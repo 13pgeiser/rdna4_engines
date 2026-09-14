@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Exact-FP16 projection-input producers for S3-f16-projection-inputs
-//! (DFlash launch fusion, gfx1100 only).
+//! (DFlash launch fusion, validated gfx1100/gfx1201 fleet).
 //!
 //! For the 48 LA qkvza, 16 FA qkv, and 64 gate/up inputs, the old path is
 //! `fused_rmsnorm_rotate_mq[_awq]_batched` (F32 `x_rot`) followed by a
@@ -22,12 +22,13 @@
 //!   `DType::F16` and never call `ensure_fp16_x`, never consult or update
 //!   `fp16_x_source_ptr`.
 //!
-//! Route contract (mirrored by the prefill hook predicate): exact gfx1100,
+//! Route contract (mirrored by the prefill hook predicate): validated gfx1100
+//! or gfx1201, with architecture-specific WMMA consumers,
 //! `DflashFusionCtx::ChainVerify`, N<=16, MQ4G256V2 weights, and
 //! `HIPFIRE_MQ_F16_PROJECTION_OFF != 1`. HipGraph/replay recording requires
 //! the fixed-grid gfx1100 split-verifier experiment. Every failed predicate
 //! runs the pre-change path; these entries return
-//! `Err` on a non-gfx1100 arch or non-F16 input rather than silently
+//! `Err` on an unsupported arch or non-F16 input rather than silently
 //! falling back. New kernels use `launch_maybe_blob` with the inline
 //! `KernargBlob` builder (capture-safe ABI, same as the baselines).
 
@@ -58,10 +59,10 @@ impl Gpu {
         eps: f32,
         batch_size: usize,
     ) -> HipResult<()> {
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_f16_projection_fusions() {
             return Err(hip_bridge::HipError::new(
                 0,
-                "fused_rmsnorm_rotate_mq_f16_batched: exact gfx1100 only",
+                "fused_rmsnorm_rotate_mq_f16_batched: unsupported architecture",
             ));
         }
         if x_rot_f16.dtype != DType::F16 {
@@ -146,10 +147,10 @@ impl Gpu {
         eps: f32,
         batch_size: usize,
     ) -> HipResult<()> {
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_f16_projection_fusions() {
             return Err(hip_bridge::HipError::new(
                 0,
-                "fused_rmsnorm_rotate_mq_awq_f16_batched: exact gfx1100 only",
+                "fused_rmsnorm_rotate_mq_awq_f16_batched: unsupported architecture",
             ));
         }
         if x_rot_f16.dtype != DType::F16 {
@@ -229,9 +230,9 @@ impl Gpu {
     /// accounting) except `xp` is the validated F16 pointer — no
     /// `ensure_fp16_x`, no `fp16_x_source_ptr` traffic. The MMQ/BT perf
     /// policies of the base launcher are intentionally absent: callers
-    /// guarantee the exact route (gfx1100, N<=16), where the base launcher
-    /// itself falls through to this same base kernel. Capture/recording is
-    /// admitted only by the fixed-grid split-verifier route. Calibration taps
+    /// guarantee the validated S3 route (N<=16); the wrapper selects the
+    /// architecture-specific base kernel. Capture/recording is admitted only
+    /// by the fixed-grid gfx1100 split-verifier route. Calibration taps
     /// mirror the `FusedQkvzaMq4G256V2` run-arm.
     pub fn gemm_qkvza_mq4g256v2_wmma_f16(
         &mut self,
@@ -254,10 +255,10 @@ impl Gpu {
         if self.fp8_verify_scope {
             return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkvza_mq4g256v2_wmma_f16"));
         }
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_f16_projection_fusions() {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_qkvza_mq4g256v2_wmma_f16: exact gfx1100 only",
+                "gemm_qkvza_mq4g256v2_wmma_f16: unsupported architecture",
             ));
         }
         if x_f16.dtype != DType::F16 {
@@ -271,9 +272,20 @@ impl Gpu {
         self.maybe_capture_activation(a_beta, x_f16, batch_size, k);
         self.maybe_capture_activation(a_alpha, x_f16, batch_size, k);
         self.bind_thread()?;
-        let kname = "gemm_qkvza_mq4g256v2_wmma";
-        let ksrc = crate::kernels::GEMM_QKVZA_MQ4G256V2_WMMA_SRC;
-        self.ensure_kernel(kname, ksrc, kname)?;
+        let (module, ksrc, func_name) = if self.arch_caps.is_rdna4() {
+            (
+                "gemm_qkvza_mq4g256v2_wmma_gfx12_f16",
+                crate::kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC,
+                "gemm_qkvza_mq4g256v2_wmma_gfx12",
+            )
+        } else {
+            (
+                "gemm_qkvza_mq4g256v2_wmma_f16",
+                crate::kernels::GEMM_QKVZA_MQ4G256V2_WMMA_SRC,
+                "gemm_qkvza_mq4g256v2_wmma",
+            )
+        };
+        self.ensure_kernel(module, ksrc, func_name)?;
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
         let mut ab = a_beta.buf.as_ptr();
@@ -318,7 +330,7 @@ impl Gpu {
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_mq4g256v2_wmma_f16", bytes);
         let result = self.launch_maybe_blob(
-            kname,
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -372,10 +384,10 @@ impl Gpu {
         if self.fp8_verify_scope {
             return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkv_mq4g256v2_wmma_f16"));
         }
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_f16_projection_fusions() {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_qkv_mq4g256v2_wmma_f16: exact gfx1100 only",
+                "gemm_qkv_mq4g256v2_wmma_f16: unsupported architecture",
             ));
         }
         if x_f16.dtype != DType::F16 {
@@ -388,9 +400,20 @@ impl Gpu {
         self.maybe_capture_activation(a_k, x_f16, batch_size, k);
         self.maybe_capture_activation(a_v, x_f16, batch_size, k);
         self.bind_thread()?;
-        let kname = "gemm_qkv_mq4g256v2_wmma";
-        let ksrc = crate::kernels::GEMM_QKV_MQ4G256V2_WMMA_SRC;
-        self.ensure_kernel(kname, ksrc, kname)?;
+        let (module, ksrc, func_name) = if self.arch_caps.is_rdna4() {
+            (
+                "gemm_qkv_mq4g256v2_wmma_gfx12_f16",
+                crate::kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC,
+                "gemm_qkv_mq4g256v2_wmma_gfx12",
+            )
+        } else {
+            (
+                "gemm_qkv_mq4g256v2_wmma_f16",
+                crate::kernels::GEMM_QKV_MQ4G256V2_WMMA_SRC,
+                "gemm_qkv_mq4g256v2_wmma",
+            )
+        };
+        self.ensure_kernel(module, ksrc, func_name)?;
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
         let mut av = a_v.buf.as_ptr();
@@ -428,7 +451,7 @@ impl Gpu {
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_mq4g256v2_wmma_f16", bytes);
         let result = self.launch_maybe_blob(
-            kname,
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -462,10 +485,11 @@ impl Gpu {
     /// copy of the `gemm_gate_up_mq4g256v2_wmma` path with the validated F16
     /// pointer. Exact-gfx1100 eager HIP defaults to RAW-slab ldsstage when
     /// eligible (HIPFIRE_GATEUP_LDSSTAGE default-on, 1<=N<=16, K%512==0; `=0`
-    /// historical base). Capture/replay use the same LDS-stage symbol only for
-    /// the fixed-grid gfx1100 split-verifier experiment; every other recorded
-    /// route keeps the historical base symbol/block32. Taps mirror the
-    /// `FusedGateUpMq4G256V2` run-arm.
+    /// historical base); gfx1201 uses its distinct gfx12 base kernel.
+    /// Capture/replay use the same LDS-stage symbol only for the fixed-grid
+    /// gfx1100 split-verifier experiment; every other recorded route keeps the
+    /// historical base symbol/block32. Taps mirror the `FusedGateUpMq4G256V2`
+    /// run-arm.
     pub fn gemm_gate_up_mq4g256v2_wmma_f16(
         &mut self,
         a_gate: &GpuTensor,
@@ -482,10 +506,10 @@ impl Gpu {
         if self.fp8_verify_scope {
             return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_gate_up_mq4g256v2_wmma_f16"));
         }
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_f16_projection_fusions() {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_gate_up_mq4g256v2_wmma_f16: exact gfx1100 only",
+                "gemm_gate_up_mq4g256v2_wmma_f16: unsupported architecture",
             ));
         }
         if x_f16.dtype != DType::F16 {
@@ -503,7 +527,7 @@ impl Gpu {
         // reduction route instead of silently switching to the base kernel.
         let recording = self.replay.is_recording() || self.graphs.capture_mode;
         let recording_supported = !recording || split_verify_capture;
-        let (kname, ksrc, block_x) = if recording_supported
+        let (module, ksrc, func_name, block_x) = if recording_supported
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && (1..=16).contains(&batch_size)
@@ -514,16 +538,25 @@ impl Gpu {
             (
                 "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage",
                 crate::kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC,
+                "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage",
                 256u32,
+            )
+        } else if self.arch_caps.is_rdna4() {
+            (
+                "gemm_gate_up_mq4g256v2_wmma_gfx12_f16",
+                crate::kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC,
+                "gemm_gate_up_mq4g256v2_wmma_gfx12",
+                32u32,
             )
         } else {
             (
-                "gemm_gate_up_mq4g256v2_wmma",
+                "gemm_gate_up_mq4g256v2_wmma_f16",
                 crate::kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC,
+                "gemm_gate_up_mq4g256v2_wmma",
                 32u32,
             )
         };
-        self.ensure_kernel(kname, ksrc, kname)?;
+        self.ensure_kernel(module, ksrc, func_name)?;
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
         let mut xp = x_f16.buf.as_ptr();
@@ -558,7 +591,7 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            kname,
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [block_x, 1, 1],
             0,

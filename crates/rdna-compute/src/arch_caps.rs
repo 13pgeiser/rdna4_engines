@@ -416,6 +416,14 @@ impl ArchCaps {
     pub fn supports_dflash_f16_residual_fusions(&self) -> bool {
         self.is_gfx1100 || self.is_gfx1201
     }
+    /// DFlash exact-F16 projection producer/consumer admission.
+    ///
+    /// The producer is wave32 portable. The consumers select distinct gfx11
+    /// and gfx12 WMMA sources, so keep this on the hardware validated by the
+    /// projection parity harness.
+    pub fn supports_dflash_f16_projection_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -616,6 +624,24 @@ mod tests {
             let caps = make_caps(arch);
             assert!(!caps.supports_dflash_hidden_scatter_fusion(), "{arch}");
             assert!(!caps.supports_dflash_f16_residual_fusions(), "{arch}");
+        }
+    }
+
+    #[test]
+    fn dflash_f16_projection_fusions_cover_validated_fleet_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(
+                make_caps(arch).supports_dflash_f16_projection_fusions(),
+                "{arch}"
+            );
+        }
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942",
+        ] {
+            assert!(
+                !make_caps(arch).supports_dflash_f16_projection_fusions(),
+                "{arch}"
+            );
         }
     }
 

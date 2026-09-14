@@ -5940,7 +5940,7 @@ fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, di
     fusion.is_chain_verify()
         // The PM FP8 verify scope never takes an F16-input projection route.
         && !gpu.fp8_verify_scope
-        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch_caps.supports_dflash_f16_projection_fusions()
         && !gpu.flags.mq_f16_projection_off
         && n >= 1
         && n <= 16
