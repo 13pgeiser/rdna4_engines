@@ -1,4 +1,4 @@
-
+#!/bin/bash
 sudo bash -c "echo "210000000" > $(echo /sys/class/drm/card0/device/hwmon/hwmon*/)power1_cap"
 docker rm -f r9700-qwen3.8-mxfp4
 cd radiance-vllm-mxfp4
