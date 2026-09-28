@@ -38,6 +38,7 @@ pub(crate) mod anthropic;
 pub(crate) mod metrics;
 
 pub mod complete;
+pub(crate) mod decide;
 pub mod http;
 pub(crate) mod responses;
 pub(crate) mod ui;
