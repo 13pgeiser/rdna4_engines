@@ -8,6 +8,7 @@ pub mod admission;
 pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
+pub mod decide;
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
@@ -229,6 +230,40 @@ pub trait Carrier: Send + Sync {
     ) -> Option<Result<hipfire_runtime::serve::SlotModelPreflight, String>> {
         None
     }
+
+    // ── decide (Jev-compatible logit readout) ──────────────────────────────
+    /// Whether this arch implements the three decide hooks below.
+    fn decide_supported(&self) -> bool {
+        false
+    }
+    /// Prefill `tokens` at `start_pos`, set `m.seq_pos = start_pos +
+    /// tokens.len()`, return the last position's full-vocab logits.
+    fn decide_prefill_logits(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _tokens: &[u32],
+        _start_pos: usize,
+    ) -> Option<Result<Vec<f32>, String>> {
+        None
+    }
+    /// Snapshot `seq_pos` + recurrent state.
+    fn decide_save(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+    ) -> Option<Result<crate::decide::DecideSnapshot, String>> {
+        None
+    }
+    /// Restore a snapshot taken by `decide_save` on the same model.
+    fn decide_restore(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _snap: &crate::decide::DecideSnapshot,
+    ) -> Option<Result<(), String>> {
+        None
+    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the
@@ -243,6 +278,11 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
         .iter()
         .copied()
         .find(|c| c.claims_arch_id(arch_id, false))
+}
+
+/// All registered carriers (read-only view for capability tests).
+pub fn registry_carriers() -> impl Iterator<Item = &'static dyn Carrier> {
+    REGISTRY.iter().copied()
 }
 
 // ─── Typed routing (replaces stringly `c.name() == "..."` predicates) ──────
