@@ -1601,9 +1601,12 @@ pub fn forward_prefill_batch_multi(
                                 )?;
                             }
                         } else {
+                            // Same S6 paired Q8 K/V-write admission as the singleton
+                            // attend (byte-identical to the two batched writes).
+                            let pair_q8_writes = dflash_fa_batch_fusion_admitted(gpu, config, r.fusion, n);
                             batch_chunk_fa_attend(
                                 gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None,
-                                layer_idx, multirow, None, false,
+                                layer_idx, multirow, None, false, pair_q8_writes,
                             )?;
                         }
                     }
