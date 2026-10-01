@@ -7,6 +7,12 @@ if [ -d /models ]; then
 		git clone https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4
 	    )
 	fi
+	if [ ! -d /models/Qwen3.8-27B-DFlash2-FP8 ]; then
+	    (
+		cd /models || exit
+		git clone https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8
+	    )
+	fi
 	if [ ! -d /models/Qwen3.8-27B-MXFP4-mtpfp8 ]; then
 	    mtp="$CURDIR/fp8_mtp.py"
 	    (
@@ -34,8 +40,3 @@ fi
 if [ ! -e chat_template.jinja ]; then
 	curl -fsSL https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja -o chat_template.jinja
 fi
-(
-	cd radiance-vllm-mxfp4
-	docker build  -t "radiance-vllm-mxfp4:$(cat VERSION)" -f Dockerfile .
-)
-
