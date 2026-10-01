@@ -1343,6 +1343,7 @@ misspelled key is unknown and fails the load with
 | `memory.mmq.screen` | `mmq_screen` | `HIPFIRE_MMQ_SCREEN` | stable |
 | `memory.mmq.screen_threshold` | `mmq_screen_threshold` | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | stable |
 | `memory.offload_exec` | `offload_exec` | `HIPFIRE_OFFLOAD_EXEC` | stable |
+| `memory.offload_passback_share` | `offload_passback_share` | `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | stable |
 | `memory.oom_guard` | `oom_guard` | `HIPFIRE_OOM_GUARD` | stable |
 | `memory.ple_format` | `ple_format` | `HIPFIRE_PLE_FORMAT` | stable |
 | `memory.ple_hot_store_bytes` | `ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | stable |
