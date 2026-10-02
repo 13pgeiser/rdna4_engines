@@ -110,6 +110,16 @@ pub enum Step<'a> {
     /// down projection) with the source's BF16 storage boundaries.  Opaque to
     /// fusion: no HC read/write pairing or epilogue fold crosses it.
     DenseFfn(crate::pipeline::layer_ops::DenseFfnOp<'a>),
+    /// Sandwich-norm attention sublayer.
+    SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
+    /// Sandwich-norm gated MLP sublayer.
+    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
+    /// Sandwich-norm per-layer-input branch.
+    PerLayerInput(crate::pipeline::sandwich::PerLayerInputOp<'a>),
+    /// In-place scalar multiply.
+    Scale(crate::pipeline::sandwich::ScaleOp<'a>),
+    /// In-place final-logit soft cap.
+    Softcap(crate::pipeline::sandwich::SoftcapOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -142,7 +152,12 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
         | Step::DenseFfn(_)
-        | Step::MoeStage(..) => None,
+        | Step::MoeStage(..)
+        | Step::SandwichAttention(_)
+        | Step::SandwichMlp(_)
+        | Step::PerLayerInput(_)
+        | Step::Scale(_)
+        | Step::Softcap(_) => None,
     }
 }
 
@@ -1617,6 +1632,13 @@ pub(crate) fn launch_op_rows(
         Step::DenseFfn(op) => crate::pipeline::layer_ops::execute_dense_ffn(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
+        Step::SandwichAttention(op) => {
+            crate::pipeline::sandwich::execute_sandwich_attention(gpu, ctx, op)
+        }
+        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
+        Step::PerLayerInput(op) => crate::pipeline::sandwich::execute_per_layer_input(gpu, ctx, op),
+        Step::Scale(op) => crate::pipeline::sandwich::execute_scale(gpu, op),
+        Step::Softcap(op) => crate::pipeline::sandwich::execute_softcap(gpu, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {
