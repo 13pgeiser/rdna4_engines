@@ -1,0 +1,2218 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+
+//! Source-aware admission (device-mesh G2).
+//!
+//! Classifies a retained source once and decides one effective topology BEFORE
+//! any destructive side effect (prior-model teardown, VMM init, remap, GPU
+//! allocation, carrier entry, collective creation). The load route consumes the
+//! [`SourceAdmission`]'s already-open [`ModelSource`] — never re-opening or
+//! re-classifying the path. A refusal here leaves whatever model is currently
+//! loaded untouched: no teardown, no allocation, no carrier entry, no cache
+//! mutation.
+
+use crate::Carrier;
+use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
+use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
+use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
+fn qwen4_vision_tensor_name(name: &str) -> bool {
+    [
+        "model.visual.",
+        "model.vision_tower.",
+        "model.vision_projection.",
+        "model.multi_modal_projector.",
+        "vision_tower.",
+        "visual.",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+/// Omission requests automatic VMM where the actual owner can allocate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvBackendRequest {
+    Automatic,
+    Explicit(KvBackend),
+}
+
+impl KvBackendRequest {
+    pub fn from_override(raw: Option<&str>) -> Result<Self, String> {
+        raw.filter(|s| !s.is_empty())
+            .map(|s| s.parse().map(Self::Explicit).map_err(|e| format!("{e}")))
+            .unwrap_or(Ok(Self::Automatic))
+    }
+}
+
+/// The sampled per-load switch only changes implicit Qwen defaults.
+pub fn qwen_default_q8_enabled() -> bool {
+    !matches!(
+        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
+            .ok()
+            .as_deref(),
+        Some("0")
+    )
+}
+
+/// Single authoritative operator warning for an admitted legacy trunk.
+pub fn legacy_warning(backend: KvBackend, reason: Option<&str>) -> Option<String> {
+    if backend != KvBackend::Legacy {
+        return None;
+    }
+    Some(match reason {
+        Some(reason) => format!(
+            "WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable ({reason}); using legacy KV storage. Inspect before benchmarking or filing a PR."
+        ),
+        None => "WARNING HIPFIRE_KV_BACKEND=legacy: explicitly selected legacy KV storage (--kv-backend legacy or memory.kv_backend); inspect before benchmarking or filing a PR.".to_string(),
+    })
+}
+
+#[derive(Clone, Copy)]
+pub struct KvBackendHints<'a> {
+    pub kv_mode: Option<&'a str>,
+    pub kv_k: Option<&'a str>,
+    pub kv_v: Option<&'a str>,
+    pub qwen_default_q8: bool,
+    pub kv_adaptive: Option<&'a str>,
+    pub cask: Option<&'a hipfire_runtime::loader_api::CaskConfig>,
+    pub deepseek4_heterogeneous: bool,
+    pub vmm_runtime_available: bool,
+    /// Free device bytes before this load, queried from HIP at admission.
+    pub free_vram_bytes: Option<usize>,
+}
+
+impl KvBackendHints<'_> {
+    pub const fn without_device() -> Self {
+        Self {
+            kv_mode: None,
+            kv_k: None,
+            kv_v: None,
+            qwen_default_q8: true,
+            kv_adaptive: None,
+            cask: None,
+            deepseek4_heterogeneous: false,
+            vmm_runtime_available: false,
+            free_vram_bytes: None,
+        }
+    }
+}
+
+/// The one effective topology admitted for a load. `tp>1` (expert-parallel) and
+/// `pp>1` (pipeline-parallel) are mutually exclusive; both default to 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveTopology {
+    Single,
+    Pipeline(usize),
+    Expert(usize),
+}
+
+/// Optional load-time controls that must be rejected at Qwen4 admission
+/// before any previous model teardown or GPU allocation.
+#[derive(Clone, Copy, Default)]
+pub struct SourceAdmissionOptions {
+    pub spec: SpecLoadCfg,
+    /// True only when `memory.kv_adaptive` is an active policy. The CLI
+    /// serializes its ordinary `off` schema default as a nonempty string.
+    pub kv_adaptive: bool,
+    pub eagle_drafter: bool,
+    pub cask: bool,
+    pub state_quant: bool,
+    pub non_single_compute: bool,
+    pub expert_count_override: bool,
+    pub pflash: bool,
+}
+
+
+/// Return whether a per-load adaptive-KV value requests the active controller.
+/// The CLI schema default is `Some("off")`, which must remain ordinary AR.
+/// Empty values are also inactive because daemon normalization drops them.
+pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "off")
+}
+
+/// Whether a Qwen4 load attaches its native MTP head. The executable HFQM
+/// manifest always carries the validated head, so `auto` (`None`) attaches it
+/// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
+/// owns the load instead: its tape is the single-row AR forward, which no MTP
+/// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
+pub(crate) fn qwen4_native_mtp(
+    spec: SpecLoadCfg,
+    gpu_arch: &str,
+    path: &str,
+    pp: usize,
+    tp: usize,
+) -> Result<bool, String> {
+    let retained =
+        hipfire_runtime::config::retained_redline_default(gpu_arch, "qwen4", path, pp, tp, true);
+    match spec.mtp {
+        Some(false) => Ok(false),
+        Some(true) if retained => Err(
+            "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
+                .into(),
+        ),
+        Some(true) => Ok(true),
+        None => Ok(!retained),
+    }
+}
+
+/// Whether an admitted Qwen4 native MTP head stays attached once
+/// `host_mapped_experts` routed-expert tensors were placed in pinned host RAM
+/// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Greedy MTP over host-mapped experts
+/// gains little (gfx1201 N=12: 1.08x median AR, slower on low-tau prompts) and
+/// its text differs from AR on 4/8 prompts, so `auto` keeps AR there and only
+/// an explicit `speculation.mtp = "on"` (`--spec mtp`) attaches the head.
+/// Device-resident loads (Strix Halo: MTP text = AR on 8/8, 1.41x) keep the
+/// `auto` default on.
+pub(crate) fn qwen4_mtp_with_host_mapped_experts(
+    spec: SpecLoadCfg,
+    host_mapped_experts: usize,
+) -> bool {
+    host_mapped_experts == 0 || spec.mtp == Some(true)
+}
+
+/// The source-only portion of Qwen4 admission. The validated config and
+/// inventory are reused by the executable Single carrier without reopening
+/// or reclassifying the HFQM path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen4SourceAdmission {
+    pub config: Qwen4Config,
+    pub effective_mesh: hipfire_arch_qwen4::EffectiveMesh,
+    pub modality: InputModality,
+    pub native_mtp: bool,
+    pub manifest_source_tensors: usize,
+}
+
+/// Refuse unsupported Qwen4 request dimensions before touching source records.
+/// In particular, image/video requests cannot make the boundary inspect vision
+/// payloads and then silently fall back to text.
+pub fn qwen4_request_admission(
+    effective_mesh: hipfire_arch_qwen4::EffectiveMesh,
+    modality: InputModality,
+    native_mtp: bool,
+) -> Result<(), String> {
+    let capabilities = if native_mtp {
+        Qwen4Capabilities::text_mtp()
+    } else {
+        Qwen4Capabilities::text_ar()
+    };
+    if !capabilities.supports_modality(modality) {
+        return Err(format!("qwen4: unsupported modality {modality:?}"));
+    }
+    if native_mtp && !capabilities.native_mtp {
+        return Err("qwen4: native MTP is not supported by this source".into());
+    }
+    if !effective_mesh.is_single() {
+        return Err(format!(
+            "qwen4: only Single topology is admitted (pp={}, tp={}, ep={})",
+            effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
+        ));
+    }
+    Ok(())
+}
+/// Validate a reserved arch-16 HFQM source without allocating weights.
+///
+/// The architecture crate owns the complete source/index contract.  Loader
+/// admission only adds request/topology policy and retains the receipt's
+/// value-only config/count for the carrier handoff.
+pub fn admit_qwen4_source(
+    source: &ModelSource,
+    effective_mesh: hipfire_arch_qwen4::EffectiveMesh,
+    modality: InputModality,
+    native_mtp: bool,
+) -> Result<Qwen4SourceAdmission, String> {
+    qwen4_request_admission(effective_mesh, modality, native_mtp)?;
+    let ModelSource::Hfq(hfq) = source else {
+        return Err(
+            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
+        );
+    };
+    let receipt =
+        hipfire_arch_qwen4::admit_hfqm_artifact(hfq).map_err(|error| error.to_string())?;
+    Ok(Qwen4SourceAdmission {
+        config: receipt.config,
+        effective_mesh,
+        modality,
+        native_mtp,
+        manifest_source_tensors: receipt.source_tensor_count,
+    })
+}
+
+/// A source admitted before any destructive side effect.
+pub struct SourceAdmission {
+    /// The already-open source. The single/pp route consumes it (no second
+    /// open); the EP route re-opens `path` per rank and drops this handle.
+    pub source: ModelSource,
+    pub arch_id: u32,
+    pub is_dir: bool,
+    /// Tower-tensor presence decides text-vs-VL; config metadata alone never
+    /// does (remediation contract `179a20d7f`).
+    pub has_vision: bool,
+    pub topology: EffectiveTopology,
+    pub kv_backend: KvBackend,
+    /// Single admitted sequence limit consumed by both daemon and loader.
+    pub max_seq: usize,
+    /// Reason for automatic legacy fallback; absent for explicit selection.
+    pub kv_backend_reason: Option<String>,
+    /// Effective context and the two default limits (when Qwen owns growing VMM KV).
+    pub sequence: Option<SequenceResolution>,
+    /// Why an automatic sequence bound retained legacy behavior.
+    pub sequence_reason: Option<&'static str>,
+    pub kv_backend_request: KvBackendRequest,
+    pub qwen_default_q8: bool,
+    /// The resolved carrier (single/pp path). `None` for expert-parallel, which
+    /// dispatches on `arch_id` directly rather than through the registry.
+    pub carrier: Option<&'static dyn Carrier>,
+    /// Validated vision-tower sidecar (`params.vision` / `HIPFIRE_VISION_SIDECAR`).
+    /// `Some` only when the sidecar opened, carries arch_id 5|6, and holds the
+    /// tower probe tensor; the single/pp route threads it into `LoadCtx`.
+    /// `None` = trunk-only (or explicit opt-out via empty string).
+    pub vision_path: Option<std::path::PathBuf>,
+    /// The resolved `vision.mode` ladder value (`off`/`auto`/`on`). The
+    /// carrier needs it to gate `<stem>.vl` sibling discovery: `vision_path`
+    /// alone cannot distinguish "off" (never probe a sibling) from "auto with
+    /// no explicit sidecar" (probe allowed). `off` suppresses discovery.
+    pub vision_mode: String,
+}
+/// The physical VMM reservation equals `max_seq` without eviction; with
+/// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
+/// grow to the full card-admitted bound. Explicit overrides may exceed either
+/// limit by operator request.
+#[derive(Debug, Clone)]
+pub struct SequenceResolution {
+    pub max_seq: usize,
+    pub bound: &'static str,
+    pub model_ctx: usize,
+    pub card_cap: usize,
+    pub kv_mode: &'static str,
+}
+
+/// Pure text-vs-VL decision. The vision tower tensor decides; configuration
+/// metadata alone never does. Every Qwen3.5-family HF config embeds
+/// `vision_config` even for text-only quantized artifacts, so a config marker
+/// without the tower is the text backbone, not a refusal.
+///
+/// LFM2 is the one exception that *refuses*: a tower tensor with no parseable
+/// `vision_config` metadata is malformed (carriers.rs:1553-1558) and fails
+/// closed rather than silently loading as text.
+///
+/// Contract provenance: remediation commit `179a20d7f` ("classify Qwen3.5/LFM2
+/// sources by vision tower tensor, not config markers").
+pub fn classify_vision(
+    arch_id: u32,
+    has_vision_tensor: bool,
+    has_vision_config: bool,
+) -> Result<bool, String> {
+    match arch_id {
+        // Qwen3.5 dense (5) / MoE (6): the tower tensor alone decides.
+        5 | 6 => Ok(has_vision_tensor),
+        // LFM2 (11): tower + config both required; tower-without-config refuses.
+        11 => {
+            if has_vision_tensor && !has_vision_config {
+                return Err(
+                    "lfm2moe: artifact carries vision tensors but no vision_config \
+                     metadata — requantize with --include-vision"
+                        .into(),
+                );
+            }
+            Ok(has_vision_tensor)
+        }
+        // Qwen4's conditional-generation name does not imply a vision route.
+        // A text artifact is capable when no tower records are present; a
+        // tower-bearing artifact is refused rather than probed as an image
+        // request or silently downgraded to text.
+        QWEN4_ARCH_ID => {
+            if has_vision_tensor {
+                Err("qwen4: vision tensors are unsupported by the text-only route".into())
+            } else {
+                Ok(false)
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Read the vision-tower probes out of an already-open source and fold them
+/// through [`classify_vision`]. Read-only: probes the HFQ tensor index and (for
+/// LFM2) parses `vision_config` metadata; touches no GPU state.
+fn probe_vision(src: &ModelSource, arch_id: u32) -> Result<bool, String> {
+    let ModelSource::Hfq(hfq) = src else {
+        return classify_vision(arch_id, false, false);
+    };
+    let (has_tensor, has_config) = match arch_id {
+        5 | 6 => (
+            hfq.tensor_data("model.visual.patch_embed.proj.weight")
+                .is_some(),
+            // Qwen3.5 does not use the config in the decision; config parse is
+            // soft (carriers.rs:527-544). A dummy `false` is never read.
+            false,
+        ),
+        11 => (
+            hfq.tensor_data("model.vision_tower.vision_model.embeddings.patch_embedding.weight")
+                .is_some(),
+            hipfire_arch_lfm2_vl::vision_config_from_hfq(hfq).is_some(),
+        ),
+        QWEN4_ARCH_ID => (
+            hfq.tensors()
+                .iter()
+                .any(|tensor| qwen4_vision_tensor_name(&tensor.name)),
+            false,
+        ),
+        _ => (false, false),
+    };
+    classify_vision(arch_id, has_tensor, has_config)
+}
+
+/// Tower probe tensor shared by the trunk and the vision sidecar.
+const VISION_PROBE_TENSOR: &str = "model.visual.patch_embed.proj.weight";
+
+/// Validate the optional vision-tower sidecar and return its resolved path.
+/// Fail-closed: an unopenable, non-5|6, or tower-less sidecar refuses with a
+/// message naming the remedy. The sidecar opens read-only as a SEPARATE
+/// `HfqFile` (never `attach_overlay` — REAP rejects additive tensor names,
+/// hfq.rs:391-427). Empty string counts as unset (explicit opt-out, same
+/// semantics as `HIPFIRE_DFLASH_DRAFT`).
+fn resolve_vision_sidecar(
+    vision: Option<&str>,
+    arch_id: u32,
+    is_dir: bool,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let path = match vision.filter(|s| !s.is_empty()) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    if is_dir {
+        return Err(format!(
+            "vision sidecar '{path}' requires an HFQ trunk: safetensors directory \
+             sources cannot carry a sidecar tower"
+        ));
+    }
+    if !matches!(arch_id, 5 | 6) {
+        return Err(format!(
+            "vision sidecar '{path}' requested for arch_id={arch_id}: vision sidecars \
+             only serve Qwen3.5-VL trunks (arch_id 5|6)"
+        ));
+    }
+    let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
+        .map_err(|e| format!("vision sidecar '{path}': open failed: {e}"))?;
+    if !matches!(sidecar.arch_id, 5 | 6) {
+        return Err(format!(
+            "vision sidecar '{path}' has arch_id={} (expected 5|6): pack the tower \
+             with `hipfire-quantize <hf-dir> --include-vision --include-prefix model.visual.`",
+            sidecar.arch_id
+        ));
+    }
+    if sidecar.tensor_data(VISION_PROBE_TENSOR).is_none() {
+        return Err(format!(
+            "vision sidecar '{path}' carries no vision tower tensor \
+             '{VISION_PROBE_TENSOR}': pack the tower with `hipfire-quantize <hf-dir> \
+             --include-vision --include-prefix model.visual.`"
+        ));
+    }
+    Ok(Some(std::path::PathBuf::from(path)))
+}
+
+/// Maple head-overlay arch id (`hipfire-quantize --head-only` carriers).
+const MAPLE_ARCH_ID: u32 = 15;
+
+/// Validate a `--head` overlay against the already-open base and attach it so
+/// the retained source IS the effective base+head: loading consumes it with
+/// no second open. Every refusal fires here, before prior-model teardown.
+/// Empty string counts as unset (explicit opt-out, same as vision/draft).
+/// Refusals, never silent fallbacks: serving the base head when an overlay
+/// was requested hands back a model the operator did not ask for.
+fn admit_head_overlay(
+    head: Option<&str>,
+    base: &mut ModelSource,
+    arch_id: u32,
+    topology: EffectiveTopology,
+) -> Result<(), String> {
+    let path = match head.filter(|s| !s.is_empty()) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    if base.is_dir() {
+        return Err(format!(
+            "--head '{path}' requires an HFQ trunk: safetensors directory \
+             sources cannot carry a head overlay"
+        ));
+    }
+    if topology != EffectiveTopology::Single {
+        return Err(format!(
+            "--head '{path}' requires a single-device load (tp=1, pp=1): \
+             expert/pipeline-parallel loads use the head baked into the model file"
+        ));
+    }
+    if arch_id != MAPLE_ARCH_ID {
+        return Err(format!(
+            "--head '{path}' requested for arch_id={arch_id}: head overlays only \
+             serve Maple (arch_id 15) — refusing rather than silently serving \
+             the base head"
+        ));
+    }
+    let ModelSource::Hfq(hfq) = &mut *base else {
+        return Err(format!("--head '{path}' requires an HFQ trunk"));
+    };
+    // The overlay slot holds at most one file: a REAP splice already
+    // installed there would be silently discarded by the head attach.
+    // Conservatively refuse the combination instead of stacking overlays.
+    if hfq.has_overlay() {
+        return Err(format!(
+            "--head '{path}' cannot combine with an active REAP overlay \
+             (single overlay slot): disable one of them"
+        ));
+    }
+    let ov = hipfire_runtime::hfq::HfqFile::open_at_offset(std::path::Path::new(path), 0)
+        .map_err(|e| format!("head overlay '{path}': open failed: {e}"))?;
+    hfq.attach_opened_head(ov, std::path::Path::new(path))?;
+    Ok(())
+}
+
+/// Resolve the single carrier that claims a source, refusing no-carrier and
+/// ambiguous-carrier sources exactly as the load entries do.
+fn resolve_carrier(src: &ModelSource) -> Result<&'static dyn Carrier, String> {
+    let mut matches = crate::REGISTRY.iter().copied().filter(|c| c.probe(src));
+    let carrier = matches
+        .next()
+        .ok_or_else(|| format!("no carrier for {}", src.describe()))?;
+    if let Some(other) = matches.next() {
+        return Err(format!(
+            "ambiguous carrier dispatch for {}: '{}' and '{}' both claim it",
+            src.describe(),
+            carrier.name(),
+            other.name()
+        ));
+    }
+    Ok(carrier)
+}
+
+/// Read-only DFlash lm-head quant refusal: a draft is attached but the target's
+/// lm_head/embed quant type is not admitted for the batched GEMM verify paths.
+/// Mirrors the gemma4-entry pre-allocation check (lib.rs) so the refusal fires
+/// at admission instead of after prior-model teardown.
+fn df_lash_lm_head_admission(
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    draft_path: Option<&str>,
+    gpu_arch: &str,
+) -> Result<(), String> {
+    if draft_path.is_none() {
+        return Ok(());
+    }
+    let lm_qt = hfq
+        .tensor_data("lm_head.weight")
+        .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
+        .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
+        .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+        .map(|(info, _)| info.quant_type);
+    if !crate::dflash_lm_head_quant_supported(lm_qt, gpu_arch) {
+        let qt_desc = match lm_qt {
+            Some(qt) => format!("quant_type={qt}"),
+            None => "no lm_head/embed_tokens tensor found".to_string(),
+        };
+        return Err(format!(
+            "DFlash draft requested but target lm_head {qt_desc} is not supported \
+             on gfx11+gfx12 WMMA ({gpu_arch})."
+        ));
+    }
+    Ok(())
+}
+
+/// FLUX/Klein image-gen arch refusal: the trunk GEMM (`gemm_wmma_lds256`)
+/// and `attention_flux_vtk/v2_wmma` use the gfx11
+/// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` intrinsic, which hipcc
+/// rejects on gfx12 ("needs target feature wmma-256b-insts,wavefrontsize32").
+/// Admits exactly the `has_wmma_w32` set (`arch_caps.rs:143-145`: `is_rdna3`,
+/// NOT the `has_wmma_w32_gfx12` gfx12 variant) — pure on the `gpu_arch`
+/// string because admission is read-only and never inits a GPU. `None` for
+/// non-diffusion archs and for gfx11; `Some(reason)` otherwise, so the load
+/// refuses before any allocation with the prior model still loaded.
+fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
+    if !matches!(arch_id, 40 | 45) {
+        return None;
+    }
+    let gfx11_wmma_w32 = matches!(
+        gpu_arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152"
+    );
+    (!gfx11_wmma_w32).then(|| {
+        format!(
+            "image generation (arch 40/45) requires RDNA3/3.5 (gfx11 wave32 WMMA); \
+             detected {gpu_arch}. See docs/IMAGEGEN.md §1."
+        )
+    })
+}
+
+/// Pipeline/tensor-parallel geometry admission (#666 G2). `Gpus::init_uniform`
+/// refuses `n_layers < n_devices` deep inside GPU init (`multi_gpu.rs`) —
+/// after the daemon has already torn down the resident model for the pp path
+/// — and `init_tp`/`init_ep` refuse a zero degree or an unsatisfiable device
+/// count the same way. These gates mirror those deep invariants here, before
+/// any teardown, so an impossible `pp`/`tp` leaves the prior model serving.
+/// The `init_*` checks stay as last-resort invariants; this is an additional
+/// earlier gate, not a replacement.
+///
+/// Reachability: `admit_source` holds the already-open source but no per-arch
+/// config parser (the `config_from_hfq` readers live in the feature-gated
+/// arch crates, which this unconditional module cannot import). `n_layers` is
+/// therefore probed out of the HF `{config}` envelope (`num_hidden_layers`,
+/// the HF-convention key every pp-capable source carries, descending into
+/// `text_config` exactly as qwen35 `from_config_value` does) rather than
+/// parsed per-arch. A source with no layer key fails this gate open (`None`)
+/// — the visible-device gate below still guards it, and every non-qwen35
+/// `pp > 1` is already refused by `admit_topology` before this runs.
+fn n_layers_from_metadata_json(metadata_json: &str) -> Option<usize> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    let config = meta.get("config").unwrap_or(&meta);
+    // Composite checkpoints nest the trunk config under `text_config`
+    // (mirrors qwen35 `from_config_value`, which descends there first).
+    // Probe the nested node, then the outer node, then the flat blob.
+    let text_config = config.get("text_config");
+    for node in [text_config.unwrap_or(config), config, &meta] {
+        for key in ["num_hidden_layers", "n_layers", "num_layers"] {
+            if let Some(n) = node.get(key).and_then(|v| v.as_u64()) {
+                if n > 0 {
+                    return Some(n as usize);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Layer count declared by an already-open source, via the metadata envelope
+/// probe above. Read-only: parses the in-memory JSON the open already
+/// returned; touches no GPU state.
+fn source_n_layers(source: &ModelSource) -> Option<usize> {
+    match source {
+        ModelSource::Hfq(hfq) => n_layers_from_metadata_json(&hfq.metadata_json),
+        ModelSource::Dir(dir) => n_layers_from_metadata_json(
+            hipfire_runtime::model_source::ModelSource::metadata_json(dir),
+        ),
+    }
+}
+/// Qwen's trained window comes from the checkpoint's
+/// `config.text_config.max_position_embeddings` (or flat `config`), not from
+/// a registry tag or the serving default. The same metadata envelope feeds
+/// `qwen35::config_from_metadata_json`.
+fn trained_context(source: &ModelSource) -> Option<usize> {
+    let raw = match source {
+        ModelSource::Hfq(hfq) => &hfq.metadata_json,
+        ModelSource::Dir(dir) => hipfire_runtime::model_source::ModelSource::metadata_json(dir),
+    };
+    let meta: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let config = meta.get("config").unwrap_or(&meta);
+    config
+        .get("text_config")
+        .unwrap_or(config)
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0)
+}
+
+/// Only Qwen's single-card cache has the matching VMM KV-row accounting.
+/// The HFQ file is a lower bound on loaded weights; include 12.5% for
+/// expanded raw tensors/runtime state and 512 MiB for allocator/transients.
+/// Reserve only the minimum 512-row PBS plus the widened guard's existing
+/// 1 GiB headroom and 128 MiB for VMM page rounding across K/V owners.
+/// Per-request prefill selects wider scratch from then-current mapped-KV free VRAM.
+fn resolve_sequence(
+    source: &ModelSource,
+    requested: usize,
+    gpu_arch: &str,
+    hints: KvBackendHints<'_>,
+) -> Result<SequenceResolution, String> {
+    use hipfire_runtime::kv_mode;
+    let ModelSource::Hfq(hfq) = source else {
+        return Err("automatic Qwen VMM context sizing requires an HFQ weight manifest".into());
+    };
+    let config = hipfire_arch_qwen35::qwen35::config_from_metadata_json(&hfq.metadata_json)?;
+    let model_ctx = trained_context(source)
+        .ok_or("Qwen checkpoint has no config.text_config.max_position_embeddings")?;
+    let raw_mode = hints
+        .kv_mode
+        .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str());
+    let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
+    let native_eligible = kv_mode::qwen35_native_eligible(
+        gpu_arch,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        1,
+        adaptive,
+        hints.cask.is_some_and(|c| c.sidecar.is_some()),
+    );
+    let policy =
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, raw_mode, native_eligible);
+    let pair = kv_mode::resolve_kv_pair(
+        raw_mode,
+        hints.kv_k,
+        hints.kv_v,
+        &policy,
+        gpu_arch,
+        hints.qwen_default_q8,
+    )
+    .map_err(|e| format!("Qwen KV sequence: {e}"))?;
+    let bytes_per_token =
+        hipfire_arch_qwen35::qwen35::prefill::vmm_kv_token_bytes(&config, pair, adaptive)
+            .ok_or("Qwen KV token stride overflow or no full-attention layers")?;
+    let free = hints
+        .free_vram_bytes
+        .ok_or("cannot query free VRAM for automatic VMM context")?;
+    let file_bytes = usize::try_from(
+        std::fs::metadata(hfq.path())
+            .map_err(|e| format!("Qwen weight size: {e}"))?
+            .len(),
+    )
+    .map_err(|_| "Qwen weight file size exceeds usize")?;
+    let weights = file_bytes
+        .saturating_add(file_bytes / 8)
+        .saturating_add(512 << 20);
+    let scratch =
+        hipfire_arch_qwen35::qwen35::prefill::minimum_prefill_reservation_bytes(&config, gpu_arch)
+            .ok_or("Qwen minimum prefill scratch sizing overflow or unsupported MoE")?;
+    let projected_card_cap = free
+        .saturating_sub(weights)
+        .saturating_sub(scratch)
+        .saturating_sub(128 << 20)
+        / bytes_per_token;
+    // Projection is a pre-teardown fit refusal, never the effective bound.
+    // Weight upload changes free VRAM; the Qwen carrier remeasures that
+    // *after* weights and immediately before KV reservation.
+    if projected_card_cap < 512 && requested == 0 {
+        return Err("Qwen VMM load refused: projected weights, minimum prefill scratch and KV do not fit free VRAM".into());
+    }
+    let (max_seq, bound) = if requested != 0 {
+        (requested, "user")
+    } else {
+        (model_ctx, "pending")
+    };
+    let kv_mode = kv_mode::qwen_k_display_name(pair.k());
+    Ok(SequenceResolution {
+        max_seq,
+        bound,
+        model_ctx,
+        card_cap: 0,
+        kv_mode,
+    })
+}
+
+/// Count a comma-separated device list (`hardware.devices`, visibility envs).
+fn count_device_list(value: &str) -> usize {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .count()
+}
+
+/// Visible HIP device count for the pp/tp geometry gates. Read-only
+/// precedence: `hardware.devices` (the same source
+/// `Gpus::resolve_device_ids` consults) first, then the visibility envs the
+/// daemon inherits, then a `hipGetDeviceCount` query — which initializes no
+/// device, creates no context, and allocates nothing. `None` = unknown (e.g.
+/// CPU-only unit tests) and the device-count gate is skipped; the `n_layers`
+/// gate still guards `pp`.
+fn visible_device_count() -> Option<usize> {
+    if let Some(devices) = hipfire_runtime::config::get().devices.as_deref() {
+        return Some(count_device_list(devices));
+    }
+    for var in [
+        hipfire_config::devices::HIP_VISIBLE_DEVICES,
+        hipfire_config::devices::ROCR_VISIBLE_DEVICES,
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.trim().is_empty() {
+                return Some(count_device_list(&value));
+            }
+        }
+    }
+    hip_bridge::HipRuntime::load()
+        .and_then(|hip| hip.device_count())
+        .map(|n| n.max(0) as usize)
+        .ok()
+}
+
+/// Pipeline-parallel geometry refusal. `pp == 0` can never satisfy
+/// `init_uniform` (`n_devices must be >= 1`); `pp` above the source's layer
+/// count can never satisfy its `n_layers < n_devices` invariant (each device
+/// must own at least one layer); `pp` above the visible device count can
+/// never bind its ranks. `pp == 1` always passes: a single device owns every
+/// layer by construction.
+fn pp_geometry_refusal(
+    pp: usize,
+    n_layers: Option<usize>,
+    n_devices: Option<usize>,
+) -> Option<String> {
+    if pp == 0 {
+        return Some(
+            "load refused: pp=0 is not a valid pipeline-parallel degree \
+             (Gpus::init_uniform requires n_devices >= 1; multi_gpu.rs)"
+                .to_string(),
+        );
+    }
+    if let Some(layers) = n_layers {
+        if pp > layers {
+            return Some(format!(
+                "load refused: pp={pp} exceeds n_layers={layers} for this source \
+                 (Gpus::init_uniform refuses n_layers < n_devices — each device must \
+                 own at least one layer; multi_gpu.rs)"
+            ));
+        }
+    }
+    if let Some(devices) = n_devices {
+        if pp > devices {
+            return Some(format!(
+                "load refused: pp={pp} exceeds visible HIP device count={devices} \
+                 (Gpus::init_uniform cannot bind that many ranks; multi_gpu.rs)"
+            ));
+        }
+    }
+    None
+}
+
+/// Expert/tensor-parallel geometry refusal. Unlike `pp`, `tp` shards
+/// within-layer work (`init_tp`/`init_ep` run every layer on every rank), so
+/// the layer count does not bound it — only the zero degree
+/// (`init_ep: ep_size must be >= 1`, `init_tp: tp_size must be >= 1`) and the
+/// visible device count (one device per rank) do. `tp == 1` always passes.
+fn tp_geometry_refusal(tp: usize, n_devices: Option<usize>) -> Option<String> {
+    if tp == 0 {
+        return Some(
+            "load refused: tp=0 is not a valid parallel degree \
+             (Gpus::init_ep/init_tp require ep_size/tp_size >= 1; multi_gpu.rs)"
+                .to_string(),
+        );
+    }
+    if let Some(devices) = n_devices {
+        if tp > devices {
+            return Some(format!(
+                "load refused: tp={tp} exceeds visible HIP device count={devices} \
+                 (Gpus::init_ep/init_tp need one device per rank; multi_gpu.rs)"
+            ));
+        }
+    }
+    None
+}
+
+/// Read-only source admission: open the source, classify `arch_id` + vision,
+/// decide the effective topology, and refuse every unsupported/contradictory
+/// combination — without touching GPU state, VMM, or any prior model.
+///
+/// Refusals mirror the current-master daemon/loader refusals so no
+/// currently-served route changes; they simply fire before destructive work.
+/// Callers that do not expose the optional load-time controls get the
+/// conservative [`SourceAdmissionOptions`] defaults.
+pub fn admit_source(
+    path: &str,
+    tp: usize,
+    pp: usize,
+    request: KvBackendRequest,
+    draft_path: Option<&str>,
+    gpu_arch: &str,
+    vision: Option<&str>,
+    // Resolved `vision.mode` (`off`/`auto`/`on`) — gates `.vl` sibling
+    // discovery in the carrier. `off` = never probe a sibling.
+    vision_mode: &str,
+    head: Option<&str>,
+    max_seq: usize,
+    hints: KvBackendHints<'_>,
+) -> Result<SourceAdmission, String> {
+    admit_source_with_options(
+        path,
+        tp,
+        pp,
+        request,
+        draft_path,
+        gpu_arch,
+        vision,
+        vision_mode,
+        head,
+        max_seq,
+        hints,
+        SourceAdmissionOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn admit_source_with_options(
+    path: &str,
+    tp: usize,
+    pp: usize,
+    request: KvBackendRequest,
+    draft_path: Option<&str>,
+    gpu_arch: &str,
+    vision: Option<&str>,
+    // Resolved `vision.mode` (`off`/`auto`/`on`), as in [`admit_source`].
+    vision_mode: &str,
+    head: Option<&str>,
+    max_seq: usize,
+    hints: KvBackendHints<'_>,
+    options: SourceAdmissionOptions,
+) -> Result<SourceAdmission, String> {
+    // #666 G2: zero parallel degrees are never servable (see the geometry
+    // gates above) and previously collapsed silently into `Single`, hiding
+    // a meaningless request. Refuse before the source is even opened.
+    if pp == 0 {
+        return Err(pp_geometry_refusal(pp, None, None).expect("pp=0 always refuses"));
+    }
+    if tp == 0 {
+        return Err(tp_geometry_refusal(tp, None).expect("tp=0 always refuses"));
+    }
+    let mut source = ModelSource::from_path(path)?;
+    let arch_id = source
+        .arch_id()
+        .ok_or_else(|| format!("unrecognized source: {}", source.describe()))?;
+    let is_dir = source.is_dir();
+
+    // FLUX/Klein need gfx11 wave32 WMMA (the trunk GEMM and vtk/v2 use the
+    // gfx11 WMMA intrinsic hipcc rejects on gfx12). Refuse here — before the
+    // topology branch and any allocation — so the prior model stays loaded.
+    if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
+        return Err(refusal);
+    }
+    // An omitted (automatic) Qwen4 request gets the default context; explicit
+    // values are checked against QWEN4_MAX_CONTEXT below.
+    let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 {
+        hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
+    } else {
+        max_seq
+    };
+
+    let mut qwen35_ep_experts = None;
+    let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
+        // Arch 16 is an executable local-path carrier, but only after its
+        // complete source-only boundary succeeds. Keep this before vision/head
+        // handling so every refusal remains pre-allocation.
+        if max_seq > hipfire_arch_qwen4::QWEN4_MAX_CONTEXT {
+            return Err(format!(
+                "qwen4: max_seq {max_seq} exceeds the admitted context limit {}",
+                hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
+            ));
+        }
+        hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
+        let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
+        crate::carrier_for(arch_id)
+            .ok_or_else(|| "no carrier for qwen4".to_string())?
+            .admit_options(draft_path, options)?;
+        admit_qwen4_source(
+            &source,
+            hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
+            InputModality::Text,
+            native_mtp,
+        )?;
+        (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
+    } else if tp > 1 {
+        // Expert-parallel admission (HFQ-only). Mirrors
+        // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
+        // refusal: DeepSeek V4 (9) serves vmm by design; Qwen3.5-MoE (5|6)
+        // and MiniMax (10) refuse it (replicated-KV EP has no VMM path).
+        if is_dir {
+            return Err(
+                "EP not supported for safetensors directory sources (load as a single HFQ file)"
+                    .into(),
+            );
+        }
+        if !matches!(arch_id, 5 | 6 | 9 | 10) {
+            return Err(format!(
+                "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
+            ));
+        }
+        // Qwen3.5 density probe (HFQ-only past the `is_dir` refusal above, so
+        // the destructure is infallible): dense (`num_experts == 0`) runs the
+        // dense-TP path with one VMM arena per rank device, so the MoE/EP VMM
+        // refusal below does not apply to it. Parsed once here; the MoE
+        // topology gate below reuses it instead of re-opening the source.
+        let qwen35_num_experts: Option<usize> = if matches!(arch_id, 5 | 6) {
+            let ModelSource::Hfq(hfq) = &source else {
+                return Err("EP qwen35 requires an HFQ source".to_string());
+            };
+            Some(
+                hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+                    .map_err(|e| format!("qwen35 config: {e}"))?
+                    .num_experts,
+            )
+        } else {
+            None
+        };
+        qwen35_ep_experts = qwen35_num_experts;
+        // #666 G2: refuse an unsatisfiable rank count before any teardown or
+        // GPU init (`init_ep` needs one device per rank). Runs after the
+        // arch/VMM refusals above so their messages are unchanged.
+        if let Some(refusal) = tp_geometry_refusal(tp, visible_device_count()) {
+            return Err(refusal);
+        }
+        // Qwen3.5 MoE EP topology gate: admit tp=2|4 where the sealed
+        // per-rank loader admits (experts divide evenly), using the loader's
+        // established predicate and exact error text. Runs after the
+        // arch/VMM/geometry refusals above so their messages are unchanged.
+        // Dense Qwen3.5 (num_experts == 0) is unaffected. Must stay paired
+        // with the loader backstop text.
+        if let Some(num_experts) = qwen35_num_experts {
+            if let Some(refusal) = crate::qwen35_ep_moe_topology_refusal(arch_id, num_experts, tp) {
+                return Err(refusal);
+            }
+        }
+        (EffectiveTopology::Expert(tp), None)
+    } else {
+        // Single / pipeline-parallel via the carrier registry.
+        let carrier = resolve_carrier(&source)?;
+        // Selection follows topology validation; unsupported automatic requests
+        // fall back rather than making a non-Qwen source unloadable.
+        // #666 G2: refuse an impossible pipeline degree before any teardown
+        // (`init_uniform` would fail `n_layers < n_devices` deep in GPU init
+        // with the resident model already gone). Runs after the carrier's
+        // own topology refusal so currently-refused archs keep their message;
+        // only sources that would otherwise proceed to GPU init reach this.
+        if let Some(refusal) =
+            pp_geometry_refusal(pp, source_n_layers(&source), visible_device_count())
+        {
+            return Err(refusal);
+        }
+        let topology = if pp > 1 {
+            EffectiveTopology::Pipeline(pp)
+        } else {
+            EffectiveTopology::Single
+        };
+        (topology, Some(carrier))
+    };
+    // Partial GPU offload (#793): only the single-GPU dense Qwen3.5 loader
+    // places layers in host RAM. Refuse a budget that would spill under tp>1,
+    // pp>1 or on a MoE model before any teardown. Unset budget: no parse.
+    if matches!(arch_id, 5 | 6)
+        && hipfire_config::memory::gpu_layer_budget()
+            != hipfire_config::memory::GpuLayerBudget::Full
+    {
+        if let ModelSource::Hfq(hfq) = &source {
+            let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+                .map_err(|e| format!("qwen35 config: {e}"))?;
+            if let Some(refusal) =
+                hipfire_arch_qwen35::qwen35::offload_topology_refusal(&config, tp, pp)
+            {
+                return Err(refusal);
+            }
+        }
+    }
+    let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
+    let unsupported = if heterogeneous_reason {
+        Some(
+            "heterogeneous DeepSeek compressor owner uses a dense gfx1100 cache with no VMM layout"
+                .to_string(),
+        )
+    } else if !hints.vmm_runtime_available {
+        Some("HIP VMM symbols/granularity unavailable".to_string())
+    } else if cfg!(windows) {
+        Some("Windows VMM mapping/graph semantics are not certified".to_string())
+    } else if gpu_arch != "gfx1201"
+        && !(matches!(gpu_arch, "gfx1100" | "gfx1151")
+            && matches!(arch_id, 5 | 6)
+            && matches!(
+                hints
+                    .kv_mode
+                    .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str())
+                    .trim(),
+                "" | "auto" | "q8"
+            ))
+    {
+        Some(format!(
+            "device {gpu_arch} has no certified VMM KV path for the selected mode"
+        ))
+    } else if pp > 1 {
+        Some("pipeline-parallel KV owner has no VMM layout".to_string())
+    } else if tp > 1 && (arch_id == 10 || qwen35_ep_experts.is_some_and(|n| n > 0)) {
+        Some("replicated-KV MoE/EP owner has no VMM layout".to_string())
+    } else if tp > 1 && arch_id == 9 {
+        Some("DeepSeek EP VMM requires every rank to have a validated VMM device".to_string())
+    } else if carrier.is_some_and(|c| !matches!(c.name(), "qwen35" | "deepseek4" | "muse_glimmer"))
+    {
+        Some(format!(
+            "carrier {} has no VMM KV owner",
+            carrier.unwrap().name()
+        ))
+    } else if arch_id == 14 && hints.cask.is_some_and(|c| c.sidecar.is_some()) {
+        Some("Muse Glimmer VMM does not support a CASK sidecar".to_string())
+    } else {
+        None
+    };
+    let (kv_backend, kv_backend_reason) = match (request, unsupported) {
+        (KvBackendRequest::Explicit(KvBackend::Legacy), _) => (KvBackend::Legacy, None),
+        (KvBackendRequest::Explicit(KvBackend::Vmm), Some(reason)) => {
+            return Err(format!("KV backend 'vmm' unsupported: {reason}; use --kv-backend legacy or a validated VMM source/device"));
+        }
+        (KvBackendRequest::Explicit(KvBackend::Vmm), None)
+        | (KvBackendRequest::Automatic, None) => (KvBackend::Vmm, None),
+        (KvBackendRequest::Automatic, Some(reason)) => (KvBackend::Legacy, Some(reason)),
+    };
+    if kv_backend == KvBackend::Legacy
+        && matches!(arch_id, 5 | 6)
+        && hints
+            .cask
+            .is_some_and(|c| c.sidecar.is_some() && c.handoff_tokens > 0)
+        && hints.kv_adaptive.is_some_and(|s| !matches!(s, "" | "off"))
+    {
+        return Err("kv_adaptive -> CASK handoff requires VMM; disable the sidecar/handoff or use a validated VMM device".into());
+    }
+    if let Some(carrier) = carrier {
+        carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
+    }
+    // The widened dense PBS ledger does not describe MoE scratch. Preserve
+    // the existing 32768 CLI/config default instead of refusing a Qwen MoE
+    // load or pretending its card capacity was measured.
+    let qwen_moe = if matches!(arch_id, 5 | 6)
+        && topology == EffectiveTopology::Single
+        && kv_backend == KvBackend::Vmm
+        && (hints.free_vram_bytes.is_some() || max_seq == 0)
+    {
+        if let ModelSource::Hfq(hfq) = &source {
+            hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+                .map_err(|e| format!("qwen35 config: {e}"))?
+                .num_experts
+                != 0
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let sequence = if matches!(arch_id, 5 | 6)
+        && topology == EffectiveTopology::Single
+        && kv_backend == KvBackend::Vmm
+        && !qwen_moe
+        && (hints.free_vram_bytes.is_some() || max_seq == 0)
+    {
+        Some(resolve_sequence(&source, max_seq, gpu_arch, hints)?)
+    } else {
+        None
+    };
+    let effective_seq = sequence.as_ref().map_or_else(
+        || {
+            if max_seq == 0 {
+                if qwen_moe {
+                    32768
+                } else {
+                    4096
+                }
+            } else {
+                max_seq
+            }
+        },
+        |resolved| resolved.max_seq,
+    );
+    let sequence_reason = (qwen_moe && max_seq == 0)
+        .then_some("max_seq auto-capacity unsupported for MoE; using prior default");
+    let mut has_vision = probe_vision(&source, arch_id)?;
+    // Shared tower sidecar (registry `vision` slot / `params.vision` /
+    // `HIPFIRE_VISION_SIDECAR`), validated fail-closed; a tower-bearing
+    // sidecar promotes a tower-less trunk to VL.
+    let vision_path = resolve_vision_sidecar(vision, arch_id, is_dir)?;
+    if vision_path.is_some() {
+        has_vision = true;
+    }
+    if let ModelSource::Hfq(hfq) = &source {
+        df_lash_lm_head_admission(hfq, draft_path, gpu_arch)?;
+        if draft_path.is_some() {
+            let mq3_supported = crate::is_dflash_lm_head_wmma_arch(gpu_arch) && arch_id == 5;
+            let unsupported = hfq
+                .first_tensor_with_quant_type(18)
+                .map(|name| ("MQ2 (qt=18)", name))
+                .or_else(|| {
+                    (!mq3_supported)
+                        .then(|| hfq.first_tensor_with_quant_type(17))
+                        .flatten()
+                        .map(|name| ("MQ3 (qt=17)", name))
+                });
+            if let Some((quant, tensor)) = unsupported {
+                return Err(format!(
+                    "DFlash draft requested but model contains {quant} weight `{tensor}` \
+                     without a supported batched verifier on {gpu_arch} (arch_id={arch_id}); \
+                     reload without a draft or use an MQ4/HFQ4/Q8 target"
+                ));
+            }
+        }
+        // Gemma 4 lowered min-context: refuse before teardown/alloc so a
+        // small max_seq leaves the prior model serving. Eager stays exempt.
+        if matches!(arch_id, 13 | 22) {
+            let use_lowered = hipfire_arch_gemma4::gemma4_source_uses_lowered(hfq, false);
+            hipfire_arch_gemma4::gemma4_context_admission(effective_seq, use_lowered)?;
+        }
+    }
+    // Head overlay (`params.head`): validated AND attached to the retained
+    // base here, so the admitted source is already effective and loading
+    // consumes it with no second open. Any refusal leaves the prior model
+    // loaded — the overlay is in-memory only; no GPU state is touched.
+    admit_head_overlay(head, &mut source, arch_id, topology)?;
+    // Split K/V is a Qwen-family contract, resolved before the daemon can
+    // unload the resident model. Non-Qwen owners retain their existing modes.
+    let k_axis = hints.kv_k.filter(|s| !s.is_empty());
+    let v_axis = hints.kv_v.filter(|s| !s.is_empty());
+    if !matches!(arch_id, 1 | 5 | 6) && (k_axis.is_some() || v_axis.is_some()) {
+        return Err(format!(
+            "--kv-k/--kv-v are Qwen-only (arch_id={arch_id}); use --kv-mode for this model"
+        ));
+    }
+    if matches!(arch_id, 1 | 5 | 6) {
+        use hipfire_runtime::kv_mode::{self, KvMode};
+        let policy = if arch_id == 1 {
+            &kv_mode::DIR_SAFETENSORS_POLICY
+        } else if tp > 1 {
+            &kv_mode::QWEN35_TP_POLICY
+        } else if pp > 1 {
+            &kv_mode::QWEN35_PP_POLICY
+        } else if is_dir {
+            &kv_mode::QWEN35_PARO_POLICY
+        } else {
+            &kv_mode::QWEN35_HFQ_POLICY
+        };
+        let mode = hints
+            .kv_mode
+            .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str())
+            .to_ascii_lowercase();
+        let qwen_cfg = if matches!(arch_id, 5 | 6) {
+            Some(
+                match &source {
+                    ModelSource::Hfq(h) => hipfire_arch_qwen35::qwen35::config_from_hfq(h),
+                    ModelSource::Dir(d) => hipfire_arch_qwen35::qwen35::config_from_safetensors(d),
+                }
+                .map_err(|e| format!("Qwen KV admission config: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
+        let native_eligible = qwen_cfg.as_ref().is_some_and(|cfg| {
+            kv_mode::qwen35_native_eligible(
+                gpu_arch,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                pp,
+                adaptive,
+                hints.cask.is_some_and(|c| c.sidecar.is_some()),
+            )
+        });
+        let policy = kv_mode::qwen35_policy_for_native(policy, &mode, native_eligible);
+        if adaptive && (k_axis.is_some() || v_axis.is_some()) {
+            return Err("adaptive Qwen KV cannot combine with fixed --kv-k/--kv-v; disable kv_adaptive or omit both axes".into());
+        }
+        let pair = kv_mode::resolve_kv_pair(
+            &mode,
+            k_axis,
+            v_axis,
+            &policy,
+            gpu_arch,
+            hints.qwen_default_q8,
+        )
+        .map_err(|e| format!("Qwen KV admission: {e}"))?;
+        let k = pair.k();
+        if (pp > 1 || tp > 1) && pair.v().is_some_and(|v| v != kv_mode::VMode::Q8) {
+            return Err(format!(
+                "Qwen {} has no multi-GPU Lloyd-V constructor; use --kv-v q8",
+                policy.site
+            ));
+        }
+        if tp > 1 && matches!(k, KvMode::Fp8 | KvMode::Bf16) {
+            return Err(
+                "Qwen native fp8/bf16 is single-GPU only; use --kv-mode q8 for TP/EP".into(),
+            );
+        }
+        if arch_id == 1 && matches!(k, KvMode::Asym3 | KvMode::Asym4) {
+            use hipfire_runtime::arch::Architecture;
+            let head_dim = match &source {
+                ModelSource::Hfq(h) => {
+                    <hipfire_arch_llama::Llama as Architecture>::config_from_hfq(h)
+                        .map_err(|e| format!("Qwen KV admission config: {e}"))?
+                        .head_dim
+                }
+                ModelSource::Dir(d) => {
+                    hipfire_runtime::hfq::config_from_safetensors_llama(d)
+                        .map_err(|e| format!("Qwen KV admission config: {e}"))?
+                        .head_dim
+                }
+            };
+            if head_dim != 256 {
+                return Err(format!(
+                    "Qwen legacy-asym K requires head_dim=256 (got {head_dim}); use --kv-mode q8"
+                ));
+            }
+        }
+        if let Some(cfg) = qwen_cfg.as_ref() {
+            if matches!(
+                k,
+                KvMode::Fp8 | KvMode::Bf16 | KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4
+            ) {
+                if matches!(k, KvMode::Fp8 | KvMode::Bf16) && !native_eligible {
+                    return Err(format!(
+                        "Qwen native KV requires exact gfx1201, H24/Hkv4/D256, single GPU and no CASK/adaptive (got {gpu_arch}, H{}/Hkv{}/D{}); use --kv-mode q8",
+                        cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
+                    ));
+                }
+                if matches!(k, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4) && cfg.head_dim != 256
+                {
+                    return Err(format!(
+                        "Qwen legacy-asym K requires head_dim=256 (got {}); use --kv-mode q8",
+                        cfg.head_dim
+                    ));
+                }
+            }
+        }
+        if !adaptive
+            && hints.cask.is_some_and(|c| c.sidecar.is_some())
+            && (matches!(k, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+                || pair.v().is_some_and(|v| v != kv_mode::VMode::Q8))
+        {
+            return Err("static CASK requires q8 or legacy-asym K with q8 V; use --kv-k legacy-asym3 --kv-v q8 or disable CASK".into());
+        }
+    }
+
+    Ok(SourceAdmission {
+        source,
+        arch_id,
+        is_dir,
+        has_vision,
+        topology,
+        kv_backend,
+        kv_backend_reason,
+        max_seq: effective_seq,
+        sequence,
+        sequence_reason,
+        kv_backend_request: request,
+        qwen_default_q8: hints.qwen_default_q8,
+        carrier,
+        vision_path,
+        vision_mode: vision_mode.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn admit_source(
+        path: &str,
+        tp: usize,
+        pp: usize,
+        raw: Option<&str>,
+        draft: Option<&str>,
+        arch: &str,
+        vision: Option<&str>,
+        vision_mode: &str,
+        head: Option<&str>,
+        max_seq: usize,
+    ) -> Result<SourceAdmission, String> {
+        super::admit_source(
+            path,
+            tp,
+            pp,
+            KvBackendRequest::from_override(raw)?,
+            draft,
+            arch,
+            vision,
+            vision_mode,
+            head,
+            max_seq,
+            KvBackendHints::without_device(),
+        )
+    }
+
+    /// Every Qwen3.5-family HF config embeds `vision_config` even for text-only
+    /// quantized artifacts (the 27B/A3B production files all do). The tower
+    /// tensor decides; config markers alone classify as the text backbone,
+    /// never refuse. This is the contract from remediation `179a20d7f`.
+    #[test]
+    fn qwen35_config_marker_without_tower_is_text() {
+        assert_eq!(classify_vision(5, false, true).unwrap(), false); // dense
+        assert_eq!(classify_vision(6, false, true).unwrap(), false); // MoE
+    }
+
+    #[test]
+    fn qwen35_tower_tensor_decides_vl() {
+        assert_eq!(classify_vision(5, true, false).unwrap(), true);
+        assert_eq!(classify_vision(6, true, false).unwrap(), true);
+    }
+
+    #[test]
+    fn lfm2_tower_without_config_refuses() {
+        assert!(classify_vision(11, true, false).is_err());
+    }
+
+    #[test]
+    fn lfm2_config_without_tower_is_text() {
+        assert_eq!(classify_vision(11, false, true).unwrap(), false);
+    }
+
+    #[test]
+    fn non_vision_archs_are_never_vl() {
+        for arch in [0u32, 1, 7, 9, 10, 22] {
+            assert_eq!(classify_vision(arch, true, true).unwrap(), false);
+        }
+    }
+
+    #[test]
+    fn qwen4_conditional_generation_without_vision_is_text_capable() {
+        assert_eq!(classify_vision(QWEN4_ARCH_ID, false, true).unwrap(), false);
+        assert!(classify_vision(QWEN4_ARCH_ID, true, false).is_err());
+    }
+
+    #[test]
+    fn qwen4_native_mtp_is_default_on_and_yields_to_retained_redline() {
+        let with = |mtp| SpecLoadCfg {
+            mtp,
+            ..SpecLoadCfg::default()
+        };
+        let (hfq, mq4r) = ("m/qwen3.8-flash-next.mq4", "m/qwen3.8-flash-next.mq4r");
+        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1), Ok(true));
+        assert_eq!(
+            qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1),
+            Ok(false)
+        );
+        assert_eq!(
+            qwen4_native_mtp(with(Some(true)), "gfx1151", hfq, 1, 1),
+            Ok(true)
+        );
+        // A `.mq4r` load on a retained-default GPU is the retained AR route.
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1),
+            Ok(false)
+        );
+        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1).is_err());
+        // Off the retained-default GPUs the name does not claim the load.
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn qwen4_host_mapped_experts_make_native_mtp_opt_in() {
+        let with = |mtp| SpecLoadCfg {
+            mtp,
+            ..SpecLoadCfg::default()
+        };
+        // Device-resident experts: the admitted head stays on under `auto`.
+        assert!(qwen4_mtp_with_host_mapped_experts(with(None), 0));
+        // Host-mapped experts: `auto` keeps AR, an explicit `on` keeps MTP.
+        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), 21));
+        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), 21));
+    }
+
+    mod qwen4_ddtree_admission {
+        use super::super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+        fn write_probe(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-qwen4-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            write_hfqm_package_mem(
+                &path,
+                QWEN4_ARCH_ID,
+                "{}",
+                &[HfqMemTensor {
+                    name: "model.embed_tokens.weight".into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    data: vec![0u8; 32],
+                }],
+            )
+            .unwrap();
+            path
+        }
+
+        fn cleanup(path: &std::path::Path) {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+
+        fn admit(
+            path: &std::path::Path,
+            spec: SpecLoadCfg,
+            kv_adaptive_override: Option<&str>,
+        ) -> Result<SourceAdmission, String> {
+            admit_source_with_options(
+                path.to_str().unwrap(),
+                1,
+                1,
+                KvBackendRequest::Automatic,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                None,
+                2048,
+                KvBackendHints::without_device(),
+                SourceAdmissionOptions {
+                    spec,
+                    kv_adaptive: qwen4_kv_adaptive_requested(kv_adaptive_override),
+                    ..Default::default()
+                },
+            )
+        }
+
+        #[test]
+        fn resolved_defaults_pass_source_gate_but_active_overrides_refuse() {
+            let path = write_probe("ddtree");
+            let defaults = SpecLoadCfg {
+                dflash: Some(false),
+                dspark: Some(false),
+                ngram_draft: Some(false),
+                ddtree_budget: Some(0),
+                ddtree_topk: Some(4),
+                mtp: Some(false),
+                ..SpecLoadCfg::default()
+            };
+            let err = admit(&path, defaults, Some("off"))
+                .map(|_| ())
+                .expect_err("minimal probe must fail later on invalid Qwen4 config");
+            assert!(
+                !err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                "resolved schema defaults must pass the DDTree source gate: {err}"
+            );
+            assert!(
+                err.contains("config admission failed"),
+                "defaults must reach Qwen4 config validation: {err}"
+            );
+
+            let active = SpecLoadCfg {
+                ddtree_budget: Some(1),
+                ddtree_topk: Some(4),
+                ..defaults
+            };
+            let err = admit(&path, active, Some("off"))
+                .map(|_| ())
+                .expect_err("active DDTree must refuse");
+            assert!(
+                err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                "active DDTree must be refused at source admission: {err}"
+            );
+
+            let nondefault_topk = SpecLoadCfg {
+                ddtree_budget: Some(0),
+                ddtree_topk: Some(5),
+                ..defaults
+            };
+            let err = admit(&path, nondefault_topk, Some("off"))
+                .map(|_| ())
+                .expect_err("non-default top-K must refuse");
+            assert!(
+                err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                "non-default DDTree top-K must be refused at source admission: {err}"
+            );
+
+            let err = admit(&path, defaults, Some("balanced"))
+                .map(|_| ())
+                .expect_err("active adaptive KV must refuse");
+            assert!(
+                err.contains("requested DFlash, DSpark, n-gram, DDTree, adaptive-KV"),
+                "active adaptive KV must be refused at source admission: {err}"
+            );
+            for (option, options) in [
+                (
+                    "PFlash",
+                    SourceAdmissionOptions {
+                        spec: defaults,
+                        pflash: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "EAGLE",
+                    SourceAdmissionOptions {
+                        spec: defaults,
+                        eagle_drafter: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "expert-count override",
+                    SourceAdmissionOptions {
+                        spec: defaults,
+                        expert_count_override: true,
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                let err = admit_source_with_options(
+                    path.to_str().unwrap(),
+                    1,
+                    1,
+                    KvBackendRequest::Automatic,
+                    None,
+                    "gfx1151",
+                    None,
+                    "auto",
+                    None,
+                    2048,
+                    KvBackendHints::without_device(),
+                    options,
+                )
+                .map(|_| ())
+                .expect_err(option);
+                assert!(
+                    err.contains("unsupported"),
+                    "{option} must refuse before config: {err}"
+                );
+            }
+            cleanup(&path);
+        }
+    }
+    #[test]
+    fn qwen4_request_refuses_image_video_and_non_single_before_source_access() {
+        let single = hipfire_arch_qwen4::EffectiveMesh::single();
+        assert!(qwen4_request_admission(single, InputModality::Text, true).is_ok());
+        assert!(qwen4_request_admission(single, InputModality::Text, false).is_ok());
+        assert!(qwen4_request_admission(single, InputModality::Image, true).is_err());
+        assert!(qwen4_request_admission(single, InputModality::Video, true).is_err());
+        assert!(qwen4_request_admission(
+            hipfire_arch_qwen4::EffectiveMesh::new(2, 1, 1),
+            InputModality::Text,
+            true
+        )
+        .is_err());
+    }
+
+    /// The EP VMM refusal is per-arch, mirroring `load_model_ep_with_kv_mode`:
+    /// Qwen3.5 (5|6) and MiniMax (10) refuse `vmm`; DeepSeek V4 (9) serves it.
+    /// A blanket gate here would refuse the DS4 EP + vmm load master serves.
+    #[test]
+    fn backend_request_preserves_explicit_opt_out() {
+        assert_eq!(
+            KvBackendRequest::from_override(None).unwrap(),
+            KvBackendRequest::Automatic
+        );
+        assert_eq!(
+            KvBackendRequest::from_override(Some("legacy")).unwrap(),
+            KvBackendRequest::Explicit(KvBackend::Legacy)
+        );
+        assert_eq!(
+            KvBackendRequest::from_override(Some("vmm")).unwrap(),
+            KvBackendRequest::Explicit(KvBackend::Vmm)
+        );
+        let migration = KvBackendRequest::from_override(Some("contiguous")).unwrap_err();
+        assert!(migration.contains("legacy"), "{migration}");
+        assert!(KvBackendRequest::from_override(Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn legacy_warning_discloses_provenance() {
+        assert!(legacy_warning(KvBackend::Vmm, None).is_none());
+        let automatic =
+            legacy_warning(KvBackend::Legacy, Some("device gfx942 unsupported")).unwrap();
+        assert!(automatic.contains("HIPFIRE_KV_BACKEND=legacy"));
+        assert!(
+            automatic.contains("automatic VMM selection unavailable (device gfx942 unsupported)")
+        );
+        let explicit = legacy_warning(KvBackend::Legacy, None).unwrap();
+        assert!(explicit.contains("HIPFIRE_KV_BACKEND=legacy"));
+        assert!(explicit.contains("explicitly selected"));
+        assert!(!explicit.contains("unavailable"));
+    }
+
+    /// FLUX/Klein admit exactly the gfx11 wave32 WMMA set: gfx1201 (and any
+    /// non-gfx11 arch) refuses with the RDNA3/3.5 remedy before any
+    /// allocation; gfx1100/gfx1151 admit; non-diffusion archs are untouched.
+    #[test]
+    fn flux_arch_refusal_is_gfx11_only() {
+        for arch_id in [40u32, 45] {
+            let err = flux_arch_refusal(arch_id, "gfx1201")
+                .expect("gfx1201 FLUX/Klein must refuse at admission");
+            assert!(err.contains("RDNA3/3.5"), "reason names remedy: {err}");
+            assert!(err.contains("gfx11 wave32 WMMA"), "reason: {err}");
+            assert!(err.contains("gfx1201"), "reason names detected arch: {err}");
+            assert!(err.contains("IMAGEGEN.md"), "reason: {err}");
+            assert!(flux_arch_refusal(arch_id, "gfx1200").is_some());
+            assert_eq!(flux_arch_refusal(arch_id, "gfx1100"), None);
+            assert_eq!(flux_arch_refusal(arch_id, "gfx1151"), None);
+        }
+        // Non-diffusion archs never hit this gate, on any arch string.
+        assert_eq!(flux_arch_refusal(5, "gfx1201"), None);
+        assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
+    }
+
+    /// #666 G2 geometry gates: the metadata probe reads the HF `{config}`
+    /// envelope every pp-capable source carries, and fails open (`None`) on
+    /// sources with no layer key rather than refusing a servable load.
+    #[test]
+    fn metadata_probe_reads_layer_keys() {
+        let enveloped = r#"{"config":{"num_hidden_layers":64}}"#;
+        assert_eq!(n_layers_from_metadata_json(enveloped), Some(64));
+        // Composite checkpoints nest the trunk under `text_config` (the
+        // production qwen3.8 envelope); the nested node wins.
+        assert_eq!(
+            n_layers_from_metadata_json(
+                r#"{"config":{"text_config":{"num_hidden_layers":64},"vision_config":{}}}"#
+            ),
+            Some(64)
+        );
+        assert_eq!(
+            n_layers_from_metadata_json(r#"{"config":{"n_layers":32}}"#),
+            Some(32)
+        );
+        // Flat (unenveloped) metadata and zero layers fail open, not refused.
+        assert_eq!(
+            n_layers_from_metadata_json(r#"{"num_hidden_layers":12}"#),
+            Some(12)
+        );
+        assert_eq!(n_layers_from_metadata_json("{}"), None);
+        assert_eq!(
+            n_layers_from_metadata_json(r#"{"config":{"num_hidden_layers":0}}"#),
+            None
+        );
+        assert_eq!(n_layers_from_metadata_json("not json"), None);
+    }
+
+    /// `pp` geometry mirrors `Gpus::init_uniform`'s deep invariants
+    /// (`n_devices >= 1`, `n_layers >= n_devices`): pp=99 on a 64-layer
+    /// source refuses naming `init_uniform`; pp=1 (the default) and any
+    /// servable degree pass; unknown geometry fails open.
+    #[test]
+    fn pp_geometry_mirrors_init_uniform() {
+        let err_zero = pp_geometry_refusal(0, Some(64), Some(4)).expect("pp=0 refuses");
+        assert!(err_zero.contains("pp=0"), "reason: {err_zero}");
+        assert!(
+            err_zero.contains("init_uniform"),
+            "names deep site: {err_zero}"
+        );
+        let err = pp_geometry_refusal(99, Some(64), Some(4)).expect("pp=99 refuses");
+        assert!(err.contains("pp=99"), "reason: {err}");
+        assert!(err.contains("n_layers=64"), "reason: {err}");
+        assert!(err.contains("init_uniform"), "names deep site: {err}");
+        let err = pp_geometry_refusal(8, Some(64), Some(4)).expect("pp=8 > 4 devices");
+        assert!(err.contains("device count=4"), "reason: {err}");
+        // Servable degrees pass untouched.
+        assert_eq!(pp_geometry_refusal(1, Some(64), Some(4)), None);
+        assert_eq!(pp_geometry_refusal(4, Some(64), Some(4)), None);
+        assert_eq!(pp_geometry_refusal(64, Some(64), Some(64)), None);
+        // Unknown geometry fails open — the deep check stays last-resort.
+        assert_eq!(pp_geometry_refusal(99, None, None), None);
+        assert_eq!(pp_geometry_refusal(1, None, None), None);
+    }
+
+    /// `tp` geometry mirrors `init_tp`/`init_ep`: no layer bound (every rank
+    /// runs every layer), only the zero degree and the device count.
+    #[test]
+    fn tp_geometry_checks_degree_and_devices_only() {
+        let err_zero = tp_geometry_refusal(0, Some(4)).expect("tp=0 refuses");
+        assert!(err_zero.contains("tp=0"), "reason: {err_zero}");
+        assert!(err_zero.contains("init_ep"), "names deep site: {err_zero}");
+        let err = tp_geometry_refusal(99, Some(4)).expect("tp=99 refuses");
+        assert!(err.contains("tp=99"), "reason: {err}");
+        assert!(err.contains("device count=4"), "reason: {err}");
+        assert_eq!(tp_geometry_refusal(1, Some(4)), None);
+        assert_eq!(tp_geometry_refusal(4, Some(4)), None);
+        assert_eq!(tp_geometry_refusal(99, None), None);
+    }
+
+    /// Device-list counting follows the comma-separated convention shared by
+    /// `hardware.devices` and the visibility envs.
+    #[test]
+    fn device_list_counting() {
+        assert_eq!(count_device_list("0,1,2,3"), 4);
+        assert_eq!(count_device_list("0"), 1);
+        assert_eq!(count_device_list(" 0, 1 ,,"), 2);
+        assert_eq!(count_device_list(""), 0);
+    }
+
+    /// Vision-sidecar fixtures: minimal HFQ files via the in-memory writer.
+    /// The trunk is a tower-less arch-5 text pack; the sidecar carries just
+    /// the probe tensor. Admission is read-only — no GPU needed.
+    mod vision_sidecar {
+        use super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+        fn write_hfq(name: &str, arch_id: u32, with_tower: bool) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-vision-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            let mut tensors = vec![HfqMemTensor {
+                name: "model.embed_tokens.weight".into(),
+                quant_type: 1,
+                shape: vec![4, 4],
+                group_size: 0,
+                data: vec![0u8; 32],
+            }];
+            if with_tower {
+                tensors.push(HfqMemTensor {
+                    name: super::super::VISION_PROBE_TENSOR.into(),
+                    quant_type: 1,
+                    shape: vec![4, 4],
+                    group_size: 0,
+                    data: vec![0u8; 32],
+                });
+            }
+            let metadata = if arch_id == 5 {
+                r#"{"config":{"text_config":{"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":4,"vocab_size":1000,"max_position_embeddings":131072}}}"#
+            } else {
+                "{}"
+            };
+            write_hfqm_package_mem(&path, arch_id, metadata, &tensors).unwrap();
+            path
+        }
+
+        fn cleanup(path: &std::path::Path) {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+
+        /// Tower-less trunk + tower-bearing sidecar admits as VL on qwen35.
+        #[test]
+        fn sidecar_promotes_tower_less_trunk_to_vl() {
+            let trunk = write_hfq("a-trunk", 5, false);
+            let sidecar = write_hfq("a-sidecar", 5, true);
+            let admitted = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .expect("tower sidecar must admit");
+            assert!(admitted.has_vision, "sidecar tower promotes trunk to VL");
+            assert_eq!(admitted.vision_path, Some(sidecar.clone()));
+            assert!(
+                admitted.carrier.is_some_and(|c| c.name() == "qwen35"),
+                "trunk still routes to qwen35"
+            );
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+
+        /// A sidecar without the tower tensor refuses with the pack remedy.
+        #[test]
+        fn sidecar_without_tower_refuses() {
+            let trunk = write_hfq("b-trunk", 5, false);
+            let sidecar = write_hfq("b-sidecar", 5, false);
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("tower-less sidecar must refuse");
+            assert!(err.contains("no vision tower tensor"), "remedy: {err}");
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+
+        /// A sidecar stamped with the wrong arch refuses.
+        #[test]
+        fn sidecar_with_wrong_arch_refuses() {
+            let trunk = write_hfq("c-trunk", 5, false);
+            let sidecar = write_hfq("c-sidecar", 9, true);
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("wrong-arch sidecar must refuse");
+            assert!(err.contains("arch_id=9"), "names the sidecar arch: {err}");
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+        #[test]
+        fn automatic_backend_resolves_by_capability_not_source_spelling() {
+            let trunk = write_hfq("kv-request", 5, false);
+            let path = trunk.to_str().unwrap();
+            let hints = KvBackendHints {
+                kv_mode: Some("q8"),
+                kv_k: None,
+                kv_v: None,
+                qwen_default_q8: true,
+                kv_adaptive: None,
+                cask: None,
+                deepseek4_heterogeneous: false,
+                vmm_runtime_available: true,
+                free_vram_bytes: None,
+            };
+            let admit = |request, arch| {
+                super::super::admit_source(
+                    path, 1, 1, request, None, arch, None, "auto", None, 4096, hints,
+                )
+            };
+            let auto = admit(KvBackendRequest::Automatic, "gfx1201").unwrap();
+            assert_eq!(auto.kv_backend, KvBackend::Vmm);
+            assert!(auto.kv_backend_reason.is_none());
+            let explicit = admit(KvBackendRequest::Explicit(KvBackend::Legacy), "gfx1201").unwrap();
+            assert_eq!(explicit.kv_backend, KvBackend::Legacy);
+            assert!(explicit.kv_backend_reason.is_none());
+            let unsupported = admit(KvBackendRequest::Automatic, "gfx940").unwrap();
+            assert_eq!(unsupported.kv_backend, KvBackend::Legacy);
+            assert!(unsupported.kv_backend_reason.unwrap().contains("gfx940"));
+            let error = admit(KvBackendRequest::Explicit(KvBackend::Vmm), "gfx940")
+                .map(|_| ())
+                .unwrap_err();
+            assert!(error.contains("gfx940") && error.contains("legacy"));
+            cleanup(&trunk);
+        }
+        #[test]
+        fn moe_preserves_legacy_context_when_dense_capacity_is_unknown() {
+            let path = write_hfq("moe-capacity", 6, false);
+            let metadata = r#"{"config":{"text_config":{"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":4,"vocab_size":1000,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":1024,"max_position_embeddings":131072}}}"#;
+            let embedding = HfqMemTensor {
+                name: "model.embed_tokens.weight".into(),
+                quant_type: 1,
+                shape: vec![4, 4],
+                group_size: 0,
+                data: vec![0u8; 32],
+            };
+            write_hfqm_package_mem(&path, 6, metadata, &[embedding]).unwrap();
+            let hints = KvBackendHints {
+                kv_mode: Some("q8"),
+                kv_k: None,
+                kv_v: None,
+                qwen_default_q8: true,
+                kv_adaptive: None,
+                cask: None,
+                deepseek4_heterogeneous: false,
+                vmm_runtime_available: true,
+                free_vram_bytes: Some(24 << 30),
+            };
+            let omitted = super::super::admit_source(
+                path.to_str().unwrap(),
+                1,
+                1,
+                KvBackendRequest::Automatic,
+                None,
+                "gfx1100",
+                None,
+                "auto",
+                None,
+                0,
+                hints,
+            )
+            .expect("MoE omission should not require dense PBS accounting");
+            assert_eq!(omitted.max_seq, 32768);
+            assert_eq!(omitted.kv_backend, KvBackend::Vmm);
+            assert!(omitted.sequence_reason.is_some());
+            let explicit = super::super::admit_source(
+                path.to_str().unwrap(),
+                1,
+                1,
+                KvBackendRequest::Automatic,
+                None,
+                "gfx1100",
+                None,
+                "auto",
+                None,
+                50000,
+                hints,
+            )
+            .expect("explicit MoE max_seq must remain authoritative");
+            assert_eq!(explicit.max_seq, 50000);
+            assert!(explicit.sequence_reason.is_none());
+            cleanup(&path);
+        }
+    }
+    mod head_overlay {
+        use super::*;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+
+        fn write_tensors(
+            name: &str,
+            arch_id: u32,
+            specs: &[(&str, u8, Vec<u32>, Vec<u8>)],
+        ) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-head-admit-{}-{}",
+                std::process::id(),
+                name
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.hfq"));
+            let tensors: Vec<HfqMemTensor> = specs
+                .iter()
+                .map(|(n, qt, shape, data)| HfqMemTensor {
+                    name: (*n).into(),
+                    quant_type: *qt,
+                    shape: shape.clone(),
+                    group_size: 0,
+                    data: data.clone(),
+                })
+                .collect();
+            write_hfqm_package_mem(&path, arch_id, "{}", &tensors).unwrap();
+            path
+        }
+
+        fn maple_trunk(name: &str) -> std::path::PathBuf {
+            write_tensors(
+                name,
+                15,
+                &[
+                    ("model.embed_tokens.weight", 1, vec![4, 4], vec![0u8; 32]),
+                    ("lm_head.weight", 3, vec![2, 4], vec![1u8; 32]),
+                ],
+            )
+        }
+
+        fn maple_head(name: &str, byte: u8) -> std::path::PathBuf {
+            write_tensors(
+                name,
+                15,
+                &[("lm_head.weight", 13, vec![2, 4], vec![byte; 32])],
+            )
+        }
+
+        fn cleanup(paths: &[std::path::PathBuf]) {
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_dir(path.parent().unwrap());
+            }
+        }
+
+        fn head_bytes(admitted: &SourceAdmission) -> Vec<u8> {
+            let ModelSource::Hfq(hfq) = &admitted.source else {
+                panic!("expected HFQ source");
+            };
+            hfq.tensor_data("lm_head.weight")
+                .map(|(_, d)| d.to_vec())
+                .expect(" admitted source must serve lm_head.weight")
+        }
+
+        /// A valid maple head admits and shadows the base head in the
+        /// retained source — loading consumes this, never reopens the file.
+        #[test]
+        fn head_on_maple_admits_and_shadows_base() {
+            let trunk = maple_trunk("d-trunk");
+            let head = maple_head("d-head", 7);
+            let admitted = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                Some(head.to_str().unwrap()),
+                4096,
+            )
+            .expect("valid maple head must admit");
+            assert!(
+                admitted.carrier.is_some_and(|c| c.name() == "maple"),
+                "trunk still routes to maple"
+            );
+            assert_eq!(
+                head_bytes(&admitted),
+                vec![7u8; 32],
+                "retained source serves the overlay head, not the base"
+            );
+            cleanup(&[trunk, head]);
+        }
+
+        /// Empty head string opts out exactly like vision/draft.
+        #[test]
+        fn empty_head_string_is_unset() {
+            let trunk = maple_trunk("e-trunk");
+            let admitted = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                Some(""),
+                4096,
+            )
+            .expect("empty head must admit as unset");
+            assert_eq!(
+                head_bytes(&admitted),
+                vec![1u8; 32],
+                "unset head serves the baked base head"
+            );
+            cleanup(&[trunk]);
+        }
+
+        /// A head on a non-Maple trunk refuses instead of being ignored.
+        #[test]
+        fn head_on_non_maple_refuses() {
+            let trunk = write_tensors(
+                "f-trunk",
+                5,
+                &[
+                    ("model.embed_tokens.weight", 1, vec![4, 4], vec![0u8; 32]),
+                    ("lm_head.weight", 3, vec![2, 4], vec![1u8; 32]),
+                ],
+            );
+            let head = maple_head("f-head", 7);
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                Some(head.to_str().unwrap()),
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("non-maple head must refuse");
+            assert!(err.contains("only serve Maple"), "refusal: {err}");
+            cleanup(&[trunk, head]);
+        }
+
+        /// A head with expert-parallel topology refuses in preflight.
+        #[test]
+        fn head_on_ep_topology_refuses() {
+            let trunk = maple_trunk("g-trunk");
+            let mut base = ModelSource::from_path(trunk.to_str().unwrap()).expect("open trunk");
+            let err = super::super::admit_head_overlay(
+                Some("g-head"),
+                &mut base,
+                15,
+                EffectiveTopology::Expert(2),
+            )
+            .expect_err("EP head must refuse");
+            assert!(err.contains("single-device"), "refusal: {err}");
+            cleanup(&[trunk]);
+        }
+
+        /// A head cannot stack on an installed REAP overlay (single slot).
+        #[test]
+        fn head_with_reap_overlay_refuses() {
+            let trunk = maple_trunk("h-trunk");
+            let plan = std::env::temp_dir()
+                .join(format!("hipfire-head-admit-{}-h-plan", std::process::id()));
+            std::fs::create_dir_all(&plan).unwrap();
+            // Install a REAP overlay through the injected plan (deterministic:
+            // no process-config snapshot involved).
+            let plan_file = plan.join("overlay.hfq");
+            let staged = write_tensors(
+                "h-ov",
+                15,
+                &[("lm_head.weight", 8, vec![2, 4], vec![9u8; 32])],
+            );
+            std::fs::rename(&staged, &plan_file).unwrap();
+            let head = maple_head("h-head", 7);
+            let base = HfqFile::open_with_reap_plan(&trunk, Some(&plan)).expect("open trunk");
+            assert!(base.has_overlay(), "REAP overlay must install");
+            let mut source = ModelSource::Hfq(base);
+            let err = super::super::admit_head_overlay(
+                Some(head.to_str().unwrap()),
+                &mut source,
+                15,
+                EffectiveTopology::Single,
+            )
+            .expect_err("REAP+head must refuse");
+            assert!(err.contains("REAP"), "refusal: {err}");
+            cleanup(&[trunk, head, plan_file, staged]);
+            let _ = std::fs::remove_dir(&plan);
+        }
+
+        /// A truncated head (valid header/index, short payload) refuses.
+        #[test]
+        fn truncated_head_refuses() {
+            let trunk = maple_trunk("i-trunk");
+            let head = maple_head("i-head", 7);
+            let len = std::fs::metadata(&head).unwrap().len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&head)
+                .unwrap()
+                .set_len(len - 10)
+                .unwrap();
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                Some(head.to_str().unwrap()),
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("truncated head must refuse");
+            assert!(err.contains("truncated"), "refusal: {err}");
+            cleanup(&[trunk, head]);
+        }
+
+        /// A head stamped for another arch refuses.
+        #[test]
+        fn head_with_wrong_arch_refuses() {
+            let trunk = maple_trunk("j-trunk");
+            let head = write_tensors(
+                "j-head",
+                9,
+                &[("lm_head.weight", 13, vec![2, 4], vec![7u8; 32])],
+            );
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                Some(head.to_str().unwrap()),
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("wrong-arch head must refuse");
+            assert!(err.contains("arch_id"), "refusal: {err}");
+            cleanup(&[trunk, head]);
+        }
+
+        /// A full model passed as --head refuses (single-tensor guard).
+        #[test]
+        fn full_model_as_head_refuses() {
+            let trunk = maple_trunk("k-trunk");
+            let head = write_tensors(
+                "k-head",
+                15,
+                &[
+                    ("model.embed_tokens.weight", 1, vec![4, 4], vec![0u8; 32]),
+                    ("lm_head.weight", 13, vec![2, 4], vec![7u8; 32]),
+                ],
+            );
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1151",
+                None,
+                "auto",
+                Some(head.to_str().unwrap()),
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("full model as head must refuse");
+            assert!(err.contains("expected only"), "refusal: {err}");
+            cleanup(&[trunk, head]);
+        }
+    }
+}

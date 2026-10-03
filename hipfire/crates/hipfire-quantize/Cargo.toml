@@ -1,0 +1,82 @@
+[package]
+name = "hipfire-quantize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+faer = { version = "0.24", default-features = false, features = ["rayon", "std"] }
+libloading = { workspace = true }
+memmap2.workspace = true
+safetensors.workspace = true
+half.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+byteorder = "1"
+rayon = "1"
+parking_lot = "0.12"
+libc = "0.2"
+hipfire-reap = { path = "../hipfire-reap" }
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
+rdna-compute = { path = "../rdna-compute" }
+ureq = "3"
+
+[dev-dependencies]
+tempfile = "3"
+# CPU-only reader for the overlay round-trip test: HfqFile parses the .hfq
+# container header/index by name without touching the GPU (builds on CPU).
+# hipfire-quantize is a binary crate (no lib target), so the overlay
+# integration test lives in-module in reap_overlay.rs (it needs crate-internal
+# write_hfq / quantize_* access that a tests/ target can't reach).
+hipfire-runtime = { path = "../hipfire-runtime" }
+# Test-only: parse `config_json_from_gguf` output through the REAL gemma4
+# loader parser (Gemma4Config::from_metadata_json) — the config-emission /
+# loader-admission boundary is where the GGUF gemma4 gap sat.
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "deepseek4_dequant_check"
+required-features = ["lab"]
+
+[[example]]
+name = "mq35_vq_fit"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_composable_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_family_mse"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_kld_proxy"
+required-features = ["lab"]
+
+[[example]]
+name = "poly_fit"
+required-features = ["lab"]

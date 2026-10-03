@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Single source of truth for `model_type` / `general.architecture` → `arch_id`.
+//!
+//! Why this table exists: three independent `model_type -> arch_id` maps
+//! drifted (safetensors_source.rs, quantize/src/pipeline.rs,
+//! quantize/src/pipeline_gguf.rs). One silently defaulted to llama (0) on
+//! unknown input, another returned UNCLAIMED, the third lacked entries. This
+//! module is the sole authority; the other sites call [`lookup_model_type`].
+//!
+//! The numeric ids are the HFQ `arch_id` stamped into the file header and
+//! claimed by `Carrier::claims_arch_id`. Changing any assignment is a
+//! wire-format / routing break, so keep them byte-identical.
+
+/// Canonical executable `model_type` (HF) / `general.architecture` (GGUF) →
+/// `arch_id`.
+///
+/// Reserved source-only families live in [`RESERVED_MODEL_TYPE_TO_ARCH_ID`]
+/// instead of this executable registry. Keeping the tables separate lets
+/// source classification retain a reservation without making reset-core and
+/// carrier inventories pretend that a generation route exists.
+///
+/// Covers the union of every string previously recognised by executable
+/// consumers. Strings absent from both tables are *unknown* and must fail
+/// closed (not silently become llama 0). The qwen2 entry is intentionally
+/// `7` (Qwen2Carrier, loads Q/K/V biases); earlier `hipfire-quantize` builds
+/// mapped it to `1` (LLaMA) which dropped those biases — that was a bug and
+/// is corrected here. See `safetensors_source.rs` commit 9002d7f8b.
+///
+/// Sorted by `arch_id` then alphabetically for auditability.
+pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
+    // arch 0 — llama family
+    ("llama", 0),
+    ("mistral", 0),
+    // arch 1 — qwen3 (llama-family loader, no bias)
+    ("qwen3", 1),
+    // arch 5 — qwen3.5 dense (qwen3.5/qwen3.6 share the same loader, 5 dense / 6 MoE)
+    ("qwen3.5", 5),
+    ("qwen3.6", 5),
+    ("qwen35", 5),
+    ("qwen3_5", 5),
+    ("qwen3_5_text", 5),
+    ("qwen3_6", 5),
+    // arch 5 — ornith 1.5 dense (9B). Same loader as qwen3.5 dense (5); a3b MoE variant is 6.
+    ("ornith", 5),
+    ("ornith-1.5", 5),
+    ("ornith1.5", 5),
+    ("ornith_1.5", 5),
+    // arch 6 — qwen3.5 MoE (explicit model_type strings; the safetensors path also
+    // derives 6 from has_experts==true for the qwen3.5/3.6 family)
+    ("qwen3_5_moe", 6),
+    ("qwen3_5_moe_text", 6),
+    ("qwen3moe", 6),
+    // arch 6 — ornith 1.5 MoE (35B-A3B). Mirrors registry_gen arch_id_for ornith-1.5 + a3b.
+    ("ornith_moe", 6),
+    ("ornith-1.5_moe", 6),
+    ("ornith1.5_moe", 6),
+    ("ornith_1.5_moe", 6),
+    ("qwen2", 7),
+    // arch 8 — dots.ocr
+    ("dots_ocr", 8),
+    // arch 9 — deepseek_v4
+    ("deepseek_v4", 9),
+    // arch 10 — minimax_m2
+    ("minimax_m2", 10),
+    // arch 11 — lfm2 (dense) + lfm2_moe (MoE); both route to hipfire-arch-lfm2moe/11
+    ("lfm2", 11),
+    ("lfm2_moe", 11),
+    // lfm2_vl is the vision-language variant; it reuses the arch-11 text backbone
+    // (hipfire-arch-lfm2moe) plus an embedded SigLIP-2 vision tower + projector.
+    ("lfm2_vl", 11),
+    // arch 12 — cohere2_moe
+    ("cohere2_moe", 12),
+    // arch 13 — gemma4 family (dense + MoE unified; text decoder only). The
+    // four strings mirror pipeline.rs; gguf's old `starts_with("gemma4")`
+    // catch-all is intentionally replaced by this exact list so unknown
+    // `gemma4*` variants fail closed instead of silently becoming 13.
+    ("gemma4", 13),
+    ("gemma4_text", 13),
+    ("gemma4_unified", 13),
+    ("gemma4_unified_text", 13),
+    // arch 14 — muse_glimmer dense (52-layer + ViT)
+    ("muse_glimmer", 14),
+    ("muse_glimmer_text", 14),
+    // arch 15 — maple (Maple-Preview 20B-A1B, natively-ternary 256-expert MoE)
+    ("maple", 15),
+    // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
+    ("gemma4_unified_assistant", 22),
+    // arch 23 — muse_glimmer DFlash drafter
+    ("muse_glimmer_assistant", 23),
+    // arch 40 — flux MMDiT diffusion trunk (image-gen component block 40–47;
+    // high by design so the sequential primary range 17–19 stays free for
+    // future text arches; never a chat-serve trunk — see
+    // docs/architecture-ids.md § Image-generation component ids)
+    ("flux", 40),
+    // arch 45 — flux2 MMDiT diffusion trunk (FLUX.2 Klein; 44 is intentionally
+    // spare). The diffusers `_class_name` strings route through the same two
+    // keys: `derive_arch_id` matches the table as substrings with the longest
+    // key winning, so `Flux2Transformer2DModel` resolves to 45 via "flux2" and
+    // `FluxTransformer2DModel` to 40 via "flux".
+    ("flux2", 45),
+];
+/// Reserved source classifications with no executable carrier or reset owner.
+/// These strings remain accepted by [`lookup_model_type`] so packers and
+/// safetensors probing can preserve the wire id without publishing a route.
+pub const RESERVED_MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] =
+    &[("qwen4_exp", 16), ("qwen4_exp_text", 16)];
+
+/// Look up an `arch_id` for a `model_type` / GGUF `general.architecture`
+/// string, including reserved source-only classifications.
+///
+/// Returns `None` for unknown inputs — callers must fail closed (error naming
+/// the unrecognised string and listing `supported_model_types()`).
+pub fn lookup_model_type(model_type: &str) -> Option<u32> {
+    MODEL_TYPE_TO_ARCH_ID
+        .iter()
+        .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID)
+        .find_map(|(key, id)| (*key == model_type).then_some(*id))
+}
+
+/// Sorted list of every recognised executable or reserved source string, for
+/// error messages. Computed from both tables so they cannot drift.
+pub fn supported_model_types() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = MODEL_TYPE_TO_ARCH_ID
+        .iter()
+        .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID)
+        .map(|(key, _)| *key)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Human-readable, comma-joined list for `eprintln!` diagnostics.
+pub fn supported_model_types_display() -> String {
+    supported_model_types().join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lookup_model_type, MODEL_TYPE_TO_ARCH_ID, RESERVED_MODEL_TYPE_TO_ARCH_ID};
+
+    #[test]
+    fn qwen4_outer_and_text_model_types_share_reserved_architecture_id() {
+        assert_eq!(lookup_model_type("qwen4_exp"), Some(16));
+        assert_eq!(lookup_model_type("qwen4_exp_text"), Some(16));
+    }
+
+    #[test]
+    fn qwen4_is_reserved_and_not_in_executable_table() {
+        assert!(MODEL_TYPE_TO_ARCH_ID
+            .iter()
+            .all(|(model_type, _)| !model_type.starts_with("qwen4")));
+        assert_eq!(
+            RESERVED_MODEL_TYPE_TO_ARCH_ID,
+            &[("qwen4_exp", 16), ("qwen4_exp_text", 16)]
+        );
+    }
+
+    #[test]
+    fn qwen4_near_misses_fail_closed() {
+        assert_eq!(lookup_model_type("qwen4"), None);
+        assert_eq!(lookup_model_type("qwen4_exp_moe"), None);
+    }
+}
