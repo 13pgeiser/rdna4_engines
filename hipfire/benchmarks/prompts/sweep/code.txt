@@ -1,1 +1,0 @@
-Write a one-line Python function named square that returns n*n.

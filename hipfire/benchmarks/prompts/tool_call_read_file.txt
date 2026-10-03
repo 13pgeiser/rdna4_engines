@@ -1,1 +1,0 @@
-What does the file /tmp/fibonacci.c contain?

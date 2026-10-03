@@ -1,1 +1,0 @@
-: The architecture must match the target: DeepSeek V4 Flash or whatever the model card says. The device must be gfx942. The kernel path

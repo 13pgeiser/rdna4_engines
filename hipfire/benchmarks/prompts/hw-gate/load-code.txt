@@ -1,1 +1,0 @@
-Write a Python function that returns the longest substring of a string without repeating characters. Reply with only the code.
