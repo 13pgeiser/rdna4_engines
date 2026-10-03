@@ -8893,6 +8893,13 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "minimum": min,
             "maximum": max,
         }),
+        ValueRule::NullableIntegerOrAuto { min, max } => serde_json::json!({
+            "type": ["integer", "string", "null"],
+            "minimum": min,
+            "maximum": max,
+            "enum": ["auto"],
+            "nullable": true,
+        }),
         ValueRule::NullableFloat { min, max } => serde_json::json!({
             "type": ["number", "null"],
             "minimum": min,
@@ -8929,6 +8936,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
         ValueRule::NullableInteger { .. } => "integer|null",
+        ValueRule::NullableIntegerOrAuto { .. } => "integer|auto|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
         ValueRule::PassbackShare => "auto-or-share",
