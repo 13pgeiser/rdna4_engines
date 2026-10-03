@@ -1,0 +1,14488 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Native hipfire control plane.
+//!
+//! This binary owns hipfire's operator surface and never shells out to a
+//! JavaScript or TypeScript runtime.
+
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Args, Parser, Subcommand};
+use hipfire_client::{
+    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
+    OpenAiSseEvent,
+};
+use hipfire_config::{
+    apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
+    field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
+    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
+    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
+};
+use hipfire_registry::{
+    load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
+    Sidecar,
+};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::prompt_frame::ToolCall;
+use saddle_core::caps::ReasoningContract;
+use saddle_core::kv::KvBackend;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::OsString,
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+mod bench_concurrency;
+mod serve;
+mod kernel_pack;
+mod setup;
+use crate::serve::complete::next_attempt_id;
+use crate::serve::http::request_id;
+use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
+use setup::setup_command;
+
+pub(crate) const MODEL_SUFFIXES: &[&str] = &[
+    ".hf4",
+    ".hf6",
+    ".hfq",
+    ".mq2",
+    ".mq2lloyd",
+    // qt51 `MQ2G256LloydU` — the UNROTATED sibling of `.mq2lloyd` (qt19, which
+    // is FWHT-rotated). Deliberately NOT folded into `.mq2lloyd`: loading a
+    // rotated container as unrotated (or the reverse) does not fail loudly, it
+    // produces silent garbage, so the two must stay nameable apart.
+    ".mq2lloydu",
+    ".mq2r",
+    ".mq2rxt",
+    ".mq3",
+    ".mq3p",
+    ".mq4",
+    ".mq4p",
+    ".mq4r",
+    ".mq5",
+    ".mq6",
+    ".mfp4",
+    ".q8",
+];
+const BUILD_COMMIT: &str = env!("HIPFIRE_BUILD_COMMIT");
+const BUILD_REF: &str = env!("HIPFIRE_BUILD_REF");
+const BUILD_DIRTY: &str = env!("HIPFIRE_BUILD_DIRTY");
+const BUILD_TARGET: &str = env!("HIPFIRE_BUILD_TARGET");
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "hipfire",
+    version = env!("HIPFIRE_BUILD_VERSION"),
+    about = "LLM inference for AMD GPUs",
+    long_about = "Native Rust control plane for hipfire. Configuration, registry, model lifecycle, serving, chat, and diagnostics are implemented without a JavaScript runtime."
+)]
+pub(crate) struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum Commands {
+    Config(ConfigArgs),
+    /// Inspect or refresh the signed-model-registry migration surface.
+    Registry(RegistryArgs),
+    /// List local models and optionally the remote registry.
+    List(ListArgs),
+    /// Download and verify a registered model and its sidecars.
+    Pull(PullArgs),
+    /// Remove a local model and registered sidecars.
+    #[command(alias = "remove")]
+    Rm(RmArgs),
+    /// Launch the Rust terminal UI.
+    Tui(TuiArgs),
+    /// Report local GPU/runtime/model/control-plane readiness.
+    Diag(OutputArgs),
+    /// Show the native service process and loaded model.
+    Ps(OutputArgs),
+    /// Benchmark a model through the native daemon protocol.
+    Bench(BenchArgs),
+    /// Report compiled kernel inventory for the detected architecture.
+    Profile(ProfileArgs),
+    /// Print build, source-checkout, and installed-daemon identity.
+    Version(OutputArgs),
+    /// Update to a branch, tag, or commit and rebuild the native control plane.
+    Update(UpdateArgs),
+    /// Install or repair this machine's hipfire runtime.
+    Setup(SetupArgs),
+    /// Install a prebuilt release kernel pack (no device compiler needed).
+    KernelPack(KernelPackArgs),
+    /// Quantize a Hugging Face or local model with the Rust quantizer.
+    Quantize(QuantizeArgs),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
+    /// Deprecated (CASK; removal in 0.5.0): generate a TriAttention calibration sidecar.
+    SidecarGen(SidecarArgs),
+    /// Generate text through a fresh native daemon process.
+    Run(RunArgs),
+    /// Generate an image (txt2img) through a fresh native daemon process.
+    Img(ImgArgs),
+    /// Start an interactive conversation through the native HTTP service.
+    Chat(ChatArgs),
+    /// Start the native OpenAI-compatible HTTP service.
+    Serve(ServeArgs),
+    /// Stop a detached native serve process.
+    Stop(StopArgs),
+    /// Stop and start the native HTTP service.
+    Restart(ServeArgs),
+}
+
+#[derive(Args, Debug)]
+#[command(subcommand_precedence_over_arg = true)]
+struct ConfigArgs {
+    /// Optional model tag, alias, filename, or local catalog identity.
+    #[arg(value_name = "MODEL")]
+    model: Option<String>,
+    #[command(subcommand)]
+    action: Option<ConfigAction>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Print every effective key, its source, and override state.
+    List(OutputArgs),
+    /// Print one effective value.
+    Get {
+        key: String,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Persist one global user override to config.toml.
+    Set { key: String, value: String },
+    /// Remove one override, or all overrides when no key is supplied.
+    Reset { key: Option<String> },
+    /// Explain a key's type, scope, default, effective value, and provenance.
+    Explain {
+        key: String,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Print the authoritative typed configuration schema.
+    Schema(OutputArgs),
+    /// Convert legacy config.json to sparse config.toml without deleting JSON.
+    Migrate,
+    /// Select or create named configuration profiles.
+    Profile {
+        #[command(subcommand)]
+        action: Option<ConfigProfileAction>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigProfileAction {
+    /// Replace the global sparse config with a built-in or custom profile.
+    Set {
+        /// Built-in (`default`, `dev`, `hip`, `redline`) or custom profile name.
+        name: String,
+    },
+    /// Snapshot the current global sparse config as a new custom profile.
+    Create {
+        /// New custom profile name (not a built-in).
+        name: String,
+    },
+}
+
+#[derive(Args, Debug, Clone, Copy)]
+struct OutputArgs {
+    /// Emit machine-readable JSON.
+    #[arg(short, long)]
+    json: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct UpdateArgs {
+    /// Branch, tag, or commit to install. A leading '@' is optional.
+    #[arg(
+        value_name = "REF",
+        conflicts_with_all = ["branch", "tag", "commit"]
+    )]
+    reference: Option<String>,
+    /// Install the tip of a named remote branch.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["tag", "commit"])]
+    branch: Option<String>,
+    /// Install a named git tag in detached/pinned mode.
+    #[arg(long, value_name = "TAG", conflicts_with = "commit")]
+    tag: Option<String>,
+    /// Install an exact git commit in detached/pinned mode.
+    #[arg(long, value_name = "SHA")]
+    commit: Option<String>,
+}
+
+#[derive(Args, Debug, Default)]
+struct SetupArgs {
+    /// Source checkout to build from (set by scripts/install.sh).
+    #[arg(long, value_name = "PATH")]
+    source: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    rocm_root: Option<PathBuf>,
+    /// Explicit device compiler (hipcc/amdclang++) when it lives in a different
+    /// prefix than the runtime. Also set via HIPFIRE_HIPCC.
+    #[arg(long, value_name = "PATH")]
+    hipcc: Option<PathBuf>,
+    /// Disable cross-root compiler fallback; require the compiler under the
+    /// selected root. Also set via HIPFIRE_ROCM_STRICT=1.
+    #[arg(long)]
+    strict_rocm: bool,
+    #[arg(long, value_name = "ARCH")]
+    gpu_arch: Option<String>,
+    /// auto (default) leaves replay.backend=auto so .mq4r models select Redline.
+    #[arg(long, value_parser = ["auto", "hip", "redline"])]
+    profile: Option<String>,
+    #[arg(long, short = 'y', visible_alias = "non-interactive")]
+    yes: bool,
+    /// Requested revision ref forwarded by scripts/install.sh for install.json.
+    /// A tag-named ref also selects that release's kernel pack.
+    #[arg(
+        long = "ref",
+        value_name = "REF",
+        hide = true,
+        conflicts_with_all = ["branch", "tag", "commit"]
+    )]
+    reference: Option<String>,
+    /// Requested branch forwarded by scripts/install.sh for install.json.
+    #[arg(
+        long,
+        value_name = "NAME",
+        hide = true,
+        conflicts_with_all = ["tag", "commit"]
+    )]
+    branch: Option<String>,
+    /// Requested tag forwarded by scripts/install.sh for install.json; also
+    /// selects that release's prebuilt kernel pack.
+    #[arg(long, value_name = "TAG", hide = true, conflicts_with = "commit")]
+    tag: Option<String>,
+    /// Requested commit forwarded by scripts/install.sh for install.json.
+    #[arg(long, value_name = "SHA", hide = true)]
+    commit: Option<String>,
+    /// Compile kernels locally with hipcc even when a release kernel pack exists.
+    #[arg(long)]
+    compile_kernels: bool,
+    /// Directory or URL (https://, file://, or a path) holding the release
+    /// kernel pack assets. Default: the tag's GitHub release downloads.
+    #[arg(long, value_name = "URL")]
+    kernel_pack_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct KernelPackArgs {
+    #[command(subcommand)]
+    action: KernelPackAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum KernelPackAction {
+    /// Download, verify and install the pack for TAG and ARCH.
+    Install(KernelPackInstallArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct KernelPackInstallArgs {
+    /// Release tag whose pack to install.
+    #[arg(long)]
+    tag: String,
+    /// GPU architecture, e.g. gfx1201.
+    #[arg(long, value_name = "ARCH")]
+    arch: String,
+    /// Source checkout the installed daemon was built from; its HEAD must be
+    /// the pack's commit.
+    #[arg(long, value_name = "PATH")]
+    source: PathBuf,
+    /// Installed kernel directory to replace.
+    /// Default: ~/.hipfire/bin/kernels/compiled/ARCH.
+    #[arg(long, value_name = "DIR")]
+    dest: Option<PathBuf>,
+    /// Directory or URL holding the release assets. Default: the tag's GitHub release.
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    /// Local ROCm version checked against the pack's supported range.
+    /// Default: the resolved ROCm root's .info/version.
+    #[arg(long, value_name = "VERSION")]
+    rocm_version: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RevisionKind {
+    Auto,
+    Branch,
+    Tag,
+    Commit,
+}
+
+impl RevisionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "ref",
+            Self::Branch => "branch",
+            Self::Tag => "tag",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RevisionSelector {
+    value: String,
+    kind: RevisionKind,
+}
+
+#[derive(Debug)]
+struct ResolvedRevision {
+    selector: RevisionSelector,
+    commit: String,
+    tracking_ref: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct RegistryArgs {
+    #[command(subcommand)]
+    action: RegistryAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum RegistryAction {
+    /// Show registry source, revision, cache path, and warnings.
+    Status(OutputArgs),
+    /// List registered model tags.
+    List(OutputArgs),
+    /// Show one canonical registry entry.
+    Show {
+        tag: String,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Refresh the dynamic registry cache.
+    Update(OutputArgs),
+    /// Validate the bundled registry or an explicit v1 JSON file.
+    Verify {
+        path: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+}
+
+#[derive(Args, Debug)]
+struct ListArgs {
+    /// Include registry models that are not downloaded.
+    #[arg(short, long)]
+    remote: bool,
+    /// Emit machine-readable JSON.
+    #[arg(short, long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct PullArgs {
+    model: String,
+    /// Replace an existing target after downloading and verifying a new copy.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug)]
+struct RmArgs {
+    model: String,
+    /// Skip the interactive confirmation.
+    #[arg(short, long)]
+    yes: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct TuiArgs {
+    /// Arguments forwarded to hipfire-tui, such as --check.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    arguments: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct RunArgs {
+    /// Registry tag, local alias, filename, or model path.
+    model: String,
+    /// Prompt words. Quote the prompt to preserve exact whitespace.
+    #[arg(num_args = 0..)]
+    prompt: Vec<String>,
+    #[arg(short = 't', long)]
+    /// Sampling temperature in 0..=2.
+    temp: Option<f64>,
+    #[arg(long)]
+    /// Nucleus probability in (0, 1].
+    top_p: Option<f64>,
+    #[arg(long)]
+    /// Multiplicative repetition penalty.
+    repeat_penalty: Option<f64>,
+    #[arg(short = 'n', long)]
+    /// Maximum generated tokens.
+    max_tokens: Option<u64>,
+    #[arg(long)]
+    /// One-shot KV format override for this model load.
+    kv_mode: Option<String>,
+    #[arg(long = "kv-k")]
+    /// Qwen-only K-format override (e.g. `fwht3`, `q8`; `legacy-asymN`, `asymN`
+    /// and `turboN` are deprecated, removal in 0.5.0).
+    kv_k: Option<String>,
+    #[arg(long = "kv-v")]
+    /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
+    kv_v: Option<String>,
+    #[arg(long)]
+    /// Select a published lm_head variant (see the registry's `heads`), e.g.
+    /// `--head q4k`. The overlay shadows the model's own head at load time;
+    /// omitting this uses the head baked into the model file.
+    head: Option<String>,
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
+    /// One-shot KV storage backend override for this model load (`legacy` or `vmm`).
+    kv_backend: Option<String>,
+    /// Tensor/expert-parallel degree for this model load (same admission as `serve --tp` / `bench --tp`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    tp: Option<u64>,
+    /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
+    #[arg(long = "spec", alias = "speculation")]
+    speculation: Option<String>,
+    /// Explicit DFlash draft model.
+    #[arg(long, alias = "md")]
+    model_draft: Option<PathBuf>,
+    /// Explicit vision-tower sidecar (overrides the registry `vision` slot
+    /// and `HIPFIRE_VISION_SIDECAR`; skipped while `vision_mode=off`).
+    #[arg(long)]
+    vision: Option<PathBuf>,
+    /// Override the active MTP/n-gram draft window.
+    #[arg(long, alias = "draft")]
+    draft_max: Option<u64>,
+    /// DSpark confidence cutoff.
+    #[arg(long)]
+    dspark_conf_threshold: Option<f64>,
+    #[arg(long)]
+    /// Override the resolved system prompt.
+    system: Option<String>,
+    #[arg(long)]
+    /// Local image path for a vision-language model.
+    image: Option<PathBuf>,
+    #[arg(short = 'j', long)]
+    /// Emit one JSON result object.
+    json: bool,
+    #[arg(long)]
+    /// Buffer visible output instead of streaming it.
+    no_stream: bool,
+}
+
+#[derive(Args, Debug)]
+#[command(after_help = "NOTE: --image must be given before the prompt words \
+    (e.g. `hipfire img --image a.png --image b.png my-flux2-klein-pipe edit this photo`); \
+    the prompt is a greedy trailing positional and swallows anything after it.")]
+struct ImgArgs {
+    /// Model tag, alias, filename, or path to an HFQ trunk pack
+    /// (`<base>-transformer.hfq`, with its sidecar packs next to it).
+    model: String,
+    /// Prompt words. Quote the prompt to preserve exact whitespace.
+    #[arg(num_args = 0..)]
+    prompt: Vec<String>,
+    /// Reference image for FLUX.2 Klein edit (repeatable, up to 4). Requires
+    /// an arch-45 pipe; a FLUX.1 pipe refuses reference images.
+    #[arg(long = "image", value_name = "PATH")]
+    image: Vec<PathBuf>,
+    /// Output PNG path (default: hipfire-<seed>.png in the working directory).
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+    /// Pixel width (must be divisible by the VAE compression factor). Defaults
+    /// to 1024 when no `--image` is given; with `--image`, defaults to the
+    /// reference image's own size.
+    #[arg(long)]
+    width: Option<u64>,
+    /// Pixel height (must be divisible by the VAE compression factor).
+    /// Defaults to 1024 when no `--image` is given; with `--image`, defaults
+    /// to the reference image's own size.
+    #[arg(long)]
+    height: Option<u64>,
+    /// Denoise steps; defaults to the model's architecture default (4 for
+    /// step-distilled schnell, 28 for guidance-distilled dev).
+    #[arg(long)]
+    steps: Option<u64>,
+    /// Noise seed; same seed → byte-identical PNG.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Execution backend for the transformer forward: `gpu` (the HIP MMDiT
+    /// forward) or `cpu` (the f32 reference oracle). Defaults to `gpu` when
+    /// a GPU is available, else `cpu`.
+    #[arg(long)]
+    backend: Option<String>,
+    /// Emit one JSON result object instead of the progress lines.
+    #[arg(short = 'j', long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct ChatArgs {
+    /// Model tag, alias, filename, or local catalog identity.
+    model: Option<String>,
+    #[arg(short = 't', long)]
+    temp: Option<f64>,
+    #[arg(long)]
+    top_p: Option<f64>,
+    #[arg(short = 'n', long)]
+    max_tokens: Option<u64>,
+    #[arg(long)]
+    system: Option<String>,
+    /// Accepted for compatibility; native chat does not emit ANSI colors.
+    #[arg(long)]
+    no_color: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BenchArgs {
+    model: String,
+    #[arg(long, default_value_t = 5)]
+    runs: usize,
+    /// Tensor/expert-parallel degree for the benchmark daemon (same admission as `serve --tp`).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    tp: Option<u64>,
+    #[arg(short = 'j', long)]
+    json: bool,
+    /// Compare the five RDNA2 kernel variants in isolated daemon processes.
+    #[arg(long)]
+    exp: bool,
+    /// Run deterministic synthetic prefill/decode rows.
+    #[arg(long)]
+    matrix: bool,
+    /// Client-side time-to-first-token: per run, generate one token on the
+    /// standard prompt and time request-send to first streamed token.
+    /// Reports prompt_tokens / TTFT, the competitor-comparable prefill
+    /// number. Standard generate path only (not --matrix).
+    #[arg(long)]
+    ttft: bool,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "128,512,2048,4096,8192,20000"
+    )]
+    pp: Vec<usize>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "128,512,2048,4096,8192,20000"
+    )]
+    ctx: Vec<usize>,
+    #[arg(long, default_value_t = 128)]
+    tg: usize,
+    /// Generated tokens per standard-bench measurement run.
+    #[arg(long, default_value_t = 128)]
+    max_tokens: usize,
+    #[arg(long)]
+    sustained_tg: Option<usize>,
+    #[arg(long, value_delimiter = ',', default_value = "128,8192")]
+    sustained_ctx: Vec<usize>,
+    #[arg(long, default_value_t = 10)]
+    warmups: usize,
+    #[arg(long)]
+    kv_mode: Option<String>,
+    #[arg(long = "kv-k")]
+    /// Qwen-only K-format override (e.g. `fwht3`, `q8`; `legacy-asymN`, `asymN`
+    /// and `turboN` are deprecated, removal in 0.5.0).
+    kv_k: Option<String>,
+    #[arg(long = "kv-v")]
+    /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
+    kv_v: Option<String>,
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
+    /// KV storage backend override (`legacy` or `vmm`).
+    kv_backend: Option<String>,
+    #[arg(long)]
+    redline: bool,
+    /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
+    #[arg(long = "spec")]
+    speculation: Option<String>,
+    /// Let the model think during the benchmark. Off by default: a reasoning
+    /// model cannot close its `<think>` span inside the benchmark's token
+    /// budget, and the daemon fails such a turn closed as a validation error.
+    /// Pair this with `--max-tokens` large enough for the span to close.
+    #[arg(long = "reasoning-on")]
+    reasoning_on: bool,
+    /// Sweep concurrent stream counts, e.g. `1,2,3,4`. Absent leaves bench
+    /// on its single-stream path, unchanged.
+    #[arg(long)]
+    concurrency: Option<String>,
+    /// Which backend to drive: slots (multi-slot engine), noslots (sequential
+    /// daemon baseline), batch (beta continuous batching), or both.
+    #[arg(long, value_parser = ["slots", "noslots", "batch", "both"], default_value = "both")]
+    backend: String,
+    /// Which workload arm to run: stateless, multiturn, or both.
+    #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
+    workload: String,
+    /// Prompt words for the standard benchmark.
+    #[arg(num_args = 0..)]
+    prompt: Vec<String>,
+    /// Read the standard-benchmark prompt verbatim from a file (raw bytes,
+    /// no trimming). Mutually exclusive with positional PROMPT words.
+    #[arg(long, conflicts_with = "prompt")]
+    prompt_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ProfileArgs {
+    model: Option<String>,
+    #[arg(long)]
+    kernel: Option<String>,
+    #[arg(short = 'j', long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct QuantizeArgs {
+    /// Hugging Face model ID or local safetensors directory (a GGUF file is
+    /// deprecated, removal in 0.5.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF).
+    input: String,
+    #[arg(long = "format")]
+    /// Repeatable output format: mq4, mq6, q8, q8f16, hf4, or hf6.
+    formats: Vec<String>,
+    #[arg(long)]
+    /// Produce both MQ4 and MQ6.
+    both: bool,
+    #[arg(short = 'o', long)]
+    /// Exact output path; valid with one format only.
+    output: Option<PathBuf>,
+    #[arg(long)]
+    /// Output directory for one or more formats.
+    output_dir: Option<PathBuf>,
+    #[arg(long)]
+    /// Override the output filename stem.
+    stem: Option<String>,
+    #[arg(long)]
+    /// Upload completed artifacts to owner/repo on Hugging Face.
+    upload: Option<String>,
+    #[arg(long)]
+    /// Create the Hugging Face model repository if needed.
+    create_repo: bool,
+    #[arg(long)]
+    /// Copy completed artifacts into ~/.hipfire/models.
+    install: bool,
+    #[arg(long)]
+    /// Register a local model alias in models.toml.
+    register: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct SidecarArgs {
+    model: String,
+    #[arg(long)]
+    corpus: Option<PathBuf>,
+    #[arg(long, default_value_t = 4000)]
+    max_tokens: usize,
+    #[arg(long, default_value_t = 256)]
+    chunk_len: usize,
+    #[arg(long, conflicts_with = "cpu_calib")]
+    gpu_calib: bool,
+    #[arg(long)]
+    cpu_calib: bool,
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+    #[arg(long)]
+    skip_validation: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ServeArgs {
+    /// Optional model, host, host:port, and/or port in legacy-compatible order.
+    #[arg(value_name = "MODEL_HOST_OR_PORT", num_args = 0..=3)]
+    positionals: Vec<String>,
+    /// Model tag/path to pre-warm for this process.
+    #[arg(long)]
+    model: Option<String>,
+    /// Run in the background and log to ~/.hipfire/serve.log.
+    #[arg(short = 'd', long, alias = "background")]
+    detach: bool,
+    /// Do not load the configured default model before accepting requests.
+    #[arg(long)]
+    no_prewarm: bool,
+    /// KV cache mode for models loaded by this service.
+    #[arg(long)]
+    kv_mode: Option<String>,
+    /// Qwen-only K-format override for models loaded by this service.
+    #[arg(long = "kv-k")]
+    kv_k: Option<String>,
+    /// Qwen-only V-format override for models loaded by this service.
+    #[arg(long = "kv-v")]
+    kv_v: Option<String>,
+    /// KV storage backend for models loaded by this service (`legacy` or `vmm`).
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
+    kv_backend: Option<String>,
+    /// Vision-tower sidecar wired into every model load (`params["vision"]`);
+    /// overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`;
+    /// skipped while `vision_mode=off`.
+    #[arg(long)]
+    vision: Option<PathBuf>,
+    /// Idle model-unload timeout in seconds; zero disables eviction.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=86400))]
+    idle_timeout: Option<u64>,
+    /// Tensor/expert-parallel degree.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    tp: Option<u64>,
+    /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
+    continuous_batch_size: Option<u64>,
+    /// Internal marker used by the detached child.
+    #[arg(long, hide = true)]
+    foreground_child: bool,
+}
+
+#[derive(Args, Debug, Clone, Copy)]
+pub(crate) struct StopArgs {
+    /// Port to free when --force or --all is used.
+    port: Option<u16>,
+    /// Reap orphan daemon processes and free the configured port.
+    #[arg(long)]
+    force: bool,
+    /// Also reap native quantizer processes.
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Paths {
+    root: PathBuf,
+    models: PathBuf,
+    config: ConfigPaths,
+    registry: RegistryPaths,
+}
+
+impl Paths {
+    fn discover() -> Self {
+        let config = ConfigPaths::discover();
+        let root = config.root.clone();
+        Self {
+            models: config.models.clone(),
+            registry: RegistryPaths {
+                cache: root.join("registry.cache.json"),
+            },
+            root,
+            config,
+        }
+    }
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("hipfire: {error:#}");
+        std::process::exit(1);
+    }
+}
+fn run() -> Result<()> {
+    let cli = Cli::parse_from(env::args_os().map(|argument| {
+        if argument == "-md" {
+            OsString::from("--model-draft")
+        } else {
+            argument
+        }
+    }));
+    let paths = Paths::discover();
+    match cli.command {
+        None => launch_tui(&paths, &[]),
+        Some(Commands::Tui(args)) => launch_tui(&paths, &args.arguments),
+        Some(Commands::Config(args)) => config_command(&paths, args),
+        Some(Commands::Registry(args)) => registry_command(&paths, args),
+        Some(Commands::List(args)) => list_command(&paths, args),
+        Some(Commands::Pull(args)) => pull_command(&paths, args),
+        Some(Commands::Rm(args)) => rm_command(&paths, args),
+        Some(Commands::Diag(output)) => diag_command(&paths, output),
+        Some(Commands::Ps(output)) => ps_command(&paths, output),
+        Some(Commands::Bench(args)) => bench_command(&paths, args),
+        Some(Commands::Profile(args)) => profile_command(&paths, args),
+        Some(Commands::Version(output)) => version_command(&paths, output),
+        Some(Commands::Update(args)) => update_command(&paths, args),
+        Some(Commands::Setup(args)) => setup_command(&paths, args),
+        Some(Commands::KernelPack(args)) => match args.action {
+            KernelPackAction::Install(args) => kernel_pack::install_command(&paths, args),
+        },
+        Some(Commands::Quantize(args)) => quantize_command(&paths, args),
+        Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
+        Some(Commands::Run(args)) => run_command(&paths, args),
+        Some(Commands::Img(args)) => img_command(&paths, args),
+        Some(Commands::Chat(args)) => chat_command(&paths, args),
+        Some(Commands::Serve(args)) => crate::serve::serve_command(&paths, args),
+        Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
+        Some(Commands::Restart(args)) => {
+            let port = args.positionals.iter().find_map(|value| {
+                value.parse::<u16>().ok().or_else(|| {
+                    crate::serve::parse_host_port(value)
+                        .ok()
+                        .flatten()
+                        .map(|(_, port)| port)
+                })
+            });
+            let _ = crate::serve::stop_command(
+                &paths,
+                StopArgs {
+                    port,
+                    force: true,
+                    all: false,
+                },
+            );
+            crate::serve::serve_command(&paths, args)
+        }
+    }
+}
+
+fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
+    if let Some(model) = args.model {
+        return model_config_command(paths, &model, args.action);
+    }
+    let Some(action) = args.action else {
+        return launch_tui(paths, &[]);
+    };
+    match action {
+        ConfigAction::List(output) => {
+            let (loaded, resolved) = resolved_global(paths, true)?;
+            if output.json {
+                let mut values = fields()
+                    .iter()
+                    .map(|field| {
+                        let item = resolved.get(field.key).ok_or_else(|| {
+                            anyhow!("configuration key '{}' is not set", field.key)
+                        })?;
+                        Ok::<_, anyhow::Error>((
+                            field.key.to_owned(),
+                            serde_json::json!({
+                                "legacy_key": field.legacy_key,
+                                "value": item.value,
+                                "default": format_default(field),
+                                "source": item.source,
+                                "overridden": loaded.layer.get(field.key).is_some(),
+                            }),
+                        ))
+                    })
+                    .collect::<Result<serde_json::Map<_, _>>>()?;
+                for (key, item) in resolved
+                    .values
+                    .iter()
+                    .filter(|(key, _)| is_developer_key(key))
+                {
+                    values.insert(
+                        key.clone(),
+                        serde_json::json!({
+                            "legacy_key": null,
+                            "value": item.value,
+                            "default": null,
+                            "source": item.source,
+                            "overridden": loaded.layer.get(key).is_some(),
+                        }),
+                    );
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "scope": "global",
+                        "path": loaded.path,
+                        "format": format!("{:?}", loaded.format).to_lowercase(),
+                        "values": values,
+                        "warnings": loaded.warnings,
+                    }))?
+                );
+            } else {
+                println!("Global configuration: {}", loaded.path.display());
+                if loaded.format == ConfigFormat::LegacyJson {
+                    println!("  legacy JSON is active; the next write will create config.toml");
+                }
+                println!();
+                for schema in fields() {
+                    let item = resolved
+                        .get(schema.key)
+                        .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
+                    let marker = if loaded.layer.get(schema.key).is_some() {
+                        "override"
+                    } else {
+                        "inherited"
+                    };
+                    println!(
+                        "  {:<43} {:<16} {:<9} {}",
+                        schema.key,
+                        item.value,
+                        marker,
+                        source_label(&item.source)
+                    );
+                }
+                for (key, item) in resolved
+                    .values
+                    .iter()
+                    .filter(|(key, _)| is_developer_key(key))
+                {
+                    let marker = if loaded.layer.get(key).is_some() {
+                        "override"
+                    } else {
+                        "inherited"
+                    };
+                    println!(
+                        "  {:<43} {:<16} {:<9} {}",
+                        key,
+                        item.value,
+                        marker,
+                        source_label(&item.source)
+                    );
+                }
+                for warning in loaded.warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Ok(())
+        }
+        ConfigAction::Get { key, output } => {
+            let (_, resolved) = resolved_global(paths, true)?;
+            let canonical = canonical_config_key(&key)
+                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let schema = field(&canonical);
+            let value = resolved
+                .get(&canonical)
+                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
+            if output.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "key": canonical,
+                        "legacy_key": schema.map(|schema| schema.legacy_key),
+                        "value": value.value,
+                        "source": value.source,
+                    }))?
+                );
+            } else {
+                println!("{}", value.value);
+            }
+            Ok(())
+        }
+        ConfigAction::Set { key, value } => {
+            let mut loaded = load_global(&paths.config)?;
+            loaded.layer.set_cli(&key, &value)?;
+            write_global_toml(&paths.config, &loaded.layer)?;
+            let canonical = canonical_config_key(&key)
+                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let value = loaded
+                .layer
+                .get(&canonical)
+                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
+            println!("{canonical} = {value}");
+            if loaded.format == ConfigFormat::LegacyJson {
+                println!(
+                    "migrated active configuration to {}; preserved {} as a rollback copy",
+                    paths.config.config_toml.display(),
+                    paths.config.config_json.display()
+                );
+            }
+            Ok(())
+        }
+        ConfigAction::Reset { key } => {
+            let mut loaded = load_global(&paths.config)?;
+            if let Some(key) = key {
+                let canonical = canonical_config_key(&key)
+                    .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let existed = loaded.layer.remove(&canonical)?.is_some();
+                write_global_toml(&paths.config, &loaded.layer)?;
+                if existed {
+                    println!("{canonical} override removed");
+                } else {
+                    println!("{canonical} was already inherited");
+                }
+            } else {
+                write_global_toml(&paths.config, &ConfigLayer::default())?;
+                println!("all global overrides removed");
+            }
+            Ok(())
+        }
+        ConfigAction::Explain { key, output } => {
+            let (loaded, resolved) = resolved_global(paths, true)?;
+            let canonical = canonical_config_key(&key)
+                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let value = resolved
+                .get(&canonical)
+                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
+            if is_developer_key(&canonical) {
+                let env_compat = developer_env_for_key(&canonical).ok_or_else(|| {
+                    anyhow!("developer key '{canonical}' has no legacy env spelling")
+                })?;
+                if output.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "key": canonical,
+                            "legacy_key": null,
+                            "value": value.value,
+                            "source": value.source,
+                            "shadowed": value.shadowed,
+                            "default": null,
+                            "category": "diagnostic",
+                            "scope": "process",
+                            "registry_allowed": false,
+                            "experimental": true,
+                            "env_compat": env_compat,
+                            "help": "Experimental process-scoped override. Prefer a typed field when one exists.",
+                            "config_path": loaded.path,
+                        }))?
+                    );
+                } else {
+                    println!("{canonical}");
+                    println!("  value:       {}", value.value);
+                    println!("  source:      {}", source_label(&value.source));
+                    println!("  default:     unset");
+                    println!("  category:    Diagnostic");
+                    println!("  scope:       Process");
+                    println!("  registry:    false");
+                    println!("  legacy env:  {env_compat}");
+                    println!(
+                        "  about:       Experimental process-scoped override. Prefer a typed field when one exists."
+                    );
+                    if !value.shadowed.is_empty() {
+                        println!("  shadowed:");
+                        for candidate in value.shadowed.iter().rev() {
+                            println!(
+                                "    {:<16} {}",
+                                candidate.value,
+                                source_label(&candidate.source)
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let schema = field(&canonical)
+                .ok_or_else(|| anyhow!("unknown configuration key '{canonical}'"))?;
+            if output.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "key": schema.key,
+                        "legacy_key": schema.legacy_key,
+                        "value": value.value,
+                        "source": value.source,
+                        "shadowed": value.shadowed,
+                        "default": format_default(schema),
+                        "category": schema.category,
+                        "scope": schema.scope,
+                        "registry_allowed": schema.registry_allowed,
+                        "experimental": schema.experimental,
+                        "env_compat": schema.env_compat,
+                        "help": schema.help,
+                        "config_path": loaded.path,
+                    }))?
+                );
+            } else {
+                println!("{}", schema.key);
+                println!("  value:       {}", value.value);
+                println!("  source:      {}", source_label(&value.source));
+                println!("  default:     {}", format_default(schema));
+                println!("  category:    {:?}", schema.category);
+                println!("  scope:       {:?}", schema.scope);
+                println!("  registry:    {}", schema.registry_allowed);
+                if let Some(env) = schema.env_compat {
+                    println!("  legacy env:  {env}");
+                }
+                println!("  about:       {}", schema.help);
+                if !value.shadowed.is_empty() {
+                    println!("  shadowed:");
+                    for candidate in value.shadowed.iter().rev() {
+                        println!(
+                            "    {:<16} {}",
+                            candidate.value,
+                            source_label(&candidate.source)
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        ConfigAction::Schema(output) => {
+            let schema = fields()
+                .iter()
+                .map(|field| {
+                    serde_json::json!({
+                        "key": field.key,
+                        "legacy_key": field.legacy_key,
+                        "category": field.category,
+                        "scope": field.scope,
+                        "default": config_default_value(field),
+                        "rule": config_rule_json(field.rule),
+                        "registry_allowed": field.registry_allowed,
+                        "experimental": field.experimental,
+                        "env_compat": field.env_compat,
+                        "help": field.help,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if output.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": CONFIG_SCHEMA_VERSION,
+                        "fields": schema,
+                        "developer_namespace": {
+                            "prefix": "developer.",
+                            "scope": "process",
+                            "registry_allowed": false,
+                            "experimental": true,
+                            "value_types": ["boolean", "integer", "number", "string"],
+                            "legacy_mapping": "HIPFIRE_FOO -> developer.foo"
+                        },
+                    }))?
+                );
+            } else {
+                println!("Configuration schema v{CONFIG_SCHEMA_VERSION}");
+                for field in fields() {
+                    println!(
+                        "  {:<48} {:<18} {:<12} {}",
+                        field.key,
+                        format_default(field),
+                        config_rule_label(field.rule),
+                        field.help
+                    );
+                }
+                println!(
+                    "  {:<48} {:<18} {:<12} Experimental process-scoped overrides (HIPFIRE_FOO -> developer.foo).",
+                    "developer.<name>", "unset", "scalar"
+                );
+            }
+            Ok(())
+        }
+        ConfigAction::Migrate => {
+            let loaded = load_global(&paths.config)?;
+            match loaded.format {
+                ConfigFormat::Toml => {
+                    println!("already using {}", paths.config.config_toml.display());
+                }
+                ConfigFormat::LegacyJson => {
+                    write_global_toml(&paths.config, &loaded.layer)?;
+                    println!(
+                        "wrote {}; preserved {} unchanged",
+                        paths.config.config_toml.display(),
+                        paths.config.config_json.display()
+                    );
+                }
+                ConfigFormat::Empty => {
+                    write_global_toml(&paths.config, &ConfigLayer::default())?;
+                    println!("wrote {}", paths.config.config_toml.display());
+                }
+            }
+            let catalog = load_catalog(&paths.config)?;
+            match catalog.format {
+                CatalogFormat::Toml => {
+                    println!("already using {}", paths.config.models_toml.display());
+                }
+                CatalogFormat::LegacyJson => {
+                    write_catalog_toml(&paths.config, &catalog.catalog)?;
+                    println!(
+                        "wrote {}; preserved {} and {} unchanged",
+                        paths.config.models_toml.display(),
+                        paths.config.models_json.display(),
+                        paths.config.legacy_per_model_json.display()
+                    );
+                    for warning in catalog.warnings {
+                        eprintln!("warning: {warning}");
+                    }
+                }
+                CatalogFormat::Empty => {
+                    write_catalog_toml(&paths.config, &catalog.catalog)?;
+                    println!("wrote {}", paths.config.models_toml.display());
+                }
+            }
+            Ok(())
+        }
+        ConfigAction::Profile { action } => config_profile_command(paths, action),
+    }
+}
+
+fn config_profile_command(paths: &Paths, action: Option<ConfigProfileAction>) -> Result<()> {
+    let Some(action) = action else {
+        return launch_tui(paths, &["--config-profile-wizard".to_owned()]);
+    };
+    match action {
+        ConfigProfileAction::Set { name } => {
+            let mut loaded = load_global(&paths.config)?;
+            apply_config_profile(&mut loaded.layer, &paths.config, &name)?;
+            write_global_toml(&paths.config, &loaded.layer)?;
+            println!("applied configuration profile '{name}'");
+            if loaded.format == ConfigFormat::LegacyJson {
+                println!(
+                    "migrated active configuration to {}; preserved {} as a rollback copy",
+                    paths.config.config_toml.display(),
+                    paths.config.config_json.display()
+                );
+            }
+            Ok(())
+        }
+        ConfigProfileAction::Create { name } => {
+            let loaded = load_global(&paths.config)?;
+            let path = create_config_profile(&paths.config, &name, &loaded.layer)?;
+            println!(
+                "created configuration profile '{name}' at {}",
+                path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn model_config_command(
+    paths: &Paths,
+    model_name: &str,
+    action: Option<ConfigAction>,
+) -> Result<()> {
+    let registry = load_registry(&paths.registry).registry;
+    let (tag, entry) = registry
+        .model(model_name)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
+        .unwrap_or((None, None));
+    let action = action.unwrap_or(ConfigAction::List(OutputArgs { json: false }));
+    if matches!(
+        action,
+        ConfigAction::Migrate | ConfigAction::Schema(_) | ConfigAction::Profile { .. }
+    ) {
+        bail!("config migrate/schema/profile are global; omit the model argument");
+    }
+
+    match action {
+        ConfigAction::List(output) => {
+            let catalog = load_catalog(&paths.config)?;
+            let record = catalog
+                .catalog
+                .model(model_name)
+                .or_else(|| tag.as_deref().and_then(|tag| catalog.catalog.model(tag)));
+            let overrides = record
+                .map(|(_, model)| &model.overrides)
+                .cloned()
+                .unwrap_or_default();
+            let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
+            if output.json {
+                let values = fields()
+                    .iter()
+                    .map(|schema| {
+                        let item = resolved.get(schema.key).ok_or_else(|| {
+                            anyhow!("configuration key '{}' is not set", schema.key)
+                        })?;
+                        Ok::<_, anyhow::Error>((
+                            schema.key.to_owned(),
+                            serde_json::json!({
+                                "legacy_key": schema.legacy_key,
+                                "value": item.value,
+                                "source": item.source,
+                                "overridden": overrides.get(schema.key).is_some(),
+                            }),
+                        ))
+                    })
+                    .collect::<Result<serde_json::Map<_, _>>>()?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "scope": "model",
+                        "model": model_name,
+                        "canonical_tag": tag,
+                        "path": catalog.path,
+                        "format": format!("{:?}", catalog.format).to_lowercase(),
+                        "values": values,
+                        "warnings": catalog.warnings,
+                    }))?
+                );
+            } else {
+                println!("Model configuration: {model_name}");
+                println!(
+                    "Catalog: {} ({:?})\n",
+                    catalog.path.display(),
+                    catalog.format
+                );
+                for schema in fields() {
+                    let item = resolved
+                        .get(schema.key)
+                        .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
+                    let marker = if overrides.get(schema.key).is_some() {
+                        "override"
+                    } else {
+                        "inherited"
+                    };
+                    println!(
+                        "  {:<43} {:<16} {:<9} {}",
+                        schema.key,
+                        item.value,
+                        marker,
+                        source_label(&item.source)
+                    );
+                }
+                for warning in catalog.warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Ok(())
+        }
+        ConfigAction::Get { key, output } => {
+            if is_developer_key(&key) {
+                bail!("developer configuration is global process policy; omit the model argument");
+            }
+            let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
+            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let value = resolved
+                .get(schema.key)
+                .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
+            if output.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "model": model_name,
+                        "key": schema.key,
+                        "legacy_key": schema.legacy_key,
+                        "value": value.value,
+                        "source": value.source,
+                    }))?
+                );
+            } else {
+                println!("{}", value.value);
+            }
+            Ok(())
+        }
+        ConfigAction::Set { key, value } => {
+            if is_developer_key(&key) {
+                bail!("developer configuration is global process policy; omit the model argument");
+            }
+            let mut loaded = load_catalog(&paths.config)?;
+            let id = loaded
+                .catalog
+                .model_id(model_name)
+                .map(str::to_owned)
+                .unwrap_or_else(|| tag.clone().unwrap_or_else(|| model_name.to_owned()));
+            let local_path = find_model_path(paths, &registry, model_name);
+            let (canonical, saved) = {
+                let record = loaded.catalog.models.entry(id.clone()).or_default();
+                if record.path.is_none() {
+                    record.path = local_path;
+                }
+                if record.registry_tag.is_none() {
+                    record.registry_tag = tag.clone();
+                }
+                record.overrides.set_cli(&key, &value)?;
+                let schema =
+                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let saved = record
+                    .overrides
+                    .get(schema.key)
+                    .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?
+                    .clone();
+                (schema.key, saved)
+            };
+            write_catalog_toml(&paths.config, &loaded.catalog)?;
+            println!("{id} {canonical} = {saved}");
+            if loaded.format == CatalogFormat::LegacyJson {
+                println!(
+                    "migrated model catalog to {}; preserved legacy JSON as rollback copies",
+                    paths.config.models_toml.display()
+                );
+            }
+            Ok(())
+        }
+        ConfigAction::Reset { key } => {
+            if key.as_deref().is_some_and(is_developer_key) {
+                bail!("developer configuration is global process policy; omit the model argument");
+            }
+            let mut loaded = load_catalog(&paths.config)?;
+            let Some(id) = loaded.catalog.model_id(model_name).map(str::to_owned) else {
+                println!("{model_name} has no per-model overrides");
+                return Ok(());
+            };
+            let record = loaded.catalog.models.get_mut(&id).ok_or_else(|| {
+                anyhow!("model '{model_name}' has no catalog entry for id '{id}'")
+            })?;
+            if let Some(key) = key {
+                let schema =
+                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let existed = record.overrides.remove(schema.key)?.is_some();
+                if existed {
+                    println!("{id} {} override removed", schema.key);
+                } else {
+                    println!("{id} {} was already inherited", schema.key);
+                }
+            } else {
+                record.overrides = ConfigLayer::default();
+                println!("all {id} overrides removed");
+            }
+            write_catalog_toml(&paths.config, &loaded.catalog)?;
+            Ok(())
+        }
+        ConfigAction::Explain { key, output } => {
+            if is_developer_key(&key) {
+                bail!("developer configuration is global process policy; omit the model argument");
+            }
+            let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
+            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let value = resolved
+                .get(schema.key)
+                .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
+            if output.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "model": model_name,
+                        "key": schema.key,
+                        "value": value.value,
+                        "source": value.source,
+                        "shadowed": value.shadowed,
+                        "scope": schema.scope,
+                        "help": schema.help,
+                    }))?
+                );
+            } else {
+                println!("{}", schema.key);
+                println!("  model:       {model_name}");
+                println!("  value:       {}", value.value);
+                println!("  source:      {}", source_label(&value.source));
+                println!("  scope:       {:?}", schema.scope);
+                println!("  about:       {}", schema.help);
+                if !value.shadowed.is_empty() {
+                    println!("  shadowed:");
+                    for candidate in value.shadowed.iter().rev() {
+                        println!(
+                            "    {:<16} {}",
+                            candidate.value,
+                            source_label(&candidate.source)
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        ConfigAction::Migrate | ConfigAction::Schema(_) | ConfigAction::Profile { .. } => {
+            unreachable!()
+        }
+    }
+}
+
+pub(crate) fn resolved_global(
+    paths: &Paths,
+    include_env: bool,
+) -> Result<(hipfire_config::LoadedConfig, hipfire_config::ResolvedConfig)> {
+    let loaded = load_global(&paths.config)?;
+    let mut layers = vec![NamedLayer {
+        source: ConfigSource::GlobalUser {
+            path: loaded.path.clone(),
+        },
+        layer: loaded.layer.clone(),
+    }];
+    if include_env {
+        let env_layer = load_env_layer()?;
+        if !env_layer.values.is_empty() {
+            // Field-level env names remain available from schema metadata. A
+            // single layer source makes effective output concise while explain
+            // still names the compatibility surface.
+            layers.push(NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_*".into(),
+                },
+                layer: env_layer,
+            });
+        }
+    }
+    Ok((loaded, resolve(layers)?))
+}
+
+fn registry_command(paths: &Paths, args: RegistryArgs) -> Result<()> {
+    match args.action {
+        RegistryAction::Verify { path, output } => {
+            let registry = if let Some(path) = path.as_deref() {
+                let raw = fs::read_to_string(path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                RegistryV1::parse(&raw, path.display().to_string())?
+            } else {
+                hipfire_registry::bundled()?
+            };
+            if output.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "valid": true,
+                        "schema_version": registry.schema_version,
+                        "generated_at": registry.generated_at,
+                        "models": registry.models.len(),
+                        "aliases": registry.aliases.len(),
+                    }))?
+                );
+            } else {
+                println!(
+                    "registry valid: schema v{}, {} models, {} aliases, generated {}",
+                    registry.schema_version,
+                    registry.models.len(),
+                    registry.aliases.len(),
+                    registry.generated_at
+                );
+            }
+            Ok(())
+        }
+        action => {
+            let loaded = load_registry(&paths.registry);
+            match action {
+                RegistryAction::Status(output) | RegistryAction::Update(output) => {
+                    if output.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&registry_status_json(paths, &loaded))?
+                        );
+                    } else {
+                        println!("source:       {}", registry_source(loaded.source));
+                        println!("schema:       v{}", loaded.registry.schema_version);
+                        println!("generated:    {}", loaded.registry.generated_at);
+                        println!("models:       {}", loaded.registry.models.len());
+                        println!("aliases:      {}", loaded.registry.aliases.len());
+                        println!("cache:        {}", paths.registry.cache.display());
+                        for warning in &loaded.warnings {
+                            eprintln!("warning: {warning}");
+                        }
+                    }
+                    Ok(())
+                }
+                RegistryAction::List(output) => print_registry_list(&loaded, output.json),
+                RegistryAction::Show { tag, output } => {
+                    let (canonical, entry) = loaded
+                        .registry
+                        .model(&tag)
+                        .ok_or_else(|| anyhow!("unknown model '{tag}'"))?;
+                    if output.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "tag": canonical,
+                                "entry": entry,
+                                "registry_source": registry_source(loaded.source),
+                            }))?
+                        );
+                    } else {
+                        println!("tag:          {canonical}");
+                        println!("repo:         {}", entry.repo);
+                        println!("file:         {}", entry.file);
+                        println!("size:         {:.3} GB", entry.size_gb);
+                        println!("minimum VRAM: {:.3} GB", entry.min_vram_gb);
+                        if let Some(hash) = &entry.sha256 {
+                            println!("sha256:       {hash}");
+                        }
+                        if let Some(quant) = &entry.quant {
+                            println!("quant:        {quant}");
+                        }
+                        println!("about:        {}", entry.desc);
+                    }
+                    Ok(())
+                }
+                RegistryAction::Verify { .. } => unreachable!(),
+            }
+        }
+    }
+}
+
+fn registry_status_json(paths: &Paths, loaded: &LoadedRegistry) -> serde_json::Value {
+    serde_json::json!({
+        "source": registry_source(loaded.source),
+        "schema_version": loaded.registry.schema_version,
+        "generated_at": loaded.registry.generated_at,
+        "models": loaded.registry.models.len(),
+        "aliases": loaded.registry.aliases.len(),
+        "cache_path": paths.registry.cache,
+        "warnings": loaded.warnings,
+    })
+}
+
+fn print_registry_list(loaded: &LoadedRegistry, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": registry_source(loaded.source),
+                "models": loaded.registry.models,
+                "aliases": loaded.registry.aliases,
+            }))?
+        );
+    } else {
+        for (tag, model) in &loaded.registry.models {
+            println!("  {:<32} {:>7.2} GB  {}", tag, model.size_gb, model.desc);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct LocalModel {
+    name: String,
+    path: PathBuf,
+    size_bytes: u64,
+    /// File mtime as a unix timestamp, the closest thing a local artifact has
+    /// to OpenAI's required `created`. `0` when the platform cannot report one.
+    created: u64,
+    registry_tag: Option<String>,
+}
+
+fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
+    let loaded = load_registry(&paths.registry);
+    let local = list_local_models(paths, &loaded.registry)?;
+    let local_files = local
+        .iter()
+        .map(|model| model.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if args.json {
+        let registry = loaded
+            .registry
+            .models
+            .iter()
+            .map(|(tag, entry)| {
+                serde_json::json!({
+                    "tag": tag,
+                    "name": entry.file,
+                    "size_bytes": entry.size_bytes.unwrap_or_else(|| (entry.size_gb * 1e9).round() as u64),
+                    "quant": entry.quant,
+                    "downloaded": local_files.contains(entry.file.as_str()),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "models": local,
+                "registry": registry,
+                "registry_source": registry_source(loaded.source),
+            }))?
+        );
+        return Ok(());
+    }
+    if local.is_empty() {
+        println!("No local models. Pull one:\n  hipfire pull qwen3.6:35b-a3b-mq4r");
+    } else {
+        println!("Local models:\n");
+        for model in &local {
+            let tag = model
+                .registry_tag
+                .as_deref()
+                .map(|tag| format!(" ({tag})"))
+                .unwrap_or_default();
+            println!(
+                "  {:<42} {:>7.2} GB{}",
+                model.name,
+                model.size_bytes as f64 / 1e9,
+                tag
+            );
+        }
+    }
+    if args.remote || local.is_empty() {
+        println!("\nAvailable models:\n");
+        for (tag, entry) in &loaded.registry.models {
+            let status = if local_files.contains(entry.file.as_str()) {
+                " [downloaded]"
+            } else {
+                ""
+            };
+            println!(
+                "  {:<32} {:>7.2} GB  {}{}",
+                tag, entry.size_gb, entry.desc, status
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
+    let mut candidates = local_model_paths(paths, registry)?;
+    let mut catalog_tags: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
+    if let Ok(catalog) = load_catalog(&paths.config) {
+        for model in catalog.catalog.models.values() {
+            if let (Some(path), Some(tag)) = (&model.path, &model.registry_tag) {
+                if let Ok(canonical) = fs::canonicalize(path) {
+                    catalog_tags.insert(canonical, tag.clone());
+                }
+            }
+        }
+        candidates.extend(
+            catalog
+                .catalog
+                .models
+                .values()
+                .filter_map(|model| model.path.clone())
+                .filter(|path| path.is_file()),
+        );
+    }
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+    for path in candidates {
+        let canonical = fs::canonicalize(&path).unwrap_or(path);
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let metadata = fs::metadata(&canonical)?;
+        let name = canonical
+            .file_name()
+            .and_then(|file| file.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        // Local listings (`hipfire list`, `hipfire diag`) keep sidecars: a
+        // pulled draft or a vision tower is a real file the operator may want
+        // to see and `hipfire rm`. The gate is `is_listable_model_file` — a
+        // model suffix OR a registry entry's own `file`, which admits both
+        // kinds. `/v1/models` narrows it further with `is_standalone_model` —
+        // see `serve::http`.
+        if !is_listable_model_file(&name, registry) {
+            continue;
+        }
+        let registry_tag = registry
+            .models
+            .iter()
+            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()))
+            .or_else(|| catalog_tags.get(&canonical).cloned());
+        let created = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        models.push(LocalModel {
+            name,
+            path: canonical,
+            size_bytes: metadata.len(),
+            created,
+            registry_tag,
+        });
+    }
+    models.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(models)
+}
+
+/// Enumerate the model files in the models dir, plus the same one level down
+/// inside subdirectories.
+///
+/// The test is [`is_listable_model_file`], not a bare suffix match: several
+/// registry tiers ship files whose suffix is absent from `MODEL_SUFFIXES`
+/// (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a suffix-only scan drops
+/// exactly those models — including the tier a client is looking for.
+///
+/// Sidecars are NOT filtered here. This scan backs `hipfire list`, `hipfire
+/// diag`, and name resolution, all of which should still see a pulled draft or
+/// a vision tower. The serve discovery surface narrows it — see
+/// [`crate::serve::http`] and [`is_standalone_model`].
+pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(&paths.models) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("failed to list model directory"),
+    };
+    let mut models = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|file| is_listable_model_file(file, registry))
+            {
+                models.push(path);
+            }
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(children) = fs::read_dir(path) else {
+            continue;
+        };
+        models.extend(children.flatten().map(|entry| entry.path()).filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|file| file.to_str())
+                    .is_some_and(|file| is_listable_model_file(file, registry))
+        }));
+    }
+    Ok(models)
+}
+
+pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
+    let loaded = load_registry(&paths.registry);
+    let (tag, entry) = loaded
+        .registry
+        .model(&args.model)
+        .ok_or_else(|| anyhow!("unknown model '{}'", args.model))?;
+    if entry.repo.is_empty() {
+        bail!(
+            "cannot pull {tag}: registry entry is local-only; place {} in {}",
+            entry.file,
+            paths.models.display()
+        );
+    }
+    fs::create_dir_all(&paths.models)
+        .with_context(|| format!("failed to create {}", paths.models.display()))?;
+    let destination = paths.models.join(&entry.file);
+    let needs_base = if args.force {
+        true
+    } else if destination.exists() {
+        if existing_artifact_valid(&destination, entry.sha256.as_deref(), entry.size_bytes) {
+            eprintln!("Already downloaded: {}", destination.display());
+            false
+        } else {
+            eprintln!("Refreshing stale artifact: {}", destination.display());
+            true
+        }
+    } else {
+        true
+    };
+    if needs_base {
+        let url = artifact_url(entry, &entry.file);
+        eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
+        download_verified(
+            &url,
+            &destination,
+            entry.sha256.as_deref(),
+            entry.size_bytes,
+            false,
+        )?;
+    }
+    for (label, sidecar) in [
+        ("TriAttention", entry.triattn.as_ref()),
+        ("MTP", entry.mtp.as_ref()),
+        ("DSpark", entry.dspark.as_ref()),
+        ("DFlash", entry.dflash.as_ref()),
+        ("XDNA", entry.xdna.as_ref()),
+        ("Vision", entry.vision.as_ref()),
+        ("T5", entry.t5.as_ref()),
+        ("CLIP", entry.clip.as_ref()),
+        ("Qwen3", entry.qwen3.as_ref()),
+        ("VAE", entry.vae.as_ref()),
+    ] {
+        let Some(sidecar) = sidecar else {
+            continue;
+        };
+        let destination = paths.models.join(&sidecar.file);
+        if destination.exists() && !args.force {
+            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
+            {
+                eprintln!("  {label} sidecar already present: {}", sidecar.file);
+                continue;
+            }
+            eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
+        } else if destination.exists() && args.force {
+            // force always refreshes
+        }
+        eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
+        let url = artifact_url(entry, &sidecar.file);
+        if let Err(error) = download_verified(
+            &url,
+            &destination,
+            sidecar.sha256.as_deref(),
+            sidecar.size_bytes,
+            true,
+        ) {
+            eprintln!("  warning: {label} sidecar unavailable: {error:#}");
+        }
+    }
+    for (name, sidecar) in &entry.heads {
+        let destination = paths.models.join(&sidecar.file);
+        if destination.exists() && !args.force {
+            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
+            {
+                eprintln!("  head {name} already present: {}", sidecar.file);
+                continue;
+            }
+            eprintln!("  head {name} stale, refreshing: {}", sidecar.file);
+        }
+        eprintln!("  Fetching head {name}: {}", sidecar.file);
+        download_verified(
+            &artifact_url(entry, &sidecar.file),
+            &destination,
+            sidecar.sha256.as_deref(),
+            sidecar.size_bytes,
+            true,
+        )?;
+    }
+    println!("{}", paths.models.join(&entry.file).display());
+    Ok(())
+}
+
+pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
+    let base = env::var("HIPFIRE_HF_BASE")
+        .or_else(|_| env::var("HF_ENDPOINT"))
+        .unwrap_or_else(|_| "https://huggingface.co".into());
+    format!(
+        "{}/{}/resolve/main/{}",
+        base.trim_end_matches('/'),
+        entry.repo,
+        file
+    )
+}
+
+pub(crate) fn download_verified(
+    url: &str,
+    destination: &Path,
+    expected_sha256: Option<&str>,
+    expected_size: Option<u64>,
+    quiet: bool,
+) -> Result<()> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(24 * 60 * 60)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut request = agent.get(url);
+    if let Some(token) = env::var_os("HF_TOKEN").or_else(|| env::var_os("HUGGING_FACE_HUB_TOKEN")) {
+        request = request.header(
+            "Authorization",
+            &format!("Bearer {}", token.to_string_lossy()),
+        );
+    }
+    let mut response = request
+        .call()
+        .map_err(|error| anyhow!("download request failed: {error}"))?;
+    if !response.status().is_success() {
+        bail!("download returned HTTP {} for {url}", response.status());
+    }
+    let announced = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let temporary = destination.with_extension(format!("part.{}", std::process::id()));
+    let mut output = fs::File::create(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    let mut reader = response.body_mut().as_reader();
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut downloaded = 0_u64;
+    let started = Instant::now();
+    let mut last_report = Instant::now();
+    let result = (|| -> Result<()> {
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            downloaded += count as u64;
+            if !quiet && last_report.elapsed() >= Duration::from_millis(500) {
+                report_progress(downloaded, announced.or(expected_size), started.elapsed());
+                last_report = Instant::now();
+            }
+        }
+        output.sync_all()?;
+        if !quiet {
+            report_progress(downloaded, announced.or(expected_size), started.elapsed());
+            eprintln!();
+        }
+        if let Some(expected) = expected_size {
+            if downloaded != expected {
+                bail!("size mismatch: expected {expected} bytes, received {downloaded}");
+            }
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if let Some(expected) = expected_sha256 {
+            if !actual.eq_ignore_ascii_case(expected) {
+                bail!("SHA-256 mismatch: expected {expected}, received {actual}");
+            }
+        }
+        fs::rename(&temporary, destination).with_context(|| {
+            format!(
+                "failed to install {} as {}",
+                temporary.display(),
+                destination.display()
+            )
+        })?;
+        eprintln!(
+            "  Saved: {} ({:.3} GB, sha256 {})",
+            destination.display(),
+            downloaded as f64 / 1e9,
+            actual
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn report_progress(downloaded: u64, total: Option<u64>, elapsed: Duration) {
+    let rate = downloaded as f64 / elapsed.as_secs_f64().max(0.001);
+    if let Some(total) = total.filter(|total| *total > 0) {
+        let percent = downloaded as f64 / total as f64 * 100.0;
+        let remaining = total.saturating_sub(downloaded) as f64 / rate.max(1.0);
+        eprint!(
+            "\r  {:>6.2}%  {:.2}/{:.2} GB  {:.1} MB/s  ETA {:.0}s",
+            percent,
+            downloaded as f64 / 1e9,
+            total as f64 / 1e9,
+            rate / 1e6,
+            remaining
+        );
+    } else {
+        eprint!(
+            "\r  {:.2} GB  {:.1} MB/s",
+            downloaded as f64 / 1e9,
+            rate / 1e6
+        );
+    }
+    let _ = std::io::stderr().flush();
+}
+
+pub(crate) fn existing_artifact_valid(
+    path: &Path,
+    expected_sha256: Option<&str>,
+    expected_size: Option<u64>,
+) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if let Some(expected) = expected_size {
+        if metadata.len() != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = expected_sha256 {
+        let Ok(digest) = sha256_path(path) else {
+            return false;
+        };
+        if !digest.eq_ignore_ascii_case(expected) {
+            return false;
+        }
+    }
+    true
+}
+
+fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
+    let loaded = load_registry(&paths.registry);
+    rm_with_registry(paths, &loaded.registry, args)
+}
+
+/// Remove one model and its sidecars. A declared DFlash draft sidecar is
+/// shared: several registry entries can name the same `dflash.file` (e.g.
+/// `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`, and `qwen3.8:27b-mq4-xt` all declare
+/// `qwen38-27b-dflash-mq4.hfq`). Deleting it while a sibling declarer is
+/// still on disk leaves those siblings running AR under `dflash_mode=auto`
+/// or refusing to load under `on`, so the sidecar is kept — with one stderr
+/// line — whenever any OTHER entry declaring the same file still has its own
+/// target file present in the models dir. The `vision` tower sidecar follows
+/// the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one
+/// `qwen3.8-27b-vision.hfq`).
+fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
+    let resolved = registry_entry_for_path(paths, registry, &args.model);
+    let path = find_model_path(paths, registry, &args.model)
+        .unwrap_or_else(|| paths.models.join(&args.model));
+    if !path.is_file() {
+        bail!("model not found: {}", path.display());
+    }
+    let mut targets = BTreeSet::from([path.clone()]);
+    // A shared DFlash sidecar that must survive this removal: (file, keepers).
+    let mut kept_sidecar: Option<(String, String)> = None;
+    // A shared vision-tower sidecar under the same rule: every `qwen3.8:27b*`
+    // tier declares `qwen3.8-27b-vision.hfq`, so the keeper check is copied
+    // from DFlash exactly.
+    let mut kept_vision: Option<(String, String)> = None;
+    // An XDNA spillover archive under the same shared-keeper rule: archives
+    // bind their model hash, so sharing across entries is unlikely, but a
+    // shared file must survive exactly like a shared DFlash draft.
+    let mut kept_xdna: Option<(String, String)> = None;
+    // A shared MTP head under the same rule: every `qwen3.8:27b*` tier declares
+    // `qwen3.8-27b.mtp`, and the stem sweep below would otherwise catch it too.
+    let mut kept_mtp: Option<(String, String)> = None;
+    if let Some((tag, entry)) = resolved {
+        targets.extend(
+            [
+                &entry.triattn,
+                &entry.dspark,
+                &entry.t5,
+                &entry.clip,
+                &entry.vae,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|sidecar| paths.models.join(&sidecar.file))
+            .filter(|path| path.is_file()),
+        );
+        if let Some(sidecar) = entry.dflash.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .dflash
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_sidecar = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
+        if let Some(sidecar) = entry.vision.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .vision
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_vision = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
+        if let Some(sidecar) = entry.xdna.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .xdna
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_xdna = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
+        if let Some(sidecar) = entry.mtp.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .mtp
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_mtp = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
+        targets.extend(
+            entry
+                .heads
+                .values()
+                .map(|sidecar| paths.models.join(&sidecar.file))
+                .filter(|path| path.is_file()),
+        );
+    }
+    if let (Some(parent), Some(file)) = (
+        path.parent(),
+        path.file_name().and_then(|file| file.to_str()),
+    ) {
+        let stem = file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file);
+        if let Ok(entries) = fs::read_dir(parent) {
+            targets.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|candidate| {
+                        let Some(name) = candidate.file_name().and_then(|name| name.to_str())
+                        else {
+                            return false;
+                        };
+                        candidate.is_file()
+                            && name != file
+                            && ((name.starts_with(&format!("{stem}.triattn"))
+                                && name.ends_with(".bin"))
+                                || (name.starts_with(stem)
+                                    && (name.ends_with(".mtp")
+                                        || name.contains("-mtp.")
+                                        || name.contains("-dspark."))))
+                    }),
+            );
+        }
+    }
+    if let Some((file, _)) = kept_mtp.as_ref() {
+        // The stem sweep matched the shared head beside the trunk; keep it.
+        let kept = paths.models.join(file);
+        if let Ok(canonical) = fs::canonicalize(&kept) {
+            targets.remove(&canonical);
+        }
+        targets.remove(&kept);
+    }
+    if !args.yes {
+        eprint!("Remove {} file(s)? [y/N] ", targets.len());
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("cancelled");
+            return Ok(());
+        }
+    }
+    for target in targets {
+        fs::remove_file(&target)
+            .with_context(|| format!("failed to remove {}", target.display()))?;
+        println!("removed {}", target.display());
+    }
+    if let Some((file, keepers)) = kept_sidecar {
+        eprintln!("keeping DFlash sidecar {file}: still declared by {keepers}");
+    }
+    if let Some((file, keepers)) = kept_vision {
+        eprintln!("keeping Vision sidecar {file}: still declared by {keepers}");
+    }
+    if let Some((file, keepers)) = kept_mtp {
+        eprintln!("keeping MTP sidecar {file}: still declared by {keepers}");
+    }
+    if let Some((file, keepers)) = kept_xdna {
+        eprintln!("keeping XDNA sidecar {file}: still declared by {keepers}");
+    }
+    Ok(())
+}
+
+fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
+    let loaded_registry = load_registry(&paths.registry);
+    let registry = &loaded_registry.registry;
+    let (canonical, entry) = registry_entry_for_path(paths, registry, &args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
+        .unwrap_or((None, None));
+    let mut model_path = find_model_path(paths, registry, &args.model);
+    if model_path.is_none() {
+        if let Some(entry) = entry {
+            eprintln!(
+                "Model not found locally. Pulling {}...",
+                canonical.as_deref().unwrap_or(&args.model)
+            );
+            pull_command(
+                paths,
+                PullArgs {
+                    model: args.model.clone(),
+                    force: false,
+                },
+            )?;
+            model_path = Some(paths.models.join(&entry.file));
+        }
+    }
+    let model_path = model_path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    if let Some(image) = &args.image {
+        if !image.is_file() {
+            bail!("image not found: {}", image.display());
+        }
+    }
+    if let Some(draft) = &args.model_draft {
+        if !draft.is_file() {
+            bail!("DFlash draft not found: {}", draft.display());
+        }
+    }
+    if let Some(vision) = &args.vision {
+        if !vision.is_file() {
+            bail!("vision sidecar not found: {}", vision.display());
+        }
+    }
+    if args
+        .dspark_conf_threshold
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        bail!("--dspark-conf-threshold must be between 0 and 1");
+    }
+
+    let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
+    let configured_max_tokens = config_u64(&resolved, "generation.max_tokens")?;
+    let max_tokens = args.max_tokens.unwrap_or(configured_max_tokens);
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
+    }
+    let temperature = request_f64(&resolved, "generation.temperature", args.temp)?;
+    let top_p = request_f64(&resolved, "generation.top_p", args.top_p)?;
+    let top_k = request_u64(&resolved, "generation.top_k", None)?;
+    let min_p = request_f64(&resolved, "generation.min_p", None)?;
+    let presence_penalty = request_f64(&resolved, "generation.presence_penalty", None)?;
+    let repeat_penalty = request_f64(&resolved, "generation.repeat_penalty", args.repeat_penalty)?;
+    let system_prompt = request_string(&resolved, "prompt.system", args.system.clone())?
+        .filter(|value| !value.is_empty());
+    if temperature.is_some_and(|value| !(0.0..=2.0).contains(&value)) {
+        bail!("--temp must be between 0 and 2");
+    }
+    if top_p.is_some_and(|value| !(0.0 < value && value <= 1.0)) {
+        bail!("--top-p must be in (0, 1]");
+    }
+    if repeat_penalty.is_some_and(|value| !(1.0..=3.0).contains(&value)) {
+        bail!("--repeat-penalty must be between 1 and 3");
+    }
+
+    let prompt = if args.prompt.is_empty() {
+        if args.image.is_some() {
+            "Describe this image.".to_owned()
+        } else {
+            "Hello".to_owned()
+        }
+    } else {
+        args.prompt.join(" ")
+    };
+    let host = config_string(&resolved, "serve.host")?;
+    let port = config_u64(&resolved, "serve.port")? as u16;
+    let force_local = run_should_force_local(&args);
+    if !force_local && service_ready(&host, port, Duration::from_millis(150)) {
+        return run_via_http(
+            &host,
+            port,
+            &args.model,
+            &prompt,
+            system_prompt.as_deref(),
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            presence_penalty,
+            repeat_penalty,
+            max_tokens,
+            args.json,
+            args.no_stream,
+        );
+    }
+
+    let daemon = find_daemon(paths).ok_or_else(|| {
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
+    })?;
+    let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    engine.ping()?;
+    let mut params = load_params(
+        &resolved,
+        entry,
+        &paths.models,
+        &model_path,
+        max_tokens,
+        args.kv_mode.as_deref(),
+        args.kv_backend.as_deref(),
+        canonical.as_deref(),
+        args.model_draft.is_some(),
+        args.head.as_deref(),
+    )?;
+    apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
+    let selector = args
+        .speculation
+        .clone()
+        .unwrap_or(config_string(&resolved, "speculation.mode")?);
+    // Tensor-parallel load: forward `tp` like `bench --tp` / `serve --tp` so the
+    // daemon takes the EP/dense-TP route instead of the single-GPU one.
+    if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
+        params["tp"] = serde_json::json!(tp);
+    }
+    apply_speculation_selector(&mut params, &selector)?;
+    // Final effective selector wins: re-project inherited draft only when DFlash
+    // remains enabled (config-off + `run --spec dflash` must still carry draft).
+    project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
+    if let Some(draft) = &args.model_draft {
+        params["draft"] = serde_json::json!(draft.display().to_string());
+        if args.speculation.is_none() {
+            apply_speculation_selector(&mut params, "dflash")?;
+        }
+    }
+    // Registry sidecar for a final auto/on selector the config-time
+    // load_params could not see (config-off + `run --spec dflash`); a
+    // no-op when load_params already resolved or an explicit draft won.
+    resolve_dflash_sidecar(
+        &mut params,
+        entry,
+        &paths.models,
+        &model_path,
+        canonical.as_deref(),
+    )?;
+    resolve_mtp_sidecar(
+        &mut params,
+        entry,
+        &paths.models,
+        &model_path,
+        &args.model,
+        canonical.as_deref(),
+    );
+    if let Some(vision) = &args.vision {
+        // Forwarded in every mode; the daemon's `vision_mode=off` gate decides
+        // and can then name the sidecar it declined on an image request.
+        params["vision"] = serde_json::json!(vision.display().to_string());
+    }
+    if let Some(window) = args.draft_max {
+        if !(1..=32).contains(&window) {
+            bail!("--draft-max must be between 1 and 32");
+        }
+        match args.speculation.as_deref().unwrap_or("auto") {
+            "ngram" => params["ngram_k"] = serde_json::json!(window),
+            "mtp" => params["mtp_k"] = serde_json::json!(window),
+            _ => {
+                params["mtp_k"] = serde_json::json!(window);
+                params["ngram_k"] = serde_json::json!(window);
+            }
+        }
+    }
+    if let Some(value) = args.dspark_conf_threshold {
+        params["dspark_conf_threshold"] = serde_json::json!(value);
+    }
+    let loaded = engine.load(&model_path, params)?;
+    if !args.json {
+        eprintln!(
+            "[{}] {}d {}L {} vocab",
+            loaded
+                .get("arch")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            loaded
+                .get("dim")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            loaded
+                .get("layers")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            loaded
+                .get("vocab")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+
+    let mut request = serde_json::json!({
+        "type": "generate",
+        "id": "run",
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        // `Engine::generate` rejects a request without `attempt_id`
+        // (hipfire-client lib.rs:557 -> "generate request missing attempt_id"),
+        // and `hipfire run` never set one, so EVERY `hipfire run` failed with a
+        // daemon protocol error. `run` is a one-shot, non-retrying caller, so a
+        // literal 1 is correct — same as `bench_generate_request` (main.rs:6407).
+        // The retrying serve path threads a real counter instead (main.rs:4234).
+        "attempt_id": 1,
+    });
+    insert_optional_f64(&mut request, "temperature", temperature);
+    insert_optional_f64(&mut request, "top_p", top_p);
+    insert_optional_u64(&mut request, "top_k", top_k);
+    insert_optional_f64(&mut request, "min_p", min_p);
+    insert_optional_f64(&mut request, "presence_penalty", presence_penalty);
+    insert_optional_f64(&mut request, "repeat_penalty", repeat_penalty);
+    if let Some(system) = system_prompt {
+        request["system"] = serde_json::Value::String(system);
+    }
+    if let Some(image) = args.image {
+        request["image"] = serde_json::Value::String(image.display().to_string());
+    }
+    let contract = loaded
+        .get("reasoning_contract")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ReasoningContract::from_wire_name)
+        .unwrap_or(ReasoningContract::Unsupported);
+    let effort_native = loaded
+        .get("reasoning_effort_native")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let supported_efforts = loaded
+        .get("reasoning_efforts")
+        .and_then(serde_json::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(|string| string.to_owned()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let _ = apply_http_reasoning_request(
+        &serde_json::json!({}),
+        &resolved,
+        &mut request,
+        contract,
+        effort_native,
+        &supported_efforts,
+    )?;
+
+    let mut content = String::new();
+    let stream = !args.no_stream && !args.json;
+    let done = engine.generate(&request, |event| {
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
+            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                content.push_str(text);
+                if stream {
+                    print!("{text}");
+                    std::io::stdout().flush()?;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "content": content,
+                "tokens": done.get("tokens").and_then(serde_json::Value::as_u64),
+                "tok_s": done.get("tok_s").and_then(serde_json::Value::as_f64),
+                "finish_reason": done.get("finish_reason"),
+            }))?
+        );
+    } else if args.no_stream {
+        println!("{content}");
+    } else {
+        println!();
+    }
+    let _ = engine.unload();
+    Ok(())
+}
+
+/// Default `hipfire img --backend`: `"gpu"` when a GPU is available
+/// (`rdna_compute::Gpu::init()` succeeds), else `"cpu"`. Probed once per
+/// process and cached — never re-probes the GPU per invocation. An explicit
+/// `--backend` always overrides this default. A failed probe prints one
+/// stderr line with the underlying HIP error so a fixable driver problem
+/// isn't silently mistaken for "no GPU present".
+fn default_img_backend() -> &'static str {
+    static GPU_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *GPU_AVAILABLE.get_or_init(|| match rdna_compute::Gpu::init() {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "hipfire: no GPU detected ({} [code {}]); defaulting --backend to cpu \
+                 (run `hipfire diag` for a full environment report if a GPU should be present)",
+                e.message, e.code
+            );
+            false
+        }
+    }) {
+        "gpu"
+    } else {
+        "cpu"
+    }
+}
+
+/// `hipfire img <model> <prompt…>`: one-shot txt2img through a fresh native
+/// daemon process. Mirrors `run`'s model resolution and
+/// local-spawn posture; prints per-step progress to stderr, writes the PNG,
+/// prints its path (or the JSON result object with `--json`).
+fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
+    if args.steps.is_some_and(|s| s == 0 || s > 128) {
+        bail!("--steps must be between 1 and 128 (omit for the model default)");
+    }
+    let backend = args
+        .backend
+        .clone()
+        .unwrap_or_else(|| default_img_backend().to_owned());
+    if backend != "cpu" && backend != "gpu" {
+        bail!("--backend must be \"cpu\" or \"gpu\", got {:?}", backend);
+    }
+    for (name, v) in [("--width", args.width), ("--height", args.height)] {
+        if let Some(v) = v {
+            if v == 0 || v > 8192 {
+                bail!("{name} must be between 1 and 8192");
+            }
+        }
+    }
+    if args.image.len() > 4 {
+        bail!("at most 4 --image references (got {})", args.image.len());
+    }
+    // Width/height default to 1024 only for plain txt2img (no reference
+    // images); a reference edit leaves them unset so the daemon defaults to
+    // the reference image's own size.
+    let (width, height) = if args.image.is_empty() {
+        (
+            Some(args.width.unwrap_or(1024)),
+            Some(args.height.unwrap_or(1024)),
+        )
+    } else {
+        (args.width, args.height)
+    };
+    // The CLI reads the reference files itself and ships their bytes; the
+    // daemon never opens a client-named path.
+    let images = args
+        .image
+        .iter()
+        .map(|p| {
+            use base64::Engine as _;
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("--image {}: cannot read file", p.display()))?;
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        })
+        .collect::<Result<Vec<String>>>()?;
+    let prompt = if args.prompt.is_empty() {
+        "a tiny cat sitting on a tiny table".to_owned()
+    } else {
+        args.prompt.join(" ")
+    };
+    let loaded_registry = load_registry(&paths.registry);
+    let registry = &loaded_registry.registry;
+    let (canonical, entry) = registry
+        .model(&args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
+        .unwrap_or((None, None));
+    let mut model_path = find_model_path(paths, registry, &args.model);
+    if model_path.is_none() {
+        if let Some(entry) = entry {
+            eprintln!(
+                "Model not found locally. Pulling {}...",
+                canonical.as_deref().unwrap_or(&args.model)
+            );
+            pull_command(
+                paths,
+                PullArgs {
+                    model: args.model.clone(),
+                    force: false,
+                },
+            )?;
+            model_path = Some(paths.models.join(&entry.file));
+        }
+    }
+    let model_path = model_path.ok_or_else(|| {
+        if std::path::Path::new(&args.model).is_dir() {
+            anyhow!(
+                "model not found: {0} is a directory; a diffusers pipe is not a model — pack it \
+                 with `hipfire-quantize --flux-pipe {0} --output <base>.hfq` and pass \
+                 `<base>-transformer.hfq`",
+                args.model
+            )
+        } else {
+            anyhow!("model not found: {}", args.model)
+        }
+    })?;
+    let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
+    let daemon = find_daemon(paths).ok_or_else(|| {
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
+    })?;
+    let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    engine.ping()?;
+    let _loaded = engine.load(&model_path, serde_json::json!({}))?;
+    let mut request = serde_json::json!({
+        "type": "img_generate",
+        "id": "img",
+        "prompt": prompt,
+        "seed": args.seed,
+        "backend": backend,
+    });
+    // Absent means the architecture default; the daemon refuses an explicit 0.
+    if let Some(s) = args.steps {
+        request["steps"] = serde_json::json!(s);
+    }
+    if let Some(w) = width {
+        request["width"] = serde_json::json!(w);
+    }
+    if let Some(h) = height {
+        request["height"] = serde_json::json!(h);
+    }
+    if !images.is_empty() {
+        request["images"] = serde_json::json!(images);
+    }
+    let mut progress = 0u64;
+    let done = engine.img_generate(&request, |event| {
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("img_progress") {
+            let step = event
+                .get("step")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let total = event
+                .get("total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if !args.json && step > progress {
+                eprintln!("[img] step {step}/{total}");
+                progress = step;
+            }
+        }
+        Ok(())
+    })?;
+    let _ = engine.unload();
+    let png_b64 = done
+        .get("png_b64")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("daemon img_done missing png_b64"))?;
+    let png = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(png_b64)
+            .context("daemon returned invalid base64 PNG")?
+    };
+    let out_path = args.out.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!("hipfire-{}.png", args.seed))
+    });
+    std::fs::write(&out_path, &png)
+        .with_context(|| format!("failed to write {}", out_path.display()))?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "path": out_path,
+                "bytes": png.len(),
+                "width": done.get("width").and_then(serde_json::Value::as_u64),
+                "height": done.get("height").and_then(serde_json::Value::as_u64),
+                "steps": done.get("steps").and_then(serde_json::Value::as_u64),
+                "seed": done.get("seed").and_then(serde_json::Value::as_u64),
+                "ms": done.get("ms").and_then(serde_json::Value::as_u64),
+                "model": done.get("model"),
+            }))?
+        );
+    } else {
+        println!("{}", out_path.display());
+    }
+    Ok(())
+}
+
+fn process_truthy(name: &str) -> bool {
+    hipfire_config::process_value(name).is_some_and(|value| {
+        !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
+    process_truthy("HIPFIRE_LOCAL")
+        || args.image.is_some()
+        || args.kv_mode.is_some()
+        || args.kv_k.is_some()
+        || args.kv_v.is_some()
+        || args.kv_backend.is_some()
+        || args.tp.is_some_and(|tp| tp > 1)
+        || args.head.is_some()
+        || args.speculation.is_some()
+        || args.model_draft.is_some()
+        || args.vision.is_some()
+        || args.draft_max.is_some()
+        || args.dspark_conf_threshold.is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_via_http(
+    host: &str,
+    port: u16,
+    model: &str,
+    prompt: &str,
+    system: Option<&str>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<u64>,
+    min_p: Option<f64>,
+    presence_penalty: Option<f64>,
+    repeat_penalty: Option<f64>,
+    max_tokens: u64,
+    json: bool,
+    no_stream: bool,
+) -> Result<()> {
+    let mut messages = Vec::new();
+    if let Some(system) = system {
+        messages.push(serde_json::json!({ "role": "system", "content": system }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": prompt }));
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    });
+    insert_optional_f64(&mut body, "temperature", temperature);
+    insert_optional_f64(&mut body, "top_p", top_p);
+    insert_optional_u64(&mut body, "top_k", top_k);
+    insert_optional_f64(&mut body, "min_p", min_p);
+    insert_optional_f64(&mut body, "presence_penalty", presence_penalty);
+    insert_optional_f64(&mut body, "repeat_penalty", repeat_penalty);
+    let timeout = Duration::from_secs(60 * 60);
+    if json || no_stream {
+        let response = complete_openai_chat(host, port, body, timeout)?;
+        let content = response
+            .pointer("/choices/0/message/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "content": content,
+                    "tokens": response.pointer("/usage/completion_tokens"),
+                    "tok_s": response.pointer("/hipfire/tok_s"),
+                    "finish_reason": response.pointer("/choices/0/finish_reason"),
+                }))?
+            );
+        } else {
+            println!("{content}");
+        }
+        return Ok(());
+    }
+
+    stream_openai_chat(
+        host,
+        port,
+        body,
+        timeout,
+        |event| {
+            match event {
+                OpenAiSseEvent::Reasoning { text } | OpenAiSseEvent::Content { text } => {
+                    print!("{text}");
+                    std::io::stdout().flush()?;
+                }
+                OpenAiSseEvent::Role { .. }
+                | OpenAiSseEvent::ToolCall { .. }
+                | OpenAiSseEvent::Finish { .. }
+                | OpenAiSseEvent::Usage { .. }
+                | OpenAiSseEvent::Done => {}
+            }
+            Ok(())
+        },
+        || false,
+    )?;
+    println!();
+    Ok(())
+}
+
+fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
+    let (_, resolved) = resolved_global(paths, true)?;
+    let host = config_string(&resolved, "serve.host")?;
+    let port = config_u64(&resolved, "serve.port")? as u16;
+    let model = args
+        .model
+        .unwrap_or(config_string(&resolved, "serve.default_model")?);
+    let max_tokens = args
+        .max_tokens
+        .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
+    }
+    if let Some(value) = args.temp {
+        if !(0.0..=2.0).contains(&value) {
+            bail!("--temp must be between 0 and 2");
+        }
+    }
+    if let Some(value) = args.top_p {
+        if !(0.0 < value && value <= 1.0) {
+            bail!("--top-p must be in (0, 1]");
+        }
+    }
+
+    if !service_ready(&host, port, Duration::from_millis(150)) {
+        let serve_args = ServeArgs {
+            positionals: vec![host.clone(), port.to_string()],
+            model: None,
+            detach: true,
+            no_prewarm: true,
+            kv_mode: None,
+            kv_k: None,
+            kv_v: None,
+            kv_backend: None,
+            vision: None,
+            idle_timeout: None,
+            tp: None,
+            continuous_batch_size: None,
+            foreground_child: false,
+        };
+        detach_serve(paths, &serve_args, &host, port)?;
+    }
+    let client_host = probe_host(&host);
+    eprintln!("Interactive chat with {model}. Commands: /clear, /exit");
+    let mut messages = Vec::new();
+    if let Some(system) = args.system {
+        messages.push(serde_json::json!({ "role": "system", "content": system }));
+    }
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("you> ");
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        if stdin.read_line(&mut input)? == 0 {
+            println!();
+            break;
+        }
+        let input = input.trim_end_matches(['\r', '\n']);
+        match input.trim() {
+            "" => continue,
+            "/exit" | "/quit" => break,
+            "/clear" => {
+                messages.retain(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+                });
+                eprintln!("conversation cleared");
+                continue;
+            }
+            _ => {}
+        }
+        messages.push(serde_json::json!({ "role": "user", "content": input }));
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        });
+        if let Some(value) = args.temp {
+            body["temperature"] = serde_json::json!(value);
+        }
+        if let Some(value) = args.top_p {
+            body["top_p"] = serde_json::json!(value);
+        }
+        print!("assistant> ");
+        std::io::stdout().flush()?;
+        let mut assistant_reasoning = String::new();
+        let mut assistant_content = String::new();
+        let result = stream_openai_chat(
+            client_host,
+            port,
+            body,
+            Duration::from_secs(60 * 60),
+            |event| {
+                match event {
+                    OpenAiSseEvent::Reasoning { text } => {
+                        assistant_reasoning.push_str(&text);
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
+                    OpenAiSseEvent::Content { text } => {
+                        assistant_content.push_str(&text);
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
+                    OpenAiSseEvent::Role { .. }
+                    | OpenAiSseEvent::ToolCall { .. }
+                    | OpenAiSseEvent::Finish { .. }
+                    | OpenAiSseEvent::Usage { .. }
+                    | OpenAiSseEvent::Done => {}
+                }
+                Ok(())
+            },
+            || false,
+        );
+        println!();
+        if let Err(error) = result {
+            messages.pop();
+            return Err(error.into());
+        }
+        let mut assistant_msg =
+            serde_json::json!({ "role": "assistant", "content": assistant_content });
+        if !assistant_reasoning.is_empty() {
+            assistant_msg["reasoning_content"] = serde_json::Value::String(assistant_reasoning);
+        }
+        messages.push(assistant_msg);
+    }
+    let _ = args.no_color;
+    Ok(())
+}
+
+pub(crate) fn resolved_for_model(
+    paths: &Paths,
+    model_name: &str,
+    tag: Option<&str>,
+    entry: Option<&ModelEntry>,
+) -> Result<hipfire_config::ResolvedConfig> {
+    let loaded = load_global(&paths.config)?;
+    let mut layers = Vec::new();
+    if let (Some(tag), Some(entry)) = (tag, entry) {
+        layers.push(NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: tag.to_owned(),
+                revision: "v1".into(),
+            },
+            layer: hipfire_registry::config_layer_for_tag(tag, entry)
+                .map_err(|error| anyhow!("invalid registry model defaults: {error}"))?,
+        });
+    }
+    layers.push(NamedLayer {
+        source: ConfigSource::GlobalUser { path: loaded.path },
+        layer: loaded.layer,
+    });
+    let catalog = load_catalog(&paths.config)?;
+    let model_override = catalog
+        .catalog
+        .model(model_name)
+        .or_else(|| tag.and_then(|tag| catalog.catalog.model(tag)))
+        .or_else(|| entry.and_then(|entry| catalog.catalog.model(entry.file.as_str())));
+    if let Some((model_id, model)) = model_override {
+        if !model.overrides.values.is_empty() {
+            layers.push(NamedLayer {
+                source: ConfigSource::ModelUser {
+                    model: model_id.to_owned(),
+                    path: catalog.path,
+                },
+                layer: model.overrides.clone(),
+            });
+        }
+    }
+    let env_layer = load_env_layer()?;
+    if !env_layer.values.is_empty() {
+        layers.push(NamedLayer {
+            source: ConfigSource::LegacyEnv {
+                name: "HIPFIRE_*".into(),
+            },
+            layer: env_layer,
+        });
+    }
+    Ok(resolve(layers)?)
+}
+
+/// How [`scan_local_models`] compares an input against on-disk filenames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchMode {
+    /// Compare the lowercased strings as written.
+    Literal,
+    /// Additionally strip `-`, `.` and `_` from both sides, so spellings that
+    /// differ only in separators compare equal (`ornith-1.5` ↔ `ornith1.5`).
+    IgnoreSeparators,
+}
+
+fn scan_local_models(local: &[PathBuf], search: &str, mode: MatchMode) -> Vec<PathBuf> {
+    let normalize = |value: &str| -> String {
+        let lower = value.to_ascii_lowercase();
+        match mode {
+            MatchMode::Literal => lower,
+            MatchMode::IgnoreSeparators => lower
+                .chars()
+                .filter(|c| !matches!(c, '-' | '.' | '_'))
+                .collect(),
+        }
+    };
+    let needle = normalize(search);
+    // A needle that normalizes to nothing (an input of only separators) would
+    // make `contains` true for every file and hand back an arbitrary model.
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    local
+        .iter()
+        .filter(|path| {
+            let name = normalize(
+                path.file_name()
+                    .and_then(|file| file.to_str())
+                    .unwrap_or_default(),
+            );
+            name == needle || name.contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Resolve a user-supplied model input to its registry entry, if it has one.
+///
+/// A path-form input receives registry identity (sidecars, kv/max_seq policy,
+/// rm targets) only when it IS the installed artifact: `canonicalize(input)`
+/// must equal `canonicalize(models_dir.join(entry.file))` for some entry.
+/// Both sides are canonicalized so a symlink inside the models directory
+/// (e.g. `qwen3.8-27b.mq4-xt` pointing out at `~/qcal`) still matches by
+/// target. A path that merely shares a basename with an entry file gets no
+/// entry and loads as (or removes as) a bare artifact.
+///
+/// Non-path inputs (tags, aliases, bare file names with no on-disk doppelganger
+/// in the current directory) go through [`RegistryV1::model`], which keeps
+/// tag/alias/`qwen3.5:` normalization and the bare `entry.file` match.
+pub(crate) fn registry_entry_for_path<'registry>(
+    paths: &Paths,
+    registry: &'registry RegistryV1,
+    input: &str,
+) -> Option<(&'registry str, &'registry ModelEntry)> {
+    let candidate = Path::new(input);
+    if input.contains('/') || input.contains('\\') || candidate.is_file() {
+        let canonical_input = fs::canonicalize(candidate).ok()?;
+        return registry.models.iter().find_map(|(tag, entry)| {
+            let canonical_installed = fs::canonicalize(paths.models.join(&entry.file)).ok()?;
+            (canonical_installed == canonical_input).then(|| (tag.as_str(), entry))
+        });
+    }
+    registry.model(input)
+}
+
+pub(crate) fn find_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Option<PathBuf> {
+    let direct = PathBuf::from(model);
+    if direct.is_file() {
+        return fs::canonicalize(direct).ok();
+    }
+    if let Ok(catalog) = load_catalog(&paths.config) {
+        if let Some((_, record)) = catalog.catalog.model(model) {
+            if let Some(path) = record.path.as_ref().filter(|path| path.is_file()) {
+                return fs::canonicalize(path).ok().or_else(|| Some(path.clone()));
+            }
+        }
+    }
+    // An exact on-disk spelling outranks a registry alias that would rewrite it.
+    // The registry maps a model NAME to its canonical FILE, which is what makes
+    // `qwen3.8:27b` resolve to `qwen3.8-27b.mq4`. But when a legacy alias points at
+    // a RENAMED artifact and both spellings are present, that rewrite silently
+    // serves weights the user did not name -- `ornith1.5:35b-a3b` reaching
+    // `ornith-1.5-35b-a3b.mq4` while `ornith1.5-35b-a3b.mq4` sits right there.
+    //
+    // The comparison is on the exact stem, deliberately NOT the looser `contains`
+    // used by scan_local_models: `qwen3.8:27b` would `contains`-match
+    // `qwen3.8-27b.mq4r` and `qwen3.8-27b.mq4-xt` as well, and the quant sort below
+    // ranks `.mq4r` ABOVE `.mq4`, so a looser rule here would silently move users
+    // onto a different tier. An exact stem can only ever match the one file the
+    // user actually spelled.
+    let exact_stem = model.replace(':', "-").to_ascii_lowercase();
+    if let Ok(local) = local_model_paths(paths, registry) {
+        if let Some(hit) = local.iter().find(|path| {
+            let name = path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            MODEL_SUFFIXES
+                .iter()
+                .any(|suffix| name == format!("{exact_stem}{suffix}"))
+        }) {
+            return Some(hit.clone());
+        }
+    }
+    if let Some((_, entry)) = registry.model(model) {
+        let path = paths.models.join(&entry.file);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let path = paths.models.join(model);
+    if path.is_file() {
+        return Some(path);
+    }
+    let search = model.replace(':', "-").to_ascii_lowercase();
+    let explicit_quant = MODEL_SUFFIXES.iter().any(|suffix| search.ends_with(suffix));
+    let local = local_model_paths(paths, registry).ok()?;
+    // Two passes. The first matches the literal spelling and is what has always
+    // run. The second retries with `-`, `.` and `_` stripped from both sides, so
+    // an input and an on-disk file that differ only in separators still meet:
+    // `ornith-1.5:35b-a3b` finds the `ornith1.5-35b-a3b.mq4` left on disk by
+    // anyone who downloaded before the artifacts were renamed.
+    //
+    // The fallback is strictly second — it runs only when the literal pass found
+    // nothing, so it can add a match where today there is none but can never
+    // change one that already resolves. That ordering is the safety argument:
+    // separator-stripping is a looser `contains`, and running it first would let
+    // it outrank an exact hit.
+    let mut candidates = scan_local_models(&local, &search, MatchMode::Literal);
+    if candidates.is_empty() {
+        candidates = scan_local_models(&local, &search, MatchMode::IgnoreSeparators);
+    }
+    candidates.sort_by_key(|path| {
+        let name = path
+            .file_name()
+            .and_then(|file| file.to_str())
+            .unwrap_or_default();
+        if explicit_quant || name.ends_with(".mq4r") {
+            0
+        } else if name.ends_with(".mq4") {
+            1
+        } else if name.ends_with(".hf4") || name.ends_with(".hfq") {
+            2
+        } else {
+            3
+        }
+    });
+    candidates.into_iter().next()
+}
+
+/// Clap value parser for `--kv-backend`: shared `KvBackend::from_str` so the old
+/// `contiguous` spelling returns the migration error naming `legacy`.
+fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
+    raw.parse::<KvBackend>()
+        .map(|backend| backend.as_str().to_owned())
+        .map_err(|err| err.to_string())
+}
+
+/// Layer an authored typed K/V axis from resolved config. Built-in empty defaults
+/// and registry pins are omitted; user/one-shot/env sources emit non-empty values.
+fn authored_kv_axis(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<String>> {
+    let Some(item) = resolved.get(key) else {
+        return Ok(None);
+    };
+    match &item.source {
+        ConfigSource::GlobalUser { .. }
+        | ConfigSource::ModelUser { .. }
+        | ConfigSource::OneShot { .. }
+        | ConfigSource::LegacyEnv { .. } => {}
+        _ => return Ok(None),
+    }
+    match &item.value {
+        hipfire_config::ConfigValue::String(value) if !value.is_empty() => Ok(Some(value.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// Apply CLI `--kv-k` / `--kv-v` onto load params (CLI wins over config axes).
+/// Empty strings are ignored. Validates through the typed schema when present.
+pub(crate) fn apply_kv_axis_overrides(
+    params: &mut serde_json::Value,
+    kv_k: Option<&str>,
+    kv_v: Option<&str>,
+) -> Result<()> {
+    if let Some(raw) = kv_k.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(schema) = field("memory.kv_k") {
+            schema
+                .parse_cli(raw)
+                .map_err(|err| anyhow!("--kv-k {raw}: {err}"))?;
+        }
+        params["kv_k"] = serde_json::json!(raw);
+    }
+    if let Some(raw) = kv_v.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(schema) = field("memory.kv_v") {
+            schema
+                .parse_cli(raw)
+                .map_err(|err| anyhow!("--kv-v {raw}: {err}"))?;
+        }
+        params["kv_v"] = serde_json::json!(raw);
+    }
+    Ok(())
+}
+
+/// Copy effective KV mode and backend fields from the validated loaded ACK.
+fn with_loaded_kv_backend_fields(
+    mut report: serde_json::Value,
+    loaded: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(object) = report.as_object_mut() else {
+        return report;
+    };
+    for key in [
+        "kv_backend",
+        "kv_backend_request",
+        "kv_backend_reason",
+        "kv_backend_legacy",
+        "kv_backend_warning",
+        "kv_mode",
+    ] {
+        object.insert(
+            key.to_owned(),
+            loaded.get(key).cloned().unwrap_or(serde_json::Value::Null),
+        );
+    }
+    report
+}
+
+pub(crate) fn load_params(
+    resolved: &hipfire_config::ResolvedConfig,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    max_tokens: u64,
+    kv_override: Option<&str>,
+    kv_backend_override: Option<&str>,
+    tag: Option<&str>,
+    explicit_draft: bool,
+    head_override: Option<&str>,
+) -> Result<serde_json::Value> {
+    // max_seq is omitted for built-in/registry provenance so the daemon can
+    // derive min(model context, card capacity). Explicit user sources are
+    // forwarded unchanged (no max_tokens+1024 inflation).
+    let configured_kv = config_string(resolved, "memory.kv_cache")?;
+    let kv_mode = kv_override
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(configured_kv);
+    // Validate through the shared schema. `auto` is preserved so architecture
+    // (maple vs qwen) can select BF16 vs Q8; do not substitute q8 here.
+    field("memory.kv_cache")
+        .expect("schema field")
+        .parse_cli(&kv_mode)?;
+    let configured_backend = config_string(resolved, "memory.kv_backend")?;
+    let backend_raw = kv_backend_override
+        .filter(|value| !value.is_empty())
+        .unwrap_or(configured_backend.as_str());
+    let kv_backend = backend_raw
+        .parse::<KvBackend>()
+        .map_err(|err| anyhow!("{err}"))?
+        .as_str()
+        .to_owned();
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
+    let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
+    if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
+        if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
+            let candidate = model_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&sidecar.file);
+            if candidate.is_file() {
+                cask_sidecar = candidate.display().to_string();
+            }
+        }
+    }
+    // Resolve --head <name> against the registry's `heads` map. The overlay
+    // lives beside the model file, exactly like the triattn sidecar. Refuse
+    // rather than fall back: a silent fall-back would serve the base's head
+    // and answer a different question than the operator asked.
+    let head_file = match head_override.filter(|s| !s.is_empty()) {
+        None => String::new(),
+        // A direct path is accepted as well as a registry name: loading a
+        // model BY PATH has no registry entry, so names cannot resolve there
+        // and only a path can work.
+        Some(name) if Path::new(name).is_file() => name.to_string(),
+        Some(name) => {
+            let heads = entry.map(|e| &e.heads);
+            let sidecar = heads.and_then(|h| h.get(name)).ok_or_else(|| {
+                let known: Vec<&str> = heads
+                    .map(|h| h.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                anyhow!(
+                    "--head {name}: not a file, and this model has no such head variant{}",
+                    if known.is_empty() {
+                        " (it publishes none)".to_string()
+                    } else {
+                        format!(" (available: {})", known.join(", "))
+                    }
+                )
+            })?;
+            let candidate = model_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&sidecar.file);
+            if !candidate.is_file() {
+                bail!(
+                    "--head {name}: overlay {} not found — fetch it with \
+                     `hipfire pull` or place it beside the model",
+                    candidate.display()
+                );
+            }
+            candidate.display().to_string()
+        }
+    };
+    let mut params = serde_json::json!({
+        "deepseek4_compute_placement": config_string(
+            resolved,
+            "hardware.deepseek4_compute_placement",
+        )?,
+        "kv_mode": kv_mode,
+        "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
+        "dflash_mode": config_string(resolved, "speculation.dflash")?,
+        "vision_mode": config_string(resolved, "vision.mode")?,
+        "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
+        "mtp_mode": config_string(resolved, "speculation.mtp")?,
+        "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
+        "ngram_draft": matches!(config_string(resolved, "speculation.ngram")?.as_str(), "on" | "auto"),
+        "ngram_k": config_u64(resolved, "speculation.ngram_k")?,
+        "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,
+        "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
+        "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
+        "cask_sidecar": cask_sidecar,
+        "head": head_file,
+        "cask": config_bool(resolved, "memory.cask.enabled")?,
+        "cask_budget": config_u64(resolved, "memory.cask.budget")?,
+        "cask_beta": config_u64(resolved, "memory.cask.beta")?,
+        "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
+        "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
+        "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
+        "prefill_compression": config_string(resolved, "speculation.prefill.mode")?,
+        "prefill_threshold": config_u64(resolved, "speculation.prefill.threshold")?,
+        "prefill_keep_ratio": config_f64(resolved, "speculation.prefill.keep_ratio")?,
+        "prefill_alpha": config_f64(resolved, "speculation.prefill.alpha")?,
+        "prefill_min_keep": config_u64(resolved, "speculation.prefill.min_keep")?,
+        "prefill_sink": config_u64(resolved, "speculation.prefill.sink")?,
+        "prefill_recent": config_u64(resolved, "speculation.prefill.recent")?,
+        "prefill_block": config_u64(resolved, "speculation.prefill.block")?,
+        "prefill_drafter": config_string(resolved, "speculation.prefill.drafter")?,
+        "prefill_drafter_device": config_i64(resolved, "speculation.prefill.drafter_device")?,
+        "prefill_sparse_threshold": config_u64(resolved, "speculation.prefill.sparse_threshold")?,
+        "speculation": config_string(resolved, "speculation.mode")?,
+        "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
+    });
+    let backend_source = &resolved
+        .get("memory.kv_backend")
+        .expect("schema field")
+        .source;
+    if kv_backend_override.is_some()
+        || matches!(
+            backend_source,
+            ConfigSource::GlobalUser { .. }
+                | ConfigSource::ModelUser { .. }
+                | ConfigSource::OneShot { .. }
+        )
+    {
+        params["kv_backend"] = serde_json::json!(kv_backend);
+    }
+    // Authored K/V axes only: CLI is applied by callers via apply_kv_axis_overrides
+    // after this returns so serve can share the same helper. Empty/BuiltIn/registry
+    // defaults are omitted from IPC.
+    if let Some(kv_k) = authored_kv_axis(resolved, "memory.kv_k")? {
+        params["kv_k"] = serde_json::json!(kv_k);
+    }
+    if let Some(kv_v) = authored_kv_axis(resolved, "memory.kv_v")? {
+        params["kv_v"] = serde_json::json!(kv_v);
+    }
+    let max_seq_source = &resolved.get("memory.max_seq").expect("schema field").source;
+    if matches!(
+        max_seq_source,
+        ConfigSource::GlobalUser { .. }
+            | ConfigSource::ModelUser { .. }
+            | ConfigSource::OneShot { .. }
+            | ConfigSource::LegacyEnv { .. }
+    ) {
+        let max_seq = config_u64(resolved, "memory.max_seq")?;
+        params["max_seq"] = serde_json::json!(max_seq);
+    }
+    if let Some(experts_per_token) =
+        config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
+    {
+        params["deepseek4_experts_per_token"] = serde_json::json!(experts_per_token);
+    }
+    let selector = config_string(resolved, "speculation.mode")?;
+    apply_speculation_selector(&mut params, &selector)?;
+    project_dflash_draft(&mut params, developer_dflash_draft(resolved));
+    if !explicit_draft {
+        // A CLI `--model-draft` (projected by the caller after this returns)
+        // always wins, so skip sidecar resolution — and its `on` fail-closed
+        // bail — when one was given.
+        resolve_dflash_sidecar(&mut params, entry, models_dir, model_path, tag)?;
+    }
+    resolve_vision_sidecar(&mut params, entry, models_dir, model_path, tag)?;
+    resolve_xdna_sidecar(&mut params, resolved, entry, models_dir, model_path, tag)?;
+    Ok(params)
+}
+
+/// Resolve a registry-declared DFlash sidecar into `params["draft"]`.
+///
+/// Call only once the final `dflash_mode` is known. When the mode is `auto`
+/// or `on`, no explicit draft is set (`params["draft"]`, e.g. from
+/// `developer.dflash_draft`), and `entry.dflash` names a pulled file, wire
+/// it: `on` without the file fails closed, `auto` logs one line and runs AR.
+/// With no entry at all the artifact is not registry-managed (e.g. a path
+/// that merely shares a basename with an entry file): `auto` runs AR as a
+/// bare artifact, but `on` fails closed instead of silently running AR.
+/// The sidecar is looked up in `models_dir` first — `find_model_path`
+/// canonicalizes, so a symlinked target's parent is wherever the artifact
+/// really lives, not the models directory the draft was pulled into — then
+/// next to the target. An explicit draft always wins; a final `off` never
+/// carries a draft (`project_dflash_draft` strips it) and returns early.
+fn resolve_dflash_sidecar(
+    params: &mut serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    tag: Option<&str>,
+) -> Result<()> {
+    if !matches!(params["dflash_mode"].as_str(), Some("auto" | "on")) {
+        return Ok(());
+    }
+    if params
+        .get("draft")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|draft| !draft.is_empty())
+    {
+        return Ok(());
+    }
+    let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
+        if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
+            bail!(
+                "DFlash draft required (dflash_mode=on) but {} is not a registry-managed artifact; pass developer.dflash_draft or use the registry tag",
+                model_path.display()
+            );
+        }
+        return Ok(());
+    };
+    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let candidate = [models_dir, beside_target]
+        .into_iter()
+        .map(|dir| dir.join(&sidecar.file))
+        .find(|candidate| candidate.is_file());
+    if let Some(candidate) = candidate {
+        params["draft"] = serde_json::json!(candidate.display().to_string());
+        return Ok(());
+    }
+    let tag = tag.unwrap_or("<model>");
+    if params["dflash_mode"].as_str() == Some("on") {
+        bail!(
+            "DFlash draft {} is not pulled; run `hipfire pull {tag}` or set developer.dflash_draft",
+            sidecar.file
+        );
+    }
+    eprintln!(
+        "[hipfire] DFlash draft {} not pulled; running AR — `hipfire pull {tag}`",
+        sidecar.file
+    );
+    Ok(())
+}
+
+/// Resolve the Qwen MTP head sidecar into `params["mtp"]`.
+///
+/// Call once the final `mtp_mode` is known (after the effective speculation
+/// selector); `off` never carries a head. Otherwise the first existing file
+/// wins: the registry `entry.mtp` file in `models_dir`, then `<entry
+/// file>.mtp` in `models_dir`, then `.mtp` beside `requested` as typed (when
+/// it names a file), then `.mtp` beside the canonical `model_path`.
+/// `find_model_path` canonicalizes, so a head beside a symlinked trunk — the
+/// models-dir layout — is invisible from `model_path` alone. With no hit
+/// `params["mtp"]` stays unset and the loader keeps its bundled-trailer and
+/// `<trunk>.mtp` lookup (and `on` fails there); a registry-declared head that
+/// is not pulled gets a one-line `hipfire pull` hint.
+pub(crate) fn resolve_mtp_sidecar(
+    params: &mut serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    requested: &str,
+    tag: Option<&str>,
+) {
+    if let Some(obj) = params.as_object_mut() {
+        obj.remove("mtp");
+    }
+    if params["mtp_mode"].as_str() == Some("off") {
+        return;
+    }
+    let mut candidates = Vec::new();
+    if let Some(entry) = entry {
+        if let Some(sidecar) = entry.mtp.as_ref() {
+            candidates.push(models_dir.join(&sidecar.file));
+        }
+        candidates.push(models_dir.join(Path::new(&entry.file).with_extension("mtp")));
+    }
+    let requested = Path::new(requested);
+    if requested.is_file() {
+        // Absolute but not canonical: the daemon may run from another cwd,
+        // and the point is to keep the symlink's own directory.
+        let requested = std::path::absolute(requested).unwrap_or_else(|_| requested.to_path_buf());
+        candidates.push(requested.with_extension("mtp"));
+    }
+    candidates.push(model_path.with_extension("mtp"));
+    if let Some(hit) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+        params["mtp"] = serde_json::json!(hit.display().to_string());
+        return;
+    }
+    if let Some(sidecar) = entry.and_then(|entry| entry.mtp.as_ref()) {
+        eprintln!(
+            "[hipfire] MTP head {} not pulled; `hipfire pull {}` enables MTP speculation",
+            sidecar.file,
+            tag.unwrap_or("<model>")
+        );
+    }
+}
+
+/// Resolve a registry-declared XDNA spillover archive into `params["xdna"]`.
+///
+/// The `kernel.npu_spillover` process flag is the opt-in: when it is off this
+/// is a no-op and no `xdna` param is projected, so flag-off loads can never
+/// observe an NPU path. When it is on, the entry's `xdna` slot must name a
+/// pulled `.xdna.zip` whose manifest verifies (`load_verified` checks shape,
+/// exact `gfx1151`/`npu5` identity, and every payload hash); the verified
+/// archive path is projected as `params["xdna"]` for the daemon, which
+/// re-verifies at load and admits it into `LoadCtx.xdna` only on an exact
+/// `gfx1151` host (see `admit_for_arch`).
+///
+/// Fail-closed only where an explicit opt-in names an artifact: flag on plus
+/// a declared-but-missing or corrupt archive bails with a `hipfire pull`
+/// hint. Flag on with no entry (a bare path that merely shares a basename)
+/// or no `xdna` slot logs one line and stays GPU-only — erroring there would
+/// make a process-global opt-in unusable for models that simply have no NPU
+/// artifact. Lookup order (models dir, then beside the target) mirrors the
+/// DFlash draft resolution, including the symlinked-target rationale.
+fn resolve_xdna_sidecar(
+    params: &mut serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    tag: Option<&str>,
+) -> Result<()> {
+    if !config_bool(resolved, "kernel.npu_spillover")? {
+        return Ok(());
+    }
+    let Some(sidecar) = entry.and_then(|entry| entry.xdna.as_ref()) else {
+        let what = tag
+            .map(str::to_owned)
+            .unwrap_or_else(|| model_path.display().to_string());
+        eprintln!(
+            "[hipfire] NPU spillover opted in but {what} declares no xdna sidecar; staying GPU-only",
+        );
+        return Ok(());
+    };
+    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let candidate = [models_dir, beside_target]
+        .into_iter()
+        .map(|dir| dir.join(&sidecar.file))
+        .find(|candidate| candidate.is_file());
+    let Some(candidate) = candidate else {
+        bail!(
+            "NPU spillover opted in but {} is not pulled; run `hipfire pull {}` (or turn kernel.npu_spillover off)",
+            sidecar.file,
+            tag.unwrap_or("<model>"),
+        );
+    };
+    if let Err(error) = hipfire_registry::XdnaSidecarDescriptor::load_verified(&candidate) {
+        bail!(
+            "NPU spillover archive {} failed verification ({error:#}); re-pull with `hipfire pull {}`",
+            candidate.display(),
+            tag.unwrap_or("<model>"),
+        );
+    }
+    params["xdna"] = serde_json::json!(candidate.display().to_string());
+    Ok(())
+}
+
+/// Resolve a registry-declared vision-tower sidecar into `params["vision"]`.
+///
+/// Call only once the final `vision_mode` is known (`load_params` projects it
+/// from `vision.mode`). `off` is a hard override mirroring the daemon's
+/// `dflash_mode=off` guard: never carry a tower, even an explicitly projected
+/// one. `auto` uses the registry/sibling sidecar when present and runs
+/// silently text-only when absent. `on` requires the declared sidecar and
+/// fails the load closed when it cannot be resolved (same shape as the
+/// DFlash `on` refusal). A trunk with an embedded tower declares no sidecar
+/// and is unaffected by this key under every mode.
+///
+/// Priority under `auto`/`on`: an already-projected `params["vision"]`
+/// (e.g. `run --vision`) always wins; then `HIPFIRE_VISION_SIDECAR` (empty
+/// string opts out, the same semantics as `HIPFIRE_DFLASH_DRAFT`); then
+/// `entry.vision`, looked up in `models_dir` first — `find_model_path`
+/// canonicalizes, so a symlinked target's parent is wherever the artifact
+/// really lives, not the models directory the sidecar was pulled into —
+/// then next to the target, then as the `<trunk-stem>-vision.hfq` sibling
+/// convention beside any trunk.
+fn resolve_vision_sidecar(
+    params: &mut serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    tag: Option<&str>,
+) -> Result<()> {
+    // Resolve in every mode. The daemon's `vision_mode=off` gate is the hard
+    // override and the only place that decides; leaving the resolved path in
+    // the params lets it tell an image request which sidecar it declined.
+    let mode = params["vision_mode"].as_str().unwrap_or("off");
+    if !matches!(mode, "off" | "auto" | "on") {
+        return Ok(());
+    }
+    if let Some(projected) = params.get("vision").and_then(serde_json::Value::as_str) {
+        if projected.is_empty() {
+            if let Some(obj) = params.as_object_mut() {
+                obj.remove("vision");
+            }
+            return Ok(());
+        }
+        return Ok(());
+    }
+    if let Ok(env) = hipfire_config::developer_var("HIPFIRE_VISION_SIDECAR") {
+        if env.is_empty() {
+            if let Some(obj) = params.as_object_mut() {
+                obj.remove("vision");
+            }
+            return Ok(());
+        }
+        params["vision"] = serde_json::json!(env);
+        return Ok(());
+    }
+    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = Vec::new();
+    if let Some(sidecar) = entry.and_then(|entry| entry.vision.as_ref()) {
+        candidates.push(models_dir.join(&sidecar.file));
+        candidates.push(beside_target.join(&sidecar.file));
+    }
+    if let Some(stem) = model_path
+        .file_name()
+        .and_then(|file| file.to_str())
+        .map(|file| file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file))
+    {
+        candidates.push(beside_target.join(format!("{stem}-vision.hfq")));
+    }
+    if let Some(hit) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+        params["vision"] = serde_json::json!(hit.display().to_string());
+        return Ok(());
+    }
+    if mode == "on" {
+        if let Some(sidecar) = entry.and_then(|entry| entry.vision.as_ref()) {
+            let tag = tag.unwrap_or("<model>");
+            bail!(
+                "Vision tower {} is not pulled; run `hipfire pull {tag}` or pass --vision",
+                sidecar.file
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Project snapshotted `developer.dflash_draft` after the effective speculation selector.
+///
+/// Call only once final `dflash_mode` is known. Config-off must not carry a draft;
+/// a later CLI selector (e.g. `run --spec dflash`) can opt back in here.
+fn project_dflash_draft(params: &mut serde_json::Value, draft: Option<&str>) {
+    if params["dflash_mode"].as_str() == Some("off") {
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("draft");
+        }
+        return;
+    }
+    if let Some(draft) = draft {
+        if !draft.is_empty() {
+            params["draft"] = serde_json::json!(draft);
+        }
+    }
+}
+
+/// Optional draft path from resolved `developer.dflash_draft` (legacy HIPFIRE_DFLASH_DRAFT).
+fn developer_dflash_draft(resolved: &hipfire_config::ResolvedConfig) -> Option<&str> {
+    match resolved
+        .get("developer.dflash_draft")
+        .map(|item| &item.value)
+    {
+        Some(hipfire_config::ConfigValue::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
+    match selector {
+        "off" => {
+            params["dflash_mode"] = serde_json::json!("off");
+            params["mtp_mode"] = serde_json::json!("off");
+            params["ngram_draft"] = serde_json::json!(false);
+            params["dspark_mode"] = serde_json::json!("off");
+        }
+        "dflash" => {
+            params["dflash_mode"] = serde_json::json!("on");
+            params["mtp_mode"] = serde_json::json!("off");
+            params["ngram_draft"] = serde_json::json!(false);
+            params["dspark_mode"] = serde_json::json!("off");
+        }
+        "mtp" => {
+            params["dflash_mode"] = serde_json::json!("off");
+            params["mtp_mode"] = serde_json::json!("on");
+            params["ngram_draft"] = serde_json::json!(false);
+            params["dspark_mode"] = serde_json::json!("off");
+        }
+        "ngram" => {
+            params["dflash_mode"] = serde_json::json!("off");
+            params["mtp_mode"] = serde_json::json!("off");
+            params["ngram_draft"] = serde_json::json!(true);
+            params["dspark_mode"] = serde_json::json!("off");
+        }
+        "dspark" => {
+            params["dflash_mode"] = serde_json::json!("off");
+            params["mtp_mode"] = serde_json::json!("off");
+            params["ngram_draft"] = serde_json::json!(false);
+            params["dspark_mode"] = serde_json::json!("on");
+        }
+        "auto" => {
+            params["dspark_mode"] = serde_json::json!("auto");
+        }
+        other => bail!("unknown speculation selector '{other}'"),
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReasoningResolution {
+    pub effective_mode: String,
+    pub effective_effort: Option<String>,
+    pub effective_cap: Option<u64>,
+    pub cap_source: String,
+    pub contract: ReasoningContract,
+    pub warnings: Vec<String>,
+}
+
+pub(crate) fn apply_http_reasoning_request(
+    body: &serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    request: &mut serde_json::Value,
+    contract: ReasoningContract,
+    effort_native: bool,
+    supported_efforts: &[String],
+) -> Result<ReasoningResolution> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut push_warn = |msg: String| {
+        eprintln!("[WARN: INVALID CONFIG] {}", msg);
+        warnings.push(msg);
+    };
+    if let Some(object) = request.as_object_mut() {
+        for key in [
+            "thinking_enabled",
+            "assistant_prefix",
+            "reasoning_effort",
+            "max_think_tokens",
+        ] {
+            object.remove(key);
+        }
+    }
+    if body.get("enable_thinking").is_some() {
+        if let Some(value) = body.get("enable_thinking") {
+            if !value.is_boolean() && !value.is_null() {
+                bail!("enable_thinking must be a boolean");
+            }
+        }
+    }
+    let top_enable = body
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool);
+    if body
+        .pointer("/chat_template_kwargs/enable_thinking")
+        .is_some()
+    {
+        if let Some(value) = body.pointer("/chat_template_kwargs/enable_thinking") {
+            if !value.is_boolean() && !value.is_null() {
+                bail!("chat_template_kwargs.enable_thinking must be a boolean");
+            }
+        }
+    }
+    let kwargs_enable = body
+        .pointer("/chat_template_kwargs/enable_thinking")
+        .and_then(serde_json::Value::as_bool);
+    let thinking_type_raw = body
+        .pointer("/thinking/type")
+        .or_else(|| body.get("thinking").and_then(|value| value.get("type")));
+    let mut thinking_type_str: Option<&str> = None;
+    if let Some(raw) = thinking_type_raw {
+        if !raw.is_string() {
+            bail!("thinking.type must be enabled or disabled");
+        } else {
+            let s = raw.as_str().unwrap();
+            if s == "enabled" || s == "disabled" {
+                thinking_type_str = Some(s);
+            } else {
+                push_warn(format!(
+                    "thinking.type '{}' dropped: expected enabled|disabled",
+                    s
+                ));
+                thinking_type_str = None;
+            }
+        }
+    }
+    let effort_raw = body
+        .get("reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            body.pointer("/reasoning/effort")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            body.pointer("/chat_template_kwargs/reasoning_effort")
+                .and_then(serde_json::Value::as_str)
+        });
+    let effort_present = body.get("reasoning_effort").is_some()
+        || body.pointer("/reasoning/effort").is_some()
+        || body
+            .pointer("/chat_template_kwargs/reasoning_effort")
+            .is_some();
+    if effort_present && effort_raw.is_none() {
+        bail!("reasoning_effort must be a string");
+    }
+    let body_budget_present = body.get("thinking_budget").is_some();
+    let body_budget_str = body
+        .get("thinking_budget")
+        .and_then(serde_json::Value::as_str);
+    if body_budget_present && body_budget_str.is_none() {
+        bail!("thinking_budget must be a string preset");
+    }
+    let body_top_max_present = body.get("max_think_tokens").is_some();
+    let body_nested_max_present = body.pointer("/reasoning/max_tokens").is_some();
+    let parse_body_think_cap = |value: &serde_json::Value, field: &str| -> Result<u64> {
+        match value {
+            serde_json::Value::Number(number) => {
+                if let Some(parsed) = number.as_u64() {
+                    if parsed > 393_216 {
+                        bail!("{field} must be between 0 and 393216");
+                    }
+                    Ok(parsed)
+                } else {
+                    bail!("{field} must be between 0 and 393216");
+                }
+            }
+            _ => bail!("{field} must be between 0 and 393216"),
+        }
+    };
+    let top_max_opt = if body_top_max_present {
+        Some(parse_body_think_cap(
+            body.get("max_think_tokens").unwrap(),
+            "max_think_tokens",
+        )?)
+    } else {
+        None
+    };
+    let nested_max_opt = if body_nested_max_present {
+        Some(parse_body_think_cap(
+            body.pointer("/reasoning/max_tokens").unwrap(),
+            "reasoning.max_tokens",
+        )?)
+    } else {
+        None
+    };
+    let (max_opt, body_max_source) = match (top_max_opt, nested_max_opt) {
+        (Some(top), Some(nested)) => {
+            if top != nested {
+                push_warn(
+                    "reasoning.max_tokens dropped because explicit max_think_tokens takes precedence"
+                        .to_string(),
+                );
+            }
+            (Some(top), "explicit:body:max_think_tokens")
+        }
+        (Some(top), None) => (Some(top), "explicit:body:max_think_tokens"),
+        (None, Some(nested)) => (Some(nested), "explicit:body:reasoning.max_tokens"),
+        (None, None) => (None, ""),
+    };
+    let has_explicit_body_max = body_top_max_present || body_nested_max_present;
+    let config_max_entry = resolved.get("reasoning.max_tokens").filter(|value| {
+        !matches!(value.source, hipfire_config::ConfigSource::BuiltIn)
+            && !matches!(value.value, hipfire_config::ConfigValue::Null)
+    });
+    let mut config_max_opt: Option<u64> = None;
+    if let Some(entry) = config_max_entry {
+        match entry.value {
+            hipfire_config::ConfigValue::Integer(value) if value >= 0 => {
+                config_max_opt = Some(value as u64);
+            }
+            _ => bail!("reasoning.max_tokens resolved to a non-negative integer"),
+        }
+    }
+    let has_explicit_config_max = config_max_opt.is_some();
+    let config_budget_entry = resolved
+        .get("reasoning.budget")
+        .filter(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let has_explicit_config_budget = config_budget_entry.is_some();
+    let config_budget_str: Option<String> = if has_explicit_config_budget {
+        Some(config_string(resolved, "reasoning.budget")?)
+    } else {
+        None
+    };
+    let has_explicit_effort = effort_raw.is_some();
+    let has_explicit_toggle =
+        top_enable.is_some() || kwargs_enable.is_some() || thinking_type_str.is_some();
+    let is_effort_native = match contract {
+        ReasoningContract::QwenJinja => effort_native,
+        ReasoningContract::DeepSeek4 => true,
+        ReasoningContract::MuseGlimmer => true,
+        _ => false,
+    };
+    if matches!(contract, ReasoningContract::Unsupported) {
+        if has_explicit_toggle {
+            push_warn(
+                "reasoning controls dropped for unsupported contract: thinking toggle ignored"
+                    .to_string(),
+            );
+        }
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped for unsupported contract",
+                effort_raw.unwrap_or("unknown")
+            ));
+        }
+        if has_explicit_body_max
+            || body_budget_present
+            || has_explicit_config_max
+            || has_explicit_config_budget
+        {
+            push_warn("max_think_tokens/budget dropped for unsupported contract".to_string());
+        }
+        let resolution = ReasoningResolution {
+            effective_mode: "disabled".to_string(),
+            effective_effort: None,
+            effective_cap: None,
+            cap_source: "none".to_string(),
+            contract,
+            warnings: warnings.clone(),
+        };
+        return Ok(resolution);
+    }
+    if matches!(contract, ReasoningContract::GemmaBoolean) {
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped for gemma_boolean: use thinking toggle only",
+                effort_raw.unwrap()
+            ));
+        }
+        if body_budget_present {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for gemma_boolean",
+                body_budget_str.unwrap()
+            ));
+        }
+        if has_explicit_body_max {
+            push_warn(format!(
+                "{} {} dropped for gemma_boolean: use thinking toggle only",
+                if body_top_max_present {
+                    "max_think_tokens"
+                } else {
+                    "reasoning.max_tokens"
+                },
+                max_opt.unwrap()
+            ));
+        }
+        if has_explicit_config_max {
+            push_warn(format!(
+                "reasoning.max_tokens {} dropped for gemma_boolean: use thinking toggle only",
+                config_max_opt.unwrap()
+            ));
+        }
+        if has_explicit_config_budget {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for gemma_boolean",
+                config_budget_str.clone().unwrap()
+            ));
+        }
+    }
+    let thinking_type_toggle = thinking_type_str.map(|value| value == "enabled");
+    let toggle_values = [top_enable, kwargs_enable, thinking_type_toggle];
+    let saw_enabled = toggle_values.iter().flatten().any(|value| *value);
+    let saw_disabled = toggle_values.iter().flatten().any(|value| !*value);
+    if saw_enabled && saw_disabled {
+        push_warn("conflicting thinking toggles normalized: disabled wins".to_string());
+    }
+    let mut toggle_opt = toggle_values
+        .into_iter()
+        .flatten()
+        .reduce(|previous, value| previous && value);
+    let is_off_effort = matches!(
+        contract,
+        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4
+    ) && matches!(effort_raw, Some("none") | Some("off") | Some("chat"));
+    if is_off_effort {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with off/none effort; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    let is_off_budget = !is_effort_native
+        && !matches!(contract, ReasoningContract::GemmaBoolean)
+        && body_budget_str == Some("off");
+    if is_off_budget {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with legacy budget off; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    // `reasoning_budget_tokens == 0` is the wire spelling hag and other OpenAI
+    // clients use for "do not think". Absent from master but genuine: without
+    // it a small max_tokens budget is burned inside <think> and the client gets
+    // empty content. Route through toggle reduction so it inherits contract
+    // gating and disabled-wins warnings, like is_off_budget.
+    let is_off_reasoning_budget_tokens = !is_effort_native
+        && !matches!(contract, ReasoningContract::GemmaBoolean)
+        && body
+            .get("reasoning_budget_tokens")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0);
+    if is_off_reasoning_budget_tokens {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with reasoning_budget_tokens 0; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    // `max_think_tokens == 1` is the engine's own lowered encoding of off
+    // (alongside assistant_prefix=closed_think). Incoming 1 must not be a
+    // contract-blind short-circuit: a client legitimately requesting a 1-token
+    // cap would be silently reinterpreted. Gate on contract and participate in
+    // disabled-wins, so every off-path is contract-aware.
+    let is_off_max_think_one = matches!(contract, ReasoningContract::QwenJinja)
+        && body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1);
+    if is_off_max_think_one {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with max_think_tokens 1; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    let config_mode = config_string(resolved, "reasoning.mode").unwrap_or_else(|_| "on".into());
+    let config_mode_is_explicit = resolved
+        .get("reasoning.mode")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let config_effort =
+        config_string(resolved, "reasoning.effort").unwrap_or_else(|_| "auto".into());
+    let config_effort_is_explicit = resolved
+        .get("reasoning.effort")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let config_budget =
+        config_string(resolved, "reasoning.budget").unwrap_or_else(|_| "uncapped".into());
+    let config_budget_is_explicit = resolved
+        .get("reasoning.budget")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let configured_off = (config_mode_is_explicit && config_mode == "off")
+        || (config_effort_is_explicit && config_effort == "none")
+        || (!is_effort_native
+            && !matches!(contract, ReasoningContract::GemmaBoolean)
+            && config_budget_is_explicit
+            && config_budget == "off");
+    let family_default = !matches!(contract, ReasoningContract::GemmaBoolean);
+    let mut thinking_enabled = toggle_opt.unwrap_or_else(|| {
+        if configured_off {
+            false
+        } else if config_mode_is_explicit {
+            config_mode != "off"
+        } else {
+            family_default
+        }
+    });
+    if matches!(contract, ReasoningContract::MuseGlimmer) && !thinking_enabled {
+        push_warn("reasoning off dropped for muse_glimmer: always-on reasoning".to_string());
+        thinking_enabled = true;
+    }
+    request["thinking_enabled"] = serde_json::json!(thinking_enabled);
+    let prefix = match contract {
+        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4 => {
+            if thinking_enabled {
+                "open_think"
+            } else {
+                "closed_think"
+            }
+        }
+        ReasoningContract::GemmaBoolean | ReasoningContract::MuseGlimmer => "plain",
+        ReasoningContract::Unsupported => "plain",
+    };
+    request["assistant_prefix"] = serde_json::json!(prefix);
+    if !thinking_enabled {
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped: thinking disabled",
+                effort_raw.unwrap()
+            ));
+        }
+        if config_effort_is_explicit && config_effort != "auto" && config_effort != "none" {
+            push_warn(format!(
+                "reasoning.effort '{}' dropped: thinking disabled",
+                config_effort
+            ));
+        }
+        let cap_present = has_explicit_body_max
+            || body_budget_present
+            || has_explicit_config_max
+            || has_explicit_config_budget;
+        if cap_present {
+            push_warn("max_think_tokens/budget dropped: thinking disabled".to_string());
+        }
+        let resolution = ReasoningResolution {
+            effective_mode: "disabled".to_string(),
+            effective_effort: None,
+            effective_cap: None,
+            cap_source: "none".to_string(),
+            contract,
+            warnings: warnings.clone(),
+        };
+        return Ok(resolution);
+    }
+    if matches!(contract, ReasoningContract::QwenJinja) && is_effort_native && body_budget_present {
+        push_warn(format!(
+            "thinking_budget '{}' ignored for effort-native contract {}: use explicit max_think_tokens for cap",
+            body_budget_str.unwrap(),
+            contract.wire_name()
+        ));
+    }
+    if matches!(contract, ReasoningContract::QwenJinja)
+        && is_effort_native
+        && has_explicit_config_budget
+    {
+        push_warn(format!(
+            "thinking_budget '{}' ignored for effort-native contract {}: use explicit max_think_tokens for cap",
+            config_budget_str.clone().unwrap(),
+            contract.wire_name()
+        ));
+    }
+
+    let (mut effective_cap, mut cap_source) = if matches!(contract, ReasoningContract::GemmaBoolean)
+    {
+        (None, "none".to_string())
+    } else if matches!(
+        contract,
+        ReasoningContract::DeepSeek4 | ReasoningContract::MuseGlimmer
+    ) && (has_explicit_body_max
+        || has_explicit_config_max
+        || body_budget_present
+        || has_explicit_config_budget)
+    {
+        if has_explicit_body_max {
+            push_warn(format!(
+                "{} {} dropped for {}: use reasoning_effort only",
+                if body_top_max_present {
+                    "max_think_tokens"
+                } else {
+                    "reasoning.max_tokens"
+                },
+                max_opt.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if has_explicit_config_max {
+            push_warn(format!(
+                "reasoning.max_tokens {} dropped for {}: use reasoning_effort only",
+                config_max_opt.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if body_budget_present {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for {}: use reasoning_effort only",
+                body_budget_str.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if has_explicit_config_budget {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for {}: use reasoning_effort only",
+                config_budget_str.clone().unwrap(),
+                contract.wire_name()
+            ));
+        }
+        (None, "none".to_string())
+    } else if has_explicit_body_max {
+        if body_budget_present {
+            push_warn(
+                "thinking_budget dropped because explicit max_think_tokens takes precedence"
+                    .to_string(),
+            );
+        }
+        (max_opt, body_max_source.to_string())
+    } else if !is_effort_native && body_budget_present {
+        let budget_str = body_budget_str.unwrap();
+        let mapped = match budget_str {
+            "off" => None,
+            "low" => Some(512),
+            "med" => Some(2048),
+            "high" => Some(8192),
+            "xhigh" => Some(24576),
+            "max" => Some(32768),
+            "uncapped" => Some(0),
+            other => {
+                push_warn(format!(
+                    "thinking_budget '{}' dropped: unknown preset",
+                    other
+                ));
+                None
+            }
+        };
+        if mapped.is_none() && budget_str != "off" && {
+            let known = ["low", "med", "high", "xhigh", "max", "uncapped"];
+            !known.contains(&budget_str)
+        } {
+            (None, "none".to_string())
+        } else {
+            (mapped, "explicit:body:thinking_budget".to_string())
+        }
+    } else if has_explicit_config_max {
+        (config_max_opt, "config:reasoning.max_tokens".to_string())
+    } else if !is_effort_native && has_explicit_config_budget {
+        let budget_str = config_budget_str.as_deref().unwrap();
+        let mapped = match budget_str {
+            "off" => None,
+            "low" => Some(512),
+            "med" => Some(2048),
+            "high" => Some(8192),
+            "xhigh" => Some(24576),
+            "max" => Some(32768),
+            "uncapped" => Some(0),
+            other => {
+                push_warn(format!(
+                    "thinking_budget '{}' dropped: unknown preset",
+                    other
+                ));
+                None
+            }
+        };
+        if mapped.is_none() && budget_str != "off" && {
+            let known = ["low", "med", "high", "xhigh", "max", "uncapped"];
+            !known.contains(&budget_str)
+        } {
+            (None, "none".to_string())
+        } else {
+            (mapped, "config:reasoning.budget".to_string())
+        }
+    } else {
+        (None, "none".to_string())
+    };
+    if effective_cap == Some(0) {
+        effective_cap = None;
+        cap_source = "none".to_string();
+    }
+    if let Some(value) = effective_cap {
+        request["max_think_tokens"] = serde_json::json!(value);
+    }
+    let mut effective_effort: Option<String> = None;
+    match contract {
+        ReasoningContract::QwenJinja => {
+            if !effort_native {
+                if has_explicit_effort {
+                    push_warn(format!(
+                        "reasoning_effort '{}' dropped: template does not natively support effort (Qwen3.6); use thinking_budget or max_think_tokens for cap",
+                        effort_raw.unwrap()
+                    ));
+                }
+                if config_effort_is_explicit && config_effort != "auto" {
+                    push_warn(format!(
+                        "reasoning.effort '{}' dropped: template does not natively support effort",
+                        config_effort
+                    ));
+                }
+                effective_effort = None;
+            } else if has_explicit_effort || config_effort_is_explicit {
+                let raw = if let Some(value) = effort_raw {
+                    value.to_owned()
+                } else {
+                    config_effort.clone()
+                };
+                if raw == "auto" {
+                    effective_effort = Some("xhigh".to_string());
+                    request["reasoning_effort"] = serde_json::json!("xhigh");
+                } else {
+                    match raw.as_str() {
+                        "low" | "medium" | "xhigh" => {
+                            if !supported_efforts.is_empty() && !supported_efforts.contains(&raw) {
+                                push_warn(format!(
+                                    "reasoning_effort '{}' dropped: not in supported {:?}",
+                                    raw, supported_efforts
+                                ));
+                                effective_effort = Some("xhigh".to_string());
+                                request["reasoning_effort"] = serde_json::json!("xhigh");
+                            } else {
+                                effective_effort = Some(raw.clone());
+                                request["reasoning_effort"] = serde_json::json!(raw);
+                            }
+                        }
+                        "high" | "max" | "minimal" | "med" => {
+                            push_warn(format!(
+                                "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
+                                raw
+                            ));
+                            effective_effort = Some("xhigh".to_string());
+                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                        }
+                        other => {
+                            push_warn(format!(
+                                "reasoning_effort '{}' normalized to qwen_jinja default xhigh",
+                                other
+                            ));
+                            effective_effort = Some("xhigh".to_string());
+                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                        }
+                    }
+                }
+            } else {
+                let default = "xhigh".to_string();
+                effective_effort = Some(default.clone());
+                request["reasoning_effort"] = serde_json::json!(default);
+            }
+        }
+        ReasoningContract::DeepSeek4 => {
+            let raw = if let Some(value) = effort_raw {
+                value.to_owned()
+            } else {
+                let cfg = config_string(resolved, "reasoning.effort")
+                    .unwrap_or_else(|_| "auto".to_string());
+                if cfg != "auto" {
+                    cfg
+                } else {
+                    "high".to_string()
+                }
+            };
+            let normalized = match raw.as_str() {
+                "minimal" => "low",
+                "low" => "low",
+                "medium" | "med" => "high",
+                "xhigh" => "high",
+                "high" => "high",
+                "max" => "max",
+                other => {
+                    push_warn(format!(
+                        "reasoning_effort '{}' normalized to deepseek4 default high",
+                        other
+                    ));
+                    "high"
+                }
+            };
+            effective_effort = Some(normalized.to_string());
+            request["reasoning_effort"] = serde_json::json!(normalized);
+        }
+        ReasoningContract::MuseGlimmer => {
+            let raw = if let Some(value) = effort_raw {
+                value.to_owned()
+            } else {
+                let cfg = config_string(resolved, "reasoning.effort")
+                    .unwrap_or_else(|_| "auto".to_string());
+                if cfg != "auto" {
+                    match cfg.as_str() {
+                        "low" | "medium" | "high" | "xhigh" | "max" => cfg,
+                        other => {
+                            push_warn(format!(
+                                "reasoning.effort '{}' normalized to muse_glimmer default high",
+                                other
+                            ));
+                            "high".to_string()
+                        }
+                    }
+                } else {
+                    "high".to_string()
+                }
+            };
+            let normalized = match raw.as_str() {
+                "low" => "low",
+                "medium" | "med" => "medium",
+                "high" => "high",
+                "xhigh" => "xhigh",
+                "max" => "xhigh",
+                other => {
+                    push_warn(format!(
+                        "reasoning_effort '{}' normalized to muse_glimmer default high",
+                        other
+                    ));
+                    "high"
+                }
+            };
+            effective_effort = Some(normalized.to_string());
+            request["reasoning_effort"] = serde_json::json!(normalized);
+        }
+        ReasoningContract::GemmaBoolean => {
+            effective_effort = None;
+        }
+        ReasoningContract::Unsupported => {
+            effective_effort = None;
+        }
+    }
+    let resolution = ReasoningResolution {
+        effective_mode: if thinking_enabled {
+            "enabled".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        effective_effort,
+        effective_cap,
+        cap_source,
+        contract,
+        warnings: warnings.clone(),
+    };
+    Ok(resolution)
+}
+
+pub(crate) fn config_value<'a>(
+    resolved: &'a hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<&'a hipfire_config::ConfigValue> {
+    resolved
+        .get(key)
+        .map(|value| &value.value)
+        .ok_or_else(|| anyhow!("missing resolved configuration key {key}"))
+}
+
+pub(crate) fn config_string(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<String> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::String(value) => Ok(value.clone()),
+        value => bail!("{key} resolved as {}, expected string", value.kind()),
+    }
+}
+
+pub(crate) fn config_bool(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<bool> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::Bool(value) => Ok(*value),
+        value => bail!("{key} resolved as {}, expected bool", value.kind()),
+    }
+}
+
+pub(crate) fn config_i64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<i64> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::Integer(value) => Ok(*value),
+        value => bail!("{key} resolved as {}, expected integer", value.kind()),
+    }
+}
+
+pub(crate) fn config_u64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<u64> {
+    let value = config_i64(resolved, key)?;
+    u64::try_from(value).map_err(|_| anyhow!("{key} cannot be negative"))
+}
+
+pub(crate) fn config_optional_u64(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<u64>> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::Null => Ok(None),
+        hipfire_config::ConfigValue::Integer(value) => u64::try_from(*value)
+            .map(Some)
+            .map_err(|_| anyhow!("{key} cannot be negative")),
+        value => bail!(
+            "{key} resolved as {}, expected integer or null",
+            value.kind()
+        ),
+    }
+}
+
+pub(crate) fn config_f64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<f64> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::Integer(value) => Ok(*value as f64),
+        hipfire_config::ConfigValue::Float(value) => Ok(*value),
+        value => bail!("{key} resolved as {}, expected number", value.kind()),
+    }
+}
+
+fn launch_tui(paths: &Paths, arguments: &[String]) -> Result<()> {
+    let executable = env::var_os("HIPFIRE_TUI_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let installed = paths.root.join("bin/hipfire-tui");
+            installed.is_file().then_some(installed)
+        })
+        .or_else(|| {
+            let workspace =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/hipfire-tui");
+            workspace.is_file().then_some(workspace)
+        })
+        .or_else(|| find_on_path("hipfire-tui"))
+        .ok_or_else(|| {
+            anyhow!(
+                "hipfire-tui is not installed; build it with `cargo build --release -p hipfire-tui`"
+            )
+        })?;
+    let status = Command::new(&executable)
+        .args(arguments)
+        .status()
+        .with_context(|| format!("failed to launch {}", executable.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("hipfire-tui exited with {status}")
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessRecord {
+    pid: u32,
+    rss_mb: u64,
+    command: String,
+}
+
+fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
+    let mut quantize = Vec::new();
+    let mut uploads = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return (quantize, uploads);
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let Ok(raw) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let command = String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .trim()
+            .to_owned();
+        if command.is_empty() {
+            continue;
+        }
+        let rss_mb = fs::read_to_string(entry.path().join("status"))
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmRSS:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+            })
+            .unwrap_or(0)
+            / 1024;
+        let record = ProcessRecord {
+            pid,
+            rss_mb,
+            command,
+        };
+        if record.command.contains("hf upload") {
+            uploads.push(record);
+        } else if record.command.contains("hipfire-quantize")
+            || record.command.contains("hipfire quantize")
+        {
+            quantize.push(record);
+        }
+    }
+    (quantize, uploads)
+}
+
+fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
+    let (_, resolved) = resolved_global(paths, true)?;
+    let host = config_string(&resolved, "serve.host")?;
+    let port = config_u64(&resolved, "serve.port")? as u16;
+    let pid_path = paths.root.join("serve.pid");
+    let pid_record = fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw));
+    let pid = pid_record.as_ref().map(|record| record.pid);
+    let alive = pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+    let health = http_get_json(&host, port, "/health");
+    let stats = http_get_json(&host, port, "/stats");
+    let (quantize, uploads) = scan_auxiliary_processes();
+    let report = serde_json::json!({
+        "running": health.is_some(),
+        "pid": pid,
+        "pid_record": pid_record,
+        "pid_alive": alive,
+        "endpoint": service_url(&host, port, ""),
+        "health": health,
+        "stats": stats,
+        "quantize": quantize,
+        "uploads": uploads,
+    });
+    if output.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report["running"].as_bool() == Some(true) {
+        println!(
+            "hipfire serve is online at {}",
+            report["endpoint"].as_str().unwrap()
+        );
+        println!(
+            "  pid:       {}",
+            pid.map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        println!(
+            "  model:     {}",
+            report
+                .pointer("/health/model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("idle")
+        );
+        println!(
+            "  requests:  {}",
+            report
+                .pointer("/stats/requests_served")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+        if let Some(tok_s) = report
+            .pointer("/stats/recent_tok_s")
+            .and_then(serde_json::Value::as_f64)
+        {
+            println!("  recent:    {tok_s:.2} tok/s");
+        }
+    } else if alive {
+        println!(
+            "hipfire serve PID {} is alive but HTTP is not ready",
+            pid.unwrap()
+        );
+    } else {
+        println!("hipfire serve is not running");
+    }
+    for (label, records) in [("quantize", &quantize), ("HF upload", &uploads)] {
+        for process in records {
+            println!(
+                "{label}: PID {}  {} MB  {}",
+                process.pid, process.rss_mb, process.command
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn http_get_json(host: &str, port: u16, path: &str) -> Option<serde_json::Value> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(1)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut response = agent.get(&service_url(host, port, path)).call().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let text = response.body_mut().read_to_string().ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct SampleStats {
+    median: f64,
+    mean: f64,
+    min: f64,
+    max: f64,
+    stdev: f64,
+}
+
+fn sample_stats(values: &[f64]) -> Option<SampleStats> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let median = if sorted.len().is_multiple_of(2) {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let variance = sorted
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / sorted.len() as f64;
+    Some(SampleStats {
+        median,
+        mean,
+        min: sorted[0],
+        max: sorted[sorted.len() - 1],
+        stdev: variance.sqrt(),
+    })
+}
+
+/// Default standard-bench prompt. Historical numbers depend on its exact
+/// bytes; do not change it.
+const BENCH_DEFAULT_PROMPT: &str = "Explain the theory of general relativity in simple terms.";
+
+/// Below this tokenized prompt length the measured `prefill_tok_s` is launch
+/// overhead, not prefill throughput (363 tok/s at ~24 tokens vs 886 at 4.4k
+/// on a 7900 XTX with the same binary).
+const BENCH_PREFILL_EVIDENCE_TOKENS: u64 = 256;
+
+/// Resolve the standard-benchmark prompt: `--prompt-file` reads the file
+/// verbatim (raw bytes, no trimming — one newline can move τ by 17%), else
+/// the positional words joined with spaces, else the historical default.
+/// The clap `conflicts_with` on `--prompt-file` covers CLI parsing; the
+/// explicit check here covers programmatically built args.
+fn resolve_bench_prompt(args: &BenchArgs) -> Result<String> {
+    if let Some(path) = args.prompt_file.as_deref() {
+        if !args.prompt.is_empty() {
+            bail!("--prompt-file cannot be combined with a positional prompt");
+        }
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read --prompt-file {}", path.display()))?;
+        return String::from_utf8(bytes)
+            .with_context(|| format!("--prompt-file {} is not valid UTF-8", path.display()));
+    }
+    Ok(if args.prompt.is_empty() {
+        BENCH_DEFAULT_PROMPT.to_owned()
+    } else {
+        args.prompt.join(" ")
+    })
+}
+
+/// Hex md5 of the exact prompt bytes sent, so two bench numbers are only
+/// compared when their prompts are byte-identical.
+fn bench_prompt_md5(prompt: &str) -> String {
+    format!("{:x}", md5::compute(prompt.as_bytes()))
+}
+
+/// Short-prompt caveat: below 256 prompt tokens `prefill_tok_s` measures
+/// launch overhead, not prefill throughput.
+fn bench_prompt_warning(prompt_tokens: u64) -> Option<String> {
+    (prompt_tokens < BENCH_PREFILL_EVIDENCE_TOKENS).then(|| {
+        format!(
+            "prompt is {prompt_tokens} tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+        )
+    })
+}
+
+/// Prompt length as the daemon reports it on the `done` event:
+/// `prefill_tokens` (rows actually prefilled) plus `cached_tokens` (prefix
+/// served from the prompt cache). `None` when the event carries neither.
+fn bench_prompt_tokens_from_done(done: &serde_json::Value) -> Option<u64> {
+    let prefill = done
+        .get("prefill_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let cached = done
+        .get("cached_tokens")
+        .and_then(serde_json::Value::as_u64);
+    match (prefill, cached) {
+        (None, None) => None,
+        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
+    }
+}
+
+fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
+    if args.runs == 0 {
+        bail!("--runs must be positive");
+    }
+    if args.exp && (args.matrix || args.redline) {
+        bail!("--exp cannot be combined with matrix or Redline options");
+    }
+    if args.ttft && args.matrix {
+        bail!("--ttft cannot be combined with --matrix (it measures the standard generate path)");
+    }
+    if args.exp && args.json {
+        bail!("--json is not supported with --exp");
+    }
+    // --exp runs a fixed 128-token protocol across five RDNA2 variants and
+    // ignores --max-tokens, so it can never give a think span room to close.
+    // Reject the combination rather than silently drop the flag and abort
+    // later on an open-think terminal.
+    if args.exp && args.reasoning_on {
+        bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
+    }
+    if let Some(spec) = args.concurrency.clone() {
+        if args.json {
+            bail!(
+                "--json is not supported with --concurrency; omit --json for the concurrency table, \
+                 or run without --concurrency for standard bench JSON (including kv_backend fields)"
+            );
+        }
+        return bench_concurrency_command(paths, &args, &spec);
+    }
+    for (name, values) in [
+        ("--pp", &args.pp),
+        ("--ctx", &args.ctx),
+        ("--sustained-ctx", &args.sustained_ctx),
+    ] {
+        if values.is_empty() || values.contains(&0) {
+            bail!("{name} values must be positive");
+        }
+    }
+    if args.tg == 0 || args.sustained_tg == Some(0) {
+        bail!("decode lengths must be positive");
+    }
+    if let Some(mode) = args.kv_mode.as_deref() {
+        // Validate against the canonical `memory.kv_cache` schema instead of a
+        // local subset. The old hardcoded list accepted only q8/fwht{2,3,4} and
+        // so rejected `f32`/`f16` — the only KV formats DeepSeek V4 implements,
+        // and precisely what the loader tells you to pass when it falls back
+        // ("Pass --kv f32 for the golden configuration"). That made the advised
+        // configuration unreachable through `bench`.
+        let field = hipfire_config::field("memory.kv_cache")
+            .ok_or_else(|| anyhow!("missing memory.kv_cache configuration field"))?;
+        field
+            .validate(&hipfire_config::ConfigValue::String(mode.to_owned()))
+            .map_err(|err| anyhow!("--kv-mode {mode}: {err}"))?;
+    }
+
+    if args.exp {
+        return bench_experimental(paths, &args);
+    }
+    let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
+    let prompt = resolve_bench_prompt(&args)?;
+    let prompt_md5 = bench_prompt_md5(&prompt);
+    let prompt_chars = prompt.chars().count() as u64;
+    eprintln!("hipfire bench");
+    eprintln!("  model:  {}", args.model);
+    eprintln!(
+        "  arch:   {}",
+        loaded
+            .get("arch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    );
+    eprintln!(
+        "  gpu:    {}",
+        post_diag
+            .get("arch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    );
+    eprintln!("  runs:   {}", args.runs);
+    eprintln!("  max_tokens: {}", args.max_tokens);
+    eprintln!("  prompt_md5: {prompt_md5}");
+    eprintln!("  prompt_chars: {prompt_chars}");
+    if args.matrix || args.redline {
+        bench_matrix(&mut engine, &args, &loaded, &post_diag)
+    } else if args.ttft {
+        bench_ttft(
+            &mut engine,
+            &args,
+            &prompt,
+            &prompt_md5,
+            prompt_chars,
+            &loaded,
+            &post_diag,
+        )
+    } else {
+        // The warmup exists to populate kernel caches and its output is
+        // discarded, so it stays in answer mode even under --reasoning-on: a
+        // 16-token budget cannot close a think span, and letting the warmup
+        // think would abort the run before a single measured sample.
+        let _ = bench_generate(&mut engine, "Hello", 16)?;
+        let mut decode = Vec::new();
+        let mut prefill = Vec::new();
+        let mut wall = Vec::new();
+        let mut ttft = Vec::new();
+        let mut prompt_tokens: Option<u64> = None;
+        for _ in 0..args.runs {
+            let done = bench_generate_with_reasoning(
+                &mut engine,
+                &prompt,
+                args.max_tokens as u64,
+                args.reasoning_on,
+            )?;
+            // Every run uses the same prompt, so the daemon's tokenized
+            // prompt length is run-invariant; keep the first report. The
+            // done event reports the prompt as `prefill_tokens` (rows the
+            // engine actually prefilled) plus `cached_tokens` (prefix served
+            // from the prompt cache); the prompt is their sum.
+            if prompt_tokens.is_none() {
+                prompt_tokens = bench_prompt_tokens_from_done(&done);
+            }
+            if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
+                decode.push(value);
+            }
+            if let Some(value) = done
+                .get("prefill_tok_s")
+                .and_then(serde_json::Value::as_f64)
+            {
+                prefill.push(value);
+            }
+            if let Some(value) = done.get("tok_s").and_then(serde_json::Value::as_f64) {
+                wall.push(value);
+            }
+            if let Some(value) = done.get("ttft_ms").and_then(serde_json::Value::as_f64) {
+                ttft.push(value);
+            }
+            eprint!(".");
+            std::io::stderr().flush()?;
+        }
+        eprintln!();
+        // Below 256 prompt tokens prefill_tok_s is launch overhead, not
+        // prefill throughput — say so in the report instead of leaving a
+        // bare number that invites a wrong comparison.
+        let warnings: Vec<String> = prompt_tokens
+            .and_then(bench_prompt_warning)
+            .into_iter()
+            .collect();
+        if let Some(tokens) = prompt_tokens {
+            eprintln!("  prompt_tokens: {tokens}");
+        }
+        for warning in &warnings {
+            eprintln!("  warning: {warning}");
+        }
+        let report = with_loaded_kv_backend_fields(
+            serde_json::json!({
+                "protocol": "native-generate-v1",
+                "model": args.model,
+                "loaded": loaded,
+                "gpu": post_diag,
+                "vram_free_before_mb": pre_diag.get("vram_free_mb"),
+                "max_tokens": args.max_tokens,
+                "runs": args.runs,
+                "batch": 1,
+                "prompt_tokens": prompt_tokens,
+                "prompt_md5": prompt_md5,
+                "prompt_chars": prompt_chars,
+                "warnings": warnings,
+                "decode_tok_s": sample_stats(&decode),
+                "prefill_tok_s": sample_stats(&prefill),
+                "wall_tok_s": sample_stats(&wall),
+                "ttft_ms": sample_stats(&ttft),
+                "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
+            }),
+            &loaded,
+        );
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_sample_row("decode", sample_stats(&decode));
+            print_sample_row("prefill", sample_stats(&prefill));
+            print_sample_row("wall", sample_stats(&wall));
+            print_sample_row("ttft ms", sample_stats(&ttft));
+        }
+        Ok(())
+    }
+}
+
+/// Concurrency sweep across both concurrent backends. Only reached when
+/// `--concurrency` is given; the single-stream path above is untouched.
+fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
+    use crate::bench_concurrency::{
+        parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
+        DaemonDriver, Point, SequentialDriver, SlotDriver, WorkloadSel,
+    };
+
+    let points = parse_concurrency(spec)?;
+    let max_k = *points.iter().max().expect("non-empty");
+    let backend_sel = match args.backend.as_str() {
+        "slots" => BackendSel::Slots,
+        "noslots" => BackendSel::Sequential,
+        "batch" => BackendSel::Batch,
+        _ => BackendSel::Both,
+    };
+    let arms: Vec<WorkloadSel> = match args.workload.as_str() {
+        "stateless" => vec![WorkloadSel::Stateless],
+        "multiturn" => vec![WorkloadSel::Multiturn],
+        _ => vec![WorkloadSel::Stateless, WorkloadSel::Multiturn],
+    };
+
+    eprintln!("hipfire bench — concurrency sweep");
+    eprintln!("  model:       {}", args.model);
+    eprintln!("  concurrency: {points:?}");
+    eprintln!("  runs/point:  {}", args.runs);
+    eprintln!("  max_tokens:  {}", args.max_tokens);
+
+    let mut out: Vec<Point> = Vec::new();
+
+    // The two backends run STRICTLY SEQUENTIALLY, and the scope below is what
+    // enforces it. Each holds a full copy of the model's weights -- 18.7 GB for
+    // a 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
+    // box with no swap that is not "slower", it is an OOM kill. `SlotEngine`'s
+    // Drop closes its channel and joins the worker thread that owns the Gpu,
+    // weights and KV arenas, so leaving this scope is what actually frees the
+    // first model before the daemon loads the second.
+    if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut slot_args = args.clone();
+        slot_args.concurrency = None;
+        // 2048-token slots, not the serve default of 8192: the sweep's prompts
+        // are one short turn and --max-tokens is small, so a larger arena buys
+        // nothing and multiplies per-slot KV by four.
+        let (engine, loaded, _, _) = open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+        let slot_capable = loaded
+            .get("experimental_multi_slot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match SlotDriver::start(engine, max_k, slot_capable) {
+            Ok(mut d) => {
+                eprintln!("  slots backend up ({max_k} slots)");
+                let r = sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                );
+                // Free the weights before the batch backend loads its own copy,
+                // even on the error path.
+                drop(d);
+                r?;
+            }
+            // A backend that cannot run this model is a RESULT, not a crash.
+            Err(e) => eprintln!("  slots backend unavailable: {e}"),
+        }
+    }
+
+    // No-slots baseline: k requests one after another through the ordinary
+    // daemon path. Runs after the slots engine has been dropped, so only one
+    // copy of the weights is ever resident.
+    if matches!(backend_sel, BackendSel::Sequential | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut seq_args = args.clone();
+        seq_args.concurrency = None;
+        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
+        let mut d = SequentialDriver::start(engine, max_k)?;
+        eprintln!("  noslots backend up (sequential daemon path)");
+        let r = sweep_backend(
+            &mut d as &mut dyn ConcurrencyBackend,
+            &arms,
+            &points,
+            args.runs,
+            args.max_tokens as u64,
+            &mut out,
+        );
+        drop(d);
+        r?;
+    }
+
+    if matches!(backend_sel, BackendSel::Batch | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut batch_args = args.clone();
+        batch_args.concurrency = None;
+        let (engine, loaded, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
+        let capable = loaded
+            .get("continuous_batch_capable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match DaemonDriver::start(engine, max_k, capable) {
+            Ok(mut d) => {
+                eprintln!("  batch backend up (continuous_batch_size={max_k})");
+                sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                )?;
+            }
+            Err(e) => eprintln!("  batch backend unavailable: {e}"),
+        }
+    }
+
+    println!("{}", render_table(&out));
+    Ok(())
+}
+
+/// Refuse to load a model that will not fit in available host memory.
+///
+/// The GPU allocates from system RAM on this class of box and there is no
+/// swap, so an overcommit is an OOM kill of the whole machine rather than a
+/// slow run. Checked between the two backends because that is precisely where
+/// a leaked first model would show up: if the slots engine did not actually
+/// release its weights, `MemAvailable` is still depressed here and this stops
+/// the sweep instead of taking the box down.
+///
+/// `memory.oom_guard` (default `auto`) opts out or forces the check on: this
+/// process never initializes a GPU, so `auto` falls back to host swap state —
+/// with swap an overcommit degrades rather than kills and the check stands
+/// down; without swap it stays up. A discrete-GPU box that wants the check
+/// anyway pins `memory.oom_guard=true`.
+fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
+    if !hipfire_config::oom_guard_effective(None) {
+        eprintln!("memory headroom guard inactive (memory.oom_guard); continuing sweep");
+        return Ok(());
+    }
+    let registry = load_registry(&paths.registry).registry;
+    let Some(path) = find_model_path(paths, &registry, model) else {
+        return Ok(());
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(());
+    };
+    let need = meta.len();
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return Ok(());
+    };
+    let avail_kb = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let avail = avail_kb * 1024;
+    // 20% headroom over the raw weight bytes for KV arenas and scratch.
+    let want = need + need / 5;
+    if avail < want {
+        bail!(
+            "refusing to load {}: needs ~{:.1} GB with headroom, only {:.1} GB available. \
+             A previous backend may not have released its weights.",
+            path.display(),
+            want as f64 / 1e9,
+            avail as f64 / 1e9
+        );
+    }
+    Ok(())
+}
+
+/// `open_bench_engine`, but loading with `continuous_batch_size` set so the
+/// daemon allocates batch lanes and advertises `continuous_batch_capable`.
+/// The value is fixed per load, which is why the sweep holds it at max.
+fn open_bench_engine_batched(
+    paths: &Paths,
+    args: &BenchArgs,
+    batch_size: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    open_bench_engine(
+        paths,
+        args,
+        None,
+        &BenchLoadOpts {
+            continuous_batch: Some(batch_size),
+            ..Default::default()
+        },
+    )
+}
+
+/// Spawn a daemon and load the model with `experimental_multi_slot=true` so
+/// the slot backend owns the GPU. The slot count and per-slot context cap are
+/// fixed per load, which is why the sweep holds them at max.
+fn open_bench_engine_slots(
+    paths: &Paths,
+    args: &BenchArgs,
+    slots: usize,
+    ctx: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    open_bench_engine(
+        paths,
+        args,
+        None,
+        &BenchLoadOpts {
+            multi_slot: Some((slots, ctx)),
+            ..Default::default()
+        },
+    )
+}
+
+/// Optional load-time knobs for `open_bench_engine`, threaded explicitly
+/// rather than via `std::env::set_var` — `hipfire_config::developer_var`
+/// reads the OnceLock process-config snapshot, not the ambient environment,
+/// so a set_var inside the process is invisible once the snapshot is taken.
+#[derive(Default)]
+struct BenchLoadOpts {
+    multi_slot: Option<(usize, usize)>,
+    continuous_batch: Option<usize>,
+}
+
+fn open_bench_engine(
+    paths: &Paths,
+    args: &BenchArgs,
+    rdna2_variant: Option<u8>,
+    load_opts: &BenchLoadOpts,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    let registry = load_registry(&paths.registry).registry;
+    let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
+        .unwrap_or((None, None));
+    let mut path = find_model_path(paths, &registry, &args.model);
+    if path.is_none() && entry.is_some() {
+        pull_command(
+            paths,
+            PullArgs {
+                model: args.model.clone(),
+                force: false,
+            },
+        )?;
+        path = entry.as_ref().map(|entry| paths.models.join(&entry.file));
+    }
+    let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
+    let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+    let environment = BTreeMap::new();
+    let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    if args.redline {
+        process_config.values.set_cli("replay.backend", "redline")?;
+        process_config.values.set_cli("replay.transport", "pm4")?;
+        process_config
+            .values
+            .set_cli("experimental.graph.ar", "true")?;
+        process_config
+            .values
+            .set_cli("experimental.graph.forward", "true")?;
+    }
+    if let Some(variant) = rdna2_variant {
+        process_config
+            .values
+            .set_cli("diagnostic.kernel.rdna2_variant", &variant.to_string())?;
+    }
+    let mut engine = Engine::spawn_configured(daemon, &environment, &process_config)?;
+    engine.ping()?;
+    let pre_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
+    let longest_prefill = args.pp.iter().copied().max().unwrap_or(0) as u64;
+    let longest_decode = args
+        .ctx
+        .iter()
+        .chain(args.sustained_ctx.iter())
+        .copied()
+        .max()
+        .unwrap_or(0) as u64
+        + args.sustained_tg.unwrap_or(args.tg) as u64;
+    let max_tokens = config_u64(&resolved, "generation.max_tokens")?;
+    let mut params = load_params(
+        &resolved,
+        entry.as_ref(),
+        &paths.models,
+        &path,
+        max_tokens,
+        args.kv_mode.as_deref(),
+        args.kv_backend.as_deref(),
+        tag.as_deref(),
+        false,
+        // No --head on this path yet; the model's own head is used.
+        None,
+    )?;
+    apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
+    if let Some(selector) = args.speculation.as_deref() {
+        apply_speculation_selector(&mut params, selector)?;
+    }
+    // Registry sidecar for a final auto/on selector the config-time
+    // load_params could not see (config-off + `bench --spec dflash`).
+    resolve_dflash_sidecar(
+        &mut params,
+        entry.as_ref(),
+        &paths.models,
+        &path,
+        tag.as_deref(),
+    )?;
+    resolve_mtp_sidecar(
+        &mut params,
+        entry.as_ref(),
+        &paths.models,
+        &path,
+        &args.model,
+        tag.as_deref(),
+    );
+    if args.matrix || args.redline {
+        let requested = longest_prefill.max(longest_decode).saturating_add(32);
+        // Automatic max_seq stays omitted so admission can derive the bound.
+        // An explicit user value is never silently inflated — refuse if too small.
+        if let Some(configured) = params.get("max_seq").and_then(|v| v.as_u64()) {
+            if configured < requested {
+                bail!(
+                    "memory.max_seq={configured} is below bench requirement {requested} \
+                     (longest prefill/decode + 32); raise max_seq or shrink the matrix"
+                );
+            }
+        }
+    }
+    if let Some(n) = load_opts.continuous_batch {
+        params["continuous_batch_size"] = serde_json::json!(n as u64);
+    }
+    if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
+        params["tp"] = serde_json::json!(tp);
+    }
+    if let Some((slots, ctx)) = load_opts.multi_slot {
+        params["experimental_multi_slot"] = serde_json::json!(true);
+        params["experimental_multi_slot_slots"] = serde_json::json!(slots as u64);
+        params["experimental_multi_slot_ctx"] = serde_json::json!(ctx as u64);
+    }
+    let loaded = engine.load(&path, params)?;
+    let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
+    Ok((engine, loaded, pre_diag, post_diag))
+}
+
+/// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
+///
+/// Answer mode is the default rather than an opt-in so every model runs the
+/// same turn shape. A reasoning model (any Qwen3.6 SKU, for one) opens
+/// `<think>` within its first tokens and would spend the benchmark's whole
+/// budget — 16 tokens for the warmup, 128 for a measured run — inside it,
+/// ending every sample mid-thought at `finish_reason=length`.
+///
+/// Benchmarks measure tokens per second and never read the text, so asking for
+/// answer mode costs nothing and keeps the measured path independent of how
+/// long a model thinks. `--reasoning-on` restores the thinking turn for anyone
+/// who wants to measure that path.
+fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
+    bench_generate_request_reasoning(prompt, max_tokens, false)
+}
+
+fn bench_generate_request_reasoning(
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({
+        "type": "generate",
+        "id": request_id(),
+        "prompt": prompt,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repeat_penalty": 1.1,
+        "max_tokens": max_tokens,
+        "attempt_id": 1,
+    });
+    if !reasoning_on {
+        request["max_think_tokens"] = serde_json::json!(1);
+        request["assistant_prefix"] = serde_json::json!("closed_think");
+        request["reasoning_effort"] = serde_json::json!("none");
+    }
+    request
+}
+
+fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
+    Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
+}
+
+fn bench_generate_with_reasoning(
+    engine: &mut Engine,
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> Result<serde_json::Value> {
+    let request = bench_generate_request_reasoning(prompt, max_tokens, reasoning_on);
+    Ok(engine.generate(&request, |_| Ok(()))?)
+}
+
+fn bench_probe(
+    engine: &mut Engine,
+    message: serde_json::Value,
+    expected: &str,
+) -> Result<serde_json::Value> {
+    let response = engine.request(&message)?;
+    match response.get("type").and_then(serde_json::Value::as_str) {
+        Some(actual) if actual == expected => Ok(response),
+        Some("error") => bail!(
+            "{}",
+            response
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("benchmark probe failed")
+        ),
+        other => bail!(
+            "expected {expected}, received {}",
+            other.unwrap_or("missing type")
+        ),
+    }
+}
+
+/// Client-side TTFT on the standard generate path: per run, generate a
+/// single token with thinking off and time wall clock from request send to
+/// the first streamed `token` event. `pp_tok_s = prompt_tokens / ttft_s` is
+/// the competitor-comparable prefill number (radiance reports
+/// prompt_tokens/TTFT p50 at an HTTP client). Warmups run the same shape
+/// and are discarded. `--reasoning-on` is intentionally ignored here: the
+/// metric is defined with thinking off.
+fn bench_ttft(
+    engine: &mut Engine,
+    args: &BenchArgs,
+    prompt: &str,
+    prompt_md5: &str,
+    prompt_chars: u64,
+    loaded: &serde_json::Value,
+    diag: &serde_json::Value,
+) -> Result<()> {
+    // The shared bench banner prints args.max_tokens; the ttft path always
+    // generates exactly one token with thinking off, so say so explicitly.
+    eprintln!("  ttft shape: max_tokens=1, thinking off");
+    for _ in 0..args.warmups {
+        let _ = bench_generate(engine, prompt, 1)?;
+    }
+    let mut ttft_ms_samples = Vec::new();
+    let mut prompt_tokens: Option<u64> = None;
+    for _ in 0..args.runs {
+        let start = Instant::now();
+        let mut first: Option<Duration> = None;
+        let request = bench_generate_request(prompt, 1);
+        let done = engine.generate(&request, |event| {
+            if first.is_none()
+                && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+            {
+                first = Some(start.elapsed());
+            }
+            Ok(())
+        })?;
+        let elapsed = first.ok_or_else(|| {
+            anyhow!("no streamed token observed; cannot measure client-side TTFT")
+        })?;
+        ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
+        if prompt_tokens.is_none() {
+            prompt_tokens = bench_prompt_tokens_from_done(&done);
+        }
+        eprint!(".");
+        std::io::stderr().flush()?;
+    }
+    eprintln!();
+    if let Some(tokens) = prompt_tokens {
+        eprintln!("  prompt_tokens: {tokens}");
+    }
+    let pp_samples: Vec<f64> = match prompt_tokens {
+        Some(tokens) if tokens > 0 => ttft_ms_samples
+            .iter()
+            .map(|ms| tokens as f64 / (ms / 1000.0))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let ttft_stats = sample_stats(&ttft_ms_samples);
+    let pp_stats = sample_stats(&pp_samples);
+    let report = with_loaded_kv_backend_fields(
+        serde_json::json!({
+            "protocol": "client-ttft-v1",
+            "model": args.model,
+            "loaded": loaded,
+            "gpu": diag,
+            "max_tokens": 1,
+            "runs": args.runs,
+            "warmups": args.warmups,
+            "batch": 1,
+            "prompt_tokens": prompt_tokens,
+            "prompt_md5": prompt_md5,
+            "prompt_chars": prompt_chars,
+            "ttft": {
+                "samples": ttft_ms_samples,
+                "median": ttft_stats.map(|stats| stats.median),
+                "stdev": ttft_stats.map(|stats| stats.stdev),
+                "prompt_tokens": prompt_tokens,
+                "prompt_md5": prompt_md5,
+            },
+            "pp_tok_s": pp_stats,
+            "pp_tok_s_samples": pp_samples,
+        }),
+        loaded,
+    );
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_sample_row("ttft ms", ttft_stats);
+        print_sample_row("pp tok/s", pp_stats);
+    }
+    Ok(())
+}
+
+fn bench_matrix(
+    engine: &mut Engine,
+    args: &BenchArgs,
+    loaded: &serde_json::Value,
+    diag: &serde_json::Value,
+) -> Result<()> {
+    for size in &args.pp {
+        let _ = bench_probe(
+            engine,
+            serde_json::json!({ "type": "bench_prefill", "tokens": size }),
+            "prefill_result",
+        )?;
+    }
+    let warm_context = args.ctx[0];
+    for _ in 0..args.warmups {
+        let _ = bench_probe(
+            engine,
+            serde_json::json!({ "type": "bench_decode", "context_tokens": warm_context, "iterations": args.tg }),
+            "decode_result",
+        )?;
+    }
+    let mut pp_rows = Vec::new();
+    for size in &args.pp {
+        let mut samples = Vec::new();
+        for _ in 0..args.runs {
+            let result = bench_probe(
+                engine,
+                serde_json::json!({ "type": "bench_prefill", "tokens": size }),
+                "prefill_result",
+            )?;
+            samples.push(
+                result
+                    .get("tok_s")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+            );
+        }
+        eprintln!(
+            "  pp{size}: {:.2} tok/s median",
+            sample_stats(&samples).unwrap().median
+        );
+        pp_rows.push(serde_json::json!({ "tokens": size, "stats": sample_stats(&samples), "samples": samples }));
+    }
+    let mut decode_rows = Vec::new();
+    for context in &args.ctx {
+        let _ = bench_probe(
+            engine,
+            serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": args.tg }),
+            "decode_result",
+        )?;
+        let mut samples = Vec::new();
+        for _ in 0..args.runs {
+            let result = bench_probe(
+                engine,
+                serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": args.tg }),
+                "decode_result",
+            )?;
+            samples.push(
+                result
+                    .get("tok_s")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+            );
+        }
+        eprintln!(
+            "  tg{}@{}: {:.2} tok/s median",
+            args.tg,
+            context,
+            sample_stats(&samples).unwrap().median
+        );
+        decode_rows.push(serde_json::json!({ "context": context, "tokens": args.tg, "stats": sample_stats(&samples), "samples": samples }));
+    }
+    let mut sustained_rows = Vec::new();
+    if let Some(tg) = args.sustained_tg {
+        for context in &args.sustained_ctx {
+            let _ = bench_probe(
+                engine,
+                serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": tg }),
+                "decode_result",
+            )?;
+            let mut samples = Vec::new();
+            for _ in 0..args.runs {
+                let result = bench_probe(
+                    engine,
+                    serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": tg }),
+                    "decode_result",
+                )?;
+                samples.push(
+                    result
+                        .get("tok_s")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                );
+            }
+            eprintln!(
+                "  tg{tg}@{context}: {:.2} tok/s median",
+                sample_stats(&samples).unwrap().median
+            );
+            sustained_rows.push(serde_json::json!({ "context": context, "tokens": tg, "stats": sample_stats(&samples), "samples": samples }));
+        }
+    }
+    let report = with_loaded_kv_backend_fields(
+        serde_json::json!({
+            "protocol": "synthetic-pp-tg-matrix-v1",
+            "model": args.model,
+            "loaded": loaded,
+            "gpu": diag,
+            "redline_pm4": args.redline,
+            "kv_mode": args.kv_mode,
+            "runs": args.runs,
+            "prefill": pp_rows,
+            "decode": decode_rows,
+            "sustained": sustained_rows,
+        }),
+        loaded,
+    );
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    }
+    Ok(())
+}
+
+fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
+    let mut rows = Vec::new();
+    for variant in 1..=5 {
+        let (mut engine, _, _, diag) = open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
+        let arch = diag
+            .get("arch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        if !matches!(arch, "gfx1030" | "gfx1031") {
+            bail!("--exp requires RDNA2 (gfx1030/gfx1031), detected {arch}");
+        }
+        let _ = bench_generate(&mut engine, "Hello", 16)?;
+        let prompt = resolve_bench_prompt(args)?;
+        let mut samples = Vec::new();
+        for _ in 0..args.runs {
+            let done = bench_generate(&mut engine, &prompt, 128)?;
+            if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
+                samples.push(value);
+            }
+        }
+        let stats = sample_stats(&samples)
+            .ok_or_else(|| anyhow!("variant {variant} produced no measurements"))?;
+        println!(
+            "v{variant}: median {:.2}, mean {:.2}, range {:.2}-{:.2} tok/s",
+            stats.median, stats.mean, stats.min, stats.max
+        );
+        rows.push((variant, stats));
+    }
+    if let Some((variant, stats)) = rows.iter().max_by(|a, b| a.1.median.total_cmp(&b.1.median)) {
+        println!("best: v{variant} at {:.2} tok/s median", stats.median);
+    }
+    Ok(())
+}
+
+fn print_sample_row(label: &str, stats: Option<SampleStats>) {
+    if let Some(stats) = stats {
+        println!(
+            "  {label:<10} median {:>9.2}  mean {:>9.2}  range {:>9.2}-{:>9.2}  sd {:>7.2}",
+            stats.median, stats.mean, stats.min, stats.max, stats.stdev
+        );
+    }
+}
+
+fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
+    let mut engine = if let Some(model) = args.model.as_deref() {
+        eprintln!("loading {model} once so its kernels are present in the inventory...");
+        let bench = BenchArgs {
+            model: model.to_owned(),
+            runs: 1,
+            tp: None,
+            json: false,
+            exp: false,
+            matrix: false,
+            ttft: false,
+            pp: vec![128],
+            ctx: vec![128],
+            tg: 1,
+            max_tokens: 128,
+            sustained_tg: None,
+            sustained_ctx: vec![128],
+            warmups: 1,
+            kv_mode: None,
+            kv_k: None,
+            kv_v: None,
+            kv_backend: None,
+            redline: false,
+            speculation: None,
+            reasoning_on: false,
+            concurrency: None,
+            backend: "both".to_owned(),
+            workload: "both".to_owned(),
+            prompt: Vec::new(),
+            prompt_file: None,
+        };
+        let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
+        let _ = bench_generate(&mut engine, "Hello", 1)?;
+        engine
+    } else {
+        let (_, resolved) = resolved_global(paths, true)?;
+        let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+        let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+        let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+        engine.ping()?;
+        engine
+    };
+    let mut report = engine.request(&serde_json::json!({ "type": "profile" }))?;
+    if report.get("type").and_then(serde_json::Value::as_str) != Some("profile") {
+        bail!(
+            "daemon profile failed: {}",
+            report
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unexpected response")
+        );
+    }
+    if let Some(filter) = args.kernel.as_deref() {
+        let filtered = report
+            .get("kernels")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|kernel| {
+                kernel
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name.contains(filter))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        report["kernels"] = serde_json::Value::Array(filtered);
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        let gpu = &report["gpu"];
+        println!(
+            "GPU: {} ({})",
+            gpu.get("arch")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            gpu.get("generation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        println!(
+            "{} CUs | peak BW {:.0} GB/s | boost {} MHz | ridge {:.1} FLOP/byte",
+            gpu.get("cu_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            gpu.get("peak_bw_gbs")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            gpu.get("boost_clock_mhz")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            gpu.get("ridge_point")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+        );
+        let kernels = report["kernels"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        println!("\nKernel report ({} kernels):", kernels.len());
+        println!(
+            "  {:<38} {:>5} {:>5} {:>8} {:>10}  limiter",
+            "kernel", "VGPR", "SGPR", "LDS", "occupancy"
+        );
+        for kernel in kernels {
+            println!(
+                "  {:<38} {:>5} {:>5} {:>8} {:>9.1}%  {}",
+                kernel
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                kernel
+                    .get("vgprs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                kernel
+                    .get("sgprs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                kernel
+                    .get("lds_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                kernel
+                    .pointer("/occupancy/pct")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+                kernel
+                    .pointer("/occupancy/limiter")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+            );
+        }
+        println!("\nFor phase-aware ISA fit evidence, run python3 scripts/kernel_atlas.py render-fit --row <atlas-row.json>.");
+    }
+    Ok(())
+}
+
+fn version_command(paths: &Paths, output: OutputArgs) -> Result<()> {
+    let installed = paths.root.join("src");
+    let (source_kind, source) = if installed.join("Cargo.toml").is_file() {
+        ("managed", installed)
+    } else {
+        (
+            "build checkout",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        )
+    };
+    let source = fs::canonicalize(&source).unwrap_or(source);
+    let source_commit = git_output(&source, &["rev-parse", "--verify", "HEAD"]).ok();
+    let source_ref = git_output(&source, &["describe", "--tags", "--exact-match", "HEAD"])
+        .ok()
+        .or_else(|| git_output(&source, &["symbolic-ref", "--short", "HEAD"]).ok());
+    let source_dirty = git_output(&source, &["status", "--porcelain"])
+        .ok()
+        .map(|status| !status.is_empty());
+    let source_matches_build = source_commit
+        .as_deref()
+        .filter(|_| BUILD_COMMIT != "unknown")
+        .map(|commit| commit == BUILD_COMMIT);
+    let daemon = ["daemon", "daemon.exe"]
+        .into_iter()
+        .map(|name| paths.root.join("bin").join(name))
+        .find(|path| path.is_file());
+    let daemon_sha256 = daemon
+        .as_deref()
+        .map(sha256_path)
+        .transpose()
+        .context("failed to hash installed daemon")?;
+    let value = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": {
+            "commit": BUILD_COMMIT,
+            "ref": BUILD_REF,
+            "dirty": BUILD_DIRTY == "true",
+            "target": BUILD_TARGET,
+        },
+        "source": {
+            "kind": source_kind,
+            "path": source,
+            "commit": source_commit,
+            "ref": source_ref,
+            "dirty": source_dirty,
+            "matches_build": source_matches_build,
+        },
+        "daemon": {
+            "path": daemon,
+            "sha256": daemon_sha256,
+        },
+        "config_schema_version": CONFIG_SCHEMA_VERSION,
+    });
+    if output.json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("hipfire {}", env!("CARGO_PKG_VERSION"));
+    println!("  build commit: {BUILD_COMMIT}");
+    println!(
+        "  build ref:    {BUILD_REF}{}",
+        if BUILD_DIRTY == "true" {
+            " (dirty)"
+        } else {
+            ""
+        }
+    );
+    println!("  build target: {BUILD_TARGET}");
+    println!("  source:       {source_kind} {}", source.display());
+    println!(
+        "  source ref:   {}",
+        source_ref.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  source commit: {}",
+        source_commit
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "unknown".into())
+    );
+    println!(
+        "  source state: {}",
+        match source_dirty {
+            Some(true) => "dirty",
+            Some(false) => "clean",
+            None => "unknown",
+        }
+    );
+    println!(
+        "  source/build: {}",
+        match source_matches_build {
+            Some(true) => "match",
+            Some(false) => "MISMATCH",
+            None => "unknown",
+        }
+    );
+    if let (Some(path), Some(digest)) = (daemon, daemon_sha256) {
+        println!("  daemon:       {}", path.display());
+        println!("  daemon sha256: {digest}");
+    } else {
+        println!("  daemon:       not installed");
+    }
+    Ok(())
+}
+
+/// Cooperative cancel flag for `hipfire update`. SIGINT/SIGTERM set this;
+/// handlers never call `process::exit` so the armed rollback guard can run.
+static UPDATE_INTERRUPT: AtomicBool = AtomicBool::new(false);
+
+fn install_update_interrupt_handler() {
+    // `termination` enables SIGTERM alongside SIGINT. Ignore AlreadyExists so a
+    // pre-installed process handler does not abort update.
+    let _ = ctrlc::set_handler(|| {
+        UPDATE_INTERRUPT.store(true, Ordering::SeqCst);
+    });
+}
+
+fn update_interrupted() -> bool {
+    UPDATE_INTERRUPT.load(Ordering::SeqCst)
+}
+
+fn ensure_update_not_interrupted() -> Result<()> {
+    if update_interrupted() {
+        bail!("update interrupted");
+    }
+    Ok(())
+}
+
+fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!(
+            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
+        );
+    }
+    // Install before any fetch/mutation so SIGINT cannot race past the guard.
+    install_update_interrupt_handler();
+    UPDATE_INTERRUPT.store(false, Ordering::SeqCst);
+
+    let requested = parse_revision_selector(&args)?;
+    let installed = paths.root.join("src");
+    let managed = installed.join("Cargo.toml").is_file();
+    let repo = if managed {
+        installed
+    } else {
+        if requested.is_some() {
+            bail!(
+                "revision switching is limited to managed installs under {}; \
+                 run install.sh --ref <ref> once to create one",
+                paths.root.join("src").display()
+            );
+        }
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    };
+    let repo = fs::canonicalize(&repo).unwrap_or(repo);
+    let current_branch = git_output(&repo, &["symbolic-ref", "--short", "HEAD"]).ok();
+    if !managed && current_branch.as_deref() != Some("master") {
+        bail!(
+            "this binary was built from an unmanaged '{}' checkout; \
+             update it with git or install a managed copy",
+            current_branch.as_deref().unwrap_or("detached")
+        );
+    }
+    let selector = requested
+        .or_else(|| {
+            current_branch.as_ref().map(|branch| RevisionSelector {
+                value: branch.clone(),
+                kind: RevisionKind::Branch,
+            })
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "this installation is pinned at a detached commit; \
+                 choose a target such as `hipfire update @master`"
+            )
+        })?;
+
+    ensure_update_not_interrupted()?;
+    eprintln!(
+        "fetching {} '{}' from origin...",
+        selector.kind.label(),
+        selector.value
+    );
+    let resolved = fetch_revision(&repo, selector)?;
+    ensure_update_not_interrupted()?;
+    let previous_head = git_output(&repo, &["rev-parse", "--verify", "HEAD"])?;
+    let previous_branch = git_output(&repo, &["symbolic-ref", "--short", "HEAD"]).ok();
+    let short = previous_head.get(..12).unwrap_or(&previous_head);
+    let backup_ref = format!(
+        "refs/hipfire/backups/pre-update-{}-{short}",
+        unix_timestamp()
+    );
+    run_checked(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["update-ref", &backup_ref, &previous_head]),
+        "git update-ref backup",
+    )?;
+    eprintln!("previous source retained at {backup_ref}");
+
+    let mut checkpoint = UpdateCheckpoint {
+        head: previous_head,
+        branch: previous_branch,
+        stash_sha: None,
+    };
+
+    let dirty = !git_output(&repo, &["status", "--porcelain"])?.is_empty();
+    if dirty {
+        let message = format!("hipfire-update-{}", unix_timestamp());
+        eprintln!("local modifications detected; stashing as {message}");
+        run_checked(
+            Command::new("git").current_dir(&repo).args([
+                "stash",
+                "push",
+                "--include-untracked",
+                "-m",
+                &message,
+            ]),
+            "git stash",
+        )?;
+        checkpoint.stash_sha = Some(git_output(&repo, &["rev-parse", "stash@{0}"])?);
+        eprintln!("recover later with: git -C {} stash pop", repo.display());
+    }
+
+    // Armed after clean/stashed checkpoint and before checkout. Drop/error
+    // rolls back unless explicitly committed after installer exit 0.
+    let mut guard = UpdateRollbackGuard::arm(repo.clone(), checkpoint);
+    ensure_update_not_interrupted()?;
+
+    if let Err(err) = checkout_revision(&repo, &resolved) {
+        return Err(guard.fail(err));
+    }
+    ensure_update_not_interrupted()?;
+
+    match run_update_installer(&repo, paths, &resolved) {
+        Ok(()) => {
+            guard.commit();
+            println!(
+                "hipfire updated to {} '{}' ({})",
+                resolved.selector.kind.label(),
+                resolved.selector.value,
+                resolved.commit
+            );
+            println!("verify with: hipfire version");
+            Ok(())
+        }
+        Err(err) => Err(guard.fail(err)),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UpdateCheckpoint {
+    head: String,
+    branch: Option<String>,
+    stash_sha: Option<String>,
+}
+
+/// Restores pre-update checkout/stash unless [`Self::commit`] is called after
+/// a successful installer handoff. Drop and explicit fail both roll back.
+struct UpdateRollbackGuard {
+    repo: PathBuf,
+    checkpoint: UpdateCheckpoint,
+    armed: bool,
+}
+
+impl UpdateRollbackGuard {
+    fn arm(repo: PathBuf, checkpoint: UpdateCheckpoint) -> Self {
+        Self {
+            repo,
+            checkpoint,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+
+    #[cfg(test)]
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    fn fail(mut self, err: anyhow::Error) -> anyhow::Error {
+        if let Err(restore_err) = self.rollback() {
+            eprintln!(
+                "WARNING: failed to restore pre-update checkout after failure: {restore_err}"
+            );
+            return err.context(format!("pre-update restore also failed: {restore_err}"));
+        }
+        err
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        restore_update_checkpoint(&self.repo, &self.checkpoint)
+    }
+}
+
+impl Drop for UpdateRollbackGuard {
+    fn drop(&mut self) {
+        if let Err(err) = self.rollback() {
+            eprintln!("WARNING: failed to restore pre-update checkout on drop: {err}");
+        }
+    }
+}
+
+fn run_update_installer(repo: &Path, paths: &Paths, resolved: &ResolvedRevision) -> Result<()> {
+    let installer = repo.join("scripts/install.sh");
+    if !installer.is_file() {
+        bail!("updated checkout has no {}", installer.display());
+    }
+    let recorded = recorded_install_metadata(&paths.root);
+    let mut installer_cmd = Command::new("bash");
+    installer_cmd
+        .arg(&installer)
+        .current_dir(repo)
+        .env("HIPFIRE_FORCE_REBUILD", "1");
+    #[cfg(unix)]
+    {
+        // Own process group so SIGTERM/KILL can reach the whole installer tree.
+        installer_cmd.process_group(0);
+    }
+    for arg in installer_handoff_args(
+        &resolved.selector,
+        recorded.rocm_root.as_deref(),
+        recorded.gpu_arch.as_deref(),
+        recorded.hipcc.as_deref(),
+        recorded.strict_rocm,
+    ) {
+        installer_cmd.arg(arg);
+    }
+    run_update_installer_child(installer_cmd)
+}
+
+/// Spawn the installer, poll-wait, and on interrupt TERM then KILL the group.
+fn run_update_installer_child(mut installer_cmd: Command) -> Result<()> {
+    let mut child = installer_cmd
+        .spawn()
+        .context("failed to start native installer")?;
+    let status = wait_update_installer_child(&mut child)?;
+    if update_interrupted() {
+        bail!("update interrupted");
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("native installer failed with {status}")
+    }
+}
+
+fn wait_update_installer_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if update_interrupted() {
+                    terminate_update_installer_group(child);
+                    return child
+                        .wait()
+                        .context("failed to reap interrupted native installer");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                return Err(err).context("failed to wait for native installer");
+            }
+        }
+    }
+}
+
+/// TERM the installer process group, then bounded KILL fallback; always wait/reap.
+fn terminate_update_installer_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            // Negative pid targets the process group created via process_group(0).
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
+/// Args forwarded to scripts/install.sh during noninteractive update handoff.
+fn installer_handoff_args(
+    selector: &RevisionSelector,
+    rocm_root: Option<&Path>,
+    gpu_arch: Option<&str>,
+    hipcc: Option<&Path>,
+    strict_rocm: bool,
+) -> Vec<String> {
+    let mut args = vec!["--yes".to_owned()];
+    match selector.kind {
+        RevisionKind::Auto => {
+            args.push("--ref".to_owned());
+            args.push(selector.value.clone());
+        }
+        RevisionKind::Branch => {
+            args.push("--branch".to_owned());
+            args.push(selector.value.clone());
+        }
+        RevisionKind::Tag => {
+            args.push("--tag".to_owned());
+            args.push(selector.value.clone());
+        }
+        RevisionKind::Commit => {
+            args.push("--commit".to_owned());
+            args.push(selector.value.clone());
+        }
+    }
+    if let Some(root) = rocm_root {
+        args.push("--rocm-root".to_owned());
+        args.push(root.to_string_lossy().into_owned());
+    }
+    if let Some(arch) = gpu_arch.map(str::trim).filter(|arch| !arch.is_empty()) {
+        args.push("--gpu-arch".to_owned());
+        args.push(arch.to_owned());
+    }
+    if let Some(hipcc) = hipcc
+        .map(|p| p.to_string_lossy().into_owned())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--hipcc".to_owned());
+        args.push(hipcc);
+    }
+    if strict_rocm {
+        args.push("--strict-rocm".to_owned());
+    }
+    args
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RecordedInstallMetadata {
+    rocm_root: Option<PathBuf>,
+    gpu_arch: Option<String>,
+    hipcc: Option<PathBuf>,
+    strict_rocm: bool,
+}
+fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
+    let text = match fs::read_to_string(install_home.join("install.json")) {
+        Ok(text) => text,
+        Err(_) => return RecordedInstallMetadata::default(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => return RecordedInstallMetadata::default(),
+    };
+    let rocm_root = value
+        .get("rocm_root")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from);
+    let gpu_arch = value
+        .get("gpu_arch")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|arch| !arch.is_empty())
+        .map(str::to_owned);
+    let hipcc = value
+        .get("hipcc")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let strict_rocm = match value.get("strict_rocm") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        }
+        Some(serde_json::Value::Number(n)) => n.as_u64().is_some_and(|v| v != 0),
+        _ => false,
+    };
+    RecordedInstallMetadata {
+        rocm_root,
+        gpu_arch,
+        hipcc,
+        strict_rocm,
+    }
+}
+
+fn restore_update_checkpoint(repo: &Path, checkpoint: &UpdateCheckpoint) -> Result<()> {
+    // Failed-target Cargo/source mutations are wiped only after the original
+    // user work is already in the update stash, so restore cannot be blocked.
+    run_checked(
+        Command::new("git")
+            .current_dir(repo)
+            .args(["reset", "--hard"]),
+        "git reset failed target",
+    )?;
+    run_checked(
+        Command::new("git").current_dir(repo).args(["clean", "-fd"]),
+        "git clean failed target",
+    )?;
+    if let Some(branch) = checkpoint.branch.as_deref() {
+        run_checked(
+            Command::new("git").current_dir(repo).args([
+                "checkout",
+                "-B",
+                branch,
+                &checkpoint.head,
+            ]),
+            "git restore previous branch",
+        )?;
+    } else {
+        run_checked(
+            Command::new("git")
+                .current_dir(repo)
+                .args(["checkout", "--detach", &checkpoint.head]),
+            "git restore previous commit",
+        )?;
+    }
+    if let Some(stash_sha) = checkpoint.stash_sha.as_deref() {
+        reapply_update_stash(repo, stash_sha)?;
+    }
+    Ok(())
+}
+
+fn reapply_update_stash(repo: &Path, stash_sha: &str) -> Result<()> {
+    // Preserve staged index state from the original dirty tree.
+    if let Err(err) = run_checked(
+        Command::new("git")
+            .current_dir(repo)
+            .args(["stash", "apply", "--index", stash_sha]),
+        "git stash apply --index",
+    ) {
+        bail!(
+            "failed to restore pre-update stash {stash_sha} (kept for recovery: \
+             git -C {} stash apply --index {stash_sha}): {err}",
+            repo.display()
+        );
+    }
+    // Drop only after successful apply so a conflicted restore keeps the stash.
+    if let Ok(list) = git_output(repo, &["stash", "list", "--format=%gd %H"]) {
+        for line in list.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(gd) = parts.next() else {
+                continue;
+            };
+            let Some(hash) = parts.next() else {
+                continue;
+            };
+            if hash == stash_sha || stash_sha.starts_with(hash) || hash.starts_with(stash_sha) {
+                let _ = run_checked(
+                    Command::new("git")
+                        .current_dir(repo)
+                        .args(["stash", "drop", gd]),
+                    "git stash drop",
+                );
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_revision_selector(args: &UpdateArgs) -> Result<Option<RevisionSelector>> {
+    let candidates = [
+        args.reference
+            .as_ref()
+            .map(|value| (value.as_str(), RevisionKind::Auto)),
+        args.branch
+            .as_ref()
+            .map(|value| (value.as_str(), RevisionKind::Branch)),
+        args.tag
+            .as_ref()
+            .map(|value| (value.as_str(), RevisionKind::Tag)),
+        args.commit
+            .as_ref()
+            .map(|value| (value.as_str(), RevisionKind::Commit)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if candidates.len() > 1 {
+        bail!("choose only one update ref, --branch, --tag, or --commit");
+    }
+    let Some((raw, mut kind)) = candidates.first().copied() else {
+        return Ok(None);
+    };
+    let mut value = raw.trim().trim_start_matches('@');
+    if let Some(branch) = value.strip_prefix("refs/heads/") {
+        value = branch;
+        kind = RevisionKind::Branch;
+    } else if let Some(tag) = value.strip_prefix("refs/tags/") {
+        value = tag;
+        kind = RevisionKind::Tag;
+    } else if let Some(branch) = value.strip_prefix("origin/") {
+        value = branch;
+        if kind == RevisionKind::Auto {
+            kind = RevisionKind::Branch;
+        }
+    }
+    validate_revision(value, kind)?;
+    Ok(Some(RevisionSelector {
+        value: value.to_owned(),
+        kind,
+    }))
+}
+
+fn validate_revision(value: &str, kind: RevisionKind) -> Result<()> {
+    let invalid = value.is_empty()
+        || value.starts_with(['-', '.', '/'])
+        || value.ends_with(['.', '/'])
+        || value.contains("..")
+        || value.contains("@{")
+        || value.contains("//")
+        || value.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '\\' | ':' | '?' | '*' | '[' | '^' | '~')
+        });
+    if invalid {
+        bail!("unsafe or invalid git revision {value:?}");
+    }
+    if kind == RevisionKind::Commit
+        && (!(7..=40).contains(&value.len())
+            || !value.chars().all(|character| character.is_ascii_hexdigit()))
+    {
+        bail!("--commit requires a 7-40 character hexadecimal git commit");
+    }
+    Ok(())
+}
+
+fn fetch_revision(repo: &Path, mut selector: RevisionSelector) -> Result<ResolvedRevision> {
+    if selector.kind == RevisionKind::Auto {
+        selector.kind = if remote_ref_exists(repo, &format!("refs/heads/{}", selector.value))? {
+            RevisionKind::Branch
+        } else if remote_ref_exists(repo, &format!("refs/tags/{}", selector.value))? {
+            RevisionKind::Tag
+        } else {
+            RevisionKind::Commit
+        };
+    }
+
+    match selector.kind {
+        RevisionKind::Branch => {
+            let remote = format!("refs/heads/{}", selector.value);
+            if !remote_ref_exists(repo, &remote)? {
+                bail!("origin has no branch '{}'", selector.value);
+            }
+            let tracking = format!("refs/remotes/origin/{}", selector.value);
+            let refspec = format!("+{remote}:{tracking}");
+            run_checked(
+                Command::new("git")
+                    .current_dir(repo)
+                    .args(["fetch", "origin", &refspec]),
+                "git fetch branch",
+            )?;
+            let commit = git_output(repo, &["rev-parse", "--verify", &tracking])?;
+            Ok(ResolvedRevision {
+                selector,
+                commit,
+                tracking_ref: Some(tracking),
+            })
+        }
+        RevisionKind::Tag => {
+            let remote = format!("refs/tags/{}", selector.value);
+            if !remote_ref_exists(repo, &remote)? {
+                bail!("origin has no tag '{}'", selector.value);
+            }
+            run_checked(
+                Command::new("git")
+                    .current_dir(repo)
+                    .args(["fetch", "--depth", "1", "origin", &remote]),
+                "git fetch tag",
+            )?;
+            let commit = git_output(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+            Ok(ResolvedRevision {
+                selector,
+                commit,
+                tracking_ref: None,
+            })
+        }
+        RevisionKind::Commit => {
+            run_checked(
+                Command::new("git").current_dir(repo).args([
+                    "fetch",
+                    "--depth",
+                    "1",
+                    "origin",
+                    &selector.value,
+                ]),
+                "git fetch commit",
+            )?;
+            let commit = git_output(repo, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+            Ok(ResolvedRevision {
+                selector,
+                commit,
+                tracking_ref: None,
+            })
+        }
+        RevisionKind::Auto => unreachable!("auto revisions are resolved before fetch"),
+    }
+}
+
+fn checkout_revision(repo: &Path, resolved: &ResolvedRevision) -> Result<()> {
+    if let Some(tracking) = &resolved.tracking_ref {
+        refuse_unpushed_branch_commits(repo, &resolved.selector.value, tracking)?;
+        run_checked(
+            Command::new("git").current_dir(repo).args([
+                "checkout",
+                "-B",
+                &resolved.selector.value,
+                tracking,
+            ]),
+            "git checkout branch",
+        )
+    } else {
+        run_checked(
+            Command::new("git")
+                .current_dir(repo)
+                .args(["checkout", "--detach", &resolved.commit]),
+            "git checkout pinned revision",
+        )
+    }
+}
+
+/// Refuse to reset a local branch that still has commits not present on the
+/// resolved remote-tracking tip. Channel switches onto a different branch are
+/// unaffected when that target branch is not ahead.
+fn refuse_unpushed_branch_commits(repo: &Path, branch: &str, tracking: &str) -> Result<()> {
+    let local_ref = format!("refs/heads/{branch}");
+    let local_tip = match git_output(repo, &["rev-parse", "--verify", &local_ref]) {
+        Ok(tip) => tip,
+        Err(_) => return Ok(()),
+    };
+    let remote_tip = git_output(repo, &["rev-parse", "--verify", tracking])?;
+    if local_tip == remote_tip {
+        return Ok(());
+    }
+    // Behind (or equal ancestry): remote contains local tip → safe to fast-forward reset.
+    if is_ancestor(repo, &local_tip, &remote_tip)? {
+        return Ok(());
+    }
+    let ahead = git_output(
+        repo,
+        &["rev-list", "--count", &format!("{tracking}..{local_ref}")],
+    )
+    .ok()
+    .and_then(|count| count.parse::<u64>().ok())
+    .unwrap_or(1);
+    bail!(
+        "refusing to update branch '{branch}': {ahead} local commit(s) ahead of {tracking}; \
+         push or move them before updating"
+    );
+}
+
+fn is_ancestor(repo: &Path, maybe_ancestor: &str, commit: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .current_dir(repo)
+        .args(["merge-base", "--is-ancestor", maybe_ancestor, commit])
+        .status()
+        .with_context(|| format!("failed to compare git ancestry {maybe_ancestor} vs {commit}"))?;
+    Ok(status.success())
+}
+
+fn remote_ref_exists(repo: &Path, reference: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["ls-remote", "--exit-code", "origin", reference])
+        .output()
+        .with_context(|| format!("failed to query origin for {reference}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
+        _ => bail!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn sha256_path(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn run_checked(command: &mut Command, label: &str) -> Result<()> {
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start {label}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("{label} failed with {status}")
+    }
+}
+
+pub(crate) fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
+    let quantizer = find_workspace_binary(paths, "hipfire-quantize").ok_or_else(|| {
+        anyhow!(
+            "hipfire-quantize is not installed; build `cargo build --release -p hipfire-quantize`"
+        )
+    })?;
+    if args.both {
+        args.formats.extend(["mq4".into(), "mq6".into()]);
+    }
+    let input_path = PathBuf::from(&args.input);
+    let is_gguf = input_path.is_file()
+        && input_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("gguf"));
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF
+    // (the one-line warning is printed by hipfire-quantize itself)
+    if args.formats.is_empty() {
+        args.formats
+            .push(if is_gguf { "hf4".into() } else { "mq4".into() });
+    }
+    for format in &mut args.formats {
+        *format = match format.as_str() {
+            "hfq4" | "hfq4g256" => "hf4".into(),
+            "hfq6" | "hfq6g256" => "hf6".into(),
+            _ => format.clone(),
+        };
+    }
+    let mut seen = BTreeSet::new();
+    args.formats.retain(|format| seen.insert(format.clone()));
+    let valid = ["mq4", "mq6", "q8", "q8f16", "hf4", "hf6"];
+    for format in &args.formats {
+        if !valid.contains(&format.as_str()) {
+            bail!(
+                "unsupported format {format}; supported: {}",
+                valid.join(", ")
+            );
+        }
+        if is_gguf && !matches!(format.as_str(), "hf4" | "hf6" | "mq4" | "mq6") {
+            bail!("GGUF input supports hf4, hf6, mq4, or mq6");
+        }
+    }
+    if args.output.is_some() && args.formats.len() != 1 {
+        bail!("--output requires exactly one format; use --output-dir for multiple formats");
+    }
+    if let Some(repo) = args.upload.as_deref() {
+        if repo.split('/').count() != 2 {
+            bail!("--upload requires owner/repo");
+        }
+    }
+    let input = if input_path.exists() {
+        fs::canonicalize(input_path)?.display().to_string()
+    } else {
+        args.input.clone()
+    };
+    let stem = args.stem.unwrap_or_else(|| {
+        Path::new(&args.input)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&args.input)
+            .trim_end_matches(".gguf")
+            .to_owned()
+    });
+    let output_dir = args.output_dir.unwrap_or(env::current_dir()?);
+    fs::create_dir_all(&output_dir)?;
+    let mut produced = Vec::new();
+    for format in &args.formats {
+        let output = args
+            .output
+            .clone()
+            .unwrap_or_else(|| output_dir.join(format!("{stem}.{format}")));
+        eprintln!("quantizing {input} -> {} ({format})", output.display());
+        run_checked(
+            Command::new(&quantizer)
+                .arg("--input")
+                .arg(&input)
+                .arg("--output")
+                .arg(&output)
+                .arg("--format")
+                .arg(format),
+            "hipfire-quantize",
+        )?;
+        if !output.is_file() {
+            bail!(
+                "quantizer reported success but {} was not created",
+                output.display()
+            );
+        }
+        produced.push((format.clone(), fs::canonicalize(&output).unwrap_or(output)));
+    }
+    if args.install {
+        fs::create_dir_all(&paths.models)?;
+        for (_, output) in &mut produced {
+            let file = output
+                .file_name()
+                .ok_or_else(|| anyhow!("invalid output path {}", output.display()))?;
+            let destination = paths.models.join(file);
+            if fs::canonicalize(&destination).ok().as_ref()
+                != fs::canonicalize(&*output).ok().as_ref()
+            {
+                fs::copy(&*output, &destination)?;
+            }
+            *output = fs::canonicalize(&destination).unwrap_or(destination);
+            eprintln!("installed {}", output.display());
+        }
+    }
+    if let Some(repo) = args.upload.as_deref() {
+        if args.create_repo {
+            run_checked(
+                Command::new("hf").args(["repos", "create", repo, "--type", "model", "--exist-ok"]),
+                "hf repos create",
+            )?;
+        }
+        for (_, output) in &produced {
+            let file = output
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow!("invalid output filename"))?;
+            run_checked(
+                Command::new("hf")
+                    .arg("upload")
+                    .arg(repo)
+                    .arg(output)
+                    .arg(file),
+                "hf upload",
+            )?;
+        }
+    }
+    if let Some(alias) = args.register {
+        let (_, primary) = produced
+            .iter()
+            .find(|(format, _)| format == "mq4")
+            .or_else(|| produced.first())
+            .ok_or_else(|| anyhow!("no quantized artifact produced"))?;
+        let mut loaded = load_catalog(&paths.config)?;
+        let id = primary
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("invalid output filename"))?
+            .to_owned();
+        loaded.catalog.models.insert(
+            id.clone(),
+            hipfire_config::LocalModelConfig {
+                path: Some(primary.clone()),
+                registry_tag: None,
+                overrides: ConfigLayer::default(),
+            },
+        );
+        loaded.catalog.aliases.insert(alias.clone(), id);
+        write_catalog_toml(&paths.config, &loaded.catalog)?;
+        eprintln!("registered {alias} -> {}", primary.display());
+    }
+    Ok(())
+}
+
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
+fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
+    eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
+    if !(1..=1_000_000).contains(&args.max_tokens) {
+        bail!("--max-tokens must be between 1 and 1000000");
+    }
+    if !(1..=16_384).contains(&args.chunk_len) {
+        bail!("--chunk-len must be between 1 and 16384");
+    }
+    if let Some(corpus) = args.corpus.as_ref().filter(|path| !path.is_file()) {
+        bail!("corpus not found: {}", corpus.display());
+    }
+    let registry = load_registry(&paths.registry).registry;
+    let model = find_model_path(paths, &registry, &args.model)
+        .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let output = args
+        .output
+        .unwrap_or_else(|| PathBuf::from(format!("{}.triattn.bin", model.display())));
+    let binary = find_workspace_example(paths, "triattn_validate").ok_or_else(|| anyhow!(
+        "triattn_validate is not installed; build `cargo build --release --features deltanet -p hipfire-runtime --example triattn_validate`"
+    ))?;
+    let mut command = Command::new(binary);
+    command
+        .arg(&model)
+        .arg("--sidecar")
+        .arg(&output)
+        .arg("--max-tokens")
+        .arg(args.max_tokens.to_string())
+        .arg("--chunk-len")
+        .arg(args.chunk_len.to_string());
+    if let Some(corpus) = args.corpus {
+        command.arg("--corpus").arg(corpus);
+    }
+    if args.cpu_calib {
+        command.arg("--cpu-calib");
+    }
+    if args.skip_validation {
+        command.arg("--val-prompt").arg("");
+    }
+    let _ = args.gpu_calib;
+    run_checked(&mut command, "triattn_validate")?;
+    if !output.is_file() {
+        bail!(
+            "sidecar generator reported success but {} was not created",
+            output.display()
+        );
+    }
+    println!("{}", output.display());
+    Ok(())
+}
+
+fn find_workspace_binary(paths: &Paths, name: &str) -> Option<PathBuf> {
+    let exe = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    [
+        paths.root.join("bin").join(&exe),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release")
+            .join(&exe),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .or_else(|| find_on_path(&exe))
+}
+
+fn find_workspace_example(paths: &Paths, name: &str) -> Option<PathBuf> {
+    let exe = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    [
+        paths.root.join("bin").join(&exe),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release/examples")
+            .join(&exe),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .or_else(|| find_on_path(&exe))
+}
+
+fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
+    let loaded_registry = load_registry(&paths.registry);
+    let models = list_local_models(paths, &loaded_registry.registry)?;
+    let loaded_config = load_global(&paths.config)?;
+    let platform = format!("{}-{}", env::consts::OS, env::consts::ARCH);
+    let kfd = Path::new("/dev/kfd").exists();
+    let amdgpu_loaded = Path::new("/sys/module/amdgpu").exists();
+    let gpu_arches = detect_gpu_arches();
+    let gpus = detect_amd_drm_cards();
+    let hipcc = command_version("hipcc", "--version");
+    // Per-root component inventory. A working `hipcc` says nothing about the
+    // HIP headers or runtime — they are separate packages — so reporting only
+    // the hipcc version made a half-installed ROCm look healthy here while
+    // every kernel compile and dlopen failed elsewhere.
+    let rocm_roots = hipfire_config::rocm::roots()
+        .iter()
+        .filter(|root| root.is_dir())
+        .map(|root| {
+            let missing = hipfire_config::rocm::missing_components(root);
+            serde_json::json!({
+                "path": root.display().to_string(),
+                "device_compiler": hipfire_config::rocm::DEVICE_COMPILERS
+                    .iter()
+                    .find_map(|name| hipfire_config::rocm::tool_from_selected_root(root, name)),
+                "hip_headers": hipfire_config::rocm::is_complete_root(root),
+                "hip_runtime": hipfire_config::rocm::runtime_library(root)
+                    .map(|p| p.display().to_string()),
+                "missing": missing.iter().map(|m| m.what).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let rocm_selected = hipfire_config::rocm::root().map(|p| p.display().to_string());
+    let daemon_path = find_daemon(paths);
+    let daemon = daemon_path.as_ref().map(|path| path.display().to_string());
+    let live_gpu = daemon_path.as_ref().and_then(|daemon| {
+        let (_, resolved) = resolved_global(paths, true).ok()?;
+        let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).ok()?;
+        let mut engine =
+            Engine::spawn_configured(daemon, &BTreeMap::new(), &process_config).ok()?;
+        engine.ping().ok()?;
+        engine.request(&serde_json::json!({ "type": "diag" })).ok()
+    });
+    let gpu = gpu_arches
+        .first()
+        .map(|arch| serde_json::json!({ "arch": arch }))
+        .unwrap_or_else(
+            || serde_json::json!({ "error": "no gfx target detected in KFD topology" }),
+        );
+    let config_overrides = loaded_config
+        .layer
+        .values
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::json!(value)))
+        .collect::<serde_json::Map<_, _>>();
+    let report = serde_json::json!({
+        "registry": registry_source(loaded_registry.source),
+        "platform": platform,
+        "hardware_probe": if cfg!(target_os = "linux") { "linux" } else { "limited" },
+        "gpus": gpus,
+        "dri_nodes": list_dri_nodes(),
+        "kfd": kfd,
+        "amdgpu_loaded": amdgpu_loaded,
+        "rocm": { "hipcc": hipcc, "selected_root": rocm_selected, "roots": rocm_roots },
+        "daemon": daemon,
+        "live_gpu": live_gpu,
+        "models": models,
+        "gpu": gpu,
+        "config_path": loaded_config.path,
+        "config_format": format!("{:?}", loaded_config.format).to_lowercase(),
+        "config_overrides": config_overrides,
+        "warnings": loaded_registry.warnings,
+    });
+    if output.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("hipfire diagnostics\n");
+        println!(
+            "registry:      {}",
+            report["registry"].as_str().unwrap_or("unknown")
+        );
+        println!("platform:      {platform}");
+        println!(
+            "amdgpu:       {}",
+            if amdgpu_loaded {
+                "loaded"
+            } else {
+                "not loaded"
+            }
+        );
+        println!("/dev/kfd:      {}", if kfd { "present" } else { "missing" });
+        println!(
+            "GPU targets:   {}",
+            if gpu_arches.is_empty() {
+                "none".into()
+            } else {
+                gpu_arches.join(", ")
+            }
+        );
+        println!("local models:  {}", models.len());
+        println!(
+            "ROCm root:     {}",
+            rocm_selected.as_deref().unwrap_or("none found")
+        );
+        // Only actionable for a root that HAS a compiler: one without is a shim
+        // directory (the /opt/rocm of a split-tree install), so its "missing"
+        // components are expected rather than a problem to fix.
+        let mut incomplete_toolchain = false;
+        for root in &rocm_roots {
+            let s = |k: &str| root[k].as_str().map(str::to_owned);
+            println!(
+                "  {}\n    compiler: {}   headers: {}   runtime: {}",
+                root["path"].as_str().unwrap_or("?"),
+                s("device_compiler").unwrap_or_else(|| "MISSING".into()),
+                if root["hip_headers"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "MISSING"
+                },
+                s("hip_runtime").unwrap_or_else(|| "MISSING".into()),
+            );
+            let missing = root["missing"].as_array().map(Vec::len).unwrap_or(0);
+            incomplete_toolchain |= missing > 0 && s("device_compiler").is_some();
+        }
+        if incomplete_toolchain {
+            println!("  a ROCm root above has a compiler but no HIP runtime/headers:");
+            for line in hipfire_config::rocm::install_guidance() {
+                println!("    {line}");
+            }
+        }
+        println!(
+            "config:        {} ({:?})",
+            loaded_config.path.display(),
+            loaded_config.format
+        );
+        println!("daemon:        {}", daemon.as_deref().unwrap_or("missing"));
+        if let Some(live) = report.get("live_gpu").filter(|value| !value.is_null()) {
+            println!(
+                "HIP GPU:       {} (HIP {})",
+                live.get("arch")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                live.get("hip_version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+            );
+            println!(
+                "VRAM:          {} MB free / {} MB total",
+                live.get("vram_free_mb")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                live.get("vram_total_mb")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            );
+            if matches!(
+                live.get("arch").and_then(serde_json::Value::as_str),
+                Some("gfx1150" | "gfx1151" | "gfx1152")
+            ) && live
+                .get("hip_version")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_major_minor)
+                .is_some_and(|version| version < (7, 2))
+            {
+                println!("WARNING: RDNA 3.5 requires ROCm/HIP 7.2 or newer.");
+            }
+        } else if daemon.is_some() {
+            println!("HIP probe:     failed (run the daemon directly for detailed startup errors)");
+        }
+    }
+    Ok(())
+}
+
+fn parse_major_minor(value: &str) -> Option<(u64, u64)> {
+    let mut parts = value.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+fn detect_gpu_arches() -> Vec<String> {
+    let root = Path::new("/sys/class/kfd/kfd/topology/nodes");
+    let mut arches = Vec::new();
+    let Ok(nodes) = fs::read_dir(root) else {
+        return arches;
+    };
+    for node in nodes.flatten() {
+        let Ok(properties) = fs::read_to_string(node.path().join("properties")) else {
+            continue;
+        };
+        let Some(version) = properties.lines().find_map(|line| {
+            line.split_whitespace()
+                .collect::<Vec<_>>()
+                .as_slice()
+                .strip_prefix(&["gfx_target_version"])
+                .and_then(|rest| rest.first())
+                .and_then(|value| value.parse::<u32>().ok())
+        }) else {
+            continue;
+        };
+        if let Some(arch) = gfx_version_to_arch(version) {
+            if !arches.iter().any(|candidate| candidate == arch) {
+                arches.push(arch.to_owned());
+            }
+        }
+    }
+    arches
+}
+
+fn gfx_version_to_arch(version: u32) -> Option<&'static str> {
+    match version {
+        90006 => Some("gfx906"),
+        90008 => Some("gfx908"),
+        90010 => Some("gfx90a"),
+        90400..=90402 => Some("gfx94x"),
+        100100 => Some("gfx1010"),
+        100300 | 100302 => Some("gfx1030"),
+        110000..=110002 => Some("gfx1100"),
+        110500 => Some("gfx1150"),
+        110501 => Some("gfx1151"),
+        120000 => Some("gfx1200"),
+        120001 => Some("gfx1201"),
+        _ => None,
+    }
+}
+
+fn detect_amd_drm_cards() -> Vec<String> {
+    let mut cards = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return cards;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("card") || !name[4..].bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let vendor = fs::read_to_string(entry.path().join("device/vendor")).unwrap_or_default();
+        if vendor.trim() == "0x1002" {
+            cards.push(name);
+        }
+    }
+    cards.sort();
+    cards
+}
+
+fn list_dri_nodes() -> Vec<String> {
+    let Ok(entries) = fs::read_dir("/dev/dri") else {
+        return Vec::new();
+    };
+    let mut nodes = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    nodes.sort();
+    nodes
+}
+
+fn command_version(command: &str, argument: &str) -> Option<String> {
+    Command::new(command)
+        .arg(argument)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        })
+        .filter(|line| !line.is_empty())
+}
+
+pub(crate) fn find_daemon(paths: &Paths) -> Option<PathBuf> {
+    if let Some(path) = env::var_os("HIPFIRE_DAEMON_BIN").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    find_daemon_in(paths, &workspace, cfg!(windows))
+}
+
+/// Daemon binary name candidates, most preferred first.
+///
+/// Windows ships the daemon as `daemon.exe`; ELF platforms ship an
+/// extensionless `daemon`. The bare spelling is kept as a fallback so a
+/// future extensionless shim still wins. `windows` is a pure parameter
+/// (mirroring `hipfire_config::rocm::tool_filename_candidates`) so the
+/// policy is unit-testable on any host without process-global env.
+fn daemon_bin_names(windows: bool) -> &'static [&'static str] {
+    if windows {
+        &["daemon.exe", "daemon"]
+    } else {
+        &["daemon"]
+    }
+}
+
+/// Candidate lookup shared by [`find_daemon`] and its platform-shaped tests:
+/// probe the install root (`~/.hipfire/bin/`) and the source-tree target dir
+/// (`release/`, then `debug/`), in that order, for each candidate name.
+fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for name in daemon_bin_names(windows) {
+        candidates.push(paths.root.join("bin").join(name));
+        candidates.push(workspace.join("release").join(name));
+        candidates.push(workspace.join("debug").join(name));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+pub(crate) fn request_f64(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+    explicit: Option<f64>,
+) -> Result<Option<f64>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    request_config_value(resolved, key)?
+        .map(|value| config_value_f64(value, key))
+        .transpose()
+}
+
+pub(crate) fn request_u64(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+    explicit: Option<u64>,
+) -> Result<Option<u64>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    request_config_value(resolved, key)?
+        .map(|value| config_value_u64(value, key))
+        .transpose()
+}
+
+pub(crate) fn request_string(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+    explicit: Option<String>,
+) -> Result<Option<String>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    request_config_value(resolved, key)?
+        .map(|value| match value {
+            hipfire_config::ConfigValue::String(value) => Ok(value.clone()),
+            value => bail!(
+                "configuration key '{key}' resolved as {}, expected string",
+                value.kind()
+            ),
+        })
+        .transpose()
+}
+
+pub(crate) fn request_config_value<'a>(
+    resolved: &'a hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<&'a hipfire_config::ConfigValue>> {
+    let value = resolved
+        .get(key)
+        .ok_or_else(|| anyhow!("configuration key '{key}' is not resolved"))?;
+    match &value.source {
+        ConfigSource::BuiltIn => Ok(None),
+        ConfigSource::GlobalUser { .. } => Ok(value
+            .shadowed
+            .iter()
+            .rev()
+            .find(|candidate| {
+                matches!(
+                    candidate.source,
+                    ConfigSource::RegistryModel { .. } | ConfigSource::RegistryTarget { .. }
+                )
+            })
+            .map(|candidate| &candidate.value)),
+        _ => Ok(Some(&value.value)),
+    }
+}
+
+pub(crate) fn config_value_f64(value: &hipfire_config::ConfigValue, key: &str) -> Result<f64> {
+    match value {
+        hipfire_config::ConfigValue::Float(value) => Ok(*value),
+        hipfire_config::ConfigValue::Integer(value) => Ok(*value as f64),
+        _ => bail!("configuration key '{key}' did not resolve to a number"),
+    }
+}
+
+pub(crate) fn config_value_u64(value: &hipfire_config::ConfigValue, key: &str) -> Result<u64> {
+    match value {
+        hipfire_config::ConfigValue::Integer(value) => u64::try_from(*value)
+            .map_err(|_| anyhow!("configuration key '{key}' cannot be negative")),
+        value => bail!(
+            "configuration key '{key}' resolved as {}, expected integer",
+            value.kind()
+        ),
+    }
+}
+
+pub(crate) fn insert_optional_f64(target: &mut serde_json::Value, key: &str, value: Option<f64>) {
+    if let Some(value) = value {
+        target[key] = serde_json::json!(value);
+    }
+}
+
+pub(crate) fn insert_optional_u64(target: &mut serde_json::Value, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        target[key] = serde_json::json!(value);
+    }
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+fn is_model_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    MODEL_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+}
+
+/// Every file the registry names as a *sidecar* of some entry — `dflash`,
+/// `vision`, `triattn`, `mtp`, `dspark`, the FLUX components, and the
+/// alternative `heads` carriers.
+///
+/// These share the model suffixes (`.hfq`), so a suffix test alone cannot
+/// tell them apart from a trunk. A sidecar is not a loadable model on its
+/// own: `qwen3.8-27b-vision.hfq` carries only tower tensors and embeds
+/// `"tokenizer": "{}"`, so loading it as a trunk fails with
+/// `tokenizer metadata field missing or wrong type: model`.
+fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
+    registry
+        .models
+        .values()
+        .flat_map(|entry| {
+            [
+                entry.triattn.as_ref(),
+                entry.mtp.as_ref(),
+                entry.dspark.as_ref(),
+                entry.t5.as_ref(),
+                entry.clip.as_ref(),
+                entry.qwen3.as_ref(),
+                entry.vae.as_ref(),
+                entry.dflash.as_ref(),
+                entry.vision.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|sidecar: &Sidecar| sidecar.file.as_str())
+            .chain(entry.heads.values().map(|sidecar| sidecar.file.as_str()))
+        })
+        .collect()
+}
+
+/// True when `name` is a model file worth showing in a local listing.
+///
+/// A model suffix OR being some registry entry's own `file`. The second term
+/// is load-bearing: several registry tiers ship files whose suffix is absent
+/// from `MODEL_SUFFIXES` (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a
+/// suffix-only test hides exactly those models.
+pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
+    is_model_file(name) || registry.models.values().any(|entry| entry.file == name)
+}
+
+/// True when `name` can actually serve a completion, as opposed to merely
+/// being a model-shaped file on disk.
+///
+/// This is the `/v1/models` discovery predicate and it is stricter than
+/// [`is_listable_model_file`] on purpose. A file the registry names in ANY
+/// sidecar slot is not a serve target, even when some entry also lists it as
+/// its own `file` — that overlap is exactly the DFlash drafts
+/// (`qwen38-27b-dflash-mq3.hfq` and friends), pullable by tag but arch
+/// 20/22/23 artifacts that `docs/architecture-ids.md` classes as "not primary
+/// `load_model` trunk targets". The vision tower (`qwen3.8-27b-vision.hfq`) is
+/// sidecar-only and embeds `"tokenizer": "{}"`, so selecting it loads all 64
+/// layers and then fails with `tokenizer metadata field missing or wrong
+/// type: model`.
+///
+/// Advertising either in `/v1/models` hands an OpenAI-compatible client an id
+/// that cannot answer. Both stay pullable and resolvable by tag, and both
+/// still appear in `hipfire list` — only the serve surface drops them.
+///
+/// A file the registry does not name at all (a locally quantized trunk, or a
+/// locally produced draft such as `qwen3-8b-dflash.hfq`) is classified by its
+/// own container header: `/v1/models` must not advertise it unless
+/// [`HfqFile::probe_arch_id`] reports a [`SERVE_TRUNK_ARCH_IDS`] id. The
+/// registry cannot answer for it — the catalog only knows the files it ships.
+pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1) -> bool {
+    if registry_sidecar_files(registry).contains(name) {
+        return false;
+    }
+    if !is_listable_model_file(name, registry) {
+        return false;
+    }
+    if registry.models.values().any(|entry| entry.file == name) {
+        return true;
+    }
+    HfqFile::probe_arch_id(path).is_ok_and(|arch_id| SERVE_TRUNK_ARCH_IDS.contains(&arch_id))
+}
+
+/// HFQ arch ids a `hipfire serve` completion can be answered from — the
+/// "Primary model ids" column of `docs/architecture-ids.md`, minus the
+/// image-generation component trunks.
+///
+/// The polarity is deliberate. This predicate exists to keep `/v1/models` to
+/// its contract ("every advertised id can answer a completion"), and it only
+/// ever judges files the registry does not vouch for (registry entries short
+/// out above). An allowlist is the fail-closed direction: an arch id that is
+/// not listed here — a sidecar the table gains later (a new drafter id, a new
+/// FLUX component) or a container that is not a model at all — is not
+/// advertised, whereas a denylist would silently re-open the reported bug the
+/// day a new draft arch ships. The cost is that a brand-new *primary* arch id
+/// is hidden from local discovery until this table is updated, which the same
+/// commit has to do anyway: assigning an arch id means editing
+/// `docs/architecture-ids.md` and the loader's carrier registry.
+///
+/// `40`/`45` (FLUX MMDiT trunks) are absent on purpose: they are image
+/// generation components, served through `hipfire img` / `/v1/images/*`, not
+/// completion trunks a `/v1/models` pick can generate text from. `8`
+/// (dots.ocr) and `11` (LFM2.5 / LFM2.5-VL) are present: both answer text
+/// completions.
+pub(crate) const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+fn source_label(source: &ConfigSource) -> String {
+    match source {
+        ConfigSource::BuiltIn => "built-in".into(),
+        ConfigSource::RegistryModel { tag, revision } => {
+            format!("registry model {tag}@{revision}")
+        }
+        ConfigSource::RegistryTarget {
+            tag,
+            arch,
+            revision,
+        } => format!("registry target {tag}/{arch}@{revision}"),
+        ConfigSource::GlobalUser { path } => format!("global user ({})", path.display()),
+        ConfigSource::ModelUser { model, path } => {
+            format!("model user {model} ({})", path.display())
+        }
+        ConfigSource::LegacyEnv { name } => format!("legacy env {name}"),
+        ConfigSource::OneShot { argument } => format!("one-shot {argument}"),
+    }
+}
+
+fn config_rule_json(rule: ValueRule) -> serde_json::Value {
+    match rule {
+        ValueRule::Bool => serde_json::json!({ "type": "boolean" }),
+        ValueRule::Integer { min, max } => {
+            serde_json::json!({ "type": "integer", "minimum": min, "maximum": max })
+        }
+        ValueRule::Float {
+            min,
+            max,
+            min_inclusive,
+        } => serde_json::json!({
+            "type": "number",
+            "minimum": min,
+            "maximum": max,
+            "minimum_inclusive": min_inclusive,
+        }),
+        ValueRule::String => serde_json::json!({ "type": "string" }),
+        ValueRule::NonEmptyString => {
+            serde_json::json!({ "type": "string", "min_length": 1 })
+        }
+        ValueRule::Host => serde_json::json!({ "type": "string", "format": "host" }),
+        ValueRule::PathOrEmpty => {
+            serde_json::json!({ "type": "string", "format": "existing-path-or-empty" })
+        }
+        ValueRule::Enum(values) => {
+            serde_json::json!({ "type": "string", "enum": values })
+        }
+        ValueRule::KvBackend => {
+            serde_json::json!({ "type": "string", "enum": ["legacy", "vmm"] })
+        }
+        ValueRule::AutoBool => serde_json::json!({
+            "type": ["boolean", "string"],
+            "enum": [true, false, "auto"],
+        }),
+        ValueRule::NullableString => {
+            serde_json::json!({ "type": ["string", "null"] })
+        }
+        ValueRule::NullableEnum(values) => serde_json::json!({
+            "type": ["string", "null"],
+            "enum": values,
+            "nullable": true,
+        }),
+        ValueRule::NullableInteger { min, max } => serde_json::json!({
+            "type": ["integer", "null"],
+            "minimum": min,
+            "maximum": max,
+        }),
+        ValueRule::NullableFloat { min, max } => serde_json::json!({
+            "type": ["number", "null"],
+            "minimum": min,
+            "maximum": max,
+        }),
+        ValueRule::KvAdaptive => serde_json::json!({
+            "type": "string",
+            "format": "kv-adaptive-policy",
+        }),
+        ValueRule::Deepseek4Placement => serde_json::json!({
+            "type": "string",
+            "format": "deepseek4-compute-placement",
+        }),
+    }
+}
+
+fn config_rule_label(rule: ValueRule) -> &'static str {
+    match rule {
+        ValueRule::Bool => "bool",
+        ValueRule::Integer { .. } => "integer",
+        ValueRule::Float { .. } => "number",
+        ValueRule::String => "string",
+        ValueRule::NonEmptyString => "nonempty-string",
+        ValueRule::Host => "host",
+        ValueRule::PathOrEmpty => "path-or-empty",
+        ValueRule::Enum(_) => "enum",
+        ValueRule::KvBackend => "kv-backend",
+        ValueRule::AutoBool => "auto-bool",
+        ValueRule::NullableString => "string|null",
+        ValueRule::NullableEnum(_) => "enum|null",
+        ValueRule::NullableInteger { .. } => "integer|null",
+        ValueRule::NullableFloat { .. } => "number|null",
+        ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::Deepseek4Placement => "deepseek4-placement",
+    }
+}
+
+fn config_default_value(schema: &hipfire_config::ConfigField) -> hipfire_config::ConfigValue {
+    // Resolve one empty layer set so the config crate remains the only place
+    // that turns the private DefaultValue representation into a public value.
+    resolve(Vec::<NamedLayer>::new())
+        .expect("built-in schema validates")
+        .get(schema.key)
+        .expect("schema key resolved")
+        .value
+        .clone()
+}
+
+fn format_default(schema: &hipfire_config::ConfigField) -> String {
+    config_default_value(schema).to_string()
+}
+
+fn registry_source(source: RegistrySource) -> &'static str {
+    match source {
+        RegistrySource::Cache => "cache",
+        RegistrySource::Network => "network",
+        RegistrySource::StaleCache => "stale-cache",
+        RegistrySource::Bundled => "bundled",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::complete::{
+        forward_think_fragments, include_reasoning_content, inject_default_system_message,
+        normalize_openai_messages, Completion, ThinkFragment,
+    };
+
+    use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
+    use hipfire_config::CONFIG_PROFILE_NAMES;
+    fn test_paths(label: &str) -> Paths {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "hipfire-cli-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = ConfigPaths::under(&root);
+        Paths {
+            models: config.models.clone(),
+            registry: RegistryPaths {
+                cache: root.join("registry.cache.json"),
+            },
+            root,
+            config,
+        }
+    }
+
+    fn idle_test_meta() -> ServeMeta {
+        ServeMeta {
+            current_model: Some("model.hfq".to_owned()),
+            loading_model: Some("model.hfq".to_owned()),
+            last_activity: Instant::now() - Duration::from_secs(600),
+            ..ServeMeta::new("test".to_owned())
+        }
+    }
+
+    /// A minimal real HFQ container carrying `arch_id`, so the discovery
+    /// predicate's header probe runs against the format it will meet on disk
+    /// rather than a stub.
+    fn write_hfq_fixture(path: &Path, arch_id: u32) {
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+        write_hfqm_package_mem(
+            path,
+            arch_id,
+            "{}",
+            &[HfqMemTensor {
+                name: "model.embed_tokens.weight".to_owned(),
+                quant_type: 1,
+                shape: vec![4, 4],
+                group_size: 0,
+                data: vec![0u8; 32],
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn model_suffix_filter_covers_current_formats() {
+        assert!(is_model_file("qwen3.6-35b-a3b.mq4r"));
+        assert!(is_model_file("deepseek.mq2lloyd"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2r"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2rxt"));
+        assert!(is_model_file("draft.hfq"));
+        assert!(!is_model_file("model.triattn.bin"));
+        assert!(!is_model_file("README.md"));
+    }
+
+    /// `/v1/models` is the discovery surface an OpenAI-compatible client reads
+    /// to choose a model. It must offer only files that load as a trunk.
+    ///
+    /// Two ways the old suffix-only scan got that wrong, both observed against
+    /// a real `~/.hipfire/models`:
+    ///   - it ADVERTISED `qwen3.8-27b-vision.hfq` and `qwen38-27b-dflash-mq3.hfq`,
+    ///     which are sidecars; selecting either fails at load with
+    ///     `tokenizer metadata field missing or wrong type: model`.
+    ///   - it DROPPED `qwen3.8-27b.mq3-xt`, whose `-xt` suffix is not in
+    ///     `MODEL_SUFFIXES`, so the tier the user actually wanted was invisible.
+    #[test]
+    fn standalone_model_classification_separates_sidecars_from_tiers() {
+        let registry = hipfire_registry::bundled().unwrap();
+        // Registry-vouched files are judged by the catalog, never by the file:
+        // these paths deliberately do not exist.
+        let classified = |name: &str| {
+            is_standalone_model(
+                &PathBuf::from("/nonexistent/models").join(name),
+                name,
+                &registry,
+            )
+        };
+
+        // The tier whose suffix is missing from MODEL_SUFFIXES: listable AND
+        // servable. This is the model the operator actually wants.
+        assert!(!is_model_file("qwen3.8-27b.mq3-xt"));
+        assert!(is_listable_model_file("qwen3.8-27b.mq3-xt", &registry));
+        assert!(classified("qwen3.8-27b.mq3-xt"));
+
+        // A sidecar-only file: listable (it is really on disk) but NOT
+        // servable. It embeds `"tokenizer": "{}"`.
+        assert!(is_listable_model_file("qwen3.8-27b-vision.hfq", &registry));
+        assert!(!classified("qwen3.8-27b-vision.hfq"));
+
+        // The overlap case: the DFlash draft is BOTH its own registry entry's
+        // `file` (the documented `hipfire pull qwen3.8:27b-draft-mq3` target)
+        // AND a `dflash` sidecar of three other entries. Arch 20 is not a serve
+        // trunk, so it must not be advertised — while staying pullable.
+        assert!(registry
+            .models
+            .values()
+            .any(|entry| entry.file == "qwen38-27b-dflash-mq3.hfq"));
+        assert!(is_listable_model_file(
+            "qwen38-27b-dflash-mq3.hfq",
+            &registry
+        ));
+        assert!(!classified("qwen38-27b-dflash-mq3.hfq"));
+
+        assert!(!is_listable_model_file("README.md", &registry));
+        assert!(!classified("README.md"));
+    }
+
+    /// A file the registry does not name at all — what `hipfire quantize`
+    /// leaves in the models dir — is classified by its own container header.
+    ///
+    /// This is the class the registry-sidecar filter cannot see: on a real
+    /// box, `/v1/models` advertised `qwen3-8b-dflash.hfq`, and selecting it
+    /// failed with `no carrier for HFQ arch_id=20`.
+    #[test]
+    fn unregistered_files_are_classified_by_their_container_arch_id() {
+        let registry = hipfire_registry::bundled().unwrap();
+        let paths = test_paths("unregistered-arch");
+        fs::create_dir_all(&paths.models).unwrap();
+        let classify = |file: &str| {
+            let path = paths.models.join(file);
+            is_standalone_model(&path, file, &registry)
+        };
+
+        // A locally quantized trunk of a primary arch: advertised.
+        write_hfq_fixture(&paths.models.join("local-trunk.mq4"), 5);
+        assert!(classify("local-trunk.mq4"));
+
+        // Locally produced sidecars: never advertised, whatever the registry
+        // knows. 20 = DFlash draft, 23 = Muse Glimmer drafter.
+        write_hfq_fixture(&paths.models.join("qwen3-8b-dflash.hfq"), 20);
+        write_hfq_fixture(&paths.models.join("glimmer-assistant.hfq"), 23);
+        assert!(!classify("qwen3-8b-dflash.hfq"));
+        assert!(!classify("glimmer-assistant.hfq"));
+
+        // Not a container at all (or truncated): fail closed rather than
+        // advertise an id that cannot be classified.
+        fs::write(paths.models.join("garbage.hfq"), b"not an HFQ container").unwrap();
+        fs::write(paths.models.join("short.hfq"), b"HFQM\x01\x00\x00\x00").unwrap();
+        assert!(!classify("garbage.hfq"));
+        assert!(!classify("short.hfq"));
+
+        // A FLUX component trunk is a container with a carrier, but it cannot
+        // answer a completion: `/v1/models` is the completion surface.
+        write_hfq_fixture(&paths.models.join("flux-transformer.hfq"), 40);
+        assert!(!classify("flux-transformer.hfq"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// The two surfaces deliberately disagree, and that is the point:
+    /// `hipfire list` shows what is on disk; `/v1/models` shows what can serve.
+    #[test]
+    fn local_listing_keeps_sidecars_that_serve_discovery_drops() {
+        let paths = test_paths("listing-sidecars");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "qwen3.8-27b.mq3-xt",
+            "qwen3.8-27b-vision.hfq",
+            "qwen38-27b-dflash-mq3.hfq",
+            "qwen3.6-27b.mq4",
+        ] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        // Unregistered artifacts, so the header probe decides: a local trunk
+        // stays advertised, a local draft does not.
+        write_hfq_fixture(&paths.models.join("local-trunk.mq4"), 5);
+        write_hfq_fixture(&paths.models.join("qwen3-8b-dflash.hfq"), 20);
+        let registry = hipfire_registry::bundled().unwrap();
+
+        let models = list_local_models(&paths, &registry).unwrap();
+        let listed: Vec<String> = models.iter().map(|model| model.name.clone()).collect();
+        // Local listing: everything on disk is visible and rm-able.
+        for file in [
+            "qwen3.8-27b.mq3-xt",
+            "qwen3.8-27b-vision.hfq",
+            "qwen38-27b-dflash-mq3.hfq",
+            "qwen3.6-27b.mq4",
+            "local-trunk.mq4",
+            "qwen3-8b-dflash.hfq",
+        ] {
+            assert!(
+                listed.contains(&file.to_owned()),
+                "{file} missing: {listed:?}"
+            );
+        }
+
+        // Serve discovery: the XT tier survives, sidecars do not.
+        let served: Vec<String> = models
+            .iter()
+            .filter(|model| is_standalone_model(&model.path, &model.name, &registry))
+            .map(|model| model.name.clone())
+            .collect();
+        assert!(
+            served.contains(&"qwen3.8-27b.mq3-xt".to_owned()),
+            "{served:?}"
+        );
+        assert!(served.contains(&"qwen3.6-27b.mq4".to_owned()), "{served:?}");
+        assert!(
+            served.contains(&"local-trunk.mq4".to_owned()),
+            "a local trunk must stay advertised: {served:?}"
+        );
+        assert!(
+            !served.contains(&"qwen3.8-27b-vision.hfq".to_owned()),
+            "tower sidecar must not be offered as a model: {served:?}"
+        );
+        assert!(
+            !served.contains(&"qwen38-27b-dflash-mq3.hfq".to_owned()),
+            "DFlash draft must not be offered as a model: {served:?}"
+        );
+        assert!(
+            !served.contains(&"qwen3-8b-dflash.hfq".to_owned()),
+            "an unregistered DFlash draft must not be offered as a model: {served:?}"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// The Ornith artifacts shipped briefly as `ornith1.5-*` before being
+    /// renamed to `ornith-1.5-*`. Anyone who downloaded during that window has
+    /// the old filename on disk, and the registry now points at the new one —
+    /// so the canonical tag must still find their file rather than silently
+    /// re-downloading 19 GB.
+    #[test]
+    fn separator_spellings_find_an_already_downloaded_file() {
+        let paths = test_paths("separator-spellings");
+        let legacy = paths.models.join("ornith1.5-35b-a3b.mq4");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        // The new canonical spelling reaches the old file only via the
+        // separator-insensitive fallback — this is the case the rename broke.
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith-1.5:35b-a3b"),
+            Some(legacy.clone()),
+            "hyphenated tag must find the unhyphenated file"
+        );
+        // The old spelling already worked through the literal pass; pin it so
+        // the fallback cannot regress it.
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith1.5:35b-a3b"),
+            Some(legacy.clone()),
+            "legacy tag must keep working"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// The fallback must not outrank a literal hit. With both spellings present
+    /// on disk, each input resolves to its own file, not to whichever the
+    /// looser comparison happened to reach first.
+    #[test]
+    fn literal_match_wins_over_the_separator_fallback() {
+        let paths = test_paths("separator-precedence");
+        let legacy = paths.models.join("ornith1.5-35b-a3b.mq4");
+        let renamed = paths.models.join("ornith-1.5-35b-a3b.mq4");
+        fs::create_dir_all(paths.models.as_path()).unwrap();
+        fs::write(&legacy, b"fixture").unwrap();
+        fs::write(&renamed, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith-1.5:35b-a3b"),
+            Some(renamed),
+            "exact spelling must win when it exists"
+        );
+        assert_eq!(
+            find_model_path(&paths, &registry, "ornith1.5:35b-a3b"),
+            Some(legacy),
+            "exact spelling must win when it exists"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// An input that normalizes to the empty string must not match everything.
+    #[test]
+    fn separator_only_input_matches_nothing() {
+        let paths = test_paths("separator-empty");
+        let model = paths.models.join("qwen3.6-35b-a3b.mq4");
+        fs::create_dir_all(model.parent().unwrap()).unwrap();
+        fs::write(&model, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        assert_eq!(find_model_path(&paths, &registry, "-.-"), None);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn nested_model_discovery_matches_native_registry_layout() {
+        let paths = test_paths("nested-models");
+        let nested = paths.models.join("community").join("example-model.mq4r");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"fixture").unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        assert_eq!(
+            find_model_path(&paths, &registry, "example-model"),
+            Some(fs::canonicalize(&nested).unwrap())
+        );
+        assert!(list_local_models(&paths, &registry)
+            .unwrap()
+            .iter()
+            .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn daemon_discovery_prefers_windows_exe_spelling() {
+        // Windows-shaped policy (runs on any host, like the rocm.rs HIPCC
+        // suffix tests): daemon.exe is probed before the bare name so an
+        // install or source-tree build is found on Windows.
+        assert_eq!(daemon_bin_names(true), &["daemon.exe", "daemon"]);
+        assert_eq!(daemon_bin_names(false), &["daemon"]);
+    }
+
+    #[test]
+    fn find_daemon_discovers_daemon_exe_under_windows_shaped_policy() {
+        // Only the .exe spelling exists — exactly the Windows install layout.
+        let paths = test_paths("daemon-exe");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon.exe"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon.exe"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_windows_policy_accepts_extensionless_shim() {
+        // The bare spelling stays a fallback on Windows for a future shim.
+        let paths = test_paths("daemon-shim");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_prefers_install_dir_over_source_tree() {
+        // Install root (~/.hipfire/bin) wins over the source-tree target dir
+        // even when both carry a candidate (real host: Windows + dev build).
+        let paths = test_paths("daemon-install-vs-target");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon.exe"), b"install").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(workspace.join("release")).unwrap();
+        fs::write(workspace.join("release").join("daemon.exe"), b"dev").unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon.exe"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_falls_back_to_bare_spelling_for_unix_shaped_policy() {
+        // Unix-shaped policy: only the extensionless daemon is probed.
+        let paths = test_paths("daemon-bare");
+        let release = paths.root.join("target").join("release");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join("daemon"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, false),
+            Some(release.join("daemon"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn cask_triattn_and_pflash_remain_opt_in_at_load() {
+        let paths = test_paths("experimental-defaults");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+        let entry = registry
+            .models
+            .values()
+            .find(|entry| entry.triattn.is_some())
+            .expect("bundled registry should retain a TriAttention sidecar");
+        let model_path = paths.models.join(&entry.file);
+        fs::write(&model_path, b"model").unwrap();
+        let triattn = entry.triattn.as_ref().unwrap();
+        let sidecar_path = paths.models.join(&triattn.file);
+        fs::write(&sidecar_path, b"sidecar").unwrap();
+
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let params = load_params(
+            &defaults,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["cask"], false);
+        assert_eq!(params["cask_handoff_tokens"], 0);
+        assert_eq!(params["cask_sidecar"], "");
+        assert_eq!(params["prefill_compression"], "off");
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("memory.cask.auto_attach", "true").unwrap();
+        let enabled = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "memory.cask.auto_attach=true".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(
+            &enabled,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["cask"], false);
+        assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
+        assert_eq!(params["prefill_compression"], "off");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_forwards_explicit_vmm_backend() {
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("vmm"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["kv_backend"], "vmm");
+    }
+
+    #[test]
+    pub(crate) fn load_params_omits_automatic_kv_backend_for_path() {
+        // Absolute path with only schema/built-in backend/max_seq is automatic:
+        // omit both so admission can pick VMM and the daemon can derive max_seq.
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            params.get("kv_backend").is_none(),
+            "absolute path automatic backend must omit kv_backend"
+        );
+        assert!(
+            params.get("max_seq").is_none(),
+            "absolute path automatic max_seq must be omitted for runtime default"
+        );
+    }
+
+    #[test]
+    pub(crate) fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
+        let paths = test_paths("registry-qwen-tag-policy");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{
+                "qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.6:35b-a3b":{"repo":"x","file":"qwen3.6-35b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.8:27b-fast":{"repo":"x","file":"qwen3.8-27b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.5:9b-draft":{"repo":"x","file":"qwen35-9b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.6:27b-dflash":{"repo":"x","file":"qwen36-27b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        // Exact Qwen families keep max_tokens only; registry no longer pins
+        // max_seq or kv_backend. load_params omits automatic max_seq/backend.
+        for tag in [
+            "qwen3.5:4b",
+            "qwen3.6:35b-a3b",
+            "qwen3.8:27b",
+            "qwen3.8:27b-fast",
+        ] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                direct.get("memory.kv_backend").is_none(),
+                "{tag} registry layer must not write kv_backend"
+            );
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry layer must not write max_seq"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
+            );
+            assert_eq!(
+                config_u64(&resolved, "generation.max_tokens").unwrap(),
+                81920,
+                "{tag}"
+            );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("kv_backend").is_none(),
+                "{tag} load_params must omit automatic kv_backend"
+            );
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
+        }
+
+        // Original qwen3:* has no tag policy — backend/max_seq stay automatic.
+        let (_, entry) = registry.model("qwen3:8b").unwrap();
+        let resolved =
+            resolved_for_model(&paths, "qwen3:8b", Some("qwen3:8b"), Some(entry)).unwrap();
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&resolved, "generation.max_tokens").unwrap(),
+            4096
+        );
+        // More directly, check the helper layer itself has no policy.
+        let direct = hipfire_registry::config_layer_for_tag("qwen3:8b", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &resolved,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            params.get("kv_backend").is_none(),
+            "original qwen3 automatic backend must omit kv_backend"
+        );
+        assert!(
+            params.get("max_seq").is_none(),
+            "original qwen3 automatic max_seq must be omitted"
+        );
+
+        // Draft/dflash sidecars do not get the Qwen policy even though family matches.
+        for tag in ["qwen3.5:9b-draft", "qwen3.6:27b-dflash"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                direct.get("memory.kv_backend").is_none(),
+                "{tag} sidecar must not get vmm"
+            );
+            assert!(direct.get("memory.max_seq").is_none());
+            assert!(direct.get("generation.max_tokens").is_none());
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn resolved_for_model_applies_glimmer_and_deepseek_targets() {
+        let paths = test_paths("registry-glimmer-deepseek-tag-policy");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{
+                "muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:fast":{"repo":"x","file":"muse-glimmer-30b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:draft":{"repo":"x","file":"muse-glimmer-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash":{"repo":"x","file":"deepseek-v4-flash-0731.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"deepseek-v4-flash-0731.mq2lloyd","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash-preview":{"repo":"x","file":"deepseek-v4-flash-preview.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:draft":{"repo":"x","file":"deepseek-v4-flash-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "other:model":{"repo":"x","file":"other.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{
+                "deepseek4":"deepseek-v4-flash",
+                "ds4":"deepseek-v4-flash",
+                "deepseek4:preview":"deepseek-v4-flash-preview",
+                "muse-glimmer:quality":"muse-glimmer"
+            }
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        // Muse Glimmer tags no longer pin max_seq; backend remains automatic.
+        for tag in ["muse-glimmer", "muse-glimmer:fast"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
+            );
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert!(direct.get("memory.kv_backend").is_none());
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry must not write max_seq"
+            );
+            assert!(
+                direct.get("generation.max_tokens").is_none(),
+                "{tag} must not get max_tokens"
+            );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
+        }
+        // quality alias lands on trunk (still no max_seq policy).
+        let (resolved_tag, entry) = registry.model("muse-glimmer:quality").unwrap();
+        assert_eq!(resolved_tag, "muse-glimmer");
+        let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+        assert!(direct.get("memory.max_seq").is_none());
+
+        // Muse Glimmer draft receives none.
+        let (_, entry) = registry.model("muse-glimmer:draft").unwrap();
+        let direct = hipfire_registry::config_layer_for_tag("muse-glimmer:draft", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+        let resolved = resolved_for_model(
+            &paths,
+            "muse-glimmer:draft",
+            Some("muse-glimmer:draft"),
+            Some(entry),
+        )
+        .unwrap();
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+
+        // DeepSeek tags keep generation.max_tokens only; no max_seq/backend pin.
+        for tag in [
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:mq2lloyd",
+            "deepseek-v4-flash-preview",
+        ] {
+            let (resolved_tag, entry) = registry.model(tag).unwrap();
+            let resolved =
+                resolved_for_model(&paths, resolved_tag, Some(resolved_tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
+            );
+            assert_eq!(
+                config_u64(&resolved, "generation.max_tokens").unwrap(),
+                393216,
+                "{tag}"
+            );
+            let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+            assert!(direct.get("memory.kv_backend").is_none());
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry must not write max_seq"
+            );
+            assert_eq!(
+                direct.get("generation.max_tokens"),
+                Some(&hipfire_config::ConfigValue::Integer(393216))
+            );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
+        }
+        for alias in ["deepseek4", "ds4", "deepseek4:preview"] {
+            let (resolved_tag, entry) = registry.model(alias).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{alias}->{resolved_tag}"
+            );
+            assert_eq!(
+                direct.get("generation.max_tokens"),
+                Some(&hipfire_config::ConfigValue::Integer(393216)),
+                "{alias}->{resolved_tag}"
+            );
+        }
+        // DeepSeek draft sidecar receives none.
+        let (_, entry) = registry.model("deepseek-v4-flash:draft").unwrap();
+        let direct =
+            hipfire_registry::config_layer_for_tag("deepseek-v4-flash:draft", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        // Absent policy: unrelated model gets no automatic policy.
+        let (_, entry) = registry.model("other:model").unwrap();
+        let direct = hipfire_registry::config_layer_for_tag("other:model", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn resolved_for_model_tag_policy_is_overridable_by_user() {
+        let paths = test_paths("registry-tag-policy-override");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&resolved, "generation.max_tokens").unwrap(),
+            81920
+        );
+
+        // Global user override wins over registry tag policy (registry below global).
+        let mut user_layer = ConfigLayer::default();
+        user_layer.set_cli("memory.kv_backend", "legacy").unwrap();
+        user_layer.set_cli("memory.max_seq", "32768").unwrap();
+        user_layer.set_cli("generation.max_tokens", "1024").unwrap();
+        let overridden = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: hipfire_registry::config_layer_for_tag(tag, entry).unwrap(),
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test.toml"),
+                },
+                layer: user_layer,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&overridden, "memory.kv_backend").unwrap(),
+            "legacy"
+        );
+        assert_eq!(config_u64(&overridden, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&overridden, "generation.max_tokens").unwrap(),
+            1024
+        );
+
+        // Explicit CLI flag is emitted (flag wins over automatic resolved backend).
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &resolved,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("legacy"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["kv_backend"], "legacy");
+        // Automatic registry/built-in: omit kv_backend and max_seq.
+        let params2 = load_params(
+            &resolved,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            params2.get("kv_backend").is_none(),
+            "registry-tag automatic backend must omit kv_backend"
+        );
+        assert!(
+            params2.get("max_seq").is_none(),
+            "registry-tag automatic max_seq must be omitted"
+        );
+
+        // Global user config is an explicit choice and is emitted.
+        let params_global = load_params(
+            &overridden,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params_global["kv_backend"], "legacy");
+        assert_eq!(params_global["max_seq"], 32768);
+
+        // Precedence: flag > model config > global config.
+        let mut global_layer = ConfigLayer::default();
+        global_layer.set_cli("memory.kv_backend", "legacy").unwrap();
+        let mut model_layer = ConfigLayer::default();
+        model_layer.set_cli("memory.kv_backend", "vmm").unwrap();
+        let model_over_global = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/global.toml"),
+                },
+                layer: global_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::ModelUser {
+                    model: tag.to_owned(),
+                    path: std::path::PathBuf::from("/tmp/model.toml"),
+                },
+                layer: model_layer,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&model_over_global, "memory.kv_backend").unwrap(),
+            "vmm",
+            "model user config must beat global user"
+        );
+        let params_model = load_params(
+            &model_over_global,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params_model["kv_backend"], "vmm");
+        let params_flag = load_params(
+            &model_over_global,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("legacy"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params_flag["kv_backend"], "legacy",
+            "CLI flag must beat model user config"
+        );
+
+        // Glimmer target likewise overridable (backend + max_seq).
+        let raw2 = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{"muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry2 = RegistryV1::parse(raw2, "test").unwrap();
+        let (g_tag, g_entry) = registry2.model("muse-glimmer").unwrap();
+        let g_layer = hipfire_registry::config_layer_for_tag(g_tag, g_entry).unwrap();
+        assert!(g_layer.get("memory.kv_backend").is_none());
+        assert!(g_layer.get("memory.max_seq").is_none());
+        assert!(g_layer.get("generation.max_tokens").is_none());
+        let mut g_user = ConfigLayer::default();
+        g_user.set_cli("memory.kv_backend", "legacy").unwrap();
+        g_user.set_cli("memory.max_seq", "8192").unwrap();
+        let g_resolved = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: g_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: g_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test2.toml"),
+                },
+                layer: g_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&g_resolved, "memory.kv_backend").unwrap(),
+            "legacy"
+        );
+        assert_eq!(config_u64(&g_resolved, "memory.max_seq").unwrap(), 8192);
+        let model_path_g = PathBuf::from("/tmp/test-model.mq4");
+        let g_params = load_params(
+            &g_resolved,
+            Some(g_entry),
+            &model_path_g.parent().unwrap(),
+            &model_path_g,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(g_params["kv_backend"], "legacy");
+        assert_eq!(g_params["max_seq"], 8192);
+
+        // DeepSeek target: generation policy remains; user max_seq still wins.
+        let raw3 = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{"deepseek-v4-flash":{"repo":"x","file":"ds4.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry3 = RegistryV1::parse(raw3, "test").unwrap();
+        let (d_tag, d_entry) = registry3.model("deepseek-v4-flash").unwrap();
+        let d_resolved = resolved_for_model(&paths, d_tag, Some(d_tag), Some(d_entry)).unwrap();
+        assert_eq!(
+            config_string(&d_resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+        assert_eq!(config_u64(&d_resolved, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&d_resolved, "generation.max_tokens").unwrap(),
+            393216
+        );
+        let mut d_user = ConfigLayer::default();
+        d_user.set_cli("memory.max_seq", "65536").unwrap();
+        d_user.set_cli("generation.max_tokens", "2048").unwrap();
+        let d_overridden = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: d_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: hipfire_registry::config_layer_for_tag(d_tag, d_entry).unwrap(),
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test3.toml"),
+                },
+                layer: d_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(config_u64(&d_overridden, "memory.max_seq").unwrap(), 65536);
+        assert_eq!(
+            config_u64(&d_overridden, "generation.max_tokens").unwrap(),
+            2048
+        );
+        let d_params = load_params(
+            &d_overridden,
+            Some(d_entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(d_params["max_seq"], 65536);
+
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
+        let model_path = PathBuf::from("/tmp/test-model.mq2r");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], "single");
+        assert!(params.get("deepseek4_experts_per_token").is_none());
+
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("model.deepseek4_experts_per_token", "4")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "model.deepseek4_experts_per_token=4".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["deepseek4_experts_per_token"], 4);
+    }
+
+    #[test]
+    pub(crate) fn load_params_forwards_typed_deepseek4_compute_placement() {
+        let raw = "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)";
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("hardware.deepseek4_compute_placement", raw)
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("hardware.deepseek4_compute_placement={raw}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            Path::new("/tmp/test-model.mq2r").parent().unwrap(),
+            Path::new("/tmp/test-model.mq2r"),
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], raw);
+    }
+
+    #[test]
+    pub(crate) fn load_params_forwards_dflash_draft_from_environment() {
+        let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.mode", "dflash").unwrap();
+        explicit.set_cli("developer.dflash_draft", draft).unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "speculation.mode=dflash".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["draft"], draft);
+    }
+
+    fn dflash_sidecar_entry(draft_file: &str) -> ModelEntry {
+        ModelEntry {
+            repo: "hipfire-models/qwen3.5-9b".into(),
+            file: "qwen3.5-9b.mq4".into(),
+            size_gb: 5.31,
+            min_vram_gb: 6.8,
+            desc: "test target".into(),
+            dflash: Some(hipfire_registry::Sidecar {
+                file: draft_file.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn vision_sidecar_entry(vision_file: &str) -> ModelEntry {
+        ModelEntry {
+            repo: "hipfire-models/qwen3.8-27b".into(),
+            file: "qwen3.8-27b.mq4".into(),
+            size_gb: 15.66,
+            min_vram_gb: 17.0,
+            desc: "test target".into(),
+            vision: Some(hipfire_registry::Sidecar {
+                file: vision_file.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+    fn xdna_sidecar_entry(xdna_file: &str) -> ModelEntry {
+        ModelEntry {
+            repo: "hipfire-models/qwen3.8-27b".into(),
+            file: "qwen3.8-27b.mq4".into(),
+            size_gb: 15.66,
+            min_vram_gb: 17.0,
+            desc: "test target".into(),
+            xdna: Some(hipfire_registry::Sidecar {
+                file: xdna_file.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn resolved_with_npu_spillover(on: bool) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("kernel.npu_spillover", if on { "true" } else { "false" })
+            .unwrap();
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("kernel.npu_spillover={on}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
+    /// Minimal stored-ZIP writer for XDNA sidecar fixtures (local headers +
+    /// central directory + EOCD, method 0 throughout).
+    fn write_stored_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        fn u16le(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u32le(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut bytes = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let local_offset = bytes.len() as u32;
+            bytes.extend_from_slice(b"PK\x03\x04");
+            u16le(&mut bytes, 20);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u32le(&mut bytes, 0);
+            u32le(&mut bytes, data.len() as u32);
+            u32le(&mut bytes, data.len() as u32);
+            u16le(&mut bytes, name.len() as u16);
+            u16le(&mut bytes, 0);
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(data);
+            central.extend_from_slice(b"PK\x01\x02");
+            u16le(&mut central, 20);
+            u16le(&mut central, 20);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u32le(&mut central, 0);
+            u32le(&mut central, data.len() as u32);
+            u32le(&mut central, data.len() as u32);
+            u16le(&mut central, name.len() as u16);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u32le(&mut central, 0);
+            u32le(&mut central, local_offset);
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_offset = bytes.len() as u32;
+        bytes.extend_from_slice(&central);
+        let central_size = central.len() as u32;
+        bytes.extend_from_slice(b"PK\x05\x06");
+        u16le(&mut bytes, 0);
+        u16le(&mut bytes, 0);
+        u16le(&mut bytes, entries.len() as u16);
+        u16le(&mut bytes, entries.len() as u16);
+        u32le(&mut bytes, central_size);
+        u32le(&mut bytes, central_offset);
+        u16le(&mut bytes, 0);
+        fs::write(path, &bytes).unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        digest
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+                out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
+                out
+            })
+    }
+
+    /// A manifest-v1 `.xdna.zip` binding the given payloads, written to the
+    /// models dir. Returns the archive path.
+    fn write_xdna_fixture(models_dir: &Path, file: &str) -> PathBuf {
+        let pdi = b"fixture-pdi-bytes";
+        let insts = b"fixture-insts-bytes";
+        let manifest = serde_json::json!({
+            "version": 1,
+            "model_sha256": "c".repeat(64),
+            "quant": "mq4g256v2",
+            "arch": "gfx1151",
+            "npu": "npu5",
+            "toolchain": {"mlir_aie": "f50bef7", "peano": "22.0.0.2026090701"},
+            "profiles": [{
+                "tensor_role": "gate_up",
+                "M": 1024, "K": 5120, "N": 512, "row_count": 1024,
+                "tile_m": 128, "tile_k": 64, "tile_n": 64,
+                "cols": 8, "k_mt": 512,
+                "pdi": "profiles/gate_up/main.pdi",
+                "insts": "profiles/gate_up/insts.bin",
+                "arg_layout": [{"name": "a", "offset": 0, "size": 64}],
+                "sha256_pdi": sha256_hex(pdi),
+                "sha256_insts": sha256_hex(insts)
+            }]
+        })
+        .to_string();
+        let path = models_dir.join(file);
+        write_stored_zip(
+            &path,
+            &[
+                ("manifest.json", manifest.as_bytes()),
+                ("profiles/gate_up/main.pdi", pdi),
+                ("profiles/gate_up/insts.bin", insts),
+            ],
+        );
+        path
+    }
+
+    fn resolved_with_dflash_mode(
+        mode: &str,
+        draft: Option<&str>,
+    ) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.dflash", mode).unwrap();
+        if let Some(draft) = draft {
+            explicit.set_cli("developer.dflash_draft", draft).unwrap();
+        }
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("speculation.dflash={mode}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
+    fn resolved_with_vision_mode(mode: &str) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("vision.mode", mode).unwrap();
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("vision.mode={mode}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    pub(crate) fn load_params_resolves_registry_dflash_sidecar_when_present() {
+        // (b) auto + pulled draft file → params["draft"] points at it.
+        let paths = test_paths("dflash-sidecar-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["draft"], draft_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    pub(crate) fn load_params_finds_sidecar_in_models_dir_for_symlinked_target() {
+        // find_model_path canonicalizes, so a target symlinked out of the
+        // models dir has a parent with no draft in it. The sidecar must be
+        // looked up in the models dir, not beside the canonical file.
+        // Measured 2026-09-03: serve --speculation dflash ran AR (tau=None)
+        // on a symlinked qwen3.8-27b.mq5 while the tag form resolved.
+        let paths = test_paths("dflash-sidecar-symlink");
+        fs::create_dir_all(&paths.models).unwrap();
+        let elsewhere = paths.root.join("artifacts");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let real_model = elsewhere.join("qwen3.5-9b.mq4v2.base.hfq");
+        fs::write(&real_model, b"model").unwrap();
+        std::os::unix::fs::symlink(&real_model, paths.models.join("qwen3.5-9b.mq4")).unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("on", None);
+        // What serve/run actually pass: the canonicalized path.
+        let canonical = fs::canonicalize(paths.models.join("qwen3.5-9b.mq4")).unwrap();
+        assert_eq!(
+            canonical.parent().unwrap(),
+            elsewhere.canonicalize().unwrap()
+        );
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &paths.models,
+            &canonical,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["draft"], draft_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_dflash_on_fails_closed_when_sidecar_missing() {
+        // (c) on + missing file errors with a pull hint naming the tag.
+        let paths = test_paths("dflash-sidecar-on-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("on", None);
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .expect_err("on without a pulled draft must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("qwen35-9b-dflash-mq4.hfq"), "{message}");
+        assert!(message.contains("hipfire pull qwen3.5:9b"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_dflash_auto_runs_ar_when_sidecar_missing() {
+        // (d) auto + missing file yields no draft and no error.
+        let paths = test_paths("dflash-sidecar-auto-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "auto");
+        assert!(
+            params.get("draft").is_none(),
+            "auto without a pulled draft runs AR"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_explicit_draft_wins_over_dflash_sidecar() {
+        // (e) developer.dflash_draft beats the sidecar even when pulled.
+        let paths = test_paths("dflash-sidecar-explicit-wins");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let explicit = "/tmp/custom-draft.hfq";
+        let resolved = resolved_with_dflash_mode("auto", Some(explicit));
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["draft"], explicit);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_final_off_drops_dflash_sidecar() {
+        // (f) off never carries the sidecar, and a final off selector drops
+        // a previously resolved one.
+        let paths = test_paths("dflash-sidecar-off-drops");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("off", None);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "off must not resolve the sidecar"
+        );
+
+        // Resolve under auto, then a final off selector drops it.
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let mut params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["draft"], draft_path.display().to_string());
+        apply_speculation_selector(&mut params, "off").unwrap();
+        project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "final off must drop the sidecar draft"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_skips_sidecar_for_explicit_cli_draft() {
+        // `run --model-draft` (projected by the caller after load_params)
+        // always wins: even `on` must not fail closed on a missing sidecar.
+        let paths = test_paths("dflash-sidecar-cli-explicit");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("on", None);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("draft").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_resolves_registry_vision_sidecar_when_present() {
+        // `auto` + pulled registry `vision.file` wires `params["vision"]`
+        // for the daemon load.
+        let paths = test_paths("vision-sidecar-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("auto");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+    #[test]
+    pub(crate) fn load_params_xdna_off_by_default_projects_nothing() {
+        // Default-off: even a declared AND pulled archive must not surface.
+        let paths = test_paths("xdna-sidecar-off-default");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        write_xdna_fixture(&paths.models, "qwen38-27b.xdna.zip");
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(false);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            params.get("xdna").is_none(),
+            "flag-off must not project xdna"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_projects_verified_archive() {
+        // Flag on + pulled verified archive → params["xdna"] carries the path
+        // for the daemon (which re-verifies and arch-gates into LoadCtx.xdna).
+        let paths = test_paths("xdna-sidecar-on-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let xdna_path = write_xdna_fixture(&paths.models, "qwen38-27b.xdna.zip");
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(true);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["xdna"], xdna_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_fails_closed_when_sidecar_missing() {
+        // Flag on + declared but unpulled archive fails with a pull hint —
+        // an explicit opt-in must not silently run GPU-only.
+        let paths = test_paths("xdna-sidecar-on-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(true);
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .expect_err("missing xdna archive must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("qwen38-27b.xdna.zip"), "{message}");
+        assert!(message.contains("hipfire pull qwen3.8:27b"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_without_entry_stays_gpu_only() {
+        // Flag on with a bare (non-registry) artifact logs one line and stays
+        // GPU-only instead of failing every load for models with no artifact.
+        let paths = test_paths("xdna-sidecar-on-no-entry");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let resolved = resolved_with_npu_spillover(true);
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("xdna").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_skips_vision_sidecar_when_unpulled() {
+        // `auto` + declared but unpulled sidecar is silently skipped: vision
+        // never gates a text-only load.
+        let paths = test_paths("vision-sidecar-absent");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("auto");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("vision").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_discovers_stem_vision_sibling_beside_trunk() {
+        // `auto` with no registry identity at all: `<trunk-stem>-vision.hfq`
+        // beside the trunk is still discovered.
+        let paths = test_paths("vision-stem-sibling");
+        let elsewhere = paths.root.join("artifacts");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let model_path = elsewhere.join("qwen3.8-27b.mq5");
+        fs::write(&model_path, b"model").unwrap();
+        let vision_path = elsewhere.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let resolved = resolved_with_vision_mode("auto");
+        let params = load_params(
+            &resolved,
+            None,
+            &paths.models,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn projected_vision_path_wins_over_registry_sidecar() {
+        // `run --vision` (projected by the caller after load_params returns)
+        // always wins: a preset `params["vision"]` is never re-resolved.
+        let paths = test_paths("vision-projected-wins");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let mut params = serde_json::json!({"vision_mode": "auto"});
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert_eq!(
+            params["vision"],
+            paths
+                .models
+                .join("qwen3.8-27b-vision.hfq")
+                .display()
+                .to_string()
+        );
+        // An explicit override survives a second resolution pass.
+        params["vision"] = serde_json::json!("/custom/tower.hfq");
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert_eq!(params["vision"], "/custom/tower.hfq");
+        // Empty string opts out: the key is dropped, never re-resolved.
+        params["vision"] = serde_json::json!("");
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert!(params.get("vision").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_off_still_forwards_sidecar_for_daemon_gate() {
+        // `off` is a hard override: a pulled sidecar is never wired, and an
+        // explicitly projected path is stripped, mirroring `dflash_mode=off`.
+        let paths = test_paths("vision-mode-off");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("off");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "off");
+        // `off` still resolves the sidecar into the params: the daemon's gate
+        // is the hard override and needs the path to name what it declined.
+        assert_eq!(
+            params["vision"],
+            paths
+                .models
+                .join("qwen3.8-27b-vision.hfq")
+                .display()
+                .to_string()
+        );
+        // An explicitly projected path is forwarded untouched under `off`.
+        let mut params = serde_json::json!({"vision_mode": "off", "vision": "/custom/tower.hfq"});
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert_eq!(params["vision"], "/custom/tower.hfq");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_wires_sidecar_when_present() {
+        // `on` + pulled sidecar wires it like `auto`.
+        let paths = test_paths("vision-mode-on-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("on");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "on");
+        assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_fails_closed_when_sidecar_missing() {
+        // `on` + declared but unpulled sidecar fails closed with a pull hint
+        // naming the tag — same shape as the DFlash `on` refusal.
+        let paths = test_paths("vision-mode-on-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("on");
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .expect_err("on without a pulled tower must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("qwen3.8-27b-vision.hfq"), "{message}");
+        assert!(message.contains("hipfire pull qwen3.8:27b"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_leaves_bare_trunk_alone() {
+        // `on` with no declared sidecar never fails: a trunk with an embedded
+        // tower is unaffected by this key, so the load proceeds without one.
+        let paths = test_paths("vision-mode-on-bare");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let resolved = resolved_with_vision_mode("on");
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("vision").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// Minimal in-memory registry for rm tests: (tag, target file, dflash file).
+    fn rm_test_registry(entries: &[(&str, &str, Option<&str>)]) -> RegistryV1 {
+        let mut models = BTreeMap::new();
+        for (tag, file, dflash) in entries {
+            models.insert(
+                (*tag).to_owned(),
+                ModelEntry {
+                    repo: "test/repo".into(),
+                    file: (*file).to_owned(),
+                    size_gb: 1.0,
+                    min_vram_gb: 1.0,
+                    desc: "rm test".into(),
+                    dflash: dflash.map(|draft| hipfire_registry::Sidecar {
+                        file: draft.into(),
+                        sha256: None,
+                        size_bytes: None,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        RegistryV1 {
+            schema_version: hipfire_registry::REGISTRY_SCHEMA_VERSION,
+            generated_at: "test".into(),
+            _comment: None,
+            models,
+            aliases: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn rm_keeps_shared_dflash_sidecar_while_sibling_target_present() {
+        // The hw-gate regression on PR #686: `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`,
+        // and `qwen3.8:27b-mq4-xt` all declare `qwen38-27b-dflash-mq4.hfq`.
+        // Removing one target must keep the sidecar while a sibling declarer's
+        // target file is still on disk.
+        let paths = test_paths("rm-shared-sidecar-kept");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "qwen3.8-27b.mq4",
+            "qwen3.8-27b.mq4-pro",
+            "qwen38-27b-dflash-mq4.hfq",
+        ] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[
+            (
+                "qwen3.8:27b",
+                "qwen3.8-27b.mq4",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-pro",
+                "qwen3.8-27b.mq4-pro",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-xt",
+                "qwen3.8-27b.mq4-xt",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+        ]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            paths.models.join("qwen3.8-27b.mq4").exists(),
+            "sibling target stays"
+        );
+        assert!(
+            paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "shared sidecar is kept while a sibling declarer is on disk"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_dflash_sidecar_with_last_declaring_target() {
+        // `qwen3.8:27b` still declares the sidecar in the registry, but its
+        // target file was never downloaded — a registry row alone must not pin
+        // the sidecar once the last on-disk declarer is removed.
+        let paths = test_paths("rm-shared-sidecar-last");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.8-27b.mq4-pro", "qwen38-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[
+            (
+                "qwen3.8:27b",
+                "qwen3.8-27b.mq4",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-pro",
+                "qwen3.8-27b.mq4-pro",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+        ]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            !paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "sidecar goes with the last on-disk declarer"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_keeps_shared_vision_sidecar_while_sibling_target_present() {
+        // Every `qwen3.8:27b*` tier declares `qwen3.8-27b-vision.hfq`.
+        // Removing one target must keep the sidecar while a sibling declarer's
+        // target file is still on disk (same shared-keeper rule as DFlash).
+        let paths = test_paths("rm-shared-vision-kept");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "qwen3.8-27b.mq4",
+            "qwen3.8-27b.mq4-pro",
+            "qwen3.8-27b-vision.hfq",
+        ] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let mut registry = rm_test_registry(&[
+            ("qwen3.8:27b", "qwen3.8-27b.mq4", None),
+            ("qwen3.8:27b-mq4-pro", "qwen3.8-27b.mq4-pro", None),
+        ]);
+        for entry in registry.models.values_mut() {
+            entry.vision = Some(hipfire_registry::Sidecar {
+                file: "qwen3.8-27b-vision.hfq".into(),
+                sha256: None,
+                size_bytes: None,
+            });
+        }
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            paths.models.join("qwen3.8-27b.mq4").exists(),
+            "sibling target stays"
+        );
+        assert!(
+            paths.models.join("qwen3.8-27b-vision.hfq").exists(),
+            "shared vision sidecar is kept while a sibling declarer is on disk"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_vision_sidecar_with_last_declaring_target() {
+        // A registry row alone must not pin the sidecar once the last
+        // on-disk declarer is removed.
+        let paths = test_paths("rm-shared-vision-last");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.8-27b.mq4-pro", "qwen3.8-27b-vision.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let mut registry = rm_test_registry(&[
+            ("qwen3.8:27b", "qwen3.8-27b.mq4", None),
+            ("qwen3.8:27b-mq4-pro", "qwen3.8-27b.mq4-pro", None),
+        ]);
+        for entry in registry.models.values_mut() {
+            entry.vision = Some(hipfire_registry::Sidecar {
+                file: "qwen3.8-27b-vision.hfq".into(),
+                sha256: None,
+                size_bytes: None,
+            });
+        }
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            !paths.models.join("qwen3.8-27b-vision.hfq").exists(),
+            "vision sidecar goes with the last on-disk declarer"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    fn mtp_entry(file: &str, mtp: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            repo: "test/repo".into(),
+            file: file.into(),
+            size_gb: 1.0,
+            min_vram_gb: 1.0,
+            desc: "mtp test".into(),
+            mtp: mtp.map(|head| hipfire_registry::Sidecar {
+                file: head.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mtp_sidecar_resolves_beside_a_symlinked_trunk() {
+        // B2: `find_model_path` canonicalizes, so the trunk path the daemon gets
+        // is the symlink TARGET. The head the user placed (or pulled) beside the
+        // symlink must still be found: via the models dir for a registry tag,
+        // via the path as typed for a bare path.
+        let paths = test_paths("mtp-symlinked-trunk");
+        let store = paths.root.join("store");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let target = store.join("h2.group-alpha-refit.hfq");
+        fs::write(&target, b"trunk").unwrap();
+        let link = paths.models.join("qwen3.8-27b.mq4-xts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let head = paths.models.join("qwen3.8-27b.mtp");
+        fs::write(&head, b"head").unwrap();
+        let canonical = fs::canonicalize(&link).unwrap();
+        assert_eq!(canonical, fs::canonicalize(&target).unwrap());
+
+        // Registry tag with the declared slot.
+        let entry = mtp_entry("qwen3.8-27b.mq4-xts", Some("qwen3.8-27b.mtp"));
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve_mtp_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &canonical,
+            "qwen3.8:27b-mq4-xts",
+            Some("qwen3.8:27b-mq4-xts"),
+        );
+        assert_eq!(params["mtp"], head.display().to_string());
+
+        // Bare path to a symlink outside the models dir, no registry entry.
+        let elsewhere = paths.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let bare_link = elsewhere.join("mine.mq4-xts");
+        std::os::unix::fs::symlink(&target, &bare_link).unwrap();
+        let bare_head = elsewhere.join("mine.mtp");
+        fs::write(&bare_head, b"head").unwrap();
+        let mut params = serde_json::json!({ "mtp_mode": "on" });
+        resolve_mtp_sidecar(
+            &mut params,
+            None,
+            &paths.models,
+            &canonical,
+            bare_link.to_str().unwrap(),
+            None,
+        );
+        assert_eq!(params["mtp"], bare_head.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn mtp_sidecar_prefers_models_dir_then_falls_back_beside_the_target() {
+        let paths = test_paths("mtp-precedence");
+        let store = paths.root.join("store");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let target = store.join("qwen3.8-27b.mq4");
+        fs::write(&target, b"trunk").unwrap();
+        let beside_target = store.join("qwen3.8-27b.mtp");
+        fs::write(&beside_target, b"head").unwrap();
+        let entry = mtp_entry("qwen3.8-27b.mq4", Some("qwen3.8-27b.mtp"));
+        let resolve = |params: &mut serde_json::Value| {
+            resolve_mtp_sidecar(
+                params,
+                Some(&entry),
+                &paths.models,
+                &target,
+                "qwen3.8:27b",
+                None,
+            )
+        };
+
+        // Only the canonical sibling exists: today's loader behaviour is kept.
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve(&mut params);
+        assert_eq!(params["mtp"], beside_target.display().to_string());
+
+        // A pulled head in the models dir wins over the canonical sibling.
+        let pulled = paths.models.join("qwen3.8-27b.mtp");
+        fs::write(&pulled, b"head").unwrap();
+        resolve(&mut params);
+        assert_eq!(params["mtp"], pulled.display().to_string());
+
+        // Nothing anywhere: no param, so the loader's own lookup decides.
+        fs::remove_file(&pulled).unwrap();
+        fs::remove_file(&beside_target).unwrap();
+        resolve(&mut params);
+        assert!(params.get("mtp").is_none(), "{params}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn mtp_sidecar_is_never_carried_when_mtp_is_off() {
+        let paths = test_paths("mtp-off");
+        fs::create_dir_all(&paths.models).unwrap();
+        let target = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&target, b"trunk").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b.mtp"), b"head").unwrap();
+        let entry = mtp_entry("qwen3.8-27b.mq4", Some("qwen3.8-27b.mtp"));
+        let resolve = |params: &mut serde_json::Value| {
+            resolve_mtp_sidecar(
+                params,
+                Some(&entry),
+                &paths.models,
+                &target,
+                "qwen3.8:27b",
+                None,
+            )
+        };
+        // A selector applied after an earlier resolution (e.g. `run --spec
+        // dflash` sets mtp_mode=off) must strip the stale path.
+        let mut params = serde_json::json!({ "mtp_mode": "auto" });
+        resolve(&mut params);
+        assert!(params.get("mtp").is_some());
+        apply_speculation_selector(&mut params, "dflash").unwrap();
+        resolve(&mut params);
+        assert!(params.get("mtp").is_none(), "{params}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_keeps_shared_mtp_head_until_the_last_declaring_target() {
+        // Every `qwen3.8:27b*` tier declares `qwen3.8-27b.mtp`, whose name also
+        // matches the `<stem>.mtp` sweep beside the trunk being removed.
+        let paths = test_paths("rm-shared-mtp");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.8-27b.mq4", "qwen3.8-27b.mq4-xts", "qwen3.8-27b.mtp"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let mut registry = rm_test_registry(&[
+            ("qwen3.8:27b", "qwen3.8-27b.mq4", None),
+            ("qwen3.8:27b-mq4-xts", "qwen3.8-27b.mq4-xts", None),
+        ]);
+        for entry in registry.models.values_mut() {
+            entry.mtp = Some(hipfire_registry::Sidecar {
+                file: "qwen3.8-27b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            });
+        }
+        let rm = |model: &str| {
+            rm_with_registry(
+                &paths,
+                &registry,
+                RmArgs {
+                    model: model.into(),
+                    yes: true,
+                },
+            )
+            .unwrap()
+        };
+        rm("qwen3.8:27b-mq4-xts");
+        assert!(!paths.models.join("qwen3.8-27b.mq4-xts").exists());
+        assert!(
+            paths.models.join("qwen3.8-27b.mtp").exists(),
+            "shared head is kept while a sibling declarer is on disk"
+        );
+        rm("qwen3.8:27b");
+        assert!(!paths.models.join("qwen3.8-27b.mq4").exists());
+        assert!(
+            !paths.models.join("qwen3.8-27b.mtp").exists(),
+            "head goes with the last on-disk declarer"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_without_dflash_declaration_leaves_draft_file_alone() {
+        // A tag with no dflash declaration keeps master behaviour: its target
+        // goes, and a draft file it never declared is not an rm target.
+        let paths = test_paths("rm-no-dflash");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::write(paths.models.join("qwen3.8-27b.mq4"), b"fixture").unwrap();
+        fs::write(paths.models.join("qwen38-27b-dflash-mq4.hfq"), b"draft").unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b", "qwen3.8-27b.mq4", None)]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "an undeclared draft file is never an rm target"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_foreign_same_basename_path_removes_only_that_file() {
+        // PR #686 hw-gate regression: `hipfire rm /elsewhere/qwen3.6-27b.mq4`
+        // basename-matched the `qwen3.6:27b` entry and deleted the installed
+        // target plus its sidecars while the installed target stayed. A path
+        // that merely shares a basename gets no registry identity: only that
+        // file goes.
+        let paths = test_paths("rm-foreign-basename");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.6-27b.mq4", "qwen36-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let elsewhere = paths.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let foreign = elsewhere.join("qwen3.6-27b.mq4");
+        fs::write(&foreign, b"lookalike").unwrap();
+        let registry = rm_test_registry(&[(
+            "qwen3.6:27b",
+            "qwen3.6-27b.mq4",
+            Some("qwen36-27b-dflash-mq4.hfq"),
+        )]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: foreign.display().to_string(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!foreign.exists(), "the named foreign file is removed");
+        assert!(
+            paths.models.join("qwen3.6-27b.mq4").exists(),
+            "installed target stays"
+        );
+        assert!(
+            paths.models.join("qwen36-27b-dflash-mq4.hfq").exists(),
+            "installed sidecars stay"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_installed_path_removes_target_and_sidecars() {
+        // The same removal by installed path keeps master behaviour: target
+        // plus declared sidecars go.
+        let paths = test_paths("rm-installed-path");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.6-27b.mq4", "qwen36-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[(
+            "qwen3.6:27b",
+            "qwen3.6-27b.mq4",
+            Some("qwen36-27b-dflash-mq4.hfq"),
+        )]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: paths.models.join("qwen3.6-27b.mq4").display().to_string(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.6-27b.mq4").exists(),
+            "installed target is gone"
+        );
+        assert!(
+            !paths.models.join("qwen36-27b-dflash-mq4.hfq").exists(),
+            "declared sidecar goes with its target"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_entry_for_path_matches_symlinked_artifact() {
+        // `qwen3.8-27b.mq4-xt` is a symlink out of the models dir: the input
+        // and the installed entry file canonicalize to the same target, so
+        // the entry (and its sidecar) still resolve. A same-basename file
+        // elsewhere canonicalizes elsewhere and gets no entry.
+        let paths = test_paths("registry-entry-symlink");
+        fs::create_dir_all(&paths.models).unwrap();
+        let elsewhere = paths.root.join("qcal");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let real = elsewhere.join("qwen3.8-27b-weights.mq4");
+        fs::write(&real, b"weights").unwrap();
+        std::os::unix::fs::symlink(&real, paths.models.join("qwen3.8-27b.mq4-xt")).unwrap();
+        let foreign_dir = paths.root.join("foreign");
+        fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join("qwen3.8-27b.mq4-xt");
+        fs::write(&foreign, b"lookalike").unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b-mq4-xt", "qwen3.8-27b.mq4-xt", None)]);
+        let installed = paths
+            .models
+            .join("qwen3.8-27b.mq4-xt")
+            .display()
+            .to_string();
+        let (tag, _) = registry_entry_for_path(&paths, &registry, &installed)
+            .expect("symlinked installed artifact must match by canonical target");
+        assert_eq!(tag, "qwen3.8:27b-mq4-xt");
+        assert!(
+            registry_entry_for_path(&paths, &registry, &foreign.display().to_string()).is_none(),
+            "same-basename foreign file gets no registry entry"
+        );
+        assert!(
+            registry_entry_for_path(&paths, &registry, "qwen3.8:27b-mq4-xt").is_some(),
+            "tag form still resolves"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn load_params_dflash_on_fails_closed_for_non_registry_artifact() {
+        // `on` + a path with no registry entry + no explicit draft fails
+        // closed with the not-managed message instead of silently running AR
+        // (Fable's earlier note on unregistered basenames). `auto` on the
+        // same file still runs AR as a bare artifact.
+        let paths = test_paths("dflash-on-foreign-path");
+        fs::create_dir_all(&paths.models).unwrap();
+        let foreign_dir = paths.root.join("elsewhere");
+        fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join("qwen3.6-27b.mq4");
+        fs::write(&foreign, b"lookalike").unwrap();
+        assert!(
+            registry_entry_for_path(
+                &paths,
+                &rm_test_registry(&[("qwen3.6:27b", "qwen3.6-27b.mq4", None)]),
+                &foreign.display().to_string()
+            )
+            .is_none(),
+            "precondition: foreign path has no entry"
+        );
+        let resolved = resolved_with_dflash_mode("on", None);
+        let error = load_params(
+            &resolved,
+            None,
+            &paths.models,
+            &foreign,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect_err("on without registry identity must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not a registry-managed artifact"),
+            "{message}"
+        );
+        assert!(message.contains("developer.dflash_draft"), "{message}");
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let params = load_params(
+            &resolved,
+            None,
+            &paths.models,
+            &foreign,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "auto");
+        assert!(
+            params.get("draft").is_none(),
+            "auto on a bare artifact runs AR"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn run_spec_dflash_projects_inherited_draft_after_config_off() {
+        // Reviewer case: resolved config leaves DFlash off, but an inherited
+        // developer.dflash_draft is present and `run --spec dflash` re-enables
+        // DFlash after load_params. Draft must land on the final load params.
+        let draft = "/tmp/qwen35-9b-dflash-mq4.hfq";
+
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.mode", "off").unwrap();
+        explicit.set_cli("developer.dflash_draft", draft).unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "speculation.mode=off".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+
+        // load_params alone must not carry the draft while config mode is off.
+        let mut params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "config-off load_params must not project developer.dflash_draft"
+        );
+
+        // Final run-path selector: CLI `--spec dflash` then project inherited draft.
+        apply_speculation_selector(&mut params, "dflash").unwrap();
+        project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
+        assert_eq!(params["dflash_mode"], "on");
+        assert_eq!(params["draft"], draft);
+
+        // Final off must clear any previously projected draft.
+        apply_speculation_selector(&mut params, "off").unwrap();
+        project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "final off must drop projected developer.dflash_draft"
+        );
+    }
+
+    #[test]
+    pub(crate) fn artifact_urls_honor_endpoint_precedence() {
+        struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => env::set_var(self.0, value),
+                    None => env::remove_var(self.0),
+                }
+            }
+        }
+
+        let _hf_base = EnvRestore("HIPFIRE_HF_BASE", env::var_os("HIPFIRE_HF_BASE"));
+        let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
+        let registry = hipfire_registry::bundled().unwrap();
+        let (_, entry) = registry.model("qwen3.6:35b-a3b-mq4r").unwrap();
+        let suffix = "hipfire-models/qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
+
+        env::remove_var("HIPFIRE_HF_BASE");
+        env::remove_var("HF_ENDPOINT");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://huggingface.co/{suffix}")
+        );
+
+        env::set_var("HF_ENDPOINT", "https://hf-mirror.example/");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://hf-mirror.example/{suffix}")
+        );
+
+        env::set_var("HIPFIRE_HF_BASE", "https://hipfire-mirror.example///");
+        assert_eq!(
+            artifact_url(entry, &entry.file),
+            format!("https://hipfire-mirror.example/{suffix}")
+        );
+    }
+
+    #[test]
+    fn native_help_exposes_migrated_command_families() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let names = command
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("config"));
+        assert!(names.contains("registry"));
+        assert!(names.contains("pull"));
+        assert!(names.contains("run"));
+        assert!(names.contains("chat"));
+        assert!(names.contains("serve"));
+        assert!(names.contains("stop"));
+        assert!(names.contains("restart"));
+        assert!(names.contains("bench"));
+        assert!(names.contains("profile"));
+        assert!(names.contains("version"));
+        assert!(names.contains("update"));
+        assert!(names.contains("quantize"));
+        assert!(names.contains("sidecar-gen"));
+    }
+
+    #[test]
+    fn build_version_includes_commit_and_ref_identity() {
+        use clap::error::ErrorKind;
+
+        let error = Cli::try_parse_from(["hipfire", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        let rendered = error.to_string();
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+        assert!(rendered.contains(BUILD_COMMIT.get(..12).unwrap_or(BUILD_COMMIT)));
+        assert!(rendered.contains(BUILD_REF));
+    }
+
+    #[test]
+    fn update_accepts_branch_tag_commit_and_at_shorthand() {
+        let cases = [
+            (
+                UpdateArgs {
+                    reference: Some("@beta".into()),
+                    ..UpdateArgs::default()
+                },
+                RevisionSelector {
+                    value: "beta".into(),
+                    kind: RevisionKind::Auto,
+                },
+            ),
+            (
+                UpdateArgs {
+                    reference: Some("@origin/beta".into()),
+                    ..UpdateArgs::default()
+                },
+                RevisionSelector {
+                    value: "beta".into(),
+                    kind: RevisionKind::Branch,
+                },
+            ),
+            (
+                UpdateArgs {
+                    tag: Some("v0.3.0".into()),
+                    ..UpdateArgs::default()
+                },
+                RevisionSelector {
+                    value: "v0.3.0".into(),
+                    kind: RevisionKind::Tag,
+                },
+            ),
+            (
+                UpdateArgs {
+                    commit: Some("0123456789abcdef".into()),
+                    ..UpdateArgs::default()
+                },
+                RevisionSelector {
+                    value: "0123456789abcdef".into(),
+                    kind: RevisionKind::Commit,
+                },
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(parse_revision_selector(&args).unwrap(), Some(expected));
+        }
+
+        let cli = Cli::try_parse_from(["hipfire", "update", "@beta"]).unwrap();
+        let Some(Commands::Update(args)) = cli.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(args.reference.as_deref(), Some("@beta"));
+    }
+
+    #[test]
+    fn update_rejects_unsafe_or_ambiguous_revisions() {
+        for value in ["../beta", "-beta", "beta^{tree}", "beta branch"] {
+            let args = UpdateArgs {
+                reference: Some(value.into()),
+                ..UpdateArgs::default()
+            };
+            assert!(parse_revision_selector(&args).is_err(), "{value}");
+        }
+        let short_commit = UpdateArgs {
+            commit: Some("123".into()),
+            ..UpdateArgs::default()
+        };
+        assert!(parse_revision_selector(&short_commit).is_err());
+        let ambiguous = UpdateArgs {
+            branch: Some("beta".into()),
+            tag: Some("v0.3.0".into()),
+            ..UpdateArgs::default()
+        };
+        assert!(parse_revision_selector(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn update_fetches_and_checks_out_branch_from_local_origin() {
+        fn git(repo: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {}", args.join(" "));
+        }
+
+        let root = env::temp_dir().join(format!(
+            "hipfire-update-ref-test-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let installed = root.join("installed");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "--bare", origin.to_str().unwrap()]);
+        fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init"]);
+        git(&seed, &["config", "user.name", "hipfire test"]);
+        git(
+            &seed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        fs::write(seed.join("channel"), "master\n").unwrap();
+        git(&seed, &["add", "channel"]);
+        git(&seed, &["commit", "-m", "master"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "master"]);
+        git(&seed, &["checkout", "-b", "beta"]);
+        fs::write(seed.join("channel"), "beta\n").unwrap();
+        git(&seed, &["commit", "-am", "beta"]);
+        git(&seed, &["push", "-u", "origin", "beta"]);
+        git(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "master",
+                origin.to_str().unwrap(),
+                installed.to_str().unwrap(),
+            ],
+        );
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Auto,
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.selector.kind, RevisionKind::Branch);
+        checkout_revision(&installed, &resolved).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("channel")).unwrap(),
+            "beta\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_refuses_branch_with_unpushed_commits() {
+        fn git(repo: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {}", args.join(" "));
+        }
+
+        let root = env::temp_dir().join(format!(
+            "hipfire-update-ahead-test-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let installed = root.join("installed");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "--bare", origin.to_str().unwrap()]);
+        fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init"]);
+        git(&seed, &["config", "user.name", "hipfire test"]);
+        git(
+            &seed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        fs::write(seed.join("channel"), "master\n").unwrap();
+        git(&seed, &["add", "channel"]);
+        git(&seed, &["commit", "-m", "master"]);
+        git(&seed, &["branch", "-M", "master"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "master"]);
+        git(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "master",
+                origin.to_str().unwrap(),
+                installed.to_str().unwrap(),
+            ],
+        );
+        git(&installed, &["config", "user.name", "hipfire test"]);
+        git(
+            &installed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        fs::write(installed.join("local_only.txt"), "keep-me\n").unwrap();
+        git(&installed, &["add", "local_only.txt"]);
+        git(&installed, &["commit", "-m", "local-only"]);
+        let local_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        let err = checkout_revision(&installed, &resolved)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ahead") && err.contains("master"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            local_head
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("local_only.txt")).unwrap(),
+            "keep-me\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn update_signal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn git_test(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {}", args.join(" "));
+    }
+
+    fn init_update_fixture(label: &str) -> (PathBuf, PathBuf) {
+        let root = env::temp_dir().join(format!(
+            "hipfire-update-{label}-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let installed = root.join("installed");
+        fs::create_dir_all(&root).unwrap();
+        git_test(&root, &["init", "--bare", origin.to_str().unwrap()]);
+        fs::create_dir_all(&seed).unwrap();
+        git_test(&seed, &["init"]);
+        git_test(&seed, &["config", "user.name", "hipfire test"]);
+        git_test(
+            &seed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        fs::write(seed.join("channel"), "master\n").unwrap();
+        git_test(&seed, &["add", "channel"]);
+        git_test(&seed, &["commit", "-m", "master"]);
+        git_test(&seed, &["branch", "-M", "master"]);
+        git_test(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_test(&seed, &["push", "-u", "origin", "master"]);
+        git_test(&seed, &["checkout", "-b", "beta"]);
+        fs::write(seed.join("channel"), "beta\n").unwrap();
+        git_test(&seed, &["commit", "-am", "beta"]);
+        git_test(&seed, &["push", "-u", "origin", "beta"]);
+        git_test(
+            &root,
+            &[
+                "clone",
+                "--branch",
+                "master",
+                origin.to_str().unwrap(),
+                installed.to_str().unwrap(),
+            ],
+        );
+        git_test(&installed, &["config", "user.name", "hipfire test"]);
+        git_test(
+            &installed,
+            &["config", "user.email", "hipfire-test@example.invalid"],
+        );
+        (root, installed)
+    }
+
+    #[test]
+    fn update_handoff_forwards_recorded_rocm_root_and_gpu_arch() {
+        let home = env::temp_dir().join(format!(
+            "hipfire-update-rocm-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("install.json"),
+            r#"{"commit":"abc","ref":"master","rocm_root":"/opt/rocm/core-7.14","gpu_arch":"gfx1201","profile":"auto","installed_at":1}"#,
+        )
+        .unwrap();
+        let recorded = recorded_install_metadata(&home);
+        assert_eq!(
+            recorded.rocm_root.as_deref(),
+            Some(Path::new("/opt/rocm/core-7.14"))
+        );
+        assert_eq!(recorded.gpu_arch.as_deref(), Some("gfx1201"));
+        let args = installer_handoff_args(
+            &RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--yes".to_owned(),
+                "--branch".to_owned(),
+                "beta".to_owned(),
+                "--rocm-root".to_owned(),
+                "/opt/rocm/core-7.14".to_owned(),
+                "--gpu-arch".to_owned(),
+                "gfx1201".to_owned(),
+            ]
+        );
+
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"  ","gpu_arch":"  "}"#,
+        )
+        .unwrap();
+        let empty = recorded_install_metadata(&home);
+        assert!(empty.rocm_root.is_none());
+        assert!(empty.gpu_arch.is_none());
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
+        let bare = installer_handoff_args(
+            &RevisionSelector {
+                value: "deadbeef".into(),
+                kind: RevisionKind::Commit,
+            },
+            None,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            bare,
+            vec![
+                "--yes".to_owned(),
+                "--commit".to_owned(),
+                "deadbeef".to_owned(),
+            ]
+        );
+
+        // Selector remains before optional install metadata; --yes stays first.
+        let arch_only = installer_handoff_args(
+            &RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Auto,
+            },
+            None,
+            Some("gfx1100"),
+            None,
+            false,
+        );
+        assert_eq!(
+            arch_only,
+            vec![
+                "--yes".to_owned(),
+                "--ref".to_owned(),
+                "master".to_owned(),
+                "--gpu-arch".to_owned(),
+                "gfx1100".to_owned(),
+            ]
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn update_handoff_forwards_hipcc_and_strict_with_backward_compat() {
+        let home = env::temp_dir().join(format!(
+            "hipfire-update-hipcc-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        // New format with hipcc and strict_rocm.
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","hipcc":"/usr/bin/hipcc","strict_rocm":true,"gpu_arch":"gfx1201"}"#,
+        )
+        .unwrap();
+        let recorded = recorded_install_metadata(&home);
+        assert_eq!(recorded.hipcc.as_deref(), Some(Path::new("/usr/bin/hipcc")));
+        assert!(recorded.strict_rocm);
+        assert_eq!(recorded.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        let args = installer_handoff_args(
+            &RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Auto,
+            },
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
+        );
+        assert!(args.contains(&"--hipcc".to_owned()));
+        assert!(args.contains(&"/usr/bin/hipcc".to_owned()));
+        assert!(args.contains(&"--strict-rocm".to_owned()));
+        assert!(args.contains(&"--rocm-root".to_owned()));
+        // Empty/whitespace hipcc is treated as None, like rocm_root.
+        fs::write(
+            home.join("install.json"),
+            r#"{"hipcc":"  ","strict_rocm":false}"#,
+        )
+        .unwrap();
+        let empty = recorded_install_metadata(&home);
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
+        let bare = installer_handoff_args(
+            &RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+            None,
+            None,
+            empty.hipcc.as_deref(),
+            empty.strict_rocm,
+        );
+        assert!(!bare.contains(&"--hipcc".to_owned()));
+        assert!(!bare.contains(&"--strict-rocm".to_owned()));
+        // Older file without hipcc key loads without error (backward compat).
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","gpu_arch":"gfx1100"}"#,
+        )
+        .unwrap();
+        let old = recorded_install_metadata(&home);
+        assert_eq!(old.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        assert!(old.hipcc.is_none());
+        assert!(!old.strict_rocm);
+        // Strict can be stored as string \"1\" or number 1 for compat.
+        fs::write(home.join("install.json"), r#"{"strict_rocm":"1"}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
+        fs::write(home.join("install.json"), r#"{"strict_rocm":1}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn update_restores_staged_unstaged_and_untracked_after_failed_handoff() {
+        let (root, installed) = init_update_fixture("index-restore");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+
+        // Tracked file with staged + unstaged split, plus untracked work.
+        fs::write(installed.join("channel"), "staged-base\n").unwrap();
+        git_test(&installed, &["add", "channel"]);
+        fs::write(installed.join("channel"), "staged-base\nunstaged-tail\n").unwrap();
+        fs::write(installed.join("scratch.txt"), "untracked-user\n").unwrap();
+
+        run_checked(
+            Command::new("git").current_dir(&installed).args([
+                "stash",
+                "push",
+                "--include-untracked",
+                "-m",
+                "hipfire-update-index-test",
+            ]),
+            "git stash",
+        )
+        .unwrap();
+        let stash_sha = git_output(&installed, &["rev-parse", "stash@{0}"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: Some(stash_sha),
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+
+        // Installer dirties the failed target with tracked + untracked junk.
+        fs::write(installed.join("channel"), "installer-mutated\n").unwrap();
+        fs::write(installed.join("installer-junk.txt"), "leftover\n").unwrap();
+
+        restore_update_checkpoint(&installed, &checkpoint).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("channel")).unwrap(),
+            "staged-base\nunstaged-tail\n"
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("scratch.txt")).unwrap(),
+            "untracked-user\n"
+        );
+        // Index holds the staged half; worktree holds the full dirty file.
+        let cached = git_output(&installed, &["show", ":channel"]).unwrap();
+        assert_eq!(cached, "staged-base");
+        assert!(!installed.join("installer-junk.txt").exists());
+        // Successful --index apply drops the update stash.
+        let stash_list = git_output(&installed, &["stash", "list"]).unwrap_or_default();
+        assert!(
+            stash_list.is_empty(),
+            "update stash should be dropped after successful apply: {stash_list}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_installer_mutations_cannot_block_checkout_restore() {
+        let (root, installed) = init_update_fixture("dirty-target");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: None,
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+
+        // Simulate cargo/installer tracked + untracked mutations on the target.
+        fs::write(installed.join("channel"), "lockfile-like-mutation\n").unwrap();
+        fs::write(installed.join("target-artifact.bin"), "blob\n").unwrap();
+
+        restore_update_checkpoint(&installed, &checkpoint).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("channel")).unwrap(),
+            "master\n"
+        );
+        assert!(!installed.join("target-artifact.bin").exists());
+        let porcelain = git_output(&installed, &["status", "--porcelain"]).unwrap_or_default();
+        assert!(
+            porcelain.is_empty(),
+            "restored tree should be clean: {porcelain}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_rollback_guard_stays_armed_until_commit() {
+        let (root, installed) = init_update_fixture("guard-arm");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: None,
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+
+        {
+            let mut guard = UpdateRollbackGuard::arm(installed.clone(), checkpoint.clone());
+            assert!(guard.is_armed());
+            // Drop without commit must restore master.
+        }
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+
+        // Success path: commit disarms so drop leaves the new revision alone.
+        checkout_revision(&installed, &resolved).unwrap();
+        {
+            let mut guard = UpdateRollbackGuard::arm(installed.clone(), checkpoint);
+            assert!(guard.is_armed());
+            guard.commit();
+            assert!(!guard.is_armed());
+        }
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_interrupted_child_is_reaped_while_checkpoint_stays_armed() {
+        let _lock = update_signal_test_lock();
+        UPDATE_INTERRUPT.store(false, Ordering::SeqCst);
+
+        let (root, installed) = init_update_fixture("interrupt-reap");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: None,
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+
+        let mut guard = UpdateRollbackGuard::arm(installed.clone(), checkpoint);
+        assert!(guard.is_armed());
+
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg("trap 'exit 0' TERM; while true; do sleep 0.05; done")
+            .current_dir(&installed);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let child_pid = child.id();
+
+        // Arm interrupt after spawn so the wait loop takes the TERM path.
+        UPDATE_INTERRUPT.store(true, Ordering::SeqCst);
+        let status = wait_update_installer_child(&mut child).unwrap();
+        assert!(
+            !status.success() || update_interrupted(),
+            "interrupted wait should surface cancel state"
+        );
+
+        // Child must be reaped (no zombie); try_wait Ok(Some) or Err after wait.
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("installer child {child_pid} was not reaped"),
+            Err(_) => {}
+        }
+
+        // Guard remains armed until explicit fail/drop performs rollback.
+        assert!(guard.is_armed());
+        let err = guard.fail(anyhow!("update interrupted"));
+        assert!(
+            err.to_string().contains("update interrupted"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+
+        UPDATE_INTERRUPT.store(false, Ordering::SeqCst);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_restores_checkout_and_stash_after_failed_handoff() {
+        let (root, installed) = init_update_fixture("restore-basic");
+        let previous_head = git_output(&installed, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(installed.join("dirty.txt"), "user-edit\n").unwrap();
+        run_checked(
+            Command::new("git").current_dir(&installed).args([
+                "stash",
+                "push",
+                "--include-untracked",
+                "-m",
+                "hipfire-update-test",
+            ]),
+            "git stash",
+        )
+        .unwrap();
+        let stash_sha = git_output(&installed, &["rev-parse", "stash@{0}"]).unwrap();
+        let checkpoint = UpdateCheckpoint {
+            head: previous_head.clone(),
+            branch: Some("master".into()),
+            stash_sha: Some(stash_sha),
+        };
+
+        let resolved = fetch_revision(
+            &installed,
+            RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+        )
+        .unwrap();
+        checkout_revision(&installed, &resolved).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "beta"
+        );
+
+        // Simulate installer handoff failure recovery.
+        restore_update_checkpoint(&installed, &checkpoint).unwrap();
+        assert_eq!(
+            git_output(&installed, &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "master"
+        );
+        assert_eq!(
+            git_output(&installed, &["rev-parse", "HEAD"]).unwrap(),
+            previous_head
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join("dirty.txt")).unwrap(),
+            "user-edit\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_options_after_prompt_and_tui_passthrough_parse() {
+        let cli =
+            Cli::try_parse_from(["hipfire", "run", "qwen:test", "hello", "--max-tokens", "7"])
+                .unwrap();
+        let Some(Commands::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.prompt, ["hello"]);
+        assert_eq!(args.max_tokens, Some(7));
+
+        let cli = Cli::try_parse_from(["hipfire", "tui", "--check"]).unwrap();
+        let Some(Commands::Tui(args)) = cli.command else {
+            panic!("expected tui command");
+        };
+        assert_eq!(args.arguments, ["--check"]);
+    }
+
+    #[test]
+    fn registry_system_prompt_is_injected_only_when_client_omits_one() {
+        let mut messages = normalize_openai_messages(
+            Some(&serde_json::json!([
+                { "role": "user", "content": "hello" }
+            ])),
+            false,
+        );
+        inject_default_system_message(&mut messages, Some("registry identity"));
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "registry identity");
+
+        let mut messages = normalize_openai_messages(
+            Some(&serde_json::json!([
+                { "role": "developer", "content": "client policy" },
+                { "role": "user", "content": "hello" }
+            ])),
+            false,
+        );
+        inject_default_system_message(&mut messages, Some("registry identity"));
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "client policy");
+    }
+
+    #[test]
+    fn normalize_reasoning_sources_with_flag_on_and_off() {
+        // reasoning field takes precedence over reasoning_content and inline think
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>inline</think>\nvisible",
+                "reasoning": "explicit reasoning",
+                "reasoning_content": "secondary"
+            }]
+        });
+        let off = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(off[0]["content"], "visible");
+        assert_eq!(off[0]["tool_plan"], "explicit reasoning");
+        assert!(off[0].get("reasoning_content").is_none());
+        let on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(on[0]["content"], "visible");
+        assert_eq!(on[0]["tool_plan"], "explicit reasoning");
+        assert_eq!(on[0]["reasoning_content"], "explicit reasoning");
+        assert_eq!(on[0]["reasoning_content"], on[0]["tool_plan"]);
+
+        // reasoning_content when reasoning absent
+        let body2 = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "visible only",
+                "reasoning_content": "from content field"
+            }]
+        });
+        let off2 = normalize_openai_messages(body2.get("messages"), false);
+        assert_eq!(off2[0]["tool_plan"], "from content field");
+        assert!(off2[0].get("reasoning_content").is_none());
+        let on2 = normalize_openai_messages(body2.get("messages"), true);
+        assert_eq!(on2[0]["reasoning_content"], "from content field");
+        assert_eq!(on2[0]["tool_plan"], "from content field");
+        assert_eq!(on2[0]["content"], "visible only");
+
+        // inline <think> when neither reasoning field present
+        let body3 = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>inline think</think>\n\nvisible answer"
+            }]
+        });
+        let off3 = normalize_openai_messages(body3.get("messages"), false);
+        assert_eq!(off3[0]["content"], "visible answer");
+        assert_eq!(off3[0]["tool_plan"], "inline think");
+        assert!(off3[0].get("reasoning_content").is_none());
+        let on3 = normalize_openai_messages(body3.get("messages"), true);
+        assert_eq!(on3[0]["content"], "visible answer");
+        assert_eq!(on3[0]["tool_plan"], "inline think");
+        assert_eq!(on3[0]["reasoning_content"], "inline think");
+        assert_eq!(on3[0]["reasoning_content"], on3[0]["tool_plan"]);
+    }
+
+    #[test]
+    fn include_reasoning_content_arch_predicate() {
+        assert!(include_reasoning_content(Some("muse_glimmer")));
+        assert!(include_reasoning_content(Some("qwen35")));
+        assert!(include_reasoning_content(Some("qwen35-vl")));
+        assert!(include_reasoning_content(Some("qwen36")));
+        assert!(include_reasoning_content(Some("Qwen3.6-A3B")));
+        assert!(include_reasoning_content(Some("qwen3.5")));
+        assert!(!include_reasoning_content(Some("llama")));
+        assert!(!include_reasoning_content(Some("gemma4")));
+        assert!(!include_reasoning_content(Some("qwen2")));
+        assert!(!include_reasoning_content(None));
+    }
+
+    #[test]
+    fn normalize_reasoning_emitted_for_qwen_include_flag() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "visible",
+                "reasoning_content": "qwen chain of thought"
+            }]
+        });
+        let include = include_reasoning_content(Some("qwen35"));
+        assert!(include);
+        let on = normalize_openai_messages(body.get("messages"), include);
+        assert_eq!(on[0]["reasoning_content"], "qwen chain of thought");
+        assert_eq!(on[0]["tool_plan"], "qwen chain of thought");
+        assert_eq!(on[0]["content"], "visible");
+
+        let off = normalize_openai_messages(
+            body.get("messages"),
+            include_reasoning_content(Some("llama")),
+        );
+        assert!(off[0].get("reasoning_content").is_none());
+        assert_eq!(off[0]["tool_plan"], "qwen chain of thought");
+    }
+
+    #[test]
+    fn normalize_tool_call_id_and_tool_result_name_survive() {
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "calling",
+                    "tool_calls": [{
+                        "id": "call_42",
+                        "type": "function",
+                        "function": { "name": "my_tool", "arguments": "{}" }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_42",
+                    "name": "my_tool",
+                    "content": "result"
+                }
+            ]
+        });
+        for flag in [false, true] {
+            let normalized = normalize_openai_messages(body.get("messages"), flag);
+            assert_eq!(normalized[0]["tool_calls"][0]["id"], "call_42");
+            assert_eq!(normalized[0]["tool_calls"][0]["name"], "my_tool");
+            assert_eq!(normalized[1]["tool_call_id"], "call_42");
+            assert_eq!(normalized[1]["name"], "my_tool");
+            assert_eq!(normalized[1]["content"], "result");
+        }
+    }
+
+    #[test]
+    fn normalize_glimmer_flag_rejects_non_object_arguments_string() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [{
+                    "function": { "name": "t", "arguments": "not-json" }
+                }]
+            }]
+        });
+        let off = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(
+            off[0]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "_raw": "not-json" })
+        );
+        let on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(
+            on[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("not-json".into())
+        );
+        // JSON string that parses to non-object (array) also surfaces as string under glimmer
+        let body_arr = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [{
+                    "function": { "name": "t", "arguments": "[1,2]" }
+                }]
+            }]
+        });
+        let on_arr = normalize_openai_messages(body_arr.get("messages"), true);
+        assert_eq!(
+            on_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("[1,2]".into())
+        );
+        let off_arr = normalize_openai_messages(body_arr.get("messages"), false);
+        // non-glimmer keeps parsed array (today's behaviour is to keep whatever parsed)
+        assert_eq!(
+            off_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::json!([1, 2])
+        );
+    }
+
+    #[test]
+    fn positional_model_config_scope_parses_without_stealing_global_actions() {
+        let global = Cli::try_parse_from(["hipfire", "config", "list", "--json"]).unwrap();
+        let Some(Commands::Config(global)) = global.command else {
+            panic!("expected config command")
+        };
+        assert!(global.model.is_none());
+        assert!(matches!(global.action, Some(ConfigAction::List(_))));
+
+        let model =
+            Cli::try_parse_from(["hipfire", "config", "qwen:test", "get", "memory.kv_cache"])
+                .unwrap();
+        let Some(Commands::Config(model)) = model.command else {
+            panic!("expected config command")
+        };
+        assert_eq!(model.model.as_deref(), Some("qwen:test"));
+        assert!(matches!(model.action, Some(ConfigAction::Get { .. })));
+
+        let schema = Cli::try_parse_from(["hipfire", "config", "schema", "--json"]).unwrap();
+        let Some(Commands::Config(schema)) = schema.command else {
+            panic!("expected config command")
+        };
+        assert!(schema.model.is_none());
+        assert!(matches!(
+            schema.action,
+            Some(ConfigAction::Schema(OutputArgs { json: true }))
+        ));
+    }
+
+    #[test]
+    fn config_profile_set_and_create_parse_as_dedicated_actions() {
+        let set = Cli::try_parse_from(["hipfire", "config", "profile", "set", "dev"]).unwrap();
+        let Some(Commands::Config(args)) = set.command else {
+            panic!("expected config command")
+        };
+        assert!(args.model.is_none());
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Set { ref name })
+            }) if name == "dev"
+        ));
+
+        let create =
+            Cli::try_parse_from(["hipfire", "config", "profile", "create", "lab"]).unwrap();
+        let Some(Commands::Config(args)) = create.command else {
+            panic!("expected config command")
+        };
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Create { ref name })
+            }) if name == "lab"
+        ));
+
+        let bare = Cli::try_parse_from(["hipfire", "config", "profile"]).unwrap();
+        let Some(Commands::Config(args)) = bare.command else {
+            panic!("expected config command")
+        };
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile { action: None })
+        ));
+    }
+
+    #[test]
+    fn config_profile_helpers_replace_layer_and_are_global_only() {
+        assert_eq!(CONFIG_PROFILE_NAMES, &["default", "dev", "hip", "redline"]);
+        let root = env::temp_dir().join(format!("hipfire-cli-profile-{}", std::process::id()));
+        let config_paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer
+            .set(
+                "generation.temperature",
+                hipfire_config::ConfigValue::Float(0.5),
+            )
+            .unwrap();
+        apply_config_profile(&mut layer, &config_paths, "redline").unwrap();
+        assert!(layer.get("generation.temperature").is_none());
+        assert_eq!(
+            layer.get("replay.backend"),
+            Some(&hipfire_config::ConfigValue::String("redline".into()))
+        );
+
+        let model = Cli::try_parse_from([
+            "hipfire",
+            "config",
+            "qwen:test",
+            "profile",
+            "set",
+            "default",
+        ])
+        .unwrap();
+        let Some(Commands::Config(args)) = model.command else {
+            panic!("expected config command")
+        };
+        assert_eq!(args.model.as_deref(), Some("qwen:test"));
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Profile {
+                action: Some(ConfigProfileAction::Set { .. })
+            })
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_json_preserves_default_types_and_validation_rules() {
+        let bool_field = field("hardware.allow_mixed_arch").unwrap();
+        assert_eq!(
+            config_default_value(bool_field),
+            hipfire_config::ConfigValue::Bool(false)
+        );
+        assert_eq!(config_rule_json(bool_field.rule)["type"], "boolean");
+
+        let variant_field = field("diagnostic.kernel.rdna2_variant").unwrap();
+        assert_eq!(
+            config_default_value(variant_field),
+            hipfire_config::ConfigValue::Null
+        );
+        assert_eq!(config_rule_json(variant_field.rule)["minimum"], 1);
+        assert_eq!(config_rule_json(variant_field.rule)["maximum"], 5);
+    }
+
+    fn sample_completion(
+        content: &str,
+        tool_calls: Vec<ToolCall>,
+        finish_reason: &str,
+    ) -> Completion {
+        Completion {
+            id: "chatcmpl_test".into(),
+            created: 42,
+            model: "qwen:test".into(),
+            content: content.into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls,
+            done: serde_json::json!({
+                "finish_reason": finish_reason,
+                "prompt_tokens": 3,
+                "tokens": 5,
+                "cached_tokens": 1,
+                "tok_s": 10.0,
+            }),
+            logprobs: None,
+            reasoning: None,
+        }
+    }
+
+    fn sample_tc(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: None,
+            name: name.into(),
+            arguments,
+            rendered_body: None,
+        }
+    }
+
+    /// Build a Completion whose done envelope has a non-string/missing finish_reason.
+    fn sample_completion_with_done(
+        content: &str,
+        tool_calls: Vec<ToolCall>,
+        done: serde_json::Value,
+    ) -> Completion {
+        Completion {
+            id: "chatcmpl_test".into(),
+            created: 42,
+            model: "qwen:test".into(),
+            content: content.into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls,
+            done,
+            logprobs: None,
+            reasoning: None,
+        }
+    }
+
+    fn sample_tool_call(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "arguments": { "path": "README.md" }
+        })
+    }
+
+    fn task15_daemon_err(class: &str, retryable: bool, attempt_id: u64) -> anyhow::Error {
+        anyhow::Error::new(hipfire_client::ClientError::Daemon(
+            hipfire_client::TypedDaemonError {
+                message: format!("t15 {class}"),
+                class: class.to_owned(),
+                retryable,
+                rolled_back: false,
+                attempt_id,
+                id: Some("req-t15".into()),
+            },
+        ))
+    }
+
+    #[test]
+    fn task15_serve_retry_config_defaults_off() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).expect("resolve empty layers");
+        let enabled = config_bool(&resolved, "serve.retry_enabled").expect("retry_enabled");
+        let backoff = config_u64(&resolved, "serve.retry_backoff_ms").expect("retry_backoff_ms");
+        assert!(!enabled, "serve.retry_enabled must default false");
+        assert_eq!(backoff, 50);
+    }
+
+    // --- StreamContractGate / complete_request framing (fix round 2) ---
+
+    // ── Task 6: canonical OpenAI tool-call adapter + endpoint registry ──
+
+    #[test]
+    fn forward_think_fragments_preserves_cancelled_callback_error() {
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let err = forward_think_fragments(
+            vec![ThinkFragment::Content("x".into())],
+            &mut content,
+            &mut reasoning,
+            &mut |_| Err(hipfire_client::ClientError::Cancelled),
+        )
+        .expect_err("callback Cancelled must surface typed");
+        assert!(matches!(err, hipfire_client::ClientError::Cancelled));
+        // Fragment still applied before callback failure (accumulation is local).
+        assert_eq!(content, "x");
+    }
+
+    // =========================================================================
+    // Task 11 — no-GPU fake-daemon HTTP acceptance through real serve lowering
+    // =========================================================================
+
+    /// Unix-only JSONL fake daemon used by the Task 11 HTTP matrix.
+    /// Scenario selection is driven by generate request prompt/model fixture tags.
+    #[cfg(unix)]
+    fn write_task11_fake_daemon(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let daemon = root.join("task11-fake-daemon.py");
+        // Python keeps correlated id/attempt_id, full reset ack, and commit handshake.
+        let script = include_str!("serve/fake_daemon.py");
+        fs::write(&daemon, script).unwrap();
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        daemon
+    }
+
+    /// In-process Hyper harness: Engine::spawn_configured → serve_listener_until.
+    /// Does not touch HIPFIRE_DAEMON_BIN.
+    #[cfg(unix)]
+    struct Task11HttpHarness {
+        paths: Paths,
+        port: u16,
+        model_name: String,
+        shared: Arc<ServeShared>,
+        shutdown: tokio_util::sync::CancellationToken,
+        _join: Option<thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl Task11HttpHarness {
+        fn spawn(label: &str) -> Self {
+            Self::spawn_inner(label, false, Duration::from_millis(0))
+        }
+
+        /// Retry-enabled variant for the Task 15 one-retry scenarios.
+        fn spawn_with_retry(label: &str, retry_backoff: Duration) -> Self {
+            Self::spawn_inner(label, true, retry_backoff)
+        }
+
+        fn spawn_inner(label: &str, retry_enabled: bool, retry_backoff: Duration) -> Self {
+            let paths = test_paths(label);
+            fs::create_dir_all(&paths.models).unwrap();
+            fs::create_dir_all(&paths.root).unwrap();
+
+            let model_name = format!("t11-fixture-{label}.hfq");
+            let model_path = paths.models.join(&model_name);
+            fs::write(&model_path, b"task11-dummy-model").unwrap();
+
+            let daemon = write_task11_fake_daemon(&paths.root);
+            let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+            let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+
+            // Bounded ETXTBSY retry like hipfire-client fake daemons.
+            const ETXTBSY: i32 = 26;
+            let mut engine = None;
+            let mut last = None;
+            for attempt in 0..8 {
+                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config) {
+                    Ok(e) => {
+                        engine = Some(e);
+                        break;
+                    }
+                    Err(hipfire_client::ClientError::Spawn { source, path })
+                        if source.raw_os_error() == Some(ETXTBSY) =>
+                    {
+                        last = Some(format!("spawn {path:?}: {source}"));
+                        thread::sleep(Duration::from_millis(
+                            5u64.saturating_mul(1 + attempt as u64),
+                        ));
+                    }
+                    Err(err) => panic!("Task11HttpHarness spawn non-retryable: {err}"),
+                }
+            }
+            let mut engine = engine.unwrap_or_else(|| {
+                panic!(
+                    "Task11HttpHarness exhausted ETXTBSY retries: {}",
+                    last.unwrap_or_default()
+                )
+            });
+            engine.ping().expect("fake daemon ping");
+
+            let registry = hipfire_registry::bundled().unwrap();
+            let shared = Arc::new(ServeShared {
+                capabilities: crate::serve::route_capabilities(
+                    false,
+                    4,
+                    8192,
+                    1024,
+                    false,
+                    0,
+                    false,
+                    4096,
+                    1,
+                    64,
+                    268435456,
+                    30000,
+                    None,
+                    64 << 20,
+                ),
+                metrics: crate::serve::metrics::Metrics::default(),
+                runtime: Mutex::new(ServeRuntime {
+                    engine,
+                    paths: paths.clone(),
+                    registry,
+                    current_path: None,
+                    current_arch: None,
+                    current_reasoning_contract: ReasoningContract::Unsupported,
+                    current_reasoning_effort_native: false,
+                    current_reasoning_efforts: Vec::new(),
+                    continuous_batch_capable: false,
+                    current_max_seq: 0,
+                    cache_capable: false,
+                    kv_override: None,
+                    kv_k_override: None,
+                    kv_v_override: None,
+                    kv_backend_override: None,
+                    vision_override: None,
+                    tp: None,
+                    continuous_batch_size: 1,
+                    multi_slot_enabled: false,
+                    multi_slot_slots: 4,
+                    multi_slot_ctx: 8192,
+                    multi_slot_prefill_chunk: 1024,
+                    spawner: crate::serve::EngineSpawner {
+                        daemon: daemon.clone(),
+                        process_config: process_config.clone(),
+                        attempts: 3,
+                        backoff: Duration::from_millis(10),
+                    },
+                    resident_model: None,
+                    request_policy: crate::serve::RequestModelPolicy {
+                        allow_pull: false,
+                        allow_paths: false,
+                        operator_model: None,
+                    },
+                    max_batch_tokens: 4096,
+                }),
+                meta: Mutex::new(ServeMeta::new(serve_instance_token())),
+                max_request_bytes: 8 * 1024 * 1024,
+                admission: Arc::new(Admission::new(4, Duration::from_secs(5))),
+                idle_timeout: Duration::from_secs(0),
+                retry_enabled,
+                retry_backoff,
+                backoff_hook: Mutex::new(None),
+                stream_stall_timeout: None,
+            });
+
+            let std_listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral serve port");
+            std_listener
+                .set_nonblocking(true)
+                .expect("set nonblocking listener");
+            let port = std_listener
+                .local_addr()
+                .expect("listener local addr")
+                .port();
+
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let shutdown_loop = shutdown.clone();
+            let shared_loop = Arc::clone(&shared);
+            let join = thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("task11 runtime");
+                rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(std_listener)
+                        .expect("tokio listener from std");
+                    if let Err(error) = crate::serve::http::serve_listener_until(
+                        listener,
+                        shared_loop,
+                        shutdown_loop,
+                    )
+                    .await
+                    {
+                        eprintln!("[task11-harness] serve failed: {error:#}");
+                    }
+                });
+            });
+
+            // Health probe — proves production Hyper service path is live.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(200)) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(500)),
+                "task11 harness never became ready on port {port}"
+            );
+
+            Self {
+                paths,
+                port,
+                // Bare file name, resolved under `paths.models` like an
+                // installed model; request-named paths are refused by default.
+                model_name,
+                shared,
+                shutdown,
+                _join: Some(join),
+            }
+        }
+
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        fn model(&self) -> &str {
+            &self.model_name
+        }
+
+        fn base_body(&self, scenario_tag: &str, stream: bool) -> serde_json::Value {
+            // Encode scenario in both model (direct path still resolves file) and
+            // user prompt so the fake daemon can select without external deps.
+            serde_json::json!({
+                "model": self.model(),
+                "stream": stream,
+                "messages": [{
+                    "role": "user",
+                    "content": format!("{scenario_tag} please")
+                }],
+            })
+        }
+
+        fn tools_body(&self, scenario_tag: &str, stream: bool) -> serde_json::Value {
+            let mut body = self.base_body(scenario_tag, stream);
+            body["tools"] = serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } }
+                    }
+                }
+            }]);
+            body
+        }
+
+        fn requests_log_path(&self) -> PathBuf {
+            self.paths.root.join("requests.log")
+        }
+
+        fn read_requests_log(&self) -> Vec<serde_json::Value> {
+            let raw = fs::read_to_string(self.requests_log_path()).unwrap_or_default();
+            raw.lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        }
+
+        fn meta_retries(&self) -> (u64, u64) {
+            let meta = self
+                .shared
+                .meta
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (meta.retries_attempted, meta.retries_succeeded)
+        }
+
+        fn set_backoff_hook<F>(&self, hook: F)
+        where
+            F: Fn(Duration) + Send + Sync + 'static,
+        {
+            let mut slot = self
+                .shared
+                .backoff_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *slot = Some(Arc::new(hook));
+        }
+
+        fn ops_of_type<'a>(log: &'a [serde_json::Value], ty: &str) -> Vec<&'a serde_json::Value> {
+            log.iter()
+                .filter(|row| row.get("type").and_then(|v| v.as_str()) == Some(ty))
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Task11HttpHarness {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+            if let Some(join) = self._join.take() {
+                let _ = join.join();
+            }
+            // Dropping Engine (inside ServeShared via Arc) kills the fake child.
+            // ServeShared is held only by the server thread which has exited.
+            let _ = fs::remove_dir_all(&self.paths.root);
+        }
+    }
+
+    // ── 0.4.0 serve lifecycle: max_tokens fit, respawn, request policy ──
+
+    #[cfg(unix)]
+    fn serve_health(port: u16) -> (u16, serde_json::Value) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut response = agent
+            .get(&format!("http://127.0.0.1:{port}/health"))
+            .call()
+            .expect("GET /health");
+        let status = response.status().as_u16();
+        let text = response.body_mut().read_to_string().expect("/health body");
+        let body = serde_json::from_str(&text).expect("/health JSON");
+        (status, body)
+    }
+
+    #[cfg(unix)]
+    fn post_status(port: u16, body: &serde_json::Value) -> (u16, serde_json::Value, String) {
+        let (status, bytes) = raw_nonstream_post(port, body);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let json = text
+            .find('{')
+            .and_then(|start| serde_json::from_str(&text[start..]).ok())
+            .unwrap_or(serde_json::Value::Null);
+        (status, json, text)
+    }
+
+    /// An omitted max_tokens (config default 4096 against the fake's 4096
+    /// context) used to reload the model on every request, because the reload
+    /// cannot grow max_seq. Now it is fitted by the daemon, and an explicit
+    /// budget that cannot fit is a 400 with no reload.
+    #[cfg(unix)]
+    #[test]
+    fn serve_omitted_max_tokens_fits_without_reload() {
+        let h = Task11HttpHarness::spawn("fit-max-tokens");
+        let body = h.base_body("t11-stop-text", false);
+        for _ in 0..2 {
+            let (status, _, text) = post_status(h.port(), &body);
+            assert_eq!(status, 200, "{text}");
+        }
+        let mut explicit = body.clone();
+        explicit["max_tokens"] = serde_json::json!(8000);
+        let (status, _, text) = post_status(h.port(), &explicit);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("max_tokens=8000"), "{text}");
+        let mut fits = body.clone();
+        fits["max_tokens"] = serde_json::json!(100);
+        let (status, _, text) = post_status(h.port(), &fits);
+        assert_eq!(status, 200, "{text}");
+
+        let log = h.read_requests_log();
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "load").len(), 1);
+        let generates = Task11HttpHarness::ops_of_type(&log, "generate");
+        assert_eq!(generates.len(), 3);
+        assert!(generates[..2]
+            .iter()
+            .all(|g| g["max_tokens_fit"] == serde_json::json!(true)));
+        assert_eq!(generates[2]["max_tokens"], serde_json::json!(100));
+        assert!(generates[2].get("max_tokens_fit").is_none());
+    }
+
+    /// A request may not load a file outside the installed models, nor start
+    /// a registry download; an installed model still loads.
+    #[cfg(unix)]
+    #[test]
+    fn serve_refuses_request_file_paths_and_downloads() {
+        let h = Task11HttpHarness::spawn("request-policy");
+        let mut body = h.base_body("t11-stop-text", false);
+        body["model"] = serde_json::json!("/etc/hostname");
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 404, "{text}");
+        assert!(text.contains("serve.allow_request_paths"), "{text}");
+        body["model"] = serde_json::json!("qwen3.5:0.8b");
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 404, "{text}");
+        assert!(text.contains("hipfire pull qwen3.5:0.8b"), "{text}");
+        assert!(Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").is_empty());
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+    }
+
+    /// After a failed switch the daemon holds nothing (tp<=1 unloads first):
+    /// `/health` must stop naming the old model and the next request for it
+    /// must reload instead of generating against an empty daemon.
+    #[cfg(unix)]
+    #[test]
+    fn serve_failed_model_switch_clears_residency() {
+        let h = Task11HttpHarness::spawn("switch-fail");
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+        let health = serve_health(h.port()).1;
+        assert_eq!(health["model"], serde_json::json!(h.model()));
+        assert_eq!(health["n_ctx"], serde_json::json!(4096), "the load ack's max_seq");
+
+        fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        let mut bad = h.base_body("t11-stop-text", false);
+        bad["model"] = serde_json::json!("t20-load-fail.hfq");
+        let (status, _, text) = post_status(h.port(), &bad);
+        assert_ne!(status, 200, "{text}");
+        let health = serve_health(h.port()).1;
+        assert!(health["model"].is_null());
+        assert!(health["n_ctx"].is_null(), "no context is advertised with nothing resident");
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+        let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
+        assert_eq!(loads, 3, "initial load, failed switch, reload of the old model");
+    }
+
+    /// A daemon that exits (crash, or a sticky GPU fault after which it exits
+    /// 75) is respawned and the next request is served.
+    #[cfg(unix)]
+    #[test]
+    fn serve_respawns_a_daemon_that_exited() {
+        let h = Task11HttpHarness::spawn("respawn");
+        let ok = h.base_body("t11-stop-text", false);
+        assert_eq!(post_status(h.port(), &ok).0, 200);
+        for fault in ["t11-premature-eof", "t20-gpu-poison"] {
+            let (status, _, text) = post_status(h.port(), &h.base_body(fault, false));
+            assert_ne!(status, 200, "{fault}: {text}");
+            let (status, _, text) = post_status(h.port(), &ok);
+            assert_eq!(status, 200, "after {fault}: {text}");
+        }
+        let log = h.read_requests_log();
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "configure").len(), 3);
+        assert_eq!(Task11HttpHarness::ops_of_type(&log, "load").len(), 3);
+        assert_eq!(serve_health(h.port()).0, 200);
+    }
+
+    /// `/health` is 503 while the daemon is dead and cannot be respawned, and
+    /// the supervisor brings it back with the resident model reloaded.
+    #[cfg(unix)]
+    #[test]
+    fn serve_health_is_unhealthy_until_the_daemon_is_back() {
+        let h = Task11HttpHarness::spawn("respawn-health");
+        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        let daemon = {
+            let mut runtime = h.shared.runtime.lock().unwrap();
+            std::mem::replace(
+                &mut runtime.spawner.daemon,
+                h.paths.root.join("missing-daemon"),
+            )
+        };
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-premature-eof", false));
+        assert_ne!(status, 200, "{text}");
+
+        assert!(crate::serve::supervise_engine(&h.shared).is_err());
+        let (status, health) = serve_health(h.port());
+        assert_eq!(status, 503);
+        assert_eq!(health["status"], "unhealthy");
+
+        h.shared.runtime.lock().unwrap().spawner.daemon = daemon;
+        crate::serve::supervise_engine(&h.shared).unwrap();
+        let (status, health) = serve_health(h.port());
+        assert_eq!(status, 200);
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["model"], serde_json::json!(h.model()));
+        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        // The supervisor reloaded the model; the request did not load again.
+        let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
+        assert_eq!(loads, 2);
+    }
+
+    /// A failed pre-warm leaves single-slot serve up to load on the next
+    /// request, but fails multi-slot serve closed: `/health` goes 503
+    /// `unhealthy` (never 200 `ok` with every request failing), the daemon is
+    /// stopped, and the load error comes back for serve to exit on.
+    #[cfg(unix)]
+    #[test]
+    fn serve_prewarm_failure_fails_closed_only_on_multi_slot() {
+        let single = Task11HttpHarness::spawn("prewarm-fail-single");
+        fs::write(single.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        {
+            let mut runtime = single.shared.runtime.lock().unwrap();
+            crate::serve::prewarm(&mut runtime, &single.shared.meta, "t20-load-fail.hfq").unwrap();
+        }
+        let (status, health) = serve_health(single.port());
+        assert_eq!(status, 200);
+        assert_eq!(health["status"], "ok");
+        assert!(health["model"].is_null());
+        let ok = single.base_body("t11-stop-text", false);
+        assert_eq!(post_status(single.port(), &ok).0, 200);
+
+        let multi = Task11HttpHarness::spawn("prewarm-fail-multi");
+        fs::write(multi.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+        let mut runtime = multi.shared.runtime.lock().unwrap();
+        runtime.multi_slot_enabled = true;
+        let error = crate::serve::prewarm(&mut runtime, &multi.shared.meta, "t20-load-fail.hfq")
+            .unwrap_err();
+        assert!(runtime.engine.exited(), "the daemon is stopped");
+        drop(runtime);
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("multi-slot pre-warm of t20-load-fail.hfq failed")
+                && message.contains("load failed: fixture"),
+            "{message}"
+        );
+        let (status, health) = serve_health(multi.port());
+        assert_eq!(status, 503);
+        assert_eq!(health["status"], "unhealthy");
+        assert!(health["model"].is_null());
+        assert!(health["loading_model"].is_null());
+    }
+
+    /// The reload after a daemon respawn follows the same rule: single-slot
+    /// serve comes back up without the model, multi-slot serve fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn serve_reload_failure_after_respawn_fails_closed_only_on_multi_slot() {
+        for multi_slot in [false, true] {
+            let h = Task11HttpHarness::spawn(&format!("reload-fail-{multi_slot}"));
+            fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
+            {
+                let mut runtime = h.shared.runtime.lock().unwrap();
+                runtime.multi_slot_enabled = multi_slot;
+                runtime.resident_model = Some("t20-load-fail.hfq".to_owned());
+                runtime.engine.terminate();
+            }
+            let supervised = crate::serve::supervise_engine(&h.shared);
+            let (status, health) = serve_health(h.port());
+            assert!(health["model"].is_null());
+            if multi_slot {
+                let message = format!("{:#}", supervised.unwrap_err());
+                assert!(
+                    message.contains(
+                        "multi-slot reload of t20-load-fail.hfq after the daemon restart failed"
+                    ),
+                    "{message}"
+                );
+                assert_eq!(status, 503);
+                assert_eq!(health["status"], "unhealthy");
+            } else {
+                supervised.unwrap();
+                assert_eq!(status, 200);
+                assert_eq!(health["status"], "ok");
+            }
+        }
+    }
+
+    /// DeepSeek V4 (legacy contract) stages tool calls only on the terminal;
+    /// they must reach the client (#593).
+    #[cfg(unix)]
+    #[test]
+    fn serve_legacy_staged_tool_calls_reach_the_client() {
+        let h = Task11HttpHarness::spawn("legacy-tools");
+        let (status, json, text) =
+            post_status(h.port(), &h.tools_body("t20-legacy-staged-tool", false));
+        assert_eq!(status, 200, "{text}");
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
+        assert_eq!(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "read_file",
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, Default)]
+    struct StreamCapture {
+        content: String,
+        reasoning: String,
+        /// Individual content deltas (for per-chunk leak assertions).
+        content_deltas: Vec<String>,
+        /// Individual reasoning deltas (for per-chunk leak assertions).
+        reasoning_deltas: Vec<String>,
+        tool_calls: Vec<(u32, Option<String>, Option<String>, Option<String>)>,
+        finish: Option<String>,
+        usage: Option<serde_json::Value>,
+        saw_done: bool,
+        saw_role: bool,
+    }
+
+    /// Tool-call protocol markers that must never appear in valid-path content/reasoning.
+    #[cfg(unix)]
+    const TASK11_TOOL_PROTOCOL_MARKERS: &[&str] = &[
+        "<tool_call>",
+        "</tool_call>",
+        "<tool_calls>",
+        "</tool_calls>",
+        "<|tool_call|>",
+        "<|tool_call_begin|>",
+        "<|tool_call_end|>",
+        "<|tool_calls_section_begin|>",
+        "<|tool_calls_section_end|>",
+        "call tool",
+        "invoke tool",
+    ];
+
+    /// Assert visible text from a *valid structured-call* path has zero protocol
+    /// markers and zero JSON argument fragments belonging to structured calls.
+    #[cfg(unix)]
+    fn assert_valid_path_text_clean(label: &str, text: &str, forbidden_arg_frags: &[&str]) {
+        for marker in TASK11_TOOL_PROTOCOL_MARKERS {
+            assert!(
+                !text.contains(marker),
+                "{label}: content/reasoning leaked tool protocol marker {marker:?} in {text:?}"
+            );
+        }
+        for frag in forbidden_arg_frags {
+            if frag.is_empty() {
+                continue;
+            }
+            assert!(
+                !text.contains(frag),
+                "{label}: content/reasoning leaked structured-call argument fragment {frag:?} in {text:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_nonstream_valid_structured_clean(
+        label: &str,
+        json: &serde_json::Value,
+        forbidden_arg_frags: &[&str],
+    ) {
+        let message = &json["choices"][0]["message"];
+        match message.get("content") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(content)) => {
+                assert_valid_path_text_clean(
+                    &format!("{label}/nonstream.content"),
+                    content,
+                    forbidden_arg_frags,
+                );
+            }
+            Some(other) => panic!("{label}: unexpected content shape {other}"),
+        }
+        if let Some(reasoning) = message
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+        {
+            assert_valid_path_text_clean(
+                &format!("{label}/nonstream.reasoning"),
+                reasoning,
+                forbidden_arg_frags,
+            );
+        }
+        // Calls/arguments may appear only under message.tool_calls.
+        if let Some(calls) = message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            assert!(
+                !calls.is_empty(),
+                "{label}: empty tool_calls array is not a structured release"
+            );
+            for call in calls {
+                assert!(
+                    call.get("function").and_then(|f| f.get("name")).is_some(),
+                    "{label}: structured tool_calls entry missing function.name"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_stream_valid_structured_clean(
+        label: &str,
+        cap: &StreamCapture,
+        forbidden_arg_frags: &[&str],
+    ) {
+        assert_valid_path_text_clean(
+            &format!("{label}/stream.content"),
+            &cap.content,
+            forbidden_arg_frags,
+        );
+        assert_valid_path_text_clean(
+            &format!("{label}/stream.reasoning"),
+            &cap.reasoning,
+            forbidden_arg_frags,
+        );
+        for (i, delta) in cap.content_deltas.iter().enumerate() {
+            assert_valid_path_text_clean(
+                &format!("{label}/stream.content_delta[{i}]"),
+                delta,
+                forbidden_arg_frags,
+            );
+        }
+        for (i, delta) in cap.reasoning_deltas.iter().enumerate() {
+            assert_valid_path_text_clean(
+                &format!("{label}/stream.reasoning_delta[{i}]"),
+                delta,
+                forbidden_arg_frags,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn capture_stream(
+        port: u16,
+        body: serde_json::Value,
+    ) -> std::result::Result<StreamCapture, hipfire_client::ClientError> {
+        let mut cap = StreamCapture::default();
+        stream_openai_chat(
+            "127.0.0.1",
+            port,
+            body,
+            Duration::from_secs(10),
+            |event| {
+                match event {
+                    OpenAiSseEvent::Role { .. } => cap.saw_role = true,
+                    OpenAiSseEvent::Content { text } => {
+                        cap.content_deltas.push(text.clone());
+                        cap.content.push_str(&text);
+                    }
+                    OpenAiSseEvent::Reasoning { text } => {
+                        cap.reasoning_deltas.push(text.clone());
+                        cap.reasoning.push_str(&text);
+                    }
+                    OpenAiSseEvent::ToolCall {
+                        index,
+                        id,
+                        name,
+                        arguments,
+                    } => cap.tool_calls.push((index, id, name, arguments)),
+                    OpenAiSseEvent::Finish { reason, .. } => cap.finish = Some(reason),
+                    OpenAiSseEvent::Usage { usage } => cap.usage = Some(usage),
+                    OpenAiSseEvent::Done => cap.saw_done = true,
+                }
+                Ok(())
+            },
+            || false,
+        )?;
+        Ok(cap)
+    }
+
+    #[cfg(unix)]
+    fn complete_nonstream(
+        port: u16,
+        body: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, hipfire_client::ClientError> {
+        complete_openai_chat("127.0.0.1", port, body, Duration::from_secs(10))
+    }
+
+    /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
+    #[cfg(unix)]
+    fn raw_nonstream_post(port: u16, body: &serde_json::Value) -> (u16, Vec<u8>) {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        let status = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body_start = text
+            .find("\r\n\r\n")
+            .map(|idx| idx + 4)
+            .or_else(|| text.find("\n\n").map(|idx| idx + 2))
+            .unwrap_or(buf.len());
+        let raw_body = buf.get(body_start..).unwrap_or(&[]);
+        let chunked = text[..body_start]
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked");
+        if !chunked {
+            return (status, raw_body.to_vec());
+        }
+        let mut decoded = Vec::new();
+        let mut remaining = raw_body;
+        loop {
+            let Some(line_end) = remaining.windows(2).position(|bytes| bytes == b"\r\n") else {
+                panic!("malformed chunk header");
+            };
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&remaining[..line_end])
+                    .expect("chunk size utf8")
+                    .split(';')
+                    .next()
+                    .expect("chunk size"),
+                16,
+            )
+            .expect("chunk size hex");
+            remaining = &remaining[line_end + 2..];
+            if size == 0 {
+                break;
+            }
+            assert!(remaining.len() >= size + 2, "truncated chunk body");
+            decoded.extend_from_slice(&remaining[..size]);
+            assert_eq!(&remaining[size..size + 2], b"\r\n");
+            remaining = &remaining[size + 2..];
+        }
+        (status, decoded)
+    }
+
+    /// Write a non-stream request and return the live TCP stream without reading status.
+    #[cfg(unix)]
+    fn open_nonstream_request(port: u16, body: &serde_json::Value) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        // Short read timeout so accidental reads fail fast; tests close without status.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.flush();
+        stream
+    }
+
+    #[cfg(unix)]
+    fn wait_fixture_ready(harness: &Task11HttpHarness, deadline: Instant) -> serde_json::Value {
+        let ready_path = harness.paths.root.join("fixture-ready.log");
+        while Instant::now() < deadline {
+            if let Ok(raw) = fs::read_to_string(&ready_path) {
+                for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                        if val.get("type").and_then(|v| v.as_str()) == Some("fixture_ready") {
+                            return val;
+                        }
+                    }
+                }
+            }
+            // Fallback: requests.log also records fixture_ready.
+            if let Some(row) = harness
+                .read_requests_log()
+                .into_iter()
+                .find(|row| row.get("type").and_then(|v| v.as_str()) == Some("fixture_ready"))
+            {
+                return row;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "fixture-ready never appeared; log={:?}",
+            harness.read_requests_log()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_declared_body_is_rejected_before_body_read() {
+        let harness = Task11HttpHarness::spawn("oversized-content-length");
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", harness.port())).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .write_all(
+                b"POST /v1/chat/completions HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 8388609\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "oversized declaration was not rejected immediately: {response:?}"
+        );
+    }
+
+    /// Silent non-stream client disconnect aborts the correlated daemon txn,
+    /// drains done/aborted before Admission releases, then admits a follow-up.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_client_disconnect_aborts_and_releases_admission() {
+        let harness = Task11HttpHarness::spawn("ns-disconnect-abort");
+        let port = harness.port();
+        let body = harness.base_body("t11-long-nonstream", false);
+
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "precondition: admission idle"
+        );
+
+        let stream = open_nonstream_request(port, &body);
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let ready = wait_fixture_ready(&harness, ready_deadline);
+        let gen_id = ready
+            .get("id")
+            .cloned()
+            .expect("fixture_ready carries generate id");
+        let gen_aid = ready
+            .get("attempt_id")
+            .and_then(|v| v.as_u64())
+            .expect("fixture_ready carries attempt_id");
+
+        // Confirm generate is in the wire log with the same correlation pair.
+        let request_log = harness.read_requests_log();
+        let generates = Task11HttpHarness::ops_of_type(&request_log, "generate");
+        assert!(
+            generates.iter().any(|g| {
+                g.get("id") == Some(&gen_id)
+                    && g.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+            }),
+            "generate missing for fixture pair: {:?}",
+            harness.read_requests_log()
+        );
+
+        // Client disconnect without ever reading an HTTP status line.
+        drop(stream);
+
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_abort = false;
+        let mut saw_done_aborted = false;
+        let mut inflight_hit_zero_before_done = false;
+
+        while Instant::now() < poll_deadline {
+            let log = harness.read_requests_log();
+            if !saw_abort {
+                saw_abort = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+            }
+            if !saw_done_aborted {
+                saw_done_aborted = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+            }
+            let inflight = harness.shared.admission.inflight();
+            if inflight == 0 && !saw_done_aborted {
+                inflight_hit_zero_before_done = true;
+            }
+            if saw_abort && saw_done_aborted && inflight == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            saw_abort,
+            "correlated abort{{id,attempt_id}} missing within poll bound; log={:?}",
+            harness.read_requests_log()
+        );
+        assert!(
+            saw_done_aborted,
+            "daemon done/aborted marker missing; log={:?}",
+            harness.read_requests_log()
+        );
+        assert!(
+            !inflight_hit_zero_before_done,
+            "Admission inflight reached 0 before done/aborted drained"
+        );
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "admission must be fully released after abort drain"
+        );
+
+        // No commit may have been sent for the cancelled attempt.
+        let log = harness.read_requests_log();
+        let commits = Task11HttpHarness::ops_of_type(&log, "commit");
+        assert!(
+            commits.iter().all(|c| {
+                !(c.get("id") == Some(&gen_id)
+                    && c.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid))
+            }),
+            "cancelled attempt must not commit: {commits:?}"
+        );
+
+        // Immediate follow-up must admit and return a single JSON success.
+        let follow = complete_nonstream(port, harness.base_body("t11-stop-text", false))
+            .expect("follow-up after cancel must return 200 JSON");
+        assert_eq!(follow["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            follow["choices"][0]["message"]["content"],
+            "hello from fake daemon"
+        );
+        let release_deadline = Instant::now() + Duration::from_millis(500);
+        while harness.shared.admission.inflight() != 0 && Instant::now() < release_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "follow-up admission guard did not release after flushed response"
+        );
+    }
+
+    /// Connected pre-terminal daemon error keeps non-200 OpenAI error JSON.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_connected_error_preserves_status() {
+        let harness = Task11HttpHarness::spawn("ns-connected-err");
+        let port = harness.port();
+        let body = harness.base_body("t15-class-validation", false);
+        let (status, raw_body) = raw_nonstream_post(port, &body);
+        assert!(
+            status >= 400 && status != 200,
+            "preterminal error must keep non-200 status, got {status}"
+        );
+        let text = String::from_utf8_lossy(&raw_body);
+        // Strip optional chunked framing / trailing whitespace for JSON parse.
+        let json_start = text.find('{').expect("OpenAI error JSON object");
+        let json_text = &text[json_start..];
+        let err: serde_json::Value =
+            serde_json::from_str(json_text.trim_end()).expect("OpenAI error JSON");
+        let message = err
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !message.is_empty(),
+            "error.message required in OpenAI error body: {err}"
+        );
+        assert!(
+            err.pointer("/choices").is_none(),
+            "error response must not look like a completion: {err}"
+        );
+        // Exactly one top-level JSON value.
+        let mut it = serde_json::Deserializer::from_str(json_text.trim_end())
+            .into_iter::<serde_json::Value>();
+        let _first = it.next().expect("one value").expect("valid JSON");
+        assert!(
+            it.next().is_none(),
+            "error body must be exactly one JSON value"
+        );
+    }
+
+    /// Connected non-stream success is exactly one JSON value (no SSE/trailer).
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_success_is_exactly_one_json() {
+        let harness = Task11HttpHarness::spawn("ns-one-json");
+        let port = harness.port();
+        let body = harness.base_body("t11-stop-text", false);
+        let (status, raw_body) = raw_nonstream_post(port, &body);
+        assert_eq!(status, 200, "success status");
+        let text = String::from_utf8_lossy(&raw_body);
+        let json_start = text.find('{').expect("JSON object in body");
+        let json_text = text[json_start..].trim_end();
+        let mut it = serde_json::Deserializer::from_str(json_text).into_iter::<serde_json::Value>();
+        let value = it
+            .next()
+            .expect("exactly one JSON value")
+            .expect("valid JSON");
+        assert!(
+            it.next().is_none(),
+            "non-stream success must not append a second JSON/SSE value; body={text:?}"
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "hello from fake daemon"
+        );
+        assert!(
+            !text.contains("data:"),
+            "non-stream body must not carry SSE framing"
+        );
+    }
+
+    /// Close-before terminal → abort and no commit; close-after full JSON → commit, no abort.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_close_before_vs_after_terminal_commit_race() {
+        let harness = Task11HttpHarness::spawn("ns-commit-race");
+        let port = harness.port();
+
+        // --- before terminal: disconnect during long silent generation ---
+        {
+            let body = harness.base_body("t11-long-nonstream", false);
+            let stream = open_nonstream_request(port, &body);
+            let ready = wait_fixture_ready(&harness, Instant::now() + Duration::from_secs(5));
+            let gen_id = ready.get("id").cloned().expect("id");
+            let gen_aid = ready
+                .get("attempt_id")
+                .and_then(|v| v.as_u64())
+                .expect("attempt_id");
+            drop(stream);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut saw_abort = false;
+            while Instant::now() < deadline {
+                let log = harness.read_requests_log();
+                saw_abort = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+                let done = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
+                        && row.get("id") == Some(&gen_id)
+                });
+                if saw_abort && done && harness.shared.admission.inflight() == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(saw_abort, "close-before-terminal must abort");
+            let log = harness.read_requests_log();
+            assert!(
+                Task11HttpHarness::ops_of_type(&log, "commit")
+                    .iter()
+                    .all(|c| c.get("id") != Some(&gen_id)),
+                "close-before-terminal must not commit: {log:?}"
+            );
+        }
+
+        // --- after terminal: full success response consumed; commit, no abort ---
+        {
+            let before_aborts =
+                Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "abort").len();
+            let body = harness.base_body("t11-stop-text", false);
+            let (status, raw_body) = raw_nonstream_post(port, &body);
+            assert_eq!(status, 200);
+            let text = String::from_utf8_lossy(&raw_body);
+            let json_start = text.find('{').expect("json");
+            let value: serde_json::Value =
+                serde_json::from_str(text[json_start..].trim_end()).expect("json body");
+            assert_eq!(value["choices"][0]["finish_reason"], "stop");
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut saw_commit = false;
+            while Instant::now() < deadline {
+                let log = harness.read_requests_log();
+                // Latest generate should have a matching commit.
+                let generates = Task11HttpHarness::ops_of_type(&log, "generate");
+                let last_gen = generates.last().expect("generate for success path");
+                let gid = last_gen.get("id").cloned();
+                let gaid = last_gen.get("attempt_id").and_then(|v| v.as_u64());
+                saw_commit = Task11HttpHarness::ops_of_type(&log, "commit")
+                    .iter()
+                    .any(|c| {
+                        c.get("id") == gid.as_ref()
+                            && c.get("attempt_id").and_then(|v| v.as_u64()) == gaid
+                    });
+                if saw_commit {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(saw_commit, "close-after-terminal must commit");
+            let after_aborts =
+                Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "abort").len();
+            assert_eq!(
+                after_aborts, before_aborts,
+                "close-after full JSON must not emit a new abort"
+            );
+        }
+    }
+
+    /// Paired stream/nonstream matrix rows for stop, pure-tool, mixed-tool,
+    /// two-tools, length-withhold, and usage ordering.
+    ///
+    /// Valid structured-call rows hard-fail on any tool-protocol marker or
+    /// structured-argument JSON fragment leaking into content/reasoning.
+    /// Invalid-producer dirty-marker diagnostics live in a separate test and
+    /// must not weaken these valid-path assertions.
+    /// (Matrix body lives with the broader Task11 suite; streaming helpers above
+    /// remain the stable surface for parity checks.)
+    #[cfg(unix)]
+
+    /// Invalid-producer diagnostic (authority violation): dirty marker token text
+    /// stays byte-verbatim content and never becomes structured tool_calls.
+    /// Kept separate so it cannot weaken valid structured-call leak assertions.
+    #[cfg(unix)]
+
+    /// Premature daemon EOF after gen_start/token without done → client/HTTP failure.
+    #[cfg(unix)]
+
+    /// Capability denial: daemon typed error on tools request → no completion/tool payload.
+    #[cfg(unix)]
+    // --- Task 15: server-owned one-retry (disabled-by-default) ---
+    #[test]
+    fn bench_generate_request_includes_numeric_first_attempt() {
+        let req = bench_generate_request("bench prompt", 37);
+        assert_eq!(req.get("type").and_then(|v| v.as_str()), Some("generate"));
+        assert_eq!(req.get("attempt_id").and_then(|v| v.as_u64()), Some(1));
+        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(!id.is_empty(), "id must be a non-empty string");
+        assert_eq!(
+            req.get("prompt").and_then(|v| v.as_str()),
+            Some("bench prompt")
+        );
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
+    }
+
+    /// Every benchmark generate must ask for answer mode.
+    ///
+    /// A reasoning model opens `<think>` in its first tokens and would spend a
+    /// benchmark's fixed budget (16 tokens for the warmup, 128 for the measured
+    /// runs) inside it, so the measured turn would never reach the answer path.
+    #[test]
+    fn bench_generate_request_is_answer_mode_by_default() {
+        let req = bench_generate_request("bench prompt", 128);
+        assert_eq!(
+            req.get("max_think_tokens").and_then(|v| v.as_u64()),
+            Some(1),
+            "benchmark generates must cap thinking"
+        );
+        assert_eq!(
+            req.get("assistant_prefix").and_then(|v| v.as_str()),
+            Some("closed_think"),
+            "benchmark generates must start in answer mode"
+        );
+        assert_eq!(
+            req.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none")
+        );
+    }
+
+    /// `--reasoning-on` restores the thinking turn for anyone who wants to
+    /// benchmark that path, and must produce a request carrying none of the
+    /// answer-mode fields.
+    #[test]
+    fn bench_reasoning_on_opts_back_into_thinking() {
+        let req = bench_generate_request_reasoning("bench prompt", 128, true);
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(req.get("assistant_prefix").is_none());
+        assert!(req.get("reasoning_effort").is_none());
+        // Still an ordinary benchmark generate otherwise.
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
+    }
+
+    fn bench_args_for_test(prompt: Vec<String>, prompt_file: Option<PathBuf>) -> BenchArgs {
+        BenchArgs {
+            model: "qwen:test".to_owned(),
+            runs: 1,
+            tp: None,
+            json: true,
+            exp: false,
+            matrix: false,
+            ttft: false,
+            pp: vec![128],
+            ctx: vec![128],
+            tg: 128,
+            max_tokens: 128,
+            sustained_tg: None,
+            sustained_ctx: vec![128],
+            warmups: 1,
+            kv_mode: None,
+            kv_k: None,
+            kv_v: None,
+            kv_backend: None,
+            redline: false,
+            speculation: None,
+            reasoning_on: false,
+            concurrency: None,
+            backend: "both".to_owned(),
+            workload: "both".to_owned(),
+            prompt,
+            prompt_file,
+        }
+    }
+
+    #[test]
+    fn bench_prompt_file_conflicts_with_positional_prompt() {
+        let err = Cli::try_parse_from([
+            "hipfire",
+            "bench",
+            "qwen:test",
+            "--prompt-file",
+            "prompt.txt",
+            "hello",
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--prompt-file"),
+            "conflict error should name the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_keeps_historical_default() {
+        let args = bench_args_for_test(Vec::new(), None);
+        assert_eq!(
+            resolve_bench_prompt(&args).unwrap(),
+            "Explain the theory of general relativity in simple terms."
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_joins_positional_words() {
+        let args = bench_args_for_test(vec!["hello".to_owned(), "world".to_owned()], None);
+        assert_eq!(resolve_bench_prompt(&args).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn bench_resolve_prompt_file_is_verbatim() {
+        let path = std::env::temp_dir().join("hipfire-bench-prompt-verbatim.txt");
+        // Trailing newline included: the file is read as raw bytes, never trimmed.
+        std::fs::write(&path, "repeat after me\n").unwrap();
+        let args = bench_args_for_test(Vec::new(), Some(path.clone()));
+        let prompt = resolve_bench_prompt(&args).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(prompt, "repeat after me\n");
+        assert_eq!(
+            bench_prompt_md5(&prompt),
+            format!("{:x}", md5::compute(b"repeat after me\n"))
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_rejects_file_and_positional() {
+        let args = bench_args_for_test(vec!["hello".to_owned()], Some(PathBuf::from("prompt.txt")));
+        assert!(resolve_bench_prompt(&args).is_err());
+    }
+
+    #[test]
+    fn bench_prompt_warning_threshold() {
+        // The default short prompt must warn; 256+ tokens must not.
+        let short = bench_prompt_warning(24).expect("24 tokens must warn");
+        assert!(
+            short.contains("launch overhead"),
+            "unexpected text: {short}"
+        );
+        assert!(
+            short.contains("24"),
+            "warning should name the count: {short}"
+        );
+        assert!(bench_prompt_warning(255).is_some());
+        assert!(bench_prompt_warning(256).is_none());
+        assert!(bench_prompt_warning(4400).is_none());
+    }
+
+    #[test]
+    fn bench_prompt_tokens_come_from_prefill_plus_cached() {
+        // The daemon's done event names the prompt as prefill_tokens (+ any
+        // prompt-cache hit in cached_tokens); there is no prompt_tokens key.
+        let done = serde_json::json!({"prefill_tokens": 4400, "cached_tokens": 8});
+        assert_eq!(bench_prompt_tokens_from_done(&done), Some(4408));
+        let no_cache = serde_json::json!({"prefill_tokens": 24});
+        assert_eq!(bench_prompt_tokens_from_done(&no_cache), Some(24));
+        let neither = serde_json::json!({"tokens": 128, "prompt_tokens": 99});
+        assert_eq!(bench_prompt_tokens_from_done(&neither), None);
+    }
+
+    #[test]
+    fn bench_prompt_md5_is_hex_of_prompt_bytes() {
+        // md5("abc") is a fixed vector; guards against swapping in sha256.
+        assert_eq!(bench_prompt_md5("abc"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn http_reasoning_nested_max_tokens_alias_resolves_cap_source() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "low",
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req["max_think_tokens"], 2048);
+        assert_eq!(res.effective_cap, Some(2048));
+        assert_eq!(res.cap_source, "explicit:body:reasoning.max_tokens");
+        assert!(res.warnings.is_empty());
+    }
+
+    #[test]
+    fn http_reasoning_top_level_max_think_tokens_precedes_nested_alias() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut conflicting = serde_json::json!({});
+        let res_conflict = apply_http_reasoning_request(
+            &serde_json::json!({
+                "max_think_tokens": 4096,
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut conflicting,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(conflicting["max_think_tokens"], 4096);
+        assert_eq!(res_conflict.effective_cap, Some(4096));
+        assert_eq!(res_conflict.cap_source, "explicit:body:max_think_tokens");
+        assert!(res_conflict.warnings.iter().any(|warning| {
+            warning.contains("reasoning.max_tokens")
+                && warning.contains("max_think_tokens")
+                && warning.contains("precedence")
+        }));
+
+        let mut equal = serde_json::json!({});
+        let res_equal = apply_http_reasoning_request(
+            &serde_json::json!({
+                "max_think_tokens": 2048,
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut equal,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(equal["max_think_tokens"], 2048);
+        assert_eq!(res_equal.effective_cap, Some(2048));
+        assert_eq!(res_equal.cap_source, "explicit:body:max_think_tokens");
+        assert!(
+            res_equal
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("reasoning.max_tokens")),
+            "equal duplicate caps must not warn"
+        );
+    }
+
+    #[test]
+    fn http_reasoning_malformed_nested_max_tokens_is_hard_error() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for bad in [
+            serde_json::json!({ "reasoning": { "max_tokens": -1 } }),
+            serde_json::json!({ "reasoning": { "max_tokens": 1.5 } }),
+            serde_json::json!({ "reasoning": { "max_tokens": "2048" } }),
+            serde_json::json!({ "reasoning": { "max_tokens": 393217 } }),
+        ] {
+            let mut req = serde_json::json!({});
+            let err = apply_http_reasoning_request(
+                &bad,
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &supported,
+            )
+            .expect_err("malformed nested reasoning.max_tokens must hard-error");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("reasoning.max_tokens")
+                    && message.contains("must be between 0 and 393216"),
+                "unexpected error wording: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_reasoning_three_toggle_sources_disabled_wins_once() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // pairwise: top true vs kwargs false
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": false }
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], false);
+        assert_eq!(res.effective_mode, "disabled");
+        let warns: Vec<_> = res
+            .warnings
+            .iter()
+            .filter(|w| w.contains("conflicting thinking toggles"))
+            .collect();
+        assert_eq!(warns.len(), 1, "pairwise conflict must warn once");
+
+        // pairwise: kwargs true vs thinking.type disabled
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "disabled" }
+            }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req2["thinking_enabled"], false);
+        assert_eq!(res2.effective_mode, "disabled");
+        assert_eq!(
+            res2.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            1
+        );
+
+        // all three: top true, kwargs true, thinking disabled => disabled wins, single warning
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "disabled" }
+            }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req3["thinking_enabled"], false);
+        assert_eq!(res3.effective_mode, "disabled");
+        assert_eq!(
+            res3.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            1
+        );
+
+        // all three agree true => no conflict warning, enabled
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "enabled" }
+            }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req4["thinking_enabled"], true);
+        assert_eq!(res4.effective_mode, "enabled");
+        assert_eq!(
+            res4.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn http_reasoning_gemma_enabled_with_cap_and_budget_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Gemma explicit enable true must remain enabled and report no cap, even with caps present
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "max_think_tokens": 1234,
+                "thinking_budget": "high",
+                "reasoning_effort": "low"
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        assert!(
+            req.get("max_think_tokens").is_none(),
+            "Gemma must not send cap"
+        );
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("reasoning_effort")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("max_think_tokens")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("thinking_budget")));
+
+        // Config caps also dropped for Gemma when thinking enabled
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.max_tokens", "4096").unwrap();
+        layer.set_cli("reasoning.budget", "low").unwrap();
+        let cfg_resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "enable_thinking": true }),
+            &cfg_resolved,
+            &mut req2,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req2["thinking_enabled"], true);
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+    }
+
+    #[test]
+    fn http_reasoning_gemma_budget_off_does_not_disable() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Gemma with enable true + budget off must stay enabled (budget off ignored for Gemma)
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "thinking_budget": "off"
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("thinking_budget")));
+        // Gemma default disabled without explicit enable, budget off should not change that (still disabled via default, not via budget)
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "off" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(res2.effective_mode, "disabled");
+        // budget off for non-Gemma Qwen should disable
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "thinking_budget": "off"
+            }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req3["thinking_enabled"], false);
+        assert_eq!(res3.effective_mode, "disabled");
+    }
+
+    #[test]
+    fn http_reasoning_invalid_enum_warns_not_hard_error_and_malformed_hard_errors() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // unknown thinking.type string -> warn+drop, not error, results in default enabled for Qwen
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "maybe" } }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert!(!res.warnings.is_empty());
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking.type") && w.contains("dropped")));
+        assert_eq!(res.effective_mode, "enabled"); // default for Qwen
+
+        // unknown non-native thinking_budget -> warn+drop, not error
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "turbo" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            false,
+            &supported,
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("dropped")));
+
+        // wrong JSON type for enable_thinking -> hard error
+        let mut req3 = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "enable_thinking": "true" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("enable_thinking must be a boolean"));
+
+        // wrong JSON type for thinking.type -> hard error
+        let mut req4 = serde_json::json!({});
+        let err2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": 123 } }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err2}").contains("thinking.type must be enabled or disabled"));
+
+        // cap range violation -> hard error (body)
+        let mut req5 = serde_json::json!({});
+        let err3 = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 999999 }),
+            &resolved,
+            &mut req5,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err3}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn http_reasoning_nested_max_tokens_and_qwen_deepseek_glimmer_contracts_intact() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Nested reasoning.max_tokens still works
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &["low".to_string(), "medium".to_string(), "xhigh".to_string()],
+        )
+        .unwrap();
+        assert_eq!(req["max_think_tokens"], 2048);
+        assert_eq!(res.effective_cap, Some(2048));
+        assert_eq!(res.cap_source, "explicit:body:reasoning.max_tokens");
+
+        // Qwen non-native still drops effort
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("reasoning_effort").is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("does not natively support effort")));
+
+        // DeepSeek effort mapping intact
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "medium" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req3["reasoning_effort"], "high");
+        assert_eq!(res3.effective_effort.as_deref(), Some("high"));
+
+        // Glimmer always-on intact
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" } }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req4["thinking_enabled"], true);
+        assert_eq!(res4.effective_mode, "enabled");
+    }
+
+    #[test]
+    fn http_reasoning_deepseek_explicit_caps_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "high",
+                "max_think_tokens": 4096
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("max_think_tokens") && w.contains("deepseek4")));
+        assert_eq!(req["reasoning_effort"], "high");
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "high" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req3.get("max_think_tokens").is_none());
+        assert!(res3
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("deepseek4")));
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.max_tokens", "8192").unwrap();
+        let cfg = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &cfg,
+            &mut req4,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req4.get("max_think_tokens").is_none());
+        assert!(res4.effective_cap.is_none());
+        assert!(res4
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+        let mut bad = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": "bad" }),
+            &resolved,
+            &mut bad,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn http_reasoning_glimmer_explicit_caps_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "low",
+                "max_think_tokens": 512
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("max_think_tokens") && w.contains("muse_glimmer")));
+        assert_eq!(req["reasoning_effort"], "low");
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning": { "max_tokens": 1024 },
+                "thinking_budget": "low"
+            }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert_eq!(res2.cap_source, "none");
+        assert!(res2.warnings.iter().any(|w| w.contains("muse_glimmer")));
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.budget", "high").unwrap();
+        let cfg = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &cfg,
+            &mut req3,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req3.get("max_think_tokens").is_none());
+        assert!(res3.effective_cap.is_none());
+        assert!(res3
+            .warnings
+            .iter()
+            .any(|w| w.contains("muse_glimmer") || w.contains("thinking_budget")));
+        let mut bad = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 500000 } }),
+            &resolved,
+            &mut bad,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn head_forces_local_even_when_service_would_be_ready() {
+        let with_head = RunArgs {
+            model: "maple-preview".into(),
+            prompt: vec![],
+            temp: None,
+            top_p: None,
+            repeat_penalty: None,
+            max_tokens: None,
+            kv_mode: None,
+            kv_k: None,
+            kv_v: None,
+            head: Some("q4k".into()),
+            kv_backend: None,
+            tp: None,
+            speculation: None,
+            model_draft: None,
+            vision: None,
+            draft_max: None,
+            dspark_conf_threshold: None,
+            system: None,
+            image: None,
+            json: false,
+            no_stream: false,
+        };
+        let without_head = RunArgs {
+            head: None,
+            ..with_head.clone()
+        };
+        // --head must force local; without head should not force local by itself
+        assert!(
+            run_should_force_local(&with_head),
+            "--head must force local load path"
+        );
+        assert!(
+            !run_should_force_local(&without_head),
+            "without head and no other flags should not force local"
+        );
+    }
+
+    #[test]
+    fn existing_artifact_valid_detects_fresh_and_stale() {
+        use sha2::{Digest, Sha256};
+        let dir = env::temp_dir().join(format!(
+            "hipfire-artifact-valid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.mq4");
+        let content = b"fresh content";
+        fs::write(&path, content).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let sha = format!("{:x}", hasher.finalize());
+        let size = content.len() as u64;
+        assert!(existing_artifact_valid(&path, Some(&sha), Some(size)));
+        assert!(!existing_artifact_valid(&path, Some(&sha), Some(size + 1)));
+        assert!(!existing_artifact_valid(
+            &path,
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            Some(size)
+        ));
+        // No expectations means existence alone is valid
+        assert!(existing_artifact_valid(&path, None, None));
+        // Missing file is invalid
+        assert!(!existing_artifact_valid(
+            &dir.join("missing"),
+            Some(&sha),
+            Some(size)
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_params_preserves_auto_for_direct_path_and_lowers_registry_bf16() {
+        // Direct-path load: no registry entry, config is auto -> must stay auto.
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert_eq!(config_string(&defaults, "memory.kv_cache").unwrap(), "auto");
+        let direct_path = PathBuf::from("/tmp/direct-model.mq4");
+        let params = load_params(
+            &defaults,
+            None,
+            &direct_path.parent().unwrap(),
+            &direct_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params["kv_mode"], "auto",
+            "direct-path auto must survive to architecture"
+        );
+
+        // A non-q8 registry default is a model-specific opinion and must lower
+        // into the resolved config before load parameters are built.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{
+                "maple-preview":{"repo":"x","file":"maple-preview.mq2lloydu","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"bf16"}
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (_, entry) = registry.model("maple-preview").unwrap();
+        let resolved = resolve(vec![NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: "maple-preview".into(),
+                revision: "test".into(),
+            },
+            layer: entry.config_layer().unwrap(),
+        }])
+        .unwrap();
+        let params2 = load_params(
+            &resolved,
+            Some(entry),
+            &direct_path.parent().unwrap(),
+            &direct_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params2["kv_mode"], "bf16",
+            "non-q8 registry default must resolve to BF16"
+        );
+
+        // Explicit override still wins.
+        let params3 = load_params(
+            &resolved,
+            Some(entry),
+            &direct_path.parent().unwrap(),
+            &direct_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params3["kv_mode"], "q8");
+    }
+
+    fn write_test_registry_cache(paths: &Paths, raw: &str) {
+        let registry = RegistryV1::parse(raw, "test-cache").unwrap();
+        let url = env::var("HIPFIRE_REGISTRY_URL")
+            .unwrap_or_else(|_| "https://example.com/test.json".into());
+        let cache = serde_json::json!({
+            "fetched_at": unix_timestamp() * 1000,
+            "url": url,
+            "registry": registry
+        });
+        fs::create_dir_all(paths.registry.cache.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.registry.cache,
+            serde_json::to_string(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn tiny_http_server(
+        files: std::collections::HashMap<String, Vec<u8>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let expected = files.len();
+        let handle = std::thread::spawn(move || {
+            let mut served = 0usize;
+            listener.set_nonblocking(false).unwrap();
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                // Extract file name from request path: /{repo}/resolve/main/{file}
+                let mut body: Option<Vec<u8>> = None;
+                for (name, data) in &files {
+                    if req.contains(name) {
+                        body = Some(data.clone());
+                        break;
+                    }
+                }
+                if let Some(data) = body {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        data.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&data);
+                } else {
+                    let header =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(header.as_bytes());
+                }
+                let _ = stream.flush();
+                served += 1;
+                if served >= expected {
+                    break;
+                }
+            }
+        });
+        // small pause to let listener start
+        std::thread::sleep(Duration::from_millis(50));
+        (base, handle)
+    }
+
+    #[test]
+    fn pull_fresh_downloads_heads_with_hash_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("pull-fresh-heads");
+        // Build tiny artifacts
+        let base_content = b"base-model-content";
+        let head_q4k_content = b"head-q4k-content";
+        let head_bf16_content = b"head-bf16-content";
+        use sha2::{Digest, Sha256};
+        let sha = |data: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(data);
+            format!("{:x}", h.finalize())
+        };
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "test-model":{{
+                    "repo":"test/repo",
+                    "file":"test-model.mq4",
+                    "size_gb":0.001,
+                    "min_vram_gb":1,
+                    "desc":"x",
+                    "default_kv_mode":"bf16",
+                    "heads":{{
+                        "q4k":{{"file":"test-model-head-q4k.hfq","sha256":"{}","size_bytes":{}}},
+                        "bf16":{{"file":"test-model-head-bf16.hfq","sha256":"{}","size_bytes":{}}}
+                    }},
+                    "sha256":"{}",
+                    "size_bytes":{}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            sha(head_q4k_content),
+            head_q4k_content.len(),
+            sha(head_bf16_content),
+            head_bf16_content.len(),
+            sha(base_content),
+            base_content.len()
+        );
+        write_test_registry_cache(&paths, &raw);
+        let mut files = std::collections::HashMap::new();
+        files.insert("test-model.mq4".to_string(), base_content.to_vec());
+        files.insert(
+            "test-model-head-q4k.hfq".to_string(),
+            head_q4k_content.to_vec(),
+        );
+        files.insert(
+            "test-model-head-bf16.hfq".to_string(),
+            head_bf16_content.to_vec(),
+        );
+        let (base, handle) = tiny_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        // Pull should download base + both heads
+        pull_command(
+            &paths,
+            PullArgs {
+                model: "test-model".into(),
+                force: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(paths.models.join("test-model.mq4")).unwrap(),
+            base_content
+        );
+        assert_eq!(
+            fs::read(paths.models.join("test-model-head-q4k.hfq")).unwrap(),
+            head_q4k_content
+        );
+        assert_eq!(
+            fs::read(paths.models.join("test-model-head-bf16.hfq")).unwrap(),
+            head_bf16_content
+        );
+        let _ = handle.join();
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_stale_same_name_artifact_refreshes_atomically() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("pull-stale-refresh");
+        let fresh = b"fresh-content";
+        let stale = b"stale-old-content";
+        use sha2::{Digest, Sha256};
+        let sha = |data: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(data);
+            format!("{:x}", h.finalize())
+        };
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "test-model":{{
+                    "repo":"test/repo",
+                    "file":"test-model.mq4",
+                    "size_gb":0.001,
+                    "min_vram_gb":1,
+                    "desc":"x",
+                    "sha256":"{}",
+                    "size_bytes":{}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            sha(fresh),
+            fresh.len()
+        );
+        write_test_registry_cache(&paths, &raw);
+        fs::create_dir_all(&paths.models).unwrap();
+        // Place stale artifact with same name but wrong hash/size
+        fs::write(paths.models.join("test-model.mq4"), stale).unwrap();
+        assert!(!existing_artifact_valid(
+            &paths.models.join("test-model.mq4"),
+            Some(&sha(fresh)),
+            Some(fresh.len() as u64)
+        ));
+        let mut files = std::collections::HashMap::new();
+        files.insert("test-model.mq4".to_string(), fresh.to_vec());
+        let (base, handle) = tiny_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        // Without --force, stale should still be detected and refreshed
+        pull_command(
+            &paths,
+            PullArgs {
+                model: "test-model".into(),
+                force: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(paths.models.join("test-model.mq4")).unwrap(),
+            fresh
+        );
+        let _ = handle.join();
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_heads_alongside_base() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("rm-heads");
+        let valid_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "test-model":{{
+                    "repo":"test/repo",
+                    "file":"test-model.mq4",
+                    "size_gb":0.001,
+                    "min_vram_gb":1,
+                    "desc":"x",
+                    "heads":{{
+                        "q4k":{{"file":"test-model-head-q4k.hfq","sha256":"{sha}","size_bytes":3}},
+                        "bf16":{{"file":"test-model-head-bf16.hfq","sha256":"{sha}","size_bytes":3}}
+                    }},
+                    "sha256":"{sha}",
+                    "size_bytes":3
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            sha = valid_sha
+        );
+        write_test_registry_cache(&paths, &raw);
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::write(paths.models.join("test-model.mq4"), b"base").unwrap();
+        fs::write(paths.models.join("test-model-head-q4k.hfq"), b"q4k").unwrap();
+        fs::write(paths.models.join("test-model-head-bf16.hfq"), b"bf16").unwrap();
+        assert!(paths.models.join("test-model-head-q4k.hfq").is_file());
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "test-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("test-model.mq4").exists());
+        assert!(!paths.models.join("test-model-head-q4k.hfq").exists());
+        assert!(!paths.models.join("test-model-head-bf16.hfq").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: String,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        fn set(key: &str, val: &str) -> Self {
+            let prev = env::var_os(key);
+            env::set_var(key, val);
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(v) = &self.prev {
+                env::set_var(&self.key, v);
+            } else {
+                env::remove_var(&self.key);
+            }
+        }
+    }
+
+    /// Raw `POST /v1/chat/completions` with `Connection: close`: status, the
+    /// lowercased response head, and the de-chunked body. Panics if a chunked
+    /// body ends without its terminating zero-size chunk (a torn stream).
+    #[cfg(unix)]
+    fn raw_chat_post(port: u16, body: &serde_json::Value) -> (u16, String, Vec<u8>) {
+        let payload = body.to_string();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+        .expect("write request");
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head");
+        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        let mut rest = &raw[split + 4..];
+        if !head.contains("transfer-encoding: chunked") {
+            return (status, head, rest.to_vec());
+        }
+        let mut body = Vec::new();
+        loop {
+            let line_end = rest
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "torn chunked body after {:?}",
+                        String::from_utf8_lossy(&body)
+                    )
+                });
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&rest[..line_end]).expect("chunk size"),
+                16,
+            )
+            .expect("chunk size hex");
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return (status, head, body);
+            }
+            assert!(
+                rest.len() >= size + 2,
+                "torn chunked body after {:?}",
+                String::from_utf8_lossy(&body)
+            );
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
+    /// `data:` payloads of an SSE body, in order.
+    #[cfg(unix)]
+    fn sse_payloads(body: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(body)
+            .split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("data: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Error status comes from the daemon's typed class, and a stream that
+    /// fails before its first frame is an ordinary JSON error, not a 200.
+    #[cfg(unix)]
+    #[test]
+    fn typed_errors_keep_their_status_stream_and_nonstream() {
+        let harness = Task11HttpHarness::spawn("error-status");
+        let port = harness.port();
+        for stream in [false, true] {
+            for (tag, status) in [
+                ("t15-class-validation", 400),
+                ("t15-class-context", 400),
+                ("t15-class-unsupported", 400),
+                ("t15-class-internal", 500),
+                ("t15-transient-always", 503),
+            ] {
+                let (got, head, body) = raw_chat_post(port, &harness.base_body(tag, stream));
+                assert_eq!(got, status, "{tag} stream={stream}: {head}");
+                assert!(
+                    head.contains("content-type: application/json"),
+                    "{tag}: {head}"
+                );
+                let err: serde_json::Value = serde_json::from_slice(&body)
+                    .unwrap_or_else(|e| panic!("{tag}: one JSON error body ({e}): {body:?}"));
+                assert!(
+                    err.pointer("/error/message")
+                        .and_then(|v| v.as_str())
+                        .is_some(),
+                    "{tag}: {err}"
+                );
+                assert_eq!(
+                    head.contains("retry-after: 1"),
+                    status == 503,
+                    "{tag}: Retry-After only on 503: {head}"
+                );
+            }
+            // Gateway validation (no daemon class) also fails before commit.
+            let mut body = harness.base_body("t11-stop-text", stream);
+            body["max_tokens"] = serde_json::json!(0);
+            let (got, _, raw) = raw_chat_post(port, &body);
+            assert_eq!(got, 400, "max_tokens=0 stream={stream}");
+            assert!(String::from_utf8_lossy(&raw).contains("max_tokens"));
+        }
+    }
+
+    /// A stream that fails after it committed ends with an OpenAI error event
+    /// and `[DONE]` inside a cleanly terminated body, never a torn one.
+    #[cfg(unix)]
+    #[test]
+    fn stream_failure_after_first_token_ends_with_error_event_and_done() {
+        let harness = Task11HttpHarness::spawn("midstream-error");
+        let port = harness.port();
+        let (status, _, body) = raw_chat_post(port, &harness.base_body("t15-visible-token", true));
+        assert_eq!(status, 200);
+        let payloads = sse_payloads(&body);
+        let [role, token, error, done] = payloads.as_slice() else {
+            panic!("role, token, error, [DONE] expected: {payloads:?}");
+        };
+        assert!(role.contains(r#""role":"assistant""#), "{role}");
+        assert!(token.contains("visible-before-fail"), "{token}");
+        let error: serde_json::Value = serde_json::from_str(error).expect("error event JSON");
+        assert_eq!(error["error"]["type"], "server_error", "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("transient after visible token")),
+            "{error}"
+        );
+        assert_eq!(done, "[DONE]");
+
+        // The OpenAI-compatible client reports the server's message.
+        match capture_stream(port, harness.base_body("t15-visible-token", true)) {
+            Err(hipfire_client::ClientError::Http(message)) => {
+                assert!(
+                    message.contains("transient after visible token"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected the stream's error event, got {other:?}"),
+        }
+
+        // Daemon death mid-stream is reported the same way.
+        let (status, _, body) = raw_chat_post(port, &harness.base_body("t11-premature-eof", true));
+        assert_eq!(status, 200);
+        let payloads = sse_payloads(&body);
+        assert!(payloads[1].contains("partial-before-eof"), "{payloads:?}");
+        assert!(payloads[2].contains(r#""error""#), "{payloads:?}");
+        assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+    }
+
+    /// Marks the child run of `accept_errors_do_not_stop_serving` (not a
+    /// product setting, so no `HIPFIRE_` prefix).
+    #[cfg(unix)]
+    const EMFILE_CHILD_ENV: &str = "T11_EMFILE_CHILD";
+
+    /// A failed `accept` must not end the server. A child process runs the
+    /// serve harness and then takes every free descriptor, so the kernel
+    /// completes this test's connect but serve's `accept` fails with EMFILE.
+    /// Once the child gives the descriptors back, the same connection must
+    /// be served.
+    #[cfg(unix)]
+    #[test]
+    fn accept_errors_do_not_stop_serving() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        if env::var_os(EMFILE_CHILD_ENV).is_some() {
+            return emfile_child();
+        }
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "tests::accept_errors_do_not_stop_serving",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test");
+        // Keep the read end open until the child exits: a closed pipe would
+        // make its test output fail.
+        let mut child_stdout = BufReader::new(child.stdout.take().unwrap());
+        let port: u16 = loop {
+            let mut line = String::new();
+            assert!(
+                child_stdout.read_line(&mut line).unwrap() > 0,
+                "child exited before it held every descriptor"
+            );
+            // libtest prints "test <name> ... " on the same line first.
+            if let Some((_, port)) = line.trim().split_once("EMFILE_READY ") {
+                break port.parse().unwrap();
+            }
+        };
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut child_stdin = child.stdin.take().unwrap();
+        writeln!(child_stdin, "connected").unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        drop(child_stdin);
+        let output = child.wait_with_output().expect("child test");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("accept failed"),
+            "serve never hit an accept error: {stderr}"
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "connection not served after EMFILE: {response:?}\n{stderr}"
+        );
+        assert!(output.status.success(), "child test failed: {stderr}");
+        drop(child_stdout);
+    }
+
+    #[cfg(unix)]
+    fn emfile_child() {
+        let harness = Task11HttpHarness::spawn("emfile");
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = limit.rlim_cur.min(256);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut hogs = Vec::new();
+        while let Ok(file) = fs::File::open("/dev/null") {
+            hogs.push(file);
+        }
+        println!("EMFILE_READY {}", harness.port());
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        // Serve fails its accept and backs off meanwhile.
+        thread::sleep(Duration::from_millis(300));
+        drop(hogs);
+        // The parent closes stdin once it has its response.
+        let _ = std::io::stdin().read_line(&mut line);
+    }
+
+    /// One `/metrics` sample value, by exact series name.
+    #[cfg(unix)]
+    fn metric(port: u16, name: &str) -> u64 {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing from /metrics: {text}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// Failed generations and admission rejections reach `/metrics`, each in
+    /// its own counter; successes reach neither.
+    #[cfg(unix)]
+    #[test]
+    fn failures_and_admission_rejections_are_counted() {
+        let harness = Task11HttpHarness::spawn("metrics-counters");
+        let port = harness.port();
+        let failed = "hipfire_requests_failed_total";
+        let rejected = "hipfire_admission_rejected_total";
+
+        // JSON error, stream rejected before commit, stream failing after it.
+        for (tag, stream, status) in [
+            ("t15-class-validation", false, 400),
+            ("t15-class-internal", true, 500),
+            ("t15-visible-token", true, 200),
+            ("t11-stop-text", false, 200),
+            ("t11-stop-text", true, 200),
+        ] {
+            let (got, _, _) = raw_chat_post(port, &harness.base_body(tag, stream));
+            assert_eq!(got, status, "{tag} stream={stream}");
+        }
+        assert_eq!(metric(port, failed), 3);
+        assert_eq!(metric(port, rejected), 0);
+
+        // Hold the only slot and fill the four-deep queue: the next request
+        // is refused by admission.
+        let held = harness.shared.admission.acquire().unwrap();
+        let queued: Vec<_> = (0..4)
+            .map(|_| {
+                let body = harness.base_body("t11-stop-text", false);
+                thread::spawn(move || raw_chat_post(port, &body).0)
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() < 5 {
+            assert!(Instant::now() < deadline, "queue never filled");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (status, head, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 503, "{head}");
+        drop(held);
+        for waiter in queued {
+            assert_eq!(waiter.join().unwrap(), 200);
+        }
+        assert_eq!(metric(port, rejected), 1);
+        assert_eq!(metric(port, failed), 3);
+    }
+
+    /// An image request queued for admission must not block the server: the
+    /// harness serves on one runtime thread, which a blocking wait would hold.
+    #[cfg(unix)]
+    #[test]
+    fn queued_image_request_does_not_block_the_server() {
+        let harness = Task11HttpHarness::spawn("images-admission");
+        let port = harness.port();
+        let held = harness.shared.admission.acquire().unwrap();
+        let image = thread::spawn(move || {
+            // `images` is refused only after admission, so this never
+            // reaches the daemon once it leaves the queue.
+            let payload = r#"{"prompt":"a red cube","images":["x"]}"#;
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            write!(
+                stream,
+                "POST /v1/images/generations HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+            .unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() < 2 {
+            assert!(Instant::now() < deadline, "image request never queued");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut health = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        health
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        health
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        let _ = health.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "/health stalled behind a queued image request: {response:?}"
+        );
+
+        drop(held);
+        let response = image.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400") && response.contains("not a field"),
+            "{response}"
+        );
+    }
+
+    /// One HTTP/1.1 response from a kept-alive connection: status and body,
+    /// de-chunked or by Content-Length. Fails if the response does not end.
+    #[cfg(unix)]
+    fn read_keepalive_response(
+        reader: &mut std::io::BufReader<std::net::TcpStream>,
+    ) -> (u16, Vec<u8>) {
+        use std::io::BufRead;
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("status line");
+        let status = line
+            .split_whitespace()
+            .nth(1)
+            .expect("status")
+            .parse()
+            .unwrap();
+        let (mut length, mut chunked) = (None, false);
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("header");
+            let header = line.trim().to_ascii_lowercase();
+            if header.is_empty() {
+                break;
+            }
+            if let Some(value) = header.strip_prefix("content-length:") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+            chunked |= header == "transfer-encoding: chunked";
+        }
+        let mut body = Vec::new();
+        if !chunked {
+            body.resize(length.expect("content-length"), 0);
+            reader.read_exact(&mut body).expect("body");
+            return (status, body);
+        }
+        loop {
+            line.clear();
+            reader
+                .read_line(&mut line)
+                .expect("chunk size (response never ended)");
+            let size = usize::from_str_radix(line.trim(), 16).expect("chunk size hex");
+            let mut chunk = vec![0; size + 2];
+            reader.read_exact(&mut chunk).expect("chunk");
+            if size == 0 {
+                return (status, body);
+            }
+            body.extend_from_slice(&chunk[..size]);
+        }
+    }
+
+    /// A client that keeps its connection gets complete, prompt responses to
+    /// a stream, then a non-stream, then a stream request on it; and a client
+    /// that closes as soon as it reads `[DONE]` does not hold the server up.
+    #[cfg(unix)]
+    #[test]
+    fn keepalive_connection_serves_stream_and_nonstream_in_turn() {
+        let harness = Task11HttpHarness::spawn("keepalive-reuse");
+        let port = harness.port();
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+        for is_stream in [true, false, true] {
+            let payload = harness.base_body("t11-stop-text", is_stream).to_string();
+            write!(
+                writer,
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                payload.len()
+            )
+            .unwrap();
+            let started = Instant::now();
+            let (status, body) = read_keepalive_response(&mut reader);
+            assert_eq!(status, 200, "stream={is_stream}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "stream={is_stream} took {:?}",
+                started.elapsed()
+            );
+            if is_stream {
+                let payloads = sse_payloads(&body);
+                assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+                assert!(payloads
+                    .iter()
+                    .any(|p| p.contains("hello from fake daemon")));
+            } else {
+                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(value["choices"][0]["finish_reason"], "stop");
+            }
+        }
+
+        // Close as soon as `[DONE]` arrives, like serve_harness and most SSE
+        // readers, before the chunked terminator.
+        let mut early = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        early
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let payload = harness.base_body("t11-stop-text", true).to_string();
+        write!(
+            early,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !String::from_utf8_lossy(&seen).contains("data: [DONE]") {
+            let n = early.read(&mut buf).expect("read until [DONE]");
+            assert!(n > 0, "closed before [DONE]");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        drop(early);
+        let (status, _, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
+        assert_eq!(status, 200);
+    }
+}

@@ -1,0 +1,1701 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Typed, immutable startup-policy resolution for rdna-compute.
+//!
+//! The native daemon installs a schema-validated process configuration before
+//! `Gpu::init()`. Dispatching hot paths access `self.flags.*` instead of
+//! parsing TOML or consulting ambient process state on every call.
+
+use hipfire_config::ProcessConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mb4Mode {
+    Pack1,
+    Pack2,
+    Pack4,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeatureFlags {
+    // ── Arch identity ──────────────────────────────────────────────
+    pub arch: String,
+
+    // ── GEMV tuning ────────────────────────────────────────────────
+    pub gemv_rows: Option<u32>,
+    pub gemv_dp4a_default_on: bool,
+    pub gemv_prefetch: Option<bool>,
+    pub gemv_prefetch_default_on: bool,
+    pub gfx942_lds_gemv: Option<bool>,
+    pub gfx942_lds_gemv_default_on: bool,
+    pub gemv_rows_default: u32,
+    pub gemv_dp4a: Option<bool>,
+    /// Override the gfx1151 temporal raw-buffer E8 U4 route. `None` selects
+    /// the accepted DeepSeek4 MQ2R route default while retaining portable
+    /// behavior for other models and architectures.
+    pub gfx1151_e8_buffer: Option<bool>,
+    /// gfx11 MMQ per-128 (X128) activation path (`HIPFIRE_GFX11_MMQ_X128`).
+    /// Default on gfx1100/gfx1151 (WT2 KLD +0.000186 <= +0.0005 gate passed);
+    /// `=0` restores the per-32 MMQ route. Other arches stay per-32.
+    pub gfx11_mmq_x128: Option<bool>,
+    /// iu4-direct MMQ prefill (W4A4, `HIPFIRE_IU4_PREFILL`,
+    /// `kernel.iu4_prefill`). Default ON for gfx1100/gfx1151 (K16 iu4 kernel)
+    /// and gfx1201 (K32 iu4 kernel, standalone `quantize_int4_mmq_ds128`
+    /// activations); `=0`/`false` keeps the incumbent Q8_1 MMQ (gfx11) /
+    /// fp8 (gfx1201) route. Other arches have no iu4 route and ignore it.
+    /// Quality cost ~+0.016 WT2-24 KLD on the MQ4-XT speed rung
+    /// (gfx1201: 0.048028 -> 0.063890).
+    pub iu4_prefill: Option<bool>,
+    /// Exact gfx1201 symmetric A4 prefill: builder-emitted `_b1` GEMM
+    /// (`HIPFIRE_G12_IU4_ISA`). Default on after byte-exact G3 and +7.04%
+    /// pp8192 G4; `=0` restores hipcc K1 when that route is selected.
+    pub g12_iu4_isa: bool,
+    /// Exact gfx1201 MQ4v2 A8 prefill (int8 per K128); opt-in, default off.
+    pub a8_prefill: bool,
+    /// Fuse A8 sidecar emission into the four activation producers (default on).
+    pub a8_fused_prod: bool,
+    /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
+    /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default on).
+    pub gfx11_iu4_gridspec: bool,
+    /// Use the 16-wave low-footprint IU4 full-tile entry on gfx1100
+    /// (`kernel.gfx11_iu4_shape`, default on). gfx1151 keeps its shipped
+    /// SET-only selection regardless of this setting.
+    pub gfx11_iu4_shape: bool,
+    /// Exploit MQ4V2's symmetric `zp = -8 * scale` contract by rebiasing
+    /// packed weight codes once and using signed-weight IU4 WMMA
+    /// (`kernel.gfx11_iu4_symfold`). Default on for symmetric gfx1100/gfx1151 only.
+    pub gfx11_iu4_symfold: bool,
+
+    // ── Quant / format toggles ────────────────────────────────────
+    pub hfq3_dp4a: Option<bool>,
+    pub hfq3_mmq: Option<bool>,
+    pub hfq4_mmq_rdna2: Option<bool>,
+    pub fp8_wmma: bool,
+    pub dot2_gemv: bool,
+    pub gcn5_wave64_hybrid: Option<bool>,
+    /// Radiowave experiment: pack two independent HFQ4 QKV rows into one
+    /// explicitly compiled wave64 on RDNA3. Default off until model-level
+    /// correctness and throughput gates promote it.
+    pub rdna3_hfq4_qkv_wave64: bool,
+    /// Radiowave experiment: split each gfx1100 QKVZA output row across two
+    /// lighter wave32s and join their partials through LDS.
+    pub rdna3_hfq4_qkvza_2wave: bool,
+    /// Radiowave experiment: package four independent gfx1100 QKVZA row
+    /// waves in one workgroup without changing per-row arithmetic.
+    pub rdna3_hfq4_qkvza_wavepack4: bool,
+    /// Stage the K=2048 QKVZA activation once per eight exact row waves in a
+    /// transposed LDS tile on gfx1100.
+    pub rdna3_hfq4_qkvza_ldsx8: bool,
+    /// Radiowave recovery of the exact gfx1100 autoresearch schedule: keep an
+    /// explicit row stride and spell out the five shuffle-reduction stages so
+    /// LLVM cannot re-form the reduction as a loop.
+    pub rdna3_hfq4_qkvza_reduce_chain: bool,
+    /// Radiowave experiment: port the gfx12 QKVZA float4 activation-hoist
+    /// schedule to gfx1100 while retaining one independent wave per row.
+    pub rdna3_hfq4_qkvza_hoist_x32: bool,
+    /// Compile the exact A3B decode shape with eight HFQ4 groups fixed at
+    /// compile time, deleting the general QKVZA loop and tail machinery.
+    /// Certified default on gfx1100; set
+    /// `HIPFIRE_RDNA3_HFQ4_QKVZA_K2048=0` to restore the general kernel.
+    pub rdna3_hfq4_qkvza_k2048: bool,
+    /// Stage one residual GEMV row's 32 activation values ahead of the
+    /// independent packed-weight loads. Certified default on exact gfx1100;
+    /// other RDNA3 targets remain explicit opt-in until separately measured.
+    pub rdna3_hfq4_residual_stage_x32: bool,
+    /// Combine the certified activation staging with a fixed eight-group
+    /// K=2048 loop on gfx1100. Opt-in until exact and tg128 gates promote it.
+    pub rdna3_hfq4_residual_k2048: bool,
+    /// Launch only the active half of the two-row shared-expert down grid.
+    /// The kernel maps row0 = blockIdx.x * 2; the legacy launcher submits M
+    /// workgroups, leaving the upper half to return immediately.
+    pub rdna3_hfq4_sigmoid_tight_grid: bool,
+    /// Compile the shared-expert sigmoid-scaled down kernel with gfx1100
+    /// temporal buffer-resource weight loads instead of global addressing.
+    /// Default-on for gfx1100; set `HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER=0`
+    /// to restore global addressing for comparison.
+    pub rdna3_hfq4_sigmoid_buffer: bool,
+    /// Schedule four shared-expert down rows per wave on gfx1100, reusing
+    /// each activation load across four independent weight streams.
+    pub rdna3_hfq4_sigmoid_rows4: bool,
+    /// Compile the exact Qwen3.5-35B LM-head shape (M=248320, K=2048) with
+    /// its eight HFQ4 groups fixed at compile time. gfx1100 experiment only.
+    pub rdna3_hfq4_lm_head_k2048: bool,
+    /// Compile the gfx1100 A3B MoE gate/up GEMV with its eight K groups fixed
+    /// at compile time. Opt-in until exact shadow and tg128 gates promote it.
+    pub rdna3_hfq4_moe_gate_up_k2048: bool,
+    pub mmq_override: Option<bool>,
+    /// Experimental PR #616 packed prefill for uniform MQ4 and MQ4V2.
+    pub packed_mq4_prefill: bool,
+    pub mmq_min_batch: Option<usize>,
+    pub fp16_disabled: bool,
+    pub fp16_layer_min: Option<usize>,
+    pub fp16_layer_max: Option<usize>,
+    pub wo_mmq: bool,
+    pub lm_head_wmma_disabled: bool,
+    pub lm_head_overwrite: bool,
+    /// Calibration-only override keeping native-BF16 teachers in BF16
+    /// (`HIPFIRE_CALIB_BF16=1`). Mirrors the `calib_force_bf16` snapshot
+    /// read so fresh `Gpu` code can take the flag from `self.flags`
+    /// instead of a process-global cache.
+    pub calib_force_bf16: bool,
+
+    // ── MMQ screening ─────────────────────────────────────────────
+    pub mmq_screen: bool,
+    pub mmq_screen_threshold: f32,
+    pub mmq_diag_quantize_only: bool,
+
+    // ── Kernel variant overrides ─────────────────────────────────
+    pub lloyd_mb4: Option<Mb4Mode>,
+    pub mq3_mb4: Option<Mb4Mode>,
+    pub hfq4g128_mmq: bool,
+    pub hfq3_mmq_layer_min: Option<usize>,
+    pub hfq3_mmq_layer_max: Option<usize>,
+    pub hfq4_mmq_gfx906_y64: bool,
+    pub gate_up_variant: Option<String>,
+    pub gate_up_nosync: bool,
+    /// gfx12 LDS-staged HFQ4-G256 residual/gate_up WMMA path. Reorders FP32
+    /// K accumulation across 8 waves (not bit-exact). Default OFF; opt in with
+    /// `HIPFIRE_HFQ4G256_LDSSTAGE=1`. Requires K % 512 == 0 at the launch site.
+    pub hfq4g256_ldsstage_wmma: bool,
+    /// RDNA3 QKVZA prefill route that keeps the large QKV/Z projections on
+    /// MMQ while sending the narrow beta/alpha tails through dot2.
+    /// Opt in with HIPFIRE_QKVZA_SPLIT_TAIL=1.
+    pub qkvza_split_tail: bool,
+    pub gfx942_gemv_v2: Option<bool>,
+    pub gfx942_gemv_v3: bool,
+    pub gfx942_rmsnorm_split: bool,
+    /// Reserve only the reduction scratch still used by the current fused
+    /// RMSNorm+MQ kernel. The historical K-float LDS cache was removed when
+    /// the prefetch schedule landed, but its launch reservation remained.
+    pub rmsnorm_mq_tight_lds: bool,
+    /// Radiowave experiment: split the K=2048 fused RMSNorm+MQ rotation over
+    /// eight resident wave32 workgroups on gfx1100. The workgroups retain the
+    /// baseline reduction order and rendezvous through persistent GPU scratch.
+    pub rdna3_rmsnorm_wavegrid: bool,
+    /// Radiowave experiment: replace the cross-workgroup rendezvous with one
+    /// exact reduction dispatch followed by eight independent rotate waves.
+    pub rdna3_rmsnorm_split: bool,
+    /// Compute the K=2048 RMS sum from each FWHT wave's prefetched float4
+    /// values, eliminating the baseline's second x load. Certified default on
+    /// gfx1100; set `HIPFIRE_RDNA3_RMSNORM_VECSUM=0` to restore the baseline.
+    pub rdna3_rmsnorm_vecsum: bool,
+    /// Radiowave experiment: stage the two shared MQ sign tables once in LDS
+    /// for the gfx1100 vecsum kernel instead of reloading them in eight waves.
+    pub rdna3_rmsnorm_sign_lds: bool,
+    /// Radiowave experiment: compile the deterministic MQ sign streams as
+    /// packed constants and apply them with FP32 sign-bit XORs.
+    pub rdna3_rmsnorm_sign_const: bool,
+    pub gfx942_mfma_prefill: Option<String>,
+    pub moe_grouped_i8: Option<bool>,
+    pub moe_grouped_i8_k8: bool,
+    pub moe_grouped_i8_k4: bool,
+    pub moe_grouped_i8_k4_gfx12: bool,
+    pub moe_grouped_m2: bool,
+    pub moe_grouped_4w: bool,
+    /// Radiowave experiment: fold four adjacent K=8 MoE down outputs per
+    /// thread with vector loads and independent exact accumulators.
+    pub moe_down_combine_vec4: bool,
+    pub moe_hfq6_i8: bool,
+    pub moe_hfq6_v2: bool,
+    // ── MoE prefill (Ship 4.2) ────────────────────────────────────
+    /// Grouped-GEMM MoE prefill gate (HIPFIRE_MOE_GROUPED_GEMM). Default ON.
+    pub moe_grouped_gemm: bool,
+    /// gfx1151 i8 MMQ opt-in for Paro grouped GEMM (HIPFIRE_MOE_PARO_I8).
+    /// None = arch-default (gfx1151 → true, else false).
+    pub moe_paro_i8: Option<bool>,
+    /// gfx1151 i8 MMQ k8 opt-in for Paro grouped GEMM (HIPFIRE_MOE_PARO_I8_K8).
+    /// None = arch-default (gfx1151 → true, else false).
+    pub moe_paro_i8_k8: Option<bool>,
+
+    // ── Graph / capture / deterministic ─────────────────────────────
+    pub graph_forward: Option<bool>,
+    pub graph_ar: bool,
+    pub graph_moe: bool,
+    pub force_blob_path: bool,
+    /// `HIPFIRE_RESIDUAL_KSPLIT_OFF=1` disables the exact-gfx1100 split-K LDS
+    /// residual tier (N<=16 DFlash verify) and restores the historical base
+    /// kernel on the policy path. Default OFF (tier live). Test harnesses use
+    /// this to force the base oracle now that the tier is capture-safe.
+    /// Disables BOTH the ksplit and ldsstage kernels.
+    pub residual_ksplit_off: bool,
+    /// `HIPFIRE_RESIDUAL_LDSSTAGE` selects the exact-gfx1100 N<=16 tier's
+    /// ldsstage kernel wherever K % 512 == 0. Certified default on exact
+    /// gfx1100; other arches default false; launchers remain exact-gfx1100-only. Set
+    /// `HIPFIRE_RESIDUAL_LDSSTAGE=0` to restore the split-K table path.
+    pub residual_ldsstage: bool,
+    /// `HIPFIRE_GATEUP_LDSSTAGE` selects the exact-gfx1100 N<=16 MQ4V2 gate_up
+    /// RAW-slab ldsstage on eligible eager HIP (1<=N<=16, K%512==0). Certified
+    /// default on exact gfx1100; other arches default false; launchers remain
+    /// exact-gfx1100-only. Capture/replay keep the historical base. Set
+    /// `HIPFIRE_GATEUP_LDSSTAGE=0` to restore the historical base symbol/block32.
+    pub gate_up_ldsstage: bool,
+    /// `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=0` opts out of the gfx1201 FP8-WMMA MQ4v2
+    /// gate_up prefill candidate (N=384, eager HIP only). Default ON on exact
+    /// gfx1201; `=1` forces it on other arches (launchers stay gfx1201-only).
+    pub gfx12_mq4v2_fp8_gateup: bool,
+    /// FP8-WMMA MQ4v2 residual (down/out-proj) prefill candidate. Default ON on
+    /// exact gfx1201; `=0` opts out.
+    pub gfx12_mq4v2_fp8_resid: bool,
+    /// FP8-WMMA MQ4v2 4-way QKVZA prefill candidate. Default ON on exact
+    /// gfx1201; `=0` opts out.
+    pub gfx12_mq4v2_fp8_qkvza: bool,
+    /// FP8-WMMA MQ4v2 3-way QKV (full-attention) prefill candidate. Default ON
+    /// on exact gfx1201; `=0` opts out.
+    pub gfx12_mq4v2_fp8_qkv: bool,
+    /// Staged-tile v2 selector for the four gfx1201 FP8-WMMA MQ4v2 prefill
+    /// routes (`HIPFIRE_GFX12_MQ4V2_FP8_V2`, `kernel.gfx12_mq4v2_fp8_v2`).
+    /// Default ON on exact gfx1201; `=0` selects the s2bt8/BT symbols.
+    /// N>=256 uses the `_v2_gfx1201` symbols (smaller batches keep s2bt8/BT).
+    /// The four family flags remain prerequisites; the activation prelude is
+    /// unchanged.
+    pub gfx12_mq4v2_fp8_v2: bool,
+    /// gfx1201 batched prefill GDN preamble fusion (slice P:
+    /// `HIPFIRE_GFX12_GDN_PRE_FUSED`, `kernel.gfx12_gdn_pre_fused`).
+    /// Default ON on exact gfx1201; `=0` restores the 3-launch sequence.
+    /// Fuses sigmoid+conv+qknorm into `gdn_pre_batched_gfx1201` on the
+    /// sequential dense prefill route. Byte-exact vs the 3-launch sequence;
+    /// any byte difference kills it.
+    pub gfx12_gdn_pre_fused: bool,
+    /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
+    /// Enabled by default on gfx1100/gfx1151/gfx1201; `HIPFIRE_GFX12_GDN_CHUNK_SCAN=0` opts out.
+    pub gfx12_gdn_chunk_scan: bool,
+    /// gfx1201 down-proj SwiGLU/FWHT + int4 quant fusion (slice 1:
+    /// `HIPFIRE_GFX12_SILU_QUANT_FUSED`, `kernel.gfx12_silu_quant_fused`).
+    /// Default ON on exact gfx1201; `=0` opts out to the standalone
+    /// `quantize_int4_mmq_ds128` launch for the down-proj input.
+    /// Bit-identical vs the silu+quantizer chain; any byte difference kills it.
+    pub gfx12_silu_quant_fused: bool,
+    /// gfx1201 RMSNorm/rotate/gated-norm + int4 quant fusions (slices 2-4:
+    /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`, `kernel.gfx12_producer_quant_fused`).
+    /// Default ON on exact gfx1201; `=0` opts out to the standalone
+    /// `quantize_int4_mmq_ds128` launch at each admitted site.
+    /// Bit-identical vs the producer+quantizer chain; any byte difference
+    /// kills it.
+    pub gfx12_producer_quant_fused: bool,
+    /// gfx1201 `_v2` RMSNorm and gated-norm IU4 producers (`HIPFIRE_G12_NORM`,
+    /// `kernel.g12_norm`). Default ON on exact gfx1201; `=0` restores the
+    /// incumbent `_gfx12` symbols. The RMSNorm twin batches its
+    /// sum-of-squares loads and forms RTN codes with one reciprocal per lane;
+    /// the gated-norm twin runs one wave per 256-group. Bit-identical outputs;
+    /// any byte difference kills it.
+    pub g12_norm: bool,
+    /// Decode norm grids (`HIPFIRE_G12_DEC_NORM`, `kernel.g12_dec_norm`).
+    /// Default ON on exact gfx1201 and exact gfx1151; `=0` restores the
+    /// single-workgroup launches. The f32 AWQ RMSNorm+FWHT runs K/256
+    /// workgroups (each redoes the row's reduction, rotates one group), the
+    /// out-of-place `rmsnorm_f32` n/256 workgroups per row, and the half-split
+    /// partial RoPE one workgroup per head. Bit-identical outputs; any byte
+    /// difference kills it.
+    pub g12_dec_norm: bool,
+    /// gfx1100 decode norm grids (`HIPFIRE_GFX1100_DEC_NORM`,
+    /// `kernel.gfx1100_dec_norm`). Default ON on exact gfx1100; `=0` restores
+    /// the single-workgroup launches. Same twins as `g12_dec_norm` built for
+    /// gfx1100: the f32 AWQ RMSNorm+FWHT runs K/256 workgroups and the
+    /// out-of-place `rmsnorm_f32` n/256 workgroups per row (RoPE is untouched:
+    /// gfx1100 decode fuses it into its FA prep). Bit-identical outputs; any
+    /// byte difference kills it.
+    pub gfx1100_dec_norm: bool,
+    /// gfx11 sigmoid/gated-norm + int4 quant fusions
+    /// (`HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`,
+    /// `kernel.gfx11_producer_quant_fused`). Default ON on gfx1100/gfx1151;
+    /// `=0` opts out to the standalone `quantize_int4_mmq_ds128` launch at
+    /// each admitted site. Bit-identical vs the producer+quantizer chain;
+    /// any byte difference kills it.
+    pub gfx11_producer_quant_fused: bool,
+    /// gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion
+    /// (`HIPFIRE_GFX12_FP8_STREAM`, `kernel.gfx12_fp8_stream`). Default OFF;
+    /// `=1` opts in on exact gfx1201. The `_mq4v2_fp8_gfx12` producer twins
+    /// emit byte-identical `prepare_mq4v2_fp8_x_f32` (scale_mode=1) outputs
+    /// for the qkvza/gate_up/qkv inputs, so the standalone
+    /// `pack_f32_to_fp8_mq4v2_gfx12` launch disappears at each admitted site.
+    /// Any byte difference kills it.
+    pub gfx12_fp8_stream: bool,
+    /// `HIPFIRE_GFX12_FA2_PREFILL=0` opts out of the gfx1201 GQA-fused FA2
+    /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
+    /// Default ON on exact gfx1201; `=1` forces it on other arches
+    /// (launchers stay gfx1201-only).
+    pub gfx12_fa2_prefill: bool,
+    /// gfx1201 packet-minimal Q128 FA2 body (`HIPFIRE_GFX12_FA_PACKET`,
+    /// `kernel.gfx12_fa_packet`). Default ON on exact gfx1201; `=0` opts out
+    /// to the route-N body. Exact stage-b arithmetic; any raw-O bit difference
+    /// kills it.
+    pub gfx12_fa_packet: bool,
+    /// Register-resident-Q wide gfx1201 FA2 prefill body
+    /// (`HIPFIRE_ATTN_QRESIDENT`, `kernel.attn_qresident`). Default ON on
+    /// exact gfx1201; `=0` opts out. Exact H24/KV4/D256 native-fp8-KV shapes only.
+    pub attn_qresident: bool,
+    /// Bit-exact reschedule of the Q-resident body
+    /// (`HIPFIRE_ATTN_QRESIDENT_V2`, `kernel.attn_qresident_v2`). Default ON
+    /// on exact gfx1201; `=0` restores the v1 Q-resident kernel. Only
+    /// consulted where `attn_qresident` selects the Q-resident route.
+    pub attn_qresident_v2: bool,
+    /// VerifyAttn (`HIPFIRE_VERIFY_ATTN`, `kernel.verify_attn`): the
+    /// GQA-shared split-K twin of the batched flash tile + reduce for
+    /// speculative-verify-sized batches (1..=32 rows, non-tree), on gfx1100
+    /// also of the multi-row R4/R8 Q8 tile, and on gfx1151 the
+    /// context-parallel twin of the single-slot WMMA flash prefill. Default ON
+    /// on exact gfx1201, gfx1100 and gfx1151; `=0` opts out to
+    /// `attention_flash_*_tile_batched`, `attention_flash_q8_0_rows{4,8}_d8`
+    /// and `attention_q8_0_flash_prefill_wmma`. Byte-identical output; any
+    /// byte difference kills it.
+    pub verify_attn: bool,
+    /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
+    /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
+    pub gfx12_fa_prep_fused: bool,
+    /// Emit preconverted fp8 Q for the v2 Q-resident attention twin.
+    /// `HIPFIRE_GFX12_FA_PREP_FP8Q=0` retains F32 Q.
+    pub gfx12_fa_prep_fp8q: bool,
+    /// Whole-chunk Q8/Q8 FA2 on exact gfx1100/gfx1151
+    /// (`HIPFIRE_GFX11_Q8_FA2_WIDE`, `kernel.gfx11_q8_fa2_wide`).
+    /// Default ON on exact gfx1100 and gfx1151 (whose FA2 twin dispatches
+    /// the heaviest q-tiles first); explicit false opts out. Requires the
+    /// master gfx11 FA2 flag. B64..8192, above-512 batches aligned to 512,
+    /// ctx64..32768.
+    pub gfx11_q8_fa2_wide: bool,
+    /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
+    /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
+    /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
+    /// (launchers stay on the gfx11 allowlist).
+    pub gfx11_fa2_prefill: bool,
+    pub gemm_dump: bool,
+    pub deterministic: bool,
+    pub mw16: bool,
+    pub q8_batched_legacy: bool,
+    /// Optional ABI-v3 CK runtime artifact. Resolved once at GPU startup;
+    /// absence or load/capability failure leaves native dispatch unchanged.
+    pub flash_attn_ck_lib: Option<String>,
+    /// Caller-owned CK staging workspace, allocated once at GPU startup.
+    pub flash_attn_ck_workspace_bytes: usize,
+    /// Fuse Gemma 4 Q8 prefill projections on exact gfx1100. This remains an
+    /// opt-in while the E-series path is validated across QKV-sharing shapes.
+    pub gemma4_q8_fused_prefill: bool,
+    /// Batch Gemma 4 main and PLE embedding lookup on validated gfx1100 and
+    /// gfx1201 paths. The `auto` policy remains independently disableable.
+    pub gemma4_batched_embedding_prefill: bool,
+    /// Batch the E-series per-layer-input model projection on exact gfx1100
+    /// instead of re-streaming the same matrix through one GEMV per row.
+    pub gemma4_ple_batched_prefill: bool,
+    /// Exact-arithmetic batched E-series PLE branch projections on validated
+    /// gfx1100/gfx1201 paths. Remains independently disableable.
+    pub gemma4_ple_branch_batched_prefill: bool,
+    /// Fuse the E-series PLE GELU and strided per-layer multiply on validated
+    /// gfx1100 and gfx1201 paths.
+    pub gemma4_ple_activation_fused_prefill: bool,
+    /// `HIPFIRE_DEEPSEEK4_Q8_WMMA=0` disables the Q8_0 dense WMMA prefill path
+    /// (forces the scalar chunked fallback). Consumed by
+    /// `gemm_q8_0_wmma_prefill_auto`.
+    pub deepseek4_q8_wmma_off: bool,
+    /// `HIPFIRE_DEEPSEEK4_Q8_4W=0` forces the single-warp 16×16 Q8_0 WMMA
+    /// kernel instead of the 4-warp 64×64 tile. Consumed by
+    /// `gemm_q8_0_wmma_prefill_auto`.
+    pub deepseek4_q8_4w_off: bool,
+    pub rope_interleaved_legacy: bool,
+    pub wo_wmma_variant: Option<String>,
+
+    // ── rocBLAS ────────────────────────────────────────────────────
+    pub rocblas_all_archs: bool,
+    pub rocblas_off: bool,
+    pub rocblas_min_batch: Option<usize>,
+    /// Batched-attention tile size (`HIPFIRE_ATTN_TILE_SIZE`). `None` = use the
+    /// 128 default. gfx1151 is the dev box, gfx1201 the deployment target, so
+    /// this must never be a baked-in `const` (spec §11).
+    pub attn_tile_size: Option<usize>,
+    /// Multi-slot attention flash-vs-scalar crossover in tokens
+    /// (`HIPFIRE_SLOTS_ATTN_CROSSOVER`). `None` = the per-arch default. Same
+    /// reasoning as `attn_tile_size`: gfx1151 is the dev box and gfx1201 the
+    /// deployment target, so this must be overridable rather than baked in.
+    pub slots_attn_crossover: Option<usize>,
+    /// Capture a pure-decode multi-slot step into a hipGraph and replay it
+    /// (`HIPFIRE_SLOTS_DECODE_GRAPH`). Off by default.
+    pub slots_decode_graph: bool,
+    /// Trace multi-slot session continuation matching (`HIPFIRE_SLOT_TRACE`).
+    /// Diagnostic only.
+    pub slot_trace: bool,
+
+    // ── Kernels.rs env reads ───────────────────────────────────────
+    pub lloyd_force_baseline: bool,
+    pub rdna2_variant: Option<u32>,
+
+    // ── Compiler.rs env reads ──────────────────────────────────────
+    /// `HIPFIRE_HIPCC_EXTRA_FLAGS`: global debug override for all module
+    /// compilations, not a way to ship flags. Production scheduler choices
+    /// belong in each module's Radiowave profile registration.
+    pub hipcc_extra_flags: String,
+
+    // ── Interpreter Phase 2a ───────────────────────────────────────
+    /// Force the discrete (un-fused) projection path where supported, for
+    /// fused-vs-unfused validation. Env: HIPFIRE_FORCE_UNFUSED=1. Single-GPU
+    /// decode projection fusions only (see Phase-2a spec §4b honest-scope).
+    pub force_unfused: bool,
+
+    // ── Speculative decode (DFlash/DDTree) ────────────────────────
+    /// DDTree tree-SWOR verify arm. **Default OFF** — linear chain wins on
+    /// every drafter measured (the DFlash drafter's independent per-position
+    /// marginals give a tree branch no joint to exploit). Opt in with the CLI
+    /// `--ddtree` flag (sets `HIPFIRE_DFLASH_TREE=1`). Tree-SWOR is still
+    /// distribution-exact at any temperature and lossless (== AR) at temp 0 —
+    /// it's just slower than chain — so the opt-in path stays correct.
+    pub dflash_tree: bool,
+    /// Override DDTree node budget (`HIPFIRE_DDTREE_BUDGET`). `None` → use the
+    /// per-call-site default (`DEFAULT_TREE_BUDGET = 8`).
+    pub ddtree_budget: Option<usize>,
+    /// Override DDTree per-position top-K breadth (`HIPFIRE_DDTREE_TOPK`).
+    /// `None` → use the per-call-site default (`DEFAULT_TREE_TOPK = 2`).
+    pub ddtree_topk: Option<usize>,
+    // D8: ddtree_verify_naive removed — SWOR is the only temp>0 verify path.
+    // The naive fallback required a ~37 MB/cycle full-logits D2H and is
+    // superseded by SWOR (distribution-exact, on-GPU). HIPFIRE_DDTREE_VERIFY
+    // env var is no longer parsed; setting it has no effect.
+    /// qwen35 ddtree tree-LA (linearized-ancestor) fast-tape path. **Default ON**;
+    /// opt out with `HIPFIRE_DDTREE_TREE_LA=0`.
+    pub ddtree_tree_la: bool,
+    /// qwen35 DFlash GPU softmax/nucleus fast path on the temp>0 sampled verify.
+    /// **Default ON**; opt out with `HIPFIRE_DFLASH_FAST_SAMPLE=0`.
+    pub dflash_fast_sample: bool,
+    /// qwen35 ddtree meta-verifier expansion cutoff (`HIPFIRE_DDTREE_LOGW_CUTOFF`).
+    /// Stores the positive X the user set (stop tree expansion when the next
+    /// candidate's cumulative logw < −X); `None`/0/unparseable → no cutoff.
+    /// Use [`FeatureFlags::ddtree_logw_cutoff_value`] for the resolved threshold.
+    pub ddtree_logw_cutoff: Option<f32>,
+    /// qwen35 DFlash Q8 WMMA lm_head in verify. **Default ON**; opt out with
+    /// `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` ∈ {0,false,off,no}.
+    pub dflash_q8_lmhead_wmma: bool,
+
+    /// Fold the 3 separate QKV `BiasAdd` launches (qwen2-family `attention_bias`)
+    /// into the per-row fused-QKV decode kernel's lane-0 store. Eliminates 3 tiny
+    /// overhead-dominated launches/layer. Env: HIPFIRE_FUSE_QKV_BIAS — default ON;
+    /// set `=0` to opt out (for bisection). NULL bias pointers are a kernel no-op,
+    /// so non-bias callers stay byte-identical regardless. Only fires for fused-QKV
+    /// keys whose dispatch arm reads the bias (see `qkv_bias_fold_supported`).
+    pub fuse_qkv_bias: bool,
+
+    /// Diagnostic: log each QKV-bias fold to stderr. Env:
+    /// HIPFIRE_FUSE_QKV_BIAS_DEBUG=1. Default off. Resolved once at init so the
+    /// default-on fold hot path takes no per-launch `env::var` lock.
+    pub fuse_qkv_bias_debug: bool,
+
+    // ── DFlash launch-fusion kill switches (prescaffold, all no-ops) ────
+    // Each `HIPFIRE_*_OFF=1` disables its slice's fast route and restores the
+    // pre-change path. All default OFF (fast routes live once slices land);
+    // nothing reads these fields yet — composers wire them in per slice.
+    /// S1: `HIPFIRE_DN_SNAPSHOT_BULK_OFF=1` restores the memcpy-loop snapshot.
+    pub dn_snapshot_bulk_off: bool,
+    /// S2: `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF=1` restores the row-copy loops.
+    pub hidden_scatter_fuse_off: bool,
+    /// S3: `HIPFIRE_MQ_F16_PROJECTION_OFF=1` restores F32 producers + convert.
+    pub mq_f16_projection_off: bool,
+    /// S4: `HIPFIRE_MQ_F16_RESIDUAL_OFF=1` restores F32 residual producers.
+    pub mq_f16_residual_off: bool,
+    /// S5: `HIPFIRE_GDN_PRE_FUSE_OFF=1` restores unfused GDN pre-kernels.
+    pub gdn_pre_fuse_off: bool,
+    /// S6: `HIPFIRE_FA_BATCH_FUSE_OFF=1` restores unbatched FA prep/KV writes.
+    pub fa_batch_fuse_off: bool,
+    /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings.
+    pub draft_collapse_off: bool,
+    /// S8: `HIPFIRE_DDTREE_TOPK_DIRECT_OFF=1` restores full-logits top-K.
+    pub ddtree_topk_direct_off: bool,
+    /// S9: `HIPFIRE_MQ_PROLOGUE_FUSE_OFF=1` restores producer+GEMM pairs.
+    pub mq_prologue_fuse_off: bool,
+    /// Railgun E0 / L6c: `HIPFIRE_GDN_REPLAY_ML_OFF=1` restores the per-layer
+    /// GDN replay launches (the gfx1201 two-launch multi-layer replay is
+    /// default-on there).
+    pub gdn_replay_ml_off: bool,
+    /// Railgun E0 / L6d: `HIPFIRE_SELECT_REGRID_OFF=1` restores the one-block-
+    /// per-row `topk_values_batched_f32` / `argmax_f32_batched` launches (the
+    /// gfx1201 multi-block re-grid is default-on there).
+    pub select_regrid_off: bool,
+    /// Railgun D8: `HIPFIRE_DN_SNAPSHOT_FLIP=1` opts exact gfx1201 into the
+    /// DFlash rollback without the restore copy: the GDN tape replay reads the
+    /// pre-verify state from the snapshot buffers and writes the live ones
+    /// (the snapshot stays the pre-window state). Default off.
+    pub dn_snapshot_flip: bool,
+}
+
+impl FeatureFlags {
+    pub fn from_process_config(arch: &str, config: &ProcessConfig) -> Self {
+        Self::from_lookup(arch, |name| config.legacy_value(name).ok_or(()))
+    }
+
+    pub fn from_active_config(arch: &str) -> Self {
+        Self::from_process_config(arch, hipfire_config::active_or_local_process_config())
+    }
+
+    fn from_lookup(arch: &str, value: impl Fn(&str) -> std::result::Result<String, ()>) -> Self {
+        let parse_bool = |name: &str| -> Option<bool> {
+            match value(name).ok().as_deref() {
+                Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") => Some(true),
+                Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") => {
+                    Some(false)
+                }
+                _ => None,
+            }
+        };
+
+        let parse_usize =
+            |name: &str| -> Option<usize> { value(name).ok().and_then(|s| s.parse().ok()) };
+
+        let parse_mb4 = |name: &str| -> Option<Mb4Mode> {
+            match value(name).ok().as_deref() {
+                Some("1") => Some(Mb4Mode::Pack1),
+                Some("2") => Some(Mb4Mode::Pack2),
+                Some("4") => Some(Mb4Mode::Pack4),
+                _ => None,
+            }
+        };
+
+        let is_gfx906 = arch == "gfx906";
+
+        let mmq_screen_default: bool = false;
+        let mmq_screen_threshold_default: f32 = if is_gfx906 { 0.50 } else { 0.10 };
+
+        let gemv_rows_default: u32 = match arch {
+            "gfx1100" | "gfx1101" | "gfx1102" => 1,
+            "gfx1030" | "gfx1031" => 1,
+            "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
+            _ => 2,
+        };
+
+        let mut hipcc_extra_flags = value("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
+        let mut append_hipcc_flag = |flag: &str| {
+            if !hipcc_extra_flags.is_empty() {
+                hipcc_extra_flags.push(' ');
+            }
+            hipcc_extra_flags.push_str(flag);
+        };
+        if arch == "gfx1100" {
+            match value("HIPFIRE_GFX11_WEIGHT_LOAD_POLICY").ok().as_deref() {
+                None | Some("") | Some("buffer") => {}
+                Some("global") => append_hipcc_flag("-DHIPFIRE_GFX11_WEIGHT_GLOBAL_LOADS=1"),
+                Some("flat-buffer") => {
+                    append_hipcc_flag("-DHIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN=1")
+                }
+                Some(other) => {
+                    eprintln!("unknown HIPFIRE_GFX11_WEIGHT_LOAD_POLICY={other:?}; using buffer")
+                }
+            }
+        }
+        if matches!(arch, "gfx1100" | "gfx1151") {
+            let candidates = match value("HIPFIRE_GFX11_A4_CANDIDATES").ok().as_deref() {
+                Some(candidate @ ("1" | "2" | "4" | "8")) => candidate.to_string(),
+                None | Some("") => "2".to_string(),
+                Some(other) => {
+                    eprintln!(
+                        "unknown HIPFIRE_GFX11_A4_CANDIDATES={other:?}; using default value 2"
+                    );
+                    "2".to_string()
+                }
+            };
+            append_hipcc_flag(&format!("-DIU4_A4_CANDIDATES={candidates}"));
+        }
+        if arch == "gfx1201" {
+            let policy_flag = match value("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY").ok().as_deref() {
+                None | Some("") | Some("rt") => None,
+                Some("global") => Some("-DHIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS=1"),
+                Some("ht") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=18"),
+                Some("nt-rt") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=20"),
+                Some("nt-ht") => Some("-DHIPFIRE_GFX12_WEIGHT_CPOL_AUX=22"),
+                Some(other) => {
+                    eprintln!("unknown HIPFIRE_GFX12_WEIGHT_LOAD_POLICY={other:?}; using rt");
+                    None
+                }
+            };
+            if let Some(flag) = policy_flag {
+                append_hipcc_flag(flag);
+            }
+            // gfx1201 IU4 producers search {5,7} like gfx11 (`HIPFIRE_G12_A4C2`,
+            // default on): the gfx1201 emit takes the one-pass producer-layout
+            // path in block_i4_128_quant.hip, bit-identical to this flag's
+            // reference search. `=0` restores RTN (d = amax/7).
+            if parse_bool("HIPFIRE_G12_A4C2").unwrap_or(true) {
+                append_hipcc_flag("-DIU4_A4_CANDIDATES=2");
+            }
+        }
+
+        Self {
+            arch: arch.to_string(),
+
+            // GEMV tuning
+            gemv_rows: value("HIPFIRE_GEMV_ROWS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|r| match r {
+                    1 | 2 | 4 | 8 => r,
+                    _ => 1,
+                }),
+            gemv_dp4a_default_on: is_gfx906,
+            gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
+            gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
+            gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
+            iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
+            g12_iu4_isa: parse_bool("HIPFIRE_G12_IU4_ISA").unwrap_or(true),
+            a8_prefill: parse_bool("HIPFIRE_A8_PREFILL").unwrap_or(false),
+            a8_fused_prod: parse_bool("HIPFIRE_A8_FUSED_PROD").unwrap_or(true),
+            gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
+            gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
+            gfx11_iu4_symfold: parse_bool("HIPFIRE_IU4_SYMFOLD").unwrap_or(true),
+            gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
+            gemv_prefetch_default_on: is_gfx906,
+            gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
+            gfx942_lds_gemv_default_on: false,
+            gemv_rows_default,
+
+            // Quant/format toggles
+            hfq3_dp4a: parse_bool("HIPFIRE_HFQ3_DP4A"),
+            hfq3_mmq: parse_bool("HIPFIRE_HFQ3_MMQ"),
+            hfq4_mmq_rdna2: parse_bool("HIPFIRE_HFQ4_MMQ_RDNA2"),
+            fp8_wmma: value("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1"),
+            dot2_gemv: value("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1"),
+            gcn5_wave64_hybrid: parse_bool("HIPFIRE_GCN5_WAVE64_HYBRID"),
+            rdna3_hfq4_qkv_wave64: value("HIPFIRE_RDNA3_HFQ4_QKV_WAVE64").as_deref() == Ok("1"),
+            rdna3_hfq4_qkvza_2wave: value("HIPFIRE_RDNA3_HFQ4_QKVZA_2WAVE").as_deref() == Ok("1"),
+            rdna3_hfq4_qkvza_wavepack4: value("HIPFIRE_RDNA3_HFQ4_QKVZA_WAVEPACK4").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_ldsx8: value("HIPFIRE_RDNA3_HFQ4_QKVZA_LDSX8").as_deref() == Ok("1"),
+            rdna3_hfq4_qkvza_reduce_chain: value("HIPFIRE_RDNA3_HFQ4_QKVZA_REDUCE_CHAIN")
+                .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_hoist_x32: value("HIPFIRE_RDNA3_HFQ4_QKVZA_HOIST_X32").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_qkvza_k2048: parse_bool("HIPFIRE_RDNA3_HFQ4_QKVZA_K2048")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_hfq4_residual_stage_x32: parse_bool("HIPFIRE_RDNA3_HFQ4_RESIDUAL_STAGE_X32")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_hfq4_residual_k2048: value("HIPFIRE_RDNA3_HFQ4_RESIDUAL_K2048").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_sigmoid_tight_grid: value("HIPFIRE_RDNA3_HFQ4_SIGMOID_TIGHT_GRID")
+                .as_deref()
+                == Ok("1"),
+            rdna3_hfq4_sigmoid_buffer: parse_bool("HIPFIRE_RDNA3_HFQ4_SIGMOID_BUFFER")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_hfq4_sigmoid_rows4: value("HIPFIRE_RDNA3_HFQ4_SIGMOID_ROWS4").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_lm_head_k2048: value("HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048").as_deref()
+                == Ok("1"),
+            rdna3_hfq4_moe_gate_up_k2048: value("HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048").as_deref()
+                == Ok("1"),
+            mmq_override: match value("HIPFIRE_MMQ").ok().as_deref() {
+                Some("0") | Some("off") => Some(false),
+                Some("1") | Some("on") => Some(true),
+                _ => None,
+            },
+            packed_mq4_prefill: value("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL").as_deref() == Ok("1"),
+            mmq_min_batch: parse_usize("HIPFIRE_MMQ_MIN_BATCH"),
+            fp16_disabled: value("HIPFIRE_FP16").map_or(false, |v| v == "0"),
+            fp16_layer_min: parse_usize("HIPFIRE_FP16_LAYER_MIN"),
+            fp16_layer_max: parse_usize("HIPFIRE_FP16_LAYER_MAX"),
+            wo_mmq: value("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
+            lm_head_wmma_disabled: value("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0"),
+            lm_head_overwrite: value("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
+            calib_force_bf16: value("HIPFIRE_CALIB_BF16").as_deref() == Ok("1"),
+
+            // MMQ screening
+            mmq_screen: value("HIPFIRE_MMQ_SCREEN")
+                .ok()
+                .map(|v| v == "1")
+                .unwrap_or(mmq_screen_default),
+            mmq_screen_threshold: value("HIPFIRE_MMQ_SCREEN_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(mmq_screen_threshold_default),
+            mmq_diag_quantize_only: value("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref()
+                == Some("1"),
+
+            // Kernel variant overrides
+            lloyd_mb4: parse_mb4("HIPFIRE_LLOYD_MB4"),
+            mq3_mb4: parse_mb4("HIPFIRE_MQ3_MB4"),
+            hfq4g128_mmq: value("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0"),
+            hfq3_mmq_layer_min: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MIN"),
+            hfq3_mmq_layer_max: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MAX"),
+            hfq4_mmq_gfx906_y64: value("HIPFIRE_HFQ4_MMQ_GFX906_Y64").map_or(false, |v| v == "1"),
+            gate_up_variant: value("HIPFIRE_GATE_UP_VARIANT").ok(),
+            gate_up_nosync: value("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
+            hfq4g256_ldsstage_wmma: value("HIPFIRE_HFQ4G256_LDSSTAGE").as_deref() == Ok("1"),
+            qkvza_split_tail: parse_bool("HIPFIRE_QKVZA_SPLIT_TAIL").unwrap_or(false),
+            gfx942_gemv_v2: parse_bool("HIPFIRE_GFX942_GEMV_V2"),
+            gfx942_gemv_v3: value("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
+            gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
+                && value("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
+            rmsnorm_mq_tight_lds: value("HIPFIRE_RMSNORM_MQ_TIGHT_LDS").as_deref() == Ok("1"),
+            rdna3_rmsnorm_wavegrid: value("HIPFIRE_RDNA3_RMSNORM_WAVEGRID").as_deref() == Ok("1"),
+            rdna3_rmsnorm_split: value("HIPFIRE_RDNA3_RMSNORM_SPLIT").as_deref() == Ok("1"),
+            rdna3_rmsnorm_vecsum: parse_bool("HIPFIRE_RDNA3_RMSNORM_VECSUM")
+                .unwrap_or(arch == "gfx1100"),
+            rdna3_rmsnorm_sign_lds: value("HIPFIRE_RDNA3_RMSNORM_SIGN_LDS").as_deref() == Ok("1"),
+            rdna3_rmsnorm_sign_const: value("HIPFIRE_RDNA3_RMSNORM_SIGN_CONST").as_deref()
+                == Ok("1"),
+            gfx942_mfma_prefill: value("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
+            moe_grouped_i8: match value("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
+            moe_grouped_i8_k8: value("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1"),
+            moe_grouped_i8_k4: value("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() == Ok("1"),
+            moe_grouped_i8_k4_gfx12: value("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref() == Ok("1"),
+            moe_grouped_m2: value("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1"),
+            moe_grouped_4w: value("HIPFIRE_MOE_GROUPED_4W").as_deref() == Ok("1"),
+            moe_down_combine_vec4: value("HIPFIRE_MOE_DOWN_COMBINE_VEC4").as_deref() == Ok("1"),
+            moe_hfq6_i8: value("HIPFIRE_MOE_HFQ6_I8").as_deref() == Ok("1"),
+            moe_hfq6_v2: value("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
+            // MoE prefill (Ship 4.2)
+            moe_grouped_gemm: match value("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() {
+                Some("0") | Some("off") => false,
+                _ => true,
+            },
+            moe_paro_i8: parse_bool("HIPFIRE_MOE_PARO_I8"),
+            moe_paro_i8_k8: parse_bool("HIPFIRE_MOE_PARO_I8_K8"),
+
+            // Graph / capture / deterministic
+            graph_forward: parse_bool("HIPFIRE_GRAPH"),
+            graph_ar: value("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"),
+            graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
+            force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
+            residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
+            residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
+            gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
+            gfx12_mq4v2_fp8_gateup: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_resid: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_RESID")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_qkvza: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKVZA")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_v2: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_V2")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_gdn_pre_fused: parse_bool("HIPFIRE_GFX12_GDN_PRE_FUSED")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_gdn_chunk_scan: parse_bool("HIPFIRE_GFX12_GDN_CHUNK_SCAN")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
+            gfx12_silu_quant_fused: parse_bool("HIPFIRE_GFX12_SILU_QUANT_FUSED")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
+                .unwrap_or(arch == "gfx1201"),
+            g12_norm: parse_bool("HIPFIRE_G12_NORM").unwrap_or(arch == "gfx1201"),
+            g12_dec_norm: parse_bool("HIPFIRE_G12_DEC_NORM")
+                .unwrap_or(matches!(arch, "gfx1201" | "gfx1151")),
+            gfx1100_dec_norm: parse_bool("HIPFIRE_GFX1100_DEC_NORM").unwrap_or(arch == "gfx1100"),
+            gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
+            gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_fa_packet: parse_bool("HIPFIRE_GFX12_FA_PACKET")
+                .unwrap_or(arch == "gfx1201"),
+            attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT")
+                .unwrap_or(arch == "gfx1201"),
+            attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2")
+                .unwrap_or(arch == "gfx1201"),
+            verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN")
+                .unwrap_or(matches!(arch, "gfx1201" | "gfx1100" | "gfx1151")),
+            gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
+                .unwrap_or(arch == "gfx1201"),
+            gfx11_q8_fa2_wide: parse_bool("HIPFIRE_GFX11_Q8_FA2_WIDE")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
+            gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
+            gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
+            deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
+            mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
+            q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
+            flash_attn_ck_lib: value("HIPFIRE_FLASH_ATTN_CK_LIB")
+                .ok()
+                .filter(|path| !path.is_empty()),
+            flash_attn_ck_workspace_bytes: value("HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES")
+                .ok()
+                .and_then(|bytes| bytes.parse().ok())
+                .unwrap_or(0),
+            gemma4_q8_fused_prefill: parse_bool("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL").unwrap_or(false),
+            gemma4_batched_embedding_prefill: parse_bool(
+                "HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL",
+            )
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
+            gemma4_ple_batched_prefill: parse_bool("HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL")
+                .unwrap_or(false),
+            gemma4_ple_branch_batched_prefill: parse_bool(
+                "HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL",
+            )
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
+            gemma4_ple_activation_fused_prefill: parse_bool(
+                "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
+            )
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
+            deepseek4_q8_wmma_off: value("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
+            deepseek4_q8_4w_off: value("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
+            rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref()
+                == Some("1"),
+            wo_wmma_variant: value("HIPFIRE_WO_WMMA_VARIANT").ok(),
+
+            // rocBLAS
+            rocblas_all_archs: value("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1"),
+            rocblas_off: value("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1"),
+            rocblas_min_batch: parse_usize("HIPFIRE_ROCBLAS_MIN_BATCH"),
+            attn_tile_size: parse_usize("HIPFIRE_ATTN_TILE_SIZE"),
+            slots_attn_crossover: parse_usize("HIPFIRE_SLOTS_ATTN_CROSSOVER"),
+            slots_decode_graph: value("HIPFIRE_SLOTS_DECODE_GRAPH").ok().as_deref() == Some("1"),
+            slot_trace: value("HIPFIRE_SLOT_TRACE").ok().as_deref() == Some("1"),
+
+            // Kernels.rs
+            lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref()
+                == Some("1"),
+            rdna2_variant: value("HIPFIRE_RDNA2_VARIANT")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok()),
+
+            // Compiler.rs
+            hipcc_extra_flags,
+
+            // Interpreter Phase 2a
+            force_unfused: value("HIPFIRE_FORCE_UNFUSED")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+
+            // Speculative decode (DFlash/DDTree). DEFAULT OFF (chain): ddtree
+            // tree-verify loses to linear chain on every drafter measured
+            // (DeltaNet + non-DeltaNet qwen3-8b/Bielik) because the DFlash
+            // drafter emits independent per-position marginals — a tree branch
+            // has no joint to exploit. Opt in with the CLI `--ddtree` flag (sets
+            // HIPFIRE_DFLASH_TREE=1).
+            dflash_tree: value("HIPFIRE_DFLASH_TREE").as_deref() == Ok("1"),
+            ddtree_budget: parse_usize("HIPFIRE_DDTREE_BUDGET").filter(|&b| b > 0),
+            ddtree_topk: parse_usize("HIPFIRE_DDTREE_TOPK").filter(|&k| k >= 1),
+            // D8: ddtree_verify_naive removed; HIPFIRE_DDTREE_VERIFY env is no-op.
+            ddtree_tree_la: value("HIPFIRE_DDTREE_TREE_LA").as_deref() != Ok("0"),
+            dflash_fast_sample: value("HIPFIRE_DFLASH_FAST_SAMPLE").as_deref() != Ok("0"),
+            ddtree_logw_cutoff: value("HIPFIRE_DDTREE_LOGW_CUTOFF")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|&x| x > 0.0),
+            dflash_q8_lmhead_wmma: match value("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
+                Ok(v) => {
+                    let v = v.trim().to_ascii_lowercase();
+                    !(v == "0" || v == "false" || v == "off" || v == "no")
+                }
+                Err(_) => true,
+            },
+
+            // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
+            fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
+            fuse_qkv_bias_debug: value("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
+
+            // DFlash launch-fusion kill switches: `_OFF=1` disables, all no-ops.
+            dn_snapshot_bulk_off: value("HIPFIRE_DN_SNAPSHOT_BULK_OFF").ok().as_deref()
+                == Some("1"),
+            hidden_scatter_fuse_off: value("HIPFIRE_HIDDEN_SCATTER_FUSE_OFF").ok().as_deref()
+                == Some("1"),
+            mq_f16_projection_off: value("HIPFIRE_MQ_F16_PROJECTION_OFF").ok().as_deref()
+                == Some("1"),
+            mq_f16_residual_off: value("HIPFIRE_MQ_F16_RESIDUAL_OFF").ok().as_deref() == Some("1"),
+            gdn_pre_fuse_off: value("HIPFIRE_GDN_PRE_FUSE_OFF").ok().as_deref() == Some("1"),
+            fa_batch_fuse_off: value("HIPFIRE_FA_BATCH_FUSE_OFF").ok().as_deref() == Some("1"),
+            draft_collapse_off: value("HIPFIRE_DRAFT_COLLAPSE_OFF").ok().as_deref() == Some("1"),
+            ddtree_topk_direct_off: value("HIPFIRE_DDTREE_TOPK_DIRECT_OFF").ok().as_deref()
+                == Some("1"),
+            mq_prologue_fuse_off: value("HIPFIRE_MQ_PROLOGUE_FUSE_OFF").ok().as_deref()
+                == Some("1"),
+            gdn_replay_ml_off: value("HIPFIRE_GDN_REPLAY_ML_OFF").ok().as_deref() == Some("1"),
+            select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
+            dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() == Some("1"),
+        }
+    }
+
+    // ── Methods replacing free functions ─────────────────────────────
+
+    pub fn gemv_dp4a_enabled(&self) -> bool {
+        self.gemv_dp4a.unwrap_or(self.gemv_dp4a_default_on)
+    }
+
+    /// Resolved ddtree meta-verifier expansion threshold: `−X` for a user-set
+    /// positive `X` (stop expanding when cumulative logw drops below it), else
+    /// `f32::NEG_INFINITY` (expand to the full budget).
+    pub fn ddtree_logw_cutoff_value(&self) -> f32 {
+        match self.ddtree_logw_cutoff {
+            Some(x) => -x,
+            None => f32::NEG_INFINITY,
+        }
+    }
+
+    pub fn gemv_prefetch_enabled(&self) -> bool {
+        self.gemv_prefetch.unwrap_or(self.gemv_prefetch_default_on)
+    }
+
+    pub fn gfx942_lds_gemv_enabled(&self) -> bool {
+        self.gfx942_lds_gemv
+            .unwrap_or(self.gfx942_lds_gemv_default_on)
+    }
+
+    /// Resolved gfx11 MMQ X128 route: env override, else default on
+    /// gfx1100/gfx1151, per-32 elsewhere.
+    pub fn gfx11_mmq_x128_enabled(&self) -> bool {
+        self.gfx11_mmq_x128
+            .unwrap_or(matches!(self.arch.as_str(), "gfx1100" | "gfx1151"))
+    }
+
+    /// Resolved iu4-direct MMQ route: on unless explicitly disabled, and only
+    /// on exact gfx1100/gfx1151 (K16 kernel) or gfx1201 (K32 kernel).
+    /// `=0`/other arches keep the incumbent.
+    pub fn iu4_prefill_enabled(&self) -> bool {
+        self.iu4_prefill.unwrap_or(true)
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+    }
+
+    /// A8 replaces the gfx1201 FP8 projection route only when explicitly selected.
+    pub fn a8_prefill_enabled(&self) -> bool {
+        self.a8_prefill && self.arch == "gfx1201"
+    }
+
+    /// Producer-emitted IU4 sidecar route on gfx1100/gfx1151 + IU4 opt-in.
+    /// When live (and eager + batch/K admission), RMSNorm/FWHT and
+    /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
+    /// keep standalone `quantize_int4_mmq_ds128`.
+    pub fn iu4_producer_sidecar_enabled(&self) -> bool {
+        self.iu4_prefill.unwrap_or(true)
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+    }
+    /// True only on exact gfx1201 with the opt-in set. The producer emits
+    /// the shared `block_i4_128` recipe, so output is bit-identical to the
+    /// standalone `quantize_int4_mmq_ds128` chain on the same f32 row.
+    pub fn gfx12_silu_quant_fused_enabled(&self) -> bool {
+        self.gfx12_silu_quant_fused && self.arch == "gfx1201"
+    }
+    /// True only on exact gfx1201 with the opt-in set. The `_gfx12`
+    /// RMSNorm/rotate/gated-norm producers emit the shared `block_i4_128`
+    /// recipe, so output is bit-identical to the standalone
+    /// `quantize_int4_mmq_ds128` chain on the same f32 row.
+    pub fn gfx12_producer_quant_fused_enabled(&self) -> bool {
+        self.gfx12_producer_quant_fused && self.arch == "gfx1201"
+    }
+    /// True only on exact gfx1201 with `HIPFIRE_G12_NORM` on: the
+    /// slices-2/4 producers launch their bit-identical `_v2` twins.
+    pub fn g12_norm_enabled(&self) -> bool {
+        self.g12_norm && self.arch == "gfx1201"
+    }
+    /// True only on exact gfx1201 or exact gfx1151 with `HIPFIRE_G12_DEC_NORM`
+    /// on: the decode RMSNorm+FWHT, final RMSNorm and RoPE launch their
+    /// bit-identical multi-workgroup twins.
+    pub fn g12_dec_norm_enabled(&self) -> bool {
+        self.g12_dec_norm && matches!(self.arch.as_str(), "gfx1201" | "gfx1151")
+    }
+    /// True only on exact gfx1100 with `HIPFIRE_GFX1100_DEC_NORM` on: the
+    /// decode RMSNorm+FWHT and final RMSNorm launch their bit-identical
+    /// multi-workgroup twins.
+    pub fn gfx1100_dec_norm_enabled(&self) -> bool {
+        self.gfx1100_dec_norm && self.arch == "gfx1100"
+    }
+    /// The decode RMSNorm+FWHT and final RMSNorm run as multi-workgroup
+    /// grids: exact gfx1201 or gfx1151 (`g12_dec_norm`) or exact gfx1100
+    /// (`gfx1100_dec_norm`).
+    pub fn dec_norm_grids_enabled(&self) -> bool {
+        self.g12_dec_norm_enabled() || self.gfx1100_dec_norm_enabled()
+    }
+    /// True only on gfx1100/gfx1151 with the opt-in set. The `_gfx11`
+    /// sigmoid/gated-norm producers emit the shared `block_i4_128` recipe,
+    /// so output is bit-identical to the standalone
+    /// `quantize_int4_mmq_ds128` chain on the same f32 row.
+    pub fn gfx11_producer_quant_fused_enabled(&self) -> bool {
+        self.gfx11_producer_quant_fused && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+    }
+    /// True only on exact gfx1201 with the opt-in set. The `_mq4v2_fp8_gfx12`
+    /// RMSNorm/rotate producers emit byte-identical standalone-pack outputs,
+    /// so the fused route is exact on finite rows.
+    pub fn gfx12_fp8_stream_enabled(&self) -> bool {
+        self.gfx12_fp8_stream && self.arch == "gfx1201"
+    }
+
+    pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
+        let lo = self.hfq3_mmq_layer_min;
+        let hi = self.hfq3_mmq_layer_max;
+        if lo.is_none() && hi.is_none() {
+            return true;
+        }
+        let layer = super::dispatch::MMQ_CURRENT_LAYER.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(lo) = lo {
+            if layer < lo {
+                return false;
+            }
+        }
+        if let Some(hi) = hi {
+            if layer > hi {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn fp16_disabled_for_current_layer(&self) -> bool {
+        if self.fp16_disabled {
+            return true;
+        }
+        let lo = self.fp16_layer_min;
+        let hi = self.fp16_layer_max;
+        if lo.is_none() && hi.is_none() {
+            return false;
+        }
+        let layer = super::dispatch::MMQ_CURRENT_LAYER.load(std::sync::atomic::Ordering::Relaxed);
+        let above_min = lo.map(|m| layer >= m).unwrap_or(true);
+        let below_max = hi.map(|m| layer <= m).unwrap_or(true);
+        above_min && below_max
+    }
+
+    pub fn hfq4_mmq_gfx906_y64_enabled(&self) -> bool {
+        self.hfq4_mmq_gfx906_y64
+    }
+
+    /// Test-only constructor: uses defaults for the given arch.
+    /// Provides deterministic FeatureFlags for unit tests regardless of the
+    /// developer's env-var configuration.
+    #[doc(hidden)]
+    pub fn for_test(arch: &str) -> Self {
+        let is_gfx906 = arch == "gfx906";
+
+        let gemv_rows_default: u32 = match arch {
+            "gfx1100" | "gfx1101" | "gfx1102" => 1,
+            "gfx1030" | "gfx1031" => 1,
+            "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
+            _ => 2,
+        };
+
+        Self {
+            arch: arch.to_string(),
+            gemv_rows: None,
+            gemv_dp4a_default_on: is_gfx906,
+            gemv_dp4a: None,
+            gfx1151_e8_buffer: None,
+            gfx11_mmq_x128: None,
+            // Deterministic unit-test baseline: the iu4 route stays off here
+            // even though the process default is on.
+            iu4_prefill: Some(false),
+            g12_iu4_isa: false,
+            a8_prefill: false,
+            a8_fused_prod: false,
+            gfx11_iu4_gridspec: false,
+            gfx11_iu4_shape: false,
+            gfx11_iu4_symfold: false,
+            gemv_prefetch: None,
+            gemv_prefetch_default_on: is_gfx906,
+            gfx942_lds_gemv: None,
+            gfx942_lds_gemv_default_on: false,
+            gemv_rows_default,
+            hfq3_dp4a: None,
+            hfq3_mmq: None,
+            hfq4_mmq_rdna2: None,
+            fp8_wmma: false,
+            dot2_gemv: false,
+            gcn5_wave64_hybrid: None,
+            rdna3_hfq4_qkv_wave64: false,
+            rdna3_hfq4_qkvza_2wave: false,
+            rdna3_hfq4_qkvza_wavepack4: false,
+            rdna3_hfq4_qkvza_ldsx8: false,
+            rdna3_hfq4_qkvza_reduce_chain: false,
+            rdna3_hfq4_qkvza_hoist_x32: false,
+            rdna3_hfq4_qkvza_k2048: false,
+            rdna3_hfq4_residual_stage_x32: false,
+            rdna3_hfq4_residual_k2048: false,
+            rdna3_hfq4_sigmoid_tight_grid: false,
+            rdna3_hfq4_sigmoid_buffer: false,
+            rdna3_hfq4_sigmoid_rows4: false,
+            rdna3_hfq4_lm_head_k2048: false,
+            rdna3_hfq4_moe_gate_up_k2048: false,
+            mmq_override: None,
+            packed_mq4_prefill: false,
+            mmq_min_batch: None,
+            fp16_disabled: false,
+            fp16_layer_min: None,
+            fp16_layer_max: None,
+            wo_mmq: false,
+            lm_head_wmma_disabled: false,
+            lm_head_overwrite: false,
+            calib_force_bf16: false,
+            mmq_screen: false,
+            mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
+            mmq_diag_quantize_only: false,
+            lloyd_mb4: None,
+            mq3_mb4: None,
+            hfq4g128_mmq: true,
+            hfq3_mmq_layer_min: None,
+            hfq3_mmq_layer_max: None,
+            hfq4_mmq_gfx906_y64: false,
+            gate_up_variant: None,
+            gate_up_nosync: false,
+            hfq4g256_ldsstage_wmma: false,
+            qkvza_split_tail: false,
+            gfx942_gemv_v2: None,
+            gfx942_gemv_v3: false,
+            gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),
+            rmsnorm_mq_tight_lds: false,
+            rdna3_rmsnorm_wavegrid: false,
+            rdna3_rmsnorm_split: false,
+            rdna3_rmsnorm_vecsum: false,
+            rdna3_rmsnorm_sign_lds: false,
+            rdna3_rmsnorm_sign_const: false,
+            gfx942_mfma_prefill: None,
+            moe_grouped_i8: None,
+            moe_grouped_i8_k8: false,
+            moe_grouped_i8_k4: false,
+            moe_grouped_i8_k4_gfx12: false,
+            moe_grouped_m2: false,
+            moe_grouped_4w: false,
+            moe_down_combine_vec4: false,
+            moe_hfq6_i8: false,
+            moe_hfq6_v2: false,
+            moe_grouped_gemm: true,
+            moe_paro_i8: None,
+            moe_paro_i8_k8: None,
+            graph_forward: None,
+            graph_ar: true,
+            graph_moe: true,
+            force_blob_path: false,
+            residual_ksplit_off: false,
+            gfx12_gdn_pre_fused: false,
+            gfx12_gdn_chunk_scan: false,
+            gfx12_silu_quant_fused: false,
+            gfx12_producer_quant_fused: false,
+            g12_norm: false,
+            g12_dec_norm: false,
+            gfx1100_dec_norm: false,
+            gfx11_producer_quant_fused: false,
+            gfx12_fp8_stream: false,
+            residual_ldsstage: false,
+            gate_up_ldsstage: false,
+            gfx12_mq4v2_fp8_gateup: false,
+            gfx12_mq4v2_fp8_resid: false,
+            gfx12_mq4v2_fp8_qkvza: false,
+            gfx12_mq4v2_fp8_qkv: false,
+            gfx12_mq4v2_fp8_v2: false,
+            gfx12_fa2_prefill: false,
+            gfx12_fa_packet: false,
+            attn_qresident: false,
+            attn_qresident_v2: false,
+            verify_attn: false,
+            gfx12_fa_prep_fused: false,
+            gfx12_fa_prep_fp8q: false,
+            gfx11_q8_fa2_wide: false,
+            gfx11_fa2_prefill: false,
+            gemm_dump: false,
+            deterministic: false,
+            mw16: false,
+            q8_batched_legacy: false,
+            flash_attn_ck_lib: None,
+            flash_attn_ck_workspace_bytes: 0,
+            gemma4_q8_fused_prefill: false,
+            gemma4_batched_embedding_prefill: false,
+            gemma4_ple_batched_prefill: false,
+            gemma4_ple_branch_batched_prefill: false,
+            gemma4_ple_activation_fused_prefill: false,
+            deepseek4_q8_wmma_off: false,
+            deepseek4_q8_4w_off: false,
+            rope_interleaved_legacy: false,
+            wo_wmma_variant: None,
+            rocblas_all_archs: false,
+            rocblas_off: false,
+            rocblas_min_batch: None,
+            attn_tile_size: None,
+            slots_attn_crossover: None,
+            slots_decode_graph: false,
+            slot_trace: false,
+            lloyd_force_baseline: false,
+            rdna2_variant: None,
+            hipcc_extra_flags: String::new(),
+            force_unfused: false,
+            dflash_tree: true,
+            ddtree_budget: None,
+            ddtree_topk: None,
+            // D8: ddtree_verify_naive removed.
+            ddtree_tree_la: true,
+            dflash_fast_sample: true,
+            ddtree_logw_cutoff: None,
+            dflash_q8_lmhead_wmma: true,
+            fuse_qkv_bias: true,
+            fuse_qkv_bias_debug: false,
+            dn_snapshot_bulk_off: false,
+            hidden_scatter_fuse_off: false,
+            mq_f16_projection_off: false,
+            mq_f16_residual_off: false,
+            gdn_pre_fuse_off: false,
+            fa_batch_fuse_off: false,
+            draft_collapse_off: false,
+            ddtree_topk_direct_off: false,
+            mq_prologue_fuse_off: false,
+            gdn_replay_ml_off: false,
+            select_regrid_off: false,
+            dn_snapshot_flip: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    #[test]
+    fn force_unfused_defaults_false_in_test_ctor() {
+        let f = FeatureFlags::for_test("gfx1151");
+        assert!(!f.force_unfused);
+    }
+
+    #[test]
+    fn fuse_qkv_bias_defaults_on_in_test_ctor() {
+        let f = FeatureFlags::for_test("gfx1151");
+        assert!(f.fuse_qkv_bias);
+    }
+
+    #[test]
+    fn gfx12_mq4v2_fp8_defaults_on_gfx1201_with_opt_out() {
+        // Default process policy: all four FP8 prefill flags admit on exact
+        // gfx1201 (chunk-512 path); explicit `=0` restores the F16 route.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_mq4v2_fp8_gateup);
+        assert!(gfx1201.gfx12_mq4v2_fp8_resid);
+        assert!(gfx1201.gfx12_mq4v2_fp8_qkvza);
+        assert!(gfx1201.gfx12_mq4v2_fp8_qkv);
+
+        let mut layer = ConfigLayer::default();
+        for key in [
+            "kernel.gfx12_mq4v2_fp8_gateup",
+            "kernel.gfx12_mq4v2_fp8_resid",
+            "kernel.gfx12_mq4v2_fp8_qkvza",
+            "kernel.gfx12_mq4v2_fp8_qkv",
+        ] {
+            layer.set_cli(key, "false").unwrap();
+        }
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out.gfx12_mq4v2_fp8_gateup);
+        assert!(!opted_out.gfx12_mq4v2_fp8_resid);
+        assert!(!opted_out.gfx12_mq4v2_fp8_qkvza);
+        assert!(!opted_out.gfx12_mq4v2_fp8_qkv);
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        let test_flags = FeatureFlags::for_test("gfx1201");
+        assert!(!test_flags.gfx12_mq4v2_fp8_gateup);
+        assert!(!test_flags.gfx12_mq4v2_fp8_resid);
+        assert!(!test_flags.gfx12_mq4v2_fp8_qkvza);
+        assert!(!test_flags.gfx12_mq4v2_fp8_qkv);
+    }
+    #[test]
+    fn gfx12_mq4v2_fp8_v2_and_gdn_pre_fused_default_on_gfx1201_with_opt_out() {
+        // Default process policy: staged-tile v2 and the GDN preamble fusion
+        // admit on exact gfx1201; explicit `=0` restores the prior route.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_mq4v2_fp8_v2);
+        assert!(gfx1201.gfx12_gdn_pre_fused);
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_mq4v2_fp8_v2, "arch={arch}");
+            assert!(!flags.gfx12_gdn_pre_fused, "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_mq4v2_fp8_v2", "false").unwrap();
+        layer
+            .set_cli("kernel.gfx12_gdn_pre_fused", "false")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out.gfx12_mq4v2_fp8_v2);
+        assert!(!opted_out.gfx12_gdn_pre_fused);
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        let test_flags = FeatureFlags::for_test("gfx1201");
+        assert!(!test_flags.gfx12_mq4v2_fp8_v2);
+        assert!(!test_flags.gfx12_gdn_pre_fused);
+    }
+
+    #[test]
+    fn fa2_prefill_defaults_on_certified_arches_with_opt_out() {
+        // Default process policy: gfx12 FA2 admits on exact gfx1201, gfx11
+        // FA2 on gfx1100/gfx1151; explicit `=0` restores the incumbent.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_fa2_prefill);
+        assert!(!gfx1201.gfx11_fa2_prefill);
+        for arch in ["gfx1100", "gfx1151"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+        for arch in ["gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(!flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_fa2_prefill", "false").unwrap();
+        layer.set_cli("kernel.gfx11_fa2_prefill", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out_12 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out_12.gfx12_fa2_prefill);
+        let opted_out_11 = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(!opted_out_11.gfx11_fa2_prefill);
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_fa2_prefill, "arch={arch}");
+            assert!(!test_flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+    }
+    #[test]
+    fn gfx12_silu_quant_fused_default_on_gfx1201_with_opt_out() {
+        // Default process policy: the exact-gfx1201 silu+quant fusion admits
+        // on gfx1201 (bit-identical to the standalone quantizer chain);
+        // explicit `=0` restores the incumbent producer+quantizer launches.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_silu_quant_fused);
+        assert!(gfx1201.gfx12_silu_quant_fused_enabled());
+        for arch in ["gfx1100", "gfx1151", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_silu_quant_fused, "arch={arch}");
+            assert!(!flags.gfx12_silu_quant_fused_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_silu_quant_fused", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out.gfx12_silu_quant_fused);
+        assert!(!opted_out.gfx12_silu_quant_fused_enabled());
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_silu_quant_fused, "arch={arch}");
+        }
+    }
+    #[test]
+    fn gfx12_producer_quant_fused_default_on_gfx1201_with_opt_out() {
+        // Default process policy: the exact-gfx1201 RMSNorm/rotate/gated-norm
+        // +quant fusions admit on gfx1201 (bit-identical to the standalone
+        // quantizer chains); explicit `=0` restores the incumbent
+        // producer+quantizer launches.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_producer_quant_fused);
+        assert!(gfx1201.gfx12_producer_quant_fused_enabled());
+        for arch in ["gfx1100", "gfx1151", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_producer_quant_fused, "arch={arch}");
+            assert!(!flags.gfx12_producer_quant_fused_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_producer_quant_fused", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out.gfx12_producer_quant_fused);
+        assert!(!opted_out.gfx12_producer_quant_fused_enabled());
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_producer_quant_fused, "arch={arch}");
+        }
+    }
+    #[test]
+    fn gfx11_producer_quant_fused_default_on_gfx11_with_opt_out() {
+        // Default process policy: the gfx11 sigmoid/gated-norm +quant
+        // fusions admit on gfx1100/gfx1151 (bit-identical to the standalone
+        // quantizer chains); explicit `=0` restores the incumbent
+        // producer+quantizer launches.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(flags.gfx11_producer_quant_fused, "arch={arch}");
+            assert!(flags.gfx11_producer_quant_fused_enabled(), "arch={arch}");
+        }
+        for arch in ["gfx1201", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx11_producer_quant_fused, "arch={arch}");
+            assert!(!flags.gfx11_producer_quant_fused_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx11_producer_quant_fused", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(!opted_out.gfx11_producer_quant_fused);
+        assert!(!opted_out.gfx11_producer_quant_fused_enabled());
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx11_producer_quant_fused, "arch={arch}");
+        }
+    }
+    #[test]
+    fn gfx12_fp8_stream_default_on_gfx1201_with_opt_out() {
+        // Default process policy: the exact-gfx1201 RMSNorm+rotate → FP8
+        // pre-pass fusion is ON on exact gfx1201 only (bit-identical, prepare
+        // launches removed); `kernel.gfx12_fp8_stream=false` (or
+        // `HIPFIRE_GFX12_FP8_STREAM=0`) opts out; other arches stay off.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let on = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(on.gfx12_fp8_stream && on.gfx12_fp8_stream_enabled());
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fp8_stream, "arch={arch}");
+            assert!(!flags.gfx12_fp8_stream_enabled(), "arch={arch}");
+        }
+        let mut off = ConfigLayer::default();
+        off.set_cli("kernel.gfx12_fp8_stream", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser { path: "config.toml".into() },
+            layer: off,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert!(!FeatureFlags::from_process_config("gfx1201", &process).gfx12_fp8_stream_enabled());
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_fp8_stream", "true").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_in = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(opted_in.gfx12_fp8_stream);
+        assert!(opted_in.gfx12_fp8_stream_enabled());
+        let other = FeatureFlags::from_process_config("gfx1151", &process);
+        assert!(other.gfx12_fp8_stream);
+        assert!(!other.gfx12_fp8_stream_enabled());
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_fp8_stream, "arch={arch}");
+        }
+    }
+
+    #[test]
+    fn iu4_prefill_default_on_gfx11_and_gfx1201() {
+        // Default process policy: the iu4-direct MMQ prefill route is on for
+        // exact gfx1100/gfx1151 (K16 kernel) and gfx1201 (K32 kernel) and
+        // nowhere else; `kernel.iu4_prefill=false` (or
+        // `HIPFIRE_IU4_PREFILL=0`) opts out.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(flags.iu4_prefill_enabled(), "arch={arch}");
+        }
+        for arch in ["gfx1101", "gfx1150", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.iu4_prefill_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.iu4_prefill", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.iu4_prefill_enabled(), "arch={arch}");
+        }
+
+        // The unit-test constructor stays off (deterministic baseline).
+        for arch in ["gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.iu4_prefill_enabled(), "arch={arch}");
+        }
+    }
+
+    #[test]
+    fn qkvza_split_tail_defaults_false_in_test_ctor() {
+        let f = FeatureFlags::for_test("gfx1100");
+        assert!(!f.qkvza_split_tail);
+        assert!(!f.gemma4_q8_fused_prefill);
+        assert!(!f.gemma4_batched_embedding_prefill);
+        assert!(!f.gemma4_ple_batched_prefill);
+        assert!(!f.gemma4_ple_branch_batched_prefill);
+        assert!(!f.gemma4_ple_activation_fused_prefill);
+        assert!(f.flash_attn_ck_lib.is_none());
+    }
+
+    #[test]
+    fn gemma4_prefill_auto_defaults_on_validated_arches() {
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+
+        let gfx1100 = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(gfx1100.gemma4_batched_embedding_prefill);
+        assert!(gfx1100.gemma4_ple_branch_batched_prefill);
+        assert!(gfx1100.gemma4_ple_activation_fused_prefill);
+        assert!(!gfx1100.gemma4_q8_fused_prefill);
+        assert!(!gfx1100.gemma4_ple_batched_prefill);
+
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gemma4_batched_embedding_prefill);
+        assert!(gfx1201.gemma4_ple_branch_batched_prefill);
+        assert!(gfx1201.gemma4_ple_activation_fused_prefill);
+        assert!(!gfx1201.gemma4_q8_fused_prefill);
+        assert!(!gfx1201.gemma4_ple_batched_prefill);
+
+        for arch in ["gfx1101", "gfx1102", "gfx1151", "gfx1200"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gemma4_batched_embedding_prefill, "arch={arch}");
+            assert!(!flags.gemma4_ple_branch_batched_prefill, "arch={arch}");
+            assert!(!flags.gemma4_ple_activation_fused_prefill, "arch={arch}");
+        }
+    }
+
+    #[test]
+    fn gemma4_prefill_auto_accepts_explicit_opt_out_on_validated_arches() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .set_cli("kernel.gemma4_batched_embedding_prefill", "false")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_branch_batched_prefill", "false")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_activation_fused_prefill", "false")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1201"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gemma4_batched_embedding_prefill, "arch={arch}");
+            assert!(!flags.gemma4_ple_branch_batched_prefill, "arch={arch}");
+            assert!(!flags.gemma4_ple_activation_fused_prefill, "arch={arch}");
+        }
+    }
+
+    #[test]
+    fn process_config_preserves_explicit_and_arch_default_flags() {
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.qkvza_split_tail", "true").unwrap();
+        layer
+            .set_cli("kernel.gemma4_q8_fused_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_batched_embedding_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_batched_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_branch_batched_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_activation_fused_prefill", "true")
+            .unwrap();
+        layer.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let flags = FeatureFlags::from_process_config("gfx1100", &process);
+
+        assert!(flags.qkvza_split_tail);
+        assert!(flags.gemma4_q8_fused_prefill);
+        assert!(flags.gemma4_batched_embedding_prefill);
+        assert!(flags.gemma4_ple_batched_prefill);
+        assert!(flags.gemma4_ple_branch_batched_prefill);
+        assert!(flags.gemma4_ple_activation_fused_prefill);
+        assert_eq!(flags.gemv_rows, Some(4));
+        assert!(flags.rdna3_hfq4_qkvza_k2048);
+        assert!(flags.rdna3_hfq4_residual_stage_x32);
+    }
+
+    #[test]
+    fn gfx11_q8_fa2_wide_auto_is_exact_gfx1100_and_gfx1151_with_explicit_overrides() {
+        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert!(process.legacy_value("HIPFIRE_GFX11_Q8_FA2_WIDE").is_none());
+        for (arch, expected) in [
+            ("gfx1100", true),
+            ("gfx1101", false),
+            ("gfx1151", true),
+            ("gfx1201", false),
+        ] {
+            assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch}");
+        }
+        for (value, expected) in [("false", false), ("true", true)] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli("kernel.gfx11_q8_fa2_wide", value).unwrap();
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                layer,
+            }]).unwrap();
+            let process = ProcessConfig::from_resolved(&resolved).unwrap();
+            for arch in ["gfx1100", "gfx1151"] {
+                assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch} value={value}");
+            }
+        }
+    }
+}

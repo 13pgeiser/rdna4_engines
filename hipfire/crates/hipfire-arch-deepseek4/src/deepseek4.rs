@@ -1,0 +1,2575 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Config / Weights / State types for DeepSeek V4 Flash.
+//!
+//! `DeepseekV4Config` mirrors the fields in the upstream
+//! `config.json`. Defaults come from the released
+//! `deepseek-ai/DeepSeek-V4-Flash` checkpoint.
+
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::model_source::ModelSource;
+use serde::{Deserialize, Serialize};
+
+use crate::backend::Mq2rBackend;
+
+/// Per-layer compression mode for the indexer / KV path.
+///
+/// `compress_ratios` in `config.json` is a per-layer array. The
+/// observed pattern on the released DeepSeek V4 is `[0, 0, 4, 128, 4, 128,
+/// ..., 4, 128, 4, 0]` — i.e. the first two and the last layer use
+/// `0` (no compression / full attention), and the middle layers
+/// alternate `4` / `128`. We carry the raw `u32` per layer rather
+/// than collapsing to an enum so future fine-tunes that pick
+/// different ratios still round-trip cleanly.
+pub type CompressRatio = u32;
+
+/// The historical DS4 product route was certified with 2,048 compressed
+/// rows (8,192 ratio-4 tokens). Keep that as the first capacity bucket so
+/// short-context launch geometry and scratch sizing remain unchanged, then
+/// grow geometrically up to the checkpoint's advertised context horizon.
+pub const INITIAL_COMPRESSED_ROWS: usize = 2_048;
+
+/// Stable block-cyclic ownership for a tensor-parallel compressor cache.
+///
+/// Ownership is derived solely from the global compressed-row index, so VMM
+/// growth never moves an existing row between ranks. Contiguous blocks retain
+/// the compressor and gather kernels' coalesced row layout, while cycling
+/// blocks across ranks avoids concentrating every short-context row on rank 0.
+/// The 256-row block matches the exact gfx1201 B=1024 ratio-4 prefill quantum
+/// (and two B=512 quanta), keeping ordinary chunk commits owner-contiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressorCacheShard {
+    rank: usize,
+    world: usize,
+    block_rows: usize,
+}
+
+impl CompressorCacheShard {
+    pub const GFX1201_BLOCK_ROWS: usize = 256;
+
+    pub fn new(rank: usize, world: usize, block_rows: usize) -> Result<Self, String> {
+        if world < 2 {
+            return Err("DeepSeek V4 compressor sharding requires at least two ranks".to_string());
+        }
+        if rank >= world {
+            return Err(format!(
+                "DeepSeek V4 compressor shard rank {rank} is outside world {world}"
+            ));
+        }
+        if block_rows == 0 || !block_rows.is_power_of_two() {
+            return Err(format!(
+                "DeepSeek V4 compressor shard block_rows must be a nonzero power of two (got {block_rows})"
+            ));
+        }
+        Ok(Self {
+            rank,
+            world,
+            block_rows,
+        })
+    }
+
+    pub const fn rank(self) -> usize {
+        self.rank
+    }
+
+    pub const fn world(self) -> usize {
+        self.world
+    }
+
+    pub const fn block_rows(self) -> usize {
+        self.block_rows
+    }
+
+    pub fn owner(self, global_row: usize) -> usize {
+        (global_row / self.block_rows) % self.world
+    }
+
+    pub fn global_to_local(self, global_row: usize) -> Option<usize> {
+        let global_block = global_row / self.block_rows;
+        if global_block % self.world != self.rank {
+            return None;
+        }
+        Some((global_block / self.world) * self.block_rows + global_row % self.block_rows)
+    }
+
+    pub fn local_to_global(self, local_row: usize) -> usize {
+        let local_block = local_row / self.block_rows;
+        (local_block * self.world + self.rank) * self.block_rows + local_row % self.block_rows
+    }
+
+    /// Number of rows owned by this rank in the global prefix `[0, rows)`.
+    pub fn local_rows_for_prefix(self, rows: usize) -> usize {
+        let full_blocks = rows / self.block_rows;
+        let tail_rows = rows % self.block_rows;
+        let full_cycles = full_blocks / self.world;
+        let tail_owner = full_blocks % self.world;
+        let rank_full_blocks = full_cycles + usize::from(self.rank < tail_owner);
+        rank_full_blocks * self.block_rows
+            + if self.rank == tail_owner {
+                tail_rows
+            } else {
+                0
+            }
+    }
+}
+
+/// Physical placement of the long-lived compressor caches. Single-GPU and
+/// existing routes remain replicated. The sharded variant is admitted only by
+/// the exact gfx1201 TP orchestration after its cross-rank raw-bit identity
+/// gate has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressorCachePlacement {
+    #[default]
+    Replicated,
+    BlockCyclic(CompressorCacheShard),
+}
+
+impl CompressorCachePlacement {
+    pub fn local_rows(self, global_rows: usize) -> usize {
+        match self {
+            Self::Replicated => global_rows,
+            Self::BlockCyclic(shard) => shard.local_rows_for_prefix(global_rows),
+        }
+    }
+
+    pub fn global_to_local(self, global_row: usize) -> Option<usize> {
+        match self {
+            Self::Replicated => Some(global_row),
+            Self::BlockCyclic(shard) => shard.global_to_local(global_row),
+        }
+    }
+}
+
+/// State-owned compressed-cache sizing. This replaces the former
+/// process-global `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` value: capacity is a
+/// property of the loaded checkpoint/session, not ambient process state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressorCapacityPlan {
+    max_tokens: usize,
+    max_rows: usize,
+    active_rows: usize,
+    prepared_tokens: usize,
+}
+
+impl CompressorCapacityPlan {
+    pub fn new(max_tokens: usize) -> Result<Self, String> {
+        if max_tokens == 0 {
+            return Err("DeepSeek V4 max_position_embeddings must be > 0".to_string());
+        }
+        // Ratio 4 is the densest compressed tier and therefore owns the
+        // common score/cache stride. Round up so a non-multiple checkpoint
+        // horizon can still admit its last partial block safely.
+        let max_rows = max_tokens.div_ceil(4);
+        Ok(Self {
+            max_tokens,
+            max_rows,
+            active_rows: INITIAL_COMPRESSED_ROWS.min(max_rows).max(1),
+            prepared_tokens: 0,
+        })
+    }
+
+    pub const fn max_tokens(self) -> usize {
+        self.max_tokens
+    }
+
+    pub const fn max_rows(self) -> usize {
+        self.max_rows
+    }
+
+    pub const fn active_rows(self) -> usize {
+        self.active_rows
+    }
+
+    /// Highest request endpoint whose cache pages have been mapped. Decode
+    /// steps at or below this position need no allocation-side work.
+    pub const fn prepared_tokens(self) -> usize {
+        self.prepared_tokens
+    }
+
+    /// Capacity bucket needed for a request ending at `required_tokens`.
+    /// Buckets double only at request boundaries; no allocation or launch
+    /// geometry changes inside a decode/verify capture.
+    pub fn rows_for_tokens(self, required_tokens: usize) -> Result<usize, String> {
+        if required_tokens > self.max_tokens {
+            return Err(format!(
+                "DeepSeek V4 context requires {required_tokens} tokens but the checkpoint advertises {}",
+                self.max_tokens
+            ));
+        }
+        let required_rows = required_tokens.div_ceil(4).max(1);
+        let bucket = required_rows
+            .max(INITIAL_COMPRESSED_ROWS.min(self.max_rows))
+            .checked_next_power_of_two()
+            .ok_or_else(|| "DeepSeek V4 compressed capacity overflow".to_string())?;
+        Ok(bucket.min(self.max_rows))
+    }
+
+    /// Map at least one historical 8K-token quantum ahead so direct decode
+    /// callers do not enter the allocation path every token. Above the final
+    /// power-of-two boundary this remains incremental, allowing F32 to use
+    /// the physical horizon instead of jumping immediately to a full 1M map.
+    pub fn prepared_target_for_tokens(self, required_tokens: usize) -> Result<usize, String> {
+        let rows = self.rows_for_tokens(required_tokens)?;
+        let bucket_tokens = rows.saturating_mul(4).min(self.max_tokens);
+        Ok(required_tokens
+            .saturating_add(INITIAL_COMPRESSED_ROWS * 4 - 1)
+            .min(bucket_tokens)
+            .max(required_tokens))
+    }
+
+    pub fn activate_for_tokens(&mut self, required_tokens: usize) -> Result<bool, String> {
+        let target = self.rows_for_tokens(required_tokens)?;
+        if target <= self.active_rows {
+            return Ok(false);
+        }
+        self.active_rows = target;
+        Ok(true)
+    }
+
+    pub fn mark_prepared(&mut self, required_tokens: usize) {
+        self.prepared_tokens = self.prepared_tokens.max(required_tokens);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepseekV4Config {
+    // ── transformer-shape basics ────────────────────────────────
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub max_position_embeddings: usize,
+    pub rms_norm_eps: f32,
+
+    // ── DeepSeek-specific attention ─────────────────────────────
+    /// Q-projection LoRA rank. Q goes through a `hidden × q_lora_rank`
+    /// then `q_lora_rank × (n_heads · head_dim)` factorisation rather
+    /// than full `hidden × (n_heads · head_dim)`.
+    pub q_lora_rank: usize,
+    /// O-projection LoRA rank. Same shape pattern as Q but on the
+    /// output side.
+    pub o_lora_rank: usize,
+    /// Number of tail dimensions per head that carry RoPE. The
+    /// remaining `head_dim - qk_rope_head_dim` dims are straight Q·K.
+    pub qk_rope_head_dim: usize,
+    /// O-projection grouping for the LoRA-bottlenecked output.
+    pub o_groups: usize,
+
+    // ── MoE ─────────────────────────────────────────────────────
+    pub n_routed_experts: usize,
+    pub n_shared_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    pub routed_scaling_factor: f32,
+    /// `noaux_tc` etc. — only `noaux_tc` is supported initially.
+    pub topk_method: String,
+    /// `sqrtsoftplus` — the routing-score function.
+    pub scoring_func: String,
+    pub norm_topk_prob: bool,
+    pub swiglu_limit: f32,
+
+    // ── Hyper-Connections ───────────────────────────────────────
+    /// Number of residual streams (typically 4).
+    pub hc_mult: usize,
+    /// Sinkhorn iteration count for the residual gating matrix.
+    pub hc_sinkhorn_iters: usize,
+    pub hc_eps: f32,
+
+    // ── Compressed-KV indexer ───────────────────────────────────
+    pub index_n_heads: usize,
+    pub index_head_dim: usize,
+    pub index_topk: usize,
+    /// Per-layer compression ratio array (length =
+    /// `num_hidden_layers + num_nextn_predict_layers`). `0` = no
+    /// compression, otherwise the indexer stride for that layer.
+    pub compress_ratios: Vec<CompressRatio>,
+    /// Compressed-KV path uses its own rope_theta.
+    pub compress_rope_theta: f32,
+
+    // ── RoPE / sliding window ───────────────────────────────────
+    pub rope_theta: f32,
+    /// YaRN scaling factor (typically 16 for DeepSeek V4's 1M context).
+    pub rope_scaling_factor: f32,
+    pub rope_scaling_original_max_position_embeddings: usize,
+    pub rope_scaling_beta_fast: usize,
+    pub rope_scaling_beta_slow: usize,
+    /// SWA window length for the main attention path (DeepSeek V4: 128).
+    pub sliding_window: usize,
+
+    // ── Multi-Token-Prediction (MTP) ────────────────────────────
+    /// Number of next-token prediction layers appended after the
+    /// main stack. DeepSeek V4 ships `1` (one MTP head).
+    pub num_nextn_predict_layers: usize,
+
+    // ── hash-routing (DeepSeek V4-only) ─────────────────────────────────
+    pub num_hash_layers: usize,
+
+    // ── REAP keep-map (optional expert-pruning emulation) ───────────────
+    /// When set (via `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir>`), the loader
+    /// keeps only `keep[l]` of the original routed experts per layer,
+    /// packed into compact slots `0..kept_per_layer`, and overrides
+    /// `n_routed_experts` to that kept count. Lets us emulate a
+    /// REAP-pruned checkpoint (e.g. 0xSero 162B, 256→144) by partial-load
+    /// of an existing full quant — no re-quant. Not (de)serialized;
+    /// populated at load time from the sidecar.
+    #[serde(skip)]
+    pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
+
+    /// Whether to load the DSpark 3-stage drafter sidecar (`<stem>-dspark.<ext>`)
+    /// during `load_weights`. Set by the loader from the `speculation` selector
+    /// (`dspark`/`auto` → true, any other mechanism → false) so a 3×MoE sidecar
+    /// is not paged into VRAM when DSpark won't run. Defaults to `true` for a
+    /// directly-driven daemon (no CLI selector). Not (de)serialized.
+    #[serde(skip)]
+    pub load_dspark: bool,
+
+    /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from an
+    /// exact `.mq2r`/`.mq2rxt` artifact identity and is never inferred from a
+    /// tensor dtype, so MQ2-Lloyd keeps its established runtime defaults. The
+    /// family shares routed-expert, route-scale, HC, and indexer policy; dense
+    /// dtype validation remains SKU-specific. Not serialized upstream.
+    #[serde(skip)]
+    pub mq2r: bool,
+
+    /// Exact DeepSeek V4 MQ2RXT SKU selector. MQ2RXT preserves MQ2R's routed
+    /// MQ2-Lloyd tier and replaces only the frozen P3 dense tensor map with
+    /// MQ4G256. It deliberately remains a distinct artifact identity so the
+    /// established MQ2R validator, DSpark sidecar, and retained tape cannot be
+    /// reused accidentally. `mq2r` is also true for this SKU because the
+    /// shared route-scale and MQ2 expert policy still apply.
+    #[serde(skip)]
+    pub mq2rxt: bool,
+}
+
+/// Raw upstream JSON shape — only the fields we read. Used to drive
+/// `from_hfq`. We deliberately mirror the upstream key names with
+/// `#[serde(rename)]` rather than renaming on the HFQ side so the
+/// metadata is the byte-for-byte same JSON the converter sees.
+#[derive(Debug, Deserialize)]
+struct RawDeepseekV4Config {
+    vocab_size: usize,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    max_position_embeddings: usize,
+    rms_norm_eps: f32,
+
+    q_lora_rank: usize,
+    o_lora_rank: usize,
+    qk_rope_head_dim: usize,
+    o_groups: usize,
+
+    n_routed_experts: usize,
+    n_shared_experts: usize,
+    num_experts_per_tok: usize,
+    moe_intermediate_size: usize,
+    routed_scaling_factor: f32,
+    topk_method: String,
+    scoring_func: String,
+    norm_topk_prob: bool,
+    swiglu_limit: f32,
+
+    hc_mult: usize,
+    hc_sinkhorn_iters: usize,
+    hc_eps: f32,
+
+    index_n_heads: usize,
+    index_head_dim: usize,
+    index_topk: usize,
+    compress_ratios: Vec<u32>,
+    compress_rope_theta: f32,
+
+    rope_theta: f32,
+    rope_scaling: RawYarnScaling,
+    sliding_window: usize,
+
+    num_nextn_predict_layers: usize,
+    num_hash_layers: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawYarnScaling {
+    factor: f32,
+    original_max_position_embeddings: usize,
+    beta_fast: usize,
+    beta_slow: usize,
+    #[serde(rename = "type")]
+    _kind: String,
+}
+
+impl DeepseekV4Config {
+    pub fn from_hfq(hfq: &HfqFile) -> Result<Self, String> {
+        // The quantizer wraps the DeepSeek V4 config inside an outer
+        // `{"architecture":..., "config":{...}, "tokenizer":...,
+        // "tokenizer_config":...}` envelope (matches the Qwen3.5
+        // pattern; see crates/hipfire-quantize/src/main.rs around
+        // line ~3805). Unwrap the inner `config` slice before parsing.
+        let wrapper: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+            .map_err(|e| format!("deepseek4: metadata_json not valid JSON: {e}"))?;
+        let inner = wrapper
+            .get("config")
+            .ok_or_else(|| "deepseek4: metadata_json missing `config` wrapper".to_string())?;
+        let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone())
+            .map_err(|e| format!("deepseek4: parsing inner config failed: {e}"))?;
+        let mq2rxt = hfq
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2rxt"))
+            || wrapper
+                .get("hipfire_quant_recipe")
+                .and_then(|value| value.as_str())
+                .is_some_and(|recipe| recipe == "deepseek4-mq2rxt-mq4-p3-v1");
+        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — DS4 MQ2R selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
+        let mq2r = mq2rxt
+            || hfq
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
+            || wrapper
+                .get("hipfire_quant_recipe")
+                .and_then(|value| value.as_str())
+                .is_some_and(|recipe| recipe == "deepseek4-mq2r-e8-p3-v1");
+        let mut config = DeepseekV4Config {
+            vocab_size: raw.vocab_size,
+            hidden_size: raw.hidden_size,
+            num_hidden_layers: raw.num_hidden_layers,
+            num_attention_heads: raw.num_attention_heads,
+            num_key_value_heads: raw.num_key_value_heads,
+            head_dim: raw.head_dim,
+            max_position_embeddings: raw.max_position_embeddings,
+            rms_norm_eps: raw.rms_norm_eps,
+            q_lora_rank: raw.q_lora_rank,
+            o_lora_rank: raw.o_lora_rank,
+            qk_rope_head_dim: raw.qk_rope_head_dim,
+            o_groups: raw.o_groups,
+            n_routed_experts: raw.n_routed_experts,
+            n_shared_experts: raw.n_shared_experts,
+            num_experts_per_tok: raw.num_experts_per_tok,
+            moe_intermediate_size: raw.moe_intermediate_size,
+            routed_scaling_factor: raw.routed_scaling_factor,
+            topk_method: raw.topk_method,
+            scoring_func: raw.scoring_func,
+            norm_topk_prob: raw.norm_topk_prob,
+            swiglu_limit: raw.swiglu_limit,
+            hc_mult: raw.hc_mult,
+            hc_sinkhorn_iters: raw.hc_sinkhorn_iters,
+            hc_eps: raw.hc_eps,
+            index_n_heads: raw.index_n_heads,
+            index_head_dim: raw.index_head_dim,
+            index_topk: raw.index_topk,
+            compress_ratios: raw.compress_ratios,
+            compress_rope_theta: raw.compress_rope_theta,
+            rope_theta: raw.rope_theta,
+            rope_scaling_factor: raw.rope_scaling.factor,
+            rope_scaling_original_max_position_embeddings: raw
+                .rope_scaling
+                .original_max_position_embeddings,
+            rope_scaling_beta_fast: raw.rope_scaling.beta_fast,
+            rope_scaling_beta_slow: raw.rope_scaling.beta_slow,
+            sliding_window: raw.sliding_window,
+            num_nextn_predict_layers: raw.num_nextn_predict_layers,
+            num_hash_layers: raw.num_hash_layers,
+            reap_keep: None,
+            load_dspark: true,
+            mq2r,
+            mq2rxt,
+        };
+        // Optional REAP plan: emulate a pruned expert pool (e.g. 162B
+        // 256→144) by partial-loading this full quant. Read BEFORE the
+        // n_routed_experts override so validation sees the original count.
+        // New generic env HIPFIRE_REAP_PLAN=<dir> (reap_plan.json); legacy
+        // HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir> (keep_by_layer.json) is still
+        // honored as a keep-only alias via ReapPlan::load_any.
+        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
+            "deepseek4",
+            Some("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP"),
+            config.num_hidden_layers,
+            config.n_routed_experts,
+        )? {
+            // An overlay-only plan has no expert keep-map. HfqFile already
+            // attached its overlay by this point, so do not route that plan
+            // through the pruning path: doing so would make hash layers look
+            // for remapped tid2eid sidecars and disable MTP unnecessarily.
+            if plan.keep.is_some() {
+                config.n_routed_experts = plan.kept_per_layer();
+                config.reap_keep = Some(std::sync::Arc::new(plan));
+            } else {
+                eprintln!(
+                    "deepseek4: REAP overlay-only plan ACTIVE — no expert pruning; dir {}",
+                    plan.dir.display()
+                );
+            }
+        }
+        Ok(config)
+    }
+}
+
+/// DSpark draft-module config, parsed from the DSpark sidecar HFQ's metadata
+/// (the released DeepSeek-V4-Flash-DSpark `config.json` carries these `dspark_*`
+/// keys). Absent on the trunk and on plain MTP sidecars — `from_metadata_json`
+/// returns `None` when `dspark_block_size` is missing, so non-DSpark files are
+/// unaffected. The number of MTP stages is NOT taken from config (the released
+/// config reports `num_nextn_predict_layers=1` even though the shipped DSpark
+/// checkpoint has 3 `mtp.{0,1,2}` stages) — the loader probes the tensor index
+/// instead. See docs/design/2026-06-28-dspark-deepseek4-forward-spec.md.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DsparkConfig {
+    /// Draft block width (slots predicted per step). V4-Flash: 5.
+    pub block_size: usize,
+    /// Target residual-stream layers whose HC-mean-pooled hidden states are
+    /// concatenated and fed through `main_proj`. V4-Flash: [40, 41, 42].
+    pub target_layer_ids: Vec<usize>,
+    /// Low-rank dim of the vanilla Markov bias head. V4-Flash: 256.
+    pub markov_rank: usize,
+    /// Token id used to fill draft block slots 1.. (slot 0 = real token).
+    pub noise_token_id: u32,
+}
+
+impl DsparkConfig {
+    /// Parse from an HFQ `metadata_json` (the outer
+    /// `{"architecture":.., "config":{..}}` envelope). Returns `None` when the
+    /// `config` wrapper or `dspark_block_size` is absent (i.e. not a DSpark
+    /// sidecar), so callers can treat `None` as "plain MTP / no DSpark".
+    pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
+        let wrapper: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+        let cfg = wrapper.get("config")?;
+        let block_size = cfg.get("dspark_block_size")?.as_u64()? as usize;
+        if block_size == 0 {
+            return None;
+        }
+        let target_layer_ids = cfg
+            .get("dspark_target_layer_ids")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_u64().map(|x| x as usize))
+            .collect::<Vec<_>>();
+        let markov_rank = cfg.get("dspark_markov_rank")?.as_u64()? as usize;
+        let noise_token_id = cfg.get("dspark_noise_token_id")?.as_u64()? as u32;
+        Some(Self {
+            block_size,
+            target_layer_ids,
+            markov_rank,
+            noise_token_id,
+        })
+    }
+}
+
+/// GPU-resident weights for the DSpark 3-stage draft module. Loaded from
+/// the separate `<stem>-dspark.<ext>` sidecar (arch_id=9), additive to the
+/// trunk's single-stage `DeepseekV4Weights::mtp_layer` — they coexist.
+///
+/// Each `stages[s]` is a full `DeepseekV4LayerWeights` carrying that stage's
+/// dense attention + FFN + HC + routed experts under the `mtp.{s}` prefix.
+/// DSpark stages have NO enorm/hnorm/e_proj/h_proj (those are MTP-only); the
+/// last stage additionally stores the head-HC mix (`mtp_hc_head_*`) and the
+/// final norm (`mtp_final_norm`) in its layer fields.
+///
+/// The DSpark-specific globals (`main_proj`/`main_norm` from stage 0,
+/// `markov_w1`/`markov_w2`/`confidence_proj` from the last stage) live
+/// directly on this struct. A target-recipe-specific sidecar may additionally
+/// carry `draft_head.weight`; it is used only for draft logits and never
+/// replaces the trunk's verification/output head.
+pub struct DsparkWeights {
+    pub cfg: DsparkConfig,
+    pub stages: Vec<DeepseekV4LayerWeights>,
+    pub main_proj: Option<rdna_compute::GpuTensor>,
+    pub main_norm: Option<rdna_compute::GpuTensor>,
+    pub markov_w1: Option<rdna_compute::GpuTensor>,
+    pub markov_w2: Option<rdna_compute::GpuTensor>,
+    pub confidence_proj: Option<rdna_compute::GpuTensor>,
+    pub draft_head: Option<rdna_compute::GpuTensor>,
+}
+
+impl DsparkWeights {
+    /// Release every GPU buffer the DSpark module owns. Frees the DSpark
+    /// globals then drains each stage via `DeepseekV4LayerWeights::free_gpu`
+    /// (which reclaims the per-stage hc_head + final-norm fields too).
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.main_proj);
+        free_opt(gpu, &mut self.main_norm);
+        free_opt(gpu, &mut self.markov_w1);
+        free_opt(gpu, &mut self.markov_w2);
+        free_opt(gpu, &mut self.confidence_proj);
+        free_opt(gpu, &mut self.draft_head);
+        for stage in self.stages.drain(..) {
+            stage.free_gpu(gpu);
+        }
+    }
+}
+
+/// Parse `DeepseekV4Config` from a `ModelSource` (safetensors or HFQ).
+/// The `ModelSource`'s metadata JSON should contain the same outer
+/// `{"architecture":..., "config":{...}}` wrapper as the HFQ format.
+pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Config> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
+    let inner = meta.get("config")?;
+    let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone()).ok()?;
+    Some(DeepseekV4Config {
+        vocab_size: raw.vocab_size,
+        hidden_size: raw.hidden_size,
+        num_hidden_layers: raw.num_hidden_layers,
+        num_attention_heads: raw.num_attention_heads,
+        num_key_value_heads: raw.num_key_value_heads,
+        head_dim: raw.head_dim,
+        max_position_embeddings: raw.max_position_embeddings,
+        rms_norm_eps: raw.rms_norm_eps,
+        q_lora_rank: raw.q_lora_rank,
+        o_lora_rank: raw.o_lora_rank,
+        qk_rope_head_dim: raw.qk_rope_head_dim,
+        o_groups: raw.o_groups,
+        n_routed_experts: raw.n_routed_experts,
+        n_shared_experts: raw.n_shared_experts,
+        num_experts_per_tok: raw.num_experts_per_tok,
+        moe_intermediate_size: raw.moe_intermediate_size,
+        routed_scaling_factor: raw.routed_scaling_factor,
+        topk_method: raw.topk_method,
+        scoring_func: raw.scoring_func,
+        norm_topk_prob: raw.norm_topk_prob,
+        swiglu_limit: raw.swiglu_limit,
+        hc_mult: raw.hc_mult,
+        hc_sinkhorn_iters: raw.hc_sinkhorn_iters,
+        hc_eps: raw.hc_eps,
+        index_n_heads: raw.index_n_heads,
+        index_head_dim: raw.index_head_dim,
+        index_topk: raw.index_topk,
+        compress_ratios: raw.compress_ratios,
+        compress_rope_theta: raw.compress_rope_theta,
+        rope_theta: raw.rope_theta,
+        rope_scaling_factor: raw.rope_scaling.factor,
+        rope_scaling_original_max_position_embeddings: raw
+            .rope_scaling
+            .original_max_position_embeddings,
+        rope_scaling_beta_fast: raw.rope_scaling.beta_fast,
+        rope_scaling_beta_slow: raw.rope_scaling.beta_slow,
+        sliding_window: raw.sliding_window,
+        num_nextn_predict_layers: raw.num_nextn_predict_layers,
+        num_hash_layers: raw.num_hash_layers,
+        reap_keep: None,
+        load_dspark: true,
+        mq2r: false,
+        mq2rxt: false,
+    })
+}
+
+/// DeepSeek-V4-specific REAP extras. The generic `hipfire-reap` plan owns the
+/// keep-map; this hook owns the arch-specific sidecar layout — here, the
+/// remapped hash-router `tid2eid` tables that live alongside the plan dir.
+pub struct Ds4ReapHook;
+
+impl hipfire_reap::hook::ReapArchHook for Ds4ReapHook {}
+
+/// Per-layer GPU-resident weights. Slots match DeepSeek V4 shipped tensor
+/// inventory; each is `Option<GpuTensor>` so partial-upload paths
+/// (host walk only / minimal upload / full upload) can populate
+/// progressively. Forward bring-up asserts all relevant slots are
+/// Some before dispatching.
+pub struct DeepseekV4LayerWeights {
+    pub compress_ratio: u32, // 0 = no indexer; otherwise stride
+
+    // Norms (F16 vectors).
+    pub attn_norm: Option<rdna_compute::GpuTensor>,
+    pub ffn_norm: Option<rdna_compute::GpuTensor>,
+    pub q_norm: Option<rdna_compute::GpuTensor>,
+    pub kv_norm: Option<rdna_compute::GpuTensor>,
+    pub attn_sink: Option<rdna_compute::GpuTensor>, // [n_heads]
+
+    // Attention LoRA + KV joint (MQ-family quantized).
+    pub wq_a: Option<rdna_compute::GpuTensor>,
+    pub wq_b: Option<rdna_compute::GpuTensor>,
+    pub wkv: Option<rdna_compute::GpuTensor>,
+    pub wo_a: Option<rdna_compute::GpuTensor>,
+    pub wo_b: Option<rdna_compute::GpuTensor>,
+    /// Exact gfx1201 three/four-rank dense-TP contract for main attention.
+    /// The explicit local ranges permit uneven whole-O-group TP3 sharding.
+    pub attn_tp_size: usize,
+    pub attn_tp_rank: usize,
+    pub attn_head_start: usize,
+    pub attn_head_count: usize,
+    pub attn_group_start: usize,
+    pub attn_group_count: usize,
+
+    // Main-attention compressor (compress_ratio > 0). Stores compressed
+    // KV at slot pos//ratio for later main-attention gather. Distinct
+    // from indexer's own compressor below.
+    pub compressor_wkv: Option<rdna_compute::GpuTensor>,
+    pub compressor_wgate: Option<rdna_compute::GpuTensor>,
+    pub compressor_norm: Option<rdna_compute::GpuTensor>,
+    pub compressor_ape: Option<rdna_compute::GpuTensor>, // [ratio, coff*head_dim]
+    /// F16-native copies of the compressor projections for the WMMA
+    /// GEMM path. Same data as `compressor_w{kv,gate}` but stored as
+    /// F16 bytes directly (no F32 decode). Populated when
+    /// `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` is enabled at load time.
+    pub compressor_wkv_f16: Option<rdna_compute::GpuTensor>,
+    pub compressor_wgate_f16: Option<rdna_compute::GpuTensor>,
+
+    // Indexer sub-module — only on layers with compress_ratio == 4.
+    // Selects top-k positions for sparse attention beyond SWA window.
+    pub indexer_wq_b: Option<rdna_compute::GpuTensor>, // [idx_n_heads * idx_head_dim, q_lora_rank]
+    pub indexer_weights_proj: Option<rdna_compute::GpuTensor>, // [idx_n_heads, hidden]
+    pub indexer_compressor_wkv: Option<rdna_compute::GpuTensor>, // [coff*idx_head_dim, hidden]
+    pub indexer_compressor_wgate: Option<rdna_compute::GpuTensor>,
+    /// F16-native copies of the indexer compressor projections for WMMA.
+    pub indexer_compressor_wkv_f16: Option<rdna_compute::GpuTensor>,
+    pub indexer_compressor_wgate_f16: Option<rdna_compute::GpuTensor>,
+    pub indexer_compressor_norm: Option<rdna_compute::GpuTensor>, // [idx_head_dim]
+    pub indexer_compressor_ape: Option<rdna_compute::GpuTensor>,  // [ratio, coff*idx_head_dim]
+
+    // MTP-specific fields (only populated for the MTP "layer" in
+    // `DeepseekV4Weights.mtp_layer`; always None for the normal
+    // `layers[0..n_hidden]` bundles). These implement the
+    // DeepSeek V3-style next-token-prediction head:
+    //   x_in   = e_proj(enorm(embed_{n+1})) + h_proj(hnorm(h_n))
+    //   x_attn = attention(attn_norm(x_in))   + x_in
+    //   x_ffn  = ffn(ffn_norm(x_attn))        + x_attn
+    //   h_n+1  = mtp_final_norm(x_ffn)        → shared head → logits_{n+2}
+    // `e_proj`/`h_proj` are FP8-source → Q8F16 on device (under the
+    // deepseek4-source-precision quant). `enorm`/`hnorm`/`mtp_final_norm`
+    // are BF16-source → F16.
+    pub mtp_enorm: Option<rdna_compute::GpuTensor>, // [hidden]
+    pub mtp_hnorm: Option<rdna_compute::GpuTensor>, // [hidden]
+    pub mtp_e_proj: Option<rdna_compute::GpuTensor>, // [hidden, hidden]
+    pub mtp_h_proj: Option<rdna_compute::GpuTensor>, // [hidden, hidden]
+    pub mtp_final_norm: Option<rdna_compute::GpuTensor>, // [hidden]
+    /// MTP-specific head-HC matrices. DeepSeek V4 ships these alongside the per-MTP
+    /// HC matrices (hc_attn_*, hc_ffn_*). Their presence in the safetensors
+    /// means the MTP layer was trained WITH head-HC mixing on its lm_head
+    /// path — taking stream 0 alone (as a naive port of V3's transformer
+    /// formulation does) drops the cross-stream mixing that MTP expects
+    /// for its prediction, measured as ~50% lower acceptance vs head-HC
+    /// mixed. Shapes match main globals: hc_head_fn [hc_mult, hc_mult*hidden],
+    /// hc_head_base [hc_mult], hc_head_scale [1] (scalar host-side after load).
+    pub mtp_hc_head_fn: Option<rdna_compute::GpuTensor>, // [hc_mult, hc_mult*hidden]
+    pub mtp_hc_head_base: Option<rdna_compute::GpuTensor>, // [hc_mult]
+    pub mtp_hc_head_scale: f32,                     // scalar (loaded from [1] F16)
+
+    // Hyper-Connections (F16 small matrices).
+    pub hc_attn_base: Option<rdna_compute::GpuTensor>,
+    pub hc_attn_fn: Option<rdna_compute::GpuTensor>,
+    pub hc_attn_scale: Option<rdna_compute::GpuTensor>,
+    pub hc_ffn_base: Option<rdna_compute::GpuTensor>,
+    pub hc_ffn_fn: Option<rdna_compute::GpuTensor>,
+    pub hc_ffn_scale: Option<rdna_compute::GpuTensor>,
+
+    // FFN router. `gate.bias` is None for hash-routed layers (first
+    // `num_hash_layers`).
+    pub gate_weight: Option<rdna_compute::GpuTensor>,
+    pub gate_bias: Option<rdna_compute::GpuTensor>,
+    /// Host-cached gate_bias for CPU-side topk-with-bias logic. DeepSeek V4
+    /// adds bias to the routing-selection scores (but not the routing
+    /// weights), so we need fast CPU access during ffn_routed. Length
+    /// = n_routed_experts; empty for hash-routed layers.
+    pub gate_bias_host: Vec<f32>,
+    /// Hash-routing lookup table `tid2eid[vocab_size, n_activated_
+    /// experts]` for layers 0..num_hash_layers. Each token_id maps to
+    /// a static set of K expert IDs. Empty for non-hash-routed layers.
+    /// Stored as flat row-major Vec<u32> length = vocab_size * k.
+    pub tid2eid_host: Vec<u32>,
+    /// Device-resident twin of `tid2eid_host` for the GPU hash-router
+    /// path (eliminates per-step d2h+h2d of scores/weights). Allocated
+    /// at load time alongside `tid2eid_host`. `None` for non-hash
+    /// layers or when the HFQ shipped without the table.
+    pub tid2eid_dev: Option<rdna_compute::GpuTensor>,
+
+    // Shared expert (one per layer, w1/w2/w3, MQ-family quantized).
+    /// Exact gfx1201 three/four-rank dense-TP contract for the shared expert.
+    /// The local interval is expressed in channels and always aligns to a
+    /// whole 256-wide FWHT group.
+    pub shared_tp_size: usize,
+    pub shared_tp_rank: usize,
+    pub shared_intermediate_start: usize,
+    pub shared_intermediate_count: usize,
+    pub shared_w1: Option<rdna_compute::GpuTensor>,
+    pub shared_w2: Option<rdna_compute::GpuTensor>,
+    pub shared_w3: Option<rdna_compute::GpuTensor>,
+
+    // Routed experts. To avoid 256 × 43 × 3 = 33K separate hipMalloc
+    // calls (drives load time to 3+ minutes), all 256 experts for each
+    // (layer, projection) are uploaded as ONE contiguous blob. The
+    // indexed MoE GEMV kernels consume a device-side pointer table.
+    //
+    // Layout per blob: `[n_routed_experts × bytes_per_expert]` raw bytes.
+    // Pointer table: F32 GpuTensor of length `2 * n_routed_experts`
+    //   (two F32 slots per u64 pointer, matching qwen35 convention).
+    pub expert_w1_blob: Option<rdna_compute::GpuTensor>,
+    pub expert_w2_blob: Option<rdna_compute::GpuTensor>,
+    pub expert_w3_blob: Option<rdna_compute::GpuTensor>,
+    pub expert_w1_ptrs: Option<rdna_compute::GpuTensor>,
+    pub expert_w2_ptrs: Option<rdna_compute::GpuTensor>,
+    pub expert_w3_ptrs: Option<rdna_compute::GpuTensor>,
+    /// Bytes per expert (uniform across all experts in a layer). Used
+    /// for sub_offset math when forward needs a per-expert view (rarely).
+    pub expert_w1_stride: usize,
+    pub expert_w2_stride: usize,
+    pub expert_w3_stride: usize,
+
+    /// Phase 1 perf: fused MoE indexed GEMV dispatch.
+    /// `expert_gate_up_blob` is a single contiguous device buffer
+    /// `[n_routed_experts × (stride_w1 + stride_w3)]` where each
+    /// expert's region holds the gate rows immediately followed by the
+    /// up rows. The `_indexed` MQ2-Lloyd MoE kernel reads from this as
+    /// a [2*intermediate, hidden] weight and splits the output by row.
+    /// `expert_gate_up_ptrs` is the per-expert pointer table.
+    pub expert_gate_up_blob: Option<rdna_compute::GpuTensor>,
+    pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
+    pub expert_gate_up_stride: usize,
+
+    /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
+    /// pointers index into (→ SwiGLU(0,0)=0 ⇒ 0 routed contribution). Owned
+    /// here so it is reclaimed by `free_gpu` on unload and by the staging guard
+    /// on a mid-load failure; `None` for single-GPU / fully-owned shards. Must
+    /// outlive the device pointer table (`expert_gate_up_ptrs`) that bakes its
+    /// address. Mirrors `MiniMaxLayerWeights::dummy_gate_up`. GpuTensor has no
+    /// Drop, so this MUST be threaded into the layer (previously
+    /// `std::mem::forget`-leaked).
+    pub expert_gate_up_dummy: Option<rdna_compute::GpuTensor>,
+}
+
+impl DeepseekV4LayerWeights {
+    /// Shallow-clone this layer: all `Option<GpuTensor>` fields are
+    /// non-owning aliases of the same device buffers; CPU-side vecs and
+    /// scalar fields are cheap-copied. Used by `Deepseek4DsparkBody` to
+    /// hold references into the bundle's DSpark stage weights without
+    /// taking ownership.
+    pub fn shallow_clone(&self) -> Self {
+        fn sc(t: &Option<rdna_compute::GpuTensor>) -> Option<rdna_compute::GpuTensor> {
+            t.as_ref().map(|t| t.shallow_clone())
+        }
+        Self {
+            compress_ratio: self.compress_ratio,
+            attn_norm: sc(&self.attn_norm),
+            ffn_norm: sc(&self.ffn_norm),
+            q_norm: sc(&self.q_norm),
+            kv_norm: sc(&self.kv_norm),
+            attn_sink: sc(&self.attn_sink),
+            wq_a: sc(&self.wq_a),
+            wq_b: sc(&self.wq_b),
+            wkv: sc(&self.wkv),
+            wo_a: sc(&self.wo_a),
+            wo_b: sc(&self.wo_b),
+            attn_tp_size: self.attn_tp_size,
+            attn_tp_rank: self.attn_tp_rank,
+            attn_head_start: self.attn_head_start,
+            attn_head_count: self.attn_head_count,
+            attn_group_start: self.attn_group_start,
+            attn_group_count: self.attn_group_count,
+            compressor_wkv: sc(&self.compressor_wkv),
+            compressor_wgate: sc(&self.compressor_wgate),
+            compressor_norm: sc(&self.compressor_norm),
+            compressor_ape: sc(&self.compressor_ape),
+            compressor_wkv_f16: sc(&self.compressor_wkv_f16),
+            compressor_wgate_f16: sc(&self.compressor_wgate_f16),
+            indexer_wq_b: sc(&self.indexer_wq_b),
+            indexer_weights_proj: sc(&self.indexer_weights_proj),
+            indexer_compressor_wkv: sc(&self.indexer_compressor_wkv),
+            indexer_compressor_wgate: sc(&self.indexer_compressor_wgate),
+            indexer_compressor_wkv_f16: sc(&self.indexer_compressor_wkv_f16),
+            indexer_compressor_wgate_f16: sc(&self.indexer_compressor_wgate_f16),
+            indexer_compressor_norm: sc(&self.indexer_compressor_norm),
+            indexer_compressor_ape: sc(&self.indexer_compressor_ape),
+            mtp_enorm: sc(&self.mtp_enorm),
+            mtp_hnorm: sc(&self.mtp_hnorm),
+            mtp_e_proj: sc(&self.mtp_e_proj),
+            mtp_h_proj: sc(&self.mtp_h_proj),
+            mtp_final_norm: sc(&self.mtp_final_norm),
+            mtp_hc_head_fn: sc(&self.mtp_hc_head_fn),
+            mtp_hc_head_base: sc(&self.mtp_hc_head_base),
+            mtp_hc_head_scale: self.mtp_hc_head_scale,
+            hc_attn_base: sc(&self.hc_attn_base),
+            hc_attn_fn: sc(&self.hc_attn_fn),
+            hc_attn_scale: sc(&self.hc_attn_scale),
+            hc_ffn_base: sc(&self.hc_ffn_base),
+            hc_ffn_fn: sc(&self.hc_ffn_fn),
+            hc_ffn_scale: sc(&self.hc_ffn_scale),
+            gate_weight: sc(&self.gate_weight),
+            gate_bias: sc(&self.gate_bias),
+            gate_bias_host: self.gate_bias_host.clone(),
+            tid2eid_host: self.tid2eid_host.clone(),
+            tid2eid_dev: sc(&self.tid2eid_dev),
+            shared_tp_size: self.shared_tp_size,
+            shared_tp_rank: self.shared_tp_rank,
+            shared_intermediate_start: self.shared_intermediate_start,
+            shared_intermediate_count: self.shared_intermediate_count,
+            shared_w1: sc(&self.shared_w1),
+            shared_w2: sc(&self.shared_w2),
+            shared_w3: sc(&self.shared_w3),
+            expert_w1_blob: sc(&self.expert_w1_blob),
+            expert_w2_blob: sc(&self.expert_w2_blob),
+            expert_w3_blob: sc(&self.expert_w3_blob),
+            expert_w1_ptrs: sc(&self.expert_w1_ptrs),
+            expert_w2_ptrs: sc(&self.expert_w2_ptrs),
+            expert_w3_ptrs: sc(&self.expert_w3_ptrs),
+            expert_w1_stride: self.expert_w1_stride,
+            expert_w2_stride: self.expert_w2_stride,
+            expert_w3_stride: self.expert_w3_stride,
+            expert_gate_up_blob: sc(&self.expert_gate_up_blob),
+            expert_gate_up_ptrs: sc(&self.expert_gate_up_ptrs),
+            expert_gate_up_stride: self.expert_gate_up_stride,
+            expert_gate_up_dummy: sc(&self.expert_gate_up_dummy),
+        }
+    }
+
+    pub fn new_empty(compress_ratio: u32) -> Self {
+        DeepseekV4LayerWeights {
+            compress_ratio,
+            attn_norm: None,
+            ffn_norm: None,
+            q_norm: None,
+            kv_norm: None,
+            attn_sink: None,
+            wq_a: None,
+            wq_b: None,
+            wkv: None,
+            wo_a: None,
+            wo_b: None,
+            attn_tp_size: 1,
+            attn_tp_rank: 0,
+            attn_head_start: 0,
+            attn_head_count: 0,
+            attn_group_start: 0,
+            attn_group_count: 0,
+            compressor_wkv: None,
+            compressor_wgate: None,
+            compressor_norm: None,
+            compressor_ape: None,
+            compressor_wkv_f16: None,
+            compressor_wgate_f16: None,
+            indexer_wq_b: None,
+            indexer_weights_proj: None,
+            indexer_compressor_wkv: None,
+            indexer_compressor_wgate: None,
+            indexer_compressor_wkv_f16: None,
+            indexer_compressor_wgate_f16: None,
+            indexer_compressor_norm: None,
+            indexer_compressor_ape: None,
+            mtp_enorm: None,
+            mtp_hnorm: None,
+            mtp_e_proj: None,
+            mtp_h_proj: None,
+            mtp_final_norm: None,
+            mtp_hc_head_fn: None,
+            mtp_hc_head_base: None,
+            mtp_hc_head_scale: 0.0,
+            hc_attn_base: None,
+            hc_attn_fn: None,
+            hc_attn_scale: None,
+            hc_ffn_base: None,
+            hc_ffn_fn: None,
+            hc_ffn_scale: None,
+            gate_weight: None,
+            gate_bias: None,
+            gate_bias_host: Vec::new(),
+            tid2eid_host: Vec::new(),
+            tid2eid_dev: None,
+            shared_tp_size: 1,
+            shared_tp_rank: 0,
+            shared_intermediate_start: 0,
+            shared_intermediate_count: 0,
+            shared_w1: None,
+            shared_w2: None,
+            shared_w3: None,
+            expert_w1_blob: None,
+            expert_w2_blob: None,
+            expert_w3_blob: None,
+            expert_w1_ptrs: None,
+            expert_w2_ptrs: None,
+            expert_w3_ptrs: None,
+            expert_w1_stride: 0,
+            expert_w2_stride: 0,
+            expert_w3_stride: 0,
+            expert_gate_up_blob: None,
+            expert_gate_up_ptrs: None,
+            expert_gate_up_stride: 0,
+            expert_gate_up_dummy: None,
+        }
+    }
+
+    /// Release every GPU buffer this layer owns back to the pool.
+    /// Used by `DeepseekV4Weights::free_gpu` to walk all 43 main layers
+    /// plus the optional MTP layer.
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        self.free_dense_gpu(gpu);
+        self.free_routed_gpu(gpu);
+    }
+
+    fn free_dense_gpu(&mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.attn_norm);
+        free_opt(gpu, &mut self.ffn_norm);
+        free_opt(gpu, &mut self.q_norm);
+        free_opt(gpu, &mut self.kv_norm);
+        free_opt(gpu, &mut self.attn_sink);
+        free_opt(gpu, &mut self.wq_a);
+        free_opt(gpu, &mut self.wq_b);
+        free_opt(gpu, &mut self.wkv);
+        free_opt(gpu, &mut self.wo_a);
+        free_opt(gpu, &mut self.wo_b);
+        free_opt(gpu, &mut self.compressor_wkv);
+        free_opt(gpu, &mut self.compressor_wgate);
+        free_opt(gpu, &mut self.compressor_norm);
+        free_opt(gpu, &mut self.compressor_ape);
+        free_opt(gpu, &mut self.compressor_wkv_f16);
+        free_opt(gpu, &mut self.compressor_wgate_f16);
+        free_opt(gpu, &mut self.indexer_wq_b);
+        free_opt(gpu, &mut self.indexer_weights_proj);
+        free_opt(gpu, &mut self.indexer_compressor_wkv);
+        free_opt(gpu, &mut self.indexer_compressor_wgate);
+        free_opt(gpu, &mut self.indexer_compressor_wkv_f16);
+        free_opt(gpu, &mut self.indexer_compressor_wgate_f16);
+        free_opt(gpu, &mut self.indexer_compressor_norm);
+        free_opt(gpu, &mut self.indexer_compressor_ape);
+        free_opt(gpu, &mut self.mtp_enorm);
+        free_opt(gpu, &mut self.mtp_hnorm);
+        free_opt(gpu, &mut self.mtp_e_proj);
+        free_opt(gpu, &mut self.mtp_h_proj);
+        free_opt(gpu, &mut self.mtp_final_norm);
+        free_opt(gpu, &mut self.mtp_hc_head_fn);
+        free_opt(gpu, &mut self.mtp_hc_head_base);
+        free_opt(gpu, &mut self.hc_attn_base);
+        free_opt(gpu, &mut self.hc_attn_fn);
+        free_opt(gpu, &mut self.hc_attn_scale);
+        free_opt(gpu, &mut self.hc_ffn_base);
+        free_opt(gpu, &mut self.hc_ffn_fn);
+        free_opt(gpu, &mut self.hc_ffn_scale);
+        free_opt(gpu, &mut self.gate_weight);
+        free_opt(gpu, &mut self.gate_bias);
+        free_opt(gpu, &mut self.tid2eid_dev);
+        free_opt(gpu, &mut self.shared_w1);
+        free_opt(gpu, &mut self.shared_w2);
+        free_opt(gpu, &mut self.shared_w3);
+    }
+
+    fn free_routed_gpu(&mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        // Pointer tables stop being live before their backing blobs return to
+        // the pool. There are no active kernels during unload, but preserving
+        // that ownership order also makes fault-injection teardown auditable.
+        free_opt(gpu, &mut self.expert_w1_ptrs);
+        free_opt(gpu, &mut self.expert_w2_ptrs);
+        free_opt(gpu, &mut self.expert_w3_ptrs);
+        free_opt(gpu, &mut self.expert_gate_up_ptrs);
+        free_opt(gpu, &mut self.expert_w1_blob);
+        free_opt(gpu, &mut self.expert_w2_blob);
+        free_opt(gpu, &mut self.expert_w3_blob);
+        free_opt(gpu, &mut self.expert_gate_up_blob);
+        // EP-shard dummy gate_up buffer (was previously mem::forget-leaked).
+        // Freed last so the pointer table that baked its address is already
+        // gone — no live aliasing into a returned buffer. No double-free: this
+        // is the sole owner.
+        free_opt(gpu, &mut self.expert_gate_up_dummy);
+    }
+
+    /// Failure-path teardown for large split-owner expert blobs. Bypass the
+    /// reuse pool so a partially loaded 73 GiB tier is returned to HIP before
+    /// the transactional constructor reports failure. Normal model unload
+    /// keeps the pooled path above and drains it once at the end.
+    fn free_routed_gpu_now(&mut self, gpu: &mut rdna_compute::Gpu, errors: &mut Vec<String>) {
+        if let Err(error) = gpu.bind_thread() {
+            errors.push(format!("bind routed failure cleanup: {error}"));
+            self.free_routed_gpu(gpu);
+            return;
+        }
+        fn free_opt(
+            gpu: &mut rdna_compute::Gpu,
+            label: &str,
+            tensor: &mut Option<rdna_compute::GpuTensor>,
+            errors: &mut Vec<String>,
+        ) {
+            let Some(tensor) = tensor.take() else {
+                return;
+            };
+            if let Err(error) = gpu.hip.free(tensor.buf) {
+                errors.push(format!("free {label}: {error}"));
+            }
+        }
+        free_opt(gpu, "expert_w1_ptrs", &mut self.expert_w1_ptrs, errors);
+        free_opt(gpu, "expert_w2_ptrs", &mut self.expert_w2_ptrs, errors);
+        free_opt(gpu, "expert_w3_ptrs", &mut self.expert_w3_ptrs, errors);
+        free_opt(
+            gpu,
+            "expert_gate_up_ptrs",
+            &mut self.expert_gate_up_ptrs,
+            errors,
+        );
+        free_opt(gpu, "expert_w1_blob", &mut self.expert_w1_blob, errors);
+        free_opt(gpu, "expert_w2_blob", &mut self.expert_w2_blob, errors);
+        free_opt(gpu, "expert_w3_blob", &mut self.expert_w3_blob, errors);
+        free_opt(
+            gpu,
+            "expert_gate_up_blob",
+            &mut self.expert_gate_up_blob,
+            errors,
+        );
+        free_opt(
+            gpu,
+            "expert_gate_up_dummy",
+            &mut self.expert_gate_up_dummy,
+            errors,
+        );
+    }
+
+    fn visit_dense_tensors(
+        &self,
+        prefix: &str,
+        visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor),
+    ) {
+        macro_rules! visit_opt {
+            ($field:ident) => {
+                if let Some(tensor) = self.$field.as_ref() {
+                    visit(&format!("{prefix}.{}", stringify!($field)), tensor);
+                }
+            };
+        }
+        visit_opt!(attn_norm);
+        visit_opt!(ffn_norm);
+        visit_opt!(q_norm);
+        visit_opt!(kv_norm);
+        visit_opt!(attn_sink);
+        visit_opt!(wq_a);
+        visit_opt!(wq_b);
+        visit_opt!(wkv);
+        visit_opt!(wo_a);
+        visit_opt!(wo_b);
+        visit_opt!(compressor_wkv);
+        visit_opt!(compressor_wgate);
+        visit_opt!(compressor_norm);
+        visit_opt!(compressor_ape);
+        visit_opt!(compressor_wkv_f16);
+        visit_opt!(compressor_wgate_f16);
+        visit_opt!(indexer_wq_b);
+        visit_opt!(indexer_weights_proj);
+        visit_opt!(indexer_compressor_wkv);
+        visit_opt!(indexer_compressor_wgate);
+        visit_opt!(indexer_compressor_wkv_f16);
+        visit_opt!(indexer_compressor_wgate_f16);
+        visit_opt!(indexer_compressor_norm);
+        visit_opt!(indexer_compressor_ape);
+        visit_opt!(mtp_enorm);
+        visit_opt!(mtp_hnorm);
+        visit_opt!(mtp_e_proj);
+        visit_opt!(mtp_h_proj);
+        visit_opt!(mtp_final_norm);
+        visit_opt!(mtp_hc_head_fn);
+        visit_opt!(mtp_hc_head_base);
+        visit_opt!(hc_attn_base);
+        visit_opt!(hc_attn_fn);
+        visit_opt!(hc_attn_scale);
+        visit_opt!(hc_ffn_base);
+        visit_opt!(hc_ffn_fn);
+        visit_opt!(hc_ffn_scale);
+        visit_opt!(gate_weight);
+        visit_opt!(gate_bias);
+        visit_opt!(tid2eid_dev);
+        visit_opt!(shared_w1);
+        visit_opt!(shared_w2);
+        visit_opt!(shared_w3);
+    }
+
+    fn visit_routed_tensors(
+        &self,
+        prefix: &str,
+        visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor),
+    ) {
+        macro_rules! visit_opt {
+            ($field:ident) => {
+                if let Some(tensor) = self.$field.as_ref() {
+                    visit(&format!("{prefix}.{}", stringify!($field)), tensor);
+                }
+            };
+        }
+        visit_opt!(expert_w1_blob);
+        visit_opt!(expert_w2_blob);
+        visit_opt!(expert_w3_blob);
+        visit_opt!(expert_w1_ptrs);
+        visit_opt!(expert_w2_ptrs);
+        visit_opt!(expert_w3_ptrs);
+        visit_opt!(expert_gate_up_blob);
+        visit_opt!(expert_gate_up_ptrs);
+        visit_opt!(expert_gate_up_dummy);
+    }
+}
+
+/// DeepSeek V4 weights — fully populated: global embeddings + norms, per-layer
+/// LoRAs (q_lora, o_lora), compressor + indexer projections, attn KV,
+/// Hyper-Connections gates, routed-expert blobs, and the optional MTP
+/// addon layer (`mtp.0.*`).
+///
+/// `mtp_layer` is `Some` after Phase 5 lands (when the
+/// `mtp.` prefix-skip in `hipfire-quantize` is lifted and MTP
+/// tensors are quantized alongside main layers).
+pub struct DeepseekV4Weights {
+    /// Model-owned execution backend for the frozen MQ2R recipe. This is kept
+    /// off the process-wide Gpu so unrelated architectures and model swaps
+    /// cannot inherit DeepSeek4 dispatch policy.
+    pub(crate) mq2r_backend: Mq2rBackend,
+    /// Token embedding table. Stored as raw Q8F16 bytes on GPU
+    /// (matches the `embed.weight` quant_type from Phase 1 ingest).
+    pub token_embd: Option<rdna_compute::GpuTensor>,
+    /// Final output norm (RMSNorm scale, F32 — converted from F16 at load time).
+    pub output_norm: Option<rdna_compute::GpuTensor>,
+    /// LM head weight (Q8_0 in the canonical build; quant_type follows the
+    /// source HFQ — `upload_quant_or_f16` routes by dtype). Shape
+    /// `[vocab_size, hidden]`.
+    pub head: Option<rdna_compute::GpuTensor>,
+    /// Head HC mix: `hc_head_fn` [hc_mult, hc_mult * hidden] F16 raw on GPU.
+    pub hc_head_fn: Option<rdna_compute::GpuTensor>,
+    /// `hc_head_base` [hc_mult] F16 raw on GPU.
+    pub hc_head_base: Option<rdna_compute::GpuTensor>,
+    /// `hc_head_scale` is shape [1] F16 on disk — cached as host f32 scalar.
+    pub hc_head_scale: f32,
+    /// One bundle per `num_hidden_layers` (43 on DeepSeek V4).
+    pub layers: Vec<DeepseekV4LayerWeights>,
+    /// MTP head — structurally identical to a main layer, plus an
+    /// `input_proj` conditioning on the base model's hidden state.
+    /// `None` at scaffold stage; populated when Phase 5 ships.
+    pub mtp_layer: Option<DeepseekV4LayerWeights>,
+    /// Optional DSpark 3-stage draft module, loaded from the
+    /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
+    /// present. `None` when no DSpark sidecar exists (silent no-op).
+    pub dspark: Option<DsparkWeights>,
+    pub _scaffold: (),
+}
+
+impl DeepseekV4Weights {
+    /// Look up the layer-shaped weight bundle by index. Resolves to
+    /// `layers[idx]` for the main `0..num_hidden_layers` range and to
+    /// `mtp_layer` for `idx == layers.len()`. Used by the per-layer
+    /// helpers so they can run against either a normal layer or the
+    /// MTP head with no signature change.
+    ///
+    /// Panics if `idx == layers.len()` but `mtp_layer.is_none()`, or
+    /// if `idx > layers.len()`.
+    /// Release every GPU buffer these weights own back to the pool.
+    /// Consumes self. Walked by `unload_model` on idle eviction or
+    /// explicit unload so VRAM is actually returned to the system (not
+    /// just released back into the daemon's pool — `drain_pool` calls
+    /// `hipFree` after this).
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.token_embd);
+        free_opt(gpu, &mut self.output_norm);
+        free_opt(gpu, &mut self.head);
+        free_opt(gpu, &mut self.hc_head_fn);
+        free_opt(gpu, &mut self.hc_head_base);
+        for l in self.layers.drain(..) {
+            l.free_gpu(gpu);
+        }
+        if let Some(mtp) = self.mtp_layer.take() {
+            mtp.free_gpu(gpu);
+        }
+        if let Some(d) = self.dspark.take() {
+            d.free_gpu(gpu);
+        }
+    }
+
+    fn visit_dense_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        macro_rules! visit_opt {
+            ($name:expr, $tensor:expr) => {
+                if let Some(tensor) = $tensor.as_ref() {
+                    visit($name, tensor);
+                }
+            };
+        }
+        visit_opt!("embed.weight", self.token_embd);
+        visit_opt!("norm.weight", self.output_norm);
+        visit_opt!("head.weight", self.head);
+        visit_opt!("hc_head_fn", self.hc_head_fn);
+        visit_opt!("hc_head_base", self.hc_head_base);
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_dense_tensors(&format!("layers.{index}"), visit);
+        }
+        if let Some(layer) = self.mtp_layer.as_ref() {
+            layer.visit_dense_tensors("mtp.0", visit);
+        }
+        if let Some(dspark) = self.dspark.as_ref() {
+            visit_opt!("dspark.main_proj", dspark.main_proj);
+            visit_opt!("dspark.main_norm", dspark.main_norm);
+            visit_opt!("dspark.markov_w1", dspark.markov_w1);
+            visit_opt!("dspark.markov_w2", dspark.markov_w2);
+            visit_opt!("dspark.confidence_proj", dspark.confidence_proj);
+            visit_opt!("dspark.draft_head", dspark.draft_head);
+            for (index, layer) in dspark.stages.iter().enumerate() {
+                layer.visit_dense_tensors(&format!("dspark.mtp.{index}"), visit);
+            }
+        }
+    }
+
+    fn visit_routed_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_routed_tensors(&format!("layers.{index}"), visit);
+        }
+        if let Some(layer) = self.mtp_layer.as_ref() {
+            layer.visit_routed_tensors("mtp.0", visit);
+        }
+        if let Some(dspark) = self.dspark.as_ref() {
+            for (index, layer) in dspark.stages.iter().enumerate() {
+                layer.visit_routed_tensors(&format!("dspark.mtp.{index}"), visit);
+            }
+        }
+    }
+
+    pub fn resolve_layer(&self, idx: usize) -> &DeepseekV4LayerWeights {
+        if idx < self.layers.len() {
+            &self.layers[idx]
+        } else if idx == self.layers.len() {
+            self.mtp_layer.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "DeepseekV4Weights::resolve_layer({idx}) — \
+                     idx points at the MTP slot but mtp_layer is None. \
+                     Either set HIPFIRE_DEEPSEEK4_LOAD_MTP=1 and use a model \
+                     quantized with MTP, or stop calling mtp_forward."
+                )
+            })
+        } else {
+            panic!(
+                "DeepseekV4Weights::resolve_layer({idx}) out of range \
+                 (have {} main layers + {} MTP)",
+                self.layers.len(),
+                self.mtp_layer.is_some() as usize,
+            );
+        }
+    }
+}
+
+/// gfx1100-owned portion of a heterogeneous DS4 load. The wrapped ordinary
+/// weight type is admitted only after proving that every routed allocation is
+/// absent, so its single-owner teardown contract remains true.
+pub struct DeepseekV4DenseWeights {
+    pub(crate) inner: DeepseekV4Weights,
+}
+
+impl DeepseekV4DenseWeights {
+    pub(crate) fn validate_loaded(inner: &DeepseekV4Weights) -> Result<(), String> {
+        let mut routed = Vec::new();
+        inner.visit_routed_tensors(&mut |name, _| routed.push(name.to_owned()));
+        if !routed.is_empty() {
+            return Err(format!(
+                "deepseek4: dense-owner weights contain routed allocations: {}",
+                routed.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_loaded(inner: DeepseekV4Weights) -> Self {
+        Self { inner }
+    }
+
+    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+        self.inner.free_gpu(gpu);
+    }
+}
+
+/// gfx1151-owned routed-expert portion of a heterogeneous DS4 load. No global,
+/// attention, shared-expert, state, or scratch allocation can enter this type.
+pub struct DeepseekV4RoutedWeights {
+    pub(crate) mq2r_backend: Mq2rBackend,
+    pub(crate) layers: Vec<DeepseekV4LayerWeights>,
+}
+
+impl DeepseekV4RoutedWeights {
+    pub(crate) fn new(cfg: &DeepseekV4Config, mq2r_backend: Mq2rBackend) -> Self {
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|layer| {
+                DeepseekV4LayerWeights::new_empty(
+                    cfg.compress_ratios.get(layer).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        Self {
+            mq2r_backend,
+            layers,
+        }
+    }
+
+    pub(crate) fn layer_mut(&mut self, index: usize) -> Option<&mut DeepseekV4LayerWeights> {
+        self.layers.get_mut(index)
+    }
+
+    pub fn resolve_layer(&self, index: usize) -> &DeepseekV4LayerWeights {
+        &self.layers[index]
+    }
+
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        for mut layer in self.layers.drain(..) {
+            layer.free_routed_gpu(gpu);
+        }
+    }
+
+    pub(crate) fn free_gpu_now(mut self, gpu: &mut rdna_compute::Gpu) -> Vec<String> {
+        let mut errors = Vec::new();
+        for mut layer in self.layers.drain(..) {
+            layer.free_routed_gpu_now(gpu, &mut errors);
+        }
+        errors
+    }
+
+    fn visit_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_routed_tensors(&format!("layers.{index}"), visit);
+        }
+    }
+}
+
+/// Split-owner weights for the heterogeneous route. The type boundary makes
+/// it impossible to call the ordinary one-GPU destructor on a mixed-owner
+/// object: each half exposes only its own owner-correct teardown.
+pub struct DeepseekV4HeterogeneousWeights {
+    pub dense: DeepseekV4DenseWeights,
+    pub routed: DeepseekV4RoutedWeights,
+}
+
+impl DeepseekV4HeterogeneousWeights {
+    pub fn free_gpu(self, dense_gpu: &mut rdna_compute::Gpu, routed_gpu: &mut rdna_compute::Gpu) {
+        self.routed.free_gpu(routed_gpu);
+        self.dense.free_gpu(dense_gpu);
+    }
+
+    /// Query HIP pointer metadata for every resident weight and prove that the
+    /// two typed owners match their exact devices. Counts include packed expert
+    /// blobs, pointer tables, and dense duplicate representations.
+    pub fn audit_owners(
+        &self,
+        dense_gpu: &mut rdna_compute::Gpu,
+        routed_gpu: &mut rdna_compute::Gpu,
+    ) -> Result<DeepseekV4OwnershipAudit, String> {
+        let mut audit = DeepseekV4OwnershipAudit::default();
+        dense_gpu
+            .bind_thread()
+            .map_err(|error| format!("deepseek4: bind dense owner for audit: {error}"))?;
+        self.dense.inner.visit_dense_tensors(&mut |name, tensor| {
+            audit.dense_tensor_count += 1;
+            audit.dense_bytes += tensor.buf.size();
+            match dense_gpu.hip.pointer_get_attributes(&tensor.buf) {
+                Ok(attr) if attr.device == dense_gpu.device_id => {}
+                Ok(attr) => audit.violations.push(format!(
+                    "{name}: dense owner device {} != expected {}",
+                    attr.device, dense_gpu.device_id
+                )),
+                Err(error) => audit
+                    .violations
+                    .push(format!("{name}: dense pointer audit failed: {error}")),
+            }
+        });
+
+        routed_gpu
+            .bind_thread()
+            .map_err(|error| format!("deepseek4: bind routed owner for audit: {error}"))?;
+        self.routed.visit_tensors(&mut |name, tensor| {
+            audit.routed_tensor_count += 1;
+            audit.routed_bytes += tensor.buf.size();
+            match routed_gpu.hip.pointer_get_attributes(&tensor.buf) {
+                Ok(attr) if attr.device == routed_gpu.device_id => {}
+                Ok(attr) => audit.violations.push(format!(
+                    "{name}: routed owner device {} != expected {}",
+                    attr.device, routed_gpu.device_id
+                )),
+                Err(error) => audit
+                    .violations
+                    .push(format!("{name}: routed pointer audit failed: {error}")),
+            }
+        });
+        if audit.violations.is_empty() {
+            Ok(audit)
+        } else {
+            Err(format!(
+                "deepseek4: heterogeneous pointer-owner audit failed: {}",
+                audit.violations.join("; ")
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeepseekV4OwnershipAudit {
+    pub dense_tensor_count: usize,
+    pub dense_bytes: usize,
+    pub routed_tensor_count: usize,
+    pub routed_bytes: usize,
+    pub violations: Vec<String>,
+}
+
+/// Per-layer state for the compressed-KV indexer (Phase 2, Lever 3).
+///
+/// Active only on layers with `compress_ratios[l] > 0`. Each layer
+/// holds:
+/// - a sparse compressed-K cache at stride `compress_ratios[l]`
+/// - scratch for the current-step top-k position indices
+///
+/// See `docs/plans/deepseek4-phase2-indexer.md` for the full kernel
+/// design and forward sequence.
+pub struct IndexerLayerState {
+    /// `compress_ratios[layer]` — stride of the compressed cache.
+    /// `0` means this layer doesn't use the indexer (full SWA only).
+    pub compress_ratio: u32,
+
+    // ── Main-attention compressor state (ratio > 0) ────────────────
+    /// Compressed KV cache `[max_compressed_pos, head_dim]`. F32 on existing
+    /// routes; F16 on the exact gfx1201 MQ2R TP3/TP4 long-context route. Holds
+    /// gated-pooled compressed values at slot pos//ratio. Used by main
+    /// attention's gather step to extend SWA window.
+    pub main_kv_cache: Option<rdna_compute::GpuTensor>,
+    /// Per-position kv state buffer `[coff*ratio, coff*head_dim]` F32.
+    /// Holds raw kv values within the current and (for overlap=true)
+    /// previous compress window.
+    pub main_kv_state: Option<rdna_compute::GpuTensor>,
+    /// Per-position score buffer `[coff*ratio, coff*head_dim]` F32 with
+    /// hc_*.ape positional bias added. Pooled via softmax to compress kv.
+    pub main_score_state: Option<rdna_compute::GpuTensor>,
+
+    // ── Indexer state (ratio == 4 only) ────────────────────────────
+    /// Indexer-specific compressed KV cache `[max_compressed_pos, idx_head_dim]`
+    /// Built by indexer's separate compressor. Uses the same storage dtype as
+    /// `main_kv_cache` and is converted to F32 by scoring kernels.
+    pub indexer_kv_cache: Option<rdna_compute::GpuTensor>,
+    /// Exact gfx1201 TP peer table for block-cyclic compressor storage.
+    /// Entries are stable VMM reservation bases, not owning buffers.
+    pub main_kv_cache_shards: [usize; 4],
+    pub indexer_kv_cache_shards: [usize; 4],
+    pub cache_shard_count: usize,
+    pub indexer_kv_state: Option<rdna_compute::GpuTensor>,
+    pub indexer_score_state: Option<rdna_compute::GpuTensor>,
+    /// Per-step indexer scratch:
+    ///   q_idx [n_idx_heads, idx_head_dim] = [64, 128]
+    ///   weights [n_idx_heads] = [64]
+    ///   index_score [n_compressed] (per current step)
+    ///   topk_indices [index_topk = 512]
+    pub q_idx: Option<rdna_compute::GpuTensor>,
+    pub idx_weights: Option<rdna_compute::GpuTensor>,
+    pub index_score: Option<rdna_compute::GpuTensor>,
+    pub topk_idx_indices: Option<rdna_compute::GpuTensor>,
+    /// Two-stage merge-tree top-K workspace (F3/G1), `[max_compressed]` each,
+    /// run j at element offset j*512. `topk_ws_indices` is an F32 tensor
+    /// holding an i32 payload (same convention as `topk_idx_indices`).
+    /// Lazy-alloc by indexer_forward ONLY when the two-stage path is selected.
+    pub topk_ws_scores: Option<rdna_compute::GpuTensor>,
+    pub topk_ws_indices: Option<rdna_compute::GpuTensor>,
+
+    // Compressor per-step scratch (re-used main and indexer; sized for
+    // the LARGER of the two — main has coff*head_dim = 1024 for ratio=4,
+    // indexer has 256). Lazy-alloc by compressor_forward.
+    /// Per-step kv = wkv @ x   [proj_dim = coff*head_dim] F32.
+    pub comp_kv_buf: Option<rdna_compute::GpuTensor>,
+    /// Per-step score = wgate @ x + ape   [proj_dim] F32.
+    pub comp_score_buf: Option<rdna_compute::GpuTensor>,
+    /// Concat scratch for overlap-pool   [2*ratio, head_dim] F32.
+    pub comp_concat_kv: Option<rdna_compute::GpuTensor>,
+    pub comp_concat_score: Option<rdna_compute::GpuTensor>,
+    /// One-row F32 commit stage. F16 cache routes perform pool, RMSNorm, and
+    /// RoPE here, then round once at the final cache store.
+    pub comp_cache_row_f32: Option<rdna_compute::GpuTensor>,
+}
+
+/// Per-layer scratch for the main attention path's gathered K/V rows.
+///
+/// The main attention attends to `sliding_window + index_topk` total
+/// positions per step: a bounded ring of the last 128 raw KV rows
+/// (SWA window) plus 512 rows gathered from the indexer's top-k.
+pub struct MainAttentionLayerState {
+    /// SWA ring K cache `[n_kv_heads, head_dim, sliding_window]` F32.
+    /// `None` until `decode_step` allocates on first call.
+    pub swa_k: Option<rdna_compute::GpuTensor>,
+    /// SWA ring V cache. DeepSeek V4 has tied K=V so this is a copy of swa_k.
+    pub swa_v: Option<rdna_compute::GpuTensor>,
+
+    /// Full positional K/V cache for indexer-gathered attention. Layout:
+    /// `[max_ctx, n_kv_heads * head_dim]` F32. Written at each decode
+    /// step (after tail-RoPE). Used by the modified main attention when
+    /// the indexer's top-K points to positions outside the SWA window.
+    ///
+    /// DeepSeek V4 has tied K=V so we keep one buffer; `full_v_cache` is None
+    /// in practice and we re-use `full_k_cache` for both. Field kept for
+    /// future-proofing models with untied K/V.
+    pub full_k_cache: Option<rdna_compute::GpuTensor>,
+    pub full_v_cache: Option<rdna_compute::GpuTensor>,
+
+    /// Gather scratch — concat of SWA-window K/V + indexer-gathered K/V
+    /// for the modified attention pass. `[n_kv_heads, head_dim,
+    /// sliding_window + index_topk]` F32, lazy-alloc.
+    pub gathered_k: Option<rdna_compute::GpuTensor>,
+    pub gathered_v: Option<rdna_compute::GpuTensor>,
+}
+
+/// Reusable host buffers for the hash-router FALLBACK path in
+/// `ffn_hash_routed` (when `layer.tid2eid_dev` is missing). Clear+reuse
+/// across hash-routed layers; capacity sized to `num_experts_per_tok`.
+#[derive(Debug, Default)]
+pub struct HashTopkHostScratch {
+    pub topk_ids: Vec<u32>,
+    pub idx_i32: Vec<i32>,
+    pub idx_bytes: Vec<u8>,
+    pub w_scaled: Vec<f32>,
+    pub w_bytes: Vec<u8>,
+}
+
+impl HashTopkHostScratch {
+    pub fn with_capacity(k: usize) -> Self {
+        Self {
+            topk_ids: Vec::with_capacity(k),
+            idx_i32: Vec::with_capacity(k),
+            idx_bytes: Vec::with_capacity(k * 4),
+            w_scaled: Vec::with_capacity(k),
+            w_bytes: Vec::with_capacity(k * 4),
+        }
+    }
+
+    /// Drop lengths to 0 while keeping capacity for the next layer.
+    pub fn clear(&mut self) {
+        self.topk_ids.clear();
+        self.idx_i32.clear();
+        self.idx_bytes.clear();
+        self.w_scaled.clear();
+        self.w_bytes.clear();
+    }
+}
+
+/// DeepSeek V4 per-decode state. Held on the daemon's per-session struct,
+/// reused across decode steps. Allocated once via `new_state`.
+pub struct DeepseekV4State {
+    /// Logical and currently-active compressed-cache capacity. The logical
+    /// horizon follows `max_position_embeddings`; the active launch/scratch
+    /// bucket grows automatically at request boundaries.
+    pub compressor_capacity: CompressorCapacityPlan,
+
+    /// Rank-local physical ownership for the long-lived main/indexer
+    /// compressor caches. Small recurrent rings remain replicated.
+    pub compressor_cache_placement: CompressorCachePlacement,
+    /// Admitted storage backend for the model-owned long-lived compressor cache.
+    pub compressor_cache_backend: hipfire_runtime::kv_backend::KvBackend,
+
+    /// Storage dtype for the two long-lived compressor caches only. All
+    /// compressor arithmetic, score reductions, recurrent rings, and scratch
+    /// remain F32.
+    pub compressor_cache_dtype: rdna_compute::DType,
+
+    /// Physical device ids granted read/write access to every sharded VMM
+    /// cache reservation. Empty on replicated and single-GPU routes.
+    pub compressor_cache_access_devices: [i32; 4],
+    pub compressor_cache_access_count: usize,
+
+    /// Per-layer (43 + 1 MTP = 44). Layers with `compress_ratio == 0`
+    /// skip the indexer.
+    pub _indexer: Vec<IndexerLayerState>,
+    pub _attention: Vec<MainAttentionLayerState>,
+
+    /// Hyper-Connections residual streams `[hc_mult = 4, hidden = 4096]`.
+    /// Stored as F32 to match hipfire's standard residual convention
+    /// (llama / qwen35 use f32 residuals + f32 RMSNorm). Quantized
+    /// kernels handle the f32 input directly.
+    /// `None` until `decode_step` allocates on first call.
+    pub residual_streams: Option<rdna_compute::GpuTensor>,
+
+    /// Alternate `[hc_mult, hidden]` output for the decode HC mixers.
+    ///
+    /// The attention and FFN mixers each swap this with `residual_streams`,
+    /// eliminating two device copies per layer. There are exactly two swaps
+    /// per layer, so the externally visible buffer identity is restored at
+    /// every decode boundary (important for graph and retained replay).
+    pub residual_streams_next: Option<rdna_compute::GpuTensor>,
+
+    /// Single-row embedding scratch `[hidden]` for the current decode
+    /// step's token lookup. F32 to match residual_streams convention.
+    pub embed_scratch: Option<rdna_compute::GpuTensor>,
+
+    /// Per-step scratch `[hidden]` F32 — used for RMSNorm output,
+    /// FWHT-rotated input to first GEMV, etc. Reused across layers.
+    pub tmp: Option<rdna_compute::GpuTensor>,
+
+    /// Plain RMSNorm'd attention-side input `[hidden]` F32 — no FWHT.
+    /// Mirrors `tmp` but skips the rotation step. Consumed by F32 (F16-
+    /// source) non-expert GEMVs (`--non-expert-f16` antirez recipe) since
+    /// `gemv_f32` expects un-rotated input. Computed once per layer in
+    /// `q_lora` alongside `tmp`.
+    pub tmp_plain: Option<rdna_compute::GpuTensor>,
+
+    /// MTP pre-block scratch — RMSNorm output of the embed input
+    /// `[hidden]` F32. Holds `mtp_enorm(embed_lookup(next_token))`
+    /// across the two-GEMV `mtp_e_proj @ ... + mtp_h_proj @ ...` fusion.
+    /// Only allocated when `mtp_forward` is called.
+    pub mtp_e_norm_scratch: Option<rdna_compute::GpuTensor>,
+
+    /// MTP pre-block scratch — RMSNorm output of the hidden input
+    /// `[hc_mult, hidden]` F32. Holds `mtp_hnorm(h_n)` applied per HC row
+    /// (rmsnorm_batched). Same lazy-allocation pattern as
+    /// `mtp_e_norm_scratch`. Reallocated if hc_mult ever changes.
+    pub mtp_h_norm_scratch: Option<rdna_compute::GpuTensor>,
+
+    /// Post-layer-block residual stream `[hc_mult, hidden]` F32 from the
+    /// most-recent `decode_step` or `mtp_forward` call. Per antirez/ds4
+    /// reference, DeepSeek V4 MTP consumes the FULL HC stream (not just stream 0)
+    /// of the previous position as its `h_n` input — capturing only stream
+    /// 0 discards 75% of the HC signal and empirically pins K=2 acceptance
+    /// at ~50%. Populated by both `final_norm_and_head` (decode path) and
+    /// `mtp_forward` step 7 so `speculative_decode_step` can chain K MTP
+    /// iterations.
+    pub mtp_last_hidden: Option<rdna_compute::GpuTensor>,
+
+    /// Q-LoRA bottleneck `[q_lora_rank = 1024]` F32. Output of
+    /// `wq_a @ x`, input to `wq_b`. Reused across layers.
+    pub q_lat: Option<rdna_compute::GpuTensor>,
+
+    /// Q-LoRA bottleneck rotated `[q_lora_rank]` F32. FWHT-rotated
+    /// view of q_lat, input to the MQ4 GEMV against wq_b.
+    pub q_lat_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Full Q `[n_heads * head_dim = 64 * 512 = 32768]` F32. Output
+    /// of `wq_b @ q_lat_rot`. Tail-only RoPE applied in place.
+    pub q: Option<rdna_compute::GpuTensor>,
+
+    /// Joint KV stream `[n_kv_heads * head_dim = 1 * 512 = 512]` F32.
+    /// Output of `wkv @ x`. DeepSeek V4 uses tied K=V via this single vector
+    /// (MQA with V tied to K — see project memory for the layout
+    /// open question; revisit during numerical-correctness gate).
+    /// Tail-only RoPE applied to last `qk_rope_head_dim = 64` dims.
+    pub kv: Option<rdna_compute::GpuTensor>,
+
+    /// Position counter for RoPE. Stored as a 1-element F32 GpuTensor
+    /// where we write the i32 position bits via memcpy_htod (the
+    /// rope_tail kernel reinterprets the bytes as int via cast).
+    ///
+    /// HIP-graphs note: in the graph-capture path (`HIPFIRE_DEEPSEEK4_GRAPH=1`)
+    /// this buffer is a sub_offset slice of `pos_array_device`, written
+    /// ONCE per token at decode_step entry from `pos_array_host`. In the
+    /// legacy direct-dispatch path it's a standalone [1] F32 buffer that
+    /// gets overwritten per layer.
+    pub pos_buf: Option<rdna_compute::GpuTensor>,
+
+    /// Separate position buffer for the indexer compressor's tail-RoPE
+    /// step. Distinct from `pos_buf` because the compressor uses a
+    /// start-of-window position `(pos / ratio) * ratio`, while the main
+    /// attention's inverse-rope (called after the compressor) needs the
+    /// current `position`. Sharing one buffer would clobber the value
+    /// the main-attn inverse rope reads.
+    pub comp_pos_buf: Option<rdna_compute::GpuTensor>,
+
+    /// HIP-graphs prerequisite: per-layer pre-computed position array
+    /// `[(num_hidden_layers + 1) * 3]` i32 (stored as F32 bits — kernels
+    /// reinterpret). Layout per layer: `[qk_pos, main_comp_rope_pos,
+    /// indexer_comp_rope_pos]`. Filled ONCE per decode_step from
+    /// `pos_array_host`, then sliced for per-layer kernel reads. Lets us
+    /// lift the ~130 per-token `memcpy_htod` pos_buf writes out of the
+    /// captured region so a single graph replay covers an entire decode.
+    pub pos_array_device: Option<rdna_compute::GpuTensor>,
+
+    /// Stable-pointer host source for `pos_array_device`. Heap-allocated
+    /// `Box<[i32]>` so the underlying address stays valid across graph
+    /// replays — captured memcpy nodes re-read this pointer on each replay
+    /// and find the values we wrote for the current position.
+    pub pos_array_host: Option<Box<[i32]>>,
+
+    /// First-call gate for the HIP graph capture path. The first
+    /// `decode_step_with_graph` call after `HIPFIRE_DEEPSEEK4_GRAPH=1` runs
+    /// direct so kernel JIT and lazy scratch allocations (rope buffers,
+    /// indexer scratch, FFN scratch, MoE expert pointers, etc.) all
+    /// happen OUTSIDE any captured region. The second call captures the
+    /// fully warm forward; the third and later calls replay it. Without
+    /// this flag, the first capture would hit
+    /// `hipMalloc not permitted under stream capture` and fail.
+    pub ar_forward_warmed_up: bool,
+
+    /// Single-i32 device buffer holding the current step's `token_id`.
+    /// Read by `hash_router_normalize_f32_buf` so the captured graph
+    /// re-reads it on every replay (mirrors the `pos_array_*` pattern).
+    /// Lazy-allocated by the first hash-routed layer that needs it.
+    pub token_id_buf: Option<rdna_compute::GpuTensor>,
+
+    /// Stable host-side source for `token_id_buf`. The captured htod
+    /// node re-reads this pointer on every graph_launch — must be a
+    /// heap allocation so the address survives across replays.
+    pub token_id_host: Option<Box<[i32; 1]>>,
+
+    /// Ten-slot device buffer for SWA + compressor runtime state.
+    /// Layout (all i32 stored as F32 bits):
+    ///   [0] swa_slot          = pos % sliding_window
+    ///   [1] n_valid_swa       = min(pos + 1, sliding_window)
+    ///   [2] n_compressed_4    = min((pos + 1) / 4, max_compressed)
+    ///   [3] n_compressed_128  = min((pos + 1) / 128, max_compressed)
+    ///   [4] k_active_4        = min(index_topk, n_compressed_4)
+    ///   [5] k_active_128      = min(topk_window, n_compressed_128)
+    ///   [6] ring_slot_4       = ring write slot for ratio=4 state
+    ///                            buffer (overlap path: 4 + pos%4)
+    ///   [7] commit_slot_4     = pos/4 if (pos+1)%4 == 0 else -1
+    ///   [8] ring_slot_128     = pos % 128 (ratio=128 state ring slot)
+    ///   [9] commit_slot_128   = pos/128 if (pos+1)%128 == 0 else -1
+    ///
+    /// All values derived from `state.n_tokens` at decode_step entry.
+    /// The `_buf` variants of SWA / topk-gather / topk-attention /
+    /// compressor kernels read the relevant slots so captured HIP graphs
+    /// pick up new positions on each replay without re-capture. Slots
+    /// 7 and 9 store -1 (sentinel) on non-commit positions so the
+    /// commit kernels can early-return without writing.
+    pub attn_state_buf: Option<rdna_compute::GpuTensor>,
+    /// Stable-pointer host source for `attn_state_buf`. Same rationale
+    /// as `pos_array_host`: captured memcpy nodes re-read this pointer
+    /// on each graph replay and find the values written for the current
+    /// position.
+    pub attn_state_host: Option<Box<[i32; 12]>>,
+
+    /// Per-token attention output `[hidden]` F32, fed to HC attn mix
+    /// as the `transform_out` arg. Currently a stub: holds a sliced
+    /// view of `q` until real attention + O-LoRA lands.
+    pub attn_out: Option<rdna_compute::GpuTensor>,
+
+    /// Per-token FFN output `[hidden]` F32, fed to HC FFN mix as
+    /// `transform_out`. Currently = shared expert output (real),
+    /// routed experts pending.
+    pub ffn_out: Option<rdna_compute::GpuTensor>,
+
+    /// Routed-only FFN partial used by the gfx1151 dual-stream decode path.
+    /// The main stream writes this while the side stream evaluates the shared
+    /// expert into `ffn_out`; after the streams join, the partial is added to
+    /// `ffn_out` before the HC mix.
+    pub ffn_routed_overlap: Option<rdna_compute::GpuTensor>,
+    /// Persistent side-stream resources for shared-vs-routed MoE overlap.
+    /// Constructed before AR graph capture and explicitly destroyed by
+    /// `free_gpu`; leaving them in the per-session state avoids global stream
+    /// ownership and keeps the optimization model/session scoped.
+    pub ffn_overlap_stream: Option<hip_bridge::Stream>,
+    pub ffn_overlap_fork_event: Option<hip_bridge::Event>,
+    pub ffn_overlap_join_event: Option<hip_bridge::Event>,
+
+    /// FFN normalised input `[hidden]` F32. RMSNorm(stream0, ffn_norm)
+    /// then FWHT-rotated for the shared-expert MQ4 GEMVs.
+    pub ffn_x_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Plain RMSNorm'd FFN-side input `[hidden]` F32 — no FWHT. Mirror of
+    /// `ffn_x_rot` for F32 (F16-source) non-expert GEMVs (antirez recipe).
+    pub ffn_x_plain: Option<rdna_compute::GpuTensor>,
+
+    /// Shared expert SwiGLU gate scratch `[moe_intermediate=2048]` F32.
+    pub ffn_gate: Option<rdna_compute::GpuTensor>,
+    /// Shared expert SwiGLU up scratch `[moe_intermediate]` F32.
+    pub ffn_up: Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated silu(gate)*up for the down GEMV.
+    pub ffn_silu_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Final pre-lm_head normalized residual `[hidden]` F32. Output
+    /// of the global RMSNorm against `output_norm`.
+    pub final_norm: Option<rdna_compute::GpuTensor>,
+
+    /// LM head output logits `[vocab_size = 129280]` F32. Output of
+    /// `head_weight @ final_norm`.
+    pub logits: Option<rdna_compute::GpuTensor>,
+
+    /// FWHT-rotated `final_norm` for the MQ4 head GEMV. Shape `[hidden]`.
+    pub final_norm_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Input-mapping output: `x_in = A · X`. Fed to the transform (attn
+    /// or FFN) as its [hidden] input.
+    pub hc_x_in: Option<rdna_compute::GpuTensor>,
+
+    /// mHC control vector `[24]` F32, set by `hc_compute_control` and
+    /// consumed by `hc_mix_4stream`. Allocated once per session.
+    /// Layout: c[0..4]=Ã, c[4..20]=B̃, c[20..24]=C̃.
+    pub hc_c: Option<rdna_compute::GpuTensor>,
+
+    /// MoE router scores `[n_routed_experts = 256]` F32, set by the
+    /// router step (gate.weight @ ffn_input + bias → sqrt_softplus).
+    pub router_scores: Option<rdna_compute::GpuTensor>,
+    /// Top-K expert indices, allocated as F32 view but interpreted
+    /// as i32. Shape `[num_experts_per_tok = 6]`.
+    pub topk_indices: Option<rdna_compute::GpuTensor>,
+    /// Per-routed-expert output scratch `[hidden]` F32. Reused for
+    /// each of the K=6 selected experts; weighted-accumulated into
+    /// `ffn_out` via `scaled_add_inplace_cpu_scalar_f32`. Legacy
+    /// fallback-path scratch (no longer reachable from forward.rs).
+    pub routed_expert_out: Option<rdna_compute::GpuTensor>,
+
+    /// Phase 1 perf: fused MoE dispatch scratch.
+    /// `moe_topk_indices` [k_top] i32, `moe_topk_weights` [k_top] f32
+    /// (pre-multiplied by route_scale_override). Filled per-token from
+    /// CPU top-K result.
+    pub moe_topk_indices: Option<rdna_compute::GpuTensor>,
+    pub moe_topk_weights: Option<rdna_compute::GpuTensor>,
+    /// Per-expert SwiGLU intermediate buffers `[k_top × intermediate]`.
+    pub moe_gate_batch: Option<rdna_compute::GpuTensor>,
+    pub moe_up_batch: Option<rdna_compute::GpuTensor>,
+    pub moe_rot_batch: Option<rdna_compute::GpuTensor>,
+    /// `[k_top × hidden]` per-expert down outputs for the deterministic MoE combine.
+    pub moe_down_expert_outputs: Option<rdna_compute::GpuTensor>,
+
+    /// Buffer of all-ones, length `head_dim`, used as the weight arg
+    /// to the per-head Q RMSNorm (upstream DeepSeek V4 has NO learnable scale
+    /// on the post-wq_b Q-norm, just rsqrt(mean(sq)+eps)). Allocated
+    /// once on first attention layer.
+    pub q_head_ones: Option<rdna_compute::GpuTensor>,
+
+    /// Raw attention output `[n_heads, head_dim]` F32 = 32768 elems.
+    /// Fed into the O-LoRA projection (wo_a + wo_b → state.attn_out).
+    pub attn_out_raw: Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated `attn_out_raw` for wo_a GEMV input.
+    pub attn_out_raw_rot: Option<rdna_compute::GpuTensor>,
+    /// wo_a output `[n_groups * o_lora_rank]` F32 = 8192 elems.
+    pub wo_a_out: Option<rdna_compute::GpuTensor>,
+    /// FWHT-rotated wo_a_out for the wo_b GEMV input.
+    pub wo_a_out_rot: Option<rdna_compute::GpuTensor>,
+
+    /// Head HC pre-weights `[hc_mult=4]` F32 from hc_head_compute_pre.
+    pub head_hc_pre: Option<rdna_compute::GpuTensor>,
+    /// Head HC combined-streams output `[hidden]` F32 → output_norm → lm_head.
+    pub head_hc_out: Option<rdna_compute::GpuTensor>,
+
+    /// Batched verify lm_head scratch (spec-decode). The lm_head weight is
+    /// `[vocab, hidden]` (~565 MB Q8) and the GEMV is pure weight-BW-bound;
+    /// the old per-position loop re-read it K times per window. These cache
+    /// the staging buffers so the verifier reads it ONCE per window:
+    ///   `head_norm_batch`   — per-position pre-lm_head normed acts `[K, hidden]` F32
+    ///   `head_x_f16`        — F16-staged GEMM input `[K*hidden]`
+    ///   `head_logits_batch` — `[K, vocab]` logits from the single batched GEMV
+    pub head_norm_batch: Option<rdna_compute::GpuTensor>,
+    pub head_x_f16: Option<rdna_compute::GpuTensor>,
+    pub head_logits_batch: Option<rdna_compute::GpuTensor>,
+
+    // ── DSpark draft-module state (lazy; only allocated when the DSpark
+    //    drafter is loaded and `dspark_forward` runs). ────────────────
+    /// Per-stage committed main_kv SWA ring `[n_kv, head_dim, window]`.
+    /// One ring per DSpark stage (each stage attends over its own
+    /// running main_kv history). Lazily allocated on first
+    /// `dspark_forward` call; `dspark_swa_k[s] == None` until then.
+    pub dspark_swa_k: Vec<Option<rdna_compute::GpuTensor>>,
+    /// Dedicated block-scratch (`max_batch >= block_size`) for the DSpark
+    /// 3-stage chain. Allocated once and reused across decode steps.
+    pub dspark_pbs: Option<crate::forward::PrefillBatchScratch>,
+    /// `main_x = main_norm(main_proj(main_hidden))` `[hidden]` — computed
+    /// once per `dspark_forward` (forward_embed) and shared by all stages.
+    pub dspark_main_x: Option<rdna_compute::GpuTensor>,
+    /// Bidirectional staging buffer `[block, head_dim, stage_w]` for the
+    /// per-stage attention. Constant-sized (block/head_dim/win are model
+    /// constants) and fully overwritten every stage by `dspark_stage_kv`
+    /// (including the zeroed tail), so it is allocated once and reused across
+    /// decode steps rather than per `dspark_forward` call — which leaked it on
+    /// any early `?` before the success-path free.
+    pub dspark_staged: Option<rdna_compute::GpuTensor>,
+
+    // ── DSpark target-hidden capture (gated; populated by the batched
+    //    trunk forward when `dspark_capture_active` is set). ───────────
+    /// When false (default) the capture block in `forward_prefill_batch_chunk`
+    /// is a byte-for-byte no-op. Set true only by the DSpark drafter path
+    /// before a prefill whose target-layer hidden states it needs.
+    pub dspark_capture_active: bool,
+    /// Trunk layer indices whose post-FFN HC-mean-pooled hidden state is
+    /// captured (e.g. `[40, 41, 42]`). The capture slot for a layer is its
+    /// index within this Vec.
+    pub dspark_target_layers: Vec<usize>,
+    /// Capture buffer `[max_batch, n_target_layers, hidden]` F32. Lazily
+    /// allocated inside the capture block (needs `pbs.max_batch`).
+    pub dspark_caps: Option<rdna_compute::GpuTensor>,
+    /// `[max_batch, hc_mult=4]` F32 filled with `0.25` — the mean-pool
+    /// weight vector fed to `hc_input_map_4stream_batched`. Lazy.
+    pub dspark_cap_ones: Option<rdna_compute::GpuTensor>,
+    /// Assembled `[n_target_layers * hidden]` main-hidden vector, the
+    /// concatenation of the captured per-target-layer slots for one batch
+    /// position. Reused across `dspark_assemble_main_hidden` calls.
+    pub dspark_main_hidden: Option<rdna_compute::GpuTensor>,
+    /// Trunk-sized PrefillBatchScratch used by the generic `DsparkDrafter`
+    /// to run the bootstrap (1-token capture) and verify (K+1 token trunk
+    /// prefill) forwards. Separate from `dspark_pbs` (which is body-owned
+    /// and sized to the DSpark block, not the trunk verify window).
+    /// Lazily allocated by `capture_seed_main_hidden` / `new_spec_scratch`.
+    pub dspark_verify_pbs: Option<crate::forward::PrefillBatchScratch>,
+
+    /// Host-side top-K scratch for the hash-router FALLBACK arm in
+    /// `ffn_hash_routed` (when `layer.tid2eid_dev` is missing). Sized to
+    /// `num_experts_per_tok` and reused across hash-routed layers so the
+    /// d2h/host-gather/h2d path does not allocate per layer.
+    pub hash_topk_host: HashTopkHostScratch,
+
+    /// Monotonic position counter — how many tokens this session has
+    /// processed. Used to compute the SWA cache slot (`pos % window`)
+    /// and number of valid cached positions.
+    pub n_tokens: u64,
+
+    pub _scaffold: (),
+}
+
+impl DeepseekV4State {
+    pub fn new(cfg: &DeepseekV4Config) -> Result<Self, String> {
+        let n_layers_total = cfg.num_hidden_layers + cfg.num_nextn_predict_layers;
+        let mut indexer = Vec::with_capacity(n_layers_total);
+        let mut attention = Vec::with_capacity(n_layers_total);
+        for layer in 0..n_layers_total {
+            let ratio = *cfg.compress_ratios.get(layer).unwrap_or(&0);
+            indexer.push(IndexerLayerState {
+                compress_ratio: ratio,
+                main_kv_cache: None,
+                main_kv_state: None,
+                main_score_state: None,
+                indexer_kv_cache: None,
+                main_kv_cache_shards: [0; 4],
+                indexer_kv_cache_shards: [0; 4],
+                cache_shard_count: 0,
+                indexer_kv_state: None,
+                indexer_score_state: None,
+                q_idx: None,
+                idx_weights: None,
+                index_score: None,
+                topk_idx_indices: None,
+                topk_ws_scores: None,
+                topk_ws_indices: None,
+                comp_kv_buf: None,
+                comp_score_buf: None,
+                comp_concat_kv: None,
+                comp_concat_score: None,
+                comp_cache_row_f32: None,
+            });
+            attention.push(MainAttentionLayerState {
+                swa_k: None,
+                swa_v: None,
+                full_k_cache: None,
+                full_v_cache: None,
+                gathered_k: None,
+                gathered_v: None,
+            });
+        }
+        Ok(DeepseekV4State {
+            compressor_capacity: CompressorCapacityPlan::new(cfg.max_position_embeddings)?,
+            compressor_cache_placement: CompressorCachePlacement::Replicated,
+            compressor_cache_backend: hipfire_runtime::kv_backend::KvBackend::Vmm,
+            compressor_cache_dtype: rdna_compute::DType::F32,
+            compressor_cache_access_devices: [0; 4],
+            compressor_cache_access_count: 0,
+            _indexer: indexer,
+            _attention: attention,
+            residual_streams: None, // allocated on first `decode_step` (needs Gpu).
+            residual_streams_next: None,
+            embed_scratch: None,
+            tmp: None,
+            tmp_plain: None,
+            mtp_e_norm_scratch: None,
+            mtp_h_norm_scratch: None,
+            mtp_last_hidden: None,
+            q_lat: None,
+            q_lat_rot: None,
+            q: None,
+            kv: None,
+            pos_buf: None,
+            comp_pos_buf: None,
+            pos_array_device: None,
+            pos_array_host: None,
+            ar_forward_warmed_up: false,
+            token_id_buf: None,
+            token_id_host: None,
+            attn_state_buf: None,
+            attn_state_host: None,
+            attn_out: None,
+            ffn_out: None,
+            ffn_routed_overlap: None,
+            ffn_overlap_stream: None,
+            ffn_overlap_fork_event: None,
+            ffn_overlap_join_event: None,
+            ffn_x_rot: None,
+            ffn_x_plain: None,
+            ffn_gate: None,
+            ffn_up: None,
+            ffn_silu_rot: None,
+            final_norm: None,
+            logits: None,
+            final_norm_rot: None,
+            hc_x_in: None,
+            hc_c: None,
+            router_scores: None,
+            topk_indices: None,
+            routed_expert_out: None,
+            moe_topk_indices: None,
+            moe_topk_weights: None,
+            moe_gate_batch: None,
+            moe_up_batch: None,
+            moe_rot_batch: None,
+            moe_down_expert_outputs: None,
+            q_head_ones: None,
+            attn_out_raw: None,
+            attn_out_raw_rot: None,
+            wo_a_out: None,
+            wo_a_out_rot: None,
+            head_hc_pre: None,
+            head_hc_out: None,
+            head_norm_batch: None,
+            head_x_f16: None,
+            head_logits_batch: None,
+            dspark_swa_k: Vec::new(),
+            dspark_pbs: None,
+            dspark_main_x: None,
+            dspark_staged: None,
+            dspark_capture_active: false,
+            dspark_target_layers: Vec::new(),
+            dspark_caps: None,
+            dspark_cap_ones: None,
+            dspark_main_hidden: None,
+            dspark_verify_pbs: None,
+            hash_topk_host: HashTopkHostScratch::with_capacity(cfg.num_experts_per_tok),
+            n_tokens: 0,
+            _scaffold: (),
+        })
+    }
+
+    /// Reset the per-conversation position cursor so the next prefill
+    /// starts at slot 0 of the SWA cache and slot 0 of the compressed-KV
+    /// rings. Mirrors `Qwen2State::reset` — we keep every allocated GPU
+    /// tensor alive (avoiding the realloc churn of `drop + ::new`) and
+    /// rely on the position-derived slot computations
+    /// (`pos % sliding_window`, `pos / ratio`) plus the
+    /// `n_valid = min(pos+1, sliding_window)` clamp in attention to
+    /// ensure stale data beyond the new `n_tokens` is never attended
+    /// to. Future writes overwrite the slots as prefill progresses.
+    ///
+    /// Why this matters: the daemon's stateless OpenAI-API contract
+    /// is "every request carries the full conversation; daemon serves
+    /// it from scratch." Without this reset, the V4F arm's
+    /// `state.n_tokens` accumulated across requests (Qwen-style arches
+    /// already reset their equivalent counters in
+    /// `daemon.rs::"reset"`), so `forward_prefill_batch_chunked` ran
+    /// with `start_pos = sum_of_prior_prefill_lengths` and wrote the
+    /// new conversation AFTER the prior one's KV slots. The model then
+    /// saw two stacked conversations through compressed-KV attention,
+    /// which matches the multi-turn path-recall corruption reported
+    /// in pi-coding-agent sessions (`/home/nick/CLion/tembrane`,
+    /// `/home/n/Downloads`) — the indexer was top-K-selecting
+    /// compressed slots from BOTH the current turn and an earlier
+    /// turn that had a similar-but-distinct embedding.
+    ///
+    /// If/when we add real prefix caching (LCP detection between the
+    /// new prompt and the existing KV-resident tokens), the daemon
+    /// should grow a separate "continue" command that skips this
+    /// reset and uses `start_pos = lcp_len` instead.
+    pub fn reset(&mut self) {
+        self.n_tokens = 0;
+        // mtp_last_hidden carries the prior decode's full HC residual
+        // stream and is only consumed by `mtp_forward` (spec decode).
+        // Leaving it populated would let the first MTP step of a new
+        // turn read stale data; drop the handle so the next request's
+        // first spec step takes the alloc-then-fill path again.
+        self.mtp_last_hidden = None;
+        // Force the next decode loop to retrace the warmup path
+        // (`decode_step` direct dispatch) before re-entering capture.
+        // Pairs with `gpu.invalidate_graph_state()` in the daemon's
+        // reset handler: graph_exec is dropped, ar_forward_warmed_up
+        // is dropped, so the next session's first decode call runs
+        // plain `decode_step` (allocs land out of the captured region),
+        // the second call captures fresh, and replay starts on the
+        // third call against state shaped for THIS session.
+        //
+        // Why this matters: the captured graph bakes the device-buffer
+        // pointers visited at capture time. Across reset() the buffers
+        // themselves are stable, but state-derived host scalars
+        // (compressor rope_pos default differs between
+        // `precompute_positions` "mid" and `update_pos_array_host`
+        // "start") and slot-derived lazy allocs (e.g.
+        // `state._attention[l].gathered_k` only allocates when a
+        // mixed-attention layer first fires) can land INSIDE the
+        // captured region of session-2 if session-1 didn't hit them.
+        // Forcing warmup → capture per session sidesteps the whole
+        // class of capture-time/replay-time staleness — and the cost
+        // is one extra direct-dispatch decode per turn, which is
+        // dwarfed by the prefill it follows.
+        self.ar_forward_warmed_up = false;
+        // Other transient scratch tensors (`tmp`, `tmp_plain`, residual_streams,
+        // attn_state_host, …) are pure per-step working memory: each
+        // forward step writes them before reading, so stale contents
+        // are overwritten on first use and don't need explicit zeroing.
+    }
+
+    /// Zero the persistent per-layer decode caches (SWA ring, full + compressed
+    /// KV, indexer/compressor scratch) so a fresh conversation starts from the
+    /// same clean state as a freshly-launched daemon.
+    ///
+    /// `reset()` only rewinds `n_tokens` and leaves these position-indexed
+    /// caches intact; a short new conversation doesn't overwrite every slot the
+    /// forward reads, so the prior turn's residue bleeds in and drifts greedy
+    /// decode.
+    ///
+    /// Must be called where `gpu` is available (the daemon's lcp==0 fresh-
+    /// conversation handler), not from `reset()` (no gpu there).
+    pub fn zero_decode_caches(&mut self, gpu: &mut rdna_compute::Gpu) {
+        fn z(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t {
+                // VMM owners describe the full logical shape but expose only
+                // their mapped prefix through `buf.size()`. Never zero the
+                // reserved-but-unmapped tail.
+                let bytes = gpu.vmm_mapped_bytes(t).unwrap_or_else(|| t.byte_size());
+                let _ = gpu.hip.memset(&t.buf, 0, bytes.min(t.buf.size()));
+            }
+        }
+        // The compressor `score_state` ring must reset to -inf, NOT 0 (matches
+        // the reference `torch.full(-inf)`): a fresh conversation's first
+        // compressed block has no overlap prev-window, and those unfilled slots
+        // must get zero softmax weight in the pooling. Reset to 0 would instead
+        // pool the prior turn's stale window (or dilute block 0 with zeros).
+        fn zinf(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t {
+                let _ = gpu.fill_f32(t, f32::NEG_INFINITY);
+            }
+        }
+        for l in &self._indexer {
+            z(gpu, &l.main_kv_cache);
+            z(gpu, &l.main_kv_state);
+            zinf(gpu, &l.main_score_state);
+            z(gpu, &l.indexer_kv_cache);
+            z(gpu, &l.indexer_kv_state);
+            zinf(gpu, &l.indexer_score_state);
+            z(gpu, &l.comp_kv_buf);
+            z(gpu, &l.comp_score_buf);
+            z(gpu, &l.comp_concat_kv);
+            z(gpu, &l.comp_concat_score);
+            z(gpu, &l.comp_cache_row_f32);
+        }
+        for l in &self._attention {
+            z(gpu, &l.swa_k);
+            z(gpu, &l.swa_v);
+            z(gpu, &l.full_k_cache);
+            z(gpu, &l.full_v_cache);
+            z(gpu, &l.gathered_k);
+            z(gpu, &l.gathered_v);
+        }
+    }
+
+    /// Release every GPU buffer this state owns back to the pool.
+    /// Consumes self. Mirrors `Qwen2State::free_gpu`.
+    ///
+    /// Without this, `unload_model` for an `arch_id=9` LoadedModel would
+    /// drop `DeepseekV4State` via plain Rust Drop, which doesn't return
+    /// the pool-managed GpuTensors — every load/unload cycle leaks the
+    /// per-session scratch + per-layer SWA/indexer/compressor caches
+    /// until the daemon exits. Idle eviction can't reclaim VRAM in that
+    /// regime, defeating its purpose.
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        if let Some(stream) = self.ffn_overlap_stream.as_ref() {
+            let _ = gpu.hip.stream_synchronize(stream);
+        }
+        if let Some(event) = self.ffn_overlap_fork_event.take() {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(event) = self.ffn_overlap_join_event.take() {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(stream) = self.ffn_overlap_stream.take() {
+            let _ = gpu.hip.stream_destroy(stream);
+        }
+        // Per-layer indexer + main-attention caches.
+        for mut l in self._indexer.drain(..) {
+            free_opt(gpu, &mut l.main_kv_cache);
+            free_opt(gpu, &mut l.main_kv_state);
+            free_opt(gpu, &mut l.main_score_state);
+            free_opt(gpu, &mut l.indexer_kv_cache);
+            free_opt(gpu, &mut l.indexer_kv_state);
+            free_opt(gpu, &mut l.indexer_score_state);
+            free_opt(gpu, &mut l.q_idx);
+            free_opt(gpu, &mut l.idx_weights);
+            free_opt(gpu, &mut l.index_score);
+            free_opt(gpu, &mut l.topk_idx_indices);
+            free_opt(gpu, &mut l.topk_ws_scores);
+            free_opt(gpu, &mut l.topk_ws_indices);
+            free_opt(gpu, &mut l.comp_kv_buf);
+            free_opt(gpu, &mut l.comp_score_buf);
+            free_opt(gpu, &mut l.comp_concat_kv);
+            free_opt(gpu, &mut l.comp_concat_score);
+            free_opt(gpu, &mut l.comp_cache_row_f32);
+        }
+        for mut l in self._attention.drain(..) {
+            free_opt(gpu, &mut l.swa_k);
+            free_opt(gpu, &mut l.swa_v);
+            free_opt(gpu, &mut l.full_k_cache);
+            free_opt(gpu, &mut l.full_v_cache);
+            free_opt(gpu, &mut l.gathered_k);
+            free_opt(gpu, &mut l.gathered_v);
+        }
+        // Top-level scratch.
+        free_opt(gpu, &mut self.residual_streams);
+        free_opt(gpu, &mut self.residual_streams_next);
+        free_opt(gpu, &mut self.embed_scratch);
+        free_opt(gpu, &mut self.tmp);
+        free_opt(gpu, &mut self.tmp_plain);
+        free_opt(gpu, &mut self.mtp_e_norm_scratch);
+        free_opt(gpu, &mut self.mtp_h_norm_scratch);
+        free_opt(gpu, &mut self.mtp_last_hidden);
+        free_opt(gpu, &mut self.q_lat);
+        free_opt(gpu, &mut self.q_lat_rot);
+        free_opt(gpu, &mut self.q);
+        free_opt(gpu, &mut self.kv);
+        free_opt(gpu, &mut self.pos_buf);
+        free_opt(gpu, &mut self.comp_pos_buf);
+        free_opt(gpu, &mut self.pos_array_device);
+        free_opt(gpu, &mut self.token_id_buf);
+        free_opt(gpu, &mut self.attn_state_buf);
+        free_opt(gpu, &mut self.attn_out);
+        free_opt(gpu, &mut self.ffn_out);
+        free_opt(gpu, &mut self.ffn_routed_overlap);
+        free_opt(gpu, &mut self.ffn_x_rot);
+        free_opt(gpu, &mut self.ffn_x_plain);
+        free_opt(gpu, &mut self.ffn_gate);
+        free_opt(gpu, &mut self.ffn_up);
+        free_opt(gpu, &mut self.ffn_silu_rot);
+        free_opt(gpu, &mut self.final_norm);
+        free_opt(gpu, &mut self.logits);
+        free_opt(gpu, &mut self.final_norm_rot);
+        free_opt(gpu, &mut self.hc_x_in);
+        free_opt(gpu, &mut self.hc_c);
+        free_opt(gpu, &mut self.router_scores);
+        free_opt(gpu, &mut self.topk_indices);
+        free_opt(gpu, &mut self.routed_expert_out);
+        free_opt(gpu, &mut self.moe_topk_indices);
+        free_opt(gpu, &mut self.moe_topk_weights);
+        free_opt(gpu, &mut self.moe_gate_batch);
+        free_opt(gpu, &mut self.moe_up_batch);
+        free_opt(gpu, &mut self.moe_rot_batch);
+        free_opt(gpu, &mut self.moe_down_expert_outputs);
+        free_opt(gpu, &mut self.q_head_ones);
+        free_opt(gpu, &mut self.attn_out_raw);
+        free_opt(gpu, &mut self.attn_out_raw_rot);
+        free_opt(gpu, &mut self.wo_a_out);
+        free_opt(gpu, &mut self.wo_a_out_rot);
+        free_opt(gpu, &mut self.head_hc_pre);
+        free_opt(gpu, &mut self.head_hc_out);
+        // DSpark draft-module state.
+        for ring in self.dspark_swa_k.drain(..) {
+            if let Some(t) = ring {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.dspark_main_x);
+        free_opt(gpu, &mut self.dspark_staged);
+        free_opt(gpu, &mut self.dspark_caps);
+        free_opt(gpu, &mut self.dspark_cap_ones);
+        free_opt(gpu, &mut self.dspark_main_hidden);
+        if let Some(pbs) = self.dspark_pbs.take() {
+            pbs.free_gpu(gpu);
+        }
+        if let Some(pbs) = self.dspark_verify_pbs.take() {
+            pbs.free_gpu(gpu);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compressor_capacity_grows_at_request_boundaries_to_model_horizon() {
+        let plan = CompressorCapacityPlan::new(1_048_576).unwrap();
+        assert_eq!(plan.max_rows(), 262_144);
+        assert_eq!(plan.active_rows(), 2_048);
+        assert_eq!(plan.prepared_tokens(), 0);
+        assert_eq!(plan.rows_for_tokens(8_192).unwrap(), 2_048);
+        assert_eq!(plan.rows_for_tokens(8_193).unwrap(), 4_096);
+        assert_eq!(plan.prepared_target_for_tokens(1).unwrap(), 8_192);
+        assert_eq!(plan.prepared_target_for_tokens(8_193).unwrap(), 16_384);
+        assert_eq!(plan.prepared_target_for_tokens(524_289).unwrap(), 532_480);
+        assert_eq!(plan.rows_for_tokens(32_768).unwrap(), 8_192);
+        assert_eq!(plan.rows_for_tokens(1_048_576).unwrap(), 262_144);
+        assert!(plan.rows_for_tokens(1_048_577).is_err());
+    }
+
+    #[test]
+    fn compressor_capacity_handles_small_and_partial_model_horizons() {
+        let mut plan = CompressorCapacityPlan::new(101).unwrap();
+        assert_eq!(plan.max_rows(), 26);
+        assert_eq!(plan.active_rows(), 26);
+        assert_eq!(plan.rows_for_tokens(101).unwrap(), 26);
+        assert!(!plan.activate_for_tokens(101).unwrap());
+        plan.mark_prepared(73);
+        plan.mark_prepared(12);
+        assert_eq!(plan.prepared_tokens(), 73);
+        assert!(CompressorCapacityPlan::new(0).is_err());
+    }
+
+    #[test]
+    fn compressor_cache_shards_are_stable_complete_and_balanced() {
+        const WORLD: usize = 3;
+        const BLOCK: usize = CompressorCacheShard::GFX1201_BLOCK_ROWS;
+        let shards: Vec<_> = (0..WORLD)
+            .map(|rank| CompressorCacheShard::new(rank, WORLD, BLOCK).unwrap())
+            .collect();
+
+        for rows in [1, 255, 256, 257, 2_048, 32_768, 262_144] {
+            let local_rows: Vec<_> = shards
+                .iter()
+                .map(|shard| shard.local_rows_for_prefix(rows))
+                .collect();
+            assert_eq!(local_rows.iter().sum::<usize>(), rows);
+            assert!(
+                local_rows.iter().max().unwrap() - local_rows.iter().min().unwrap() <= BLOCK,
+                "rows={rows}, local_rows={local_rows:?}"
+            );
+
+            for global_row in 0..rows {
+                let owner = shards[0].owner(global_row);
+                let local_row = shards[owner]
+                    .global_to_local(global_row)
+                    .expect("owner must map its global row");
+                assert!(local_row < local_rows[owner]);
+                assert_eq!(shards[owner].local_to_global(local_row), global_row);
+                for (rank, shard) in shards.iter().enumerate() {
+                    assert_eq!(shard.global_to_local(global_row).is_some(), rank == owner);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compressor_cache_shard_ownership_does_not_move_when_prefix_grows() {
+        let shard =
+            CompressorCacheShard::new(1, 3, CompressorCacheShard::GFX1201_BLOCK_ROWS).unwrap();
+        let before: Vec<_> = (0..8_192)
+            .filter_map(|global| shard.global_to_local(global).map(|local| (global, local)))
+            .collect();
+        assert!(shard.local_rows_for_prefix(262_144) > shard.local_rows_for_prefix(8_192));
+        for (global, local) in before {
+            assert_eq!(shard.global_to_local(global), Some(local));
+        }
+        assert!(CompressorCacheShard::new(0, 1, 256).is_err());
+        assert!(CompressorCacheShard::new(3, 3, 256).is_err());
+        assert!(CompressorCacheShard::new(0, 3, 0).is_err());
+        assert!(CompressorCacheShard::new(0, 3, 192).is_err());
+    }
+
+    const DEEPSEEK4_CONFIG_JSON: &str = r#"{
+        "vocab_size": 129280, "hidden_size": 4096, "num_hidden_layers": 43,
+        "num_attention_heads": 64, "num_key_value_heads": 1, "head_dim": 512,
+        "max_position_embeddings": 1048576, "rms_norm_eps": 1e-6,
+        "q_lora_rank": 1024, "o_lora_rank": 1024, "qk_rope_head_dim": 64,
+        "o_groups": 8,
+        "n_routed_experts": 256, "n_shared_experts": 1,
+        "num_experts_per_tok": 6, "moe_intermediate_size": 2048,
+        "routed_scaling_factor": 1.5, "topk_method": "noaux_tc",
+        "scoring_func": "sqrtsoftplus", "norm_topk_prob": true,
+        "swiglu_limit": 10.0,
+        "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6,
+        "index_n_heads": 64, "index_head_dim": 128, "index_topk": 512,
+        "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 0],
+        "compress_rope_theta": 160000,
+        "rope_theta": 10000,
+        "rope_scaling": {
+            "factor": 16, "original_max_position_embeddings": 65536,
+            "beta_fast": 32, "beta_slow": 1, "type": "yarn"
+        },
+        "sliding_window": 128,
+        "num_nextn_predict_layers": 1, "num_hash_layers": 3
+    }"#;
+
+    #[test]
+    fn parses_deepseek4_config_shape() {
+        let raw: RawDeepseekV4Config = serde_json::from_str(DEEPSEEK4_CONFIG_JSON).unwrap();
+        assert_eq!(raw.num_hidden_layers, 43);
+        assert_eq!(raw.head_dim, 512);
+        assert_eq!(raw.qk_rope_head_dim, 64);
+        assert_eq!(raw.q_lora_rank, 1024);
+        assert_eq!(raw.o_lora_rank, 1024);
+        assert_eq!(raw.n_routed_experts, 256);
+        assert_eq!(raw.num_experts_per_tok, 6);
+        assert_eq!(raw.hc_mult, 4);
+        assert_eq!(raw.hc_sinkhorn_iters, 20);
+        assert_eq!(raw.index_n_heads, 64);
+        assert_eq!(raw.index_head_dim, 128);
+        assert_eq!(raw.index_topk, 512);
+        assert_eq!(raw.sliding_window, 128);
+        assert_eq!(raw.compress_ratios.len(), 8);
+    }
+
+    #[test]
+    fn parses_dspark_config_and_skips_non_dspark() {
+        // DSpark sidecar metadata envelope (subset of the real config keys).
+        let dspark_meta = r#"{"architecture":"deepseek_v4","config":{
+            "dspark_block_size":5,
+            "dspark_target_layer_ids":[40,41,42],
+            "dspark_markov_rank":256,
+            "dspark_noise_token_id":128799}}"#;
+        let c = DsparkConfig::from_metadata_json(dspark_meta)
+            .expect("DSpark sidecar metadata must parse");
+        assert_eq!(c.block_size, 5);
+        assert_eq!(c.target_layer_ids, vec![40, 41, 42]);
+        assert_eq!(c.markov_rank, 256);
+        assert_eq!(c.noise_token_id, 128799);
+
+        // A trunk / plain-MTP metadata envelope (no dspark_* keys) → None.
+        let plain_meta = r#"{"architecture":"deepseek_v4","config":{"hidden_size":4096}}"#;
+        assert!(DsparkConfig::from_metadata_json(plain_meta).is_none());
+        // Missing config wrapper → None (not a panic).
+        assert!(DsparkConfig::from_metadata_json("{}").is_none());
+    }
+
+    /// Verify the parser handles the actual released DeepSeek V4 config.json
+    /// (snapshot 6976c7ff). Catches schema drift if the upstream
+    /// model card adds or renames fields.
+    #[test]
+    fn parses_real_deepseek4_config_json() {
+        let real_config_path =
+            "/home/nick/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/\
+             snapshots/6976c7ff1b30a1b2cb7805021b8ba4684041f136/config.json";
+        let raw_json = match std::fs::read_to_string(real_config_path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("skipping real-config test — DeepSeek V4 not locally available");
+                return;
+            }
+        };
+        // Real config has extra fields beyond what RawDeepseekV4Config
+        // reads (architectures, attention_bias, etc). serde silently
+        // ignores them — verify we still parse the fields we care about.
+        let raw: RawDeepseekV4Config = serde_json::from_str(&raw_json)
+            .expect("real DeepSeek V4 config.json must parse — schema drift detected");
+
+        // Cross-check against the documented DeepSeek V4 constants.
+        assert_eq!(raw.num_hidden_layers, 43);
+        assert_eq!(raw.head_dim, 512);
+        assert_eq!(raw.qk_rope_head_dim, 64);
+        assert_eq!(raw.q_lora_rank, 1024);
+        assert_eq!(raw.o_lora_rank, 1024);
+        assert_eq!(raw.n_routed_experts, 256);
+        assert_eq!(raw.num_experts_per_tok, 6);
+        assert_eq!(raw.hc_mult, 4);
+        assert_eq!(raw.index_n_heads, 64);
+        assert_eq!(raw.sliding_window, 128);
+
+        // The released checkpoint's compress_ratios has length
+        // num_hidden_layers + num_nextn_predict_layers = 44.
+        assert_eq!(
+            raw.compress_ratios.len(),
+            raw.num_hidden_layers + raw.num_nextn_predict_layers
+        );
+
+        // Check the alternating pattern in the middle layers.
+        // DeepSeek V4 shipped pattern: [0, 0, 4, 128, 4, 128, ..., 4, 0].
+        for (i, &r) in raw.compress_ratios.iter().enumerate() {
+            if i < 2 || i == raw.compress_ratios.len() - 1 {
+                assert_eq!(r, 0, "layer {i}: expected ratio=0, got {r}");
+            } else {
+                let expected = if i % 2 == 0 { 4 } else { 128 };
+                assert_eq!(r, expected, "layer {i}: expected ratio={expected}, got {r}");
+            }
+        }
+
+        // Verify DeepseekV4State::new accepts the real config.
+        // (Reconstruct the full Config from raw to drive State::new.)
+        // Skip — would require a fake HfqFile. The shape test above
+        // is enough for the schema-drift gate.
+    }
+}
