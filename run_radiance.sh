@@ -1,9 +1,13 @@
 #!/bin/bash
-ROCM="${1:-rocm10}"
-case "$ROCM" in
-    rocm7|rocm10) ;;
-    *) echo "usage: $0 [rocm7|rocm10]" >&2; exit 1 ;;
-esac
+ROCM="rocm10"
+BENCH=0
+for a in "$@"; do
+    case "$a" in
+        rocm7|rocm10) ROCM="$a" ;;
+        --bench) BENCH=1 ;;
+        *) echo "usage: $0 [rocm7|rocm10] [--bench]" >&2; exit 1 ;;
+    esac
+done
 CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # -------------------------------
@@ -89,7 +93,33 @@ sed -i '/override-generation-config/c\    --override-generation-config '\''{"tem
 trap 'git -C "$CURDIR/radiance-vllm-mxfp4" checkout -- serve-mxfp4.sh' EXIT
 
 # -------------------------------
-CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 FAST_DRAFT=0 ./serve-mxfp4.sh
+if [ "$BENCH" = 1 ]; then
+	# detached serve: the container is RUNNING when this returns, the engine is not ready yet
+	DETACH=1 CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 FAST_DRAFT=0 ./serve-mxfp4.sh
+	deadline=$((SECONDS + 900))
+	until curl -fsS "http://127.0.0.1:9931/health" >/dev/null 2>&1; do
+	    if [ "$SECONDS" -ge "$deadline" ]; then
+		docker rm -f r9700-qwen3.8-mxfp4
+		echo "server did not become healthy within 900 s" >&2
+		exit 1
+	    fi
+	    sleep 5
+	done
+	# vLLM benchmark client (formerly bench.sh)
+	docker run -it --network host --entrypoint /opt/vllm/bin/vllm -v /models:/models "$IMAGE" bench serve \
+	    --backend openai-chat \
+	    --model models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken \
+	    --served-model-name qwen3.8 \
+	    --base-url "http://127.0.0.1:9931" \
+	    --endpoint "/v1/chat/completions" \
+	    --dataset-name random \
+	    --num-prompts 100 \
+	    --max-concurrency 1 \
+	    --request-rate inf
+	docker rm -f r9700-qwen3.8-mxfp4
+else
+	CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 FAST_DRAFT=0 ./serve-mxfp4.sh
+fi
 # ============ Serving Benchmark Result ============
 # Successful requests:                     100       
 # Failed requests:                         0         
