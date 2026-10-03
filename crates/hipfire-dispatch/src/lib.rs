@@ -18,13 +18,9 @@ pub mod ops;
 pub mod pipeline;
 pub use cpu_exec::{
     cpu_exec_counters, cpu_exec_enabled, cpu_exec_redline_conflict, cpu_offload_active,
-    cpu_quant_for, host_mapped_cpu_capable, log_capture_disabled_once, passback_enabled,
-    reject_cpu_exec_under_redline, run_host_mapped_gemv, run_host_mapped_gemv_residual,
-    split_counters,
-};
-pub use offload_split::{
-    passback_capable_format, probe_synthetic, probe_weight, row_bytes_for, scheduler_snapshot,
-    seed, PassbackOptions, ShapeSnapshot, SplitCalibration,
+    cpu_quant_for, host_mapped_cpu_capable, log_capture_disabled_once,
+    moe_cpu_down_residual, moe_cpu_down_residual_batched, reject_cpu_exec_under_redline,
+    run_host_mapped_gemv, run_host_mapped_gemv_residual,
 };
 pub mod resource;
 pub mod tables;
