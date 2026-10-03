@@ -1,5 +1,7 @@
 #!/bin/bash
 ROCM="rocm10"
+SERVED_MODEL_NAME="qwen3.8"
+#SERVED_MODEL_NAME="qwen3.8:27b-mq4-xts"
 BENCH=0
 for a in "$@"; do
     case "$a" in
@@ -109,7 +111,7 @@ if [ "$BENCH" = 1 ]; then
 	docker run -it --network host --entrypoint /opt/vllm/bin/vllm -v /models:/models "$IMAGE" bench serve \
 	    --backend openai-chat \
 	    --model models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken \
-	    --served-model-name qwen3.8 \
+	    --served-model-name "$SERVED_MODEL_NAME" \
 	    --base-url "http://127.0.0.1:9931" \
 	    --endpoint "/v1/chat/completions" \
 	    --dataset-name random \
