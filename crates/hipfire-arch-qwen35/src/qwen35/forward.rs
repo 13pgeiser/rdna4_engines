@@ -742,6 +742,7 @@ fn moe_ffn_decode_impl<'a>(
                 s.topk_weights,
                 s.down_expanded,
                 ffn.layer_idx,
+                ffn.expert_down_awq_ptrs.is_some(),
             );
         }
     }
