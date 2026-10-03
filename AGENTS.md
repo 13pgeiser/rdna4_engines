@@ -13,7 +13,7 @@ Sync all four with `./git.sh` (runs `git subtree add` or `pull` per dir). Change
 
 ## The local flow (top-level scripts)
 
-- `./run_radiance.sh [rocm7|rocm10]` — the single radiance entry point (default **rocm10**). It prepares **`/models`** (filesystem root, absolute path not `~/models`), builds the docker image **only if missing** (`radiance-vllm-mxfp4:$(cat VERSION)` for rocm7; `rocm10-radiance-vllm-mxfp4:$(cat VERSION)` for rocm10, via a sed-rewritten `Dockerfile.rocm10` with ROCm 10.0 base), writes the 210 W GPU power cap (sudo), and serves via `serve-mxfp4.sh`. Docker, not podman (the subtree README prefers podman). The old split scripts (`base_*_radiance.sh`, `rocm{7,10}_{build,run}_radiance.sh`) are kept intact alongside it.
+- `./run_radiance.sh [rocm7|rocm10]` — the single radiance entry point (default **rocm10**). It prepares **`/models`** (filesystem root, absolute path not `~/models`), builds the docker image **only if missing** (`radiance-vllm-mxfp4:$(cat VERSION)` for rocm7; `rocm10-radiance-vllm-mxfp4:$(cat VERSION)` for rocm10, via a sed-rewritten `Dockerfile.rocm10` with ROCm 10.0 base), writes the 210 W GPU power cap (sudo), and serves via `serve-mxfp4.sh`. Docker, not podman (the subtree README prefers podman).
 - `./build_llama.sh` — builds llama.cpp via `.devops/rocm.Dockerfile` with `AMDGPU_TARGETS=gfx1201`. `./run_llama.sh` serves the GGUF model.
 - `./build_hipfire.sh` — builds the `local/hipfire` deliverable image via `hipfire/Containerfile` (multi-stage, podman-native but docker-compatible; `--target runtime`; no GPU needed at build time).
 - The llama.cpp/radiance servers listen on port **9931** (not the upstream default 8080) and start by writing a 210 W power cap to sysfs via `sudo`.
@@ -22,12 +22,12 @@ Sync all four with `./git.sh` (runs `git subtree add` or `pull` per dir). Change
 
 AMD's `Qwen3.8-27B-Quark-AWQ-MXFP4` **does not load as-is**: its bf16 MTP head is mis-declared in the quark config (fails with `AssertionError: Attempted to load weight (5120, 10240) into (5120, 5120)`). The rewrite is mandatory:
 
-1. `fp8_mtp.py <src> <dst>` → `Qwen3.8-27B-MXFP4-mtpfp8` (needs **torch**; `run_radiance.sh` spins a throwaway venv in `/models` for it)
-2. `mtpfp8-pertoken.py <src config.json> <dst config.json>` → `-pertoken` variant (config-only, no torch; rewrites the 8 `mtp.*` `input_tensors` to per-channel; prints "expect 8")
+1. `radiance/fp8_mtp.py <src> <dst>` → `Qwen3.8-27B-MXFP4-mtpfp8` (needs **torch**; `run_radiance.sh` spins a throwaway venv in `/models` for it)
+2. `radiance/mtpfp8-pertoken.py <src config.json> <dst config.json>` → `-pertoken` variant (config-only, no torch; rewrites the 8 `mtp.*` `input_tensors` to per-channel; prints "expect 8")
 
-Note: `fp8_mtp.py` exists in two copies (top level and in `radiance-vllm-mxfp4/`) and **they differ**; `run_radiance.sh` uses the top-level one.
+Note: `radiance/fp8_mtp.py` and the copy in `radiance-vllm-mxfp4/` **differ**; `run_radiance.sh` uses the `radiance/` one.
 
-`chat_template.jinja` (top level) is auto-downloaded from `froggeric/Qwen-Fixed-Chat-Templates` if missing; `run_radiance.sh` mounts it into the container.
+`radiance/chat_template.jinja` is auto-downloaded from `froggeric/Qwen-Fixed-Chat-Templates` if missing; `run_radiance.sh` mounts it into the container.
 
 ## Radiance stack
 
