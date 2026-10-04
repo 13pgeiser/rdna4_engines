@@ -2589,14 +2589,15 @@ pub use hipfire_runtime::model_load::Layout;
 ///
 /// Follows the same silence contract as the residency report in
 /// [`super::config::apply_offload_policy`]: nothing is printed unless
-/// `memory.offload_exec` was actually configured to `cpu`/`passback` — except for
-/// one informational line when a pass-back share is set in a mode that cannot
-/// read it (the key is inert, not misconfigured; see
-/// [`hipfire_config::memory::stray_passback_share_configured`]).
-pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
-    use hipfire_config::memory::{
-        offload_exec, offload_passback_share, stray_passback_share_configured, OffloadExec,
-    };
+/// `memory.offload_exec` was actually configured to `cpu`, so a stock-vs-branch
+/// log diff stays readable.
+pub fn report_cpu_exec_coverage(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    placement: Option<&hipfire_runtime::offload::Placement>,
+) {
+    use hipfire_config::memory::{offload_exec, OffloadExec};
+    use hipfire_runtime::offload::{ExpertResidency, WeightResidency};
     use std::collections::BTreeSet;
 
     if stray_passback_share_configured() {
@@ -2610,30 +2611,59 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
     if !matches!(mode, OffloadExec::Cpu | OffloadExec::Passback) {
         return;
     }
-    if mode == OffloadExec::Passback {
+    // The loaded placement is the only honest statement of what spilled: the
+    // config-level `i_gpu_start` mirror is 0 for an experts-only spill, so it
+    // would report "nothing is spilled" while every routed expert sits in host
+    // RAM. The `None` route is the pre-placement one; fall back to `i_gpu_start`
+    // there (the dense prefix it mirrors).
+    let (host_layers, expert_layers): (Vec<usize>, Vec<usize>) = match placement {
+        Some(p) => (
+            (0..config.n_layers)
+                .filter(|l| p.layer(*l) == WeightResidency::HostMapped)
+                .collect(),
+            (0..config.n_layers)
+                .filter(|l| p.experts(*l) == ExpertResidency::HostMapped)
+                .collect(),
+        ),
+        None => ((0..config.i_gpu_start).collect(), Vec::new()),
+    };
+    // The layer knob dominates: a host-placed layer's expert axis reads
+    // `HostMapped` even when the model has no routed experts (a dense layer's
+    // expert bytes are zero). Only a model that has an expert tier can have
+    // expert steps on the PCIe path; without one the layer is the whole story.
+    let expert_layers = if config.num_experts == 0 {
+        Vec::new()
+    } else {
+        expert_layers
+    };
+    if host_layers.is_empty() && expert_layers.is_empty() {
         eprintln!(
-            "passback: memory.offload_exec=passback is non-deterministic by design — its CPU/GPU \
-             row split is scheduled per process, so generated tokens may change across runs; \
-             choose cpu or pcie for reproducible output"
-        );
-    }
-    let spilled = config.i_gpu_start;
-    if spilled == 0 {
-        eprintln!(
-            "cpu exec: memory.offload_exec={mode} but nothing is spilled \
-             (memory.gpu_layer_budget leaves every layer resident) — every step stays on the GPU"
+            "cpu exec: memory.offload_exec=cpu but nothing is spilled \
+             (memory.gpu_layer_budget / memory.moe_expert_budget leave every weight resident) — \
+             every step stays on the GPU"
         );
         return;
     }
 
+    let mut spilled: BTreeSet<usize> = host_layers.iter().copied().collect();
+    spilled.extend(expert_layers.iter().copied());
+
     let mut covered = 0usize;
     let mut splittable = 0usize;
     let mut uncovered: BTreeSet<String> = BTreeSet::new();
-    for layer in 0..spilled {
+    for layer in &spilled {
+        // A layer whose routed experts are host-placed is not CPU-covered until
+        // stage 2 expresses their work as seam steps: MoE experts dispatch
+        // through `families::moe`, not `execute_steps`, so the CPU seam cannot
+        // see them and they stay on the PCIe path.
+        if expert_layers.contains(layer) {
+            uncovered.insert("routed-experts (PCIe)".to_string());
+            continue;
+        }
         let mut layer_covered = true;
         let mut layer_splittable = true;
         for t in hfq.tensors() {
-            if crate::serve_engine::tensor_layer_index(&t.name) != Some(layer) {
+            if crate::serve_engine::tensor_layer_index(&t.name) != Some(*layer) {
                 continue;
             }
             // Resolve through the *loader's own* map, not the passthrough table:
@@ -2670,7 +2700,10 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
         uncovered.into_iter().collect::<Vec<_>>().join(", ")
     };
     eprintln!(
-        "cpu exec: {covered}/{spilled} spilled layers fully covered; uncovered quants: {list}"
+        "cpu exec: {covered}/{} spilled layers fully covered by the CPU seam; routed-expert steps \
+         of {} layers stay on the PCIe path; uncovered quants: {list}",
+        spilled.len(),
+        expert_layers.len(),
     );
     if mode == OffloadExec::Passback {
         let min_mib = hipfire_dispatch::offload_split::MIN_SPLIT_BYTES / (1 << 20);
