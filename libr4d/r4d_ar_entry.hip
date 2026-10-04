@@ -803,10 +803,15 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
 }
 
 /* The tiered-int8 wire. Its slot stride is in BYTES, not 16-byte words: the wire is 38 bytes per
- * group of 32 and so is not 16-byte aligned at all. */
+ * group of 32 and so is not 16-byte aligned at all.
+ *
+ * Four-rank blocks issue every all_reduce in place and without `hops`, so a lossy wire lands here
+ * for every message. As in r4d_rad_ar_oneshot_2rank_wht6, a message under `min_bytes` (or one the
+ * groups do not tile) goes to the exact one-shot. In place is safe: each block reads its range of
+ * the input before it writes the same range of the output, and no peer reads this rank's input. */
 extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     ArCall c;
-    int rc = ar_setup(a, &c, 1, 1);
+    int rc = ar_setup(a, &c, 0, 1);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
     if (c.in->dtype == 2) return RAD_E_DTYPE;
@@ -814,8 +819,9 @@ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     int group = 0, group_bytes = 0;
     r4d_ar_ti8_dims(&group, &group_bytes);
     if (group <= 0) return RAD_E_DEVICE;
-    /* numel must tile whole groups over every shard, which is numel % (group * world_size). */
-    if (c.numel % ((long)group * c.in->world)) return RAD_E_SHAPE;
+    const long long floor_b = r4d_pgeti_or(a->p, a->n_p, "min_bytes", R4D_AR_WHT6_MIN_BYTES);
+    if ((long long)c.numel * c.in->esize < floor_b || c.numel % ((long)group * c.in->world))
+        return r4d_rad_ar_oneshot_4rank_exact(a, s);
     /* The slot holds two wire images of one shard. */
     const long wire = (c.numel / c.in->world / group) * group_bytes;
     if (2 * wire > c.in->slot_bytes) return RAD_E_SCRATCH;
