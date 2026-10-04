@@ -718,11 +718,34 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
  * The peer arguments are ascending global rank with the current rank removed, which is exactly
  * the order build() filled peer_scratch/peer_flags in. */
 
+/* Four-rank blocks issue every all_reduce in place and without `hops`, so the exact two-shot row
+ * (hops=2) is never selected. Above this floor the one-shot entry runs the two-shot kernel instead:
+ * 1.5N rather than 3N bytes a rank, same fp32 fold order, bit-identical. In place is safe for the
+ * reason given at the ti8 entry. Prefill +17% at 16k/64k on 4x R9700; decode stays one-shot. */
+enum { R4D_AR_EXACT_TWOSHOT_MIN_BYTES = 1024 * 1024 };
+
 extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 0, 0);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
+    const long long msg_b = (long long)c.numel * c.in->esize;
+    if (msg_b >= R4D_AR_EXACT_TWOSHOT_MIN_BYTES && c.numel <= R4D_AR_TWOSHOT_WIDE_MAX_ELEMS &&
+        msg_b % 16 == 0 && (msg_b / 16) % c.in->world == 0 &&
+        2 * msg_b / c.in->world <= c.in->slot_bytes) {     /* the two-shot's own preconditions */
+        ArCall t;
+        if (ar_setup(a, &t, 0, 1) == RAD_OK) {             /* shard-scaled block count */
+            const ArInst* in = t.in;
+            R4D_TRY("ar_twoshot_4rank_exact",
+                r4d_ar_twoshot_4rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                                           in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                                           in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                           t.inp, t.out, t.numel, in->dtype, in->rank,
+                                           (long)(uintptr_t)s, t.nblocks, t.nthreads, t.drain, t.acq,
+                                           t.pub));
+            return RAD_OK;
+        }
+    }
     const ArInst* in = c.in;
     R4D_TRY("ar_oneshot_4rank_exact",
         r4d_ar_oneshot_4rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
@@ -755,7 +778,8 @@ extern "C" int r4d_rad_ar_oneshot_8rank_exact(const RadArgs* a, RadStream s) {
 }
 
 /* The two-shots shard the message, so their block count scales with the SHARD -- a full-message
- * count over-launches the whole mid band. Both refuse an in-place call. */
+ * count over-launches the whole mid band. Both refuse an in-place call; the four-rank one-shot
+ * entry runs the exact one in place above R4D_AR_EXACT_TWOSHOT_MIN_BYTES. */
 extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 1, 1);
