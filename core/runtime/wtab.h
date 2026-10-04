@@ -24,8 +24,8 @@ struct WtabPatch {
     void*    val[kWtabPatch] = {};
 };
 
-/* Enqueue `p` on `s`. Under the host backend, whose streams run their work as it is issued and
- * whose device memory is host memory, the writes happen here. */
+/* Enqueue `p` on `s`. Under the host backend, whose device memory is host memory, the writes
+ * happen here once `s` has run everything issued before them. */
 int wtab_patch(const WtabPatch& p, RadStream s);
 
 }  /* namespace rad */

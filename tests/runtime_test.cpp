@@ -20,6 +20,7 @@
 #include "runtime/ctx.h"
 #include "runtime/rank_barrier.h"
 #include "runtime/residency.h"
+#include "runtime/wtab.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -1259,6 +1260,49 @@ TEST(arena_plan_bytes_returns_the_total_with_or_without_its_out_parameters) {
     const int64_t b = rad::arena_plan_bytes(f.P, nullptr, nullptr);
     CHECK_EQ(a, b);
     CHECK_EQ(a, total);
+}
+
+/* A WEIGHT-TABLE PATCH LANDS AT ITS PLACE IN STREAM ORDER: work issued before it reads the old
+ * entry, work issued after it the new one. On the host backend the patch is a host write, and
+ * made without draining the stream it reached the table before a queued reader issued ahead of
+ * it. A chain of copies holds that reader back long enough for a write that jumps the queue to
+ * show. */
+TEST(a_weight_table_patch_lands_in_stream_order) {
+    const int64_t big = 4 << 20;
+    const int     chain = 16;
+    RadStream s = nullptr;
+    REQUIRE(rad_stream_create(&s, 0) >= 0);
+    auto* blob_src = (uint8_t*)rad_dev_alloc(big, RAD_MEM_HOST_PINNED);
+    auto* blob_dst = (uint8_t*)rad_dev_alloc(big, RAD_MEM_DEVICE);
+    auto* tab   = (void**)rad_dev_alloc(64, RAD_MEM_DEVICE);
+    auto* stage = (void**)rad_dev_alloc(64, RAD_MEM_HOST_PINNED);
+    REQUIRE(blob_src && blob_dst && tab && stage);
+    std::memset(blob_src, 0x5A, (size_t)big);
+    for (int round = 0; round < 3; ++round) {
+        void* const before = (void*)(uintptr_t)(0x1000 + round);
+        void* const after  = (void*)(uintptr_t)(0x2000 + round);
+        stage[0] = before;
+        stage[1] = stage[2] = nullptr;
+        REQUIRE(rad_memcpy_async(tab, stage, sizeof(void*), s) >= 0);
+        REQUIRE(rad_stream_sync(s) >= 0);
+
+        for (int i = 0; i < chain; ++i) REQUIRE(rad_memcpy_async(blob_dst, blob_src, big, s) >= 0);
+        REQUIRE(rad_memcpy_async(stage + 1, tab, sizeof(void*), s) >= 0);
+        rad::WtabPatch p;
+        p.n = 1;
+        p.dst[0] = tab;
+        p.val[0] = after;
+        CHECK_OK(rad::wtab_patch(p, s));
+        REQUIRE(rad_memcpy_async(stage + 2, tab, sizeof(void*), s) >= 0);
+        REQUIRE(rad_stream_sync(s) >= 0);
+        CHECK(stage[1] == before);
+        CHECK(stage[2] == after);
+    }
+    rad_dev_free(stage, RAD_MEM_HOST_PINNED);
+    rad_dev_free(tab, RAD_MEM_DEVICE);
+    rad_dev_free(blob_dst, RAD_MEM_DEVICE);
+    rad_dev_free(blob_src, RAD_MEM_HOST_PINNED);
+    rad_stream_destroy(s);
 }
 
 RAD_TEST_MAIN()

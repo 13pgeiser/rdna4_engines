@@ -177,9 +177,10 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
     } else {
         if (prom == b.end() || !prom->is_string())
             return error_response(err_bad("prompt", "must be a string, or send `messages`"));
+        /* Encoded as /v1/completions encodes it, so the count is the count that endpoint sees. */
         toks = deps_.tok->encode(prom->get<std::string>(),
                                  get_bool_or(b, "add_special_tokens", true),
-                                 /*parse_special=*/false);
+                                 /*parse_special=*/true);
     }
 
     json o;

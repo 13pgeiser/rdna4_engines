@@ -36,11 +36,13 @@ curl -LC - -O https://huggingface.co/StillDeadcode/minicpm5-2b-fp8/resolve/main/
 
 The host needs Docker and an `amdgpu` driver that supports ROCm 7.2; it does not need ROCm. The
 image is [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance), with its
-kernels built for `gfx1201`. Pull it, then start a model from its compose file:
+kernels built for `gfx1201`. Pull it, clone this repository for its compose files, then start a
+model from one of them:
 
 ```sh
 docker pull stilldeadcode/radiance
-cp -r deploy/compose ~/radiance-compose && cd ~/radiance-compose
+git clone https://codeberg.org/StillDeadcode/radiance.git
+cp -r radiance/deploy/compose ~/radiance-compose && cd ~/radiance-compose
 cp .env.example .env                         # set RADIANCE_MODELS, RADIANCE_STATE, RADIANCE_API_KEY, the GIDs
 docker compose -f minicpm5-2b.yaml up -d     # or any file from the table
 docker compose -f minicpm5-2b.yaml logs -f
@@ -51,15 +53,16 @@ Every model uses both cards and the same port, so run one at a time. Running wit
 the reason for each `docker run` option, is in [`docs/DOCKER.md`](docs/DOCKER.md).
 
 To build the image yourself, for example for other cards, run `docker/build.sh -t 'gfx1200;gfx1201'`
-(it needs `docker buildx` and tests the build as it goes). Then set `RADIANCE_IMAGE=radiance:latest`
-in `.env`.
+in the clone (it needs `docker buildx` and tests the build as it goes). Then set
+`RADIANCE_IMAGE=radiance:latest` in `.env`.
 
 ## Build from source
 
-You need Linux, a C++20 compiler, CMake 3.21+ and Ninja. For the device kernels you also need ROCm
-7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`).
+You need Linux, git, a C++20 compiler, CMake 3.21+ and Ninja. For the device kernels you also need
+ROCm 7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`). Clone the repository and build in it:
 
 ```sh
+git clone https://codeberg.org/StillDeadcode/radiance.git && cd radiance
 ./build.sh                                   # configure, build for the cards present, run the tests
 ./build.sh --no-hip                          # host backend only
 cmake -S . -B build -G Ninja -DRAD_GPU_TARGETS='gfx1201'   # build for cards this machine lacks

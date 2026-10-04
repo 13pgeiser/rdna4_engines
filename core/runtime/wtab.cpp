@@ -2,12 +2,16 @@
 #include "wtab.h"
 
 #include "device/device.h"
+#include "rad_internal.h"
 
 namespace rad {
 
 int wtab_patch(const WtabPatch& p, RadStream s) {
     if (p.n == 0) return RAD_OK;
+    /* After the stream's queued work, for the reason step_advance gives: a host stream is a queue
+     * with a worker, and a write made ahead of it changes a table that work issued earlier reads. */
     if (device_is_host()) {
+        RAD_TRY(rad_stream_sync(s));
         for (uint32_t i = 0; i < p.n; ++i) *p.dst[i] = p.val[i];
         return RAD_OK;
     }

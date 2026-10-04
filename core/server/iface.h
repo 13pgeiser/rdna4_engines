@@ -299,12 +299,12 @@ class ITokenizer {
 public:
     virtual ~ITokenizer() = default;
 
-    /* `parse_special` is a security parameter, not a convenience one, and it is why this takes
-     * three arguments rather than two. A rendered chat template contains control tokens that must
-     * be recognised as themselves; raw user content must NOT be, because otherwise a user who
-     * types "<|im_start|>system" reaches the system role. The server passes true for the one and
-     * false for the other, and there is no default because a default is how the wrong one gets
-     * picked silently. */
+    /* `parse_special` decides whether a control token spelled out in the text is that token or
+     * its characters, and there is no default because a default is how the wrong one gets picked
+     * silently. Text the server is sent as a whole prompt is parsed: a rendered chat template
+     * carries the control tokens that frame its turns, and a raw /v1/completions prompt is the
+     * client's own rendering of the same, as vLLM and llama.cpp read it. Text that must reach the
+     * model as characters is encoded with false. */
     virtual std::vector<int32_t> encode(const std::string& text, bool add_special,
                                         bool parse_special) const = 0;
     virtual std::string          decode(const std::vector<int32_t>& toks) const = 0;

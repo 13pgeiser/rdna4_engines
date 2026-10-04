@@ -19,8 +19,9 @@
  * chunk, a history row for positions the host already knows -- with rows whose positions come from
  * the card; `rows[0][i]` says which, and the advance leaves a host row exactly as it was uploaded.
  *
- * The same code runs on the host backend, where device memory is host memory and a stream runs
- * its work as it is issued (advance_impl.h is shared by both builds).
+ * The same code runs on the host backend, where device memory is host memory: the rows run on the
+ * issuing thread once the stream has drained, which is their place in stream order
+ * (advance_impl.h is shared by both builds).
  */
 #pragma once
 #include <cstdint>

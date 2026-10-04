@@ -1444,10 +1444,15 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
         return RAD_E_INVAL;
     }
 
+    /* A raw prompt is the client's whole input: no template wraps it and no role is the server's
+     * to protect, so its control tokens are parsed, as vLLM and llama.cpp parse them. A client
+     * that renders its own chat template sends "<|im_start|>" meaning the token; read as text it
+     * reaches the model as six pieces of punctuation. Token ids could name any control token
+     * already. */
     auto push_text = [&](const std::string& s) {
         PromptInput p;
         p.text = s;
-        p.tokens = d.tok->encode(s, true, /*parse_special=*/false);
+        p.tokens = d.tok->encode(s, true, /*parse_special=*/true);
         out->prompts.push_back(std::move(p));
     };
     auto push_ids = [&](const json& arr, ApiError* e) -> bool {
@@ -1565,10 +1570,12 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
         return true;
     };
 
+    /* Parsed like a /v1/completions prompt, and for the same reason: the input is the client's
+     * own text with no template around it. */
     if (it->is_string()) {
         PromptInput p;
         p.text = it->get<std::string>();
-        p.tokens = d.tok->encode(p.text, true, /*parse_special=*/false);
+        p.tokens = d.tok->encode(p.text, true, /*parse_special=*/true);
         out->prompts.push_back(std::move(p));
     } else if (it->is_array()) {
         if (it->empty()) { *err = err_bad("input", "must not be empty"); return RAD_E_INVAL; }
@@ -1577,7 +1584,7 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
                 if (!s.is_string()) { *err = err_bad("input", "expected all strings"); return RAD_E_INVAL; }
                 PromptInput p;
                 p.text = s.get<std::string>();
-                p.tokens = d.tok->encode(p.text, true, /*parse_special=*/false);
+                p.tokens = d.tok->encode(p.text, true, /*parse_special=*/true);
                 out->prompts.push_back(std::move(p));
             }
         } else if (it->front().is_number_integer()) {

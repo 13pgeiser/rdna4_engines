@@ -515,6 +515,32 @@ TEST(the_encoder_matches_the_reference_on_trained_vocabularies) {
     }
 }
 
+/* A TEXT THAT OPENS WITH BOS GETS NO SECOND ONE. A client rendering its own chat template writes
+ * the BOS into the prompt; one the text spells anywhere else, or a second one at the start, is
+ * the client's and stays. */
+TEST(a_text_that_opens_with_bos_gets_no_second_one) {
+    VocabBuild vb;
+    REQUIRE(parse_tokenizer_json_buf(k_tiny, "test.json", vb) >= 0);
+    vb.bos = 12;
+    vb.add_bos = true;
+    auto v = load(std::move(vb));
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    auto enc = [&](const char* s, bool add_special, bool parse_special) {
+        std::vector<int32_t> ids;
+        t.encode(s, ids, add_special, parse_special);
+        return ids;
+    };
+    CHECK(enc("ab", true, true) == (std::vector<int32_t>{ 12, 4 }));
+    CHECK(enc("<|end|>ab", true, true) == (std::vector<int32_t>{ 12, 4 }));
+    CHECK(enc("<|end|><|end|>ab", true, true) == (std::vector<int32_t>{ 12, 12, 4 }));
+    CHECK(enc("ab<|end|>", true, true) == (std::vector<int32_t>{ 12, 4, 12 }));
+    CHECK(enc("<|end|>ab", false, true) == (std::vector<int32_t>{ 12, 4 }));
+    /* Not parsed, the spelling is not the token, so the BOS is still owed. */
+    CHECK(enc("<|end|>x", true, false) == (std::vector<int32_t>{ 12, 11 }));
+}
+
 /* SPECIAL TOKENS ARE CLAIMED LONGEST FIRST, not leftmost: "bcde" wins over "ab" in "abcde" even
  * though "ab" starts earlier, and "<|im_start|>" is never cut by its prefix "<|im". */
 TEST(special_tokens_are_claimed_by_priority) {

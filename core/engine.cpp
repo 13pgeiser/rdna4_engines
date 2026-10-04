@@ -1525,6 +1525,10 @@ int Engine::serve() {
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    /* The step staging the budget kept room for exists now, so a checkpoint slot backed from here
+     * on leaves the headroom and only what is still to be built on first use. */
+    set_checkpoint_floors(std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * (1ll << 20) +
+                          late_lazy_bytes_);
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 

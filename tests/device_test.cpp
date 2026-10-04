@@ -12,6 +12,7 @@
 #include "rad_internal.h"
 #include "device/device.h"
 #include "device/directio.h"
+#include "sched/advance.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -470,6 +471,68 @@ TEST(waiting_on_an_unrecorded_event_is_a_no_op) {
     CHECK_OK(rad_event_wait(st.s, e.e));
     CHECK_OK(rad_stream_sync(st.s));
 }
+
+/* AN ADVANCE RUNS AT ITS PLACE IN STREAM ORDER. The sampled token it accepts is the last thing a
+ * step copies into place, and the advance is issued behind that copy without a host wait. The
+ * host backend's streams are queues with a worker thread each, so an advance run on the issuing
+ * thread without draining the stream read the token before the copy landed, and the next step
+ * continued from the previous token: CPU-only decode repeated words and differed at temperature
+ * 0. A long chain of copies goes ahead of the token's here, so an advance that jumps the queue
+ * reads the poison. */
+TEST(an_advance_reads_the_token_a_copy_issued_before_it_delivers) {
+    const int64_t big = 4 << 20;
+    const int     chain = 16;
+    RadStream s = nullptr;
+    REQUIRE(rad_stream_create(&s, 0) >= 0);
+    auto* blob_src = (uint8_t*)rad_dev_alloc(big, RAD_MEM_HOST_PINNED);
+    auto* blob_dst = (uint8_t*)rad_dev_alloc(big, RAD_MEM_DEVICE);
+    auto* slab = (char*)rad_dev_alloc(4096, RAD_MEM_DEVICE);
+    auto* src  = (int32_t*)rad_dev_alloc(64, RAD_MEM_DEVICE);
+    auto* st   = (rad::StepSlot*)rad_dev_alloc((int64_t)sizeof(rad::StepSlot), RAD_MEM_DEVICE);
+    auto* stage = (int32_t*)rad_dev_alloc(4096, RAD_MEM_HOST_PINNED);
+    REQUIRE(blob_src && blob_dst && slab && src && st && stage);
+    std::memset(blob_src, 0x5A, (size_t)big);
+
+    /* One device row that sampled row 0 with no drafts, at context 10, slot 0. */
+    rad::AdvanceArgs a;
+    a.mode = rad::ADV_ACCEPT;
+    a.n_seq = 1;
+    a.slab = slab;
+    a.row_off = 0;   a.row_pitch = 1;
+    a.tok_off = 16;  a.pos_off = 24; a.ctx_off = 32; a.acc_off = 40; a.out_off = 48;
+    a.sid_off = 56;  a.cu_off = 64;  a.q_off = 72;   a.grp_off = 80;
+    a.st = st;
+    a.src = src;
+    const int32_t layout[20] = { 1, 0, 0, 0,  0, 0,  0, 0,  10, 0,  0, 0,  0, 0,  0, 0,  0, 0,  1, 0 };
+    std::memcpy(stage, layout, sizeof(layout));
+    for (int round = 0; round < 3; ++round) {
+        stage[64] = 7;                       /* the poison: what src holds before the copy */
+        stage[65] = 4242 + round;            /* the token the copy delivers */
+        REQUIRE(rad_memcpy_async(slab, stage, sizeof(layout), s) >= 0);
+        REQUIRE(rad_memcpy_async(src, stage + 64, 4, s) >= 0);
+        REQUIRE(rad_memset_async(st, 0, (int64_t)sizeof(rad::StepSlot), s) >= 0);
+        REQUIRE(rad_stream_sync(s) >= 0);
+
+        for (int i = 0; i < chain; ++i) REQUIRE(rad_memcpy_async(blob_dst, blob_src, big, s) >= 0);
+        REQUIRE(rad_memcpy_async(src, stage + 65, 4, s) >= 0);
+        CHECK_OK(rad::step_advance(a, s));
+        rad::StepSlot got{};
+        REQUIRE(rad_memcpy_async(stage + 128, st, (int64_t)sizeof(rad::StepSlot), s) >= 0);
+        REQUIRE(rad_stream_sync(s) >= 0);
+        std::memcpy(&got, stage + 128, sizeof(rad::StepSlot));
+        CHECK_EQ(got.tok[0], 4242 + round);
+        CHECK_EQ(got.ctx, 11);
+        CHECK_EQ(got.n_acc, 1);
+    }
+    rad_dev_free(stage, RAD_MEM_HOST_PINNED);
+    rad_dev_free(st, RAD_MEM_DEVICE);
+    rad_dev_free(src, RAD_MEM_DEVICE);
+    rad_dev_free(slab, RAD_MEM_DEVICE);
+    rad_dev_free(blob_dst, RAD_MEM_DEVICE);
+    rad_dev_free(blob_src, RAD_MEM_HOST_PINNED);
+    rad_stream_destroy(s);
+}
+
 
 TEST(the_null_stream_is_refused) {
     /* HIP's stream 0 serialises against every other blocking stream in the process, which is the

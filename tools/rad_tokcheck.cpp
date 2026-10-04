@@ -39,7 +39,7 @@ void usage() {
         "  --hf-dir DIR    compare against HuggingFace ids in DIR/<corpus basename>.ids\n"
         "                  (little-endian int32, encode(text, add_special_tokens=False))\n"
         "  --no-ref        skip the reference encoder, which is slow\n"
-        "  --user          encode with parse_special off, as the server does for user content\n"
+        "  --user          encode with parse_special off: a control token's spelling is text\n"
         "  --turns N       turns in the multi-turn measurement (default 40, 0 skips it)\n"
         "  --repeat N      timing repeats, best taken (default 3)\n"
         "  --context N     ids shown either side of a difference (default 6)\n"

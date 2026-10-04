@@ -1312,8 +1312,6 @@ int Tokenizer::encode(std::string_view text, std::vector<int32_t>& out,
     if (!v_ || !v_->ready()) return RAD_E_STATE;
     const TokEncoder& e = *v_->enc_;
 
-    if (add_special && v_->add_bos() && v_->bos() >= 0) out.push_back(v_->bos());
-
     /* Special-token partitioning. The text is cut into (raw, token, raw, token, ...) around any
      * declared special token that appears literally, before any other step touches it, because a
      * special token is not something the pre-tokeniser is allowed to split.
@@ -1323,6 +1321,19 @@ int Tokenizer::encode(std::string_view text, std::vector<int32_t>& out,
      * as an actual role switch. */
     std::vector<SpecialFrag> frags;
     e.specials.split(text, parse_special, frags);
+
+    /* A text that already opens with BOS gets no second one. A client that renders its own chat
+     * template writes the template's BOS into the prompt, and a doubled BOS is a sequence the
+     * model never saw in training. */
+    if (add_special && v_->add_bos() && v_->bos() >= 0) {
+        int32_t first = -1;
+        for (const SpecialFrag& f : frags) {
+            if (f.id < 0 && f.len == 0) continue;
+            first = f.id;
+            break;
+        }
+        if (first != v_->bos()) out.push_back(v_->bos());
+    }
 
     EncodeScratch sc;
     WordCache words;

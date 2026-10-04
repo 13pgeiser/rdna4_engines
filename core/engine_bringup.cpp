@@ -652,12 +652,27 @@ int Engine::plan() {
     {
         std::vector<VramFacts> facts;
         facts.reserve(ranks_.size());
+        late_step_bytes_ = late_lazy_bytes_ = 0;
         const int64_t ctx = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
+            VramFacts f{};
+            /* ONE HARDWARE QUEUE'S VRAM, MEASURED BY MAKING TWO. The engine's compute stream,
+             * its mover's and a second compute lane are all made after this reading, and the
+             * driver backs each queue with VRAM the ring alone does not account for. The second
+             * queue is the unit, so a runtime that sets itself up on its first queue charges that
+             * once and to `already held`, which is read after both are gone. */
+            {
+                RadStream q[2] = { nullptr, nullptr };
+                RadDeviceProps a{}, b{};
+                if (rad_stream_create(&q[0], 0) >= 0 && rad_dev_props(r->device, &a) >= 0 &&
+                    rad_stream_create(&q[1], 0) >= 0 && rad_dev_props(r->device, &b) >= 0)
+                    f.queue_bytes = std::max<int64_t>(a.vram_free - b.vram_free, 0);
+                for (RadStream s : q) if (s) rad_stream_destroy(s);
+            }
+            f.n_queues = 2 + (r->program.scratch_regions > 1 ? 1 : 0);
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
-            VramFacts f{};
             f.capacity = props.vram_bytes;
             f.free     = props.vram_free;
             /* AN EIGHTH OF THE HOST'S MEMORY STAYS THE HOST'S on integrated graphics. The card's
@@ -702,6 +717,26 @@ int Engine::plan() {
             }
             f.staging = BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
+            late_step_bytes_ = std::max(late_step_bytes_, f.staging);
+            int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
+            /* AND THE KV TIERS' COPY STAGING, which TierExec::device_init builds on the first
+             * copy out. Which groups the prefix cache indexes is settled after this split, so
+             * every paged group is counted: the entry it sizes can only be smaller. */
+            if (cfg_.prefix_cache_host_mib > 0 || cfg_.prefix_cache_disk_mib > 0) {
+                int64_t entry = 0, bs = 0;
+                int ng = 0;
+                for (size_t g = 0; g < r->program.kv_groups.size(); ++g) {
+                    const KVGroupPlan* p = probe.plan((int32_t)g);
+                    if (!p || !p->paged() || p->bytes_per_block <= 0) continue;
+                    entry += p->bytes_per_block;
+                    bs = bs > 0 ? std::min<int64_t>(bs, p->block_size) : p->block_size;
+                    ++ng;
+                }
+                const int64_t tier = TierExec::device_bytes(entry, ng, TierExec::sizes(entry, ctx, bs));
+                f.staging += tier;
+                lazy += tier;
+            }
+            late_lazy_bytes_ = std::max(late_lazy_bytes_, lazy);
             facts.push_back(f);
         }
         VramBudget vb;
@@ -2150,20 +2185,19 @@ int Engine::configure_kv() {
                  * and 0.02 ms a step of the VRAM it costs. The batch is one gather per (group,
                  * layer) however many entries are in it, so the launches are the same either
                  * way -- this buys the copies, which are what there are thousands of. */
-                const int max_batch = (int)std::min<int64_t>(
-                    4096, std::max<int64_t>(64, (16ll << 20) / entry_bytes));
                 /* A COPY OUT IS FOUR STAGING BATCHES, about 64 MiB a rank. It shares the transfer
                  * stream with the expert mover, so what it queues is what a promotion issued
                  * behind it waits for -- a few milliseconds of link at this size -- and the next
                  * copy goes out on the tick after this one lands, so a long conversation still
                  * leaves at the rate the link carries it.
                  *
-                 * A RESTORE IS A WHOLE CHAIN, as long as the longest context this server takes. */
-                const int64_t max_copy = 4ll * max_batch;
-                const int64_t bs = std::max<int64_t>(1, ranks_[0]->prefix.block_size());
-                const int64_t max_chain =
-                    (std::max<int64_t>(1, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train)
-                     + bs - 1) / bs + 1;
+                 * A RESTORE IS A WHOLE CHAIN, as long as the longest context this server takes.
+                 * TierExec::sizes holds the arithmetic, which the VRAM budget reserves from. */
+                const TierExec::Sizes tz = TierExec::sizes(
+                    entry_bytes, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train,
+                    ranks_[0]->prefix.block_size());
+                const int max_batch = tz.max_batch;
+                const int64_t max_copy = tz.max_copy, max_chain = tz.max_chain;
                 bool all = true;
                 for (auto& r : ranks_) {
                     /* ON THAT RANK'S DEVICE. rad_dev_alloc takes the CURRENT device, and the
@@ -2345,6 +2379,18 @@ static void bind_kv_pools(const Program& p, const KVManager& kv, std::vector<KVP
 }
 
 /* ================================================================== start */
+void Engine::set_checkpoint_floors(int64_t keep) {
+    for (auto& r : ranks_) {
+        const int dev = r->device;
+        r->kv.set_checkpoint_floor([dev](int64_t* free_now) -> int {
+            RadDeviceProps p{};
+            RAD_TRY(rad_dev_props(dev, &p));
+            *free_now = p.vram_free;
+            return RAD_OK;
+        }, keep);
+    }
+}
+
 int Engine::start() {
     std::vector<int> devs;
     std::string inventory;
@@ -2650,18 +2696,14 @@ int Engine::start() {
      * HEADROOM. Rank 0's free list hands the ids out and every rank writes its shard of a snapshot
      * into the same slot of its own pool; backing a slot on one card and meeting a refusal on the
      * other at the snapshot copy would stop the engine mid-serve. See
-     * KVManager::set_checkpoint_floor for why the floor is the headroom. */
+     * KVManager::set_checkpoint_floor for why the floor is the headroom.
+     *
+     * AND NOT INTO WHAT THE BUDGET KEPT FOR LATER either: the step staging serve() allocates, and
+     * what is built on first use. serve() lowers the floor once the staging exists. */
+    const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * (1ll << 20);
+    const int64_t keep_now = headroom + late_step_bytes_ + late_lazy_bytes_;
     if (!ranks_.empty()) {
-        const int64_t keep = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * (1ll << 20);
-        for (auto& r : ranks_) {
-            const int dev = r->device;
-            r->kv.set_checkpoint_floor([dev](int64_t* free_now) -> int {
-                RadDeviceProps p{};
-                RAD_TRY(rad_dev_props(dev, &p));
-                *free_now = p.vram_free;
-                return RAD_OK;
-            }, keep);
-        }
+        set_checkpoint_floors(keep_now);
         std::vector<KVManager*> peers;
         for (size_t i = 1; i < ranks_.size(); ++i) peers.push_back(&ranks_[i]->kv);
         ranks_[0]->kv.set_checkpoint_peers(std::move(peers));
@@ -2679,21 +2721,22 @@ int Engine::start() {
         RAD_TRY(lead.back_free_checkpoints(&gone));
         if (gone > 0) {
             const int64_t stride = lead.checkpoint_stride();
-            const int64_t keep = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * (1ll << 20);
             int64_t short_by = 0;
             for (auto& r : ranks_) {
                 RadDeviceProps p{};
                 if (rad_dev_props(r->device, &p) < 0) continue;
-                short_by = std::max(short_by, gone * stride - (p.vram_free - keep));
+                short_by = std::max(short_by, gone * stride - (p.vram_free - keep_now));
             }
             RAD_WARN("checkpoint slots: %lld of %lld backed (%s each), %lld withdrawn -- one more "
-                     "would take a card under the %s --gpu-headroom-mib, the room a kernel's first "
-                     "launch allocates from. The prefix cache holds %lld linear-state snapshots on "
-                     "the card and its retention policy decides which. The budget counted all "
-                     "%lld; the card is %s short of them, which is allocations made after the "
-                     "budget was resolved.",
+                     "would take a card under the %s it has to keep free: the %s "
+                     "--gpu-headroom-mib, the room a kernel's first launch allocates from, and %s "
+                     "the budget kept for the step staging and for what is built on first use. "
+                     "The prefix cache holds %lld linear-state snapshots on the card and its "
+                     "retention policy decides which. The budget counted all %lld; the card is %s "
+                     "short of them, which is allocations made after the budget was resolved.",
                      (long long)(asked - gone), (long long)asked, humanb(stride).c_str(),
-                     (long long)gone, humanb(keep).c_str(), (long long)(asked - gone),
+                     (long long)gone, humanb(keep_now).c_str(), humanb(headroom).c_str(),
+                     humanb(late_step_bytes_ + late_lazy_bytes_).c_str(), (long long)(asked - gone),
                      (long long)asked, humanb(short_by).c_str());
         }
     }
@@ -2703,20 +2746,29 @@ int Engine::start() {
         RadDeviceProps props{};
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
 
+        /* AGAINST THE HEADROOM AND WHAT THE BUDGET KEPT FOR LATER, because both are still free
+         * here: the step staging is allocated by serve(), and the KV tiers' staging and a second
+         * compute lane are built on first use. A card at exactly the headroom now would be under
+         * it once those exist. */
         const int64_t MiB  = 1024 * 1024;
-        const int64_t want = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * MiB;
+        const int64_t late = late_step_bytes_ + late_lazy_bytes_;
+        const int64_t want = headroom + late;
         const int64_t got  = props.vram_free;
+        const std::string asked =
+            late > 0 ? fmt("%s (the %s --gpu-headroom-mib and %s kept for the step staging and "
+                           "for what is built on first use)", humanb(want).c_str(),
+                           humanb(headroom).c_str(), humanb(late).c_str())
+                     : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
         if (got < want) {
             /* WHAT THIS SHORTFALL THREATENS is whatever allocates after startup: a kernel's code
              * object, loaded on its FIRST launch, and a spilling kernel's scratch, sized on its
              * first launch by the whole grid. Neither is knowable when the budget is resolved, and
              * running out for either is a fault inside the HIP runtime rather than an error. */
-            RAD_WARN("card %d settled at %s free against the %s --gpu-headroom-mib asked to keep. "
-                     "The difference is allocations made after the budget was resolved, and it is "
-                     "the room a kernel's first launch allocates from. Raise --gpu-headroom-mib by "
-                     "at least %s so the budget is resolved against the right number.",
-                     r->device, humanb(got).c_str(), humanb(want).c_str(),
-                     humanb(want - got).c_str());
+            RAD_WARN("card %d settled at %s free against %s. The difference is allocations "
+                     "made after the budget was resolved, and it comes out of the room a kernel's "
+                     "first launch allocates from. Raise --gpu-headroom-mib by at least %s so the "
+                     "budget is resolved against the right number.",
+                     r->device, humanb(got).c_str(), asked.c_str(), humanb(want - got).c_str());
         }
         else if (got > want + 256 * MiB) {
             /* AND "TOO MUCH" IS ONLY A FAULT WHERE SOMEBODY STATED THE BUDGET. Where the resolver
@@ -2726,20 +2778,19 @@ int Engine::start() {
              * Warning here would contradict that receipt and send the reader looking for a flag
              * to set. */
             if (cfg_.vram_budget_derived)
-                RAD_INFO("card %d settled at %s free against the %s --gpu-headroom-mib asked to "
-                         "keep. The split accounted for it: neither pool could address another "
-                         "byte, which is the `unusable` line of the VRAM budget above.",
-                         r->device, humanb(got).c_str(), humanb(want).c_str());
+                RAD_INFO("card %d settled at %s free against %s. The split accounted for it: "
+                         "neither pool could address another byte, which is the `unusable` line of "
+                         "the VRAM budget above.",
+                         r->device, humanb(got).c_str(), asked.c_str());
             else
-                RAD_WARN("card %d settled at %s free against the %s --gpu-headroom-mib asked to "
-                         "keep, so %s is unused. On a model that does not fit in VRAM every unused "
-                         "GiB is weight that has to be moved instead of read, and that is decode "
-                         "step time.",
-                         r->device, humanb(got).c_str(), humanb(want).c_str(),
+                RAD_WARN("card %d settled at %s free against %s, so %s is unused. On a model that "
+                         "does not fit in VRAM every unused GiB is weight that has to be moved "
+                         "instead of read, and that is decode step time.",
+                         r->device, humanb(got).c_str(), asked.c_str(),
                          humanb(got - want).c_str());
         } else
-            RAD_INFO("card %d settled at %s free, against the %s --gpu-headroom-mib asked to keep",
-                     r->device, humanb(got).c_str(), humanb(want).c_str());
+            RAD_INFO("card %d settled at %s free, against %s",
+                     r->device, humanb(got).c_str(), asked.c_str());
     }
     return RAD_OK;
 }

@@ -86,6 +86,28 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers, SSDTier*
     return RAD_OK;
 }
 
+TierExec::Sizes TierExec::sizes(int64_t entry_bytes, int64_t max_ctx, int64_t block_size) {
+    Sizes s;
+    if (entry_bytes <= 0) return s;
+    /* 16 MiB of staging a rank, as entries, between 64 and 4096 of them: the reasons are at the
+     * call in bringup. A copy out is four batches, and a restore is a whole chain, as long as the
+     * longest context the server takes. */
+    s.max_batch = (int)std::min<int64_t>(4096, std::max<int64_t>(64, (16ll << 20) / entry_bytes));
+    s.max_copy  = 4ll * s.max_batch;
+    const int64_t bs = std::max<int64_t>(1, block_size);
+    s.max_chain = (std::max<int64_t>(1, max_ctx) + bs - 1) / bs + 1;
+    return s;
+}
+
+/* What device_init() allocates, each allocation rounded to the pool granule the card hands VRAM
+ * out in. */
+int64_t TierExec::device_bytes(int64_t entry_bytes, int n_groups, const Sizes& s) {
+    if (entry_bytes <= 0 || n_groups <= 0 || s.max_batch <= 0) return 0;
+    const int64_t idx_n = (int64_t)n_groups * (s.max_copy + (int64_t)kRing * s.max_chain);
+    return align_up((int64_t)s.max_batch * entry_bytes, (int64_t)RAD_ALIGN_POOL) +
+           align_up(idx_n * (int64_t)sizeof(int32_t), (int64_t)RAD_ALIGN_POOL);
+}
+
 void TierExec::close() {
     /* Nothing may still be reading the buffers about to be freed. */
     if (stream_) (void)rad_stream_sync(stream_);

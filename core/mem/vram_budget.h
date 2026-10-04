@@ -60,7 +60,15 @@ struct VramFacts {
     int64_t capacity   = 0;   /* RadDeviceProps::vram_bytes -- totalGlobalMem */
     int64_t free       = 0;   /* RadDeviceProps::vram_free, measured now */
     int64_t arena      = 0;   /* arena_plan_bytes() for this rank's program, total incl. scratch */
-    int64_t staging    = 0;   /* BatchBuilder::device_bytes(): the step slab and the media staging */
+    int64_t staging    = 0;   /* BatchBuilder::device_bytes(): the step slab and the media staging,
+                               * and TierExec::device_bytes() when a KV tier is configured */
+    /* THE HARDWARE QUEUES this rank creates after `free` was read -- its compute stream, the expert
+     * mover's, and the second compute lane where the program declares one -- at `queue_bytes`
+     * each. MEASURED, by making one: a queue's kernel-argument ring is the engine's, and the
+     * driver backs every queue with VRAM of its own beside it (33 MiB a queue on an R9700, eight
+     * times the ring). */
+    int     n_queues    = 0;
+    int64_t queue_bytes = 0;
     int64_t kv_ceiling = 0;   /* KVManager::ceiling(max_ctx) for this rank's declared groups */
     int64_t kv_fixed   = 0;   /* KVManager::fixed_bytes(): the part of the ceiling that is state */
     /* weight_footprint() for this rank, which under tensor parallel is already this card's even
@@ -78,6 +86,9 @@ struct VramFacts {
  * operator stated the budgets -- the placement report and the pool report both want the totals. */
 struct VramBudget {
     int64_t capacity = 0, already_held = 0, headroom = 0, arena = 0, staging = 0;
+    int64_t queues = 0;               /* n_queues * queue_bytes, from the rank that needs most */
+    int     n_queues = 0;
+    int64_t queue_bytes = 0;
     int64_t claimable = 0;            /* after the fixed terms above */
     int64_t statics = 0;              /* off the top, before the ratio sees anything */
     int64_t elastic = 0;              /* claimable - statics: what the ratio divides */

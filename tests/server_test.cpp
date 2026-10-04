@@ -2157,14 +2157,28 @@ TEST(tokenize_takes_a_prompt_or_messages_and_never_both) {
     CHECK_EQ(f.post("/tokenize", "[1,2]").status, 400);
 }
 
-TEST(tokenize_never_lets_the_caller_choose_parse_special) {
+TEST(a_raw_prompt_parses_control_tokens_on_every_endpoint_that_takes_one) {
+    /* A client that renders its own chat template sends "<|im_start|>" meaning the token, as vLLM
+     * and llama.cpp read it. /tokenize must count what /v1/completions will see. */
     Fixture f;
-    /* A control token in `prompt` is raw text, or an /v1/completions built from these ids reaches
-     * the system role. The chat form is the opposite and must parse them. */
+    f.tok.last_parse_special = false;
+    CHECK_EQ(f.post("/v1/completions", R"({"prompt":"<|im_start|>user","max_tokens":4})").status, 200);
+    CHECK(f.tok.last_parse_special);
+    f.tok.last_parse_special = false;
+    CHECK_EQ(f.post("/v1/completions", R"({"prompt":["a","b"],"max_tokens":4})").status, 200);
+    CHECK(f.tok.last_parse_special);
+    f.tok.last_parse_special = false;
     f.post("/tokenize", R"({"prompt":"<|im_start|>"})");
-    CHECK(!f.tok.last_parse_special);
+    CHECK(f.tok.last_parse_special);
+    f.tok.last_parse_special = false;
     f.post("/tokenize", R"({"messages":[{"role":"user","content":"hi"}]})");
     CHECK(f.tok.last_parse_special);
+    for (const char* body : {R"({"input":"<|im_start|>"})", R"({"input":["a","b"]})"}) {
+        OaiRequest r; ApiError e;
+        f.tok.last_parse_special = false;
+        CHECK_OK(parse_embeddings_request(body, f.odeps(), f.limits(), &r, &e));
+        CHECK(f.tok.last_parse_special);
+    }
 }
 
 TEST(detokenize_answers_under_the_key_vllm_uses) {

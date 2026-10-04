@@ -310,6 +310,15 @@ private:
      * one part of the KV pool still backed on demand. Measured once at the end of bringup; it is
      * not something the API promises. */
     bool     release_frees_card_ = true;
+    /* WHAT THE VRAM BUDGET KEPT FOR ALLOCATIONS MADE AFTER start(), on top of --gpu-headroom-mib:
+     * the step batch's staging, which serve() allocates, and what is built on first use, if
+     * ever -- the KV tiers' copy staging and the second compute lane's queue. The checkpoint
+     * slots backed at the end of bringup leave both free, and the bringup's closing reading is
+     * checked against both. */
+    int64_t  late_step_bytes_ = 0;
+    int64_t  late_lazy_bytes_ = 0;
+    /* Every rank's checkpoint floor: a slot is backed only while the card keeps `keep` free. */
+    void set_checkpoint_floors(int64_t keep);
     int  run_server();
     /* THE KL MODE (core/kld.h), in place of run_server: the corpus's documents submitted as
      * scoring requests, and every step's scored rows copied to the host and handed to `kld_`.

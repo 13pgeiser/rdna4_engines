@@ -307,6 +307,51 @@ TEST(a_dense_model_has_no_expert_share_to_lose) {
     CHECK(c.vram_weights_mib * MiB - f.statics < MiB);
 }
 
+/* THE ENGINE'S HARDWARE QUEUES ARE A FIXED TERM. Each one costs the card VRAM the driver backs it
+ * with, and the streams are made after the card is read, so a split that left them out spent
+ * them out of the headroom: 67 MiB a card on a two-card Flash-Next server, leaving 9 MiB free
+ * under load against 96. The rank that needs most sets the term, as every fold here does. */
+TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    c.expert_cache_ratio = 0.75;
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 144LL << 20;
+    f.staging    = 98LL << 20;
+    f.statics    = 2LL << 30;
+    f.experts    = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+    VramBudget b0;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b0));
+
+    /* A fresh config: the resolver writes its answer back into the one it is given. */
+    Config c2 = small_config();
+    c2.vram_weights_mib = 0;
+    c2.vram_kv_mib      = 0;
+    c2.gpu_headroom_mib = 96;
+    c2.expert_cache_ratio = 0.75;
+    VramFacts g = f, h = f;
+    g.n_queues = 2; g.queue_bytes = 33LL << 20;
+    h.n_queues = 3; h.queue_bytes = 33LL << 20;     /* a rank with a second compute lane */
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c2, { g, h }, &b));
+    CHECK_EQ(b.queues, 99LL << 20);
+    CHECK_EQ(b.n_queues, 3);
+    CHECK_EQ(b.claimable, b0.claimable - (99LL << 20));
+    CHECK(b.report.find("hardware queues") != std::string::npos);
+
+    /* What is left after the pools is still the headroom, with the queues and the staging paid. */
+    const int64_t MiB = 1024 * 1024;
+    const int64_t unclaimed = f.capacity - (512LL << 20) - f.arena - f.staging - b.queues
+                            - c2.vram_weights_mib * MiB - c2.vram_kv_mib * MiB;
+    CHECK(unclaimed >= 96 * MiB);
+    CHECK(unclaimed < 98 * MiB);
+}
+
 TEST(a_stated_budget_still_wins_and_the_other_side_still_derives) {
     Config c = small_config();
     c.vram_weights_mib = 20000;          /* stated */

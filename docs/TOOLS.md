@@ -452,7 +452,7 @@ rad-tokcheck [options] <tokenizer.json> <corpus-file>...
   --hf-dir DIR    compare against HuggingFace ids in DIR/<corpus basename>.ids
                   (little-endian int32, encode(text, add_special_tokens=False))
   --no-ref        skip the reference encoder, which is slow
-  --user          encode with parse_special off, as the server does for user content
+  --user          encode with parse_special off: a control token's spelling is text
   --turns N       turns in the multi-turn measurement (default 40, 0 skips it)
   --repeat N      timing repeats, best taken (default 3)
   --context N     ids shown either side of a difference (default 6)

@@ -513,6 +513,12 @@ quite keep its headroom is safe rather than fatal — but it is costing you the 
 `--gpu-headroom-mib` past the number startup names, so the budget resolver sees it and the expert
 plane is sized against it instead of trimmed afterwards.
 
+What the engine itself allocates after the card is read is charged before the split, so it never
+comes out of the headroom: the step staging, the KV tiers' copy staging, and its hardware queues.
+A queue costs more than its ring — the driver backs each one with VRAM of its own, 33 MiB on an
+R9700 — so startup measures one and the receipt's `hardware queues` line shows how many a card
+holds at that price.
+
 ### 4.4 Long context
 
 ```sh
@@ -957,6 +963,11 @@ for a model that takes no images or video.
 Method spellings follow vLLM's, including the ones that look odd: `/tokenize` is POST because its
 input is a body, and `/ping` answers both GET and POST because different load balancers send
 different ones.
+
+A text prompt to `/v1/completions`, `/v1/embeddings` or `/tokenize` reads the model's control
+tokens as tokens, as vLLM and llama.cpp do: a client that renders its own chat template can send
+`<|im_start|>user\n…` and the model sees the turn markers. The BOS the model declares is prepended
+unless the prompt already opens with it.
 
 ### 5.2 Chat
 

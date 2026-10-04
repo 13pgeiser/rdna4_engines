@@ -76,6 +76,14 @@ public:
     bool enabled() const { return enabled_; }
     std::string report() const { return report_; }
 
+    /* THE SIZES A CONFIGURE IS GIVEN, from one entry's bytes on this rank, the longest context and
+     * the block size, and the VRAM device_init() then takes for them. The VRAM budget reserves
+     * device_bytes() before any of this exists and bringup configures with sizes(), so the two
+     * cannot drift apart. */
+    struct Sizes { int max_batch = 0; int64_t max_copy = 0, max_chain = 0; };
+    static Sizes   sizes(int64_t entry_bytes, int64_t max_ctx, int64_t block_size);
+    static int64_t device_bytes(int64_t entry_bytes, int n_groups, const Sizes& s);
+
     /* DECIDING AND DOING ARE SEPARATE, and under tensor parallelism that is the point. The policy
      * is one object describing CONVERSATIONS, which are not sharded; the transfer is per rank,
      * because each rank holds its own shard of every block. So the leader plans, every rank runs
