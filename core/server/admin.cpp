@@ -321,6 +321,8 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     defs["max_tokens"]         = srv["default_max_tokens"];
     defs["reasoning_effort"]   = opt_.default_reasoning_effort.empty()
                                      ? json(nullptr) : json(opt_.default_reasoning_effort);
+    defs["thinking_token_budget"] = opt_.default_thinking_budget < 0
+                                        ? json(nullptr) : json(opt_.default_thinking_budget);
     json kw = json::object();
     for (const auto& [k, v] : opt_.default_template_kwargs) {
         json parsed = json::parse(v, nullptr, false);

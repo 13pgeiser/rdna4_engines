@@ -188,6 +188,58 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
     return out->empty() ? RAD_E_DEVICE : RAD_OK;
 }
 
+/* WHY A POOL'S MEMORY WAS REFUSED, from what the machine holds now. The refusal carries the
+ * driver's own answer; these are the facts that explain most of them.
+ *
+ * A card refusing its weights pool after its budget was measured had that memory taken in
+ * between, and another process on the card is the usual taker -- the budget is measured once,
+ * before any rank allocates. A host pool is PINNED memory, and the amdgpu driver caps what the
+ * whole system may pin (ttm.pages_limit, half of RAM unless raised); every rank pins its own
+ * --host-pool-mib, so a second rank asks for the same amount again. */
+static void report_pool_refusal(int rank, int device, const Pools& pools, const Config& cfg) {
+    bool card = false, host = false;
+    for (const Shortfall& f : pools.shortfalls()) (f.pool == "host_pool" ? host : card) = true;
+    if (card) {
+        RadDeviceProps p{};
+        if (rad_dev_props(device, &p) == RAD_OK)
+            RAD_ERR("card %d has %s of %s free now. Its budget was measured before any rank "
+                    "allocated, so memory gone since then is another process's; rocm-smi "
+                    "--showpids names it", device, humanb(p.vram_free).c_str(),
+                    humanb(p.vram_bytes).c_str());
+    }
+    if (host) {
+        int64_t pinned = 0, mapped = 0;
+        rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
+        rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
+        int64_t cap = -1, avail = -1;
+        {
+            std::ifstream f("/sys/module/ttm/parameters/pages_limit");
+            long long pages = 0;
+            if (f >> pages && pages > 0) cap = (int64_t)pages * (int64_t)sysconf(_SC_PAGESIZE);
+        }
+        {
+            std::ifstream f("/proc/meminfo");
+            std::string line;
+            while (std::getline(f, line)) {
+                long long kb = 0;
+                if (std::sscanf(line.c_str(), "MemAvailable: %lld kB", &kb) == 1) {
+                    avail = (int64_t)kb * 1024;
+                    break;
+                }
+            }
+        }
+        RAD_ERR("host: --host-pool-mib %lld is pinned once per rank, so %d rank(s) pin %s; this "
+                "process had taken %s of pinned host memory before rank %d's pool. The amdgpu "
+                "driver caps pinned memory system-wide at %s (ttm.pages_limit, half of RAM unless "
+                "raised), and %s of RAM is available. Lower --host-pool-mib, or raise the cap",
+                (long long)cfg.host_pool_mib, cfg.tp,
+                humanb((int64_t)cfg.tp * cfg.host_pool_mib * 1024 * 1024).c_str(),
+                humanb(pinned + mapped).c_str(), rank,
+                cap > 0 ? humanb(cap).c_str() : "an unreadable limit",
+                avail >= 0 ? humanb(avail).c_str() : "an unknown amount");
+    }
+}
+
 /* ================================================================== 2. metadata */
 /* The model's metadata ONLY -- architecture id, dimensions, quantisation, vocab. Not the weights:
  * which weights exist is the architecture plugin's answer, not the container's, and reading them
@@ -770,7 +822,10 @@ int Engine::plan() {
          * much rather than shrinking anything. */
         int s = r->pools.configure(cfg_, props.vram_bytes);
         RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
-        if (s < 0) return s;
+        if (s < 0) {
+            report_pool_refusal(r->index, r->device, r->pools, cfg_);
+            return s;
+        }
 
         /* Under tensor parallel the placement unit is a SHARD of a weight, so each rank plans
          * against its own card's budget (spec §5.3). */
@@ -2422,6 +2477,40 @@ int Engine::start() {
         r->index  = i;
         r->device = devs[i];
         ranks_.push_back(std::move(r));
+    }
+
+    /* PEER ACCESS, MEASURED BEFORE ANYTHING IS SELECTED. A kernel that reads or writes another
+     * card's memory says so with a constraint on device.p2p (rad_types.h), and the selector reads
+     * it from here: on a machine where some pair of the ranks' cards cannot reach each other such a
+     * kernel is not selected, and declare names the constraint instead of the all-reduce faulting
+     * or hanging on its first message. Every ordered pair, because access is granted one way at a
+     * time. */
+    {
+        long long p2p = 1;
+        std::string blocked;
+        for (int i = 0; i < cfg_.tp; ++i)
+            for (int j = 0; j < cfg_.tp; ++j) {
+                if (i == j) continue;
+                const int a = dev_peer_access(devs[i], devs[j]);
+                if (a < 0) {
+                    RAD_ERR("device: could not ask whether card %d can reach card %d's memory: %s",
+                            devs[i], devs[j], rad_dev_last_error());
+                    return a;
+                }
+                if (a == 0) {
+                    p2p = 0;
+                    blocked += fmt("%s%d->%d", blocked.empty() ? "" : ", ", devs[i], devs[j]);
+                }
+            }
+        rad_tools_registry().set_device_fact(RAD_FACT_P2P, p2p);
+        if (cfg_.tp > 1) {
+            if (p2p) RAD_INFO("device: the %d cards reach each other's memory directly (peer to "
+                              "peer)", cfg_.tp);
+            else RAD_WARN("device: no peer-to-peer access between cards %s. A kernel that needs "
+                          "it (device.p2p == 1) is not selected; if nothing else implements its "
+                          "op, startup stops below naming it. IOMMU settings and the PCIe "
+                          "topology decide this, not radiance", blocked.c_str());
+        }
     }
 
     RAD_TRY(declare());

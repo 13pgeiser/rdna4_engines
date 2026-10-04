@@ -43,6 +43,9 @@ MemAllocator& rad_malloc_allocator() { static MallocAllocator a; return a; }
 /* ------------------------------------------------------------------ Shortfall */
 
 std::string Shortfall::str() const {
+    if (!refused.empty())
+        return fmt("%s: %s of %s refused: %s", pool.c_str(), what.c_str(),
+                   humanb(wanted).c_str(), refused.c_str());
     return fmt("%s: %s wanted %s, %s available -- short by %s",
                pool.c_str(), what.c_str(), humanb(wanted).c_str(),
                humanb(available).c_str(), humanb(missing()).c_str());
@@ -81,8 +84,11 @@ int Pool::init(std::string_view nm, int64_t bytes, int kind, MemAllocator* a, bo
     base_ = a->alloc(bytes_, kind);
     if (!base_) {
         /* Refuse; do not retry smaller. An engine that quietly re-optimises the split is an
-         * engine whose benchmarks do not reproduce (spec §6). */
-        shortfalls_.push_back({name_, "backing allocation", bytes_, 0});
+         * engine whose benchmarks do not reproduce (spec §6). The allocator's reason goes with
+         * it: the device layer says what the driver answered. */
+        const char* why = a == &rad_device_allocator() ? rad_dev_last_error() : nullptr;
+        shortfalls_.push_back({name_, "backing allocation", bytes_, 0,
+                               why && *why ? why : "the allocator returned nothing"});
         bytes_ = 0;
         return RAD_E_NOMEM;
     }
@@ -131,7 +137,9 @@ int Pool::init_elastic(std::string_view nm, int64_t bytes, int kind, MemAllocato
         /* Refuse; do not retry smaller. An address range is not memory -- a reservation that
          * fails on a 64-bit card is a bug and not a budget, and quietly halving it would hide the
          * bug behind a pool that cannot grow to what the operator asked for. */
-        shortfalls_.push_back({ name_, "address reservation", bytes_, 0 });
+        const char* why = rad_dev_last_error();
+        shortfalls_.push_back({ name_, "address reservation", bytes_, 0,
+                                *why ? why : "the device layer gave no reason" });
         bytes_ = 0;
         return rc;
     }

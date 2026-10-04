@@ -22,6 +22,9 @@ struct Server::Generation {
     int         prompt_index = 0;
     std::string text;
     std::vector<LogprobEntry> logprobs;
+    /* The reply against its reasoning block, every token the sink delivers: what
+     * completion_tokens_details.reasoning_tokens reports. */
+    ReasoningCount think;
     Finish      finish = Finish::None;
     bool        closed = false;      /* the server has decided this choice is over */
     size_t      scanned = 0;         /* how far the stop-string scan has reached */
@@ -56,6 +59,7 @@ Server::Server(const Deps& d, const ServerOptions& o)
     lim_.allow_audio = opt_.allow_audio;
     lim_.supports_logprobs = opt_.supports_logprobs;
     lim_.default_reasoning_effort = opt_.default_reasoning_effort;
+    lim_.default_thinking_budget = opt_.default_thinking_budget;
     lim_.default_sampling = opt_.default_sampling;
     lim_.default_dry_breakers_set = opt_.default_dry_breakers_set;
     lim_.default_template_kwargs = opt_.default_template_kwargs;
@@ -193,6 +197,16 @@ void Server::check_template_defaults(std::string* kwargs_why, std::string* effor
     if (!l.default_reasoning_effort.empty()) render(l, effort_why);
 }
 
+std::string Server::check_thinking_budget() const {
+    if (!deps_.chat || lim_.default_thinking_budget < 0) return std::string();
+    const std::string body = R"({"messages":[{"role":"user","content":"Hello"}],"max_tokens":1,)"
+                             R"("thinking_token_budget":)" +
+                             std::to_string(lim_.default_thinking_budget) + "}";
+    OaiRequest r;
+    ApiError e;
+    return parse_chat_request(body, odeps_, lim_, &r, &e) < 0 ? e.message : std::string();
+}
+
 void Server::stop() {
     stopping_.store(true);
     transport_.stop();
@@ -273,6 +287,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             g.prompt_index = (int)p;
             g.sink = std::make_shared<Sink>();
             g.sink->set_has_logprobs(opt_.supports_logprobs);
+            g.think.start(r.sp.reasoning);
             g.detok = deps_.tok->detokenizer(r.stop, r.preserved_tokens);
             if (!g.detok) {
                 *err = err_not_implemented("the tokenizer did not supply an incremental decoder");
@@ -353,6 +368,7 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
         while ((n = g.sink->read(buf, 128)) > 0) {
             progress = true;
             for (size_t i = 0; i < n; ++i) {
+                g.think.push(r.sp.reasoning, buf[i].token);
                 std::string piece = g.detok->push(buf[i].token);
                 if (!piece.empty()) g.text += piece;
                 if (r.want_logprobs)
@@ -408,6 +424,63 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
         }
     }
     return progress;
+}
+
+/* ------------------------------------------------------------------ usage */
+
+/* THE REQUEST'S TOKENS, ONCE FOR BOTH PATHS. `n` choices share a prompt, so the prompt and its
+ * cached part are counted once per prompt. Reasoning is reported only where the reply's block can
+ * be counted by token (ReasoningSpan); a model without one reports no breakdown rather than a
+ * zero that would claim there was no reasoning. */
+UsageOut Server::usage_of(const OaiRequest& r, const std::vector<Generation>& gens) {
+    UsageOut u;
+    for (const auto& p : r.prompts) u.prompt += (int64_t)p.tokens.size();
+    if (r.sp.reasoning.known()) u.reasoning = 0;
+    for (const auto& g : gens) {
+        u.completion += g.sink->n_produced();
+        if (g.prompt_index * r.n == g.index) u.cached += g.sink->n_cached();
+        if (u.reasoning >= 0) u.reasoning += g.think.tokens;
+    }
+    return u;
+}
+
+/* WHERE THE REQUEST'S TIME WENT, from its sinks: one for a choice's final chunk, all of them for
+ * the request. Every time is moved onto one clock first -- each sink counts from its own
+ * construction. See TimingsOut for what each field means. */
+TimingsOut Server::timings_of(const Sink* const* sinks, size_t n) {
+    TimingsOut t;
+    int64_t admit = INT64_MAX, first_lo = INT64_MAX, first_hi = INT64_MIN, last = INT64_MIN;
+    bool admitted = true;
+    for (size_t i = 0; i < n; ++i) {
+        const Sink& s = *sinks[i];
+        const int64_t produced = s.n_produced();
+        t.predicted_n      += produced;
+        t.draft_n          += s.n_drafted();
+        t.draft_n_accepted += s.n_draft_accepted();
+        const int64_t tf = s.t_first_token_ns();
+        if (tf < 0) continue;
+        t.valid = true;
+        t.cache_n  += s.n_cached();
+        t.prompt_n += s.n_prompt() - s.n_cached();
+        if (produced > 1) t.decode_n += produced - 1;
+        const int64_t t0 = s.t_start_ns(), ta = s.t_admitted_ns();
+        if (ta < 0) admitted = false;
+        else admit = std::min(admit, t0 + ta);
+        first_lo = std::min(first_lo, t0 + tf);
+        first_hi = std::max(first_hi, t0 + tf);
+        last     = std::max(last, t0 + s.t_last_token_ns());
+    }
+    if (!t.valid) return t;
+    if (admitted) t.prompt_ms = (double)(first_hi - admit) * 1e-6;
+    t.predicted_ms = (double)(last - first_lo) * 1e-6;
+    return t;
+}
+
+TimingsOut Server::timings_of(const std::vector<Generation>& gens) {
+    std::vector<const Sink*> v;
+    v.reserve(gens.size());
+    for (const auto& g : gens) v.push_back(g.sink.get());
+    return timings_of(v.data(), v.size());
 }
 
 /* ------------------------------------------------------------------ metrics bookkeeping */
@@ -494,14 +567,11 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     }
 
     Finish overall = Finish::Stop;
-    UsageOut usage;
-    for (const auto& p : r.prompts) usage.prompt += (int64_t)p.tokens.size();
+    const UsageOut usage = usage_of(r, gens);
     std::vector<ChoiceOut> choices;
     choices.reserve(gens.size());
 
     for (auto& g : gens) {
-        usage.completion += g.sink->n_produced();
-        if (g.prompt_index * r.n == g.index) usage.cached += g.sink->n_cached();
 
         ChoiceOut c;
         c.index = g.index;
@@ -562,9 +632,10 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     retire(gens);
     release(r.n_choices());
 
+    const TimingsOut timings = timings_of(gens);
     std::string body = r.endpoint == Endpoint::Chat
-                           ? chat_completion_body(r, choices, usage)
-                           : text_completion_body(r, choices, usage);
+                           ? chat_completion_body(r, choices, usage, timings)
+                           : text_completion_body(r, choices, usage, timings);
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, std::move(body));
 }
@@ -572,7 +643,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
 /* ------------------------------------------------------------------ streaming */
 
 static std::string text_chunk(const OaiRequest& r, int index, const std::string& delta,
-                              const char* finish_reason) {
+                              const char* finish_reason, const TimingsOut* t = nullptr) {
     nlohmann::ordered_json ch;
     ch["text"] = delta;
     ch["index"] = index;
@@ -584,6 +655,7 @@ static std::string text_chunk(const OaiRequest& r, int index, const std::string&
     o["created"] = r.created;
     o["model"] = r.model;
     o["choices"] = nlohmann::ordered_json::array({ch});
+    if (t && t->valid) o["timings"] = timings_json(*t);
     return sse_event(o.dump());
 }
 
@@ -675,21 +747,20 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
         }
 
         if (self->all_done(st->gens)) {
-            UsageOut u;
-            for (const auto& p : st->r.prompts) u.prompt += (int64_t)p.tokens.size();
-            for (auto& g : st->gens) {
-                u.completion += g.sink->n_produced();
-                if (g.prompt_index * st->r.n == g.index) u.cached += g.sink->n_cached();
-            }
+            const UsageOut u = usage_of(st->r, st->gens);
             Finish overall = Finish::Stop;
             for (auto& g : st->gens) {
+                /* EACH CHOICE'S OWN TIMINGS ON ITS FINAL CHUNK, so a client that asked for no
+                 * usage chunk still has them, as llama.cpp sends them. */
+                const Sink* one = g.sink.get();
+                const TimingsOut gt = timings_of(&one, 1);
                 if (st->r.endpoint == Endpoint::Chat) {
-                    out += g.delta->final_chunk(g.finish);
+                    out += g.delta->final_chunk(g.finish, gt);
                     Finish adj = g.delta->adjusted_finish(g.finish);
                     if (adj == Finish::Error || adj == Finish::Cancelled) overall = adj;
                     else if (adj == Finish::ToolCalls) overall = adj;
                 } else {
-                    out += text_chunk(st->r, g.index, "", finish_reason_oai(g.finish));
+                    out += text_chunk(st->r, g.index, "", finish_reason_oai(g.finish), &gt);
                     if (g.finish == Finish::Error) overall = Finish::Error;
                 }
                 /* A failed generation cannot become a non-200 -- the headers left long ago -- so
@@ -711,9 +782,11 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
              * it, and once for the request rather than once per choice: `n` completions share one
              * prompt and one total, so emitting it per generation would count the prompt n times
              * and interleave usage between the choices' final chunks. */
-            if (st->r.include_usage)
-                out += st->r.endpoint == Endpoint::Chat ? chat_usage_chunk(st->r, u)
-                                                        : text_usage_chunk(st->r, u);
+            if (st->r.include_usage) {
+                const TimingsOut t = timings_of(st->gens);
+                out += st->r.endpoint == Endpoint::Chat ? chat_usage_chunk(st->r, u, t)
+                                                        : text_usage_chunk(st->r, u, t);
+            }
 
             out += SSE_DONE;
             st->done_sent = true;

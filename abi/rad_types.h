@@ -303,6 +303,19 @@ typedef struct RadConstraint {
     const char* sval;   /* IN: space-separated set of admissible strings */
 } RadConstraint;
 
+/* A CONSTRAINT ON THE MACHINE rather than on the geometry. A key that starts "device." is matched
+ * against what the engine measured about the ranks' devices at launch, not against the op's
+ * parameters: a capability such as reaching another card's memory belongs to the machine, and
+ * carrying it as a parameter would have every architecture plugin declare it on every op and
+ * every schema grow a field for it. Such a key is in no geometry, so it changes no tuning key
+ * and no selection fold. Where nothing measured it -- a tool selecting without an engine -- it is
+ * absent, and a constraint on an absent key does not hold.
+ *
+ *   device.p2p   1 when every rank's device can read and write every other rank's memory
+ *                directly; 0 when some pair cannot. One rank has no peer to reach, and is 1. */
+#define RAD_DEVICE_FACT_PREFIX "device."
+#define RAD_FACT_P2P           "device.p2p"
+
 #define RAD_C(k, o, v)  { (k), (o), (long long)(v), 0 }
 #define RAD_CEQ(k, v)   { (k), RAD_C_EQ,  (long long)(v), 0 }
 #define RAD_CLE(k, v)   { (k), RAD_C_LE,  (long long)(v), 0 }

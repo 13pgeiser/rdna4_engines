@@ -391,6 +391,13 @@ struct ChatRender {
 
     /* The tokens that parser must be able to SEE. See ITokenizer::detokenizer. */
     std::vector<std::string> preserved_tokens;
+
+    /* THE REASONING BLOCK THIS RENDER LEAVES THE REPLY FACING, as the parser reads it: the
+     * markers with their optional whitespace trimmed, and whether the reply starts inside the
+     * block. Empty `think_close` is a model with no reasoning block. The server turns these into
+     * token ids (ReasoningSpan) to count the block and to hold a budget on it. */
+    std::string think_open, think_close;
+    bool        think_starts_open = false;
 };
 
 class IChatTemplate {

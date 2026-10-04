@@ -62,6 +62,11 @@
 #define C_DIV(k, v) { (k), RAD_C_DIV, (long long)(v), nullptr }
 #define C_IN(k, s)  { (k), RAD_C_IN,  0, (s) }
 
+/* EVERY KERNEL THAT TOUCHES A PEER'S MEMORY: the collectives push into the other ranks' scratch and
+ * raise their flags directly, so a machine whose cards cannot reach each other must not select
+ * them. The engine measures this at launch (rad_types.h, device.p2p). */
+#define C_P2P       C_EQ(RAD_FACT_P2P, 1)
+
 /* libr4d's R4D_AR_TWOSHOT_WIDE_MAX_ELEMS, restated because this file must not include r4d.h.
  * r4d_ar_entry.hip static_asserts the two against each other. */
 #define R4D_AR_TWOSHOT_WIDE_MAX_ELEMS 20971520
@@ -2297,32 +2302,40 @@ static const RadConstraint cGdnGatedRmsNorm[] = {
  * accepts either, so a constraint that took only one would refuse the sampler by a synonym. */
 static const RadConstraint cArGather2[] = {
     C_EQ("world_size", 2), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+    C_P2P,
 };
 
 static const RadConstraint cArExact[] = {
     C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_P2P,
 };
 static const RadConstraint cArExact4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_P2P,
 };
 static const RadConstraint cArExact8[] = {
     C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_P2P,
 };
 static const RadConstraint cArTsExact4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 1), C_EQ("hops", 2),
     C_IN("dtype", "bf16 fp16 fp32"),
     C_DIV("numel", 64), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+    C_P2P,
 };
 static const RadConstraint cArTsExact8[] = {
     C_EQ("world_size", 8), C_EQ("exact", 1), C_EQ("hops", 2),
     C_IN("dtype", "bf16 fp16 fp32"),
     C_DIV("numel", 64), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+    C_P2P,
 };
 static const RadConstraint cArWht6[] = {
     C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
+    C_P2P,
 };
 static const RadConstraint cArTi8Ts4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
+    C_P2P,
 };
 
 /* ---- GEMM ------------------------------------------------------------------------------------
@@ -2595,17 +2608,20 @@ static const RadConstraint cRmsNormQuantFp8[] = {
 static const RadConstraint cArRmsNormQuantFp8[] = {
     C_DIV("n", 8), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
     C_EQ("world_size", 2),
+    C_P2P,
 };
 /* hc_write's own bounds plus the all-reduce's: `n DIV 8` because `y` is pushed as 16B words, and
  * world_size 2 because the handshake is one peer flag per block. */
 static const RadConstraint cArHcWrite[] = {
     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
     C_EQ("world_size", 2),
+    C_P2P,
 };
 /* ar_hc_write's bounds and the gather's: top_k up to the 64 slots a row's table holds in LDS. */
 static const RadConstraint cArGatherHcWrite[] = {
     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
     C_EQ("world_size", 2), C_GE("top_k", 1), C_LE("top_k", 64),
+    C_P2P,
 };
 static const RadConstraint cGatedQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
@@ -2658,6 +2674,7 @@ static const RadConstraint cRmsNormHadQuantI8[] = {
 static const RadConstraint cArLnHadQuantI8[] = {
     C_DIV("n", 16), C_DIV("n", 128), C_LE("n", 16256), C_LE("group", 512), C_IN("dtype", "bf16"),
     C_EQ("world_size", 2),
+    C_P2P,
 };
 static const RadConstraint cQkNormRopeGate[] = {
     C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),

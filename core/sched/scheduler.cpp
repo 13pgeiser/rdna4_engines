@@ -257,7 +257,8 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
  *
  * Appending to `Request::output` is not enough on its own: without a push the engine generates
  * correctly, step after step, while the HTTP thread waits in `Sink::wait()` until the client times
- * out. `sink_push`, `sink_finish` and `sink_prompt_stats` are called from here and nowhere else.
+ * out. Every sink_* call -- push, finish, prompt stats, admission and drafts -- is made from this
+ * file and nowhere else.
  *
  * A push returns false ONLY on overflow, and an overflowing sink has already failed the request --
  * a stream missing tokens in the middle is worse than one that stops and says so -- so the return
@@ -826,6 +827,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
     if (s.card < 0) { s.card = free_cards_.back(); free_cards_.pop_back(); }
     r.state = ReqState::Running;
     s.running = true;
+    server::sink_admitted(r.sink);
     s.sched_tokens = (int32_t)want;
     s.pending_ckpt = ckpt;
     ++m_.admitted;
@@ -1488,6 +1490,7 @@ int Scheduler::commit(const StepResult& res) {
                 draft_.observe(e.n_spec, a);
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
+                server::sink_drafts(r.sink, e.n_spec, a);
             }
         }
         s.n_draft = 0;

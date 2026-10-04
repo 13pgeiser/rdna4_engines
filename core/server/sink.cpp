@@ -100,6 +100,18 @@ void Sink::set_prompt_stats(int32_t n_prompt, int32_t n_cached) {
     n_cached_.store(n_cached, std::memory_order_release);
 }
 
+void Sink::mark_admitted() {
+    if (t_admit_.load(std::memory_order_relaxed) < 0)
+        t_admit_.store(now_ns() - t_start_ns_, std::memory_order_release);
+}
+
+/* One producer, so a load and a store is the whole of the update. */
+void Sink::add_drafts(int32_t n, int32_t accepted) {
+    n_draft_.store(n_draft_.load(std::memory_order_relaxed) + n, std::memory_order_release);
+    n_draft_acc_.store(n_draft_acc_.load(std::memory_order_relaxed) + accepted,
+                       std::memory_order_release);
+}
+
 size_t Sink::read(SinkToken* out, size_t max) {
     const uint64_t t = tail_.load(std::memory_order_relaxed);
     const uint64_t h = head_.load(std::memory_order_acquire);

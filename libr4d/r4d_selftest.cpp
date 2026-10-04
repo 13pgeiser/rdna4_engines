@@ -337,8 +337,11 @@ static void cross_check(const Plugin& pl) {
             continue;
         }
         /* THE CHECK THAT EARNS ITS KEEP. A constraint on a key the op does not declare can never
-         * be satisfied, so the row is unreachable and nothing says so. */
+         * be satisfied, so the row is unreachable and nothing says so. A "device." key is not a
+         * parameter at all: it is matched against the machine (rad_types.h). */
+        static const size_t kFact = std::strlen(RAD_DEVICE_FACT_PREFIX);
         for (int c = 0; c < r->n_constraints; ++c) {
+            if (!std::strncmp(r->constraints[c].key, RAD_DEVICE_FACT_PREFIX, kFact)) continue;
             bool found = false;
             for (int j = 0; j < sc->n_params; ++j)
                 if (!std::strcmp(sc->params[j].key, r->constraints[c].key)) { found = true; break; }

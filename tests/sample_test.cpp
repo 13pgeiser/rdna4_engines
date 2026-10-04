@@ -1855,4 +1855,129 @@ TEST(admission_resolves_grammar_triggers_and_refuses_a_regular_expression) {
     CHECK_EQ(ch.s.check_request(sp, &why), RAD_E_UNSUPPORTED);
 }
 
+/* A THINKING BUDGET CLOSES THE REASONING BLOCK WHERE THE BODY REACHES IT, and it is walked over the
+ * speculative window as a grammar is: position k counts the committed reply and drafts 0..k-1, so
+ * a window that crosses the budget is forced from the first position past it, and a draft that
+ * closes the block itself frees every position behind it. Token 1 wins every row's logits, so a
+ * row that comes back 5 was forced. */
+TEST(a_thinking_budget_forces_the_close_from_the_position_that_spends_it) {
+    HostChain ch(8, 1, 2);
+    NEED_CHAIN(ch)
+    SamplingParams sp = greedy_params();
+    sp.reasoning.close = 5;
+    sp.reasoning.starts_open = true;
+    sp.thinking_budget = 2;
+    std::vector<float> lg(3 * 8, 0.0f);
+    for (int r = 0; r < 3; ++r) lg[(size_t)r * 8 + 1] = 5.0f;
+    std::vector<int32_t> tok;
+
+    Request a = make_req(1, { 3 }, sp);
+    a.output = { 1 };
+    int32_t da[2] = { 2, 2 };
+    a.n_draft = 2;
+    a.draft = da;
+    CHECK_OK(ch.step({ &a }, lg, &tok));
+    CHECK_EQ(tok[0], 1);                   /* one body token: within the budget */
+    CHECK_EQ(tok[1], 5);                   /* behind a draft that makes it two */
+    CHECK_EQ(tok[2], 5);
+
+    Request b = make_req(2, { 3 }, sp);
+    b.output = { 1 };
+    int32_t db[2] = { 5, 2 };
+    b.n_draft = 2;
+    b.draft = db;
+    CHECK_OK(ch.step({ &b }, lg, &tok));
+    CHECK_EQ(tok[0], 1);
+    CHECK_EQ(tok[1], 1);                   /* the draft closed the block: nothing left to force */
+    CHECK_EQ(tok[2], 1);
+}
+
+/* THE COMMITTED REPLY IS COUNTED ACROSS STEPS, and only from where the block opens: a reply that
+ * opens its own block counts from its opener, and one that starts any other way has no block to
+ * budget. Sampled, not greedy, so the mask is what decides and not an argmax that happens to
+ * agree. */
+TEST(a_thinking_budget_counts_the_reply_across_steps_and_only_inside_the_block) {
+    HostChain ch(8, 2, 0);
+    NEED_CHAIN(ch)
+    SamplingParams sp;
+    sp.temp = 1.0f;
+    sp.reasoning.open = 4;
+    sp.reasoning.close = 5;
+    sp.thinking_budget = 1;
+    std::vector<float> lg(2 * 8, 0.0f);
+    lg[1] = 40.0f;
+    lg[8 + 1] = 40.0f;
+    std::vector<int32_t> tok;
+
+    Request opens = make_req(1, { 3 }, sp);
+    Request plain = make_req(2, { 3 }, sp);
+    opens.output = { 4 };                  /* the opener: the block starts, nothing in it yet */
+    plain.output = { 2 };                  /* no opener first: there is no block */
+    CHECK_OK(ch.step({ &opens, &plain }, lg, &tok));
+    CHECK_EQ(tok[0], 1);
+    CHECK_EQ(tok[1], 1);
+
+    opens.output.push_back(1);             /* one body token: the budget is spent */
+    plain.output.push_back(1);
+    CHECK_OK(ch.step({ &opens, &plain }, lg, &tok));
+    CHECK_EQ(tok[0], 5);
+    CHECK_EQ(tok[1], 1);
+
+    opens.output.push_back(5);             /* closed: the answer is free again */
+    CHECK_OK(ch.step({ &opens, &plain }, lg, &tok));
+    CHECK_EQ(tok[0], 1);
+}
+
+/* A GRAMMAR KEEPS THE LAST WORD. The close is forced only where the grammar admits it; where it
+ * does not, the row is the grammar's, and the budget waits for a position the grammar allows. */
+TEST(a_thinking_budget_forces_the_close_only_where_the_grammar_admits_it) {
+    SimpleVocab v({ "a", "b", "c", "</t>" });
+    HostChain ch(4, 1, 0, &v);
+    NEED_CHAIN(ch)
+    SamplingParams sp = greedy_params();
+    sp.reasoning.close = 3;
+    sp.reasoning.starts_open = true;
+    sp.thinking_budget = 0;
+    std::vector<float> lg = { 9.0f, 0.0f, 0.0f, 0.0f };
+    std::vector<int32_t> tok;
+
+    sp.grammar = "root ::= (\"a\" | \"</t>\")+";
+    Request admits = make_req(1, { 1 }, sp);
+    CHECK_OK(ch.step({ &admits }, lg, &tok));
+    CHECK_EQ(tok[0], 3);
+
+    sp.grammar = "root ::= \"a\"+";
+    Request forbids = make_req(2, { 1 }, sp);
+    CHECK_OK(ch.step({ &forbids }, lg, &tok));
+    CHECK_EQ(tok[0], 0);
+}
+
+/* The count a budget is held against and the count usage reports are one definition. */
+TEST(reasoning_count_follows_the_parser_s_reading_of_the_block) {
+    ReasoningSpan s;
+    s.open = 4;
+    s.close = 5;
+    ReasoningCount c;
+    c.start(s);
+    for (int32_t t : { 4, 1, 1, 5, 1, 4, 1 }) c.push(s, t);
+    CHECK_EQ(c.tokens, (int64_t)4);        /* the opener, two body tokens, the close */
+    CHECK_EQ(c.body, (int64_t)2);
+    CHECK(!c.inside());
+
+    s.starts_open = true;
+    c.start(s);
+    for (int32_t t : { 1, 1, 1 }) c.push(s, t);
+    CHECK(c.inside());
+    CHECK_EQ(c.tokens, (int64_t)3);
+
+    s.starts_open = false;
+    c.start(s);
+    for (int32_t t : { 1, 4, 1 }) c.push(s, t);
+    CHECK_EQ(c.tokens, (int64_t)0);        /* a block opened mid-reply is not one */
+
+    c.start(ReasoningSpan{});
+    c.push(ReasoningSpan{}, 1);
+    CHECK_EQ(c.tokens, (int64_t)0);
+}
+
 RAD_TEST_MAIN()

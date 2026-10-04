@@ -430,6 +430,10 @@ int     tape_set_overlap(RadTape t, int i, bool on) {
     return dev()->tape_set_overlap ? dev()->tape_set_overlap(t, i, on ? 1 : 0) : RAD_E_UNSUPPORTED;
 }
 bool    dev_integrated(int device) { return dev()->integrated && dev()->integrated(device) > 0; }
+int     dev_peer_access(int self, int peer) {
+    if (self == peer) return 1;
+    return dev()->peer_access ? dev()->peer_access(self, peer) : 1;
+}
 size_t  dev_code_mark() { return dev()->code_mark ? dev()->code_mark() : 0; }
 int     dev_code_runs(size_t from, size_t to, int device, std::string* why) {
     if (!dev()->code_runs || from >= to) return 1;

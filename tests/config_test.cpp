@@ -220,6 +220,23 @@ TEST(the_paths_and_names_reach_their_fields) {
     CHECK_EQ(c.override_chat_template, std::string("/t.jinja"));
 }
 
+/* The reasoning budget is a count or nothing: unset is -1, which no request default can mean. */
+TEST(thinking_token_budget_takes_a_count_and_defaults_to_none) {
+    Config c;
+    CHECK_EQ(parse({}, &c), RAD_OK);
+    CHECK_EQ(c.thinking_token_budget, (int64_t)-1);
+    Config d;
+    CHECK_EQ(parse({ "--thinking-token-budget", "2048" }, &d), RAD_OK);
+    CHECK_EQ(d.thinking_token_budget, (int64_t)2048);
+    Config e;
+    CHECK_EQ(parse({ "--thinking-token-budget", "0" }, &e), RAD_OK);
+    CHECK_EQ(e.thinking_token_budget, (int64_t)0);
+    Config f;
+    CHECK(parse({ "--thinking-token-budget", "-1" }, &f) < 0);
+    Config g;
+    CHECK(parse({ "--thinking-token-budget", "lots" }, &g) < 0);
+}
+
 TEST(the_boolean_flags_are_off_until_they_are_given) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);

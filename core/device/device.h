@@ -223,6 +223,11 @@ struct DeviceBackend {
      * as device memory is shared with every process on the machine. Null on a backend with no such
      * devices, which answers 0. */
     int     (*integrated)(int device);
+
+    /* ---- 1 when `self` can read and write `peer`'s memory directly, 0 when it cannot, < 0 when
+     * the backend cannot say. Asked, not enabled: rad_dev_enable_peer is the call that maps the
+     * memory. Null on a backend whose devices share one address space, which answers 1. */
+    int     (*peer_access)(int self, int peer);
 };
 
 
@@ -240,6 +245,9 @@ int     tape_diff(RadTape a, RadTape b, std::string* why);
 void    tape_destroy(RadTape t);
 int     tape_record(RadTape t, int i, int* kind, uint32_t* queue);
 int     tape_set_overlap(RadTape t, int i, bool on);
+
+/* The current backend's DeviceBackend::peer_access. */
+int     dev_peer_access(int self, int peer);
 
 /* The current backend's DeviceBackend::vram_used. */
 int     dev_vram_used(int device, int64_t* out);

@@ -118,8 +118,8 @@ TEST(loading_reads_identity_and_calls_open) {
     if (!base) return;
     CHECK_EQ((int)base->kind, RAD_PLUGIN_KERNEL);
     CHECK_EQ(base->version, "0.1");
-    CHECK_EQ(base->n_kernels, 13);
-    CHECK_EQ(base->n_schemas, 7);
+    CHECK_EQ(base->n_kernels, 16);
+    CHECK_EQ(base->n_schemas, 9);
 
     /* The optional open hook runs once, after load and before any selection. */
     auto open_calls = reinterpret_cast<int (*)(void)>(dlsym(base->handle, "radtest_open_calls"));
@@ -285,7 +285,7 @@ TEST(every_row_s_op_has_a_schema) {
     CHECK_OK(load(r));
     CHECK_OK(r.check_complete());
     const auto ops = r.op_names();
-    CHECK_EQ(ops.size(), (size_t)7);
+    CHECK_EQ(ops.size(), (size_t)9);
     CHECK_EQ(ops[0], "t_attn");
 }
 
@@ -788,6 +788,33 @@ TEST(the_selection_table_folds_repeats_and_names_the_refusal) {
 
     r.clear_selections();
     CHECK_EQ(r.n_selections(), (size_t)0);
+}
+
+/* A "device." CONSTRAINT IS READ FROM THE MACHINE, not from the query: the engine measures peer
+ * access at launch and the selector holds a kernel that needs it to that. Unmeasured, the kernel
+ * is not selected and the refusal says nothing measured it; measured absent, the next row in the
+ * plugin takes the op, and an op with no such row is refused naming the fact. The query never
+ * carries the key, so no geometry -- and no tuning key -- changes. */
+TEST(a_device_fact_constraint_is_matched_against_the_machine) {
+    Registry r;
+    CHECK_OK(load(r));
+    Geometry g;
+    g.set_i("M", 4);
+    g.set_i("n", 64);
+
+    CHECK_EQ(picked(r.select("t_peer", g, RAD_DOMAIN_DEVICE)), "t_peer_staged");
+    CHECK(has(refusal(r, "t_peer_only", g), "device.p2p is not known"));
+
+    r.set_device_fact(RAD_FACT_P2P, 1);
+    CHECK_EQ(picked(r.select("t_peer", g, RAD_DOMAIN_DEVICE)), "t_peer_direct");
+    CHECK_EQ(picked(r.select("t_peer_only", g, RAD_DOMAIN_DEVICE)), "t_peer_only_direct");
+    CHECK(!g.has(RAD_FACT_P2P));
+
+    r.set_device_fact(RAD_FACT_P2P, 0);
+    CHECK_EQ(picked(r.select("t_peer", g, RAD_DOMAIN_DEVICE)), "t_peer_staged");
+    const std::string why = refusal(r, "t_peer_only", g);
+    CHECK(has(why, "device.p2p == 1, have 0"));
+    CHECK(has(why, "measured at launch"));
 }
 
 RAD_TEST_MAIN()

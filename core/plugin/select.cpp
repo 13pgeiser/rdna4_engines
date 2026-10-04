@@ -23,14 +23,24 @@ namespace {
 /* True when every constraint holds. Otherwise `why` names the FIRST one that did not and what it
  * wanted: "no kernel" on its own is not an answer anyone can act on, and the first failure is the
  * one a reader can fix -- listing all four of a row's unmet constraints buries it. */
-bool row_matches(const KernelRow& r, const Geometry& g, const std::vector<std::string>& skip,
-                 std::string* why) {
+bool row_matches(const KernelRow& r, const Geometry& g, const Geometry& facts,
+                 const std::vector<std::string>& skip, std::string* why) {
+    static const size_t kFact = std::strlen(RAD_DEVICE_FACT_PREFIX);
     for (int i = 0; i < r.info->n_constraints; ++i) {
         const RadConstraint& c = r.info->constraints[i];
         /* A constraint on a RAD_DERIVED parameter the caller did not name is not a predicate on
          * the question -- it IS the answer, read back afterwards. Matching on it would make the
          * kernel unreachable by the only query anyone can ask (rad_abi.h, spec §7.2). */
         if (c.key && std::find(skip.begin(), skip.end(), c.key) != skip.end()) continue;
+        /* A "device." key is a fact about the machine, read from what the engine measured. */
+        if (c.key && std::strncmp(c.key, RAD_DEVICE_FACT_PREFIX, kFact) == 0) {
+            if (constraint_holds(c, facts)) continue;
+            if (why)
+                *why = facts.has(c.key)
+                           ? constraint_why(c, facts) + " -- this machine, measured at launch"
+                           : std::string(c.key) + " is not known: nothing measured this machine";
+            return false;
+        }
         if (!constraint_holds(c, g)) {
             if (why) *why = constraint_why(c, g);
             return false;
@@ -111,7 +121,7 @@ const KernelRow* Registry::select(std::string_view op, const Geometry& g, int do
             }
 
             std::string whynot;
-            bool ok = row_matches(*r, g, derived_keys, &whynot);
+            bool ok = row_matches(*r, g, device_facts_, derived_keys, &whynot);
             if (ok && accept && *accept) {
                 whynot = (*accept)(*r, g);
                 ok = whynot.empty();

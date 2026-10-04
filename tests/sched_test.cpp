@@ -2076,4 +2076,49 @@ TEST(shutdown_fails_each_sink_with_the_status_that_stopped_the_engine) {
     }
 }
 
+/* A REQUEST'S OWN SPECULATION AND ITS ADMISSION REACH ITS SINK, which is what lets a response say
+ * how many tokens were drafted for it and when its prefill started: the aggregate counters cannot
+ * be split between requests that overlap. The count is the drafts each verify step proposed for
+ * this request and the ones it accepted -- the same numbers /metrics sums. */
+TEST(a_sink_carries_its_requests_admission_and_draft_counts) {
+    server::Sink sink;
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+
+    const uint64_t id = f.submit_to(&sink, 40, 60);
+    CHECK(id != 0);
+    CHECK(sink.t_admitted_ns() < 0);
+    int64_t drafted = 0, accepted = 0;
+    uint32_t rng = 99;
+    for (int step = 0; step < 40 && !sink.done(); ++step) {
+        int32_t draft[4] = { 31, 32, 33, 34 };
+        (void)f.sch.set_draft(id, draft, 4);
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        CHECK(sink.t_admitted_ns() >= 0);
+        const StepPlan& p = f.sch.plan();
+        Scheduler::StepResult r;
+        static int32_t acc[64], tok[64];
+        static uint8_t eos[64];
+        for (size_t k = 0; k < p.e.size(); ++k) {
+            rng = rng * 1664525u + 1013904223u;
+            acc[k] = p.e[k].n_spec > 0 ? (int32_t)((rng >> 16) % (uint32_t)(p.e[k].n_spec + 1)) : 0;
+            tok[k] = 5;
+            eos[k] = 0;
+            if (!p.e[k].is_prefill && p.e[k].n_spec > 0) {
+                drafted += p.e[k].n_spec;
+                accepted += acc[k];
+            }
+        }
+        r.n_seq = (int)p.e.size();
+        r.n_accepted = acc; r.token = tok; r.eos = eos;
+        CHECK_OK(f.sch.commit(r));
+    }
+    CHECK(drafted > 0);
+    CHECK_EQ(sink.n_drafted(), drafted);
+    CHECK_EQ(sink.n_draft_accepted(), accepted);
+}
+
 RAD_TEST_MAIN()

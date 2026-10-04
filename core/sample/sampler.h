@@ -218,7 +218,18 @@ private:
     struct SeqState {
         std::unique_ptr<GrammarBackend> grammar;
         DryBreakers                     dry;
+        /* Where the reply stands against its reasoning block, over `output[0, think_seen)`.
+         * Advanced by build_step over what each commit appended, so a step costs the tokens it
+         * added and not the reply's length. Read only when the request carries a budget. */
+        ReasoningCount                  think;
+        size_t                          think_seen = 0;
     };
+
+    /* Mask staged row `row` to the reasoning block's close token: the budget is spent and the
+     * sampled position is still inside the block. A grammar already masking the row keeps the
+     * last word -- the close is forced only where the grammar admits it, and a row whose grammar
+     * forbids it is left to the grammar and forced at a later position. */
+    void force_close(DeviceSampleParams& p, int64_t row, int32_t close);
 
     SamplerConfig    cfg_{};
     const VocabView* vocab_ = nullptr;

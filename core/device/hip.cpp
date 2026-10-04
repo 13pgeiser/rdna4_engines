@@ -251,6 +251,12 @@ int d_props(int device, RadDeviceProps* out) {
     return RAD_OK;
 }
 
+int d_peer_access(int self, int peer) {
+    int can = 0;
+    HIP_TRY(hipDeviceCanAccessPeer(&can, self, peer));
+    return can ? 1 : 0;
+}
+
 int d_enable_peer(int self, int peer) {
     if (self == peer) return RAD_OK;
     int can = 0;
@@ -370,6 +376,7 @@ const DeviceBackend g_hip = {
     /* Plugin device code: the AQL backend's, which owns the fat-binary registrations. */
     nullptr, nullptr,
     d_integrated,
+    d_peer_access,
 };
 
 }  /* namespace */

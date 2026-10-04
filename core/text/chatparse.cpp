@@ -704,6 +704,21 @@ size_t ReplyParser::hold_bound() const {
            3 * 3;
 }
 
+ReasoningMarkers ReplyParser::reasoning() const {
+    const ReplyFormat::Impl& F = impl_->fmt->impl();
+    ReasoningMarkers m;
+    if (!F.f.has_reasoning()) return m;
+    m.open  = F.open_core;
+    m.close = F.close_core;
+    /* `tail` starts at the opener when the prompt holds one, and a prompt that also closed the
+     * block -- thinking turned off -- leaves the reply after it. With no opener at all the stream
+     * starts in the block (after_lead). */
+    const std::string& t = impl_->tail;
+    m.starts_open = F.open_core.empty() ||
+                    (!t.empty() && t.find(F.close_core, F.open_core.size()) == std::string::npos);
+    return m;
+}
+
 /* Read the tools the way the grammar generator reads them, so a name or a type means the same
  * thing to the parser as to the grammar that constrained the reply. */
 static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParser::Impl* P,

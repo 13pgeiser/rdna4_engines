@@ -76,6 +76,9 @@ struct ServerOptions {
     /* The deployment default for `reasoning_effort`, empty for the template's own. See
      * OaiLimits::default_reasoning_effort for why a server-side default is needed at all. */
     std::string default_reasoning_effort;
+    /* The deployment default for `thinking_token_budget`, -1 for none. See
+     * OaiLimits::default_thinking_budget. */
+    int64_t     default_thinking_budget = -1;
     /* What a request that sends no sampler fields is served with. See
      * OaiLimits::default_sampling; only the sampler knobs are read from it. */
     SamplingParams default_sampling;
@@ -141,6 +144,10 @@ public:
      * A render that fails at the first step says nothing about the defaults and is not reported.
      * `kwargs_why` / `effort_why` are left empty, or hold the template's refusal at that step. */
     void check_template_defaults(std::string* kwargs_why, std::string* effort_why) const;
+    /* THE DEPLOYMENT'S thinking_token_budget, asked for by a one-message chat the way a request
+     * would ask for it. Empty when this model's reasoning block can hold one; otherwise the 400 a
+     * request naming the budget would get, which says why. */
+    std::string check_thinking_budget() const;
     void stop();
     int  port() const { return transport_.port(); }   /* 0 until run() is accepting */
 
@@ -149,6 +156,10 @@ public:
 private:
     struct Generation;
     struct StreamState;
+
+    static UsageOut usage_of(const OaiRequest& r, const std::vector<Generation>& gens);
+    static TimingsOut timings_of(const Sink* const* sinks, size_t n);
+    static TimingsOut timings_of(const std::vector<Generation>& gens);
 
     void register_routes();
 

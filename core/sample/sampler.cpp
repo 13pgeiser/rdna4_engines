@@ -382,7 +382,8 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
     if (!missing) missing = need(sp.typical_p < 1.0f, op_typical_, "sample_typical");
     if (!missing) missing = need(sp.xtc_probability > 0.0f, op_xtc_, "sample_xtc");
     if (!missing) missing = need(dry_on(sp), op_dry_, "sample_dry");
-    if (!missing) missing = need(!sp.grammar.empty(), op_mask_, "sample_mask");
+    if (!missing) missing = need(!sp.grammar.empty() || sp.thinking_budget >= 0, op_mask_,
+                                 "sample_mask");
     if (!missing) missing = need(penalties_on(sp), op_penalties_, "sample_penalties");
     if (missing) {
         if (why) *why = std::string("no kernel resolved for '") + missing + "'";
@@ -456,6 +457,7 @@ int Sampler::begin_request(uint64_t req_id, const SamplingParams& sp, std::strin
         }
     }
 
+    st.think.start(sp.reasoning);
     seqs_[req_id] = std::move(st);
     return RAD_OK;
 }
@@ -591,8 +593,25 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
         if (walk) gr->push_state();
         bool dead = false;
 
+        /* THE REASONING BUDGET, walked over the window as the grammar is. Position k is inside the
+         * block or not according to the committed reply and drafts 0..k-1, which is the only
+         * history under which its token is ever emitted; a draft that ends the block early is
+         * accepted or rejected like any other. */
+        const bool budget = st && sp.thinking_budget >= 0 && sp.reasoning.known();
+        ReasoningCount think;
+        if (budget) {
+            if (st->think_seen > (size_t)n_out) {
+                st->think.start(sp.reasoning);
+                st->think_seen = 0;
+            }
+            for (; st->think_seen < (size_t)n_out; ++st->think_seen)
+                st->think.push(sp.reasoning, r->output[st->think_seen]);
+            think = st->think;
+        }
+
         for (int k = 0; k < n_pos; ++k) {
             if (walk && k > 0 && !dead && gr->accept_token(r->draft[k - 1]) < 0) dead = true;
+            if (budget && k > 0) think.push(sp.reasoning, r->draft[k - 1]);
             const int64_t row = n_seq_++;
 
             DeviceSampleParams& p = params_stage_[row];
@@ -744,6 +763,9 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
                     }
                 }
             }
+
+            if (budget && think.inside() && think.body >= sp.thinking_budget)
+                force_close(p, row, sp.reasoning.close);
         }
 
         /* Back to where the sequence actually is. The tokens it really accepted are applied by
@@ -765,6 +787,29 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
         }
     }
     return RAD_OK;
+}
+
+void Sampler::force_close(DeviceSampleParams& p, int64_t row, int32_t close) {
+    uint32_t* dst = mask_stage_ + row * mask_words_;
+    const int64_t at = (int64_t)close - cfg_.vocab_off;
+    const bool local = at >= 0 && at < cfg_.n_vocab_local;
+    if (p.flags & RAD_SP_MASK) {
+        /* The grammar's mask for this row. Under a split vocabulary the whole one is still in
+         * mask_full_, and the close may be another rank's column. */
+        const bool admitted =
+            vocab_parallel()
+                ? close < (int64_t)mask_full_.size() * 32 &&
+                      (mask_full_[(size_t)(close >> 5)] >> (uint32_t)(close & 31)) & 1u
+                : local && (dst[at >> 5] >> (uint32_t)(at & 31)) & 1u;
+        if (!admitted) return;
+    }
+    /* ONE ADMISSIBLE TOKEN, on whichever rank holds its column. The others mask the whole row
+     * out, which the candidate merge reads as no candidate from them (the grammar's own masks do
+     * the same when the admissible set lives on one shard). */
+    std::memset(dst, 0, (size_t)mask_words_ * 4);
+    if (local) dst[at >> 5] |= 1u << (uint32_t)(at & 31);
+    p.mask_row = (int32_t)row;
+    p.flags |= RAD_SP_MASK;
 }
 
 int Sampler::build_greedy(int64_t n) {

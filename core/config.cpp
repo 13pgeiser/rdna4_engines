@@ -114,6 +114,10 @@ static const Flag g_flags[] = {
     "                                    set is the template's: Qwen3.8 takes xhigh|medium|low and defaults\n"
     "                                    to xhigh, which on a short task can spend the whole token budget\n"
     "                                    inside <think> and answer nothing. \"none\" turns thinking off" },
+    { "--thinking-token-budget", "N",   "default `thinking_token_budget` for chat requests that do not set one: at\n"
+    "                                    N reasoning tokens the reasoning block is closed and the answer follows,\n"
+    "                                    so a client's max_tokens is not spent on reasoning alone. Unset is no\n"
+    "                                    limit. Needs a reasoning block that ends in one token, as </think> is" },
     { "--typical-p",          "F",      "default typical_p, (0, 1]. This flag and the eleven below set the default\n"
     "                                    for requests that do not name the field; a request that names it wins" },
     { "--presence-penalty",   "F",      "default presence_penalty, [-2, 2]" },
@@ -449,6 +453,10 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--reasoning-effort"))      { if (!(v = need(i))) return RAD_E_INVAL;
                                                  c->reasoning_effort = v; }
+        else if (S("--thinking-token-budget")) { if (!(v = need(i)) ||
+                                                     !parse_int(a.c_str(), v, 0, INT32_MAX,
+                                                                &c->thinking_token_budget))
+                                                     return RAD_E_INVAL; }
         else if (S("--generation-config"))     { if (!(v = need(i))) return RAD_E_INVAL;
                                                  c->generation_config = v; }
         else if (S("--override-chat-template")) { if (!(v = need(i))) return RAD_E_INVAL;

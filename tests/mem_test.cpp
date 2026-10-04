@@ -170,6 +170,25 @@ TEST(pool_reservation_never_falls_through) {
     CHECK_EQ(p.kv().used(), 512ll << 10);
 }
 
+/* A BACKING ALLOCATION THE ALLOCATOR REFUSES IS REPORTED AS A REFUSAL, with the allocator's reason
+ * where it has one -- not as "0 B available", which reads as a measurement of the card and sends
+ * the reader looking for memory that was never measured. */
+TEST(a_refused_backing_allocation_says_it_was_refused_and_why) {
+    struct Refuses final : MemAllocator {
+        void* alloc(int64_t, int) override { return nullptr; }
+        void  free(void*, int) override {}
+        const char* name() const override { return "refuses"; }
+    } none;
+    Config c = small_config();
+    Pools p;
+    CHECK_EQ(p.configure(c, 0, &none, &none), RAD_E_NOMEM);
+    const std::string& r = p.fit_report();
+    CHECK(r.find("backing allocation of") != std::string::npos);
+    CHECK(r.find("refused: the allocator returned nothing") != std::string::npos);
+    CHECK(r.find("0 B available") == std::string::npos);
+    CHECK(!p.configured());
+}
+
 /* ================================================================== the derived budget */
 
 TEST(derived_budget_takes_the_statics_off_the_top_then_divides_the_rest) {

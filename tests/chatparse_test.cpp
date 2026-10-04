@@ -849,6 +849,42 @@ static RadChatFormat qwen_abi() {
     return c;
 }
 
+/* WHERE THE REPLY STARTS AGAINST ITS REASONING BLOCK, read from the generation prompt as the stream
+ * reads it: opened by the prompt, opened and closed again (thinking off), or not opened at all --
+ * and the markers trimmed of the whitespace that is optional to match. The engine counts and closes
+ * the block by these, so a reply this calls open has to be one the stream reads as reasoning. */
+TEST(the_parser_says_whether_a_reply_starts_inside_its_reasoning_block) {
+    RadChatFormat c = qwen_abi();
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(&c, &f, &why));
+    std::shared_ptr<const ReplyFormat> rf;
+    CHECK_OK(ReplyFormat::compile(f, &rf, &why));
+    struct Case { const char* prompt; bool open; };
+    for (const Case& k : { Case{ "<|im_start|>assistant\n<think>\n", true },
+                           Case{ "<|im_start|>assistant\n<think>\n\n</think>\n\n", false },
+                           Case{ "<|im_start|>assistant\n", false } }) {
+        ReplyOptions ro;
+        ro.generation_prompt = k.prompt;
+        std::shared_ptr<const ReplyParser> rp;
+        CHECK_OK(ReplyParser::create(rf, ro, &rp, &why));
+        const ReasoningMarkers m = rp->reasoning();
+        CHECK_EQ(m.open, std::string("<think>"));
+        CHECK_EQ(m.close, std::string("</think>"));
+        CHECK_EQ(m.starts_open, k.open);
+        const ReplyMessage r = reply_parse(*rp, "x</think>\n\ny");
+        CHECK_EQ(r.reasoning.empty(), !k.open);
+    }
+
+    ChatFormat none;
+    CHECK_OK(chat_format_from_template("", "", "", &none, &why, &why));
+    CHECK_OK(ReplyFormat::compile(none, &rf, &why));
+    std::shared_ptr<const ReplyParser> rp;
+    CHECK_OK(ReplyParser::create(rf, ReplyOptions{}, &rp, &why));
+    CHECK(rp->reasoning().close.empty());
+    CHECK(!rp->reasoning().starts_open);
+}
+
 /* A plugin that declares its model's format gets exactly what the template analysis derives for
  * the same model: the same parser behaviour and the same grammar. */
 TEST(a_declared_format_reads_and_constrains_like_the_derived_one) {

@@ -203,6 +203,7 @@ const char* kAcceptedChat[] = {
     "messages", "tools", "tool_choice", "response_format", "top_logprobs",
     "parallel_tool_calls", "add_generation_prompt", "max_completion_tokens",
     "chat_template_kwargs", "reasoning_effort", "enable_thinking", "preserve_thinking",
+    "thinking_token_budget", "thinking_budget",
 };
 
 const char* kAcceptedCompletion[] = { "prompt", "echo" };
@@ -1157,6 +1158,74 @@ static int clamp_max_tokens(size_t n_prompt, const OaiLimits& lim, const char* f
 
 /* ================================================================== chat */
 
+/* THE REASONING BLOCK BY TOKEN ID, and the budget on it.
+ *
+ * The render names the block's markers as text; the engine counts and closes it by token, so
+ * the markers are encoded here, once per request. A marker that is not one token leaves the span
+ * unknown: the reply's reasoning is still split out, but it is not counted and cannot be closed
+ * by forcing a token. The opener matters only to a reply that must open its own block.
+ *
+ * `thinking_token_budget` is vLLM's name for the field and `thinking_budget` Qwen's API's; both
+ * are read, as max_tokens and max_completion_tokens are. A budget the span cannot hold is a 400
+ * naming why -- accepting it and generating unbounded reasoning is the outcome this file's
+ * header forbids. The deployment's default applies only where it can be held: a reply whose
+ * block cannot be counted gets none, as it would on a model with no reasoning block at all. */
+static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimits& lim,
+                                 const ChatRender& render, SamplingParams* sp, ApiError* err) {
+    ReasoningSpan span;
+    size_t n_close = 0, n_open = 0;
+    if (!render.think_close.empty() && d.tok) {
+        const std::vector<int32_t> c = d.tok->encode(render.think_close, false, true);
+        std::vector<int32_t> o;
+        if (!render.think_open.empty()) o = d.tok->encode(render.think_open, false, true);
+        n_close = c.size();
+        n_open  = o.size();
+        if (c.size() == 1 && (render.think_starts_open || o.size() == 1)) {
+            span.close       = c[0];
+            span.open        = o.size() == 1 ? o[0] : -1;
+            span.starts_open = render.think_starts_open;
+        }
+    }
+    sp->reasoning = span;
+
+    int64_t budget = -1;
+    const char* named = nullptr;
+    for (const char* k : { "thinking_token_budget", "thinking_budget" }) {
+        auto it = b.find(k);
+        if (it == b.end() || it->is_null()) continue;
+        int64_t v = 0;
+        if (!get_int(b, k, &v, err)) return RAD_E_INVAL;
+        if (v < 0) { *err = err_bad(k, "must be >= 0"); return RAD_E_INVAL; }
+        if (named && v != budget) {
+            *err = err_bad(k, std::string("disagrees with ") + named + ", which is the same field");
+            return RAD_E_INVAL;
+        }
+        budget = v;
+        named = k;
+    }
+    if (!named) {
+        if (span.known()) sp->thinking_budget = (int32_t)lim.default_thinking_budget;
+        return RAD_OK;
+    }
+    if (!span.known()) {
+        std::string why;
+        if (render.think_close.empty())
+            why = "this model's chat template has no reasoning block to hold a budget on";
+        else if (n_close != 1)
+            why = "this model's reasoning block ends in `" + render.think_close + "`, which is " +
+                  std::to_string(n_close) + " tokens, and a budget is held by forcing that end "
+                  "as one token";
+        else
+            why = "this reply has to open its own reasoning block, and the opener `" +
+                  render.think_open + "` is " + std::to_string(n_open) + " tokens, so the block "
+                  "cannot be found by token";
+        *err = err_unsupported(named, why);
+        return RAD_E_UNSUPPORTED;
+    }
+    sp->thinking_budget = (int32_t)budget;
+    return RAD_OK;
+}
+
 int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                        OaiRequest* out, ApiError* err) {
     json b;
@@ -1347,6 +1416,7 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     out->reply_parser        = render.parser;
     out->preserved_tokens    = render.preserved_tokens;
     out->parse_tools         = out->tools_present && render.parser != nullptr;
+    RAD_TRY(parse_thinking_budget(b, d, lim, render, &out->sp, err));
 
     /* The format's own end-of-turn markers join the caller's stop strings rather than living in a
      * second list: both end the generation and both report `finish_reason: "stop"` (sink.cpp), so
@@ -1639,6 +1709,39 @@ static json usage_json(const UsageOut& u) {
     o["completion_tokens"] = u.completion;
     o["total_tokens"] = u.prompt + u.completion;
     o["prompt_tokens_details"] = d;
+    /* HOW MUCH OF completion_tokens THE CLIENT NEVER SEES AS CONTENT. Without it a reply cut at
+     * max_tokens inside its reasoning reads as a model that answered nothing; with it the client
+     * can tell the budget went to reasoning. */
+    if (u.reasoning >= 0) {
+        json c;
+        c["reasoning_tokens"] = u.reasoning;
+        o["completion_tokens_details"] = c;
+    }
+    return o;
+}
+
+json timings_json(const TimingsOut& t) {
+    auto per = [](int64_t n, double ms) -> json {
+        return n > 0 && ms > 0.0 ? json(ms / (double)n) : json(nullptr);
+    };
+    auto rate = [](int64_t n, double ms) -> json {
+        return n > 0 && ms > 0.0 ? json((double)n * 1000.0 / ms) : json(nullptr);
+    };
+    const json pms = t.prompt_ms >= 0.0 ? json(t.prompt_ms) : json(nullptr);
+    json o;
+    o["cache_n"]                = t.cache_n;
+    o["prompt_n"]               = t.prompt_n;
+    o["prompt_ms"]              = pms;
+    o["prompt_per_token_ms"]    = per(t.prompt_n, t.prompt_ms);
+    o["prompt_per_second"]      = rate(t.prompt_n, t.prompt_ms);
+    o["predicted_n"]            = t.predicted_n;
+    o["predicted_ms"]           = t.predicted_ms;
+    o["predicted_per_token_ms"] = per(t.decode_n, t.predicted_ms);
+    o["predicted_per_second"]   = rate(t.decode_n, t.predicted_ms);
+    if (t.draft_n > 0) {
+        o["draft_n"]          = t.draft_n;
+        o["draft_n_accepted"] = t.draft_n_accepted;
+    }
     return o;
 }
 
@@ -1650,7 +1753,8 @@ static json usage_json(const UsageOut& u) {
  *
  * One contract for both, OpenAI's: an empty choices array, sent after the last content chunk
  * and before [DONE]. Only the `object` differs, because it is a different endpoint's stream. */
-static std::string usage_chunk(const OaiRequest& r, const UsageOut& u, const char* object) {
+static std::string usage_chunk(const OaiRequest& r, const UsageOut& u, const TimingsOut& t,
+                               const char* object) {
     json o;
     o["id"] = r.id;
     o["object"] = object;
@@ -1658,15 +1762,16 @@ static std::string usage_chunk(const OaiRequest& r, const UsageOut& u, const cha
     o["model"] = r.model;
     o["choices"] = json::array();
     o["usage"] = usage_json(u);
+    if (t.valid) o["timings"] = timings_json(t);
     return sse_event(o.dump());
 }
 
-std::string text_usage_chunk(const OaiRequest& r, const UsageOut& u) {
-    return usage_chunk(r, u, "text_completion");
+std::string text_usage_chunk(const OaiRequest& r, const UsageOut& u, const TimingsOut& t) {
+    return usage_chunk(r, u, t, "text_completion");
 }
 
-std::string chat_usage_chunk(const OaiRequest& r, const UsageOut& u) {
-    return usage_chunk(r, u, "chat.completion.chunk");
+std::string chat_usage_chunk(const OaiRequest& r, const UsageOut& u, const TimingsOut& t) {
+    return usage_chunk(r, u, t, "chat.completion.chunk");
 }
 
 static json chat_logprobs_json(const std::vector<LogprobEntry>& lp) {
@@ -1687,7 +1792,7 @@ static json chat_logprobs_json(const std::vector<LogprobEntry>& lp) {
 }
 
 std::string chat_completion_body(const OaiRequest& r, const std::vector<ChoiceOut>& choices,
-                                 const UsageOut& u) {
+                                 const UsageOut& u, const TimingsOut& t) {
     json arr = json::array();
     for (const auto& c : choices) {
         json m;
@@ -1712,11 +1817,12 @@ std::string chat_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
     o["model"] = r.model;
     o["choices"] = std::move(arr);
     o["usage"] = usage_json(u);
+    if (t.valid) o["timings"] = timings_json(t);
     return o.dump();
 }
 
 std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOut>& choices,
-                                 const UsageOut& u) {
+                                 const UsageOut& u, const TimingsOut& t) {
     json arr = json::array();
     for (const auto& c : choices) {
         json ch;
@@ -1750,6 +1856,7 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
     o["model"] = r.model;
     o["choices"] = std::move(arr);
     o["usage"] = usage_json(u);
+    if (t.valid) o["timings"] = timings_json(t);
     return o.dump();
 }
 
@@ -1808,7 +1915,7 @@ ChatDeltaStream::ChatDeltaStream(const OaiRequest& r, int index, const IReplyPar
     : reader_(parser ? parser->open() : nullptr), id_(r.id), model_(r.model),
       created_(r.created), index_(index) {}
 
-std::string ChatDeltaStream::chunk(json delta, const char* finish_reason) {
+std::string ChatDeltaStream::chunk(json delta, const char* finish_reason, const TimingsOut* t) {
     json ch;
     ch["index"] = index_;
     ch["delta"] = std::move(delta);
@@ -1820,6 +1927,7 @@ std::string ChatDeltaStream::chunk(json delta, const char* finish_reason) {
     o["created"] = created_;
     o["model"] = model_;
     o["choices"] = json::array({ch});
+    if (t && t->valid) o["timings"] = timings_json(*t);
     return sse_event(o.dump());
 }
 
@@ -1924,11 +2032,11 @@ Finish ChatDeltaStream::adjusted_finish(Finish f) const {
     return Finish::ToolCalls;
 }
 
-std::string ChatDeltaStream::final_chunk(Finish f) {
+std::string ChatDeltaStream::final_chunk(Finish f, const TimingsOut& t) {
     /* The generation is over, so whatever the reader was holding is resolved now. A caller that
      * already said so gets nothing twice. */
     std::string out = push(std::string_view(), true);
-    out += chunk(json::object(), finish_reason_oai(adjusted_finish(f)));
+    out += chunk(json::object(), finish_reason_oai(adjusted_finish(f)), &t);
     return out;
 }
 

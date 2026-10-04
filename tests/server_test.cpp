@@ -124,6 +124,9 @@ struct FakeChatTemplate : IChatTemplate {
         /* The parser is built per render and reads calls only for a request that sent tools --
          * the contract the real bridge keeps (IReplyParser). */
         if (with_parser) out->parser = std::make_shared<FakeReplyParser>(!tools.empty());
+        out->think_open = think_open;
+        out->think_close = think_close;
+        out->think_starts_open = think_starts_open;
         return RAD_OK;
     }
     bool supports_tools() const override { return tools_ok; }
@@ -133,6 +136,9 @@ struct FakeChatTemplate : IChatTemplate {
     bool        with_parser = false;
     std::string refusal;
     std::string refuse_kwarg;
+    /* The reasoning block a render reports. FakeTokenizer makes a one-byte marker one token. */
+    std::string think_open, think_close;
+    bool        think_starts_open = false;
 
     /* Reads "TOOL:<name>:<json...>" -- everything after the second colon is the arguments,
      * however incomplete, and it arrives a piece at a time. That is exactly the shape the
@@ -230,10 +236,14 @@ struct FakeScheduler : IScheduler {
      * fails every request it holds when a step fails. */
     int fail_status = 0;
     const char* fail_why = nullptr;
+    /* Nonzero: every token after the first is a verify step that proposed this many drafts and
+     * accepted one, as a speculating engine reports them. */
+    int32_t drafts = 0;
     SchedMetrics m;
 
     std::mutex mu;
     std::vector<uint64_t> submitted;
+    SamplingParams last_sp;              /* what the last submitted request was to sample with */
     std::vector<uint64_t> cancelled;
     std::vector<std::thread> workers;
     std::atomic<uint64_t> next_id{1};
@@ -250,6 +260,7 @@ struct FakeScheduler : IScheduler {
         {
             std::lock_guard<std::mutex> lk(mu);
             submitted.push_back(id);
+            last_sp = r.sp;
         }
         void* sink = r.sink;
         int32_t cap = r.max_tokens;
@@ -257,14 +268,17 @@ struct FakeScheduler : IScheduler {
         bool h = hang;
         const int fst = fail_status;
         const char* fwhy = fail_why;
+        const int32_t nd = drafts;
         /* Under the lock: over a real socket, submits arrive from several HTTP workers at once. */
         std::lock_guard<std::mutex> lk(mu);
-        workers.emplace_back([sink, cap, text, h, fst, fwhy] {
+        workers.emplace_back([sink, cap, text, h, fst, fwhy, nd] {
+            sink_admitted(sink);
             sink_prompt_stats(sink, 8, 4);
             int32_t n = 0;
             for (char c : text) {
                 if (n >= cap) break;
                 if (sink_cancelled(sink)) { sink_finish(sink, Finish::Cancelled); return; }
+                if (n > 0 && nd > 0) sink_drafts(sink, nd, 1);
                 if (!sink_push(sink, (int32_t)(unsigned char)c)) return;
                 ++n;
                 if (h && n >= 3) break;
@@ -1645,6 +1659,254 @@ TEST(n_streamed_choices_share_one_usage_chunk_after_every_final_chunk) {
         CHECK(usage_at > last_final_at);
         CHECK_EQ(usage_at, p.size() - 2);
     }
+}
+
+/* ================================================================== reasoning */
+
+/* HOW MUCH OF completion_tokens WAS REASONING, on both paths: the reply below opens inside the
+ * block (the render says so), and `|` -- one token to FakeTokenizer -- closes it after three body
+ * tokens, so four of the seven tokens are reasoning, the close included. A model whose block
+ * cannot be counted reports no breakdown rather than a zero. */
+TEST(usage_reports_the_reasoning_tokens_inside_completion_tokens) {
+    {
+        Fixture f;
+        f.tmpl.think_close = "|";
+        f.tmpl.think_starts_open = true;
+        f.sched.reply = "abc|xyz";
+        HttpResponse r = f.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}]})");
+        CHECK_EQ(r.status, 200);
+        const json j = json::parse(r.body);
+        CHECK_EQ(j["usage"]["completion_tokens"].get<int>(), 7);
+        CHECK_EQ(j["usage"]["completion_tokens_details"]["reasoning_tokens"].get<int>(), 4);
+
+        HttpResponse st = f.post("/v1/chat/completions",
+                                 R"({"messages":[{"role":"user","content":"hi"}],"stream":true,
+                                     "stream_options":{"include_usage":true}})");
+        int bad = 0;
+        auto p = sse_payloads(drain(st), &bad);
+        CHECK_EQ(bad, 0);
+        REQUIRE(p.size() >= 2);
+        const json u = json::parse(p[p.size() - 2]);
+        CHECK_EQ(u["usage"]["completion_tokens_details"]["reasoning_tokens"].get<int>(), 4);
+    }
+    {
+        Fixture f;
+        f.tmpl.think_close = "</t>";       /* four tokens: not a countable block */
+        f.tmpl.think_starts_open = true;
+        HttpResponse r = f.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}]})");
+        CHECK_EQ(r.status, 200);
+        CHECK(!json::parse(r.body)["usage"].contains("completion_tokens_details"));
+    }
+}
+
+/* THE BUDGET REACHES THE ENGINE in either spelling, with the block it is held on; one the block
+ * cannot hold, a negative one, and two spellings that disagree are 400s naming the field. */
+TEST(a_thinking_budget_reaches_the_engine_or_is_refused_by_name) {
+    Fixture f;
+    f.tmpl.think_open = "{";
+    f.tmpl.think_close = "|";
+    f.tmpl.think_starts_open = true;
+    for (const char* k : { "thinking_token_budget", "thinking_budget" }) {
+        HttpResponse r = f.post("/v1/chat/completions",
+                                std::string(R"({"messages":[{"role":"user","content":"hi"}],")") +
+                                    k + R"(":7})");
+        CHECK_EQ(r.status, 200);
+        f.sched.join_all();
+        std::lock_guard<std::mutex> lk(f.sched.mu);
+        CHECK_EQ(f.sched.last_sp.thinking_budget, 7);
+        CHECK_EQ(f.sched.last_sp.reasoning.close, (int32_t)'|');
+        CHECK_EQ(f.sched.last_sp.reasoning.open, (int32_t)'{');
+        CHECK(f.sched.last_sp.reasoning.starts_open);
+    }
+
+    struct Case { const char* extra; const char* param; };
+    for (const Case& c : { Case{ R"("thinking_token_budget":-1)", "thinking_token_budget" },
+                           Case{ R"("thinking_token_budget":3,"thinking_budget":4)",
+                                 "thinking_budget" },
+                           Case{ R"("thinking_budget":"3")", "thinking_budget" } }) {
+        HttpResponse r = f.post("/v1/chat/completions",
+                                std::string(R"({"messages":[{"role":"user","content":"hi"}],)") +
+                                    c.extra + "}");
+        CHECK_EQ(r.status, 400);
+        CHECK_EQ(json::parse(r.body)["error"]["param"].get<std::string>(), std::string(c.param));
+    }
+
+    Fixture multi;
+    multi.tmpl.think_close = "</t>";
+    multi.tmpl.think_starts_open = true;
+    HttpResponse r = multi.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}],
+                                    "thinking_token_budget":5})");
+    CHECK_EQ(r.status, 400);
+    CHECK(json::parse(r.body)["error"]["message"].get<std::string>().find("4 tokens") !=
+          std::string::npos);
+
+    Fixture none;
+    HttpResponse n = none.post("/v1/chat/completions",
+                               R"({"messages":[{"role":"user","content":"hi"}],
+                                   "thinking_token_budget":5})");
+    CHECK_EQ(n.status, 400);
+    CHECK(json::parse(n.body)["error"]["message"].get<std::string>().find("no reasoning block") !=
+          std::string::npos);
+}
+
+/* THE DEPLOYMENT'S BUDGET applies to a request that names none, loses to one that does, and is
+ * not applied where the block cannot be counted -- it could not be held there. The startup check
+ * says why a model cannot take it at all. */
+TEST(the_deployment_s_thinking_budget_is_a_default_a_request_can_override) {
+    Fixture f;
+    f.tmpl.think_close = "|";
+    f.tmpl.think_starts_open = true;
+    OaiLimits lim = f.limits();
+    lim.default_thinking_budget = 64;
+    CHECK_EQ(chat_with(f, lim, "").sp.thinking_budget, 64);
+    CHECK_EQ(chat_with(f, lim, R"("thinking_token_budget":3)").sp.thinking_budget, 3);
+    CHECK_EQ(chat_with(f, f.limits(), "").sp.thinking_budget, -1);
+
+    f.tmpl.think_close.clear();
+    CHECK_EQ(chat_with(f, lim, "").sp.thinking_budget, -1);
+
+    Fixture g;
+    ServerOptions o;
+    o.model_id = "test-model";
+    o.default_max_tokens = 32;
+    o.default_thinking_budget = 64;
+    Deps d;
+    d.sched = &g.sched;
+    d.tok = &g.tok;
+    d.chat = &g.tmpl;
+    d.grammar = &g.gram;
+    Server s(d, o);
+    CHECK(s.check_thinking_budget().find("no reasoning block") != std::string::npos);
+    g.tmpl.think_close = "|";
+    g.tmpl.think_starts_open = true;
+    CHECK(s.check_thinking_budget().empty());
+}
+
+/* ================================================================== timings */
+
+/* WHERE THE REQUEST'S TIME WENT, in llama.cpp's shape, on every path a client can take: the
+ * buffered body, each streamed choice's final chunk whether or not a usage chunk was asked for,
+ * and the usage chunk when it was. The fake places 8 prompt tokens with 4 from the cache, and
+ * every token after the first is a verify step that proposed 3 drafts and took 1. */
+TEST(a_response_carries_its_requests_timings_and_draft_counts) {
+    auto check = [](const json& t, int64_t predicted, bool drafts) {
+        CHECK_EQ(t["prompt_n"].get<int64_t>(), (int64_t)4);
+        CHECK_EQ(t["cache_n"].get<int64_t>(), (int64_t)4);
+        CHECK_EQ(t["predicted_n"].get<int64_t>(), predicted);
+        CHECK(t["prompt_ms"].is_number());
+        CHECK(t["predicted_ms"].is_number());
+        CHECK(t["prompt_ms"].get<double>() >= 0.0);
+        for (const char* k : { "prompt_per_token_ms", "prompt_per_second",
+                               "predicted_per_token_ms", "predicted_per_second" })
+            CHECK(t[k].is_number() || t[k].is_null());
+        CHECK_EQ(t.contains("draft_n"), drafts);
+        if (drafts) {
+            CHECK_EQ(t["draft_n"].get<int64_t>(), (predicted - 1) * 3);
+            CHECK_EQ(t["draft_n_accepted"].get<int64_t>(), predicted - 1);
+        }
+    };
+    {
+        Fixture f;
+        f.sched.drafts = 3;
+        HttpResponse r = f.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}]})");
+        CHECK_EQ(r.status, 200);
+        const json j = json::parse(r.body);
+        REQUIRE(j.contains("timings"));
+        check(j["timings"], 5, true);
+        CHECK_EQ(j["timings"]["predicted_n"].get<int64_t>(),
+                 j["usage"]["completion_tokens"].get<int64_t>());
+    }
+    {
+        Fixture f;
+        HttpResponse r = f.post("/v1/completions", R"({"prompt":"hi","max_tokens":8})");
+        CHECK_EQ(r.status, 200);
+        const json j = json::parse(r.body);
+        REQUIRE(j.contains("timings"));
+        check(j["timings"], 5, false);
+    }
+    const char* paths[] = { "/v1/chat/completions", "/v1/completions" };
+    const char* bodies[] = { R"({"messages":[{"role":"user","content":"hi"}],"stream":true)",
+                             R"({"prompt":"hi","stream":true)" };
+    for (int k = 0; k < 2; ++k)
+        for (bool usage : { false, true }) {
+            Fixture f;
+            f.sched.drafts = 3;
+            HttpResponse r = f.post(paths[k], std::string(bodies[k]) +
+                                    (usage ? R"(,"stream_options":{"include_usage":true}})"
+                                           : "}"));
+            CHECK_EQ(r.status, 200);
+            int bad = 0;
+            auto p = sse_payloads(drain(r), &bad);
+            CHECK_EQ(bad, 0);
+            int finals = 0, with_timings = 0;
+            for (size_t i = 0; i + 1 < p.size(); ++i) {
+                const json j = json::parse(p[i]);
+                if (j.contains("usage")) {
+                    REQUIRE(j.contains("timings"));
+                    check(j["timings"], 5, true);
+                    ++with_timings;
+                    continue;
+                }
+                if (j["choices"][0]["finish_reason"].is_null()) {
+                    CHECK(!j.contains("timings"));
+                    continue;
+                }
+                ++finals;
+                REQUIRE(j.contains("timings"));
+                check(j["timings"], 5, true);
+                ++with_timings;
+            }
+            CHECK_EQ(finals, 1);
+            CHECK_EQ(with_timings, usage ? 2 : 1);
+        }
+}
+
+/* The rates are the tokens over the time that produced them, the first token being the prompt
+ * phase's; a rate whose count or time is zero is null, and so is a prompt time the engine never
+ * reported. */
+TEST(timings_rates_divide_the_tokens_by_the_time_that_produced_them) {
+    TimingsOut t;
+    t.valid = true;
+    t.prompt_n = 100;
+    t.prompt_ms = 50.0;
+    t.predicted_n = 10;
+    t.decode_n = 9;
+    t.predicted_ms = 90.0;
+    json j = timings_json(t);
+    CHECK_NEAR(j["prompt_per_second"].get<double>(), 2000.0, 1e-9);
+    CHECK_NEAR(j["prompt_per_token_ms"].get<double>(), 0.5, 1e-12);
+    CHECK_NEAR(j["predicted_per_second"].get<double>(), 100.0, 1e-9);
+    CHECK_NEAR(j["predicted_per_token_ms"].get<double>(), 10.0, 1e-12);
+    CHECK(!j.contains("draft_n"));
+
+    t.decode_n = 0;
+    t.predicted_ms = 0.0;
+    t.prompt_ms = -1.0;
+    j = timings_json(t);
+    CHECK(j["predicted_per_second"].is_null());
+    CHECK(j["predicted_per_token_ms"].is_null());
+    CHECK(j["prompt_ms"].is_null());
+    CHECK(j["prompt_per_second"].is_null());
+}
+
+/* The sink keeps the first admission across a preemption and sums the drafts it is told of. */
+TEST(a_sink_keeps_its_first_admission_and_sums_its_drafts) {
+    Sink s;
+    CHECK(s.t_admitted_ns() < 0);
+    s.mark_admitted();
+    const int64_t a = s.t_admitted_ns();
+    CHECK(a >= 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    s.mark_admitted();
+    CHECK_EQ(s.t_admitted_ns(), a);
+    s.add_drafts(4, 2);
+    s.add_drafts(3, 3);
+    CHECK_EQ(s.n_drafted(), (int64_t)7);
+    CHECK_EQ(s.n_draft_accepted(), (int64_t)5);
 }
 
 /* ================================================================== cancellation */

@@ -373,6 +373,50 @@ public:
 
 enum class ReqState { Waiting, Running, Preempted, Finished, Failed, Cancelled };
 
+/* A CHAT REPLY'S REASONING BLOCK, AS TOKENS. The reply parser reads the block in text
+ * (core/text/chatparse.h); this is the same block named by token id, so the engine can count it
+ * and close it without detokenising. It exists only where both markers the reply needs are
+ * single tokens -- `<think>` and `</think>` are, on every model this engine serves -- and
+ * `close < 0` says it does not: such a reply's reasoning is still split out as text, but it is
+ * not counted and no budget can be held on it.
+ *
+ * The block is read where the parser reads it: at the start of the reply. It is open from the
+ * first token when the generation prompt opened it (`starts_open`), or opens on `open` as the
+ * reply's first token, and the first `close` ends it. A reply that starts any other way has no
+ * block. */
+struct ReasoningSpan {
+    int32_t open = -1;            /* the token a reply opens its own block with; -1 for none */
+    int32_t close = -1;           /* the token that ends the block; -1: no countable block */
+    bool    starts_open = false;  /* the generation prompt left the reply inside the block */
+    bool known() const { return close >= 0; }
+};
+
+/* A reply's position relative to its ReasoningSpan, advanced one emitted token at a time. The
+ * server counts with it and the sampler enforces a budget with it, and both must agree on where
+ * the block ends, so there is one definition. */
+struct ReasoningCount {
+    enum State : uint8_t { Lead, Think, Done };
+    State   st = Lead;
+    int64_t tokens = 0;           /* reasoning tokens: the markers the reply wrote, and the body */
+    int64_t body = 0;             /* the tokens between the markers, which a budget limits */
+
+    void start(const ReasoningSpan& s) {
+        st = !s.known() ? Done : s.starts_open ? Think : Lead;
+        tokens = body = 0;
+    }
+    void push(const ReasoningSpan& s, int32_t tok) {
+        if (st == Lead) {
+            if (s.open >= 0 && tok == s.open) { st = Think; ++tokens; }
+            else st = Done;
+        } else if (st == Think) {
+            ++tokens;
+            if (tok == s.close) st = Done;
+            else ++body;
+        }
+    }
+    bool inside() const { return st == Think; }
+};
+
 struct SamplingParams {
     float  temp = 1.0f;
     int    top_k = 0;                /* 0 = off */
@@ -393,6 +437,13 @@ struct SamplingParams {
     bool   greedy() const { return top_k == 1 || temp <= 0.0f; }
     std::string grammar;             /* GBNF, or "" */
     std::vector<std::string> dry_seq_breakers;
+
+    /* THE REPLY'S REASONING BLOCK, and how many tokens its body may run to. -1 is no limit. At
+     * the limit the sampler masks every position still inside the block to `reasoning.close`, so
+     * the block ends there and the answer follows -- vLLM's `thinking_token_budget`. A budget
+     * needs a known span; the server refuses one it cannot hold. */
+    ReasoningSpan reasoning;
+    int32_t       thinking_budget = -1;
 
     /* A LAZY GRAMMAR CONSTRAINS NOTHING UNTIL A TRIGGER FIRES, and that is the only shape in
      * which a tool-calling chat template can be enforced: the reply is free prose until the
@@ -651,6 +702,8 @@ struct Config {
     /* The chat endpoint's default `reasoning_effort`, empty for the template's own default.
      * Passed through verbatim: the legal set belongs to the template, not to us. */
     std::string reasoning_effort;
+    /* --thinking-token-budget: the chat endpoint's default `thinking_token_budget`, -1 for none. */
+    int64_t     thinking_token_budget = -1;
     int         port = 8000;
     /* --api-key: the bearer key every request but the probes and the dashboard page must carry.
      * Empty serves without one. */

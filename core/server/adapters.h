@@ -618,6 +618,10 @@ public:
             if (why) *why = perr;
             return ps;
         }
+        const ReasoningMarkers rm = rp->reasoning();
+        out->think_open        = rm.open;
+        out->think_close       = rm.close;
+        out->think_starts_open = rm.starts_open;
         out->parser = std::make_shared<ReplyParserBridge>(std::move(rp));
         return RAD_OK;
     }

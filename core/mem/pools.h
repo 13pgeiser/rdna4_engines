@@ -54,6 +54,10 @@ struct Shortfall {
     std::string what;       /* what was being reserved when it ran out */
     int64_t     wanted = 0;
     int64_t     available = 0;
+    /* A backing allocation the allocator refused: there is no "available" to report, only the
+     * allocator's own sentence for why, which is what tells an out-of-memory card from a pinned-
+     * memory limit from a driver that would not map the range. */
+    std::string refused;
     int64_t     missing() const { return wanted - available; }
     std::string str() const;
 };

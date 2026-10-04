@@ -118,6 +118,14 @@ struct ReplyOptions {
 
 class ReplyStream;
 
+/* The reasoning block as one request's reply meets it: its markers with the optional whitespace
+ * around them trimmed, and whether the reply starts inside it -- the generation prompt opened it,
+ * or the format has no opener. Empty `close` is a format with no reasoning block. */
+struct ReasoningMarkers {
+    std::string open, close;
+    bool        starts_open = false;
+};
+
 /* A format compiled once: its automata and its delimiters. Shared by every request. */
 class ReplyFormat {
 public:
@@ -150,6 +158,9 @@ public:
      * prefix in each place one can be pending at once, a value's undecided head, and an
      * unfinished UTF-8 sequence on each output. A constant of the format, not of the reply. */
     size_t hold_bound() const;
+    /* Read from the generation prompt exactly as a stream's first bytes are, so a reply this
+     * says starts in the block is one the stream reads as reasoning from its first byte. */
+    ReasoningMarkers reasoning() const;
 
     struct Impl;
     const Impl& impl() const { return *impl_; }

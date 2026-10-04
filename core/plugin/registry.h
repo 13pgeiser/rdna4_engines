@@ -181,6 +181,12 @@ public:
      * loads anything, once it has chosen its cards. */
     void set_code_device(int device) { code_device_ = device; }
 
+    /* WHAT THE ENGINE MEASURED ABOUT THE RANKS' DEVICES, for the constraints on "device." keys
+     * (rad_types.h). Set before the first selection, by whoever chose the devices; a registry
+     * nobody told anything has no facts, and a kernel constrained on one is not selected. */
+    void set_device_fact(std::string_view key, long long v) { device_facts_.set_i(key, v); }
+    const Geometry& device_facts() const { return device_facts_; }
+
     void close();                       /* fini instances, close hooks, dlclose, forget everything */
 
     const std::vector<Plugin>&      plugins() const { return plugins_; }
@@ -327,6 +333,7 @@ private:
     };
 
     int code_device_ = 0;
+    Geometry device_facts_;
     TuneCache tune_;
 
     int  stage_(const std::string& path, Staged* out);

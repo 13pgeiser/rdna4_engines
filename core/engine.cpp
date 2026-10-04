@@ -1812,6 +1812,8 @@ std::string request_overrides(const Config& c) {
             std::to_string(c.max_stop_bytes) + " bytes");
     for (const auto& [k, v] : c.chat_template_kwargs) add("template " + k + "=" + v);
     if (c.reasoning_format != "auto") add("reasoning_format " + c.reasoning_format);
+    if (c.thinking_token_budget >= 0)
+        add("thinking_token_budget " + std::to_string(c.thinking_token_budget));
     return out;
 }
 }  /* namespace */
@@ -2029,6 +2031,7 @@ int Engine::run_server() {
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     o.default_reasoning_effort = cfg_.reasoning_effort;
+    o.default_thinking_budget = cfg_.thinking_token_budget;
     o.default_sampling = resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
     o.default_dry_breakers_set = cfg_.sample_dry_seq_breakers.has_value();
     /* -1 leaves ServerOptions' own default, which is `auto` (0). That is resolved per request
@@ -2153,6 +2156,13 @@ int Engine::run_server() {
             RAD_WARN("--reasoning-effort %s: the chat template refuses it, so every chat request "
                      "that sends no reasoning effort of its own will be answered 400: %s",
                      cfg_.reasoning_effort.c_str(), eff_why.c_str());
+    }
+    /* A BUDGET THE MODEL CANNOT HOLD STOPS STARTUP, as --chat-template-kwargs does: the default
+     * would apply to no request at all, and the operator who set it would not find out. */
+    if (const std::string why = srv.check_thinking_budget(); !why.empty()) {
+        RAD_ERR("--thinking-token-budget %lld: %s", (long long)cfg_.thinking_token_budget,
+                why.c_str());
+        return RAD_E_INVAL;
     }
     RAD_INFO("serving on http://%s:%d  (/v1/completions%s)%s", o.host.c_str(), o.port,
              d.chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",

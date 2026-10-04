@@ -136,6 +136,13 @@ struct OaiLimits {
      * dial at all. Seeded only when the request says nothing, so a caller always wins. */
     std::string default_reasoning_effort;
 
+    /* THE DEPLOYMENT'S DEFAULT `thinking_token_budget`, -1 for none. For the same reason the
+     * effort default exists: an agent framework sizes max_tokens per turn and sends no budget, and
+     * a reasoning block that spends the whole of max_tokens returns a turn with no answer in it.
+     * Applied only to a request that names no budget, and only where the reply's reasoning block
+     * can be counted. */
+    int64_t     default_thinking_budget = -1;
+
     /* WHAT A REQUEST THAT SENDS NO SAMPLER FIELDS IS SERVED WITH, field by field.
      *
      * The struct's own defaults are an untruncated sampler -- temperature 1, top_k off, top_p 1
@@ -220,12 +227,46 @@ struct UsageOut {
     int64_t prompt = 0;
     int64_t completion = 0;
     int64_t cached = 0;
+    /* Of `completion`, the tokens inside the reply's reasoning block, its markers included: OpenAI's
+     * completion_tokens_details.reasoning_tokens. -1 when the block cannot be counted, and the
+     * breakdown is then left out. */
+    int64_t reasoning = -1;
 };
 
+/* WHERE ONE REQUEST'S TIME WENT, in llama.cpp's `timings` shape, which proxies and dashboards
+ * built against llama-server already read (llama-swap's activity view is one). /metrics holds the
+ * same quantities summed over every request, and two overlapping requests cannot be told apart
+ * there; this is the per-request half.
+ *
+ *   prompt_n      prompt tokens computed, the prefix cache's excluded; cache_n is those
+ *   prompt_ms     from the first step the scheduler gave the request to its first token -- the
+ *                 prefill, without the time it waited for admission
+ *   predicted_n   tokens generated: usage.completion_tokens
+ *   predicted_ms  from the first token to the last
+ *   draft_n, draft_n_accepted
+ *                 speculative tokens proposed for this request and accepted; present when any
+ *                 were proposed, as llama.cpp does
+ *
+ * The rates divide the tokens by the time that produced them: prompt_n by prompt_ms, and the
+ * predicted_n - 1 tokens after the first by predicted_ms, since the first token is the prompt
+ * phase's product -- the same figure as /metrics' time per output token. A rate whose count or
+ * time is zero is null. Over several choices the counts are summed and each time runs from the
+ * earliest choice's start to the latest choice's end. */
+struct TimingsOut {
+    bool    valid = false;       /* some choice produced a token; nothing is reported otherwise */
+    int64_t prompt_n = 0, cache_n = 0;
+    double  prompt_ms = -1.0;    /* < 0: the engine did not report the admission */
+    int64_t predicted_n = 0;
+    int64_t decode_n = 0;        /* of predicted_n, the tokens after each choice's first */
+    double  predicted_ms = 0.0;
+    int64_t draft_n = 0, draft_n_accepted = 0;
+};
+
+/* `timings` is added at the top level when it is valid. */
 std::string chat_completion_body(const OaiRequest& r, const std::vector<ChoiceOut>& choices,
-                                 const UsageOut& u);
+                                 const UsageOut& u, const TimingsOut& t = TimingsOut());
 std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOut>& choices,
-                                 const UsageOut& u);
+                                 const UsageOut& u, const TimingsOut& t = TimingsOut());
 std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
                             const UsageOut& u);
 std::string models_body(const std::string& model_id, int64_t created);
@@ -234,8 +275,12 @@ std::string models_body(const std::string& model_id, int64_t created);
  * only payload is `usage`. Emitted when the request asked for stream_options.include_usage, ONCE
  * per stream and after every choice's final chunk -- `n` choices share one prompt and one total,
  * so a chunk per choice would count the prompt n times and interleave with the choices. */
-std::string text_usage_chunk(const OaiRequest& r, const UsageOut& u);
-std::string chat_usage_chunk(const OaiRequest& r, const UsageOut& u);
+std::string text_usage_chunk(const OaiRequest& r, const UsageOut& u,
+                             const TimingsOut& t = TimingsOut());
+std::string chat_usage_chunk(const OaiRequest& r, const UsageOut& u,
+                             const TimingsOut& t = TimingsOut());
+/* The `timings` object, for a stream's final chunks. */
+json timings_json(const TimingsOut& t);
 
 /* ================================================================== streaming
  *
@@ -256,9 +301,10 @@ public:
      * `is_final` says the generation is over, which resolves whatever the reader was holding. */
     std::string push(std::string_view appended, bool is_final);
 
-    /* The terminating chunk carrying finish_reason. The usage chunk is the stream's, not the
-     * choice's: chat_usage_chunk. */
-    std::string final_chunk(Finish f);
+    /* The terminating chunk carrying finish_reason, and this choice's `timings` when they are
+     * valid -- on the final chunk whether or not the request asked for a usage chunk, as
+     * llama.cpp sends them. The usage chunk is the stream's, not the choice's: chat_usage_chunk. */
+    std::string final_chunk(Finish f, const TimingsOut& t = TimingsOut());
 
     /* What the whole generation parsed to -- the non-streaming shape. Complete once push has
      * been called with is_final. */
@@ -266,7 +312,7 @@ public:
     Finish adjusted_finish(Finish f) const;
 
 private:
-    std::string chunk(json delta, const char* finish_reason);
+    std::string chunk(json delta, const char* finish_reason, const TimingsOut* t = nullptr);
     std::string emit(const std::vector<ReplyDelta>& ev);
 
     std::unique_ptr<IReplyReader> reader_;

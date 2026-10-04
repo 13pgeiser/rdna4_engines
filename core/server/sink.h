@@ -90,6 +90,14 @@ public:
     /* Admission accounting, set once by the scheduler when the prompt is placed. */
     void set_prompt_stats(int32_t n_prompt, int32_t n_cached);
 
+    /* THE FIRST TIME THE SCHEDULER GIVES THIS REQUEST A STEP: where its prompt phase starts, so
+     * the time it waited in the queue is not counted as prefill. A preempted request admitted
+     * again keeps the first mark. */
+    void mark_admitted();
+    /* A verify step's speculation for this request: `n` tokens proposed, `accepted` of them
+     * taken. Summed over the request, the per-request half of /metrics' draft counters. */
+    void add_drafts(int32_t n, int32_t accepted);
+
     /* ------------------------------------------------------------------ consumer: HTTP */
 
     /* Copies up to `max` tokens out. Returns how many. Never blocks. */
@@ -112,7 +120,14 @@ public:
     /* Timings, in steady-clock nanoseconds since the sink was constructed. -1 until observed. */
     int64_t t_first_token_ns() const { return t_first_.load(std::memory_order_acquire); }
     int64_t t_last_token_ns() const  { return t_last_.load(std::memory_order_acquire); }
+    int64_t t_admitted_ns() const    { return t_admit_.load(std::memory_order_acquire); }
     int64_t age_ns() const;
+    /* The steady clock at construction, which the times above count from: what puts two sinks'
+     * times on one axis. */
+    int64_t t_start_ns() const { return t_start_ns_; }
+
+    int64_t n_drafted() const        { return n_draft_.load(std::memory_order_acquire); }
+    int64_t n_draft_accepted() const { return n_draft_acc_.load(std::memory_order_acquire); }
 
     int64_t n_produced() const { return (int64_t)head_.load(std::memory_order_acquire); }
     int32_t n_prompt() const { return n_prompt_.load(std::memory_order_acquire); }
@@ -145,6 +160,9 @@ private:
 
     std::atomic<int64_t>  t_first_{-1};
     std::atomic<int64_t>  t_last_{-1};
+    std::atomic<int64_t>  t_admit_{-1};
+    std::atomic<int64_t>  n_draft_{0};
+    std::atomic<int64_t>  n_draft_acc_{0};
     int64_t               t_start_ns_ = 0;
 
     std::atomic<int32_t>  n_prompt_{0};
@@ -171,6 +189,12 @@ inline bool sink_cancelled(const void* s) {
 }
 inline void sink_prompt_stats(void* s, int32_t n_prompt, int32_t n_cached) {
     if (s) static_cast<Sink*>(s)->set_prompt_stats(n_prompt, n_cached);
+}
+inline void sink_admitted(void* s) {
+    if (s) static_cast<Sink*>(s)->mark_admitted();
+}
+inline void sink_drafts(void* s, int32_t n, int32_t accepted) {
+    if (s) static_cast<Sink*>(s)->add_drafts(n, accepted);
 }
 
 }  /* namespace server */

@@ -679,6 +679,14 @@ write, with the MoE gather in front of it, on either wire: the rotated forms of 
 worth +5.6–6.3% of prefill at a 2048-token chunk (20K prompt 5556 → 5908 tok/s; a 23K extension at
 81K depth 4998 → 5278) and −1.3% of the eight-stream decode step; one-stream decode stays exact.
 
+**The cards must reach each other's memory directly** (peer to peer, P2P). The all-reduce
+kernels push into the other card's memory. At launch radiance asks the driver, for every pair of
+the cards it will use, whether that works, and logs the answer. When some pair cannot, those
+kernels are not selected, and startup stops naming `device.p2p` instead of the first all-reduce
+faulting or hanging. Whether P2P works is decided by the platform: the IOMMU setting, the PCIe
+topology, and whether the cards sit behind a switch that allows peer traffic. The startup line
+names the pairs that failed.
+
 ### 4.8 Finished conversations: copied to host, VRAM given up on demand
 
 By default a finished conversation's KV blocks stay in VRAM, held by the prefix cache, until the
@@ -792,6 +800,13 @@ refuses is a warning at startup: requests that send their own effort still work.
 radiance --model m.rad --reasoning-effort medium
 ```
 
+**`--thinking-token-budget N`** caps the reasoning instead of its depth. At N tokens inside the
+reasoning block the block is closed, by masking the next position to its end token
+(`</think>`), and the answer follows. This makes a client's `max_tokens` buy an answer, where
+otherwise the reasoning could use all of it. It is the default for chat requests that send no
+`thinking_token_budget` of their own (§5.2). It needs a reasoning block that ends in a single
+token, as Qwen's and MiniCPM's do. On a model whose block does not, startup stops and says why.
+
 **`--reasoning-format none`** leaves a reasoning block inline in `content` instead of returning it
 as `reasoning_content`, for a client that reads it there.
 
@@ -902,6 +917,7 @@ that names the field wins.
 | `--max-stop-strings N`, `--max-stop-bytes N` | 64, 4096 | how many stop strings a request may send, and how long each may be |
 | `--chat-template-kwargs JSON` | — | variables for the chat template on every chat request; a JSON object or `@FILE`, repeatable |
 | `--reasoning-effort S` | template's own | default `reasoning_effort` for chat |
+| `--thinking-token-budget N` | none | default `thinking_token_budget` for chat: the reasoning block is closed at N tokens |
 | `--reasoning-format MODE` | auto | `auto` returns reasoning as `reasoning_content`; `none` leaves it inline in `content` |
 
 **Media** — each replaces what the container's preprocessor configuration states. They do nothing
@@ -994,6 +1010,27 @@ so — use `/v1/completions` instead.
 ```
 
 Reasoning text comes back in `choices[].message.reasoning_content`, separate from `content`.
+
+**Reasoning counts against `max_tokens`**, as in OpenAI's API, vLLM and llama.cpp: every
+generated token does. A reply that runs out inside its reasoning comes back with empty
+`content` and `finish_reason: "length"`. `usage.completion_tokens_details.reasoning_tokens` says
+how many of `completion_tokens` were reasoning, the block's end token included, so a client can
+tell that case from a model that answered nothing.
+
+**Capping the reasoning.** `thinking_token_budget` (vLLM's name; `thinking_budget`, Qwen's, is
+read as the same field) is how many tokens the reasoning may run to. At that count the block is
+closed and the model answers from what it has reasoned so far:
+
+```json
+{"max_tokens": 4096, "thinking_token_budget": 2048}
+```
+
+The count starts after the opening `<think>`. A reasoning block that ends sooner is not
+affected. The close is forced by the sampler, so it holds under speculative decoding and at any
+temperature. A `grammar` or `response_format` that does not allow the close at some position
+keeps that position, and the close comes at the next position that allows it. The budget and
+`reasoning_tokens` need the block's end to be one token. A model whose end is not one token
+reports no `completion_tokens_details` and refuses a budget with a 400 that says why.
 
 ### 5.3 Streaming
 
@@ -1125,6 +1162,7 @@ curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
 | `tools`, `tool_choice`, `parallel_tool_calls` | chat only |
 | `add_generation_prompt`, `chat_template_kwargs` | chat only |
 | `reasoning_effort`, `enable_thinking` | chat only |
+| `thinking_token_budget`, `thinking_budget` | chat only. ≥ 0: the reasoning tokens after which the block is closed — see §5.2. Default `--thinking-token-budget`, else none |
 | `preserve_thinking` | chat only. The chat template variable of that name, as llama.cpp maps it; Qwen3.6 and later keep earlier turns' reasoning in the prompt with it |
 | `response_format` | chat only. Mutually exclusive with `grammar` |
 | `grammar` | a GBNF grammar directly. On chat it passes through the chat template and a template that drops it makes the request a refusal — see §5.5 |
@@ -1198,6 +1236,42 @@ and ends `finish_reason: "length"`. `POST /tokenize` is how to size a prompt tha
 precisely without running the model.
 
 ---
+
+### 5.9 What a response says about its own speed
+
+Every chat and completion response carries a top-level `timings` object for the request. It uses
+llama.cpp's field names, so a proxy or dashboard built against llama-server (llama-swap's activity
+view, for one) reads it unchanged:
+
+```json
+"timings": {
+  "cache_n": 1024, "prompt_n": 71, "prompt_ms": 284.0,
+  "prompt_per_token_ms": 4.0, "prompt_per_second": 250.0,
+  "predicted_n": 64, "predicted_ms": 711.0,
+  "predicted_per_token_ms": 11.29, "predicted_per_second": 88.6,
+  "draft_n": 78, "draft_n_accepted": 37
+}
+```
+
+| field | meaning |
+|---|---|
+| `prompt_n` | prompt tokens this request computed. Tokens the prefix cache supplied are not in it |
+| `cache_n` | prompt tokens the prefix cache supplied. `prompt_n + cache_n` is the prompt |
+| `prompt_ms` | from the first step the scheduler gave the request to its first token: the prefill. The time it waited for admission is not in it |
+| `prompt_per_second`, `prompt_per_token_ms` | `prompt_n` over `prompt_ms`. A prompt the cache mostly supplied computes few tokens, so this is the speed of the prefill that actually ran, not the prompt length over the time to first token |
+| `predicted_n` | tokens generated, the same as `usage.completion_tokens` |
+| `predicted_ms` | from the first generated token to the last |
+| `predicted_per_second`, `predicted_per_token_ms` | the `predicted_n − 1` tokens after the first, over `predicted_ms`. The first token is the prefill's product. It is the same figure as `/metrics`' time per output token, and with speculative decoding it counts every token a step accepts |
+| `draft_n`, `draft_n_accepted` | speculative tokens proposed for this request and how many were accepted. Present when any were proposed, as llama.cpp does |
+
+Milliseconds are wall-clock milliseconds, and the rates are tokens per second. A rate whose count
+or time is zero is `null`. A request with several choices (`n`, or a batch of prompts) sums the
+counts, and each time runs from the earliest choice's start to the latest choice's end.
+
+When streaming, each choice's final chunk (the one with `finish_reason`) carries its own
+`timings`, whether or not the request asked for `stream_options.include_usage`. The usage chunk,
+when asked for, carries the request's. `/metrics` stays the aggregate surface (§6.3). It sums
+the same quantities over every request, so it cannot say which request they belong to.
 
 ## 6. Operate it
 
@@ -1356,10 +1430,11 @@ released until it does.
 | The server dies with no log line, on a request it had been serving fine | A kernel whose code object had never been loaded could not be: the card has no room left. HIP faults inside the launch rather than returning an error, so there is nothing to print | A card that never met `--gpu-headroom-mib` — see §4.3. Raise the headroom past the shortfall startup names. `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
 | KV in VRAM stays high with one session and nothing moves | The idle tiers are **off** — they are sized, and with no size nothing is copied | Pass `--prefix-cache-host-mib N` |
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |
+| `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps pinned memory system-wide at `ttm.pages_limit`, half of RAM by default | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under the cap the refusal names, or raise it with the kernel parameter `ttm.pages_limit` |
 | `--draft-model is not implemented` | This engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
 | `context_length_exceeded` on a request | The **prompt alone** does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate at all | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
 | `unknown option '--foo'` and the engine exits | Deliberate. A typo in a budget flag is the difference between the plan you asked for and one the planner invented | Check `radiance --help` |
-| Empty `content` and `finish_reason: "length"` on short chat turns | The template's default `reasoning_effort` spent the budget inside `<think>` | `--reasoning-effort medium`, or `"reasoning_effort": "none"` per request |
+| Empty `content` and `finish_reason: "length"` on short chat turns | The reasoning spent all of `max_tokens` inside `<think>`; `usage.completion_tokens_details.reasoning_tokens` equals `completion_tokens`. Qwen3.8's default `reasoning_effort` is `xhigh` | `--reasoning-effort medium`, or `"reasoning_effort": "none"` per request; or cap the reasoning with `thinking_token_budget` / `--thinking-token-budget` below `max_tokens` |
 | `401` with `invalid api key` | The server was started with `--api-key` | Send `Authorization: Bearer KEY` (§6.6) |
 
 First three things to run when a server will not start:

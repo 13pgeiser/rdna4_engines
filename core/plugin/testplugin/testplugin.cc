@@ -159,6 +159,11 @@ static const RadConstraint kCNorm4096[] = {
 static const RadConstraint kCTie[] = {
     RAD_CGE("M", 1),
 };
+/* A kernel that reaches another card's memory: a constraint on the machine, not the geometry. */
+static const RadConstraint kCPeer[] = {
+    RAD_CGE("M", 1),
+    RAD_CEQ(RAD_FACT_P2P, 1),
+};
 /* Constraint ORDER is the order the miss message reports in: the first unmet one is what a reader
  * is told, so the cheapest and most identifying predicate goes first. */
 static const RadConstraint kCAttn[] = {
@@ -197,6 +202,10 @@ static const RadOpSchema kSchemas[] = {
       "a derived key its kernel does not pin" },
     { "t_skinny", kPGemm, NELEM(kPGemm), kOpdGemm, NELEM(kOpdGemm), "a range with a hole in it" },
     { "t_eq",     kPTie,  NELEM(kPTie),  kOpdNorm, NELEM(kOpdNorm), "an EQ band boundary" },
+    { "t_peer",   kPTie,  NELEM(kPTie),  kOpdNorm, NELEM(kOpdNorm),
+      "a peer kernel with a fallback beneath it" },
+    { "t_peer_only", kPTie, NELEM(kPTie), kOpdNorm, NELEM(kOpdNorm),
+      "a peer kernel and nothing else" },
 };
 
 static const RadKernelInfo kKernels[] = {
@@ -235,6 +244,20 @@ static const RadKernelInfo kKernels[] = {
     { .name = "t_norm_host", .op = "t_norm", .family = "norm",
       .computes = "nothing; a registry row", .shape = "any", .dtypes = "any",
       .domain = RAD_DOMAIN_HOST, .priority = 10, .launch = t_launch },
+
+    /* Peer access is the machine's: the direct row needs it, the staged one does not. */
+    { .name = "t_peer_direct", .op = "t_peer", .family = "ar",
+      .computes = "nothing; a registry row", .shape = "M >= 1, cards reach each other",
+      .dtypes = "any", .domain = RAD_DOMAIN_DEVICE, .priority = 20,
+      .constraints = kCPeer, .n_constraints = NELEM(kCPeer), .launch = t_launch },
+    { .name = "t_peer_staged", .op = "t_peer", .family = "ar",
+      .computes = "nothing; a registry row", .shape = "M >= 1", .dtypes = "any",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+      .constraints = kCTie, .n_constraints = NELEM(kCTie), .launch = t_launch },
+    { .name = "t_peer_only_direct", .op = "t_peer_only", .family = "ar",
+      .computes = "nothing; a registry row", .shape = "M >= 1, cards reach each other",
+      .dtypes = "any", .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+      .constraints = kCPeer, .n_constraints = NELEM(kCPeer), .launch = t_launch },
 
     /* Same op, same priority, same constraints. Ties break on declaration order, so t_tie_first
      * wins -- and if it ever does not, the tie rule has silently changed. */
