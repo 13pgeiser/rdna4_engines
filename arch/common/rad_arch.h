@@ -782,8 +782,8 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
      * replaces (Flash-Next: 2 KV heads x 5120 x 256 rows read twice instead of once). What it buys
      * is that world 4 is declarable at all.
      *
-     * When world <= n_head_kv_all the split below is untouched: TP2 stays byte-identical, the
-     * geometry paro is served on cannot regress. */
+     * When world <= n_head_kv_all the split below is untouched, so a world that divides the KV
+     * heads -- TP2 on this family -- declares exactly as it did before replication existed. */
     if (g.world > g.n_head_kv_all) {
         if (g.world % g.n_head_kv_all != 0) {
             fprintf(stderr, "radiance: world_size = %d cannot replicate n_head_kv = %lld; "

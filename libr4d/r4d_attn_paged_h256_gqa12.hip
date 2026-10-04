@@ -16,7 +16,8 @@
 // unit entirely rather than shipping them untested.
 #define R4D_ATTN_GQA  12
 #define R4D_ATTN_H128 0
-// THE KV PAGE IS FOUR TOKENS HERE, AND IT IS THE ONLY GEOMETRY IN THIS LIBRARY WHERE IT IS NOT 16.
+// THE KV PAGE IS FOUR TOKENS HERE, as in the gqa 6 unit that serves the same layers at four
+// ranks; every other geometry in this library pages at 16.
 //
 // Qwen3.8-Flash-Next's QSA indexer selects 4-TOKEN BLOCKS of the key history. With a page of 4 a
 // selected block IS a page, so the selection is a paged block table and the sparse attention is

@@ -299,14 +299,20 @@ three blocks on rank 0 and two on rank 1.
 even share is 160 columns, 1.25 blocks — but the split is TWO SLICES per expert, not one slice a
 rank: each parity's blocks are cut contiguously across the ranks and the rank taking the odd block
 alternates with the parity, so every rank's share is whole blocks, every block of every expert has
-exactly one owner, and each rank still computes a slice of every routed expert — the balance the
-parity tables buy at two ranks survives at any world. At four ranks and five blocks an even-parity
-expert is `[0, 2)` blocks on rank 0, `[2, 3)` on rank 1, `[3, 4)` on rank 2, `[4, 5)` on rank 3,
-and each rank's place on the odd parity shifts by one — rank 1 takes the fat block there instead of
-rank 0 — so no rank takes the extra block of both parities. A world
+exactly one owner, and each rank still computes a slice of every routed expert. At four ranks and
+five blocks an even-parity expert is `[0, 2)` blocks on rank 0, `[2, 3)` on rank 1, `[3, 4)` on
+rank 2, `[4, 5)` on rank 3, and each rank's place on the odd parity shifts by one — rank 1 takes the
+fat block there instead of rank 0 — so no rank takes the extra block of both parities. A world
 above the block count is refused at declare, by name: a rank with an empty slice computes nothing
 and still joins the all-reduce. The shared expert's 640 columns split as evenly as whole blocks
 allow: five blocks over four ranks is rank 0 `[0, 256)` and one block each on ranks 1, 2 and 3.
+
+**At four ranks the shares are not equal.** Parity gives the extra block only two places to go, so
+ranks 0 and 1 compute three blocks of every even/odd pair of routed experts and ranks 2 and 3
+compute two; the shared expert's extra block is rank 0's, and the protected bf16 experts' ten
+64-wide tiles go 3, 3, 2, 2. Ranks 2 and 3 wait for the other two at every block's all-reduce.
+Equal shares need the extra block rotated by the expert's number mod 4: four slice tables where
+`moe_gemm_q` takes two.
 Expert parallelism — whole experts a rank — is what this replaced, and why it stays replaced: the
 recipe protects its bf16 experts in pairs precisely so each rank's quantised count stays even, and
 sharding experts by rank breaks that parity property the weight tables rest on.
@@ -325,8 +331,9 @@ time.
 **The fused all-reduce forms are two-rank.** At four ranks nothing fuses: the hyper-connection pair
 runs the standalone sequence — `all_reduce` (libr4d's 4-rank oneshot/twoshot), then
 `hc_write_bf16`, then `moe_gather` — 2 to 3 extra launches per pair against the two-rank fused
-form, and the fused attention ops have no bs4/gqa6 instantiation either. The unfused sequence is
-declared beside the probe, so nothing is unresolved at boot. The per-step cost against tp2 on the
+form. The unfused sequence is declared beside the probe, so nothing is unresolved at boot. The
+attention's own fusion is not a collective and does carry over: the sparse decode with the output
+gate and the quantiser in its merge (`attn_paged_gate_quant`) has gqa-6, page-4 rows. The per-step cost against tp2 on the
 same cards is unmeasured.
 
 **One collective does generalise, because it has to.** The lm_head is vocab-sharded, so the sampler

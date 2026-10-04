@@ -285,10 +285,10 @@ static void cross_check(const Plugin& pl) {
     ok("op schema names are unique", dup_schema == 0);
     ok("kernel names are unique", dup_kernel == 0);
 
-    int no_schema = 0, bad_key = 0, no_launch = 0, init_no_fini = 0, bad_domain = 0;
+    int no_schema = 0, bad_key = 0, no_launch = 0, init_no_fini = 0, bad_domain = 0, no_p2p = 0;
     int bad_axis = 0, bad_deflt = 0, dup_axis = 0;
     std::string axisdetail;
-    std::string keydetail;
+    std::string keydetail, p2pdetail;
     for (int k = 0; k < nk; ++k) {
         const RadKernelInfo* r = pl.kernel_at(k);
         if (!r->launch) { ++no_launch; continue; }
@@ -351,6 +351,23 @@ static void cross_check(const Plugin& pl) {
                              "' which op '" + r->op + "' does not declare; ";
             }
         }
+        /* EVERY MULTI-CARD ROW NEEDS PEER ACCESS. Each kernel in this library that runs only at
+         * two or more ranks reads or writes the other cards' memory directly, so without
+         * device.p2p a machine whose cards cannot reach each other resolves it and the launch
+         * faults or hangs instead of being refused by name at selection. */
+        bool multi = false, p2p = false;
+        for (int c = 0; c < r->n_constraints; ++c) {
+            const RadConstraint& rc = r->constraints[c];
+            if (!std::strcmp(rc.key, "world_size") &&
+                (rc.op == RAD_C_EQ || rc.op == RAD_C_GE) && rc.ival >= 2)
+                multi = true;
+            if (!std::strcmp(rc.key, RAD_FACT_P2P) && rc.op == RAD_C_EQ && rc.ival == 1)
+                p2p = true;
+        }
+        if (multi && !p2p) {
+            ++no_p2p;
+            p2pdetail += std::string(r->name) + "; ";
+        }
     }
     ok("every row has a launch", no_launch == 0);
     ok("every row with init has fini", init_no_fini == 0);
@@ -360,6 +377,7 @@ static void cross_check(const Plugin& pl) {
     ok("no row declares the same axis key twice", dup_axis == 0, axisdetail);
     ok("every row's op has a schema", no_schema == 0, keydetail);
     ok("every constraint key is a declared parameter of its op", bad_key == 0, keydetail);
+    ok("every row that needs two or more ranks requires device.p2p", no_p2p == 0, p2pdetail);
 
     /* The libr4d orderings the integer priority has to preserve. */
     int p_ts = -1, p_os = -1, p_dec = -1, p_pre = -1, p_m16 = -1, p_m64 = -1, p_bt = -1;

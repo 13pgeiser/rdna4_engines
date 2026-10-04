@@ -103,7 +103,7 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
         return RAD_E_INVAL;
     }
 
-    /* KV-HEAD REPLICATION IS NOT PLUMBLED HERE. `geom_from` answers a world size above the KV head
+    /* KV-HEAD REPLICATION IS NOT PLUMBED HERE. `geom_from` answers a world size above the KV head
      * count by giving every rank ONE kv head and a `kv_off` row span into a projection that stays
      * `n_head_kv_all * head_dim` rows in the container -- and this block declares its k and v with
      * the plain even row-shard, which at four ranks would hand a rank half of one KV head. The

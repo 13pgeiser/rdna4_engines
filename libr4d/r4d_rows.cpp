@@ -2351,9 +2351,11 @@ static const RadConstraint cArGather2[] = {
  * dtype set is cArGather2's verbatim for the same reason -- the two callers' synonyms. */
 static const RadConstraint cArGather4[] = {
     C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+    C_P2P,
 };
 static const RadConstraint cArGather8[] = {
     C_EQ("world_size", 8), C_IN("dtype", "bf16 fp16 f16 fp32 f32"),
+    C_P2P,
 };
 
 static const RadConstraint cArExact[] = {

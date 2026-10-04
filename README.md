@@ -94,15 +94,18 @@ sequence holds its own recurrent state and 32 of them leave the attention cache 
 keeps the 200K request and costs single-stream decode about 15%) and the 27B in bf16. See
 [`docs/GUIDE.md`](docs/GUIDE.md) §4.4.
 
-`--tp 4` runs the unfused all-reduce chain, so it is slower per step than `--tp 2` on the same
-cards (unmeasured) — it is a capacity configuration, not a speed one, and it takes no `--tp-wire`:
-`wht6` is a two-rank wire and four ranks run the exact one. The tiering flags above are the tp2
-recipe carried over; above two ranks each rank still owns a **slice of every expert's width** —
-each parity's 128-column blocks are cut contiguously over the ranks and the odd block alternates
-with the parity, so every rank's share is whole blocks and every block has exactly one owner —
-and the resident expert bytes per rank are smaller, so the elastic window is a
-different shape: read the boot log's `elastic` line and re-derive `--expert-vs-cache-ratio`
-and `--host-pool-mib` before trusting them.
+`--tp 4` runs the unfused all-reduce chain, because the fused forms are two-rank, and it takes no
+`--tp-wire`: `wht6` is a two-rank wire and four ranks run the exact one. It is a capacity
+configuration; its per-step rate against `--tp 2` on the same cards has not been measured. The
+tiering flags are the tp2 recipe carried over. Above two ranks each rank still owns a **slice of
+every expert's width** — each parity's 128-column blocks are cut contiguously over the ranks and the
+odd block alternates with the parity, so every rank's share is whole blocks and every block has
+exactly one owner — and the resident expert bytes per rank are smaller, so the elastic window is a
+different shape: read the boot log's `elastic` line and re-derive `--expert-vs-cache-ratio` and
+`--host-pool-mib` before trusting them. **`--host-pool-mib` is pinned on every card**, so the row
+above pins 4 × 12 GiB = 48 GiB, and the amdgpu driver caps pinned memory at `ttm.pages_limit`, half
+of RAM by default: that row needs 96 GiB of RAM or a raised limit
+([`docs/GUIDE.md`](docs/GUIDE.md) §7).
 
 Add `--api-key KEY` to require `Authorization: Bearer KEY`. Add `--debug-graph` to print every op
 and the kernel it resolved to, then exit without serving. Then:

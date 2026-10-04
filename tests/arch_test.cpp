@@ -1832,7 +1832,7 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
 }
 
 
-/* FOUR RANKS: THE KV HEADS REPLICATE, THE EXPERTS SPLIT WHOLE, THE FUSED COLLECTIVES STOP.
+/* FOUR RANKS: THE KV HEADS REPLICATE, THE EXPERT WIDTHS SPLIT, THE FUSED COLLECTIVES STOP.
  *
  * This is the tensor-parallel test above's sibling for the other model in the tree, and it exists
  * because world 4 was not declarable at all: `geom_from` refused any world larger than the KV head
@@ -2039,8 +2039,8 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
     }
 
     /* AT TWO, THE OLD DECLARATION: the KV heads split, so the even shard already selects the right
-     * rows and NO SPAN is declared at all -- TP2 is byte-identical to the tree this fork started
-     * from. The fused forms are the tell that world 2 is a different deployment and not the same
+     * rows and NO SPAN is declared at all -- TP2 declares as it did before replication existed.
+     * The fused forms are the tell that world 2 is a different deployment and not the same
      * one stretched: they resolve there and nowhere else. */
     {
         RadBuilder h[2];

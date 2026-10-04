@@ -1075,8 +1075,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
              * tiles, which four ranks take as 3, 3, 2, 2. Every tile has exactly one owner, each
              * rank writes its own columns of gate/up and reads its own of down, and the block's
              * all-reduce sums the partials exactly as it does for the quantised experts and for
-             * the shared arm. The even case keeps the old declaration verbatim -- no span at all --
-             * so a rank count that divides stays byte-identical to the tree this fork started on. */
+             * the shared arm. The even case keeps the even-split declaration verbatim -- no span
+             * at all -- so a rank count that divides declares exactly as it did before. */
             psh_row = RAD_SHARD_ROW;
             psh_col = RAD_SHARD_COL;
             pparts  = 2;
