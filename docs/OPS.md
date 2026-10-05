@@ -130,9 +130,11 @@ the codes and the scale planes of its even experts and of its odd ones. Whatever
 is split EVENLY across the table positions, in declaration order, and where it does not come out
 whole the first positions take one more each: `moe_gemm_q_mod4`'s first `n_expert % 4` classes hold
 one expert more than the rest, and their codes and scales are its first table positions. A list too
-short to give every table an entry is refused at declare, and a run that is not one contiguous,
-same-shaped table is refused at issue. That is exactly right for the case tables exist for: every
-table of one MoE op takes one weight per expert of its class.
+short to give every table an entry is refused at declare. A table whose declared run is not
+contiguous is refused when the tables are bound, before the first step; one whose entries disagree
+about their shape, or an issue naming a run other than the declared one, is refused at issue. That
+is exactly right for the case tables exist for: every table of one MoE op takes one weight per
+expert of its class.
 
 ## What the loader enforces
 
@@ -772,7 +774,9 @@ and the input, and the reduced sum lands in it.
 output feeds a gated residual rather than a norm. `y` is INOUT for the same reason `x` is above.
 It serves both wires, one op a wire: a caller declares the rotated form beside the exact one and
 issues whichever the step's message goes out on, and a `wire` of 6 is 6 at every size. At four
-ranks only the exact form exists.
+ranks only the exact form exists. A caller states `wire` 0 on the exact form rather than leaving it
+out: a row that serves one wire only says so with a constraint on `wire`, and a constraint on an
+absent key does not hold.
 
 `ar_gather_hc_write` is `moe_gather` followed by `ar_hc_write`: the gather's output IS the
 message, so `y` is written by the gather half before it is reduced in place, and the five gather
@@ -785,7 +789,7 @@ form exists, as for `ar_hc_write`.
 | op | params | operands |
 |---|---|---|
 | `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w → `x` |
-| `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `resident`/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
+| `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
@@ -892,12 +896,6 @@ has touched in a row cache of its own and reads a miss straight from the file wi
 the alignment the filesystem reports for direct I/O, or its block size where it reports none, as
 btrfs does; one read of the table proves it before the first row is served. A filesystem with no
 direct I/O at all cannot hold a container with this table.
-
-**`resident` keeps the table in RAM instead**, for a deployment that has the memory: libavx copies
-it once into locked huge pages, in the background from the first gather that carries it, and reads
-the copy from then on; until the copy is in place, and wherever the process cannot lock that much,
-the rows come from the file as above. The result is the same either way. An architecture sets it
-from `RadBuildCtx::ngram_table_ram` (`--ngram-table ram`).
 
 The placement planner runs an op on the host when **every weight operand of it** is `Site::Host`,
 which is why the table must be a weight operand at all: `gather_rows` takes a plain `IN` operand and

@@ -94,9 +94,10 @@ sequence holds its own recurrent state and 32 of them leave the attention cache 
 keeps the 200K request and costs single-stream decode about 15%) and the 27B in bf16. See
 [`docs/GUIDE.md`](docs/GUIDE.md) §4.4.
 
-`--tp 4` runs the unfused all-reduce chain, because the fused forms are two-rank. Its exact
-all-reduce is one-shot up to 1 MiB a message, which covers decode, and two-shot above that, which
-sends half the bytes on a prefill chunk; both produce the same bits. The row above runs exact.
+At `--tp 4` the gated residual's write carries the exact all-reduce, with the MoE gather in front
+of it, on decode and verify steps; a prefill chunk runs the unfused chain. That chain's exact
+all-reduce is one-shot up to 1 MiB a message and two-shot above that, which sends half the bytes
+on a prefill chunk; both produce the same bits. The row above runs exact.
 `--tp-wire wht6` at four ranks selects a different lossy wire, tiered int8 over the two-shot,
 above `--tp-wire-min-kb`. Eight ranks have no lossy wire, so `--tp 8 --tp-wire wht6` stops at
 startup naming the all-reduce. Four ranks is a capacity configuration; its per-step rate against

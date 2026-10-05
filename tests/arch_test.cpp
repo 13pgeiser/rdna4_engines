@@ -1849,18 +1849,18 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
  *     cannot cut evenly, so the split is UNEVEN BY CLASS and it is the width that divides, not the
  *     expert set: every rank routes every one of the 512 experts and computes [lo, hi) of each, the
  *     rank taking the odd block going round with the expert's number mod 4 -- five blocks of every
- *     four experts on every rank -- and with its parity in a layer whose quantised experts do not
- *     come in fours. Sharding the experts instead
- *     was tried and is wrong here -- protection is per-rank, so a rank can end up owning one plain
- *     bf16 expert, leaving an odd count of quantised ones, and the grouped GEMM takes its experts as
- *     two EQUAL tables by parity. The recipe protects experts in pairs for exactly that reason.
+ *     four experts on every rank, whatever count of quantised experts (four or more) a layer
+ *     keeps. Sharding the experts instead was tried and is wrong here -- protection is per-rank,
+ *     so a rank can end up owning one plain bf16 expert, leaving an odd count of quantised ones,
+ *     and the grouped GEMM takes its experts as two EQUAL tables by parity. The recipe protects
+ *     experts in pairs for exactly that reason.
  *   - the FUSED all-reduces are world-2 kernels (`ar_wire_is_exact` and `ar_fused_ok` both return
  *     false off two), with one exception: the gated residual's write. `ar_hc_write` and
- *     `ar_gather_hc_write` also exist at four, on the exact wire only (no `wire` key, never the
- *     rotated form). Every block still declares its standalone `all_reduce`, and every MoE block
- *     its `moe_gather`, which serve the steps the fused write declines. The contrast with world 2
- *     in the same test is the contract -- it fails loudly if a fused declare is ever gated on the
- *     wrong condition.
+ *     `ar_gather_hc_write` also exist at four, on the exact wire only (`wire` 0, never the rotated
+ *     form) and over the rows of a decode or verify step, max_seqs * (1 + max_spec). Every block
+ *     still declares its standalone `all_reduce`, and every MoE block its `moe_gather`, which
+ *     serve the steps the fused write declines. The contrast with world 2 in the same test is the
+ *     contract -- it fails loudly if a fused declare is ever gated on the wrong condition.
  *
  * Every expected number is derived from the meta this file builds (n_head 24, n_head_kv 2, head_dim
  * 256, num_experts 512), so the fixture and the assertions cannot drift apart. Where a number is
@@ -2002,7 +2002,9 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
 
         /* (4) A standalone collective per reduction, the exact four-rank ar_hc_write and
          * ar_gather_hc_write beside it -- the gather form on every MoE connection, so one a layer
-         * plus the MTP head's if there is one -- and not the fused norm. */
+         * plus the MTP head's if there is one -- and not the fused norm. Both fused forms state
+         * the exact wire and are declared over a decode or verify step's rows, 8 * (1 + 3): the
+         * architecture's own bound, not a message size a kernel library chose. */
         CHECK(count_op(b[r], "all_reduce") > 0);
         CHECK_EQ(pint(find_op(b[r], "all_reduce"), "world_size"), world);
         CHECK(count_op(b[r], "ar_hc_write") > 0);
@@ -2012,7 +2014,11 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         for (const RecOp& o : b[r].ops) {
             if (o.op != "ar_hc_write" && o.op != "ar_gather_hc_write") continue;
             CHECK_EQ(pint(&o, "world_size"), world);
-            CHECK(param(&o, "wire") == nullptr);           /* exact only */
+            CHECK_EQ(pint(&o, "wire"), 0);                 /* exact only, and stated */
+            const RecParam* m = param(&o, "M");
+            REQUIRE(m != nullptr);
+            CHECK_EQ(m->kind, (int)RAD_P_RANGE);
+            CHECK_EQ(m->ihi, c[r].max_seqs * (1 + c[r].max_spec));
         }
         CHECK_EQ(count_op(b[r], "ar_rmsnorm_quant_fp8"), 0);
     }
@@ -2048,9 +2054,9 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
     }
 
     /* THE SHARED ARM IS SPLIT BY WHOLE BLOCKS AND IS UNEVEN AT FOUR: 640 is five blocks of 128, and
-     * the rank taking the extra block is rank 2, the first rank the routed split gives no extra
-     * block (qwen4exp_fp8.cpp's narrow_place) -- ranks 2, 3, 0, 1 cut [0,256) [256,384) [384,512)
-     * [512,640) in the model's column numbering. At two ranks rank 0 still takes three of five.
+     * the rank taking the extra block is rank 2, the first rank after the plain experts' extra
+     * tiles on ranks 0 and 1 (qwen4exp_fp8.cpp's shared_place) -- ranks 2, 3, 0, 1 cut [0,256)
+     * [256,384) [384,512) [512,640) in the model's column numbering. At two ranks rank 0 still takes three of five.
      * This is the one world-4 span that is NOT a KV head. */
     const int64_t sh_lo[] = { 384, 512, 0,   256 };
     const int64_t sh_hi[] = { 512, 640, 256, 384 };
@@ -2095,6 +2101,14 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
             CHECK_EQ(pint(find_op(h[r], "moe_scatter"), "expert_base"), 0);
             CHECK(count_op(h[r], "ar_hc_write") > 0);
             CHECK(count_op(h[r], "ar_gather_hc_write") > 0);
+            /* Two ranks keep the exact write over every step, prefill chunks included. */
+            for (const RecOp& o : h[r].ops) {
+                if (o.op != "ar_hc_write") continue;
+                CHECK_EQ(pint(&o, "wire"), 0);
+                const RecParam* m = param(&o, "M");
+                REQUIRE(m != nullptr);
+                CHECK_EQ(m->ihi, c2.max_tok);
+            }
             /* Not ar_rmsnorm_quant_fp8: qwen4exp hands every block's norm `kArNone`, because here
              * the reduction rides in the gated residual's WRITE rather than in the norm that
              * follows it (qwen4exp_fp8.cpp's block declares). So this one is absent at BOTH world
@@ -2103,24 +2117,54 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         }
     }
 
-    /* THE FOUR-RANK FUSED WRITE'S STEPS: exactly those the standalone collective would have served
-     * as the exact one-shot -- under 1 MiB, and on the lossy wire also under its floor (or off its
-     * 128-element tile). The block in front and the write ask the same predicate. At two ranks it
-     * is ar_wire_is_exact unchanged, and ar_wire_is_exact itself stays false at four. */
+    /* THE FOUR-RANK FUSED WRITE'S STEPS: the decode and verify steps -- max_seqs * (1 + max_spec)
+     * rows, never more than max_tok -- whose message goes out exact, which on the lossy wire means
+     * under its floor or off its 128-element tile. The bound is the architecture's own and not a
+     * message size: 64 sequences at depth 3 are 256 rows, 1.25 MiB, and still take it, while a
+     * prefill chunk keeps the pair at any size. The block in front and the write ask the same
+     * predicate. At two ranks it is ar_wire_is_exact unchanged, and ar_wire_is_exact itself stays
+     * false at four. */
     {
         rad::arch::Geom g4{};
         g4.world = 4; g4.n_embd = 2560; g4.wire_exact = 1; g4.wire_min_bytes = 128 * 1024;
-        CHECK(rad::arch::ar_exact_write_takes(g4, 8));      /* a decode step, 40 KiB */
-        CHECK(rad::arch::ar_exact_write_takes(g4, 204));    /* 1020 KiB */
-        CHECK(!rad::arch::ar_exact_write_takes(g4, 205));   /* 1025 KiB: the two-shot's */
+        g4.max_tok = 2048; g4.max_seqs = 8; g4.max_spec = 3;
+        CHECK_EQ(rad::arch::ar_wide_write_rows(g4), (int64_t)32);
+        CHECK_EQ(rad::arch::ar_exact_write_rows(g4), (int64_t)32);
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 0));
+        CHECK(rad::arch::ar_exact_write_takes(g4, 1));
+        CHECK(rad::arch::ar_exact_write_takes(g4, 8));      /* a decode step */
+        CHECK(rad::arch::ar_exact_write_takes(g4, 32));     /* every sequence verifying 1 + 3 */
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 33));    /* more: a prefill chunk's */
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 2048));
         CHECK(!rad::arch::ar_wire_is_exact(g4, 8));
         g4.wire_exact = 0;
         CHECK(rad::arch::ar_exact_write_takes(g4, 25));     /* 125 KiB, under the floor */
         CHECK(!rad::arch::ar_exact_write_takes(g4, 26));    /* 130 KiB, the ti8 wire's */
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 32));
+        g4.wire_exact = 1;
+        g4.max_spec = 0;                                    /* one row a sequence */
+        CHECK_EQ(rad::arch::ar_wide_write_rows(g4), (int64_t)8);
+        CHECK(rad::arch::ar_exact_write_takes(g4, 8));
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 9));
+        g4.max_seqs = 64; g4.max_spec = 3;
+        CHECK(rad::arch::ar_exact_write_takes(g4, 256));    /* 1.25 MiB */
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 257));
+        g4.max_tok = 128;                                   /* a step holds no more than this */
+        CHECK_EQ(rad::arch::ar_wide_write_rows(g4), (int64_t)128);
+        CHECK(rad::arch::ar_exact_write_takes(g4, 128));
+        CHECK(!rad::arch::ar_exact_write_takes(g4, 129));
+        rad::arch::Geom g8 = g4;
+        g8.world = 8;
+        CHECK_EQ(rad::arch::ar_exact_write_rows(g8), (int64_t)0);
+        CHECK(!rad::arch::ar_exact_write_takes(g8, 8));
         rad::arch::Geom g2 = g4;
-        g2.world = 2;
-        for (int64_t T : { 1, 8, 25, 26, 205, 4096 })
-            CHECK(rad::arch::ar_exact_write_takes(g2, T) == rad::arch::ar_wire_is_exact(g2, T));
+        g2.world = 2; g2.max_tok = 4096; g2.max_seqs = 8;
+        CHECK_EQ(rad::arch::ar_exact_write_rows(g2), g2.max_tok);
+        for (int exact : { 0, 1 }) {
+            g2.wire_exact = exact;
+            for (int64_t T : { 1, 8, 25, 26, 33, 205, 4096 })
+                CHECK(rad::arch::ar_exact_write_takes(g2, T) == rad::arch::ar_wire_is_exact(g2, T));
+        }
     }
     /* THE FOUR-RANK GATHER'S STEPS: the fused write's, and within one MoE pass. The exact bound
      * is the only one at four (the rotated form is never declared there, so `rows6` is 0), and a
@@ -2129,14 +2173,15 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
     {
         rad::arch::Geom g4{};
         g4.world = 4; g4.n_embd = 2560; g4.wire_exact = 1; g4.wire_min_bytes = 128 * 1024;
-        CHECK(rad::arch::gather_taken(g4, 8, 2048, 0));      /* a decode step */
-        CHECK(rad::arch::gather_taken(g4, 204, 2048, 0));    /* 1020 KiB, one pass */
-        CHECK(!rad::arch::gather_taken(g4, 205, 2048, 0));   /* the two-shot's */
+        g4.max_tok = 2048; g4.max_seqs = 8; g4.max_spec = 3;
+        CHECK(rad::arch::gather_taken(g4, 8, 32, 0));        /* a decode step */
+        CHECK(rad::arch::gather_taken(g4, 32, 32, 0));       /* a verify step, one pass */
+        CHECK(!rad::arch::gather_taken(g4, 33, 2048, 0));    /* the write declines it */
         CHECK(!rad::arch::gather_taken(g4, 8, 0, 0));        /* not declared */
-        CHECK(!rad::arch::gather_taken(g4, 100, 64, 0));     /* two passes */
+        CHECK(!rad::arch::gather_taken(g4, 20, 16, 0));      /* two passes */
         g4.wire_exact = 0;
-        CHECK(rad::arch::gather_taken(g4, 25, 2048, 0));     /* under the floor */
-        CHECK(!rad::arch::gather_taken(g4, 26, 2048, 0));    /* the ti8 wire's */
+        CHECK(rad::arch::gather_taken(g4, 25, 32, 0));       /* under the floor */
+        CHECK(!rad::arch::gather_taken(g4, 26, 32, 0));      /* the ti8 wire's */
         rad::arch::Geom g2 = g4;
         g2.world = 2;
         for (int64_t T : { 1, 8, 25, 26, 205, 4096 })
@@ -2146,7 +2191,7 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
             }
     }
     /* ...and the lossy wire at four declares no rotated write and no rotated gather form: the
-     * exact ones only, for the steps under the floor. */
+     * exact ones only, stating `wire` 0, for the decode and verify steps under the floor. */
     {
         RadBuilder b4;
         RadBuildCtx c4 = build_ctx(0, world);
@@ -2158,7 +2203,10 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         CHECK(count_op(b4, "ar_gather_hc_write") > 0);
         for (const RecOp& o : b4.ops) {
             if (o.op != "ar_hc_write" && o.op != "ar_gather_hc_write") continue;
-            CHECK(param(&o, "wire") == nullptr);
+            CHECK_EQ(pint(&o, "wire"), 0);
+            const RecParam* m = param(&o, "M");
+            REQUIRE(m != nullptr);
+            CHECK_EQ(m->ihi, c4.max_seqs * (1 + c4.max_spec));
         }
     }
 
@@ -2181,9 +2229,7 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
         const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
                                      rad_enc_copy_str(e.transform, "fwht128"); return e; }();
         const RadEncoding plain = rad_enc_plain(RAD_BF16);
-        /* The parity slices, [lo, hi) by place parity, and the four-class ones by place mod 4. */
-        const int64_t par_lo[4][2] = { { 0, 512 }, { 256, 0 }, { 384, 256 }, { 512, 384 } };
-        const int64_t par_hi[4][2] = { { 256, 640 }, { 384, 256 }, { 512, 384 }, { 640, 512 } };
+        /* The four-class slices, [lo, hi) by rank and place mod 4. */
         const int64_t c4_lo[4][4] = { { 0, 512, 384, 256 }, { 256, 0, 512, 384 },
                                       { 384, 256, 0, 512 }, { 512, 384, 256, 0 } };
         const int64_t c4_hi[4][4] = { { 256, 640, 512, 384 }, { 384, 256, 640, 512 },
@@ -2204,7 +2250,6 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
                 RadBuildCtx cp = build_ctx(r, world);
                 cp.max_tok = 2048; cp.max_seqs = 8; cp.max_spec = 3; cp.max_ctx = 200000;
                 REQUIRE_EQ(qwen4exp_fp8::declare(&bp, &meta, &cp), RAD_OK);
-                const int ncls = 4;
                 const int64_t n_reg = ne_all - nprot;
                 /* layer 1's quantised GEMMs, and nobody else's */
                 int l1_ops = 0, other_ops = 0;
@@ -2215,7 +2260,7 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
                         l1 = l1 || bp.weights[wh - 1].name.rfind("blk.1.", 0) == 0;
                     if (!l1) { CHECK_EQ(o.op, std::string("moe_gemm_q_mod4")); ++other_ops; continue; }
                     ++l1_ops;
-                    CHECK_EQ(o.op, std::string(ncls == 4 ? "moe_gemm_q_mod4" : "moe_gemm_q"));
+                    CHECK_EQ(o.op, std::string("moe_gemm_q_mod4"));
                     CHECK_EQ(pint(&o, "n_expert"), n_reg);
                     CHECK_EQ(o.w.size(), (size_t)(2 * n_reg));
                     /* the four runs, read off the declaration: codes then scales, class by class,
@@ -2247,18 +2292,12 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
                     int place = e;
                     for (int x : pe) place -= x < e ? 1 : 0;
                     CHECK(w.span_set);
-                    if (ncls == 4) {
-                        CHECK_EQ(w.span_lo, c4_lo[r][place % 4]);
-                        CHECK_EQ(w.span_hi, c4_hi[r][place % 4]);
-                    } else {
-                        CHECK_EQ(w.span_lo, par_lo[r][place % 2]);
-                        CHECK_EQ(w.span_hi, par_hi[r][place % 2]);
-                    }
+                    CHECK_EQ(w.span_lo, c4_lo[r][place % 4]);
+                    CHECK_EQ(w.span_hi, c4_hi[r][place % 4]);
                     ++seen;
                 }
                 CHECK_EQ(seen, (int)n_reg);
-                /* the plain experts' tiles: by narrow_place at two classes, by rank at four */
-                const int64_t p2_lo[4] = { 384, 512, 0,   192 }, p2_hi[4] = { 512, 640, 192, 384 };
+                /* the plain experts' tiles, by rank: 3, 3, 2, 2 */
                 const int64_t p4_lo[4] = { 0, 192, 384, 512 },   p4_hi[4] = { 192, 384, 512, 640 };
                 int pseen = 0;
                 for (const RecWeight& w : bp.weights) {
@@ -2266,8 +2305,8 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
                     if (w.name.find("_exps.") == std::string::npos) continue;
                     if (w.name.compare(w.name.size() - 7, 7, ".weight") != 0) continue;
                     CHECK(w.span_set);
-                    CHECK_EQ(w.span_lo, ncls == 4 ? p4_lo[r] : p2_lo[r]);
-                    CHECK_EQ(w.span_hi, ncls == 4 ? p4_hi[r] : p2_hi[r]);
+                    CHECK_EQ(w.span_lo, p4_lo[r]);
+                    CHECK_EQ(w.span_hi, p4_hi[r]);
                     ++pseen;
                 }
                 CHECK_EQ(pseen, 2 * nprot);
@@ -2289,7 +2328,7 @@ TEST(flashnext_tp4_replicates_kv_heads_and_splits_expert_widths) {
      * Ten tiles over four ranks is 3, 3, 2, 2: an UNEVEN share, still whole tiles, every tile owned
      * once. Ranks 0 and 1 compute 192 columns of every protected expert and ranks 2 and 3 compute
      * 128: the routed experts are split in four classes, so every rank holds the same routed
-     * width, and rank 2 holds the shared expert's extra block (narrow_place). Two protected
+     * width, and rank 2 holds the shared expert's extra block (shared_place). Two protected
      * experts, as the production recipe's pairs have it. */
     {
         const RadEncoding w4p = [] { RadEncoding e = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);

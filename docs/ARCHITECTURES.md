@@ -334,17 +334,20 @@ time.
 
 **The fused all-reduce forms are two-rank, except the exact write.** At four ranks `ar_hc_write`
 exists on the exact wire only (`ar_hc_write_4rank`, the 4-rank one-shot with the write as its
-epilogue, on the plain all-reduce's buffers), and so does `ar_gather_hc_write`
-(`ar_gather_hc_write_4rank`, the same with `moe_gather` as its prologue), which the MoE
-connections take wherever the step is one MoE pass. A step takes either where the standalone
-`all_reduce` would have been the exact one-shot: under 1 MiB, and with `--tp-wire wht6` also
-under `--tp-wire-min-kb`. Larger messages, and every lossy one, keep the standalone sequence —
-`moe_gather` on the MoE connections, `all_reduce` (4-rank two-shot or ti8), then
-`hc_write_bf16`. The unfused sequence is declared beside the fused one, so nothing is unresolved
-at boot. The
-attention's own fusion is not a collective and does carry over: the sparse decode with the output
-gate and the quantiser in its merge (`attn_paged_gate_quant`) has gqa-6, page-4 rows. The per-step cost against tp2 on the
-same cards is unmeasured.
+epilogue), and so does `ar_gather_hc_write` (`ar_gather_hc_write_4rank`, the same with
+`moe_gather` as its prologue), which the MoE connections take wherever the step is one MoE pass.
+Both are declared over the rows of a decode or verify step — `--max-num-seqs` × (1 +
+`--num-speculative-tokens`) — because a one-shot is for those messages, and a step within that
+bound takes them wherever its message goes out exact: always with `--tp-wire exact`, and with
+`--tp-wire wht6` under `--tp-wire-min-kb`. They run on an all-reduce instance keyed by that bound,
+not on the standalone all-reduce's unless the two bounds agree; the wide family's flag, sequence
+and slot discipline is what makes either safe on one stream. A prefill chunk, and every message
+that goes out lossy, keeps the standalone sequence — `moe_gather` on the MoE connections,
+`all_reduce` (whose size bands pick the 4-rank one-shot or two-shot, or ti8 on the lossy wire),
+then `hc_write_bf16`. The unfused sequence is declared beside the fused one, so nothing is
+unresolved at boot. The attention's own fusion is not a collective and does carry over: the sparse
+decode with the output gate and the quantiser in its merge (`attn_paged_gate_quant`) has gqa-6,
+page-4 rows. The per-step cost against tp2 on the same cards is unmeasured.
 
 **One collective does generalise, because it has to.** The lm_head is vocab-sharded, so the sampler
 gathers the ranks' candidate sets rather than their logits (`core/sample/sampler.cpp`) and an

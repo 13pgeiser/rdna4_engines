@@ -2072,6 +2072,28 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
         CHECK_EQ(y.at(0), 160.0f);                   /* 0.5 * (64*1*2 + 64*1*3) */
         CHECK_EQ(y.at(1), 320.0f);                   /* 0.5 * (64*2*2 + 64*2*3) */
     }
+
+    /* A dtype that names none of those grids -- a format of another op, or no dtype at all -- is
+     * declined for every operand, the scale planes and the rest: a plane sized on a guessed grid
+     * is a tensor of the wrong extent. */
+    for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
+        const RadKernelInfo* k = kern(op);
+        REQUIRE(k != nullptr && k->opd_shape != nullptr);
+        for (const char* dt : { "w8a8", "mxfp4a8", "" }) {
+            A a;
+            a.i("M", 2).i("N", 256).i("K", 512).i("n_expert", 8).i("top_k", 2).i("group", 128)
+             .s("a_order", "token");
+            if (*dt) a.s("dtype", dt);
+            const RadArgs* r = a.get();
+            for (int opd : { 0, 2, 3 }) {
+                RadOpdDesc d{};
+                if (k->opd_shape(r->p, r->n_p, opd, &d) != RAD_E_UNSUPPORTED)
+                    std::fprintf(stderr, "    %s at dtype '%s': operand %d described\n", op, dt,
+                                 opd);
+                CHECK_EQ(k->opd_shape(r->p, r->n_p, opd, &d), RAD_E_UNSUPPORTED);
+            }
+        }
+    }
 }
 
 TEST(op_moe_chain) {

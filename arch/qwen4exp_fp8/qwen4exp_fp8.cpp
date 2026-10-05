@@ -292,28 +292,18 @@ static int64_t ngram_table_rows(int64_t base, int64_t heads, int64_t divisor) {
     return divisor > 1 ? ((total + divisor - 1) / divisor) * divisor : total;
 }
 
-/* A RANK'S PLACE WHEN A WIDTH THAT DOES NOT DIVIDE IS CUT OVER THE RANKS, the first places taking
- * one unit more: the ranks in order of how many 128-column blocks of an even/odd pair of routed
- * experts declare()'s parity split gives each, fewest first, by rank among equals. At four ranks
- * and five blocks that is ranks 2, 3, 0, 1 -- under parity ranks 0 and 1 hold the routed extra
- * blocks, and cutting the shared expert from rank 0 as well would stack its extra columns on the
- * ranks every block's all-reduce already waits for. The four-class split that four ranks serve
- * gives every rank the same routed width, and the shared expert's extra block stays rank 2's: the
- * plain experts' extra tiles are cut by rank there (MoeFP8::declare), so the two do not stack.
- * Where the routed width divides it is the rank; declare() asks only above two ranks. */
-static int64_t narrow_place(int64_t n_ff_all, int world, int rank) {
-    const int64_t nb = n_ff_all / RAD_FP8_BLOCK;
-    if (n_ff_all % RAD_FP8_BLOCK || nb < world || nb % world == 0) return rank;
-    auto blocks = [&](int r) {
-        int64_t n = 0;
-        for (int q = 0; q < 2; ++q)
-            n += nb / world + ((r - q + world) % world < nb % world ? 1 : 0);
-        return n;
-    };
-    int64_t place = 0;
-    for (int r = 0; r < world; ++r)
-        if (blocks(r) < blocks(rank) || (blocks(r) == blocks(rank) && r < rank)) ++place;
-    return place;
+/* A RANK'S PLACE WHERE THE SHARED EXPERT'S BLOCKS DO NOT DIVIDE over the ranks, the first places
+ * taking one block more. A plain expert is a routed expert's width in 64-wide tiles, which need
+ * not divide either, and MoeFP8::declare hands its extra tiles to the first ranks by index; the
+ * shared expert's extra blocks start at the rank after the last of those, so the two remainders
+ * land on different ranks while there are ranks enough for both. The routed experts leave no
+ * remainder to avoid: at two ranks the parity split and at four the four-class split give every
+ * rank the same width of them. At four ranks and this family's 640 columns -- ten tiles, five
+ * blocks -- ranks 0 and 1 take a tile more and rank 2 the block; at two the ten tiles divide and
+ * the place is the rank. */
+static int64_t shared_place(int64_t n_ff_all, int world, int rank) {
+    const int64_t first = (n_ff_all / 64) % world;
+    return (rank - first + world) % world;
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
@@ -429,15 +419,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         mc.n_ff_exp    = g.n_ff;
         mc.n_ff_shared = meta_int2(meta, "qwen4exp.expert_shared_feed_forward_length",
                                    "shared_expert_intermediate_size", 0);
-        /* This rank's place where a remainder is handed out: the rank itself at one or two ranks,
-         * and above that the narrow ranks first (narrow_place). The plain experts' tile split in
-         * MoeFP8 takes the same place. */
-        const int64_t place = g.world > 2 ? narrow_place(g.n_ff_all, g.world, g.rank) : g.rank;
-        mc.extra_place = g.world > 2 ? place : -1;
         /* THE SHARED ARM IS SPLIT BY WHOLE fp8 SCALE BLOCKS: evenly when its width halves into
-         * them, and otherwise as evenly as whole blocks allow -- this family's 640 columns are
-         * five blocks, three on rank 0 and two on rank 1; at four ranks two on rank 2 and one on
-         * each of the others. See MoeFP8::Config::shared_lo. */
+         * them, and otherwise as evenly as whole blocks allow, cut by the rank's place
+         * (shared_place) -- this family's 640 columns are five blocks, three on rank 0 and two on
+         * rank 1; at four ranks two on rank 2 and one on each of the others. See
+         * MoeFP8::Config::shared_lo. */
         if (mc.n_ff_shared > 0 && g.world > 1 && (mc.n_ff_shared / g.world) % RAD_FP8_BLOCK == 0) {
             int s;
             if ((s = divide_or_fail(mc.n_ff_shared, g.world,
@@ -453,6 +439,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
             const int64_t nb = mc.n_ff_shared / RAD_FP8_BLOCK;
             const int64_t base = nb / g.world, extra = nb % g.world;
+            const int64_t place = shared_place(g.n_ff_all, g.world, g.rank);
             const int64_t b0 = place * base + std::min<int64_t>(place, extra);
             const int64_t b1 = b0 + base + (place < extra ? 1 : 0);
             mc.shared_lo   = b0 * RAD_FP8_BLOCK;
@@ -528,9 +515,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * the extra block is rotated over four places, by the expert's number mod 4: four slice
          * tables (`moe_gemm_q_mod4`), and every rank computes five blocks of every four experts.
          * A layer keeping two experts plain bf16 has 510 quantised ones, and its first two classes
-         * are one expert longer. What does not divide elsewhere stays apart: the shared expert's
-         * extra block is rank 2's (narrow_place) and the plain experts' extra tiles ranks 0 and
-         * 1's (MoeFP8::declare).
+         * are one expert longer. What does not divide elsewhere stays apart: the plain experts'
+         * extra tiles are ranks 0 and 1's (MoeFP8::declare) and the shared expert's extra block
+         * rank 2's (shared_place).
          *
          * WHY NOT EXPERT PARALLELISM, which splits the EXPERTS: rank r owns [r*E/W, (r+1)*E/W)
          * whole. The bytes a rank reads are the same on average either way, but which rank a
@@ -592,14 +579,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     mc.ff_hi[q] = b1 * RAD_FP8_BLOCK;
                 }
                 mc.n_ff_exp = std::max(mc.ff_hi[0] - mc.ff_lo[0], mc.ff_hi[1] - mc.ff_lo[1]);
-                rad_note(b, "routed experts: rank %d computes columns [%lld, %lld) of each even "
-                            "expert and [%lld, %lld) of each odd one, of %lld. The width is %lld "
-                            "blocks of %d, which %lld ranks split unevenly, so the rank taking the "
-                            "extra block alternates with the expert's parity; the block's "
-                            "all-reduce sums the partials.",
-                         g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
-                         (long long)mc.ff_lo[1], (long long)mc.ff_hi[1], (long long)g.n_ff_all,
-                         (long long)nb, RAD_FP8_BLOCK, (long long)g.world);
                 /* AND AT FOUR RANKS FOUR CLASSES, by the expert's number mod 4 (MoeFP8::Config::
                  * ff_lo4), which every layer then takes instead: the same cut with the rank's place
                  * shifted by the class, so the extra block goes round all four ranks instead of
@@ -622,6 +601,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              (long long)mc.ff_lo4[1], (long long)mc.ff_hi4[1],
                              (long long)mc.ff_lo4[2], (long long)mc.ff_hi4[2],
                              (long long)mc.ff_lo4[3], (long long)mc.ff_hi4[3], (long long)nb);
+                } else {
+                    rad_note(b, "routed experts: rank %d computes columns [%lld, %lld) of each "
+                                "even expert and [%lld, %lld) of each odd one, of %lld. The width "
+                                "is %lld blocks of %d, which %lld ranks split unevenly, so the rank "
+                                "taking the extra block alternates with the expert's parity; the "
+                                "block's all-reduce sums the partials.",
+                             g.rank, (long long)mc.ff_lo[0], (long long)mc.ff_hi[0],
+                             (long long)mc.ff_lo[1], (long long)mc.ff_hi[1],
+                             (long long)g.n_ff_all, (long long)nb, RAD_FP8_BLOCK,
+                             (long long)g.world);
                 }
             } else {
                 fprintf(stderr, "radiance: qwen4exp: an expert is %lld blocks of %d, which %d ranks "

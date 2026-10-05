@@ -365,6 +365,10 @@ typo'd directory is a message, not a silent quality regression.
 
 - `r4d_selftest --case moe_gemm_w4a8` -- the kernel against an independent host decode of the same
   planes, both M bands, through the relayout the loader runs.
+- `r4d_selftest --case moe_gemm_w4a8_mod4` -- the four-class op against the two-class one byte for
+  byte, and against a host decode with every class at its own geometry and one of classes 1 to 3
+  the only wide one, as ranks 1 to 3 of four hold them; `--case moe_gemm_fp8a8_mod4` is the same
+  host decode at block fp8.
 - `quant_test` -- **GPTQ against the objective it minimises**. The metric is
   `||X (W - W')^T||^2 = sum over rows of e H e^T` and *not* rel_l2 on the weight: error feedback
   makes the weight worse in the plain sense, deliberately. The control is no Hessian at all, under

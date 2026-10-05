@@ -667,6 +667,72 @@ TEST(a_weight_table_resolves_only_the_entries_that_moved) {
     CHECK_EQ(res.lookups, before + 4);
 }
 
+/* A TABLE'S RUN IS THE DECLARATION'S. The weights declared at a table position (OpInfo::
+ * weight_opd) are bound as one table before the first step. A declared run with a gap in it is
+ * refused there -- the kernel is handed one base and strides through it, so a gap is a wrong
+ * expert read -- and an issue naming any other run than the bound one is refused at issue, by
+ * name, rather than handed a table of other experts. */
+TEST(a_weight_table_issued_against_its_declaration_is_refused) {
+    static const RadOperandSpec opds[] = {
+        { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WTAB, 0 }, { "y", RAD_OPD_OUT, 0 },
+    };
+    static const RadOpSchema schema = {
+        "moe_gemm", g_gemm_params, 4, opds, 3, "A[M,K] x B[e][N,K]^T -> Y[M,N]"
+    };
+    static uint16_t expert_bytes[4][32];
+    auto experts = [](Fixture& f) {
+        std::vector<rad_weight> w;
+        for (int e = 0; e < 4; ++e)
+            w.push_back(f.add_weight(("blk.0.e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4,
+                                     expert_bytes[e]));
+        return w;
+    };
+
+    {
+        /* Experts 0, 1 and 3 at the table, 2 missing from the run: refused when the tables are
+         * bound, so the Ctx never runs a step. */
+        Fixture f;
+        const std::vector<rad_weight> w = experts(f);
+        f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+        rad_op op = f.add_op("moe_gemm", "M", { 8192 }, { k_pre }, { "prefill" }, &schema,
+                             { w[0], w[1], w[3] });
+        f.P.ops[op].weight_opd = { 1, 1, 1 };
+        CHECK_EQ(f.start(), RAD_E_INVAL);
+    }
+
+    Fixture f;
+    const std::vector<rad_weight> w = experts(f);
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op op = f.add_op("moe_gemm", "M", { 8192 }, { k_pre }, { "prefill" }, &schema, w);
+    f.P.ops[op].weight_opd = { 1, 1, 1, 1 };
+    CHECK_OK(f.start());
+
+    /* The declared run is served. */
+    g_rec.clear();
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_WTAB(w[0], 4), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+    }));
+    CHECK_EQ(g_rec.size(), (size_t)1);
+
+    /* One entry short, and the same length one expert along: both name experts the declaration
+     * did not put at this table, and neither reaches the kernel. */
+    int step_no = 1;
+    for (const RadOperand tab : { RAD_WTAB(w[0], 3), RAD_WTAB(w[1], 3) }) {
+        g_rec.clear();
+        const int s = f.step(4, step_no++, [&](Ctx& c) {
+            RadOperand opd[3] = { RAD_B(x), tab, RAD_B(y) };
+            c.issue(op, opd, 3, RAD_N_BATCH);
+        });
+        CHECK_EQ(s, RAD_E_INVAL);
+        CHECK_EQ(g_rec.size(), (size_t)0);
+        CHECK(std::strstr(f.ctx.step_error(), "A table's run is fixed by the declaration") !=
+              nullptr);
+    }
+}
+
 /* Routing never blocks the compute stream: the histogram is copied back asynchronously and the
  * heat engine DRAINS it on a later step (spec §5.5). */
 TEST(route_report_is_asynchronous_and_drains_oldest_first) {

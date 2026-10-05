@@ -24,7 +24,9 @@
  *
  * THE STATIC WEIGHTS COME OFF THE TOP. Everything that is not an expert -- the attention
  * projections, the norms, the embedding, the head -- has to be resident for the model to run at a
- * sensible speed at all, and under tensor parallel each rank already holds its own even share of
+ * sensible speed at all (the one exception is a token embedding --embedding-placement puts in the
+ * pinned host pool, which a lookup reads a few rows of in place; weight_footprint counts it out of
+ * the statics then), and under tensor parallel each rank already holds its own even share of
  * them (declare runs per rank with every dimension divided, spec §9). They are a FLOOR, not a
  * share of anything: applying a ratio to the weights as a whole would let --expert-vs-cache-ratio
  * 0.3 demote the attention projections to host memory to make room for a cache nothing will fill.
@@ -113,5 +115,10 @@ struct VramBudget {
  *
  * Refuses, by name and by how much, when the fixed terms alone exceed the card. */
 int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out);
+
+/* The same split worked out on a copy of `cfg`, written nowhere and printed nowhere: for a caller
+ * deciding between two programs before it resolves the one it keeps (Engine::plan's table
+ * placement). */
+int vram_budget_trial(const Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out);
 
 }  /* namespace rad */

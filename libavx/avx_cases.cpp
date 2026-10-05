@@ -237,30 +237,32 @@ std::vector<Case> build_cases() {
         for (const char* order : { "token", "sorted" }) {
             add("moe_gemm",   { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8),
                                 HI("top_k", 2), HS("a_order", order), HS("dtype", dt) });
+            /* `fp8a8`, the block-fp8 grid: libref describes a grouped GEMM's weight scale plane
+             * only at a dtype that names its grid. */
             add("moe_gemm_q", { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8),
                                 HI("top_k", 2), HI("group", 128), HS("a_order", order),
-                                HS("dtype", "w8a8") });
+                                HS("dtype", "fp8a8") });
         }
         /* The two classes at different widths: a gate/up pair whose odd experts are half as wide
          * (the output's second part begins past the odd class's zeros), and a down projection
          * whose odd experts are half as long. */
         add("moe_gemm_q", { HI("M", 9), HI("N", 256), HI("K", 128), HI("N_odd", 128),
                             HI("parts", 2), HI("n_expert", 8), HI("top_k", 2), HI("group", 128),
-                            HS("a_order", "token"), HS("dtype", "w8a8") });
+                            HS("a_order", "token"), HS("dtype", "fp8a8") });
         add("moe_gemm_q", { HI("M", 9), HI("N", 64), HI("K", 256), HI("K_odd", 128),
                             HI("n_expert", 8), HI("top_k", 2), HI("group", 128),
-                            HS("a_order", "sorted"), HS("dtype", "w8a8") });
+                            HS("a_order", "sorted"), HS("dtype", "fp8a8") });
         /* Four classes at three widths -- a four-rank slice of a five-block expert is two blocks
          * of one class and one of each other -- over ten experts, so classes 2 and 3 hold one
          * fewer than 0 and 1: the gate/up pair and the down projection. */
         add("moe_gemm_q_mod4", { HI("M", 9), HI("N", 128), HI("K", 128), HI("N_1", 256),
                                  HI("N_2", 128), HI("N_3", 128), HI("parts", 2),
                                  HI("n_expert", 10), HI("top_k", 2), HI("group", 128),
-                                 HS("a_order", "token"), HS("dtype", "w8a8") });
+                                 HS("a_order", "token"), HS("dtype", "fp8a8") });
         add("moe_gemm_q_mod4", { HI("M", 9), HI("N", 64), HI("K", 128), HI("K_1", 128),
                                  HI("K_2", 256), HI("K_3", 128), HI("n_expert", 10),
                                  HI("top_k", 2), HI("group", 128), HS("a_order", "sorted"),
-                                 HS("dtype", "w8a8") });
+                                 HS("dtype", "fp8a8") });
     }
     add("moe_scatter", { HI("M", 9), HI("n_expert", 8), HI("top_k", 2), HI("expert_base", 0) });
 

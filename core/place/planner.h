@@ -95,10 +95,10 @@ struct MoveUnit {
     Site    site = Site::Device;
     int32_t slab_slot = -1;
     bool    movable = false;     /* may the heat engine relocate it after load */
-    bool    host_forced = false; /* --host-weights put it in the pinned pool; no strategy moves it */
+    bool    host_forced = false; /* --embedding-placement ram put it in the pinned pool */
 
     /* PLACED BEFORE ANY STRATEGY RAN, so every assignment pass skips it and no VRAM total counts
-     * it: the mapped tier (no device kernel can read it) and --host-weights. */
+     * it: the mapped tier (no device kernel can read it) and --embedding-placement ram. */
     bool preplaced() const { return tier == Tier::Mapped || host_forced; }
     const char* reason = "fits in vram";   /* a fixed string, so the report never guesses */
 
@@ -244,9 +244,14 @@ public:
     int64_t vram_budget = 0, host_budget = 0;
     int64_t file_stage_reserve = 0;
     int64_t file_windows = 0;          /* the read windows' part of it */
-    /* --host-weights: taken out of --host-pool-mib before any strategy ran, like the file staging
-     * above, and reported beside it rather than among the pooled units. */
-    int64_t host_weights_bytes = 0;
+    /* --embedding-placement ram: the pool slots taken out of --host-pool-mib before any strategy
+     * ran, like the file staging above, and reported beside it rather than among the pooled units.
+     * `embedding_host_used` is the same tables' weight bytes, the unit the tier totals count in. */
+    int64_t embedding_host_bytes = 0;
+    int64_t embedding_host_used = 0;
+    /* --ngram-placement ram: the n-gram tables the load phase copies into locked memory. They stay
+     * on the mapped tier as far as every pool is concerned; this is what the copy costs in RAM. */
+    int64_t ngram_copy_bytes = 0;
     /* ROUTED EXPERTS ON THE FILE TIER have no address of their own: a routed layer's are read into
      * one of two VRAM buffers before the layer's first expert op and published there until the next
      * routed layer starts (place/stager.h, FileStager). `file_layer_max` is the most one layer's
@@ -325,7 +330,7 @@ private:
     void resolve_sites(const Program& prog);
     void build_units(const Program& prog, Plan* p);
     void pin_mapped(const Program& prog, Plan* p);
-    int  pin_host_weights(const Program& prog, const Config& cfg, Plan* p) const;
+    int  pin_embedding(const Program& prog, const Config& cfg, Plan* p) const;
     void build_classes(Plan* p);
     void rank_units(Plan* p, std::vector<int32_t>* order) const;
     int  assign(Plan* p);
@@ -370,20 +375,33 @@ struct WeightFootprint {
     int64_t experts = 0;   /* the elastic plane: what streams from host when it does not fit */
     int64_t expert_layer_max = 0;   /* the most expert bytes any one routed layer holds */
     int64_t mapped  = 0;   /* no device kernel can read them; they never enter a pool at all */
-    int64_t hosted  = 0;   /* --host-weights: in the pinned host pool, never on the card */
+    int64_t hosted  = 0;   /* --embedding-placement ram: in the pinned host pool, off the card */
+    /* The tables the two placement flags move, wherever the buckets above count them: `embedding`
+     * is inside statics or hosted, `ngram` inside mapped. */
+    int64_t embedding = 0;
+    int64_t ngram     = 0;
+    /* An n-gram table some device kernel reads, which the strategies place like any weight. No
+     * plugin has one today; it is what makes --ngram-placement vram mean something. */
+    bool    ngram_device = false;
     int64_t n_units = 0;
 };
-void weight_footprint(const Program& prog, WeightFootprint* out,
-                      const std::vector<std::string>& host_weights = {});
+/* `embedding` is what the token embedding's placement resolved to; only Ram moves it out of the
+ * statics. Stated by every caller, so the budget and the planner cannot count it differently. */
+void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding);
 
-/* Does `name` match the --host-weights list: comma-separated, a trailing '*' matching a prefix.
- * One definition, because Planner::pin_host_weights and weight_footprint must agree on it or the
- * budget is resolved for weights the planner then puts somewhere else. */
-bool host_weight_match(const std::vector<std::string>& list, const std::string& name);
-
-/* Is every op that reads weight `w` an embedding lookup? Only those read a few rows a step; any
- * other reader (a GEMM) would stream the whole weight over the link on every step. */
-bool read_only_by_lookups(const Program& prog, rad_weight w);
+/* THE TABLES THE PLACEMENT FLAGS MOVE, by what reads them and not by name: a model-level weight
+ * that at least one op reads and that only `embed_lookup` reads is a token embedding table, and
+ * one only `embed_lookup_q` reads is an n-gram table. A lookup reads M rows a step, which is what
+ * makes a tier below the card usable for it at all; a weight a GEMM also reads -- an output head
+ * tied to the embedding -- would stream whole over the link every step, and is neither. One
+ * definition, because the budget resolver and the planner must pick the same weights. */
+bool read_only_by(const Program& prog, rad_weight w, const char* op);
+inline bool is_embedding_table(const Program& prog, rad_weight w) {
+    return read_only_by(prog, w, "embed_lookup");
+}
+inline bool is_ngram_table(const Program& prog, rad_weight w) {
+    return read_only_by(prog, w, "embed_lookup_q");
+}
 
 /* "blk.12.ffn_gate_exps.3.weight" -> "blk.*.ffn_gate_exps.*.weight". The report's grouping key:
  * one line per weight class rather than per weight (spec §16). */

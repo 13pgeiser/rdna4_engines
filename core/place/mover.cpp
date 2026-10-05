@@ -293,10 +293,10 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
          *
          * A staging slot only ever receives a unit read from the container, so sizing it off every
          * class charges the host pool for classes that are never staged. The widest class is
-         * typically the embedding table -- its own class, gigabytes wide, and resident in VRAM for
-         * the whole run -- so sizing on it reserves several times that in pinned memory to receive
-         * a weight that never arrives, and the file tier is then refused for want of memory it
-         * did not need. */
+         * typically the embedding table -- its own class, gigabytes wide, and never on the file
+         * tier: in VRAM, or in the pinned host pool by --embedding-placement -- so sizing on it
+         * reserves several times that in pinned memory to receive a weight that never arrives, and
+         * the file tier is then refused for want of memory it did not need. */
         int64_t widest = 0;
         for (const MoveUnit& mu : plan.units) {
             if (mu.tier != Tier::SSD || mu.slab_class < 0) continue;

@@ -57,16 +57,19 @@ static const Flag g_flags[] = {
     { "--vram-kv-mib",        "N",      "the paged KV pool; 0 derives it from the card" },
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 -- fp8 halves what a token of context costs" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
-    { "--host-weights",       "NAMES",  "embedding tables to keep in the pinned host pool, read in place\n"
-    "                                    over the link: comma-separated weight names, a trailing *\n"
-    "                                    matching a prefix (token_embd.weight)" },
+    { "--embedding-placement", "WHERE", "auto (default) | vram | ram: where the token embedding lives. ram\n"
+    "                                    keeps it in the pinned host pool, read over the link in place;\n"
+    "                                    auto keeps it on the card unless the KV cache could then not\n"
+    "                                    hold one --max-model-len sequence. disk is refused: the lookup\n"
+    "                                    writes the card's activations, which no host read can reach" },
+    { "--ngram-placement",    "WHERE",  "auto (default) | ram | disk: where an n-gram embedding table\n"
+    "                                    lives (Qwen3.8-Flash-Next: 47.7 GiB). disk reads its rows from\n"
+    "                                    the container; ram copies it into locked memory at load; auto\n"
+    "                                    takes ram when free memory, the memlock limit and the cgroup\n"
+    "                                    allow it. vram is refused: only a host kernel reads the table" },
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },
-    { "--ngram-table",        "MODE",   "disk (default) or ram: where the n-gram embedding's host gather\n"
-    "                                    reads its rows. ram copies the table into locked host memory\n"
-    "                                    in the background from the first request and reads the copy\n"
-    "                                    (Qwen3.8-Flash-Next: 47.7 GiB; needs a memlock limit that large)" },
     { "--prefix-cache-host-mib", "N",   "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. 0 is off. Part of it holds\n"
@@ -215,6 +218,17 @@ void config_usage(const char* argv0) {
         "\nEvery pool is budgeted explicitly. The trade between KV blocks and resident weights\n"
         "is the operator's to make: an engine that re-optimises it quietly is an engine whose\n"
         "benchmarks do not reproduce.\n");
+}
+
+/* The four names exactly, lower case: what a table's placement costs is the operator's to state,
+ * so a spelling this build does not know stops the server rather than picking a tier. */
+static bool parse_table_placement(const char* v, TablePlacement* out) {
+    if      (!std::strcmp(v, "auto")) *out = TablePlacement::Auto;
+    else if (!std::strcmp(v, "vram")) *out = TablePlacement::Vram;
+    else if (!std::strcmp(v, "ram"))  *out = TablePlacement::Ram;
+    else if (!std::strcmp(v, "disk")) *out = TablePlacement::Disk;
+    else return false;
+    return true;
 }
 
 static std::vector<std::string> split_commas(const std::string& s) {
@@ -384,30 +398,17 @@ int config_parse(int argc, char** argv, Config* c) {
             }
         }
         else if (S("--host-pool-mib"))         { if (!(v = need(i))) return RAD_E_INVAL; c->host_pool_mib = atoll(v); }
-        else if (S("--host-weights")) {
+        else if (S("--embedding-placement") || S("--ngram-placement")) {
+            const bool emb = S("--embedding-placement");
             if (!(v = need(i))) return RAD_E_INVAL;
-            c->host_weights.clear();
-            for (std::string p : split_commas(v)) {
-                p.erase(0, p.find_first_not_of(" \t"));
-                p.erase(p.find_last_not_of(" \t") + 1);
-                if (p.empty() || p == "*") {
-                    RAD_ERR("--host-weights: '%s' is not a weight name", p.c_str());
-                    return RAD_E_INVAL;
-                }
-                c->host_weights.push_back(p);
-            }
-            if (c->host_weights.empty()) {
-                RAD_ERR("--host-weights: no weight names in '%s'", v);
+            TablePlacement p;
+            if (!parse_table_placement(v, &p)) {
+                RAD_ERR("%s takes auto, vram, ram or disk, not '%s'", a.c_str(), v);
                 return RAD_E_INVAL;
             }
+            (emb ? c->embedding_placement : c->ngram_placement) = p;
         }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
-        else if (S("--ngram-table")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if      (!std::strcmp(v, "disk")) c->ngram_table_ram = false;
-            else if (!std::strcmp(v, "ram"))  c->ngram_table_ram = true;
-            else { RAD_ERR("--ngram-table takes disk or ram, not '%s'", v); return RAD_E_INVAL; }
-        }
         else if (S("--prefix-cache-host-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_host_mib = atoll(v); }
         else if (S("--prefix-cache-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }
         else if (S("--prefix-cache-disk-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_disk_mib = atoll(v); }

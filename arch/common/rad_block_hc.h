@@ -295,15 +295,21 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
         if (!op_write) return RAD_E_INVAL;
         /* A handle that did not resolve is 0 and not an error: a backend without the fused kernel
          * keeps the pair, and takes_ar() then answers no on every step. At four ranks only the
-         * exact form exists, and it takes a step only where ar_wide_write_exact says the
-         * standalone collective would have been the exact one-shot. */
-        if (c.reduce && (g.world == 2 || g.world == 4))
+         * exact form exists, declared over the decode and verify steps' rows and taken where
+         * ar_wide_write_exact says so. The exact form states `wire` 0 rather than leaving it out:
+         * a row that serves one wire only says so with a constraint on `wire`, and a constraint on
+         * an absent key does not hold. */
+        const int64_t ar_rows = ar_exact_write_rows(g);
+        if (c.reduce && ar_rows >= 1)
             op_ar_write = rw(b, RAD_OP(b, "ar_hc_write",
-                                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                RAD_PARAMS(RAD_RANGE("M", 1, ar_rows), RAD_INT("n", g.n_embd),
                                            RAD_INT("hc", c.hc), RAD_INT("world_size", g.world),
-                                           RAD_STR("dtype", g.dtype)),
+                                           RAD_STR("dtype", g.dtype), RAD_INT("wire", 0)),
                                 RAD_NOWEIGHTS),
                              {w.x.x, w.inj, w.h}, {w.x.x, w.h});
+        /* The rotated form at two ranks only: the op has no four-rank form on that wire
+         * (docs/OPS.md), and an op declared that nothing resolves is reported at startup as a
+         * band a request cannot run in. */
         if (op_ar_write && !g.wire_exact && g.world == 2)
             op_ar_write6 = rw(b, RAD_OP(b, "ar_hc_write",
                                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
@@ -323,11 +329,14 @@ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
     if (g.world != 2 && g.world != 4) return RAD_OK;
     const bool shared = src.sh && src.sg;
     gsrc = src;
-    /* EVERY ROW COUNT ONE PASS CARRIES, prefill chunks included: the kernel reads its slots from
-     * an LDS table at a decode step and from an inverse table at a chunk, where the gather's reads
-     * then run beside the reduction's push instead of in a launch of their own. */
+    /* EVERY ROW COUNT ONE PASS CARRIES, up to the rows the write itself was declared for
+     * (ar_exact_write_rows): prefill chunks included at two ranks, the decode and verify steps at
+     * four. The kernel reads its slots from an LDS table at a decode step and from an inverse
+     * table at a chunk, where the gather's reads then run beside the reduction's push instead of
+     * in a launch of their own. */
     int64_t rows = src.rows;
-    if (rows > g.max_tok) rows = g.max_tok;
+    const int64_t ar_rows = ar_exact_write_rows(g);
+    if (rows > ar_rows) rows = ar_rows;
     if (rows < 1) return RAD_OK;
     const rad_buf rd[8] = { src.ye, src.ew, src.sorted, w.x.x, w.inj, w.h, src.sh, src.sg };
     const rad_buf wr[2] = { w.x.x, w.h };
@@ -339,7 +348,8 @@ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
                                            RAD_INT("hc", c.hc), RAD_INT("top_k", src.top_k),
                                            RAD_INT("world_size", g.world),
                                            RAD_STR("dtype", g.dtype),
-                                           RAD_STR("act", shared ? "sigmoid" : "none")),
+                                           RAD_STR("act", shared ? "sigmoid" : "none"),
+                                           RAD_INT("wire", 0)),
                                 RAD_NOWEIGHTS);
     if (op_ar_gather_write) {
         RAD_ARCH_TRY(rad_op_reads (b, op_ar_gather_write, rd, shared ? 8 : 6));

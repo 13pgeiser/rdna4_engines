@@ -6160,6 +6160,267 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
     }
 }
 
+/* THE FOUR-CLASS GROUPED GEMM, EACH CLASS AT ITS OWN GEOMETRY, AGAINST A HOST DECODE.
+ *
+ * moe_w4_gemm's four-class pass reads the two-class op's tables as four, so its classes come in
+ * geometry pairs -- 0 with 2, 1 with 3 -- and class 0 is always among the wide ones. A rank of four
+ * holds two blocks of its own class of every five-block expert and one of each other: ONE wide
+ * class, which is class 0 on rank 0 only. Here every class is built at its own [N_q, K_q], stored
+ * through the row's own hooks at its own operands (2/3, 6/7, 8/9, 10/11), and checked against the
+ * planes, so a wide class 1, 2 or 3 has to read its own width and pitch, and a narrow class 0 has
+ * to write the zeros past its part. `dt` names the format: fp8a8 runs `moe_gemm_fp8a8_mod4`, block
+ * E4M3 with a bf16 scale a 128x128 tile; the four-bit ones run `moe_gemm_w4a8_mod4`, as
+ * moe_w4_gemm reads them. Every form, as there. */
+struct MoeQ4Shape { const char* name; int64_t N[4], K[4], parts, ne; };
+
+/* A rank of four's slices of a five-block expert: the gate/up pair (two parts) at two 128-column
+ * blocks a part for the wide class and one for the others, the down projection at 256 and 128 of
+ * K. The wide class is 1, 2 or 3 -- what the ranks other than 0 hold. Ten experts make classes 0
+ * and 1 one expert longer than 2 and 3; three hundred spread a decode step's few runs over
+ * experts that are mostly empty. Every part is whole 128-row blocks of the fp8 scale grid or lies
+ * inside one, so no output tile's weight rows straddle two -- block fp8 reads one scale a tile. */
+static const MoeQ4Shape kMoeQ4Shapes[] = {
+    { "gate/up, class 1 wide", { 256, 512, 256, 256 }, { 256, 256, 256, 256 }, 2, 10 },
+    { "gate/up, class 2 wide", { 256, 256, 512, 256 }, { 256, 256, 256, 256 }, 2, 10 },
+    { "down, class 3 wide",    { 128, 128, 128, 128 }, { 128, 128, 128, 256 }, 1, 10 },
+    { "300 experts, gate/up, class 3 wide", { 128, 128, 128, 256 }, { 128, 128, 128, 128 }, 2,
+      300 },
+};
+
+static void moe_q4_gemm(const Plugin& pl, int64_t Tr, const MoeQ4Shape& sh, const char* dt) {
+    const bool fp8 = std::strcmp(dt, "fp8a8") == 0, w5 = std::strcmp(dt, "w5nl64a8h") == 0;
+    /* Scale groups a 128 of K at the E4M3-scaled forms (moe_w4_gemm's `sub`), 0 at the others. */
+    const int64_t sub = std::strcmp(dt, "w4nl32a8h") == 0 ? 4
+                      : (w5 || std::strcmp(dt, "w4nl64a8h") == 0) ? 2 : 0;
+    const bool g64 = sub > 1;
+    const float* tab = w5 ? kW5nlTable : kW4nlTable;
+    static const char* const kForm[] = { "rule", "aligned prefill form", "decode form",
+                                         "uniform prefill grid" };
+    const char* row = fp8 ? "moe_gemm_fp8a8_mod4" : "moe_gemm_w4a8_mod4";
+    const std::string what = std::string(row) + " vs a host decode (T=" + std::to_string(Tr) +
+                             ", " + sh.name + ", " + dt + ")";
+    const RadKernelInfo* r = find(pl, row);
+    if (!r || !r->layout || (!fp8 && !r->relayout)) {
+        ok(what.c_str(), false, "row or hooks absent");
+        return;
+    }
+
+    const int64_t ne = sh.ne, group = 128, top_k = 2;
+    int64_t N = 0, K = 0;
+    for (int q = 0; q < 4; ++q) {
+        N = std::max(N, sh.N[q]);
+        K = std::max(K, sh.K[q]);
+    }
+    const int64_t kb = K / group, M = Tr / top_k, fy = N / sh.parts;
+    const std::vector<RadParam> lp = {
+        PI("N", sh.N[0]), PI("K", sh.K[0]), PI("N_1", sh.N[1]), PI("K_1", sh.K[1]),
+        PI("N_2", sh.N[2]), PI("K_2", sh.K[2]), PI("N_3", sh.N[3]), PI("K_3", sh.K[3]),
+        PI("group", group), PS("dtype", dt),
+    };
+
+    /* Each class's experts e = 4x + q, from moe_w4_gemm's float source; their planes, kept for
+     * the reference, and the bytes the hooks store for them, asked at the class's own operands.
+     * Block fp8 is stored as its planes are, in both views; the four-bit codes are re-laid, and so
+     * is the E4M3 scale view with its second level, while a bf16 scale plane is stored as it is. */
+    std::vector<uint8_t> wq[4], ws[4];
+    std::vector<Planes>  cp[4];
+    int64_t nec[4] = { 0, 0, 0, 0 };
+    for (int q = 0; q < 4; ++q) {
+        const int64_t Nq = sh.N[q], Kq = sh.K[q], kbq = Kq / group;
+        const int ow = q ? 4 + 2 * q : 2, os = ow + 1;
+        const int64_t wbytes = fp8 ? Nq * Kq : w5 ? Nq * Kq / 8 * 5 : Nq * Kq / 2;
+        const int64_t sbytes = fp8 ? (Nq + group - 1) / group * kbq * 2
+                                   : Nq * kbq * (g64 ? sub : 2);
+        nec[q] = (ne + 3 - q) / 4;
+        std::vector<float> wsrc((size_t)(Nq * Kq));
+        for (int64_t x = 0; x < nec[q]; ++x) {
+            const int64_t e = 4 * x + q;
+            for (int64_t n = 0; n < Nq; ++n)
+                for (int64_t k = 0; k < Kq; ++k)
+                    wsrc[(size_t)(n * Kq + k)] =
+                        (float)(((e * 7 + n * 31 + k * 17) % 61) - 30) / 37.0f;
+            cp[q].push_back(fp8 ? fp8_block_planes(wsrc, Nq, Kq)
+                            : g64 ? nl64_planes(wsrc, Nq, Kq, group / sub, w5)
+                                  : int4_planes(wsrc, Nq, Kq, group, RAD_BF16, false));
+            std::vector<uint8_t> w, sc;
+            const int rw = g64 ? stored(r, lp, ow, cp[q].back(), { "codes", "table" }, &w)
+                               : stored(r, lp, ow, cp[q].back(), { "codes" }, &w);
+            const int rs = g64 ? stored(r, lp, os, cp[q].back(), { "scale", "scale.1" }, &sc)
+                               : stored(r, lp, os, cp[q].back(), { "scale" }, &sc);
+            if (rw != (fp8 ? RAD_E_UNSUPPORTED : RAD_OK) ||
+                rs != (g64 ? RAD_OK : RAD_E_UNSUPPORTED)) {
+                ok(what.c_str(), false, "class " + std::to_string(q) + " relayout rc " +
+                                        std::to_string(rw) + "/" + std::to_string(rs));
+                return;
+            }
+            if ((int64_t)w.size() != wbytes || (int64_t)sc.size() != sbytes) {
+                ok(what.c_str(), false, "class " + std::to_string(q) + " stored " +
+                                        std::to_string(w.size()) + " and " +
+                                        std::to_string(sc.size()) + " bytes an expert, for " +
+                                        std::to_string(wbytes) + " and " + std::to_string(sbytes));
+                return;
+            }
+            wq[q].insert(wq[q].end(), w.begin(), w.end());
+            ws[q].insert(ws[q].end(), sc.begin(), sc.end());
+        }
+    }
+
+    /* moe_w4_gemm's activation and routing: E4M3 bytes with no subnormal and no NaN, an f32 scale
+     * a (row, group), an uneven run on each expert and a dropped tail. */
+    std::vector<uint8_t> aq((size_t)(M * K));
+    std::vector<float>   as((size_t)(M * kb));
+    for (int64_t m = 0; m < M; ++m) {
+        for (int64_t g = 0; g < kb; ++g) as[(size_t)(m * kb + g)] = 0.011f + 0.003f * (float)g;
+        for (int64_t k = 0; k < K; ++k) {
+            const uint32_t c = (uint32_t)((m * 13 + k * 5) % 119) + 8;
+            aq[(size_t)(m * K + k)] = (uint8_t)(((m + k) & 1) ? (c | 0x80u) : c);
+        }
+    }
+    std::vector<int32_t> off((size_t)(ne + 1), 0), sorted((size_t)Tr, -1);
+    const int64_t live = Tr - 3;
+    for (int64_t e = 0; e <= ne; ++e) off[(size_t)e] = (int32_t)((live * e) / ne);
+    off[(size_t)ne] = (int32_t)live;
+    for (int64_t i = 0; i < live; ++i) sorted[(size_t)i] = (int32_t)((i * 7 + 3) % Tr);
+
+    void* d_a  = dalloc(aq.size());
+    void* d_as = dalloc(as.size() * 4);
+    void* d_w[4];
+    void* d_ws[4];
+    for (int q = 0; q < 4; ++q) {
+        d_w[q]  = dalloc(wq[q].size());
+        d_ws[q] = dalloc(ws[q].size());
+        st_memcpy(d_w[q],  wq[q].data(), wq[q].size(), hipMemcpyHostToDevice);
+        st_memcpy(d_ws[q], ws[q].data(), ws[q].size(), hipMemcpyHostToDevice);
+    }
+    void* d_s = dalloc(sorted.size() * 4);
+    void* d_o = dalloc(off.size() * 4);
+    void* d_y = dalloc((size_t)(Tr * N * 2));
+    st_memcpy(d_a,  aq.data(),     aq.size(),         hipMemcpyHostToDevice);
+    st_memcpy(d_as, as.data(),     as.size() * 4,     hipMemcpyHostToDevice);
+    st_memcpy(d_s,  sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_o,  off.data(),    off.size() * 4,    hipMemcpyHostToDevice);
+
+    /* The stacked table form, as moe_w4_gemm hands it, each class at its own extents. */
+    auto codes_t = [&](int q) {
+        return T(d_w[q], fp8 ? (uint32_t)RAD_F8E4M3 : w5 ? (uint32_t)R4D_DT_MOEW5
+                                                         : (uint32_t)R4D_DT_MOEW4,
+                 { nec[q], sh.N[q], sh.K[q] });
+    };
+    auto scale_t = [&](int q) {
+        const int64_t kbq = sh.K[q] / group;
+        return fp8 ? T(d_ws[q], RAD_BF16, { nec[q], (sh.N[q] + group - 1) / group, kbq })
+             : g64 ? T(d_ws[q], RAD_F8E4M3, { nec[q], sh.N[q], sub * kbq })
+                   : T(d_ws[q], RAD_BF16, { nec[q], sh.N[q], kbq });
+    };
+    std::vector<RadTensor> ts = {
+        T(d_a, RAD_F8E4M3, { M, K }), T(d_as, RAD_F32, { M, kb }), codes_t(0), scale_t(0),
+        T(d_s, RAD_I32, { Tr }), T(d_o, RAD_I32, { ne + 1 }), codes_t(1), scale_t(1),
+        codes_t(2), scale_t(2), codes_t(3), scale_t(3), T(d_y, RAD_BF16, { Tr, N }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("N", sh.N[0]), PI("K", sh.K[0]), PI("N_1", sh.N[1]), PI("K_1", sh.K[1]),
+        PI("N_2", sh.N[2]), PI("K_2", sh.K[2]), PI("N_3", sh.N[3]), PI("K_3", sh.K[3]),
+        PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
+        PS("a_order", "token"), PS("dtype", dt),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    const int64_t map_bytes = (1 + 2 * (ne + Tr / 16 + 2)) * 4;
+    void* d_map = dalloc((size_t)map_bytes);
+
+    /* The reference, from the planes: row i's expert e is class e % 4, entry e / 4, at that
+     * class's width and K; a part's columns past the class's width are zero. */
+    std::vector<double> ref((size_t)(Tr * N), 0.0);
+    for (int64_t i = 0; i < Tr; ++i) {
+        const int32_t f = sorted[(size_t)i];
+        int64_t e = 0;
+        while (e + 1 < ne && off[(size_t)(e + 1)] <= i) ++e;
+        const int q = (int)(e % 4);
+        const Planes& p = cp[q][(size_t)(e / 4)];
+        const int64_t fc = sh.N[q] / sh.parts, Kq = sh.K[q], kbq = Kq / group;
+        for (int64_t n = 0; n < N; ++n) {
+            double want = 0.0;
+            const int64_t pp = n / fy, j = n - pp * fy;
+            if (f >= 0 && i < live && j < fc) {
+                const int64_t tok = f / top_k, wr = pp * fc + j;
+                for (int64_t g = 0; g < kbq; ++g) {
+                    const double a_s = (double)as[(size_t)(tok * kb + g)];
+                    if (fp8) {
+                        /* E4M3 codes, and the bf16 scale of the 128x128 tile the element is in. */
+                        double part = 0.0;
+                        for (int64_t k = g * group; k < (g + 1) * group; ++k)
+                            part += (double)h_e4m3(p.data[0][(size_t)(wr * Kq + k)]) *
+                                    (double)st_e4m3(aq[(size_t)(tok * K + k)]);
+                        want += part * (double)rad_load_f32(p.data[1].data(), RAD_BF16,
+                                                            (wr / group) * kbq + g) * a_s;
+                    } else if (g64) {
+                        /* `sub` scale groups a 128, each an E4M3 byte under the fixed constant. */
+                        const int64_t gw = group / sub;
+                        for (int64_t h = 0; h < sub; ++h) {
+                            double part = 0.0;
+                            for (int64_t k = g * group + h * gw; k < g * group + (h + 1) * gw; ++k)
+                                part += (double)tab[code_at(p, wr, k)] *
+                                        (double)st_e4m3(aq[(size_t)(tok * K + k)]);
+                            const uint8_t sb =
+                                p.data[1][(size_t)(wr * p.row_bytes(1) + sub * g + h)];
+                            want += part * (double)h_e4m3(sb) * (double)kW4G64Scale * a_s;
+                        }
+                    } else {
+                        double part = 0.0;
+                        for (int64_t k = g * group; k < (g + 1) * group; ++k)
+                            part += (double)code_at(p, wr, k) *
+                                    (double)st_e4m3(aq[(size_t)(tok * K + k)]);
+                        want += part * (double)rad_load_f32(p.data[1].data(), RAD_BF16,
+                                                            wr * kbq + g) * a_s;
+                    }
+                }
+            }
+            ref[(size_t)(i * N + n)] = want;
+        }
+    }
+
+    const int f_lo = pl.pin_moe ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
+    for (int form = f_lo; form <= f_hi; ++form) {
+        const std::string label = what + " " + kForm[form];
+        if (pl.pin_moe) pl.pin_moe(form);
+        /* Stale bytes where a narrow class writes zeros, so a pad tile left unwritten shows. */
+        {
+            std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+        }
+        a.scratch = form == 3 ? nullptr : d_map;
+        a.scratch_bytes = form == 3 ? 0 : map_bytes;
+        const int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (pl.pin_moe) pl.pin_moe(0);
+        if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+
+        std::vector<uint16_t> got((size_t)(Tr * N));
+        st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+        double worst = 0.0;
+        int64_t bad = 0;
+        std::string first;
+        for (int64_t i = 0; i < Tr; ++i)
+            for (int64_t n = 0; n < N; ++n) {
+                const double want = ref[(size_t)(i * N + n)];
+                const double err = std::fabs((double)h_bf16(got[(size_t)(i * N + n)]) - want);
+                /* moe_w4_gemm's tolerance, written so that a NaN on either side is a miss. */
+                if (!(err <= 0.004 * std::fabs(want) + 1e-4)) {
+                    if (!bad++)
+                        first = ", first at row " + std::to_string(i) + " col " +
+                                std::to_string(n) + ": " +
+                                std::to_string(h_bf16(got[(size_t)(i * N + n)])) + " for " +
+                                std::to_string(want);
+                    if (!(err <= worst)) worst = err;
+                }
+            }
+        ok(label.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
+                                    " elements off, worst " + std::to_string(worst) + first);
+    }
+}
+
 /* THE ARRANGED PLANE, AGAINST THE FORMAT IT STATES, AND BACK.
  *
  * `moe_gemm_w4a8` is the one large weight of a routed model, and what a checker reads it through is
@@ -9728,7 +9989,7 @@ static void device_phase(const Plugin& pl) {
 
     if (sel("moe_gemm_w4a8_mod4")) {
         if (!g_case) std::printf("\nthe 4-bit grouped MoE GEMM over four classes, against its "
-                                 "two-class form\n");
+                                 "two-class form and a host decode\n");
         /* The same shapes, read as four classes: the even table's halves are classes 0 and 2 and
          * the odd one's 1 and 3, so the two-class launch is the reference, byte for byte. */
         static const MoeW4Shape kShapes4[] = {
@@ -9741,8 +10002,22 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {
                 moe_w4_gemm(pl, t, sh, 0, false, true);
                 moe_w4_gemm(pl, t, sh, 2, false, true);
+                moe_w4_gemm(pl, t, sh, 4, false, true);
                 moe_w4_gemm(pl, t, sh, 2, true, true);
             }
+        /* And every class at its own geometry, one of classes 1 to 3 the only wide one. */
+        for (const MoeQ4Shape& sh : kMoeQ4Shapes)
+            for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
+                for (const char* dt : { "w4a8", "w4nl64a8h", "w4nl32a8h", "w5nl64a8h" })
+                    moe_q4_gemm(pl, t, sh, dt);
+    }
+
+    if (sel("moe_gemm_fp8a8_mod4")) {
+        if (!g_case) std::printf("\nthe block-fp8 grouped MoE GEMM over four classes, against a "
+                                 "host decode\n");
+        for (const MoeQ4Shape& sh : kMoeQ4Shapes)
+            for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
+                moe_q4_gemm(pl, t, sh, "fp8a8");
     }
 
     if (sel("hc_read_e4m3")) {

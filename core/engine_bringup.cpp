@@ -15,6 +15,7 @@
 #include "device/directio.h"
 #include "format/radfile.h"
 #include "format/share.h"
+#include "format/table_copy.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
 #include "runtime/arena.h"
@@ -23,6 +24,7 @@
 #include "text/tokenizer.h"
 
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -240,6 +242,261 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
     }
 }
 
+/* ------------------------------------------------------------------ locked host memory */
+/* WHAT EVERYTHING ELSE ON THE HOST STILL NEEDS beside a table locked whole: the process's own
+ * unpooled allocations, the load's staging windows and the page cache the container's hot pages
+ * live in. A copy that spends the last of it trades a faster gather for the kernel reclaiming
+ * the files this engine reads, and then for the OOM killer. */
+static const int64_t kLockMargin = (int64_t)4 << 30;
+
+/* A cgroup limit and what its members use that reclaim cannot give back: memory.current less its
+ * file pages (cgroup v2) or usage_in_bytes less its cache (v1), since page cache yields to a
+ * locked allocation and anonymous memory does not. "max" and v1's near-INT64_MAX sentinel are no
+ * limit. True with `room` set when `dir` holds one. */
+static bool cgroup_room(const std::string& dir, bool v2, int64_t* room) {
+    auto read_ll = [](const std::string& f, long long* v) {
+        std::ifstream in(f);
+        std::string t;
+        if (!(in >> t)) return false;
+        char* e = nullptr;
+        *v = std::strtoll(t.c_str(), &e, 10);
+        return e && *e == '\0';
+    };
+    auto stat_ll = [](const std::string& f, const char* key, long long* v) {
+        std::ifstream in(f);
+        std::string k;
+        long long x = 0;
+        while (in >> k >> x) if (k == key) { *v = x; return true; }
+        return false;
+    };
+    long long lim = 0, used = 0, file = 0;
+    if (v2) {
+        if (!read_ll(dir + "/memory.max", &lim)) return false;           /* "max" fails to parse */
+        if (!read_ll(dir + "/memory.current", &used)) return false;
+        (void)stat_ll(dir + "/memory.stat", "file", &file);
+    } else {
+        if (!read_ll(dir + "/memory.limit_in_bytes", &lim) || lim >= ((long long)1 << 62))
+            return false;
+        if (!read_ll(dir + "/memory.usage_in_bytes", &used)) return false;
+        if (!stat_ll(dir + "/memory.stat", "total_cache", &file))
+            (void)stat_ll(dir + "/memory.stat", "cache", &file);
+    }
+    const long long hard = used > file ? used - file : 0;
+    *room = lim > hard ? (int64_t)(lim - hard) : 0;
+    return true;
+}
+
+/* WHETHER `need` MORE BYTES CAN BE LOCKED IN HOST MEMORY, after `still` more that this process
+ * will allocate before the copy is made, or why not. Each limit is one a copy would otherwise meet
+ * part way through: RLIMIT_MEMLOCK (unless the process holds CAP_IPC_LOCK), the memory the kernel
+ * reports available, and every memory cgroup from the process's own up to the root it can see,
+ * which is the limit Docker's --memory sets and the kernel enforces by killing the process. A
+ * limit that cannot be read is not one; a limit that can is never guessed at. */
+static bool lockable_room(int64_t need, int64_t still, std::string* why) {
+    long long locked_kb = 0;
+    unsigned long long caps = 0;
+    {
+        std::ifstream f("/proc/self/status");
+        std::string line;
+        while (std::getline(f, line)) {
+            (void)std::sscanf(line.c_str(), "VmLck: %lld", &locked_kb);
+            (void)std::sscanf(line.c_str(), "CapEff: %llx", &caps);
+        }
+    }
+    struct rlimit rl {};
+    if (!((caps >> 14) & 1) && ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
+        rl.rlim_cur != RLIM_INFINITY && (int64_t)rl.rlim_cur < locked_kb * 1024 + need) {
+        *why = fmt("RLIMIT_MEMLOCK allows %s locked and the copy locks %s (Docker: --ulimit "
+                   "memlock=-1; systemd: LimitMEMLOCK=infinity)", humanb((int64_t)rl.rlim_cur).c_str(),
+                   humanb(need).c_str());
+        return false;
+    }
+    {
+        std::ifstream f("/proc/meminfo");
+        std::string line;
+        long long kb = -1;
+        while (std::getline(f, line))
+            if (std::sscanf(line.c_str(), "MemAvailable: %lld kB", &kb) == 1) break;
+        if (kb >= 0 && kb * 1024 - still - kLockMargin < need) {
+            *why = fmt("%s of memory is available, %s more is still to be allocated (the pinned "
+                       "host pools and the prefix cache's host tier), and the copy wants %s with %s "
+                       "to spare", humanb(kb * 1024).c_str(), humanb(still).c_str(),
+                       humanb(need).c_str(), humanb(kLockMargin).c_str());
+            return false;
+        }
+    }
+    /* /proc/self/cgroup: "0::/path" on v2, "N:memory:/path" (or a comma list naming memory) on v1.
+     * Each level up to the root of the hierarchy this process can see is a limit of its own. */
+    std::ifstream f("/proc/self/cgroup");
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t a = line.find(':'), b = a == std::string::npos ? a : line.find(':', a + 1);
+        if (b == std::string::npos) continue;
+        const std::string ctrl = line.substr(a + 1, b - a - 1);
+        std::string path = line.substr(b + 1);
+        const bool v2 = ctrl.empty();
+        bool memory = v2;
+        for (size_t i = 0; !memory && i < ctrl.size();) {
+            const size_t j = std::min(ctrl.find(',', i), ctrl.size());
+            memory = ctrl.compare(i, j - i, "memory") == 0;
+            i = j + 1;
+        }
+        if (!memory) continue;
+        const std::string root = v2 ? "/sys/fs/cgroup" : "/sys/fs/cgroup/memory";
+        for (;;) {
+            const std::string dir = root + (path == "/" ? std::string() : path);
+            int64_t room = 0;
+            if (cgroup_room(dir, v2, &room) && room - still - kLockMargin < need) {
+                *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
+                           "and the copy wants %s with %s to spare", dir.c_str(),
+                           humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
+                           humanb(kLockMargin).c_str());
+                return false;
+            }
+            if (path.empty() || path == "/") break;
+            const size_t up = path.find_last_of('/');
+            path = up == 0 || up == std::string::npos ? "/" : path.substr(0, up);
+        }
+    }
+    return true;
+}
+
+/* --ngram-placement ram: the copy is table_copy_make's (core/format/table_copy.h); this keeps one
+ * a container address, shared by every rank, and frees them after the ranks in ~Engine. */
+int Engine::lock_table_copy(const uint8_t* src, int64_t n, int64_t foff, void** out,
+                            std::string* why) {
+    for (const auto& c : table_copy_of_)
+        if (c.first == src) { *out = c.second; return RAD_OK; }
+    const auto t0 = std::chrono::steady_clock::now();
+    TableCopy tc;
+    const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
+    if (rc != RAD_OK) return rc;
+    RAD_INFO("placement: n-gram table copied into locked memory, %s in %.1f s",
+             humanb(n).c_str(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    table_copies_.push_back(tc);
+    table_copy_of_.push_back({ src, tc.base });
+    *out = tc.base;
+    return RAD_OK;
+}
+
+/* WHERE THE TWO LOOKUP TABLES GO (--embedding-placement, --ngram-placement), decided once for every
+ * rank before the card is split, and written into Config for the planner and the load phase.
+ *
+ * THE EMBEDDING: Auto keeps it on the card -- where every other weight a step reads lives --
+ * unless that leaves the split unable to hold the fixed weights, or leaves a derived KV pool
+ * unable to hold one --max-model-len sequence (`kv_floor`); then the pinned host pool takes it if
+ * --host-pool-mib can, the card's lookup reading it over the link in place. Disk is refused: the
+ * lookup writes the activations a card reads, which a host kernel reading the container cannot
+ * reach -- an architecture declares a buffer's domain, and the token embedding's is the device.
+ *
+ * THE N-GRAM TABLE: only a host kernel reads one today, so Vram is refused and the choice is
+ * between a locked copy in RAM and the container. Auto takes RAM when lockable_room says the
+ * memory, the memlock limit and every cgroup allow it after the pools still to be allocated. */
+int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
+                                    const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
+                                    int64_t ngram_bytes, bool ngram_device) {
+    const int64_t MiB = (int64_t)1 << 20;
+    int64_t emb_max = 0;
+    for (int64_t b : emb_bytes) emb_max = std::max(emb_max, b);
+
+    TablePlacement emb = cfg_.embedding_placement;
+    std::string emb_why;
+    if (emb == TablePlacement::Disk) {
+        RAD_ERR("--embedding-placement disk: the token embedding's lookup writes activations the "
+                "card reads, and a host kernel reading the container cannot write them -- the "
+                "architecture declares that buffer on the device. Use vram, ram or auto.");
+        return RAD_E_INVAL;
+    }
+    if (emb_max == 0) {
+        if (emb == TablePlacement::Ram) {
+            RAD_ERR("--embedding-placement ram: this model has no token embedding table that only "
+                    "embed_lookup reads. An output head tied to the table reads it too, and would "
+                    "stream it over the link every step.");
+            return RAD_E_INVAL;
+        }
+        emb = TablePlacement::Vram;
+        emb_why = "no table only embed_lookup reads";
+    } else if (emb == TablePlacement::Auto) {
+        VramBudget tb;
+        const int st = vram_budget_trial(cfg_, facts, &tb);
+        const bool holds = st == RAD_OK && (!tb.derived_kv || tb.kv >= kv_floor);
+        const bool host  = cfg_.host_pool_mib * MiB >= emb_max;
+        if (holds) {
+            emb = TablePlacement::Vram;
+            emb_why = "the card holds it beside the other weights and a KV pool for one "
+                      "--max-model-len sequence";
+        } else if (host) {
+            emb = TablePlacement::Ram;
+            emb_why = st != RAD_OK
+                ? "the card cannot hold the other weights with it, and the pinned host pool can"
+                : fmt("with it on the card the KV pool is %s, short of the %s one --max-model-len "
+                      "sequence needs, and the pinned host pool can hold it",
+                      humanb(tb.kv).c_str(), humanb(kv_floor).c_str());
+        } else {
+            emb = TablePlacement::Vram;
+            emb_why = fmt("the card is short of room for it, and --host-pool-mib %lld cannot hold "
+                          "%s either", (long long)cfg_.host_pool_mib, humanb(emb_max).c_str());
+        }
+    } else {
+        emb_why = "as asked";
+    }
+    cfg_.embedding_resolved = emb;
+
+    TablePlacement ng = cfg_.ngram_placement;
+    std::string ng_why;
+    if (ngram_device) {
+        if (ng == TablePlacement::Ram || ng == TablePlacement::Disk) {
+            RAD_ERR("--ngram-placement %s: a device kernel reads this model's n-gram table, so the "
+                    "placement strategy places it with the other weights; only vram or auto apply",
+                    table_placement_name(ng));
+            return RAD_E_INVAL;
+        }
+        ng = TablePlacement::Vram;
+        ng_why = "a device kernel reads it; placed with the other weights";
+    } else if (ngram_bytes == 0) {
+        if (ng != TablePlacement::Auto)
+            RAD_WARN("--ngram-placement %s: this model has no n-gram table, so there is nothing to "
+                     "place", table_placement_name(ng));
+        ng = TablePlacement::Disk;
+    } else if (ng == TablePlacement::Vram) {
+        RAD_ERR("--ngram-placement vram: no loaded kernel plugin reads an n-gram table on a card "
+                "(embed_lookup_q has host kernels only), so it is read from host memory or the "
+                "container: ram or disk");
+        return RAD_E_INVAL;
+    } else if (ng == TablePlacement::Ram || ng == TablePlacement::Auto) {
+        const int64_t still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
+                              cfg_.prefix_cache_host_mib * MiB;
+        const int64_t need = align_up(ngram_bytes, (int64_t)2 << 20);
+        std::string why;
+        const bool room = lockable_room(need, still, &why);
+        if (ng == TablePlacement::Ram && !room) {
+            RAD_ERR("--ngram-placement ram: the n-gram table (%s) cannot be locked in memory: %s",
+                    humanb(ngram_bytes).c_str(), why.c_str());
+            return RAD_E_NOMEM;
+        }
+        if (ng == TablePlacement::Auto)
+            ng_why = room ? "the memory, the memlock limit and the cgroups allow a locked copy"
+                          : "a locked copy does not fit: " + why;
+        else
+            ng_why = "as asked";
+        ng = room ? TablePlacement::Ram : TablePlacement::Disk;
+    } else {
+        ng_why = "as asked";
+    }
+    cfg_.ngram_resolved = ng;
+
+    if (emb_max > 0)
+        RAD_INFO("placement: token embedding (%s a rank) %s%s: %s", humanb(emb_max).c_str(),
+                 table_placement_name(emb),
+                 cfg_.embedding_placement == TablePlacement::Auto ? " (auto)" : "", emb_why.c_str());
+    if (ngram_bytes > 0 || ngram_device)
+        RAD_INFO("placement: n-gram table (%s) %s%s: %s", humanb(ngram_bytes).c_str(),
+                 table_placement_name(ng),
+                 cfg_.ngram_placement == TablePlacement::Auto ? " (auto)" : "", ng_why.c_str());
+    return RAD_OK;
+}
+
 /* ================================================================== 2. metadata */
 /* The model's metadata ONLY -- architecture id, dimensions, quantisation, vocab. Not the weights:
  * which weights exist is the architecture plugin's answer, not the container's, and reading them
@@ -413,7 +670,6 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* A row at every token of the step and the sampler's row a sequence before them
      * (core/kld.h); the KL mode has no speculation, so a sequence samples one. */
     bc.max_out_rows = cfg_.kld() ? max_tok + cfg_.max_seqs : 0;
-    bc.ngram_table_ram = cfg_.ngram_table_ram ? 1 : 0;
     return bc;
 }
 
@@ -707,6 +963,11 @@ int Engine::plan() {
         std::vector<VramFacts> facts;
         facts.reserve(ranks_.size());
         late_step_bytes_ = late_lazy_bytes_ = 0;
+        /* The placement flags' tables, per rank where they are sharded (the embedding) and once
+         * where they are not (the n-gram table every rank reads from the one mapping). */
+        std::vector<int64_t> emb_bytes;
+        int64_t ngram_bytes = 0, kv_floor = 0;
+        bool ngram_device = false;
         const int64_t ctx = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
@@ -744,9 +1005,23 @@ int Engine::plan() {
              * already this card's even share of the static weights: declare ran once per rank
              * with every dimension divided. */
             WeightFootprint wf;
-            weight_footprint(r->program, &wf, cfg_.host_weights);
+            weight_footprint(r->program, &wf, TablePlacement::Vram);
             f.statics = wf.statics;
             f.experts = wf.experts;
+            emb_bytes.push_back(wf.embedding);
+            ngram_bytes = std::max(ngram_bytes, wf.ngram);
+            ngram_device = ngram_device || wf.ngram_device;
+            /* ONE --max-model-len SEQUENCE'S CACHE: the same groups planned for a single
+             * sequence, which is the least a KV pool can hold and still serve every request the
+             * API accepts (configure_kv warns below it). --embedding-placement auto keeps the
+             * table off the card only to stay above it. */
+            {
+                Config one = cfg_;
+                one.max_seqs = 1;
+                KVManager single;
+                if (single.plan_groups(r->program.kv_groups, one) == RAD_OK)
+                    kv_floor = std::max(kv_floor, single.ceiling(ctx));
+            }
             /* THE STAGING REGION IS SIZED ONLY WHERE THE ARENA LENDS ITS TOP: with no smaller level
              * nothing gives the region back to the slab at decode, and a deterministic plan moves
              * nothing, so neither can stage or recover what a region would cost. */
@@ -793,6 +1068,9 @@ int Engine::plan() {
             late_lazy_bytes_ = std::max(late_lazy_bytes_, lazy);
             facts.push_back(f);
         }
+        RAD_TRY(resolve_table_placement(facts, emb_bytes, kv_floor, ngram_bytes, ngram_device));
+        if (cfg_.embedding_resolved == TablePlacement::Ram)
+            for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= emb_bytes[i];
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
@@ -1812,6 +2090,30 @@ int Engine::load_weights() {
                 }
                 w.ptr = (void*)file_->data(p0);
                 w.host_ptr = w.ptr;
+                /* --ngram-placement ram: the host kernel reads the locked copy instead of the
+                 * mapping. A copy auto chose and could not make leaves the table where it was, and
+                 * says so; one the operator asked for refuses the start. */
+                if (cfg_.ngram_resolved == TablePlacement::Ram &&
+                    is_ngram_table(r->program, (rad_weight)i)) {
+                    void* copy = nullptr;
+                    std::string why;
+                    const int cs = lock_table_copy((const uint8_t*)w.ptr, n, (int64_t)p0.offset,
+                                                   &copy, &why);
+                    if (cs == RAD_OK) {
+                        w.ptr = copy;
+                        w.host_ptr = copy;
+                        r->mover.publish_mapped((rad_weight)i, w.ptr);
+                        continue;   /* reported once, by lock_table_copy, and not as mapped */
+                    }
+                    if (cfg_.ngram_placement == TablePlacement::Ram) {
+                        RAD_ERR("--ngram-placement ram: '%s' could not be copied into locked "
+                                "memory: %s", w.name.c_str(), why.c_str());
+                        return cs;
+                    }
+                    RAD_WARN("--ngram-placement auto: '%s' could not be copied into locked memory "
+                             "(%s); it is read from the container", w.name.c_str(), why.c_str());
+                    cfg_.ngram_resolved = TablePlacement::Disk;
+                }
                 /* NO READAHEAD ON A MAPPED WEIGHT. What reads one is a host kernel gathering rows
                  * out of it, and the only reason a weight is on this tier at all is that it is far
                  * too big to be resident -- so a fault is a real read from the file and the pages

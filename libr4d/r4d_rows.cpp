@@ -2726,11 +2726,13 @@ static const RadConstraint cArHcWrite[] = {
     C_P2P,
 };
 /* The same bounds at four ranks, where the handshake is the wide family's (r4d_ar_wide.h). Exact
- * wire only, and that cannot be a constraint here: the exact op declares no `wire` and an absent
- * key fails a constraint, so the init and the entry refuse wire 6 instead. */
+ * wire only: the four-rank lossy wire is the ti8 two-shot and has no fused form, so a `wire` 6
+ * request is a selection miss here and its caller keeps the unfused pair, where an init refusal
+ * would stop declare. The caller states `wire` 0 on the exact form, because a constraint on an
+ * absent key does not hold; the init and the entry still refuse any other wire. */
 static const RadConstraint cArHcWrite4[] = {
     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
-    C_EQ("world_size", 4),
+    C_EQ("world_size", 4), C_EQ("wire", 0),
     C_P2P,
 };
 /* ar_hc_write's bounds and the gather's: top_k up to the 64 slots a row's table holds in LDS. */
@@ -2739,11 +2741,10 @@ static const RadConstraint cArGatherHcWrite[] = {
     C_EQ("world_size", 2), C_GE("top_k", 1), C_LE("top_k", 64),
     C_P2P,
 };
-/* The same at four ranks, exact wire only for cArHcWrite4's reason: the init and the entry refuse a
- * declared `wire` 6, since the exact op declares no `wire` and an absent key fails a constraint. */
+/* The same at four ranks, exact wire only and constrained so for cArHcWrite4's reason. */
 static const RadConstraint cArGatherHcWrite4[] = {
     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
-    C_EQ("world_size", 4), C_GE("top_k", 1), C_LE("top_k", 64),
+    C_EQ("world_size", 4), C_EQ("wire", 0), C_GE("top_k", 1), C_LE("top_k", 64),
     C_P2P,
 };
 static const RadConstraint cGatedQuantFp8[] = {
@@ -4796,8 +4797,9 @@ static const RadKernelInfo kKernels[] = {
   "h[s] += inj[s] * y over the reduced y",
   "exactly 4 ranks, all peer-accessible; exact wire only; n a multiple of 8 and y unpitched, "
   "because y is the message and a block pushes it as 16B words; the stream pitch a multiple of 8; "
-  "hc 2..8; the wide one-shot's handshake, slots and block partition, on the plain four-rank "
-  "all-reduce's instance; cudagraph-safe",
+  "hc 2..8; the wide one-shot's handshake, slots and block partition, on an instance keyed by "
+  "its own M bound -- the wide family's flag/seq/slot discipline is what lets it share a stream, "
+  "or an instance where the keys agree, with the plain all-reduce; cudagraph-safe",
   "bf16 throughout; the sum in fp32 in ascending rank order and rounded to bf16 exactly as the "
   "four-rank exact all-reduce stores it, and the write in hc_write's arithmetic over that bf16 "
   "value -- byte-identical to the pair it replaces",
@@ -4829,10 +4831,10 @@ static const RadKernelInfo kKernels[] = {
   "reduces and writes exactly as ar_hc_write_4rank does",
   "exactly 4 ranks, all peer-accessible; exact wire only; n a multiple of 8, y unpitched and "
   "y_expert's pitch a multiple of 8, because both move as 16B words; top_k <= 64; the stream "
-  "pitch a multiple of 8; hc 2..8; the wide one-shot's handshake and slots on the plain four-rank "
-  "all-reduce's instance; the grid widened until a block's slot table fits in LDS, or the "
-  "inverse table in the scratch where that would take more blocks than the reduction asks for; "
-  "cudagraph-safe",
+  "pitch a multiple of 8; hc 2..8; the wide one-shot's handshake and slots, on an instance keyed "
+  "by its own M bound as ar_hc_write_4rank's is; the grid widened until a block's slot table fits "
+  "in LDS, or the inverse table in the scratch where that would take more blocks than the "
+  "reduction asks for; cudagraph-safe",
   "bf16 throughout; the gather's sums and narrows are moe_gather's (round-to-nearest-even, the "
   "shared arm's product rounded before the add), the sum in fp32 in ascending rank order and "
   "rounded to bf16 exactly as the four-rank exact all-reduce stores it, and the write in "

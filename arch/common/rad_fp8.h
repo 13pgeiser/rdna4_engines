@@ -324,33 +324,53 @@ inline bool ar_fused_ok(const Geom& g, int64_t T) {
     return ar_wire_is_exact(g, T) || (g.n_embd % kArWire6Chunk) == 0;
 }
 
+/* THE FOUR-RANK LOSSY WIRE'S TILE: tiered int8 in groups of 32, and a group may not straddle one
+ * of the four shards, so a message whose element count is not a multiple of 128 goes out exact.
+ * Stated here for the reason the rotation's group of 64 is stated in ar_wire_is_exact: the
+ * architecture has to decide, identically on every rank, which wire a step's message takes. */
+static const int64_t kArWideWireTile = 128;
+
+/* THE MOST ROWS A DECODE OR SPECULATIVE-VERIFY STEP CARRIES: one a sequence, and 1 + max_spec a
+ * sequence at a verify (max_spec is 0 with speculation off), never more than max_tok. It is a fact
+ * about this engine's own steps, which is why the architecture holds it. The four-rank fused write
+ * and its gather are declared over M up to this, and ar_wide_write_exact takes no step above it, so
+ * a step sent to them is always inside the range they were resolved for. */
+inline int64_t ar_wide_write_rows(const Geom& g) {
+    const int64_t r = g.max_seqs * (1 + (g.max_spec > 0 ? g.max_spec : 0));
+    return r < g.max_tok ? r : g.max_tok;
+}
+
+/* THE ROWS THE EXACT FUSED WRITE IS DECLARED FOR: every step at two ranks, the decode and verify
+ * steps at four (ar_wide_write_rows), and none at any other width. */
+inline int64_t ar_exact_write_rows(const Geom& g) {
+    if (g.world == 2) return g.max_tok;
+    if (g.world == 4) return ar_wide_write_rows(g);
+    return 0;
+}
+
 /* THE FOUR-RANK FUSED WRITE'S STEPS. At four ranks ar_hc_write exists on the exact wire only, and
- * it is the exact ONE-SHOT with the write behind it -- so it may take a message only where the
- * standalone `all_reduce` would have sent that message exact and as a one-shot:
+ * it is the exact ONE-SHOT with the write behind it. A step takes it where both of these hold:
  *
- *   exact     --tp-wire exact, or a message the four-rank lossy row serves exactly itself: its
- *             tiered-int8 groups of 32 must tile each of the four shards (numel % 128), and below
- *             `min_bytes` it hands the message to the exact entry. ar_wire_is_exact's three facts,
- *             with that wire's tile.
- *   one-shot  under 1 MiB. From there libr4d's exact entry runs the two-shot instead
- *             (R4D_AR_EXACT_TWOSHOT_MIN_BYTES, r4d_ar_entry.hip), which moves half the bytes, so
- *             the pair stays. Either way the bytes are the same; this bound is a cost, not a
- *             correctness line.
+ *   rows      T is at most ar_wide_write_rows. The fused kernel is a one-shot, and the messages a
+ *             one-shot is for are the decode and verify steps'. A larger step -- a prefill chunk --
+ *             keeps the pair, and there the standalone `all_reduce`'s own size bands choose the
+ *             one-shot or the two-shot: where that choice falls is the kernel library's to say,
+ *             so the architecture holds no copy of it. The fused one-shot serves any message it was
+ *             declared for with the same bytes, so this bound is a cost, not a correctness line.
+ *   exact     --tp-wire exact, or a message the four-rank lossy row serves exactly itself: one
+ *             kArWideWireTile does not tile, or one under `min_bytes`, both of which that row hands
+ *             to the exact sum. ar_wire_is_exact's three facts, with that wire's tile.
  *
  * ar_wire_is_exact itself stays false off two ranks: the embedding's collective asks it whether
- * layer 0's fused norm absorbs that reduction, and at four no norm does. Both ranks evaluate this
- * on the same T, so neither can take a different branch. */
-static const int64_t kArWideWireTile     = 128;
-static const int64_t kArWideOneshotBytes = 1024 * 1024;
-
+ * layer 0's fused norm absorbs that reduction, and at four no norm does. Every rank evaluates this
+ * on the same T, so none can take a different branch. */
 inline bool ar_wide_write_exact(const Geom& g, int64_t T) {
-    if (g.world != 4) return false;
+    if (g.world != 4 || T < 1 || T > ar_wide_write_rows(g)) return false;
     const int64_t numel = T * g.n_embd;
-    const int64_t bytes = numel * 2;                      /* bf16 on the wire */
-    if (numel <= 0 || bytes >= kArWideOneshotBytes) return false;
+    if (numel <= 0) return false;
     if (g.wire_exact) return true;
     if (numel % kArWideWireTile) return true;
-    return bytes < g.wire_min_bytes;
+    return numel * 2 < g.wire_min_bytes;   /* bf16 on the wire */
 }
 
 /* WHETHER A GATED RESIDUAL'S EXACT FUSED WRITE TAKES THE ALL-REDUCE AT T ROWS: at two ranks on every
@@ -367,7 +387,7 @@ inline bool ar_exact_write_takes(const Geom& g, int64_t T) {
  *                (ar_fused_ok);
  *   kArOutExact  a gated residual's write with the exact fused form only, so a message that would
  *                go out compressed stays with the block (ar_exact_write_takes -- at four ranks
- *                also one the standalone row would send as a two-shot);
+ *                also one of a step larger than a decode or verify step);
  *   kArOutBoth   a gated residual's write with a fused form on each wire, which takes every
  *                message (HyperConn::ar_take). */
 enum ArOut : int {
@@ -390,7 +410,8 @@ inline bool ar_taken(const Geom& g, int64_t T, bool out, int take) {
  * wire, 0 where it was not: at most the tokens one MoE pass carries, so a step it serves is one
  * pass whose gather is the whole step's. The wire the step's message goes out on picks the bound:
  * the exact one wherever the exact fused write takes the step (ar_exact_write_takes -- at two
- * ranks ar_wire_is_exact itself, at four the exact one-shot's steps, where `rows6` is always 0).
+ * ranks ar_wire_is_exact itself, at four the decode and verify steps on the exact wire, where
+ * `rows6` is always 0).
  * The block that would issue the gather and the write that would absorb it ask this of the same T
  * and the same bounds, so neither can skip it while the other issues it. */
 inline bool gather_taken(const Geom& g, int64_t T, int64_t rows, int64_t rows6) {

@@ -324,21 +324,27 @@ TEST(the_kv_cache_dtype_is_one_of_two_names) {
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
 }
 
-TEST(the_ngram_table_is_on_disk_or_in_ram) {
+/* THE TWO TABLE PLACEMENTS take the same four names and nothing else, default to auto, and leave
+ * the resolved values to Engine::plan: a parse never decides a tier. Where each table may go is
+ * the engine's to refuse, with the model in hand -- not the parser's. */
+TEST(the_table_placements_are_auto_vram_ram_or_disk) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
-    CHECK(!d.ngram_table_ram);
+    CHECK(d.embedding_placement == TablePlacement::Auto);
+    CHECK(d.ngram_placement == TablePlacement::Auto);
     Config c;
-    CHECK_EQ(parse({ "--ngram-table", "ram" }, &c), RAD_OK);
-    CHECK(c.ngram_table_ram);
-    CHECK_EQ(parse({ "--ngram-table", "disk" }, &c), RAD_OK);
-    CHECK(!c.ngram_table_ram);
-    /* 47.7 GiB of locked memory is the operator's to give, so a name this build does not know
-     * stops the server rather than picking either side. */
-    CHECK_EQ(parse({ "--ngram-table", "memory" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--ngram-table", "RAM" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--ngram-table", "" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--ngram-table" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--embedding-placement", "ram", "--ngram-placement", "disk" }, &c), RAD_OK);
+    CHECK(c.embedding_placement == TablePlacement::Ram);
+    CHECK(c.ngram_placement == TablePlacement::Disk);
+    CHECK_EQ(parse({ "--embedding-placement", "vram", "--ngram-placement", "auto" }, &c), RAD_OK);
+    CHECK(c.embedding_placement == TablePlacement::Vram);
+    CHECK(c.ngram_placement == TablePlacement::Auto);
+    CHECK(c.embedding_resolved == TablePlacement::Vram);     /* untouched until plan */
+    for (const char* bad : { "RAM", "memory", "host", "" }) {
+        CHECK_EQ(parse({ "--embedding-placement", bad }, &c), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
+    }
+    CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
 }
 
 /* THE FLAG THAT DECIDES WHETHER MULTI-TURN WORKS. It is the WEIGHTS share, strictly inside
@@ -814,7 +820,8 @@ TEST(usage_names_every_flag_it_documents) {
     CHECK(text.find("--checkpoint-policy") != std::string::npos);
     CHECK(text.find("--prefix-cache-host-mib") != std::string::npos);
     CHECK(text.find("--tp-wire") != std::string::npos);
-    CHECK(text.find("--ngram-table") != std::string::npos);
+    CHECK(text.find("--embedding-placement") != std::string::npos);
+    CHECK(text.find("--ngram-placement") != std::string::npos);
     CHECK(text.find("--kld-record") != std::string::npos);
     CHECK(text.find("--kld-ref") != std::string::npos);
     for (const char* f : { "--default-max-tokens", "--max-tokens-cap", "--presence-penalty",

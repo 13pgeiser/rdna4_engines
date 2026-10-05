@@ -8,6 +8,7 @@
  */
 #include "rad_test.h"
 #include "format/radfile.h"
+#include "format/table_copy.h"
 #include "format/tunecache.h"
 #include "format/imatrix.h"
 #include "format/safetensors.h"
@@ -424,6 +425,59 @@ TEST(fixed_stride_expert_addressing) {
 
     f.close();
     ::unlink(b.path.c_str());
+}
+
+/* --ngram-placement ram: A TABLE COPIED OUT OF THE CONTAINER INTO LOCKED MEMORY is the mapping's
+ * bytes, every one of them, at an address no file backs; and a copy read from the wrong file offset
+ * is refused by the check against the mapping rather than handed out. Small enough to lock under a
+ * default RLIMIT_MEMLOCK, and an odd size so the copy's 2 MiB rounding is exercised. */
+TEST(a_table_copied_into_locked_memory_is_the_mapping_byte_for_byte) {
+    const std::string p = tmp_path("tcopy");
+    RadWriter w;
+    REQUIRE(w.begin(p.c_str()) >= 0);
+    w.set_arch("radtest");
+    const RadWriter::Weight x = mkw("ngram.weight", plain_bf16(), 1500, 999, -1, -1, 0);
+    const Planes want = planes_of(x, 5);
+    REQUIRE(w.add_weight(x, want.ptr.data()) >= 0);
+    /* A weight after it, so a read shifted past the table's end is still inside the file. */
+    const RadWriter::Weight y = mkw("tail.weight", plain_bf16(), 64, 64, -1, -1, 0);
+    const Planes ywant = planes_of(y, 6);
+    REQUIRE(w.add_weight(y, ywant.ptr.data()) >= 0);
+    REQUIRE(w.finish() >= 0);
+
+    RadFile f;
+    REQUIRE(f.open(p.c_str()) >= 0);
+    const RadFileEntry* e = f.find("ngram.weight");
+    REQUIRE(e != nullptr);
+    const RadFilePlane& pl = f.plane(*e, 0);
+    const uint8_t* src = f.data(pl);
+    const int64_t n = (int64_t)pl.bytes;
+    CHECK_EQ(n, (int64_t)1500 * 999 * 2);
+
+    TableCopy c;
+    std::string why;
+    const int rc = table_copy_make(f, src, n, (int64_t)pl.offset, &c, &why);
+    if (rc == RAD_E_NOMEM && why.find("mlock2") != std::string::npos) {
+        std::fprintf(stderr, "  SKIP %s: %s\n", ::radtest::current(), why.c_str());
+    } else {
+        CHECK_OK(rc);
+        CHECK(c.base != nullptr && c.base != (const void*)src);
+        CHECK_EQ(c.bytes % ((size_t)2 << 20), (size_t)0);
+        CHECK(c.bytes >= (size_t)n);
+        if (c.base) CHECK(std::memcmp(c.base, src, (size_t)n) == 0);
+        table_copy_free(&c);
+        CHECK(c.base == nullptr);
+
+        /* A sixteen-byte shift in the file offset reads real bytes from the wrong place. */
+        TableCopy bad;
+        std::string bwhy;
+        CHECK_EQ(table_copy_make(f, src, n, (int64_t)pl.offset + 16, &bad, &bwhy), (int)RAD_E_IO);
+        CHECK(bad.base == nullptr);
+        CHECK(bwhy.find("does not match") != std::string::npos);
+    }
+    table_copy_free(&c);                  /* a copy never made, or freed already: a no-op */
+    f.close();
+    ::unlink(p.c_str());
 }
 
 /* ------------------------------------------------------------------ reserving and writing */

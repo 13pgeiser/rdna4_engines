@@ -67,6 +67,21 @@ inline bool r4d_pack_one(RadLaunchDesc& d, size_t& off, int& i, const T& v) {
     return true;
 }
 
+/* A kernel's parameter list as r4d_pack_one lays it out -- each value at its own alignment, in
+ * declaration order -- so that a kernel whose list runs close to RAD_KPARAM_BLOB or
+ * RAD_MAX_KPARAMS can assert at compile time that it fits, rather than meet RAD_E_FULL at its
+ * first launch. `F` is the kernel's function type: `decltype(kernel)`, or for a template
+ * `decltype(kernel<args>)`. */
+template <class F> struct R4dParams;
+template <class... P> struct R4dParams<void(P...)> {
+    static constexpr size_t count = sizeof...(P);
+    static constexpr size_t bytes() {
+        size_t off = 0;
+        ((off = ((off + alignof(P) - 1) & ~(size_t)(alignof(P) - 1)) + sizeof(P)), ...);
+        return off;
+    }
+};
+
 /* THE ONE EMIT, AND IT TAKES THE KERNEL TYPED.
  *
  * `hipLaunchKernelGGL` type-checks its arguments against the kernel's signature and CONVERTS them

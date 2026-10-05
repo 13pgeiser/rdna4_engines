@@ -103,6 +103,19 @@ static const RadOperandSpec kOpdNorm[] = {
 static const RadOperandSpec kOpdAttn[] = {
     { "q", RAD_OPD_IN, 0 }, { "kv_cache", RAD_OPD_INOUT, 0 }, { "out", RAD_OPD_OUT, 0 },
 };
+/* A grouped GEMM's operand list in miniature: one fixed weight, then four classes of experts as
+ * table pairs -- codes, then scales -- with an activation operand between the first pair and the
+ * rest, the way `moe_gemm_q_mod4` lays its classes out. It is here for the declaration's division
+ * of one weight list over several table positions (tests/build_test.cpp). */
+static const RadOperandSpec kOpdMoe[] = {
+    { "a", RAD_OPD_IN, 0 },       { "g", RAD_OPD_WEIGHT, 0 },
+    { "w", RAD_OPD_WTAB, 0 },     { "w_scale", RAD_OPD_WTAB, 0 },
+    { "sorted", RAD_OPD_IN, 0 },
+    { "w_1", RAD_OPD_WTAB, 0 },   { "w_1_scale", RAD_OPD_WTAB, 0 },
+    { "w_2", RAD_OPD_WTAB, 0 },   { "w_2_scale", RAD_OPD_WTAB, 0 },
+    { "w_3", RAD_OPD_WTAB, 0 },   { "w_3_scale", RAD_OPD_WTAB, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
 
 /* ------------------------------------------------------------------ schemas */
 static const RadParamSpec kPGemm[] = {
@@ -206,6 +219,8 @@ static const RadOpSchema kSchemas[] = {
       "a peer kernel with a fallback beneath it" },
     { "t_peer_only", kPTie, NELEM(kPTie), kOpdNorm, NELEM(kOpdNorm),
       "a peer kernel and nothing else" },
+    { "t_moe", kPTie, NELEM(kPTie), kOpdMoe, NELEM(kOpdMoe),
+      "one weight list over eight table operands" },
 };
 
 static const RadKernelInfo kKernels[] = {
@@ -298,6 +313,10 @@ static const RadKernelInfo kKernels[] = {
       .domain = RAD_DOMAIN_DEVICE, .priority = 10,
       .constraints = kCEqM32, .n_constraints = NELEM(kCEqM32),
       .init = t_init_fails, .launch = t_launch },
+
+    { .name = "t_moe_any", .op = "t_moe", .family = "moe",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "any",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 10, .launch = t_launch },
 };
 
 /* The name is a -D so that two of these can load side by side, and one of them can declare itself

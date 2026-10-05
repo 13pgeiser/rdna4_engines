@@ -483,9 +483,12 @@ bool Ctx::oracle_unrelayout(rad_op h, const IssuePlan& hip, const IssuePlan& dip
         }
         RadOpdDesc d{};
         if (shape(dip.args.p, dip.args.n_p, i, &d) != RAD_OK || d.rank == 0) {
+            /* A shape hook declines without a reason (RadShapeFn), so the geometry it declined is
+             * printed, the dtype with it -- a description refuses a dtype it knows no grid for. */
             RAD_WARN("oracle #%lld op '%s': NOT CHECKED. nothing could describe the logical form "
-                     "of '%s' at this geometry, so there is nothing to invert its layout into.",
-                     (long long)seq, oi.op.c_str(), w.name.c_str());
+                     "of '%s' at this geometry {%s}, so there is nothing to invert its layout "
+                     "into.", (long long)seq, oi.op.c_str(), w.name.c_str(),
+                     oi.base.str().c_str());
             return false;
         }
         RadTensor lg{};

@@ -115,10 +115,10 @@ __global__ void r4d_ar_oneshot_wide_exact_kernel(
 
 // THE SAME ONE-SHOT WITH THE GATED RESIDUAL'S WRITE AS ITS EPILOGUE, bf16 only. `y` is the
 // message and is reduced IN PLACE; everything up to the reduce is the kernel above, step for step,
-// because both run on one instance's buffers in one stream: the same seq take, the same handshake
-// value 2*s, the same (parity, source) slots and the same block partition of the word space. The
-// reduce is the same ar_vsum, so the stored word is the plain all-reduce's to the bit; then
-// h[r][c*n + i] += inj[r][c] * y[r][i] in hc_write's arithmetic over that bf16 word
+// because the two may run on one instance's buffers in one stream: the same seq take, the same
+// handshake value 2*s, the same (parity, source) slots and the same block partition of the word
+// space. The reduce is the same ar_vsum, so the stored word is the plain all-reduce's to the bit;
+// then h[r][c*n + i] += inj[r][c] * y[r][i] in hc_write's arithmetic over that bf16 word
 // (r4d_ar_hc_write_word, as the two-rank r4d_ar_hc_write_kernel).
 //
 // In place is safe: a thread reads every source of word k before it stores word k, its own block

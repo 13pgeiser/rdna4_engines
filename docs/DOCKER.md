@@ -88,13 +88,12 @@ Every one of these options is needed:
   without this the model cannot serve. The profile also refuses the NUMA binding calls the ROCm
   runtime makes for host memory.
 - **`--init`**: the engine is not PID 1. It finishes its step and releases the cards on SIGTERM.
+- **`--ulimit memlock=-1`**: `--ngram-placement ram` locks a copy of the n-gram table in RAM
+  (47.7 GiB for Qwen3.8-Flash-Next), far past Docker's default memlock limit. Without it `auto`
+  reads the table from the container and `ram` refuses the start. `deploy/compose/common.yaml`
+  sets it.
 - **`--network host`**: the server binds the host's addresses directly, IPv4 and IPv6, with no
   NAT in front of it.
-
-And one more for `--ngram-table ram`: **`--ulimit memlock=-1`**. The copy of the n-gram table is
-locked in RAM, and Docker's default memlock limit is far below its 47.7 GiB; without it the server
-says so at the first request and reads the table from the container as it does by default.
-`deploy/compose/common.yaml` sets it.
 
 The image sets `GPU_MAX_ALLOC_PERCENT=100` and `GPU_MAX_HEAP_SIZE=100`. The HIP runtime's defaults
 cap one allocation, and the heap, below what the placement plan hands out.

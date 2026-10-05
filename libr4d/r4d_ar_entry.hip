@@ -405,11 +405,14 @@ extern "C" int r4d_rad_ar_ln_init(const RadParam* p, int n_p, int rank, int worl
     return ar_mn_acquire(p, n_p, rank, world, out);
 }
 
-/* The four-rank ar_hc_write. Its key is the one the plain all_reduce at the same call site builds
- * -- {rank, 4, bf16, M_hi * n}, and the blocks declare that all_reduce's numel up to max_tok * n --
- * so the fused write and the standalone collective it stands in for run on the SAME scratch, flags
- * and counters, and a step that takes either one keeps a single launch sequence on that set.
- * Exact wire only: a declared `wire` 6 is refused here, at declare, rather than at the first step. */
+/* The four-rank ar_hc_write and ar_gather_hc_write. The key is the family's -- {rank, 4, bf16,
+ * M_hi * n} -- so the instance is sized for the most rows the op was declared for, and it is the
+ * same instance as a standalone all_reduce band's only where the two bounds agree. Either way is
+ * safe on one stream: every wide kernel takes its flag value from the instance's seq counters,
+ * advances them once per all-reduce and writes only the (parity, source) slot that value names
+ * (r4d_ar_wide.h), so ops sharing an instance interleave in any order every rank issues them in,
+ * and ops on separate instances touch nothing of each other's. Exact wire only: the rows constrain
+ * `wire` to 0, and a `wire` 6 that reaches this init anyway is refused. */
 extern "C" int r4d_rad_ar_hc_wide_init(const RadParam* p, int n_p, int rank, int world,
                                        void** out) {
     if (!out) return RAD_E_INVAL;
@@ -1226,9 +1229,10 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
     return rc == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
-/* AT FOUR RANKS, EXACT WIRE ONLY: r4d_rad_ar_hc_write_4rank with the gather in front, on the same
- * instance (r4d_rad_ar_hc_wide_init). The architecture issues it only on a step whose write takes
- * the exact one-shot (ar_exact_write_takes, arch/common/rad_fp8.h) and whose gather is one pass's.
+/* AT FOUR RANKS, EXACT WIRE ONLY: r4d_rad_ar_hc_write_4rank with the gather in front, on an
+ * instance from the same init (r4d_rad_ar_hc_wide_init). The architecture issues it only on a step
+ * whose write takes the exact fused form (ar_exact_write_takes, arch/common/rad_fp8.h) and whose
+ * gather is one pass's.
  * The block count is that write's rule, widened by the launcher until a block's slot table fits in
  * LDS -- or, where that would take more blocks than the rule asks for and the scratch is there,
  * kept and served from the inverse table, as at two ranks. */
@@ -1350,15 +1354,16 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
 }
 
 /* AT FOUR RANKS, EXACT WIRE ONLY: the wide one-shot with the write as its epilogue. The four-rank
- * lossy wire is the ti8 two-shot and has no fused form, so a `wire` 6 is refused (init already
- * refuses to build it). The architecture issues this only for a message the standalone row would
- * have served with the exact one-shot (ar_wide_write_exact, arch/common/rad_fp8.h); larger exact
- * messages are still served correctly here, as a one-shot, which the standalone entry would have
- * replaced by the two-shot above R4D_AR_EXACT_TWOSHOT_MIN_BYTES -- same bytes, more traffic.
+ * lossy wire is the ti8 two-shot and has no fused form: the row constrains `wire` to 0, and a
+ * `wire` 6 that reaches this entry anyway is refused. Every message up to the instance's bound is
+ * served correctly here as a one-shot. Which steps take it is the caller's choice -- the
+ * architecture issues it on decode and verify steps (ar_wide_write_exact, arch/common/rad_fp8.h) --
+ * and a message the standalone all_reduce's bands would have sent as a two-shot costs more traffic
+ * here for the same bytes.
  *
  * The block count is the plain one-shot's rule (ar_setup's nb_for over the whole message under
  * nb_cap); a block's words, flags and slot are the one-shot's, which is what lets the two share an
- * instance. */
+ * instance where their keys agree. */
 extern "C" int r4d_rad_ar_hc_write_4rank(const RadArgs* a, RadStream s) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;

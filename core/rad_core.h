@@ -113,6 +113,20 @@ struct Band {
  * planner assigns this tier where, and only where, no device kernel for the op exists at all
  * (embed_lookup_q, libavx/avx_ngram.cpp, is the one such op in this tree). */
 enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 4 };
+
+/* WHERE A LOOKUP TABLE LIVES: the token embedding (--embedding-placement) and an n-gram embedding
+ * (--ngram-placement), each a model-level weight that only a row lookup reads, so a step touches M
+ * of its rows and never the whole table. That is what makes every tier below the card usable for
+ * it, and why the operator gets to choose.
+ *
+ *   Vram   resident on the card, a weight like any other.
+ *   Ram    in host memory the card or a host kernel reads in place: the embedding in the pinned
+ *          host pool, read over the link; an n-gram table as a locked copy made at load.
+ *   Disk   read from the container on demand.
+ *   Auto   the fastest of the three that has room once every other weight is placed; Engine::plan
+ *          decides it and writes the answer into Config, so every rank plans from one choice. */
+enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
+const char* table_placement_name(TablePlacement p);
 enum class Site { Device = 0, DeviceStaged = 1, DeviceZeroCopy = 2, Host = 3 };
 
 /* Tier-indexed arrays are sized by this rather than by a literal: the report, the live view and
@@ -614,21 +628,14 @@ struct Config {
      * is a server that is correct and several orders of magnitude slow. The tier needs no directory
      * of its own; the container is the file. */
     bool    weights_disk_tier = false;
-    /* --ngram-table disk|ram: where the host gather of a table too large for any card -- the n-gram
-     * embedding, 47.7 GiB in Qwen3.8-Flash-Next -- reads its rows. disk, the default, reads them
-     * from the container through a row cache and holds no more of the table than that. ram copies
-     * the table once into locked host memory, in the background from the first request, and reads
-     * the copy: a faster prefill and a few percent of throughput, for the table's size in RAM. A
-     * process that cannot lock that much says so and stays on disk. A deployment choice and not a
-     * tuning one, because only the operator knows what else the host's memory is for. */
-    bool    ngram_table_ram = false;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
-    /* MODEL-LEVEL WEIGHTS KEPT IN THE PINNED HOST POOL by name, comma-separated (a trailing '*'
-     * matches a prefix). The device kernel reads them over the link in place (DeviceZeroCopy), so
-     * this is for a gather -- the embedding table, of which a step reads a few rows -- and not for
-     * a GEMM operand. Charged to --host-pool-mib; every strategy leaves them where they are. */
-    std::vector<std::string> host_weights;
+    /* --embedding-placement and --ngram-placement, as asked (TablePlacement says what each tier
+     * is), and what Engine::plan resolved them to before any rank planned: never Auto. */
+    TablePlacement embedding_placement = TablePlacement::Auto;
+    TablePlacement ngram_placement     = TablePlacement::Auto;
+    TablePlacement embedding_resolved  = TablePlacement::Vram;
+    TablePlacement ngram_resolved      = TablePlacement::Disk;
     bool    deterministic = false;
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
     /* HOW MANY LINEAR-STATE SNAPSHOTS THE SERVER MAY HOLD AT ONCE -- a CAP and not a charge.

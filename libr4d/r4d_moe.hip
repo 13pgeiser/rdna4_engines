@@ -839,10 +839,14 @@ struct MoeCls {
  *
  * FOUR CLASSES AND THE TABLE MUST FIT RAD_KPARAM_BLOB (256 bytes) BESIDE EVERYTHING ELSE, because
  * a kernel's arguments are packed into one descriptor whether it is launched or described: four
- * classes at 40 bytes, the five operand pointers and the map, eight words and this. That is why a
- * class carries 32-bit entry strides and no table of its own, and why `mode` packs three small
- * values into one word. */
+ * classes at 40 bytes, the five operand pointers and the map, eight words and this -- 160 + 48 +
+ * 32 + 16, exactly 256, with no padding since a class is 8-aligned. That is why a class carries
+ * 32-bit entry strides and no table of its own, and why `mode` packs three small values into one
+ * word. The sizes are asserted here and the whole list after the kernel. */
 struct MoeTab { uint32_t v[4]; };
+static_assert(sizeof(MoeCls) == 40 && alignof(MoeCls) == 8,
+              "a class is two pointers and six words: the kernel's argument budget counts 40");
+static_assert(sizeof(MoeTab) == 16, "the code table is four words");
 
 /* W4 IS THE WEIGHT'S FORM: 0 block E4M3, 1 four-bit with one bf16 scale a (row, 128 of K), 2 the
  * same codes with one E4M3 scale a (row, 64 of K) times the fixed kW4G64Scale (w4nl64a8h), 3 the
@@ -1321,6 +1325,13 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         if (ES) break;                     /* one run a block, and it is done */
     }
 }
+/* The whole argument list against the descriptor (see MoeTab): every instantiation takes the same
+ * parameters, so the decode form stands for all of them. */
+using MoeQArgs = R4dParams<decltype(moe_gemm_q_kernel<1, 4, 1, 4, 0, true>)>;
+static_assert(MoeQArgs::bytes() <= RAD_KPARAM_BLOB,
+              "moe_gemm_q_kernel's arguments overflow RAD_KPARAM_BLOB");
+static_assert(MoeQArgs::count <= RAD_MAX_KPARAMS,
+              "moe_gemm_q_kernel has more arguments than RAD_MAX_KPARAMS");
 
 /* ================================================================== moe_gemm, bf16
  *

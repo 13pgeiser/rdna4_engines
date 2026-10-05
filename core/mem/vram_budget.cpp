@@ -33,7 +33,10 @@ static double paged_share(const VramBudget& b) {
     return ctx > 0 ? std::max(0.0, (double)(b.kv - b.kv_fixed)) / ctx : 0.0;
 }
 
-int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out) {
+/* The resolver, with its three log lines behind `log`: vram_budget_trial asks the same question
+ * of a configuration it may not use, and a refusal printed for a split nobody takes reads as the
+ * startup failing. */
+static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out, bool log) {
     VramBudget b;
     if (per_rank.empty()) { if (out) *out = b; return RAD_OK; }
 
@@ -115,7 +118,7 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
             want_kv ? "" : fmt("  --vram-kv-mib      %10s   (stated)\n",
                                humanb(cfg.vram_kv_mib * kMiB).c_str()).c_str(),
             humanb(-b.claimable).c_str());
-        RAD_ERR("%s", b.report.c_str());
+        if (log) RAD_ERR("%s", b.report.c_str());
         if (out) *out = b;
         return RAD_E_NOMEM;
     }
@@ -134,7 +137,7 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
             /* Not fatal: the planner will demote what does not fit and the model still serves,
              * badly. Name it, because "why is this model 8x slower than it should be" has no other
              * answer at startup. */
-            RAD_WARN("the static (non-expert) weights alone want %s of the %s this card has to "
+            if (log) RAD_WARN("the static (non-expert) weights alone want %s of the %s this card has to "
                      "give. Every expert will stream from host memory and the KV cache has "
                      "nothing left -- this model wants more VRAM, fewer ranks of it, or a smaller "
                      "--max-num-batched-tokens.",
@@ -234,7 +237,7 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
      * because it is a real limit rather than a ratio, is that ONE max-length sequence fits: a
      * context no single request can complete is a configuration error however much slack the pool
      * has (core/engine_bringup.cpp, configure_kv). */
-    if (b.derived_kv && b.kv_ceiling > 0 && cfg.max_ctx > 0)
+    if (log && b.derived_kv && b.kv_ceiling > 0 && cfg.max_ctx > 0)
         RAD_INFO("kv: the pool backs %.0f%% of the worst case (%lld sequences all at %lld tokens), "
                  "%.1f full-length sessions. That is concurrency at length before the scheduler "
                  "preempts, not a bound on any one request. WITH PREFIX CACHING a finished "
@@ -349,6 +352,15 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
 
     if (out) *out = b;
     return RAD_OK;
+}
+
+int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out) {
+    return resolve(cfg, per_rank, out, true);
+}
+
+int vram_budget_trial(const Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out) {
+    Config c = cfg;
+    return resolve(c, per_rank, out, false);
 }
 
 }  /* namespace rad */

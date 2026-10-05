@@ -468,22 +468,46 @@ Related flags:
 --gpu-headroom-mib 96      # VRAM left unclaimed on every card
 --kv-cache-dtype fp8       # halve what a token of context costs (a real quantisation)
 --host-pool-mib 8192       # pinned host tier for weights
---host-weights token_embd.weight   # the embedding table off the card (below)
+--embedding-placement ram   # the token embedding off the card (below)
+--ngram-placement ram       # an n-gram table in locked RAM instead of read from disk (below)
 --weights-disk-tier       # stream what fits neither from the container; needs O_DIRECT
 ```
 
-**`--host-weights` takes the embedding table off the card.** It is the largest model-level weight a
-dense model has -- 248320 x 5120 in bf16 is 1.18 GiB a card at `--tp 2` -- and a step reads only its
-rows: M of them, a few KiB at decode. Named here, it is placed in the pinned host pool before any
-strategy runs and the lookup kernel reads it over the link in place, so it costs no VRAM and the
-KV pool gets its share. On Qwen3.8-27B at two 16 GiB cards decode and prefill measured within noise
-of the table on the card, against ~73K more tokens of context. The pool must hold it
-(`--host-pool-mib`, every rank its own shard), a derived split leaves it out of the weight budget,
-and a name any other op reads -- a head, a GEMM operand -- is refused: it would stream every step.
+**Two lookup tables have a placement of their own**, because a step reads only M of their rows and
+never the whole table, so a tier below the card serves them at little or no cost:
+
+| | `vram` | `ram` | `disk` |
+|---|---|---|---|
+| `--embedding-placement` | on the card, with the other weights | the pinned host pool, read over the link in place | refused |
+| `--ngram-placement` | refused | a locked copy in RAM, made at load | read from the container through a row cache |
+
+Both default to `auto`, the fastest tier that has room once every other weight is placed. Startup
+prints what each resolved to and why. A tier the flag names that cannot be honoured stops the
+server with the reason; nothing falls back quietly.
+
+**The token embedding** is the largest model-level weight a dense model has -- 248320 x 5120 in bf16
+is 1.18 GiB a card at `--tp 2`. With `ram` it is placed in the pinned host pool before any strategy
+runs and the lookup reads it over the link in place, so it costs no VRAM and the KV pool gets its
+share. The pool must hold it (`--host-pool-mib`, every rank its own shard). `auto` keeps it on the
+card unless the card cannot hold the other weights with it, or a derived KV pool could then not
+hold one `--max-model-len` sequence; then it takes `ram` if the host pool can hold it. The table is
+found by what reads it: a model-level weight only `embed_lookup` reads. A head tied to it is read by
+a GEMM too and is never moved, since it would stream whole every step. `disk` is refused: the lookup
+writes activations the card reads, and a host kernel reading the container cannot write them.
 
 ```sh
-radiance --model m.rad --tp 2 --host-pool-mib 1280 --host-weights token_embd.weight
+radiance --model m.rad --tp 2 --host-pool-mib 1280 --embedding-placement ram
 ```
+
+**An n-gram table** (Qwen3.8-Flash-Next's is 47.7 GiB) is read by a host kernel only, so it is never
+on the card. `disk` reads its rows from the container through a row cache and direct reads; about
+half of a step's rows are first-seen, so steps wait on the drive. `ram` copies the whole table into
+locked huge pages at load -- 12 to 40 s more startup, depending on the page cache -- and every gather
+reads memory. It needs the table's size in memory after the pinned host pools and the prefix
+cache's host tier, with 4 GiB to spare, a memlock limit that large (`--ulimit memlock=-1` in Docker,
+`LimitMEMLOCK=infinity` under systemd), and room under every memory cgroup the process sits in.
+`ram` short of any of them refuses the start and names which; `auto` takes `ram` when all of them
+allow it and `disk` otherwise.
 
 **A model larger than the card and the host pool together still serves with
 `--weights-disk-tier`** -- and every step is then paced by the drive, which is the trade the flag
@@ -695,10 +719,14 @@ eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
 bits.
 
 On a model with a gated residual (Qwen3.8-Flash-Next) the all-reduce rides inside the residual's
-write, with the MoE gather in front of it, on either wire: the rotated forms of `ar_hc_write` and
-`ar_gather_hc_write` produce the same bytes as the unfused chain on the same wire. There `wht6` is
-worth +5.6–6.3% of prefill at a 2048-token chunk (20K prompt 5556 → 5908 tok/s; a 23K extension at
-81K depth 4998 → 5278) and −1.3% of the eight-stream decode step; one-stream decode stays exact.
+write, with the MoE gather in front of it. At two ranks that holds on either wire: the rotated
+forms of `ar_hc_write` and `ar_gather_hc_write` produce the same bytes as the unfused chain on the
+same wire. There `wht6` is worth +5.6–6.3% of prefill at a 2048-token chunk (20K prompt 5556 →
+5908 tok/s; a 23K extension at 81K depth 4998 → 5278) and −1.3% of the eight-stream decode step;
+one-stream decode stays exact. At four ranks only the exact wire has a fused form, and it takes
+the decode and verify steps — up to `--max-num-seqs` × (1 + `--num-speculative-tokens`) rows. A
+prefill chunk, and a message that goes out on the tiered-int8 wire, runs the unfused chain, where
+the all-reduce's own size choice between one-shot and two-shot applies.
 
 **The cards must reach each other's memory directly** (peer to peer, P2P). The all-reduce
 kernels push into the other card's memory. At launch radiance asks the driver, for every pair of
@@ -864,9 +892,9 @@ one line naming each one the command line moved.
 | `--vram-kv-mib N` | derive | the paged KV pool |
 | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
-| `--host-weights NAMES` | none | embedding tables kept in the pinned host pool and read in place over the link (comma-separated, a trailing `*` matches a prefix); charged to `--host-pool-mib`, and only a weight embedding lookups alone read is accepted. See §4.3 |
+| `--embedding-placement WHERE` | auto | `auto`, `vram` or `ram`: the token embedding on the card or in the pinned host pool, read in place; `disk` is refused. See §4.3 |
+| `--ngram-placement WHERE` | auto | `auto`, `ram` or `disk`: an n-gram table as a locked copy in RAM made at load, or read from the container; `vram` is refused. See §4.3 |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
-| `--ngram-table MODE` | disk | where the n-gram embedding's host gather reads its rows: `disk` from the container through a row cache, `ram` from a copy of the whole table in locked host memory (Qwen3.8-Flash-Next: 47.7 GiB), made in the background from the first request. `ram` needs the memory and a memlock limit that large (`--ulimit memlock=-1` in Docker); short of either it says so and stays on `disk` |
 
 **Idle session tiers**
 

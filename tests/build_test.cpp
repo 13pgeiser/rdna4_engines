@@ -486,6 +486,87 @@ TEST(no_schema_names_the_near_miss) {
     CHECK(has(b.errors().back(), "did you mean"));
 }
 
+/* ================================================================== a weight list over its tables
+ * A table operand consumes a RUN of the declared weights, and the declaration decides which run:
+ * the fixed weight positions take one each, and the rest is divided over the table positions in
+ * declaration order, the first positions taking one more where it does not divide. That map
+ * (OpInfo::weight_opd) is what the layout pass, the converter and the issue path all read, so it
+ * is asserted whole. t_moe is one fixed weight (operand 1) and eight tables -- class pairs at
+ * operands 2/3, 5/6, 7/8 and 9/10 -- the way a four-class grouped GEMM lays its classes out. */
+namespace {
+
+/* `n` weights declared in a row under `tag`, and t_moe over them. */
+rad_op decl_moe(Builder& b, const char* tag, int n, std::vector<rad_weight>* w) {
+    w->clear();
+    for (int i = 0; i < n; ++i)
+        w->push_back(decl_w(b, (std::string(tag) + ".e" + std::to_string(i)).c_str(), 64, 64));
+    const RadParam p[] = { RAD_INT("M", 8), RAD_INT("n", 64) };
+    return b.decl_op("t_moe", p, 2, w->data(), (int)w->size());
+}
+
+/* The operand each declared weight went to, as runs: "1x1 2x3" is one weight at operand 1, then
+ * three at operand 2. */
+std::string runs(const OpInfo* o) {
+    std::string s;
+    for (size_t i = 0; i < o->weight_opd.size();) {
+        size_t j = i;
+        while (j < o->weight_opd.size() && o->weight_opd[j] == o->weight_opd[i]) ++j;
+        s += (s.empty() ? "" : " ") + std::to_string(o->weight_opd[i]) + "x" +
+             std::to_string(j - i);
+        i = j;
+    }
+    return s;
+}
+
+}  /* namespace */
+
+TEST(a_weight_list_divides_over_its_tables_the_first_taking_the_remainder) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    std::vector<rad_weight> w;
+
+    /* Ten experts' codes and scales behind the fixed weight: twenty entries over eight tables is
+     * two each and four left, so the first four positions -- classes 0 and 1, codes and scales --
+     * hold three and the last four two. A four-class grouped GEMM over ten experts, whose first
+     * two classes are one expert longer. */
+    rad_op h = decl_moe(b, "ten", 21, &w);
+    REQUIRE(h != RAD_NULL_HANDLE);
+    const OpInfo* o = b.program().op(h);
+    REQUIRE(o != nullptr);
+    CHECK_EQ(runs(o), std::string("1x1 2x3 3x3 5x3 6x3 7x2 8x2 9x2 10x2"));
+    /* The list is cut into runs in the order it was declared, not dealt out. */
+    CHECK(o->weights == w);
+
+    /* A list that divides is the plain equal division: sixteen entries, two a table. */
+    h = decl_moe(b, "eight", 17, &w);
+    REQUIRE(h != RAD_NULL_HANDLE);
+    CHECK_EQ(runs(b.program().op(h)), std::string("1x1 2x2 3x2 5x2 6x2 7x2 8x2 9x2 10x2"));
+
+    /* One entry a table is the least a declaration can give. */
+    h = decl_moe(b, "four", 9, &w);
+    REQUIRE(h != RAD_NULL_HANDLE);
+    CHECK_EQ(runs(b.program().op(h)), std::string("1x1 2x1 3x1 5x1 6x1 7x1 8x1 9x1 10x1"));
+    CHECK_EQ((int)b.errors().size(), 0);
+}
+
+TEST(a_weight_list_shorter_than_its_tables_is_refused_by_name) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    std::vector<rad_weight> w;
+    const size_t ops = b.program().ops.size();
+
+    /* Seven entries for eight tables leaves one empty, which no division can fill: refused at
+     * declare, with the counts that say so. */
+    CHECK_EQ(decl_moe(b, "short", 8, &w), RAD_NULL_HANDLE);
+    CHECK_EQ(b.status(), RAD_E_SCHEMA);
+    REQUIRE(!b.errors().empty());
+    CHECK(has(b.errors().back(), "op 't_moe': 8 weight operands declared"));
+    CHECK(has(b.errors().back(), "1 fixed weight operands and 8 weight TABLE operands"));
+    CHECK(has(b.errors().back(), "so 7 leaves a table empty"));
+    /* Nothing is recorded for the run phase to reach. */
+    CHECK_EQ(b.program().ops.size(), ops);
+}
+
 /* ================================================================== misses, reported whole */
 TEST(a_hole_in_the_range_is_reported_as_that_band) {
     NEED_PLUGIN(reg)

@@ -1111,11 +1111,13 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 }
 
 /* THE WEIGHT SCALE GRID IS THE ONE `dtype` NAMES, and the grouped GEMM serves more than one. The
- * block-fp8 experts carry the checkpoint's: a scale a 128x128 tile, `group` holding the 128. The
- * four-bit ones (docs/MOE-W4.md) carry one a ROW per group of K -- all of `group` at w4a8, w4a8h
- * and w4nla8h, half of it at w4nl64a8h and w5nl64a8h, a quarter at w4nl32a8h. Those strings are
- * the served formats' own names (arch/common/rad_block_moe_fp8.h, kServed), so this states a
- * format and guesses at no kernel's stream; anything else is the block grid.
+ * block-fp8 experts (fp8a8) carry the checkpoint's: a scale a 128x128 tile, `group` holding the
+ * 128. The four-bit ones (docs/MOE-W4.md) carry one a ROW per group of K -- all of `group` at
+ * w4a8, w4a8h and w4nla8h, half of it at w4nl64a8h and w5nl64a8h, a quarter at w4nl32a8h. Those
+ * strings are the served formats' own names (arch/common/rad_block_moe_fp8.h, kServed), so this
+ * states a format and guesses at no kernel's stream. Any other dtype, or none, names no grid this
+ * file knows: the answer is { 0, 0 } and the description declines (RAD_E_UNSUPPORTED), because a
+ * scale plane sized on a guessed grid is a tensor of the wrong extent handed to the oracle.
  *
  * It matters past the extents. A weight its kernel stores re-laid goes back through that
  * kernel's inverse into the tensor THIS describes before the oracle hands it over
@@ -1123,15 +1125,16 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
  * operand -- so tiles here leave every such expert's scales with nothing to be inverted into.
  * The arithmetic reads whichever grid it is handed (ref_gemm.h derives the group from the
  * extents) and is unchanged. Weight rows and K elements a scale covers, or 0 when `group` is too
- * small to divide. */
+ * small to divide or the dtype names no grid. */
 struct MoeScaleGrid { int64_t rows, k; };
 static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
     const char* d = gs(p, n_p, "dtype");
     auto is = [&](const char* s) { return d && std::strcmp(d, s) == 0; };
+    if (is("fp8a8")) return { g, g };
     if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g };
     if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2 };
     if (is("w4nl32a8h")) return { 1, g / 4 };
-    return { g, g };
+    return { 0, 0 };
 }
 
 /* The quantised arm. Same planes, plus the two scale streams: the activation's is per row per

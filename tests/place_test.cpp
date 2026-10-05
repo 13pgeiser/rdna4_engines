@@ -2237,7 +2237,7 @@ TEST(the_weight_footprint_splits_statics_from_the_elastic_expert_plane) {
     build_moe(f, /*n=*/4, /*each=*/2 * MiB, &experts);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram);
 
     /* One model-level weight and four experts: five units. */
     CHECK_EQ(fp.n_units, 5ll);
@@ -2267,7 +2267,7 @@ TEST(weights_in_one_layer_are_one_unit_and_are_aligned_once_each) {
     }
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram);
     CHECK_EQ(fp.n_units, 2ll);              /* the declared group is the unit, not the weight */
 
     /* ONE align_up A UNIT AND ONE INSIDE IT, which is how Mover::init spends the slab. A budget
@@ -2300,16 +2300,16 @@ TEST(a_weight_with_no_device_band_takes_its_whole_unit_to_the_mapped_tier) {
     f.prog.ops.push_back(host_only);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram);
     CHECK_EQ(fp.n_units, 1ll);
     CHECK_EQ(fp.statics, 0ll);
     CHECK_EQ(fp.mapped, 6 * MiB);          /* both weights: the unit is what moves */
 }
 
-/* --host-weights. The fixture's embedding is read by an `embed_lookup`, as every arch declares it:
- * that is the only reader the flag accepts. */
-void build_dense_lookup(Fixture& f, int layers, int64_t per_layer) {
-    const rad_weight m = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+/* --embedding-placement. The fixture's embedding is read by an `embed_lookup`, as every arch
+ * declares it, and its head by a GEMM: the first is the table the flag moves, the second never. */
+void build_dense_lookup(Fixture& f, int layers, int64_t per_layer, int64_t emb = 1 * MiB) {
+    const rad_weight m = f.weight("token_embd.weight", emb, RAD_ACCESS_VOCAB, -1, -1);
     f.op("embed_lookup", {m}, false);
     for (int l = 0; l < layers; ++l) {
         const rad_weight w = f.weight("blk." + std::to_string(l) + ".ffn_down.weight", per_layer,
@@ -2320,39 +2320,72 @@ void build_dense_lookup(Fixture& f, int layers, int64_t per_layer) {
     f.op("logits_gemm", {o}, false);
 }
 
-/* A HOSTED WEIGHT IS IN THE HOST POOL, NOT ON THE CARD, and the footprint has to say so: the
- * resolver sizes a derived weight budget from `statics`, so a hosted weight counted there would
- * reserve VRAM the planner never spends. */
-TEST(host_weights_leave_the_statics_for_the_hosted_bucket) {
+/* An n-gram table: model-level, read only by `embed_lookup_q`, which only a host kernel serves. */
+rad_weight add_ngram_table(Fixture& f, int64_t bytes) {
+    const rad_weight t = f.weight("ngram.weight", bytes, RAD_ACCESS_VOCAB, -1, -1);
+    OpInfo o;
+    o.op = "embed_lookup_q";
+    o.index = (int32_t)f.prog.ops.size();
+    o.weights = { t };
+    Band hb;
+    hb.hi = 1 << 20;
+    hb.dom[RAD_DOMAIN_HOST].row = &g_host_row;
+    hb.miss[RAD_DOMAIN_DEVICE] = "no device kernel";
+    o.bands.push_back(hb);
+    f.prog.ops.push_back(o);
+    return t;
+}
+
+/* THE TABLES ARE FOUND BY WHAT READS THEM. A model-level weight only embed_lookup reads is the
+ * embedding; one only embed_lookup_q reads is an n-gram table; a head a GEMM reads is neither, and
+ * neither is a table a GEMM reads beside the lookup -- a tied head would stream whole over the
+ * link every step. Placed in RAM the embedding leaves the statics for the hosted bucket, because
+ * the resolver sizes a derived weight budget from the statics. */
+TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     Fixture f;
     build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
+    add_ngram_table(f, 8 * MiB);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, {"token_embd.weight"});
+    weight_footprint(f.prog, &fp, TablePlacement::Vram);
+    CHECK_EQ(fp.embedding, 1 * MiB);
+    CHECK_EQ(fp.ngram, 8 * MiB);
+    CHECK(!fp.ngram_device);
+    CHECK_EQ(fp.hosted, 0ll);
+    CHECK_EQ(fp.statics, 2 * 4 * MiB + 2 * MiB);
+    CHECK_EQ(fp.mapped, 8 * MiB);
+
+    weight_footprint(f.prog, &fp, TablePlacement::Ram);
+    CHECK_EQ(fp.embedding, 1 * MiB);
     CHECK_EQ(fp.hosted, 1 * MiB);
     CHECK_EQ(fp.statics, 2 * 4 * MiB + 1 * MiB);
 
-    weight_footprint(f.prog, &fp, {"token_*"});         /* a trailing '*' is a prefix */
-    CHECK_EQ(fp.hosted, 1 * MiB);
+    CHECK(is_embedding_table(f.prog, 1));
+    CHECK(!is_embedding_table(f.prog, 2));                 /* a layer's GEMM operand */
+    CHECK(!is_embedding_table(f.prog, 4));                 /* the head */
+    CHECK(is_ngram_table(f.prog, 5));
+    CHECK(!is_ngram_table(f.prog, 1));
 
-    /* NEITHER A LAYER WEIGHT NOR A GEMM'S: layers belong to the offload strategies, and a GEMM
-       operand would stream every step. */
-    weight_footprint(f.prog, &fp, {"blk.*", "output.weight"});
+    /* A head tied to the table: the same weight read by the lookup and the logits GEMM. */
+    Fixture t;
+    const rad_weight m = t.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    t.op("embed_lookup", {m}, false);
+    t.op("logits_gemm", {m}, false);
+    CHECK(!is_embedding_table(t.prog, m));
+    weight_footprint(t.prog, &fp, TablePlacement::Ram);
+    CHECK_EQ(fp.embedding, 0ll);
     CHECK_EQ(fp.hosted, 0ll);
-
-    weight_footprint(f.prog, &fp);                      /* and none named is none hosted */
-    CHECK_EQ(fp.hosted, 0ll);
-    CHECK_EQ(fp.statics, 2 * 4 * MiB + 2 * MiB);
 }
 
-TEST(host_weights_go_to_the_pinned_pool_read_in_place_and_cost_no_vram) {
+TEST(embedding_ram_goes_to_the_pinned_pool_read_in_place_and_costs_no_vram) {
     Fixture f;
     build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
     Config cfg = base_config();
     cfg.placement = "all_vram";
     cfg.vram_weights_mib = 9;           /* layers and the head exactly: not the embedding */
     cfg.host_pool_mib = 2;
-    cfg.host_weights = {"token_embd.weight"};
+    cfg.embedding_placement = TablePlacement::Ram;
+    cfg.embedding_resolved = TablePlacement::Ram;
     Plan plan;
     PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
     CHECK_OK(Planner(in).plan(&plan));
@@ -2361,31 +2394,69 @@ TEST(host_weights_go_to_the_pinned_pool_read_in_place_and_cost_no_vram) {
     CHECK(plan.weight[emb].tier == Tier::HostPinned);
     CHECK(plan.weight[emb].site == Site::DeviceZeroCopy);
     CHECK(!plan.units[(size_t)plan.weight[emb].unit].movable);
-    CHECK_EQ(plan.host_weights_bytes, 1 * MiB);
+    CHECK_EQ(plan.embedding_host_bytes, 1 * MiB);
     for (rad_weight w = 2; (size_t)w < f.prog.weights.size(); ++w)
         CHECK(plan.weight[w].tier == Tier::VRAM);
+
+    /* Vram, the default, leaves it with the other weights. */
+    cfg.embedding_resolved = TablePlacement::Vram;
+    cfg.vram_weights_mib = 10;
+    Plan plan2;
+    CHECK_OK(Planner(in).plan(&plan2));
+    CHECK(plan2.weight[emb].tier == Tier::VRAM);
+    CHECK_EQ(plan2.embedding_host_bytes, 0ll);
 }
 
-TEST(host_weights_that_a_gemm_reads_are_refused) {
+/* A TABLE THAT IS NOT A WHOLE NUMBER OF PAGES still leaves the report's pinned total at what the
+ * pooled units use: the pool slot is charged rounded up and the tier total counts weight bytes, so
+ * the report subtracts the same weight bytes it added. */
+TEST(the_report_counts_a_hosted_embedding_once_in_one_unit) {
     Fixture f;
-    build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB);
+    build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB, /*emb=*/3 * MiB + 100);
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    cfg.host_pool_mib = 8;
+    cfg.embedding_resolved = TablePlacement::Ram;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    CHECK_EQ(plan.embedding_host_used, 3 * MiB + 100);
+    CHECK(plan.embedding_host_bytes >= plan.embedding_host_used);
+    const std::string r = plan.report(f.prog);
+    const size_t at = r.find("host pinned");
+    CHECK(at != std::string::npos);
+    if (at != std::string::npos) {
+        const std::string line = r.substr(at, r.find('\n', at) - at);
+        CHECK(line.find('-') == std::string::npos);           /* no negative total */
+    }
+    CHECK(r.find("--embedding-placement ram") != std::string::npos);
+}
+
+/* A plan resolved to Ram for a program with no table only embed_lookup reads is a budget split
+ * for a different program; it refuses rather than leave the table on a card split without it. */
+TEST(embedding_ram_with_no_table_to_place_is_refused) {
+    Fixture t;
+    const rad_weight m = t.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    t.op("embed_lookup", {m}, false);
+    t.op("logits_gemm", {m}, false);
     Config cfg = base_config();
     cfg.placement = "all_vram";
     cfg.host_pool_mib = 4;
-    cfg.host_weights = {"output.weight"};
+    cfg.embedding_resolved = TablePlacement::Ram;
     Plan plan;
-    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
-    CHECK_EQ(Planner(in).plan(&plan), RAD_E_INVAL);
+    PlannerInput in{&t.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_EQ(Planner(in).plan(&plan), RAD_E_STATE);
     CHECK(!plan.notes.empty());
+    CHECK(plan.weight[m].tier == Tier::VRAM);
 }
 
-TEST(host_weights_that_do_not_fit_the_host_pool_are_refused_with_the_plan_filled_in) {
+TEST(embedding_ram_that_does_not_fit_the_host_pool_is_refused_with_the_plan_filled_in) {
     Fixture f;
     build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB);
     Config cfg = base_config();
     cfg.placement = "all_vram";
     cfg.host_pool_mib = 0;              /* nowhere to put it */
-    cfg.host_weights = {"token_embd.weight"};
+    cfg.embedding_resolved = TablePlacement::Ram;
     Plan plan;
     PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
     CHECK_EQ(Planner(in).plan(&plan), RAD_E_NOMEM);
@@ -2393,16 +2464,42 @@ TEST(host_weights_that_do_not_fit_the_host_pool_are_refused_with_the_plan_filled
     CHECK(!plan.notes.empty());
 }
 
+/* --ngram-placement ram leaves the table on the mapped tier, which no pool counts, and names the
+ * copy the load phase makes: its reason says where the rows will come from, and the report what
+ * the copy costs in RAM. */
+TEST(ngram_ram_stays_mapped_and_reports_the_copy) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB);
+    const rad_weight t = add_ngram_table(f, 8 * MiB);
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    cfg.ngram_resolved = TablePlacement::Ram;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    CHECK(plan.weight[t].tier == Tier::Mapped);
+    CHECK(plan.weight[t].site == Site::Host);
+    CHECK_EQ(plan.ngram_copy_bytes, 8 * MiB);
+    CHECK(std::string(plan.weight[t].reason).find("--ngram-placement ram") != std::string::npos);
+    CHECK(plan.report(f.prog).find("n-gram copy") != std::string::npos);
+
+    cfg.ngram_resolved = TablePlacement::Disk;
+    Plan plan2;
+    CHECK_OK(Planner(in).plan(&plan2));
+    CHECK_EQ(plan2.ngram_copy_bytes, 0ll);
+    CHECK(plan2.report(f.prog).find("n-gram copy") == std::string::npos);
+}
+
 TEST(an_empty_program_has_an_empty_footprint) {
     Fixture f;
     WeightFootprint fp;
     fp.statics = 1;                         /* and the out parameter is reset, not accumulated */
-    weight_footprint(f.prog, &fp);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram);
     CHECK_EQ(fp.statics, 0ll);
     CHECK_EQ(fp.experts, 0ll);
     CHECK_EQ(fp.mapped, 0ll);
     CHECK_EQ(fp.n_units, 0ll);
-    weight_footprint(f.prog, nullptr);      /* and a null one is not a crash */
+    weight_footprint(f.prog, nullptr, TablePlacement::Vram);      /* and a null one is not a crash */
 }
 
 RAD_TEST_MAIN()

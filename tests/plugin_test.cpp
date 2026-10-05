@@ -119,8 +119,8 @@ TEST(loading_reads_identity_and_calls_open) {
     if (!base) return;
     CHECK_EQ((int)base->kind, RAD_PLUGIN_KERNEL);
     CHECK_EQ(base->version, "0.1");
-    CHECK_EQ(base->n_kernels, 16);
-    CHECK_EQ(base->n_schemas, 9);
+    CHECK_EQ(base->n_kernels, 17);
+    CHECK_EQ(base->n_schemas, 10);
 
     /* The optional open hook runs once, after load and before any selection. */
     auto open_calls = reinterpret_cast<int (*)(void)>(dlsym(base->handle, "radtest_open_calls"));
@@ -286,7 +286,7 @@ TEST(every_row_s_op_has_a_schema) {
     CHECK_OK(load(r));
     CHECK_OK(r.check_complete());
     const auto ops = r.op_names();
-    CHECK_EQ(ops.size(), (size_t)9);
+    CHECK_EQ(ops.size(), (size_t)10);
     CHECK_EQ(ops[0], "t_attn");
 }
 
@@ -878,6 +878,61 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
     for (const Band& b : none) {
         CHECK(!b.dom[RAD_DOMAIN_DEVICE]);
         CHECK(has(b.miss[RAD_DOMAIN_DEVICE], "exact"));
+    }
+}
+
+/* THE FOUR-RANK FUSED WRITES SERVE THE EXACT WIRE ONLY, AND SAY SO IN SELECTION. A caller states
+ * `wire` 0 for the exact form and gets the four-rank rows; a request for the rotated wire at four
+ * ranks is a miss that names `wire`, so the caller keeps its unfused pair -- not a row that
+ * matches and then refuses its instance, which would stop declare. At two ranks both wires keep
+ * their row. Geometry is Qwen3.8-Flash-Next's: 2560 wide, four streams, top-k 10, declared over a
+ * decode or verify step of 8 sequences at depth 3. */
+TEST(libr4d_resolves_the_four_rank_fused_writes_on_the_exact_wire_only) {
+    const std::string so = home() + "/kernels/libr4d.so";
+    if (access(so.c_str(), R_OK) != 0) {
+        fprintf(stderr, "  SKIP %s: no %s (a build without HIP)\n", ::radtest::current(),
+                so.c_str());
+        return;
+    }
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    r.set_device_fact(RAD_FACT_P2P, 1);
+
+    const int64_t rows = 8 * (1 + 3);
+    auto bands = [&](const std::string& op, int world, int wire) {
+        Geometry g;
+        g.set_i("n", 2560);
+        g.set_i("hc", 4);
+        g.set_i("world_size", world);
+        g.set_s("dtype", "bf16");
+        g.set_i("wire", wire);
+        if (op == "ar_gather_hc_write") {
+            g.set_i("top_k", 10);
+            g.set_s("act", "sigmoid");
+        }
+        return r.build_bands(op, "M", 1, rows, g);
+    };
+    auto names = [](const std::vector<Band>& b) {
+        std::string s;
+        for (const Band& x : b)
+            s += fmt("%lld:%s ", (long long)x.hi, picked(x.dom[RAD_DOMAIN_DEVICE].row).c_str());
+        return s;
+    };
+
+    CHECK_EQ(names(bands("ar_hc_write", 4, 0)), "32:ar_hc_write_4rank ");
+    CHECK_EQ(names(bands("ar_gather_hc_write", 4, 0)), "32:ar_gather_hc_write_4rank ");
+    for (int wire : { 0, 6 }) {
+        CHECK_EQ(names(bands("ar_hc_write", 2, wire)), "32:ar_hc_write ");
+        CHECK_EQ(names(bands("ar_gather_hc_write", 2, wire)), "32:ar_gather_hc_write ");
+    }
+
+    for (const char* op : { "ar_hc_write", "ar_gather_hc_write" }) {
+        const std::vector<Band> none = bands(op, 4, 6);
+        CHECK(!none.empty());
+        for (const Band& b : none) {
+            CHECK(!b.dom[RAD_DOMAIN_DEVICE]);
+            CHECK(has(b.miss[RAD_DOMAIN_DEVICE], "wire"));
+        }
     }
 }
 

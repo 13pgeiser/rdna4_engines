@@ -684,15 +684,17 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
      * A RAD_OPD_WTAB position consumes a RUN of declared weights, so the count alone does not
      * say how the list divides. The rule is EQUAL DIVISION: whatever is left after the fixed
      * weight positions have taken one each is split evenly across the table positions, in
-     * declaration order. That is exactly right for the case tables exist for -- `moe_gemm_q`'s
+     * declaration order. That is exactly right for the case tables exist for -- a grouped GEMM's
      * codes and scale planes are one of each per expert, always the same count.
      *
      * WHERE IT DOES NOT COME OUT WHOLE, THE FIRST POSITIONS TAKE ONE MORE. A grouped GEMM whose
-     * experts are classes by number mod C -- `moe_gemm_q_mod4` -- gives its first `n % C` classes
-     * one expert more than the rest, and its tables are each class's codes then its scales, so
-     * that is exactly the first `2 * (n % C)` positions. Any other grouping is still refused, at
-     * issue, by the run checks: a table that is not one contiguous run of one shape. A list
-     * shorter than the tables is refused here. */
+     * n experts are C classes by number mod C, declared class by class as a codes table and a
+     * scales table each, gives its first `n % C` classes one expert more than the rest -- exactly
+     * the positions this rule lengthens. A list grouped any other way is refused at issue: the
+     * plugin names each table's run there, and a run other than the one this division bound is
+     * refused. A bound run must also be contiguous, checked when the tables are bound before the
+     * first step, and its entries of one shape, checked at its first issue. A list shorter than
+     * the tables is refused here. */
     int per_tab = 0, tab_extra = 0;
     if (n_tab > 0) {
         const int rest = n_w - w_max;

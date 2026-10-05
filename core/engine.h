@@ -28,6 +28,7 @@
 #include "runtime/rank_barrier.h"
 #include "text/tokenizer.h"
 #include "format/radfile.h"
+#include "format/table_copy.h"
 
 #include <atomic>
 #include <chrono>
@@ -43,6 +44,8 @@ class Kld;
 struct TierPump;
 struct TierJob;
 struct StepSlot;
+
+struct VramFacts;   /* mem/vram_budget.h */
 
 class Engine {
 public:
@@ -115,6 +118,18 @@ private:
     int read_checkpoint_metadata();
     int declare();
     int plan();
+    /* --embedding-placement and --ngram-placement, resolved into Config before the card is split
+     * (engine_bringup.cpp says how auto chooses). */
+    int resolve_table_placement(const std::vector<VramFacts>& facts,
+                                const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
+                                int64_t ngram_bytes, bool ngram_device);
+    /* --ngram-placement ram: the locked copy of the container's [src, src + n), file offset `foff`,
+     * made once and shared by every rank. */
+    int lock_table_copy(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
+    /* The copies made, each [base, base + bytes), and the container address each one copies.
+     * Unlocked and unmapped in ~Engine after the ranks that read them are gone. */
+    std::vector<TableCopy> table_copies_;
+    std::vector<std::pair<const void*, void*>> table_copy_of_;
     int load_weights();
     int configure_kv();
     /* One sampled row's worth of bookkeeping, so the step loop can map a logits row back to the
