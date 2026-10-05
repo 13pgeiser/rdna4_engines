@@ -343,8 +343,7 @@ TEST(a_zero_divisor_holds_for_nothing_rather_than_faulting) {
 }
 
 /* A CONSTRAINT WHOSE KEY THE GEOMETRY DOES NOT CARRY DOES NOT HOLD. The header names what this
- * buys: libr4d's two-shot all-reduce rows are reachable only by a query that asks for `hops`,
- * because a query that omits it fails the more constrained row. */
+ * buys: a row that constrains an optional parameter serves only a caller that states it. */
 TEST(an_absent_key_fails_every_constraint) {
     Geometry g;
     g.set_i("M", 64);

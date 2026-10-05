@@ -35,8 +35,10 @@ static const Flag g_flags[] = {
     { "--kernels",            "LIST",   "kernel plugin hierarchy, comma-separated, first wins" },
 
     { "--tp",                 "N",      "tensor-parallel ranks" },
-    { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6" },
-    { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the wht6 wire is used for" },
+    { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6, a\n"
+                                        "lossy wire: rotated 6-bit at 2 ranks, tiered int8 at 4,\n"
+                                        "none at 8" },
+    { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the lossy wire is used for" },
     { "--max-num-batched-tokens", "N",  "the largest token count one step may carry" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },

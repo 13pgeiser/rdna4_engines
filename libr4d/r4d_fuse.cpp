@@ -657,10 +657,8 @@ extern "C" int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam* p, int n_p, u
  *                0." Leaving the key out would let a small message go out exact on one side of the
  *                comparison and rotated on the other.
  *
- * `hops` is deliberately NOT emitted. A query that omits it falls through to the one-shot rows,
- * which is what this kernel is; naming it would be pinning a topology that does not exist at two
- * ranks. `y` is RAD_FUSE_NONE: the fused kernel reduces in place into `x`, which is what the
- * one-shot rows do and what the two-shot rows refuse by name.
+ * `hops` is not emitted: no libr4d row reads it, and two ranks have only the one-shot. `y` is
+ * RAD_FUSE_NONE: the fused kernel reduces in place into `x`, as every all-reduce row does.
  */
 /* ==========================================================================================
  * attn_paged_gate_quant -- attn_paged, then gate_quant_fp8 over its output.

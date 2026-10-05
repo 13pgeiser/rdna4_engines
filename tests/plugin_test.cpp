@@ -19,6 +19,7 @@
 #include <nlohmann/json.hpp>
 
 #include <dlfcn.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <string>
 
@@ -488,8 +489,8 @@ TEST(every_constraint_operator_refuses_with_its_own_reason) {
     g = attn_geom(); g.set_s("kv_dtype", "f32");
     CHECK(has(refusal(r, "t_attn", g), "kv_dtype in {bf16 fp8_e4m3}, have f32"));
 
-    /* A constraint whose key the geometry lacks does NOT hold -- libr4d's rule, and the reason its
-     * two-shot all-reduce rows can be reached at all. */
+    /* A constraint whose key the geometry lacks does NOT hold -- libr4d's rule: a row that needs
+     * a parameter the caller did not state is not a match. */
     Geometry partial;
     partial.set_i("q_len", 8);
     CHECK(has(refusal(r, "t_attn", partial), "did not name head_dim"));
@@ -815,6 +816,69 @@ TEST(a_device_fact_constraint_is_matched_against_the_machine) {
     const std::string why = refusal(r, "t_peer_only", g);
     CHECK(has(why, "device.p2p == 1, have 0"));
     CHECK(has(why, "measured at launch"));
+}
+
+/* THE SHIPPED libr4d PICKS THE ALL-REDUCE BY MESSAGE SIZE, and the selector is what says so. At 4
+ * and 8 ranks the exact sum is a one-shot for a decode-sized message and a two-shot for a prefill
+ * chunk; the two-shot rows start one element above the one-shot bound, so that bound is a band
+ * edge of the blocks' ranged `numel`. The band at or under the edge has to stay resolvable for
+ * every row that places a DIV on `numel` -- the two-rank wht6 wire (64) and the four-rank ti8 wire
+ * (128) among them -- or a lossy two-rank serve would lose its decode band. Checked here against
+ * the real plugin, because nothing else can run a four- or eight-rank resolution on a two-card
+ * machine. Geometry is Qwen3.8-Flash-Next's: 2560 wide, a 2048-token chunk. */
+TEST(libr4d_resolves_the_all_reduce_by_message_size) {
+    const std::string so = home() + "/kernels/libr4d.so";
+    if (access(so.c_str(), R_OK) != 0) {
+        fprintf(stderr, "  SKIP %s: no %s (a build without HIP)\n", ::radtest::current(),
+                so.c_str());
+        return;
+    }
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    r.set_device_fact(RAD_FACT_P2P, 1);
+
+    const int64_t width = 2560, chunk = 2048;
+    auto bands = [&](int world, int exact, int64_t max_tok) {
+        Geometry g;
+        g.set_i("world_size", world);
+        g.set_s("dtype", "bf16");
+        g.set_i("exact", exact);
+        g.set_i("min_bytes", 128 * 1024);
+        return r.build_bands("all_reduce", "numel", width, max_tok * width, g);
+    };
+    auto names = [](const std::vector<Band>& b) {
+        std::string s;
+        for (const Band& x : b)
+            s += fmt("%lld:%s ", (long long)x.hi, picked(x.dom[RAD_DOMAIN_DEVICE].row).c_str());
+        return s;
+    };
+
+    CHECK_EQ(names(bands(4, 1, chunk)),
+             "524288:ar_oneshot_4rank_exact 5242880:ar_twoshot_4rank_exact ");
+    CHECK_EQ(names(bands(8, 1, chunk)),
+             "524288:ar_oneshot_8rank_exact 5242880:ar_twoshot_8rank_exact ");
+    CHECK_EQ(names(bands(4, 0, chunk)),
+             "524288:ar_twoshot_4rank_ti8 5242880:ar_twoshot_4rank_ti8 ");
+    CHECK_EQ(names(bands(2, 0, chunk)),
+             "524288:ar_oneshot_2rank_wht6 5242880:ar_oneshot_2rank_wht6 ");
+    CHECK_EQ(names(bands(2, 1, chunk)),
+             "524288:ar_oneshot_2rank_exact 5242880:ar_oneshot_2rank_exact ");
+
+    /* Above the two-shot's cap the one-shot takes the message back. */
+    CHECK_EQ(names(bands(4, 1, 16384)),
+             "524288:ar_oneshot_4rank_exact 20971520:ar_twoshot_4rank_exact "
+             "41943040:ar_oneshot_4rank_exact ");
+
+    /* A step that never exceeds the bound has one band, and it is the one-shot's. */
+    CHECK_EQ(names(bands(4, 1, 128)), "327680:ar_oneshot_4rank_exact ");
+
+    /* Eight ranks have no lossy wire: every band is a miss that names the request. */
+    const std::vector<Band> none = bands(8, 0, chunk);
+    CHECK(!none.empty());
+    for (const Band& b : none) {
+        CHECK(!b.dom[RAD_DOMAIN_DEVICE]);
+        CHECK(has(b.miss[RAD_DOMAIN_DEVICE], "exact"));
+    }
 }
 
 RAD_TEST_MAIN()

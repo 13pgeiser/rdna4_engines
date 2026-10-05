@@ -431,9 +431,9 @@ static int nb_for(long words16, int max_nb) {
 }
 
 /* Shared front half of every all-reduce launch: find the instance, check the message against what
- * init sized for, resolve the tuned point. Two-shot rows pass want_distinct because they gather into
- * the output while the input is still being read for the scatter. */
-static int ar_setup(const RadArgs* a, ArCall* c, int want_distinct, int shard_nb) {
+ * init sized for, resolve the tuned point. Every kernel of the family runs in place (`y` absent or
+ * equal to `x`); each says why at its entry. */
+static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;                  /* init did not run: a core sequencing bug */
     const RadTensor* x = r4d_opt(a, AR_X);
@@ -445,7 +445,6 @@ static int ar_setup(const RadArgs* a, ArCall* c, int want_distinct, int shard_nb
         if (!r4d_contig(y)) return RAD_E_STRIDE;
         if (r4d_numel(y) != r4d_numel(x)) return RAD_E_SHAPE;
     }
-    if (want_distinct && (!y || y->data == x->data)) return RAD_E_INVAL;
 
     const long n = (long)r4d_numel(x);
     if (n <= 0) return RAD_E_SHAPE;
@@ -637,7 +636,7 @@ extern "C" int r4d_rad_ar_gather_8rank(const RadArgs* a, RadStream s) {
 
 extern "C" int r4d_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
-    int rc = ar_setup(a, &c, 0, 0);
+    int rc = ar_setup(a, &c, 0);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 2) return RAD_E_SHAPE;
     R4D_TRY("ar_oneshot_2rank_exact",
@@ -669,7 +668,7 @@ enum { R4D_AR_WHT6_FUSED_THREADS = 512 };
 
 extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
     ArCall c;
-    int rc = ar_setup(a, &c, 0, 0);
+    int rc = ar_setup(a, &c, 0);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 2) return RAD_E_SHAPE;
     if (c.in->dtype == 2) return RAD_E_DTYPE;      /* the rotated wire is bf16/fp16 only */
@@ -718,34 +717,14 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
  * The peer arguments are ascending global rank with the current rank removed, which is exactly
  * the order build() filled peer_scratch/peer_flags in. */
 
-/* Four-rank blocks issue every all_reduce in place and without `hops`, so the exact two-shot row
- * (hops=2) is never selected. Above this floor the one-shot entry runs the two-shot kernel instead:
- * 1.5N rather than 3N bytes a rank, same fp32 fold order, bit-identical. In place is safe for the
- * reason given at the ti8 entry. Prefill +17% at 16k/64k on 4x R9700; decode stays one-shot. */
-enum { R4D_AR_EXACT_TWOSHOT_MIN_BYTES = 1024 * 1024 };
-
+/* The one-shots run in place: the thread that stores word k of the output is the one that read
+ * word k of the input, for its push and again as its own term of the fold, and peers read only
+ * their own scratch (r4d_ar_oneshot_Nrank_exact.hip). */
 extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
-    int rc = ar_setup(a, &c, 0, 0);
+    int rc = ar_setup(a, &c, 0);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
-    const long long msg_b = (long long)c.numel * c.in->esize;
-    if (msg_b >= R4D_AR_EXACT_TWOSHOT_MIN_BYTES && c.numel <= R4D_AR_TWOSHOT_WIDE_MAX_ELEMS &&
-        msg_b % 16 == 0 && (msg_b / 16) % c.in->world == 0 &&
-        2 * msg_b / c.in->world <= c.in->slot_bytes) {     /* the two-shot's own preconditions */
-        ArCall t;
-        if (ar_setup(a, &t, 0, 1) == RAD_OK) {             /* shard-scaled block count */
-            const ArInst* in = t.in;
-            R4D_TRY("ar_twoshot_4rank_exact",
-                r4d_ar_twoshot_4rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
-                                           in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
-                                           in->my_scratch, in->my_flags, in->my_seq, in->slot16,
-                                           t.inp, t.out, t.numel, in->dtype, in->rank,
-                                           (long)(uintptr_t)s, t.nblocks, t.nthreads, t.drain, t.acq,
-                                           t.pub));
-            return RAD_OK;
-        }
-    }
     const ArInst* in = c.in;
     R4D_TRY("ar_oneshot_4rank_exact",
         r4d_ar_oneshot_4rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
@@ -759,7 +738,7 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
 
 extern "C" int r4d_rad_ar_oneshot_8rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
-    int rc = ar_setup(a, &c, 0, 0);
+    int rc = ar_setup(a, &c, 0);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 8) return RAD_E_SHAPE;
     const ArInst* in = c.in;
@@ -778,11 +757,18 @@ extern "C" int r4d_rad_ar_oneshot_8rank_exact(const RadArgs* a, RadStream s) {
 }
 
 /* The two-shots shard the message, so their block count scales with the SHARD -- a full-message
- * count over-launches the whole mid band. Both refuse an in-place call; the four-rank one-shot
- * entry runs the exact one in place above R4D_AR_EXACT_TWOSHOT_MIN_BYTES. */
+ * count over-launches the whole mid band.
+ *
+ * IN PLACE IS SAFE (r4d_ar_twoshot_Nrank_exact.hip). A thread takes one set of word offsets k
+ * within a shard and uses it in all three phases: the push reads word k of every peer's shard out
+ * of the input, the reduce reads word k of its own shard and stores the sum over it, and the
+ * assemble writes word k of every peer's shard. Each input word is therefore overwritten only by
+ * the thread that already read it, later in its own program order, and no peer reads this rank's
+ * input -- peers read their own scratch. The selector hands the two-shot the messages above the
+ * one-shot's size bound (r4d_rows.cpp, cArTsExact4). */
 extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
-    int rc = ar_setup(a, &c, 1, 1);
+    int rc = ar_setup(a, &c, 1);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
     if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
@@ -804,7 +790,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
 
 extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
-    int rc = ar_setup(a, &c, 1, 1);
+    int rc = ar_setup(a, &c, 1);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 8) return RAD_E_SHAPE;
     if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
@@ -829,13 +815,16 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
 /* The tiered-int8 wire. Its slot stride is in BYTES, not 16-byte words: the wire is 38 bytes per
  * group of 32 and so is not 16-byte aligned at all.
  *
- * Four-rank blocks issue every all_reduce in place and without `hops`, so a lossy wire lands here
- * for every message. As in r4d_rad_ar_oneshot_2rank_wht6, a message under `min_bytes` (or one the
- * groups do not tile) goes to the exact one-shot. In place is safe: each block reads its range of
- * the input before it writes the same range of the output, and no peer reads this rank's input. */
+ * It is the only lossy row at four ranks, so a lossy request resolves it at every message size. As
+ * in r4d_rad_ar_oneshot_2rank_wht6, a message under `min_bytes` (or one the groups do not tile)
+ * goes to the exact one-shot. The default floor is the two-rank wire's: every block declares
+ * `min_bytes` from --tp-wire-min-kb, so the default serves only a caller that leaves it out, and no
+ * four-rank crossover has been measured to set another. In place is safe for the exact two-shot's
+ * reason: a thread owns the same 8 elements of a shard in all three phases, reads them from the
+ * input before it writes them, and no peer reads this rank's input. */
 extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     ArCall c;
-    int rc = ar_setup(a, &c, 0, 1);
+    int rc = ar_setup(a, &c, 1);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
     if (c.in->dtype == 2) return RAD_E_DTYPE;

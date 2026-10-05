@@ -298,7 +298,7 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
      * here because the plugin put it here, and --debug-graph shows it exactly here (spec §9).
      * `exact` is stated rather than defaulted -- a caller that does not say it will accept a
      * quantised wire gets the exact kernel or no kernel. `hops` is not stated: one-shot against
-     * two-shot is the kernel's business. */
+     * two-shot is the kernel library's choice, by message size. */
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
                        RAD_PARAMS(RAD_INT("world_size", g.world),

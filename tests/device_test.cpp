@@ -159,6 +159,81 @@ TEST(alloc_free_roundtrip) {
     CHECK(rad_dev_host_ptr(nullptr) == nullptr);
 }
 
+/* A pinned range larger than one pin is locked in several (core/device/aql.cpp, pin_pieces), and
+ * nothing above the device layer may be able to tell: one base, every byte of it at the same
+ * address on the card, copies and fills that cross a piece boundary landing whole, and none of
+ * them taken for pageable memory -- a fill of pageable memory is refused, so the fill is the
+ * check. 2.5 GiB is the single-pin size an Intel VT-d host refused; the boundaries crossed are
+ * the whole GiBs. */
+TEST(a_pinned_range_larger_than_one_pin_is_one_range_on_the_card) {
+    const int64_t gib = (int64_t)1 << 30;
+    const int64_t n = 5 * (gib / 2) + 4096 + 17;
+    const int64_t w = 8 << 20;
+    Stream st;
+    auto* h = (uint8_t*)rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
+    auto* d = (uint8_t*)rad_dev_alloc(w, RAD_MEM_DEVICE);
+    CHECK(h != nullptr);
+    CHECK(d != nullptr);
+    if (!h || !d) {
+        rad_dev_free(h, RAD_MEM_HOST_MAPPED);
+        rad_dev_free(d, RAD_MEM_DEVICE);
+        return;
+    }
+    /* The host backend resolves only an allocation's base, so the interior addresses are a card's
+     * question. */
+    CHECK_EQ(rad_dev_device_ptr(h), (void*)h);
+    if (!rad::device_is_host())
+        for (int64_t off : { gib - 1, gib, 2 * gib - 4096, 2 * gib, n - 1 })
+            CHECK_EQ(rad_dev_device_ptr(h + off), (void*)(h + off));
+
+    std::string expect((size_t)w, '\0');
+    for (int64_t b : { gib, 2 * gib }) {
+        uint8_t* span = h + b - w / 2;
+        fill(span, w, (uint32_t)(b >> 20));
+        std::memcpy(expect.data(), span, (size_t)w);
+        CHECK_OK(rad_memcpy_async(d, span, w, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        std::memset(span, 0, (size_t)w);
+        CHECK_OK(rad_memcpy_async(span, d, w, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_EQ(std::memcmp(span, expect.data(), (size_t)w), 0);
+        CHECK_OK(rad_memset_async(span, 0xA5, w, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK(span[0] == 0xA5 && span[w / 2 - 1] == 0xA5 && span[w / 2] == 0xA5 && span[w - 1] == 0xA5);
+    }
+    rad_dev_free(d, RAD_MEM_DEVICE);
+    rad_dev_free(h, RAD_MEM_HOST_MAPPED);
+}
+
+/* A DEVICE ALLOCATION THE CARD CANNOT TAKE IS AN ERROR, AND STAYS ONE AFTER A QUEUE HAS BEEN
+ * DESTROYED. ROCm 7.2's runtime answers a VRAM allocation the driver refuses by walking every queue
+ * the process ever created, destroyed ones included, and dies of SIGSEGV there; the backend refuses
+ * such a request itself, before the runtime is asked (core/device/aql.cpp, "the room check"). A
+ * stream is made and destroyed first, so the walk would have a freed queue to touch, and then the
+ * whole card is asked for: more than the driver has left, since this process already holds some of
+ * it, and no more than one allocation may be, so without the check it reaches the driver. */
+TEST(an_allocation_the_card_cannot_take_is_refused_after_a_queue_was_destroyed) {
+    if (rad::device_is_host()) {
+        std::fprintf(stderr, "  SKIP an_allocation_the_card_cannot_take_is_refused_after_a_queue_"
+                             "was_destroyed: a card only\n");
+        return;
+    }
+    { Stream st; CHECK(st.s != nullptr); }
+    RadDeviceProps p{};
+    CHECK_OK(rad_dev_props(0, &p));
+    void* d = rad_dev_alloc(p.vram_bytes, RAD_MEM_DEVICE);
+    CHECK(d == nullptr);
+    const char* why = rad_dev_last_error();
+    CHECK(std::strstr(why, "on card 0: the driver has") != nullptr);
+    CHECK(std::strstr(why, "this process") != nullptr);
+    if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+
+    /* And the card still serves an allocation it can take. */
+    void* ok = rad_dev_alloc(8 << 20, RAD_MEM_DEVICE);
+    CHECK(ok != nullptr);
+    rad_dev_free(ok, RAD_MEM_DEVICE);
+}
+
 TEST(device_allocation_moves_vram_free) {
     /* On a card, other processes move it too. */
     if (!rad::device_is_host()) {

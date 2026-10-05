@@ -673,6 +673,13 @@ which is why it is a named flag and not a heuristic.
 `--tp-wire-min-kb` is the floor below which messages are still served exactly — 128 KiB leaves
 single-sequence decode exact and compresses prefill, which is where the win is.
 
+At four ranks `wht6` selects a different lossy wire with the same floor: tiered int8 over a
+two-shot all-reduce, both hops quantised. Eight ranks have no lossy wire, and `--tp 8 --tp-wire
+wht6` stops at startup naming the all-reduce it found no kernel for. The exact wire at four and
+eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
+2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it; the two produce the same
+bits.
+
 On a model with a gated residual (Qwen3.8-Flash-Next) the all-reduce rides inside the residual's
 write, with the MoE gather in front of it, on either wire: the rotated forms of `ar_hc_write` and
 `ar_gather_hc_write` produce the same bytes as the unfused chain on the same wire. There `wht6` is
@@ -869,8 +876,8 @@ one line naming each one the command line moved.
 | flag | default | |
 |---|---|---|
 | `--tp N` | 1 | tensor-parallel ranks |
-| `--tp-wire MODE` | exact | `exact` or `wht6` |
-| `--tp-wire-min-kb N` | 128 | smallest all-reduce the `wht6` wire is used for |
+| `--tp-wire MODE` | exact | `exact` or `wht6`, the lossy wire (§4.7) |
+| `--tp-wire-min-kb N` | 128 | smallest all-reduce the lossy wire is used for |
 
 **Speculation**
 
@@ -1431,6 +1438,7 @@ released until it does.
 | KV in VRAM stays high with one session and nothing moves | The idle tiers are **off** — they are sized, and with no size nothing is copied | Pass `--prefix-cache-host-mib N` |
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |
 | `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps pinned memory system-wide at `ttm.pages_limit`, half of RAM by default | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under the cap the refusal names, or raise it with the kernel parameter `ttm.pages_limit` |
+| `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode was seen to refuse any single pin above about 2.5 GiB; a piece failing means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through but on that host also removed peer access between the cards, and every multi-rank kernel requires it. Report the kernel version, the IOMMU mode and the refusal line |
 | `--draft-model is not implemented` | This engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
 | `context_length_exceeded` on a request | The **prompt alone** does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate at all | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
 | `unknown option '--foo'` and the engine exits | Deliberate. A typo in a budget flag is the difference between the plan you asked for and one the planner invented | Check `radiance --help` |

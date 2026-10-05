@@ -281,9 +281,8 @@ inline int rad_operand_shapes(const std::string& op, const Geometry& g, int n_op
     }
     else if (op == "all_reduce" || op == "all_gather") {
         /* Both take two operands. all_gather's second is [world_size * numel]; all_reduce's is the
-         * optional SECOND DESTINATION -- absent means in place, which is the form docs/OPS.md
-         * draws and the only one a one-shot kernel needs, but libr4d's two-shot rows are not safe
-         * in place and cannot be checked at all without it, so it is passed. */
+         * optional SECOND DESTINATION -- absent means in place, the form docs/OPS.md draws and
+         * every block issues. It is passed so the out-of-place form is exercised too. */
         const int64_t numel = gi("numel", n ? n : M);
         add(D, {numel});
         add(D, {op == "all_gather" ? numel * gi("world_size", 1) : numel});

@@ -43,6 +43,7 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <unordered_set>
 
 using namespace rad;
 
@@ -233,6 +234,9 @@ void usage() {
         "      --reuse FILE     a container converted earlier from the SAME checkpoint. A weight\n"
         "                       it holds with the same encoding, quantiser, options and shape is\n"
         "                       copied from it instead of quantised again\n"
+        "      --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from\n"
+        "                       the checkpoint the --reuse container was converted from. Every\n"
+        "                       weight that reads one is converted; the rest are copied\n"
         "      --in-place       with --reuse: EXTEND that container instead of writing a new one.\n"
         "                       Its weights stay where they are; new ones are written past its\n"
         "                       end and the header last. Refused when a weight it holds would\n"
@@ -257,7 +261,7 @@ int main(int argc, char** argv) {
     int      max_spec = kMaxSpecDefault;
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false;
-    std::string reuse_path;
+    std::string reuse_path, changed_path;
     bool        in_place = false;
     int         kv_dtype = RAD_DT_INVALID;
     std::vector<std::pair<std::string, std::string>> set_kv;
@@ -295,6 +299,7 @@ int main(int argc, char** argv) {
         else if (a == "--plan-only") plan_only = true;
         else if (a == "--report")    report_n = std::atoi(next("--report"));
         else if (a == "--reuse")     reuse_path = next("--reuse");
+        else if (a == "--changed")   changed_path = next("--changed");
         else if (a == "--in-place")  in_place = true;
         else if (a == "--kv-cache-dtype") {
             const std::string v = next("--kv-cache-dtype");
@@ -338,6 +343,12 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (!changed_path.empty() && (reuse_path.empty() || in_place)) {
+        std::fprintf(stderr, "rad-convert: --changed says which weights not to copy from the "
+                             "container --reuse names, and needs --reuse without --in-place (a "
+                             "weight cannot be replaced in place)\n");
+        return 2;
+    }
     if (in_place) {
         if (reuse_path.empty()) {
             std::fprintf(stderr, "rad-convert: --in-place extends the container --reuse names\n");
@@ -396,6 +407,26 @@ int main(int argc, char** argv) {
     /* THE CONTAINER --reuse NAMES, read with pread and never paged through its mapping. */
     RadFile reuse;
     if (!reuse_path.empty() && reuse.open(reuse_path.c_str()) != RAD_OK) return 1;
+    /* THE TENSORS --changed NAMES: a checkpoint that differs from the --reuse container's own in
+     * these and nowhere else -- a weight edit, a fine-tune of some matrices. --reuse matches a
+     * weight on how it was converted and not on its source bytes, so without this list it would
+     * copy the old weight for every one of them. */
+    std::unordered_set<std::string> changed, changed_read;
+    if (!changed_path.empty()) {
+        std::ifstream cf(changed_path);
+        if (!cf) { RAD_ERR("--changed %s: cannot read it", changed_path.c_str()); return 1; }
+        std::string line;
+        while (std::getline(cf, line)) {
+            const size_t a = line.find_first_not_of(" \t\r");
+            const size_t z = line.find_last_not_of(" \t\r");
+            if (a == std::string::npos || line[a] == '#') continue;
+            changed.insert(line.substr(a, z - a + 1));
+        }
+        if (changed.empty()) {
+            RAD_ERR("--changed %s names no tensor", changed_path.c_str());
+            return 1;
+        }
+    }
     /* EXTENDED, NOT RE-DECIDED. The container's radiance.* keys are the convert-time choices its
      * weights were made under, and a run that keeps those weights declares under the same ones.
      * `radiance.encoder` is not a choice; this run derives it. */
@@ -738,7 +769,7 @@ int main(int argc, char** argv) {
     };
     std::vector<Job> jobs;
     jobs.reserve(plan.size());
-    int64_t reused_inplace = 0, n_inplace = 0;
+    int64_t reused_inplace = 0, n_inplace = 0, n_changed = 0;
 
     for (Logical* Lp : plan) {
         Logical& L = *Lp;
@@ -760,6 +791,12 @@ int main(int argc, char** argv) {
          * are the same planes, given the same checkpoint -- which --reuse leaves to the operator,
          * since nothing in either container records a Hessian's contents. */
         const RadFileEntry* re = reuse.is_open() ? reuse.find(ww.name) : nullptr;
+        const bool reads_changed =
+            !changed.empty() && ckpt_reads_any(L.src, changed, &changed_read);
+        if (re && reads_changed) {
+            re = nullptr;
+            ++n_changed;
+        }
         if (re) {
             bool same = rad_enc_equal(&reuse.encoding(*re), &ww.enc) &&
                         ww.quantizer == reuse.str(re->quantizer) &&
@@ -788,6 +825,22 @@ int main(int argc, char** argv) {
         const int64_t idx = w.add_weight(ww);
         if (idx < 0) { w.abort(); return 1; }
         jobs.push_back(Job{ Lp, idx, re, plane_total });
+    }
+    /* A NAME NO WEIGHT READS changes nothing, so it is a typo or a tensor this program does not
+     * convert -- and either way the operator believes a weight is being converted that is not. */
+    if (!changed.empty()) {
+        std::vector<std::string> unread;
+        for (const std::string& n : changed)
+            if (!changed_read.count(n)) unread.push_back(n);
+        if (!unread.empty()) {
+            std::sort(unread.begin(), unread.end());
+            RAD_ERR("--changed names %zu tensor(s) no weight of this conversion reads, e.g. '%s'",
+                    unread.size(), unread[0].c_str());
+            w.abort();
+            return 1;
+        }
+        RAD_INFO("--changed: %zu tensor(s) read by %lld weight(s), which are converted rather "
+                 "than copied", changed.size(), (long long)n_changed);
     }
 
     /* ---------------------------------------------------------------- vocab */

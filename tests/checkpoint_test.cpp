@@ -16,6 +16,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_set>
 #include <vector>
 
 using namespace rad;
@@ -259,6 +260,37 @@ TEST(an_expert_is_its_slice_of_a_stack) {
     REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 1, sp.data(), &why), RAD_OK);
     CHECK_EQ(rad_load_f32(sp.data(), RAD_BF16, 0), 8.0f);    /* the second expert's scale */
     CHECK(ckpt_resolve(ck, prog, "e9", false, &w, &why) < 0);
+    remove_checkpoint(dir);
+}
+
+/* A CHANGED TENSOR IS NAMED AS THE CHECKPOINT NAMES IT. An expert is a slice "exps[2]" of its
+ * stack, and it reads "exps"; a block-FP8 weight reads its scale plane as well as its codes, so a
+ * changed scale changes the weight. */
+TEST(a_weight_reads_the_checkpoint_tensors_its_pieces_and_scales_come_from) {
+    const std::string dir = write_checkpoint(
+        { bf16("exps", { 4, 2, 3 }, 0.0f), fp8("q.weight", { 2, 128, 128 }),
+          bf16("q.weight_scale_inv", { 2, 1, 1 }, 7.0f), bf16("a.weight", { 2, 3 }, 0.0f),
+          bf16("b.weight", { 2, 3 }, 0.0f) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("e2", RAD_MAP_COPY, { "exps" }, { 2 }));
+    prog.name_map.push_back(map("q1", RAD_MAP_COPY, { "q.weight" }, { 1 }));
+    prog.name_map.push_back(map("ab", RAD_MAP_CONCAT, { "a.weight", "b.weight" }));
+    CkptWeight e2, q1, ab;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "e2", false, &e2, &why), RAD_OK);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "q1", false, &q1, &why), RAD_OK);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "ab", false, &ab, &why), RAD_OK);
+    CHECK_EQ(ckpt_tensor_of(*e2.pieces[0]), std::string("exps"));
+
+    std::unordered_set<std::string> hit;
+    CHECK(ckpt_reads_any(e2, { "exps" }, &hit));
+    CHECK(!ckpt_reads_any(e2, { "exps[2]" }));        /* a slice is not a checkpoint name */
+    CHECK(ckpt_reads_any(q1, { "q.weight_scale_inv" }, &hit));
+    CHECK(ckpt_reads_any(ab, { "b.weight" }, &hit));   /* one changed piece of a join */
+    CHECK(!ckpt_reads_any(ab, { "q.weight", "exps" }));
+    CHECK_EQ(hit.size(), (size_t)3);
     remove_checkpoint(dir);
 }
 

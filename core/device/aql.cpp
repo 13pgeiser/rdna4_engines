@@ -35,15 +35,20 @@
 
 /* The standard headers first: HIP's defines __noinline__, which <format> (reached through
  * <chrono>) uses as an attribute name. */
+#include <dirent.h>
 #include <dlfcn.h>
 #include <immintrin.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <linux/kfd_ioctl.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
@@ -52,6 +57,7 @@
 #include <cstring>
 #include <memory>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <new>
 #include <string>
@@ -207,6 +213,7 @@ struct Dev {
     std::vector<std::string> isas;      /* the targets it accepts, preferred first; see agent_isas */
     hsa_amd_memory_pool_t vram{};
     bool        has_vram = false;
+    uint32_t    kfd_id = 0;             /* the driver's gpu_id: its sysfs and ioctls name it so */
 };
 
 struct Global {
@@ -349,6 +356,8 @@ bool init_devices() {
                 g.dev[(size_t)i].agent = a;
                 g.dev[(size_t)i].isa = agent_isa(a);
                 g.dev[(size_t)i].isas = agent_isas(a);
+                hsa_agent_get_info(a, (hsa_agent_info_t)HSA_AMD_AGENT_INFO_DRIVER_UID,
+                                   &g.dev[(size_t)i].kfd_id);
                 hsa_amd_agent_iterate_memory_pools(a, find_vram, &g.dev[(size_t)i]);
                 found = true;
                 break;
@@ -1014,6 +1023,23 @@ void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owne
     h.gen = gen;
 }
 
+/* The host ranges this backend pinned itself (see "pinned host memory, in pieces"): base ->
+ * length, ordered so an inner address finds its range. */
+std::mutex g_pinned_mu;
+std::map<uintptr_t, int64_t> g_pinned;
+
+bool pinned_range(const void* p, uintptr_t* lo, int64_t* len) {
+    const uintptr_t a = (uintptr_t)p;
+    std::lock_guard<std::mutex> lk(g_pinned_mu);
+    auto it = g_pinned.upper_bound(a);
+    if (it == g_pinned.begin()) return false;
+    --it;
+    if (a - it->first >= (uintptr_t)it->second) return false;
+    if (lo) *lo = it->first;
+    if (len) *len = it->second;
+    return true;
+}
+
 Loc locate(const void* p, const Stream* s, const void** gpu) {
     *gpu = p;
     const uintptr_t a = (uintptr_t)p;
@@ -1023,6 +1049,15 @@ Loc locate(const void* p, const Stream* s, const void** gpu) {
         *gpu = (const void*)(a + (uintptr_t)h.shift);
         if (!h.owner) return kHost;
         return h.owner == s->agent.handle ? kDevLocal : kDevPeer;
+    }
+    /* PINNED HERE, ANSWERED HERE. hsa_amd_pointer_info reports memory locked with
+     * hsa_amd_memory_lock_to_pool as UNKNOWN on this runtime -- indistinguishable from pageable --
+     * although the lock mapped it on every card at its own address. */
+    uintptr_t plo = 0;
+    int64_t plen = 0;
+    if (pinned_range(p, &plo, &plen)) {
+        loc_keep((const void*)plo, (size_t)plen, 0, 0, gen);
+        return kHost;
     }
     hsa_amd_pointer_info_t info{};
     info.size = sizeof info;
@@ -1774,6 +1809,87 @@ int a_memset_async(void* dst, int value, int64_t bytes, RadStream rs) {
     return rc < 0 ? RAD_E_DEVICE : RAD_OK;
 }
 
+/* ---- VRAM: the room check.
+ *
+ * A VRAM ALLOCATION THE DRIVER REFUSES KILLS THE PROCESS IN THIS RUNTIME once a queue has been
+ * destroyed. On a refusal ROCr releases its caches and asks again (GpuAgent::Trim), and the release
+ * walks every queue the process created on the card. ROCm 7.2's runtime adds a queue to that list
+ * (GpuAgent::aql_queues_, amd_gpu_agent.cpp) and never takes a destroyed one off it, so the walk
+ * calls into freed memory and the process dies of SIGSEGV inside libhsa-runtime64.so instead of
+ * being told no. Startup destroys queues before it allocates anything large -- the two it makes to
+ * measure what a queue costs, and the loader's when a load ends -- so every refused device
+ * allocation took that path: a card another process had taken memory from crashed startup in
+ * hipMalloc rather than refusing its arena. ROCr's develop branch takes the queue off the list on
+ * destroy; until a release carries that, every device allocation here is held to what the driver
+ * will still give on the card and refused by this layer, naming what the card has and which
+ * processes hold it, before the runtime is asked.
+ *
+ * The figure is the driver's own (AMDKFD_IOC_AVAILABLE_MEMORY), the one its allocation check
+ * compares against, and the request is rounded up to 2 MiB so one the driver rounds up is not
+ * passed by a hair. It is a check, not a reservation: memory another process takes between it and
+ * the allocation still reaches the runtime. */
+
+/* What the driver will still allocate on card `ord`, -1 when it will not say. */
+int64_t card_available(int ord) {
+    if (ord < 0 || ord >= (int)G().dev.size() || G().kfd < 0) return -1;
+    kfd_ioctl_get_available_memory_args a{};
+    a.gpu_id = G().dev[(size_t)ord].kfd_id;
+    if (!a.gpu_id || ioctl(G().kfd, AMDKFD_IOC_AVAILABLE_MEMORY, &a) < 0) return -1;
+    return (int64_t)a.available;
+}
+
+/* The processes holding VRAM on card `ord`, largest first, as the driver lists them: host process
+ * ids, which inside a container are not this process's own numbering, so this process is named
+ * only where the ids agree. */
+std::string card_holders(int ord) {
+    const uint32_t id = G().dev[(size_t)ord].kfd_id;
+    std::vector<std::pair<int64_t, long>> held;
+    if (DIR* d = opendir("/sys/class/kfd/kfd/proc")) {
+        while (dirent* e = readdir(d)) {
+            char* end = nullptr;
+            const long pid = std::strtol(e->d_name, &end, 10);
+            if (end == e->d_name || *end) continue;
+            char path[128];
+            std::snprintf(path, sizeof path, "/sys/class/kfd/kfd/proc/%ld/vram_%u", pid, id);
+            FILE* f = std::fopen(path, "r");
+            if (!f) continue;
+            long long v = 0;
+            if (std::fscanf(f, "%lld", &v) == 1 && v > 0) held.push_back({ (int64_t)v, pid });
+            std::fclose(f);
+        }
+        closedir(d);
+    }
+    if (held.empty()) return std::string();
+    std::sort(held.begin(), held.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    std::string s = fmt(" %zu process(es) hold memory on it, by host process id:", held.size());
+    bool self = false;
+    for (size_t i = 0; i < held.size() && i < 8; ++i) {
+        const bool me = held[i].second == (long)getpid();
+        self = self || me;
+        s += fmt("%s %ld %s%s", i ? "," : "", held[i].second, humanb(held[i].first).c_str(),
+                 me ? " (this process)" : "");
+    }
+    if (held.size() > 8) s += fmt(", and %zu more", held.size() - 8);
+    if (!self) s += "; this process is one of them under the host's numbering";
+    return s + ".";
+}
+
+/* True when card `ord` can take `bytes` more; otherwise false with the refusal set, `what` naming
+ * the call. A card whose figure the driver will not give is let through, as before this check. */
+bool card_has_room(int ord, int64_t bytes, const char* what) {
+    const int64_t avail = card_available(ord);
+    if (avail < 0) return true;
+    constexpr int64_t kUnit = (int64_t)2 << 20;
+    const int64_t need = (bytes + kUnit - 1) / kUnit * kUnit;
+    if (need <= avail) return true;
+    device_set_error("%s(%s) on card %d: the driver has %s left to give on it.%s Memory another "
+                     "process took after the VRAM budget was measured is the usual cause: stop "
+                     "that process, or start this one again once it has gone",
+                     what, humanb(bytes).c_str(), ord, humanb(avail).c_str(),
+                     card_holders(ord).c_str());
+    return false;
+}
+
 /* ---- elastic memory, through HSA.
  *
  * HIP's virtual-memory calls build HIP's own default-stream queue on the card the first time a
@@ -1857,6 +1973,7 @@ int a_vmem_commit(void* addr, int64_t bytes) {
     if (dev < 0 && hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
     if (dev < 0 || dev >= (int)G().dev.size()) return RAD_E_DEVICE;
     const Dev& d = G().dev[(size_t)dev];
+    if (!card_has_room(dev, bytes, "vmem commit")) return RAD_E_NOMEM;
     hsa_amd_vmem_alloc_handle_t h{};
     if (hsa_amd_vmem_handle_create(d.vram, (size_t)bytes, MEMORY_TYPE_NONE, 0, &h) !=
         HSA_STATUS_SUCCESS) {
@@ -1903,12 +2020,190 @@ int a_vmem_decommit(void* addr, int64_t bytes) {
     return RAD_OK;
 }
 
-/* HIP's own free, behind the forgetting every free needs (locate's cache). */
+/* ------------------------------------------------------------------ pinned host memory, in pieces
+ *
+ * EVERY PINNED OR MAPPED HOST ALLOCATION IS ONE ADDRESS RANGE LOCKED AS PIECES OF AT MOST
+ * kPinPiece, BECAUSE OF THE IOMMU. Host memory a card reaches is a userptr buffer object, which the
+ * kernel DMA-maps for each card as one scatterlist. On an Intel VT-d host in scalable mode (Linux
+ * 7.0, two R9700) that mapping fails for any single buffer larger than about 2.5 GiB while smaller
+ * ones succeed every time, so a 12 GiB host pool allocated whole was refused at startup far below
+ * the driver's pinned-memory cap. Passthrough (iommu=pt) lets the large pin through but takes peer
+ * access away, which every multi-rank kernel requires, so the configuration has to work with
+ * translation on. A range locked in pieces never asks the IOMMU for more than one piece at a time.
+ *
+ * The lock is ROCr's, hsa_amd_memory_lock_to_pool: the same userptr pin hipHostMalloc makes, one
+ * buffer object per call. hsa_amd_pointer_info does not report what it locked, so locate() answers
+ * from this backend's own record of the ranges (g_pinned) and HIP is never asked about them.
+ * hipHostRegister would be HIP's record instead, and HIP's record is not what the copies read.
+ *
+ * The cards still see one range: a locked piece is mapped at its own host address, so the pieces
+ * of one reservation are consecutive on the card too. Each piece is checked rather than assumed,
+ * because the pools, the mover and the activation arena all hand a kernel base + offset.
+ *
+ * What hipHostMalloc does besides the pin is kept, so the pages are the same pages: shared
+ * anonymous memory, huge pages advised from 2 MiB up, a preferred NUMA node that is the one
+ * nearest the current card (ROCr allocates from that node's pool), fine-grained coherence (the
+ * pool locked to), and access from every card.
+ *
+ * kPinPiece is a power of two well under the failing size. The cost is one buffer object per piece
+ * per card: a few dozen for the largest pools. */
+constexpr int64_t kPinPiece = (int64_t)1 << 30;
+
+/* The NUMA node sysfs reports for the current card, -1 when it reports none. */
+int current_card_numa_node() {
+    int dev = 0;
+    char bus[64] = {0};
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetPCIBusId(bus, (int)sizeof bus, dev) != hipSuccess || !bus[0])
+        return -1;
+    for (char* c = bus; *c; ++c) *c = (char)std::tolower((unsigned char)*c);
+    char path[160];
+    std::snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/numa_node", bus);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return -1;
+    int node = -1;
+    if (std::fscanf(f, "%d", &node) != 1) node = -1;
+    std::fclose(f);
+    return node;
+}
+
+/* MPOL_PREFERRED | MPOL_F_STATIC_NODES, the policy ROCr's own host allocations take. A refusal (a
+ * seccomp profile that blocks mbind, a node with no memory) leaves the pages on whichever node
+ * first touches them, which is a placement cost and not a correctness one: said once, then the
+ * lock goes ahead. */
+void prefer_numa_node(void* p, int64_t len, int node) {
+    constexpr int kMaxNodes = 1024;
+    constexpr int kBits = 8 * (int)sizeof(unsigned long);
+    if (node < 0 || node >= kMaxNodes) return;
+    unsigned long mask[kMaxNodes / kBits] = {};
+    mask[node / kBits] |= 1ul << (node % kBits);
+    constexpr int kMpolPreferred = 1, kMpolStaticNodes = 1 << 15;
+    if (::syscall(SYS_mbind, p, (unsigned long)len, kMpolPreferred | kMpolStaticNodes, mask,
+                  (unsigned long)kMaxNodes + 1, 0u) == 0)
+        return;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        RAD_WARN("device: pinned host memory could not prefer NUMA node %d, the one nearest the "
+                 "card (mbind: %s); its pages land on whichever node touches them first", node,
+                 std::strerror(errno));
+}
+
+const char* hsa_why(hsa_status_t st) {
+    const char* m = nullptr;
+    return hsa_status_string(st, &m) == HSA_STATUS_SUCCESS && m ? m : "unknown HSA status";
+}
+
+void* pin_pieces(int64_t bytes) {
+    const int64_t align = RAD_ALIGN_POOL;
+    const int64_t len = align_up(bytes, 4096);
+    /* One alignment over, trimmed at both ends, so the range starts on a 2 MiB boundary: a pool's
+     * fixed-stride slots inherit its base alignment, and a huge page needs it. */
+    void* m = ::mmap(nullptr, (size_t)(len + align), PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) {
+        device_set_error("rad_dev_alloc(%s): mmap: %s", humanb(bytes).c_str(), std::strerror(errno));
+        return nullptr;
+    }
+    const uintptr_t lo = (uintptr_t)m;
+    const uintptr_t at = (lo + (uintptr_t)align - 1) & ~((uintptr_t)align - 1);
+    if (at > lo) ::munmap(m, at - lo);
+    if (lo + (uintptr_t)align > at) ::munmap((void*)(at + (uintptr_t)len), lo + (uintptr_t)align - at);
+    char* const p = (char*)at;
+
+    prefer_numa_node(p, len, current_card_numa_node());
+    if (len >= ((int64_t)2 << 20)) ::madvise(p, (size_t)len, MADV_HUGEPAGE);
+
+    std::vector<hsa_agent_t> cards;
+    for (const Dev& d : G().dev) cards.push_back(d.agent);
+    const int pieces = (int)((len + kPinPiece - 1) / kPinPiece);
+    int done = 0;
+    for (; done < pieces; ++done) {
+        const int64_t off = (int64_t)done * kPinPiece;
+        const int64_t n = std::min(kPinPiece, len - off);
+        void* on_card = nullptr;
+        const hsa_status_t st = hsa_amd_memory_lock_to_pool(p + off, (size_t)n, cards.data(),
+                                                            (int)cards.size(), G().host_fine, 0,
+                                                            &on_card);
+        if (st != HSA_STATUS_SUCCESS) {
+            device_set_error("rad_dev_alloc(%s): locking piece %d of %d (%s at +%s): %s",
+                             humanb(bytes).c_str(), done + 1, pieces, humanb(n).c_str(),
+                             humanb(off).c_str(), hsa_why(st));
+            break;
+        }
+        if (on_card != p + off) {
+            ++done;
+            device_set_error("rad_dev_alloc(%s): piece %d of %d is mapped on the cards at %p, not "
+                             "at its host address %p, so the pieces are not one range there",
+                             humanb(bytes).c_str(), done, pieces, on_card, (void*)(p + off));
+            break;
+        }
+    }
+    if (done < pieces) {
+        for (int i = 0; i < done; ++i) (void)hsa_amd_memory_unlock(p + (int64_t)i * kPinPiece);
+        ::munmap(p, (size_t)len);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lk(g_pinned_mu);
+    g_pinned.emplace((uintptr_t)p, len);
+    return p;
+}
+
+void unpin_pieces(void* p) {
+    int64_t len = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_pinned_mu);
+        auto it = g_pinned.find((uintptr_t)p);
+        if (it == g_pinned.end()) {
+            RAD_WARN("rad_dev_free(%p): not the base of a pinned range this backend handed out; "
+                     "leaked rather than unpinned", p);
+            return;
+        }
+        len = it->second;
+        g_pinned.erase(it);
+    }
+    for (int64_t off = 0; off < len; off += kPinPiece) {
+        const hsa_status_t st = hsa_amd_memory_unlock((char*)p + off);
+        if (st != HSA_STATUS_SUCCESS)
+            RAD_WARN("device: unlocking pinned piece %p: %s", (void*)((char*)p + off), hsa_why(st));
+    }
+    ::munmap(p, (size_t)len);
+}
+
+bool pinned_kind(int kind) { return kind == RAD_MEM_HOST_PINNED || kind == RAD_MEM_HOST_MAPPED; }
+
+/* HIP's own allocation calls for device and pageable memory; the pinned kinds are the pieces. The
+ * two pinned kinds are one thing here: RAD_MEM_HOST_PINNED (the mover's staging and the O_DIRECT
+ * landing zone, spec §5.4) and RAD_MEM_HOST_MAPPED (the zero-copy execution site, row three of
+ * spec §5.1's table) are both a locked range every card addresses at its host address. */
+void* (*g_hip_alloc)(int64_t, int) = nullptr;
+void* a_alloc(int64_t bytes, int kind) {
+    if (kind == RAD_MEM_DEVICE && bytes > 0) {
+        int dev = -1;
+        if (hipGetDevice(&dev) == hipSuccess && !card_has_room(dev, bytes, "rad_dev_alloc"))
+            return nullptr;
+    }
+    if (!pinned_kind(kind)) return g_hip_alloc(bytes, kind);
+    if (bytes <= 0) {
+        device_set_error("rad_dev_alloc(%lld): size must be positive", (long long)bytes);
+        return nullptr;
+    }
+    return pin_pieces(bytes);
+}
+
+/* Behind the forgetting every free needs (locate's cache). */
 void (*g_hip_free)(void*, int) = nullptr;
 void a_free(void* p, int kind) {
     loc_forget();
-    if (g_hip_free) g_hip_free(p, kind);
+    if (!p) return;
+    if (pinned_kind(kind)) unpin_pieces(p);
+    else if (g_hip_free) g_hip_free(p, kind);
 }
+
+/* A pinned range is the same address on both sides, inner addresses included. */
+void* (*g_hip_host_ptr)(void*) = nullptr;
+void* (*g_hip_device_ptr)(void*) = nullptr;
+void* a_host_ptr(void* p) { return pinned_range(p, nullptr, nullptr) ? p : g_hip_host_ptr(p); }
+void* a_device_ptr(void* p) { return pinned_range(p, nullptr, nullptr) ? p : g_hip_device_ptr(p); }
 
 /* ------------------------------------------------------------------ plugin device code */
 
@@ -1969,8 +2264,14 @@ const DeviceBackend* aql_backend_if_present(void) {
         G().ok = true;
         g_aql = *hip;
         g_aql.name = "aql";
+        g_hip_alloc = hip->alloc;
         g_hip_free = hip->free;
+        g_hip_host_ptr = hip->host_ptr;
+        g_hip_device_ptr = hip->device_ptr;
+        g_aql.alloc = a_alloc;
         g_aql.free = a_free;
+        g_aql.host_ptr = a_host_ptr;
+        g_aql.device_ptr = a_device_ptr;
         g_aql.stream_create = a_stream_create;
         g_aql.stream_destroy = a_stream_destroy;
         g_aql.stream_sync = a_stream_sync;

@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rad {
@@ -146,6 +147,15 @@ struct CkptWeight {
  * there; anything else with the reason in `why`. */
 int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, bool optional,
                  CkptWeight* out, std::string* why);
+
+/* The checkpoint tensor a piece or scale reads: its name without the "[index]" a slice of a
+ * stacked tensor carries, so an expert reads the stack it was cut from. */
+std::string ckpt_tensor_of(const SrcTensor& t);
+
+/* Whether `w` reads any tensor named in `names` (checkpoint names, as ckpt_tensor_of gives them),
+ * through a piece or a scale. Each name it reads is added to `hit` when that is given. */
+bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& names,
+                    std::unordered_set<std::string>* hit = nullptr);
 
 /* Logical rows [r0, r0 + nr) of `w` as f32 [nr, cols], whatever the pieces are stored as: a
  * plain float widened, FP8 times its block scale, a GGUF block type dequantised. */

@@ -65,8 +65,8 @@ they are why `gdn_conv_prep` and `gdn_recurrent_update` carry the long operand l
    that lacks an operand cannot express the call at all, so the narrower reading always loses. An
    implementation ignores an optional operand it does not use; it cannot invent one it needs.
 2. **Parameters are the UNION, and anything only one implementation needs is `optional`.** Same
-   argument. A constraint on an absent key simply does not hold, which is the correct answer and
-   is how `hops` works.
+   argument. A constraint on an absent key simply does not hold, which is the correct answer: a
+   row that needs a parameter the caller did not state is not a match.
 3. **A float-valued parameter is `RAD_P_F64`.** `eps`, `scale`, `theta`, `softplus_thr`, `l2_eps`,
    `wadd`. A `"%.9g"` string round-trips an IEEE single exactly and is unreadable in a graph dump,
    which is the whole of the argument against spelling them as strings. **Constraints never match
@@ -708,13 +708,17 @@ and the third is what needs the token stride carried separately.
 
 | op | params | operands |
 |---|---|---|
-| `all_reduce` | `world_size` `numel` `dtype` `exact` `min_bytes`/opt `hops`/opt | `x`:inout, `y`:out? |
+| `all_reduce` | `world_size` `numel`(range) `dtype` `exact` `min_bytes`/opt `hops`/opt | `x`:inout, `y`:out? |
 | `all_gather` | `world_size` `numel` `dtype` `row`/opt | `x` → `y` |
 
 `exact` separates the exact sum from the quantised wire, and a caller has to say which it wants: a
 request that does not declare it will accept a lossy wire gets no kernel rather than the quantised
-one. `hops` separates one-shot from two-shot at a width that has both. Both are libr4d's rules and
-they are right.
+one. That is libr4d's rule and it is right.
+
+libr4d separates one-shot from two-shot, at a width that has both, by message size: its two-shot
+rows start above 524288 elements, which makes that a band edge of the ranged `numel`, so a caller
+states nothing for it. `hops` is a caller's request for one or the other (1 or 2); libref accepts
+and ignores it, and no libr4d row reads it. Every all-reduce kernel serves `y` absent, in place.
 
 `min_bytes` is the byte floor under which a LOSSY row must serve the message exactly anyway, and it
 is a parameter rather than a constant in the library because it is a property of the link and not

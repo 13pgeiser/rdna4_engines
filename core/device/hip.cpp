@@ -1,7 +1,8 @@
 /* hip.cpp -- the HIP half of the device backend: devices, memory and elastic memory.
  *
  * Streams, events, copies and fills are not here. They are AQL packets the engine writes into
- * queues it owns (aql.cpp), which starts from this table and fills in the rest.
+ * queues it owns (aql.cpp), which starts from this table and fills in the rest -- pinned host
+ * memory included, because the copies have to recognise it.
  *
  * Thin by design. Every entry point is one hip* call plus an error capture, because anything
  * cleverer than that is a place where the host backend and this one can disagree, and the host
@@ -293,18 +294,11 @@ void* d_alloc(int64_t bytes, int kind) {
             e = hipMalloc(&p, (size_t)bytes);
             break;
         case RAD_MEM_HOST_PINNED:
-            /* The mover's staging pool and the O_DIRECT landing zone. Pinned so a transfer is a
-             * DMA the driver does not have to stage through its own bounce buffer (spec §5.4). */
-            e = hipHostMalloc(&p, (size_t)bytes, hipHostMallocDefault);
-            break;
         case RAD_MEM_HOST_MAPPED:
-            /* The zero-copy execution site: tier host, site device, no slab slot -- row three of
-             * spec §5.1's table. hipHostMallocMapped is what makes the allocation addressable from
-             * a kernel over the link, which is the whole mechanism. The cost is that every read is
-             * a link read, so this is for read-once weights and the planner decides which
-             * (spec §19.3). */
-            e = hipHostMalloc(&p, (size_t)bytes, hipHostMallocMapped);
-            break;
+            /* The AQL backend's, which pins host memory through ROCr in pieces the IOMMU can map
+             * (aql.cpp, "pinned host memory, in pieces"). */
+            device_set_error("rad_dev_alloc: pinned host memory is the AQL backend's");
+            return nullptr;
         case RAD_MEM_HOST:
             /* Pageable. Aligned to a page anyway so the same buffer can be an O_DIRECT target. */
             if (posix_memalign(&p, 4096, (size_t)((bytes + 4095) / 4096 * 4096)) != 0) p = nullptr;
@@ -325,9 +319,11 @@ void d_free(void* p, int kind) {
     if (!p) return;
     switch (kind) {
         case RAD_MEM_DEVICE:       HIP_NOTE(hipFree(p)); break;
-        case RAD_MEM_HOST_PINNED:
-        case RAD_MEM_HOST_MAPPED:  HIP_NOTE(hipHostFree(p)); break;
         case RAD_MEM_HOST:         std::free(p); break;
+        case RAD_MEM_HOST_PINNED:
+        case RAD_MEM_HOST_MAPPED:
+            RAD_WARN("rad_dev_free(%p): pinned host memory is the AQL backend's; leaked", p);
+            break;
         default:
             RAD_WARN("rad_dev_free(%p): unknown memory kind %d; leaked rather than freed with the "
                      "wrong allocator", p, kind);

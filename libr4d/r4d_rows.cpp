@@ -71,6 +71,18 @@
  * r4d_ar_entry.hip static_asserts the two against each other. */
 #define R4D_AR_TWOSHOT_WIDE_MAX_ELEMS 20971520
 
+/* The largest message, in elements, a 4- or 8-rank exact all-reduce keeps on the one-shot; above it
+ * the two-shot rows take it. 1 MiB of a 16-bit payload. The one-shot sends (ws-1)*N bytes a rank
+ * in one hop and the two-shot 2*(ws-1)/ws*N in two, so the one-shot wins while the second hop's
+ * latency outweighs the bytes it saves. The value is a separation, not a measured crossover: on
+ * Qwen3.8-Flash-Next (2560 wide, 5 KiB a row) the largest decode message is 640 KiB, at 32
+ * sequences each verifying four tokens, and a 2048-token prefill chunk is 10 MiB, so any bound
+ * between the two sends decode one-shot and prefill two-shot. It is a multiple of 128 for the
+ * reason pAllReduce's `numel` gives. */
+#define R4D_AR_WIDE_ONESHOT_MAX_ELEMS 524288
+#define R4D_XSTR(v) R4D_STR(v)
+#define R4D_STR(v)  #v
+
 /* ==================================================================================== schemas
  *
  * The first plugin in hierarchy order to declare an op fixes its schema (spec §2.3), and this
@@ -617,11 +629,13 @@ static const RadOperandSpec oDflashSelect[] = {
 /* ------------------------------------------------------------------------------ collectives */
 static const RadParamSpec pAllReduce[] = {
     { "world_size", RAD_P_INT, RAD_REQUIRED },
-    /* THE LARGEST message this instance will ever carry, not the one a given step carries. init()
-     * sizes the peer scratch from it once and the launch reads the real count off the tensor.
-     * docs/OPS.md marks no parameter of `all_reduce` as ranged, and this is why that is right
-     * here even though the message size does vary per step: making `numel` a RANGE would put a
-     * RAD_C_DIV constraint on a ranged parameter, and a band is not divisible by anything. */
+    /* The message, in elements. Every block declares it as a RANGE -- a step carries its row
+     * count times the width -- so the selector cuts it into bands at the bounds the rows below
+     * place on it and resolves each band at its upper bound: init() sizes the peer scratch for
+     * that bound once, and the launch reads the real count off the tensor. A row's RAD_C_DIV on
+     * `numel` is therefore checked at a band's upper bound, so every bound a row here places on
+     * it is a multiple of 128, the largest DIV among them; a bound that was not would leave a
+     * band no DIV row could serve. */
     { "numel",      RAD_P_INT, RAD_REQUIRED },
     { "dtype",      RAD_P_STR, RAD_REQUIRED },
     { "exact",      RAD_P_INT, RAD_REQUIRED },
@@ -631,12 +645,16 @@ static const RadParamSpec pAllReduce[] = {
      * stops costing more than the bytes it removes, and that is a bandwidth the deployment knows
      * and the library does not. An exact row ignores it -- there is nothing to fall back to. */
     { "min_bytes",  RAD_P_INT, RAD_OPTIONAL },
+    /* A caller's request for a one-shot (1) or two-shot (2). docs/OPS.md's schema is the union of
+     * every plugin's parameters and libref accepts it, so it stays declared here; no row of this
+     * plugin reads it, because the message size picks the two-shot (the all-reduce constraints
+     * below). */
     { "hops",       RAD_P_INT, RAD_OPTIONAL },
 };
-/* docs/OPS.md has `x` -> `x` (inout). The one-shot kernels reduce elementwise out[i] = in[i] +
- * peer_staged[i] and are safe in place; the two-shots are not, because a rank gathers into the
- * output while its own input is still being read for the scatter. So the output is an optional
- * SECOND operand: absent means in place, and the two-shot shims refuse in place by name. */
+/* docs/OPS.md has `x` -> `x` (inout). Every kernel here is safe in place -- the thread that
+ * overwrites a word of the input is the one that read it (r4d_ar_entry.hip says so per kernel) --
+ * and every block issues it that way. The output is an optional SECOND operand for a caller that
+ * wants the sum somewhere else: absent means in place. */
 static const RadOperandSpec oAllReduce[] = {
     { "x", RAD_OPD_INOUT, 0 },
     { "y", RAD_OPD_OUT,   1 },
@@ -1911,8 +1929,10 @@ static const RadOpSchema kSchemas[] = {
            "serial and the other K-1 rows of the score matrix are never read."),
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
-           "quantised wire and a caller that does not declare it gets no kernel; `hops` separates "
-           "one-shot from two-shot at a width that has both."),
+           "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
+           "the exact sum is one-shot up to " R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements and "
+           "two-shot above, chosen by the "
+           "message's band; `hops` is accepted and no row of this plugin reads it."),
     SCHEMA("all_gather", pAllGather, oAllGather,
            "y is [world_size * numel] with rank r's contribution at offset r * numel. The bytes are "
            "moved and never summed: the vocab-parallel sampler's payload is (u32 token id, f32 "
@@ -2329,13 +2349,14 @@ static const RadConstraint cGdnGatedRmsNorm[] = {
 /* ---- all-reduce ------------------------------------------------------------------------------
  * `exact` separates the two, and a caller has to say which it wants: a request that does not
  * declare it will accept a lossy wire format gets no kernel rather than the quantised one.
- * `hops` separates the one-shot from the two-shot at a width that has both. It has to be a
- * predicate and not just row order: a two-shot row's constraints are otherwise a superset of the
- * one-shot's at the same world_size. Omitting `hops` still resolves to the one-shot, which is the
- * latency-band default; ask for hops=2 to be handed the two-shot. On the kernel side that default
- * falls out of row order; here it is R4D_PRIO_AR_TWOSHOT > R4D_PRIO_AR_ONESHOT, so the mechanism
- * is written down rather than implied by position. The ti8 wire needs no such key -- exact=0
- * already separates it. */
+ * MESSAGE SIZE separates the one-shot from the two-shot at a width that has both. The two-shot
+ * rows start above R4D_AR_WIDE_ONESHOT_MAX_ELEMS, which makes that bound a band edge of `numel`:
+ * the band at or under it resolves only the one-shot, and in the band above both rows match and
+ * R4D_PRIO_AR_TWOSHOT > R4D_PRIO_AR_ONESHOT hands it the two-shot. The GE is one past the bound so
+ * the band under it ends ON the bound, a multiple of every DIV here (see pAllReduce's `numel`). The
+ * choice is the selector's and so it is what the band report names; no entry point substitutes
+ * one kernel for another. The ti8 wire needs no such key -- exact=0 already separates it, and it
+ * serves its own small messages exactly. */
 /* ---- all-gather -------------------------------------------------------------------------------
  * The vocab-parallel sampler's candidate merge, and nothing else in the engine issues one. No
  * `exact` key: a gather MOVES its payload and cannot be lossy, so there is no second row for it
@@ -2371,15 +2392,15 @@ static const RadConstraint cArExact8[] = {
     C_P2P,
 };
 static const RadConstraint cArTsExact4[] = {
-    C_EQ("world_size", 4), C_EQ("exact", 1), C_EQ("hops", 2),
-    C_IN("dtype", "bf16 fp16 fp32"),
-    C_DIV("numel", 64), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+    C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_DIV("numel", 64), C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
+    C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
     C_P2P,
 };
 static const RadConstraint cArTsExact8[] = {
-    C_EQ("world_size", 8), C_EQ("exact", 1), C_EQ("hops", 2),
-    C_IN("dtype", "bf16 fp16 fp32"),
-    C_DIV("numel", 64), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+    C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_DIV("numel", 64), C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
+    C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
     C_P2P,
 };
 static const RadConstraint cArWht6[] = {
@@ -3837,13 +3858,13 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_gdn_gated_rmsnorm },
 
 /* ---------------------------------------------------------------------------- all-reduce ----
- * The two-shot rows come FIRST in libr4d and outrank here, for the reason the constraint block
- * above states at length. */
+ * The two-shot rows outrank the one-shots, for the reason the constraint block above states. */
 { "ar_twoshot_4rank_exact", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
   "handshake",
-  "exactly 4 ranks, all peer-accessible; two hops (select with hops=2); shares the wide family's "
-  "flag/seq/scratch set; message must shard evenly over the ranks; cudagraph-safe",
+  "exactly 4 ranks, all peer-accessible; messages above "
+  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements, two hops; shares the wide family's "
+  "flag/seq/scratch set; message must shard evenly over the ranks; in place; cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT,
   ROW(cArTsExact4), ROW(tAr), nullptr,
@@ -3853,8 +3874,9 @@ static const RadKernelInfo kKernels[] = {
 { "ar_twoshot_8rank_exact", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
   "handshake",
-  "exactly 8 ranks, all peer-accessible; two hops (select with hops=2); shares the wide family's "
-  "flag/seq/scratch set; message must shard evenly over the ranks; cudagraph-safe",
+  "exactly 8 ranks, all peer-accessible; messages above "
+  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements, two hops; shares the wide family's "
+  "flag/seq/scratch set; message must shard evenly over the ranks; in place; cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT,
   ROW(cArTsExact8), ROW(tAr), nullptr,
@@ -3916,8 +3938,8 @@ static const RadKernelInfo kKernels[] = {
 
 { "ar_oneshot_4rank_exact", "all_reduce", "ar",
   "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
-  "exactly 4 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
-  "cudagraph-safe",
+  "exactly 4 ranks, all peer-accessible; one scratch slot per (parity, source rank); in "
+  "place; cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArExact4), ROW(tAr), nullptr,
@@ -3926,8 +3948,8 @@ static const RadKernelInfo kKernels[] = {
 
 { "ar_oneshot_8rank_exact", "all_reduce", "ar",
   "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
-  "exactly 8 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
-  "cudagraph-safe",
+  "exactly 8 ranks, all peer-accessible; one scratch slot per (parity, source rank); in "
+  "place; cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArExact8), ROW(tAr), nullptr,

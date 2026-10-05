@@ -1028,10 +1028,8 @@ extern "C" int r4d_shape_all_reduce(const RadParam* p, int n_p, int operand,
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
         opd(D, numel),
-        /* The optional SECOND DESTINATION. Absent means in place, which is what the one-shot rows
-         * do; the two-shot rows are not safe in place -- a rank gathers into the output while its
-         * own input is still being read for the scatter -- and refuse a null by name. Passing it
-         * is the one description that serves every row of the op. */
+        /* The optional SECOND DESTINATION. Absent means in place, which every row of the op
+         * serves; described so a caller that passes one is checked against the same extent. */
         opd(D, numel),
     };
     R4D_PICK(l);

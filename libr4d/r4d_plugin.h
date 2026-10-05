@@ -25,9 +25,8 @@
 enum {
     /* A two-shot row's constraints are a SUPERSET of the one-shot's at the same world_size, so a
      * two-shot that ranked below could never be reached: every query it serves the one-shot also
-     * matches. `hops` is ALSO a predicate, and both mechanisms are needed -- the predicate is what
-     * makes a query that omits `hops` fall through to the one-shot, and the priority is what makes
-     * hops=2 reachable at all. */
+     * matches. Its lower bound on `numel` is what keeps a small message on the one-shot, and the
+     * priority is what hands a large one to the two-shot. */
     R4D_PRIO_AR_TWOSHOT   = 70,
     R4D_PRIO_AR_ONESHOT   = 60,
 

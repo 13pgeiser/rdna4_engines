@@ -522,6 +522,26 @@ std::string scale_name(const std::string& codes) { return codes + "_scale_inv"; 
 
 }  /* namespace */
 
+std::string ckpt_tensor_of(const SrcTensor& t) {
+    const size_t br = t.name.size() && t.name.back() == ']' ? t.name.rfind('[') : std::string::npos;
+    return br == std::string::npos ? t.name : t.name.substr(0, br);
+}
+
+bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& names,
+                    std::unordered_set<std::string>* hit) {
+    bool any = false;
+    for (const auto* list : { &w.pieces, &w.scales })
+        for (const SrcTensor* t : *list) {
+            if (!t) continue;
+            const std::string n = ckpt_tensor_of(*t);
+            if (names.count(n)) {
+                any = true;
+                if (hit) hit->insert(n);
+            }
+        }
+    return any;
+}
+
 int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, bool optional,
                  CkptWeight* out, std::string* why) {
     auto refuse = [&](int rc, std::string m) {

@@ -241,11 +241,10 @@ std::string Geometry::str() const {
 }
 
 /* ------------------------------------------------------------------ constraint matching */
-/* A constraint whose key the geometry does not carry does NOT hold. That is libr4d's rule and the
- * reason its two-shot all-reduce rows have to precede the one-shot ones: a query that omits `hops`
- * fails the row that needs it, so the more constrained row can never be reached unless it is
- * asked for. Making the absence a failure is what makes "ask for hops=2 to be handed the two-shot"
- * mean something. */
+/* A constraint whose key the geometry does not carry does NOT hold. That is libr4d's rule: a row
+ * that constrains an optional parameter serves only a caller that states it, so the more
+ * constrained of two rows is reached only when it is asked for, and a caller that leaves the
+ * parameter out is handed the row that does not need it. */
 bool constraint_holds(const RadConstraint& c, const Geometry& g) {
     if (c.op == RAD_C_IN) {
         const char* v = g.get_s(c.key);
