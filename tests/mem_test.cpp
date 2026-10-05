@@ -731,6 +731,48 @@ TEST(kv_conv_slot_is_a_rolling_window) {
     CHECK_EQ(kv.free_states(G_CONV), s0);
 }
 
+/* THE SLOT THE MANAGER HANDS OUT IS THE SLOT THE KERNELS INDEX. The kernels take a conv slot's
+ * layout from the state tensor's last extent, conv_width-1 + n_spec; the manager clears a slot
+ * when it hands it out and saves and restores it at a checkpoint in the layout bytes_per_state
+ * describes. A builder figure one entry wider a slot -- what the allocation once carried --
+ * made handing slot s to a new sequence zero the start of slot s+1's window, the window of a
+ * sequence still decoding. The manager refuses the disagreement rather than serve with it. */
+TEST(kv_refuses_a_state_slot_the_kernels_would_not_index) {
+    auto group = [](int kind, int64_t bytes_per_state) {
+        KVGroupInfo k;
+        k.name = "state";
+        k.decl.kind = kind;
+        k.decl.dtype = RAD_BF16;
+        k.decl.n_head_kv = 2;
+        k.decl.head_dim = 8;
+        k.decl.state_dim[0] = 4;
+        k.decl.state_dim[1] = 8;
+        k.decl.conv_width = 4;
+        k.layers = { 0, 1 };
+        k.bytes_per_state = bytes_per_state;
+        return k;
+    };
+    auto configure = [](const KVGroupInfo& k) -> int {
+        std::vector<KVGroupInfo> g;
+        g.push_back(null_group());
+        g.push_back(k);
+        Config cfg = small_config();
+        cfg.n_spec = 3;
+        cfg.checkpoint_slots = 0;
+        Pools p;
+        if (p.configure(cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()) < 0)
+            return RAD_E_NOMEM;
+        KVManager kv;
+        return kv.configure(g, cfg, p.kv());
+    };
+    /* Conv: (4-1) + 3 = 6 entries of 2 x 8 bf16 channels, over two layers. */
+    CHECK_OK(configure(group(RAD_KV_CONV, 6LL * 2 * 8 * 2 * 2)));
+    CHECK_EQ(configure(group(RAD_KV_CONV, 7LL * 2 * 8 * 2 * 2)), RAD_E_SHAPE);
+    /* Linear: 2 heads of 4 x 8 bf16, over two layers. */
+    CHECK_OK(configure(group(RAD_KV_LINEAR, 2LL * 4 * 8 * 2 * 2)));
+    CHECK_EQ(configure(group(RAD_KV_LINEAR, 2LL * 4 * 8 * 2 * 2 + 64)), RAD_E_SHAPE);
+}
+
 TEST(kv_adopts_the_blocks_a_cache_hit_found) {
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/false));

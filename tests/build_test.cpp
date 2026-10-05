@@ -773,15 +773,16 @@ TEST(linear_state_is_sized_per_sequence) {
     CHECK_EQ(b.program().kv_groups[gl].bytes_per_state, 32LL * 128 * 128 * 4);
     CHECK_EQ(b.program().kv_groups[gl].bytes_per_block, 0);
 
-    /* A rolling window of conv_width-1 + n_spec + 1 entries, so a speculative rejection is a
-     * change of read offset rather than a recompute (spec §10).
+    /* A rolling window of conv_width-1 + n_spec entries, so a speculative rejection is a change of
+     * read offset rather than a recompute (spec §10).
      *
-     * THE +1 IS THE VERIFY STEP'S OWN OUTPUT. A verify writes 1 + n_spec conv outputs before
-     * anyone knows which survive, so peak occupancy is the retained history PLUS all of them --
-     * which is the modulus BatchBuilder::init and Scheduler::conv_window cycle the cursor by. A
-     * state sized without it is overrun by one entry every verify. rad_builder.cpp's own note on
-     * `entries` is the argument. */
-    CHECK_EQ(b.program().kv_groups[gc].bytes_per_state, 32LL * 128 * (4 - 1 + 4 + 1) * 4);
+     * EXACTLY THE STATE TENSOR'S EXTENT. The kernels lay a slot out from the tensor's last extent,
+     * conv_width-1 + n_spec, and the KV manager clears, checkpoints and restores the slot this
+     * figure describes; one entry more here put each of those over the start of the next
+     * sequence's window. rad_builder.cpp's note on `entries` is the argument. */
+    CHECK_EQ(b.program().kv_groups[gc].bytes_per_state, 32LL * 128 * (4 - 1 + 4) * 4);
+    CHECK_EQ(b.program().kv_groups[gc].bytes_per_state,
+             32LL * 128 * conv_window_entries(cd, 4) * 4);
 }
 
 /* ================================================================== names, notes, the C surface */

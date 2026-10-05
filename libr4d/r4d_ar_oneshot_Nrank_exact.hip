@@ -15,6 +15,7 @@
 //
 // The IPC helpers live in r4d_ar_oneshot_2rank_exact.hip; this unit links beside it.
 #include "r4d.h"
+#include <cstring>
 #include "r4d_ar_wide.h"
 #include "r4d_ar_hc.h"      // the gather and hc write words, shared with the two-rank fused forms
 #include <stdexcept>
@@ -521,7 +522,10 @@ static void ar_gather_hc_write_wide_launch(
     r4d_ar_check_extent(peer_flags[i], flag_bytes, "ar_gather_hc_write", "peer flags");
   }
 
+  /* Zeroed whole, padding included: the struct is passed by value, so its tail padding is
+   * kernel-argument bytes too, and a recorded pass's audit compares those bytes. */
   R4dArGather G;
+  std::memset(&G, 0, sizeof G);
   G.ye = (const unsigned short*)ye;
   G.ew = (const unsigned short*)ew;
   G.sorted = (const int*)sorted;

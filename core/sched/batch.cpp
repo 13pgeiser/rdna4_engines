@@ -399,8 +399,9 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
     if (max_ctx_ <= 0) max_ctx_ = cfg.max_tok;
 
     /* The conv rolling window: width-1 entries of history plus room for the whole speculative
-     * window, because a verify writes num_spec+1 conv outputs before anything is accepted, and a
-     * rejection then reads back at the slot the last accepted token left (spec §10). */
+     * window, and a rejection then reads back at the slot the last accepted token left (spec §10).
+     * The state tensor's own extent (conv_window_entries), so the cursor derived from it stays
+     * inside the slot the kernels index. */
     conv_window_.assign(prog.kv_groups.size(), 1);
     conv_group_ = -1;
     n_conv_ = 0;
@@ -410,8 +411,7 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
         ++n_conv_;
         conv_group_ = n_conv_ == 1 ? (int32_t)i : -1;   /* -1 once there is more than one */
         if (g.decl.conv_width > 0)
-            conv_window_[i] = (int32_t)(g.decl.conv_width - 1 +
-                                        (cfg.n_spec > 0 ? cfg.n_spec : 0) + 1);
+            conv_window_[i] = (int32_t)conv_window_entries(g.decl, cfg.n_spec);
     }
 
     /* ------------------------------------------------------------ derived buffers */

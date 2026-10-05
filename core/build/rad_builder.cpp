@@ -1382,22 +1382,18 @@ void Builder::finish_kv_groups() {
                                          * (d.state_dim[1] ? d.state_dim[1] : 1)) * n_bound;
                 break;
             case RAD_KV_CONV: {
-                /* A rolling window of conv_width-1 + n_spec + 1 entries, so a speculative
-                 * rejection is a change of read offset rather than a recompute (spec §10). The
-                 * window is sized for the largest speculative window this deployment was
-                 * configured for.
+                /* A rolling window of conv_width-1 + n_spec entries, so a speculative rejection
+                 * is a change of read offset rather than a recompute (spec §10). The window is
+                 * sized for the largest speculative window this deployment was configured for.
                  *
-                 * THE +1 IS THE VERIFY STEP'S OWN OUTPUT, and it is not optional. A verify writes
-                 * 1 + n_spec conv outputs before anyone knows which survive, so peak occupancy is
-                 * the conv_width-1 of retained history PLUS all 1 + n_spec of them. Sizing this
-                 * `conv_width - 1 + max_spec` instead -- six entries at width 4 depth 3 -- puts it
-                 * one short of the modulus BatchBuilder::init and Scheduler::conv_window cycle
-                 * `conv_cursor` by, which is `conv_width - 1 + n_spec + 1`, seven: `(cursor + 1 +
-                 * a) % 7` reaches 6, one past the end of the allocation and into the slot that
-                 * belongs to the next sequence. At n_spec 0 the two agree (modulus conv_width,
-                 * history conv_width-1 plus the one output), so the discrepancy hides there. */
-                int64_t entries = (d.conv_width > 0 ? d.conv_width - 1 : 0) +
-                                  (prog_.ctx.max_spec > 0 ? prog_.ctx.max_spec : 0) + 1;
+                 * EXACTLY THE STATE TENSOR'S EXTENT, conv_window_entries(), and not one more. The
+                 * kernels lay the slots out from the tensor, so an allocation one entry wider a
+                 * slot puts the manager's slot `s` -- the bytes it clears when it hands the slot
+                 * out, and saves and restores at a checkpoint -- over the start of the kernels'
+                 * slot `s + 1`. Handing a slot to a new sequence then zeroes part of a running
+                 * sequence's window. conv_state_index's cursor cycles by the same number, so it
+                 * stays inside the slot. */
+                int64_t entries = conv_window_entries(d, prog_.ctx.max_spec);
                 if (entries <= 0) entries = 1;
                 gi.bytes_per_block = 0;
                 gi.bytes_per_state =

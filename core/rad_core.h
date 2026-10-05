@@ -285,6 +285,18 @@ struct KVGroupInfo {
     std::vector<int> layers;
 };
 
+/* A RAD_KV_CONV GROUP'S WINDOW, IN ENTRIES: conv_width - 1 of history and one more for every
+ * speculative position. It is the last extent of the state tensor the kernels index, and the
+ * kernels take the layout from that extent -- a slot is `entries` consecutive entries a channel,
+ * and libr4d's conv update derives the verify step's query length from it as
+ * entries - (conv_width - 2). So the allocation's slot, the KV manager's view of a slot (its clear
+ * when one is handed out, a checkpoint's save and restore) and the cursor conv_state_index derives
+ * all take this one number. A slot sized larger on the manager's side than in the tensor puts
+ * each of those views across the start of the next sequence's window. */
+inline int64_t conv_window_entries(const RadKVGroupDecl& d, int64_t n_spec) {
+    return (d.conv_width > 0 ? d.conv_width - 1 : 0) + (n_spec > 0 ? n_spec : 0);
+}
+
 /* Everything declare produced. The core owns it; the plugin only ever sees handles into it. */
 class Program {
 public:

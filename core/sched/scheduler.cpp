@@ -2089,7 +2089,7 @@ int32_t Scheduler::conv_window() const {
     int32_t W = 1;
     for (const KVGroupInfo& g : prog_->kv_groups)
         if (g.decl.kind == RAD_KV_CONV && g.decl.conv_width > 0)
-            W = (int32_t)(g.decl.conv_width - 1 + (cfg_.n_spec > 0 ? cfg_.n_spec : 0) + 1);
+            W = (int32_t)conv_window_entries(g.decl, cfg_.n_spec);
     return W;
 }
 

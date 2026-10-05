@@ -191,8 +191,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
                  * a change of read offset rather than a recompute (spec §10). The engine's
                  * contract is that the kernel pair supports that; the manager's job is to make the
                  * slot big enough for it. */
-                p.conv_slots = (g.decl.conv_width > 0 ? g.decl.conv_width - 1 : 0)
-                             + (cfg.n_spec > 0 ? cfg.n_spec : 0);
+                p.conv_slots = conv_window_entries(g.decl, cfg.n_spec);
                 if (p.conv_slots <= 0) {
                     RAD_ERR("KV group '%s': conv_width %lld with n_spec %d gives 0 slots",
                             p.name.c_str(), (long long)g.decl.conv_width, cfg.n_spec);
@@ -230,6 +229,24 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
             if (p.bytes_per_state <= 0) {
                 RAD_ERR("KV group '%s': per-sequence state computes to 0", p.name.c_str());
                 return RAD_E_INVAL;
+            }
+            /* THE SLOT THE KERNELS INDEX, which is the slot this manager has to hand out. The
+             * kernels lay slots out from the state tensor ([n_states, channels, conv_slots] or
+             * [n_states, n_head_kv, state_dim]); this manager lays them out from bytes_per_state,
+             * and clears, saves and restores slots in that layout. Two different sizes make every
+             * one of those touch a neighbouring sequence's state. */
+            const int64_t indexed =
+                (p.kind == RAD_KV_CONV
+                     ? p.conv_slots * g.decl.n_head_kv * g.decl.head_dim
+                     : g.decl.n_head_kv * g.decl.state_dim[0] * g.decl.state_dim[1])
+                * elt * p.n_layers;
+            if (p.bytes_per_state != indexed) {
+                RAD_ERR("KV group '%s': %lld bytes a sequence are allocated, and the state the "
+                        "kernels index is %lld bytes over its %lld layers -- the slot this manager "
+                        "clears, checkpoints and restores would not be the slot the kernels read",
+                        p.name.c_str(), (long long)p.bytes_per_state, (long long)indexed,
+                        (long long)p.n_layers);
+                return RAD_E_SHAPE;
             }
             /* Exactly one slot per concurrent sequence, times whatever the kernel needs beside
              * it. Not a heuristic: a sequence owns exactly one recurrent state, so max_seqs is

@@ -449,7 +449,10 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
   int nt = (int)nthreads;
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
+  /* Zeroed whole, padding included: the struct is passed by value, so its tail padding is
+   * kernel-argument bytes too, and a recorded pass's audit compares those bytes. */
   R4dArGather G;
+  std::memset(&G, 0, sizeof G);
   G.ye = (const unsigned short*)ye;
   G.ew = (const unsigned short*)ew;
   G.sorted = (const int*)sorted;
