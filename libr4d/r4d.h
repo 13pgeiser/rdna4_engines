@@ -660,6 +660,11 @@ void r4d_moe_pf2_pin(int pin);
 // The parts the launches since the last call took, under a pin, as R4D_MOE_PF2's mask; cleared by
 // the call. A test reads it to know a part's kernel ran rather than the default's.
 uint32_t r4d_moe_pf2_used(void);
+// THE SORTED OPERAND'S DECODE KERNEL, pinned for a test: 0 is R4D_MOE_DOWN2's rule (and
+// R4D_MOE_DOWN2_G's), -1 the (tile, run) form, n > 0 moe_down_dec_kernel at n column tiles a block.
+// Inside the decode form only, which r4d_moe_gemm_pin_prefill(2) pins. Bit-identical, and
+// r4d_selftest compares their bytes.
+void r4d_moe_gemm_pin_down2(int pin);
 // THE GATED RESIDUAL READ'S PREFILL TILE, pinned for a test: 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
 // kernels (which then refuse a shape they are not built for), 3 the PF2 kernels the rule takes from
