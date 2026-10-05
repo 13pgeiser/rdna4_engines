@@ -340,6 +340,8 @@ R4D_HOOKS(moe_w4_mod4)
 #undef R4D_HOOKS
 int r4d_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
+int r4d_rad_layout_embed_q(const RadParam*, int, int, const RadEncoding*, const int*,
+                           const RadTensor*, int, RadLayout*);
 int r4d_rad_layout_moe_fp8(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, RadLayout*);
 int r4d_rad_layout_moe_fp8_mod4(const RadParam*, int, int, const RadEncoding*, const int*,
@@ -364,6 +366,10 @@ int r4d_rad_relayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const 
  * fatal issue, not a slow one. `logits_gemm` is declared with them. */
 int r4d_rad_embed_lookup    (const RadArgs*, RadStream);
 int r4d_rad_embed_lookup_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+/* The quantised gather (embed_lookup_q): the n-gram table's, where a card reads the table -- in
+ * VRAM, or in pinned host memory over the link. */
+int r4d_rad_embed_lookup_q  (const RadArgs*, RadStream);
+int r4d_rad_embed_lookup_q_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_ngram_ids       (const RadArgs*, RadStream);
 /* ABI v10: the same dispatch, described. Generated with the launch above by R4D_ENTRY, from one
  * body, so the two cannot describe different work. */
@@ -427,6 +433,7 @@ int r4d_rad_sample_merge_topk(const RadArgs*, RadStream);
  * Pure host code, called before anything is allocated, so it includes neither r4d.h nor
  * <hip/hip_runtime.h> -- the same split r4d_rows.cpp and r4d_layout.cpp keep. */
 int r4d_shape_embed_lookup   (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_embed_lookup_q (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gather_rows    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gather_rows_u8 (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scatter_rows_u8(const RadParam*, int, int operand, RadOpdDesc*);

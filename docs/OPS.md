@@ -868,11 +868,12 @@ holds only where the rank holds the WHOLE vocabulary -- `world_size` 1, not mere
 on most steps, so a check keyed on the offset alone refuses correct calls. Bounding ids is the
 caller's, and the tokeniser and the sampler both already are.
 
-### `embed_lookup_q`, the host gather
+### `embed_lookup_q`, the n-gram gather
 
 **A gather from a table quantised with ONE scale for all of it**: `x[m] = wte[id] * scale[0]`.
 Padding and bounds behave exactly as `embed_lookup`'s — a negative id writes a zero row, an id past
-the table fails the launch.
+the table fails the launch in the host kernels and writes a zero row in the device one, which
+cannot read its ids before it runs (libr4d's divergence note).
 
 **Why one scale is enough**, measured on the bf16 original: E4M3 carries its own exponent, a row's
 dynamic range in this table is only 2.3×, and the scale sits on a **three-octave plateau** where
@@ -886,21 +887,38 @@ different kernels. It is `gemm_nt_q`'s argument against being a `dtype` on `gemm
 scale to `embed_lookup` as an optional operand would also have moved `x` from slot 2 to slot 3 for
 every caller in the tree.
 
-**It runs on the HOST, served by libavx; no device library has a row for it.** The table it
-gathers from is 51.2 GB and cannot go anywhere else: staging a whole movement unit to use 5 KB is
-the wrong shape, pinning it for zero-copy needs all 51.2 GB pinned in host RAM, and
-`hipHostRegister` on the container's mapping would force all of it resident. The container is
-mmapped, so the table is at a host address on open. libavx keeps the rows a gather
-has touched in a row cache of its own and reads a miss straight from the file with O_DIRECT
-(`libavx/avx_ngram.cpp`): the page cache would map a 4 KiB page per 160-byte row. The reads keep
-the alignment the filesystem reports for direct I/O, or its block size where it reports none, as
-btrfs does; one read of the table proves it before the first row is served. A filesystem with no
-direct I/O at all cannot hold a container with this table.
+**Where it runs is where `--ngram-placement` puts the table**, because the planner runs an op on
+the host when **every weight operand of it** is `Site::Host` and takes that from the table's
+placement. The table is 51.2 GB and is never staged a unit at a time — moving a whole unit to use
+5 KB is the wrong shape — so it is read where it lies:
 
-The placement planner runs an op on the host when **every weight operand of it** is `Site::Host`,
-which is why the table must be a weight operand at all: `gather_rows` takes a plain `IN` operand and
-would never trigger it. And the host kernel has to live in a production plugin — libavx, the host
-kernel library — because `rad_gate_reference_kernels` refuses to serve on libref by design.
+| placement | the table | the gather |
+|---|---|---|
+| `disk` | the container's mapping | libavx's host kernel |
+| `ram`, libr4d loaded | a pinned copy every card maps at its host address | libr4d's device kernel, over the link |
+| `ram`, no device kernel | a locked copy (`core/format/table_copy.h`) | libavx's host kernel |
+| `vram` | the card, every rank holding all of it | libr4d's device kernel |
+
+`hipHostRegister` on the container's mapping is not one of them: it would force all of the file
+resident.
+
+**The host gather keeps its own row cache.** The container is mmapped, so the table is at a host
+address on open. libavx keeps the rows a gather has touched in a row cache of its own and reads a
+miss straight from the file with O_DIRECT (`libavx/avx_ngram.cpp`): the page cache would map a
+4 KiB page per 160-byte row. The reads keep the alignment the filesystem reports for direct I/O, or
+its block size where it reports none, as btrfs does; one read of the table proves it before the
+first row is served. A filesystem with no direct I/O at all cannot hold a container with this table
+on `disk`.
+
+**The device gather is libr4d's `embed_lookup_q_bf16`**: four entries a thread, each E4M3 code
+decoded exactly, multiplied by the scale in f32 and rounded to nearest even — the value libavx's
+lookup table holds, to the bit. It reads the ids and writes `e` in the host arena, where the
+architecture declares them for the host gather, so the step has no host op left in it.
+
+The table has to be a weight operand at all for the host site to be reachable: `gather_rows` takes
+a plain `IN` operand and would never be placed there. And the host kernel has to live in a
+production plugin — libavx, the host kernel library — because `rad_gate_reference_kernels`
+refuses to serve on libref by design.
 
 ### `ngram_ids`, and the gather that is not an op
 
@@ -937,8 +955,9 @@ derives the read cursor for it.
 operand of it is `Site::Host`, and `gather_rows` takes a plain `IN` operand.
 
 **`ahead_ids` and `ahead`: the next chunk's rows, a step early.** A prefill chunk gathers `heads`
-rows a token and, on text the row cache has not seen, most of them are random reads of the
-container file — ~30 ms a 2048-token chunk on an NVMe, with the card idle behind the host-site op.
+rows a token and, with the table on `disk` and text the row cache has not seen, most of them are
+random reads of the container file — ~30 ms a 2048-token chunk on an NVMe, with the card idle behind
+the host-site op.
 The next chunk of the prompt is already known (`RadBatch::n_ahead`, which stores it in `token_ids`
 after the step's own tokens), so:
 

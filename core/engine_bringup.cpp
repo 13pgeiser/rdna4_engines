@@ -56,9 +56,10 @@ namespace rad {
  * every one gets a line of its own carrying the geometry and the constraint that refused it.
  *
  * A DEVICE miss whose op DID resolve on the host is not a hole at all. The planner puts that op's
- * arithmetic on the host and its weights in the container's mapping, which is the whole of how
- * `embed_lookup_q` serves a table too large to copy into VRAM. Reporting that as fatal produces
- * an error nobody believes, and an error nobody believes is how a real one goes unread.
+ * arithmetic on the host and its weights in the container's mapping, which is how `embed_lookup_q`
+ * serves a table too large to copy into VRAM when no device kernel for it is loaded. Reporting
+ * that as fatal produces an error nobody believes, and an error nobody believes is how a real one
+ * goes unread.
  *
  * A HOST miss removes ONE placement option for ONE op, and for a kernel library written for a GPU
  * it is the ordinary case rather than news: most ops have no host implementation and never will.
@@ -286,13 +287,15 @@ static bool cgroup_room(const std::string& dir, bool v2, int64_t* room) {
     return true;
 }
 
-/* WHETHER `need` MORE BYTES CAN BE LOCKED IN HOST MEMORY, after `still` more that this process
- * will allocate before the copy is made, or why not. Each limit is one a copy would otherwise meet
- * part way through: RLIMIT_MEMLOCK (unless the process holds CAP_IPC_LOCK), the memory the kernel
- * reports available, and every memory cgroup from the process's own up to the root it can see,
- * which is the limit Docker's --memory sets and the kernel enforces by killing the process. A
- * limit that cannot be read is not one; a limit that can is never guessed at. */
-static bool lockable_room(int64_t need, int64_t still, std::string* why) {
+/* WHETHER `need` MORE BYTES CAN BE HELD IN HOST MEMORY, after `still` more that this process will
+ * allocate before the copy is made, or why not. Each limit is one a copy would otherwise meet part
+ * way through: the memory the kernel reports available, every memory cgroup from the process's own
+ * up to the root it can see, which is the limit Docker's --memory sets and the kernel enforces by
+ * killing the process -- and, for a copy mlock()ed for the host gather (`mlocks`), RLIMIT_MEMLOCK
+ * unless the process holds CAP_IPC_LOCK. Pinned memory a card reads is the driver's userptr
+ * mapping, the host pools' kind, and RLIMIT_MEMLOCK does not count it. A limit that cannot be read
+ * is not one; a limit that can is never guessed at. */
+static bool lockable_room(int64_t need, int64_t still, bool mlocks, std::string* why) {
     long long locked_kb = 0;
     unsigned long long caps = 0;
     {
@@ -304,7 +307,7 @@ static bool lockable_room(int64_t need, int64_t still, std::string* why) {
         }
     }
     struct rlimit rl {};
-    if (!((caps >> 14) & 1) && ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
+    if (mlocks && !((caps >> 14) & 1) && ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
         rl.rlim_cur != RLIM_INFINITY && (int64_t)rl.rlim_cur < locked_kb * 1024 + need) {
         *why = fmt("RLIMIT_MEMLOCK allows %s locked and the copy locks %s (Docker: --ulimit "
                    "memlock=-1; systemd: LimitMEMLOCK=infinity)", humanb((int64_t)rl.rlim_cur).c_str(),
@@ -361,23 +364,61 @@ static bool lockable_room(int64_t need, int64_t still, std::string* why) {
     return true;
 }
 
-/* --ngram-placement ram: the copy is table_copy_make's (core/format/table_copy.h); this keeps one
- * a container address, shared by every rank, and frees them after the ranks in ~Engine. */
-int Engine::lock_table_copy(const uint8_t* src, int64_t n, int64_t foff, void** out,
-                            std::string* why) {
+/* --ngram-placement ram: the copy is table_copy_make's (core/format/table_copy.h), or for a card,
+ * table_copy_fill's into pinned memory every card maps at its host address (rad_dev_alloc
+ * RAD_MEM_HOST_MAPPED, locked in pieces). This keeps one a container address, shared by every rank,
+ * and frees them after the ranks in ~Engine. */
+int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
+                       std::string* why) {
     for (const auto& c : table_copy_of_)
         if (c.first == src) { *out = c.second; return RAD_OK; }
     const auto t0 = std::chrono::steady_clock::now();
-    TableCopy tc;
-    const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
-    if (rc != RAD_OK) return rc;
-    RAD_INFO("placement: n-gram table copied into locked memory, %s in %.1f s",
-             humanb(n).c_str(),
+    void* base = nullptr;
+    if (card) {
+        base = rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
+        if (!base) {
+            *why = fmt("pinning %s: %s", humanb(n).c_str(), rad_dev_last_error());
+            return RAD_E_NOMEM;
+        }
+        const int rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
+        if (rc != RAD_OK) {
+            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
+            return rc;
+        }
+        card_copies_.push_back(base);
+    } else {
+        TableCopy tc;
+        const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
+        if (rc != RAD_OK) return rc;
+        table_copies_.push_back(tc);
+        base = tc.base;
+    }
+    RAD_INFO("placement: n-gram table copied into %s, %s in %.1f s",
+             card ? "pinned memory the cards read" : "locked memory", humanb(n).c_str(),
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    table_copies_.push_back(tc);
-    table_copy_of_.push_back({ src, tc.base });
-    *out = tc.base;
+    table_copy_of_.push_back({ src, base });
+    *out = base;
     return RAD_OK;
+}
+
+/* THE GATHER MOVES TO THE HOST WITH THE TABLE, when --ngram-placement auto chose a pinned copy for
+ * a card and it could not be made. Every rank's n-gram weights take the host site, on the
+ * WeightInfo Ctx::init reads to choose the op's domain and on the plan beside it, so the gather and
+ * its scale move together; a copy some rank already published is host memory, which the host
+ * gather reads as it reads RAM. False where no host kernel gathers the table. */
+bool Engine::ngram_gather_to_host() {
+    for (auto& r : ranks_) {
+        WeightFootprint f;
+        weight_footprint(r->program, &f, TablePlacement::Vram, TablePlacement::Disk);
+        if (!f.ngram_host) return false;
+    }
+    for (auto& r : ranks_)
+        for (size_t i = 1; i < r->program.weights.size(); ++i) {
+            if (!is_ngram_table(r->program, (rad_weight)i)) continue;
+            r->program.weights[i].site = Site::Host;
+            if (i < r->plan.weight.size()) r->plan.weight[i].site = Site::Host;
+        }
+    return true;
 }
 
 /* WHERE THE TWO LOOKUP TABLES GO (--embedding-placement, --ngram-placement), decided once for every
@@ -390,12 +431,15 @@ int Engine::lock_table_copy(const uint8_t* src, int64_t n, int64_t foff, void** 
  * lookup writes the activations a card reads, which a host kernel reading the container cannot
  * reach -- an architecture declares a buffer's domain, and the token embedding's is the device.
  *
- * THE N-GRAM TABLE: only a host kernel reads one today, so Vram is refused and the choice is
- * between a locked copy in RAM and the container. Auto takes RAM when lockable_room says the
- * memory, the memlock limit and every cgroup allow it after the pools still to be allocated. */
+ * THE N-GRAM TABLE: Vram where a device kernel gathers it and the card holds it; Ram as a copy,
+ * pinned for that kernel to read over the link or locked for the host gather; Disk in the
+ * container, read by the host gather. Each tier is refused where no kernel reads it there. Auto
+ * takes the first that holds the table, in that order: the card's test is the embedding's, and
+ * RAM's is lockable_room's -- the memory and every cgroup after the pools still to be allocated,
+ * and the memlock limit for a locked copy. */
 int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                                     const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
-                                    int64_t ngram_bytes, bool ngram_device) {
+                                    int64_t ngram_bytes, bool ngram_device, bool ngram_host) {
     const int64_t MiB = (int64_t)1 << 20;
     int64_t emb_max = 0;
     for (int64_t b : emb_bytes) emb_max = std::max(emb_max, b);
@@ -445,44 +489,98 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
 
     TablePlacement ng = cfg_.ngram_placement;
     std::string ng_why;
-    if (ngram_device) {
-        if (ng == TablePlacement::Ram || ng == TablePlacement::Disk) {
-            RAD_ERR("--ngram-placement %s: a device kernel reads this model's n-gram table, so the "
-                    "placement strategy places it with the other weights; only vram or auto apply",
-                    table_placement_name(ng));
-            return RAD_E_INVAL;
+    /* THE FASTEST TIER WITH THE ROOM, the card first: the table on the card, every rank holding
+     * all of it (a lookup is not sharded), with the fixed weights and a KV pool for one
+     * --max-model-len sequence beside it, as the embedding's test is; then a copy in RAM -- pinned
+     * for a device kernel to read over the link, or locked for the host gather; then the
+     * container, which only the host gather reads. Each is open only where a kernel reads it. */
+    const int64_t still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
+                          cfg_.prefix_cache_host_mib * MiB;
+    const int64_t need = align_up(ngram_bytes, (int64_t)2 << 20);
+    const char* copy = ngram_device ? "a pinned copy the card reads" : "a locked copy";
+    auto card_holds = [&](std::string* why) {
+        std::vector<VramFacts> with = facts;
+        int64_t fixed = 0;
+        for (VramFacts& f : with) {
+            f.statics += ngram_bytes;
+            if (emb == TablePlacement::Ram) f.statics -= emb_max;
+            fixed = std::max(fixed, f.statics);
         }
-        ng = TablePlacement::Vram;
-        ng_why = "a device kernel reads it; placed with the other weights";
-    } else if (ngram_bytes == 0) {
+        /* `fixed` and not the trial's own statics: the split clamps those to what the card can give
+         * and serves on, streaming every expert, so the trial alone cannot say they do not fit. */
+        VramBudget tb;
+        const int st = vram_budget_trial(cfg_, with, &tb);
+        const bool over = st == RAD_OK && fixed >= tb.claimable;
+        if (st == RAD_OK && !over && (!tb.derived_kv || tb.kv >= kv_floor)) return true;
+        if (st != RAD_OK)
+            *why = "the card cannot hold the other weights with it";
+        else if (over)
+            *why = fmt("with it the fixed weights want %s of a card that has %s to give",
+                       humanb(fixed).c_str(), humanb(tb.claimable).c_str());
+        else
+            *why = fmt("with it on the card the KV pool is %s, short of the %s one "
+                       "--max-model-len sequence needs", humanb(tb.kv).c_str(),
+                       humanb(kv_floor).c_str());
+        return false;
+    };
+    if (ngram_bytes == 0) {
         if (ng != TablePlacement::Auto)
             RAD_WARN("--ngram-placement %s: this model has no n-gram table, so there is nothing to "
                      "place", table_placement_name(ng));
         ng = TablePlacement::Disk;
     } else if (ng == TablePlacement::Vram) {
-        RAD_ERR("--ngram-placement vram: no loaded kernel plugin reads an n-gram table on a card "
-                "(embed_lookup_q has host kernels only), so it is read from host memory or the "
-                "container: ram or disk");
-        return RAD_E_INVAL;
-    } else if (ng == TablePlacement::Ram || ng == TablePlacement::Auto) {
-        const int64_t still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
-                              cfg_.prefix_cache_host_mib * MiB;
-        const int64_t need = align_up(ngram_bytes, (int64_t)2 << 20);
         std::string why;
-        const bool room = lockable_room(need, still, &why);
-        if (ng == TablePlacement::Ram && !room) {
-            RAD_ERR("--ngram-placement ram: the n-gram table (%s) cannot be locked in memory: %s",
-                    humanb(ngram_bytes).c_str(), why.c_str());
+        if (!ngram_device) {
+            RAD_ERR("--ngram-placement vram: no loaded kernel plugin reads an n-gram table on a "
+                    "card (embed_lookup_q has host kernels only), so it is read from host memory "
+                    "or the container: ram or disk");
+            return RAD_E_INVAL;
+        }
+        if (!card_holds(&why)) {
+            RAD_ERR("--ngram-placement vram: the n-gram table (%s, all of it on every card) does "
+                    "not fit: %s. Use ram, disk or auto.", humanb(ngram_bytes).c_str(),
+                    why.c_str());
             return RAD_E_NOMEM;
         }
-        if (ng == TablePlacement::Auto)
-            ng_why = room ? "the memory, the memlock limit and the cgroups allow a locked copy"
-                          : "a locked copy does not fit: " + why;
-        else
-            ng_why = "as asked";
-        ng = room ? TablePlacement::Ram : TablePlacement::Disk;
-    } else {
         ng_why = "as asked";
+    } else if (ng == TablePlacement::Disk) {
+        if (!ngram_host) {
+            RAD_ERR("--ngram-placement disk: no loaded kernel plugin gathers an n-gram table on "
+                    "the host, which is what reads it from the container. Use vram, ram or auto.");
+            return RAD_E_INVAL;
+        }
+        ng_why = "as asked";
+    } else {
+        std::string card_why, ram_why;
+        const bool card = ng == TablePlacement::Auto && ngram_device && card_holds(&card_why);
+        const bool room = !card && lockable_room(need, still, !ngram_device, &ram_why);
+        if (ng == TablePlacement::Ram) {
+            if (!room) {
+                RAD_ERR("--ngram-placement ram: the n-gram table (%s) cannot be held in memory as "
+                        "%s: %s", humanb(ngram_bytes).c_str(), copy, ram_why.c_str());
+                return RAD_E_NOMEM;
+            }
+            ng_why = "as asked";
+        } else if (card) {
+            ng = TablePlacement::Vram;
+            ng_why = "the card holds it beside the other weights and a KV pool for one "
+                     "--max-model-len sequence";
+        } else if (room) {
+            ng = TablePlacement::Ram;
+            ng_why = fmt("%sthe memory%s and the cgroups allow %s",
+                         ngram_device ? (card_why + "; ").c_str() : "",
+                         ngram_device ? "" : ", the memlock limit", copy);
+        } else if (ngram_host) {
+            ng = TablePlacement::Disk;
+            ng_why = fmt("%s%s does not fit: %s", ngram_device ? (card_why + "; ").c_str() : "",
+                         copy, ram_why.c_str());
+        } else {
+            RAD_ERR("--ngram-placement auto: the n-gram table (%s) has nowhere to go: %s; %s does "
+                    "not fit (%s); and no loaded kernel plugin gathers it on the host, which is "
+                    "what reads it from the container", humanb(ngram_bytes).c_str(),
+                    card_why.c_str(), copy, ram_why.c_str());
+            return RAD_E_NOMEM;
+        }
     }
     cfg_.ngram_resolved = ng;
 
@@ -490,7 +588,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         RAD_INFO("placement: token embedding (%s a rank) %s%s: %s", humanb(emb_max).c_str(),
                  table_placement_name(emb),
                  cfg_.embedding_placement == TablePlacement::Auto ? " (auto)" : "", emb_why.c_str());
-    if (ngram_bytes > 0 || ngram_device)
+    if (ngram_bytes > 0)
         RAD_INFO("placement: n-gram table (%s) %s%s: %s", humanb(ngram_bytes).c_str(),
                  table_placement_name(ng),
                  cfg_.ngram_placement == TablePlacement::Auto ? " (auto)" : "", ng_why.c_str());
@@ -967,7 +1065,7 @@ int Engine::plan() {
          * where they are not (the n-gram table every rank reads from the one mapping). */
         std::vector<int64_t> emb_bytes;
         int64_t ngram_bytes = 0, kv_floor = 0;
-        bool ngram_device = false;
+        bool ngram_device = false, ngram_host = false;
         const int64_t ctx = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
@@ -1005,12 +1103,13 @@ int Engine::plan() {
              * already this card's even share of the static weights: declare ran once per rank
              * with every dimension divided. */
             WeightFootprint wf;
-            weight_footprint(r->program, &wf, TablePlacement::Vram);
+            weight_footprint(r->program, &wf, TablePlacement::Vram, TablePlacement::Disk);
             f.statics = wf.statics;
             f.experts = wf.experts;
             emb_bytes.push_back(wf.embedding);
             ngram_bytes = std::max(ngram_bytes, wf.ngram);
             ngram_device = ngram_device || wf.ngram_device;
+            ngram_host = ngram_host || wf.ngram_host;
             /* ONE --max-model-len SEQUENCE'S CACHE: the same groups planned for a single
              * sequence, which is the least a KV pool can hold and still serve every request the
              * API accepts (configure_kv warns below it). --embedding-placement auto keeps the
@@ -1068,7 +1167,11 @@ int Engine::plan() {
             late_lazy_bytes_ = std::max(late_lazy_bytes_, lazy);
             facts.push_back(f);
         }
-        RAD_TRY(resolve_table_placement(facts, emb_bytes, kv_floor, ngram_bytes, ngram_device));
+        RAD_TRY(resolve_table_placement(facts, emb_bytes, kv_floor, ngram_bytes, ngram_device,
+                                        ngram_host));
+        /* The n-gram table was counted off the card; on it, it is every rank's whole table. */
+        if (cfg_.ngram_resolved == TablePlacement::Vram)
+            for (VramFacts& f : facts) f.statics += ngram_bytes;
         if (cfg_.embedding_resolved == TablePlacement::Ram)
             for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= emb_bytes[i];
         VramBudget vb;
@@ -2090,28 +2193,42 @@ int Engine::load_weights() {
                 }
                 w.ptr = (void*)file_->data(p0);
                 w.host_ptr = w.ptr;
-                /* --ngram-placement ram: the host kernel reads the locked copy instead of the
-                 * mapping. A copy auto chose and could not make leaves the table where it was, and
-                 * says so; one the operator asked for refuses the start. */
+                /* --ngram-placement ram: the gather reads a copy instead of the mapping -- pinned
+                 * memory a device kernel reads in place over the link, where the planner put the
+                 * table on the zero-copy site, or locked memory for the host gather. A copy auto
+                 * chose and could not make leaves the table in the container and says so, and a
+                 * card's gather moves to the host with it; one the operator asked for refuses the
+                 * start. */
                 if (cfg_.ngram_resolved == TablePlacement::Ram &&
                     is_ngram_table(r->program, (rad_weight)i)) {
+                    const bool card = w.site == Site::DeviceZeroCopy;
                     void* copy = nullptr;
                     std::string why;
-                    const int cs = lock_table_copy((const uint8_t*)w.ptr, n, (int64_t)p0.offset,
-                                                   &copy, &why);
+                    const int cs = copy_table((const uint8_t*)w.ptr, n, (int64_t)p0.offset, card,
+                                              &copy, &why);
                     if (cs == RAD_OK) {
-                        w.ptr = copy;
+                        void* on_card = card ? rad_dev_device_ptr(copy) : nullptr;
+                        w.ptr = on_card ? on_card : copy;
                         w.host_ptr = copy;
                         r->mover.publish_mapped((rad_weight)i, w.ptr);
-                        continue;   /* reported once, by lock_table_copy, and not as mapped */
+                        continue;   /* reported once, by copy_table, and not as mapped */
                     }
+                    const char* into = card ? "pinned" : "locked";
                     if (cfg_.ngram_placement == TablePlacement::Ram) {
-                        RAD_ERR("--ngram-placement ram: '%s' could not be copied into locked "
-                                "memory: %s", w.name.c_str(), why.c_str());
+                        RAD_ERR("--ngram-placement ram: '%s' could not be copied into %s memory: "
+                                "%s", w.name.c_str(), into, why.c_str());
                         return cs;
                     }
-                    RAD_WARN("--ngram-placement auto: '%s' could not be copied into locked memory "
-                             "(%s); it is read from the container", w.name.c_str(), why.c_str());
+                    if (card && !ngram_gather_to_host()) {
+                        RAD_ERR("--ngram-placement auto: '%s' could not be copied into pinned "
+                                "memory (%s), and no loaded kernel plugin gathers it on the host, "
+                                "which is what reads it from the container", w.name.c_str(),
+                                why.c_str());
+                        return cs;
+                    }
+                    RAD_WARN("--ngram-placement auto: '%s' could not be copied into %s memory "
+                             "(%s); it is read from the container%s", w.name.c_str(), into,
+                             why.c_str(), card ? " by the host gather" : "");
                     cfg_.ngram_resolved = TablePlacement::Disk;
                 }
                 /* NO READAHEAD ON A MAPPED WEIGHT. What reads one is a host kernel gathering rows

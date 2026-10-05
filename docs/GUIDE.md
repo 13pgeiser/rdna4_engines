@@ -469,7 +469,7 @@ Related flags:
 --kv-cache-dtype fp8       # halve what a token of context costs (a real quantisation)
 --host-pool-mib 8192       # pinned host tier for weights
 --embedding-placement ram   # the token embedding off the card (below)
---ngram-placement ram       # an n-gram table in locked RAM instead of read from disk (below)
+--ngram-placement ram       # an n-gram table in RAM instead of read from disk (below)
 --weights-disk-tier       # stream what fits neither from the container; needs O_DIRECT
 ```
 
@@ -479,7 +479,7 @@ never the whole table, so a tier below the card serves them at little or no cost
 | | `vram` | `ram` | `disk` |
 |---|---|---|---|
 | `--embedding-placement` | on the card, with the other weights | the pinned host pool, read over the link in place | refused |
-| `--ngram-placement` | refused | a locked copy in RAM, made at load | read from the container through a row cache |
+| `--ngram-placement` | on the card, every card holding all of it | a copy in RAM made at load, read by the card over the link | read from the container through a row cache |
 
 Both default to `auto`, the fastest tier that has room once every other weight is placed. Startup
 prints what each resolved to and why. A tier the flag names that cannot be honoured stops the
@@ -499,15 +499,19 @@ writes activations the card reads, and a host kernel reading the container canno
 radiance --model m.rad --tp 2 --host-pool-mib 1280 --embedding-placement ram
 ```
 
-**An n-gram table** (Qwen3.8-Flash-Next's is 47.7 GiB) is read by a host kernel only, so it is never
-on the card. `disk` reads its rows from the container through a row cache and direct reads; about
-half of a step's rows are first-seen, so steps wait on the drive. `ram` copies the whole table into
-locked huge pages at load -- 12 to 40 s more startup, depending on the page cache -- and every gather
-reads memory. It needs the table's size in memory after the pinned host pools and the prefix
-cache's host tier, with 4 GiB to spare, a memlock limit that large (`--ulimit memlock=-1` in Docker,
-`LimitMEMLOCK=infinity` under systemd), and room under every memory cgroup the process sits in.
-`ram` short of any of them refuses the start and names which; `auto` takes `ram` when all of them
-allow it and `disk` otherwise.
+**An n-gram table** (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token, which is why it
+can live off the card at all. `disk` reads its rows from the container through a row cache and
+direct reads on the host; about half of a step's rows are first-seen, so steps wait on the drive.
+`ram` copies the whole table into host memory at load -- 12 to 40 s more startup, depending on the
+page cache -- and every gather reads memory: the card's own gather kernel reads a pinned copy over
+the link, so a step has no host work in it at all. `vram` puts it on the card, every card holding
+all of it, which needs a card that large. `ram` needs the table's size in memory after the pinned
+host pools and the prefix cache's host tier, with 4 GiB to spare, and room under every memory cgroup
+the process sits in; it refuses the start short of either and names which. `auto` takes the first
+of `vram`, `ram` and `disk` that holds the table. Without a device kernel for the gather (a build
+with no libr4d), the table is read on the host: `vram` is refused, and `ram` is a copy in locked
+huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
+`LimitMEMLOCK=infinity` under systemd).
 
 **A model larger than the card and the host pool together still serves with
 `--weights-disk-tier`** -- and every step is then paced by the drive, which is the trade the flag
@@ -893,7 +897,7 @@ one line naming each one the command line moved.
 | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--embedding-placement WHERE` | auto | `auto`, `vram` or `ram`: the token embedding on the card or in the pinned host pool, read in place; `disk` is refused. See §4.3 |
-| `--ngram-placement WHERE` | auto | `auto`, `ram` or `disk`: an n-gram table as a locked copy in RAM made at load, or read from the container; `vram` is refused. See §4.3 |
+| `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container. See §4.3 |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
 **Idle session tiers**

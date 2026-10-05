@@ -101,25 +101,31 @@ int64_t weight_bytes(const WeightInfo& w) {
 /* See planner.h. Planner::resolve_sites, Planner::build_units and Planner::pin_mapped, run over
  * the same program without allocating a Plan -- the budget resolver calls this before a Planner
  * exists. Kept adjacent to the three so a change to any of them has this in the same diff. */
-void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding) {
+void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding,
+                      TablePlacement ngram) {
     if (!out) return;
     *out = WeightFootprint{};
 
     /* resolve_sites: a weight every one of whose ops lacks a device band cannot be read on the
      * card, so it is never copied there whatever the budgets say. */
-    std::vector<uint8_t> device_ok(prog.weights.size(), 1u);
+    std::vector<uint8_t> device_ok(prog.weights.size(), 1u), host_ok(prog.weights.size(), 1u);
     for (const OpInfo& o : prog.ops) {
-        bool dev = !o.bands.empty();
-        for (const Band& b : o.bands) if (!b.dom[RAD_DOMAIN_DEVICE]) dev = false;
-        if (dev) continue;
-        for (rad_weight w : o.weights)
-            if (w != RAD_NULL_HANDLE && w < device_ok.size()) device_ok[w] = 0u;
+        bool dev = !o.bands.empty(), host = !o.bands.empty();
+        for (const Band& b : o.bands) {
+            if (!b.dom[RAD_DOMAIN_DEVICE]) dev = false;
+            if (!b.dom[RAD_DOMAIN_HOST]) host = false;
+        }
+        for (rad_weight w : o.weights) {
+            if (w == RAD_NULL_HANDLE || w >= device_ok.size()) continue;
+            if (!dev) device_ok[w] = 0u;
+            if (!host) host_ok[w] = 0u;
+        }
     }
 
     /* build_units: a model-level weight is its own unit, everything else groups by the declared
      * (layer, expert). Ordered, for the same reason build_units is. */
     struct U { int32_t layer = -1, expert = -1; int64_t bytes = 0; bool mapped = false;
-               bool emb = false, ngram = false; };
+               bool emb = false, ngram = false, host = true; };
     std::map<std::pair<int32_t, int32_t>, size_t> by_group;
     std::vector<U> units;
 
@@ -148,6 +154,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
         mu.bytes = align_up(mu.bytes, a) + weight_bytes(wi);
         /* pin_mapped: THE WHOLE UNIT GOES, not the one weight. */
         if (w < device_ok.size() && !device_ok[w]) mu.mapped = true;
+        if (w < host_ok.size() && !host_ok[w]) mu.host = false;
         /* The placement flags' tables: model-level, so the unit is this one weight. */
         if (layer < 0) {
             mu.emb   = is_embedding_table(prog, w);
@@ -159,19 +166,24 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
      * align_up(static_need, RAD_ALIGN_UNIT)` before every unit it places. A budget that summed raw
      * bytes would be short by one alignment per unit, which on a 512-expert MoE is real. */
     std::map<int32_t, int64_t> layer_experts;
+    bool ngram_host = true;
+    for (const U& mu : units) if (mu.ngram && !mu.host) ngram_host = false;
     for (const U& mu : units) {
         const int64_t b = align_up(mu.bytes, RAD_ALIGN_UNIT);
         /* pin_embedding moves a table out of the statics only where nothing has mapped it. */
         if (mu.emb && !mu.mapped) out->embedding += b;
-        if (mu.ngram && mu.mapped) out->ngram += b;
+        if (mu.ngram) out->ngram += b;
         if (mu.ngram && !mu.mapped) out->ngram_device = true;
-        if (mu.mapped)          out->mapped  += b;
+        /* pin_mapped: an n-gram table a device kernel reads stays off the card unless it was
+         * placed in VRAM. */
+        if (mu.mapped || (mu.ngram && ngram != TablePlacement::Vram)) out->mapped += b;
         else if (mu.emb && embedding == TablePlacement::Ram) out->hosted += b;
         else if (mu.expert >= 0) { out->experts += b; layer_experts[mu.layer] += b; }
         else                     out->statics += b;
     }
     for (const auto& le : layer_experts)
         out->expert_layer_max = std::max(out->expert_layer_max, le.second);
+    out->ngram_host = out->ngram > 0 && ngram_host;
     out->n_units = (int64_t)units.size();
 }
 std::string weight_class_key(const std::string& name) {
@@ -206,9 +218,8 @@ std::string weight_class_key(const std::string& name) {
  *
  * Tracking host alone would rest on the argument that a missing device kernel is fatal at declare
  * and never reaches the planner. That is true only of an op with NO kernel in either domain: an op
- * such as `embed_lookup_q` resolves on the host and nowhere else -- deliberately, because its
- * table is far too large for the card and must not be copied there -- and declare reports that
- * device band as unserved without refusing the model. */
+ * such as `embed_lookup_q` resolves on the host and nowhere else when no device kernel for it is
+ * loaded, and declare reports that device band as unserved without refusing the model. */
 void Planner::resolve_sites(const Program& prog) {
     host_ok_.assign(prog.weights.size(), 1u);
     device_ok_.assign(prog.weights.size(), 1u);
@@ -237,54 +248,75 @@ void Planner::resolve_sites(const Program& prog) {
 
 /* ------------------------------------------------------------------ the mapped tier */
 /* A weight no device kernel can read is pinned to the container's mapping BEFORE any budget is
- * consulted, because it is not a budget question. The other three off-device tiers are what the
- * planner falls back to when VRAM runs out; this one is where the weight has to be whatever the
- * budgets say, and charging a pool for bytes that are never copied would make the operator size a
- * pool against a number that does not exist.
+ * consulted, because it is not a budget question -- and so is an n-gram table --ngram-placement put
+ * in RAM or on disk, whatever kernels could read it on a card. The other three off-device tiers are
+ * what the planner falls back to when VRAM runs out; this one is where the weight has to be
+ * whatever the budgets say, and charging a pool for bytes that are never copied would make the
+ * operator size a pool against a number that does not exist.
  *
- * THE WHOLE UNIT GOES, not the one weight. A unit is the movement granularity and a half-mapped
- * one has no meaning -- and it costs nothing here, because `device_ok_` is cleared for EVERY
- * weight operand of a host-only op, so the unit's other members are the same op's scale and
- * constants. What this does exclude is a plugin that groups a host-only weight with a device one:
- * that collapses the whole group onto the host, so the report names it. */
+ * THE WHOLE UNIT GOES, not the one weight. A unit is the movement granularity and a half-mapped one
+ * has no meaning -- and it costs nothing here, because `device_ok_` is cleared for EVERY weight
+ * operand of a host-only op, so the unit's other members are the same op's scale and constants.
+ * What this does exclude is a plugin that groups a host-only weight with a device one: that
+ * collapses the whole group onto the host, so the report names it. */
 void Planner::pin_mapped(const Program& prog, Plan* p) {
+    const TablePlacement ng = in_.config->ngram_resolved;
     for (MoveUnit& mu : p->units) {
-        bool mapped = false;
+        bool host_only = false;
         for (rad_weight w : mu.weights)
-            if (w < device_ok_.size() && !device_ok_[w]) mapped = true;
-        if (!mapped) continue;
+            if (w < device_ok_.size() && !device_ok_[w]) host_only = true;
+        /* --ngram-placement keeps an n-gram table OFF THE CARD unless it says vram, whether or not
+         * a device kernel could read it there: ram and disk are where the operator put it, and the
+         * strategies below would otherwise spend the card on 48 GB of rows read sixteen a token. */
+        const bool ngram = mu.layer < 0 && !mu.weights.empty() &&
+                           is_ngram_table(prog, mu.weights.front());
+        if (!host_only && !(ngram && ng != TablePlacement::Vram)) continue;
 
         mu.tier = Tier::Mapped;
-        mu.site = Site::Host;
         mu.movable = false;
-        mu.reason = "no device kernel for its op; read from the container's mapping";
-        /* --ngram-placement ram: the load phase copies an n-gram table out of the mapping into
-         * locked memory and publishes the copy, so the host kernel reads RAM instead of the file.
-         * Every pool still sees the mapped tier; the report shows what the copy costs. */
-        if (in_.config->ngram_resolved == TablePlacement::Ram && mu.layer < 0 &&
-            !mu.weights.empty() && is_ngram_table(prog, mu.weights.front())) {
-            mu.reason = "--ngram-placement ram: a locked copy in RAM, made at load";
+        if (host_only) {
+            mu.site = Site::Host;
+            mu.reason = "no device kernel for its op; read from the container's mapping";
+        } else if (ng == TablePlacement::Ram) {
+            mu.site = Site::DeviceZeroCopy;
+            mu.reason = "--ngram-placement ram: a pinned copy in RAM the card reads in place, made "
+                        "at load";
+        } else {
+            mu.site = Site::Host;
+            mu.reason = "--ngram-placement disk: the host gather reads it from the container";
+            for (rad_weight w : mu.weights)
+                if (w < host_ok_.size() && !host_ok_[w])
+                    note_unfit(p, mu, "--ngram-placement disk needs a host kernel for its gather, "
+                                      "and none was loaded");
+        }
+        /* --ngram-placement ram: the load phase copies an n-gram table out of the mapping and
+         * publishes the copy -- locked memory the host kernel reads, or pinned memory the card
+         * reads where a device kernel gathers. Every pool still sees the mapped tier; the report
+         * shows what the copy costs. */
+        if (ngram && ng == TablePlacement::Ram) {
+            if (host_only) mu.reason = "--ngram-placement ram: a locked copy in RAM, made at load";
+            else           p->ngram_copy_card = true;
             p->ngram_copy_bytes += mu.bytes;
         }
-        /* AND ONLY WHAT LIES IN THE CONTAINER AS THE KERNEL READS IT can be read from the mapping:
-         * a weight its kernel rearranges at load, or a shard of one, has no place in the file
-         * that already looks the way the kernel reads it (spec §5.1). */
+        /* AND ONLY WHAT LIES IN THE CONTAINER AS THE KERNEL READS IT can be read from the mapping,
+         * or copied out of it: a weight its kernel rearranges at load, or a shard of one, has no
+         * place in the file that already looks the way the kernel reads it (spec §5.1). */
         if (!in_.container)
-            note_unfit(p, mu, "only a host kernel reads it, so it must be read from a "
-                              "container's mapping -- and a checkpoint served directly has "
-                              "none; convert it to a container");
+            note_unfit(p, mu, "it is read from a container's mapping or copied out of one -- and "
+                              "a checkpoint served directly has none; convert it to a container");
         else
             for (rad_weight w : mu.weights)
                 if (w < prog.weights.size() &&
                     !weight_file_direct(prog.weights[w], prog.ctx.world_size))
-                    note_unfit(p, mu, "only a host kernel reads it, so it must be read from the "
-                                      "container's mapping -- and its stored form is not the "
-                                      "container's (a relayout, a widening or a shard)");
-        for (rad_weight w : mu.weights)
-            if (w < device_ok_.size() && device_ok_[w])
-                RAD_WARN("placement: '%s' is grouped with a weight only a host kernel can read, "
-                         "so the whole group stays in the container's mapping",
-                         prog.weights[w].name.c_str());
+                    note_unfit(p, mu, "it is read from the container's mapping or copied out of "
+                                      "it -- and its stored form is not the container's (a "
+                                      "relayout, a widening or a shard)");
+        if (host_only)
+            for (rad_weight w : mu.weights)
+                if (w < device_ok_.size() && device_ok_[w])
+                    RAD_WARN("placement: '%s' is grouped with a weight only a host kernel can "
+                             "read, so the whole group stays in the container's mapping",
+                             prog.weights[w].name.c_str());
     }
 }
 
@@ -1270,8 +1302,9 @@ std::string Plan::report(const Program& prog) const {
         s += fmt("  embedding     %12s  %12s   (--embedding-placement ram, pinned, read in place)\n",
                  "-", humanb(embedding_host_bytes).c_str());
     if (ngram_copy_bytes)
-        s += fmt("  n-gram copy   %12s  %12s   (--ngram-placement ram, locked RAM, filled at load)\n",
-                 "-", humanb(ngram_copy_bytes).c_str());
+        s += fmt("  n-gram copy   %12s  %12s   (--ngram-placement ram, %s, filled at load)\n",
+                 "-", humanb(ngram_copy_bytes).c_str(),
+                 ngram_copy_card ? "pinned RAM the card reads" : "locked RAM");
     /* Out of the VRAM weight budget, beside the residents and not among them: the two buffers a
      * routed layer's file-tier experts are read into, each sized to the layer that puts the most
      * there. */

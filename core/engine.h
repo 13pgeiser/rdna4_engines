@@ -122,13 +122,19 @@ private:
      * (engine_bringup.cpp says how auto chooses). */
     int resolve_table_placement(const std::vector<VramFacts>& facts,
                                 const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
-                                int64_t ngram_bytes, bool ngram_device);
-    /* --ngram-placement ram: the locked copy of the container's [src, src + n), file offset `foff`,
-     * made once and shared by every rank. */
-    int lock_table_copy(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
-    /* The copies made, each [base, base + bytes), and the container address each one copies.
-     * Unlocked and unmapped in ~Engine after the ranks that read them are gone. */
+                                int64_t ngram_bytes, bool ngram_device, bool ngram_host);
+    /* --ngram-placement ram: the copy of the container's [src, src + n), file offset `foff`, made
+     * once and shared by every rank -- locked for the host gather, or pinned for a device kernel
+     * to read over the link (`card`). */
+    int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
+                   std::string* why);
+    /* An auto-chosen pinned copy that could not be made: every rank's n-gram gather to the host. */
+    bool ngram_gather_to_host();
+    /* The copies made: the locked ones, each [base, base + bytes); the pinned ones, rad_dev_alloc
+     * RAD_MEM_HOST_MAPPED ranges; and the container address each one copies. Freed in ~Engine
+     * after the ranks that read them are gone. */
     std::vector<TableCopy> table_copies_;
+    std::vector<void*> card_copies_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
     int load_weights();
     int configure_kv();

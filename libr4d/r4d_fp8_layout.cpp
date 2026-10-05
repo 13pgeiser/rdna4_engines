@@ -539,3 +539,36 @@ extern "C" int r4d_rad_unrelayout_mtp_e4m3(const RadParam* p, int n_p, int opera
     if (rc == RAD_OK) rc = hcrows_enc_layout(g, "r4d.mtp.e4m3.g128", enc, sel, pl, n, &L);
     return rc != RAD_OK ? rc : hcrows_unrelayout(g, src, src_bytes, pl);
 }
+
+/* ================================================================= embed_lookup_q's table
+ *
+ * The gather reads the table AS IT IS, so this hook only answers whether it can: E4M3 codes with
+ * ONE bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe), or the
+ * table as the checkpoint ships it, plain bf16 with no scale. The same two forms libavx's host
+ * gather accepts (avx_layout_ngram), checked the same way, so a model whose table one of them
+ * reads is never refused by the other at declare. */
+extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
+                                      const RadEncoding* enc, const int* sel,
+                                      const RadTensor* pl, int n, RadLayout* out) {
+    (void)out;
+    enum { EQ_WTE = 1, EQ_SCALE = 2 };
+    if (operand != EQ_WTE && operand != EQ_SCALE) return RAD_E_UNSUPPORTED;
+    const long long rows = rad_param_geti(p, n_p, "n_vocab", 0);
+    const long long dim  = rad_param_geti(p, n_p, "n_embd", 0);
+    if (rows <= 0 || dim <= 0) return RAD_E_SHAPE;
+    if (rad_enc_is(enc, "plain") && enc->n_planes == 1 && enc->plane[0].dtype == RAD_BF16) {
+        if (operand != EQ_WTE) return RAD_E_DTYPE;
+        if (n != 1 || !pl || !r4d_enc::dims(pl[0], rows, dim)) return RAD_E_SHAPE;
+        return RAD_E_UNSUPPORTED;
+    }
+    const RadEncPlane* sc = rad_enc_plane(enc, "scale");
+    if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
+        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[0] != 0 ||
+        sc->block[1] != 0)
+        return RAD_E_DTYPE;
+    if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
+    if (!r4d_enc::selects(enc, sel, n, operand == EQ_WTE ? "codes" : "scale")) return RAD_E_SHAPE;
+    if (!r4d_enc::dims(pl[0], operand == EQ_WTE ? rows : 1, operand == EQ_WTE ? dim : 1))
+        return RAD_E_SHAPE;
+    return RAD_E_UNSUPPORTED;
+}

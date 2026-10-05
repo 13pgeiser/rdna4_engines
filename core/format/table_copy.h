@@ -1,4 +1,6 @@
-/* table_copy.h -- a container table copied into locked host memory (--ngram-placement ram).
+/* table_copy.h -- a container table copied into host memory (--ngram-placement ram): locked memory
+ * for the host gather, made here, or pinned memory a card reads, which the caller allocates and
+ * table_copy_fill fills. What follows is about the locked copy; the read and the check are both's.
  *
  * A COPY IN HUGE PAGES, NOT THE MAPPING LOCKED. Faulting a container's mapping in costs a fault every
  * 4 KiB page and leaves every row behind a 4 KiB translation, so a gather of scattered rows walks
@@ -27,6 +29,11 @@ struct TableCopy {
  * region. RAD_OK with `out` filled, or a refusal with `why` saying what failed and nothing held. */
 int  table_copy_make(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
                      TableCopy* out, std::string* why);
+
+/* The read and the check table_copy_make makes, into [dst, dst + n) the caller allocated: pinned
+ * memory a card reads in place, when a device kernel gathers the table (--ngram-placement ram). */
+int  table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
+                     uint8_t* dst, std::string* why);
 
 /* Unlocks and unmaps it; a copy never made is a no-op. */
 void table_copy_free(TableCopy* c);

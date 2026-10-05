@@ -19,16 +19,18 @@ embedding's gather, every step — needs this plugin.
 
 ## The embedding gather
 
-`embed_lookup_q` over an E4M3 table into bf16 is the one host op a GPU deployment runs: the
-n-gram table is tens of gigabytes in the container's mapping and never on a card. Its rows come
-through `avx_ngram.cpp`, compiled baseline so the process has one of each: a row cache shared by
-every thread (2^19 rows, eight ways, CLOCK), an O_DIRECT read through io_uring for each miss, the
-ranks dividing a call's misses rather than duplicating them, and a reader thread that fetches the
-next prefill chunk's rows while the current one runs. The level's kernel decodes the rows: at
-AVX-512 the call's 256-entry bf16 table sits in eight registers and four `vpermt2w` look up 32
-codes; below it, one code at a time. The row's layout hook only checks the table's encoding —
-E4M3 with one bf16 scale, or the checkpoint's plain bf16 — and asks for no re-layout, because the
-gather reads the rows from the container file in the layout they are stored in.
+`embed_lookup_q` over an E4M3 table into bf16 is the one host op a GPU deployment runs, wherever
+`--ngram-placement` leaves the n-gram table for the host gather: in the container's mapping
+(`disk`), or in a locked copy in RAM when no device kernel for the op is loaded (`ram`). Where
+libr4d is loaded, `ram` is a pinned copy its kernel reads over the link and this one does not run.
+Its rows come through `avx_ngram.cpp`, compiled baseline so the process has one of each: a row
+cache shared by every thread (2^19 rows, eight ways, CLOCK), an O_DIRECT read through io_uring for
+each miss, the ranks dividing a call's misses rather than duplicating them, and a reader thread
+that fetches the next prefill chunk's rows while the current one runs. The level's kernel decodes
+the rows: at AVX-512 the call's 256-entry bf16 table sits in eight registers and four `vpermt2w`
+look up 32 codes; below it, one code at a time. The row's layout hook only checks the table's
+encoding — E4M3 with one bf16 scale, or the checkpoint's plain bf16 — and asks for no re-layout,
+because the gather reads the rows from the container file in the layout they are stored in.
 
 `rad-avx-check` runs the op over a file-backed table with two ranks and the reader racing, at
 every level, and compares every row with the file's bytes.

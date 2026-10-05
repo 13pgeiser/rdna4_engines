@@ -2237,7 +2237,7 @@ TEST(the_weight_footprint_splits_statics_from_the_elastic_expert_plane) {
     build_moe(f, /*n=*/4, /*each=*/2 * MiB, &experts);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
 
     /* One model-level weight and four experts: five units. */
     CHECK_EQ(fp.n_units, 5ll);
@@ -2267,7 +2267,7 @@ TEST(weights_in_one_layer_are_one_unit_and_are_aligned_once_each) {
     }
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
     CHECK_EQ(fp.n_units, 2ll);              /* the declared group is the unit, not the weight */
 
     /* ONE align_up A UNIT AND ONE INSIDE IT, which is how Mover::init spends the slab. A budget
@@ -2300,7 +2300,7 @@ TEST(a_weight_with_no_device_band_takes_its_whole_unit_to_the_mapped_tier) {
     f.prog.ops.push_back(host_only);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
     CHECK_EQ(fp.n_units, 1ll);
     CHECK_EQ(fp.statics, 0ll);
     CHECK_EQ(fp.mapped, 6 * MiB);          /* both weights: the unit is what moves */
@@ -2347,7 +2347,7 @@ TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     add_ngram_table(f, 8 * MiB);
 
     WeightFootprint fp;
-    weight_footprint(f.prog, &fp, TablePlacement::Vram);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
     CHECK_EQ(fp.embedding, 1 * MiB);
     CHECK_EQ(fp.ngram, 8 * MiB);
     CHECK(!fp.ngram_device);
@@ -2355,7 +2355,7 @@ TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     CHECK_EQ(fp.statics, 2 * 4 * MiB + 2 * MiB);
     CHECK_EQ(fp.mapped, 8 * MiB);
 
-    weight_footprint(f.prog, &fp, TablePlacement::Ram);
+    weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk);
     CHECK_EQ(fp.embedding, 1 * MiB);
     CHECK_EQ(fp.hosted, 1 * MiB);
     CHECK_EQ(fp.statics, 2 * 4 * MiB + 1 * MiB);
@@ -2372,7 +2372,7 @@ TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     t.op("embed_lookup", {m}, false);
     t.op("logits_gemm", {m}, false);
     CHECK(!is_embedding_table(t.prog, m));
-    weight_footprint(t.prog, &fp, TablePlacement::Ram);
+    weight_footprint(t.prog, &fp, TablePlacement::Ram, TablePlacement::Disk);
     CHECK_EQ(fp.embedding, 0ll);
     CHECK_EQ(fp.hosted, 0ll);
 }
@@ -2490,16 +2490,84 @@ TEST(ngram_ram_stays_mapped_and_reports_the_copy) {
     CHECK(plan2.report(f.prog).find("n-gram copy") == std::string::npos);
 }
 
+/* An n-gram table a device kernel reads as well as the host one: --ngram-placement says where it
+ * is, and so who gathers. vram counts it with the statics and places it with them; ram keeps it on
+ * the mapped tier at the zero-copy site, the pinned copy a card reads, and reports that copy; disk
+ * keeps it on the mapped tier at the host site, where the host gather reads the container. */
+TEST(an_ngram_table_a_device_kernel_reads_goes_where_the_placement_says) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/1, /*per_layer=*/4 * MiB);
+    const rad_weight t = f.weight("ngram.weight", 8 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed_lookup_q", {t}, /*host_kernel=*/true);
+
+    WeightFootprint fp;
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Vram);
+    CHECK(fp.ngram_device);
+    CHECK(fp.ngram_host);
+    CHECK_EQ(fp.ngram, 8 * MiB);
+    CHECK_EQ(fp.mapped, 0ll);
+    CHECK_EQ(fp.statics, 4 * MiB + 2 * MiB + 8 * MiB);
+    for (TablePlacement off : { TablePlacement::Ram, TablePlacement::Disk }) {
+        weight_footprint(f.prog, &fp, TablePlacement::Vram, off);
+        CHECK_EQ(fp.ngram, 8 * MiB);
+        CHECK_EQ(fp.mapped, 8 * MiB);
+        CHECK_EQ(fp.statics, 4 * MiB + 2 * MiB);
+    }
+
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+
+    cfg.ngram_resolved = TablePlacement::Vram;
+    Plan on_card;
+    CHECK_OK(Planner(in).plan(&on_card));
+    CHECK(on_card.weight[t].tier == Tier::VRAM);
+    CHECK(on_card.weight[t].site == Site::Device);
+    CHECK_EQ(on_card.ngram_copy_bytes, 0ll);
+
+    cfg.ngram_resolved = TablePlacement::Ram;
+    Plan in_ram;
+    CHECK_OK(Planner(in).plan(&in_ram));
+    CHECK(in_ram.weight[t].tier == Tier::Mapped);
+    CHECK(in_ram.weight[t].site == Site::DeviceZeroCopy);
+    CHECK_EQ(in_ram.ngram_copy_bytes, 8 * MiB);
+    CHECK(in_ram.ngram_copy_card);
+    CHECK(std::string(in_ram.weight[t].reason).find("the card reads") != std::string::npos);
+    CHECK(in_ram.report(f.prog).find("pinned RAM the card reads") != std::string::npos);
+
+    cfg.ngram_resolved = TablePlacement::Disk;
+    Plan on_disk;
+    CHECK_OK(Planner(in).plan(&on_disk));
+    CHECK(on_disk.weight[t].tier == Tier::Mapped);
+    CHECK(on_disk.weight[t].site == Site::Host);
+    CHECK_EQ(on_disk.ngram_copy_bytes, 0ll);
+    CHECK(std::string(on_disk.weight[t].reason).find("--ngram-placement disk") !=
+          std::string::npos);
+}
+
+/* The host gather's own kernel is what makes disk possible at all: an n-gram table only a device
+ * kernel reads has no host site, and the footprint says so. */
+TEST(an_ngram_table_with_no_host_kernel_cannot_stay_on_disk) {
+    Fixture f;
+    const rad_weight t = f.weight("ngram.weight", 8 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed_lookup_q", {t}, /*host_kernel=*/false);
+    WeightFootprint fp;
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
+    CHECK(fp.ngram_device);
+    CHECK(!fp.ngram_host);
+}
+
 TEST(an_empty_program_has_an_empty_footprint) {
     Fixture f;
     WeightFootprint fp;
     fp.statics = 1;                         /* and the out parameter is reset, not accumulated */
-    weight_footprint(f.prog, &fp, TablePlacement::Vram);
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk);
     CHECK_EQ(fp.statics, 0ll);
     CHECK_EQ(fp.experts, 0ll);
     CHECK_EQ(fp.mapped, 0ll);
     CHECK_EQ(fp.n_units, 0ll);
-    weight_footprint(f.prog, nullptr, TablePlacement::Vram);      /* and a null one is not a crash */
+    /* and a null one is not a crash */
+    weight_footprint(f.prog, nullptr, TablePlacement::Vram, TablePlacement::Disk);
 }
 
 RAD_TEST_MAIN()

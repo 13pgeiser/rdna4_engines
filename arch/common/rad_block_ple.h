@@ -20,16 +20,19 @@
  *
  * ============================== THE TABLE DECIDES THE SHAPE OF ALL OF THIS ======================
  *
- * 51.2 GB cannot be on the card and cannot be staged onto it, so `embed_lookup_q` runs on the HOST
- * over the container's own mmap and its result crosses the link once -- 5 KB a token at decode.
- * libavx/avx_ngram.cpp carries that argument in full. Three consequences reach this file:
+ * 51.2 GB cannot be staged onto a card, so `embed_lookup_q` reads it where --ngram-placement put
+ * it: the HOST gather over the container's own mmap or a locked copy in RAM (libavx/avx_ngram.cpp
+ * carries that argument in full), or a device kernel reading a pinned copy over the link -- or the
+ * card's own copy, on a card that holds it. Either way its result reaches the card through the
+ * host arena, 5 KB a token at decode. Three consequences reach this file:
  *
  *   THE TABLE IS A WEIGHT OPERAND, because the planner puts an op on the host only when every
- *   weight operand of it is Site::Host. A gather whose source were an activation could never be
- *   placed there.
+ *   weight operand of it is Site::Host, and decides that from the table's placement. A gather
+ *   whose source were an activation could never be placed there.
  *
- *   ITS BUFFERS ARE HOST DOMAIN. `ids` and `e` are read and written by a host kernel, so they live
- *   in the host arena; everything downstream of `e` is ordinary device work.
+ *   ITS BUFFERS ARE HOST DOMAIN. `ids` and `e` are read and written by the host gather when it
+ *   runs, so they live in the host arena, which a device gather reads and writes over the link
+ *   just as well; everything downstream of `e` is ordinary device work.
  *
  *   IT IS 128 CHECKPOINT TENSORS. RadNameMap holds eight sources, so the map is declared in pieces
  *   by map_concat_shards() and the order IS the concatenation -- a permuted table is a model that
@@ -302,9 +305,12 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
 
     /* ---- buffers ---------------------------------------------------------------------------- */
     /* HOST DOMAIN for the two the gather touches. `ids` is written by ngram_ids and read by the
-     * host gather; `e` is written by the host gather and read by one device copy onto the card
+     * gather; `e` is written by the gather and read by one device copy onto the card
      * (`ple_emb_dev`, below). The host arena is mapped, so the device side of that hand-off is a
-     * link read (core/runtime/ctx.cpp) -- 5 KB a token at decode.
+     * link read (core/runtime/ctx.cpp) -- 5 KB a token at decode. Where a device kernel gathers
+     * (--ngram-placement ram or vram, with libr4d loaded) it reads `ids` and writes `e` over the
+     * link too, which costs a round trip of those 5 KB and leaves no host op in the step: the
+     * domain is declared here, before the placement that would say who gathers is decided.
      *
      * `ids` IS PERSIST because it is written at the top of the step and read at this layer: the
      * buffer plan computes liveness in DECLARED order, where the two ops are neighbours, and a

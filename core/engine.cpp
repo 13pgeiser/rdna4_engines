@@ -82,6 +82,8 @@ Engine::~Engine() {
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
     table_copies_.clear();
+    for (void* p : card_copies_) rad_dev_free(p, RAD_MEM_HOST_MAPPED);
+    card_copies_.clear();
     rad_tools_registry().close();
 }
 

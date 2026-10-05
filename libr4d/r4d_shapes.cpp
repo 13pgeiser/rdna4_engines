@@ -296,6 +296,26 @@ extern "C" int r4d_shape_embed_lookup(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* The quantised gather: libref's description (ref_embed_lookup_q_shape), an E4M3 table and a
+ * one-element scale in the activation dtype. `ahead` is not passed: it is ids for a reader that
+ * fetches rows from a file, and the kernel does not read it. */
+extern "C" int r4d_shape_embed_lookup_q(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t ne = pi(p, n_p, "n_embd");
+    const int64_t nv = pi(p, n_p, "n_vocab");
+    const int64_t vo = pi(p, n_p, "vocab_offset", 0);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd_idx(M, 0, vo + nv),
+        opd((uint32_t)RAD_F8E4M3, nv, ne),
+        opd(D, 1),
+        opd(D, M, ne),
+        opd_none(),
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_gather_rows(const RadParam* p, int n_p, int operand,
                                      RadOpdDesc* out) {
 

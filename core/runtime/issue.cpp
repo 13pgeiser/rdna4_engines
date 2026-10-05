@@ -890,11 +890,11 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * is the one place it stops being harmless: it runs NOW, on this thread, and reads and writes
      * the host arena NOW.
      *
-     * A PLE gather is exactly that shape. `ngram_ids` writes the hashed row ids into a host-domain
-     * buffer on the device, and `embed_lookup_q` reads them on the host. With no join the host
-     * reads whatever the arena holds from an earlier step and gathers the rows of the wrong
-     * n-gram -- valid ids, valid rows, every kernel agreeing with its oracle, and fluent text that
-     * is a stable wrong answer rather than an intermittent one.
+     * A PLE gather on the host is exactly that shape. `ngram_ids` writes the hashed row ids into a
+     * host-domain buffer on the device, and `embed_lookup_q` reads them on the host. With no join
+     * the host reads whatever the arena holds from an earlier step and gathers the rows of the
+     * wrong n-gram -- valid ids, valid rows, every kernel agreeing with its oracle, and fluent text
+     * that is a stable wrong answer rather than an intermittent one.
      *
      * WHAT THE JOIN WAITS FOR is the last device op on each lane that touched the host arena
      * (host_touch_ev_), not the whole stream. Every hazard a host op has is with such an op -- the

@@ -109,9 +109,11 @@ struct Band {
  * beside the mapping that already holds one. A sparse Zipfian gather of a dozen rows out of
  * hundreds of millions is exactly what a page cache is good at.
  *
- * Only a HOST kernel can read one -- the bytes are pageable and at no device address -- so the
- * planner assigns this tier where, and only where, no device kernel for the op exists at all
- * (embed_lookup_q, libavx/avx_ngram.cpp, is the one such op in this tree). */
+ * Only a HOST kernel can read the mapping -- the bytes are pageable and at no device address -- so
+ * the planner assigns this tier where no device kernel for the op exists at all, and where
+ * --ngram-placement keeps an n-gram table off the card (embed_lookup_q, libavx/avx_ngram.cpp).
+ * Under `ram` the load phase publishes a copy in place of the mapping: locked memory for the host
+ * gather, or pinned memory a device kernel reads over the link (the zero-copy site). */
 enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 4 };
 
 /* WHERE A LOOKUP TABLE LIVES: the token embedding (--embedding-placement) and an n-gram embedding

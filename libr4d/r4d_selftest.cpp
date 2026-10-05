@@ -9112,6 +9112,119 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs) {
  * `tok` behind them. Their ids must be the ids step two computes running [7, 8, 9] against the
  * window step one left; that window must be the step's own; and the step's own ids must be the
  * ones a launch without `ahead_ids` writes. The same property ref_test holds libref to. */
+/* embed_lookup_q against a host gather of the same bytes, through the host side's own conversions.
+ *
+ * THE BAR IS THE BIT, not a tolerance. libavx's gather decodes a code as
+ * rad_f32_to_bf16(rad_fp8e4m3_to_f32(code) * scale), and the device kernel has to produce exactly
+ * that for every code, or one model reads a different n-gram embedding depending on which tier
+ * --ngram-placement put its table on. So the oracle is those two functions, the table holds every
+ * code but the two NaN encodings (no quantiser writes them), and the comparison is of the bytes.
+ *
+ * Five launches: the quad walk and the entry walk (the model's width of 160, and 13); an E4M3
+ * table with a scale and a plain bf16 one without, whose rows come back unchanged; the table in
+ * VRAM and in pinned host memory read over the link, the placement this kernel exists for. The ids
+ * include padding (-1) and one past the table, and both write a zero row. */
+static void embed_lookup_q_case(const Plugin& pl) {
+    if (!sel("embed_lookup_q_bf16")) return;
+    const char* what = "embed_lookup_q vs a host gather, to the bit";
+    const RadKernelInfo* r = find(pl, "embed_lookup_q_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+
+    struct Shape { int64_t ne; bool e4m3; bool host; };
+    const Shape shapes[] = { { 160, true, false }, { 160, true, true }, { 13, true, false },
+                             { 160, false, true }, { 13, false, false } };
+    const int64_t NV = 1031, M = 37;
+    const float scale = rad_bf16_to_f32(rad_f32_to_bf16(1.99317932e-4f));
+    std::vector<void*> pinned;
+    std::string bad;
+    for (const Shape& sh : shapes) {
+        const int64_t es = sh.e4m3 ? 1 : 2;
+        const size_t tbytes = (size_t)(NV * sh.ne * es);
+        std::vector<uint8_t> table(tbytes);
+        uint32_t rs = 0x9e3779b9u;
+        for (int64_t i = 0; i < NV * sh.ne; ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            if (sh.e4m3) {
+                uint8_t c = (uint8_t)((i * 167 + (rs >> 24)) & 0xFF);
+                if ((c & 0x7F) == 0x7F) c ^= 0x01;           /* 0x7F and 0xFF are NaN */
+                table[(size_t)i] = c;
+            } else {
+                const uint16_t b = rad_f32_to_bf16((float)((int32_t)(rs >> 9) - (1 << 22)) * 1e-6f);
+                std::memcpy(&table[(size_t)(2 * i)], &b, 2);
+            }
+        }
+        std::vector<int32_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) ids[(size_t)m] = (int32_t)((m * 131 + 7) % NV);
+        ids[3] = -1;
+        ids[7] = (int32_t)NV;
+        ids[11] = (int32_t)(NV - 1);
+
+        void* d_tab = nullptr;
+        if (sh.host) {
+            void* h = nullptr;
+            if (hipHostMalloc(&h, tbytes, hipHostMallocMapped) != hipSuccess) {
+                ok(what, false, "pinned table allocation failed");
+                return;
+            }
+            pinned.push_back(h);
+            std::memcpy(h, table.data(), tbytes);
+            if (hipHostGetDevicePointer(&d_tab, h, 0) != hipSuccess || !d_tab) {
+                ok(what, false, "no device address for the pinned table");
+                return;
+            }
+        } else {
+            d_tab = dalloc(tbytes);
+            st_memcpy(d_tab, table.data(), tbytes, hipMemcpyHostToDevice);
+        }
+        const uint16_t sc_bits = rad_f32_to_bf16(scale);
+        void* d_sc = dalloc(2);
+        st_memcpy(d_sc, &sc_bits, 2, hipMemcpyHostToDevice);
+        void* d_tok = dalloc((size_t)M * 4);
+        st_memcpy(d_tok, ids.data(), (size_t)M * 4, hipMemcpyHostToDevice);
+        void* d_x = dalloc((size_t)(M * sh.ne * 2));
+        st_memset(d_x, 0xFF, (size_t)(M * sh.ne * 2));    /* a zero row has to be written */
+
+        std::vector<RadTensor> ts = { T(d_tok, RAD_I32, { M }),
+                                      T(d_tab, sh.e4m3 ? RAD_F8E4M3 : RAD_BF16, { NV, sh.ne }),
+                                      T(sh.e4m3 ? d_sc : nullptr, RAD_BF16, { 1 }),
+                                      T(d_x, RAD_BF16, { M, sh.ne }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("n_embd", sh.ne), PI("n_vocab", NV),
+                                     PS("dtype", "bf16") };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        const int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        std::vector<uint16_t> got((size_t)(M * sh.ne), 0);
+        st_memcpy(got.data(), d_x, got.size() * 2, hipMemcpyDeviceToHost);
+
+        int64_t wrong = 0;
+        for (int64_t m = 0; m < M; ++m) {
+            const int32_t id = ids[(size_t)m];
+            for (int64_t i = 0; i < sh.ne; ++i) {
+                uint16_t want = 0;
+                if (id >= 0 && id < NV) {
+                    const size_t at = (size_t)(id * sh.ne + i);
+                    if (sh.e4m3) {
+                        want = rad_f32_to_bf16(rad_fp8e4m3_to_f32(table[at]) * scale);
+                    } else {
+                        std::memcpy(&want, &table[2 * at], 2);
+                    }
+                }
+                if (got[(size_t)(m * sh.ne + i)] != want) ++wrong;
+            }
+        }
+        if (rc != RAD_OK || wrong)
+            bad += fmt("%s n_embd=%lld %s: rc=%d, %lld of %lld entries differ; ",
+                       sh.e4m3 ? "e4m3" : "bf16", (long long)sh.ne,
+                       sh.host ? "pinned host table" : "vram table", rc, (long long)wrong,
+                       (long long)(M * sh.ne));
+    }
+    for (void* h : pinned) hip_ck(hipHostFree(h), "hipHostFree", __LINE__);
+    ok(what, bad.empty(), bad);
+}
+
 static void ngram_ahead_case(const Plugin& pl) {
     if (!sel("ngram_ids_i32")) return;
     const RadKernelInfo* r = find(pl, "ngram_ids_i32");
@@ -9194,6 +9307,7 @@ static void device_phase(const Plugin& pl) {
     if (!g_case) std::printf("\ndevice smoke tests (device %d)\n", devs[0]);
 
     ngram_ahead_case(pl);
+    embed_lookup_q_case(pl);
 
     /* --- the paged cache's write side --- */
     kv_store_case(pl, "kv_store_bf16", "bf16");

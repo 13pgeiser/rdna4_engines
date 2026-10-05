@@ -249,9 +249,12 @@ public:
      * `embedding_host_used` is the same tables' weight bytes, the unit the tier totals count in. */
     int64_t embedding_host_bytes = 0;
     int64_t embedding_host_used = 0;
-    /* --ngram-placement ram: the n-gram tables the load phase copies into locked memory. They stay
-     * on the mapped tier as far as every pool is concerned; this is what the copy costs in RAM. */
+    /* --ngram-placement ram: the n-gram tables the load phase copies into host memory. They stay
+     * on the mapped tier as far as every pool is concerned; this is what the copy costs in RAM.
+     * `ngram_copy_card` says which copy: pinned memory a device kernel reads in place over the
+     * link, or locked memory the host gather reads. */
     int64_t ngram_copy_bytes = 0;
+    bool    ngram_copy_card = false;
     /* ROUTED EXPERTS ON THE FILE TIER have no address of their own: a routed layer's are read into
      * one of two VRAM buffers before the layer's first expert op and published there until the next
      * routed layer starts (place/stager.h, FileStager). `file_layer_max` is the most one layer's
@@ -377,17 +380,23 @@ struct WeightFootprint {
     int64_t mapped  = 0;   /* no device kernel can read them; they never enter a pool at all */
     int64_t hosted  = 0;   /* --embedding-placement ram: in the pinned host pool, off the card */
     /* The tables the two placement flags move, wherever the buckets above count them: `embedding`
-     * is inside statics or hosted, `ngram` inside mapped. */
+     * is inside statics or hosted, `ngram` inside statics when a device kernel reads it and it is
+     * placed in VRAM, inside mapped otherwise. */
     int64_t embedding = 0;
     int64_t ngram     = 0;
-    /* An n-gram table some device kernel reads, which the strategies place like any weight. No
-     * plugin has one today; it is what makes --ngram-placement vram mean something. */
+    /* A device kernel reads the n-gram table, so it can be on the card or read over the link from
+     * pinned host memory; without one only the host gather reads it, from RAM or the container. */
     bool    ngram_device = false;
+    /* A host kernel gathers it, so it can stay in the container (--ngram-placement disk). */
+    bool    ngram_host = false;
     int64_t n_units = 0;
 };
 /* `embedding` is what the token embedding's placement resolved to; only Ram moves it out of the
- * statics. Stated by every caller, so the budget and the planner cannot count it differently. */
-void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding);
+ * statics. `ngram` is the n-gram table's; only Vram puts it among them, and only where a device
+ * kernel reads it. Stated by every caller, so the budget and the planner cannot count it
+ * differently. */
+void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding,
+                      TablePlacement ngram);
 
 /* THE TABLES THE PLACEMENT FLAGS MOVE, by what reads them and not by name: a model-level weight
  * that at least one op reads and that only `embed_lookup` reads is a token embedding table, and

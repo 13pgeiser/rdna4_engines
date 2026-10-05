@@ -62,11 +62,13 @@ static const Flag g_flags[] = {
     "                                    auto keeps it on the card unless the KV cache could then not\n"
     "                                    hold one --max-model-len sequence. disk is refused: the lookup\n"
     "                                    writes the card's activations, which no host read can reach" },
-    { "--ngram-placement",    "WHERE",  "auto (default) | ram | disk: where an n-gram embedding table\n"
-    "                                    lives (Qwen3.8-Flash-Next: 47.7 GiB). disk reads its rows from\n"
-    "                                    the container; ram copies it into locked memory at load; auto\n"
-    "                                    takes ram when free memory, the memlock limit and the cgroup\n"
-    "                                    allow it. vram is refused: only a host kernel reads the table" },
+    { "--ngram-placement",    "WHERE",  "auto (default) | vram | ram | disk: where an n-gram\n"
+    "                                    embedding table lives (Qwen3.8-Flash-Next: 47.7 GiB).\n"
+    "                                    vram puts all of it on every card; ram copies it into\n"
+    "                                    host memory at load, pinned for the cards to read\n"
+    "                                    (locked, where only a host kernel reads it); disk reads\n"
+    "                                    its rows from the container on the host. auto takes the\n"
+    "                                    first of the three that holds it" },
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },

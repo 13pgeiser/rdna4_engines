@@ -1614,6 +1614,16 @@ static const RadOperandSpec oEmbed[] = {
     { "wte",    RAD_OPD_WEIGHT, 0 },
     { "x",      RAD_OPD_OUT,    0 },
 };
+/* The quantised gather's: libref's list (ref_registry.cpp), which the loader holds every plugin
+ * serving the op to -- a one-element `scale`, absent for a table stored plain, and `ahead`, the
+ * next prompt's ids for a host reader that fetches rows from a file. */
+static const RadOperandSpec oEmbedQ[] = {
+    { "tokens", RAD_OPD_IN,     0 },
+    { "wte",    RAD_OPD_WEIGHT, 0 },
+    { "scale",  RAD_OPD_WEIGHT, 1 },
+    { "x",      RAD_OPD_OUT,    0 },
+    { "ahead",  RAD_OPD_IN,     1 },
+};
 /* PLE's hashed n-gram ids. `state` is a rolling window of committed ids -- RAD_KV_CONV's shape and
  * ple_conv's contract -- except that a cold window is EOS and not zero, because zero is a real
  * token id. */
@@ -1821,6 +1831,11 @@ static const RadOpSchema kSchemas[] = {
            "[vocab_offset, vocab_offset + n_vocab) -- which is what makes the table shardable "
            "across the vocabulary, the symmetry lm_head already had. Ids stay GLOBAL; summing the "
            "ranks reconstructs x, so the caller follows this with an exact all_reduce."),
+    SCHEMA("embed_lookup_q", pEmbed, oEmbedQ,
+           "the same gather from a table quantised with ONE scale for all of it: x[m] = "
+           "wte[id] * scale[0], an absent scale being one. Padding and bounds behave exactly as "
+           "embed_lookup's. `ahead` is the next prompt's ids, for a reader that fetches rows ahead "
+           "of the step; a kernel that reads its table in place ignores it."),
     SCHEMA("ple_gate", pPleGate, oPleGate,
            "PLE's gate. K = grouped_rmsnorm(k) * (w_key + wadd) and Q likewise over `q`, one rsqrt "
            "per n-wide stream and one gain across all hc*n; s[c] = sum_d K[c][d]*Q[c][d] / sqrt(n); "
@@ -3136,6 +3151,15 @@ static const RadKernelInfo kKernels[] = {
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_embed_lookup, nullptr, nullptr, nullptr,
   r4d_shape_embed_lookup, nullptr, nullptr, r4d_rad_embed_lookup_describe },
+
+{ "embed_lookup_q_bf16", "embed_lookup_q", "vocab",
+  "quantised embedding gather, four entries a thread",
+  "any n_embd and n_vocab; a negative or out-of-range id writes a zero row",
+  "i32 tokens, an E4M3 table with a bf16 or f32 scale or a plain bf16 one, bf16 output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_embed_lookup_q, nullptr, r4d_rad_layout_embed_q, nullptr,
+  r4d_shape_embed_lookup_q, nullptr, nullptr, r4d_rad_embed_lookup_q_describe },
 
 { "ple_gate_bf16", "ple_gate", "norm",
   "PLE's dot-product gate, one workgroup a (row, stream) pair",
