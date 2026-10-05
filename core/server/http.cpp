@@ -367,6 +367,10 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
             std::string got = hreq.get_header_value("Authorization");
             const std::string want = "Bearer " + api_key;
             if (got != want) {
+                /* Said like every other refusal (Server::error_response), which this one never
+                 * reaches: the gate answers before the router does. */
+                RAD_INFO("req refused from %s:%d -> 401 authentication_error: invalid api key",
+                         hreq.remote_addr.c_str(), hreq.remote_port);
                 hres.status = 401;
                 hres.set_content(error_body("authentication_error", "invalid api key"),
                                  "application/json");

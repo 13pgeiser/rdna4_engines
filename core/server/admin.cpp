@@ -131,11 +131,12 @@ HttpResponse Server::handle_load(const HttpRequest&) {
  * finds out what this endpoint's token ids do to a subsequent /v1/completions. */
 HttpResponse Server::handle_tokenize(const HttpRequest& req) {
     if (!deps_.tok)
-        return error_response(err_not_implemented("the server has no tokenizer attached"));
+        return error_response(err_not_implemented("the server has no tokenizer attached"),
+                              req.peer);
 
     json b;
     ApiError err;
-    if (!parse_object(req.body, opt_.max_ctx, &b, &err)) return error_response(err);
+    if (!parse_object(req.body, opt_.max_ctx, &b, &err)) return error_response(err, req.peer);
 
     const bool want_strs = get_bool_or(b, "return_token_strs", false);
     std::vector<int32_t> toks;
@@ -143,15 +144,15 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
     auto msgs = b.find("messages");
     auto prom = b.find("prompt");
     if (msgs != b.end() && prom != b.end())
-        return error_response(err_bad("prompt", "send `prompt` or `messages`, not both"));
+        return error_response(err_bad("prompt", "send `prompt` or `messages`, not both"), req.peer);
 
     if (msgs != b.end()) {
         if (!deps_.chat)
             return error_response(err_not_implemented(
                 "tokenising `messages` requires a chat template; this model was not loaded with "
-                "one. Send `prompt` with the text you want tokenised"));
+                "one. Send `prompt` with the text you want tokenised"), req.peer);
         if (!msgs->is_array() || msgs->empty())
-            return error_response(err_bad("messages", "must be a non-empty array"));
+            return error_response(err_bad("messages", "must be a non-empty array"), req.peer);
 
         ChatRenderOptions opt;
         opt.add_generation_prompt = get_bool_or(b, "add_generation_prompt", true);
@@ -170,13 +171,14 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
         if (deps_.chat->apply(*msgs, tools, opt, &render, &why) < 0)
             return error_response(err_bad("messages", why.empty()
                                           ? "the chat template could not render this request"
-                                          : why));
+                                          : why), req.peer);
         toks = deps_.tok->encode(render.prompt,
                                  get_bool_or(b, "add_special_tokens", false),
                                  /*parse_special=*/true);
     } else {
         if (prom == b.end() || !prom->is_string())
-            return error_response(err_bad("prompt", "must be a string, or send `messages`"));
+            return error_response(err_bad("prompt", "must be a string, or send `messages`"),
+                                  req.peer);
         /* Encoded as /v1/completions encodes it, so the count is the count that endpoint sees. */
         toks = deps_.tok->encode(prom->get<std::string>(),
                                  get_bool_or(b, "add_special_tokens", true),
@@ -203,25 +205,26 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
  * a token array would arrive as. The name is odd and it is the name clients read. */
 HttpResponse Server::handle_detokenize(const HttpRequest& req) {
     if (!deps_.tok)
-        return error_response(err_not_implemented("the server has no tokenizer attached"));
+        return error_response(err_not_implemented("the server has no tokenizer attached"),
+                              req.peer);
 
     json b;
     ApiError err;
-    if (!parse_object(req.body, opt_.max_ctx, &b, &err)) return error_response(err);
+    if (!parse_object(req.body, opt_.max_ctx, &b, &err)) return error_response(err, req.peer);
 
     auto t = b.find("tokens");
     if (t == b.end() || !t->is_array())
-        return error_response(err_bad("tokens", "must be an array of integers"));
+        return error_response(err_bad("tokens", "must be an array of integers"), req.peer);
 
     std::vector<int32_t> toks;
     toks.reserve(t->size());
     for (const auto& v : *t) {
         if (!v.is_number_integer())
-            return error_response(err_bad("tokens", "must be an array of integers"));
+            return error_response(err_bad("tokens", "must be an array of integers"), req.peer);
         int32_t id = 0;
         if (!token_id(v, &id))
             return error_response(err_bad("tokens", "a token id must be in [0, 2147483647], "
-                                                    "got " + v.dump()));
+                                                    "got " + v.dump()), req.peer);
         toks.push_back(id);
     }
 
@@ -236,9 +239,10 @@ HttpResponse Server::handle_detokenize(const HttpRequest& req) {
  * container carries a normalised vocabulary and not the JSON it was built from. So this answers
  * the questions that config is actually READ for -- how big is the vocabulary, which ids end a
  * generation, is a chat template available -- and says nothing it would have to invent. */
-HttpResponse Server::handle_tokenizer_info(const HttpRequest&) {
+HttpResponse Server::handle_tokenizer_info(const HttpRequest& req) {
     if (!deps_.tok)
-        return error_response(err_not_implemented("the server has no tokenizer attached"));
+        return error_response(err_not_implemented("the server has no tokenizer attached"),
+                              req.peer);
 
     const ITokenizer::VocabInfo v = deps_.tok->vocab_info();
     json o;
@@ -356,15 +360,15 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
 /* 501 when there is no prefix cache to reset, and that is the point: vLLM answers 200 with an
  * empty body whether or not anything happened, so a benchmark that thinks it started cold has no
  * way to find out it did not. This says how many entries went. */
-HttpResponse Server::handle_reset_prefix_cache(const HttpRequest&) {
+HttpResponse Server::handle_reset_prefix_cache(const HttpRequest& req) {
     if (!deps_.sched)
-        return error_response(err_not_implemented("the server has no engine attached"));
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
 
     const int64_t n = deps_.sched->reset_prefix_cache();
     if (n < 0)
         return error_response(err_not_implemented(
             "this engine has no prefix cache (started with --no-prefix-cache, or the model "
-            "declares no cacheable KV group)"));
+            "declares no cacheable KV group)"), req.peer);
 
     json o;
     o["entries_dropped"] = n;

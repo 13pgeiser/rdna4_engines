@@ -742,8 +742,9 @@ libr4d serves these at **2, 3, 4 and 8 ranks**. Two ranks have their own kernels
 block, the rotated 6-bit wire, the fused norm-and-reduce forms). The wide family is one template on
 the world size; 4 and 8 have both hops, 3 has the one-shot only -- the two-shot shards the message
 `world` ways and a residual width such as 2560 does not divide by 3 -- and `all_gather` at width
-rides the same instance as the wide `all_reduce` (`ar_gather_3rank`, `_4rank`, `_8rank`). The fused forms are declared
-only at two ranks by the arch blocks, which fall back to the plain pair at any other width.
+rides the same instance as the wide `all_reduce` (`ar_gather_3rank`, `_4rank`, `_8rank`). The
+fused forms are declared only at two ranks by the arch blocks, which fall back to the plain pair at
+any other width.
 
 `min_bytes` is the byte floor under which a LOSSY row must serve the message exactly anyway, and it
 is a parameter rather than a constant in the library because it is a property of the link and not

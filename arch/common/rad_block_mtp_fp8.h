@@ -436,16 +436,22 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_fc, brows(w.c, T), RAD_W(w_fc), brows(w.x, T));
 
     attn.step(c, batch);
+
+    /* A HISTORY PASS THAT DRAFTS NOTHING ENDS HERE. It exists to leave K and V behind, and the
+     * attention above has stored them. The feed-forward, the norm and the lm_head compute the
+     * head's output, which only a drafting row reads -- and every prefill chunk but a prompt's
+     * last drafts nothing. `n_draft_out` is the batch's and the same on every rank, so a
+     * collective the feed-forward would run is skipped on all of them. */
+    if (r < 0 && batch->n_draft_out <= 0) return;
+
     mlp.step(c, batch);
 
     RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.hout, T));
 
-    /* A history pass that drafts nothing exists only to leave K and V behind. One that does
-     * brings round 1's rows to the front first. */
+    /* A history pass that drafts brings round 1's rows to the front first. */
     int64_t L = T;                      /* the rows the lm_head runs over */
     if (r < 0) {
         L = batch->n_draft_out;
-        if (L <= 0) return;
         RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.hout), praw(batch->draft_out_ids, RAD_I32, L),
                     brows(w.x, L));
         RAD_ISSUE_N(c, op_dback, L, brows(w.x, L), brows(w.hout, L));

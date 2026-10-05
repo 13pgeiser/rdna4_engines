@@ -250,17 +250,23 @@ void Server::sweep_abandoned() {
 
 /* ------------------------------------------------------------------ errors */
 
+/* " from <addr:port>" for the request log, or nothing in-process, where no transport names a
+ * peer. */
+static std::string from_peer(const std::string& peer) {
+    return peer.empty() ? std::string() : " from " + peer;
+}
+
 HttpResponse Server::error_response(const ApiError& e, const std::string& peer) {
     metrics_.observe_http(e.status);
     /* A refusal is the line the operator is looking for when a client says "rejected": the
      * status, the type, the message, and who asked. 4xx is the client's doing and said at info;
      * 5xx is ours and said as a warning. */
     if (e.status >= 500)
-        RAD_WARN("req %s%s%s -> %d %s: %s", peer.empty() ? "" : "from ", peer.c_str(),
-                 peer.empty() ? "refused" : "", e.status, e.type.c_str(), e.message.c_str());
+        RAD_WARN("req refused%s -> %d %s: %s", from_peer(peer).c_str(), e.status, e.type.c_str(),
+                 e.message.c_str());
     else
-        RAD_INFO("req %s%s%s -> %d %s: %s", peer.empty() ? "" : "from ", peer.c_str(),
-                 peer.empty() ? "refused" : "", e.status, e.type.c_str(), e.message.c_str());
+        RAD_INFO("req refused%s -> %d %s: %s", from_peer(peer).c_str(), e.status, e.type.c_str(),
+                 e.message.c_str());
     HttpResponse r = HttpResponse::json_body(e.status, e.dump());
     if (e.status == 429) r.set_header("Retry-After", std::to_string(opt_.retry_after_s));
     return r;
@@ -273,14 +279,17 @@ void Server::log_admitted(const OaiRequest& r) const {
     for (const auto& p : r.prompts) n_prompt += (int64_t)p.tokens.size();
     const char* kind = r.endpoint == Endpoint::Chat ? "chat" : "completion";
     if (r.endpoint == Endpoint::Chat)
-        RAD_INFO("req %s %s%s from %s model=%s msgs=%d tools=%d prompt=%lld tok n=%d max_tokens=%lld",
-                 r.id.c_str(), kind, r.stream ? " stream" : "", r.peer.c_str(), r.model.c_str(),
-                 r.n_messages, r.n_tools, (long long)n_prompt, r.n, (long long)r.max_tokens);
+        RAD_INFO("req %s %s%s%s model=%s msgs=%d tools=%d prompt=%lld tok n=%d max_tokens=%lld",
+                 r.id.c_str(), kind, r.stream ? " stream" : "", from_peer(r.peer).c_str(),
+                 r.model.c_str(), r.n_messages, r.n_tools, (long long)n_prompt, r.n,
+                 (long long)r.max_tokens);
     else
-        RAD_INFO("req %s %s%s from %s model=%s prompts=%zu prompt=%lld tok n=%d max_tokens=%lld",
-                 r.id.c_str(), kind, r.stream ? " stream" : "", r.peer.c_str(), r.model.c_str(),
-                 r.prompts.size(), (long long)n_prompt, r.n, (long long)r.max_tokens);
-    if (!r.last_user.empty()) RAD_DEBUG("req %s last user: %s", r.id.c_str(), r.last_user.c_str());
+        RAD_INFO("req %s %s%s%s model=%s prompts=%zu prompt=%lld tok n=%d max_tokens=%lld",
+                 r.id.c_str(), kind, r.stream ? " stream" : "", from_peer(r.peer).c_str(),
+                 r.model.c_str(), r.prompts.size(), (long long)n_prompt, r.n,
+                 (long long)r.max_tokens);
+    if (!r.last_user.empty())
+        RAD_DEBUG("req %s last user: %s", r.id.c_str(), r.last_user.c_str());
 }
 
 /* ------------------------------------------------------------------ submission */
@@ -570,8 +579,8 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     if (ttft >= 0) std::snprintf(ttft_s, sizeof ttft_s, "ttft=%.2fs", ttft);
     char rate_s[32] = "";
     if (rate > 0) std::snprintf(rate_s, sizeof rate_s, " %.1f tok/s", rate);
-    RAD_INFO("req %s %s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs",
-             r.id.c_str(), r.peer.empty() ? "done" : r.peer.c_str(), finish_reason_oai(overall),
+    RAD_INFO("req %s done%s finish=%s prompt=%lld (cache %lld) gen=%lld%s %s%s %.2fs",
+             r.id.c_str(), from_peer(r.peer).c_str(), finish_reason_oai(overall),
              (long long)n_prompt, (long long)(t.valid ? t.cache_n : 0), (long long)n_gen, reason,
              ttft_s, rate_s, e2e);
 }
@@ -584,7 +593,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     if (submit_all(r, &gens, &err) < 0) {
         retire(gens);
         release(r.n_choices());
-        return error_response(err);
+        return error_response(err, req.peer);
     }
 
     for (;;) {
@@ -605,7 +614,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
             cancel_all(gens, false);
             retire(gens);
             release(r.n_choices());
-            return error_response(err_overloaded("the server is shutting down"));
+            return error_response(err_overloaded("the server is shutting down"), req.peer);
         }
         /* Wait on whichever choice is still running. Bounded, so the peer check above runs. */
         for (auto& g : gens) if (!g.closed) { g.sink->wait(); break; }
@@ -673,7 +682,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
             e.status = 500;
             e.type = "internal_server_error";
             e.message = why;
-            return error_response(e);
+            return error_response(e, req.peer);
         }
     }
 
@@ -717,7 +726,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
     if (submit_all(st->r, &st->gens, &err) < 0) {
         retire(st->gens);
         release(r.n_choices());
-        return error_response(err);
+        return error_response(err, req.peer);
     }
     if (st->r.endpoint == Endpoint::Chat)
         for (auto& g : st->gens)
@@ -878,7 +887,8 @@ HttpResponse Server::handle_chat(const HttpRequest& req) {
 
     OaiRequest r;
     ApiError err;
-    if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err, req.peer);
+    if (parse_chat_request(req.body, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer);
     r.peer = req.peer;
 
     sweep_abandoned();
@@ -898,7 +908,8 @@ HttpResponse Server::handle_completion(const HttpRequest& req) {
 
     OaiRequest r;
     ApiError err;
-    if (parse_completion_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err, req.peer);
+    if (parse_completion_request(req.body, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer);
     r.peer = req.peer;
 
     sweep_abandoned();
@@ -914,14 +925,17 @@ HttpResponse Server::handle_completion(const HttpRequest& req) {
 
 HttpResponse Server::handle_embeddings(const HttpRequest& req) {
     if (!deps_.tok)
-        return error_response(err_not_implemented("the server has no tokenizer attached"));
+        return error_response(err_not_implemented("the server has no tokenizer attached"),
+                              req.peer);
     if (!deps_.embed)
         return error_response(err_not_implemented(
-            "/v1/embeddings requires an embedding head; this model was not loaded with one"));
+            "/v1/embeddings requires an embedding head; this model was not loaded with one"),
+                req.peer);
 
     OaiRequest r;
     ApiError err;
-    if (parse_embeddings_request(req.body, odeps_, lim_, &r, &err) < 0) return error_response(err, req.peer);
+    if (parse_embeddings_request(req.body, odeps_, lim_, &r, &err) < 0)
+        return error_response(err, req.peer);
 
     std::vector<std::vector<float>> vecs;
     UsageOut u;
@@ -934,7 +948,7 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
             e.status = 500;
             e.type = "internal_server_error";
             e.message = std::string("the embedding pass failed: ") + rad_strerror(s);
-            return error_response(e);
+            return error_response(e, req.peer);
         }
         u.prompt += (int64_t)p.tokens.size();
         vecs.push_back(std::move(v));

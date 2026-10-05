@@ -528,6 +528,16 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
      * when the attention runs. */
     qsa.step(c, attn.w.h, batch);
     attn.step(c, batch);
+
+    /* A HISTORY PASS THAT DRAFTS NOTHING ENDS HERE. It exists to leave the head's state behind --
+     * the K and V the attention just stored and the indexer's block keys and tail -- and both are
+     * written above. Everything below computes the head's stream, which only a drafting row
+     * reads: the experts, the two connections around them and the lm_head. Every prefill chunk
+     * but a prompt's last is such a pass, so on those the head costs its attention alone.
+     * `n_draft_out` is the batch's and the same on every rank, so the collectives skipped here
+     * are skipped on all of them. */
+    if (r < 0 && batch->n_draft_out <= 0) return;
+
     hc_attn.write(c, T, 0, T);
 
     hc_mlp.read(c, T, 0, T);
@@ -536,12 +546,10 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
 
     /* THE CARRY, and only where a round after this one will read it. The last round of a group
      * is followed by a trunk step. A history pass that drafts takes round 1's rows out of its own
-     * -- into the carry, and back to the front of `hw` for the mixer below -- and one that does
-     * not exists only to leave K and V behind. */
+     * -- into the carry, and back to the front of `hw` for the mixer below. */
     int64_t L = T;                      /* the rows the lm_head runs over */
     if (r < 0) {
         L = batch->n_draft_out;
-        if (L <= 0) return;
         RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.hw), praw(batch->draft_out_ids, RAD_I32, L),
                     brows(w.hin, L));
         RAD_ISSUE_N(c, op_dback, L, brows(w.hin, L), brows(w.hw, L));

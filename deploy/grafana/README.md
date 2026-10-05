@@ -15,6 +15,10 @@ scrape_configs:
   - job_name: radiance
     static_configs:
       - targets: ["gpu-host:8000"]
+    # Only when the server runs with --api-key: /metrics is behind the key like every path but
+    # /health, /ping and the dashboard page, and an unauthorised scrape gets 401.
+    authorization:
+      credentials: "<the server's --api-key>"
 ```
 
 Window values are counter ratios with the definitions of the since-start gauges:

@@ -189,7 +189,7 @@ private:
     HttpResponse handle_stats(const HttpRequest& req);
     HttpResponse handle_graph(const HttpRequest& req);
 
-    HttpResponse error_response(const ApiError& e, const std::string& peer = std::string());
+    HttpResponse error_response(const ApiError& e, const std::string& peer);
     /* THE REQUEST LOG. One line when a request is admitted and one from record() when it ends,
      * at the info level, so `docker logs` answers "who asked what, how long, how did it end"
      * without the engine's own levels. The debug level adds the last user message's opening. */

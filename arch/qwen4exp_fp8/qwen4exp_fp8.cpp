@@ -413,8 +413,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- the routed feed-forward.
      *
-     * n_ff is `moe_intermediate_size` and geom_from already divided it by world_size -- and that
-     * division is exactly what the header's tensor-parallel section is about. */
+     * n_ff is `moe_intermediate_size`: divided by world_size when the world divides it, and left
+     * whole when it does not (geom_from's `arch_splits_ff`). Either way it is only the starting
+     * point -- at more than one rank the split below decides the rank's width, by whole fp8
+     * blocks and parity, which is what the header's tensor-parallel section is about. */
     {
         MoeFP8::Config& mc = m.moecfg;
         mc.n_expert    = meta_int2(meta, "qwen4exp.expert_count",      "num_experts", 0);

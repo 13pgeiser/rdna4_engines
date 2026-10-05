@@ -4,3 +4,4 @@ compile_commands.json
 *.so
 *.rad
 /sync-jarvis.sh
+__pycache__/

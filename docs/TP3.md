@@ -107,8 +107,8 @@ radiance --model qfn-tp3pad.rad --tp 3 --tp-wire exact --max-num-seqs 8 --max-mo
 
 Measured on three Radeon AI PRO R9700 (gfx1201, PCIe Gen5 x16, Threadripper PRO 9955WX), the
 uncensored Flash-Next fine-tune padded as above and converted with the shipped recipe
-(`qwen4exp-w4nl64-i8-hc8m`, here without Hessians: nearest into the codebook), this branch over
-1.0.8; the two-rank column is the shipped `qwen3.8-next-flash-fp8-iq4r-moe.rad` on the same box:
+(`qwen4exp-w4nl64-i8-hc8m`, here without Hessians: nearest into the codebook), on 1.0.8 with
+the changes above; the two-rank column is the shipped `qwen3.8-next-flash-fp8-iq4r-moe.rad` on the same box:
 
 | | three ranks, padded | two ranks, shipped container |
 |---|---|---|

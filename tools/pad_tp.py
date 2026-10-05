@@ -15,7 +15,7 @@ What is padded and why it is exact (fp32-accumulated, zero terms add nothing):
   gdn         (Qwen3-Next, --gdn-k/--gdn-v) in_proj_qkvz / in_proj_ba gain zero rows per the
               fused layout, conv1d zero channels, A_log / dt_bias zero heads, out_proj zero columns.
 Everything with n_embd as its only width (norms, embeddings, lm_head) is untouched. config.json is
-rewritten with the new counts and an explicit head_dim. Dummies go LAST, as Rob's vLLM tp_padding
+rewritten with the new counts and an explicit head_dim. Dummies go LAST, as tcclaviger's vLLM tp_padding
 does, so rank w-1 carries them.
 
 bf16 is handled as raw u16 (no arithmetic happens here), so numpy alone suffices.

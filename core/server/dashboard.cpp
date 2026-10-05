@@ -361,10 +361,11 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
  * This is the same walk (dump_graph_json shares every helper with the text one) served from the
  * process that is actually running, which is where the question is usually asked. Static after
  * declare, so it is rendered once and handed over. */
-HttpResponse Server::handle_graph(const HttpRequest&) {
+HttpResponse Server::handle_graph(const HttpRequest& req) {
     if (!opt_.graph_json)
         return error_response(err_not_implemented(
-            "the server was not given a declared graph; this build has no engine attached"));
+            "the server was not given a declared graph; this build has no engine attached"),
+                req.peer);
     HttpResponse r;
     r.status = 200;
     r.body = opt_.graph_json();
