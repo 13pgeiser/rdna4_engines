@@ -5923,11 +5923,16 @@ pub(crate) fn batch_chunk_upload_positions(
 /// S3-f16-projection-inputs: exact-route gate for the FP16 projection-input
 /// fast path (all four `batch_chunk_*` projection hooks below).
 ///
-/// All predicates are cheap field reads — no env/lock/JIT in the cycle (the
-/// kill switch resolves once at `FeatureFlags` init). Every failed predicate
-/// runs the pre-change F32-producer + `convert_f32_to_f16` path byte-for-byte.
+/// All ordinary-path predicates are cheap field reads. Capture/recording is
+/// admitted only together with the exact-gfx1100 split-verifier experiment:
+/// that route owns fixed, preallocated F16 sidecars and records every producer
+/// and consumer through the blob funnel. Every failed predicate runs the
+/// pre-change F32-producer + `convert_f32_to_f16` path byte-for-byte.
 #[inline]
 fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, dim: usize) -> bool {
+    let recording = gpu.graphs.capture_mode || gpu.replay.is_recording();
+    let recording_supported =
+        !recording || hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false);
     matches!(fusion, DflashFusionCtx::ChainVerify)
         // The PM FP8 verify scope never takes an F16-input projection route.
         && !gpu.fp8_verify_scope
@@ -5936,8 +5941,7 @@ fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, di
         && n >= 1
         && n <= 16
         && dim % 256 == 0
-        && !gpu.graphs.capture_mode
-        && !gpu.replay.is_recording()
+        && recording_supported
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9782,6 +9786,7 @@ fn q8_multirow_attn_admitted(
     is_independent: bool,
     capture_mode: bool,
     replay_recording: bool,
+    capture_safe_fixed_grid: bool,
 ) -> bool {
     matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
         && quant_q8
@@ -9790,8 +9795,7 @@ fn q8_multirow_attn_admitted(
         && min_ctx.is_some_and(|threshold| logical_ctx > threshold)
         && !is_tree
         && !is_independent
-        && !capture_mode
-        && !replay_recording
+        && ((!capture_mode && !replay_recording) || capture_safe_fixed_grid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10077,7 +10081,7 @@ fn batch_chunk_fa_attend(
             }
             _ => {}
         }
-        if gpu.attention_flash_q8_0_rows_masked(
+        if gpu.attention_flash_q8_0_rows_masked_logical(
             &pbs.fa_q_batch,
             &kv_cache.k_gpu[layer_idx],
             &kv_cache.v_gpu[layer_idx],
@@ -10087,6 +10091,7 @@ fn batch_chunk_fa_attend(
             config.n_kv_heads,
             config.head_dim,
             max_ctx_len,
+            start_pos + n,
             n,
             &s.flash_partials,
         )? {
@@ -13511,6 +13516,8 @@ fn forward_prefill_chunk_pair(
         fa_pertoken_min_ctx(gpu.arch_caps.arch()),
         gpu.graphs.capture_mode,
         gpu.replay.is_recording(),
+        gpu.arch_caps.is_gfx1100()
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false),
     );
     let multirow_admitted = |max_ctx: usize| {
         q8_multirow_attn_admitted(
@@ -13524,6 +13531,7 @@ fn forward_prefill_chunk_pair(
             false,
             multirow_common.4,
             multirow_common.5,
+            multirow_common.6,
         )
     };
     let multirow_c = multirow_admitted(max_ctx_c);
@@ -14203,8 +14211,10 @@ pub(crate) fn forward_batch_chunk_impl(
     // and re-scans the whole KV once per row, so a small verify block over a
     // long context pays the scan n times (202 vs 103 ms at 33k). The layer's
     // GEMMs stay batched either way — only the attend step switches to the
-    // multi-row tile. Its tile grid is sized from the live logical context on
-    // the host, so a captured replay would keep the first cycle's tile count.
+    // multi-row tile. The incumbent tile grid is sized from the live logical
+    // context and therefore stays out of capture. The gfx1100 split-KV route
+    // uses fixed S=8 geometry and is admitted only behind its explicit opt-in;
+    // the launcher independently rejects every other captured shape.
     let fa_attn_multirow = q8_multirow_attn_admitted(
         gpu.arch_caps.arch(),
         kv_cache.quant_q8,
@@ -14216,6 +14226,8 @@ pub(crate) fn forward_batch_chunk_impl(
         batch_semantics.is_independent(),
         gpu.graphs.capture_mode,
         gpu.replay.is_recording(),
+        gpu.arch_caps.is_gfx1100()
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY", false),
     );
     let logical_max_ctx = match batch_semantics {
         BatchSemantics::Sequential => start_pos + n,
@@ -15302,6 +15314,7 @@ mod tests {
                         false,
                         false,
                         false,
+                        false,
                     ));
                 }
             }
@@ -15331,6 +15344,7 @@ mod tests {
                 is_independent,
                 capture_mode,
                 replay_recording,
+                false,
             )
         };
         assert!(!admitted(
@@ -15452,6 +15466,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
                 arch,
@@ -15464,8 +15479,39 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
             ));
         }
+    }
+
+    #[test]
+    fn q8_multirow_attn_allows_only_explicit_fixed_grid_capture() {
+        assert!(q8_multirow_attn_admitted(
+            "gfx1100",
+            true,
+            256,
+            16,
+            8192,
+            Some(4096),
+            false,
+            false,
+            true,
+            true,
+            true,
+        ));
+        assert!(!q8_multirow_attn_admitted(
+            "gfx1100",
+            true,
+            256,
+            16,
+            8192,
+            Some(4096),
+            false,
+            false,
+            true,
+            true,
+            false,
+        ));
     }
 
     #[test]
@@ -17050,13 +17096,27 @@ mod tests {
         ));
         assert!(!native_mq4_widened_flags_admitted("gfx1100", &make(), true));
         let mut variants = Vec::new();
-        let mut f = make(); f.fp16_disabled = true; variants.push(f);
-        let mut f = make(); f.rocblas_all_archs = true; variants.push(f);
-        let mut f = make(); f.gemv_dp4a = Some(true); variants.push(f);
-        let mut f = make(); f.mmq_override = Some(false); variants.push(f);
-        let mut f = make(); f.mmq_min_batch = Some(2048); variants.push(f);
-        let mut f = make(); f.qkvza_split_tail = true; variants.push(f);
-        let mut f = make(); f.wo_wmma_variant = Some("k4".into()); variants.push(f);
+        let mut f = make();
+        f.fp16_disabled = true;
+        variants.push(f);
+        let mut f = make();
+        f.rocblas_all_archs = true;
+        variants.push(f);
+        let mut f = make();
+        f.gemv_dp4a = Some(true);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_override = Some(false);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_min_batch = Some(2048);
+        variants.push(f);
+        let mut f = make();
+        f.qkvza_split_tail = true;
+        variants.push(f);
+        let mut f = make();
+        f.wo_wmma_variant = Some("k4".into());
+        variants.push(f);
         // Packed FFN shares the budgeted MMQ slot and keeps native tails.
         let mut packed = make();
         packed.packed_mq4_prefill = true;
