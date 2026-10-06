@@ -827,6 +827,29 @@ static const RadOperandSpec oRouterTopkScatter[] = {
     { "expert_offset", RAD_OPD_OUT, 0 },
     { "expert_count",  RAD_OPD_OUT, 0 },
 };
+/* THE ROUTER'S GEMM IN FRONT OF THAT PAIR, and the shared expert's one-column gate beside it:
+ * `gemm_nt` [M, K] x [n_expert, K]^T, then `router_topk_scatter` over what it wrote, and -- with
+ * `gate_b` and `gate` present -- `gemm_nt` at N = 1 over the same input. The parameters are the
+ * union again; N is `n_expert` for the router and 1 for the gate, so neither is a parameter.
+ * The logits stay an OUTPUT: the routing report and the debug paths read them after the step. */
+static const RadParamSpec pRouterGemmTopkScatter[] = {
+    P_INT("M"), P_INT("K"), P_INT("n_expert"), P_INTO("n_local"),
+    P_INT("top_k"), P_INT("norm"), P_STR("dtype"),
+    P_INTO("expert_base"),
+    P_STRO("protect"),
+};
+static const RadOperandSpec oRouterGemmTopkScatter[] = {
+    { "a",             RAD_OPD_IN,     0 },
+    { "b",             RAD_OPD_WEIGHT, 0 },
+    { "gate_b",        RAD_OPD_WEIGHT, 1 },
+    { "logits",        RAD_OPD_OUT,    0 },
+    { "expert_ids",    RAD_OPD_OUT,    0 },
+    { "expert_w",      RAD_OPD_OUT,    0 },
+    { "sorted_tok",    RAD_OPD_OUT,    0 },
+    { "expert_offset", RAD_OPD_OUT,    0 },
+    { "expert_count",  RAD_OPD_OUT,    0 },
+    { "gate",          RAD_OPD_OUT,    1 },
+};
 static const RadOperandSpec oMoeScatter[] = {
     { "expert_ids",    RAD_OPD_IN,  0 },
     { "sorted_tok",    RAD_OPD_OUT, 0 },
@@ -2008,6 +2031,14 @@ static const RadOpSchema kSchemas[] = {
            "256-thread workgroup ranking about a kilobyte, and each costs the one-workgroup "
            "dispatch floor. Bounded: `M * top_k` must fit the sort's single-workgroup form, and a "
            "caller past that gets a refusal rather than a silent fallback to a different cost."),
+    SCHEMA("router_gemm_topk_scatter", pRouterGemmTopkScatter, oRouterGemmTopkScatter,
+           "`gemm_nt` (the router, N = n_expert) then `router_topk_scatter` over its logits, in "
+           "one launch -- and with `gate_b` and `gate` present, the shared expert's `gemm_nt` at "
+           "N = 1 over the same input as well. The workgroup that finishes the GEMM last runs the "
+           "selection and the sort. Byte-identical to the launches it stands in for: the same "
+           "split-K WMMA arithmetic at the split the unfused GEMM's own law picks, and the same "
+           "selection and sort. Decode only: M <= 64 and M * top_k within the sort's "
+           "single-workgroup form."),
     SCHEMA("moe_scatter", pMoeScatter, oMoeScatter,
            "a STABLE counting sort of the (token, slot) pairs by expert. `sorted_tok` holds the "
            "FLATTENED index token*top_k + slot and not the bare token id, because gather has to "
@@ -2542,6 +2573,11 @@ static const RadConstraint cRouterTopK[] = {
 static const RadConstraint cRouterTopkScatter[] = {
     C_GE("M", 1), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("top_k", 1),
     C_LE("top_k", 32), C_IN("dtype", "bf16"),
+};
+/* The selection's bounds and the skinny GEMM's decode band: four 16-row tiles. */
+static const RadConstraint cRouterGemmTopkScatter[] = {
+    C_GE("M", 1), C_LE("M", 64), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("top_k", 1), C_LE("top_k", 32), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cMoeScatter[] = {
     C_GE("M", 1), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("top_k", 1),
@@ -4339,6 +4375,19 @@ static const RadKernelInfo kKernels[] = {
   ROW(cRouterTopkScatter), NOTUNE,
   nullptr, nullptr, r4d_rad_router_topk_scatter, nullptr, nullptr, nullptr,
   r4d_shape_router_topk_scatter, nullptr, nullptr, r4d_rad_router_topk_scatter_describe },
+
+{ "router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
+  "the router GEMM, its top-k and the stable counting sort in one launch -- the last workgroup "
+  "of the GEMM ranks -- and optionally the shared expert's one-column gate beside it",
+  "M <= 64 and M*top_k <= 1024; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
+  "16 times the split the bf16 skinny GEMM's law picks",
+  "bf16 activation and weights, fp32 accumulate; bf16 logits, gate and weights, i32 ids, "
+  "sorted slots, offsets and counts out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRouterGemmTopkScatter), NOTUNE,
+  nullptr, nullptr, r4d_rad_router_gemm_topk_scatter, nullptr, nullptr, nullptr,
+  r4d_shape_router_gemm_topk_scatter, nullptr, nullptr,
+  r4d_rad_router_gemm_topk_scatter_describe },
 
 { "moe_scatter_i32", "moe_scatter", "moe",
   "a stable counting sort of the routing slots by expert, with the offsets and the histogram",

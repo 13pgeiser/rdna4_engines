@@ -1277,6 +1277,33 @@ extern "C" int r4d_shape_router_topk_scatter(const RadParam* p, int n_p, int ope
     };
     R4D_PICK(l);
 }
+/* The router's gemm_nt in front of router_topk_scatter, and the shared gate's gemm_nt at N = 1
+ * beside it: the three lists, with `logits` named once as the GEMM's output. */
+extern "C" int r4d_shape_router_gemm_topk_scatter(const RadParam* p, int n_p, int operand,
+                                                  RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t K  = pi(p, n_p, "K");
+    const int64_t ne = pi(p, n_p, "n_expert");
+    const int64_t k  = pi(p, n_p, "top_k");
+    if (ne <= 0 || ne > 256 || k <= 0 || k > ne || K <= 0) return RAD_E_UNSUPPORTED;
+    if (M > 64 || M * k > 1024) return RAD_E_UNSUPPORTED;
+    const int64_t nl = pi(p, n_p, "n_local", ne);
+    if (nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, K),
+        opd(D, ne, K),
+        opd(D, 1, K),
+        opd(D, M, ne),
+        opd((uint32_t)RAD_I32, M, k),
+        opd(D, M, k),
+        opd((uint32_t)RAD_I32, M * k),
+        opd((uint32_t)RAD_I32, nl + 1),
+        opd((uint32_t)RAD_I32, nl),
+        opd(D, M, 1),
+    };
+    R4D_PICK(l);
+}
 extern "C" int r4d_shape_moe_scatter(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = pi(p, n_p, "M");
     const int64_t ne = pi(p, n_p, "n_expert");

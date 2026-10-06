@@ -1794,6 +1794,200 @@ static void topk_scatter_at(const RadKernelInfo* rf, const RadKernelInfo* rt,
     }
 }
 
+/* -------------------------------- router_gemm_topk_scatter, against the launches it stands in for
+ *
+ * The claim is byte equality with THREE launches: the router's gemm_nt, the shared gate's gemm_nt
+ * at N = 1, and router_topk_scatter over the router's logits -- so all seven outputs are compared,
+ * the logits and the gate included. Those two are what the claim rests on: an element of the
+ * skinny bf16 GEMM is a function of its split-K count alone, and the fused op asks the unfused
+ * launch's own law for that count at each N (four at 512 x 2560, twenty for the one-column gate;
+ * eight and sixteen at 256 x 2048).
+ *
+ * ROWS AT EVERY WAVE COUNT AND EVERY ROW-TILE COUNT the fused op launches -- 8, 16 and 32 waves,
+ * one to four 16-row tiles, partial tiles included -- at the served geometry (512 experts,
+ * top_k 10, K 2560) and at a 256-expert one, which takes the other selection instantiation and
+ * other splits. An expert-parallel slice with a protect list, and the form without the gate.
+ *
+ * AND TWICE, BACK TO BACK, ON ONE OUTPUT. The last workgroup is named by a counter that resets
+ * itself; a counter left behind by one launch would make the next one rank before the GEMM was
+ * done, or never. The configurations share one logits buffer -- and with it one counter -- in
+ * an order that changes the grid between consecutive launches. */
+static void router_gemm_fused_case(const Plugin& pl) {
+    if (!sel("router_gemm_topk_scatter_bf16")) return;
+    const RadKernelInfo* rg  = find(pl, "router_gemm_topk_scatter_bf16");
+    const RadKernelInfo* m16 = find(pl, "gemm_bf16_nt_m16");
+    const RadKernelInfo* m64 = find(pl, "gemm_bf16_nt_m64");
+    const RadKernelInfo* rf  = find(pl, "router_topk_scatter_bf16");
+    if (!rg || !m16 || !m64 || !rf) { ok("router_gemm_topk_scatter", false, "row absent"); return; }
+
+    struct RgCase {
+        int64_t ne, K, k, nl, base;
+        const char* prot;
+        bool gate;
+        std::vector<int64_t> Ms;
+    };
+    const std::vector<RgCase> cfgs = {
+        { 512, 2560, 10, 512, 0, nullptr, true,  { 1, 4, 5, 8, 13, 16, 20, 33, 45, 64 } },
+        { 512, 2560, 10, 512, 0, nullptr, false, { 4, 20 } },
+        { 512, 2560, 10, 254, 3, "0,17,101,253", true, { 5, 45 } },
+        { 512, 2560, 10, 254, 3, nullptr, false, { 13 } },
+        { 256, 2048,  8, 256, 0, nullptr, true,  { 4, 33 } },
+    };
+    const int64_t maxM = 64, maxNe = 512, maxK = 2560, maxNS = 64 * 10;
+
+    uint64_t rs64 = 0x2545F4914F6CDD1Dull;
+    auto rnd = [&]() { rs64 ^= rs64 << 13; rs64 ^= rs64 >> 7; rs64 ^= rs64 << 17; return rs64; };
+    auto uni = [&](float lo, float hi) {
+        return lo + (hi - lo) * (float)((rnd() >> 40) & 0xFFFFFFu) * (1.0f / 16777216.0f);
+    };
+
+    void* d_a  = dalloc((size_t)maxM * maxK * 2);
+    void* d_w  = dalloc((size_t)maxNe * maxK * 2);
+    void* d_wg = dalloc((size_t)maxK * 2);
+    void* d_lg[2] = { dalloc((size_t)maxM * maxNe * 2), dalloc((size_t)maxM * maxNe * 2) };
+    void* d_g [2] = { dalloc((size_t)maxM * 2),         dalloc((size_t)maxM * 2) };
+    void* d_id[2] = { dalloc((size_t)maxNS * 4), dalloc((size_t)maxNS * 4) };
+    void* d_ew[2] = { dalloc((size_t)maxNS * 2), dalloc((size_t)maxNS * 2) };
+    void* d_so[2] = { dalloc((size_t)maxNS * 4), dalloc((size_t)maxNS * 4) };
+    void* d_of[2] = { dalloc((size_t)(maxNe + 1) * 4), dalloc((size_t)(maxNe + 1) * 4) };
+    void* d_cn[2] = { dalloc((size_t)maxNe * 4), dalloc((size_t)maxNe * 4) };
+    if (!d_a || !d_w || !d_wg || !d_lg[0] || !d_lg[1] || !d_g[0] || !d_g[1] || !d_id[0] ||
+        !d_id[1] || !d_ew[0] || !d_ew[1] || !d_so[0] || !d_so[1] || !d_of[0] || !d_of[1] ||
+        !d_cn[0] || !d_cn[1]) {
+        ok("router_gemm_topk_scatter", false, "hipMalloc failed");
+        return;
+    }
+
+    for (const RgCase& c : cfgs) {
+        /* A trained router's logits are a few units wide; these are about that, with a tie
+         * planted in every row so the selection's tie rule decides something. */
+        std::vector<uint16_t> hw((size_t)c.ne * c.K), hwg((size_t)c.K);
+        for (auto& v : hw)  v = h_to_bf16(uni(-0.06f, 0.06f));
+        for (auto& v : hwg) v = h_to_bf16(uni(-0.06f, 0.06f));
+        for (int64_t kk = 0; kk < c.K; ++kk) hw[(size_t)(7 * c.K + kk)] = hw[(size_t)(3 * c.K + kk)];
+        st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_wg, hwg.data(), hwg.size() * 2, hipMemcpyHostToDevice);
+
+        for (const int64_t M : c.Ms) {
+            const int64_t NS = M * c.k;
+            const std::string at = fmt(" (n_expert %lld, n_local %lld, M=%lld%s%s)",
+                                       (long long)c.ne, (long long)c.nl, (long long)M,
+                                       c.gate ? ", gate" : "",
+                                       c.prot ? ", protect" : "");
+            std::vector<uint16_t> ha((size_t)M * c.K);
+            for (auto& v : ha) v = h_to_bf16(uni(-2.0f, 2.0f));
+            st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+            for (int i = 0; i < 2; ++i) {
+                st_memset(d_lg[i], 0xFF, (size_t)maxM * maxNe * 2);
+                st_memset(d_g[i], 0xFF, (size_t)maxM * 2);
+                st_memset(d_id[i], 0xFF, (size_t)maxNS * 4);
+                st_memset(d_ew[i], 0, (size_t)maxNS * 2);
+                st_memset(d_so[i], 0xFF, (size_t)maxNS * 4);
+                st_memset(d_of[i], 0xFF, (size_t)(maxNe + 1) * 4);
+                st_memset(d_cn[i], 0xFF, (size_t)maxNe * 4);
+            }
+
+            /* ---- the three launches */
+            const RadKernelInfo* gr = M <= 16 ? m16 : m64;
+            {
+                std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { M, c.K }),
+                                              T(d_w, RAD_BF16, { c.ne, c.K }),
+                                              T(d_lg[0], RAD_BF16, { M, c.ne }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("N", c.ne), PI("K", c.K),
+                                             PS("dtype", "bf16") };
+                run_case(gr, ts, ps);
+            }
+            if (c.gate) {
+                std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { M, c.K }),
+                                              T(d_wg, RAD_BF16, { 1, c.K }),
+                                              T(d_g[0], RAD_BF16, { M, 1 }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("N", 1), PI("K", c.K),
+                                             PS("dtype", "bf16") };
+                run_case(gr, ts, ps);
+            }
+            {
+                std::vector<RadTensor> ts = { T(d_lg[0], RAD_BF16, { M, c.ne }),
+                                              T(d_id[0], RAD_I32, { M, c.k }),
+                                              T(d_ew[0], RAD_BF16, { M, c.k }),
+                                              T(d_so[0], RAD_I32, { NS }),
+                                              T(d_of[0], RAD_I32, { c.nl + 1 }),
+                                              T(d_cn[0], RAD_I32, { c.nl }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n_expert", c.ne),
+                                             PI("n_local", c.nl), PI("top_k", c.k), PI("norm", 1),
+                                             PS("dtype", "bf16"), PI("expert_base", c.base) };
+                if (c.prot) ps.push_back(PS("protect", c.prot));
+                run_case(rf, ts, ps);
+            }
+
+            /* ---- the fused op, twice */
+            for (int rep = 0; rep < 2; ++rep) {
+                std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { M, c.K }),
+                                              T(d_w, RAD_BF16, { c.ne, c.K }),
+                                              T(d_wg, RAD_BF16, { 1, c.K }),
+                                              T(d_lg[1], RAD_BF16, { M, c.ne }),
+                                              T(d_id[1], RAD_I32, { M, c.k }),
+                                              T(d_ew[1], RAD_BF16, { M, c.k }),
+                                              T(d_so[1], RAD_I32, { NS }),
+                                              T(d_of[1], RAD_I32, { c.nl + 1 }),
+                                              T(d_cn[1], RAD_I32, { c.nl }),
+                                              T(d_g[1], RAD_BF16, { M, 1 }) };
+                if (!c.gate) { absent(ts[2]); absent(ts[9]); }
+                std::vector<RadParam> ps = { PI("M", M), PI("K", c.K), PI("n_expert", c.ne),
+                                             PI("n_local", c.nl), PI("top_k", c.k), PI("norm", 1),
+                                             PS("dtype", "bf16"), PI("expert_base", c.base) };
+                if (c.prot) ps.push_back(PS("protect", c.prot));
+                if (rep == 1) {
+                    /* The second launch must not find anything the first one left. */
+                    st_memset(d_id[1], 0xFF, (size_t)maxNS * 4);
+                    st_memset(d_so[1], 0xFF, (size_t)maxNS * 4);
+                    st_memset(d_of[1], 0xFF, (size_t)(maxNe + 1) * 4);
+                }
+                run_case(rg, ts, ps);
+
+                const std::string tag = at + (rep ? ", second launch" : "");
+                auto same = [&](const char* what, void* a, void* b, size_t bytes) {
+                    std::vector<uint8_t> x(bytes), y(bytes);
+                    st_memcpy(x.data(), a, bytes, hipMemcpyDeviceToHost);
+                    st_memcpy(y.data(), b, bytes, hipMemcpyDeviceToHost);
+                    size_t first = bytes;
+                    int64_t n_off = 0;
+                    for (size_t i = 0; i < bytes; ++i)
+                        if (x[i] != y[i]) { if (first == bytes) first = i; ++n_off; }
+                    ok((std::string("router_gemm_topk_scatter ") + what +
+                        " is byte-identical to the unfused launches" + tag).c_str(),
+                       n_off == 0,
+                       n_off ? fmt("%lld byte(s) differ, first at byte %zu", (long long)n_off,
+                                   first) : std::string());
+                };
+                same("logits", d_lg[0], d_lg[1], (size_t)M * c.ne * 2);
+                if (c.gate) same("shared gate", d_g[0], d_g[1], (size_t)M * 2);
+                same("expert_ids", d_id[0], d_id[1], (size_t)NS * 4);
+                same("expert_w", d_ew[0], d_ew[1], (size_t)NS * 2);
+                same("sorted_tok", d_so[0], d_so[1], (size_t)NS * 4);
+                same("expert_offset", d_of[0], d_of[1], (size_t)(c.nl + 1) * 4);
+                same("expert_count", d_cn[0], d_cn[1], (size_t)c.nl * 4);
+            }
+        }
+    }
+    /* A shape past the decode band is refused, not served at another arithmetic. */
+    {
+        const int64_t M = 65;
+        std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { M, 2560 }),
+                                      T(d_w, RAD_BF16, { 512, 2560 }),
+                                      T(d_wg, RAD_BF16, { 1, 2560 }),
+                                      T(nullptr, RAD_BF16, { M, 512 }),
+                                      T(nullptr, RAD_I32, { M, 10 }),
+                                      T(nullptr, RAD_BF16, { M, 10 }),
+                                      T(nullptr, RAD_I32, { M * 10 }),
+                                      T(nullptr, RAD_I32, { 513 }),
+                                      T(nullptr, RAD_I32, { 512 }),
+                                      T(nullptr, RAD_BF16, { M, 1 }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("K", 2560), PI("n_expert", 512),
+                                     PI("top_k", 10), PI("norm", 1), PS("dtype", "bf16") };
+        run_case(rg, ts, ps, RAD_E_SHAPE);
+    }
+}
+
 /* THE PROTECTED EXPERTS ARE SORTED LAST, against a host stable sort by place. A layer that keeps a
  * few experts at a higher precision serves them with a second grouped GEMM over a trailing run of
  * the offsets, so the sort has to put their rows after every other expert's, in the order listed,
@@ -10152,6 +10346,7 @@ static void device_phase(const Plugin& pl) {
         qk_kv_fold_case(pl, true);
         qsa_qprep_case(pl);
         topk_scatter_case(pl);
+        router_gemm_fused_case(pl);
         scatter_protect_case(pl);
         if (sel("rowtopk_bf16")) {
             const RadKernelInfo* r = find(pl, "rowtopk_bf16");

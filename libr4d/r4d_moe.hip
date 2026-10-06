@@ -57,11 +57,17 @@
 #include "r4d_fp8_wmma.h"
 #include "r4d_plugin.h"
 #include "r4d_emit.h"
+#include "r4d_gemm_args.h"
+
+#include <hip/hip_bf16.h>
 
 #include <cstdlib>
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -2656,3 +2662,322 @@ extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
     R4D_MOE_CHK();
     return RAD_OK;
 }
+
+/* ================================================================== router GEMM + router_topk_scatter
+ *
+ * THE ROUTER, ITS SELECTION AND ITS SORT IN ONE LAUNCH -- and, where the layer has a shared expert,
+ * that expert's one-column gate beside them. rad_block_moe_fp8.h declares it under
+ * R4D_ROUTER_FUSED; this is the kernel and its shim.
+ *
+ * At a decode step the router is a [n_expert, n_embd] bf16 GEMM over a handful of rows, and what
+ * follows it -- `router_topk_scatter` -- is one workgroup with almost no work in it. They are two
+ * DEPENDENT dispatches on every routed layer, and the boundary between them is a command-processor
+ * gap plus a second launch, on the critical path. The selection needs every logit of a row, so it
+ * cannot run inside a column tile; it runs in whichever workgroup finishes LAST, which an arrival
+ * counter names. That is the device-wide pattern gemm_fp8a8's split-K finisher and hc_up_mix's
+ * quantiser already use, and its rule is theirs: one counter a (stream, output), self-resetting.
+ *
+ * The shared expert's gate is a gemm_nt at N = 1 over the SAME input, a launch of its own for one
+ * output column. It rides along as one more workgroup of this grid (`skg` > 0), so the launch the
+ * routed gate_up was overlapping disappears from the queue.
+ *
+ * BYTE-IDENTICAL TO THE LAUNCHES IT STANDS IN FOR, and the claim rests on two things:
+ *
+ *   - THE GEMM IS r4d_gemm_bf16_nt_m64_kernel'S ARITHMETIC, ELEMENT BY ELEMENT. An output element of
+ *     that kernel is SK partial tiles, each ONE wave's WMMA chain over one contiguous K slice in
+ *     ascending K, summed in ascending split order from 0.f and narrowed by the language's own
+ *     conversion. Which block owns the tile, how many tiles a block holds (WV, MB) and how many
+ *     waves a block has do not enter it -- only SK does. So the split counts are asked of the law
+ *     the unfused launches ask (cfg_for with the same N-tile count: a 512-wide router and a
+ *     one-column gate get different ones), and a wave here may run several (tile, split) items
+ *     one after another: each item is the same chain from zero into an LDS slot of its own, so the
+ *     sum sees exactly the operands it saw before.
+ *   - THE SELECTION AND THE SORT ARE router_topk_scatter_kernel'S BODY: the same two device
+ *     functions over the same logits, wave-local per row and stable without an atomic ordering
+ *     anything, so the number of waves the last block happens to have moves no bit.
+ *
+ * A TUNED POINT for the unfused router would break the first of those: this row is NOTUNE and
+ * always takes the law's split. No shipped configuration tunes these GEMMs.
+ *
+ * DECODE ONLY: at most kRgMaxM rows (four 16-row tiles), which is the skinny GEMM's decode band;
+ * past it the router is the tiled kernel and the architecture issues the pair. */
+constexpr long long kRgMaxM = 64;
+
+namespace {
+
+constexpr int kRgKU = 8;                  /* r4d_gemm_bf16_nt_m64's KU: the unroll, not the order */
+
+typedef __bf16 rg_v8bf __attribute__((ext_vector_type(8)));
+typedef float  rg_v8f  __attribute__((ext_vector_type(8)));
+/* Global-address-space pointer for the fragment loads, as r4d_gemm_bf16_nt_m64.hip holds it. */
+typedef __attribute__((address_space(1))) const unsigned long long* rg_gu2;
+
+__device__ __forceinline__ rg_v8f rg_mma(rg_v8bf a, rg_v8bf b, rg_v8f c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+}
+/* r4d_gemm_bf16_nt_m64.hip's fragU: k step `u` of a K-contiguous row, two runs of four. */
+__device__ __forceinline__ rg_v8bf rg_fragU(rg_gu2 p, int u) {
+    union { unsigned long long w[2]; rg_v8bf f; } x;
+    x.w[0] = p[4 * u];
+    x.w[1] = p[4 * u + 2];
+    return x.f;
+}
+/* r4d_gdn_wmma.h's rowGo: this lane's row, clamped to `lim`, as a 32-bit element offset. */
+__device__ __forceinline__ unsigned rg_rowGo(unsigned rowstride, int row0, int lim, int lane) {
+    int r = row0 + (lane & 15);
+    r = r < lim ? r : lim;
+    return (unsigned)r * rowstride + 4u * (unsigned)(lane >> 4);
+}
+
+/* ONE (tile, split) ITEM: the 16 x 16 partial tile r4d_gemm_bf16_nt_m64_kernel's wave (n0, ks)
+ * accumulates at MT = 1 -- the same loads, the same WMMA chain in the same order from zero. */
+__device__ __forceinline__ rg_v8f rg_item(const uint16_t* __restrict__ A,
+                                          const uint16_t* __restrict__ W, int M, int K, int N,
+                                          int n0, int m0, int ks, int SK, int lane) {
+    const int Ks = K / SK, ksteps = Ks / 16, kbase = ks * Ks;
+    rg_v8f acc = (rg_v8f)(0.f);
+    const unsigned woff = rg_rowGo((unsigned)K, n0, N - 1, lane) + (unsigned)kbase;
+    const unsigned aoff = rg_rowGo((unsigned)K, m0, M - 1, lane) + (unsigned)kbase;
+    if (n0 < N) {
+        rg_gu2 pw = (rg_gu2)(const unsigned long long*)(W + woff);
+        rg_gu2 pa = (rg_gu2)(const unsigned long long*)(A + aoff);
+        int s = 0;
+        for (; s + kRgKU <= ksteps; s += kRgKU) {
+#pragma unroll
+            for (int u = 0; u < kRgKU; u++) {
+                const rg_v8bf b = rg_fragU(pw, u);
+                acc = rg_mma(rg_fragU(pa, u), b, acc);
+            }
+            pw += kRgKU * 4;
+            pa += kRgKU * 4;
+        }
+        for (; s < ksteps; s++) {
+            const rg_v8bf b = rg_fragU(pw, 0);
+            pw += 4;
+            acc = rg_mma(rg_fragU(pa, 0), b, acc);
+            pa += 4;
+        }
+    }
+    return acc;
+}
+
+/* The launch geometry, one argument: `sk` the router's split and `tpb` its 16-column tiles a
+ * block, `nrb` the router's blocks along x, `skg` the gate's split (0: no gate; its block is
+ * x = nrb). Rows are tiled along y, one 16-row tile a block. */
+struct RgGeom {
+    uint32_t M, K, n_expert, n_local, top_k, lg_ld;
+    int32_t  norm, base;
+    uint32_t sk, tpb, nrb, skg;
+};
+
+/* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
+template <uint32_t MAXOWN, uint32_t NW>
+__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot) {
+    /* The partial tiles of the GEMM, then -- in the last block only, after two barriers -- the
+     * sort's LDS. The shim sizes it for the larger of the two. */
+    extern __shared__ __align__(16) unsigned char rg_smem[];
+    float* const red = (float*)rg_smem;
+    const uint32_t tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
+
+    const bool      gb  = g.skg > 0 && blockIdx.x == g.nrb;
+    const int       SK  = (int)(gb ? g.skg : g.sk);
+    const uint32_t  nti = gb ? 1u : g.tpb;
+    const int       N   = gb ? 1 : (int)g.n_expert;
+    const uint32_t  nt0 = gb ? 0u : blockIdx.x * g.tpb;
+    const uint16_t* Wb  = gb ? Wg : W;
+    const int       m0  = (int)(blockIdx.y * 16u);
+
+    const uint32_t items = nti * (uint32_t)SK;
+    for (uint32_t it = wave; it < items; it += NW) {
+        const uint32_t j = it / (uint32_t)SK, ks = it % (uint32_t)SK;
+        const rg_v8f acc = rg_item(A, Wb, (int)g.M, (int)g.K, N, (int)((nt0 + j) * 16u), m0,
+                                   (int)ks, SK, (int)lane);
+        float* const slot = red + (size_t)it * 256;           /* it == j * SK + ks */
+#pragma unroll
+        for (int e = 0; e < 8; e++) slot[e * (int)kWave + (int)lane] = acc[e];
+    }
+    __syncthreads();
+    /* THE REDUCTION, r4d_gemm_bf16_nt_m64_kernel's: the splits in ascending order from 0.f, and
+     * the language's float-to-bf16 conversion -- not f32_to_bf16, which is the same only away
+     * from NaN. */
+    for (uint32_t idx = tid; idx < nti * 256u; idx += NW * kWave) {
+        const uint32_t j = idx >> 8, o = idx & 255u;
+        float v = 0.f;
+        for (int s = 0; s < SK; s++) v += red[((size_t)j * (size_t)SK + (size_t)s) * 256 + o];
+        const uint32_t l = o & 31u;
+        const int n = (int)((nt0 + j) * 16u + (l & 15u));
+        const int m = m0 + (int)(8u * (l >> 4) + (o >> 5));
+        if (n < N && m < (int)g.M) {
+            if (gb) ((__hip_bfloat16*)gate)[m] = (__hip_bfloat16)v;
+            else    ((__hip_bfloat16*)lg)[(size_t)m * g.lg_ld + (size_t)n] = (__hip_bfloat16)v;
+        }
+    }
+
+    /* ---- THE LAST BLOCK RANKS. Every store above is made visible device-wide before the
+     * arrival is published, and the block that completes the count resets it for the next
+     * launch and acquires the other blocks' logits. */
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned int s_arrived;
+    if (tid == 0)
+        s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    if (s_arrived + 1u != gridDim.x * gridDim.y) return;
+    if (tid == 0) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __threadfence();
+
+    /* router_topk_scatter_kernel, from here to the end. */
+    ScatterLds<NW>& sl = *reinterpret_cast<ScatterLds<NW>*>(rg_smem);
+    for (uint32_t e = tid; e < g.n_local; e += blockDim.x) sl.cnt[e] = 0;
+    const SlotSink snk{sl.e, g.base, g.n_local, prot};
+    for (uint32_t m = wave; m < g.M; m += NW)
+        router_topk_row<MAXOWN>(lg, ids, w, m, g.n_expert, g.top_k, g.lg_ld, g.norm, lane, snk);
+    lds_barrier();
+    scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
+}
+
+}  /* namespace */
+
+/* THE ARRIVAL COUNTER, one a (stream, logits buffer): ctx.h's rule TWO, and gemm_fp8a8's split_ctr
+ * says why the output is part of the key. Launches that share a logits buffer on one stream are
+ * ordered through it -- every routed layer writes the same plane -- so they reuse one counter.
+ * Zeroed once and reset by the last block of every launch. Null when it cannot be allocated; the
+ * op then refuses rather than computing without it. */
+static unsigned int* router_fused_ctr(RadStream s, const void* out) {
+    static std::mutex m;
+    static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
+    std::lock_guard<std::mutex> lk(m);
+    const auto key = std::make_pair(s, out);
+    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+    void* p = nullptr;
+    if (hipMalloc(&p, 64) != hipSuccess) return nullptr;
+    if (hipMemset(p, 0, 64) != hipSuccess) {
+        (void)hipFree(p);
+        return nullptr;
+    }
+    blocks.emplace(key, (unsigned int*)p);
+    return (unsigned int*)p;
+}
+
+/* Operands: a, b (the router), gate_b? -> logits, expert_ids, expert_w, sorted_tok,
+ * expert_offset, expert_count, gate?. The two optional ones come together or not at all. Every
+ * check of the two shims it stands in for is made here too; nothing new is asserted beyond the
+ * row bound. */
+static int rad_router_gemm_topk_scatter_body(const RadArgs* a, const R4dSink& sk) {
+    int emit_rc = RAD_OK;
+    const RadTensor* x      = r4d_opt(a, 0);
+    const RadTensor* wr     = r4d_opt(a, 1);
+    const RadTensor* wg     = r4d_opt(a, 2);
+    const RadTensor* lg     = r4d_opt(a, 3);
+    const RadTensor* ids    = r4d_opt(a, 4);
+    const RadTensor* w      = r4d_opt(a, 5);
+    const RadTensor* sorted = r4d_opt(a, 6);
+    const RadTensor* off    = r4d_opt(a, 7);
+    const RadTensor* cnt    = r4d_opt(a, 8);
+    const RadTensor* gate   = r4d_opt(a, 9);
+    if (!x || !wr || !lg || !ids || !w || !sorted || !off || !cnt) return R4D_NO(RAD_E_INVAL);
+    if ((wg != nullptr) != (gate != nullptr)) return R4D_NO(RAD_E_INVAL);
+
+    const long long n_expert = r4d_geti_or(a, "n_expert", 0);
+    const long long n_local  = r4d_geti_or(a, "n_local", n_expert);
+    const long long top_k    = r4d_geti_or(a, "top_k", 0);
+    const long long norm     = r4d_geti_or(a, "norm", 0);
+    const long long base     = r4d_geti_or(a, "expert_base", 0);
+    if (n_expert <= 0 || n_expert > (long long)kMaxExpert || top_k <= 0 || top_k > n_expert)
+        return R4D_NO(RAD_E_SHAPE);
+    if (top_k > (long long)kWave) return R4D_NO(RAD_E_SHAPE);
+    if (n_local <= 0 || n_local > n_expert) return R4D_NO(RAD_E_SHAPE);
+    if (base < 0 || base + n_local > n_expert) return R4D_NO(RAD_E_SHAPE);
+    Protect prot;
+    const int prc = protect_of(a, n_local, &prot);
+    if (prc != RAD_OK) return prc;
+    if (x->dtype != RAD_BF16 || wr->dtype != RAD_BF16 || lg->dtype != RAD_BF16 ||
+        w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (wg && (wg->dtype != RAD_BF16 || gate->dtype != RAD_BF16)) return R4D_NO(RAD_E_DTYPE);
+    if (ids->dtype != RAD_I32 || sorted->dtype != RAD_I32 || off->dtype != RAD_I32 ||
+        cnt->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+
+    /* The GEMM's operands, as gemm_ops reads them: A [M, K] contiguous, the output contiguous,
+     * A and the weights 16-byte aligned. */
+    long long M = 0, K = 0;
+    if (r4d_rows_of(x, &M, &K) != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(x)) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_geti_or(a, "K", K) != K) return R4D_NO(RAD_E_SHAPE);
+    if (M > kRgMaxM) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_aligned(x->data, 16) || !r4d_aligned(wr->data, 16) ||
+        (wg && !r4d_aligned(wg->data, 16))) return R4D_NO(RAD_E_ALIGN);
+    if (r4d_numel(wr) < n_expert * K || (wg && r4d_numel(wg) < K)) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(lg) || r4d_numel(lg) < M * n_expert) return R4D_NO(RAD_E_STRIDE);
+    if (gate && (!r4d_contig(gate) || r4d_numel(gate) < M)) return R4D_NO(RAD_E_STRIDE);
+
+    const long long T = M * top_k;
+    if (T > (long long)kScatterSmall) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(ids) || !r4d_contig(w) || !r4d_contig(sorted) || !r4d_contig(off) ||
+        !r4d_contig(cnt)) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_numel(ids) < T || r4d_numel(w) < T) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(sorted) < T) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(off) < n_local + 1 || r4d_numel(cnt) < n_local) return R4D_NO(RAD_E_SHAPE);
+
+    /* THE SPLITS THE UNFUSED LAUNCHES TAKE: gemm_bf16_nt_m16/_m64 ask cfg_for with ceil(N/16)
+     * tiles, so the router asks with its own width and the gate with one tile. */
+    const long long ntiles = (n_expert + 15) / 16;
+    Cfg cr{}, cg{};
+    int rc = cfg_for(a, K, M, 16, BR_FLAT, &cr, ntiles);
+    if (rc != RAD_OK) return rc;
+    if (wg) {
+        rc = cfg_for(a, K, M, 16, BR_FLAT, &cg, 1);
+        if (rc != RAD_OK) return rc;
+    }
+    unsigned int* const ctr = router_fused_ctr(sk.stream, lg->data);
+    if (!ctr) return R4D_NO(RAD_E_DEVICE);
+
+    /* THE WAVE COUNT IS THE SELECTION'S, router_topk_scatter's rule: a wave a row up to 32. The
+     * GEMM then takes as many 16-column tiles a block as fills those waves at its split. */
+    const uint32_t nw = M <= 8 ? 8u : M <= 16 ? 16u : 32u;
+    long long tpb = (long long)nw / cr.sk;
+    if (tpb < 1) tpb = 1;
+    if (tpb > ntiles) tpb = ntiles;
+    const long long nrb = (ntiles + tpb - 1) / tpb;
+    size_t lds = (size_t)(tpb * cr.sk) * 256 * sizeof(float);
+    if (wg) lds = std::max(lds, (size_t)cg.sk * 256 * sizeof(float));
+    const size_t sort_lds = nw == 8 ? sizeof(ScatterLds<8>)
+                          : nw == 16 ? sizeof(ScatterLds<16>) : sizeof(ScatterLds<32>);
+    lds = std::max(lds, sort_lds);
+
+    RgGeom g{};
+    g.M = (uint32_t)M;               g.K = (uint32_t)K;
+    g.n_expert = (uint32_t)n_expert; g.n_local = (uint32_t)n_local;
+    g.top_k = (uint32_t)top_k;       g.lg_ld = (uint32_t)n_expert;
+    g.norm = (int32_t)norm;          g.base = (int32_t)base;
+    g.sk = (uint32_t)cr.sk;          g.tpb = (uint32_t)tpb;
+    g.nrb = (uint32_t)nrb;           g.skg = wg ? (uint32_t)cg.sk : 0u;
+    const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((M + 15) / 16));
+
+#define R4D_RG_L(OWN, NWV)                                                                      \
+    emit_rc = R4D_EMIT(sk, (router_gemm_topk_scatter_kernel<OWN, NWV>), grid,                   \
+                       dim3((NWV) * kWave), lds,                                                \
+                       (const uint16_t*)x->data, (const uint16_t*)wr->data,                     \
+                       wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,               \
+                       (uint16_t*)lg->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,  \
+                       (int32_t*)ids->data, (uint16_t*)w->data, (int32_t*)sorted->data,         \
+                       (int32_t*)off->data, (int32_t*)cnt->data, ctr, g, prot)
+    if (n_expert <= (long long)(8 * kWave)) {
+        if      (nw == 8)  R4D_RG_L(8, 8);
+        else if (nw == 16) R4D_RG_L(8, 16);
+        else               R4D_RG_L(8, 32);
+    } else {
+        if      (nw == 8)  R4D_RG_L(16, 8);
+        else if (nw == 16) R4D_RG_L(16, 16);
+        else               R4D_RG_L(16, 32);
+    }
+#undef R4D_RG_L
+    if (emit_rc != RAD_OK) return emit_rc;
+    if (!sk.desc) R4D_MOE_CHK();
+    return RAD_OK;
+}
+R4D_ENTRY(r4d_rad_router_gemm_topk_scatter, rad_router_gemm_topk_scatter_body)

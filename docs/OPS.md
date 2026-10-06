@@ -479,6 +479,7 @@ and adding 0.0f is exact, so a block sum over 8 wave partials and over 32 are th
 | `router_topk` | `M`(range) `n_expert` `top_k` `norm` `dtype` | `logits` → `expert_ids`, `expert_w` |
 | `moe_scatter` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `logits` → `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count` |
+| `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
@@ -530,6 +531,17 @@ without an atomic deciding the order. That bound is the decode band by construct
 sequences at depth 3 and top_k 10 is 320 slots — and a prefill chunk is past it, which is also
 where the pair is amortised over real work and a fusion would buy nothing. A caller past the bound
 gets a refusal, not a silent change of cost.
+
+**`router_gemm_topk_scatter` puts the router's GEMM in front of that pair**, in the same launch:
+`gemm_nt` of `a` [M, K] against the router `b` [n_expert, K] into `logits`, then exactly
+`router_topk_scatter` over those logits. With `gate_b` [1, K] and `gate` [M, 1] present it is
+also the shared expert's one-column `gemm_nt` over the same `a`; the two come together or not at
+all. The selection needs every logit of a row, so it runs in the workgroup that finishes the GEMM
+last (an arrival counter, self-resetting, one a stream and logits buffer). It is byte-identical to
+the launches it stands in for: an element of the skinny bf16 GEMM depends only on its split-K
+count, which this op takes from the same law at the same N, and the selection and sort are the
+same code. Decode only, `M <= 64` -- past that the router is the tiled GEMM -- and bounded like the
+pair. The logits stay an output.
 
 `moe_scatter`'s output is what `rad_route_report` hands the heat engine. The histogram is read
 back asynchronously and consumed on the next step; nothing here blocks the compute stream

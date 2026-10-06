@@ -226,6 +226,11 @@ int     r4d_rad_router_topk        (const RadArgs*, RadStream);
 int     r4d_rad_moe_scatter        (const RadArgs*, RadStream);
 int     r4d_rad_router_topk_scatter(const RadArgs*, RadStream);
 int r4d_rad_router_topk_scatter_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+/* The router GEMM, the selection and the sort in one launch, the shared gate optionally beside
+ * them (R4D_ROUTER_FUSED in rad_block_moe_fp8.h). */
+int     r4d_rad_router_gemm_topk_scatter(const RadArgs*, RadStream);
+int r4d_rad_router_gemm_topk_scatter_describe(const RadArgs*, RadStream, RadLaunchDesc*, int,
+                                              int*);
 int64_t r4d_rad_moe_scatter_scratch(const RadArgs*);
 int     r4d_rad_moe_gemm_q         (const RadArgs*, RadStream);
 /* Scratch for the run map the prefill form is aligned by. Zero in the decode band and zero for a
@@ -487,6 +492,7 @@ int r4d_shape_dequant_w4     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_row_topk       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_router_gemm_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_moe_scatter    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q_mod4(const RadParam*, int, int operand, RadOpdDesc*);

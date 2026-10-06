@@ -76,6 +76,23 @@ namespace arch {
  * decide, at declare time and identically on both ranks, whether the op exists at all. */
 static const int64_t kMoeSortRows = 1024;
 
+/* R4D_ROUTER_FUSED: the router's GEMM in the same launch as `router_topk_scatter`
+ * (`router_gemm_topk_scatter`), at decode shapes. 1 also computes the shared expert's one-column
+ * gate in that launch, 2 leaves the gate its own `gemm_nt`; unset or 0 declares nothing new and the
+ * graph is the one without it. Read once, at declare, so a recorded pass and a live one issue the
+ * same ops. Every output is byte-identical either way (see libr4d's r4d_moe.hip). */
+inline int moe_router_fused_mode() {
+    static const int v = [] {
+        const char* e = std::getenv("R4D_ROUTER_FUSED");
+        const int x = e ? std::atoi(e) : 0;
+        return (x == 1 || x == 2) ? x : 0;
+    }();
+    return v;
+}
+/* The skinny bf16 GEMM's decode band, which is where the fused op's GEMM is that GEMM's own
+ * arithmetic; past it the router runs the tiled kernel and the pair is issued as before. */
+static const int64_t kMoeRouterFusedRows = 64;
+
 
 
 /* ---- RADIANCE_DEBUG_ROUTING: the routing WEIGHTS of token 0, which nothing else reports.
@@ -362,6 +379,12 @@ struct MoeFP8 {
      * a prefill chunk is past it. */
     rad_op  op_topk_scatter = 0;
     int64_t topk_scatter_rows = 0;
+    /* `router_gemm_topk_scatter` (R4D_ROUTER_FUSED), if declared: the router GEMM in front of the
+     * pair above, up to `router_fused_rows` tokens, and with `router_fused_gate` the shared
+     * expert's gate (`op_sgate`'s work) as well. 0 issues the router and the pair as always. */
+    rad_op  op_router_fused = 0;
+    int64_t router_fused_rows = 0;
+    bool    router_fused_gate = false;
     /* The rotated re-quantisation of the block input, declared only when `expert_rot` is set and
      * the caller does not already write `w.hr`. */
     rad_op op_hq = 0;
@@ -452,7 +475,7 @@ struct MoeFP8 {
     void step(RadCtx* c, const RadBatch* batch) const;
     /* One pass of at most `c.rows` tokens. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
-    void shared_up(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
+    void shared_up(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool gate_done = false) const;
 };
 
 inline int MoeFP8::format_of(const RadEncoding& e) {
@@ -1367,6 +1390,68 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                      {w.h.x}, {w.sgate});
     }
 
+    /* ---- R4D_ROUTER_FUSED: the router GEMM and `router_topk_scatter` as one op, and with mode 1
+     * the shared gate as well. Declared HERE, after the gate's weight, and not beside the router:
+     * the op names both weights, and declaring it late only lengthens the planned lifetime of the
+     * buffers it touches, never shortens one -- each of them is also declared by the op it stands
+     * in for, at that op's place. Only where the pair itself is declared, and only up to the
+     * pair's own row bound. */
+    if (moe_router_fused_mode() && op_topk_scatter) {
+        router_fused_rows = topk_scatter_rows < kMoeRouterFusedRows ? topk_scatter_rows
+                                                                    : kMoeRouterFusedRows;
+        router_fused_gate = moe_router_fused_mode() == 1 && op_sgate != 0;
+        const int64_t fr = router_fused_rows;
+        if (router_fused_gate && !prot_list)
+            op_router_fused = rw(b, RAD_OP(b, "router_gemm_topk_scatter",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, fr), RAD_INT("K", g.n_embd),
+                                               RAD_INT("n_expert", c.n_expert_all),
+                                               RAD_INT("n_local", c.n_expert),
+                                               RAD_INT("top_k", c.top_k),
+                                               RAD_INT("norm", c.norm_topk),
+                                               RAD_STR("dtype", g.dtype),
+                                               RAD_INT("expert_base", c.expert_base)),
+                                    RAD_WEIGHTS(w_router, w_sgate)),
+                                 {w.h.x}, {w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt,
+                                           w.sgate});
+        else if (router_fused_gate)
+            op_router_fused = rw(b, RAD_OP(b, "router_gemm_topk_scatter",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, fr), RAD_INT("K", g.n_embd),
+                                               RAD_INT("n_expert", c.n_expert_all),
+                                               RAD_INT("n_local", c.n_expert),
+                                               RAD_INT("top_k", c.top_k),
+                                               RAD_INT("norm", c.norm_topk),
+                                               RAD_STR("dtype", g.dtype),
+                                               RAD_INT("expert_base", c.expert_base),
+                                               RAD_STR("protect", prot_list)),
+                                    RAD_WEIGHTS(w_router, w_sgate)),
+                                 {w.h.x}, {w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt,
+                                           w.sgate});
+        else if (!prot_list)
+            op_router_fused = rw(b, RAD_OP(b, "router_gemm_topk_scatter",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, fr), RAD_INT("K", g.n_embd),
+                                               RAD_INT("n_expert", c.n_expert_all),
+                                               RAD_INT("n_local", c.n_expert),
+                                               RAD_INT("top_k", c.top_k),
+                                               RAD_INT("norm", c.norm_topk),
+                                               RAD_STR("dtype", g.dtype),
+                                               RAD_INT("expert_base", c.expert_base)),
+                                    RAD_WEIGHTS(w_router)),
+                                 {w.h.x}, {w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt});
+        else
+            op_router_fused = rw(b, RAD_OP(b, "router_gemm_topk_scatter",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, fr), RAD_INT("K", g.n_embd),
+                                               RAD_INT("n_expert", c.n_expert_all),
+                                               RAD_INT("n_local", c.n_expert),
+                                               RAD_INT("top_k", c.top_k),
+                                               RAD_INT("norm", c.norm_topk),
+                                               RAD_STR("dtype", g.dtype),
+                                               RAD_INT("expert_base", c.expert_base),
+                                               RAD_STR("protect", prot_list)),
+                                    RAD_WEIGHTS(w_router)),
+                                 {w.h.x}, {w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt});
+        if (!op_router_fused) router_fused_gate = false;
+    }
+
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
                        RAD_PARAMS(RAD_INT("world_size", g.world),
@@ -1399,7 +1484,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
  * The shared expert is ordinary dense linears over that input, and every buffer it touches is the
  * step's height -- so the pass offset goes through all of them exactly as it does through an
  * MlpFP8 slice. */
-inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
+inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
+                              bool gate_done) const {
+    /* `gate_done`: the fused router already wrote this pass's gate (R4D_ROUTER_FUSED=1). */
+    if (!gate_done)
     RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_sgate),
                 brow_slice(w.sgate, r0, rows, 1));
     sh_gate_up.step(c_, w.h, w.sgu, T, r0, rows);
@@ -1431,11 +1519,24 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
      * a routed layer, a whole dependent dispatch for a kilobyte. */
     int32_t* const counts = rad_route_counts(c_, layer, ne);
     const RadOperand ecnt = counts ? praw(counts, RAD_I32, ne) : brows(w.ecnt, ne);
+    /* R4D_ROUTER_FUSED: the router, the pair below and -- with `router_fused_gate` -- the shared
+     * gate, in one launch with the operands the three are handed. */
+    const bool rfused = op_router_fused && rows <= router_fused_rows;
+    if (rfused)
+        RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                    RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
+                    brow_slice(w.logits, r0, rows, ne_all),
+                    brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
+                    router_fused_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE);
+    else
     RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
                 brow_slice(w.logits, r0, rows, ne_all));
     /* One launch or two. `w.ids` is the fused op's OUTPUT where it was the sort's input, and
      * every other operand is the one the pair is handed. */
-    if (op_topk_scatter && rows <= topk_scatter_rows) {
+    if (rfused) {
+        /* the fused router wrote all five */
+    } else if (op_topk_scatter && rows <= topk_scatter_rows) {
         RAD_ISSUE_N(c_, op_topk_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
@@ -1482,7 +1583,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
                 brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                 RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
                 brows(w.egu, rows * k));
-    if (shared) shared_up(c_, T, r0, rows);
+    if (shared) shared_up(c_, T, r0, rows, rfused && router_fused_gate);
     gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (c.expert_bf16)
