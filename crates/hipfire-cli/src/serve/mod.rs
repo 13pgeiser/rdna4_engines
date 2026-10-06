@@ -1323,6 +1323,9 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
     if let Some(backend) = &args.kv_backend {
         command.arg("--kv-backend").arg(backend);
     }
+    if let Some(max_seq) = args.max_seq {
+        command.arg("--max-seq").arg(max_seq.to_string());
+    }
     if let Some(seconds) = args.idle_timeout {
         command.arg("--idle-timeout").arg(seconds.to_string());
     }
@@ -1505,7 +1508,9 @@ pub(crate) fn serve_foreground(
     let vmm_batch = VmmBatchFlags::from_config(&global)?;
     let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
     let multi_slot_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4);
-    let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
+    let multi_slot_ctx = args
+        .max_seq
+        .unwrap_or(config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192));
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
     // Serving cache/scheduler contract keys (spec §9.1). The VMM batch route
@@ -2725,6 +2730,8 @@ mod tests {
             "q8",
             "--kv-backend",
             "vmm",
+            "--max-seq",
+            "65536",
             "--idle-timeout",
             "0",
             "--tp",
@@ -2737,6 +2744,7 @@ mod tests {
         assert_eq!(args.positionals.len(), 3);
         assert_eq!(args.kv_mode.as_deref(), Some("q8"));
         assert_eq!(args.kv_backend.as_deref(), Some("vmm"));
+        assert_eq!(args.max_seq, Some(65_536));
         assert_eq!(args.idle_timeout, Some(0));
         assert_eq!(args.tp, Some(2));
     }
