@@ -727,13 +727,6 @@ struct LinearFP8 {
                  int64_t span_lo = 0, int64_t span_hi = 0);
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
               int64_t rows = 0) const;
-    /* THIS RANK READS NOTHING FOR IT: the weight and its scale plane are zeros
-     * (rad_weight_shard_zero). After declare(); for an attention-zero rank (rad_arch.h). */
-    int  zero_share(RadBuilder* b) const {
-        RAD_ARCH_TRY(rad_weight_shard_zero(b, w));
-        if (ws) RAD_ARCH_TRY(rad_weight_shard_zero(b, ws));
-        return RAD_OK;
-    }
     /* A SPAN PER STACKED ROW PART (rad_weight_shard_span_parts), in the weight's rows; the scale
      * plane takes the same spans in its own rows. After declare(); every span and total has to be
      * whole scale blocks when the plane is 1/128, which head widths of 128 are. */

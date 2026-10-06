@@ -438,7 +438,8 @@ bool Engine::ngram_gather_to_host() {
  * RAM's is lockable_room's -- the memory and every cgroup after the pools still to be allocated,
  * and the memlock limit for a locked copy. */
 int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
-                                    const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
+                                    const std::vector<int64_t>& emb_bytes,
+                                    const std::vector<int64_t>& floor_emb_ram, int64_t kv_floor,
                                     int64_t ngram_bytes, bool ngram_device, bool ngram_host) {
     const int64_t MiB = (int64_t)1 << 20;
     int64_t emb_max = 0;
@@ -501,9 +502,13 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     auto card_holds = [&](std::string* why) {
         std::vector<VramFacts> with = facts;
         int64_t fixed = 0;
-        for (VramFacts& f : with) {
+        for (size_t i = 0; i < with.size(); ++i) {
+            VramFacts& f = with[i];
             f.statics += ngram_bytes;
-            if (emb == TablePlacement::Ram) f.statics -= emb_max;
+            if (emb == TablePlacement::Ram) {
+                f.statics -= emb_max;
+                f.expert_floor = floor_emb_ram[i];
+            }
             fixed = std::max(fixed, f.statics);
         }
         /* `fixed` and not the trial's own statics: the split clamps those to what the card can give
@@ -511,12 +516,21 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         VramBudget tb;
         const int st = vram_budget_trial(cfg_, with, &tb);
         const bool over = st == RAD_OK && fixed >= tb.claimable;
-        if (st == RAD_OK && !over && (!tb.derived_kv || tb.kv >= kv_floor)) return true;
+        /* AND THE EXPERTS KEEP A TIER: where the cache lends, those the host pool cannot hold have
+         * only the card, and a table that took their room would leave them nowhere. */
+        const bool starved = st == RAD_OK && tb.lends && tb.expert_ceiling > 0 &&
+                             tb.experts < tb.expert_floor;
+        if (st == RAD_OK && !over && !starved && (!tb.derived_kv || tb.kv >= kv_floor))
+            return true;
         if (st != RAD_OK)
             *why = "the card cannot hold the other weights with it";
         else if (over)
             *why = fmt("with it the fixed weights want %s of a card that has %s to give",
                        humanb(fixed).c_str(), humanb(tb.claimable).c_str());
+        else if (starved)
+            *why = fmt("with it on the card the experts get %s, short of the %s the pinned host "
+                       "pool cannot hold", humanb(tb.experts).c_str(),
+                       humanb(tb.expert_floor).c_str());
         else
             *why = fmt("with it on the card the KV pool is %s, short of the %s one "
                        "--max-model-len sequence needs", humanb(tb.kv).c_str(),
@@ -1064,6 +1078,7 @@ int Engine::plan() {
         /* The placement flags' tables, per rank where they are sharded (the embedding) and once
          * where they are not (the n-gram table every rank reads from the one mapping). */
         std::vector<int64_t> emb_bytes;
+        std::vector<WeightFootprint> wfs;
         int64_t ngram_bytes = 0, kv_floor = 0;
         bool ngram_device = false, ngram_host = false;
         const int64_t ctx = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
@@ -1106,6 +1121,12 @@ int Engine::plan() {
             weight_footprint(r->program, &wf, TablePlacement::Vram, TablePlacement::Disk);
             f.statics = wf.statics;
             f.experts = wf.experts;
+            /* The expert floor waits for the tables' placement: the embedding may take its share
+             * of the host pool first. */
+            wfs.push_back(wf);
+            /* THE CACHE LENDS where units move and the pool can give its blocks back in place. */
+            f.lends = VMem::supported() && !cfg_.deterministic &&
+                      (cfg_.placement == "auto" || cfg_.placement == "expert_tiered");
             emb_bytes.push_back(wf.embedding);
             ngram_bytes = std::max(ngram_bytes, wf.ngram);
             ngram_device = ngram_device || wf.ngram_device;
@@ -1118,8 +1139,10 @@ int Engine::plan() {
                 Config one = cfg_;
                 one.max_seqs = 1;
                 KVManager single;
-                if (single.plan_groups(r->program.kv_groups, one) == RAD_OK)
+                if (single.plan_groups(r->program.kv_groups, one) == RAD_OK) {
                     kv_floor = std::max(kv_floor, single.ceiling(ctx));
+                    f.kv_one = single.ceiling(ctx);
+                }
             }
             /* THE STAGING REGION IS SIZED ONLY WHERE THE ARENA LENDS ITS TOP: with no smaller level
              * nothing gives the region back to the slab at decode, and a deterministic plan moves
@@ -1167,13 +1190,28 @@ int Engine::plan() {
             late_lazy_bytes_ = std::max(late_lazy_bytes_, lazy);
             facts.push_back(f);
         }
-        RAD_TRY(resolve_table_placement(facts, emb_bytes, kv_floor, ngram_bytes, ngram_device,
-                                        ngram_host));
+        /* THE PINNED HOST POOL IS THE EXPERTS' OTHER HOME, less what Planner::plan takes out of it
+         * before any expert: the embedding when it is placed there, and the file tier's staging.
+         * Both floors are known before the tables are placed, so placing them can ask whether the
+         * experts would still have a tier. */
+        std::vector<int64_t> floor_emb_ram(facts.size(), 0);
+        for (size_t i = 0; i < facts.size(); ++i) {
+            int64_t room = cfg_.host_pool_mib * ((int64_t)1 << 20);
+            if (cfg_.weights_disk_tier)
+                room -= file_stage_reserve(wfs[i].layer_unit_max, wfs[i].routed);
+            facts[i].expert_floor = expert_vram_floor(wfs[i], std::max<int64_t>(room, 0));
+            floor_emb_ram[i] = expert_vram_floor(wfs[i], std::max<int64_t>(room - emb_bytes[i], 0));
+        }
+        RAD_TRY(resolve_table_placement(facts, emb_bytes, floor_emb_ram, kv_floor, ngram_bytes,
+                                        ngram_device, ngram_host));
         /* The n-gram table was counted off the card; on it, it is every rank's whole table. */
         if (cfg_.ngram_resolved == TablePlacement::Vram)
             for (VramFacts& f : facts) f.statics += ngram_bytes;
         if (cfg_.embedding_resolved == TablePlacement::Ram)
-            for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= emb_bytes[i];
+            for (size_t i = 0; i < facts.size(); ++i) {
+                facts[i].statics -= emb_bytes[i];
+                facts[i].expert_floor = floor_emb_ram[i];
+            }
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
@@ -2002,10 +2040,6 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     for (size_t k = 0; k < shares.size(); ++k) {
         const PlaneShare& sh = shares[k];
         uint8_t* at = in + offs[k];
-        if (sh.zero) {
-            std::memset(at, 0, (size_t)sh.dense_bytes());
-            continue;
-        }
         const RadEncPlane& p = cw.enc.plane[sel[k]];
         int64_t pr = 0, pc = 0;
         rad_enc_plane_dims(&p, cw.rows, cw.cols, &pr, &pc);
@@ -2322,11 +2356,8 @@ int Engine::load_weights() {
 
             /* FROM A CHECKPOINT, every weight is staged and its worker reads it: there is no
              * sweep to deliver it, and the stored form is whatever the pool makes of the share --
-             * as it is, widened, or relaid. A ZERO SHARE (rad_weight_shard_zero) takes the same
-             * route from a container: nothing in the file is its source, so no sweep run can
-             * deliver it; its worker writes zeros and the pool stores them as it would any share. */
-            const bool zero_share = sh[0].zero;
-            if (!e || zero_share) {
+             * as it is, widened, or relaid. */
+            if (!e) {
                 StagedWeight sw;
                 sw.prog = &r->program;
                 sw.wi = i;
@@ -2351,17 +2382,9 @@ int Engine::load_weights() {
                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
                 std::vector<int64_t> offs(sw.plane_off, sw.plane_off + w.n_sel);
                 const std::string name = w.name;
-                if (zero_share) {
-                    const int64_t bytes = in_bytes;
-                    sw.fill = [bytes](uint8_t* in) -> int {
-                        std::memset(in, 0, (size_t)bytes);
-                        return RAD_OK;
-                    };
-                } else {
-                    sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
-                        return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
-                    };
-                }
+                sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
+                    return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
+                };
                 staged.push_back(std::move(sw));
                 ++n_loaded;
                 continue;
@@ -2447,16 +2470,6 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        /* A WEIGHT WITH NO BYTES IN THE FILE -- a zero share -- is one the sweep never reaches: no
-         * run of the container is its source, so nothing would ever arrive for it and its worker
-         * would never run. It is handed to the workers here, whole, and its own fill writes it
-         * (the checkpoint branch below does the same for every weight, which is why the hole was
-         * never seen there). */
-        for (size_t k = 0; k < staged.size() && !pool.failed(); ++k)
-            if (staged[k].fill) {
-                pool.reserve((int)k);
-                pool.arrived((int)k, staged[k].remaining);
-            }
         sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
     } else {
         /* every weight to the workers, in declaration order, as fast as the budget lets them in */
@@ -2542,6 +2555,7 @@ int Engine::configure_kv() {
         LogRank lr(r->index);
         RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
+        if (t == KVManager::kUnboundedTokens) continue;   /* holds no cache; limits nobody */
         if (least < 0 || t < least) least = t;
     }
     for (auto& r : ranks_) {
@@ -2549,7 +2563,7 @@ int Engine::configure_kv() {
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the CURRENT device; see plan() */
         if (ranks_.size() > 1) {
             const int64_t own = r->kv.paged_tokens(r->pools.kv().avail());
-            if (own > least)
+            if (own > least && own != KVManager::kUnboundedTokens)
                 RAD_INFO("kv: rank %d could page %lld tokens and carves %lld, the least rank's, so "
                          "that one block table serves every rank", r->index, (long long)own,
                          (long long)least);
@@ -2559,14 +2573,52 @@ int Engine::configure_kv() {
         /* THE ONE CASE WHERE THE CACHE CANNOT GIVE ANYTHING BACK, said once and named. Every
          * caller is written against the elastic contract and runs unchanged here -- the pool
          * simply holds its whole carve -- so nothing fails, and the only symptom is an expert
-         * plane that never grows and a split that stays where --expert-vs-cache-ratio put it.
+         * plane that never grows and a split that stays where the budget put it.
          * That is worth a line, because it is indistinguishable from a working run in every
          * counter this engine reports. */
         if (r->index == 0 && !r->pools.kv().elastic())
             RAD_WARN("this device has no virtual memory management, so the KV cache holds its "
-                     "whole carve and the expert slab has nothing to grow into. The split stays "
-                     "where --expert-vs-cache-ratio put it.");
+                     "whole carve and the expert slab has nothing to grow into. The experts were "
+                     "given the card first and the cache one full-length sequence.");
         if (cfg_.debug_placement) fputs(r->kv.report().c_str(), stderr);
+    }
+
+    /* ---------------- the linear-state snapshot store ---------------- */
+    /* PINNED HOST MEMORY, NOT THE CARD. A snapshot is a copy of a sequence's recurrent state that
+     * no kernel reads: a save copies the state out after the step that produced it and a hit
+     * copies it back before the step that resumes from it, each a few milliseconds across the
+     * link. Holding it in VRAM would charge the KV pool for memory the live cache could use.
+     *
+     * One slot holds every rank's shard, each at its own offset, so the disk tier moves a slot as
+     * one payload; rank 0's manager hands the ids out. Opened only where there is something to
+     * snapshot and a cache to serve it. */
+    {
+        /* THE SHARDS NEED NOT BE EQUAL: a rank's state holds its own heads of each group, and a
+         * world the heads do not divide gives the ranks different shares. A slot is the sum of
+         * the ranks' shards and a rank's starts where the ranks before it end. */
+        std::vector<int64_t> shard_off(ranks_.size(), 0);
+        int64_t slot = 0;
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            shard_off[i] = slot;
+            slot += ranks_[i]->kv.checkpoint_bytes();
+        }
+        const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
+        if (slot > 0 && n > 0 && cfg_.prefix_cache) {
+            if (ck_store_.open(slot, slot * n) != RAD_OK) {
+                RAD_WARN("checkpoint slots: no pinned host memory for %lld snapshot(s) of %s; a "
+                         "hybrid session's prefix hits replay their linear layers from zero. "
+                         "Lower --checkpoint-slots.", (long long)n, humanb(slot).c_str());
+            } else {
+                RAD_INFO("checkpoint slots: %lld linear-state snapshot(s) of %s in pinned host "
+                         "memory (%s), none of it on the card", (long long)n,
+                         humanb(slot).c_str(), humanb(ck_store_.cap_bytes()).c_str());
+            }
+        }
+        for (auto& r : ranks_)
+            r->kv.set_checkpoint_store(&ck_store_, shard_off[(size_t)(&r - &ranks_[0])]);
+    }
+    for (auto& r : ranks_) {
+        LogRank lr(r->index);
         RAD_TRY(r->prefix.configure(cfg_, &r->kv, geo_.checkpoint_interval));
     }
 
@@ -2594,23 +2646,19 @@ int Engine::configure_kv() {
          * at offsets of one entry, as it always was. The sizing below (TierExec::sizes) takes
          * the largest rank's entry: the staging ring is a rank's own, and the ring that fits
          * the largest fits every one. */
-        std::vector<int64_t> rank_entry(ranks_.size(), 0), rank_ck(ranks_.size(), 0);
-        std::vector<int64_t> entry_off(ranks_.size(), 0), ck_off(ranks_.size(), 0);
-        int64_t entry_bytes = 0, slot_bytes = 0, ck_slot_bytes = 0;
+        std::vector<int64_t> rank_entry(ranks_.size(), 0), entry_off(ranks_.size(), 0);
+        int64_t entry_bytes = 0, slot_bytes = 0;
         for (size_t i = 0; i < ranks_.size(); ++i) {
             for (int32_t g : cg) {
                 const KVGroupPlan* p = ranks_[i]->kv.plan(g);
                 if (p && p->paged()) rank_entry[i] += p->bytes_per_block;
             }
-            rank_ck[i]   = ranks_[i]->kv.checkpoint_bytes();
             entry_off[i] = slot_bytes;
-            ck_off[i]    = ck_slot_bytes;
-            slot_bytes    += rank_entry[i];
-            ck_slot_bytes += rank_ck[i];
+            slot_bytes += rank_entry[i];
             entry_bytes = std::max(entry_bytes, rank_entry[i]);
         }
 
-        /* ---- how the tier is split between the two halves of a session ----
+        /* ---- how the disk tier is split between the two halves of a session ----
          *
          * ON THIS BUILD A RESTORED HYBRID SESSION WITH NO SNAPSHOT REUSES NOTHING AT ALL. The
          * scheduler clamps its reuse to the last reachable checkpoint and says why: RadBatch
@@ -2635,8 +2683,12 @@ int Engine::configure_kv() {
          *
          * Two thirds is the ceiling. Not because the arithmetic asks for one, but because the
          * clamp above is a property of THIS build rather than of the design, and a tier with
-         * almost no room for blocks would be badly sized the day it is lifted. */
-        int64_t ck_host_cap = 0, ck_disk_slots = 0;
+         * almost no room for blocks would be badly sized the day it is lifted.
+         *
+         * THE HOST TIER IS NOT SPLIT: snapshots live in the checkpoint store, which
+         * --checkpoint-slots sizes, and --prefix-cache-host-mib is the blocks' alone. */
+        const int64_t ck_slot_bytes = ck_store_.enabled() ? ck_store_.slot_bytes() : 0;
+        int64_t ck_disk_slots = 0;
         if (ck_slot_bytes > 0) {
             const int64_t bs = ranks_[0]->prefix.block_size();
             const int64_t iv = ranks_[0]->prefix.checkpoint_interval();
@@ -2649,19 +2701,13 @@ int Engine::configure_kv() {
             const int64_t sess_blocks = bs > 0 ? (mlen / bs) * slot_bytes : slot_bytes;
             const int64_t sess_snaps  = retained * ck_slot_bytes;
             const int64_t denom = sess_blocks + sess_snaps;
-            const int64_t host_cap = cfg_.prefix_cache_host_mib << 20;
             const int64_t disk_cap = cfg_.prefix_cache_disk_mib << 20;
-            const int64_t host_ck  = std::min(host_cap * 2 / 3, denom > 0 ? host_cap / denom * sess_snaps
-                                                                            + host_cap % denom * sess_snaps / denom
-                                                                          : 0);
             const int64_t disk_ck  = std::min(disk_cap * 2 / 3, denom > 0 ? disk_cap / denom * sess_snaps
                                                                             + disk_cap % denom * sess_snaps / denom
                                                                           : 0);
-            ck_host_cap   = (host_ck / ck_slot_bytes) * ck_slot_bytes;
             ck_disk_slots = disk_ck / ck_slot_bytes;
-            /* One of each where there is room for one at all: a tier that holds a session's blocks
-             * and not one snapshot holds nothing usable. */
-            if (ck_host_cap == 0 && host_cap >= ck_slot_bytes * 2) ck_host_cap = ck_slot_bytes;
+            /* One where there is room for one at all: a tier that holds a session's blocks and not
+             * one snapshot holds nothing usable. */
             if (ck_disk_slots == 0 && disk_cap >= ck_slot_bytes * 2) ck_disk_slots = 1;
         }
         if (cg.empty() || entry_bytes <= 0) {
@@ -2721,7 +2767,7 @@ int Engine::configure_kv() {
             tc.disk_cap_bytes  = kv_disk_ ? (cfg_.prefix_cache_disk_mib << 20) : 0;
             tc.entry_bytes     = slot_bytes;
             tc.ckpt_bytes      = ck_slot_bytes;
-            tc.ckpt_cap_bytes  = ck_host_cap;
+            tc.ckpt_slots      = ck_store_.capacity();
             tc.ckpt_disk_slots = kv_disk_ ? ck_disk_slots : 0;
 
             /* THE POLICY IS RANK 0'S AND THE TRANSFER IS EVERY RANK'S. A session is not sharded --
@@ -2774,7 +2820,7 @@ int Engine::configure_kv() {
                                            /*leader=*/&r == &ranks_[0],
                                            r->device,
                                            entry_off[(size_t)(&r - &ranks_[0])],
-                                           ck_off[(size_t)(&r - &ranks_[0])],
+                                           &ck_store_,
                                            /*shared=*/r->mover.transfer_stream())
                             != RAD_OK) {
                         all = false;
@@ -2790,7 +2836,7 @@ int Engine::configure_kv() {
                     T.close();
                     kv_disk_.reset();
                     tc.host_cap_bytes = tc.disk_cap_bytes = 0;
-                    tc.ckpt_cap_bytes = tc.ckpt_disk_slots = 0;
+                    tc.ckpt_disk_slots = 0;
                     RAD_TRY(T.configure(tc, nullptr));
                 } else {
                     /* The tiers can lose an entry without the cache asking: a capacity drop, or a
@@ -2799,10 +2845,10 @@ int Engine::configure_kv() {
                     T.set_drop_sink([this](const BlockHash& h) {
                         ranks_[0]->prefix.drop_offdevice(h);
                     });
-                    /* And the linear half on its own. The snapshot store is far smaller than the
-                     * block store, so it overflows first and by itself; an index entry left
-                     * behind would be a checkpoint the cache goes on offering whose bytes nobody
-                     * holds, which is the recurrent-state form of the same corruption. */
+                    /* And the linear half on its own: a snapshot whose only copy was on disk and
+                     * that the disk store let go of. An index entry left behind would be a
+                     * checkpoint the cache goes on offering whose bytes nobody holds, which is the
+                     * recurrent-state form of the same corruption. */
                     T.set_snapshot_drop_sink([this](const BlockHash& h) {
                         ranks_[0]->prefix.drop_snapshot(h);
                     });
@@ -2867,9 +2913,10 @@ int Engine::configure_kv() {
              * that request is accepted by the API and can never complete, whatever the load. */
             RAD_WARN("kv group '%s' holds %lld tokens but the context limit is %lld: ONE request "
                      "longer than %lld tokens is accepted by the API and then refused as too "
-                     "large to ever fit -- this is a hard limit, not a backing ratio. Raise "
-                     "--expert-vs-cache-ratio toward the cache (about %lld MiB more for the whole "
-                     "context), halve the cost a token with --kv-cache-dtype fp8, or lower "
+                     "large to ever fit -- this is a hard limit, not a backing ratio. Give the "
+                     "cache more (about %lld MiB for the whole context: a larger --host-pool-mib "
+                     "takes experts off the card), halve the cost a token with --kv-cache-dtype fp8, "
+                     "or lower "
                      "--max-model-len to %lld.",
                      p->name.c_str(), (long long)cap, (long long)want, (long long)cap,
                      (long long)(((want - cap) / p->block_size * p->bytes_per_block) >> 20),
@@ -2938,18 +2985,6 @@ static void bind_kv_pools(const Program& p, const KVManager& kv, std::vector<KVP
 }
 
 /* ================================================================== start */
-void Engine::set_checkpoint_floors(int64_t keep) {
-    for (auto& r : ranks_) {
-        const int dev = r->device;
-        r->kv.set_checkpoint_floor([dev](int64_t* free_now) -> int {
-            RadDeviceProps p{};
-            RAD_TRY(rad_dev_props(dev, &p));
-            *free_now = p.vram_free;
-            return RAD_OK;
-        }, keep);
-    }
-}
-
 int Engine::start() {
     std::vector<int> devs;
     std::string inventory;
@@ -3150,6 +3185,35 @@ int Engine::start() {
     }
     (void)rad_dev_set(ranks_[0]->device);
 
+    /* THE MOST THE CACHE CAN HOLD, said once in one line: the whole carve, with every block it lends
+     * the experts taken back -- which a request that needs them does, the same step. Tokens are the
+     * paged groups' shared axis, so the smallest of theirs; a windowed group bounds how far back a
+     * sequence keeps context, not how much fits, and is left out. The /stats and /metrics figures
+     * (kv_tokens_max, radiance:kv_cache_max_tokens) are the same numbers. */
+    {
+        const KVManager& kv = ranks_[0]->kv;
+        int64_t bytes = 0, state = 0, tokens = 0;
+        for (const KVGroupPlan& p : kv.plans()) {
+            bytes += kv.pool_bytes_carved(p.index);
+            if (p.stateful()) state += kv.pool_bytes_carved(p.index);
+            if (!p.paged() || p.kind == RAD_KV_WINDOW || p.block_size <= 0) continue;
+            const int64_t t = p.n_blocks * p.block_size;
+            if (tokens == 0 || t < tokens) tokens = t;
+        }
+        const int64_t mlen = cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train;
+        const int64_t lent = lending_ ? ranks_[0]->mover.flex_capacity() : 0;
+        if (bytes > 0)
+            RAD_INFO("kv: the cache can grow to %s a card -- %lld tokens of context, %.1f sessions at "
+                     "%lld -- with every block it lends the experts taken back; %s of that is "
+                     "per-sequence state, and %s",
+                     humanb(bytes).c_str(), (long long)tokens,
+                     mlen > 0 ? (double)tokens / (double)mlen : 0.0, (long long)mlen,
+                     humanb(state).c_str(),
+                     lent > 0 ? fmt("up to %s is lent to the experts while no request holds it",
+                                    humanb(lent).c_str()).c_str()
+                              : "nothing is lent: it is all the cache's");
+    }
+
     /* ---- AND THE TOP OF THE ACTIVATION ARENA, lent while the steps are small ----------------
      *
      * One stretch a rank: from the end of the full plan's transients down to the end of the
@@ -3257,83 +3321,7 @@ int Engine::start() {
      *
      * A slack of one arena is tolerated silently: MiB rounding and a kernel plugin's own
      * workspaces live in there, and naming a number this close to right would be noise. */
-    /* DOES A DECOMMIT GIVE THE CARD BACK? The checkpoint slots are the one part of the KV pool
-     * backed on demand, and releasing a freed slot's pages is only worth a driver call where the
-     * card actually gets them back. That is a claim about the driver rather than about the API,
-     * so it is measured here, once, on a range nothing else owns: commit it, read the card,
-     * decommit it, read again. tools/vmemprobe.cpp asks the same question in more detail, and on
-     * ROCm 7.2 / gfx1201 the answer is no -- hipMemUnmap returns nothing, and a reservation is
-     * charged for its high-water commit until hipMemAddressFree.
-     *
-     * The expert slab does not depend on the answer. It borrows the cache's idle blocks at the
-     * addresses the cache already owns, so no page ever changes hands (Engine::loan_tick). */
-    if (!ranks_.empty() && VMem::supported()) {
-        VMem      v;
-        const int64_t g = VMem::granularity();
-        const int64_t n = std::max<int64_t>(64ll << 20, g > 0 ? g * 16 : 0);
-        RadDeviceProps a{}, b{};
-        release_frees_card_ = false;
-        if (rad_dev_set(ranks_[0]->device) >= 0 && v.reserve(n) >= 0 && v.commit(0, n) >= 0 &&
-            rad_dev_props(ranks_[0]->device, &a) >= 0 && v.decommit(0, n) >= 0 &&
-            rad_dev_props(ranks_[0]->device, &b) >= 0)
-            release_frees_card_ = (b.vram_free - a.vram_free) > n / 2;
-        for (auto& r : ranks_) r->kv.set_release_frees_card(release_frees_card_);
-        if (!release_frees_card_)
-            RAD_INFO("this driver does not return decommitted VRAM to the card (%s unmapped, the "
-                     "free counter did not move), so a freed checkpoint slot keeps its pages. The "
-                     "expert slab is unaffected: it borrows the cache's idle blocks in place.",
-                     humanb(n).c_str());
-    }
-
-    /* A CHECKPOINT SLOT IS BACKED ON EVERY CARD BEFORE ITS ID IS HANDED OUT, AND NEVER INTO THE
-     * HEADROOM. Rank 0's free list hands the ids out and every rank writes its shard of a snapshot
-     * into the same slot of its own pool; backing a slot on one card and meeting a refusal on the
-     * other at the snapshot copy would stop the engine mid-serve. See
-     * KVManager::set_checkpoint_floor for why the floor is the headroom.
-     *
-     * AND NOT INTO WHAT THE BUDGET KEPT FOR LATER either: the step staging serve() allocates, and
-     * what is built on first use. serve() lowers the floor once the staging exists. */
     const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * (1ll << 20);
-    const int64_t keep_now = headroom + late_step_bytes_ + late_lazy_bytes_;
-    if (!ranks_.empty()) {
-        set_checkpoint_floors(keep_now);
-        std::vector<KVManager*> peers;
-        for (size_t i = 1; i < ranks_.size(); ++i) peers.push_back(&ranks_[i]->kv);
-        ranks_[0]->kv.set_checkpoint_peers(std::move(peers));
-    }
-    /* AND ON A DRIVER THAT KEEPS WHAT IT MAPS, BACKED NOW. A slot backed later would cost the card
-     * exactly what it costs now and could never be given back, so waiting would only move the
-     * region's cost out of the reading below and into the middle of serving -- where the budget's
-     * misses (allocations made after it was resolved) may already have taken part of it. Backed
-     * here, the reading includes the slots, and a slot the cards have no room for is withdrawn
-     * here and said so. */
-    if (!release_frees_card_ && !ranks_.empty() && ranks_[0]->kv.free_checkpoint_slots() > 0) {
-        KVManager& lead = ranks_[0]->kv;
-        const int64_t asked = lead.free_checkpoint_slots();
-        int64_t gone = 0;
-        RAD_TRY(lead.back_free_checkpoints(&gone));
-        if (gone > 0) {
-            const int64_t stride = lead.checkpoint_stride();
-            int64_t short_by = 0;
-            for (auto& r : ranks_) {
-                RadDeviceProps p{};
-                if (rad_dev_props(r->device, &p) < 0) continue;
-                short_by = std::max(short_by, gone * stride - (p.vram_free - keep_now));
-            }
-            RAD_WARN("checkpoint slots: %lld of %lld backed (%s each), %lld withdrawn -- one more "
-                     "would take a card under the %s it has to keep free: the %s "
-                     "--gpu-headroom-mib, the room a kernel's first launch allocates from, and %s "
-                     "the budget kept for the step staging and for what is built on first use. "
-                     "The prefix cache holds %lld linear-state snapshots on the card and its "
-                     "retention policy decides which. The budget counted all %lld; the card is %s "
-                     "short of them, which is allocations made after the budget was resolved.",
-                     (long long)(asked - gone), (long long)asked, humanb(stride).c_str(),
-                     (long long)gone, humanb(keep_now).c_str(), humanb(headroom).c_str(),
-                     humanb(late_step_bytes_ + late_lazy_bytes_).c_str(), (long long)(asked - gone),
-                     (long long)asked, humanb(short_by).c_str());
-        }
-    }
-
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RadDeviceProps props{};

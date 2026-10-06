@@ -150,7 +150,66 @@ int oracle_impl(const GbnfGrammar& g, uint32_t* bitmask, int64_t n_words, uint64
     return RAD_E_STATE;
 }
 
+void accept_chr(const GbnfRuleSet& rules, const GbnfStack& stack, uint32_t chr,
+                GbnfStacks& out, SetBuild& build) {
+    if (stack.empty()) return;
+    const GbnfElement* pos = stack.back();
+    if (is_token_elem(pos)) return;
+    auto m = match_char(pos, chr);
+    build.work.add((size_t)(m.second - pos));
+    if (!m.first) return;
+    GbnfStack next(stack.begin(), stack.end() - 1);
+    if (!is_end_of_sequence(m.second)) next.push_back(m.second);
+    advance_stack(rules, next, out, build);
+}
+
+int accept_impl(const GbnfGrammar& g, int32_t token, GbnfStacks* out, PartialUtf8* partial) {
+    const GbnfRuleSet& rules = program_rules(g.program());
+    const auto decoded = decode_utf8(g.vocab()->token_piece(token), g.partial());
+    const auto& cps = decoded.first;
+
+    OpWork     work;
+    GbnfStacks new_stacks;
+    SetBuild   new_set(work);
+    GbnfStacks current;
+    for (const auto& stack : g.stacks()) {
+        if (stack.empty()) continue;
+        const GbnfElement* pos = stack.back();
+        if (is_token_elem(pos)) {
+            if (!match_token(pos, token)) continue;
+            GbnfStack next(stack.begin(), stack.end() - 1);
+            if (!is_end_of_sequence(pos + 1)) next.push_back(pos + 1);
+            advance_stack(rules, next, new_stacks, new_set);
+        } else {
+            current.push_back(stack);
+        }
+    }
+    for (auto it = cps.begin(), end = cps.end() - 1; it != end && !current.empty(); ++it) {
+        GbnfStacks next;
+        SetBuild   next_set(work);
+        for (const auto& cs : current) accept_chr(rules, cs, *it, next, next_set);
+        current = std::move(next);
+    }
+    for (auto& s : current) new_set.insert(new_stacks, std::move(s));
+    std::sort(new_stacks.begin(), new_stacks.end());
+    *out = std::move(new_stacks);
+    *partial = decoded.second;
+    return out->empty() ? RAD_E_STATE : RAD_OK;
+}
+
 }  /* namespace */
+
+int gbnf_oracle_accept(const GbnfGrammar& g, int32_t token, GbnfStacks* out,
+                       PartialUtf8* partial) {
+    if (!out || !partial || !g.vocab()) return RAD_E_INVAL;
+    try {
+        return accept_impl(g, token, out, partial);
+    } catch (const gbnf::GbnfLimit&) {
+        return RAD_E_FULL;
+    } catch (const std::bad_alloc&) {
+        return RAD_E_NOMEM;
+    }
+}
 
 int gbnf_oracle_mask(const GbnfGrammar& g, uint32_t* bitmask, int64_t n_words,
                      uint64_t work_limit) {

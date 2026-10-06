@@ -18,6 +18,7 @@
 #include <cstring>
 #include <atomic>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -117,14 +118,17 @@ const char* device_backend_name() { return dev()->name; }
  * RADIANCE_TRACE_ALLOC=N logs every allocation of at least N bytes as it happens. That is the
  * instrument; the counters are the summary.
  *
- * RADIANCE_POISON_ALLOC=B fills every fresh DEVICE allocation with byte B (0..255) before it is
- * handed out, so a buffer that is read before anything wrote it shows up as garbage rather than
- * as the zeros a wiped card hands back by luck. A card that has just been through a driver reset
- * ("VRAM is lost") is that garbage for real, which is where such a read is otherwise first seen.
- * RADIANCE_POISON_RANGE=lo:hi narrows the fill to device allocations with ordinal in [lo, hi) --
- * ordinals count from 1 in allocation order ON THE ALLOCATING THREAD, the `#n on this thread` the
- * trace prints -- to bisect to the one allocation that matters. Both are debug knobs: the fill is synchronous and costs a stream a
- * call. */
+ * RADIANCE_DEBUG_POISON_ALLOC=B fills every fresh DEVICE allocation with byte B (0..255) before
+ * it is handed out, so a buffer that is read before anything wrote it shows up as garbage rather
+ * than as the zeros a wiped card hands back by luck. A card that has just been through a driver
+ * reset ("VRAM is lost") is that garbage for real, which is where such a read is otherwise first
+ * seen. A correct engine serves the same output with it set. RADIANCE_DEBUG_POISON_RANGE=lo:hi
+ * narrows the fill to device allocations with ordinal in [lo, hi) -- ordinals count from 1 in
+ * allocation order ON THE ALLOCATING THREAD, the `#n on this thread` the trace prints -- to bisect
+ * to the one allocation that matters. Both are instruments: the fill is synchronous, through one
+ * stream per thread and device that lives until exit (a stream is a hardware queue, and creating
+ * and destroying one per allocation is both slow and the queue churn ROCr's Trim path faults on).
+ * A byte outside 0..255 or a range that does not parse is refused at the first allocation. */
 namespace rad {
 namespace {
 
@@ -152,10 +156,15 @@ int64_t trace_floor() {
 /* -1 when off; otherwise the byte. */
 int poison_byte() {
     static const int v = [] {
-        const char* e = std::getenv("RADIANCE_POISON_ALLOC");
+        const char* e = std::getenv("RADIANCE_DEBUG_POISON_ALLOC");
         if (!e || !*e) return -1;
-        const long x = std::atol(e);
-        return (x >= 0 && x <= 255) ? (int)x : 255;
+        char* end = nullptr;
+        const long x = std::strtol(e, &end, 0);
+        if (*end || x < 0 || x > 255) {
+            RAD_ERR("RADIANCE_DEBUG_POISON_ALLOC=%s is not a byte (0..255)", e);
+            std::abort();
+        }
+        return (int)x;
     }();
     return v;
 }
@@ -163,9 +172,12 @@ int poison_byte() {
 /* [lo, hi) over device-allocation ordinals; the whole run when unset. */
 bool poison_in_range(int64_t ordinal) {
     static const std::pair<int64_t, int64_t> r = [] {
-        const char* e = std::getenv("RADIANCE_POISON_RANGE");
+        const char* e = std::getenv("RADIANCE_DEBUG_POISON_RANGE");
         long long lo = 0, hi = INT64_MAX;
-        if (e && *e && std::sscanf(e, "%lld:%lld", &lo, &hi) < 1) { lo = 0; hi = INT64_MAX; }
+        if (e && *e && (std::sscanf(e, "%lld:%lld", &lo, &hi) != 2 || lo < 0 || hi <= lo)) {
+            RAD_ERR("RADIANCE_DEBUG_POISON_RANGE=%s is not lo:hi with 0 <= lo < hi", e);
+            std::abort();
+        }
         return std::make_pair((int64_t)lo, (int64_t)hi);
     }();
     return ordinal >= r.first && ordinal < r.second;
@@ -400,7 +412,14 @@ using rad::dev;
 extern "C" {
 
 int  rad_dev_count(void)                          { return dev()->count(); }
-int  rad_dev_set(int device)                      { return dev()->set(device); }
+/* The device this thread last selected, for the poison fill's stream (rad_dev_alloc). */
+static thread_local int t_device = 0;
+static thread_local std::map<int, RadStream> t_poison_stream;
+int  rad_dev_set(int device) {
+    const int st = dev()->set(device);
+    if (st == RAD_OK) t_device = device;
+    return st;
+}
 int  rad_dev_props(int device, RadDeviceProps* o)  { return dev()->props(device, o); }
 int  rad_dev_enable_peer(int self, int peer)      { return dev()->enable_peer(self, peer); }
 
@@ -424,16 +443,15 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
          * holds on both backends; synchronous, so the bytes are there before the caller sees p. */
         const int poison = rad::poison_byte();
         if (poison >= 0 && kind == RAD_MEM_DEVICE && rad::poison_in_range(ordinal)) {
-            RadStream s = nullptr;
-            if (dev()->stream_create(&s, 0) == RAD_OK) {
-                if (dev()->memset_async(p, poison, bytes, s) != RAD_OK || dev()->stream_sync(s) != RAD_OK)
-                    RAD_WARN("poison: device allocation #%lld (%s) was not filled",
-                             (long long)ordinal, rad::humanb(bytes).c_str());
-                else if (floor_ >= 0 && bytes >= floor_)
-                    RAD_INFO("poison: device allocation #%lld filled with 0x%02x", (long long)ordinal,
-                             poison);
-                dev()->stream_destroy(s);
-            }
+            RadStream& s = t_poison_stream[t_device];
+            if (!s && dev()->stream_create(&s, 0) != RAD_OK) s = nullptr;
+            if (!s || dev()->memset_async(p, poison, bytes, s) != RAD_OK ||
+                dev()->stream_sync(s) != RAD_OK)
+                RAD_WARN("poison: device allocation #%lld (%s) was not filled",
+                         (long long)ordinal, rad::humanb(bytes).c_str());
+            else if (floor_ >= 0 && bytes >= floor_)
+                RAD_INFO("poison: device allocation #%lld filled with 0x%02x", (long long)ordinal,
+                         poison);
         }
     }
     return p;

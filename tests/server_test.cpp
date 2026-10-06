@@ -10,6 +10,7 @@
 #include "mm/processor.h"
 #include "rad_test.h"
 
+#include "server/adapters.h"
 #include "server/http.h"
 #include "server/json_partial.h"
 #include "server/liveview.h"
@@ -17,6 +18,8 @@
 #include "server/oai.h"
 #include "server/server.h"
 #include "server/sink.h"
+#include "text/chatfmt.h"
+#include "text/chatparse.h"
 
 #include <nlohmann/json.hpp>
 
@@ -33,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -123,7 +127,8 @@ struct FakeChatTemplate : IChatTemplate {
         }
         /* The parser is built per render and reads calls only for a request that sent tools --
          * the contract the real bridge keeps (IReplyParser). */
-        if (with_parser) out->parser = std::make_shared<FakeReplyParser>(!tools.empty());
+        if (real_parser) out->parser = real_parser;
+        else if (with_parser) out->parser = std::make_shared<FakeReplyParser>(!tools.empty());
         out->think_open = think_open;
         out->think_close = think_close;
         out->think_starts_open = think_starts_open;
@@ -134,6 +139,8 @@ struct FakeChatTemplate : IChatTemplate {
     std::string tool_refusal() const override { return refusal; }
 
     bool        with_parser = false;
+    /* A real reply parser to hand out instead of the fake one. */
+    std::shared_ptr<IReplyParser> real_parser;
     std::string refusal;
     std::string refuse_kwarg;
     /* The reasoning block a render reports. FakeTokenizer makes a one-byte marker one token. */
@@ -142,15 +149,22 @@ struct FakeChatTemplate : IChatTemplate {
 
     /* Reads "TOOL:<name>:<json...>" -- everything after the second colon is the arguments,
      * however incomplete, and it arrives a piece at a time. That is exactly the shape the
-     * streaming path has to cope with. With calls off every byte is content. */
+     * streaming path has to cope with. With calls off every byte is content. The call is open
+     * when the reply ends before its arguments are whole, and its text is then the reply. */
     struct FakeReplyReader : IReplyReader {
         explicit FakeReplyReader(bool calls) : calls_(calls) {}
         void feed(std::string_view t, std::vector<ReplyDelta>* out) override {
             text_.append(t);
             step(out, false);
         }
-        void finish(std::vector<ReplyDelta>* out) override { step(out, true); }
+        void finish(std::vector<ReplyDelta>* out) override {
+            step(out, true);
+            msg_.open_call = !msg_.tool_calls.empty() && !json_complete(msg_.tool_calls[0].arguments);
+        }
         ParsedMessage message() const override { return msg_; }
+        std::string content_with_open_call(std::string_view reply) const override {
+            return msg_.open_call ? std::string(reply) : msg_.content;
+        }
     private:
         void emit(std::vector<ReplyDelta>* out, ReplyDelta::Kind k, std::string s) {
             if (out) out->push_back({ k, 0, std::move(s) });
@@ -239,7 +253,7 @@ struct FakeScheduler : IScheduler {
     /* Nonzero: every token after the first is a verify step that proposed this many drafts and
      * accepted one, as a speculating engine reports them. */
     int32_t drafts = 0;
-    SchedMetrics m;
+    server::SchedMetrics m;
 
     std::mutex mu;
     std::vector<uint64_t> submitted;
@@ -302,7 +316,7 @@ struct FakeScheduler : IScheduler {
         cancelled.push_back(id);
     }
 
-    SchedMetrics metrics() const override { return m; }
+    server::SchedMetrics metrics() const override { return m; }
 
     bool saw_cancel() {
         std::lock_guard<std::mutex> lk(mu);
@@ -1511,6 +1525,88 @@ TEST(a_request_the_engine_failed_says_what_failed) {
              std::string("the engine failed this request: unsupported"));
 }
 
+/* A REPLY THAT ENDS INSIDE ITS LAST CALL, read by the real parser in Qwen's format: that call is
+ * the text the model wrote, after the content before it, and nothing else moves -- the reasoning
+ * stays reasoning, a call that closed before it stays a call, and the finish reason is "stop",
+ * streamed or not. The stream has sent the open call's deltas already and cannot take them back;
+ * its finish reason is what says not to run it, and it is the buffered one. */
+static std::shared_ptr<IReplyParser> qwen_reply_parser(const json& tools) {
+    ChatFormat f;
+    f.reasoning_open = "<think>\n";
+    f.reasoning_close = "\n</think>\n\n";
+    f.reasoning_breaks = { "<tool_call>\n" };
+    f.call_open = "<tool_call>\n";
+    f.call_close = "</tool_call>";
+    f.name_prefix = "<function=";
+    f.name_suffix = ">\n";
+    f.call_end = "</function>\n";
+    f.arg_prefix = "<parameter=";
+    f.arg_name_suffix = ">\n";
+    f.arg_value_suffix = "</parameter>\n";
+    f.triggers = { "<tool_call>\n" };
+    std::shared_ptr<const ReplyFormat> rf;
+    std::string why;
+    if (ReplyFormat::compile(f, &rf, &why) < 0) return nullptr;
+    ReplyOptions ro;
+    ro.generation_prompt = "<|im_start|>assistant\n<think>\n";
+    ro.tools = &tools;
+    std::shared_ptr<const ReplyParser> rp;
+    if (ReplyParser::create(rf, ro, &rp, &why) < 0) return nullptr;
+    return std::make_shared<ReplyParserBridge>(rp);
+}
+
+TEST(a_reply_ending_inside_a_call_keeps_its_reasoning_and_earlier_calls) {
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"bash",
+        "parameters":{"type":"object","properties":{"command":{"type":"string"}},
+                      "required":["command"]}}}])");
+    const std::string call1 = "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n"
+                              "</function>\n</tool_call>\n";
+    const std::string open = "<tool_call>\n<function=bash>\n<parameter=command>\ncat /a";
+    const std::string reply = "Look first.\n</think>\n\nChecking.\n" + call1 + open;
+    const std::string body = R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":1000,
+        "tools":)" + tools.dump();
+
+    Fixture f;
+    f.tmpl.real_parser = qwen_reply_parser(tools);
+    REQUIRE(f.tmpl.real_parser != nullptr);
+    f.sched.reply = reply;
+    HttpResponse r = f.post("/v1/chat/completions", body + "}");
+    CHECK_EQ(r.status, 200);
+    const json c = json::parse(r.body)["choices"][0];
+    CHECK_EQ(c["finish_reason"].get<std::string>(), std::string("stop"));
+    CHECK_EQ(c["message"]["reasoning_content"].get<std::string>(), std::string("Look first.\n"));
+    CHECK_EQ(c["message"]["content"].get<std::string>(), "Checking.\n" + open);
+    REQUIRE(c["message"].contains("tool_calls") && c["message"]["tool_calls"].size() == 1);
+    CHECK_EQ(c["message"]["tool_calls"][0]["function"]["arguments"].get<std::string>(),
+             std::string("{\"command\":\"ls\"}"));
+
+    /* Streamed: the same reasoning, the closed call, the same finish reason. */
+    HttpResponse s = f.post("/v1/chat/completions", body + R"(,"stream":true})");
+    CHECK_EQ(s.status, 200);
+    int bad = 0;
+    std::string reasoning, finish;
+    std::vector<std::string> args;
+    for (const std::string& p : sse_payloads(drain(s), &bad)) {
+        if (p == "[DONE]") continue;
+        const json j = json::parse(p);
+        if (j["choices"].empty()) continue;
+        const json& ch = j["choices"][0];
+        if (!ch["finish_reason"].is_null()) finish = ch["finish_reason"].get<std::string>();
+        const json& d = ch["delta"];
+        if (d.contains("reasoning_content")) reasoning += d["reasoning_content"].get<std::string>();
+        if (!d.contains("tool_calls")) continue;
+        const size_t k = d["tool_calls"][0]["index"].get<size_t>();
+        if (k >= args.size()) args.resize(k + 1);
+        if (d["tool_calls"][0]["function"].contains("arguments"))
+            args[k] += d["tool_calls"][0]["function"]["arguments"].get<std::string>();
+    }
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(finish, std::string("stop"));
+    CHECK_EQ(reasoning, std::string("Look first.\n"));
+    REQUIRE(!args.empty());
+    CHECK_EQ(args[0], std::string("{\"command\":\"ls\"}"));
+}
+
 TEST(a_streamed_tool_call_is_named_before_its_arguments_flow) {
     Fixture f;
     f.sched.reply = "TOOL:lookup:{\"q\":\"x\"}";
@@ -2153,7 +2249,7 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
  * each total once: however many of them run, the counter ends at the total. */
 TEST(concurrent_scrapes_count_each_total_once) {
     Metrics m("m", 1024);
-    SchedMetrics s;
+    server::SchedMetrics s;
     s.steps = 1000;
     s.prefill_tokens = 5000;
     s.draft_depth_seen = 3;
@@ -2229,6 +2325,43 @@ TEST(a_stable_prefix_never_cuts_a_code_point_or_an_escape) {
     /* A half-typed \u escape is held back until all four digits are there. */
     CHECK_EQ((long long)json_stable_prefix("x\\u00"), 1LL);
     CHECK_EQ((long long)json_stable_prefix("x\\u0041"), 7LL);
+}
+
+/* A string literal is written exactly as nlohmann writes it, and refused exactly where nlohmann
+ * refuses: every byte value alone and after each lead byte, and random strings drawn from the
+ * bytes that decide -- controls, the quote and backslash, DEL, continuation and lead bytes. */
+TEST(a_quoted_string_is_what_nlohmann_writes) {
+    auto agree = [](const std::string& s) {
+        std::string got = "x";
+        const bool ok = json_quote_append(got, s);
+        std::string want;
+        bool refused = false;
+        try {
+            want = "x" + json(s).dump();
+        } catch (const nlohmann::json::type_error&) {
+            refused = true;
+        }
+        CHECK_EQ(ok, !refused);
+        if (ok) CHECK_EQ(got, want);
+        else CHECK_EQ(got, std::string("x"));
+        return ok == !refused && (!ok || got == want);
+    };
+    for (int a = 0; a < 256; ++a) {
+        agree(std::string(1, (char)a));
+        for (int b = 0; b < 256; ++b) agree(std::string{ (char)a, (char)b, 'z' });
+    }
+    const unsigned char pool[] = { 0x00, 0x01, 0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x1f, 0x20, '"',
+                                   '\\', '/', 'a', 0x7f, 0x80, 0x8f, 0x90, 0x9f, 0xa0, 0xbf,
+                                   0xc0, 0xc1, 0xc2, 0xdf, 0xe0, 0xed, 0xee, 0xef, 0xf0, 0xf4,
+                                   0xf5, 0xff };
+    std::mt19937 rng(7);
+    int bad = 0;
+    for (int i = 0; i < 200000 && bad < 4; ++i) {
+        std::string s(rng() % 12, '\0');
+        for (char& c : s) c = (char)pool[rng() % sizeof pool];
+        if (!agree(s)) ++bad;
+    }
+    CHECK_EQ(bad, 0);
 }
 
 /* ================================================================== the live view */

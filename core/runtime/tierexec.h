@@ -71,7 +71,7 @@ public:
     int  configure(Registry* reg, KVManager* kv, IdleTiers* tiers, SSDTier* disk,
                    const std::vector<int32_t>& groups, int max_batch, int64_t max_copy,
                    int64_t max_chain, bool leader, int device, int64_t slot_off,
-                   int64_t ck_slot_off, RadStream shared);
+                   const HostArena* ck_store, RadStream shared);
     void close();
     bool enabled() const { return enabled_; }
     std::string report() const { return report_; }
@@ -105,6 +105,13 @@ public:
      * the transfer stream reported an error. Taking the answer clears it. */
     int  copy_state();
     bool copy_out() const { return copy_out_; }
+    /* copy_state, after waiting for the batch to land. For a caller that cannot go on until the
+     * copy has a host slot to show for it -- an eviction that would otherwise lose the entry. */
+    int  wait_copy();
+    /* EVERYTHING THIS RANK ENQUEUED HAS LANDED. For a block given back on a failure path while a
+     * copy into it may still be in flight: the pool would hand it to a sequence whose writes the
+     * late copy then overwrites. */
+    void quiesce();
 
     /* ---------------- restore ----------------
      *
@@ -115,35 +122,32 @@ public:
      * the jobs past the cut are left unstarted. `ok[i]` is whether job i was fully enqueued on
      * this rank. */
     int  issue_restore(std::vector<TierJob>& jobs, RadStream compute, std::vector<char>* ok);
-
-    /* A MARK ON THIS RANK'S TRANSFER STREAM, after everything enqueued on it so far. A restore
-     * reads host slots asynchronously, and a slot it is still reading may be given up and handed
-     * to a read off disk the moment the restore has reported; the IO thread waits for this mark
-     * before it writes into any slot it was handed. Null when nothing was ever enqueued here. The
+    /* A MARK ON THIS RANK'S TRANSFER STREAM, after everything enqueued on it so far -- or on
+     * `on`, the rank's compute stream, when it is given. A restore reads host slots
+     * asynchronously, and a slot it is still reading may be given up and handed to a read off
+     * disk the moment the restore has reported; the IO thread waits for this mark before it
+     * writes into any slot it was handed. A snapshot's store slot is read and written by copies
+     * on the compute stream (KVManager::checkpoint_save), so a disk write or read of one waits
+     * for that stream's mark. Null when nothing was ever enqueued on the transfer stream. The
      * caller owns the event. */
-    int  fence(RadEvent* out);
+    int  fence(RadEvent* out, RadStream on = nullptr);
 
     /* ---------------- the disk store (leader only; TierIO's thread) ---------------- */
     void run_disk(std::vector<TierJob>& jobs, std::vector<char>* ok);
     /* One ToDisk job; true when it was written. */
     bool run_write(TierJob& j);
     /* ToHost jobs: the blocks read in parallel into the host slots they were given, then the
-     * snapshots. `ok[i]` is the blocks' result, `ck_ok` the snapshot's. */
+     * snapshots into their store slots. `ok[i]` is the blocks' result, `ck_ok` the snapshot's. */
     void run_fetch(std::vector<TierJob>& jobs, std::vector<char>* ok);
 
-    /* Leader only. Gives back what a failed job held -- a restore's blocks and checkpoint slot --
-     * reports every job to the policy, and frees the device checkpoint slots a finished copy was
-     * holding on the cache's behalf. `now_ns` is when the pass ran: a promotion is a use. */
+    /* Leader only. Gives back what a failed job held -- a restore's blocks -- reports every job to
+     * the policy, and frees the store slots a finished write or an unclaimed read was holding on
+     * the cache's behalf. `now_ns` is when the pass ran: a promotion is a use. */
     void report_pass(std::vector<TierJob>& jobs, const std::vector<char>& ok, uint64_t now_ns);
 
     /* A lookup hit off-device: the job that would bring it back, or false when the entry is not
      * off-device or already has work outstanding. */
     bool plan_promote(const BlockHash& key, TierJob* out);           /* leader only */
-
-    /* Leader only: how a restore gets a device checkpoint slot when the pool is full. The cache
-     * owns the policy for which snapshot gives its slot up (PrefixCache::free_checkpoint_for_restore);
-     * this object only knows it needs one. True when a slot was freed. */
-    void set_checkpoint_room(std::function<bool()> f) { ck_room_ = std::move(f); }
 
     struct Stats { int64_t passes = 0, jobs = 0, bytes_out = 0, bytes_in = 0; };
     const Stats& stats() const { return st_; }
@@ -157,6 +161,10 @@ private:
         int64_t  n_blocks = 0;
         void*    base = nullptr;
         int64_t  off = 0;           /* this group's start inside one entry's staging bytes */
+        /* rad_kv_group_zero: no shard on this rank. Kept in its place, because a job's block ids
+         * are one per cached group in the same order on every rank; nothing is gathered or
+         * scattered for it and it is no part of this rank's entry. */
+        bool     zero = false;
         Resolved gather, scatter;
     };
 
@@ -202,16 +210,13 @@ private:
     KVManager* kv_ = nullptr;
     IdleTiers* tiers_ = nullptr;
     SSDTier*  disk_ = nullptr;
-    std::function<bool()> ck_room_;
     std::vector<GroupInfo> gi_;
     int64_t   entry_bytes_ = 0;
     /* ---- the linear half ----
-     * `ck_bytes_` is THIS RANK's shard of one snapshot and `ck_slot_bytes_` the whole shared slot,
-     * exactly as entry_bytes_ and slot_bytes_ are for blocks. Zero on a model with no recurrent
-     * state, which is the whole of the "off" path here. */
-    int64_t   ck_bytes_ = 0;
-    int64_t   ck_slot_bytes_ = 0;
-    int64_t   ck_slot_off_ = 0;
+     * The engine's snapshot store, whose slots the disk thread writes out and reads back whole --
+     * every rank's shard of a snapshot together. Null on a model with no recurrent state, which
+     * is the whole of the "off" path here. */
+    const HostArena* ck_store_ = nullptr;
     int       max_batch_ = 0;
     int64_t   max_copy_ = 0;
     int64_t   max_chain_ = 0;
@@ -254,17 +259,17 @@ private:
      * the only question worth asking first: is the tier moving the wrong bytes, or is it moving
      * the right ones and something downstream is choosing differently?
      *
-     * A DIAGNOSTIC, NOT A GUARD. It hashes on the host, which for a snapshot is tens of
-     * milliseconds an entry -- affordable when a run is being bisected and not otherwise. Off
+     * A DIAGNOSTIC, NOT A GUARD. It hashes on the host, which is a cost on every entry --
+     * affordable when a run is being bisected and not otherwise. Off
      * unless the variable is set, and leader-only, because the map is keyed by an object the
      * followers do not own. A copy out is hashed when it has LANDED, which is when copy_state
      * first sees it done. */
     bool      verify_ = false;
-    std::unordered_map<BlockHash, uint64_t, BlockHashHash> out_sum_, out_ck_;
-    struct VerifyNote { BlockHash key; int32_t host_slot = -1; int32_t ck_host = -1; };
+    std::unordered_map<BlockHash, uint64_t, BlockHashHash> out_sum_;
+    struct VerifyNote { BlockHash key; int32_t host_slot = -1; };
     std::vector<VerifyNote> verify_pending_;
-    void      verify_note(const BlockHash& key, const void* p, int64_t n, bool snapshot);
-    void      verify_check(const BlockHash& key, const void* p, int64_t n, bool snapshot);
+    void      verify_note(const BlockHash& key, const void* p, int64_t n);
+    void      verify_check(const BlockHash& key, const void* p, int64_t n);
 
     std::string report_;
     Stats     st_;
@@ -288,10 +293,13 @@ public:
     ~TierIO();
     void start(TierExec* leader);
     void stop();
-    /* False when a batch is already out. */
-    bool submit(std::vector<TierJob>&& jobs);
+    /* False when a batch is already out. `fences` are waited on before the first job is written --
+     * a snapshot's store slot is filled by a copy on the compute stream (TierExec::fence) -- and
+     * come back with the batch from take(), still the caller's to destroy. */
+    bool submit(std::vector<TierJob>&& jobs, std::vector<RadEvent>&& fences = {});
     /* The finished batch, when there is one. */
-    bool take(std::vector<TierJob>* jobs, std::vector<char>* ok);
+    bool take(std::vector<TierJob>* jobs, std::vector<char>* ok,
+              std::vector<RadEvent>* fences = nullptr);
     bool busy() const;
 
     /* A read off disk. `tag` is the caller's (the request waiting on it); `fences` are waited on
@@ -314,6 +322,7 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::vector<TierJob> work_, done_;
+    std::vector<RadEvent> work_fences_, done_fences_;
     std::vector<char> ok_;
     size_t work_at_ = 0;          /* the next write job; the thread's alone while has_work_ */
     bool has_work_ = false, has_done_ = false, stop_ = false;

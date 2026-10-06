@@ -534,19 +534,19 @@ deliberately disconnects clients from it, which is not the same promise.
 | | knobs |
 |---|---|
 | `mcserve.sh` | MiniCPM5-2B + DSpark drafter (`minicpm5-2b-dspark.v2.rad`), left running. `P` `TP` `MLEN` `SEQS` `M` `KVD` `HR` `MNBT` `EXTRA` `EXTRA_ENV` |
-| `fnserve.sh` | Qwen3.8-Flash-Next, the production container `w4nl64-i8lm.rad`, same contract. `P` `TP` `MLEN` `SEQS` `M` `RATIO` `NS` `HOSTPOOL` `KVD` `HR` `MNBT` `WIRE` `KVHOST` `KVDIR` `KVDISK` `EXTRA` `EXTRA_ENV` |
+| `fnserve.sh` | Qwen3.8-Flash-Next, the production container `w4nl64-i8lm.rad`, same contract. `P` `TP` `MLEN` `SEQS` `M` `NS` `HOSTPOOL` `KVD` `HR` `MNBT` `WIRE` `KVHOST` `KVDIR` `KVDISK` `EXTRA` `EXTRA_ENV` |
 | `fnstop.sh` | stops whichever is running and **waits for the process to go** |
 | `convdspark.sh`, `convfn.sh` | rebuild the containers those two serve. The conversions of record. `convfn.sh` needs `CALIB=<dir>`: the production recipe's expert rule runs GPTQ against the calibration Grams there |
 | `hfget.sh` | fetch a checkpoint from Hugging Face with `curl` and `jq`. Resumable |
 
 ```sh
-scripts/fnserve.sh                             # defaults: port 8100, tp 2, 200K ctx, ratio 0.82
+scripts/fnserve.sh                             # defaults: port 8100, tp 2, 200K ctx
 P=8100 MLEN=131072 SEQS=4 scripts/fnserve.sh   # override
 scripts/fnstop.sh
 ```
 
 Both print the endpoints and exit with the server still up. Read their headers — `fnserve.sh` in
-particular carries the whole `--expert-vs-cache-ratio` argument with the measurements behind it.
+particular records why each production flag is what it is.
 
 ### Measuring a server that is already up
 

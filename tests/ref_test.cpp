@@ -256,7 +256,7 @@ TEST(op_vocabulary) {
     static const char* kOps[] = {
         "rmsnorm", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "mtp_enter",
         "layernorm", "add", "mul", "silu_mul", "gelu", "silu",
-        "sigmoid", "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv",
+        "sigmoid", "fill", "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv",
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",

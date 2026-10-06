@@ -44,15 +44,6 @@ static const Flag g_flags[] = {
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
 
     { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
-    /* THE FLAG THAT DECIDES WHETHER MULTI-TURN WORKS, which is more than the split it names.
-     * The KV side is not just concurrency: prefix caching holds a finished sequence's blocks
-     * so the next turn can reuse them, so when the pool cannot hold the LIVE SESSIONS the
-     * cache drops prefixes the next turn wanted and that turn re-prefills its whole context.
-     * At long contexts that is two orders of magnitude of time-to-first-token, bought back for
-     * a fraction of a percent of the decode step. See core/mem/prefix.h. */
-    { "--expert-vs-cache-ratio", "R",   "weights vs KV split of what is claimed (default "
-                                          "0.75). The KV side also holds cached prefixes, so "
-                                          "too little of it makes every agent turn re-prefill" },
     { "--vram-weights-mib",   "N",      "the resident weight slab; 0 derives it from the card" },
     { "--vram-kv-mib",        "N",      "the paged KV pool; 0 derives it from the card" },
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 -- fp8 halves what a token of context costs" },
@@ -89,13 +80,14 @@ static const Flag g_flags[] = {
     "                                    this does NOT make the engine bit-reproducible across\n"
     "                                    batch positions -- see spec §19" },
     { "--checkpoint-interval","N",      "linear-attention state checkpoint interval, in tokens" },
-    /* TOTAL, NOT PER SEQUENCE. `ck_free_` is one global free list of N slots handed out by
-     * pop_back (core/mem/kv.cpp), so an operator reading "per sequence" and setting 2 gets
+    /* TOTAL, NOT PER SEQUENCE. The snapshot store is one pool of N slots for the whole server
+     * (KVManager::set_checkpoint_store), so an operator reading "per sequence" and setting 2 gets
      * 2 for the whole server rather than 2 x --max-num-seqs. At the default 8 slots and
      * 8 sequences that is one snapshot a sequence, which is what an append-only chat wants --
      * the next turn's hit lands at the end of the last one. */
     { "--checkpoint-slots",   "N",      "linear-state snapshots retained IN TOTAL (not "
-                                          "per sequence); compare against --max-num-seqs" },
+                                          "per sequence), in pinned host memory; compare "
+                                          "against --max-num-seqs" },
     { "--no-prefix-cache",    nullptr,  "disable prefix caching" },
     { "--checkpoint-policy",  "NAME",   "which snapshots a session retains: geometric-backoff "
                                         "(default), tip-only, keep-all" },
@@ -388,16 +380,6 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->kv_cache_dtype = v;
-        }
-        else if (S("--expert-vs-cache-ratio")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            c->expert_cache_ratio = atof(v);
-            if (!(c->expert_cache_ratio > 0.0 && c->expert_cache_ratio < 1.0)) {
-                RAD_ERR("--expert-vs-cache-ratio is the WEIGHTS share of what is claimed and must "
-                        "be strictly between 0 and 1, not '%s'. 0.75 gives three quarters to "
-                        "weights and a quarter to the KV cache.", v);
-                return RAD_E_INVAL;
-            }
         }
         else if (S("--host-pool-mib"))         { if (!(v = need(i))) return RAD_E_INVAL; c->host_pool_mib = atoll(v); }
         else if (S("--embedding-placement") || S("--ngram-placement")) {

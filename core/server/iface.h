@@ -67,6 +67,11 @@ struct SchedMetrics {
     int64_t kv_bytes_total = 0;
     /* What the pool was carved to address, which an elastic pool may not be holding. */
     int64_t kv_bytes_carved = 0;
+    /* THE MOST CONTEXT THE CACHE CAN HOLD: every block of its carve, the ones lent to the expert
+     * slab taken back. `kv_bytes_carved` is the same figure in bytes. The paged groups share one
+     * token axis, so it is the smallest of theirs; a windowed group is left out, because its carve
+     * bounds how far back a sequence keeps context rather than how much fits. */
+    int64_t kv_tokens_max = 0;
 
     double  prefix_hit_rate = 0.0;    /* 0..1 */
     /* Cumulative prefix-cache evictions. `prefix_hit_rate` falls only AFTER a prefix that
@@ -157,7 +162,7 @@ struct SessionStat {
      * back and re-run every recurrent layer over its whole transcript -- which the hit rate will
      * report as a hit. Zero everywhere on a model that has no recurrent state. */
     int64_t     snapshots = 0;
-    int64_t     snap_device = 0, snap_host = 0, snap_disk = 0;
+    int64_t     snap_host = 0, snap_disk = 0;    /* in the store; only on disk */
     int64_t     snap_bytes = 0;
     /* The prefix a return skips: the deepest snapshot's position (IdleTiers::SessionInfo). */
     int64_t     resume_tokens = 0;
@@ -264,11 +269,12 @@ public:
         int64_t fetched = 0, ck_fetched = 0;
         int64_t host_bytes = 0, disk_bytes = 0;
         /* THE LINEAR HALF, MOVED. Separate counters because a hybrid server can move every block
-         * it has and no snapshots at all -- the arena too small, the device slots contended --
-         * and no block counter can tell that apart from tiering working. */
-        int64_t ck_to_host = 0, ck_to_disk = 0, ck_promoted = 0, ck_drops = 0, ck_starved = 0;
+         * it has and no snapshots at all, and no block counter can tell that apart from tiering
+         * working. `ck_drops` is snapshots whose only copy was lost. */
+        int64_t ck_to_disk = 0, ck_drops = 0;
         int64_t ck_bytes = 0;      /* one snapshot; 0 on a model with no recurrent state */
-        int64_t ck_host_slots = 0, ck_disk_slots = 0;
+        int64_t ck_host_slots = 0, ck_disk_slots = 0;   /* the store's; the disk store's */
+        int64_t restores = 0, restore_ns = 0, flushes = 0, flush_ns = 0;   /* IdleTiers::Stats */
         /* WHETHER ANYTHING CAN MOVE AT ALL, which no counter above can answer: a tier that is on
          * and has had nothing to do reads the same as one that was never given a size, and the
          * two call for opposite responses from whoever is looking. */
@@ -430,6 +436,8 @@ struct ParsedMessage {
     std::string           content;
     std::string           reasoning;    /* "" unless the template supports reasoning */
     std::vector<ToolCall> tool_calls;
+    /* The reply ended inside its last call: that call never closed, and is no call to run. */
+    bool                  open_call = false;
 };
 
 /* One increment of a reply that is being read as it is generated. What has been delivered is
@@ -458,6 +466,10 @@ public:
     virtual void finish(std::vector<ReplyDelta>* out) = 0;
     /* The whole reply, once finish() has run. */
     virtual ParsedMessage message() const = 0;
+    /* Once finish() has run: the content with an open last call (ParsedMessage::open_call) read
+     * as the text it was written as -- the content before the call, then the call's own bytes
+     * from `reply`, the whole text fed. The content alone when no call is open. */
+    virtual std::string content_with_open_call(std::string_view reply) const = 0;
 };
 
 /* A request's reply format. Each choice opens its own reader, and a request that sent no tools

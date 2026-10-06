@@ -264,6 +264,8 @@ private:
     std::string stop_hit_;
     size_t      max_stop_ = 0;
     bool        first_ = true;
+    Tokenizer   tok_;              /* over v_, set up by the first push */
+    bool        tok_ready_ = false;
 
     size_t safe_prefix() const;   /* how much of pending_ can be released */
 };

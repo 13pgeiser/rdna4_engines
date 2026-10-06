@@ -66,9 +66,8 @@ LDS lookup a byte), more protected bf16 experts (+4% bytes for 7% less error), a
 (13% less error energy for +13-18% on the expert GEMMs).
 
 **Further quality levers**, in order: five bits on both projections of layers
-16-31 (the same +8% as the down projections, ~0.066 expected); fewer layers at five bits for a
-smaller prefill cost; and `--expert-vs-cache-ratio`, which buys the residency back with KV
-capacity. The formats, the kernel and a layer's own choice of form are all in the tree.
+16-31 (the same +8% as the down projections, ~0.066 expected), and fewer layers at five bits for a
+smaller prefill cost. The formats, the kernel and a layer's own choice of form are all in the tree.
 
 ## The stored plane
 
@@ -244,8 +243,8 @@ its Hessians in the model's own domain; a rotated recipe's GPTQ reads them rotat
 Whole experts per rank, which a calibration run wants anyway. A step reads about 100 GiB a rank from
 the drive and grows only slowly with what it carries -- 50 s at ~32K tokens, 59 s at ~55K -- so
 drive it with large prefill steps: `--max-num-batched-tokens 65536 --max-num-seqs 64`, about 96
-requests in flight, and `--expert-vs-cache-ratio 0.5` so the cache share holds 64 sequences'
-recurrent state. That records ~930 tokens a second, ten million tokens in three hours.
+requests in flight, with a KV pool that holds 64 sequences' recurrent state (`--vram-kv-mib`
+states it outright). That records ~930 tokens a second, ten million tokens in three hours.
 
 **The corpus is what the Hessian is of, so it has to look like the traffic.** A few thousand
 tokens of one repeated sentence gives a Gram whose energy sits in a handful of directions, and GPTQ

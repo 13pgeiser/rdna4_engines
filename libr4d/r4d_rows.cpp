@@ -4405,7 +4405,8 @@ static const RadKernelInfo kKernels[] = {
   "sorted slots, offsets and counts out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRouterGemmTopkScatter), NOTUNE,
-  nullptr, nullptr, r4d_rad_router_gemm_topk_scatter, nullptr, nullptr, nullptr,
+  r4d_rad_router_gemm_topk_scatter_init, r4d_rad_router_gemm_topk_scatter_fini,
+  r4d_rad_router_gemm_topk_scatter, nullptr, nullptr, nullptr,
   r4d_shape_router_gemm_topk_scatter, nullptr, nullptr,
   r4d_rad_router_gemm_topk_scatter_describe },
 
@@ -5099,9 +5100,11 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  *   gemm_w8a8_tiled
  *   every collective    the peer flags and exchange buffers the all-reduces own
  *
- * gemm_fp8a8_nt_m16's finisher counters are keyed on the stream AND the output, so two launches
- * that could run at once never share them, and the row is concurrent. A row added with state of
- * its own that the stream's order protects belongs in this list. */
+ * gemm_fp8a8_nt_m16's finisher counters are keyed on the stream AND the output, and
+ * router_gemm_topk_scatter_bf16's arrival counter is its op instance's (taken at init, one a
+ * declared op and band), so two launches that could run at once never share them, and both rows
+ * are concurrent. A row added with state of its own that the stream's order protects belongs in
+ * this list. */
 extern "C" int rad_kernel_concurrent(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;

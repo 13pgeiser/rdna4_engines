@@ -186,20 +186,50 @@ Verdict compare(const Bench& b, const std::string& text) {
                             o.content.find(f.call_open.substr(a, e - a)) != std::string::npos;
     }
     v.same = o.content == m.content && o.reasoning == m.reasoning && o.calls.size() == m.calls.size();
+    /* ARGUMENTS THE OLD READER LEFT AS NO JSON AT ALL are not a reading to agree with: it passed a
+     * typed value's text through bare (`"verbose":True`, `"extra":}`), which no client can parse,
+     * and the new reader makes every complete such value JSON (chatparse.cpp, ValueOut). So the
+     * arguments are compared only where the old object is JSON, and there byte for byte; the new
+     * reader's own reading of the rest is held by the decided shapes and the streaming checks. */
+    auto args_agree = [](const std::string& old_a, const std::string& new_a) {
+        if (old_a == new_a || !nlohmann::json::accept(old_a)) return true;
+        /* NOR IS A NEWLINE THE OLD READER TOOK OFF A VALUE'S FRONT that the tag before it had
+         * already ended with -- Qwen's `<parameter=NAME>\n` -- the newline the template writes
+         * when the value itself starts with one. Every other byte must agree. */
+        const ojson o = ojson::parse(old_a, nullptr, false);
+        const ojson n = ojson::parse(new_a, nullptr, false);
+        if (!o.is_object() || !n.is_object() || o.size() != n.size()) return false;
+        for (auto it = o.begin(); it != o.end(); ++it) {
+            if (!n.contains(it.key())) return false;
+            const ojson& nv = n.at(it.key());
+            if (nv == it.value()) continue;
+            if (!nv.is_string() || !it.value().is_string()) return false;
+            const std::string& ns = nv.get_ref<const std::string&>();
+            if (ns.empty() || ns[0] != '\n' || ns.compare(1, std::string::npos,
+                                                         it.value().get_ref<const std::string&>()) != 0)
+                return false;
+        }
+        return true;
+    };
     for (size_t i = 0; v.same && i < o.calls.size(); ++i)
-        v.same = o.calls[i].name == m.calls[i].name && o.calls[i].arguments == m.calls[i].arguments;
+        v.same = o.calls[i].name == m.calls[i].name &&
+                 args_agree(o.calls[i].arguments, m.calls[i].arguments);
+    for (const legacy::ToolCall& c : o.calls)
+        for (char ch : c.arguments)
+            if ((unsigned char)ch < 0x20) v.old_raw_control = true;
     if (!v.same) v.detail = "    old: " + show(o) + "\n    new: " + show(m);
     return v;
 }
 
 std::string judge(const Verdict& v) {
     if (v.strict) {
-        if (v.old_clean && !v.same) return "both read the reply within the grammar and disagree";
+        if (v.old_clean && !v.same && !v.old_raw_control)
+            return "both read the reply within the grammar and disagree";
         if (!v.old_clean && !v.bare_lift)
             return "the new parser read within the grammar a reply the old grammar rejected";
         return std::string();
     }
-    if (v.old_clean && !v.old_call_syntax)
+    if (v.old_clean && !v.old_call_syntax && !v.old_raw_control)
         return "the new parser left the grammar on a reply the old grammar accepted";
     return std::string();
 }
@@ -274,6 +304,24 @@ std::string check_stream(const ReplyParser& p, const std::string& text,
     if (!err.empty()) return err;
     if (!same(got, expect)) return "the deltas add up to\n      " + show(got);
     if (!same(s->message(), expect)) return "the message is\n      " + show(s->message());
+    /* Where each call begins in the reply, which an open call's text is read back from, is a
+     * fact of the reply, not of how it was cut. */
+    for (size_t i = 0; i < expect.calls.size(); ++i) {
+        const ReplyCall& a = s->message().calls[i];
+        const ReplyCall& b = expect.calls[i];
+        if (a.at != b.at || a.content_at != b.content_at || a.content_held != b.content_held)
+            return "call " + std::to_string(i) + " begins at " + std::to_string(a.at) + " cut this way, " +
+                   std::to_string(b.at) + " read whole";
+        if (b.at >= text.size() || (i > 0 && b.at <= expect.calls[i - 1].at))
+            return "call " + std::to_string(i) + " begins at " + std::to_string(b.at) + ", outside the reply";
+    }
+    /* A closed call is one a client is handed to run: its arguments are JSON, whatever the
+     * model wrote into them -- in a reply that is UTF-8, as every reply is once the decoder has
+     * sanitised it. */
+    if (sanitize(text) == text)
+        for (const ReplyCall& c : expect.calls)
+            if (c.closed && !nlohmann::json::accept(c.arguments))
+                return "a closed call's arguments are no JSON: " + q(c.arguments);
     return std::string();
 }
 
@@ -343,6 +391,7 @@ std::vector<ojson> rendered_corpus() {
     v.push_back(message("", "", { call("write", { { "path", "/work/x.xml" },
         { "content", "<param name=\"k\">v</param>\n</param\n</parameter\n</function>x" } }) }));
     v.push_back(message("", "", { call("write", { { "path", "" }, { "content", "" } }) }));
+    v.push_back(message("", "", { call("write", { { "path", "/a" }, { "content", "\n\nx\n\n" } }) }));
     v.push_back(message("", "", { call("ping", ojson::object()) }));
     return v;
 }
@@ -400,6 +449,20 @@ std::vector<Adversarial> adversarial(const Model& m) {
     add("JSON then a stray character", T + C(m, "configure", { { "extra", "{\"a\": 1}x" } }));
     add("an unterminated JSON string", T + C(m, "configure", { { "extra", "\"abc" } }));
     add("a number that is not one", T + C(m, "read", { { "path", "/a" }, { "limit", "01" } }));
+    add("Python literals", T + C(m, "configure", { { "verbose", "True" }, { "nothing", "None" } }));
+    add("a Python dict with literals", T + C(m, "configure",
+                                             { { "extra", "{'a': True, 'b': None, 'c': 'False'}" } }));
+    add("an empty typed value", T + C(m, "configure", { { "level", "" } }));
+    add("a typed value that is no JSON", T + C(m, "configure", { { "verbose", "yes please" } }));
+    add("JSON strings holding a raw line break and tab", T + C(m, "configure",
+        { { "extra", "{\"a\": \"line1\nline2\",\n \"b\": \"\tx\"}" } }));
+    add("Python containers that are no JSON", T + C(m, "configure",
+        { { "extra", "{'a': 1, 'b': [2, 3],}" }, { "tags", "['x', nan]" } }));
+    add("a container missing its close", T + C(m, "configure", { { "extra", "{'a': [1, 2}" } }));
+    add("JSON a client cannot read", T + C(m, "configure",
+        { { "level", "1e400" }, { "extra", R"({"a": "\ud800"})" } }));
+    add("an escaped quote in a double-quoted string", T + C(m, "configure",
+        { { "tags", "  [\"it\\'s\", 'x']" } }));
     add("unicode", T + "Größe 大小 🚀 " + C(m, "write", { { "path", "/中.txt" }, { "content", "こんにちは 🌍" } }));
     add("CDATA with brackets and tags", T + C(m, "write", { { "path", "/a" },
         { "content", "<![CDATA[if (a[b[0]]) { x = \"]]\"; }\n  <tag>\n    indented\n]]>" } }));
@@ -450,6 +513,9 @@ std::vector<Adversarial> adversarial(const Model& m) {
         add("a call with no closing wrapper",
             T + "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"
                 "<tool_call>\n<function=read>\n<parameter=path>\n/a\n</parameter>\n</function>\n</tool_call>");
+        add("a call closed by its wrapper alone",
+            T + "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</tool_call>\n" +
+                C(m, "read", { { "path", "/a" } }));
         add("an argument with no newline after its name",
             T + "<tool_call>\n<function=bash>\n<parameter=command>ls</parameter>\n</function>\n</tool_call>");
     } else {

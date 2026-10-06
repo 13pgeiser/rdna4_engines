@@ -361,9 +361,8 @@ int64_t weight_bytes(const WeightInfo& w);
  * order: how much room is there, and only then what goes in it. And the split matters more than
  * the total. A model's static weights -- everything that is not an expert -- have to be resident
  * for the model to run at a sensible speed at all, so they come off the top; the expert plane is
- * the only thing that trades against the KV cache, and it is what --expert-vs-cache-ratio divides.
- * Applying a ratio to the two together would let a 0.3 setting demote the attention projections to
- * host memory to make room for a cache nothing will fill.
+ * the only thing that trades against the KV cache. Dividing the two together would let the cache's
+ * side demote the attention projections to host memory to make room for blocks nothing will fill.
  *
  * The three answers are per RANK, and under tensor parallel that is already the even split across
  * devices: declare runs once per rank with every dimension ALREADY DIVIDED (spec §9), so summing
@@ -377,6 +376,13 @@ struct WeightFootprint {
     int64_t statics = 0;   /* non-expert and device-readable -- the floor under any budget */
     int64_t experts = 0;   /* the elastic plane: what streams from host when it does not fit */
     int64_t expert_layer_max = 0;   /* the most expert bytes any one routed layer holds */
+    int64_t expert_unit_max  = 0;   /* the largest expert unit's slot */
+    /* THE SLAB'S SPARE SLOTS beside the residents of an expert-tiered plan, at their most: per
+     * expert slab class, the shadow slots and the staging ring and the tail pad
+     * (Planner::assign_expert_tiered). They come out of the same weight budget as the residents. */
+    int64_t expert_spare     = 0;
+    int64_t layer_unit_max   = 0;   /* the widest per-layer unit's slot: the file tier's staging */
+    bool    routed           = false;   /* a layer has experts: the file tier's read windows */
     int64_t mapped  = 0;   /* no device kernel can read them; they never enter a pool at all */
     int64_t hosted  = 0;   /* --embedding-placement ram: in the pinned host pool, off the card */
     /* The tables the two placement flags move, wherever the buckets above count them: `embedding`
@@ -397,6 +403,18 @@ struct WeightFootprint {
  * differently. */
 void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding,
                       TablePlacement ngram);
+
+/* THE PINNED STAGING THE FILE TIER TAKES OUT OF --host-pool-mib before any unit is placed in it:
+ * RAD_PLACE_FILE_STAGE_SLOTS of the widest per-layer unit, and the read windows when a routed
+ * layer can stream from the container. Planner::plan spends it; the budget counts it the same. */
+int64_t file_stage_reserve(int64_t widest, bool routed);
+
+/* THE EXPERT BYTES THE CARD MUST HOLD when `host_room` bytes of the pinned host pool are free for
+ * experts: everything the pool cannot take, the slab's spare slots beside them, and one unit of
+ * first-fit slack on each side -- the resident fill and the pool fill each skip a unit that does
+ * not fit and can leave up to one unit's room unspent. At most every expert and the spare slots.
+ * A weight budget of the statics and this much places every expert in VRAM or the host pool. */
+int64_t expert_vram_floor(const WeightFootprint& wf, int64_t host_room);
 
 /* THE TABLES THE PLACEMENT FLAGS MOVE, by what reads them and not by name: a model-level weight
  * that at least one op reads and that only `embed_lookup` reads is a token embedding table, and

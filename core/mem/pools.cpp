@@ -213,7 +213,7 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
     if (cfg.vram_kv_mib      <= 0) missing += "  vram_kv resolved to 0 MiB\n";
     if (!missing.empty()) {
         fit_report_ = "VRAM pool budgets are empty -- state --vram-weights-mib / --vram-kv-mib, or "
-                      "let the card be split by --gpu-headroom-mib and --expert-vs-cache-ratio:\n"
+                      "let the card be split from --gpu-headroom-mib and --host-pool-mib:\n"
                       + missing;
         RAD_ERR("%s", fit_report_.c_str());
         return RAD_E_INVAL;
@@ -230,9 +230,8 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
             "  total          %10s\n"
             "  card total     %10s\n"
             "  OVER BY        %10s\n"
-            "Lower --vram-weights-mib / --vram-kv-mib, or raise --gpu-headroom-mib and let "
-            "--expert-vs-cache-ratio split what is left. The split is yours to make; the engine "
-            "will not make it for you (spec §6).\n",
+            "Lower --vram-weights-mib / --vram-kv-mib, or state neither and let the card be split "
+            "from --gpu-headroom-mib and --host-pool-mib (spec §6).\n",
             humanb(w).c_str(), humanb(kv).c_str(),
             humanb(want).c_str(), humanb(vram_capacity).c_str(),
             humanb(want - vram_capacity).c_str());

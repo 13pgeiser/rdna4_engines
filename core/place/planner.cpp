@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <set>
 
 namespace rad {
 
@@ -101,6 +102,17 @@ int64_t weight_bytes(const WeightInfo& w) {
 /* See planner.h. Planner::resolve_sites, Planner::build_units and Planner::pin_mapped, run over
  * the same program without allocating a Plan -- the budget resolver calls this before a Planner
  * exists. Kept adjacent to the three so a change to any of them has this in the same diff. */
+int64_t file_stage_reserve(int64_t widest, bool routed) {
+    return (int64_t)RAD_PLACE_FILE_STAGE_SLOTS * widest +
+           (routed ? (int64_t)RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES : 0);
+}
+
+int64_t expert_vram_floor(const WeightFootprint& wf, int64_t host_room) {
+    if (wf.experts <= 0) return 0;
+    const int64_t all = wf.experts + wf.expert_spare;
+    return std::min(all, std::max<int64_t>(all + 2 * wf.expert_unit_max - host_room, 0));
+}
+
 void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding,
                       TablePlacement ngram) {
     if (!out) return;
@@ -166,6 +178,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
      * align_up(static_need, RAD_ALIGN_UNIT)` before every unit it places. A budget that summed raw
      * bytes would be short by one alignment per unit, which on a 512-expert MoE is real. */
     std::map<int32_t, int64_t> layer_experts;
+    std::set<int64_t> expert_strides;
     bool ngram_host = true;
     for (const U& mu : units) if (mu.ngram && !mu.host) ngram_host = false;
     for (const U& mu : units) {
@@ -178,9 +191,20 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
          * placed in VRAM. */
         if (mu.mapped || (mu.ngram && ngram != TablePlacement::Vram)) out->mapped += b;
         else if (mu.emb && embedding == TablePlacement::Ram) out->hosted += b;
-        else if (mu.expert >= 0) { out->experts += b; layer_experts[mu.layer] += b; }
+        else if (mu.expert >= 0) {
+            out->experts += b;
+            layer_experts[mu.layer] += b;
+            out->expert_unit_max = std::max(out->expert_unit_max, b);
+            expert_strides.insert(b);
+        }
         else                     out->statics += b;
+        if (mu.layer >= 0 && !mu.mapped) out->layer_unit_max = std::max(out->layer_unit_max, b);
+        if (mu.expert >= 0 && mu.layer >= 0) out->routed = true;
     }
+    /* build_classes: one expert slab class a stride. */
+    for (int64_t s : expert_strides)
+        out->expert_spare += (int64_t)(RAD_PLACE_SHADOW_SLOTS + RAD_PLACE_STAGE_RING) * s +
+                             RAD_ALIGN_UNIT;
     for (const auto& le : layer_experts)
         out->expert_layer_max = std::max(out->expert_layer_max, le.second);
     out->ngram_host = out->ngram > 0 && ngram_host;
@@ -1157,7 +1181,7 @@ int Planner::plan(Plan* out) {
         }
         const int64_t windows = routed ? (int64_t)RAD_PLACE_FILE_WINDOWS *
                                          RAD_PLACE_FILE_WINDOW_BYTES : 0;
-        const int64_t need = (int64_t)RAD_PLACE_FILE_STAGE_SLOTS * widest + windows;
+        const int64_t need = file_stage_reserve(widest, routed);
         if (need > 0) {
             if (need >= out->host_budget) {
                 RAD_ERR("placement: the file tier needs %s of pinned staging (%d slots of %s%s) "

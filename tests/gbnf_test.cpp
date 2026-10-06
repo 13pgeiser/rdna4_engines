@@ -4,7 +4,9 @@
  * (core/sample/gbnf_mask.cpp); tests/gbnf_oracle.cpp computes the same mask the way llama.cpp
  * does, by rescanning the vocabulary. They are two implementations of one pure function of the
  * grammar's state, so every case here is the same assertion: at every state a walk reaches, the
- * two agree bit for bit and status for status.
+ * two agree bit for bit and status for status. Accepting is held the same way: the engine steps a
+ * state through the mask plan's automaton, the oracle through the stack machinery one stack and
+ * one code point at a time, and every token a walk accepts must leave both in the same state.
  *
  * WHAT MAKES A STATE WORTH COMPARING is that the engine reached it the way the sampler does. The
  * walks below drive a grammar exactly as Sampler::build_step drives a constrained sequence under
@@ -243,6 +245,7 @@ struct Tally {
                               * rescanning one stack at a time, could still answer */
     int64_t grammars = 0;
     int64_t mismatches = 0;
+    int64_t accepts = 0;     /* accepted tokens whose new state was compared with the oracle's */
 };
 
 std::string show_piece(const std::string& s) {
@@ -306,6 +309,32 @@ bool has(const std::vector<uint32_t>& m, int32_t id) {
     return id >= 0 && ((m[(size_t)id >> 5] >> (id & 31)) & 1u);
 }
 
+/* Accept `id`, holding the state it leaves to the oracle's: the same status, the same stack set
+ * and the same carried partial character. Returns the engine's status. A side that ran past its
+ * bounds is not compared, for the reason compare() gives. */
+int accept(GbnfGrammar& g, int32_t id, Tally& t) {
+    const bool cmp = !g.awaiting_trigger() && !g.vocab()->is_eog(id);
+    GbnfStacks  ref;
+    PartialUtf8 rp;
+    const int rs = cmp ? gbnf_oracle_accept(g, id, &ref, &rp) : RAD_OK;
+    const int as = g.accept_token(id);
+    if (!cmp || rs == RAD_E_FULL || rs == RAD_E_NOMEM || as == RAD_E_FULL || as == RAD_E_NOMEM)
+        return as;
+    ++t.accepts;
+    bool same = (as >= 0) == (rs >= 0);
+    if (same && as >= 0) {
+        GbnfStacks got = g.stacks();
+        std::sort(got.begin(), got.end());
+        same = got == ref && g.partial().value == rp.value && g.partial().n_remain == rp.n_remain;
+    }
+    CHECK(same);
+    if (!same && ++t.mismatches <= 4)
+        std::fprintf(stderr, "    accept %d '%s': engine status %d with %zu stacks, oracle %d "
+                     "with %zu\n", id, show_piece(g.vocab()->token_piece(id)).c_str(), as,
+                     g.stacks().size(), rs, ref.size());
+    return as;
+}
+
 /* MAY THE MASK ADMIT A TOKEN THAT ACCEPTING THEN REFUSES? Upstream's mask and upstream's accept
  * read a piece differently in two places, and the engine reproduces the mask exactly, so an
  * admitted token can kill the parse:
@@ -364,7 +393,7 @@ void walk_and_compare(const std::string& gbnf, const BpeVocab& bv, uint64_t seed
             g->push_state();
             int live = 0;
             for (int k = 0; k < n_pos; ++k) {
-                if (k > 0 && g->accept_token(d[(size_t)k - 1]) < 0) {
+                if (k > 0 && accept(*g, d[(size_t)k - 1], t) < 0) {
                     /* A draft the grammar refuses leaves no parse; the mask there must say so. */
                     compare(*g, v, m[(size_t)k], ref, t, name + " after a refused draft");
                     break;
@@ -388,7 +417,7 @@ void walk_and_compare(const std::string& gbnf, const BpeVocab& bv, uint64_t seed
             bool ok = true;
             for (size_t k = 0; k < j && ok; ++k) {
                 const bool quirk = accept_may_refuse(*g, gbnf, v, d[k]);
-                const int  as = g->accept_token(d[k]);
+                const int  as = accept(*g, d[k], t);
                 ok = as >= 0;
                 CHECK(ok || quirk || as == RAD_E_FULL || as == RAD_E_NOMEM);
             }
@@ -396,7 +425,7 @@ void walk_and_compare(const std::string& gbnf, const BpeVocab& bv, uint64_t seed
             const int32_t bonus = pick_admitted(m[j], bv, rng);
             if (bonus < 0) break;
             const bool quirk = accept_may_refuse(*g, gbnf, v, bonus);
-            const int  as = g->accept_token(bonus);
+            const int  as = accept(*g, bonus, t);
             if (as == RAD_E_FULL || as == RAD_E_NOMEM) break;     /* the parse outgrew its bounds */
             CHECK(as >= 0 || quirk);
             if (as < 0) break;
@@ -421,14 +450,14 @@ void replay_and_compare(const std::string& gbnf, const BpeVocab& bv,
         const int n_pos = (int)std::min<size_t>(4, toks.size() - i);
         g->push_state();
         for (int k = 0; k < n_pos; ++k) {
-            if (k > 0 && g->accept_token(toks[i + (size_t)k - 1]) < 0) { CHECK(false); break; }
+            if (k > 0 && accept(*g, toks[i + (size_t)k - 1], t) < 0) { CHECK(false); break; }
             const std::string where = name + " token " + std::to_string(i + (size_t)k);
             if (compare(*g, v, m, ref, t, where) < 0) break;
             CHECK(has(m, toks[i + (size_t)k]));
         }
         CHECK_OK(g->rollback());
         const size_t n_acc = std::min<size_t>(3, toks.size() - i);
-        for (size_t k = 0; k < n_acc; ++k) REQUIRE(g->accept_token(toks[i + k]) >= 0);
+        for (size_t k = 0; k < n_acc; ++k) REQUIRE(accept(*g, toks[i + k], t) >= 0);
         i += n_acc;
     }
     ++t.grammars;
@@ -436,9 +465,10 @@ void replay_and_compare(const std::string& gbnf, const BpeVocab& bv,
 
 void report(const char* what, const Tally& t) {
     std::fprintf(stderr, "    %s: %lld grammars, %lld masks compared (%lld at a split character, "
-                 "%lld dead); %lld beyond the oracle's bound, %lld beyond the engine's\n", what,
+                 "%lld dead), %lld accepts; %lld beyond the oracle's bound, %lld beyond the "
+                 "engine's\n", what,
                  (long long)t.grammars, (long long)t.masks, (long long)t.partial, (long long)t.dead,
-                 (long long)t.skipped, (long long)t.bounded);
+                 (long long)t.accepts, (long long)t.skipped, (long long)t.bounded);
 }
 
 /* ================================================================== grammars */

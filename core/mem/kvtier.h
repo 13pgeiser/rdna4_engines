@@ -78,6 +78,7 @@
  * such a transfer -- it reads host memory and nothing else -- and holds only the slots it reads.
  */
 #pragma once
+#include "mem/hostarena.h"
 #include "mem/kv.h"
 #include "mem/prefix.h"
 #include "rad_core.h"
@@ -123,30 +124,23 @@ struct TierJob {
 
     /* ---- the linear half, on a hybrid model ----
      *
-     * A session's recurrent state lives in a CHECKPOINT SLOT rather than in blocks: one contiguous
-     * KVManager::checkpoint_bytes() extent, which is why nothing here needs a gather. The snapshot
-     * belonging to this entry moves with it, so a restored hybrid session gets its attention hit
-     * AND its state back, instead of an attention hit and a full linear replay from token zero.
+     * A session's recurrent state lives in a SNAPSHOT SLOT of the checkpoint store -- pinned host
+     * memory, one contiguous KVManager::checkpoint_bytes() shard a rank -- rather than in blocks,
+     * so it never crosses the link with them: a lookup restores it straight out of its slot. The
+     * tiers only move it between that slot and the disk store, on the disk thread: a ToDisk job
+     * reads `ck_slot`, a ToHost job writes it.
      *
-     * `ck_dev` is the device slot: where the bytes are read from on the way out, and where the
-     * engine put them on the way in -- it is an OUTPUT of a promotion, exactly as `blocks` is. */
-    int32_t   ck_dev = -1;
-    int32_t   ck_host = -1;     /* a slot in the snapshot arena, not the block arena */
+     * `ck_slot` is an INPUT to both. A read off disk is planned with `ck_want` and the engine
+     * allocates the slot before the job leaves its hands (it holds the store's free list); a
+     * write names the slot the snapshot is in. */
+    int32_t   ck_slot = -1;
     int64_t   ck_pos = 0;       /* the token position, which the disk store verifies on the way back */
-    bool      ck_want = false;  /* a promotion should bring the snapshot back too */
-    /* DID THE SNAPSHOT HALF SUCCEED. Separate from the job's own result because the two halves
-     * fail for different reasons and are repaired differently: a snapshot that could not be copied
-     * has not been damaged, it is still sitting correct and committed in its device slot and a
-     * later pass reaches it again for free, so the blocks may as well carry on without it.
-     *
-     * A snapshot that is DROPPED is another matter, and it is worth being exact about the cost
-     * because it is not what it looks like. On this build the scheduler clamps a hybrid session's
-     * reuse to the last LINEAR CHECKPOINT it can reach, not to the attention hit -- RadBatch
-     * carries one query length for every KV group, so the linear layers cannot be replayed over a
-     * longer range than the attention ones (core/sched/scheduler.cpp, admit_one). A session whose
-     * blocks came back and whose state did not therefore reuses NOTHING. The blocks are not a
-     * partial win; they are unusable until some checkpoint under them survives. */
+    bool      ck_want = false;  /* a read off disk should bring the snapshot in too */
     int64_t   ck_bytes = 0;
+    /* DID THE SNAPSHOT HALF SUCCEED. Separate from the job's own result because the two halves
+     * fail for different reasons and are repaired differently: a snapshot whose disk write failed
+     * is still correct in its slot, and one whose read failed costs the session a replay of its
+     * linear layers, not its blocks. */
     bool      ck_ok = true;
     /* A PROMOTION THAT WAS NEVER STARTED, as opposed to one that failed part of the way through.
      * A restore reserves every block before it moves a byte, and a chain that did not fit is cut
@@ -155,54 +149,6 @@ struct TierJob {
      * scatter may have run is dropped on failure. A read off disk that never ran -- its batch
      * could not be handed to the thread -- is the same: the record stays on disk. */
     bool      started = false;
-};
-
-/* ------------------------------------------------------------------ the host arena */
-/* Pinned, because every byte of it is a PCIe transfer endpoint and a pageable one collapses: the
- * driver stages an async copy to pageable memory through its own buffer and, on some paths,
- * synchronises. Slot-allocated at one
- * fixed size rather than malloc'd per entry: every entry in a given model holds exactly one block
- * per cached group, so the size is a property of the geometry and a bitmap is the whole allocator.
- *
- * RUNS, BECAUSE A TRANSFER IS PER RUN. A 4-token block makes a 200K-token conversation fifty
- * thousand entries, and a copy per entry is fifty thousand driver calls on the engine thread --
- * the call rate, not the link, is then what a restore costs. Entries written together are given
- * consecutive slots wherever the arena has them, so a batch crosses the link as one strided copy
- * a run. */
-class HostArena {
-public:
-    ~HostArena();
-    int  open(int64_t slot_bytes, int64_t cap_bytes);
-    void close();
-    bool enabled() const { return base_ != nullptr; }
-
-    int64_t slot_bytes() const { return slot_bytes_; }
-    /* Fixed when the arena is opened. Stored rather than counted from the bitmap, because an
-     * HTTP thread reads it for the sessions view while the engine thread allocates and frees. */
-    int64_t capacity()   const { return cap_slots_; }
-    int64_t used_slots() const { return used_; }
-    int64_t cap_bytes()  const { return slot_bytes_ * capacity(); }
-    int64_t free_slots() const { return cap_slots_ - used_; }
-
-    /* -1 when the arena is full. The caller evicts and retries; this does not choose victims,
-     * because the LRU that would choose them lives in IdleTiers and an allocator that reached
-     * into it would give each record two owners. */
-    bool    full() const { return used_ >= cap_slots_; }
-    int32_t alloc();
-    /* UP TO `want` CONSECUTIVE SLOTS, the first free run at or after the cursor. `*got` is how
-     * many; the caller asks again for the rest. -1 when the arena is full. */
-    int32_t alloc_run(int32_t want, int32_t* got);
-    void    free(int32_t slot);
-    void*   at(int32_t slot) const;
-
-private:
-    bool    is_used(int64_t s) const { return (bits_[(size_t)(s >> 6)] >> (s & 63)) & 1ull; }
-    void*   base_ = nullptr;
-    int64_t slot_bytes_ = 0;
-    int64_t used_ = 0;
-    int64_t cap_slots_ = 0;
-    int64_t cursor_ = 0;
-    std::vector<uint64_t> bits_;
 };
 
 /* ------------------------------------------------------------------ the policy */
@@ -214,12 +160,11 @@ public:
         int64_t entry_bytes     = 0;   /* one entry: sum over cached groups of bytes_per_block */
         /* ---- the linear half ----
          * `ckpt_bytes` is ONE SNAPSHOT, every rank's shard of it, laid out exactly like
-         * `entry_bytes`. `ckpt_cap_bytes` is carved out of the tier the operator sized rather than
-         * added to it: a snapshot store is host memory like any other and a tier that quietly
-         * allocated past its stated cap would be the one thing --prefix-cache-host-mib is for. Zero
-         * for either means snapshots do not tier, and the blocks still do. */
+         * `entry_bytes`. The snapshots live in the engine's checkpoint store, `ckpt_slots` deep,
+         * which is reported here and not allocated: --prefix-cache-host-mib is the blocks' alone.
+         * `ckpt_disk_slots` zero means snapshots never reach disk, and the blocks still do. */
         int64_t ckpt_bytes      = 0;
-        int64_t ckpt_cap_bytes  = 0;   /* host; part of host_cap_bytes, not additional to it */
+        int64_t ckpt_slots      = 0;   /* the checkpoint store's capacity, for the report and view */
         int64_t ckpt_disk_slots = 0;   /* how many the disk store was opened for */
     };
 
@@ -262,10 +207,7 @@ public:
      *
      * The records waiting for a host copy, up to `max_entries`, as WriteBack jobs with their host
      * slots already allocated. Oldest first, so a conversation that went idle before another is
-     * copied before it. A record whose snapshot is still only on the device is included even when
-     * its blocks already have their copy, with `blocks` empty -- the snapshot is the half a hybrid
-     * session cannot resume without, and it becomes copyable later than the blocks (a checkpoint
-     * is committed on its own clock).
+     * copied before it. Blocks only: a snapshot is in host memory from the moment it is saved.
      *
      * Every record named by a returned job is `pending` until report() is called for it. An arena
      * too full to take the batch first gives up the host slots of the oldest entries the disk also
@@ -286,32 +228,31 @@ public:
     bool droppable(const BlockHash& key) const;
     /* The cache released the blocks. The record is now a host record with its copy, on the host
      * tier's list like any other -- or a disk record, when its host slot was already given up.
-     *
-     * ITS SNAPSHOT STAYS WHERE IT IS. A snapshot's device slot is not memory anything else can
-     * use -- the expert slab borrows blocks, never checkpoint slots -- so taking it off the device
-     * along with the blocks would buy nothing and put the session's recurrent state at the mercy
-     * of a host arena a few snapshots deep, shared by every conversation. The slot goes when the
-     * checkpoint pool itself needs it (snapshot_backed). */
+     * Its snapshot stays in its slot: the store is not the pool, and the blocks leaving frees
+     * nothing there. */
     void drop_commit(const BlockHash& key);
 
     /* ---------------- the snapshots' own pressure ----------------
      *
-     * The checkpoint pool is --checkpoint-slots deep for the whole server, and when it is full the
-     * cache retires the least recently used snapshot to make room. One whose bytes the tiers also
-     * hold need not be lost: the cache DETACHES it instead -- the slot goes back, the index entry
-     * stays, and the next restore of the session brings the state back with the blocks. True when
-     * this key's device snapshot has a finished copy off the card that nothing is still writing. */
+     * The checkpoint store is --checkpoint-slots deep for the whole server, and when it is full
+     * the cache retires the least recently used snapshot to make room. One the disk also holds
+     * need not be lost: the cache DETACHES it instead -- the slot goes back, the index entry
+     * stays, and the next restore of the session reads the state back off disk (plan_fetch).
+     * True when this key's snapshot is in a slot and has a finished disk copy that no write is
+     * still producing. */
     bool snapshot_backed(const BlockHash& key) const;
-    /* The cache gave the device slot back; the copy off the card is now the snapshot. */
+    /* Is this key's snapshot in store slot `slot` by this object's record? */
+    bool snapshot_in_slot(const BlockHash& key, int32_t slot) const;
+    /* The cache gave the slot back; the disk copy is now the snapshot. */
     void snapshot_detached(const BlockHash& key);
 
     /* ---------------- the slow half ----------------
      *
      * The host copies waiting for their disk copy, in the order they landed, as ToDisk jobs --
-     * blocks and snapshot halves together where both are waiting. A ToDisk job does NOT make its
-     * record pending: it only reads the host slots it names, which a restore may read at the same
-     * time, and a slot the record gives up while the write is out is freed when the write reports
-     * rather than under it. With no disk tier, the copies the arena refused since the last plan
+     * blocks and snapshot halves together where both are waiting, and a resume point's snapshot
+     * ahead of everything (note_snapshot). A ToDisk job does NOT make its record pending: it only
+     * reads the host slots it names, which a restore may read at the same time, and a slot given
+     * up while the write is out is freed when the write reports rather than under it. With no disk tier, the copies the arena refused since the last plan
      * are made room for by dropping that many of the oldest host-only entries. `budget` bounds
      * one plan so the IO a pass asks for is bounded too. */
     void plan(int budget, std::vector<TierJob>* out);
@@ -340,12 +281,17 @@ public:
      * none of the chain is on disk, or none of what is can be given a slot -- a chain larger than
      * the arena comes back as far as the arena holds, and the rest is prefilled.
      *
-     * The chain's deepest snapshot that is only on disk is read with it, into the snapshot arena,
-     * because that is the state the hit resumes from (TierExec::issue_restore). Every record named
-     * is `pending` until the read reports, and what a read brought in is not given up to make
-     * room for anybody else until the request has had the step it needs to claim it. */
+     * The chain's deepest snapshot, when it is only on disk, is read with it -- that is the state
+     * the hit resumes from -- into the store slot `*ck_slot` the caller allocated after asking
+     * snapshot_fetch_wanted. The slot is taken (and `*ck_slot` set to -1) only when the read is
+     * planned; otherwise it is still the caller's to free. Every record named is `pending` until
+     * the read reports, and what a read brought in is not given up to make room for anybody else
+     * until the request has had the step it needs to claim it. */
     bool plan_fetch(const std::vector<BlockHash>& chain, std::vector<TierJob>* out,
-                    uint64_t now_ns);
+                    uint64_t now_ns, int32_t* ck_slot = nullptr);
+    /* Would plan_fetch read this chain's deepest snapshot off disk -- is it there and nowhere
+     * else? Asked first, because the slot it reads into is the store's, which the caller owns. */
+    bool snapshot_fetch_wanted(const std::vector<BlockHash>& chain) const;
 
     /* A promotion, asked for by a lookup that hit off-device. Returns false when the entry is not
      * in host memory -- a disk entry is read in by plan_fetch first -- or already has work
@@ -382,38 +328,42 @@ public:
      *
      * Told by PrefixCache::commit_checkpoint, for the same reason note_used carries the block ids:
      * a copy has to know what to move and the cache's index is the only place it is written down.
-     * `dev_slot` is a KVManager checkpoint slot and `pos` the token position the disk store
-     * verifies a read against.
+     * `slot` is a checkpoint store slot and `pos` the token position the disk store verifies a
+     * read against.
      *
      * A record may hear this BEFORE it hears note_used -- a checkpoint is committed mid-request
      * and the chain is published when the request closes -- so this creates the record if it has
-     * to. The snapshot is queued for a copy when the record is published, or at once when it
-     * already was. */
-    void note_snapshot(const BlockHash& key, int32_t dev_slot, int64_t pos);
-    /* The cache is done with the snapshot at `key`: return whatever tier storage holds it. The
-     * record's BLOCKS are untouched -- the two halves are retired by different policies on
-     * different clocks, and a snapshot the retention policy drops says nothing about the prefix.
+     * to. The snapshot is queued for its disk copy when the record is published, or at once when
+     * it already was -- or AT ONCE AND AHEAD OF EVERYTHING when it is a resume point (`resume`):
+     * the deepest checkpoint its prompt gets, which the next turn resumes from. Until it is on disk
+     * the store can only retire it, and a burst of prefills churns the store through the whole
+     * decode in between. */
+    void note_snapshot(const BlockHash& key, int32_t slot, int64_t pos, bool resume = false);
+    /* The cache is done with the snapshot at `key`, which is in store slot `slot`: return whatever
+     * the tiers hold for it. The record's BLOCKS are untouched -- the two halves are retired by
+     * different policies on different clocks, and a snapshot the retention policy drops says
+     * nothing about the prefix.
      *
-     * TRUE WHEN A COPY IS STILL READING THE DEVICE SLOT, and then the slot is NOT the caller's to
-     * free: an asynchronous copy out of a slot the pool has decommitted reads a page that is no
-     * longer there, which is a device fault rather than a stale byte. The tiers keep the slot and
-     * hand it back through `take_checkpoint_frees` once the copy has reported. */
-    bool release_snapshot(const BlockHash& key);
-    /* Device checkpoint slots whose release waited on a copy, now safe to free. */
+     * TRUE WHEN A DISK WRITE IS STILL READING THE SLOT, and then the slot is NOT the caller's to
+     * free: a save into it would put half of another snapshot on disk under this key. The tiers
+     * keep the slot and hand it back through `take_checkpoint_frees` once the write has reported.
+     * Decided by the slot and not by the record, which may have gone while the write was out. */
+    bool release_snapshot(const BlockHash& key, int32_t slot);
+    /* Store slots whose release waited on a disk write, now safe to free. */
     void take_checkpoint_frees(std::vector<int32_t>* out);
-    /* Is a copy reading this key's device snapshot right now? A save into that slot would tear it. */
-    bool snapshot_reading(const BlockHash& key) const;
-    /* THE TIERS LOST A SNAPSHOT BUT KEPT THE BLOCKS. The snapshot store is far smaller than the
-     * block store (a snapshot is thousands of blocks' worth of bytes) so it overflows first and on
-     * its own, and the cache has to stop offering an index entry whose bytes nobody holds. Wired
-     * to PrefixCache::drop_snapshot; separate from set_drop_sink because losing half an entry and
-     * losing all of it are different events with different repairs. */
+    /* Is a disk write reading store slot `slot` right now? A save into it would tear the write. */
+    bool slot_reading(int32_t slot) const;
+    /* THE TIERS LOST A SNAPSHOT BUT KEPT THE BLOCKS: its only copy was on disk and the disk store
+     * no longer has it. The cache has to stop offering an index entry whose bytes nobody holds.
+     * Wired to PrefixCache::drop_snapshot; separate from set_drop_sink because losing half an
+     * entry and losing all of it are different events with different repairs. Never said of a
+     * snapshot still in its slot: that one is the cache's. */
     void set_snapshot_drop_sink(std::function<void(const BlockHash&)> f) { on_ck_drop_ = std::move(f); }
-    bool     ckpt_on() const { return ck_arena_.enabled(); }
+    /* Do snapshots reach disk at all? */
+    bool     ckpt_disk_on() const { return disk_on() && cfg_.ckpt_bytes > 0 && cfg_.ckpt_disk_slots > 0; }
     int64_t  ckpt_bytes() const { return cfg_.ckpt_bytes; }
-    HostArena&       ckpt_arena()       { return ck_arena_; }
-    const HostArena& ckpt_arena() const { return ck_arena_; }
-    int64_t          ckpt_disk_slots() const { return cfg_.ckpt_disk_slots; }
+    int64_t  ckpt_disk_slots() const { return cfg_.ckpt_disk_slots; }
+    int64_t  ckpt_slots() const { return cfg_.ckpt_slots; }
 
     /* ---------------- the session view ----------------
      *
@@ -440,11 +390,11 @@ public:
         int64_t     on_device = 0, on_host = 0, on_disk = 0;   /* blocks, by tier */
         /* LINEAR STATE, on a hybrid model. Counted separately from blocks because it is a
          * different resource with a different scarcity: a snapshot is thousands of blocks' worth
-         * of bytes and there are only --checkpoint-slots of them on the device. A session showing
+         * of bytes and there are only --checkpoint-slots of them in host memory. A session showing
          * blocks on disk and no snapshot anywhere is one that will come back and re-run every
          * recurrent layer over its whole transcript, which is not what "restored" should mean. */
         int64_t     snapshots = 0;                             /* this session holds, any tier */
-        int64_t     snap_device = 0, snap_host = 0, snap_disk = 0;
+        int64_t     snap_host = 0, snap_disk = 0;              /* in the store; only on disk */
         int64_t     snap_bytes = 0;
         /* WHAT A RETURN REUSES: the token position of the deepest snapshot on the chain, in any
          * tier. On a hybrid model the scheduler clamps a hit to the last linear checkpoint it can
@@ -500,9 +450,17 @@ public:
         int64_t fetched = 0, ck_fetched = 0;
         /* SNAPSHOTS MOVED, counted apart from blocks. A hybrid session can move its whole chain
          * off the device and still replay every linear layer from zero on the way back, and no
-         * block counter can tell the two apart -- these are the numbers that can. */
-        int64_t ck_to_host = 0, ck_to_disk = 0, ck_promoted = 0, ck_drops = 0, ck_starved = 0;
+         * block counter can tell the two apart -- these are the numbers that can. `ck_drops` is
+         * snapshots whose only copy was lost. */
+        int64_t ck_to_disk = 0, ck_drops = 0;
+        /* WHAT THE STEP THREAD SPENT ON THEM, under the scheduler's lock: restores issued at
+         * admission, and copies landed synchronously because pressure could not wait for them.
+         * Host time, not link time -- what every other request waits through. */
+        int64_t restores = 0, restore_ns = 0, flushes = 0, flush_ns = 0;
     };
+    /* The step thread's own time on the tiers (see Stats). */
+    void note_restore(int64_t ns) { std::lock_guard lk(mu_); ++stats_.restores; stats_.restore_ns += ns; }
+    void note_flush(int64_t ns)   { std::lock_guard lk(mu_); ++stats_.flushes;  stats_.flush_ns += ns; }
     /* A copy, taken under the lock: an HTTP thread reads these while the engine thread moves
      * records. */
     Stats        stats() const;
@@ -529,30 +487,19 @@ private:
         bool     fetching = false;  /* the pending job is a read off disk (plan_fetch) */
         bool     doomed  = false;   /* forget() arrived while pending */
         bool     queued  = false;   /* in wb_q_: waiting for a copy */
+        bool     resume_q = false;  /* in resume_q_: a resume point waiting for its disk copy */
         bool     clean_q = false;   /* in clean_q_: a drop the cache has not been asked about */
         bool     listed  = false;   /* on host_lru_ or disk_lru_; `it` is valid */
         std::vector<int32_t> blocks;
         /* ---- the linear half ----
-         * `ck_dev` is the snapshot's device slot, `ck_host` its host copy and `ck_on_disk` the
-         * disk store's. A clean device snapshot has both of the first two; a snapshot that has
-         * left the device has no `ck_dev`. All clear when the record carries no snapshot, which is
-         * the common case -- one block in every (interval / block_size) is a checkpoint position. */
-        int32_t  ck_dev = -1;
-        int32_t  ck_host = -1;
+         * `ck_slot` is the snapshot's checkpoint store slot and `ck_on_disk` the disk store's
+         * copy. A snapshot the store gave up has only the second. All clear when the record
+         * carries no snapshot, which is the common case -- one block in every
+         * (interval / block_size) is a checkpoint position. */
+        int32_t  ck_slot = -1;
         bool     ck_on_disk = false;
         int64_t  ck_pos = 0;
-        /* A COPY IS READING `ck_dev` RIGHT NOW: set when a write-back takes the snapshot, cleared
-         * when it reports. The one moment the device slot is not the cache's to free. */
-        bool     ck_reading = false;
-        /* THIS SNAPSHOT WILL NOT BE COPIED AGAIN: its copy was refused for want of room, or taken
-         * back to make room for another. The snapshot store is a few slots deep for the whole
-         * server, and a snapshot still in its device slot re-queued the moment its copy was
-         * evicted would evict the next one's, and so on -- every pass copying a hundred megabytes
-         * a rank to throw another hundred away. Cleared when a new commit replaces the state. */
-        bool     ck_skip = false;
-        /* A device slot the cache let go of while a copy was reading it. See release_snapshot. */
-        int32_t  ck_free_after = -1;
-        /* The snapshot host slot a disk write is reading, as `disk_src` is for the blocks. */
+        /* The store slot a disk write is reading, as `disk_src` is for the blocks. */
         int32_t  ck_disk_src = -1;
         /* WHEN A READ OFF DISK BROUGHT THIS RECORD IN, 0 when none did or its restore has run.
          * Until the request that asked for it has been admitted the slots are its and not the
@@ -566,24 +513,20 @@ private:
         std::list<BlockHash>::iterator it;
     };
 
-    /* Does this record want a copy it does not have yet? The blocks when they are in VRAM with no
-     * copy off the card; the snapshot when it is in a device slot with no copy off the card and
-     * the snapshot store exists at all. */
+    /* Does this record want a host copy it does not have yet? Its blocks are in VRAM with none. */
     bool wants_copy(const Rec& r) const;
-    /* The snapshot half of that on its own. */
-    bool wants_ck_copy(const Rec& r) const;
     /* And a disk copy: a host copy of either half that the disk does not hold yet. */
     bool wants_disk(const Rec& r) const;
+    bool wants_ck_disk(const Rec& r) const;
     void queue_copy(const BlockHash& key, Rec& r);
     void queue_clean(const BlockHash& key, Rec& r);
     void queue_disk(const BlockHash& key, Rec& r);
     /* GIVE UP A HOST SLOT, the record's or a finished job's. Every block-arena free goes through
      * `give_slot`, because a freed slot is what unblocks a write-back that found the arena full.
-     * `free_host` / `free_ck_host` are the record's own: a slot a disk write is reading is left
+     * `free_host` is the record's own: a slot a disk write is reading is left
      * for that write's report to free. */
     void give_slot(int32_t slot);
     void free_host(Rec& r);
-    void free_ck_host(Rec& r);
     void set_on_disk(Rec& r, bool v);
     int64_t make_room_locked(int64_t n);
     /* May this record's host copies be given up to make room right now? Not while a read put
@@ -594,12 +537,8 @@ private:
     void relist(const BlockHash& key, Rec& r);
     std::list<BlockHash>& list_for(KVTier t) { return t == KVTier::Host ? host_lru_ : disk_lru_; }
     void release_storage(const BlockHash& key, Rec& r);
-    /* Take a snapshot arena slot from the record whose host copy is cheapest to lose, and tell the
-     * cache if that was the snapshot's only copy. NO SECOND LIST: the records are walked, which
-     * keeps the header's "one record, one tier, one list" rule intact. `lossless` takes only a
-     * snapshot the disk also holds.
-     * Returns -1 when there is none to take. */
-    int32_t evict_snapshot_slot(bool lossless);
+    /* The chain position of the deepest snapshot no job is out on, or chain.size(). */
+    size_t deepest_snapshot(const std::vector<BlockHash>& chain) const;
 
     struct Session {
         int64_t  n_tokens = 0;
@@ -655,16 +594,21 @@ private:
     Config   cfg_;
     SSDTier* disk_ = nullptr;
     HostArena arena_;
-    HostArena ck_arena_;     /* snapshots; a different slot size, so a different arena */
     std::unordered_map<BlockHash, Rec, BlockHashHash> recs_;
     std::list<BlockHash> host_lru_, disk_lru_;   /* front = oldest */
     /* THE WORK QUEUES, in the order the work arrived. Each holds a key at most once -- the Rec's
      * flag says whether it is in -- and a key whose record changed under it is skipped when it is
      * reached rather than searched for, so both stay a push and a pop. */
     std::deque<BlockHash> wb_q_;       /* records wanting a host copy */
+    std::deque<BlockHash> resume_q_;   /* resume points wanting a disk copy, served first */
     std::deque<BlockHash> dk_q_;       /* records wanting a disk copy, in the order they landed */
     std::vector<BlockHash> clean_q_;   /* records whose VRAM copy may now go */
-    std::vector<int32_t> ck_frees_;    /* device checkpoint slots a finished copy released */
+    /* STORE SLOTS A DISK WRITE IS READING, and those the cache let go of meanwhile. Kept by slot
+     * and not on the record, because the record can be forgotten while the write is out and the
+     * slot is the cache's either way. A few entries at most: one write batch is out at a time. */
+    std::vector<int32_t> ck_reading_;
+    std::vector<int32_t> ck_free_after_;
+    std::vector<int32_t> ck_frees_;    /* store slots a finished write released */
     /* COPIES THE ARENA REFUSED since the last maintenance plan, which is what that plan frees
      * room for. A count and not a list: any host-only entry makes room for any copy. */
     int64_t  starved_ = 0;

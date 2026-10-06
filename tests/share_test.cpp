@@ -192,28 +192,6 @@ TEST(per_part_spans_cut_each_stacked_part_by_its_own_rows) {
     CHECK(why.find("stated rows") != std::string::npos);
 }
 
-/* A ZERO SHARE has the declaration's extents and no rectangles: the loader writes zeros and reads
- * nothing. At one rank there is nothing to zero. */
-TEST(a_zero_share_is_the_declared_extent_and_no_rectangles) {
-    const RadEncoding e = fp8_block();
-    WeightInfo w = decl(e, { 0, 1 }, 1536, 128, RAD_SHARD_ROW, 3);
-    w.shard_zero = true;
-    PlaneShare s[RAD_ENC_MAX_PLANES];
-    REQUIRE_EQ(share(w, 1536, 128, 3, 2, s), RAD_OK);
-    CHECK(s[0].zero);
-    CHECK_EQ(s[0].rects.size(), (size_t)0);
-    CHECK_EQ(s[0].rows, (int64_t)512);
-    CHECK_EQ(s[0].cols, (int64_t)128);
-    CHECK_EQ(s[0].dense_bytes(), (int64_t)(512 * 128));
-    CHECK(s[1].zero);
-    CHECK_EQ(s[1].rows, (int64_t)4);
-    WeightInfo one = decl(e, { 0, 1 }, 1536, 128, RAD_SHARD_ROW, 1);
-    one.shard_zero = true;
-    REQUIRE_EQ(share(one, 1536, 128, 1, 0, s), RAD_OK);
-    CHECK(!s[0].zero);
-    CHECK_EQ(s[0].rows, (int64_t)1536);
-}
-
 /* A per-tensor scale is one value every rank carries whole, once, whatever the codes' cut. */
 TEST(a_per_tensor_scale_is_carried_whole_by_every_rank) {
     RadEncoding e;

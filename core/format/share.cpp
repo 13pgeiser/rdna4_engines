@@ -13,23 +13,6 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
         return RAD_E_SHAPE;
     };
     if (w.n_sel < 1 || w.n_sel > RAD_ENC_MAX_PLANES) return refuse("no planes selected");
-    /* A ZERO SHARE: the declaration's own extents of every selected plane, and nothing to read.
-     * At one rank there is no share to zero -- the weight is whole and real. */
-    if (w.shard_zero && world > 1) {
-        for (int k = 0; k < w.n_sel; ++k) {
-            const RadEncPlane& p = enc.plane[w.sel[k]];
-            PlaneShare& s = out[k];
-            s = PlaneShare{};
-            s.dtype = p.dtype;
-            s.rows = w.sel_rows[k];
-            s.cols = w.sel_cols[k];
-            s.row_bytes = rad_enc_row_bytes(p.dtype, s.cols);
-            s.zero = true;
-            if (s.rows <= 0 || s.cols <= 0)
-                return refuse(fmt("a zero share of the '%s' plane has no extent", p.role));
-        }
-        return RAD_OK;
-    }
     int64_t R = 0, C = 0;
     rad_enc_view(rank, shape, &R, &C);
 

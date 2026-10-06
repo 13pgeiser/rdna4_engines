@@ -19,7 +19,7 @@ TierExec::~TierExec() { close(); }
 int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers, SSDTier* disk,
                         const std::vector<int32_t>& groups, int max_batch, int64_t max_copy,
                         int64_t max_chain, bool leader, int device, int64_t slot_off,
-                        int64_t ck_slot_off, RadStream shared) {
+                        const HostArena* ck_store, RadStream shared) {
     close();
     if (!reg || !kv || !tiers || groups.empty() || max_batch <= 0 || max_copy <= 0 ||
         max_chain <= 0)
@@ -28,9 +28,7 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers, SSDTier*
     max_batch_ = max_batch; max_copy_ = max_copy; max_chain_ = max_chain;
     slot_off_ = slot_off;
     slot_bytes_    = tiers->entry_bytes();
-    ck_bytes_      = kv->checkpoint_bytes();
-    ck_slot_bytes_ = tiers->ckpt_bytes();
-    ck_slot_off_   = ck_slot_off;
+    ck_store_      = ck_store && ck_store->enabled() ? ck_store : nullptr;
     shared_        = shared;
     RAD_TRY(rad_dev_set(device_));
 
@@ -46,6 +44,11 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers, SSDTier*
         gi.n_blocks = p->n_blocks;
         gi.base = p->base;
         gi.off = off;
+        if (p->zero) {
+            gi.zero = true;
+            gi_.push_back(gi);
+            continue;
+        }
         /* THE FRAGMENT WIDTH IS THE CONSTRAINT THE KERNEL IS PICKED ON. libr4d's byte-row pair
          * takes n as a multiple of 4; a geometry that does not satisfy it resolves to nothing
          * here rather than failing at launch inside a batch. */
@@ -66,6 +69,15 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers, SSDTier*
         gi_.push_back(gi);
     }
     if (gi_.empty()) return RAD_E_UNSUPPORTED;
+    /* EVERY CACHED GROUP ZERO ON THIS RANK: it would hold nothing of any entry, and an empty
+     * entry is a zero-width copy on every path below. Said, and the tiers are off -- one rank
+     * that cannot take part takes them off for all. */
+    if (off == 0) {
+        RAD_WARN("kv tiers: this rank keeps no cache for any group the prefix cache holds "
+                 "(rad_kv_group_zero), so it has no part of an entry to move. The tiers are off.");
+        close();
+        return RAD_E_UNSUPPORTED;
+    }
     entry_bytes_ = off;
 
     /* NOTHING IS BUILT ON THE DEVICE HERE -- see device_init(). A tier that is configured but has
@@ -77,10 +89,8 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers, SSDTier*
     char buf[320];
     std::snprintf(buf, sizeof buf,
                   "kv tier transfer: %zu paged group(s), %s an entry, batches of %d through "
-                  "gather_rows/scatter_rows at u8%s%s",
-                  gi_.size(), humanb(entry_bytes_).c_str(), max_batch_,
-                  ck_bytes_ > 0 ? "; linear state as one contiguous copy of " : "",
-                  ck_bytes_ > 0 ? humanb(ck_bytes_).c_str() : "");
+                  "gather_rows/scatter_rows at u8",
+                  gi_.size(), humanb(entry_bytes_).c_str(), max_batch_);
     report_ = buf;
     enabled_ = true;
     return RAD_OK;
@@ -129,7 +139,7 @@ void TierExec::close() {
     order_.clear();
     verify_pending_.clear();
     entry_bytes_ = 0;
-    ck_bytes_ = ck_slot_bytes_ = ck_slot_off_ = 0;
+    ck_store_ = nullptr;
     enabled_ = false;
     leader_ = false;
     reg_ = nullptr; kv_ = nullptr; tiers_ = nullptr; disk_ = nullptr;
@@ -255,22 +265,20 @@ static uint64_t tier_fnv(const void* p, int64_t n) {
     return h;
 }
 
-void TierExec::verify_note(const BlockHash& key, const void* p, int64_t n, bool snapshot) {
+void TierExec::verify_note(const BlockHash& key, const void* p, int64_t n) {
     if (!verify_ || !leader_ || !p || n <= 0) return;
-    (snapshot ? out_ck_ : out_sum_)[key] = tier_fnv(p, n);
+    out_sum_[key] = tier_fnv(p, n);
 }
 
-void TierExec::verify_check(const BlockHash& key, const void* p, int64_t n, bool snapshot) {
+void TierExec::verify_check(const BlockHash& key, const void* p, int64_t n) {
     if (!verify_ || !leader_ || !p || n <= 0) return;
-    auto& m = snapshot ? out_ck_ : out_sum_;
-    auto it = m.find(key);
-    if (it == m.end()) return;                      /* never went out through this process */
+    auto it = out_sum_.find(key);
+    if (it == out_sum_.end()) return;               /* never went out through this process */
     const uint64_t back = tier_fnv(p, n);
     if (back == it->second) return;
-    RAD_ERR("kv tiers: the %s for %s came back DIFFERENT (%016llx out, %016llx in). The tier is "
-            "moving the wrong bytes, not the engine choosing differently downstream.",
-            snapshot ? "linear-state snapshot" : "attention blocks", key.str().c_str(),
-            (unsigned long long)it->second, (unsigned long long)back);
+    RAD_ERR("kv tiers: the attention blocks for %s came back DIFFERENT (%016llx out, %016llx in). "
+            "The tier is moving the wrong bytes, not the engine choosing differently downstream.",
+            key.str().c_str(), (unsigned long long)it->second, (unsigned long long)back);
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -295,7 +303,7 @@ bool TierExec::blocks_backed(const std::vector<int32_t>& blocks, const char* wha
     for (size_t k = 0; k < gi_.size(); ++k) {
         if (k >= blocks.size()) continue;          /* an absent group is the gather's -1 row */
         const int32_t b = blocks[k];
-        if (b < 0) continue;
+        if (b < 0 || gi_[k].zero) continue;
         const int64_t live = kv_->live_blocks(gi_[k].g);
         if (b < live) continue;
         if (warned_unbacked_) return false;
@@ -352,7 +360,7 @@ int TierExec::enqueue_copy(std::vector<TierJob>& jobs, RadStream compute) {
         if (!blocks_backed(j->blocks, "copy to host")) return RAD_E_STATE;
 
     /* AFTER EVERYTHING THE COMPUTE STREAM HAS BEEN GIVEN, which includes the step that wrote these
-     * blocks and the save that wrote the snapshots. A stream wait, not a host wait. */
+     * blocks. A stream wait, not a host wait. */
     TIER_TRY(rad_event_record(ev_compute_, compute), "ordering the copy after the step");
     TIER_TRY(rad_event_wait(stream_, ev_compute_), "ordering the copy after the step");
 
@@ -369,7 +377,7 @@ int TierExec::enqueue_copy(std::vector<TierJob>& jobs, RadStream compute) {
         for (int64_t s = 0; s < n; s += max_batch_) {
             const int64_t c = std::min<int64_t>(max_batch_, n - s);
             for (size_t gidx = 0; gidx < gi_.size(); ++gidx)
-                for (int64_t l = 0; l < gi_[gidx].n_layers; ++l)
+                for (int64_t l = 0; l < gi_[gidx].n_layers && !gi_[gidx].zero; ++l)
                     TIER_TRY(run_rows(gi_[gidx].gather, /*scatter=*/false, gi_[gidx], l, stage_,
                                       idx_dev_ + (int64_t)gidx * n + s, c),
                              "the gather out of the pool");
@@ -378,30 +386,13 @@ int TierExec::enqueue_copy(std::vector<TierJob>& jobs, RadStream compute) {
         st_.bytes_out += n * entry_bytes_;
     }
 
-    /* The linear half: one contiguous copy each, out of the device slot the snapshot sits in. */
-    for (TierJob& j : jobs) {
-        if (j.ck_host < 0 || j.ck_dev < 0 || ck_bytes_ <= 0) continue;
-        if (kv_->back_checkpoint(j.ck_dev) < 0) { j.ck_ok = false; continue; }
-        const void* src = kv_->checkpoint_ptr(j.ck_dev);
-        char* dst = (char*)tiers_->ckpt_arena().at(j.ck_host);
-        if (!src || !dst) { j.ck_ok = false; continue; }
-        const int st = rad_memcpy_async(dst + ck_slot_off_, src, ck_bytes_, stream_);
-        if (st != RAD_OK) {
-            warn_once("the snapshot copy to host memory", st);
-            j.ck_ok = false;
-            continue;
-        }
-        st_.bytes_out += ck_bytes_;
-    }
-
     TIER_TRY(rad_event_record(ev_copy_, stream_), "marking the copy");
     copy_out_ = true;
     ++st_.passes;
     st_.jobs += (int64_t)jobs.size();
     if (verify_)
         for (const TierJob& j : jobs)
-            verify_pending_.push_back({j.key, j.blocks.empty() ? -1 : j.host_slot,
-                                       j.ck_ok ? j.ck_host : -1});
+            verify_pending_.push_back({j.key, j.blocks.empty() ? -1 : j.host_slot});
     return RAD_OK;
 }
 
@@ -415,10 +406,7 @@ int TierExec::copy_state() {
         for (const VerifyNote& v : verify_pending_) {
             if (v.host_slot >= 0)
                 verify_note(v.key, (char*)tiers_->arena().at(v.host_slot) + slot_off_,
-                            entry_bytes_, false);
-            if (v.ck_host >= 0)
-                verify_note(v.key, (char*)tiers_->ckpt_arena().at(v.ck_host) + ck_slot_off_,
-                            ck_bytes_, true);
+                            entry_bytes_);
         }
     }
     verify_pending_.clear();
@@ -426,7 +414,21 @@ int TierExec::copy_state() {
     return q > 0 ? 1 : q;
 }
 
+int TierExec::wait_copy() {
+    if (!copy_out_) return 1;
+    (void)rad_dev_set(device_);
+    const int st = rad_event_sync(ev_copy_);
+    if (st != RAD_OK) warn_once("waiting for the copy to host memory", st);
+    return copy_state();
+}
+
 /* ------------------------------------------------------------------ restore */
+
+void TierExec::quiesce() {
+    if (!enabled_ || !stream_) return;
+    if (rad_dev_set(device_) < 0) return;
+    (void)rad_stream_sync(stream_);
+}
 
 int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
                             std::vector<char>* ok) {
@@ -486,7 +488,7 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
     for (size_t i = 0; i < m; ++i) order_.push_back(&jobs[i]);
     for (size_t i = 0; i < m; ++i)
         verify_check(jobs[i].key, (char*)tiers_->arena().at(jobs[i].host_slot) + slot_off_,
-                     entry_bytes_, false);
+                     entry_bytes_);
 
     /* FROM HERE ON A FAILURE LEAVES A MIXTURE, so every job about to be written is marked started
      * first -- report() drops a started job that failed rather than trusting its host copy to
@@ -513,7 +515,7 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
             const int64_t cc = std::min<int64_t>(max_batch_, c - b);
             if ((st = copy_runs(order_, s + (size_t)b, cc, /*out=*/false)) != RAD_OK) break;
             for (size_t gidx = 0; gidx < ng && st == RAD_OK; ++gidx)
-                for (int64_t l = 0; l < gi_[gidx].n_layers && st == RAD_OK; ++l)
+                for (int64_t l = 0; l < gi_[gidx].n_layers && st == RAD_OK && !gi_[gidx].zero; ++l)
                     st = run_rows(gi_[gidx].scatter, /*scatter=*/true, gi_[gidx], l, stage_,
                                   d + (int64_t)gidx * c + b, cc);
         }
@@ -522,45 +524,6 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
     if (st != RAD_OK) warn_once("the restore into the pool", st);
     for (size_t i = 0; i < done; ++i) (*ok)[i] = 1;
     st_.bytes_in += (int64_t)done * entry_bytes_;
-
-    /* THE LINEAR HALF, into a slot the leader allocates. The same rule as the blocks: the id is
-     * rank 0's to choose, and a follower takes the id it is handed and backs its own pages. A
-     * snapshot that cannot be placed is not a failure of the restore -- the session keeps its
-     * attention hit and replays its linear layers, which is what it would have done with no
-     * tiers at all.
-     *
-     * THE DEEPEST ONE IS WORTH A SLOT SOMEBODY ELSE HAS. A hit resumes from the last checkpoint at
-     * or below its attention hit, which on a restored chain is the chain's last snapshot; the
-     * earlier ones take a slot only where one is free. A full pool is then made room in for that
-     * one snapshot by detaching another session's, which that session's own next restore brings
-     * back -- rather than for every snapshot on the chain, which would push out as many other
-     * sessions' states as this one has checkpoints. */
-    size_t deepest = done;
-    for (size_t i = 0; i < done; ++i)
-        if (jobs[i].ck_want && jobs[i].ck_ok && jobs[i].ck_host >= 0) deepest = i;
-    for (size_t i = 0; i < done; ++i) {
-        TierJob& j = jobs[i];
-        if (!j.ck_want || !j.ck_ok || j.ck_host < 0 || ck_bytes_ <= 0) continue;
-        if (leader_) {
-            int32_t slot = -1;
-            if (kv_->alloc_checkpoint(&slot) != RAD_OK || slot < 0) {
-                slot = -1;
-                if (i != deepest || !ck_room_ || !ck_room_() ||
-                    kv_->alloc_checkpoint(&slot) != RAD_OK || slot < 0)
-                    continue;
-            }
-            j.ck_dev = slot;
-        }
-        if (j.ck_dev < 0) continue;
-        if (kv_->back_checkpoint(j.ck_dev) < 0) { j.ck_ok = false; continue; }
-        const char* src = (const char*)tiers_->ckpt_arena().at(j.ck_host);
-        void* dst = kv_->checkpoint_ptr(j.ck_dev);
-        if (!src || !dst) { j.ck_ok = false; continue; }
-        verify_check(j.key, src + ck_slot_off_, ck_bytes_, true);
-        const int cs = rad_memcpy_async(dst, src + ck_slot_off_, ck_bytes_, stream_);
-        if (cs != RAD_OK) { warn_once("the snapshot copy back into the pool", cs); j.ck_ok = false; continue; }
-        st_.bytes_in += ck_bytes_;
-    }
 
     /* THE STEP THAT READS THESE WAITS FOR THEM, on the device. If even the marker cannot be
      * enqueued the only ordering left is the host's. */
@@ -573,13 +536,13 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
     return st;
 }
 
-int TierExec::fence(RadEvent* out) {
+int TierExec::fence(RadEvent* out, RadStream on) {
     *out = nullptr;
-    if (!enabled_ || !stream_) return RAD_OK;
+    if (!enabled_ || (!on && !stream_)) return RAD_OK;
     RAD_TRY(rad_dev_set(device_));
     RadEvent e = nullptr;
     RAD_TRY(rad_event_create(&e));
-    const int st = rad_event_record(e, stream_);
+    const int st = rad_event_record(e, on ? on : stream_);
     if (st != RAD_OK) { rad_event_destroy(e); return st; }
     *out = e;
     return RAD_OK;
@@ -602,12 +565,13 @@ bool TierExec::run_write(TierJob& j) {
         const void* src = tiers_->arena().at(j.host_slot);
         ok = disk_ && src && disk_->put_block(j.key, nullptr, 0, src, slot_bytes_) == RAD_OK;
     }
-    if (j.ck_host >= 0) {
-        const void* cs = tiers_->ckpt_arena().at(j.ck_host);
+    if (j.ck_slot >= 0) {
+        const void* cs = ck_store_ ? ck_store_->at(j.ck_slot) : nullptr;
         /* A snapshot store that was never opened -- no room for one inside the disk cap -- refuses
-         * this, which is the right answer and not an error: the host copy stays the only one, as
-         * it was. */
-        j.ck_ok = disk_ && cs && disk_->put_checkpoint(j.key, j.ck_pos, cs, ck_slot_bytes_) == RAD_OK;
+         * this, which is the right answer and not an error: the slot stays the only copy, as it
+         * was. */
+        j.ck_ok = disk_ && cs &&
+                  disk_->put_checkpoint(j.key, j.ck_pos, cs, ck_store_->slot_bytes()) == RAD_OK;
     }
     return ok;
 }
@@ -633,9 +597,10 @@ void TierExec::run_fetch(std::vector<TierJob>& jobs, std::vector<char>* ok) {
         st_.bytes_in += (int64_t)keys.size() * slot_bytes_;
     }
     for (TierJob& j : jobs) {
-        if (j.ck_host < 0) continue;
-        void* cs = tiers_->ckpt_arena().at(j.ck_host);
-        j.ck_ok = disk_ && cs && disk_->get_checkpoint(j.key, j.ck_pos, cs, ck_slot_bytes_) == RAD_OK;
+        if (!j.ck_want || j.ck_slot < 0) continue;
+        void* cs = ck_store_ ? ck_store_->at(j.ck_slot) : nullptr;
+        j.ck_ok = disk_ && cs &&
+                  disk_->get_checkpoint(j.key, j.ck_pos, cs, ck_store_->slot_bytes()) == RAD_OK;
     }
 }
 
@@ -644,28 +609,23 @@ void TierExec::run_fetch(std::vector<TierJob>& jobs, std::vector<char>* ok) {
 void TierExec::report_pass(std::vector<TierJob>& jobs, const std::vector<char>& ok,
                            uint64_t now_ns) {
     if (!enabled_ || !leader_) return;
+    bool quiet = false;
     for (size_t i = 0; i < jobs.size(); ++i) {
         TierJob& j = jobs[i];
         const bool good = i < ok.size() && ok[i];
-        /* A SNAPSHOT IS RESTORED ONLY IF EVERY RANK RESTORED ITS SHARD, and the leader is the only
-         * one that can act on that. It allocates the checkpoint slot and fills its own window
-         * first, so a follower that then fails leaves the slot holding this rank's new state beside
-         * another rank's stale state -- a checkpoint the cache would go on to serve, one card
-         * resuming the conversation and the other resuming whatever it last held.
-         *
-         * A PROMOTION THAT FAILED AS A WHOLE gives back everything the leader took for it: report()
-         * drops or keeps the record, and nothing will ever name these blocks or this slot again. */
-        if (j.kind == TierJob::Kind::ToDevice && j.ck_dev >= 0 && (!j.ck_ok || !good)) {
-            kv_->free_checkpoint(j.ck_dev);
-            j.ck_dev = -1;
-        }
+        /* A PROMOTION THAT FAILED AS A WHOLE gives back the blocks the leader took for it, once
+         * nothing queued against them can still land: report() drops or keeps the record, and
+         * nothing will ever name these blocks again. */
         if (j.kind == TierJob::Kind::ToDevice && !good) {
+            if (!quiet) { quiesce(); quiet = true; }
             for (size_t k = 0; k < gi_.size() && k < j.blocks.size(); ++k)
                 if (j.blocks[k] >= 0) kv_->release_block(gi_[k].g, j.blocks[k]);
             j.blocks.clear();
         }
         tiers_->report(j, good, now_ns);
     }
+    /* STORE SLOTS THE TIERS HAD BEEN KEEPING: a write that read one the cache let go of, or a
+     * read nothing took. The disk thread is done with them -- these come only from reports. */
     std::vector<int32_t> frees;
     tiers_->take_checkpoint_frees(&frees);
     for (int32_t s : frees) kv_->free_checkpoint(s);
@@ -703,11 +663,12 @@ void TierIO::stop() {
     fetch_done_.clear();
 }
 
-bool TierIO::submit(std::vector<TierJob>&& jobs) {
+bool TierIO::submit(std::vector<TierJob>&& jobs, std::vector<RadEvent>&& fences) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (has_work_ || has_done_ || !th_.joinable()) return false;
         work_ = std::move(jobs);
+        work_fences_ = std::move(fences);
         ok_.assign(work_.size(), 1);
         work_at_ = 0;
         has_work_ = true;
@@ -734,12 +695,15 @@ bool TierIO::take_fetch(Fetch* out) {
     return true;
 }
 
-bool TierIO::take(std::vector<TierJob>* jobs, std::vector<char>* ok) {
+bool TierIO::take(std::vector<TierJob>* jobs, std::vector<char>* ok,
+                  std::vector<RadEvent>* fences) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!has_done_) return false;
     *jobs = std::move(done_);
     *ok = std::move(ok_);
+    if (fences) *fences = std::move(done_fences_);
     done_.clear();
+    done_fences_.clear();
     ok_.clear();
     has_done_ = false;
     return true;
@@ -778,14 +742,26 @@ void TierIO::loop() {
             fetch_done_.push_back(std::move(f));
             continue;
         }
-        /* One write at a time, so a read that arrives behind a long batch waits for one job. */
-        const bool ok = i < work_.size() ? x_->run_write(work_[i]) : true;
+        /* NOT A BYTE UNTIL THE COPIES THAT FILLED THE SLOTS HAVE LANDED, once a batch. A fence
+         * that cannot be waited on fails the batch, and every record keeps what it had. */
+        bool fenced = true;
+        if (i == 0)
+            for (RadEvent e : work_fences_) if (e && rad_event_sync(e) != RAD_OK) fenced = false;
+        bool ok = false;
+        if (fenced) ok = i < work_.size() ? x_->run_write(work_[i]) : true;
         std::lock_guard<std::mutex> lk(mu_);
-        if (i < ok_.size()) ok_[i] = ok ? 1 : 0;
-        work_at_ = i + 1;
+        if (!fenced) {
+            ok_.assign(work_.size(), 0);
+            work_at_ = work_.size();
+        } else {
+            if (i < ok_.size()) ok_[i] = ok ? 1 : 0;
+            work_at_ = i + 1;
+        }
         if (work_at_ >= work_.size()) {
             done_ = std::move(work_);
+            done_fences_ = std::move(work_fences_);
             work_.clear();
+            work_fences_.clear();
             has_work_ = false;
             has_done_ = true;
         }

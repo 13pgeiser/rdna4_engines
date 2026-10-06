@@ -112,6 +112,7 @@ private:
     std::string labels_;        /* {model_name="...",engine="0"} */
 
     Gauge   g_running_, g_waiting_, g_kv_util_, g_prefix_hit_;
+    Gauge   g_kv_max_tokens_, g_kv_max_bytes_;
     Gauge   g_prefill_tps_, g_decode_tps_, g_draft_accept_, g_preempted_;
     Gauge   queue_depth_;
     /* The per-position draft hazard, kept as plain gauges because that is what it is: a

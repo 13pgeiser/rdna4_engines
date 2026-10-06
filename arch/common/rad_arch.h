@@ -580,10 +580,11 @@ struct Geom {
      * -- three ranks over Flash-Next's two KV heads -- serves attention on the largest multiple
      * of the head count below it (`attn_world`, here 2: split, or replicated when that is still
      * above the count) and the remaining ranks are ATTENTION-ZERO: they declare the same heads and
-     * the same program as their peers, read nothing for the attention projections
-     * (rad_weight_shard_zero) and add exactly zero to the reduce. `attn_rank` is this rank's
-     * index inside the attention world (an attention-zero rank clamps to the last). When
-     * attn_world == world nothing here is used and every block declares as it always did. */
+     * the same program as their peers, compute no attention (a `fill` of the block's output and
+     * a zero KV group, rad_kv_group_zero) and add exactly zero to the reduce. `attn_rank` is this
+     * rank's index inside the attention world (an attention-zero rank clamps to the last). When
+     * attn_world == world nothing here is used and every block declares as it always did. Set
+     * only for a plugin that asks for it (geom_from's `attn_world_ok`). */
     int     attn_world = 1;
     int     attn_rank  = 0;
     bool    attn_zero  = false;
@@ -728,20 +729,15 @@ inline long long meta_int2(const RadModelMeta* m, const char* gguf_key, const ch
     return v == sentinel ? dflt : v;
 }
 
-/* `arch_splits_ff`: the plugin divides the feed-forward width across the ranks ITSELF (qwen4exp:
- * the routed experts' width is cut by whole fp8 blocks, by parity, at any world up to the block
- * count). With it set, a width the world does not divide is left whole in g.n_ff and the plugin
- * takes its slice from there; without it the refusal stands, because for every other plugin g.n_ff
- * IS the per-rank width. A width that does divide is unaffected either way. */
 /* THE REMAINDER-FIRST ORDER OF THE RANKS. What does not divide evenly over the world and is a
  * HEAD'S worth of work -- the extra delta-net head -- goes to the ranks with NO attention first:
  * they pay nothing for attention (rad_block_attn_gated_fp8.h: one fill) and keep no attention
  * cache (rad_kv_group_zero), so they have the time for it, and the rank that held the extra head
  * AND attention -- the step's slowest -- is lighter for it. An expert's extra block is not a
- * head's worth (qwen4exp_fp8.cpp says why it stays on the rotation). This is a rank's PLACE in that order: the attention-zero ranks
- * take places 0..n-1 whatever `parity` is, and the attention ranks follow in today's rotation by
- * `parity` -- so where no rank is attention-zero (every world the heads divide) the place is
- * exactly (rank - parity) mod world and every cut is what it always was, byte for byte. */
+ * head's worth (qwen4exp_fp8.cpp says why it stays on the rotation). This is a rank's PLACE in
+ * that order: the attention-zero ranks take places 0..n-1 whatever `parity` is, and the attention
+ * ranks follow in the rotation by `parity` -- so where no rank is attention-zero (every world the
+ * heads divide) the place is exactly (rank - parity) mod world and every cut is the even one. */
 inline int64_t remainder_place(const Geom& g, int rank, int parity) {
     const int nz = g.world - g.attn_world;
     if (rank >= g.attn_world) return rank - g.attn_world;
@@ -749,8 +745,19 @@ inline int64_t remainder_place(const Geom& g, int rank, int parity) {
     return nz + ((rank - parity) % aw + aw) % aw;
 }
 
+/* `arch_splits_ff`: the plugin divides the feed-forward width across the ranks ITSELF (qwen4exp:
+ * the routed experts' width is cut by whole fp8 blocks, by parity, at any world up to the block
+ * count). With it set, a width the world does not divide is left whole in g.n_ff and the plugin
+ * takes its slice from there; without it the refusal stands, because for every other plugin g.n_ff
+ * IS the per-rank width. A width that does divide is unaffected either way. */
+/* `attn_world`: the plugin's attention block serves a SMALLER ATTENTION WORLD (Geom::attn_world)
+ * -- it declares the attention-zero rank's fill and zero KV group and spans the attention
+ * projections by `attn_rank`. Only rad_block_attn_gated_fp8.h does. Without it a world the KV head
+ * count neither divides nor is a multiple of is refused here, by name, rather than declared with
+ * an even shard the block would then cut wrongly. */
 inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
-                     const char* dtype, uint32_t act_dtype, bool arch_splits_ff = false) {
+                     const char* dtype, uint32_t act_dtype, bool arch_splits_ff = false,
+                     bool attn_world_ok = false) {
     if (!m || !c) return RAD_E_INVAL;
     if (c->is_draft) {
         /* A drafter declared into this plugin would need a second set of per-rank handles and a
@@ -819,7 +826,7 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.attn_world = g.world;
     g.attn_rank  = g.rank;
     g.attn_zero  = false;
-    if (g.world > g.n_head_kv_all && g.world % g.n_head_kv_all != 0) {
+    if (attn_world_ok && g.world > g.n_head_kv_all && g.world % g.n_head_kv_all != 0) {
         g.attn_world = (int)(g.n_head_kv_all * (g.world / g.n_head_kv_all));
         g.attn_zero  = g.rank >= g.attn_world;
         g.attn_rank  = g.attn_zero ? g.attn_world - 1 : g.rank;

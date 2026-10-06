@@ -163,8 +163,6 @@ struct Plugin {
     void (*pin_qsa)(int) = nullptr;
     void (*pin_moe)(int) = nullptr;
     void (*pin_fk)(int) = nullptr;
-    void (*pin_uw)(int) = nullptr;
-    void (*pin_rs)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_qsel)(int) = nullptr;
 };
@@ -196,8 +194,6 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_qsa_score_pin_form", &pl->pin_qsa);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_prefill", &pl->pin_moe);
     okall &= sym(pl->h, "r4d_moe_gemm_pin_fk", &pl->pin_fk);
-    okall &= sym(pl->h, "r4d_moe_gemm_pin_uw", &pl->pin_uw);
-    okall &= sym(pl->h, "r4d_moe_gemm_pin_rs", &pl->pin_rs);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     return okall;
@@ -672,7 +668,7 @@ static std::vector<RadParam> with_point(const std::vector<RadParam>& ps, const T
  * whose data is null, sizes and allocates scratch from the row's own hook, then synchronises so a
  * launch failure is attributed here and not to whatever runs next. */
 static void run_case(const RadKernelInfo* r, std::vector<RadTensor>& ts,
-                     std::vector<RadParam>& ps, int expect = RAD_OK) {
+                     std::vector<RadParam>& ps, int expect = RAD_OK, void* instance = nullptr) {
     for (auto& t : ts) if (!t.data && t.rank) t.data = alloc_for(t);
 
     RadArgs a;
@@ -680,6 +676,7 @@ static void run_case(const RadKernelInfo* r, std::vector<RadTensor>& ts,
     a.t = ts.data(); a.n_t = (int)ts.size();
     a.p = ps.data(); a.n_p = (int)ps.size();
     a.world_size = 1;
+    a.instance = instance;
 
     if (r->scratch) {
         const int64_t need = r->scratch(&a);
@@ -1816,8 +1813,9 @@ static void topk_scatter_at(const RadKernelInfo* rf, const RadKernelInfo* rt,
  *
  * AND TWICE, BACK TO BACK, ON ONE OUTPUT. The last workgroup is named by a counter that resets
  * itself; a counter left behind by one launch would make the next one rank before the GEMM was
- * done, or never. The configurations share one logits buffer -- and with it one counter -- in
- * an order that changes the grid between consecutive launches. */
+ * done, or never. The counter is the instance's, taken by the row's init as the engine takes it,
+ * and every launch here shares that one instance -- and with it one counter -- in an order that
+ * changes the grid between consecutive launches. A launch with no instance is refused. */
 static void router_gemm_fused_case(const Plugin& pl) {
     if (!sel("router_gemm_topk_scatter_bf16")) return;
     const RadKernelInfo* rg  = find(pl, "router_gemm_topk_scatter_bf16");
@@ -1862,6 +1860,16 @@ static void router_gemm_fused_case(const Plugin& pl) {
         !d_cn[0] || !d_cn[1]) {
         ok("router_gemm_topk_scatter", false, "hipMalloc failed");
         return;
+    }
+    void* inst = nullptr;
+    {
+        std::vector<RadParam> ip = { PI("M", maxM), PI("K", maxK), PI("n_expert", maxNe),
+                                     PI("top_k", 10), PI("norm", 1), PS("dtype", "bf16") };
+        const int irc = rg->init && rg->fini
+                            ? rg->init(ip.data(), (int)ip.size(), 0, 1, &inst) : RAD_E_INVAL;
+        ok("router_gemm_topk_scatter init takes an instance", irc == RAD_OK && inst != nullptr,
+           "rc=" + std::to_string(irc));
+        if (irc != RAD_OK || !inst) return;
     }
 
     for (const RgCase& c : cfgs) {
@@ -1948,7 +1956,7 @@ static void router_gemm_fused_case(const Plugin& pl) {
                     st_memset(d_so[1], 0xFF, (size_t)maxNS * 4);
                     st_memset(d_of[1], 0xFF, (size_t)(maxNe + 1) * 4);
                 }
-                run_case(rg, ts, ps);
+                run_case(rg, ts, ps, RAD_OK, inst);
 
                 const std::string tag = at + (rep ? ", second launch" : "");
                 auto same = [&](const char* what, void* a, void* b, size_t bytes) {
@@ -1990,8 +1998,26 @@ static void router_gemm_fused_case(const Plugin& pl) {
                                       T(nullptr, RAD_BF16, { M, 1 }) };
         std::vector<RadParam> ps = { PI("M", M), PI("K", 2560), PI("n_expert", 512),
                                      PI("top_k", 10), PI("norm", 1), PS("dtype", "bf16") };
-        run_case(rg, ts, ps, RAD_E_SHAPE);
+        run_case(rg, ts, ps, RAD_E_SHAPE, inst);
     }
+    /* A served shape with no instance is refused: there is no counter to name the last block. */
+    {
+        const int64_t M = 4;
+        std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { M, 2560 }),
+                                      T(d_w, RAD_BF16, { 512, 2560 }),
+                                      T(d_wg, RAD_BF16, { 1, 2560 }),
+                                      T(d_lg[1], RAD_BF16, { M, 512 }),
+                                      T(d_id[1], RAD_I32, { M, 10 }),
+                                      T(d_ew[1], RAD_BF16, { M, 10 }),
+                                      T(d_so[1], RAD_I32, { M * 10 }),
+                                      T(d_of[1], RAD_I32, { 513 }),
+                                      T(d_cn[1], RAD_I32, { 512 }),
+                                      T(d_g[1], RAD_BF16, { M, 1 }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("K", 2560), PI("n_expert", 512),
+                                     PI("top_k", 10), PI("norm", 1), PS("dtype", "bf16") };
+        run_case(rg, ts, ps, RAD_E_STATE);
+    }
+    rg->fini(inst);
 }
 
 /* THE PROTECTED EXPERTS ARE SORTED LAST, against a host stable sort by place. A layer that keeps a
@@ -5090,7 +5116,10 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
     struct Proj { const char* name; int64_t N0, K0, N1, K1, parts; bool srt; };
     const Proj projs[2] = { { "gate_up", 768, 2560, 512, 2560, 2, false },
                             { "down",    2560, 384, 2560, 256, 1, true } };
-    const int nforms = pl.pin_moe ? 3 : 1;
+    /* Form 4, where the plugin has the pin, is the decode form at two 128-wide K blocks a pass:
+     * the timing kMoeGuFk256Rows is set from. Only gate_up has it (K a multiple of 256 and a
+     * format that folds scale groups); elsewhere it runs as form 2. */
+    const int nforms = pl.pin_moe ? (pl.pin_fk ? 4 : 3) : 1;
     for (const Proj& P : projs) {
         const int64_t N = std::max(P.N0, P.N1), K = std::max(P.K0, P.K1), kb = K / group;
         const int64_t Ma = P.srt ? Tr : Mtok;
@@ -5225,7 +5254,8 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         const std::string pname = std::string(P.name) + (w5 ? " w5" : sub == 4 ? " g32"
                                                          : g64 ? " g64" : "");
         for (int f = 0; f < nforms; ++f) {
-            if (pl.pin_moe) pl.pin_moe(f + 1);
+            if (pl.pin_moe) pl.pin_moe(f == 3 ? 2 : f + 1);
+            if (pl.pin_fk) pl.pin_fk(f == 3 ? 2 : 1);
             const int rc = r->launch(&a, nullptr);
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
                 std::printf("  %-12s form %d  rc=%d (not served)\n", pname.c_str(), f + 1, rc);
@@ -5275,8 +5305,13 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
         }
         }
         if (pl.pin_moe) pl.pin_moe(0);
+        if (pl.pin_fk) pl.pin_fk(0);
     }
 }
+
+/* The launcher's kPf2MinRows: from this band the rule takes the PF2 form and the scratch hook
+ * sizes `u` for its weight planes; below it the pin to PF2 is refused. */
+static constexpr int64_t kHcPf2MinRows = 512;
 
 /* THE GATED RESIDUAL'S READ AT INT8 CODES. The same inputs run twice, the codes plane once E4M3
  * and once I8: the bf16 block input and the rotated E4M3 twin must come out byte-identical -- the
@@ -5325,12 +5360,7 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
     void* d_rq = dalloc(qb);
     void* d_rs = dalloc(sb);
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
-                                         "the wide kernels", "the PF2 kernels",
-                                         "the PF2 down product", "the PF2 up product",
-                                         "the PF2 kernels at 128 rows",
-                                         "the PF2 down and persistent up products",
-                                         "the PF2 128-row down and persistent up products",
-                                         "the PF2 persistent up product" };
+                                         "the wide kernels", "the PF2 kernels" };
     const std::string nm = fmt("hc_read_e4m3 int8 codes at M=%lld (%s, %s)", (long long)M,
                                real_stream ? "a real stream" : "the null stream", kForm[form]);
     if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
@@ -5409,13 +5439,18 @@ static void hc_read_i8(const Plugin& pl, int64_t M, bool real_stream, int form) 
  * split. Random codes and small positive scales: what is timed is the traffic and the arithmetic.
  *
  * EVERY FORM OF THE PREFILL TILE is run -- the decode tiles' kernels at 128 rows, the wide kernels
- * and, where the band can hold their weight planes, the PF2 kernels, through the
- * r4d_hc_read_pin_prefill hook -- and their outputs compared BYTE FOR BYTE, which is what the wide
- * and the PF2 kernels claim. `timed` times each form as well. */
-static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
+ * and, from kHcPf2MinRows rows, the PF2 kernels, through the r4d_hc_read_pin_prefill hook -- and
+ * their outputs compared BYTE FOR BYTE, which is what the wide and the PF2 kernels claim. `timed`
+ * times each form as well.
+ *
+ * `f8` picks the row: hc_read_e4m3, or hc_read_bf16 over bf16 mixing matrices. Both enter the same
+ * launcher and both reach PF2, whose prologue then copies mix_down where it decodes it at E4M3 and
+ * whose up product reads the stored mix_up where it reads a decoded one -- a path of its own. */
+static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool f8 = true) {
     if (iters <= 0) iters = 20;
-    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
-    if (!r) { skip("hc_read_e4m3 prefill forms", "row absent"); return; }
+    const char* const rn = f8 ? "hc_read_e4m3" : "hc_read_bf16";
+    const RadKernelInfo* r = find(pl, rn);
+    if (!r) { skip(fmt("%s prefill forms", rn).c_str(), "row absent"); return; }
     const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128;
     const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
     const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
@@ -5436,8 +5471,16 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
         }
         return b;
     };
-    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
-    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    /* bf16 weights of the E4M3 planes' magnitude: |w| up to 0.25. */
+    auto bplane = [&](int64_t count) {
+        std::vector<uint8_t> b((size_t)(count * 2));
+        uint16_t* v = (uint16_t*)b.data();
+        for (int64_t i = 0; i < count; ++i)
+            v[i] = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 4000.0f);
+        return b;
+    };
+    std::vector<uint8_t> down = f8 ? plane(lr, HN, r4d_hc8::down_group(HN), dld) : bplane(lr * HN);
+    std::vector<uint8_t> up   = f8 ? plane(HN, lr, r4d_hc8::up_group(lr), uld) : bplane(HN * lr);
     std::vector<uint16_t> injw((size_t)(hc * HN));
     for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
 
@@ -5455,7 +5498,7 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
     void* d_rq = dalloc(qb);
     void* d_rs = dalloc(sb);
     if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
-        ok("hc_read_e4m3 prefill forms: allocation", false);
+        ok(fmt("%s prefill forms: allocation", rn).c_str(), false);
         return;
     }
     st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
@@ -5466,9 +5509,10 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
 
     /* The mixing matrices arrive at their DECLARED shape with the stored dtype, as the engine
      * hands them; the launcher derives the stored row pitch itself. */
+    const uint32_t mdt = f8 ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
     std::vector<RadTensor> ts = {
         T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
-        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_dn, mdt,        { lr, HN }),    T(d_up, mdt,        { HN, lr }),
         T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
         T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  RAD_F8E4M3, { M, n }),
         T(d_qs, RAD_F32,    { M, n / grp }), T(d_rq, RAD_F8E4M3, { M, n }),
@@ -5477,7 +5521,7 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
     std::vector<RadParam> ps = {
         PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
         PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
-        PI("rotate", 1), PS("mix", "e4m3"),
+        PI("rotate", 1), PS("mix", f8 ? "e4m3" : "bf16"),
     };
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
@@ -5490,21 +5534,16 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
     /* A REAL STREAM, because the op keys per-stream state on it -- the fused forms' arrival
      * counters -- and on the null stream it finds none and takes the unfused path. */
     hipStream_t hs = nullptr;
-    if (hipStreamCreate(&hs) != hipSuccess) { ok("hc_read_e4m3 prefill forms: stream", false); return; }
+    if (hipStreamCreate(&hs) != hipSuccess) {
+        ok(fmt("%s prefill forms: stream", rn).c_str(), false);
+        return;
+    }
     const RadStream rst = (RadStream)hs;
 
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; };
-    /* PF2 keeps its two weight planes in the band's `u` buffer, M * hc * n bf16: they need
-     * ceil((lr + hc) / 16) * 16 + lr rows of it, so a smaller M is the wide form's alone. */
-    const int64_t pf2_min_m = ((lr + hc + 15) / 16) * 16 + lr;
-    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= pf2_min_m ? 9 : 2) : 0;
+    const int f_lo = pl.pin_hc ? 1 : 0, f_hi = pl.pin_hc ? (M >= kHcPf2MinRows ? 3 : 2) : 0;
     static const char* const kForm[] = { "the launcher's rule", "the decode tiles' kernels",
-                                         "the wide kernels", "the PF2 kernels",
-                                         "the PF2 down product", "the PF2 up product",
-                                         "the PF2 kernels at 128 rows",
-                                         "the PF2 down and persistent up products",
-                                         "the PF2 128-row down and persistent up products",
-                                         "the PF2 persistent up product" };
+                                         "the wide kernels", "the PF2 kernels" };
     std::vector<Out> outs;
     for (int form = f_lo; form <= f_hi; ++form) {
         if (pl.pin_hc) pl.pin_hc(form);
@@ -5512,7 +5551,7 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
         st_memset(d_qs, 0, sb); st_memset(d_rq, 0, qb); st_memset(d_rs, 0, sb);
         const int rc = r->launch(&a, rst);
         if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
-            ok(fmt("hc_read_e4m3 prefill form '%s' at M=%lld is served", kForm[form],
+            ok(fmt("%s prefill form '%s' at M=%lld is served", rn, kForm[form],
                    (long long)M).c_str(), false, fmt("rc=%d", rc));
             if (pl.pin_hc) pl.pin_hc(0);
             (void)hipStreamDestroy(hs);
@@ -5538,8 +5577,8 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
         /* A zero output would pass a byte comparison between two forms that both wrote nothing. */
         size_t nz = 0;
         for (uint8_t v : outs[f].q) nz += v != 0;
-        ok(fmt("hc_read_e4m3 prefill tile at M=%lld, %s: byte-identical to the decode tiles' "
-               "kernels", (long long)M, what).c_str(),
+        ok(fmt("%s prefill tile at M=%lld, %s: byte-identical to the decode tiles' kernels", rn,
+               (long long)M, what).c_str(),
            bad.empty() && nz > qb / 2, bad.empty() ? fmt("%zu of %zu codes non-zero", nz, qb)
                                                    : "differs in" + bad);
     };
@@ -5570,8 +5609,8 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed) {
             st_ev_destroy(e0); st_ev_destroy(e1);
             const double us = (double)ms * 1000.0 / iters;
             const double flop = 2.0 * (double)M * (double)HN * (double)(2 * lr + hc);
-            std::printf("hc_read_e4m3 at M=%lld (n %lld, hc %lld, lowrank %lld, inject, fp8 twin + "
-                        "rotated), %s: %.1f us a call, %.1f TFLOP/s\n", (long long)M,
+            std::printf("%s at M=%lld (n %lld, hc %lld, lowrank %lld, inject, fp8 twin + "
+                        "rotated), %s: %.1f us a call, %.1f TFLOP/s\n", rn, (long long)M,
                         (long long)n, (long long)hc, (long long)lr, kForm[form], us,
                         flop / (us * 1e6));
         }
@@ -6072,43 +6111,30 @@ static float st_e4m3(uint8_t b) {
  * its part and its down projection reads a shorter K. */
 struct MoeW4Shape { const char* name; int64_t N0, K0, N1, K1, parts, ne; };
 
-/* THE DECODE FORM'S BIT-IDENTICAL VARIANTS, each against the default, byte for byte: the weight from
- * a uniform global base (R4D_MOE_UWLOAD), the run search in one round trip (R4D_MOE_RUNSCAN), two
- * 128-wide K blocks a pass (R4D_MOE_GU_FK256), and every combination. Every launch is DESCRIBED
- * first: a variant that named the default's kernel would match it trivially, so two pins naming
- * one function is a failure, not a pass. `fk2` is whether this shape can take two blocks a pass --
- * the token operand, a format that folds scale groups, every class's K a multiple of 256; the
- * other two are open to every shape. The default here is PINNED, so an R4D_MOE_* switch in the
- * environment cannot make the comparison one variant against itself.
+/* THE DECODE FORM'S STAGED K, BOTH WAYS, byte for byte: one 128-wide K block a pass and two. Every
+ * launch is DESCRIBED first: a pin that named the other's kernel would match it trivially, so two
+ * pins naming one function is a failure, not a pass. `fk2` is whether this shape can take two
+ * blocks a pass -- the token operand, a format that folds scale groups, every class's K a multiple
+ * of 256; a shape that cannot has one form only, which the form loop already held to the host
+ * decode. Both launches are PINNED, so the launcher's row limit cannot make the comparison one form
+ * against itself.
  *
  * A row with no describe hook -- moe_gemm_fp8a8_mod4 -- is compared on its bytes alone, and says
  * so in its label: that the variant ran is then not shown, only that what ran agrees. */
 static void moe_dec_variants(const Plugin& pl, const RadKernelInfo* row, RadArgs& a, void* d_y,
                              size_t elems, bool fk2, const std::string& what) {
-    if (!pl.pin_fk || !pl.pin_uw || !pl.pin_rs || !pl.pin_moe) return;
+    if (!fk2 || !pl.pin_fk || !pl.pin_moe) return;
     const bool described = row->describe != nullptr;
-    struct Var { int uw, rs, fk; const char* name; };
-    static const Var kVar[] = {
-        { 1, 1, 1, "as upstream" },
-        { 2, 1, 1, "uniform weight base" },
-        { 1, 2, 1, "one-pass run search" },
-        { 2, 2, 1, "uniform weight base, one-pass run search" },
-        { 1, 1, 2, "two K blocks a pass" },
-        { 2, 1, 2, "uniform weight base, two K blocks a pass" },
-        { 1, 2, 2, "one-pass run search, two K blocks a pass" },
-        { 2, 2, 2, "uniform weight base, one-pass run search, two K blocks a pass" },
-    };
+    struct Var { int fk; const char* name; };
+    static const Var kVar[] = { { 1, "one K block a pass" }, { 2, "two K blocks a pass" } };
     constexpr int kN = (int)(sizeof(kVar) / sizeof(kVar[0]));
     const void* fn[kN] = {};
     std::vector<uint16_t> base;
     for (int v = 0; v < kN; ++v) {
-        if (kVar[v].fk == 2 && !fk2) continue;
         const std::string label = what + " decode form, " + kVar[v].name +
                                   (described ? "" : " (launch not described)");
         auto pin = [&](bool on) {
             pl.pin_moe(on ? 2 : 0);
-            pl.pin_uw(on ? kVar[v].uw : 0);
-            pl.pin_rs(on ? kVar[v].rs : 0);
             pl.pin_fk(on ? kVar[v].fk : 0);
         };
         if (described) {
@@ -6390,7 +6416,20 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
                                     " elements off, worst " + std::to_string(worst) + first);
         two_cls[form] = got;
     }
-    /* The decode form's variants; two K blocks a pass where the switch can take this shape. */
+    /* THE DECODE FORM AGAINST THE UNIFORM PREFILL GRID, byte for byte. Every form keeps each
+     * output element's accumulation order, so the bytes agree exactly, not within the host
+     * decode's tolerance. The decode form finds its runs by the one-round-trip search up to 512
+     * experts and by the chunked search above that; the uniform grid walks the offsets from a
+     * binary search, so this holds whichever search the expert count picks to a third way of
+     * finding the same runs. */
+    if (!two_cls[2].empty() && !two_cls[3].empty()) {
+        int64_t diff = 0;
+        for (size_t i = 0; i < two_cls[2].size(); ++i) diff += two_cls[2][i] != two_cls[3][i];
+        ok((what + " decode form, byte for byte with the uniform prefill grid").c_str(),
+           diff == 0, std::to_string(diff) + " of " + std::to_string(Tr * N) +
+                      " elements differ");
+    }
+    /* The decode form's staged K both ways, where this shape can take two blocks a pass. */
     const bool fk2 = g64 && sh.K0 % 256 == 0 && sh.K1 % 256 == 0;
     moe_dec_variants(pl, r, a, d_y, (size_t)(Tr * N), fk2, what);
     if (!four) return;
@@ -10587,6 +10626,10 @@ static void device_phase(const Plugin& pl) {
             /* Three passes of 256 along K: the decode form's two-block pass then also runs its
              * one-ahead prefetch, which a single pass never reaches. */
             { "40 experts, gate/up 2:1, K 768", 256, 768, 128, 768, 2, 40 },
+            /* Past 512 experts: the decode form's chunked run search, which the one-round-trip
+             * search hands every wider expert count to. Runs land on experts on both sides of
+             * 512, and K 256 lets the two-block pass run on that search as well. */
+            { "640 experts, gate/up 2:1, K 256", 256, 256, 128, 256, 2, 640 },
         };
         for (const MoeW4Shape& sh : kShapes) {
             moe_w4_gemm(pl, 24, sh);
@@ -10611,6 +10654,7 @@ static void device_phase(const Plugin& pl) {
             { "down 2:1",    64, 256,  64, 128, 1, 10 },
             { "300 experts, gate/up 2:1", 256, 128, 128, 128, 2, 300 },
             { "40 experts, gate/up 2:1, K 768", 256, 768, 128, 768, 2, 40 },
+            { "640 experts, gate/up 2:1, K 256", 256, 256, 128, 256, 2, 640 },
         };
         for (const MoeW4Shape& sh : kShapes4)
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {
@@ -10635,21 +10679,26 @@ static void device_phase(const Plugin& pl) {
     }
 
     if (sel("hc_read_e4m3")) {
-        if (!g_case) std::printf("\nthe gated residual's read at the prefill tile, the wide "
-                                 "kernels against the decode tiles'\n");
+        if (!g_case) std::printf("\nthe gated residual's read at the prefill tile, every form "
+                                 "against the decode tiles'\n");
         /* 700 and 1000 put PF2's K chunks across a stream boundary and its row tiles past the
          * last row; 4096 is the one-chunk epilogue. */
         for (int64_t m : { 65, 300, 700, 1000, 2048, 4096 }) hc_prefill(pl, m, 0, false);
-        for (int64_t m : { 1, 4, 33, 65, 300, 2048 }) {
+        /* 1 to 7 rows are one up-product row group each, every instantiation below eight. */
+        for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 33, 65, 300, 2048 }) {
             hc_read_i8(pl, m, false, 0);
             hc_read_i8(pl, m, true, 0);
         }
         if (pl.pin_hc) {
             for (int64_t m : { 65, 2048 })
                 for (int form : { 1, 2 }) hc_read_i8(pl, m, true, form);
-            for (int64_t m : { 700, 2048 })
-                for (int form = 3; form <= 9; ++form) hc_read_i8(pl, m, true, form);
+            for (int64_t m : { 700, 2048 }) hc_read_i8(pl, m, true, 3);
         }
+    }
+    if (sel("hc_read_bf16")) {
+        if (!g_case) std::printf("\nthe gated residual's read over bf16 mixing matrices at the "
+                                 "prefill tile, every form against the decode tiles'\n");
+        for (int64_t m : { 300, 700, 2048 }) hc_prefill(pl, m, 0, false, false);
     }
 
     if (sel("moe_gemm_w4a8")) {
@@ -10934,7 +10983,7 @@ static void usage(void) {
                 "             rows -- at one shape, each with its TFLOP/s.\n"
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
                 "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
-                "             prefill-tile form (PF2 from M=656) compared byte for byte and timed\n"
+                "             prefill-tile form (PF2 from M=512) compared byte for byte and timed\n"
                 "             as one op each;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
                 "  --perfmoe M [iters] [experts] [top_k] [pooled%%]:  the routed-expert w4 GEMM,\n"

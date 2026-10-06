@@ -75,6 +75,9 @@ struct SchedMetrics {
         /* Tokens one block covers, 0 for a stateful group. A pool measured in blocks cannot be
          * compared with a request measured in tokens, and every reader wants that comparison. */
         int64_t block_tokens = 0;
+        /* A WINDOWED GROUP recycles its blocks below the window, so its carve says how far back a
+         * sequence keeps context and nothing about how much context fits. */
+        bool    window = false;
         /* AND THE SAME GROUP IN BYTES, which is the measure that survives being added to the next
          * group's. Neither blocks nor tokens does: a stateful group has no token axis, and two
          * paged groups share one, so a token of context takes a slot in both and summing them

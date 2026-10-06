@@ -44,7 +44,7 @@ env GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 $EXTRA_ENV \
     --host 127.0.0.1 --port "$P" \
     --max-num-seqs ${SEQS:-8} --max-model-len ${MLEN:-200000} \
     --tp ${TP:-2} --placement expert_tiered --host-pool-mib ${HOSTPOOL:-12288} \
-    --gpu-headroom-mib ${HR:-96} --expert-vs-cache-ratio ${RATIO:-0.82} --kv-cache-dtype ${KVD:-fp8} \
+    --gpu-headroom-mib ${HR:-96} --kv-cache-dtype ${KVD:-fp8} \
     --num-speculative-tokens ${NS:-3} \
     --max-num-batched-tokens ${MNBT:-2048} \
     $EXTRA > "$HOME/fntrace.log" 2>&1 &

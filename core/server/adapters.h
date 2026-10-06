@@ -116,10 +116,11 @@ public:
         c.host_freed = s.host_freed; c.host_drops = s.host_drops; c.failures = s.failures;
         c.fetched = s.fetched; c.ck_fetched = s.ck_fetched;
         c.host_bytes = s.host_bytes; c.disk_bytes = s.disk_bytes;
-        c.ck_to_host = s.ck_to_host; c.ck_to_disk = s.ck_to_disk; c.ck_promoted = s.ck_promoted;
-        c.ck_drops = s.ck_drops; c.ck_starved = s.ck_starved;
+        c.ck_to_disk = s.ck_to_disk; c.ck_drops = s.ck_drops;
+        c.restores = s.restores; c.restore_ns = s.restore_ns;
+        c.flushes = s.flushes; c.flush_ns = s.flush_ns;
         c.ck_bytes = tiers_->ckpt_bytes();
-        c.ck_host_slots = tiers_->ckpt_arena().capacity();
+        c.ck_host_slots = tiers_->ckpt_slots();
         c.ck_disk_slots = tiers_->ckpt_disk_slots();
         c.host_on = tiers_->host_on();
         c.disk_on = tiers_->disk_on();
@@ -150,7 +151,6 @@ public:
             o.on_disk   = s.on_disk;
             o.moving    = s.moving;
             o.snapshots   = s.snapshots;
-            o.snap_device = s.snap_device;
             o.snap_host   = s.snap_host;
             o.snap_disk   = s.snap_disk;
             o.snap_bytes  = s.snap_bytes;
@@ -246,6 +246,9 @@ public:
             o.kv_bytes_total += m.kv[i].bytes_total;
             o.kv_bytes_used  += m.kv[i].bytes_used;
             o.kv_bytes_carved += m.kv[i].bytes_carved;
+            if (m.kv[i].block_tokens <= 0 || m.kv[i].window) continue;
+            const int64_t t = m.kv[i].blocks_total * m.kv[i].block_tokens;
+            if (o.kv_tokens_max == 0 || t < o.kv_tokens_max) o.kv_tokens_max = t;
         }
 
         /* vLLM's gpu_prefix_cache_hit_rate is a single number and attention caching is what it
@@ -432,7 +435,12 @@ public:
         m.reasoning = r.reasoning;
         m.tool_calls.reserve(r.calls.size());
         for (const ReplyCall& c : r.calls) m.tool_calls.push_back({ std::string(), c.name, c.arguments });
+        m.open_call = !r.calls.empty() && !r.calls.back().closed;
         return m;
+    }
+
+    std::string content_with_open_call(std::string_view reply) const override {
+        return s_->content_with_open_call(reply);
     }
 
 private:

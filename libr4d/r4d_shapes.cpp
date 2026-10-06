@@ -1293,7 +1293,9 @@ extern "C" int r4d_shape_router_gemm_topk_scatter(const RadParam* p, int n_p, in
     const int64_t K  = pi(p, n_p, "K");
     const int64_t ne = pi(p, n_p, "n_expert");
     const int64_t k  = pi(p, n_p, "top_k");
-    if (ne <= 0 || ne > 256 || k <= 0 || k > ne || K <= 0) return RAD_E_UNSUPPORTED;
+    /* 512 experts: the selection keeps sixteen logits a lane (kMaxExpert in r4d_moe.hip), which
+     * is the shim's bound and the row's constraint. */
+    if (ne <= 0 || ne > 512 || k <= 0 || k > ne || K <= 0) return RAD_E_UNSUPPORTED;
     if (M > 64 || M * k > 1024) return RAD_E_UNSUPPORTED;
     const int64_t nl = pi(p, n_p, "n_local", ne);
     if (nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;

@@ -45,7 +45,9 @@
  *   * a tag's own name while it is being read, since a name is only a name once it is closed;
  *   * a JSON-typed argument value until its closing delimiter: `30` and `30 seconds` differ from
  *     their first byte (a number, or the string "30 seconds"), so the value is emitted whole once
- *     its type is known. A value that stops being JSON part-way is streamed as text from there.
+ *     its type is known. A value that stops being JSON part-way is streamed as text from there,
+ *     except a container (`[`, `{`), which is held to its end: only there is it known whether
+ *     it is JSON once its Python quoting is normalised, or the JSON string of its text.
  *
  * Streaming emits in the reply's order; a call's arguments are streamed as they are parsed. */
 #pragma once
@@ -81,6 +83,12 @@ struct ReplyCall {
     std::string name;
     std::string arguments;    /* JSON text, as the OpenAI API carries it */
     bool        closed = false;
+    /* Where the call's text begins in the reply, and the content up to it: `content_at` bytes
+     * of the message's content and the untrimmed whitespace held after them. What the content
+     * is when the call is read as text (ReplyStream::content_with_open_call). */
+    size_t      at = 0;
+    size_t      content_at = 0;
+    std::string content_held;
 };
 
 /* A reply, taken apart. After finish() it is the whole reply; before, what has been emitted. */
@@ -179,6 +187,11 @@ public:
     void finish(std::vector<ReplyEvent>* out);
 
     const ReplyMessage& message() const;
+    /* After finish(): the content were the last call text, when the reply ended inside that call
+     * -- the content before it, then the call as `reply` (every byte fed) spells it, trimmed at
+     * the end as content is. A call that never closed cannot be reported as a call, and its text
+     * is what the model wrote. The message's content when the last call closed, or there is none. */
+    std::string content_with_open_call(std::string_view reply) const;
     /* False once the reply left the format's grammar and was read by a recovery rule. */
     bool strict() const;
     ReplyHeld held() const;

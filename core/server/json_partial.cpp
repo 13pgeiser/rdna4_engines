@@ -174,5 +174,63 @@ size_t json_stable_prefix(std::string_view s) {
     return n;
 }
 
+bool json_quote_append(std::string& out, std::string_view s) {
+    static const char kHex[] = "0123456789abcdef";
+    const size_t mark = out.size();
+    out.reserve(mark + s.size() + 2);
+    out.push_back('"');
+    const unsigned char* p = (const unsigned char*)s.data();
+    const unsigned char* e = p + s.size();
+    const unsigned char* run = p;     /* [run, p) is verified and goes out as it is */
+    while (p < e) {
+        const unsigned char c = *p;
+        if (c >= 0x80) {
+            /* Length, and the range the SECOND byte is restricted to, which is what rejects
+             * overlong forms, surrogates and anything past U+10FFFF without decoding. */
+            size_t len;
+            unsigned char lo = 0x80, hi = 0xBF;
+            if (c >= 0xC2 && c <= 0xDF)      len = 2;
+            else if (c == 0xE0)              { len = 3; lo = 0xA0; }
+            else if (c >= 0xE1 && c <= 0xEC) len = 3;
+            else if (c == 0xED)              { len = 3; hi = 0x9F; }
+            else if (c >= 0xEE && c <= 0xEF) len = 3;
+            else if (c == 0xF0)              { len = 4; lo = 0x90; }
+            else if (c >= 0xF1 && c <= 0xF3) len = 4;
+            else if (c == 0xF4)              { len = 4; hi = 0x8F; }
+            else                             len = 0;
+            bool ok = len != 0 && (size_t)(e - p) >= len && p[1] >= lo && p[1] <= hi;
+            for (size_t k = 2; ok && k < len; ++k) ok = p[k] >= 0x80 && p[k] <= 0xBF;
+            if (!ok) {
+                out.resize(mark);
+                return false;
+            }
+            p += len;
+            continue;
+        }
+        if (c >= 0x20 && c != '"' && c != '\\') {
+            ++p;
+            continue;
+        }
+        out.append((const char*)run, (size_t)(p - run));
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\t': out += "\\t"; break;
+            case '\n': out += "\\n"; break;
+            case '\f': out += "\\f"; break;
+            case '\r': out += "\\r"; break;
+            default: {
+                const char u[6] = { '\\', 'u', '0', '0', kHex[c >> 4], kHex[c & 15] };
+                out.append(u, 6);
+            }
+        }
+        run = ++p;
+    }
+    out.append((const char*)run, (size_t)(p - run));
+    out.push_back('"');
+    return true;
+}
+
 }  /* namespace server */
 }  /* namespace rad */

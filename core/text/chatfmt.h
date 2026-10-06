@@ -105,7 +105,8 @@ struct ChatFormat {
     ChatValue   string_value = ChatValue::Cdata;  /* a string-typed argument: Raw or Cdata */
     ChatValue   other_value  = ChatValue::Json;   /* any other type: Json */
     /* One newline at each end of a value is punctuation: the template writes the value on its own
-     * lines, and exactly the first and last newline belong to the tags. */
+     * lines, and exactly the first and last newline belong to the tags. A tag that ends with its
+     * newline (Qwen's `>\n`) has written the first one already, and the value starts after it. */
     bool        value_newlines = true;
 
     /* The literal words that start constrained decoding of a call. Empty means no lazy grammar:

@@ -909,6 +909,8 @@ struct MaskPlan {
     struct Group { int32_t key; std::vector<int32_t> ctx; };
     mutable std::vector<Group>      groups;
     mutable GbnfStack               ctx;
+    mutable std::vector<const GbnfStack*> step_ptrs;
+    mutable uint64_t                dfa_gen = 0;   /* which automaton `dfa` is; see plan_step */
 };
 
 void MaskPlanDeleter::operator()(MaskPlan* p) const { delete p; }
@@ -1841,23 +1843,85 @@ static void fill_resume(const MaskPlan& P, SetDfa& dfa, const GbnfStacks& stacks
     }
 }
 
+/* The plan's automaton, for one operation charged to `work`. The caller holds P.mu.
+ *
+ * The automaton is a memo, so past its bound it is dropped and rebuilt rather than refused: every
+ * state in it can be rediscovered, and a grammar whose stacks deepen with every token would
+ * otherwise hold a new state per token for as long as it is cached. */
+static SetDfa& plan_dfa(const MaskPlan& P, OpWork& work) {
+    if (!P.dfa || P.dfa->elems() > kMaxDfaElems) {
+        if (P.dfa)
+            RAD_DEBUG("gbnf: the stack-set automaton holds %zu states, %zu stack elements; "
+                      "rebuilding it", P.dfa->n_states(), P.dfa->elems());
+        P.dfa = std::make_unique<SetDfa>(P.rules);
+        ++P.dfa_gen;
+    }
+    P.dfa->begin(&work);
+    return *P.dfa;
+}
+
+bool plan_step(const MaskPlan& P, const std::vector<const GbnfStack*>& stacks, PlanState* at,
+               const uint32_t* cps, size_t n, GbnfStacks* out, OpWork& work) {
+    std::lock_guard<std::mutex> lk(P.mu);
+    SetDfa& dfa = plan_dfa(P, work);
+
+    /* The set as a state: the one the caller names, or canonicalised through pointers -- sorted,
+     * without duplicates, and copied only if the automaton has not seen it. Charged as intern()
+     * charges a sort. */
+    const bool named = at->id >= 0 && at->gen == P.dfa_gen;
+    int32_t s0;
+    if (named) {
+        s0 = at->id;
+        work.add(stacks.size() + 1);
+    } else {
+        std::vector<const GbnfStack*>& ps = P.step_ptrs;
+        ps.clear();
+        size_t elems = 0;
+        for (const GbnfStack* k : stacks) {
+            ps.push_back(k);
+            elems += k->size() + 1;
+        }
+        work.add(elems * (1 + (uint64_t)std::bit_width(ps.size())));
+        std::sort(ps.begin(), ps.end(),
+                  [](const GbnfStack* a, const GbnfStack* b) { return *a < *b; });
+        ps.erase(std::unique(ps.begin(), ps.end(),
+                             [](const GbnfStack* a, const GbnfStack* b) { return *a == *b; }),
+                 ps.end());
+        s0 = dfa.intern_ptrs(ps);
+    }
+    int32_t s = s0;
+
+    /* One successor per code point: the interval the code point falls in, then that interval's
+     * successor, each built on first use and served from the memo after. */
+    for (size_t k = 0; k < n && s >= 0; ++k) {
+        const SetDfa::St& S = dfa.parted(s);
+        const size_t i = (size_t)(std::upper_bound(S.lo.begin(), S.lo.end(), cps[k]) -
+                                  S.lo.begin()) - 1;
+        work.add(8);
+        s = dfa.next(s, i);
+    }
+    if (named && s == s0) return true;
+    at->gen = P.dfa_gen;
+    if (s < 0) {
+        at->id = -1;
+        out->clear();
+        return false;
+    }
+    const SetDfa::St& S = dfa.st(s);
+    at->id = S.has_empty || !S.ttop.empty() ? -1 : s;
+    out->resize(S.stacks.size());
+    for (size_t i = 0; i < S.stacks.size(); ++i)
+        (*out)[i].assign(S.stacks[i].begin(), S.stacks[i].end());
+    return false;
+}
+
 int plan_fill(const MaskPlan& P, const GbnfStacks& stacks, PartialUtf8 partial, bool allow_eog,
               uint32_t* bitmask, int64_t n_words) {
     std::lock_guard<std::mutex> lk(P.mu);
     std::fill(bitmask, bitmask + n_words, 0u);
 
     OpWork work;
-    /* The automaton is a memo, so past its bound it is dropped and rebuilt rather than refused:
-     * every state in it can be rediscovered, and a grammar whose stacks deepen with every token
-     * would otherwise hold a new state per token for as long as it is cached. */
-    if (!P.dfa || P.dfa->elems() > kMaxDfaElems) {
-        if (P.dfa)
-            RAD_DEBUG("gbnf: the stack-set automaton holds %zu states, %zu stack elements; "
-                      "rebuilding it", P.dfa->n_states(), P.dfa->elems());
-        P.dfa = std::make_unique<SetDfa>(P.rules);
-    }
-    SetDfa& dfa = *P.dfa;
-    dfa.begin(&work);
+    SetDfa& dfa = plan_dfa(P, work);
 
     if (allow_eog)
         for (int32_t id : P.vx->eog) set_bit(bitmask, id);

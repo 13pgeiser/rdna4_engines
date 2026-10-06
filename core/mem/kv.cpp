@@ -100,7 +100,8 @@ int KVManager::configure(const std::vector<KVGroupInfo>& groups, const Config& c
 }
 
 int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config& cfg) {
-    /* The snapshot count is the operator's, through --checkpoint-slots. Nothing here derives it. */
+    /* Only to say it is ignored on a model with no recurrent state: the slots are host memory and
+     * the engine opens them (set_checkpoint_store). */
     const int64_t budget_ckpts = cfg.checkpoint_slots > 0 ? cfg.checkpoint_slots : 0;
 
     forget();
@@ -285,37 +286,12 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     int64_t fixed = 0;
     for (const auto& p : plans_)
         if (p.stateful()) fixed += align_up(p.bytes_per_state * p.n_states, RAD_ALIGN_UNIT);
-    /* A SLOT IS ELASTIC ONLY WHEN A SNAPSHOT IS WORTH A GRANULE, and the stride follows from
-     * that. Committing and releasing a slot on its own needs the stride to be a whole number of
-     * granules: a commit rounds outward and a release rounds inward, so a straddling stride
-     * would leave every slot's last partial granule backed for the life of the process and let
-     * one slot's commit back part of its neighbour.
-     *
-     * That rounding is free on a linear-attention model, where a snapshot is a sizeable fraction
-     * of a gigabyte. It is not free on a small one: a 16 KiB snapshot rounded to a 2 MiB granule
-     * is 128x the address space to manage a charge that was never worth managing. Below a
-     * granule the slots stay in the eagerly committed region, where they cost what they say
-     * they cost and nothing reclaims them because there is nothing to reclaim. */
-    const int64_t granule = Pool::granule();
-    ck_elastic_ = granule > 0 && checkpoint_bytes_ >= granule;
-    ck_stride_  = align_up(checkpoint_bytes_, ck_align());
-    /* AND THE PAD IN FRONT OF THE REGION IS PART OF ITS COST. The slots are reserved LAST, after
-     * every group, and on a ck_align() boundary -- so the region starts up to one alignment unit
-     * past wherever the groups happened to end. Where that is cannot be known here, because the
-     * paged split below is what decides it, so the whole unit is reserved rather than the exact
-     * pad: it is at most one commit granule against a pool measured in gigabytes, and the
-     * alternative is a budget the LAST slot falls off the end of -- a refusal at load on some
-     * models and not others, depending on where the groups happened to end. */
-    const int64_t ck_pad   = budget_ckpts > 0 ? ck_align() : 0;
-    const int64_t ck_total = budget_ckpts * ck_stride_ + ck_pad;
-    fixed += ck_total;
     /* And one unit a paged group, for the same reason: a page size that is not a multiple of the
      * alignment pads too, and the carve below hands the groups everything that is left. */
     for (const auto& p : plans_) if (p.paged()) fixed += RAD_ALIGN_UNIT;
 
-    fixed_    = fixed;
-    ck_total_ = ck_total;
-    ckpts_    = budget_ckpts;
+    fixed_ = fixed;
+    ckpts_ = budget_ckpts;
     return RAD_OK;
 }
 
@@ -361,11 +337,7 @@ void KVManager::forget() {
     chunk_blocks_.clear(); short_peak_.clear();
     pool_ = nullptr;
     clears_.clear();
-    seqs_.clear(); pending_.clear(); ck_slot_base_.clear(); ck_free_.clear();
-    ck_stride_ = ck_region_off_ = 0;
-    ck_elastic_ = false;
-    ck_high_water_ = 0;
-    ck_backed_ = 0;
+    seqs_.clear(); pending_.clear();
     configured_ = false;
     report_.clear();
 }
@@ -376,8 +348,22 @@ int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* block
      * run out of full-attention blocks with a window pool still half empty. */
     std::vector<int64_t> out(plans_.size(), 0);
     int64_t remaining = budget_bytes - fixed_;
-    std::vector<int32_t> open;
-    for (const auto& p : plans_) if (p.paged()) open.push_back(p.index);
+    /* A ZERO GROUP COSTS THIS RANK NOTHING, so it takes no part in the split: it holds the
+     * shared table's block count, which is what the costed groups settle on (here, or under the
+     * cap, on the rank that does hold the cache). */
+    std::vector<int32_t> open, zeros;
+    for (const auto& p : plans_)
+        if (p.paged()) (p.zero ? zeros : open).push_back(p.index);
+    /* Every paged group zero: nothing on this rank limits the token count. The cap is what the
+     * ranks that hold the cache carve, and without one there is no figure to report. */
+    if (open.empty() && !zeros.empty()) {
+        const int64_t tokens = tokens_cap_ > 0 ? tokens_cap_ : kUnboundedTokens;
+        if (blocks) {
+            for (int32_t i : zeros) out[i] = zero_blocks(plans_[i], tokens);
+            *blocks = std::move(out);
+        }
+        return tokens;
+    }
 
     int64_t tokens = 0;
     while (!open.empty() && remaining > 0) {
@@ -404,34 +390,34 @@ int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* block
         open.erase(std::find(open.begin(), open.end(), capped));
     }
     for (int32_t i : open) out[i] = remaining > 0 ? tokens / plans_[i].block_size : 0;
+    for (int32_t i : zeros) out[i] = remaining > 0 ? zero_blocks(plans_[i], tokens) : 0;
     if (blocks) *blocks = std::move(out);
     return tokens;
+}
+
+int64_t KVManager::zero_blocks(const KVGroupPlan& p, int64_t tokens) const {
+    if (tokens == kUnboundedTokens) return 0;
+    const int64_t b = tokens / p.block_size;
+    if (p.kind == RAD_KV_WINDOW && b > max_seqs_ * p.window_blocks) return max_seqs_ * p.window_blocks;
+    return b;
 }
 
 int KVManager::carve_into(Pool& kv_pool) {
     /* The pool is whatever the operator stated or the resolver derived; nothing here re-decides
      * it. What this does decide is how the groups share it, which is arithmetic, not policy. */
     const int64_t budget_bytes = kv_pool.avail();
-    const int64_t budget_ckpts = ckpts_;
     const int64_t fixed        = fixed_;
-    const int64_t ck_total     = ck_total_;
     pool_base_ = kv_pool.base();
     pool_ = &kv_pool;
 
     if (fixed >= budget_bytes) {
         RAD_ERR("vram_kv does not fit its fixed costs:\n"
                 "  linear/conv state  %10s  (%lld sequences)\n"
-                "  checkpoints        %10s  (%lld x %s)\n"
-                "  ------------------------------\n"
-                "  fixed              %10s\n"
                 "  --vram-kv-mib      %10s\n"
                 "  SHORT BY           %10s\n"
-                "Lower --max-seqs or the checkpoint slot count, or raise --vram-kv-mib. "
-                "The engine will not shrink one of them for you (spec §6).",
-                humanb(fixed - ck_total).c_str(), (long long)max_seqs_,
-                humanb(ck_total).c_str(), (long long)budget_ckpts,
-                humanb(ck_stride_).c_str(),
-                humanb(fixed).c_str(), humanb(budget_bytes).c_str(),
+                "Lower --max-seqs or raise --vram-kv-mib. The engine will not shrink one of them "
+                "for you (spec §6).",
+                humanb(fixed).c_str(), (long long)max_seqs_, humanb(budget_bytes).c_str(),
                 humanb(fixed - budget_bytes + 1).c_str());
         return RAD_E_NOMEM;
     }
@@ -444,10 +430,16 @@ int KVManager::carve_into(Pool& kv_pool) {
 
     for (auto& p : plans_) {
         if (!p.paged()) continue;
+        if (p.n_blocks <= 0 && p.zero) {
+            RAD_ERR("KV group '%s' is zero on this rank and nothing set its block count: a zero "
+                    "group holds what the ranks keeping the cache carve, and no cap from them was "
+                    "given (cap_paged_tokens)", p.name.c_str());
+            return RAD_E_STATE;
+        }
         if (p.n_blocks <= 0) {
             RAD_ERR("KV group '%s': a %s KV pool leaves 0 blocks (%s a page) after the fixed "
-                    "linear/conv costs of %s. Raise --vram-kv-mib, lower --expert-vs-cache-ratio, "
-                    "or lower --max-seqs.",
+                    "linear/conv costs of %s. Raise --vram-kv-mib or --host-pool-mib, or lower "
+                    "--max-seqs.",
                     p.name.c_str(), humanb(budget_bytes).c_str(),
                     humanb(p.bytes_per_block).c_str(), humanb(fixed).c_str());
             return RAD_E_NOMEM;
@@ -456,11 +448,9 @@ int KVManager::carve_into(Pool& kv_pool) {
 
     /* ---- carve. Every reservation comes from the KV pool and only from the KV pool: the mover
      * works inside the weight slab and cannot reach this (spec §6). ---- */
-    int64_t paged_taken = 0;
     for (auto& p : plans_) {
         int64_t bytes = p.paged() ? p.n_blocks * p.bytes_per_block
                                   : p.n_states * p.bytes_per_state;
-        if (p.paged()) paged_taken += bytes;
         if (p.zero) {
             p.base = nullptr;
             p.pool_offset = 0;
@@ -481,30 +471,11 @@ int KVManager::carve_into(Pool& kv_pool) {
         p.pool_offset = off;
         p.pool_bytes = bytes;
     }
-    /* --checkpoint-slots on a model with no recurrent state buys nothing, and allocating zero-byte
+    /* --checkpoint-slots on a model with no recurrent state buys nothing, and opening zero-byte
      * slots for it would leave the operator's flag looking honoured. Ignore it and say so. */
-    if (budget_ckpts > 0 && checkpoint_bytes_ <= 0)
+    if (ckpts_ > 0 && checkpoint_bytes_ <= 0)
         RAD_WARN("--checkpoint-slots %lld ignored: this model declares no linear-attention state, "
-                 "so there is nothing to snapshot", (long long)budget_ckpts);
-    for (int64_t i = 0; checkpoint_bytes_ > 0 && i < budget_ckpts; ++i) {
-        int64_t off = 0;
-        if (!kv_pool.reserve("linear checkpoint", ck_stride_, ck_align(), &off)
-            && !kv_pool.accounting_only()) {
-            /* The arithmetic that is supposed to make this impossible, printed next to the
-             * failure: `fixed` reserved budget_ckpts * checkpoint_bytes_ up front, so a checkpoint
-             * that does not fit means the paged carve above spent more than `remaining`. */
-            RAD_ERR("linear checkpoint slot %lld (%lld B) did not fit the KV pool: %lld B of "
-                    "%lld B left after the paged groups took %lld B against a %lld B share",
-                    (long long)i, (long long)checkpoint_bytes_,
-                    (long long)kv_pool.avail(), (long long)budget_bytes,
-                    (long long)paged_taken, (long long)(budget_bytes - fixed));
-            return RAD_E_NOMEM;
-        }
-        if (i == 0) ck_region_off_ = off;
-        ck_slot_base_.push_back(off);
-        ck_free_.push_back((int32_t)i);
-    }
-    std::reverse(ck_free_.begin(), ck_free_.end());   /* pop_back hands out slot 0 first */
+                 "so there is nothing to snapshot", (long long)ckpts_);
 
     /* ---- free lists ---- */
     free_blocks_.resize(plans_.size());
@@ -542,36 +513,13 @@ int KVManager::carve_into(Pool& kv_pool) {
      *
      * The fixed part -- recurrent state and conv slots -- is never released. It is sized per
      * sequence rather than per token, so there is no idle fraction of it to give back, and a
-     * state slot cannot be re-created on demand the way a page can.
-     *
-     * CHECKPOINT SLOTS ARE NOT PART OF THAT. They are a CACHE -- the retention policy creates and
-     * retires them all run, and a slot nobody has taken holds nothing that has to survive -- so
-     * backing them all here would make --checkpoint-slots a standing VRAM charge whether or not a
-     * snapshot exists. On a linear-attention model a slot is a sizeable fraction of a gigabyte,
-     * and on a card whose experts do not fit that charge is decode step time. The region is left
-     * unbacked and each slot is committed as it is handed out, which makes the flag a cap. */
+     * state slot cannot be re-created on demand the way a page can. */
     if (pool_ && pool_->elastic()) {
-        /* EVERYTHING EXCEPT THE CHECKPOINT REGION. The slots are reserved last, so the
-         * second range is empty and this is a prefix -- written as a hole anyway, because
-         * "commit everything below the slots" is the rule and "the slots are at the end" is a
-         * detail of the carve above that nothing here should depend on. A prefix that stopped at
-         * a region in the MIDDLE would leave every group past it addressable and unbacked, and
-         * the paged groups are live from the first step: a fault at a valid-looking address on
-         * the first write, which is the worst shape this class of bug has.
-         *
-         * Both edges are granule-aligned by construction (the slot reserve asks for ck_align()
-         * and the stride is a whole number of granules), so neither commit rounds outward into
-         * the region. That alignment is the whole reason it can be skipped at all. */
-        const int64_t used     = pool_->used();
-        const int64_t hole_off = ck_elastic_ && !ck_slot_base_.empty() ? ck_region_off_ : used;
-        const int64_t hole_end = ck_elastic_ && !ck_slot_base_.empty()
-                                     ? ck_slot_base_.back() + ck_stride_
-                                     : used;
-        int rc = pool_->commit(0, hole_off);
-        if (rc >= 0 && used > hole_end) rc = pool_->commit(hole_end, used - hole_end);
+        const int64_t used = pool_->used();
+        const int rc = pool_->commit(0, used);
         if (rc < 0) {
             RAD_ERR("KV pool: the carve reserved %s of address space and the card would not back "
-                    "it", humanb(used - (hole_end - hole_off)).c_str());
+                    "it", humanb(used).c_str());
             return rc;
         }
     }
@@ -618,19 +566,12 @@ int KVManager::carve_into(Pool& kv_pool) {
     }
     /* WHERE EACH GROUP STARTS, SO A FAULT ADDRESS CAN BE PLACED. A GPU memory fault names an
      * address and nothing else, and without this the only way to tell "kv_attn layer 7" from
-     * "checkpoint slot 3" is to reconstruct the carve by hand from the sizes above. One line. */
-    report_ += fmt("    pool at %p, %s; groups at +%lld..+%lld, checkpoints at +%lld\n",
+     * "kv_gdn_state slot 3" is to reconstruct the carve by hand from the sizes above. One line. */
+    report_ += fmt("    pool at %p, %s; groups at +%lld..+%lld\n",
                    pool_base_, humanb(pool_ ? pool_->bytes() : 0).c_str(),
                    (long long)(plans_.size() > 1 ? plans_[1].pool_offset : 0),
                    (long long)(plans_.empty() ? 0 : plans_.back().pool_offset +
-                                                    plans_.back().pool_bytes),
-                   (long long)(ck_slot_base_.empty() ? 0 : ck_slot_base_.front()));
-    if (checkpoint_bytes_ > 0)
-        report_ += fmt(
-"    %-14s %-6s      %lld slots x %s = %s%s\n", "checkpoints", "linear",
-                       (long long)ck_slot_base_.size(), humanb(ck_stride_).c_str(),
-                       humanb((int64_t)ck_slot_base_.size() * ck_stride_).c_str(),
-                       ck_elastic_ ? "  (address space; backed as slots are taken)" : "");
+                                                    plans_.back().pool_bytes));
     return RAD_OK;
 }
 
@@ -779,73 +720,6 @@ int64_t KVManager::buffer_bytes() const {
     for (size_t i = 0; i < plans_.size(); ++i)
         if (plans_[i].paged()) b += buf_blocks(i) * plans_[i].bytes_per_block;
     return b;
-}
-
-int64_t KVManager::ck_reserve_bytes() const {
-    if (!ck_elastic_ || ck_stride_ <= 0) return 0;
-    /* Counted from what is BACKED and not from the free list, because a rank that is not the one
-     * holding the free list still backs the slots it writes, and its reserve has to cover them. */
-    const int64_t want = std::min(ckpts_, ck_high_water_ + 1);
-    return want > ck_backed_ ? (want - ck_backed_) * ck_stride_ : 0;
-}
-
-bool KVManager::ck_backed(int32_t slot) const {
-    if (slot < 0 || slot >= (int32_t)ck_slot_base_.size()) return false;
-    if (!ck_elastic_ || !pool_ || !pool_->elastic() || ck_stride_ <= 0) return true;
-    return pool_->is_committed(ck_slot_base_[(size_t)slot], ck_stride_);
-}
-
-int KVManager::ck_room(int32_t slot) const {
-    if (slot < 0 || slot >= (int32_t)ck_slot_base_.size()) return RAD_E_INVAL;
-    if (ck_backed(slot) || !ck_free_bytes_ || ck_keep_free_ <= 0) return RAD_OK;
-    int64_t free_now = 0;
-    RAD_TRY(ck_free_bytes_(&free_now));
-    return free_now - ck_stride_ >= ck_keep_free_ ? RAD_OK : RAD_E_FULL;
-}
-
-int KVManager::ck_commit(int32_t slot) {
-    if (slot < 0 || slot >= (int32_t)ck_slot_base_.size()) return RAD_E_INVAL;
-    if (ck_backed(slot)) return RAD_OK;
-    if (pool_->commit(ck_slot_base_[(size_t)slot], ck_stride_) < 0) return RAD_E_FULL;
-    if (++ck_backed_ > ck_high_water_) ck_high_water_ = ck_backed_;
-    return RAD_OK;
-}
-
-int KVManager::back_checkpoint(int32_t slot) {
-    RAD_TRY(ck_room(slot));
-    return ck_commit(slot);
-}
-
-/* EVERY CARD'S ANSWER BEFORE ANY CARD'S PAGES. Asking first means a slot one card refuses costs
- * the others nothing: on a driver that keeps what it maps, pages committed for a slot that is then
- * not handed out would be charged to that card for the life of the process. */
-int KVManager::ck_back_everywhere(int32_t slot) {
-    RAD_TRY(ck_room(slot));
-    for (KVManager* p : ck_peers_) RAD_TRY(p->ck_room(slot));
-    RAD_TRY(ck_commit(slot));
-    for (KVManager* p : ck_peers_) RAD_TRY(p->ck_commit(slot));
-    return RAD_OK;
-}
-
-int KVManager::back_free_checkpoints(int64_t* withdrawn) {
-    std::vector<int32_t> keep;
-    keep.reserve(ck_free_.size());
-    int64_t gone = 0;
-    for (const int32_t s : ck_free_) {
-        const int rc = ck_back_everywhere(s);
-        if (rc == RAD_E_FULL) { ++gone; continue; }
-        if (rc < 0) return rc;
-        keep.push_back(s);
-    }
-    ck_free_.swap(keep);
-    if (withdrawn) *withdrawn = gone;
-    return RAD_OK;
-}
-
-int64_t KVManager::ck_align() const {
-    if (!ck_elastic_) return (int64_t)RAD_ALIGN_UNIT;
-    const int64_t g = Pool::granule();
-    return g > (int64_t)RAD_ALIGN_UNIT ? g : (int64_t)RAD_ALIGN_UNIT;
 }
 
 /* WHAT THE GROUP CAN STILL HAND OUT, WHICH IS NOT WHAT IT HAS BELOW THE MARK. A lent block is
@@ -1447,47 +1321,27 @@ int KVManager::make_room(uint64_t id, int64_t n_tokens,
  * caller sees RAD_E_FULL, which is the answer it already handles -- the retention policy runs and
  * the allocation is retried. Anything else would turn a card that is momentarily busy into a
  * failed request. */
+void KVManager::set_checkpoint_store(HostArena* store, int64_t rank_off) {
+    ck_store_ = store && store->enabled() ? store : nullptr;
+    ck_rank_off_ = rank_off;
+}
+
 int KVManager::alloc_checkpoint(int32_t* slot_out) {
-    if (ck_free_.empty()) return RAD_E_FULL;
-    /* A SLOT EVERY CARD HAS BACKED ALREADY, WHERE ONE IS FREE: it costs no commit and no reading
-     * of the card, and a card at its floor still has every slot it backed before. Otherwise the
-     * top of the free list, backed on every card or not handed out at all. */
-    size_t at = ck_free_.size() - 1;
-    for (size_t i = ck_free_.size(); i-- > 0;) {
-        const int32_t s = ck_free_[i];
-        bool all = ck_backed(s);
-        for (const KVManager* p : ck_peers_) all = all && p->ck_backed(s);
-        if (all) { at = i; break; }
-    }
-    const int32_t slot = ck_free_[at];
-    const int rc = ck_back_everywhere(slot);
-    if (rc < 0) return rc;
-    ck_free_.erase(ck_free_.begin() + (std::ptrdiff_t)at);
+    if (!ck_store_ || checkpoint_bytes_ <= 0) return RAD_E_FULL;
+    const int32_t slot = ck_store_->alloc();
+    if (slot < 0) return RAD_E_FULL;
     *slot_out = slot;
     return RAD_OK;
 }
 
 void KVManager::free_checkpoint(int32_t slot) {
-    if (slot < 0 || slot >= (int32_t)ck_slot_base_.size()) return;
-    for (int32_t f : ck_free_) if (f == slot) return;      /* double free: refuse, do not corrupt */
-    ck_free_.push_back(slot);
-    /* AFTER the free list, so a release the driver refuses still leaves the slot allocatable: the
-     * next commit of the same range is idempotent and the bytes are correct either way. */
-    /* AND ONLY WHERE A RELEASE IS WORTH MAKING. See set_release_frees_card: on a driver that does
-     * not return decommitted VRAM, unmapping these pages buys the card nothing and costs a commit
-     * on the next allocation of the slot. It is not merely wasted work: the range is unmapped
-     * while the slot id goes straight back on the free list, so anything still addressing it
-     * reads a page that is no longer there. */
-    if (ck_elastic_ && release_frees_card_ && pool_ && pool_->elastic() && ck_stride_ > 0) {
-        const int64_t off = ck_slot_base_[(size_t)slot];
-        if (pool_->is_committed(off, ck_stride_) && ck_backed_ > 0) --ck_backed_;
-        (void)pool_->decommit(off, ck_stride_);
-    }
+    if (ck_store_) ck_store_->free(slot);
 }
 
 void* KVManager::checkpoint_ptr(int32_t slot) const {
-    if (!pool_base_ || slot < 0 || slot >= (int32_t)ck_slot_base_.size()) return nullptr;
-    return (char*)pool_base_ + ck_slot_base_[(size_t)slot];
+    if (!ck_store_) return nullptr;
+    char* p = (char*)ck_store_->at(slot);
+    return p ? p + ck_rank_off_ : nullptr;
 }
 
 /* One walk, both directions. Keeping save and restore as a single traversal is deliberate: the
@@ -1496,14 +1350,16 @@ void* KVManager::checkpoint_ptr(int32_t slot) const {
  * functions that could stop agreeing. */
 int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t ck_slot,
                                bool save, RadStream s) {
-    /* THIS RANK'S PAGES, BEFORE THIS RANK'S COPY. alloc_checkpoint backed the slot on every rank
-     * before it handed the id out, so this finds it backed; a refusal here is a slot that did not
-     * come from there. See KVManager::back_checkpoint. */
-    RAD_TRY(back_checkpoint(ck_slot));
+    /* A SLOT NOBODY HOLDS IS NOT ONE TO WRITE. Rank 0 hands the ids out, so a follower checks the
+     * shared store rather than a list of its own. */
+    if (!ck_store_ || !ck_store_->in_use(ck_slot)) return RAD_E_INVAL;
     char* ck = (char*)checkpoint_ptr(ck_slot);
     if (!ck) return RAD_E_INVAL;
     if (!state_slots || n_slots < (int)plans_.size()) return RAD_E_INVAL;
 
+    /* ONE PITCHED COPY A GROUP. Within a group the state of one sequence is a row a layer, one
+     * layer_stride apart in the pool and packed end to end in the slot, so a group's whole share
+     * crosses the link as one launch rather than a launch a layer. */
     int64_t off = 0;
     for (size_t g = 0; g < plans_.size(); ++g) {
         const KVGroupPlan& p = plans_[g];
@@ -1511,19 +1367,19 @@ int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t 
         const int32_t slot = state_slots[g];
         if (slot < 0) return RAD_E_STATE;          /* no state to save, or none to restore into */
         const int64_t nbytes = p.layer_bytes_per_state();
-        for (int64_t l = 0; l < p.n_layers; ++l) {
-            void* st = state_ptr((int32_t)g, (int32_t)l, slot);
-            if (!st) return RAD_E_STATE;
-            if (off + nbytes > checkpoint_bytes_) {
-                RAD_ERR("checkpoint slot %d holds %lld bytes and this sequence's linear state "
-                        "needs more than that; configure() sized it from the same plans, so the "
-                        "two have gone out of step", (int)ck_slot, (long long)checkpoint_bytes_);
-                return RAD_E_STATE;
-            }
-            RAD_TRY(save ? rad_memcpy_async(ck + off, st, nbytes, s)
-                         : rad_memcpy_async(st, ck + off, nbytes, s));
-            off += nbytes;
+        void* st = state_ptr((int32_t)g, 0, slot);
+        if (!st || p.n_layers <= 0) return RAD_E_STATE;
+        if (off + nbytes * p.n_layers > checkpoint_bytes_) {
+            RAD_ERR("checkpoint slot %d holds %lld bytes a rank and this sequence's linear state "
+                    "needs more than that; the store was sized from the same plans, so the two "
+                    "have gone out of step", (int)ck_slot, (long long)checkpoint_bytes_);
+            return RAD_E_STATE;
         }
+        RAD_TRY(save ? rad_memcpy_2d_async(ck + off, nbytes, st, p.layer_stride(), nbytes,
+                                           p.n_layers, s)
+                     : rad_memcpy_2d_async(st, p.layer_stride(), ck + off, nbytes, nbytes,
+                                           p.n_layers, s));
+        off += nbytes * p.n_layers;
     }
     return RAD_OK;
 }

@@ -117,7 +117,6 @@ TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     CHECK_EQ(parse({ "--tp" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--port" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kv-cache-dtype" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio" }, &c), RAD_E_INVAL);
     Args a{ "--model" };
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), RAD_E_INVAL);
 }
@@ -345,30 +344,6 @@ TEST(the_table_placements_are_auto_vram_ram_or_disk) {
         CHECK_EQ(parse({ "--ngram-placement", bad }, &c), RAD_E_INVAL);
     }
     CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
-}
-
-/* THE FLAG THAT DECIDES WHETHER MULTI-TURN WORKS. It is the WEIGHTS share, strictly inside
- * (0, 1): either endpoint gives one side of the split nothing at all, and the server would come
- * up and then fail to place either the experts or the cache. */
-TEST(the_expert_cache_ratio_is_strictly_between_zero_and_one) {
-    Config c;
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio", "0.82" }, &c), RAD_OK);
-    CHECK_NEAR(c.expert_cache_ratio, 0.82, 1e-9);
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio", "0.5" }, &c), RAD_OK);
-
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio", "0" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio", "1" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio", "1.5" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio", "-0.5" }, &c), RAD_E_INVAL);
-    /* A PERCENTAGE IS THE OBVIOUS MISREADING of a flag documented as a ratio, and 82 is outside
-     * the range rather than clamped to it -- which is the difference between a server that says
-     * what is wrong and one that quietly serves a different split. */
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio", "82" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--expert-vs-cache-ratio", "high" }, &c), RAD_E_INVAL);
-
-    Config d;
-    CHECK_EQ(parse({}, &d), RAD_OK);
-    CHECK_NEAR(d.expert_cache_ratio, 0.75, 1e-9);
 }
 
 /* A POLICY NAME THIS BUILD DOES NOT KNOW WOULD FALL THROUGH TO THE DEFAULT, and a measurement
@@ -814,7 +789,7 @@ TEST(usage_names_every_flag_it_documents) {
     fclose(f);
 
     CHECK(text.find("--model") != std::string::npos);
-    CHECK(text.find("--expert-vs-cache-ratio") != std::string::npos);
+    CHECK(text.find("--host-pool-mib") != std::string::npos);
     CHECK(text.find("--kv-cache-dtype") != std::string::npos);
     CHECK(text.find("--num-speculative-tokens") != std::string::npos);
     CHECK(text.find("--checkpoint-policy") != std::string::npos);

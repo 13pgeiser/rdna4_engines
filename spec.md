@@ -953,7 +953,6 @@ utilisation fraction and no inference about what the workload will be:
 | | |
 |---|---|
 | `--gpu-headroom-mib` | VRAM left unclaimed on every card (default 96) |
-| `--expert-vs-cache-ratio` | weights vs KV split of what is claimed (default 0.75) |
 | `--vram-weights-mib` | the resident weight slab; 0 derives it from the card |
 | `--vram-kv-mib` | the paged KV pool; 0 derives it from the card |
 | `--host-pool-mib` | pinned host tier |
@@ -974,7 +973,8 @@ and what is left is spent in **two steps**, because only one of the two is a tra
     claimable           31.19 GiB
     static weights       3.94 GiB   off the top: every rank's own shard, not a share of anything
     ------------------------------
-    elastic             27.25 GiB   what --expert-vs-cache-ratio divides
+    elastic             27.25 GiB   the experts keep what the host pool cannot hold; the cache takes the rest
+                                    and lends what no live request holds to the expert slab
       experts           26.18 GiB
       kv cache           1.08 GiB   a full cache for 8 sequences at 2048 tokens
     ==============================
@@ -985,9 +985,21 @@ and what is left is spent in **two steps**, because only one of the two is a tra
 projections, the norms, the embedding, the head — has to be resident for the model to run at a
 sensible speed at all, and under tensor parallel each rank already holds its own even share of
 them (declare runs per rank with every dimension divided, §9). Dividing the weights *as a whole*
-by a ratio would let `--expert-vs-cache-ratio 0.3` demote an attention projection to host memory
-to make room for a cache nothing will fill. So they come out whole first, and what remains is the
-one genuinely two-sided trade this engine has: the expert plane against the KV cache.
+would let the cache's side demote an attention projection to host memory to make room for blocks
+nothing will fill. So they come out whole first, and what remains is the one genuinely two-sided
+trade this engine has: the expert plane against the KV cache.
+
+**Where the cache lends, that trade has nothing to guess.** Under `--placement auto` or
+`expert_tiered`, without `--deterministic`, on a device with virtual memory management, the
+experts keep on the card exactly what the pinned host pool (`--host-pool-mib`) cannot hold, plus
+one expert unit of packing slack — they have nowhere else to be — and the cache takes the rest, up
+to what it could ever address. Every block no live request holds is lent back to the expert slab
+in place, so the cache is as large as the work needs at the moment and the experts have everything
+else, for a long-context server and a high-concurrency one alike. `--host-pool-mib` is what moves
+the split: a larger pool takes experts off the card and gives the cache more. The prefill staging
+region comes out of the cache's side. Without a lender a block the cache does not use would sit
+empty, so the experts come first and the cache keeps one max-length sequence. Either way the cache
+never gets less than that sequence.
 
 **Both sides are then capped at what they could use, and the slack crosses over.** The ceilings
 are upper bounds and not targets. An expert plane that is entirely resident has no use for another
@@ -1008,10 +1020,8 @@ What *is* a hard limit, and is still checked: the pool must hold **one** max-len
 context no single request can ever complete is a configuration error however much slack the pool
 has, because the API accepts that request and admission then refuses it.
 
-The trade between KV blocks and resident weights is real and workload-dependent — a long-context
-low-concurrency server and a short-context high-concurrency one want opposite splits — and stating
-it is still the operator's to do: `--vram-weights-mib` and `--vram-kv-mib` win outright wherever
-they are given, and nothing re-optimises a split that was stated. An engine that quietly
+`--vram-weights-mib` and `--vram-kv-mib` win outright wherever they are given, and nothing
+re-optimises a split that was stated. An engine that quietly
 re-optimises is an engine whose benchmarks do not reproduce.
 A fixed weight-slab budget also means dynamic re-placement (§5.4) never competes with the KV pool.
 The mover works inside its own slab and cannot evict a KV block to promote an expert.

@@ -92,6 +92,12 @@ struct Verdict {
      * without its wrapper, which the legacy lifter takes only when nothing else in the reply
      * parses as a call, and which the streaming parser always reads as one. */
     bool old_call_syntax = false;
+    /* A call in the legacy answer has a raw control character in its arguments: its JSON reader
+     * took a string holding one, which the schema grammar refuses -- the reply goes on in the
+     * grammar's text arm, and ends the value at its suffix, where the legacy reader kept reading
+     * -- or it passed a typed value's text through bare. Neither is JSON, and neither is a
+     * reading to hold the streaming parser to. */
+    bool old_raw_control = false;
     std::string detail;         /* both answers, when they differ */
 };
 Verdict compare(const Bench& b, const std::string& text);

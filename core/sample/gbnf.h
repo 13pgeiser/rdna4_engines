@@ -32,6 +32,11 @@
  *     stacks that match code points are advanced together rather than one at a time, and a
  *     large set is de-duplicated through an index. Each gives the same set as upstream; without
  *     them, stacks that converge on one continuation re-expand it once each.
+ *   - Accepting a token steps the stacks that match code points through the mask plan's
+ *     stack-set automaton (gbnf_mask.cpp, plan_step) rather than through a closure per stack per
+ *     code point, and the grammar remembers which automaton state its stacks are. The set is the
+ *     one upstream's accept builds; the test oracle keeps upstream's accept and every accepted
+ *     token is held to it.
  *   - The token mask is not upstream's candidate walk. It is served from a plan precomputed when
  *     the grammar is compiled (gbnf_mask.cpp): per stack suffix, the tokens it admits whatever lies
  *     below it, and a small trie of what depends on what does. Upstream's walk survives only as
@@ -239,12 +244,23 @@ private:
         uint64_t start;
     };
 
+    /* The state of the mask plan's automaton `stacks_` is exactly, when it is one: which
+     * automaton (`gen`) and which state in it, or an id of -1 when that is not known. It lets
+     * accepting skip canonicalising the set, and skip rewriting it when a token leaves it where
+     * it was. Everything that sets `stacks_` other than accepting through the automaton resets
+     * it, or restores it with the stacks it describes. */
+    struct At {
+        uint64_t gen = 0;
+        int32_t  id  = -1;
+    };
+
     struct Snapshot {
         GbnfStacks  stacks;
         PartialUtf8 partial;
         bool        awaiting_trigger = false;
         WordScanner::State      scan;
         std::vector<Recent>     recent;
+        At                      at;
     };
 
     const VocabView* vocab_ = nullptr;
@@ -256,10 +272,9 @@ private:
     std::shared_ptr<const GbnfProgram> prog_;
     GbnfStacks       stacks_;
     PartialUtf8      partial_utf8_{};
+    At               at_;
 
     std::vector<Snapshot>   saved_;
-
-    GbnfState state_key(bool allow_eog, int64_t n_words) const;
 
     /* The mask itself, from the program's plan, with no memo. */
     int mask_compute(uint32_t* bitmask, int64_t n_words) const;
@@ -278,6 +293,13 @@ private:
 
     int accept_token_piece(int32_t token, const std::string& piece);
     int accept_token_piece_impl(int32_t token, const std::string& piece);
+
+    /* Scratch for accepting, kept so a token in the steady state of a value allocates nothing:
+     * the piece's code points, the stacks that step over them, and the set before the last one
+     * accepted, whose storage the next one is written into. None of it is state. */
+    std::vector<uint32_t>          cps_;
+    std::vector<const GbnfStack*>  current_;
+    GbnfStacks                     spare_;
 };
 
 /* COMPILE A GRAMMAR, on the calling thread, into the program every GbnfGrammar::create for the

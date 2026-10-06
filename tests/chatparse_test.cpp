@@ -160,16 +160,16 @@ static Verdict run(Bench* b, const std::string& text, const char* what, size_t s
  * grammar, and the calls must come back as the message had them. */
 
 /* What the template wrote for an argument, read back: a string argument is its text and any
- * other one is JSON. Two exceptions, both the template's rendering rather than the parser's
- * reading: a boolean or null, which Jinja renders the Python way (`True`, `None`), and -- in
- * MiniCPM's template, which prints a value with a bare `{{ param_value }}` -- a list or an object,
- * which this Jinja engine prints without its brackets. Those are compared by what the reply says,
- * which the differential check already covers, rather than by what the message held. */
+ * other one is JSON -- a boolean or null included, which Jinja renders the Python way (`True`,
+ * `None`) and the parser reads back as JSON's. One exception, the template's rendering rather than
+ * the parser's reading: MiniCPM's template prints a value with a bare `{{ param_value }}`, and a
+ * list or an object comes out of this Jinja engine without its brackets. Those are compared by
+ * what the reply says, which the differential check already covers, rather than by what the
+ * message held. */
 static bool round_trips(const json& want, const json& got, bool containers) {
     if (!got.is_object() || want.size() != got.size()) return false;
     for (auto it = want.begin(); it != want.end(); ++it) {
         if (!got.contains(it.key())) return false;
-        if (it.value().is_boolean() || it.value().is_null()) continue;
         if (!containers && it.value().is_structured()) continue;
         if (got.at(it.key()) != it.value()) return false;
     }
@@ -295,6 +295,71 @@ TEST(the_decided_shapes_read_as_decided) {
         if (!r.calls.empty())
             CHECK_EQ(r.calls[0].arguments, std::string("{\"command\":\"sleep\",\"timeout\":\"30 seconds\"}"));
 
+        /* A typed argument always reads as JSON: Python's literals as JSON's, inside a container
+         * too, an empty value as null, and text that spells no JSON value as a string of it.
+         * Qwen's format reads non-string arguments as JSON; MiniCPM's reads every one as text. */
+        if (q) {
+            r = read_adv(m, "Python literals");
+            CHECK_EQ(r.calls.size(), (size_t)1);
+            if (!r.calls.empty())
+                CHECK_EQ(r.calls[0].arguments, std::string("{\"verbose\":true,\"nothing\":null}"));
+            r = read_adv(m, "a Python dict with literals");
+            if (!r.calls.empty()) {
+                const json a = json::parse(r.calls[0].arguments, nullptr, false);
+                CHECK(!a.is_discarded());
+                if (!a.is_discarded()) {
+                    CHECK(a["extra"]["a"] == json(true));
+                    CHECK(a["extra"]["b"].is_null());
+                    CHECK(a["extra"]["c"] == json("False"));
+                }
+            }
+            r = read_adv(m, "an empty typed value");
+            if (!r.calls.empty())
+                CHECK_EQ(r.calls[0].arguments, std::string("{\"level\":null}"));
+            r = read_adv(m, "a typed value that is no JSON");
+            if (!r.calls.empty())
+                CHECK_EQ(r.calls[0].arguments, std::string("{\"verbose\":\"yes please\"}"));
+            r = read_adv(m, "a number that is not one");
+            if (!r.calls.empty())
+                CHECK_EQ(r.calls[0].arguments, std::string("{\"path\":\"/a\",\"limit\":\"01\"}"));
+            /* A raw line break or tab inside a string is the escape JSON spells it as: a client's
+             * JSON parser refuses the raw character. */
+            r = read_adv(m, "JSON strings holding a raw line break and tab");
+            CHECK_EQ(r.calls.size(), (size_t)1);
+            if (!r.calls.empty()) {
+                const json a = json::parse(r.calls[0].arguments, nullptr, false);
+                CHECK(!a.is_discarded());
+                if (!a.is_discarded()) {
+                    CHECK(a["extra"]["a"] == json("line1\nline2"));
+                    CHECK(a["extra"]["b"] == json("\tx"));
+                }
+            }
+            /* A container is JSON once normalised, or the string of its text: a trailing comma,
+             * a bare word or a missing bracket is no JSON, and the arguments must stay JSON. */
+            r = read_adv(m, "Python containers that are no JSON");
+            CHECK_EQ(r.calls.size(), (size_t)1);
+            if (!r.calls.empty())
+                CHECK_EQ(r.calls[0].arguments, std::string("{\"extra\":\"{'a': 1, 'b': [2, 3],}\","
+                                                           "\"tags\":\"['x', nan]\"}"));
+            r = read_adv(m, "a container missing its close");
+            if (!r.calls.empty())
+                CHECK_EQ(r.calls[0].arguments, std::string("{\"extra\":\"{'a': [1, 2}\"}"));
+            r = read_adv(m, "an escaped quote in a double-quoted string");
+            if (!r.calls.empty())
+                CHECK_EQ(r.calls[0].arguments, std::string("{\"tags\":[\"it's\", \"x\"]}"));
+            /* The grammar's JSON admits a number past a double's range and an unpaired surrogate
+             * escape, which a client's JSON parser refuses: such a value is its text. */
+            r = read_adv(m, "JSON a client cannot read");
+            if (!r.calls.empty()) {
+                const json a = json::parse(r.calls[0].arguments, nullptr, false);
+                CHECK(!a.is_discarded());
+                if (!a.is_discarded()) {
+                    CHECK(a["level"] == json("1e400"));
+                    CHECK(a["extra"] == json(R"({"a": "\ud800"})"));
+                }
+            }
+        }
+
         /* A Python-quoted array is normalised to JSON. */
         r = read_adv(m, "a Python-quoted array");
         if (!r.calls.empty()) {
@@ -331,11 +396,98 @@ TEST(the_decided_shapes_read_as_decided) {
                 CHECK_EQ(r.calls[0].arguments, std::string("{\"command\":\"ls\"}"));
             }
             CHECK(r.content.empty());
+
+            /* A call whose own close is missing is ended by its wrapper's, and the next call is
+             * a call of its own rather than more arguments for this one. */
+            r = read_adv(m, "a call closed by its wrapper alone");
+            CHECK_EQ(r.calls.size(), (size_t)2);
+            if (r.calls.size() == 2) {
+                CHECK(r.calls[0].closed);
+                CHECK_EQ(r.calls[0].arguments, std::string("{\"command\":\"ls\"}"));
+                CHECK_EQ(r.calls[1].name, std::string("read"));
+                CHECK_EQ(r.calls[1].arguments, std::string("{\"path\":\"/a\"}"));
+            }
+            CHECK(r.content.empty());
         }
 
         /* The terminator is not the answer, nor is trailing whitespace. */
         CHECK_EQ(read_adv(m, "a turn terminator at the end").content, std::string("Answer."));
         CHECK_EQ(read_adv(m, "trailing spaces and newlines").content, std::string("Answer."));
+    }
+}
+
+/* AN ARGUMENT NAME THAT REPEATS ITS OWN TAG'S OPENING -- `<parameter=parameter=command>`, which
+ * models write and the grammar's undeclared arm admits -- is the argument it names, read
+ * leniently: as the undeclared `parameter=command` the call reaches the tool without its command.
+ * A name the repetition does not make a declared one stays as written. */
+TEST(an_argument_name_repeating_its_tag_is_the_argument_it_names) {
+    for (const Model& m : models()) {
+        Bench* b = bench(m, ChatRequest{});
+        if (!b) continue;
+        const std::string T = "Thinking it over.\n</think>\n\n";
+        const bool q = is_qwen(m);
+        const std::string rep = q ? "parameter=" : "param name=\"";
+        const std::string text = T + C(m, "bash", { { rep + "command", "ls -la" },
+                                                    { rep + rep + "timeout", "30" },
+                                                    { rep + "nope", "x" } });
+        bool strict = true;
+        const ReplyMessage r = b->new_parse(text, &strict);
+        CHECK(!strict);
+        REQUIRE(r.calls.size() == 1);
+        const bool typed = b->format().other_value == ChatValue::Json;
+        CHECK_EQ(r.calls[0].arguments, "{\"command\":\"ls -la\",\"timeout\":" +
+                                           std::string(typed ? "30" : "\"30\"") + "," +
+                                           json(rep + "nope").dump() + ":\"x\"}");
+        const std::string s = stream_all(b->parser(), text);
+        CHECK(s.empty());
+        if (!s.empty()) fprintf(stderr, "    %s\n", s.c_str());
+    }
+}
+
+/* A CALL THE REPLY ENDED INSIDE reads back, as content, as the text it was written as: the content
+ * before it, then the call's own bytes -- never the reasoning, never a call that closed before it.
+ * What a buffered response answers with when that call cannot be reported as a call. */
+TEST(a_call_the_reply_ended_inside_reads_back_as_its_text) {
+    auto trimmed = [](std::string s) {
+        while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+        return s;
+    };
+    for (const Model& m : models()) {
+        Bench* b = bench(m, ChatRequest{});
+        if (!b) continue;
+        const std::string T = "Thinking it over.\n</think>\n\n";
+        const std::string done = C(m, "bash", { { "command", "ls" } });
+        const std::string call = C(m, "write", { { "path", "/a" }, { "content", "partial fi" } });
+        for (const size_t cut : { call.find("partial") + 3, call.find("</function>") + 3 }) {
+            const std::string open = call.substr(0, cut);
+            struct Case { std::string text, content; size_t calls; };
+            std::vector<Case> cases = {
+                { T + "Writing.\n" + open, "Writing.\n" + trimmed(open), 1 },
+                { T + "Writing.\n" + done + "\n" + open, "Writing.\n" + trimmed(open), 2 },
+                { T + open, trimmed(open), 1 },
+            };
+            /* Qwen's reasoning block ends where a call starts. */
+            if (is_qwen(m)) cases.push_back({ "I will write it.\n" + open, trimmed(open), 1 });
+            for (const Case& k : cases) {
+                std::unique_ptr<ReplyStream> s = b->parser().open();
+                for (size_t i = 0; i < k.text.size(); ++i)
+                    s->feed(std::string_view(k.text).substr(i, 1), nullptr);
+                s->finish(nullptr);
+                const ReplyMessage& r = s->message();
+                CHECK_EQ(r.calls.size(), k.calls);
+                if (r.calls.size() != k.calls) continue;
+                CHECK(!r.calls.back().closed);
+                if (k.calls == 2) CHECK(r.calls[0].closed);
+                CHECK_EQ(s->content_with_open_call(k.text), k.content);
+                CHECK(stream_all(b->parser(), k.text).empty());
+            }
+        }
+        /* With no open call the content is the content. */
+        const std::string whole = T + "Writing.\n" + done;
+        std::unique_ptr<ReplyStream> s = b->parser().open();
+        s->feed(whole, nullptr);
+        s->finish(nullptr);
+        CHECK_EQ(s->content_with_open_call(whole), std::string("Writing."));
     }
 }
 
@@ -378,6 +530,11 @@ static std::vector<Shape> bare_shapes() {
         { "two bare calls", T + ls + "\n" + rd, 2, false },
         { "two bare calls with a sentence between", T + ls + "\nNow the file.\n" + rd, 2, false },
         { "a bare call with no arguments", T + "<function=which gcc cc>\n</function>", 1, false },
+        /* The first argument's name is what makes the opener a call, and it is held while it is
+         * read: a tag name, not a delimiter, however long. */
+        { "a bare call whose first argument name is long",
+          T + "<function=bash>\n<parameter=" + std::string(200, 'x') + ">\nls\n</parameter>\n</function>",
+          1, false },
         /* Unconstrained, the model need not write the newlines the template puts around each
          * tag; a loose call's tags are read with that whitespace optional. */
         { "a bare call written without newlines",
@@ -400,6 +557,9 @@ static std::vector<Shape> bare_shapes() {
         /* An argument name that runs into a tag is no argument: the opener was text. */
         { "a bare opener whose argument name runs into a tag",
           T + "<function=bash>\n<parameter=com\nls\n</parameter>\n</function>", 0, true },
+        { "a bare opener whose long argument name runs into a tag",
+          T + "<function=bash>\n<parameter=" + std::string(200, 'x') + "\nls\n</parameter>\n</function>",
+          0, true },
         { "a mangled bare opener before a wrapped call",
           T + "<function=bash>\n<parameter=com\nls\n</parameter>\n</function>\n<tool_call>\n" + rd +
               "\n</tool_call>", 1, true },
@@ -950,6 +1110,16 @@ TEST(an_argument_no_value_satisfies_has_no_arm_in_either_grammar) {
     gq.generation_prompt = b->prompt().generation_prompt;
     CHECK_OK(chat_format_grammar(declared, gq, &g, &why));
     CHECK_EQ(g.text, b->prompt().grammar);
+
+    /* And the parser reads such an argument as the grammar does, by the undeclared arm: text,
+     * though its value spells JSON. */
+    const std::string reply = "Thinking it over.\n</think>\n\n" +
+        C(models()[0], "task", { { "context", "c" }, { "tasks", "[]" }, { "model", "123" } });
+    const Verdict v = run(b, reply, "an argument no value satisfies");
+    CHECK(v.strict);
+    const ReplyMessage r = b->new_parse(reply);
+    REQUIRE(r.calls.size() == 1);
+    CHECK_EQ(r.calls[0].arguments, std::string("{\"context\":\"c\",\"tasks\":[],\"model\":\"123\"}"));
 }
 
 /* OH-MY-PI 18.6.0's TOOLS AS AN UNMODIFIED CLIENT SENDS THEM (tests/data/chat), descriptions aside.
@@ -1059,7 +1229,9 @@ TEST(a_tool_name_holding_the_format_delimiter_is_refused_at_admission) {
 /* ================================================================== the wire
  *
  * What a streaming client assembles from the SSE chunks -- content, reasoning, each call's id,
- * name and arguments -- is the buffered answer, for every reply, cut a byte at a time. */
+ * name and arguments -- is the buffered answer, for every reply, cut a byte at a time. Every
+ * chunk is the bytes nlohmann writes for the value it carries: the delta chunks are written
+ * directly rather than through a tree, and are held to it here. */
 TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
@@ -1096,7 +1268,9 @@ TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
             size_t at = 0;
             while ((at = sse.find("data: ", at)) != std::string::npos) {
                 const size_t end = sse.find("\n\n", at);
-                const json j = json::parse(sse.substr(at + 6, end - at - 6));
+                const std::string payload = sse.substr(at + 6, end - at - 6);
+                const json j = json::parse(payload);
+                CHECK_EQ(j.dump(), payload);
                 at = end;
                 const json& c = j["choices"][0];
                 if (!c["finish_reason"].is_null()) finish = c["finish_reason"].get<std::string>();
@@ -1126,8 +1300,8 @@ TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
                 CHECK_EQ(args[k], want.calls[k].arguments);
                 CHECK_EQ(p.tool_calls[k].id, ids[k]);
             }
-            /* A call is reported as one only when its arguments parse. */
-            bool complete = !want.calls.empty();
+            /* A call is reported as one only when it closed and its arguments parse. */
+            bool complete = !want.calls.empty() && want.calls.back().closed;
             for (const ReplyCall& c : want.calls) complete = complete && server::json_complete(c.arguments);
             CHECK_EQ(finish, std::string(complete ? "tool_calls" : "stop"));
         }

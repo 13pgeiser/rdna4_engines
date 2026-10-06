@@ -90,7 +90,7 @@ int         avx_isa_force(int level);
     X(mul)                  X(silu_mul)             X(gelu)                 X(silu)               \
     X(sigmoid)              X(gather_rows)          X(scatter_rows)         X(ngram_ids)          \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \
-    X(scale_rows)                                                                                 \
+    X(scale_rows)           X(fill)                                                               \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(had_quant_act_i8)     X(quant_act_fp8)        X(had_quant_act_fp8)  \
     X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8)   X(dequant)            \

@@ -22,6 +22,13 @@ int64_t to_mib(int64_t bytes) { return bytes > 0 ? bytes / kMiB : 0; }
  * footprint to the byte, and there the rounding direction decides whether it loads. The MiB this
  * claims comes out of the headroom, which is what the headroom is for. */
 int64_t to_mib_up(int64_t bytes) { return bytes > 0 ? (bytes + kMiB - 1) / kMiB : 0; }
+
+/* WHAT THE DRIVER'S OWN HOLDING MOVES BY AFTER IT IS READ. `already_held` is one reading, and on
+ * ROCm 7.2 the same server started twice has read 4 MiB less than it later held (and once 30 MiB
+ * more): a budget that split the difference away came up a few MiB short of the headroom the
+ * first launches of kernels allocate from. Four times the drift seen, and charged before anything
+ * is split. */
+constexpr int64_t kDriverDrift = 16 * kMiB;
 }  /* namespace */
 
 /* WHAT THE CACHE BACKS, counted on its PAGED part. The ceiling is the recurrent and conv state of
@@ -33,7 +40,7 @@ static double paged_share(const VramBudget& b) {
     return ctx > 0 ? std::max(0.0, (double)(b.kv - b.kv_fixed)) / ctx : 0.0;
 }
 
-/* The resolver, with its three log lines behind `log`: vram_budget_trial asks the same question
+/* The resolver, with its log lines behind `log`: vram_budget_trial asks the same question
  * of a configuration it may not use, and a refusal printed for a split nobody takes reads as the
  * startup failing. */
 static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out, bool log) {
@@ -46,7 +53,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * overcommitting the smaller one on the first allocation. */
     b.capacity   = per_rank[0].capacity;
     int64_t freeb = per_rank[0].free;
-    int64_t layer_max = 0;
+    int64_t layer_max = 0, kv_one = 0;
     for (const VramFacts& f : per_rank) {
         b.capacity   = std::min(b.capacity, f.capacity);
         freeb        = std::min(freeb, f.free);
@@ -62,7 +69,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.statics    = std::max(b.statics, f.statics);
         b.expert_ceiling = std::max(b.expert_ceiling, f.experts);
         layer_max        = std::max(layer_max, f.expert_layer_max);
+        /* THE RANK THAT NEEDS MOST ON THE CARD SETS THE FLOOR. */
+        b.expert_floor = std::max(b.expert_floor, f.expert_floor);
+        kv_one = std::max(kv_one, f.kv_one);
     }
+    b.lends = true;
+    for (const VramFacts& f : per_rank) b.lends = b.lends && f.lends;
     b.headroom = std::max<int64_t>(cfg.gpu_headroom_mib, 0) * kMiB;
     int64_t host_reserve = 0;
     for (const VramFacts& f : per_rank) host_reserve = std::max(host_reserve, f.host_reserve);
@@ -91,7 +103,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     b.derived_kv      = want_kv;
 
     /* What is left after the terms nobody gets to spend. */
-    int64_t fixed = b.already_held + b.headroom + b.arena + b.staging + b.queues;
+    b.drift = (want_w || want_kv) ? kDriverDrift : 0;
+    int64_t fixed = b.already_held + b.drift + b.headroom + b.arena + b.staging + b.queues;
     if (!want_w)  fixed += cfg.vram_weights_mib * kMiB;   /* a stated pool is fixed too */
     if (!want_kv) fixed += cfg.vram_kv_mib * kMiB;
     b.claimable = b.capacity - fixed;
@@ -101,6 +114,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "VRAM does not cover the fixed costs before a single pool is sized:\n"
             "  card total         %10s\n"
             "  already held       %10s   (driver context, code objects, anything else on the card)\n"
+            "  driver drift       %10s   (what that moves by after it is read)\n"
             "  --gpu-headroom-mib %10s\n"
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
             "  step staging       %10s   (block tables, media and KV tier staging)\n"
@@ -110,7 +124,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  SHORT BY           %10s\n"
             "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
             "or free the card.\n",
-            humanb(b.capacity).c_str(), humanb(b.already_held).c_str(),
+            humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
             want_w  ? "" : fmt("  --vram-weights-mib %10s   (stated)\n",
@@ -147,39 +161,42 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     b.elastic = want_w ? b.claimable - b.statics : b.claimable;
     if (b.elastic < 0) b.elastic = 0;
 
-    /* ---- and only what is left is what the ratio divides ------------------------------------- */
+    /* ---- and only what is left is divided --------------------------------------------------- */
     if (want_w && want_kv) {
-        const double r = (cfg.expert_cache_ratio > 0.0 && cfg.expert_cache_ratio < 1.0)
-                       ? cfg.expert_cache_ratio : 0.75;
-        int64_t kv  = (int64_t)((double)b.elastic * (1.0 - r));
-        int64_t exp = b.elastic - kv;
-
-        /* BOTH SIDES ARE CAPPED AT WHAT THEY COULD USE, AND THE SLACK CROSSES OVER. A paged cache
-         * cannot address past max_seqs x max_ctx tokens and an expert plane that is entirely
-         * resident has no use for another byte -- so a share above either ceiling is memory
-         * nothing will ever touch. Cap, then hand the remainder to whichever side is still short,
-         * then stop: what neither can take is genuinely unusable and is reported as such rather
-         * than allocated into a pool that reports itself three quarters empty. */
-        if (b.kv_ceiling > 0 && kv > b.kv_ceiling) kv = b.kv_ceiling;
-        /* ZERO EXPERTS IS A CEILING OF ZERO, NOT AN UNMEASURED ONE. weight_footprint() runs on
-         * every rank before this call, so expert_ceiling is always known -- and guarding this cap
-         * with `> 0` would read "dense" as "unlimited", handing a model with no experts at all a
-         * large expert budget against nothing to put in it while its cache goes short.
-         * kv_ceiling keeps its guard: that one IS genuinely unset when plan_groups fails. */
-        if (exp > b.expert_ceiling) exp = b.expert_ceiling;
-        int64_t spare = b.elastic - kv - exp;
-        if (spare > 0 && b.expert_ceiling > exp) {
-            const int64_t take = std::min(spare, b.expert_ceiling - exp);
-            exp += take; spare -= take;
+        /* An unset cache ceiling (plan_groups failed) bounds nothing; zero experts is a ceiling of
+         * zero, which weight_footprint always measures. */
+        const int64_t kv_cap = b.kv_ceiling > 0 ? b.kv_ceiling : b.elastic;
+        int64_t kv = 0, exp = 0;
+        if (kv_cap + b.expert_ceiling <= b.elastic) {
+            /* BOTH FIT: nothing trades. */
+            kv  = kv_cap;
+            exp = b.expert_ceiling;
+        } else if (b.lends) {
+            /* THE CACHE LENDS, so it is sized for what live requests could need and gives back
+             * whatever they do not. The experts keep what the host pool cannot hold. */
+            exp = std::min(b.expert_floor, b.elastic);
+            kv  = std::min(kv_cap, std::max(b.elastic - exp, kv_one));
+            exp = std::min(std::max(b.expert_ceiling, b.expert_floor), b.elastic - kv);
+            /* THE ONE SEQUENCE WINS, and the experts it pushes off the card have no tier: the
+             * planner refuses them by name. Said here too, with what moves it. */
+            if (log && exp < b.expert_floor)
+                RAD_WARN("one --max-model-len sequence's cache (%s) leaves the experts %s, short of "
+                         "the %s the pinned host pool cannot hold: raise --host-pool-mib or lower "
+                         "--max-model-len",
+                         humanb(kv_one).c_str(), humanb(exp).c_str(),
+                         humanb(b.expert_floor).c_str());
+        } else {
+            /* NO LENDER: a block the cache does not use would sit empty, so the experts come
+             * first and the cache keeps one --max-model-len sequence. */
+            kv  = std::min(kv_cap, std::max(b.elastic - b.expert_ceiling, kv_one));
+            exp = std::min(b.expert_ceiling, b.elastic - kv);
         }
-        if (spare > 0 && b.kv_ceiling > kv) {
-            const int64_t take = std::min(spare, b.kv_ceiling - kv);
-            kv += take; spare -= take;
-        }
+        if (kv > b.elastic) kv = b.elastic;
+        if (exp < 0) exp = 0;
         b.experts  = exp;
         b.kv       = kv;
         b.weights  = b.statics + exp;
-        b.unusable = spare > 0 ? spare : 0;
+        b.unusable = std::max<int64_t>(b.elastic - kv - exp, 0);
     } else if (want_kv) {
         b.kv = b.kv_ceiling > 0 ? std::min(b.claimable, b.kv_ceiling) : b.claimable;
         b.unusable = b.claimable - b.kv;
@@ -214,7 +231,15 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
         const int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
                             RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-        if (2 * one < b.experts) {
+        if (b.lends && want_kv) {
+            /* A LENDING CACHE PAYS FOR IT: the experts are at their floor and a byte less would
+             * leave one with no tier, while the region is lent to the slab whenever the steps are
+             * small -- the same memory the cache would have lent. */
+            if (b.kv - 2 * one >= kv_one) {
+                b.stage = 2 * one;
+                b.kv   -= b.stage;
+            }
+        } else if (2 * one < b.experts) {
             b.stage    = 2 * one;
             b.experts -= b.stage;
             b.weights  = b.statics + b.experts;
@@ -244,7 +269,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                  "sequence's blocks stay held so the next turn can reuse them, so the demand is "
                  "live SESSIONS and not running requests -- when they do not all fit, the cache "
                  "evicts prefixes the next turn wanted and that turn re-prefills its whole "
-                 "context. --expert-vs-cache-ratio moves it.",
+                 "context. --host-pool-mib moves it: the experts the host pool cannot hold are the "
+                 "part of the card the cache cannot have.",
                  100.0 * paged_share(b),
                  (long long)cfg.max_seqs, (long long)cfg.max_ctx,
                  (double)cfg.max_seqs * paged_share(b));
@@ -262,13 +288,14 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * line is not padding: to_mib truncates, and what it drops is real VRAM that ends up beside
      * the headroom. */
     const int64_t granted   = cfg.vram_weights_mib * kMiB + cfg.vram_kv_mib * kMiB;
-    const int64_t unclaimed = b.capacity - b.already_held - b.arena - b.staging - b.queues - b.stage -
-                              granted;
+    const int64_t unclaimed = b.capacity - b.already_held - b.drift - b.arena - b.staging - b.queues -
+                              b.stage - granted;
     const double  ela       = b.elastic > 0 ? (double)b.elastic : 1.0;
     b.report = fmt(
         "VRAM budget, per card:\n"
         "  card total         %10s\n"
         "  already held       %10s   measured: driver context, code objects, anything else resident\n"
+        "  driver drift       %10s   what that moves by after it is read: kept free\n"
         "  activation arena   %10s   computed from the buffer plan\n"
         "  step staging       %10s   the step batch's block tables and media staging, and the\n"
         "                                  KV tiers' copy staging\n"
@@ -278,7 +305,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         "  claimable          %10s\n"
         "  static weights     %10s   %s\n"
         "  ------------------------------\n"
-        "  elastic            %10s   what --expert-vs-cache-ratio %.2f divides\n"
+        "  elastic            %10s   %s\n"
         "    experts          %10s   %.0f%% of it%s\n"
         "    kv cache         %10s   %.0f%% of it%s\n"
         "%s"
@@ -288,8 +315,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         "  vram_kv            %10s   %s\n"
         "  unclaimed          %10s   the headroom, the unusable above, and what MiB rounding\n"
         "                                  could not place\n",
-        humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.arena).c_str(),
-        humanb(b.staging).c_str(),
+        humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
+        humanb(b.arena).c_str(), humanb(b.staging).c_str(),
         humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
         shared ? "left to the host" : "--gpu-headroom-mib", humanb(b.headroom).c_str(),
         shared ? "integrated graphics: this memory is the host's; --vram-kv-mib states a pool "
@@ -300,8 +327,10 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.derived_weights ? "off the top: every rank's own shard, and not a share of anything"
                           : "(not charged here -- --vram-weights-mib was stated)",
         humanb(b.elastic).c_str(),
-        (cfg.expert_cache_ratio > 0.0 && cfg.expert_cache_ratio < 1.0) ? cfg.expert_cache_ratio
-                                                                       : 0.75,
+        b.lends ? "the experts keep what the host pool cannot hold; the cache takes the rest\n"
+                  "                                  and lends what no live request holds to the "
+                  "expert slab"
+                : "no lender: the experts first, the cache at least one full-length sequence",
         humanb(b.experts).c_str(), 100.0 * (double)b.experts / ela,
         b.expert_ceiling == 0
             ? " -- a dense model, so there is no expert plane for this share to fill and the\n"
@@ -339,10 +368,11 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                   "ceiling\n", humanb(b.unusable).c_str()).c_str()
             : "",
         b.stage > 0
-            ? fmt("    prefill staging  %10s   out of the experts: two buffers of one layer's "
+            ? fmt("    prefill staging  %10s   out of the %s: two buffers of one layer's "
                   "non-resident experts,\n"
                   "                                  at the arena's top and lent back to the "
-                  "slab while steps are small\n", humanb(b.stage).c_str()).c_str()
+                  "slab while steps are small\n", humanb(b.stage).c_str(),
+                  b.lends ? "cache" : "experts").c_str()
             : "",
         humanb(cfg.vram_weights_mib * kMiB).c_str(),
         b.derived_weights ? "static + experts" : "stated by --vram-weights-mib",

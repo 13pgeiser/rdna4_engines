@@ -22,6 +22,7 @@
 #pragma once
 #include "rad_core.h"
 #include "build/startup.h"
+#include "mem/hostarena.h"
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
 #include "sample/vocab_view.h"
@@ -121,7 +122,8 @@ private:
     /* --embedding-placement and --ngram-placement, resolved into Config before the card is split
      * (engine_bringup.cpp says how auto chooses). */
     int resolve_table_placement(const std::vector<VramFacts>& facts,
-                                const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
+                                const std::vector<int64_t>& emb_bytes,
+                                const std::vector<int64_t>& floor_emb_ram, int64_t kv_floor,
                                 int64_t ngram_bytes, bool ngram_device, bool ngram_host);
     /* --ngram-placement ram: the copy of the container's [src, src + n), file offset `foff`, made
      * once and shared by every rank -- locked for the host gather, or pinned for a device kernel
@@ -306,6 +308,15 @@ private:
      * and the scheduler's lock is held only around the bookkeeping. */
     void tier_tick();
     bool submit_fetch(uint64_t tag, std::vector<TierJob>&& jobs);
+    /* A MARK ON EVERY RANK'S STREAMS, for the disk thread to wait on before it touches a slot:
+     * the transfer streams' when `transfer`, the compute streams' when `compute`, in that order,
+     * one a rank each; `st` is the first failure to make one. destroy_fences gives them back on
+     * their own cards. */
+    std::vector<RadEvent> rank_fences(bool transfer, bool compute, int* st = nullptr);
+    void destroy_fences(std::vector<RadEvent>& f);
+    /* Every host copy that is waiting, issued and landed now. Under the scheduler's lock, from an
+     * eviction that would otherwise erase what the copies cover. True when any landed. */
+    bool flush_copies();
     uint64_t tier_last_ns_ = 0;
     /* THE LOAN: what the KV cache is not using, lent to every rank's expert slab at the addresses
      * the cache already owns (KVManager, the loan block). Here rather than inside the scheduler
@@ -327,19 +338,16 @@ private:
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;
-    /* WHETHER THIS DRIVER RETURNS DECOMMITTED VRAM TO THE CARD, for the checkpoint slots -- the
-     * one part of the KV pool still backed on demand. Measured once at the end of bringup; it is
-     * not something the API promises. */
-    bool     release_frees_card_ = true;
     /* WHAT THE VRAM BUDGET KEPT FOR ALLOCATIONS MADE AFTER start(), on top of --gpu-headroom-mib:
      * the step batch's staging, which serve() allocates, and what is built on first use, if
-     * ever -- the KV tiers' copy staging and the second compute lane's queue. The checkpoint
-     * slots backed at the end of bringup leave both free, and the bringup's closing reading is
-     * checked against both. */
+     * ever -- the KV tiers' copy staging and the second compute lane's queue. The bringup's
+     * closing reading is checked against both. */
     int64_t  late_step_bytes_ = 0;
     int64_t  late_lazy_bytes_ = 0;
-    /* Every rank's checkpoint floor: a slot is backed only while the card keeps `keep` free. */
-    void set_checkpoint_floors(int64_t keep);
+    /* THE LINEAR-STATE SNAPSHOT STORE: pinned host memory, --checkpoint-slots slots, each holding
+     * every rank's shard of one snapshot (KVManager::set_checkpoint_store). Not on the card: a
+     * snapshot is read by no kernel, only copied back into a sequence's state. */
+    HostArena ck_store_;
     int  run_server();
     /* THE KL MODE (core/kld.h), in place of run_server: the corpus's documents submitted as
      * scoring requests, and every step's scored rows copied to the host and handed to `kld_`.

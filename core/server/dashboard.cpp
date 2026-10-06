@@ -53,7 +53,7 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
     if (deps_.sched) deps_.sched->sessions(&v, &occ);
 
     int64_t dev = 0, host = 0, disk = 0, bytes = 0;
-    int64_t sdev = 0, shost = 0, sdisk = 0;
+    int64_t shost = 0, sdisk = 0;
     json a = json::array();
     for (const SessionStat& s : v) {
         json e;
@@ -69,17 +69,16 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         e["moving"]    = s.moving;
         /* THE RECURRENT HALF. On a hybrid model a session's attention blocks are only part of
          * what it needs back; the rest is its linear-state snapshots, which are a different size
-         * of object in a different store. Counted where the BYTES are, so a snapshot that stayed
-         * on the device while its blocks went to disk shows as exactly that. */
+         * of object in a different store. Counted where the BYTES are: in the store in host
+         * memory, or on disk alone. */
         e["snapshots"]   = s.snapshots;
-        e["snap_device"] = s.snap_device;
         e["snap_host"]   = s.snap_host;
         e["snap_disk"]   = s.snap_disk;
         e["snap_bytes"]  = s.snap_bytes;
         e["resume_tokens"] = s.resume_tokens;
         a.push_back(std::move(e));
         dev += s.on_device; host += s.on_host; disk += s.on_disk;
-        sdev += s.snap_device; shost += s.snap_host; sdisk += s.snap_disk;
+        shost += s.snap_host; sdisk += s.snap_disk;
         bytes += s.bytes;
     }
     o["sessions"] = std::move(a);
@@ -88,7 +87,7 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
      * a server carrying long agent transcripts by more than an order of magnitude. The field
      * names say so rather than pretending the sums are totals. */
     o["blocks_sum_overlapping"] = { { "device", dev }, { "host", host }, { "disk", disk } };
-    o["snapshots"] = { { "device", sdev }, { "host", shost }, { "disk", sdisk } };
+    o["snapshots"] = { { "host", shost }, { "disk", sdisk } };
     o["bytes_sum_overlapping"] = bytes;
     const SchedMetrics sm = deps_.sched ? deps_.sched->metrics() : SchedMetrics{};
     /* AND THE ONE FIGURE THAT IS NOT A SUM, because a view about what the conversations cost has
@@ -109,15 +108,14 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
                    { "fetched", c.fetched } };
     /* THE SNAPSHOT COUNTERS ARE NOT OPTIONAL ON A HYBRID MODEL, because a server that moves every
      * block it has and no snapshots at all looks identical in the block counters to one where
-     * tiering works -- and the difference is a full linear replay on every restored session.
-     * `starved` is the one to read when `to_host` stays at zero: it means the snapshot arena had
-     * no room, which --prefix-cache-host-mib fixes. */
-    o["snapshots_moved"] = { { "to_host", c.ck_to_host }, { "to_disk", c.ck_to_disk },
-                             { "promoted", c.ck_promoted }, { "fetched", c.ck_fetched },
-                             { "drops", c.ck_drops },
-                             { "starved", c.ck_starved }, { "bytes_each", c.ck_bytes },
+     * tiering works -- and the difference is a full linear replay on every restored session. */
+    o["snapshots_moved"] = { { "to_disk", c.ck_to_disk }, { "fetched", c.ck_fetched },
+                             { "drops", c.ck_drops }, { "bytes_each", c.ck_bytes },
                              { "host_slots", c.ck_host_slots },
                              { "disk_slots", c.ck_disk_slots } };
+    /* THE STEP THREAD'S TIME ON THE TIERS: every request waits through it. */
+    o["stall"] = { { "restores", c.restores }, { "restore_ms", (double)c.restore_ns / 1e6 },
+                   { "flushes", c.flushes }, { "flush_ms", (double)c.flush_ns / 1e6 } };
     /* AND WHETHER ANY OF IT IS BEING READ. Moving a snapshot and restoring it proves the bytes
      * travelled; this is the number that says a lookup then SERVED one. A hybrid server can move
      * snapshots all day and still replay from token zero if the checkpoint the restore put back
@@ -170,6 +168,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["kv_bytes_used"]   = (double)m.kv_bytes_used;
         o["kv_bytes_total"]  = (double)m.kv_bytes_total;
         o["kv_bytes_carved"] = (double)m.kv_bytes_carved;
+        o["kv_tokens_max"]   = m.kv_tokens_max;
         o["prefix_hit_rate"] = m.prefix_hit_rate;
         /* The leading indicator beside the lagging one: past ~75% kv utilisation the cache
          * begins dropping prefixes the next turn wants, and the hit rate only falls once
@@ -1484,6 +1483,10 @@ function meter(host, cls, title, idx, split) {
 const mKv = meter($("mem"), "meter", "KV cache", undefined, true);
 const mKvSub = el("div", "ksub");
 mKv.wrap.appendChild(mKvSub);
+/* AND HOW FAR IT CAN GROW: every block of the carve, the ones lent to the expert slab taken
+   back -- which a request that needs them does, the same step. */
+const mKvMax = el("div", "ksub");
+mKv.wrap.appendChild(mKvMax);
 const mPc = meter($("mem"), "meter", "Prefix hits");
 /* `hot` is for a meter whose ceiling is a FAILURE -- KV utilisation near 100% preempts. A device
  * VRAM bar near 100% is the engine doing its job, so it passes false and stays neutral. */
@@ -1729,7 +1732,8 @@ function update(s, dt) {
      of the pool is not among them: it is the bar in the memory panel, and repeating it here cost
      the line that says how much context the bytes are actually holding. */
   $("m-kvdet").textContent = s.kv_bytes_total > 0
-      ? "of " + hb(s.kv_bytes_total) + "  ·  " + cnt3(s.kv_tokens_used) + " tok"
+      ? "of " + hb(s.kv_bytes_total) + " (max " + hb(s.kv_bytes_carved || 0) + ")  ·  "
+        + cnt3(s.kv_tokens_used) + " tok"
         + (kvGave > 0 ? "  ·  " + hb(kvGave) + " lent to experts" : "")
       : "";
   setMetric("accept",  100 * s.draft_accept,
@@ -1768,6 +1772,10 @@ function update(s, dt) {
      from it, the second is context nothing is reading and the next eviction frees. */
   mKvSub.textContent = s.kv_tokens_used > 0
       ? cnt3(kvLive) + " tok read by running requests  ·  " + cnt3(kvCached) + " kept for reuse"
+      : "";
+  mKvMax.textContent = s.kv_tokens_max > 0
+      ? "can grow to " + hb(s.kv_bytes_carved || 0) + "  ·  " + cnt3(s.kv_tokens_max)
+        + " tok, with what the experts borrowed taken back"
       : "";
   mPc.v.textContent = pct(s.prefix_hit_rate); setBar(mPc.i, s.prefix_hit_rate, false);
 

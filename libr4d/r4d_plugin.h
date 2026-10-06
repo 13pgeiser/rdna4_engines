@@ -227,7 +227,10 @@ int     r4d_rad_moe_scatter        (const RadArgs*, RadStream);
 int     r4d_rad_router_topk_scatter(const RadArgs*, RadStream);
 int r4d_rad_router_topk_scatter_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 /* The router GEMM, the selection and the sort in one launch, the shared gate optionally beside
- * them (R4D_ROUTER_FUSED in rad_block_moe_fp8.h). */
+ * them. init takes the instance's arrival counter (r4d_moe.hip, THE ARRIVAL COUNTER) and fini
+ * gives it back; a launch with no instance is refused. */
+int  r4d_rad_router_gemm_topk_scatter_init(const RadParam*, int, int rank, int world, void** out);
+void r4d_rad_router_gemm_topk_scatter_fini(void*);
 int     r4d_rad_router_gemm_topk_scatter(const RadArgs*, RadStream);
 int r4d_rad_router_gemm_topk_scatter_describe(const RadArgs*, RadStream, RadLaunchDesc*, int,
                                               int*);

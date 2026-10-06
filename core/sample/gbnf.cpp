@@ -83,9 +83,17 @@ std::pair<uint32_t, const char*> decode_utf8(const char* src) {
 
 std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(const std::string& src,
                                                          PartialUtf8 partial_start) {
+    std::vector<uint32_t> cps;
+    const PartialUtf8 p = decode_utf8(src, partial_start, &cps);
+    return { std::move(cps), p };
+}
+
+PartialUtf8 decode_utf8(const std::string& src, PartialUtf8 partial_start,
+                        std::vector<uint32_t>* out) {
     static const int lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4 };
     const char* pos = src.c_str();
-    std::vector<uint32_t> cps;
+    std::vector<uint32_t>& cps = *out;
+    cps.clear();
     cps.reserve(src.size() + 1);
 
     uint32_t value    = partial_start.value;
@@ -95,7 +103,7 @@ std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(const std::string& src
         const uint8_t next_byte = (uint8_t)*pos;
         if ((next_byte >> 6) != 2) {
             cps.push_back(0);
-            return { std::move(cps), PartialUtf8{ 0, -1 } };
+            return PartialUtf8{ 0, -1 };
         }
         value = (value << 6) + (next_byte & 0x3F);
         ++pos;
@@ -110,7 +118,7 @@ std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(const std::string& src
         if (n_remain < 0) {
             cps.clear();
             cps.push_back(0);
-            return { std::move(cps), PartialUtf8{ 0, n_remain } };
+            return PartialUtf8{ 0, n_remain };
         }
         const uint8_t mask = (uint8_t)((1 << (7 - n_remain)) - 1);
         value = first_byte & mask;
@@ -123,7 +131,7 @@ std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(const std::string& src
         if (n_remain == 0) cps.push_back(value);
     }
     cps.push_back(0);
-    return { std::move(cps), PartialUtf8{ value, n_remain } };
+    return PartialUtf8{ value, n_remain };
 }
 
 }  /* namespace gbnf */
@@ -830,21 +838,72 @@ struct GbnfState {
     }
 };
 
+/* A STATE AS fill_mask HOLDS IT, NOT COPIED: the stacks through pointers, in the order the key
+ * sorts them into. It hashes and compares as the GbnfState it would become, so the cache is
+ * probed without building a key -- a copy of every stack, per mask -- and one is built only for a
+ * mask that is stored. */
+struct GbnfStateView {
+    const std::vector<const GbnfStack*>* stacks;
+    PartialUtf8                          partial;
+    bool                                 allow_eog;
+    int64_t                              words;
+};
+
 struct GbnfStateHash {
-    size_t operator()(const GbnfState& k) const {
+    using is_transparent = void;
+
+    template <class Stacks, class Deref>
+    static size_t hash(const Stacks& stacks, Deref deref, PartialUtf8 partial, bool allow_eog,
+                       int64_t words) {
         size_t h = 1469598103934665603ull;
         auto mix = [&h](size_t v) { h ^= v; h *= 1099511628211ull; };
-        for (const GbnfStack& s : k.stacks) {
+        for (const auto& x : stacks) {
+            const GbnfStack& s = deref(x);
             mix(s.size());
             for (const GbnfElement* e : s) mix((size_t)e);
         }
-        mix(k.partial.value);
-        mix((size_t)(k.partial.n_remain + 1));
-        mix(k.allow_eog ? 1u : 0u);
-        mix((size_t)k.words);
+        mix(partial.value);
+        mix((size_t)(partial.n_remain + 1));
+        mix(allow_eog ? 1u : 0u);
+        mix((size_t)words);
         return h;
     }
+    size_t operator()(const GbnfState& k) const {
+        return hash(k.stacks, [](const GbnfStack& s) -> const GbnfStack& { return s; },
+                    k.partial, k.allow_eog, k.words);
+    }
+    size_t operator()(const GbnfStateView& k) const {
+        return hash(*k.stacks, [](const GbnfStack* s) -> const GbnfStack& { return *s; },
+                    k.partial, k.allow_eog, k.words);
+    }
 };
+
+struct GbnfStateEq {
+    using is_transparent = void;
+
+    bool operator()(const GbnfState& a, const GbnfState& b) const { return a == b; }
+    bool operator()(const GbnfStateView& v, const GbnfState& k) const {
+        if (k.allow_eog != v.allow_eog || k.words != v.words ||
+            k.partial.value != v.partial.value || k.partial.n_remain != v.partial.n_remain ||
+            k.stacks.size() != v.stacks->size())
+            return false;
+        for (size_t i = 0; i < k.stacks.size(); ++i)
+            if (k.stacks[i] != *(*v.stacks)[i]) return false;
+        return true;
+    }
+    bool operator()(const GbnfState& k, const GbnfStateView& v) const { return (*this)(v, k); }
+};
+
+/* The key a view becomes, for storing. */
+static GbnfState state_of(const GbnfStateView& v) {
+    GbnfState k;
+    k.stacks.reserve(v.stacks->size());
+    for (const GbnfStack* s : *v.stacks) k.stacks.push_back(*s);
+    k.partial   = v.partial;
+    k.allow_eog = v.allow_eog;
+    k.words     = v.words;
+    return k;
+}
 
 struct GbnfProgram {
     GbnfRuleSet        rules;
@@ -864,7 +923,7 @@ struct GbnfProgram {
      * speculative window revisiting a state the work again. */
     mutable std::mutex mu;
     struct Entry { std::vector<uint32_t> mask; uint64_t used = 0; };
-    mutable std::unordered_map<GbnfState, Entry, GbnfStateHash> masks;
+    mutable std::unordered_map<GbnfState, Entry, GbnfStateHash, GbnfStateEq> masks;
     mutable uint64_t clock = 0;
 
     /* A tool-calling schema's working set is on the order of a hundred states; 512 is room for a
@@ -873,7 +932,7 @@ struct GbnfProgram {
      * that was computed. */
     static constexpr size_t kMaxMasks = 512;
 
-    bool lookup(const GbnfState& k, uint32_t* dst, int64_t n_words) const {
+    bool lookup(const GbnfStateView& k, uint32_t* dst, int64_t n_words) const {
         std::lock_guard<std::mutex> lk(mu);
         auto it = masks.find(k);
         if (it == masks.end()) return false;
@@ -1157,29 +1216,42 @@ int GbnfGrammar::accept_token_piece(int32_t token, const std::string& piece) {
         RAD_WARN("gbnf: token %d cannot be accepted: %s; the request cannot be continued",
                  token, e.what());
         stacks_.clear();
+        at_ = At{};
         return RAD_E_FULL;
     } catch (const std::bad_alloc&) {
         RAD_ERR("gbnf: out of memory accepting token %d; the request cannot be continued", token);
         stacks_.clear();
+        at_ = At{};
         return RAD_E_NOMEM;
     }
 }
 
 int GbnfGrammar::accept_token_piece_impl(int32_t token, const std::string& piece) {
-    const auto decoded = decode_utf8(piece, partial_utf8_);
-    const auto& cps = decoded.first;
+    const PartialUtf8 partial = decode_utf8(piece, partial_utf8_, &cps_);
+    const size_t      n_cps   = cps_.size() - 1;     /* the terminating 0 is not a code point */
 
     OpWork     work;
     GbnfStacks new_stacks;
     SetBuild   new_set(work);
-    new_stacks.reserve(stacks_.size());
 
     /* THE STACKS THAT MATCH CODE POINTS ARE ADVANCED TOGETHER, one code point at a time, as
      * accept_str does. Advancing each through the whole piece on its own gives the same set --
      * the union of the parts is the part of the union -- but when many stacks converge on one
      * continuation, as every alternative of a wide rule does once it matches, each of them
-     * re-expands that continuation, and the token costs the square of the width. */
-    GbnfStacks current;
+     * re-expands that continuation, and the token costs the square of the width.
+     *
+     * AND THEY ARE ADVANCED THROUGH THE MASK PLAN'S AUTOMATON (plan_step), which holds each stack
+     * set as a state with its successors memoised per interval of code points. The set is the
+     * one accept_chr builds; what changes is that a state seen before -- the same free-text
+     * value, token after token -- is a lookup per code point rather than every closure rebuilt,
+     * allocated and de-duplicated again. The set comes back sorted, which nothing reads: the
+     * mask cache sorts its key, and a mask is a union over the stacks.
+     *
+     * The new set is written over the one the previous token left (`spare_`) and the two are
+     * swapped, so a set of the same shape, token after token, allocates nothing; and when the
+     * automaton says the token left the set the state it was -- the steady state of a free-text
+     * value -- the set is not touched at all. */
+    current_.clear();
     for (const auto& stack : stacks_) {
         if (stack.empty()) continue;
         const GbnfElement* pos = stack.back();
@@ -1190,19 +1262,37 @@ int GbnfGrammar::accept_token_piece_impl(int32_t token, const std::string& piece
             if (!is_end_of_sequence(pos + 1)) next.push_back(pos + 1);
             advance_stack(prog_->rules, next, new_stacks, new_set);
         } else {
-            current.push_back(stack);
+            current_.push_back(&stack);
         }
     }
-    for (auto it = cps.begin(), end = cps.end() - 1; it != end && !current.empty(); ++it) {
-        GbnfStacks next;
-        SetBuild   next_set(work);
-        for (const auto& cs : current) accept_chr(prog_->rules, cs, *it, next, next_set);
-        current = std::move(next);
+    GbnfStacks& out = spare_;
+    if (n_cps > 0 && !current_.empty()) {
+        /* `at_` names a state only when every stack steps over code points, so with it known no
+         * stack matched a token terminal above and the set is the stepped stacks alone. */
+        gbnf::PlanState at{ at_.gen, at_.id };
+        const bool same = gbnf::plan_step(*prog_->plan, current_, &at, cps_.data(), n_cps, &out,
+                                          work);
+        at_ = At{ at.gen, at.id };
+        if (same) {
+            partial_utf8_ = partial;
+            return RAD_OK;
+        }
+    } else {
+        out.resize(current_.size());
+        for (size_t i = 0; i < current_.size(); ++i) out[i].assign(current_[i]->begin(),
+                                                                   current_[i]->end());
+        at_ = At{};
     }
-    for (auto& s : current) new_set.insert(new_stacks, std::move(s));
-
-    stacks_ = std::move(new_stacks);
-    partial_utf8_ = decoded.second;
+    /* What a token terminal matched goes first, then the rest without the ones it already holds;
+     * with nothing matched by token, `out` is the set as it stands -- a state of the automaton,
+     * or a subset of the set before, and either way without duplicates. */
+    if (!new_stacks.empty()) {
+        for (auto& s : out) new_set.insert(new_stacks, std::move(s));
+        out.swap(new_stacks);
+        at_ = At{};
+    }
+    stacks_.swap(out);
+    partial_utf8_ = partial;
 
     if (stacks_.empty()) {
         /* NOT AN ERROR HERE, WHICH IS WHY IT LOGS AT DEBUG. This is reached as a matter of course
@@ -1290,6 +1380,7 @@ int GbnfGrammar::accept_token(int32_t token) {
 int GbnfGrammar::accept_str(const std::string& piece) {
     const auto decoded = decode_utf8(piece, partial_utf8_);
     const auto& cps = decoded.first;
+    at_ = At{};
 
     try {
         OpWork work;
@@ -1318,7 +1409,7 @@ int GbnfGrammar::accept_str(const std::string& piece) {
 
 
 void GbnfGrammar::push_state() {
-    saved_.push_back(Snapshot{ stacks_, partial_utf8_, awaiting_trigger_, scan_, recent_ });
+    saved_.push_back(Snapshot{ stacks_, partial_utf8_, awaiting_trigger_, scan_, recent_, at_ });
 }
 
 int GbnfGrammar::rollback() {
@@ -1332,19 +1423,9 @@ int GbnfGrammar::rollback() {
     awaiting_trigger_         = s.awaiting_trigger;
     scan_                     = s.scan;
     recent_                   = std::move(s.recent);
+    at_                       = s.at;
     saved_.pop_back();
     return RAD_OK;
-}
-
-/* The cache key for the state the machine is in right now. */
-GbnfState GbnfGrammar::state_key(bool allow_eog, int64_t n_words) const {
-    GbnfState k;
-    k.stacks    = stacks_;
-    k.partial   = partial_utf8_;
-    k.allow_eog = allow_eog;
-    k.words     = n_words;
-    std::sort(k.stacks.begin(), k.stacks.end());
-    return k;
 }
 
 /* The mask for the current state, with no memo. */
@@ -1391,8 +1472,14 @@ int GbnfGrammar::fill_mask(uint32_t* bitmask, int64_t n_words) const {
      * because a collision accepted on the hash alone would hand back a mask for a state the
      * sequence is not in and admit the wrong token set. The key sorts the stacks: two requests
      * that reach the same state by the same path produce the same order anyway, but the sort is
-     * what makes that a guarantee rather than an observation. */
-    const GbnfState key = state_key(complete(), n_words);
+     * what makes that a guarantee rather than an observation. The probe sorts pointers to the
+     * stacks, in storage of the calling thread's own, and copies them only to store. */
+    thread_local std::vector<const GbnfStack*> sorted;
+    sorted.clear();
+    for (const GbnfStack& s : stacks_) sorted.push_back(&s);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const GbnfStack* a, const GbnfStack* b) { return *a < *b; });
+    const GbnfStateView key{ &sorted, partial_utf8_, complete(), n_words };
     if (prog_->lookup(key, bitmask, n_words)) return RAD_OK;
 
     prog_->computed.fetch_add(1, std::memory_order_relaxed);
@@ -1400,7 +1487,7 @@ int GbnfGrammar::fill_mask(uint32_t* bitmask, int64_t n_words) const {
     if (st < 0) return st;
 
     /* Store only a mask that stands: a dead state is not worth an entry and returns above. */
-    prog_->store(key, bitmask, n_words);
+    prog_->store(state_of(key), bitmask, n_words);
     return RAD_OK;
 }
 

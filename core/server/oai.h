@@ -290,6 +290,11 @@ std::string chat_usage_chunk(const OaiRequest& r, const UsageOut& u,
 /* The `timings` object, for a stream's final chunks. */
 json timings_json(const TimingsOut& t);
 
+/* Whether a parsed reply's calls are all calls a client can run: none left open, each named,
+ * each one's arguments one JSON value (json_partial.h). A reply is answered `tool_calls` by this
+ * alone, streamed or not. */
+bool calls_complete(const ParsedMessage& m);
+
 /* ================================================================== streaming
  *
  * One of these per choice. It feeds the generated text to the choice's reply reader as it grows
@@ -322,6 +327,14 @@ public:
 private:
     std::string chunk(json delta, const char* finish_reason, const TimingsOut* t = nullptr);
     std::string emit(const std::vector<ReplyDelta>& ev);
+
+    /* A delta's chunk is written, not built: the frame around the delta object is the same in
+     * every one, so it is serialised once, and the delta between is written with
+     * json_quote_append. The bytes are the ones chunk() writes for the same delta. */
+    void delta_open(std::string& out);
+    void delta_close(std::string& out) const;
+    static void quote(std::string& out, std::string_view s);
+    std::string head_;     /* `data: {...,"choices":[{"index":N,"delta":`, built on first use */
 
     std::unique_ptr<IReplyReader> reader_;
     std::string id_, model_;

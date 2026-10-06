@@ -388,9 +388,29 @@ struct FakePC : IPrefixCache {
         ++evict_calls;
         if (evict_grant <= 0) return 0;
         int64_t took = n < evict_grant ? n : evict_grant;
+        if (evict_frees) {
+            /* An entry is one block in every cached group: give that many back to the pool. */
+            int64_t have = seeded.empty() ? 0 : (int64_t)seeded[0].size();
+            took = std::min(took, have);
+            for (size_t i = 0; i < groups.size() && i < seeded.size(); ++i)
+                for (int64_t k = 0; k < took; ++k) {
+                    kv->release(groups[i], seeded[i].back());
+                    seeded[i].pop_back();
+                }
+        }
         evict_grant -= took;
         evicted += took;
         return took;
+    }
+    bool evict_frees = false;    /* evict() returns the seeded blocks to the pool */
+    std::vector<uint64_t> holds, releases;
+    void hold(const Request& r) override { holds.push_back(r.id); }
+    void release(const Request& r) override { releases.push_back(r.id); }
+    /* What the reserve asked for, call by call. */
+    std::vector<int64_t> trims;
+    int64_t trim(int64_t n) override {
+        trims.push_back(n);
+        return 0;
     }
     /* Cumulative, like the real cache's: the scheduler publishes it as a counter and the
      * server takes deltas, so a fake that reported per-call would read as a cache that
@@ -402,7 +422,11 @@ struct FakePC : IPrefixCache {
         return ((pos / interval) + 1) * interval;
     }
     std::vector<int64_t> committed;
-    void commit_checkpoint(const Request&, int64_t pos) override { committed.push_back(pos); }
+    std::vector<int64_t> resumed;                    /* the commits marked as resume points */
+    void commit_checkpoint(const Request&, int64_t pos, bool resume) override {
+        committed.push_back(pos);
+        if (resume) resumed.push_back(pos);
+    }
     int reserve_checkpoint(const Request&, int64_t, int32_t* slot_out) override {
         ++reserved;
         *slot_out = next_slot++;
@@ -618,10 +642,23 @@ TEST(prefill_chunks_split_at_the_checkpoint_interval) {
     CHECK_EQ(f.sch.plan_chunk(256, 1000, 512, &ck), 256);
     CHECK_EQ(ck, 512);
 
-    /* The final chunk is allowed to be short -- that is the accepted cost of owning the
-     * boundaries -- and writes no checkpoint because it does not reach one. */
-    CHECK_EQ(f.sch.plan_chunk(768, 1000, 512, &ck), 232);
+    /* The final chunk ends at the prompt's last quantum boundary and writes a checkpoint there:
+     * the next turn of a conversation resumes from it instead of from 768. The remainder, under a
+     * quantum, is the chunk after it and writes none -- that is the accepted cost of owning the
+     * boundaries. */
+    CHECK_EQ(f.sch.plan_chunk(768, 1000, 512, &ck), 192);
+    CHECK_EQ(ck, 960);
+    CHECK_EQ(f.sch.plan_chunk(960, 1000, 512, &ck), 40);
     CHECK_EQ(ck, -1);
+    /* A prompt that ends less than a quantum past where the chunk starts has no boundary to
+     * split at, and one inside the first interval is cheap enough to prefill again. */
+    CHECK_EQ(f.sch.plan_chunk(768, 830, 512, &ck), 62);
+    CHECK_EQ(ck, -1);
+    CHECK_EQ(f.sch.plan_chunk(0, 200, 512, &ck), 200);
+    CHECK_EQ(ck, -1);
+    /* And a prompt ending on a quantum boundary takes its checkpoint at the end, unsplit. */
+    CHECK_EQ(f.sch.plan_chunk(768, 960, 512, &ck), 192);
+    CHECK_EQ(ck, 960);
 
     /* A budget short of the interval still ends on a quantum, never in the middle of a tile. */
     CHECK_EQ(f.sch.plan_chunk(0, 1000, 100, &ck), 64);
@@ -782,6 +819,23 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     f.commit_plain();
     CHECK_EQ((int)f.pc.committed.size(), 1);
     CHECK_EQ(f.pc.committed[0], 512);        /* ctx_len 256 + ckpt_tok 255 + 1 */
+}
+
+/* THE DEEPEST CHECKPOINT A PROMPT GETS IS ITS RESUME POINT, and it alone is committed as one: it is
+ * the state the next turn resumes from, and the tiers copy it off the card at once rather than
+ * with the rest of the conversation at its publish. */
+TEST(only_a_prompt_s_deepest_checkpoint_is_its_resume_point) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(1000, 8);
+    for (int i = 0; i < 64 && f.sch.find(a)->n_computed < 1000; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    REQUIRE(f.pc.committed.size() >= 2u);
+    REQUIRE_EQ(f.pc.resumed.size(), 1u);
+    CHECK_EQ(f.pc.resumed[0], f.pc.committed.back());
 }
 
 /* A hit that skipped tokens with no snapshot to resume from is the corruption this whole mechanism
@@ -2031,6 +2085,63 @@ TEST(the_cache_trim_does_not_mistake_released_vram_for_occupancy) {
     f.commit_plain();                                /* finishes and publishes */
     CHECK_EQ((int)f.pc.published.size(), 1);
     CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK(f.pc.trims.empty());
+}
+
+/* WHEN LIVE SEQUENCES HOLD MORE THAN THE RESERVE ALLOWS, THE TRIM ASKS FOR THE SHORTFALL ONCE.
+ * Nothing the cache can give closes it entirely, and a loop that kept evicting until it did would
+ * take the conversation this close has just published along with everything else on the list. */
+TEST(the_cache_trim_asks_for_the_shortfall_and_not_for_the_whole_cache) {
+    Fixture f;
+    f.build(/*blocks=*/40, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.evict_grant = 1 << 20;
+
+    f.submit(160, /*max_tokens=*/1);                 /* 10 blocks, finishes on the first commit */
+    f.submit(176, /*max_tokens=*/64);                /* 11 blocks each, still running after it */
+    f.submit(176, /*max_tokens=*/64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.kv.held_blocks(0), 32ll);             /* 8 free against a reserve of 10 */
+    f.commit_plain();
+    CHECK_EQ((int)f.pc.published.size(), 1);
+    REQUIRE(f.pc.trims.size() == 1u);
+    CHECK_EQ(f.pc.trims[0], 2ll);
+    CHECK_EQ(f.pc.evict_calls, 0);
+}
+
+/* THE CACHE GIVES WAY TO A NEW REQUEST AS IT DOES TO A RUNNING ONE. With nothing running, no
+ * other path takes blocks back from the cache, and a pool full of finished conversations would
+ * keep the request waiting for good. */
+TEST(an_admission_short_of_blocks_takes_them_from_the_cache) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed(240);                                  /* 15 of 20 held by finished conversations */
+    f.pc.attn = 0;                                   /* and none of them is this prompt */
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 1 << 20;
+    const uint64_t a = f.submit(160, 8);             /* 10 blocks, 5 free */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK(f.pc.evict_calls >= 1);
+    CHECK(f.pc.holds.empty());
+}
+
+/* A REFUSED ADMISSION HOLDS WHAT ITS RESTORE BROUGHT BACK, and lets go once the request is gone,
+ * so the next attempt finds the chain on the card instead of copying it again. */
+TEST(a_refused_admission_holds_its_chain_until_the_request_goes) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 0;
+    const uint64_t a = f.submit(160, 8);             /* the cache gives nothing back */
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Waiting);
+    REQUIRE_EQ(f.pc.holds.size(), 1u);
+    CHECK_EQ(f.pc.holds[0], a);
+    CHECK_OK(f.sch.cancel(a));
+    CHECK(std::find(f.pc.releases.begin(), f.pc.releases.end(), a) != f.pc.releases.end());
 }
 
 /* AN ENGINE THAT HAS STOPPED ANSWERS EVERY REQUEST IT HELD AND REFUSES NEW ONES, rather than

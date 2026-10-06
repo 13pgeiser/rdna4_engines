@@ -69,16 +69,28 @@ std::string byte_encode(std::string_view raw) {
  * user-defined token spelt in real text needs; it cannot be confused with a mapped one because
  * the mapped set is closed. */
 std::string byte_decode(const std::string& enc) {
+    /* Unit by unit, a unit being what the lead byte says, cut short at the end. A unit is mapped
+     * iff it is exactly some byte's spelling in the alphabet -- one ASCII byte, or a two-byte
+     * sequence (lead C2..DF, a continuation byte) whose code point is below U+0144 -- so the
+     * code point table answers what a lookup of the unit's bytes in `from` would, without
+     * building a string per character. Anything else is passed through as its own bytes. */
     const ByteLevelAlphabet& a = alphabet();
+    const uint8_t* p = (const uint8_t*)enc.data();
+    const size_t   n = enc.size();
     std::string out;
-    out.reserve(enc.size());
-    for (size_t i = 0; i < enc.size(); ) {
-        const size_t n = std::min(unicode_len_utf8(enc[i]), enc.size() - i);
-        const std::string one = enc.substr(i, n);
-        auto it = a.from.find(one);
-        if (it != a.from.end()) out += (char)it->second;
-        else                    out += one;
-        i += n;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ) {
+        const size_t len = std::min(unicode_len_utf8(enc[i]), n - i);
+        int b = -1;
+        if (len == 1 && p[i] < 0x80) {
+            b = a.byte_of_cpt[p[i]];
+        } else if (len == 2 && p[i] >= 0xC2 && (p[i + 1] & 0xC0) == 0x80) {
+            const uint32_t c = ((uint32_t)(p[i] & 0x1F) << 6) | (p[i + 1] & 0x3F);
+            if (c < 0x144) b = a.byte_of_cpt[c];
+        }
+        if (b >= 0) out += (char)b;
+        else        out.append(enc, i, len);
+        i += len;
     }
     return out;
 }
@@ -1568,14 +1580,15 @@ std::string utf8_sanitize(std::string_view s) {
 std::string Detokenizer::push(int32_t token) {
     if (!v_ || !v_->ready() || stopped_) return {};
 
-    Tokenizer t;
-    /* Constructing a Tokenizer per push looks wasteful and is not: it holds a shared_ptr and
-     * nothing else, and piece() is a pure function of the vocab. Keeping one as a member would
-     * make Detokenizer non-copyable for no gain. */
-    if (t.init(std::const_pointer_cast<Vocab>(std::const_pointer_cast<const Vocab>(v_))) < 0)
-        return {};
-
-    std::string p = t.piece(token, render_special_ || preserved_.count(token) != 0);
+    /* One Tokenizer for the stream, set up on the first push: it holds the vocab's shared_ptr
+     * and nothing else, and piece() is a pure function of the vocab, so one built per push only
+     * added a reference-count round trip to every token. */
+    if (!tok_ready_) {
+        if (tok_.init(v_) < 0) return {};
+        tok_ready_ = true;
+    }
+    std::string p = tok_.piece(token, render_special_ ||
+                                          (!preserved_.empty() && preserved_.count(token) != 0));
 
     /* HuggingFace's decoders strip the leading space that Metaspace's prepend added. Only the
      * first piece of a stream can carry it, which is why this is a member flag and not a
@@ -1613,9 +1626,10 @@ std::string Detokenizer::push(int32_t token) {
 
     const size_t cut = safe_prefix();
     if (cut == 0) return {};
-    std::string out = pending_.substr(0, cut);
+    /* Sanitised straight out of pending_, which keeps its storage for the next token. */
+    std::string out = utf8_sanitize(std::string_view(pending_).substr(0, cut));
     pending_.erase(0, cut);
-    return utf8_sanitize(out);
+    return out;
 }
 
 std::string Detokenizer::flush() {

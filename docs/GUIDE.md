@@ -409,39 +409,38 @@ outright:
 radiance --model m.rad --vram-weights-mib 24000 --vram-kv-mib 6000
 ```
 
-or let the engine derive it from the card and tell it only the ratio:
+or leave both unset and let the engine derive it from the card. The non-expert weights come off
+the top of what is claimed. The rest — the `elastic` line of the startup receipt — is shared by
+the expert slab and the KV cache, and no flag divides it:
 
-```sh
-radiance --model m.rad --expert-vs-cache-ratio 0.82
-```
+- **The cache lends** under `--placement auto` or `expert_tiered`, without `--deterministic`, on a
+  device with virtual memory management. The experts keep on the card exactly what the pinned host
+  pool (`--host-pool-mib`) cannot hold, plus one expert unit of packing slack; they have nowhere
+  else to be. The cache takes everything else, up to what it could ever address
+  (`--max-num-seqs` x `--max-model-len`), and every block no live request holds is lent back to the
+  expert slab in place. The prefill staging region comes out of the cache's side.
+- **Without a lender** — `--deterministic`, a stated `--placement all_vram` or `layer_offload`, or
+  no virtual memory management — a block the cache does not use would sit empty, so the experts
+  come first and the cache keeps one `--max-model-len` sequence.
 
-`--expert-vs-cache-ratio` is the **weights** share of what is claimed. 0.75 (the default) gives
-three quarters to weights and a quarter to KV.
+The cache never gets less than one `--max-model-len` sequence, and when both sides fit, both are
+whole. With a lending cache, `--host-pool-mib` is what moves the split: a larger pool takes experts
+off the card and gives the cache more.
 
-**This flag decides whether multi-turn works, which is more than the split it names.** The KV side
-is not only concurrency: prefix caching holds a finished sequence's blocks so the next turn can
-reuse them. When the pool cannot hold the *live sessions*, the cache drops prefixes the next turn
-wanted and that turn re-prefills its whole context. At long contexts that is two orders of magnitude
-of time-to-first-token, bought back for a fraction of a percent of the decode step.
-
-Measured on Qwen3.8-Flash-Next at a 200K context, two ~184K-token sessions, byte-identical text:
-
-| ratio | turn 1 | turn 2 | prefix hit |
-|---|---|---|---|
-| 0.87 | 207.4 s | 173.0 s | 0.0% |
-| 0.82 | 227.7 s | **3.0 s** | 99.0% |
-
-Same model, same prompts. The only difference is whether the pool could hold both sessions. 57x on
-the second turn, paid for with ~10% on the cold first turn and ~1.4% of the decode step — experts
-lose 5% of the elastic pool and the MoE GEMM is residency-bound.
-
-The cliff is sharp and it is worth knowing where: at this shape 0.84 is **not** enough (49.7% hit,
-one of the two sessions), and watching `kv_util` finds it — between 0.75 and 0.81 of the pool the
-hit rate falls from 80.7% to 49.4%.
+**The cache's size decides whether multi-turn works.** The KV side is not only concurrency: prefix
+caching holds a finished sequence's blocks so the next turn can reuse them. When the pool cannot
+hold the *live sessions*, the cache drops prefixes the next turn wanted and that turn re-prefills
+its whole context. At long contexts that is two orders of magnitude of time-to-first-token.
+Measured on Qwen3.8-Flash-Next at a 200K context with two ~184K-token sessions and byte-identical
+text, the second turn took 173.0 s at a 0.0% prefix hit with a pool that could not hold both
+sessions, and 3.0 s at 99.0% with one that could. The fall-off is sharp, and `kv_util` shows a
+pool approaching it.
 
 To size it yourself: work out what a token of context costs across **all** paged groups for your
 model (the startup log prints this), multiply by the context you actually serve, multiply by the
-sessions you want live at once, and give the KV side at least that.
+sessions you want live at once, and compare that with the cache the receipt reports. The cache
+already has everything the experts can do without; a larger `--host-pool-mib` (RAM permitting) or
+`--kv-cache-dtype fp8` gives it more.
 
 Worked, on Qwen3.8-Flash-Next: two paged groups share one token axis — `kv_attn` at 26.00 KiB and
 `kv_qsa_bkey` at 3.25 KiB per 4-token block — so a token of context costs **7.32 KiB**, and a
@@ -564,8 +563,7 @@ holds at that price.
 ### 4.4 Long context
 
 ```sh
-radiance --model m.rad --max-model-len 200000 --kv-cache-dtype fp8 \
-         --expert-vs-cache-ratio 0.82 --max-num-seqs 8
+radiance --model m.rad --max-model-len 200000 --kv-cache-dtype fp8 --max-num-seqs 8
 ```
 
 `--max-model-len` does not reserve anything per request — it sets the worst case the pool is sized
@@ -584,11 +582,10 @@ per sequence whether it is used or not:
 
 - **Recurrent state.** On a hybrid model every sequence owns its delta-net state, and with
   speculation two copies of it. Qwen3.8-Flash-Next keeps 54 MiB a copy on each card, so 32
-  sequences take 3.4 GiB of the cache share before a single token is cached. At
-  `--expert-vs-cache-ratio 0.82` the attention cache then holds about 116K tokens, less than one
-  200K request, and startup warns that a longer one would be refused; 0.78 brings it back, and the
-  experts it moves off the card cost single-stream decode about 15%. The 27B in bf16 lands at
-  117K the same way. The 27B in FP8 holds 2.8 full-length sessions at 32, the 35B-A3B ten.
+  sequences take 3.4 GiB of the cache share before a single token is cached. The 27B in bf16,
+  with no experts to give way, then holds about 117K tokens of attention cache, less than one 200K
+  request, and startup warns that a longer one would be refused. The 27B in FP8 holds 2.8
+  full-length sessions at 32, the 35B-A3B ten.
 - **Block tables.** The step batch's tables are carved for every sequence at the full context.
   They are charged to the VRAM budget (`step staging` in the startup receipt), so they come out of
   the cache share and not out of `--gpu-headroom-mib`.
@@ -763,18 +760,21 @@ radiance --model m.rad \
     --prefix-cache-disk-mib 65536 --prefix-cache-dir /var/cache/radiance
 ```
 
-- `--prefix-cache-host-mib N` — **this is the switch.** Without a size, nothing is copied. Part of
-  it goes to linear-state snapshots on a hybrid model; startup says how many. Size it for the
-  conversations you expect to come back: one that does not fit comes back from disk instead.
+- `--prefix-cache-host-mib N` — **this is the switch.** Without a size, nothing is copied. It holds
+  attention blocks only; a hybrid model's linear-state snapshots are in host memory already, in the
+  `--checkpoint-slots` store. Size it for the conversations you expect to come back: one that does
+  not fit comes back from disk instead.
 - `--prefix-cache-disk-mib N` — the disk tier's size. Everything that reaches host memory is
-  written here too, so it sees the same bytes the host tier does.
+  written here too, snapshots included, so a full snapshot store detaches its least recently used
+  snapshot instead of losing it.
 - `--prefix-cache-dir DIR` — where the disk tier lives. **Not `--weights-disk-tier`**, which is about
   *weights*. The disk tier holds conversation content unencrypted.
 - Recovering a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
 
-On a hybrid model this includes the recurrent state, not just the attention blocks — restoring the
+On a hybrid model the recurrent state matters as much as the attention blocks — restoring the
 blocks alone leaves the session re-running every linear layer over its whole transcript, which
-every hit-rate counter reports as a hit. `/sessions` shows what is stored, where, and whether the
+every hit-rate counter reports as a hit. The snapshots never take VRAM: each is copied to host
+memory after the step that produced it and back before the step that resumes from it. `/sessions` shows what is stored, where, and whether the
 linear half is being served.
 
 ### 4.9 What a request that leaves a field out gets
@@ -891,7 +891,6 @@ one line naming each one the command line moved.
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
-| `--expert-vs-cache-ratio R` | 0.75 | weights share of what is claimed |
 | `--vram-weights-mib N` | derive | the resident weight slab |
 | `--vram-kv-mib N` | derive | the paged KV pool |
 | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
@@ -915,7 +914,7 @@ one line naming each one the command line moved.
 | `--placement MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `--deterministic` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `--checkpoint-interval N` | 2048 | linear-attention state checkpoint interval, in tokens |
-| `--checkpoint-slots N` | 8 | linear-state snapshots the server may hold at once, **in total**, not per sequence. A cap, not a charge: slots are backed as they are taken, so unused ones cost no VRAM. Raising it trades addressable context, since the range comes out of the KV pool |
+| `--checkpoint-slots N` | 8 | linear-state snapshots the server may hold at once, **in total**, not per sequence. They live in pinned host memory, not VRAM: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`), allocated at startup. A snapshot is copied off the card after the step that produced it and back before the step that resumes from it. With a disk tier a full store detaches its least recently used snapshot to disk instead of losing it |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
 | `--no-prefix-cache` | — | disable prefix caching |
 
@@ -1480,10 +1479,10 @@ released until it does.
 | What you see | What it means | What to do |
 |---|---|---|
 | `N declared op(s) resolve to libref` and the engine exits | No kernel library covers those ops on this card. Serving from the reference implementation would be orders of magnitude slow with nothing to say so | Install a library that covers them, or accept the cost with `--debug-accept-reference-kernels`. The named ops are exactly what a new library must implement |
-| `did not fit` at load, naming a weight class or a KV group | The split left one side too little. A routed expert cannot be served from the file tier, so it has nowhere else to go | If **weights** did not fit: **raise** `--expert-vs-cache-ratio`, lower `--max-model-len` or `--max-num-seqs`, or add `--host-pool-mib`. If a **KV group** did not fit: lower the ratio, or `--kv-cache-dtype fp8`. The plan report names which, by class, with the shortfall |
+| `did not fit` at load, naming a weight class or a KV group | The split left one side too little. A routed expert cannot be served from the file tier, so it has nowhere else to go | If **weights** did not fit: add or raise `--host-pool-mib`, or lower `--max-model-len` or `--max-num-seqs`. If a **KV group** did not fit: `--kv-cache-dtype fp8`, or a larger `--host-pool-mib` (RAM permitting), which takes experts off the card. The plan report names which, by class, with the shortfall |
 | `chat is 501` in the startup line | The container carries no chat template | Re-convert with `--tokenizer`, and check that a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint. Meanwhile use `/v1/completions` |
 | `does not read '<weight>' encoded <encoding>` at startup | No loaded kernel takes that weight's encoding for the op that reads it | Convert with a recipe that writes an encoding a loaded kernel reads, or load the library that reads it |
-| Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | Lower `--expert-vs-cache-ratio` (more to KV), or `--kv-cache-dtype fp8`, or fewer/shorter sessions. See §4.3 |
+| Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can do without: a larger `--host-pool-mib` (RAM permitting), `--kv-cache-dtype fp8`, or fewer/shorter sessions. See §4.3 |
 | The server dies with no log line, on a request it had been serving fine | A kernel whose code object had never been loaded could not be: the card has no room left. HIP faults inside the launch rather than returning an error, so there is nothing to print | A card that never met `--gpu-headroom-mib` — see §4.3. Raise the headroom past the shortfall startup names. `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
 | KV in VRAM stays high with one session and nothing moves | The idle tiers are **off** — they are sized, and with no size nothing is copied | Pass `--prefix-cache-host-mib N` |
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |

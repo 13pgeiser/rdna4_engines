@@ -644,17 +644,20 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
                 rd->feed(g.text, nullptr);
                 rd->finish(nullptr);
                 c.msg = rd->message();
-                /* Only claim a tool call when the arguments actually parse (json_partial.h). */
-                bool complete = r.parse_tools && !c.msg.tool_calls.empty();
-                for (const auto& tc : c.msg.tool_calls)
-                    if (tc.name.empty() || !json_complete(tc.arguments)) complete = false;
+                /* Only claim a tool call when every call closed and its arguments parse
+                 * (json_partial.h) -- the streaming path's rule (calls_complete). */
+                const bool complete = r.parse_tools && calls_complete(c.msg);
                 if (complete && (c.finish == Finish::Stop || c.finish == Finish::StopString))
                     c.finish = Finish::ToolCalls;
-                else if (!c.msg.tool_calls.empty() && !complete) {
-                    /* A half-finished call is content, not a call. The client gets what the model
-                     * actually produced instead of a tool invocation with truncated arguments. */
-                    c.msg.tool_calls.clear();
-                    c.msg.content = g.text;
+                if (c.msg.open_call) {
+                    /* A half-finished call is content, not a call: the client gets what the model
+                     * wrote instead of a tool invocation with truncated arguments. Only that call
+                     * -- the reply ended inside it, so it is the last -- and only its own text:
+                     * the reasoning stays reasoning, and the calls before it, which closed, stay
+                     * calls, as the stream announced them. The finish reason is the stream's. */
+                    c.msg.content = rd->content_with_open_call(g.text);
+                    c.msg.tool_calls.pop_back();
+                    c.msg.open_call = false;
                 }
             } else {
                 c.msg.content = g.text;

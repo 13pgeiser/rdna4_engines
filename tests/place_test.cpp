@@ -97,6 +97,7 @@ const char* rad_dev_last_error(void) { return ""; }
 namespace {
 
 constexpr int64_t MiB = 1024 * 1024;
+constexpr int64_t KiB = 1024;
 
 /* Two kernel rows, one per domain. The planner reads Band::dom[] to learn whether a host site
  * exists at all, so a fixture that wants to exercise that has to resolve real rows. */
@@ -407,6 +408,57 @@ TEST(planner_spills_experts_before_dense_weights) {
     for (const MoveUnit& mu : p.units)
         if (mu.tier == Tier::HostPinned && mu.site == Site::DeviceZeroCopy) ++zero_copy;
     CHECK_EQ(zero_copy, 6);
+}
+
+/* THE BUDGET'S EXPERT FLOOR PLACES EVERY EXPERT. A lending cache leaves the expert slab exactly
+ * expert_vram_floor, so a floor short of what the planner spends -- the residents, the slab's
+ * spare slots beside them, and the slack each first-fit pass can strand -- is experts with no
+ * tier, and a server that refuses to start. Two strides make two slab classes, each with its own
+ * shadow slots, which is the shape a mixed-precision container has. */
+TEST(the_expert_floor_places_every_expert) {
+    Fixture f;
+    const rad_weight m = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {m}, false);
+    for (int l = 0; l < 8; ++l) {
+        const int64_t gu = l < 4 ? 600 * KiB : 1 * MiB, dn = l < 4 ? 300 * KiB : 500 * KiB;
+        std::vector<rad_weight> g, d;
+        for (int e = 0; e < 16; ++e) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            g.push_back(f.weight(b + "ffn_gate_up_exps." + std::to_string(e) + ".weight", gu,
+                                 RAD_ACCESS_CONDITIONAL, l, e));
+            d.push_back(f.weight(b + "ffn_down_exps." + std::to_string(e) + ".weight", dn,
+                                 RAD_ACCESS_CONDITIONAL, l, e));
+        }
+        f.op("moe_gemm", g, false);
+        f.op("moe_gemm", d, false);
+    }
+    WeightFootprint wf;
+    weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk);
+    CHECK(wf.expert_spare > 0);
+
+    const int64_t host = 100 * MiB;
+    auto plan_with = [&](int64_t floor, Plan* p) {
+        Config c = base_config();
+        c.placement = "expert_tiered";
+        c.vram_weights_mib = (wf.statics + floor + MiB - 1) / MiB;
+        c.host_pool_mib = host / MiB;
+        PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+        return Planner(in).plan(p);
+    };
+
+    const int64_t floor = expert_vram_floor(wf, host);
+    CHECK(floor > 0 && floor < wf.experts);
+    Plan p;
+    CHECK_OK(plan_with(floor, &p));
+    CHECK(p.unfit.empty());
+    CHECK_EQ(count_tier(f.prog, p, Tier::SSD), 0);
+    CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead <= p.vram_budget);
+
+    /* AND THE SPARE SLOTS ARE WHY: a floor that counts only the experts the pool cannot hold and
+     * one unit of slack strands some. */
+    Plan q;
+    CHECK(plan_with(wf.experts - host + wf.expert_unit_max, &q) == RAD_E_NOMEM);
+    CHECK(!q.unfit.empty());
 }
 
 TEST(planner_warm_starts_from_the_container_profile) {

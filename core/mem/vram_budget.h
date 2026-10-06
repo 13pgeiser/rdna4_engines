@@ -28,20 +28,23 @@
  * pinned host pool, which a lookup reads a few rows of in place; weight_footprint counts it out of
  * the statics then), and under tensor parallel each rank already holds its own even share of
  * them (declare runs per rank with every dimension divided, spec §9). They are a FLOOR, not a
- * share of anything: applying a ratio to the weights as a whole would let --expert-vs-cache-ratio
- * 0.3 demote the attention projections to host memory to make room for a cache nothing will fill.
- * If they do not fit, that is a refusal with the shortfall named.
+ * share of anything: dividing the weights as a whole would let the cache's side demote the
+ * attention projections to host memory to make room for blocks nothing will fill. If they do not
+ * fit, that is a refusal with the shortfall named.
  *
- * ONLY WHAT IS LEFT AFTER THAT IS DIVIDED, and that is the division the flag is named for: the
- * expert plane against the KV cache, which is the one genuinely two-sided trade on this engine. A
- * long-context low-concurrency server and a short-context high-concurrency one want opposite
- * answers and neither is derivable.
+ * ONLY WHAT IS LEFT AFTER THAT IS DIVIDED: the expert plane against the KV cache. Where the cache
+ * lends its idle blocks to the expert slab, that division has nothing to guess. The experts keep
+ * on the card exactly what the pinned host pool cannot hold -- they have nowhere else to be -- and
+ * the cache takes the rest, up to what it could ever address; every block no live request holds
+ * is lent back to the experts in place. So the cache is as large as the work needs at the moment
+ * and the experts have everything else, for a long-context server and a high-concurrency one
+ * alike. Without a lender the cache would hold that memory empty, so there the experts come first
+ * and the cache keeps one --max-model-len sequence. The cache never gets less than that sequence.
  *
- * BOTH SIDES ARE THEN CAPPED AT WHAT THEY COULD USE, and whatever one side cannot take goes to the
+ * BOTH SIDES ARE CAPPED AT WHAT THEY COULD USE, and whatever one side cannot take goes to the
  * other rather than nowhere. A cache cannot address past max_seqs x max_ctx tokens
- * (KVManager::ceiling), so a share larger than that ceiling is VRAM the cache can never fill and
- * the expert plane could have held. And an expert plane that fits entirely in VRAM has no use for
- * more; on a model that fits, the ratio stops meaning anything and that is correct.
+ * (KVManager::ceiling), and an expert plane that fits entirely in VRAM has no use for more; when
+ * both fit, both are whole.
  *
  * A stated --vram-weights-mib or --vram-kv-mib still wins outright and turns the whole of this
  * off for that pool. The point is that the DEFAULT is a full card rather than a guess: VRAM left
@@ -76,8 +79,18 @@ struct VramFacts {
     /* weight_footprint() for this rank, which under tensor parallel is already this card's even
      * share: declare runs per rank with every dimension already divided. */
     int64_t statics    = 0;   /* non-expert weights -- the floor, not a share of anything */
-    int64_t experts    = 0;   /* the elastic plane the ratio divides against the KV cache */
+    int64_t experts    = 0;   /* the expert plane: what trades against the KV cache */
     int64_t expert_layer_max = 0;   /* the most expert bytes one routed layer holds */
+    /* THE EXPERTS THE PINNED HOST POOL CANNOT HOLD on this rank, with the slab's spare slots
+     * beside them: they have nowhere to be but the card, so this is the floor under the expert
+     * slab when the cache lends (expert_vram_floor, core/place/planner.h). */
+    int64_t expert_floor = 0;
+    int64_t kv_one     = 0;   /* the cache for ONE --max-model-len sequence: the least it may get */
+    /* WILL THE CACHE LEND ITS IDLE BLOCKS TO THE EXPERT SLAB: a placement that moves units
+     * (expert_tiered, or auto), not --deterministic, on a device with virtual memory management.
+     * Decides the split: a cache that lends gives back what it does not use, so it can be sized
+     * for what live requests could need; one that does not would hold it empty. */
+    bool    lends      = false;
     /* Integrated graphics: what of the host's memory the card leaves to the host. Its device
      * memory IS the host's, so an unclaimed MiB is the operating system's and every other
      * process's to run in, not slack. 0 on a discrete card. */
@@ -88,12 +101,15 @@ struct VramFacts {
  * operator stated the budgets -- the placement report and the pool report both want the totals. */
 struct VramBudget {
     int64_t capacity = 0, already_held = 0, headroom = 0, arena = 0, staging = 0;
+    int64_t drift = 0;                /* kDriverDrift: what already_held moves by after it is read */
     int64_t queues = 0;               /* n_queues * queue_bytes, from the rank that needs most */
     int     n_queues = 0;
     int64_t queue_bytes = 0;
     int64_t claimable = 0;            /* after the fixed terms above */
-    int64_t statics = 0;              /* off the top, before the ratio sees anything */
-    int64_t elastic = 0;              /* claimable - statics: what the ratio divides */
+    int64_t statics = 0;              /* off the top, before the split sees anything */
+    int64_t elastic = 0;              /* claimable - statics: what experts and cache share */
+    int64_t expert_floor = 0;         /* the experts the host pool cannot hold */
+    bool    lends = false;            /* every rank's cache lends its idle blocks */
     int64_t kv_ceiling = 0, expert_ceiling = 0;
     int64_t kv_fixed = 0;             /* the state part of kv_ceiling, which no context uses */
     int64_t experts = 0, kv = 0;      /* the two shares, each capped at its ceiling */

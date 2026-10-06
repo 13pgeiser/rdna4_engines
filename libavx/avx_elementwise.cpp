@@ -261,6 +261,25 @@ AVX_KERNEL(gelu)    { return unary<UN_GELU>(a); }
 AVX_KERNEL(silu)    { return unary<UN_SILU>(a); }
 AVX_KERNEL(sigmoid) { return unary<UN_SIGMOID>(a); }
 
+/* ------------------------------------------------------------------ fill */
+/* y = value over [M, n] at y's own row pitch, the value rounded once by the store. Nothing to
+ * vectorise that the store does not already do: it is a write of one number. */
+AVX_KERNEL(fill) {
+    if (!rad_args_have(a, 1)) return RAD_E_INVAL;
+    const RadTensor* y = &a->t[0];
+    const int64_t n = p_int(a, "n", y->rank >= 1 ? y->shape[y->rank - 1] : 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t M = rows_of(y, n);
+    if (M <= 0) return RAD_E_SHAPE;
+    const float v = p_f32(a, "value", 0.0f);
+    AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t yb = rowoff(y, r, n), ys = laststride(y);
+        for (int64_t i = 0; i < n; ++i) stt(y, yb + i * ys, v);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ gather_rows */
 /* y[i, :] = x[idx[i], :]. A negative index writes a ZERO ROW -- the padding rule embed_lookup
  * follows, and what a step with fewer sampled rows than the buffer's extent leaves behind. An

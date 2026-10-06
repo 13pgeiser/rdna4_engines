@@ -18,6 +18,7 @@
  * one of the two allocators keeps handing its state slot to the next request.
  */
 #pragma once
+#include "mem/hostarena.h"
 #include "mem/pools.h"
 #include "rad_core.h"
 
@@ -155,11 +156,10 @@ public:
      * exhaust at the same total token count, and any other split strands memory in whichever
      * group outlasts the others.
      *
-     * Both budgets come from the operator and neither is derived here: the byte budget is whatever
-     * `kv_pool` still has (which is --vram-kv-mib), and the linear-snapshot count is
-     * Config::checkpoint_slots (--checkpoint-slots). A checkpoint is ~96 MiB on a Qwen3-Next and
-     * 64 of them is 6 GiB, so how many to retain is a budget decision and therefore not this
-     * component's to make (spec §6, §7.3). */
+     * The byte budget comes from the operator and is not derived here: it is whatever `kv_pool`
+     * still has (which is --vram-kv-mib). The linear-state snapshots take none of it -- they live
+     * in pinned host memory (set_checkpoint_store) -- so the pool is the live cache and nothing
+     * else (spec §6, §7.3). */
     int configure(const std::vector<KVGroupInfo>& groups, const Config& cfg, Pool& kv_pool);
 
     /* configure(), split at the seam the budget resolver needs. plan_groups() sizes every group
@@ -170,14 +170,17 @@ public:
     int     plan_groups(const std::vector<KVGroupInfo>& groups, const Config& cfg);
     int64_t ceiling(int64_t ctx) const;
     /* The part of every ceiling that is not context: recurrent and conv state for max_seqs
-     * sequences, the checkpoint slots and the padding. Set by plan_groups(). */
+     * sequences, and the padding. Set by plan_groups(). */
     int64_t fixed_bytes() const { return fixed_; }
     /* THE TOKEN COUNT THE PAGED GROUPS SETTLE ON for `budget_bytes` of pool -- carve()'s split
      * with nothing carved. One block table serves every rank, so every rank's paged groups must
      * hold the SAME number of blocks; under an uneven tensor-parallel split the ranks' pools are
      * not the same size (a rank with more delta-net heads holds more state and has less left for
      * pages, and a rank with no attention weights has more). The engine asks each rank this and
-     * cap_paged_tokens() the least on all of them before carve(). 0 is no cap. */
+     * cap_paged_tokens() the least on all of them before carve(). 0 is no cap.
+     * kUnboundedTokens when every paged group of this rank is zero (rad_kv_group_zero): its pages
+     * cost it nothing, so it takes what the ranks holding the cache carve and limits nobody. */
+    static constexpr int64_t kUnboundedTokens = INT64_MAX;
     int64_t paged_tokens(int64_t budget_bytes) const { return paged_split(budget_bytes, nullptr); }
     void    cap_paged_tokens(int64_t tokens) { tokens_cap_ = tokens > 0 ? tokens : 0; }
     int     carve(Pool& kv_pool);
@@ -348,12 +351,6 @@ public:
      * recalled and the request is refused (RAD_E_FULL). */
     void    set_reclaim(std::function<int(int64_t tokens)> f) { reclaim_ = std::move(f); }
 
-    /* WHETHER A DECOMMIT ACTUALLY GIVES THE CARD BACK, for the checkpoint region, which is the one
-     * part of the pool still backed on demand. Measured once at bringup rather than assumed,
-     * because it is a property of the driver: where it is false a freed checkpoint slot keeps its
-     * pages, since unmapping them would cost driver calls and return nothing. */
-    void set_release_frees_card(bool yes) { release_frees_card_ = yes; }
-
     /* MATCH A LEADER'S LOAN, FOR A RANK THAT DOES NOT KNOW WHAT IT IS HOLDING.
      *
      * Block ids are SHARED ACROSS RANKS -- RadBatch carries one block table and every rank indexes
@@ -366,59 +363,6 @@ public:
     /* HOW MANY OF A GROUP'S BLOCKS THE CACHE MAY HAND OUT: the carve less what is lent. */
     int64_t live_blocks(int32_t group) const;
     int64_t committed_bytes() const;
-
-    /* HOW MUCH OF THE CHECKPOINT REGION MUST STAY AVAILABLE, in bytes, counting only what is not
-     * committed already. The number is the HIGH WATER MARK PLUS ONE rather than the whole cap:
-     * the cap is what the operator allows and the high water is what this workload takes, and
-     * holding one slot past it means the allocation that would advance it always has room. */
-    int64_t ck_reserve_bytes() const;
-
-    /* BACK THIS RANK'S COPY OF A SLOT, AND SAY SO IF THE CARD WILL NOT.
-     *
-     * A slot's LIFETIME is decided once: rank 0's PrefixCache owns the free list and every other
-     * rank takes the id it is handed. Its BACKING is per rank, because every rank writes its own
-     * shard of the snapshot into the same offset of its OWN pool. alloc_checkpoint backs the slot
-     * on every rank before it hands the id out (set_checkpoint_peers), so on the paths that use a
-     * slot this is a check that finds it backed. Called before EVERY access rather than once:
-     * idempotence is what makes that safe, and a commit of a range already committed is a no-op.
-     *
-     * RAD_E_FULL when the commit would take the card under its floor (set_checkpoint_floor). */
-    int back_checkpoint(int32_t slot);
-
-    /* THE CARD'S FLOOR FOR A CHECKPOINT SLOT'S PAGES: the card is read before a slot is backed,
-     * and a slot that would leave it under `keep_free` bytes is refused as a full pool.
-     *
-     * The budget counts the whole checkpoint region as the cache's, but the region is backed as
-     * slots are taken, and until then its bytes read as free. The allocations nobody sizes in
-     * advance -- a kernel's code object and a spilling kernel's scratch, both made on the
-     * kernel's first launch -- are made out of that same free memory. A slot that took the last
-     * of it would leave the next first launch nothing, which is a fault inside the HIP runtime
-     * and not an error. A refused slot is a snapshot fewer on the card, which the retention
-     * policy answers and the host tier covers.
-     *
-     * `free_bytes` reads the card's free memory into its argument: the engine reads the device, a
-     * test reads a simulated card, and no floor is set on a backend with no card. */
-    using FreeBytes = std::function<int(int64_t*)>;
-    void set_checkpoint_floor(FreeBytes free_bytes, int64_t keep_free) {
-        ck_free_bytes_ = std::move(free_bytes);
-        ck_keep_free_  = keep_free;
-    }
-
-    /* THE OTHER RANKS' MANAGERS, given to the one whose free list hands the ids out. Every rank
-     * writes its shard of a snapshot into the same slot of its own pool, so a slot is backed on
-     * every card or handed out on none: a card that cannot back it is a full pool at allocation,
-     * which the prefix cache answers by retiring a snapshot, rather than a failed copy after the
-     * step that produced the state, which stops the engine. */
-    void set_checkpoint_peers(std::vector<KVManager*> peers) { ck_peers_ = std::move(peers); }
-
-    /* BACK EVERY FREE SLOT NOW, ON EVERY RANK, and withdraw the ones the cards have no room for.
-     * For a driver that never takes a mapping's pages back (set_release_frees_card(false)): a
-     * slot backed later costs exactly what it costs now, and backing it now puts the region's
-     * cost on the card before serving starts, where the startup reading shows it. A withdrawn
-     * slot is never handed out. `withdrawn` counts them; RAD_E_FULL is not returned. */
-    int back_free_checkpoints(int64_t* withdrawn);
-
-    int64_t checkpoint_stride() const { return ck_stride_; }
 
     /* ---------------- preemption by recompute (spec §7.1, §17) ---------------- */
     /* Free the sequence's blocks and take it back to zero tokens. Its state slots are freed too: a
@@ -470,10 +414,24 @@ public:
                    const std::vector<uint64_t>& victims,
                    std::vector<uint64_t>* preempted);
 
-    /* ---------------- linear-state checkpoints (spec §7.3) ---------------- */
+    /* ---------------- linear-state checkpoints (spec §7.3) ----------------
+     *
+     * A SNAPSHOT LIVES IN PINNED HOST MEMORY, NOT ON THE CARD. It is a copy of a sequence's state
+     * that no kernel reads -- the step reads the live state slots, and a snapshot only ever goes
+     * back into one of those -- so it has no reason to hold VRAM. Saving it is one copy across the
+     * link after the step that produced the state, restoring it one copy back before the step
+     * that resumes from it, each a few milliseconds on a 50-100 MiB snapshot.
+     *
+     * THE STORE IS SHARED BY EVERY RANK and owned by the engine: a slot holds every rank's shard
+     * of one snapshot, each at its own offset (`rank_off`), so the disk tier reads and writes a
+     * slot as one payload. The slot ids are rank 0's -- its manager hands them out and the others
+     * address the id they are given. Without a store no slot is ever handed out and a hybrid
+     * model's prefix hits replay their linear layers from zero. `checkpoint_bytes()` is THIS
+     * rank's shard. */
+    void    set_checkpoint_store(HostArena* store, int64_t rank_off);
     int64_t checkpoint_bytes() const { return checkpoint_bytes_; }
-    int64_t checkpoint_slots() const { return (int64_t)ck_slot_base_.size(); }
-    int64_t free_checkpoint_slots() const { return (int64_t)ck_free_.size(); }
+    int64_t checkpoint_slots() const { return ck_store_ ? ck_store_->capacity() : 0; }
+    int64_t free_checkpoint_slots() const { return ck_store_ ? ck_store_->free_slots() : 0; }
     int  alloc_checkpoint(int32_t* slot_out);
     void free_checkpoint(int32_t slot);
     void* checkpoint_ptr(int32_t slot) const;
@@ -495,7 +453,8 @@ public:
      *
      * Enqueued on `s`, not synchronous: the save has to follow the step that produced the state
      * and the restore has to precede the step that consumes it, and both are ordered by the
-     * stream rather than by waiting. RAD_E_INVAL on a bad slot or an unknown sequence. */
+     * stream rather than by waiting. One pitched copy a stateful group between the card and the
+     * store, at the link's rate. RAD_E_INVAL on a bad slot or an unknown sequence. */
     int checkpoint_save(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s);
     int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s);
 
@@ -513,6 +472,9 @@ private:
      * `budget_bytes` of pool, under tokens_cap_, and each group's block count in `blocks` (by group
      * index; a windowed group capped at its window). carve_into() spends what this says. */
     int64_t paged_split(int64_t budget_bytes, std::vector<int64_t>* blocks) const;
+    /* A zero group's share of `tokens`: the block count of the shared table, capped at the window
+     * for a windowed group. 0 for kUnboundedTokens, which is not a count. */
+    int64_t zero_blocks(const KVGroupPlan& p, int64_t tokens) const;
     void forget();
 
     /* One traversal serving both checkpoint directions; see checkpoint_save. */
@@ -552,8 +514,8 @@ private:
     std::unordered_map<uint64_t, Seq> seqs_;
     std::vector<BlockCopy> pending_;
 
-    std::vector<int64_t> ck_slot_base_;               /* pool offsets of the checkpoint slots */
-    std::vector<int32_t> ck_free_;
+    HostArena* ck_store_ = nullptr;                   /* set_checkpoint_store */
+    int64_t   ck_rank_off_ = 0;
     int64_t   checkpoint_bytes_ = 0;
     std::vector<StateClear> clears_;                  /* grabbed slots the engine must zero */
     void*     pool_base_ = nullptr;
@@ -563,33 +525,9 @@ private:
     int64_t   max_ctx_ = 0;
     int64_t   max_tok_ = 0;      /* --max-num-batched-tokens; the buffer floor is one of these */
     /* plan_groups() computes these; carve() spends against them and ceiling() reports on them. */
-    int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, checkpoints, padding */
-    int64_t   ck_total_ = 0;   /* the checkpoint part of fixed_, named for the refusal message */
-    int64_t   ckpts_ = 0;      /* --checkpoint-slots, as plan_groups() resolved it */
+    int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, padding */
+    int64_t   ckpts_ = 0;      /* --checkpoint-slots, kept for the warning on a model with none */
     int64_t   tokens_cap_ = 0; /* cap_paged_tokens(): the least any rank can carve; 0 is none */
-    /* THE SLOT STRIDE AND WHERE THE SLOTS BEGIN. The stride is checkpoint_bytes_ rounded up to a
-     * whole number of commit granules, so a slot can be backed and released without touching a
-     * neighbour; the offset is where the eager startup commit stops, because everything from
-     * there up is backed as it is handed out. Zero on a model with no linear state. */
-    bool      release_frees_card_ = true;
-    bool      ck_elastic_ = false;
-    int64_t   ck_high_water_ = 0;
-    int64_t   ck_backed_ = 0;
-    int64_t   ck_stride_ = 0;
-    int64_t   ck_region_off_ = 0;
-    FreeBytes ck_free_bytes_;        /* set_checkpoint_floor */
-    int64_t   ck_keep_free_ = 0;
-    std::vector<KVManager*> ck_peers_;
-    /* RAD_OK when this rank has the slot backed or room above the floor to back it. */
-    int  ck_room(int32_t slot) const;
-    bool ck_backed(int32_t slot) const;
-    /* The commit itself, with no floor: callers have asked ck_room on every rank first. */
-    int  ck_commit(int32_t slot);
-    /* ck_room on every rank, then ck_commit on every rank. */
-    int  ck_back_everywhere(int32_t slot);
-    /* What a checkpoint slot is aligned and sized to. RAD_ALIGN_UNIT on a device with no virtual
-     * memory management, where nothing is released and the stride is only padding. */
-    int64_t ck_align() const;
 
     /* ---- the loan. See the public block for what this is and why a block that anything holds
      * is never lent. ----

@@ -320,8 +320,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* arch_splits_ff: the routed experts' width (640 = five fp8 blocks) is split by the plugin
      * below, by whole blocks and parity, at any world up to the block count -- three ranks included,
-     * which 640 does not divide. geom_from must not refuse what the plugin then answers. */
-    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16, /*arch_splits_ff=*/true));
+     * which 640 does not divide. geom_from must not refuse what the plugin then answers.
+     * attn_world_ok: every attention block this plugin declares is rad_block_attn_gated_fp8.h's,
+     * which serves the smaller attention world of a world the two KV heads do not divide. */
+    RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16, /*arch_splits_ff=*/true,
+                           /*attn_world_ok=*/true));
     Geom& g = m.g;
 
     /* Qwen4-Exp's norms are all `x_hat * (1 + w)` -- `Qwen3NextRMSNorm.forward` is

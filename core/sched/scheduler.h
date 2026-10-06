@@ -445,6 +445,9 @@ public:
 
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). */
+    /* plan_chunk's checkpoint rules, asked after the fact (see the definitions). */
+    bool    last_checkpoint(int64_t pos, int64_t target) const;
+    int64_t tail_checkpoint(int64_t target) const;
     int64_t plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
                        int64_t* checkpoint_pos) const;
 

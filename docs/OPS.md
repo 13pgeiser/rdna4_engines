@@ -544,11 +544,19 @@ gets a refusal, not a silent change of cost.
 `router_topk_scatter` over those logits. With `gate_b` [1, K] and `gate` [M, 1] present it is
 also the shared expert's one-column `gemm_nt` over the same `a`; the two come together or not at
 all. The selection needs every logit of a row, so it runs in the workgroup that finishes the GEMM
-last (an arrival counter, self-resetting, one a stream and logits buffer). It is byte-identical to
-the launches it stands in for: an element of the skinny bf16 GEMM depends only on its split-K
-count, which this op takes from the same law at the same N, and the selection and sort are the
-same code. Decode only, `M <= 64` -- past that the router is the tiled GEMM -- and bounded like the
-pair. The logits stay an output.
+last (an arrival counter, self-resetting, one an op instance: libr4d takes it in the row's `init`,
+so it is in the VRAM budget, and refuses a launch without one). It is byte-identical to the
+launches it stands in for: an element of the skinny bf16 GEMM depends only on its split-K count,
+which this op takes from the same law at the same N, and the selection and sort are the same code.
+Decode only, `M <= 64` -- past that the router is the tiled GEMM -- and bounded like the pair. The
+logits stay an output.
+
+**The router GEMM inside it is NOTUNE.** It always takes the split the untuned law picks, which is
+what makes it byte-identical to the unfused GEMM as an untuned install runs it. A tune-cache entry
+for the unfused router's `gemm_nt` does not reach this op, so on a tuned install the two forms may
+differ in the last bit; no shipped configuration tunes these GEMMs. An architecture asks for this op
+wherever it declares the pair and issues the router and the pair itself where it does not resolve
+or a pass is past its rows.
 
 `moe_scatter`'s output is what `rad_route_report` hands the heat engine. The histogram is read
 back asynchronously and consumed on the next step; nothing here blocks the compute stream

@@ -151,8 +151,6 @@ struct WeightInfo {
     int            n_part_spans = 0;
     int64_t        part_lo[RAD_MAX_ROW_PARTS] = {0}, part_hi[RAD_MAX_ROW_PARTS] = {0};
     int64_t        part_total[RAD_MAX_ROW_PARTS] = {0};
-    /* rad_weight_shard_zero: this rank reads nothing for it and the loader writes zeros. */
-    bool           shard_zero = false;
 
     /* WHAT IT IS A VIEW OF (RadWeightDecl::source and ::planes, spec §4.3). `enc` is the source's
      * encoding as the model holds it -- or, with nothing behind the builder, plain in the declared
@@ -212,7 +210,6 @@ struct WeightInfo {
         for (int i = 0; i < RAD_MAX_ROW_PARTS; ++i) {
             part_lo[i] = o.part_lo[i]; part_hi[i] = o.part_hi[i]; part_total[i] = o.part_total[i];
         }
-        shard_zero = o.shard_zero;
         source = o.source; enc = o.enc; enc_known = o.enc_known; n_sel = o.n_sel;
         for (int i = 0; i < RAD_ENC_MAX_PLANES; ++i) {
             sel[i] = o.sel[i]; sel_rows[i] = o.sel_rows[i]; sel_cols[i] = o.sel_cols[i];
@@ -641,7 +638,6 @@ struct Config {
      * a third name for the second one, and a flag whose values are not all distinct is a flag
      * whose log line cannot be read back. */
     std::string kv_cache_dtype = "bf16";
-    double  expert_cache_ratio = 0.75; /* --expert-vs-cache-ratio, weights vs KV of the remainder */
     /* SET BY THE RESOLVER, NOT BY A FLAG. vram_budget_resolve writes the two budgets above into
      * this config, which erases the only evidence of whether they were stated or derived -- and
      * Pools needs that to know whether unspent VRAM is a mis-stated budget worth warning about or

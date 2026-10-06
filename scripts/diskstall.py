@@ -74,8 +74,8 @@ while True:
         print(f"diskstall: the session never left RAM and VRAM for disk: {s}", file=sys.stderr)
         sys.exit(1)
     time.sleep(1)
-print(f"on disk   {s['on_disk']} blocks, snapshots device/host/disk "
-      f"{s['snap_device']}/{s['snap_host']}/{s['snap_disk']}, after {time.time()-t0:.0f}s")
+print(f"on disk   {s['on_disk']} blocks, snapshots host/disk "
+      f"{s['snap_host']}/{s['snap_disk']}, after {time.time()-t0:.0f}s")
 
 # ---- the bystander: a stream that only decodes ----------------------------------------------------
 stamps = []

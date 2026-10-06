@@ -1962,6 +1962,27 @@ std::string ChatDeltaStream::chunk(json delta, const char* finish_reason, const 
     return sse_event(o.dump());
 }
 
+void ChatDeltaStream::delta_open(std::string& out) {
+    /* Built from nlohmann's own serialisation of each field, on first use rather than in the
+     * constructor, so a field nlohmann refuses throws where chunk() would have. */
+    if (head_.empty())
+        head_ = "data: {\"id\":" + json(id_).dump() +
+                ",\"object\":\"chat.completion.chunk\",\"created\":" + json(created_).dump() +
+                ",\"model\":" + json(model_).dump() + ",\"choices\":[{\"index\":" +
+                json(index_).dump() + ",\"delta\":";
+    out += head_;
+}
+
+void ChatDeltaStream::delta_close(std::string& out) const {
+    out += ",\"finish_reason\":null}]}\n\n";
+}
+
+/* Text that is not well-formed UTF-8 goes to nlohmann, which refuses it with the exception the
+ * tree in chunk() raises for it. */
+void ChatDeltaStream::quote(std::string& out, std::string_view s) {
+    if (!json_quote_append(out, s)) out += json(std::string(s)).dump();
+}
+
 std::string ChatDeltaStream::first_chunk() {
     json d;
     d["role"] = "assistant";
@@ -1976,49 +1997,53 @@ std::string ChatDeltaStream::first_chunk() {
 std::string ChatDeltaStream::emit(const std::vector<ReplyDelta>& ev) {
     std::string out;
     for (const ReplyDelta& d : ev) {
-        json delta;
         switch (d.kind) {
         case ReplyDelta::Reasoning:
             if (d.text.empty()) continue;
             last_.reasoning += d.text;
-            delta["reasoning_content"] = d.text;
+            delta_open(out);
+            out += "{\"reasoning_content\":";
+            quote(out, d.text);
+            out += '}';
             break;
         case ReplyDelta::Content:
             if (d.text.empty()) continue;
             last_.content += d.text;
-            delta["content"] = d.text;
+            delta_open(out);
+            out += "{\"content\":";
+            quote(out, d.text);
+            out += '}';
             break;
         case ReplyDelta::CallBegin: {
             ToolCall tc;
             tc.id   = random_id("call_");
             tc.name = d.text;
-            last_.tool_calls.push_back(tc);
-            json f;
-            f["name"] = tc.name;
-            f["arguments"] = "";
-            json e;
-            e["index"] = (int64_t)d.call;
-            e["id"] = tc.id;
-            e["type"] = "function";
-            e["function"] = std::move(f);
-            delta["tool_calls"] = json::array({e});
+            delta_open(out);
+            out += "{\"tool_calls\":[{\"index\":";
+            out += std::to_string((int64_t)d.call);
+            out += ",\"id\":";
+            quote(out, tc.id);
+            out += ",\"type\":\"function\",\"function\":{\"name\":";
+            quote(out, tc.name);
+            out += ",\"arguments\":\"\"}}]}";
+            last_.tool_calls.push_back(std::move(tc));
             break;
         }
         case ReplyDelta::CallArgs: {
             if (d.text.empty() || d.call >= last_.tool_calls.size()) continue;
             last_.tool_calls[d.call].arguments += d.text;
-            json f;
-            f["arguments"] = d.text;
-            json e;
-            e["index"] = (int64_t)d.call;
-            e["function"] = std::move(f);
-            delta["tool_calls"] = json::array({e});
+            delta_open(out);
+            out += "{\"tool_calls\":[{\"index\":";
+            out += std::to_string((int64_t)d.call);
+            out += ",\"function\":{\"arguments\":";
+            quote(out, d.text);
+            out += "}}]}";
             break;
         }
         case ReplyDelta::CallEnd:
             continue;
         }
-        out += chunk(std::move(delta), nullptr);
+        delta_close(out);
     }
     return out;
 }
@@ -2030,9 +2055,11 @@ std::string ChatDeltaStream::push(std::string_view appended, bool is_final) {
         /* Nothing to parse: the text is the answer, as it arrives. */
         if (!appended.empty()) {
             last_.content.append(appended);
-            json d;
-            d["content"] = std::string(appended);
-            out = chunk(std::move(d), nullptr);
+            delta_open(out);
+            out += "{\"content\":";
+            quote(out, appended);
+            out += '}';
+            delta_close(out);
         }
         finished_ = is_final;
         return out;
@@ -2053,14 +2080,19 @@ std::string ChatDeltaStream::push(std::string_view appended, bool is_final) {
     return out;
 }
 
+bool calls_complete(const ParsedMessage& m) {
+    if (m.tool_calls.empty() || m.open_call) return false;
+    for (const auto& tc : m.tool_calls)
+        if (tc.name.empty() || !json_complete(tc.arguments)) return false;
+    return true;
+}
+
 Finish ChatDeltaStream::adjusted_finish(Finish f) const {
     if (f != Finish::Stop && f != Finish::StopString) return f;
-    if (last_.tool_calls.empty()) return f;
-    /* Only claim tool_calls if every call's arguments actually parse. A truncated arguments
-     * object reported as a tool call is a tool invoked with the wrong arguments (json_partial.h). */
-    for (const auto& tc : last_.tool_calls)
-        if (tc.name.empty() || !json_complete(tc.arguments)) return f;
-    return Finish::ToolCalls;
+    /* Only claim tool_calls if every call closed and its arguments parse. A truncated arguments
+     * object reported as a tool call is a tool invoked with the wrong arguments (json_partial.h).
+     * The deltas of an open call have gone out already; the finish reason says not to run it. */
+    return calls_complete(last_) ? Finish::ToolCalls : f;
 }
 
 std::string ChatDeltaStream::final_chunk(Finish f, const TimingsOut& t) {

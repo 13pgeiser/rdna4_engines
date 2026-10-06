@@ -17,7 +17,7 @@ header lists its own). The ones that only attach to a live server need nothing b
 | | |
 |---|---|
 | `mcserve.sh` | MiniCPM5-2B with its DSpark drafter (`minicpm5-2b-dspark.v2.rad`), left running on :8100. Records why `--max-model-len` is the container's `n_ctx_train` and why a dense model of this size needs no explicit VRAM split. |
-| `fnserve.sh` | Qwen3.8-Flash-Next, the production container `w4nl64-i8lm.rad`, same contract. Records the production flags and why: the 200K context and the 0.82 expert/cache ratio that keeps the prefix cache useful at it, the 2048-token chunk, the prefix-cache tiers and the lossy `wht6` cross-rank wire. |
+| `fnserve.sh` | Qwen3.8-Flash-Next, the production container `w4nl64-i8lm.rad`, same contract. Records the production flags and why: the 200K context and how the expert/cache split sizes the prefix cache at it, the 2048-token chunk, the prefix-cache tiers and the lossy `wht6` cross-rank wire. |
 | `fnstop.sh` | Stops whichever is running and waits for the process to go. |
 | `convdspark.sh` | Rebuilds the container `mcserve.sh` serves, with the drafter merged. The conversion of record. |
 | `convfn.sh` | Rebuilds the container `fnserve.sh` serves from `data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`. Needs `CALIB=<dir>`: the recipe's expert rule runs GPTQ against the calibration Grams there (`docs/MOE-W4.md`). |

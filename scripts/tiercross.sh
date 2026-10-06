@@ -192,7 +192,7 @@ cmp_arm "B restored from disk is still B" "$B2" "$BH" "$(hit b2)" "$(hit bh)"
 curl -sS --fail "http://$H:$P/sessions" > "$work/s.json"
 echo "  moved: blocks to_host=$(jq -r .moved.to_host < "$work/s.json") to_disk=$(jq -r .moved.to_disk < "$work/s.json") promoted=$(jq -r .moved.promoted < "$work/s.json")"
 if [ "$CKS" != "0" ]; then
-    echo "  state: to_host=$(jq -r .snapshots_moved.to_host < "$work/s.json") to_disk=$(jq -r .snapshots_moved.to_disk < "$work/s.json") promoted=$(jq -r .snapshots_moved.promoted < "$work/s.json") dropped=$(jq -r .snapshots_moved.drops < "$work/s.json")"
+    echo "  state: to_disk=$(jq -r .snapshots_moved.to_disk < "$work/s.json") fetched=$(jq -r .snapshots_moved.fetched < "$work/s.json") dropped=$(jq -r .snapshots_moved.drops < "$work/s.json")"
     # A RUN WITH NO CONTENTION TESTED THE EASY CASE. Two stores have to run out for the paths this
     # script exists for to execute, and they are sized by different flags: --checkpoint-slots is
     # the DEVICE pool the retention policy spends, and a share of --prefix-cache-host-mib (startup

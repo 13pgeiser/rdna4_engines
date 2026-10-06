@@ -1349,14 +1349,14 @@ TEST(the_gate_names_its_caller) {
     CHECK(has(msg, "the container's layout"));
 }
 
-/* A span, per-part spans and a zero share have to SURVIVE THE WEIGHT LIST GROWING: WeightInfo's
- * copy is hand-written (the atomic), so a field the copy leaves out is reset on every weight
- * declared before the vector's last reallocation -- which is what the loader saw on rank 0 of a
- * three-rank Flash-Next: layer 0's [a|b] with its per-part spans gone, refused as an even share. */
-TEST(shard_spans_and_zero_survive_the_weight_list_reallocating) {
+/* A span and per-part spans have to SURVIVE THE WEIGHT LIST GROWING: WeightInfo's copy is
+ * hand-written (the atomic), so a field the copy leaves out is reset on every weight declared
+ * before the vector's last reallocation, and the loader then sees an uneven share as an even one
+ * and refuses it. */
+TEST(shard_spans_survive_the_weight_list_reallocating) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
-    /* Three weights declared first and marked, then enough declared after them to grow the
+    /* Two weights declared first and marked, then enough declared after them to grow the
      * list several times over. */
     RadWeightDecl d{};
     d.dtype = RAD_BF16; d.rank = 2; d.shape[0] = 36; d.shape[1] = 64;
@@ -1370,8 +1370,6 @@ TEST(shard_spans_and_zero_survive_the_weight_list_reallocating) {
     const rad_weight sp = decl_w(b, "span", 18, 64);
     CHECK_EQ(b.weight_shard_span(sp, 6, 24), RAD_OK);
 
-    const rad_weight z = decl_w(b, "zero", 18, 64);
-    CHECK_EQ(b.weight_shard_zero(z), RAD_OK);
 
     for (int i = 0; i < 300; ++i) {
         char n[32]; snprintf(n, sizeof n, "w%d", i);
@@ -1387,8 +1385,6 @@ TEST(shard_spans_and_zero_survive_the_weight_list_reallocating) {
     w = b.program().weight(sp);
     CHECK_EQ((long long)w->shard_lo, 6LL);
     CHECK_EQ((long long)w->shard_hi, 24LL);
-    w = b.program().weight(z);
-    CHECK(w->shard_zero);
     CHECK_EQ((int)b.errors().size(), 0);
 }
 

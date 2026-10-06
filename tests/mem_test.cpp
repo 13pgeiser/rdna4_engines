@@ -16,6 +16,7 @@
 #include "device/device.h"
 #include "plugin/registry.h"
 #include "runtime/tierexec.h"
+#include "sched/mem_iface.h"
 #include "rad_internal.h"
 
 #include <algorithm>
@@ -85,6 +86,7 @@ static std::vector<KVGroupInfo> hybrid_groups(bool with_linear = true) {
 
 struct Fixture {
     Pools pools;
+    HostArena ck;              /* the engine's snapshot store, in miniature */
     KVManager kv;
     PrefixCache pc;
     Config cfg = small_config();
@@ -98,6 +100,11 @@ struct Fixture {
         if (s < 0) return s;
         s = kv.configure(groups, cfg, pools.kv());
         if (s < 0) return s;
+        if (kv.checkpoint_bytes() > 0 && cfg.checkpoint_slots > 0) {
+            s = ck.open(kv.checkpoint_bytes(), kv.checkpoint_bytes() * cfg.checkpoint_slots);
+            if (s < 0) return s;
+            kv.set_checkpoint_store(&ck, 0);
+        }
         return pc.configure(cfg, &kv, cfg.checkpoint_interval);
     }
 };
@@ -192,11 +199,12 @@ TEST(a_refused_backing_allocation_says_it_was_refused_and_why) {
 /* ================================================================== the derived budget */
 
 TEST(derived_budget_takes_the_statics_off_the_top_then_divides_the_rest) {
+    /* With no lender stated the experts come first; what each side gets is the subject of the
+     * cases below. */
     Config c = small_config();
     c.vram_weights_mib = 0;              /* both unset: derive */
     c.vram_kv_mib      = 0;
     c.gpu_headroom_mib = 96;
-    c.expert_cache_ratio = 0.75;
     c.max_seqs = 8;
     c.max_ctx  = 2048;
 
@@ -207,62 +215,111 @@ TEST(derived_budget_takes_the_statics_off_the_top_then_divides_the_rest) {
     f.statics    = 2LL << 30;                    /* this rank's shard of the non-expert weights */
     f.experts    = 200LL << 30;                  /* far more than fits: the plane is elastic */
     f.kv_ceiling = 100LL << 30;                  /* far above any share, so no cap fires */
+    f.kv_one     = 1LL << 30;
 
     VramBudget b;
     CHECK_OK(vram_budget_resolve(c, { f }, &b));
 
-    CHECK_EQ(b.claimable, f.capacity - (512LL << 20) - (96LL << 20) - (144LL << 20));
+    /* Held, the driver's drift on it, the headroom and the arena. */
+    CHECK_EQ(b.drift, 16LL << 20);
+    CHECK_EQ(b.claimable, f.capacity - (512LL << 20) - (16LL << 20) - (96LL << 20) - (144LL << 20));
     CHECK(b.derived_weights && b.derived_kv);
 
-    /* THE FLOOR IS NOT A SHARE. The statics come out whole before the ratio sees anything, so
-     * lowering the ratio can never demote an attention projection to host memory. */
+    /* THE FLOOR IS NOT A SHARE. The statics come out whole before the split sees anything, so
+     * nothing the cache is given can demote an attention projection to host memory. */
     CHECK_EQ(b.statics, f.statics);
     CHECK_EQ(b.elastic, b.claimable - f.statics);
     CHECK_EQ(b.experts + b.kv, b.elastic);
     CHECK_EQ(b.weights, b.statics + b.experts);
 
-    /* Three quarters and a quarter OF THE ELASTIC PART, which is the whole point: against the
-     * claimable total the weights are a much larger fraction than 0.75, and that is correct. */
-    const double share = (double)b.experts / (double)b.elastic;
-    CHECK(share > 0.74 && share < 0.76);
-
     const int64_t MiB = 1024 * 1024;
     const int64_t unclaimed = f.capacity - (512LL << 20) - f.arena
                             - c.vram_weights_mib * MiB - c.vram_kv_mib * MiB;
-    CHECK(unclaimed >= 96 * MiB);                 /* never less than the headroom asked for */
-    CHECK(unclaimed < 98 * MiB);                  /* and never more than MiB rounding can strand */
+    CHECK(unclaimed >= 112 * MiB);                /* never less than the headroom and the drift */
+    CHECK(unclaimed < 114 * MiB);                 /* and never more than MiB rounding can strand */
 }
 
-TEST(the_ratio_moves_the_elastic_part_and_only_that) {
-    /* The same card at two ratios. The statics are identical in both; everything that moves is
-     * the division of what was left. */
+static Config derive_config() {
+    Config c = small_config();
+    c.vram_weights_mib = 0; c.vram_kv_mib = 0; c.gpu_headroom_mib = 96;
+    return c;
+}
+static VramFacts big_moe_facts() {
     VramFacts f{};
     f.capacity   = 32LL << 30;
     f.free       = f.capacity - (512LL << 20);
     f.arena      = 144LL << 20;
     f.statics    = 4LL << 30;
-    f.experts    = 200LL << 30;
+    f.experts    = 40LL << 30;                   /* more than the card: some must stream */
     f.kv_ceiling = 100LL << 30;
+    f.kv_one     = 2LL << 30;
+    return f;
+}
 
-    Config c7 = small_config();
-    c7.vram_weights_mib = 0; c7.vram_kv_mib = 0; c7.gpu_headroom_mib = 96;
-    c7.expert_cache_ratio = 0.7;
-    VramBudget b7;
-    CHECK_OK(vram_budget_resolve(c7, { f }, &b7));
+/* A LENDING CACHE TAKES EVERYTHING THE EXPERTS CAN DO WITHOUT. The experts keep on the card what
+ * the host pool cannot hold (expert_vram_floor, which place_test holds to the planner) and not a
+ * byte more: every block the cache does not use is lent back to them. */
+TEST(a_lending_cache_takes_everything_the_experts_can_do_without) {
+    VramFacts f = big_moe_facts();
+    f.lends     = true;
+    f.expert_floor = 16LL << 30;                 /* the host pool takes 24 of the 40 */
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK(b.lends);
+    CHECK_EQ(b.expert_floor, 16LL << 30);
+    CHECK_EQ(b.experts, b.expert_floor);
+    CHECK_EQ(b.kv, b.elastic - b.expert_floor);
+    CHECK_EQ(b.weights, b.statics + b.experts);
 
-    Config c3 = small_config();
-    c3.vram_weights_mib = 0; c3.vram_kv_mib = 0; c3.gpu_headroom_mib = 96;
-    c3.expert_cache_ratio = 0.3;
-    VramBudget b3;
-    CHECK_OK(vram_budget_resolve(c3, { f }, &b3));
+    /* AND THE HOST POOL IS WHAT MOVES IT: a larger pool takes experts off the card, and the cache
+     * gets exactly that much more. */
+    VramFacts g = f;
+    g.expert_floor = 12LL << 30;
+    Config c2 = derive_config();
+    VramBudget b2;
+    CHECK_OK(vram_budget_resolve(c2, { g }, &b2));
+    CHECK_EQ(b2.experts, b.experts - (4LL << 30));
+    CHECK_EQ(b2.kv, b.kv + (4LL << 30));
+    CHECK_EQ(b2.statics, b.statics);
+}
 
-    CHECK_EQ(b7.statics, b3.statics);             /* the floor does not move */
-    CHECK_EQ(b7.elastic, b3.elastic);
-    CHECK(b7.experts > b3.experts);               /* 0.7 gives the experts more than 0.3 does */
-    CHECK(b7.kv < b3.kv);
-    /* And even at 0.3 the weight pool still holds every static byte. */
-    CHECK(b3.weights > b3.statics);
-    CHECK_EQ(b3.weights, b3.statics + b3.experts);
+/* WITHOUT A LENDER a block the cache does not use sits empty, so the experts come first and the
+ * cache keeps one --max-model-len sequence. */
+TEST(without_a_lender_the_experts_come_first_and_the_cache_keeps_one_sequence) {
+    VramFacts f = big_moe_facts();
+    f.lends     = false;
+    f.expert_floor = 16LL << 30;
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK(!b.lends);
+    CHECK_EQ(b.kv, f.kv_one);
+    CHECK_EQ(b.experts, b.elastic - f.kv_one);
+}
+
+/* THE CACHE NEVER GETS LESS THAN ONE FULL-LENGTH SEQUENCE: a context the API accepts and no pool
+ * can hold is a configuration error, and the experts' shortfall is the planner's to name. */
+TEST(the_cache_keeps_one_full_length_sequence_even_against_the_expert_floor) {
+    VramFacts f = big_moe_facts();
+    f.lends     = true;
+    f.expert_floor = f.experts;                  /* every expert wants the card */
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK_EQ(b.kv, f.kv_one);
+    CHECK_EQ(b.experts, b.elastic - f.kv_one);
+
+    /* And a cache that could never use more than its ceiling gives the rest to the experts. */
+    VramFacts g = big_moe_facts();
+    g.lends      = true;
+    g.expert_floor = 1LL << 30;
+    g.kv_ceiling = 3LL << 30;
+    Config c2 = derive_config();
+    VramBudget b2;
+    CHECK_OK(vram_budget_resolve(c2, { g }, &b2));
+    CHECK_EQ(b2.kv, g.kv_ceiling);
+    CHECK_EQ(b2.experts, b2.elastic - g.kv_ceiling);
 }
 
 TEST(neither_side_is_given_more_than_it_could_use) {
@@ -271,7 +328,6 @@ TEST(neither_side_is_given_more_than_it_could_use) {
      * allocated into a pool that would sit empty. */
     Config c = small_config();
     c.vram_weights_mib = 0; c.vram_kv_mib = 0; c.gpu_headroom_mib = 96;
-    c.expert_cache_ratio = 0.75;
 
     VramFacts f{};
     f.capacity   = 32LL << 30;
@@ -291,13 +347,12 @@ TEST(neither_side_is_given_more_than_it_could_use) {
 }
 
 TEST(a_dense_model_has_no_expert_share_to_lose) {
-    /* A dense model in miniature: 42 dense layers and not one expert. The ratio's weight share has
+    /* A dense model in miniature: 42 dense layers and not one expert. An expert share would have
      * nothing to claim it, and a share nothing can claim is not slack -- it is memory no pool will
      * ever touch. Handing it to the weights anyway reserves tens of gigabytes for 0 B of experts
      * and leaves the cache short of the worst case it was asked to back. */
     Config c = small_config();
     c.vram_weights_mib = 0; c.vram_kv_mib = 0; c.gpu_headroom_mib = 96;
-    c.expert_cache_ratio = 0.75;
     c.max_seqs = 8;
     c.max_ctx  = 131072;
 
@@ -335,7 +390,6 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
     c.vram_weights_mib = 0;
     c.vram_kv_mib      = 0;
     c.gpu_headroom_mib = 96;
-    c.expert_cache_ratio = 0.75;
     VramFacts f{};
     f.capacity   = 32LL << 30;
     f.free       = f.capacity - (512LL << 20);
@@ -352,7 +406,6 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
     c2.vram_weights_mib = 0;
     c2.vram_kv_mib      = 0;
     c2.gpu_headroom_mib = 96;
-    c2.expert_cache_ratio = 0.75;
     VramFacts g = f, h = f;
     g.n_queues = 2; g.queue_bytes = 33LL << 20;
     h.n_queues = 3; h.queue_bytes = 33LL << 20;     /* a rank with a second compute lane */
@@ -363,12 +416,13 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
     CHECK_EQ(b.claimable, b0.claimable - (99LL << 20));
     CHECK(b.report.find("hardware queues") != std::string::npos);
 
-    /* What is left after the pools is still the headroom, with the queues and the staging paid. */
+    /* What is left after the pools is still the headroom and the drift, with the queues and the
+     * staging paid. */
     const int64_t MiB = 1024 * 1024;
     const int64_t unclaimed = f.capacity - (512LL << 20) - f.arena - f.staging - b.queues
                             - c2.vram_weights_mib * MiB - c2.vram_kv_mib * MiB;
-    CHECK(unclaimed >= 96 * MiB);
-    CHECK(unclaimed < 98 * MiB);
+    CHECK(unclaimed >= 112 * MiB);
+    CHECK(unclaimed < 114 * MiB);
 }
 
 TEST(a_stated_budget_still_wins_and_the_other_side_still_derives) {
@@ -461,16 +515,11 @@ TEST(kv_configure_reports_and_sizes) {
     CHECK_EQ(f.kv.checkpoint_bytes(), 16384ll);
     CHECK_EQ(f.kv.checkpoint_slots(), 4ll);
     CHECK(full->n_blocks > 0);
-    /* 1 MiB minus 8 states, 4 checkpoints and TWO ALIGNMENT UNITS, all of it in pages of 2 KiB.
-     * The two units are the budget admitting what the pool actually spends: every reserve()
-     * aligns its offset up, so a carve that hands the paged groups every remaining byte overruns
-     * by the padding. One is the paged group's own. The other is the checkpoint region's, and it
-     * is an allowance rather than an exact figure -- the slots are reserved LAST, after every
-     * group, so where the region starts is decided by the paged split that has not run yet.
-     * Without it the last slot does not fit a plan the report has just called a fit, on whichever
-     * models happen to leave the cursor off a boundary. */
-    CHECK_EQ(full->n_blocks,
-             ((1ll << 20) - 8 * 16384 - 4 * 16384 - 2 * RAD_ALIGN_UNIT) / 2048);
+    /* 1 MiB minus 8 states and ONE ALIGNMENT UNIT, all of it in pages of 2 KiB. The unit is the
+     * budget admitting what the pool actually spends: every reserve() aligns its offset up, so a
+     * carve that hands the paged groups every remaining byte overruns by the padding. The four
+     * snapshots cost the pool nothing -- they are in host memory. */
+    CHECK_EQ(full->n_blocks, ((1ll << 20) - 8 * 16384 - RAD_ALIGN_UNIT) / 2048);
 }
 
 TEST(kv_ranks_with_unequal_pools_carve_the_least_ranks_blocks_under_a_cap) {
@@ -508,6 +557,40 @@ TEST(kv_ranks_with_unequal_pools_carve_the_least_ranks_blocks_under_a_cap) {
     CHECK_EQ(c.kv.plan(G_FULL)->n_blocks, tc / 16);
 }
 
+/* A RANK WHOSE ONLY PAGED GROUP IS ZERO (rad_kv_group_zero) pages nothing of its own, so its pages
+ * limit nobody: it reports no token count, takes the cap the ranks holding the cache set, carves
+ * nothing for the group and still holds the shared table's block count. Without a cap there is no
+ * count to hold, and the carve says so rather than leaving the group at zero blocks. */
+TEST(kv_a_rank_whose_only_paged_group_is_zero_takes_the_others_block_count) {
+    std::vector<KVGroupInfo> zg = hybrid_groups();
+    zg[1].zero = true;                           /* the one paged group */
+    Fixture a, z;
+    a.cfg.checkpoint_slots = z.cfg.checkpoint_slots = 0;
+    CHECK_OK(a.pools.configure(a.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_OK(z.pools.configure(z.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_OK(a.kv.plan_groups(hybrid_groups(), a.cfg));
+    CHECK_OK(z.kv.plan_groups(zg, z.cfg));
+    const int64_t ta = a.kv.paged_tokens(a.pools.kv().avail());
+    CHECK(ta > 0);
+    CHECK_EQ(z.kv.paged_tokens(z.pools.kv().avail()), KVManager::kUnboundedTokens);
+    a.kv.cap_paged_tokens(ta);
+    z.kv.cap_paged_tokens(ta);
+    CHECK_OK(a.kv.carve(a.pools.kv()));
+    CHECK_OK(z.kv.carve(z.pools.kv()));
+    CHECK_EQ(z.kv.plan(G_FULL)->n_blocks, a.kv.plan(G_FULL)->n_blocks);
+    CHECK(z.kv.plan(G_FULL)->base == nullptr);
+    CHECK_EQ(z.kv.plan(G_FULL)->pool_bytes, (int64_t)0);
+    CHECK(!z.kv.lendable(G_FULL));
+    /* Its recurrent state is its own and carved as on any rank. */
+    CHECK(z.kv.plan(G_GDN)->base != nullptr);
+
+    Fixture u;
+    u.cfg.checkpoint_slots = 0;
+    CHECK_OK(u.pools.configure(u.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_OK(u.kv.plan_groups(zg, u.cfg));
+    CHECK_EQ(u.kv.carve(u.pools.kv()), RAD_E_STATE);
+}
+
 TEST(kv_refuses_a_group_with_no_block_size) {
     /* Block size comes off the resolved attention kernel. A zero here means the attention op did
      * not resolve, and the manager refuses rather than inventing 16. */
@@ -529,8 +612,9 @@ TEST(kv_refuses_when_fixed_costs_do_not_fit) {
     CHECK_OK(f.pools.configure(f.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
     CHECK_EQ(f.kv.configure(hybrid_groups(), f.cfg, f.pools.kv()), RAD_E_NOMEM);
 
-    /* And the checkpoint budget is a budget: the same config fits at 8 sequences with no
-     * snapshots and stops fitting once --checkpoint-slots asks for more than is left. */
+    /* AND THE SNAPSHOTS ARE NOT PART OF IT. The same config fits at 8 sequences whatever
+     * --checkpoint-slots asks for -- 64 x 16 KiB is the whole pool, and it is host memory -- and
+     * the paged groups get exactly what they get with none. */
     Fixture g2;
     g2.cfg.max_seqs = 8;
     g2.cfg.checkpoint_slots = 0;
@@ -538,9 +622,11 @@ TEST(kv_refuses_when_fixed_costs_do_not_fit) {
     CHECK_OK(g2.kv.configure(hybrid_groups(), g2.cfg, g2.pools.kv()));
     Fixture g3;
     g3.cfg.max_seqs = 8;
-    g3.cfg.checkpoint_slots = 64;         /* 64 x 16 KiB = 1 MiB, on top of the state */
+    g3.cfg.checkpoint_slots = 64;
     CHECK_OK(g3.pools.configure(g3.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
-    CHECK_EQ(g3.kv.configure(hybrid_groups(), g3.cfg, g3.pools.kv()), RAD_E_NOMEM);
+    CHECK_OK(g3.kv.configure(hybrid_groups(), g3.cfg, g3.pools.kv()));
+    CHECK_EQ(g3.kv.fixed_bytes(), g2.kv.fixed_bytes());
+    CHECK_EQ(g3.kv.plan(G_FULL)->n_blocks, g2.kv.plan(G_FULL)->n_blocks);
 }
 
 
@@ -920,6 +1006,11 @@ TEST(prefix_cache_lru_eviction_order) {
     publish(f, 2, b, 16);
     publish(f, 3, c, 16);
     CHECK_EQ(f.pc.size(), 3ll);
+    /* WHILE THE SEQUENCES HOLD THEM, EVICTION TAKES NOTHING: releasing the cache's reference
+     * would free no block and only lose the entry. */
+    CHECK_EQ(f.pc.evict_lru(3), 0ll);
+    CHECK_EQ(f.pc.size(), 3ll);
+    for (uint64_t id : { 1, 2, 3 }) f.kv.free_sequence(id);
 
     /* Touch A, so the order becomes B, C, A. */
     CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 16);
@@ -931,9 +1022,6 @@ TEST(prefix_cache_lru_eviction_order) {
     CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, 0);      /* B was the oldest and went first */
     CHECK_EQ(f.pc.lookup(c, {}).n_attn_tokens, 16);
     CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 16);
-
-    /* Eviction releases the cache's reference; it does not free a block a sequence still holds. */
-    CHECK(f.kv.block_refcount(G_FULL, f.kv.block_table(2, G_FULL)[0]) >= 1);
 }
 
 TEST(prefix_cache_holds_a_reference_on_every_indexed_block) {
@@ -975,6 +1063,8 @@ TEST(the_cache_reports_the_context_it_is_holding) {
 
     /* And it falls when the cache gives blocks back, which is the half that makes it an answer
      * to "is the pool releasing anything". */
+    f.kv.free_sequence(1);
+    f.kv.free_sequence(2);
     f.pc.evict_lru(1);
     CHECK_EQ(f.pc.size() * f.pc.block_size(), 32);
     f.pc.clear();
@@ -1049,6 +1139,74 @@ TEST(split_lookup_reuses_attention_between_checkpoints) {
     /* A checkpoint under a DIFFERENT prefix is not reachable from here. */
     auto other = tok_run(9000, 336);
     CHECK_EQ(f.pc.lookup(other, {}).n_linear_tokens, 0);
+}
+
+/* The chained block hashes of `tokens`, one a block, as the cache computes them. */
+static std::vector<BlockHash> chain_of(const std::vector<int32_t>& tokens, int bs) {
+    std::vector<BlockHash> hs;
+    BlockHash parent;
+    for (int b = 0; b + bs <= (int)tokens.size(); b += bs) {
+        parent = chain_block_hash(parent, tokens.data() + b, bs, nullptr, 0, b);
+        hs.push_back(parent);
+    }
+    return hs;
+}
+static void ckpt_at(Fixture& f, uint64_t session, const std::vector<BlockHash>& hs, int64_t pos) {
+    int32_t slot = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(session, pos, hs[(size_t)(pos / 16 - 1)], &slot));
+    CHECK(slot >= 0);
+    f.pc.commit_checkpoint(hs[(size_t)(pos / 16 - 1)]);
+}
+
+/* A CHECKPOINT AT THE TAIL OF A PROMPT, off the interval, is one the next turn resumes from: the
+ * lookup takes the deepest snapshot under the hit wherever it sits on a block boundary. */
+TEST(a_checkpoint_at_the_tail_of_a_prompt_is_found_and_the_deepest_wins) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    const auto prompt = tok_run(7000, 336);
+    publish(f, 1, prompt, 320);
+    const std::vector<BlockHash> hs = chain_of(prompt, 16);
+    ckpt_at(f, 1, hs, 128);                   /* on the interval */
+    ckpt_at(f, 1, hs, 304);                   /* the tail: a block boundary, not an interval */
+    CacheHit h = f.pc.lookup(prompt, {});
+    CHECK_EQ(h.n_attn_tokens, 320);
+    CHECK_EQ(h.n_linear_tokens, 304);
+
+    /* A prompt that shares only the first 200 tokens reaches 128 and not 304. */
+    auto other = prompt;
+    for (size_t k = 200; k < other.size(); ++k) other[k] += 50000;
+    CHECK_EQ(f.pc.lookup(other, {}).n_linear_tokens, 128);
+
+    /* Off a block boundary there is no key to hold it by. */
+    int32_t slot = -1;
+    CHECK_EQ(f.pc.reserve_checkpoint(1, 300, hs[300 / 16 - 1], &slot), RAD_E_INVAL);
+}
+
+/* A CONVERSATION'S SNAPSHOTS BELONG TO ITS LATEST TURN, so the retention policy sees one session
+ * with one tip rather than one tip a turn. What a diverging conversation shares moves with the
+ * prefix it shares, and only that. */
+TEST(a_turn_that_extends_a_conversation_takes_over_its_snapshots) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+    const auto p1 = tok_run(7000, 336);
+    publish(f, 1, p1, 320);
+    const std::vector<BlockHash> hs = chain_of(p1, 16);
+    ckpt_at(f, 1, hs, 128);
+    ckpt_at(f, 1, hs, 256);
+    CHECK_EQ(f.pc.checkpoints(1).size(), 2u);
+
+    auto p2 = p1;
+    for (int k = 0; k < 64; ++k) p2.push_back(90000 + k);
+    publish(f, 2, p2, 400);
+    CHECK(f.pc.checkpoints(1).empty());
+    CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 128, 256 }));
+    CHECK_EQ(f.pc.sessions_tracked(), 1ll);
+
+    auto p3 = p1;
+    for (size_t k = 200; k < p3.size(); ++k) p3[k] += 50000;
+    publish(f, 3, p3, 320);
+    CHECK(f.pc.checkpoints(3) == (std::vector<int64_t>{ 128 }));
+    CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 256 }));
 }
 
 TEST(checkpoint_interval_must_be_a_block_multiple) {
@@ -1587,214 +1745,64 @@ TEST(a_follower_takes_the_leaders_mark) {
  * model has, and it is the only shape for which a checkpoint slot is managed elastically. The
  * second state dimension is solved for rather than written down, because a constant that happened
  * to clear a 2 MiB granule would quietly stop testing anything on a device with a larger one. */
-static std::vector<KVGroupInfo> big_linear_groups(int64_t want_state_bytes) {
-    std::vector<KVGroupInfo> g = hybrid_groups(/*with_linear=*/false);
-    KVGroupInfo k;
-    k.name = "gdn";
-    k.decl.kind = RAD_KV_LINEAR;
-    k.decl.dtype = RAD_F32;
-    k.decl.n_head_kv = 4;
-    k.decl.state_dim[0] = 256;
-    k.layers = { 2, 3, 4, 5 };
-    /* bytes = n_head_kv * d0 * d1 * sizeof(f32) * n_layers */
-    const int64_t per_d1 = 4ll * 256 * 4 * (int64_t)k.layers.size();
-    k.decl.state_dim[1] = (int32_t)std::max<int64_t>(16, (want_state_bytes + per_d1 - 1) / per_d1);
-    g.push_back(k);
-    return g;
-}
+/* ================================================================== the snapshot store */
 
-struct BigCkpt {
-    Pools     pools;
-    KVManager kv;
-    Config    cfg = small_config();
-
-    int build(int64_t ckpt_slots = 4) {
-        cfg.vram_kv_mib      = 1024;
-        cfg.max_seqs         = 2;
-        cfg.max_tok          = 256;
-        cfg.checkpoint_slots = ckpt_slots;
-        int s = pools.configure(cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator());
-        if (s < 0) return s;
-        return kv.configure(big_linear_groups(2 * Pool::granule()), cfg, pools.kv());
-    }
-};
-
-TEST(a_checkpoint_slot_is_backed_when_it_is_handed_out) {
-    if (!VMem::supported()) {
-        std::fprintf(stderr, "  SKIP a_checkpoint_slot_is_backed_when_it_is_handed_out: no VMM\n");
-        return;
-    }
-    BigCkpt f;
-    CHECK_OK(f.build(/*ckpt_slots=*/4));
-    REQUIRE(f.pools.kv().elastic());
-    CHECK_EQ(f.kv.checkpoint_slots(), 4);
-    CHECK_EQ(f.kv.free_checkpoint_slots(), 4);
-    CHECK(f.kv.checkpoint_bytes() >= Pool::granule());
-
-    const int64_t idle = f.pools.kv().committed();
-    int32_t a = -1, b = -1;
-    CHECK_OK(f.kv.alloc_checkpoint(&a));
-    const int64_t one = f.pools.kv().committed();
-    CHECK(one > idle);                              /* taking one costs the card */
-    CHECK_OK(f.kv.alloc_checkpoint(&b));
-    CHECK(f.pools.kv().committed() > one);
-
-    /* AND GIVING IT BACK RELEASES IT EXACTLY, which is what the granule-aligned stride buys: an
-     * unaligned slot would round its release inward and leave a partial granule backed forever. */
-    f.kv.free_checkpoint(b);
-    CHECK_EQ(f.pools.kv().committed(), one);
-    f.kv.free_checkpoint(a);
-    CHECK_EQ(f.pools.kv().committed(), idle);
-
-    /* The slot comes back at the same address and really backed: the pointer never moved, only
-     * the pages under it. Asked of the pool rather than by writing to it -- an elastic range is
-     * DEVICE memory even here, because it comes from the driver and not from the fixture's
-     * allocators, so a host store to it is a fault and not a test. */
-    int32_t again = -1;
-    CHECK_OK(f.kv.alloc_checkpoint(&again));
-    void* p = f.kv.checkpoint_ptr(again);
-    REQUIRE(p != nullptr);
-    const int64_t off = (char*)p - (char*)f.pools.kv().base();
-    CHECK(f.pools.kv().is_committed(off, f.kv.checkpoint_bytes()));
-    f.kv.free_checkpoint(again);
-    CHECK(!f.pools.kv().is_committed(off, f.kv.checkpoint_bytes()));
-}
-
-/* THE OTHER HALF OF THE SAME DECISION. A snapshot smaller than a granule cannot be committed on
- * its own without rounding the slot up to one, which on this fixture's 16 KiB state is 128x the
- * address space to manage a charge of 64 KiB. Those slots stay in the eagerly backed region --
- * so the whole point of the test is that handing one out moves NOTHING, and the slot works
- * anyway. Without this the engine would silently pick the mode and nothing would say which. */
-TEST(a_snapshot_below_a_granule_is_not_managed) {
-    if (!VMem::supported()) {
-        std::fprintf(stderr, "  SKIP a_snapshot_below_a_granule_is_not_managed: no VMM\n");
-        return;
-    }
+/* A SLOT IS HOST MEMORY AND THE POOL NEVER SEES IT. Taking one, writing it and giving it back
+ * moves nothing the KV pool reports, and the bytes are the store's: what is written through
+ * checkpoint_ptr is what the store holds at that slot. */
+TEST(a_checkpoint_slot_is_host_memory_and_costs_the_pool_nothing) {
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
-    REQUIRE(f.kv.checkpoint_bytes() < Pool::granule());
-
-    const int64_t idle = f.pools.kv().committed();
-    int32_t a = -1, b = -1;
-    CHECK_OK(f.kv.alloc_checkpoint(&a));
-    CHECK_OK(f.kv.alloc_checkpoint(&b));
-    CHECK_EQ(f.pools.kv().committed(), idle);       /* nothing to back and nothing to reclaim */
-    void* p = f.kv.checkpoint_ptr(a);
-    REQUIRE(p != nullptr);
-    const int64_t off = (char*)p - (char*)f.pools.kv().base();
-    CHECK(f.pools.kv().is_committed(off, f.kv.checkpoint_bytes()));   /* backed all along */
-    f.kv.free_checkpoint(a);
-    f.kv.free_checkpoint(b);
+    CHECK_EQ(f.kv.checkpoint_slots(), 4);
     CHECK_EQ(f.kv.free_checkpoint_slots(), 4);
-}
-
-/* A SIMULATED CARD: `cap` bytes, of which the pools on it have committed what they report. The
- * floor tests cannot read the real device -- memory the previous test's fixtures released is still
- * coming back while this one reads, so the answer moves under them -- and two ranks here share
- * one device where the engine's are on two. A card per rank is what the engine has. */
-struct SimCard {
-    int64_t cap = 0;
-    std::vector<const Pool*> pools;
-    int64_t used() const {
-        int64_t u = 0;
-        for (const Pool* p : pools) u += p->committed();
-        return u;
-    }
-    KVManager::FreeBytes reader() const {
-        return [this](int64_t* free_now) -> int { *free_now = cap - used(); return RAD_OK; };
-    }
-    /* The floor that lets `extra` more slots of `stride` fit and not one more: half a slot of
-     * slack either side of the boundary. */
-    int64_t floor_for(int64_t extra, int64_t stride) const {
-        return cap - used() - extra * stride - stride / 2;
-    }
-};
-
-/* A SLOT IS BACKED ON EVERY RANK OR HANDED OUT ON NONE. If rank 0 backs a slot at allocation and
- * rank 1's card refuses it at the snapshot copy, the engine stops mid-serve. So the peer is asked
- * before anything is committed: its refusal is a full pool at allocation, which the prefix cache
- * answers, and the leader has spent nothing on the slot it could not hand out. */
-TEST(a_checkpoint_slot_is_backed_on_every_rank_or_none) {
-    if (!VMem::supported()) {
-        std::fprintf(stderr, "  SKIP a_checkpoint_slot_is_backed_on_every_rank_or_none: no VMM\n");
-        return;
-    }
-    BigCkpt lead, peer;
-    CHECK_OK(lead.build(/*ckpt_slots=*/4));
-    CHECK_OK(peer.build(/*ckpt_slots=*/4));
-    lead.kv.set_checkpoint_peers({ &peer.kv });
-    const int64_t stride = lead.kv.checkpoint_stride();
-    REQUIRE(stride > 0);
-    SimCard lcard, pcard;
-    lcard.cap = pcard.cap = 64ll << 30;
-    lcard.pools = { &lead.pools.kv() };
-    pcard.pools = { &peer.pools.kv() };
-
-    /* Room on the leader's card and none on the peer's: nothing is handed out. */
-    lead.kv.set_checkpoint_floor(lcard.reader(), lcard.floor_for(4, stride));
-    peer.kv.set_checkpoint_floor(pcard.reader(), pcard.floor_for(0, stride));
-    const int64_t l0 = lead.pools.kv().committed(), p0 = peer.pools.kv().committed();
-    int32_t s = -1;
-    CHECK_EQ(lead.kv.alloc_checkpoint(&s), RAD_E_FULL);
-    CHECK_EQ(lead.pools.kv().committed(), l0);       /* asked first, so nothing was spent */
-    CHECK_EQ(peer.pools.kv().committed(), p0);
-    CHECK_EQ(lead.kv.free_checkpoint_slots(), 4);
-
-    /* Room for one slot on the peer's card: that one is backed on both, and the next one is
-     * refused by the peer and costs the leader nothing. */
-    peer.kv.set_checkpoint_floor(pcard.reader(), pcard.floor_for(1, stride));
-    CHECK_OK(lead.kv.alloc_checkpoint(&s));
-    CHECK_EQ(lead.pools.kv().committed(), l0 + stride);
-    CHECK_EQ(peer.pools.kv().committed(), p0 + stride);
-    int32_t t = -1;
-    CHECK_EQ(lead.kv.alloc_checkpoint(&t), RAD_E_FULL);
-    CHECK_EQ(lead.pools.kv().committed(), l0 + stride);
-    CHECK_EQ(peer.pools.kv().committed(), p0 + stride);
-
-    /* And a copy into the slot finds it backed on the peer without touching the card. */
-    CHECK_OK(peer.kv.back_checkpoint(s));
-    CHECK_EQ(peer.pools.kv().committed(), p0 + stride);
-    lead.kv.free_checkpoint(s);
-}
-
-/* ON A DRIVER THAT KEEPS WHAT IT MAPS, EVERY SLOT IS BACKED AT BRINGUP, and the ones the card has
- * no room for above its floor are withdrawn -- never handed out, so serving never commits. */
-TEST(back_free_checkpoints_withdraws_what_the_card_cannot_hold) {
-    if (!VMem::supported()) {
-        std::fprintf(stderr, "  SKIP back_free_checkpoints_withdraws_what_the_card_cannot_hold: "
-                             "no VMM\n");
-        return;
-    }
-    BigCkpt f;
-    CHECK_OK(f.build(/*ckpt_slots=*/4));
-    f.kv.set_release_frees_card(false);
-    const int64_t stride = f.kv.checkpoint_stride();
-    SimCard card;
-    card.cap = 64ll << 30;
-    card.pools = { &f.pools.kv() };
-    f.kv.set_checkpoint_floor(card.reader(), card.floor_for(2, stride));
-    const int64_t idle = f.pools.kv().committed();
-
-    int64_t gone = -1;
-    CHECK_OK(f.kv.back_free_checkpoints(&gone));
-    CHECK_EQ(gone, 2);
-    CHECK_EQ(f.kv.free_checkpoint_slots(), 2);
-    const int64_t backed = f.pools.kv().committed();
-    CHECK_EQ(backed, idle + 2 * stride);
-
-    /* Both survivors are handed out with no commit, and then the pool is full. */
-    int32_t a = -1, b = -1, c = -1;
+    const int64_t used = f.pools.kv().used();
+    int32_t a = -1, b = -1;
     CHECK_OK(f.kv.alloc_checkpoint(&a));
     CHECK_OK(f.kv.alloc_checkpoint(&b));
     CHECK(a != b);
-    CHECK_EQ(f.pools.kv().committed(), backed);
-    CHECK_EQ(f.kv.alloc_checkpoint(&c), RAD_E_FULL);
-
-    /* A freed slot keeps its pages on this driver and is the one handed out next. */
+    CHECK_EQ(f.kv.free_checkpoint_slots(), 2);
+    CHECK_EQ(f.pools.kv().used(), used);
+    char* p = (char*)f.kv.checkpoint_ptr(a);
+    REQUIRE(p != nullptr);
+    CHECK(p == (char*)f.ck.at(a));
+    std::memset(p, 0x5a, (size_t)f.kv.checkpoint_bytes());
+    CHECK_EQ(((unsigned char*)f.ck.at(a))[f.kv.checkpoint_bytes() - 1], 0x5a);
     f.kv.free_checkpoint(a);
-    CHECK_OK(f.kv.alloc_checkpoint(&c));
-    CHECK_EQ(c, a);
-    CHECK_EQ(f.pools.kv().committed(), backed);
+    f.kv.free_checkpoint(a);                         /* a double free is refused, not counted */
+    f.kv.free_checkpoint(b);
+    CHECK_EQ(f.kv.free_checkpoint_slots(), 4);
+}
+
+/* NO STORE, NO SLOTS: a hybrid model served without one hands nothing out, rather than a pointer
+ * to memory nobody owns. */
+TEST(without_a_store_no_checkpoint_slot_is_handed_out) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/0));
+    CHECK_EQ(f.kv.checkpoint_slots(), 0);
+    int32_t s = -1;
+    CHECK_EQ(f.kv.alloc_checkpoint(&s), RAD_E_FULL);
+    CHECK(f.kv.checkpoint_ptr(0) == nullptr);
+}
+
+/* ONE SLOT, EVERY RANK'S SHARD. Rank 0 hands the ids out and each rank addresses its own window
+ * of the same slot, so the disk tier can move a slot as one payload; two ranks writing at offset
+ * zero would leave the last one's shard and restore it on both. */
+TEST(each_rank_addresses_its_own_window_of_a_shared_snapshot_slot) {
+    Fixture lead, follow;
+    CHECK_OK(lead.build(/*with_linear=*/true, /*ckpt_slots=*/0));
+    CHECK_OK(follow.build(/*with_linear=*/true, /*ckpt_slots=*/0));
+    const int64_t shard = lead.kv.checkpoint_bytes();
+    HostArena store;
+    CHECK_OK(store.open(2 * shard, 2 * shard * 3));
+    lead.kv.set_checkpoint_store(&store, 0);
+    follow.kv.set_checkpoint_store(&store, shard);
+    int32_t s = -1;
+    CHECK_OK(lead.kv.alloc_checkpoint(&s));
+    CHECK((char*)lead.kv.checkpoint_ptr(s) == (char*)store.at(s));
+    CHECK((char*)follow.kv.checkpoint_ptr(s) == (char*)store.at(s) + shard);
+    CHECK_EQ(follow.kv.free_checkpoint_slots(), 2);  /* the follower reads the same free list */
+    lead.kv.free_checkpoint(s);
+    CHECK_EQ(store.used_slots(), 0);
 }
 
 RAD_TEST_MAIN()
@@ -2269,293 +2277,191 @@ TEST(tiers_stay_off_until_a_size_is_given) {
 /* ================================================================== the linear half
  *
  * On a hybrid model an entry's attention blocks are only part of a session. The rest is a
- * recurrent-state SNAPSHOT in a checkpoint slot, of which there are --checkpoint-slots for the
- * whole server, and a tier that copied the blocks and left the snapshot behind would free the
- * plentiful resource and hold the scarce one -- while the session that came back would replay
- * every linear layer from token zero and report a cache hit doing it.
+ * recurrent-state SNAPSHOT in a slot of the engine's checkpoint store -- pinned host memory,
+ * --checkpoint-slots of them for the whole server. A snapshot never follows its blocks through
+ * the tiers: it is restored straight out of its slot. The only tier below the store is disk, and
+ * what these tests pin is that leg -- what is written when, what the store may give up, and that
+ * a slot a write is reading is never handed to the next save.
  *
  * Still no bytes: every test drives the policy and reports jobs back as the engine would.
  */
 
 static IdleTiers::Config ck_config(int64_t host_bytes, int64_t disk_bytes, int64_t entry,
-                                   int64_t ck_bytes, int64_t ck_cap, int64_t ck_disk_slots) {
+                                   int64_t ck_bytes, int64_t ck_slots, int64_t ck_disk_slots) {
     IdleTiers::Config c = tier_config(host_bytes, disk_bytes, entry);
     c.ckpt_bytes      = ck_bytes;
-    c.ckpt_cap_bytes  = ck_cap;
+    c.ckpt_slots      = ck_slots;
     c.ckpt_disk_slots = ck_disk_slots;
     return c;
 }
 
-TEST(a_snapshot_is_copied_with_the_blocks_it_is_keyed_by) {
-    TmpDisk d;
-    CHECK_OK(d.open(1024, 2048, 8, 4));
+/* A tier with a disk store that holds snapshots: the configuration every test below starts from
+ * unless it is about the absence of one. */
+struct CkTiers {
+    TmpDisk   d;
     IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 1 << 20, 1024, 2048, 8192, 4), &d.disk));
-    CHECK(t.ckpt_on());
-    CHECK(t.disk_on());
+    int open(int64_t host = 1 << 20) {
+        RAD_TRY(d.open(1024, 2048, 16, 16));
+        return t.configure(ck_config(host, 1 << 20, 1024, 2048, 8, 16), &d.disk);
+    }
+};
 
-    t.note_used(bh(1), {10}, 1 * SEC);
-    t.note_snapshot(bh(1), /*dev_slot=*/7, /*pos=*/2048);
+/* A RESUME POINT GOES TO DISK AHEAD OF EVERYTHING. It is committed mid-request, before its chain
+ * is published, and until the disk holds it a full store can only retire it -- so it does not
+ * wait for its publish, nor behind a long queue of other conversations' writes. */
+TEST(a_resume_point_is_written_to_disk_ahead_of_everything) {
+    CkTiers c;
+    CHECK_OK(c.open());
+    IdleTiers& t = c.t;
+    for (uint64_t k = 1; k <= 64; ++k) t.note_used(bh(k), {(int32_t)k}, 1 * SEC);
+    copy_now(t);                                       /* 64 host copies wanting their disk copy */
+    t.note_snapshot(bh(500), /*slot=*/3, /*pos=*/4096, /*resume=*/false);
+    t.note_snapshot(bh(900), /*slot=*/5, /*pos=*/8192, /*resume=*/true);
+    CHECK(t.disk_waiting());
 
     std::vector<TierJob> jobs;
-    t.plan_writeback(16, &jobs);
-    REQUIRE_EQ(jobs.size(), 1u);
-    /* ONE JOB, BOTH HALVES. They are stored in different places and moved by different copies,
-     * but they are decided together. */
-    CHECK_EQ(jobs[0].blocks.size(), 1u);
-    CHECK_EQ(jobs[0].ck_dev, 7);
-    CHECK(jobs[0].ck_host >= 0);
-    CHECK_EQ(jobs[0].ck_pos, 2048ll);
-    CHECK(t.snapshot_reading(bh(1)));
-    t.report(jobs[0], true);
-    CHECK(!t.snapshot_reading(bh(1)));
-    CHECK_EQ(t.stats().ck_to_host, 1ll);
+    t.plan(4, &jobs);
+    REQUIRE(!jobs.empty());
+    CHECK(jobs[0].key == bh(900));
+    CHECK(jobs[0].kind == TierJob::Kind::ToDisk);
+    CHECK_EQ(jobs[0].ck_slot, 5);
+    CHECK_EQ(jobs[0].host_slot, -1);                   /* not published: the snapshot alone */
+    for (const TierJob& j : jobs) CHECK(!(j.key == bh(500)));   /* waits for its publish */
+    CHECK(t.slot_reading(5));
+    for (TierJob& j : jobs) t.report(j, true);
+    CHECK(!t.slot_reading(5));
+    CHECK(t.snapshot_backed(bh(900)));
+    CHECK_EQ(t.stats().ck_to_disk, 1ll);
+}
 
-    /* THE BLOCKS GO AND THE SNAPSHOT STAYS in its device slot, which nothing else could use;
-     * the copy is what lets the checkpoint pool take the slot later without losing the state. */
-    CHECK(drop_now(t, bh(1)));
-    CHECK(t.resident_off_device(bh(1)));
-    CHECK(t.snapshot_backed(bh(1)));
-    CHECK(detach_now(t, bh(1)));                  /* the pool wanted the slot */
-
-    /* ...and on to disk, both halves in one write, as COPIES: the host slots stay. */
-    CHECK(t.disk_waiting());
-    jobs.clear();
+/* A SNAPSHOT IS WRITTEN WHEN ITS CHAIN IS PUBLISHED, with the blocks' own write where both wait,
+ * and once the disk holds it the store may give its slot up and read it back later. */
+TEST(a_snapshot_the_disk_holds_gives_its_slot_up_and_is_read_back) {
+    CkTiers c;
+    CHECK_OK(c.open());
+    IdleTiers& t = c.t;
+    t.note_snapshot(bh(1), /*slot=*/7, /*pos=*/2048);
+    CHECK(!t.disk_waiting());                          /* not published yet */
+    t.note_used(bh(1), {10}, 1 * SEC);
+    copy_now(t);
+    std::vector<TierJob> jobs;
     t.plan(16, &jobs);
     REQUIRE_EQ(jobs.size(), 1u);
-    CHECK(jobs[0].kind == TierJob::Kind::ToDisk);
-    CHECK(jobs[0].host_slot >= 0);
-    CHECK(jobs[0].ck_host >= 0);
+    CHECK(jobs[0].host_slot >= 0);                     /* ONE WRITE, BOTH HALVES */
+    CHECK_EQ(jobs[0].ck_slot, 7);
+    CHECK_EQ(jobs[0].ck_pos, 2048ll);
+    CHECK(!t.snapshot_backed(bh(1)));                  /* not while the write is out */
     t.report(jobs[0], true);
-    CHECK_EQ(t.stats().to_disk, 1ll);
-    CHECK_EQ(t.stats().ck_to_disk, 1ll);
-    CHECK_EQ(t.arena().used_slots(), 1ll);
-    CHECK_EQ(t.ckpt_arena().used_slots(), 1ll);
-    CHECK(!t.disk_waiting());
-
-    /* The arena wants the slot: it goes for nothing, and the entry is a disk entry. */
-    CHECK_EQ(t.make_room(1), 1ll);
-    CHECK_EQ(t.tier_of(bh(1)), KVTier::Disk);
-    CHECK_EQ(t.arena().used_slots(), 0ll);
-    CHECK_EQ(t.stats().host_freed, 1ll);
-
-    /* ...and back: read into a host slot first, then promoted out of it with the device slot the
-     * engine allocated -- and the entry keeps both host copies, clean. */
-    TierJob up;
-    CHECK(!t.plan_promote(bh(1), &up));           /* not out of disk: a restore reads host memory */
-    const std::vector<TierJob> rd = fetch_now(t, {bh(1)});
-    REQUIRE_EQ(rd.size(), 1u);
-    CHECK(rd[0].kind == TierJob::Kind::ToHost);
-    CHECK_EQ(rd[0].ck_host, -1);                  /* the snapshot's host copy never left */
-    CHECK_EQ(t.tier_of(bh(1)), KVTier::Host);
-    CHECK(t.plan_promote(bh(1), &up));
-    CHECK(up.ck_want);
-    CHECK_EQ(up.host_slot, rd[0].host_slot);
-    CHECK(up.ck_host >= 0);
-    up.blocks = {11};
-    up.ck_dev = 3;
-    up.started = true;
-    t.report(up, true);
-    CHECK_EQ(t.stats().ck_promoted, 1ll);
-    CHECK_EQ(t.tier_of(bh(1)), KVTier::Device);
-    CHECK_EQ(t.arena().used_slots(), 1ll);
-    CHECK_EQ(t.ckpt_arena().used_slots(), 1ll);
-    CHECK(t.droppable(bh(1)));
     CHECK(t.snapshot_backed(bh(1)));
-    /* And the disk copies survived the promotion: nothing is written twice. */
     CHECK(!t.disk_waiting());
-}
 
-TEST(a_snapshot_that_cannot_be_placed_does_not_hold_the_blocks_in_vram) {
-    /* THE BLOCKS ARE WORTH MORE. They are most of the bytes and all of the attention, and a
-     * snapshot with nowhere to go is still sitting in its device slot -- correct, and reachable
-     * again the moment the blocks come back. */
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 0, 0), nullptr));
-    CHECK(t.host_on());
-    CHECK(!t.ckpt_on());                          /* no room was given for snapshots */
-
-    t.note_used(bh(1), {10}, 1 * SEC);
-    t.note_snapshot(bh(1), 7, 2048);
-    std::vector<TierJob> jobs = copy_now(t);
-    REQUIRE_EQ(jobs.size(), 1u);
-    CHECK_EQ(jobs[0].ck_host, -1);                /* nothing carried */
-    CHECK_EQ(t.stats().to_host, 1ll);
-    CHECK_EQ(t.stats().ck_to_host, 0ll);
-
-    CHECK(drop_now(t, bh(1)));
-    CHECK(!t.snapshot_backed(bh(1)));             /* the device slot is the only home it has */
-    /* And the cache was NOT told to drop it: the snapshot never moved and never became wrong. */
-    CHECK_EQ(t.stats().ck_drops, 0ll);
-}
-
-TEST(the_snapshot_store_evicts_one_of_its_own_rather_than_starving) {
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 2048, 0), nullptr));
-    CHECK_EQ(t.ckpt_arena().capacity(), 1ll);     /* room for exactly one */
-
-    std::vector<BlockHash> lost;
-    t.set_snapshot_drop_sink([&lost](const BlockHash& h) { lost.push_back(h); });
-
-    t.note_used(bh(1), {10}, 1 * SEC);
-    t.note_snapshot(bh(1), 7, 2048);
-    copy_now(t);
-    drop_now(t, bh(1));
-    detach_now(t, bh(1));                         /* its only copy of the state is on the host */
-
-    t.note_used(bh(2), {11}, 50 * SEC);
-    t.note_snapshot(bh(2), 8, 2048);
-    std::vector<TierJob> jobs = copy_now(t);
-    REQUIRE_EQ(jobs.size(), 1u);
-    CHECK(jobs[0].ck_host >= 0);                  /* it got the slot the first one held */
-
-    /* THE FIRST SNAPSHOT IS GONE AND THE CACHE WAS TOLD. An index entry left behind would be a
-     * checkpoint the cache goes on offering whose bytes nobody holds. */
-    REQUIRE_EQ(lost.size(), 1u);
-    CHECK(lost[0] == bh(1));
-    CHECK_EQ(t.stats().ck_drops, 1ll);
-    /* The first entry's BLOCKS are untouched: losing half an entry is not losing it. */
-    CHECK_EQ(t.tier_of(bh(1)), KVTier::Host);
-}
-
-/* A BACKUP EVICTED IS NOT COPIED AGAIN. Two snapshots, both still in their device slots, and room
- * for one copy: each pass that re-queued the evicted one would copy it back and evict the other --
- * a hundred megabytes a rank each way, forever, enough to saturate the link. */
-TEST(two_snapshots_and_one_slot_settle_instead_of_trading_places) {
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 2048, 0), nullptr));
-    REQUIRE_EQ(t.ckpt_arena().capacity(), 1ll);
-    t.note_used(bh(1), {10}, 1 * SEC);
-    t.note_snapshot(bh(1), 7, 2048);
-    copy_now(t);
-    drop_now(t, bh(1));                  /* on the host list, its snapshot still on the device */
-    t.note_used(bh(2), {11}, 2 * SEC);
-    t.note_snapshot(bh(2), 8, 4096);
-    copy_now(t);                         /* takes the one slot from bh(1)'s backup */
-    int copies = 0;
-    for (int pass = 0; pass < 8; ++pass) copies += (int)copy_now(t).size();
-    CHECK_EQ(copies, 0);
-    CHECK_EQ(t.stats().ck_to_host, 2ll);
-    CHECK_EQ(t.stats().ck_drops, 0ll);   /* neither was lost: both are in their device slots */
-    /* A NEW COMMIT at the key is new state, and wants a copy again. */
-    t.note_snapshot(bh(1), 9, 2048);
-    CHECK(t.writeback_waiting());
-}
-
-TEST(the_snapshot_evicted_is_the_earliest_position_not_the_first_in_the_list) {
-    /* A SESSION'S RECORDS ALL GO IDLE AT ONCE and reach the host list in whatever order they were
-     * dropped, so list order is effectively arbitrary within a session. Taking the tip while
-     * keeping a snapshot from earlier in the same transcript is the worst available outcome: the
-     * tip is the one position an appending conversation asks for. Position decides. */
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 4096, 0), nullptr));
-    CHECK_EQ(t.ckpt_arena().capacity(), 2ll);
-
-    std::vector<BlockHash> lost;
-    t.set_snapshot_drop_sink([&lost](const BlockHash& h) { lost.push_back(h); });
-
-    /* The TIP reaches the list first -- exactly the case an oldest-first rule gets wrong. */
-    t.note_used(bh(1), {10}, 1 * SEC);
-    t.note_snapshot(bh(1), 7, /*pos=*/8192);
-    t.note_used(bh(2), {11}, 1 * SEC);
-    t.note_snapshot(bh(2), 8, /*pos=*/2048);
-    CHECK_EQ(copy_now(t).size(), 2u);
-    for (uint64_t k : { 1, 2 }) { drop_now(t, bh(k)); detach_now(t, bh(k)); }
-    CHECK_EQ(t.ckpt_arena().used_slots(), 2ll);
-
-    /* A third wants a slot and there is none. */
-    t.note_used(bh(3), {12}, 50 * SEC);
-    t.note_snapshot(bh(3), 9, 2048);
-    std::vector<TierJob> jobs = copy_now(t);
-    REQUIRE_EQ(jobs.size(), 1u);
-    CHECK(jobs[0].ck_host >= 0);
-
-    REQUIRE_EQ(lost.size(), 1u);
-    CHECK(lost[0] == bh(2));      /* position 2048, not the tip at 8192 */
-}
-
-TEST(a_snapshot_the_cache_retires_gives_its_tier_storage_back) {
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 8192, 0), nullptr));
-    t.note_used(bh(1), {10}, 1 * SEC);
-    t.note_snapshot(bh(1), 7, 2048);
-    copy_now(t);
-    CHECK_EQ(t.ckpt_arena().used_slots(), 1ll);
-
-    /* The retention policy dropped it, or a reservation at the same prefix replaced it. Either
-     * way the cache is the owner of that decision and the bytes come back here. Nothing was
-     * reading the slot, so it is the cache's to free. */
-    CHECK(!t.release_snapshot(bh(1)));
-    CHECK_EQ(t.ckpt_arena().used_slots(), 0ll);
-    CHECK_EQ(t.tier_of(bh(1)), KVTier::Device);   /* the blocks are still stored */
+    /* The store wants the slot: the snapshot is on disk alone. Nothing about the blocks moved. */
+    CHECK(detach_now(t, bh(1)));
     CHECK(!t.snapshot_backed(bh(1)));
+    CHECK_EQ(t.tier_of(bh(1)), KVTier::Device);
+    CHECK(t.snapshot_fetch_wanted({ bh(1) }));
+
+    /* ...and back, into the slot the engine took for it. The disk copy stays, so the slot can go
+     * again for nothing. */
+    int32_t slot = 4;
+    std::vector<TierJob> reads;
+    CHECK(t.plan_fetch({ bh(1) }, &reads, 3 * SEC, &slot));
+    CHECK_EQ(slot, -1);                                /* taken */
+    REQUIRE_EQ(reads.size(), 1u);
+    CHECK(reads[0].kind == TierJob::Kind::ToHost);
+    CHECK_EQ(reads[0].host_slot, -1);                  /* the blocks are in VRAM */
+    CHECK(reads[0].ck_want);
+    CHECK_EQ(reads[0].ck_slot, 4);
+    reads[0].started = true;
+    t.report(reads[0], true);
+    CHECK_EQ(t.stats().ck_fetched, 1ll);
+    CHECK(t.snapshot_in_slot(bh(1), 4));
+    CHECK(t.snapshot_backed(bh(1)));
+    CHECK(!t.snapshot_fetch_wanted({ bh(1) }));
+    std::vector<int32_t> frees;
+    t.take_checkpoint_frees(&frees);
+    CHECK(frees.empty());                              /* the cache owns slot 4 now */
 }
 
-TEST(the_cache_retiring_an_on_device_snapshot_unregisters_its_slot) {
-    /* THE SLOT NUMBER IS THE HAZARD. note_snapshot records a snapshot's DEVICE slot at commit,
-     * because a copy has to know what to read. If the retention policy then frees that slot
-     * without saying so, this record still names it -- and the pool has since handed it to another
-     * session. The next copy reads THAT session's recurrent state into the tier and restores it
-     * as this one's. */
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 8192, 0), nullptr));
+/* A SLOT THE PLAN DOES NOT READ INTO STAYS THE CALLER'S. The engine takes one before it knows,
+ * and it must get it back rather than lose it to a record that never wanted it. */
+TEST(a_fetch_that_reads_no_snapshot_hands_the_slot_back) {
+    CkTiers c;
+    CHECK_OK(c.open());
+    IdleTiers& t = c.t;
     t.note_used(bh(1), {10}, 1 * SEC);
-    t.note_snapshot(bh(1), /*dev_slot=*/7, 2048);
-
-    t.release_snapshot(bh(1));          /* PrefixCache::retire_ckpt */
-
-    std::vector<TierJob> jobs = copy_now(t);
-    REQUIRE_EQ(jobs.size(), 1u);        /* the blocks are still copied */
-    CHECK_EQ(jobs[0].ck_dev, -1);       /* and nothing names slot 7 any more */
-    CHECK_EQ(jobs[0].ck_host, -1);
-    CHECK_EQ(t.stats().ck_to_host, 0ll);
-    CHECK_EQ(t.ckpt_arena().used_slots(), 0ll);
+    t.note_snapshot(bh(1), 7, 2048);                   /* in its slot */
+    CHECK(!t.snapshot_fetch_wanted({ bh(1) }));
+    int32_t slot = 4;
+    std::vector<TierJob> reads;
+    CHECK(!t.plan_fetch({ bh(1) }, &reads, 1 * SEC, &slot));
+    CHECK(reads.empty());
+    CHECK_EQ(slot, 4);
 }
 
-TEST(a_snapshot_a_copy_is_reading_is_freed_only_after_the_copy_reports) {
-    /* THE SLOT MAY BE DECOMMITTED WHEN IT IS FREED, and an asynchronous copy out of an unmapped
-     * page is a device fault. So a release that lands while the copy is out hands the slot to the
-     * tiers, and they give it back once the copy has reported. */
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 8192, 0), nullptr));
+/* A SAVE INTO A SLOT A DISK WRITE IS READING WOULD PUT HALF OF ANOTHER SNAPSHOT ON DISK UNDER THIS
+ * KEY. So a release that lands while the write is out leaves the slot with the tiers, and they
+ * give it back once the write has reported -- decided by the SLOT, because the record may be
+ * forgotten in between and the slot is the cache's either way. */
+TEST(a_slot_a_disk_write_reads_is_freed_only_after_the_write_reports) {
+    CkTiers c;
+    CHECK_OK(c.open());
+    IdleTiers& t = c.t;
     t.note_used(bh(1), {10}, 1 * SEC);
     t.note_snapshot(bh(1), 7, 2048);
     std::vector<TierJob> jobs;
-    t.plan_writeback(16, &jobs);
+    t.plan(16, &jobs);
     REQUIRE_EQ(jobs.size(), 1u);
-    CHECK(t.snapshot_reading(bh(1)));
+    CHECK(t.slot_reading(7));
 
-    CHECK(t.release_snapshot(bh(1)));             /* the tiers took the slot */
+    t.forget(bh(1));                                   /* the blocks were evicted meanwhile */
+    CHECK(t.release_snapshot(bh(1), 7));               /* the tiers keep the slot */
     std::vector<int32_t> frees;
     t.take_checkpoint_frees(&frees);
-    CHECK(frees.empty());                         /* not yet: the copy is still out */
+    CHECK(frees.empty());                              /* not yet: the write is still out */
 
     t.report(jobs[0], true);
     t.take_checkpoint_frees(&frees);
     REQUIRE_EQ(frees.size(), 1u);
     CHECK_EQ(frees[0], 7);
-    /* The bytes that landed describe a snapshot nobody holds, so they are not kept. */
-    CHECK_EQ(t.stats().ck_to_host, 0ll);
-    CHECK_EQ(t.ckpt_arena().used_slots(), 0ll);
-    CHECK_EQ(t.stats().to_host, 1ll);             /* the blocks were fine */
+    CHECK(!t.slot_reading(7));
+    CHECK_EQ(t.stats().ck_to_disk, 0ll);               /* nobody holds what landed */
+
+    /* A slot nobody is reading is the caller's to free at once. */
+    t.note_snapshot(bh(2), 8, 2048);
+    CHECK(!t.release_snapshot(bh(2), 8));
 }
 
-TEST(a_new_commit_at_a_key_replaces_the_host_copy_of_its_snapshot) {
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 8192, 0), nullptr));
+/* A NEW COMMIT AT A KEY REPLACES ITS DISK COPY, and one made while the old write is still out is
+ * written on its own once that write has reported -- the bytes the old write put down describe a
+ * state nobody holds. */
+TEST(a_new_commit_at_a_key_replaces_its_disk_copy) {
+    CkTiers c;
+    CHECK_OK(c.open());
+    IdleTiers& t = c.t;
     t.note_used(bh(1), {10}, 1 * SEC);
     t.note_snapshot(bh(1), 7, 2048);
-    copy_now(t);
-    CHECK_EQ(t.ckpt_arena().used_slots(), 1ll);
+    disk_now(t);
+    CHECK(t.snapshot_backed(bh(1)));
 
-    t.note_snapshot(bh(1), 9, 2048);              /* recomputed and saved into a fresh slot */
-    CHECK_EQ(t.ckpt_arena().used_slots(), 0ll);
-    CHECK(t.writeback_waiting());
+    t.note_snapshot(bh(1), 9, 2048);                   /* recomputed into a fresh slot */
+    CHECK(!t.snapshot_backed(bh(1)));
+    CHECK(t.disk_waiting());
     std::vector<TierJob> jobs;
-    t.plan_writeback(16, &jobs);
+    t.plan(16, &jobs);
     REQUIRE_EQ(jobs.size(), 1u);
-    CHECK(jobs[0].blocks.empty());                /* the blocks' copy is still good */
-    CHECK_EQ(jobs[0].ck_dev, 9);
+    CHECK_EQ(jobs[0].ck_slot, 9);
+    CHECK_EQ(jobs[0].host_slot, -1);                   /* the blocks' copy is still good */
+
+    t.note_snapshot(bh(1), 11, 2048);                  /* and again, while that write is out */
+    t.report(jobs[0], true);
+    CHECK(!t.snapshot_backed(bh(1)));                  /* slot 9's bytes are not slot 11's */
+    jobs.clear();
+    t.plan(16, &jobs);
+    REQUIRE_EQ(jobs.size(), 1u);
+    CHECK_EQ(jobs[0].ck_slot, 11);
+    t.report(jobs[0], true);
+    CHECK(t.snapshot_backed(bh(1)));
 }
 
 TEST(a_record_that_only_ever_held_a_snapshot_is_forgotten_with_it) {
@@ -2563,170 +2469,94 @@ TEST(a_record_that_only_ever_held_a_snapshot_is_forgotten_with_it) {
      * published, which is when the request closes. A request that never publishes -- a rebased
      * block table, a cancel before the first whole block -- would otherwise leave a record with
      * no blocks, no storage and no way to be reached again, one per checkpoint, forever. */
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 8192, 0), nullptr));
+    CkTiers c;
+    CHECK_OK(c.open());
+    IdleTiers& t = c.t;
     t.note_snapshot(bh(1), 7, 2048);
-    /* NOT COPIED UNTIL ITS CHAIN IS PUBLISHED, so a request's checkpoints are planned together
-     * and the deepest goes first -- and a request that never publishes costs no copy at all. */
-    CHECK_EQ(copy_now(t).size(), 0u);
-    CHECK(!t.snapshot_backed(bh(1)));
-
-    t.release_snapshot(bh(1));
-    CHECK_EQ(t.ckpt_arena().used_slots(), 0ll);
-    CHECK_EQ(t.tier_of(bh(1)), KVTier::Device);   /* which is what "no record" answers */
-    CHECK(!t.writeback_waiting());
-
-    /* Published after the commit: the snapshot goes with the blocks. */
-    t.note_snapshot(bh(2), 8, 2048);
-    t.note_used(bh(2), {12}, 1 * SEC);
-    std::vector<TierJob> jobs = copy_now(t);
-    REQUIRE_EQ(jobs.size(), 1u);
-    CHECK_EQ(jobs[0].blocks.size(), 1u);
-    CHECK(jobs[0].ck_host >= 0);
-    CHECK(t.snapshot_backed(bh(2)));
+    CHECK_EQ(disk_now(t).size(), 0u);                  /* a request that never publishes costs nothing */
+    CHECK(!t.release_snapshot(bh(1), 7));
+    CHECK_EQ(t.tier_of(bh(1)), KVTier::Device);        /* which is what "no record" answers */
+    CHECK(!t.disk_waiting());
+    CHECK_EQ(t.sessions().size(), 0u);
 }
 
-TEST(a_restore_that_cannot_place_the_state_keeps_its_host_copy) {
-    /* NO DEVICE SLOT WAS FREE for the snapshot. This turn replays its linear layers, but the host
-     * copy is intact, and dropping it would make one full slot pool cost the session its state
-     * for good. It comes back with the blocks next time. */
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 8192, 0), nullptr));
+/* THE DISK LOSING A SNAPSHOT IS SAID ONCE, and only of one that was there alone: the cache has to
+ * stop offering an index entry whose bytes nobody holds. A snapshot still in its slot is the
+ * cache's and is never announced. */
+TEST(a_snapshot_read_that_fails_tells_the_cache_and_gives_the_slot_back) {
+    CkTiers c;
+    CHECK_OK(c.open());
+    IdleTiers& t = c.t;
     std::vector<BlockHash> lost;
     t.set_snapshot_drop_sink([&lost](const BlockHash& h) { lost.push_back(h); });
-
     t.note_used(bh(1), {10}, 1 * SEC);
     t.note_snapshot(bh(1), 7, 2048);
-    copy_now(t);
-    drop_now(t, bh(1));
-    detach_now(t, bh(1));
-
-    TierJob up;
-    CHECK(t.plan_promote(bh(1), &up));
-    CHECK(up.ck_want);
-    up.blocks = {11};
-    up.ck_dev = -1;
-    up.started = true;
-    t.report(up, true);
-
-    CHECK_EQ(t.tier_of(bh(1)), KVTier::Device);   /* the attention hit survives */
-    CHECK_EQ(t.stats().promoted, 1ll);
-    CHECK_EQ(t.stats().ck_promoted, 0ll);
-    CHECK(lost.empty());
-    CHECK_EQ(t.ckpt_arena().used_slots(), 1ll);
-
-    /* Out again, and back again -- and this time the state is asked for. */
-    CHECK(drop_now(t, bh(1)));
-    TierJob next;
-    CHECK(t.plan_promote(bh(1), &next));
-    CHECK(next.ck_want);
-    CHECK(next.ck_host >= 0);
-}
-
-TEST(a_snapshot_left_behind_by_the_budget_is_copied_on_a_later_pass) {
-    /* A snapshot is a hundred megabytes on a production hybrid, so only a couple are copied a
-     * pass. The blocks do not wait for them -- and the snapshots are not forgotten either: a
-     * record whose state has no copy stays queued until it has one. */
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 1 << 16, 0), nullptr));
-    for (int i = 1; i <= 5; ++i) {
-        t.note_used(bh((uint64_t)i), {10 + i}, 1 * SEC);
-        t.note_snapshot(bh((uint64_t)i), 7 + i, 2048 * i);
-    }
-    std::vector<TierJob> jobs = copy_now(t);
-    CHECK_EQ(jobs.size(), 5u);
-    int with_ck = 0;
-    for (const TierJob& j : jobs) with_ck += j.ck_host >= 0;
-    CHECK_EQ(with_ck, 2);
-
-    jobs = copy_now(t);
-    CHECK_EQ(jobs.size(), 2u);
-    for (const TierJob& j : jobs) { CHECK(j.blocks.empty()); CHECK(j.ck_host >= 0); }
-    jobs = copy_now(t);
-    CHECK_EQ(jobs.size(), 1u);
-    CHECK_EQ(copy_now(t).size(), 0u);
-
-    CHECK_EQ(t.stats().to_host, 5ll);
-    CHECK_EQ(t.stats().ck_to_host, 5ll);
-    CHECK_EQ(t.stats().ck_starved, 0ll);
-}
-
-TEST(the_snapshot_arena_goes_to_a_session_s_tip_before_its_older_checkpoints) {
-    /* A session commits its checkpoints in order, so its tip is queued last -- and the tip is the
-     * one its next turn resumes from. One slot, two snapshots: the deeper one gets it. */
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 2048, 0), nullptr));
-    REQUIRE_EQ(t.ckpt_arena().capacity(), 1);
-    t.note_used(bh(1), {11}, 1 * SEC);
-    t.note_used(bh(2), {12}, 1 * SEC);
-    t.note_snapshot(bh(1), 7, 2048);
-    t.note_snapshot(bh(2), 8, 4096);
-    const std::vector<TierJob> jobs = copy_now(t);
-    CHECK_EQ(jobs.size(), 2u);
-    for (const TierJob& j : jobs) CHECK_EQ(j.ck_host >= 0, j.key == bh(2));
-    CHECK_EQ(t.stats().ck_to_host, 1ll);
-    CHECK(t.snapshot_backed(bh(2)));
-    CHECK(!t.snapshot_backed(bh(1)));
-}
-
-TEST(a_snapshot_copy_can_take_the_slot_of_one_a_session_in_vram_holds) {
-    /* A snapshot whose session stays in VRAM must not keep the arena for as long as it stays: a
-     * search of only the off-device lists for a slot to take never finds it, because a live
-     * session is on none. Once the disk holds that copy, giving its slot up costs nothing. */
-    TmpDisk d;
-    CHECK_OK(d.open(1024, 2048, 16, 16));
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 1 << 20, 1024, 2048, 2048, 16), &d.disk));
-    REQUIRE_EQ(t.ckpt_arena().capacity(), 1);
-    t.note_used(bh(1), {11}, 1 * SEC);
-    t.note_snapshot(bh(1), 7, 2048);
-    copy_now(t);
     disk_now(t);
-    CHECK_EQ(t.tier_of(bh(1)), KVTier::Device);
+    CHECK(detach_now(t, bh(1)));
 
-    t.note_used(bh(2), {12}, 2 * SEC);
-    t.note_snapshot(bh(2), 8, 4096);
-    copy_now(t);
-    CHECK_EQ(t.stats().ck_to_host, 2ll);
-    CHECK_EQ(t.stats().ck_starved, 0ll);
-    CHECK(t.snapshot_backed(bh(1)));              /* through its disk copy */
-    CHECK(t.snapshot_backed(bh(2)));
-    CHECK_EQ(t.stats().ck_drops, 0ll);
+    int32_t slot = 3;
+    std::vector<TierJob> reads;
+    CHECK(t.plan_fetch({ bh(1) }, &reads, 2 * SEC, &slot));
+    REQUIRE_EQ(reads.size(), 1u);
+    reads[0].started = true;
+    reads[0].ck_ok = false;                            /* the store no longer had it */
+    t.report(reads[0], true);
+    REQUIRE_EQ(lost.size(), 1u);
+    CHECK(lost[0] == bh(1));
+    CHECK_EQ(t.stats().ck_drops, 1ll);
+    std::vector<int32_t> frees;
+    t.take_checkpoint_frees(&frees);
+    REQUIRE_EQ(frees.size(), 1u);
+    CHECK_EQ(frees[0], 3);
+    CHECK(!t.snapshot_fetch_wanted({ bh(1) }));
+
+    /* And forgetting a record whose snapshot is in its slot announces nothing. */
+    t.note_used(bh(2), {11}, 1 * SEC);
+    t.note_snapshot(bh(2), 8, 2048);
+    t.forget(bh(2));
+    CHECK_EQ(lost.size(), 1u);
 }
 
-TEST(the_blocks_go_to_disk_without_waiting_for_the_snapshot_budget) {
-    /* Only a couple of snapshots are written a plan -- one is a hundred megabytes on a production
-     * hybrid -- and the blocks do not wait for them: a record whose snapshot the budget left
-     * behind sends its blocks and goes to the back of the queue for the rest. */
-    TmpDisk d;
-    CHECK_OK(d.open(1024, 2048, 16, 16));
+/* WITHOUT A DISK THE STORE IS THE LAST TIER: nothing is written, nothing is ever backed, and the
+ * cache's retention policy is the whole of the snapshot policy. */
+TEST(without_a_disk_a_snapshot_never_leaves_its_slot) {
     IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 1 << 20, 1024, 2048, 1 << 16, 16), &d.disk));
+    CHECK_OK(t.configure(ck_config(1 << 20, 0, 1024, 2048, 8, 0), nullptr));
+    CHECK(!t.ckpt_disk_on());
+    t.note_used(bh(1), {10}, 1 * SEC);
+    t.note_snapshot(bh(1), 7, 2048, /*resume=*/true);
+    copy_now(t);
+    CHECK_EQ(disk_now(t).size(), 0u);
+    CHECK(!t.snapshot_backed(bh(1)));
+    CHECK(!t.snapshot_fetch_wanted({ bh(1) }));
+    CHECK(!t.disk_waiting());
+}
+
+TEST(only_two_snapshots_go_to_disk_a_plan_and_the_blocks_do_not_wait) {
+    /* A snapshot is a hundred megabytes on a production hybrid and the disk store copies it twice
+     * on the way out, so a plan writes two; the blocks do not wait for them, and the rest are not
+     * forgotten. */
+    CkTiers c;
+    CHECK_OK(c.open());
+    IdleTiers& t = c.t;
     for (int i = 1; i <= 4; ++i) {
         t.note_used(bh((uint64_t)i), {10 + i}, 1 * SEC);
         t.note_snapshot(bh((uint64_t)i), 7 + i, 2048);
     }
     copy_now(t);
-    copy_now(t);
-    CHECK_EQ(t.stats().ck_to_host, 4ll);
-
     std::vector<TierJob> jobs;
     t.plan(16, &jobs);
     REQUIRE_EQ(jobs.size(), 4u);
     int with_ck = 0;
-    for (const TierJob& j : jobs) { CHECK(j.host_slot >= 0); with_ck += j.ck_host >= 0; }
+    for (const TierJob& j : jobs) { CHECK(j.host_slot >= 0); with_ck += j.ck_slot >= 0; }
     CHECK_EQ(with_ck, 2);
     for (TierJob& j : jobs) t.report(j, true);
     CHECK_EQ(t.stats().to_disk, 4ll);
     CHECK_EQ(t.stats().ck_to_disk, 2ll);
-
     CHECK(t.disk_waiting());
-    jobs.clear();
-    t.plan(16, &jobs);
+    jobs = disk_now(t);
     REQUIRE_EQ(jobs.size(), 2u);
-    for (const TierJob& j : jobs) { CHECK_EQ(j.host_slot, -1); CHECK(j.ck_host >= 0); }
-    for (TierJob& j : jobs) t.report(j, true);
-    CHECK_EQ(t.stats().to_disk, 4ll);
+    for (const TierJob& j : jobs) { CHECK_EQ(j.host_slot, -1); CHECK(j.ck_slot >= 0); }
     CHECK_EQ(t.stats().ck_to_disk, 4ll);
     CHECK(!t.disk_waiting());
 }
@@ -2735,11 +2565,10 @@ TEST(the_blocks_go_to_disk_without_waiting_for_the_snapshot_budget) {
 /* ------------------------------------------------------------------ the cache's half of it */
 
 TEST(a_detached_snapshot_is_not_offered_and_a_reattached_one_is) {
-    /* THE INDEX ENTRY OUTLIVES THE BYTES ON PURPOSE. A snapshot the idle tiers hold has no slot
-     * in the pool, so it cannot be served -- but it is exactly what a promotion puts back, and
-     * the position and session it stands for are not recoverable from anywhere else. The state
-     * it is in while tiered is the one a reserved-but-unwritten snapshot is already in, handled
-     * by the same branch in lookup(). */
+    /* THE INDEX ENTRY OUTLIVES THE SLOT ON PURPOSE. A detached snapshot is only on disk, so it
+     * cannot be served -- but it is exactly what a read puts back, and the position and session
+     * it stands for are not recoverable from anywhere else. The state it is in meanwhile is the
+     * one a reserved-but-unwritten snapshot is already in, handled by the same branch in lookup(). */
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
 
@@ -2760,11 +2589,8 @@ TEST(a_detached_snapshot_is_not_offered_and_a_reattached_one_is) {
 
     const int64_t free_before = f.kv.free_checkpoint_slots();
     CHECK_OK(f.pc.detach_snapshot(key));
-    /* THE SLOT IS THE POINT. There are --checkpoint-slots of them for the whole server, and
-     * moving the bytes without giving the slot back would free the plentiful resource and keep
-     * the scarce one. */
     CHECK_EQ(f.kv.free_checkpoint_slots(), free_before + 1);
-    CHECK_EQ(f.pc.snapshots_off_device(), 1ll);
+    CHECK_EQ(f.pc.snapshots_detached(), 1ll);
 
     CacheHit tiered = f.pc.lookup(prompt, {});
     CHECK_EQ(tiered.n_attn_tokens, 320);      /* the blocks are still here */
@@ -2774,18 +2600,17 @@ TEST(a_detached_snapshot_is_not_offered_and_a_reattached_one_is) {
     int32_t back = -1;
     CHECK_OK(f.kv.alloc_checkpoint(&back));
     CHECK_OK(f.pc.reattach_snapshot(key, back));
-    CHECK_EQ(f.pc.snapshots_off_device(), 0ll);
+    CHECK_EQ(f.pc.snapshots_detached(), 0ll);
     CacheHit restored = f.pc.lookup(prompt, {});
     CHECK_EQ(restored.n_linear_tokens, 128);
     CHECK_EQ(restored.checkpoint_slot, back);
 }
 
-TEST(a_tiered_snapshot_is_not_a_victim_and_not_a_slot_to_hand_back) {
-    /* Two ways the checkpoint index can go wrong once a snapshot can be somewhere else, and both
-     * of them are silent. Choosing a tiered snapshot as the victim when the SLOT pool is full
-     * frees nothing and retires a usable snapshot; handing its -1 back from reserve_checkpoint
-     * reads to the scheduler exactly like a refusal, and linear caching stops with nothing in
-     * the log. */
+TEST(a_detached_snapshot_is_not_a_victim_and_not_a_slot_to_hand_back) {
+    /* Two ways the checkpoint index can go wrong once a snapshot can be on disk alone, and both
+     * of them are silent. Choosing a detached snapshot as the victim when the store is full frees
+     * nothing and retires a usable snapshot; handing its -1 back from reserve_checkpoint reads to
+     * the scheduler exactly like a refusal, and linear caching stops with nothing in the log. */
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/2));
 
@@ -2808,11 +2633,11 @@ TEST(a_tiered_snapshot_is_not_a_victim_and_not_a_slot_to_hand_back) {
     CHECK_OK(f.pc.detach_snapshot(hs[64 / 16 - 1]));
     CHECK_EQ(f.kv.free_checkpoint_slots(), 1ll);
 
-    /* A reservation at the tiered snapshot's own prefix gets a REAL slot, not its -1. */
+    /* A reservation at the detached snapshot's own prefix gets a REAL slot, not its -1. */
     int32_t again = -1;
     CHECK_OK(f.pc.reserve_checkpoint(1, 64, hs[64 / 16 - 1], &again));
     CHECK(again >= 0);
-    CHECK_EQ(f.pc.snapshots_off_device(), 0ll);
+    CHECK_EQ(f.pc.snapshots_detached(), 0ll);
 }
 
 TEST(the_tiers_losing_a_snapshot_erases_the_index_entry) {
@@ -2832,30 +2657,32 @@ TEST(the_tiers_losing_a_snapshot_erases_the_index_entry) {
     f.pc.commit_checkpoint(key);
     CHECK_OK(f.pc.detach_snapshot(key));
 
-    /* The snapshot arena overflowed, or a promotion could not place the state. Either way the
-     * bytes are gone and an index entry that outlived them would be a checkpoint the cache goes
-     * on offering that nothing can ever fill. */
+    /* The disk store let it go, or a read of it failed. Either way the bytes are gone and an index
+     * entry that outlived them would be a checkpoint the cache goes on offering that nothing can
+     * ever fill. */
     f.pc.drop_snapshot(key);
-    CHECK_EQ(f.pc.snapshots_off_device(), 0ll);
+    CHECK_EQ(f.pc.snapshots_detached(), 0ll);
     CHECK_EQ(f.pc.checkpoints(1).size(), 0u);
     CHECK_EQ(f.pc.lookup(prompt, {}).n_linear_tokens, 0);
-    /* And no double free: the device slot went back at detach, not here. */
+    /* And no double free: the slot went back at detach, not here. */
     CHECK_EQ(f.kv.free_checkpoint_slots(), 4ll);
 }
 
-/* A FULL CHECKPOINT POOL DETACHES WHAT THE TIERS HOLD, and only that. The victim's slot goes back
- * either way; a victim with a finished copy off the card keeps its index entry, marked off-device,
- * so the session's next restore brings the state back instead of replaying every recurrent layer.
- * A victim with no copy is retired. */
-TEST(a_full_checkpoint_pool_detaches_a_snapshot_the_tiers_hold_rather_than_losing_it) {
+/* A FULL STORE DETACHES WHAT THE DISK HOLDS, and only that. The victim's slot goes back either
+ * way; a victim the disk holds keeps its index entry, detached, so the session's next restore
+ * reads the state back instead of replaying every recurrent layer. A victim with no disk copy is
+ * retired. */
+TEST(a_full_store_detaches_a_snapshot_the_disk_holds_rather_than_losing_it) {
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/2));
     const int64_t ck = f.kv.checkpoint_bytes();
     REQUIRE(ck > 0);
+    const int64_t entry = f.kv.plan(G_FULL)->bytes_per_block;
+    TmpDisk d;
+    CHECK_OK(d.open(entry, ck, 64, 8));
     IdleTiers t;
-    CHECK_OK(t.configure(ck_config(64 << 20, 0, f.kv.plan(G_FULL)->bytes_per_block, ck, 8 * ck, 0),
-                         nullptr));
-    REQUIRE(t.ckpt_on());
+    CHECK_OK(t.configure(ck_config(64 << 20, 1 << 20, entry, ck, 2, 8), &d.disk));
+    REQUIRE(t.ckpt_disk_on());
     f.pc.set_tiers(&t);
 
     auto chain = [&](const std::vector<int32_t>& p) {
@@ -2876,34 +2703,35 @@ TEST(a_full_checkpoint_pool_detaches_a_snapshot_the_tiers_hold_rather_than_losin
     CHECK_OK(f.pc.reserve_checkpoint(1, 128, ha[128 / 16 - 1], &s2));
     f.pc.commit_checkpoint(ha[128 / 16 - 1]);
     CHECK_EQ(f.kv.free_checkpoint_slots(), 0ll);
-    copy_now(t);
+    disk_now(t);
     CHECK(t.snapshot_backed(ha[64 / 16 - 1]));
 
     /* Another session wants a slot; the least recently used snapshot that is not a tip is the
-     * one at 64, and it has a copy. */
+     * one at 64, and the disk holds it. */
     int32_t s3 = -1;
     CHECK_OK(f.pc.reserve_checkpoint(2, 64, hb[64 / 16 - 1], &s3));
     CHECK(s3 >= 0);
-    CHECK_EQ(f.pc.snapshots_off_device(), 1ll);
+    CHECK_EQ(f.pc.snapshots_detached(), 1ll);
     CHECK_EQ(f.pc.checkpoints(1).size(), 2u);      /* the session still knows both */
     CHECK(!t.snapshot_backed(ha[64 / 16 - 1]));
+    CHECK(t.snapshot_fetch_wanted(std::vector<BlockHash>(ha.begin(), ha.begin() + 4)));
     CHECK_EQ(f.pc.stats().ckpt_evictions, 0ll);    /* nothing was lost */
     f.pc.set_tiers(nullptr);
 }
 
-/* A RESTORED SESSION'S STATE NEEDS A DEVICE SLOT, and the pool is full whenever as many sessions
- * have run since. The restore takes one from the least recently used snapshot the tiers hold a
- * copy of -- but never one a lookup handed out this step: that request reads the slot in the
- * coming forward, and the restore writes it before the forward runs. */
-TEST(a_restore_takes_a_checkpoint_slot_only_from_a_backed_snapshot_nobody_was_handed) {
+/* A READ OFF DISK NEEDS A STORE SLOT, and the store is full whenever as many sessions have run
+ * since. One is taken from the least recently used snapshot the disk also holds -- but never one
+ * a lookup handed out this step: that request's restore reads the slot ahead of its step. */
+TEST(a_read_takes_a_store_slot_only_from_a_backed_snapshot_nobody_was_handed) {
     Fixture f;
     CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/2));
     const int64_t ck = f.kv.checkpoint_bytes();
     REQUIRE(ck > 0);
+    const int64_t entry = f.kv.plan(G_FULL)->bytes_per_block;
+    TmpDisk d;
+    CHECK_OK(d.open(entry, ck, 64, 8));
     IdleTiers t;
-    CHECK_OK(t.configure(ck_config(64 << 20, 0, f.kv.plan(G_FULL)->bytes_per_block, ck, 8 * ck, 0),
-                         nullptr));
-    REQUIRE(t.ckpt_on());
+    CHECK_OK(t.configure(ck_config(64 << 20, 1 << 20, entry, ck, 2, 8), &d.disk));
     f.pc.set_tiers(&t);
 
     const auto a = tok_run(7500, 336);
@@ -2920,7 +2748,7 @@ TEST(a_restore_takes_a_checkpoint_slot_only_from_a_backed_snapshot_nobody_was_ha
     CHECK_OK(f.pc.reserve_checkpoint(1, 128, ha[128 / 16 - 1], &s2));
     f.pc.commit_checkpoint(ha[128 / 16 - 1]);
     CHECK_EQ(f.kv.free_checkpoint_slots(), 0ll);
-    copy_now(t);
+    disk_now(t);
     CHECK(t.snapshot_backed(ha[128 / 16 - 1]));
 
     /* This step's admission is handed the one at 128. */
@@ -2940,8 +2768,59 @@ TEST(a_restore_takes_a_checkpoint_slot_only_from_a_backed_snapshot_nobody_was_ha
     CHECK(!f.pc.free_checkpoint_for_restore());       /* 128 is this step's */
     f.pc.begin_step();
     CHECK(f.pc.free_checkpoint_for_restore());        /* and the next step's to take */
-    CHECK_EQ(f.pc.snapshots_off_device(), 2ll);
+    CHECK_EQ(f.pc.snapshots_detached(), 2ll);
     f.kv.free_checkpoint(taken);
+    f.pc.set_tiers(nullptr);
+}
+
+/* THE CACHE RETIRING A SNAPSHOT A WRITE IS READING leaves the slot with the tiers: the retention
+ * policy runs on its own clock, and a save into the slot before the write is done would put half
+ * of another snapshot on disk under this key. */
+TEST(the_cache_retiring_a_snapshot_under_a_disk_write_does_not_free_its_slot) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/3));
+    const int64_t ck = f.kv.checkpoint_bytes();
+    const int64_t entry = f.kv.plan(G_FULL)->bytes_per_block;
+    TmpDisk d;
+    CHECK_OK(d.open(entry, ck, 64, 8));
+    IdleTiers t;
+    CHECK_OK(t.configure(ck_config(64 << 20, 1 << 20, entry, ck, 3, 8), &d.disk));
+    f.pc.set_tiers(&t);
+    f.pc.set_policy(std::make_unique<KeepTipOnly>());
+
+    const auto a = tok_run(7600, 336);
+    publish(f, 1, a, 320);
+    std::vector<BlockHash> ha;
+    BlockHash parent;
+    for (int b = 0; b < 21; ++b) {
+        parent = chain_block_hash(parent, a.data() + b * 16, 16, nullptr, 0, b * 16);
+        ha.push_back(parent);
+    }
+    int32_t s1 = -1, s2 = -1, s3 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(1, 64, ha[64 / 16 - 1], &s1));
+    f.pc.commit_checkpoint(ha[64 / 16 - 1]);
+    CHECK_OK(f.pc.reserve_checkpoint(1, 128, ha[128 / 16 - 1], &s2));
+    f.pc.commit_checkpoint(ha[128 / 16 - 1]);
+    std::vector<TierJob> writes;
+    t.plan(1 << 20, &writes);                          /* both writes out, not yet reported */
+    CHECK(t.slot_reading(s1));
+    CHECK(t.slot_reading(s2));
+    CHECK_OK(f.pc.reserve_checkpoint(1, 192, ha[192 / 16 - 1], &s3));
+    f.pc.commit_checkpoint(ha[192 / 16 - 1]);
+
+    /* A fourth squeezes the store: tip-only retires 64 and 128, whose slots their writes are still
+     * reading, and the only slot that can be handed out is one no write reads. */
+    int32_t s4 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(1, 256, ha[256 / 16 - 1], &s4));
+    CHECK(s4 != s1);
+    CHECK(s4 != s2);
+    for (TierJob& j : writes) t.report(j, true);
+    std::vector<int32_t> frees;
+    t.take_checkpoint_frees(&frees);
+    REQUIRE_EQ(frees.size(), 2u);
+    CHECK((frees[0] == s1 && frees[1] == s2) || (frees[0] == s2 && frees[1] == s1));
+    for (int32_t s : frees) f.kv.free_checkpoint(s);
+    CHECK_EQ(f.kv.free_checkpoint_slots(), 2ll);
     f.pc.set_tiers(nullptr);
 }
 
@@ -3143,6 +3022,188 @@ TEST(pressure_on_the_pool_moves_a_clean_entry_and_drops_one_with_no_copy) {
      * and loses nothing. */
     CHECK_EQ(x.f.pc.evict_lru(1000), 0);
     CHECK_EQ(x.f.pc.size(), 20ll);
+}
+
+/* THE RESERVE'S TRIM LOSES NO CONVERSATION. It runs right after a publish, while the sequence that
+ * published still holds its blocks and before any host copy of them can have landed -- so an entry
+ * a sequence holds, and one with no copy yet, are exactly what it must pass over. */
+TEST(the_trim_keeps_what_a_sequence_holds_and_what_has_no_copy_yet) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const auto a = tok_run(7600, 336);
+    const auto b = tok_run(9600, 336);
+    const auto c = tok_run(11600, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);
+    copy_now(x.t);                                  /* a is clean */
+    publish(x.f, 2, b, 320);
+    x.f.kv.free_sequence(2);                        /* b has no copy yet */
+    publish(x.f, 3, c, 320);                        /* c's sequence is still running */
+
+    CHECK_EQ(x.f.pc.trim(1000), 20);                /* a, and only a */
+    CHECK_EQ(x.f.pc.restorable_from(a, {}).size(), 20u);
+    CHECK_EQ(x.f.pc.lookup(b, {}).n_attn_tokens, 320);
+    CHECK_EQ(x.f.pc.lookup(c, {}).n_attn_tokens, 320);
+    CHECK_EQ(x.f.pc.stats().drops, 20ll);
+    CHECK_EQ(x.f.pc.stats().evictions, 0ll);
+
+    copy_now(x.t);                                  /* b and c land */
+    CHECK_EQ(x.f.pc.trim(1000), 20);                /* b; c is still read by its sequence */
+    CHECK_EQ(x.f.pc.lookup(c, {}).n_attn_tokens, 320);
+    x.f.kv.free_sequence(3);
+    CHECK_EQ(x.f.pc.trim(5), 5);                    /* and no more than it was asked for */
+    CHECK_EQ(x.f.pc.stats().evictions, 0ll);
+    CHECK_EQ(x.f.pc.size(), 60ll);                  /* every entry still indexed */
+}
+
+TEST(without_tiers_the_trim_frees_only_what_no_sequence_holds) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false));
+    const auto a = tok_run(7600, 336);
+    const auto b = tok_run(9600, 336);
+    publish(f, 1, a, 320);
+    f.kv.free_sequence(1);
+    publish(f, 2, b, 320);                          /* still running */
+    CHECK_EQ(f.pc.trim(1000), 20);
+    CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 0);
+    CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, 320);
+    CHECK_EQ(f.pc.stats().evictions, 20ll);
+    CHECK_EQ(f.pc.trim(1000), 0);
+}
+
+/* PRESSURE LANDS A WAITING COPY INSTEAD OF ERASING. The binding drops what already has a host
+ * copy, then has the engine land the copies still on their way and drops those too; only what the
+ * tiers then still cannot take is erased. */
+TEST(pressure_lands_a_waiting_copy_instead_of_erasing_the_entry) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const auto a = tok_run(7600, 336);
+    publish(x.f, 1, a, 320);
+    x.f.kv.free_sequence(1);                        /* finished; its copy has not landed */
+    PCBinding<PrefixCache> b(&x.f.pc);
+    int flushes = 0;
+    b.flush_fn = [&]() { ++flushes; return !copy_now(x.t).empty(); };
+    CHECK_EQ(b.evict(20), 20);
+    CHECK_EQ(flushes, 1);
+    CHECK_EQ(x.f.pc.stats().evictions, 0ll);
+    CHECK_EQ(x.f.pc.stats().drops, 20ll);
+    CHECK_EQ(x.f.pc.restorable_from(a, {}).size(), 20u);
+
+    /* With nothing to land the copies, the binding has no lossless way left and erases. */
+    const auto c = tok_run(9600, 336);
+    publish(x.f, 2, c, 320);
+    x.f.kv.free_sequence(2);
+    PCBinding<PrefixCache> bare(&x.f.pc);
+    CHECK_EQ(bare.evict(20), 20);
+    CHECK_EQ(x.f.pc.stats().evictions, 20ll);
+}
+
+/* A hybrid cache with snapshot tiers: the linear fixture, and a disk store that holds snapshots. */
+struct CkTierFixture {
+    Fixture f;
+    TmpDisk d;
+    IdleTiers t;
+    int build(int ckpt_slots) {
+        int s = f.build(/*with_linear=*/true, ckpt_slots);
+        if (s < 0) return s;
+        const int64_t ck = f.kv.checkpoint_bytes();
+        s = d.open(1024, ck, 64, 8);
+        if (s < 0) return s;
+        s = t.configure(ck_config(1 << 20, 1 << 20, 1024, ck, ckpt_slots, 8), &d.disk);
+        if (s < 0) return s;
+        f.pc.set_tiers(&t);
+        return RAD_OK;
+    }
+};
+
+TEST(the_retention_policy_detaches_a_snapshot_the_disk_holds_instead_of_retiring_it) {
+    CkTierFixture x;
+    CHECK_OK(x.build(/*ckpt_slots=*/2));
+    x.f.pc.set_policy(std::make_unique<KeepTipOnly>());
+    const auto prompt = tok_run(7000, 336);
+    publish(x.f, 1, prompt, 320);
+    const std::vector<BlockHash> hs = chain_of(prompt, 16);
+    ckpt_at(x.f, 1, hs, 64);
+    ckpt_at(x.f, 1, hs, 128);
+    disk_now(x.t);                                  /* both are on disk */
+    ckpt_at(x.f, 1, hs, 192);                       /* the store is full: the policy runs */
+    CHECK(x.f.pc.checkpoints(1) == (std::vector<int64_t>{ 64, 128, 192 }));
+    CHECK_EQ(x.f.pc.snapshots_detached(), 1ll);     /* 64 left its slot and stayed indexed */
+    CHECK_EQ(x.f.pc.stats().ckpt_evictions, 0ll);
+}
+
+/* A SNAPSHOT THAT LOST ITS SLOT IS NOT SERVED, whatever else its entry says: the lookup takes the
+ * deepest one still in a slot, and a commit arriving after the slot went does not make it servable
+ * again. */
+TEST(a_lookup_takes_the_deepest_snapshot_still_in_its_slot) {
+    CkTierFixture x;
+    CHECK_OK(x.build(/*ckpt_slots=*/4));
+    const auto prompt = tok_run(7000, 336);
+    publish(x.f, 1, prompt, 320);
+    const std::vector<BlockHash> hs = chain_of(prompt, 16);
+    ckpt_at(x.f, 1, hs, 128);
+    int32_t slot = -1;
+    CHECK_OK(x.f.pc.reserve_checkpoint(1, 256, hs[256 / 16 - 1], &slot));
+    CHECK_OK(x.f.pc.detach_snapshot(hs[256 / 16 - 1]));
+    x.f.pc.commit_checkpoint(hs[256 / 16 - 1]);
+    CacheHit h = x.f.pc.lookup(prompt, {});
+    CHECK_EQ(h.n_linear_tokens, 128);
+    CHECK(h.checkpoint_slot >= 0);
+}
+
+/* AN ENTRY ALREADY IN A SLOT KEEPS IT: a second slot offered for the same snapshot is refused, and
+ * the caller gives it back, rather than the first one leaking. */
+TEST(a_snapshot_in_its_slot_refuses_a_second_one) {
+    CkTierFixture x;
+    CHECK_OK(x.build(/*ckpt_slots=*/4));
+    const auto prompt = tok_run(7000, 336);
+    publish(x.f, 1, prompt, 320);
+    const std::vector<BlockHash> hs = chain_of(prompt, 16);
+    ckpt_at(x.f, 1, hs, 128);
+    const int32_t mine = x.f.pc.lookup(prompt, {}).checkpoint_slot;
+    CHECK(mine >= 0);
+    CHECK_OK(x.f.pc.reattach_snapshot(hs[128 / 16 - 1], mine));
+    CHECK(x.f.pc.reattach_snapshot(hs[128 / 16 - 1], mine + 1) == RAD_E_STATE);
+    CHECK_EQ(x.f.pc.lookup(prompt, {}).checkpoint_slot, mine);
+}
+
+/* A WAITING REQUEST'S CHAIN STAYS ON THE CARD. An admission refused after its restore gives the hit
+ * back, and the entries it brought back are clean; held, the eager drop passes them over until the
+ * request is gone, so the next attempt finds them where they are instead of copying them again. */
+TEST(a_held_chain_is_not_dropped_until_its_request_lets_go) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const auto prompt = tok_run(7600, 336);
+    publish(x.f, 1, prompt, 320);
+    x.f.kv.free_sequence(1);
+    copy_now(x.t);
+    x.f.pc.hold(7, prompt, {});
+    x.f.pc.hold(7, prompt, {});                     /* once per request */
+    CHECK_EQ(x.f.pc.drop_clean(), 0);
+    CHECK_EQ(x.f.pc.lookup(prompt, {}).n_attn_tokens, 320);
+    /* Pressure still takes it: a held entry has its copy, and trim loses nothing. */
+    CHECK_EQ(x.f.pc.trim(5), 5);
+    x.f.pc.release(7);
+    CHECK_EQ(x.f.pc.drop_clean(), 15);
+    CHECK_EQ(x.f.kv.pool_bytes_used(G_FULL), 0ll);
+    CHECK_EQ(x.f.pc.stats().evictions, 0ll);
+}
+
+/* TIERS ATTACHED AND OFF ARE NO TIERS: the engine attaches them whatever the flags say, and a trim
+ * that waited for a copy nobody will make would never keep the reserve. */
+TEST(with_the_tiers_attached_and_off_the_trim_still_frees) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false));
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(0, 0, 1024), nullptr));
+    f.pc.set_tiers(&t);
+    const auto a = tok_run(7600, 336);
+    publish(f, 1, a, 320);
+    f.kv.free_sequence(1);
+    CHECK_EQ(f.pc.trim(1000), 20);
+    CHECK_EQ(f.kv.pool_bytes_used(G_FULL), 0ll);
+    CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 0);
+    CHECK_EQ(f.pc.size(), 0ll);
 }
 
 TEST(a_prefix_computed_again_takes_the_new_blocks_as_its_device_copy) {
@@ -3632,67 +3693,6 @@ TEST(a_slot_given_up_while_its_disk_write_is_out_is_freed_when_the_write_reports
     CHECK(t.writeback_waiting());
 }
 
-TEST(a_snapshot_the_disk_holds_gives_its_slot_up_before_one_only_the_host_holds) {
-    TmpDisk d;
-    CHECK_OK(d.open(1024, 2048, 16, 16));
-    IdleTiers t;
-    CHECK_OK(t.configure(ck_config(1 << 20, 1 << 20, 1024, 2048, 2 * 2048, 16), &d.disk));
-    REQUIRE_EQ(t.ckpt_arena().capacity(), 2);
-    int lost_ck = 0;
-    t.set_snapshot_drop_sink([&lost_ck](const BlockHash&) { ++lost_ck; });
-
-    t.note_used(bh(1), {11}, 1 * SEC);
-    t.note_used(bh(2), {12}, 2 * SEC);
-    t.note_snapshot(bh(1), 7, 2048);
-    t.note_snapshot(bh(2), 8, 4096);
-    copy_now(t);
-    CHECK_EQ(t.stats().ck_to_host, 2ll);
-    for (uint64_t k : {1, 2}) { CHECK(drop_now(t, bh(k))); CHECK(detach_now(t, bh(k))); }
-
-    /* Only the second snapshot reaches disk. */
-    std::vector<TierJob> jobs;
-    t.plan(16, &jobs);
-    for (TierJob& j : jobs) { if (j.key == bh(1)) j.ck_ok = false; t.report(j, true); }
-    CHECK_EQ(t.stats().ck_to_disk, 1ll);
-
-    /* The earliest position would lose -- except that one is the only copy of its state, and the
-     * other costs nothing to give up. */
-    t.note_used(bh(3), {13}, 3 * SEC);
-    t.note_snapshot(bh(3), 9, 6144);
-    copy_now(t);
-    CHECK_EQ(t.stats().ck_to_host, 3ll);
-    CHECK_EQ(lost_ck, 0);
-    CHECK_EQ(t.stats().ck_drops, 0ll);
-
-    /* The second session's state is now only on disk, and reading it back needs a slot. A read
-     * never takes another session's only copy -- nor the copy that lets a snapshot still in its
-     * device slot be detached, until the disk holds it too. With no slot the read is not planned
-     * and the session is restored without it. */
-    std::vector<TierJob> rd;
-    CHECK(!t.plan_fetch({bh(2)}, &rd, 1));
-    CHECK(rd.empty());
-    CHECK(drop_now(t, bh(3)));
-    CHECK(t.snapshot_backed(bh(3)));
-    CHECK(!t.plan_fetch({bh(2)}, &rd, 1));
-    CHECK(rd.empty());
-    CHECK(t.snapshot_backed(bh(3)));
-    disk_now(t);
-    CHECK(t.plan_fetch({bh(2)}, &rd, 1));
-    REQUIRE_EQ(rd.size(), 1u);
-    CHECK_EQ(rd[0].host_slot, -1);                /* its blocks are in host memory already */
-    CHECK(rd[0].ck_host >= 0);
-    CHECK_EQ(rd[0].ck_pos, 4096ll);
-    CHECK(t.snapshot_backed(bh(3)));              /* through its disk copy now */
-    rd[0].started = true;
-    t.report(rd[0], true);
-    CHECK_EQ(t.stats().ck_fetched, 1ll);
-    TierJob up;
-    CHECK(t.plan_promote(bh(2), &up));
-    CHECK(up.ck_want);
-    CHECK_EQ(up.ck_host, rd[0].ck_host);
-    CHECK_EQ(lost_ck, 0);
-}
-
 /* A RESTORE IS SIZED BEFORE IT STARTS, so it recalls the loan for the whole chain at once. One
  * recall a block would drain the slab a buffer at a time and stop at whatever the cache kept in
  * hand. */
@@ -3752,6 +3752,7 @@ static unsigned char pat(int rank, int64_t layer, int32_t block, int64_t i) {
 static void fill(Fixture& f, int rank) {
     for (int32_t g : f.pc.cached_groups()) {
         const KVGroupPlan* p = f.kv.plan(g);
+        if (p->zero) continue;
         const int64_t frag = p->layer_bytes_per_block();
         for (int64_t l = 0; l < p->n_layers; ++l)
             for (int32_t b = 0; b < (int32_t)p->n_blocks; ++b) {
@@ -3764,6 +3765,7 @@ static void fill(Fixture& f, int rank) {
 static void scribble(Fixture& f) {
     for (int32_t g : f.pc.cached_groups()) {
         const KVGroupPlan* p = f.kv.plan(g);
+        if (p->zero) continue;
         for (int64_t l = 0; l < p->n_layers; ++l)
             std::memset((char*)p->base + l * p->layer_stride(), 0xEE, (size_t)p->layer_stride());
     }
@@ -3779,6 +3781,7 @@ static int64_t same_bytes(Fixture& f, int rank, const std::vector<std::vector<in
         bool ok = true;
         for (size_t gi = 0; gi < cg.size() && ok; ++gi) {
             const KVGroupPlan* p = f.kv.plan(cg[gi]);
+            if (p->zero) continue;
             const int64_t frag = p->layer_bytes_per_block();
             for (int64_t l = 0; l < p->n_layers && ok; ++l) {
                 const unsigned char* row =
@@ -3819,7 +3822,10 @@ static std::vector<KVGroupInfo> two_paged_groups() {
     return g;
 }
 
-static void run_transfer(int world, bool fragment) {
+/* `zero_last`: the last rank keeps no cache for the attention group (rad_kv_group_zero), as an
+ * attention-zero rank does. Its window of a slot is the narrower group alone, the ranks' windows
+ * are unequal, and every rank still takes part in every job. */
+static void run_transfer(int world, bool fragment, bool zero_last = false) {
     /* THE HOST BACKEND ONLY. The stand-in kernels copy rows with the CPU, which on the host backend
      * is where "device" memory is; on a card the staging buffer is VRAM and the production kernels
      * are the ones to run. */
@@ -3836,19 +3842,27 @@ static void run_transfer(int world, bool fragment) {
     for (int r = 0; r < world; ++r) {
         fx.push_back(std::make_unique<Fixture>());
         fx.back()->cfg.checkpoint_slots = 0;
-        REQUIRE_EQ(fx.back()->build_groups(two_paged_groups()), RAD_OK);
+        std::vector<KVGroupInfo> groups = two_paged_groups();
+        if (zero_last && r == world - 1) groups[1].zero = true;
+        REQUIRE_EQ(fx.back()->build_groups(groups), RAD_OK);
     }
     Fixture& f = *fx[0];
     const std::vector<int32_t>& cg = f.pc.cached_groups();
     REQUIRE_EQ(cg.size(), 2u);
-    int64_t entry = 0;
-    for (int32_t g : cg) entry += f.kv.plan(g)->bytes_per_block;
+    /* A slot is the sum of the ranks' entries, each rank's window where the ones before it end
+     * (Engine::configure_kv). */
+    std::vector<int64_t> win_off((size_t)world, 0);
+    int64_t slot = 0;
+    for (int r = 0; r < world; ++r) {
+        win_off[(size_t)r] = slot;
+        for (int32_t g : cg) slot += fx[(size_t)r]->kv.plan(g)->bytes_per_block;
+    }
 
     /* FORTY SLOTS. Fragmented, every other one is taken and the copy goes out as twenty runs of
      * one; whole, it goes out as one run of twenty, which is the case where a rank's pitch through
      * a slot every rank shares decides where its rows land. */
     IdleTiers t;
-    CHECK_OK(t.configure(tier_config(40 * entry * world, 0, entry * world), nullptr));
+    CHECK_OK(t.configure(tier_config(40 * slot, 0, slot), nullptr));
     REQUIRE_EQ(t.arena().capacity(), 40);
     if (fragment) {
         for (int i = 0; i < 40; ++i) CHECK_EQ(t.arena().alloc(), i);
@@ -3865,7 +3879,7 @@ static void run_transfer(int world, bool fragment) {
         /* A three-entry staging buffer, so twenty entries cross it in seven pieces. */
         REQUIRE_EQ(x.back()->configure(&reg, &fx[(size_t)r]->kv, &t, nullptr, cg, /*max_batch=*/3,
                                        /*max_copy=*/64, /*max_chain=*/64, /*leader=*/r == 0,
-                                       /*device=*/0, /*slot_off=*/r * entry, /*ck_slot_off=*/0,
+                                       /*device=*/0, /*slot_off=*/win_off[(size_t)r], /*ck_store=*/nullptr,
                                        /*shared=*/nullptr), RAD_OK);
     }
 
@@ -3986,7 +4000,7 @@ static void run_disk_cut(int world) {
         x.push_back(std::make_unique<TierExec>());
         REQUIRE_EQ(x.back()->configure(&reg, &fx[(size_t)r]->kv, &t, &d.disk, cg, /*max_batch=*/3,
                                        /*max_copy=*/64, /*max_chain=*/64, /*leader=*/r == 0,
-                                       /*device=*/0, /*slot_off=*/r * entry, /*ck_slot_off=*/0,
+                                       /*device=*/0, /*slot_off=*/r * entry, /*ck_store=*/nullptr,
                                        /*shared=*/nullptr), RAD_OK);
     }
 
@@ -4128,6 +4142,10 @@ TEST(a_conversation_restored_from_host_is_byte_identical_in_new_blocks) {
 TEST(each_rank_restores_its_own_window_of_a_shared_slot) {
     run_transfer(2, /*fragment=*/false);
     run_transfer(2, /*fragment=*/true);
+}
+TEST(a_rank_with_a_zero_group_moves_only_its_own_groups) {
+    run_transfer(3, /*fragment=*/false, /*zero_last=*/true);
+    run_transfer(3, /*fragment=*/true, /*zero_last=*/true);
 }
 
 /* A SPECULATING DEPLOYMENT KEEPS TWO PHYSICAL SLOTS A SEQUENCE, and the free list counts logical

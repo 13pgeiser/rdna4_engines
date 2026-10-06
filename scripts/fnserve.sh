@@ -4,26 +4,25 @@
 # production one, w4nl64-i8lm.rad, built by data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe
 # (scripts/convfn.sh).
 #
-# 200K CONTEXT, AND WHY THE RATIO IS 0.82 RATHER THAN 0.75. --max-model-len reserves nothing per
-# request; it sets the WORST CASE that --expert-vs-cache-ratio sizes the paged pool against. At
-# 200000 x 8 sequences the default 0.75 binds: the cache takes its full quarter of the elastic pool,
-# and the routed experts it displaces fit in neither VRAM nor the host pool, so without
-# --weights-disk-tier the planner refuses at load ("DID NOT FIT").
+# 200K CONTEXT. --max-model-len reserves nothing per request; it sets the WORST CASE the paged
+# pool is sized against. Under expert_tiered the cache lends: the routed experts keep on the card
+# exactly what the host pool cannot hold, and the cache takes the rest of the elastic pool, up to
+# --max-num-seqs x --max-model-len, lending every block no live request holds back to the expert
+# slab. --host-pool-mib is what moves that split: a larger pool takes experts off the card and
+# gives the cache more, in pinned host RAM.
 #
 # The pool is a CAPACITY, not a per-request cap. A token costs 7.31 KiB across the two paged
 # groups (kv_attn 26.00 KiB and kv_qsa_bkey 3.25 KiB per 4-token block), so one 200K sequence is
-# 1.43 GiB. 0.87 is enough for one-shot requests (a 200K and a 120K sequence at once) but not
-# for multi-turn ones: with prefix caching a finished sequence's blocks stay HELD so the next turn
-# can reuse them, so the demand is the live SESSIONS, and a context of T tokens occupies about
-# 1.8 x T pool tokens. At 0.87 two ~184K sessions do not fit, the cache evicts exactly what the
-# next turn asks for, and every turn re-prefills its whole context (0% prefix hit; minutes per
-# turn instead of seconds). 0.82 holds about two concurrent 200K sessions (99% hit on the second
-# turn) for about 1.4% of decode step time, since the experts lose 5% of the elastic pool; 0.84
-# holds one. Watch kv_util: the hit rate falls off a cliff between 0.75 and 0.81 of the pool.
+# 1.43 GiB. A one-shot request needs its own context; a multi-turn one needs more: with prefix
+# caching a finished sequence's blocks stay HELD so the next turn can reuse them, so the demand is
+# the live SESSIONS, and a context of T tokens occupies about 1.8 x T pool tokens. When the pool
+# cannot hold the live sessions, the cache evicts exactly what the next turn asks for, and every
+# turn re-prefills its whole context (0% prefix hit; minutes per turn instead of seconds). Watch
+# kv_util: the hit rate falls off a cliff as the pool fills.
 #
-# Defaults are the production shape (gpu-headroom-mib 96, expert-vs-cache-ratio 0.82,
-# kv-cache-dtype fp8, max-num-batched-tokens 2048, tp 2, speculation depth 3), with the prefix
-# cache on and --checkpoint-slots at its default, because multi-turn chat wants both.
+# Defaults are the production shape (gpu-headroom-mib 96, kv-cache-dtype fp8,
+# max-num-batched-tokens 2048, tp 2, speculation depth 3), with the prefix cache on and
+# --checkpoint-slots at its default, because multi-turn chat wants both.
 #
 # THE CHUNK IS 2048. `--max-num-batched-tokens` is the prefill chunk when checkpoints are off, and
 # it sets how many routed rows the MoE GEMM sees at once. Part of the expert weight is not in
@@ -98,7 +97,7 @@ nohup ./bin/radiance --model "$M" \
     --host 0.0.0.0 --port "$P" \
     --max-num-seqs ${SEQS:-8} --max-model-len ${MLEN:-200000} \
     --tp ${TP:-2} --placement expert_tiered --host-pool-mib ${HOSTPOOL:-12288} \
-    --gpu-headroom-mib ${HR:-96} --expert-vs-cache-ratio ${RATIO:-0.82} --kv-cache-dtype ${KVD:-fp8} \
+    --gpu-headroom-mib ${HR:-96} --kv-cache-dtype ${KVD:-fp8} \
     --prefix-cache-host-mib ${KVHOST:-4096} \
     --prefix-cache-dir ${KVDIR:-$HOME/kvcache} --prefix-cache-disk-mib ${KVDISK:-131072} \
     --num-speculative-tokens ${NS:-3} \

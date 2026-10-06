@@ -54,6 +54,8 @@ std::vector<Case> build_cases() {
         add("gelu",        { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("silu",        { HI("M", 6), HI("n", 640), HS("dtype", dt) }, EB(6, 640, w, 2));
         add("sigmoid",     { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
+        add("fill",        { HI("M", 6), HI("n", 645), HS("dtype", dt), HF("value", 1.3) },
+            EB(6, 645, w, 1));
         add("softmax",     { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("gather_rows", { HI("M", 6), HI("n", 640), HS("dtype", dt) }, EB(6, 640, w, 2));
         add("scatter_rows", { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));

@@ -43,8 +43,8 @@
  * is unaffected either way; the only difference is whether the prefixes still exist when the next
  * turn asks for them, and that difference is one to two orders of magnitude of time to first
  * token. Size the cache so live sessions fit with room to spare -- a context of T tokens occupies
- * roughly 1.8 x T pool-tokens across the paged groups -- and keep --expert-vs-cache-ratio on the
- * safe side of that.
+ * roughly 1.8 x T pool-tokens across the paged groups. The budget gives the cache everything the
+ * experts can do without (core/mem/vram_budget.h); --host-pool-mib is what moves that.
  *
  * WHAT TO WATCH: `kv_util` (/stats, or vllm:kv_cache_usage_perc) is the predictor, and
  * `radiance:prefix_cache_evictions_total` is the event -- the hit rate is neither, because it only
@@ -203,6 +203,20 @@ public:
      * instead of forgetting it: the next turn restores it rather than re-prefilling it. Only an
      * entry with no host copy yet is lost. Either way the blocks go back to the pool. */
     int64_t evict_lru(int64_t n_entries);
+    /* FREE UP TO `n_blocks` BLOCKS OF THE POOL for the reserve the scheduler keeps, losing nothing
+     * a later turn could have reused. One walk of the LRU list, oldest first, that takes only what
+     * gives the pool a block back without costing a conversation:
+     *
+     *   - an entry a live sequence also holds is passed over. Releasing the cache's reference on
+     *     it frees nothing, and without a host copy it erases the entry -- which, right after a
+     *     publish, is the conversation that request just finished;
+     *   - with the idle tiers on, an entry whose host copy has not landed is passed over too. It
+     *     is the next turn's context with nowhere else to come from, and in a moment it is clean
+     *     and can leave VRAM for nothing.
+     *
+     * Pressure that cannot wait -- an admission or a step that needs the blocks now -- is
+     * evict_lru's. Returns how many blocks went back. */
+    int64_t trim(int64_t n_blocks);
     /* GIVE UP EVERY VRAM COPY THAT CAN GO FOR NOTHING: the entries whose host copy has landed and
      * that no running sequence is still reading. Called when the memory has a better use -- the
      * expert slab's loan -- and returns how many entries left VRAM. An entry a sequence still
@@ -258,50 +272,53 @@ public:
     /* ---------------- the linear half of an idle session ----------------
      *
      * ON A HYBRID MODEL THE BLOCKS ARE ONLY HALF OF WHAT A SESSION NEEDS BACK. The other half is
-     * the recurrent state, and it lives in a CHECKPOINT SLOT: a device-resident object of
-     * KVManager::checkpoint_bytes(), of which there are --checkpoint-slots IN TOTAL for the whole
-     * server. Eight by default, against the six or seven a single 200K session retains under
-     * geometric backoff -- so a second session evicts the first's snapshots, tip included.
-     *
-     * Tiering the blocks and leaving the snapshot behind therefore gets the trade backwards: it
-     * frees the plentiful resource and holds on to the scarce one. And what the session loses is
-     * not part of its hit, it is ALL of it -- the scheduler clamps reuse to the last checkpoint a
-     * hit can reach, because RadBatch carries one query length for every KV group and the linear
+     * the recurrent state, and it lives in a CHECKPOINT SLOT: a slot of the engine's snapshot
+     * store in pinned host memory, KVManager::checkpoint_bytes() a rank, of which there are
+     * --checkpoint-slots IN TOTAL for the whole server. What the session loses without it is not
+     * part of its hit, it is ALL of it -- the scheduler clamps reuse to the last checkpoint a hit
+     * can reach, because RadBatch carries one query length for every KV group and the linear
      * layers cannot be replayed over a longer range than the attention ones (core/sched/
      * scheduler.cpp, admit_one). A restored session with no reachable snapshot reuses zero tokens
-     * and re-prefills its whole transcript. The blocks without the state are not a partial win;
-     * they are unusable.
+     * and re-prefills its whole transcript.
      *
-     * So a snapshot moves with the blocks whose hash it is keyed by, and these calls are the
-     * cache's whole part in that. The bytes are the engine's to move. */
+     * A snapshot never needs to follow its blocks: it is restored straight out of its slot into
+     * the new sequence's state, wherever the blocks are. The only tier below the store is disk,
+     * and a snapshot the disk holds can give its slot up and stay in the index (DETACHED) until a
+     * read brings it back. */
 
-    /* Its bytes are on another tier now: give the device slot back and stop offering it. The index
-     * entry STAYS, because that is what a promotion puts the snapshot back into, and an entry
-     * whose state is not in the pool is exactly the `valid` flag's existing meaning -- lookup
-     * already walks past one and falls back to an older position. */
+    /* Its bytes are only on disk now: give the slot back and stop offering it. The index entry
+     * STAYS, because that is what a read off disk puts the snapshot back into, and an entry whose
+     * state is not in the store is exactly the `valid` flag's existing meaning -- lookup already
+     * walks past one and falls back to an older position. */
     int  detach_snapshot(const BlockHash& key);
     /* And back again, into a slot the caller has already filled. */
     int  reattach_snapshot(const BlockHash& key, int32_t slot);
-    /* A DEVICE CHECKPOINT SLOT FOR A RESTORE. The pool is --checkpoint-slots deep for the whole
-     * server, and it is full whenever as many sessions have run since; a session restored then
-     * would get its blocks back and replay every recurrent layer from an older point, because its
-     * state has nowhere to land. One slot is freed by detaching the least recently used snapshot
-     * the tiers hold a copy of -- which the next restore of THAT session brings back -- and never
-     * one whose only copy is the slot, and never one a lookup has handed out since the step began:
-     * that request reads the slot in this step's forward, and a restore writes it before the
-     * forward runs. True when a slot was freed. */
+    /* A STORE SLOT FOR A READ OFF DISK. The store is --checkpoint-slots deep for the whole server,
+     * and it is full whenever as many sessions have run since; a session whose snapshot is only on
+     * disk would then replay every recurrent layer from an older point, because its state has
+     * nowhere to land. One slot is freed by detaching the least recently used snapshot the disk
+     * also holds -- which the next restore of THAT session reads back -- and never one whose only
+     * copy is the slot, and never one a lookup has handed out since the step began: that request's
+     * restore reads the slot ahead of its step. True when a slot was freed. */
     bool free_checkpoint_for_restore();
+    /* KEEP A WAITING REQUEST'S CHAIN ON THE CARD. An admission that restored a chain and was then
+     * refused -- no free sequence, no room in the pool -- gives its hit back, and its entries are
+     * clean: drop_clean would let them go at the next pass and the next attempt would restore the
+     * same chain again, every step for as long as the request waits. A held entry is passed over
+     * by drop_clean until release(); trim and evict_lru still take it under pressure, which costs
+     * a restore and loses nothing. Idempotent per request. */
+    void hold(uint64_t req, const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm);
+    /* How many of `chain`'s leading entries are in VRAM: as far as a lookup's hit can reach. */
+    size_t resident_prefix(const std::vector<BlockHash>& chain) const;
+    void release(uint64_t req);
     /* A step's admissions begin. The snapshots the last step's lookups handed out have been read
      * by its forward, which committed before this step was planned. */
     void begin_step() { handed_.clear(); }
-    /* The tiers lost it -- a capacity drop, a failed promotion, or an entry they were told to
-     * forget. Erase the index entry; there is no device slot to give back. */
+    /* The tiers lost it -- the disk store let it go, a failed read, or an entry they were told to
+     * forget. Erase the index entry and give back the slot, if it still has one. */
     void drop_snapshot(const BlockHash& key);
-    /* How many snapshots the index holds whose bytes the tiers have. Reported rather than derived
-     * because it is the number that says whether hybrid tiering is doing anything at all: a
-     * session can move its whole chain off the device and still be re-prefilling its linear
-     * layers from zero on every hit, and nothing else distinguishes the two. */
-    int64_t snapshots_off_device() const;
+    /* How many snapshots the index holds whose bytes are only on disk. */
+    int64_t snapshots_detached() const;
     /* ---------------- linear checkpoints ---------------- */
     /* The next position strictly after `pos` at which the scheduler must split a chunk so that a
      * checkpoint lands on a boundary (spec §7.1, §7.3). */
@@ -313,8 +330,9 @@ public:
     int  reserve_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
                             int32_t* slot_out);
     /* The state named by `prefix` is now IN its slot. Until this is called the reservation is only
-     * a promise and lookup() will not offer it -- see Ckpt::valid. */
-    void commit_checkpoint(const BlockHash& prefix);
+     * a promise and lookup() will not offer it -- see Ckpt::valid. A `resume` point is copied off
+     * the card at once (IdleTiers::note_snapshot). */
+    void commit_checkpoint(const BlockHash& prefix, bool resume = false);
     /* Every checkpoint of a session, ascending. */
     std::vector<int64_t> checkpoints(uint64_t session) const;
     /* Apply the retention policy to one session now. Returns how many snapshots were released.
@@ -361,21 +379,24 @@ private:
          * lookup between those two points would hand out a slot holding the previous tenant's
          * history, which is the exact failure this whole mechanism exists to prevent. */
         bool      valid = false;
-        /* ARE THE BYTES STILL IN THE POOL. The idle tiers move a snapshot along with the blocks
-         * it is keyed by, and `slot` is -1 for the whole time they hold it. Kept as its own flag
-         * rather than inferred from the slot so that the two reasons a snapshot cannot be served
-         * -- not written yet, and not here -- stay distinguishable in a debugger and in a report. */
-        bool      off_device = false;
+        /* ARE THE BYTES ONLY ON DISK. A detached snapshot gave its store slot up because the disk
+         * holds it, and `slot` is -1 until a read brings it back. Kept as its own flag rather than
+         * inferred from the slot so that the two reasons a snapshot cannot be served -- not written
+         * yet, and not here -- stay distinguishable in a debugger and in a report. */
+        bool      detached = false;
     };
 
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
     void touch(const BlockHash& h) const;
-    /* Retire one snapshot whatever tier holds its bytes: a device slot goes back to the pool, and
-     * tiered bytes go back to the tiers. One place, because three call sites that each remembered
-     * to check `off_device` would be three places to forget. The session index is the caller's,
-     * since every caller is already rebuilding or erasing it. */
+    /* Does a live sequence hold any of this entry's blocks as well? Then releasing the cache's
+     * reference frees nothing. */
+    bool shared_with_live(const Entry& e) const;
+    /* Retire one snapshot whatever tier holds its bytes: a slot goes back to the store, and a disk
+     * copy goes back to the tiers. One place, because three call sites that each remembered to
+     * check `detached` would be three places to forget. The session index is the caller's, since
+     * every caller is already rebuilding or erasing it. */
     void retire_ckpt(std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator it);
 
     KVManager*  kv_ = nullptr;
@@ -394,6 +415,11 @@ private:
     std::vector<BlockHash> drop_wait_;
     std::vector<BlockHash> drop_scratch_;
     uint64_t    frees_seen_ = 0;
+    /* hold(): the keys each waiting request holds, and how many requests hold each key. A release
+     * makes drop_wait_ worth looking at again, as a freed sequence does. */
+    std::unordered_map<uint64_t, std::vector<BlockHash>> holds_;
+    std::unordered_map<BlockHash, int32_t, BlockHashHash> held_;
+    bool        released_ = false;
     mutable std::unordered_map<BlockHash, Ckpt, BlockHashHash> ck_by_prefix_;
     std::unordered_map<uint64_t, std::vector<BlockHash>> ck_by_session_;
     /* Snapshots lookup handed out since begin_step: not a restore's to take (free_checkpoint_for_restore). */

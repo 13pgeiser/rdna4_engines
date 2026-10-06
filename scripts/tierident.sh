@@ -122,7 +122,7 @@ where() {                     # where -> "vram=N ram=N disk=N [+ snapshots]" for
     snap
     w="vram=$(q .blocks_sum_overlapping.device) ram=$(q .blocks_sum_overlapping.host) disk=$(q .blocks_sum_overlapping.disk)"
     if [ "$(q .snapshots_moved.bytes_each)" != "0" ]; then
-        w="$w  state: vram=$(q .snapshots.device) ram=$(q .snapshots.host) disk=$(q .snapshots.disk)"
+        w="$w  state: ram=$(q .snapshots.host) disk=$(q .snapshots.disk)"
     fi
     echo "$w"
 }
@@ -188,26 +188,28 @@ case "$(q .blocks_sum_overlapping.host)" in 0|null|"") false ;; *) true ;; esac 
         (--prefix-cache-host-mib set? is the maintenance pass running?)"
 if [ "$HYBRID" = 1 ]; then
     snap
-    [ "$(q .snapshots_moved.to_host)" = "0" ] && \
-        note "no linear-state snapshot reached RAM, so the restore below tests the blocks only
-        (starved: $(q .snapshots_moved.starved), dropped: $(q .snapshots_moved.drops))"
+    # A SNAPSHOT IS IN HOST MEMORY FROM THE MOMENT IT IS SAVED (the checkpoint store), so the
+    # session's state must be there or on disk -- nowhere else is a place it can be.
+    case "$(q .snapshots.host)/$(q .snapshots.disk)" in 0/0|null/*|*/null) false ;; *) true ;; esac || \
+        note "the session holds no linear-state snapshot, so the restore below tests the blocks only
+        (dropped: $(q .snapshots_moved.drops))"
 fi
 snap
-PROM0=$([ "$HYBRID" = 1 ] && q .snapshots_moved.promoted || echo 0)
+FET0=$([ "$HYBRID" = 1 ] && q .snapshots_moved.fetched || echo 0)
 LIN0=$([ "$HYBRID" = 1 ] && lin || echo 0)
-DEV0=$([ "$HYBRID" = 1 ] && q .snapshots.device || echo 0)
+RAM0=$([ "$HYBRID" = 1 ] && q .snapshots.host || echo 0)
 FROMHOST=$(ask fromhost)
 echo "  restored from RAM          $FROMHOST   [$(where)]"
 check "a session restored from RAM reproduces the cold answer" "$FROMHOST" "$COLD"
 if [ "$HYBRID" = 1 ]; then
     snap
-    # A SNAPSHOT STILL IN ITS DEVICE SLOT NEEDS NO PROMOTION: it stays there when the blocks go,
-    # and only the checkpoint pool's own pressure detaches it. Whether it was SERVED is the check
-    # below either way; this one only says which path served it.
-    if [ "$(q .snapshots_moved.promoted)" -gt "$PROM0" ]; then
-        echo "  ok    its linear state came back with it  ($(( $(q .snapshots_moved.promoted) - PROM0 )) snapshot(s))"
-    elif [ "$DEV0" -gt 0 ]; then
-        echo "  --    its linear state never left its device slot ($DEV0 there), so nothing was promoted"
+    # A SNAPSHOT IN THE STORE NEEDS NO READ: it is restored straight out of its slot, and only
+    # the store's own pressure sends it to disk. Whether it was SERVED is the check below either
+    # way; this one only says which path served it.
+    if [ "$(q .snapshots_moved.fetched)" -gt "$FET0" ]; then
+        echo "  ok    its linear state was read back off disk  ($(( $(q .snapshots_moved.fetched) - FET0 )) snapshot(s))"
+    elif [ "$RAM0" -gt 0 ]; then
+        echo "  --    its linear state stayed in the snapshot store ($RAM0 there), so nothing was read"
     else
         note "the blocks came back and the linear state did not -- the answer is right and the
         session will replay every recurrent layer from an older checkpoint to produce it"
@@ -238,25 +240,25 @@ if [ "$HYBRID" = 1 ]; then
         (disk snapshot slots: $(q .snapshots_moved.disk_slots))"
 fi
 snap
-PROM1=$([ "$HYBRID" = 1 ] && q .snapshots_moved.promoted || echo 0)
+FET1=$([ "$HYBRID" = 1 ] && q .snapshots_moved.fetched || echo 0)
 LIN1=$([ "$HYBRID" = 1 ] && lin || echo 0)
 FROMDISK=$(ask fromdisk)
 echo "  restored from disk         $FROMDISK   [$(where)]"
 check "a session restored from disk reproduces the cold answer" "$FROMDISK" "$COLD"
 if [ "$HYBRID" = 1 ]; then
     snap
-    if [ "$(q .snapshots_moved.promoted)" -gt "$PROM1" ]; then
+    if [ "$(q .snapshots_moved.fetched)" -gt "$FET1" ]; then
         echo "  ok    its linear state came back from disk too"
     else
-        note "nothing promoted a snapshot out of disk -- the filler's snapshots did not push the
-        session's out of the device pool (--checkpoint-slots 2?), so the disk path never ran"
+        note "no snapshot was read off disk -- the filler's snapshots did not push the session's
+        out of the snapshot store (--checkpoint-slots 2?), so the disk path never ran"
     fi
     if [ "$(lin)" -gt "$LIN1" ]; then
         echo "  ok    and the state restored from disk was SERVED  ($(( $(lin) - LIN1 )) prompt tokens)"
     else
         note "a snapshot came back from disk and no lookup used it"
     fi
-    echo "  snapshots: to_host=$(q .snapshots_moved.to_host) to_disk=$(q .snapshots_moved.to_disk) promoted=$(q .snapshots_moved.promoted) dropped=$(q .snapshots_moved.drops) starved=$(q .snapshots_moved.starved)"
+    echo "  snapshots: to_disk=$(q .snapshots_moved.to_disk) fetched=$(q .snapshots_moved.fetched) dropped=$(q .snapshots_moved.drops)"
 fi
 
 # ---- and the text itself, so a failure says WHERE ----------------------------------------------

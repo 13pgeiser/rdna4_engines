@@ -26,4 +26,15 @@ namespace rad {
 int gbnf_oracle_mask(const GbnfGrammar& g, uint32_t* bitmask, int64_t n_words,
                      uint64_t work_limit = 0);
 
+/* THE STATE ACCEPTING `token` LEAVES, the way the stack machinery builds it: every stack advanced
+ * one code point at a time through accept_chr and the epsilon closure, as upstream's
+ * llama_grammar_accept_impl does. The engine steps the stacks that match code points through the
+ * mask plan's automaton instead, and the two must leave the same stack set and the same carried
+ * partial character. `*out` comes back sorted. Returns RAD_OK, RAD_E_STATE when no stack
+ * survives, or RAD_E_FULL / RAD_E_NOMEM past the engine's bounds. For a grammar not waiting on
+ * its trigger, and a token that is not end-of-generation -- accept_token answers those without
+ * the stacks. */
+int gbnf_oracle_accept(const GbnfGrammar& g, int32_t token, GbnfStacks* out,
+                       PartialUtf8* partial);
+
 }  /* namespace rad */

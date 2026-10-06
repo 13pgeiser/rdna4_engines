@@ -374,13 +374,6 @@ int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi);
 int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, const int64_t* hi,
                                 const int64_t* total, int n);
 
-/* THIS RANK'S SHARE IS ZEROS. The weight is declared with its row or column shard and extent as
- * on every other rank, and nothing is read for it: the loader writes zeros. It is for a rank the
- * geometry gives no real heads (rad_arch.h: a world size the KV head count does not divide), so
- * that rank runs the same program as its peers -- the scheduler sees one program -- and its
- * projection contributes exactly nothing to the reduce. Additive export. */
-int rad_weight_shard_zero(RadBuilder* b, rad_weight w);
-
 /* THIS RANK KEEPS NO CACHE FOR THE GROUP. The group is declared as on every other rank -- the
  * scheduler indexes groups by position and one block table serves every rank, so it must exist
  * here with the same block size and layers -- and nothing is carved for it: it costs this rank no
@@ -691,7 +684,8 @@ typedef struct RadChatFormat {
 
     uint32_t    string_value;        /* RAD_CHAT_VALUE_RAW or _CDATA: a string-typed argument */
     uint32_t    other_value;         /* RAD_CHAT_VALUE_JSON: any other type (or _RAW, as text) */
-    /* Non-zero: one newline at each end of a value is punctuation, not part of the value. */
+    /* Non-zero: one newline at each end of a value is punctuation, not part of the value -- at
+     * its start only where the tag before it does not end with that newline itself. */
     uint32_t    value_newlines;
 
     /* The literal words that start constrained decoding of a call. None: no grammar, and the

@@ -12,11 +12,15 @@
  *      boundary: cutting a multi-byte code point in half turns one delta into mojibake and the
  *      next into a decode error.
  *
+ * And one way to write it: `json_quote_append`, a string literal exactly as nlohmann writes one,
+ * for the chunks that carry a delta.
+ *
  * This is a scanner, not a parser: it allocates nothing and builds no DOM.
  */
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <string_view>
 
 namespace rad {
@@ -35,6 +39,16 @@ size_t utf8_trunc(std::string_view s);
  * because a client that pretty-prints each delta is a client that would otherwise print a broken
  * escape, and the class of bug that produces is unbisectable from the server side. */
 size_t json_stable_prefix(std::string_view s);
+
+/* Append `s` to `out` as a JSON string literal, quotes included, byte for byte as nlohmann's
+ * dump() writes one: `\b \t \n \f \r \" \\` as two characters, every other control character
+ * as `\u00xx` in lowercase hex, and everything else -- DEL and non-ASCII included -- as itself.
+ * Returns false, with `out` as it was, when `s` is not well-formed UTF-8 (overlong forms,
+ * surrogates and code points past U+10FFFF included), which nlohmann refuses rather than writes.
+ *
+ * A streamed chunk is written with this around a fixed frame instead of through a DOM: building
+ * and dumping a tree per token cost more than every other part of the token's host work. */
+bool json_quote_append(std::string& out, std::string_view s);
 
 }  /* namespace server */
 }  /* namespace rad */

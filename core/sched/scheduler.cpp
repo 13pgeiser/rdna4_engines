@@ -280,7 +280,16 @@ static server::Finish finish_of(ReqState st, const std::string& reason) {
  * So a reserve is kept free. It is a fraction of the pool rather than a token count because the
  * thing being protected is the ability to admit ANY sequence, and how big that is depends on the
  * deployment. Trimming happens after a publish, off the step path, where the blocks were just
- * added -- not during admission, where the cost lands on a request that did nothing wrong. */
+ * added -- not during admission, where the cost lands on a request that did nothing wrong.
+ *
+ * THE RESERVE IS NOT ALWAYS THE CACHE'S TO MEET. Live sequences count against it too, and once they
+ * hold more than three quarters of the pool -- five or six agent sessions at 70K tokens each -- no
+ * amount of trimming reaches it. Evicting in LRU order until it did would take everything on the
+ * list: the entries running sequences share, which frees no block, and the conversation the
+ * request being closed has just published, before its host copy can land -- so every agent's next
+ * turn would re-prefill its whole context. The trim therefore asks the cache for the blocks it is
+ * short and nothing more, and the cache gives only what frees a block without losing a
+ * conversation (PrefixCache::trim). */
 
 /* Drop every entry, in VRAM or off it -- IPrefixCache::reset, because an eviction does not
  * mean "forgotten" for an entry the idle tiers hold a copy of. */
@@ -300,17 +309,12 @@ void Scheduler::trim_prefix_cache() {
     const int64_t total = kv_->total_blocks(g);
     if (total <= 0) return;
     const int64_t reserve = total / 4;              /* a quarter of the pool stays free */
-    for (int guard = 0; guard < 4096; ++guard) {
-        /* FREE AGAINST THE CARVE, not free_blocks(). On an elastic pool free_blocks() is bounded
-         * by the live mark, so a pool that has handed its unused top back reads as nearly full
-         * however little anything holds -- and this loop would then drain the whole cache to
-         * make room the pool can grow back into on demand. */
-        if (total - kv_->held_blocks(g) >= reserve) return;
-        if (pc_->evict(256) <= 0) return;           /* nothing left to give back */
-    }
-    RAD_WARN("prefix cache: could not free %lld of %lld blocks in group %d after 4096 rounds; the "
-             "pool is held by live sequences rather than by the cache",
-             (long long)reserve, (long long)total, (int)g);
+    /* FREE AGAINST THE CARVE, not free_blocks(). On an elastic pool free_blocks() is bounded by
+     * the live mark, so a pool that has handed its unused top back reads as nearly full however
+     * little anything holds -- and the trim would then drain the whole cache to make room the pool
+     * can grow back into on demand. */
+    const int64_t short_by = reserve - (total - kv_->held_blocks(g));
+    if (short_by > 0) (void)pc_->trim(short_by);
 }
 
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
@@ -340,6 +344,8 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
             trim_prefix_cache();
         }
     }
+
+    if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
 
     if (defer_free) {
         if (!s.pending_free) ++n_deferred_;
@@ -665,7 +671,22 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
         if (n_computed + want > next) want = next - n_computed;
-        if (n_computed + want == next && checkpoint_pos) *checkpoint_pos = next;
+        if (n_computed + want == next) {
+            if (checkpoint_pos) *checkpoint_pos = next;
+        } else if (n_computed + want == n_target) {
+            /* AND ONE AT THE TAIL OF THE PROMPT. The next turn of a conversation is this prompt
+             * with more on the end, and it resumes from the deepest snapshot under its hit -- on
+             * the interval alone that is up to an interval short of where this prompt ended, and
+             * every one of those tokens is prefilled again on every turn. The last quantum
+             * boundary is as far as a chunk may end short of the target, so the final chunk is
+             * split there and the remainder, under a quantum, runs as the next step's chunk
+             * (tail_checkpoint says where it is worth that step). */
+            const int64_t tail = tail_checkpoint(n_target);
+            if (tail > n_computed) {
+                want = tail - n_computed;
+                if (checkpoint_pos) *checkpoint_pos = tail;
+            }
+        }
     }
 
     if (want < remaining) {
@@ -686,6 +707,26 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
         }
     }
     return want;
+}
+
+/* THE DEEPEST CHECKPOINT A PROMPT OF `target` TOKENS GETS, asked of one at `pos`: no interval
+ * boundary is left before the target and no tail checkpoint will follow (plan_chunk's rules). It
+ * is the state the prompt's next turn resumes from. */
+bool Scheduler::last_checkpoint(int64_t pos, int64_t target) const {
+    if (!geo_.checkpoints()) return false;
+    const int64_t I = geo_.checkpoint_interval;
+    if ((pos / I + 1) * I <= target) return false;
+    return tail_checkpoint(target) <= pos;
+}
+
+/* THE TAIL CHECKPOINT OF A PROMPT OF `target` TOKENS, or -1: its last quantum boundary, past the
+ * first interval -- a shorter prompt is cheap to prefill again -- and only where it buys a quarter
+ * of an interval or more over the interval checkpoint below it, which is worth the extra step. */
+int64_t Scheduler::tail_checkpoint(int64_t target) const {
+    const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
+    if (I <= 0 || Q <= 0) return -1;
+    const int64_t tail = target / Q * Q;
+    return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
 
 /* ------------------------------------------------------------------ preemption */
@@ -734,6 +775,13 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
         s.hit_owed = true;
     }
 
+    /* WHAT NO HIT CAN CHANGE IS ASKED FIRST: a free sequence and a budget that can take a chunk.
+     * A restore copies the whole context back, and an admission refused after it would give that
+     * hit back and copy it again on the next attempt. */
+    if (s.card < 0 && free_cards_.empty()) return RAD_E_FULL;
+    if (budget < std::max<int64_t>(geo_.quantum, 1) && budget < s.seq_len() - r.n_computed)
+        return RAD_E_FULL;
+
     if (r.n_computed == 0 && cfg_.prefix_cache) {
         /* BEFORE the lookup, because the lookup stops at the first block the tiers hold -- an
          * honest shorter hit, but a shorter one. This is where a cold session gets its
@@ -770,9 +818,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
 
         /* Claim the cached blocks. Without this the hit is only an accounting entry: the sequence
          * would skip computing those tokens and then attend to blocks it does not own. adopt()
-         * takes a whole block multiple, which `reuse` is -- it is a multiple of the checkpoint
-         * interval, which geometry.h made a multiple of the quantum, which is a multiple of the
-         * block size. */
+         * takes a whole block multiple, which `reuse` is -- a whole number of blocks, or a
+         * checkpoint position, which is on the interval or on a quantum boundary at a prompt's tail
+         * (plan_chunk), and geometry.h made both multiples of the block size. */
         if (reuse > 0) {
             const std::vector<int32_t>& cg = pc_->cached_groups();
             for (size_t i = 0; i < cg.size() && i < hit_blocks_.size(); ++i) {
@@ -801,7 +849,17 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
     int rc = RAD_OK;
     if (want <= 0)                                          rc = RAD_E_FULL;
     else if (s.card < 0 && free_cards_.empty())             rc = RAD_E_FULL;
-    else if (kv_->ensure(r.id, r.n_computed + want) < 0)    rc = RAD_E_NOMEM;
+    else {
+        /* THE CACHE GIVES WAY TO A NEW REQUEST as it does to a running one: with nothing running,
+         * no other path would ever take blocks back from it, and the request would wait for good. */
+        int rounds = 0;
+        while (kv_->ensure(r.id, r.n_computed + want) < 0) {
+            if (++rounds > 256 || !cfg_.prefix_cache || pc_->evict(256) <= 0) {
+                rc = RAD_E_NOMEM;
+                break;
+            }
+        }
+    }
     if (rc < 0) {
         /* A HIT THAT RESUMES FROM A SNAPSHOT IS NOT KEPT ACROSS A FAILED ATTEMPT. The slot is
          * named by id only, and until this request's first step restores from it nothing stops
@@ -811,6 +869,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
          * a lookup; the attention-only hit of a model with no recurrent state holds only
          * refcounted blocks and is kept. */
         if (s.ckpt_src >= 0) undo_hit(s);
+        /* AND WHAT THE RESTORE BROUGHT BACK STAYS for the next attempt (IPrefixCache::hold). */
+        if (cfg_.prefix_cache) pc_->hold(r);
         return rc;
     }
 
@@ -1413,8 +1473,10 @@ int Scheduler::commit(const StepResult& res) {
          * still holding the previous tenant's state. Stream ordering does the rest -- a later
          * restore is enqueued on the same stream behind this save, so validity does not have to
          * wait on the copy landing, only on it being issued. */
-        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
-            pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_) {
+            const int64_t pos = (int64_t)e.ctx_len + e.ckpt_tok + 1;
+            pc_->commit_checkpoint(r, pos, last_checkpoint(pos, s.seq_len()));
+        }
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
@@ -2172,6 +2234,7 @@ SchedMetrics Scheduler::metrics_locked() const {
         m.kv[i].blocks_free = fr;
         m.kv[i].utilisation = tot > 0 ? (float)(1.0 - (double)fr / (double)tot) : 0.0f;
         m.kv[i].block_tokens = kv_->block_tokens(i);
+        m.kv[i].window       = gs[(size_t)i].decl.kind == RAD_KV_WINDOW;
         m.kv[i].bytes_total  = kv_->pool_bytes(i);
         m.kv[i].bytes_used   = kv_->pool_bytes_used(i);
         m.kv[i].bytes_carved = kv_->pool_bytes_carved(i);

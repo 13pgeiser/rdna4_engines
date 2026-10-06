@@ -144,6 +144,9 @@ static const RadParamSpec pMnD[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oBinary[]  = { OPD("a"), OPD("b"), OUT("y") };
 static const RadOperandSpec oGateUp[]  = { OPD("gate_up"), OUT("y") };
 static const RadOperandSpec oUnary[]   = { OPD("x"), OUT("y") };
+/* `fill` has no input: `value` is the whole of what it writes. */
+static const RadParamSpec pFill[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value") };
+static const RadOperandSpec oFill[] = { OUT("y") };
 static const RadOperandSpec oGather[]  = { OPD("x"), OPD("idx"), OUT("y") };
 static const RadOperandSpec oScatterRows[] = { OPD("v"), OPD("idx"), INOUT("x") };
 
@@ -594,6 +597,10 @@ static const RadOpSchema kSchemas[] = {
   "y = 0.5x(1 + erf(x/sqrt(2))). The exact erf form, not the tanh approximation." },
 { "silu", ARR(pMnD), ARR(oUnary), "y = x * sigmoid(x)." },
 { "sigmoid", ARR(pMnD), ARR(oUnary), "y = 1 / (1 + exp(-x))." },
+{ "fill", ARR(pFill), ARR(oFill),
+  "y = value, every element of an [M, n] extent (default 0), rounded once to y's dtype. The op a "
+  "rank issues where it computes nothing and a reader downstream -- an all-reduce, a residual -- "
+  "still expects a defined buffer." },
 { "ple_gate", ARR(pPleGate), ARR(oPleGate),
   "Per-Layer Embedding's gate. K = grouped_rmsnorm(k) * (w_key + wadd) and Q likewise over `q`, "
   "one rsqrt per `n`-wide stream and one gain across all hc*n; s[c] = sum_d K[c][d]*Q[c][d] / "
@@ -981,6 +988,7 @@ SIMPLE("ref_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate
 SIMPLE("ref_gelu", "gelu", "elem", "exact erf gelu", DT_FLOAT, ref_gelu),
 SIMPLE("ref_silu", "silu", "elem", "silu", DT_FLOAT, ref_silu),
 SIMPLE("ref_sigmoid", "sigmoid", "elem", "logistic sigmoid", DT_FLOAT, ref_sigmoid),
+SIMPLE("ref_fill", "fill", "elem", "constant fill", DT_FLOAT, ref_fill),
 SIMPLE("ref_ngram_ids", "ngram_ids", "vocab", "hashed n-gram row ids for PLE", DT_ANY,
        ref_ngram_ids),
 SIMPLE("ref_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot, a signed sqrt",

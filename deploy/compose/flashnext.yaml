@@ -12,7 +12,7 @@ services:
       --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
       --tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000
       --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96
-      --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8
+      --kv-cache-dtype fp8
       --prefix-cache-host-mib 4096 --prefix-cache-dir /data/kvcache/flashnext
       --prefix-cache-disk-mib 131072
       --num-speculative-tokens 3 --max-num-batched-tokens 2048

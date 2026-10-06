@@ -651,13 +651,13 @@ int Engine::step_loop() {
         }
 
         /* THE RECURRENT HALF OF A PREFIX HIT, restored BEFORE the step that reads it. The adopted
-         * blocks carry the attention layers; this carries the recurrent ones. Enqueued on each
-         * rank's own stream ahead of the release, so it is ordered before the kernels without a
-         * synchronisation -- the same way collect_step's readback is ordered after them.
+         * blocks carry the attention layers; this carries the recurrent ones, copied out of the
+         * snapshot's slot in host memory. Enqueued on each rank's own stream ahead of the
+         * release, so it is ordered before the kernels without a synchronisation -- the same way
+         * collect_step's readback is ordered after them.
          *
-         * UNDER THE SCHEDULER'S LOCK, because it reads the sequence table and backs checkpoint
-         * slots in rank 0's manager, which an HTTP thread's cancel mutates under that lock. Taken
-         * only on a step that has a restore in it. */
+         * UNDER THE SCHEDULER'S LOCK, because it reads the sequence table, which an HTTP thread's
+         * cancel mutates under that lock. Taken only on a step that has a restore in it. */
         bool any_restore = false;
         for (const StepEntry& e : plan.e) if (e.ckpt_restore >= 0) { any_restore = true; break; }
         if (any_restore) {
@@ -666,12 +666,7 @@ int Engine::step_loop() {
                     if (e.ckpt_restore < 0) continue;
                     if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
                     for (auto& rk : ranks_) {
-                    /* THIS RANK'S DEVICE, BECAUSE THE COPY MAY HAVE TO MAP MEMORY FIRST. A
-                     * checkpoint slot is backed by the rank that writes it
-                     * (KVManager::back_checkpoint), and a commit must land on the card whose pool
-                     * it backs -- a commit on card 0 mapped into rank 1's range succeeds, grants
-                     * access to the wrong card, and rank 1's next kernel faults on a page that is
-                     * present somewhere else. */
+                        /* This rank's device, for its own stream and its own state slots. */
                         if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                         const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
                                                                 (int)ckpt_slots_.size(),
@@ -759,8 +754,9 @@ int Engine::step_loop() {
 
         /* AND THE SNAPSHOT, taken AFTER the step that produced the state. The chunker split this
          * chunk so its last token IS the checkpoint position, so what copy 0 holds now is exactly
-         * the state at that position. It is issued before collect_step's readback synchronises, so
-         * the copy overlaps whatever is left of the step rather than adding to it.
+         * the state at that position. It is a copy across the link into the snapshot's slot in host
+         * memory, issued before collect_step's readback synchronises and ahead of any step issued
+         * behind this one, which is what orders the next write of the state after it.
          *
          * Under the scheduler's lock for the reason the restore above is, and only on a step that
          * writes a checkpoint. */
@@ -773,8 +769,6 @@ int Engine::step_loop() {
                     if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
                     if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
                     for (auto& rk : ranks_) {
-                    /* THIS RANK'S DEVICE, for the reason the restore gives: the copy may have to
-                     * back the slot first, and the pages belong on this rank's card. */
                         if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                         const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
                                                              (int)ckpt_slots_.size(),
@@ -1147,15 +1141,8 @@ void Engine::loan_tick(bool idle) {
     const auto lk = sched_.hold();
     Rank& lead = *ranks_[0];
 
-    /* A FINISHED CONVERSATION'S VRAM GOES FIRST, when the slabs have a use for it. An entry whose
-     * host copy has landed loses nothing by leaving -- a return restores it from host memory --
-     * so while any slab has slots the loan does not yet cover, every such entry is released and
-     * its blocks count toward what the cache can spare below. Past that point the VRAM would sit
-     * empty in the slab, and the entries stay where a return finds them for free. */
-    int64_t ceiling = 0;
-    for (auto& r : ranks_) ceiling = std::max(ceiling, r->mover.loan_ceiling(Mover::kLendKV));
-    if (lead.kv.loan_tokens() < ceiling) (void)lead.prefix.drop_clean();
-
+    /* A FINISHED CONVERSATION'S VRAM IS ALREADY FREE by the time this runs: tier_tick gives up
+     * every entry whose host copy has landed, so what the cache can spare below counts it. */
     /* WHAT THE CACHE CAN DO WITHOUT, AND WHAT THE SLABS STILL OCCUPY. A loan grows as soon as the
      * cache can spare it -- the slots are filled on the next dispatch or the next idle tick -- but
      * only by at least a prefill chunk, so a cache breathing by a few blocks does not have its
@@ -1296,14 +1283,20 @@ void Engine::tier_tick() {
     {
         TierIO::Fetch f;
         while (P.io.take_fetch(&f)) {
-            for (size_t i = 0; i < f.fences.size() && i < ranks_.size(); ++i) {
-                if (!f.fences[i]) continue;
-                (void)rad_dev_set(ranks_[i]->device);
-                rad_event_destroy(f.fences[i]);
-            }
-            if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
+            destroy_fences(f.fences);
             const auto lk = sched_.hold();
             lead.tierx.report_pass(f.jobs, f.ok, now);
+            /* A SNAPSHOT READ BACK INTO ITS SLOT goes to the cache's index entry, which the lookup
+             * then serves. One whose entry went while the read was out has nothing to land in, and
+             * the record must not go on naming a slot the store will hand to somebody else. */
+            for (const TierJob& j : f.jobs) {
+                if (!j.ck_want || j.ck_slot < 0 || !lead.tiers.snapshot_in_slot(j.key, j.ck_slot))
+                    continue;
+                if (lead.prefix.reattach_snapshot(j.key, j.ck_slot) != RAD_OK) {
+                    lead.tiers.snapshot_detached(j.key);
+                    lead.kv.free_checkpoint(j.ck_slot);
+                }
+            }
             P.waiting.erase(std::remove(P.waiting.begin(), P.waiting.end(), f.tag), P.waiting.end());
         }
     }
@@ -1312,7 +1305,9 @@ void Engine::tier_tick() {
     {
         std::vector<TierJob> jobs;
         std::vector<char> ok;
-        if (P.io.take(&jobs, &ok)) {
+        std::vector<RadEvent> fences;
+        if (P.io.take(&jobs, &ok, &fences)) {
+            destroy_fences(fences);
             const auto lk = sched_.hold();
             lead.tierx.report_pass(jobs, ok, now);
         }
@@ -1334,6 +1329,22 @@ void Engine::tier_tick() {
         }
     }
 
+    /* ---- what is not live leaves VRAM -------------------------------------------------------- */
+    /* AS SOON AS ITS COPY HAS LANDED, WHILE THE EXPERT SLAB HAS A USE FOR THE BLOCKS. An entry no
+     * running sequence reads and whose host copy is in place costs nothing to give up -- a later
+     * turn restores it in a copy -- and its blocks are lent to the slab. With no lender, or a slab
+     * whose loan already covers every slot it has, the blocks would sit empty in the pool, so the
+     * entry stays where the next turn finds it for free; a request that needs the room takes it
+     * through trim, which drops the same entries on demand.
+     *
+     * NOT THE SNAPSHOTS: they are in host memory already and hold no VRAM. */
+    if (lending_) {
+        int64_t ceiling = 0;
+        for (auto& r : ranks_) ceiling = std::max(ceiling, r->mover.loan_ceiling(Mover::kLendKV));
+        const auto lk = sched_.hold();
+        if (lead.kv.loan_tokens() < ceiling) (void)lead.prefix.drop_clean();
+    }
+
     /* ---- the slow half ---------------------------------------------------------------------- */
     /* AS SOON AS A DISK COPY IS WAITING, not on the clock: until it lands, the entry's host slot
      * cannot be given up for nothing, and a full arena is then a restore that cannot read through
@@ -1343,7 +1354,25 @@ void Engine::tier_tick() {
         tier_last_ns_ = now;
         std::vector<TierJob> jobs;
         lead.tiers.plan(P.slow_budget, &jobs);
-        if (!jobs.empty() && !P.io.submit(std::move(jobs))) {
+        /* A SNAPSHOT'S SLOT IS FILLED BY A COPY ON THE COMPUTE STREAM, issued after the step that
+         * produced the state and before the cache was told of it; the write waits for that copy to
+         * land, and every one of its kind is behind this mark. */
+        bool snaps = false;
+        for (const TierJob& j : jobs) snaps = snaps || j.ck_slot >= 0;
+        int fst = RAD_OK;
+        std::vector<RadEvent> fences = snaps ? rank_fences(false, true, &fst)
+                                             : std::vector<RadEvent>{};
+        /* A mark that could not be made leaves nothing to order the write by: the batch is
+         * reported failed, and every record keeps what it had. */
+        if (fst != RAD_OK) {
+            destroy_fences(fences);
+            const std::vector<char> ok(jobs.size(), 0);
+            const auto lk = sched_.hold();
+            lead.tierx.report_pass(jobs, ok, now);
+            return;
+        }
+        if (!jobs.empty() && !P.io.submit(std::move(jobs), std::move(fences))) {
+            destroy_fences(fences);
             /* The thread is not running -- no disk tier -- and a plan without one holds only drops,
              * which move nothing. They are reported here. */
             std::vector<char> ok(jobs.size(), 1);
@@ -1351,6 +1380,74 @@ void Engine::tier_tick() {
             lead.tierx.report_pass(jobs, ok, now);
         }
     }
+}
+
+std::vector<RadEvent> Engine::rank_fences(bool transfer, bool compute, int* st) {
+    std::vector<RadEvent> out;
+    int rc = RAD_OK;
+    for (int pass = 0; pass < 2; ++pass) {
+        if ((pass == 0 && !transfer) || (pass == 1 && !compute)) continue;
+        for (auto& r : ranks_) {
+            RadEvent e = nullptr;
+            const int s = r->tierx.fence(&e, pass == 1 ? r->ctx.stream() : nullptr);
+            if (s != RAD_OK && rc == RAD_OK) rc = s;
+            out.push_back(e);
+        }
+    }
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    if (st) *st = rc;
+    return out;
+}
+
+void Engine::destroy_fences(std::vector<RadEvent>& f) {
+    for (size_t i = 0; i < f.size(); ++i) {
+        if (!f[i]) continue;
+        (void)rad_dev_set(ranks_[i % ranks_.size()]->device);
+        rad_event_destroy(f[i]);
+    }
+    f.clear();
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+}
+
+bool Engine::flush_copies() {
+    if (!pump_ || !ranks_[0]->tierx.enabled()) return false;
+    TierPump& P = *pump_;
+    Rank& lead = *ranks_[0];
+    bool landed = false;
+    const uint64_t t0 = rad_mono_ns();
+    /* Counted only when something was in flight or waiting: a call that found nothing to land
+     * stalled nobody. */
+    struct Note {
+        IdleTiers& t; uint64_t t0; bool worked = false;
+        ~Note() { if (worked) t.note_flush((int64_t)(rad_mono_ns() - t0)); }
+    } note{lead.tiers, t0};
+    /* BOUNDED: each round lands one batch of P.max_copy entries, and a pool short of more than
+     * that many rounds' worth is a pool the tiers cannot relieve in one step. */
+    for (int round = 0; round < 64; ++round) {
+        if (!P.copy.empty()) {
+            note.worked = true;
+            bool good = true;
+            for (size_t i = 0; i < ranks_.size(); ++i) {
+                if (P.copy_st[i] == 0) P.copy_st[i] = ranks_[i]->tierx.wait_copy();
+                if (P.copy_st[i] < 0) good = false;
+            }
+            if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
+            const std::vector<char> ok(P.copy.size(), good ? 1 : 0);
+            lead.tierx.report_pass(P.copy, ok, rad_mono_ns());
+            P.copy.clear();
+            landed = landed || good;
+        }
+        if (!lead.tiers.writeback_waiting()) break;
+        lead.tiers.plan_writeback(P.max_copy, &P.copy);
+        if (P.copy.empty()) break;
+        P.copy_st.assign(ranks_.size(), 0);
+        for (size_t i = 0; i < ranks_.size(); ++i) {
+            const int st = ranks_[i]->tierx.issue_copy(P.copy, ranks_[i]->ctx.stream());
+            if (st < 0) P.copy_st[i] = st;
+        }
+        if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
+    }
+    return landed;
 }
 
 /* HAND A READ OFF DISK TO THE IO THREAD, fenced on every rank's transfer stream: the slots it
@@ -1362,25 +1459,20 @@ bool Engine::submit_fetch(uint64_t tag, std::vector<TierJob>&& jobs) {
     TierIO::Fetch f;
     f.tag = tag;
     f.jobs = std::move(jobs);
+    /* THE TRANSFER STREAMS, for the restores that read block slots, and THE COMPUTE STREAMS when a
+     * snapshot comes in: its store slot may have been given up by a snapshot a restore on that
+     * stream is still copying out of. */
+    bool snap = false;
+    for (const TierJob& j : f.jobs) snap = snap || (j.ck_want && j.ck_slot >= 0);
     int st = RAD_OK;
-    for (auto& r : ranks_) {
-        RadEvent e = nullptr;
-        if (st == RAD_OK) st = r->tierx.fence(&e);
-        f.fences.push_back(e);
-    }
-    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    f.fences = rank_fences(true, snap, &st);
     if (st == RAD_OK && P.io.submit_fetch(std::move(f))) {
         P.waiting.push_back(tag);
         return true;
     }
     RAD_ERR("kv tiers: a read off disk could not be handed to the IO thread (%s); the request is "
             "admitted with what host memory holds", st < 0 ? rad_strerror(st) : "not running");
-    for (size_t i = 0; i < f.fences.size(); ++i) {
-        if (!f.fences[i]) continue;
-        (void)rad_dev_set(ranks_[i]->device);
-        rad_event_destroy(f.fences[i]);
-    }
-    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    destroy_fences(f.fences);
     const std::vector<char> ok(f.jobs.size(), 0);
     ranks_[0]->tierx.report_pass(f.jobs, ok, rad_mono_ns());
     return false;
@@ -1408,11 +1500,12 @@ int Engine::serve() {
     }
 
     /* The scheduler drives ONE block manager. Block ids are pure bookkeeping and identical on
-     * every rank -- the heads divide equally, so every rank's pool has the same geometry and its
-     * free list evolves identically. What differs per rank is the pool BASE, and that lives in
-     * KVPoolBinding. So rank 0's manager owns the bookkeeping and the others exist to own their
-     * own card's allocation. If the geometries ever disagree the block tables mean different
-     * things on different cards, so it is checked rather than assumed. */
+     * every rank: every rank carves the same block count (Engine::configure_kv caps each at the
+     * least rank's), so its free list evolves identically even where the ranks' shares of a
+     * group differ in bytes, or are zero (rad_kv_group_zero). What differs per rank is the pool
+     * BASE, and that lives in KVPoolBinding. So rank 0's manager owns the bookkeeping and the
+     * others exist to own their own card's allocation. If the counts ever disagree the block
+     * tables mean different things on different cards, so it is checked rather than assumed. */
     for (size_t i = 1; i < ranks_.size(); ++i) {
         const auto& a = ranks_[0]->kv.plans();
         const auto& c = ranks_[i]->kv.plans();
@@ -1452,12 +1545,9 @@ int Engine::serve() {
         /* CALLED FROM INSIDE Scheduler::step(), UNDER ITS LOCK -- which is what makes it safe to
          * touch the cache and rank 0's manager here, and why nothing below may call back into the
          * scheduler. */
-        /* A restored session's state needs a device checkpoint slot, and which snapshot gives
-         * one up is the cache's decision: it knows which ones a lookup this step handed out. */
-        ranks_[0]->tierx.set_checkpoint_room(
-            [this] { return ranks_[0]->prefix.free_checkpoint_for_restore(); });
         b->restore_fn = [this](const Request& req) -> IPrefixCache::Restore {
             using R = IPrefixCache::Restore;
+            const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
             TierPump& P = *pump_;
             if (std::find(P.waiting.begin(), P.waiting.end(), req.id) != P.waiting.end())
@@ -1468,13 +1558,27 @@ int Engine::serve() {
             const std::vector<BlockHash> want = pc.restorable_from(req.prompt, mk, &chain);
             /* THE DISK PART IS READ FIRST, ON THE IO THREAD, while this request waits and every
              * other one runs; the restore below then copies host memory and nothing else. Asked
-             * only when something could be on disk or in flight: a chain wholly in VRAM is the
-             * common case, and it is thousands of keys. */
-            if (!want.empty() || !P.waiting.empty()) {
+             * on every attempt, because a chain wholly in VRAM can still want a read: its deepest
+             * snapshot may have given its store slot up and be on disk alone.
+             *
+             * THAT SNAPSHOT NEEDS A STORE SLOT TO LAND IN, and the store's free list is rank 0's
+             * manager's: one is taken here -- making room by detaching a snapshot the disk also
+             * holds, which is the cache's choice -- and handed to the plan, which gives it back
+             * when it does not read the snapshot after all. */
+            {
                 std::vector<TierJob> reads;
-                if (ranks_[0]->tiers.plan_fetch(chain, &reads, rad_mono_ns())) {
-                    if (reads.empty() || submit_fetch(req.id, std::move(reads))) return R::Wait;
+                int32_t ck = -1;
+                if (ranks_[0]->tiers.snapshot_fetch_wanted(chain) &&
+                    ranks_[0]->kv.alloc_checkpoint(&ck) != RAD_OK) {
+                    ck = -1;
+                    if (pc.free_checkpoint_for_restore() &&
+                        ranks_[0]->kv.alloc_checkpoint(&ck) != RAD_OK)
+                        ck = -1;
                 }
+                const bool wait = ranks_[0]->tiers.plan_fetch(chain, &reads, rad_mono_ns(), &ck);
+                if (ck >= 0) ranks_[0]->kv.free_checkpoint(ck);
+                if (wait && (reads.empty() || submit_fetch(req.id, std::move(reads))))
+                    return R::Wait;
             }
             if (want.empty()) return R::Done;
             /* THE WHOLE CHAIN IN ONE RESTORE. A 4-token block makes a long conversation tens of
@@ -1513,22 +1617,20 @@ int Engine::serve() {
                      * them too, and would be released later from under whoever the pool gives them
                      * to. Both are let go, so the blocks return to the pool and the key is simply
                      * unknown. */
+                    ranks_[0]->tierx.quiesce();
                     for (size_t k = 0; k < cg.size() && k < j.blocks.size(); ++k)
                         if (j.blocks[k] >= 0) ranks_[0]->kv.release_block(cg[k], j.blocks[k]);
                     ranks_[0]->tiers.forget(j.key);
-                    if (j.ck_dev >= 0) ranks_[0]->kv.free_checkpoint(j.ck_dev);
-                    continue;
                 }
-                /* AND THE RECURRENT HALF, into the slot the restore allocated for it. Without this
-                 * the session gets its attention hit back and replays every linear layer from
-                 * token zero, which on a long transcript is most of a prefill. NOBODY ELSE OWNS
-                 * THAT SLOT UNTIL THE CACHE TAKES IT: if the index entry the snapshot belongs to
-                 * was retired, the slot has no path back to the free list. */
-                if (j.ck_dev >= 0 && pc.reattach_snapshot(j.key, j.ck_dev) != RAD_OK)
-                    ranks_[0]->kv.free_checkpoint(j.ck_dev);
             }
+            ranks_[0]->tiers.note_restore((int64_t)(rad_mono_ns() - t0));
             return R::Done;
         };
+        /* AN EVICTION THAT WOULD LOSE AN ENTRY WAITS FOR ITS COPY INSTEAD. Called by the
+         * prefix cache binding under the scheduler's lock, on this thread, when dropping the
+         * entries that already have a host copy did not free enough: every copy waiting is
+         * planned, issued and landed now, so the entries it covers can leave VRAM and be kept. */
+        b->flush_fn = [this]() -> bool { return flush_copies(); };
     }
     /* EVERY RANK'S CARD, STREAM AND ARENA. The batch is one build shared by pointer (spec §1) and
      * that is right for the host side; the DEVICE side is staged per rank, because a rank reading
@@ -1539,10 +1641,6 @@ int Engine::serve() {
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
-    /* The step staging the budget kept room for exists now, so a checkpoint slot backed from here
-     * on leaves the headroom and only what is still to be built on first use. */
-    set_checkpoint_floors(std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * (1ll << 20) +
-                          late_lazy_bytes_);
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 

@@ -183,6 +183,10 @@ std::pair<uint32_t, const char*> decode_utf8(const char* src);
 std::pair<std::vector<uint32_t>, PartialUtf8> decode_utf8(const std::string& src,
                                                          PartialUtf8 partial_start);
 
+/* The same into `out`, whose capacity is reused; returns the carried state. */
+PartialUtf8 decode_utf8(const std::string& src, PartialUtf8 partial_start,
+                        std::vector<uint32_t>* out);
+
 /* ============================================================ elements */
 
 inline bool is_end_of_sequence(const GbnfElement* pos) {
@@ -330,6 +334,31 @@ int plan_build(const GbnfRuleSet& rules, uint32_t root, const std::shared_ptr<co
  * bounds. Thread-safe: it takes the plan's lock. */
 int plan_fill(const MaskPlan& plan, const GbnfStacks& stacks, PartialUtf8 partial, bool allow_eog,
               uint32_t* bitmask, int64_t n_words);
+
+/* STEP A STACK SET OVER CODE POINTS through the plan's automaton: `out` is the set accepting
+ * cps[0..n) one at a time leaves -- what accept_chr over every stack, code point by code point,
+ * builds -- sorted, without duplicates, written over what `out` held so its capacity is reused.
+ * `stacks` need not be sorted and must not point into `out`.
+ *
+ * `at` IS THE STATE THE CALLER'S SET IS, when it knows: on entry, a state an earlier step on this
+ * plan returned, which spares canonicalising the set, or an id of -1; on return, the state
+ * reached, or an id of -1 when that state holds an empty stack or a token terminal on top -- a
+ * set the caller does not step whole, so not one it can name next time. Valid only while the
+ * automaton that issued it lives; `gen` says which one that was. Returns true when the state
+ * reached is the one `at` named on entry: the caller's set already is it, and `out` is left
+ * alone. That is the steady state of a free-text value.
+ *
+ * The automaton memoises each state's successor per
+ * interval of code points, so a state seen before costs a lookup per code point where the stack
+ * machinery would rebuild every closure; inside a free-text value the state is the same one
+ * token after token. Throws GbnfLimit past the per-operation bounds. Thread-safe: it takes the
+ * plan's lock. */
+struct PlanState {
+    uint64_t gen = 0;
+    int32_t  id  = -1;
+};
+bool plan_step(const MaskPlan& plan, const std::vector<const GbnfStack*>& stacks, PlanState* at,
+               const uint32_t* cps, size_t n, GbnfStacks* out, OpWork& work);
 
 }  /* namespace gbnf */
 }  /* namespace rad */

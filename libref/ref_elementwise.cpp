@@ -307,6 +307,25 @@ int ref_silu(const RadArgs* a, RadStream) { return unary(a, 1); }
  * it that expert runs ungated, which is a different model and not a slower one. */
 int ref_sigmoid(const RadArgs* a, RadStream) { return unary(a, 2); }
 
+/* ------------------------------------------------------------------ fill */
+/* y = value over [M, n], at y's own row pitch. The value is rounded once, by the store. */
+int ref_fill(const RadArgs* a, RadStream) {
+    if (!have(a, 1)) return RAD_E_INVAL;
+    const RadTensor* y = &a->t[0];
+    const int64_t n = p_int(a, "n", numel(y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0) return RAD_E_SHAPE;
+    const float v = p_f32(a, "value", 0.0f);
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t yb = rowoff(y, r, n), ys = laststride(y);
+        for (int64_t i = 0; i < n; ++i) stt(y, yb + i * ys, v);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ gather_rows */
 /* y[i, :] = x[idx[i], :]. The op that turns "correct" into "affordable": without it a plugin runs
  * the lm_head GEMM over every token of a prefill chunk when the sampler wants one row per

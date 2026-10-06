@@ -130,6 +130,8 @@ void Metrics::sample(const SchedMetrics& m) {
     g_waiting_.set((double)m.waiting);
     g_preempted_.set((double)m.preempted);
     g_kv_util_.set(m.kv_util);
+    g_kv_max_tokens_.set((double)m.kv_tokens_max);
+    g_kv_max_bytes_.set((double)m.kv_bytes_carved);
     g_prefix_hit_.set(m.prefix_hit_rate);
     g_prefill_tps_.set(m.prefill_tps);
     g_decode_tps_.set(m.decode_tps);
@@ -239,6 +241,12 @@ std::string Metrics::render() const {
             "GPU KV-cache usage. 1 means 100 percent usage.", L, g_kv_util_.get());
     w.gauge("vllm:kv_cache_usage_perc",
             "KV-cache usage. 1 means 100 percent usage.", L, g_kv_util_.get());
+    w.gauge("radiance:kv_cache_max_tokens",
+            "Tokens of context the KV cache holds with every block it lends the experts taken "
+            "back.", L, g_kv_max_tokens_.get());
+    w.gauge("radiance:kv_cache_max_bytes",
+            "VRAM the KV cache holds with every block it lends the experts taken back, one card.",
+            L, g_kv_max_bytes_.get());
     w.gauge("vllm:gpu_prefix_cache_hit_rate",
             "GPU prefix cache block hit rate.", L, g_prefix_hit_.get());
 

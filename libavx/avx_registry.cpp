@@ -129,6 +129,9 @@ static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype")
 static const RadOperandSpec oBinary[] = { OPD("a"), OPD("b"), OUT("y") };
 static const RadOperandSpec oGateUp[] = { OPD("gate_up"), OUT("y") };
 static const RadOperandSpec oUnary[]  = { OPD("x"), OUT("y") };
+/* `fill` has no input: `value` is the whole of what it writes. */
+static const RadParamSpec pFill[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value") };
+static const RadOperandSpec oFill[] = { OUT("y") };
 static const RadOperandSpec oGather[] = { OPD("x"), OPD("idx"), OUT("y") };
 static const RadOperandSpec oScatterRows[] = { OPD("v"), OPD("idx"), INOUT("x") };
 
@@ -446,6 +449,7 @@ static const RadOpSchema kSchemas[] = {
 { "gelu", ARR(pMnD), ARR(oUnary), "exact erf gelu." },
 { "silu", ARR(pMnD), ARR(oUnary), "silu." },
 { "sigmoid", ARR(pMnD), ARR(oUnary), "logistic sigmoid." },
+{ "fill", ARR(pFill), ARR(oFill), "y = value over [M, n], rounded once to y's dtype (default 0)." },
 { "ple_gate", ARR(pPleGate), ARR(oPleGate),
   "PLE gate: three grouped norms, a dot, a signed sqrt." },
 { "ple_conv", ARR(pPleConv), ARR(oPleConv),
@@ -621,6 +625,7 @@ SIMPLE("avx_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate
 SIMPLE("avx_gelu", "gelu", "elem", "exact erf gelu", DT_FLOAT, L(gelu)),
 SIMPLE("avx_silu", "silu", "elem", "silu", DT_FLOAT, L(silu)),
 SIMPLE("avx_sigmoid", "sigmoid", "elem", "logistic sigmoid", DT_FLOAT, L(sigmoid)),
+SIMPLE("avx_fill", "fill", "elem", "constant fill", DT_FLOAT, L(fill)),
 SIMPLE("avx_gather_rows", "gather_rows", "elem", "y[i,:] = x[idx[i],:]", DT_ANY, L(gather_rows)),
 SIMPLE("avx_scatter_rows", "scatter_rows", "elem", "x[idx[i],:] = v[i,:]", DT_ANY,
        L(scatter_rows)),

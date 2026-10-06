@@ -5,8 +5,8 @@
 # /health, print the endpoints, exit with the server still up. Stop it with scripts/fnstop.sh.
 #
 # WHY THE VRAM FLAGS ARE ABSENT. This is a DENSE model, so every weight is static and the
-# planner takes it off the top as a floor; --expert-vs-cache-ratio then divides an elastic pool
-# that has no expert side to claim it, and the slack crosses over to the cache. Stating
+# planner takes it off the top as a floor; the elastic pool left after it has no expert side to
+# claim it, so all of it goes to the cache. Stating
 # --vram-weights-mib here would only cap what does not need capping.
 #
 # WHY 131072 AND NOT 200000. n_ctx_train is 131072 for this checkpoint; the 200K context

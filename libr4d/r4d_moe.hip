@@ -879,9 +879,9 @@ __device__ __forceinline__ uint16_t u16_load_w(const uint16_t* p) {
  * why the median sits near the resident cost and the upper quantiles near one and two misses.
  *
  * SO THE LEVER IS THE MISS RATE AND NOTHING ELSE. Residency is 82% of 256 experts a layer and it
- * is not raisable here: --expert-vs-cache-ratio already gives the experts everything the KV pool
- * does not need, and the KV pool is sized by --max-num-seqs and --max-model-len, which are the
- * deployment's capability rather than a tuning knob. If every routed expert were resident this
+ * is not raisable here: the KV pool lends the experts every block no live request holds, and what
+ * live requests hold is set by --max-num-seqs and --max-model-len, which are the deployment's
+ * capability rather than a tuning knob. If every routed expert were resident this
  * kernel would run at its resident rate and its share of device time would roughly halve. That is
  * the size of the prize for anything that raises capacity or sharpens the ranking, and it is why
  * the kernel's own arithmetic is not the lever.
@@ -930,8 +930,13 @@ static_assert(sizeof(MoeTab) == 16, "the code table is four words");
  * its own activation scale. Same products, same sums, same order: bit-identical to FK 128.
  *
  * UW reads the weight and its scales from a uniform global base -- see the UW note at w4_load.
+ * The decode form always takes it. The prefill forms keep the plain loads: the waits UW removes
+ * were measured on the decode grid, and the prefill tiles' timing under UW is unmeasured, so
+ * their instructions stay as they were.
  *
- * RS finds an ES block's run in one round trip -- see the RS note at the run search. */
+ * RS finds an ES block's run in one round trip -- see the RS note at the run search. It covers
+ * up to kMaxExpert experts; a wider expert count takes the chunked search, which numbers the runs
+ * the same way. */
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
           bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
           bool RS = false>
@@ -1117,6 +1122,10 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         rs_first = s_sel[1];
         rs_end = s_sel[2];
     } else if constexpr (ES) {
+        /* THE CHUNKED SEARCH SERVES THE DECODE FORM ABOVE kMaxExpert EXPERTS. RS holds a thread's
+         * share of the offsets in NPT registers sized for kMaxExpert, so a wider expert count is
+         * this loop's, which walks any count a chunk of NTHR at a time. r4d_selftest runs the
+         * decode form at 640 experts against the uniform prefill grid, byte for byte. */
         __shared__ int32_t  s_run[FM];
         __shared__ uint32_t s_wc[NTHR / kWave];
         uint32_t nrun = 0;
@@ -2341,52 +2350,36 @@ constexpr long long kPrefillCols = 128;
 static inline bool r4d_moe_decode_band(long long T, long long n_expert) {
     return 2 * T <= 3 * n_expert;
 }
-/* R4D_MOE_GU_FK256: the decode form of the TOKEN-operand projection (gate_up) stages two 128-wide
- * K blocks a pass instead of one -- see FK at the kernel. Unset or 0: one block, as upstream. 1:
- * every decode-form gate_up launch that can take it; N > 1: those of at most N routed rows. It
- * can where the weight's format already folds scale groups (W4 2 to 4) and every class's K is a
- * multiple of 256; anything else keeps one block. Bit-identical either way. Read once, so a
- * recorded pass and a live one take the same kernel. */
-static long long moe_gu_fk256() {
-    static const long long v = [] {
-        const char* e = std::getenv("R4D_MOE_GU_FK256");
-        const long long x = e ? std::atoll(e) : 0;
-        return x > 0 ? x : 0LL;
-    }();
-    return v;
-}
-/* THE STAGED K OF THE DECODE FORM, pinned for a test: 0 is R4D_MOE_GU_FK256's rule, 1 one 128-wide
- * block a pass, 2 two wherever the shape allows it, whatever the switch says. r4d_selftest
- * compares the two byte for byte. */
+/* THE ROW LIMIT OF TWO 128-WIDE K BLOCKS A PASS, by weight format: the decode form of the
+ * TOKEN-operand projection (gate_up) stages two blocks a pass instead of one -- see FK at the
+ * kernel -- at most this many routed rows. Only a shape whose weight format already folds scale
+ * groups (W4 2 to 4) and whose every class's K is a multiple of 256 can take two; anything else
+ * keeps one block. The two are bit-identical. A constant, so a recorded pass and a live one take
+ * the same kernel.
+ *
+ * MEASURED, `r4d_selftest --perfmoe M` on gfx1201 at rank 0's tp2 width split (512 experts, top
+ * 10), gate_up in us, one block a pass / two:
+ *
+ *      tokens (rows)     1 (10)   2 (20)   4 (40)   8 (80)   16 (160)   32 (320)
+ *      w4nl64a8h  (2)   17.9/15.6 25.6/22.4 36.4/37.3 65.6/67.8 164.6/170.2 328.7/310.8
+ *      w4nl32a8h  (3)   19.5/17.0 26.2/24.0 40.0/40.5 71.6/77.7 177.9/177.5 337.0/321.0
+ *      w5nl64a8h  (4)   20.3/17.6 30.0/25.5 122.3/43.1 212.9/78.6 373.2/219.8 672.3/380.5
+ *
+ * The four-bit formats gain at one and two tokens and not in between, which is where a
+ * speculative decode step sits (one sequence at depth 3 is 40 rows); the five-bit format's one
+ * block a pass is two to three times slower from 40 rows on, and two blocks are the faster at
+ * every row count. */
+template <int W4>
+constexpr long long kMoeGuFk256Rows = W4 == 4 ? (1ll << 40) : (W4 == 2 || W4 == 3) ? 20 : 0;
+/* THE STAGED K OF THE DECODE FORM, pinned for a test: 0 is kMoeGuFk256Rows's rule, 1 one 128-wide
+ * block a pass, 2 two wherever the shape allows it. r4d_selftest compares the two byte for byte,
+ * so the two-block path is held to the one-block bytes whatever the row limit is. */
 static int g_moe_fk_pin = 0;
+template <int W4>
 static inline bool r4d_moe_gu_fk256(long long T, bool a_sorted) {
     if (a_sorted || g_moe_fk_pin == 1) return false;
     if (g_moe_fk_pin == 2) return true;
-    const long long sw = moe_gu_fk256();
-    return sw == 1 || (sw > 1 && T <= sw);
-}
-/* R4D_MOE_UWLOAD=1: the decode form -- both projections -- reads the weight and its scales from a
- * uniform global base (see UW at w4_load). Unset or 0: the generic pointer, as upstream.
- * Bit-identical either way; read once, like the others. A test pin over it: 0 the switch, 1 off,
- * 2 on. */
-static int g_moe_uw_pin = 0;
-static bool r4d_moe_uwload() {
-    static const bool v = [] {
-        const char* e = std::getenv("R4D_MOE_UWLOAD");
-        return e && std::atoll(e) > 0;
-    }();
-    return g_moe_uw_pin ? g_moe_uw_pin == 2 : v;
-}
-/* R4D_MOE_RUNSCAN=1: the decode form -- both projections -- finds its block's run in one round
- * trip (see RS at the run search). Unset or 0: the chunked search, as upstream. Bit-identical;
- * read once. A test pin over it: 0 the switch, 1 off, 2 on. */
-static int g_moe_rs_pin = 0;
-static bool r4d_moe_runscan() {
-    static const bool v = [] {
-        const char* e = std::getenv("R4D_MOE_RUNSCAN");
-        return e && std::atoll(e) > 0;
-    }();
-    return g_moe_rs_pin ? g_moe_rs_pin == 2 : v;
+    return T <= kMoeGuFk256Rows<W4>;
 }
 /* THE MAP'S UPPER BOUND, stated once because the scratch hook and the launcher must agree about
  * it exactly: a hook that answers for a different shape than the launch uses is how a kernel ends
@@ -2616,23 +2609,21 @@ static int moe_gemm_launch(const RadArgs* a, const R4dSink& sk, int ncls = 2) {
         /* THE DECODE GRID IS (tile, run) WIDE -- see the kernel's ES note. One tile of rows is all
          * a decode step has, so without this the whole layer runs on N/64 workgroups. */
         const unsigned tiles = (unsigned)((T + 15) / 16);
-        /* WHICH INSTANTIATION: the weight from a uniform global base (R4D_MOE_UWLOAD), the run
-         * search in one round trip (R4D_MOE_RUNSCAN, up to kMaxExpert experts), and two 128-wide
-         * K blocks a pass (R4D_MOE_GU_FK256) where every class's K is whole passes of 256 and the
-         * format folds scale groups. All of them are bit-identical; the function moves with the
-         * choice, which a recorded pass sees as a new node. */
-        const bool uw = r4d_moe_uwload();
-        const bool rs = r4d_moe_runscan() && n_expert <= (long long)kMaxExpert;
+        /* WHICH INSTANTIATION: the weight from a uniform global base (UW) always; the run search
+         * in one round trip (RS) up to kMaxExpert experts and the chunked search above that; and
+         * two 128-wide K blocks a pass where kMoeGuFk256Rows admits the row count, every class's
+         * K is whole passes of 256 and the format folds scale groups. All of them are
+         * bit-identical; the function moves with the choice, which a recorded pass sees as a new
+         * node. */
+        const bool rs = n_expert <= (long long)kMaxExpert;
         auto pick = [&](auto fk) {
             constexpr uint32_t F = decltype(fk)::value;
-            return uw ? (rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, true>
-                            : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true>)
-                      : (rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, false, true>
-                            : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F>);
+            return rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, true>
+                      : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, false>;
         };
         auto kern = pick(std::integral_constant<uint32_t, kFK>{});
         if constexpr (W4 >= 2) {
-            bool fk2 = r4d_moe_gu_fk256(T, a_sorted);
+            bool fk2 = r4d_moe_gu_fk256<W4>(T, a_sorted);
             for (int q = 0; q < ncls; ++q) fk2 = fk2 && Kc[q] % (2 * (long long)kBlock) == 0;
             if (fk2) kern = pick(std::integral_constant<uint32_t, 2 * kFK>{});
         }
@@ -2732,8 +2723,6 @@ extern "C" int64_t r4d_rad_moe_gemm_w4a8_scratch(const RadArgs* a) { return moe_
 
 extern "C" void r4d_moe_gemm_pin_prefill(int form) { g_moe_prefill_form = form; }
 extern "C" void r4d_moe_gemm_pin_fk(int pin) { g_moe_fk_pin = pin; }
-extern "C" void r4d_moe_gemm_pin_uw(int pin) { g_moe_uw_pin = pin; }
-extern "C" void r4d_moe_gemm_pin_rs(int pin) { g_moe_rs_pin = pin; }
 
 extern "C" int r4d_rad_moe_gemm_q(const RadArgs* a, RadStream s) {
     return moe_gemm_launch<0>(a, r4d_stream_sink(s));
@@ -3000,8 +2989,8 @@ extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
 /* ================================================================== router GEMM + router_topk_scatter
  *
  * THE ROUTER, ITS SELECTION AND ITS SORT IN ONE LAUNCH -- and, where the layer has a shared expert,
- * that expert's one-column gate beside them. rad_block_moe_fp8.h declares it under
- * R4D_ROUTER_FUSED; this is the kernel and its shim.
+ * that expert's one-column gate beside them. rad_block_moe_fp8.h asks for it wherever it declares
+ * router_topk_scatter and issues it up to kRgMaxM rows; this is the kernel and its shim.
  *
  * At a decode step the router is a [n_expert, n_embd] bf16 GEMM over a handful of rows, and what
  * follows it -- `router_topk_scatter` -- is one workgroup with almost no work in it. They are two
@@ -3009,7 +2998,8 @@ extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
  * gap plus a second launch, on the critical path. The selection needs every logit of a row, so it
  * cannot run inside a column tile; it runs in whichever workgroup finishes LAST, which an arrival
  * counter names. That is the device-wide pattern gemm_fp8a8's split-K finisher and hc_up_mix's
- * quantiser already use, and its rule is theirs: one counter a (stream, output), self-resetting.
+ * quantiser already use, and its rule is theirs: self-resetting, and never shared by two launches
+ * that can run at once. Here it is the op instance's, taken at init -- see THE ARRIVAL COUNTER.
  *
  * The shared expert's gate is a gemm_nt at N = 1 over the SAME input, a launch of its own for one
  * output column. It rides along as one more workgroup of this grid (`skg` > 0), so the launch the
@@ -3175,27 +3165,87 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
 }
 
+/* THE ARRIVAL COUNTER IS THE OP INSTANCE'S, taken at init and not on the launch path.
+ *
+ * It has to persist between launches, zeroed: the last block of every launch resets it, and a
+ * launch that found it non-zero would rank before the GEMM was done. A scratch hook cannot carry
+ * that -- the scratch is one arena region every other op's kernel writes between two of these
+ * launches. The other counters in this library (gemm_fp8a8's split_ctr, hc_bf16's mix counters)
+ * are allocated on first use from the launch path, which leaves them out of the VRAM budget and
+ * puts an allocation on the describe path that must not allocate. The init hook has neither
+ * problem: the engine calls it once per resolved instance during declare, on the rank's device,
+ * and reads the free VRAM for its budget after every init has run, so what init takes is
+ * counted.
+ *
+ * ONE COUNTER AN INSTANCE -- one declared op, one band, one domain, one rank. Each routed layer
+ * declares its own op, so two layers never share one, and the launches of one instance are
+ * ordered: every one of them writes the same declared sort outputs, which the engine does not
+ * reorder or overlap. The counters are 64-byte slots of one zeroed block a device, so a model's
+ * few hundred instances cost one allocation; the block is freed with its last instance. */
+constexpr uint32_t kRgCtrStride = 16;       /* uint32 words a slot: one 64-byte line each */
+constexpr uint32_t kRgCtrSlots  = 4096;     /* instances a device; a model declares hundreds */
+
+struct RgCtrBlock {
+    unsigned int* base = nullptr;
+    uint32_t next = 0;                      /* slots handed out since the block was made */
+    uint32_t live = 0;                      /* instances holding one */
+};
+struct RgInst {
+    int dev = 0;
+    unsigned int* ctr = nullptr;
+};
+std::mutex g_rg_mu;
+std::map<int, RgCtrBlock> g_rg_blocks;
+
 }  /* namespace */
 
-/* THE ARRIVAL COUNTER, one a (stream, logits buffer): ctx.h's rule TWO, and gemm_fp8a8's split_ctr
- * says why the output is part of the key. Launches that share a logits buffer on one stream are
- * ordered through it -- every routed layer writes the same plane -- so they reuse one counter.
- * Zeroed once and reset by the last block of every launch. Null when it cannot be allocated; the
- * op then refuses rather than computing without it. */
-static unsigned int* router_fused_ctr(RadStream s, const void* out) {
-    static std::mutex m;
-    static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
-    std::lock_guard<std::mutex> lk(m);
-    const auto key = std::make_pair(s, out);
-    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
-    void* p = nullptr;
-    if (hipMalloc(&p, 64) != hipSuccess) return nullptr;
-    if (hipMemset(p, 0, 64) != hipSuccess) {
-        (void)hipFree(p);
-        return nullptr;
+extern "C" int r4d_rad_router_gemm_topk_scatter_init(const RadParam*, int, int, int,
+                                                     void** out) {
+    if (!out) return RAD_E_INVAL;
+    *out = nullptr;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
+    std::lock_guard<std::mutex> lk(g_rg_mu);
+    RgCtrBlock& blk = g_rg_blocks[dev];
+    if (!blk.base) {
+        const size_t bytes = (size_t)kRgCtrSlots * kRgCtrStride * sizeof(unsigned int);
+        void* p = nullptr;
+        if (hipMalloc(&p, bytes) != hipSuccess) return RAD_E_NOMEM;
+        /* Zero before any launch can read it: the memset is ordered on the null stream, and the
+         * engine's streams need not wait for that one, so it is waited for here. */
+        if (hipMemset(p, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
+            (void)hipFree(p);
+            return RAD_E_DEVICE;
+        }
+        blk.base = (unsigned int*)p;
+        blk.next = 0;
     }
-    blocks.emplace(key, (unsigned int*)p);
-    return (unsigned int*)p;
+    /* A slot is never handed out twice while its block lives: one returned by fini is not known
+     * to be zero if its last launch did not finish, so it is not reused. */
+    if (blk.next >= kRgCtrSlots) return RAD_E_FULL;
+    RgInst* in = new RgInst;
+    in->dev = dev;
+    in->ctr = blk.base + (size_t)blk.next * kRgCtrStride;
+    ++blk.next;
+    ++blk.live;
+    *out = in;
+    return RAD_OK;
+}
+
+extern "C" void r4d_rad_router_gemm_topk_scatter_fini(void* inst) {
+    RgInst* in = (RgInst*)inst;
+    if (!in) return;
+    std::lock_guard<std::mutex> lk(g_rg_mu);
+    auto it = g_rg_blocks.find(in->dev);
+    if (it != g_rg_blocks.end() && it->second.live > 0 && --it->second.live == 0) {
+        int prev = 0;
+        const bool moved = hipGetDevice(&prev) == hipSuccess && prev != in->dev &&
+                           hipSetDevice(in->dev) == hipSuccess;
+        (void)hipFree(it->second.base);
+        if (moved) (void)hipSetDevice(prev);
+        g_rg_blocks.erase(it);
+    }
+    delete in;
 }
 
 /* Operands: a, b (the router), gate_b? -> logits, expert_ids, expert_w, sorted_tok,
@@ -3267,8 +3317,11 @@ static int rad_router_gemm_topk_scatter_body(const RadArgs* a, const R4dSink& sk
         rc = cfg_for(a, K, M, 16, BR_FLAT, &cg, 1);
         if (rc != RAD_OK) return rc;
     }
-    unsigned int* const ctr = router_fused_ctr(sk.stream, lg->data);
-    if (!ctr) return R4D_NO(RAD_E_DEVICE);
+    /* The instance's counter (see THE ARRIVAL COUNTER). A caller that ran no init has none, and
+     * the op is refused: a launch without it would have no last block to rank. */
+    const RgInst* const inst = (const RgInst*)a->instance;
+    if (!inst || !inst->ctr) return R4D_NO(RAD_E_STATE);
+    unsigned int* const ctr = inst->ctr;
 
     /* THE WAVE COUNT IS THE SELECTION'S, router_topk_scatter's rule: a wave a row up to 32. The
      * GEMM then takes as many 16-column tiles a block as fills those waves at its split. */

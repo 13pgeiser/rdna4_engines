@@ -495,6 +495,14 @@ int ref_silu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 int ref_sigmoid_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return unary_shape(p, n_p, operand, "sigmoid", out);
 }
+
+int ref_fill_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });          /* y */
+    return o.finish("fill", operand, out);
+}
 int ref_softmax_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return unary_shape(p, n_p, operand, "softmax", out);
 }

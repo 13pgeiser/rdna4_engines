@@ -141,6 +141,12 @@ struct IPrefixCache {
     virtual Restore restore(const Request&) { return Restore::Done; }
     /* A step's admissions begin: what the last step's lookups handed out has been read. */
     virtual void begin_step() {}
+    /* KEEP THIS WAITING REQUEST'S CHAIN WHERE IT IS until release(). Called when an admission is
+     * refused after restore(): the request gives its hit back, and without the hold the chain it
+     * just had restored would leave VRAM again before the next attempt restores it once more. */
+    virtual void hold(const Request&) {}
+    /* The request is gone -- finished, failed or cancelled -- and holds nothing any more. */
+    virtual void release(const Request&) {}
 
     virtual CacheHit lookup(const Request& r,
                             std::vector<std::vector<int32_t>>* blocks_out) const = 0;
@@ -159,6 +165,11 @@ struct IPrefixCache {
      * blocks no live sequence needs, so this is what the scheduler tries BEFORE preempting a
      * running request: a cached prefix is a saving, a running request is work already done. */
     virtual int64_t evict(int64_t n_entries) = 0;
+    /* FREE UP TO `n_blocks` FOR THE RESERVE, and nothing a later turn needs. Unlike evict(), which
+     * answers a shortfall that cannot wait, this passes over an entry a live sequence still holds
+     * (releasing it frees no block) and one whose only copy is in VRAM (it is the next turn's
+     * context). Returns how many blocks went back to the pool. */
+    virtual int64_t trim(int64_t n_blocks) = 0;
 
     /* FORGET EVERYTHING, wherever it is. Not a loop over evict(): with idle tiers an eviction moves
      * an entry whose host copy has landed off the card and keeps it, so a reset built out of
@@ -206,8 +217,9 @@ struct IPrefixCache {
     /* The state that reservation named is now IN its slot. A reservation is made when the chunk is
      * PLANNED and the state exists only after the step that computes it, so a lookup in between
      * would adopt a slot holding the previous tenant's history. Until this is called, the
-     * reservation is a promise and lookup will not offer it. */
-    virtual void commit_checkpoint(const Request& r, int64_t pos) = 0;
+     * reservation is a promise and lookup will not offer it. `resume`: the deepest checkpoint this
+     * prompt gets, the one its next turn resumes from (Scheduler::last_checkpoint). */
+    virtual void commit_checkpoint(const Request& r, int64_t pos, bool resume) = 0;
 };
 
 /* ------------------------------------------------------------------ block geometry */
@@ -335,6 +347,11 @@ struct PCBinding final : IPrefixCache {
         return restore_fn ? restore_fn(r) : Restore::Done;
     }
     void begin_step() override { m->begin_step(); }
+    void hold(const Request& r) override {
+        media_keys(r, &mm_);
+        m->hold(r.id, r.prompt, mm_);
+    }
+    void release(const Request& r) override { m->release(r.id); }
     const std::vector<int32_t>& cached_groups() const override { return m->cached_groups(); }
 
     /* prompt ++ output, for the same reason reserve_checkpoint chains both: the next turn of a
@@ -352,7 +369,35 @@ struct PCBinding final : IPrefixCache {
         media_keys(r, &mm_);
         return m->insert(r.id, toks, mm_, blocks, n_tokens);
     }
-    int64_t evict(int64_t n) override { return m->evict_lru(n); }
+    /* Installed by the engine when the idle tiers are on: lands every host copy that is waiting,
+     * now, and says whether any landed. Called on the step thread under the scheduler's lock. */
+    std::function<bool()> flush_fn;
+    uint64_t lost_warned_ns_ = 0;
+    /* PRESSURE TAKES WHAT CAN LEAVE VRAM AND STAY, FIRST. An entry whose host copy has landed is
+     * dropped and kept (trim); a copy still on its way is landed and that entry dropped too; only
+     * what the tiers then still cannot take -- an arena with no room and a disk that has not caught
+     * up, or no tiers at all -- is erased, and an erase with the tiers on is said, because it is
+     * a conversation a later turn will prefill again. */
+    int64_t evict(int64_t n) override {
+        int64_t k = m->trim(n);
+        if (k < n && flush_fn && flush_fn()) k += m->trim(n - k);
+        if (k >= n) return k;
+        const int64_t before = m->stats().evictions;
+        k += m->evict_lru(n - k);
+        const int64_t lost = m->stats().evictions - before;
+        if (lost > 0 && flush_fn) {
+            const uint64_t now = rad_mono_ns();
+            if (now - lost_warned_ns_ >= 60ull * 1000000000ull) {
+                lost_warned_ns_ = now;
+                RAD_WARN("prefix cache: %lld entries erased with no copy off the card -- the host "
+                         "tier had no room for them in time (--prefix-cache-host-mib, and the disk "
+                         "behind it); radiance:prefix_cache_evictions_total counts every one",
+                         (long long)lost);
+            }
+        }
+        return k;
+    }
+    int64_t trim(int64_t n) override { return m->trim(n); }
     int64_t reset() override {
         const int64_t n = m->size();
         m->clear();
@@ -378,8 +423,8 @@ struct PCBinding final : IPrefixCache {
         return m->reserve_checkpoint(r.id, pos, prefix_hash(r, pos), slot_out);
     }
 
-    void commit_checkpoint(const Request& r, int64_t pos) override {
-        m->commit_checkpoint(prefix_hash(r, pos));
+    void commit_checkpoint(const Request& r, int64_t pos, bool resume) override {
+        m->commit_checkpoint(prefix_hash(r, pos), resume);
     }
 
 private:
