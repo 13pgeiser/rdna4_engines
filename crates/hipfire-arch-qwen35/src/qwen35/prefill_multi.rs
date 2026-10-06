@@ -668,6 +668,7 @@ fn lane_fa_chunk_admitted(
             false,
             false,
             false,
+            false,
         );
         if r.fusion != DflashFusionCtx::ChainVerify
             || !kv.quant_fp8
@@ -1573,6 +1574,7 @@ pub fn forward_prefill_batch_multi(
                             n,
                             r.start_pos + n,
                             fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+                            false,
                             false,
                             false,
                             false,

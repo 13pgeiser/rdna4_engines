@@ -1434,6 +1434,7 @@ misspelled key is unknown and fails the load with
 | `kernel.gemv_dp4a` | `gemv_dp4a` | `HIPFIRE_GEMV_DP4A` | stable |
 | `kernel.gemv_prefetch` | `gemv_prefetch` | `HIPFIRE_GEMV_PREFETCH` | stable |
 | `kernel.gfx1100_dec_norm` | `gfx1100_dec_norm` | `HIPFIRE_GFX1100_DEC_NORM` | stable |
+| `kernel.gfx1100_fa2_split_verify` | `gfx1100_fa2_split_verify` | `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY` | stable |
 | `kernel.gfx11_a4_candidates` | `gfx11_a4_candidates` | `HIPFIRE_GFX11_A4_CANDIDATES` | experimental |
 | `kernel.gfx11_fa2_prefill` | `gfx11_fa2_prefill` | `HIPFIRE_GFX11_FA2_PREFILL` | stable |
 | `kernel.gfx11_iu4_gridspec` | `gfx11_iu4_gridspec` | `HIPFIRE_GFX11_IU4_GRIDSPEC` | stable |
