@@ -85,6 +85,7 @@ to `auto` and do not materialize an environment value until explicitly set:
 
 | Family | Keys |
 |---|---|
+| RDNA4 MQ4V2 gate/up decode | `kernel.gfx12_mq4v2_gateup_k5120` (exact gfx1201, K=5120, 17408 rows per output; default off) |
 | GEMV / quant | `kernel.gemv_dp4a`, `kernel.gemv_prefetch`, `kernel.gfx942_lds_gemv`, `kernel.hfq3_dp4a`, `kernel.hfq3_mmq`, `kernel.hfq4_mmq_rdna2`, `kernel.gcn5_wave64_hybrid`, `kernel.mmq`, `kernel.gfx942_gemv_v2` |
 | MoE | `kernel.moe_grouped_i8`, `kernel.moe_paro_i8`, `kernel.moe_paro_i8_k8` |
 | Certified arch routes | `kernel.rdna3_hfq4_qkvza_k2048`, `kernel.rdna3_hfq4_residual_stage_x32`, `kernel.rdna3_hfq4_sigmoid_buffer`, `kernel.rdna3_rmsnorm_vecsum`, `kernel.gfx942_rmsnorm_split` |
@@ -139,6 +140,8 @@ Architecture-gated default-on kernel routes (exact arch only; other arches keep 
 | `kernel.pm_decode` | `auto`: exact gfx1201 | `false` / `HIPFIRE_PM_DECODE=0` | Loads the embedded, oracle-accepted PeaceMaker twins of the five W1 decode projection modules (`fused_qkvza_hfq4g256_mq4v2`, `fused_qkv_hfq4g256_mq4v2`, `fused_gate_up_hfq4g256_mq4v2`, `gemv_hfq4g256_multirow_default_mq4v2`, `gemv_hfq4g256_residual_mq4v2`) instead of compiling them with hipcc. Each image is pinned by bundle and ELF SHA-256 and refused on mismatch. Byte-identical outputs; the hipcc modules stay in the kernel pack for the opt-out; other arches never load the twins. |
 
 See [`env-vars.md`](env-vars.md) for the full per-variable rows.
+
+The experimental gfx1201 twin is independently controlled by `kernel.gfx12_mq4v2_gateup_k5120` (`HIPFIRE_GFX12_MQ4V2_GATEUP_K5120=1` / `0`). It does not change the gfx1100 default above. Restart the daemon after changing this process-scoped setting. Compiler-less installations need a pack containing `fused_gate_up_mq4g256v2_k5120_gfx1201`. The twin preserves DEV/RT weight loads, quantization, arithmetic and resident weight layout. Initial R9700 AR ABBA showed only +0.37%; this is not a statistically established E2E speedup.
 
 Diagnostic booleans all default off: `diagnostic.prompt_token_heat`,
 `diagnostic.prompt_heat_json`, `diagnostic.draft_gemm_dump`,
@@ -1273,6 +1276,7 @@ misspelled key is unknown and fails the load with
 | `kernel.gfx12_gdn_chunk_scan` | `gfx12_gdn_chunk_scan` | `HIPFIRE_GFX12_GDN_CHUNK_SCAN` | stable |
 | `kernel.gfx12_gdn_pre_fused` | `gfx12_gdn_pre_fused` | `HIPFIRE_GFX12_GDN_PRE_FUSED` | stable |
 | `kernel.gfx12_mq4v2_fp8_gateup` | `gfx12_mq4v2_fp8_gateup` | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` | stable |
+| `kernel.gfx12_mq4v2_gateup_k5120` | `gfx12_mq4v2_gateup_k5120` | `HIPFIRE_GFX12_MQ4V2_GATEUP_K5120` | experimental |
 | `kernel.gfx12_mq4v2_fp8_qkv` | `gfx12_mq4v2_fp8_qkv` | `HIPFIRE_GFX12_MQ4V2_FP8_QKV` | stable |
 | `kernel.gfx12_mq4v2_fp8_qkvza` | `gfx12_mq4v2_fp8_qkvza` | `HIPFIRE_GFX12_MQ4V2_FP8_QKVZA` | stable |
 | `kernel.gfx12_mq4v2_fp8_resid` | `gfx12_mq4v2_fp8_resid` | `HIPFIRE_GFX12_MQ4V2_FP8_RESID` | stable |
