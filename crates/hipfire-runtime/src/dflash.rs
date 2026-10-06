@@ -1743,6 +1743,9 @@ pub struct DflashScratch {
     /// scratch (`None` elsewhere, and when the batched path is off). See
     /// [`DflashScratch::enable_lane_workspace`].
     pub lane_ws: Option<DraftLaneWorkspace>,
+    /// Developer-only online draft tuner (`HIPFIRE_DFLASH_ONLINE_TUNE`);
+    /// `None` keeps the shipping argmax proposal path.
+    pub online: Option<crate::dflash_online::OnlineDraftTuner>,
 }
 
 impl DflashScratch {
@@ -2103,6 +2106,7 @@ impl DflashScratch {
             draft_ffn_graphs,
             draft_ffn_warmed_up,
             lane_ws: None,
+            online: crate::dflash_online::OnlineDraftTuner::from_env(),
         };
         debug_assert!(live.iter().all(|s| s.is_none()));
         Ok(scratch)
@@ -2163,6 +2167,9 @@ impl DflashScratch {
                 let _ = gpu.hip.graph_exec_destroy(exec);
                 let _ = gpu.hip.graph_destroy(graph);
             }
+        }
+        if let Some(mut t) = self.online {
+            t.free_gpu(gpu);
         }
         let _ = gpu.free_tensor(self.x);
         let _ = gpu.free_tensor(self.x_norm);

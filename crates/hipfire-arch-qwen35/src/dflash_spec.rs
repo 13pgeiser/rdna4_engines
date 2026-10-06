@@ -993,6 +993,9 @@ impl Speculator for DflashSpeculator {
             .df
             .as_mut()
             .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        if let Some(t) = df.draft_scratch.online.as_mut() {
+            t.seed_prompt(prompt_tokens);
+        }
 
         // A CPU shadow exists only while the cold backfill reads it (see
         // `dflash_prefill_host_required`). Cold prompts drop draft
@@ -1314,6 +1317,11 @@ impl Speculator for DflashSpeculator {
                 Some(&mut df.verify_pm4),
             )
         };
+        if df.ddtree.is_none() {
+            if let (Ok(r), Some(t)) = (&result, df.draft_scratch.online.as_mut()) {
+                t.observe(position, &r.committed[1..], r.accepted);
+            }
+        }
 
         let lowered = result
             .map(lower_qwen35)
@@ -1519,6 +1527,13 @@ impl Speculator for DflashSpeculator {
         // the full block; the controller re-shrinks only after a fresh
         // 8-cycle window (no cross-request stale-history shrink).
         self.adaptive.reset();
+        if let Some(t) = self
+            .df
+            .as_mut()
+            .and_then(|df| df.draft_scratch.online.as_mut())
+        {
+            t.reset();
+        }
     }
 
     fn requires_greedy(&self) -> bool {
