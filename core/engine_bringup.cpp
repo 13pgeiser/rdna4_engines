@@ -231,15 +231,22 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
                 }
             }
         }
+        /* A refusal with room under both is not a capacity one, and advice to shrink the pool
+         * would send the reader after the wrong cause: the device's reason above is the answer. */
+        const int64_t want = (int64_t)cfg.tp * cfg.host_pool_mib * 1024 * 1024 + pinned + mapped;
+        const bool fits = cap > 0 && avail >= 0 && want <= cap && want <= avail;
         RAD_ERR("host: --host-pool-mib %lld is pinned once per rank, so %d rank(s) pin %s; this "
                 "process had taken %s of pinned host memory before rank %d's pool. The amdgpu "
                 "driver caps pinned memory system-wide at %s (ttm.pages_limit, half of RAM unless "
-                "raised), and %s of RAM is available. Lower --host-pool-mib, or raise the cap",
+                "raised), and %s of RAM is available. %s",
                 (long long)cfg.host_pool_mib, cfg.tp,
                 humanb((int64_t)cfg.tp * cfg.host_pool_mib * 1024 * 1024).c_str(),
                 humanb(pinned + mapped).c_str(), rank,
                 cap > 0 ? humanb(cap).c_str() : "an unreadable limit",
-                avail >= 0 ? humanb(avail).c_str() : "an unknown amount");
+                avail >= 0 ? humanb(avail).c_str() : "an unknown amount",
+                fits ? "The pools fit under both, so the refusal is not one of size; the reason "
+                       "the device gave is above"
+                     : "Lower --host-pool-mib, or raise the cap");
     }
 }
 

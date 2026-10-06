@@ -1023,10 +1023,15 @@ void loc_keep(const void* host_base, size_t bytes, intptr_t shift, uint64_t owne
     h.gen = gen;
 }
 
-/* The host ranges this backend pinned itself (see "pinned host memory, in pieces"): base ->
- * length, ordered so an inner address finds its range. */
+/* The host ranges this backend pinned itself (see "pinned host memory, in pieces"), by base,
+ * ordered so an inner address finds its range. `pool` is the host-pool allocation the range sits
+ * in when it was not locked in pieces, and null when it was. */
+struct Pinned {
+    int64_t len = 0;
+    void* pool = nullptr;
+};
 std::mutex g_pinned_mu;
-std::map<uintptr_t, int64_t> g_pinned;
+std::map<uintptr_t, Pinned> g_pinned;
 
 bool pinned_range(const void* p, uintptr_t* lo, int64_t* len) {
     const uintptr_t a = (uintptr_t)p;
@@ -1034,9 +1039,9 @@ bool pinned_range(const void* p, uintptr_t* lo, int64_t* len) {
     auto it = g_pinned.upper_bound(a);
     if (it == g_pinned.begin()) return false;
     --it;
-    if (a - it->first >= (uintptr_t)it->second) return false;
+    if (a - it->first >= (uintptr_t)it->second.len) return false;
     if (lo) *lo = it->first;
-    if (len) *len = it->second;
+    if (len) *len = it->second.len;
     return true;
 }
 
@@ -2040,6 +2045,20 @@ int a_vmem_decommit(void* addr, int64_t bytes) {
  * of one reservation are consecutive on the card too. Each piece is checked rather than assumed,
  * because the pools, the mover and the activation arena all hand a kernel base + offset.
  *
+ * THAT TAKES THE KERNEL DRIVER'S SVM API, AND WITHOUT IT THE RANGE IS ONE ALLOCATION OF THE HOST
+ * POOL. A lock lands at its host address because ROCr's thunk registers the range through the
+ * KFD's SVM API, which maps a range where it is. A driver that does not offer it -- amdgpu could
+ * not register the card's memory with HMM, seen in a KVM guest with both cards passed through --
+ * gets a userptr buffer object instead, at an address the thunk's own aperture hands out: below
+ * the host address, and each piece a guard page away from the one before, so the pieces are
+ * neither where the host has them nor next to each other on the card. hsa_amd_vmem cannot join
+ * them (ROCm 7.2 refuses a vmem handle on the host pool). The host pool's own allocation can: the
+ * thunk maps it for the CPU at the address the aperture gave the cards. It is one buffer object,
+ * as hipHostMalloc made before the pieces, so a host whose IOMMU refuses a large pin AND whose
+ * driver has no SVM API has no large pinned range at all; the refusal names both. Which path a
+ * process takes is the runtime's HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED, the same capability the thunk
+ * decides by, and the log says it once.
+ *
  * What hipHostMalloc does besides the pin is kept, so the pages are the same pages: shared
  * anonymous memory, huge pages advised from 2 MiB up, a preferred NUMA node that is the one
  * nearest the current card (ROCr allocates from that node's pool), fine-grained coherence (the
@@ -2093,7 +2112,56 @@ const char* hsa_why(hsa_status_t st) {
     return hsa_status_string(st, &m) == HSA_STATUS_SUCCESS && m ? m : "unknown HSA status";
 }
 
+/* Whether every card's driver offers the SVM API, so that a locked piece is mapped in place. */
+bool svm_in_place() {
+    static const bool on = [] {
+        bool svm = false;
+        if (hsa_system_get_info((hsa_system_info_t)HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED, &svm) !=
+            HSA_STATUS_SUCCESS)
+            svm = false;
+        if (!svm)
+            RAD_INFO("device: the kernel driver offers no SVM API, so a pinned host range is one "
+                     "allocation of the host pool rather than locked in pieces of %s",
+                     humanb(kPinPiece).c_str());
+        return svm;
+    }();
+    return on;
+}
+
+/* The range as one allocation of the host pool, for a driver without the SVM API. The pool
+ * aligns only a buffer's end to 2 MiB, so one alignment more is asked for and the base rounded
+ * up inside it. */
+void* pin_whole(int64_t bytes, const std::vector<hsa_agent_t>& cards) {
+    const int64_t align = RAD_ALIGN_POOL;
+    const int64_t len = align_up(bytes, 4096);
+    const int64_t ask = align_up(len, align) + align;
+    void* q = nullptr;
+    hsa_status_t st = hsa_amd_memory_pool_allocate(G().host_fine, (size_t)ask, 0, &q);
+    if (st != HSA_STATUS_SUCCESS) {
+        device_set_error("rad_dev_alloc(%s): the kernel driver offers no SVM API, so a pinned "
+                         "range has to be one allocation of the host pool (locked pieces would "
+                         "land apart on the cards), and the pool refused %s: %s",
+                         humanb(bytes).c_str(), humanb(ask).c_str(), hsa_why(st));
+        return nullptr;
+    }
+    st = hsa_amd_agents_allow_access((uint32_t)cards.size(), cards.data(), nullptr, q);
+    if (st != HSA_STATUS_SUCCESS) {
+        device_set_error("rad_dev_alloc(%s): giving the cards access to the host-pool range: %s",
+                         humanb(bytes).c_str(), hsa_why(st));
+        (void)hsa_amd_memory_pool_free(q);
+        return nullptr;
+    }
+    char* const p = (char*)(((uintptr_t)q + (uintptr_t)align - 1) & ~((uintptr_t)align - 1));
+    std::lock_guard<std::mutex> lk(g_pinned_mu);
+    g_pinned.emplace((uintptr_t)p, Pinned{len, q});
+    return p;
+}
+
 void* pin_pieces(int64_t bytes) {
+    std::vector<hsa_agent_t> cards;
+    for (const Dev& d : G().dev) cards.push_back(d.agent);
+    if (!svm_in_place()) return pin_whole(bytes, cards);
+
     const int64_t align = RAD_ALIGN_POOL;
     const int64_t len = align_up(bytes, 4096);
     /* One alignment over, trimmed at both ends, so the range starts on a 2 MiB boundary: a pool's
@@ -2113,8 +2181,6 @@ void* pin_pieces(int64_t bytes) {
     prefer_numa_node(p, len, current_card_numa_node());
     if (len >= ((int64_t)2 << 20)) ::madvise(p, (size_t)len, MADV_HUGEPAGE);
 
-    std::vector<hsa_agent_t> cards;
-    for (const Dev& d : G().dev) cards.push_back(d.agent);
     const int pieces = (int)((len + kPinPiece - 1) / kPinPiece);
     int done = 0;
     for (; done < pieces; ++done) {
@@ -2133,7 +2199,9 @@ void* pin_pieces(int64_t bytes) {
         if (on_card != p + off) {
             ++done;
             device_set_error("rad_dev_alloc(%s): piece %d of %d is mapped on the cards at %p, not "
-                             "at its host address %p, so the pieces are not one range there",
+                             "at its host address %p, so the pieces are not one range there, "
+                             "although the kernel driver reports the SVM API that maps a lock in "
+                             "place",
                              humanb(bytes).c_str(), done, pieces, on_card, (void*)(p + off));
             break;
         }
@@ -2144,12 +2212,12 @@ void* pin_pieces(int64_t bytes) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lk(g_pinned_mu);
-    g_pinned.emplace((uintptr_t)p, len);
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
     return p;
 }
 
 void unpin_pieces(void* p) {
-    int64_t len = 0;
+    Pinned r;
     {
         std::lock_guard<std::mutex> lk(g_pinned_mu);
         auto it = g_pinned.find((uintptr_t)p);
@@ -2158,9 +2226,16 @@ void unpin_pieces(void* p) {
                      "leaked rather than unpinned", p);
             return;
         }
-        len = it->second;
+        r = it->second;
         g_pinned.erase(it);
     }
+    if (r.pool) {
+        const hsa_status_t st = hsa_amd_memory_pool_free(r.pool);
+        if (st != HSA_STATUS_SUCCESS)
+            RAD_WARN("device: freeing pinned host-pool range %p: %s", r.pool, hsa_why(st));
+        return;
+    }
+    const int64_t len = r.len;
     for (int64_t off = 0; off < len; off += kPinPiece) {
         const hsa_status_t st = hsa_amd_memory_unlock((char*)p + off);
         if (st != HSA_STATUS_SUCCESS)

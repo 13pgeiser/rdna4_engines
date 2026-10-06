@@ -152,6 +152,21 @@ if(RAD_HIP_FOUND AND TARGET r4d_selftest)
     ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
 endif()
 
+# ================================================================== the device layer without SVM
+#
+# A KERNEL DRIVER WITHOUT THE SVM API PINS HOST MEMORY ANOTHER WAY, and a machine with it never
+# takes that way. ROCr's thunk maps a locked range in place only through the KFD's SVM API; without
+# it (a KVM guest whose amdgpu registered no device memory with HMM) the backend allocates a pinned
+# range whole from the host pool (core/device/aql.cpp, "pinned host memory, in pieces"). HSA_USE_SVM=0
+# is the thunk's own switch for that driver, so device_test runs a second time under it and the
+# path is held on every machine with a card. On the host backend both runs are the same run.
+if(RAD_HIP_FOUND AND TARGET device_test)
+  add_test(NAME device_test_nosvm COMMAND device_test)
+  set_tests_properties(device_test_nosvm PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home;HSA_USE_SVM=0")
+endif()
+
 # ================================================================== the host kernels
 #
 # rad-avx-check holds libavx to libref, op for op and at every ISA level the machine executes, and

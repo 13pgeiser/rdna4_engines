@@ -164,7 +164,8 @@ TEST(alloc_free_roundtrip) {
  * address on the card, copies and fills that cross a piece boundary landing whole, and none of
  * them taken for pageable memory -- a fill of pageable memory is refused, so the fill is the
  * check. 2.5 GiB is the single-pin size an Intel VT-d host refused; the boundaries crossed are
- * the whole GiBs. */
+ * the whole GiBs. Under HSA_USE_SVM=0 (ctest's device_test_nosvm) the same range is one host-pool
+ * allocation instead, and the same checks hold it. */
 TEST(a_pinned_range_larger_than_one_pin_is_one_range_on_the_card) {
     const int64_t gib = (int64_t)1 << 30;
     const int64_t n = 5 * (gib / 2) + 4096 + 17;
