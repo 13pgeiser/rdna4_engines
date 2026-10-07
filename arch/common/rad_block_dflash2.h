@@ -65,8 +65,10 @@
  * The head reads the 2-BIT copy of the lm_head, exactly as the MTP head does and for exactly the
  * reason rad_block_mtp_fp8.h gives at op_dlogits: a draft is a proposal, the target verifies every
  * one of them with its own untouched head, and speculative decoding is distribution-preserving --
- * so a coarser draft costs acceptance and cannot change a token the model emits. Here it also buys
- * something MTP does not need: the head stays a SINGLE-RANK computation, so the candidate ids are
+ * so a coarser draft costs acceptance and cannot change a token the model emits. Its candidates
+ * are then rescored against the target's own head where that head is fp8 or int8 (op_drerank), so
+ * the coarseness costs only which candidates are proposed, not how they are ranked. The 2-bit head
+ * also buys something MTP does not need: the head stays a SINGLE-RANK computation, so the candidate ids are
  * global without an all-gather and the selector's codebooks can be indexed directly.
  *
  * ============================== THE NORMS ARE PLAIN ==============================
@@ -230,10 +232,11 @@ struct Dflash2 {
 
     /* model-scope weights.
      *
-     * THE SIX LINEARS ARE FP8 AND THE CHECKPOINT IS BF16. rad_fp8.h's DenseFP8 declares each as
-     * block fp8 and the recipe makes it so -- and the reason is bytes: the drafter is read WHOLE on
-     * every decode step, which makes it one of the largest single items in the decode budget
-     * after the trunk's own GEMMs.
+     * THE SIX LINEARS ARE FP8 OR MXFP4 AND THE CHECKPOINT IS BF16. rad_fp8.h's DenseFP8 declares
+     * each as block fp8 or OCP-MXFP4, whichever the recipe made it -- and the reason is bytes: the
+     * drafter is read WHOLE on every decode step, which makes it one of the largest single items in
+     * the decode budget after the trunk's own GEMMs. On Qwen3.8-27B at depth 7, MXFP4 rounded to
+     * nearest accepts ~1% fewer tokens a step than fp8 and takes ~1.5 ms off a ~34 ms step.
      * Nothing it computes can change an emitted token, because every draft is verified against the
      * trunk exactly; the only thing quantising it can move is acceptance. */
     DenseFP8   w_fc{};
@@ -284,6 +287,14 @@ struct Dflash2 {
     /* head and selector */
     rad_op op_gather = 0, op_dquant = 0, op_dlogits = 0, op_dtopk = 0;
     rad_op op_dgather = 0, op_dmerge = 0;   /* the vocab-parallel pair; 0 when the head is whole */
+    rad_op op_drerank = 0;                  /* the candidates rescored against the target's head */
+    /* THE TARGET'S lm_head, set by the plugin before declare when its plane is one logit_rerank
+     * reads (fp8 or int8 rows); 0 leaves the coarse head's own scores as the candidates'. */
+    rad_weight w_lm = 0;
+    /* How many candidates the coarse head proposes for the rerank: logit_rerank's and row_topk's
+     * ceiling. Rescoring is exact, so a wider set can only find more of the exact top sel_topk. */
+    static constexpr int64_t kRerankR = 32;
+    int64_t    top_w = 0;                   /* the coarse top-K's width: kRerankR or sel_topk */
     rad_op op_hp = 0, op_sel = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int base_layer,
@@ -471,8 +482,10 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                 {w.q}, {w.attn});
 
     /* ---------------------------------------------------------------- the context pass */
-    /* EVERY LINEAR HERE IS `fp8a8`, and every activation that feeds one gets a `quant_act_fp8` in
-     * front of it. The weights are E4M3 with a 128x128 scale plane (rad_fp8.h's DenseFP8 says
+    /* EVERY LINEAR HERE IS `fp8a8` -- or `mxfp4a8` where the recipe made the drafter 4-bit; DenseFP8
+     * reads which off the container and declares the GEMM (`gemm()`), and either one reads the
+     * same E4M3 pair -- and every activation that feeds one gets a `quant_act_fp8` in
+     * front of it. The fp8 weights are E4M3 with a 128x128 scale plane (rad_fp8.h's DenseFP8 says
      * why), and there is no `fp8a16` band anywhere in this block: that kernel is M <= 1, and
      * neither pass here ever runs at one row -- a context pass is a committed chunk and a query
      * pass is `block` rows by construction.
@@ -489,12 +502,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.src}, {w.srcq, w.srcs});
-    op_cfc = rw(b, RAD_OP(b, "gemm_nt_q",
-                   RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("N", g.n_embd),
-                              RAD_INT("K", cfg.n_taps * g.n_embd),
-                              RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "fp8a8")),
-                   RAD_WEIGHTS(w_fc.w, w_fc.s)),
-               {w.srcq, w.srcs}, {w.c});
+    op_cfc = w_fc.gemm(b, crows, g.n_embd, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.c});
     /* IN PLACE. Safe for any implementation that computes a row's scale before writing the row,
      * which none can avoid doing; the per-head q/k norms below run in place for the same reason. */
     op_cnorm = rw(b, RAD_OP(b, "rmsnorm",
@@ -515,18 +523,8 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
         /* TWO OPS OF THE SAME SHAPE, one per weight. An op's declared weight list is what gives a
          * weight its prefetch interval and its residency class, so two weights want two ops even
          * where one would issue both. */
-        op_ck[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("N", kvd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_k[i].w, w_k[i].s)),
-                     {w.cq, w.cs}, {w.ck});
-        op_cv[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("N", kvd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_v[i].w, w_v[i].s)),
-                     {w.cq, w.cs}, {w.cv});
+        op_ck[i] = w_k[i].gemm(b, crows, kvd, g.n_embd, {w.cq, w.cs}, {w.ck});
+        op_cv[i] = w_v[i].gemm(b, crows, kvd, g.n_embd, {w.cq, w.cs}, {w.cv});
         op_cknorm[i] = rw(b, RAD_OP(b, "rmsnorm",
                              RAD_PARAMS(RAD_RANGE("M", 1, crows * g.n_head_kv),
                                         RAD_INT("n", g.head_dim), RAD_F64("eps", g.eps),
@@ -603,24 +601,9 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                        RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
                             RAD_WEIGHTS(w_acp[i])),
                         {w.h}, {w.coef});
-        op_qp[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", qd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_q[i].w, w_q[i].s)),
-                     {w.h2q, w.h2s}, {w.q});
-        op_kp[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", kvd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_k[i].w, w_k[i].s)),
-                     {w.h2q, w.h2s}, {w.k});
-        op_vp[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", kvd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_v[i].w, w_v[i].s)),
-                     {w.h2q, w.h2s}, {w.v});
+        op_qp[i] = w_q[i].gemm(b, qrows, qd, g.n_embd, {w.h2q, w.h2s}, {w.q});
+        op_kp[i] = w_k[i].gemm(b, qrows, kvd, g.n_embd, {w.h2q, w.h2s}, {w.k});
+        op_vp[i] = w_v[i].gemm(b, qrows, kvd, g.n_embd, {w.h2q, w.h2s}, {w.v});
         op_qn[i] = rw(b, RAD_OP(b, "rmsnorm",
                          RAD_PARAMS(RAD_RANGE("M", 1, qrows * g.n_head), RAD_INT("n", g.head_dim),
                                     RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd_qk),
@@ -633,12 +616,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                     RAD_STR("dtype", g.dtype)),
                          RAD_WEIGHTS(w_kn[i])),
                      {w.k}, {w.k});
-        op_op[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", g.n_embd),
-                                    RAD_INT("K", qd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_o[i].w, w_o[i].s)),
-                     {w.atq, w.ats}, {w.h});
+        op_op[i] = w_o[i].gemm(b, qrows, g.n_embd, qd, {w.atq, w.ats}, {w.h});
         op_fnorm[i] = rw(b, RAD_OP(b, "rmsnorm",
                             RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_embd),
                                        RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd),
@@ -650,12 +628,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                        RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
                             RAD_WEIGHTS(w_fcp[i])),
                         {w.h}, {w.coef});
-        op_gu[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", 2 * g.n_ff),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_gu[i].w, w_gu[i].s)),
-                     {w.h2q, w.h2s}, {w.gate_up});
+        op_gu[i] = w_gu[i].gemm(b, qrows, 2 * g.n_ff, g.n_embd, {w.h2q, w.h2s}, {w.gate_up});
         /* THE SAME FOLD THE TRUNK'S MLP HAS, over the same weights and into the same activation;
          * rad_block_mlp_fp8.h declares it beside the pair for the same reason. Unfused, a layer
          * runs gate_up -> silu_mul -> quant, which is two extra launches and two extra passes over
@@ -667,7 +640,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
          * because M > 64 is a refusal in the kernel and not a slower path. */
         {
             const int64_t hi = qrows < 64 ? qrows : 64;
-            if (hi > 0) {
+            if (hi > 0 && !w_gu[i].mx) {   /* the fold is an fp8a8 tile; an MXFP4 gate_up takes the pair */
                 op_gug[i] = rw(b, RAD_OP(b, "gemm_nt_q_gated",
                                    RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", 2 * g.n_ff),
                                               RAD_INT("K", g.n_embd),
@@ -678,12 +651,7 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                 if (op_gug[i]) gated_rows = hi;
             }
         }
-        op_dn[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", g.n_embd),
-                                    RAD_INT("K", g.n_ff), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_dn[i].w, w_dn[i].s)),
-                     {w.ffq, w.ffs}, {w.h});
+        op_dn[i] = w_dn[i].gemm(b, qrows, g.n_embd, g.n_ff, {w.ffq, w.ffs}, {w.h});
     }
 
     /* The convolutions. `block_size` is the QUERY BLOCK -- the mask that kills the shifted tap at
@@ -789,31 +757,56 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
      * the pair plane the gather moves. `vocab_off` is omitted entirely when the head is
      * replicated, so that graph is the one it always was -- an optional parameter present with
      * the value 0 is not the same declaration as an absent one. */
+    const bool rerank = w_lm && (dh_shard || g.world <= 1);   /* see op_drerank below */
+    if (!rerank) top_w = cfg.sel_topk;
     op_dtopk = dh_shard
         ? rw(b, RAD_OP(b, "row_topk",
                 RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                           RAD_INT("R", cfg.sel_topk), RAD_INT("vocab_off", g.vocab_off),
+                           RAD_INT("R", top_w), RAD_INT("vocab_off", g.vocab_off),
                            RAD_STR("dtype", g.dtype)),
                 RAD_NOWEIGHTS),
              {w.dlog}, {w.cand, w.unary, w.dpair})
         : rw(b, RAD_OP(b, "row_topk",
                 RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                           RAD_INT("R", cfg.sel_topk), RAD_STR("dtype", g.dtype)),
+                           RAD_INT("R", top_w), RAD_STR("dtype", g.dtype)),
                 RAD_NOWEIGHTS),
              {w.dlog}, {w.cand, w.unary});
+    /* THE CANDIDATES ARE RESCORED EXACTLY when the target's head can be read row by row. The
+     * coarse head proposes its top kRerankR, `logit_rerank` scores those against the target's own
+     * fp8 head and re-sorts them, and the selector reads the best sel_topk of that order -- the
+     * candidate set and the unary logits the drafter was trained against, at kRerankR rows of the
+     * weight a draft row instead of a second, finer copy of the head. On Qwen3.8-27B the 2-bit
+     * head's own top-1 matches the exact head's on 76% of draft rows and the rescored one on all of
+     * them; served at depth 7 that is the 4-bit head's speed at half its bytes (330 MiB).
+     *
+     * Sharded, each rank rescores only ids it owns (row_topk reports this rank's slice), and the
+     * gather and merge below then rank exact values. A replicated draft head above one rank
+     * proposes ids another rank owns, so it keeps its own scores. */
+    if (rerank) {
+        op_drerank = RAD_OP(b, "logit_rerank",
+                        RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("R", top_w),
+                                   RAD_INT("n_vocab", head_rows(g)), RAD_INT("n_embd", g.n_embd),
+                                   RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", g.dtype)),
+                        RAD_WEIGHTS(w_lm));
+        if (!op_drerank) return RAD_E_INVAL;
+        rad_buf rd[2] = { w.sel_h, w.cand };
+        rad_buf wr[3] = { w.cand, w.unary, w.dpair };
+        rad_op_reads (b, op_drerank, rd, 2);
+        rad_op_writes(b, op_drerank, wr, dh_shard ? 3 : 2);
+    }
     if (dh_shard) {
         /* ROW-INTERLEAVED, so one draft position's pairs from every rank land side by side --
          * `row_topk_merge` reads one row at one row stride, the same reason the sampler's own
          * candidate gather carries `row`. */
         op_dgather = rw(b, RAD_OP(b, "all_gather",
                            RAD_PARAMS(RAD_INT("world_size", g.world),
-                                      RAD_INT("numel", srows * cfg.sel_topk * 2),
+                                      RAD_INT("numel", srows * top_w * 2),
                                       RAD_STR("dtype", "f32"),
-                                      RAD_INT("row", cfg.sel_topk * 2)),
+                                      RAD_INT("row", top_w * 2)),
                            RAD_NOWEIGHTS),
                        {w.dpair}, {w.dgath});
         op_dmerge = rw(b, RAD_OP(b, "row_topk_merge",
-                          RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("R", cfg.sel_topk),
+                          RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("R", top_w),
                                      RAD_INT("world_size", g.world),
                                      RAD_STR("dtype", g.dtype)),
                           RAD_NOWEIGHTS),
@@ -851,16 +844,16 @@ inline void Dflash2::context(RadCtx* c, const RadBatch* batch) const {
      * rows. */
     RAD_ISSUE_N(c, op_qsrc, T, brows(w.src, T), brows(w.srcq, T), brows(w.srcs, T));
     RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
-                brows(w.c, T), RAD_NONE, RAD_NONE);
+                brows(w.c, T), RAD_NONE, w_fc.bref());
     RAD_ISSUE_N(c, op_cnorm, T, brows(w.c, T), RAD_W(w_hnorm), brows(w.c, T));
     RAD_ISSUE_N(c, op_qc, T, brows(w.c, T), brows(w.cq, T), brows(w.cs, T));
 
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
         RAD_ISSUE_N(c, op_ck[i], T, brows(w.cq, T), brows(w.cs, T),
-                    RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.ck, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.ck, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_cv[i], T, brows(w.cq, T), brows(w.cs, T),
-                    RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.cv, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.cv, T), RAD_NONE, w_v[i].bref());
         RAD_ISSUE_N(c, op_cknorm[i], T * g.n_head_kv,
                     brows(w.ck, T), RAD_W(w_kn[i]), brows(w.ck, T));
         RAD_ISSUE_N(c, op_crope, T, brows(w.ck, T), praw(batch->positions, RAD_I32, T));
@@ -898,11 +891,11 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
 
         RAD_ISSUE_N(c, op_qh2, T, brows(w.h2, T), brows(w.h2q, T), brows(w.h2s, T));
         RAD_ISSUE_N(c, op_qp[i], T, brows(w.h2q, T), brows(w.h2s, T),
-                    RAD_W(w_q[i].w), RAD_W(w_q[i].s), brows(w.q, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_q[i].w), RAD_W(w_q[i].s), brows(w.q, T), RAD_NONE, w_q[i].bref());
         RAD_ISSUE_N(c, op_kp[i], T, brows(w.h2q, T), brows(w.h2s, T),
-                    RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.k, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.k, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_vp[i], T, brows(w.h2q, T), brows(w.h2s, T),
-                    RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.v, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.v, T), RAD_NONE, w_v[i].bref());
         RAD_ISSUE_N(c, op_qn[i], T * g.n_head, brows(w.q, T), RAD_W(w_qn[i]), brows(w.q, T));
         RAD_ISSUE_N(c, op_kn[i], T * g.n_head_kv,
                     brows(w.k, T), RAD_W(w_kn[i]), brows(w.k, T));
@@ -919,7 +912,7 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
                     brows(w.attn, T));
         RAD_ISSUE_N(c, op_qat, T, brows(w.attn, T), brows(w.atq, T), brows(w.ats, T));
         RAD_ISSUE_N(c, op_op[i], T, brows(w.atq, T), brows(w.ats, T),
-                    RAD_W(w_o[i].w), RAD_W(w_o[i].s), brows(w.h, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_o[i].w), RAD_W(w_o[i].s), brows(w.h, T), RAD_NONE, w_o[i].bref());
         /* BEFORE the closing convolution, not after. The convolution is linear in its input and
          * its coefficients come from the replicated pre-attention norm, so either order is the
          * same arithmetic -- and reducing first keeps the residual stream's contract ("what the
@@ -941,13 +934,12 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
                         RAD_NONE);
         } else {
             RAD_ISSUE_N(c, op_gu[i], T, brows(w.h2q, T), brows(w.h2s, T),
-                        RAD_W(w_gu[i].w), RAD_W(w_gu[i].s), brows(w.gate_up, T), RAD_NONE,
-                        RAD_NONE);
+                        RAD_W(w_gu[i].w), RAD_W(w_gu[i].s), brows(w.gate_up, T), RAD_NONE, w_gu[i].bref());
             RAD_ISSUE_N(c, op_act, T, brows(w.gate_up, T), brows(w.ffn, T));
             RAD_ISSUE_N(c, op_qff, T, brows(w.ffn, T), brows(w.ffq, T), brows(w.ffs, T));
         }
         RAD_ISSUE_N(c, op_dn[i], T, brows(w.ffq, T), brows(w.ffs, T),
-                    RAD_W(w_dn[i].w), RAD_W(w_dn[i].s), brows(w.h, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_dn[i].w), RAD_W(w_dn[i].s), brows(w.h, T), RAD_NONE, w_dn[i].bref());
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
         RAD_ISSUE_N(c, op_fconv[i], T, brows(w.h, T), bcol(w.coef, half, half, T),
                     wrow_slice(w_fcb[i], 1, 1, cfg.taps * g.n_embd), brows(w.h2, T));
@@ -980,15 +972,22 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     if (op_dmerge) {
         RAD_ISSUE_N(c, op_dtopk, S, brows(w.dlog, S), brows(w.cand, S), brows(w.unary, S),
                     brows(w.dpair, S));
+        if (op_drerank)
+            RAD_ISSUE_N(c, op_drerank, S, brows(w.sel_h, S), RAD_W(w_lm), brows(w.cand, S),
+                        brows(w.cand, S), brows(w.unary, S), brows(w.dpair, S));
         RAD_ISSUE(c, op_dgather, brows(w.dpair, S), brows(w.dgath, S));
         RAD_ISSUE_N(c, op_dmerge, S, brows(w.dgath, S), brows(w.cand, S), brows(w.unary, S));
     } else {
         RAD_ISSUE_N(c, op_dtopk, S, brows(w.dlog, S), brows(w.cand, S), brows(w.unary, S),
                     RAD_NONE);
+        if (op_drerank)
+            RAD_ISSUE_N(c, op_drerank, S, brows(w.sel_h, S), RAD_W(w_lm), brows(w.cand, S),
+                        brows(w.cand, S), brows(w.unary, S), RAD_NONE);
     }
 
     RAD_ISSUE_N(c, op_hp, S, brows(w.sel_h, S), RAD_W(w_selp), brows(w.hp, S));
-    RAD_ISSUE_N(c, op_sel, batch->n_seq, brows(w.cand, S), brows(w.unary, S), brows(w.hp, S),
+    RAD_ISSUE_N(c, op_sel, batch->n_seq, bcol(w.cand, 0, cfg.sel_topk, S),
+                bcol(w.unary, 0, cfg.sel_topk, S), brows(w.hp, S),
                 praw(batch->token_ids, RAD_I32, T), RAD_W(w_pred), RAD_W(w_succ),
                 brows(w.tokens, batch->n_seq));
 }

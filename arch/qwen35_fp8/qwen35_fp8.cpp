@@ -493,13 +493,24 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
      * vocab-sharded, asked here rather than re-derived, because a buffer that disagreed with the
      * op declared over it is a read past its end. */
     dw.dlog    = decl_b(b, nm.f("df_dlog"), dg.act_dtype, {sr, Dflash2::head_rows(dg)});
-    dw.cand    = decl_b(b, nm.f("df_cand"), RAD_I32, {sr, dc.sel_topk});
-    dw.unary   = decl_b(b, nm.f("df_unary"), RAD_F32, {sr, dc.sel_topk});
+    /* THE CANDIDATES ARE RESCORED against the target's head when logit_rerank can read its plane
+     * (fp8 or int8 rows) and every candidate a rank proposes is one it owns -- the rule the block
+     * applies; the planes are then kRerankR wide and the selector reads the first sel_topk. */
+    {
+        const uint32_t hd = weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16);
+        if ((hd == RAD_F8E4M3 || hd == RAD_I8) && (Dflash2::head_sharded(dg) || dg.world <= 1)) {
+            m.df.w_lm  = m.w_lm_head;
+            m.df.top_w = Dflash2::kRerankR;
+        }
+    }
+    const int64_t tw = m.df.w_lm ? m.df.top_w : dc.sel_topk;
+    dw.cand    = decl_b(b, nm.f("df_cand"), RAD_I32, {sr, tw});
+    dw.unary   = decl_b(b, nm.f("df_unary"), RAD_F32, {sr, tw});
     /* The vocab-parallel candidate exchange, and only when there is one: this rank's top-R as
      * (int32 id, float value) pairs and the all-gathered world_size * R of them. */
     if (Dflash2::head_sharded(dg)) {
-        dw.dpair = decl_b(b, nm.f("df_dpair"), RAD_F32, {sr, dc.sel_topk, 2});
-        dw.dgath = decl_b(b, nm.f("df_dgath"), RAD_F32, {sr, (int64_t)dg.world * dc.sel_topk, 2});
+        dw.dpair = decl_b(b, nm.f("df_dpair"), RAD_F32, {sr, tw, 2});
+        dw.dgath = decl_b(b, nm.f("df_dgath"), RAD_F32, {sr, (int64_t)dg.world * tw, 2});
     }
     /* NAMED, because the engine reads the draft out of it by name: a DFlash2 pass proposes through
      * the selector and never through the sampler's token buffer. */
