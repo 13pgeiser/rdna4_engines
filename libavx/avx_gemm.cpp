@@ -755,6 +755,10 @@ static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
     const RadTensor* bs_ = rad_arg_in(a, 3);
     const RadTensor* bias = bias_operand ? rad_arg_in(a, 4) : nullptr;
 
+    /* `pb1`/`pb2` split the weight's rows into parts that meet separate copies of the activation
+     * (ParoQuant); this driver reads one. Refused rather than computed against the wrong copy. */
+    if (p_int(a, "pb1", 0) || p_int(a, "pb2", 0)) return RAD_E_UNSUPPORTED;
+
     const int64_t K = p_int(a, "K", B->rank >= 2 ? B->shape[B->rank - 1] : 0);
     const int64_t N = p_int(a, "N", B->rank >= 2 ? B->shape[B->rank - 2] : 0);
     if (K <= 0 || N <= 0) return RAD_E_SHAPE;

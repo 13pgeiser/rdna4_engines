@@ -17,6 +17,7 @@
  * thousands in every GEMM a transformer issues. Each thread owns whole output elements, so the
  * summation order does not depend on the thread count.
  */
+#include <algorithm>
 #include "ref_common.h"
 #include "ref_gemm.h"
 #include "ref_ops.h"
@@ -252,6 +253,52 @@ static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
     if (M <= 0) return RAD_E_SHAPE;
     if (numel(A) < M * K || numel(B) < N * K) return RAD_E_SHAPE;
     if (bias && numel(bias) < N) return RAD_E_SHAPE;
+
+    /* PARTS (`pb1`, `pb2`): the weight's rows are [0, pb1), [pb1, pb2) and [pb2, N), each against
+     * its own copy of the activation -- a fused projection whose pieces were rotated separately
+     * (ParoQuant). The copies sit side by side in a row of `a`, so `a` is [M, parts * K] and its
+     * scale [M, parts * K / 128]; a part is the plain product over its rows, which is how it is
+     * computed. 0 leaves a bound out: no `pb1` is one part, no `pb2` ends the second at N. */
+    const int64_t pb1 = p_int(a, "pb1", 0), pb2 = p_int(a, "pb2", 0);
+    if (pb1 > 0 || pb2 > 0) {
+        if (bias_operand || B->dtype != RAD_FP4E2M1 || A->rank < 2) return RAD_E_UNSUPPORTED;
+        const int64_t e1 = pb1 > 0 ? std::min<int64_t>(pb1, N) : N;
+        const int64_t e2 = pb2 > 0 ? std::max<int64_t>(e1, std::min<int64_t>(pb2, N)) : N;
+        const int64_t bound[4] = { 0, e1, e2, N };
+        const int64_t acols = A->shape[A->rank - 1];
+        const int64_t parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
+        if (acols != parts * K || (e1 % 16) || (e2 % 16)) return RAD_E_SHAPE;
+        const bool sa_row = as_ && as_->data && as_->rank >= 2;
+        if (!sa_row) return RAD_E_INVAL;
+        const int64_t sa_cols = as_->shape[as_->rank - 1];
+        if (sa_cols % parts) return RAD_E_SHAPE;
+        const int64_t sa_part = sa_cols / parts;                 /* K / 128 */
+        for (int p = 0; p < 3; ++p) {
+            const int64_t n0 = bound[p], n1 = bound[p + 1];
+            if (n1 <= n0) continue;
+            RadTensor Ap = *A, Sp = *as_, Bp = *B, Bsp = *bs_, Yp = *Y;
+            Ap.data = (uint8_t*)A->data + rad_dtype_bytes(A->dtype, p * K);
+            Ap.rank = 2; Ap.shape[0] = M; Ap.shape[1] = K;
+            Ap.stride[0] = row_stride(A, acols); Ap.stride[1] = 1;
+            Sp.data = (uint8_t*)as_->data + rad_dtype_bytes(as_->dtype, p * sa_part);
+            Sp.shape[Sp.rank - 1] = sa_part;
+            Bp.data = (uint8_t*)B->data + rad_dtype_bytes(B->dtype, n0 * K);
+            Bp.rank = 2; Bp.shape[0] = n1 - n0; Bp.shape[1] = K; Bp.stride[0] = K; Bp.stride[1] = 1;
+            const int64_t bs_cols = bs_->shape[bs_->rank - 1];
+            Bsp.data = (uint8_t*)bs_->data + rad_dtype_bytes(bs_->dtype, n0 * bs_cols);
+            Bsp.rank = 2; Bsp.shape[0] = n1 - n0; Bsp.shape[1] = bs_cols;
+            Bsp.stride[0] = bs_cols; Bsp.stride[1] = 1;
+            const int64_t ys = row_stride(Y, N);
+            Yp.data = (uint8_t*)Y->data + rad_dtype_bytes(Y->dtype, n0);
+            Yp.rank = 2; Yp.shape[0] = M; Yp.shape[1] = n1 - n0; Yp.stride[0] = ys; Yp.stride[1] = 1;
+            Scales SAp = make_scales(&Sp, M, K, false), SBp = make_scales(&Bsp, n1 - n0, K, true);
+            const Mat map_ = as_mat(&Ap, M, K), mbp = as_mat(&Bp, n1 - n0, K);
+            QuantFn fn = pick_quant(Ap.dtype, Bp.dtype);
+            if (fn) fn(map_, mbp, SAp, SBp, &Yp, nullptr, M, n1 - n0, K, 1.0f);
+            else    gemm_quant_generic(map_, mbp, SAp, SBp, &Yp, nullptr, M, n1 - n0, K, 1.0f);
+        }
+        return RAD_OK;
+    }
 
     const bool mx = B->dtype == RAD_FP4E2M1;
     Scales SA = make_scales(as_, M, K, false);

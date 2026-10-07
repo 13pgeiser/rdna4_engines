@@ -410,6 +410,82 @@ int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------- givens_quant_act_fp8 */
+/* ParoQuant's activation side: every row scaled by its channel factors, rotated by `stages`
+ * rounds of disjoint Givens pairs, then the same symmetric block-scaled E4M3 quantiser. A weight
+ * stored as v = w . D . G_1 ... G_S (abi/rad_encoding.h, "givens") meets the activation
+ * x . D^-1 . G_1 ... G_S, because <v, x D^-1 G_1..G_S> = <w, x> and each G is orthogonal.
+ *
+ * PARTS. A fused projection (gate|up, q|k|v) was rotated per piece, so a row has `parts` rotated
+ * copies, written side by side: q is [rows, parts * n] and scale [rows, parts * n/group], part p at
+ * columns [p*n, (p+1)*n). The tables stack the parts: pairs and angle `stages` rows each, scale one
+ * row, per part. A part's pairs address columns of the row, and a pair must stay inside one scale
+ * group (the checkpoint's are within groups of 128): the quantiser reads each group's rotated
+ * values after the stages and the device kernel rotates a group at a time.
+ *
+ * The arithmetic is the device kernel's, restated: the divide by the channel scale, then for each
+ * stage a' = a cos t + b sin t, b' = b cos t - a sin t in f32, then amax/448 per group. Not
+ * bit-identical to the device on the angle: cos and sin of an f32 differ by an ulp between libm
+ * and the GPU's. */
+int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *pr = &a->t[1], *an = &a->t[2], *sc = &a->t[3];
+    const RadTensor *q = &a->t[4], *s = &a->t[5];
+    const int64_t n = p_int(a, "n", 0), S = p_int(a, "stages", 0), P = p_int(a, "parts", 1);
+    int64_t g = p_int(a, "group", 0);
+    if (n <= 0 || S <= 0 || P <= 0 || (n & 1)) return RAD_E_SHAPE;
+    if (g <= 0 || g > n || n % g != 0) return RAD_E_SHAPE;
+    if (numel(pr) < P * S * n || numel(an) < P * S * (n / 2) || numel(sc) < P * n) return RAD_E_SHAPE;
+    const int64_t rows = numel(x) / n;
+    const int64_t ngrp = n / g;
+    if (rows <= 0 || numel(q) < rows * P * n || numel(s) < rows * P * ngrp) return RAD_E_SHAPE;
+
+    // validated before the loop, because an OpenMP body cannot return
+    for (int64_t i = 0; i < P * S * n; ++i) {
+        const int64_t c = ld_int(pr->dtype, pr->data, i);
+        if (c < 0 || c >= n) return RAD_E_INVAL;
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        std::vector<float> buf((size_t)n);
+        const int64_t xb = rowoff(x, r, n), qb = rowoff(q, r, P * n);
+        const int64_t xs = laststride(x), qs = laststride(q);
+        for (int64_t p = 0; p < P; ++p) {
+            for (int64_t k = 0; k < n; ++k) buf[(size_t)k] = ldt(x, xb + k * xs) / ldt(sc, p * n + k);
+            for (int64_t st = 0; st < S; ++st) {
+                const int64_t t0 = (p * S + st) * n, a0 = (p * S + st) * (n / 2);
+                for (int64_t j = 0; j < n / 2; ++j) {
+                    const int64_t ia = ld_int(pr->dtype, pr->data, t0 + 2 * j);
+                    const int64_t ib = ld_int(pr->dtype, pr->data, t0 + 2 * j + 1);
+                    const float th = ldt(an, a0 + j), c = std::cos(th), sn = std::sin(th);
+                    const float va = buf[(size_t)ia], vb = buf[(size_t)ib];
+                    buf[(size_t)ia] = va * c + vb * sn;
+                    buf[(size_t)ib] = vb * c - va * sn;
+                }
+            }
+            for (int64_t gi = 0; gi < ngrp; ++gi) {
+                const int64_t k0 = gi * g;
+                float amax = 0.0f;
+                for (int64_t i = 0; i < g; ++i) {
+                    const float m = std::fabs(buf[(size_t)(k0 + i)]);
+                    if (m > amax) amax = m;
+                }
+                const float scl = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+                const float inv = 1.0f / scl;
+                for (int64_t i = 0; i < g; ++i) {
+                    float v = buf[(size_t)(k0 + i)] * inv;
+                    if (v > 448.0f) v = 448.0f;
+                    if (v < -448.0f) v = -448.0f;
+                    st_dt(q->dtype, q->data, qb + (p * n + k0 + i) * qs, v);
+                }
+                stt(s, rowoff(s, r, P * ngrp) + (p * ngrp + gi) * laststride(s), scl);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* ---------------------------------------------------------------- the Gram accumulator
  *
  * h[k1][k2] += sum over rows of x[m][k1] * x[m][k2], where x is the DEQUANTISED E4M3 input, or

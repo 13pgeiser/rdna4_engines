@@ -362,9 +362,32 @@ spelling of `act`, not the vocabulary's.
 |---|---|---|
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `givens_quant_act_fp8` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `q`, `scale` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+
+### `givens_quant_act_fp8`: ParoQuant's rotated activation
+
+A weight stored with the `givens` transform (`abi/rad_encoding.h`) is `v = w . D . G_1 ... G_S`: the
+channel scale `D` and `S` stages of disjoint pairwise rotations were applied to each row BEFORE it
+was quantised (ParoQuant, z-lab), so the product the GEMM contracts is `<v, x'>` with
+`x' = x . D^-1 . G_1 ... G_S` -- the activation takes the same rotation, forward, once a token.
+`givens_quant_act_fp8` is that: `x / rscale`, then for each stage `a' = a cos t + b sin t,
+b' = b cos t - a sin t` over its pairs, then `quant_act_fp8`'s quantiser (scale `amax / 448` per
+`group` columns). The pairs are column indices of the row and each pair lies inside ONE scale group
+(ParoQuant's are within groups of 128), so the kernel rotates a group at a time and the quantiser
+sees the rotated group. The consumer is the plain `gemm_nt_q` at `mxfp4a8`; nothing in the weight's
+codes or exponents changed.
+
+A fused projection (gate|up, qkv|z) was rotated PER CHECKPOINT TENSOR, so it has `parts` rotated
+copies of the activation, written side by side -- `q` is `[M, parts * n]`, `scale`
+`[M, parts * n / group]` -- and `pairs` and `angle` stack the parts' `stages` rows each, `rscale`
+one row a part. `gemm_nt_q` then takes `pb1` and `pb2`, the row bounds of the weight's parts: its
+rows `[0, pb1)`, `[pb1, pb2)` and `[pb2, N)` meet copy 0, 1 and 2, and `a`/`a_scale` are the wide
+planes. `pb1` absent is one part; `pb2` absent ends the second part at `N`. Only the `mxfp4a8` rows
+read them, and the host rows that do not (`libavx`) refuse a call that names one rather than
+contract against the wrong copy.
 
 ### The int8 and gated fp8 fusions — device-only
 
@@ -410,7 +433,7 @@ waiting on the mover's event — a read of weight bytes that may not have arrive
 |---|---|---|
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
-| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 
 `nt` is A row-major `[M,K]` times B **transposed** `[N,K]`, giving `[M,N]` — the layout every

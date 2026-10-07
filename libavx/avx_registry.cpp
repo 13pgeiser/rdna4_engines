@@ -210,6 +210,8 @@ static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD
                                             OUT("y") };
 
 static const RadParamSpec pGemmQ[]        = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
+                                              P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2") };
+static const RadParamSpec pGemmQBias[]    = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                               P_STR("dtype") };
 static const RadOperandSpec oGemmQ[]      = { OPD("a"), OPD_O("a_scale"), WGT("b"), WGT("b_scale"),
                                               OUT("y"), OPD_O("a_sum"), WGT_O("b_ref") };
@@ -567,7 +569,7 @@ static const RadOpSchema kSchemas[] = {
 { "gemm_nt_q", ARR(pGemmQ), ARR(oGemmQ),
   "C = A B^T with group-scaled quantised operands. `a_sum` and `b_ref` are libr4d's asymmetric and "
   "mxfp4 forms and are ignored here, as they are in libref." },
-{ "gemm_nt_q_bias", ARR(pGemmQ), ARR(oGemmQBias), "quantised C = A B^T + bias." },
+{ "gemm_nt_q_bias", ARR(pGemmQBias), ARR(oGemmQBias), "quantised C = A B^T + bias." },
 { "gemm_nt_q_gated", ARR(pGemmQGated), ARR(oGemmQGated),
   "gemm_nt_q over a [N, K] gate_up plane with gated_quant_fp8's pass in the epilogue, byte for "
   "byte the pair. `N` is the weight's rows, twice the fused width; the output is [M, N/2]." },

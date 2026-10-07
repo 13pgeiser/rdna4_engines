@@ -828,6 +828,14 @@ int ref_gram_accum_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("gram_accum", operand, out);
 }
 
+/* DECLINED, on purpose: `pairs` must be a pairing of each group's columns (every column once a
+ * stage, the partner inside the group), and a described operand can only be drawn, not constructed
+ * -- an index draw has repeats, and a Givens stage over a repeated column is not a rotation. A case
+ * built from one would compare two implementations of nothing. r4d_selftest builds real pairings. */
+int ref_givens_quant_act_fp8_shape(const RadParam*, int, int, RadOpdDesc*) {
+    return RAD_E_UNSUPPORTED;
+}
+
 int ref_had_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

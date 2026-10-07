@@ -201,6 +201,13 @@ static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 /* No `asum`: that output exists for the asymmetric integer grids and an fp8 grid is symmetric by
  * construction (libr4d/r4d_rows.cpp says the same). */
 static const RadOperandSpec oQuantFp8[]  = { OPD("x"), OUT("q"), OUT("scale") };
+/* ParoQuant's activation quantiser: a rotation per part in front of quant_act_fp8's. The three
+ * tables are the "givens" encoding's (abi/rad_encoding.h) and are WEIGHT operands, so they are
+ * resolved, moved and placed with the weight they belong to. */
+static const RadParamSpec pGivensQuant[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                             P_INT("stages"), P_INT("parts") };
+static const RadOperandSpec oGivensQuant[] = { OPD("x"), WGT("pairs"), WGT("angle"), WGT("rscale"),
+                                               OUT("q"), OUT("scale") };
 
 /* ---- the fp8 fusions ----------------------------------------------------------------------
  * A fused op's operands are the unfused pair's minus the tensor between them, and `out_bf16`
@@ -264,7 +271,10 @@ static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD
                                             OUT("y") };
 
 static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
-                                       P_STR("dtype") };
+                                       P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2") };
+/* The bias form has no parts: a fused projection rotated apart is the plain product's. */
+static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
+                                           P_STR("dtype") };
 /* `a_sum` and `b_ref` are libr4d's, appended AFTER `y` so docs/OPS.md's list stays a positional
  * prefix: the asymmetric 4-bit and 2-bit grids subtract the activation's per-group code sums, and
  * mxfp4 folds a per-output-row reference exponent. Neither is expressible as a weight aux stream,
@@ -790,6 +800,15 @@ static const RadOpSchema kSchemas[] = {
   "previous pick. `hp` absent is a plane of ones, which drops the form to a plain low-rank "
   "bigram. Serial in l by construction -- the predecessor is not known until the previous step "
   "has been decided." },
+{ "givens_quant_act_fp8", ARR(pGivensQuant), ARR(oGivensQuant),
+  "ParoQuant's activation quantiser: x is divided by the channel scale `rscale`, rotated by "
+  "`stages` rounds of disjoint Givens pairs (a' = a cos t + b sin t, b' = b cos t - a sin t, pairs "
+  "as column indices of the row, each inside one scale group), then quantised as quant_act_fp8 "
+  "does: scale = amax / 448 per `group`. `parts` rotated copies are written side by side -- q is "
+  "[M, parts * n], scale [M, parts * n / group] -- part p from table rows [p * stages, (p + 1) * "
+  "stages) of `pairs` and `angle` and row p of `rscale`: a fused projection's pieces were each "
+  "rotated on their own. Only a weight stored with the \"givens\" transform reads the result; "
+  "it is NOT quant_act_fp8's output in either direction." },
 { "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
   "A Walsh-Hadamard rotation of width `group` along n, then symmetric E4M3 per group: scale = "
   "amax(rotated) / 448, shaped [M, n/group] in f32. n must be a multiple of `group` -- a rotation "
@@ -831,7 +850,7 @@ static const RadOpSchema kSchemas[] = {
   "gemm_nt with quantised operands. The group sub-sum is accumulated from the raw codes and "
   "scaled once per group, which is what an int8 or fp8 WMMA kernel does. Scale streams are "
   "[rows, groups] or [rows]; an mxfp4 weight's u8 scale stream is read as OCP e8m0." },
-{ "gemm_nt_q_bias", ARR(pGemmQ), ARR(oGemmQBias), "gemm_nt_q with a per-column bias." },
+{ "gemm_nt_q_bias", ARR(pGemmQBias), ARR(oGemmQBias), "gemm_nt_q with a per-column bias." },
 
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then V per "
@@ -1152,6 +1171,10 @@ SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_givens_quant_act_fp8", "givens_quant_act_fp8", "quant",
+       "channel scale and Givens rotations per part, then the block-scaled E4M3 quantiser",
+       "float in, fp8_e4m3 out, f32 scale per group; int32 pairs, f32 angles and channel scales",
+       ref_givens_quant_act_fp8),
 SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",

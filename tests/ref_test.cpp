@@ -261,7 +261,8 @@ TEST(op_vocabulary) {
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
-        "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "had_quant_act_i8", "gram_accum",
+        "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "givens_quant_act_fp8", "had_quant_act_i8",
+        "gram_accum",
         /* The fused fp8 forms. A host run needs EVERY op covered, so these are what stands
          * between a host-backend run and "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
@@ -1454,6 +1455,144 @@ TEST(op_gemm_nt_q) {
     CHECK_OK(run("gemm_nt_q", c));
     CHECK_EQ(y3.at(0), (1 * 2.0f + 2 * 4.0f) * 0.5f);
     CHECK_EQ(y3.at(1), (3 * 2.0f + 4 * 4.0f) * 1.0f);
+}
+
+/* A weight whose row PARTS meet their own copy of the activation: parts = 2 rows [0, 16) and
+ * [16, 32) over K = 128, the copies side by side in one row of `a`. The parted product must be the
+ * plain product of each part's rows against its own copy -- computed here as two plain calls. */
+TEST(op_gemm_nt_q_parts_read_their_own_activation_copy) {
+    const int64_t M = 3, N = 32, K = 128, P = 2;
+    uint32_t rng = 7;
+    auto nxt = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 9; };
+    T a2(RAD_F8E4M3, {M, P * K});
+    std::vector<float> av((size_t)(M * P * K));
+    for (auto& v : av) v = (float)((int)(nxt() % 15) - 7) * 0.25f;
+    a2.f(av);
+    T as2(RAD_F32, {M, P});
+    std::vector<float> asv((size_t)(M * P));
+    for (auto& v : asv) v = 0.01f * (float)(1 + nxt() % 9);
+    as2.f(asv);
+    T b_(RAD_FP4E2M1, {N, K});
+    for (int64_t i = 0; i < N * K / 2; ++i) b_.mem[(size_t)i] = (uint8_t)nxt();
+    T bs(RAD_U8, {N, K / 32});
+    for (int64_t i = 0; i < N * K / 32; ++i) bs.mem[(size_t)i] = (uint8_t)(124 + nxt() % 5);
+
+    T y(RAD_BF16, {M, N});
+    A a; a.t(a2).t(as2).t(b_).t(bs).t(y).tnull().tnull()
+          .i("M", M).i("N", N).i("K", K).i("group", 32).s("dtype", "mxfp4a8").i("pb1", 16);
+    CHECK_OK(run("gemm_nt_q", a));
+
+    for (int64_t p = 0; p < P; ++p) {
+        T ap(RAD_F8E4M3, {M, K}), asp(RAD_F32, {M, 1});
+        std::vector<float> v1((size_t)(M * K)), v2((size_t)M);
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t k = 0; k < K; ++k) v1[(size_t)(m * K + k)] = av[(size_t)(m * P * K + p * K + k)];
+            v2[(size_t)m] = asv[(size_t)(m * P + p)];
+        }
+        ap.f(v1);
+        asp.f(v2);
+        T bp(RAD_FP4E2M1, {N / P, K}), bsp(RAD_U8, {N / P, K / 32});
+        std::memcpy(bp.mem.data(), b_.mem.data() + p * (N / P) * K / 2, (size_t)((N / P) * K / 2));
+        std::memcpy(bsp.mem.data(), bs.mem.data() + p * (N / P) * K / 32, (size_t)((N / P) * K / 32));
+        T yp(RAD_BF16, {M, N / P});
+        A c; c.t(ap).t(asp).t(bp).t(bsp).t(yp).tnull().tnull()
+              .i("M", M).i("N", N / P).i("K", K).i("group", 32).s("dtype", "mxfp4a8");
+        CHECK_OK(run("gemm_nt_q", c));
+        int bad = 0;
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t n = 0; n < N / P; ++n)
+                if (y.at(m * N + p * (N / P) + n) != yp.at(m * (N / P) + n)) ++bad;
+        CHECK_EQ(bad, 0);
+    }
+}
+
+/* ParoQuant's activation quantiser. With zero angles and unit channel scales it IS quant_act_fp8;
+ * with real rotations the dequantised row is the rotated row to within the fp8 grid, and the
+ * rotation preserves the row's norm -- checked per part, against a double-precision rotation. */
+TEST(op_givens_quant_act_fp8) {
+    const int64_t M = 3, n = 256, S = 3, P = 2, G = 128;
+    uint32_t rng = 99;
+    auto nxt = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    auto frand = [&](float lo, float hi) { return lo + (hi - lo) * (float)(nxt() % 10000) / 10000.0f; };
+    T x(RAD_BF16, {M, n});
+    std::vector<float> xv((size_t)(M * n));
+    for (auto& v : xv) v = frand(-3.0f, 3.0f);
+    x.f(xv);
+    for (int64_t m = 0; m < M; ++m) xv[(size_t)(m * n + 7)] = 0;      // a zero in the mix
+    // a pairing of each group of 128 per stage per part
+    T pr(RAD_I32, {P * S, n}), an(RAD_F32, {P * S, n / 2}), rs(RAD_F32, {P, n});
+    for (int64_t ps = 0; ps < P * S; ++ps)
+        for (int64_t g = 0; g < n / G; ++g) {
+            std::vector<int32_t> perm((size_t)G);
+            for (int i = 0; i < G; ++i) perm[(size_t)i] = (int32_t)(g * G + i);
+            for (int i = (int)G - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[nxt() % (i + 1)]);
+            for (int i = 0; i < G; ++i) st_int(RAD_I32, pr.t.data, ps * n + g * G + i, perm[(size_t)i]);
+        }
+    std::vector<float> av((size_t)(P * S * n / 2)), sv((size_t)(P * n));
+    for (auto& v : av) v = frand(-3.0f, 3.0f);
+    for (auto& v : sv) v = frand(0.5f, 2.0f);
+    an.f(av);
+    rs.f(sv);
+
+    T q(RAD_F8E4M3, {M, P * n}), s(RAD_F32, {M, P * n / G});
+    A a; a.t(x).t(pr).t(an).t(rs).t(q).t(s)
+          .i("M", M).i("n", n).i("group", G).s("dtype", "bf16").i("stages", S).i("parts", P);
+    CHECK_OK(run("givens_quant_act_fp8", a));
+    double worst = 0;
+    int bad_norm = 0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t p = 0; p < P; ++p) {
+            std::vector<double> b((size_t)n);
+            double n0 = 0;
+            for (int64_t k = 0; k < n; ++k) {
+                b[(size_t)k] = (double)x.at(m * n + k) / (double)sv[(size_t)(p * n + k)];
+                n0 += b[(size_t)k] * b[(size_t)k];
+            }
+            for (int64_t st = 0; st < S; ++st)
+                for (int64_t j = 0; j < n / 2; ++j) {
+                    const int64_t ia = pr.iat((p * S + st) * n + 2 * j), ib = pr.iat((p * S + st) * n + 2 * j + 1);
+                    const double t = av[(size_t)((p * S + st) * (n / 2) + j)], c = std::cos(t), sn = std::sin(t);
+                    const double va = b[(size_t)ia], vb = b[(size_t)ib];
+                    b[(size_t)ia] = va * c + vb * sn;
+                    b[(size_t)ib] = vb * c - va * sn;
+                }
+            double n1 = 0;
+            for (int64_t k = 0; k < n; ++k) n1 += b[(size_t)k] * b[(size_t)k];
+            if (std::fabs(n1 - n0) > 1e-9 * n0) ++bad_norm;
+            for (int64_t g = 0; g < n / G; ++g) {
+                double amax = 0;
+                for (int64_t i = 0; i < G; ++i) amax = std::max(amax, std::fabs(b[(size_t)(g * G + i)]));
+                const double sc = s.at(m * (P * n / G) + p * (n / G) + g);
+                CHECK(std::fabs(sc - amax / 448.0) < 1e-5 * amax / 448.0 + 1e-12);
+                for (int64_t i = 0; i < G; ++i) {
+                    const double deq = (double)q.at(m * P * n + p * n + g * G + i) * sc;
+                    worst = std::max(worst, std::fabs(deq - b[(size_t)(g * G + i)]) / amax);
+                }
+            }
+        }
+    CHECK_EQ(bad_norm, 0);
+    CHECK(worst < 0.04);            // half an e4m3 step at the top of the range is 1/16 of 1/2
+
+    // zero angles, unit scales: exactly quant_act_fp8
+    T an0(RAD_F32, {P * S, n / 2}), rs1(RAD_F32, {P, n});
+    std::vector<float> ones((size_t)(P * n), 1.0f);
+    rs1.f(ones);
+    T q1(RAD_F8E4M3, {M, P * n}), s1(RAD_F32, {M, P * n / G});
+    A b; b.t(x).t(pr).t(an0).t(rs1).t(q1).t(s1)
+          .i("M", M).i("n", n).i("group", G).s("dtype", "bf16").i("stages", S).i("parts", P);
+    CHECK_OK(run("givens_quant_act_fp8", b));
+    T q2(RAD_F8E4M3, {M, n}), s2(RAD_F32, {M, n / G});
+    A c; c.t(x).t(q2).t(s2).i("M", M).i("n", n).i("group", G).s("dtype", "bf16");
+    CHECK_OK(run("quant_act_fp8", c));
+    int diff = 0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t p = 0; p < P; ++p) {
+            for (int64_t k = 0; k < n; ++k)
+                if (q1.mem[(size_t)(m * P * n + p * n + k)] != q2.mem[(size_t)(m * n + k)]) ++diff;
+            for (int64_t g = 0; g < n / G; ++g)
+                if (s1.at(m * (P * n / G) + p * (n / G) + g) != s2.at(m * (n / G) + g)) ++diff;
+        }
+    CHECK_EQ(diff, 0);
 }
 
 /* A BLOCK GRID WHOSE LAST BLOCK IS PARTIAL, on both axes. K = 300 at 128 is three scales over 128,
