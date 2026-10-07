@@ -128,11 +128,12 @@ public:
     /* THE CHECKPOINT'S QUANTISATION, IMPORTED WEIGHT BY WEIGHT, or None. Read from
      * quantization_config at open: AutoRound's `auto_round:auto_gptq` export and GPTQ's own (v1,
      * the zero point stored less one) are Gptq; Quark's MXFP4 (fp4 weights, per_group 32, e8m0
-     * scales, no per-layer overrides) is QuarkMx. A quantisation of one of those tools in a form
+     * scales, no per-layer overrides) is QuarkMx; ParoQuant's MXFP4 (`paroquant_mxfp4`: Quark's
+     * codes and exponents in a ROTATED basis, with the rotations beside them) is ParoMx. A quantisation of one of those tools in a form
      * this does not read stays None, with the reason in import_refusal(). */
     /* Its quantization_config keys are then renamed `imported_quantization_config.*`: they
      * describe the tool, not a served format, and a plugin reads the latter there. */
-    enum class Import { None, Gptq, QuarkMx };
+    enum class Import { None, Gptq, QuarkMx, ParoMx };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 
@@ -186,6 +187,13 @@ struct CkptWeight {
      * Not trivial -- the rounding means the numbers are not served as shipped -- so the loader
      * refuses one and rad-convert keeps it in `enc`, as it keeps a trivial weight. */
     bool        imported = false;
+    /* PAROQUANT MXFP4, IMPORTED (Import::ParoMx): `imported` too, so the loader refuses it and
+     * rad-convert writes it plane by plane through ckpt_plane_rows. Planes 0 and 1 are Quark's
+     * codes and exponents byte for byte; the rest are the "givens" transform's tables, built here
+     * from `pq_pairs`/`pq_theta`/`pq_scale`, one set per piece (a piece is a row PART: gate and up,
+     * or q, k and v, each rotated on its own). */
+    bool        paro = false;
+    std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale;
     RadEncoding enc{};
     std::string why;
 };

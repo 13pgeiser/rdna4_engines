@@ -73,6 +73,12 @@
  *              [S x cols] lists stage s's pairs as (pairs[s][2p], pairs[s][2p+1]), TABLE "t.angle"
  *              f32 [S x cols/2] their angles, and a row vector's pair (a, b) at angle t becomes
  *              (a cos t + b sin t, b cos t - a sin t). ParoQuant's scaled pairwise rotation.
+ *              A weight whose row PARTS were rotated independently (a fused gate_up, a fused
+ *              q|k|v: each projection has its own rotation) carries P parts: TABLE "t.part" i32
+ *              [1 x P] holds the END ROW (exclusive) of each part, and the other tables stack the
+ *              parts in order -- t.pairs and t.angle S rows a part (P*S rows), t.scale one row a
+ *              part (P rows). Without "t.part" the weight is one part. The stages of a part are
+ *              applied in table order, and a part's pairs address columns of the whole row.
  *
  * Pure C, header-only, like the rest of abi/.
  */
@@ -213,6 +219,15 @@ static inline int64_t rad_enc_fwht(const RadEncoding* e) {
     return (int64_t)n;
 }
 
+/* The number of independently rotated row parts of a "givens" weight: the width of its "t.part"
+ * table, or 1 without one. 0 when the table is malformed. */
+static inline int64_t rad_enc_givens_parts(const RadEncoding* e) {
+    const int i = rad_enc_find(e, "t.part");
+    if (i < 0) return 1;
+    return e->plane[i].kind == RAD_PLANE_TABLE && e->plane[i].extent[0] == 1 &&
+           e->plane[i].extent[1] >= 1 ? e->plane[i].extent[1] : 0;
+}
+
 /* Byte-for-byte equality, which is what two encodings agreeing means: the strings are
  * zero-padded by construction, so there is nothing a memcmp could see that a reader cannot. */
 static inline int rad_enc_equal(const RadEncoding* a, const RadEncoding* b) {
@@ -329,8 +344,18 @@ static inline int rad_enc_valid(const RadEncoding* e) {
     if (!t[0]) return 1;
     if (!strncmp(t, "fwht", 4)) return rad_enc_fwht(e) > 0;
     if (!strcmp(t, "perm")) return rad_enc_find(e, "t.perm") > 0;
-    if (!strcmp(t, "givens"))
-        return rad_enc_find(e, "t.pairs") > 0 && rad_enc_find(e, "t.angle") > 0;
+    if (!strcmp(t, "givens")) {
+        const int ip = rad_enc_find(e, "t.pairs"), ia = rad_enc_find(e, "t.angle");
+        const int is = rad_enc_find(e, "t.scale");
+        const int64_t np = rad_enc_givens_parts(e);
+        if (ip <= 0 || ia <= 0 || np < 1) return 0;
+        if (e->plane[ip].kind != RAD_PLANE_TABLE || e->plane[ia].kind != RAD_PLANE_TABLE) return 0;
+        if (e->plane[ip].extent[0] % np || e->plane[ia].extent[0] != e->plane[ip].extent[0]) return 0;
+        if (e->plane[ia].extent[1] * 2 != e->plane[ip].extent[1]) return 0;
+        if (is > 0 && (e->plane[is].kind != RAD_PLANE_TABLE || e->plane[is].extent[0] != np ||
+                       e->plane[is].extent[1] != e->plane[ip].extent[1])) return 0;
+        return 1;
+    }
     return 0;
 }
 

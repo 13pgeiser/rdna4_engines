@@ -8,6 +8,7 @@
  */
 #include "rad_test.h"
 #include "format/checkpoint.h"
+#include "format/encoding.h"
 #include "rad_plugin.h"
 
 #include <cmath>
@@ -683,4 +684,153 @@ TEST(the_index_decides_which_shard_a_tensor_is_read_from) {
                            "model.safetensors.index.json" })
         std::remove((dir + "/" + f).c_str());
     ::rmdir(dir.c_str());
+}
+
+/* PAROQUANT MXFP4 is Quark's codes and exponents in a rotated basis plus the rotations: each
+ * projection's pairs (group-local int16), theta and channel scales. Gate and up are two PARTS of
+ * the fused weight, and the tables must say so: pairs made whole-row, angles widened, the channel
+ * scale inverted, the part ends. Decoding the planes through the core must then give a weight
+ * that, rotated forward again, is the codes the checkpoint shipped. */
+TEST(a_paroquant_mxfp4_weight_carries_its_rotations_as_parts) {
+    const int64_t K = 128, S = 2;
+    uint32_t rng = 12345;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    auto codes = [&](const std::string& n, int64_t N) {
+        T t{ n, "U8", { N, K / 2 }, {} };
+        for (int64_t i = 0; i < N * K / 2; ++i) t.bytes.push_back((uint8_t)(next() & 0xff));
+        return t;
+    };
+    auto exps = [&](const std::string& n, int64_t N) {
+        T t{ n, "U8", { N, K / 32 }, {} };
+        for (int64_t i = 0; i < N * K / 32; ++i) t.bytes.push_back((uint8_t)(122 + next() % 5));
+        return t;
+    };
+    auto pairs = [&](const std::string& n) {
+        T t{ n, "I16", { S, K }, {} };
+        for (int64_t s = 0; s < S; ++s) {
+            std::vector<int16_t> perm((size_t)K);
+            for (int64_t i = 0; i < K; ++i) perm[(size_t)i] = (int16_t)i;
+            for (int64_t i = K - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[next() % (i + 1)]);
+            for (int64_t i = 0; i < K; ++i) {
+                t.bytes.push_back((uint8_t)(perm[(size_t)i] & 0xff));
+                t.bytes.push_back((uint8_t)(perm[(size_t)i] >> 8));
+            }
+        }
+        return t;
+    };
+    auto f16s = [&](const std::string& n, std::vector<int64_t> shape, float lo, float hi) {
+        T t{ n, "F16", shape, {} };
+        int64_t cnt = 1;
+        for (int64_t d : shape) cnt *= d;
+        for (int64_t i = 0; i < cnt; ++i) {
+            const float f = lo + (hi - lo) * (float)(next() % 1000) / 1000.0f;
+            const uint16_t h = rad_f32_to_f16(f);
+            t.bytes.push_back((uint8_t)(h & 0xff));
+            t.bytes.push_back((uint8_t)(h >> 8));
+        }
+        return t;
+    };
+    const T gw = codes("g.weight", 16), gs = exps("g.weight_scale", 16), gp = pairs("g.pairs"),
+            gt = f16s("g.theta", { S, K / 2 }, -3.0f, 3.0f), gc = f16s("g.channel_scales", { 1, K }, 0.5f, 2.0f);
+    const T uw = codes("u.weight", 16), us = exps("u.weight_scale", 16), up = pairs("u.pairs"),
+            ut = f16s("u.theta", { S, K / 2 }, -3.0f, 3.0f), uc = f16s("u.channel_scales", { 1, K }, 0.5f, 2.0f);
+    // a per-row fp8 head beside them: weight_scale is one f32 a row
+    T hs{ "h.weight_scale", "F32", { 4 }, {} };
+    for (int i = 0; i < 4; ++i) { float f = 0.25f * (float)(i + 1); hs.bytes.resize(hs.bytes.size() + 4); std::memcpy(hs.bytes.data() + 4 * i, &f, 4); }
+    const std::string dir = write_checkpoint(
+        { gw, gs, gp, gt, gc, uw, us, up, ut, uc, fp8("h.weight", { 4, 8 }), hs },
+        "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"paroquant_mxfp4\","
+        "\"format\":\"mxfp4\",\"bits\":4,\"group_size\":128,\"mxfp4_block\":32,\"krot\":2}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ParoMx);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g.weight", "u.weight" }));
+    prog.name_map.push_back(map("h", RAD_MAP_COPY, { "h.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.paro);
+    CHECK(w.imported && !w.trivial);
+    REQUIRE(rad_enc_valid(&w.enc));
+    CHECK_EQ(std::string(w.enc.transform), std::string("givens"));
+    CHECK_EQ(rad_enc_givens_parts(&w.enc), (int64_t)2);
+    CHECK_EQ(w.rows, (int64_t)32);
+    REQUIRE_EQ(w.enc.n_planes, 6);
+
+    std::vector<std::vector<uint8_t>> pl((size_t)w.enc.n_planes);
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
+        pl[(size_t)k].resize((size_t)(pr * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)));
+        REQUIRE_EQ(ckpt_plane_rows(w, k, 0, pr, pl[(size_t)k].data(), &why), RAD_OK);
+    }
+    // codes and exponents are the checkpoint's bytes, joined
+    CHECK_EQ(std::memcmp(pl[0].data(), gw.bytes.data(), gw.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(pl[0].data() + gw.bytes.size(), uw.bytes.data(), uw.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(pl[1].data() + gs.bytes.size(), us.bytes.data(), us.bytes.size()), 0);
+    const int32_t* tp = (const int32_t*)pl[2].data();
+    const float* ta = (const float*)pl[3].data();
+    const float* tsc = (const float*)pl[4].data();
+    const int32_t* tpart = (const int32_t*)pl[5].data();
+    CHECK_EQ(tpart[0], 16);
+    CHECK_EQ(tpart[1], 32);
+    for (int64_t c = 0; c < K; ++c) {
+        CHECK_EQ(tp[c], (int32_t)(*(const int16_t*)(gp.bytes.data() + 2 * c)));             // part 0, stage 0
+        CHECK_EQ(tp[(S + 1) * K + c], (int32_t)(*(const int16_t*)(up.bytes.data() + 2 * (K + c))));  // part 1, stage 1
+        const uint16_t h = *(const uint16_t*)(gc.bytes.data() + 2 * c);
+        CHECK(std::fabs(tsc[c] - 1.0f / rad_f16_to_f32(h)) < 1e-6f);
+    }
+    CHECK(std::fabs(ta[0] - rad_f16_to_f32(*(const uint16_t*)gt.bytes.data())) == 0.0f);
+
+    // decode, rotate forward again with the checkpoint's own convention, compare to the codes
+    const void* data[6];
+    for (int k = 0; k < 6; ++k) data[k] = pl[(size_t)k].data();
+    EncodedView v;
+    enc_view(w.enc, w.rows, w.cols, data, &v);
+    std::vector<float> dec((size_t)(w.rows * K));
+    REQUIRE_EQ(enc_decode_rows(v, 0, w.rows, dec.data(), &why), RAD_OK);
+    const T* cw[2] = { &gw, &uw };
+    const T* es[2] = { &gs, &us };
+    const T* pp[2] = { &gp, &up };
+    const T* th[2] = { &gt, &ut };
+    const T* cc[2] = { &gc, &uc };
+    double worst = 0;
+    for (int64_t r = 0; r < w.rows; ++r) {
+        const int part = r >= 16, rr = r - 16 * part;
+        std::vector<double> x((size_t)K);
+        for (int64_t k = 0; k < K; ++k)
+            x[(size_t)k] = (double)dec[(size_t)(r * K + k)] *
+                           (1.0 / rad_f16_to_f32(*(const uint16_t*)(cc[part]->bytes.data() + 2 * k)));
+        for (int64_t s = 0; s < S; ++s)
+            for (int64_t p = 0; p < K / 2; ++p) {
+                const int16_t* pv = (const int16_t*)pp[part]->bytes.data();
+                const int64_t a = pv[s * K + 2 * p], b = pv[s * K + 2 * p + 1];
+                const double t = rad_f16_to_f32(*(const uint16_t*)(th[part]->bytes.data() + 2 * (s * (K / 2) + p)));
+                const double c = std::cos(t), sn = std::sin(t);
+                const double xa = x[(size_t)a], xb = x[(size_t)b];
+                x[(size_t)a] = xa * c + xb * sn;
+                x[(size_t)b] = xb * c - xa * sn;
+            }
+        for (int64_t k = 0; k < K; ++k) {
+            const uint8_t bt = cw[part]->bytes[(size_t)(rr * K / 2 + k / 2)];
+            const float code = rad_fp4e2m1_to_f32((uint8_t)(k % 2 ? bt >> 4 : bt & 15));
+            const float sc = std::ldexp(1.0f, (int)es[part]->bytes[(size_t)(rr * K / 32 + k / 32)] - 127);
+            worst = std::max(worst, std::fabs(x[(size_t)k] - (double)code * sc));
+        }
+    }
+    CHECK(worst < 1e-4);
+
+    // the per-row fp8 head: one f32 scale a row, read as [N, 1]
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "h", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)0);
+    std::vector<float> f(4 * 8);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 4, f.data(), &why), RAD_OK);
+    for (int r = 0; r < 4; ++r) {
+        const float q = rad_load_f32(fp8("h.weight", { 4, 8 }).bytes.data(), RAD_F8E4M3, r * 8);
+        CHECK_EQ(f[(size_t)(r * 8)], q * 0.25f * (float)(r + 1));
+    }
+    remove_checkpoint(dir);
 }

@@ -433,6 +433,52 @@ TEST(a_givens_transform_with_channel_scales_inverts) {
     for (int k = 0; k < K; ++k) CHECK(std::fabs(out[k] - w[k]) < 1e-5f);
 }
 
+TEST(a_givens_weight_with_two_parts_undoes_each_rows_own_rotation) {
+    /* Two rows over 4 columns, each its own PART (row 0 ends part 0, row 1 ends part 1): the
+     * tables stack part-major, t.scale has a row a part, and decoding row r reads its part's. */
+    const int K = 4;
+    const float w[2][4] = { { 1.0f, -2.0f, 0.5f, 3.0f }, { -0.25f, 1.5f, 2.0f, -1.0f } };
+    const float dsc[2][4] = { { 2.0f, 0.5f, 1.0f, 4.0f }, { 1.0f, 3.0f, 0.25f, 2.0f } };
+    const int32_t pairs[2][4] = { { 0, 1, 2, 3 }, { 0, 3, 1, 2 } };       /* one stage a part */
+    const float ang[2][2] = { { 0.3f, -1.1f }, { 0.9f, 2.2f } };
+    const int32_t end[2] = { 1, 2 };
+    float vq[2][4];
+    for (int r = 0; r < 2; ++r) {
+        double x[4];
+        for (int k = 0; k < K; ++k) x[k] = (double)w[r][k] * dsc[r][k];
+        for (int p = 0; p < 2; ++p) {
+            const int a = pairs[r][2 * p], b = pairs[r][2 * p + 1];
+            const double c = std::cos((double)ang[r][p]), sn = std::sin((double)ang[r][p]);
+            const double xa = x[a], xb = x[b];
+            x[a] = xa * c + xb * sn;
+            x[b] = xb * c - xa * sn;
+        }
+        for (int k = 0; k < K; ++k) vq[r][k] = (float)x[k];
+    }
+    RadEncoding e = rad_enc_plain(RAD_F32);
+    rad_enc_copy_str(e.scheme, "affine");
+    rad_enc_add_plane(&e, "scale", RAD_F32, 0, 0);
+    rad_enc_add_table(&e, "t.pairs", RAD_I32, 2, 4);
+    rad_enc_add_table(&e, "t.angle", RAD_F32, 2, 2);
+    rad_enc_add_table(&e, "t.scale", RAD_F32, 2, 4);
+    rad_enc_add_table(&e, "t.part", RAD_I32, 1, 2);
+    rad_enc_copy_str(e.transform, "givens");
+    REQUIRE(rad_enc_valid(&e));
+    CHECK_EQ(rad_enc_givens_parts(&e), (int64_t)2);
+    const float one = 1.0f;
+    const void* planes[6] = { vq, &one, pairs, ang, dsc, end };
+    EncodedView v;
+    enc_view(e, 2, 4, planes, &v);
+    float out[8];
+    REQUIRE_EQ(enc_decode_rows(v, 0, 2, out), RAD_OK);
+    for (int r = 0; r < 2; ++r)
+        for (int k = 0; k < K; ++k) CHECK(std::fabs(out[r * K + k] - w[r][k]) < 1e-5f);
+    /* a part table that does not stack to the pairs' rows is not well formed */
+    RadEncoding bad = e;
+    bad.plane[bad.n_planes - 1].extent[1] = 3;
+    CHECK(!rad_enc_valid(&bad));
+}
+
 TEST(the_core_declines_a_scheme_it_did_not_define) {
     RadEncoding e;
     rad_enc_clear(&e);
