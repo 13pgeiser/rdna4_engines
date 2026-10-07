@@ -1136,6 +1136,7 @@ for a model that takes no images or video.
 | `GET /health`, `/ping`, `POST /ping` | liveness |
 | `GET /load` | current load |
 | `GET /version` | server version |
+| `GET /props` | llama-server's props for the clients built against it: `n_ctx`, `total_slots`, `modalities`, the request defaults |
 | `GET /server_info` | the whole configuration of the running engine |
 | `GET /metrics` | Prometheus |
 | `POST /tokenize`, `POST /detokenize` | |

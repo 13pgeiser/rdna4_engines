@@ -233,6 +233,53 @@ HttpResponse Server::handle_detokenize(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
+/* ================================================================== /props */
+/* llama-server's /props, for the clients built against it: a front-end that sizes its context
+ * from default_generation_settings.n_ctx, shows an image button when modalities.vision is set,
+ * and reads what a request that sends no sampler fields inherits. /server_info says all of it and
+ * more, but nothing written for llama-server knows to ask there.
+ *
+ * Only what this server can fill honestly, under llama-server's names: no chat template text
+ * (the server holds a compiled template, not its source), no GGUF metadata, no per-slot state.
+ * n_ctx is the context ONE request may use, which is what llama-server's per-slot n_ctx means to
+ * the clients reading it; left out when the server does not know its length. */
+HttpResponse Server::handle_props(const HttpRequest&) {
+    const SamplingParams& sp = opt_.default_sampling;
+    json params;
+    params["n_predict"]          = opt_.default_max_tokens > 0 ? opt_.default_max_tokens : -1;
+    params["temperature"]        = sp.temp;
+    params["top_k"]              = sp.top_k;
+    params["top_p"]              = sp.top_p;
+    params["min_p"]              = sp.min_p;
+    params["typical_p"]          = sp.typical_p;
+    params["repeat_last_n"]      = sp.penalty_last_n;
+    params["repeat_penalty"]     = sp.rep_penalty;
+    params["presence_penalty"]   = sp.pres_penalty;
+    params["frequency_penalty"]  = sp.freq_penalty;
+    params["dry_multiplier"]     = sp.dry_multiplier;
+    params["dry_base"]           = sp.dry_base;
+    params["dry_allowed_length"] = sp.dry_allowed_length;
+    params["dry_penalty_last_n"] = sp.dry_penalty_last_n;
+    params["xtc_probability"]    = sp.xtc_probability;
+    params["xtc_threshold"]      = sp.xtc_threshold;
+
+    json gen;
+    if (opt_.max_ctx > 0) gen["n_ctx"] = opt_.max_ctx;
+    gen["params"] = std::move(params);
+
+    json modal;
+    modal["vision"] = deps_.mm && deps_.mm->accepts(MediaKind::Image);
+    modal["audio"]  = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
+
+    json o;
+    o["default_generation_settings"] = std::move(gen);
+    o["total_slots"] = opt_.max_seqs;
+    o["modalities"]  = std::move(modal);
+    o["build_info"]  = "radiance " + opt_.version;
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
 /* ================================================================== /get_tokenizer_info */
 /* vLLM returns the HuggingFace tokenizer config verbatim, which this engine does not have: a .rad
  * container carries a normalised vocabulary and not the JSON it was built from. So this answers

@@ -191,6 +191,7 @@ private:
     HttpResponse handle_health(const HttpRequest& req);
     HttpResponse handle_ping(const HttpRequest& req);
     HttpResponse handle_version(const HttpRequest& req);
+    HttpResponse handle_props(const HttpRequest& req);
     HttpResponse handle_load(const HttpRequest& req);
     HttpResponse handle_tokenize(const HttpRequest& req);
     HttpResponse handle_detokenize(const HttpRequest& req);

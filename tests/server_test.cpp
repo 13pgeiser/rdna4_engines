@@ -2736,6 +2736,45 @@ TEST(server_info_lists_the_router_rather_than_a_copy_of_it) {
     for (const std::string& sig : f.srv->router().routes()) CHECK(has(r.body, sig));
 }
 
+TEST(props_answers_what_a_llama_server_client_reads) {
+    Fixture f;
+    HttpResponse r = f.get("/props");
+    CHECK_EQ(r.status, 200);
+    const json p = json::parse(r.body);
+    CHECK_EQ(p.value("total_slots", (int64_t)0), (int64_t)4);
+    /* No media pipeline attached: no image button. */
+    CHECK(!p["modalities"].value("vision", true));
+    /* The fixture knows no context length, so none is invented. */
+    CHECK(!p["default_generation_settings"].contains("n_ctx"));
+    /* The same defaults /server_info reports, under llama-server's names. */
+    const json defs = json::parse(f.get("/server_info").body)["request_defaults"];
+    const json params = p["default_generation_settings"]["params"];
+    CHECK_NEAR(params.value("temperature", -1.0), defs.value("temperature", -2.0), 1e-9);
+    CHECK_NEAR(params.value("repeat_penalty", -1.0), defs.value("repetition_penalty", -2.0), 1e-9);
+    CHECK_EQ(params.value("n_predict", (int64_t)0), (int64_t)32);   /* the fixture's default */
+    CHECK(has(p.value("build_info", std::string()), "radiance"));
+}
+
+TEST(props_reports_the_context_one_request_may_use) {
+    /* The fixture with a known length: build one rather than widen the shared Fixture. */
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    FakeChatTemplate tmpl;
+    FakeGrammar gram;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    d.chat = &tmpl;
+    d.grammar = &gram;
+    ServerOptions o;
+    o.model_id = "test-model";
+    o.max_ctx = 262144;
+    Server srv(d, o);
+    const json p = json::parse(srv.router().call("GET", "/props").body);
+    CHECK_EQ(p["default_generation_settings"].value("n_ctx", (int64_t)0), (int64_t)262144);
+    sched.join_all();
+}
+
 TEST(server_info_drops_an_engine_blob_that_is_not_an_object) {
     /* A malformed blob must not corrupt the response: /server_info missing a section beats
      * /server_info being unparseable. */

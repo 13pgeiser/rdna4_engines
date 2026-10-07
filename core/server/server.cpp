@@ -139,6 +139,7 @@ void Server::register_routes() {
     router_.get ("/load",                [this](const HttpRequest& q) { return handle_load(q); });
     router_.get ("/version",             [this](const HttpRequest& q) { return handle_version(q); });
     router_.get ("/server_info",         [this](const HttpRequest& q) { return handle_server_info(q); });
+    router_.get ("/props",               [this](const HttpRequest& q) { return handle_props(q); });
 
     router_.post("/tokenize",            [this](const HttpRequest& q) { return handle_tokenize(q); });
     router_.post("/detokenize",          [this](const HttpRequest& q) { return handle_detokenize(q); });
