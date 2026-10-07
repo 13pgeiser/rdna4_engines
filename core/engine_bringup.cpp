@@ -684,7 +684,9 @@ int Engine::read_metadata() {
     meta_.n_expert_shared = geti("n_expert_shared", 0);
     meta_.rms_eps         = getf("rms_eps", 1e-6);
     meta_.rope_theta      = getf("rope_theta", 10000.0);
-    meta_.rope_scale      = getf("rope_scale", 1.0);
+    /* 1 (abi/rad_builder.h): the rotary's scaling is read with its type from the free-form keys.
+     * An older container's `rope_scale` key holds the factor alone and is not read. */
+    meta_.rope_scale      = 1.0f;
 
     /* A container that says nothing about its own shape is refused HERE, by name, rather than at
      * declare as an "invalid argument" from a plugin that was handed zeros. */
@@ -770,7 +772,6 @@ int Engine::apply_rope_scaling() {
         return RAD_E_INVAL;
     }
     if (spec.kind != RopeSpec::Keep) {
-        const RopeResolved before = rope_resolve(meta_kv_k_, meta_kv_v_, "");
         std::string why;
         if (!rope_override_group(meta_kv_k_, meta_kv_v_, spec, "", meta_.n_ctx_train, &why)) {
             RAD_ERR("--rope-scaling %s: %s", cfg_.rope_scaling.c_str(), why.c_str());
@@ -786,9 +787,6 @@ int Engine::apply_rope_scaling() {
                 return RAD_E_INVAL;
             }
         }
-        /* A converter that read a YaRN factor as the linear rope_scale left it there; with YaRN
-         * taken off it would stay behind as a position divisor. */
-        if (spec.kind == RopeSpec::None && before.type == "yarn") meta_.rope_scale = 1.0f;
     }
 
     const RopeResolved r = rope_resolve(meta_kv_k_, meta_kv_v_, "");
@@ -801,7 +799,8 @@ int Engine::apply_rope_scaling() {
         if (want > reach)
             RAD_WARN("--max-model-len %lld is past the %lld positions YaRN factor %g covers; "
                      "positions beyond them are extrapolated", want, reach, r.factor);
-    } else if (meta_.n_ctx_train > 0 && want > meta_.n_ctx_train && !(meta_.rope_scale > 1.0f)) {
+    } else if (meta_.n_ctx_train > 0 && want > meta_.n_ctx_train &&
+               !(r.type == "linear" && r.factor > 1.0)) {
         RAD_WARN("--max-model-len %lld is past the %lld positions the model was trained on and "
                  "nothing scales its rotary, so positions beyond them are extrapolated; a model "
                  "card's YaRN extension is --rope-scaling yarn:FACTOR (docs/YARN.md)", want,
@@ -1304,59 +1303,96 @@ int Engine::plan() {
          * Only a DERIVED split under expert_tiered is re-split. An operator who stated either pool
          * has decided what every card gets. And under `auto` a rank whose grown pool covers all of
          * its weights would choose all_vram while its peers spill -- one strategy per world is the
-         * contract that keeps their movers alike, so `auto` keeps the common split.
-         * Where every rank costs the same -- every world the heads divide -- no rank qualifies and
-         * rank_cfg_ is cfg_ on every rank, field for field. */
+         * contract that keeps their movers alike, so `auto` keeps the common split. A cache that
+         * does not lend (--deterministic, or a device without virtual memory management) is
+         * re-split all the same: the bytes it would never page are bytes its experts can hold, and
+         * without virtual memory management they are allocated whole.
+         * Where every rank's cache costs the same per token no rank qualifies and rank_cfg_ is cfg_
+         * on every rank, field for field. A rank that qualifies and is not re-split is named with
+         * the reason, once. */
         rank_cfg_.assign(ranks_.size(), cfg_);
         kv_planned_tokens_ = 0;
-        if (vb.derived_kv && vb.derived_weights && vb.lends && cfg_.placement == "expert_tiered" &&
-            facts.size() == ranks_.size() && ranks_.size() > 1) {
-            constexpr int64_t kMiB = (int64_t)1 << 20;
-            int64_t kv_max = 0;
-            for (const VramFacts& f : facts) kv_max = std::max(kv_max, f.kv_ceiling);
+        constexpr int64_t kMiB = (int64_t)1 << 20;
+        int64_t kv_max = 0;
+        for (const VramFacts& f : facts) kv_max = std::max(kv_max, f.kv_ceiling);
+        std::vector<size_t> cheaper;
+        for (size_t i = 0; i < facts.size() && i < ranks_.size(); ++i)
+            if (facts[i].kv_ceiling < kv_max) cheaper.push_back(i);
+        /* Why no cheaper rank is re-split, where the reason holds for the whole world. */
+        std::string kept;
+        std::vector<std::unique_ptr<KVManager>> probes(ranks_.size());
+        int64_t T = -1;
+        if (cheaper.empty()) {
+            /* Every rank's cache costs the same per token: there is nothing to re-split. */
+        } else if (!vb.derived_kv || !vb.derived_weights) {
+            kept = "a stated --vram-kv-mib or --vram-weights-mib is applied to every card";
+        } else if (cfg_.placement != "expert_tiered") {
+            kept = fmt("--placement %s keeps one split for every card; only expert_tiered re-splits",
+                       cfg_.placement.c_str());
+        } else {
             /* THE TOKEN COUNT configure_kv WILL SETTLE ON: every rank's paged tokens in the common
-             * pool, the least of them. Asked of the same plan configure_kv makes. */
-            std::vector<std::unique_ptr<KVManager>> probes(ranks_.size());
-            int64_t T = -1;
+             * pool, the least of them. Asked of the same plan configure_kv makes, against the same
+             * bytes: nothing reserves from a KV pool before its carve. */
             for (size_t i = 0; i < ranks_.size(); ++i) {
                 probes[i] = std::make_unique<KVManager>();
-                if (probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) { T = -1; break; }
+                if (probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) {
+                    kept = fmt("rank %d's KV groups did not plan", ranks_[i]->index);
+                    break;
+                }
                 const int64_t t = probes[i]->paged_tokens(cfg_.vram_kv_mib * kMiB);
                 if (t == KVManager::kUnboundedTokens) continue;
                 if (T < 0 || t < T) T = t;
             }
-            for (size_t i = 0; T > 0 && i < ranks_.size(); ++i) {
-                if (facts[i].kv_ceiling >= kv_max) continue;
-                const int64_t need = probes[i]->pool_mib_for_tokens(T, cfg_.vram_kv_mib);
-                if (need < 0) continue;
-                /* A MARGIN, so that whatever the pool's own alignment costs never makes the re-split
-                 * rank the least: configure_kv names it if it ever does. */
-                const int64_t need_m = std::min(need + 64, cfg_.vram_kv_mib);
-                const int64_t cap = facts[i].statics + expert_vram_floor(wfs[i], 0);
-                const RankSplit rs =
-                    vram_budget_rank_split(cfg_.vram_weights_mib, cfg_.vram_kv_mib, need_m, cap);
-                if (!rs.resplit) continue;
-                rank_cfg_[i].vram_kv_mib      = rs.kv_mib;
-                rank_cfg_[i].vram_weights_mib = rs.weights_mib;
-                kv_planned_tokens_ = T;
-                RAD_INFO("kv: rank %d's cache costs %s at the worst case where its dearest peer's costs "
-                         "%s, so its KV pool pages the common %lld tokens in %lld MiB instead of %lld; "
-                         "its weights pool grows %lld -> %lld MiB (every weight resident wants %s)%s",
-                         ranks_[i]->index, humanb(facts[i].kv_ceiling).c_str(), humanb(kv_max).c_str(),
-                         (long long)T, (long long)rs.kv_mib, (long long)cfg_.vram_kv_mib,
-                         (long long)cfg_.vram_weights_mib, (long long)rs.weights_mib,
-                         humanb(cap).c_str(),
-                         rs.unusable_mib > 0
-                             ? fmt(", and %lld MiB stay unclaimed", (long long)rs.unusable_mib).c_str()
-                             : "");
+            if (kept.empty() && T <= 0)
+                kept = "no rank's cache pages a bounded token count in the common pool";
+        }
+        for (size_t i : cheaper) {
+            const std::string costs =
+                fmt("kv: rank %d's cache costs %s at the worst case where its dearest peer's costs "
+                    "%s", ranks_[i]->index, humanb(facts[i].kv_ceiling).c_str(),
+                    humanb(kv_max).c_str());
+            if (!kept.empty()) {
+                RAD_INFO("%s; its pools stay the common split: %s", costs.c_str(), kept.c_str());
+                continue;
             }
+            /* EXACT, NO MARGIN: paged_split is monotone in the budget, so the least whole MiB that
+             * pages T here pages at least T in configure_kv -- the same plan, the same arithmetic,
+             * a pool whose budget is exactly this many MiB. The pool's own alignment is already
+             * among the plan's fixed costs (a RAD_ALIGN_UNIT a reservation). */
+            const int64_t need = probes[i]->pool_mib_for_tokens(T, cfg_.vram_kv_mib);
+            if (need < 0) {
+                RAD_INFO("%s; its pools stay the common split: it does not page the common %lld "
+                         "tokens in the common %lld MiB", costs.c_str(), (long long)T,
+                         (long long)cfg_.vram_kv_mib);
+                continue;
+            }
+            const int64_t cap = facts[i].statics + expert_vram_floor(wfs[i], 0);
+            const RankSplit rs =
+                vram_budget_rank_split(cfg_.vram_weights_mib, cfg_.vram_kv_mib, need, cap);
+            if (!rs.resplit) {
+                RAD_INFO("%s; its pools stay the common split: it needs all %lld MiB of the common "
+                         "pool to page the common %lld tokens", costs.c_str(),
+                         (long long)cfg_.vram_kv_mib, (long long)T);
+                continue;
+            }
+            rank_cfg_[i].vram_kv_mib      = rs.kv_mib;
+            rank_cfg_[i].vram_weights_mib = rs.weights_mib;
+            kv_planned_tokens_ = T;
+            RAD_INFO("%s, so its KV pool pages the common %lld tokens in %lld MiB instead of %lld; "
+                     "its weights pool grows %lld -> %lld MiB (every weight resident wants %s)%s",
+                     costs.c_str(), (long long)T, (long long)rs.kv_mib, (long long)cfg_.vram_kv_mib,
+                     (long long)cfg_.vram_weights_mib, (long long)rs.weights_mib,
+                     humanb(cap).c_str(),
+                     rs.unusable_mib > 0
+                         ? fmt(", and %lld MiB stay unclaimed", (long long)rs.unusable_mib).c_str()
+                         : "");
         }
     }
 
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
-        /* This rank's own split: cfg_ itself on an even world, its re-split copy otherwise. */
-        const Config& rc = rank_cfg_.size() == ranks_.size() ? rank_cfg_[ri] : cfg_;
+        /* This rank's own split: cfg_ field for field unless the block above re-split it. */
+        const Config& rc = rank_cfg_[ri];
         LogRank lr(r->index);
         /* THE MAIN THREAD RUNS EVERY RANK'S STARTUP, one rank after another, and every allocator
          * reachable from here takes the CURRENT device -- rad_dev_alloc has no device argument.
@@ -1394,6 +1430,16 @@ int Engine::plan() {
         if (cfg_.debug_placement || s < 0)
             fputs(r->plan.report(r->program).c_str(), stderr);
         if (s < 0) return s;
+        /* The slab the planner filled is the pool the mover will fill: one split, read twice. */
+        RAD_TRY(plan_check_weights_pool(r->plan, r->pools.weights().bytes()));
+        /* --host-pool-mib IS ONE NUMBER FOR EVERY RANK, allocated whole by Pools::configure, so a
+         * re-split rank whose grown weights pool took every weight still holds it. Said, because
+         * the `kv: rank N ...` line above reads as if that rank's memory were all accounted for. */
+        if (rc.vram_kv_mib < cfg_.vram_kv_mib && cfg_.host_pool_mib > 0 &&
+            r->plan.totals.bytes[(int)Tier::HostPinned] == 0)
+            RAD_INFO("kv: rank %d's weights all fit its grown weights pool, so its pinned host pool "
+                     "holds no weights; its %lld MiB (--host-pool-mib) stay allocated, as on every "
+                     "rank", r->index, (long long)cfg_.host_pool_mib);
     }
     return RAD_OK;
 }
@@ -2680,23 +2726,25 @@ int Engine::configure_kv() {
      * every rank is capped at the least before any carves. At an even split the cap is what
      * every rank would have carved anyway. */
     int64_t least = -1;
-    size_t least_pos = 0;
     for (size_t i = 0; i < ranks_.size(); ++i) {
         auto& r = ranks_[i];
         LogRank lr(r->index);
         RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
+        /* A RANK plan() RE-SIZED FOR THE COMMON TOKEN COUNT PAGES AT LEAST THAT COUNT, by
+         * construction: its pool is the least whole MiB whose paged split reaches it, asked of the
+         * same plan against the same bytes. Short of it, this rank would set every rank's count
+         * under what its dearest peer pages -- a broken construction, refused by name. */
+        if (rank_cfg_[i].vram_kv_mib < cfg_.vram_kv_mib && t < kv_planned_tokens_) {
+            RAD_ERR("kv: rank %d's KV pool was sized at %lld MiB to page the common %lld tokens "
+                    "and pages %lld: the pool and the plan that sized it disagree", r->index,
+                    (long long)rank_cfg_[i].vram_kv_mib, (long long)kv_planned_tokens_,
+                    (long long)t);
+            return RAD_E_STATE;
+        }
         if (t == KVManager::kUnboundedTokens) continue;   /* holds no cache; limits nobody */
-        if (least < 0 || t < least) { least = t; least_pos = i; }
+        if (least < 0 || t < least) least = t;
     }
-    /* A RANK plan() RE-SIZED FOR THE COMMON TOKEN COUNT MUST NEVER BE THE ONE THAT SETS IT: its pool
-     * was sized, with a margin, to page what its dearest peer pages. If it does bind, every rank
-     * carves fewer tokens than its dearest peer could -- named, because nothing else would show it. */
-    if (least >= 0 && least_pos < rank_cfg_.size() &&
-        rank_cfg_[least_pos].vram_kv_mib < cfg_.vram_kv_mib)
-        RAD_WARN("kv: rank %d's re-sized pool pages %lld tokens and binds every rank (planned for "
-                 "%lld); its margin was short", ranks_[least_pos]->index, (long long)least,
-                 (long long)kv_planned_tokens_);
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the CURRENT device; see plan() */
@@ -2869,16 +2917,20 @@ int Engine::configure_kv() {
                     sc.n_ckpt_slots  = ck_disk_slots;
                     sc.n_block_slots = ((cfg_.prefix_cache_disk_mib << 20)
                                         - ck_disk_slots * ck_slot_bytes) / slot_bytes;
-                    /* THE FINGERPRINT IS WHAT MAKES A PERSISTED STORE SAFE. A cached block is only
-                     * meaningful under the container and layout that produced it; read back under
-                     * another, it is a lossless function of somebody else's weights. */
                     /* THE FINGERPRINT IS WHAT MAKES A PERSISTED STORE SAFE, and it is built from
                      * everything a cached block's bytes actually depend on. Read back under a
-                     * different container, layout or KV width, a block is a lossless function of
-                     * somebody else's weights -- fluent, confident and wrong. There is no cheaper
-                     * check than refusing the whole store, because a block carries no evidence of
-                     * what produced it beyond the tokens it was keyed by. */
+                     * different container, layout, KV width or rotary, a block is a lossless
+                     * function of somebody else's weights -- fluent, confident and wrong. There is
+                     * no cheaper check than refusing the whole store, because a block carries no
+                     * evidence of what produced it beyond the tokens it was keyed by.
+                     *
+                     * The rotary is the RESOLVED one, target and drafter, after --rope-scaling
+                     * (rope_identity): a YaRN container converted from the same checkpoint has the
+                     * same name and shapes as the stock one, and every cached key and QSA block key
+                     * is rotated differently under it. */
                     {
+                        char theta[32];
+                        std::snprintf(theta, sizeof theta, "%.9g", (double)meta_.rope_theta);
                         const std::string id =
                             std::string(meta_.name ? meta_.name : "") + "|" +
                             std::string(meta_.arch_id ? meta_.arch_id : "") + "|" +
@@ -2887,10 +2939,7 @@ int Engine::configure_kv() {
                             std::to_string(slot_bytes) + "|" + std::to_string(ck_slot_bytes) + "|" +
                             cfg_.kv_cache_dtype + "|" +
                             std::to_string((long long)ranks_.size()) + "|" + RAD_VERSION +
-                            /* --rope-scaling rotates every cached key differently. Appended only
-                             * when given, so a store written without it keeps its fingerprint. */
-                            (cfg_.rope_scaling.empty() ? std::string()
-                                                       : "|rope=" + cfg_.rope_scaling);
+                            "|theta=" + theta + "|" + rope_identity(meta_kv_k_, meta_kv_v_);
                         uint64_t h = 1469598103934665603ull;
                         for (char c : id) { h ^= (unsigned char)c; h *= 1099511628211ull; }
                         sc.fingerprint = h;
@@ -3491,7 +3540,8 @@ int Engine::start() {
     const int64_t MiB = 1024 * 1024;
     const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * MiB;
     const int64_t allowance = Config{}.gpu_headroom_mib * MiB;
-    for (auto& r : ranks_) {
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+        auto& r = ranks_[ri];
         LogRank lr(r->index);
         RadDeviceProps props{};
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
@@ -3534,8 +3584,19 @@ int Engine::start() {
              * byte -- a small dense model already at the largest context its cache can hold
              * leaves most of the card -- and vram_budget.cpp printed it on the `unusable` line.
              * Warning here would contradict that receipt and send the reader looking for a flag
-             * to set. */
-            if (cfg_.vram_budget_derived)
+             * to set. A rank plan() re-split for the common token count also leaves what its
+             * weights could not use, and the `kv: rank N ...` line said how much. */
+            const int64_t unclaimed_mib =
+                (cfg_.vram_weights_mib + cfg_.vram_kv_mib) -
+                (rank_cfg_[ri].vram_weights_mib + rank_cfg_[ri].vram_kv_mib);
+            if (cfg_.vram_budget_derived && unclaimed_mib > 0)
+                RAD_INFO("card %d settled at %s free against %s. The split accounted for it: %lld "
+                         "MiB are what rank %d's weights could not use of what its KV pool did not "
+                         "need, on the `kv: rank %d ...` line above, and the rest is the `unusable` "
+                         "line of the VRAM budget.",
+                         r->device, humanb(got).c_str(), asked.c_str(), (long long)unclaimed_mib,
+                         r->index, r->index);
+            else if (cfg_.vram_budget_derived)
                 RAD_INFO("card %d settled at %s free against %s. The split accounted for it: "
                          "neither pool could address another byte, which is the `unusable` line of "
                          "the VRAM budget above.",

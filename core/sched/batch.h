@@ -73,6 +73,10 @@ struct StepEntry {
     bool    draft_out = false;
     bool    is_prefill = false;
     bool    produces_token = false;   /* this entry's last token is the sequence's last */
+    /* ITS DRAFTS CAME FROM PROMPT LOOKUP, not from the declared drafter. Their outcome is counted
+     * in the reported acceptance like any other, and kept out of the adaptive window's estimate,
+     * which describes the draft head (DraftController, draft.h). */
+    bool    ngram = false;
     /* A DEVICE ROW: the card fills its tokens, positions, rollback count and slots from the slot's
      * StepSlot before the pass runs (advance.h), and what the host staged for them is replaced.
      * `ctx_len` is then an upper bound, which is what the host-side ceilings read. The other three

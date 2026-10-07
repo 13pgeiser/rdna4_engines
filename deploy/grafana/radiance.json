@@ -1751,7 +1751,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Mean draft window the adaptive policy gives the running sequences; a gap while none runs. Only while RADIANCE_DRAFT_ADAPT is on; no data otherwise.",
+      "description": "Mean draft window the adaptive policy gives the running sequences; a gap while none runs. Only under --draft-window adaptive; no data otherwise.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1806,7 +1806,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Share of verifies by the number of drafts they carried, under the adaptive window. Only while RADIANCE_DRAFT_ADAPT is on; no data otherwise.",
+      "description": "Share of verifies by the number of drafts they carried, under the adaptive window. Only under --draft-window adaptive; no data otherwise.",
       "gridPos": {
         "h": 8,
         "w": 12,

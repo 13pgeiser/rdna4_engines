@@ -12,6 +12,7 @@
 #include "format/tunecache.h"
 #include "format/imatrix.h"
 #include "format/safetensors.h"
+#include "format/checkpoint.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -1899,6 +1900,62 @@ TEST(a_legacy_entry_count_that_is_not_one_is_refused) {
     ImatrixFile im;
     CHECK_EQ(im.open(path), RAD_E_FORMAT);
     std::remove(path.c_str());
+}
+
+/* A GGUF's rotary scaling arrives as the config.json keys the architecture reads, type and all,
+ * and never as a bare factor in RadModelMeta::rope_scale. A YaRN modifier config.json has no
+ * spelling for is refused. */
+TEST(a_gguf_rotary_scaling_becomes_the_config_keys_with_its_type) {
+    auto meta = [](const std::vector<GgufKv>& extra, const char* leaf, MetaOwn* out) -> int {
+        std::vector<GgufKv> kvs = { { "general.architecture", 8, 0, "llama" },
+                                    { "llama.block_count", 4, 2, "" } };
+        kvs.insert(kvs.end(), extra.begin(), extra.end());
+        GgufFile g;
+        if (g.open(write_bin(leaf, gguf_bytes({}, kvs)).c_str()) != RAD_OK) return RAD_E_IO;
+        return meta_from_gguf(g, out);
+    };
+    {
+        MetaOwn m;
+        CHECK_OK(meta({ { "llama.rope.scaling.type", 8, 0, "yarn" },
+                        { "llama.rope.scaling.factor", 12, 4, "" },
+                        { "llama.rope.scaling.original_context_length", 4, 32768, "" } },
+                      "yarn.gguf", &m));
+        CHECK_EQ(m.m.rope_scale, 1.0f);
+        REQUIRE(m.get("rope_scaling.type"));
+        CHECK_EQ(std::string(m.get("rope_scaling.type")), std::string("yarn"));
+        CHECK_EQ(std::string(m.get("rope_scaling.factor")), std::string("4"));
+        CHECK_EQ(std::string(m.get("rope_scaling.original_max_position_embeddings")),
+                 std::string("32768"));
+    }
+    {   /* llama.cpp's default type is linear, and the older key names its factor. */
+        MetaOwn m;
+        CHECK_OK(meta({ { "llama.rope.scale_linear", 12, 2, "" } }, "linear.gguf", &m));
+        CHECK_EQ(std::string(m.get("rope_scaling.type")), std::string("linear"));
+        CHECK_EQ(std::string(m.get("rope_scaling.factor")), std::string("2"));
+        CHECK_EQ(m.m.rope_scale, 1.0f);
+    }
+    {   /* A type the architecture does not implement is carried by name for it to refuse. */
+        MetaOwn m;
+        CHECK_OK(meta({ { "llama.rope.scaling.type", 8, 0, "longrope" },
+                        { "llama.rope.scaling.factor", 12, 4, "" } }, "longrope.gguf", &m));
+        CHECK_EQ(std::string(m.get("rope_scaling.type")), std::string("longrope"));
+    }
+    {
+        MetaOwn m;
+        CHECK_OK(meta({ { "llama.rope.scaling.type", 8, 0, "none" },
+                        { "llama.rope.scaling.factor", 12, 4, "" } }, "none.gguf", &m));
+        CHECK(!m.get("rope_scaling.type"));
+        MetaOwn n;
+        CHECK_OK(meta({}, "plain.gguf", &n));
+        CHECK(!n.get("rope_scaling.type"));
+    }
+    {
+        MetaOwn m;
+        CHECK_EQ(meta({ { "llama.rope.scaling.type", 8, 0, "yarn" },
+                        { "llama.rope.scaling.factor", 12, 4, "" },
+                        { "llama.rope.scaling.attn_factor", 12, 2, "" } }, "attn.gguf", &m),
+                 RAD_E_UNSUPPORTED);
+    }
 }
 
 TEST(a_gguf_version_this_reader_does_not_know_is_refused) {

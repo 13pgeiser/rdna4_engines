@@ -117,9 +117,11 @@ grep -E "passed|failed" "$W/logs/kbench.log" | tail -3
 say "4. the installed rad-kbench replays the fixture from the out-of-tree home: $(ls "$HH/kernels" | tr '\n' ' ')"
 
 # 5. The device library's machine code, against the tree's, object by object. A code object also
-# carries its compilation unit's ID, which clang hashes from the command line and the output path,
-# so two builds of one source never agree byte for byte; their instructions (.text) and kernel
-# descriptors do, unless the flags that reach the device compiler differ.
+# carries its compilation unit's ID, which rad_add_plugin names from the plugin and the source's
+# path inside it rather than leaving clang to hash the build directory into it
+# (cmake/RadAddPlugin.cmake) -- so the instructions (.text), the kernel descriptors and the rest of
+# the read-only data agree between the two builds wherever each was made, unless the flags that
+# reach the device compiler differ.
 #
 # THE DESCRIPTORS ARE COMPARED BY NAME, NOT AS .rodata's BYTES. The compiler lays them out in an
 # order that changes from one run of the same command to the next -- ROCm 7's clang does it to the

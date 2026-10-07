@@ -652,19 +652,22 @@ void r4d_moe_gemm_pin_prefill(int form);
 // every class's K a multiple of 256, a format that folds scale groups). The two are bit-identical,
 // and r4d_selftest compares their bytes.
 void r4d_moe_gemm_pin_fk(int pin);
-// THE PREFILL MoE FORMS (R4D_MOE_PF2), pinned for a test: below zero the switch's rule, otherwise
-// the value the switch would hold -- 0 none, 1 every part, else a mask of the parts (r4d_moe.hip
-// lists them). Every part is bit-identical to the form it replaces, and r4d_selftest compares their
-// bytes: moe_gather and moe_scatter at a prefill chunk, and the GEMM's run-aligned form.
-void r4d_moe_pf2_pin(int pin);
-// The parts the launches since the last call took, under a pin, as R4D_MOE_PF2's mask; cleared by
-// the call. A test reads it to know a part's kernel ran rather than the default's.
-uint32_t r4d_moe_pf2_used(void);
-// THE SORTED OPERAND'S DECODE KERNEL, pinned for a test: 0 is R4D_MOE_DOWN2's rule (and
-// R4D_MOE_DOWN2_G's), -1 the (tile, run) form, n > 0 moe_down_dec_kernel at n column tiles a block.
-// Inside the decode form only, which r4d_moe_gemm_pin_prefill(2) pins. Bit-identical, and
-// r4d_selftest compares their bytes.
-void r4d_moe_gemm_pin_down2(int pin);
+// THE RUN-ALIGNED FORM'S COLUMN TILE, pinned for a test: 0 is the launcher's shape rule (the down
+// projection's 256-column tile wherever the sorted operand, one part, a w4 weight and every class's
+// width allow it), 1 never that tile, 2 that tile -- refused where the shape cannot take it or the
+// launch is not the aligned form. Bit-identical, and r4d_selftest compares their bytes.
+void r4d_moe_gemm_pin_down_tile(int pin);
+// THE GATHER'S FORM, pinned for a test: 0 is the launcher's rule, 1 a column a thread
+// (gather_kernel), 2 a wave a token and sixteen bytes a lane (gather_wide_kernel), refused on a
+// shape it cannot take. Bit-identical, and r4d_selftest compares their bytes.
+void r4d_moe_gather_pin_form(int form);
+// THE SORTED OPERAND'S DECODE KERNEL, pinned for a test: 0 is the launcher's rule
+// (moe_down_dec_kernel on the sorted operand, one part, at most 512 experts, at a column-tile count
+// set by the routed rows -- kMoeDownDecG2Rows), -1 the (tile, run) form, n > 0 moe_down_dec_kernel
+// at n column tiles a block, capped at 16 and refused on a shape the kernel does not serve. Inside
+// the decode form only, which r4d_moe_gemm_pin_prefill(2) pins. Bit-identical, and r4d_selftest
+// compares their bytes.
+void r4d_moe_gemm_pin_down_dec(int pin);
 // THE GATED RESIDUAL READ'S PREFILL TILE, pinned for a test: 0 is the launcher's rule, 1 the decode
 // tiles' kernels at 128 rows (hc_down_tiled, then hc_up_tiled into `ubuf` and hc_mix), 2 the wide
 // kernels (which then refuse a shape they are not built for), 3 the PF2 kernels the rule takes from

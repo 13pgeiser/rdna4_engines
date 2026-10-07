@@ -987,3 +987,105 @@ AVX_KERNEL(rope_table) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ qsa_block_key */
+/* QSA's compressed key (docs/OPS.md): a block's `ratio` rows of k averaged in f32 and rounded to
+ * k's dtype, RMS-normed with gain (wadd + w), then NeoX-rotated over `rotary_dim` at the block's
+ * position, YaRN included. libref's arithmetic in libref's order; what differs is that the angles
+ * of a block come from one `angles` table, and the inverse frequencies are built once a launch. */
+AVX_KERNEL(qsa_block_key) {
+    const RadTensor* k = rad_arg_in(a, 0);
+    const RadTensor* w = rad_arg_in(a, 1);
+    const RadTensor* page = rad_arg_in(a, 2);
+    const RadTensor* pos = rad_arg_in(a, 3);
+    const RadTensor* out = rad_arg_in(a, 4);
+    if (!k || !w || !out) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t rot = p_int(a, "rotary_dim", 0), pos0 = p_int(a, "pos0", -1);
+    if (n <= 0 || ratio <= 0 || (pos0 < 0 && !pos)) return RAD_E_INVAL;
+    if (rot < 0 || rot > n || (rot & 1) || rot / 2 > 512) return RAD_E_SHAPE;
+    if (p_int(a, "block_size", ratio) != ratio) return RAD_E_SHAPE;
+    if (k->rank != 2 || out->rank < 2 || out->shape[0] < 1) return RAD_E_SHAPE;
+    const int64_t M = page ? numel(page) : out->shape[0];
+    if (M < 1 || numel(out) / out->shape[0] != n) return RAD_E_SHAPE;
+    if (k->shape[0] != M * ratio || k->shape[1] != n || numel(w) < n) return RAD_E_SHAPE;
+    const bool pos2 = pos && pos->rank == 2;
+    if (pos && (pos2 ? pos->shape[0] < M : numel(pos) < M)) return RAD_E_SHAPE;
+
+    const float eps = p_f32(a, "eps", 1e-6f), wadd = p_f32(a, "wadd", 1.0f);
+    const float theta = p_f32(a, "theta", 10000.0f), rscale = p_f32(a, "scale", 1.0f);
+    static const char* kModes[] = { "neox", "mrope", "imrope" };
+    const int mi = p_enum(a, "mode", kModes, 3, 0);
+    if (mi < 0) return RAD_E_UNSUPPORTED;
+    int64_t sec[3] = {};
+    int n_sec = 0;
+    for (const char* v = p_str(a, "sections", nullptr); v && *v;) {
+        char* e = nullptr;
+        const long long x = std::strtoll(v, &e, 10);
+        if (e == v) break;
+        if (x <= 0 || n_sec >= 3) return RAD_E_SHAPE;
+        sec[n_sec++] = x;
+        v = e;
+    }
+    /* Several components only with a mode, its sections and three columns of `pos`. */
+    const bool mc = mi != 0 && n_sec > 0 && pos2 && pos->shape[1] >= 3;
+    const RadYarn yarn = rad_yarn_args(a);
+    if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && (rot <= 0 || rscale != 1.0f)))
+        return RAD_E_INVAL;
+    const int64_t half = rot / 2;
+    float* invf = inv_freqs(half, rot, theta);
+    int comp[512] = {};
+    if (mc) {
+        int64_t total = 0;
+        for (int c = 0; c < n_sec; ++c) total += sec[c];
+        if (mi == 1 && total != half) return RAD_E_SHAPE;
+        for (int64_t i = 0; i < half; ++i) {
+            int c = 0;
+            if (mi == 1) {
+                int64_t start = 0;
+                while (c + 1 < n_sec && i >= start + sec[c]) { start += sec[c]; ++c; }
+            } else if (n_sec >= 3) {
+                if (i % 3 == 1 && i < 3 * sec[1]) c = 1;
+                else if (i % 3 == 2 && i < 3 * sec[2]) c = 2;
+            }
+            comp[i] = c;
+        }
+    }
+    for (int64_t i = 0; i < half; ++i) invf[i] = yarn.frequency(invf[i], (int)i);
+    float* gain = (float*)scratch_f32_c((size_t)n);
+    for (int64_t t = 0; t < n; ++t) gain[t] = wadd + ldt(w, offlin(w, t));
+
+    AVX_PARALLEL_FOR_IF(M * ratio * n >= AVX_PAR_MIN)
+    for (int64_t b = 0; b < M; ++b) {
+        const int64_t orow = page ? ldi(page, offlin(page, b)) : b;
+        if (orow < 0) continue;
+        float* y = scratch_f32((size_t)n);
+        float* cs = scratch_f32_b((size_t)(rot > 0 ? rot : 1));
+        double ss = 0.0;
+        for (int64_t t = 0; t < n; ++t) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < ratio; ++j) acc += ldt(k, offlin(k, (b * ratio + j) * n + t));
+            uint64_t tmp = 0;
+            st_elem(&tmp, k->dtype, 0, acc / (float)ratio);
+            y[t] = ld_elem(&tmp, k->dtype, 0);
+            ss += (double)y[t] * y[t];
+        }
+        const float s = 1.0f / std::sqrt((float)(ss / (double)n) + eps);
+        for (int64_t t = 0; t < n; ++t) y[t] = y[t] * s * gain[t];
+        const float div = rscale != 0.0f ? rscale : 1.0f;
+        float pc[3] = {};
+        for (int c = 0; c < (mc ? 3 : 1); ++c)
+            pc[c] = (float)(!pos ? pos0 + b * ratio
+                                 : ldi(pos, offlin(pos, pos2 ? b * pos->shape[1] + c : b))) / div;
+        if (mc) angles_multi(cs, invf, comp, half, pc);
+        else    angles(cs, invf, half, pc[0]);
+        for (int64_t i = 0; i < half; ++i) {
+            const float c = cs[i] * yarn.magnitude, sn = cs[half + i] * yarn.magnitude;
+            const float x0 = y[i], x1 = y[half + i];
+            y[i] = x0 * c - x1 * sn;
+            y[half + i] = x0 * sn + x1 * c;
+        }
+        for (int64_t t = 0; t < n; ++t) stt(out, offlin(out, orow * n + t), y[t]);
+    }
+    return RAD_OK;
+}

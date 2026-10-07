@@ -791,7 +791,7 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.wire_min_bytes = c->tp_wire_min_bytes;
     g.eps       = m->rms_eps;
     g.theta     = m->rope_theta;
-    g.rope_scale= m->rope_scale ? m->rope_scale : 1.0f;
+    g.rope_scale= 1.0f;   /* yarn_from reads the model's rotary scaling */
     g.dtype     = dtype;
     g.act_dtype = act_dtype;
     {
@@ -1025,9 +1025,8 @@ inline RadOperand rope_posmc(const Geom& g, const RadBatch* b, int64_t T) {
  * cannot rotate. */
 inline bool rope_mixed(const RadBatch* b) { return b->rope_pos && b->rope_mixed; }
 
-/* `rope` declared for the geometry's rotary: M-RoPE's mode and sections when the model has them,
- * `mode` otherwise. */
-/* Append only for explicit YaRN, preserving stock op identities and tune keys. */
+/* A rotary op declared with the geometry's YaRN coefficients appended. A model without YaRN declares
+ * exactly the parameters it was given, so its op identities and tune keys are unchanged. */
 inline rad_op decl_rotary(RadBuilder* b, const Geom& g, const char* name,
                           const RadParam* params, int n, const rad_weight* weights, int nw) {
     if (g.yarn.factor == 0.0f) return rad_decl_op(b, name, params, n, weights, nw);
@@ -1039,23 +1038,45 @@ inline rad_op decl_rotary(RadBuilder* b, const Geom& g, const char* name,
     return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
 }
 
-/* Both modern HF rope_parameters and legacy rope_scaling. Nested text_config is
- * authoritative for a multimodal target; the draft has its own independent config. */
+/* THE ONE READER OF A MODEL'S ROTARY SCALING. Every architecture calls it after geom_from, for the
+ * target ("") and for a drafter with a config of its own ("draft."), and it sets `g.rope_scale` and
+ * `g.yarn` from the free-form keys and from nothing else. RadModelMeta::rope_scale is not read: a
+ * factor without its type would be a linear position divide for a scheme that is not one.
+ *
+ * The object read is the first of `text_config.rope_parameters.`, `rope_parameters.`,
+ * `text_config.rope_scaling.`, `rope_scaling.` (a drafter: `draft.rope_parameters.`,
+ * `draft.rope_scaling.`) that names a type in `rope_type` or `type`; a multimodal target's
+ * text_config is authoritative. core/format/rope_override.h writes --rope-scaling into the same
+ * object, found in the same order.
+ *
+ *   default, mrope   no scaling (`mrope` is the legacy Qwen2-VL spelling of default + sections)
+ *   linear           positions divided by `factor`
+ *   yarn             static YaRN: frequencies blended over the correction range that `factor`,
+ *                    `original_max_position_embeddings`, `beta_fast`/`beta_slow` and `truncate`
+ *                    give, cos/sin scaled by `attention_factor` (default 1 + 0.1 ln factor). The
+ *                    factor is the config's, read as vLLM and transformers read it.
+ *
+ * Anything else -- llama3, longrope, dynamic -- is refused by name, as is YaRN's `mscale` form. A
+ * refusal leaves the geometry as it was. */
 inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int64_t rot) {
-    g.yarn = {};
     const std::string root(prefix);
+    const char* who = root.empty() ? "target" : "draft";
     const std::vector<std::string> homes = root.empty()
         ? std::vector<std::string>{"text_config.rope_parameters.", "rope_parameters.",
                                     "text_config.rope_scaling.", "rope_scaling."}
         : std::vector<std::string>{root + "rope_parameters.", root + "rope_scaling."};
-    std::string home;
+    std::string home, type_key;
     const char* type = nullptr;
     for (const auto& h : homes) {
-        type = rad_meta_gets(meta, (h + "rope_type").c_str(),
-                              rad_meta_gets(meta, (h + "type").c_str(), nullptr));
+        for (const char* t : {"rope_type", "type"})
+            if ((type = rad_meta_gets(meta, (h + t).c_str(), nullptr))) { type_key = h + t; break; }
         if (type) { home = h; break; }
     }
-    if (!type || !std::strcmp(type, "default")) return RAD_OK;
+    if (!type || !std::strcmp(type, "default") || !std::strcmp(type, "mrope")) {
+        g.yarn = {};
+        g.rope_scale = 1.0f;
+        return RAD_OK;
+    }
     auto get = [&](const char* key, double fallback) {
         const char* text = rad_meta_gets(meta, (home + key).c_str(), nullptr);
         if (!text) return fallback;
@@ -1067,33 +1088,44 @@ inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int6
     };
     if (!std::strcmp(type, "linear")) {
         const double factor = get("factor", 0.0);
-        if (!std::isfinite(factor) || factor <= 0.0) return RAD_E_INVAL;
         const float scale = (float)factor;
-        if (!std::isfinite(scale) || scale <= 0.0f) return RAD_E_INVAL;
+        if (!std::isfinite(factor) || factor <= 0.0 || !std::isfinite(scale) || scale <= 0.0f) {
+            fprintf(stderr, "radiance: %s linear rotary scaling (%s) needs a finite factor > 0\n",
+                    who, home.c_str());
+            return RAD_E_INVAL;
+        }
+        g.yarn = {};
         g.rope_scale = scale;
         return RAD_OK;
     }
     if (std::strcmp(type, "yarn")) {
-        fprintf(stderr, "radiance: %s rotary type '%s' is unsupported\n", prefix, type);
+        fprintf(stderr, "radiance: %s rotary type '%s' (%s) is not implemented; default, linear "
+                        "and yarn are\n", who, type, type_key.c_str());
         return RAD_E_UNSUPPORTED;
     }
+    /* `truncate` is a JSON boolean, which the converter writes as 1 or 0; true and false spelled
+     * out are the same answer. */
+    double truncate = 1.0;
+    if (const char* t = rad_meta_gets(meta, (home + "truncate").c_str(), nullptr))
+        truncate = !std::strcmp(t, "true") ? 1.0 : !std::strcmp(t, "false") ? 0.0 : get("truncate", 1.0);
     const double factor = get("factor", 0.0), original = get("original_max_position_embeddings", 0.0);
     const double fast = get("beta_fast", 32.0), slow = get("beta_slow", 1.0);
     const double magnitude = get("attention_factor", factor > 1.0 ? 1.0 + 0.1 * std::log(factor) : 1.0);
-    const double truncate = get("truncate", 1.0);
     if (!std::isfinite(factor) || factor < 1.0 || !std::isfinite(original) || original < 1.0 ||
         original != std::floor(original) || (truncate != 0.0 && truncate != 1.0) ||
         !std::isfinite(fast) || !std::isfinite(slow) || slow <= 0.0 || fast < slow ||
         !std::isfinite(magnitude) || magnitude <= 0.0 || !std::isfinite(g.theta) || g.theta <= 1.0f ||
         rot < 2 || (rot & 1)) {
-        fprintf(stderr, "radiance: %s YaRN needs finite factor >= 1, original context > 0, "
-                        "beta_fast >= beta_slow > 0 and attention_factor > 0\n", prefix);
+        fprintf(stderr, "radiance: %s YaRN (%s) needs a finite factor >= 1, an integral "
+                        "original_max_position_embeddings > 0, beta_fast >= beta_slow > 0, "
+                        "attention_factor > 0 and truncate true or false\n", who, home.c_str());
         return RAD_E_INVAL;
     }
     /* mscale variants are a different contract; never silently ignore them. */
     for (const char* k : {"mscale", "mscale_all_dim"})
         if (rad_meta_gets(meta, (home + k).c_str(), nullptr)) {
-            fprintf(stderr, "radiance: %s YaRN %s is unsupported; use attention_factor\n", prefix, k);
+            fprintf(stderr, "radiance: %s YaRN %s%s is not implemented; attention_factor is\n",
+                    who, home.c_str(), k);
             return RAD_E_UNSUPPORTED;
         }
     auto correction = [&](double beta) {
@@ -1102,13 +1134,20 @@ inline int yarn_from(Geom& g, const RadModelMeta* meta, const char* prefix, int6
     };
     double low = correction(fast), high = correction(slow);
     if (truncate != 0.0) { low = std::floor(low); high = std::ceil(high); }
-    g.yarn = {(float)factor, (float)std::max(0.0, low),
-              (float)std::min((double)rot - 1, high), (float)magnitude};
-    if (!rad_yarn_valid(g.yarn)) return RAD_E_INVAL;
+    const RadYarn y = {(float)factor, (float)std::max(0.0, low),
+                       (float)std::min((double)rot - 1, high), (float)magnitude};
+    if (!rad_yarn_valid(y)) {
+        fprintf(stderr, "radiance: %s YaRN (%s) resolves to an empty correction range\n", who,
+                home.c_str());
+        return RAD_E_INVAL;
+    }
+    g.yarn = y;
     g.rope_scale = 1.0f; /* YaRN blends frequencies; it does not divide positions. */
     return RAD_OK;
 }
 
+/* `rope` declared for the geometry's rotary: M-RoPE's mode and sections when the model has them,
+ * `mode` otherwise. */
 inline rad_op decl_rope(RadBuilder* b, const Geom& g, int64_t rows, int64_t head_dim,
                         int64_t n_head, int64_t n_head_kv, int64_t rot, const char* mode) {
     if (g.rope_mc)

@@ -39,6 +39,10 @@ typedef struct RadModelMeta {
 
     float   rms_eps;
     float   rope_theta;
+    /* Always 1. A rotary's scaling is a TYPE with parameters -- linear, YaRN, llama3, longrope --
+     * and it is carried in the free-form keys below (rope_parameters.* / rope_scaling.*, with
+     * text_config.* and draft.* forms), which arch/common/rad_arch.h's yarn_from reads and refuses
+     * by name. A bare factor here would read every scheme as a linear position divide. */
     float   rope_scale;
 
     /* Free-form key/value from the container header, for anything the struct above does not

@@ -2473,9 +2473,9 @@ TEST(each_draft_position_counts_its_acceptances) {
                5.0 / 7.0, 1e-9);
 }
 
-/* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT) IS EXPOSED ONLY WHILE IT IS ON, so a deployment
- * without it scrapes exactly what it always did -- and when it is on, the gauge and the histogram
- * are well-formed families with the labels every other sample carries. */
+/* THE ADAPTIVE DRAFT WINDOW (--draft-window adaptive) IS EXPOSED ONLY WHILE IT IS ON, so a
+ * deployment without it scrapes exactly what it always did -- and when it is on, the gauge and the
+ * histogram are well-formed families with the labels every other sample carries. */
 TEST(the_adaptive_draft_window_is_exposed_only_while_it_is_on) {
     Metrics m("m", 1024);
     server::SchedMetrics s;

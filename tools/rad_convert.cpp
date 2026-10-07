@@ -747,7 +747,6 @@ int main(int argc, char** argv) {
     w.meta_i("n_expert_shared",meta.m.n_expert_shared);
     w.meta_f("rms_eps",        meta.m.rms_eps);
     w.meta_f("rope_theta",     meta.m.rope_theta);
-    w.meta_f("rope_scale",     meta.m.rope_scale);
     for (int i = 0; i < meta.m.n_kv; ++i) w.meta_s(meta.m.kv_key[i], meta.m.kv_val[i]);
     /* THE CONTAINER CARRIES AN ENCODER'S WEIGHTS: what `--mm-max-patches auto` keys on. */
     if (prog.encoder.modalities != 0) w.meta_s("radiance.encoder", prog.encoder_name.c_str());

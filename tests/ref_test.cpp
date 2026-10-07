@@ -22,8 +22,6 @@
 #include "rad_abi.h"
 #include "../libref/ref_common.h"
 #include "rad_sample.h"
-#include "../vendor/nlohmann/json.hpp"
-#include <fstream>
 
 #include <deque>
 #include <string>
@@ -270,7 +268,7 @@ TEST(op_vocabulary) {
         "gated_had_quant_i8",
         "dequant",
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
-        "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope",
+        "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
         "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
         "row_topk_merge", "logit_rerank",
@@ -1781,16 +1779,33 @@ TEST(op_rope) {
     CHECK_EQ(qkv.at(5), 9.0f);
 }
 
-TEST(yarn_rotary_matches_independent_vllm_vectors) {
-    const std::string here = __FILE__;
-    std::ifstream input(here.substr(0, here.find_last_of('/')) + "/data/yarn_reference.json");
-    REQUIRE(input.good());
-    const auto fixture = nlohmann::json::parse(input);
-    const auto positions = fixture["positions"].get<std::vector<int64_t>>();
-    for (const auto& c : fixture["cases"]) {
-        const int rot = c["rot"], half = rot / 2, hd = rot + 16;
-        const double low = rot == 64 ? 14 : (rot == 128 ? 28 : 56);
-        const double high = rot == 64 ? 22 : (rot == 128 ? 43 : 85);
+/* STATIC YaRN, IN DOUBLE: cos and sin of rotary pair i at one position -- the inverse frequency
+ * theta^(-2i/rot), blended toward inv/factor over the linear ramp [low, high] as vLLM's
+ * YaRNScalingRotaryEmbedding blends it, times the magnitude. The bounds are vLLM's correction range
+ * at factor 2 over 262144 trained positions, theta 1e7 (tests/yarn_test.cpp holds yarn_from to the
+ * same integers), so these and the formula are the whole of the vLLM agreement.
+ *
+ * `tol` is what an f32 evaluation may differ by: 8 ulp of the angle (powf, the reciprocal, the blend
+ * and the product each cost about one) plus the rounding of the result. It is a few 1e-5 where the
+ * ramp sits at position 524287 and loose only in the fastest pairs there, which YaRN leaves
+ * unscaled and no f32 rotary places better than its angle's own ulp. */
+struct YarnRef { double c, s, tol; };
+YarnRef yarn_ref(double pos, int i, int rot, double low, double high) {
+    const double theta = 1e7, factor = 2.0, magnitude = 1.0 + 0.1 * std::log(2.0);
+    const double inv  = std::pow(theta, -2.0 * i / rot);
+    const double ramp = std::min(1.0, std::max(0.0, (i - low) / (high == low ? 0.001 : high - low)));
+    const double a    = pos * (inv / factor * ramp + inv * (1.0 - ramp));
+    return { std::cos(a) * magnitude, std::sin(a) * magnitude,
+             magnitude * (std::fabs(a) * 0x1p-20 + 0x1p-21) };
+}
+
+TEST(yarn_rotary_matches_a_double_yarn_through_524287) {
+    const std::vector<int64_t> positions = { 0, 1, 4096, 262143, 262144, 500000, 524287 };
+    const double magnitude = 1.0 + 0.1 * std::log(2.0);
+    const struct { int rot; double low, high; } cases[] = { { 64, 14, 22 }, { 128, 28, 43 },
+                                                            { 256, 56, 85 } };
+    for (const auto& c : cases) {
+        const int rot = c.rot, half = rot / 2, hd = rot + 16;
         T pos(RAD_I32, {(int64_t)positions.size()}); pos.n(positions);
         T qkv(RAD_F32, {(int64_t)positions.size(), hd * 3});
         std::vector<float> values(positions.size() * hd * 3, 9.0f);
@@ -1800,20 +1815,19 @@ TEST(yarn_rotary_matches_independent_vllm_vectors) {
         qkv.f(values);
         A direct; direct.t(qkv).t(pos).i("M", positions.size()).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 1)
             .i("rotary_dim", rot).d("theta", 1e7).d("scale", 1).s("mode", "neox")
-            .d("yarn_factor", 2).d("yarn_low", low).d("yarn_high", high).d("yarn_magnitude", c["magnitude"]);
+            .d("yarn_factor", 2).d("yarn_low", c.low).d("yarn_high", c.high).d("yarn_magnitude", magnitude);
         CHECK_OK(run("rope", direct));
         /* The table is position-addressed. Allocate its real extent, not a compact stand-in. */
         T table(RAD_F32, {524288, rot});
         A ta; ta.t(pos).t(table).i("M", positions.size()).i("rot", rot).d("theta", 1e7).d("scale", 1).s("dtype", "f32")
-            .d("yarn_factor", 2).d("yarn_low", low).d("yarn_high", high).d("yarn_magnitude", c["magnitude"]);
+            .d("yarn_factor", 2).d("yarn_low", c.low).d("yarn_high", c.high).d("yarn_magnitude", magnitude);
         CHECK_OK(run("rope_table", ta));
         for (size_t m = 0; m < positions.size(); ++m) {
             for (int i = 0; i < half; ++i) {
-                const float cosine = c["cos"][m][i], sine = c["sin"][m][i];
-                /* FP32 libm/pow versus torch; at long positions an inverse-frequency ULP
-                 * is amplified into the phase. Bound the actual absolute cosine error. */
-                CHECK_NEAR(qkv.at(m * hd * 3 + i), cosine, 0.004);
-                CHECK_NEAR(qkv.at(m * hd * 3 + half + i), sine, 0.004);
+                const YarnRef y = yarn_ref((double)positions[m], i, rot, c.low, c.high);
+                /* A unit pair (1, 0) rotated is (cos, sin). */
+                CHECK_NEAR(qkv.at(m * hd * 3 + i), y.c, y.tol);
+                CHECK_NEAR(qkv.at(m * hd * 3 + half + i), y.s, y.tol);
                 CHECK_EQ(table.at(positions[m] * rot + i), qkv.at(m * hd * 3 + i));
                 CHECK_EQ(table.at(positions[m] * rot + half + i), qkv.at(m * hd * 3 + half + i));
                 CHECK_EQ(qkv.at(m * hd * 3 + hd + i), qkv.at(m * hd * 3 + i));
@@ -1821,6 +1835,113 @@ TEST(yarn_rotary_matches_independent_vllm_vectors) {
             for (int i = rot; i < hd; ++i) CHECK_EQ(qkv.at(m * hd * 3 + i), 9.0f);
             for (int i = 0; i < hd; ++i) CHECK_EQ(qkv.at(m * hd * 3 + 2 * hd + i), 9.0f);
         }
+    }
+}
+
+/* THE REFERENCE IS NOT VACUOUS: the same op with the bounds one pair off, or without the
+ * magnitude, lands outside yarn_ref's bound somewhere in the ramp. */
+TEST(yarn_reference_bound_sees_a_shifted_ramp_and_a_missing_magnitude) {
+    const int rot = 64, hd = 64;
+    const double magnitude = 1.0 + 0.1 * std::log(2.0);
+    for (int variant = 0; variant < 2; ++variant) {
+        T pos(RAD_I32, {1}); pos.n({500000});
+        T qkv(RAD_F32, {1, hd});
+        std::vector<float> values((size_t)hd, 0.0f);
+        for (int i = 0; i < rot / 2; ++i) values[(size_t)i] = 1.0f;
+        qkv.f(values);
+        A a; a.t(qkv).t(pos).i("M", 1).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 0)
+            .i("rotary_dim", rot).d("theta", 1e7).d("scale", 1).s("mode", "neox")
+            .d("yarn_factor", 2).d("yarn_low", variant == 0 ? 15 : 14)
+            .d("yarn_high", variant == 0 ? 23 : 22).d("yarn_magnitude", variant == 0 ? magnitude : 1.0);
+        CHECK_OK(run("rope", a));
+        int outside = 0;
+        for (int i = 0; i < rot / 2; ++i) {
+            const YarnRef y = yarn_ref(500000.0, i, rot, 14, 22);
+            outside += std::fabs(qkv.at(i) - y.c) > y.tol || std::fabs(qkv.at(rot / 2 + i) - y.s) > y.tol;
+        }
+        CHECK(outside > 0);
+    }
+}
+
+/* QSA's compressed key. Identical unit keys pool to one and a unit gain with eps 0 norms to one,
+ * so what is left is the rotation at the block's position: c - s, then s + c, then the unrotated
+ * tail -- held to yarn_ref with YaRN on. Then the three things the op does besides rotate: the
+ * mean ROUNDED to k's dtype before the norm, `page` choosing the output row (and -1 none), and a
+ * [M, 3] position list read per frequency under imrope. */
+TEST(op_qsa_block_key) {
+    const int64_t n = 128, ratio = 4, rot = 64;
+    const double magnitude = 1.0 + 0.1 * std::log(2.0);
+    {
+        const std::vector<int64_t> blocks = { 0, 262144, 524287 };
+        const int64_t M = (int64_t)blocks.size();
+        T k(RAD_F32, {M * ratio, n}); k.f(std::vector<float>((size_t)(M * ratio * n), 1.0f));
+        T w(RAD_F32, {n}); w.f(std::vector<float>((size_t)n, 1.0f));
+        T pos(RAD_I32, {M}); pos.n(blocks);
+        T out(RAD_F32, {M, n});
+        A a; a.t(k).t(w).tnull().t(pos).t(out).i("M", M).i("n", n).i("ratio", ratio)
+            .i("rotary_dim", rot).d("eps", 0).d("theta", 1e7).d("scale", 1).d("wadd", 0)
+            .s("dtype", "f32").d("yarn_factor", 2).d("yarn_low", 14).d("yarn_high", 22)
+            .d("yarn_magnitude", magnitude);
+        CHECK_OK(run("qsa_block_key", a));
+        for (int64_t b = 0; b < M; ++b)
+            for (int64_t i = 0; i < n; ++i) {
+                if (i >= rot) { CHECK_EQ(out.at(b * n + i), 1.0f); continue; }
+                const YarnRef y = yarn_ref((double)blocks[(size_t)b], (int)(i % (rot / 2)), (int)rot,
+                                           14, 22);
+                CHECK_NEAR(out.at(b * n + i), i < rot / 2 ? y.c - y.s : y.c + y.s, 2 * y.tol + 1e-6);
+            }
+    }
+    {   /* bf16 keys whose lane-0 mean, 1 + 2^-9, rounds to 1 before the norm reads it. */
+        T k(RAD_BF16, {ratio, 2});
+        k.f({ 1.0f, 2.0f, 1.0f, 2.0f, 1.0f, 2.0f, 1.0f + 0x1p-7f, 2.0f });
+        T w(RAD_F32, {2}); w.f({ 1.0f, 1.0f });
+        T out(RAD_F32, {1, 2});
+        A a; a.t(k).t(w).tnull().tnull().t(out).i("M", 1).i("n", 2).i("ratio", ratio)
+            .i("rotary_dim", 0).i("pos0", 0).d("eps", 0).d("theta", 1e7).d("wadd", 0)
+            .s("dtype", "bf16");
+        CHECK_OK(run("qsa_block_key", a));
+        CHECK_NEAR(out.at(0), 1.0 / std::sqrt(2.5), 1e-6);
+        CHECK_NEAR(out.at(1), 2.0 / std::sqrt(2.5), 1e-6);
+    }
+    {   /* page: block 0 to row 1, block 1 nowhere, block 2 to row 0. Block b's lanes are
+         * (1, b + 1), so each normed row says which block it came from. */
+        T k(RAD_F32, {3 * ratio, 2});
+        std::vector<float> kv;
+        for (int b = 0; b < 3; ++b)
+            for (int r = 0; r < ratio; ++r) { kv.push_back(1.0f); kv.push_back((float)(b + 1)); }
+        k.f(kv);
+        T w(RAD_F32, {2}); w.f({ 1.0f, 1.0f });
+        T page(RAD_I32, {3}); page.n({ 1, -1, 0 });
+        T out(RAD_F32, {2, 2}); out.f({ 7, 7, 7, 7 });
+        A a; a.t(k).t(w).t(page).tnull().t(out).i("M", 3).i("n", 2).i("ratio", ratio)
+            .i("rotary_dim", 0).i("pos0", 0).d("eps", 0).d("theta", 1e7).d("wadd", 0)
+            .s("dtype", "f32");
+        CHECK_OK(run("qsa_block_key", a));
+        CHECK_NEAR(out.at(0), 1.0 / std::sqrt(5.0), 1e-6);
+        CHECK_NEAR(out.at(1), 3.0 / std::sqrt(5.0), 1e-6);
+        CHECK_NEAR(out.at(2), 1.0, 1e-6);
+        CHECK_NEAR(out.at(3), 1.0, 1e-6);
+    }
+    {   /* imrope with a [M, 3] list: equal components are the one-position rotation, and moving
+         * component 1 moves frequency 1 (i % 3 == 1) and leaves frequency 0 alone. */
+        T k(RAD_F32, {ratio, n}); k.f(std::vector<float>((size_t)(ratio * n), 1.0f));
+        T w(RAD_F32, {n}); w.f(std::vector<float>((size_t)n, 1.0f));
+        auto key = [&](std::vector<int64_t> p, bool multi) {
+            T pos(RAD_I32, multi ? std::vector<int64_t>{1, 3} : std::vector<int64_t>{1}); pos.n(p);
+            T out(RAD_F32, {1, n});
+            A a; a.t(k).t(w).tnull().t(pos).t(out).i("M", 1).i("n", n).i("ratio", ratio)
+                .i("rotary_dim", rot).d("eps", 0).d("theta", 1e7).d("wadd", 0).s("dtype", "f32")
+                .s("mode", "imrope").s("sections", "11 11 10");
+            CHECK_OK(run("qsa_block_key", a));
+            std::vector<float> v((size_t)n);
+            for (int64_t i = 0; i < n; ++i) v[(size_t)i] = out.at(i);
+            return v;
+        };
+        const std::vector<float> one = key({ 5000 }, false), same = key({ 5000, 5000, 5000 }, true);
+        const std::vector<float> moved = key({ 5000, 9000, 5000 }, true);
+        for (int64_t i = 0; i < n; ++i) CHECK_EQ(same[(size_t)i], one[(size_t)i]);
+        CHECK_EQ(moved[0], one[0]);
+        CHECK(std::fabs(moved[1] - one[1]) > 1e-3);
     }
 }
 

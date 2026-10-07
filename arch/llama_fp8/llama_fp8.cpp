@@ -185,7 +185,6 @@ static int declare_dspark(RadBuilder* b, const RadModelMeta* meta, const RadBuil
     dg.eps           = (float)rad_meta_getf(meta, "draft.rms_norm_eps", 0.0);
     dg.theta         = (float)rad_meta_getf(meta, "draft.rope_parameters.rope_theta",
                                             rad_meta_getf(meta, "draft.rope_theta", 0.0));
-    dg.rope_scale    = 1.0f;
     /* PLAIN RMS NORM: the reference norms with Qwen3RMSNorm and the config says `model_type:
      * qwen3`. It happens to agree with this MiniCPM5 target, and it is asked of the DRAFTER's
      * config anyway -- two conventions in one process is exactly why this is a second Geom. */
@@ -201,6 +200,7 @@ static int declare_dspark(RadBuilder* b, const RadModelMeta* meta, const RadBuil
                 (long long)dg.head_dim, (long long)dg.n_ff_all, (double)dg.eps, (double)dg.theta);
         return RAD_E_INVAL;
     }
+    RAD_ARCH_TRY(yarn_from(dg, meta, "draft.", dg.head_dim));
     int s;
     if ((s = divide_or_fail(dg.n_head_all,    dg.world, "draft num_attention_heads", &dg.n_head))    < 0) return s;
     if ((s = divide_or_fail(dg.n_head_kv_all, dg.world, "draft num_key_value_heads", &dg.n_head_kv)) < 0) return s;
@@ -431,6 +431,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "%lld\n", (long long)m.n_rot, (long long)g.head_dim);
         return RAD_E_INVAL;
     }
+    RAD_ARCH_TRY(yarn_from(g, meta, "", m.n_rot));
 
     /* ---- the KV cache. One group: every layer is full attention. */
     RadKVGroupDecl fd{};

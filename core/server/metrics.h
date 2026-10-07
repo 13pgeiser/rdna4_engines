@@ -123,7 +123,7 @@ private:
     Gauge   g_draft_pos_reached_[MAX_DRAFT_POS];
     Gauge   g_draft_pos_accepted_[MAX_DRAFT_POS];
     std::atomic<int> draft_pos_seen_{0};
-    /* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT): the mean window of the running sequences,
+    /* THE ADAPTIVE DRAFT WINDOW (--draft-window adaptive): the mean window of the running sequences,
      * and the verifies by the window they carried, index = drafts. Rendered only while the policy
      * is on, so a deployment without it exposes exactly what it always did. */
     Gauge   g_draft_depth_adapt_;

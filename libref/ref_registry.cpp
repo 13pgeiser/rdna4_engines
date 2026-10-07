@@ -292,6 +292,18 @@ static const RadParamSpec pRopeTable[] = { P_INT("M"), P_INT("rot"), P_F64("thet
                                            P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
 
+/* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
+ * spelled for the KV group the block-key store is, `page` and `pos` are optional. */
+static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
+                                             P_INT("rotary_dim"), P_INTO("pos0"),
+                                             P_INTO("block_size"), P_F64("eps"), P_F64("theta"),
+                                             P_F64O("scale"), P_F64O("wadd"), P_STR("dtype"),
+                                             P_STRO("mode"), P_STRO("sections"),
+                                             P_F64O("yarn_factor"), P_F64O("yarn_low"),
+                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page"), OPD_O("pos"),
+                                               OUT("out") };
+
 static const RadParamSpec pQkNormRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                             P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
                                             P_F64O("scale"), P_STRO("mode"), P_INTO("rotary_dim"),
@@ -751,6 +763,12 @@ static const RadOpSchema kSchemas[] = {
   "cos/sin for the positions a step names, at each position's own row of a [max_ctx, rot] plane: "
   "rot values a row, cos for the first half and sin for the second. The angles are `rope`'s "
   "exactly. A row no position names is not written; a negative position writes nothing." },
+{ "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
+  "QSA's compressed key, one vector per `ratio` rows of k: the block's mean accumulated in f32 and "
+  "rounded to k's dtype, RMS-normed with gain (wadd + w), then NeoX-rotated over `rotary_dim` at "
+  "the block's position -- `pos[b]` (with `mode` mrope/imrope and `sections`, a [>= M, 3] list's "
+  "three components) or `pos0 + b*ratio` -- with YaRN's blend and magnitude when given. `page[b]`, "
+  "when given, is the output row; a negative entry writes nothing." },
 { "rope", ARR(pRope), ARR(oRope),
   "Rotary embedding in place over the q and k heads of a fused [q|k|v] row; the v heads are left "
   "alone. `mode` is \"neox\" or \"gptj\", or a multi-component form: \"mrope\" (contiguous "
@@ -1084,6 +1102,9 @@ SIMPLE("ref_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
 SIMPLE("ref_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        ref_moe_gather),
 SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT, ref_rope_table),
+SIMPLE("ref_qsa_block_key", "qsa_block_key", "attn",
+       "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
+       ref_qsa_block_key),
 SIMPLE("ref_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, ref_row_topk),
 SIMPLE("ref_row_topk_merge", "row_topk_merge", "moe", "the global top-R of the gathered per-rank candidate sets", DT_FLOAT, ref_row_topk_merge),
 SIMPLE("ref_logit_rerank", "logit_rerank", "moe", "R candidates a row rescored exactly against the full-precision head", DT_FLOAT, ref_logit_rerank),

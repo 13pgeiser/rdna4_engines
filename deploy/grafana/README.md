@@ -31,7 +31,7 @@ Window values are counter ratios with the definitions of the since-start gauges:
 | conditional acceptance at j | `draft_position_accepted`(j) / `draft_position_reached`(j) | `radiance:draft_position_acceptance_ratio` |
 
 Draft blocks per decode step is the reach of position 0 over `engine_steps_decode_total` (GUIDE §6.3).
-The adaptive draft window and verifies by draft depth have data only while `RADIANCE_DRAFT_ADAPT` is on.
+The adaptive draft window and verifies by draft depth have data only under `--draft-window adaptive`.
 
 Prometheus extrapolates `rate()` inside the window and VictoriaMetrics does not, so short windows at
 the edge of a burst differ between the two. The overview's ratios are taken over the dashboard's time

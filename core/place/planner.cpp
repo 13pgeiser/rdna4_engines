@@ -113,6 +113,15 @@ int64_t expert_vram_floor(const WeightFootprint& wf, int64_t host_room) {
     return std::min(all, std::max<int64_t>(all + 2 * wf.expert_unit_max - host_room, 0));
 }
 
+int plan_check_weights_pool(const Plan& p, int64_t pool_bytes) {
+    if (p.vram_budget == pool_bytes) return RAD_OK;
+    RAD_ERR("placement: rank %d planned against a %s weights budget (%lld bytes) and its weights "
+            "pool holds %s (%lld bytes): the planner and the pool were given different splits",
+            p.rank, humanb(p.vram_budget).c_str(), (long long)p.vram_budget,
+            humanb(pool_bytes).c_str(), (long long)pool_bytes);
+    return RAD_E_STATE;
+}
+
 void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement embedding,
                       TablePlacement ngram) {
     if (!out) return;

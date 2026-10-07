@@ -43,18 +43,30 @@ card, the dearest rank's -- and an attention-zero rank's cache costs a fraction 
 token (at TP3 on Flash-Next it keeps only the QSA block keys: 2.3 GiB at the worst case where an
 attention rank's costs 15.2). Under `expert_tiered` with both pools derived, `Engine::plan` gives
 such a rank a KV pool that pages exactly the common token count (`KVManager::pool_mib_for_tokens`,
-the inverse of `paged_tokens`, plus a 64 MiB margin) and moves the difference into its weights pool,
-no further than every one of its weights resident. Both readers of the resolved sizes take the
-rank's own split -- `Pools::configure` and the planner -- so the grown pool is planned into. The
-token count, the carve, the loan and the attention ranks' pools are unchanged; a stated
-`--vram-kv-mib` / `--vram-weights-mib` keeps meaning "this many on every card", and `auto` keeps the
-common split (a fully resident rank would choose all_vram while its peers spill). At TP2/TP4 every
-rank costs the same and nothing is re-split. The log line, and its effect on the third rank:
+the inverse of `paged_tokens`: the least whole MiB whose paged split reaches the count, exact
+because the split is monotone in the budget and its alignment is among the fixed costs) and moves the
+difference into its weights pool, no further than every one of its weights resident. Both readers
+of the resolved sizes take the rank's own split -- `Pools::configure` and the planner -- so the
+grown pool is planned into, and startup refuses a rank whose plan and weights pool disagree, or
+whose re-sized KV pool pages fewer tokens than it was sized for. The token count, the carve, the
+loan and the attention ranks' pools are unchanged; a stated `--vram-kv-mib` / `--vram-weights-mib`
+keeps meaning "this many on every card", and `auto` keeps the common split (a fully resident rank
+would choose all_vram while its peers spill). `--deterministic` and a device without virtual memory
+management re-split like any other: the cache does not lend there, and the bytes the rank never
+pages are as much its experts' as they are under a lending cache. The condition is the cost, not
+the world: a rank is re-split only where its cache costs less per token than the dearest rank's,
+which at TP2/TP4 no rank does. A rank that qualifies and keeps the common split names the reason on
+its `kv: rank N's cache costs ...` line. The pinned host pool is not re-split: every rank allocates
+its whole `--host-pool-mib`, and a re-split rank whose weights all fit on the card says so
+(`its pinned host pool holds no weights`). The log line, and the mover on the third rank:
 
 ```
-kv: rank 2's cache costs 2.27 GiB at the worst case where its dearest peer's costs 15.16 GiB, so its KV pool pages the common 1446302 tokens in 1875 MiB instead of 10881; its weights pool grows 19747 -> 21692 MiB (every weight resident wants 21.18 GiB), and 7061 MiB stay unclaimed
-I[2] mover: 25142 slab slots (64 shadow), 0 pinned pool slots      (was 22479 slots, 2663 pinned)
+kv: rank 2's cache costs 2.27 GiB at the worst case where its dearest peer's costs 15.16 GiB, so its KV pool pages the common 1446302 tokens in 1811 MiB instead of 10881; its weights pool grows 19747 -> 21692 MiB (every weight resident wants 21.18 GiB), and 7125 MiB stay unclaimed
+I[2] mover: 25142 slab slots (64 shadow), 0 pinned pool slots
 ```
+
+The settle check's INFO line on that card names the unclaimed MiB and points at this line rather
+than at the budget's `unusable` line alone.
 
 Under a smaller attention world the plain even shard over `world` is the wrong cut for every
 attention projection, so the attention ranks declare **spans** (`rad_weight_shard_span`, the same

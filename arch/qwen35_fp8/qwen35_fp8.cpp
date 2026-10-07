@@ -339,7 +339,6 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dg.eps           = (float)rad_meta_getf(meta, "draft.rms_norm_eps", 0.0);
     dg.theta         = (float)rad_meta_getf(meta, "draft.rope_parameters.rope_theta",
                                             rad_meta_getf(meta, "draft.rope_theta", 0.0));
-    dg.rope_scale    = 1.0f;
     RAD_ARCH_TRY(yarn_from(dg, meta, "draft.", dg.head_dim));
     /* PLAIN RMS NORM. The drafter uses the ordinary norm where the trunk uses GemmaRMSNorm, and
      * the checkpoint agrees rather than only vLLM -- rad_block_dflash2.h has the numbers. Two

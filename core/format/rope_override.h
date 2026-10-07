@@ -16,6 +16,7 @@
  * (tests/yarn_test.cpp holds them to yarn_from). */
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -141,7 +142,8 @@ inline bool rope_override_group(std::vector<std::string>& k, std::vector<std::st
         if (type == "yarn") kv.set(tk, "default");
         return true;
     }
-    if (!type.empty() && type != "default" && type != "yarn") {
+    /* `mrope` is the legacy Qwen2-VL spelling of default with sections. */
+    if (!type.empty() && type != "default" && type != "mrope" && type != "yarn") {
         *why = "the " + std::string(*group ? "drafter's" : "model's") + " rotary is '" + type +
                "' (" + tk + "); YaRN over it is not --rope-scaling's to decide";
         return false;
@@ -172,6 +174,36 @@ inline bool rope_override_group(std::vector<std::string>& k, std::vector<std::st
     for (const char* stale : { "attention_factor", "mscale", "mscale_all_dim" })
         kv.erase(home + stale);
     return true;
+}
+
+/* THE ROTARY AS A CACHED KEY DEPENDS ON IT: every key with a path component naming `rope` or
+ * `rotary` -- rope_parameters.*, rope_scaling.*, rope_theta, partial_rotary_factor, their
+ * text_config. and draft. forms, a GGUF's <arch>.rope.* -- as key=value, sorted, after
+ * --rope-scaling has been applied. A persisted prefix store is fingerprinted with it: a container
+ * converted from the same checkpoint with YaRN has the same name and the same shapes, and its
+ * stock-rotated keys (and QSA block keys) read back under YaRN would be attended to at the wrong
+ * angles. Key order and unrelated keys do not change it. */
+inline std::string rope_identity(const std::vector<std::string>& k,
+                                 const std::vector<std::string>& v) {
+    auto names_rotary = [](const std::string& key) {
+        size_t s = 0;
+        while (s <= key.size()) {
+            size_t e = key.find('.', s);
+            if (e == std::string::npos) e = key.size();
+            const std::string part = key.substr(s, e - s);
+            if (part.find("rope") != std::string::npos || part.find("rotary") != std::string::npos)
+                return true;
+            s = e + 1;
+        }
+        return false;
+    };
+    std::vector<std::string> rows;
+    for (size_t i = 0; i < k.size() && i < v.size(); ++i)
+        if (names_rotary(k[i])) rows.push_back(k[i] + "=" + v[i]);
+    std::sort(rows.begin(), rows.end());
+    std::string out;
+    for (const auto& r : rows) { out += r; out += ';'; }
+    return out;
 }
 
 }  /* namespace rad */

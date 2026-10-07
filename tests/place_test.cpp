@@ -25,6 +25,8 @@
 #include "rad_test.h"
 
 #include "device/directio.h"
+#include "mem/pools.h"
+#include "mem/vram_budget.h"
 #include "place/heat.h"
 #include "place/mover.h"
 #include "place/stager.h"
@@ -408,6 +410,46 @@ TEST(planner_spills_experts_before_dense_weights) {
     for (const MoveUnit& mu : p.units)
         if (mu.tier == Tier::HostPinned && mu.site == Site::DeviceZeroCopy) ++zero_copy;
     CHECK_EQ(zero_copy, 6);
+}
+
+/* A RE-SPLIT RANK'S CONFIG REACHES BOTH READERS OF THE POOL SIZES. Engine::plan hands a rank whose
+ * cache costs less per token its own Config (vram_budget_rank_split): Pools::configure allocates
+ * the weights pool from it and the planner budgets the slab from it (Budgets::from), and the two
+ * have to read the same copy -- a grown pool the planner never reads is an empty pool, and a plan
+ * against a pool the rank does not have overruns it. plan_check_weights_pool is the startup check
+ * that they did. */
+TEST(a_resplit_ranks_config_reaches_the_pools_and_the_planner) {
+    Fixture f;
+    build_moe(f, 8, 1 * MiB, nullptr);
+
+    Config common = base_config();
+    common.placement = "expert_tiered";
+    common.vram_weights_mib = 5;      /* 1 MiB embedding and room for three experts and a shadow */
+    common.vram_kv_mib = 8;
+    common.host_pool_mib = 64;
+    const RankSplit rs = vram_budget_rank_split(common.vram_weights_mib, common.vram_kv_mib, 2,
+                                                64 * MiB);
+    CHECK(rs.resplit);
+    Config rc = common;
+    rc.vram_weights_mib = rs.weights_mib;
+    rc.vram_kv_mib = rs.kv_mib;
+
+    Pools pools;
+    CHECK_OK(pools.configure(rc, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_EQ(pools.weights().bytes(), rs.weights_mib * MiB);
+    CHECK_EQ(pools.kv().bytes(), rs.kv_mib * MiB);
+    CHECK_EQ(Budgets::from(rc).vram_weights, pools.weights().bytes());
+
+    Plan grown, flat;
+    { PlannerInput in{&f.prog, &rc, 0, 1, nullptr, 0}; CHECK_OK(Planner(in).plan(&grown)); }
+    { PlannerInput in{&f.prog, &common, 0, 1, nullptr, 0}; CHECK_OK(Planner(in).plan(&flat)); }
+    CHECK_EQ(grown.vram_budget, pools.weights().bytes());
+    CHECK_EQ(plan_check_weights_pool(grown, pools.weights().bytes()), RAD_OK);
+    /* The grown pool is planned into: more of the experts are on the card. */
+    CHECK(grown.totals.bytes[(int)Tier::VRAM] > flat.totals.bytes[(int)Tier::VRAM]);
+    CHECK(grown.totals.bytes[(int)Tier::VRAM] + grown.slab_overhead <= pools.weights().bytes());
+    /* A planner handed the common split beside the rank's grown pool is refused by name. */
+    CHECK_EQ(plan_check_weights_pool(flat, pools.weights().bytes()), RAD_E_STATE);
 }
 
 /* THE BUDGET'S EXPERT FLOOR PLACES EVERY EXPERT. A lending cache leaves the expert slab exactly

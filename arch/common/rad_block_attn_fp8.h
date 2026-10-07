@@ -121,7 +121,7 @@ inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, r
                              RAD_SHARD_ROW, grp_layer(l), { src.q, src.k, src.v }, w.h, w.qkv,
                              0, { q_dim, kv_dim, kv_dim }));
 
-    op_rope = rw(b, RAD_OP(b, "rope",
+    op_rope = rw(b, decl_rotary(b, g, "rope",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", g.n_head_kv),
                                 RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),

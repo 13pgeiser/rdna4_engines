@@ -600,3 +600,90 @@ int ref_rope_table(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ qsa_block_key */
+/* The QSA indexer's compressed key (docs/OPS.md, docs/QSA.md): for each of M blocks,
+ *
+ *   pooled = mean of the block's `ratio` rows of k, accumulated in f32 and ROUNDED TO k's dtype
+ *   normed = pooled * rsqrt(mean(pooled^2) + eps) * (wadd + w)
+ *   out    = NeoX rotary of normed's first `rotary_dim` lanes at the block's position, the rest
+ *            passed through, rounded once at the store
+ *
+ * The rounding after the mean is the reference model's (`.float().mean(dim=1).to(dtype)`) and is
+ * part of the answer. The block's position is `pos[b]` (a [>= M, 1 or 3] list carries a block's
+ * components side by side, read under `mode` mrope/imrope and `sections`), or `pos0 + b*ratio`
+ * without one. `page[b]`, when given, is the output row, and a negative entry writes nothing. The
+ * rotary is `rope`'s ladder with YaRN's blend and magnitude when the coefficients are given. */
+int ref_qsa_block_key(const RadArgs* a, RadStream) {
+    const RadTensor* k = t_in(a, 0);
+    const RadTensor* w = t_in(a, 1);
+    const RadTensor* page = t_in(a, 2);
+    const RadTensor* pos = t_in(a, 3);
+    const RadTensor* out = t_in(a, 4);
+    if (!k || !w || !out) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t rot = p_int(a, "rotary_dim", 0), pos0 = p_int(a, "pos0", -1);
+    if (n <= 0 || n > REF_HD_MAX || ratio <= 0 || (pos0 < 0 && !pos)) return RAD_E_INVAL;
+    if (rot < 0 || rot > n || (rot & 1)) return RAD_E_SHAPE;
+    if (p_int(a, "block_size", ratio) != ratio) return RAD_E_SHAPE;
+    if (k->rank != 2 || out->rank < 2 || out->shape[0] < 1) return RAD_E_SHAPE;
+    const int64_t M = page ? numel(page) : out->shape[0];
+    if (M < 1 || numel(out) / out->shape[0] != n) return RAD_E_SHAPE;
+    if (k->shape[0] != M * ratio || k->shape[1] != n || numel(w) < n) return RAD_E_SHAPE;
+    const bool pos2 = pos && pos->rank == 2;
+    if (pos && (pos2 ? pos->shape[0] < M : numel(pos) < M)) return RAD_E_SHAPE;
+
+    const float eps = p_f32(a, "eps", 1e-6f), wadd = p_f32(a, "wadd", 1.0f);
+    const float theta = p_f32(a, "theta", 10000.0f), rscale = p_f32(a, "scale", 1.0f);
+    static const char* kModes[] = { "neox", "mrope", "imrope" };
+    const int mi = p_enum(a, "mode", kModes, 3, 0);
+    if (mi < 0) return RAD_E_UNSUPPORTED;
+    const int mode = mi == 1 ? ROPE_MROPE : mi == 2 ? ROPE_IMROPE : ROPE_NEOX;
+    int64_t sec[8] = {};
+    const int n_sec = rope_sections(a, sec);
+    if (n_sec < 0 || n_sec > 3) return RAD_E_SHAPE;
+    /* Several components only with a mode, its sections and three columns of `pos`; otherwise
+     * every frequency reads the block's one position, which every mode reads as NeoX. */
+    const bool mc = mode != ROPE_NEOX && n_sec > 0 && pos2 && pos->shape[1] >= 3;
+    const RadYarn yarn = rad_yarn_args(a);
+    if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && (rot <= 0 || rscale != 1.0f)))
+        return RAD_E_INVAL;
+    RopeFreq f;
+    RAD_REF_TRY(rope_freqs(mc ? mode : ROPE_NEOX, rot, theta, sec, mc ? n_sec : 0, &f));
+    for (int64_t i = 0; i < rot / 2; ++i) f.inv[i] = yarn.frequency(f.inv[i], (int)i);
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t b = 0; b < M; ++b) {
+        const int64_t orow = page ? ld_int(page->dtype, page->data, offlin(page, b)) : b;
+        if (orow < 0) continue;
+        float x[REF_HD_MAX], y[REF_HD_MAX];
+        double ss = 0.0;
+        for (int64_t t = 0; t < n; ++t) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < ratio; ++j) acc += ldt(k, offlin(k, (b * ratio + j) * n + t));
+            uint64_t tmp = 0;
+            st_dt(k->dtype, &tmp, 0, acc / (float)ratio);
+            x[t] = ld_dt(k->dtype, &tmp, 0);
+            ss += (double)x[t] * x[t];
+        }
+        const float inv = 1.0f / std::sqrt((float)(ss / (double)n) + eps);
+        for (int64_t t = 0; t < n; ++t) y[t] = x[t] * inv * (wadd + ldt(w, offlin(w, t)));
+        float p[3] = {};
+        for (int c = 0; c < (mc ? 3 : 1); ++c) {
+            const int64_t bp = !pos ? pos0 + b * ratio
+                             : ld_int(pos->dtype, pos->data,
+                                      offlin(pos, pos2 ? b * pos->shape[1] + c : b));
+            p[c] = (float)bp / (rscale != 0.0f ? rscale : 1.0f);
+        }
+        const int64_t half = rot / 2;
+        for (int64_t i = 0; i < half; ++i) {
+            const float ang = p[f.comp[i]] * f.inv[i];
+            const float c = std::cos(ang) * yarn.magnitude, s = std::sin(ang) * yarn.magnitude;
+            const float x0 = y[i], x1 = y[half + i];
+            y[i] = x0 * c - x1 * s;
+            y[half + i] = x0 * s + x1 * c;
+        }
+        for (int64_t t = 0; t < n; ++t) stt(out, offlin(out, orow * n + t), y[t]);
+    }
+    return RAD_OK;
+}

@@ -109,11 +109,13 @@ struct SchedReq {
         draft_hi     = 0;
     }
 
-    /* THE ADAPTIVE DRAFT WINDOW'S ESTIMATE FOR THIS REQUEST (RADIANCE_DRAFT_ADAPT, draft.h), and
+    /* THE ADAPTIVE DRAFT WINDOW'S ESTIMATE FOR THIS REQUEST (--draft-window adaptive, draft.h), and
      * deliberately NOT in drafter_reset(): it describes the text the request is writing, which a
      * preemption does not change, rather than any cache the request holds. A recycled slot starts
      * it over in add_locked. Untouched while the policy is off. */
     DraftAdapt adapt;
+    /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
+    bool       draft_ngram = false;
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
@@ -289,13 +291,6 @@ public:
     /* The drafter's proposal for a request's next step. n is clamped to the sequence's window
      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
     int      set_draft(uint64_t id, const int32_t* tokens, int n);
-
-    /* RADIANCE_DRAFT_ADAPT is the SERIAL drafter's policy: every draft there is one more round of
-     * the head, which is what its cost table prices. A block drafter proposes its whole block in
-     * one pass, so a shorter window only saves verify rows -- a different trade with a policy of its
-     * own. The engine calls this once, before the first step, when the drafter is a block drafter;
-     * the switch then changes nothing about that run. Says so when it was on. */
-    void     draft_adapt_off(const char* why);
 
     /* ---------------------------------------------------------- media the encoder owes
      * A REQUEST CARRYING MEDIA IS ADMITTED ONLY ONCE EVERY ITEM IS ENCODED. Until then it keeps
@@ -506,28 +501,27 @@ private:
         return hit_holes_draft_ ? ctx_len : 0;
     }
 
-    /* THE WINDOW A SEQUENCE MAY DRAFT INTO: the configured depth, or under RADIANCE_DRAFT_ADAPT
-     * the one its own acceptance pays for (DraftController::depth_for, which starts the estimate
-     * on the first ask), under this cycle's load cap. It is the rule every site that caps a
-     * proposal applies -- step(), set_draft(), expect_draft() and the rounds in serial_begin() --
-     * and with the policy off it is next_depth(), exactly as before. */
+    /* THE WINDOW A SEQUENCE MAY DRAFT INTO: the configured depth, or under the adaptive window
+     * min(D, its stop) (DraftController::window_for, which starts the estimate on the first ask).
+     * It is the rule every site that caps a proposal applies -- step(), set_draft(),
+     * expect_draft() and the rounds in serial_begin() -- and with the policy off it is
+     * next_depth(), exactly as before. */
     int draft_cap(SchedReq& s) const {
-        if (!draft_.adaptive()) return draft_.next_depth();
-        const int d = draft_.depth_for(s.adapt);
-        return (draft_busy_cap_ > 0 && d > draft_busy_cap_) ? draft_busy_cap_ : d;
+        return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
     }
 
-    /* THE LOAD CAP OF THE CYCLE IN FLIGHT (RADIANCE_DRAFT_ADAPT_BUSY, draft.h), 0 for none.
+    /* THE STEP'S HEAD DEPTH D IS CHOSEN ONCE A CYCLE AND HELD, by draft_cycle(), which is the
+     * first thing step() and promote_next() do -- every cycle opens with exactly one of the two.
+     * A cycle's proposal passes through four sites -- the plan that verifies it, the rounds that
+     * draft the next one, expect_draft() and set_draft() -- and the step issued ahead holds them
+     * to agree: it was built with the count expect_draft() gave it, and set_draft() refuses a
+     * different one. A D read live could move between them, because a commit or a client hanging
+     * up changes the running set mid-cycle; held, it moves only where a cycle starts, and a
+     * proposal drafted under one D and planned under the next is only ever cut shorter.
      *
-     * COUNTED ONCE A CYCLE AND HELD, by draft_cycle(), which is the first thing step() and
-     * promote_next() do -- every cycle opens with exactly one of the two. A cycle's proposal
-     * passes through four sites -- the plan that verifies it, the rounds that draft the next one,
-     * expect_draft() and set_draft() -- and the step issued ahead holds them to agree: it was
-     * built with the count expect_draft() gave it, and set_draft() refuses a different one. A
-     * cap read live could move between them, because a commit or a client hanging up takes a
-     * sequence out of running_ mid-cycle; held, it moves only where a cycle starts, and a
-     * proposal drafted under one cap and planned under the next is only ever cut shorter. */
-    int32_t draft_busy_cap_ = 0;
+     * `draft_est_` is the list plan_step reads, reserved at init so the step path does not
+     * allocate. */
+    std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
 
     /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many

@@ -417,7 +417,7 @@ std::string Metrics::render() const {
             w.out += "radiance:draft_position_accepted_total" + base + ",position=\"" +
                      std::to_string(j) + "\"} " + num(g_draft_pos_accepted_[j].get()) + '\n';
     }
-    /* THE ADAPTIVE DRAFT WINDOW, only while RADIANCE_DRAFT_ADAPT is on: where the policy stands --
+    /* THE ADAPTIVE DRAFT WINDOW, only while --draft-window adaptive is in force: where the policy stands --
      * at one sequence, that sequence's window -- and where it has been, as verifies by the
      * number of drafts they carried. */
     if (draft_adapt_on_.load(std::memory_order_acquire)) {

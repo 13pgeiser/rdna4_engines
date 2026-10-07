@@ -225,6 +225,17 @@ std::vector<Case> build_cases() {
         add("rope_table", { HI("M", 12), HI("rot", 64), HF("theta", 1e7), HF("scale", 1),
                             HS("dtype", "f32"), HF("yarn_factor", 0), HF("yarn_magnitude", magnitude) });
     }
+    /* QSA's compressed key at Flash-Next's geometry (n 128, ratio 4, a 64-wide rotary), stock and
+     * with YaRN, positions drawn up to the block count times the ratio. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("qsa_block_key", { HI("M", 12), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                               HF("eps", 1e-6), HF("theta", 1e7), HF("scale", 1), HF("wadd", 1),
+                               HS("dtype", dt) });
+        add("qsa_block_key", { HI("M", 12), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                               HF("eps", 1e-6), HF("theta", 1e7), HF("scale", 1), HF("wadd", 0),
+                               HS("dtype", dt), HF("yarn_factor", 2), HF("yarn_low", 14),
+                               HF("yarn_high", 22), HF("yarn_magnitude", 1.069314718) });
+    }
     /* The multi-component forms: Qwen3-VL's interleaved M-RoPE over a partial rotary, and a vision
      * tower's 2-D axial rotary over a whole 72-wide head. */
     for (const char* dt : { "f32", "bf16" }) {

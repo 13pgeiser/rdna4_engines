@@ -2,6 +2,7 @@
 #include "../arch/common/rad_arch.h"
 #include "format/rope_override.h"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -28,6 +29,72 @@ TEST(yarn_metadata_is_independent_of_deployment_context) {
     vals[4] = "4";
     CHECK_OK(yarn_from(draft, &m, "draft.", 128));
     CHECK_EQ(draft.yarn.factor, 4.0f); CHECK_EQ(target.yarn.factor, 2.0f);
+}
+
+/* THE CORRECTION BOUNDS ARE vLLM's: _yarn_find_correction_range at beta 32/1 over 262144 trained
+ * positions and theta 1e7, floored and ceiled, for the three rotary widths the Qwen family uses.
+ * These integers and the blend formula in abi/rad_yarn.h are the whole of the vLLM agreement; the
+ * frequency and phase references in tests/ref_test.cpp are pinned to them. */
+TEST(yarn_correction_bounds_match_vllm_at_every_rotary_width) {
+    const char* keys[] = {"rope_parameters.rope_type", "rope_parameters.factor",
+                          "rope_parameters.original_max_position_embeddings"};
+    const char* vals[] = {"yarn", "2", "262144"};
+    RadModelMeta m{}; m.n_kv = 3; m.kv_key = keys; m.kv_val = vals;
+    const struct { int64_t rot; float low, high; } want[] = {
+        {64, 14.0f, 22.0f}, {128, 28.0f, 43.0f}, {256, 56.0f, 85.0f}};
+    for (const auto& w : want) {
+        Geom g{}; g.theta = 1e7f;
+        CHECK_OK(yarn_from(g, &m, "", w.rot));
+        CHECK_EQ(g.yarn.low, w.low); CHECK_EQ(g.yarn.high, w.high);
+        CHECK_NEAR(g.yarn.magnitude, 1.0 + 0.1 * std::log(2.0), 1e-7);
+    }
+}
+
+/* ONE READER, AND IT ANSWERS FOR EVERY TYPE: default and the legacy `mrope` spelling are no
+ * scaling, linear divides positions, and a scheme it does not implement is refused by name with
+ * the geometry left as it was -- never read as a linear divide by its factor. */
+TEST(the_rotary_reader_names_every_type_it_does_not_implement) {
+    const char* keys[] = {"rope_scaling.type", "rope_scaling.factor",
+                          "rope_scaling.original_max_position_embeddings"};
+    const char* vals[] = {"mrope", "8", "8192"};
+    RadModelMeta m{}; m.n_kv = 3; m.kv_key = keys; m.kv_val = vals;
+    Geom g{}; g.theta = 5e5f; g.rope_scale = 7.0f;
+    CHECK_OK(yarn_from(g, &m, "", 128));
+    CHECK_EQ(g.yarn.factor, 0.0f); CHECK_EQ(g.rope_scale, 1.0f);
+    for (const char* t : {"llama3", "longrope", "dynamic", "su", "bogus"}) {
+        vals[0] = t;
+        g.rope_scale = 7.0f;
+        CHECK_EQ(yarn_from(g, &m, "", 128), RAD_E_UNSUPPORTED);
+        CHECK_EQ(g.rope_scale, 7.0f); CHECK_EQ(g.yarn.factor, 0.0f);
+    }
+    vals[0] = "linear";
+    CHECK_OK(yarn_from(g, &m, "", 128));
+    CHECK_EQ(g.rope_scale, 8.0f); CHECK_EQ(g.yarn.factor, 0.0f);
+    /* Nothing named at all is the default, whatever a previous read left. */
+    m.n_kv = 0;
+    CHECK_OK(yarn_from(g, &m, "", 128));
+    CHECK_EQ(g.rope_scale, 1.0f);
+}
+
+/* `truncate` is a JSON boolean: the converter writes 1/0, and true/false spelled out is the same. */
+TEST(yarn_truncate_takes_true_and_false_as_well_as_one_and_zero) {
+    const char* keys[] = {"rope_parameters.rope_type", "rope_parameters.factor",
+                          "rope_parameters.original_max_position_embeddings",
+                          "rope_parameters.truncate"};
+    const char* vals[] = {"yarn", "2", "262144", "true"};
+    RadModelMeta m{}; m.n_kv = 4; m.kv_key = keys; m.kv_val = vals;
+    Geom a{}, b{}; a.theta = b.theta = 1e7f;
+    CHECK_OK(yarn_from(a, &m, "", 64));
+    CHECK_EQ(a.yarn.low, 14.0f); CHECK_EQ(a.yarn.high, 22.0f);
+    vals[3] = "1"; CHECK_OK(yarn_from(b, &m, "", 64)); CHECK_EQ(b.yarn.low, a.yarn.low);
+    vals[3] = "false";
+    CHECK_OK(yarn_from(a, &m, "", 64));
+    CHECK(a.yarn.low > 14.0f && a.yarn.low < 15.0f);
+    vals[3] = "0"; CHECK_OK(yarn_from(b, &m, "", 64)); CHECK_EQ(b.yarn.low, a.yarn.low);
+    for (const char* bad : {"yes", "2", "True"}) {
+        vals[3] = bad;
+        CHECK_EQ(yarn_from(a, &m, "", 64), RAD_E_INVAL);
+    }
 }
 
 TEST(yarn_metadata_rejects_bad_inputs_and_preserves_default) {
@@ -217,6 +284,12 @@ TEST(rope_override_refuses_linear_and_scales_a_drafter_on_its_own) {
     CHECK(!rad::rope_override_group(bare.k, bare.v, spec("yarn:2"), "", 0, &why));
     CHECK(rad::rope_override_group(bare.k, bare.v, spec("yarn:2:65536"), "", 0, &why));
     CHECK_EQ(*bare.get("rope_parameters.rope_type"), std::string("yarn"));
+    /* The legacy `mrope` type is default with sections, so YaRN goes over it. */
+    Meta vl{ { "rope_scaling.type", "mrope" }, { "rope_scaling.mrope_section", "16 24 24" } };
+    CHECK(rad::rope_override_group(vl.k, vl.v, spec("yarn:2"), "", 32768, &why));
+    Geom gv{}; gv.theta = 1e6f;
+    CHECK_OK(yarn_from(gv, vl.meta(), "", 128));
+    CHECK_EQ(gv.yarn.factor, 2.0f);
 
     Meta d = qfn_container();
     d.k.push_back("draft.rope_parameters.rope_type"); d.v.push_back("default");
@@ -228,6 +301,53 @@ TEST(rope_override_refuses_linear_and_scales_a_drafter_on_its_own) {
     CHECK_OK(yarn_from(dr, d.meta(), "draft.", 128));
     CHECK_EQ(t.yarn.factor, 2.0f); CHECK_EQ(dr.yarn.factor, 2.0f);
     CHECK_EQ(dr.yarn.low, 28.0f); CHECK_EQ(dr.yarn.high, 43.0f);
+}
+
+/* A persisted prefix store is fingerprinted with rope_identity (Engine::configure_kv). The stock
+ * container, the same container under --rope-scaling, one converted with YaRN and the same model
+ * whose drafter alone is scaled must all differ; key order and unrelated keys must not matter. */
+TEST(the_rotary_identity_tells_every_resolved_rotary_apart) {
+    std::string why;
+    Meta stock = qfn_container();
+    const std::string base = rad::rope_identity(stock.k, stock.v);
+    CHECK(!base.empty());
+    CHECK(base.find("text_config.rope_parameters.rope_type=default") != std::string::npos);
+
+    Meta flag = qfn_container();
+    CHECK(rad::rope_override_group(flag.k, flag.v, spec("yarn:2"), "", 262144, &why));
+    const std::string scaled = rad::rope_identity(flag.k, flag.v);
+    CHECK(scaled != base);
+    Meta flag4 = qfn_container();
+    CHECK(rad::rope_override_group(flag4.k, flag4.v, spec("yarn:4"), "", 262144, &why));
+    CHECK(rad::rope_identity(flag4.k, flag4.v) != scaled);
+
+    /* Converted with YaRN: the same keys written by the converter, not by the flag. */
+    Meta conv = qfn_container();
+    conv.v[9] = "yarn";
+    conv.k.push_back("text_config.rope_parameters.factor"); conv.v.push_back("2");
+    conv.k.push_back("text_config.rope_parameters.original_max_position_embeddings");
+    conv.v.push_back("262144");
+    CHECK(rad::rope_identity(conv.k, conv.v) != base);
+    conv.k.push_back("text_config.rope_parameters.beta_fast"); conv.v.push_back("16");
+    CHECK(rad::rope_identity(conv.k, conv.v) != rad::rope_identity(flag.k, flag.v));
+
+    Meta draft = qfn_container();
+    draft.k.push_back("draft.rope_theta"); draft.v.push_back("10000000");
+    const std::string d0 = rad::rope_identity(draft.k, draft.v);
+    draft.k.push_back("draft.rope_parameters.rope_type"); draft.v.push_back("yarn");
+    CHECK(rad::rope_identity(draft.k, draft.v) != d0);
+
+    Meta shuffled = qfn_container();
+    std::reverse(shuffled.k.begin(), shuffled.k.end());
+    std::reverse(shuffled.v.begin(), shuffled.v.end());
+    shuffled.k.push_back("eos_token_id"); shuffled.v.push_back("248044");
+    shuffled.k.push_back("max_position_embeddings"); shuffled.v.push_back("1");
+    CHECK_EQ(rad::rope_identity(shuffled.k, shuffled.v), base);
+    Meta gguf{ { "qwen35.rope.dimension_count", "64" }, { "qwen35.rope.freq_base", "1e7" },
+               { "partial_rotary_factor", "0.25" }, { "qwen35.block_count", "64" } };
+    CHECK_EQ(rad::rope_identity(gguf.k, gguf.v),
+             std::string("partial_rotary_factor=0.25;qwen35.rope.dimension_count=64;"
+                         "qwen35.rope.freq_base=1e7;"));
 }
 
 RAD_TEST_MAIN()

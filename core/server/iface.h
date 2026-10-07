@@ -114,7 +114,7 @@ struct SchedMetrics {
     int     draft_depth_seen = 0;
     int64_t draft_pos_reached [MAX_DRAFT_POS] = {};
     int64_t draft_pos_accepted[MAX_DRAFT_POS] = {};
-    /* THE ADAPTIVE DRAFT WINDOW (RADIANCE_DRAFT_ADAPT), all zero while it is off: the mean window
+    /* THE ADAPTIVE DRAFT WINDOW (--draft-window adaptive), all zero while it is off: the mean window
      * of the running sequences, and the verifies by the window they carried (index = drafts). */
     bool    draft_adaptive = false;
     double  draft_depth_adaptive = 0.0;

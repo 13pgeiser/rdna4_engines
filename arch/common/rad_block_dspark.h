@@ -508,7 +508,7 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
      * THE POSITION IS THE COMMITTED TOKEN'S OWN, which is what makes the split passes equal the
      * reference's one concatenated rope: it hands `k` the full position range and `q` only the
      * last `q_len` of it, so a context row at absolute position p is rotated by p either way. */
-    op_crope = rw(b, RAD_OP(b, "rope",
+    op_crope = rw(b, decl_rotary(b, g, "rope",
                      RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("n_head", g.n_head_kv), RAD_INT("n_head_kv", 0),
                                 RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
@@ -667,14 +667,14 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                      {w.ffn.q, w.ffn.s}, {w.h.x});
     }
 
-    op_qrope = rw(b, RAD_OP(b, "rope",
+    op_qrope = rw(b, decl_rotary(b, g, "rope",
                      RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("n_head", g.n_head), RAD_INT("n_head_kv", 0),
                                 RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),
                                 RAD_STR("mode", "neox")),
                      RAD_NOWEIGHTS),
                  {w.q}, {w.q});
-    op_krope = rw(b, RAD_OP(b, "rope",
+    op_krope = rw(b, decl_rotary(b, g, "rope",
                      RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("n_head", g.n_head_kv), RAD_INT("n_head_kv", 0),
                                 RAD_F64("theta", g.theta), RAD_F64("scale", g.rope_scale),

@@ -621,6 +621,101 @@ TEST(kv_pool_mib_for_tokens_is_the_inverse_of_paged_tokens) {
     CHECK(zn == 0 || (zn - 1) * MiB < zero.kv.fixed_bytes());
 }
 
+/* THE INVERSE ON A SHAPE, AND THE CARVE IT PROMISES. The dear rank's pool of `common_mib` sets the
+ * token count; the cheap rank's inverse names the least whole MiB that pages it (one MiB less does
+ * not, or does not hold the fixed costs); and a pool of exactly that size, capped at the count the
+ * way configure_kv caps every rank, carves every paged group the dear rank's block count -- the
+ * one block table. Returns the MiB the cheap rank needed. */
+static int64_t check_inverse_and_carve(const std::vector<KVGroupInfo>& dear_g,
+                                       const std::vector<KVGroupInfo>& cheap_g, int64_t common_mib) {
+    constexpr int64_t MiB = 1ll << 20;
+    Fixture dear, cheap;
+    dear.cfg.checkpoint_slots = cheap.cfg.checkpoint_slots = 0;
+    dear.cfg.vram_kv_mib = common_mib;
+    CHECK_OK(dear.kv.plan_groups(dear_g, dear.cfg));
+    CHECK_OK(cheap.kv.plan_groups(cheap_g, cheap.cfg));
+    const int64_t T = dear.kv.paged_tokens(common_mib * MiB);
+    CHECK(T > 0 && T != KVManager::kUnboundedTokens);
+    const int64_t need = cheap.kv.pool_mib_for_tokens(T, common_mib);
+    CHECK(need > 0 && need < common_mib);
+    if (need <= 0) return need;
+    CHECK(cheap.kv.paged_tokens(need * MiB) >= T);
+    CHECK((need - 1) * MiB < cheap.kv.fixed_bytes() || cheap.kv.paged_tokens((need - 1) * MiB) < T);
+
+    cheap.cfg.vram_kv_mib = need;
+    CHECK_OK(dear.pools.configure(dear.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_OK(cheap.pools.configure(cheap.cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    CHECK_EQ(cheap.pools.kv().avail(), need * MiB);
+    CHECK_EQ(dear.kv.paged_tokens(dear.pools.kv().avail()), T);
+    dear.kv.cap_paged_tokens(T);
+    cheap.kv.cap_paged_tokens(T);
+    CHECK_OK(dear.kv.carve(dear.pools.kv()));
+    CHECK_OK(cheap.kv.carve(cheap.pools.kv()));
+    for (int32_t g = 1; g < (int32_t)dear_g.size(); ++g) {
+        if (!dear.kv.plan(g)->paged()) continue;
+        CHECK_EQ(cheap.kv.plan(g)->n_blocks, dear.kv.plan(g)->n_blocks);
+        CHECK(dear.kv.plan(g)->n_blocks > 0);
+    }
+    return need;
+}
+
+static KVGroupInfo paged_group(const char* name, int kind, int64_t heads, int64_t block,
+                               std::vector<int32_t> layers, int64_t window = 0) {
+    KVGroupInfo k;
+    k.name = name;
+    k.decl.kind = kind;
+    k.decl.dtype = RAD_BF16;
+    k.decl.n_head_kv = heads;
+    k.decl.head_dim = 8;
+    k.decl.window = window;
+    k.block_size = block;
+    k.layers = std::move(layers);
+    return k;
+}
+
+/* A WINDOWED GROUP is capped at its window on both ranks, and the cap moves the bytes it frees to
+ * the other groups -- a kink in paged_split the inverse has to cross exactly. Here the dear rank's
+ * count is past the window, so its window group holds max_seqs x window_blocks on both ranks. */
+TEST(kv_pool_mib_for_tokens_crosses_a_windowed_groups_cap) {
+    std::vector<KVGroupInfo> dear = hybrid_groups();
+    dear.push_back(paged_group("swa", RAD_KV_WINDOW, 4, 16, { 6, 7, 8, 9 }, 2048));
+    std::vector<KVGroupInfo> cheap = dear;
+    cheap[G_FULL].decl.n_head_kv = 1;
+    check_inverse_and_carve(dear, cheap, 32);
+    /* And with the cheap rank's window group the cheaper one: what it saves is all in the window. */
+    cheap = dear;
+    cheap[3].decl.n_head_kv = 1;
+    check_inverse_and_carve(dear, cheap, 32);
+}
+
+/* TWO PAGED GROUPS AT DIFFERENT BLOCK SIZES: one token count, two block counts, each the dear
+ * rank's. */
+TEST(kv_pool_mib_for_tokens_holds_across_block_sizes) {
+    std::vector<KVGroupInfo> dear = hybrid_groups();
+    dear.push_back(paged_group("full32", RAD_KV_FULL, 2, 32, { 6, 7, 8 }));
+    std::vector<KVGroupInfo> cheap = dear;
+    cheap[G_FULL].decl.n_head_kv = 1;
+    check_inverse_and_carve(dear, cheap, 8);
+    cheap = dear;
+    cheap[3].decl.n_head_kv = 1;
+    check_inverse_and_carve(dear, cheap, 8);
+}
+
+/* AN ATTENTION-ZERO GROUP BESIDE ANOTHER PAGED GROUP: the zero group costs this rank nothing and
+ * takes no part in the split, so the other group alone sets what its pool pages -- and the zero
+ * group still holds the shared table's block count after the carve. */
+TEST(kv_pool_mib_for_tokens_with_a_zero_group_beside_a_paged_one) {
+    std::vector<KVGroupInfo> dear = hybrid_groups();
+    dear.push_back(paged_group("full32", RAD_KV_FULL, 2, 32, { 6, 7, 8 }));
+    std::vector<KVGroupInfo> cheap = dear;
+    cheap[G_FULL].zero = true;
+    const int64_t need = check_inverse_and_carve(dear, cheap, 8);
+    /* Cheaper than a rank that keeps the group at half its heads. */
+    std::vector<KVGroupInfo> kept = dear;
+    kept[G_FULL].decl.n_head_kv = 1;
+    CHECK(need < check_inverse_and_carve(dear, kept, 8));
+}
+
 /* The re-split moves what the cheaper rank's KV pool saves into its weights pool, never past every
  * weight resident and never below the common pool; what the cap leaves is reported, not allocated.
  * A need that is not below the common pool changes nothing -- the even world's case. */

@@ -416,6 +416,13 @@ int64_t file_stage_reserve(int64_t widest, bool routed);
  * A weight budget of the statics and this much places every expert in VRAM or the host pool. */
 int64_t expert_vram_floor(const WeightFootprint& wf, int64_t host_room);
 
+/* THE PLAN AND ITS RANK'S WEIGHTS POOL READ ONE SPLIT. The planner places against
+ * Plan::vram_budget and the mover fills the pool Pools::configure allocated, each from the Config
+ * it was handed; a rank given two different Configs plans a slab the pool does not have, or leaves
+ * part of the pool unplanned and empty, and nothing downstream would say so. RAD_E_STATE, naming
+ * the rank and both sizes, when they differ. */
+int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
+
 /* THE TABLES THE PLACEMENT FLAGS MOVE, by what reads them and not by name: a model-level weight
  * that at least one op reads and that only `embed_lookup` reads is a token embedding table, and
  * one only `embed_lookup_q` reads is an n-gram table. A lookup reads M rows a step, which is what

@@ -306,6 +306,8 @@ extern "C" void* rad_buf_ptr   (RadCtx* c, rad_buf    b) { (void)c; return (void
 #include "../arch/qwen35_bf16/qwen35_bf16.cpp"
 /* And the production architecture, for its sizing declare (RadBuildCtx::shape_probe). */
 #include "../arch/qwen4exp_fp8/qwen4exp_fp8.cpp"
+/* And the LLaMA family, for how it reads its rotary scaling. */
+#include "../arch/llama_fp8/llama_fp8.cpp"
 /* The PLE block on its own: no architecture in this file declares it, and what its step() hands
  * the two windowed ops is a contract of its own (rad_block_ple.h). */
 #include <arch/rad_block_ple.h>
@@ -576,6 +578,58 @@ TEST(qwen35_bf16_yarn_reaches_every_text_rotary_op) {
     vals[vals.size()-2] = "nan";
     RadBuilder invalid;
     CHECK_EQ(qwen35_bf16::declare(&invalid, &meta, &ctx), RAD_E_INVAL);
+}
+
+/* THE LLAMA FAMILY READS ITS ROTARY SCALING THROUGH THE SAME READER. A Llama 3.1 checkpoint says
+ * `rope_type: llama3` with a factor of 8; read as a bare factor that is a linear position divide
+ * by 8 and fluent nonsense, so it is refused by name at declare. Linear stays linear and YaRN
+ * reaches the rope op. */
+TEST(llama_reads_its_rotary_scaling_by_type) {
+    (void)&llama_fp8::step;        /* included for its declare; nothing here runs a step */
+    (void)&llama_fp8::probe;
+    auto declare = [](const char* type, const char* factor, RadBuilder* b) {
+        const char* keys[] = {"rope_scaling.rope_type", "rope_scaling.factor",
+                              "rope_scaling.original_max_position_embeddings"};
+        const char* vals[] = {type, factor, "8192"};
+        RadModelMeta m{};
+        m.arch_id = "llama"; m.name = "test-llama"; m.quant = "fp8_e4m3";
+        m.n_layers = 2; m.n_embd = 1024; m.n_head = 8; m.n_head_kv = 2; m.head_dim = 128;
+        m.n_ff = 2048; m.n_vocab = 32000; m.n_ctx_train = 8192;
+        m.rms_eps = 1e-5f; m.rope_theta = 5e5f; m.rope_scale = 1.0f;
+        m.n_kv = type ? 3 : 0; m.kv_key = keys; m.kv_val = vals;
+        RadBuildCtx c = build_ctx();
+        return llama_fp8::declare(b, &m, &c);
+    };
+    for (const char* refused : {"llama3", "longrope", "dynamic"}) {
+        RadBuilder b;
+        CHECK_EQ(declare(refused, "8", &b), RAD_E_UNSUPPORTED);
+    }
+    {
+        RadBuilder b;
+        CHECK_OK(declare("linear", "2", &b));
+        CHECK(count_op(b, "rope") > 0);
+        for (const auto& op : b.ops) if (op.op == "rope") {
+            CHECK_EQ(pflt(&op, "scale"), 2.0);
+            CHECK(!param(&op, "yarn_factor"));
+        }
+    }
+    {
+        RadBuilder b;
+        CHECK_OK(declare("yarn", "4", &b));
+        CHECK(count_op(b, "rope") > 0);
+        for (const auto& op : b.ops) if (op.op == "rope") {
+            CHECK_EQ(pflt(&op, "scale"), 1.0);
+            CHECK_EQ(pflt(&op, "yarn_factor"), 4.0);
+        }
+    }
+    {
+        RadBuilder b;
+        CHECK_OK(declare(nullptr, "", &b));
+        for (const auto& op : b.ops) if (op.op == "rope") {
+            CHECK_EQ(pflt(&op, "scale"), 1.0);
+            CHECK(!param(&op, "yarn_factor"));
+        }
+    }
 }
 
 TEST(the_alternation_puts_full_attention_at_3_and_7) {

@@ -229,6 +229,18 @@ static const RadParamSpec pRopeTable[]   = { P_INT("M"), P_INT("rot"), P_F64("th
                                              P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
 
+/* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
+ * spelled for the KV group the block-key store is, `page` and `pos` are optional. */
+static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
+                                             P_INT("rotary_dim"), P_INTO("pos0"),
+                                             P_INTO("block_size"), P_F64("eps"), P_F64("theta"),
+                                             P_F64O("scale"), P_F64O("wadd"), P_STR("dtype"),
+                                             P_STRO("mode"), P_STRO("sections"),
+                                             P_F64O("yarn_factor"), P_F64O("yarn_low"),
+                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+static const RadOperandSpec oQsaBlockKey[] = { OPD("k"), WGT("w"), OPD_O("page"), OPD_O("pos"),
+                                               OUT("out") };
+
 static const RadParamSpec pQkNormRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                               P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
                                               P_F64O("scale"), P_STRO("mode"),
@@ -510,6 +522,10 @@ static const RadOpSchema kSchemas[] = {
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense), "dense varlen attention over cu_seqlens." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore), "scatter k and v into the paged cache." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable), "cos/sin at each position's own row." },
+{ "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
+  "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
+  "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
+  "arithmetic with the angles from one table a block." },
 { "rope", ARR(pRope), ARR(oRope), "rotary embedding in place." },
 { "qk_norm_rope", ARR(pQkNormRope), ARR(oQkNormRope), "per-head QK norm then rotary embedding." },
 { "scale_rows", ARR(pScaleRows), ARR(oScaleRows),
@@ -697,6 +713,9 @@ ROW("avx_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", 
 SIMPLE("avx_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, L(rope)),
 SIMPLE("avx_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT,
        L(rope_table)),
+SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
+       "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
+       L(qsa_block_key)),
 SIMPLE("avx_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary embedding",
        DT_FLOAT, L(qk_norm_rope)),
 

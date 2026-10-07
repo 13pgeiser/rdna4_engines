@@ -1040,6 +1040,23 @@ int ref_rope_table_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("rope_table", operand, out);
 }
 
+int ref_qsa_block_key_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    const int64_t n = gi(p, n_p, "n", 0);
+    const int64_t r = gi(p, n_p, "ratio", 0);
+    if (M <= 0 || n <= 0 || r <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M * r, n });                            /* k -- `ratio` rows a block */
+    o.t((uint32_t)RAD_F32, { n });                   /* w -- the norm gain */
+    /* page: absent, so the write is contiguous. A drawn page list may repeat an entry, and two
+     * blocks onto one row is a race whose winner the comparison would then measure. */
+    o.skip();
+    o.t_idx({ M }, M * r, -1, 0);                    /* pos -- each block's first-token position */
+    o.t(D, { M, n });                                /* out */
+    return o.finish("qsa_block_key", operand, out);
+}
+
 /* ================================================================== mixture of experts */
 
 int ref_scale_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

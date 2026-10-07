@@ -100,7 +100,7 @@ int         avx_isa_force(int level);
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(kv_store)             X(rope)               \
-    X(rope_table)           X(qk_norm_rope)                                                       \
+    X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)                              \
     /* ---- mixture of experts */                                                                 \
     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \
     X(moe_gather)           X(row_topk)             X(row_topk_merge)       X(logit_rerank)     \

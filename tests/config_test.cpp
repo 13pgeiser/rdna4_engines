@@ -362,6 +362,28 @@ TEST(the_table_placements_are_auto_vram_ram_or_disk) {
     CHECK_EQ(parse({ "--ngram-placement" }, &c), RAD_E_INVAL);
 }
 
+/* --draft-window takes its two names and nothing else; the default is kDraftWindowDefault, and the
+ * help text states it from there. Whether the window CAN adapt -- a serial drafter, a depth above
+ * zero -- is the scheduler's to say with the program in hand, not the parser's. */
+TEST(the_draft_window_is_fixed_or_adaptive) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.draft_window == kDraftWindowDefault);
+    Config c;
+    CHECK_EQ(parse({ "--draft-window", "adaptive" }, &c), RAD_OK);
+    CHECK(c.draft_window == DraftWindow::Adaptive);
+    CHECK_EQ(parse({ "--draft-window", "fixed" }, &c), RAD_OK);
+    CHECK(c.draft_window == DraftWindow::Fixed);
+    CHECK_EQ(parse({ "--draft-window", "adaptive", "--num-speculative-tokens", "6" }, &c), RAD_OK);
+    CHECK(c.draft_window == DraftWindow::Adaptive);
+    CHECK_EQ(c.n_spec, 6);
+    for (const char* bad : { "Adaptive", "auto", "dynamic", "1", "" })
+        CHECK_EQ(parse({ "--draft-window", bad }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
+    CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
+    CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+}
+
 /* A POLICY NAME THIS BUILD DOES NOT KNOW WOULD FALL THROUGH TO THE DEFAULT, and a measurement
  * comparing the default against itself is the failure that costs the most to notice. */
 TEST(the_checkpoint_policy_is_one_of_the_three_that_exist) {
@@ -808,6 +830,9 @@ TEST(usage_names_every_flag_it_documents) {
     CHECK(text.find("--host-pool-mib") != std::string::npos);
     CHECK(text.find("--kv-cache-dtype") != std::string::npos);
     CHECK(text.find("--num-speculative-tokens") != std::string::npos);
+    CHECK(text.find("--draft-window") != std::string::npos);
+    CHECK(text.find(std::string("Default ") + draft_window_name(kDraftWindowDefault)) !=
+          std::string::npos);
     CHECK(text.find("--checkpoint-policy") != std::string::npos);
     CHECK(text.find("--prefix-cache-host-mib") != std::string::npos);
     CHECK(text.find("--tp-wire") != std::string::npos);
@@ -823,8 +848,6 @@ TEST(usage_names_every_flag_it_documents) {
         CHECK(text.find(f) != std::string::npos);
     CHECK(text.size() > 1000);
 }
-
-RAD_TEST_MAIN()
 
 /* --rope-scaling is checked at the command line: a typo is a refusal, not a model served with its
  * trained rotary at a length it cannot reach. */
@@ -843,3 +866,5 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.rope_scaling.empty());
 }
+
+RAD_TEST_MAIN()

@@ -774,11 +774,12 @@ extern "C" int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope
                             row_pitch, 0, nullptr, 0, 0, stream);
 }
 
-// The multi-component form: `mode` 2 mrope, 3 imrope, 4 axial, `sec[0..n_sec)` the sections and
-// `plane` the component pitch of `pos`; plane 0 is the one-component rotary above.
-extern "C" int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads,
-                                int rot, int gptj, float theta, float rscale, int row_pitch,
-                                int mode, const int* sec, int n_sec, int plane, long stream) {
+// THE ONE LAUNCH OF rope_kernel. `yarn` with factor 0 is the plain rotary: the kernel's YaRN
+// blend returns the frequency it was given and the magnitude is not applied, so the C entry points
+// below and the op without YaRN run the same arithmetic with the same arguments.
+static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot,
+                       int gptj, float theta, float rscale, int row_pitch, int mode,
+                       const int* sec, int n_sec, int plane, RadYarn yarn, long stream) {
     if (!qkv || !pos) return -1;
     if (M <= 0 || head_dim <= 0 || n_rope_heads <= 0) return -2;
     if (rot <= 0 || rot > head_dim || (rot & 1)) return -3;
@@ -790,8 +791,17 @@ extern "C" int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_r
     hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0, (hipStream_t)stream,
                        (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)head_dim,
                        (uint32_t)n_rope_heads, (uint32_t)rot, gptj, theta, rscale,
-                       (uint32_t)row_pitch, mode, s0, s1, s2, n_sec, (uint32_t)plane, RadYarn{});
+                       (uint32_t)row_pitch, mode, s0, s1, s2, n_sec, (uint32_t)plane, yarn);
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+// The multi-component form: `mode` 2 mrope, 3 imrope, 4 axial, `sec[0..n_sec)` the sections and
+// `plane` the component pitch of `pos`; plane 0 is the one-component rotary above.
+extern "C" int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads,
+                                int rot, int gptj, float theta, float rscale, int row_pitch,
+                                int mode, const int* sec, int n_sec, int plane, long stream) {
+    return rope_launch(qkv, pos, M, head_dim, n_rope_heads, rot, gptj, theta, rscale, row_pitch,
+                       mode, sec, n_sec, plane, RadYarn{}, stream);
 }
 
 extern "C" int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int head_dim,
@@ -1389,22 +1399,14 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     const float rscale = (float)r4d_getf(a, "scale", 1.0);
     const RadYarn yarn = rad_yarn_args(a);
     if (!rad_yarn_valid(yarn)) return R4D_NO(RAD_E_INVAL);
-    if (yarn.factor != 0.0f) {
-        if (mc == 4 || rscale != 1.0f) return R4D_NO(RAD_E_UNSUPPORTED);
-        const uint32_t heads = (uint32_t)(n_head + n_head_kv);
-        const uint32_t gy = (heads * (uint32_t)(rot / 2) + kThreads - 1) / kThreads;
-        hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)Mp, gy), dim3(kThreads), 0, (hipStream_t)s,
-                           (uint16_t*)r4d_addr(qkv), (const int32_t*)r4d_addr(pos),
-                           (uint32_t)head_dim, heads, (uint32_t)rot, gptj, theta, rscale,
-                           (uint32_t)pitch, mc, sec[0], sec[1], sec[2], n_sec, (uint32_t)plane, yarn);
-        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
-    }
+    /* YaRN over the axial vision rotary, or over a linear position divide, is no model's. */
+    if (yarn.factor != 0.0f && (mc == 4 || rscale != 1.0f)) return R4D_NO(RAD_E_UNSUPPORTED);
     /* The Q heads and the K heads rotate; the V heads that follow them do not, which is the whole
      * reason this op takes the fused projection rather than two tensors. */
-    return r4d_rope_mc_bf16(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,
-                            (int)(n_head + n_head_kv), (int)rot, gptj, theta, rscale, (int)pitch,
-                            mc, sec, n_sec, plane, (long)(uintptr_t)s) == 0 ? RAD_OK
-                                                                            : RAD_E_DEVICE;
+    return rope_launch(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,
+                       (int)(n_head + n_head_kv), (int)rot, gptj, theta, rscale, (int)pitch,
+                       mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s) == 0 ? RAD_OK
+                                                                          : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ kv_store */

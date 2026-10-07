@@ -232,7 +232,7 @@ not.
 | `ple_gate` |   | device | host |
 | `qk_norm_rope` |   | - | host |
 | `qk_norm_rope_gate` |   | device | - |
-| `qsa_block_key` |   | device | - |
+| `qsa_block_key` |   | device | host |
 | `qsa_score` |   | device | - |
 | `qsa_select` |   | device | - |
 | `qsa_tail_store` |   | device | - |

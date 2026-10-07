@@ -29,6 +29,15 @@ struct Flag {
     const char* help;
 };
 
+/* Built from kDraftWindowDefault, so the default is stated in one place. Defined before the table
+ * that points at it: the two are initialised in this order. */
+static const std::string g_draft_window_help =
+    std::string("fixed | adaptive: how many drafts each sequence carries. fixed drafts\n"
+                "                                    --num-speculative-tokens every step; adaptive makes that\n"
+                "                                    the ceiling and follows each sequence's acceptance and the\n"
+                "                                    measured step cost (a serial draft head only). Default ") +
+    draft_window_name(kDraftWindowDefault);
+
 static const Flag g_flags[] = {
     { "--model",              "PATH",   "the .rad container, or a checkpoint served as it stands" },
     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
@@ -101,6 +110,7 @@ static const Flag g_flags[] = {
     { "--num-speculative-tokens", "N",  "speculative window; 0 disables. Default `auto`: the drafter's\n"
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
+    { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -455,6 +465,15 @@ int config_parse(int argc, char** argv, Config* c) {
             if (std::strcmp(v, "auto") && c->n_spec < 0) {
                 RAD_ERR("--num-speculative-tokens takes auto or a depth >= 0 (0 turns speculation "
                         "off), not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-window")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "fixed"))    c->draft_window = DraftWindow::Fixed;
+            else if (!std::strcmp(v, "adaptive")) c->draft_window = DraftWindow::Adaptive;
+            else {
+                RAD_ERR("--draft-window takes fixed or adaptive, not '%s'", v);
                 return RAD_E_INVAL;
             }
         }

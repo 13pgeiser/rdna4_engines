@@ -97,10 +97,29 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
-    /* The adaptive window's switch and knobs, read once per process (draft.h). Off unless set. */
-    DraftController::from_env(&dp);
+    /* THE ADAPTIVE WINDOW IS THE SERIAL DRAFTER'S POLICY (draft.h): it prices a draft as one more
+     * round of the head. A block drafter proposes its block in one pass and prompt lookup runs no
+     * pass at all, so for either the window stays fixed -- decided here, once, before any step
+     * has counted an acceptance, and said, because a flag that changes nothing reads exactly
+     * like a flag that made no difference. */
+    if (cfg.draft_window == DraftWindow::Adaptive) {
+        const RadDrafterDecl& dd = prog.drafter;
+        if (cfg.n_spec <= 0)
+            RAD_WARN("--draft-window adaptive: this deployment does not speculate "
+                     "(--num-speculative-tokens %d), so there is no window to adapt", cfg.n_spec);
+        else if (dd.kind != RAD_DRAFT_SERIAL || dd.depth <= 0)
+            RAD_WARN("--draft-window adaptive: the window is fixed at %d with %s -- the adaptive "
+                     "window prices the rounds of a serial draft head, which this deployment does "
+                     "not run", cfg.n_spec,
+                     dd.kind == RAD_DRAFT_BLOCK ? "a block drafter, which proposes its block in one "
+                                                  "pass"
+                                                : "prompt lookup only");
+        else
+            dp.adapt = true;
+    }
     RAD_TRY(draft_.configure(dp));
-    draft_busy_cap_ = 0;
+    draft_est_.clear();
+    draft_est_.reserve((size_t)cfg.max_seqs);
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
     /* The builder's bound and not a second derivation of it: it is what the block tables were
@@ -366,6 +385,12 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     }
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
+    /* What the draft head did on this text is now part of what the next text starts from --
+     * once: the estimate is marked unstarted, so a second close of the same request adds nothing. */
+    if (draft_.adaptive()) {
+        draft_.adapt_retire(s.adapt);
+        s.adapt.depth = 0;
+    }
 
     if (defer_free) {
         if (!s.pending_free) ++n_deferred_;
@@ -937,7 +962,7 @@ void Scheduler::undo_hit(SchedReq& s) {
 /* ------------------------------------------------------------------ the step */
 const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
-    /* A cycle opens here, so its load cap is counted here (scheduler.h, draft_busy_cap_). */
+    /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
 
     /* The drafter's snapshots describe the step before this one and nothing reads them from here
@@ -997,12 +1022,19 @@ const RadBatch* Scheduler::step() {
              * none. Request::may_speculate says why a request can be ineligible.
              *
              * AND THE CAP IS THE SEQUENCE'S OWN WINDOW, which is `depth` unless the adaptive
-             * policy is on -- then it is what this sequence's acceptance pays for, and the n-gram
-             * fallback is held to it like any other proposal. */
+             * policy is on -- then it is what this sequence's acceptance of the HEAD's drafts pays
+             * for. The n-gram fallback is not the head and that estimate says nothing about it, so
+             * it is held to the step's window instead: as deep as the head drafts this step and no
+             * deeper, which adds no pass shape the head's own windows do not. */
             const int cap = draft_.adaptive() ? draft_cap(s) : depth;
+            bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
-            else if (s.n_draft == 0) s.n_draft = (int32_t)draft_ngram(s, cap);
-            if (s.n_draft > cap) s.n_draft = cap;
+            else if (s.n_draft == 0) {
+                s.n_draft = (int32_t)draft_ngram(s, draft_.step_window());
+                ngram = s.n_draft > 0;
+            }
+            if (!ngram && s.n_draft > cap) s.n_draft = cap;
+            s.draft_ngram = ngram;
             /* NO VERIFIED POSITION AT OR PAST THE CONTEXT. The step computes positions n_computed
              * .. n_computed + n_draft, and nothing past ctx_limit_ - 1 has a rotary row or a
              * block-table column. commit() finishes a sequence before its length reaches the
@@ -1089,6 +1121,7 @@ const RadBatch* Scheduler::step() {
         e.draft = s.draft;
         e.n_draft = s.n_draft;
         e.is_prefill = prefill;
+        e.ngram = !prefill && s.draft_ngram && s.n_draft > 0;
         e.produces_token = (r.n_computed + want >= target);
         /* The snapshot a hit resumes from, consumed once: the state is in the slot for the whole
          * sequence after this, and restoring it again on a later chunk would rewind it. */
@@ -1355,24 +1388,23 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
     out->swap(enc_want_);
 }
 
-/* ------------------------------------------------------------------ the load cap */
-void Scheduler::draft_adapt_off(const char* why) {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (!draft_.adaptive()) return;
-    DraftController::Params p = draft_.params();
-    p.adapt = false;
-    if (draft_.configure(p) == RAD_OK)
-        RAD_WARN("RADIANCE_DRAFT_ADAPT is set and the drafter is %s: the adaptive window is the serial "
-                 "drafter's policy, so this run keeps the configured depth %d", why, p.max_depth);
-    draft_busy_cap_ = 0;
-}
-
+/* ------------------------------------------------------------------ the step's head depth */
 void Scheduler::draft_cycle() {
-    const int32_t cap = (int32_t)draft_.busy_cap((int)running_.size());
-    if (cap != draft_busy_cap_)
-        RAD_DEBUG("draft window: %zu running, %s", running_.size(),
-                  cap > 0 ? "every window capped at the busy depth" : "the cap is lifted");
-    draft_busy_cap_ = cap;
+    if (!draft_.adaptive()) return;
+    /* THE ROWS THE OPENING STEP WILL DECODE: every running sequence past its prompt. Those that
+     * may speculate draft, and their estimates choose D; the rest emit one token each, which is
+     * part of what the step yields and of what it costs. A sequence still prefilling is neither. */
+    draft_est_.clear();
+    int n_rows = 0;
+    for (int32_t slot : running_) {
+        SchedReq& s = *reqs_[(size_t)slot];
+        if (!s.req || !s.running) continue;
+        const Request& r = *s.req;
+        if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;
+        ++n_rows;
+        if (r.may_speculate) draft_est_.push_back(&s.adapt);
+    }
+    (void)draft_.plan_step(draft_est_.data(), (int)draft_est_.size(), n_rows);
 }
 
 /* ------------------------------------------------------------------ the next step */
@@ -1383,7 +1415,7 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     SchedReq& s = *reqs_[(size_t)it->second];
     /* UNDER THE ADAPTIVE WINDOW THE ROUNDS RAN FOR THE DEEPEST SEQUENCE, and this one verifies the
      * first of them up to its own window -- the cap serial_begin sized the rounds from, unchanged
-     * since: nothing commits between the two, and the load cap is the cycle's (draft_busy_cap_). */
+     * since: nothing commits between the two, and D is the cycle's (draft_cycle). */
     if (draft_.adaptive() && n > 0) {
         const int cap = draft_cap(s);
         if (n > cap) n = cap;
@@ -1473,7 +1505,7 @@ void Scheduler::promote_next() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!next_open_) return;
     /* The other place a cycle opens: the step issued ahead becomes this one, and step() is not
-     * called. Its proposals were counted under the last cycle's cap; the next ones are drafted
+     * called. Its proposals were counted under the last cycle's D; the next ones are drafted
      * under this one. */
     draft_cycle();
     std::swap(plan_, plan_next_);
@@ -1634,9 +1666,12 @@ int Scheduler::commit(const StepResult& res) {
             if (e.n_spec > 0) {
                 draft_.observe(e.n_spec, a);
                 /* AND THIS SEQUENCE'S OWN ESTIMATE, from the same outcome, under the adaptive
-                 * window. A move takes effect at the next draft: this step's drafter has already
-                 * run, sized from the estimate as it stood before this commit. */
-                if (draft_.adaptive()) {
+                 * window -- when the head drafted it. A prompt-lookup proposal is accepted on
+                 * different text by a different rule, and folding it in would price the head's
+                 * next window on what the lookup found. A move takes effect at the next draft:
+                 * this step's drafter has already run, sized from the estimate as it stood before
+                 * this commit. */
+                if (draft_.adaptive() && !e.ngram) {
                     const int was = s.adapt.depth;
                     const int now = draft_.adapt_observe(s.adapt, e.n_spec, a);
                     if (now != was && was > 0 && (int)log_level() >= (int)Log::Debug) {
@@ -1646,9 +1681,10 @@ int Scheduler::commit(const StepResult& res) {
                             o += std::snprintf(est + o, sizeof est - (size_t)o, "%s%.2f",
                                                j ? " " : "", (double)s.adapt.a[j]);
                         est[o] = 0;
-                        RAD_DEBUG("draft window: request %llu %d -> %d (E/T %.4f -> %.4f; "
-                                  "acceptance by position %s)", (unsigned long long)r.id, was,
-                                  now, draft_.gain(s.adapt, was), draft_.gain(s.adapt, now), est);
+                        RAD_DEBUG("draft window: request %llu stops at %d, was %d (expected "
+                                  "tokens a verify %.3f -> %.3f; acceptance by position %s)",
+                                  (unsigned long long)r.id, now, was, draft_.yield(s.adapt, was),
+                                  draft_.yield(s.adapt, now), est);
                     }
                 }
                 m_.draft_tokens += e.n_spec;
@@ -1776,6 +1812,16 @@ void Scheduler::step_finished() {
          * nobody wants to read. Below a twentieth of a token a second it IS zero. */
         if (m_.prefill_tps < 0.05f) m_.prefill_tps = 0.0f;
         if (m_.decode_tps  < 0.05f) m_.decode_tps  = 0.0f;
+    }
+    /* AND WHAT THE STEP COST AT ITS DEPTH, for the adaptive window (draft.h): the same wall time,
+     * which is the step's share of the loop -- the draft rounds that followed it included, and a
+     * step issued ahead counted from the end of the one before rather than twice. A decode step
+     * only: a prefill chunk's time is the chunk's, not the window's. Keyed by the deepest window
+     * the step verified, which is the head depth it ran at whenever D held from the step before. */
+    if (draft_.adaptive() && plan_.phase == RAD_PHASE_DECODE && plan_.n_spec > 0 && wall > 0) {
+        int rows = 0;
+        for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
+        draft_.step_time((int)plan_.n_spec, rows, wall * 1e3);
     }
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
@@ -2392,9 +2438,8 @@ SchedMetrics Scheduler::metrics_locked() const {
         for (int32_t slot : running_) {
             const SchedReq& s = *reqs_[(size_t)slot];
             if (s.adapt.depth <= 0) continue;
-            /* The window it drafts into, which under load is the cap and not its estimate. */
-            sum += (draft_busy_cap_ > 0 && s.adapt.depth > draft_busy_cap_) ? draft_busy_cap_
-                                                                           : s.adapt.depth;
+            /* The window it drafts into: its stop under the step's head depth. */
+            sum += draft_.window_of(s.adapt);
             ++n;
         }
         m.draft_depth_adaptive = n ? (float)((double)sum / (double)n) : 0.0f;

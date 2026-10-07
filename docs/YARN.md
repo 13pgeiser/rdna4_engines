@@ -1,48 +1,43 @@
-# Static YaRN for Qwen architectures
+# Static YaRN
 
 Increasing `--max-model-len` reserves a larger serving window; it does not change
-the model's rotary embeddings. A Qwen checkpoint trained at 262144 positions can
+the model's rotary embeddings. A checkpoint trained at 262144 positions can
 explicitly request static YaRN for a 524288-token deployment. Whether that extension
 preserves useful accuracy must be measured on the model and workload.
 
-The Qwen architectures read the target's `text_config.rope_parameters`,
-then `rope_parameters`, then their legacy `rope_scaling` spellings, in that order.
-The first object with `rope_type` (or legacy `type`) is authoritative. The DFlash2
-drafter reads its own `draft.rope_parameters` / `draft.rope_scaling`; it does not
-inherit the target's scaling. The vision tower keeps its original axial rotations.
+One reader takes every architecture's rotary scaling (`yarn_from`,
+`arch/common/rad_arch.h`). For the target it reads `text_config.rope_parameters`,
+then `rope_parameters`, then the legacy `text_config.rope_scaling` and `rope_scaling`,
+in that order; the first object with `rope_type` (or legacy `type`) is authoritative.
+A drafter (DFlash2, DSpark) reads its own `draft.rope_parameters` /
+`draft.rope_scaling`; it does not inherit the target's scaling. The vision tower keeps
+its original axial rotations. A GGUF's `rope.scaling.*` keys are carried in as the
+same `rope_scaling` keys when it is read.
 
-## Coverage
+**The factor convention is the config's**, as vLLM and transformers read it:
+`factor` 2 over `original_max_position_embeddings` 262144 reaches 524288 positions.
 
-| Architecture | Rotary paths | Validation so far |
-| --- | --- | --- |
-| `qwen35_fp8` | Target direct/table; independent DFlash2 | 27B FP8, uncensored FP8 and MXFP4: text/tool/image checks, 499997-token retrieval and two overlapping 255981-token requests, TP4/BF16 KV |
-| `qwen35_bf16` | Target direct rotary | Architecture declaration and shared numerical tests; no end-to-end BF16 model run yet |
-| `qwen35moe_fp8` | Shared Qwen35 target and MTP geometry | 35B-A3B stock/YaRN smoke and retrieval, including 499997 tokens and paired 255981-token requests; TP2/BF16 KV |
-| `qwen4exp_fp8` | Attention, indexer, compressed block keys and shared MTP geometry | Both Flash variants: stock/YaRN smoke and retrieval, including 499997 tokens and paired 255981-token requests; TP4, tiered experts, BF16 KV |
-
-Radiance 1.2.0 also serves the published Qwen3.8-27B MXFP4 container through the
-Qwen35 FP8 architecture's encoding dispatch. It passed the model checks above.
-Request logs prove overlapping request lifetimes, not continuous simultaneous GPU
-residency or a common decode batch. See [qualification and audit](YARN-VALIDATION.md)
-for exact settings, timings, evidence boundaries and outstanding review findings.
-Synthetic retrieval is evidence for those requests, not a general accuracy benchmark
-or a capacity guarantee for other model sizes. Original-context quality should be
-checked alongside extended-context quality when deploying static YaRN.
+Validated so far: the Qwen3.8 27B and 35B-A3B containers and both Flash-Next
+variants at factor 2, with retrieval at ~500K tokens, and TP3 perplexity with
+`--rope-scaling` within roughly ±1% of stock at factor 2. The LLaMA plugins read the
+same keys and declare the same ops; YaRN there has had no model run.
 
 ## Metadata
 
 | Key within the rotary object | Meaning |
 | --- | --- |
-| `rope_type` | `yarn`; default/absent preserves stock behavior; `linear` divides positions uniformly |
+| `rope_type` | `yarn`; `default`, absent or legacy `mrope` is no scaling; `linear` divides positions by `factor` |
 | `factor` | finite number >= 1, required for YaRN |
 | `original_max_position_embeddings` | positive integer, required; the **training** length, not the enlarged deployment/table length |
 | `beta_fast`, `beta_slow` | defaults 32 and 1; finite, fast >= slow > 0 |
 | `attention_factor` | positive finite cos/sin multiplier; default 1 + 0.1 ln(factor) for factor > 1, otherwise 1 |
-| `truncate` | 1 (default): floor/ceil correction bounds; 0: retain fractional bounds |
+| `truncate` | true/1 (default): floor/ceil correction bounds; false/0: retain fractional bounds |
 
-`mscale` and `mscale_all_dim` variants are refused; specify `attention_factor`
-explicitly. Other explicit rotary types are refused in this architecture. Rotary
-width (including partial rotary), theta and M-RoPE section selection are unchanged.
+Every other type -- `llama3`, `longrope`, `dynamic` -- is refused by name at load,
+as are the `mscale` and `mscale_all_dim` variants (specify `attention_factor`). A
+GGUF that sets llama.cpp's YaRN `attn_factor`, `ext_factor` or log multiplier to
+anything but its neutral value is refused when read. Rotary width (including
+partial rotary), theta and M-RoPE section selection are unchanged.
 
 ## Convert a separate container
 
@@ -95,7 +90,7 @@ radiance --model /models/qwen3.8-next-flash-fp8.rad \
 (`ORIG`, default the container's own trained length) in the rotary object the reader above
 takes first -- for a Qwen3.8 container that is `text_config.rope_parameters`, which already says
 `default`; YaRN written under plain `rope_parameters` would sit behind it and never be read. A
-DFlash2 drafter gets the same factor over its own trained length. Over a checkpoint's own YaRN
+drafter gets the same factor over its own trained length. Over a checkpoint's own YaRN
 the factor is replaced, its trained length kept unless `ORIG` is given, and an explicit
 `attention_factor` (or `mscale` variant) dropped so the magnitude is derived for the new factor.
 `none` takes a checkpoint's YaRN off. A linear or other explicit rotary type is refused rather
@@ -104,28 +99,29 @@ than stacked over. The result is resolved and checked exactly as a converted con
 
 Startup says what the rotary is (`rope: YaRN factor 2 over 262144 trained positions -- the rotary
 reaches 524288`) and warns when `--max-model-len` is past what it covers -- also with no scaling
-at all, past the trained length. A persisted prefix cache (`--prefix-cache-dir`) written under a
-different `--rope-scaling` is not reused: every cached key was rotated differently.
+at all, past the trained length. A persisted prefix cache (`--prefix-cache-dir`) is fingerprinted
+with the resolved rotary of the target and the drafter, so a store written under a different
+one -- another `--rope-scaling`, or a container converted with YaRN -- is not reused: every cached
+key was rotated differently.
 
 The flag is for trying a factor, or serving a container whose source checkpoints are not at hand;
 a deployment that settles on one can convert it in as above and drop the flag.
 
 ## Kernel and test contract
 
-`rope` and `rope_table` take optional resolved coefficients `yarn_factor`,
-`yarn_low`, `yarn_high`, `yarn_magnitude`. Absent factor is the original path.
-With YaRN, `scale` must be 1: inverse frequencies are blended rather than all
-positions being divided. Axial rotary with YaRN is refused. Rebuild the bundled
-plugins together because their shared op schemas must match.
+`rope`, `rope_table` and `qsa_block_key` take optional resolved coefficients
+`yarn_factor`, `yarn_low`, `yarn_high`, `yarn_magnitude` (docs/OPS.md). Absent factor
+is the original path, with the original op identities. With YaRN, `scale` must be 1:
+inverse frequencies are blended rather than all positions being divided. Axial
+rotary with YaRN is refused. Rebuild the bundled plugins together because their
+shared op schemas must match.
 
-The math follows the static YaRN formulation (Peng et al.) and is checked against
-independent vLLM `YaRNScalingRotaryEmbedding` FP32 vectors for each backend. The fixture generator
-is `tests/data/generate_yarn_reference.py`; it is not a runtime dependency.
-Vectors cover target rotary width 64, draft width 128, an additional width 256,
-and positions through 524287.
-The CPU fixture uses torch CPU; the HIP fixture uses torch ROCm on gfx1201
-(`generate_yarn_reference.py cuda`). CPU and ROCm `pow` differ by a few ULPs;
-at 524K positions their cos/sin values can differ by 0.033 even within torch.
-Compare each implementation against its backend's independent vectors.
-The numerical check allows 0.004 absolute cos/sin error; fused versus unfused HIP rotation is checked
-byte-for-byte separately. Existing stock rotary tests remain active.
+The math follows the static YaRN formulation (Peng et al.) as vLLM's
+`YaRNScalingRotaryEmbedding` implements it. `tests/yarn_test.cpp` pins the
+correction bounds to vLLM's integers (14/22, 28/43, 56/85 for rotary widths 64, 128,
+256 at factor 2, theta 1e7, 262144 trained positions); `tests/ref_test.cpp` and
+`r4d_selftest` compare libref and libr4d against a double-precision evaluation of the
+same formula at positions through 524287, within 8 ulp of each angle -- tight where
+the ramp sits, loose only in the fastest pairs at long positions, which no f32 rotary
+places better than its angle's own ulp. libavx is held to libref by `avx_check`, and
+fused versus unfused HIP rotation is checked byte-for-byte separately.

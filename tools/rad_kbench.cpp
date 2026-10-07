@@ -1707,7 +1707,7 @@ int main(int argc, char** argv) {
     meta.n_expert = mi("n_expert", 0);  meta.n_expert_used = mi("n_expert_used", 0);
     meta.n_expert_shared = mi("n_expert_shared", 0);
     meta.rms_eps = mf("rms_eps", 1e-6); meta.rope_theta = mf("rope_theta", 10000.f);
-    meta.rope_scale = mf("rope_scale", 1.f);
+    meta.rope_scale = 1.f;   /* the rotary's scaling is the free-form rope keys (rad_builder.h) */
 
     /* The gated-delta-net head counts. No op names them -- the kernels read them off the operands
      * -- so a recipe sizing a GDN case would otherwise have to invent them, and a GDN check at an

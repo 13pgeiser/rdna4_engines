@@ -129,6 +129,27 @@ enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 
  *          decides it and writes the answer into Config, so every rank plans from one choice. */
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
+/* --draft-window: how many drafts a step verifies for each sequence (core/sched/draft.h).
+ *   Fixed     every sequence drafts --num-speculative-tokens.
+ *   Adaptive  that is the ceiling; each step's head depth and each sequence's stop follow the
+ *             measured acceptance and the measured step cost. A serial drafter's policy only.
+ * The default is kDraftWindowDefault, and the help text and the startup line read it from there.
+ *
+ * FIXED IS THE DEFAULT BECAUSE ADAPTIVE LOSES WHERE A SERVER IS BUSY. Qwen3.8-Flash-Next at TP2 on
+ * two R9700, distinct prompts a sequence, tokens a second over a steady window against fixed depth 3:
+ *
+ *      concurrent sequences        1        2        4        8
+ *      adaptive, ceiling 3       +0.4%    -0.1%    +1.7%    -0.3%
+ *      adaptive, ceiling 5       +7.1%    -2.3%    +7.4%   -11.9%
+ *
+ * At eight the head runs five rounds for little more text: 43.0 against 36.3 ms a step (1.18x) for
+ * 23.3 against 22.3 tokens. The cost model's prior puts depth 5 over depth 3 at 1.10x, and a depth
+ * not yet timed at a load is priced on the prior. */
+enum class DraftWindow { Fixed = 0, Adaptive = 1 };
+constexpr DraftWindow kDraftWindowDefault = DraftWindow::Fixed;
+inline const char* draft_window_name(DraftWindow w) {
+    return w == DraftWindow::Adaptive ? "adaptive" : "fixed";
+}
 enum class Site { Device = 0, DeviceStaged = 1, DeviceZeroCopy = 2, Host = 3 };
 
 /* Tier-indexed arrays are sized by this rather than by a literal: the report, the live view and
@@ -638,9 +659,10 @@ struct Config {
      * what the driver already holds is measured rather than assumed. core/mem/vram_budget.cpp does
      * that sum and writes the answer back into the two fields below, so every consumer downstream
      * -- the planner, the KV manager, the pool report -- reads one resolved number and there is no
-     * second place for them to disagree. Under an uneven world Engine::plan derives each rank's own
-     * copy from it (rank_cfg_, see docs/TP3.md §1), and the rank's pools and planner both read that
-     * copy -- still one number per card, and the same number on every card of an even world.
+     * second place for them to disagree. Engine::plan derives each rank's own copy from it
+     * (rank_cfg_, see docs/TP3.md §1), and the rank's pools and planner both read that copy --
+     * still one number per card, and the same number on every card whose cache costs as much per
+     * token as the dearest rank's.
      *
      * Zero means "derive"; a stated --vram-weights-mib / --vram-kv-mib still wins outright. */
     int64_t vram_weights_mib = 0;
@@ -727,8 +749,8 @@ struct Config {
      * code object, which HIP loads on the kernel's FIRST LAUNCH and not at startup, and which
      * faults inside the HIP runtime rather than returning an error when there is no room. */
 
-    /* The speculative window, and the whole of the draft policy: the depth is constant and this
-     * is it. See core/sched/draft.h. */
+    /* The speculative window: the depth, or under --draft-window adaptive its ceiling. See
+     * core/sched/draft.h. */
     /* -1 is `auto`: engine_bringup asks rad_arch_probe for the depth THIS container's drafter was
      * trained at, and a container with no draft head resolves to 0 with a line saying so.
      *
@@ -738,6 +760,7 @@ struct Config {
      * paying for it again in VRAM, and then running at one token a step -- a small fraction of
      * the throughput the same container gives at its declared depth. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
+    DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

@@ -1161,7 +1161,7 @@ stages of its sorting network when the runs are a power of two long and fill the
 over two runs of 1024 where a full sort is 66 -- and the whole network otherwise. A producer that
 hands it unsorted runs gets a wrong order, not a slow one.
 
-## Sparse attention (QSA) — device-only
+## Sparse attention (QSA)
 
 | op | params | operands |
 |---|---|---|
@@ -1173,7 +1173,8 @@ hands it unsorted runs gets a wrong order, not a slow one.
 
 Five ops decompose one thing: an indexer that scores blocks of key history against the query and
 hands `attn_paged` a shorter block table. `docs/QSA.md` is that decomposition; these are the
-schemas, and `arch/common/rad_qsa.h` issues all five.
+schemas, and `arch/common/rad_qsa.h` issues all five. **`qsa_block_key` has a host kernel in libref
+and libavx** -- the oracle for libr4d's, YaRN included -- and the other four are **device-only**.
 
 `qsa_block_key` builds the **compressed key**: one vector per `ratio` tokens of key history, which
 is what the indexer's block scores are taken against.
@@ -1181,6 +1182,11 @@ is what the indexer's block scores are taken against.
 ```
 out[b] = rope( rmsnorm( mean over j<ratio of k[b*ratio + j] ),  at position pos0 + b*ratio )
 ```
+
+The rotation is `rope`'s NeoX ladder over the first `rotary_dim` lanes, with `rope`'s YaRN
+coefficients (`yarn_factor`, `yarn_low`, `yarn_high`, `yarn_magnitude`) when given -- the
+attention's own rotary, so a compressed key and the keys it summarises are rotated alike. With
+YaRN, `scale` must be 1.
 
 **`M` is BLOCKS and `k` is `ratio` times taller.** Every other op in this document has one output
 row per input row. A caller that sized `k` at the block count would have every block pool three

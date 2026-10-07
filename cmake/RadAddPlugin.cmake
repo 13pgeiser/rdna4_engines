@@ -97,6 +97,22 @@ function(rad_add_plugin name kind)
         "because the language a project compiles in is the project's own decision.")
     endif()
     set_source_files_properties(${P_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
+    # EVERY DEVICE SOURCE NAMES ITS OWN COMPILATION UNIT ID, from the plugin's name and the
+    # source's path inside the plugin's directory. Left to clang, the ID is a hash of the absolute
+    # input path, the output path and the command line, so one source built in two directories --
+    # the tree and an out-of-tree build of the same plugin -- gets two IDs. The ID becomes a symbol
+    # (__hip_cuid_<hash of it>) whose name is not of fixed length, and a longer one shifts the code
+    # object's read-only data and with it every PC-relative address .text forms into it: the same
+    # instructions, different bytes. Named from what identifies the unit and nothing about where it
+    # was built, the ID is the same wherever the plugin is built and still differs between any two
+    # sources, which is the property clang needs of it.
+    foreach(src ${P_HIP_SOURCES})
+      get_filename_component(_rad_abs "${src}" ABSOLUTE)
+      file(RELATIVE_PATH _rad_rel "${CMAKE_CURRENT_SOURCE_DIR}" "${_rad_abs}")
+      string(SHA256 _rad_cuid "${name}/${_rad_rel}")
+      string(SUBSTRING "${_rad_cuid}" 0 16 _rad_cuid)
+      set_property(SOURCE "${src}" APPEND PROPERTY COMPILE_OPTIONS "-cuid=${_rad_cuid}")
+    endforeach()
     list(APPEND srcs ${P_HIP_SOURCES})
   endif()
   add_library(${name} MODULE ${srcs})

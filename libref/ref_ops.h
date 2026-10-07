@@ -115,6 +115,7 @@ int ref_kv_store           (const RadArgs*, RadStream);
 int ref_rope               (const RadArgs*, RadStream);
 int ref_rope_table         (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
+int ref_qsa_block_key      (const RadArgs*, RadStream);
 
 /* ---- mixture of experts */
 int ref_router_topk        (const RadArgs*, RadStream);
@@ -229,6 +230,7 @@ REF_SHAPE_FN(ref_kv_store);
 REF_SHAPE_FN(ref_rope);
 REF_SHAPE_FN(ref_rope_table);
 REF_SHAPE_FN(ref_qk_norm_rope);
+REF_SHAPE_FN(ref_qsa_block_key);
 
 REF_SHAPE_FN(ref_router_topk);
 REF_SHAPE_FN(ref_moe_scatter);

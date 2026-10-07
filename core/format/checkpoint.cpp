@@ -253,7 +253,10 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     m.n_expert_shared = gi("shared_expert_intermediate_size", 0) ? 1 : 0;
     m.rms_eps     = (float)gf("rms_norm_eps", 1e-6);
     m.rope_theta  = (float)gf("rope_parameters.rope_theta", gf("rope_theta", 10000.0));
-    m.rope_scale  = (float)gf("rope_scaling.factor", 1.0);
+    /* The rotary's scaling stays in the free-form keys with its type beside it; the architecture
+     * reads both (arch/common/rad_arch.h, yarn_from). A factor copied here without its type would
+     * be a linear position divide for llama3, longrope or YaRN. */
+    m.rope_scale  = 1.0f;
 
     /* The quantisation descriptor, which with the architecture selects the plugin (spec §2.4).
      * "fp8" plus its format, so qwen35_fp8 and qwen35_bf16 are told apart by the checkpoint
@@ -300,7 +303,48 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
     m.n_expert_shared= gi("expert_shared_count", 0);
     m.rms_eps     = (float)gf("attention.layer_norm_rms_epsilon", 1e-6);
     m.rope_theta  = (float)gf("rope.freq_base", 10000.0);
-    m.rope_scale  = (float)gf("rope.scaling.factor", 1.0);
+    m.rope_scale  = 1.0f;
+
+    /* THE ROTARY'S SCALING, written as the config.json keys a safetensors release carries, because
+     * those are what the architecture reads (arch/common/rad_arch.h, yarn_from) -- one reader, so
+     * a type is refused or honoured by name whichever file it came from. llama.cpp's YaRN
+     * attn_factor, ext_factor and log multiplier modify the magnitude and ramp in ways config.json
+     * has no spelling for, so a file that sets one to anything but its neutral value is refused
+     * here rather than served as plain YaRN. */
+    {
+        /* llama.cpp's reading: the type defaults to linear, the factor is rope.scaling.factor or
+         * the older rope.scale_linear, and 0 or 1 is no scaling. */
+        std::string type = "linear";
+        g.get_str(a + ".rope.scaling.type", &type);
+        const double factor = gf("rope.scaling.factor", gf("rope.scale_linear", 0.0));
+        const bool none = type == "none" || (type == "linear" && (factor == 0.0 || factor == 1.0));
+        if (!none) {
+            const struct { const char* key; double neutral; } kOff[] = {
+                { "rope.scaling.attn_factor", 1.0 }, { "rope.scaling.yarn_attn_factor", 1.0 },
+                { "rope.scaling.yarn_log_multiplier", 0.0 } };
+            for (const auto& k : kOff)
+                if (gf(k.key, k.neutral) != k.neutral) {
+                    RAD_ERR("the GGUF sets %s.%s = %g; that modifier of the rotary's scaling is "
+                            "not implemented", a.c_str(), k.key, gf(k.key, k.neutral));
+                    return RAD_E_UNSUPPORTED;
+                }
+            const double ext = gf("rope.scaling.yarn_ext_factor", -1.0);
+            if (ext >= 0.0 && ext != 1.0) {
+                RAD_ERR("the GGUF sets %s.rope.scaling.yarn_ext_factor = %g; YaRN is implemented "
+                        "at extrapolation factor 1", a.c_str(), ext);
+                return RAD_E_UNSUPPORTED;
+            }
+            out->kv("rope_scaling.type", type);
+            if (factor != 0.0) out->kv("rope_scaling.factor", fmt("%.17g", factor));
+            const int64_t orig = gi("rope.scaling.original_context_length", 0);
+            if (orig > 0) out->kv("rope_scaling.original_max_position_embeddings",
+                                  fmt("%lld", (long long)orig));
+            for (const char* beta : { "beta_fast", "beta_slow" }) {
+                const double v = gf((std::string("rope.scaling.yarn_") + beta).c_str(), 0.0);
+                if (v != 0.0) out->kv(std::string("rope_scaling.") + beta, fmt("%.17g", v));
+            }
+        }
+    }
 
     std::vector<std::string> toks;
     if (g.get_strs("tokenizer.ggml.tokens", &toks)) m.n_vocab = (int64_t)toks.size();
