@@ -90,9 +90,12 @@ struct RadBuilder {
     /* The buffer the plugin named as this step's logits (rad_declare_logits). */
     rad_buf logits = 0;
 
-    /* The vision tower's declaration (rad_declare_encoder), when the plugin made one. */
+    /* The vision tower's declaration (rad_declare_encoder), when the plugin made one, and the
+     * audio encoder's. */
     RadEncoderDecl encoder{};
     std::string    encoder_name;
+    RadEncoderDecl audio_encoder{};
+    std::string    audio_encoder_name;
 
     /* What rad_weight_encoding answers: the first entry whose key the source name contains. Empty
      * is a builder with no model behind it, where every weight is plain in its declared dtype. */
@@ -248,6 +251,11 @@ extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
 }
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b || !d || !d->name || !d->modalities) return RAD_E_INVAL;
+    if (d->modalities == RAD_MM_AUDIO) {
+        b->audio_encoder = *d;
+        b->audio_encoder_name = d->name;
+        return RAD_OK;
+    }
     b->encoder = *d;
     b->encoder_name = d->name;
     return RAD_OK;

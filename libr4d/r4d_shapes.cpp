@@ -382,11 +382,12 @@ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
     /* `from` and `to` are separate keys because the whole point of the op is that the two ends
-     * differ. This row is compiled for bf16 -> bf16 only -- it is a strided row copy -- and the
-     * shim refuses anything else on dtype, so a geometry that names another pair is declined here
-     * rather than described into a refusal. */
+     * differ. Two rows serve it -- bf16 -> bf16 (a strided row copy) and bf16 -> f32 (the
+     * widening) -- and the shims refuse anything else on dtype, so a geometry that names another
+     * pair is declined here rather than described into a refusal. */
     const uint32_t f = dt_par(p, n_p, "from"), t = dt_par(p, n_p, "to");
-    if (f != (uint32_t)RAD_BF16 || t != (uint32_t)RAD_BF16) return RAD_E_UNSUPPORTED;
+    if (f != (uint32_t)RAD_BF16 || (t != (uint32_t)RAD_BF16 && t != (uint32_t)RAD_F32))
+        return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = { opd(f, M, n), opd(t, M, n) };
     R4D_PICK(l);
 }
@@ -525,6 +526,17 @@ extern "C" int r4d_shape_binary(const RadParam* p, int n_p, int operand,
     const int64_t n = pi(p, n_p, "n");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n), opd(D, M, n) };
+    R4D_PICK(l);
+}
+
+/* mul_weight: the one-row form of the weight (a per-channel gain), or with `scalar` the
+ * one-element form. */
+extern "C" int r4d_shape_mul_weight(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const int64_t wn = pi(p, n_p, "scalar") ? 1 : n;
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, 1, wn), opd(D, M, n) };
     R4D_PICK(l);
 }
 

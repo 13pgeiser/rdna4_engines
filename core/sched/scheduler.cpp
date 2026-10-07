@@ -177,6 +177,9 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (!r) return RAD_E_INVAL;
     if (r->prompt.empty()) return RAD_E_INVAL;
     if (by_id_.count(r->id)) return RAD_E_DUPLICATE;
+    /* AN EMBEDDING INPUT RUNS IN ONE STEP OR NOT AT ALL (Request::embed), so one longer than a
+     * step could never be admitted and would wait for good. */
+    if (r->embed && (int64_t)r->prompt.size() > cfg_.max_tok) return RAD_E_INVAL;
     /* NO ENGINE BEHIND THE QUEUE ANY MORE. Accepting would leave the caller waiting on a step
      * that is never coming, so the sink is failed here -- it is the one thing the caller is
      * listening to -- and the refusal says why. */
@@ -900,6 +903,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
     int64_t target = s.seq_len();
     int64_t ckpt = -1;
     int64_t want = plan_chunk(r.n_computed, target, budget, &ckpt);
+    /* The whole input or nothing this step (Request::embed): the next step starts with a whole
+     * budget, and add_locked refused an input no budget holds. */
+    if (r.embed && want < target - (int64_t)r.n_computed) want = 0;
     int rc = RAD_OK;
     if (want <= 0)                                          rc = RAD_E_FULL;
     else if (s.card < 0 && free_cards_.empty())             rc = RAD_E_FULL;
@@ -1600,7 +1606,11 @@ int Scheduler::commit(const StepResult& res) {
              * reports. `n_cached` is what the prefix cache supplied and is not recomputed here. */
             if (r.n_computed >= (int64_t)r.prompt.size())
                 server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
-            if (e.produces_token && res.token) {
+            if (e.produces_token && res.token && r.embed) {
+                /* The answer is the pooled vector the engine already put in the sink; there is
+                 * no token to emit, and `eos` ends the request below. */
+                if (!s.first_tok_us) s.first_tok_us = mono_us();
+            } else if (e.produces_token && res.token) {
                 if (!s.first_tok_us) s.first_tok_us = mono_us();
                 r.output.push_back(res.token[i]);
                 overflowed = !server::sink_push(r.sink, res.token[i]);

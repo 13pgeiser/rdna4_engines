@@ -15,8 +15,12 @@
 #include "mm/media.h"
 #include "mm/processor.h"
 #include "mm_golden.h"
+#include "rad_plugin.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <memory>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -330,6 +334,53 @@ TEST(a_media_configuration_with_an_empty_band_names_it) {
     b.max_frames = 5;
     CHECK_EQ(b.check(&why), RAD_E_INVAL);
     CHECK(why.find("max_frames") != std::string::npos);
+}
+
+/* THE AUDIO FRONT END IS THE REFERENCE'S. Gemma4AudioFeatureExtractor (transformers 5.18) on a
+ * 16037-sample tone (0.5 sin 440 Hz + 0.25 sin 3 kHz at 16 kHz): 100 real frames, and these
+ * log-mel values. The front end stores bf16, so each is checked to bf16's resolution. */
+TEST(the_audio_front_end_is_the_references) {
+    mm::AudioConfig c;
+    c.rate = 16000; c.frame_length = 320; c.hop = 160; c.fft = 512; c.n_mels = 128;
+    c.min_freq = 0.0; c.max_freq = 8000.0; c.mel_floor = 1e-3;
+    c.max_samples = 480000;
+    c.tok_audio = 258881; c.tok_start = 256000; c.tok_end = 258883;
+    c.merge = 4; c.max_frames = 3000;
+    mm::Processor p;
+    CHECK_EQ(p.init_audio(c), RAD_OK);
+    const int n = 16037;
+    std::vector<float> x((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        const float t = (float)i / 16000.0f;
+        x[(size_t)i] = 0.5f * std::sin(2.0f * 3.14159265358979f * 440.0f * t) +
+                       0.25f * std::sin(2.0f * 3.14159265358979f * 3000.0f * t);
+    }
+    std::shared_ptr<mm::Item> it;
+    std::string why;
+    CHECK_EQ(p.audio_from(x, &it, &why), RAD_OK);
+    CHECK(it != nullptr);
+    if (!it) return;
+    CHECK_EQ(it->valid, 100);
+    CHECK_EQ(it->seg_rows, 25);
+    CHECK_EQ(it->grid_h, 100);
+    CHECK_EQ(it->expand.size(), (size_t)27);
+    CHECK_EQ(it->expand.front(), 256000);
+    CHECK_EQ(it->expand.back(), 258883);
+    struct Want { int frame, bin; float v; };
+    const Want want[] = { { 0, 0, -6.907755374908447f }, { 0, 14, 0.5496962070465088f },
+                          { 1, 14, -2.903297185897827f }, { 50, 14, -2.905748128890991f },
+                          { 50, 96, -5.7037482261657715f }, { 99, 14, -2.902763605117798f },
+                          { 99, 127, -5.386524200439453f } };
+    for (const Want& w : want) {
+        const float got = rad_bf16_to_f32(it->pixels[(size_t)(w.frame * 128 + w.bin)]);
+        CHECK_NEAR(got, w.v, 0.008f * std::max(1.0f, std::fabs(w.v)));
+    }
+    /* A clip shorter than one real frame is <boa><eoa> and nothing to encode. */
+    std::vector<float> tiny(150, 0.1f);
+    CHECK_EQ(p.audio_from(tiny, &it, &why), RAD_OK);
+    CHECK_EQ(it->seg_rows, 0);
+    CHECK(it->encoded);
+    CHECK_EQ(it->expand.size(), (size_t)2);
 }
 
 RAD_TEST_MAIN()
