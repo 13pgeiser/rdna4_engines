@@ -1332,6 +1332,86 @@ TEST(checkpoint_retention_is_budgeted_and_keeps_the_tip) {
     CHECK(has_512);
 }
 
+/* A SNAPSHOT A LOOKUP HANDED OUT THIS STEP KEEPS ITS SLOT until the next step begins. The
+ * admission it was handed to restores from the slot ahead of the step, and a later admission in
+ * the same step reserves its own checkpoint -- which, on a full store, runs retention and then
+ * evicts. Either taking the handed snapshot leaves the restore naming a slot the store gave back,
+ * and the engine stopped on it ("could not restore ... from checkpoint slot 1: invalid
+ * argument"). Geometric backoff over {64..512} releases 192, so the hit is made to land there. */
+TEST(a_snapshot_handed_out_this_step_survives_retention) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+
+    const auto a = tok_run(4242, 16 * 33);
+    publish(f, 1, a, 16 * 32);
+    BlockHash parent;
+    std::vector<BlockHash> hs;
+    for (int b = 0; b < 33; ++b) {
+        parent = chain_block_hash(parent, a.data() + b * 16, 16, nullptr, 0, b * 16);
+        hs.push_back(parent);
+    }
+    std::vector<int32_t> slot_at(9, -1);
+    for (int i = 1; i <= 8; ++i) {
+        CHECK_OK(f.pc.reserve_checkpoint(1, i * 64, hs[i * 4 - 1], &slot_at[(size_t)i]));
+        f.pc.commit_checkpoint(hs[i * 4 - 1]);
+    }
+    CHECK_EQ(f.kv.free_checkpoint_slots(), 0ll);
+
+    /* A prompt that leaves the chain after 200 tokens: the deepest snapshot under it is 192. */
+    f.pc.begin_step();
+    auto b = a;
+    b.resize(16 * 20);
+    for (int i = 200; i < (int)b.size(); ++i) b[(size_t)i] = 900000 + i;
+    std::vector<std::vector<int32_t>> hit;
+    const CacheHit h = f.pc.lookup(b, {}, &hit);
+    REQUIRE_EQ(h.n_linear_tokens, 192);
+    REQUIRE_EQ(h.checkpoint_slot, slot_at[3]);
+
+    /* The same step's next reservation finds the store full. */
+    BlockHash other = hs[3];
+    other.lo ^= 0x5eedull;
+    int32_t s9 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(2, 64, other, &s9));
+    CHECK(s9 >= 0);
+    CHECK(s9 != h.checkpoint_slot);
+    CHECK(f.kv.checkpoint_held(h.checkpoint_slot));
+    bool kept_192 = false;
+    for (int64_t p : f.pc.checkpoints(1)) if (p == 192) kept_192 = true;
+    CHECK(kept_192);
+}
+
+/* AND THE EVICTION AFTER RETENTION passes it over too. With one slot, the handed snapshot is the
+ * only thing a reservation could take, so the reservation is refused instead: that chunk goes
+ * without a checkpoint, and the restore still has its state. */
+TEST(a_snapshot_handed_out_this_step_is_not_evicted) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/1));
+    const auto a = tok_run(5151, 16 * 9);
+    publish(f, 1, a, 16 * 8);
+    BlockHash parent;
+    std::vector<BlockHash> hs;
+    for (int b = 0; b < 9; ++b) {
+        parent = chain_block_hash(parent, a.data() + b * 16, 16, nullptr, 0, b * 16);
+        hs.push_back(parent);
+    }
+    int32_t s1 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(1, 64, hs[3], &s1));
+    f.pc.commit_checkpoint(hs[3]);
+
+    f.pc.begin_step();
+    std::vector<std::vector<int32_t>> hit;
+    const CacheHit h = f.pc.lookup(a, {}, &hit);
+    REQUIRE_EQ(h.checkpoint_slot, s1);
+
+    int32_t s2 = -1;
+    CHECK_EQ(f.pc.reserve_checkpoint(1, 128, hs[7], &s2), RAD_E_FULL);
+    CHECK(f.kv.checkpoint_held(s1));
+    CHECK_EQ(f.pc.stats().ckpt_evictions, 0ll);
+
+    f.pc.begin_step();
+    CHECK_OK(f.pc.reserve_checkpoint(1, 128, hs[7], &s2));
+}
+
 TEST(a_dead_sessions_tip_is_evictable_so_the_slot_pool_cannot_wedge) {
     /* One checkpoint each from more DISTINCT sessions than there are slots. Every one of them is
      * its session's tip, so a rule that made a tip unevictable would wedge the pool here: the

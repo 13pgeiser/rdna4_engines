@@ -373,10 +373,14 @@ struct ChatRenderOptions {
     bool        enable_thinking = true;
     bool        parallel_tool_calls = true;
     std::string tool_choice = "auto";        /* auto | none | required */
+    std::string tool_name;                   /* a named tool_choice's function, or "" */
     std::string grammar;                     /* the caller's GBNF, or "" */
     std::string json_schema;                 /* a response_format schema, as JSON text, or "" */
     std::string reasoning_format = "auto";
     std::map<std::string, std::string> template_kwargs;
+    /* A render whose refusal is an answer and not an error -- the startup probes of what the
+     * template takes -- so the template's refusal is not logged. */
+    bool        quiet = false;
 };
 
 /* What it gives back. A STRING IS NOT ENOUGH, and that is the whole reason this struct exists: a

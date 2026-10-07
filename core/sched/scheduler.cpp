@@ -1263,8 +1263,23 @@ const RadBatch* Scheduler::step() {
     }();
     if (force_mixed && plan_.phase == RAD_PHASE_DECODE) plan_.phase = RAD_PHASE_MIXED;
 
+    /* EVERY SNAPSHOT THIS STEP RESTORES FROM IS STILL IN THE STORE. The prefix cache keeps a
+     * handed-out snapshot's slot until the next step begins (PrefixCache::begin_step), so this
+     * holds by construction; it is checked because a restore from a slot the store gave back
+     * reads another session's state or nothing, and the engine can only stop on it. A step that
+     * finds one is abandoned like a failed staging, below: the request gives its hit back and is
+     * prefilled again, and the rest re-schedule unchanged. */
+    bool lost_restore = false;
+    for (const StepEntry& e : plan_.e) {
+        if (e.ckpt_restore < 0 || kv_->checkpoint_held(e.ckpt_restore)) continue;
+        RAD_ERR("sequence %llu was to resume from checkpoint slot %d, which the store no longer "
+                "holds; its hit is given back and its prompt prefilled again",
+                (unsigned long long)e.seq, (int)e.ckpt_restore);
+        lost_restore = true;
+    }
+
     step_start_ = std::chrono::steady_clock::now();
-    const RadBatch* b = builder_.build(plan_, *kv_, step_);
+    const RadBatch* b = lost_restore ? nullptr : builder_.build(plan_, *kv_, step_);
     if (!b) {
         /* Staging failed. Nothing was computed, so nothing is committed and n_computed did not
          * advance: the next step re-schedules the same chunks and the KV allocations already made

@@ -123,6 +123,10 @@ static const Flag g_flags[] = {
     "                                    set is the template's: Qwen3.8 takes xhigh|medium|low and defaults\n"
     "                                    to xhigh, which on a short task can spend the whole token budget\n"
     "                                    inside <think> and answer nothing. \"none\" turns thinking off" },
+    { "--reasoning-effort-map", "MAP",  "FROM=TO[,FROM=TO...]: a `reasoning_effort` a request sends, replaced before\n"
+    "                                    the chat template sees it -- high=xhigh lets a client that always sends\n"
+    "                                    OpenAI's top level reach Qwen3.8's. TO is checked against the template at\n"
+    "                                    startup; none and minimal turn thinking off. Repeatable" },
     { "--thinking-token-budget", "N",   "default `thinking_token_budget` for chat requests that do not set one: at\n"
     "                                    N reasoning tokens the reasoning block is closed and the answer follows,\n"
     "                                    so a client's max_tokens is not spent on reasoning alone. Unset is no\n"
@@ -480,6 +484,24 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--reasoning-effort"))      { if (!(v = need(i))) return RAD_E_INVAL;
                                                  c->reasoning_effort = v; }
+        else if (S("--reasoning-effort-map"))  {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const std::string all = v;
+            size_t at = 0;
+            while (at <= all.size()) {
+                const size_t end = std::min(all.find(',', at), all.size());
+                const std::string pair = all.substr(at, end - at);
+                const size_t eq = pair.find('=');
+                if (eq == std::string::npos || eq == 0 || eq + 1 == pair.size() ||
+                    pair.find('=', eq + 1) != std::string::npos) {
+                    RAD_ERR("--reasoning-effort-map takes FROM=TO pairs separated by commas, "
+                            "not '%s'", pair.c_str());
+                    return RAD_E_INVAL;
+                }
+                c->reasoning_effort_map[pair.substr(0, eq)] = pair.substr(eq + 1);
+                at = end + 1;
+            }
+        }
         else if (S("--thinking-token-budget")) { if (!(v = need(i)) ||
                                                      !parse_int(a.c_str(), v, 0, INT32_MAX,
                                                                 &c->thinking_token_budget))

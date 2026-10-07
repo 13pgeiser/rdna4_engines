@@ -918,6 +918,77 @@ TEST(the_generated_grammar_accepts_what_the_vendored_one_accepts) {
     log_set_level(Log::Warn);
 }
 
+/* A REQUIRED CALL IS THE WHOLE REPLY: from the generation prompt the sampler feeds it, the
+ * reasoning block and then the calls, with no prose before them and nothing after them -- so a
+ * complete grammar admits only the end of the turn and the reply stops at the last call. A named
+ * function admits that function alone, and `parallel_tool_calls: false` one call. */
+TEST(a_required_call_grammar_is_the_whole_reply) {
+    log_set_level(Log::Error);
+    static const SimpleVocab vocab = [] {
+        SimpleVocab v;
+        for (int c = 32; c < 127; ++c) v.add(std::string(1, (char)c));
+        v.add("\n");
+        return v;
+    }();
+    int checked = 0;
+    for (const Model& m : models()) {
+        Bench* b = bench(m, ChatRequest{});
+        if (!b || b->prompt().grammar.empty()) continue;
+        const std::string gp = b->prompt().generation_prompt;
+        auto grammar = [&](bool parallel, const std::string& only) {
+            ChatGrammarRequest gq;
+            gq.tools = &agent_tools();
+            gq.generation_prompt = gp;
+            gq.parallel_tool_calls = parallel;
+            gq.require_call = true;
+            gq.only_tool = only;
+            ChatGrammar g;
+            std::string why;
+            CHECK_OK(chat_format_grammar(b->format(), gq, &g, &why));
+            CHECK(!g.lazy);
+            CHECK(g.trigger_words.empty());
+            return g.text;
+        };
+        /* 1 complete, 0 admitted but unfinished or refused. The sampler feeds the generation
+         * prompt first (SamplingParams::grammar_prefix), so the reply is read after it. */
+        auto admits = [&](const std::string& gbnf, const std::string& reply) {
+            std::unique_ptr<GbnfGrammar> gr;
+            std::string err;
+            if (GbnfGrammar::create(gbnf, "root", &vocab, false, {}, {}, &gr, &err) < 0) return -1;
+            if (gr->accept_str(gp) < 0 || gr->accept_str(reply) < 0) return 0;
+            return gr->complete() ? 1 : 0;
+        };
+        const std::string any = grammar(true, ""), one = grammar(false, ""),
+                          read = grammar(true, "read");
+        const std::string T = "Thinking it over.\n</think>\n\n";
+        const std::string bash = C(m, "bash", { { "command", "ls" } });
+        const std::string rd = C(m, "read", { { "path", "/a" } });
+
+        CHECK_EQ(admits(any, T + bash), 1);
+        CHECK_EQ(admits(any, T + bash + "\n" + rd), 1);
+        CHECK_EQ(admits(any, T + "The answer is 42."), 0);
+        CHECK_EQ(admits(any, T + "Checking.\n" + bash), 0);
+        CHECK_EQ(admits(any, T + bash + "\nDone now."), 0);
+        CHECK_EQ(admits(any, T), 0);
+        CHECK_EQ(admits(one, T + bash), 1);
+        CHECK_EQ(admits(one, T + bash + "\n" + rd), 0);
+        CHECK_EQ(admits(read, T + rd), 1);
+        CHECK_EQ(admits(read, T + bash), 0);
+
+        ChatGrammarRequest gq;
+        gq.tools = &agent_tools();
+        gq.require_call = true;
+        gq.only_tool = "nope";
+        ChatGrammar g;
+        std::string why;
+        CHECK(chat_format_grammar(b->format(), gq, &g, &why) == RAD_E_INVAL);
+        CHECK(why.find("nope") != std::string::npos);
+        ++checked;
+    }
+    CHECK(checked > 0);
+    log_set_level(Log::Warn);
+}
+
 /* ================================================================== the description */
 
 TEST(the_derived_formats_are_the_ones_in_service) {

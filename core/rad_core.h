@@ -756,6 +756,9 @@ struct Config {
     /* The chat endpoint's default `reasoning_effort`, empty for the template's own default.
      * Passed through verbatim: the legal set belongs to the template, not to us. */
     std::string reasoning_effort;
+    /* --reasoning-effort-map FROM=TO,...: an effort a request sends, replaced before the template
+     * sees it. */
+    std::map<std::string, std::string> reasoning_effort_map;
     /* --thinking-token-budget: the chat endpoint's default `thinking_token_budget`, -1 for none. */
     int64_t     thinking_token_budget = -1;
     int         port = 8000;

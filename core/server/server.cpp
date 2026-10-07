@@ -69,6 +69,7 @@ Server::Server(const Deps& d, const ServerOptions& o)
     lim_.default_sampling = opt_.default_sampling;
     lim_.default_dry_breakers_set = opt_.default_dry_breakers_set;
     lim_.default_template_kwargs = opt_.default_template_kwargs;
+    lim_.reasoning_effort_map = opt_.reasoning_effort_map;
     lim_.reasoning_format = opt_.reasoning_format;
 
     odeps_.tok = deps_.tok;
@@ -196,11 +197,56 @@ void Server::check_template_defaults(std::string* kwargs_why, std::string* effor
     OaiLimits l = lim_;
     l.default_template_kwargs.clear();
     l.default_reasoning_effort.clear();
+    l.probe = true;
     if (!render(l, nullptr)) return;
     l.default_template_kwargs = lim_.default_template_kwargs;
     if (!l.default_template_kwargs.empty() && !render(l, kwargs_why)) return;
     l.default_reasoning_effort = lim_.default_reasoning_effort;
     if (!l.default_reasoning_effort.empty()) render(l, effort_why);
+}
+
+std::vector<std::string> Server::probe_reasoning_efforts() {
+    lim_.reasoning_efforts.clear();
+    if (!deps_.chat) return {};
+    OaiLimits l = lim_;
+    l.default_template_kwargs.clear();
+    l.default_reasoning_effort.clear();
+    l.reasoning_effort_map.clear();
+    l.probe = true;
+    auto takes = [&](const std::string& effort) {
+        std::string body = R"({"messages":[{"role":"user","content":"Hello"}],"max_tokens":1)";
+        if (!effort.empty()) body += R"(,"reasoning_effort":)" + json(effort).dump();
+        body += "}";
+        OaiRequest r;
+        ApiError e;
+        return parse_chat_request(body, odeps_, l, &r, &e) >= 0;
+    };
+    /* A render that fails with no effort at all says nothing about efforts, and one that takes a
+     * word no ladder has takes every word. */
+    if (!takes("") || takes("radiance-probe-not-a-level")) return {};
+    std::vector<std::string> set;
+    for (const char* w : { "low", "medium", "high", "xhigh", "max" })
+        if (takes(w)) set.push_back(w);
+    lim_.reasoning_efforts = set;
+    return set;
+}
+
+std::string Server::check_reasoning_effort_map() const {
+    if (!deps_.chat) return std::string();
+    OaiLimits l = lim_;
+    l.default_template_kwargs.clear();
+    l.default_reasoning_effort.clear();
+    l.reasoning_effort_map.clear();
+    l.probe = true;
+    for (const auto& [from, to] : lim_.reasoning_effort_map) {
+        const std::string body = R"({"messages":[{"role":"user","content":"Hello"}],"max_tokens":1,)"
+                                 R"("reasoning_effort":)" + json(to).dump() + "}";
+        OaiRequest r;
+        ApiError e;
+        if (parse_chat_request(body, odeps_, l, &r, &e) < 0)
+            return from + "=" + to + ": the chat template refuses '" + to + "': " + e.message;
+    }
+    return std::string();
 }
 
 std::string Server::check_thinking_budget() const {

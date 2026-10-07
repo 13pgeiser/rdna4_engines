@@ -555,6 +555,7 @@ public:
         o.grammar               = opt.grammar;
         o.json_schema           = opt.json_schema;
         o.template_kwargs       = opt.template_kwargs;
+        o.quiet                 = opt.quiet;
 
         ChatPrompt p;
         const int st = t_.apply(messages, tools, o, &p);
@@ -597,6 +598,8 @@ public:
             gq.generation_prompt   = p.generation_prompt;
             gq.parallel_tool_calls = opt.parallel_tool_calls;
             gq.extract_reasoning   = opt.reasoning_format != "none";
+            gq.require_call        = calls && opt.tool_choice == "required";
+            gq.only_tool           = opt.tool_name;
             ChatGrammar g;
             std::string gerr;
             if (chat_format_grammar(f, gq, &g, &gerr) < 0) {

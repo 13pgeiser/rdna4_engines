@@ -54,6 +54,7 @@
 #include "mem/kv.h"
 #include "rad_core.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -325,7 +326,9 @@ public:
     size_t resident_prefix(const std::vector<BlockHash>& chain) const;
     void release(uint64_t req);
     /* A step's admissions begin. The snapshots the last step's lookups handed out have been read
-     * by its forward, which committed before this step was planned. */
+     * by its forward, which committed before this step was planned. Until then a handed snapshot
+     * keeps its slot through every path that would give one up: retention, the eviction in
+     * reserve_checkpoint, and free_checkpoint_for_restore. */
     void begin_step() { handed_.clear(); }
     /* The tiers lost it -- the disk store let it go, a failed read, or an entry they were told to
      * forget. Erase the index entry and give back the slot, if it still has one. */
@@ -339,7 +342,10 @@ public:
     bool    is_checkpoint(int64_t pos) const { return interval_ > 0 && pos > 0 && pos % interval_ == 0; }
 
     /* Reserve a snapshot slot for `session` at `pos`. Applies the retention policy when the slot
-     * pool is exhausted, never evicting a session tip. RAD_E_FULL when even that is not enough. */
+     * pool is exhausted, then evicts the least recently used snapshot, a session's tip last. A
+     * snapshot a lookup handed out this step is never given up: the admission it was handed to
+     * restores from the slot ahead of the step, after this reservation was made. RAD_E_FULL when
+     * nothing else can be given up. */
     int  reserve_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
                             int32_t* slot_out);
     /* The state named by `prefix` is now IN its slot. Until this is called the reservation is only
@@ -435,8 +441,11 @@ private:
     bool        released_ = false;
     mutable std::unordered_map<BlockHash, Ckpt, BlockHashHash> ck_by_prefix_;
     std::unordered_map<uint64_t, std::vector<BlockHash>> ck_by_session_;
-    /* Snapshots lookup handed out since begin_step: not a restore's to take (free_checkpoint_for_restore). */
+    /* Snapshots lookup handed out since begin_step: kept in their slots until then (begin_step). */
     mutable std::vector<BlockHash> handed_;
+    bool handed(const BlockHash& h) const {
+        return std::find(handed_.begin(), handed_.end(), h) != handed_.end();
+    }
     mutable uint64_t clock_ = 0;
     std::unique_ptr<CheckpointPolicy> policy_;
     mutable Stats stats_;

@@ -59,6 +59,7 @@ struct ChatOptions {
     bool        add_bos = false;
     bool        add_eos = false;
     std::map<std::string, std::string> template_kwargs;
+    bool        quiet = false;                  /* a refusal is not logged: a startup probe */
 };
 
 /* Everything the scheduler and the sampler need for one request, produced in one pass. */

@@ -757,7 +757,8 @@ int Engine::read_checkpoint_metadata() {
 /* ================================================================== 3 + 4. plugins, declare */
 int Engine::load_plugins() {
     int s = rad_tools_load_plugins(cfg_.radiance_home, cfg_.kernel_hierarchy,
-                                   meta_.arch_id, meta_.quant ? meta_.quant : "", &plugins_);
+                                   meta_.arch_id, meta_.quant ? meta_.quant : "", &plugins_,
+                                   ckpt_ && ckpt_->imports() != Checkpoint::Import::None);
     if (s < 0) {
         /* rad_tools_load_plugins has said why -- a plugin refused, or no architecture plugin for
          * this model -- each by name. What it does not know is that this was the engine's start. */
@@ -3332,18 +3333,29 @@ int Engine::start() {
      *
      * Everything above this line allocated: the two pools, the activation arena, the step batch
      * staging, the weight tables a grouped GEMM walks. What is left on the card should now be
-     * --gpu-headroom-mib and nothing else, and this is the only place that can say whether it is.
+     * --gpu-headroom-mib plus what the budget kept for later, and this is the only place that can
+     * say whether it is.
      *
-     * Both directions are worth a line. TOO LITTLE means the terms the resolver could not compute
-     * -- anything still allocated lazily, and whatever the driver took after the reading -- ate
-     * into the memory the operator asked to keep, and the next thing to allocate on this card is
-     * whatever fails. TOO MUCH means the budget left VRAM on the floor, which on a model whose
-     * experts do not fit is milliseconds of decode step for every unspent GiB -- the exact
-     * failure this resolver exists to remove.
+     * TOO LITTLE is memory taken after the budget read the card that the budget did not count:
+     * another process on the card (a desktop, a second server), or a driver allocation made
+     * after the reading. It comes out of the room a kernel's first launch allocates its code
+     * object and scratch from, and running out of that is a fault inside the HIP runtime.
      *
-     * A slack of one arena is tolerated silently: MiB rounding and a kernel plugin's own
-     * workspaces live in there, and naming a number this close to right would be noise. */
-    const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * (1ll << 20);
+     * THE WARNING IS ON THE ROOM, NOT ON THE FLAG. Raising --gpu-headroom-mib raises what is left
+     * here and what this compares it with by the same amount, so a check of free memory against
+     * the flag can never be satisfied by the flag: the gap is whatever was taken after the
+     * reading, and it is there at every value. The room a first launch has -- what is free less
+     * what the budget kept for later -- is what the flag actually moves, and it is held against
+     * this engine's own allowance for its first launches (the flag's default). A card short of
+     * that is warned with the value that clears it; one that kept the allowance but lost part of
+     * a larger stated headroom says so on its INFO line.
+     *
+     * TOO MUCH means the budget left VRAM on the floor, which on a model whose experts do not
+     * fit is milliseconds of decode step for every unspent GiB. A slack of 256 MiB is tolerated
+     * silently: MiB rounding and a kernel plugin's own workspaces live in there. */
+    const int64_t MiB = 1024 * 1024;
+    const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * MiB;
+    const int64_t allowance = Config{}.gpu_headroom_mib * MiB;
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RadDeviceProps props{};
@@ -3351,29 +3363,37 @@ int Engine::start() {
 
         /* AGAINST THE HEADROOM AND WHAT THE BUDGET KEPT FOR LATER, because both are still free
          * here: the step staging is allocated by serve(), and the KV tiers' staging and a second
-         * compute lane are built on first use. A card at exactly the headroom now would be under
-         * it once those exist. */
-        const int64_t MiB  = 1024 * 1024;
+         * compute lane are built on first use. */
         const int64_t late = late_step_bytes_ + late_lazy_bytes_;
         const int64_t want = headroom + late;
         const int64_t got  = props.vram_free;
+        const int64_t room = got - late;
         const std::string asked =
             late > 0 ? fmt("%s (the %s --gpu-headroom-mib and %s kept for the step staging and "
                            "for what is built on first use)", humanb(want).c_str(),
                            humanb(headroom).c_str(), humanb(late).c_str())
                      : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
-        if (got < want) {
-            /* WHAT THIS SHORTFALL THREATENS is whatever allocates after startup: a kernel's code
-             * object, loaded on its FIRST launch, and a spilling kernel's scratch, sized on its
-             * first launch by the whole grid. Neither is knowable when the budget is resolved, and
-             * running out for either is a fault inside the HIP runtime rather than an error. */
-            RAD_WARN("card %d settled at %s free against %s. The difference is allocations "
-                     "made after the budget was resolved, and it comes out of the room a kernel's "
-                     "first launch allocates from. Raise --gpu-headroom-mib by at least %s so the "
-                     "budget is resolved against the right number.",
-                     r->device, humanb(got).c_str(), asked.c_str(), humanb(want - got).c_str());
-        }
-        else if (got > want + 256 * MiB) {
+        if (room < allowance) {
+            const int64_t raise_mib = (allowance - room + MiB - 1) / MiB;
+            RAD_WARN("card %d settled at %s free against %s, which leaves %s for a kernel's first "
+                     "launch to load its code object and size its scratch in -- under the %s this "
+                     "engine allows for its own. %s Set --gpu-headroom-mib to at least %lld: what "
+                     "is left here rises with it one for one.",
+                     r->device, humanb(got).c_str(), asked.c_str(),
+                     humanb(std::max<int64_t>(room, 0)).c_str(), humanb(allowance).c_str(),
+                     got < want
+                         ? fmt("%s of the headroom was taken after the budget read the card, by "
+                               "another process on it or an allocation the budget does not "
+                               "count.", humanb(want - got).c_str()).c_str()
+                         : "",
+                     (long long)(std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib));
+        } else if (got < want) {
+            RAD_INFO("card %d settled at %s free against %s: %s of the headroom was taken after "
+                     "the budget read the card, by another process on it or an allocation the "
+                     "budget does not count, and %s is left for first launches",
+                     r->device, humanb(got).c_str(), asked.c_str(), humanb(want - got).c_str(),
+                     humanb(room).c_str());
+        } else if (got > want + 256 * MiB) {
             /* AND "TOO MUCH" IS ONLY A FAULT WHERE SOMEBODY STATED THE BUDGET. Where the resolver
              * made the split, what is left is left because neither pool could address another
              * byte -- a small dense model already at the largest context its cache can hold

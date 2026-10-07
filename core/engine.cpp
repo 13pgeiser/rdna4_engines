@@ -665,16 +665,17 @@ int Engine::step_loop() {
                 for (const StepEntry& e : plan.e) {
                     if (e.ckpt_restore < 0) continue;
                     if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
-                    for (auto& rk : ranks_) {
+                    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                        auto& rk = ranks_[ri];
                         /* This rank's device, for its own stream and its own state slots. */
                         if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                         const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
                                                                 (int)ckpt_slots_.size(),
                                                                 e.ckpt_restore, rk->ctx.stream());
                         if (s < 0) {
-                            RAD_ERR("could not restore sequence %llu from checkpoint slot %d: %s",
-                                    (unsigned long long)e.seq, (int)e.ckpt_restore,
-                                    rad_strerror(s));
+                            RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
+                                    "rank %d: %s", (unsigned long long)e.seq,
+                                    (int)e.ckpt_restore, (int)ri, rad_strerror(s));
                             if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
                             return s;
                         }
@@ -2149,6 +2150,7 @@ int Engine::run_server() {
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     o.default_reasoning_effort = cfg_.reasoning_effort;
+    o.reasoning_effort_map = cfg_.reasoning_effort_map;
     o.default_thinking_budget = cfg_.thinking_token_budget;
     o.default_sampling = resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
     o.default_dry_breakers_set = cfg_.sample_dry_seq_breakers.has_value();
@@ -2274,6 +2276,28 @@ int Engine::run_server() {
             RAD_WARN("--reasoning-effort %s: the chat template refuses it, so every chat request "
                      "that sends no reasoning effort of its own will be answered 400: %s",
                      cfg_.reasoning_effort.c_str(), eff_why.c_str());
+    }
+    /* THE EFFORTS THE TEMPLATE TAKES, said once: a client sending another gets this set back in
+     * its 400 and can read it off /server_info beforehand. A map whose target the template
+     * refuses would refuse every request it maps, so it stops startup. */
+    if (d.chat) {
+        const std::vector<std::string> efforts = srv.probe_reasoning_efforts();
+        std::string mapped;
+        for (const auto& [from, to] : cfg_.reasoning_effort_map)
+            mapped += fmt("%s%s -> %s", mapped.empty() ? "" : ", ", from.c_str(), to.c_str());
+        if (!efforts.empty()) {
+            std::string list;
+            for (const std::string& e : efforts) list += (list.empty() ? "" : ", ") + e;
+            RAD_INFO("chat: the template takes reasoning_effort %s, and none or minimal turn "
+                     "thinking off%s%s", list.c_str(), mapped.empty() ? "" : "; mapped: ",
+                     mapped.c_str());
+        } else if (!mapped.empty()) {
+            RAD_INFO("chat: reasoning_effort mapped: %s", mapped.c_str());
+        }
+        if (const std::string why = srv.check_reasoning_effort_map(); !why.empty()) {
+            RAD_ERR("--reasoning-effort-map %s", why.c_str());
+            return RAD_E_INVAL;
+        }
     }
     /* A BUDGET THE MODEL CANNOT HOLD STOPS STARTUP, as --chat-template-kwargs does: the default
      * would apply to no request at all, and the operator who set it would not find out. */

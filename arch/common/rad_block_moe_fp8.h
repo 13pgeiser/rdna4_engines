@@ -506,6 +506,31 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
     return RAD_E_DTYPE;
 }
 
+/* WHETHER A CHECKPOINT SHIPS ONE LAYER'S EXPERTS STACKED OR ONE BY ONE, as the Src it fills.
+ * Recent releases stack them -- `<prefix>.gate_up_proj` and `<prefix>.down_proj` -- and a
+ * quantised export (AutoRound's) writes each expert on its own, `<prefix>.<e>.{gate,up,down}_proj`.
+ * Each form is asked of the checkpoint through a probe name mapped to its first expert, which the
+ * checkpoint answers or does not. Stacked is the answer when neither is found: a container is
+ * read by declared name, the same under both maps, so it asks nothing here. `tag` keeps one
+ * caller's probe name apart from another's for the same layer. */
+inline int moe_expert_sources(RadBuilder* b, Names& nm, const char* tag, const char* prefix,
+                              MoeFP8::Src* src) {
+    const char* gu = nm.ckpt("%s.gate_up_proj", prefix);
+    const char* probe = nm.f("probe.%s.%s.0", tag, prefix);
+    RadEncoding e{};
+    RAD_ARCH_TRY(map_concat(b, probe, { nm.ckpt("%s.0.gate_proj.weight", prefix),
+                                        nm.ckpt("%s.0.up_proj.weight", prefix) }));
+    if (weight_enc(b, probe, &e)) {
+        src->experts = nm.ckpt("%s", prefix);
+        src->experts_gate_up = src->experts_down = nullptr;
+    } else {
+        src->experts = nullptr;
+        src->experts_gate_up = gu;
+        src->experts_down    = nm.ckpt("%s.down_proj", prefix);
+    }
+    return RAD_OK;
+}
+
 /* The gate_up and down name maps of one expert: a dim-0 slice of the stacked tensors, or the
  * checkpoint's per-expert gate and up joined along rows. `gate_up` false maps down alone. */
 inline int moe_map_expert(RadBuilder* b, Names& nm, const MoeFP8::Src& src, const char* guw,

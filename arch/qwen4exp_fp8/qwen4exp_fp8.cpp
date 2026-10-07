@@ -520,8 +520,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                ? (int64_t)g.rank * (mc.n_expert / g.world) : 0;
         {
             MoeFP8::Src ps{};
-            ps.experts_gate_up = nm.ckpt("model.language_model.layers.0.mlp.experts.gate_up_proj");
-            ps.experts_down    = nm.ckpt("model.language_model.layers.0.mlp.experts.down_proj");
+            RAD_ARCH_TRY(moe_expert_sources(b, nm, "format",
+                                            "model.language_model.layers.0.mlp.experts", &ps));
             RAD_ARCH_TRY(MoeFP8::probe(b, nm, 0, ps, &mc));
         }
         /* A CHECKPOINT SERVED AS IT SHIPS IS bf16 THROUGHOUT. Plain experts mean a container
@@ -1205,8 +1205,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         MoeFP8::Src ms{};
         ms.cfg              = m.moecfg;
         ms.router           = nm.ckpt("%s.%lld.mlp.gate.weight", pre, (long long)l);
-        ms.experts_gate_up  = nm.ckpt("%s.%lld.mlp.experts.gate_up_proj", pre, (long long)l);
-        ms.experts_down     = nm.ckpt("%s.%lld.mlp.experts.down_proj",    pre, (long long)l);
+        RAD_ARCH_TRY(moe_expert_sources(b, nm, "layer",
+                                        nm.ckpt("%s.%lld.mlp.experts", pre, (long long)l), &ms));
         if (m.moecfg.n_ff_shared > 0) {
             ms.shared      = nm.ckpt("%s.%lld.mlp.shared_expert", pre, (long long)l);
             ms.shared_gate = nm.ckpt("%s.%lld.mlp.shared_expert_gate.weight", pre, (long long)l);
@@ -1367,8 +1367,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         ts.mlp.cfg             = m.moecfg;
         ts.mlp.router          = nm.ckpt("%s.layers.0.mlp.gate.weight", mpre);
-        ts.mlp.experts_gate_up = nm.ckpt("%s.layers.0.mlp.experts.gate_up_proj", mpre);
-        ts.mlp.experts_down    = nm.ckpt("%s.layers.0.mlp.experts.down_proj", mpre);
+        RAD_ARCH_TRY(moe_expert_sources(b, nm, "mtp", nm.ckpt("%s.layers.0.mlp.experts", mpre),
+                                        &ts.mlp));
         if (m.moecfg.n_ff_shared > 0) {
             ts.mlp.shared      = nm.ckpt("%s.layers.0.mlp.shared_expert", mpre);
             ts.mlp.shared_gate = nm.ckpt("%s.layers.0.mlp.shared_expert_gate.weight", mpre);

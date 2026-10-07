@@ -85,6 +85,8 @@ struct ServerOptions {
     bool        default_dry_breakers_set = false;
     /* The deployment's chat template variables and reply format. See OaiLimits. */
     std::map<std::string, std::string> default_template_kwargs;
+    /* --reasoning-effort-map. See OaiLimits::reasoning_effort_map. */
+    std::map<std::string, std::string> reasoning_effort_map;
     std::string reasoning_format = "auto";
     bool        allow_image = false;
     bool        allow_video = false;
@@ -148,6 +150,15 @@ public:
      * would ask for it. Empty when this model's reasoning block can hold one; otherwise the 400 a
      * request naming the budget would get, which says why. */
     std::string check_thinking_budget() const;
+    /* THE EFFORTS THE CHAT TEMPLATE TAKES, found by parsing a one-message chat with each word this
+     * server knows of (low, medium, high, xhigh, max) the way a request would send it, with no
+     * deployment defaults. A template that takes a word nobody uses takes any word, and the answer
+     * is empty. Kept for the refusal of a word outside the set and for /server_info; called once,
+     * before run(). */
+    std::vector<std::string> probe_reasoning_efforts();
+    /* --reasoning-effort-map's targets, each rendered as a request's effort would be. Empty when
+     * the template takes every one; otherwise the first refusal, naming the target. */
+    std::string check_reasoning_effort_map() const;
     void stop();
     int  port() const { return transport_.port(); }   /* 0 until run() is accepting */
 

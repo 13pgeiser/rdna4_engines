@@ -462,11 +462,21 @@ int main(int argc, char** argv) {
 
     /* ---------------------------------------------------------------- plugins */
     LoadedPlugins plugins;
-    if (rad_tools_load_plugins(home, hierarchy, meta.arch, meta.quant, &plugins) < 0) {
+    const bool imported = ck.imports() != Checkpoint::Import::None;
+    if (!ck.import_refusal().empty())
+        RAD_ERR("quantisation '%s' cannot be imported: %s", meta.quant.c_str(),
+                ck.import_refusal().c_str());
+    if (rad_tools_load_plugins(home, hierarchy, meta.arch, meta.quant, &plugins, imported) < 0) {
         RAD_ERR("rad-convert runs the architecture plugin's declare: its name map says which "
                 "checkpoint tensors make each weight, and the kernels it resolves are what the "
                 "recipe is checked against");
         return 1;
+    }
+    /* AN IMPORTED QUANTISATION IS RECORDED AS THE DESCRIPTOR OF THE PLUGIN THAT SERVES IT: every
+     * weight states its own encoding in the container, and the engine selects by exact match. */
+    if (imported) {
+        meta.quant = plugins.arch_quant;
+        meta.finish();
     }
     Registry& reg = rad_tools_registry();
     std::deque<Compiled> compiled;
@@ -530,7 +540,7 @@ int main(int argc, char** argv) {
             const RadQuantWeight qw = quant_weight(L, nullptr);
             const int st = L.rule->q->encoding(L.rule->params.data(), (int)L.rule->params.size(),
                                                &qw, &L.enc);
-            if (st == RAD_E_UNSUPPORTED && L.src.trivial) {
+            if (st == RAD_E_UNSUPPORTED && (L.src.trivial || L.src.imported)) {
                 /* declined -- a norm under a pattern meant for matrices -- and kept as it is */
                 L.rule = nullptr;
                 L.enc = L.src.enc;
@@ -541,7 +551,7 @@ int main(int argc, char** argv) {
                 L.status = RAD_E_FORMAT;
                 L.why = r->quantizer + " answered with a malformed encoding";
             }
-        } else if (!L.src.trivial) {
+        } else if (!L.src.trivial && !L.src.imported) {
             L.status = RAD_E_UNSUPPORTED;
             L.why = "no recipe rule matches it, and its checkpoint form is not one the engine "
                     "serves as it is: " + L.src.why;
@@ -666,10 +676,12 @@ int main(int argc, char** argv) {
     std::sort(plan.begin(), plan.end(), plan_less);
 
     {
-        int64_t n_q = 0, n_kept = 0;
-        for (const Logical* L : plan) (L->rule ? n_q : n_kept)++;
+        int64_t n_q = 0, n_kept = 0, n_imp = 0;
+        for (const Logical* L : plan) (L->rule ? n_q : L->src.imported ? n_imp : n_kept)++;
         RAD_INFO("plan     %zu weight(s): %lld quantised by the recipe, %lld kept as the "
-                 "checkpoint holds them", plan.size(), (long long)n_q, (long long)n_kept);
+                 "checkpoint holds them%s", plan.size(), (long long)n_q, (long long)n_kept,
+                 n_imp ? fmt(", %lld imported from its packed codes", (long long)n_imp).c_str()
+                       : "");
         for (const auto& c : compiled) {
             int64_t n = 0;
             for (const Logical* L : plan) if (L->rule == &c) ++n;
@@ -976,7 +988,9 @@ int main(int argc, char** argv) {
             for (int k = 0; k < L.enc.n_planes; ++k) {
                 const std::vector<const SrcTensor*>& src = k == 0 ? L.src.pieces : L.src.scales;
                 const int64_t pb = w.plane_bytes(idx, k);
-                if (L.src.concat_dim == 0 || src.size() == 1) {
+                /* An imported weight is re-laid row by row (ckpt_plane_rows); its bytes are not
+                 * the plane's. */
+                if (!L.src.imported && (L.src.concat_dim == 0 || src.size() == 1)) {
                     int64_t off = 0;
                     for (const SrcTensor* s : src) {
                         if (w.write_plane(idx, k, off, s->data, s->bytes) != RAD_OK)

@@ -129,7 +129,7 @@ static std::vector<std::string> home_subdirs(const std::string& home, const char
 
 int rad_tools_load_plugins(const std::string& home, const std::vector<std::string>& hierarchy,
                            const std::string& arch_id, const std::string& quant,
-                           LoadedPlugins* out) {
+                           LoadedPlugins* out, bool imported) {
     if (!out) return RAD_E_INVAL;
     *out = LoadedPlugins{};
 
@@ -185,6 +185,35 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
             out->arch_version = p.version;
             out->arch_id      = p.arch_id;
             out->arch_quant   = p.arch_quant;
+        }
+    }
+
+    /* AN IMPORTED QUANTISATION is served by the family's quantised plugin (startup.h). */
+    if (imported && !arch_id.empty() && out->arch_plugin.empty()) {
+        std::vector<const Plugin*> fam, quantised;
+        for (const Plugin& p : r.plugins())
+            if (p.kind == RAD_PLUGIN_ARCH && p.arch_id == arch_id) {
+                fam.push_back(&p);
+                if (!p.arch_quant.empty()) quantised.push_back(&p);
+            }
+        const Plugin* pick = quantised.size() == 1 ? quantised[0]
+                           : quantised.empty() && fam.size() == 1 ? fam[0] : nullptr;
+        if (!pick && quantised.size() > 1) {
+            std::string names;
+            for (const Plugin* p : quantised) names += (names.empty() ? "" : ", ") + p->arch_quant;
+            RAD_ERR("'%s' is quantised by %s and imported weight by weight, and '%s' has more than "
+                    "one quantised plugin (%s) to serve it; none is chosen for it",
+                    arch_id.c_str(), quant.c_str(), arch_id.c_str(), names.c_str());
+            return RAD_E_NOTFOUND;
+        }
+        if (pick) {
+            out->arch_plugin  = pick->name;
+            out->arch_version = pick->version;
+            out->arch_id      = pick->arch_id;
+            out->arch_quant   = pick->arch_quant;
+            RAD_INFO("quantisation '%s' is imported weight by weight; '%s' serves it as %s",
+                     quant.c_str(), pick->name.c_str(),
+                     pick->arch_quant.empty() ? "(unquantised)" : pick->arch_quant.c_str());
         }
     }
 

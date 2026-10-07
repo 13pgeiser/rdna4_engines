@@ -142,6 +142,7 @@ std::string ApiError::dump() const {
     e["type"] = type;
     if (param.empty()) e["param"] = nullptr; else e["param"] = param;
     if (code.empty()) e["code"] = nullptr; else e["code"] = code;
+    if (!supported.empty()) e["supported"] = supported;
     json o;
     o["error"] = e;
     return o.dump();
@@ -652,6 +653,53 @@ void apply_template_defaults(const json& b, const OaiLimits& lim, ChatRenderOpti
     opt->reasoning_format = lim.reasoning_format;
 }
 
+void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
+    if (lim.reasoning_effort_map.empty()) return;
+    auto it = opt->template_kwargs.find("reasoning_effort");
+    if (it == opt->template_kwargs.end()) return;
+    const json v = json::parse(it->second, nullptr, false);
+    if (!v.is_string()) return;
+    auto m = lim.reasoning_effort_map.find(v.get<std::string>());
+    if (m == lim.reasoning_effort_map.end()) return;
+    if (m->second == "none" || m->second == "minimal") {
+        opt->enable_thinking = false;
+        opt->template_kwargs.erase(it);
+    } else {
+        it->second = json(m->second).dump();
+    }
+}
+
+ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, int rs,
+                          const std::string& why) {
+    /* AN EFFORT OUTSIDE THE SET IS THE REASON, when the set is known and the word is not in it:
+     * the render that refused carried no other variable the template was probed for. The
+     * template's own sentence is a traceback through its source, which says nothing a client can
+     * act on that the set does not. */
+    auto it = opt.template_kwargs.find("reasoning_effort");
+    if (it != opt.template_kwargs.end() && !lim.reasoning_efforts.empty()) {
+        const json v = json::parse(it->second, nullptr, false);
+        const std::vector<std::string>& set = lim.reasoning_efforts;
+        if (v.is_string() && std::find(set.begin(), set.end(), v.get<std::string>()) == set.end()) {
+            std::string list;
+            for (size_t i = 0; i < set.size(); ++i)
+                list += (i ? (i + 1 == set.size() ? " and " : ", ") : "") + ("'" + set[i] + "'");
+            ApiError e = err_bad("reasoning_effort",
+                                 "'" + v.get<std::string>() + "' is not a level this model's chat "
+                                 "template takes. It takes " + list + "; 'none' and 'minimal' "
+                                 "turn thinking off");
+            e.code = "unsupported_value";
+            e.supported = { "none", "minimal" };
+            e.supported.insert(e.supported.end(), set.begin(), set.end());
+            return e;
+        }
+    }
+    return rs == RAD_E_UNSUPPORTED
+               ? err_unsupported("messages", why.empty() ? "the chat template refused this request"
+                                                         : why)
+               : err_bad("messages", why.empty() ? "the chat template could not render this "
+                                                   "request" : why);
+}
+
 static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions* opt,
                           ApiError* err) {
     auto kw = b.find("chat_template_kwargs");
@@ -677,6 +725,7 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
             }
         }
     }
+    map_reasoning_effort(lim, opt);
 
     bool think = opt->enable_thinking;
     if (!get_bool(b, "enable_thinking", &think, err)) return RAD_E_INVAL;
@@ -713,6 +762,10 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
      * An explicit chat_template_kwargs entry still wins: emplace does not overwrite. */
     std::string effort;
     if (!get_str(b, "reasoning_effort", &effort, err)) return RAD_E_INVAL;
+    /* --reasoning-effort-map, before "none" and "minimal" are read, so a map can name either. */
+    if (auto m = lim.reasoning_effort_map.find(effort);
+        !effort.empty() && m != lim.reasoning_effort_map.end())
+        effort = m->second;
     /* The deployment's default, where the request did not say. Last, so every explicit spelling
      * above it wins; emplace, so a chat_template_kwargs entry that already set the key stands.
      * "none" and "minimal" are an enable_thinking default, so any word about thinking drops them;
@@ -1323,14 +1376,10 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         out->n_tools = (int)tools.size();
     }
 
-    /* FORCING A CALL IS REFUSED, and not because the grammar is out of reach -- the template
-     * returns one. It is that the grammar it returns for a forced choice does not force anything:
-     * it admits leading prose (the template invites "optional reasoning BEFORE the function
-     * call") and then an unbounded run of calls with no terminating state, so the reply is prose
-     * followed by invented calls and `finish_reason: "length"`. Serving that would be worse than
-     * refusing it: the caller asked for exactly one call and would get a request that never stops.
-     * `parallel_tool_calls: false` IS honoured -- that one narrows the grammar's repetition rule,
-     * which is a change the generator actually makes. */
+    /* A forced choice -- "required", or an object naming one function -- makes the call grammar
+     * the whole reply instead of a lazy one: the reasoning block, then the calls (one when
+     * `parallel_tool_calls` is false), then nothing, so the reply ends at the last call. A named
+     * function narrows the calls to that one. */
     std::string tool_choice = "auto", named;
     auto tcit = b.find("tool_choice");
     if (tcit != b.end() && !tcit->is_null()) {
@@ -1355,17 +1404,22 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     if (tool_choice == "none") {
         tools = json::array();
     } else if (tool_choice == "required") {
-        *err = err_unsupported(
-            "tool_choice",
-            named.empty()
-                ? "\"auto\" and \"none\" are implemented. \"required\" is not: the grammar this "
-                  "model's template produces for it admits prose before the call and an unbounded "
-                  "run of calls after it, so it does not force one call -- it produces a reply "
-                  "that runs to max_tokens. Send \"auto\" and check the response for a call."
-                : "a named function is not implemented, for the same reason \"required\" is not: "
-                  "the template's forced-call grammar does not terminate. Send \"auto\" with only "
-                  "that function in `tools`.");
-        return RAD_E_UNSUPPORTED;
+        if (tools.empty()) {
+            *err = err_bad("tool_choice", "a tool call is required, but `tools` is empty");
+            return RAD_E_INVAL;
+        }
+        if (!named.empty() &&
+            std::none_of(tools.begin(), tools.end(), [&](const json& t) {
+                return t.at("function").at("name") == named;
+            })) {
+            *err = err_bad("tool_choice", "names \"" + named + "\", which is not in `tools`");
+            return RAD_E_INVAL;
+        }
+        if (!schema_json.empty() || !out->sp.grammar.empty()) {
+            *err = err_bad("tool_choice", "a forced tool call is the whole reply, so it cannot be "
+                                          "combined with `response_format` or `grammar`");
+            return RAD_E_INVAL;
+        }
     } else if (tool_choice != "auto") {
         *err = err_bad("tool_choice", "must be \"none\", \"auto\", \"required\", or an object");
         return RAD_E_INVAL;
@@ -1392,7 +1446,9 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     out->tools_present = !tools.empty();
 
     ChatRenderOptions opt;
+    opt.quiet = lim.probe;
     opt.tool_choice = tool_choice;
+    opt.tool_name = named;
     opt.parallel_tool_calls = parallel;
     if (!get_bool(b, "add_generation_prompt", &opt.add_generation_prompt, err)) return RAD_E_INVAL;
 
@@ -1412,11 +1468,7 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     std::string why;
     const int rs = d.chat->apply(messages, tools, opt, &render, &why);
     if (rs < 0) {
-        *err = rs == RAD_E_UNSUPPORTED
-                   ? err_unsupported("messages", why.empty() ? "the chat template refused this "
-                                                               "request" : why)
-                   : err_bad("messages", why.empty() ? "the chat template could not render this "
-                                                       "request" : why);
+        *err = template_refusal(opt, lim, rs, why);
         return rs;
     }
     if (render.prompt.empty()) {

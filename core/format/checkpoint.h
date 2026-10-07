@@ -10,9 +10,16 @@
  *     resolves it to -- concatenations, alternatives and expert slices included -- with the
  *     encoding they already are when that encoding is trivial, and the rows of it on demand.
  *
- * Trivial is the set spec §4.3 names: plain f32, f16 and bf16 (GGUF's too), and block-scaled
- * FP8, where `X.weight_scale_inv` is the scale plane of `X.weight`. Anything else is a weight
- * whose served form needs quantisation work, which a recipe does ahead of time.
+ * Trivial is the set spec §4.3 names: plain f32, f16 and bf16 (GGUF's too), block-scaled FP8,
+ * where `X.weight_scale_inv` is the scale plane of `X.weight`, and MXFP4 as AMD Quark ships it
+ * (`X.weight` U8 codes, `X.weight_scale` U8 exponents), which is `fp4_e2m1*e8m0[1x32]` byte for
+ * byte. Anything else is a weight whose served form needs quantisation work, which a recipe does
+ * ahead of time -- or, for a published GPTQ-packed release (AutoRound, GPTQ), an IMPORT: the
+ * shipped integer codes and group scales re-laid as an encoding the kernels read, at convert time.
+ *
+ * AN IMPORTED QUANTISATION IS STATED WEIGHT BY WEIGHT. The checkpoint's quantisation descriptor
+ * (`auto-round`, `gptq`, `quark`) names the tool that made it, not a served form, so no
+ * architecture plugin claims it; the plugin is chosen as Checkpoint::imports() describes.
  */
 #pragma once
 #include "../rad_internal.h"
@@ -42,6 +49,13 @@ struct SrcTensor {
     std::vector<int64_t> shape;                        /* row-major */
     const void*          data = nullptr;
     int64_t              bytes = 0;
+    /* GPTQ-PACKED (auto_gptq's layout, which AutoRound's `auto_round:auto_gptq` export shares):
+     * `data` is the qweight's int32 words [K * bits / 32, N], each packing 32 / bits codes along
+     * K from the low bits up, stored unsigned with the zero point 2^(bits-1). The tensor this
+     * describes is the logical [N, K] code matrix, `rad_dtype` RAD_I4 or RAD_I8; `gptq_group` is
+     * the K columns one row of its scale tensor covers. 0 for any other tensor. */
+    int32_t              gptq_bits = 0;
+    int64_t              gptq_group = 0;
 
     int64_t numel() const {
         int64_t n = 1;
@@ -109,10 +123,29 @@ public:
     int64_t fp8_block_rows() const { return fp8_br_; }
     int64_t fp8_block_cols() const { return fp8_bc_; }
 
+    /* THE CHECKPOINT'S QUANTISATION, IMPORTED WEIGHT BY WEIGHT, or None. Read from
+     * quantization_config at open: AutoRound's `auto_round:auto_gptq` export and GPTQ's own (v1,
+     * the zero point stored less one) are Gptq; Quark's MXFP4 (fp4 weights, per_group 32, e8m0
+     * scales, no per-layer overrides) is QuarkMx. A quantisation of one of those tools in a form
+     * this does not read stays None, with the reason in import_refusal(). */
+    /* Its quantization_config keys are then renamed `imported_quantization_config.*`: they
+     * describe the tool, not a served format, and a plugin reads the latter there. */
+    enum class Import { None, Gptq, QuarkMx };
+    Import imports() const { return import_; }
+    const std::string& import_refusal() const { return import_why_; }
+
+    /* The pieces an imported weight is read from, as views owned here: for `name` (a `.weight`)
+     * the GPTQ-packed codes and their scale tensor, or Quark's codes and exponents as their RAD
+     * dtypes. RAD_E_NOTFOUND when the checkpoint ships `name` as an ordinary tensor or not at
+     * all; another error, with `why`, when it ships an imported form this cannot read. */
+    int import_piece(const std::string& name, const SrcTensor** codes, const SrcTensor** scale,
+                     std::string* why);
+
 private:
     int add_shard(const std::string& p, const std::string& prefix = "");
     int open_safetensors(const std::string& path);
     int open_gguf(const std::string& path);
+    void detect_import();
 
     enum Kind { None, Gguf, SafeT } kind_ = None;
     std::string path_, dir_;
@@ -123,6 +156,10 @@ private:
     std::unordered_map<std::string, size_t> index_;
     std::deque<SrcTensor> sliced_;            /* views; a deque never moves what it holds */
     int64_t fp8_br_ = 128, fp8_bc_ = 128;
+    Import      import_ = Import::None;
+    std::string import_why_;
+    /* import_piece's answers by name, so a weight resolved twice reads one pair of views. */
+    std::unordered_map<std::string, std::pair<const SrcTensor*, const SrcTensor*>> imported_;
 };
 
 /* ================================================================== logical weights */
@@ -138,6 +175,11 @@ struct CkptWeight {
     int64_t  rows = 0, cols = 0;              /* its [rows, cols] view (rad_enc_view) */
     /* The encoding the pieces ARE, when it is trivial; `why` says what is not when it is not. */
     bool        trivial = false;
+    /* GPTQ-PACKED PIECES, read into `enc` (`i4` or `i8` codes, bf16 scales a 128 of K) by
+     * ckpt_plane_rows: the codes transposed and offset to signed, the f16 scales rounded to bf16.
+     * Not trivial -- the rounding means the numbers are not served as shipped -- so the loader
+     * refuses one and rad-convert keeps it in `enc`, as it keeps a trivial weight. */
+    bool        imported = false;
     RadEncoding enc{};
     std::string why;
 };
@@ -161,8 +203,8 @@ bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& 
  * plain float widened, FP8 times its block scale, a GGUF block type dequantised. */
 int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::string* why);
 
-/* Rows [r0, r0 + nr) of plane `k` of a TRIVIAL `w`, in the plane's own elements, dense into
- * `dst`: the bytes a container entry holds for it. */
+/* Rows [r0, r0 + nr) of plane `k` of a TRIVIAL or IMPORTED `w`, in the plane's own elements, dense
+ * into `dst`: the bytes a container entry holds for it. */
 int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* dst,
                     std::string* why);
 

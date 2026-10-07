@@ -577,6 +577,13 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
     const ojson& tools = req.tools ? *req.tools : none;
     const bool has_tools = f.has_tools() && tools.is_array() && !tools.empty();
     const bool has_rf = req.json_schema && req.json_schema->is_object() && !req.json_schema->empty();
+    if (req.require_call && (has_rf || !has_tools)) {
+        if (why)
+            *why = has_rf ? "a required tool call and a response format cannot both be the "
+                            "whole reply"
+                          : "a tool call is required, but there are no tools this format can call";
+        return RAD_E_INVAL;
+    }
     if (!has_rf && !(has_tools && !f.triggers.empty())) return RAD_OK;
 
     const std::string opener = f.call_open.empty() ? f.name_prefix : f.call_open;
@@ -598,12 +605,9 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                 b.resolve_refs(schema);
             }
 
-            if (has_rf) {
-                /* The whole reply: what follows the generation prompt, the reasoning block, and
-                 * the document, fenced or not. */
-                b.add_rule("response-format", b.add_schema("response-format-schema",
-                                                           *req.json_schema));
-                add_json_rules(b);
+            /* A grammar that is the whole reply starts where the generation prompt does, so the
+             * prompt's assistant prefix and the reasoning block come first. */
+            auto whole_reply = [&]() {
                 std::string gp = req.generation_prompt;
                 if (f.has_reasoning() && !f.reasoning_open.empty()) {
                     const size_t at = gp.find(f.reasoning_open);
@@ -612,6 +616,15 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                 std::vector<G> root{ gp.empty() ? eps() : lit(gp), space() };
                 if (f.has_reasoning() && req.extract_reasoning) root.push_back(reasoning_expr(f, breaks));
                 root.push_back(space());
+                return root;
+            };
+            if (has_rf) {
+                /* The whole reply: what follows the generation prompt, the reasoning block, and
+                 * the document, fenced or not. */
+                b.add_rule("response-format", b.add_schema("response-format-schema",
+                                                           *req.json_schema));
+                add_json_rules(b);
+                std::vector<G> root = whole_reply();
                 root.push_back(alt({ seq({ lit("```json"), space(), rule_ref("response-format"), space(),
                                            lit("```") }),
                                      rule_ref("response-format") }));
@@ -630,6 +643,7 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                     continue;
                 const auto& fn = tool.at("function");
                 const std::string name = fn.at("name");
+                if (!req.only_tool.empty() && name != req.only_tool) continue;
                 auto params = fn.contains("parameters") ? fn.at("parameters") : ojson::object();
                 const auto properties = params.contains("properties") ? params.at("properties")
                                                                      : ojson::object();
@@ -687,6 +701,8 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                 b.add_rule(rule_name("tool-" + name), render(func));
                 choices.push_back(rule_ref(rule_name("tool-" + name)));
             }
+            if (choices.empty() && !req.only_tool.empty())
+                throw std::invalid_argument("no tool named \"" + req.only_tool + "\" to call");
             if (typed) add_json_rules(b);
             if (!choices.empty()) b.add_rule("until-suffix", until_pattern({ f.arg_value_suffix }));
 
@@ -704,13 +720,21 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                             : seq({ lit(""), space(), choice, space(), lit("") });
             }
             b.add_rule("tool-call", render(calls));
-            b.add_rule("root", "tool-call");
+            if (req.require_call) {
+                /* The calls and nothing after them: a complete grammar admits only the end of
+                 * the turn, so the reply stops at the last call's closer. */
+                std::vector<G> root = whole_reply();
+                root.push_back(rule_ref("tool-call"));
+                b.add_rule("root", render(seq(std::move(root))));
+            } else {
+                b.add_rule("root", "tool-call");
+            }
         });
     } catch (const std::exception& e) {
         if (why) *why = e.what();
         return RAD_E_INVAL;
     }
-    out->lazy = !has_rf;
+    out->lazy = !has_rf && !req.require_call;
     if (out->lazy) out->trigger_words = f.triggers;
     return RAD_OK;
 }

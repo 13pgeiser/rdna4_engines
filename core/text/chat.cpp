@@ -198,7 +198,7 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
     try {
         p = common_chat_templates_apply(impl_->tmpls.get(), in);
     } catch (const std::exception& e) {
-        RAD_ERR("chat: template refused the request: %s", e.what());
+        if (!opt.quiet) RAD_ERR("chat: template refused the request: %s", e.what());
         out->error = e.what();
         return RAD_E_UNSUPPORTED;
     }

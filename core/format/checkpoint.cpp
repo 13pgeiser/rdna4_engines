@@ -432,7 +432,166 @@ int Checkpoint::open_safetensors(const std::string& path) {
             fp8_bc_ = c;
         }
     }
+    detect_import();
     meta_.finish();
+    return RAD_OK;
+}
+
+/* WHICH PUBLISHED QUANTISATION THIS IS, from quantization_config alone: the tensors are checked
+ * one by one when a weight is resolved (import_piece), so a file that says one thing and holds
+ * another is refused at the weight that differs. */
+void Checkpoint::detect_import() {
+    auto qc = [&](const std::string& k) {
+        const char* v = meta_.get("quantization_config." + k);
+        return v ? std::string(v) : std::string();
+    };
+    auto any_under = [&](const std::string& prefix) {
+        for (const std::string& k : meta_.keys)
+            if (k.rfind("quantization_config." + prefix, 0) == 0) return true;
+        return false;
+    };
+    const std::string qm = qc("quant_method");
+    if (qm == "auto-round") {
+        /* AutoRound's GPTQ-compatible export; its own `auto_round` packing is another layout. */
+        const std::string pf = qc("packing_format");
+        if (pf == "auto_round:auto_gptq") import_ = Import::Gptq;
+        else import_why_ = "AutoRound's packing_format '" + pf + "' is not one this reads; its "
+                           "auto_round:auto_gptq export is";
+    } else if (qm == "gptq") {
+        /* v1, the format auto_gptq writes: the zero point stored less one. gptq_v2 stores it as
+         * it is, and reading it as v1 would shift every code by one. */
+        const std::string cf = qc("checkpoint_format");
+        if (cf.empty() || cf == "gptq") import_ = Import::Gptq;
+        else import_why_ = "GPTQ's checkpoint_format '" + cf + "' is not one this reads; 'gptq' is";
+    } else if (qm == "quark") {
+        const std::string w = "global_quant_config.weight.";
+        if (qc(w + "dtype") == "fp4" && qc(w + "qscheme") == "per_group" &&
+            qc(w + "group_size") == "32" && qc(w + "scale_format") == "e8m0" &&
+            !any_under("layer_quant_config.") && !any_under("layer_type_quant_config."))
+            import_ = Import::QuarkMx;
+        else
+            import_why_ = "Quark's weight scheme here is not MXFP4 (fp4, per_group 32, e8m0 scales) "
+                          "throughout, which is the one this reads";
+    }
+    /* THE TOOL'S DESCRIPTION IS KEPT, UNDER ANOTHER NAME. A plugin reads quantization_config as
+     * the statement of the format it serves (qwen35_fp8 checks quant_method is "fp8"), and an
+     * imported checkpoint's says how a tool made it instead: every weight states its own
+     * encoding. Renamed, it still travels into the container as provenance. */
+    if (import_ != Import::None)
+        for (std::string& k : meta_.keys)
+            if (k.rfind("quantization_config.", 0) == 0) k = "imported_" + k;
+}
+
+int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
+                             const SrcTensor** scale, std::string* why) {
+    auto refuse = [&](int rc, std::string m) {
+        if (why) *why = std::move(m);
+        return rc;
+    };
+    if (import_ == Import::None) return RAD_E_NOTFOUND;
+    if (auto hit = imported_.find(name); hit != imported_.end()) {
+        *codes = hit->second.first;
+        *scale = hit->second.second;
+        return RAD_OK;
+    }
+
+    if (import_ == Import::QuarkMx) {
+        /* QUARK'S MXFP4 IS THE ENCODING AS IT STANDS: two codes a byte, element 2j in the low
+         * nibble, and one biased exponent a 32 of K -- `fp4_e2m1*e8m0[1x32]`. A view renames the
+         * dtypes and the logical width; no byte moves. Its excluded layers are plain tensors. */
+        const SrcTensor* w = find(name);
+        const SrcTensor* e = w ? find(name + "_scale") : nullptr;
+        if (!w || !e || w->rad_dtype != RAD_U8) return RAD_E_NOTFOUND;
+        if (e->rad_dtype != RAD_U8 || w->shape.size() != 2 || e->shape.size() != 2 ||
+            e->shape[0] != w->shape[0] || e->shape[1] * 32 != w->shape[1] * 2)
+            return refuse(RAD_E_SHAPE, "'" + e->name + "' is not the [N, K/32] exponent plane of '" +
+                                       w->name + "'");
+        SrcTensor c = *w;
+        c.rad_dtype = RAD_FP4E2M1;
+        c.shape = { w->shape[0], w->shape[1] * 2 };
+        SrcTensor x = *e;
+        x.rad_dtype = RAD_E8M0;
+        sliced_.push_back(std::move(c));
+        *codes = &sliced_.back();
+        sliced_.push_back(std::move(x));
+        *scale = &sliced_.back();
+        imported_[name] = { *codes, *scale };
+        return RAD_OK;
+    }
+
+    /* GPTQ-PACKED: `X.weight` is shipped as X.qweight, X.scales, X.qzeros and, optionally,
+     * X.g_idx. The width is read off the tensors rather than quantization_config, because a
+     * release may mix widths -- int4 experts beside int8 projections -- and say so only per layer. */
+    const std::string suffix = ".weight";
+    if (name.size() <= suffix.size() ||
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+        return RAD_E_NOTFOUND;
+    const std::string base = name.substr(0, name.size() - suffix.size());
+    const SrcTensor* qw = find(base + ".qweight");
+    if (!qw) return RAD_E_NOTFOUND;
+    const SrcTensor* sc = find(base + ".scales");
+    const SrcTensor* qz = find(base + ".qzeros");
+    const SrcTensor* gi = find(base + ".g_idx");
+    const std::string what = "'" + qw->name + "'";
+    if (qw->rad_dtype != RAD_I32 || qw->shape.size() != 2)
+        return refuse(RAD_E_FORMAT, what + " is not an int32 [K*bits/32, N] matrix");
+    if (!sc || sc->shape.size() != 2 ||
+        (sc->rad_dtype != RAD_F16 && sc->rad_dtype != RAD_BF16 && sc->rad_dtype != RAD_F32))
+        return refuse(RAD_E_FORMAT, what + " has no float [groups, N] '" + base + ".scales' beside it");
+    if (!qz || qz->rad_dtype != RAD_I32 || qz->shape.size() != 2)
+        return refuse(RAD_E_FORMAT, what + " has no int32 '" + base + ".qzeros' beside it");
+    const int64_t N = qw->shape[1];
+    const int64_t bits = N > 0 && (qz->shape[1] * 32) % N == 0 ? qz->shape[1] * 32 / N : 0;
+    if (bits != 4 && bits != 8)
+        return refuse(RAD_E_UNSUPPORTED, what + " packs " + std::to_string(bits) + "-bit codes "
+                                         "(from its qzeros' width); 4 and 8 are read");
+    const int64_t K = qw->shape[0] * 32 / bits;
+    const int64_t G = sc->shape[0];
+    if (sc->shape[1] != N || G <= 0 || K % G)
+        return refuse(RAD_E_SHAPE, "'" + sc->name + "' is not a [groups, " + std::to_string(N) +
+                                   "] scale tensor for " + std::to_string(K) + " columns");
+    const int64_t group = K / G;
+    /* THE SERVED SCALE COVERS 128 OF K, so a group of 128 is one scale each and a wider one --
+     * per channel included -- repeats; a narrower group has no form the kernels read. */
+    if (K % 128 || group % 128)
+        return refuse(RAD_E_UNSUPPORTED, what + " has groups of " + std::to_string(group) +
+                                         " columns; the imported form scales a 128 of K, so the "
+                                         "group must be a multiple of 128");
+    if (qz->shape[0] != G)
+        return refuse(RAD_E_SHAPE, "'" + qz->name + "' has " + std::to_string(qz->shape[0]) +
+                                   " rows for " + std::to_string(G) + " groups");
+    /* SYMMETRIC, OR NOT READ: every zero point the v1 2^(bits-1) - 1, which is what makes a code
+     * the signed value it offsets to. An asymmetric weight would need a zero plane. */
+    const uint32_t zero = bits == 4 ? 0x77777777u : 0x7f7f7f7fu;
+    for (int64_t i = 0; i < qz->numel(); ++i) {
+        uint32_t v;
+        std::memcpy(&v, (const uint8_t*)qz->data + i * 4, 4);
+        if (v != zero)
+            return refuse(RAD_E_UNSUPPORTED, "'" + qz->name + "' holds a zero point other than "
+                                             "the symmetric one; an asymmetric weight is not read");
+    }
+    /* AND IN ORDER: act-order (desc_act) permutes the columns' groups, which a [1x128] scale
+     * cannot follow. The identity, or none, is the only g_idx read. */
+    if (gi) {
+        if (gi->rad_dtype != RAD_I32 || gi->numel() != K)
+            return refuse(RAD_E_FORMAT, "'" + gi->name + "' is not an int32 [K] group index");
+        for (int64_t k = 0; k < K; ++k) {
+            int32_t v;
+            std::memcpy(&v, (const uint8_t*)gi->data + k * 4, 4);
+            if (v != k / group)
+                return refuse(RAD_E_UNSUPPORTED, "'" + gi->name + "' reorders the columns' groups "
+                                                 "(act-order); only an in-order index is read");
+        }
+    }
+    SrcTensor c = *qw;
+    c.rad_dtype = bits == 4 ? RAD_I4 : RAD_I8;
+    c.shape = { N, K };
+    c.gptq_bits = (int32_t)bits;
+    c.gptq_group = group;
+    sliced_.push_back(std::move(c));
+    *codes = &sliced_.back();
+    *scale = sc;
+    imported_[name] = { *codes, *scale };
     return RAD_OK;
 }
 
@@ -577,6 +736,22 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     for (const Src1& s1 : srcs) {
         const SrcTensor* st = ck.find(s1.name);
         const SrcTensor* sc = st ? ck.find(scale_name(s1.name)) : nullptr;
+        /* A WEIGHT THE CHECKPOINT SHIPS IN AN IMPORTED FORM is read through that form's views. */
+        {
+            const SrcTensor *ic = nullptr, *is = nullptr;
+            std::string iw;
+            const int ir = ck.import_piece(s1.name, &ic, &is, &iw);
+            if (ir == RAD_OK) {
+                if (s1.index >= 0)
+                    return refuse(RAD_E_UNSUPPORTED, "it is a slice of '" + std::string(s1.name) +
+                                                     "', which the checkpoint ships quantised; an "
+                                                     "imported tensor is read whole");
+                st = ic;
+                sc = is;
+            } else if (ir != RAD_E_NOTFOUND) {
+                return refuse(ir, iw);
+            }
+        }
         /* A SUB-TENSOR INDEX IS TAKEN, never ignored: ignoring it gives every expert a copy of
          * the whole stack, in a model that loads and answers. Its scale plane is stacked the same
          * way and sliced at the same index. */
@@ -636,6 +811,40 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                    (gguf_dtype(p0.ggml) ? gguf_dtype(p0.ggml)->name : "block") + " tensor";
     } else if (!same) {
         out->why = "its pieces are stored in different dtypes";
+    } else if (p0.gptq_bits) {
+        /* GPTQ-PACKED, IMPORTED: one width and one group throughout, joined only along rows --
+         * a column join would put two pieces' groups in one scale block. */
+        out->imported = true;
+        for (size_t k = 1; k < out->pieces.size() && out->imported; ++k)
+            if (out->pieces[k]->gptq_bits != p0.gptq_bits ||
+                out->pieces[k]->gptq_group != p0.gptq_group) {
+                out->imported = false;
+                out->why = "its GPTQ-packed pieces differ in width or group";
+            }
+        if (out->imported && d != 0 && out->pieces.size() > 1) {
+            out->imported = false;
+            out->why = "its GPTQ-packed pieces are joined along a column, across their groups";
+        }
+        if (out->imported) {
+            rad_enc_clear(&out->enc);
+            rad_enc_copy_str(out->enc.scheme, "affine");
+            rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
+            rad_enc_add_plane(&out->enc, "scale", RAD_BF16, 1, 128);
+            out->why = "it is GPTQ-packed int" + std::to_string(p0.gptq_bits) + ", which "
+                       "rad-convert imports with its scales rounded to bf16 -- serve the "
+                       "container it writes";
+        }
+    } else if (dt == RAD_FP4E2M1 && scaled) {
+        /* QUARK'S MXFP4, byte for byte: the codes and exponents are the planes of
+         * `fp4_e2m1*e8m0[1x32]`. Joined only along rows, which is how gate and up become one. */
+        out->trivial = d == 0 || out->pieces.size() == 1;
+        if (!out->trivial) out->why = "its MXFP4 pieces are joined along a column";
+        if (out->trivial) {
+            rad_enc_clear(&out->enc);
+            rad_enc_copy_str(out->enc.scheme, "affine");
+            rad_enc_add_plane(&out->enc, "codes", RAD_FP4E2M1, 1, 1);
+            rad_enc_add_plane(&out->enc, "scale", RAD_E8M0, 1, 32);
+        }
     } else if ((dt == RAD_F8E4M3 || dt == RAD_F8E5M2) && scaled) {
         /* BLOCK-SCALED FP8, byte for byte: the codes and the scale plane are the planes of
          * `fp8_e4m3*bf16[128x128]` (whatever the scale's own dtype). Joined only along rows, and
@@ -785,6 +994,21 @@ struct Joined {
 
 /* `n` elements of a stored-dtype piece from element `e`, as f32. */
 int piece_f32(const SrcTensor& t, int64_t e, int64_t n, float* out) {
+    if (t.gptq_bits) {
+        /* the signed code: element (row, k) of the logical [N, K] matrix is field k % (32/bits)
+         * of word [k / (32/bits), row], less its zero point */
+        const int64_t N = t.shape[0], K = t.shape[1];
+        const int64_t per = 32 / t.gptq_bits;
+        const uint32_t mask = (1u << t.gptq_bits) - 1u;
+        const int zp = 1 << (t.gptq_bits - 1);
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t row = (e + i) / K, k = (e + i) % K;
+            uint32_t w;
+            std::memcpy(&w, (const uint8_t*)t.data + ((k / per) * N + row) * 4, 4);
+            out[i] = (float)((int)((w >> ((k % per) * t.gptq_bits)) & mask) - zp);
+        }
+        return RAD_OK;
+    }
     if (t.rad_dtype == RAD_DT_INVALID) {
         /* a GGUF block type: whole rows only, and a row is whole blocks */
         const int64_t cols = t.shape.back();
@@ -807,7 +1031,7 @@ int piece_f32(const SrcTensor& t, int64_t e, int64_t n, float* out) {
             }
             return RAD_OK;
         }
-        case RAD_F16: case RAD_F8E4M3: case RAD_F8E5M2:
+        case RAD_F16: case RAD_F8E4M3: case RAD_F8E5M2: case RAD_FP4E2M1:
         case RAD_I8: case RAD_U8: case RAD_I16: case RAD_I32: case RAD_U32: case RAD_U16:
             for (int64_t i = 0; i < n; ++i) out[i] = rad_load_f32(p, t.rad_dtype, e + i);
             return RAD_OK;
@@ -841,8 +1065,25 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
                                                               : "?")
                                             : std::string(rad_dtype_name(w.pieces[0]->rad_dtype))) +
                           ")");
-    /* FP8 IS ITS CODE TIMES ITS BLOCK'S SCALE: the pieces are joined along rows, so logical row
-     * r is in the piece whose rows cover it, and its scales are that piece's. */
+    /* A GPTQ-PACKED CODE TIMES ITS GROUP'S SCALE, the scale read as shipped: the scale tensor is
+     * [groups, N], so row r's scales are a column of it. */
+    if (w.imported) {
+        int64_t base = 0;
+        for (size_t k = 0; k < w.pieces.size(); ++k) {
+            const SrcTensor& pk = *w.pieces[k];
+            const SrcTensor& sk = *w.scales[k];
+            const int64_t pr = pk.shape[0];
+            for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + pr); ++r)
+                for (int64_t c = 0; c < w.cols; ++c)
+                    out[(r - r0) * w.cols + c] *=
+                        rad_load_f32(sk.data, sk.rad_dtype, (c / pk.gptq_group) * pr + (r - base));
+            base += pr;
+        }
+        return RAD_OK;
+    }
+    /* FP8 IS ITS CODE TIMES ITS BLOCK'S SCALE (and MXFP4 its code times its exponent): the pieces
+     * are joined along rows, so logical row r is in the piece whose rows cover it, and its scales
+     * are that piece's. */
     if (!w.scales.empty() && w.scales[0]) {
         const int64_t br = w.enc.n_planes > 1 ? w.enc.plane[1].block[0] : 128;
         const int64_t bc = w.enc.n_planes > 1 ? w.enc.plane[1].block[1] : 128;
@@ -869,8 +1110,8 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
         if (why) *why = std::move(m);
         return rc;
     };
-    if (!w.trivial || k < 0 || k >= w.enc.n_planes)
-        return refuse(RAD_E_STATE, "not a plane of a trivial encoding");
+    if (!(w.trivial || w.imported) || k < 0 || k >= w.enc.n_planes)
+        return refuse(RAD_E_STATE, "not a plane of a trivial or imported encoding");
     const std::vector<const SrcTensor*>& src = k == 0 ? w.pieces : w.scales;
     int64_t pr = 0, pc = 0;
     rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
@@ -878,14 +1119,50 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     const uint32_t dt = w.enc.plane[k].dtype;
     const int64_t eb = rad_dtype_bits(dt) / 8;
     uint8_t* o = (uint8_t*)dst;
+    if (w.imported) {
+        /* GPTQ-PACKED, RE-LAID: a row of codes is a column of the qweight, its words' bytes in
+         * order -- two codes a byte for int4, low nibble first, as the encoding packs them -- each
+         * offset to signed by flipping the top bit of every field; a row of scales is a column of
+         * the scale tensor, one a 128 of K, rounded to bf16. */
+        int64_t base = 0;
+        for (size_t p = 0; p < w.pieces.size(); ++p) {
+            const SrcTensor& c = *w.pieces[p];
+            const SrcTensor& s = *w.scales[p];
+            const int64_t N = c.shape[0], K = c.shape[1];
+            const uint8_t flip = c.gptq_bits == 4 ? 0x88 : 0x80;
+            for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + N); ++r) {
+                const int64_t n = r - base;
+                if (k == 0) {
+                    const uint8_t* q = (const uint8_t*)c.data;
+                    for (int64_t wi = 0; wi < K * c.gptq_bits / 32; ++wi) {
+                        uint32_t v;
+                        std::memcpy(&v, q + (wi * N + n) * 4, 4);
+                        for (int b = 0; b < 4; ++b) *o++ = (uint8_t)(v >> (8 * b)) ^ flip;
+                    }
+                } else {
+                    for (int64_t g = 0; g < K / 128; ++g) {
+                        const uint16_t h = rad_f32_to_bf16(
+                            rad_load_f32(s.data, s.rad_dtype, ((g * 128) / c.gptq_group) * N + n));
+                        std::memcpy(o, &h, 2);
+                        o += 2;
+                    }
+                }
+            }
+            base += N;
+        }
+        return RAD_OK;
+    }
     if (k == 0) {
-        /* the codes: the pieces joined, bytes as they are */
+        /* the codes: the pieces joined, bytes as they are. A sub-byte code (MXFP4) joins along
+         * rows of even width, so every run starts and ends on a byte. */
+        const int64_t bits = rad_dtype_bits(dt);
         Joined j;
         j.init(src, w.concat_dim);
         return j.walk(r0 * pc, (r0 + nr) * pc, [&](int p, int64_t e, int64_t n) {
-            std::memcpy(o, (const uint8_t*)src[(size_t)p]->data + e * eb, (size_t)(n * eb));
-            o += n * eb;
-            return RAD_OK;
+            if ((e * bits) % 8 || (n * bits) % 8) return (int)RAD_E_SHAPE;
+            std::memcpy(o, (const uint8_t*)src[(size_t)p]->data + e * bits / 8, (size_t)(n * bits / 8));
+            o += n * bits / 8;
+            return (int)RAD_OK;
         });
     }
     /* an FP8 scale plane: the pieces' scale rows one after another */

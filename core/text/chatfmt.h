@@ -146,14 +146,20 @@ std::string chat_format_describe(const ChatFormat& f);
  * The GBNF that constrains a reply to the format, generated from the description. For a tool
  * request it is LAZY: the reply is free until one of `triggers` appears, and from there the
  * grammar admits the call syntax with each argument constrained by its schema. For a response
- * format it is the whole reply. Rule names and structure follow the vendored generator so the
- * two produce the same grammar for a template-analysed format. */
+ * format, and for a request that requires a call, it is the whole reply. Rule names and structure
+ * follow the vendored generator so the two produce the same grammar for a template-analysed
+ * format. */
 struct ChatGrammarRequest {
     const nlohmann::ordered_json* tools = nullptr;        /* the request's tools, or null */
     const nlohmann::ordered_json* json_schema = nullptr;  /* a response format's schema, or null */
     std::string generation_prompt;
     bool        parallel_tool_calls = true;
     bool        extract_reasoning = true;  /* reasoning_format != "none" */
+    /* tool_choice "required" or a named function: the grammar is the whole reply rather than lazy,
+     * the reasoning block and then the calls with nothing after them, and `only_tool` (when set)
+     * narrows the calls to that one function. */
+    bool        require_call = false;
+    std::string only_tool;
 };
 
 struct ChatGrammar {

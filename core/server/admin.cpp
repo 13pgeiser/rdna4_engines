@@ -161,6 +161,7 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
         if (kw != b.end() && kw->is_object())
             for (auto it = kw->begin(); it != kw->end(); ++it)
                 opt.template_kwargs[it.key()] = json_dump(it.value());
+        map_reasoning_effort(lim_, &opt);
 
         json tools = json::array();
         auto t = b.find("tools");
@@ -168,10 +169,8 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
 
         ChatRender render;
         std::string why;
-        if (deps_.chat->apply(*msgs, tools, opt, &render, &why) < 0)
-            return error_response(err_bad("messages", why.empty()
-                                          ? "the chat template could not render this request"
-                                          : why), req.peer);
+        if (const int rs = deps_.chat->apply(*msgs, tools, opt, &render, &why); rs < 0)
+            return error_response(template_refusal(opt, lim_, rs, why), req.peer);
         toks = deps_.tok->encode(render.prompt,
                                  get_bool_or(b, "add_special_tokens", false),
                                  /*parse_special=*/true);
@@ -299,6 +298,15 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
     caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
     caps["logprobs"]  = opt_.supports_logprobs;
+    /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
+     * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
+    if (lim_.reasoning_efforts.empty()) {
+        caps["reasoning_efforts"] = nullptr;
+    } else {
+        std::vector<std::string> e = { "none", "minimal" };
+        e.insert(e.end(), lim_.reasoning_efforts.begin(), lim_.reasoning_efforts.end());
+        caps["reasoning_efforts"] = e;
+    }
 
     /* WHAT A REQUEST THAT LEAVES A FIELD OUT GETS, under the request's own spelling of each
      * field, so a client can read off exactly what leaving one out means on this deployment. */
@@ -325,6 +333,9 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     defs["max_tokens"]         = srv["default_max_tokens"];
     defs["reasoning_effort"]   = opt_.default_reasoning_effort.empty()
                                      ? json(nullptr) : json(opt_.default_reasoning_effort);
+    json emap = json::object();
+    for (const auto& [from, to] : lim_.reasoning_effort_map) emap[from] = to;
+    defs["reasoning_effort_map"] = std::move(emap);
     defs["thinking_token_budget"] = opt_.default_thinking_budget < 0
                                         ? json(nullptr) : json(opt_.default_thinking_budget);
     json kw = json::object();

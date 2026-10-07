@@ -191,8 +191,8 @@ code is built for every family's generic target besides, whatever is named here.
 ## 2. Five things to know before you start
 
 **1. A model is a checkpoint served as it stands, or a `.rad` container.** A checkpoint whose
-weights are bf16, f16, f32 or block-scaled fp8 is served at that precision straight from its
-directory. Anything that needs quantising is quantised once, by `rad-convert` and a recipe, into a
+weights are bf16, f16, f32, block-scaled fp8 or Quark's MXFP4 is served at that precision straight
+from its directory. Anything that needs quantising is quantised once, by `rad-convert` and a recipe, into a
 container. A container holds each weight as the planes of its *encoding* — codes, scales, zero
 points, a rotation — in one canonical arrangement, plus the tokeniser, the chat template, the
 metadata, the recipe it was quantised with and optionally a draft head. No kernel library is named
@@ -310,6 +310,33 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
 
 The conversions of record live in `scripts/convfn.sh` and `scripts/convdspark.sh`, with their
 recipes in `data/recipes/`.
+
+**A release someone else already quantised is read as it ships.** Two forms are imported weight
+by weight, so their quantised linears need no recipe rule:
+
+| `quantization_config` | read as | |
+|---|---|---|
+| `quark`, MXFP4 weights (fp4, per_group 32, e8m0) | `fp4_e2m1*e8m0[1x32]` | byte for byte: the same codes and exponents. A checkpoint of this form is also served as it stands (§3.4) |
+| `auto-round` with `packing_format: auto_round:auto_gptq`, and `gptq` (v1) | `i4*bf16[1x128]` or `i8*bf16[1x128]` | the GPTQ-packed codes transposed and made signed, the f16 scales rounded to bf16. Symmetric, group 128 or a multiple of it (per channel included), no act-order. Convert-time only, because the scales are not served as shipped |
+
+The width is read per tensor, so a release mixing int4 experts with int8 projections imports both.
+What an import cannot read — an asymmetric zero point, an act-order index, a group under 128 — is
+refused by name at the weight. The release's `quantization_config` names the tool, not a served
+form, so it is kept in the container as `imported_quantization_config.*`, and the model is served by
+its family's quantised plugin (`qwen35_fp8` for Qwen3.8-27B; `qwen4exp_fp8` for Flash-Next).
+
+A weight the architecture declares in another form than the release holds still takes a rule: the
+recipe dequantises the import exactly and quantises from that. The two recipes of record:
+
+```sh
+# AMD's Quark AWQ-MXFP4 Qwen3.8-27B with the DFlash2 drafter
+rad-convert ~/models/amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 \
+    --recipe data/recipes/q38-27b-quark-mxfp4-df2.recipe -o q38-27b-quark-mxfp4-df2.rad
+
+# An AutoRound int4 Qwen3.8-Flash-Next: its experts imported, its int4 projections made int8
+rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound \
+    --recipe data/recipes/qwen4exp-autoround-i8-hc8m.recipe -o swift-autoround.rad
+```
 
 ### 3.3 Look at what you built
 
@@ -543,16 +570,18 @@ run to pay for cache nobody is using.
 
 What it leans on is `--gpu-headroom-mib`. That reserve is what the card keeps for allocations
 this engine does not make — chief among them a kernel's code object, which HIP loads on the
-kernel's *first launch*, not at startup. A deployment whose budget settles *below* its stated
-headroom has already spent it, and the slab growing into what is left collides with the first
-kernel that has never run: a draft head's, a sampler chain's, whatever the early requests did not
-reach. It fails its load and faults inside the HIP runtime, which arrives as a segfault in a
-kernel that is correct, on a server that had been serving fine.
+kernel's *first launch*, not at startup. A card with too little of it left collides with the
+first kernel that has never run: a draft head's, a sampler chain's, whatever the early requests
+did not reach. It fails its load and faults inside the HIP runtime, which arrives as a segfault in
+a kernel that is correct, on a server that had been serving fine.
 
-Startup measures that shortfall and holds it back on top of the reserve, so a run that did not
-quite keep its headroom is safe rather than fatal — but it is costing you the VRAM twice. Raise
-`--gpu-headroom-mib` past the number startup names, so the budget resolver sees it and the expert
-plane is sized against it instead of trimmed afterwards.
+Startup checks what is left once everything is allocated (`card N settled at ... free`). Memory
+taken after the budget read the card — another process on it, such as a desktop, or a driver
+allocation — comes out of the headroom, and the line says how much. It warns only when the room
+left for first launches is under the 96 MiB the engine allows for its own, and then names the
+`--gpu-headroom-mib` value that clears it: what is left rises one for one with the flag, so that
+value is a fixed point. A larger headroom that lost part of itself to another process is reported
+on the INFO line and not warned.
 
 What the engine itself allocates after the card is read is charged before the split, so it never
 comes out of the headroom: the step staging, the KV tiers' copy staging, and its hardware queues.
@@ -874,6 +903,24 @@ refuses is a warning at startup: requests that send their own effort still work.
 radiance --model m.rad --reasoning-effort medium
 ```
 
+**The template's set is probed at startup** by rendering each of `low`, `medium`, `high`, `xhigh`
+and `max`, and startup names the ones it takes. `/server_info` publishes them as
+`capabilities.reasoning_efforts` (with `none` and `minimal`, which are the server's own; `null`
+when the template takes any word). A request outside the set gets a 400 with `param:
+"reasoning_effort"`, `code: "unsupported_value"` and the set in `error.supported`, rather than the
+template's traceback.
+
+**`--reasoning-effort-map FROM=TO,...`** rewrites a request's effort before the template sees it,
+for a client that always sends a word of OpenAI's ladder. Qwen3.8 has no `high`, so:
+
+```sh
+radiance --model m.rad --reasoning-effort-map high=xhigh
+```
+
+It applies to both spellings (`reasoning_effort` and `chat_template_kwargs.reasoning_effort`), and
+before `none` and `minimal` are read, so `minimal=low` keeps thinking on. A `TO` the template
+refuses stops startup.
+
 **`--thinking-token-budget N`** caps the reasoning instead of its depth. At N tokens inside the
 reasoning block the block is closed, by masking the next position to its end token
 (`</think>`), and the answer follows. This makes a client's `max_tokens` buy an answer, where
@@ -993,6 +1040,7 @@ that names the field wins.
 | `--max-stop-strings N`, `--max-stop-bytes N` | 64, 4096 | how many stop strings a request may send, and how long each may be |
 | `--chat-template-kwargs JSON` | — | variables for the chat template on every chat request; a JSON object or `@FILE`, repeatable |
 | `--reasoning-effort S` | template's own | default `reasoning_effort` for chat |
+| `--reasoning-effort-map MAP` | — | `FROM=TO,...`: a request's `reasoning_effort` rewritten before the template sees it; `TO` is checked at startup |
 | `--thinking-token-budget N` | none | default `thinking_token_budget` for chat: the reasoning block is closed at N tokens |
 | `--reasoning-format MODE` | auto | `auto` returns reasoning as `reasoning_content`; `none` leaves it inline in `content` |
 
@@ -1235,9 +1283,9 @@ curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
 | `ignore_eos` | generate to `max_tokens` whatever the model emits |
 | `stream`, `stream_options.include_usage` | |
 | `logprobs`, `top_logprobs` | **not implemented** — refused, not returned as nulls. `/server_info` reports `logprobs: false` |
-| `tools`, `tool_choice`, `parallel_tool_calls` | chat only |
+| `tools`, `tool_choice`, `parallel_tool_calls` | chat only. `tool_choice` is `auto`, `none`, `required` or `{"type":"function","function":{"name":...}}`; the last two hold the whole reply to calls (after the reasoning block), the named form to that one function, and cannot be combined with `response_format` or `grammar` |
 | `add_generation_prompt`, `chat_template_kwargs` | chat only |
-| `reasoning_effort`, `enable_thinking` | chat only |
+| `reasoning_effort`, `enable_thinking` | chat only. The levels are the template's (`capabilities.reasoning_efforts` on `/server_info`); `none` and `minimal` turn thinking off |
 | `thinking_token_budget`, `thinking_budget` | chat only. ≥ 0: the reasoning tokens after which the block is closed — see §5.2. Default `--thinking-token-budget`, else none |
 | `preserve_thinking` | chat only. The chat template variable of that name, as llama.cpp maps it; Qwen3.6 and later keep earlier turns' reasoning in the prompt with it |
 | `response_format` | chat only. Mutually exclusive with `grammar` |
@@ -1397,8 +1445,9 @@ the startup log too — but a startup log is on a machine, in a file, from a pro
 been restarted since.
 
 Its `request_defaults` object says what a request that leaves a field out is served with: every
-sampler field, `max_tokens`, `reasoning_effort`, `chat_template_kwargs` and `reasoning_format`,
-under the request's own spelling of each. `server.default_max_tokens` is `null` for `auto`, and
+sampler field, `max_tokens`, `reasoning_effort`, `reasoning_effort_map`, `chat_template_kwargs` and
+`reasoning_format`, under the request's own spelling of each. `capabilities.reasoning_efforts`
+lists the efforts the chat template takes, or is `null` when it takes any. `server.default_max_tokens` is `null` for `auto`, and
 `server.max_tokens_cap` is `null` when there is none.
 
 ### 6.3 Metrics
@@ -1506,7 +1555,7 @@ released until it does.
 | `chat is 501` in the startup line | The container carries no chat template | Re-convert with `--tokenizer`, and check that a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint. Meanwhile use `/v1/completions` |
 | `does not read '<weight>' encoded <encoding>` at startup | No loaded kernel takes that weight's encoding for the op that reads it | Convert with a recipe that writes an encoding a loaded kernel reads, or load the library that reads it |
 | Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can do without: a larger `--host-pool-mib` (RAM permitting), `--kv-cache-dtype fp8`, or fewer/shorter sessions. See §4.3 |
-| The server dies with no log line, on a request it had been serving fine | A kernel whose code object had never been loaded could not be: the card has no room left. HIP faults inside the launch rather than returning an error, so there is nothing to print | A card that never met `--gpu-headroom-mib` — see §4.3. Raise the headroom past the shortfall startup names. `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
+| The server dies with no log line, on a request it had been serving fine | A kernel whose code object had never been loaded could not be: the card has no room left. HIP faults inside the launch rather than returning an error, so there is nothing to print | A card left with too little room for a first launch — see §4.3. Set `--gpu-headroom-mib` to the value the startup warning names. `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
 | KV in VRAM stays high with one session and nothing moves | The idle tiers are **off** — they are sized, and with no size nothing is copied | Pass `--prefix-cache-host-mib N` |
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |
 | `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps pinned memory system-wide at `ttm.pages_limit`, half of RAM by default | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under the cap the refusal names, or raise it with the kernel parameter `ttm.pages_limit` |

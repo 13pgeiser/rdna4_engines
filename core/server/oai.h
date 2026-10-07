@@ -37,6 +37,9 @@ struct ApiError {
     std::string message;
     std::string param;      /* "" when the error is not about one field */
     std::string code;       /* "" when there is nothing more specific to say */
+    /* The values `param` takes, when the error is a value outside a known set: `supported` in the
+     * envelope, so a client can retry with one rather than parse the sentence. */
+    std::vector<std::string> supported;
 
     std::string dump() const;    /* the OpenAI error envelope, as a JSON string */
 };
@@ -147,6 +150,22 @@ struct OaiLimits {
      * dial at all. Seeded only when the request says nothing, so a caller always wins. */
     std::string default_reasoning_effort;
 
+    /* THE WORDS THE CHAT TEMPLATE TAKES AS `reasoning_effort`, found at startup by rendering each
+     * word this server knows of (Server::probe_reasoning_efforts). Empty when the template takes
+     * any word -- it does not read the variable, or reads it without refusing one -- and when
+     * nothing was probed. A request whose effort the template refuses is answered with this set
+     * rather than with the template's traceback (template_refusal). */
+    std::vector<std::string> reasoning_efforts;
+
+    /* --reasoning-effort-map: an effort a request sends, replaced by the deployment's word before
+     * the template sees it. For a client that always sends a word of OpenAI's ladder ("high")
+     * to a model whose template has its own ("xhigh"). */
+    std::map<std::string, std::string> reasoning_effort_map;
+
+    /* A STARTUP PROBE, NOT A REQUEST: what the template refuses is the answer being asked for, so
+     * its refusal is not logged (ChatRenderOptions::quiet). */
+    bool        probe = false;
+
     /* THE DEPLOYMENT'S DEFAULT `thinking_token_budget`, -1 for none. For the same reason the
      * effort default exists: an agent framework sizes max_tokens per turn and sends no budget, and
      * a reasoning block that spends the whole of max_tokens returns a turn with no answer in it.
@@ -195,6 +214,19 @@ RequestThinking request_thinking(const json& b);
  * The chat endpoint and /tokenize both render through this, so a prompt counted by one is the
  * prompt served by the other. */
 void apply_template_defaults(const json& b, const OaiLimits& lim, ChatRenderOptions* opt);
+
+/* --reasoning-effort-map, on the effort chat_template_kwargs put in the render options: a mapped
+ * word replaces it, and a word mapped to "none" or "minimal" turns thinking off instead. The chat
+ * endpoint maps the top-level `reasoning_effort` itself, before it reads "none" and "minimal";
+ * this is the kwargs spelling, for it and for /tokenize. */
+void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt);
+
+/* THE 400 FOR A TEMPLATE THAT REFUSED A RENDER. An effort outside the template's known set
+ * (OaiLimits::reasoning_efforts) is named as `reasoning_effort` with the set in `supported`, the
+ * way OpenAI answers an unsupported value; anything else is `messages` with the template's own
+ * sentence. */
+ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, int rs,
+                          const std::string& why);
 
 /* True when `v` is a legal value of the sampler field a request spells `field`; otherwise `why`
  * says what the legal set is, in the words a 400 carries. The same table checks a request and the

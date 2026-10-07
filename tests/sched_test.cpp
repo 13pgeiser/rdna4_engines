@@ -280,6 +280,11 @@ struct FakeKV : IKVManager {
         it->second.dirty[(size_t)g] = INT64_MAX;
         return d;
     }
+    /* Snapshot slots the store has given back; every other slot is held. */
+    std::vector<int32_t> ck_gone;
+    bool checkpoint_held(int32_t slot) const override {
+        return std::find(ck_gone.begin(), ck_gone.end(), slot) == ck_gone.end();
+    }
     /* Blocks an elastic pool has handed back to the card: still carved and free, but not
      * available to hand out until the pool grows again. free_blocks() is bounded by that and
      * held_blocks() is not, which is the difference an elastic pool presents. */
@@ -874,6 +879,35 @@ TEST(a_hit_with_no_checkpoint_slot_reuses_nothing) {
     CHECK(f.sch.step() != nullptr);
     CHECK_EQ(f.sch.find(a)->n_computed, 0);
     CHECK_EQ(f.sch.metrics().linear_cached_tokens, 0);
+}
+
+/* A RESTORE FROM A SLOT THE STORE GAVE BACK IS NEVER BUILT. The cache keeps a handed-out snapshot
+ * until the step that restores it has run, so this is a guard: a step that finds one is abandoned,
+ * the request gives its hit back and goes to the queue, and the next step prefills it from a fresh
+ * lookup rather than the engine stopping on the restore. */
+TEST(a_restore_from_a_slot_the_store_gave_back_is_prefilled_again) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    f.kv.ck_gone = {3};
+    const int64_t free_before = f.kv.free_blocks(0);
+
+    const uint64_t a = f.submit(1000, 8);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 0);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.kv.free_blocks(0), free_before);      /* the adopted blocks went back */
+
+    /* The next lookup finds no snapshot, and the request runs from zero. */
+    f.pc.src = -1;
+    f.kv.ck_gone.clear();
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->ctx_lens[0], 0);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, -1);
 }
 
 TEST(a_hit_that_no_checkpoint_covers_replays_from_zero) {

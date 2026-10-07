@@ -740,6 +740,9 @@ int64_t PrefixCache::retain(uint64_t session) {
     int64_t freed = 0;
     for (const auto& a : all) {
         if (std::binary_search(keep.begin(), keep.end(), a.first)) { kept.push_back(a.second); continue; }
+        /* NOR ONE HANDED OUT THIS STEP, whatever the policy says of its position: the admission it
+         * was handed to restores from the slot ahead of the step, and that is after this runs. */
+        if (handed(a.second)) { kept.push_back(a.second); continue; }
         auto e = ck_by_prefix_.find(a.second);
         if (e == ck_by_prefix_.end()) continue;
         /* A SNAPSHOT THE DISK HOLDS LEAVES THE SLOT AND STAYS IN THE INDEX: the policy is about
@@ -793,6 +796,9 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
             *slot_out = existing->second.slot;
             return RAD_OK;
         }
+        /* ONE HANDED OUT THIS STEP IS NOT RETIRED either: an admission restores from it ahead of
+         * the step. This chunk goes without a checkpoint, which costs a later hit some replay. */
+        if (handed(prefix)) return RAD_E_FULL;
         const uint64_t vs = existing->second.session;
         retire_ckpt(existing);
         auto sit = ck_by_session_.find(vs);
@@ -841,6 +847,9 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
                 /* NOR ONE A DISK WRITE IS READING: its slot comes back only when the write
                  * reports, so retiring it now loses the snapshot and frees nothing yet. */
                 if (tiers_ && tiers_->slot_reading(kvp.second.slot)) continue;
+                /* NOR ONE A LOOKUP HANDED OUT THIS STEP: its admission restores from the slot
+                 * ahead of the step, and a slot freed under it restores nothing. */
+                if (handed(kvp.first)) continue;
                 auto sit = ck_by_session_.find(kvp.second.session);
                 bool is_tip = false;
                 if (sit != ck_by_session_.end()) {
@@ -969,7 +978,7 @@ bool PrefixCache::free_checkpoint_for_restore() {
         const Ckpt& c = kvp.second;
         if (c.detached || c.slot < 0 || !c.valid) continue;
         if (victim && c.used >= victim->used) continue;
-        if (std::find(handed_.begin(), handed_.end(), kvp.first) != handed_.end()) continue;
+        if (handed(kvp.first)) continue;
         if (!tiers_->snapshot_backed(kvp.first)) continue;
         victim = &c;
     }

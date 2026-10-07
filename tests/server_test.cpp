@@ -103,6 +103,14 @@ struct FakeChatTemplate : IChatTemplate {
             if (why) *why = "the template does not take " + refuse_kwarg;
             return RAD_E_UNSUPPORTED;
         }
+        /* And one with a set of its own, as Qwen3.8's xhigh|medium|low. */
+        if (!efforts.empty() && opt.template_kwargs.count("reasoning_effort")) {
+            const std::string& v = opt.template_kwargs.at("reasoning_effort");
+            if (std::find(efforts.begin(), efforts.end(), v) == efforts.end()) {
+                if (why) *why = "Jinja Exception: Unexpected reasoning effort " + v;
+                return RAD_E_UNSUPPORTED;
+            }
+        }
         std::string s;
         if (!tools.empty()) s += "[tools:" + std::to_string(tools.size()) + "]";
         if (!opt.enable_thinking) s += "[nothink]";
@@ -143,6 +151,7 @@ struct FakeChatTemplate : IChatTemplate {
     std::shared_ptr<IReplyParser> real_parser;
     std::string refusal;
     std::string refuse_kwarg;
+    std::vector<std::string> efforts;   /* JSON text, as the template context carries them */
     /* The reasoning block a render reports. FakeTokenizer makes a one-byte marker one token. */
     std::string think_open, think_close;
     bool        think_starts_open = false;
@@ -845,23 +854,6 @@ TEST(unsupported_parameters_are_400_and_name_themselves) {
     CHECK_EQ(r3.status, 400);
     CHECK(r3.body.find("temperature") != std::string::npos);
 
-    /* A forced tool choice is refused rather than approximated: the template's forced-call
-     * grammar does not terminate, so honouring it would mean a reply that runs to max_tokens. */
-    HttpResponse r4 = f.post("/v1/chat/completions",
-                             R"({"messages":[{"role":"user","content":"hi"}],
-                                 "tools":[{"type":"function","function":{"name":"f"}}],
-                                 "tool_choice":"required"})");
-    CHECK_EQ(r4.status, 400);
-    CHECK(r4.body.find("tool_choice") != std::string::npos);
-
-    /* ...and the object form is the same refusal, not a different one. */
-    HttpResponse r4b = f.post("/v1/chat/completions",
-                              R"({"messages":[{"role":"user","content":"hi"}],
-                                  "tools":[{"type":"function","function":{"name":"f"}}],
-                                  "tool_choice":{"type":"function","function":{"name":"f"}}})");
-    CHECK_EQ(r4b.status, 400);
-    CHECK(r4b.body.find("tool_choice") != std::string::npos);
-
     /* logprobs without sampler support is refused rather than answered with nulls. */
     HttpResponse r5 = f.post("/v1/chat/completions",
                              R"({"messages":[{"role":"user","content":"hi"}],
@@ -1275,6 +1267,109 @@ TEST(a_template_default_the_template_refuses_is_found_before_a_caller_sends_one)
     CHECK(kw_why.empty() && eff_why.empty());
 }
 
+/* AN EFFORT THE TEMPLATE REFUSES IS NAMED AS ONE. The template's own set is probed at startup, a
+ * request outside it is answered as OpenAI answers an unsupported value -- `reasoning_effort`,
+ * `unsupported_value`, the set in `supported` -- and /server_info publishes the set beforehand.
+ * Codeberg #31: the 400 blamed `messages` and carried the set only inside a Jinja traceback. */
+TEST(an_effort_the_template_refuses_is_answered_with_the_set_it_takes) {
+    Fixture f;
+    f.tmpl.efforts = { "\"xhigh\"", "\"medium\"", "\"low\"" };
+    const std::vector<std::string> set = f.srv->probe_reasoning_efforts();
+    REQUIRE_EQ(set.size(), 3u);
+    CHECK_EQ(set[0], std::string("low"));
+    CHECK_EQ(set[1], std::string("medium"));
+    CHECK_EQ(set[2], std::string("xhigh"));
+
+    OaiLimits lim = f.limits();
+    lim.reasoning_efforts = set;
+    for (const char* extra : { R"("reasoning_effort":"high")",
+                               R"("chat_template_kwargs":{"reasoning_effort":"high"})" }) {
+        OaiRequest r;
+        ApiError e;
+        const std::string body =
+            std::string(R"({"messages":[{"role":"user","content":"hi"}],)") + extra + "}";
+        CHECK(parse_chat_request(body, f.odeps(), lim, &r, &e) < 0);
+        CHECK_EQ(e.status, 400);
+        CHECK_EQ(e.param, std::string("reasoning_effort"));
+        CHECK_EQ(e.code, std::string("unsupported_value"));
+        CHECK(!has(e.message, "Jinja"));
+        CHECK(has(e.message, "'xhigh'"));
+        const json env = json::parse(e.dump());
+        REQUIRE(env["error"]["supported"].is_array());
+        CHECK_EQ(env["error"]["supported"].size(), 5u);
+        CHECK_EQ(env["error"]["supported"][0].get<std::string>(), std::string("none"));
+        CHECK_EQ(env["error"]["supported"][4].get<std::string>(), std::string("xhigh"));
+    }
+    chat_with(f, lim, R"("reasoning_effort":"xhigh")");
+    chat_with(f, lim, R"("reasoning_effort":"none")");
+
+    const json j = json::parse(f.srv->router().call("GET", "/server_info").body);
+    const json& caps = j["capabilities"]["reasoning_efforts"];
+    REQUIRE(caps.is_array());
+    CHECK_EQ(caps.size(), 5u);
+    CHECK_EQ(caps[2].get<std::string>(), std::string("low"));
+}
+
+/* A TEMPLATE THAT TAKES ANY WORD has no set to publish or to refuse with, and a template that
+ * refuses for another reason keeps blaming `messages` with its own sentence. */
+TEST(a_template_that_takes_any_effort_publishes_no_set) {
+    Fixture f;
+    CHECK(f.srv->probe_reasoning_efforts().empty());
+    const json j = json::parse(f.srv->router().call("GET", "/server_info").body);
+    CHECK(j["capabilities"]["reasoning_efforts"].is_null());
+
+    f.tmpl.refuse_kwarg = "custom";
+    OaiLimits lim = f.limits();
+    lim.reasoning_efforts = { "low" };
+    OaiRequest r;
+    ApiError e;
+    CHECK(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],
+                                 "reasoning_effort":"low","chat_template_kwargs":{"custom":1}})",
+                             f.odeps(), lim, &r, &e) < 0);
+    CHECK_EQ(e.param, std::string("messages"));
+    CHECK(has(e.message, "does not take custom"));
+}
+
+/* --reasoning-effort-map: the deployment's word replaces the request's before the template sees
+ * it, in either spelling; a word mapped to "none" turns thinking off; a target the template
+ * refuses is found at startup. */
+TEST(a_mapped_effort_reaches_the_template_as_the_deployments_word) {
+    Fixture f;
+    f.tmpl.efforts = { "\"xhigh\"", "\"medium\"", "\"low\"" };
+    OaiLimits lim = f.limits();
+    lim.reasoning_effort_map = { { "high", "xhigh" }, { "minimal", "low" }, { "max", "none" } };
+    chat_with(f, lim, R"("reasoning_effort":"high")");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"xhigh\""));
+    chat_with(f, lim, R"("chat_template_kwargs":{"reasoning_effort":"high"})");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"xhigh\""));
+    chat_with(f, lim, R"("reasoning_effort":"medium")");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"medium\""));
+    chat_with(f, lim, R"("reasoning_effort":"max")");
+    CHECK(!f.tmpl.last_opt.enable_thinking);
+    CHECK(!f.tmpl.last_opt.template_kwargs.count("reasoning_effort"));
+    /* The map is read before "none" and "minimal" are, so it can name either. */
+    chat_with(f, lim, R"("reasoning_effort":"minimal")");
+    CHECK(f.tmpl.last_opt.enable_thinking);
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"low\""));
+
+    auto check = [&](const std::map<std::string, std::string>& m) {
+        FakeScheduler sched;
+        FakeTokenizer tok;
+        Deps d;
+        d.sched = &sched;
+        d.tok = &tok;
+        d.chat = &f.tmpl;
+        ServerOptions o;
+        o.reasoning_effort_map = m;
+        Server srv(d, o);
+        const json j = json::parse(srv.router().call("GET", "/server_info").body);
+        CHECK_EQ(j["request_defaults"]["reasoning_effort_map"].size(), m.size());
+        return srv.check_reasoning_effort_map();
+    };
+    CHECK(check({ { "high", "xhigh" }, { "max", "none" } }).empty());
+    CHECK(has(check({ { "high", "ultra" } }), "high=ultra"));
+}
+
 TEST(server_info_reports_what_a_request_that_leaves_a_field_out_gets) {
     FakeScheduler sched;
     FakeTokenizer tok;
@@ -1356,6 +1451,47 @@ TEST(parallel_tool_calls_false_reaches_the_template) {
     CHECK_EQ(r.status, 200);
     CHECK(!f.tmpl.last_opt.parallel_tool_calls);
     CHECK_EQ(f.tmpl.last_n_tools, 1);
+}
+
+/* A forced choice reaches the template as "required", with the function it names; the grammar
+ * that holds the reply to it is built from that (chatparse_test). */
+TEST(a_forced_tool_choice_reaches_the_template) {
+    Fixture f;
+    f.sched.reply = "TOOL:a:{}";
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":128,
+                                "tools":[{"type":"function","function":{"name":"a"}}],
+                                "tool_choice":"required"})");
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(f.tmpl.last_opt.tool_choice, std::string("required"));
+    CHECK(f.tmpl.last_opt.tool_name.empty());
+
+    HttpResponse r2 = f.post("/v1/chat/completions",
+                             R"({"messages":[{"role":"user","content":"hi"}],"max_tokens":128,
+                                 "tools":[{"type":"function","function":{"name":"a"}},
+                                          {"type":"function","function":{"name":"b"}}],
+                                 "tool_choice":{"type":"function","function":{"name":"b"}}})");
+    CHECK_EQ(r2.status, 200);
+    CHECK_EQ(f.tmpl.last_opt.tool_choice, std::string("required"));
+    CHECK_EQ(f.tmpl.last_opt.tool_name, std::string("b"));
+    CHECK_EQ(f.tmpl.last_n_tools, 2);
+}
+
+/* What cannot be forced is a 400 naming tool_choice: a call with no tools, a function the request
+ * does not offer, and a call that would have to share the whole reply with a document. */
+TEST(a_forced_tool_choice_that_cannot_be_kept_is_refused) {
+    Fixture f;
+    auto refused = [&](const std::string& body) {
+        HttpResponse r = f.post("/v1/chat/completions", body);
+        return r.status == 400 && r.body.find("tool_choice") != std::string::npos;
+    };
+    CHECK(refused(R"({"messages":[{"role":"user","content":"hi"}],"tool_choice":"required"})"));
+    CHECK(refused(R"({"messages":[{"role":"user","content":"hi"}],
+                      "tools":[{"type":"function","function":{"name":"a"}}],
+                      "tool_choice":{"type":"function","function":{"name":"zz"}}})"));
+    CHECK(refused(R"({"messages":[{"role":"user","content":"hi"}],
+                      "tools":[{"type":"function","function":{"name":"a"}}],
+                      "tool_choice":"required","response_format":{"type":"json_object"}})"));
 }
 
 /* A grammar the compiler cannot run is a 400 at admission, not a request that dies mid-stream. */

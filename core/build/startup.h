@@ -66,11 +66,19 @@ std::string rad_home_file(const std::string& home, const std::string& rel);
  * has one plugin per weight format and they all answer the same architecture id. `quant` is the
  * container's own descriptor -- RadModelMeta::quant, RadFileHeader::quant -- and "" is the
  * unquantised case, which matches a plugin that says "" and nothing else. */
+/*
+ * `imported` is a checkpoint whose quantisation is imported weight by weight
+ * (Checkpoint::imports): its descriptor names the tool that made it and no plugin claims it, so
+ * the plugin is the architecture's QUANTISED one -- the one plugin of the family claiming a
+ * descriptor, or the family's only plugin when that claims none. Two quantised plugins are a
+ * choice this cannot make, and are refused by name. `out->arch_quant` is the descriptor chosen,
+ * which is what a container converted from it records. */
 int rad_tools_load_plugins(const std::string& radiance_home,
                            const std::vector<std::string>& hierarchy,
                            const std::string& arch_id,
                            const std::string& quant,
-                           LoadedPlugins* out);
+                           LoadedPlugins* out,
+                           bool imported = false);
 
 /* `also` declares into the SAME builder after the architecture plugin has. That is what puts the
  * sampler chain in the same Program: its ops resolve through the same hierarchy at the same

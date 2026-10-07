@@ -117,6 +117,11 @@ struct IKVManager {
      * it, so the batch builder is its one caller: it keeps the device's copy of a table and
      * stages only what moved. 0 is always a correct answer -- it restages the whole table. */
     virtual int64_t take_table_changes(uint64_t seq, int32_t group) const = 0;
+
+    /* THE SNAPSHOT STORE STILL HOLDS `slot`: it was allocated and not given back since. A step
+     * that restores from a slot the store gave back would read another session's state or
+     * nothing, so the scheduler asks before it builds one. */
+    virtual bool checkpoint_held(int32_t slot) const = 0;
 };
 
 /* ------------------------------------------------------------------ the prefix cache */
@@ -307,6 +312,7 @@ struct KVBinding final : IKVManager {
     int64_t take_table_changes(uint64_t s, int32_t g) const override {
         return m->take_table_changes(s, g);
     }
+    bool checkpoint_held(int32_t slot) const override { return m->checkpoint_held(slot); }
 };
 
 /* The prefix cache's own lookup takes tokens and content-hashed multimodal keys rather than a

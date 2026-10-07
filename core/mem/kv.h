@@ -435,6 +435,8 @@ public:
     int  alloc_checkpoint(int32_t* slot_out);
     void free_checkpoint(int32_t slot);
     void* checkpoint_ptr(int32_t slot) const;
+    /* The store holds `slot`: it was allocated and not given back since. */
+    bool  checkpoint_held(int32_t slot) const;
 
     /* SNAPSHOT AND RESUME A SEQUENCE'S WHOLE LINEAR STATE. This is what makes a prefix hit legal
      * on a hybrid model: the attention half of a hit is carried by the adopted blocks, and the

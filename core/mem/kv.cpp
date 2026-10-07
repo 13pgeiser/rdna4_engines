@@ -1338,6 +1338,10 @@ void KVManager::free_checkpoint(int32_t slot) {
     if (ck_store_) ck_store_->free(slot);
 }
 
+bool KVManager::checkpoint_held(int32_t slot) const {
+    return ck_store_ && ck_store_->in_use(slot);
+}
+
 void* KVManager::checkpoint_ptr(int32_t slot) const {
     if (!ck_store_) return nullptr;
     char* p = (char*)ck_store_->at(slot);
@@ -1351,11 +1355,29 @@ void* KVManager::checkpoint_ptr(int32_t slot) const {
 int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t ck_slot,
                                bool save, RadStream s) {
     /* A SLOT NOBODY HOLDS IS NOT ONE TO WRITE. Rank 0 hands the ids out, so a follower checks the
-     * shared store rather than a list of its own. */
-    if (!ck_store_ || !ck_store_->in_use(ck_slot)) return RAD_E_INVAL;
+     * shared store rather than a list of its own. Each refusal says which check it is: a slot the
+     * store gave back is a lifetime fault in whoever handed the id out, and nothing about the copy. */
+    const char* dir = save ? "save into" : "restore from";
+    if (!ck_store_) {
+        RAD_ERR("checkpoint %s slot %d: this rank has no snapshot store", dir, (int)ck_slot);
+        return RAD_E_INVAL;
+    }
+    if (!ck_store_->in_use(ck_slot)) {
+        RAD_ERR("checkpoint %s slot %d: the store does not hold that slot (%lld of %lld in use) -- "
+                "it was given back after its id was handed out", dir, (int)ck_slot,
+                (long long)ck_store_->used_slots(), (long long)ck_store_->capacity());
+        return RAD_E_INVAL;
+    }
     char* ck = (char*)checkpoint_ptr(ck_slot);
-    if (!ck) return RAD_E_INVAL;
-    if (!state_slots || n_slots < (int)plans_.size()) return RAD_E_INVAL;
+    if (!ck) {
+        RAD_ERR("checkpoint %s slot %d: the store has no address for it", dir, (int)ck_slot);
+        return RAD_E_INVAL;
+    }
+    if (!state_slots || n_slots < (int)plans_.size()) {
+        RAD_ERR("checkpoint %s slot %d: %d state slot(s) named for %d group(s)", dir, (int)ck_slot,
+                state_slots ? n_slots : 0, (int)plans_.size());
+        return RAD_E_INVAL;
+    }
 
     /* ONE PITCHED COPY A GROUP. Within a group the state of one sequence is a row a layer, one
      * layer_stride apart in the pool and packed end to end in the slot, so a group's whole share
@@ -1365,20 +1387,34 @@ int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t 
         const KVGroupPlan& p = plans_[g];
         if (!p.stateful()) continue;
         const int32_t slot = state_slots[g];
-        if (slot < 0) return RAD_E_STATE;          /* no state to save, or none to restore into */
+        if (slot < 0) {                            /* no state to save, or none to restore into */
+            RAD_ERR("checkpoint %s slot %d: the sequence holds no state slot in group %d", dir,
+                    (int)ck_slot, (int)g);
+            return RAD_E_STATE;
+        }
         const int64_t nbytes = p.layer_bytes_per_state();
         void* st = state_ptr((int32_t)g, 0, slot);
-        if (!st || p.n_layers <= 0) return RAD_E_STATE;
+        if (!st || p.n_layers <= 0) {
+            RAD_ERR("checkpoint %s slot %d: group %d has no address for state slot %d", dir,
+                    (int)ck_slot, (int)g, (int)slot);
+            return RAD_E_STATE;
+        }
         if (off + nbytes * p.n_layers > checkpoint_bytes_) {
             RAD_ERR("checkpoint slot %d holds %lld bytes a rank and this sequence's linear state "
                     "needs more than that; the store was sized from the same plans, so the two "
                     "have gone out of step", (int)ck_slot, (long long)checkpoint_bytes_);
             return RAD_E_STATE;
         }
-        RAD_TRY(save ? rad_memcpy_2d_async(ck + off, nbytes, st, p.layer_stride(), nbytes,
-                                           p.n_layers, s)
-                     : rad_memcpy_2d_async(st, p.layer_stride(), ck + off, nbytes, nbytes,
-                                           p.n_layers, s));
+        const int cs = save ? rad_memcpy_2d_async(ck + off, nbytes, st, p.layer_stride(), nbytes,
+                                                  p.n_layers, s)
+                            : rad_memcpy_2d_async(st, p.layer_stride(), ck + off, nbytes, nbytes,
+                                                  p.n_layers, s);
+        if (cs < 0) {
+            RAD_ERR("checkpoint %s slot %d: the device refused the copy of group %d (%lld rows of "
+                    "%lld bytes): %s", dir, (int)ck_slot, (int)g, (long long)p.n_layers,
+                    (long long)nbytes, rad_strerror(cs));
+            return cs;
+        }
         off += nbytes * p.n_layers;
     }
     return RAD_OK;
