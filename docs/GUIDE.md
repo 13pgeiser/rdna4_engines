@@ -344,12 +344,13 @@ that points each name at its copy. A name two shards hold that no index entry se
 The conversions of record live in `scripts/convfn.sh` and `scripts/convdspark.sh`, with their
 recipes in `data/recipes/`.
 
-**A release someone else already quantised is read as it ships.** Two forms are imported weight
+**A release someone else already quantised is read as it ships.** Three forms are imported weight
 by weight, so their quantised linears need no recipe rule:
 
 | `quantization_config` | read as | |
 |---|---|---|
 | `quark`, MXFP4 weights (fp4, per_group 32, e8m0) | `fp4_e2m1*e8m0[1x32]` | byte for byte: the same codes and exponents. A checkpoint of this form is also served as it stands (§3.4) |
+| `paroquant_mxfp4` (z-lab's ParoQuant on the MXFP4 grid: `format mxfp4`, `mxfp4_block 32`, `group_size 128`) | `fp4_e2m1*e8m0[1x32]/givens` | the codes and exponents byte for byte, plus the learned rotation as the encoding's `givens` tables: per checkpoint tensor the Givens pairs (made whole-row columns), angles and `1 / channel_scales`, a fused gate\|up or qkv\|z carrying one set a part. Convert-time only (the tables are built, not mapped); served by the rotating activation quantiser `givens_quant_act_fp8` and the ordinary MXFP4 GEMM (docs/OPS.md). Its fp8 heads and embedding (one f32 scale a row) are read exactly, for a recipe's `cast`/`rtn` rule |
 | `auto-round` with `packing_format: auto_round:auto_gptq`, and `gptq` (v1) | `i4*bf16[1x128]` or `i8*bf16[1x128]` | the GPTQ-packed codes transposed and made signed, the f16 scales rounded to bf16. Symmetric, group 128 or a multiple of it (per channel included), no act-order. Convert-time only, because the scales are not served as shipped |
 
 The width is read per tensor, so a release mixing int4 experts with int8 projections imports both.
@@ -359,12 +360,16 @@ form, so it is kept in the container as `imported_quantization_config.*`, and th
 its family's quantised plugin (`qwen35_fp8` for Qwen3.8-27B; `qwen4exp_fp8` for Flash-Next).
 
 A weight the architecture declares in another form than the release holds still takes a rule: the
-recipe dequantises the import exactly and quantises from that. The two recipes of record:
+recipe dequantises the import exactly and quantises from that. The recipes of record:
 
 ```sh
 # AMD's Quark AWQ-MXFP4 Qwen3.8-27B with the DFlash2 drafter
 rad-convert ~/models/amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-quark-mxfp4-df2.recipe -o q38-27b-quark-mxfp4-df2.rad
+
+# A ParoQuant MXFP4 Qwen3.8-27B (rotated MXFP4 trunk imported with its rotations; fp16 parts cast to bf16)
+rad-convert ~/models/MisterSnrub/Qwen3.8-27B-PARO-MXFP4-v2 --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 \
+    --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe -o q38-27b-paro-mxfp4-df2.rad
 
 # An AutoRound int4 Qwen3.8-Flash-Next: its experts imported, its int4 projections made int8
 rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound \

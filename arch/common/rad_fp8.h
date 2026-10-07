@@ -58,6 +58,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace rad {
 namespace arch {
@@ -690,6 +691,17 @@ struct LinearFP8 {
      * feeds an MXFP4 linear unchanged. Read off the weight's encoding like `bf16` and `i8`. */
     bool       mx = false;
     rad_weight wref = 0;
+    /* ...ROTATED (ParoQuant), a variant of `mx`: the same GEMM over an activation that
+     * `givens_quant_act_fp8` made from the input's bf16 plane -- the channel scale, the Givens
+     * stages and the E4M3 quantiser in one pass, once for each rotated PART of a fused projection
+     * (gate|up, qkv|z: each piece was rotated on its own) -- into this linear's own code and
+     * scale planes, `parts` copies side by side. The tables are views of the weight's own planes.
+     * The GEMM takes the parts' row bounds as `pb1`/`pb2` and meets copy p with part p's rows. */
+    bool       paro = false, probed_paro = false;
+    rad_weight rot_pairs = 0, rot_angle = 0, rot_scale = 0;
+    rad_buf    rot_q = 0, rot_s = 0;
+    rad_op     op_rot = 0;
+    int64_t    rot_parts = 1;
     /* What probe() read: the weight is int8. Lets a model learn its trunk's format from one linear
      * before it declares the activation buffers that format decides (ActFP8::declare_qs's `i8`). */
     bool       probed_i8 = false;
@@ -728,12 +740,16 @@ struct LinearFP8 {
     /* `span_lo`/`span_hi`, when hi is set, is this rank's uneven slice of the split dimension in
      * the model's units -- rows of each row part for RAD_SHARD_ROW, columns for RAD_SHARD_COL --
      * and n_out / n_in is already its width; see rad_weight_shard_span. Whole scale blocks. */
+    /* `rot_parts`: the rows of each independently rotated part of a ROTATED weight (probed_paro),
+     * which `row_parts` is when the pieces and the shard parts are the same cut -- gate|up -- and
+     * is not when they are not: the delta net's qkv|z is four shard parts and two rotated ones. */
     int  declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
                  int64_t n_out, int64_t n_in, int shard, RadWeightGroup grp,
                  std::initializer_list<const char*> src,
                  const ActFP8& a, rad_buf y, int64_t max_rows = 0,
                  std::initializer_list<int64_t> row_parts = {},
-                 int64_t span_lo = 0, int64_t span_hi = 0);
+                 int64_t span_lo = 0, int64_t span_hi = 0,
+                 std::initializer_list<int64_t> rot_part_rows = {});
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
               int64_t rows = 0) const;
     /* A SPAN PER STACKED ROW PART (rad_weight_shard_span_parts), in the weight's rows; the scale
@@ -797,6 +813,21 @@ inline bool linear_is_mxfp4(const RadEncoding& e) {
            sc->dtype == RAD_E8M0 && sc->block[0] == 1 && sc->block[1] == RAD_MX_GROUP;
 }
 
+/* The ROTATED OCP-MXFP4 weight (ParoQuant): the same codes and E8M0 exponents, stored in the basis
+ * a "givens" transform names, with the rotation's tables as planes of their own (int32 column
+ * pairs, f32 angles, f32 channel scales, and for a fused projection one set a part). The GEMM
+ * reads it as the plain MXFP4 weight; the activation in front of it is rotated first. */
+inline bool linear_is_paro_mxfp4(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || std::strncmp(e.transform, "givens", RAD_ENC_STR) != 0) return false;
+    if (!rad_enc_valid(&e) || e.n_planes < 5) return false;
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    const RadEncPlane *pr = rad_enc_plane(&e, "t.pairs"), *an = rad_enc_plane(&e, "t.angle"),
+                      *rs = rad_enc_plane(&e, "t.scale");
+    return e.plane[0].dtype == RAD_FP4E2M1 && e.plane[0].block[1] == 1 && sc &&
+           sc->dtype == RAD_E8M0 && sc->block[0] == 1 && sc->block[1] == RAD_MX_GROUP &&
+           pr && an && rs && pr->dtype == RAD_I32 && an->dtype == RAD_F32 && rs->dtype == RAD_F32;
+}
+
 inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char* base,
                             std::initializer_list<const char*> src) {
     if (src.size() == 0) return RAD_E_INVAL;
@@ -808,7 +839,9 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
     probed_i8 = known && linear_is_w8(enc);
-    reads_x = g.w_bf16 || plain || probed_i8;
+    /* A ROTATED weight rotates the bf16 plane itself: its quantiser is not the producer's. */
+    probed_paro = known && linear_is_paro_mxfp4(enc);
+    reads_x = g.w_bf16 || plain || probed_i8 || probed_paro;
     return RAD_OK;
 }
 
@@ -817,7 +850,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                               std::initializer_list<const char*> src,
                               const ActFP8& a, rad_buf y, int64_t max_rows,
                               std::initializer_list<int64_t> row_parts,
-                              int64_t span_lo, int64_t span_hi) {
+                              int64_t span_lo, int64_t span_hi,
+                              std::initializer_list<int64_t> rot_part_rows) {
     N = n_out;
     K = n_in;
     if (N <= 0 || K <= 0 || src.size() == 0) return RAD_E_INVAL;
@@ -941,9 +975,24 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * the exponent plane as `b_scale`, and the same plane again as `b_ref`. Every view takes the
      * weight's row parts as they are -- the exponent grid is one row tall -- and a column slice in
      * whole 128s, which is the ACTIVATION's scale block and so the stricter of the two. */
-    mx = known && linear_is_mxfp4(enc);
+    paro = known && linear_is_paro_mxfp4(enc);
+    mx = known && (linear_is_mxfp4(enc) || paro);
     if (mx) {
-        if (!a.q || !a.s) {
+        if (paro) {
+            /* THE ROTATION OF A ROTATED WEIGHT IS THE ACTIVATION'S, so this linear needs the input's
+             * bf16 plane (probe() set reads_x; the producer wrote it) and quantises it itself. */
+            if (!a.x) {
+                fprintf(stderr, "radiance: '%s' is a rotated MXFP4 weight, rotated and quantised "
+                                "from its input's bf16 plane, and its input has none\n", wn);
+                return RAD_E_DTYPE;
+            }
+            if (g.world > 1 || span_hi > 0) {
+                fprintf(stderr, "radiance: '%s' is a rotated MXFP4 weight; its rotation is per "
+                                "projection and is not cut by a tensor-parallel shard (world %d)\n",
+                        wn, g.world);
+                return RAD_E_UNSUPPORTED;
+            }
+        } else if (!a.q || !a.s) {
             fprintf(stderr, "radiance: '%s' is an MXFP4 weight read against its input's E4M3 "
                             "pair, and its input has none\n", wn);
             return RAD_E_DTYPE;
@@ -965,6 +1014,58 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                 return RAD_E_INVAL;
             }
             parts[np++] = p;
+        }
+        int64_t pb1 = 0, pb2 = 0;
+        if (paro) {
+            /* THE PARTS, in rows, and the tables as weights of their own. The container records
+             * how many parts there are and not where they end -- a declaration has no plane bytes
+             * -- so the block says: `rot_part_rows`, or its row parts when those are the cut. */
+            const int64_t P = rad_enc_givens_parts(&enc);
+            const RadEncPlane* tp = rad_enc_plane(&enc, "t.pairs");
+            if (P < 1 || !tp || tp->extent[0] % P || tp->extent[1] != K) {
+                fprintf(stderr, "radiance: '%s' has rotation tables that do not fit %lld columns\n",
+                        wn, (long long)K);
+                return RAD_E_SHAPE;
+            }
+            const int64_t S = tp->extent[0] / P;
+            std::vector<int64_t> cut;
+            for (int64_t p : rot_part_rows) cut.push_back(p);
+            if (cut.empty()) for (int64_t p : row_parts) cut.push_back(p);
+            if (cut.empty() && P == 1) cut.push_back(N);
+            int64_t sum = 0;
+            for (int64_t p : cut) sum += p;
+            if ((int64_t)cut.size() != P || sum != N || P > 3) {
+                fprintf(stderr, "radiance: '%s' was rotated as %lld part(s) and is declared as %zu "
+                                "rotated part(s) of %lld rows; the GEMM meets up to three copies "
+                                "of the activation\n", wn, (long long)P, cut.size(), (long long)sum);
+                return RAD_E_SHAPE;
+            }
+            for (int64_t i = 0; i + 1 < P; ++i) if (cut[(size_t)i] % 128) {
+                fprintf(stderr, "radiance: '%s' rotation part of %lld rows is not whole 128s\n",
+                        wn, (long long)cut[(size_t)i]);
+                return RAD_E_SHAPE;
+            }
+            rot_parts = P;
+            pb1 = P > 1 ? cut[0] : 0;
+            pb2 = P > 2 ? cut[0] + cut[1] : 0;
+            rot_pairs = decl_view(b, nm.f("%s.rot_pairs", base), wn, "t.pairs", RAD_I32,
+                                  { P * S, K }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
+            rot_angle = decl_view(b, nm.f("%s.rot_angle", base), wn, "t.angle", RAD_F32,
+                                  { P * S, K / 2 }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
+            rot_scale = decl_view(b, nm.f("%s.rot_scale", base), wn, "t.scale", RAD_F32,
+                                  { P, K }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
+            if (!rot_pairs || !rot_angle || !rot_scale) return RAD_E_INVAL;
+            const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
+            rot_q = decl_b(b, nm.f("%s.rot_q", base), RAD_F8E4M3, { rows, P * K });
+            rot_s = decl_b(b, nm.f("%s.rot_s", base), RAD_F32, { rows, P * (K / RAD_FP8_BLOCK) });
+            if (!rot_q || !rot_s) return RAD_E_INVAL;
+            op_rot = rw(b, RAD_OP(b, "givens_quant_act_fp8",
+                            RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", K),
+                                       RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),
+                                       RAD_INT("stages", S), RAD_INT("parts", P)),
+                            RAD_WEIGHTS(rot_pairs, rot_angle, rot_scale)),
+                        { a.x }, { rot_q, rot_s });
+            if (!op_rot) return RAD_E_INVAL;
         }
         const char* sn = nm.f("%s.scale", base);
         const char* rn = nm.f("%s.ref", base);
@@ -990,6 +1091,21 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             RAD_ARCH_TRY(rad_weight_shard_span(b, wref, lo, hi));
         }
         const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
+        if (paro) {
+            op = rot_parts > 1
+                ? rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8"),
+                                     RAD_INT("pb1", pb1), RAD_INT("pb2", pb2)),
+                          RAD_WEIGHTS(w, ws, wref)),
+                      { rot_q, rot_s }, { y })
+                : rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
+                          RAD_WEIGHTS(w, ws, wref)),
+                      { rot_q, rot_s }, { y });
+            return op ? RAD_OK : RAD_E_INVAL;
+        }
         op = rw(b, RAD_OP(b, "gemm_nt_q",
                    RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
                               RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
@@ -1094,6 +1210,17 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),
                     brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK),
                     RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+        return;
+    }
+    if (paro) {
+        /* The rotation first: this linear's own codes, `rot_parts` copies side by side. */
+        RAD_ISSUE_N(c, op_rot, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_pairs),
+                    RAD_W(rot_angle), RAD_W(rot_scale),
+                    brow_slice(rot_q, r0, rows, rot_parts * K),
+                    brow_slice(rot_s, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)));
+        RAD_ISSUE_N(c, op, rows, brow_slice(rot_q, r0, rows, rot_parts * K),
+                    brow_slice(rot_s, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)),
+                    RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_W(wref));
         return;
     }
     if (mx) {

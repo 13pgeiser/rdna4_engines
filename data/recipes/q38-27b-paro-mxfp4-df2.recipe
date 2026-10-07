@@ -1,0 +1,38 @@
+# q38-27b-paro-mxfp4-df2.recipe -- a ParoQuant MXFP4 Qwen3.8-27B (quant_method paroquant_mxfp4) with the
+# DFlash2 drafter.
+#
+#   rad-convert <MisterSnrub/Qwen3.8-27B-PARO-MXFP4-v2> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe q38-27b-paro-mxfp4-df2.recipe -o q38-27b-paro-mxfp4-df2.rad
+#
+# The trunk's linears are imported as they ship, and need no rule: e2m1 codes and an E8M0 exponent a
+# 32 of K -- Quark's planes byte for byte -- stored in the ROTATED basis ParoQuant trained them in,
+# with the rotations beside them as the encoding's "givens" transform (abi/rad_encoding.h): per
+# projection the Givens pairs and angles of 8 stages inside groups of 128 columns, and the channel
+# scales. A fused gate|up or qkv|z keeps one set of tables a checkpoint tensor (parts). rad-convert
+# writes them as planes of the weight; the GEMM is the plain MXFP4 one, and the activation is
+# rotated in front of it (givens_quant_act_fp8) -- nothing is re-quantised, so the weights are the
+# release's to the bit.
+#
+# What the checkpoint does NOT ship in a form the architecture declares gets a rule. The release is
+# fp16 throughout (norms, the delta net's a|b and conv, the vision tower), where the plugin declares
+# bf16: `cast` rounds f16 to bf16 once. Its embedding and head are fp8 with one f32 scale a ROW,
+# read exactly and re-expressed: the embedding as bf16, the head as block fp8 like every other
+# recipe here. Its MTP head is not read: the DFlash2 drafter displaces it.
+#
+# THE DRAFTER is made as small as its acceptance allows, as in q38-27b-quark-mxfp4-df2.recipe.
+
+blk.*.ssm_ab.weight                  cast dtype=bf16
+blk.*.ssm_conv1d.weight              cast dtype=bf16
+token_embd.weight                    cast dtype=bf16
+v.*                                  cast dtype=bf16
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0
