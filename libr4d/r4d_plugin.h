@@ -319,6 +319,8 @@ int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_had_quant_act_fp8 (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_givens_quant_act_fp8 (const RadArgs*, RadStream);
+int r4d_rad_givens_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_rmsnorm_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_gated_quant_fp8 (const RadArgs*, RadStream);
 int r4d_rad_gated_quant_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);

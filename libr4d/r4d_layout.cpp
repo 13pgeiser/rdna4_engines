@@ -615,6 +615,29 @@ extern "C" int r4d_rad_unrelayout_w2a8(const RadParam* p, int n_p, int operand,
  * exponents to [K/32][N], and b_ref is each row's largest exponent -- a reduction over the plane,
  * which is a derivation any reader of the plane could make and so not a choice. */
 namespace {
+/* A ROTATED MXFP4 WEIGHT (ParoQuant): the same two planes -- e2m1 codes, an E8M0 exponent a 32 --
+ * stored in the basis the "givens" transform names, with the rotation's tables beside them. The
+ * GEMM reads the codes and exponents exactly as it reads an unrotated weight; the rotation is the
+ * activation's (givens_quant_act_fp8), and the tables are separate weight operands of that op, so
+ * nothing here touches them. What is checked is that they are there and are the kind of
+ * rotation the quantiser applies: a transform this library does not read would hand the kernel
+ * codes that decode to other numbers. */
+bool mx_paro_enc(const RadEncoding* e, long long K) {
+    if (!e || !rad_enc_is(e, "affine") || std::strncmp(e->transform, "givens", RAD_ENC_STR) != 0) return false;
+    if (e->n_planes < 5 || !rad_enc_valid(e)) return false;
+    if (std::strncmp(e->plane[0].role, "codes", RAD_ENC_STR) != 0 || e->plane[0].dtype != RAD_FP4E2M1 ||
+        e->plane[0].block[0] != 1 || e->plane[0].block[1] != 1) return false;
+    const int s = rad_enc_find(e, "scale");
+    if (s != 1 || e->plane[s].dtype != RAD_E8M0 || e->plane[s].kind != RAD_PLANE_TILED ||
+        e->plane[s].block[0] != 1 || e->plane[s].block[1] != R4D_MXFP4_GROUP) return false;
+    const int p = rad_enc_find(e, "t.pairs"), an = rad_enc_find(e, "t.angle"), sc = rad_enc_find(e, "t.scale");
+    if (p < 0 || an < 0 || sc < 0) return false;
+    if (e->plane[p].dtype != RAD_I32 || e->plane[an].dtype != RAD_F32 || e->plane[sc].dtype != RAD_F32)
+        return false;
+    // the quantiser rotates whole groups of 128 columns, one scale per group
+    return K % 128 == 0 && e->plane[p].extent[1] == K;
+}
+
 int mx_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
     if (!out || !pl) return RAD_E_INVAL;
@@ -622,7 +645,8 @@ int mx_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     int rc = wgeom(p, n_p, R4D_MXFP4_GROUP, &g);
     if (rc != RAD_OK) return rc;
     if (g.group != R4D_MXFP4_GROUP || g.K % 16) return RAD_E_SHAPE;
-    if (!r4d_enc::affine(enc, RAD_FP4E2M1, RAD_E8M0, 1, R4D_MXFP4_GROUP)) return RAD_E_DTYPE;
+    if (!r4d_enc::affine(enc, RAD_FP4E2M1, RAD_E8M0, 1, R4D_MXFP4_GROUP) &&
+        !mx_paro_enc(enc, g.K)) return RAD_E_DTYPE;
     if (gout) *gout = g;
     const long long nblk = g.K / R4D_MXFP4_GROUP;
     if (operand == Q_BSCALE || operand == Q_BREF) {

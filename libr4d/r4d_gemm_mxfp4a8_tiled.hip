@@ -101,7 +101,7 @@ static __device__ __forceinline__ void mxt_lds_barrier() {
 // contiguous and each lane reads one 8-byte group of one row.
 __global__ __launch_bounds__(256) void r4d_mxfp4a8_tile_a_kernel(
     const unsigned char* __restrict__ A, unsigned char* __restrict__ AT, int M, int K,
-    long long slots) {
+    long long slots, int lda) {
   const long long o = (long long)blockIdx.x * 256 + threadIdx.x;
   if (o >= slots) return;
   const int ks = K / 16;
@@ -110,7 +110,7 @@ __global__ __launch_bounds__(256) void r4d_mxfp4a8_tile_a_kernel(
   const int mt = (int)(f / ks), kst = (int)(f % ks);
   const int r = mt * 16 + (lane & 15), k = kst * 16 + (lane >> 4) * 8;
   mxt_u2 v = { 0u, 0u };
-  if (r < M) v = *(const mxt_u2*)(A + (size_t)r * K + k);
+  if (r < M) v = *(const mxt_u2*)(A + (size_t)r * lda + k);
   *(mxt_u2*)(AT + o * 8) = v;
 }
 
@@ -119,7 +119,7 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
     const unsigned char* __restrict__ AT, const float* __restrict__ As,
     const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
     const unsigned char* __restrict__ Wref, __hip_bfloat16* __restrict__ C,
-    int M, int K, int N, int as_rs) {
+    int M, int K, int N, int as_rs, int ldws, int ldc) {
   constexpr int TM = R4D_MXT_TM, WN = R4D_MXT_WN, NTHR = R4D_MXT_NTHR, BMF = R4D_MXT_BMF;
   constexpr int NS = LBK / 16, STR = LBK + R4D_MXT_PAD, BNF = WN * TN * 16;
   constexpr int NTILES_T = BNF / 16, TOT_SLOTS = NTILES_T * NS * 32;
@@ -213,14 +213,14 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
       if constexpr (WSLOTS == 4) {
         const mxt_u4 v = *(const mxt_u4*)src;
         wq[0] = v[0]; wq[1] = v[1]; wq[2] = v[2]; wq[3] = v[3];
-        wsw = *(const unsigned int*)(Ws + (size_t)blk * N + wrc[it]);
+        wsw = *(const unsigned int*)(Ws + (size_t)blk * ldws + wrc[it]);
       } else if constexpr (WSLOTS == 2) {
         const mxt_u2 v = *(const mxt_u2*)src;
         wq[0] = v[0]; wq[1] = v[1];
-        wsw = *(const unsigned short*)(Ws + (size_t)blk * N + wrc[it]);
+        wsw = *(const unsigned short*)(Ws + (size_t)blk * ldws + wrc[it]);
       } else {
         wq[0] = *src;
-        wsw = Ws[(size_t)blk * N + wrc[it]];
+        wsw = Ws[(size_t)blk * ldws + wrc[it]];
       }
 #pragma unroll
       for (int q = 0; q < WSLOTS; ++q) {
@@ -306,7 +306,7 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
         const float rf = __int_as_float((int)((rb[e >> 2] >> (8 * (e & 3))) & 0xFF) << 23);
         o.h[e] = (__hip_bfloat16)(acc[i][j][e] * rf * sc[i]);
       }
-      *(mxt_u4*)(C + (size_t)m * N + nb) = o.v;
+      *(mxt_u4*)(C + (size_t)m * ldc + nb) = o.v;
     }
   }
 }
@@ -317,17 +317,20 @@ extern "C" long r4d_mxfp4a8_tile_a_bytes(int M, int K) {
   return M < 1 || K < 16 ? 0 : (long)((M + 15) / 16) * 16 * K;
 }
 
-extern "C" void r4d_mxfp4a8_tile_a(long a, long at, int M, int K, long stream) {
+extern "C" void r4d_mxfp4a8_tile_a(long a, long at, int M, int K, long stream, int lda) {
+  if (!lda) lda = K;
   if (M < 1) throw std::runtime_error("r4d mxfp4a8_tile_a: M must be >= 1");
   if (K < 16 || K % 16) throw std::runtime_error("r4d mxfp4a8_tile_a: K must be a multiple of 16");
   const long long slots = (long long)((M + 15) / 16) * (K / 16) * 32;
   hipLaunchKernelGGL(r4d_mxfp4a8_tile_a_kernel, dim3((unsigned)((slots + 255) / 256)), dim3(256), 0,
-                     (hipStream_t)stream, (const unsigned char*)a, (unsigned char*)at, M, K, slots);
+                     (hipStream_t)stream, (const unsigned char*)a, (unsigned char*)at, M, K, slots, lda);
 }
 
 extern "C" void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, long wref, long c,
                                        int M, int K, int N, int TN, int as_group, int as_rs,
-                                       long stream) {
+                                       long stream, int ldws, int ldc) {
+  if (!ldws) ldws = N;
+  if (!ldc) ldc = N;
   if (M < 1) throw std::runtime_error("r4d gemm_mxfp4a8_tiled: M must be >= 1");
   if (N < 16 || N % 16) throw std::runtime_error("r4d gemm_mxfp4a8_tiled: N must be a multiple of 16");
   if (K < R4D_MXT_KUNIT || K % R4D_MXT_KUNIT)
@@ -355,7 +358,7 @@ extern "C" void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, l
   hipStream_t st = (hipStream_t)stream;
 #define MXT_LAUNCH(TNv, LBKv, ABv)                                                              \
   hipLaunchKernelGGL((r4d_gemm_mxfp4a8_tiled_kernel<TNv, LBKv, ABv>), grid, block, 0, st, Ap, Sp, \
-                     Wp, Zp, Rp, Cp, M, K, N, as_rs)
+                     Wp, Zp, Rp, Cp, M, K, N, as_rs, ldws, ldc)
   if (TN == 4)        { if (ablk) MXT_LAUNCH(4, 64, true);  else MXT_LAUNCH(4, 64, false); }
   else if (wide_slab) { if (ablk) MXT_LAUNCH(2, 128, true); else MXT_LAUNCH(2, 128, false); }
   else                { if (ablk) MXT_LAUNCH(2, 64, true);  else MXT_LAUNCH(2, 64, false); }
@@ -364,35 +367,52 @@ extern "C" void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, l
 
 // ============================================================== the plugin ABI entry point
 // The row-major activation is re-tiled into the op's scratch, then the GEMM reads it from there.
+// A partitioned weight re-tiles each part's copy of the activation into its own slab of the
+// scratch and runs the GEMM over that part's rows (mx_parts).
 extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 1);
     if (rc != RAD_OK) return rc;
     if (g.N < 16 || g.N % 16) return R4D_NO(RAD_E_SHAPE);
-    if (g.K % R4D_MXT_KUNIT) return R4D_NO(RAD_E_SHAPE);
     if (!g.ascale) return R4D_NO(RAD_E_INVAL);
     /* The per-row reference exponent, as in r4d_rad_gemm_mxfp4a8_m64: without it the fold has no
      * reference and every element would be scaled against zero. */
     if (!g.bref) return R4D_NO(RAD_E_INVAL);
-    int as_group = 0, as_rs = 1;
-    rc = mx_ascale_grid(g, &as_group, &as_rs);
+    MxParts mp;
+    rc = mx_parts(a, &g, &mp);
     if (rc != RAD_OK) return rc;
-    if (!a->scratch || a->scratch_bytes < r4d_mxfp4a8_tile_a_bytes((int)g.M, (int)g.K))
-        return R4D_NO(RAD_E_INVAL);
+    if (g.K % R4D_MXT_KUNIT) return R4D_NO(RAD_E_SHAPE);
+    int as_group = 0, as_rs = 1;
+    rc = mx_ascale_grid(g, &as_group, &as_rs, mp.n);
+    if (rc != RAD_OK) return rc;
+    const long long slab = r4d_mxfp4a8_tile_a_bytes((int)g.M, (int)g.K);
+    if (!a->scratch || a->scratch_bytes < slab * mp.n) return R4D_NO(RAD_E_INVAL);
     R4dMxTileCfg t;
     r4d_cfg_mxfp4_tiled(a, &t);
-    const long at = (long)(uintptr_t)a->scratch;
-    R4D_TRY("gemm_mxfp4a8_tiled",
-        r4d_mxfp4a8_tile_a(r4d_addr(g.a), at, (int)g.M, (int)g.K, (long)(uintptr_t)s);
-        r4d_gemm_mxfp4a8_tiled(at, r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale),
-                               r4d_addr(g.bref), r4d_addr(g.y), (int)g.M, (int)g.K, (int)g.N,
-                               t.tn, as_group, as_rs, (long)(uintptr_t)s));
+    const long kb = (long)((g.K + 127) / 128);
+    for (int p = 0; p < mp.n; ++p) {
+        const long long n0 = mp.n0[p], np = mp.n1[p] - mp.n0[p];
+        const long at = (long)(uintptr_t)a->scratch + (long)(p * slab);
+        R4D_TRY("gemm_mxfp4a8_tiled",
+            r4d_mxfp4a8_tile_a(r4d_addr(g.a) + p * g.K, at, (int)g.M, (int)g.K,
+                               (long)(uintptr_t)s, (int)(mp.lda ? mp.lda : g.K));
+            r4d_gemm_mxfp4a8_tiled(at, r4d_addr(g.ascale) + p * kb * 4, r4d_addr(g.b) + n0 * g.K / 2,
+                                   r4d_addr(g.bscale) + n0, r4d_addr(g.bref) + n0,
+                                   r4d_addr(g.y) + n0 * 2, (int)g.M, (int)g.K, (int)np, t.tn,
+                                   as_group, as_rs, (long)(uintptr_t)s, (int)g.N, (int)g.N));
+    }
     return RAD_OK;
 }
 
 /* The core sizes the op's scratch from this, at the band's widest M: the fragment-tiled copy of
- * the activation, whole 16-row fragments. */
+ * the activation, whole 16-row fragments -- one a part. */
 extern "C" int64_t r4d_rad_gemm_mxfp4a8_tiled_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), K = r4d_geti_or(a, "K", 0);
-    return (int64_t)r4d_mxfp4a8_tile_a_bytes((int)M, (int)K);
+    const long long N = r4d_geti_or(a, "N", 0);
+    const long long pb1 = r4d_geti_or(a, "pb1", 0), pb2 = r4d_geti_or(a, "pb2", 0);
+    const long long e1 = pb1 > 0 ? (pb1 < N ? pb1 : N) : N;
+    long long e2 = pb2 > 0 ? (pb2 < N ? pb2 : N) : N;
+    if (e2 < e1) e2 = e1;
+    const int parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
+    return (int64_t)r4d_mxfp4a8_tile_a_bytes((int)M, (int)K) * parts;
 }

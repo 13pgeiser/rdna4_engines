@@ -123,6 +123,7 @@ set(R4D_UNITS
   "r4d_gemm_fp8a16_nt_m1|"
   "r4d_gemm_fp8a8|"
   "r4d_quant_act_fp8|"
+  "r4d_givens_quant_act_fp8|"
   "r4d_fused_quant_fp8|"
   "r4d_gram_accum_fp8|"
   "r4d_qsa_block_key_bf16|"

@@ -704,12 +704,18 @@ static const RadOperandSpec oGemmNt[] = {
     { "y", RAD_OPD_OUT,    0 },
 };
 
+/* `pb1` and `pb2` are ParoQuant's, and the mxfp4a8 rows alone read them: the weight's rows
+ * [0, pb1), [pb1, pb2) and [pb2, N) each meet their own copy of the activation, side by side in a
+ * row of `a` (so `a` is [M, parts * K]). 0 leaves a bound out. Optional, and absent from every
+ * other grid: a fused projection whose pieces were not rotated apart has one activation. */
 static const RadParamSpec pGemmNtQ[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "N",     RAD_P_INT, RAD_REQUIRED },
     { "K",     RAD_P_INT, RAD_REQUIRED },
     { "group", RAD_P_INT, RAD_REQUIRED },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "pb1",   RAD_P_INT, RAD_OPTIONAL },
+    { "pb2",   RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md's `gemm_nt_q` is `a`, `a_scale`, `b`w, `b_scale`w -> `y`. Two of libr4d's six
  * quantised GEMMs need a seventh operand each and neither is expressible as a weight aux stream,
@@ -1043,6 +1049,26 @@ static const RadOperandSpec oQuantActFp8[] = {
     { "x",     RAD_OPD_IN,  0 },
     { "q",     RAD_OPD_OUT, 0 },
     { "scale", RAD_OPD_OUT, 0 },
+};
+
+/* `givens_quant_act_fp8` is ParoQuant's activation side, and libref declared this schema first
+ * (the loader refuses two that differ). The tables are the "givens" encoding's, as WEIGHT operands;
+ * see libref/ref_quant.cpp for the contract and r4d_givens_quant_act_fp8.hip for the kernel. */
+static const RadParamSpec pGivensQuantAct[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n",      RAD_P_INT, RAD_REQUIRED },
+    { "group",  RAD_P_INT, RAD_REQUIRED },
+    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "stages", RAD_P_INT, RAD_REQUIRED },
+    { "parts",  RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oGivensQuantAct[] = {
+    { "x",      RAD_OPD_IN,     0 },
+    { "pairs",  RAD_OPD_WEIGHT, 0 },
+    { "angle",  RAD_OPD_WEIGHT, 0 },
+    { "rscale", RAD_OPD_WEIGHT, 0 },
+    { "q",      RAD_OPD_OUT,    0 },
+    { "scale",  RAD_OPD_OUT,    0 },
 };
 
 /* `gram_accum` is a NEW OP and this plugin fixes its schema. It is the calibration half of GPTQ:
@@ -2298,6 +2324,16 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("had_quant_act_i8g", pQuantActFp8, oQuantActFp8,
            "quant_act_i8g with a `group`-wide Hadamard along K first; pairs with an i8 weight stored "
            "rotated, its scale carrying the residual factor of `group`."),
+    SCHEMA("givens_quant_act_fp8", pGivensQuantAct, oGivensQuantAct,
+           "ParoQuant's activation quantiser: x is divided by the channel scale `rscale`, rotated by "
+           "`stages` rounds of disjoint Givens pairs (a' = a cos t + b sin t, b' = b cos t - a sin t, "
+           "pairs as column indices of the row, each inside one scale group), then quantised as "
+           "quant_act_fp8 does: scale = amax / 448 per `group`. `parts` rotated copies are written "
+           "side by side -- q is [M, parts * n], scale [M, parts * n / group] -- part p from table "
+           "rows [p * stages, (p + 1) * stages) of `pairs` and `angle` and row p of `rscale`: a "
+           "fused projection's pieces were each rotated on their own. Only a weight stored with "
+           "the \"givens\" transform reads the result; it is NOT quant_act_fp8's output in either "
+           "direction."),
     SCHEMA("had_quant_act_fp8", pQuantActFp8, oQuantActFp8,
            "the same, with a `group`-wide Hadamard along K applied BEFORE the absmax. Pairs with "
            "an expert weight stored at dtype w4a8h, which carries the matching rotation and the "
@@ -5114,6 +5150,22 @@ static const RadKernelInfo kKernels[] = {
   ROW(cHadQuantActFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_had_quant_act_fp8, nullptr, nullptr, nullptr,
   r4d_shape_quant_act_fp8, nullptr, nullptr, r4d_rad_had_quant_act_fp8_describe },
+
+/* ParoQuant's rotation and the quantiser in one pass, because the rotation changes the maximum the
+ * scale is taken over and so cannot be a separate launch ahead of quant_act_fp8 without writing
+ * and re-reading the rotated row. It exists for the MXFP4 weight stored rotated and for nothing
+ * else. */
+{ "givens_quant_act_fp8", "givens_quant_act_fp8", "quant",
+  "the channel scale, ParoQuant's Givens rotations, then per-(row, 128-column) symmetric E4M3 "
+  "quantisation, once for each rotated part of a fused projection",
+  "n a multiple of 128 -- a rotation group cannot straddle the end of a row -- and group 128, "
+  "which is both the rotation group and the weight scale's activation block",
+  "bf16 in, E4M3 out in PLAIN ROW-MAJOR order, parts side by side, with an f32 scale per (row, part, "
+  "128 columns); the tables are the weight's int32 pairs, f32 angles and f32 channel scales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHadQuantActFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_givens_quant_act_fp8, nullptr, nullptr, nullptr,
+  nullptr, nullptr, nullptr, r4d_rad_givens_quant_act_fp8_describe },
 
 { "quant_act_i8g", "quant_act_i8g", "quant",
   "per-(row, 128-column) symmetric int8 quantisation of a bf16 activation",
