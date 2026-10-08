@@ -495,6 +495,52 @@ static int givens_body(const RadArgs* a, bool quant, bool i8 = false) {
 int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) { return givens_body(a, true); }
 int ref_givens_quant_act_i8g(const RadArgs* a, RadStream) { return givens_body(a, true, true); }
 
+/* The same activation with the rotation applied as the dense matrix: y[j] = sum_i T[j][i] * x[i] / D[i] over
+ * each (part, 128-column group), then the quantiser `q`'s dtype names. T is the weight, f16, one [128, 128]
+ * matrix a (part, group) -- what r4d_rad_relayout_gdense composes from the givens tables. */
+int ref_givens_dense_quant(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *tm = &a->t[1], *sc = &a->t[2], *q = &a->t[3], *s = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), P = p_int(a, "parts", 1), g = p_int(a, "group", 0);
+    if (n <= 0 || P <= 0 || g != 128 || n % g != 0) return RAD_E_SHAPE;
+    const bool i8 = q->dtype == RAD_I8;
+    if (!i8 && q->dtype != RAD_F8E4M3) return RAD_E_DTYPE;
+    const int64_t rows = numel(x) / n, ngrp = n / g;
+    if (rows <= 0 || numel(tm) < P * n * g || numel(sc) < P * n || numel(q) < rows * P * n ||
+        numel(s) < rows * P * ngrp) return RAD_E_SHAPE;
+    const float qmax = i8 ? 127.0f : 448.0f;
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(x, r, n), qb = rowoff(q, r, P * n);
+        const int64_t xs = laststride(x), qs = laststride(q);
+        std::vector<float> in((size_t)g), y((size_t)g);
+        for (int64_t p = 0; p < P; ++p)
+            for (int64_t gi = 0; gi < ngrp; ++gi) {
+                for (int64_t i = 0; i < g; ++i)
+                    in[(size_t)i] = ldt(x, xb + (gi * g + i) * xs) / ldt(sc, p * n + gi * g + i);
+                float amax = 0.0f;
+                for (int64_t j = 0; j < g; ++j) {
+                    double acc = 0.0;
+                    for (int64_t i = 0; i < g; ++i)
+                        acc += (double)ldt(tm, ((p * ngrp + gi) * g + j) * g + i) * (double)in[(size_t)i];
+                    y[(size_t)j] = (float)acc;
+                    amax = std::max(amax, std::fabs(y[(size_t)j]));
+                }
+                const float scl = amax > 0.0f ? amax * (1.0f / qmax) : 1.0f;
+                const float inv = 1.0f / scl;
+                for (int64_t j = 0; j < g; ++j) {
+                    float v = y[(size_t)j] * inv;
+                    if (v > qmax) v = qmax;
+                    if (v < -qmax) v = -qmax;
+                    if (i8) v = std::nearbyint(v);
+                    st_dt(q->dtype, q->data, qb + (p * n + gi * g + j) * qs, v);
+                }
+                stt(s, rowoff(s, r, P * ngrp) + (p * ngrp + gi) * laststride(s), scl);
+            }
+    }
+    return RAD_OK;
+}
+
 /* The same channel scale and rotations with NO quantiser: y = the rotated row in y's dtype, `parts`
  * copies side by side. For a weight whose GEMM reads a 16-bit activation (w5a16). */
 int ref_givens_rotate(const RadArgs* a, RadStream) { return givens_body(a, false); }

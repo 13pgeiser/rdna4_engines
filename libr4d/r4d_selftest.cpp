@@ -3775,12 +3775,13 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
  * must sit within the E4M3 grid of the reference (half a step at the top of the range is 1/16 of
  * the group's maximum, so 7% of it is a bound a wrong pair or a wrong angle cannot meet). */
 static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, int stages,
-                           bool rot_only = false, bool i8 = false) {
-    const char* row = rot_only ? "givens_rotate" : i8 ? "givens_quant_act_i8g" : "givens_quant_act_fp8";
+                           bool rot_only = false, bool i8 = false, bool dense = false) {
+    const char* row = dense ? "givens_dense_quant" : rot_only ? "givens_rotate"
+                    : i8 ? "givens_quant_act_i8g" : "givens_quant_act_fp8";
     if (!sel(row)) return;
     char nm[160];
-    std::snprintf(nm, sizeof nm, "%s numeric M=%lld K=%lld parts=%d stages=%d", row, (long long)M,
-                  (long long)K, parts, stages);
+    std::snprintf(nm, sizeof nm, "%s %s numeric M=%lld K=%lld parts=%d stages=%d", row,
+                  dense ? (i8 ? "i8" : "fp8") : "", (long long)M, (long long)K, parts, stages);
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->launch) { ok(nm, false, "row absent"); return; }
     const int64_t G = 128, ng = K / G;
@@ -3818,6 +3819,7 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
     void* d_r = dalloc(rs.size() * 4);
     void* d_q = dalloc((size_t)(M * parts * K) * (rot_only ? 2 : 1));
     void* d_s = dalloc((size_t)(M * parts * ng) * 4);
+    void* d_t = nullptr;
     if (!d_x || !d_p || !d_a || !d_r || !d_q || !d_s) { ok(nm, false, "hipMalloc failed"); return; }
     st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
     st_memcpy(d_p, pairs.data(), pairs.size() * 4, hipMemcpyHostToDevice);
@@ -3832,6 +3834,29 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
     if (rot_only) ts.pop_back();
     std::vector<RadParam> ps = { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16"),
                                  PI("stages", stages), PI("parts", parts) };
+    if (dense) {
+        // the matrices come out of the row's own layout hook, from the same tables, as rad-convert makes them
+        Planes pp;
+        pp.enc = rad_enc_plain(RAD_BF16);
+        rad_enc_add_table(&pp.enc, "t.pairs", RAD_I32, NPS, K);
+        rad_enc_add_table(&pp.enc, "t.angle", RAD_F32, NPS, K / 2);
+        pp.data.assign(3, {});
+        pp.rows = { 0, NPS, NPS };
+        pp.cols = { 0, K, K / 2 };
+        pp.data[1].assign((const uint8_t*)pairs.data(), (const uint8_t*)(pairs.data() + pairs.size()));
+        pp.data[2].assign((const uint8_t*)ang.data(), (const uint8_t*)(ang.data() + ang.size()));
+        std::vector<RadParam> lp = { PI("n", K), PI("parts", parts) };
+        std::vector<uint8_t> blob;
+        const int rl = stored(r, lp, 1, pp, { "t.pairs", "t.angle" }, &blob);
+        if (rl != RAD_OK) { ok(nm, false, "relayout rc " + std::to_string(rl)); return; }
+        d_t = dalloc(blob.size());
+        if (!d_t) { ok(nm, false, "hipMalloc failed"); return; }
+        st_memcpy(d_t, blob.data(), blob.size(), hipMemcpyHostToDevice);
+        ts = { T(d_x, RAD_BF16, { M, K }), T(d_t, RAD_F16, { parts * K, 128 }), T(d_r, RAD_F32, { (int64_t)parts, K }),
+               T(d_q, i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, { M, parts * K }), T(d_s, RAD_F32, { M, parts * ng }) };
+        ps = { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16"), PI("parts", parts),
+               PS("out", i8 ? "i8" : "fp8") };
+    }
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size();
@@ -3877,9 +3902,25 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
                 }
             }
         }
-    char d[96];
+    char d[128];
     std::snprintf(d, sizeof d, "scale rel %.2e, value/amax %.3f", worst_scale, worst_val);
-    ok(nm, rot_only ? worst_val < 1e-3 : (worst_scale < 1e-4 && worst_val < (i8 ? 0.01 : 0.07)), d);
+    if (M >= 1024) {                                  // a prefill chunk: say how fast it ran
+        hipEvent_t e0, e1;
+        st_ev_create(&e0); st_ev_create(&e1);
+        for (int i = 0; i < 3; ++i) r->launch(&a, nullptr);
+        st_ev_record(e0, nullptr);
+        for (int i = 0; i < 20; ++i) r->launch(&a, nullptr);
+        st_ev_record(e1, nullptr);
+        st_ev_sync(e1);
+        float ms = 0;
+        st_ev_elapsed(&ms, e0, e1);
+        st_ev_destroy(e0); st_ev_destroy(e1);
+        std::printf("        %.1f us a launch   (%s)\n", (double)ms * 50.0, d);
+    }
+    // the dense form carries f16 matrices: its scale reads ~1e-3 off the f32 network's, its values stay within the
+    // quantiser's own step
+    ok(nm, rot_only ? worst_val < 1e-3
+                    : (worst_scale < (dense ? 3e-3 : 1e-4) && worst_val < (i8 ? 0.01 : 0.07)), d);
 }
 
 
@@ -13148,6 +13189,22 @@ static void device_phase(const Plugin& pl) {
         givens_numeric(pl, 5, 5120, 2, 8, false, true);
         givens_numeric(pl, 64, 17408, 1, 8, false, true);
         givens_numeric(pl, 300, 6144, 2, 8, false, true);
+        givens_numeric(pl, 2048, 5120, 1, 8, false, true);
+        givens_numeric(pl, 2048, 5120, 2, 8, false, true);
+        givens_numeric(pl, 2048, 17408, 1, 8, false, true);
+    }
+    if (sel("givens_dense_quant")) {
+        if (!g_case) std::printf("\nParoQuant's rotation as dense per-group matrices, int8 and E4M3 output, against libm's rotation\n");
+        for (int i8 = 0; i8 < 2; ++i8) {
+            givens_numeric(pl, 1, 128, 1, 8, false, i8, true);
+            givens_numeric(pl, 5, 5120, 2, 8, false, i8, true);
+            givens_numeric(pl, 8, 5120, 2, 8, false, i8, true);
+            givens_numeric(pl, 16, 5120, 1, 8, false, i8, true);
+            givens_numeric(pl, 300, 6144, 2, 8, false, i8, true);
+            givens_numeric(pl, 2048, 5120, 1, 8, false, i8, true);
+            givens_numeric(pl, 2048, 5120, 2, 8, false, i8, true);
+            givens_numeric(pl, 2048, 17408, 1, 8, false, i8, true);
+        }
     }
     if (sel("givens_quant_act_fp8")) {
         if (!g_case) std::printf("\nParoQuant's rotate-and-quantise, against an f64 rotation\n");

@@ -709,7 +709,7 @@ struct LinearFP8 {
     int64_t    rot_split = 0;
     rad_buf    rot_q2 = 0, rot_s2 = 0;
     rad_op     op_rot2 = 0, op2 = 0;
-    rad_weight rot_pairs = 0, rot_angle = 0, rot_scale = 0;
+    rad_weight rot_pairs = 0, rot_angle = 0, rot_scale = 0, rot_dense = 0;
     rad_buf    rot_q = 0, rot_s = 0;
     rad_op     op_rot = 0;
     int64_t    rot_parts = 1, rot_stages = 0;
@@ -761,21 +761,28 @@ struct LinearFP8 {
                  std::initializer_list<int64_t> row_parts = {},
                  int64_t span_lo = 0, int64_t span_hi = 0,
                  std::initializer_list<int64_t> rot_part_rows = {});
-    /* THE ROTATION TABLES OF A ROTATED WEIGHT, declared as views of the weight's own planes, with
-     * `rot_parts` and `rot_stages`. `cut` is the rows of each rotated part; the GEMM's part bounds
-     * come back in pb1 and pb2. */
+    /* THE ROTATION OF A ROTATED WEIGHT: its parts and stages (`rot_parts`, `rot_stages`) and its
+     * channel scale as a view of the weight's own plane. `cut` is the rows of each rotated part; the
+     * GEMM's part bounds come back in pb1 and pb2. */
     int  declare_rotation(RadBuilder* b, Names& nm, const char* base, const char* wn,
                           const RadEncoding& enc, int64_t N, int64_t K, RadWeightGroup grp,
                           const std::vector<int64_t>& cut, int64_t* pb1, int64_t* pb2);
-    /* The op in front of the GEMM, over those tables: `op` is givens_rotate (f16 out) or a
-     * rotate-and-quantise (codes and a scale), for M in [lo, hi]. */
-    rad_op decl_rot_op(RadBuilder* b, const Geom& g, const ActFP8& a, const char* op, int64_t lo,
-                       int64_t hi, std::initializer_list<rad_buf> outs) const;
+    /* THE SEQUENTIAL NETWORK (decode: a few rows, where one network a row is cheap): the pairs and
+     * angles as views, and givens_rotate over them to f16, for M in [lo, hi]. */
+    int  decl_seq_tables(RadBuilder* b, Names& nm, const char* base, const char* wn, RadWeightGroup grp);
+    rad_op decl_rot_op(RadBuilder* b, const Geom& g, const ActFP8& a, int64_t lo, int64_t hi,
+                       std::initializer_list<rad_buf> outs) const;
+    /* THE DENSE ROTATION (rot_dense, decl_dense): givens_dense_quant to `out` ("fp8" or "i8") codes
+     * and a scale, for M in [lo, hi]. */
+    rad_op decl_dense_op(RadBuilder* b, const Geom& g, const ActFP8& a, const char* out, int64_t lo,
+                         int64_t hi, std::initializer_list<rad_buf> outs) const;
     /* gemm_nt_q over this weight, M in [lo, hi]. `pb1`/`pb2` go only to a weight with rotated
      * parts, so a one-part op keeps the plain op's geometry -- the key the tune cache is read by. */
     rad_op decl_gemm_q(RadBuilder* b, int64_t lo, int64_t hi, int64_t group, const char* dtype,
                        int64_t pb1, int64_t pb2, std::initializer_list<rad_weight> wts,
                        std::initializer_list<rad_buf> reads, rad_buf y) const;
+    rad_weight decl_dense(RadBuilder* b, Names& nm, const char* base, const char* wn, int64_t N, int64_t K,
+                          RadWeightGroup grp);
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
               int64_t rows = 0) const;
     /* A SPAN PER STACKED ROW PART (rad_weight_shard_span_parts), in the weight's rows; the scale
@@ -930,23 +937,48 @@ inline int LinearFP8::declare_rotation(RadBuilder* b, Names& nm, const char* bas
     rot_stages = S;
     *pb1 = P > 1 ? cut[0] : 0;
     *pb2 = P > 2 ? cut[0] + cut[1] : 0;
-    rot_pairs = decl_view(b, nm.f("%s.rot_pairs", base), wn, "t.pairs", RAD_I32,
-                          { P * S, K }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
-    rot_angle = decl_view(b, nm.f("%s.rot_angle", base), wn, "t.angle", RAD_F32,
-                          { P * S, K / 2 }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
     rot_scale = decl_view(b, nm.f("%s.rot_scale", base), wn, "t.scale", RAD_F32,
                           { P, K }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
-    return rot_pairs && rot_angle && rot_scale ? RAD_OK : RAD_E_INVAL;
+    return rot_scale ? RAD_OK : RAD_E_INVAL;
 }
 
-inline rad_op LinearFP8::decl_rot_op(RadBuilder* b, const Geom& g, const ActFP8& a, const char* op,
-                                     int64_t lo, int64_t hi, std::initializer_list<rad_buf> outs) const {
-    return rw(b, RAD_OP(b, op,
+inline int LinearFP8::decl_seq_tables(RadBuilder* b, Names& nm, const char* base, const char* wn,
+                                      RadWeightGroup grp) {
+    const int64_t PS = rot_parts * rot_stages;
+    rot_pairs = decl_view(b, nm.f("%s.rot_pairs", base), wn, "t.pairs", RAD_I32,
+                          { PS, K }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
+    rot_angle = decl_view(b, nm.f("%s.rot_angle", base), wn, "t.angle", RAD_F32,
+                          { PS, K / 2 }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
+    return rot_pairs && rot_angle ? RAD_OK : RAD_E_INVAL;
+}
+
+inline rad_op LinearFP8::decl_rot_op(RadBuilder* b, const Geom& g, const ActFP8& a, int64_t lo,
+                                     int64_t hi, std::initializer_list<rad_buf> outs) const {
+    return rw(b, RAD_OP(b, "givens_rotate",
                   RAD_PARAMS(RAD_RANGE("M", lo, hi), RAD_INT("n", K), RAD_INT("group", RAD_FP8_BLOCK),
                              RAD_STR("dtype", g.dtype), RAD_INT("stages", rot_stages),
                              RAD_INT("parts", rot_parts)),
                   RAD_WEIGHTS(rot_pairs, rot_angle, rot_scale)),
               { a.x }, outs);
+}
+
+inline rad_op LinearFP8::decl_dense_op(RadBuilder* b, const Geom& g, const ActFP8& a, const char* out,
+                                       int64_t lo, int64_t hi, std::initializer_list<rad_buf> outs) const {
+    return rw(b, RAD_OP(b, "givens_dense_quant",
+                  RAD_PARAMS(RAD_RANGE("M", lo, hi), RAD_INT("n", K), RAD_INT("group", RAD_FP8_BLOCK),
+                             RAD_STR("dtype", g.dtype), RAD_INT("parts", rot_parts),
+                             RAD_STR("out", out)),
+                  RAD_WEIGHTS(rot_dense, rot_scale)),
+              { a.x }, outs);
+}
+
+/* The dense rotation matrices of a rotated weight: a view of its two table planes, declared as several planes
+ * are -- at the first one's dtype (i32) and the weight's logical [N, K] -- that the op's layout hook
+ * (r4d_rad_layout_gdense) composes into [P * K, 128] f16. */
+inline rad_weight LinearFP8::decl_dense(RadBuilder* b, Names& nm, const char* base, const char* wn,
+                                        int64_t N, int64_t K, RadWeightGroup grp) {
+    return decl_view(b, nm.f("%s.rot_dense", base), wn, "t.pairs,t.angle", RAD_I32, { N, K },
+                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
 }
 
 inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
@@ -1097,10 +1129,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         const bool band = hi > kSplit;
         const int64_t f16_hi = band ? kSplit : hi;      /* the f16 chain's rows */
         RAD_ARCH_TRY(declare_rotation(b, nm, base, wn, enc, N, K, grp, cut, &pb1, &pb2));
+        RAD_ARCH_TRY(decl_seq_tables(b, nm, base, wn, grp));
         const int64_t P = rot_parts;
         rot_q = decl_b(b, nm.f("%s.rot_y", base), RAD_F16, { f16_hi, P * K });
         if (!rot_q) return RAD_E_INVAL;
-        op_rot = decl_rot_op(b, g, a, "givens_rotate", 1, f16_hi, { rot_q });
+        op_rot = decl_rot_op(b, g, a, 1, f16_hi, { rot_q });
         if (!op_rot) return RAD_E_INVAL;
         w  = decl_view(b, wn, nullptr, "codes", enc.plane[0].dtype, { N, K }, RAD_ACCESS_PER_TOKEN,
                        shard, grp);
@@ -1117,7 +1150,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             rot_q2 = decl_b(b, nm.f("%s.rot_q2", base), RAD_I8, { hi, P * K });
             rot_s2 = decl_b(b, nm.f("%s.rot_s2", base), RAD_F32, { hi, P * (K / RAD_FP8_BLOCK) });
             if (!rot_q2 || !rot_s2) return RAD_E_INVAL;
-            op_rot2 = decl_rot_op(b, g, a, "givens_quant_act_i8g", kSplit + 1, hi, { rot_q2, rot_s2 });
+            rot_dense = decl_dense(b, nm, base, wn, N, K, grp);
+            if (!rot_dense) return RAD_E_INVAL;
+            op_rot2 = decl_dense_op(b, g, a, "i8", kSplit + 1, hi, { rot_q2, rot_s2 });
             op2 = decl_gemm_q(b, kSplit + 1, hi, RAD_FP8_BLOCK, bits5 ? "w5a8i8" : "w4a8i8_asym",
                               pb1, pb2, { w, ws }, { rot_q2, rot_s2 }, y);
             if (!op_rot2 || !op2) return RAD_E_INVAL;
@@ -1187,7 +1222,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             rot_q = decl_b(b, nm.f("%s.rot_q", base), RAD_F8E4M3, { rows, rot_parts * K });
             rot_s = decl_b(b, nm.f("%s.rot_s", base), RAD_F32, { rows, rot_parts * (K / RAD_FP8_BLOCK) });
             if (!rot_q || !rot_s) return RAD_E_INVAL;
-            op_rot = decl_rot_op(b, g, a, "givens_quant_act_fp8", 1, rows, { rot_q, rot_s });
+            rot_dense = decl_dense(b, nm, base, wn, N, K, grp);
+            if (!rot_dense) return RAD_E_INVAL;
+            op_rot = decl_dense_op(b, g, a, "fp8", 1, rows, { rot_q, rot_s });
             if (!op_rot) return RAD_E_INVAL;
         }
         const char* sn = nm.f("%s.scale", base);
@@ -1318,8 +1355,8 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         return;
     }
     if (paro5 && rot_split && rows > rot_split) {
-        RAD_ISSUE_N(c, op_rot2, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_pairs),
-                    RAD_W(rot_angle), RAD_W(rot_scale), brow_slice(rot_q2, r0, rows, rot_parts * K),
+        RAD_ISSUE_N(c, op_rot2, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_dense),
+                    RAD_W(rot_scale), brow_slice(rot_q2, r0, rows, rot_parts * K),
                     brow_slice(rot_s2, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)));
         RAD_ISSUE_N(c, op2, rows, brow_slice(rot_q2, r0, rows, rot_parts * K),
                     brow_slice(rot_s2, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)),
@@ -1339,8 +1376,8 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         const rad_buf aq = paro ? rot_q : a.q, as = paro ? rot_s : a.s;
         const int64_t ak = rot_parts * K;
         if (paro)
-            RAD_ISSUE_N(c, op_rot, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_pairs),
-                        RAD_W(rot_angle), RAD_W(rot_scale), brow_slice(aq, r0, rows, ak),
+            RAD_ISSUE_N(c, op_rot, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_dense),
+                        RAD_W(rot_scale), brow_slice(aq, r0, rows, ak),
                         brow_slice(as, r0, rows, ak / RAD_FP8_BLOCK));
         RAD_ISSUE_N(c, op, rows, brow_slice(aq, r0, rows, ak),
                     brow_slice(as, r0, rows, ak / RAD_FP8_BLOCK),

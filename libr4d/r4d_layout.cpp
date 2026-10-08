@@ -571,6 +571,90 @@ extern "C" int r4d_rad_unrelayout_w5(const RadParam* p, int n_p, int operand, co
     return RAD_OK;
 }
 
+/* ---- givens_dense: ParoQuant's rotation tables composed into one dense matrix a (part, group).
+ *
+ * A "givens" weight stores its rotation as pairs (i32 [P*S, K]) and angles (f32 [P*S, K/2]); the dense
+ * kernel (r4d_givens_dense.hip) applies it as T (x / D), T being the composition of the group's S
+ * stages.  The blob is [P * K/128][128 (j)][128 (i)] f16, T[j][i] = output j of the network fed the unit
+ * vector e_i, so a (part, group) is 32 KiB the kernel stages whole.  Composed in f32 in the order the
+ * stages are applied (stage 0 first), a' = a c + b s, b' = b c - a s -- libref's loop -- and rounded to
+ * f16 once.  Operand 1 of givens_dense_quant; everything else stays as stored. */
+namespace {
+constexpr int GD_OPERAND = 1;
+constexpr long long GD_GROUP = 128;
+
+int gd_geom(const RadParam* p, int n_p, const RadEncoding* enc, const int* sel, const RadTensor* pl, int n,
+            long long* P, long long* S, long long* K) {
+    if (n != 2 || std::strncmp(r4d_enc::role(enc, sel, 0), "t.pairs", RAD_ENC_STR) != 0 ||
+        std::strncmp(r4d_enc::role(enc, sel, 1), "t.angle", RAD_ENC_STR) != 0) return RAD_E_SHAPE;
+    *K = r4d_pgeti_or(p, n_p, "n", 0);
+    *P = r4d_pgeti_or(p, n_p, "parts", 1);
+    if (*K <= 0 || *K % GD_GROUP || *P < 1) return RAD_E_SHAPE;
+    if (pl[0].rank != 2 || pl[0].shape[1] != *K || pl[0].shape[0] % *P || pl[0].dtype != RAD_I32)
+        return RAD_E_SHAPE;
+    *S = pl[0].shape[0] / *P;
+    if (*S < 1 || !dims(pl[1], *P * *S, *K / 2) || pl[1].dtype != RAD_F32) return RAD_E_SHAPE;
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_gdense(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                     const int* sel, const RadTensor* pl, int n, RadLayout* out) {
+    if (!out || !pl) return RAD_E_INVAL;
+    if (operand != GD_OPERAND) return RAD_E_UNSUPPORTED;
+    long long P, S, K;
+    const int rc = gd_geom(p, n_p, enc, sel, pl, n, &P, &S, &K);
+    if (rc != RAD_OK) return rc;
+    fill(out, "r4d.givens.dense.g128", RAD_F16, P * K, GD_GROUP, P * K * GD_GROUP * 2);
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_relayout_gdense(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                       const int* sel, const RadTensor* pl, int n, void* dst,
+                                       int64_t dst_bytes) {
+    RadLayout L;
+    int rc = r4d_rad_layout_gdense(p, n_p, operand, enc, sel, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+    long long P, S, K;
+    rc = gd_geom(p, n_p, enc, sel, pl, n, &P, &S, &K);
+    if (rc != RAD_OK) return rc;
+    const int32_t* pairs = (const int32_t*)pdata(pl[0]);
+    const float* ang = (const float*)pdata(pl[1]);
+    uint16_t* t = (uint16_t*)dst;
+    const long long nkb = K / GD_GROUP, half = GD_GROUP / 2;
+    std::vector<int> ia((size_t)(S * half)), ib((size_t)(S * half));
+    std::vector<float> cs((size_t)(S * half)), sn((size_t)(S * half));
+    std::vector<float> v((size_t)GD_GROUP);
+    for (long long pt = 0; pt < P; ++pt)
+        for (long long g = 0; g < nkb; ++g) {
+            for (long long st = 0; st < S; ++st)
+                for (long long j = 0; j < half; ++j) {
+                    const long long row = pt * S + st, o = (size_t)(st * half + j);
+                    const long long a = pairs[row * K + g * GD_GROUP + 2 * j] - g * GD_GROUP;
+                    const long long b = pairs[row * K + g * GD_GROUP + 2 * j + 1] - g * GD_GROUP;
+                    if (a < 0 || a >= GD_GROUP || b < 0 || b >= GD_GROUP || a == b) return RAD_E_FORMAT;
+                    ia[(size_t)o] = (int)a;
+                    ib[(size_t)o] = (int)b;
+                    const float th = ang[row * (K / 2) + g * half + j];
+                    cs[(size_t)o] = std::cos(th);
+                    sn[(size_t)o] = std::sin(th);
+                }
+            uint16_t* tg = t + (size_t)(pt * nkb + g) * GD_GROUP * GD_GROUP;
+            for (long long i = 0; i < GD_GROUP; ++i) {
+                std::fill(v.begin(), v.end(), 0.0f);
+                v[(size_t)i] = 1.0f;
+                for (long long o = 0; o < S * half; ++o) {
+                    const float va = v[(size_t)ia[(size_t)o]], vb = v[(size_t)ib[(size_t)o]];
+                    v[(size_t)ia[(size_t)o]] = va * cs[(size_t)o] + vb * sn[(size_t)o];
+                    v[(size_t)ib[(size_t)o]] = vb * cs[(size_t)o] - va * sn[(size_t)o];
+                }
+                for (long long j = 0; j < GD_GROUP; ++j) tg[j * GD_GROUP + i] = f32_to_f16(v[(size_t)j]);
+            }
+        }
+    return RAD_OK;
+}
+
 /* ---- w8: i8 codes, symmetric about zero, an f16 scale a group. The f16 kernel (a16) reads the
  * code offset binary with zero 128 in the shared dword; the int8 kernel (a8) reads it signed with a
  * bare f16 scale plane. */

@@ -367,6 +367,7 @@ spelling of `act`, not the vocabulary's.
 | `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `givens_quant_act_fp8` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `q`, `scale` |
 | `givens_quant_act_i8g` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `q`, `scale` |
+| `givens_dense_quant` | `M` `n` `group` `dtype` `parts` `out`:str | `x`, `tdense`w, `rscale`w → `q`, `scale` |
 | `givens_rotate` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `y` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |

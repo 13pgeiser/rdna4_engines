@@ -840,6 +840,10 @@ int ref_givens_quant_act_i8g_shape(const RadParam*, int, int, RadOpdDesc*) {
     return RAD_E_UNSUPPORTED;               /* a pairing cannot be drawn: see givens_quant_act_fp8 */
 }
 
+int ref_givens_dense_quant_shape(const RadParam*, int, int, RadOpdDesc*) {
+    return RAD_E_UNSUPPORTED;               /* a composed rotation cannot be drawn: see givens_quant_act_fp8 */
+}
+
 int ref_givens_rotate_shape(const RadParam*, int, int, RadOpdDesc*) {
     return RAD_E_UNSUPPORTED;               /* a pairing cannot be drawn: see givens_quant_act_fp8 */
 }
