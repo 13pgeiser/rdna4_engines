@@ -634,7 +634,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1563
+**Count:** 1564
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1676,7 +1676,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_NPU_SPILLOVER` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_NPU_TRUNK_TEST_MODEL` | crates/hipfire-arch-qwen4/tests/npu_trunk_model_sanity.rs | harness |
 | `HIPFIRE_OFFLOAD_DEBUG` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/rdna-compute/src/dispatch.rs | developer |
-| `HIPFIRE_OFFLOAD_EXEC` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/cpu_exec.rs | stable |
+| `HIPFIRE_OFFLOAD_EXEC` | crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_OOM_GUARD` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/kv_slots.rs | stable |
 | `HIPFIRE_ORACLE_DIVERGE` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
