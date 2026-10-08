@@ -456,6 +456,36 @@
   - Speed (Strix Halo, same artifact and route, `hipfire bench --matrix --pp 512,1024,8192 --ctx 128 --tg 1 --runs 2 --warmups 1 --spec off --backend noslots --workload stateless`, synthetic stream `token[i] = 10 + (i % 1000)`, graph on, 3 fresh processes per arm in a Latin-square order, medians of per-process medians; armed vs beta `d608ac9ed`): pp512 1,289.9 → 1,374.5 tok/s, pp1024 1,445.7 → 1,552.4, pp8192 1,676.3 → 1,833.8 (ranges disjoint); decode at ctx 128 33.6 → 33.7 tok/s. `=0` on the same binary measures as beta (1,289.2 / 1,440.4 / 1,669.7).
   - Caveats: the entries are HIP, without PeaceMaker twins; the Redline prefill phase capture of Qwen4 refuses on beta and on this branch alike (the QSA gather workspace may not grow while a capture is armed), so no Redline prefill fingerprint exists for it.
 
+- Gemma 4 layers run as engine `Step`s: 12B dense, E2B/E4B, the 26B-A4B MoE
+  and the EAGLE draft head (`gemma-4-*-assistant`) all execute
+  `[SandwichAttention, SandwichMlp | ParallelMoeMlp, PerLayerInput?, Scale?]`
+  from `hipfire_dispatch`; dense and E-series batched prefill and EAGLE verify
+  run the same program with `rows > 1`. The Gemma 4 super-op path and its
+  `HIPFIRE_FORWARD_LOWERED` hand arms are gone.
+  - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
+    byte-identical, logits included; EAGLE tau is unchanged.
+  - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
+    kernels. Greedy text stays coherent and can diverge late.
+  - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
+    through the same program (`lowered::forward_prefill_batch`, 64-row
+    chunks, Q8 KV). The dispatch sandwich projections feed the calibration
+    collector, so any architecture on these steps calibrates without
+    per-architecture taps. Gemma calibration and KLD numbers move: the tools
+    now use the serve kernels. The 26B-A4B MoE block runs batched too.
+  - `HIPFIRE_BATCHED_PREFILL` and `HIPFIRE_WMMA_PREFILL` are removed; dense
+    Gemma 4 always loads on the eager stack, MoE on the lowered one.
+  - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM,PROJ}` developer
+    switches are removed; the fused routes are always on. The debug switches
+    `HIPFIRE_GEMMA4_{BASELINE_ATTN,ATTN_VERIFY,GEMM_VERIFY}` and
+    `HIPFIRE_MOE_{BYPASS,BUCKETED}` are removed with their hand-written paths.
+  - The 26B-A4B lowered stack loads MQ4G256V2 weights and runs MQ4G256V2 and
+    MQ6G256 routed experts on the indexed kernels, which is what the current
+    quantizer emits for it. A MoE checkpoint whose expert formats have no
+    indexed kernel pair now refuses to load instead of running a host-side
+    expert loop, and so does one whose HFQ4-G128 expert `down_proj` (K = 704)
+    was packed across rows by a quantizer before `b4846285e`; both produced
+    garbage. Requantize such files.
+
 ### Known issues
 
 - **Uniform MQ6G256 V1 (qt15) Qwen35 MoE native MTP on gfx1200/gfx1201 with FP16 WMMA enabled is refused before serving/generation when a head would attach.** Admission uses tensor metadata, not filenames, and covers explicit MTP and resident `auto` attachment. `--spec off` / `speculation.mtp=off` and a host-mapped routed-expert spill whose `auto` has declined remain AR, not blanket-refused. `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense models remain allowed. This guards the reported garbled narrow verify windows; it does not fix or establish the root cause of the underlying WMMA defect. Historical performance checkpoints remain author-reported measurements, not validation of this admission change.
