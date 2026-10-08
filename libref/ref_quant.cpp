@@ -410,35 +410,31 @@ int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
-/* ------------------------------------------------------------- givens_quant_act_fp8 */
-/* ParoQuant's activation side: every row scaled by its channel factors, rotated by `stages`
- * rounds of disjoint Givens pairs, then the same symmetric block-scaled E4M3 quantiser. A weight
- * stored as v = w . D . G_1 ... G_S (abi/rad_encoding.h, "givens") meets the activation
- * x . D^-1 . G_1 ... G_S, because <v, x D^-1 G_1..G_S> = <w, x> and each G is orthogonal.
+/* ------------------------------------------------------------- givens_rotate */
+/* ParoQuant's activation side: every row scaled by its channel factors and rotated by `stages` rounds of
+ * disjoint Givens pairs, written in y's dtype. A weight stored as v = w . D . G_1 ... G_S
+ * (abi/rad_encoding.h, "givens") meets the activation x . D^-1 . G_1 ... G_S, because
+ * <v, x D^-1 G_1..G_S> = <w, x> and each G is orthogonal. For a weight whose GEMM reads a 16-bit
+ * activation (w5a16); the quantising form is givens_dense_quant, over the composed matrices.
  *
  * PARTS. A fused projection (gate|up, q|k|v) was rotated per piece, so a row has `parts` rotated
- * copies, written side by side: q is [rows, parts * n] and scale [rows, parts * n/group], part p at
- * columns [p*n, (p+1)*n). The tables stack the parts: pairs and angle `stages` rows each, scale one
- * row, per part. A part's pairs address columns of the row, and a pair must stay inside one scale
- * group (the checkpoint's are within groups of 128): the quantiser reads each group's rotated
- * values after the stages and the device kernel rotates a group at a time.
+ * copies, written side by side: y is [rows, parts * n], part p at columns [p*n, (p+1)*n). The tables
+ * stack the parts: pairs and angle `stages` rows each, scale one row, per part. A part's pairs address
+ * columns of the row and stay inside one group of `group` (the checkpoint's are within groups of 128).
  *
  * The arithmetic is the device kernel's, restated: the divide by the channel scale, then for each
- * stage a' = a cos t + b sin t, b' = b cos t - a sin t in f32, then amax/448 per group. Not
- * bit-identical to the device on the angle: cos and sin of an f32 differ by an ulp between libm
- * and the GPU's. */
-static int givens_body(const RadArgs* a, bool quant, bool i8 = false) {
-    if (!have(a, quant ? 6 : 5)) return RAD_E_INVAL;
-    const RadTensor *x = &a->t[0], *pr = &a->t[1], *an = &a->t[2], *sc = &a->t[3];
-    const RadTensor *q = &a->t[4], *s = quant ? &a->t[5] : nullptr;
+ * stage a' = a cos t + b sin t, b' = b cos t - a sin t in f32. Not bit-identical to the device on the
+ * angle: cos and sin of an f32 differ by an ulp between libm and the GPU's. */
+int ref_givens_rotate(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *pr = &a->t[1], *an = &a->t[2], *sc = &a->t[3], *q = &a->t[4];
     const int64_t n = p_int(a, "n", 0), S = p_int(a, "stages", 0), P = p_int(a, "parts", 1);
-    int64_t g = p_int(a, "group", 0);
+    const int64_t g = p_int(a, "group", 0);
     if (n <= 0 || S <= 0 || P <= 0 || (n & 1)) return RAD_E_SHAPE;
     if (g <= 0 || g > n || n % g != 0) return RAD_E_SHAPE;
     if (numel(pr) < P * S * n || numel(an) < P * S * (n / 2) || numel(sc) < P * n) return RAD_E_SHAPE;
     const int64_t rows = numel(x) / n;
-    const int64_t ngrp = n / g;
-    if (rows <= 0 || numel(q) < rows * P * n || (quant && numel(s) < rows * P * ngrp)) return RAD_E_SHAPE;
+    if (rows <= 0 || numel(q) < rows * P * n) return RAD_E_SHAPE;
 
     // validated before the loop, because an OpenMP body cannot return
     for (int64_t i = 0; i < P * S * n; ++i) {
@@ -464,38 +460,13 @@ static int givens_body(const RadArgs* a, bool quant, bool i8 = false) {
                     buf[(size_t)ib] = vb * c - va * sn;
                 }
             }
-            if (!quant) {                       // givens_rotate: the rotated row, in q's dtype
-                for (int64_t k = 0; k < n; ++k) st_dt(q->dtype, q->data, qb + (p * n + k) * qs, buf[(size_t)k]);
-                continue;
-            }
-            for (int64_t gi = 0; gi < ngrp; ++gi) {
-                const int64_t k0 = gi * g;
-                float amax = 0.0f;
-                for (int64_t i = 0; i < g; ++i) {
-                    const float m = std::fabs(buf[(size_t)(k0 + i)]);
-                    if (m > amax) amax = m;
-                }
-                const float qmax = i8 ? 127.0f : 448.0f;
-                const float scl = amax > 0.0f ? amax * (1.0f / qmax) : 1.0f;
-                const float inv = 1.0f / scl;
-                for (int64_t i = 0; i < g; ++i) {
-                    float v = buf[(size_t)(k0 + i)] * inv;
-                    if (v > qmax) v = qmax;
-                    if (v < -qmax) v = -qmax;
-                    if (i8) v = std::nearbyint(v);
-                    st_dt(q->dtype, q->data, qb + (p * n + k0 + i) * qs, v);
-                }
-                stt(s, rowoff(s, r, P * ngrp) + (p * ngrp + gi) * laststride(s), scl);
-            }
+            for (int64_t k = 0; k < n; ++k) st_dt(q->dtype, q->data, qb + (p * n + k) * qs, buf[(size_t)k]);
         }
     }
     return RAD_OK;
 }
 
-int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) { return givens_body(a, true); }
-int ref_givens_quant_act_i8g(const RadArgs* a, RadStream) { return givens_body(a, true, true); }
-
-/* The same activation with the rotation applied as the dense matrix: y[j] = sum_i T[j][i] * x[i] / D[i] over
+/* ParoQuant's activation quantiser: the rotation applied as the dense matrix, y[j] = sum_i T[j][i] * x[i] / D[i] over
  * each (part, 128-column group), then the quantiser `q`'s dtype names. T is the weight, f16, one [128, 128]
  * matrix a (part, group) -- what r4d_rad_relayout_gdense composes from the givens tables. */
 int ref_givens_dense_quant(const RadArgs* a, RadStream) {
@@ -541,9 +512,6 @@ int ref_givens_dense_quant(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
-/* The same channel scale and rotations with NO quantiser: y = the rotated row in y's dtype, `parts`
- * copies side by side. For a weight whose GEMM reads a 16-bit activation (w5a16). */
-int ref_givens_rotate(const RadArgs* a, RadStream) { return givens_body(a, false); }
 
 /* ---------------------------------------------------------------- the Gram accumulator
  *

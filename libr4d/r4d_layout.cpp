@@ -901,7 +901,7 @@ namespace {
 /* A ROTATED MXFP4 WEIGHT (ParoQuant): the same two planes -- e2m1 codes, an E8M0 exponent a 32 --
  * stored in the basis the "givens" transform names, with the rotation's tables beside them. The
  * GEMM reads the codes and exponents exactly as it reads an unrotated weight; the rotation is the
- * activation's (givens_quant_act_fp8), and the tables are separate weight operands of that op, so
+ * activation's (givens_dense_quant), and the tables are separate weight operands of that op, so
  * nothing here touches them. What is checked is that they are there and are the kind of
  * rotation the quantiser applies: a transform this library does not read would hand the kernel
  * codes that decode to other numbers. */

@@ -261,7 +261,7 @@ TEST(op_vocabulary) {
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
-        "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "givens_quant_act_fp8", "givens_quant_act_i8g", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
+        "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
         "gram_accum",
         /* The fused fp8 forms. A host run needs EVERY op covered, so these are what stands
          * between a host-backend run and "site 'host' is unavailable for this band". */
@@ -1506,10 +1506,13 @@ TEST(op_gemm_nt_q_parts_read_their_own_activation_copy) {
     }
 }
 
-/* ParoQuant's activation quantiser. With zero angles and unit channel scales it IS quant_act_fp8;
- * with real rotations the dequantised row is the rotated row to within the fp8 grid, and the
- * rotation preserves the row's norm -- checked per part, against a double-precision rotation. */
-TEST(op_givens_quant_act_fp8) {
+/* ParoQuant's activation quantiser, the rotation as dense per-group matrices. T[j][i] of a (part, group) is
+ * the group's composed network applied to the unit vector e_i, built here in double from the same pairs and
+ * angles the device layout hook reads; with it the dequantised row is the rotated row to within the
+ * quantiser's grid (plus the f16 rounding of T), and the rotation preserves the row's norm -- both checked
+ * per part against a double-precision rotation. With T the identity and unit channel scales it IS
+ * quant_act_fp8, exactly. Run for both quantisers `out` names. */
+TEST(op_givens_dense_quant) {
     const int64_t M = 3, n = 256, S = 3, P = 2, G = 128;
     uint32_t rng = 99;
     auto nxt = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
@@ -1517,70 +1520,105 @@ TEST(op_givens_quant_act_fp8) {
     T x(RAD_BF16, {M, n});
     std::vector<float> xv((size_t)(M * n));
     for (auto& v : xv) v = frand(-3.0f, 3.0f);
-    x.f(xv);
     for (int64_t m = 0; m < M; ++m) xv[(size_t)(m * n + 7)] = 0;      // a zero in the mix
+    x.f(xv);
     // a pairing of each group of 128 per stage per part
-    T pr(RAD_I32, {P * S, n}), an(RAD_F32, {P * S, n / 2}), rs(RAD_F32, {P, n});
+    std::vector<int32_t> pairs((size_t)(P * S * n));
     for (int64_t ps = 0; ps < P * S; ++ps)
         for (int64_t g = 0; g < n / G; ++g) {
             std::vector<int32_t> perm((size_t)G);
             for (int i = 0; i < G; ++i) perm[(size_t)i] = (int32_t)(g * G + i);
             for (int i = (int)G - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[nxt() % (i + 1)]);
-            for (int i = 0; i < G; ++i) st_int(RAD_I32, pr.t.data, ps * n + g * G + i, perm[(size_t)i]);
+            for (int i = 0; i < G; ++i) pairs[(size_t)(ps * n + g * G + i)] = perm[(size_t)i];
         }
     std::vector<float> av((size_t)(P * S * n / 2)), sv((size_t)(P * n));
     for (auto& v : av) v = frand(-3.0f, 3.0f);
     for (auto& v : sv) v = frand(0.5f, 2.0f);
-    an.f(av);
+    T rs(RAD_F32, {P, n});
     rs.f(sv);
 
-    T q(RAD_F8E4M3, {M, P * n}), s(RAD_F32, {M, P * n / G});
-    A a; a.t(x).t(pr).t(an).t(rs).t(q).t(s)
-          .i("M", M).i("n", n).i("group", G).s("dtype", "bf16").i("stages", S).i("parts", P);
-    CHECK_OK(run("givens_quant_act_fp8", a));
-    double worst = 0;
-    int bad_norm = 0;
-    for (int64_t m = 0; m < M; ++m)
-        for (int64_t p = 0; p < P; ++p) {
-            std::vector<double> b((size_t)n);
-            double n0 = 0;
-            for (int64_t k = 0; k < n; ++k) {
-                b[(size_t)k] = (double)x.at(m * n + k) / (double)sv[(size_t)(p * n + k)];
-                n0 += b[(size_t)k] * b[(size_t)k];
-            }
-            for (int64_t st = 0; st < S; ++st)
-                for (int64_t j = 0; j < n / 2; ++j) {
-                    const int64_t ia = pr.iat((p * S + st) * n + 2 * j), ib = pr.iat((p * S + st) * n + 2 * j + 1);
-                    const double t = av[(size_t)((p * S + st) * (n / 2) + j)], c = std::cos(t), sn = std::sin(t);
-                    const double va = b[(size_t)ia], vb = b[(size_t)ib];
-                    b[(size_t)ia] = va * c + vb * sn;
-                    b[(size_t)ib] = vb * c - va * sn;
-                }
-            double n1 = 0;
-            for (int64_t k = 0; k < n; ++k) n1 += b[(size_t)k] * b[(size_t)k];
-            if (std::fabs(n1 - n0) > 1e-9 * n0) ++bad_norm;
-            for (int64_t g = 0; g < n / G; ++g) {
-                double amax = 0;
-                for (int64_t i = 0; i < G; ++i) amax = std::max(amax, std::fabs(b[(size_t)(g * G + i)]));
-                const double sc = s.at(m * (P * n / G) + p * (n / G) + g);
-                CHECK(std::fabs(sc - amax / 448.0) < 1e-5 * amax / 448.0 + 1e-12);
+    // the composed matrices, [P * n/G groups][G (j)][G (i)], as f16
+    auto compose = [&](const std::vector<float>& angles, std::vector<float>* tm) {
+        tm->assign((size_t)(P * (n / G) * G * G), 0.0f);
+        for (int64_t p = 0; p < P; ++p)
+            for (int64_t g = 0; g < n / G; ++g)
                 for (int64_t i = 0; i < G; ++i) {
-                    const double deq = (double)q.at(m * P * n + p * n + g * G + i) * sc;
-                    worst = std::max(worst, std::fabs(deq - b[(size_t)(g * G + i)]) / amax);
+                    std::vector<double> v((size_t)G, 0.0);
+                    v[(size_t)i] = 1.0;
+                    for (int64_t st = 0; st < S; ++st)
+                        for (int64_t j = 0; j < G / 2; ++j) {
+                            const int64_t ia = pairs[(size_t)((p * S + st) * n + g * G + 2 * j)] - g * G;
+                            const int64_t ib = pairs[(size_t)((p * S + st) * n + g * G + 2 * j + 1)] - g * G;
+                            const double t = angles[(size_t)((p * S + st) * (n / 2) + g * (G / 2) + j)];
+                            const double c = std::cos(t), sn = std::sin(t);
+                            const double va = v[(size_t)ia], vb = v[(size_t)ib];
+                            v[(size_t)ia] = va * c + vb * sn;
+                            v[(size_t)ib] = vb * c - va * sn;
+                        }
+                    for (int64_t j = 0; j < G; ++j)
+                        (*tm)[(size_t)(((p * (n / G) + g) * G + j) * G + i)] = (float)v[(size_t)j];
+                }
+    };
+    std::vector<float> tmv;
+    compose(av, &tmv);
+    T tm(RAD_F16, {P * n, G});
+    tm.f(tmv);
+
+    for (int i8 = 0; i8 < 2; ++i8) {
+        const double qmax = i8 ? 127.0 : 448.0;
+        const uint32_t qdt = i8 ? RAD_I8 : RAD_F8E4M3;
+        T q(qdt, {M, P * n}), s(RAD_F32, {M, P * n / G});
+        A a; a.t(x).t(tm).t(rs).t(q).t(s)
+              .i("M", M).i("n", n).i("group", G).s("dtype", "bf16").i("parts", P).s("out", i8 ? "i8" : "fp8");
+        CHECK_OK(run("givens_dense_quant", a));
+        double worst = 0;
+        int bad_norm = 0;
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t p = 0; p < P; ++p) {
+                std::vector<double> b((size_t)n);
+                double n0 = 0;
+                for (int64_t k = 0; k < n; ++k) {
+                    b[(size_t)k] = (double)x.at(m * n + k) / (double)sv[(size_t)(p * n + k)];
+                    n0 += b[(size_t)k] * b[(size_t)k];
+                }
+                for (int64_t st = 0; st < S; ++st)
+                    for (int64_t j = 0; j < n / 2; ++j) {
+                        const int64_t ia = pairs[(size_t)((p * S + st) * n + 2 * j)];
+                        const int64_t ib = pairs[(size_t)((p * S + st) * n + 2 * j + 1)];
+                        const double t = av[(size_t)((p * S + st) * (n / 2) + j)], c = std::cos(t), sn = std::sin(t);
+                        const double va = b[(size_t)ia], vb = b[(size_t)ib];
+                        b[(size_t)ia] = va * c + vb * sn;
+                        b[(size_t)ib] = vb * c - va * sn;
+                    }
+                double n1 = 0;
+                for (int64_t k = 0; k < n; ++k) n1 += b[(size_t)k] * b[(size_t)k];
+                if (std::fabs(n1 - n0) > 1e-9 * n0) ++bad_norm;
+                for (int64_t g = 0; g < n / G; ++g) {
+                    double amax = 0;
+                    for (int64_t i = 0; i < G; ++i) amax = std::max(amax, std::fabs(b[(size_t)(g * G + i)]));
+                    const double sc = s.at(m * (P * n / G) + p * (n / G) + g);
+                    CHECK(std::fabs(sc - amax / qmax) < 2e-3 * amax / qmax + 1e-12);   // T is f16
+                    for (int64_t i = 0; i < G; ++i) {
+                        const double deq = (double)q.at(m * P * n + p * n + g * G + i) * sc;
+                        worst = std::max(worst, std::fabs(deq - b[(size_t)(g * G + i)]) / amax);
+                    }
                 }
             }
-        }
-    CHECK_EQ(bad_norm, 0);
-    CHECK(worst < 0.04);            // half an e4m3 step at the top of the range is 1/16 of 1/2
+        CHECK_EQ(bad_norm, 0);
+        CHECK(worst < (i8 ? 0.006 : 0.04));   // half a step of the grid (int8: 1/254 of the maximum), and T's f16
+    }
 
-    // zero angles, unit scales: exactly quant_act_fp8
-    T an0(RAD_F32, {P * S, n / 2}), rs1(RAD_F32, {P, n});
-    std::vector<float> ones((size_t)(P * n), 1.0f);
+    // T the identity, unit scales: exactly quant_act_fp8
+    std::vector<float> eye((size_t)(P * (n / G) * G * G), 0.0f), ones((size_t)(P * n), 1.0f);
+    for (int64_t pg = 0; pg < P * (n / G); ++pg)
+        for (int64_t i = 0; i < G; ++i) eye[(size_t)((pg * G + i) * G + i)] = 1.0f;
+    T tid(RAD_F16, {P * n, G}), rs1(RAD_F32, {P, n});
+    tid.f(eye);
     rs1.f(ones);
     T q1(RAD_F8E4M3, {M, P * n}), s1(RAD_F32, {M, P * n / G});
-    A b; b.t(x).t(pr).t(an0).t(rs1).t(q1).t(s1)
-          .i("M", M).i("n", n).i("group", G).s("dtype", "bf16").i("stages", S).i("parts", P);
-    CHECK_OK(run("givens_quant_act_fp8", b));
+    A b; b.t(x).t(tid).t(rs1).t(q1).t(s1)
+          .i("M", M).i("n", n).i("group", G).s("dtype", "bf16").i("parts", P).s("out", "fp8");
+    CHECK_OK(run("givens_dense_quant", b));
     T q2(RAD_F8E4M3, {M, n}), s2(RAD_F32, {M, n / G});
     A c; c.t(x).t(q2).t(s2).i("M", M).i("n", n).i("group", G).s("dtype", "bf16");
     CHECK_OK(run("quant_act_fp8", c));

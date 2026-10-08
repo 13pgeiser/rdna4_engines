@@ -692,8 +692,8 @@ struct LinearFP8 {
     bool       mx = false;
     rad_weight wref = 0;
     /* ...ROTATED (ParoQuant), a variant of `mx`: the same GEMM over an activation that
-     * `givens_quant_act_fp8` made from the input's bf16 plane -- the channel scale, the Givens
-     * stages and the E4M3 quantiser in one pass, once for each rotated PART of a fused projection
+     * `givens_dense_quant` made from the input's bf16 plane -- the channel scale, the rotation (a
+     * dense per-group matrix) and the E4M3 quantiser in one pass, once for each rotated PART of a fused projection
      * (gate|up, qkv|z: each piece was rotated on its own) -- into this linear's own code and
      * scale planes, `parts` copies side by side. The tables are views of the weight's own planes.
      * The GEMM takes the parts' row bounds as `pb1`/`pb2` and meets copy p with part p's rows. */

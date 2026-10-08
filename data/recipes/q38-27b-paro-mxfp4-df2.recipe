@@ -10,7 +10,7 @@
 # projection the Givens pairs and angles of 8 stages inside groups of 128 columns, and the channel
 # scales. A fused gate|up or qkv|z keeps one set of tables a checkpoint tensor (parts). rad-convert
 # writes them as planes of the weight; the GEMM is the plain MXFP4 one, and the activation is
-# rotated in front of it (givens_quant_act_fp8) -- nothing is re-quantised, so the weights are the
+# rotated in front of it (givens_dense_quant) -- nothing is re-quantised, so the weights are the
 # release's to the bit.
 #
 # What the checkpoint does NOT ship in a form the architecture declares gets a rule. The release is

@@ -201,10 +201,10 @@ static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 /* No `asum`: that output exists for the asymmetric integer grids and an fp8 grid is symmetric by
  * construction (libr4d/r4d_rows.cpp says the same). */
 static const RadOperandSpec oQuantFp8[]  = { OPD("x"), OUT("q"), OUT("scale") };
-/* ParoQuant's activation quantiser: a rotation per part in front of quant_act_fp8's. The three
+/* ParoQuant's rotation: a rotation per part, to f16 for the 16-bit GEMMs. The three
  * tables are the "givens" encoding's (abi/rad_encoding.h) and are WEIGHT operands, so they are
  * resolved, moved and placed with the weight they belong to. */
-static const RadParamSpec pGivensQuant[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+static const RadParamSpec pGivensRotate[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
                                              P_INT("stages"), P_INT("parts") };
 static const RadParamSpec pGivensDense[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
                                              P_INT("parts"), P_STR("out") };
@@ -212,8 +212,6 @@ static const RadOperandSpec oGivensDense[] = { OPD("x"), WGT("tdense"), WGT("rsc
                                                OUT("scale") };
 static const RadOperandSpec oGivensRotate[] = { OPD("x"), WGT("pairs"), WGT("angle"), WGT("rscale"),
                                                 OUT("y") };
-static const RadOperandSpec oGivensQuant[] = { OPD("x"), WGT("pairs"), WGT("angle"), WGT("rscale"),
-                                               OUT("q"), OUT("scale") };
 
 /* ---- the fp8 fusions ----------------------------------------------------------------------
  * A fused op's operands are the unfused pair's minus the tensor between them, and `out_bf16`
@@ -806,28 +804,15 @@ static const RadOpSchema kSchemas[] = {
   "previous pick. `hp` absent is a plane of ones, which drops the form to a plain low-rank "
   "bigram. Serial in l by construction -- the predecessor is not known until the previous step "
   "has been decided." },
-{ "givens_quant_act_fp8", ARR(pGivensQuant), ARR(oGivensQuant),
-  "ParoQuant's activation quantiser: x is divided by the channel scale `rscale`, rotated by "
-  "`stages` rounds of disjoint Givens pairs (a' = a cos t + b sin t, b' = b cos t - a sin t, pairs "
-  "as column indices of the row, each inside one scale group), then quantised as quant_act_fp8 "
-  "does: scale = amax / 448 per `group`. `parts` rotated copies are written side by side -- q is "
-  "[M, parts * n], scale [M, parts * n / group] -- part p from table rows [p * stages, (p + 1) * "
-  "stages) of `pairs` and `angle` and row p of `rscale`: a fused projection's pieces were each "
-  "rotated on their own. Only a weight stored with the \"givens\" transform reads the result; "
-  "it is NOT quant_act_fp8's output in either direction." },
 { "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
   "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
   "rscale) for each of `parts` rotated copies, T the [128, 128] f16 matrix a (part, 128-column "
   "group) that its Givens stages compose to, then the block-scaled quantiser `out` names "
   "(\"i8\": scale amax / 127, round to nearest; \"fp8\": E4M3, amax / 448). q is [M, parts * n] "
   "and scale [M, parts * n / group]; tdense is [parts * n, 128]. The same activation as "
-  "givens_quant_act_i8g / _fp8 up to the f16 rounding of T." },
-{ "givens_quant_act_i8g", ARR(pGivensQuant), ARR(oGivensQuant),
-  "givens_quant_act_fp8 with an int8 output: the same channel scale and rotations, then "
-  "quant_act_i8g's quantiser (scale = amax / 127 per `group`, round to nearest). For the int8 "
-  "prefill GEMMs of a weight stored with the \"givens\" transform." },
-{ "givens_rotate", ARR(pGivensQuant), ARR(oGivensRotate),
-  "givens_quant_act_fp8 without the quantiser: y = x / rscale rotated by `stages` rounds of Givens "
+  "the sequential rotation, up to the f16 rounding of T." },
+{ "givens_rotate", ARR(pGivensRotate), ARR(oGivensRotate),
+  "ParoQuant's rotation without a quantiser: y = x / rscale rotated by `stages` rounds of Givens "
   "pairs, `parts` copies side by side ([M, parts * n]) in y's own dtype. For a weight whose GEMM "
   "reads a 16-bit activation. `group` is the width a pair stays inside." },
 { "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
@@ -1195,18 +1180,10 @@ SIMPLE("ref_dflash_select", "dflash_select", "draft",
 SIMPLE("ref_givens_rotate", "givens_rotate", "quant",
        "channel scale and Givens rotations per part, in the output's dtype",
        "float in, float out; int32 pairs, f32 angles and channel scales", ref_givens_rotate),
-SIMPLE("ref_givens_quant_act_fp8", "givens_quant_act_fp8", "quant",
-       "channel scale and Givens rotations per part, then the block-scaled E4M3 quantiser",
-       "float in, fp8_e4m3 out, f32 scale per group; int32 pairs, f32 angles and channel scales",
-       ref_givens_quant_act_fp8),
 SIMPLE("ref_givens_dense_quant", "givens_dense_quant", "quant",
        "the rotation as a dense per-group matrix, then the block-scaled int8 or E4M3 quantiser",
        "float in, int8 or fp8_e4m3 out, f32 scale per group; f16 matrices and f32 channel scales",
        ref_givens_dense_quant),
-SIMPLE("ref_givens_quant_act_i8g", "givens_quant_act_i8g", "quant",
-       "channel scale and Givens rotations per part, then the block-scaled int8 quantiser",
-       "float in, int8 out, f32 scale per group; int32 pairs, f32 angles and channel scales",
-       ref_givens_quant_act_i8g),
 SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",

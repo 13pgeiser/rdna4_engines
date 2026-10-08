@@ -3,7 +3,7 @@
 //
 //     dequant(Wq)[n][k] = scale[n][k/128] * (code[n][k] - zero[n][k/128]),   code in 0..15 or 0..31
 //
-// -- ParoQuant's int4 (z-lab) and int5 once the activation has been rotated (givens_quant_act_i8g) -- in
+// -- ParoQuant's int4 (z-lab) and int5 once the activation has been rotated (givens_dense_quant) -- in
 // 16x16x16 int8 WMMA, which issues at the fp8 instruction's rate.  The f16 skinny kernel these weights
 // also serve (r4d_gemm_w5a16_nt_m64) is capped by the f16 matrix instruction at about 75 TF/s; this is the
 // tall-tile form with no such ceiling, built on r4d_gemm_mxfp4a8_tiled.hip's arrangement:

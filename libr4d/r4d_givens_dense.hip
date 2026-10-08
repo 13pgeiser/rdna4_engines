@@ -2,7 +2,7 @@
 //
 // The Givens stages of a 128-column group compose to one orthogonal 128 x 128 matrix T, so
 // y = T (x / D) is a small GEMM: out[m][j] = sum_i T[j][i] * (x[m][i] / D[i]).  The sequential kernel
-// (r4d_givens_quant_act_fp8.hip) does the same job in `stages` dependent LDS rounds a group and is
+// (r4d_givens_rotate.hip) does the same job in `stages` dependent LDS rounds a group and is
 // latency bound (~100-130 GB/s of ~640); this one spends ~8x the multiply-adds on the f16 WMMA, which
 // is 5 us of math for a 2048-row part, and quantises in the epilogue -- int8 (scale amax / 127, for the
 // int8 prefill GEMMs) or E4M3 (amax / 448, for the mxfp4a8 GEMMs), the same scale grid as the

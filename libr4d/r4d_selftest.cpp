@@ -3776,8 +3776,7 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
  * the group's maximum, so 7% of it is a bound a wrong pair or a wrong angle cannot meet). */
 static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, int stages,
                            bool rot_only = false, bool i8 = false, bool dense = false) {
-    const char* row = dense ? "givens_dense_quant" : rot_only ? "givens_rotate"
-                    : i8 ? "givens_quant_act_i8g" : "givens_quant_act_fp8";
+    const char* row = dense ? "givens_dense_quant" : "givens_rotate";
     if (!sel(row)) return;
     char nm[160];
     std::snprintf(nm, sizeof nm, "%s %s numeric M=%lld K=%lld parts=%d stages=%d", row,
@@ -13182,17 +13181,6 @@ static void device_phase(const Plugin& pl) {
         givens_numeric(pl, 300, 6144, 2, 8, true);
     }
 
-    if (sel("givens_quant_act_i8g")) {
-        if (!g_case) std::printf("\nParoQuant's rotated activation, int8 output, against libm's rotation\n");
-        givens_numeric(pl, 1, 128, 1, 8, false, true);
-        givens_numeric(pl, 3, 5120, 1, 8, false, true);
-        givens_numeric(pl, 5, 5120, 2, 8, false, true);
-        givens_numeric(pl, 64, 17408, 1, 8, false, true);
-        givens_numeric(pl, 300, 6144, 2, 8, false, true);
-        givens_numeric(pl, 2048, 5120, 1, 8, false, true);
-        givens_numeric(pl, 2048, 5120, 2, 8, false, true);
-        givens_numeric(pl, 2048, 17408, 1, 8, false, true);
-    }
     if (sel("givens_dense_quant")) {
         if (!g_case) std::printf("\nParoQuant's rotation as dense per-group matrices, int8 and E4M3 output, against libm's rotation\n");
         for (int i8 = 0; i8 < 2; ++i8) {
@@ -13203,17 +13191,10 @@ static void device_phase(const Plugin& pl) {
             givens_numeric(pl, 300, 6144, 2, 8, false, i8, true);
             givens_numeric(pl, 2048, 5120, 1, 8, false, i8, true);
             givens_numeric(pl, 2048, 5120, 2, 8, false, i8, true);
+            givens_numeric(pl, 64, 17408, 1, 8, false, i8, true);
             givens_numeric(pl, 2048, 17408, 1, 8, false, i8, true);
+            givens_numeric(pl, 7, 5120, 3, 2, false, i8, true);
         }
-    }
-    if (sel("givens_quant_act_fp8")) {
-        if (!g_case) std::printf("\nParoQuant's rotate-and-quantise, against an f64 rotation\n");
-        givens_numeric(pl, 1, 128, 1, 8);
-        givens_numeric(pl, 3, 5120, 1, 8);
-        givens_numeric(pl, 5, 5120, 2, 8);
-        givens_numeric(pl, 64, 17408, 1, 8);
-        givens_numeric(pl, 300, 6144, 2, 8);
-        givens_numeric(pl, 7, 5120, 3, 2);
     }
 
     if (sel("gram_accum")) {

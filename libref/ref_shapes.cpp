@@ -832,20 +832,12 @@ int ref_gram_accum_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
  * stage, the partner inside the group), and a described operand can only be drawn, not constructed
  * -- an index draw has repeats, and a Givens stage over a repeated column is not a rotation. A case
  * built from one would compare two implementations of nothing. r4d_selftest builds real pairings. */
-int ref_givens_quant_act_fp8_shape(const RadParam*, int, int, RadOpdDesc*) {
-    return RAD_E_UNSUPPORTED;
-}
-
-int ref_givens_quant_act_i8g_shape(const RadParam*, int, int, RadOpdDesc*) {
-    return RAD_E_UNSUPPORTED;               /* a pairing cannot be drawn: see givens_quant_act_fp8 */
-}
-
 int ref_givens_dense_quant_shape(const RadParam*, int, int, RadOpdDesc*) {
-    return RAD_E_UNSUPPORTED;               /* a composed rotation cannot be drawn: see givens_quant_act_fp8 */
+    return RAD_E_UNSUPPORTED;               /* a composed rotation cannot be drawn: it is a weight, built from real pairings */
 }
 
 int ref_givens_rotate_shape(const RadParam*, int, int, RadOpdDesc*) {
-    return RAD_E_UNSUPPORTED;               /* a pairing cannot be drawn: see givens_quant_act_fp8 */
+    return RAD_E_UNSUPPORTED;               /* a pairing cannot be drawn: a described operand can only be drawn, and an index draw has repeats */
 }
 
 int ref_had_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
