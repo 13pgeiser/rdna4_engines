@@ -104,6 +104,13 @@ int     r4d_rad_attn_prefill_h128_gqa8_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa8_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa8_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h128_gqa8_scratch(const RadArgs*);
+/* Four queries a KV head, head_dim 256 only -- Qwen3.5-0.8B. Same body, different
+ * instantiation (r4d_attn_paged_h256_gqa4.hip). */
+int     r4d_rad_attn_prefill_h256_gqa4_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h256_gqa4_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa4_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa4_bf16 (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa4_scratch(const RadArgs*);
 /* Twelve queries a KV head, head_dim 256 only -- Qwen3.8-Flash-Next's QSA layers. Same body,
  * different instantiation; r4d_attn_paged_h256_gqa12.hip is four lines. */
 int     r4d_rad_attn_prefill_h256_gqa12_fp8 (const RadArgs*, RadStream);
@@ -452,6 +459,7 @@ int r4d_rad_sample_temp      (const RadArgs*, RadStream);
 int r4d_rad_sample_mask      (const RadArgs*, RadStream);
 int r4d_rad_sample_topk      (const RadArgs*, RadStream);
 int r4d_rad_sample_argmax    (const RadArgs*, RadStream);
+int r4d_rad_sample_logprobs  (const RadArgs*, RadStream);
 int r4d_rad_sample_topp      (const RadArgs*, RadStream);
 int r4d_rad_sample_minp      (const RadArgs*, RadStream);
 int r4d_rad_sample_typical   (const RadArgs*, RadStream);
@@ -500,6 +508,7 @@ int r4d_shape_sample_temp      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_mask      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_topk      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_argmax    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_sample_logprobs  (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_narrow    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_pick      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_sample_chain     (const RadParam*, int, int operand, RadOpdDesc*);

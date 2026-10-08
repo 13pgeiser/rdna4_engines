@@ -2,6 +2,7 @@
  * a command line into that sequence and a status into an exit code.
  */
 #include "engine.h"
+#include "hf_model.h"
 
 int main(int argc, char** argv) {
     rad::Config cfg;
@@ -9,7 +10,7 @@ int main(int argc, char** argv) {
     if (s == 1) { rad::config_usage(argv[0]); return 0; }
     if (s < 0)  { rad::config_usage(argv[0]); return 2; }
 
-    if (!rad::resolve_hf_model(cfg)) return 2;   /* --model given as an HF repo id: fetch + rewrite */
+    if (!rad::resolve_hf_model(cfg)) return 1;   /* a repo id: fetched, and --model points at it */
 
     rad::Engine engine(std::move(cfg));
 

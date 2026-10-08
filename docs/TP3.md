@@ -49,9 +49,8 @@ difference into its weights pool, no further than every one of its weights resid
 of the resolved sizes take the rank's own split -- `Pools::configure` and the planner -- so the
 grown pool is planned into, and startup refuses a rank whose plan and weights pool disagree, or
 whose re-sized KV pool pages fewer tokens than it was sized for. The token count, the carve, the
-loan and the attention ranks' pools are unchanged; a stated `--vram-kv-mib` / `--vram-weights-mib`
-keeps meaning "this many on every card", and `auto` keeps the common split (a fully resident rank
-would choose all_vram while its peers spill). `--deterministic` and a device without virtual memory
+loan and the attention ranks' pools are unchanged, and `auto` keeps the common split (a fully
+resident rank would choose all_vram while its peers spill). `--deterministic` and a device without virtual memory
 management re-split like any other: the cache does not lend there, and the bytes the rank never
 pages are as much its experts' as they are under a lending cache. The condition is the cost, not
 the world: a rank is re-split only where its cache costs less per token than the dearest rank's,

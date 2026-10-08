@@ -546,11 +546,19 @@ TEST(a_text_completion_body_is_the_other_shape_entirely) {
 
 /* THE LOGPROB SHAPES DIFFER BETWEEN THE TWO ENDPOINTS and both are fixed by the schema: chat
  * nests an array of per-token objects under `content`, completions carries four parallel arrays.
- * text_offset is cumulative over the token texts, which is what makes it an offset into `text`. */
+ * text_offset is where each token's text starts in `text`: where the token before it ended. */
 TEST(logprobs_take_each_endpoints_own_shape) {
     ChoiceOut c;
     c.text = "abcd";
-    c.logprobs = { { 1, "ab", -0.5f }, { 2, "cd", -1.5f } };
+    auto entry = [](int32_t id, const char* t, float lp, size_t end) {
+        LogprobEntry e;
+        e.token = id;
+        e.text = e.bytes = t;
+        e.logprob = lp;
+        e.end = end;
+        return e;
+    };
+    c.logprobs = { entry(1, "ab", -0.5f, 2), entry(2, "cd", -1.5f, 4) };
     OaiRequest r = a_request("x", "m");
     r.want_logprobs = true;
 

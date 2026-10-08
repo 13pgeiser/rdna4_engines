@@ -196,6 +196,18 @@ private:
     HttpResponse handle_ping(const HttpRequest& req);
     HttpResponse handle_version(const HttpRequest& req);
     HttpResponse handle_props(const HttpRequest& req);
+    HttpResponse handle_apply_template(const HttpRequest& req);
+    HttpResponse handle_input_tokens(const HttpRequest& req);
+    HttpResponse handle_messages(const HttpRequest& req);
+    HttpResponse handle_count_tokens(const HttpRequest& req);
+    HttpResponse handle_responses(const HttpRequest& req);
+    HttpResponse handle_responses_tokens(const HttpRequest& req);
+    /* A request another API's shape was translated into: admitted and served like a chat one,
+     * answered in `r.shape`. */
+    HttpResponse serve_translated(const HttpRequest& req, OaiRequest& r);
+    HttpResponse handle_native_completion(const HttpRequest& req);
+    HttpResponse handle_infill(const HttpRequest& req);
+    json native_result(const OaiRequest& r, const Generation& g, const std::string& content);
     HttpResponse handle_load(const HttpRequest& req);
     HttpResponse handle_tokenize(const HttpRequest& req);
     HttpResponse handle_detokenize(const HttpRequest& req);
@@ -213,7 +225,8 @@ private:
     HttpResponse handle_stats(const HttpRequest& req);
     HttpResponse handle_graph(const HttpRequest& req);
 
-    HttpResponse error_response(const ApiError& e, const std::string& peer);
+    HttpResponse error_response(const ApiError& e, const std::string& peer,
+                                ApiShape shape = ApiShape::OpenAI);
     /* THE REQUEST LOG. One line when a request is admitted and one from record() when it ends,
      * at the info level, so `docker logs` answers "who asked what, how long, how did it end"
      * without the engine's own levels. The debug level adds the last user message's opening. */

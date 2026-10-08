@@ -89,7 +89,8 @@ rad-convert [options] <input> -o <model.rad>
       --list-quantizers  every quantiser loaded and the options it takes
       --arch ID        override the architecture id from the checkpoint
       --home DIR       $RADIANCE_HOME
-      --kernels A:B    kernel plugin hierarchy, first wins. Default $RADIANCE_KERNELS
+      --kernels A:B    the kernel libraries to load, first wins. Default $RADIANCE_KERNELS,
+                       else every library found
       --tokenizer F    tokenizer.json; its declared chain is baked instead of being
                        reconstructed from a pre-tokenizer name
       --imatrix F      llama.cpp imatrix: expert profile, column importances, error weighting
@@ -214,6 +215,13 @@ CALIB=<calibration dir> rad-convert <Qwen3.8-Flash-Next checkpoint> -o flashnext
 # has is wanted (GUIDE §3.4)
 rad-convert <Qwen3.8-27B-FP8 checkpoint> -o q38-27b-fp8.rad
 
+# A bf16 checkpoint of the same model, as that release's block fp8 (the recipe's header has the
+# --set keys that select the fp8 plugin)
+rad-convert <Qwen3.8-27B or a finetune> -o q38-27b-fp8.rad --recipe data/recipes/q38-27b-fp8block-df2.recipe \
+    --draft-model <DFlash2 checkpoint> --set quantization_config.quant_method=fp8 \
+    --set quantization_config.fmt=e4m3 --set "quantization_config.weight_block_size=128 128" \
+    --set quantization_config.activation_scheme=dynamic
+
 # Check the plan without writing 166 GiB
 rad-convert $SRC -o /dev/null --recipe r.recipe --plan-only -v
 
@@ -234,7 +242,10 @@ newer repos moved the template out of the JSON, and the symptom of missing it is
 
 **`--set K=V` is how a convert-time choice that must also hold at serve time is stated once.** The
 key is handed to declare *and* written into the container. What a weight is stored as is not such a
-choice: the encoding is in the container, and the plugin reads it from there.
+choice: the encoding is in the container, and the plugin reads it from there. Which plugin serves
+the container is: a `quantization_config.*` key re-derives the descriptor the plugin is chosen by,
+so a bf16 checkpoint whose recipe writes Qwen's block fp8 is stated as that format and converted for
+the fp8 plugin (`data/recipes/q38-27b-fp8block-df2.recipe` has the keys).
 
 **`--max-ctx`.** Some architectures' graphs depend on the context bound: Qwen4-Exp sizes its QSA
 buffers by it, and refuses a `--max-tok` and context pair whose score plane would pass 2 GiB.
@@ -323,7 +334,7 @@ rad-kbench -m moe.rad   --max-cases 1 --record data/kernels_moe.rkb
 | `--fixture FILE` | the recording to replay (default `$RADIANCE_HOME/kernels.rkb`) |
 | `--record FILE` | with `-m`: write a fixture |
 | `-m, --model FILE` | the `.rad` to read weight operands from |
-| `--home DIR`, `--kernels A:B` | plugin home and hierarchy |
+| `--home DIR`, `--kernels A:B` | plugin home, and the kernel libraries to load (default every one found) |
 | `--op NAME` | check only this op (repeatable prefix match) |
 | `--ref NAME` | the oracle plugin's name (default `libref`) |
 | `--seed N` | base seed; every case derives its own, so changing a filter does not change any other case's inputs |
@@ -379,7 +390,7 @@ rad-tune -m <model.rad> [options]
 
   -m, --model FILE   the .rad whose declared graph supplies the shapes
       --home DIR     $RADIANCE_HOME; the cache is written to <home>/tune/<machine>.tune
-      --kernels A:B  kernel plugin hierarchy, first wins
+      --kernels A:B  the kernel libraries to load, first wins; default every library found
       --op NAME      tune only ops whose name starts with NAME
       --machine KEY  override the machine key (for writing a cache for another box)
       --reps N       timing reps, median reported (default 5)
@@ -537,7 +548,7 @@ deliberately disconnects clients from it, which is not the same promise.
 | `fnserve.sh` | Qwen3.8-Flash-Next, the production container `w4nl64-i8lm.rad`, same contract. `P` `TP` `MLEN` `SEQS` `M` `NS` `HOSTPOOL` `KVD` `HR` `MNBT` `WIRE` `KVHOST` `KVDIR` `KVDISK` `EXTRA` `EXTRA_ENV` |
 | `fnstop.sh` | stops whichever is running and **waits for the process to go** |
 | `convdspark.sh`, `convfn.sh` | rebuild the containers those two serve. The conversions of record. `convfn.sh` needs `CALIB=<dir>`: the production recipe's expert rule runs GPTQ against the calibration Grams there |
-| `hfget.sh` | fetch a checkpoint from Hugging Face with `curl` and `jq`. Resumable |
+| `hfget.sh` | fetch a checkpoint from Hugging Face with `curl` and `jq`. Resumable; a file changed at the same size is fetched again (`.hfget-manifest`). `radiance --model <owner/name>` runs it too |
 
 ```sh
 scripts/fnserve.sh                             # defaults: port 8100, tp 2, 200K ctx

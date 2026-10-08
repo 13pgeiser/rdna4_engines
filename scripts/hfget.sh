@@ -11,6 +11,16 @@
 # matches the listing is skipped and a short one is continued with `curl -C -`, so an interrupted
 # transfer of a 300 GB checkpoint costs only what it had not finished.
 #
+# A CHANGED FILE IS FETCHED AGAIN even at the same size. A complete run records each file's content
+# key (the LFS sha256, or the size for a small file) in <dest>/.hfget-manifest, and a later run
+# compares the listing against it. The manifest is written only when every file arrived, so its
+# presence means the directory is a complete copy of some revision.
+#
+# Exit status: 0 complete; 3 nothing on disk was changed (the listing could not be read, or what is
+# still to fetch does not fit), so a complete earlier copy is intact; anything else, a transfer
+# failed and a file may be partial -- re-run to resume. `radiance --model <repo-id>` serves the
+# earlier copy on 3 and refuses on the rest.
+#
 # WEIGHT DUPLICATES ARE SKIPPED. Many repos carry the same tensors several times over -- safetensors
 # beside the older pickle .bin, an ONNX export, a GGUF conversion -- and on a large checkpoint each
 # copy is hundreds of gigabytes of the same numbers. When the listing holds any .safetensors, every
@@ -64,6 +74,7 @@ dest=${2:-$HOME/models/$repo}
 rev=${3:-main}
 jobs=${HFGET_JOBS:-4}
 command -v jq >/dev/null || { echo "hfget: jq is required" >&2; exit 2; }
+command -v curl >/dev/null || { echo "hfget: curl is required" >&2; exit 2; }
 
 echo "hfget: listing $repo@$rev"
 # THE LISTING IS PAGINATED AND THE PAGE SIZE IS SMALL. A large checkpoint runs to a hundred-odd
@@ -76,15 +87,22 @@ listing='[]'
 page=0
 while [ -n "$api" ]; do
     hdr=$(mktemp "${TMPDIR:-/tmp}/hfhdr.XXXXXX")
+    # A failed request is reported here rather than by set -e, which would exit with curl's status
+    # and say nothing; and with 3, since nothing has been written yet.
+    st=0
     if [ -n "$HF_TOKEN" ]; then
-        body=$(curl -sSL --fail-with-body -D "$hdr" -H "Authorization: Bearer $HF_TOKEN" "$api")
+        body=$(curl -sSL --fail-with-body -D "$hdr" -H "Authorization: Bearer $HF_TOKEN" "$api") \
+            || st=$?
     else
-        body=$(curl -sSL --fail-with-body -D "$hdr" "$api")
+        body=$(curl -sSL --fail-with-body -D "$hdr" "$api") || st=$?
     fi
-    [ "$(printf '%s' "$body" | jq -r 'type')" = "array" ] || {
+    [ "$(printf '%s' "$body" | jq -r 'type' 2>/dev/null)" = "array" ] || {
         rm -f "$hdr"
-        echo "hfget: $(printf '%s' "$body" | jq -r '.error // .message // .')" >&2
-        echo "hfget: a gated or private repo needs HF_TOKEN in the environment" >&2; exit 1; }
+        echo "hfget: listing $repo@$rev failed (curl exit $st)" >&2
+        [ -n "$body" ] && {
+            echo "hfget: $(printf '%s' "$body" | jq -r '.error // .message // .' 2>/dev/null)" >&2
+            echo "hfget: a gated or private repo needs HF_TOKEN in the environment" >&2; }
+        exit 3; }
     listing=$(printf '%s\n%s' "$listing" "$body" | jq -s 'add')
     api=$(tr -d '\r' < "$hdr" | sed -n 's/^[Ll]ink: *<\([^>]*\)>; *rel="next".*/\1/p' | head -1)
     rm -f "$hdr"
@@ -101,14 +119,33 @@ trap 'rm -f "$list" "$dest/.hfget-manifest.tmp"' EXIT INT TERM
 printf '%s' "$listing" | jq -r "$sel"' | "\(.lfs.oid // "")\t\(.size)\t\(.path)"' > "$list"
 
 n=$(wc -l < "$list")
-[ "$n" -gt 0 ] || { echo "hfget: the listing has no files" >&2; exit 1; }
+[ "$n" -gt 0 ] || { echo "hfget: the listing has no files" >&2; exit 3; }
 need=$(awk -F'\t' '{s += $2} END {printf "%.1f", s / 1073741824}' "$list")
 mkdir -p "$dest"
+: > "$dest/.hfget-manifest.tmp"
+# WHAT IS STILL TO FETCH, not the repo's size: a warm cache of a model larger than the free space
+# left beside it must not read as a download that does not fit. A file is counted from its local
+# length, and whole when the manifest says its content changed.
+todo=0
+# Split by expansion, as the child does: a tab is IFS whitespace, so `read` would merge the empty
+# key of a non-LFS file into the next field.
+while IFS= read -r line; do
+    oid=${line%%	*}; rest=${line#*	}; size=${rest%%	*}; path=${rest#*	}
+    cur=0
+    if [ -f "$dest/$path" ]; then cur=$(wc -c < "$dest/$path"); fi
+    if [ "$cur" = "$size" ] && [ -f "$dest/.hfget-manifest" ]; then
+        rec=$(p="$path" awk -F'\t' '$2==ENVIRON["p"]{print $1; exit}' "$dest/.hfget-manifest")
+        if [ -n "$rec" ] && [ "$rec" != "${oid:-$size}" ]; then cur=0; fi
+    fi
+    if [ "$cur" -lt "$size" ]; then todo=$((todo + size - cur)); fi
+done < "$list"
 free=$(df -BG --output=avail "$dest" | tail -1 | tr -dc '0-9')
 echo "hfget: $n file(s), $need GiB -> $dest"
 [ "$have_st" -gt 0 ] && echo "hfget: safetensors present, pickle weight formats skipped"
-echo "hfget: $free GiB free on the destination filesystem"
-awk -v n="$need" -v f="$free" 'BEGIN { if (n > f) { print "hfget: THE DOWNLOAD DOES NOT FIT"; exit 1 } }'
+echo "hfget: $(awk -v t="$todo" 'BEGIN { printf "%.1f", t / 1073741824 }') GiB to fetch," \
+     "$free GiB free on the destination filesystem"
+awk -v t="$todo" -v f="$free" 'BEGIN { exit !(t / 1073741824 > f) }' \
+    && { echo "hfget: THE DOWNLOAD DOES NOT FIT" >&2; exit 3; }
 
 export HFGET_CHILD=1 HFGET_DEST="$dest" HFGET_REPO="$repo" HFGET_REV="$rev" HFGET_MAN_OUT="$dest/.hfget-manifest.tmp"
 self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
