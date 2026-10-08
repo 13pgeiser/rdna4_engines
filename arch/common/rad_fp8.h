@@ -697,10 +697,18 @@ struct LinearFP8 {
      * (gate|up, qkv|z: each piece was rotated on its own) -- into this linear's own code and
      * scale planes, `parts` copies side by side. The tables are views of the weight's own planes.
      * The GEMM takes the parts' row bounds as `pb1`/`pb2` and meets copy p with part p's rows. */
-    bool       paro = false, probed_paro = false;
+    bool       paro = false;
     /* ...AND ITS 5-BIT SIBLING: the same rotation, to f16 (`rot_q` is then the f16 plane and there is no
      * `rot_s`), then gemm_nt_q at w5a16 over a weight of u5 codes, an f16 scale and a zero point. */
     bool       paro5 = false;
+    /* ...AND ITS PREFILL BAND (z-lab's int4 and the int5): above `rot_split` rows the f16 skinny kernel is
+     * bound by the slow f16 matrix instruction, so a second chain runs there -- the same rotation to
+     * int8 with a scale a (row, 128) into `rot_q2`/`rot_s2`, then the int8 tiled GEMM
+     * (`w4a8i8_asym` / `w5a8i8`), both reading the SAME weight views. At or below the split the f16 chain
+     * above runs. */
+    int64_t    rot_split = 0;
+    rad_buf    rot_q2 = 0, rot_s2 = 0;
+    rad_op     op_rot2 = 0, op2 = 0;
     rad_weight rot_pairs = 0, rot_angle = 0, rot_scale = 0;
     rad_buf    rot_q = 0, rot_s = 0;
     rad_op     op_rot = 0;
@@ -743,7 +751,7 @@ struct LinearFP8 {
     /* `span_lo`/`span_hi`, when hi is set, is this rank's uneven slice of the split dimension in
      * the model's units -- rows of each row part for RAD_SHARD_ROW, columns for RAD_SHARD_COL --
      * and n_out / n_in is already its width; see rad_weight_shard_span. Whole scale blocks. */
-    /* `rot_parts`: the rows of each independently rotated part of a ROTATED weight (probed_paro),
+    /* `rot_parts`: the rows of each independently rotated part of a ROTATED weight,
      * which `row_parts` is when the pieces and the shard parts are the same cut -- gate|up -- and
      * is not when they are not: the delta net's qkv|z is four shard parts and two rotated ones. */
     int  declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
@@ -862,8 +870,8 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
                        enc.plane[0].dtype == RAD_BF16;
     probed_i8 = known && linear_is_w8(enc);
     /* A ROTATED weight rotates the bf16 plane itself: its quantiser is not the producer's. */
-    probed_paro = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc));
-    reads_x = g.w_bf16 || plain || probed_i8 || probed_paro;
+    const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc));
+    reads_x = g.w_bf16 || plain || probed_i8 || rotated;
     return RAD_OK;
 }
 
@@ -1074,31 +1082,63 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         for (int64_t p : rot_part_rows) cut.push_back(p);
         if (cut.empty()) for (int64_t p : row_parts) cut.push_back(p);
         int64_t pb1 = 0, pb2 = 0;
-        RAD_ARCH_TRY(declare_rotation(b, nm, g, base, wn, enc, N, K, grp, a, max_rows, cut, true,
-                                      &pb1, &pb2));
+        const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
         const bool bits5 = enc.plane[0].dtype == RAD_U5;
+        const int64_t kSplit = 64;                      /* the skinny kernel's M ceiling */
+        const bool band = hi > kSplit;
+        RAD_ARCH_TRY(declare_rotation(b, nm, g, base, wn, enc, N, K, grp, a,
+                                      band ? kSplit : max_rows, cut, true, &pb1, &pb2));
         w  = decl_view(b, wn, nullptr, "codes", enc.plane[0].dtype, { N, K }, RAD_ACCESS_PER_TOKEN,
                        shard, grp);
         ws = decl_view(b, nm.f("%s.scale", base), wn, "scale,zero", RAD_F16, { N, K },
                        RAD_ACCESS_PER_TOKEN, shard, grp);
         if (!w || !ws) return RAD_E_INVAL;
-        const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
         op = rot_parts > 1
             ? rw(b, RAD_OP(b, "gemm_nt_q",
-                      RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                      RAD_PARAMS(RAD_RANGE("M", 1, band ? kSplit : hi), RAD_INT("N", N), RAD_INT("K", K),
                                  RAD_INT("group", RAD_FP8_BLOCK),
                                  RAD_STR("dtype", bits5 ? "w5a16" : "w4a16_asym"),
                                  RAD_INT("pb1", pb1), RAD_INT("pb2", pb2)),
                       RAD_WEIGHTS(w, ws)),
                   { rot_q }, { y })
             : rw(b, RAD_OP(b, "gemm_nt_q",
-                      RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                      RAD_PARAMS(RAD_RANGE("M", 1, band ? kSplit : hi), RAD_INT("N", N), RAD_INT("K", K),
                                  RAD_INT("group", RAD_FP8_BLOCK),
                                  RAD_STR("dtype", bits5 ? "w5a16" : "w4a16_asym")),
                       RAD_WEIGHTS(w, ws)),
                   { rot_q }, { y });
-        paro = false;
-        return op ? RAD_OK : RAD_E_INVAL;
+        if (!op) return RAD_E_INVAL;
+        if (band) {
+            /* THE PREFILL BAND: rows above the skinny kernel's ceiling rotate to int8 and meet the int8
+             * tiled GEMM. Declared over the tables and weight views already made above. */
+            const int64_t P = rot_parts;
+            rot_split = kSplit;
+            rot_q2 = decl_b(b, nm.f("%s.rot_q2", base), RAD_I8, { hi, P * K });
+            rot_s2 = decl_b(b, nm.f("%s.rot_s2", base), RAD_F32, { hi, P * (K / RAD_FP8_BLOCK) });
+            if (!rot_q2 || !rot_s2) return RAD_E_INVAL;
+            const RadEncPlane* tp = rad_enc_plane(&enc, "t.pairs");
+            const int64_t S = tp->extent[0] / P;
+            op_rot2 = rw(b, RAD_OP(b, "givens_quant_act_i8g",
+                              RAD_PARAMS(RAD_RANGE("M", kSplit + 1, hi), RAD_INT("n", K),
+                                         RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),
+                                         RAD_INT("stages", S), RAD_INT("parts", P)),
+                              RAD_WEIGHTS(rot_pairs, rot_angle, rot_scale)),
+                          { a.x }, { rot_q2, rot_s2 });
+            op2 = rot_parts > 1
+                ? rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", kSplit + 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", bits5 ? "w5a8i8" : "w4a8i8_asym"),
+                                     RAD_INT("pb1", pb1), RAD_INT("pb2", pb2)),
+                          RAD_WEIGHTS(w, ws)),
+                      { rot_q2, rot_s2 }, { y })
+                : rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", kSplit + 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", bits5 ? "w5a8i8" : "w4a8i8_asym")),
+                          RAD_WEIGHTS(w, ws)),
+                      { rot_q2, rot_s2 }, { y });
+            if (!op_rot2 || !op2) return RAD_E_INVAL;
+        }
+        return RAD_OK;
     }
 
     /* An E4M3 weight reads the E4M3 pair, and an input the model feeds at int8 codes has none --
@@ -1292,6 +1332,15 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
                         brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK));
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),
                     brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK),
+                    RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+        return;
+    }
+    if (paro5 && rot_split && rows > rot_split) {
+        RAD_ISSUE_N(c, op_rot2, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_pairs),
+                    RAD_W(rot_angle), RAD_W(rot_scale), brow_slice(rot_q2, r0, rows, rot_parts * K),
+                    brow_slice(rot_s2, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)));
+        RAD_ISSUE_N(c, op2, rows, brow_slice(rot_q2, r0, rows, rot_parts * K),
+                    brow_slice(rot_s2, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)),
                     RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
         return;
     }

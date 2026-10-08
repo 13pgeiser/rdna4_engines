@@ -506,15 +506,11 @@ extern "C" int r4d_rad_relayout_w5(const RadParam* p, int n_p, int operand, cons
     }
     uint32_t* wq = (uint32_t*)dst;
     uint32_t* hi = wq + g.N * g.K / 8;                    /* after the N*K/2 bytes of nibbles */
-    const long long kpb = g.K / R4D_W4_KPB;
     const long long rb = (g.K * 5 + 7) / 8;
     for (long long nn = 0; nn < g.N; ++nn) {
         const uint8_t* row = pdata(pl[0]) + nn * rb;
         for (long long k = 0; k < g.K; ++k) {
-            const long long bit = k * 5;
-            uint32_t v = row[bit >> 3];
-            if ((bit & 7) > 3) v |= (uint32_t)row[(bit >> 3) + 1] << 8;
-            const uint32_t q = (v >> (bit & 7)) & 31u;
+            const uint32_t q = rad_load_bits(row, 5, k);
             long long w;
             int nib;
             w4_slot(g, nn, k, &w, &nib);
@@ -527,7 +523,6 @@ extern "C" int r4d_rad_relayout_w5(const RadParam* p, int n_p, int operand, cons
             hi[hw] |= (q >> 4) << (8 * s + e);
         }
     }
-    (void)kpb;
     return RAD_OK;
 }
 

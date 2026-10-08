@@ -427,7 +427,7 @@ int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
  * stage a' = a cos t + b sin t, b' = b cos t - a sin t in f32, then amax/448 per group. Not
  * bit-identical to the device on the angle: cos and sin of an f32 differ by an ulp between libm
  * and the GPU's. */
-static int givens_body(const RadArgs* a, bool quant) {
+static int givens_body(const RadArgs* a, bool quant, bool i8 = false) {
     if (!have(a, quant ? 6 : 5)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *pr = &a->t[1], *an = &a->t[2], *sc = &a->t[3];
     const RadTensor *q = &a->t[4], *s = quant ? &a->t[5] : nullptr;
@@ -475,12 +475,14 @@ static int givens_body(const RadArgs* a, bool quant) {
                     const float m = std::fabs(buf[(size_t)(k0 + i)]);
                     if (m > amax) amax = m;
                 }
-                const float scl = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+                const float qmax = i8 ? 127.0f : 448.0f;
+                const float scl = amax > 0.0f ? amax * (1.0f / qmax) : 1.0f;
                 const float inv = 1.0f / scl;
                 for (int64_t i = 0; i < g; ++i) {
                     float v = buf[(size_t)(k0 + i)] * inv;
-                    if (v > 448.0f) v = 448.0f;
-                    if (v < -448.0f) v = -448.0f;
+                    if (v > qmax) v = qmax;
+                    if (v < -qmax) v = -qmax;
+                    if (i8) v = std::nearbyint(v);
                     st_dt(q->dtype, q->data, qb + (p * n + k0 + i) * qs, v);
                 }
                 stt(s, rowoff(s, r, P * ngrp) + (p * ngrp + gi) * laststride(s), scl);
@@ -491,6 +493,7 @@ static int givens_body(const RadArgs* a, bool quant) {
 }
 
 int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) { return givens_body(a, true); }
+int ref_givens_quant_act_i8g(const RadArgs* a, RadStream) { return givens_body(a, true, true); }
 
 /* The same channel scale and rotations with NO quantiser: y = the rotated row in y's dtype, `parts`
  * copies side by side. For a weight whose GEMM reads a 16-bit activation (w5a16). */

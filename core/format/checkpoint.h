@@ -60,8 +60,7 @@ struct SrcTensor {
      * [K, N/8] and the tensor described is the logical [N, K] u5 code matrix; `aux` are the fifth-bit
      * plane qweight_hi [K, N/32], and the zero points qzeros [G, N/8] and qzeros_hi [G, N/32].
      * z-lab's int4 (Import::ParoI4) is the same without the fifth-bit planes (aux[0], aux[2] null). */
-    bool                 int5 = false;
-    int                  pbits = 0;            /* 5 for int5-bitplane, 4 for z-lab's plain AWQ-packed int4 */
+    int                  pbits = 0;            /* 5 for int5-bitplane, 4 for z-lab's plain AWQ-packed int4; 0 otherwise */
     const SrcTensor*     aux[3] = { nullptr, nullptr, nullptr };
 
     int64_t numel() const {

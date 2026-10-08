@@ -261,7 +261,7 @@ TEST(op_vocabulary) {
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
-        "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "givens_quant_act_fp8", "givens_rotate", "had_quant_act_i8",
+        "quant_act_i8", "quant_act_fp8", "had_quant_act_fp8", "givens_quant_act_fp8", "givens_quant_act_i8g", "givens_rotate", "had_quant_act_i8",
         "gram_accum",
         /* The fused fp8 forms. A host run needs EVERY op covered, so these are what stands
          * between a host-backend run and "site 'host' is unavailable for this band". */

@@ -704,7 +704,8 @@ static const RadOperandSpec oGemmNt[] = {
     { "y", RAD_OPD_OUT,    0 },
 };
 
-/* `pb1` and `pb2` are ParoQuant's, and the mxfp4a8 rows alone read them: the weight's rows
+/* `pb1` and `pb2` are ParoQuant's, and the mxfp4a8 rows and the 4- and 5-bit asymmetric rows (w5a16,
+ * w4a16_asym, w4a8i8_asym, w5a8i8) read them: the weight's rows
  * [0, pb1), [pb1, pb2) and [pb2, N) each meet their own copy of the activation, side by side in a
  * row of `a` (so `a` is [M, parts * K]). 0 leaves a bound out. Optional, and absent from every
  * other grid: a fused projection whose pieces were not rotated apart has one activation. */
@@ -2345,6 +2346,10 @@ static const RadOpSchema kSchemas[] = {
            "fused projection's pieces were each rotated on their own. Only a weight stored with "
            "the \"givens\" transform reads the result; it is NOT quant_act_fp8's output in either "
            "direction."),
+    SCHEMA("givens_quant_act_i8g", pGivensQuantAct, oGivensQuantAct,
+           "givens_quant_act_fp8 with an int8 output: the same channel scale and rotations, then "
+           "quant_act_i8g's quantiser (scale = amax / 127 per `group`, round to nearest). For the int8 "
+           "prefill GEMMs of a weight stored with the \"givens\" transform."),
     SCHEMA("had_quant_act_fp8", pQuantActFp8, oQuantActFp8,
            "the same, with a `group`-wide Hadamard along K applied BEFORE the absmax. Pairs with "
            "an expert weight stored at dtype w4a8h, which carries the matching rotation and the "
@@ -2943,6 +2948,12 @@ static const RadConstraint cGemmNtW5[] = {
 };
 static const RadConstraint cGemmNtW4Asym[] = {
     C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a16_asym"),
+};
+static const RadConstraint cGemmNtW4A8I8[] = {
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a8i8_asym"),
+};
+static const RadConstraint cGemmNtW5A8I8[] = {
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w5a8i8"),
 };
 static const RadConstraint cGemmNtW2A8[] = {
     C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w2a8"),
@@ -4713,6 +4724,30 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_gemm_w4a16asym_m64, nullptr, r4d_rad_layout_w4, r4d_rad_relayout_w4,
   nullptr, nullptr },
 
+{ "gemm_w4a8i8_tiled", "gemm_nt_q", "gemm",
+  "the 4-bit ASYMMETRIC weight x int8 activation GEMM for prefill row counts (z-lab's ParoQuant int4): "
+  "int8 WMMA over (code - zero), the weight and activation scales folded per 128 of K",
+  "N a multiple of 16; K a multiple of 128; the activation scale per (row, 128 of K); weight in the "
+  "f16 kernel's fragment order; a partitioned weight (pb1/pb2) one launch a part",
+  "I8 A (parts side by side) with an f32 scale per (row, part, 128), 4-bit W with an f16 scale and "
+  "integer zero per 128 K, bf16 C, int32 accumulate per 128 of K",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtW4A8I8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_w4a8i8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
+  r4d_rad_layout_w4, r4d_rad_relayout_w4, nullptr, nullptr },
+
+{ "gemm_w5a8i8_tiled", "gemm_nt_q", "gemm",
+  "the 5-bit ASYMMETRIC weight x int8 activation GEMM for prefill row counts (ParoQuant int5): int8 "
+  "WMMA over (code - zero), the weight and activation scales folded per 128 of K",
+  "N a multiple of 16; K a multiple of 128; the activation scale per (row, 128 of K); weight in the "
+  "int5 kernel's two planes (nibbles, then fifth bits); a partitioned weight (pb1/pb2) one launch a part",
+  "I8 A (parts side by side) with an f32 scale per (row, part, 128), 5-bit W with an f16 scale and "
+  "integer zero per 128 K, bf16 C, int32 accumulate per 128 of K",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtW5A8I8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_w5a8i8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
+  r4d_rad_layout_w5, r4d_rad_relayout_w5, nullptr, nullptr },
+
 { "gemm_w8a16_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with an 8-bit weight, 16x16x16 WMMA, split-K reduced in LDS",
   "M <= 64; N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order, "
@@ -5209,6 +5244,18 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_givens_quant_act_fp8, nullptr, r4d_rad_layout_givens_pairs,
   r4d_rad_relayout_givens_pairs, nullptr, r4d_rad_unrelayout_givens_pairs, nullptr,
   r4d_rad_givens_quant_act_fp8_describe },
+
+{ "givens_quant_act_i8g", "givens_quant_act_i8g", "quant",
+  "the channel scale, ParoQuant's Givens rotations, then per-(row, 128-column) symmetric int8 "
+  "quantisation, once for each rotated part of a fused projection",
+  "n a multiple of 128 and group 128, as givens_quant_act_fp8's",
+  "bf16 in, int8 out in PLAIN ROW-MAJOR order, parts side by side, with an f32 scale of amax/127 per "
+  "(row, part, 128 columns); the tables are the weight's int32 pairs, f32 angles and f32 channel "
+  "scales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHadQuantActFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_givens_quant_act_i8g, nullptr, nullptr, nullptr,
+  nullptr, nullptr, nullptr, r4d_rad_givens_quant_act_i8g_describe },
 
 { "givens_rotate", "givens_rotate", "quant",
   "the channel scale and ParoQuant's Givens rotations, once for each rotated part, to f16",

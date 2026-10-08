@@ -108,6 +108,7 @@ set(R4D_UNITS
   "r4d_gemm_bf16_nt_tiled|"
   "r4d_gemm_w4a16_nt_m64|-DR4D_GEMM_W4_GROUP=${RAD_W4_GROUP}"
   "r4d_gemm_w5a16_nt_m64|-DR4D_GEMM_W4_GROUP=${RAD_W4_GROUP}"
+  "r4d_gemm_wpa8i8_tiled|"
   "r4d_gemm_w8a16_nt_m64|-DR4D_GEMM_W8_GROUP=${RAD_W4_GROUP}"
   "r4d_gemm_w2a8_nt|-DR4D_GEMM_W2A8_GROUP=${RAD_W4_GROUP}"
   "r4d_gemm_w4a8_nt_m64|-DR4D_GEMM_W4A8_GROUP=${RAD_W4_GROUP}"

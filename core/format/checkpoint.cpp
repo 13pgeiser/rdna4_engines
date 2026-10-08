@@ -621,7 +621,6 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         c.name = name;
         c.rad_dtype = i5 ? RAD_U5 : RAD_U4;
         c.shape = { N, K };
-        c.int5 = true;
         c.pbits = i5 ? 5 : 4;
         c.aux[0] = hi; c.aux[1] = qz; c.aux[2] = qzh;
         sliced_.push_back(std::move(c));
@@ -1047,11 +1046,11 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                    (gguf_dtype(p0.ggml) ? gguf_dtype(p0.ggml)->name : "block") + " tensor";
     } else if (!same) {
         out->why = "its pieces are stored in different dtypes";
-    } else if (p0.int5) {
+    } else if (p0.pbits) {
         /* PARO int5-bitplane: u5 codes, an f16 scale and a u8 zero point a 128 of K, then the
          * rotation tables. Joined only along rows (gate|up), as every imported form is. */
         bool fits = d == 0 || out->pieces.size() == 1;
-        for (const SrcTensor* pk : out->pieces) fits = fits && pk->int5 && pk->pbits == p0.pbits;
+        for (const SrcTensor* pk : out->pieces) fits = fits && pk->pbits == p0.pbits;
         if (!fits) {
             out->why = "its int5 pieces are joined along a column, across their groups";
         } else {
@@ -1389,7 +1388,7 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     const uint32_t dt = w.enc.plane[k].dtype;
     const int64_t eb = rad_dtype_bits(dt) / 8;
     uint8_t* o = (uint8_t*)dst;
-    if (w.paro && w.pieces[0]->int5 && k <= 2) {
+    if (w.paro && w.pieces[0]->pbits && k <= 2) {
         /* PARO int5-bitplane, RE-LAID a row of the logical [N, K] matrix at a time. The checkpoint
          * packs along N: qweight [K, N/8] holds eight low nibbles per word in AWQ order (word
          * column c of a group of eight sits in nibble j, ORDER[j] == c), and qweight_hi [K, N/32]

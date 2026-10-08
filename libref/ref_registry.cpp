@@ -811,6 +811,10 @@ static const RadOpSchema kSchemas[] = {
   "stages) of `pairs` and `angle` and row p of `rscale`: a fused projection's pieces were each "
   "rotated on their own. Only a weight stored with the \"givens\" transform reads the result; "
   "it is NOT quant_act_fp8's output in either direction." },
+{ "givens_quant_act_i8g", ARR(pGivensQuant), ARR(oGivensQuant),
+  "givens_quant_act_fp8 with an int8 output: the same channel scale and rotations, then "
+  "quant_act_i8g's quantiser (scale = amax / 127 per `group`, round to nearest). For the int8 "
+  "prefill GEMMs of a weight stored with the \"givens\" transform." },
 { "givens_rotate", ARR(pGivensQuant), ARR(oGivensRotate),
   "givens_quant_act_fp8 without the quantiser: y = x / rscale rotated by `stages` rounds of Givens "
   "pairs, `parts` copies side by side ([M, parts * n]) in y's own dtype. For a weight whose GEMM "
@@ -1184,6 +1188,10 @@ SIMPLE("ref_givens_quant_act_fp8", "givens_quant_act_fp8", "quant",
        "channel scale and Givens rotations per part, then the block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; int32 pairs, f32 angles and channel scales",
        ref_givens_quant_act_fp8),
+SIMPLE("ref_givens_quant_act_i8g", "givens_quant_act_i8g", "quant",
+       "channel scale and Givens rotations per part, then the block-scaled int8 quantiser",
+       "float in, int8 out, f32 scale per group; int32 pairs, f32 angles and channel scales",
+       ref_givens_quant_act_i8g),
 SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
