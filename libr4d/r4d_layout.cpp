@@ -571,6 +571,71 @@ extern "C" int r4d_rad_unrelayout_w5(const RadParam* p, int n_p, int operand, co
     return RAD_OK;
 }
 
+/* ---- givens pairs: ParoQuant's rotation pairs (i32 [P*S, K]), stored as they are but CHECKED.
+ * The rotate kernels index a group's 128 LDS slots with them unchecked, so a stage that is not a
+ * pairing of its own group -- an index outside the group, or one column twice -- is refused here,
+ * at load, rather than read out of bounds. Operand 1 of the givens rows; the rest is as stored. */
+namespace {
+constexpr int GV_PAIRS_OPERAND = 1;
+constexpr long long GV_GROUP = 128;
+
+int gv_pairs_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                    const RadTensor* pl, int n, RadLayout* out) {
+    if (!out || !pl) return RAD_E_INVAL;
+    if (operand != GV_PAIRS_OPERAND) return RAD_E_UNSUPPORTED;
+    const long long K = r4d_pgeti_or(p, n_p, "n", 0);
+    if (K <= 0 || K % GV_GROUP || !selects(enc, sel, n, "t.pairs") || pl[0].rank != 2 ||
+        pl[0].dtype != RAD_I32 || pl[0].shape[1] != K) return RAD_E_SHAPE;
+    fill(out, "r4d.givens.pairs", RAD_I32, pl[0].shape[0], K, pl[0].shape[0] * K * 4);
+    return RAD_OK;
+}
+
+/* Every row (a stage of a part) is, group by group, a perfect matching of the group's columns. */
+bool gv_pairs_ok(const int32_t* pairs, long long rows, long long K) {
+    for (long long r = 0; r < rows; ++r)
+        for (long long g = 0; g < K; g += GV_GROUP) {
+            bool seen[GV_GROUP] = {};
+            for (long long i = 0; i < GV_GROUP; ++i) {
+                const long long c = (long long)pairs[r * K + g + i] - g;
+                if (c < 0 || c >= GV_GROUP || seen[c]) return false;
+                seen[c] = true;
+            }
+        }
+    return true;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_givens_pairs(const RadParam* p, int n_p, int operand,
+                                           const RadEncoding* enc, const int* sel,
+                                           const RadTensor* pl, int n, RadLayout* out) {
+    return gv_pairs_layout(p, n_p, operand, enc, sel, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_givens_pairs(const RadParam* p, int n_p, int operand,
+                                             const RadEncoding* enc, const int* sel,
+                                             const RadTensor* pl, int n, void* dst,
+                                             int64_t dst_bytes) {
+    RadLayout L;
+    const int rc = gv_pairs_layout(p, n_p, operand, enc, sel, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
+    if (!gv_pairs_ok((const int32_t*)pl[0].data, L.shape[0], L.shape[1])) return RAD_E_FORMAT;
+    std::memcpy(dst, pl[0].data, (size_t)L.bytes);
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_unrelayout_givens_pairs(const RadParam* p, int n_p, int operand,
+                                               const RadEncoding* enc, const int* sel,
+                                               const void* src, int64_t src_bytes,
+                                               const RadTensor* pl, int n) {
+    RadLayout L;
+    const int rc = gv_pairs_layout(p, n_p, operand, enc, sel, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
+    std::memcpy(pl[0].data, src, (size_t)L.bytes);
+    return RAD_OK;
+}
+
 /* ---- givens_dense: ParoQuant's rotation tables composed into one dense matrix a (part, group).
  *
  * A "givens" weight stores its rotation as pairs (i32 [P*S, K]) and angles (f32 [P*S, K/2]); the dense
@@ -620,6 +685,7 @@ extern "C" int r4d_rad_relayout_gdense(const RadParam* p, int n_p, int operand, 
     rc = gd_geom(p, n_p, enc, sel, pl, n, &P, &S, &K);
     if (rc != RAD_OK) return rc;
     const int32_t* pairs = (const int32_t*)pdata(pl[0]);
+    if (!gv_pairs_ok(pairs, P * S, K)) return RAD_E_FORMAT;
     const float* ang = (const float*)pdata(pl[1]);
     uint16_t* t = (uint16_t*)dst;
     const long long nkb = K / GD_GROUP, half = GD_GROUP / 2;
@@ -631,11 +697,8 @@ extern "C" int r4d_rad_relayout_gdense(const RadParam* p, int n_p, int operand, 
             for (long long st = 0; st < S; ++st)
                 for (long long j = 0; j < half; ++j) {
                     const long long row = pt * S + st, o = (size_t)(st * half + j);
-                    const long long a = pairs[row * K + g * GD_GROUP + 2 * j] - g * GD_GROUP;
-                    const long long b = pairs[row * K + g * GD_GROUP + 2 * j + 1] - g * GD_GROUP;
-                    if (a < 0 || a >= GD_GROUP || b < 0 || b >= GD_GROUP || a == b) return RAD_E_FORMAT;
-                    ia[(size_t)o] = (int)a;
-                    ib[(size_t)o] = (int)b;
+                    ia[(size_t)o] = (int)(pairs[row * K + g * GD_GROUP + 2 * j] - g * GD_GROUP);
+                    ib[(size_t)o] = (int)(pairs[row * K + g * GD_GROUP + 2 * j + 1] - g * GD_GROUP);
                     const float th = ang[row * (K / 2) + g * half + j];
                     cs[(size_t)o] = std::cos(th);
                     sn[(size_t)o] = std::sin(th);
@@ -826,71 +889,6 @@ extern "C" int r4d_rad_unrelayout_w2a8(const RadParam* p, int n_p, int operand,
             w2_slot(g, nn, k, &w, &f);
             d[nn * (g.K / 4) + (k >> 2)] |= (uint8_t)(((wq[w] >> (2 * f)) & 3) << (2 * (k & 3)));
         }
-    return RAD_OK;
-}
-
-/* ---- givens pairs: ParoQuant's rotation pairs (i32 [P*S, K]), stored as they are but CHECKED.
- * The rotate kernels index a group's 128 LDS slots with them unchecked, so a stage that is not a
- * pairing of its own group -- an index outside the group, or one column twice -- is refused here,
- * at load, rather than read out of bounds. Operand 1 of the givens rows; the rest is as stored. */
-namespace {
-constexpr int GV_PAIRS_OPERAND = 1;
-constexpr long long GV_GROUP = 128;
-
-int gv_pairs_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
-                    const RadTensor* pl, int n, RadLayout* out) {
-    if (!out || !pl) return RAD_E_INVAL;
-    if (operand != GV_PAIRS_OPERAND) return RAD_E_UNSUPPORTED;
-    const long long K = r4d_pgeti_or(p, n_p, "n", 0);
-    if (K <= 0 || K % GV_GROUP || !selects(enc, sel, n, "t.pairs") || pl[0].rank != 2 ||
-        pl[0].dtype != RAD_I32 || pl[0].shape[1] != K) return RAD_E_SHAPE;
-    fill(out, "r4d.givens.pairs", RAD_I32, pl[0].shape[0], K, pl[0].shape[0] * K * 4);
-    return RAD_OK;
-}
-
-/* Every row (a stage of a part) is, group by group, a perfect matching of the group's columns. */
-bool gv_pairs_ok(const int32_t* pairs, long long rows, long long K) {
-    for (long long r = 0; r < rows; ++r)
-        for (long long g = 0; g < K; g += GV_GROUP) {
-            bool seen[GV_GROUP] = {};
-            for (long long i = 0; i < GV_GROUP; ++i) {
-                const long long c = (long long)pairs[r * K + g + i] - g;
-                if (c < 0 || c >= GV_GROUP || seen[c]) return false;
-                seen[c] = true;
-            }
-        }
-    return true;
-}
-}  /* namespace */
-
-extern "C" int r4d_rad_layout_givens_pairs(const RadParam* p, int n_p, int operand,
-                                           const RadEncoding* enc, const int* sel,
-                                           const RadTensor* pl, int n, RadLayout* out) {
-    return gv_pairs_layout(p, n_p, operand, enc, sel, pl, n, out);
-}
-
-extern "C" int r4d_rad_relayout_givens_pairs(const RadParam* p, int n_p, int operand,
-                                             const RadEncoding* enc, const int* sel,
-                                             const RadTensor* pl, int n, void* dst,
-                                             int64_t dst_bytes) {
-    RadLayout L;
-    const int rc = gv_pairs_layout(p, n_p, operand, enc, sel, pl, n, &L);
-    if (rc != RAD_OK) return rc;
-    if (dst_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
-    if (!gv_pairs_ok((const int32_t*)pl[0].data, L.shape[0], L.shape[1])) return RAD_E_FORMAT;
-    std::memcpy(dst, pl[0].data, (size_t)L.bytes);
-    return RAD_OK;
-}
-
-extern "C" int r4d_rad_unrelayout_givens_pairs(const RadParam* p, int n_p, int operand,
-                                               const RadEncoding* enc, const int* sel,
-                                               const void* src, int64_t src_bytes,
-                                               const RadTensor* pl, int n) {
-    RadLayout L;
-    const int rc = gv_pairs_layout(p, n_p, operand, enc, sel, pl, n, &L);
-    if (rc != RAD_OK) return rc;
-    if (src_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
-    std::memcpy(pl[0].data, src, (size_t)L.bytes);
     return RAD_OK;
 }
 
