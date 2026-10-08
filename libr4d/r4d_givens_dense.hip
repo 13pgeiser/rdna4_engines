@@ -33,13 +33,15 @@
 #include <hip/hip_fp16.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 
 namespace {
 
 constexpr uint32_t kGroup = 128;
 constexpr uint32_t kThreads = 128;
 constexpr uint32_t kWaves = kThreads / 32;
-constexpr uint32_t kTStride = kGroup + 8;           // f16 per LDS row of T: 16 B pad, conflict-free b128 reads
+constexpr uint32_t kTStride = kGroup + 8;
+static_assert(kThreads == kGroup, "a thread stages one channel scale of the group (invd[tid])");           // f16 per LDS row of T: 16 B pad, conflict-free b128 reads
 
 typedef _Float16 v8h_t __attribute__((ext_vector_type(8)));
 
@@ -141,8 +143,11 @@ static int givens_dense_body(const RadArgs* a, const R4dSink& sk) {
     if (x->rank < 2 || q->rank != 2 || sc->rank != 2 || t->rank != 2 || rs->rank != 2)
         return R4D_NO(RAD_E_SHAPE);
     if (t->dtype != RAD_F16 || rs->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    // `out` names the quantiser and q's dtype must be it: a mismatch is refused, not read from q
+    const char* out = r4d_gets(a, "out");
     const bool i8 = q->dtype == RAD_I8;
     if (!i8 && q->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    if (!out || std::strcmp(out, i8 ? "i8" : "fp8") != 0) return R4D_NO(RAD_E_DTYPE);
     const long long M = x->shape[0], K = r4d_numel(x) / (x->shape[0] > 0 ? x->shape[0] : 1);
     const long long parts = r4d_geti_or(a, "parts", 1), nkb = K / kGroup;
     if (r4d_geti_or(a, "group", kGroup) != kGroup || K % kGroup || parts < 1) return R4D_NO(RAD_E_SHAPE);

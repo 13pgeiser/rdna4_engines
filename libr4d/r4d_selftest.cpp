@@ -3774,8 +3774,11 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
  * kernel's scale must match it to the rounding of its f32 sincos, and every dequantised element
  * must sit within the E4M3 grid of the reference (half a step at the top of the range is 1/16 of
  * the group's maximum, so 7% of it is a bound a wrong pair or a wrong angle cannot meet). */
-static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, int stages,
-                           bool rot_only = false, bool i8 = false, bool dense = false) {
+/* What givens_numeric runs: the sequential rotation to f16, or the dense rotation with either quantiser. */
+enum class GvCase { Rotate, DenseFp8, DenseI8 };
+
+static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, int stages, GvCase mode) {
+    const bool rot_only = mode == GvCase::Rotate, i8 = mode == GvCase::DenseI8, dense = !rot_only;
     const char* row = dense ? "givens_dense_quant" : "givens_rotate";
     if (!sel(row)) return;
     char nm[160];
@@ -13176,24 +13179,24 @@ static void device_phase(const Plugin& pl) {
 
     if (sel("givens_rotate")) {
         if (!g_case) std::printf("\nParoQuant's rotation to f16, against an f64 rotation\n");
-        givens_numeric(pl, 3, 5120, 1, 8, true);
-        givens_numeric(pl, 5, 5120, 2, 8, true);
-        givens_numeric(pl, 300, 6144, 2, 8, true);
+        givens_numeric(pl, 3, 5120, 1, 8, GvCase::Rotate);
+        givens_numeric(pl, 5, 5120, 2, 8, GvCase::Rotate);
+        givens_numeric(pl, 300, 6144, 2, 8, GvCase::Rotate);
     }
 
     if (sel("givens_dense_quant")) {
         if (!g_case) std::printf("\nParoQuant's rotation as dense per-group matrices, int8 and E4M3 output, against libm's rotation\n");
-        for (int i8 = 0; i8 < 2; ++i8) {
-            givens_numeric(pl, 1, 128, 1, 8, false, i8, true);
-            givens_numeric(pl, 5, 5120, 2, 8, false, i8, true);
-            givens_numeric(pl, 8, 5120, 2, 8, false, i8, true);
-            givens_numeric(pl, 16, 5120, 1, 8, false, i8, true);
-            givens_numeric(pl, 300, 6144, 2, 8, false, i8, true);
-            givens_numeric(pl, 2048, 5120, 1, 8, false, i8, true);
-            givens_numeric(pl, 2048, 5120, 2, 8, false, i8, true);
-            givens_numeric(pl, 64, 17408, 1, 8, false, i8, true);
-            givens_numeric(pl, 2048, 17408, 1, 8, false, i8, true);
-            givens_numeric(pl, 7, 5120, 3, 2, false, i8, true);
+        for (const GvCase mode : { GvCase::DenseFp8, GvCase::DenseI8 }) {
+            givens_numeric(pl, 1, 128, 1, 8, mode);
+            givens_numeric(pl, 5, 5120, 2, 8, mode);
+            givens_numeric(pl, 8, 5120, 2, 8, mode);
+            givens_numeric(pl, 16, 5120, 1, 8, mode);
+            givens_numeric(pl, 300, 6144, 2, 8, mode);
+            givens_numeric(pl, 2048, 5120, 1, 8, mode);
+            givens_numeric(pl, 2048, 5120, 2, 8, mode);
+            givens_numeric(pl, 64, 17408, 1, 8, mode);
+            givens_numeric(pl, 2048, 17408, 1, 8, mode);
+            givens_numeric(pl, 7, 5120, 3, 2, mode);
         }
     }
 

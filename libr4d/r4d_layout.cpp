@@ -641,9 +641,14 @@ extern "C" int r4d_rad_unrelayout_givens_pairs(const RadParam* p, int n_p, int o
  * A "givens" weight stores its rotation as pairs (i32 [P*S, K]) and angles (f32 [P*S, K/2]); the dense
  * kernel (r4d_givens_dense.hip) applies it as T (x / D), T being the composition of the group's S
  * stages.  The blob is [P * K/128][128 (j)][128 (i)] f16, T[j][i] = output j of the network fed the unit
- * vector e_i, so a (part, group) is 32 KiB the kernel stages whole.  Composed in f32 in the order the
- * stages are applied (stage 0 first), a' = a c + b s, b' = b c - a s -- libref's loop -- and rounded to
- * f16 once.  Operand 1 of givens_dense_quant; everything else stays as stored. */
+ * vector e_i, so a (part, group) is 32 KiB the kernel stages whole.  Composed in the order the stages are
+ * applied (stage 0 first), a' = a c + b s, b' = b c - a s -- libref's loop.
+ *
+ * A DERIVATION, NOT A CHOICE (abi/rad_abi.h: a relayout derives nothing a reader of the planes could not):
+ * the composition is done in f64 -- the f32 angles widened, cos and sin and every product in double --
+ * so its error (~1e-15) is far below an f16 step and the stored matrix is the exact composition rounded
+ * to f16 (by way of f32), the same bytes whichever libm or summation order computed it.  Operand 1 of
+ * givens_dense_quant; everything else stays as stored. */
 namespace {
 constexpr int GD_OPERAND = 1;
 constexpr long long GD_GROUP = 128;
@@ -690,8 +695,8 @@ extern "C" int r4d_rad_relayout_gdense(const RadParam* p, int n_p, int operand, 
     uint16_t* t = (uint16_t*)dst;
     const long long nkb = K / GD_GROUP, half = GD_GROUP / 2;
     std::vector<int> ia((size_t)(S * half)), ib((size_t)(S * half));
-    std::vector<float> cs((size_t)(S * half)), sn((size_t)(S * half));
-    std::vector<float> v((size_t)GD_GROUP);
+    std::vector<double> cs((size_t)(S * half)), sn((size_t)(S * half));
+    std::vector<double> v((size_t)GD_GROUP);
     for (long long pt = 0; pt < P; ++pt)
         for (long long g = 0; g < nkb; ++g) {
             for (long long st = 0; st < S; ++st)
@@ -699,20 +704,20 @@ extern "C" int r4d_rad_relayout_gdense(const RadParam* p, int n_p, int operand, 
                     const long long row = pt * S + st, o = (size_t)(st * half + j);
                     ia[(size_t)o] = (int)(pairs[row * K + g * GD_GROUP + 2 * j] - g * GD_GROUP);
                     ib[(size_t)o] = (int)(pairs[row * K + g * GD_GROUP + 2 * j + 1] - g * GD_GROUP);
-                    const float th = ang[row * (K / 2) + g * half + j];
+                    const double th = (double)ang[row * (K / 2) + g * half + j];
                     cs[(size_t)o] = std::cos(th);
                     sn[(size_t)o] = std::sin(th);
                 }
             uint16_t* tg = t + (size_t)(pt * nkb + g) * GD_GROUP * GD_GROUP;
             for (long long i = 0; i < GD_GROUP; ++i) {
-                std::fill(v.begin(), v.end(), 0.0f);
-                v[(size_t)i] = 1.0f;
+                std::fill(v.begin(), v.end(), 0.0);
+                v[(size_t)i] = 1.0;
                 for (long long o = 0; o < S * half; ++o) {
-                    const float va = v[(size_t)ia[(size_t)o]], vb = v[(size_t)ib[(size_t)o]];
+                    const double va = v[(size_t)ia[(size_t)o]], vb = v[(size_t)ib[(size_t)o]];
                     v[(size_t)ia[(size_t)o]] = va * cs[(size_t)o] + vb * sn[(size_t)o];
                     v[(size_t)ib[(size_t)o]] = vb * cs[(size_t)o] - va * sn[(size_t)o];
                 }
-                for (long long j = 0; j < GD_GROUP; ++j) tg[j * GD_GROUP + i] = f32_to_f16(v[(size_t)j]);
+                for (long long j = 0; j < GD_GROUP; ++j) tg[j * GD_GROUP + i] = f32_to_f16((float)v[(size_t)j]);
             }
         }
     return RAD_OK;

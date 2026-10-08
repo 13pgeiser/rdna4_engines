@@ -3020,11 +3020,13 @@ static const RadConstraint cQuantActFp8[] = {
  * straddle the end of a row: the ragged tail the unrotated kernel writes zero-padded would mix
  * real values with padding inside one butterfly, and there is no weight block on the other side
  * that was rotated the same way. */
-static const RadConstraint cGivensDense[] = {
-    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"), C_IN("out", "i8 fp8"),
-};
 static const RadConstraint cHadQuantActFp8[] = {
     C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+/* ParoQuant's dense rotation: the same whole-group rule (a rotation group cannot straddle a row's end),
+ * and `out` one of the two quantisers its epilogue has. */
+static const RadConstraint cGivensDense[] = {
+    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"), C_IN("out", "i8 fp8"),
 };
 
 /* The dtype is the INPUT's, and the input is already quantised -- so it is `fp8a8` and not `bf16`

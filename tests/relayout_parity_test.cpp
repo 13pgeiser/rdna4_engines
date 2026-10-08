@@ -835,3 +835,57 @@ TEST(givens_pairs_are_stored_as_they_are_and_checked) {
                  RAD_E_FORMAT);
     }
 }
+
+/* ParoQuant's dense rotation matrices: composed at load from the pairs and angles, exactly (f64), and
+ * rounded to f16 -- a derivation of the planes, pinned by hash so that a change in how they are composed
+ * shows here. Each stored matrix is orthogonal to f16 accuracy, and a broken pairing is refused. */
+TEST(givens_dense_matrices_are_the_exact_composition) {
+    const int64_t K = 256, P = 2, S = 3, PS = P * S, G = 128;
+    RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    rad_enc_add_table(&e, "t.pairs", RAD_I32, PS, K);
+    rad_enc_add_table(&e, "t.angle", RAD_F32, PS, K / 2);
+    const int sel[2] = { rad_enc_find(&e, "t.pairs"), rad_enc_find(&e, "t.angle") };
+    std::vector<int32_t> pairs((size_t)(PS * K));
+    std::vector<float> ang((size_t)(PS * K / 2));
+    for (int64_t r = 0; r < PS; ++r) {
+        const int64_t mul = 2 * r + 3, add = 17 * r + 5;                  /* odd multiplier: a permutation */
+        for (int64_t c = 0; c < K; ++c)
+            pairs[(size_t)(r * K + c)] = (int32_t)((c / G) * G + (c % G * mul + add) % G);
+        for (int64_t j = 0; j < K / 2; ++j) ang[(size_t)(r * K / 2 + j)] = 0.37f * (float)(r + 1) - 0.011f * (float)j;
+    }
+    auto tensor = [](void* d, uint32_t dt, int64_t r, int64_t c) {
+        RadTensor t{};
+        t.data = d;
+        t.dtype = dt;
+        t.rank = 2;
+        t.shape[0] = r;
+        t.shape[1] = c;
+        t.stride[0] = c;
+        t.stride[1] = 1;
+        return t;
+    };
+    RadTensor t[2] = { tensor(pairs.data(), RAD_I32, PS, K), tensor(ang.data(), RAD_F32, PS, K / 2) };
+    Opts kp;
+    kp.i("n", K).i("parts", P);
+    RadLayout L{};
+    REQUIRE_EQ(r4d_rad_layout_gdense(kp.data(), kp.n(), 1, &e, sel, t, 2, &L), RAD_OK);
+    REQUIRE_EQ(L.bytes, (int64_t)(P * K * G * 2));
+    std::vector<uint8_t> dst((size_t)L.bytes);
+    REQUIRE_EQ(r4d_rad_relayout_gdense(kp.data(), kp.n(), 1, &e, sel, t, 2, dst.data(), L.bytes), RAD_OK);
+    golden("givens dense", fnv(dst), 0x8e72bd2bb541c6e6ull);
+    /* T's columns are unit vectors (the composition of rotations is orthogonal), to f16 accuracy */
+    const uint16_t* tm = (const uint16_t*)dst.data();
+    double worst = 0;
+    for (int64_t pg = 0; pg < P * K / G; ++pg)
+        for (int64_t i = 0; i < G; ++i) {
+            double nrm = 0;
+            for (int64_t j = 0; j < G; ++j) {
+                const double v = rad_f16_to_f32(tm[(size_t)((pg * G + j) * G + i)]);
+                nrm += v * v;
+            }
+            worst = std::max(worst, std::fabs(nrm - 1.0));
+        }
+    CHECK(worst < 2e-3);
+    pairs[5] = pairs[6];                                                  /* a column twice in a stage */
+    CHECK_EQ(r4d_rad_relayout_gdense(kp.data(), kp.n(), 1, &e, sel, t, 2, dst.data(), L.bytes), RAD_E_FORMAT);
+}

@@ -476,6 +476,7 @@ int ref_givens_dense_quant(const RadArgs* a, RadStream) {
     if (n <= 0 || P <= 0 || g != 128 || n % g != 0) return RAD_E_SHAPE;
     const bool i8 = q->dtype == RAD_I8;
     if (!i8 && q->dtype != RAD_F8E4M3) return RAD_E_DTYPE;
+    if (std::strcmp(p_str(a, "out", ""), i8 ? "i8" : "fp8") != 0) return RAD_E_DTYPE;   // `out` names q's dtype
     const int64_t rows = numel(x) / n, ngrp = n / g;
     if (rows <= 0 || numel(tm) < P * n * g || numel(sc) < P * n || numel(q) < rows * P * n ||
         numel(s) < rows * P * ngrp) return RAD_E_SHAPE;
