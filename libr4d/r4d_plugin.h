@@ -391,6 +391,12 @@ int r4d_rad_layout_mxfp4(const RadParam*, int, int, const RadEncoding*, const in
                          const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, void*, int64_t);
+int r4d_rad_layout_givens_pairs(const RadParam*, int, int, const RadEncoding*, const int*,
+                                const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_givens_pairs(const RadParam*, int, int, const RadEncoding*, const int*,
+                                  const RadTensor*, int, void*, int64_t);
+int r4d_rad_unrelayout_givens_pairs(const RadParam*, int, int, const RadEncoding*, const int*,
+                                    const void*, int64_t, const RadTensor*, int);
 
 /* -- the small bf16 model ops (r4d_model_bf16.hip) --
  *

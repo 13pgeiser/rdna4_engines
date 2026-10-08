@@ -5161,11 +5161,13 @@ static const RadKernelInfo kKernels[] = {
   "n a multiple of 128 -- a rotation group cannot straddle the end of a row -- and group 128, "
   "which is both the rotation group and the weight scale's activation block",
   "bf16 in, E4M3 out in PLAIN ROW-MAJOR order, parts side by side, with an f32 scale per (row, part, "
-  "128 columns); the tables are the weight's int32 pairs, f32 angles and f32 channel scales",
+  "128 columns); the tables are the weight's int32 pairs (checked at load to pair each group's own "
+  "columns), f32 angles and f32 channel scales",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cHadQuantActFp8), NOTUNE,
-  nullptr, nullptr, r4d_rad_givens_quant_act_fp8, nullptr, nullptr, nullptr,
-  nullptr, nullptr, nullptr, r4d_rad_givens_quant_act_fp8_describe },
+  nullptr, nullptr, r4d_rad_givens_quant_act_fp8, nullptr, r4d_rad_layout_givens_pairs,
+  r4d_rad_relayout_givens_pairs, nullptr, r4d_rad_unrelayout_givens_pairs, nullptr,
+  r4d_rad_givens_quant_act_fp8_describe },
 
 { "quant_act_i8g", "quant_act_i8g", "quant",
   "per-(row, 128-column) symmetric int8 quantisation of a bf16 activation",

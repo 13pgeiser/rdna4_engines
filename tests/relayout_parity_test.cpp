@@ -760,3 +760,49 @@ TEST(a_kernel_refuses_an_encoding_it_does_not_read) {
 }
 
 RAD_TEST_MAIN()
+
+/* ParoQuant's rotation pairs are stored as they are -- and refused at load when a stage is not a
+ * pairing of its own group's 128 columns, which the rotate kernels would index out of bounds. */
+TEST(givens_pairs_are_stored_as_they_are_and_checked) {
+    const int64_t K = 256, R = 2;                    /* two groups, two stages */
+    RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    rad_enc_add_table(&e, "t.pairs", RAD_I32, R, K);
+    const int sel[1] = { rad_enc_find(&e, "t.pairs") };
+    std::vector<int32_t> pairs((size_t)(R * K));
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t c = 0; c < K; ++c)                /* stage 0 reverses each group, stage 1 not */
+            pairs[(size_t)(r * K + c)] = (int32_t)((c / 128) * 128 + (r ? c % 128 : 127 - c % 128));
+    RadTensor t{};
+    t.data = pairs.data();
+    t.dtype = RAD_I32;
+    t.rank = 2;
+    t.shape[0] = R;
+    t.shape[1] = K;
+    t.stride[0] = K;
+    t.stride[1] = 1;
+    Opts kp;
+    kp.i("n", K).i("stages", 1).i("parts", 2);
+    RadLayout L{};
+    CHECK_EQ(r4d_rad_layout_givens_pairs(kp.data(), kp.n(), 2, &e, sel, &t, 1, &L), RAD_E_UNSUPPORTED);
+    REQUIRE_EQ(r4d_rad_layout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, &L), RAD_OK);
+    REQUIRE_EQ(L.bytes, (int64_t)(R * K * 4));
+    std::vector<uint8_t> dst((size_t)L.bytes);
+    REQUIRE_EQ(r4d_rad_relayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, dst.data(), L.bytes),
+               RAD_OK);
+    CHECK_EQ(std::memcmp(dst.data(), pairs.data(), dst.size()), 0);
+    std::vector<int32_t> back((size_t)(R * K), -1);
+    RadTensor tb = t;
+    tb.data = back.data();
+    REQUIRE_EQ(r4d_rad_unrelayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, dst.data(), L.bytes, &tb, 1),
+               RAD_OK);
+    CHECK(back == pairs);
+    /* a pair leaving its group, and a column paired twice in a stage */
+    std::vector<int32_t> out = pairs, dup = pairs;
+    out[(size_t)(K + 5)] = 130;
+    dup[3] = dup[4];
+    for (std::vector<int32_t>* bad : { &out, &dup }) {
+        t.data = bad->data();
+        CHECK_EQ(r4d_rad_relayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, dst.data(), L.bytes),
+                 RAD_E_FORMAT);
+    }
+}

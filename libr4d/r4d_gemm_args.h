@@ -368,21 +368,30 @@ struct MxParts {
     long long lda = 0;                  /* 0: the plane's own K */
 };
 
+/* The bounds `pb1`/`pb2` name over N rows, as every reader takes them: { 0, e1, e2, N }, part i
+ * being [bound[i], bound[i+1]). Returns how many copies of the activation they imply, 1..3. */
+static inline int mx_part_bounds(long long N, long long pb1, long long pb2, long long bound[4]) {
+    const long long e1 = pb1 > 0 && pb1 < N ? pb1 : N;
+    long long e2 = pb2 > 0 && pb2 < N ? pb2 : N;
+    if (e2 < e1) e2 = e1;
+    bound[0] = 0;
+    bound[1] = e1;
+    bound[2] = e2;
+    bound[3] = N;
+    return e2 < N ? 3 : (e1 < N ? 2 : 1);
+}
+
 static inline int mx_parts(const RadArgs* a, GemmOps* g, MxParts* p) {
-    const long long pb1 = r4d_geti_or(a, "pb1", 0), pb2 = r4d_geti_or(a, "pb2", 0);
     p->n = 1;
     p->n0[0] = 0;
     p->n1[0] = g->N;
     p->lda = 0;
-    if (pb1 <= 0 && pb2 <= 0) return RAD_OK;
+    long long bound[4];
+    const int segs = mx_part_bounds(g->N, r4d_geti_or(a, "pb1", 0), r4d_geti_or(a, "pb2", 0), bound);
+    if (segs == 1) return RAD_OK;
     const long long K = r4d_geti_or(a, "K", 0);
     if (K <= 0) return R4D_NO(RAD_E_INVAL);
-    const long long e1 = pb1 > 0 ? (pb1 < g->N ? pb1 : g->N) : g->N;
-    long long e2 = pb2 > 0 ? (pb2 < g->N ? pb2 : g->N) : g->N;
-    if (e2 < e1) e2 = e1;
-    const long long bound[4] = { 0, e1, e2, g->N };
-    const int segs = e2 < g->N ? 3 : (e1 < g->N ? 2 : 1);
-    if (g->K != (long long)segs * K || (e1 % 16) || (e2 % 16)) return R4D_NO(RAD_E_SHAPE);
+    if (g->K != (long long)segs * K || (bound[1] % 16) || (bound[2] % 16)) return R4D_NO(RAD_E_SHAPE);
     p->n = 0;
     for (int i = 0; i < 3; ++i)
         if (bound[i + 1] > bound[i]) {

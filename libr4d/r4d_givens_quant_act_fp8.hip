@@ -5,8 +5,8 @@
 // the weight is read by the plain MXFP4 GEMM unchanged.
 //
 // WHY THE ROTATION IS A GROUP AT A TIME. ParoQuant's pairs never leave a group of 128 columns --
-// that is how the checkpoint is trained, and the converter refuses one that does -- so a group is a
-// closed system: its 128 values are rotated by S stages of 64 disjoint pairs and then quantised
+// that is how the checkpoint is trained, and the converter and the loader (r4d_rad_relayout_givens_pairs)
+// refuse one that does -- so a group is a closed system: its 128 values are rotated by S stages of 64 disjoint pairs and then quantised
 // with ONE scale. A wave owns a group. The values sit in LDS (128 floats a wave, no barrier
 // needed: a wave's LDS accesses are in order, and the pairs of a stage are disjoint so no two lanes
 // touch one address), each lane takes two pairs a stage, and the absmax is a wave reduction. The

@@ -367,8 +367,8 @@ extern "C" void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, l
 
 // ============================================================== the plugin ABI entry point
 // The row-major activation is re-tiled into the op's scratch, then the GEMM reads it from there.
-// A partitioned weight re-tiles each part's copy of the activation into its own slab of the
-// scratch and runs the GEMM over that part's rows (mx_parts).
+// A partitioned weight re-tiles each part's copy of the activation into the scratch in turn and
+// runs the GEMM over that part's rows (mx_parts).
 extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 1);
@@ -386,13 +386,13 @@ extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
     rc = mx_ascale_grid(g, &as_group, &as_rs, mp.n);
     if (rc != RAD_OK) return rc;
     const long long slab = r4d_mxfp4a8_tile_a_bytes((int)g.M, (int)g.K);
-    if (!a->scratch || a->scratch_bytes < slab * mp.n) return R4D_NO(RAD_E_INVAL);
+    if (!a->scratch || a->scratch_bytes < slab) return R4D_NO(RAD_E_INVAL);
     R4dMxTileCfg t;
     r4d_cfg_mxfp4_tiled(a, &t);
     const long kb = (long)((g.K + 127) / 128);
+    const long at = (long)(uintptr_t)a->scratch;
     for (int p = 0; p < mp.n; ++p) {
         const long long n0 = mp.n0[p], np = mp.n1[p] - mp.n0[p];
-        const long at = (long)(uintptr_t)a->scratch + (long)(p * slab);
         R4D_TRY("gemm_mxfp4a8_tiled",
             r4d_mxfp4a8_tile_a(r4d_addr(g.a) + p * g.K, at, (int)g.M, (int)g.K,
                                (long)(uintptr_t)s, (int)(mp.lda ? mp.lda : g.K));
@@ -405,14 +405,9 @@ extern "C" int r4d_rad_gemm_mxfp4a8_tiled(const RadArgs* a, RadStream s) {
 }
 
 /* The core sizes the op's scratch from this, at the band's widest M: the fragment-tiled copy of
- * the activation, whole 16-row fragments -- one a part. */
+ * the activation, whole 16-row fragments. One copy for every part: the parts run one after another
+ * on the op's stream, so a part's re-tile cannot overtake the previous part's GEMM. */
 extern "C" int64_t r4d_rad_gemm_mxfp4a8_tiled_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), K = r4d_geti_or(a, "K", 0);
-    const long long N = r4d_geti_or(a, "N", 0);
-    const long long pb1 = r4d_geti_or(a, "pb1", 0), pb2 = r4d_geti_or(a, "pb2", 0);
-    const long long e1 = pb1 > 0 ? (pb1 < N ? pb1 : N) : N;
-    long long e2 = pb2 > 0 ? (pb2 < N ? pb2 : N) : N;
-    if (e2 < e1) e2 = e1;
-    const int parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
-    return (int64_t)r4d_mxfp4a8_tile_a_bytes((int)M, (int)K) * parts;
+    return (int64_t)r4d_mxfp4a8_tile_a_bytes((int)M, (int)K);
 }

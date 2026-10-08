@@ -1090,27 +1090,16 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             RAD_ARCH_TRY(rad_weight_shard_span(b, ws, lo, hi));
             RAD_ARCH_TRY(rad_weight_shard_span(b, wref, lo, hi));
         }
+        /* ONE GEMM for both: a rotated weight reads its own rotated pair, a plain one the
+         * producer's. `pb1`/`pb2` (the last two params) go only to a weight with parts, so a one-part
+         * op keeps the plain op's geometry -- the key the tune cache is read by. */
         const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
-        if (paro) {
-            op = rot_parts > 1
-                ? rw(b, RAD_OP(b, "gemm_nt_q",
-                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                                     RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8"),
-                                     RAD_INT("pb1", pb1), RAD_INT("pb2", pb2)),
-                          RAD_WEIGHTS(w, ws, wref)),
-                      { rot_q, rot_s }, { y })
-                : rw(b, RAD_OP(b, "gemm_nt_q",
-                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                                     RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
-                          RAD_WEIGHTS(w, ws, wref)),
-                      { rot_q, rot_s }, { y });
-            return op ? RAD_OK : RAD_E_INVAL;
-        }
-        op = rw(b, RAD_OP(b, "gemm_nt_q",
-                   RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                              RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
-                   RAD_WEIGHTS(w, ws, wref)),
-               { a.q, a.s }, { y });
+        const RadParam ps[] = { RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8"),
+                                RAD_INT("pb1", pb1), RAD_INT("pb2", pb2) };
+        const int n_ps = (int)(sizeof ps / sizeof ps[0]) - (rot_parts > 1 ? 0 : 2);
+        op = rw(b, rad_decl_op(b, "gemm_nt_q", ps, n_ps, RAD_WEIGHTS(w, ws, wref)),
+                { paro ? rot_q : a.q, paro ? rot_s : a.s }, { y });
         return op ? RAD_OK : RAD_E_INVAL;
     }
 
@@ -1212,20 +1201,17 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
                     RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
-    if (paro) {
-        /* The rotation first: this linear's own codes, `rot_parts` copies side by side. */
-        RAD_ISSUE_N(c, op_rot, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_pairs),
-                    RAD_W(rot_angle), RAD_W(rot_scale),
-                    brow_slice(rot_q, r0, rows, rot_parts * K),
-                    brow_slice(rot_s, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)));
-        RAD_ISSUE_N(c, op, rows, brow_slice(rot_q, r0, rows, rot_parts * K),
-                    brow_slice(rot_s, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)),
-                    RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_W(wref));
-        return;
-    }
     if (mx) {
-        RAD_ISSUE_N(c, op, rows, brow_slice(a.q, r0, rows, K),
-                    brow_slice(a.s, r0, rows, K / RAD_FP8_BLOCK),
+        /* A rotated weight rotates its input first, into its own codes, `rot_parts` copies side
+         * by side (one for a plain weight, which reads the producer's). */
+        const rad_buf aq = paro ? rot_q : a.q, as = paro ? rot_s : a.s;
+        const int64_t ak = rot_parts * K;
+        if (paro)
+            RAD_ISSUE_N(c, op_rot, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_pairs),
+                        RAD_W(rot_angle), RAD_W(rot_scale), brow_slice(aq, r0, rows, ak),
+                        brow_slice(as, r0, rows, ak / RAD_FP8_BLOCK));
+        RAD_ISSUE_N(c, op, rows, brow_slice(aq, r0, rows, ak),
+                    brow_slice(as, r0, rows, ak / RAD_FP8_BLOCK),
                     RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_W(wref));
         return;
     }

@@ -621,11 +621,8 @@ extern "C" int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs* a) {
     if (M < 1 || N < 16 || K < 64 || M > r4d_gemm_mxfp4a8_decode_max_m()) return 0;
     R4dMxDecCfg t;
     r4d_cfg_mxfp4_decode(a, &t);
-    const long long pb1 = r4d_geti_or(a, "pb1", 0), pb2 = r4d_geti_or(a, "pb2", 0);
-    const long long e1 = pb1 > 0 ? (pb1 < N ? pb1 : N) : N;
-    long long e2 = pb2 > 0 ? (pb2 < N ? pb2 : N) : N;
-    if (e2 < e1) e2 = e1;
-    const long long bound[4] = { 0, e1, e2, N };
+    long long bound[4];
+    mx_part_bounds(N, r4d_geti_or(a, "pb1", 0), r4d_geti_or(a, "pb2", 0), bound);
     int64_t worst = 0;
     for (int i = 0; i < 3; ++i) {
         const long long np = bound[i + 1] - bound[i];
