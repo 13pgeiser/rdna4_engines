@@ -142,20 +142,18 @@ impl Qwen4Bundle {
     /// MTP calls this only after A's head append and before B's append.
     pub(crate) fn publish_pair_session_boundary(&mut self, gpu: &mut Gpu, position: usize) -> Result<(), BundleError> {
         if self.session_next_boundary() != Some(position) { return Ok(()); }
-        let Some(turn) = self.turn.take() else {
-            return Err(BundleError::Forward("paired session boundary has no canonical prompt".into()));
-        };
-        let result = if let Some(prefix) = turn.0.get(..position) {
-            self.session_at_boundary(gpu, prefix)
-        } else {
-            Err(BundleError::Forward("paired session boundary exceeds canonical prompt".into()))
-        };
-        self.turn = Some(turn);
+        let result = self
+            .ep_refuse("session_at_boundary outside a replicated call")
+            .and_then(|()| {
+                self.with_session(|session, bundle| session.at_turn_boundary(gpu, bundle, position))
+                    .unwrap_or(Ok(()))
+                    .map_err(BundleError::Forward)
+            });
         if let Some(stage) = &mut self.pair_session_stage { stage.position = None; }
         result
     }
 
     pub(crate) fn pair_boundary_is_ar(&self) -> bool {
-        self.turn.as_ref().is_some_and(|(_, route)| *route == SessionRoute::Ar)
+        self.session.as_ref().and_then(SessionDriver::turn_route) == Some(SessionRoute::Ar)
     }
 }
