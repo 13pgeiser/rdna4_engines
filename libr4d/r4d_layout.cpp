@@ -342,6 +342,26 @@ void sz_read(const WGeom& g, const uint32_t* sz, const RadTensor* pl, bool asym)
             }
 }
 
+/* A ROTATED asymmetric grid (ParoQuant): codes of `codes` dtype, an f16 scale and a u8 zero point a
+ * group, then a `givens` transform and its tables -- the same bytes as the unrotated grid, the
+ * rotation being the activation's. */
+static bool paro_asym_enc(const RadEncoding* e, uint32_t codes, long long group) {
+    if (!e || !rad_enc_is(e, "affine") || e->n_planes < 3) return false;
+    const bool giv = std::strncmp(e->transform, "givens", RAD_ENC_STR) == 0;
+    if (!giv && e->transform[0]) return false;
+    if (!giv && e->n_planes != 3) return false;
+    if (giv && (!rad_enc_valid(e) || rad_enc_find(e, "t.pairs") < 0)) return false;
+    if (std::strncmp(e->plane[0].role, "codes", RAD_ENC_STR) != 0 || e->plane[0].dtype != codes ||
+        e->plane[0].block[0] != 1 || e->plane[0].block[1] != 1) return false;
+    const int s = rad_enc_find(e, "scale"), z = rad_enc_find(e, "zero");
+    if (s != 1 || z != 2) return false;
+    return e->plane[s].dtype == RAD_F16 && e->plane[s].kind == RAD_PLANE_TILED &&
+           e->plane[s].block[0] == 1 && e->plane[s].block[1] == group &&
+           (e->plane[z].dtype == RAD_U8 || e->plane[z].dtype == codes) &&
+           e->plane[z].kind == RAD_PLANE_TILED && e->plane[z].block[0] == 1 &&
+           e->plane[z].block[1] == group;
+}
+
 /* ---- w4: a symmetric grid is i4 codes with an f16 scale; `_asym` is u4 codes with a zero. */
 int w4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
@@ -352,7 +372,8 @@ int w4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     if (g.K % R4D_W4_KPB) return RAD_E_SHAPE;
     const bool asym = w4_asym(p, n_p);
     const bool ok = asym ? (r4d_enc::affine(enc, RAD_U4, RAD_F16, 1, g.group, RAD_U8) ||
-                            r4d_enc::affine(enc, RAD_U4, RAD_F16, 1, g.group, RAD_U4))
+                            r4d_enc::affine(enc, RAD_U4, RAD_F16, 1, g.group, RAD_U4) ||
+                            paro_asym_enc(enc, RAD_U4, g.group))
                          : r4d_enc::affine(enc, RAD_I4, RAD_F16, 1, g.group);
     if (!ok) return RAD_E_DTYPE;
     if (gout) *gout = g;
@@ -434,6 +455,79 @@ extern "C" int r4d_rad_unrelayout_w4(const RadParam* p, int n_p, int operand,
             const uint32_t q = (wq[w] >> (4 * nib)) & 0xF;
             d[nn * (g.K / 2) + (k >> 1)] |= (uint8_t)(q << (4 * (k & 1)));
         }
+    return RAD_OK;
+}
+
+/* ---- w5: ParoQuant's int5, asymmetric: u5 codes, an f16 scale and a u8 zero point (0..31) a 128 of K.
+ * The blob is w4's fragment order for the low four bits of every code (offset binary, no sign flip)
+ * followed by a plane of 32-bit words holding the fifth bits, one a (n-tile, 64 of K, lane): byte s
+ * is k step s of the block and bit e the fragment element e -- the element whose nibble is
+ * 2e (e < 4) or 2(e-4)+1 in dword s of that lane's 16 bytes (r4d_gemm_w5a16_nt_m64.hip). The scale
+ * operand is w4u's (scale, zero) dword plane. A ROTATED weight (a `givens` transform and its
+ * tables beside the first three planes) is the same bytes: the rotation is the activation's. */
+namespace {
+bool w5_enc(const RadEncoding* e, long long group) { return paro_asym_enc(e, RAD_U5, group); }
+
+int w5_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+                  const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
+    if (!out || !pl) return RAD_E_INVAL;
+    WGeom g;
+    int rc = wgeom(p, n_p, R4D_W4_GROUP, &g);
+    if (rc != RAD_OK) return rc;
+    if (g.K % R4D_W4_KPB) return RAD_E_SHAPE;
+    if (!w5_enc(enc, g.group)) return RAD_E_DTYPE;
+    if (gout) *gout = g;
+    if (operand == Q_BSCALE)
+        return sz_layout(g, enc, sel, pl, n, true, "r4d.w5.sz.g128", R4D_DT_W4_SZ, 4, out);
+    if (operand != Q_B) return RAD_E_UNSUPPORTED;
+    if (!selects(enc, sel, n, "codes") || !dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
+    fill(out, "r4d.w5.frag.g128", R4D_DT_W4_FRAG, g.N, g.K, g.N * g.K * 5 / 8);
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_w5(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                 const int* sel, const RadTensor* pl, int n, RadLayout* out) {
+    return w5_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr);
+}
+
+extern "C" int r4d_rad_relayout_w5(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                   const int* sel, const RadTensor* pl, int n, void* dst,
+                                   int64_t dst_bytes) {
+    RadLayout L;
+    WGeom g;
+    const int rc = w5_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+    std::memset(dst, 0, (size_t)dst_bytes);
+    if (operand == Q_BSCALE) {
+        sz_write(g, pl, -1, (uint32_t*)dst);
+        return RAD_OK;
+    }
+    uint32_t* wq = (uint32_t*)dst;
+    uint32_t* hi = wq + g.N * g.K / 8;                    /* after the N*K/2 bytes of nibbles */
+    const long long kpb = g.K / R4D_W4_KPB;
+    const long long rb = (g.K * 5 + 7) / 8;
+    for (long long nn = 0; nn < g.N; ++nn) {
+        const uint8_t* row = pdata(pl[0]) + nn * rb;
+        for (long long k = 0; k < g.K; ++k) {
+            const long long bit = k * 5;
+            uint32_t v = row[bit >> 3];
+            if ((bit & 7) > 3) v |= (uint32_t)row[(bit >> 3) + 1] << 8;
+            const uint32_t q = (v >> (bit & 7)) & 31u;
+            long long w;
+            int nib;
+            w4_slot(g, nn, k, &w, &nib);
+            wq[w] |= (q & 15u) << (4 * nib);
+            /* the fifth bit: word (t, kb, lane) = w / 4 (w4_slot's dword index is that * 4 + s);
+             * byte s = w % 4, bit e from the nibble position */
+            const long long hw = w / 4;
+            const int s = (int)(w % 4);
+            const int e = nib % 2 == 0 ? nib / 2 : 4 + nib / 2;     /* nibble 2e / 2(e-4)+1 -> e */
+            hi[hw] |= (q >> 4) << (8 * s + e);
+        }
+    }
+    (void)kpb;
     return RAD_OK;
 }
 

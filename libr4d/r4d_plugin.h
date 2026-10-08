@@ -216,6 +216,8 @@ int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_tiled (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16_m64  (const RadArgs*, RadStream);
+int r4d_rad_gemm_w5a16_m64  (const RadArgs*, RadStream);
+int r4d_rad_gemm_w4a16asym_m64(const RadArgs*, RadStream);
 int r4d_rad_gemm_w8a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a8_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a8_tiled (const RadArgs*, RadStream);
@@ -319,6 +321,8 @@ int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_had_quant_act_fp8 (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_givens_rotate (const RadArgs*, RadStream);
+int r4d_rad_givens_rotate_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_givens_quant_act_fp8 (const RadArgs*, RadStream);
 int r4d_rad_givens_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_rmsnorm_quant_fp8(const RadArgs*, RadStream);
@@ -387,6 +391,10 @@ int r4d_rad_relayout_w8a16(const RadParam*, int, int, const RadEncoding*, const 
                            const RadTensor*, int, void*, int64_t);
 int r4d_rad_relayout_w8a8(const RadParam*, int, int, const RadEncoding*, const int*,
                           const RadTensor*, int, void*, int64_t);
+int r4d_rad_layout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
+                      const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
+                        const RadTensor*, int, void*, int64_t);
 int r4d_rad_layout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
                          const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,

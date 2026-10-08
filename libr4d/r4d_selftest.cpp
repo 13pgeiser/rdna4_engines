@@ -3740,8 +3740,9 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
  * kernel's scale must match it to the rounding of its f32 sincos, and every dequantised element
  * must sit within the E4M3 grid of the reference (half a step at the top of the range is 1/16 of
  * the group's maximum, so 7% of it is a bound a wrong pair or a wrong angle cannot meet). */
-static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, int stages) {
-    const char* row = "givens_quant_act_fp8";
+static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, int stages,
+                           bool rot_only = false) {
+    const char* row = rot_only ? "givens_rotate" : "givens_quant_act_fp8";
     if (!sel(row)) return;
     char nm[160];
     std::snprintf(nm, sizeof nm, "%s numeric M=%lld K=%lld parts=%d stages=%d", row, (long long)M,
@@ -3781,7 +3782,7 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
     void* d_p = dalloc(pairs.size() * 4);
     void* d_a = dalloc(ang.size() * 4);
     void* d_r = dalloc(rs.size() * 4);
-    void* d_q = dalloc((size_t)(M * parts * K));
+    void* d_q = dalloc((size_t)(M * parts * K) * (rot_only ? 2 : 1));
     void* d_s = dalloc((size_t)(M * parts * ng) * 4);
     if (!d_x || !d_p || !d_a || !d_r || !d_q || !d_s) { ok(nm, false, "hipMalloc failed"); return; }
     st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
@@ -3790,9 +3791,11 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
     st_memcpy(d_r, rs.data(), rs.size() * 4, hipMemcpyHostToDevice);
     std::vector<RadTensor> ts = {
         T(d_x, RAD_BF16, { M, K }), T(d_p, RAD_I32, { NPS, K }), T(d_a, RAD_F32, { NPS, K / 2 }),
-        T(d_r, RAD_F32, { (int64_t)parts, K }), T(d_q, RAD_F8E4M3, { M, parts * K }),
+        T(d_r, RAD_F32, { (int64_t)parts, K }),
+        T(d_q, rot_only ? (uint32_t)RAD_F16 : (uint32_t)RAD_F8E4M3, { M, parts * K }),
         T(d_s, RAD_F32, { M, parts * ng }),
     };
+    if (rot_only) ts.pop_back();
     std::vector<RadParam> ps = { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16"),
                                  PI("stages", stages), PI("parts", parts) };
     RadArgs a;
@@ -3802,7 +3805,7 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
     a.world_size = 1;
     const int rc = r->launch(&a, (RadStream) nullptr);
     if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { ok(nm, false, "rc=" + std::to_string(rc)); return; }
-    std::vector<uint8_t> hq((size_t)(M * parts * K));
+    std::vector<uint8_t> hq((size_t)(M * parts * K) * (rot_only ? 2 : 1));
     std::vector<float> hs((size_t)(M * parts * ng));
     st_memcpy(hq.data(), d_q, hq.size(), hipMemcpyDeviceToHost);
     st_memcpy(hs.data(), d_s, hs.size() * 4, hipMemcpyDeviceToHost);
@@ -3824,6 +3827,13 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
             for (int64_t g = 0; g < ng; ++g) {
                 double amax = 0;
                 for (int k = 0; k < G; ++k) amax = std::max(amax, std::fabs(b[(size_t)(g * G + k)]));
+                if (rot_only) {                 // f16: relative 2^-11 of the value, 1e-3 of the group max
+                    for (int k = 0; k < G; ++k) {
+                        const double y = rad_load_f32(hq.data(), RAD_F16, i * parts * K + p * K + g * G + k);
+                        worst_val = std::max(worst_val, std::fabs(y - b[(size_t)(g * G + k)]) / (amax + 1e-30));
+                    }
+                    continue;
+                }
                 const double sc = hs[(size_t)(i * parts * ng + p * ng + g)];
                 worst_scale = std::max(worst_scale, std::fabs(sc - amax / 448.0) / (amax / 448.0 + 1e-30));
                 for (int k = 0; k < G; ++k) {
@@ -3834,7 +3844,115 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
         }
     char d[96];
     std::snprintf(d, sizeof d, "scale rel %.2e, value/amax %.3f", worst_scale, worst_val);
-    ok(nm, worst_scale < 1e-4 && worst_val < 0.07, d);
+    ok(nm, rot_only ? worst_val < 1e-3 : (worst_scale < 1e-4 && worst_val < 0.07), d);
+}
+
+
+/* PARO'S 5-BIT SKINNY GEMM against what the planes mean: u5 codes (a bit stream along K), an f16 scale
+ * and a zero point 0..31 a 128 of K, an f16 activation, the weight stored through the row's hooks.
+ * `pb1`/`pb2` give a partitioned weight (the activation copies side by side). M past 64 runs the
+ * dispatcher's 64-row chunks. */
+static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
+                          int64_t pb2 = 0) {
+    const char* row = "gemm_w5a16_nt_m64";
+    if (!sel(row)) return;
+    const int64_t e1 = pb1 > 0 ? std::min(pb1, N) : N;
+    const int64_t e2 = pb2 > 0 ? std::max(e1, std::min(pb2, N)) : N;
+    const int parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
+    auto part_of = [&](int64_t n) { return (int)(n >= e1) + (int)(n >= e2); };
+    char nm[160];
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d", row, (long long)M,
+                  (long long)N, (long long)K, parts);
+    const RadKernelInfo* r = find(pl, row);
+    if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
+    const int64_t G = K / 128;
+    Planes p;
+    p.enc = rad_enc_affine(RAD_U5, RAD_F16, 1, 128);
+    rad_enc_add_plane(&p.enc, "zero", RAD_U8, 1, 128);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
+    const int64_t rb = p.row_bytes(ic);
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k) {
+            const uint32_t q = st_mix32((uint32_t)(n * K + k) ^ 0x5eedu) & 31u;
+            const int64_t bit = k * 5;
+            uint8_t* b = p.data[(size_t)ic].data() + n * rb + (bit >> 3);
+            const uint32_t v = q << (bit & 7);
+            b[0] |= (uint8_t)(v & 0xFF);
+            if ((bit & 7) > 3) b[1] |= (uint8_t)(v >> 8);
+        }
+        for (int64_t g = 0; g < G; ++g) {
+            const uint32_t h = st_mix32((uint32_t)(n * G + g) ^ 0x2545u);
+            const float sc = 0.002f * (float)(1 + h % 40);
+            rad_store_f32(p.data[(size_t)is].data(), RAD_F16, n * G + g, sc);
+            p.data[(size_t)iz][(size_t)(n * G + g)] = (uint8_t)(8 + (h >> 8) % 20);
+        }
+    }
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128) };
+    std::vector<uint8_t> wq, ws;
+    const int rw = stored(r, lp, 2, p, { "codes" }, &wq);
+    const int rs = stored(r, lp, 3, p, { "scale", "zero" }, &ws);
+    if (rw != RAD_OK || rs != RAD_OK) {
+        ok(nm, false, "relayout rc " + std::to_string(rw) + "/" + std::to_string(rs));
+        return;
+    }
+    const int64_t PK = parts * K;
+    std::vector<uint16_t> ha((size_t)(M * PK));
+    std::vector<float> av((size_t)(M * PK));
+    for (int64_t i = 0; i < M; ++i)
+        for (int64_t k = 0; k < PK; ++k) {
+            const uint32_t h = st_mix32((uint32_t)(i * 0x10001 + k) ^ 0x3cu);
+            const float v = (float)((int)(h % 401) - 200) * 0.01f;
+            rad_store_f32(&ha[(size_t)(i * PK + k)], RAD_F16, 0, v);
+            av[(size_t)(i * PK + k)] = rad_load_f32(&ha[(size_t)(i * PK + k)], RAD_F16, 0);
+        }
+    std::vector<uint16_t> hy((size_t)(M * N), 0);
+    void* d_a = dalloc(ha.size() * 2);
+    void* d_w = dalloc(wq.size());
+    void* d_s = dalloc(ws.size());
+    void* d_y = dalloc(hy.size() * 2);
+    if (!d_a || !d_w || !d_s || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, ws.data(), ws.size(), hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = {
+        T(d_a, RAD_F16, { M, PK }), T(nullptr, RAD_F32, { 1 }),
+        T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_s, RAD_U8, { (int64_t)ws.size() }),
+        T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(nullptr, RAD_F32, { 1 }),
+    };
+    absent(ts[1]); absent(ts[5]); absent(ts[6]);
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                                 PS("dtype", "w5a16") };
+    if (pb1) ps.push_back(PI("pb1", pb1));
+    if (pb2) ps.push_back(PI("pb2", pb2));
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    const int rc = r->launch(&a, (RadStream) nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { ok(nm, false, "rc=" + std::to_string(rc)); return; }
+    st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+    const int64_t nstep = N > 96 ? N / 96 : 1;
+    double num = 0, den = 0;
+    for (int64_t i = 0; i < M; ++i)
+        for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
+            const int pt = part_of(n);
+            double acc = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                const double q = rad_load_f32(p.data[(size_t)ic].data() + n * rb, RAD_U5, k);
+                const double z = p.data[(size_t)iz][(size_t)(n * G + k / 128)];
+                const double sc = rad_load_f32(p.data[(size_t)is].data(), RAD_F16, n * G + k / 128);
+                acc += (double)av[(size_t)(i * PK + pt * K + k)] * (q - z) * sc;
+            }
+            const double d = (double)h_bf16(hy[(size_t)(i * N + n)]) - acc;
+            num += d * d;
+            den += acc * acc;
+        }
+    const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
+    char d[64];
+    std::snprintf(d, sizeof d, "rel_l2 %.3e", rel);
+    ok(nm, rel < 1e-2, d);
 }
 
 
@@ -12775,6 +12893,24 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\nthe ROTATED 4-bit expert format, against the f32 it "
                                  "approximates\n");
         moe_w4_rot(pl);
+    }
+
+    if (sel("gemm_w5a16_nt_m64")) {
+        if (!g_case) std::printf("\nParoQuant's 5-bit GEMM, against the planes' meaning\n");
+        w5a16_numeric(pl, 8, 272, 640);
+        w5a16_numeric(pl, 64, 400, 2560);
+        w5a16_numeric(pl, 5, 400, 640, 144);
+        w5a16_numeric(pl, 40, 512, 2560, 128, 384);
+        w5a16_numeric(pl, 300, 400, 640, 192);
+        w5a16_numeric(pl, 4, 34816, 5120, 17408);
+        w5a16_numeric(pl, 150, 5120, 17408);
+    }
+
+    if (sel("givens_rotate")) {
+        if (!g_case) std::printf("\nParoQuant's rotation to f16, against an f64 rotation\n");
+        givens_numeric(pl, 3, 5120, 1, 8, true);
+        givens_numeric(pl, 5, 5120, 2, 8, true);
+        givens_numeric(pl, 300, 6144, 2, 8, true);
     }
 
     if (sel("givens_quant_act_fp8")) {

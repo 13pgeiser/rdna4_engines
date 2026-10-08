@@ -363,6 +363,7 @@ spelling of `act`, not the vocabulary's.
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `givens_quant_act_fp8` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `q`, `scale` |
+| `givens_rotate` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `y` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
@@ -385,7 +386,7 @@ copies of the activation, written side by side -- `q` is `[M, parts * n]`, `scal
 `[M, parts * n / group]` -- and `pairs` and `angle` stack the parts' `stages` rows each, `rscale`
 one row a part. `gemm_nt_q` then takes `pb1` and `pb2`, the row bounds of the weight's parts: its
 rows `[0, pb1)`, `[pb1, pb2)` and `[pb2, N)` meet copy 0, 1 and 2, and `a`/`a_scale` are the wide
-planes. `pb1` absent is one part; `pb2` absent ends the second part at `N`. Only the `mxfp4a8` rows
+planes. `givens_rotate` is the same rotation with no quantiser, `y` in its own dtype (f16), for the 16-bit-activation weights `w5a16` (ParoQuant int5: u5 codes, an f16 scale and a u8 zero point a 128 of K) and `w4a16_asym` (z-lab's int4, the same at 4 bits); their GEMM serves any `M` (rows past 64 run as chunks of 64). `pb1` absent is one part; `pb2` absent ends the second part at `N`. Only the `mxfp4a8` rows
 read them, and the host rows that do not (`libavx`) refuse a call that names one rather than
 contract against the wrong copy.
 

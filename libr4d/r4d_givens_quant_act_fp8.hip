@@ -32,6 +32,7 @@
 #include "r4d_emit.h"
 #include "r4d_fp8_args.h"
 #include "r4d_fp8_wmma.h"
+#include <hip/hip_fp16.h>
 
 namespace {
 
@@ -57,6 +58,9 @@ __device__ __forceinline__ void wave_sync() {
 // spreads a row's `parts * nkb` groups over blocks of kWaves waves -- one group a wave, so a row is
 // several blocks and a decode step of a few rows still fills the part. A wave that has no group
 // returns at once; nothing in the kernel is a block barrier.
+// QUANT false is givens_rotate: the same rotation, no quantiser, the rotated row written as f16 into
+// `q` (read as a uint16 plane, y_ld elements a row) for a GEMM that reads a 16-bit activation.
+template <bool QUANT>
 __global__ __launch_bounds__(kThreads) void givens_quant_act_fp8_kernel(
     const uint16_t* __restrict__ x, const int32_t* __restrict__ pairs,
     const float* __restrict__ angle, const float* __restrict__ rscale, uint8_t* __restrict__ q,
@@ -122,6 +126,15 @@ __global__ __launch_bounds__(kThreads) void givens_quant_act_fp8_kernel(
 
     const float4 r = *(const float4*)(buf + lane * 4u);
     float v[4] = { r.x, r.y, r.z, r.w };
+    if constexpr (!QUANT) {
+        // f16 holds +-65504; a rotated post-norm row is orders below that, and the clamp keeps an
+        // outlier finite instead of inf
+        union { __half h[4]; uint2 u; } o;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o.h[j] = __float2half(fminf(fmaxf(v[j], -65504.0f), 65504.0f));
+        *(uint2*)((uint16_t*)q + (size_t)row * q_ld + (size_t)part * K + c0 + lane * 4u) = o.u;
+        return;
+    }
     float m = 0.0f;
 #pragma unroll
     for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[j]));
@@ -147,8 +160,8 @@ __global__ __launch_bounds__(kThreads) void givens_quant_act_fp8_kernel(
 //   s       [M][parts*K/128]     f32
 static int givens_quant_launch(long x, long pairs, long angle, long rscale, long q, long s, int M,
                                int K, int parts, int stages, int x_ld, int q_ld, int s_ld,
-                               const R4dSink& sk) {
-    if (!x || !pairs || !angle || !rscale || !q || !s) return -1;
+                               const R4dSink& sk, bool quant = true) {
+    if (!x || !pairs || !angle || !rscale || !q || (quant && !s)) return -1;
     if (M <= 0 || K <= 0 || parts <= 0 || stages <= 0) return -2;
     if (K % (int)kGroup) return -3;       // a rotation group cannot straddle the end of a row
     if (!x_ld) x_ld = K;
@@ -156,11 +169,17 @@ static int givens_quant_launch(long x, long pairs, long angle, long rscale, long
     if (!q_ld) q_ld = parts * K;
     if (!s_ld) s_ld = parts * nkb;
     const uint32_t gy = ((uint32_t)(parts * nkb) + kWaves - 1) / kWaves;
-    const int rc = R4D_EMIT(sk, givens_quant_act_fp8_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0,
-                            (const uint16_t*)x, (const int32_t*)pairs, (const float*)angle,
-                            (const float*)rscale, (uint8_t*)q, (float*)s, (uint32_t)K,
-                            (uint32_t)nkb, (uint32_t)parts, (uint32_t)stages, (uint32_t)x_ld,
-                            (uint32_t)q_ld, (uint32_t)s_ld);
+    const int rc = quant
+        ? R4D_EMIT(sk, givens_quant_act_fp8_kernel<true>, dim3((uint32_t)M, gy), dim3(kThreads), 0,
+                   (const uint16_t*)x, (const int32_t*)pairs, (const float*)angle,
+                   (const float*)rscale, (uint8_t*)q, (float*)s, (uint32_t)K,
+                   (uint32_t)nkb, (uint32_t)parts, (uint32_t)stages, (uint32_t)x_ld,
+                   (uint32_t)q_ld, (uint32_t)s_ld)
+        : R4D_EMIT(sk, givens_quant_act_fp8_kernel<false>, dim3((uint32_t)M, gy), dim3(kThreads), 0,
+                   (const uint16_t*)x, (const int32_t*)pairs, (const float*)angle,
+                   (const float*)rscale, (uint8_t*)q, (float*)s, (uint32_t)K,
+                   (uint32_t)nkb, (uint32_t)parts, (uint32_t)stages, (uint32_t)x_ld,
+                   (uint32_t)q_ld, (uint32_t)s_ld);
     if (rc != RAD_OK) return -4;
     return (!sk.desc && hipGetLastError() != hipSuccess) ? -4 : 0;
 }
@@ -170,16 +189,17 @@ extern "C" int r4d_givens_quant_act_fp8_group(void) { return (int)kGroup; }
 // ============================================================== the plugin ABI entry point
 enum { GV_X = 0, GV_PAIRS = 1, GV_ANGLE = 2, GV_RSCALE = 3, GV_Q = 4, GV_S = 5 };
 
-static int rad_givens_quant_act_fp8_body(const RadArgs* a, const R4dSink& sk) {
+static int givens_body(const RadArgs* a, const R4dSink& sk, bool quant) {
     const RadTensor* x  = r4d_opt(a, GV_X);
     const RadTensor* pr = r4d_opt(a, GV_PAIRS);
     const RadTensor* an = r4d_opt(a, GV_ANGLE);
     const RadTensor* rs = r4d_opt(a, GV_RSCALE);
     const RadTensor* q  = r4d_opt(a, GV_Q);
-    const RadTensor* sc = r4d_opt(a, GV_S);
-    if (!x || !pr || !an || !rs || !q || !sc) return R4D_NO(RAD_E_INVAL);
-    if (x->rank < 2 || q->rank != 2 || sc->rank != 2 || pr->rank != 2 || an->rank != 2 ||
+    const RadTensor* sc = quant ? r4d_opt(a, GV_S) : nullptr;
+    if (!x || !pr || !an || !rs || !q || (quant && !sc)) return R4D_NO(RAD_E_INVAL);
+    if (x->rank < 2 || q->rank != 2 || (quant && sc->rank != 2) || pr->rank != 2 || an->rank != 2 ||
         rs->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    if (!quant && q->dtype != RAD_F16) return R4D_NO(RAD_E_DTYPE);
     if (pr->dtype != RAD_I32 || an->dtype != RAD_F32 || rs->dtype != RAD_F32)
         return R4D_NO(RAD_E_DTYPE);
     // rows are dim 0 and everything after it is the row, as quant_act_fp8 reads them
@@ -189,18 +209,25 @@ static int rad_givens_quant_act_fp8_body(const RadArgs* a, const R4dSink& sk) {
     if (r4d_geti_or(a, "group", grp) != grp || K % grp || parts < 1 || stages < 1)
         return R4D_NO(RAD_E_SHAPE);
     if (q->shape[0] != M || q->shape[1] != parts * K) return R4D_NO(RAD_E_SHAPE);
-    if (sc->shape[0] != M || sc->shape[1] != parts * nkb) return R4D_NO(RAD_E_SHAPE);
+    if (quant && (sc->shape[0] != M || sc->shape[1] != parts * nkb)) return R4D_NO(RAD_E_SHAPE);
     // the tables are the weight's, contiguous: parts * stages rows of K pairs and K/2 angles
     if (pr->shape[0] != parts * stages || pr->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
     if (an->shape[0] != parts * stages || an->shape[1] != K / 2) return R4D_NO(RAD_E_SHAPE);
     if (rs->shape[0] != parts || rs->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_aligned(rs->data, 16) || !r4d_aligned(pr->data, 8) || !r4d_aligned(q->data, 4))
         return R4D_NO(RAD_E_ALIGN);
-    const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
+    const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = quant ? r4d_row_pitch(sc) : 0;
     if (xp < 0 || qp < 0 || sp < 0) return R4D_NO(RAD_E_STRIDE);
     const int e = givens_quant_launch(r4d_addr(x), r4d_addr(pr), r4d_addr(an), r4d_addr(rs),
                                       r4d_addr(q), r4d_addr(sc), (int)M, (int)K, (int)parts,
-                                      (int)stages, (int)xp, (int)qp, (int)sp, sk);
+                                      (int)stages, (int)xp, (int)qp, (int)sp, sk, quant);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
+static int rad_givens_quant_act_fp8_body(const RadArgs* a, const R4dSink& sk) {
+    return givens_body(a, sk, true);
+}
+static int rad_givens_rotate_body(const RadArgs* a, const R4dSink& sk) {
+    return givens_body(a, sk, false);
+}
 R4D_ENTRY(r4d_rad_givens_quant_act_fp8, rad_givens_quant_act_fp8_body)
+R4D_ENTRY(r4d_rad_givens_rotate, rad_givens_rotate_body)

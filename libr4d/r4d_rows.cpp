@@ -1062,6 +1062,13 @@ static const RadParamSpec pGivensQuantAct[] = {
     { "stages", RAD_P_INT, RAD_REQUIRED },
     { "parts",  RAD_P_INT, RAD_REQUIRED },
 };
+static const RadOperandSpec oGivensRotate[] = {
+    { "x",      RAD_OPD_IN,     0 },
+    { "pairs",  RAD_OPD_WEIGHT, 0 },
+    { "angle",  RAD_OPD_WEIGHT, 0 },
+    { "rscale", RAD_OPD_WEIGHT, 0 },
+    { "y",      RAD_OPD_OUT,    0 },
+};
 static const RadOperandSpec oGivensQuantAct[] = {
     { "x",      RAD_OPD_IN,     0 },
     { "pairs",  RAD_OPD_WEIGHT, 0 },
@@ -2324,6 +2331,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("had_quant_act_i8g", pQuantActFp8, oQuantActFp8,
            "quant_act_i8g with a `group`-wide Hadamard along K first; pairs with an i8 weight stored "
            "rotated, its scale carrying the residual factor of `group`."),
+    SCHEMA("givens_rotate", pGivensQuantAct, oGivensRotate,
+           "givens_quant_act_fp8 without the quantiser: y = x / rscale rotated by `stages` rounds of "
+           "Givens pairs, `parts` copies side by side ([M, parts * n]) in y's own dtype. For a weight "
+           "whose GEMM reads a 16-bit activation. `group` is the width a pair stays inside."),
     SCHEMA("givens_quant_act_fp8", pGivensQuantAct, oGivensQuantAct,
            "ParoQuant's activation quantiser: x is divided by the channel scale `rscale`, rotated by "
            "`stages` rounds of disjoint Givens pairs (a' = a cos t + b sin t, b' = b cos t - a sin t, "
@@ -2925,6 +2936,13 @@ static const RadConstraint cGemmNtTiled[] = {
 };
 static const RadConstraint cGemmNtW4[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a16"),
+};
+/* w5a16 serves any M: the dispatcher takes rows past 64 as chunks of 64. */
+static const RadConstraint cGemmNtW5[] = {
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w5a16"),
+};
+static const RadConstraint cGemmNtW4Asym[] = {
+    C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a16_asym"),
 };
 static const RadConstraint cGemmNtW2A8[] = {
     C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w2a8"),
@@ -4672,6 +4690,29 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_gemm_w4a16_m64, nullptr, r4d_rad_layout_w4, r4d_rad_relayout_w4,
   nullptr, r4d_rad_unrelayout_w4 },
 
+{ "gemm_w5a16_nt_m64", "gemm_nt_q", "gemm",
+  "skinny GEMM with a 5-bit asymmetric weight (ParoQuant int5), 16x16x16 f16 WMMA, split-K reduced "
+  "in LDS; rows past 64 in chunks of 64, a partitioned weight (pb1/pb2) one launch a part",
+  "N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order, a nibble "
+  "plane then a fifth-bit plane",
+  "f16 A (parts side by side), 5-bit W with an f16 scale and integer zero per 128 K, bf16 C, fp32 "
+  "accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtW5), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_w5a16_m64, nullptr, r4d_rad_layout_w5, r4d_rad_relayout_w5,
+  nullptr, nullptr },
+
+{ "gemm_w4a16_asym_nt_m64", "gemm_nt_q", "gemm",
+  "skinny GEMM with a 4-bit ASYMMETRIC weight (z-lab's ParoQuant int4), the 5-bit row's kernel with "
+  "no fifth-bit plane; rows past 64 in chunks of 64, a partitioned weight (pb1/pb2) one launch a part",
+  "N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order, unsigned nibbles",
+  "f16 A (parts side by side), 4-bit W with an f16 scale and integer zero per 128 K, bf16 C, fp32 "
+  "accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtW4Asym), ROW(tGemmSkinny), r4d_tune_valid_gemm,
+  nullptr, nullptr, r4d_rad_gemm_w4a16asym_m64, nullptr, r4d_rad_layout_w4, r4d_rad_relayout_w4,
+  nullptr, nullptr },
+
 { "gemm_w8a16_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with an 8-bit weight, 16x16x16 WMMA, split-K reduced in LDS",
   "M <= 64; N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order, "
@@ -5168,6 +5209,16 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_givens_quant_act_fp8, nullptr, r4d_rad_layout_givens_pairs,
   r4d_rad_relayout_givens_pairs, nullptr, r4d_rad_unrelayout_givens_pairs, nullptr,
   r4d_rad_givens_quant_act_fp8_describe },
+
+{ "givens_rotate", "givens_rotate", "quant",
+  "the channel scale and ParoQuant's Givens rotations, once for each rotated part, to f16",
+  "n a multiple of 128 and group 128: a rotation group cannot straddle the end of a row",
+  "bf16 in, f16 out, parts side by side; the tables are the weight's int32 pairs, f32 angles and "
+  "f32 channel scales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHadQuantActFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_givens_rotate, nullptr, nullptr, nullptr,
+  nullptr, nullptr, nullptr, r4d_rad_givens_rotate_describe },
 
 { "quant_act_i8g", "quant_act_i8g", "quant",
   "per-(row, 128-column) symmetric int8 quantisation of a bf16 activation",
