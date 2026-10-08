@@ -39,10 +39,13 @@ made knowingly.
 - `dtype` is always present and always a string. It names the **operand combination**, which is
   why a weight format and an activation format share one key: `bf16`, `f16`/`fp16`, `f32`/`fp32`,
   `fp8_e4m3`, `fp8a8`, `fp8a16`, `w4`, `w4a8`, `w4a8_asym`, `w4a8h`, `w8a8`, `w4a16`, `w8a16`,
-  `w2a8`, `mxfp4a8`. `w4a8h` is `w4a8` with a `group`-wide Walsh–Hadamard along K baked into the
-  stored weight (`docs/MOE-W4.md`), `w4a8_asym` the unsigned-nibble-minus-zero-point grid rather
-  than the symmetric one, and `fp8a8`/`fp8a16` say whether a block-scaled E4M3 weight is met by
-  an fp8 activation or a bf16 one. `q_dtype` and `kv_dtype` are the same key split in two where
+  `w2a8`, `mxfp4a8`, `w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`. `w4a8h` is `w4a8` with a
+  `group`-wide Walsh–Hadamard along K baked into the stored weight (`docs/MOE-W4.md`), `w4a8_asym`
+  the unsigned-nibble-minus-zero-point grid rather than the symmetric one, and `fp8a8`/`fp8a16` say
+  whether a block-scaled E4M3 weight is met by an fp8 activation or a bf16 one. `w5a16` and
+  `w4a16_asym` are ParoQuant's int5 and z-lab's int4 (u5 / u4 codes, an f16 scale and a u8 zero
+  point a 128 of K) against an f16 activation, and `w5a8i8` / `w4a8i8_asym` the same weights
+  against an int8 one with an f32 scale per (row, 128 of K). `q_dtype` and `kv_dtype` are the same key split in two where
   attention reads two formats at once.
 - `M` is the ranged parameter wherever a token count appears. **At most one ranged parameter per
   op** — that is what keeps `rad_issue` a single integer on the hot path.
@@ -387,9 +390,10 @@ copies of the activation, written side by side -- `q` is `[M, parts * n]`, `scal
 `[M, parts * n / group]` -- and `pairs` and `angle` stack the parts' `stages` rows each, `rscale`
 one row a part. `gemm_nt_q` then takes `pb1` and `pb2`, the row bounds of the weight's parts: its
 rows `[0, pb1)`, `[pb1, pb2)` and `[pb2, N)` meet copy 0, 1 and 2, and `a`/`a_scale` are the wide
-planes. `givens_rotate` is the same rotation with no quantiser, `y` in its own dtype (f16), for the 16-bit-activation weights `w5a16` (ParoQuant int5: u5 codes, an f16 scale and a u8 zero point a 128 of K) and `w4a16_asym` (z-lab's int4, the same at 4 bits); their GEMM serves any `M` (rows past 64 run as chunks of 64). `pb1` absent is one part; `pb2` absent ends the second part at `N`. Only the `mxfp4a8` rows
-read them, and the host rows that do not (`libavx`) refuse a call that names one rather than
-contract against the wrong copy.
+planes. `givens_rotate` is the same rotation with no quantiser, `y` in its own dtype (f16), for the 16-bit-activation weights `w5a16` and `w4a16_asym`; their GEMM serves any `M` (rows past 64 run as chunks of 64). `givens_quant_act_i8g` is the rotation with `quant_act_i8g`'s quantiser (scale `amax / 127` per `group`), for `w5a8i8` / `w4a8i8_asym`. `pb1` absent is one part; `pb2` absent ends the second part at `N`. The `mxfp4a8` rows and the
+asymmetric 4- and 5-bit rows (`w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`) read them, and the
+host rows that do not (`libavx`) refuse a call that names one rather than contract against the
+wrong copy.
 
 ### The int8 and gated fp8 fusions — device-only
 

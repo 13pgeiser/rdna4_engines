@@ -166,6 +166,7 @@ const Hooks nHc        { r4d_rad_layout_hc_e4m3, r4d_rad_relayout_hc_e4m3,
 const Hooks nMtp       { r4d_rad_layout_mtp_e4m3, r4d_rad_relayout_mtp_e4m3,
                        r4d_rad_unrelayout_mtp_e4m3 };
 const Hooks nW4        { r4d_rad_layout_w4, r4d_rad_relayout_w4, r4d_rad_unrelayout_w4 };
+const Hooks nW5        { r4d_rad_layout_w5, r4d_rad_relayout_w5, r4d_rad_unrelayout_w5 };
 const Hooks nW8a16     { r4d_rad_layout_w8a16, r4d_rad_relayout_w8a16, nullptr };
 const Hooks nW8a8      { r4d_rad_layout_w8a8, r4d_rad_relayout_w8a8, nullptr };
 const Hooks nW2        { r4d_rad_layout_w2a8, r4d_rad_relayout_w2a8, r4d_rad_unrelayout_w2a8 };
@@ -282,6 +283,34 @@ TEST(dense_int4_symmetric_and_asymmetric) {
                                  { { B, { "codes" } }, { BSCALE, { "scale", "zero" } } }),
                0x5854c2996f14a80eull);
     }
+}
+
+/* ParoQuant's int5: u5 codes as w4's nibble plane plus a fifth-bit plane, the (scale, zero) dwords
+ * of the asymmetric w4 grid -- read back exactly; and a zero point that is not a 5-bit code refused,
+ * since the int8 prefill kernel reads five bits of it where the f16 one reads the whole value. */
+TEST(dense_int5_asymmetric) {
+    NEED_LIBQUANT();
+    const int64_t N = 64, K = 256;
+    const std::vector<float> w = weight(N, K, 19, 1, 128);
+    Opts kp, g;
+    kp.i("N", N).i("K", K).s("dtype", "w5a16");
+    g.s("codes", "u5").s("zero", "u8").i("group", 128).s("scale", "f16");
+    golden("w5", stored("w5", nW5, kp, "rtn", g, "blk.0.ffn_up.weight", N, K, w,
+                        { { B, { "codes" } }, { BSCALE, { "scale", "zero" } } }),
+           0xb0b1f9d187cbf267ull);
+    const Quantised q = quantise(quantizer("rtn"), g, "x", N, K, w);
+    REQUIRE_EQ(q.status, RAD_OK);
+    std::vector<std::vector<uint8_t>> bufs;
+    Selection s = select(q, N, K, { "scale", "zero" }, &bufs);
+    std::memcpy(bufs[0].data(), q.planes[(size_t)s.sel[0]].data(), bufs[0].size());
+    std::memcpy(bufs[1].data(), q.planes[(size_t)s.sel[1]].data(), bufs[1].size());
+    bufs[1][3] = 32;
+    RadLayout L{};
+    REQUIRE_EQ(r4d_rad_layout_w5(kp.data(), kp.n(), BSCALE, &q.enc, s.sel.data(), s.t.data(),
+                                 (int)s.t.size(), &L), RAD_OK);
+    std::vector<uint8_t> dst((size_t)L.bytes);
+    CHECK_EQ(r4d_rad_relayout_w5(kp.data(), kp.n(), BSCALE, &q.enc, s.sel.data(), s.t.data(),
+                                 (int)s.t.size(), dst.data(), L.bytes), RAD_E_FORMAT);
 }
 
 TEST(dense_int8_for_the_f16_and_the_int8_kernel) {

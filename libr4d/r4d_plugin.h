@@ -399,6 +399,8 @@ int r4d_rad_layout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
                       const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
                         const RadTensor*, int, void*, int64_t);
+int r4d_rad_unrelayout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
+                          const void*, int64_t, const RadTensor*, int);
 int r4d_rad_layout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
                          const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,

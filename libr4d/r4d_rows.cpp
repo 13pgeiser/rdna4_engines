@@ -4711,7 +4711,7 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
   ROW(cGemmNtW5), ROW(tGemmSkinny), r4d_tune_valid_gemm,
   nullptr, nullptr, r4d_rad_gemm_w5a16_m64, nullptr, r4d_rad_layout_w5, r4d_rad_relayout_w5,
-  nullptr, nullptr },
+  nullptr, r4d_rad_unrelayout_w5 },
 
 { "gemm_w4a16_asym_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with a 4-bit ASYMMETRIC weight (z-lab's ParoQuant int4), the 5-bit row's kernel with "
@@ -4722,7 +4722,7 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
   ROW(cGemmNtW4Asym), ROW(tGemmSkinny), r4d_tune_valid_gemm,
   nullptr, nullptr, r4d_rad_gemm_w4a16asym_m64, nullptr, r4d_rad_layout_w4, r4d_rad_relayout_w4,
-  nullptr, nullptr },
+  nullptr, r4d_rad_unrelayout_w4 },
 
 { "gemm_w4a8i8_tiled", "gemm_nt_q", "gemm",
   "the 4-bit ASYMMETRIC weight x int8 activation GEMM for prefill row counts (z-lab's ParoQuant int4): "
@@ -4734,7 +4734,7 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
   ROW(cGemmNtW4A8I8), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_w4a8i8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
-  r4d_rad_layout_w4, r4d_rad_relayout_w4, nullptr, nullptr },
+  r4d_rad_layout_w4, r4d_rad_relayout_w4, nullptr, r4d_rad_unrelayout_w4 },
 
 { "gemm_w5a8i8_tiled", "gemm_nt_q", "gemm",
   "the 5-bit ASYMMETRIC weight x int8 activation GEMM for prefill row counts (ParoQuant int5): int8 "
@@ -4746,7 +4746,7 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
   ROW(cGemmNtW5A8I8), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_w5a8i8_tiled, r4d_rad_gemm_mxfp4a8_tiled_scratch,
-  r4d_rad_layout_w5, r4d_rad_relayout_w5, nullptr, nullptr },
+  r4d_rad_layout_w5, r4d_rad_relayout_w5, nullptr, r4d_rad_unrelayout_w5 },
 
 { "gemm_w8a16_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with an 8-bit weight, 16x16x16 WMMA, split-K reduced in LDS",

@@ -552,8 +552,8 @@ void Checkpoint::detect_import() {
         else if (qc("format").empty() && qc("bits") == "4" && qc("group_size") == "128")
             import_ = Import::ParoI4;       /* z-lab's own release: AWQ-packed int4, asymmetric */
         else
-            import_why_ = "ParoQuant here is not the int5-bitplane format with 5-bit codes in groups "
-                          "of 128, which is the one this reads";
+            import_why_ = "ParoQuant here is neither the int5-bitplane format (5-bit codes) nor z-lab's "
+                          "AWQ-packed int4, in groups of 128, which are the ones this reads";
     } else if (qm == "paroquant_mxfp4") {
         /* QUARK'S MXFP4 PLANES IN A ROTATED BASIS: e2m1 codes, an e8m0 exponent a 32 of K, and per
          * projection the learned Givens rotations (`pairs`, `theta`) and channel scales in groups

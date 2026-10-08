@@ -865,6 +865,42 @@ struct Planes {
     }
 };
 
+/* gemm_nt_q's `pb1`/`pb2` over N rows (ParoQuant): rows [0, e1), [e1, e2), [e2, N) meet copies 0, 1,
+ * 2 of the activation, side by side in a row; `parts` is how many copies there are. 0 leaves a
+ * bound out, as the kernels read it. */
+struct PartCut {
+    int64_t e1, e2;
+    int     parts;
+    PartCut(int64_t N, int64_t pb1, int64_t pb2)
+        : e1(pb1 > 0 ? std::min(pb1, N) : N),
+          e2(pb2 > 0 ? std::max(e1, std::min(pb2, N)) : N),
+          parts(e2 < N ? 3 : (e1 < N ? 2 : 1)) {}
+    int part_of(int64_t n) const { return (int)(n >= e1) + (int)(n >= e2); }
+};
+
+/* An ASYMMETRIC grid's planes for a [N, K] weight: `bits`-bit codes (a bit stream along K), an f16
+ * scale and a u8 zero point 0 .. 2^bits - 1 a 128 of K, drawn through st_mix32 of their coordinates. */
+static Planes asym_planes(int bits, int64_t N, int64_t K) {
+    Planes p;
+    p.enc = rad_enc_affine(bits == 4 ? RAD_U4 : RAD_U5, RAD_F16, 1, 128);
+    rad_enc_add_plane(&p.enc, "zero", RAD_U8, 1, 128);
+    p.size(N, K);
+    const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
+    const int64_t rb = p.row_bytes(ic), G = K / 128;
+    const uint32_t top = (1u << bits) - 1;
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k)
+            rad_store_code(p.data[(size_t)ic].data() + n * rb, p.enc.plane[ic].dtype, k,
+                           (int)(st_mix32((uint32_t)(n * K + k) ^ 0x5eedu) & top));
+        for (int64_t g = 0; g < G; ++g) {
+            const uint32_t h = st_mix32((uint32_t)(n * G + g) ^ 0x2545u);
+            rad_store_f32(p.data[(size_t)is].data(), RAD_F16, n * G + g, 0.002f * (float)(1 + h % 40));
+            p.data[(size_t)iz][(size_t)(n * G + g)] = (uint8_t)((h >> 8) & top);
+        }
+    }
+    return p;
+}
+
 /* The unnormalised Sylvester Walsh-Hadamard transform of `n` values, in place: (a + b) to the lower
  * index and (a - b) to the upper, the transform an "fwhtN" encoding names. H_n H_n = n I. */
 static void h_fwht(float* v, int64_t n) {
@@ -3609,10 +3645,8 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
     if (!sel(row)) return;
     /* PARTS (ParoQuant): the weight's rows [0, pb1), [pb1, pb2), [pb2, N) each meet their own copy
      * of the activation, the copies side by side in a row. `K` is one copy's width. */
-    const int64_t e1 = pb1 > 0 ? std::min(pb1, N) : N;
-    const int64_t e2 = pb2 > 0 ? std::max(e1, std::min(pb2, N)) : N;
-    const int parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
-    auto part_of = [&](int64_t n) { return (int)(n >= e1) + (int)(n >= e2); };
+    const PartCut cut(N, pb1, pb2);
+    const int parts = cut.parts;
     char nm[160];
     std::string ex;
     for (const RadParam& p : extra) ex += std::string(" ") + p.key + "=" + std::to_string(p.ival);
@@ -3713,7 +3747,7 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
     for (int64_t i = 0; i < M; ++i)
         for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
             double acc = 0;
-            const int pt = part_of(n);
+            const int pt = cut.part_of(n);
             for (int64_t k = 0; k < K; ++k) {
                 const double w = (double)rad_load_f32(p.data[(size_t)ic].data(), RAD_FP4E2M1, n * K + k) *
                                  (double)rad_load_f32(p.data[(size_t)is].data(), RAD_E8M0, n * nblk + k / 32);
@@ -3857,38 +3891,17 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
                           int64_t pb2 = 0) {
     const char* row = "gemm_w5a16_nt_m64";
     if (!sel(row)) return;
-    const int64_t e1 = pb1 > 0 ? std::min(pb1, N) : N;
-    const int64_t e2 = pb2 > 0 ? std::max(e1, std::min(pb2, N)) : N;
-    const int parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
-    auto part_of = [&](int64_t n) { return (int)(n >= e1) + (int)(n >= e2); };
+    const PartCut cut(N, pb1, pb2);
+    const int parts = cut.parts;
     char nm[160];
     std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d", row, (long long)M,
                   (long long)N, (long long)K, parts);
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
     const int64_t G = K / 128;
-    Planes p;
-    p.enc = rad_enc_affine(RAD_U5, RAD_F16, 1, 128);
-    rad_enc_add_plane(&p.enc, "zero", RAD_U8, 1, 128);
-    p.size(N, K);
+    const Planes p = asym_planes(5, N, K);
     const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
     const int64_t rb = p.row_bytes(ic);
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t k = 0; k < K; ++k) {
-            const uint32_t q = st_mix32((uint32_t)(n * K + k) ^ 0x5eedu) & 31u;
-            const int64_t bit = k * 5;
-            uint8_t* b = p.data[(size_t)ic].data() + n * rb + (bit >> 3);
-            const uint32_t v = q << (bit & 7);
-            b[0] |= (uint8_t)(v & 0xFF);
-            if ((bit & 7) > 3) b[1] |= (uint8_t)(v >> 8);
-        }
-        for (int64_t g = 0; g < G; ++g) {
-            const uint32_t h = st_mix32((uint32_t)(n * G + g) ^ 0x2545u);
-            const float sc = 0.002f * (float)(1 + h % 40);
-            rad_store_f32(p.data[(size_t)is].data(), RAD_F16, n * G + g, sc);
-            p.data[(size_t)iz][(size_t)(n * G + g)] = (uint8_t)(8 + (h >> 8) % 20);
-        }
-    }
     std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128) };
     std::vector<uint8_t> wq, ws;
     const int rw = stored(r, lp, 2, p, { "codes" }, &wq);
@@ -3938,7 +3951,7 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
     double num = 0, den = 0;
     for (int64_t i = 0; i < M; ++i)
         for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
-            const int pt = part_of(n);
+            const int pt = cut.part_of(n);
             double acc = 0;
             for (int64_t k = 0; k < K; ++k) {
                 const double q = rad_load_f32(p.data[(size_t)ic].data() + n * rb, RAD_U5, k);
@@ -4048,37 +4061,17 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
                             int64_t pb2 = 0) {
     const char* row = bits == 4 ? "gemm_w4a8i8_tiled" : "gemm_w5a8i8_tiled";
     if (!sel(row)) return;
-    const int64_t e1 = pb1 > 0 ? std::min(pb1, N) : N;
-    const int64_t e2 = pb2 > 0 ? std::max(e1, std::min(pb2, N)) : N;
-    const int parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
-    auto part_of = [&](int64_t n) { return (int)(n >= e1) + (int)(n >= e2); };
+    const PartCut cut(N, pb1, pb2);
+    const int parts = cut.parts;
     char nm[160];
     std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d", row, (long long)M,
                   (long long)N, (long long)K, parts);
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
     const int64_t G = K / 128;
-    Planes p;
-    p.enc = rad_enc_affine(bits == 4 ? RAD_U4 : RAD_U5, RAD_F16, 1, 128);
-    rad_enc_add_plane(&p.enc, "zero", RAD_U8, 1, 128);
-    p.size(N, K);
+    const Planes p = asym_planes(bits, N, K);
     const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
     const int64_t rb = p.row_bytes(ic);
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t k = 0; k < K; ++k) {
-            const uint32_t q = st_mix32((uint32_t)(n * K + k) ^ 0x5eedu) & ((1u << bits) - 1);
-            const int64_t bit = k * bits;
-            uint8_t* b = p.data[(size_t)ic].data() + n * rb + (bit >> 3);
-            const uint32_t v = q << (bit & 7);
-            b[0] |= (uint8_t)(v & 0xFF);
-            if ((bit & 7) > 3) b[1] |= (uint8_t)(v >> 8);
-        }
-        for (int64_t g = 0; g < G; ++g) {
-            const uint32_t h = st_mix32((uint32_t)(n * G + g) ^ 0x2545u);
-            rad_store_f32(p.data[(size_t)is].data(), RAD_F16, n * G + g, 0.002f * (float)(1 + h % 40));
-            p.data[(size_t)iz][(size_t)(n * G + g)] = (uint8_t)((h >> 8) % (1u << bits));
-        }
-    }
     std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", bits == 4 ? "w4a8i8_asym" : "w5a8i8") };
     std::vector<uint8_t> wq, ws;
     const int rw = stored(r, lp, 2, p, { "codes" }, &wq);
@@ -4136,18 +4129,14 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
     double num = 0, den = 0;
     for (int64_t i = 0; i < M; i += (M > 64 ? 3 : 1))
         for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
-            const int pt = part_of(n);
+            const int pt = cut.part_of(n);
             double acc = 0;
             for (int64_t g = 0; g < G; ++g) {
                 double grp = 0;
                 const double z = p.data[(size_t)iz][(size_t)(n * G + g)];
                 const double sc = rad_load_f32(p.data[(size_t)is].data(), RAD_F16, n * G + g);
                 for (int64_t k = g * 128; k < (g + 1) * 128; ++k) {
-                    const int64_t bit = k * bits;
-                    const uint8_t* rowp = p.data[(size_t)ic].data() + n * rb;
-                    uint32_t v = rowp[bit >> 3];
-                    if ((bit & 7) > 3) v |= (uint32_t)rowp[(bit >> 3) + 1] << 8;
-                    const double q = (v >> (bit & 7)) & ((1u << bits) - 1);
+                    const double q = rad_load_f32(p.data[(size_t)ic].data() + n * rb, p.enc.plane[ic].dtype, k);
                     grp += (double)av[(size_t)(i * PK + pt * K + k)] * (q - z);
                 }
                 acc += grp * sc * (double)as[(size_t)(i * PG + pt * G + g)];

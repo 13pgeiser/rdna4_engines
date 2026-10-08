@@ -327,6 +327,18 @@ void sz_write(const WGeom& g, const RadTensor* pl, int zfixed, uint32_t* sz) {
             }
 }
 
+/* Every zero point a code of `bits` bits: what an asymmetric grid's zero is, and what the int8
+ * prefill kernel reads back out of the scale dword (r4d_gemm_wpa8i8_tiled.hip takes five bits of it,
+ * where the f16 kernel takes the whole value -- a larger zero would make the two disagree). */
+bool sz_zeros_fit(const WGeom& g, const RadTensor& zp, int bits) {
+    const long long nz = g.N * (g.K / g.group);
+    for (long long i = 0; i < nz; ++i) {
+        const int z = zero_at(zp, i);
+        if (z < 0 || z >= (1 << bits)) return false;
+    }
+    return true;
+}
+
 void sz_read(const WGeom& g, const uint32_t* sz, const RadTensor* pl, bool asym) {
     const long long nt = g.N / R4D_NTILE, nsz = g.K / g.group;
     for (long long t = 0; t < nt; ++t)
@@ -416,6 +428,9 @@ extern "C" int r4d_rad_relayout_w4(const RadParam* p, int n_p, int operand, cons
     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
     std::memset(dst, 0, (size_t)dst_bytes);
     if (operand == Q_BSCALE) {
+        /* a ROTATED (ParoQuant) grid's zero is a 4-bit code */
+        if (w4_asym(p, n_p) && std::strncmp(enc->transform, "givens", RAD_ENC_STR) == 0 &&
+            !sz_zeros_fit(g, pl[1], 4)) return RAD_E_FORMAT;
         sz_write(g, pl, w4_asym(p, n_p) ? -1 : 8, (uint32_t*)dst);
         return RAD_OK;
     }
@@ -501,6 +516,7 @@ extern "C" int r4d_rad_relayout_w5(const RadParam* p, int n_p, int operand, cons
     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
     std::memset(dst, 0, (size_t)dst_bytes);
     if (operand == Q_BSCALE) {
+        if (!sz_zeros_fit(g, pl[1], 5)) return RAD_E_FORMAT;
         sz_write(g, pl, -1, (uint32_t*)dst);
         return RAD_OK;
     }
@@ -523,6 +539,35 @@ extern "C" int r4d_rad_relayout_w5(const RadParam* p, int n_p, int operand, cons
             hi[hw] |= (q >> 4) << (8 * s + e);
         }
     }
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_unrelayout_w5(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                     const int* sel, const void* src, int64_t src_bytes,
+                                     const RadTensor* pl, int n) {
+    RadLayout L;
+    WGeom g;
+    const int rc = w5_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes) return RAD_E_SHAPE;
+    if (operand == Q_BSCALE) {
+        sz_read(g, (const uint32_t*)src, pl, true);
+        return RAD_OK;
+    }
+    const uint32_t* wq = (const uint32_t*)src;
+    const uint32_t* hi = wq + g.N * g.K / 8;
+    const long long rb = (g.K * 5 + 7) / 8;
+    uint8_t* d = (uint8_t*)pl[0].data;
+    std::memset(d, 0, (size_t)(g.N * rb));
+    for (long long nn = 0; nn < g.N; ++nn)
+        for (long long k = 0; k < g.K; ++k) {
+            long long w;
+            int nib;
+            w4_slot(g, nn, k, &w, &nib);
+            const int e = nib % 2 == 0 ? nib / 2 : 4 + nib / 2;     /* as r4d_rad_relayout_w5 */
+            const uint32_t q = ((wq[w] >> (4 * nib)) & 15u) | (((hi[w / 4] >> (8 * (w % 4) + e)) & 1u) << 4);
+            rad_store_bits(d + nn * rb, 5, k, q);
+        }
     return RAD_OK;
 }
 

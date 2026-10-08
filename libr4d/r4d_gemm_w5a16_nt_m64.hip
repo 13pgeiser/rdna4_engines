@@ -76,54 +76,18 @@ __device__ __forceinline__ v8h fragA(r4d_gu2 p, int u) {
   return x.f;
 }
 
-// One dword of eight nibbles -> one 16x16x16 f16 B fragment, minus the zero point.
-// t0/t1 split the even and odd nibbles into bytes; each v_perm_b32 pairs two of those bytes with
-// the constant high byte 0x64, which is the f16 exponent field for 1024.  nz carries
-// -(1024 + zero) in BOTH halves so one v_pk_add_f16 corrects a pair.
-// The unpack is under a percent of this kernel at M=8, where it is at the DRAM roofline and the
-// arithmetic hides in the load latency. It is a real fraction at M=64, but that band belongs to
-// r4d_gemm_w4a8_nt_m64 -- and with no dequant at all the f16 form still trails the int8 one there,
-// because the gap is the matrix instruction and not the dequant. Nothing here is worth a knob.
-#ifndef R4D_GEMM_W4_TWOS
-#define R4D_GEMM_W4_TWOS 1
-#endif
-
 // DO NOT FOLD THE GROUP SCALE INTO THE B FRAGMENT.  One v_pk_mul_f16 per pair on the finished
 // integer q is exact in f16, removes the second accumulator array entirely and takes the M=64 shape
 // from 192 VGPRs to 135 -- and it is SLOWER on most of the drafter's shapes.  The multiply lands
 // inside the per-fragment dependent chain between the unpack and the WMMA, where the per-group
 // epilogue it replaces sits outside it; this kernel is stall-bound, not register-bound.
 
-__device__ __forceinline__ v8h dequant(unsigned w, __half2 nz) {
-  const unsigned K64 = 0x64646464u;
-#if R4D_GEMM_W4_TWOS
-  // The stored nibble is a 4-bit TWO'S COMPLEMENT code, because that is what
-  // r4d_gemm_w4a8_nt_m64 needs -- it shifts the nibble into the byte's high half and reads the
-  // byte signed.  This kernel wants OFFSET BINARY, so that 1024 + n minus the constant 1024 + 8
-  // is the value.  The two differ by bit 3 of the nibble, so one XOR per spread dword converts,
-  // and the zero point is then pinned to 8 for every group.  Two instructions per fragment, on
-  // the kernel whose whole unpack is a fraction of a percent of its time at M=8 -- which is why
-  // the conversion lives here and not in the int8 kernel, where the unpack is three instructions
-  // and does matter.  One quantised weight, two kernels, dispatched on M.
-  const unsigned t0 = (w & 0x0F0F0F0Fu) ^ 0x08080808u;
-  const unsigned t1 = ((w >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-#else
-  const unsigned t0 = w & 0x0F0F0F0Fu;
-  const unsigned t1 = (w >> 4) & 0x0F0F0F0Fu;
-#endif
-  union { unsigned u[4]; __half2 h2[4]; v8h f; } x;
-  x.u[0] = __builtin_amdgcn_perm(K64, t0, 0x05010400u);   // nibbles 0, 2
-  x.u[1] = __builtin_amdgcn_perm(K64, t0, 0x05030402u);   // nibbles 4, 6
-  x.u[2] = __builtin_amdgcn_perm(K64, t1, 0x05010400u);   // nibbles 1, 3
-  x.u[3] = __builtin_amdgcn_perm(K64, t1, 0x05030402u);   // nibbles 5, 7
-#pragma unroll
-  for (int i = 0; i < 4; i++) x.h2[i] = __hadd2(x.h2[i], nz);
-  return x.f;
-}
-
 // One dword of eight nibbles plus the byte of their fifth bits -> one 16x16x16 f16 B fragment,
 // minus the zero point.  Nibble 2e (e < 4) / 2(e-4)+1 is fragment element e, so bits 0..3 of `hb`
-// are the fifth bits of the even nibbles' elements and bits 4..7 the odd nibbles'.
+// are the fifth bits of the even nibbles' elements and bits 4..7 the odd nibbles'.  Each v_perm_b32
+// pairs two code bytes with the constant high byte 0x64, the f16 exponent field for 1024, so a half
+// is 1024 + code; nz carries -(1024 + zero) in BOTH halves, so one v_pk_add_f16 corrects a pair.
+// The codes are offset binary (0..31, or 0..15 without the fifth bit): no sign flip.
 __device__ __forceinline__ unsigned spread16(unsigned n) {      // 4 bits -> bit 4 of each byte
   return ((n * 0x00204081u) & 0x01010101u) << 4;
 }
@@ -288,18 +252,18 @@ void r4d_gemm_w5a16_nt_m64(long a, long wq, long whi, long wsz, long c, int M, i
   if (!lda) lda = K;
   if (!ldc) ldc = N;
   if (M < 1 || M > R4D_GEMM_W4_MAX_M)
-    throw std::runtime_error("r4d gemm_w4a16_nt_m64: M must be 1..64");
-  if (N % 16) throw std::runtime_error("r4d gemm_w4a16_nt_m64: N must be a multiple of 16");
+    throw std::runtime_error("r4d gemm_w5a16_nt_m64: M must be 1..64");
+  if (N % 16) throw std::runtime_error("r4d gemm_w5a16_nt_m64: N must be a multiple of 16");
   if (K % (SK * R4D_GEMM_W4_GROUP))
-    throw std::runtime_error("r4d gemm_w4a16_nt_m64: K must be divisible by SK*128");
-  if (WV * SK * WAVE32 > 1024) throw std::runtime_error("r4d gemm_w4a16_nt_m64: threads/block > 1024");
-  if (MB < 1 || MB > 4) throw std::runtime_error("r4d gemm_w4a16_nt_m64: MB must be 1..4");
-  if (NPW != 1 && NPW != 4) throw std::runtime_error("r4d gemm_w4a16_nt_m64: NPW must be 1 or 4");
+    throw std::runtime_error("r4d gemm_w5a16_nt_m64: K must be divisible by SK*128");
+  if (WV * SK * WAVE32 > 1024) throw std::runtime_error("r4d gemm_w5a16_nt_m64: threads/block > 1024");
+  if (MB < 1 || MB > 4) throw std::runtime_error("r4d gemm_w5a16_nt_m64: MB must be 1..4");
+  if (NPW != 1 && NPW != 4) throw std::runtime_error("r4d gemm_w5a16_nt_m64: NPW must be 1 or 4");
   const int ntiles = N / 16, mtiles = (M + 15) / 16;
   const int ncols = WV * NPW;
   dim3 grid((ntiles + ncols - 1) / ncols, (mtiles + MB - 1) / MB), block(WV * SK * WAVE32);
   size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
-  if (smem > 64 * 1024) throw std::runtime_error("r4d gemm_w4a16_nt_m64: WV*NPW*SK too large");
+  if (smem > 64 * 1024) throw std::runtime_error("r4d gemm_w5a16_nt_m64: WV*NPW*SK too large");
   auto Ap = (const unsigned short*)a;
   auto Wp = (const unsigned*)wq;
   auto Hp = (const unsigned*)whi;
@@ -316,7 +280,7 @@ void r4d_gemm_w5a16_nt_m64(long a, long wq, long whi, long wsz, long c, int M, i
     case 2: LAUNCH(2, NP, TT); break; \
     case 3: LAUNCH(3, NP, TT); break; \
     case 4: LAUNCH(4, NP, TT); break; \
-    default: throw std::runtime_error("r4d gemm_w4a16_nt_m64: MB unsupported"); }
+    default: throw std::runtime_error("r4d gemm_w5a16_nt_m64: MB unsupported"); }
   if (NPW == 1) {
     if (NT) { LAUNCH_MB(1, true); } else { LAUNCH_MB(1, false); }
   } else {

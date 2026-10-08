@@ -932,3 +932,100 @@ TEST(a_paroquant_int5_weight_is_relaid_row_by_row) {
     CHECK_EQ(bad, 0);
     remove_checkpoint(dir);
 }
+
+/* Z-LAB'S INT4 (`paroquant`, bits 4, no `format`): the int5 test's AWQ nibbles with no fifth-bit
+ * planes, here as a fused gate|up -- two pieces, each with its own rotation, so the weight carries
+ * two parts. Codes and zero points come out row by row per piece, and t.part ends each piece. */
+TEST(a_paroquant_int4_fused_weight_is_two_rotated_parts) {
+    const int64_t N = 32, K = 128, G = K / 128;
+    uint32_t rng = 4242;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    static const int kOrder[8] = { 0, 2, 4, 6, 1, 3, 5, 7 };
+    auto pack_awq = [&](const std::string& name, const std::vector<int>& v, int64_t rows) {
+        T t{ name, "I32", { rows, N / 8 }, {} };
+        t.bytes.assign((size_t)(rows * N / 8 * 4), 0);
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t n = 0; n < N; ++n) {
+                int j = 0;
+                while (kOrder[j] != n % 8) ++j;
+                uint32_t w;
+                uint8_t* p = t.bytes.data() + (r * (N / 8) + n / 8) * 4;
+                std::memcpy(&w, p, 4);
+                w |= (uint32_t)(v[(size_t)(n * rows + r)] & 15) << (4 * j);
+                std::memcpy(p, &w, 4);
+            }
+        return t;
+    };
+    auto f16s = [&](const std::string& name, std::vector<int64_t> shape, float v) {
+        T t{ name, "F16", shape, {} };
+        int64_t cnt = 1;
+        for (int64_t d : shape) cnt *= d;
+        const uint16_t h = rad_f32_to_f16(v);
+        for (int64_t i = 0; i < cnt; ++i) { t.bytes.push_back((uint8_t)(h & 0xff)); t.bytes.push_back((uint8_t)(h >> 8)); }
+        return t;
+    };
+    auto pairs = [&](const std::string& name, int shift) {
+        T t{ name, "I16", { 1, K }, {} };
+        for (int64_t i = 0; i < K; ++i) {
+            const int16_t v = (int16_t)((i ^ shift) % 128);
+            t.bytes.push_back((uint8_t)(v & 0xff));
+            t.bytes.push_back((uint8_t)(v >> 8));
+        }
+        return t;
+    };
+    std::vector<T> ts;
+    std::vector<int> code[2], zero[2];
+    const char* names[2] = { "g", "u" };
+    for (int p = 0; p < 2; ++p) {
+        code[p].resize((size_t)(N * K));
+        zero[p].resize((size_t)(N * G));
+        for (auto& c : code[p]) c = (int)(next() % 16);
+        for (auto& z : zero[p]) z = (int)(next() % 16);
+        const std::string b = names[p];
+        ts.push_back(pack_awq(b + ".qweight", code[p], K));
+        ts.push_back(pack_awq(b + ".qzeros", zero[p], G));
+        ts.push_back(f16s(b + ".scales", { G, N }, 0.01f * (float)(p + 1)));
+        ts.push_back(pairs(b + ".pairs", p + 1));                         // adjacent / next-but-one swaps
+        ts.push_back(f16s(b + ".theta", { 1, K / 2 }, 0.2f));
+        ts.push_back(f16s(b + ".channel_scales", { 1, K }, 1.25f));
+    }
+    const std::string dir = write_checkpoint(ts,
+        "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"paroquant\","
+        "\"bits\":4,\"group_size\":128,\"krot\":1}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ParoI4);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g.weight", "u.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.paro && w.imported);
+    CHECK_EQ(w.rows, 2 * N);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_U4);
+    CHECK_EQ(rad_enc_givens_parts(&w.enc), (int64_t)2);
+    std::vector<std::vector<uint8_t>> pl((size_t)w.enc.n_planes);
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr_ = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr_, &pc);
+        pl[(size_t)k].assign((size_t)(pr_ * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)) + 8, 0);
+        REQUIRE_EQ(ckpt_plane_rows(w, k, 0, pr_, pl[(size_t)k].data(), &why), RAD_OK);
+    }
+    const int64_t rb = rad_enc_row_bytes(RAD_U4, K);
+    int bad = 0;
+    for (int p = 0; p < 2; ++p)
+        for (int64_t n = 0; n < N; ++n) {
+            const int64_t r = p * N + n;
+            for (int64_t k = 0; k < K; ++k)
+                if ((int)rad_load_f32(pl[0].data() + r * rb, RAD_U4, k) != code[p][(size_t)(n * K + k)]) ++bad;
+            for (int64_t g = 0; g < G; ++g)
+                if (pl[2][(size_t)(r * G + g)] != zero[p][(size_t)(n * G + g)]) ++bad;
+        }
+    CHECK_EQ(bad, 0);
+    const int tpart = rad_enc_find(&w.enc, "t.part");
+    REQUIRE(tpart > 0);
+    const int32_t* ends = (const int32_t*)pl[(size_t)tpart].data();
+    CHECK_EQ(ends[0], (int32_t)N);
+    CHECK_EQ(ends[1], (int32_t)(2 * N));
+    remove_checkpoint(dir);
+}
