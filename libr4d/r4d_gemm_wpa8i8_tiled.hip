@@ -239,7 +239,7 @@ static void wpa8i8_launch(long at, long ascale, long wq, long whi, long wsz, lon
 }
 
 // ============================================================== the plugin ABI entry points
-// The row-major int8 activation is re-tiled into the op's scratch (one slab a part), then the GEMM
+// The row-major int8 activation is re-tiled into the op's scratch (one slab, the parts in turn), then the GEMM
 // reads it from there -- mxfp4a8_tiled's arrangement exactly, including a partitioned weight as
 // one launch per part over windows of the planes.
 template <int BITS>
@@ -258,11 +258,11 @@ static int wpa8i8_dispatch(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     if (as_group != 128) return R4D_NO(RAD_E_SHAPE);       // one scale a (row, 128): the slab
     const long long slab = r4d_mxfp4a8_tile_a_bytes((int)g.M, (int)g.K);
-    if (!a->scratch || a->scratch_bytes < slab * mp.n) return R4D_NO(RAD_E_INVAL);
+    if (!a->scratch || a->scratch_bytes < slab) return R4D_NO(RAD_E_INVAL);
     const long long kb = g.K / 128;
+    const long at = (long)(uintptr_t)a->scratch;
     for (int p = 0; p < mp.n; ++p) {
         const long long n0 = mp.n0[p], np = mp.n1[p] - mp.n0[p];
-        const long at = (long)(uintptr_t)a->scratch + (long)(p * slab);
         R4D_TRY("gemm_wpa8i8_tiled",
             r4d_mxfp4a8_tile_a(r4d_addr(g.a) + p * g.K, at, (int)g.M, (int)g.K, (long)(uintptr_t)s,
                                (int)(mp.lda ? mp.lda : g.K));

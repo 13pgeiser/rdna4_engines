@@ -764,11 +764,16 @@ struct LinearFP8 {
     /* THE ROTATION OF A ROTATED WEIGHT, declared: its tables as views of the weight's own planes, its
      * code planes (`givens_quant_act_fp8`: E4M3 and a scale) or, with `f16`, its single f16 plane
      * (`givens_rotate`, for a GEMM that reads a 16-bit activation), and the op in front of the
-     * GEMM. `cut` is the rows of each rotated part; *pb1/*pb2 come back as the GEMM's part bounds. */
+     * GEMM. `cut` is the rows of each rotated part; the GEMM's part bounds come back in pb1 and pb2. */
     int  declare_rotation(RadBuilder* b, Names& nm, const Geom& g, const char* base, const char* wn,
                           const RadEncoding& enc, int64_t N, int64_t K, RadWeightGroup grp,
                           const ActFP8& a, int64_t max_rows, const std::vector<int64_t>& cut,
                           bool f16, int64_t* pb1, int64_t* pb2);
+    /* gemm_nt_q over this weight, M in [lo, hi]. `pb1`/`pb2` go only to a weight with rotated
+     * parts, so a one-part op keeps the plain op's geometry -- the key the tune cache is read by. */
+    rad_op decl_gemm_q(RadBuilder* b, int64_t lo, int64_t hi, int64_t group, const char* dtype,
+                       int64_t pb1, int64_t pb2, std::initializer_list<rad_weight> wts,
+                       std::initializer_list<rad_buf> reads, rad_buf y) const;
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
               int64_t rows = 0) const;
     /* A SPAN PER STACKED ROW PART (rad_weight_shard_span_parts), in the weight's rows; the scale
@@ -873,6 +878,17 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc));
     reads_x = g.w_bf16 || plain || probed_i8 || rotated;
     return RAD_OK;
+}
+
+inline rad_op LinearFP8::decl_gemm_q(RadBuilder* b, int64_t lo, int64_t hi, int64_t group,
+                                     const char* dtype, int64_t pb1, int64_t pb2,
+                                     std::initializer_list<rad_weight> wts,
+                                     std::initializer_list<rad_buf> reads, rad_buf y) const {
+    const RadParam ps[] = { RAD_RANGE("M", lo, hi), RAD_INT("N", N), RAD_INT("K", K),
+                            RAD_INT("group", group), RAD_STR("dtype", dtype),
+                            RAD_INT("pb1", pb1), RAD_INT("pb2", pb2) };
+    const int n_ps = (int)(sizeof ps / sizeof ps[0]) - (rot_parts > 1 ? 0 : 2);
+    return rw(b, rad_decl_op(b, "gemm_nt_q", ps, n_ps, wts.begin(), (int)wts.size()), reads, { y });
 }
 
 inline int LinearFP8::declare_rotation(RadBuilder* b, Names& nm, const Geom& g, const char* base,
@@ -1093,20 +1109,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         ws = decl_view(b, nm.f("%s.scale", base), wn, "scale,zero", RAD_F16, { N, K },
                        RAD_ACCESS_PER_TOKEN, shard, grp);
         if (!w || !ws) return RAD_E_INVAL;
-        op = rot_parts > 1
-            ? rw(b, RAD_OP(b, "gemm_nt_q",
-                      RAD_PARAMS(RAD_RANGE("M", 1, band ? kSplit : hi), RAD_INT("N", N), RAD_INT("K", K),
-                                 RAD_INT("group", RAD_FP8_BLOCK),
-                                 RAD_STR("dtype", bits5 ? "w5a16" : "w4a16_asym"),
-                                 RAD_INT("pb1", pb1), RAD_INT("pb2", pb2)),
-                      RAD_WEIGHTS(w, ws)),
-                  { rot_q }, { y })
-            : rw(b, RAD_OP(b, "gemm_nt_q",
-                      RAD_PARAMS(RAD_RANGE("M", 1, band ? kSplit : hi), RAD_INT("N", N), RAD_INT("K", K),
-                                 RAD_INT("group", RAD_FP8_BLOCK),
-                                 RAD_STR("dtype", bits5 ? "w5a16" : "w4a16_asym")),
-                      RAD_WEIGHTS(w, ws)),
-                  { rot_q }, { y });
+        op = decl_gemm_q(b, 1, band ? kSplit : hi, RAD_FP8_BLOCK, bits5 ? "w5a16" : "w4a16_asym",
+                         pb1, pb2, { w, ws }, { rot_q }, y);
         if (!op) return RAD_E_INVAL;
         if (band) {
             /* THE PREFILL BAND: rows above the skinny kernel's ceiling rotate to int8 and meet the int8
@@ -1124,18 +1128,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                                          RAD_INT("stages", S), RAD_INT("parts", P)),
                               RAD_WEIGHTS(rot_pairs, rot_angle, rot_scale)),
                           { a.x }, { rot_q2, rot_s2 });
-            op2 = rot_parts > 1
-                ? rw(b, RAD_OP(b, "gemm_nt_q",
-                          RAD_PARAMS(RAD_RANGE("M", kSplit + 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", bits5 ? "w5a8i8" : "w4a8i8_asym"),
-                                     RAD_INT("pb1", pb1), RAD_INT("pb2", pb2)),
-                          RAD_WEIGHTS(w, ws)),
-                      { rot_q2, rot_s2 }, { y })
-                : rw(b, RAD_OP(b, "gemm_nt_q",
-                          RAD_PARAMS(RAD_RANGE("M", kSplit + 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", bits5 ? "w5a8i8" : "w4a8i8_asym")),
-                          RAD_WEIGHTS(w, ws)),
-                      { rot_q2, rot_s2 }, { y });
+            op2 = decl_gemm_q(b, kSplit + 1, hi, RAD_FP8_BLOCK, bits5 ? "w5a8i8" : "w4a8i8_asym",
+                              pb1, pb2, { w, ws }, { rot_q2, rot_s2 }, y);
             if (!op_rot2 || !op2) return RAD_E_INVAL;
         }
         return RAD_OK;
@@ -1224,16 +1218,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             RAD_ARCH_TRY(rad_weight_shard_span(b, ws, lo, hi));
             RAD_ARCH_TRY(rad_weight_shard_span(b, wref, lo, hi));
         }
-        /* ONE GEMM for both: a rotated weight reads its own rotated pair, a plain one the
-         * producer's. `pb1`/`pb2` (the last two params) go only to a weight with parts, so a one-part
-         * op keeps the plain op's geometry -- the key the tune cache is read by. */
-        const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
-        const RadParam ps[] = { RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                                RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8"),
-                                RAD_INT("pb1", pb1), RAD_INT("pb2", pb2) };
-        const int n_ps = (int)(sizeof ps / sizeof ps[0]) - (rot_parts > 1 ? 0 : 2);
-        op = rw(b, rad_decl_op(b, "gemm_nt_q", ps, n_ps, RAD_WEIGHTS(w, ws, wref)),
-                { paro ? rot_q : a.q, paro ? rot_s : a.s }, { y });
+        /* ONE GEMM for both: a rotated weight reads its own rotated pair, a plain one the producer's. */
+        op = decl_gemm_q(b, 1, max_rows > 0 ? max_rows : g.max_tok, RAD_MX_GROUP, "mxfp4a8", pb1, pb2,
+                         { w, ws, wref }, { paro ? rot_q : a.q, paro ? rot_s : a.s }, y);
         return op ? RAD_OK : RAD_E_INVAL;
     }
 

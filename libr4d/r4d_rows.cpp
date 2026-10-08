@@ -5254,8 +5254,9 @@ static const RadKernelInfo kKernels[] = {
   "scales",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cHadQuantActFp8), NOTUNE,
-  nullptr, nullptr, r4d_rad_givens_quant_act_i8g, nullptr, nullptr, nullptr,
-  nullptr, nullptr, nullptr, r4d_rad_givens_quant_act_i8g_describe },
+  nullptr, nullptr, r4d_rad_givens_quant_act_i8g, nullptr, r4d_rad_layout_givens_pairs,
+  r4d_rad_relayout_givens_pairs, nullptr, r4d_rad_unrelayout_givens_pairs, nullptr,
+  r4d_rad_givens_quant_act_i8g_describe },
 
 { "givens_rotate", "givens_rotate", "quant",
   "the channel scale and ParoQuant's Givens rotations, once for each rotated part, to f16",
@@ -5264,8 +5265,9 @@ static const RadKernelInfo kKernels[] = {
   "f32 channel scales",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cHadQuantActFp8), NOTUNE,
-  nullptr, nullptr, r4d_rad_givens_rotate, nullptr, nullptr, nullptr,
-  nullptr, nullptr, nullptr, r4d_rad_givens_rotate_describe },
+  nullptr, nullptr, r4d_rad_givens_rotate, nullptr, r4d_rad_layout_givens_pairs,
+  r4d_rad_relayout_givens_pairs, nullptr, r4d_rad_unrelayout_givens_pairs, nullptr,
+  r4d_rad_givens_rotate_describe },
 
 { "quant_act_i8g", "quant_act_i8g", "quant",
   "per-(row, 128-column) symmetric int8 quantisation of a bf16 activation",
