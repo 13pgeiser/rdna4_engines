@@ -427,10 +427,10 @@ int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
  * stage a' = a cos t + b sin t, b' = b cos t - a sin t in f32, then amax/448 per group. Not
  * bit-identical to the device on the angle: cos and sin of an f32 differ by an ulp between libm
  * and the GPU's. */
-int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) {
-    if (!have(a, 6)) return RAD_E_INVAL;
+static int givens_body(const RadArgs* a, bool quant) {
+    if (!have(a, quant ? 6 : 5)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *pr = &a->t[1], *an = &a->t[2], *sc = &a->t[3];
-    const RadTensor *q = &a->t[4], *s = &a->t[5];
+    const RadTensor *q = &a->t[4], *s = quant ? &a->t[5] : nullptr;
     const int64_t n = p_int(a, "n", 0), S = p_int(a, "stages", 0), P = p_int(a, "parts", 1);
     int64_t g = p_int(a, "group", 0);
     if (n <= 0 || S <= 0 || P <= 0 || (n & 1)) return RAD_E_SHAPE;
@@ -438,7 +438,7 @@ int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) {
     if (numel(pr) < P * S * n || numel(an) < P * S * (n / 2) || numel(sc) < P * n) return RAD_E_SHAPE;
     const int64_t rows = numel(x) / n;
     const int64_t ngrp = n / g;
-    if (rows <= 0 || numel(q) < rows * P * n || numel(s) < rows * P * ngrp) return RAD_E_SHAPE;
+    if (rows <= 0 || numel(q) < rows * P * n || (quant && numel(s) < rows * P * ngrp)) return RAD_E_SHAPE;
 
     // validated before the loop, because an OpenMP body cannot return
     for (int64_t i = 0; i < P * S * n; ++i) {
@@ -464,6 +464,10 @@ int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) {
                     buf[(size_t)ib] = vb * c - va * sn;
                 }
             }
+            if (!quant) {                       // givens_rotate: the rotated row, in q's dtype
+                for (int64_t k = 0; k < n; ++k) st_dt(q->dtype, q->data, qb + (p * n + k) * qs, buf[(size_t)k]);
+                continue;
+            }
             for (int64_t gi = 0; gi < ngrp; ++gi) {
                 const int64_t k0 = gi * g;
                 float amax = 0.0f;
@@ -485,6 +489,12 @@ int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+int ref_givens_quant_act_fp8(const RadArgs* a, RadStream) { return givens_body(a, true); }
+
+/* The same channel scale and rotations with NO quantiser: y = the rotated row in y's dtype, `parts`
+ * copies side by side. For a weight whose GEMM reads a 16-bit activation (w5a16). */
+int ref_givens_rotate(const RadArgs* a, RadStream) { return givens_body(a, false); }
 
 /* ---------------------------------------------------------------- the Gram accumulator
  *

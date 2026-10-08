@@ -836,6 +836,10 @@ int ref_givens_quant_act_fp8_shape(const RadParam*, int, int, RadOpdDesc*) {
     return RAD_E_UNSUPPORTED;
 }
 
+int ref_givens_rotate_shape(const RadParam*, int, int, RadOpdDesc*) {
+    return RAD_E_UNSUPPORTED;               /* a pairing cannot be drawn: see givens_quant_act_fp8 */
+}
+
 int ref_had_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

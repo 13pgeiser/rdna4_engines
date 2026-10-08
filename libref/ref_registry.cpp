@@ -206,6 +206,8 @@ static const RadOperandSpec oQuantFp8[]  = { OPD("x"), OUT("q"), OUT("scale") };
  * resolved, moved and placed with the weight they belong to. */
 static const RadParamSpec pGivensQuant[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
                                              P_INT("stages"), P_INT("parts") };
+static const RadOperandSpec oGivensRotate[] = { OPD("x"), WGT("pairs"), WGT("angle"), WGT("rscale"),
+                                                OUT("y") };
 static const RadOperandSpec oGivensQuant[] = { OPD("x"), WGT("pairs"), WGT("angle"), WGT("rscale"),
                                                OUT("q"), OUT("scale") };
 
@@ -809,6 +811,10 @@ static const RadOpSchema kSchemas[] = {
   "stages) of `pairs` and `angle` and row p of `rscale`: a fused projection's pieces were each "
   "rotated on their own. Only a weight stored with the \"givens\" transform reads the result; "
   "it is NOT quant_act_fp8's output in either direction." },
+{ "givens_rotate", ARR(pGivensQuant), ARR(oGivensRotate),
+  "givens_quant_act_fp8 without the quantiser: y = x / rscale rotated by `stages` rounds of Givens "
+  "pairs, `parts` copies side by side ([M, parts * n]) in y's own dtype. For a weight whose GEMM "
+  "reads a 16-bit activation. `group` is the width a pair stays inside." },
 { "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
   "A Walsh-Hadamard rotation of width `group` along n, then symmetric E4M3 per group: scale = "
   "amax(rotated) / 448, shaped [M, n/group] in f32. n must be a multiple of `group` -- a rotation "
@@ -1171,6 +1177,9 @@ SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_givens_rotate", "givens_rotate", "quant",
+       "channel scale and Givens rotations per part, in the output's dtype",
+       "float in, float out; int32 pairs, f32 angles and channel scales", ref_givens_rotate),
 SIMPLE("ref_givens_quant_act_fp8", "givens_quant_act_fp8", "quant",
        "channel scale and Givens rotations per part, then the block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; int32 pairs, f32 angles and channel scales",
