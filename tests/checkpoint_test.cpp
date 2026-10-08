@@ -834,3 +834,101 @@ TEST(a_paroquant_mxfp4_weight_carries_its_rotations_as_parts) {
     }
     remove_checkpoint(dir);
 }
+
+/* PAROQUANT INT5-BITPLANE: the low nibbles AWQ-packed along N (qweight [K, N/8], eight columns a
+ * word in the order 0,2,4,6,1,3,5,7), a fifth-bit plane (qweight_hi [K, N/32], bit n % 32) and the
+ * same two packings of the zero points. The logical [N, K] weight comes out as u5 codes (a bit
+ * stream along K), an f16 scale and a u8 zero a 128 of K, plus the rotation as `givens` tables. */
+TEST(a_paroquant_int5_weight_is_relaid_row_by_row) {
+    const int64_t N = 64, K = 256, G = K / 128;
+    uint32_t rng = 777;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    std::vector<int> code((size_t)(N * K)), zero((size_t)(N * G));
+    for (auto& c : code) c = (int)(next() % 32);
+    for (auto& z : zero) z = (int)(next() % 32);
+    static const int kOrder[8] = { 0, 2, 4, 6, 1, 3, 5, 7 };
+    auto pack_awq = [&](const std::vector<int>& v, int64_t rows) {       // v[n * rows + r] -> [rows, N/8]
+        T t{ "", "I32", { rows, N / 8 }, {} };
+        t.bytes.assign((size_t)(rows * N / 8 * 4), 0);
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t n = 0; n < N; ++n) {
+                int j = 0;
+                while (kOrder[j] != n % 8) ++j;
+                uint32_t w;
+                uint8_t* p = t.bytes.data() + (r * (N / 8) + n / 8) * 4;
+                std::memcpy(&w, p, 4);
+                w |= (uint32_t)(v[(size_t)(n * rows + r)] & 15) << (4 * j);
+                std::memcpy(p, &w, 4);
+            }
+        return t;
+    };
+    auto pack_hi = [&](const std::vector<int>& v, int64_t rows) {
+        T t{ "", "I32", { rows, N / 32 }, {} };
+        t.bytes.assign((size_t)(rows * N / 32 * 4), 0);
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t n = 0; n < N; ++n) {
+                uint32_t w;
+                uint8_t* p = t.bytes.data() + (r * (N / 32) + n / 32) * 4;
+                std::memcpy(&w, p, 4);
+                w |= (uint32_t)((v[(size_t)(n * rows + r)] >> 4) & 1) << (n % 32);
+                std::memcpy(p, &w, 4);
+            }
+        return t;
+    };
+    T qw = pack_awq(code, K), qwh = pack_hi(code, K), qz = pack_awq(zero, G), qzh = pack_hi(zero, G);
+    qw.name = "q.qweight"; qwh.name = "q.qweight_hi"; qz.name = "q.qzeros"; qzh.name = "q.qzeros_hi";
+    T sc{ "q.scales", "F16", { G, N }, {} };
+    for (int64_t i = 0; i < G * N; ++i) {
+        const uint16_t h = rad_f32_to_f16(0.01f * (float)(1 + next() % 50));
+        sc.bytes.push_back((uint8_t)(h & 0xff));
+        sc.bytes.push_back((uint8_t)(h >> 8));
+    }
+    T pr{ "q.pairs", "I16", { 2, K }, {} };
+    for (int64_t s = 0; s < 2; ++s)
+        for (int64_t i = 0; i < K; ++i) {
+            const int16_t v = (int16_t)(i % 128 ^ 1);                       // adjacent swap: a pairing
+            pr.bytes.push_back((uint8_t)(v & 0xff));
+            pr.bytes.push_back((uint8_t)(v >> 8));
+        }
+    T th{ "q.theta", "F16", { 2, K / 2 }, {} }, cs{ "q.channel_scales", "F16", { 1, K }, {} };
+    for (int64_t i = 0; i < 2 * K / 2; ++i) { const uint16_t h = rad_f32_to_f16(0.3f); th.bytes.push_back(h & 0xff); th.bytes.push_back(h >> 8); }
+    for (int64_t i = 0; i < K; ++i) { const uint16_t h = rad_f32_to_f16(1.5f); cs.bytes.push_back(h & 0xff); cs.bytes.push_back(h >> 8); }
+    const std::string dir = write_checkpoint(
+        { qw, qwh, qz, qzh, sc, pr, th, cs },
+        "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"paroquant\","
+        "\"bits\":5,\"group_size\":128,\"krot\":2,\"format\":\"int5-bitplane\"}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ParoI5);
+    Program prog;
+    prog.name_map.push_back(map("w", RAD_MAP_COPY, { "q.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "w", false, &w, &why), RAD_OK);
+    REQUIRE(w.paro && w.imported);
+    CHECK_EQ(w.rows, N);
+    CHECK_EQ(w.cols, K);
+    REQUIRE(rad_enc_valid(&w.enc));
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_U5);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_F16);
+    CHECK_EQ(w.enc.plane[2].dtype, (uint32_t)RAD_U8);
+    std::vector<std::vector<uint8_t>> pl((size_t)w.enc.n_planes);
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr_ = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr_, &pc);
+        pl[(size_t)k].assign((size_t)(pr_ * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)) + 8, 0);
+        REQUIRE_EQ(ckpt_plane_rows(w, k, 0, pr_, pl[(size_t)k].data(), &why), RAD_OK);
+    }
+    const int64_t rb = rad_enc_row_bytes(RAD_U5, K);
+    int bad = 0;
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k)
+            if ((int)rad_load_f32(pl[0].data() + n * rb, RAD_U5, k) != code[(size_t)(n * K + k)]) ++bad;
+        for (int64_t g = 0; g < G; ++g) {
+            if (pl[2][(size_t)(n * G + g)] != zero[(size_t)(n * G + g)]) ++bad;
+            if (std::memcmp(pl[1].data() + (n * G + g) * 2, sc.bytes.data() + (g * N + n) * 2, 2) != 0) ++bad;
+        }
+    }
+    CHECK_EQ(bad, 0);
+    remove_checkpoint(dir);
+}
