@@ -501,6 +501,18 @@ private:
      * also skips on a block-size mismatch. A bound like this lives in exactly one place; a second
      * copy is free to drift out of step with the first. */
     bool          hit_holes_draft_ = true;
+    /* DOES A HIT HOLE THE TRUNK ITSELF? hit_holes_draft_ is the drafter's guard, and draft_refill_
+     * repairs a drafter hole by recomputing the prompt's TAIL. A TRUNK group the cache does not
+     * index admits no such repair: the adopted blocks cover the cached groups only, while the
+     * windowed trunk layers read the positions below ctx_len this sequence never wrote — the KV of
+     * whoever held these blocks last. So a trunk hole refuses the hit outright.
+     *
+     * THE TRUNK IS WHICH GROUPS? The one a drafter borrows is bound at `base_layer` and above —
+     * the drafter's layers run after the trunk's (rad_bind_layer_kv at the drafter declare), so a
+     * group with a bound layer below meta.n_layers belongs to the trunk and a hit must cover it;
+     * a drafter's own group is the refill's business, not this clamp's. Read off the Program,
+     * which carries both the bindings and the trunk's layer count. */
+    bool          hit_holes_trunk_ = false;
     /* DRAFT REFILL. Where a hit leaves a hole in a WINDOWED block drafter's cache, the drafter is
      * declined until its window has slid past the hole, which on the follow-up turn of a chat --
      * the turn a prefix hit is for -- is most or all of the reply. So the hit is ended one window

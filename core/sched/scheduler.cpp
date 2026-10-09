@@ -87,6 +87,21 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  n_paged, pc->cached_groups().size(),
                  hit_holes_draft_ ? "LEAVES a hole in a drafter's own KV" : "leaves no hole");
     }
+    /* THE TRUNK'S SHARE of that question: a paged group a TRUNK layer reads (a bound layer below
+     * the trunk's layer count — a drafter borrows from base_layer and above) that the cache does
+     * not index. Its hole is not repairable by recomputing the tail; see scheduler.h. */
+    hit_holes_trunk_ = false;
+    for (size_t i = 0; i < prog.kv_groups.size(); ++i) {
+        if (kv->block_tokens((int32_t)i) <= 0) continue;
+        bool trunk = false;
+        for (int l : prog.kv_groups[i].layers) if (l < prog.meta.n_layers) { trunk = true; break; }
+        if (!trunk) continue;
+        const std::vector<int32_t>& cg = pc->cached_groups();
+        if (std::find(cg.begin(), cg.end(), (int32_t)i) == cg.end()) { hit_holes_trunk_ = true; break; }
+    }
+    if (hit_holes_trunk_)
+        RAD_INFO("prefix cache: a TRUNK paged group is not prefix-cached — a hit re-prefills, "
+                 "it cannot be capped");
     draft_refill_ = 0;
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
         hit_holes_draft_) {
@@ -963,6 +978,29 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * snapshot to resume from -- that is every recurrent layer continuing from whatever the
          * slot last held, and it reads as fluent text rather than as a failure. */
         if (reuse > 0 && has_linear_state_ && h.checkpoint_slot < 0) reuse = 0;
+
+        /* THE WINDOWED-GROUP CLAMP — a prefix hit on a model whose OWN (trunk) KV includes a
+         * paged group the cache does not index. prefix.cpp skips RAD_KV_WINDOW groups — their
+         * blocks below the window are recycled, so no block list describes them; the comment
+         * there says a hit "costs the sequences ... a windowed layer whose cache starts where
+         * the hit ended" — this is that cost in KV corruption. The adopted blocks cover the
+         * cached groups ONLY, while `used = ctx_len + n_tokens` (batch.cpp) makes every
+         * windowed trunk layer read the positions below ctx_len that this sequence NEVER WROTE
+         * — and grab_block's min-heap (kv.cpp) hands this sequence the very blocks the most
+         * recent tenant wrote. The model then attends to the PREVIOUS REQUEST'S KV as its own
+         * prefix: fluent text carrying the last request's CONTENT. Zero the reuse; the prefix
+         * re-prefills (windowed prefixes are small; the re-prefill is milliseconds).
+         *
+         * NOT the drafter's hole. A drafter's own group (bound at base_layer and above — see
+         * scheduler.h) is repaired by draft refill, which CAPS the hit so the recompute covers
+         * the drafter's window while the trunk reuses the rest; zeroing here would delete that
+         * design. The trunk's hole, which no tail-recompute can fix, is this clamp's own. */
+        if (reuse > 0 && hit_holes_trunk_) {
+            reuse = 0;
+            RAD_DEBUG("admit %llu: prefix hit %lld zeroed — a trunk paged group is not "
+                      "prefix-cached (windowed); re-prefilling", (unsigned long long)r.id,
+                      (long long)h.n_attn_tokens);
+        }
 
         /* Claim the cached blocks. Without this the hit is only an accounting entry: the sequence
          * would skip computing those tokens and then attend to blocks it does not own. adopt()
