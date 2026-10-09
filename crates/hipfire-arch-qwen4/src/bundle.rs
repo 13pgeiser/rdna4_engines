@@ -2485,7 +2485,8 @@ impl Qwen4Bundle {
     }
 
     /// Drop every session snapshot, pending ones included, releasing their
-    /// device buffers. No-op without a cache.
+    /// device buffers; with a disk tier attached, published snapshots are
+    /// demoted to disk instead of dropped. No-op without a cache.
     pub fn session_clear(&mut self, gpu: &mut Gpu) {
         if self.ep.is_some() {
             return self.ep_session_clear(gpu);
