@@ -131,22 +131,31 @@ RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
 
 # ----------------------------------------------------------------------------------------- rootfs
 FROM build AS rootfs
+# hfget.sh, which fetches the Hugging Face repo a --model id names, runs curl and jq, and curl needs
+# a CA bundle to reach the hub over TLS. Installed in this stage, not in `build`, so adding them does
+# not recompile the engine.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      curl jq ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 # The marker makes this stage, and so the shipped image, depend on the test stage.
 COPY --from=test /build/host-tests-passed /rootfs/opt/radiance/share/radiance/.host-tests-passed
 # Every library the binaries and plugins load, plus comgr, which the HIP runtime opens at run time
 # and cannot initialise a device without, goes into one directory the dynamic loader searches by
 # default: no ld.so.cache, no LD_LIBRARY_PATH. libdrm_amdgpu names the card from amdgpu.ids. A
-# static busybox provides the health check's wget and a shell for `docker exec`. docker/licenses.sh
+# static busybox provides the health check's wget and a shell for `docker exec`; curl, jq and the
+# CA bundle are hfget.sh's, and the bundle is ca-certificates' Mozilla set, which is the directory
+# named for it in the license list. docker/licenses.sh
 # traces each of those files to its package and records its license and source in
 # /usr/share/doc/THIRD-PARTY. Then every ELF file is resolved from inside the tree, so nothing can
 # depend on a library the image lacks.
 RUN set -e; R=/rootfs; L=$R/usr/lib/x86_64-linux-gnu; \
-    mkdir -p $L $R/lib64 $R/usr/bin $R/bin $R/usr/share/libdrm $R/data $R/tmp; \
+    mkdir -p $L $R/lib64 $R/usr/bin $R/bin $R/usr/share/libdrm $R/etc/ssl/certs $R/data $R/tmp; \
     chmod 1777 $R/tmp; \
     cp -a /stage/opt/radiance $R/opt/; \
     elves=$(find $R/opt/radiance -type f -exec sh -c 'head -c4 "$1" | grep -q ELF' _ {} \; -print); \
     strip --strip-unneeded $elves; \
-    libs=$(for f in $elves /opt/rocm/lib/libamd_comgr.so.3; do ldd "$f"; done \
+    libs=$(for f in $elves /usr/bin/curl /usr/bin/jq /opt/rocm/lib/libamd_comgr.so.3; do ldd "$f"; done \
            | awk '/=> \//{print $3} /^\t\/lib64\//{print $1}' | sort -u); \
     for lib in $libs; do \
       case "$lib" in */ld-linux-x86-64.so.2) cp -L "$lib" $R/lib64/ ;; *) cp -L "$lib" $L/ ;; esac; \
@@ -154,13 +163,18 @@ RUN set -e; R=/rootfs; L=$R/usr/lib/x86_64-linux-gnu; \
     cp -L /opt/rocm/lib/libamd_comgr.so.3 $L/; \
     cp /usr/share/libdrm/amdgpu.ids $R/usr/share/libdrm/; \
     cp /bin/busybox $R/usr/bin/busybox; ln -s /usr/bin/busybox $R/bin/sh; \
+    cp /usr/bin/curl /usr/bin/jq $R/usr/bin/; \
+    cp /etc/ssl/certs/ca-certificates.crt $R/etc/ssl/certs/; \
     sh /src/docker/licenses.sh $R $libs /opt/rocm/lib/libamd_comgr.so.3 \
-      /usr/share/libdrm/amdgpu.ids /bin/busybox; \
-    for f in $(cd $R && find opt/radiance usr/lib -type f -exec sh -c 'head -c4 "$1" | grep -q ELF' _ {} \; -print); do \
+      /usr/share/libdrm/amdgpu.ids /bin/busybox /usr/bin/curl /usr/bin/jq \
+      /usr/share/ca-certificates/mozilla; \
+    for f in $(cd $R && find opt/radiance usr/lib -type f -exec sh -c 'head -c4 "$1" | grep -q ELF' _ {} \; -print) \
+             usr/bin/curl usr/bin/jq; do \
       out=$(chroot $R /lib64/ld-linux-x86-64.so.2 --list "/$f" 2>&1) || { echo "$f: $out" >&2; exit 1; }; \
       if echo "$out" | grep -q 'not found'; then echo "$f: $out" >&2; exit 1; fi; \
     done; \
     chroot $R /opt/radiance/bin/radiance --help > /dev/null; \
+    chroot $R /usr/bin/curl --version > /dev/null; chroot $R /usr/bin/jq --version > /dev/null; \
     du -sh $R $L $R/opt/radiance
 
 # ---------------------------------------------------------------------------------------- runtime
