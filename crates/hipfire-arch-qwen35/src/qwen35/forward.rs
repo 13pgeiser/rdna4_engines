@@ -7181,6 +7181,21 @@ fn gfx1201_state_fusions_enabled(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_gfx1201()
 }
 
+/// Experimental gate: run the gfx1100-certified campaign fusions on a gfx1101
+/// device (same RDNA3 ISA, same wave32 WMMA; kernels compile for the runtime
+/// arch via --offload-arch). Set HIPFIRE_GFX1101_GFX1100_CAMPAIGN=1. NOT a
+/// certified path — diagnostic A/B only.
+fn gfx1101_campaign_gates_enabled(gpu: &Gpu) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    gpu.arch_caps.is_gfx1101()
+        && *ENABLED.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_GFX1101_GFX1100_CAMPAIGN")
+                .ok()
+                .as_deref()
+                == Some("1")
+        })
+}
+
 fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
     config.dim == 2_048
         && config.n_heads == 16
@@ -7282,7 +7297,7 @@ pub(crate) fn gated_norm_mq_rotate_enabled(
         // 128), dim 2560. The kernel is grid-agnostic in n_heads (2 heads per
         // 64-thread block); the dim term only scopes certification.
         // Certified 2026-08-21: greedy text parity + 3 fresh-process E2E pairs.
-        || (gpu.arch_caps.is_gfx1100() && config.dim == 2_560 && n_v_heads == 32)
+        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu)) && config.dim == 2_560 && n_v_heads == 32)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
             && super::config::qwen36_27b_dense_shape(config, n_v_heads));
     enabled
@@ -7309,7 +7324,7 @@ fn qwen35_fa_kvwrite_fold_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
             == Some("1")
     });
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 4
         && config.head_dim == 256
@@ -7340,7 +7355,7 @@ pub(crate) fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         // Qwen3.5-4B (gfx1100): 16Q/4K, head_dim 256, n_rot 64. The kernel
         // derives K workgroups from the grid (head_slot - NQ) and the host
         // launches NQ + n_kv workgroups, so 4 K heads need no kernel change.
-        || (gpu.arch_caps.is_gfx1100()
+        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
             && config.n_heads == 16
             && config.n_kv_heads == 4)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
@@ -7376,7 +7391,7 @@ pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &
         // (grid = n_heads) and the tile pass is shared with the non-gated
         // flash path 4B already runs, so 4 K heads need no kernel change.
         // Certified 2026-08-21: greedy text parity + 3 fresh-process E2E pairs.
-        || (gpu.arch_caps.is_gfx1100()
+        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
             && config.n_heads == 16
             && config.n_kv_heads == 4)
         || (gpu.arch_caps.is_gfx1100()
@@ -7422,7 +7437,7 @@ pub(crate) fn qkvza_scalar_prep_enabled(
     });
     let dtype = wqkv.gpu_dtype;
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
         && gdn_compact2_enabled(gpu, config, n_v_heads, quant)
         && wqkv.k == 2_048
         && w_beta.m == n_v_heads
@@ -7465,7 +7480,7 @@ pub(crate) fn conv_scalar_prep_enabled(
     };
     let shape = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
         && n_v_heads <= 256
         && shape.as_deref().is_none_or(|v| v == "b256")
         && conv_qknorm_enabled(gpu, config, quant)
@@ -7475,6 +7490,7 @@ pub(crate) fn conv_qknorm_enabled(gpu: &Gpu, config: &Qwen35Config, quant: State
     let mode = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM").ok();
     let arch_enabled = (gpu.arch_caps.is_gfx1201()
         || gpu.arch_caps.arch() == "gfx1100"
+        || gfx1101_campaign_gates_enabled(gpu)
         || gfx1151_radiowave_fusions_enabled(gpu))
         && mode.as_deref() != Some("0");
     arch_enabled && quant == StateQuant::Q8 && config.linear_key_head_dim == 128
