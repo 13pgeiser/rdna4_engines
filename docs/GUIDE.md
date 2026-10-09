@@ -719,6 +719,24 @@ step, so a decode step queued behind one waits longer — but the prefill it is 
 finishes sooner, and that is the larger term. Four decoders with a long prompt landing beside
 them finished in 29.5 s at a 2048 chunk against 31.9 s at 512.
 
+**Nor does a long prefill lock out the work behind it** (`--busy-prefill-chunk`, default `auto`).
+A chunk used to take every token the step had left, so for the whole of a long prompt's prefill —
+a minute or more at 256K — a decode row behind it in the batch got no rows and a request that
+arrived was not even admitted: a mostly-cached turn that needed a few hundred tokens waited for
+somebody else's prompt to finish. Now, when other work is pending in a step, the chunk leaves it
+room: one row plus the draft window for every decode row behind it, and a share of the budget
+(an eighth, at least one quantum) for each prefill behind it and for the next request waiting to
+start. It never drops under the smallest step the prefill stager overlaps (1025 tokens by
+default), because under that every routed layer reads its pooled experts synchronously and the
+prefill slows far more than the shared step saves; and where holding a chunk back for a waiting
+request or another prefill would leave a short remainder before the checkpoint boundary, the
+interval is split into two staged halves instead. Decode rows alone only take their few tokens: the
+chunk ends a quantum short of the boundary and the next step finishes it, the same pair of steps a
+prefill already runs when decode rows are ahead of it. A prompt with nothing beside it is planned exactly as before. `off` restores the old
+behaviour; `--busy-prefill-chunk N` holds a shared chunk to N tokens (the startup line warns when
+N is under the stager's step). `radiance:engine_prefill_chunks_capped_total` counts the chunks
+held back.
+
 **And check it did not cost you the prefix cache.** The arena it grows is charged before the
 split (§4.3), so the KV pool shrinks a little — here 516,864 → 499,920 pool tokens, 3.3% — and
 §4.3's cliff is sharp enough that 3% is worth confirming rather than assuming. On this shape it
@@ -1028,6 +1046,7 @@ one line naming each one the command line moved.
 | flag | default | |
 |---|---|---|
 | `--max-num-batched-tokens N` | 8192 | largest token count one step may carry |
+| `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows behind it and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
 | `--rope-scaling SPEC` | — | `yarn:FACTOR[:ORIG]`: static YaRN over the container's own rotary keys, no reconvert; `none` takes a checkpoint's YaRN off ([YARN.md](YARN.md)) |

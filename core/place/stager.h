@@ -71,6 +71,10 @@ public:
 
     bool    enabled() const { return !layers_.empty(); }
     int64_t buffer_bytes() const { return cap_; }
+    /* The smallest pass (in tokens) the stager arms for: a step under it reads every pooled
+     * expert of a routed layer synchronously. The scheduler keeps a held-back prefill chunk at
+     * or above it (Scheduler::set_stage_rows). */
+    int64_t min_rows() const { return min_rows_; }
     size_t  n_layers() const { return layers_.size(); }
 
     bool begin_pass(const RadBatch* b) override;

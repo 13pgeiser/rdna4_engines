@@ -294,6 +294,7 @@ public:
         o.steps_prefill = m.steps_prefill;  o.steps_mixed = m.steps_mixed;
         o.steps_decode = m.steps_decode;
         o.steps_ahead = m.steps_ahead;
+        o.prefill_chunks_capped = m.prefill_chunks_capped;
         o.decode_rows_unspeculated = m.decode_rows_unspeculated;
         o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
         return o;

@@ -46,6 +46,11 @@ struct SchedMetrics {
      * commit and staging with the card idle, so steps_ahead against steps is how much of the run
      * kept the card fed through the host's part of it. */
     int64_t steps_ahead = 0;
+    /* PREFILL CHUNKS HELD BACK for other work in the same step (--busy-prefill-chunk): each is a
+     * chunk that would have taken more of the step and left decode rows behind it, or a request
+     * waiting to be admitted, with nothing. Zero under `off`, and on a load that never overlaps a
+     * prefill with anything else. */
+    int64_t prefill_chunks_capped = 0;
 
     /* HOW LONG THE ENGINE SPENT INSIDE A STEP, cumulative nanoseconds, and the decode half of it
      * separately. Neither is a derived rate -- they are counters, and that is the point.

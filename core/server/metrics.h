@@ -144,6 +144,7 @@ private:
     /* STEPS BY SHAPE, and the decode rows a mixed step cost speculation. Exposed as counters so
      * two scrapes give the rate over a window rather than a number dominated by startup. */
     Counter c_steps_prefill_, c_steps_mixed_, c_steps_decode_, c_rows_unspec_, c_steps_ahead_;
+    Counter c_prefill_capped_;
     /* SECONDS SPENT INSIDE A STEP, and the decode half of it. A step time is not wall clock over
      * a step count -- SchedMetrics::step_ns says why -- and without these every scraper has to
      * assume a saturated window and no prefill in it. */

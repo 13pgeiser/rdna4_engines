@@ -1561,6 +1561,223 @@ TEST(a_running_prefill_does_not_suppress_the_draft) {
     CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
 }
 
+/* ================================================================== a prefill sharing a step */
+/* --busy-prefill-chunk. The shape that starves: the checkpoint interval as large as the step
+ * budget, so a long prefill's chunk can take the whole step every step. Here 512 and 512, the
+ * quantum 64; the sequence is long enough for many full chunks. */
+static void share_fixture(Fixture& f, int64_t mode) {
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 512;
+    f.cfg.busy_prefill_chunk = mode;
+}
+
+/* What 1.3.0 did, and `off` still does: once the long prefill owns the step, a request that
+ * arrives is not even admitted until it ends. */
+TEST(off_a_long_prefill_keeps_a_new_request_out_of_every_step) {
+    Fixture f;
+    share_fixture(f, /*off=*/0);
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);
+    f.commit_plain();
+    uint64_t b = f.submit(100, 64);
+    for (int k = 0; k < 4; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.plan().e.size(), 1);
+        CHECK_EQ(f.sch.plan().e[0].seq, a);
+        CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);
+        f.commit_plain();
+    }
+    CHECK_EQ(f.sch.metrics().queue_depth, 1);
+    CHECK(f.sch.find(b) != nullptr);
+    CHECK_EQ(f.sch.metrics().prefill_chunks_capped, 0);
+}
+
+/* auto: the same arrival is admitted in the very next step, and its prompt finishes in two. */
+TEST(auto_a_request_arriving_during_a_long_prefill_is_admitted_at_once) {
+    Fixture f;
+    share_fixture(f, /*auto=*/-1);
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);       /* alone: the whole step, as before */
+    f.commit_plain();
+    uint64_t b = f.submit(100, 64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.plan().e.size(), 2);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
+    int64_t a_tok = 0, b_tok = 0;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq == a) a_tok = e.n_tokens;
+        if (e.seq == b) b_tok = e.n_tokens;
+    }
+    CHECK(a_tok >= 64 && a_tok % 64 == 0);
+    CHECK(b_tok > 0);
+    CHECK(a_tok + b_tok <= 512);
+    CHECK_EQ(f.sch.metrics().prefill_chunks_capped, 1);
+    f.commit_plain(11);
+    /* b's 100 tokens are done by the next step and it decodes beside the prefill from then on */
+    for (int k = 0; k < 4; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        bool saw_b = false;
+        for (const StepEntry& e : f.sch.plan().e) if (e.seq == b) saw_b = true;
+        CHECK(saw_b);
+        f.commit_plain(12);
+    }
+    CHECK((int)f.sch.find(b)->output.size() >= 2);
+}
+
+/* A decode row BEHIND a long prefill in running_ (the prefill outranks it) is planned every step
+ * under auto; under off it is left out of every step that begins on an interval boundary. */
+static int decode_rows_seen(int64_t mode) {
+    Fixture f;
+    share_fixture(f, mode);
+    CHECK_OK(f.start());
+    uint64_t b = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);            /* b's whole prompt: it decodes from the next step */
+    f.commit_plain(11);
+    f.submit(3500, 64, /*priority=*/1);        /* outranks b: walked first */
+    int seen = 0;
+    for (int k = 0; k < 8; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        for (const StepEntry& e : f.sch.plan().e) if (e.seq == b && !e.is_prefill) ++seen;
+        f.commit_plain(12);
+    }
+    return seen;
+}
+
+TEST(auto_a_decode_row_behind_a_long_prefill_gets_every_step) {
+    CHECK_EQ(decode_rows_seen(-1), 8);
+    CHECK(decode_rows_seen(0) < 8);
+}
+
+/* Nothing else wants in: the cap does not apply, and a lone prefill is planned chunk for chunk
+ * as before -- which is what keeps every single-request gate unchanged. */
+TEST(auto_a_lone_prefill_is_planned_as_before) {
+    std::vector<int32_t> plans[2];
+    for (int m = 0; m < 2; ++m) {
+        Fixture f;
+        share_fixture(f, m == 0 ? 0 : -1);
+        CHECK_OK(f.start());
+        f.submit(3000, 4);
+        for (int k = 0; k < 10; ++k) {
+            if (!f.sch.step()) break;
+            plans[m].push_back(f.sch.plan().e[0].n_tokens);
+            f.commit_plain();
+        }
+        CHECK_EQ(f.sch.metrics().prefill_chunks_capped, 0);
+    }
+    CHECK(plans[0] == plans[1]);
+}
+
+/* An explicit N holds the chunk to N while something waits. */
+TEST(an_explicit_busy_prefill_chunk_holds_the_chunk_to_it) {
+    Fixture f;
+    share_fixture(f, 128);
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);       /* alone */
+    f.commit_plain();
+    f.submit(100, 64);
+    CHECK(f.sch.step() != nullptr);
+    for (const StepEntry& e : f.sch.plan().e)
+        if (e.seq == a) CHECK_EQ(e.n_tokens, 128);
+}
+
+/* The arithmetic, at the shape of a real deployment: a 2048-token step and interval, the stager
+ * arming at 1025 tokens (so a held-back chunk keeps 1024 and its step-mates make up the rest). */
+TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
+    f.cfg.checkpoint_interval = 2048;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025);
+    /* nothing reserved: the budget */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 0), 2048);
+    /* a little reserved at an interval boundary: 2048 - 272 would leave a 272-token runt before
+     * the boundary, so the interval splits in two staged halves instead */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 272), 1024);
+    /* half way to the boundary the rest of the interval already fits under the cap */
+    CHECK(f.sch.busy_cap(1024, 100000, 2048, 272) >= 1024);
+    CHECK_EQ(f.sch.plan_chunk(1024, 100000, f.sch.busy_cap(1024, 100000, 2048, 272), nullptr), 1024);
+    /* more reserved than the floor allows for: the floor */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 1500), 1024);
+    /* a prompt's last stretch, shorter than the cap: all of it */
+    CHECK_EQ(f.sch.plan_chunk(0, 1500, f.sch.busy_cap(0, 1500, 2048, 272), nullptr), 1500);
+    /* a budget already under the floor: never more than the budget */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 512, 64), 512);
+    /* decode rows alone behind it (2 rows x (1 + 3 drafts)): no split -- the chunk ends a quantum
+     * short of the boundary (1984) and the next step takes the remaining 64, the pair a prefill
+     * already runs with decode rows AHEAD of it */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8, false, /*rows_only=*/true), 2040);
+    CHECK_EQ(f.sch.plan_chunk(0, 100000, f.sch.busy_cap(0, 100000, 2048, 8, false, true), nullptr), 1984);
+    /* the same reserve with a share in it splits the interval */
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1024);
+}
+
+/* The share left for a request that then does not start (here its context is still being read
+ * back from the host tier) goes back to the chunk that made room for it: the step is planned as
+ * if nothing had waited. */
+TEST(auto_a_share_nobody_takes_goes_back_to_the_prefill) {
+    Fixture f;
+    share_fixture(f, -1);
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    uint64_t b = f.submit(100, 64);
+    f.pc.reading.push_back(b);
+    CHECK(f.sch.step() != nullptr);
+    REQUIRE_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK_EQ(f.sch.plan().e[0].seq, a);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);
+    CHECK_EQ(f.sch.metrics().prefill_chunks_capped, 0);
+    CHECK_EQ(f.sch.metrics().queue_depth, 1);
+}
+
+/* An explicit N also holds a chunk back for rows planned AHEAD of it -- the operator's trade of
+ * prefill speed for every other row's latency; auto leaves those alone. */
+TEST(an_explicit_busy_prefill_chunk_applies_to_rows_ahead_auto_does_not) {
+    for (int64_t mode : { (int64_t)-1, (int64_t)128 }) {
+        Fixture f;
+        share_fixture(f, mode);
+        CHECK_OK(f.start());
+        uint64_t b = f.submit(100, 512, /*priority=*/1);   /* outranks the prefill: planned first */
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        uint64_t a = f.submit(3500, 64, /*priority=*/0);
+        CHECK(f.sch.step() != nullptr);                    /* b decodes, a is admitted behind it */
+        f.commit_plain(12);
+        int64_t most = 0; bool saw_b = true;
+        for (int k = 0; k < 3; ++k) {
+            CHECK(f.sch.step() != nullptr);
+            bool here = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == a) most = std::max<int64_t>(most, e.n_tokens);
+                if (e.seq == b) here = true;
+            }
+            saw_b = saw_b && here;
+            f.commit_plain(12);
+        }
+        CHECK(saw_b);
+        if (mode > 0) CHECK_EQ(most, 128);
+        else          CHECK(most > 128);
+    }
+}
+
+TEST(busy_cap_is_the_budget_when_off) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.busy_prefill_chunk = 0;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025);
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 272), 2048);
+    CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 1500), 2048);
+}
+
 TEST(the_draft_depth_is_the_configured_one_whatever_the_acceptance_trace) {
     DraftController c;
     DraftController::Params p;

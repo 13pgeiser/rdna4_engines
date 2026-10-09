@@ -56,6 +56,9 @@ static const Flag g_flags[] = {
                                         "asks the driver, on requires peer access and stops without\n"
                                         "it, off exchanges through pinned host memory" },
     { "--max-num-batched-tokens", "N",  "the largest token count one step may carry" },
+    { "--busy-prefill-chunk", "MODE",   "a prefill chunk's share of a step that has other work: auto\n"
+                                        "(default) leaves decode rows and new requests their room,\n"
+                                        "off takes the whole step, N holds the chunk to N tokens" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
@@ -404,6 +407,18 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--tp-wire-min-kb"))        { if (!(v = need(i))) return RAD_E_INVAL; c->tp_wire_min_kb = atoll(v); }
         else if (S("--max-num-batched-tokens")){ if (!(v = need(i))) return RAD_E_INVAL; c->max_tok = atoll(v); }
+        else if (S("--busy-prefill-chunk")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* end = nullptr;
+            const long long n = std::strtoll(v, &end, 10);
+            if      (!std::strcmp(v, "auto")) c->busy_prefill_chunk = -1;
+            else if (!std::strcmp(v, "off"))  c->busy_prefill_chunk = 0;
+            else if (end && end != v && *end == '\0' && n > 0) c->busy_prefill_chunk = n;
+            else {
+                RAD_ERR("--busy-prefill-chunk takes auto, off or a positive token count, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--max-num-seqs"))          { if (!(v = need(i))) return RAD_E_INVAL; c->max_seqs = atoll(v); }
         else if (S("--max-model-len"))         { if (!(v = need(i))) return RAD_E_INVAL; c->max_ctx = atoll(v); }
         else if (S("--rope-scaling")) {

@@ -163,6 +163,7 @@ void Metrics::sample(const SchedMetrics& m) {
     c_steps_mixed_.inc(std::max(0.0, (double)m.steps_mixed - c_steps_mixed_.get()));
     c_steps_decode_.inc(std::max(0.0, (double)m.steps_decode - c_steps_decode_.get()));
     c_steps_ahead_.inc(std::max(0.0, (double)m.steps_ahead - c_steps_ahead_.get()));
+    c_prefill_capped_.inc(std::max(0.0, (double)m.prefill_chunks_capped - c_prefill_capped_.get()));
     c_rows_unspec_.inc(std::max(0.0,
         (double)m.decode_rows_unspeculated - c_rows_unspec_.get()));
     c_step_secs_.inc(std::max(0.0, (double)m.step_ns * 1e-9 - c_step_secs_.get()));
@@ -332,6 +333,10 @@ std::string Metrics::render() const {
     w.counter("radiance:engine_steps_ahead_total",
               "Steps whose forward pass was issued behind the step before, ahead of its commit.",
               L, c_steps_ahead_.get());
+    w.counter("radiance:engine_prefill_chunks_capped_total",
+              "Prefill chunks held back so decode rows and waiting requests got into the step "
+              "(--busy-prefill-chunk).",
+              L, c_prefill_capped_.get());
     w.counter("radiance:decode_rows_unspeculated_total",
               "Decode rows that took no draft, for any reason.",
               L, c_rows_unspec_.get());

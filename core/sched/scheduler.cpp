@@ -777,6 +777,97 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
     return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
 
+/* ------------------------------------------------------------------ a prefill sharing a step */
+void Scheduler::set_stage_rows(int64_t rows) {
+    stage_rows_ = rows > 0 ? rows : 0;
+    const int64_t n = cfg_.busy_prefill_chunk;
+    if (n == 0) {
+        RAD_INFO("scheduler: --busy-prefill-chunk off: a prefill chunk takes every token the step "
+                 "has left, so decode rows behind it and requests waiting to start get none until "
+                 "it ends");
+        return;
+    }
+    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+    if (n > 0) {
+        RAD_INFO("scheduler: --busy-prefill-chunk %lld: a prefill chunk sharing a step with other "
+                 "work takes at most %lld tokens of it", (long long)n, (long long)(n / Q * Q));
+        if (stage_rows_ > 0 && n < stage_rows_)
+            RAD_WARN("scheduler: --busy-prefill-chunk %lld is under the %lld-token step the prefill "
+                     "stager overlaps at: a held-back chunk alone reads every routed layer's "
+                     "pooled experts synchronously, which slows a long prefill far more than the "
+                     "smaller step saves", (long long)n, (long long)stage_rows_);
+        return;
+    }
+    RAD_INFO("scheduler: --busy-prefill-chunk auto: a prefill chunk sharing a step leaves decode "
+             "rows and waiting requests their room and keeps at least %lld tokens%s",
+             (long long)std::max(Q, stage_rows_ / Q * Q),
+             stage_rows_ > 0 ? " (the prefill stager's smallest pass)" : "");
+}
+
+/* HOW MUCH OF THE STEP A PREFILL CHUNK MAY TAKE WHEN OTHER WORK WANTS IN.
+ *
+ * Without a cap the running loop hands a prefill row every token the step has left
+ * (plan_chunk(..., budget)). On a step budget of a few thousand tokens and a prompt of a few
+ * hundred thousand, that is every step for a minute or more, and in that time a decode row behind
+ * the prefill in running_ gets nothing (`want > budget` -> break) and admission never runs
+ * (`budget > 0`): a mostly-cached turn that needs a few hundred tokens waits for the whole of
+ * somebody else's prefill. The cap leaves `reserve` -- the rows behind it and a share for
+ * admission, worked out by step() -- and never goes under the floor.
+ *
+ * THE FLOOR is the smallest step the prefill stager overlaps (rounded down to the quantum: the
+ * rows the chunk shares the step with make up the difference). A step under it reads every
+ * routed layer's pooled experts synchronously, and on an expert-tiered placement that costs a
+ * long prefill far more than the shared step saves -- a budget set one token under the threshold
+ * measured -65 % prefill (#61). With no stager the floor is one quantum.
+ *
+ * AND THE REST OF THE INTERVAL STAYS ABOVE IT. A chunk ends on the checkpoint interval
+ * (plan_chunk), so a chunk held short of the boundary leaves a remainder that is the next step's
+ * whole chunk. Held to `budget - reserve`, that remainder is the size of the reserve -- a few
+ * hundred tokens, under the floor, and the slowest step of all. When the cap would leave such a
+ * remainder the interval is split into two chunks each at or above the floor instead: two staged
+ * steps, each with room for the rest of the step's work. */
+int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget,
+                            int64_t reserve, bool shared, bool rows_only) const {
+    const int64_t mode = cfg_.busy_prefill_chunk;
+    if (mode == 0 || budget <= 0) return budget;
+    /* auto holds a chunk back only for work that would otherwise get NOTHING this step -- rows
+     * behind it, a request waiting to start. Rows already planned ahead of it are in the step
+     * whatever the chunk takes, so auto leaves the chunk alone for them (it was never what
+     * starved them). An explicit N is the operator trading prefill speed for the latency of every
+     * other row, so it applies whenever the chunk shares the step at all. */
+    if (reserve <= 0 && !(mode > 0 && shared)) return budget;
+    reserve = std::max<int64_t>(reserve, 0);
+    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+
+    int64_t cap = budget - reserve;
+    if (mode > 0) {
+        /* The operator's number. No floor: --busy-prefill-chunk N under the stager's step is a
+         * choice set_stage_rows warns about, not one this overrides. */
+        cap = std::min(cap, mode);
+    } else {
+        const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
+        cap = std::max(cap, floor);
+        const int64_t remaining = n_target - n_computed;
+        int64_t span = remaining;                       /* where this run of chunks must end */
+        if (geo_.checkpoints()) {
+            const int64_t I = geo_.checkpoint_interval;
+            span = std::min(span, ((n_computed / I) + 1) * I - n_computed);
+        }
+        /* ...but not for decode rows alone. Their reserve is a few tokens, the chunk ends a
+         * quantum short of the boundary and the next step finishes the interval: the same pair of
+         * steps a prefill already runs whenever decode rows are planned AHEAD of it, so it adds
+         * no step shape the engine does not already pay for. Halving instead would hold a long
+         * prompt to half-interval chunks for as long as any request decodes behind it -- measured
+         * as the larger cost (NOTES: prefill-share run 2). The split is for a share (a request
+         * waiting to start, another prefill), which lasts a step or two. */
+        if (!rows_only && cap < span && span - cap < floor && span - floor >= floor)
+            cap = span - floor;
+    }
+    cap = std::min(cap, budget);
+    cap = std::max(cap, Q);
+    return std::min(cap, budget);
+}
+
 /* ------------------------------------------------------------------ preemption */
 void Scheduler::preempt_back() {
     int32_t slot = running_.back();
@@ -810,7 +901,7 @@ void Scheduler::preempt_back() {
 /* Admission checks the KV budget BEFORE a request enters running. A request admitted without the
  * blocks to run it is a request that will be preempted on its first step, which costs a full
  * recompute for nothing. */
-int Scheduler::admit_one(SchedReq& s, int64_t budget) {
+int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     Request& r = *s.req;
 
     if (!kv_->has_sequence(r.id)) RAD_TRY(kv_->add_sequence(r.id));
@@ -902,7 +993,13 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget) {
 
     int64_t target = s.seq_len();
     int64_t ckpt = -1;
-    int64_t want = plan_chunk(r.n_computed, target, budget, &ckpt);
+    /* AN ADMISSION SHARES THE STEP THE SAME WAY. A cold prompt admitted with requests queued
+     * behind it would otherwise take every token left, and the queue behind it would wait a step
+     * for nothing; the hit above is known by now, so the cap is on what really has to run. */
+    const int64_t cap = r.embed ? budget   /* whole input or nothing: never held back (below) */
+                                : busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
+    int64_t want = plan_chunk(r.n_computed, target, cap, &ckpt);
+    if (cap < budget && want > 0) admit_full_ = plan_chunk(r.n_computed, target, budget, nullptr);
     /* The whole input or nothing this step (Request::embed): the next step starts with a whole
      * budget, and add_locked refused an input no budget holds. */
     if (r.embed && want < target - (int64_t)r.n_computed) want = 0;
@@ -1002,6 +1099,31 @@ const RadBatch* Scheduler::step() {
      * alone rather than as anything failing. */
     const int depth = draft_.next_depth();
 
+    /* WHAT ELSE WANTS INTO THIS STEP, for --busy-prefill-chunk (busy_cap). The rows still to be
+     * walked -- each decode row's 1 + the deepest window it can take, each prefill row a share --
+     * and one share when a request is waiting and a sequence slot is free for it. Counted down as
+     * the loop walks, so a row's reserve is what is BEHIND it. No allocation: two counters. */
+    const bool share_step = cfg_.busy_prefill_chunk != 0;
+    const int64_t share_tok = std::max<int64_t>(std::max<int64_t>(geo_.quantum, 1),
+                                                cfg_.max_tok / 8 / std::max<int64_t>(geo_.quantum, 1)
+                                                    * std::max<int64_t>(geo_.quantum, 1));
+    const int64_t dec_row_tok = 1 + std::max<int64_t>(depth, draft_.step_window());
+    int64_t behind_dec = 0, behind_pf = 0;
+    if (share_step) {
+        for (int32_t slot : running_) {
+            const Request& rr = *reqs_[(size_t)slot]->req;
+            const int64_t tg = reqs_[(size_t)slot]->seq_len();
+            const bool pf = (rr.n_computed < (int64_t)rr.prompt.size()) || (rr.n_computed + 1 < tg);
+            if (pf) ++behind_pf; else behind_dec += dec_row_tok;
+        }
+    }
+    const bool admit_waits = share_step && !waiting_.empty() && !free_cards_.empty() &&
+                             (int64_t)running_.size() < cfg_.max_seqs;
+    /* The first prefill chunk held back this step (its index in plan_.e before the sort) and what
+     * it would have taken: whatever the work it made room for did not use goes back to it. */
+    int32_t capped_at = -1;
+    int64_t capped_full = 0;
+
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: a request already holding blocks is served before a new one is let in,
      * because the alternative is admitting work that then preempts work already half done. */
@@ -1015,11 +1137,27 @@ const RadBatch* Scheduler::step() {
         const int64_t target = s.seq_len();
         const bool prefill = (r.n_computed < (int64_t)r.prompt.size()) ||
                              (r.n_computed + 1 < target);
+        if (share_step) {
+            if (prefill) behind_pf = std::max<int64_t>(0, behind_pf - 1);
+            else         behind_dec = std::max<int64_t>(0, behind_dec - dec_row_tok);
+        }
 
         int64_t ckpt = -1;
         int64_t want;
         if (prefill) {
-            want = plan_chunk(r.n_computed, target, budget, &ckpt);
+            const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
+            const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
+            const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),
+                                         /*rows_only=*/shares == 0);
+            want = plan_chunk(r.n_computed, target, cap, &ckpt);
+            if (cap < budget && want > 0 && capped_at < 0) {
+                const int64_t full = plan_chunk(r.n_computed, target, budget, nullptr);
+                if (want < full) { capped_at = (int32_t)plan_.e.size(); capped_full = full; }
+            }
+            /* A PREFILL WITH NO ROOM LEFT DOES NOT STOP THE WALK. Under a quantum of budget it can
+             * take nothing this step, but a decode row behind it needs only 1 + its window -- so
+             * it is passed over rather than ending the loop (off keeps the old `break`). */
+            if (want <= 0 && share_step) { ++i; continue; }
         } else {
             /* A verify step is 1 + n_draft query rows, which is why attention kernels take a
              * query length rather than assuming one (spec §10). */
@@ -1187,9 +1325,21 @@ const RadBatch* Scheduler::step() {
              * behind it is asked, exactly as for a context still being read off disk; the engine
              * runs the encoder before the next step (encodes_pending). */
             if (s.req->media && !media_ready(s)) { ++at; continue; }
-            const int as = admit_one(s, budget);
+            /* One share left for the next request in the queue, when there is one and a slot
+             * for it (busy_cap). The embed path takes a whole input or nothing, so it is not
+             * held back: a share could only turn its admission into a refusal. */
+            const int64_t areserve =
+                share_step && !s.req->embed && at + 1 < waiting_.size() &&
+                (int64_t)plan_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
+                    ? share_tok : 0;
+            admit_full_ = 0;
+            const int as = admit_one(s, budget, areserve);
             if (as == kAdmitWait) { ++at; continue; }
             if (as < 0) break;                     /* head of line: do not admit behind it */
+            if (admit_full_ > s.sched_tokens && capped_at < 0) {
+                capped_at = (int32_t)plan_.e.size();
+                capped_full = admit_full_;
+            }
 
             Request& r = *s.req;
             StepEntry e;
@@ -1241,6 +1391,43 @@ const RadBatch* Scheduler::step() {
             }
             waiting_.resize(w);
         }
+    }
+
+    /* WHAT THE HELD-BACK CHUNK LEFT FOR OTHERS AND THEY DID NOT TAKE GOES BACK TO IT. The reserve
+     * is a forecast: a decode row drafts less than its window, an admission is refused (the pool
+     * is short, the head of the queue waits on a read), a step preempts and skips admission. A
+     * chunk held to the stager's floor in a step that then carries nothing else is a pass under
+     * the threshold -- exactly the slow step the floor exists to avoid -- so the unused budget is
+     * handed back, as far as the chunk's own geometry allows (plan_chunk) and only if the pool
+     * grants the blocks without a preemption; otherwise the chunk stays as planned. */
+    if (capped_at >= 0) {
+        StepEntry& e = plan_.e[(size_t)capped_at];
+        const Request& r = *e.req;
+        SchedReq& s = *reqs_[(size_t)e.slot];
+        const int64_t had = e.n_tokens;
+        /* An explicit --busy-prefill-chunk N is a ceiling the operator chose, not a forecast:
+         * the chunk grows back to it at most. */
+        int64_t limit = std::min(capped_full, had + budget);
+        if (cfg_.busy_prefill_chunk > 0) limit = std::min(limit, std::max(had, cfg_.busy_prefill_chunk));
+        int64_t ckpt = -1;
+        const int64_t grown = e.ckpt_slot < 0 && limit > had
+            ? plan_chunk(r.n_computed, s.seq_len(), limit, &ckpt) : had;
+        if (grown > had && kv_->ensure(r.id, r.n_computed + grown) >= 0) {
+            e.n_tokens = (int32_t)grown;
+            e.produces_token = (r.n_computed + grown >= s.seq_len());
+            if (ckpt > 0) {
+                int32_t cs = -1;
+                if (pc_->reserve_checkpoint(r, ckpt, &cs) >= 0 && cs >= 0) {
+                    e.ckpt_tok = (int32_t)(grown - 1);
+                    e.ckpt_slot = cs;
+                    ++m_.checkpoints_written;
+                }
+            }
+            s.sched_tokens = (int32_t)grown;
+            plan_.n_tok += grown - had;
+            budget -= grown - had;
+        }
+        if (e.n_tokens < capped_full) ++m_.prefill_chunks_capped;
     }
 
     if (plan_.e.empty()) return nullptr;

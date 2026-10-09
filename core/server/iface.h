@@ -132,6 +132,7 @@ struct SchedMetrics {
     int64_t steps_mixed = 0;
     int64_t steps_decode = 0;
     int64_t steps_ahead = 0;          /* issued behind the step before, ahead of its commit */
+    int64_t prefill_chunks_capped = 0; /* held back for other work in the step (--busy-prefill-chunk) */
     int64_t decode_rows_unspeculated = 0;
     /* WHAT THE STEPS COST: cumulative nanoseconds spent inside a step, and the decode half of it
      * separately. A step time is not wall clock over a step count -- the engine idles between an

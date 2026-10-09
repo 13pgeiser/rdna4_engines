@@ -465,6 +465,17 @@ public:
     int64_t plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
                        int64_t* checkpoint_pos) const;
 
+    /* THE SMALLEST STEP THE PREFILL STAGER OVERLAPS, in tokens (0 = no stager), set once by the
+     * engine after init. --busy-prefill-chunk keeps a held-back chunk at or above it; see
+     * busy_cap. Also where the resolved policy is stated at startup. */
+    void    set_stage_rows(int64_t rows);
+    /* Visible for tests: the most a prefill chunk at `n_computed` of a `n_target`-token sequence
+     * may take of `budget` when `reserve` tokens of other work are still to be planned in the step
+     * and `shared` says rows are already planned ahead of it. Returns `budget` when
+     * --busy-prefill-chunk is off, or when auto has nothing to reserve. */
+    int64_t busy_cap(int64_t n_computed, int64_t n_target, int64_t budget, int64_t reserve,
+                     bool shared = false, bool rows_only = false) const;
+
 private:
     Program*      prog_ = nullptr;
     Config        cfg_{};
@@ -472,6 +483,10 @@ private:
     KVGeom        kvgeom_{};
     /* Does this model carry recurrent state a prefix hit would have to restore? See admit_one. */
     bool          has_linear_state_ = false;
+    /* set_stage_rows: the prefill stager's smallest pass, 0 when it is not armed. */
+    int64_t       stage_rows_ = 0;
+    /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
+    int64_t       admit_full_ = 0;
     IKVManager*   kv_ = nullptr;
     IPrefixCache* pc_ = nullptr;
 
@@ -719,7 +734,9 @@ private:
     /* RAD_OK, a negative status when the request cannot be admitted now -- nothing behind it is
      * either -- or kAdmitWait when its context is still being read off disk and the next request
      * may go ahead of it. */
-    int  admit_one(SchedReq& s, int64_t budget);
+    /* `reserve`: tokens of the step to leave for the requests queued behind this one
+     * (--busy-prefill-chunk; busy_cap). 0 plans the chunk on the whole budget, as before. */
+    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0);
     static constexpr int kAdmitWait = 1;
     /* The queue positions one step's admission took, kept to reuse the allocation. */
     std::vector<size_t> took_;

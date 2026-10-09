@@ -1748,6 +1748,16 @@ int Engine::serve() {
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    /* THE SMALLEST STEP THE PREFILL STAGER OVERLAPS. A prefill chunk the scheduler holds back for
+     * other work in the step (--busy-prefill-chunk) is kept at or above it: under it every routed
+     * layer reads its pooled experts synchronously, which costs a long prefill far more than the
+     * step it shares saves. The largest over the ranks, since the step waits for the slowest. */
+    {
+        int64_t stage_rows = 0;
+        for (auto& rk : ranks_)
+            if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->stager.min_rows());
+        sched_.set_stage_rows(stage_rows);
+    }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 

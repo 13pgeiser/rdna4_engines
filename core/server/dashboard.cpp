@@ -192,6 +192,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["steps"]           = m.steps;
         o["steps_prefill"]   = m.steps_prefill;
         o["steps_mixed"]     = m.steps_mixed;
+        o["prefill_chunks_capped"] = m.prefill_chunks_capped;
         o["steps_decode"]    = m.steps_decode;
         /* WHAT THE STEPS COST, so the page does not have to divide wall clock by a step count.
          * That is the derivation this handler's header calls the page's job, and it is the one

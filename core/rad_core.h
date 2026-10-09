@@ -696,6 +696,13 @@ struct Config {
      * P2P should not quietly serve on something else. */
     int   p2p = RAD_P2P_AUTO;         /* --p2p auto|on|off */
     int64_t max_tok = 8192;            /* --max-num-batched-tokens */
+    /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
+     * pending in it (decode rows behind it, another prefill, a request waiting to be admitted).
+     * -1 = auto: the chunk leaves those their rows and a share for admission, and keeps at least
+     * the smallest pass the prefill stager arms for. 0 = off: the chunk takes every token the
+     * step has left, as 1.3.0 did. N > 0: the chunk is held to N tokens on such a step.
+     * Scheduler::step, docs/GUIDE.md. */
+    int64_t busy_prefill_chunk = -1;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the
