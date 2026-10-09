@@ -30,11 +30,13 @@
 # saturate the link and more only makes the destination seek.
 set -e
 
-# ---- child mode: one file, named by "<oid><tab><size><tab><path>" in $1, everything else inherited
+# ---- child mode: one file, named by "<size><tab><oid><tab><path>" in $1, everything else inherited.
+# Size first: a non-LFS file has no oid, and busybox `xargs -I` strips the leading blanks of a line,
+# so a line that began with its empty oid field would reach the child one tab short.
 # sh cannot export a function, so parallelism is one re-entry of this script per file under
 # `xargs -P` rather than a worker pool.
 if [ -n "$HFGET_CHILD" ]; then
-    oid=${1%%	*}; rest=${1#*	}; size=${rest%%	*}; path=${rest#*	}
+    size=${1%%	*}; rest=${1#*	}; oid=${rest%%	*}; path=${rest#*	}
     key=${oid:-$size}                                  # LFS: sha256, non-LFS: size
     out=$HFGET_DEST/$path
     man=$HFGET_DEST/.hfget-manifest
@@ -116,11 +118,11 @@ sel='.[] | select(.type == "file")'
 
 list=$(mktemp "${TMPDIR:-/tmp}/hfget.XXXXXX")
 trap 'rm -f "$list" "$dest/.hfget-manifest.tmp"' EXIT INT TERM
-printf '%s' "$listing" | jq -r "$sel"' | "\(.lfs.oid // "")\t\(.size)\t\(.path)"' > "$list"
+printf '%s' "$listing" | jq -r "$sel"' | "\(.size)\t\(.lfs.oid // "")\t\(.path)"' > "$list"
 
 n=$(wc -l < "$list")
 [ "$n" -gt 0 ] || { echo "hfget: the listing has no files" >&2; exit 3; }
-need=$(awk -F'\t' '{s += $2} END {printf "%.1f", s / 1073741824}' "$list")
+need=$(awk -F'\t' '{s += $1} END {printf "%.1f", s / 1073741824}' "$list")
 mkdir -p "$dest"
 : > "$dest/.hfget-manifest.tmp"
 # WHAT IS STILL TO FETCH, not the repo's size: a warm cache of a model larger than the free space
@@ -130,7 +132,7 @@ todo=0
 # Split by expansion, as the child does: a tab is IFS whitespace, so `read` would merge the empty
 # key of a non-LFS file into the next field.
 while IFS= read -r line; do
-    oid=${line%%	*}; rest=${line#*	}; size=${rest%%	*}; path=${rest#*	}
+    size=${line%%	*}; rest=${line#*	}; oid=${rest%%	*}; path=${rest#*	}
     cur=0
     if [ -f "$dest/$path" ]; then cur=$(wc -c < "$dest/$path"); fi
     if [ "$cur" = "$size" ] && [ -f "$dest/.hfget-manifest" ]; then
@@ -139,12 +141,14 @@ while IFS= read -r line; do
     fi
     if [ "$cur" -lt "$size" ]; then todo=$((todo + size - cur)); fi
 done < "$list"
-free=$(df -BG --output=avail "$dest" | tail -1 | tr -dc '0-9')
+# Free space in KiB from POSIX `df -Pk` (one line per filesystem, 1024-byte blocks): GNU's
+# `-BG --output=avail` is not in busybox, which is the df the container image has.
+free=$(df -Pk "$dest" | awk 'NR == 2 { print $4 }')
 echo "hfget: $n file(s), $need GiB -> $dest"
 [ "$have_st" -gt 0 ] && echo "hfget: safetensors present, pickle weight formats skipped"
 echo "hfget: $(awk -v t="$todo" 'BEGIN { printf "%.1f", t / 1073741824 }') GiB to fetch," \
-     "$free GiB free on the destination filesystem"
-awk -v t="$todo" -v f="$free" 'BEGIN { exit !(t / 1073741824 > f) }' \
+     "$(awk -v f="$free" 'BEGIN { printf "%.1f", f / 1048576 }') GiB free on the destination filesystem"
+awk -v t="$todo" -v f="$free" 'BEGIN { exit !(t > f * 1024) }' \
     && { echo "hfget: THE DOWNLOAD DOES NOT FIT" >&2; exit 3; }
 
 export HFGET_CHILD=1 HFGET_DEST="$dest" HFGET_REPO="$repo" HFGET_REV="$rev" HFGET_MAN_OUT="$dest/.hfget-manifest.tmp"
