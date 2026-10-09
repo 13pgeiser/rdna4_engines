@@ -315,6 +315,13 @@ static int w5_dispatch(const RadArgs* a, RadStream s, bool hi5) {
     Cfg c;
     rc = cfg_for(a, g.K, mc, group, BR_FLAT, &c);
     if (rc != RAD_OK) return rc;
+    /* cfg_for pins MB = 1 across the decode band (the grid, not the weight, is the cost for the bf16 and
+     * mxfp4 skinny kernels). Here the dequantise is: one block per row tile unpacks each weight fragment
+     * once PER TILE, so three streams (M = 24, two tiles) pay it twice. Cover every row tile in one block
+     * unless the tuner pinned MB; same split, so the output bits are unchanged. */
+    R4dGemmCfg tuned;
+    r4d_cfg_gemm(a, &tuned);
+    if (tuned.mb <= 0) c.mb = std::min<long long>(4, (mc + 15) / 16);
     const long long Ntot = g.N, K = g.K, lda = mp.lda ? mp.lda : g.K;
     const long long nsz = K / R4D_GEMM_W4_GROUP;
     for (int p = 0; p < mp.n; ++p) {
