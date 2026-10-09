@@ -492,7 +492,7 @@ struct Fixture {
     ~Fixture() { sch.fini(); for (void* p : owned) std::free(p); }
 
     void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512,
-               int64_t max_ctx = 4096) {
+               int64_t max_ctx = 4096, bool windowed = false) {
         g_gdn_ki = RadKernelInfo{};
         g_gdn_ki.name = "gdn_fake";
         g_gdn_ki.op = "gdn_chunked";
@@ -523,6 +523,25 @@ struct Fixture {
         conv.decl.kind = RAD_KV_CONV;
         conv.decl.conv_width = 4;
         prog.kv_groups.push_back(conv);
+
+        /* A WINDOWED paged group — the second half of the pair a sliding-window model declares
+         * (windowed layers + a full group; qwen35/llama windowed checkpoints declare these).
+         * Paged, block-aligned, and deliberately NOT prefix-cached: prefix.cpp indexes only the
+         * groups whose blocks below the window stay put. Tests that want a prefix cache over a
+         * WINDOW+FULL pair trim pc.groups to the cached ones. */
+        if (windowed) {
+            KVGroupInfo win;
+            win.name = "swa";
+            win.decl.kind = RAD_KV_WINDOW;
+            win.decl.window = 64;
+            win.block_size = 16;
+            win.layers = { 2 };   /* bound to a TRUNK layer — the group a trunk attention reads;
+                                   * a drafter's own group is bound at the trunk's layer count and
+                                   * above (rad_bind_layer_kv at the drafter declare) */
+            prog.kv_groups.push_back(win);
+            prog.meta.n_layers = 16;   /* trunk layers 0..15; the drafter tests' appended group
+                                        * stays unbound, and unbound is not trunk-owned */
+        }
 
         OpInfo op;
         op.op = "gdn_chunk_scan";
@@ -926,6 +945,50 @@ TEST(a_hit_that_no_checkpoint_covers_replays_from_zero) {
     CHECK_EQ(f.sch.metrics().linear_cached_tokens, 0);
 }
 
+/* THE PREFIX CACHE CANNOT COVER A MODEL WITH A PAGED GROUP IT DOES NOT INDEX. The fixture's
+ * groups are FULL, LINEAR, CONV, WINDOW — the windowed group is paged, bound to a trunk layer,
+ * and a real cache skips it (prefix.cpp: its blocks below the window are recycled, so no block
+ * list describes them), which is what pc.groups = {0} reproduces: three paged groups, one
+ * cached. The cache below is seeded to a DEEP, checkpoint-covered hit — 304 attention blocks,
+ * the linear state at 256, a slot to restore from — the most legitimate hit there is: every
+ * clamp above the trunk one lets it through untouched. The adopted blocks cover group 0 ONLY,
+ * while used = ctx_len + n_tok makes the windowed trunk layers read the positions below ctx_len
+ * this sequence never wrote — and the pool hands out the most recently freed blocks, i.e. the
+ * previous tenant's. That is reading ANOTHER REQUEST'S KV AS YOUR OWN PREFIX: fluent text
+ * carrying the last request's content. No tail-recompute repairs a trunk hole (a drafter's own
+ * hole is another matter, and the refill tests above keep theirs); the hit is refused. */
+TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    f.pc.groups = {0};    /* a cache that indexes the FULL group only — windowed groups are not
+                           * prefix-cacheable; must precede start(), which reads it once */
+    CHECK_OK(f.start());
+    f.pc.seed(304);       /* a deep, block-aligned attention hit: 19 blocks */
+    f.pc.lin = 256;       /* its linear state checkpoints at 256 — the resume point exists */
+    f.pc.src = 3;         /* and names a snapshot, so no checkpoint clamp applies */
+
+    uint64_t a = f.submit(300, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+
+    /* The whole hit is refused, not trimmed: the request runs from zero. */
+    CHECK_EQ(f.sch.find(a)->n_computed, 0);
+    CHECK_EQ(f.sch.find(a)->n_cached, 0);
+    CHECK_EQ(b->ctx_lens[0], 0);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, -1);
+
+    /* NOTHING IS ADOPTED — the 16 blocks covering the 256-token chunk are all freshly grabbed. */
+    CHECK_EQ((int)f.kv.block_table(a, 0).size(), 16);
+    CHECK(std::find(f.pc.seeded[0].begin(), f.pc.seeded[0].end(),
+                    f.kv.block_table(a, 0)[0]) == f.pc.seeded[0].end());
+
+    /* THE CACHE STILL REPORTED THE MATCH, and the metrics say so: this is a real hit the
+     * scheduler refused, not a lookup that found nothing. */
+    SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.attn_cached_tokens, 304);
+    CHECK_EQ(m.linear_cached_tokens, 0);
+}
+
 /* ================================================================== preemption */
 /* A REQUEST WHOSE CONTEXT IS STILL BEING READ OFF DISK WAITS, AND ONLY IT DOES. It is not admitted
  * short -- the hit length is what its prefill is shaped by -- and it does not hold up the queue:
@@ -1291,7 +1354,11 @@ RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
     f.cfg.n_spec = 7;
     f.prog.drafter.kind = RAD_DRAFT_BLOCK;
     f.prog.drafter.window = 512;
-    KVGroupInfo w;                 /* the drafter's own group: paged, windowed, not prefix-cached */
+    KVGroupInfo w;                 /* the drafter's own group: paged, windowed, not prefix-cached.
+                                    * UNBOUND, and a drafter group bound at the trunk's layer count
+                                    * and above is the same — the trunk clamp reads bound TRUNK
+                                    * layers (scheduler.h, hit_holes_trunk_) and does not fire on a
+                                    * drafter hole: the refill below is exactly its repair. */
     w.name = "draft";
     w.decl.kind = RAD_KV_WINDOW;
     w.decl.window = 512;
