@@ -207,8 +207,31 @@ public:
 
     /* Grow the sequence's mapping to cover `n_tokens` in every group. Unshares a shared partial
      * block first (copy-on-write) and appends the copy request to the pending list.
-     * RAD_E_FULL when a group's free list is empty -- the caller preempts and retries. */
-    int  ensure(uint64_t seq, int64_t n_tokens);
+     * RAD_E_FULL when a group's free list is empty -- the caller preempts and retries.
+     *
+     * `keep_from` is the position of the FIRST query the coming step runs (the scheduler's
+     * n_computed); -1 means the sequence's current end. A WINDOW group recycles only the blocks no
+     * query at or past it can read -- below keep_from - window + 1 -- and NOT the blocks below the
+     * window of the step's END: a prefill chunk longer than a block would otherwise lose the keys
+     * its first rows attend to (a chunk of C tokens from position 0 rebased the table at
+     * ceil(C/block) - window_blocks and left every position below it with no KV at all). */
+    int  ensure(uint64_t seq, int64_t n_tokens, int64_t keep_from = -1);
+
+    /* A WINDOW group's caps: a sequence holds its window behind the step's first query AND the
+     * step's own tokens (window_blocks + ceil(max_tok / block) + 1 at most), and one step carries
+     * at most max_tok tokens across every sequence in it, so the pool needs max_seqs windows plus
+     * one step's worth on top. */
+    int64_t window_seq_cap(const KVGroupPlan& p) const;
+    int64_t window_pool_cap(const KVGroupPlan& p) const;
+
+    /* GIVE BACK A FINISHED CHUNK'S BLOCKS once it is committed. ensure() keeps a chunk's own blocks
+     * beside the window behind its first query, and only the sequence's NEXT ensure() recycles
+     * them -- so a prefill waiting a step for its next chunk would sit on a whole chunk of window
+     * blocks while other sequences prefill, and eight of them exhaust the pool (measured on
+     * Gemma 4: "the KV pool cannot hold 12480 tokens" with eight 16K prompts). Called by the
+     * scheduler when it advances n_computed: keep_from is the new n_computed, the first query any
+     * later step can run. */
+    void trim_window(uint64_t seq, int64_t keep_from);
 
     /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a whole multiple of the group's
      * block size: a partial block is never shared, because the next token written into it would
@@ -509,6 +532,8 @@ private:
     void drop_state(int32_t g, int32_t s);
     Seq* find(uint64_t seq);
     const Seq* find(uint64_t seq) const;
+    /* Recycle a WINDOW group's blocks no query at or past `keep_from` can read. */
+    void recycle_window(Seq* s, int64_t keep_from);
 
     std::vector<KVGroupPlan> plans_;
     std::vector<std::vector<int32_t>> free_blocks_;   /* per group */

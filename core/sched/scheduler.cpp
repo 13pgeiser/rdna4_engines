@@ -1048,7 +1048,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         /* THE CACHE GIVES WAY TO A NEW REQUEST as it does to a running one: with nothing running,
          * no other path would ever take blocks back from it, and the request would wait for good. */
         int rounds = 0;
-        while (kv_->ensure(r.id, r.n_computed + want) < 0) {
+        while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
             if (++rounds > 256 || !cfg_.prefix_cache || pc_->evict(256) <= 0) {
                 rc = RAD_E_NOMEM;
                 break;
@@ -1238,7 +1238,7 @@ const RadBatch* Scheduler::step() {
         static const int kMaxEvictRounds = 256;
         int evict_rounds = 0;
         bool failed = false;
-        while (kv_->ensure(r.id, r.n_computed + want) < 0) {
+        while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
             /* THE CACHE GIVES ITS BLOCKS BACK BEFORE A RUNNING REQUEST DOES. Everything the prefix
              * cache holds is a saving on work that has already been done once; everything a
              * running request holds is work in flight. Evicting first is therefore strictly the
@@ -1450,7 +1450,7 @@ const RadBatch* Scheduler::step() {
         int64_t ckpt = -1;
         const int64_t grown = e.ckpt_slot < 0 && limit > had
             ? plan_chunk(r.n_computed, s.seq_len(), limit, &ckpt) : had;
-        if (grown > had && kv_->ensure(r.id, r.n_computed + grown) >= 0) {
+        if (grown > had && kv_->ensure_from(r.id, r.n_computed + grown, r.n_computed) >= 0) {
             e.n_tokens = (int32_t)grown;
             e.produces_token = (r.n_computed + grown >= s.seq_len());
             if (ckpt > 0) {
@@ -1690,7 +1690,7 @@ const RadBatch* Scheduler::step_next_locked() {
         const int32_t d      = s.draft_next;
         const int64_t want   = 1 + d;
         if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_) return nullptr;
-        if (kv_->ensure(r.id, ctx_up + want) < 0) return nullptr;
+        if (kv_->ensure_from(r.id, ctx_up + want, r.n_computed) < 0) return nullptr;
 
         StepEntry n;
         n.req            = &r;
@@ -1831,6 +1831,10 @@ int Scheduler::commit(const StepResult& res) {
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
+            /* The chunk is committed: a window group gives its blocks below the window back now,
+             * not at this sequence's next ensure(), which may be steps away while others
+             * prefill. */
+            kv_->trim_window(r.id, r.n_computed);
             step_prefill_tok_ += e.n_tokens;
             server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
                                          r.n_cached);
@@ -2167,7 +2171,8 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
          * unwritten in the head's layer for good. The same goes for a row too near the end of the
          * context for its rounds, whose last positions do not exist. */
         if (can_draft && ctx_limit_ > 0 && head_max + *rounds > ctx_limit_) can_draft = false;
-        if (can_draft && kv_->ensure(r.id, head_max + *rounds) < 0) can_draft = false;
+        if (can_draft && kv_->ensure_from(r.id, head_max + *rounds, r.n_computed) < 0)
+            can_draft = false;
 
         /* THE HISTORY THIS STEP OWES, in two parts. Before the verified positions, the positions
          * the step computed whose next token the host holds -- a prefill chunk's prompt -- from
@@ -2418,7 +2423,8 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         /* The query block writes positions n_computed .. n_computed + block - 1, and none of them
          * may be at or past the end of the context. */
         const bool ok_ctx  = ctx_limit_ <= 0 || r.n_computed + block <= ctx_limit_;
-        const bool ok_kv   = ok_room && ok_ctx && kv_->ensure(r.id, r.n_computed + block) >= 0;
+        const bool ok_kv   = ok_room && ok_ctx &&
+                             kv_->ensure_from(r.id, r.n_computed + block, r.n_computed) >= 0;
         static const bool dbg = [] { const char* v = std::getenv("RADIANCE_DEBUG_DRAFT");
                                      return v && *v && *v != '0'; }();
         if (dbg) {

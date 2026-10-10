@@ -965,18 +965,59 @@ TEST(kv_window_group_recycles_below_the_window) {
     CHECK_OK(kv.configure(g, cfg, p.kv()));
     /* window 64 at block 16 is 4 blocks plus one for the straddle. */
     CHECK_EQ(kv.plan(G_FULL)->window_blocks, 5ll);
-    /* Sized against the cap, not against the whole budget: blocks past the window are memory
-     * nobody will ever address. */
-    CHECK_EQ(kv.total_blocks(G_FULL), cfg.max_seqs * 5);
+    /* Sized against the cap, not against the whole budget: a window a sequence plus one step's
+     * worth of tokens (max_tok) and a straddle block a sequence -- a chunk's own blocks are held
+     * beside the window behind its first query. Past that is memory nobody will ever address. */
+    CHECK_EQ(kv.total_blocks(G_FULL), cfg.max_seqs * 5 + (cfg.max_tok + 15) / 16 + cfg.max_seqs);
 
     const int64_t n0 = kv.free_blocks(G_FULL);
     CHECK_OK(kv.add_sequence(1));
-    CHECK_OK(kv.ensure(1, 80));
+    CHECK_OK(kv.ensure(1, 80));                          /* a chunk from 0: all of it held */
+    CHECK_EQ(kv.first_block_pos(1, G_FULL), 0ll);
     CHECK_EQ((long long)kv.block_table(1, G_FULL).size(), 5ll);
+    /* A chunk from 80 to 400: its first query (80) reads back to 17, so block 1 stays and only
+     * block 0 goes -- NOT the window behind 400, which left rows 80..335 with no keys. */
     CHECK_OK(kv.ensure(1, 400));
-    CHECK_EQ((long long)kv.block_table(1, G_FULL).size(), 5ll);   /* recycled, not grown */
+    CHECK_EQ(kv.first_block_pos(1, G_FULL), 16ll);
+    CHECK_EQ((long long)kv.block_table(1, G_FULL).size(), 24ll);
+    /* A decode step from 400: back to the window, recycled rather than grown. */
+    CHECK_OK(kv.ensure(1, 401));
+    CHECK_EQ(kv.first_block_pos(1, G_FULL), 336ll);
+    CHECK_EQ((long long)kv.block_table(1, G_FULL).size(), 5ll);
     CHECK_EQ(kv.free_blocks(G_FULL), n0 - 5);
     kv.free_sequence(1);
+    CHECK_EQ(kv.free_blocks(G_FULL), n0);
+
+    /* THE PROMPT LONGER THAN THE WINDOW, in one chunk from 0: every position keeps its slot. The
+     * old rule rebased this table at ceil(400/16) - 5 = 20 blocks, and a sliding layer read no
+     * keys at all for positions 0..319. */
+    CHECK_OK(kv.add_sequence(2));
+    CHECK_OK(kv.ensure(2, 400));
+    CHECK_EQ(kv.first_block_pos(2, G_FULL), 0ll);
+    CHECK_EQ((long long)kv.block_table(2, G_FULL).size(), 25ll);
+    /* And the scheduler's form names the step's first query itself: a chunk grown in the same
+     * step (ensure called twice) keeps what the first call's first query reads. */
+    CHECK_OK(kv.ensure(2, 432, 400));
+    CHECK_EQ(kv.first_block_pos(2, G_FULL), 336ll);
+    CHECK_OK(kv.ensure(2, 464, 400));
+    CHECK_EQ(kv.first_block_pos(2, G_FULL), 336ll);
+    CHECK_EQ((long long)kv.block_table(2, G_FULL).size(), 8ll);
+    kv.free_sequence(2);
+    CHECK_EQ(kv.free_blocks(G_FULL), n0);
+
+    /* A COMMITTED CHUNK GIVES ITS BLOCKS BACK at once: trim_window to the new end keeps the window
+     * behind it and nothing else, so a prefill that waits a step for its next chunk holds a window
+     * and not a chunk. */
+    CHECK_OK(kv.add_sequence(3));
+    CHECK_OK(kv.ensure(3, 400));
+    CHECK_EQ((long long)kv.block_table(3, G_FULL).size(), 25ll);
+    kv.trim_window(3, 400);
+    CHECK_EQ(kv.first_block_pos(3, G_FULL), 336ll);
+    CHECK_EQ((long long)kv.block_table(3, G_FULL).size(), 4ll);
+    CHECK_EQ(kv.free_blocks(G_FULL), n0 - 4);
+    CHECK_OK(kv.ensure(3, 401));
+    CHECK_EQ((long long)kv.block_table(3, G_FULL).size(), 5ll);
+    kv.free_sequence(3);
     CHECK_EQ(kv.free_blocks(G_FULL), n0);
 }
 

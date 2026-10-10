@@ -307,7 +307,7 @@ int64_t KVManager::ceiling(int64_t ctx) const {
         if (!p.paged() || p.block_size <= 0) continue;
         int64_t blocks = max_seqs_ * ((ctx + p.block_size - 1) / p.block_size);
         if (p.kind == RAD_KV_WINDOW && p.window_blocks > 0)
-            blocks = std::min(blocks, max_seqs_ * p.window_blocks);
+            blocks = std::min(blocks, window_pool_cap(p));
         need += blocks * p.bytes_per_block;
     }
     return need;
@@ -382,10 +382,10 @@ int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* block
         for (int32_t i : open) {
             const auto& p = plans_[i];
             if (p.kind != RAD_KV_WINDOW) continue;
-            if (tokens / p.block_size > max_seqs_ * p.window_blocks) { capped = i; break; }
+            if (tokens / p.block_size > window_pool_cap(p)) { capped = i; break; }
         }
         if (capped < 0) break;
-        out[capped] = max_seqs_ * plans_[capped].window_blocks;
+        out[capped] = window_pool_cap(plans_[capped]);
         remaining -= out[capped] * plans_[capped].bytes_per_block;
         open.erase(std::find(open.begin(), open.end(), capped));
     }
@@ -419,7 +419,7 @@ int64_t KVManager::pool_mib_for_tokens(int64_t tokens, int64_t max_mib) const {
 int64_t KVManager::zero_blocks(const KVGroupPlan& p, int64_t tokens) const {
     if (tokens == kUnboundedTokens) return 0;
     const int64_t b = tokens / p.block_size;
-    if (p.kind == RAD_KV_WINDOW && b > max_seqs_ * p.window_blocks) return max_seqs_ * p.window_blocks;
+    if (p.kind == RAD_KV_WINDOW && b > window_pool_cap(p)) return window_pool_cap(p);
     return b;
 }
 
@@ -921,7 +921,7 @@ int64_t KVManager::blocks_for(int32_t g, int64_t n_tokens) const {
     const KVGroupPlan* p = plan(g);
     if (!p || !p->paged() || n_tokens <= 0) return 0;
     int64_t n = ceil_div(n_tokens, p->block_size);
-    if (p->kind == RAD_KV_WINDOW) n = std::min(n, p->window_blocks);
+    if (p->kind == RAD_KV_WINDOW) n = std::min(n, window_seq_cap(*p));
     return n;
 }
 
@@ -1156,19 +1156,29 @@ std::vector<BlockCopy> KVManager::take_pending_copies() {
 
 /* ------------------------------------------------------------------ ensure */
 
-int KVManager::ensure(uint64_t id, int64_t n_tokens) {
-    Seq* s = find(id);
-    if (!s) return RAD_E_NOTFOUND;
-    if (n_tokens <= s->n_tokens) return RAD_OK;
+int64_t KVManager::window_seq_cap(const KVGroupPlan& p) const {
+    return p.window_blocks + (max_tok_ > 0 ? ceil_div(max_tok_, p.block_size) : 0) + 1;
+}
 
-    /* Pass 0: recycle whatever the window has slid past. This only frees, so it cannot fail, and
-     * doing it first means the availability check below sees the memory it releases. */
+int64_t KVManager::window_pool_cap(const KVGroupPlan& p) const {
+    return max_seqs_ * p.window_blocks + (max_tok_ > 0 ? ceil_div(max_tok_, p.block_size) : 0) +
+           max_seqs_;
+}
+
+/* SLID PAST THE STEP'S FIRST QUERY, NOT ITS LAST. The query at keep_from reads keys down to
+ * keep_from - window + 1, which lies in block keep_from / block - (window_blocks - 1) or later
+ * (window_blocks - 1 >= window / block). A target taken from the END of the step --
+ * ceil(n_tokens / block) - window_blocks -- is the same block for a decode step and drops the keys
+ * every row of a longer prefill chunk still needs. Measured on Gemma 4 (#75: 50 of 60 layers
+ * windowed at 1024): a 2185-token prompt rebased the table at 1152, its sliding layers held no KV
+ * for positions 0..1151, and every prompt past ~1040 tokens came back as nonsense. */
+void KVManager::recycle_window(Seq* s, int64_t keep_from) {
     for (size_t g = 0; g < plans_.size(); ++g) {
         const auto& p = plans_[g];
         if (p.kind != RAD_KV_WINDOW) continue;
-        int64_t want_end = ceil_div(n_tokens, p.block_size);
         int64_t first    = s->first_block_pos[g] / p.block_size;
-        int64_t target   = std::max<int64_t>(first, want_end - p.window_blocks);
+        int64_t target   = std::max<int64_t>(first,
+                                             keep_from / p.block_size - (p.window_blocks - 1));
         while (first < target && !s->blocks[g].empty()) {
             drop_block((int32_t)g, s->blocks[g].front());
             s->blocks[g].erase(s->blocks[g].begin());
@@ -1178,6 +1188,24 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens) {
         if (s->blocks[g].empty()) first = target;   /* nothing held: rebase to the window */
         s->first_block_pos[g] = first * p.block_size;
     }
+}
+
+void KVManager::trim_window(uint64_t id, int64_t keep_from) {
+    Seq* s = find(id);
+    if (!s || keep_from < 0) return;
+    if (keep_from > s->n_tokens) keep_from = s->n_tokens;
+    recycle_window(s, keep_from);
+}
+
+int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
+    Seq* s = find(id);
+    if (!s) return RAD_E_NOTFOUND;
+    if (n_tokens <= s->n_tokens) return RAD_OK;
+    if (keep_from < 0 || keep_from > s->n_tokens) keep_from = s->n_tokens;
+
+    /* Pass 0: recycle whatever the window has slid past. This only frees, so it cannot fail, and
+     * doing it first means the availability check below sees the memory it releases. */
+    recycle_window(s, keep_from);
 
     /* Pass 1: can every group serve this? Check before touching anything, so a group that runs
      * out does not leave the sequence half-extended and the caller unable to say what it owns. */
@@ -1316,7 +1344,7 @@ int KVManager::make_room(uint64_t id, int64_t n_tokens,
             if (p.paged()) {
                 int64_t first = s->first_block_pos[g] / p.block_size;
                 int64_t want  = ceil_div(n_tokens, p.block_size) - first;
-                if (p.kind == RAD_KV_WINDOW) want = std::min(want, p.window_blocks);
+                if (p.kind == RAD_KV_WINDOW) want = std::min(want, window_seq_cap(p));
                 int64_t extra = want - (int64_t)s->blocks[g].size() + 1;  /* +1 for a COW copy */
                 if (extra > available_blocks((int32_t)g)) return false;
             } else if (p.stateful() && s->state[g] < 0 && free_states_[g].empty()) return false;

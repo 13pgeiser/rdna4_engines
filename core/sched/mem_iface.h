@@ -46,6 +46,16 @@ struct IKVManager {
      * free list is empty, which is a scheduling signal and not an error: the caller preempts a
      * victim and retries. */
     virtual int  ensure(uint64_t seq, int64_t n_tokens) = 0;
+    /* The same, for a step whose first query sits at `keep_from` (the request's n_computed): a
+     * WINDOW group then keeps every block that query can still read, however long the step is.
+     * See KVManager::ensure. The default is for a manager with no windowed group. */
+    virtual int  ensure_from(uint64_t seq, int64_t n_tokens, int64_t keep_from) {
+        (void)keep_from;
+        return ensure(seq, n_tokens);
+    }
+    /* A committed step: a WINDOW group gives back what no later query can read. A no-op for a
+     * manager with no windowed group. See KVManager::trim_window. */
+    virtual void trim_window(uint64_t seq, int64_t keep_from) { (void)seq; (void)keep_from; }
 
     /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a whole multiple of the group's
      * block size -- a partial block is never shared, because the next token written into it would
@@ -282,6 +292,8 @@ struct KVBinding final : IKVManager {
     bool has_sequence(uint64_t s) const override    { return m->has_sequence(s); }
     void free_sequence(uint64_t s) override         { m->free_sequence(s); }
     int  ensure(uint64_t s, int64_t n) override     { return m->ensure(s, n); }
+    int  ensure_from(uint64_t s, int64_t n, int64_t k) override { return m->ensure(s, n, k); }
+    void trim_window(uint64_t s, int64_t k) override { m->trim_window(s, k); }
     int  adopt(uint64_t s, int32_t g, const std::vector<int32_t>& b, int64_t n) override {
         return m->adopt(s, g, b, n);
     }
