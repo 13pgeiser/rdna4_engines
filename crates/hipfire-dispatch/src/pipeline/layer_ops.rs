@@ -136,9 +136,16 @@ pub fn project_weight(
 }
 
 /// [`project_weight`] for several weights reading the same `input`.  On the
-/// gfx1151 MQ6 BT8 route the input is rotated straight to F16 once per K and
-/// every MQ6 GEMM reads that copy (the per-weight path rotates to F32 and
-/// converts to F16 again for each); the bytes each GEMM sees are unchanged.
+/// gfx1151 MQ6 BT8 and MQ4 prefill routes the input is rotated straight to F16
+/// once per K and every MQ6 / MQ4 GEMM reads that copy (the per-weight path
+/// rotates to F32 and converts to F16 again for each); the bytes each GEMM sees
+/// are unchanged.
+///
+/// Few-row verify (2..=8 rows): the MQ4G256V2 members of one rotated input run
+/// through `Gpu::gemv_mq4g256v2_rows_x4`, four per launch (a lone member takes
+/// it too, via `project_rotated`), each output bitwise the AR `gemv_mq4g256v2`;
+/// the MQ6G256V2 members take `gemm_mq6g256v2_f32_rows_x4` the same way. One row
+/// keeps the single-matrix GEMVs; more than 8 rows keep the GEMMs.
 pub fn project_weights(
     gpu: &mut Gpu,
     input: &GpuTensor,
@@ -167,8 +174,11 @@ fn project_weights_inner(
     region_members: Option<&[bool]>,
 ) -> Result<(), DispatchError> {
     debug_assert!(region_members.is_none_or(|m| m.len() == projections.len()));
-    let shared = |w: &WeightRef<'_>, gpu: &Gpu| {
-        w.dtype == DType::MQ6G256V2 && gpu.gemm_mq6g256v2_xf16_applies(w.k, rows)
+    let shared = |w: &WeightRef<'_>, gpu: &Gpu| match w.dtype {
+        DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, rows),
+        // gfx1151, more than 8 rows (N >= 96): PM or exact bt4 on the shared F16 rotation.
+        DType::MQ4G256V2 => gpu.gemm_mq4g256v2_xf16_applies(w.k, rows),
+        _ => false,
     };
     // Shared-rotation weights first, grouped by K: other projections reuse
     // the same F16 scratch and would overwrite the rotated copy.
@@ -181,40 +191,56 @@ fn project_weights_inner(
         let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
         // The chunked GDN qkv output is BF16; its three F32 a/b/z siblings
         // may share one row-region launch without sharing their accumulators.
-        if let (Some(members), true) = (region_members, gpu.qwen4_mq6_x4_regions()) {
-            let mut indices = [0usize; 3];
-            let mut count = 0;
-            for j in i..projections.len() {
-                let (w, out) = projections[j];
-                if members[j]
-                    && !done[j]
-                    && w.k == weight.k
-                    && shared(w, gpu)
-                    && out.dtype == DType::F32
-                {
-                    if count < 3 { indices[count] = j; }
-                    count += 1;
+        if let Some(members) = region_members {
+            for fold in [DType::MQ6G256V2, DType::MQ4G256V2] {
+                // The MQ6 fold has its own switch; the MQ4 one is the PM module's.
+                if fold == DType::MQ6G256V2 && !gpu.qwen4_mq6_x4_regions() {
+                    continue;
                 }
-            }
-            if count == 3 {
-                let regions = indices.map(|j| {
+                let mut indices = [0usize; 3];
+                let mut count = 0;
+                for j in i..projections.len() {
                     let (w, out) = projections[j];
-                    (w.buf, out, w.m)
-                });
-                if hip(gpu.gemm_mq6g256v2_xf16_regions(&regions, &x_f16, weight.k, rows))? {
-                    for j in indices { done[j] = true; }
+                    if members[j]
+                        && !done[j]
+                        && w.dtype == fold
+                        && w.k == weight.k
+                        && shared(w, gpu)
+                        && out.dtype == DType::F32
+                    {
+                        if count < 3 { indices[count] = j; }
+                        count += 1;
+                    }
+                }
+                if count == 3 {
+                    let regions = indices.map(|j| {
+                        let (w, out) = projections[j];
+                        (w.buf, out, w.m)
+                    });
+                    let folded = if fold == DType::MQ4G256V2 {
+                        gpu.gemm_mq4g256v2_xf16_regions(&regions, &x_f16, weight.k, rows)
+                    } else {
+                        gpu.gemm_mq6g256v2_xf16_regions(&regions, &x_f16, weight.k, rows)
+                    };
+                    if hip(folded)? {
+                        for j in indices { done[j] = true; }
+                    }
                 }
             }
         }
         for j in i..projections.len() {
             let (w, out) = projections[j];
             if !done[j] && w.k == weight.k && shared(w, gpu) {
-                hip(gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows))?;
+                hip(if w.dtype == DType::MQ4G256V2 {
+                    gpu.gemm_mq4g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows)
+                } else {
+                    gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows)
+                })?;
                 done[j] = true;
             }
         }
     }
-    // Only the shared MQ6 rotation reads a BF16 activation.
+    // Only the shared F16 rotation reads a BF16 activation.
     if input.dtype != DType::F32 && done.iter().any(|d| !d) {
         return Err(DispatchError::UnsupportedVariant {
             family: "layer-operations",
@@ -318,7 +344,26 @@ fn project_weights_inner(
                 gpu.gemm_mq6g256v2_f32_rows_x4(parts, x, weight.k, rows)
             })?;
         }
-        for &j in group.iter().filter(|j| !mq6.contains(j)) {
+        // Few-row verify (2..=8 rows): the group's MQ4G256V2 members share
+        // `gemv_mq4g256v2_rows_x4` launches, four at a time (a lone member
+        // takes the same launch with empty slots); each output is bitwise the
+        // AR singleton `gemv_mq4g256v2`. One row keeps that singleton.
+        let mq4: SmallVec<[usize; 4]> = group
+            .iter()
+            .copied()
+            .filter(|&j| {
+                (2..=8).contains(&rows) && projections[j].0.dtype == DType::MQ4G256V2
+            })
+            .collect();
+        for chunk in mq4.chunks(4) {
+            let part = |n: usize| {
+                let (w, y) = projections[chunk[n.min(chunk.len() - 1)]];
+                (w.buf, y, if n < chunk.len() { w.m } else { 0 })
+            };
+            let parts = [part(0), part(1), part(2), part(3)];
+            hip(gpu.gemv_mq4g256v2_rows_x4(parts, x, weight.k, rows))?;
+        }
+        for &j in group.iter().filter(|j| !mq6.contains(j) && !mq4.contains(j)) {
             let (w, out) = projections[j];
             project_rotated(gpu, w, x, out, rows)?;
         }
@@ -339,7 +384,7 @@ struct ZbaFold<'a> {
 /// Qwen4 trunk projections (GDN in/out, QSA in/out) of one shared input.
 ///
 /// `a4[i]` says the per-layer mask (`HIPFIRE_QWEN4_TRUNK_IU4`) selected
-/// `projections[i]`. Each projection takes one of three routes, run as
+/// `projections[i]`. Each projection takes one of two routes, run as
 /// groups that each finish before the next starts (the A4 sidecar, the
 /// rotation scratch and the shared F16 X scratch are reused group to group):
 ///
@@ -350,11 +395,11 @@ struct ZbaFold<'a> {
 ///    V2B / `pm_v2b` where eligible, X5 / symfold otherwise); a GDN `zba`
 ///    fold, when all of Z, beta and alpha are in this group, runs
 ///    Z|beta|alpha as one V2B SET with the split in its epilogue.
-/// 2. Any other MQ4G256V2 projection of an F32 prefill input (more than 8
-///    rows, gfx1151): exact (F16) activations, one shared rotation.
-/// 3. Everything else (MQ6 and the rest): [`project_weights`] exactly as if
-///    no MQ4 sibling existed. When siblings were split off a GDN in-projection
-///    group (`gdn_in_proj`), the MQ6 row-region fold stays enabled for the
+/// 2. Everything else: [`project_weights`]. That includes every other MQ4G256V2
+///    projection of a prefill input (more than 8 rows, gfx1151): the shared F16
+///    rotation per K with the exact PM / bt4 GEMMs (see `project_weights_inner`).
+///    When siblings were split off a GDN in-projection
+///    group (`gdn_in_proj`), the MQ6 / MQ4 row-region fold stays enabled for the
 ///    group's original a/b/z only (never qkv).
 #[allow(clippy::too_many_arguments)]
 fn project_trunk(
@@ -409,18 +454,6 @@ fn project_trunk(
                     hip(gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(w.buf, xq, out, w.m, k, rows))?;
                     done[j] = true;
                 }
-            }
-        }
-        let exact: SmallVec<[usize; 4]> = mq4.iter().copied().filter(|&j| !done[j]).collect();
-        if rows > 8 && !exact.is_empty() {
-            let x = view(rotation, 0, rows * k);
-            hip(gpu.rotate_x_mq_batched(input, &x, k, rows))?;
-            for &j in &exact {
-                let (w, out) = projections[j];
-                if !hip(gpu.gemm_qwen4_trunk_mq4_xf16(w.buf, &x, out, w.m, k, rows))? {
-                    break;
-                }
-                done[j] = true;
             }
         }
     }
@@ -524,6 +557,14 @@ fn project_rotated(
         let part = (weight.buf, output, weight.m);
         let none = (weight.buf, output, 0);
         return hip(gpu.gemv_bf16_xf32_x4_rows([part, none, none, none], x, weight.k, rows));
+    }
+    // Few-row verify (2..=8 rows): the exact MQ4 rows kernel, bitwise the AR
+    // `gemv_mq4g256v2` per activation row. One row keeps that GEMV; more than
+    // eight rows keep the WMMA `gemm_mq4g256v2`.
+    if weight.dtype == DType::MQ4G256V2 && (2..=8).contains(&rows) {
+        let part = (weight.buf, output, weight.m);
+        let none = (weight.buf, output, 0);
+        return hip(gpu.gemv_mq4g256v2_rows_x4([part, none, none, none], x, weight.k, rows));
     }
     let result = match (weight.dtype, rows > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
@@ -1082,7 +1123,8 @@ pub fn execute_hyper_write_pregated(
     execute_hyper_write_inner(gpu, op, true)
 }
 
-/// H4 attention epilogue (`HIPFIRE_QWEN4_HC_FUSE` >= 2): an MQ6G256V2 output
+/// H4 attention epilogue (`HIPFIRE_QWEN4_HC_FUSE` >= 2): an MQ6G256V2 (or, on the
+/// gfx1151 PM module, MQ4G256V2) output
 /// projection that applies the paired HC write `write` in its GEMM epilogue.
 /// `write`'s gates must already be in `write.gates` (the paired read produced
 /// them from the streams the write overwrites; see
@@ -1098,13 +1140,24 @@ fn project_output_into_hyper_write(
     input: &GpuTensor,
     rows: usize,
     rotation: Option<&GpuTensor>,
+    a4: bool,
     write: &HyperWriteOp<'_>,
 ) -> Result<bool, DispatchError> {
     let Some(wide) = write.branches.checked_mul(write.hidden) else {
         return Ok(false);
     };
+    // MQ4G256V2 (gfx1151 PM module only) is declined where the unfused route
+    // would run the IU4 trunk projection (`a4`: its trunk bit) instead.
+    let covered = match weight.dtype {
+        DType::MQ6G256V2 => gpu.gemm_mq6g256v2_hcw_applies(weight.m, weight.k, rows),
+        DType::MQ4G256V2 => {
+            gpu.gemm_mq4g256v2_hcw_applies(weight.m, weight.k, rows)
+                && !(a4 && gpu.qwen4_trunk_iu4_applies(rows))
+        }
+        _ => false,
+    };
     if gpu.flags.qwen4_hc_fuse_level() < 2
-        || weight.dtype != DType::MQ6G256V2
+        || !covered
         || weight.m != write.hidden
         || write.branches != 4
         || write.rows != rows
@@ -1113,9 +1166,23 @@ fn project_output_into_hyper_write(
         || write.input.numel() < rows * wide
         || write.gates.dtype != DType::F32
         || write.gates.numel() < rows * write.branches
-        || !gpu.gemm_mq6g256v2_hcw_applies(weight.m, weight.k, rows)
     {
         return Ok(false);
+    }
+    if weight.dtype == DType::MQ4G256V2 {
+        let x = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
+        hip(gpu.gemm_mq4g256v2_hcw(
+            weight.buf,
+            &x,
+            None,
+            weight.m,
+            weight.k,
+            rows,
+            write.input,
+            write.gates,
+            write.state_bf16,
+        ))?;
+        return Ok(true);
     }
     let (x, x_is_f16) = if gpu.arch_caps.is_gfx1151() || input.dtype == DType::BF16 {
         (hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?, true)
@@ -1678,11 +1745,22 @@ pub fn execute_gated_delta_net_hc(
         ));
     }
     // On the chunked route the qkv projection is read (by the convolution)
-    // only through its BF16 rounding, so the MQ6 GEMM stores it as BF16 bits.
-    let bf16_store = |w: &WeightRef<'_>, gpu: &Gpu| {
-        chunked && w.dtype == DType::MQ6G256V2 && gpu.gemm_mq6g256v2_xf16_applies(w.k, op.rows)
+    // only through its BF16 rounding, so the MQ6 / MQ4 GEMM stores it as BF16 bits
+    // (RNE of the F32 projection, the same value the convolution would round).
+    // MQ4 has BF16 output only in the PM module and never when the IU4 route
+    // (`a4` = the projection's trunk bit; F32 output only) takes the projection.
+    let bf16_store = |w: &WeightRef<'_>, a4: u16, gpu: &Gpu| {
+        chunked
+            && match w.dtype {
+                DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, op.rows),
+                DType::MQ4G256V2 => {
+                    gpu.gemm_mq4g256v2_pm_applies(w.k, op.rows)
+                        && !(op.trunk_a4 & a4 != 0 && gpu.qwen4_trunk_iu4_applies(op.rows))
+                }
+                _ => false,
+            }
     };
-    if bf16_store(&op.qkv, gpu) {
+    if bf16_store(&op.qkv, TrunkFamily::GdnQkv.bit(), gpu) {
         projection.dtype = DType::BF16;
     }
     if matches!(phase, MixerPhase::Whole | MixerPhase::InProj) {
@@ -1714,7 +1792,7 @@ pub fn execute_gated_delta_net_hc(
     if phase == MixerPhase::OutProj {
         // The core ran in an earlier call; only the dtype decision it made for
         // its output is owed here.
-        if persistent_batch && bf16_store(&op.output, gpu) {
+        if persistent_batch && bf16_store(&op.output, TrunkFamily::GdnOut.bit(), gpu) {
             gdn_output.dtype = DType::BF16;
         }
     } else if persistent_batch {
@@ -1781,7 +1859,7 @@ pub fn execute_gated_delta_net_hc(
         }
         // The chunked route's output is BF16-rounded: stored as BF16 when the
         // output projection rotates it straight to F16 (half the bytes).
-        if bf16_store(&op.output, gpu) {
+        if bf16_store(&op.output, TrunkFamily::GdnOut.bit(), gpu) {
             gdn_output.dtype = DType::BF16;
         }
         let gated = GatedDeltaGateBatched {
@@ -1919,6 +1997,7 @@ pub fn execute_gated_delta_net_hc(
             &gdn_output,
             op.rows,
             Some(op.rotation),
+            op.trunk_a4 & TrunkFamily::GdnOut.bit() != 0,
             write,
         )? {
             *fused = true;
@@ -2421,6 +2500,7 @@ fn qsa_project_output(
             qsa_output_batch,
             op.rows,
             Some(op.rotation),
+            op.trunk_a4 & TrunkFamily::QsaO.bit() != 0,
             write,
         )?,
         None => false,
@@ -3803,6 +3883,7 @@ mod tests {
                             &input,
                             rows,
                             Some(&rotation),
+                            false,
                             &write_op!(&fused),
                         )
                         .expect("fused"),

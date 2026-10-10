@@ -215,6 +215,18 @@ static QWEN4_MQ6_X4_PM: LazyLock<bool> = LazyLock::new(|| {
 pub const QWEN4_MQ6_X4_PM_MIN_M_GFX1151: usize = 2560;
 /// See [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`].
 pub const QWEN4_MQ6_X4_PM_MIN_N_GFX1151: usize = 2048;
+/// `HIPFIRE_QWEN4_MQ4_X4_PM` (on unless `0`): exact gfx1151 MQ4G256V2 prefill
+/// (`Gpu::gemm_mq4g256v2_xf16` and its regions / HC-write siblings) runs from the
+/// certified builder module `kernels::QWEN4_MQ4_X4_PM_GFX1151`; `0` keeps hipcc
+/// `gemm_mq4g256v2_residual_wmma_gfx11_bt4` for the plain F32 launch (same bytes) and
+/// leaves BF16 output, regions and the HC-write fusion off. Read once.
+static QWEN4_MQ4_X4_PM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ4_X4_PM", true)
+});
+/// Smallest token count of the gfx1151 MQ4G256V2 shared-F16 prefill route: the floor of
+/// the hipcc BT4 route it replaces (below it the generic projection keeps its routes);
+/// one 256-token PM tile handles any partial N above it.
+pub const QWEN4_MQ4_X4_MIN_N_GFX1151: usize = 96;
 
 /// Header-planner counterpart of the launcher's selective native MQ6 arm.
 /// The process-frozen switch is supplied explicitly so shape policy is pure.
@@ -36622,6 +36634,23 @@ impl Gpu {
         batch_size: usize,
         batch_tile: usize,
     ) -> HipResult<()> {
+        self.mq4g256v2_residual_wmma_gfx1151_bt_x(a_raw, x, y, m, k, batch_size, batch_tile, None)
+    }
+
+    /// [`Gpu::gemm_mq4g256v2_residual_wmma_gfx1151_bt`] with `x_f16` (when `Some`) the
+    /// already F16 `x` device pointer, skipping the F32 -> F16 conversion.
+    #[allow(clippy::too_many_arguments)]
+    fn mq4g256v2_residual_wmma_gfx1151_bt_x(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+        x_f16: Option<*mut c_void>,
+    ) -> HipResult<()> {
         let func_name = match batch_tile {
             4 => "gemm_mq4g256v2_residual_wmma_gfx11_bt4",
             6 => "gemm_mq4g256v2_residual_wmma_gfx11_bt6",
@@ -36640,7 +36669,10 @@ impl Gpu {
             kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC,
             func_name,
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let x_f16_ptr = match x_f16 {
+            Some(ptr) => ptr,
+            None => self.ensure_fp16_x(x, batch_size * k)?,
+        };
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -41234,6 +41266,273 @@ impl Gpu {
         }
         result
     }
+
+    /// Whether the MQ4G256V2 shared-F16 prefill route applies (`HIPFIRE_QWEN4_MQ4_X4_PM`
+    /// decides only which kernel runs it): exact gfx1151, at least
+    /// [`QWEN4_MQ4_X4_MIN_N_GFX1151`] tokens, `k % 256 == 0`, no replay recording or graph
+    /// capture. [`Gpu::gemm_mq4g256v2_xf16`] then writes `Y = W·X` for F32 `y`.
+    pub fn gemm_mq4g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
+        self.arch.as_str() == "gfx1151"
+            && batch_size >= QWEN4_MQ4_X4_MIN_N_GFX1151
+            && k % 256 == 0
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// [`Gpu::gemm_mq4g256v2_xf16_applies`] with the certified builder module
+    /// (`HIPFIRE_QWEN4_MQ4_X4_PM`, on unless `0`) active: the route's BF16 output, the
+    /// a/b/z regions fold and the HC-write epilogue exist only there (the hipcc fallback
+    /// has no such twin), so their callers gate on this.
+    pub fn gemm_mq4g256v2_pm_applies(&self, k: usize, batch_size: usize) -> bool {
+        *QWEN4_MQ4_X4_PM && self.gemm_mq4g256v2_xf16_applies(k, batch_size)
+    }
+
+    /// Zero `y` (`n` rows of `m` F32) on the active stream.
+    fn zero_f32_rows(&mut self, y: &GpuTensor, m: usize, n: usize) -> HipResult<()> {
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&y.buf, 0, n * m * 4, stream),
+            None => self.hip.memset(&y.buf, 0, n * m * 4),
+        }
+    }
+
+    /// MQ4G256V2 prefill GEMM `Y = W·X` on X already rotated and converted to F16
+    /// (`x_f16`, `[batch_size × k]`, e.g. by `rotate_x_mq_batched_f16`); gate with
+    /// [`Gpu::gemm_mq4g256v2_xf16_applies`]. `y` is F32, or BF16 (the values RNE-rounded
+    /// to BF16 bits) when the PM module is active ([`Gpu::gemm_mq4g256v2_pm_applies`]).
+    ///
+    /// PM on (`HIPFIRE_QWEN4_MQ4_X4_PM`): the `qwen4_mq4_x4_pm_gfx1151_{w8,w4}[_bf16out]`
+    /// entry of `kernels::QWEN4_MQ4_X4_PM_GFX1151` (`w4` for `m <= 64`, else `w8`; grid
+    /// `[ceil(m/(16*wr)), ceil(n/256)]`, block `32*wr`). Off: zero `y`, then the hipcc
+    /// `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on the same F16 `x`. Both produce the same
+    /// bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_xf16(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !self.gemm_mq4g256v2_xf16_applies(k, batch_size) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq4g256v2_xf16: exact gfx1151, N >= 96, K % 256 == 0 and no recorder/capture required",
+            ));
+        }
+        let bf16 = y.dtype == DType::BF16;
+        let pm = *QWEN4_MQ4_X4_PM;
+        if bf16 && !pm {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq4g256v2_xf16: BF16 output needs the PM module (HIPFIRE_QWEN4_MQ4_X4_PM)",
+            ));
+        }
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        if !pm {
+            self.zero_f32_rows(y, m, batch_size)?;
+            let ptr = x_f16.buf.as_ptr();
+            return self.mq4g256v2_residual_wmma_gfx1151_bt_x(
+                a_raw, x_f16, y, m, k, batch_size, 4, Some(ptr),
+            );
+        }
+        let (name, wr): (&'static str, usize) = match (bf16, m <= 64) {
+            (false, false) => ("qwen4_mq4_x4_pm_gfx1151_w8", 8),
+            (false, true) => ("qwen4_mq4_x4_pm_gfx1151_w4", 4),
+            (true, false) => ("qwen4_mq4_x4_pm_gfx1151_w8_bf16out", 8),
+            (true, true) => ("qwen4_mq4_x4_pm_gfx1151_w4_bf16out", 4),
+        };
+        self.ensure_embedded_kernel("qwen4_mq4_x4_pm_gfx1151", kernels::QWEN4_MQ4_X4_PM_GFX1151, name)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let out_bytes = if bf16 { 2 } else { 4 };
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            + batch_size * k * 2
+            + batch_size * m * out_bytes;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [m.div_ceil(16 * wr) as u32, batch_size.div_ceil(256) as u32, 1],
+            [(32 * wr) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Three independent MQ4G256V2 F32 overwrite projections of one prepared F16 X in a
+    /// single `qwen4_mq4_x4_pm_gfx1151_w8_regions` launch (separate accumulators; bytes
+    /// equal three [`Gpu::gemm_mq4g256v2_xf16`] launches). Returns `false`, having
+    /// launched nothing, unless [`Gpu::gemm_mq4g256v2_pm_applies`] and every output is
+    /// F32; the caller then projects separately.
+    pub fn gemm_mq4g256v2_xf16_regions(
+        &mut self,
+        regions: &[(&GpuTensor, &GpuTensor, usize); 3],
+        x_f16: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.gemm_mq4g256v2_pm_applies(k, batch_size)
+            || regions.iter().any(|(_, y, _)| y.dtype != DType::F32)
+        {
+            return Ok(false);
+        }
+        let total_m: usize = regions.iter().map(|(_, _, m)| *m).sum();
+        let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(128)).sum();
+        if row_tiles == 0 || batch_size == 0 {
+            return Ok(true);
+        }
+        self.bind_thread()?;
+        let name = "qwen4_mq4_x4_pm_gfx1151_w8_regions";
+        self.ensure_embedded_kernel("qwen4_mq4_x4_pm_gfx1151", kernels::QWEN4_MQ4_X4_PM_GFX1151, name)?;
+        let mut ptrs = [
+            regions[0].0.buf.as_ptr(), regions[1].0.buf.as_ptr(), regions[2].0.buf.as_ptr(),
+            x_f16.buf.as_ptr(),
+            regions[0].1.buf.as_ptr(), regions[1].1.buf.as_ptr(), regions[2].1.buf.as_ptr(),
+        ];
+        let mut dims = [regions[0].2 as i32, regions[1].2 as i32, regions[2].2 as i32,
+            k as i32, batch_size as i32];
+        let mut params: [*mut c_void; 12] = std::array::from_fn(|i| {
+            if i < 7 {
+                ptrs.as_mut_ptr().wrapping_add(i).cast()
+            } else {
+                dims.as_mut_ptr().wrapping_add(i - 7).cast()
+            }
+        });
+        let bytes = total_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            + batch_size * k * 2 + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result = self.launch_maybe_blob(
+            name, [row_tiles as u32, batch_size.div_ceil(256) as u32, 1],
+            [256, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                for ptr in ptrs { blob.push_ptr(ptr); }
+                for dim in dims { blob.push_i32(dim); }
+                blob
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result.map(|_| true)
+    }
+
+    /// Whether [`Gpu::gemm_mq4g256v2_hcw`] applies (H4 attention epilogue,
+    /// `HIPFIRE_QWEN4_HC_FUSE >= 2`): the PM module is active
+    /// ([`Gpu::gemm_mq4g256v2_pm_applies`]) and `m % 8 == 0`. There is no hipcc twin, so
+    /// `HIPFIRE_QWEN4_MQ4_X4_PM=0` keeps the unfused projection and HC write.
+    pub fn gemm_mq4g256v2_hcw_applies(&self, m: usize, k: usize, batch_size: usize) -> bool {
+        m % 8 == 0 && self.gemm_mq4g256v2_pm_applies(k, batch_size)
+    }
+
+    /// `hyper_write(streams, mixed = W·X)` in the epilogue of the MQ4G256V2 output
+    /// projection (`qwen4_mq4_x4_pm_gfx1151_w8_hcw`; the MQ6 contract of
+    /// [`Gpu::gemm_mq6g256v2_hcw`]): `x_f16` is the rotated F16 input, `hc_streams`
+    /// (`[batch_size, 4 * m]`, BF16 bits when `hc_bf16`) receives the HC write with the
+    /// gate logits `hc_gates` (`[batch_size, 4]`), `mirror` the F32 projection when
+    /// given. Bitwise [`Gpu::gemm_mq4g256v2_xf16`] followed by the unfused HC write; gate
+    /// with [`Gpu::gemm_mq4g256v2_hcw_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_hcw(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16: &GpuTensor,
+        mirror: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        hc_streams: &GpuTensor,
+        hc_gates: &GpuTensor,
+        hc_bf16: bool,
+    ) -> HipResult<()> {
+        if !self.gemm_mq4g256v2_hcw_applies(m, k, batch_size) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq4g256v2_hcw: PM module, exact gfx1151, N >= 96, M % 8 == 0 and K % 256 == 0 required",
+            ));
+        }
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let name = "qwen4_mq4_x4_pm_gfx1151_w8_hcw";
+        self.ensure_embedded_kernel("qwen4_mq4_x4_pm_gfx1151", kernels::QWEN4_MQ4_X4_PM_GFX1151, name)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16.buf.as_ptr();
+        let mut y_ptr = mirror.map_or(std::ptr::null_mut(), |y| y.buf.as_ptr());
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut streams_ptr = hc_streams.buf.as_ptr();
+        let mut gates_ptr = hc_gates.buf.as_ptr();
+        let mut bf16_val = hc_bf16 as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut streams_ptr as *mut _ as *mut c_void,
+            &mut gates_ptr as *mut _ as *mut c_void,
+            &mut bf16_val as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [m.div_ceil(128) as u32, batch_size.div_ceil(256) as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_ptr(streams_ptr);
+                b.push_ptr(gates_ptr);
+                b.push_i32(bf16_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     pub fn gemm_mq6g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -45391,31 +45690,6 @@ impl Gpu {
         }
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
         self.gemm_zba_v2b_scatter(a_fold, xq, y_z, y_beta, y_alpha, z_m, k, n)?;
-        Ok(true)
-    }
-
-    /// Exact-activation (F16 X) MQ4G256V2 prefill for the Qwen4 trunk when
-    /// the IU4 route is off: SET semantics over the gfx1151 BT4 F16 WMMA
-    /// kernel on the rotated F32 `x`. `Ok(false)` off gfx1151, below 96 rows
-    /// or under replay/capture (the caller keeps the generic projection).
-    pub fn gemm_qwen4_trunk_mq4_xf16(
-        &mut self,
-        a: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        n: usize,
-    ) -> HipResult<bool> {
-        if self.arch != "gfx1151" || n < 96 || self.replay.is_recording() || self.graphs.capture_mode {
-            return Ok(false);
-        }
-        self.bind_thread()?;
-        match self.active_stream.as_ref() {
-            Some(stream) => self.hip.memset_async(&y.buf, 0, n * m * 4, stream)?,
-            None => self.hip.memset(&y.buf, 0, n * m * 4)?,
-        }
-        self.gemm_mq4g256v2_residual_wmma_gfx1151_bt(a, x, y, m, k, n, 4)?;
         Ok(true)
     }
 }

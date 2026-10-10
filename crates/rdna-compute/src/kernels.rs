@@ -4267,6 +4267,32 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/q
 /// SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1151`], verified before the first load
 /// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
 pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str = "31efa309145ce2cf7ed481bacfe5fb26b99db503cd4a71113d9c53162421b62a";
+/// Certified builder module of gfx1151's MQ4G256V2 trunk prefill GEMM (the builder
+/// `crates/hipfire-isa/src/kernels/qwen4_mq6_x4_gfx11.rs` over the MQ4G256V2 weight format):
+/// the exact twin of hipcc `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on a zeroed
+/// output (F16 activations, one ascending-K WMMA chain), over 256-token tiles (grid
+/// `[ceil(M/(16*wr)), ceil(N/256), 1]`, block `32*wr`, static LDS 40960). Entries
+/// `qwen4_mq4_x4_pm_gfx1151_{w4,w8}` (plain F32), `_{w4,w8}_bf16out`, `_w8_regions` and
+/// `_w8_hcw`, with the kernarg ABIs of the MQ6 entries. The runtime launches them for
+/// N >= 96 (`w4` for M <= 64); `HIPFIRE_QWEN4_MQ4_X4_PM=0` keeps hipcc bt4 and the
+/// unfused HC write.
+/// SHA-256 8281105b382654e560297af5732caff8da1198706abbc2c1f2e3f145b569574c
+/// (`sha256sum kernels/qwen4_mq4_x4_pm_gfx1151.hxaco`).
+pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq4_x4_pm_gfx1151.hxaco");
+/// Certified builder modules of the few-row MQ4G256V2 projection kernel
+/// `gemv_mq4g256v2_rows_x4_pm_gfx{1151,1201}` (`hipfire-isa emit --kernel
+/// mq4_rows_x4 --arch gfx{1151,1201}`): MTP verify (2..=8 activation rows) of four
+/// MQ4G256V2 trunk projections per launch, each output bitwise the AR decode GEMV
+/// `gemv_mq4g256v2` (96-byte kernarg: A0..A3, x, y0..y3, M0..M3, K, B; grid
+/// `[sum(ceil(M_i/2)), 1, 1]`, block 32). Default on
+/// (`HIPFIRE_QWEN4_MQ4_ROWS_PM=0` runs the per-row `gemv_mq4g256v2` launches).
+/// SHA-256 bf9d23d10ca351835f1c5983f43889d5360ffa1d1866a0ca902d07e4d830184c
+/// (`sha256sum kernels/mq4_rows_x4_pm_gfx1151.hxaco`).
+pub const MQ4_ROWS_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1151.hxaco");
+/// The gfx1201 image of [`MQ4_ROWS_X4_PM_GFX1151`].
+/// SHA-256 eb9f5700257e353bee5105d28129f0df9dbfb73ecdf4a312b85b374c1a7433aa
+/// (`sha256sum kernels/mq4_rows_x4_pm_gfx1201.hxaco`).
+pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco");
 /// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block.
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with

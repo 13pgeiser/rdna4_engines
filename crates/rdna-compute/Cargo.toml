@@ -877,5 +877,13 @@ name = "lane_rows_pm_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "mq4_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_mq4_x4_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "cb_rows_twins_gate"
 required-features = ["deltanet"]
