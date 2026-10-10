@@ -1791,8 +1791,11 @@ mod tests {
         // gfx1201 65536-workgroup limit. The two RMSNorm/FWHT modules' source
         // gained the fold's batched Phase-1a behind `HIPFIRE_RMSNORM_FOLD` +
         // `HIPFIRE_RMSNORM_P1A_BATCHED` (gfx1151 `_fold_b8`); their
-        // preprocessed source is unchanged on gfx1100/gfx1151/gfx1201.
-        const REPINNED_SINCE_P0: [&str; 14] = [
+        // preprocessed source is unchanged on gfx1100/gfx1151/gfx1201. The
+        // four `sample_top_p_parallel*` modules' penalty prepass now finds
+        // each token's (last index, count) by an LDS sort; the per-token
+        // update and every result bit are unchanged (sampler oracle dumps).
+        const REPINNED_SINCE_P0: [&str; 18] = [
             "conv1d_silu_split_qknorm_b256",
             "fused_qk_l2_norm_scale",
             "fused_rmsnorm_mq_rotate",
@@ -1807,6 +1810,10 @@ mod tests {
             "kv_cache_write_q8_0_independent",
             "kv_cache_write_q8_0_independent_masked",
             "rotate_x_mq_awq",
+            "sample_top_p_parallel",
+            "sample_top_p_parallel_fast21",
+            "sample_top_p_parallel_fast65",
+            "sample_top_p_parallel_w64",
         ];
         const FLAGS_ADDED_SINCE_P0: [&str; 2] = ["-fuse-cuid=none", "-mcode-object-version=6"];
         let mut repins_seen = HashSet::new();

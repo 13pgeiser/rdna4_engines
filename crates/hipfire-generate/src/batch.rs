@@ -3525,11 +3525,24 @@ pub fn drive_qwen_vmm_continuous_batch(
             // singleton route's own mode only (`vmm_sampled_lane`): an AR
             // lane for an AR singleton; an MTP/DFlash lane when the driver's
             // engine and the same requirements hold; otherwise it goes back
-            // to the singleton route (`sampled_handback`), never to an AR lane.
+            // to the singleton route (`sampled_handback`). A speculative
+            // singleton whose prompt + fitted budget + one draft block exceeds
+            // the speculator's context capacity falls back to AR itself
+            // (qwen.rs `spec_ctx_request_fits` guard), so that request is an
+            // AR lane here: the same algorithm the singleton runs.
             let mut sampled_handback = false;
+            let singleton_spec_fits = model.speculator.as_ref().is_some_and(|sp| {
+                crate::common::spec_ctx_request_fits(
+                    rendered.len(),
+                    crate::common::fit_max_tokens(lane_max_tokens(&key, sched), rendered.len(), model.physical_cap),
+                    sp.block_size(),
+                    sp.ctx_capacity(),
+                )
+            });
             let spec_pick: Option<(VmmLaneDecode, hipfire_runtime::spec::SpecRequestConfig)> = if s.temp > 0.0 {
                 match vmm_sampled_lane(&pending_req.original_msg, model, s) {
                     Some(VmmLaneDecode::Ar) => None,
+                    Some(VmmLaneDecode::Mtp | VmmLaneDecode::Dflash) if !singleton_spec_fits => None,
                     Some(VmmLaneDecode::Mtp) => match spec_engine {
                         Some((k, cap))
                             if !think.budgeted()
