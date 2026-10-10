@@ -50,6 +50,9 @@
 #include "r4d_common.h"
 
 #include <cfloat>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 // THE PARAMS ROW IS THE ENGINE'S STRUCT, not a restatement of it. Two independent declarations of
 // one wire format drift, and the drift is silent: a sampler reading `top_p` out of `min_p`
@@ -1393,6 +1396,38 @@ extern "C" int r4d_rad_sample_argmax(const RadArgs* a, RadStream s) {
     if (!tok) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_i32(tok));
     if (!r4d_contig(tok) || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
+    /* DEBUG: dump the sampler's INPUT row 0 at the first two calls (prefill, then first decode),
+     * with the SAME fields as the [LOGITS] dump at the GEMM entry, plus the lg pointer + pitch, so
+     * the two dumps compare pointer-for-pointer and row-for-row in one run. Sync `s` first (the
+     * logits are produced by the logit_softcap op on `s`), then copy. Gated: R4D_DIAG=1.
+     * Findings: sampler input = the GEMM buffer (same pointer); softcap applied (43.02 -> 26.77 =
+     * 30*tanh(43.02/30)); true argmax 100 (prefill) / 45518 (decode) = the GEMM argmax. */
+    static const int r4d_sampin_on = std::getenv("R4D_DIAG") ? 1 : 0;
+    if (r4d_sampin_on) {
+        static int n = 0;
+        if (n < 2) {
+            n++;
+            hipStreamSynchronize((hipStream_t)(long)(uintptr_t)s);
+            const long lgp = r4d_addr(lg);
+            std::vector<float> lh((size_t)M * (size_t)ld);
+            hipMemcpy(lh.data(), (const void*)(uintptr_t)lgp, (size_t)M * (size_t)ld, hipMemcpyDeviceToHost);
+            long double s1 = 0, s2 = 0; float mx = -1e30f; int mi = 0;
+            for (long long v = 0; v < nv; ++v) { const double x = lh[v]; s1 += x; s2 += x * x; if (lh[v] > mx) { mx = lh[v]; mi = (int)v; } }
+            const double mean = (double)(s1 / nv), var = (double)(s2 / nv) - mean * mean;
+            int top[5] = {-1,-1,-1,-1,-1}; float tv[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+            for (long long v = 0; v < nv; ++v) {
+                float x = lh[v];
+                for (int i = 4; i >= 0; --i) { if (x > tv[i]) { if (i < 4) { tv[i+1] = tv[i]; top[i+1] = top[i]; } tv[i] = x; top[i] = (int)v; break; } }
+            }
+            fprintf(stderr, "[SAMPIN] call=%d lg=%p M=%lld nv=%lld ld=%lld row0 mean=%.4f std=%.4f max=%.4f argmax=%d top5:",
+                    n, (void*)(uintptr_t)lgp, M, nv, ld, mean, sqrt(var), mx, mi);
+            for (int i = 0; i < 5; ++i) fprintf(stderr, " (%d,%.4f)", top[i], tv[i]);
+            fprintf(stderr, " row0[0..7]=");
+            for (long long v = 0; v < 8 && v < nv; ++v) fprintf(stderr, " %.4f", lh[v]);
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
     R4D_LAUNCH(r4d_sample_argmax_f32(r4d_addr(lg), r4d_addr(tok), (int)M, (int)nv, (int)ld,
                                      (long)(uintptr_t)s));
 }

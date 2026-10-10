@@ -1858,6 +1858,9 @@ idle scrubs, routing and issue dumps), `RADIANCE_OP_ORACLE*` (named ops checked 
 the operands the model issued; `scripts/oracle.sh` drives it) and `RADIANCE_OP_REPEAT` (named ops
 run a second time on the same inputs, to ask whether a kernel is a function of them). They are
 instruments, not features; grep `getenv` if you need one, and read the comment beside it first.
+`libr4d` keeps the same culture under `R4D_DIAG` (master switch for selection/store/hidden-state
+traces), `R4D_VERIFY_ATTN` and `R4D_VERIFY_OFF` (device kernels recomputed on the host and diffed),
+and `RADIANCE_TRACE_RESID` (an arch-side residual ring); all default off.
 
 ---
 

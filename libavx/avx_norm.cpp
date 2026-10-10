@@ -98,6 +98,36 @@ AVX_KERNEL(rmsnorm) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ rmsnorm_p */
+/* y = x * rsqrt(mean(x^2) + eps) -- the rmsnorm with no gain. Same one-conversion, two-pass shape
+ * and same four-accumulator sum of squares as rmsnorm; the only difference is there is no weight
+ * to widen and no gain to multiply in, because the op has no `w` at all. */
+AVX_KERNEL(rmsnorm_p) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0);
+    const float eps  = p_f32(a, "eps", 1e-6f);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || numel(y) < rows * n) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* sx = scratch_f32((size_t)n);
+        float* sy = scratch_f32_b((size_t)n);
+        const float* v = in_row(x, rowoff(x, r, n), n, sx);
+        const float ss = row_sumsq(v, n);
+        const float s = 1.0f / std::sqrt(ss / (float)n + eps);
+        const vf vs = vf_set1(s);
+        int64_t i = 0;
+        for (; i + VF_N <= n; i += VF_N)
+            vf_storeu(sy + i, vf_mul(vf_loadu(v + i), vs));
+        for (; i < n; ++i) sy[i] = v[i] * s;
+        out_row(y, rowoff(y, r, n), n, sy);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ rmsnorm_add */
 /* residual_out = x + residual;  y = rmsnorm(residual_out) * (w + wadd), with the variance from the
  * unrounded sum and the multiply from the narrowed one. */

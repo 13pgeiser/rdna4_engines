@@ -43,7 +43,11 @@ std::vector<Case> build_cases() {
         add("rmsnorm",     { HI("M", 7), HI("n", 640), HF("eps", 1e-6), HS("dtype", dt),
                              HF("wadd", 0) }, EB(7, 640, w, 2));
         add("rmsnorm",     { HI("M", 3), HI("n", 645), HF("eps", 1e-5), HS("dtype", dt),
-                             HF("wadd", 1) }, EB(3, 645, w, 2));
+                              HF("wadd", 1) }, EB(3, 645, w, 2));
+        add("rmsnorm_p",   { HI("M", 7), HI("n", 640), HF("eps", 1e-6), HS("dtype", dt) },
+                              EB(7, 640, w, 2));
+        add("rmsnorm_p",   { HI("M", 3), HI("n", 645), HF("eps", 1e-5), HS("dtype", dt) },
+                              EB(3, 645, w, 2));
         add("rmsnorm_add", { HI("M", 5), HI("n", 640), HF("eps", 1e-6), HS("dtype", dt),
                              HF("wadd", 0) }, EB(5, 640, w, 4));
         add("layernorm",   { HI("M", 5), HI("n", 645), HF("eps", 1e-5), HS("dtype", dt) },
@@ -51,11 +55,15 @@ std::vector<Case> build_cases() {
         add("add",         { HI("M", 9), HI("n", 645), HS("dtype", dt) }, EB(9, 645, w, 3));
         add("mul",         { HI("M", 9), HI("n", 640), HS("dtype", dt) }, EB(9, 640, w, 3));
         add("silu_mul",    { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 3));
+        add("gelu_mul",    { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 3));
         add("gelu",        { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("silu",        { HI("M", 6), HI("n", 640), HS("dtype", dt) }, EB(6, 640, w, 2));
         add("sigmoid",     { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("fill",        { HI("M", 6), HI("n", 645), HS("dtype", dt), HF("value", 1.3) },
             EB(6, 645, w, 1));
+        add("logit_softcap", { HI("M", 6), HI("n", 645), HF("cap", 30.0), HS("dtype", dt) },
+                              EB(6, 645, w, 2));
+        add("scale",         { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("softmax",     { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("gather_rows", { HI("M", 6), HI("n", 640), HS("dtype", dt) }, EB(6, 640, w, 2));
         for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid" })
@@ -297,8 +305,17 @@ std::vector<Case> build_cases() {
         add("qsa_block_key", { HI("M", 12), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
                                HF("eps", 1e-6), HF("theta", 1e7), HF("scale", 1), HF("wadd", 0),
                                HS("dtype", dt), HF("yarn_factor", 2), HF("yarn_low", 14),
-                               HF("yarn_high", 22), HF("yarn_magnitude", 1.069314718) });
+                                HF("yarn_high", 22), HF("yarn_magnitude", 1.069314718) });
     }
+    /* The proportional ladder: a partial rotary (rotary_dim < head_dim) with `ladder` head, so the
+     * denominator is head_dim and libavx's answer must agree with libref's on it. */
+    for (const char* mode : { "neox", "gptj" }) {
+        add("rope", { HI("M", 12), HI("head_dim", 64), HI("n_head", 4), HI("n_head_kv", 2),
+                      HF("theta", 10000.0), HF("scale", 1.0), HS("mode", mode),
+                      HI("rotary_dim", 32), HS("ladder", "head") });
+    }
+    add("rope_table", { HI("M", 12), HI("rot", 32), HF("theta", 10000.0), HF("scale", 1.0),
+                        HS("dtype", "f32"), HI("head_dim", 64), HS("ladder", "head") });
     /* The multi-component forms: Qwen3-VL's interleaved M-RoPE over a partial rotary, and a vision
      * tower's 2-D axial rotary over a whole 72-wide head. */
     for (const char* dt : { "f32", "bf16" }) {

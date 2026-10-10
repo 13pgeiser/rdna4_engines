@@ -1272,6 +1272,17 @@ extern "C" int r4d_shape_scale_rows(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* The per-tensor scalar: one [1] weight broadcast over the whole [M, n] extent. `s` is the middle
+ * operand; its extent is 1, not M (that would be scale_rows) and not M*n (that would be a
+ * per-element mask). The scalar's dtype is the stream's, so a bf16 or f32 `s` both read. */
+extern "C" int r4d_shape_scale(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, 1), opd(D, M, n) };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_router_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = pi(p, n_p, "M");
     const int64_t ne = pi(p, n_p, "n_expert");

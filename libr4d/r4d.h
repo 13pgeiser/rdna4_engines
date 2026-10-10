@@ -108,6 +108,24 @@ int  r4d_attn_h128_gqa4_have_prefill(void);
 // Bytes of split-KV partial buffer one decode launch of this shape needs. Independent of the cache
 // dtype: the partials are f16 either way.
 long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a);
+ // The Gemma 4 dense sliding-window geometry: head_dim 256, 2 queries per KV head, sliding window.
+ // Both bands: the decode band (q_len*gqa <= 64, i.e. q_len <= 32) and the windowed prefill band
+ // (a prefill-length query, WIN on). The prefill leg is the same r4d_attn_prefill_kernel the
+ // h256/gqa6 and h512/gqa8 dispatches instantiate, with the window bit turned on.
+ int  r4d_attn_prefill_h256_gqa2_fp8kv (const R4DArgs* a, hipStream_t stream);
+ int  r4d_attn_prefill_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t stream);
+ int  r4d_attn_decode_h256_gqa2_fp8kv  (const R4DArgs* a, hipStream_t stream);
+ int  r4d_attn_decode_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t stream);
+ long r4d_attn_decode_h256_gqa2_scratch_bytes(const R4DArgs* a);
+// The Gemma 4 dense global geometry: head_dim 512, 8 queries per KV head, full attention (window 0).
+// The one head_dim the library had not compiled -- a stand-alone instantiation, not the gqa8
+// parameterised body (whose prefill tile of 48 does not fit 512-channel tiles in LDS). Both legs
+// spill ~384 VGPRs at this head; a 3b tuning question, not a 3a one.
+int  r4d_attn_prefill_h512_gqa8_fp8kv (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_prefill_h512_gqa8_bf16kv(const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h512_gqa8_fp8kv  (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h512_gqa8_bf16kv (const R4DArgs* a, hipStream_t stream);
+long r4d_attn_decode_h512_gqa8_scratch_bytes(const R4DArgs* a);
 // The geometry the attention kernels above are compiled for, so a caller can test a model against
 // it instead of discovering the mismatch at the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);
@@ -892,6 +910,11 @@ void r4d_dequant_w4_bf16(long wq, long ws, long out, int N, int K, int group, in
 // whole table, an unsliced lookup.
 int r4d_embed_lookup_bf16(long tok, long wte, long x, int M, int n_embd, int n_vocab,
                           int vocab_off, int x_ld, long stream);
+// The same lookup with a RUNTIME gather scale on the rows that are found (x = table[id] *
+// scale); 1.0 is the plain copy, and a missed row still writes zero rather than zero * scale.
+// Gemma 4's embedding is scaled by sqrt(n_embd) at the lookup, not baked into the table.
+int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd, int n_vocab,
+                                 int vocab_off, int x_ld, float scale, long stream);
 int r4d_gather_rows_bf16(long x, long idx, long y, int M, int n, int src_rows,
                          int x_ld, int y_ld, long stream);
 // y = x * rsqrt(mean(x^2) + eps) * (w + wadd).  `wadd` is GemmaRMSNorm's `1 +`, added in f32 after
@@ -900,6 +923,9 @@ int r4d_gather_rows_bf16(long x, long idx, long y, int M, int n, int src_rows,
 // is -- or bf16. The activation either side is bf16 in both cases.
 int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps, float wadd, int w_f32,
                      int x_ld, int y_ld, long stream);
+// y = x * rsqrt(mean(x^2) + eps).  The weightless RMS: the same two-pass sum of squares as rmsnorm
+// with the gain multiply dropped, gemma's bare value normalisation.
+int r4d_rmsnorm_p_bf16(long x, long y, int M, int n, float eps, int x_ld, int y_ld, long stream);
 // `op` 0 sums, 1 multiplies.  A `b_ld` of 0 is the ONE broadcast form: every row reads the same n
 // elements, which is what makes a bias add this op rather than a second one.
 int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
@@ -909,6 +935,9 @@ int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream);
 // y[.., i] = silu(gu[.., i]) * gu[.., n + i].  The GATE IS THE FIRST HALF -- the order rad-convert
 // fuses gate_proj and up_proj in.
 int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream);
+// y[.., i] = gelu_tanh(gu[.., i]) * gu[.., n + i].  The GATE IS THE FIRST HALF, the tanh
+// approximation (gemma's gelu_pytorch_tanh), not the erf one.
+int r4d_gelu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream);
 // In place over `n_rope_heads` consecutive heads of a row; anything after them (the V heads of a
 // fused projection) is untouched.  `gptj` 0 pairs i with i + rot/2 (NeoX, and mrope, which is the
 // same arithmetic when every position component is equal); 1 pairs 2i with 2i+1.  `rot` may be less
@@ -918,9 +947,12 @@ int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads, int
                   float theta, float rscale, int row_pitch, long stream);
 // The multi-component rotary (docs/OPS.md, `rope`): `mode` 2 mrope, 3 imrope, 4 axial over
 // `sec[0..n_sec)`, component c of token m at pos[c * plane + m]. plane 0 is the call above.
-int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int gptj,
-                     float theta, float rscale, int row_pitch, int mode, const int* sec, int n_sec,
-                     int plane, long stream);
+// `den` is the width the base ladder's exponent divides by: `rot` (the `rotary` ladder, the
+// default) or `head_dim` (the `head` ladder, the proportional variant). The `rope` row resolves it
+// from its `ladder` param; the plain form above passes `rot`.
+int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int den,
+                      int gptj, float theta, float rscale, int row_pitch, int mode, const int* sec,
+                      int n_sec, int plane, long stream);
 // C[M,N] f32 = A[M,K] bf16 @ W[N,K]^T bf16, f32 accumulate. THE OUTPUT IS f32 and that is why this
 // is not r4d_gemm_bf16_nt_m16 under another name: the engine declares its logits buffer f32,
 // because a bf16 logit has eight bits of mantissa and a nucleus cut compares neighbouring

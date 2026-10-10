@@ -63,6 +63,7 @@ extern "C" {
 
 /* ---- elementwise and norms */
 int ref_rmsnorm            (const RadArgs*, RadStream);
+int ref_rmsnorm_p          (const RadArgs*, RadStream);
 int ref_rmsnorm_add        (const RadArgs*, RadStream);
 int ref_hc_enter           (const RadArgs*, RadStream);
 int ref_hc_read            (const RadArgs*, RadStream);
@@ -73,6 +74,7 @@ int ref_grid_embed         (const RadArgs*, RadStream);
 int ref_add                (const RadArgs*, RadStream);
 int ref_mul                (const RadArgs*, RadStream);
 int ref_silu_mul           (const RadArgs*, RadStream);
+int ref_gelu_mul           (const RadArgs*, RadStream);
 int ref_act_mul            (const RadArgs*, RadStream);
 int ref_mul_weight         (const RadArgs*, RadStream);
 int ref_seg_mean           (const RadArgs*, RadStream);
@@ -86,6 +88,8 @@ int ref_attn_local_rel     (const RadArgs*, RadStream);
 int ref_gelu               (const RadArgs*, RadStream);
 int ref_silu               (const RadArgs*, RadStream);
 int ref_sigmoid            (const RadArgs*, RadStream);
+int ref_logit_softcap      (const RadArgs*, RadStream);
+int ref_scale              (const RadArgs*, RadStream);
 int ref_fill               (const RadArgs*, RadStream);
 int ref_gather_rows        (const RadArgs*, RadStream);
 int ref_scatter_rows       (const RadArgs*, RadStream);
@@ -192,6 +196,7 @@ int ref_sample_logprobs    (const RadArgs*, RadStream);
     int fn##_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 
 REF_SHAPE_FN(ref_rmsnorm);
+REF_SHAPE_FN(ref_rmsnorm_p);
 REF_SHAPE_FN(ref_rmsnorm_add);
 REF_SHAPE_FN(ref_hc_enter);
 REF_SHAPE_FN(ref_hc_read);
@@ -202,6 +207,7 @@ REF_SHAPE_FN(ref_grid_embed);
 REF_SHAPE_FN(ref_add);
 REF_SHAPE_FN(ref_mul);
 REF_SHAPE_FN(ref_silu_mul);
+REF_SHAPE_FN(ref_gelu_mul);
 REF_SHAPE_FN(ref_act_mul);
 REF_SHAPE_FN(ref_mul_weight);
 REF_SHAPE_FN(ref_seg_mean);
@@ -215,6 +221,8 @@ REF_SHAPE_FN(ref_attn_local_rel);
 REF_SHAPE_FN(ref_gelu);
 REF_SHAPE_FN(ref_silu);
 REF_SHAPE_FN(ref_sigmoid);
+REF_SHAPE_FN(ref_logit_softcap);
+REF_SHAPE_FN(ref_scale);
 REF_SHAPE_FN(ref_fill);
 REF_SHAPE_FN(ref_gather_rows);
 REF_SHAPE_FN(ref_scatter_rows);

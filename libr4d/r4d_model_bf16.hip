@@ -49,8 +49,359 @@
 #include "r4d_fp8_wmma.h"
 
 #include <cstdlib>
+#include <vector>
+#include <cmath>
+#include <cstring>
+
+// ================================================================== attn_paged verify
+// Copy n bytes from a (possibly host-page-table-unmapped) device VA into a regular allocation, via
+// the DEVICE page table (mapped) -- a host DtoH copy on such a VA faults. Global scope so the
+// verify (which reads the KV cache) can use it. Utility for the env-gated verify path only.
+__global__ void r4d_copy8_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, size_t n) {
+    for (size_t i = blockIdx.x * (size_t)256 + threadIdx.x; i < n;
+         i += (size_t)gridDim.x * 256)
+        dst[i] = src[i];
+}
+// DEBUG (env-gated, R4D_VERIFY_OFF): run the paged-attention kernel, then recompute the SAME
+// attention on the host (the libref two-pass-softmax formula, f32) from the bf16/fp8 q and the
+// paged k/v the kernel read, and report the max deviation. A deviation well above the bf16
+// rounding (~1e-3) means the device kernel is wrong for the real (paged, ragged) inputs. GLOBAL
+// scope (not the anonymous namespace below) so the attention wrappers -- a different translation
+// unit -- can call it. Only the first few of each band (decode / prefill) are checked.
+static float attn_verify_bf16(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+static float attn_verify_e4m3(uint8_t b) {
+    const float sign = (b & 0x80u) ? -1.0f : 1.0f;
+    const uint32_t ex = (uint32_t)(b >> 3) & 0x0Fu, mn = (uint32_t)b & 0x07u;
+    if (ex == 0) return sign * (float)mn * (1.0f / 512.0f);
+    return sign * (1.0f + (float)mn / 8.0f) * std::ldexp(1.0f, (int)ex - 7);
+}
+int g_attn_decode_verify_n = 0;
+int g_attn_prefill_verify_n = 0;
+
+/* Diagnostics master switch (degenerate-output investigation, 2026-10-08): OFF by default. Set
+ * R4D_DIAG=1 to arm the env-gated probes; the probe families each keep their own env:
+ * R4D_VERIFY_ATTN=1 -> verify_attn_paged (KV store + attention recompute, maxd);
+ * the [KVCHK]/[HIDD]/[LOGITS] store/GEMM probes and [SAMPIN] (sampler input) run their capped
+ * dumps under R4D_DIAG alone. Cleared 2026-10: KV store byte-exact, attention maxd ~0.04,
+ * hidden state rich, logits sharp, softcap applied, sampler argmax correct. */
+int r4d_diag_on() {
+    static const int v = std::getenv("R4D_DIAG") ? 1 : 0;
+    return v;
+}
+
+void verify_attn_paged(const R4DArgs* r, long stream, int kv_is_fp8, int is_decode) {
+    static int on = -1;
+    if (on < 0) { const char* e = std::getenv("R4D_VERIFY_ATTN"); on = (e && *e) ? 1 : 0; }
+    if (!on) return;
+    int* cnt = is_decode ? &g_attn_decode_verify_n : &g_attn_prefill_verify_n;
+    const int cap = is_decode ? 10 : 4;   /* decode 10 covers the first global (h512) layer too */
+    if (*cnt >= cap) return;
+    (*cnt)++;
+    /* SYNC BEFORE ANY DtoH COPY (see verify_rmsnorm_p): the q / kv / out buffers are the products
+     * of earlier ops on `stream`, and a subsequent op reuses the workspace. The DtoH copies below
+     * run on the DEFAULT stream (concurrent with `stream`), so without this sync they can read a
+     * buffer while a later op overwrites it. Syncing `stream` first guarantees the producers + this
+     * kernel have completed and the consumer has not yet been launched. */
+    hipStreamSynchronize((hipStream_t)stream);
+
+    const int ew         = kv_is_fp8 ? 1 : 2;
+    const int num_seqs   = r->num_seqs, q_len = r->q_len, q_heads = r->q_heads,
+              kv_heads   = r->kv_heads, hd = r->head_dim, bs = r->block_size,
+              max_blocks = r->max_blocks;
+    const bool ragged    = (r->cu_q != nullptr);
+    const int total_q    = ragged ? r->total_q : num_seqs * q_len;
+    const int gqa        = kv_heads > 0 ? q_heads / kv_heads : 1;
+    fprintf(stderr, "[VERIFY attn_%s] START seqs=%d q_len=%d tot_q=%d qh=%d kvh=%d hd=%d bs=%d mb=%d kvs=%ld kvh_s=%ld\n",
+            is_decode ? "decode" : "prefill", num_seqs, q_len, total_q,
+            q_heads, kv_heads, hd, bs, max_blocks,
+            (long)r->kv_block_stride, (long)r->kv_head_stride);
+
+    std::vector<int> bt_h((size_t)num_seqs * (size_t)max_blocks);
+    hipMemcpy(bt_h.data(), r->block_table, bt_h.size() * 4, hipMemcpyDeviceToHost);
+    std::vector<int> su_h(num_seqs);
+    hipMemcpy(su_h.data(), r->seqused_k, su_h.size() * 4, hipMemcpyDeviceToHost);
+    std::vector<int> cu_h(num_seqs + 1);
+    if (ragged) hipMemcpy(cu_h.data(), r->cu_q, cu_h.size() * 4, hipMemcpyDeviceToHost);
+    else for (int s = 0; s <= num_seqs; ++s) cu_h[s] = s * q_len;
+    std::vector<float> kds_h(num_seqs * kv_heads), vds_h(num_seqs * kv_heads);
+    if (r->k_descale) hipMemcpy(kds_h.data(), r->k_descale, kds_h.size() * 4, hipMemcpyDeviceToHost);
+    if (r->v_descale) hipMemcpy(vds_h.data(), r->v_descale, vds_h.size() * 4, hipMemcpyDeviceToHost);
+    fprintf(stderr, "[VERIFY attn_%s] P1 small-copies done su0=%d\n", is_decode ? "decode" : "prefill", su_h[0]);
+
+    /* Only the blocks the block tables actually reference are read, so copy just those (a full
+     * cache can be gigabytes; a decode step touches one). */
+    std::vector<int> used;
+    for (int s = 0; s < num_seqs; ++s) {
+        int nb = (su_h[s] + bs - 1) / bs;
+        if (nb > max_blocks) nb = max_blocks;
+        for (int b = 0; b < nb; ++b) {
+            int blk = bt_h[(size_t)s * max_blocks + b];
+            if (blk < 0) continue;
+            bool seen = false;
+            for (int u : used) if (u == blk) { seen = true; break; }
+            if (!seen) used.push_back(blk);
+        }
+    }
+    fprintf(stderr, "[VERIFY attn_%s] P2 used_n=%zu used0=%d\n", is_decode ? "decode" : "prefill", used.size(), used.empty() ? -1 : used[0]);
+    /* The cache DtoH copy faults (host page table unmapped). Read the used blocks via a DEVICE copy
+     * kernel (the device page table IS mapped -- the store kernel wrote the cache fine) into a
+     * regular allocation, then DtoH that. TEMP (degenerate-output investigation). */
+    const size_t per_bytes = (size_t)r->kv_block_stride * (size_t)ew;
+    std::vector<uint8_t> kv_h(used.size() * per_bytes);
+    {
+        uint8_t* reg = nullptr;
+        if (hipMalloc(&reg, kv_h.size()) == hipSuccess && reg) {
+            for (size_t i = 0; i < used.size(); ++i)
+                r4d_copy8_kernel<<<(unsigned)((per_bytes + 255) / 256), 256>>>(
+                    (const uint8_t*)r->kv + (size_t)used[i] * per_bytes, reg + i * per_bytes, per_bytes);
+            hipDeviceSynchronize();
+            hipMemcpy(kv_h.data(), reg, kv_h.size(), hipMemcpyDeviceToHost);
+            hipFree(reg);
+        }
+    }
+    fprintf(stderr, "[VERIFY attn_%s] P3 kv_h done bytes=%zu\n", is_decode ? "decode" : "prefill", kv_h.size());
+    auto blkidx = [&](int blk) -> int {
+        for (size_t i = 0; i < used.size(); ++i) if (used[i] == blk) return (int)i;
+        return -1;
+    };
+
+    std::vector<uint16_t> qh((size_t)total_q * (size_t)q_heads * (size_t)hd);
+    hipMemcpy(qh.data(), r->q, qh.size() * 2, hipMemcpyDeviceToHost);
+    fprintf(stderr, "[VERIFY attn_%s] P4 qh done bytes=%zu\n", is_decode ? "decode" : "prefill", qh.size() * 2);
+    std::vector<uint16_t> oh((size_t)total_q * (size_t)q_heads * (size_t)hd);
+    hipMemcpy(oh.data(), r->out, oh.size() * 2, hipMemcpyDeviceToHost);
+    fprintf(stderr, "[VERIFY attn_%s] P5 oh done bytes=%zu\n", is_decode ? "decode" : "prefill", oh.size() * 2);
+
+    float maxq = 0.0f;
+    for (size_t i = 0; i < qh.size(); ++i) { float a = fabsf(attn_verify_bf16(qh[i])); if (a > maxq) maxq = a; }
+
+    /* Cap the host recompute so a large prefill (total_q * ctx big) cannot stall the server; the
+     * decode band (total_q 1) is always well under it. */
+    int ctx_max = 0;
+    for (int s = 0; s < num_seqs; ++s) if (su_h[s] > ctx_max) ctx_max = su_h[s];
+    const long long work = (long long)total_q * (long long)q_heads * (long long)ctx_max * (long long)hd;
+    if (work > 200000000LL) {
+        fprintf(stderr, "[VERIFY attn_%s] SKIPPED (work=%lld>cap) seqs=%d q_len=%d tot_q=%d qh=%d kvh=%d hd=%d win=%d scale=%.3g maxq=%.6g\n",
+                is_decode ? "decode" : "prefill", work, num_seqs, q_len, total_q, q_heads, kv_heads,
+                hd, r->window, r->scale, maxq);
+        return;
+    }
+
+    float maxd = 0.0f; int bad = 0, ntot = 0;
+    for (int t = 0; t < total_q; ++t) {
+        int seq = 0, i = 0, ctx = 0, qlen_seq = 0;
+        if (ragged) {
+            for (int s = 0; s < num_seqs; ++s)
+                if (t >= cu_h[s] && t < cu_h[s + 1]) { seq = s; break; }
+            i = t - cu_h[seq];
+            ctx = su_h[seq];
+            qlen_seq = cu_h[seq + 1] - cu_h[seq];
+        } else {
+            seq = t / q_len;
+            i = t % q_len;
+            ctx = su_h[seq];
+            qlen_seq = q_len;
+        }
+        const int pos = ctx - qlen_seq + i;
+        for (int h = 0; h < q_heads; ++h) {
+            const int kh = h / gqa;
+            const float kds = r->k_descale ? kds_h[seq * kv_heads + kh] : 1.0f;
+            const float vds = r->v_descale ? vds_h[seq * kv_heads + kh] : 1.0f;
+            auto visible = [&](int j) -> bool {
+                if (r->causal) {
+                    if (j > pos) return false;
+                    if (r->window > 0 && (pos - j) >= r->window) return false;
+                } else {
+                    if (j >= ctx) return false;
+                    if (r->window > 0) { int d = pos - j; if (d >= r->window || d <= -r->window) return false; }
+                }
+                return true;
+            };
+            auto kdot = [&](int j, int idx) -> float {
+                float dot = 0.0f;
+                for (int d = 0; d < hd; ++d) {
+                    const long off = (long)idx * r->kv_block_stride + (long)kh * r->kv_head_stride
+                                   + (long)(j % bs) * 2 * hd + d;
+                    const uint8_t* p = kv_h.data() + off * ew;
+                    float k = kv_is_fp8 ? attn_verify_e4m3(p[0]) : attn_verify_bf16(*(const uint16_t*)p);
+                    dot += attn_verify_bf16(qh[(size_t)t * q_heads * hd + (size_t)h * hd + d]) * (k * kds);
+                }
+                return dot * r->scale;
+            };
+            float mx = -INFINITY;
+            for (int j = 0; j < ctx; ++j) {
+                if (!visible(j)) continue;
+                if (j / bs >= max_blocks) break;
+                int blk = bt_h[(size_t)seq * max_blocks + (j / bs)];
+                if (blk < 0) continue;
+                int idx = blkidx(blk);
+                if (idx < 0) continue;
+                float dot = kdot(j, idx);
+                if (dot > mx) mx = dot;
+            }
+            std::vector<float> ref(hd, 0.0f);
+            if (mx != -INFINITY) {
+                float sum = 0.0f;
+                for (int j = 0; j < ctx; ++j) {
+                    if (!visible(j)) continue;
+                    if (j / bs >= max_blocks) break;
+                    int blk = bt_h[(size_t)seq * max_blocks + (j / bs)];
+                    if (blk < 0) continue;
+                    int idx = blkidx(blk);
+                    if (idx < 0) continue;
+                    float dot = kdot(j, idx);
+                    const float w = std::exp(dot - mx);
+                    sum += w;
+                    for (int d = 0; d < hd; ++d) {
+                        const long off = (long)idx * r->kv_block_stride + (long)kh * r->kv_head_stride
+                                       + (long)(j % bs) * 2 * hd + hd + d;
+                        const uint8_t* p = kv_h.data() + off * ew;
+                        float v = kv_is_fp8 ? attn_verify_e4m3(p[0]) : attn_verify_bf16(*(const uint16_t*)p);
+                        ref[d] += w * (v * vds);
+                    }
+                }
+                const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                for (int d = 0; d < hd; ++d) ref[d] *= inv;
+            }
+            for (int d = 0; d < hd; ++d) {
+                float dv = fabsf(attn_verify_bf16(oh[(size_t)t * q_heads * hd + (size_t)h * hd + d]) - ref[d]);
+                if (dv > maxd) maxd = dv;
+                if (dv > 1e-2f) bad++;
+                ntot++;
+            }
+        }
+    }
+    fprintf(stderr, "[VERIFY attn_%s] seqs=%d q_len=%d tot_q=%d qh=%d kvh=%d hd=%d bs=%d mb=%d win=%d caus=%d scale=%.3g maxd=%.6g bad=%d/%d maxq=%.6g\n",
+            is_decode ? "decode" : "prefill", num_seqs, q_len, total_q, q_heads, kv_heads, hd, bs,
+            max_blocks, r->window, r->causal, r->scale, maxd, bad, ntot, maxq);
+    if (*cnt == 1) {
+        fprintf(stderr, "  q  :"); for (int d = 0; d < 8 && d < hd; ++d) fprintf(stderr, " %g", attn_verify_bf16(qh[d]));
+        fprintf(stderr, "  out:"); for (int d = 0; d < 8 && d < hd; ++d) fprintf(stderr, " %g", attn_verify_bf16(oh[d]));
+        fprintf(stderr, "\n");
+    }
+}
 
 namespace {
+
+// DEBUG (env-gated, R4D_VERIFY_OFF=1): run the device kernel, then recompute the same op on the
+// host (the libref formula, f32) from the bf16 input the kernel read, and report the max deviation.
+// A deviation well above the bf16 rounding (~1e-3) means the device kernel is wrong for the real
+// shape; a deviation at the bf16 rounding means it is correct. Only the first few calls are
+// checked. OFF by default: the DtoH syncs inside perturb stream timing, which the KV-isolation
+// investigation cannot afford.
+int r4d_verify_on() {
+    static int on = -1;
+    if (on < 0) { const char* e = std::getenv("R4D_VERIFY_OFF"); on = (e && *e) ? 1 : 0; }
+    return on;
+}
+int g_rmsnorm_p_verify_n = 0;
+int g_gelu_mul_verify_n = 0;
+
+// The CORRECT bf16 -> f32 decode: the 16-bit pattern is the high half of the f32 bits. (Casting a
+// uint16_t to float gives the integer value of the pattern, 0..65535, which is NOT the value.)
+static float bf16_to_f32(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+void verify_rmsnorm_p(const uint16_t* x, const uint16_t* y, int M, int n, int x_ld, int y_ld,
+                      float eps, long stream) {
+    if (!r4d_verify_on() || g_rmsnorm_p_verify_n >= 4) return;
+    g_rmsnorm_p_verify_n++;
+    /* SYNC BEFORE ANY DtoH COPY: the input `x` is the output of an earlier GEMM on `stream`, and a
+     * subsequent GEMM (launched after this verify returns) reuses the workspace and overwrites it.
+     * The DtoH copy below runs on the DEFAULT stream (concurrent with `stream`), so without this
+     * sync it can read `x` while the next GEMM is overwriting it -- a race that produced false
+     * O(1e37) "garbage" readings. Syncing `stream` first guarantees the producer GEMM + this kernel
+     * have completed and the consumer GEMM has not yet been launched. */
+    hipStreamSynchronize((hipStream_t)stream);
+    std::vector<uint16_t> xh((size_t)M * (size_t)x_ld);
+    hipMemcpy(xh.data(), x, (size_t)M * (size_t)x_ld * 2, hipMemcpyDeviceToHost);
+    std::vector<float> xf((size_t)M * (size_t)x_ld);
+    for (size_t i = 0; i < xf.size(); ++i) xf[i] = bf16_to_f32(xh[i]);
+    std::vector<float> ref((size_t)M * (size_t)y_ld);
+    for (int m = 0; m < M; ++m) {
+        float ss = 0.0f;
+        for (int i = 0; i < n; ++i) { float v = xf[(size_t)m * (size_t)x_ld + i]; ss += v * v; }
+        float s = 1.0f / sqrtf(ss / (float)n + eps);
+        for (int i = 0; i < n; ++i)
+            ref[(size_t)m * (size_t)y_ld + i] = xf[(size_t)m * (size_t)x_ld + i] * s;
+    }
+    std::vector<uint16_t> yh((size_t)M * (size_t)y_ld);
+    hipMemcpy(yh.data(), y, (size_t)M * (size_t)y_ld * 2, hipMemcpyDeviceToHost);
+    float maxd = 0.0f; int bad = 0;
+    float maxin = 0.0f;
+    for (size_t i = 0; i < xf.size(); ++i) { float a = fabsf(xf[i]); if (a > maxin) maxin = a; }
+    for (int m = 0; m < M; ++m) for (int i = 0; i < n; ++i) {
+        float d = fabsf(bf16_to_f32(yh[(size_t)m * (size_t)y_ld + i]) - ref[(size_t)m * (size_t)y_ld + i]);
+        if (d > maxd) maxd = d;
+        if (d > 1e-2f) bad++;
+    }
+    // sample: first 8 input, first 8 device-out, first 8 ref (all as f32); maxin = max-abs of the input (realistic ~O(1) vs GARBAGE ~O(1e37))
+    fprintf(stderr, "[VERIFY rmsnorm_p] M=%d n=%d x_ld=%d y_ld=%d eps=%.3g maxd=%.6g bad=%d/%d maxin=%.6g\n",
+            M, n, x_ld, y_ld, eps, maxd, bad, M * n, maxin);
+    if (g_rmsnorm_p_verify_n == 1) {
+        fprintf(stderr, "  in :"); for (int i = 0; i < 8 && i < n; ++i) fprintf(stderr, " %g", xf[i]);
+        fprintf(stderr, "  out:"); for (int i = 0; i < 8 && i < n; ++i) fprintf(stderr, " %g", bf16_to_f32(yh[i]));
+        fprintf(stderr, "  ref:"); for (int i = 0; i < 8 && i < n; ++i) fprintf(stderr, " %g", ref[i]);
+        fprintf(stderr, "\n");
+    }
+}
+
+void verify_gelu_mul(const uint16_t* gu, const uint16_t* y, int M, int n, int gu_ld, int y_ld,
+                     long stream) {
+    if (!r4d_verify_on() || g_gelu_mul_verify_n >= 4) return;
+    g_gelu_mul_verify_n++;
+    /* SYNC BEFORE ANY DtoH COPY (see verify_rmsnorm_p): the input `gu` is the output of the
+     * gate_up GEMM on `stream`, and a subsequent GEMM reuses the workspace and overwrites it.
+     * The DtoH copy below runs on the DEFAULT stream (concurrent with `stream`), so without this
+     * sync it can read `gu` while the next GEMM is overwriting it -- a race that produced false
+     * O(1e37) "garbage" readings. Syncing `stream` first guarantees the gate_up GEMM + this kernel
+     * have completed and the consumer GEMM has not yet been launched. */
+    hipStreamSynchronize((hipStream_t)stream);
+    std::vector<uint16_t> guh((size_t)M * (size_t)gu_ld);
+    hipMemcpy(guh.data(), gu, (size_t)M * (size_t)gu_ld * 2, hipMemcpyDeviceToHost);
+    std::vector<float> ref((size_t)M * (size_t)y_ld);
+    const double k0 = 0.7978845608028654, k1 = 0.044715;
+    for (int m = 0; m < M; ++m)
+        for (int i = 0; i < n; ++i) {
+            double g = (double)bf16_to_f32(guh[(size_t)m * (size_t)gu_ld + i]);
+            double u = (double)bf16_to_f32(guh[(size_t)m * (size_t)gu_ld + n + i]);
+            ref[(size_t)m * (size_t)y_ld + i] = (float)(0.5 * g * (1.0 + std::tanh(k0 * (g + k1 * g * g * g))) * u);
+        }
+    std::vector<uint16_t> yh((size_t)M * (size_t)y_ld);
+    hipMemcpy(yh.data(), y, (size_t)M * (size_t)y_ld * 2, hipMemcpyDeviceToHost);
+    float maxd = 0.0f; int bad = 0;
+    float maxg = 0.0f;
+    for (int m = 0; m < M; ++m) for (int i = 0; i < n; ++i) {
+        float a = fabsf((float)bf16_to_f32(guh[(size_t)m * (size_t)gu_ld + i]));
+        if (a > maxg) maxg = a;
+    }
+    for (int m = 0; m < M; ++m) for (int i = 0; i < n; ++i) {
+        float d = fabsf(bf16_to_f32(yh[(size_t)m * (size_t)y_ld + i]) - ref[(size_t)m * (size_t)y_ld + i]);
+        if (d > maxd) maxd = d;
+        if (d > 1e-2f) bad++;
+    }
+    /* maxg = max-abs of the gate (first half of gu): realistic ~O(1) vs GARBAGE ~O(1e37). If maxg is
+     * now realistic after the sync-before-copy fix, the O(1e37) readings were a verify artifact
+     * (a race with a subsequent GEMM overwriting the workspace). If maxg is still ~O(1e37), the
+     * gate_up GEMM is genuinely producing garbage. */
+    fprintf(stderr, "[VERIFY gelu_mul] M=%d n=%d gu_ld=%d y_ld=%d maxd=%.6g bad=%d/%d maxg=%.6g\n",
+            M, n, gu_ld, y_ld, maxd, bad, M * n, maxg);
+    if (g_gelu_mul_verify_n == 1) {
+        fprintf(stderr, "  g  :"); for (int i = 0; i < 8 && i < n; ++i) fprintf(stderr, " %g", bf16_to_f32(guh[i]));
+        fprintf(stderr, "  out:"); for (int i = 0; i < 8 && i < n; ++i) fprintf(stderr, " %g", bf16_to_f32(yh[i]));
+        fprintf(stderr, "  ref:"); for (int i = 0; i < 8 && i < n; ++i) fprintf(stderr, " %g", ref[i]);
+        fprintf(stderr, "\n");
+    }
+}
 
 constexpr uint32_t kWave    = 32;
 constexpr uint32_t kThreads = 256;
@@ -152,7 +503,7 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
         else                  dst[0] = 0;
         return;
     }
-    const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf16_to_f32(*(const uint16_t*)sc);
+    const float s = !sc ? 1.0f : sc_f32 ? *(const float*)sc : bf2f(*(const uint16_t*)sc);
     const size_t at = (size_t)id * n_embd + j;
     float v[V];
     if constexpr (Q && V == 4) {
@@ -163,10 +514,10 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
         v[0] = r4d_fp8::e4m3(((const uint8_t*)wte)[at]);
     } else if constexpr (V == 4) {
         const uint2 b = *(const uint2*)((const uint16_t*)wte + at);
-        v[0] = bf16_to_f32((uint16_t)b.x); v[1] = bf16_to_f32((uint16_t)(b.x >> 16));
-        v[2] = bf16_to_f32((uint16_t)b.y); v[3] = bf16_to_f32((uint16_t)(b.y >> 16));
+        v[0] = bf2f((uint16_t)b.x); v[1] = bf2f((uint16_t)(b.x >> 16));
+        v[2] = bf2f((uint16_t)b.y); v[3] = bf2f((uint16_t)(b.y >> 16));
     } else {
-        v[0] = bf16_to_f32(((const uint16_t*)wte)[at]);
+        v[0] = bf2f(((const uint16_t*)wte)[at]);
     }
     if constexpr (V == 4) {
         *(uint2*)dst = make_uint2(
@@ -273,6 +624,29 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- rmsnorm_p
+// ref_rmsnorm_p: y = x * rsqrt(mean(x^2) + eps) -- the SAME normalisation as rmsnorm with NO gain.
+// It is the weightless value normalisation Gemma's attention uses on V (llama.cpp's
+// ggml_rms_norm(V, eps), no tensor); there is no checkpoint plane to feed a gain through, so an
+// rmsnorm call would need a phantom all-zero weight. Two passes over the row, the sum of squares
+// in f32; the second pass drops the gain multiply rmsnorm has. The mean accumulates in f32 in
+// ascending index order, exactly as rmsnorm does, so the two agree bit-for-bit where rmsnorm's
+// gain happens to be one.
+__global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint32_t n, float eps, uint32_t x_ld, uint32_t y_ld) {
+    __shared__ float lds[kThreads / kWave];
+    const uint32_t m = blockIdx.x;
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) { const float v = bf2f(xr[i]); ss += v * v; }
+    ss = block_sum<kThreads / kWave>(ss, lds);
+    const float s = rsqrtf(ss / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        yr[i] = f32_to_bf16(bf2f(xr[i]) * s);
+}
+
 // ---------------------------------------------------------------------------- add / mul
 // ref_add / ref_mul, including THE ONE BROADCAST RULE: an operand carrying exactly n elements
 // against an output of rows*n broadcasts along rows, and nothing else broadcasts at all.  That is
@@ -310,6 +684,53 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
         yr[i] = f32_to_bf16(1.0f / (1.0f + expf(-bf2f(xr[i]))));
 }
 
+// ---------------------------------------------------------------------------- logit_softcap
+// ref_logit_softcap: y = cap * tanh(x / cap), the final-logit softcap. THE ROW-WISE-WITH-A-PITCH
+// SHAPE IS COPIED FROM sigmoid on purpose: Gemma's arch issues it against the logits_gemm's output,
+// and the pitch form costs nothing on a contiguous buffer -- it is x_ld == n.
+__global__ __launch_bounds__(kThreads) void logit_softcap_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
+    const uint32_t m = blockIdx.x;
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        yr[i] = f32_to_bf16(cap * tanhf(bf2f(xr[i]) / cap));
+}
+
+/* The f32 leg: the 1.3.0 sampling chain carries the logits in f32 from the gemm, so the softcap
+ * is issued against f32 rows. The same row-with-pitch shape as the bf16 leg, and the math is the
+ * op's definition verbatim -- no rounding pass, the buffer already holds the arithmetic dtype. */
+__global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
+    const float* __restrict__ x, float* __restrict__ y,
+    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
+    const uint32_t m = blockIdx.x;
+    const float* __restrict__ xr = x + (size_t)m * x_ld;
+    float* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        yr[i] = cap * tanhf(xr[i] / cap);
+}
+
+// ---------------------------------------------------------------------------- scale
+// ref_scale: y = x * s, s a [1] weight broadcast over every element. THE ROW-WISE-WITH-A-PITCH
+// SHAPE IS COPIED FROM sigmoid on purpose: Gemma's arch issues it against the residual stream at
+// the end of every layer (the per-layer scalar), and the pitch form costs nothing on a contiguous
+// buffer -- it is x_ld == n. The scalar is read once per block (a single load, cached), not per
+// element: a per-element reload of a [1] tensor is the same value every time and costs a load per
+// element. `s` is f32 or bf16 (the layer_scalar weight is bf16 in the checkpoint); the branch is
+// on its dtype, so the op is dtype-generic in the scalar and the bf16 kernel is the residual
+// stream's, which is what a served Gemma 4 issues it against.
+__global__ __launch_bounds__(kThreads) void scale_kernel(
+    const uint16_t* __restrict__ x, const void* __restrict__ s, uint32_t s_dt,
+    uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld, uint32_t y_ld) {
+    const uint32_t m = blockIdx.x;
+    const float sv = (s_dt == RAD_F32) ? ((const float*)s)[0] : bf2f(((const uint16_t*)s)[0]);
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        yr[i] = f32_to_bf16(bf2f(xr[i]) * sv);
+}
+
 // ---------------------------------------------------------------------------- silu_mul
 // ref_silu_mul: y[.., i] = silu(gu[.., i]) * gu[.., n + i].  THE GATE IS THE FIRST HALF, which is
 // the order rad-convert fuses gate_proj and up_proj into one weight in; the two conventions cannot
@@ -326,6 +747,26 @@ __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- gelu_mul
+// ref_gelu_mul: y[.., i] = gelu_tanh(gu[.., i]) * gu[.., n + i]. THE GATE IS THE FIRST HALF, the
+// same order-lock as silu_mul. The tanh-approx GELU (gemma's gelu_pytorch_tanh), NOT the erf one:
+// gated feed-forwards are trained with the tanh form, and the constants are the standard fit the
+// gemm_nt_bias "gelu_tanh" epilogue uses (the identical function, so a GELU-gated FFN and a
+// tanh-gelu epilogue agree to the last bit).
+__global__ __launch_bounds__(kThreads) void gelu_mul_kernel(
+    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
+    uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+    const uint32_t m = blockIdx.x;
+    const uint16_t* __restrict__ gr = gu + (size_t)m * gu_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
+        const float g = bf2f(gr[i]);
+        const float k0 = 0.7978845608028654f, k1 = 0.044715f;
+        const float gelu = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+        yr[i] = f32_to_bf16(gelu * bf2f(gr[n + i]));
+    }
+}
+
 // ---------------------------------------------------------------------------- rope
 // ref_rope, in place over a fused [n_head + 2*n_head_kv] head row -- the V heads at the end are
 // left alone, which is the whole reason the op takes the fused projection rather than two tensors.
@@ -337,8 +778,10 @@ __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
 // (rad_block_attn_gated.h says so and says what would have to change first), so the shim maps it.
 //
 // PARTIAL ROTARY.  `rot` may be less than head_dim -- 64 of 256 on this target -- and the tail of
-// the head is untouched.  The frequency exponent divides by `rot`, not by head_dim: the rotated
-// prefix is a complete rotary of its own width.
+// the head is untouched.  The base ladder's exponent divides by `den`, which `ladder` resolves:
+// `rot` for `rotary` (the rotated prefix, a complete rotary of its own width) and `head_dim` for
+// `head` (the proportional variant, a prefix of the full-width table). `den` = `rot` on the
+// default path, so existing models are bit-for-bit unchanged.
 //
 // One thread a PAIR.  The pair's two loads and two stores are the whole body, so there is no
 // reduction and no LDS; the grid is (M, heads).
@@ -362,7 +805,7 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
 
 __global__ __launch_bounds__(kThreads) void rope_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos,
-    uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, int gptj,
+    uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, int den, int gptj,
     float theta, float rscale, uint32_t row_pitch,
     int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn) {
     const uint32_t m = blockIdx.x;
@@ -375,7 +818,7 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
          t += kThreads * gridDim.y) {
         const uint32_t h = t / half, i = t % half;
         uint16_t* __restrict__ hd = qkv + (size_t)m * row_pitch + (size_t)h * head_dim;
-        float inv = 1.0f / powf(theta, (float)(2 * i) / (float)rot);
+        float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
         float p = p0;
         if (plane) {
             uint32_t j = i;
@@ -621,6 +1064,13 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
     return rc == RAD_OK ? 0 : -4;
 }
 
+extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,
+                                           int n_vocab, int vocab_off, int x_ld, float scale,
+                                           long stream) {
+    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
+    return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, scale, sk);
+}
+
 static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src_rows,
                                  int x_ld, int y_ld, const R4dSink& sk) {
     if (!x || !idx || !y) return -1;
@@ -717,6 +1167,22 @@ extern "C" int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps,
     return r4d_rmsnorm_mult_bf16(x, w, y, M, n, eps, wadd, 1.0f, w_f32, x_ld, y_ld, stream);
 }
 
+// The weightless norm: rmsnorm without the gain multiply.  It is not templated on a thread count
+// the way rmsnorm is, because rmsnorm's width is pinned to the fused rmsnorm_quant_fp8 by their
+// shared byte-identical requirement, and rmsnorm_p has no fused quantiser counterpart to match --
+// kThreads is the same choice the other non-templated row kernels (binary, sigmoid, silu_mul) make.
+extern "C" int r4d_rmsnorm_p_bf16(long x, long y, int M, int n, float eps,
+                                  int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(rmsnorm_p_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+                       (const uint16_t*)x, (uint16_t*)y, (uint32_t)n, eps,
+                       (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 // `op` is 0 for a sum and 1 for a product.  `b_ld` of 0 with the same n is the broadcast form: the
 // caller passes a b_ld of zero and every row reads the same n elements.
 // b_ld -1 is a ONE-ELEMENT b, the scalar broadcast; 0 is one row broadcast down the rows.
@@ -771,6 +1237,48 @@ extern "C" int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long s
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+extern "C" int r4d_logit_softcap_bf16(long x, long y, int M, int n, float cap,
+                                      int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!(cap > 0.0f)) return -3;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(logit_softcap_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream,
+                       (const uint16_t*)x, (uint16_t*)y, (uint32_t)n, cap,
+                       (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_logit_softcap_f32(long x, long y, int M, int n, float cap,
+                                     int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!(cap > 0.0f)) return -3;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(logit_softcap_kernel_f32, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream,
+                       (const float*)x, (float*)y, (uint32_t)n, cap,
+                       (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_scale_bf16(long x, long s, uint32_t s_dt, long y, int M, int n,
+                              int x_ld, int y_ld, long stream) {
+    if (!x || !s || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (s_dt != RAD_F32 && s_dt != RAD_BF16) return -3;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(scale_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream,
+                       (const uint16_t*)x, (const void*)s, s_dt, (uint16_t*)y, (uint32_t)n,
+                       (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
     if (!gu || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -782,19 +1290,35 @@ extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+// GELU-gated product, the gemma FFN activation.  Same shape and order-lock as silu_mul (the gate
+// is the first half of the fused [M, 2n] row); the only difference is the nonlinearity, which is
+// the tanh approximation, not the erf one, to match ref_gelu_mul's act_gelu_tanh.
+extern "C" int r4d_gelu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
+    if (!gu || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!gu_ld) gu_ld = 2 * n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(gelu_mul_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+                       (const uint16_t*)gu, (uint16_t*)y, (uint32_t)n,
+                       (uint32_t)gu_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 // `n_rope_heads` is n_head + n_head_kv: the Q heads and the K heads of a fused projection, or just
 // the one buffer's heads when q and k are separate tensors (which is what the gated block does).
 extern "C" int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads,
                              int rot, int gptj, float theta, float rscale, int row_pitch,
                              long stream) {
-    return r4d_rope_mc_bf16(qkv, pos, M, head_dim, n_rope_heads, rot, gptj, theta, rscale,
+    return r4d_rope_mc_bf16(qkv, pos, M, head_dim, n_rope_heads, rot, rot, gptj, theta, rscale,
                             row_pitch, 0, nullptr, 0, 0, stream);
 }
 
 // THE ONE LAUNCH OF rope_kernel. `yarn` with factor 0 is the plain rotary: the kernel's YaRN
 // blend returns the frequency it was given and the magnitude is not applied, so the C entry points
-// below and the op without YaRN run the same arithmetic with the same arguments.
-static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot,
+// below and the op without YaRN run the same arithmetic with the same arguments. `den` is the
+// ladder's width (`rot` for `rotary`, `head_dim` for `head`) -- the multi-component form passes
+// the caller's, and the plain entry passes `rot`, as it always has.
+static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int den,
                        int gptj, float theta, float rscale, int row_pitch, int mode,
                        const int* sec, int n_sec, int plane, RadYarn yarn, long stream) {
     if (!qkv || !pos) return -1;
@@ -807,7 +1331,7 @@ static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads
     const int s0 = n_sec > 0 ? sec[0] : 0, s1 = n_sec > 1 ? sec[1] : 0, s2 = n_sec > 2 ? sec[2] : 0;
     hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0, (hipStream_t)stream,
                        (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)head_dim,
-                       (uint32_t)n_rope_heads, (uint32_t)rot, gptj, theta, rscale,
+                       (uint32_t)n_rope_heads, (uint32_t)rot, (int)den, gptj, theta, rscale,
                        (uint32_t)row_pitch, mode, s0, s1, s2, n_sec, (uint32_t)plane, yarn);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -815,10 +1339,24 @@ static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads
 // The multi-component form: `mode` 2 mrope, 3 imrope, 4 axial, `sec[0..n_sec)` the sections and
 // `plane` the component pitch of `pos`; plane 0 is the one-component rotary above.
 extern "C" int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads,
-                                int rot, int gptj, float theta, float rscale, int row_pitch,
-                                int mode, const int* sec, int n_sec, int plane, long stream) {
-    return rope_launch(qkv, pos, M, head_dim, n_rope_heads, rot, gptj, theta, rscale, row_pitch,
-                       mode, sec, n_sec, plane, RadYarn{}, stream);
+                                int rot, int den, int gptj, float theta, float rscale,
+                                int row_pitch, int mode, const int* sec, int n_sec, int plane,
+                                long stream) {
+    return rope_launch(qkv, pos, M, head_dim, n_rope_heads, rot, den, gptj, theta, rscale,
+                       row_pitch, mode, sec, n_sec, plane, RadYarn{}, stream);
+}
+
+// Copy n bf16 from a (possibly host-page-table-unmapped) device VA into a regular allocation.
+// The device kernel reads via the DEVICE page table (mapped); a host DtoH copy on such a VA faults.
+__global__ void r4d_kv_copy_kernel(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst, size_t n) {
+    for (size_t i = blockIdx.x * (size_t)kThreads + threadIdx.x; i < n;
+         i += (size_t)gridDim.x * kThreads)
+        dst[i] = src[i];
+}
+__global__ void r4d_kv_copy8_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, size_t n) {
+    for (size_t i = blockIdx.x * (size_t)kThreads + threadIdx.x; i < n;
+         i += (size_t)gridDim.x * kThreads)
+        dst[i] = src[i];
 }
 
 extern "C" int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int head_dim,
@@ -840,6 +1378,57 @@ extern "C" int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int 
                        (const uint16_t*)k, (const uint16_t*)v, (const int32_t*)slot,
                        (uint16_t*)kv, (uint32_t)head_dim, (uint32_t)kv_heads,
                        (uint32_t)block_size, (uint32_t)n_blocks, (uint32_t)k_ld, (uint32_t)v_ld);
+    /* ==== TEMP DIAGNOSTIC (degenerate-output investigation): the store-populate check. ====
+     * Established: kv/k/v/slot are DEVICE pointers; the store kernel launches+completes clean;
+     * a DtoH copy from `slot` succeeds but a DtoH copy from `kv` FAULTS; kv is not a VMM allocation
+     * (hipMemRetainAllocationHandle=invalid). Coherent reading: the cache is mapped in the DEVICE
+     * page table (device kernels read/write it fine -> the model runs) and NOT in the HOST page
+     * table (host copies fault). So the model's cache is fine; the degenerate output is a forward
+     * bug. To confirm the store kernel POPULATED the cache, read it via a DEVICE copy kernel (the
+     * device page table is mapped -> succeeds) into a regular allocation, then DtoH that regular
+     * buffer. Compare the cached K against the store kernel's input k. Gated: R4D_DIAG=1. */
+    if (r4d_diag_on()) {
+        static int s_kvchk = 0;
+        if (s_kvchk < 2) {
+            ++s_kvchk;
+            hipDeviceSynchronize();
+            const size_t blk_elems = (size_t)kv_heads * block_size * 2 * head_dim;  // stride[0]
+            uint16_t* reg = nullptr;
+            hipError_t am = hipMalloc(&reg, blk_elems * 2);
+            fprintf(stderr, "[KVCHK] call=%d M=%d hd=%d kvh=%d bs=%d nb=%d kld=%d vld=%d malloc=%d reg=%p\n",
+                    s_kvchk, M, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld, (int)am, (void*)reg);
+            fflush(stderr);
+            if (am == hipSuccess && reg) {
+                r4d_kv_copy_kernel<<<(unsigned)((blk_elems + kThreads - 1) / kThreads), kThreads>>>(
+                    (const uint16_t*)kv, reg, blk_elems);
+                hipError_t cs = hipDeviceSynchronize();
+                std::vector<uint16_t> kv_h(blk_elems);
+                hipError_t kc = hipMemcpy(kv_h.data(), reg, blk_elems * 2, hipMemcpyDeviceToHost);
+                fprintf(stderr, "[KVCHK] call=%d devcopy_sync=%d kvcopy=%d\n", s_kvchk, (int)cs, (int)kc);
+                fflush(stderr);
+                if (cs == hipSuccess && kc == hipSuccess) {
+                    std::vector<int32_t> slot_h(M);
+                    hipMemcpy(slot_h.data(), (const int32_t*)(uintptr_t)slot, M * 4, hipMemcpyDeviceToHost);
+                    std::vector<uint16_t> k_h((size_t)M * k_ld);
+                    hipMemcpy(k_h.data(), (const uint16_t*)(uintptr_t)k, k_h.size() * 2, hipMemcpyDeviceToHost);
+                    for (int t = 0; t < M && t < 6; ++t) {
+                        int s = slot_h[t];
+                        if (s < 0) continue;
+                        const int blk = s / block_size, off = s % block_size;
+                        const size_t base = ((size_t)blk * kv_heads * block_size + (size_t)off) * 2 * head_dim;
+                        if (base + 2 * head_dim > kv_h.size()) break;
+                        fprintf(stderr, "[KVCHK] call=%d t=%d slot=%d blk=%d off=%d cacheK[0..3]=", s_kvchk, t, s, blk, off);
+                        for (int i = 0; i < 4; ++i) fprintf(stderr, " %.4f", attn_verify_bf16(kv_h[base + i]));
+                        fprintf(stderr, "  inputK[0..3]=");
+                        for (int i = 0; i < 4; ++i) fprintf(stderr, " %.4f", attn_verify_bf16(k_h[(size_t)t * k_ld + i]));
+                        fprintf(stderr, "\n");
+                    }
+                    fflush(stderr);
+                }
+            }
+            if (reg) hipFree(reg);
+        }
+    }
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -956,6 +1545,53 @@ extern "C" int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N,
     hipLaunchKernelGGL(logits_gemm_kernel, dim3((uint32_t)N), dim3(kThreads), 0,
                        (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
                        (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    /* ==== TEMP DIAGNOSTIC (degenerate-output investigation): is the final hidden state featureless? ====
+     * KV store + attention verified fine; the logits are near-flat (top-5 within a few points) ->
+     * a near-constant hidden state would make every logit the same. a is a regular device buffer
+     * (DtoH succeeds). Dump per-row mean/std over K + a few elements: std~0 = featureless (forward
+     * collapses); std large = hidden state varies and the flat logits come from elsewhere.
+     * Gated: R4D_DIAG=1. */
+    if (r4d_diag_on()) {
+        static int s_hidd = 0;
+        if (s_hidd < 2) {
+            ++s_hidd;
+            hipDeviceSynchronize();
+            const int M1 = (M < 2) ? M : 2;
+            std::vector<uint16_t> a_h((size_t)M1 * a_ld);
+            hipMemcpy(a_h.data(), (const uint16_t*)a, a_h.size() * 2, hipMemcpyDeviceToHost);
+            for (int r = 0; r < M1; ++r) {
+                double s = 0, s2 = 0;
+                for (int d = 0; d < K; ++d) { double v = attn_verify_bf16(a_h[(size_t)r * a_ld + d]); s += v; s2 += v * v; }
+                const double mean = s / K, var = s2 / K - mean * mean;
+                fprintf(stderr, "[HIDD] call=%d M=%d K=%d r=%d mean=%.4f std=%.4f a[0..7]=", s_hidd, M, K, r, mean, sqrt(var));
+                for (int d = 0; d < 8 && d < K; ++d) fprintf(stderr, " %.4f", attn_verify_bf16(a_h[(size_t)r * a_ld + d]));
+                fprintf(stderr, "\n");
+            }
+            fflush(stderr);
+        }
+    }
+    /* ==== TEMP DIAGNOSTIC (degenerate-output investigation): the logits-GEMM output. ====
+     * Hidden state verified RICH (std~4.6). A rich hidden state + a correct logits GEMM => sharp
+     * logits; observed logits are near-flat (top-5 within a few points). Dump c (f32, regular
+     * buffer, DtoH succeeds): mean/std over the full vocab + max/argmax. std~0 => GEMM output flat
+     * (kernel bug); std large => GEMM fine and the sampler/softcap downstream is the suspect.
+     * Gated: R4D_DIAG=1. */
+    if (r4d_diag_on()) {
+        static int s_log = 0;
+        if (s_log < 2) {
+            ++s_log;
+            hipDeviceSynchronize();
+            std::vector<float> c_h((size_t)N);
+            hipMemcpy(c_h.data(), (const float*)c, (size_t)N * 4, hipMemcpyDeviceToHost);
+            long double s = 0, s2 = 0; float mx = -1e30f; int mi = 0;
+            for (int j = 0; j < N; ++j) { const double v = c_h[j]; s += v; s2 += v * v; if (c_h[j] > mx) { mx = c_h[j]; mi = j; } }
+            const double mean = (double)(s / N), var = (double)(s2 / N) - mean * mean;
+            fprintf(stderr, "[LOGITS] call=%d c=%p N=%d ld=%d mean=%.4f std=%.4f max=%.4f argmax=%d c[0..7]=", s_log, (void*)(uintptr_t)c, N, c_ld, mean, sqrt(var), mx, mi);
+            for (int j = 0; j < 8 && j < N; ++j) fprintf(stderr, " %.4f", c_h[j]);
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1263,6 +1899,32 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
                                                                                  : RAD_E_DEVICE;
 }
 
+/* ------------------------------------------------------------------ rmsnorm_p */
+
+extern "C" int r4d_rad_rmsnorm_p(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(x));
+    R4D_NEED(dt_bf16(y));
+
+    const long long n = r4d_geti_or(a, "n", r4d_dim(x, (int)x->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    const long long y_ld = r4d_rows_pitch(y, n, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+
+    const float eps = (float)r4d_getf(a, "eps", 1e-6);
+    const int rc = r4d_rmsnorm_p_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, eps,
+                                      (int)x_ld, (int)y_ld, (long)(uintptr_t)s);
+    if (rc != 0) return RAD_E_DEVICE;
+    verify_rmsnorm_p((const uint16_t*)(uintptr_t)r4d_addr(x), (const uint16_t*)(uintptr_t)r4d_addr(y),
+                     (int)M, (int)n, (int)x_ld, (int)y_ld, eps, (long)(uintptr_t)s);
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ add / mul */
 
 enum { BI_A = 0, BI_B, BI_Y };
@@ -1375,6 +2037,76 @@ extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
                          (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
+/* ------------------------------------------------------------------ logit_softcap */
+
+extern "C" int r4d_rad_logit_softcap(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    /* Two legs, one op: bf16 (the logits buffer as the gemm writes it on the bf16 chain) and f32
+     * (the 1.3.0 sampling chain, where the gemm hands the sampler f32 rows). The dtype check
+     * moved from the entry to the call below because the legs differ, not the geometry. */
+    const bool leg_bf16 = (x->dtype == RAD_BF16) && (y->dtype == RAD_BF16);
+    const bool leg_f32  = (x->dtype == RAD_F32)  && (y->dtype == RAD_F32);
+    if (!leg_bf16 && !leg_f32) return R4D_NO(RAD_E_DTYPE);
+
+    /* `cap` is where the model lives: Gemma 4 issues it at 30.0. The default exists for the same
+     * reason every other one here does (a direct call with no declare in front), and the `> 0`
+     * test is load-bearing: a zero cap is a division by zero in every lane, not a bad answer. */
+    const float cap = (float)r4d_getf(a, "cap", 30.0);
+    if (!(cap > 0.0f)) return R4D_NO(RAD_E_INVAL);
+
+    /* ROW-WISE WITH A PITCH, same as sigmoid: issued against a column slice there is no contiguous
+     * extent to walk, and the contiguous case costs nothing. */
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    const long long y_ld = r4d_rows_pitch(y, n, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+
+    const int rc = leg_bf16
+        ? r4d_logit_softcap_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, cap,
+                                 (int)x_ld, (int)y_ld, (long)(uintptr_t)s)
+        : r4d_logit_softcap_f32(r4d_addr(x), r4d_addr(y), (int)M, (int)n, cap,
+                                (int)x_ld, (int)y_ld, (long)(uintptr_t)s);
+    return rc == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ------------------------------------------------------------------ scale */
+
+extern "C" int r4d_rad_scale(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* sc = r4d_opt(a, 1);
+    const RadTensor* y = r4d_opt(a, 2);
+    if (!x || !sc || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(x));
+    R4D_NEED(dt_bf16(y));
+
+    /* `s` is a [1] weight, f32 or bf16 (the layer_scalar weight is bf16 in the checkpoint). A
+     * scalar with no element is a shape error, not a broadcast of zero -- a zero scalar would be
+     * a plausible number, which is the thing the oracle rules out. Read on the device (the kernel
+     * reads s[0] once per block) rather than a host copy: a device-to-host copy of one element is
+     * a synchronisation on the step path, and the per-block read is cached. */
+    if (sc->dtype != RAD_F32 && sc->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (r4d_numel(sc) < 1) return R4D_NO(RAD_E_SHAPE);
+
+    /* ROW-WISE WITH A PITCH, same as sigmoid: issued against the residual stream at the end of a
+     * layer there is no contiguous extent to walk, and the contiguous case costs nothing. */
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    const long long y_ld = r4d_rows_pitch(y, n, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+
+    return r4d_scale_bf16(r4d_addr(x), r4d_addr(sc), sc->dtype, r4d_addr(y), (int)M, (int)n,
+                          (int)x_ld, (int)y_ld,
+                          (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
 /* ------------------------------------------------------------------ silu_mul */
 
 extern "C" int r4d_rad_silu_mul(const RadArgs* a, RadStream s) {
@@ -1396,6 +2128,31 @@ extern "C" int r4d_rad_silu_mul(const RadArgs* a, RadStream s) {
                              (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
+/* ------------------------------------------------------------------ gelu_mul */
+
+extern "C" int r4d_rad_gelu_mul(const RadArgs* a, RadStream s) {
+    const RadTensor* gu = r4d_opt(a, 0);
+    const RadTensor* y  = r4d_opt(a, 1);
+    if (!gu || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(gu));
+    R4D_NEED(dt_bf16(y));
+
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, Mg = 0;
+    const long long y_ld  = r4d_rows_pitch(y, n, &M);
+    const long long gu_ld = r4d_rows_pitch(gu, 2 * n, &Mg);
+    if (y_ld < 0 || gu_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || Mg < M) return R4D_NO(RAD_E_SHAPE);
+
+    const int rc = r4d_gelu_mul_bf16(r4d_addr(gu), r4d_addr(y), (int)M, (int)n, (int)gu_ld, (int)y_ld,
+                                     (long)(uintptr_t)s);
+    if (rc != 0) return RAD_E_DEVICE;
+    verify_gelu_mul((const uint16_t*)(uintptr_t)r4d_addr(gu), (const uint16_t*)(uintptr_t)r4d_addr(y),
+                    (int)M, (int)n, (int)gu_ld, (int)y_ld, (long)(uintptr_t)s);
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ rope */
 
 enum { RP_QKV = 0, RP_POS };
@@ -1414,6 +2171,16 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     const long long rot       = r4d_geti_or(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0) return R4D_NO(RAD_E_SHAPE);
     if (rot <= 0 || rot > head_dim || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
+
+    /* `ladder`: `rotary` (default) measures the base ladder in `rot`; `head` in `head_dim`, the
+     * proportional variant. head_dim is already validated above, so `den = head_dim` is safe. */
+    const char* lad = r4d_gets(a, "ladder");
+    long long den = rot;
+    if (lad) {
+        if (!std::strcmp(lad, "head")) den = head_dim;
+        else if (std::strcmp(lad, "rotary") && std::strcmp(lad, "head"))
+            return R4D_NO(RAD_E_UNSUPPORTED);
+    }
 
     /* THE MODE, and with it how many components a position has. With [M] positions -- one
      * component a token -- mrope and imrope ARE neox: every frequency reads the same position and
@@ -1465,9 +2232,10 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     /* The Q heads and the K heads rotate; the V heads that follow them do not, which is the whole
      * reason this op takes the fused projection rather than two tensors. */
     return rope_launch(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,
-                       (int)(n_head + n_head_kv), (int)rot, gptj, theta, rscale, (int)pitch,
-                       mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s) == 0 ? RAD_OK
-                                                                          : RAD_E_DEVICE;
+                       (int)(n_head + n_head_kv), (int)rot, (int)den, gptj, theta, rscale,
+                       (int)pitch, mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s) == 0
+        ? RAD_OK
+        : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ kv_store */
