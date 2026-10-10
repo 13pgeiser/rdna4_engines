@@ -1149,11 +1149,29 @@ static void rope_head(const RadTensor* t, int64_t base, int64_t ds, int64_t rot,
     }
 }
 
-static float* inv_freqs(int64_t half, int64_t rot, float theta) {
+/* `den` is the width the base ladder is measured in: `rot` for a `rotary` ladder (a partial rotary
+ * is a complete rotation of its own width) and `head_dim` for `head`, the proportional variant.
+ * Shared by `rope` and `rope_table` because the two must compute the same angles. */
+static float* inv_freqs(int64_t half, int64_t den, float theta) {
     float* f = (float*)scratch_raw((size_t)half * sizeof(float));
     for (int64_t i = 0; i < half; ++i)
-        f[i] = 1.0f / std::pow(theta, (float)(2 * i) / (float)rot);
+        f[i] = 1.0f / std::pow(theta, (float)(2 * i) / (float)den);
     return f;
+}
+
+/* `ladder` names the width the base frequency ladder is measured in -- see inv_freqs. Absent and
+ * `rotary` divide by `rot` (every existing model); `head` divides by `head_dim`, which it needs. An
+ * unknown value is a schema error, not a silent default. */
+static int rope_ladder(const RadArgs* a, int64_t rot, int64_t head_dim, int64_t* den) {
+    const char* lad = p_str(a, "ladder", nullptr);
+    if (!lad) { *den = rot; return RAD_OK; }
+    if (!std::strcmp(lad, "rotary")) { *den = rot; return RAD_OK; }
+    if (!std::strcmp(lad, "head")) {
+        if (head_dim <= 0) return RAD_E_SHAPE;
+        *den = head_dim;
+        return RAD_OK;
+    }
+    return RAD_E_UNSUPPORTED;
 }
 
 AVX_KERNEL(rope) {
@@ -1170,6 +1188,9 @@ AVX_KERNEL(rope) {
     if (mode < 0) return RAD_E_UNSUPPORTED;
     const int64_t rot = p_int(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
+    int64_t den;
+    const int lrc = rope_ladder(a, rot, head_dim, &den);
+    if (lrc != RAD_OK) return lrc;
 
     /* [M] one component a token, or [C, M] component-major with `sections`. */
     int64_t sec[8] = {};
@@ -1194,7 +1215,7 @@ AVX_KERNEL(rope) {
     const int64_t rs = qkv->rank >= 2 ? qkv->stride[qkv->rank - 2] : stride_row;
     const int64_t ds = laststride(qkv);
     const int64_t half = rot / 2;
-    float* invf = inv_freqs(half, rot, theta);
+    float* invf = inv_freqs(half, den, theta);
     int comp[512] = {};
     if (half > 512) return RAD_E_UNSUPPORTED;
     if (multi) {
@@ -1416,19 +1437,24 @@ AVX_KERNEL(qk_norm_rope) {
 AVX_KERNEL(rope_table) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *pos = &a->t[0], *cs = &a->t[1];
-    const int64_t rot = p_int(a, "rot", 0);
+    const int64_t rot      = p_int(a, "rot", 0);
+    const int64_t head_dim = p_int(a, "head_dim", 0);
     const float theta = p_f32(a, "theta", 10000.0f);
     const float rscale = p_f32(a, "scale", 1.0f);
     if (rot < 2 || (rot & 1)) return RAD_E_SHAPE;
+    int64_t den;
+    const int lrc = rope_ladder(a, rot, head_dim, &den);
+    if (lrc != RAD_OK) return lrc;
     const int64_t M = numel(pos);
     if (M <= 0 || numel(cs) % rot) return RAD_E_SHAPE;
     const int64_t rows = numel(cs) / rot;
     const int64_t half = rot / 2;
-    float* invf = inv_freqs(half, rot, theta);
+    float* invf = inv_freqs(half, den, theta);
     const RadYarn yarn = rad_yarn_args(a);
     if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && rscale != 1.0f)) return RAD_E_INVAL;
     if (yarn.factor != 0.0f)
         for (int64_t i = 0; i < half; ++i) invf[i] = yarn.frequency(invf[i], (int)i);
+
 
     AVX_PARALLEL_FOR_IF(M * rot >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {

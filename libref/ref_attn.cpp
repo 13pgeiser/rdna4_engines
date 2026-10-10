@@ -395,8 +395,11 @@ struct RopeFreq {
 };
 
 /* Which component and inverse frequency each of the rot/2 frequencies uses. */
-static int rope_freqs(int mode, int64_t rot, float theta, const int64_t* sec, int n_sec,
-                      RopeFreq* f) {
+/* `den` is the width the BASE ladder is measured in: `rot` for a `rotary` ladder (a partial rotary
+ * is a complete rotation of its own width) and `head_dim` for `head`, the proportional variant. The
+ * loop count and the NeoX/GPT-J pairing still come from `rot`; `axial` overrides `inv` below. */
+static int rope_freqs(int mode, int64_t rot, int64_t den, float theta, const int64_t* sec,
+                      int n_sec, RopeFreq* f) {
     const int64_t half = rot / 2;
     if (half > REF_HD_MAX / 2) return RAD_E_UNSUPPORTED;
     int64_t start[8] = {}, total = 0;
@@ -404,7 +407,7 @@ static int rope_freqs(int mode, int64_t rot, float theta, const int64_t* sec, in
     if ((mode == ROPE_MROPE || mode == ROPE_AXIAL) && n_sec > 0 && total != half) return RAD_E_SHAPE;
     for (int64_t i = 0; i < half; ++i) {
         int c = 0;
-        float inv = 1.0f / std::pow(theta, (float)(2 * i) / (float)rot);
+        float inv = 1.0f / std::pow(theta, (float)(2 * i) / (float)den);
         if (n_sec > 0 && (mode == ROPE_MROPE || mode == ROPE_AXIAL)) {
             while (c + 1 < n_sec && i >= start[c + 1]) ++c;
             if (mode == ROPE_AXIAL) {
@@ -450,6 +453,21 @@ static int rope_sections(const RadArgs* a, int64_t* sec) {
     return n;
 }
 
+/* `ladder` names the width the base frequency ladder is measured in -- see rope_freqs. Absent and
+ * `rotary` divide by `rot` (every existing model); `head` divides by `head_dim`, which it needs. An
+ * unknown value is a schema error, not a silent default: a mistyped ladder is a silent wrong angle. */
+static int rope_ladder(const RadArgs* a, int64_t rot, int64_t head_dim, int64_t* den) {
+    const char* lad = p_str(a, "ladder", nullptr);
+    if (!lad) { *den = rot; return RAD_OK; }
+    if (!std::strcmp(lad, "rotary")) { *den = rot; return RAD_OK; }
+    if (!std::strcmp(lad, "head")) {
+        if (head_dim <= 0) return RAD_E_SHAPE;
+        *den = head_dim;
+        return RAD_OK;
+    }
+    return RAD_E_UNSUPPORTED;
+}
+
 }  /* namespace */
 
 int ref_rope(const RadArgs* a, RadStream) {
@@ -466,6 +484,8 @@ int ref_rope(const RadArgs* a, RadStream) {
     if (mode < 0) return RAD_E_UNSUPPORTED;
     int64_t rot = p_int(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
+    int64_t den;
+    RAD_REF_TRY(rope_ladder(a, rot, head_dim, &den));
 
     int64_t sec[8] = {};
     const int n_sec = rope_sections(a, sec);
@@ -480,13 +500,14 @@ int ref_rope(const RadArgs* a, RadStream) {
         if (n_comp < need || n_comp > 8) return RAD_E_SHAPE;
     }
     RopeFreq f;
-    RAD_REF_TRY(rope_freqs(mode, rot, theta, sec, multi ? n_sec : 0, &f));
+    RAD_REF_TRY(rope_freqs(mode, rot, den, theta, sec, multi ? n_sec : 0, &f));
     const RadYarn yarn = rad_yarn_args(a);
     if (!rad_yarn_valid(yarn)) return RAD_E_INVAL;
     if (yarn.factor != 0.0f) {
         if (mode == ROPE_AXIAL || rscale != 1.0f) return RAD_E_UNSUPPORTED;
         for (int64_t i = 0; i < rot / 2; ++i) f.inv[i] = yarn.frequency(f.inv[i], (int)i);
     }
+
 
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
     if (M <= 0 || numel(qkv) < M * stride_row) return RAD_E_SHAPE;
@@ -582,7 +603,9 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     const int64_t rs = qkv->rank >= 2 ? qkv->stride[qkv->rank - 2] : stride_row;
     const int64_t ds = laststride(qkv);
     RopeFreq f;
-    if (!blocks) RAD_REF_TRY(rope_freqs(mode, rot, theta, nullptr, 0, &f));
+    /* No `ladder` on this row yet: the fused norm+rope measures by `rot`, as it always has. */
+    RAD_REF_TRY(rope_freqs(mode, rot, rot, theta, nullptr, 0, &f));
+
 
     #pragma omp parallel for schedule(static)
     for (int64_t m = 0; m < M; ++m) {
@@ -746,10 +769,13 @@ int ref_attn_local_rel(const RadArgs* a, RadStream) {
 int ref_rope_table(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *pos = &a->t[0], *cs = &a->t[1];
-    const int64_t rot   = p_int(a, "rot", 0);
+    const int64_t rot      = p_int(a, "rot", 0);
+    const int64_t head_dim = p_int(a, "head_dim", 0);
     const float   theta = p_f32(a, "theta", 10000.0f);
     const float   rscale = p_f32(a, "scale", 1.0f);
     if (rot < 2 || (rot & 1)) return RAD_E_SHAPE;
+    int64_t den;
+    RAD_REF_TRY(rope_ladder(a, rot, head_dim, &den));
     const int64_t M = numel(pos);
     if (M <= 0 || numel(cs) % rot) return RAD_E_SHAPE;
     const int64_t rows = numel(cs) / rot;
@@ -763,7 +789,7 @@ int ref_rope_table(const RadArgs* a, RadStream) {
         if (pp < 0 || pp >= rows) continue;
         const float p = (float)pp / (rscale != 0.0f ? rscale : 1.0f);
         for (int64_t i = 0; i < half; ++i) {
-            const float inv = yarn.frequency(1.0f / std::pow(theta, (float)(2 * i) / (float)rot), (int)i);
+            const float inv = yarn.frequency(1.0f / std::pow(theta, (float)(2 * i) / (float)den), (int)i);
             const float ang = p * inv;
             stt(cs, offlin(cs, pp * rot + i),        std::cos(ang) * yarn.magnitude);
             stt(cs, offlin(cs, pp * rot + half + i), std::sin(ang) * yarn.magnitude);
@@ -820,7 +846,7 @@ int ref_qsa_block_key(const RadArgs* a, RadStream) {
     if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && (rot <= 0 || rscale != 1.0f)))
         return RAD_E_INVAL;
     RopeFreq f;
-    RAD_REF_TRY(rope_freqs(mc ? mode : ROPE_NEOX, rot, theta, sec, mc ? n_sec : 0, &f));
+    RAD_REF_TRY(rope_freqs(mc ? mode : ROPE_NEOX, rot, rot, theta, sec, mc ? n_sec : 0, &f));
     for (int64_t i = 0; i < rot / 2; ++i) f.inv[i] = yarn.frequency(f.inv[i], (int)i);
 
     #pragma omp parallel for schedule(static)

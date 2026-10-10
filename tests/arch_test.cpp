@@ -19,6 +19,7 @@
 #include "rad_runtime.h"
 
 #include <cstdarg>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <set>
@@ -296,6 +297,7 @@ extern "C" const RadBatch* rad_batch(RadCtx* c)      { return c->batch; }
 extern "C" int             rad_rank(RadCtx* c)       { return c->rank; }
 extern "C" int             rad_world_size(RadCtx* c) { return c->world; }
 extern "C" RadStream       rad_stream(RadCtx* c)     { (void)c; return nullptr; }
+extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK; }
 extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
     (void)r;
     c->routed_layers.push_back(layer);
@@ -316,6 +318,8 @@ extern "C" void* rad_buf_ptr   (RadCtx* c, rad_buf    b) { (void)c; return (void
 #include "../arch/qwen4exp_fp8/qwen4exp_fp8.cpp"
 /* And the LLaMA family, for how it reads its rotary scaling. */
 #include "../arch/llama_fp8/llama_fp8.cpp"
+/* Gemma 4 dense: two attention classes (sliding-window + proportional-RoPE global) on one stream. */
+#include "../arch/gemma4_bf16/gemma4_bf16.cpp"
 /* The PLE block on its own: no architecture in this file declares it, and what its step() hands
  * the two windowed ops is a contract of its own (rad_block_ple.h). */
 #include <arch/rad_block_ple.h>
@@ -360,6 +364,46 @@ RadModelMeta qwen35_meta() {
     m.n_kv        = (int)(sizeof(k_keys) / sizeof(k_keys[0]));
     m.kv_key      = k_keys;
     m.kv_val      = k_vals;
+    return m;
+}
+
+/* Gemma 4 31B's text geometry, cut to TWELVE layers so a failure names a real shape. Twelve is the
+ * smallest count that lands two global layers at (l + 1) % 6 == 0 -- layers 5 and 11 -- over the ten
+ * sliding ones, the 5:1 ratio the model card carries. head_dim 256 here is the SLIDING width; the
+ * global class' 512 width and 4 heads are free-form header keys the plugin must read, not fields on
+ * RadModelMeta. */
+const char* k_gem4_keys[] = {
+    "sliding_window",
+    "global_head_dim",
+    "num_global_key_value_heads",
+    "rope_parameters.sliding_attention.rope_theta",
+    "rope_parameters.full_attention.rope_theta",
+    "rope_parameters.full_attention.partial_rotary_factor",
+    "num_kv_shared_layers",
+    "final_logit_softcapping",
+    "full_attention_interval",
+};
+const char* k_gem4_vals[] = { "1024", "512", "4", "10000", "1000000", "0.25", "0", "30", "6" };
+
+RadModelMeta gemma4_meta() {
+    RadModelMeta m{};
+    m.arch_id     = "gemma4";
+    m.name        = "test-gemma4-31b";
+    m.quant       = "bf16";
+    m.n_layers    = 12;
+    m.n_embd      = 5376;
+    m.n_head      = 32;
+    m.n_head_kv   = 16;
+    m.head_dim    = 256;
+    m.n_ff        = 21504;
+    m.n_vocab     = 262144;
+    m.n_ctx_train = 262144;
+    m.rms_eps     = 1e-6f;
+    m.rope_theta  = 1e6f;
+    m.rope_scale  = 1.0f;
+    m.n_kv        = (int)(sizeof(k_gem4_keys) / sizeof(k_gem4_keys[0]));
+    m.kv_key      = k_gem4_keys;
+    m.kv_val      = k_gem4_vals;
     return m;
 }
 
@@ -3085,4 +3129,223 @@ TEST(the_per_expert_tap_keeps_each_experts_gram_whole) {
         for (int64_t x = 0; x < k * k; ++x) bad += got[(size_t)x] != want[(size_t)(e * k * k + x)];
     }
     CHECK_EQ(bad, 0);
+}
+
+/* =============================== gemma4 dense: two attention classes =========================== */
+
+TEST(declare_is_a_gemma4_trunk) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    /* 12 layers: 10 sliding + 2 global (layers 5 and 11). */
+    CHECK_EQ(count_op(b, "attn_paged"),  12);
+    CHECK_EQ(count_op(b, "kv_store"),    12);
+    CHECK_EQ(count_op(b, "rmsnorm_p"),   12);   /* the weightless value normalisation, one per layer */
+    CHECK_EQ(count_op(b, "rope"),        24);   /* q + k */
+    CHECK_EQ(count_op(b, "gelu_mul"),    12);   /* Gemma's FFN activation, not SwiGLU */
+    CHECK_EQ(count_op(b, "silu_mul"),     0);
+    CHECK_EQ(count_op(b, "gemm_nt"),     70);   /* 10x6 sliding (q,k,v,o,gu,down) + 2x5 global (no v) */
+    CHECK_EQ(count_op(b, "rmsnorm"),     73);   /* 4 attn + 2 ffn per layer, plus the final norm */
+    CHECK_EQ(count_op(b, "add"),         24);   /* the two GemmaRMSNorm residuals per layer */
+    CHECK_EQ(count_op(b, "embed_lookup"),  1);
+    CHECK_EQ(count_op(b, "gather_rows"),   1);
+    CHECK_EQ(count_op(b, "logits_gemm"),   1);
+    CHECK_EQ(count_op(b, "logit_softcap"), 1);
+    CHECK_EQ(count_op(b, "all_reduce"),    0);  /* world 1 */
+}
+
+TEST(gemma4_declares_two_kv_groups_and_binds_the_schedule) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    CHECK_EQ((int)b.kv_groups.size(), 2);
+    CHECK_EQ((int)b.kv_groups[0].d.kind, RAD_KV_WINDOW);   /* sliding, declared first */
+    CHECK_EQ(b.kv_groups[0].d.window,    1024);
+    CHECK_EQ(b.kv_groups[0].d.n_head_kv, 16);
+    CHECK_EQ(b.kv_groups[0].d.head_dim,  256);
+    CHECK_EQ((int)b.kv_groups[1].d.kind, RAD_KV_FULL);     /* global */
+    CHECK_EQ(b.kv_groups[1].d.window,    0);
+    CHECK_EQ(b.kv_groups[1].d.n_head_kv, 4);
+    CHECK_EQ(b.kv_groups[1].d.head_dim,  512);
+
+    /* (l + 1) % 6 == 0 -> global layers 5 and 11; the fake hands group #1 to sliding (declared
+     * first) and #2 to global. */
+    CHECK_EQ((int)b.binds.size(), 12);
+    for (int l = 0; l < 12; ++l) {
+        const bool want_global = ((l + 1) % 6 == 0);
+        CHECK_EQ((int)b.binds[(size_t)l].first, l);
+        CHECK_EQ((int)b.binds[(size_t)l].second, want_global ? 2 : 1);
+    }
+}
+
+TEST(gemma4_attention_shapes_for_both_classes) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    /* layer 0 (sliding): q 32x256, k/v 16x256, windowed. */
+    {
+        const RecOp* at = find_op(b, "attn_paged", 0);
+        CHECK(at != nullptr);
+        CHECK_EQ(pint(at, "head_dim"), 256);
+        CHECK_EQ(pint(at, "gqa"),      2);
+        CHECK_EQ(pint(at, "window"),   1024);
+        CHECK_EQ(pint(at, "n_head"),   32);
+        CHECK_EQ(pint(at, "block_size"), 16);
+        CHECK_EQ(pstr(at, "q_dtype"), std::string("bf16"));
+    }
+    /* layer 5 (the first global, (5+1)%6==0): q 32x512, k 4x512, windowless. */
+    {
+        const RecOp* at = find_op(b, "attn_paged", 5);
+        CHECK(at != nullptr);
+        CHECK_EQ(pint(at, "head_dim"), 512);
+        CHECK_EQ(pint(at, "gqa"),      8);
+        CHECK_EQ(pint(at, "window"),   0);
+        CHECK_EQ(pint(at, "n_head"),   32);
+    }
+
+    /* rope: the sliding call is standard over the full 256 (theta 1e4); the global call is
+     * proportional over 128 of 512 (the "head" ladder, theta 1e6). rope ops are declared q, k per
+     * layer, so global index = 2*layer + (q ? 0 : 1). */
+    {
+        const RecOp* r  = find_op(b, "rope", 0);   /* layer 0, q */
+        CHECK(r != nullptr);
+        CHECK_EQ(pint(r, "head_dim"),   256);
+        CHECK_EQ(pint(r, "rotary_dim"), 256);
+        CHECK_NEAR(pflt(r, "theta"),    1e4, 1.0);
+        CHECK_EQ(pstr(r, "ladder"), std::string("rotary"));
+        CHECK_EQ(pint(r, "n_head"),    32);
+
+        const RecOp* rg = find_op(b, "rope", 10);  /* layer 5, q */
+        CHECK(rg != nullptr);
+        CHECK_EQ(pint(rg, "head_dim"),   512);
+        CHECK_EQ(pint(rg, "rotary_dim"), 128);
+        CHECK_NEAR(pflt(rg, "theta"),    1e6, 1.0);
+        CHECK_EQ(pstr(rg, "ladder"), std::string("head"));
+        CHECK_EQ(pint(rg, "n_head"),    32);
+
+        /* the k rope is a separate buffer, served by the fused-row kernel as a q-only form over
+         * the k heads: n_head is the head count to rotate (here n_head_kv = 4) and n_head_kv is 0. */
+        const RecOp* rkg = find_op(b, "rope", 11); /* layer 5, k */
+        CHECK(rkg != nullptr);
+        CHECK_EQ(pint(rkg, "n_head"),    4);
+        CHECK_EQ(pint(rkg, "n_head_kv"), 0);
+    }
+
+    /* the weightless value normalisation reads 256 dims on a sliding layer, 512 on a global one;
+     * and the global layer has no v_proj weight at all -- v is k. */
+    {
+        const RecOp* vn  = find_op(b, "rmsnorm_p", 0);   /* layer 0 */
+        CHECK(vn != nullptr);
+        CHECK_EQ(pint(vn, "n"), 256);
+        const RecOp* vng = find_op(b, "rmsnorm_p", 5);   /* layer 5 */
+        CHECK(vng != nullptr);
+        CHECK_EQ(pint(vng, "n"), 512);
+    }
+    CHECK(find_w(b, "blk.0.attn_v.weight") != nullptr);  /* sliding has a v projection */
+    CHECK(find_w(b, "blk.5.attn_v.weight") == nullptr);  /* global: k == v */
+    CHECK(find_w(b, "blk.5.attn_q.weight") != nullptr);
+    CHECK(find_w(b, "blk.5.attn_o.weight") != nullptr);
+}
+
+TEST(gemma4_final_norm_softcap_and_vocab) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    const RecOp* cap = find_op(b, "logit_softcap", 0);
+    CHECK(cap != nullptr);
+    CHECK_EQ(pint(cap, "n"), 262144);
+    CHECK_NEAR(pflt(cap, "cap"), 30.0, 1e-9);
+    CHECK_EQ(pstr(cap, "dtype"), std::string("f32"));
+
+    const RecOp* lg = find_op(b, "logits_gemm", 0);
+    CHECK(lg != nullptr);
+    CHECK_EQ(pint(lg, "n_vocab"), 262144);
+    CHECK_EQ(pint(lg, "n_embd"),  5376);
+
+    const RecWeight* emb = find_w(b, "token_embd.weight");
+    CHECK(emb != nullptr);
+    CHECK_EQ(emb->d.shape[0], 262144);
+    CHECK_EQ(emb->d.shape[1], 5376);
+    CHECK_EQ(emb->d.shard, RAD_SHARD_ROW);
+
+    /* lm_head is tied to the embedding. */
+    CHECK(find_map(b, "output.weight") != nullptr);
+
+    /* The embedding is scaled by sqrt(n_embd) at the LOOKUP, not baked into the table (the
+     * reference's build_inp_embd and HF's ScaledWordEmbedding both do it there), so the table
+     * stays tied to the head's. The scale rides the op. */
+    const RecOp* el = find_op(b, "embed_lookup", 0);
+    CHECK(el != nullptr);
+    CHECK_NEAR(pflt(el, "mult"), std::sqrt(5376.0), 1e-9);
+}
+
+TEST(gemma4_every_op_declares_the_buffers_it_touches) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+    for (const auto& o : b.ops)
+        if (o.resolved) CHECK(o.uses_declared);
+}
+
+TEST(gemma4_every_weight_has_a_name_map) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+    for (const auto& w : b.weights)
+        CHECK(find_map(b, w.name) != nullptr);
+}
+
+TEST(a_gemma4_decode_step_runs_both_classes_in_order) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+    RadBatch batch = decode_batch();
+    c.batch = &batch;
+    gemma4_bf16::step(&c, &batch);
+
+    std::vector<std::string> want = { "embed_lookup" };
+    for (int l = 0; l < 12; ++l) {
+        if ((l + 1) % 6 == 0) {
+            /* global: k == v, so no v gemm -- the weightless v norm derives from k instead. */
+            for (const char* s : { "rmsnorm", "gemm_nt", "gemm_nt",
+                                   "rmsnorm_p", "rmsnorm", "rmsnorm", "rope", "rope",
+                                   "kv_store", "attn_paged", "gemm_nt", "rmsnorm", "add" })
+                want.push_back(s);
+        } else {
+            /* sliding: a v gemm feeds the weightless v norm. */
+            for (const char* s : { "rmsnorm", "gemm_nt", "gemm_nt", "gemm_nt",
+                                   "rmsnorm_p", "rmsnorm", "rmsnorm", "rope", "rope",
+                                   "kv_store", "attn_paged", "gemm_nt", "rmsnorm", "add" })
+                want.push_back(s);
+        }
+        for (const char* s : { "rmsnorm", "gemm_nt", "gelu_mul", "gemm_nt", "rmsnorm", "add" })
+            want.push_back(s);
+        want.push_back("scale");   /* the per-layer scalar over the residual stream */
+    }
+    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
+        want.push_back(s);
+    CHECK_EQ(join(issued_ops(b, c)), join(want));
+
+    /* The sampled-row ops band on n_out; the attention bands on q_len. */
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "attn_paged")
+            CHECK_EQ(i.n, (int64_t)batch.max_q_len);
+        else if (o->op == "gather_rows" || o->op == "logits_gemm" || o->op == "logit_softcap")
+            CHECK_EQ(i.n, (int64_t)batch.n_out);
+    }
 }
