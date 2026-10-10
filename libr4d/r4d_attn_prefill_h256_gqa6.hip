@@ -76,7 +76,12 @@ __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
                  __builtin_bit_cast(float, w & 0xffff0000u) * s);
 }
 
-template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT>
+// WIN turns on a sliding window (a.window positions, ending at each row's causal limit), the way
+// the decode kernel's WIN does. The window's lower bound masks the keys before it, and the KV walk
+// starts at the tile holding the window's first token (taken at query row 0, whose window reaches
+// furthest back) so the tiles no row can reach are never walked. window <= 0 (or WIN off) is the
+// full-attention form, unchanged.
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int WIN = 0>
 __global__ __launch_bounds__(NWARPS * 32)
 void r4d_attn_prefill_kernel(const R4DArgs a)
 {
@@ -159,6 +164,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     }
 
     const int klimit = ctx - qlen + qpos;
+    // The window's first key this row may attend to: the causal limit back by the window, floored
+    // at zero. The decode kernel's r4d_attn_wlo is the same formula, inlined here because the
+    // prefill header is compiled before the decode one that defines it.
+    int wlo = (WIN && a.window > 0) ? (ctx - qlen + qpos - a.window + 1) : 0;
+    if (WIN && a.window > 0 && wlo < 0) wlo = 0;
 
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
@@ -170,6 +180,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, qlen - 1);
     const int klimit_cta = ctx - qlen + qmax_cta;
     const int ntiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
+    // The window's first tile, taken at query row 0 (whose window reaches furthest back); the walk
+    // starts there so no row's below-window tiles are fetched. WIN off (or window <= 0) starts at 0.
+    const int wlo0 = (WIN && a.window > 0) ? (ctx - qlen - a.window + 1) : 0;
+    const int tstart = (WIN && a.window > 0 && wlo0 > 0) ? (wlo0 / TILE) : 0;
 
     // ---- staging, split into a global FETCH (registers) and an LDS STORE ------------------------
     // Splitting them is what lets GPREV move the fetch out from between the barriers; without
@@ -302,10 +316,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
         }
     };
     int blk[NB];
-    if (BTS) load_bt(0, blk);
-    if (GPREV) fetchV(0, blk);
+    if (BTS) load_bt(tstart * NB, blk);
+    if (GPREV) fetchV(tstart * TILE, blk);
 
-    for (int ti = 0; ti < ntiles; ++ti) {
+    for (int ti = tstart; ti < ntiles; ++ti) {
         const int k0 = ti * TILE;
         int blkn[NB];
         if (BTS && ti + 1 < ntiles) {
@@ -352,9 +366,12 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
 
             const int kbase = k0 + mt * 16 + 8 * h;
-            if (!MSKIP || wave_any(kbase + 7 > klimit)) {
+            // The causal bound masks the keys past klimit; the window bound (WIN) also masks the
+            // keys before wlo. MSKIP skips both when an m-tile straddles neither limit.
+            if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < wlo))) {
                 #pragma unroll
-                for (int e = 0; e < 8; ++e) sc[e] = (kbase + e <= klimit) ? sc[e] : -INFINITY;
+                for (int e = 0; e < 8; ++e) sc[e] = ((kbase + e <= klimit) && (!WIN || kbase + e >= wlo))
+                                                    ? sc[e] : -INFINITY;
             }
 
             float smax = sc[0];
