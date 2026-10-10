@@ -7203,6 +7203,7 @@ mod tests {
             nonexact: false,
             max_batch_tokens: 4096,
             prefill_min_tokens: 1,
+            sampled: false,
         };
         qwen4_lane_ack_fields(&mut v, &receipt, 4, 32, params);
         assert_eq!(v["continuous_batch_route"], "fn-lanes");

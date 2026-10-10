@@ -1184,7 +1184,7 @@
     {
      "module": "sample_top_p_parallel",
      "kind": "hip",
-     "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+     "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -1204,7 +1204,7 @@
     {
      "module": "sample_top_p_parallel_fast21",
      "kind": "hip",
-     "sha256": "af11d3c9fcf4513f59533efd7769b006387b9f0de642988a587f20092a0c509f",
+     "sha256": "c8c96a20da1c638382f5ae1144193618b5b16b120d9c809d08681d636bd6f6c8",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -1223,7 +1223,7 @@
     {
      "module": "sample_top_p_parallel_fast65",
      "kind": "hip",
-     "sha256": "2fe31c09772af9f349e592674043abd1a582091f13333ed355acae5d22121328",
+     "sha256": "c11602685ff0268c3733e70486315737f15e757d2da4cc6bb30fc249ea71e888",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -1242,7 +1242,7 @@
     {
      "module": "sample_top_p_parallel_w64",
      "kind": "hip",
-     "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+     "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2837,7 +2837,7 @@
     {
      "module": "sample_top_p_parallel",
      "kind": "hip",
-     "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+     "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2857,7 +2857,7 @@
     {
      "module": "sample_top_p_parallel_fast21",
      "kind": "hip",
-     "sha256": "af11d3c9fcf4513f59533efd7769b006387b9f0de642988a587f20092a0c509f",
+     "sha256": "c8c96a20da1c638382f5ae1144193618b5b16b120d9c809d08681d636bd6f6c8",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2876,7 +2876,7 @@
     {
      "module": "sample_top_p_parallel_fast65",
      "kind": "hip",
-     "sha256": "2fe31c09772af9f349e592674043abd1a582091f13333ed355acae5d22121328",
+     "sha256": "c11602685ff0268c3733e70486315737f15e757d2da4cc6bb30fc249ea71e888",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2895,7 +2895,7 @@
     {
      "module": "sample_top_p_parallel_w64",
      "kind": "hip",
-     "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+     "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -3874,7 +3874,7 @@
     "module": "sample_top_p_parallel",
     "symbol": "sample_apply_repeat_penalty",
     "kind": "hip",
-    "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+    "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3890,7 +3890,7 @@
     "module": "sample_top_p_parallel",
     "symbol": "sample_topk_finalize",
     "kind": "hip",
-    "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+    "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3906,7 +3906,7 @@
     "module": "sample_top_p_parallel",
     "symbol": "sample_topk_partial",
     "kind": "hip",
-    "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+    "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3922,7 +3922,7 @@
     "module": "sample_top_p_parallel_fast21",
     "symbol": "sample_topk_finalize_fast21",
     "kind": "hip",
-    "sha256": "af11d3c9fcf4513f59533efd7769b006387b9f0de642988a587f20092a0c509f",
+    "sha256": "c8c96a20da1c638382f5ae1144193618b5b16b120d9c809d08681d636bd6f6c8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3938,7 +3938,7 @@
     "module": "sample_top_p_parallel_fast21",
     "symbol": "sample_topk_partial_fast21",
     "kind": "hip",
-    "sha256": "af11d3c9fcf4513f59533efd7769b006387b9f0de642988a587f20092a0c509f",
+    "sha256": "c8c96a20da1c638382f5ae1144193618b5b16b120d9c809d08681d636bd6f6c8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3954,7 +3954,7 @@
     "module": "sample_top_p_parallel_fast65",
     "symbol": "sample_topk_finalize_fast65",
     "kind": "hip",
-    "sha256": "2fe31c09772af9f349e592674043abd1a582091f13333ed355acae5d22121328",
+    "sha256": "c11602685ff0268c3733e70486315737f15e757d2da4cc6bb30fc249ea71e888",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3970,7 +3970,7 @@
     "module": "sample_top_p_parallel_fast65",
     "symbol": "sample_topk_partial_fast65",
     "kind": "hip",
-    "sha256": "2fe31c09772af9f349e592674043abd1a582091f13333ed355acae5d22121328",
+    "sha256": "c11602685ff0268c3733e70486315737f15e757d2da4cc6bb30fc249ea71e888",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3986,7 +3986,7 @@
     "module": "sample_top_p_parallel_w64",
     "symbol": "sample_apply_repeat_penalty_w64",
     "kind": "hip",
-    "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+    "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -4002,7 +4002,7 @@
     "module": "sample_top_p_parallel_w64",
     "symbol": "sample_topk_finalize_w64",
     "kind": "hip",
-    "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+    "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -4018,7 +4018,7 @@
     "module": "sample_top_p_parallel_w64",
     "symbol": "sample_topk_partial_w64",
     "kind": "hip",
-    "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+    "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -5196,7 +5196,7 @@
     "module": "sample_top_p_parallel",
     "symbol": "sample_apply_repeat_penalty",
     "kind": "hip",
-    "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+    "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
