@@ -180,9 +180,12 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, qlen - 1);
     const int klimit_cta = ctx - qlen + qmax_cta;
     const int ntiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
-    // The window's first tile, taken at query row 0 (whose window reaches furthest back); the walk
-    // starts there so no row's below-window tiles are fetched. WIN off (or window <= 0) starts at 0.
-    const int wlo0 = (WIN && a.window > 0) ? (ctx - qlen - a.window + 1) : 0;
+    // The window's first tile, taken at THIS CTA's first query row (whose window reaches furthest
+    // back among the rows it holds); the walk starts there, so no tile below every row's window is
+    // fetched. Taken at the CHUNK's row 0 instead, the last CTA of an 8192-token chunk walked eight
+    // thousand keys none of its rows can see -- fully masked tiles, so skipping them changes no
+    // value. WIN off (or window <= 0) starts at 0.
+    const int wlo0 = (WIN && a.window > 0) ? (ctx - qlen + qb * BLOCK_Q - a.window + 1) : 0;
     const int tstart = (WIN && a.window > 0 && wlo0 > 0) ? (wlo0 / TILE) : 0;
 
     // ---- staging, split into a global FETCH (registers) and an LDS STORE ------------------------
