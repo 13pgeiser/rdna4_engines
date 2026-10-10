@@ -1186,7 +1186,7 @@ AVX_KERNEL(rope) {
     static const char* kModes[] = { "neox", "gptj", "mrope", "imrope", "axial" };
     const int mode = p_enum(a, "mode", kModes, 5, -1);
     if (mode < 0) return RAD_E_UNSUPPORTED;
-    const int64_t rot = p_int(a, "rotary_dim", head_dim);
+    int64_t rot = p_int(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
     int64_t den;
     const int lrc = rope_ladder(a, rot, head_dim, &den);
@@ -1214,6 +1214,10 @@ AVX_KERNEL(rope) {
     if (M <= 0 || numel(qkv) < M * stride_row) return RAD_E_SHAPE;
     const int64_t rs = qkv->rank >= 2 ? qkv->stride[qkv->rank - 2] : stride_row;
     const int64_t ds = laststride(qkv);
+    /* THE PROPORTIONAL LADDER (`head`) is HF's: the rotation spans the whole head -- pair i is
+     * (i, i + head_dim/2) -- and every frequency past rotary_dim/2 is zero (libref, ref_rope). */
+    const int64_t nfreq = rot / 2;
+    if (den == head_dim && rot < head_dim && !multi && mode == ROPE_NEOX) rot = head_dim;
     const int64_t half = rot / 2;
     float* invf = inv_freqs(half, den, theta);
     int comp[512] = {};
@@ -1243,6 +1247,7 @@ AVX_KERNEL(rope) {
         if (mode == ROPE_AXIAL || rscale != 1.0f) return RAD_E_UNSUPPORTED;
         for (int64_t i = 0; i < half; ++i) invf[i] = yarn.frequency(invf[i], (int)i);
     }
+    for (int64_t i = nfreq; i < half; ++i) invf[i] = 0.0f;
     const int64_t pcs = multi ? pos->stride[0] : 0, pms = multi ? pos->stride[1] : 0;
 
     AVX_PARALLEL_FOR_IF(M * (n_head + n_head_kv) * rot >= AVX_PAR_MIN)

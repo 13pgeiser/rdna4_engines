@@ -499,6 +499,11 @@ int ref_rope(const RadArgs* a, RadStream) {
         const int64_t need = mode == ROPE_IMROPE ? 3 : n_sec;
         if (n_comp < need || n_comp > 8) return RAD_E_SHAPE;
     }
+    /* THE PROPORTIONAL LADDER (`head`) is HF's: the rotation spans the whole head -- pair i is
+     * (i, i + head_dim/2) -- and every frequency past rotary_dim/2 is zero, so those pairs turn by
+     * nothing. A rotary of rotary_dim's own width, pairing (i, i + rot/2), turns other channels. */
+    const int64_t nfreq = rot / 2;
+    if (den == head_dim && rot < head_dim && !multi && mode == ROPE_NEOX) rot = head_dim;
     RopeFreq f;
     RAD_REF_TRY(rope_freqs(mode, rot, den, theta, sec, multi ? n_sec : 0, &f));
     const RadYarn yarn = rad_yarn_args(a);
@@ -507,6 +512,7 @@ int ref_rope(const RadArgs* a, RadStream) {
         if (mode == ROPE_AXIAL || rscale != 1.0f) return RAD_E_UNSUPPORTED;
         for (int64_t i = 0; i < rot / 2; ++i) f.inv[i] = yarn.frequency(f.inv[i], (int)i);
     }
+    for (int64_t i = nfreq; i < rot / 2; ++i) f.inv[i] = 0.0f;
 
 
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;

@@ -2441,14 +2441,19 @@ TEST(op_rope_multi_component) {
 }
 
 /* THE PROPORTIONAL LADDER. With head_dim wider than rotary_dim, the two ladders give frequency 1 a
- * different angle: `rotary` divides by rotary_dim, `head` by head_dim. Frequency 0 is theta^0 under
- * both, and the tail past rotary_dim is never touched, so those pin the unchanged parts while
- * frequency 1 pins the switch itself. */
+ * different angle: `rotary` divides by rotary_dim, `head` by head_dim. And they pair different
+ * channels: `rotary` is a complete rotary of rotary_dim's own width, pair i = (i, i + rot/2) with
+ * the tail past rot untouched, while `head` is HF's proportional RoPE
+ * (_compute_proportional_rope_parameters + rotate_half over the WHOLE head): pair i is
+ * (i, i + head_dim/2) and every frequency past rot/2 is zero, so only those rot/2 pairs turn.
+ * Frequency 0 is theta^0 under both; frequency 1 pins the ladder, the partner index the pairing. */
 TEST(op_rope_ladder) {
     const int64_t hd = 8, rot = 4;        /* two frequencies, a partial rotary (hd > rot) */
     const float pos = 7.0f;
     for (const char* lad : { "rotary", "head" }) {
-        const int64_t den = (lad[0] == 'h') ? hd : rot;
+        const bool head = lad[0] == 'h';
+        const int64_t den = head ? hd : rot;
+        const int64_t poff = head ? hd / 2 : rot / 2;   /* where pair i's partner sits */
         T got(RAD_F32, { 1, hd });
         got.f(std::vector<float>(hd, 1.0f));
         T p1(RAD_I32, { 1 }); p1.n({ 7 });
@@ -2456,13 +2461,16 @@ TEST(op_rope_ladder) {
               .d("theta", 100).d("scale", 1).s("mode", "neox").i("rotary_dim", rot)
               .s("ladder", lad);
         CHECK_OK(run("rope", a));
+        std::vector<bool> turned(hd, false);
         for (int i = 0; i < rot / 2; ++i) {
             const float inv = 1.0f / std::pow(100.0f, (float)(2 * i) / (float)den);
             const float ang = pos * inv;
             CHECK_NEAR(got.at(i), std::cos(ang) - std::sin(ang), 1e-5);
-            CHECK_NEAR(got.at(i + rot / 2), std::sin(ang) + std::cos(ang), 1e-5);
+            CHECK_NEAR(got.at(i + poff), std::sin(ang) + std::cos(ang), 1e-5);
+            turned[i] = turned[i + poff] = true;
         }
-        for (int d = rot; d < hd; ++d) CHECK_EQ(got.at(d), 1.0f);   /* untouched tail */
+        for (int d = 0; d < hd; ++d)
+            if (!turned[d]) CHECK_EQ(got.at(d), 1.0f);   /* every other channel untouched */
     }
     /* absent ladder == rotary: the models that never set it keep the old angles bit-for-bit */
     {

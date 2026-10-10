@@ -805,7 +805,7 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
 
 __global__ __launch_bounds__(kThreads) void rope_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos,
-    uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, int den, int gptj,
+    uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, uint32_t nfreq, int den, int gptj,
     float theta, float rscale, uint32_t row_pitch,
     int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn) {
     const uint32_t m = blockIdx.x;
@@ -828,6 +828,10 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
                 inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[c]));
         }
         inv = yarn.frequency(inv, (int)i);
+        /* THE PROPORTIONAL LADDER rotates the whole head with every frequency past nfreq zero
+         * (HF's _compute_proportional_rope_parameters), so pair i is (i, i + head_dim/2) and the
+         * pairs past nfreq turn by 0: cos 1, sin 0, the value back exactly. */
+        if (i >= nfreq) inv = 0.0f;
         const float ang = p * inv;
         float c, s;
         sincosf(ang, &s, &c);
@@ -1320,7 +1324,8 @@ extern "C" int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope
 // the caller's, and the plain entry passes `rot`, as it always has.
 static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int den,
                        int gptj, float theta, float rscale, int row_pitch, int mode,
-                       const int* sec, int n_sec, int plane, RadYarn yarn, long stream) {
+                       const int* sec, int n_sec, int plane, RadYarn yarn, long stream,
+                       int nfreq = -1) {
     if (!qkv || !pos) return -1;
     if (M <= 0 || head_dim <= 0 || n_rope_heads <= 0) return -2;
     if (rot <= 0 || rot > head_dim || (rot & 1)) return -3;
@@ -1329,9 +1334,11 @@ static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads
     const uint32_t pairs = (uint32_t)n_rope_heads * (uint32_t)(rot / 2);
     const uint32_t gy = (pairs + kThreads - 1) / kThreads;
     const int s0 = n_sec > 0 ? sec[0] : 0, s1 = n_sec > 1 ? sec[1] : 0, s2 = n_sec > 2 ? sec[2] : 0;
+    if (nfreq < 0) nfreq = rot / 2;
     hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0, (hipStream_t)stream,
                        (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)head_dim,
-                       (uint32_t)n_rope_heads, (uint32_t)rot, (int)den, gptj, theta, rscale,
+                       (uint32_t)n_rope_heads, (uint32_t)rot, (uint32_t)nfreq, (int)den, gptj, theta,
+                       rscale,
                        (uint32_t)row_pitch, mode, s0, s1, s2, n_sec, (uint32_t)plane, yarn);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -2181,6 +2188,11 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
         else if (std::strcmp(lad, "rotary") && std::strcmp(lad, "head"))
             return R4D_NO(RAD_E_UNSUPPORTED);
     }
+    /* `head` is HF's proportional RoPE: the rotation spans the WHOLE head (rotate_half over
+     * head_dim, so pair i is (i, i + head_dim/2)) and only the first rotary_dim/2 frequencies are
+     * non-zero. Rotating the first rotary_dim dims as a rotary of their own pairs (i, i + rot/2)
+     * instead -- Gemma 4's global layers, 128 of 512 -- turns the wrong channels, and long-range
+     * attention degrades with distance. */
 
     /* THE MODE, and with it how many components a position has. With [M] positions -- one
      * component a token -- mrope and imrope ARE neox: every frequency reads the same position and
@@ -2231,9 +2243,12 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     if (yarn.factor != 0.0f && (mc == 4 || rscale != 1.0f)) return R4D_NO(RAD_E_UNSUPPORTED);
     /* The Q heads and the K heads rotate; the V heads that follow them do not, which is the whole
      * reason this op takes the fused projection rather than two tensors. */
+    long long rot_l = rot, nfreq = rot / 2;
+    if (den == head_dim && rot < head_dim && !multi && !gptj && mc == 0) rot_l = head_dim;
     return rope_launch(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,
-                       (int)(n_head + n_head_kv), (int)rot, (int)den, gptj, theta, rscale,
-                       (int)pitch, mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s) == 0
+                       (int)(n_head + n_head_kv), (int)rot_l, (int)den, gptj, theta, rscale,
+                       (int)pitch, mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s,
+                       (int)nfreq) == 0
         ? RAD_OK
         : RAD_E_DEVICE;
 }

@@ -4634,7 +4634,8 @@ static void rope_ladder_case(const Plugin& pl) {
             for (int64_t h = 0; h < n_rope; ++h) {
                 for (int64_t i = 0; i < half; ++i) {
                     const size_t i0 = base + (size_t)h * hd + i;
-                    const size_t i1 = i0 + half;
+                    /* `head` is HF's proportional RoPE: pair i is (i, i + head_dim/2). */
+                    const size_t i1 = i0 + ((lad && !std::strcmp(lad, "head")) ? hd / 2 : half);
                     const float x0 = h_bf16(saved[(size_t)i0]), x1 = h_bf16(saved[(size_t)i1]);
                     const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
                     float s, c;
