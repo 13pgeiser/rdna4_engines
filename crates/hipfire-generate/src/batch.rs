@@ -260,6 +260,16 @@ fn request_has_stop(msg: &serde_json::Value) -> bool {
     )
 }
 
+/// Whether a generate message carries a think budget the singleton decode
+/// loop enforces: the request's `max_think_tokens` (the daemon's resolved
+/// cap, including the `1` sentinel of thinking-off) or the global
+/// `reasoning.max_total_tokens`. Same predicate as the admission's
+/// [`crate::vmm_conv::ThinkCtl::budgeted`].
+fn request_think_budgeted(msg: &serde_json::Value) -> bool {
+    let max_think = msg.get("max_think_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    crate::vmm_conv::ThinkCtl::new(max_think).budgeted()
+}
+
 /// Tightened admission: require Qwen 5/6 (QwenAr) or dense LFM 11 (LfmAr), pp=1,
 /// no EP, model-owned batch state present, and no excluded features. Rendered
 /// prompts that open a think span stay on the sequential barrier route. MoE LFM
@@ -1824,8 +1834,11 @@ const VMM_DFLASH_SAMPLED: bool = true;
 /// request stays on the singleton route). The one capability decision used by
 /// eligibility, the promotion permit and lane admission. A sampled request
 /// whose singleton route is speculative is never served as an AR lane (that
-/// would substitute a different RNG schedule); spec lanes do not run stop
-/// strings, so a request with stops stays singleton.
+/// would substitute a different RNG schedule); spec lanes run neither stop
+/// strings nor think control, so a speculative request with stops or a think
+/// budget stays singleton. Deciding this at eligibility keeps the request
+/// out of the batch before its start is announced.
+#[allow(clippy::too_many_arguments)]
 fn sampled_lane_for(
     route: GenerationRoute,
     speculator_is_mtp: bool,
@@ -1834,17 +1847,17 @@ fn sampled_lane_for(
     dflash_sampled: bool,
     sampled_flag: bool,
     has_stops: bool,
+    think_budgeted: bool,
 ) -> Option<VmmLaneDecode> {
     if !sampled_flag {
         return None;
     }
+    let spec_shape = !has_stops && !think_budgeted;
     match route {
         GenerationRoute::QwenAr => Some(VmmLaneDecode::Ar),
-        GenerationRoute::QwenDflash if speculator_is_mtp => {
-            (mtp_engine && !has_stops).then_some(VmmLaneDecode::Mtp)
-        }
+        GenerationRoute::QwenDflash if speculator_is_mtp => (mtp_engine && spec_shape).then_some(VmmLaneDecode::Mtp),
         GenerationRoute::QwenDflash => {
-            (dflash_engine && dflash_sampled && !has_stops).then_some(VmmLaneDecode::Dflash)
+            (dflash_engine && dflash_sampled && spec_shape).then_some(VmmLaneDecode::Dflash)
         }
         _ => None,
     }
@@ -1883,6 +1896,7 @@ fn vmm_sampled_lane(msg: &serde_json::Value, m: &LoadedModel, sampling: &BatchSa
         VMM_DFLASH_SAMPLED,
         vmm_store_sampled(store),
         request_has_stop(msg),
+        request_think_budgeted(msg),
     )
 }
 
@@ -3522,10 +3536,12 @@ pub fn drive_qwen_vmm_continuous_batch(
             // which run per committed token on AR lanes. MTP: head lane cap.
             // DFlash: the singleton greedy DFlash route's own selector and
             // the resolved context cap. A SAMPLED request is served in its
-            // singleton route's own mode only (`vmm_sampled_lane`): an AR
-            // lane for an AR singleton; an MTP/DFlash lane when the driver's
-            // engine and the same requirements hold; otherwise it goes back
-            // to the singleton route (`sampled_handback`). A speculative
+            // singleton route's own mode only (`vmm_sampled_lane`, which
+            // already holds a think-budgeted or stop-string speculative
+            // request back at eligibility): an AR lane for an AR singleton;
+            // an MTP/DFlash lane when the driver's engine cap holds;
+            // otherwise it goes back to the singleton route
+            // (`sampled_handback`). A speculative
             // singleton whose prompt + fitted budget + one draft block exceeds
             // the speculator's context capacity falls back to AR itself
             // (qwen.rs `spec_ctx_request_fits` guard), so that request is an
@@ -3544,10 +3560,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                     Some(VmmLaneDecode::Ar) => None,
                     Some(VmmLaneDecode::Mtp | VmmLaneDecode::Dflash) if !singleton_spec_fits => None,
                     Some(VmmLaneDecode::Mtp) => match spec_engine {
-                        Some((k, cap))
-                            if !think.budgeted()
-                                && stops.is_empty()
-                                && rendered.len() + lane_max_tokens(&key, sched) + k + 1 <= cap =>
+                        Some((k, cap)) if rendered.len() + lane_max_tokens(&key, sched) + k + 1 <= cap =>
                         {
                             Some((VmmLaneDecode::Mtp, spec_request_config(s, rng_state as u64)))
                         }
@@ -3557,10 +3570,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                         }
                     },
                     Some(VmmLaneDecode::Dflash) => match dflash_engine {
-                        Some((block, cap))
-                            if !think.budgeted()
-                                && stops.is_empty()
-                                && dflash_lane_fits(rendered.len(), lane_max_tokens(&key, sched), block, cap) =>
+                        Some((block, cap)) if dflash_lane_fits(rendered.len(), lane_max_tokens(&key, sched), block, cap) =>
                         {
                             Some((VmmLaneDecode::Dflash, spec_request_config(s, rng_state as u64)))
                         }
@@ -3596,7 +3606,15 @@ pub fn drive_qwen_vmm_continuous_batch(
                 // mechanism as a lonely request). Its `gen_start` must not be
                 // on the wire yet (a second start would be a duplicate); an
                 // already-announced request cannot move, so it fails visibly.
+                // Eligibility runs the same `vmm_sampled_lane` decision, so a
+                // think budget or stop strings never get an announced
+                // request here; only an engine/capacity mismatch between the
+                // singleton's speculator and the staged engine can.
                 if announced.borrow().contains(&key) {
+                    debug_assert!(
+                        !think.budgeted() && stops.is_empty(),
+                        "eligibility admitted a sampled request whose spec lane needs think control or stops"
+                    );
                     refuse(
                         stdout,
                         sched,
@@ -8531,7 +8549,7 @@ mod tests {
         flag: bool,
         stops: bool,
     ) -> Option<VmmLaneDecode> {
-        sampled_lane_for(route, mtp_spec, mtp_engine, dflash_engine, dflash_sampled, flag, stops)
+        sampled_lane_for(route, mtp_spec, mtp_engine, dflash_engine, dflash_sampled, flag, stops, false)
     }
 
     #[test]
@@ -8581,6 +8599,26 @@ mod tests {
         assert_eq!(lane_for(r, false, false, true, true, true, true), None);
         // The shipped capability admits the supported sampled selector chain.
         assert!(VMM_DFLASH_SAMPLED);
+    }
+
+    #[test]
+    fn sampled_lane_think_budget_keeps_spec_singleton_and_ar_a_lane() {
+        // The `--thinking off` sentinel cap 1 is a think budget: a sampled
+        // MTP/DFlash request stays singleton at eligibility (never admitted,
+        // so never refused after its start is announced); an AR lane runs
+        // the singleton's think control and still batches.
+        let r = GenerationRoute::QwenDflash;
+        assert_eq!(sampled_lane_for(r, true, true, false, false, true, false, true), None);
+        assert_eq!(sampled_lane_for(r, false, false, true, true, true, false, true), None);
+        assert_eq!(
+            sampled_lane_for(GenerationRoute::QwenAr, false, true, true, true, true, false, true),
+            Some(VmmLaneDecode::Ar)
+        );
+        if hipfire_runtime::config::get().max_total_think_tokens == 0 {
+            assert!(request_think_budgeted(&serde_json::json!({"max_think_tokens": 1})));
+            assert!(!request_think_budgeted(&serde_json::json!({"max_think_tokens": 0})));
+            assert!(!request_think_budgeted(&serde_json::json!({})));
+        }
     }
 
     #[test]
