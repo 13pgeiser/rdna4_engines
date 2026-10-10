@@ -1214,7 +1214,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         "HIPFIRE_SERVE_BATCH_SAMPLED",
-        "Experimental, default off. Admit sampled (temperature>0) requests to the VMM batch route only for lane modes proven byte-identical to the same-mode singleton (AR, native MTP); requires serve.vmm_batch. 0 keeps sampled requests on the serialized singleton route."
+        "Experimental, default off. Admit sampled (temperature>0) requests to the VMM batch route only in the lane mode the singleton route selects for them, each proven byte-identical to that singleton (AR, native MTP, FAST_SAMPLE selector-chain DFlash); requires serve.vmm_batch. 0 keeps sampled requests on the serialized singleton route."
     ),
     field!(
         "serve.queue_timeout_ms",

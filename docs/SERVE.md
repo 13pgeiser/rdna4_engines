@@ -118,13 +118,21 @@ Config and env owners for bind, idle, queue, and body limits:
    non-exact shared slots body instead (`continuous_batch_nonexact: true`).
    `serve.batch_sampled` / `HIPFIRE_SERVE_BATCH_SAMPLED=1` (experimental,
    default off) additionally admits sampled (temperature>0) requests to the
-   exact route for lane modes proven byte-identical to the same-mode
-   singleton (AR, native MTP); with it off those requests stay on the
-   serialized singleton route.
-   Stage-1 limits: greedy requests only
-   (penalties apply as on the singleton route) and AR rows only;
-   `serve.batch_spec` (`HIPFIRE_SERVE_BATCH_SPEC=0`) is a reserved switch — no
-   cross-request speculation is enabled yet. A request that is alone at
+   exact route, each in the lane mode its singleton route selects (AR, native
+   MTP, FAST_SAMPLE selector-chain DFlash) and byte-identical to that
+   singleton for the same wire seed. A sampled request the batch cannot serve
+   in its own mode (stop strings or a think budget on a speculative lane, a
+   lane cap overflow) stays on the singleton route, never an AR substitute;
+   sampled speculative singletons are not promoted mid-generation. The load
+   ack reports `continuous_batch_sampling: "sampled"` and
+   `continuous_batch_sampled_modes`; each batched request's
+   `continuous_batch` receipt carries `spec_mode`, `sampling` and
+   `equivalence: "singleton_exact"`. With the flag off sampled requests stay
+   on the serialized singleton route.
+   Greedy requests (and sampled ones under `serve.batch_sampled`) batch with
+   penalties applied as on the singleton route; `serve.batch_spec`
+   (`HIPFIRE_SERVE_BATCH_SPEC=0` disables it) lets lanes decode as
+   cross-request MTP/DFlash speculative verify rows. A request that is alone at
    dispatch keeps the unchanged singleton
    route (including native MTP/DFlash); requests arriving while a singleton
    generation runs wait for it to finish, so their TTFT includes that
