@@ -66,7 +66,8 @@ const PLE_HOT_LOAD_RESERVE_BYTES: u64 = 6 << 30;
 /// Host RAM the load takes beyond its weights (state, workspaces, runtime),
 /// added to the planned load.
 const PLE_HOT_STATE_BYTES: u64 = 4 << 30;
-/// Free host RAM below which the fill stops and releases tiers.
+/// `MemAvailable` (without the TTM pool estimate) below which the fill stops
+/// and releases tiers, so a full store keeps at least this much headroom.
 const PLE_HOT_FILL_FLOOR_BYTES: u64 = 4 << 30;
 /// Lowest rate (bytes/s) the adaptive fill throttle backs off to while the
 /// weight sweep is reading.
@@ -1087,6 +1088,12 @@ impl Carrier for Qwen4Carrier {
         // (every PLE fetch pauses it); requests before it finishes use
         // whatever shards are done.
         if let Some(store) = bundle.ple_hot_store() {
+            // Size the store from what the load actually left: keep the
+            // reserve of `MemAvailable` (the fill's floor stops it 2 GiB
+            // lower still).
+            if let Some(available) = hipfire_runtime::ple_hot_store::mem_available_bytes() {
+                store.fit_to_headroom(available, PLE_HOT_LOAD_RESERVE_BYTES);
+            }
             store.release_throttle();
         }
         match bundle.qsa_context_committed_bytes(ctx.gpu) {

@@ -687,6 +687,23 @@ fn proc_io_read_bytes() -> Option<u64> {
         .and_then(|value| value.trim().parse().ok())
 }
 
+/// `/proc/meminfo` `MemAvailable` in bytes.  The store's budget and the
+/// fill's floor use this alone, not `uma_memory::host_available_bytes` (which
+/// adds an estimate of TTM's page pool): the pool estimate let a full store
+/// leave 0.8 GiB `MemAvailable` on Strix Halo.
+pub fn mem_available_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kib * 1024)
+}
+
 fn debug_enabled() -> bool {
     hipfire_config::memory::ple_hot_debug()
 }
@@ -985,6 +1002,32 @@ impl HotRowStore {
         );
     }
 
+    /// Release lowest-ranked tiers until the bytes still to be filled fit in
+    /// `available - headroom` (`available` = `MemAvailable` now, after the
+    /// load).  The load-start budget can only estimate the load's footprint;
+    /// this sizes the store from what the load actually left.  Returns the
+    /// tiers released.
+    pub fn fit_to_headroom(&self, available: u64, headroom: u64) -> usize {
+        let room = available.saturating_sub(headroom);
+        let mut released = 0;
+        while self.resident_bytes().saturating_sub(self.filled_bytes()) > room {
+            if self.release_lowest() == 0 {
+                break;
+            }
+            released += 1;
+        }
+        if released > 0 {
+            eprintln!(
+                "{TAG}: sized to {:.2} GiB after load ({released} tiers released; {:.2} GiB \
+                 MemAvailable, {:.2} GiB headroom kept)",
+                gib(self.resident_bytes()),
+                gib(available),
+                gib(headroom),
+            );
+        }
+        released
+    }
+
     /// Tiers dropped so far.
     pub fn released_tiers(&self) -> usize {
         self.released.load(Ordering::Acquire)
@@ -1235,7 +1278,7 @@ impl HotRowStore {
             &FillParams {
                 floor_bytes,
                 pressure_interval_bytes: PRESSURE_INTERVAL_BYTES,
-                avail: &rdna_compute::uma_memory::host_available_bytes,
+                avail: &mem_available_bytes,
                 io_read_bytes: &proc_io_read_bytes,
                 adapt_interval: Duration::from_secs(1),
             },
@@ -1790,6 +1833,20 @@ mod tests {
         assert!(!hot.fill_complete());
         let guard = hot.read();
         assert!((0..ROWS as u64).all(|row| hot.get(&guard, row).is_none()));
+    }
+
+    /// `fit_to_headroom` releases lowest tiers until the unfilled bytes fit
+    /// the room left above the headroom, and nothing when they already fit.
+    #[test]
+    fn fit_to_headroom_releases_until_the_store_fits() {
+        let hot = store(256, 4, 19);
+        let total = hot.resident_bytes();
+        assert_eq!(hot.fit_to_headroom(total + 100, 100), 0);
+        let room = total / 2;
+        let released = hot.fit_to_headroom(room + 100, 100);
+        assert!(released > 0);
+        assert!(hot.resident_bytes() <= room);
+        assert_eq!(hot.released_tiers(), released);
     }
 
     /// Before any fetch the fill runs at once; a fetch pauses it while its
