@@ -1492,6 +1492,187 @@ TEST(a_template_whose_calls_cannot_be_described_refuses_tools_and_still_chats) {
     CHECK(!why.empty());
 }
 
+/* ================================================================== the object family
+ *
+ * A call written as its name and ONE object holding the arguments (ChatArgs::Object): JSON behind
+ * a name tag with neither an end nor a wrapper -- Mistral's `[TOOL_CALLS]NAME[ARGS]{...}` -- and
+ * behind a function tag that has its own close. The dialect fields (Gemma 4's strings and bare
+ * keys) are held in chatparse_gemma4_test, against the model's own template and llama.cpp's
+ * parser for it. */
+
+static std::shared_ptr<const ReplyParser> object_format(bool tagged_end, ChatFormat* out = nullptr) {
+    static const char* const kT1[] = { "[TOOL_CALLS]" };
+    static const char* const kT2[] = { "<tool_call>" };
+    RadChatFormat c{};
+    c.struct_size = sizeof(RadChatFormat);
+    c.args_form = RAD_CHAT_ARGS_OBJECT;
+    if (!tagged_end) {
+        c.name = "test:name-tag";
+        c.name_prefix = "[TOOL_CALLS]";
+        c.name_suffix = "[ARGS]";
+        c.triggers = kT1;
+    } else {
+        c.name = "test:function-tag";
+        c.call_open = "<tool_call>\n";
+        c.call_close = "</tool_call>";
+        c.name_prefix = "<function=";
+        c.name_suffix = ">";
+        c.call_end = "</function>\n";
+        c.triggers = kT2;
+    }
+    c.n_triggers = 1;
+    ChatFormat f;
+    std::string why;
+    std::shared_ptr<const ReplyFormat> rf;
+    std::shared_ptr<const ReplyParser> p;
+    if (chat_format_from_abi(&c, &f, &why) < 0 || ReplyFormat::compile(f, &rf, &why) < 0) {
+        ::radtest::fail(__FILE__, __LINE__, why);
+        return nullptr;
+    }
+    if (out) *out = f;
+    ReplyOptions ro;
+    ro.tools = &agent_tools();
+    if (ReplyParser::create(rf, ro, &p, &why) < 0) ::radtest::fail(__FILE__, __LINE__, why);
+    return p;
+}
+
+static int object_admits(const std::string& gbnf, const std::string& text) {
+    static const SimpleVocab vocab = [] {
+        SimpleVocab v;
+        for (int c = 32; c < 127; ++c) v.add(std::string(1, (char)c));
+        v.add("\n");
+        return v;
+    }();
+    std::unique_ptr<GbnfGrammar> gr;
+    std::string err;
+    if (GbnfGrammar::create(gbnf, "root", &vocab, false, {}, {}, &gr, &err) < 0) return -1;
+    if (gr->accept_str(text) < 0) return 0;
+    return gr->complete() ? 1 : 0;
+}
+
+TEST(json_arguments_behind_a_name_tag_read_as_one_object) {
+    std::shared_ptr<const ReplyParser> p = object_format(false);
+    REQUIRE(p != nullptr);
+    bool strict = false;
+    const std::string reply = "Sure.[TOOL_CALLS]bash[ARGS]{\"command\": \"ls -la\", \"timeout\": 30}"
+                              "[TOOL_CALLS]read[ARGS]{\"path\": \"/a\", \"limit\": [1, {\"x\": null}]}";
+    const ReplyMessage m = reply_parse(*p, reply, &strict);
+    CHECK(strict);
+    CHECK_EQ(m.content, std::string("Sure."));
+    REQUIRE(m.calls.size() == 2);
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"command\":\"ls -la\",\"timeout\":30}"));
+    CHECK_EQ(m.calls[1].arguments, std::string("{\"path\":\"/a\",\"limit\":[1,{\"x\":null}]}"));
+    const std::string err = stream_all(*p, reply);
+    if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+    /* A bare key is outside JSON: read, and said so. */
+    const ReplyMessage b = reply_parse(*p, "[TOOL_CALLS]read[ARGS]{path: \"/a\"}", &strict);
+    CHECK(!strict);
+    REQUIRE(b.calls.size() == 1);
+    CHECK_EQ(b.calls[0].arguments, std::string("{\"path\":\"/a\"}"));
+    /* No object after the tag: a call with none, and what stood there is content. */
+    const ReplyMessage n = reply_parse(*p, "[TOOL_CALLS]ping[ARGS] and then", &strict);
+    CHECK(!strict);
+    REQUIRE(n.calls.size() == 1);
+    CHECK_EQ(n.calls[0].arguments, std::string("{}"));
+    CHECK_EQ(n.content, std::string("and then"));
+}
+
+TEST(json_arguments_behind_a_function_tag_end_at_its_close) {
+    ChatFormat f;
+    std::shared_ptr<const ReplyParser> p = object_format(true, &f);
+    REQUIRE(p != nullptr);
+    bool strict = false;
+    const std::string reply = "<tool_call>\n<function=bash>{\"command\": \"ls\"}</function>\n</tool_call>"
+                              "<tool_call>\n<function=read>{\"path\": \"/a\"}\n</function>\n</tool_call>";
+    const ReplyMessage m = reply_parse(*p, reply, &strict);
+    CHECK(strict);
+    REQUIRE(m.calls.size() == 2);
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"command\":\"ls\"}"));
+    CHECK_EQ(m.calls[1].arguments, std::string("{\"path\":\"/a\"}"));
+    const std::string err = stream_all(*p, reply);
+    if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+    /* The function's close where the object was still open closes it. */
+    const ReplyMessage c = reply_parse(
+        *p, "<tool_call>\n<function=read>{\"path\": \"/a\"</function>\n</tool_call>", &strict);
+    CHECK(!strict);
+    REQUIRE(c.calls.size() == 1);
+    CHECK(c.calls[0].closed);
+    CHECK_EQ(c.calls[0].arguments, std::string("{\"path\":\"/a\"}"));
+
+    /* The grammar: a JSON object between the tags, and the tags as written. */
+    ChatGrammarRequest gq;
+    gq.tools = &agent_tools();
+    ChatGrammar g;
+    std::string why;
+    CHECK_OK(chat_format_grammar(f, gq, &g, &why));
+    CHECK(g.lazy);
+    log_set_level(Log::Error);
+    CHECK_EQ(object_admits(g.text, "<tool_call>\n<function=bash>{\"command\": \"ls\", \"n\": [1, {\"a\": null}]}"
+                                   "</function>\n</tool_call>"), 1);
+    CHECK_EQ(object_admits(g.text, "<tool_call>\n<function=bash>{command: \"ls\"}</function>\n</tool_call>"), 0);
+    CHECK_EQ(object_admits(g.text, "<tool_call>\n<function=nope>{}</function>\n</tool_call>"), 0);
+    log_set_level(Log::Warn);
+}
+
+/* reasoning_anywhere: a block that opens after the answer is reasoning there too, and a close
+ * with no block open is not part of the answer. Without it, both are content. */
+TEST(a_reasoning_block_may_open_again_later_when_the_format_says_so) {
+    for (bool anywhere : { false, true }) {
+        RadChatFormat c = qwen_abi();
+        c.reasoning_anywhere = anywhere ? 1 : 0;
+        ChatFormat f;
+        std::string why;
+        std::shared_ptr<const ReplyFormat> rf;
+        std::shared_ptr<const ReplyParser> p;
+        CHECK_OK(chat_format_from_abi(&c, &f, &why));
+        CHECK_OK(ReplyFormat::compile(f, &rf, &why));
+        ReplyOptions ro;
+        ro.generation_prompt = "<|im_start|>assistant\n<think>\n";
+        ro.tools = &agent_tools();
+        CHECK_OK(ReplyParser::create(rf, ro, &p, &why));
+        const std::string reply = "Plan.\n</think>\n\nAnswer.<think>\nmore\n</think>\n\nTail.</think>";
+        bool strict = false;
+        const ReplyMessage m = reply_parse(*p, reply, &strict);
+        if (anywhere) {
+            CHECK_EQ(m.reasoning, std::string("Plan.\nmore\n"));
+            CHECK_EQ(m.content, std::string("Answer.Tail."));
+            CHECK(!strict);   /* the last </think> closed nothing */
+        } else {
+            CHECK_EQ(m.reasoning, std::string("Plan.\n"));
+            CHECK_EQ(m.content, std::string("Answer.<think>\nmore\n</think>\n\nTail.</think>"));
+        }
+        const std::string err = stream_all(*p, reply);
+        if (!err.empty()) ::radtest::fail(__FILE__, __LINE__, err);
+    }
+}
+
+TEST(an_object_format_the_parser_cannot_read_is_refused) {
+    auto refused = [](void (*edit)(RadChatFormat&), const char* word) {
+        static const char* const kT[] = { "[TOOL_CALLS]" };
+        RadChatFormat c{};
+        c.struct_size = sizeof(RadChatFormat);
+        c.args_form = RAD_CHAT_ARGS_OBJECT;
+        c.name_prefix = "[TOOL_CALLS]";
+        c.name_suffix = "[ARGS]";
+        c.triggers = kT;
+        c.n_triggers = 1;
+        edit(c);
+        ChatFormat f;
+        std::string why;
+        if (chat_format_from_abi(&c, &f, &why) < 0) return false;
+        return chat_format_check(f, &why) == RAD_E_UNSUPPORTED && why.find(word) != std::string::npos;
+    };
+    CHECK(refused([](RadChatFormat&) {}, "") == false);   /* the base is a format */
+    CHECK(refused([](RadChatFormat& c) { c.arg_value_suffix = "</a>"; }, "arg_*"));
+    CHECK(refused([](RadChatFormat& c) { c.object_string_open = "<s>"; }, "together"));
+    CHECK(refused([](RadChatFormat& c) { c.object_string_open = c.object_string_close = "'"; },
+                  "bare word"));
+    CHECK(refused([](RadChatFormat& c) { c.call_end = "<,>"; }, "punctuation"));
+    CHECK(refused([](RadChatFormat& c) { c.call_end = " \n"; }, "only whitespace"));
+    CHECK(refused([](RadChatFormat& c) { c.name_prefix = ""; c.triggers = nullptr; c.n_triggers = 0; },
+                  "name_prefix is empty"));
+}
+
 /* ================================================================== cost
  *
  * The legacy path re-parses the whole reply on every chunk, so a reply of n bytes costs O(n^2). The
