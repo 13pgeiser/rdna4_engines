@@ -9,8 +9,8 @@
 //! route) except that the verify trunk and the verify head are shared:
 //!
 //! 1. draft — per request, unchanged ([`mtp_draft_phase_inner`]); the greedy
-//!    device-chain lanes and the exact sampled lanes (no penalties, matching
-//!    softmax controls) additionally share the lm_head (and, sampled, the
+//!    device-chain lanes and the exact sampled lanes (matching softmax
+//!    controls; per-lane penalties replayed exactly) additionally share the lm_head (and, sampled, the
 //!    softmax kernel) per draft step ([`mtp_cb_draft_batched`]);
 //! 2. verify trunk — every request's `[seed, drafts..]` rows through ONE
 //!    [`forward_prefill_batch_multi`] (per request byte-identical to the
@@ -108,8 +108,8 @@ fn draft_batchable(gpu: &Gpu, weights: &Qwen35Weights, head: &Qwen35MtpHead, lan
 }
 
 /// Does this lane's singleton draft take the exact full-vocab SAMPLED loop
-/// (host token embedding, no device token chain, no proposal graph, no
-/// penalties) whose head the batched sampled drafter shares? Its lm_head is
+/// (host token embedding, no device token chain, no proposal graph; any
+/// per-lane penalties are replayed per row by the batched drafter) whose head the batched sampled drafter shares? Its lm_head is
 /// the same PM `multirow_r2` the greedy group uses, so the PM launcher's
 /// shape/32-bit-offset limits for the largest chunk
 /// (`min(cb.max_rows, PM_XBATCH_MAX)` columns) are part of eligibility:
@@ -132,7 +132,6 @@ fn sampled_batchable(
     lane.k.min(st.max_n) > 0
         && head.weights.lm_head_draft.is_none()
         && !st.sampling.is_greedy()
-        && !st.sampling.penalized()
         && out_w.gpu_dtype == DType::MQ4G256V2
         && gpu.arch_caps.is_gfx1201()
         && gpu.arch_caps.gemv_rows_default() == 2
@@ -153,8 +152,8 @@ fn sampled_batchable(
 /// then ONE multi-column lm_head (the PM twin of the singleton
 /// `gemv_mq4g256v2_multirow_r2`, column-identical) over all lanes, then
 /// either each lane's own argmax into its device token chain (greedy group)
-/// or, for exact sampled lanes ([`sampled_batchable`]: no penalties, same
-/// softmax controls), ONE batched softmax+nucleus kernel over the cohort
+/// or, for exact sampled lanes ([`sampled_batchable`]: same softmax
+/// controls, per-lane penalties replayed on each lane's own row), ONE batched softmax+nucleus kernel over the cohort
 /// with three dense D2H copies, then each lane's own host top_p cut and
 /// RNG draw. Per lane this is the singleton greedy full-vocab device-chain
 /// draft or the singleton sampled draft; other lanes draft alone
@@ -262,8 +261,9 @@ pub fn mtp_cb_draft_batched(
     // (host token embedding, per-lane head block + norm + rotate, host RNG,
     // `apply_topp_trunc` / `sample_categorical`) with the lm_head GEMV and
     // the softmax+nucleus kernel shared across the cohort. A cohort must be
-    // launch-uniform in the softmax controls (raw-bit-equal temp/top_p/min_p,
-    // equal top_k), kept in lane order and split at `cb.max_rows`; cohorts of
+    // launch-uniform in the softmax controls (raw-bit-equal temp/top_p/min_p, equal top_k; penalty
+    // controls may differ per lane and are applied per lane row before the
+    // shared softmax), kept in lane order and split at `cb.max_rows`; cohorts of
     // fewer than two lanes fall through to the singleton drafter below.
     let mut cohorts: Vec<Vec<usize>> = Vec::new();
     for i in 0..lanes.len() {
@@ -368,6 +368,34 @@ pub fn mtp_cb_draft_batched(
                 )?;
                 c0 = c1;
             }
+            // Per-lane exact-AR penalties on the lane's own full-vocab row
+            // (`emitted ‖ candidates[..k]` history, lane's own controls),
+            // mirroring the singleton drafter: the row's penalty depth is the
+            // logical draft depth `k`, not the packed column `col`.
+            for (col, &g) in act.iter().enumerate() {
+                let st = &mut *lanes[group[g]].state;
+                if !st.sampling.penalized() {
+                    continue;
+                }
+                let sampling = st.sampling;
+                let t0 = MtpPenaltyTiming::start();
+                let mut uploads = 0;
+                if k == 0 {
+                    mtp_penalty_begin_drafts(gpu, &mut st.penalty, &st.mtp_sample_repeat_buf)?;
+                    uploads = u32::from(!st.penalty.tokens().is_empty());
+                }
+                mtp_penalty_apply_row(
+                    gpu,
+                    &st.penalty,
+                    &st.mtp_sample_repeat_buf,
+                    &cb.logits.sub_offset(col * vocab, vocab),
+                    k,
+                    vocab,
+                    &sampling,
+                )?;
+                let launches = u32::from(!st.penalty.row_range(k).is_empty());
+                st.penalty_timing.finish(t0, uploads, launches);
+            }
             let probs_view = cb.sampled_probs.sub_offset(0, n_act * vocab);
             let tau_view = cb.sampled_tau.sub_offset(0, n_act);
             let z_view = cb.sampled_z.sub_offset(0, n_act);
@@ -399,6 +427,14 @@ pub fn mtp_cb_draft_batched(
                 let o = &mut outs[g];
                 o.draft_probs.push(probs[draft_idx]);
                 o.candidates.push(draft_idx as u32);
+                if o.sampling.penalized() {
+                    // Singleton `mtp_draft_phase_inner` appends every actual
+                    // pick (even one that truncates the chain below), never a
+                    // future candidate.
+                    let t0 = MtpPenaltyTiming::start();
+                    mtp_penalty_append_draft(gpu, &mut st.penalty, &st.mtp_sample_repeat_buf, draft_idx as u32)?;
+                    st.penalty_timing.finish(t0, 1, 0);
+                }
                 o.draft_softmaxes.push(probs);
                 o.drafts_generated = o.candidates.len();
                 if st.p_min > 0.0 && top_prob < st.p_min {
