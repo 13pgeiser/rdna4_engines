@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
@@ -139,6 +140,13 @@ const KernelRow* Registry::select(std::string_view op, const Geometry& g, int do
         }
     }
 
+    static const int seldbg = std::getenv("R4D_DIAG") ? 1 : 0;  /* kernel-selection trace; R4D_DIAG=1 */
+    if (seldbg && std::string(op) == "attn_paged" && domain == RAD_DOMAIN_DEVICE) {
+        std::fprintf(stderr, "[SELDBG] %s | best=%s\n", t.query.c_str(), best ? best->info->name : "(none)");
+        for (const auto& c : t.candidates)
+            std::fprintf(stderr, "    %-28s prio=%-3d ok=%d why=%s\n", c.kernel.c_str(),
+                        c.priority, (int)c.ok, c.why.c_str());
+    }
     if (best) {
         t.kernel   = best->info->name;
         t.plugin   = best->plugin;

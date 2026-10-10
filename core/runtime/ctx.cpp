@@ -401,7 +401,10 @@ int Ctx::bind_ops() {
         /* Execution site. Site is a property of the weights (spec §5.1), so an op whose every
          * weight operand was placed on the host runs its host kernel and everything else runs on
          * the device. An op with no weights stays on the device; the planner overrides through
-         * set_op_domain, which is where the "contiguous host runs" objective actually lands.
+         * set_op_domain, which is where the "contiguous host runs" objective actually lands. A
+         * weightless op with no device kernel in any band (host-only: rmsnorm_p / gelu_mul /
+         * logit_softcap / attn_paged) falls back to the band resolution and runs on the host --
+         * the device is not a correct answer for a kernel that exists only on the host.
          *
          * ON THE HOST BACKEND (no card visible: CPU-only serving) the device domain is the host's
          * own memory and an op with no device kernel in any band runs its host kernel -- the
@@ -431,6 +434,11 @@ int Ctx::bind_ops() {
                 all_host = false;
             }
             if (all_host) dom = RAD_DOMAIN_HOST;
+        } else {
+            bool any_dev = false;
+            for (const Band& b : oi.bands)
+                if (b.dom[RAD_DOMAIN_DEVICE]) { any_dev = true; break; }
+            if (!any_dev) dom = RAD_DOMAIN_HOST;
         }
         op_domain_[i].store((uint8_t)dom, std::memory_order_relaxed);
 
