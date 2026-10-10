@@ -1207,6 +1207,15 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_SERVE_BATCH_NONEXACT",
         "Permit explicitly labeled non-bit-exact batched arithmetic on the VMM batch route. Always default off."
     ),
+    process_bool_field!(
+        "serve.batch_sampled",
+        "serve_batch_sampled",
+        Serve,
+        false,
+        true,
+        "HIPFIRE_SERVE_BATCH_SAMPLED",
+        "Experimental, default off. Admit sampled (temperature>0) requests to the VMM batch route only for lane modes proven byte-identical to the same-mode singleton (AR, native MTP); requires serve.vmm_batch. 0 keeps sampled requests on the serialized singleton route."
+    ),
     field!(
         "serve.queue_timeout_ms",
         "serve_queue_timeout_ms",

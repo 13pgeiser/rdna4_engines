@@ -255,18 +255,21 @@ pub(crate) struct VmmBatchFlags {
     pub(crate) enabled: bool,
     pub(crate) spec: bool,
     pub(crate) nonexact: bool,
+    pub(crate) sampled: bool,
     /// `serve.prefill_min_tokens`: the VMM route's rotating prefill quantum.
     pub(crate) prefill_min_tokens: u64,
 }
 
 impl VmmBatchFlags {
     /// The `serve.vmm_batch` / `serve.batch_spec` / `serve.batch_nonexact`
-    /// / `serve.prefill_min_tokens` switches of a resolved configuration.
+    /// / `serve.batch_sampled` / `serve.prefill_min_tokens` switches of a
+    /// resolved configuration.
     pub(crate) fn from_config(resolved: &hipfire_config::ResolvedConfig) -> Result<Self> {
         Ok(Self {
             enabled: config_bool(resolved, "serve.vmm_batch")?,
             spec: config_bool(resolved, "serve.batch_spec")?,
             nonexact: config_bool(resolved, "serve.batch_nonexact")?,
+            sampled: config_bool(resolved, "serve.batch_sampled")?,
             prefill_min_tokens: config_u64(resolved, "serve.prefill_min_tokens")?,
         })
     }
@@ -279,6 +282,7 @@ impl VmmBatchFlags {
         serde_json::json!({
             "spec": self.spec,
             "nonexact": self.nonexact,
+            "sampled": self.sampled,
             "max_batch_tokens": max_batch_tokens,
             "prefill_min_tokens": self.prefill_min_tokens,
         })

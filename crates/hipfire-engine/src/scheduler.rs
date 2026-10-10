@@ -874,6 +874,7 @@ pub fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize 
 pub struct VmmBatchParams {
     pub spec: bool,
     pub nonexact: bool,
+    pub sampled: bool,
     pub max_batch_tokens: usize,
     pub prefill_min_tokens: usize,
 }
@@ -885,6 +886,7 @@ pub fn parse_vmm_batch_params(params: Option<&serde_json::Value>) -> Option<VmmB
     Some(VmmBatchParams {
         spec: flag("spec", true),
         nonexact: flag("nonexact", false),
+        sampled: flag("sampled", false),
         max_batch_tokens: num("max_batch_tokens", 4096).max(1),
         prefill_min_tokens: num("prefill_min_tokens", 1).max(1),
     })

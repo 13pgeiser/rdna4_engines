@@ -11,7 +11,9 @@
 //! (provision), the verify trunk and head shared with every other Verify
 //! request (forward), per-request accept/repair (commit). Per request
 //! the committed ids and the full state (trunk KV, DeltaNet, MTP head KV,
-//! `prev_hidden`) equal its isolated singleton spec run (greedy).
+//! `prev_hidden`) follow its isolated singleton spec run. Sampled lanes keep
+//! the singleton's request-local MtpRng, generation-only history and window
+//! budget; sampled singleton promotion is not supported by `spec_adopt`.
 
 use super::{vmm_map_room, Qwen35RequestState, Qwen35VmmStore};
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
@@ -19,7 +21,7 @@ use crate::mtp_spec::cb::{
     mtp_cb_accept, mtp_cb_draft_batched, mtp_cb_verify, MtpCbDraftLane, MtpCbScratch, MtpCbVerified, MtpCbVerifyLane,
 };
 use crate::mtp_spec::MtpDraftOutput;
-use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, MtpPrefillTarget, MtpPromptRoute};
+use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, sample_from_logits, MtpPrefillTarget, MtpPromptRoute};
 use crate::mtp_speculator::{new_qwen35_mtp_lane_state, Qwen35MtpDrafter};
 use crate::qwen35::{DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind};
@@ -159,9 +161,9 @@ impl Qwen35VmmStore {
     /// Make `epoch` a spec lane and fill its prompt by the singleton MTP
     /// prompt prefill (cold: fresh owners, positions from 0), its MTP state
     /// configured with `request` as the singleton speculator would be.
-    /// Returns the first generated id (greedy: trunk argmax at the last
-    /// prompt row) and leaves it as the lane's pending seed. On error the
-    /// lane is poisoned.
+    /// Returns the first generated id (greedy: host argmax; sampled: the
+    /// singleton's unpenalized host sample) and leaves it as the lane's pending
+    /// seed. On error the lane is poisoned.
     #[allow(clippy::too_many_arguments)]
     pub fn spec_prefill(
         &mut self,
@@ -211,14 +213,20 @@ impl Qwen35VmmStore {
             });
             s.mtp = Some(st);
             filled.map_err(|e| format!("spec prefill: {e}"))?;
-            // The singleton drafter's seed: host argmax over the last
-            // prompt row's logits (first maximum wins).
+            // Mirror Qwen35MtpDrafter::mtp_prefill (mtp_speculator.rs:487-501):
+            // the first token is unpenalized, and consumes the SAME MtpRng
+            // subsequently used for drafts, acceptance, residual and bonus.
             let logits = gpu.download_f32(&scratch.logits).map_err(|e| format!("spec prefill: seed logits: {e}"))?;
-            let seed = logits
-                .iter()
-                .enumerate()
-                .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i as u32, v) } else { (bi, bv) })
-                .0;
+            let st = s.mtp.as_mut().expect("installed above");
+            let seed = if st.sampling.is_greedy() {
+                logits
+                    .iter()
+                    .enumerate()
+                    .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i as u32, v) } else { (bi, bv) })
+                    .0
+            } else {
+                sample_from_logits(&logits, &st.sampling, &mut st.rng).0
+            };
             s.position = prompt.len();
             s.pending_seed = Some(seed);
             s.history.push(seed);
@@ -405,6 +413,9 @@ impl Qwen35VmmStore {
         for (o, &(_, draft_len)) in owners.into_iter().zip(&planned) {
             let Qwen35RequestState { mtp, history, position, pending_seed, spec_draft, .. } =
                 o.expect("checked at provision");
+            // Mirror mtp_speculator.rs:545,566-572: request-budget k and
+            // generated-only emitted history, already including the pending
+            // seed once. mtp_cb_draft rebuilds the penalty window from this.
             lanes.push(MtpCbDraftLane {
                 state: mtp.as_mut().expect("checked at provision"),
                 cur_pos: *position,

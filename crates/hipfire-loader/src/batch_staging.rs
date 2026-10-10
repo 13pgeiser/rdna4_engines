@@ -58,6 +58,10 @@ pub struct VmmStagingRequest {
     /// Decode requests as cross-request batched MTP spec lanes when the
     /// model serves MTP (`serve_vmm_batch.spec`, default on).
     pub spec: bool,
+    /// Admit sampled (temperature>0) requests to the batch route for lane
+    /// modes proven byte-identical to the same-mode singleton
+    /// (`serve_vmm_batch.sampled`, `serve.batch_sampled`, default off).
+    pub sampled: bool,
 }
 
 /// True when embedding and lm_head formats admit the batched decode kernels.
@@ -634,7 +638,8 @@ fn stage_qwen_vmm_batch(
             kv_budget_bytes,
             req.route,
         ) {
-            Ok(store) => {
+            Ok(mut store) => {
+                store.set_sampled(req.sampled);
                 b.vmm_store = Some(store);
                 out.capable = true;
                 out.vmm = true;

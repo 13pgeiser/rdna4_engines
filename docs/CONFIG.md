@@ -1185,6 +1185,7 @@ misspelled key is unknown and fails the load with
 | `serve.allow_request_paths` | `allow_request_paths` | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | stable |
 | `serve.allow_request_pull` | `allow_request_pull` | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | stable |
 | `serve.batch_nonexact` | `serve_batch_nonexact` | `HIPFIRE_SERVE_BATCH_NONEXACT` | experimental |
+| `serve.batch_sampled` | `serve_batch_sampled` | `HIPFIRE_SERVE_BATCH_SAMPLED` | experimental |
 | `serve.batch_spec` | `serve_batch_spec` | `HIPFIRE_SERVE_BATCH_SPEC` | experimental |
 | `serve.continuous_batch_size` | `continuous_batch_size` | `HIPFIRE_CONTINUOUS_BATCH_SIZE` | stable |
 | `serve.default_model` | `default_model` | `HIPFIRE_MODEL` | stable |

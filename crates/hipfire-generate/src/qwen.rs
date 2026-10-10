@@ -4551,10 +4551,12 @@ pub fn generate_spec(
         // pending seed is emitted, not yet fed), a serve-batched peer is
         // waiting and the daemon granted a permit: discard the draft state,
         // keep the seed, and continue this request as exact batched AR in
-        // the VMM driver instead of making the peer wait.
+        // the VMM driver instead of making the peer wait. Greedy requests
+        // only: this path reseeds and substitutes AR, which a sampled
+        // speculative request must never undergo.
         if promo_shape_ok && pending_seed_committable && semantic_stop.is_none() && m.eviction.is_none() {
             if let Some(permit) = crate::batch::promotion_permit()
-                .filter(|_| crate::batch::promotion_wanted(generated))
+                .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))
             {
                 let attempt = hipfire_engine::terminal::active_attempt_id();
                 let rng_state = request_seed_for(&AttemptKey::new(id, attempt), permit.client_seed);

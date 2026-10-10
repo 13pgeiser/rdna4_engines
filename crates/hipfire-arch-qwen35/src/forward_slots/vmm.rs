@@ -645,6 +645,11 @@ pub struct Qwen35VmmStore {
     skip: Vec<bool>,
     /// RNG states produced by the forwarded step, published by commit.
     pending_rng: Vec<(RequestEpoch, u32)>,
+    /// Batched head sampler (`hipfire_runtime::batch_sampler`): device result
+    /// slots, packed penalty-scope slab and pinned stage. Allocated on the
+    /// first sampled pass (needs the scratch's `repeat_buf` capacity, which
+    /// `new` does not see); freed with the store.
+    sampler_arena: Option<hipfire_runtime::batch_sampler::BatchSamplerArena>,
     /// Plan-ordered pre-norm hidden rows of a split (decode + prefill) step.
     hidden_out: GpuTensor,
     /// Exact route: device row tables of the rows-batched twins (one
@@ -669,6 +674,10 @@ pub struct Qwen35VmmStore {
     /// DFlash lanes. May coexist with the MTP engine: a request is one or
     /// the other.
     dflash_engine: Option<dflash::VmmDflashEngine>,
+    /// Staged `serve.batch_sampled`: sampled (temperature>0) requests may be
+    /// admitted to this store's lanes (set by the loader at staging; default
+    /// false = greedy-only).
+    sampled: bool,
 }
 
 /// Arithmetic of a VMM batched step.
@@ -699,6 +708,18 @@ impl Qwen35VmmStore {
     /// nonexact slots body.
     pub fn route(&self) -> VmmRoute {
         self.route
+    }
+
+    /// Whether the store was staged with `serve.batch_sampled` on (sampled
+    /// requests admitted to the batch route for provably singleton-exact lane
+    /// modes).
+    pub fn sampled(&self) -> bool {
+        self.sampled
+    }
+
+    /// Staging: record `serve.batch_sampled` (loader, before first use).
+    pub fn set_sampled(&mut self, sampled: bool) {
+        self.sampled = sampled;
     }
 
     /// The singleton route's prefill chunk length for `epoch` with
@@ -836,6 +857,7 @@ impl Qwen35VmmStore {
             row_slot_host: Vec::with_capacity(row_budget),
             skip: vec![false; max_slots],
             pending_rng: Vec::with_capacity(max_slots),
+            sampler_arena: None,
             hidden_out,
             rows_tables,
             rows_tables_key: Vec::new(),
@@ -847,6 +869,7 @@ impl Qwen35VmmStore {
             spec: None,
             prefix_pool: Vec::new(),
             dflash_engine: None,
+            sampled: false,
         })
     }
 
@@ -1254,6 +1277,9 @@ impl Qwen35VmmStore {
         if let Some(t) = self.rows_tables {
             let _ = gpu.free_tensor(t);
         }
+        if let Some(arena) = self.sampler_arena {
+            arena.free_gpu(gpu);
+        }
         if let Some(engine) = self.spec {
             engine.free_gpu(gpu);
         }
@@ -1554,8 +1580,9 @@ impl Qwen35VmmExecutor<'_> {
             st.hidden_split = false;
             exact::decode(gpu, st, weights, config, s, plan, &decode, &mut picks)?;
             for &i in &prefill {
-                exact::prefill(gpu, st, weights, config, s, plan, i, &mut picks)?;
+                exact::prefill(gpu, st, weights, config, s, plan, i)?;
             }
+            sample_heads(gpu, st, config, s, plan, &prefill, &mut picks)?;
         } else if split {
             run_pass(gpu, st, weights, config, s, plan, &decode, true, &mut picks)?;
             run_pass(gpu, st, weights, config, s, plan, &prefill, true, &mut picks)?;
@@ -1700,55 +1727,76 @@ fn run_pass(
         return Ok(());
     }
     final_logits_per_slot(gpu, weights, config, &b, &st.pbs, s, &st.logits, &st.skip)?;
-    for &i in members {
-        sample_head(gpu, st, config, s, plan, i, picks)?;
-    }
-    Ok(())
+    sample_heads(gpu, st, config, s, plan, members, picks)
 }
 
-/// Pick plan request `i`'s head row from its `logits` row with the singleton
-/// route's own sampler (`sampler::sample`: same kernel, same scratch window
-/// cap, same penalty/blocked-token order), its own history/config and a COPY
-/// of its RNG; the advanced RNG is published only by commit. No-op for a
-/// request without a head this step.
-fn sample_head(
+/// Pick every head row of `members` (plan request indices) from its `logits`
+/// row with ONE `batch_sampler::sample_batch` — byte-identical per request to
+/// the singleton route's own `sampler::sample` (same kernels, same scratch
+/// window cap = `s.repeat_buf`, same blocked-token/penalty order), each with
+/// its own history/config and a COPY of its RNG; the advanced RNG is
+/// published only by commit. Requests without a head this step are skipped.
+fn sample_heads(
     gpu: &mut Gpu,
     st: &mut Qwen35VmmStore,
     config: &Qwen35Config,
     s: &Qwen35Scratch,
     plan: &BatchStepPlan,
-    i: usize,
+    members: &[usize],
     picks: &mut [u32],
 ) -> HipResult<()> {
-    let r = &plan.requests[i];
-    if !st.wants_head(r) {
+    let vocab = config.vocab_size;
+    if !members.iter().any(|&i| st.wants_head(&plan.requests[i])) {
         return Ok(());
     }
-    let state = st
-        .slots
-        .iter()
-        .flatten()
-        .find(|x| x.epoch == r.epoch)
-        .expect("provisioned epoch");
-    let view = st
-        .logits
-        .sub_offset(state.slot * config.vocab_size, config.vocab_size);
-    let mut rng = state.rng_state;
-    let id = hipfire_runtime::sampler::sample(
-        gpu,
-        &view,
-        &s.sample_buf,
-        &s.repeat_buf,
-        config.vocab_size,
-        &state.history,
-        &state.sampler,
-        &mut rng,
-    );
-    if id as usize >= config.vocab_size {
-        return Err(HipError::new(0, &format!("VMM executor: pick {id} out of vocab")));
+    if st.sampler_arena.is_none() {
+        st.sampler_arena = Some(hipfire_runtime::batch_sampler::BatchSamplerArena::new(
+            gpu,
+            st.max_slots,
+            s.repeat_buf.buf.size() / 4,
+        )?);
     }
-    picks[r.rows.begin + r.rows.len - 1] = id;
-    st.pending_rng.push((r.epoch, rng));
+    let mut heads: Vec<(usize, &Qwen35RequestState)> = Vec::with_capacity(members.len());
+    for &i in members {
+        let r = &plan.requests[i];
+        if !st.wants_head(r) {
+            continue;
+        }
+        let state = st
+            .slots
+            .iter()
+            .flatten()
+            .find(|x| x.epoch == r.epoch)
+            .expect("provisioned epoch");
+        heads.push((i, state));
+    }
+    let views: Vec<GpuTensor> = heads
+        .iter()
+        .map(|(_, state)| st.logits.sub_offset(state.slot * vocab, vocab))
+        .collect();
+    let jobs: Vec<hipfire_runtime::batch_sampler::BatchSampleJob<'_>> = heads
+        .iter()
+        .zip(&views)
+        .map(|((_, state), view)| hipfire_runtime::batch_sampler::BatchSampleJob {
+            logits: view,
+            history: &state.history,
+            cfg: &state.sampler,
+            rng_state: state.rng_state,
+        })
+        .collect();
+    let arena = st.sampler_arena.as_mut().expect("allocated above");
+    let sampled = hipfire_runtime::batch_sampler::sample_batch(gpu, arena, &jobs)?;
+    for (&(i, _), pick) in heads.iter().zip(sampled) {
+        let r = &plan.requests[i];
+        if pick.token_id as usize >= vocab {
+            return Err(HipError::new(
+                0,
+                &format!("VMM executor: pick {} out of vocab", pick.token_id),
+            ));
+        }
+        picks[r.rows.begin + r.rows.len - 1] = pick.token_id;
+        st.pending_rng.push((r.epoch, pick.advanced_rng));
+    }
     Ok(())
 }
 

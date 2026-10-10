@@ -1491,10 +1491,11 @@ pub fn drive_qwen_continuous_batch(
 // `ContinuousBatchScheduler` (same AttemptKey/LaneTicket registry, same
 // commit_ready/commit/abort transaction as the fixed-lane driver).
 //
-// Stage 1 limits, enforced by `is_vmm_batch_request_eligible`: greedy
-// requests only (the executor picks with the singleton sampler incl. the
-// repeat/presence/frequency penalties; sampled-RNG equivalence has no gate
-// yet), AR rows only
+// Limits, enforced by `is_vmm_batch_request_eligible`: greedy requests, or
+// (default-OFF `serve.batch_sampled`) sampled requests whose singleton mode a
+// lane serves exactly (`vmm_sampled_lane`: AR, native MTP); the executor picks
+// with the singleton sampler incl. the repeat/presence/frequency penalties.
+// AR rows only
 // (no cross-request speculation yet), and a request that is lonely at
 // dispatch stays on the unchanged singleton route (the daemon checks the
 // inbox); arrivals during a singleton generation wait for it to finish.
@@ -1773,11 +1774,11 @@ fn attach_vmm_spec_evidence(done: &mut serde_json::Value, decode: VmmLaneDecode,
     }
 }
 
-/// The singleton greedy DFlash route's selector for one batch request: the
-/// same `select_generation_route` inputs the singleton generate path builds,
-/// so a request the singleton would serve through DFlash (greedy, neutral
-/// penalties, no forced-AR chat) is the one a DFlash lane serves.
-fn vmm_dflash_route_selected(msg: &serde_json::Value, m: &LoadedModel, sampling: &BatchSampling) -> bool {
+/// The singleton generate path's route for one batch request: the same
+/// `select_generation_route` inputs the singleton builds, so a request the
+/// singleton would serve through DFlash/MTP (neutral penalties, no forced-AR
+/// chat) or AR is the mode a lane must serve.
+fn vmm_singleton_route(msg: &serde_json::Value, m: &LoadedModel, sampling: &BatchSampling) -> GenerationRoute {
     let user_explicit = [
         "top_p",
         "top_k",
@@ -1811,7 +1812,127 @@ fn vmm_dflash_route_selected(msg: &serde_json::Value, m: &LoadedModel, sampling:
         supports_chain_nucleus_verify: spec.is_some_and(|s| s.supports_chain_nucleus_verify()),
         kv_adaptive: m.kv_adaptive.is_some(),
     };
-    select_generation_route(&route_inputs) == GenerationRoute::QwenDflash
+    select_generation_route(&route_inputs)
+}
+
+/// Sampled DFlash lanes. Gated on the DFlash prerequisites (the sampled
+/// selector-chain lane state, the bonus/target-law repair and the default
+/// graph identity): the DFlash slice flips this once they land. Until then a
+/// sampled request whose singleton route is DFlash stays singleton.
+const VMM_DFLASH_SAMPLED: bool = false;
+
+/// Lane mode the VMM batch serves a SAMPLED request with, or `None` (the
+/// request stays on the singleton route). The one capability decision used by
+/// eligibility, the promotion permit and lane admission. A sampled request
+/// whose singleton route is speculative is never served as an AR lane (that
+/// would substitute a different RNG schedule); spec lanes do not run stop
+/// strings, so a request with stops stays singleton.
+fn sampled_lane_for(
+    route: GenerationRoute,
+    speculator_is_mtp: bool,
+    mtp_engine: bool,
+    dflash_engine: bool,
+    dflash_sampled: bool,
+    sampled_flag: bool,
+    has_stops: bool,
+) -> Option<VmmLaneDecode> {
+    if !sampled_flag {
+        return None;
+    }
+    match route {
+        GenerationRoute::QwenAr => Some(VmmLaneDecode::Ar),
+        GenerationRoute::QwenDflash if speculator_is_mtp => {
+            (mtp_engine && !has_stops).then_some(VmmLaneDecode::Mtp)
+        }
+        GenerationRoute::QwenDflash => {
+            (dflash_engine && dflash_sampled && !has_stops).then_some(VmmLaneDecode::Dflash)
+        }
+        _ => None,
+    }
+}
+
+/// The staged store's native MTP engine as a sampled lane can use it: the
+/// engine exists and no n-gram modifier could change the singleton's windows
+/// (the GPU-arch-dependent half of that check stays at admission).
+fn vmm_store_mtp_engine(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore) -> bool {
+    store.spec_engine().is_some() && !hipfire_config::mtp_ngram_enabled()
+}
+
+/// Whether the store serves sampled requests at all: staged with
+/// `serve.batch_sampled` on, and the byte-exact VMM route (the non-exact
+/// shared body makes no singleton-identity claim).
+fn vmm_store_sampled(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore) -> bool {
+    store.sampled() && store.route() == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+}
+
+/// `sampled_lane_for` for one request against the loaded model's staged
+/// store; `None` when the store is not staged.
+fn vmm_sampled_lane(msg: &serde_json::Value, m: &LoadedModel, sampling: &BatchSampling) -> Option<VmmLaneDecode> {
+    let store = m.qwen35().and_then(|b| b.vmm_store.as_ref())?;
+    sampled_lane_for(
+        vmm_singleton_route(msg, m, sampling),
+        m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
+        vmm_store_mtp_engine(store),
+        store.dflash_engine().is_some(),
+        VMM_DFLASH_SAMPLED,
+        vmm_store_sampled(store),
+        request_has_stop(msg),
+    )
+}
+
+/// The singleton's per-request AR sampler seed for a lane: the scheduler's
+/// u64 request RNG folded to u32 with the zero rule of
+/// `hipfire_engine::scheduler::request_seed_for` (xorshift state 0 is stuck).
+fn vmm_lane_rng(rng_u64: u64) -> u32 {
+    let seed = rng_u64 as u32;
+    if seed == 0 {
+        0x13579BDF
+    } else {
+        seed
+    }
+}
+
+/// Sampled modes a staged store advertises (empty = greedy only).
+fn vmm_sampled_modes(sampled: bool, mtp_engine: bool, dflash_engine: bool) -> Vec<&'static str> {
+    let mut modes = Vec::new();
+    if sampled {
+        modes.push("ar");
+        if mtp_engine {
+            modes.push("mtp");
+        }
+        if VMM_DFLASH_SAMPLED && dflash_engine {
+            modes.push("dflash");
+        }
+    }
+    modes
+}
+
+/// Load-ack sampling receipt: `greedy_only` unless sampled lanes exist, then
+/// `sampled` plus the modes a lane can serve.
+fn attach_vmm_sampling_ack(v: &mut serde_json::Value, sampled: bool, mtp_engine: bool, dflash_engine: bool) {
+    let modes = vmm_sampled_modes(sampled, mtp_engine, dflash_engine);
+    if modes.is_empty() {
+        v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+    } else {
+        v["continuous_batch_sampling"] = serde_json::json!("sampled");
+        v["continuous_batch_sampled_modes"] = serde_json::json!(modes);
+    }
+}
+
+/// Per-request done receipt of a VMM-batched request: the lane's actual
+/// decode mode, whether it sampled, and the equivalence claim. Written inside
+/// the `continuous_batch` object (the part serve forwards) and mirrored at
+/// the top level like `continuous_batch_spec_mode`.
+fn attach_vmm_batch_receipts(done: &mut serde_json::Value, decode: VmmLaneDecode, sampled: bool, exact: bool) {
+    let sampling = if sampled { "sampled" } else { "greedy" };
+    let equivalence = if exact { "singleton_exact" } else { "nonexact" };
+    if let Some(cb) = done.get_mut("continuous_batch").and_then(|v| v.as_object_mut()) {
+        cb.insert("spec_mode".into(), serde_json::json!(decode.wire()));
+        cb.insert("sampling".into(), serde_json::json!(sampling));
+        cb.insert("equivalence".into(), serde_json::json!(equivalence));
+    }
+    done["continuous_batch_sampling"] = serde_json::json!(sampling);
+    done["continuous_batch_equivalence"] = serde_json::json!(equivalence);
 }
 
 /// The singleton MTP route's per-request speculator config for a batch
@@ -2302,20 +2423,24 @@ fn vmm_retire_free(
 }
 
 /// VMM-route admission predicate on a model that staged `vmm_store`:
-/// greedy requests (penalties apply exactly as on the singleton route) with
-/// a text-chat shape — any number of system/user/assistant turns, rendered
+/// greedy requests (penalties apply exactly as on the singleton route), or,
+/// with `serve.batch_sampled` staged, sampled requests a lane serves in the
+/// singleton route's own mode (`vmm_sampled_lane`: AR lane for an AR
+/// singleton, native MTP lane for an MTP singleton; any other sampled request
+/// stays singleton, never an AR substitute). Text-chat shape — any number of
+/// system/user/assistant turns, rendered
 /// through the Jinja template exactly as the singleton renders them (a
 /// template-less model keeps the single-user-turn shape, which is all the
 /// singleton's ChatFrame path renders), think-open or closed, with or
 /// without stop strings (the lane's producer matches them as the
-/// singleton's does). Still sequential, each because the batch lane does
+/// singleton's does; spec lanes run none, so a spec lane excludes them).
+/// Still sequential, each because the batch lane does
 /// not run it per row: tools/tool turns (grammar-constrained CPU sampling
 /// and the tool-call parser), images (vision path), invalid stops (the
 /// singleton reports them), logprobs (the singleton sampler's envelopes),
 /// budget alerts (mid-stream text injection), adaptive KV/eviction/PFlash
-/// (per-request KV rewriting), PP/EP, sampled requests (no RNG equivalence
-/// gate yet). A loaded
-/// speculator does not exclude the request — batched rows are AR, and a
+/// (per-request KV rewriting), PP/EP. A loaded
+/// speculator does not exclude a greedy request — batched rows are AR, and a
 /// lonely request keeps its singleton spec route.
 pub fn is_vmm_batch_request_eligible(
     msg: &serde_json::Value,
@@ -2361,13 +2486,10 @@ pub fn is_vmm_batch_request_eligible(
         return false;
     }
     let sampling = resolve_batch_sampling(msg, m);
-    if sampling.temp > 0.0 {
-        return false;
-    }
     if m.qwen4().is_some() {
-        return qwen4_lane_request_supported(msg, &sampling);
+        return sampling.temp <= 0.0 && qwen4_lane_request_supported(msg, &sampling);
     }
-    true
+    sampling.temp <= 0.0 || vmm_sampled_lane(msg, m, &sampling).is_some()
 }
 
 /// Daemon: the VMM route serves this model (params parsed at load and
@@ -2452,6 +2574,7 @@ pub fn vmm_staging_request(
         row_budget: p.max_batch_tokens,
         route: if p.nonexact { VmmRoute::Nonexact } else { VmmRoute::Exact },
         spec: p.spec,
+        sampled: p.sampled,
     })
 }
 
@@ -2482,13 +2605,14 @@ pub fn vmm_loaded_ack(
         qwen4_lane_ack_fields(&mut v, &receipt, slots, row_budget, p);
         return v.to_string();
     }
-    let (receipt, spec_mode, dflash_receipt) = match m.qwen35_mut().and_then(|b| b.vmm_store.as_mut()) {
+    let (receipt, spec_mode, dflash_receipt, sampling_ack) = match m.qwen35_mut().and_then(|b| b.vmm_store.as_mut()) {
         Some(s) => {
             let mode = vmm_store_spec_mode(s);
             let rx = s.dflash_engine().map(|e| e.receipt());
-            (Some(s.receipt()), mode, rx)
+            let ack = (vmm_store_sampled(s), vmm_store_mtp_engine(s), s.dflash_engine().is_some());
+            (Some(s.receipt()), mode, rx, ack)
         }
-        None => (None, VmmSpecMode::Off, None),
+        None => (None, VmmSpecMode::Off, None, (false, false, false)),
     };
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
         return ack;
@@ -2516,7 +2640,7 @@ pub fn vmm_loaded_ack(
     });
     v["continuous_batch_nonexact"] = serde_json::json!(!exact);
     v["continuous_batch_exact"] = serde_json::json!(exact);
-    v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+    attach_vmm_sampling_ack(&mut v, sampling_ack.0, sampling_ack.1, sampling_ack.2);
     match receipt {
         Some(Ok(r)) => {
             v["vmm_batch_kv_backend"] = serde_json::json!(r.kv_backend);
@@ -2599,12 +2723,17 @@ pub fn arm_promotion(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
 ) {
     // Qwen4 never promotes: its lane store has no singleton hand-off.
+    let sampling = resolve_batch_sampling(msg, m);
+    // A sampled request promotes only as an AR lane: the AR singleton
+    // boundary moves its advanced rng/history/sampler. A sampled speculative
+    // singleton would be continued as AR (reseeded), never promoted.
     let permit = (armed
         && m.qwen4().is_none()
-        && is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active))
+        && is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active)
+        && (sampling.temp <= 0.0 || vmm_sampled_lane(msg, m, &sampling) == Some(VmmLaneDecode::Ar)))
     .then(|| PromotionPermit {
         original_msg: msg.clone(),
-        sampling: resolve_batch_sampling(msg, m),
+        sampling,
         max_tokens,
         max_think_tokens,
         client_seed,
@@ -2941,6 +3070,12 @@ pub fn drive_qwen_vmm_continuous_batch(
         let ticket = match seed {
             None => {
                 installed = Err("promoted request has no pending seed".into());
+                None
+            }
+            // A sampled speculative singleton is never continued as AR (the
+            // reseeded stream would not be its own): fail it visibly.
+            Some(_) if sampling.temp > 0.0 && !matches!(kind, PromotedDecode::Ar) => {
+                installed = Err("sampled speculative singleton cannot continue as an AR lane".into());
                 None
             }
             Some(_) => sched.adopt_running(pending, progress),
@@ -3321,7 +3456,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                 owner_generation: ticket.generation.wrapping_add(1).max(1),
             };
             let rng_state = match &sched.lanes[lane_idx] {
-                BatchLane::Running(l) => l.rng_state as u32,
+                BatchLane::Running(l) => vmm_lane_rng(l.rng_state),
                 _ => continue,
             };
             let think = crate::vmm_conv::ThinkCtl::new(pending_req.max_think_tokens);
@@ -3361,12 +3496,14 @@ pub fn drive_qwen_vmm_continuous_batch(
             };
             let s = &pending_req.sampling;
             // Singleton AR sampling scope: generated tokens only (empty at
-            // the first sample), so no attractor blocks yet.
+            // the first sample), so no attractor blocks yet. The singleton
+            // samples with `repeat_window.max(1)` (clamped to the buffer cap
+            // by `sampler::sample`).
             let sampler = hipfire_runtime::sampler::SamplerConfig {
                 temperature: s.temp,
                 top_p: s.top_p,
                 repeat_penalty: s.repeat_penalty,
-                repeat_window: s.repeat_window,
+                repeat_window: s.repeat_window.max(1),
                 presence_penalty: s.presence_penalty,
                 frequency_penalty: s.frequency_penalty,
                 blocked_tokens: Vec::new(),
@@ -3378,10 +3515,47 @@ pub fn drive_qwen_vmm_continuous_batch(
             // serve it — unless it carries a think budget or stop strings,
             // which run per committed token on AR lanes. MTP: head lane cap.
             // DFlash: the singleton greedy DFlash route's own selector and
-            // the resolved context cap.
-            let spec_pick: Option<(VmmLaneDecode, hipfire_runtime::spec::SpecRequestConfig)> = if let Some((k, cap)) =
-                spec_engine
-            {
+            // the resolved context cap. A SAMPLED request is served in its
+            // singleton route's own mode only (`vmm_sampled_lane`): an AR
+            // lane for an AR singleton; an MTP/DFlash lane when the driver's
+            // engine and the same requirements hold; otherwise it goes back
+            // to the singleton route (`sampled_handback`), never to an AR lane.
+            let mut sampled_handback = false;
+            let spec_pick: Option<(VmmLaneDecode, hipfire_runtime::spec::SpecRequestConfig)> = if s.temp > 0.0 {
+                match vmm_sampled_lane(&pending_req.original_msg, model, s) {
+                    Some(VmmLaneDecode::Ar) => None,
+                    Some(VmmLaneDecode::Mtp) => match spec_engine {
+                        Some((k, cap))
+                            if !think.budgeted()
+                                && stops.is_empty()
+                                && rendered.len() + lane_max_tokens(&key, sched) + k + 1 <= cap =>
+                        {
+                            Some((VmmLaneDecode::Mtp, spec_request_config(s, rng_state as u64)))
+                        }
+                        _ => {
+                            sampled_handback = true;
+                            None
+                        }
+                    },
+                    Some(VmmLaneDecode::Dflash) => match dflash_engine {
+                        Some((block, cap))
+                            if !think.budgeted()
+                                && stops.is_empty()
+                                && dflash_lane_fits(rendered.len(), lane_max_tokens(&key, sched), block, cap) =>
+                        {
+                            Some((VmmLaneDecode::Dflash, spec_request_config(s, rng_state as u64)))
+                        }
+                        _ => {
+                            sampled_handback = true;
+                            None
+                        }
+                    },
+                    None => {
+                        sampled_handback = true;
+                        None
+                    }
+                }
+            } else if let Some((k, cap)) = spec_engine {
                 (s.temp <= 0.0
                     && !think.budgeted()
                     && stops.is_empty()
@@ -3392,11 +3566,39 @@ pub fn drive_qwen_vmm_continuous_batch(
                     && !think.budgeted()
                     && stops.is_empty()
                     && dflash_lane_fits(rendered.len(), lane_max_tokens(&key, sched), block, cap)
-                    && vmm_dflash_route_selected(&pending_req.original_msg, model, s))
+                    && vmm_singleton_route(&pending_req.original_msg, model, s) == GenerationRoute::QwenDflash)
                 .then(|| (VmmLaneDecode::Dflash, spec_request_config(s, rng_state as u64)))
             } else {
                 None
             };
+            if sampled_handback {
+                // The batch cannot serve this sampled request exactly in its
+                // singleton mode: the singleton route serves it (same
+                // mechanism as a lonely request). Its `gen_start` must not be
+                // on the wire yet (a second start would be a duplicate); an
+                // already-announced request cannot move, so it fails visibly.
+                if announced.borrow().contains(&key) {
+                    refuse(
+                        stdout,
+                        sched,
+                        "sampled request cannot be served exactly by the VMM batch route".into(),
+                        "validation",
+                    );
+                    continue;
+                }
+                let handoff = match handoff_started_in_think(
+                    sched,
+                    lane_idx,
+                    &key,
+                    &pending_req,
+                    GenerationRoute::QwenAr,
+                ) {
+                    Ok(msg) => msg,
+                    Err(reason) => return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, reason),
+                };
+                inbox.push_front(handoff);
+                continue;
+            }
             let keep = keep_conversations && spec_pick.is_none();
             let spec_pick_kind = spec_pick.as_ref().map(|(k, _)| *k);
             enum SpecAdmit {
@@ -3512,6 +3714,29 @@ pub fn drive_qwen_vmm_continuous_batch(
                     .map(|s| s.budget_report(gpu))
                     .unwrap_or_default();
                 eprintln!("[vmm-budget] resident lanes={resident} (high water) {report}");
+            }
+            // A spec pick always yields its seed (errors/aborts returned
+            // above); a sampled request is never demoted to an AR lane.
+            if s.temp > 0.0 && spec_pick_kind.is_some() && spec_seed.is_none() {
+                crate::vmm_conv::free_checkpoints(checkpoints, gpu);
+                if let Err(e) = vmm_retire_free(model, gpu, &epoch) {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        model,
+                        &mut epochs,
+                        &mut ctl,
+                        stdout,
+                        format!("retire refused sampled lane {lane_idx}: {e}"),
+                    );
+                }
+                refuse(
+                    stdout,
+                    sched,
+                    "VMM batch admission refused: sampled speculative lane produced no seed".into(),
+                    "internal",
+                );
+                continue;
             }
             lane_decode[lane_idx] = match (spec_seed, spec_pick_kind) {
                 (Some(_), Some(kind)) => kind,
@@ -3720,6 +3945,7 @@ pub fn drive_qwen_vmm_continuous_batch(
             if spec_engine.is_some() || dflash_engine.is_some() {
                 attach_vmm_spec_evidence(&mut pending_done, lane_decode[idx], spec_stats[idx]);
             }
+            attach_vmm_batch_receipts(&mut pending_done, lane_decode[idx], lane.sampling.temp > 0.0, !params.nonexact);
             // The singleton's verbatim assistant-turn store: the generated
             // body less its ChatML trailer and `<|im_end|>`, applied when the
             // client commits.
@@ -8274,5 +8500,128 @@ mod tests {
         assert_eq!(VmmSpecMode::Off.wire(), "off");
         assert_eq!(VmmSpecMode::Mtp { k: 4, cap: 8 }.wire(), "mtp");
         assert_eq!(VmmSpecMode::Dflash { block: 16, cap: 8 }.wire(), "dflash");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lane_for(
+        route: GenerationRoute,
+        mtp_spec: bool,
+        mtp_engine: bool,
+        dflash_engine: bool,
+        dflash_sampled: bool,
+        flag: bool,
+        stops: bool,
+    ) -> Option<VmmLaneDecode> {
+        sampled_lane_for(route, mtp_spec, mtp_engine, dflash_engine, dflash_sampled, flag, stops)
+    }
+
+    #[test]
+    fn sampled_lane_flag_off_is_never_a_lane() {
+        for route in [
+            GenerationRoute::QwenAr,
+            GenerationRoute::QwenDflash,
+            GenerationRoute::Qwen4Ar,
+        ] {
+            for mtp_spec in [false, true] {
+                assert_eq!(lane_for(route, mtp_spec, true, true, true, false, false), None);
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_lane_ar_route_is_an_ar_lane() {
+        // Engines and stops do not matter: the AR producer runs stops, and
+        // an AR singleton is compared against an AR lane.
+        for (mtp, df, stops) in [(false, false, false), (true, true, false), (true, true, true)] {
+            assert_eq!(
+                lane_for(GenerationRoute::QwenAr, false, mtp, df, true, true, stops),
+                Some(VmmLaneDecode::Ar)
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_lane_mtp_route_needs_engine_and_no_stops_never_ar() {
+        let r = GenerationRoute::QwenDflash;
+        assert_eq!(lane_for(r, true, true, false, false, true, false), Some(VmmLaneDecode::Mtp));
+        // DFlash capability is irrelevant to an MTP singleton.
+        assert_eq!(lane_for(r, true, true, true, true, true, false), Some(VmmLaneDecode::Mtp));
+        // No engine / stop strings: stays singleton, never an AR lane.
+        assert_eq!(lane_for(r, true, false, false, false, true, false), None);
+        assert_eq!(lane_for(r, true, false, true, true, true, false), None);
+        assert_eq!(lane_for(r, true, true, false, false, true, true), None);
+    }
+
+    #[test]
+    fn sampled_lane_dflash_route_is_gated_on_dflash_sampled() {
+        let r = GenerationRoute::QwenDflash;
+        assert_eq!(lane_for(r, false, false, true, false, true, false), None);
+        assert_eq!(lane_for(r, false, true, true, false, true, false), None);
+        assert_eq!(lane_for(r, false, false, true, true, true, false), Some(VmmLaneDecode::Dflash));
+        assert_eq!(lane_for(r, false, false, false, true, true, false), None);
+        assert_eq!(lane_for(r, false, false, true, true, true, true), None);
+        // The shipped gate keeps sampled DFlash singleton.
+        assert!(!VMM_DFLASH_SAMPLED);
+    }
+
+    #[test]
+    fn sampled_lane_other_routes_stay_singleton() {
+        for route in [
+            GenerationRoute::Qwen4Ar,
+            GenerationRoute::Qwen4Spec,
+            GenerationRoute::Qwen2Ar,
+            GenerationRoute::Qwen2Spec,
+            GenerationRoute::Deepseek4Ar,
+            GenerationRoute::CohereAr,
+        ] {
+            assert_eq!(lane_for(route, true, true, true, true, true, false), None);
+        }
+    }
+
+    #[test]
+    fn lane_rng_follows_request_seed_zero_rule() {
+        assert_eq!(vmm_lane_rng(0), 0x13579BDF);
+        assert_eq!(vmm_lane_rng(0x1_0000_0000), 0x13579BDF);
+        assert_eq!(vmm_lane_rng(0x1_0000_0007), 7);
+        assert_eq!(vmm_lane_rng(0xDEAD_BEEF), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn sampled_modes_and_load_ack_receipt() {
+        assert!(vmm_sampled_modes(false, true, true).is_empty());
+        assert_eq!(vmm_sampled_modes(true, false, false), vec!["ar"]);
+        assert_eq!(vmm_sampled_modes(true, true, false), vec!["ar", "mtp"]);
+        // Sampled DFlash is gated off: an engine alone advertises nothing.
+        assert_eq!(vmm_sampled_modes(true, true, true), vec!["ar", "mtp"]);
+
+        let mut off = serde_json::json!({});
+        attach_vmm_sampling_ack(&mut off, false, true, true);
+        assert_eq!(off, serde_json::json!({"continuous_batch_sampling": "greedy_only"}));
+
+        let mut on = serde_json::json!({});
+        attach_vmm_sampling_ack(&mut on, true, true, false);
+        assert_eq!(on["continuous_batch_sampling"], "sampled");
+        assert_eq!(on["continuous_batch_sampled_modes"], serde_json::json!(["ar", "mtp"]));
+
+        let mut ar_only = serde_json::json!({});
+        attach_vmm_sampling_ack(&mut ar_only, true, false, false);
+        assert_eq!(ar_only["continuous_batch_sampled_modes"], serde_json::json!(["ar"]));
+    }
+
+    #[test]
+    fn batch_done_receipts_name_mode_sampling_and_equivalence() {
+        let mut done = serde_json::json!({"continuous_batch": {"executed": true}});
+        attach_vmm_batch_receipts(&mut done, VmmLaneDecode::Mtp, true, true);
+        assert_eq!(done["continuous_batch"]["spec_mode"], "mtp");
+        assert_eq!(done["continuous_batch"]["sampling"], "sampled");
+        assert_eq!(done["continuous_batch"]["equivalence"], "singleton_exact");
+        assert_eq!(done["continuous_batch"]["executed"], true);
+        assert_eq!(done["continuous_batch_sampling"], "sampled");
+        assert_eq!(done["continuous_batch_equivalence"], "singleton_exact");
+
+        let mut greedy = serde_json::json!({"continuous_batch": {}});
+        attach_vmm_batch_receipts(&mut greedy, VmmLaneDecode::Ar, false, true);
+        assert_eq!(greedy["continuous_batch"]["spec_mode"], "ar");
+        assert_eq!(greedy["continuous_batch"]["sampling"], "greedy");
     }
 }

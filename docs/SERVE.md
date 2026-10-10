@@ -116,6 +116,11 @@ Config and env owners for bind, idle, queue, and body limits:
    MQ4G256V2 dense layers); the ack reports `continuous_batch_exact: true`.
    `serve.batch_nonexact` / `HIPFIRE_SERVE_BATCH_NONEXACT=1` selects the
    non-exact shared slots body instead (`continuous_batch_nonexact: true`).
+   `serve.batch_sampled` / `HIPFIRE_SERVE_BATCH_SAMPLED=1` (experimental,
+   default off) additionally admits sampled (temperature>0) requests to the
+   exact route for lane modes proven byte-identical to the same-mode
+   singleton (AR, native MTP); with it off those requests stay on the
+   serialized singleton route.
    Stage-1 limits: greedy requests only
    (penalties apply as on the singleton route) and AR rows only;
    `serve.batch_spec` (`HIPFIRE_SERVE_BATCH_SPEC=0`) is a reserved switch — no

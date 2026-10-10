@@ -205,6 +205,14 @@ required-features = []
 name = "c8_sampler_validate"
 required-features = []
 
+# Exactness/cost oracle for batch_sampler::sample_batch vs serial
+# sampler::sample (token, rng, logits bytes, transfer counts, penalty cost).
+# No model load; synthetic adversarial logits. Requires a live GPU. Gated
+# (`--features lab`) to keep the ungated-example ratchet flat.
+[[example]]
+name = "sample_batch_exact_oracle"
+required-features = ["lab"]
+
 # Gate F1: FA2 N=1024 vs two N=512 bit-identity oracle (throwaway; repaired positions).
 [[example]]
 name = "tmp_fa2_n1024_oracle"
