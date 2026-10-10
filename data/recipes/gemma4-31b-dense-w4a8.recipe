@@ -1,0 +1,19 @@
+# gemma4-31b-dense-w4a8.recipe -- Gemma 4 31B dense (text), from its CT-INT4 (w4a16)
+# checkpoint, as the w4a8 container serves it.
+#
+#   rad-convert <gemma-4-31B-it-qat-w4a16-ct checkpoint> \
+#       --recipe data/recipes/gemma4-31b-dense-w4a8.recipe -o gemma4-31b-dense-w4a8.rad
+#
+# The checkpoint's GEMM weights are CT-INT4 (group-32, a bf16 scale a 32 codes, no zero point);
+# the converter unpacks them and re-quantises to group-128 int4 with an f16 scale. The norms
+# (input / post-attention / pre- and post-feedforward layernorms, the q/k head norms) and the
+# embedding + lm_head are bf16 and are kept as the checkpoint holds them -- a weight no rule
+# matches is served in its checkpoint form. A rank-1 weight a pattern happens to match is declined
+# by the quantiser and kept as it is, so the norms stay bf16 even under a broad pattern.
+
+blk.*.attn_q.weight       rtn  codes=i4 group=128 scale=f16
+blk.*.attn_k.weight       rtn  codes=i4 group=128 scale=f16
+blk.*.attn_v.weight       rtn  codes=i4 group=128 scale=f16
+blk.*.attn_o.weight       rtn  codes=i4 group=128 scale=f16
+blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16
+blk.*.ffn_down.weight     rtn  codes=i4 group=128 scale=f16
