@@ -955,6 +955,26 @@ TEST(vocab_treats_an_out_of_range_special_id_as_absent) {
     CHECK_EQ(v->pad(), -1);
 }
 
+/* The checkpoint's own end-of-generation list -- generation_config.json's eos_token_id, which the
+ * container carries as `generation.eos_token_id` -- ends a generation on every id it names: Gemma 4
+ * names <|tool_response> there, where the model stops after its calls. An id naming no token is
+ * no id. */
+TEST(vocab_ends_a_generation_on_every_id_the_checkpoint_names) {
+    VocabBuild vb;
+    vb.kind   = RAD_TOK_BPE;
+    vb.tokens = { "a", "<eos>", "<|tool_response>", "<|tool_call>" };
+    vb.types  = { RAD_TT_NORMAL, RAD_TT_CONTROL, RAD_TT_CONTROL, RAD_TT_CONTROL };
+    vb.eos = 1;
+    vb.eos_ids = { 1, 2, 99, -3 };
+    auto v = std::make_shared<Vocab>();
+    CHECK_OK(v->load(std::move(vb)));
+    CHECK(v->is_eog(1));
+    CHECK(v->is_eog(2));
+    CHECK(!v->is_eog(3));
+    CHECK(!v->is_eog(0));
+    CHECK_EQ(v->eog().size(), (size_t)2);
+}
+
 /* ================================================================== chain steps */
 
 TEST(step_chain_units) {

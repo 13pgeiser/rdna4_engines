@@ -3748,6 +3748,19 @@ int Engine::load_vocab() {
         vb.chat_template = std::move(t);
     }
 
+    /* The checkpoint's own end-of-generation list travels as metadata, flattened from
+     * generation_config.json -- a space-separated list, or one id. */
+    if (const char* ids = rad_meta_gets(&meta_, "generation.eos_token_id", nullptr)) {
+        const char* q = ids;
+        while (*q) {
+            char* end = nullptr;
+            const long v = std::strtol(q, &end, 10);
+            if (end == q) break;
+            if (v >= 0 && v <= INT32_MAX) vb.eos_ids.push_back((int32_t)v);
+            q = end;
+        }
+    }
+
     auto v = std::make_shared<Vocab>();
     RAD_TRY(v->load(std::move(vb)));
     vocab_ = v;
