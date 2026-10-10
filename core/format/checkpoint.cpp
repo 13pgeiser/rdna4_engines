@@ -748,8 +748,15 @@ const SrcTensor* Checkpoint::slice(const SrcTensor& st, int index, const char* d
 
 namespace {
 
-/* FP8's scale plane is a companion tensor: `X.weight` is scaled by `X.weight_scale_inv`. */
-std::string scale_name(const std::string& codes) { return codes + "_scale_inv"; }
+/* A scale plane is a companion tensor. FP8's is `X.weight_scale_inv`; a CT-INT4 checkpoint's
+ * code tensor is `X.weight_packed` (i32, eight int4 codes each) and its scale is `X.weight_scale`. */
+std::string scale_name(const std::string& codes) {
+    static const char packed[] = "_packed";
+    const size_t n = strlen(packed);
+    if (codes.size() >= n && codes.compare(codes.size() - n, n, packed) == 0)
+        return codes.substr(0, codes.size() - n) + "_scale";
+    return codes + "_scale_inv";
+}
 
 }  /* namespace */
 
@@ -961,6 +968,35 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
             rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
         }
+    } else if (dt == RAD_I32 && scaled) {
+        /* A CT-INT4 checkpoint: `X.weight_packed` (i32, eight int4 codes each) with
+         * `X.weight_scale` (one per 32 codes). The logical weight is the codes unpacked -- the
+         * last extent is eight times the packed extent -- and its scale plane is one per 32. */
+        out->trivial = true;
+        if (d != 0 && out->pieces.size() > 1) {
+            out->trivial = false;
+            out->why = "its CT-INT4 pieces are joined along a column, across their code blocks";
+        }
+        out->shape[out->rank - 1] *= 8;
+        rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
+        for (size_t k = 0; k < out->pieces.size() && out->trivial; ++k) {
+            const SrcTensor& pk = *out->pieces[k];
+            const SrcTensor& sk = *out->scales[k];
+            int64_t pr = 0, pc = 0, sr = 0, scl = 0;
+            rad_enc_view((uint32_t)pk.shape.size(), pk.shape.data(), &pr, &pc);
+            rad_enc_view((uint32_t)sk.shape.size(), sk.shape.data(), &sr, &scl);
+            if (sk.rad_dtype != out->scales[0]->rad_dtype || sr != pr || pc % 4 || scl != pc / 4) {
+                out->trivial = false;
+                out->why = "'" + sk.name + "' is not the [" + std::to_string(pr) + ", " +
+                           std::to_string(pc / 4) + "] scale plane of '" + pk.name + "'";
+            }
+        }
+        if (out->trivial) {
+            rad_enc_clear(&out->enc);
+            rad_enc_copy_str(out->enc.scheme, "affine");
+            rad_enc_add_plane(&out->enc, "codes", RAD_I4, 1, 8);
+            rad_enc_add_plane(&out->enc, "scale", out->scales[0]->rad_dtype, 1, 32);
+        }
     } else if (!unscaled) {
         out->why = "some of its pieces carry a scale plane and some do not";
     } else if (dt == RAD_F8E4M3 || dt == RAD_F8E5M2) {
@@ -1127,6 +1163,35 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
         return rc;
     };
     if (r0 < 0 || nr < 0 || r0 + nr > w.rows) return refuse(RAD_E_SHAPE, "rows out of range");
+    /* CT-INT4: the codes are packed (eight int4 per i32) and the scale is one per 32, so the
+     * f32 read below would read the i32 as a float. Decode them to f32 directly, row by row --
+     * the pieces are joined along rows, so logical row r is in the piece whose rows cover it. */
+    if (!w.pieces.empty() && w.pieces[0]->rad_dtype == RAD_I32
+            && !w.scales.empty() && w.scales[0]) {
+        int64_t base = 0;
+        for (size_t k = 0; k < w.pieces.size(); ++k) {
+            const SrcTensor& pk = *w.pieces[k];
+            const SrcTensor& sk = *w.scales[k];
+            int64_t pr = 0, pc = 0;
+            rad_enc_view((uint32_t)pk.shape.size(), pk.shape.data(), &pr, &pc);
+            const int64_t sg = pc / 4;   /* scale cols per row = (K/8)/4 = K/32 */
+            const uint32_t* pkd = (const uint32_t*)pk.data;
+            for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + pr); ++r) {
+                const int64_t rr = r - base;
+                const uint32_t* pkrow = pkd + rr * pc;
+                for (int64_t c = 0; c < (int64_t)(pc * 8); ++c) {
+                    const uint32_t code = (pkrow[c >> 3] >> ((c & 7) << 2)) & 0xFu;
+                    const float scale = rad_load_f32(sk.data, sk.rad_dtype, rr * sg + (c >> 5));
+                    /* SIGNED: a code below eight is a negative weight, and `code - 8` on the
+                     * uint32_t would wrap to four billion, which the re-quantiser would scale
+                     * to an infinite f16 and zero codes. */
+                    out[(r - r0) * w.cols + c] = ((int)code - 8) * scale;
+                }
+            }
+            base += pr;
+        }
+        return RAD_OK;
+    }
     Joined j;
     j.init(w.pieces, w.concat_dim);
     /* the runs come in order, so the cursor is the elements already written */

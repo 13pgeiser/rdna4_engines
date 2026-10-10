@@ -357,6 +357,50 @@ TEST(what_is_not_served_as_it_is_says_why) {
     remove_checkpoint(dir);
 }
 
+/* CT-INT4 (a QAT checkpoint): eight int4 codes packed per i32, one bf16 scale per 32 codes,
+ * no zero point -- a code below eight is a NEGATIVE weight. The unsigned wrap of `code - 8`
+ * on the uint32_t used to send every code below eight to four billion, which the re-quantiser
+ * then scaled to an infinite f16 and zero codes, and the converted model answered NaN. */
+TEST(ct_int4_is_the_codes_minus_eight_times_their_scale) {
+    const int64_t N = 2, K = 32;   /* four words a row, one scale a row */
+    T p{ "p.weight_packed", "I32", { N, 4 }, {} };
+    p.bytes.resize((size_t)N * 4 * 4);
+    T s{ "p.weight_scale", "BF16", { N, 1 }, {} };
+    s.bytes.resize((size_t)N * 2);
+    for (int64_t r = 0; r < N; ++r) {
+        uint32_t words[4] = { 0, 0, 0, 0 };
+        for (int64_t c = 0; c < K; ++c) {
+            const int code = (int)((r * 5 + (c / 8) * 4 + (c % 8)) % 16);
+            words[c / 8] |= (uint32_t)code << (4 * (c % 8));
+        }
+        for (int w = 0; w < 4; ++w) std::memcpy(p.bytes.data() + (size_t)(r * 4 + w) * 4, &words[w], 4);
+        rad_store_f32(s.bytes.data(), RAD_BF16, r, 0.25f * (float)(r + 1));
+    }
+    const std::string dir = write_checkpoint({ p, s }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("p", RAD_MAP_COPY, { "p.weight_packed" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    CHECK(rad_enc_is(&w.enc, "affine"));
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_I4);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    CHECK_EQ(w.rows, (int64_t)N);
+    CHECK_EQ(w.cols, (int64_t)K);
+    std::vector<float> f((size_t)N * K);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, N, f.data(), &why), RAD_OK);
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t c = 0; c < K; ++c) {
+            const int code = (int)((r * 5 + (c / 8) * 4 + (c % 8)) % 16);
+            CHECK_EQ(f[(size_t)(r * K + c)], (float)(code - 8) * 0.25f * (float)(r + 1));
+        }
+    remove_checkpoint(dir);
+}
+
 RAD_TEST_MAIN()
 
 /* ================================================================== imported quantisations */
