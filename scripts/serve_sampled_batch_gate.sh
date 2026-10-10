@@ -76,26 +76,35 @@ done
 grep -q "VMM continuous batch staged" "$WORK/serve.log" || fail "the VMM batch route was not staged"
 
 # serve_harness exits non-zero on any HTTP error or missing/duplicate terminal.
+# max_tokens 40000 is above the MTP lane head cap (32,768) and inside the
+# singleton speculator's context, so no request has a batch lane.
 python3 -I "$ROOT/scripts/serve_harness.py" --no-spawn --port "$PORT" --model "$MODEL" \
-  --mode battery --concurrent-clients 1,8 --thinking off --seed 42 \
+  --mode battery --concurrent-clients 1,8 --thinking off --seed 42 --max-tokens 40000 \
   --sampling 'json:{"temperature":0.7,"top_p":0.95,"top_k":20}' \
   --out "$WORK/harness.json" > "$WORK/harness.txt" 2>&1
 hrc=$?
 tail -5 "$WORK/harness.txt"
 [ "$hrc" = 0 ] || fail "serve_harness rc=$hrc (see $WORK/harness.txt)"
 
-# Belt and braces on the recorded rows: every request at every level answered
-# 200 with one terminal, and C8 ran all eight clients' full batteries.
+# On the recorded rows: every request at every level answered 200 with one
+# terminal, C8 ran all eight clients' full batteries, every request ran the
+# singleton MTP route (never an AR substitute), and with the one wire seed
+# each prompt's C8 text equals its C1 text.
 python3 -I - "$WORK/harness.json" <<'EOF' || fail "harness rows failed the gate"
 import json, sys
 rows = json.load(open(sys.argv[1]))
 bad = [r for r in rows if r.get("http_status") not in (None, 200) or r.get("terminal_count") != 1]
+not_mtp = [r for r in rows if not r.get("mtp") or r.get("ar_windows")]
 c1 = [r for r in rows if r["concurrency"] == 1]
 c8 = [r for r in rows if r["concurrency"] == 8]
-print(f"rows={len(rows)} c1={len(c1)} c8={len(c8)} non200_or_bad_terminal={len(bad)}")
-for r in bad[:8]:
-    print(f"  c{r['concurrency']}/client{r['client']}/turn{r['turn']}: http={r.get('http_status')} {r.get('stream_error')}")
-sys.exit(0 if not bad and c1 and len(c8) == 8 * len(c1) else 1)
+ref = {r["prompt_index"]: r["content"] for r in c1}
+differ = [r for r in c8 if r["content"] != ref.get(r["prompt_index"])]
+print(f"rows={len(rows)} c1={len(c1)} c8={len(c8)} non200_or_bad_terminal={len(bad)} "
+      f"not_singleton_mtp={len(not_mtp)} c8_text_differs_from_c1={len(differ)}")
+for r in (bad + not_mtp + differ)[:8]:
+    print(f"  c{r['concurrency']}/client{r['client']}/turn{r['turn']}: http={r.get('http_status')} "
+          f"mtp={r.get('mtp')} ar_windows={r.get('ar_windows')} {r.get('stream_error')}")
+sys.exit(0 if not (bad or not_mtp or differ) and c1 and len(c8) == 8 * len(c1) else 1)
 EOF
 
 echo "PASS: sampled MTP batch, thinking off, C1+C8: every request HTTP 200"
