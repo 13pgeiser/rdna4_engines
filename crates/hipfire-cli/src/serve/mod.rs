@@ -292,9 +292,10 @@ pub(crate) struct ServeRuntime {
     pub(crate) current_reasoning_effort_native: bool,
     pub(crate) current_reasoning_efforts: Vec<String>,
     pub(crate) continuous_batch_capable: bool,
-    /// Daemon load ack reported `continuous_batch_route == "vmm"`: the VMM
-    /// batch route renders multi-turn text chats, so HTTP admission may batch them.
-    pub(crate) continuous_batch_vmm: bool,
+    /// Daemon load ack reported `continuous_batch_history_capable`: its exact
+    /// batch lanes render appended multi-turn text chats, so HTTP admission may
+    /// batch them. Typed capability; the route name is never consulted.
+    pub(crate) continuous_batch_history: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
@@ -957,18 +958,19 @@ impl Drop for AdmissionGuard {
 /// and synchronous; model arch is taken from `current_arch` when available,
 /// otherwise inferred from the requested model name containing `qwen` or `lfm`.
 ///
-/// Message-shape gate: absent/empty `messages` are eligible. Fixed-lane route
-/// (`vmm_route == false`) admits exactly one `user` message with plain string
-/// content (no tool_calls, no multipart/array content) and no `stop`,
-/// matching daemon admission. The VMM route (`vmm_route == true`) admits
+/// Message-shape gate: absent/empty `messages` are eligible. Routes without
+/// history support (`history_capable == false`) admit exactly one `user`
+/// message with plain string content (no tool_calls, no multipart/array
+/// content) and no `stop`, matching daemon admission. Routes that advertise
+/// `continuous_batch_history_capable` (qwen35 `vmm`, qwen4 `fn-lanes`) admit
 /// multi-turn text chats via `batch_messages_are_text_chat`, with or without
-/// `stop` (its lanes run the singleton's stop matcher).
+/// `stop` (their lanes run the singleton's stop matcher).
 pub(crate) fn is_batch_eligible_request(
     body: &serde_json::Value,
     tp: Option<u64>,
     current_arch: Option<&str>,
     daemon_batch_capable: bool,
-    vmm_route: bool,
+    history_capable: bool,
 ) -> bool {
     if !daemon_batch_capable {
         return false;
@@ -1012,14 +1014,14 @@ pub(crate) fn is_batch_eligible_request(
         return false;
     }
     // Message history shape depends on the batch route.
-    if !(if vmm_route {
+    if !(if history_capable {
         batch_messages_are_text_chat(body)
     } else {
         batch_messages_are_single_user(body)
     }) {
         return false;
     }
-    if !vmm_route && body.get("stop").is_some() {
+    if !history_capable && body.get("stop").is_some() {
         return false;
     }
     // Speculation / adaptive / prefix behavior disqualifies.
@@ -1037,6 +1039,19 @@ pub(crate) fn is_batch_eligible_request(
         }
     }
     true
+}
+
+/// Load-ack multi-turn capability: the daemon's typed
+/// `continuous_batch_history_capable` flag, valid only alongside
+/// `continuous_batch_capable`. Route names are not inspected.
+pub(crate) fn ack_history_capable(loaded: &serde_json::Value) -> bool {
+    let flag = |key: &str| {
+        loaded
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    flag("continuous_batch_capable") && flag("continuous_batch_history_capable")
 }
 
 /// HTTP/OpenAI `messages` are batch-eligible only when absent/empty (prompt
@@ -1564,7 +1579,7 @@ pub(crate) fn serve_foreground(
             current_reasoning_effort_native: false,
             current_reasoning_efforts: Vec::new(),
             continuous_batch_capable: false,
-            continuous_batch_vmm: false,
+            continuous_batch_history: false,
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
@@ -1970,10 +1985,7 @@ impl ServeRuntime {
                 .get("continuous_batch_capable")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            self.continuous_batch_vmm = loaded
-                .get("continuous_batch_route")
-                .and_then(serde_json::Value::as_str)
-                == Some("vmm");
+            self.continuous_batch_history = ack_history_capable(&loaded);
             self.current_max_seq = loaded
                 .get("max_seq")
                 .and_then(serde_json::Value::as_u64)
@@ -2067,7 +2079,7 @@ impl ServeRuntime {
         self.current_reasoning_effort_native = false;
         self.current_reasoning_efforts = Vec::new();
         self.continuous_batch_capable = false;
-        self.continuous_batch_vmm = false;
+        self.continuous_batch_history = false;
         self.current_max_seq = 0;
         self.cache_capable = false;
         self.resident_model = None;
@@ -3063,6 +3075,46 @@ mod tests {
     }
 
     #[test]
+    fn ack_history_capability_is_typed_not_route_named() {
+        let fn_lanes = serde_json::json!({
+            "continuous_batch_capable": true,
+            "continuous_batch_route": "fn-lanes",
+            "continuous_batch_history_capable": true
+        });
+        assert!(ack_history_capable(&fn_lanes));
+        let multi_turn = serde_json::json!({"model":"qwen4:flash","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"},
+            {"role":"user","content":"again"}
+        ]});
+        assert!(is_batch_eligible_request(
+            &multi_turn,
+            Some(1),
+            Some("qwen4"),
+            true,
+            ack_history_capable(&fn_lanes)
+        ));
+        // A route without the capability keeps the single-user-turn rule.
+        let unsupported = serde_json::json!({
+            "continuous_batch_capable": true,
+            "continuous_batch_route": "fn-lanes"
+        });
+        assert!(!ack_history_capable(&unsupported));
+        assert!(!is_batch_eligible_request(
+            &multi_turn,
+            Some(1),
+            Some("qwen4"),
+            true,
+            ack_history_capable(&unsupported)
+        ));
+        // Capability without batch capability never admits.
+        assert!(!ack_history_capable(&serde_json::json!({
+            "continuous_batch_capable": false,
+            "continuous_batch_history_capable": true
+        })));
+    }
+
+    #[test]
     fn batch_messages_text_chat_shape() {
         assert!(batch_messages_are_text_chat(&serde_json::json!({})));
         assert!(batch_messages_are_text_chat(
@@ -3224,7 +3276,7 @@ mod tests {
             current_reasoning_effort_native: true,
             current_reasoning_efforts: vec!["xhigh".to_owned()],
             continuous_batch_capable: true,
-            continuous_batch_vmm: false,
+            continuous_batch_history: false,
             current_max_seq: 32768,
             cache_capable: true,
             kv_override: Some("q8".to_owned()),

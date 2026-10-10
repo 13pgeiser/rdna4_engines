@@ -880,7 +880,7 @@ async fn handle_request(
                 let tp = runtime.tp;
                 let arch = runtime.current_arch.clone();
                 let batch_capable = runtime.continuous_batch_capable;
-                let batch_vmm = runtime.continuous_batch_vmm;
+                let batch_history = runtime.continuous_batch_history;
                 let multi_slot = runtime.multi_slot_enabled;
                 drop(runtime);
                 // The admission gate is transport concurrency, not a batch-mode
@@ -892,7 +892,7 @@ async fn handle_request(
                         tp,
                         arch.as_deref(),
                         batch_capable,
-                        batch_vmm,
+                        batch_history,
                     );
                 let model = body_val
                     .get("model")

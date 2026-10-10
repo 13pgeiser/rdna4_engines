@@ -267,6 +267,8 @@ fn finish_lane(
         batch_finite_rate(lane.prompt_len, ctl.prefill_ms / 1000.0),
         batch_finite_rate(generated, decode), ctl.prefill_ms, 0, "");
     stage_terminal_tool_calls(&mut done, finish.finish_reason, &finish.wire_tool_calls);
+    attach_continuous_batch_route_evidence(&mut done, sched.lanes.len(), idx, sched.lane_capacity,
+        lane.max_active_lanes.max(1));
     let action = qwen_ar_cache_action(&finish, &visible);
     if action.store {
         let tokenizer = model.tokenizer.as_ref().ok_or("tokenizer disappeared")?;

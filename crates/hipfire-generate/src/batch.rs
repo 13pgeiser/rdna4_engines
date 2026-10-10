@@ -2411,6 +2411,9 @@ fn qwen4_lane_ack_fields(
     p: VmmBatchParams,
 ) {
     v["continuous_batch_route"] = serde_json::json!("fn-lanes");
+    // Typed capability: exact lanes admit appended (multi-turn) text-chat
+    // histories; the gateway keys admission on this, not on the route name.
+    v["continuous_batch_history_capable"] = serde_json::json!(true);
     v["continuous_batch_slots"] = serde_json::json!(slots);
     v["continuous_batch_row_budget"] = serde_json::json!(row_budget);
     v["continuous_batch_row_budget_requested"] = serde_json::json!(p.max_batch_tokens);
@@ -2486,6 +2489,7 @@ pub fn vmm_loaded_ack(
         return ack;
     };
     v["continuous_batch_route"] = serde_json::json!("vmm");
+    v["continuous_batch_history_capable"] = serde_json::json!(true);
     v["continuous_batch_slots"] = serde_json::json!(slots);
     v["continuous_batch_row_budget"] = serde_json::json!(row_budget);
     v["continuous_batch_row_budget_requested"] = serde_json::json!(p.max_batch_tokens);
@@ -6853,6 +6857,7 @@ mod tests {
         };
         qwen4_lane_ack_fields(&mut v, &receipt, 4, 32, params);
         assert_eq!(v["continuous_batch_route"], "fn-lanes");
+        assert_eq!(v["continuous_batch_history_capable"], true);
         assert_eq!(v["continuous_batch_slots"], 4);
         assert_eq!(v["continuous_batch_row_budget"], 32);
         assert_eq!(v["continuous_batch_row_budget_requested"], 4096);

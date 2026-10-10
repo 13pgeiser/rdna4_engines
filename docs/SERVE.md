@@ -544,6 +544,9 @@ request run alone on the singleton route. **Default off, experimental.**
   every stage per lane until their own G0 run.
 
 The loaded ack reports `continuous_batch_route: "fn-lanes"`,
+`continuous_batch_history_capable: true` (the typed capability the serve
+gateway uses to admit appended multi-turn histories; it never matches route
+names),
 `continuous_batch_slots`, `continuous_batch_exact: true`,
 `continuous_batch_sampling: "greedy_only"` and the lane-store receipt:
 `fn_lanes_kv_backend`, `fn_lanes_qsa_format`, `fn_lanes_gdn_format`,
