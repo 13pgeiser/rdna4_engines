@@ -10,6 +10,8 @@
  */
 #include <arch/rad_arch.h>
 
+#include "gemma4_chat_format.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -879,11 +881,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
+/* The reply format: gemma4_chat_format.h. */
+const RadChatFormat* chat_format(const RadModelMeta*) { return chat_format_decl(); }
+
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
                 "Gemma 4 dense (text-only), w4a8 from its CT-INT4 (compressed-tensors) release: "
                 "sliding-window and proportional-RoPE global attention over a GemmaRMSNorm stream "
                 "with GELU feed-forward, per-layer scalar scaling and soft-capped logits")
+RAD_ARCH_CHAT_FORMAT(gemma4_bf16)
 #endif
 
 }  /* namespace gemma4_bf16 */

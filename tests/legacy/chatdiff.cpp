@@ -65,6 +65,11 @@ int Bench::load(const Model& m, const std::string& jinja, std::string* why) {
         *why = "the template did not compile";
         return RAD_E_FORMAT;
     }
+    if (m.declared) {
+        const int st = chat_format_from_abi(m.declared, &fmt_, why);
+        if (st < 0) return st;
+        return ReplyFormat::compile(fmt_, &rf_, why);
+    }
     std::string refused;
     int st = chat_format_from_template(jinja, m.bos, m.eos, &fmt_, &refused, why);
     if (st < 0) return st;

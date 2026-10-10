@@ -3156,6 +3156,31 @@ TEST(declare_is_a_gemma4_trunk) {
     CHECK_EQ(count_op(b, "all_reduce"),    0);  /* world 1 */
 }
 
+/* The reply format is the plugin's to state: Gemma 4's template is one the template analysis
+ * cannot read. Its calls are the object family -- a name and one object in Gemma's dialect --
+ * and its thought channel may open again after the answer. The parser's reading of it is
+ * chatparse_gemma4_test's; this holds the export to what the header declares. */
+TEST(gemma4_declares_its_reply_format) {
+    RadModelMeta meta = gemma4_meta();
+    const RadChatFormat* f = gemma4_bf16::chat_format(&meta);
+    REQUIRE(f != nullptr);
+    CHECK_EQ(f->struct_size, (uint32_t)sizeof(RadChatFormat));
+    CHECK_EQ(f->args_form, (uint32_t)RAD_CHAT_ARGS_OBJECT);
+    CHECK_EQ(std::string(f->call_open), std::string("<|tool_call>"));
+    CHECK_EQ(std::string(f->call_close), std::string("<tool_call|>"));
+    CHECK_EQ(std::string(f->name_prefix), std::string("call:"));
+    CHECK_EQ(std::string(f->name_suffix), std::string(""));
+    CHECK_EQ(std::string(f->object_string_open), std::string("<|\"|>"));
+    CHECK_EQ(std::string(f->object_string_close), std::string("<|\"|>"));
+    CHECK(f->object_bare_keys != 0);
+    CHECK_EQ(std::string(f->reasoning_open), std::string("<|channel>thought\n"));
+    CHECK_EQ(std::string(f->reasoning_close), std::string("<channel|>"));
+    CHECK(f->reasoning_anywhere != 0);
+    REQUIRE(f->n_triggers == 1);
+    CHECK_EQ(std::string(f->triggers[0]), std::string("<|tool_call>"));
+    CHECK(f->arg_prefix == nullptr && f->arg_value_suffix == nullptr);
+}
+
 TEST(gemma4_declares_two_kv_groups_and_binds_the_schedule) {
     RadBuilder b;
     RadModelMeta meta = gemma4_meta();
