@@ -683,18 +683,22 @@ impl Rig {
     /// device-synchronised seconds of the suffix call.
     fn product_run(&mut self, req: &Req, all: bool) -> R<(LaneOut, f64)> {
         let Rig { w, sc, tile, .. } = self;
+        // The product entries take exactly the logits they write: one row
+        // (`forward_chunk_final`) or every suffix row (`forward_chunk`).
+        let final_row = sc.final_logits.sub_offset(0, w.vocab);
         w.bundle.reset(&mut w.gpu).map_err(e)?;
         for t in req.prefix.chunks(*tile) {
-            w.bundle.forward_chunk_final(&mut w.gpu, t, &sc.final_logits, None).map_err(e)?;
+            w.bundle.forward_chunk_final(&mut w.gpu, t, &final_row, None).map_err(e)?;
         }
         w.gpu.hip.device_synchronize().map_err(e)?;
         let t0 = Instant::now();
         if all {
             let buf = sc.all.as_ref().ok_or("--all-logits buffer is not allocated")?;
-            w.bundle.forward_chunk(&mut w.gpu, &req.suffix, buf, Some(&sc.top1)).map_err(e)?;
+            let rows = buf.sub_offset(0, req.suffix.len() * w.vocab);
+            w.bundle.forward_chunk(&mut w.gpu, &req.suffix, &rows, Some(&sc.top1)).map_err(e)?;
         } else {
             w.bundle
-                .forward_chunk_final(&mut w.gpu, &req.suffix, &sc.final_logits, Some(&sc.top1))
+                .forward_chunk_final(&mut w.gpu, &req.suffix, &final_row, Some(&sc.top1))
                 .map_err(e)?;
         }
         w.gpu.hip.device_synchronize().map_err(e)?;
