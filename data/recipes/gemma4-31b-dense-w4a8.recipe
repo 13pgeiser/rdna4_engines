@@ -10,6 +10,13 @@
 # embedding + lm_head are bf16 and are kept as the checkpoint holds them -- a weight no rule
 # matches is served in its checkpoint form. A rank-1 weight a pattern happens to match is declined
 # by the quantiser and kept as it is, so the norms stay bf16 even under a broad pattern.
+#
+# With the assistant (draft) head merged in -- add `--draft-model <gemma-4-31B-it-assistant>` --
+# its weights are declared as `mtp.*` and no rule below matches them: the head is served bf16 as
+# Google ships it (0.9 GB). The patterns are anchored, so `blk.*` never reaches `mtp.blk.*`.
+# Its lm_head (`mtp.output.weight`, 0.5 GB, read once a draft round) may be made int8 with
+#     mtp.output.weight  rtn  codes=i8 group=128 scale=bf16 clamp=sym
+# and the head then reads it through logits_gemm_i8; a draft only proposes, the trunk verifies.
 
 blk.*.attn_q.weight       rtn  codes=i4 group=128 scale=f16
 blk.*.attn_k.weight       rtn  codes=i4 group=128 scale=f16

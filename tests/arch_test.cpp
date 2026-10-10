@@ -91,6 +91,13 @@ struct RadBuilder {
     /* The buffer the plugin named as this step's logits (rad_declare_logits). */
     rad_buf logits = 0;
 
+    /* The draft head's declaration (rad_declare_drafter), and whether it said it keeps no cache
+     * of its own (rad_drafter_shared_kv) and at which rotary offset. */
+    RadDrafterDecl drafter{};
+    std::string    drafter_name;
+    bool           drafter_shared = false;
+    int            drafter_pos = -1;
+
     /* The vision tower's declaration (rad_declare_encoder), when the plugin made one, and the
      * audio encoder's. */
     RadEncoderDecl encoder{};
@@ -247,7 +254,16 @@ extern "C" int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     return RAD_OK;
 }
 extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
-    (void)b; (void)d;
+    if (!b || !d) return RAD_E_INVAL;
+    b->drafter = *d;
+    b->drafter_name = d->name ? d->name : "";
+    return RAD_OK;
+}
+extern "C" int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
+    if (!b || b->drafter.kind != RAD_DRAFT_SERIAL || (pos_offset != 0 && pos_offset != 1))
+        return RAD_E_STATE;
+    b->drafter_shared = true;
+    b->drafter_pos = pos_offset;
     return RAD_OK;
 }
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
@@ -404,6 +420,46 @@ RadModelMeta gemma4_meta() {
     m.n_kv        = (int)(sizeof(k_gem4_keys) / sizeof(k_gem4_keys[0]));
     m.kv_key      = k_gem4_keys;
     m.kv_val      = k_gem4_vals;
+    return m;
+}
+
+/* The same twelve layers with Gemma's assistant head merged under `draft.`, the way
+ * `rad-convert --draft-model` writes it: the head's own config flattened, its text config nested
+ * under `draft.text_config.`. The 31B's head: width 1024, four layers (three sliding, one full),
+ * the trunk's head geometry and window, its own 262144-row tied table. */
+const char* k_gem4d_keys[] = {
+    "sliding_window", "global_head_dim", "num_global_key_value_heads",
+    "rope_parameters.sliding_attention.rope_theta", "rope_parameters.full_attention.rope_theta",
+    "rope_parameters.full_attention.partial_rotary_factor", "num_kv_shared_layers",
+    "final_logit_softcapping", "full_attention_interval",
+    "draft.architectures", "draft.backbone_hidden_size", "draft.use_ordered_embeddings",
+    "draft.text_config.hidden_size", "draft.text_config.num_hidden_layers",
+    "draft.text_config.layer_types", "draft.text_config.num_attention_heads",
+    "draft.text_config.num_key_value_heads", "draft.text_config.num_global_key_value_heads",
+    "draft.text_config.head_dim", "draft.text_config.global_head_dim",
+    "draft.text_config.intermediate_size", "draft.text_config.sliding_window",
+    "draft.text_config.vocab_size", "draft.text_config.rms_norm_eps",
+    "draft.text_config.rope_parameters.sliding_attention.rope_theta",
+    "draft.text_config.rope_parameters.full_attention.rope_theta",
+    "draft.text_config.rope_parameters.full_attention.partial_rotary_factor",
+};
+const char* k_gem4d_vals[] = {
+    "1024", "512", "4", "10000", "1000000", "0.25", "0", "30", "6",
+    "Gemma4AssistantForCausalLM", "5376", "0",
+    "1024", "4",
+    "sliding_attention sliding_attention sliding_attention full_attention", "32",
+    "16", "4",
+    "256", "512",
+    "8192", "1024",
+    "262144", "1e-06",
+    "10000", "1000000", "0.25",
+};
+
+RadModelMeta gemma4_draft_meta() {
+    RadModelMeta m = gemma4_meta();
+    m.n_kv   = (int)(sizeof(k_gem4d_keys) / sizeof(k_gem4d_keys[0]));
+    m.kv_key = k_gem4d_keys;
+    m.kv_val = k_gem4d_vals;
     return m;
 }
 
@@ -3373,4 +3429,240 @@ TEST(a_gemma4_decode_step_runs_both_classes_in_order) {
         else if (o->op == "gather_rows" || o->op == "logits_gemm" || o->op == "logit_softcap")
             CHECK_EQ(i.n, (int64_t)batch.n_out);
     }
+}
+
+/* =============================== gemma4: the assistant (MTP) head =============================== */
+
+namespace {
+/* The draft passes the core stages for a head with no cache of its own: one row a drafting
+ * sequence. Four sequences; the history pass names every row as a draft row. */
+static const int32_t kHeadRows[] = { 0, 1, 2, 3 };
+RadBatch head_batch(int pass) {
+    RadBatch b{};
+    b.phase         = RAD_PHASE_DECODE;
+    b.n_tok         = 4;
+    b.n_seq         = 4;
+    b.max_q_len     = 1;
+    b.max_ctx_len   = 100;
+    b.draft_pass    = pass;
+    if (pass < 0) {
+        b.n_out         = 4;
+        b.out_ids       = kHeadRows;
+        b.n_draft_out   = 4;
+        b.draft_out_ids = kHeadRows;
+    }
+    return b;
+}
+}  /* namespace */
+
+TEST(gemma4_declares_no_head_without_one_or_without_speculation) {
+    {
+        RadBuilder b;
+        RadModelMeta meta = gemma4_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        ctx.max_spec = 3;
+        CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+        CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_NONE);
+        CHECK(find_w(b, "mtp.pre_proj.weight") == nullptr);
+    }
+    {
+        RadBuilder b;
+        RadModelMeta meta = gemma4_draft_meta();
+        RadBuildCtx  ctx  = build_ctx();      /* max_spec 0 */
+        CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+        CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_NONE);
+        CHECK(find_w(b, "mtp.pre_proj.weight") == nullptr);
+        CHECK_EQ(count_op(b, "attn_paged"), 12);
+    }
+}
+
+TEST(gemma4_assistant_is_a_serial_head_with_no_cache_of_its_own) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_draft_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    ctx.max_spec = 3;
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_SERIAL);
+    CHECK_EQ(b.drafter.depth, 3);
+    CHECK_EQ(b.drafter_name, std::string("mtp"));
+    CHECK_EQ((int)b.drafter.proposal, 0);         /* through the sampler chain */
+    CHECK(b.drafter_shared);
+    CHECK_EQ(b.drafter_pos, gemma4_bf16::kHeadPosOffset);
+
+    /* It binds no layer: it writes no K and V. The trunk's twelve bindings are all there are. */
+    CHECK_EQ((int)b.binds.size(), 12);
+    CHECK_EQ((int)b.kv_groups.size(), 2);
+
+    /* Four head layers' worth of attention beside the trunk's twelve, none of them storing. */
+    CHECK_EQ(count_op(b, "attn_paged"), 16);
+    CHECK_EQ(count_op(b, "kv_store"), 12);
+    CHECK_EQ(count_op(b, "logit_softcap"), 1);    /* the trunk's; the head's logits are not capped */
+    CHECK_EQ(count_op(b, "logits_gemm"), 2);
+
+    for (int l = 0; l < 4; ++l) {
+        const RecOp* at = find_op(b, "attn_paged", 12 + l);
+        REQUIRE(at != nullptr);
+        const bool full = (l == 3);
+        CHECK_EQ(pint(at, "head_dim"), full ? 512 : 256);
+        CHECK_EQ(pint(at, "gqa"), full ? 8 : 2);
+        CHECK_EQ(pint(at, "window"), full ? 0 : 1024);
+        CHECK_EQ(pint(at, "causal"), 1);
+        CHECK_NEAR(pflt(at, "scale"), 1.0, 1e-12);
+        const RecParam* ql = param(at, "q_len");
+        REQUIRE(ql != nullptr);
+        CHECK_EQ(ql->ival, 1);                        /* one row a sequence, the decode band only */
+        CHECK_EQ(ql->ihi, 1);
+    }
+
+    /* The weights: q-only attention, the two projections and the head's own tied table. */
+    const RecWeight* wq0 = find_w(b, "mtp.blk.0.attn_q.weight");
+    const RecWeight* wq3 = find_w(b, "mtp.blk.3.attn_q.weight");
+    REQUIRE(wq0 != nullptr); REQUIRE(wq3 != nullptr);
+    CHECK_EQ(wq0->d.shape[0], 32 * 256); CHECK_EQ(wq0->d.shape[1], 1024);
+    CHECK_EQ(wq3->d.shape[0], 32 * 512); CHECK_EQ(wq3->d.shape[1], 1024);
+    const RecWeight* wo3 = find_w(b, "mtp.blk.3.attn_o.weight");
+    REQUIRE(wo3 != nullptr);
+    CHECK_EQ(wo3->d.shape[0], 1024); CHECK_EQ(wo3->d.shape[1], 32 * 512);
+    CHECK(find_w(b, "mtp.blk.0.attn_k.weight") == nullptr);
+    CHECK(find_w(b, "mtp.blk.0.attn_v.weight") == nullptr);
+    const RecWeight* gu = find_w(b, "mtp.blk.1.ffn_gate_up.weight");
+    REQUIRE(gu != nullptr);
+    CHECK_EQ(gu->d.shape[0], 2 * 8192); CHECK_EQ(gu->d.shape[1], 1024);
+    const RecWeight* pre  = find_w(b, "mtp.pre_proj.weight");
+    const RecWeight* post = find_w(b, "mtp.post_proj.weight");
+    REQUIRE(pre != nullptr); REQUIRE(post != nullptr);
+    CHECK_EQ(pre->d.shape[0], 1024);  CHECK_EQ(pre->d.shape[1], 2 * 5376);
+    CHECK_EQ(post->d.shape[0], 5376); CHECK_EQ(post->d.shape[1], 1024);
+    CHECK_EQ(pre->d.shard, RAD_SHARD_NONE);
+    const RecWeight* lm = find_w(b, "mtp.output.weight");
+    REQUIRE(lm != nullptr);
+    CHECK_EQ(lm->d.shape[0], 262144); CHECK_EQ(lm->d.shape[1], 1024);
+    CHECK_EQ(lm->d.shard, RAD_SHARD_ROW);
+    CHECK_EQ(lm->d.access, RAD_ACCESS_VOCAB);
+
+    /* The checkpoint's names, merged under `draft.`: the head's table is its lm_head and nothing
+     * else, and gate and up are fused like the trunk's. */
+    const RecMap* mlm = find_map(b, "mtp.output.weight");
+    REQUIRE(mlm != nullptr);
+    CHECK_EQ(mlm->src[0], std::string("draft.model.embed_tokens.weight"));
+    const RecMap* mgu = find_map(b, "mtp.blk.1.ffn_gate_up.weight");
+    REQUIRE(mgu != nullptr);
+    CHECK_EQ(mgu->mode, RAD_MAP_CONCAT);
+    CHECK_EQ(mgu->src[0], std::string("draft.model.layers.1.mlp.gate_proj.weight"));
+    CHECK_EQ(mgu->src[1], std::string("draft.model.layers.1.mlp.up_proj.weight"));
+    const RecMap* mpre = find_map(b, "mtp.pre_proj.weight");
+    REQUIRE(mpre != nullptr);
+    CHECK_EQ(mpre->src[0], std::string("draft.pre_projection.weight"));
+
+    /* The entry embeds through the TRUNK's table, scaled as the trunk scales it. */
+    const RecOp* el = find_op(b, "embed_lookup", 1);
+    REQUIRE(el != nullptr);
+    CHECK_EQ(pint(el, "n_embd"), 5376);
+    CHECK_NEAR(pflt(el, "mult"), std::sqrt(5376.0), 1e-9);
+    CHECK(el->w.size() == 1 && find_op(b, "embed_lookup", 0)->w == el->w);
+
+    for (const auto& o : b.ops)
+        if (o.resolved) CHECK(o.uses_declared);
+    for (const auto& w : b.weights)
+        CHECK(find_map(b, w.name) != nullptr);
+}
+
+TEST(gemma4_head_passes_read_the_last_trunk_layer_of_their_class) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_draft_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    ctx.max_spec = 3;
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    for (int pass : { -1, 2 }) {
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = head_batch(pass);
+        c.batch = &batch;
+        gemma4_bf16::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+
+        std::vector<std::string> want;
+        want.push_back(pass < 0 ? "gather_rows" : "cast");   /* the trunk's h, or the head's h' */
+        for (const char* s : { "embed_lookup", "cast", "gemm_nt" }) want.push_back(s);
+        for (int l = 0; l < 4; ++l)
+            for (const char* s : { "rmsnorm", "gemm_nt", "rmsnorm", "rope", "attn_paged", "gemm_nt",
+                                   "rmsnorm", "add", "rmsnorm", "gemm_nt", "gelu_mul", "gemm_nt",
+                                   "rmsnorm", "add", "scale" })
+                want.push_back(s);
+        for (const char* s : { "rmsnorm", "logits_gemm", "gemm_nt" }) want.push_back(s);
+        CHECK_EQ(join(issued_ops(b, c)), join(want));
+
+        /* The attention reads the trunk's cache: layers 0..2 the last sliding trunk layer (10 of
+         * the twelve), layer 3 the last full one (11). Groups by declaration: 1 sliding, 2 full. */
+        int seen = 0;
+        for (const auto& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "attn_paged") continue;
+            REQUIRE(i.opd.size() > 1);
+            CHECK_EQ((int)i.opd[1].kind, (int)RAD_OPK_KV);
+            CHECK_EQ((int)i.opd[1].handle, seen < 3 ? 1 : 2);
+            CHECK_EQ((long long)i.opd[1].offset, seen < 3 ? 10LL : 11LL);
+            CHECK_EQ(i.n, 1);
+            ++seen;
+        }
+        CHECK_EQ(seen, 4);
+    }
+}
+
+TEST(gemma4_head_at_two_ranks_reduces_before_each_post_norm) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_draft_meta();
+    RadBuildCtx  ctx  = build_ctx(0, 2);
+    ctx.max_spec = 3;
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    const RecWeight* wq0 = find_w(b, "mtp.blk.0.attn_q.weight");
+    REQUIRE(wq0 != nullptr);
+    CHECK_EQ(wq0->d.shape[0], 16 * 256);
+    const RecWeight* lm = find_w(b, "mtp.output.weight");
+    REQUIRE(lm != nullptr);
+    CHECK_EQ(lm->d.shape[0], 131072);
+
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 2;
+    RadBatch batch = head_batch(-1);
+    c.batch = &batch;
+    gemma4_bf16::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    const std::vector<std::string> got = issued_ops(b, c);
+    std::vector<std::string> want = { "gather_rows", "embed_lookup", "all_reduce", "cast", "gemm_nt" };
+    for (int l = 0; l < 4; ++l)
+        for (const char* s : { "rmsnorm", "gemm_nt", "rmsnorm", "rope", "attn_paged", "gemm_nt",
+                               "all_reduce", "rmsnorm", "add", "rmsnorm", "gemm_nt", "gelu_mul",
+                               "gemm_nt", "all_reduce", "rmsnorm", "add", "scale" })
+            want.push_back(s);
+    for (const char* s : { "rmsnorm", "logits_gemm", "gemm_nt" }) want.push_back(s);
+    CHECK_EQ(join(got), join(want));
+}
+
+TEST(gemma4_head_refuses_a_history_pass_shaped_for_a_cache_of_its_own) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_draft_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    ctx.max_spec = 3;
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+    RadBatch batch = head_batch(-1);
+    batch.n_draft_out = 1;                 /* a history run with rows that do not draft */
+    c.batch = &batch;
+    gemma4_bf16::step(&c, &batch);
+    CHECK(!c.step_fail.empty());
+    CHECK(c.issues.empty());
+}
+
+TEST(gemma4_probe_names_the_heads_operating_depth) {
+    RadArchProbe p{};
+    RadModelMeta with = gemma4_draft_meta();
+    CHECK_OK(gemma4_bf16::probe(&with, &p));
+    CHECK_EQ(p.draft_depth, gemma4_bf16::kHeadDepth);
+    CHECK_EQ(p.draft_depth_fixed, 0);
+    RadArchProbe q{};
+    RadModelMeta without = gemma4_meta();
+    CHECK_OK(gemma4_bf16::probe(&without, &q));
+    CHECK_EQ(q.draft_depth, 0);
 }

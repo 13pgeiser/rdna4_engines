@@ -72,27 +72,32 @@ static inline void trc_copy(RadCtx* c, uint16_t* ring, int64_t n_embd, int row, 
 
 /* layer_types is optional. When present it must name EVERY layer "full_attention" or
  * "sliding_attention"; when absent the (l + 1) % interval == 0 fallback is the model card. */
+static int g4_parse_types(const char* lt, int64_t n, std::vector<int>& is_global) {
+    is_global.assign((size_t)n, -1);
+    size_t got = 0;
+    const char* p = lt;
+    while (*p) {
+        if (!std::strncmp(p, "full_attention", 14)) {
+            if (got >= (size_t)n) return RAD_E_INVAL;
+            is_global[got++] = 1; p += 14;
+        } else if (!std::strncmp(p, "sliding_attention", 17)) {
+            if (got >= (size_t)n) return RAD_E_INVAL;
+            is_global[got++] = 0; p += 17;
+        } else {
+            ++p;   /* separators: whitespace, quotes, [ ] , and / */
+        }
+    }
+    if (got != (size_t)n) return RAD_E_INVAL;
+    for (size_t i = 0; i < is_global.size(); ++i) if (is_global[i] < 0) return RAD_E_INVAL;
+    return RAD_OK;
+}
+
 static int g4_schedule(const RadModelMeta* m, int64_t n, int64_t interval,
                        std::vector<int>& is_global) {
     const char* lt = rad_meta_gets(m, "layer_types", rad_meta_gets(m, "text_config.layer_types", nullptr));
     is_global.assign((size_t)n, 0);
     if (lt && *lt) {
-        is_global.assign((size_t)n, -1);
-        size_t got = 0;
-        const char* p = lt;
-        while (*p) {
-            if (!std::strncmp(p, "full_attention", 14)) {
-                if (got >= (size_t)n) return RAD_E_INVAL;
-                is_global[got++] = 1; p += 14;
-            } else if (!std::strncmp(p, "sliding_attention", 17)) {
-                if (got >= (size_t)n) return RAD_E_INVAL;
-                is_global[got++] = 0; p += 17;
-            } else {
-                ++p;   /* separators: whitespace, quotes, [ ] , and / */
-            }
-        }
-        if (got != (size_t)n) return RAD_E_INVAL;
-        for (size_t i = 0; i < is_global.size(); ++i) if (is_global[i] < 0) return RAD_E_INVAL;
+        RAD_ARCH_TRY(g4_parse_types(lt, n, is_global));
     } else {
         if (interval <= 0) {
             fprintf(stderr, "radiance: gemma4: no layer_types and invalid full_attention_interval %lld\n",
@@ -527,6 +532,497 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_add,   brows(w.x, T),   brows(w.h, T),  brows(w.x, T));
 }
 
+/* ==================================================================== the assistant head
+ *
+ * GEMMA 4'S DRAFT HEAD, the "assistant" (Gemma4AssistantForCausalLM), merged under `draft.` by
+ * `rad-convert --draft-model <gemma-4-*-it-assistant>`. Read off the checkpoint and three reference
+ * implementations -- transformers' modeling_gemma4_assistant.py with its candidate generator,
+ * vLLM's gemma4_mtp.py with spec_decode/gemma4.py, and llama.cpp's gemma4-assistant.cpp:
+ *
+ *     x  = pre_projection( concat( E_trunk[tok] * sqrt(n_trunk), h_trunk ) )        2*n_trunk -> n
+ *     x  = the head's layers over x (31B: sliding, sliding, sliding, full)
+ *     hd = norm(x)
+ *     logits = lm_head(hd)       the head's OWN table, tied to its embed_tokens; no soft-cap
+ *     h' = post_projection(hd)                                                       n -> n_trunk
+ *
+ * `h_trunk` is the trunk's FINAL-NORMED hidden state -- the trunk lm_head's input -- and `E_trunk`
+ * the trunk's embedding table, scaled the way the trunk scales it. The head's own embed_tokens is
+ * its lm_head and nothing else (vLLM swaps the trunk's table in for the input side). The
+ * concatenation is the embedding FIRST, then the hidden state; all three references agree.
+ *
+ * A LAYER IS A TRUNK LAYER WITH THE KEY AND VALUE TAKEN AWAY: q_proj, the per-head q norm, the
+ * rotary of its class, attention over the TRUNK'S cache at scale 1, o_proj, the same four
+ * plain-gain norms, the GELU feed-forward and the per-layer scalar. Each layer reads the LAST trunk
+ * layer of its own class -- the sliding ones the last sliding layer, the full one the last full
+ * layer, 58 and 59 on the 31B (vLLM's _setup_gemma4_kv_sharing). So the head's q heads and the
+ * trunk's kv heads must be the same geometry, and declare checks that they are.
+ *
+ * IT KEEPS NO CACHE OF ITS OWN, and that is what the core is told (rad_drafter_shared_kv): no
+ * history pass, one row a drafting sequence, every round at the committed position over the
+ * committed context. Round 1's row embeds the token the trunk chose and continues from the trunk's
+ * hidden state; round r embeds round r-1's proposal and continues from its h'. What the head
+ * proposed reaches the next round through those two and nothing else -- which is the whole design
+ * of the head, not a shortcut taken here.
+ *
+ * THE TENSOR-PARALLEL SPLIT IS THE TRUNK'S: q heads row-sharded over the ranks, so each rank's
+ * queries meet its own share of the trunk's kv heads; o_proj and the feed-forward down projection
+ * column-sharded, each followed by an all-reduce BEFORE its post-norm (the norm of a partial sum is
+ * not the partial of a norm). The two projections and every norm are replicated: they read and
+ * write the replicated stream, and a split would cost an all-reduce to save a few MiB. The lm_head
+ * is vocab-sharded like the trunk's and goes through the same sampler chain, greedy. */
+/* Where the head's rows sit for the rotary, relative to the committed position
+ * (rad_drafter_shared_kv), and the depth `--num-speculative-tokens auto` takes. */
+static constexpr int kHeadPosOffset = 0;
+static constexpr int kHeadDepth     = 3;
+
+struct Gemma4Head {
+    struct HLayer {
+        bool        global = false;
+        int         trunk_layer = 0;   /* the trunk layer whose cache this layer reads */
+        rad_kvgroup kv = 0;
+        ClassGeom   cls{};
+        rad_buf     q = 0, attn = 0;   /* the class's own rows: the two widths differ */
+        rad_weight  w_norm = 0, w_qn = 0, w_post = 0, w_fnorm = 0, w_fpost = 0, w_scalar = 0;
+        G4Linear    ln_q{}, ln_o{}, ln_gu{}, ln_down{};
+        rad_op      op_norm = 0, op_qn = 0, op_rq = 0, op_attn = 0, op_ar = 0, op_post = 0,
+                    op_add = 0, op_fnorm = 0, op_act = 0, op_far = 0, op_fpost = 0, op_fadd = 0,
+                    op_scale = 0;
+    };
+
+    Geom    g{};            /* the trunk's, with max_tok cut to the head's rows */
+    int64_t n = 0;          /* the head's width (1024 on the 31B) */
+    int64_t n_trunk = 0;    /* the trunk's width, which the two projections join */
+    int64_t n_ff = 0;       /* this rank's share of the feed-forward */
+    int64_t rows = 0;       /* the most rows one pass carries: one a drafting sequence */
+    double  softcap = 0.0;  /* 0: none, which is what the 31B's head says */
+    std::vector<HLayer> layers;
+
+    rad_buf src = 0;        /* the trunk's final-normed hidden state, [max_tok, n_trunk] */
+    rad_buf logits = 0;     /* the trunk's logits plane: the sampler reads the head's from it */
+    rad_buf b_c = 0, b_e = 0, b_x = 0, b_h = 0, b_gu = 0, b_ffn = 0, b_hd = 0, b_hn = 0;
+    rad_weight w_tok = 0, w_norm = 0, w_lm = 0;
+    G4Linear   ln_pre{}, ln_post{};
+    rad_op op_hsrc = 0, op_hcopy = 0, op_embed = 0, op_embed_ar = 0, op_ecopy = 0, op_norm = 0,
+           op_logits = 0, op_cap = 0;
+
+    int  declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, const Geom& trunk,
+                 const ClassGeom& cs, const ClassGeom& cg, rad_kvgroup kv_s, rad_kvgroup kv_g,
+                 int last_sliding, int last_full, int64_t n_main, rad_weight tok_embd,
+                 rad_buf trunk_h, rad_buf trunk_logits);
+    void step(RadCtx* c, const RadBatch* batch) const;
+};
+
+/* A `draft.` key under the head's text config, where Gemma4AssistantConfig nests every dimension,
+ * or at the top of it. */
+static long long hd_i(const RadModelMeta* m, const char* k, long long d) {
+    long long v = rad_meta_geti(m, (std::string("draft.text_config.") + k).c_str(), -0x7FFFFFFFll);
+    return v != -0x7FFFFFFFll ? v : rad_meta_geti(m, (std::string("draft.") + k).c_str(), d);
+}
+static double hd_f(const RadModelMeta* m, const char* k, double d) {
+    const double nan = std::nan("");
+    double v = rad_meta_getf(m, (std::string("draft.text_config.") + k).c_str(), nan);
+    return std::isnan(v) ? rad_meta_getf(m, (std::string("draft.") + k).c_str(), d) : v;
+}
+
+/* Does the container carry an assistant head at all? */
+static bool has_assistant(const RadModelMeta* m) {
+    const char* a = rad_meta_gets(m, "draft.architectures", "");
+    return a && std::strstr(a, "Gemma4Assistant") != nullptr;
+}
+
+int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, const Geom& trunk,
+                        const ClassGeom& cs, const ClassGeom& cg, rad_kvgroup kv_s,
+                        rad_kvgroup kv_g, int last_sliding, int last_full, int64_t n_main,
+                        rad_weight tok_embd, rad_buf trunk_h, rad_buf trunk_logits) {
+    g = trunk;
+    rows = trunk.max_seqs > 0 ? trunk.max_seqs : 1;
+    g.max_tok = rows;
+    src = trunk_h;
+    logits = trunk_logits;
+    w_tok = tok_embd;
+
+    /* ---- the head's own geometry, and what it must share with the trunk's. */
+    n       = hd_i(meta, "hidden_size", 0);
+    n_trunk = rad_meta_geti(meta, "draft.backbone_hidden_size", 0);
+    const long long n_l      = hd_i(meta, "num_hidden_layers", 0);
+    const long long n_h      = hd_i(meta, "num_attention_heads", 0);
+    const long long n_kv     = hd_i(meta, "num_key_value_heads", 0);
+    const long long n_kv_g   = hd_i(meta, "num_global_key_value_heads", n_kv);
+    const long long head_s   = hd_i(meta, "head_dim", 0);
+    const long long head_g   = hd_i(meta, "global_head_dim", head_s);
+    const long long ff       = hd_i(meta, "intermediate_size", 0);
+    const long long win      = hd_i(meta, "sliding_window", 0);
+    const long long vocab    = hd_i(meta, "vocab_size", 0);
+    const long long ordered  = rad_meta_geti(meta, "draft.use_ordered_embeddings", 0);
+    const double    eps      = hd_f(meta, "rms_norm_eps", 0.0);
+    const double    theta_s  = hd_f(meta, "rope_parameters.sliding_attention.rope_theta", 0.0);
+    const double    theta_g  = hd_f(meta, "rope_parameters.full_attention.rope_theta", 0.0);
+    double          prf      = hd_f(meta, "rope_parameters.full_attention.partial_rotary_factor", -1.0);
+    softcap = hd_f(meta, "final_logit_softcapping", 0.0);
+    if (!(prf > 0.0)) prf = 1.0;
+
+    if (n <= 0 || n_l <= 0 || n_h <= 0 || ff <= 0 || !(eps > 0.0)) {
+        fprintf(stderr, "radiance: gemma4 assistant: the `draft.` config is incomplete (hidden %lld, "
+                        "layers %lld, heads %lld, ffn %lld, eps %g)\n",
+                (long long)n, n_l, n_h, ff, eps);
+        return RAD_E_INVAL;
+    }
+    /* IT READS THE TRUNK'S CACHE, so everything the cache's shape depends on must agree: the two
+     * head widths, the two kv head counts and the window. A head that disagrees was trained beside
+     * another trunk, and its attention would read keys that are not the ones it learned against. */
+    if (n_trunk != trunk.n_embd || vocab != trunk.n_vocab_all || head_s != cs.head_dim ||
+        head_g != cg.head_dim || n_kv != cs.n_head_kv * trunk.world ||
+        n_kv_g != cg.n_head_kv * trunk.world || win != cs.window) {
+        fprintf(stderr, "radiance: gemma4 assistant: this head was not made for this trunk -- it "
+                        "states width %lld, vocabulary %lld, heads %lld/%lld x %lld/%lld kv over a "
+                        "window of %lld; the trunk's cache is %lld/%lld kv heads of %lld/%lld over "
+                        "%lld, at width %lld and vocabulary %lld\n",
+                (long long)n_trunk, vocab, n_kv, n_kv_g, head_s, head_g, win,
+                (long long)(cs.n_head_kv * trunk.world), (long long)(cg.n_head_kv * trunk.world),
+                (long long)cs.head_dim, (long long)cg.head_dim, (long long)cs.window,
+                (long long)trunk.n_embd, (long long)trunk.n_vocab_all);
+        return RAD_E_INVAL;
+    }
+    /* THE QUERIES MUST ROTATE AS THE TRUNK'S KEYS DID, or q.k measures the wrong distance. */
+    const int64_t rot_g = (int64_t)(head_g * prf + 0.5);
+    if (theta_s != cs.theta || theta_g != cg.theta || rot_g != cg.n_rot) {
+        fprintf(stderr, "radiance: gemma4 assistant: its rotary (theta %g / %g, %lld of %lld global "
+                        "dims) is not the trunk's (%g / %g, %lld): its queries would meet the "
+                        "trunk's keys at the wrong angle\n",
+                theta_s, theta_g, (long long)rot_g, head_g, cs.theta, cg.theta,
+                (long long)cg.n_rot);
+        return RAD_E_INVAL;
+    }
+    /* CENTROID MASKING (use_ordered_embeddings) scores a top-k of vocabulary clusters instead of
+     * the whole head. The 31B's head does not use it, and nothing here implements it; refusing is
+     * better than a head that scores every token while its checkpoint expects a mask. */
+    if (ordered) {
+        fprintf(stderr, "radiance: gemma4 assistant: use_ordered_embeddings (centroid-masked logits) "
+                        "is not implemented\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    int64_t nh = 0;
+    if (divide_or_fail(n_h, trunk.world, "draft num_attention_heads", &nh) < 0) return RAD_E_INVAL;
+    if (divide_or_fail(ff, trunk.world, "draft intermediate_size", &n_ff) < 0) return RAD_E_INVAL;
+    if (nh % cs.n_head_kv || nh % cg.n_head_kv) {
+        fprintf(stderr, "radiance: gemma4 assistant: %lld query heads a rank do not group over %lld "
+                        "sliding / %lld global kv heads\n",
+                (long long)nh, (long long)cs.n_head_kv, (long long)cg.n_head_kv);
+        return RAD_E_INVAL;
+    }
+
+    /* The layer schedule: `layer_types` names every layer, as the trunk's does. */
+    std::vector<int> is_global;
+    {
+        const char* lt = rad_meta_gets(meta, "draft.text_config.layer_types",
+                                       rad_meta_gets(meta, "draft.layer_types", nullptr));
+        if (!lt || !*lt || g4_parse_types(lt, n_l, is_global) < 0) {
+            fprintf(stderr, "radiance: gemma4 assistant: the `draft.` config's layer_types does not "
+                            "name its %lld layers\n", n_l);
+            return RAD_E_INVAL;
+        }
+    }
+
+    const int64_t base = n_main;   /* the head's weight groups, past the trunk's layers */
+    g.eps = (float)eps;
+
+    /* ---- the rows. The two classes keep their own query and attention rows, as in the trunk. */
+    ClassGeom hs = cs; hs.n_head = nh;
+    ClassGeom hgc = cg; hgc.n_head = nh;
+    b_c   = decl_b(b, nm.f("mtp_c"),   g.act_dtype, {rows, 2 * n_trunk});
+    b_e   = decl_b(b, nm.f("mtp_e"),   g.act_dtype, {rows, n_trunk});
+    b_x   = decl_b(b, nm.f("mtp_x"),   g.act_dtype, {rows, n});
+    b_h   = decl_b(b, nm.f("mtp_h"),   g.act_dtype, {rows, n});
+    b_gu  = decl_b(b, nm.f("mtp_gu"),  g.act_dtype, {rows, 2 * n_ff});
+    b_ffn = decl_b(b, nm.f("mtp_ffn"), g.act_dtype, {rows, n_ff});
+    b_hd  = decl_b(b, nm.f("mtp_hd"),  g.act_dtype, {rows, n});
+    b_hn  = decl_b(b, nm.f("mtp_hn"),  g.act_dtype, {rows, n_trunk});
+    const rad_buf q_s = decl_b(b, nm.f("mtp_qs"), g.act_dtype, {rows, hs.q_dim()});
+    const rad_buf a_s = decl_b(b, nm.f("mtp_as"), g.act_dtype, {rows, hs.q_dim()});
+    const rad_buf q_g = decl_b(b, nm.f("mtp_qg"), g.act_dtype, {rows, hgc.q_dim()});
+    const rad_buf a_g = decl_b(b, nm.f("mtp_ag"), g.act_dtype, {rows, hgc.q_dim()});
+
+    /* ---- the entry: the trunk's hidden state into the right half of `c`, the trunk's scaled
+     * embedding into the left. A history pass gathers the hidden state from the trunk's rows; a
+     * round copies the head's own h' from the round before. Both write the half in place: a
+     * gather and a cast read their destination's row pitch off the operand. */
+    op_hsrc = rw(b, RAD_OP(b, "gather_rows",
+                   RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n_trunk), RAD_STR("dtype", g.dtype)),
+                   RAD_NOWEIGHTS),
+                 {src}, {b_c});
+    op_hcopy = rw(b, RAD_OP(b, "cast",
+                    RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n_trunk),
+                               RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                    RAD_NOWEIGHTS),
+                  {b_hn}, {b_c});
+    op_embed = rw(b, RAD_OP(b, "embed_lookup",
+                    RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_embd", n_trunk),
+                               RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                               RAD_INT("vocab_offset", g.vocab_off),
+                               RAD_F64("mult", std::sqrt((double)n_trunk))),
+                    RAD_WEIGHTS(w_tok)),
+                  {}, {b_e});
+    if (g.world > 1)
+        op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
+                             RAD_PARAMS(RAD_INT("world_size", g.world),
+                                        RAD_RANGE("numel", n_trunk, rows * n_trunk),
+                                        RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
+                             RAD_NOWEIGHTS),
+                         {b_e}, {b_e});
+    op_ecopy = rw(b, RAD_OP(b, "cast",
+                    RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n_trunk),
+                               RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                    RAD_NOWEIGHTS),
+                  {b_e}, {b_c});
+    if (!op_hsrc || !op_hcopy || !op_embed || !op_ecopy) return RAD_E_INVAL;
+
+    /* pre_projection: the joined row to the head's width. Replicated: it reads and writes the
+     * replicated stream. */
+    RAD_ARCH_TRY(ln_pre.declare(b, nm, g, nm.f("mtp.pre_proj"), { nm.ckpt("draft.pre_projection.weight") },
+                                n, 2 * n_trunk, RAD_SHARD_NONE, grp_layer((int)(base + n_l)),
+                                b_c, b_x));
+
+    /* ---- the layers. */
+    layers.resize((size_t)n_l);
+    for (int64_t l = 0; l < n_l; ++l) {
+        HLayer& L = layers[(size_t)l];
+        const int gl = (int)(base + l);
+        L.global = is_global[(size_t)l] == 1;
+        L.cls = L.global ? hgc : hs;
+        L.trunk_layer = L.global ? last_full : last_sliding;
+        L.kv = L.global ? kv_g : kv_s;
+        L.q = L.global ? q_g : q_s;
+        L.attn = L.global ? a_g : a_s;
+        if (L.trunk_layer < 0) {
+            fprintf(stderr, "radiance: gemma4 assistant: layer %lld reads a %s trunk layer and the "
+                            "trunk has none\n", (long long)l, L.global ? "full" : "sliding");
+            return RAD_E_INVAL;
+        }
+        const char* pre = "draft.model.layers";
+        RAD_ARCH_TRY(map_copy(b, nm.f("mtp.blk.%lld.attn_norm.weight", (long long)l),
+                              nm.ckpt("%s.%lld.input_layernorm.weight", pre, (long long)l)));
+        RAD_ARCH_TRY(map_copy(b, nm.f("mtp.blk.%lld.attn_q_norm.weight", (long long)l),
+                              nm.ckpt("%s.%lld.self_attn.q_norm.weight", pre, (long long)l)));
+        RAD_ARCH_TRY(map_copy(b, nm.f("mtp.blk.%lld.attn_post_norm.weight", (long long)l),
+                              nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l)));
+        RAD_ARCH_TRY(map_copy(b, nm.f("mtp.blk.%lld.ffn_norm.weight", (long long)l),
+                              nm.ckpt("%s.%lld.pre_feedforward_layernorm.weight", pre, (long long)l)));
+        RAD_ARCH_TRY(map_copy(b, nm.f("mtp.blk.%lld.ffn_post_norm.weight", (long long)l),
+                              nm.ckpt("%s.%lld.post_feedforward_layernorm.weight", pre, (long long)l)));
+        RAD_ARCH_TRY(map_copy(b, nm.f("mtp.blk.%lld.layer_scalar", (long long)l),
+                              nm.ckpt("%s.%lld.layer_scalar", pre, (long long)l)));
+        L.w_norm   = decl_w(b, nm.f("mtp.blk.%lld.attn_norm.weight", (long long)l), RAD_BF16, {n},
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(gl));
+        L.w_qn     = decl_w(b, nm.f("mtp.blk.%lld.attn_q_norm.weight", (long long)l), RAD_BF16,
+                            {L.cls.head_dim}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(gl));
+        L.w_post   = decl_w(b, nm.f("mtp.blk.%lld.attn_post_norm.weight", (long long)l), RAD_BF16, {n},
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(gl));
+        L.w_fnorm  = decl_w(b, nm.f("mtp.blk.%lld.ffn_norm.weight", (long long)l), RAD_BF16, {n},
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(gl));
+        L.w_fpost  = decl_w(b, nm.f("mtp.blk.%lld.ffn_post_norm.weight", (long long)l), RAD_BF16, {n},
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(gl));
+        L.w_scalar = decl_w(b, nm.f("mtp.blk.%lld.layer_scalar", (long long)l), RAD_BF16, {1},
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(gl));
+
+        RAD_ARCH_TRY(L.ln_q.declare(b, nm, g, nm.f("mtp.blk.%lld.attn_q", (long long)l),
+                                    { nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l) },
+                                    L.cls.q_dim(), n, RAD_SHARD_ROW, grp_layer(gl), b_h, L.q));
+        RAD_ARCH_TRY(L.ln_o.declare(b, nm, g, nm.f("mtp.blk.%lld.attn_o", (long long)l),
+                                    { nm.ckpt("%s.%lld.self_attn.o_proj.weight", pre, (long long)l) },
+                                    n, L.cls.q_dim(), RAD_SHARD_COL, grp_layer(gl), L.attn, b_h));
+        RAD_ARCH_TRY(L.ln_gu.declare(b, nm, g, nm.f("mtp.blk.%lld.ffn_gate_up", (long long)l),
+                                     { nm.ckpt("%s.%lld.mlp.gate_proj.weight", pre, (long long)l),
+                                       nm.ckpt("%s.%lld.mlp.up_proj.weight",   pre, (long long)l) },
+                                     2 * n_ff, n, RAD_SHARD_ROW, grp_layer(gl), b_h, b_gu,
+                                     { n_ff, n_ff }));
+        RAD_ARCH_TRY(L.ln_down.declare(b, nm, g, nm.f("mtp.blk.%lld.ffn_down", (long long)l),
+                                       { nm.ckpt("%s.%lld.mlp.down_proj.weight", pre, (long long)l) },
+                                       n, n_ff, RAD_SHARD_COL, grp_layer(gl), b_ffn, b_h));
+
+        L.op_norm = rw(b, RAD_OP(b, "rmsnorm",
+                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
+                                    RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                         RAD_WEIGHTS(L.w_norm)),
+                       {b_x}, {b_h});
+        L.op_qn = rw(b, RAD_OP(b, "rmsnorm",
+                       RAD_PARAMS(RAD_RANGE("M", 1, rows * L.cls.n_head), RAD_INT("n", L.cls.head_dim),
+                                  RAD_F64("eps", eps), RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                       RAD_WEIGHTS(L.w_qn)),
+                     {L.q}, {L.q});
+        L.op_rq = rw(b, RAD_OP(b, "rope",
+                       RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("head_dim", L.cls.head_dim),
+                                  RAD_INT("n_head", L.cls.n_head), RAD_INT("n_head_kv", 0),
+                                  RAD_F64("theta", L.cls.theta), RAD_F64("scale", L.cls.scale),
+                                  RAD_STR("mode", "neox"), RAD_INT("rotary_dim", L.cls.n_rot),
+                                  RAD_STR("ladder", L.cls.head_ladder ? "head" : "rotary")),
+                       RAD_NOWEIGHTS),
+                     {L.q}, {L.q});
+        /* ONE QUERY ROW A SEQUENCE over the trunk's cache, at scale 1 like the trunk's. The
+         * context is the committed positions (the core's doing: rad_drafter_shared_kv), so the
+         * decode band is the only band there is. */
+        L.op_attn = rw(b, RAD_OP(b, "attn_paged",
+                         RAD_PARAMS(RAD_RANGE("q_len", 1, 1), RAD_INT("head_dim", L.cls.head_dim),
+                                    RAD_INT("gqa", L.cls.gqa()), RAD_INT("causal", 1),
+                                    RAD_INT("window", L.cls.window), RAD_INT("n_head", L.cls.n_head),
+                                    RAD_INT("block_size", RAD_KV_BLOCK), RAD_INT("max_seqs", rows),
+                                    RAD_INT("max_ctx", g.max_ctx), RAD_F64("scale", 1.0),
+                                    RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                         RAD_NOWEIGHTS),
+                       {L.q}, {L.attn});
+        if (g.world > 1)
+            L.op_ar = rw(b, RAD_OP(b, "all_reduce",
+                            RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", n, rows * n),
+                                       RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                                       RAD_INT("min_bytes", g.wire_min_bytes)),
+                            RAD_NOWEIGHTS),
+                         {b_h}, {b_h});
+        L.op_post = rw(b, RAD_OP(b, "rmsnorm",
+                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
+                                    RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                         RAD_WEIGHTS(L.w_post)),
+                       {b_h}, {b_h});
+        L.op_add = rw(b, RAD_OP(b, "add",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS),
+                      {b_x, b_h}, {b_x});
+        L.op_fnorm = rw(b, RAD_OP(b, "rmsnorm",
+                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
+                                     RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                          RAD_WEIGHTS(L.w_fnorm)),
+                        {b_x}, {b_h});
+        L.op_act = rw(b, RAD_OP(b, "gelu_mul",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n_ff), RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS),
+                      {b_gu}, {b_ffn});
+        if (g.world > 1)
+            L.op_far = rw(b, RAD_OP(b, "all_reduce",
+                             RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", n, rows * n),
+                                        RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                                        RAD_INT("min_bytes", g.wire_min_bytes)),
+                             RAD_NOWEIGHTS),
+                          {b_h}, {b_h});
+        L.op_fpost = rw(b, RAD_OP(b, "rmsnorm",
+                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
+                                     RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                          RAD_WEIGHTS(L.w_fpost)),
+                        {b_h}, {b_h});
+        L.op_fadd = rw(b, RAD_OP(b, "add",
+                         RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
+                         RAD_NOWEIGHTS),
+                       {b_x, b_h}, {b_x});
+        L.op_scale = rw(b, RAD_OP(b, "scale",
+                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_STR("dtype", g.dtype)),
+                          RAD_WEIGHTS(L.w_scalar)),
+                        {b_x}, {b_x});
+        if (!L.op_norm || !L.op_qn || !L.op_rq || !L.op_attn || !L.op_post || !L.op_add ||
+            !L.op_fnorm || !L.op_act || !L.op_fpost || !L.op_fadd || !L.op_scale ||
+            (g.world > 1 && (!L.op_ar || !L.op_far)))
+            return RAD_E_INVAL;
+    }
+
+    /* ---- the exit: the final norm, the head's own lm_head, and h' for the next round. */
+    RAD_ARCH_TRY(map_copy(b, nm.f("mtp.output_norm.weight"), nm.ckpt("draft.model.norm.weight")));
+    RAD_ARCH_TRY(map_copy(b, nm.f("mtp.output.weight"), nm.ckpt("draft.model.embed_tokens.weight")));
+    w_norm = decl_w(b, nm.f("mtp.output_norm.weight"), RAD_BF16, {n}, RAD_ACCESS_PER_TOKEN,
+                    RAD_SHARD_NONE, grp_layer((int)(base + n_l)));
+    /* VOCAB-SHARDED, LIKE THE TRUNK'S: the draft's logits go through the same sampler chain, which
+     * merges the ranks' candidate sets, so a rank holds its own slice of the vocabulary. Declared
+     * at its codes' dtype: bf16 as Google ships it, or int8 / block fp8 where a recipe makes it so,
+     * and the logits_gemm kernel that reads that encoding serves it. It is the largest read of a
+     * round, and a draft is only a proposal: the trunk verifies every token with its own head. */
+    w_lm = decl_w(b, nm.f("mtp.output.weight"), weight_codes_dtype(b, nm.f("mtp.output.weight"), RAD_BF16),
+                  {g.n_vocab, n}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_layer((int)(base + n_l)));
+    op_norm = rw(b, RAD_OP(b, "rmsnorm",
+                   RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", eps),
+                              RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                   RAD_WEIGHTS(w_norm)),
+                 {b_x}, {b_hd});
+    op_logits = rw(b, RAD_OP(b, "logits_gemm",
+                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_vocab", g.n_vocab),
+                                RAD_INT("n_embd", n), RAD_STR("dtype", g.dtype)),
+                     RAD_WEIGHTS(w_lm)),
+                   {b_hd}, {logits});
+    if (softcap > 0.0)
+        op_cap = rw(b, RAD_OP(b, "logit_softcap",
+                      RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_vocab),
+                                 RAD_F64("cap", softcap), RAD_STR("dtype", "f32")),
+                      RAD_NOWEIGHTS),
+                    {logits}, {logits});
+    if (!op_norm || !op_logits || (softcap > 0.0 && !op_cap)) return RAD_E_INVAL;
+    /* post_projection LAST: h' is the next round's input, and the op that reads it (op_hcopy) is
+     * the head's first. Declared here, its life runs the whole head, so no op of a pass can be laid
+     * over it before the round after has read it. */
+    RAD_ARCH_TRY(ln_post.declare(b, nm, g, nm.f("mtp.post_proj"), { nm.ckpt("draft.post_projection.weight") },
+                                 n_trunk, n, RAD_SHARD_NONE, grp_layer((int)(base + n_l)),
+                                 b_hd, b_hn));
+
+    rad_note(b, "the assistant head is declared: %lld layer(s) of width %lld at absolute %lld..%lld, "
+                "reading the trunk's cache at layer %d (sliding) and %d (full); no cache of its own, "
+                "every round at the committed position",
+             (long long)n_l, (long long)n, (long long)base, (long long)(base + n_l - 1),
+             last_sliding, last_full);
+    return RAD_OK;
+}
+
+/* One pass. The batch is the one the scheduler staged for a head with no cache of its own: one row
+ * a drafting sequence, at the committed position, its context ending there. */
+void Gemma4Head::step(RadCtx* c, const RadBatch* batch) const {
+    const int64_t T = batch->n_tok;
+    if (T <= 0) return;
+    if (batch->draft_pass < 0) {
+        /* Every row of the pass is a drafting row: that is what rad_drafter_shared_kv asked the
+         * scheduler for. Anything else is a batch built for a head with a cache of its own. */
+        if (batch->n_draft_out != T || batch->n_out != T) {
+            rad_step_fail(c, "the gemma4 assistant head was handed a history pass that is not one row "
+                             "a drafting sequence; it keeps no cache of its own and drafts from that "
+                             "shape only (rad_drafter_shared_kv)");
+            return;
+        }
+        RAD_ISSUE_N(c, op_hsrc, T, RAD_B(src), praw(batch->out_ids, RAD_I32, T),
+                    bcol(b_c, n_trunk, n_trunk, T));
+    } else {
+        RAD_ISSUE_N(c, op_hcopy, T, brows(b_hn, T), bcol(b_c, n_trunk, n_trunk, T));
+    }
+    RAD_ISSUE(c, op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(b_e, T));
+    if (op_embed_ar) RAD_ISSUE_N(c, op_embed_ar, T * n_trunk, brows(b_e, T), RAD_NONE);
+    RAD_ISSUE_N(c, op_ecopy, T, brows(b_e, T), bcol(b_c, 0, n_trunk, T));
+    ln_pre.step(c, b_c, b_x, T);
+
+    for (const HLayer& L : layers) {
+        const RadKVGroupBatch* kvb = kv_batch(batch, L.kv);
+        RAD_ISSUE(c, L.op_norm, brows(b_x, T), RAD_W(L.w_norm), brows(b_h, T));
+        L.ln_q.step(c, b_h, L.q, T);
+        RAD_ISSUE_N(c, L.op_qn, T * L.cls.n_head, brows(L.q, T), RAD_W(L.w_qn), brows(L.q, T));
+        RAD_ISSUE(c, L.op_rq, brows(L.q, T), rope_posmc(g, batch, T));
+        RAD_ISSUE_N(c, L.op_attn, batch->max_q_len,
+                    brows(L.q, T), kv_cache(L.kv, L.trunk_layer),
+                    praw2(kvb ? kvb->block_table : nullptr, RAD_I32, batch->n_seq,
+                          kvb ? kvb->block_table_pitch : 0),
+                    praw(kvb ? kvb->seqused : nullptr, RAD_I32, batch->n_seq),
+                    RAD_NONE, RAD_NONE,
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                    brows(L.attn, T));
+        L.ln_o.step(c, L.attn, b_h, T);
+        if (L.op_ar) RAD_ISSUE_N(c, L.op_ar, T * n, brows(b_h, T), RAD_NONE);
+        RAD_ISSUE_N(c, L.op_post, T, brows(b_h, T), RAD_W(L.w_post), brows(b_h, T));
+        RAD_ISSUE(c, L.op_add, brows(b_x, T), brows(b_h, T), brows(b_x, T));
+
+        RAD_ISSUE(c, L.op_fnorm, brows(b_x, T), RAD_W(L.w_fnorm), brows(b_h, T));
+        L.ln_gu.step(c, b_h, b_gu, T);
+        RAD_ISSUE(c, L.op_act, brows(b_gu, T), brows(b_ffn, T));
+        L.ln_down.step(c, b_ffn, b_h, T);
+        if (L.op_far) RAD_ISSUE_N(c, L.op_far, T * n, brows(b_h, T), RAD_NONE);
+        RAD_ISSUE_N(c, L.op_fpost, T, brows(b_h, T), RAD_W(L.w_fpost), brows(b_h, T));
+        RAD_ISSUE(c, L.op_fadd, brows(b_x, T), brows(b_h, T), brows(b_x, T));
+        RAD_ISSUE(c, L.op_scale, brows(b_x, T), RAD_W(L.w_scalar), brows(b_x, T));
+    }
+
+    RAD_ISSUE(c, op_norm, brows(b_x, T), RAD_W(w_norm), brows(b_hd, T));
+    RAD_ISSUE_N(c, op_logits, T, brows(b_hd, T), RAD_W(w_lm), brows(logits, T));
+    if (op_cap) RAD_ISSUE_N(c, op_cap, T, brows(logits, T), brows(logits, T));
+    ln_post.step(c, b_hd, b_hn, T);
+}
+
 struct Layer {
     bool       global = false;
     Gemma4Attn attn{};
@@ -556,6 +1052,11 @@ struct Model {
 
     uint16_t* trc = nullptr;   /* pinned ring [n_main+1][TRC_SITES][n_embd] bf16; set only when tracing */
     bool      trc_done = false;
+
+    /* The assistant head, declared only when the container carries one and the deployment
+     * speculates (`max_spec` > 0). */
+    Gemma4Head head{};
+    bool       have_head = false;
 };
 
 static Model g_model[MAX_RANKS];
@@ -809,6 +1310,30 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                       RAD_NOWEIGHTS),
                      {m.b_logits}, {m.b_logits});
 
+    /* ---- the assistant head, when the container carries one (`rad-convert --draft-model`) and
+     * the deployment speculates. A container converted without it, or a serve at max_spec 0,
+     * declares none of it: half a gigabyte of weights stays off the card. */
+    if (ctx->max_spec > 0 && has_assistant(meta)) {
+        int last_s = -1, last_f = -1;
+        for (int64_t l = 0; l < m.n_main; ++l) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
+        RAD_ARCH_TRY(m.head.declare(b, nm, meta, g, m.cs, m.cg, m.kv_s, m.kv_g, last_s, last_f,
+                                    m.n_main, m.w_tok, m.b_h, m.b_logits));
+        m.have_head = true;
+
+        /* WHAT THE ENGINE DRIVES. Serial: `max_spec` dependent passes, each embedding what the
+         * last one proposed, through the ordinary sampler chain (proposal 0) -- and a head with no
+         * cache of its own, so the core stages every pass at the committed position. */
+        RadDrafterDecl dd{};
+        dd.name           = "mtp";
+        dd.kind           = RAD_DRAFT_SERIAL;
+        dd.depth          = ctx->max_spec;
+        dd.proposal       = 0;
+        dd.proposal_pitch = 1;
+        dd.mask_token     = -1;
+        RAD_ARCH_TRY(rad_declare_drafter(b, &dd));
+        RAD_ARCH_TRY(rad_drafter_shared_kv(b, kHeadPosOffset));
+    }
+
     rad_note(b, "rank %d/%d: %lld layers (%lld global, %lld sliding), sliding window %lld, "
                 "slider %lld heads x %lld, global %lld heads x %lld, soft-capped logits",
              g.rank, g.world, (long long)g.n_layer, (long long)n_global,
@@ -827,6 +1352,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
+
+    /* A DRAFT PASS RUNS THE HEAD AND NOTHING ELSE. The trunk already ran this step and left its
+     * final-normed hidden state in `h`, which the head's history pass gathers from. */
+    if (batch->draft_pass != 0) {
+        if (!m.have_head) {
+            rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
+                             "container carries no `draft.` assistant, or declare ran at max_spec 0");
+            return;
+        }
+        m.head.step(c, batch);
+        return;
+    }
     /* Scan on every step from the second on: the ring holds the PREVIOUS step's rows. The
      * previous step's copies (x0 early, h_fin last) are drained HERE before the read: the
      * engine's step_end sync does not wait for the arch's out-of-band trc copies on the host
@@ -884,12 +1421,25 @@ static void step(RadCtx* c, const RadBatch* batch) {
 /* The reply format: gemma4_chat_format.h. */
 const RadChatFormat* chat_format(const RadModelMeta*) { return chat_format_decl(); }
 
+/* WHAT THIS CONTAINER'S HEAD IS WORTH SPECULATING TO, for `--num-speculative-tokens auto`. A serial
+ * head names an operating point, not a trained depth: one more round is one more pass of the head,
+ * and every depth still runs. */
+static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (!meta || !out) return RAD_E_INVAL;
+    if (has_assistant(meta)) {
+        out->draft_depth = kHeadDepth;
+        out->draft_depth_fixed = 0;
+    }
+    return RAD_OK;
+}
+
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
                 "Gemma 4 dense (text-only), w4a8 from its CT-INT4 (compressed-tensors) release: "
                 "sliding-window and proportional-RoPE global attention over a GemmaRMSNorm stream "
                 "with GELU feed-forward, per-layer scalar scaling and soft-capped logits")
 RAD_ARCH_CHAT_FORMAT(gemma4_bf16)
+RAD_ARCH_PROBE(gemma4_bf16)
 #endif
 
 }  /* namespace gemma4_bf16 */
