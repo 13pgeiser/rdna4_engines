@@ -1256,8 +1256,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * host-only), so an f32-declared output_norm would widen and fail to serve from the mapping. */
     m.w_out = decl_w(b, nm.f("output_norm.weight"), RAD_BF16, {g.n_embd},
                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    m.w_lm  = decl_w(b, nm.f("output.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+    /* DECLARED AT ITS CODES' DTYPE, as the assistant head's lm_head is: bf16 as the checkpoint ships
+     * it, or int8 / block fp8 where a recipe (`--quant output.weight=...`) makes it so, and the
+     * logits_gemm kernel for that encoding serves it. At a decode step it is the largest single read
+     * of the trunk (n_vocab x n_embd a rank), so its encoding is a direct share of the step. */
+    m.w_lm  = decl_w(b, nm.f("output.weight"), weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
+                     {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
 
     /* The embedding is scaled by sqrt(n_embd) at the LOOKUP, not baked into the table (the
      * reference's build_inp_embd and HF's ScaledWordEmbedding both do it there), and the
