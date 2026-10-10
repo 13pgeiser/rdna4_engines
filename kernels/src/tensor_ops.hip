@@ -418,7 +418,11 @@ static __device__ __forceinline__ float gdn_q8_halves_peak(
 // `kCapture` too (verify and its rollback), every earlier row also
 // requantizes at its own position, as single-row decode does, so the window
 // is token-exact with AR; the unarmed batch keeps one requantization.
-template <bool kCapture, bool kQ8 = false>
+// `kTokenQ8` (default `kCapture`): every row requantizes at its own position
+// as described above. The `canon_q8` entry sets it without `kCapture`: the
+// final state is stored to `state` (not a ring slot), so the result is the
+// token-canonical recurrence, independent of how rows split into launches.
+template <bool kCapture, bool kQ8 = false, bool kTokenQ8 = kCapture>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
     const float* gate,
@@ -631,7 +635,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             // state; the next row runs on that state requantized at the row's
             // own frame and dequantized (scale * code, the next decode's read).
             // The last row's requantization is the final store below.
-            if constexpr (kCapture && kQ8) {
+            if constexpr (kTokenQ8 && kQ8) {
                 if (row + 1 < rows) {
                     const float peak = gdn_q8_halves_peak(state_half, half, value_index);
                     const float inv = gdn_q8_inv(peak);
@@ -722,6 +726,19 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_captur
     gated_delta_step_persistent256_body<true, true>(projection, gate, beta, state, output,
         row_states, rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale,
         frame);
+}
+
+// Token-canonical Q8 prefill recurrence (`HIPFIRE_QWEN4_GDN_PREFILL=canon`):
+// the plain `_q8` signature and final store (`state`, no row ring), with the
+// capture kernel's per-row requantization at `frame - (rows - 1 - row)`.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_canon_q8(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    float* output, int rows, int qkv_width, int key_heads, int value_heads,
+    int key_dim, int value_dim, float query_scale, unsigned int frame) {
+    gated_delta_step_persistent256_body<false, true, true>(projection, gate, beta, state,
+        output, nullptr, rows, qkv_width, key_heads, value_heads, key_dim, value_dim,
+        query_scale, frame);
 }
 
 #if defined(__GFX12__)

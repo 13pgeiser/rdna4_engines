@@ -57,6 +57,10 @@ name = "qwen4_moe_sym"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_mq6_rows"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_trunk_iu4"
 required-features = ["lab"]
 

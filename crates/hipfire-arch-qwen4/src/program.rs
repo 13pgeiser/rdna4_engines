@@ -437,7 +437,10 @@ pub fn execute_lm_head(
     rotation: Option<&GpuTensor>,
 ) -> Result<(), DispatchError> {
     validate_lm_head(weight, hidden_batch, logits, rows, requested_rows)?;
-    if requested_rows == rows {
+    // Under the batch-invariant prefill profile a one-row head is the final-row
+    // head (the GEMV, never the routed GEMM), so a one-row forward and a longer
+    // forward's final row produce the same bytes.
+    if requested_rows == rows && (rows > 1 || !gpu.prefill_invariant_scope) {
         if weight.dtype == DType::F32 {
             return hip(gpu.gemm_f32_batched(
                 weight.buf,
@@ -624,17 +627,21 @@ fn require_dense_weight(
 /// Seal the architecture-bound MoE call before any operation in the layer
 /// step list can launch.  The returned call retains the shared sealed-MoE
 /// ownership/lifecycle contract; the architecture owns the surrounding
-/// operation order.
+/// operation order.  The decode-vs-prefill route is decided on `route_rows`
+/// (`Gpu::route_rows(rows)`: the canonical chunk under the invariant prefill
+/// profile, so a one-row prefill still seals the grouped prefill call);
+/// `rows` sizes the call.
 pub fn seal_moe_for_layer<'a>(
     ctx: &'a hipfire_dispatch::context::DispatchCtx,
     dims: Qwen4ProgramDims,
     layer: &Qwen4LayerDescription<'a>,
     scratch: &'a Qwen4LayerScratch<'a>,
     rows: usize,
+    route_rows: usize,
 ) -> Result<hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>, DispatchError> {
     let bound = BoundMoeExperts::from_cache(layer.moe.table, layer.moe.cache)
         .map_err(|error| DispatchError::Hip(format!("bound Qwen4 experts: {error:?}")))?;
-    if rows == 1 {
+    if route_rows == 1 {
         let params = build_moe_decode(dims, layer.moe, scratch.hc_mixed, scratch)?;
         seal_decode(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 decode MoE: {error:?}")))

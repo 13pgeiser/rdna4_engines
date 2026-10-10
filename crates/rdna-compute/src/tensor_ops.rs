@@ -11,6 +11,7 @@
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
 use crate::{DType, Gpu, GpuTensor};
+use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
 
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
@@ -519,14 +520,25 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
+    // `HIPFIRE_QWEN4_GDN_PREFILL=canon` (lab): a Q8 state inside the Qwen4
+    // forward (`Gpu::qwen4_scope`, so the arm also works with the invariant
+    // profile off) runs the token-canonical persistent recurrence, which
+    // requantizes every row at its own position and stores to `state`: the
+    // result no longer depends on how rows are split into launches.  An F32
+    // state keeps the persistent kernel (already token-exact).
+    let canon = p.row_states.is_none()
+        && format == GdnStateFormat::Q8
+        && gpu.qwen4_scope
+        && qwen4_gdn_prefill() == Qwen4GdnPrefill::Canon;
     // gfx1201 non-capture: the register-resident one-thread-per-column
     // recurrence (bitwise the persistent256 kernel's result), 128 threads.
-    let pipe128 = p.row_states.is_none() && gpu.arch == "gfx1201" && *QWEN4_GDN_PIPE;
+    let pipe128 = !canon && p.row_states.is_none() && gpu.arch == "gfx1201" && *QWEN4_GDN_PIPE;
     let kernel = match (p.row_states.is_some(), format) {
         (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
         (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
         (false, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_f32",
         (true, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
+        (false, GdnStateFormat::Q8) if canon => "gated_delta_step_halves_state128_persistent256_canon_q8",
         (false, GdnStateFormat::Q8) if pipe128 => "gated_delta_step_pipe128_q8",
         (false, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_q8",
     };
@@ -640,7 +652,8 @@ pub fn gated_delta_rollback_layers(
 /// then stores its output as packed BF16 for that kernel.
 pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
     gpu.arch_caps.has_wmma_w32()
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && qwen4_gdn_prefill() == Qwen4GdnPrefill::Wy
         && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
@@ -3626,7 +3639,9 @@ const QSA_SELECT_PM_MIN_ROWS: usize = 512;
 /// offsets below the out-of-range offset (pooled extents use its element size).
 fn qsa_select_pm_fits(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> bool {
     qsa_select_pm_shape_fits(
-        gpu.arch_caps.is_gfx1151(), p.pooled.dtype, p.rows, p.index_heads,
+        // Threshold input under the invariant profile; never below the real
+        // rows, which the shape's raw-offset bounds are checked against.
+        gpu.arch_caps.is_gfx1151(), p.pooled.dtype, gpu.route_rows(p.rows).max(p.rows), p.index_heads,
         p.index_dim, p.block_count, p.query_row_stride, p.capacity,
     )
 }
@@ -3689,7 +3704,7 @@ pub fn indexed_attention_select_batch_pm_arm(
         && p.index_dim.is_multiple_of(4)
         && p.index_dim <= 128
         && p.block_count > 0
-        && p.rows > 8
+        && gpu.route_rows(p.rows) > 8
         && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET;
     if !live || (arm != QsaSelectPmArm::Hipcc && !qsa_select_pm_fits(gpu, p)) {
         return Err(HipError::new(0, "QSA select PM arm: call not covered"));
@@ -3726,7 +3741,7 @@ fn indexed_attention_select_rows8(
         ("indexed_attention_select_scores_rows16_bf16_pm_gfx1151", 16)
     } else if pm.score() {
         ("indexed_attention_select_scores_rows16_f32_pm_gfx1151", 16)
-    } else if p.rows > 8 {
+    } else if gpu.route_rows(p.rows) > 8 {
         ("indexed_attention_select_scores_rows16_f32", 16)
     } else {
         ("indexed_attention_select_scores_rows8_f32", 8)
@@ -4324,7 +4339,7 @@ fn qsa_attention_hg4_lds_bytes(
     if !gpu.arch_caps.has_gfx11_plus_simt()
         || p.head_dim != 256
         || group % QSA_ATTENTION_HG4_HEADS != 0
-        || p.rows < QSA_ATTENTION_HG4_MIN_ROWS
+        || gpu.route_rows(p.rows) < QSA_ATTENTION_HG4_MIN_ROWS
     {
         return None;
     }
@@ -4476,7 +4491,7 @@ fn indexed_attention_attention_batch_impl(
         && gpu.arch_caps.has_gfx11_plus_simt()
         && p.head_dim == 256
         && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
-        && p.rows >= QSA_ATTENTION_HG12_MIN_ROWS
+        && gpu.route_rows(p.rows) >= QSA_ATTENTION_HG12_MIN_ROWS
         && shape_selected <= QSA_ATTENTION_HG12_MAX_SELECTED;
     let hg4_bytes = (allow_fast && !hg12)
         .then(|| qsa_attention_hg4_lds_bytes(gpu, p, shape_selected))
@@ -4599,7 +4614,7 @@ fn qsa_dense_wmma_applies(
     end_position: usize,
 ) -> bool {
     gpu.arch_caps.has_wmma_w32()
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
@@ -4795,7 +4810,7 @@ pub fn reserve_qsa_gathered_wmma_scratch(
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` every launch is the incumbent's.
 fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
     qsa_gathered_wmma_enabled(gpu, p.format)
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.head_dim == 256

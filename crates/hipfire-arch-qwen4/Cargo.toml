@@ -51,6 +51,10 @@ required-features = ["lab"]
 name = "fn_lane_oracle"
 required-features = ["lab"]
 
+[[example]]
+name = "fn_prefill_g0"
+required-features = ["lab"]
+
 [[test]]
 name = "mtp_takeover_fill_hw"
 required-features = ["reference-parity"]

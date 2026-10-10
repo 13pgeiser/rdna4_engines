@@ -67,3 +67,4 @@ pub use ple::{
 pub use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
 pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qwen4StateFormat};
 pub use weights::{Qwen4ManifestIdentity, Qwen4TierRecipe};
+pub use gpu_forward_lanes::{WaveHead, WaveLane};

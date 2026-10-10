@@ -48,6 +48,7 @@ pub mod lane_rows_pm;
 pub mod verify_twins;
 pub mod page_pool;
 pub mod pool;
+pub mod prefill_invariant;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;

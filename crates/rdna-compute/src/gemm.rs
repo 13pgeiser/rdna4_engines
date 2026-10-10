@@ -25627,7 +25627,7 @@ impl Gpu {
     ) -> HipResult<()> {
         // Few rows (speculative verify) on gfx1151: the decode kernels over
         // every row, weights read once.
-        if self.gemv_q8_0_staged_rows_supported(k, n) {
+        if self.gemv_q8_0_staged_rows_supported(k, self.route_rows(n)) {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
         }
         self.bind_thread()?;
@@ -27952,7 +27952,7 @@ impl Gpu {
     pub fn qwen4_f16_wmma_applies(&self, weight: &GpuTensor, k: usize, batch_size: usize) -> bool {
         (self.arch_caps.has_wmma_w32() || self.qwen4_f16_wmma_gfx1201())
             && weight.dtype == DType::BF16
-            && batch_size >= QWEN4_F16_WMMA_MIN_TOKENS
+            && self.route_rows(batch_size) >= QWEN4_F16_WMMA_MIN_TOKENS
             && k % 64 == 0
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -27974,7 +27974,7 @@ impl Gpu {
     /// the forward decides once and hands the flag to every stream op.
     pub fn qwen4_bf16_streams(&self, rows: usize) -> bool {
         self.arch_caps.has_gfx11_plus_simt()
-            && rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && self.route_rows(rows) >= QWEN4_F16_WMMA_MIN_TOKENS
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && *QWEN4_F16_WMMA
@@ -28034,7 +28034,7 @@ impl Gpu {
             // HC-down keeps the incumbent 64 x 128 p_s4 tile's four K splits on the
             // 160 x 80 / k32 tile (HIPFIRE_QWEN4_HC_DOWN_TILE), so the bytes match.
             let tile = if hc_down_tile_selected(
-                self.arch.as_str(), *QWEN4_HC_DOWN_TILE, m, k, batch_size,
+                self.arch.as_str(), *QWEN4_HC_DOWN_TILE, m, k, self.route_rows(batch_size),
                 self.replay.is_recording(), self.graphs.capture_mode,
             ) {
                 LdsTileSplitK::HC_DOWN_GFX1201
@@ -28046,7 +28046,7 @@ impl Gpu {
         // Measured gfx1151 (flushed, N = 8192 / 2048 / 512): 3.66 / 1.75 / 0.60 ms on 64 x 64
         // vs 3.10 / 1.54 / 1.12 ms on 160 x 64, so only the large batches take it.
         if hc_down_tile_selected(
-            self.arch.as_str(), *QWEN4_HC_DOWN_TILE, m, k, batch_size,
+            self.arch.as_str(), *QWEN4_HC_DOWN_TILE, m, k, self.route_rows(batch_size),
             self.replay.is_recording(), self.graphs.capture_mode,
         )
         {
@@ -28801,12 +28801,12 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if batch_size == 1 {
+        if self.route_rows(batch_size) == 1 {
             return self.gemv_mq4g128v2(a_raw, x, y, m, k);
         }
 
         self.bind_thread()?;
-        let gfx1151_multirow = batch_size > 1 && self.arch_caps.has_gfx11_plus_simt();
+        let gfx1151_multirow = self.route_rows(batch_size) > 1 && self.arch_caps.has_gfx11_plus_simt();
         let (func, source, token_tiles) = if gfx1151_multirow {
             (
                 "gemm_mq4g128v2_multirow_gfx1151",
@@ -31879,7 +31879,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Qkvza,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 match self.arch.as_str() {
                     "gfx1100" => {
@@ -32637,7 +32637,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 if self.arch.as_str() == "gfx1201" {
                     return self.gemm_qkv_mq4g256v2_wmma_gfx1201_bt(
@@ -32772,7 +32772,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 match self.arch.as_str() {
                     "gfx1100" => {
@@ -34016,7 +34016,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::GateUp,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 match self.arch.as_str() {
                     "gfx1100" => {
@@ -36098,7 +36098,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Residual,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 match self.arch.as_str() {
                     "gfx1100" => {
@@ -37880,7 +37880,7 @@ impl Gpu {
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::Qkvza,
-            batch_size,
+            self.route_rows(batch_size),
         ) else {
             return Ok(false);
         };
@@ -37918,7 +37918,7 @@ impl Gpu {
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::Qkv,
-            batch_size,
+            self.route_rows(batch_size),
         ) else {
             return Ok(false);
         };
@@ -37963,7 +37963,7 @@ impl Gpu {
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::GateUp,
-            batch_size,
+            self.route_rows(batch_size),
         ) else {
             return Ok(false);
         };
@@ -38002,7 +38002,7 @@ impl Gpu {
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::Residual,
-            batch_size,
+            self.route_rows(batch_size),
         ) else {
             return Ok(false);
         };
@@ -39210,7 +39210,7 @@ impl Gpu {
                 self.arch.as_str(),
                 5,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(8)
             {
                 return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
@@ -40373,7 +40373,7 @@ impl Gpu {
                 self.arch.as_str(),
                 6,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(8)
             {
                 return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
@@ -40962,7 +40962,7 @@ impl Gpu {
     pub fn qwen4_mq6_x4_gfx1201(&self, batch_size: usize) -> bool {
         self.flags
             .qwen4_mq6_x4_gfx1201
-            .unwrap_or(self.qwen4_scope && batch_size >= QWEN4_F16_WMMA_MIN_TOKENS)
+            .unwrap_or(self.qwen4_scope && self.route_rows(batch_size) >= QWEN4_F16_WMMA_MIN_TOKENS)
     }
 
     /// U3: the gfx1151 MQ6 X-LDS tile (`[0, 0, 0]` = measured table, `None` =
@@ -40980,7 +40980,7 @@ impl Gpu {
     /// `n % 192 == 0` and has no regions/HC-write twins.
     fn qwen4_mq6_x4_pick(&self, kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
         mq6_x4_tile_selected(
-            self.arch.as_str(), self.qwen4_mq6_x4_tile(), kind, m, k, n,
+            self.arch.as_str(), self.qwen4_mq6_x4_tile(), kind, m, k, self.route_rows(n),
         )
     }
 
@@ -40998,7 +40998,7 @@ impl Gpu {
     /// builder module `qwen4_mq6_x4_pm_gfx1151` from [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`] rows
     /// and [`QWEN4_MQ6_X4_PM_MIN_N_GFX1151`] tokens up (256-token tiles, `_w8` entries).
     fn mq6_x4_pm_gfx1151(&self, pm: bool, m: usize, n: usize) -> bool {
-        mq6_x4_pm_gfx1151_selected(self.arch.as_str(), pm, m, n)
+        mq6_x4_pm_gfx1151_selected(self.arch.as_str(), pm, m, self.route_rows(n))
     }
 
     /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the BT8 X-LDS
@@ -41016,7 +41016,7 @@ impl Gpu {
                     self.arch.as_str(),
                     6,
                     MqV2PrefillProjection::Residual,
-                    batch_size,
+                    self.route_rows(batch_size),
                 ) == Some(8))
     }
 
@@ -41143,10 +41143,10 @@ impl Gpu {
                         "gfx1151",
                         6,
                         MqV2PrefillProjection::Residual,
-                        batch_size,
+                        self.route_rows(batch_size),
                     ) == Some(8)
                 }
-                "gfx1201" => batch_size >= 64,
+                "gfx1201" => self.route_rows(batch_size) >= 64,
                 _ => false,
             }
     }
@@ -43179,7 +43179,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::Qkvza,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(4)
             {
                 return self.gemm_qkvza_mqv2_wmma_gfx11_bt(
@@ -43325,7 +43325,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(8)
             {
                 return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
@@ -43426,7 +43426,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(4)
             {
                 return self.gemm_qkv_mqv2_wmma_gfx11_bt(
@@ -43642,7 +43642,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::GateUp,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(12)
             {
                 return self.gemm_gate_up_mqv2_wmma_gfx11_bt(
@@ -43828,7 +43828,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::Residual,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(4)
             {
                 return self.gemm_mqv2_residual_wmma_gfx11_bt(2, 4, a_raw, x, y, m, k, batch_size);
@@ -45239,7 +45239,7 @@ impl Gpu {
         self.arch_caps.has_wmma()
             && m == 1280
             && k == 2560
-            && x_src_rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && self.route_rows(x_src_rows) >= QWEN4_F16_WMMA_MIN_TOKENS
             && *QWEN4_F16_WMMA
     }
 
@@ -45638,8 +45638,15 @@ impl Gpu {
     /// N tile would reach the IU4 tail entry, whose fold differs from the
     /// symmetric one (measured: tail outputs off by up to 4e-6 vs the dense
     /// fold at N=1131); such chunks keep exact activations instead.
+    ///
+    /// Never under the batch-invariant prefill profile
+    /// ([`Gpu::prefill_invariant_scope`]): a row's bytes would depend on
+    /// whether it lands in a whole or a partial 128-row tile, i.e. on how many
+    /// other rows share the forward, so the profile takes the exact-activation
+    /// route at every row count.
     pub fn qwen4_trunk_iu4_applies(&self, rows: usize) -> bool {
         self.qwen4_trunk_iu4
+            && !self.prefill_invariant_scope
             && rows >= QWEN4_F16_WMMA_MIN_TOKENS
             && rows % 128 == 0
             && !self.replay.is_recording()
@@ -45692,6 +45699,7 @@ impl Gpu {
         self.gemm_zba_v2b_scatter(a_fold, xq, y_z, y_beta, y_alpha, z_m, k, n)?;
         Ok(true)
     }
+
 }
 
 /// Qwen4 symmetric IU4 MoE route (fn-moe-sym): header check, stable
@@ -45719,7 +45727,7 @@ impl Gpu {
     /// Whether a `rows`-row prefill takes the route (smaller prefill, decode
     /// and speculative verify stay on the incumbent).
     pub fn qwen4_moe_sym_iu4_applies(&self, rows: usize) -> bool {
-        rows >= QWEN4_MOE_SYM_IU4_MIN_ROWS && self.qwen4_moe_sym_iu4_requested()
+        self.route_rows(rows) >= QWEN4_MOE_SYM_IU4_MIN_ROWS && self.qwen4_moe_sym_iu4_requested()
     }
 
     /// Index of this arch in the route's per-arch tables (gfx1151, gfx1201).

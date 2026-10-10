@@ -174,6 +174,7 @@ fn project_weights_inner(
     region_members: Option<&[bool]>,
 ) -> Result<(), DispatchError> {
     debug_assert!(region_members.is_none_or(|m| m.len() == projections.len()));
+    let route = gpu.route_rows(rows);
     let shared = |w: &WeightRef<'_>, gpu: &Gpu| match w.dtype {
         DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, rows),
         // gfx1151, more than 8 rows (N >= 96): PM or exact bt4 on the shared F16 rotation.
@@ -273,7 +274,7 @@ fn project_weights_inner(
     // rotate it once for the whole group instead of once per weight.
     // Few rows (speculative verify) on gfx11+: BF16 weights of one K share
     // multi-row launches, four matrices at a time, each weight read once.
-    if (2..=8).contains(&rows) && gpu.arch_caps.has_gfx11_plus_simt() {
+    if (2..=8).contains(&route) && gpu.arch_caps.has_gfx11_plus_simt() {
         for i in 0..projections.len() {
             let (weight, _) = projections[i];
             if done[i] || weight.dtype != DType::BF16 {
@@ -327,7 +328,7 @@ fn project_weights_inner(
         let mut mq6: SmallVec<[usize; 4]> = group
             .iter()
             .copied()
-            .filter(|&j| rows <= 8 && projections[j].0.dtype == DType::MQ6G256V2)
+            .filter(|&j| route <= 8 && projections[j].0.dtype == DType::MQ6G256V2)
             .collect();
         if mq6.len() < 2 {
             mq6.clear();
@@ -456,6 +457,7 @@ fn project_trunk(
                 }
             }
         }
+
     }
     if done.iter().all(|d| !d) {
         return project_weights(gpu, input, rows, Some(rotation), projections);
@@ -532,7 +534,7 @@ fn rotate_input(
     let elements = checked_mul(rows, weight.k, "rotation scratch")?;
     let scratch = view(rotation, 0, elements);
     match basis {
-        RotationBasis::Aligned256 if rows > 1 => {
+        RotationBasis::Aligned256 if gpu.route_rows(rows) > 1 => {
             hip(gpu.rotate_x_mq_batched(input, &scratch, weight.k, rows))?
         }
         RotationBasis::Aligned256 => hip(gpu.rotate_x_mq(input, &scratch, weight.k))?,
@@ -549,10 +551,11 @@ fn project_rotated(
     output: &GpuTensor,
     rows: usize,
 ) -> Result<(), DispatchError> {
-    if weight.dtype == DType::MQ6G256V2 && (2..=8).contains(&rows) {
+    let route = gpu.route_rows(rows);
+    if weight.dtype == DType::MQ6G256V2 && (2..=8).contains(&route) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }
-    if weight.dtype == DType::BF16 && (2..=8).contains(&rows) && gpu.arch_caps.has_gfx11_plus_simt()
+    if weight.dtype == DType::BF16 && (2..=8).contains(&route) && gpu.arch_caps.has_gfx11_plus_simt()
     {
         let part = (weight.buf, output, weight.m);
         let none = (weight.buf, output, 0);
@@ -561,12 +564,12 @@ fn project_rotated(
     // Few-row verify (2..=8 rows): the exact MQ4 rows kernel, bitwise the AR
     // `gemv_mq4g256v2` per activation row. One row keeps that GEMV; more than
     // eight rows keep the WMMA `gemm_mq4g256v2`.
-    if weight.dtype == DType::MQ4G256V2 && (2..=8).contains(&rows) {
+    if weight.dtype == DType::MQ4G256V2 && (2..=8).contains(&route) {
         let part = (weight.buf, output, weight.m);
         let none = (weight.buf, output, 0);
         return hip(gpu.gemv_mq4g256v2_rows_x4([part, none, none, none], x, weight.k, rows));
     }
-    let result = match (weight.dtype, rows > 1) {
+    let result = match (weight.dtype, route > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
         (DType::BF16, true) => {
             // Long prefill on gfx11 or gfx1201: the KLD-gated F16 WMMA route,
@@ -578,6 +581,9 @@ fn project_rotated(
                 rows,
             ) {
                 Ok(true) => Ok(()),
+                Ok(false) if rows == 1 => {
+                    gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k)
+                }
                 Ok(false) => {
                     gpu.gemm_bf16_xf32_multirow(weight.buf, x, output, weight.m, weight.k, rows)
                 }
@@ -793,7 +799,7 @@ pub fn execute_hyper_read_prenormed(
 fn hyper_read_wmma_route(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
     let wide = op.branches * op.hidden;
     let up_fused = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows > 1
+        && gpu.route_rows(op.rows) > 1
         && op.branches == 4
         && op.input_mix_up.dtype == DType::BF16
         && op.input_mix_up.m == wide
@@ -835,7 +841,7 @@ fn execute_hyper_read_inner(
     // Multi-row: the up projection feeds the branch mix directly; bitwise
     // identical to the GEMM + hyper_read_projected pair below.
     let up_fused = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows > 1
+        && gpu.route_rows(op.rows) > 1
         && op.branches == 4
         && op.input_mix_up.dtype == DType::BF16
         && op.input_mix_up.m == wide
@@ -895,7 +901,7 @@ fn execute_hyper_read_inner(
         ))?;
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows <= 8
+        && gpu.route_rows(op.rows) <= 8
         && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k.is_multiple_of(32))
             || (op.input_mix_down.dtype == DType::Q8_0
                 && op.input_mix_down.k.is_multiple_of(256)))
@@ -1274,7 +1280,7 @@ pub fn execute_hyper_write_then_read(
     clear: Option<&ClearOp<'_>>,
     rotate_into: Option<&GpuTensor>,
 ) -> Result<Option<bool>, DispatchError> {
-    let fusable = (1..=8).contains(&write.rows)
+    let fusable = (1..=8).contains(&gpu.route_rows(write.rows))
         && read.rows == write.rows
         && !write.state_bf16
         && !read.state_bf16
@@ -1351,14 +1357,14 @@ fn hyper_write_gates(
     // K across four waves, and a verify row is bitwise the decode row it
     // replaces (greedy MTP == AR depends on it).
     let k4 = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows <= 8
+        && gpu.route_rows(op.rows) <= 8
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.k.is_multiple_of(32);
     // Multi-row: one launch normalizes each row into LDS and projects the
     // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.
     let fused = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows > 1
+        && gpu.route_rows(op.rows) > 1
         && !k4
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.m == op.branches
@@ -1696,7 +1702,7 @@ pub fn execute_gated_delta_net_hc(
     let z = view(op.z_output, 0, op.rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
     let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows > 1
+        && gpu.route_rows(op.rows) > 1
         && op.key_dim == 128
         && op.value_dim == 128
         && op.conv_kernel == 4;
@@ -2589,7 +2595,7 @@ pub fn execute_indexed_attention_hc(
         return qsa_project_output(gpu, op, &qsa_output_batch, hc, fused);
     }
 
-    if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
+    if gpu.route_rows(op.rows) <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
         // Decode / few-row verify: the norms, RoPE, cache append and
         // index-key round trip and copy below, in one launch.
         hip(indexed_attention_decode_prologue(
@@ -3354,7 +3360,10 @@ pub fn execute_lm_head(
     requested_rows: usize,
 ) -> Result<(), DispatchError> {
     validate_lm_head(weight, hidden_batch, logits, rows, requested_rows)?;
-    if requested_rows == rows {
+    // Under the batch-invariant prefill profile a one-row head is the final-row
+    // head's GEMV (never the routed GEMM), so a one-row forward and a longer
+    // forward's final row produce the same bytes.
+    if requested_rows == rows && (rows > 1 || !gpu.prefill_invariant_scope) {
         match weight.dtype {
             DType::BF16 => project_weight(gpu, weight, hidden_batch, logits, rows, None),
             DType::F32 => hip(gpu.gemm_f32_batched(

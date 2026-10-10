@@ -559,6 +559,28 @@ pub(crate) fn ple_desc<'a>(
     })
 }
 
+/// `HIPFIRE_QWEN4_PLE_FUSE`: whether a `rows`-row forward stages the PLE rows
+/// straight as F16 for the BF16 key/value projections (the singleton chunk
+/// forward and the prefill wave decide it with this one expression; under the
+/// invariant prefill profile the F16 route applies at every row count).
+pub(crate) fn qwen4_ple_rows_f16(
+    gpu: &Gpu,
+    bf16_state: bool,
+    hc_count: usize,
+    hidden_size: usize,
+    ple: &Qwen4PleWeights<'_>,
+    rows: usize,
+) -> bool {
+    bf16_state
+        && gpu.flags.qwen4_ple_fuse_enabled()
+        && hc_count <= 4
+        && hidden_size % 32 == 0
+        && ple.key.k == hidden_size
+        && ple.value.k == hidden_size
+        && gpu.qwen4_f16_wmma_applies(ple.key.buf, ple.key.k, rows)
+        && gpu.qwen4_f16_wmma_applies(ple.value.buf, ple.value.k, rows)
+}
+
 /// `decode_q8` / `rows`: the forward's Q8_0 decode copies and row count; a
 /// one-row forward binds this layer's shared-expert copies.
 #[allow(clippy::too_many_arguments)]
@@ -2046,6 +2068,12 @@ pub struct Qwen4GpuForward {
     /// then never a retained-body candidate, so it neither records nor
     /// replays the singleton's tape (whose pointers name the resident state).
     pub(crate) lane_scope: bool,
+    /// Set only by the bundle's prefill entries (`forward_chunk*`,
+    /// `spec_prefill_rows*`, `lane_prefill_tile`) around their forward call:
+    /// with `HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151 the forward then runs the
+    /// batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`]). Never
+    /// set for decode, MTP verify or the MTP head.
+    pub(crate) prefill_scope: bool,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -2323,6 +2351,7 @@ impl Qwen4GpuForward {
             trunk_a4,
             qsa_tap: None,
             lane_scope: false,
+            prefill_scope: false,
         })
     }
 
@@ -2866,6 +2895,14 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
+        // The batch-invariant prefill profile (see `rdna_compute::prefill_invariant`):
+        // every row-count routing decision of this forward sees the canonical
+        // chunk size; launches keep the real row count. Restored below on every
+        // return path.
+        let invariant = self.prefill_scope
+            && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled()
+            && gpu.arch == "gfx1151";
+        let prior_invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -2877,6 +2914,7 @@ impl Qwen4GpuForward {
             output_policy,
         );
         gpu.qwen4_scope = scope;
+        gpu.prefill_invariant_scope = prior_invariant;
         result
     }
 
@@ -2985,7 +3023,7 @@ impl Qwen4GpuForward {
                     "map Qwen4 QSA context through {end_position} tokens: {error}"
                 ))
             })?;
-        if n >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
+        if gpu.route_rows(n) >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
             if let Some(qsa) = bundle.state.qsa.first() {
                 rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
                     gpu,
@@ -3079,6 +3117,9 @@ impl Qwen4GpuForward {
         let scratch_desc = layer_scratch(&self.scratch, &router_logits);
         // Decided once: every op touching the HC streams in this forward agrees.
         let bf16_state = gpu.qwen4_bf16_streams(n);
+        // The row count every routing decision below sees (`n` unless the
+        // invariant prefill profile is on); launch extents keep `n`.
+        let route_n = gpu.route_rows(n);
         if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
         {
             return Err(invalid(
@@ -3124,14 +3165,14 @@ impl Qwen4GpuForward {
                     ));
                 }
                 let ple = ple_desc(&bundle.weights, ple_weights)?;
-                ple_rows_f16 = bf16_state
-                    && gpu.flags.qwen4_ple_fuse_enabled()
-                    && dims.hc_count <= 4
-                    && config.hidden_size % 32 == 0
-                    && ple.key.k == config.hidden_size
-                    && ple.value.k == config.hidden_size
-                    && gpu.qwen4_f16_wmma_applies(ple.key.buf, ple.key.k, n)
-                    && gpu.qwen4_f16_wmma_applies(ple.value.buf, ple.value.k, n);
+                ple_rows_f16 = qwen4_ple_rows_f16(
+                    gpu,
+                    bf16_state,
+                    dims.hc_count,
+                    config.hidden_size,
+                    &ple,
+                    n,
+                );
                 steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
                     rotation: &self.scratch.rotation,
                     state_bf16: bf16_state,
@@ -3166,7 +3207,7 @@ impl Qwen4GpuForward {
                 &self.moe[layer_index],
                 &config,
                 &self.decode_q8,
-                n,
+                route_n,
                 expert_stage,
             )?;
             let attn_read = &description.attn_hyper.read;
@@ -3183,13 +3224,13 @@ impl Qwen4GpuForward {
                 input_mix_down: decode_copy(
                     &self.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER,
-                    n,
+                    route_n,
                     attn_read.input_mix_down,
                 ),
                 input_mix_up: decode_copy(
                     &self.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 1,
-                    n,
+                    route_n,
                     attn_read.input_mix_up,
                 ),
                 normalized: &self.scratch.hc_normalized,
@@ -3345,13 +3386,13 @@ impl Qwen4GpuForward {
                 input_mix_down: decode_copy(
                     &self.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 2,
-                    n,
+                    route_n,
                     mlp_read.input_mix_down,
                 ),
                 input_mix_up: decode_copy(
                     &self.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 3,
-                    n,
+                    route_n,
                     mlp_read.input_mix_up,
                 ),
                 normalized: &self.scratch.hc_normalized,
@@ -3366,7 +3407,7 @@ impl Qwen4GpuForward {
             }));
 
             let sealed =
-                crate::program::seal_moe_for_layer(&ctx, dims, &description, &scratch_desc, n)
+                crate::program::seal_moe_for_layer(&ctx, dims, &description, &scratch_desc, n, route_n)
                     .map_err(|error| {
                         Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}"))
                     })?;
@@ -3422,6 +3463,7 @@ impl Qwen4GpuForward {
         // A HIP body: no retained tape records or routes this forward.
         let hip_body = n == 1
             && !self.lane_scope
+            && !gpu.prefill_invariant_scope
             && matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback);
         // `argmax_of` on a HIP body: the GPU argmax writes the token id and the
         // host reads it back only at the PLE layer, so the GPU runs this
@@ -3683,6 +3725,7 @@ impl Qwen4GpuForward {
             // capture is the speculative-verify shape and must never enter the tape.
             let eligible = n == 1
                 && !self.lane_scope
+                && !gpu.prefill_invariant_scope
                 && wide_hidden_capture.is_none()
                 && self.qsa_tap.is_none()
                 && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();

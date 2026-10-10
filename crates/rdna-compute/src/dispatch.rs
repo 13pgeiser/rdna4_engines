@@ -1182,6 +1182,11 @@ pub struct Gpu {
     /// rows launchers to the gfx1151 PeaceMaker lane-rows kernels
     /// ([`Gpu::lane_rows_pm_enabled`]).
     pub lane_rows_scope: bool,
+    /// True while a Qwen4 prefill forward runs under the batch-invariant
+    /// profile (`HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151): every row-count
+    /// ROUTING predicate sees `prefill_invariant::QWEN4_PREFILL_CANON_ROWS`
+    /// via `Gpu::route_rows` while launches keep the real row count.
+    pub prefill_invariant_scope: bool,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -1993,6 +1998,7 @@ impl Gpu {
             hessian_capture: None,
             qwen4_scope: false,
             lane_rows_scope: false,
+            prefill_invariant_scope: false,
         })
         .map(|mut gpu| {
             if gpu.flags.force_blob_path {

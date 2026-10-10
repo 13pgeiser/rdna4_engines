@@ -122,7 +122,7 @@ pub(crate) fn router_projection(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     // Projected by the shared gate/up stage's launch instead.
-    if router_with_shared(p) || router_shares_f16(gpu, p) {
+    if router_with_shared(gpu, p) || router_shares_f16(gpu, p) {
         return Ok(());
     }
     batch_projection(
@@ -138,8 +138,8 @@ pub(crate) fn router_projection(
 /// bitwise each projection's own) projects the router together with the
 /// all-BF16 shared selector/gate/up in one launch (the shared gate/up stage,
 /// which the route always runs right after the router stage).
-fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
-    p.batch_size <= 8
+fn router_with_shared(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    gpu.route_rows(p.batch_size) <= 8
         && p.prelude.router.dtype == DType::BF16
         && p.prelude.shared.as_ref().is_some_and(|shared| {
             [
@@ -159,7 +159,7 @@ fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
 /// of `x_norm_batch` instead of converting it a second time.
 fn router_shares_f16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     let router = &p.prelude.router;
-    p.batch_size > 8
+    gpu.route_rows(p.batch_size) > 8
         && p.x_norm_batch.dtype == DType::F32
         && router.dtype == DType::BF16
         && gpu.qwen4_f16_wmma_applies(router.buf, router.k, p.batch_size)
@@ -190,7 +190,7 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let weights = &shared.weights;
-    if router_with_shared(p) {
+    if router_with_shared(gpu, p) {
         // All read the natural activation: one launch (one F16 conversion).
         super::layer_ops::project_weights(
             gpu,
@@ -915,7 +915,7 @@ pub(crate) fn activation(
 /// faster.  Its per-slot dot is the grouped kernel's (bitwise), combined in
 /// slot order.
 fn indexed_down(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
-    use_path2 && p.batch_size <= 8 && !down_wmma(gpu, p)
+    use_path2 && gpu.route_rows(p.batch_size) <= 8 && !down_wmma(gpu, p)
 }
 
 /// Release the stage immediately after the routed down, before combine.

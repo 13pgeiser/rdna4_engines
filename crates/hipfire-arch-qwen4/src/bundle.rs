@@ -918,7 +918,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         capture_hidden: bool,
     ) -> Result<Vec<u32>, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All)
+        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All, false)
     }
 
     /// Final-row argmax of one forward over `tokens`: prompt fills and
@@ -929,7 +929,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         capture_hidden: bool,
     ) -> Result<u32, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::Final)?
+        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::Final, true)?
             .into_iter()
             .next()
             .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
@@ -981,9 +981,11 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
             .forward_chunk_silent(self, gpu, tokens, Some(&hidden))
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
@@ -994,6 +996,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         capture_hidden: bool,
         output_rows: Qwen4OutputRows,
+        prefill: bool,
     ) -> Result<Vec<u32>, BundleError> {
         if tokens.is_empty() {
             return Err(BundleError::Forward(
@@ -1062,6 +1065,7 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, prefill);
         let result = forward
             .forward_chunk(
                 self,
@@ -1073,6 +1077,7 @@ impl Qwen4Bundle {
                 output_rows,
             )
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result?;
         let bytes_len = output_count * std::mem::size_of::<i32>();
@@ -1873,9 +1878,11 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
             .forward_chunk(self, gpu, tokens, logits, top1, None, Qwen4OutputRows::All)
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
@@ -1895,6 +1902,7 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
             .forward_chunk(
                 self,
@@ -1906,6 +1914,7 @@ impl Qwen4Bundle {
                 Qwen4OutputRows::Final,
             )
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
@@ -1922,9 +1931,11 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
             .forward_chunk_silent(self, gpu, tokens, None)
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
@@ -2612,6 +2623,7 @@ impl Qwen4Bundle {
             let mut forward = bundle.execution.take().ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
             })?;
+            let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
             let result = match final_logits {
                 Some(logits) => forward.forward_chunk(
                     bundle,
@@ -2625,9 +2637,59 @@ impl Qwen4Bundle {
                 None => forward.forward_chunk_silent(bundle, gpu, tokens, None),
             }
             .map_err(|error| BundleError::Forward(error.to_string()));
+            forward.prefill_scope = prior_scope;
             bundle.execution = Some(forward);
             result
         })?
+    }
+
+    /// A fresh prefill-wave lane state: the same constructor as a lane
+    /// store's states (the resident state's formats, QSA backend and context
+    /// bound).
+    pub fn new_wave_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
+        self.new_lane_state(gpu)
+    }
+
+    /// One prefill wave: every lane's rows forwarded together
+    /// ([`crate::gpu_forward_lanes`] module docs). Each lane state's QSA
+    /// arenas are mapped through its end position first; the wave then runs
+    /// one forward in which row-local stages follow `policy` and stateful
+    /// stages run per lane on the lane's own state, publishing each lane's
+    /// host state as the singleton forward does. `logits` is F32,
+    /// `lanes.len() * vocab` (`WaveHead::Final`) or `total_rows * vocab`
+    /// (`WaveHead::All`); `top1` is Raw, one i32 per output row. The wave
+    /// never touches the resident `state`, the MTP head, the session cache
+    /// or the retained tape (eager HIP); `execution` is back in place on
+    /// every return path.
+    pub fn prefill_wave(
+        &mut self,
+        gpu: &mut Gpu,
+        lanes: &mut [crate::gpu_forward_lanes::WaveLane<'_>],
+        head: crate::gpu_forward_lanes::WaveHead,
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        policy: &crate::gpu_forward_lanes::LaneStagePolicy,
+    ) -> Result<(), BundleError> {
+        for lane in lanes.iter_mut() {
+            let end = lane
+                .state
+                .position
+                .checked_add(lane.tokens.len())
+                .ok_or_else(|| BundleError::Forward("Qwen4 wave lane position overflows".to_string()))?;
+            if end > lane.state.max_seq_len {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 wave lane end position {end} exceeds its context capacity {}",
+                    lane.state.max_seq_len
+                )));
+            }
+            lane.state.ensure_mapped_capacity(gpu, end).map_err(|error| {
+                BundleError::Forward(format!(
+                    "map Qwen4 wave lane QSA context through {end} tokens: {error}"
+                ))
+            })?;
+        }
+        crate::gpu_forward_lanes::forward_wave(gpu, self, lanes, head, logits, top1, policy)
+            .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
