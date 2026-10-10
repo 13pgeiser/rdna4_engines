@@ -1007,7 +1007,7 @@ impl MtpGpuState {
     /// first chunk's mapped pages, the rest being virtual until forwards
     /// map it), then the selection and wide-hidden carry, twice with their
     /// snapshot backups.
-    fn device_bytes(config: &Qwen4Config, context: &Qwen4ContextCommit) -> Option<usize> {
+    pub(crate) fn device_bytes(config: &Qwen4Config, context: &Qwen4ContextCommit) -> Option<usize> {
         let carry = config
             .qsa_selected_capacity()
             .checked_mul(std::mem::size_of::<i32>())?
@@ -1601,6 +1601,87 @@ impl MtpGpuState {
     }
 }
 
+/// Every byte family of a head state: full K/V and raw/pooled index rows
+/// below their lengths, the selected indices up to `selected_len`, the
+/// device selected length, the wide hidden, and the marks, position and step
+/// index as little-endian u64s.
+#[cfg(feature = "lab")]
+pub fn lab_head_items(gpu: &Gpu, head: &MtpGpuState) -> Result<Vec<(String, Vec<u8>)>, String> {
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| format!("Qwen4 MTP lab head sync: {error}"))?;
+    let download = |tensor: &GpuTensor, bytes: usize| -> Result<Vec<u8>, String> {
+        let mut out = vec![0u8; bytes];
+        if bytes > 0 {
+            if bytes > tensor.buf.size() {
+                return Err(format!(
+                    "Qwen4 MTP lab head read of {bytes} bytes exceeds the {} mapped",
+                    tensor.buf.size()
+                ));
+            }
+            gpu.hip
+                .memcpy_dtoh(&mut out, &tensor.buf)
+                .map_err(|error| format!("Qwen4 MTP lab head download: {error}"))?;
+        }
+        Ok(out)
+    };
+    let rows = |tensor: &GpuTensor, capacity: usize, len: usize| -> Result<Vec<u8>, String> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let row_bytes = tensor
+            .byte_size()
+            .checked_div(capacity)
+            .ok_or_else(|| "Qwen4 MTP lab head arena has no capacity".to_string())?;
+        download(tensor, len * row_bytes)
+    };
+    let words = [
+        head.full_len,
+        head.raw_len,
+        head.pooled_len,
+        head.selected_len,
+        head.position,
+        head.step_index,
+    ]
+    .iter()
+    .flat_map(|&word| (word as u64).to_le_bytes())
+    .collect::<Vec<u8>>();
+    Ok(vec![
+        (
+            "head.full_keys".to_string(),
+            rows(&head.full_keys, head.full_capacity, head.full_len)?,
+        ),
+        (
+            "head.full_values".to_string(),
+            rows(&head.full_values, head.full_capacity, head.full_len)?,
+        ),
+        (
+            "head.raw_index_keys".to_string(),
+            rows(&head.raw_index_keys, head.raw_capacity, head.raw_len)?,
+        ),
+        (
+            "head.pooled_keys".to_string(),
+            rows(&head.pooled_keys, head.pooled_capacity, head.pooled_len)?,
+        ),
+        (
+            "head.selected_indices".to_string(),
+            download(
+                &head.selected_indices,
+                head.selected_len * std::mem::size_of::<i32>(),
+            )?,
+        ),
+        (
+            "head.selected_len_out".to_string(),
+            download(&head.selected_len_out, head.selected_len_out.byte_size())?,
+        ),
+        (
+            "head.wide_hidden".to_string(),
+            download(&head.wide_hidden, head.wide_hidden.byte_size())?,
+        ),
+        ("head.marks".to_string(), words),
+    ])
+}
+
 /// Model-owned native MTP operator and state.
 pub struct Qwen4MtpGpu {
     pub(crate) scratch: MtpGpuScratch,
@@ -1928,6 +2009,111 @@ impl Qwen4MtpGpu {
         fresh_qsa_selection: bool,
         step: MtpStep,
     ) -> Result<Option<u32>, MtpGpuError> {
+        let lengths = self.head_block(
+            gpu,
+            weights,
+            config,
+            token,
+            backbone_hidden,
+            position,
+            fresh_qsa_selection,
+            step,
+        )?;
+        let next_token = if step == MtpStep::Predict {
+            let head = weights.resident(&weights.root.lm_head)?;
+            Some(self.draft.draft(gpu, head, &self.scratch.hc_mixed)?)
+        } else {
+            None
+        };
+        self.finish_head_step(gpu, step, lengths)?;
+        Ok(next_token)
+    }
+
+    /// [`Self::forward_token`] with [`MtpStep::Predict`] and the draft read
+    /// deferred: the head block, the draft's device work into `top1_out`
+    /// (Raw, at least `Gpu::TOPK8_OUT_BYTES`; parsed later by
+    /// `self.draft.draft_finish`), the wide-hidden copy and the state
+    /// bookkeeping, in `forward_token`'s order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_token_deferred(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+        top1_out: &GpuTensor,
+    ) -> Result<(), MtpGpuError> {
+        if top1_out.dtype != DType::Raw || top1_out.byte_size() < Gpu::TOPK8_OUT_BYTES {
+            return Err(invalid(format!(
+                "MTP deferred draft output must be Raw with at least {} bytes",
+                Gpu::TOPK8_OUT_BYTES
+            )));
+        }
+        let lengths = self.head_block(
+            gpu,
+            weights,
+            config,
+            token,
+            backbone_hidden,
+            position,
+            fresh_qsa_selection,
+            MtpStep::Predict,
+        )?;
+        let head = weights.resident(&weights.root.lm_head)?;
+        self.draft
+            .draft_enqueue(gpu, head, &self.scratch.hc_mixed, top1_out)?;
+        self.finish_head_step(gpu, MtpStep::Predict, lengths)
+    }
+
+    /// The tail of a head step the draft does not touch: the wide-hidden
+    /// copy (every step but an append) and the state bookkeeping.
+    fn finish_head_step(
+        &mut self,
+        gpu: &mut Gpu,
+        step: MtpStep,
+        (full_len, raw_len, pooled_len, selected_len, next_position): (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ),
+    ) -> Result<(), MtpGpuError> {
+        if step != MtpStep::Append {
+            gpu.copy_d2d(
+                &self.scratch.wide,
+                &self.state.wide_hidden,
+                self.scratch.wide.byte_size(),
+            )?;
+        }
+        let state = &mut self.state;
+        state.position = next_position;
+        state.full_len = full_len;
+        state.raw_len = raw_len;
+        state.pooled_len = pooled_len;
+        state.selected_len = selected_len;
+        state.step_index = state.step_index.wrapping_add(1);
+        Ok(())
+    }
+
+    /// The head step's checks and device work up to (not including) the
+    /// draft: returns the lengths the step publishes in
+    /// [`Self::finish_head_step`].
+    #[allow(clippy::too_many_arguments)]
+    fn head_block(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+        step: MtpStep,
+    ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
         let wide = MTP_BRANCHES
             .checked_mul(config.hidden_size)
             .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
@@ -1967,7 +2153,7 @@ impl Qwen4MtpGpu {
             .copy_from_slice(&(token as i32).to_ne_bytes());
         gpu.memcpy_htod_auto(&self.scratch.token_ids.buf, &self.scratch.host_token_bytes)?;
 
-        let (full_len, raw_len, pooled_len, selected_len, next_position) = {
+        let lengths = {
             let scratch = &self.scratch;
             let state = &self.state;
             let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
@@ -2144,28 +2330,7 @@ impl Qwen4MtpGpu {
             execute_validated_steps(gpu, &ctx, &steps)?;
             lengths
         };
-
-        let next_token = if step == MtpStep::Predict {
-            let head = weights.resident(&weights.root.lm_head)?;
-            Some(self.draft.draft(gpu, head, &self.scratch.hc_mixed)?)
-        } else {
-            None
-        };
-        if step != MtpStep::Append {
-            gpu.copy_d2d(
-                &self.scratch.wide,
-                &self.state.wide_hidden,
-                self.scratch.wide.byte_size(),
-            )?;
-        }
-        let state = &mut self.state;
-        state.position = next_position;
-        state.full_len = full_len;
-        state.raw_len = raw_len;
-        state.pooled_len = pooled_len;
-        state.selected_len = selected_len;
-        state.step_index = state.step_index.wrapping_add(1);
-        Ok(next_token)
+        Ok(lengths)
     }
 
     /// Whether [`Self::append_rows`] can run for this model on this GPU:

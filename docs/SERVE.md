@@ -703,11 +703,25 @@ request run alone on the singleton route. **Default off, experimental.**
   images, logprobs or penalties. Ineligible requests keep the singleton route.
 - **Singleton when alone:** a request that is alone at dispatch runs the
   unchanged singleton route (including native MTP).
-- **AR lanes only:** lanes decode one token per step. There are no MTP lanes
-  yet, and no per-lane session cache, parking or promotion.
-- **Exact per request:** stateful stages (PLE conv, GDN core, QSA core) run per
-  lane on the lane's own state; a row-local stage runs once over all lanes'
-  rows only where the G0 byte-identity oracle admitted it, otherwise per lane.
+- **MTP lanes (default when the MTP head is loaded):** each lane runs its own
+  native MTP window per step: a step-synchronous batched draft for every
+  drafting lane, then one `(d+1)`-row verify per lane inside the shared lane
+  step (the step's row budget counts lanes, not rows). A lane that
+  drafts nothing, or that the floor retires, decodes one AR row per step.
+  `serve.batch_spec = false` (`HIPFIRE_SERVE_BATCH_SPEC=0`) keeps the AR lanes
+  of before (one token per lane per step). There is no per-lane session
+  cache, parking or promotion.
+- **Per-lane AR floor:** each lane keeps the singleton's MTP floor (probe
+  windows, sticky retirement, decayed per-depth costs), priced in AR-row
+  units from a measured model of the shared step (an AR row costs its
+  proportional share of an all-AR step; a window adds its verify rows'
+  marginal cost), so a lane whose drafts do not pay falls back to AR rows.
+- **Exact per lane:** every MTP lane window is byte-identical to the one
+  singleton window it takes (a batched window at the lane's draft depth, or
+  the singleton's AR step), on the lane's own states. Stateful stages (PLE
+  conv, GDN core, QSA core) run per lane on the lane's own state; a row-local
+  stage runs once over all lanes' rows only where the G0 byte-identity oracle
+  admitted it, otherwise per lane.
   On gfx1151 G0 admitted every row-local stage (embedding, HC read/write, the
   GDN/QSA projections, the MoE, final HC read, head, argmax); other cards run
   every stage per lane until their own G0 run.
@@ -717,12 +731,17 @@ The loaded ack reports `continuous_batch_route: "fn-lanes"`,
 gateway uses to admit appended multi-turn histories; it never matches route
 names),
 `continuous_batch_slots`, `continuous_batch_exact: true`,
-`continuous_batch_sampling: "greedy_only"` and the lane-store receipt:
+`continuous_batch_sampling: "greedy_only"`, the speculation state
+(`continuous_batch_spec`, `continuous_batch_spec_mode` = `"mtp"` or `"off"`,
+`continuous_batch_spec_k` with MTP lanes, `continuous_batch_spec_requested`)
+and the lane-store receipt:
 `fn_lanes_kv_backend`, `fn_lanes_qsa_format`, `fn_lanes_gdn_format`,
 `fn_lanes_ring_rows`, `fn_lanes_max_lanes`, `fn_lanes_row_budget`,
 `fn_lanes_mapped_bytes`, `fn_lanes_stage_policy` (the per-stage sharing
 policy) and `fn_lanes_stage_evidence` (the G0 receipt id for the production
-policy).
+policy). Each lane's `done` event carries the singleton's MTP counters
+(`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`) plus `mtp_drafts` and
+`mtp_accepted`.
 
 ## Multi-process notes
 

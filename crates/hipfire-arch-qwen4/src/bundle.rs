@@ -1097,6 +1097,22 @@ impl Qwen4Bundle {
         row: usize,
         destination: &GpuTensor,
     ) -> Result<(), BundleError> {
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        self.copy_hidden_row(gpu, source, row, destination)
+    }
+
+    /// Copy row `row` (`hc_count * hidden_size` F32) of `source` into
+    /// `destination`. `source` holds captured wide-hidden rows (the spec
+    /// hidden, or a lane's rows of it).
+    pub(crate) fn copy_hidden_row(
+        &self,
+        gpu: &mut Gpu,
+        source: &GpuTensor,
+        row: usize,
+        destination: &GpuTensor,
+    ) -> Result<(), BundleError> {
         let width = self
             .config
             .hc_count
@@ -1107,9 +1123,6 @@ impl Qwen4Bundle {
                 "Qwen4 spec hidden destination shape mismatch".to_string(),
             ));
         }
-        let source = self.spec_hidden.as_ref().ok_or_else(|| {
-            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
-        })?;
         let offset = row
             .checked_mul(width)
             .ok_or_else(|| BundleError::Forward("spec hidden row offset overflow".to_string()))?;
@@ -1146,14 +1159,30 @@ impl Qwen4Bundle {
         keep: usize,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
-        let ple_normed = &self
-            .execution
-            .as_ref()
-            .ok_or_else(|| {
-                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
-            })?
-            .scratch
-            .ple_normed;
+        let ple_normed = {
+            let tensor = &self
+                .execution
+                .as_ref()
+                .ok_or_else(|| {
+                    BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+                })?
+                .scratch
+                .ple_normed;
+            tensor.sub_offset(0, tensor.numel())
+        };
+        self.rollback_verify_rows_retain_with(gpu, snapshot, keep, tokens, &ple_normed)
+    }
+
+    /// [`Self::rollback_verify_rows_retain`] with the verify's PLE
+    /// convolution input rows (`ple_normed`, from the block's row 0) given.
+    pub(crate) fn rollback_verify_rows_retain_with(
+        &mut self,
+        gpu: &mut Gpu,
+        snapshot: Qwen4StateSnapshot,
+        keep: usize,
+        tokens: &[u32],
+        ple_normed: &GpuTensor,
+    ) -> Result<(), BundleError> {
         self.state
             .rollback_rows_retain(
                 gpu,
@@ -1168,6 +1197,42 @@ impl Qwen4Bundle {
                 self.config.indexer_budget,
             )
             .map_err(BundleError::State)
+    }
+
+    /// The forward scratch's PLE convolution input rows from row `row`
+    /// through `row + rows` (`hc_count * hidden_size` F32 per row); a view
+    /// running to the end of the scratch tensor, valid until the next forward.
+    pub(crate) fn lane_ple_normed_rows(
+        &self,
+        row: usize,
+        rows: usize,
+    ) -> Result<GpuTensor, BundleError> {
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("PLE row width overflow".to_string()))?;
+        let tensor = &self
+            .execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?
+            .scratch
+            .ple_normed;
+        let offset = row
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("PLE row offset overflow".to_string()))?;
+        let end = row
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(width))
+            .ok_or_else(|| BundleError::Forward("PLE row extent overflow".to_string()))?;
+        if end > tensor.numel() {
+            return Err(BundleError::Forward(
+                "Qwen4 PLE rows are outside the forward scratch".to_string(),
+            ));
+        }
+        Ok(tensor.sub_offset(offset, tensor.numel() - offset))
     }
 
     /// Start reading the PLE rows `tokens` (the next tokens after the
@@ -1271,6 +1336,63 @@ impl Qwen4Bundle {
         .ok_or_else(|| {
             BundleError::Forward("MTP prediction requested but no token produced".into())
         })
+    }
+
+    /// [`Self::mtp_forward_token`] with the draft read deferred: the draft's
+    /// device work lands in `top1_out` (Raw, at least `Gpu::TOPK8_OUT_BYTES`)
+    /// and [`Self::mtp_draft_finish`] parses it once downloaded.
+    pub(crate) fn mtp_forward_token_deferred(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+        top1_out: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        mapped_mtp(self.mtp.as_mut(), gpu, position)?
+            .forward_token_deferred(
+                gpu,
+                &self.weights,
+                &self.config,
+                token,
+                backbone_hidden,
+                position,
+                fresh_qsa_selection,
+                top1_out,
+            )
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Parse a downloaded deferred draft (`top1_out`'s first
+    /// `Gpu::TOPK8_OUT_BYTES` bytes): the draft token, with the head's
+    /// margin and candidates updated as `draft` does.
+    pub(crate) fn mtp_draft_finish(&mut self, top: &[u8]) -> Result<u32, BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .draft
+            .draft_finish(top)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Every byte family of the resident MTP head state
+    /// ([`crate::mtp_gpu::lab_head_items`]) followed by its draft request
+    /// state (`full_steps` u32 LE, `margin` f32 LE).
+    #[cfg(feature = "lab")]
+    pub fn lab_resident_head_items(&self, gpu: &Gpu) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP resources are not attached".to_string())?;
+        let mut items = crate::mtp_gpu::lab_head_items(gpu, &mtp.state)?;
+        let request = mtp.draft.request_state();
+        let mut bytes = request.full_steps.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&request.margin.to_le_bytes());
+        items.push(("draft_request_state".to_string(), bytes));
+        Ok(items)
     }
 
     /// Exact logit margin of the last MTP draft over its runner-up.
@@ -2088,14 +2210,17 @@ impl Qwen4Bundle {
         self.state_format
     }
 
-    /// Stage the exact AR lane store: `max_lanes` request owners, at most
-    /// `row_budget` AR rows per step. Lane states are allocated on first
-    /// admission into a slot.
+    /// Stage the exact lane store: `max_lanes` request owners, at most
+    /// `row_budget` decode lanes per step. Lane states are allocated on first
+    /// admission into a slot. With `spec` every lane is an MTP lane (native
+    /// MTP windows of at most `spec.k` drafts); refused when the bundle has
+    /// no MTP head or `k + 1` verify rows exceed `LANE_MAX_ROWS`.
     pub fn stage_lanes(
         &mut self,
         gpu: &mut Gpu,
         max_lanes: usize,
         row_budget: usize,
+        spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
         if self.lanes.is_some() {
             return Err(BundleError::Forward(
@@ -2107,7 +2232,25 @@ impl Qwen4Bundle {
                 "Qwen4 lanes need the attached forward".to_string(),
             ));
         }
-        let store = crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget)
+        if let Some(spec) = spec {
+            if self.mtp.is_none() {
+                return Err(BundleError::Forward(
+                    "Qwen4 MTP lanes need the attached MTP head".to_string(),
+                ));
+            }
+            if spec.k == 0 || spec.k + 1 > crate::gpu_forward_lanes::LANE_MAX_ROWS {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 MTP lanes need 1 <= k <= {}, got {}",
+                    crate::gpu_forward_lanes::LANE_MAX_ROWS - 1,
+                    spec.k
+                )));
+            }
+            // The lanes' prompt fill captures wide hidden rows into the
+            // resident spec buffer, as the singleton prefill does.
+            let chunk = self.spec_chunk_rows().unwrap_or(1).max(1);
+            self.ensure_spec_hidden(gpu, (spec.k + 1).max(chunk))?;
+        }
+        let store = crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget, spec)
             .map_err(BundleError::Forward)?;
         self.lanes = Some(store);
         Ok(())
@@ -2237,11 +2380,79 @@ impl Qwen4Bundle {
             .min(remaining)
     }
 
+    /// Run `f` with the lane's `state` (and, when given, its head state and
+    /// draft request state) swapped into the resident slots, the session
+    /// cache out and the forward in lane scope with no PLE lookahead, so
+    /// the singleton chunk/verify/head programs run on the lane's own
+    /// states and never record or replay the resident state's retained
+    /// body. Everything is back in place, the lane's updated draft request
+    /// state written to `head`, before this returns; `Err` is only returned
+    /// before anything was swapped (no forward attached, or `head` given
+    /// with no MTP head attached).
+    pub(crate) fn with_lane<R>(
+        &mut self,
+        state: &mut Qwen4State,
+        head: Option<(
+            &mut crate::mtp_gpu::MtpGpuState,
+            &mut hipfire_dispatch::pipeline::DraftHeadRequestState,
+        )>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, BundleError> {
+        if self.execution.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 forward resources are not attached".to_string(),
+            ));
+        }
+        if head.is_some() && self.mtp.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 MTP resources are not attached".to_string(),
+            ));
+        }
+        let mut head = head;
+        let session = self.session.take();
+        std::mem::swap(&mut self.state, state);
+        let resident_draft = match (head.as_mut(), self.mtp.as_mut()) {
+            (Some((head_state, draft)), Some(mtp)) => {
+                std::mem::swap(&mut mtp.state, &mut **head_state);
+                let resident = mtp.draft.request_state();
+                mtp.draft.set_request_state(**draft);
+                Some(resident)
+            }
+            _ => None,
+        };
+        let prior_scope = match self.execution.as_mut() {
+            Some(forward) => {
+                let prior = forward.lane_scope;
+                forward.lane_scope = true;
+                // No lookahead names this lane's next rows: never adopt
+                // another request's PLE ticket by accident (ids would have
+                // to match exactly, which keeps bytes identical anyway, but
+                // the prefetch is wasted).
+                forward.set_ple_lookahead(&[]);
+                prior
+            }
+            None => false,
+        };
+        let result = f(self);
+        if let Some(forward) = self.execution.as_mut() {
+            forward.lane_scope = prior_scope;
+        }
+        if let (Some(resident), Some((head_state, draft)), Some(mtp)) =
+            (resident_draft, head.as_mut(), self.mtp.as_mut())
+        {
+            **draft = mtp.draft.request_state();
+            mtp.draft.set_request_state(resident);
+            std::mem::swap(&mut mtp.state, &mut **head_state);
+        }
+        std::mem::swap(&mut self.state, state);
+        self.session = session;
+        Ok(result)
+    }
+
     /// One prefill tile of a lane: the singleton chunk program
-    /// (`forward_chunk_final` / `forward_chunk_silent`) on `state`. The lane
-    /// state is swapped in for the call only; the session cache stays out
-    /// (lanes keep none) and the forward runs in lane scope, so it never
-    /// records or replays the resident state's retained body. The resident
+    /// (`forward_chunk_final` / `forward_chunk_silent`) on `state`, inside
+    /// [`Self::with_lane`] (lanes keep no session cache; the forward never
+    /// records or replays the resident state's retained body). The resident
     /// state is back in place on every return path.
     pub(crate) fn lane_prefill_tile(
         &mut self,
@@ -2250,34 +2461,26 @@ impl Qwen4Bundle {
         tokens: &[u32],
         final_logits: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
-        let mut forward = self.execution.take().ok_or_else(|| {
-            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
-        })?;
-        let session = self.session.take();
-        std::mem::swap(&mut self.state, state);
-        forward.lane_scope = true;
-        // No lookahead names this lane's next rows: never adopt another
-        // request's PLE ticket by accident (ids would have to match exactly,
-        // which keeps bytes identical anyway, but the prefetch is wasted).
-        forward.set_ple_lookahead(&[]);
-        let result = match final_logits {
-            Some(logits) => forward.forward_chunk(
-                self,
-                gpu,
-                tokens,
-                logits,
-                None,
-                None,
-                Qwen4OutputRows::Final,
-            ),
-            None => forward.forward_chunk_silent(self, gpu, tokens, None),
-        }
-        .map_err(|error| BundleError::Forward(error.to_string()));
-        forward.lane_scope = false;
-        std::mem::swap(&mut self.state, state);
-        self.session = session;
-        self.execution = Some(forward);
-        result
+        self.with_lane(state, None, |bundle| {
+            let mut forward = bundle.execution.take().ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?;
+            let result = match final_logits {
+                Some(logits) => forward.forward_chunk(
+                    bundle,
+                    gpu,
+                    tokens,
+                    logits,
+                    None,
+                    None,
+                    Qwen4OutputRows::Final,
+                ),
+                None => forward.forward_chunk_silent(bundle, gpu, tokens, None),
+            }
+            .map_err(|error| BundleError::Forward(error.to_string()));
+            bundle.execution = Some(forward);
+            result
+        })?
     }
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {

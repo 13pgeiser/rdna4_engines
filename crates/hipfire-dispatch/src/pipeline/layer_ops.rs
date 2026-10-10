@@ -1432,11 +1432,16 @@ impl GatedDeltaNetOp<'_> {
         self.validate_layout()
     }
 
-    /// A row capture spans the whole op: a split phase cannot honor it.
+    /// A row capture spans the stateful part of the op: the whole mixer, or
+    /// its core when the input projections ran in an earlier call (the core
+    /// then copies the qkv projection rows into the capture's `inputs`). The
+    /// projection-only phases cannot honor one.
     fn check_phase(&self) -> Result<(), DispatchError> {
-        if self.phase != MixerPhase::Whole && self.row_capture.is_some() {
+        if matches!(self.phase, MixerPhase::InProj | MixerPhase::OutProj)
+            && self.row_capture.is_some()
+        {
             return Err(DispatchError::Hip(
-                "GDN row capture needs the whole mixer op".into(),
+                "GDN row capture needs the whole mixer op or its core".into(),
             ));
         }
         Ok(())
@@ -1636,10 +1641,16 @@ pub fn execute_gated_delta_net_hc(
     }
     let capture = op.row_capture.as_ref();
     // A row capture keeps the qkv projection and the recurrence inputs:
-    // write them straight into it.
+    // write them straight into it. A split core receives the projection
+    // the input phase left in `op.projection`, copied into the capture
+    // unchanged (the convolution reads the same values either way).
     let mut conv_output = view(op.projection2, 0, op.rows * qkv);
     if let Some(capture) = capture {
-        projection = view(capture.inputs, 0, op.rows * qkv);
+        let inputs = view(capture.inputs, 0, op.rows * qkv);
+        if phase == MixerPhase::Core {
+            hip(gpu.copy_d2d(&projection, &inputs, inputs.byte_size()))?;
+        }
+        projection = inputs;
         let heads = op.rows * op.value_heads;
         conv_output = view(capture.recurrence, 0, op.rows * qkv);
         gate = view(capture.recurrence, op.rows * qkv, heads);
@@ -3572,10 +3583,15 @@ mod tests {
     }
 
     #[test]
-    fn gdn_split_phase_refuses_a_row_capture() {
+    fn gdn_projection_phases_refuse_a_row_capture() {
         let fixture = GdnFixture::new();
         let scratch = tensor(64, DType::F32);
-        for phase in [MixerPhase::InProj, MixerPhase::Core, MixerPhase::OutProj] {
+        for (phase, refused) in [
+            (MixerPhase::InProj, true),
+            (MixerPhase::OutProj, true),
+            (MixerPhase::Core, false),
+            (MixerPhase::Whole, false),
+        ] {
             let mut op = fixture.op();
             op.phase = phase;
             op.row_capture = Some(GdnRowCapture {
@@ -3583,11 +3599,9 @@ mod tests {
                 inputs: &scratch,
                 recurrence: &scratch,
             });
-            let error = op
-                .validate_layout()
-                .expect_err("a row capture needs the whole mixer op");
-            assert!(
-                error.to_string().contains("GDN row capture needs the whole mixer op"),
+            assert_eq!(
+                op.check_phase().is_err(),
+                refused,
                 "{phase:?}"
             );
         }

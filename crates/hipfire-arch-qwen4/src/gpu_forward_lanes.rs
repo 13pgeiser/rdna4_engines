@@ -2,13 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact AR lane step (Flash-Next lane batching, fn-batch S2).
+//! Exact lane step (Flash-Next lane batching, fn-batch S2 AR rows, S5 MTP
+//! verify rows).
 //!
 //! One trunk step over several admitted requests ("lanes"), each with its
 //! own [`Qwen4State`]. Per lane, the committed state and logits must be
-//! byte-identical to that request run alone on the singleton AR route
-//! (`Qwen4Bundle::prefill_final` + `forward_token_or_argmax`), so the step is
-//! built from the singleton's own typed layer operations with one rule:
+//! byte-identical to that request run alone on the singleton route the lane
+//! takes: an AR row is `forward_token_or_argmax`, a verify block
+//! `[seed, drafts..]` is the native MTP window's `verify_block` (armed GDN
+//! ring, wide-hidden capture). The step is built from the singleton's own
+//! typed layer operations with one rule:
 //!
 //! - **Stateful stages** (PLE convolution, GDN conv/recurrence/gate, QSA
 //!   prologue/select/attend) always run per lane, on the lane's state, with
@@ -332,10 +335,15 @@ impl LaneStagePolicy {
     }
 }
 
-/// What a lane's rows do this step. Verify rows arrive with MTP lanes (S5).
+/// What a lane's rows do this step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneRowKind {
+    /// One AR row (the lane's pending seed); no GDN row capture.
     Ar,
+    /// An MTP verify block `[seed, drafts..]` of `1 + draft_len` rows
+    /// (`2..=LANE_MAX_ROWS`), run under the lane's armed GDN ring exactly as
+    /// the singleton `verify_block` runs it.
+    Verify { draft_len: usize },
 }
 
 /// One lane's rows in a step.
@@ -351,6 +359,10 @@ pub struct LaneOutputs<'a> {
     pub logits: &'a GpuTensor,
     /// Raw, at least `total_rows * 4` bytes (one i32 per row).
     pub top1: &'a GpuTensor,
+    /// F32, at least `total_rows * hc_count * hidden` elements: every row's
+    /// final HC streams (the trunk output before the final hyper read),
+    /// exactly what the singleton's wide-hidden capture writes.
+    pub wide_hidden: Option<&'a GpuTensor>,
 }
 
 /// A contiguous row range of the step: one lane, or a group of lanes a
@@ -633,12 +645,15 @@ fn layer_program(
 /// post-forward commit): `(lane, qsa slot, full, raw, pooled, selected, position)`.
 type QsaCommit = (usize, usize, usize, usize, usize, usize, usize);
 
-/// One exact trunk step over AR lanes (see the module docs). Row `r` of the
-/// outputs belongs to the lanes concatenated in slice order. On success
-/// every lane's host state is published exactly as the singleton forward
-/// publishes it (QSA lengths, PLE history, `position += rows`); on failure
-/// nothing host-side is published and the caller must treat the lanes'
-/// device state as untrusted.
+/// One exact trunk step over lanes (see the module docs): AR rows and MTP
+/// verify blocks. Row `r` of the outputs belongs to the lanes concatenated in
+/// slice order. On success every lane's host state is published exactly as
+/// the singleton forward publishes it (QSA lengths, PLE history, the armed
+/// ring's live slot, `position += rows`); a verify lane's PLE convolution
+/// input rows stay in the forward scratch at the lane's first row until the
+/// next forward ([`Qwen4Bundle::lane_ple_normed_rows`]). On failure nothing
+/// host-side is published and the caller must treat the lanes' device state
+/// as untrusted.
 pub(crate) fn forward_lanes(
     gpu: &mut Gpu,
     bundle: &mut Qwen4Bundle,
@@ -675,11 +690,32 @@ fn forward_lanes_scoped(
     let rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
     let n: usize = rows.iter().sum();
     for (lane, rows) in lanes.iter().zip(&rows) {
-        match lane.kind {
-            LaneRowKind::Ar if *rows == 1 => {}
-            LaneRowKind::Ar => return Err(invalid("an AR lane contributes exactly one row")),
-        }
         let state = &*lane.state;
+        match lane.kind {
+            LaneRowKind::Ar if *rows != 1 => {
+                return Err(invalid("an AR lane contributes exactly one row"));
+            }
+            LaneRowKind::Ar if state.row_capture_armed => {
+                return Err(invalid("an AR lane row never arms a GDN row capture"));
+            }
+            LaneRowKind::Ar => {}
+            LaneRowKind::Verify { draft_len } => {
+                if draft_len == 0 || *rows != draft_len + 1 || *rows > LANE_MAX_ROWS {
+                    return Err(invalid(format!(
+                        "a verify lane carries 1 + {draft_len} rows within {LANE_MAX_ROWS}, got {rows}"
+                    )));
+                }
+                // The singleton's `verify_block` arms the ring for exactly
+                // this shape; a lane verify never runs without it.
+                if !state.row_capture_armed || state.row_capture_rows() < *rows {
+                    return Err(invalid(format!(
+                        "a {rows}-row verify lane needs its armed GDN ring (armed {}, {} rows)",
+                        state.row_capture_armed,
+                        state.row_capture_rows()
+                    )));
+                }
+            }
+        }
         let end = state
             .position
             .checked_add(*rows)
@@ -696,9 +732,6 @@ fn forward_lanes_scoped(
                 state.mapped_context_tokens()
             )));
         }
-        if state.row_capture_armed {
-            return Err(invalid("an AR lane step never arms a GDN row capture"));
-        }
         if lane.tokens.iter().any(|&token| token as usize >= vocab) {
             return Err(invalid("lane token id is outside the embedding vocabulary"));
         }
@@ -714,6 +747,13 @@ fn forward_lanes_scoped(
     }
     if out.top1.dtype != DType::Raw || out.top1.buf.size() < n * std::mem::size_of::<i32>() {
         return Err(invalid("lane top1 must be Raw with one i32 per row"));
+    }
+    if let Some(capture) = out.wide_hidden {
+        if capture.dtype != DType::F32 || capture.numel() < n * dims.wide() {
+            return Err(invalid(
+                "lane wide hidden capture must be F32 with total_rows * hc_count * hidden elements",
+            ));
+        }
     }
     // Before anything reads an expert a failed staged prefill left in a donor.
     fwd.restore_expert_stage(gpu)?;
@@ -1178,6 +1218,24 @@ fn forward_lanes_scoped(
             )?;
         }
         execute(gpu, &steps[split..])?;
+
+        // Wide hidden capture: every row's final streams, lanes concatenated
+        // (the singleton verify's `wide_hidden_capture` copy).
+        if let Some(capture) = out.wide_hidden {
+            let wide_elements = n * dims.wide();
+            let source = view(&scratch.streams, 0, wide_elements);
+            let destination = view(capture, 0, wide_elements);
+            if bf16_state {
+                rdna_compute::tensor_ops::hc_state_bf16_to_f32(
+                    gpu,
+                    &source,
+                    &destination,
+                    wide_elements,
+                )?;
+            } else {
+                gpu.copy_d2d(&source, &destination, destination.byte_size())?;
+            }
+        }
 
         // Final HC read, LM head, greedy top-1.
         let final_share = policy.share(StageName::FinalHyper);

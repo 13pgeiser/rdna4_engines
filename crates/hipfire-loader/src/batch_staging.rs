@@ -513,8 +513,10 @@ pub fn stage_continuous_batch(
     Ok(out)
 }
 
-/// Stage the exact Flash-Next (qwen4) AR lane store beside the resident
-/// bundle. Qwen4 has only the exact route: the non-exact `VmmRoute` and any
+/// Stage the exact Flash-Next (qwen4) lane store beside the resident
+/// bundle: native MTP lanes when `req.spec` (`serve.batch_spec`) is on and
+/// the loaded model carries the MTP head, AR lanes otherwise. Qwen4 has only
+/// the exact route: the non-exact `VmmRoute` and any
 /// non-VMM QSA backend are refused, as is a lane store that does not fit the
 /// free device memory. Every refusal logs the reason and keeps the singleton
 /// route (`capable == false`); nothing is staged.
@@ -534,9 +536,27 @@ fn stage_qwen4_lanes(
         return refuse("qwen4 has only the exact lane route");
     }
     let max_seq = m.max_seq;
+    let spec_off_reason = if !req.spec {
+        Some("serve.batch_spec off")
+    } else if !m.mtp_weights_present {
+        Some("no MTP head loaded")
+    } else if m.mtp_mode == "off" {
+        Some("MTP mode off")
+    } else {
+        None
+    };
+    // The lane ring is `K + 1` rows and a verify block is at most
+    // `LANE_MAX_ROWS` rows, so the lane draft depth is bounded by it.
+    let spec_k = m.mtp_k.min(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1).max(1);
+    let end_of_turn = m.tokenizer.as_ref().and_then(|t| t.special_token_id("<|im_end|>"));
     let Some(bundle) = m.qwen4_mut() else {
         return refuse("model state not Qwen4");
     };
+    let spec = spec_off_reason.is_none().then_some(hipfire_arch_qwen4::lane::LaneSpecConfig {
+        k: spec_k,
+        end_of_turn,
+    });
+    let spec_on_k = spec.as_ref().map(|s| s.k);
     if bundle.state.qsa_backend() != Qwen4KvBackend::Vmm {
         return refuse("QSA context backend is not VMM");
     }
@@ -554,6 +574,7 @@ fn stage_qwen4_lanes(
         &context,
         requested,
         row_budget,
+        spec_on_k,
     ) else {
         return refuse("lane store device bytes overflow");
     };
@@ -568,14 +589,19 @@ fn stage_qwen4_lanes(
             free >> 20
         ));
     }
-    if let Err(e) = bundle.stage_lanes(gpu, requested, row_budget) {
+    if let Err(e) = bundle.stage_lanes(gpu, requested, row_budget, spec) {
         return refuse(&format!("staging failed: {e}"));
     }
     let Some(store) = bundle.lanes() else {
         return refuse("lane store missing after staging");
     };
+    let spec_log = match (spec_on_k, spec_off_reason) {
+        (Some(k), _) => format!("mtp K={k}"),
+        (None, Some(reason)) => format!("off ({reason})"),
+        (None, None) => "off".to_string(),
+    };
     eprintln!(
-        "[daemon] qwen4 fn-lanes staged: lanes={requested} row_budget={} policy={}",
+        "[daemon] qwen4 fn-lanes staged: lanes={requested} row_budget={} spec={spec_log} policy={}",
         store.row_budget(),
         store.stage_policy().describe()
     );

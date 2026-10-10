@@ -2649,8 +2649,9 @@ fn qwen4_lane_request_supported(
     tools_ok && images_ok && logprobs_ok
 }
 
-/// Qwen4 load-ack fields: `fn-lanes` route, exact greedy-only lanes with
-/// speculation off, plus the staged `LaneStoreReceipt`.
+/// Qwen4 load-ack fields: `fn-lanes` route, exact greedy-only lanes (native
+/// MTP lanes when the staged receipt says `spec == "mtp"`, AR lanes
+/// otherwise), plus the staged `LaneStoreReceipt`.
 fn qwen4_lane_ack_fields(
     v: &mut serde_json::Value,
     r: &hipfire_arch_qwen4::lane::LaneStoreReceipt,
@@ -2665,8 +2666,12 @@ fn qwen4_lane_ack_fields(
     v["continuous_batch_slots"] = serde_json::json!(slots);
     v["continuous_batch_row_budget"] = serde_json::json!(row_budget);
     v["continuous_batch_row_budget_requested"] = serde_json::json!(p.max_batch_tokens);
-    v["continuous_batch_spec"] = serde_json::json!(false);
-    v["continuous_batch_spec_mode"] = serde_json::json!("off");
+    let spec_on = r.spec == "mtp";
+    v["continuous_batch_spec"] = serde_json::json!(spec_on);
+    v["continuous_batch_spec_mode"] = serde_json::json!(r.spec);
+    if spec_on {
+        v["continuous_batch_spec_k"] = serde_json::json!(r.spec_k);
+    }
     v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);
     v["continuous_batch_nonexact"] = serde_json::json!(false);
     v["continuous_batch_exact"] = serde_json::json!(true);
@@ -7196,6 +7201,8 @@ mod tests {
             mapped_bytes: 123_456,
             stage_policy: "embed=once,argmax=once".to_string(),
             stage_evidence: "g0-receipt",
+            spec: "mtp",
+            spec_k: 3,
         };
         let mut v = serde_json::json!({"type": "loaded"});
         let params = VmmBatchParams {
@@ -7211,8 +7218,9 @@ mod tests {
         assert_eq!(v["continuous_batch_slots"], 4);
         assert_eq!(v["continuous_batch_row_budget"], 32);
         assert_eq!(v["continuous_batch_row_budget_requested"], 4096);
-        assert_eq!(v["continuous_batch_spec"], false);
-        assert_eq!(v["continuous_batch_spec_mode"], "off");
+        assert_eq!(v["continuous_batch_spec"], true);
+        assert_eq!(v["continuous_batch_spec_mode"], "mtp");
+        assert_eq!(v["continuous_batch_spec_k"], 3);
         assert_eq!(v["continuous_batch_spec_requested"], true);
         assert_eq!(v["continuous_batch_exact"], true);
         assert_eq!(v["continuous_batch_nonexact"], false);
@@ -7226,6 +7234,13 @@ mod tests {
         assert_eq!(v["fn_lanes_mapped_bytes"], 123_456);
         assert_eq!(v["fn_lanes_stage_policy"], "embed=once,argmax=once");
         assert_eq!(v["fn_lanes_stage_evidence"], "g0-receipt");
+        let off = hipfire_arch_qwen4::lane::LaneStoreReceipt { spec: "off", spec_k: 0, ..receipt };
+        let mut w = serde_json::json!({"type": "loaded"});
+        qwen4_lane_ack_fields(&mut w, &off, 4, 32, params);
+        assert_eq!(w["continuous_batch_spec"], false);
+        assert_eq!(w["continuous_batch_spec_mode"], "off");
+        assert!(w.get("continuous_batch_spec_k").is_none());
+        assert_eq!(w["continuous_batch_spec_requested"], true);
     }
 
     #[test]

@@ -2,14 +2,19 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact AR lane store of the Flash-Next batch route.
+//! Exact lane store of the Flash-Next batch route.
 //!
 //! A lane is one admitted request with its own [`Qwen4State`]; nothing is
-//! shared between lanes but the weights. [`Qwen4LaneStore`] owns the lanes
-//! and the step output buffers; [`crate::lane_exec::Qwen4LaneExecutor`] runs
-//! plans over it. The host-side lane table ([`LaneTable`]) is generic over
-//! its device payload so its admission/release/poison rules are covered by
-//! CPU tests.
+//! shared between lanes but the weights. A store staged with a
+//! [`LaneSpecConfig`] makes every lane an MTP lane: it also owns the lane's
+//! MTP head state, draft request state, pending hidden, GDN capture ring and
+//! window policy ([`LaneSpec`]), and the store shares the step buffers MTP
+//! windows need (wide-hidden capture, the batched draft's top-1 slots, the
+//! prompt-fill append scratch, the step cost model). [`Qwen4LaneStore`] owns
+//! the lanes and the step output buffers; [`crate::lane_exec::Qwen4LaneExecutor`]
+//! runs plans over it. The host-side lane table ([`LaneTable`]) is generic
+//! over its device payload so its admission/release/poison rules are
+//! covered by CPU tests.
 //!
 //! Lane device states are allocated on a slot's first admission and kept
 //! across releases: a later admission into that slot resets the state in
@@ -17,13 +22,17 @@
 
 use crate::bundle::Qwen4Bundle;
 use crate::config::Qwen4Config;
-use crate::gpu_forward_lanes::LaneStagePolicy;
+use crate::gpu_forward_lanes::{LaneStagePolicy, LANE_MAX_ROWS};
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::lane_exec::LanePhase;
-use crate::mtp_gpu::MtpGpuState;
+use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState, MTP_FILL_ROWS};
+use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy, PendingWindow};
+use crate::mtp_spec::{mtp_batched_fill_enabled, native_mtp_row_capture};
 use crate::state::{Qwen4State, Qwen4StateFormat};
+use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::time::Instant;
 
 /// Most lanes one store holds.
 const MAX_LANES: usize = 64;
@@ -34,7 +43,8 @@ pub struct LaneStoreReceipt {
     pub kv_backend: &'static str,
     pub qsa_format: &'static str,
     pub gdn_format: &'static str,
-    /// GDN capture rows armed per lane (0: AR lanes arm no ring).
+    /// GDN capture rows armed per lane (0: AR lanes arm no ring; MTP lanes
+    /// arm `k + 1`).
     pub ring_rows: usize,
     pub max_lanes: usize,
     pub row_budget: usize,
@@ -42,6 +52,10 @@ pub struct LaneStoreReceipt {
     pub mapped_bytes: u64,
     pub stage_policy: String,
     pub stage_evidence: &'static str,
+    /// `"mtp"` when every lane is an MTP lane, else `"off"`.
+    pub spec: &'static str,
+    /// Most drafts one window carries (0 without spec).
+    pub spec_k: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,12 +87,125 @@ pub struct LaneHost {
     pub stamp: u64,
 }
 
+/// Staging of the lanes' native MTP windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneSpecConfig {
+    /// Most drafts per window, `1..=7` (`k + 1` verify rows fit
+    /// [`LANE_MAX_ROWS`] and the lane's `k + 1`-row GDN ring).
+    pub k: usize,
+    /// The end-of-turn token a window stops at; `None` uses the model's EOS.
+    pub end_of_turn: Option<u32>,
+}
+
+/// Counters of one MTP lane's windows (read after the request, or at any
+/// step boundary).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LaneSpecStats {
+    /// Native windows: batched windows and `ArSynced` AR rows.
+    pub windows: u64,
+    /// Head-free AR rows after retirement.
+    pub ar_windows: u64,
+    /// Drafts verified.
+    pub drafts: u64,
+    /// Drafts accepted.
+    pub accepted: u64,
+    /// The lane's floor retired it to head-free AR.
+    pub retired: bool,
+}
+
+/// Lab route modes of the store's window router.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LabRoutes {
+    /// The lane floor (production).
+    #[default]
+    Floor,
+    /// `Batched{K}`, `Batched{1}`, `ArSynced`, `Batched{2}` three times,
+    /// then `ArRetired`.
+    Cycle,
+    /// Every window drafts its whole budget.
+    Batched,
+}
+
+/// One MTP lane's device state next to its trunk state.
+pub struct LaneSpec {
+    /// The lane's MTP head state (QSA arenas, selection, wide hidden).
+    pub head: MtpGpuState,
+    /// The draft head's request-local policy (full-vocabulary hold, margin).
+    pub draft: DraftHeadRequestState,
+    /// `[hc_count * hidden]` F32: the next window's row-0 head hidden.
+    pub pending_hidden: GpuTensor,
+    pub(crate) policy: LaneSpecPolicy,
+    /// The routed window between `draft_step` and `commit_step`.
+    pub(crate) window: Option<PendingWindow>,
+    pub stats: LaneSpecStats,
+}
+
+impl LaneSpec {
+    /// A fresh spec state: the trunk `state` gets its `k + 1`-row verify
+    /// ring, the head is built on the resident head's backend and context
+    /// bound.
+    fn new(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        spec: LaneSpecConfig,
+        head_max_seq: usize,
+        backend: Qwen4KvBackend,
+        state: &mut Qwen4State,
+    ) -> Result<Self, String> {
+        let config = &bundle.config;
+        state
+            .ensure_row_capture(gpu, spec.k + 1, config.linear_conv_kernel_dim - 1)
+            .map_err(|e| format!("lane ring: {e}"))?;
+        let head = MtpGpuState::new_with_backend(gpu, config, head_max_seq, backend)
+            .map_err(|e| format!("lane head state: {e}"))?;
+        let width = config
+            .hc_count
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| "lane pending hidden width overflow".to_string())?;
+        let pending_hidden = match gpu.zeros(&[width], DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = head.free_gpu(gpu);
+                return Err(format!("lane pending hidden: {error}"));
+            }
+        };
+        Ok(Self {
+            head,
+            draft: DraftHeadRequestState::default(),
+            pending_hidden,
+            policy: LaneSpecPolicy::new(spec.k),
+            window: None,
+            stats: LaneSpecStats::default(),
+        })
+    }
+
+    /// Back to a request's start: empty head, default draft policy, zero
+    /// pending hidden, fresh window policy and counters, no window.
+    fn reset(&mut self, gpu: &mut Gpu, k: usize) -> Result<(), String> {
+        self.head
+            .reset(gpu)
+            .map_err(|e| format!("lane head reset: {e}"))?;
+        self.draft = DraftHeadRequestState::default();
+        gpu.hip
+            .memset(
+                &self.pending_hidden.buf,
+                0,
+                self.pending_hidden.buf.size(),
+            )
+            .map_err(|e| format!("lane pending hidden reset: {e}"))?;
+        self.policy = LaneSpecPolicy::new(k);
+        self.window = None;
+        self.stats = LaneSpecStats::default();
+        Ok(())
+    }
+}
+
 /// One admitted request's whole device state.
 pub struct Qwen4LaneState {
     pub host: LaneHost,
     pub state: Qwen4State,
-    /// Always `None` on AR lanes.
-    pub mtp: Option<MtpGpuState>,
+    /// `Some` on every lane of a store staged with spec, `None` on AR lanes.
+    pub spec: Option<LaneSpec>,
 }
 
 /// A lane-table cell: host bookkeeping plus a device payload that outlives
@@ -91,10 +218,10 @@ trait LaneCell {
 }
 
 impl LaneCell for Qwen4LaneState {
-    type Payload = (Qwen4State, Option<MtpGpuState>);
+    type Payload = (Qwen4State, Option<LaneSpec>);
 
-    fn assemble(host: LaneHost, (state, mtp): Self::Payload) -> Self {
-        Self { host, state, mtp }
+    fn assemble(host: LaneHost, (state, spec): Self::Payload) -> Self {
+        Self { host, state, spec }
     }
 
     fn host(&self) -> &LaneHost {
@@ -267,17 +394,108 @@ impl<C: LaneCell> LaneTable<C> {
     }
 }
 
+/// Buffers and policy shared by the MTP lanes of one store.
+pub(crate) struct SpecStore {
+    pub config: LaneSpecConfig,
+    /// The resident head's context bound: every lane head is built with it.
+    pub head_max_seq: usize,
+    pub backend: Qwen4KvBackend,
+    /// F32, `rows_cap * hc_count * hidden`: the wide hidden of every decode
+    /// row of a step (the lane forward's capture).
+    pub hidden: GpuTensor,
+    /// Raw, `max_lanes * Gpu::TOPK8_OUT_BYTES`: one slot per still-drafting
+    /// lane per draft step.
+    pub draft_top1: GpuTensor,
+    /// Host mirror of `draft_top1`.
+    pub draft_top1_host: Vec<u8>,
+    /// Shared prompt-fill append scratch (`None` when batched fill is off or
+    /// unsupported).
+    pub append_scratch: Option<MtpAppendScratch>,
+    pub cost: LaneCostModel,
+    pub routes: LabRoutes,
+    /// Lab negative control: a rejected verify keeps its full rows.
+    pub skip_rollback: bool,
+}
+
+impl SpecStore {
+    fn new(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        config: LaneSpecConfig,
+        max_lanes: usize,
+        rows_cap: usize,
+    ) -> Result<Self, String> {
+        let mtp = bundle
+            .mtp
+            .as_ref()
+            .ok_or_else(|| "lane store: MTP lanes need the attached MTP head".to_string())?;
+        let (head_max_seq, backend) = (mtp.max_seq, mtp.state.backend());
+        let wide = bundle
+            .config
+            .hc_count
+            .checked_mul(bundle.config.hidden_size)
+            .ok_or_else(|| "lane store: hidden width overflow".to_string())?;
+        let hidden_elements = rows_cap
+            .checked_mul(wide)
+            .ok_or_else(|| "lane store: hidden capture extent overflow".to_string())?;
+        let hidden = gpu
+            .zeros(&[hidden_elements], DType::F32)
+            .map_err(|e| format!("lane store: hidden capture: {e}"))?;
+        let top1_bytes = max_lanes * Gpu::TOPK8_OUT_BYTES;
+        let draft_top1 = match gpu.zeros(&[top1_bytes], DType::Raw) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(hidden);
+                return Err(format!("lane store: draft top-1: {error}"));
+            }
+        };
+        let append_scratch = if mtp_batched_fill_enabled() && bundle.mtp_append_rows_supported(gpu)
+        {
+            let rows = MTP_FILL_ROWS.min(bundle.spec_chunk_rows().unwrap_or(1).max(1));
+            // Prompt-id rows = append rows: a tile of at most `rows` rows
+            // uploads its ids once; a longer one uploads per sub-chunk
+            // (`append_rows`' own upload, the same bytes).
+            match MtpAppendScratch::new(gpu, &bundle.config, rows, rows) {
+                Ok(scratch) => Some(scratch),
+                Err(error) => {
+                    let _ = gpu.free_tensor(hidden);
+                    let _ = gpu.free_tensor(draft_top1);
+                    return Err(format!("lane store: append scratch: {error}"));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            config,
+            head_max_seq,
+            backend,
+            hidden,
+            draft_top1,
+            draft_top1_host: vec![0; top1_bytes],
+            append_scratch,
+            cost: LaneCostModel::new(max_lanes),
+            routes: LabRoutes::Floor,
+            skip_rollback: false,
+        })
+    }
+}
+
 /// Disjoint borrows one step needs out of the store.
 pub(crate) struct StepParts<'a> {
     /// The planned lanes, in plan order.
     pub lanes: Vec<&'a mut Qwen4LaneState>,
-    /// F32, `2 * max_lanes * vocab`.
+    /// F32, `(rows_cap + max_lanes) * vocab`.
     pub logits: &'a GpuTensor,
-    /// Raw, `2 * max_lanes * 4` bytes.
+    /// Raw, `(rows_cap + max_lanes) * 4` bytes.
     pub top1: &'a GpuTensor,
     pub policy: LaneStagePolicy,
     /// Host mirror of `top1`.
     pub top1_host: &'a mut Vec<u8>,
+    /// Decode rows the step buffers hold: `max_lanes * (k + 1)` with spec,
+    /// else `max_lanes`.
+    pub rows_cap: usize,
+    pub spec: Option<&'a mut SpecStore>,
 }
 
 /// The lane owner: lanes, step output buffers, stage policy and the step
@@ -289,23 +507,33 @@ pub struct Qwen4LaneStore {
     format: Qwen4StateFormat,
     backend: Qwen4KvBackend,
     policy: LaneStagePolicy,
-    /// Rows `[0, max_lanes)`: the AR rows of a step; `[max_lanes,
-    /// 2 * max_lanes)`: the prompt-completing prefill rows.
+    /// Decode rows the step buffers hold (`max_lanes * (k + 1)` with spec,
+    /// else `max_lanes`).
+    rows_cap: usize,
+    /// Rows `[0, rows_cap)`: the decode rows of a step (the planned decode
+    /// requests' rows concatenated in plan order); `[rows_cap, rows_cap +
+    /// max_lanes)`: the prompt-completing prefill rows.
     logits: GpuTensor,
     top1: GpuTensor,
     top1_host: Vec<u8>,
+    spec: Option<SpecStore>,
     pub(crate) phase: LanePhase,
     pub(crate) next_step_id: u64,
+    /// Start of the step's wall clock: set by `draft_step` (or provision when
+    /// no draft ran), taken by the forward.
+    pub(crate) step_started: Option<Instant>,
 }
 
 impl Qwen4LaneStore {
     /// An empty store for `max_lanes` lanes (states are allocated on first
-    /// admission into a slot) and its step output buffers.
+    /// admission into a slot) and its step output buffers. With `spec`
+    /// every lane is an MTP lane.
     pub(crate) fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         max_lanes: usize,
         row_budget: usize,
+        spec: Option<LaneSpecConfig>,
     ) -> Result<Self, String> {
         if max_lanes == 0 || max_lanes > MAX_LANES {
             return Err(format!("lane store: max_lanes {max_lanes} outside 1..={MAX_LANES}"));
@@ -313,7 +541,28 @@ impl Qwen4LaneStore {
         if row_budget == 0 {
             return Err("lane store: row_budget must be at least 1".to_string());
         }
-        let rows = max_lanes * 2;
+        if let Some(spec) = spec {
+            if spec.k == 0 || spec.k + 1 > LANE_MAX_ROWS {
+                return Err(format!(
+                    "lane store: MTP k {} outside 1..={}",
+                    spec.k,
+                    LANE_MAX_ROWS - 1
+                ));
+            }
+            if bundle.mtp.is_none() {
+                return Err("lane store: MTP lanes need the attached MTP head".to_string());
+            }
+            if !native_mtp_row_capture(gpu, &bundle.config) {
+                return Err(
+                    "lane store: MTP lanes need the GDN row capture this GPU lacks".to_string(),
+                );
+            }
+        }
+        let rows_cap = match spec {
+            Some(spec) => max_lanes * (spec.k + 1),
+            None => max_lanes,
+        };
+        let rows = rows_cap + max_lanes;
         let vocab = bundle.lane_vocab();
         let logit_elements = rows
             .checked_mul(vocab)
@@ -328,45 +577,88 @@ impl Qwen4LaneStore {
                 return Err(format!("lane store: top1: {error}"));
             }
         };
+        let spec_store = match spec {
+            Some(config) => match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    let _ = gpu.free_tensor(logits);
+                    let _ = gpu.free_tensor(top1);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         Ok(Self {
             table: LaneTable::new(max_lanes),
             row_budget: row_budget.min(max_lanes),
-            ring_rows: 0,
+            ring_rows: spec.map_or(0, |spec| spec.k + 1),
             format: bundle.state_format(),
             backend: bundle.state.qsa_backend(),
             // Shared stages only where G0 evidenced them (gfx1151).
             policy: LaneStagePolicy::for_arch(&gpu.arch),
+            rows_cap,
             logits,
             top1,
             top1_host: vec![0; rows * std::mem::size_of::<i32>()],
+            spec: spec_store,
             phase: LanePhase::Idle,
             next_step_id: 0,
+            step_started: None,
         })
     }
 
     /// Device bytes the store commits at load: `max_lanes` lane states
     /// ([`Qwen4State::device_bytes`]) plus the step logits and top-1
-    /// buffers. `_row_budget` is accepted for the frozen signature: AR rows
-    /// share the `max_lanes` output rows, so the budget adds nothing.
+    /// buffers; with `spec_k` each lane also holds its MTP head state, its
+    /// `k + 1`-row GDN ring and pending hidden, and the store the wide-hidden
+    /// capture, the draft top-1 slots and the prompt-fill append scratch
+    /// (counted at its `MTP_FILL_ROWS` bound: the real scratch is
+    /// `min(MTP_FILL_ROWS, forward max_chunk)` rows). `_row_budget` is
+    /// accepted for the frozen signature: decode rows share the
+    /// `max_lanes * (k + 1)` output rows, so the budget adds nothing.
     pub fn device_bytes(
         config: &Qwen4Config,
         format: Qwen4StateFormat,
         context: &Qwen4ContextCommit,
         max_lanes: usize,
         _row_budget: usize,
+        spec_k: Option<usize>,
     ) -> Option<u64> {
-        let state = Qwen4State::device_bytes(config, format, context)?;
-        let rows = max_lanes.checked_mul(2)?;
-        let outputs = rows
+        let f32_bytes = std::mem::size_of::<f32>();
+        let mut per_lane = Qwen4State::device_bytes(config, format, context)?;
+        let rows_cap = match spec_k {
+            Some(k) => max_lanes.checked_mul(k.checked_add(1)?)?,
+            None => max_lanes,
+        };
+        let rows = rows_cap.checked_add(max_lanes)?;
+        let mut shared = rows
             .checked_mul(config.vocab_size)?
-            .checked_mul(std::mem::size_of::<f32>())?
+            .checked_mul(f32_bytes)?
             .checked_add(rows.checked_mul(std::mem::size_of::<i32>())?)?;
-        u64::try_from(max_lanes.checked_mul(state)?.checked_add(outputs)?).ok()
+        if let Some(k) = spec_k {
+            let wide = config.hc_count.checked_mul(config.hidden_size)?;
+            let ring = Qwen4State::row_capture_bytes(config, format.gdn, k.checked_add(1)?)?;
+            per_lane = per_lane
+                .checked_add(MtpGpuState::device_bytes(config, context)?)?
+                .checked_add(ring)?
+                .checked_add(wide.checked_mul(f32_bytes)?)?;
+            let append = if mtp_batched_fill_enabled() {
+                MtpAppendScratch::device_bytes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).unwrap_or(0)
+            } else {
+                0
+            };
+            shared = shared
+                .checked_add(rows_cap.checked_mul(wide)?.checked_mul(f32_bytes)?)?
+                .checked_add(max_lanes.checked_mul(Gpu::TOPK8_OUT_BYTES)?)?
+                .checked_add(append)?;
+        }
+        u64::try_from(max_lanes.checked_mul(per_lane)?.checked_add(shared)?).ok()
     }
 
     /// Admit `epoch` with its canonical `prompt` into the lowest free lane
     /// and return its slot. A slot that held a request before resets its
-    /// state in place; a fresh slot allocates one.
+    /// state in place (an MTP lane also its head, draft policy, pending
+    /// hidden, window policy and counters); a fresh slot allocates one.
     pub fn admit(
         &mut self,
         gpu: &mut Gpu,
@@ -374,18 +666,47 @@ impl Qwen4LaneStore {
         epoch: RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, String> {
+        let spec_cfg = self
+            .spec
+            .as_ref()
+            .map(|s| (s.config, s.head_max_seq, s.backend));
         self.table.admit(epoch, prompt, |slot, existing| match existing {
             Some(cell) => {
                 cell.state
                     .reset(gpu)
                     .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
+                cell.state.row_capture_armed = false;
+                match (spec_cfg, cell.spec.as_mut()) {
+                    (Some((config, _, _)), Some(spec)) => spec
+                        .reset(gpu, config.k)
+                        .map_err(|e| format!("admit: reset lane {slot}: {e}"))?,
+                    (None, None) => {}
+                    _ => {
+                        return Err(format!(
+                            "admit: lane {slot} spec state does not match the store"
+                        ));
+                    }
+                }
                 Ok(None)
             }
             None => {
-                let state = bundle
+                let mut state = bundle
                     .new_lane_state(gpu)
                     .map_err(|e| format!("admit: allocate lane {slot}: {e}"))?;
-                Ok(Some((state, None)))
+                let spec = match spec_cfg {
+                    None => None,
+                    Some((config, head_max_seq, backend)) => {
+                        match LaneSpec::new(gpu, bundle, config, head_max_seq, backend, &mut state)
+                        {
+                            Ok(spec) => Some(spec),
+                            Err(error) => {
+                                let _ = state.free_gpu(gpu);
+                                return Err(format!("admit: allocate lane {slot}: {error}"));
+                            }
+                        }
+                    }
+                };
+                Ok(Some((state, spec)))
             }
         })
     }
@@ -395,8 +716,15 @@ impl Qwen4LaneStore {
         self.table.release(epoch)
     }
 
-    /// Mark `epoch`'s lane untrusted; unknown epochs are ignored.
     pub fn poison(&mut self, epoch: &RequestEpoch) {
+        if let Some(lane) = self.table.get_mut(epoch) {
+            // A half-run window's tickets die with it: the next admission's
+            // reset invalidates them.
+            lane.state.row_capture_armed = false;
+            if let Some(spec) = lane.spec.as_mut() {
+                spec.window = None;
+            }
+        }
         self.table.poison(epoch);
     }
 
@@ -419,12 +747,83 @@ impl Qwen4LaneStore {
         self.table.epochs()
     }
 
-    /// The step logits (F32, `2 * max_lanes` rows of `vocab`): the k-th AR
-    /// request of the plan, in plan order, is row `k`; the i-th Prefill
-    /// request is row `max_lanes + i` (written on a prompt-completing tile).
+    /// The step logits (F32, `(rows_cap + max_lanes)` rows of `vocab`):
+    /// row `r < rows_cap` is the `r`-th decode row of the plan (the planned
+    /// decode requests' rows concatenated in plan order: an AR request is
+    /// one row, a Verify request `1 + draft_len` rows); the i-th Prefill
+    /// request is row `rows_cap + i` (written on a prompt-completing tile of
+    /// an AR lane; an MTP lane's prompt-completing pick is read by the
+    /// singleton chunk path and leaves no logits row). `rows_cap` is
+    /// `max_lanes` without spec, so an AR-only plan is the S3 layout.
     /// Valid until the next forward; read it before `commit_step`.
     pub fn logits(&self) -> &GpuTensor {
         &self.logits
+    }
+
+    /// First prompt-completing logits row: `rows_cap` (`max_lanes * (k + 1)`
+    /// with spec, else `max_lanes`).
+    pub fn prefill_logits_row(&self) -> usize {
+        self.rows_cap
+    }
+
+    /// The MTP staging (`None`: AR lanes).
+    pub fn spec(&self) -> Option<LaneSpecConfig> {
+        self.spec.as_ref().map(|s| s.config)
+    }
+
+    /// `epoch`'s window counters (`None`: unknown lane or an AR lane).
+    pub fn lane_spec_stats(&self, epoch: &RequestEpoch) -> Option<LaneSpecStats> {
+        let spec = self.lane(epoch)?.spec.as_ref()?;
+        Some(LaneSpecStats {
+            retired: spec.policy.retired(),
+            ..spec.stats
+        })
+    }
+
+    /// Choose the window router (lab): the floor (default), a fixed cycle or
+    /// full-budget batched windows. No effect on AR lanes.
+    #[cfg(feature = "lab")]
+    pub fn lab_set_routes(&mut self, routes: LabRoutes) {
+        if let Some(spec) = self.spec.as_mut() {
+            spec.routes = routes;
+        }
+    }
+
+    /// Negative control (lab): a rejected verify keeps its full rows.
+    #[cfg(feature = "lab")]
+    pub fn lab_set_skip_rollback(&mut self, on: bool) {
+        if let Some(spec) = self.spec.as_mut() {
+            spec.skip_rollback = on;
+        }
+    }
+
+    /// Every byte family of `epoch`'s MTP head state
+    /// ([`crate::mtp_gpu::lab_head_items`]), then `draft_request_state`
+    /// (`full_steps` u32 LE, `margin` f32 LE) and `pending_hidden` (F32 LE).
+    #[cfg(feature = "lab")]
+    pub fn lab_lane_items(
+        &self,
+        gpu: &Gpu,
+        epoch: &RequestEpoch,
+    ) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let spec = self
+            .lane(epoch)
+            .ok_or_else(|| format!("lab_lane_items: unknown or stale epoch {epoch:?}"))?
+            .spec
+            .as_ref()
+            .ok_or_else(|| "lab_lane_items: AR lane".to_string())?;
+        let mut items = crate::mtp_gpu::lab_head_items(gpu, &spec.head)?;
+        let mut request = spec.draft.full_steps.to_le_bytes().to_vec();
+        request.extend_from_slice(&spec.draft.margin.to_le_bytes());
+        items.push(("draft_request_state".to_string(), request));
+        let pending = gpu
+            .download_f32(&spec.pending_hidden)
+            .map_err(|e| format!("lab_lane_items: pending hidden: {e}"))?;
+        items.push((
+            "pending_hidden".to_string(),
+            pending.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        ));
+        Ok(items)
     }
 
     /// Disjoint borrows of the `epochs` lanes (plan order) and the step
@@ -436,6 +835,8 @@ impl Qwen4LaneStore {
             logits,
             top1,
             top1_host,
+            rows_cap,
+            spec,
             ..
         } = self;
         Ok(StepParts {
@@ -444,7 +845,19 @@ impl Qwen4LaneStore {
             top1,
             policy: *policy,
             top1_host,
+            rows_cap: *rows_cap,
+            spec: spec.as_mut(),
         })
+    }
+
+    /// Disjoint borrows of the `epochs` lanes (request order) and the MTP
+    /// buffers, for the draft phase.
+    pub(crate) fn draft_parts(
+        &mut self,
+        epochs: &[RequestEpoch],
+    ) -> Result<(Vec<&mut Qwen4LaneState>, Option<&mut SpecStore>), String> {
+        let Self { table, spec, .. } = self;
+        Ok((table.pick_mut(epochs)?, spec.as_mut()))
     }
 
     pub fn receipt(&self, gpu: &Gpu) -> LaneStoreReceipt {
@@ -453,7 +866,13 @@ impl Qwen4LaneStore {
             .cells
             .iter()
             .flatten()
-            .map(|lane| lane.state.mapped_context_bytes(gpu).unwrap_or(0))
+            .map(|lane| {
+                lane.state.mapped_context_bytes(gpu).unwrap_or(0)
+                    + lane
+                        .spec
+                        .as_ref()
+                        .map_or(0, |spec| spec.head.mapped_context_bytes(gpu).unwrap_or(0))
+            })
             .sum();
         LaneStoreReceipt {
             kv_backend: self.backend.name(),
@@ -465,6 +884,8 @@ impl Qwen4LaneStore {
             mapped_bytes: mapped as u64,
             stage_policy: self.policy.describe(),
             stage_evidence: self.policy.evidence(),
+            spec: if self.spec.is_some() { "mtp" } else { "off" },
+            spec_k: self.spec.as_ref().map_or(0, |s| s.config.k),
         }
     }
 
@@ -496,17 +917,44 @@ impl Qwen4LaneStore {
             table,
             logits,
             top1,
+            spec,
             ..
         } = self;
         let mut first: Option<String> = None;
         for lane in table.into_cells() {
-            let Qwen4LaneState { state, mtp, .. } = lane;
+            let Qwen4LaneState { state, spec, .. } = lane;
             if let Err(error) = state.free_gpu(gpu) {
                 first.get_or_insert(format!("lane state: {error}"));
             }
-            if let Some(mtp) = mtp {
-                if let Some(error) = mtp.free_gpu(gpu) {
+            if let Some(LaneSpec {
+                head,
+                pending_hidden,
+                ..
+            }) = spec
+            {
+                if let Some(error) = head.free_gpu(gpu) {
                     first.get_or_insert(format!("lane mtp state: {error}"));
+                }
+                if let Err(error) = gpu.free_tensor(pending_hidden) {
+                    first.get_or_insert(format!("lane pending hidden: {error}"));
+                }
+            }
+        }
+        if let Some(SpecStore {
+            hidden,
+            draft_top1,
+            append_scratch,
+            ..
+        }) = spec
+        {
+            for (name, tensor) in [("hidden capture", hidden), ("draft top1", draft_top1)] {
+                if let Err(error) = gpu.free_tensor(tensor) {
+                    first.get_or_insert(format!("lane {name}: {error}"));
+                }
+            }
+            if let Some(scratch) = append_scratch {
+                if let Err(error) = scratch.free_gpu(gpu) {
+                    first.get_or_insert(format!("lane append scratch: {error}"));
                 }
             }
         }

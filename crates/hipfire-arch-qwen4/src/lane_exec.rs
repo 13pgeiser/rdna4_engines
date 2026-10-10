@@ -2,47 +2,68 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! The §4.2 step executor over the exact AR lanes
-//! ([`crate::lane::Qwen4LaneStore`]).
+//! The §4.2 step executor over the exact lanes
+//! ([`crate::lane::Qwen4LaneStore`]): AR lanes, and MTP lanes when the store
+//! is staged with a [`crate::lane::LaneSpecConfig`].
 //!
 //! A plan carries `Ar` requests (one row: the lane's pending seed at the
-//! lane's position) and `Prefill` requests (one singleton prefill tile of
-//! the lane's prompt, [`Qwen4Bundle::lane_prefill_tile_len`] rows).
-//! `Verify` and `Forced` rows are refused. Per step:
+//! lane's position), `Verify { draft_len }` requests (`1 + draft_len` rows:
+//! `[seed, drafts..]` of an MTP lane's drafted window) and `Prefill`
+//! requests (one singleton prefill tile of the lane's prompt,
+//! [`Qwen4Bundle::lane_prefill_tile_len`] rows). `Forced` rows are refused.
+//! Per step:
 //!
+//! 0. [`Qwen4LaneExecutor::draft_step`] (MTP stores; AR lanes just answer
+//!    `Ar`) routes the next window of every decoding lane and runs the
+//!    step-synchronous batched draft of the `Batched` ones. A spec lane's
+//!    decode row must be planned from its [`LaneDraft`]: `Verify` for
+//!    `Batched`, `Ar` for the other routes.
 //! 1. [`Qwen4LaneExecutor::provision_step`] validates the plan against the
-//!    lane table and maps every lane's QSA arenas up to the step's end
-//!    position.
-//! 2. [`Qwen4LaneExecutor::forward_step`] runs the AR rows of all lanes as
-//!    one exact trunk step (`forward_lanes`), then each prefill tile through
-//!    the singleton chunk program on the lane's own state, and downloads the
-//!    greedy picks once.
+//!    lane table (and the lanes' pending windows) and maps every lane's QSA
+//!    arenas (an MTP lane's head arenas too) up to the step's end position.
+//! 2. [`Qwen4LaneExecutor::forward_step`] runs the decode rows of all lanes
+//!    as one exact trunk step (`forward_lanes`; each Verify lane under its
+//!    armed ring and a target snapshot, the wide hidden captured), downloads
+//!    the greedy picks of every decode row once, finishes every Verify
+//!    window (greedy accept, ring rollback, head commit), runs the head
+//!    append of every `ArSynced` lane, then each prefill tile through the
+//!    singleton chunk program on the lane's own state (an MTP lane's tile
+//!    also fills its head). A pure-decode step's wall clock (draft start to
+//!    the final sync) feeds the store's cost model, then every MTP lane's
+//!    window policy observes its window.
 //! 3. [`Qwen4LaneExecutor::commit_step`] applies the lane bookkeeping. The
 //!    forwards publish the device and host trunk state (QSA lengths, PLE
 //!    history, `state.position`) themselves, exactly as the singleton route
 //!    does; commit never touches device state.
 //!
-//! Invariants of the lane plan (PLAN §3.2) that apply to AR lanes, and how
-//! each is enforced:
+//! Invariants of the lane plan (PLAN §3.2), and how each is enforced:
 //!
-//! - I1 (`state.position == mtp.position`): AR lanes carry no MTP state
-//!   (`mtp` is `None`); the position every row is checked against is the
-//!   lane's `state.position`.
-//! - I2 (one snapshot ticket, only in a verify): no lane step snapshots; no
-//!   verify row is admitted.
-//! - I3 (`row_capture_armed` only during a verify forward): AR lanes arm no
-//!   ring (`ring_rows == 0`) and nothing in a lane step sets the flag.
-//! - I4 (mapping only at provision): `ensure_mapped_capacity` is called
-//!   in `provision_step` and nowhere else; the forwards run on mapped
-//!   arenas.
+//! - I1 (`state.position == mtp.position`): AR lanes carry no MTP state; the
+//!   position every row is checked against is the lane's `state.position`.
+//!   MTP lanes check it when a batched window is drafted, before an
+//!   `ArSynced` head append, before each prefill tile, and at the end of
+//!   every verify (`mtp_lanes`).
+//! - I2 (one snapshot ticket, only in a verify): AR lanes snapshot nothing.
+//!   An MTP lane holds one head ticket (taken at `draft_step`) and one target
+//!   ticket (taken at `forward_step`) only inside a `Batched` window; both
+//!   are committed by the window's finish, or dropped with the lane by
+//!   poison/abort (the next admission's reset invalidates them).
+//! - I3 (`row_capture_armed` only during a verify forward): armed per Verify
+//!   lane right before the target snapshot and disarmed right after
+//!   `forward_lanes` returns, success or not; `poison` and `abort_step`
+//!   disarm too.
+//! - I4 (mapping only at provision): `ensure_mapped_capacity` is called in
+//!   `provision_step` and, for the head and trunk arenas a batched window's
+//!   draft steps and append reach, in `draft_step`, which precedes the
+//!   forward; the forwards run on mapped arenas.
 //! - I5 (one plan identity across provision, forward, commit): the
 //!   [`StepKey`] recorded at provision must equal the plan at forward and at
 //!   commit, and commit also needs the step id forward issued. A failed
 //!   forward poisons its participants and returns to idle.
-//! - I6 (a lane step never touches `bundle.state`/`bundle.mtp`):
-//!   `forward_lanes` works on the lanes' own states; a prefill tile swaps
-//!   the lane's state in for the call only.
-//! - I7 (rings are never shared): none exist on AR lanes.
+//! - I6 (a lane step never touches `bundle.state`/`bundle.mtp`): lane work
+//!   runs on the lanes' own states; a prefill tile or head step swaps the
+//!   lane's states in for the call only (`Qwen4Bundle::with_lane`).
+//! - I7 (rings are never shared): each MTP lane owns its `k + 1`-row ring.
 //! - I8 (session bookkeeping keyed by epoch): lanes keep no session cache in
 //!   this route; every lookup here is by the full epoch (tag and generation).
 //! - I9 (arenas cover the step's end position before the first launch):
@@ -50,13 +71,46 @@
 //!   refuses ends past `state.max_seq_len`.
 
 use crate::bundle::Qwen4Bundle;
-use crate::gpu_forward_lanes::{forward_lanes, LaneOutputs, LaneRowKind, LaneRows};
-use crate::lane::{LaneHost, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
+use crate::gpu_forward_lanes::{
+    forward_lanes, LaneOutputs, LaneRowKind, LaneRows, LANE_MAX_ROWS,
+};
+use crate::lane::{
+    LaneHost, LaneSpecConfig, LaneStatus, Qwen4LaneState, Qwen4LaneStore, SpecStore, StepParts,
+};
+use crate::mtp_gpu::MtpAppendScratch;
+use crate::mtp_lanes::{
+    ar_synced_head, draft_lanes, finish_lane_window, prefill_tile, LaneCostModel,
+};
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, StepOutput,
 };
+use hipfire_runtime::spec::MtpWindow;
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
+use std::time::Instant;
+
+/// How a lane's next window runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneRoute {
+    /// A non-spec lane: one AR row.
+    Ar,
+    /// An MTP lane's AR row followed by the head append of its seed (the
+    /// singleton's calibration window): the head stays in step.
+    ArSynced,
+    /// An MTP lane retired to head-free AR rows.
+    ArRetired,
+    /// Up to `k_max` drafts verified in one `1 + drafts` row block.
+    Batched { k_max: usize },
+}
+
+/// One lane's routed window, as `draft_step` returns it.
+#[derive(Clone, Debug)]
+pub struct LaneDraft {
+    pub epoch: RequestEpoch,
+    pub route: LaneRoute,
+    /// The kept drafts (`Batched`: at least one; empty for every other route).
+    pub drafts: Vec<u32>,
+}
 
 /// Plan identity recorded by provision/forward and checked by commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +150,13 @@ impl LanePhase {
         }
     }
 
+    fn check_draft(&self) -> Result<(), String> {
+        match self {
+            Self::Idle => Ok(()),
+            _ => Err("draft_step: previous step not committed or aborted".to_string()),
+        }
+    }
+
     fn check_forward(&self, key: &StepKey) -> Result<(), String> {
         match self {
             Self::Provisioned(provisioned) if provisioned == key => Ok(()),
@@ -111,6 +172,20 @@ impl LanePhase {
     }
 }
 
+/// What plan validation reads of a lane's pending window.
+struct WindowView<'a> {
+    route: LaneRoute,
+    /// The lane's position when the window was routed.
+    position: usize,
+    seed: u32,
+    drafts: &'a [u32],
+}
+
+/// What plan validation reads of an MTP lane.
+struct SpecView<'a> {
+    window: Option<WindowView<'a>>,
+}
+
 /// What plan validation reads of one lane.
 struct LaneView<'a> {
     slot: usize,
@@ -119,6 +194,8 @@ struct LaneView<'a> {
     position: usize,
     /// `state.max_seq_len`.
     max_seq_len: usize,
+    /// `Some` on an MTP lane.
+    spec: Option<SpecView<'a>>,
 }
 
 fn view_of(lane: &Qwen4LaneState) -> LaneView<'_> {
@@ -127,6 +204,14 @@ fn view_of(lane: &Qwen4LaneState) -> LaneView<'_> {
         host: &lane.host,
         position: lane.state.position,
         max_seq_len: lane.state.max_seq_len,
+        spec: lane.spec.as_ref().map(|spec| SpecView {
+            window: spec.window.as_ref().map(|w| WindowView {
+                route: w.route,
+                position: w.position,
+                seed: w.seed,
+                drafts: &w.drafts,
+            }),
+        }),
     }
 }
 
@@ -163,11 +248,11 @@ fn validate_plan<'a>(
     }
     let mut covered = vec![false; n];
     let mut seen_slots = vec![false; limits.max_lanes];
-    let mut ar_rows = 0usize;
+    let mut decode_lanes = 0usize;
     let mut completing = 0usize;
     let mut ends = Vec::with_capacity(plan.requests.len());
     for r in &plan.requests {
-        if matches!(r.kind, RequestStepKind::Verify { .. } | RequestStepKind::Forced) {
+        if matches!(r.kind, RequestStepKind::Forced) {
             return Err(format!(
                 "provision_step: {:?} rows are not admitted on AR lanes",
                 r.kind
@@ -215,7 +300,83 @@ fn validate_plan<'a>(
                         tokens[0], r.epoch
                     ));
                 }
-                ar_rows += 1;
+                // An MTP lane's AR row is an `ArSynced`/`ArRetired` window.
+                if let Some(spec) = &lane.spec {
+                    let window = spec.window.as_ref().ok_or_else(|| {
+                        format!(
+                            "provision_step: MTP lane {:?} has no drafted window (draft_step first)",
+                            r.epoch
+                        )
+                    })?;
+                    if !matches!(window.route, LaneRoute::ArSynced | LaneRoute::ArRetired) {
+                        return Err(format!(
+                            "provision_step: AR row for MTP lane {:?} whose window is routed {:?}",
+                            r.epoch, window.route
+                        ));
+                    }
+                    if window.position != lane.position || window.seed != tokens[0] {
+                        return Err(format!(
+                            "provision_step: lane {:?} window (position {}, seed {}) is stale",
+                            r.epoch, window.position, window.seed
+                        ));
+                    }
+                }
+                decode_lanes += 1;
+            }
+            RequestStepKind::Verify { draft_len } => {
+                let Some(spec) = &lane.spec else {
+                    return Err(format!(
+                        "provision_step: Verify rows are not admitted on AR lanes (epoch {:?} has no MTP state)",
+                        r.epoch
+                    ));
+                };
+                if host.status != LaneStatus::Decoding {
+                    return Err(format!(
+                        "provision_step: Verify rows for {:?} lane {:?}",
+                        host.status, r.epoch
+                    ));
+                }
+                if draft_len == 0 || r.rows.len != draft_len + 1 || r.rows.len > LANE_MAX_ROWS {
+                    return Err(format!(
+                        "provision_step: Verify of {draft_len} drafts must contribute {} rows within {LANE_MAX_ROWS}, got {}",
+                        draft_len + 1,
+                        r.rows.len
+                    ));
+                }
+                let seed = host.pending_seed.ok_or_else(|| {
+                    format!("provision_step: epoch {:?} has no pending seed", r.epoch)
+                })?;
+                let window = spec.window.as_ref().ok_or_else(|| {
+                    format!(
+                        "provision_step: MTP lane {:?} has no drafted window (draft_step first)",
+                        r.epoch
+                    )
+                })?;
+                if !matches!(window.route, LaneRoute::Batched { .. }) {
+                    return Err(format!(
+                        "provision_step: Verify rows for MTP lane {:?} whose window is routed {:?}, not Batched",
+                        r.epoch, window.route
+                    ));
+                }
+                if tokens[0] != seed || window.seed != seed {
+                    return Err(format!(
+                        "provision_step: Verify seed {} != pending seed {seed} for {:?}",
+                        tokens[0], r.epoch
+                    ));
+                }
+                if window.drafts.len() != draft_len || tokens[1..] != *window.drafts {
+                    return Err(format!(
+                        "provision_step: Verify drafts of {:?} differ from its drafted window",
+                        r.epoch
+                    ));
+                }
+                if window.position != lane.position {
+                    return Err(format!(
+                        "provision_step: lane {:?} window position {} != state position {}",
+                        r.epoch, window.position, lane.position
+                    ));
+                }
+                decode_lanes += 1;
             }
             RequestStepKind::Prefill => {
                 if host.status != LaneStatus::Prefilling {
@@ -255,7 +416,7 @@ fn validate_plan<'a>(
                     completing += 1;
                 }
             }
-            RequestStepKind::Verify { .. } | RequestStepKind::Forced => unreachable!(),
+            RequestStepKind::Forced => unreachable!(),
         }
         for (j, row) in (r.rows.begin..r.rows.end()).enumerate() {
             if std::mem::replace(&mut covered[row], true) {
@@ -287,9 +448,9 @@ fn validate_plan<'a>(
     if covered.iter().any(|c| !c) {
         return Err("provision_step: rows outside every request range".to_string());
     }
-    if ar_rows > limits.row_budget {
+    if decode_lanes > limits.row_budget {
         return Err(format!(
-            "provision_step: {ar_rows} AR rows exceed row budget {}",
+            "provision_step: {decode_lanes} decode rows exceed row budget {}",
             limits.row_budget
         ));
     }
@@ -302,17 +463,18 @@ fn validate_plan<'a>(
     Ok(ends)
 }
 
-/// Whether `r` ends in a greedy pick: an AR row, or the tile that completes
-/// the prompt.
+/// Whether `r` ends in a greedy pick: a decode row (AR or Verify), or the
+/// tile that completes the prompt.
 fn wants_pick(host: &LaneHost, r: &RequestRows) -> bool {
     match r.kind {
-        RequestStepKind::Ar => true,
+        RequestStepKind::Ar | RequestStepKind::Verify { .. } => true,
         RequestStepKind::Prefill => host.prefilled + r.rows.len == host.prompt.len(),
-        RequestStepKind::Verify { .. } | RequestStepKind::Forced => false,
+        RequestStepKind::Forced => false,
     }
 }
 
-/// Lane bookkeeping of one committed request; returns the committed id.
+/// Lane bookkeeping of one committed AR or Prefill request; returns the
+/// committed id.
 fn commit_host(host: &mut LaneHost, r: &RequestRows, pick: u32) -> Option<u32> {
     let picks = wants_pick(host, r);
     if r.kind == RequestStepKind::Prefill {
@@ -327,6 +489,16 @@ fn commit_host(host: &mut LaneHost, r: &RequestRows, pick: u32) -> Option<u32> {
     host.generated.push(pick);
     host.pending_seed = Some(pick);
     Some(pick)
+}
+
+/// Lane bookkeeping of one committed Verify window: its committed tokens
+/// (accepted drafts and the bonus, the seed excluded) extend the lane and
+/// the last one is the next seed.
+fn commit_verify(host: &mut LaneHost, committed: &[u32]) -> Option<u32> {
+    let last = *committed.last()?;
+    host.generated.extend_from_slice(committed);
+    host.pending_seed = Some(last);
+    Some(last)
 }
 
 /// The lane executor: borrows the bundle (weights, forward program) and its
@@ -360,9 +532,45 @@ impl Qwen4LaneExecutor<'_> {
             .lane_prefill_tile_len(&lane.host.prompt, lane.host.prefilled))
     }
 
+    /// Route the next window of every listed Decoding lane (`budget`: most
+    /// drafts allowed this window; 0 = AR) and run the step-synchronous
+    /// batched draft for the `Batched` ones (one D2H per draft step for all
+    /// lanes). Must precede `provision_step` whenever the plan holds an MTP
+    /// lane's decode row, and every listed lane must then be planned:
+    /// `Verify` for a `Batched` window (its kept drafts), `Ar` for the
+    /// others. Non-spec lanes answer `Ar`. A failure poisons every listed
+    /// lane.
+    pub fn draft_step(
+        &mut self,
+        gpu: &mut Gpu,
+        requests: &[(RequestEpoch, usize)],
+    ) -> Result<Vec<LaneDraft>, String> {
+        let mut store = self
+            .bundle
+            .lanes
+            .take()
+            .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
+        let result = match store.phase.check_draft() {
+            Ok(()) => {
+                store.step_started = Some(Instant::now());
+                let drafted = draft_lanes(self.bundle, gpu, &mut store, requests);
+                if drafted.is_err() {
+                    for (epoch, _) in requests {
+                        store.poison(epoch);
+                    }
+                    store.step_started = None;
+                }
+                drafted
+            }
+            Err(error) => Err(error),
+        };
+        self.bundle.lanes = Some(store);
+        result
+    }
+
     /// Validate the plan against the lane table and map every lane's QSA
-    /// arenas through the step's end position. Mapping happens here, never
-    /// inside a forward (I4).
+    /// arenas (an MTP lane's head arenas too) through the step's end
+    /// position. Mapping happens here, never inside a forward (I4).
     pub fn provision_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
         let ends = {
             let bundle: &Qwen4Bundle = &*self.bundle;
@@ -386,6 +594,8 @@ impl Qwen4LaneExecutor<'_> {
             .lanes
             .as_mut()
             .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
+        // A step with no draft phase starts its wall clock here.
+        store.step_started.get_or_insert_with(Instant::now);
         for (r, &end) in plan.requests.iter().zip(&ends) {
             let lane = store
                 .lane_mut(&r.epoch)
@@ -393,17 +603,30 @@ impl Qwen4LaneExecutor<'_> {
             lane.state
                 .ensure_mapped_capacity(gpu, end)
                 .map_err(|e| format!("provision_step: map {end} positions for {:?}: {e}", r.epoch))?;
+            if let Some(spec) = lane.spec.as_mut() {
+                // A retired lane's head lags the trunk and is never touched.
+                let retired = spec
+                    .window
+                    .as_ref()
+                    .is_some_and(|w| w.route == LaneRoute::ArRetired);
+                if !retired {
+                    spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
+                        format!("provision_step: map {end} head positions for {:?}: {e}", r.epoch)
+                    })?;
+                }
+            }
         }
         store.phase = LanePhase::Provisioned(StepKey::of(plan));
         Ok(())
     }
 
-    /// The step's trunk forward(s) and one pick per AR / prompt-completing
-    /// row. AR rows of all lanes run as one exact trunk step, then each
-    /// prefill tile runs the singleton chunk program on its own lane state:
-    /// a decode row is never co-batched with a prefill tile. Waits for the
-    /// picks (the download synchronizes). On error every participant is
-    /// poisoned and the executor returns to idle.
+    /// The step's trunk forward(s) and one pick per decode / prompt-completing
+    /// row. Decode rows (AR and Verify) of all lanes run as one exact trunk
+    /// step, every Verify window and `ArSynced` head append finishes, then
+    /// each prefill tile runs the singleton chunk program on its own lane
+    /// state: a decode row is never co-batched with a prefill tile. Waits
+    /// for the picks (the download synchronizes). On error every participant
+    /// is poisoned and the executor returns to idle.
     pub fn forward_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<StepOutput, String> {
         let key = StepKey::of(plan);
         let store = self
@@ -428,6 +651,7 @@ impl Qwen4LaneExecutor<'_> {
                 for r in &plan.requests {
                     store.poison(&r.epoch);
                 }
+                store.step_started = None;
                 store.phase = LanePhase::Idle;
                 Err(format!("forward_step: {error}"))
             }
@@ -438,7 +662,8 @@ impl Qwen4LaneExecutor<'_> {
 
     /// Apply the forwarded step's lane bookkeeping. Validates the plan
     /// identity, step id, pick count and every participant before mutating
-    /// anything.
+    /// anything. A Verify request advances by its window's committed tokens
+    /// (`committed_ids`, `accepted_drafts`, `verified_rows = drafts + 1`).
     pub fn commit_step(
         &mut self,
         _gpu: &mut Gpu,
@@ -467,36 +692,81 @@ impl Qwen4LaneExecutor<'_> {
             if wants_pick(&lane.host, r) && output.target_picks[r.rows.end() - 1] == u32::MAX {
                 return Err("commit_step: head row without a target pick".to_string());
             }
+            let window = lane.spec.as_ref().and_then(|spec| spec.window.as_ref());
+            match (r.kind, window) {
+                (RequestStepKind::Verify { .. }, Some(w)) => {
+                    if w.outcome.as_ref().map_or(true, |o| o.committed.is_empty()) {
+                        return Err(format!(
+                            "commit_step: Verify window of {:?} never finished",
+                            r.epoch
+                        ));
+                    }
+                }
+                (RequestStepKind::Verify { .. }, None) => {
+                    return Err(format!("commit_step: Verify of {:?} has no window", r.epoch));
+                }
+                _ => {}
+            }
         }
         let mut advances = Vec::with_capacity(plan.requests.len());
         for r in &plan.requests {
             let pick = output.target_picks[r.rows.end() - 1];
             let lane = store.lane_mut(&r.epoch).expect("validated above");
-            let committed = commit_host(&mut lane.host, r, pick);
+            let window = lane.spec.as_mut().and_then(|spec| spec.window.take());
+            let (committed_ids, accepted_drafts, verified_rows) = match r.kind {
+                RequestStepKind::Verify { draft_len } => {
+                    let outcome: MtpWindow = window
+                        .and_then(|w| w.outcome)
+                        .expect("validated above");
+                    commit_verify(&mut lane.host, &outcome.committed);
+                    (outcome.committed, outcome.accepted, draft_len + 1)
+                }
+                _ => (
+                    commit_host(&mut lane.host, r, pick).into_iter().collect(),
+                    0,
+                    0,
+                ),
+            };
             let position = lane.state.position;
             advances.push(RequestAdvance {
                 epoch: r.epoch,
-                committed_ids: committed.into_iter().collect(),
+                committed_ids,
                 committed_position: position,
-                accepted_drafts: 0,
-                verified_rows: 0,
+                accepted_drafts,
+                verified_rows,
                 finish: (position >= lane.state.max_seq_len).then(|| "length".to_string()),
             });
         }
+        store.step_started = None;
         store.phase = LanePhase::Idle;
         Ok(advances)
     }
 
     /// Drop the step: every participant is poisoned (its device state may be
-    /// half-advanced) and the executor returns to idle.
+    /// half-advanced), its pending window dropped, and the executor returns
+    /// to idle.
     pub fn abort_step(&mut self, plan: &BatchStepPlan) {
         if let Some(store) = self.bundle.lanes.as_mut() {
             for r in &plan.requests {
                 store.poison(&r.epoch);
             }
+            store.step_started = None;
             store.phase = LanePhase::Idle;
         }
     }
+}
+
+/// One planned request inside a forward.
+struct Entry<'a> {
+    r: &'a RequestRows,
+    lane: &'a mut Qwen4LaneState,
+    /// First decode row of a decode request (`None` for a prefill tile).
+    dec: Option<usize>,
+}
+
+fn pick_at(host: &[u8], row: usize) -> u32 {
+    let b = &host[row * 4..row * 4 + 4];
+    u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
 }
 
 /// The forward of a provisioned plan; the store is out of the bundle so the
@@ -508,57 +778,219 @@ fn forward_inner(
     plan: &BatchStepPlan,
 ) -> Result<Vec<u32>, String> {
     let vocab = bundle.lane_vocab();
-    let max_lanes = store.max_lanes();
     let epochs: Vec<RequestEpoch> = plan.requests.iter().map(|r| r.epoch).collect();
+    let started = store.step_started.take().unwrap_or_else(Instant::now);
+    let spec_config: Option<LaneSpecConfig> = store.spec();
     let StepParts {
         lanes,
         logits,
         top1,
         policy,
         top1_host,
+        rows_cap,
+        spec,
     } = store.step_parts(&epochs)?;
+    let mut hidden: Option<&GpuTensor> = None;
+    let mut append: Option<&mut Option<MtpAppendScratch>> = None;
+    let mut cost: Option<&mut LaneCostModel> = None;
+    let mut skip_rollback = false;
+    if let Some(spec) = spec {
+        let SpecStore {
+            hidden: h,
+            append_scratch,
+            cost: c,
+            skip_rollback: skip,
+            ..
+        } = spec;
+        hidden = Some(&*h);
+        append = Some(append_scratch);
+        cost = Some(c);
+        skip_rollback = *skip;
+    }
 
-    let mut ar: Vec<LaneRows<'_>> = Vec::new();
-    let mut ar_begin: Vec<usize> = Vec::new();
-    let mut prefill: Vec<(&RequestRows, &mut Qwen4LaneState)> = Vec::new();
+    // Plan order, with each decode request's first row among the step's
+    // decode rows.
+    let mut entries: Vec<Entry<'_>> = Vec::with_capacity(plan.requests.len());
+    let (mut n_dec, mut n_prefill, mut decode_lanes, mut verified) = (0usize, 0usize, 0usize, 0usize);
     for (r, lane) in plan.requests.iter().zip(lanes) {
-        match r.kind {
-            RequestStepKind::Ar => {
-                ar_begin.push(r.rows.begin);
-                ar.push(LaneRows {
-                    state: &mut lane.state,
-                    tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
-                    kind: LaneRowKind::Ar,
-                });
+        let dec = match r.kind {
+            RequestStepKind::Ar | RequestStepKind::Verify { .. } => {
+                if let RequestStepKind::Verify { draft_len } = r.kind {
+                    verified += draft_len;
+                }
+                let first = n_dec;
+                n_dec += r.rows.len;
+                decode_lanes += 1;
+                Some(first)
             }
-            RequestStepKind::Prefill => prefill.push((r, lane)),
-            RequestStepKind::Verify { .. } | RequestStepKind::Forced => {
+            RequestStepKind::Prefill => {
+                n_prefill += 1;
+                None
+            }
+            RequestStepKind::Forced => {
                 return Err(format!("{:?} rows are not admitted on AR lanes", r.kind));
+            }
+        };
+        entries.push(Entry { r, lane, dec });
+    }
+    if n_dec > rows_cap {
+        return Err(format!("{n_dec} decode rows exceed the step buffers ({rows_cap})"));
+    }
+
+    // Arm the ring, then take the target ticket, of every Verify lane.
+    for e in entries.iter_mut() {
+        let RequestStepKind::Verify { draft_len } = e.r.kind else {
+            continue;
+        };
+        let rows = draft_len + 1;
+        let tokens = &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()];
+        let Qwen4LaneState { state, spec, .. } = &mut *e.lane;
+        let window = spec
+            .as_mut()
+            .and_then(|spec| spec.window.as_mut())
+            .ok_or_else(|| format!("Verify lane {:?} has no window", e.r.epoch))?;
+        if !matches!(window.route, LaneRoute::Batched { .. })
+            || window.seed != tokens[0]
+            || window.drafts != tokens[1..]
+            || window.position != state.position
+        {
+            return Err(format!("Verify lane {:?} disagrees with its window", e.r.epoch));
+        }
+        if window.target_ticket.is_some() {
+            return Err(format!("Verify lane {:?} already holds a target ticket", e.r.epoch));
+        }
+        if state.row_capture_rows() < rows {
+            return Err(format!(
+                "Verify lane {:?}: the ring holds {} rows, the verify needs {rows}",
+                e.r.epoch,
+                state.row_capture_rows()
+            ));
+        }
+        // Armed before the snapshot: the GDN states then need no copy.
+        state.row_capture_armed = true;
+        let ticket = crate::mtp_lanes::lane_call(bundle.with_lane(state, None, |b| b.snapshot(gpu)));
+        match ticket {
+            Ok(ticket) => window.target_ticket = Some(ticket),
+            Err(error) => {
+                state.row_capture_armed = false;
+                return Err(format!("target snapshot of {:?}: {error}", e.r.epoch));
             }
         }
     }
-    let n_ar = ar.len();
-    if n_ar > 0 {
-        let out = LaneOutputs {
-            logits: &logits.sub_offset(0, n_ar * vocab),
-            top1: &top1.sub_offset(0, n_ar * std::mem::size_of::<i32>()),
-        };
-        forward_lanes(gpu, bundle, &mut ar, &out, &policy).map_err(|e| e.to_string())?;
-    }
-    drop(ar);
 
-    let n_prefill = prefill.len();
-    // (prefill ordinal, plan row of its pick)
+    // One exact trunk step over every decode row, in plan order.
+    if n_dec > 0 {
+        let mut rows: Vec<LaneRows<'_>> = Vec::new();
+        for e in entries.iter_mut() {
+            let kind = match e.r.kind {
+                RequestStepKind::Ar => LaneRowKind::Ar,
+                RequestStepKind::Verify { draft_len } => LaneRowKind::Verify { draft_len },
+                _ => continue,
+            };
+            rows.push(LaneRows {
+                state: &mut e.lane.state,
+                tokens: &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()],
+                kind,
+            });
+        }
+        let out = LaneOutputs {
+            logits: &logits.sub_offset(0, n_dec * vocab),
+            top1: &top1.sub_offset(0, n_dec * std::mem::size_of::<i32>()),
+            wide_hidden: hidden,
+        };
+        let forwarded = forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string());
+        drop(rows);
+        // I3: disarmed on every path out of the forward.
+        for e in entries.iter_mut() {
+            if matches!(e.r.kind, RequestStepKind::Verify { .. }) {
+                e.lane.state.row_capture_armed = false;
+            }
+        }
+        forwarded?;
+        gpu.hip
+            .memcpy_dtoh(&mut top1_host[..n_dec * std::mem::size_of::<i32>()], &top1.buf)
+            .map_err(|e| e.to_string())?;
+    }
+    let mut picks = vec![u32::MAX; plan.total_rows()];
+    for e in &entries {
+        if let Some(first) = e.dec {
+            for j in 0..e.r.rows.len {
+                picks[e.r.rows.begin + j] = pick_at(top1_host, first + j);
+            }
+        }
+    }
+
+    // Verify windows, then the head appends of the ArSynced lanes.
+    for e in entries.iter_mut() {
+        let Some(first) = e.dec else {
+            continue;
+        };
+        let lane_picks: Vec<u32> = (0..e.r.rows.len).map(|j| pick_at(top1_host, first + j)).collect();
+        let route = e
+            .lane
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.window.as_ref())
+            .map(|w| w.route);
+        let outcome = match (e.r.kind, route) {
+            (RequestStepKind::Verify { .. }, _) => {
+                let config = spec_config.ok_or_else(|| "Verify row in a store without MTP lanes".to_string())?;
+                let hidden = hidden.ok_or_else(|| "Verify row without a hidden capture".to_string())?;
+                finish_lane_window(
+                    bundle,
+                    gpu,
+                    &mut *e.lane,
+                    config,
+                    hidden,
+                    first,
+                    &lane_picks,
+                    skip_rollback,
+                )?
+            }
+            (RequestStepKind::Ar, Some(route)) => {
+                if route == LaneRoute::ArSynced {
+                    let hidden = hidden.ok_or_else(|| "ArSynced row without a hidden capture".to_string())?;
+                    ar_synced_head(bundle, gpu, &mut *e.lane, hidden, first)?;
+                }
+                MtpWindow {
+                    committed: lane_picks,
+                    accepted: 0,
+                    drafts_generated: 0,
+                }
+            }
+            _ => continue,
+        };
+        if let Some(window) = e.lane.spec.as_mut().and_then(|spec| spec.window.as_mut()) {
+            window.outcome = Some(outcome);
+        }
+    }
+
+    // Prefill tiles.
+    // (prefill ordinal, plan row of its pick) of AR-lane completing tiles.
     let mut final_tiles: Vec<(usize, usize)> = Vec::new();
-    for (i, (r, lane)) in prefill.into_iter().enumerate() {
-        let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
-        if wants_pick(&lane.host, r) {
-            let row = logits.sub_offset((max_lanes + i) * vocab, vocab);
+    let mut ordinal = 0usize;
+    for e in entries.iter_mut() {
+        if e.r.kind != RequestStepKind::Prefill {
+            continue;
+        }
+        let i = ordinal;
+        ordinal += 1;
+        let tokens = &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()];
+        let completes = wants_pick(&e.lane.host, e.r);
+        if e.lane.spec.is_some() {
+            let scratch = append.as_deref_mut().and_then(Option::as_mut);
+            let pick = prefill_tile(bundle, gpu, &mut *e.lane, tokens, scratch)?;
+            if completes {
+                picks[e.r.rows.end() - 1] =
+                    pick.ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
+            }
+        } else if completes {
+            let row = logits.sub_offset((rows_cap + i) * vocab, vocab);
             bundle
-                .lane_prefill_tile(gpu, &mut lane.state, tokens, Some(&row))
+                .lane_prefill_tile(gpu, &mut e.lane.state, tokens, Some(&row))
                 .map_err(|e| e.to_string())?;
             let slot = top1.sub_offset(
-                (max_lanes + i) * std::mem::size_of::<i32>(),
+                (rows_cap + i) * std::mem::size_of::<i32>(),
                 std::mem::size_of::<i32>(),
             );
             argmax_f32(
@@ -571,37 +1003,65 @@ fn forward_inner(
                 },
             )
             .map_err(|e| e.to_string())?;
-            final_tiles.push((i, r.rows.end() - 1));
+            final_tiles.push((i, e.r.rows.end() - 1));
         } else {
             bundle
-                .lane_prefill_tile(gpu, &mut lane.state, tokens, None)
+                .lane_prefill_tile(gpu, &mut e.lane.state, tokens, None)
                 .map_err(|e| e.to_string())?;
         }
     }
-
-    let used_rows = if final_tiles.is_empty() {
-        n_ar
-    } else {
-        max_lanes + n_prefill
-    };
-    let used = used_rows * std::mem::size_of::<i32>();
-    if used > 0 {
+    let prefill_ran = ordinal > 0;
+    if !final_tiles.is_empty() {
+        let used = (rows_cap + n_prefill) * std::mem::size_of::<i32>();
         gpu.hip
             .memcpy_dtoh(&mut top1_host[..used], &top1.buf)
             .map_err(|e| e.to_string())?;
-    } else {
-        gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+        for &(i, row) in &final_tiles {
+            picks[row] = pick_at(top1_host, rows_cap + i);
+        }
     }
-    let pick_at = |row: usize| {
-        let b = &top1_host[row * 4..row * 4 + 4];
-        u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
-    };
-    let mut picks = vec![u32::MAX; plan.total_rows()];
-    for (k, &begin) in ar_begin.iter().enumerate() {
-        picks[begin] = pick_at(k);
-    }
-    for &(i, row) in &final_tiles {
-        picks[row] = pick_at(max_lanes + i);
+
+    // The step's wall clock feeds the cost model only on a pure-decode
+    // step; every MTP lane's policy observes its window either way.
+    if let Some(cost) = cost {
+        if decode_lanes > 0 {
+            if !prefill_ran {
+                gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+                let wall_us = started.elapsed().as_secs_f64() * 1e6;
+                cost.observe(decode_lanes, verified, wall_us as f32);
+            }
+            for e in entries.iter_mut() {
+                if e.dec.is_none() {
+                    continue;
+                }
+                let Some(spec) = e.lane.spec.as_mut() else {
+                    continue;
+                };
+                let (Some(window), policy, stats) = (spec.window.as_ref(), &mut spec.policy, &mut spec.stats)
+                else {
+                    continue;
+                };
+                let Some(outcome) = window.outcome.as_ref() else {
+                    continue;
+                };
+                match window.route {
+                    LaneRoute::Batched { .. } => {
+                        let units = cost.window_units(decode_lanes, outcome.drafts_generated);
+                        policy.observe_batched(outcome, units, window.budget);
+                        stats.windows += 1;
+                        stats.drafts += outcome.drafts_generated as u64;
+                        stats.accepted += outcome.accepted as u64;
+                    }
+                    LaneRoute::ArSynced => {
+                        policy.observe_ar_synced(outcome, window.budget);
+                        stats.windows += 1;
+                    }
+                    LaneRoute::ArRetired => stats.ar_windows += 1,
+                    LaneRoute::Ar => {}
+                }
+                stats.retired = policy.retired();
+            }
+        }
     }
     Ok(picks)
 }
@@ -624,9 +1084,20 @@ mod tests {
         }
     }
 
+    /// A pending window of an MTP lane.
+    #[derive(Clone)]
+    struct TestWindow {
+        route: LaneRoute,
+        position: usize,
+        seed: u32,
+        drafts: Vec<u32>,
+    }
+
     struct Lane {
         host: LaneHost,
         position: usize,
+        /// `Some`: an MTP lane (with its pending window, if any).
+        spec: Option<Option<TestWindow>>,
     }
 
     fn host(tag: u64, slot: usize, status: LaneStatus, prompt_len: usize, prefilled: usize) -> LaneHost {
@@ -656,10 +1127,27 @@ mod tests {
                 Lane {
                     host: host(tag, slot, status, prompt, prefilled),
                     position,
+                    spec: None,
                 },
             );
         }
         lanes
+    }
+
+    /// `lanes()` with lane 1 an MTP lane holding `window`.
+    fn spec_lanes(window: Option<TestWindow>) -> HashMap<RequestEpoch, Lane> {
+        let mut table = lanes();
+        table.get_mut(&epoch(1)).unwrap().spec = Some(window);
+        table
+    }
+
+    fn batched_window() -> TestWindow {
+        TestWindow {
+            route: LaneRoute::Batched { k_max: 3 },
+            position: 10,
+            seed: 77,
+            drafts: vec![5, 6],
+        }
     }
 
     struct Entry {
@@ -676,6 +1164,18 @@ mod tests {
             slot,
             kind: RequestStepKind::Ar,
             tokens: vec![token],
+            start: position,
+        }
+    }
+
+    fn verify(tag: u64, slot: usize, tokens: &[u32], position: usize) -> Entry {
+        Entry {
+            tag,
+            slot,
+            kind: RequestStepKind::Verify {
+                draft_len: tokens.len() - 1,
+            },
+            tokens: tokens.to_vec(),
             start: position,
         }
     }
@@ -726,6 +1226,14 @@ mod tests {
                     host: &l.host,
                     position: l.position,
                     max_seq_len: CONTEXT,
+                    spec: l.spec.as_ref().map(|window| SpecView {
+                        window: window.as_ref().map(|w| WindowView {
+                            route: w.route,
+                            position: w.position,
+                            seed: w.seed,
+                            drafts: &w.drafts,
+                        }),
+                    }),
                 })
             },
             |h| TILE.min(h.prompt.len() - h.prefilled),
@@ -742,7 +1250,11 @@ mod tests {
     }
 
     fn refused(entries: &[Entry], needle: &str) {
-        let error = validate(&plan_of(entries), &lanes()).unwrap_err();
+        refused_on(entries, &lanes(), needle);
+    }
+
+    fn refused_on(entries: &[Entry], table: &HashMap<RequestEpoch, Lane>, needle: &str) {
+        let error = validate(&plan_of(entries), table).unwrap_err();
         assert!(error.contains(needle), "{error:?} lacks {needle:?}");
     }
 
@@ -784,12 +1296,98 @@ mod tests {
     }
 
     #[test]
-    fn verify_and_forced_rows_are_not_admitted() {
-        for kind in [RequestStepKind::Verify { draft_len: 0 }, RequestStepKind::Forced] {
-            let mut entry = ar(1, 0, 77, 10);
-            entry.kind = kind;
-            refused(&[entry], "not admitted on AR lanes");
+    fn forced_rows_are_not_admitted() {
+        let mut entry = ar(1, 0, 77, 10);
+        entry.kind = RequestStepKind::Forced;
+        refused(&[entry], "not admitted on AR lanes");
+    }
+
+    #[test]
+    fn verify_rows_need_an_mtp_lane() {
+        // Lane 1 is an AR lane here.
+        refused(&[verify(1, 0, &[77, 5, 6], 10)], "not admitted on AR lanes");
+    }
+
+    #[test]
+    fn a_verify_row_matching_the_pending_window_is_accepted() {
+        let table = spec_lanes(Some(batched_window()));
+        let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10), ar(2, 1, 77, 20), tile(3, 2, &tile3(), 4)]);
+        assert_eq!(validate(&plan, &table), Ok(vec![13, 21, 8]));
+        // One draft is fine too, when that is what the window kept.
+        let mut one = batched_window();
+        one.drafts = vec![5];
+        let table = spec_lanes(Some(one));
+        assert_eq!(
+            validate(&plan_of(&[verify(1, 0, &[77, 5], 10)]), &table),
+            Ok(vec![12])
+        );
+    }
+
+    #[test]
+    fn a_verify_row_must_equal_its_window() {
+        let table = spec_lanes(Some(batched_window()));
+        // Drafts differ.
+        refused_on(&[verify(1, 0, &[77, 5, 9], 10)], &table, "differ from its drafted window");
+        // Fewer drafts than the window kept.
+        refused_on(&[verify(1, 0, &[77, 5], 10)], &table, "differ from its drafted window");
+        // Seed differs.
+        refused_on(&[verify(1, 0, &[78, 5, 6], 10)], &table, "pending seed");
+        // Rows at another position.
+        refused_on(&[verify(1, 0, &[77, 5, 6], 11)], &table, "position");
+        // draft_len disagrees with the row count.
+        let mut lying = verify(1, 0, &[77, 5, 6], 10);
+        lying.kind = RequestStepKind::Verify { draft_len: 1 };
+        refused_on(&[lying], &table, "must contribute");
+        let mut empty = verify(1, 0, &[77, 5, 6], 10);
+        empty.kind = RequestStepKind::Verify { draft_len: 0 };
+        refused_on(&[empty], &table, "must contribute");
+        // A window drafted at another position is stale.
+        let mut stale = batched_window();
+        stale.position = 9;
+        refused_on(
+            &[verify(1, 0, &[77, 5, 6], 10)],
+            &spec_lanes(Some(stale)),
+            "window position",
+        );
+        // No window, or a window of another route.
+        refused_on(&[verify(1, 0, &[77, 5, 6], 10)], &spec_lanes(None), "no drafted window");
+        let mut synced = batched_window();
+        synced.route = LaneRoute::ArSynced;
+        synced.drafts = Vec::new();
+        refused_on(&[verify(1, 0, &[77, 5, 6], 10)], &spec_lanes(Some(synced)), "not Batched");
+        // A verify for a lane still prefilling.
+        let mut table = spec_lanes(Some(batched_window()));
+        table.get_mut(&epoch(3)).unwrap().spec = Some(None);
+        refused_on(&[verify(3, 2, &[77, 5], 4)], &table, "Prefilling");
+    }
+
+    #[test]
+    fn an_ar_row_of_an_mtp_lane_needs_a_pending_ar_route() {
+        refused_on(&[ar(1, 0, 77, 10)], &spec_lanes(None), "no drafted window");
+        refused_on(
+            &[ar(1, 0, 77, 10)],
+            &spec_lanes(Some(batched_window())),
+            "routed",
+        );
+        for route in [LaneRoute::ArSynced, LaneRoute::ArRetired] {
+            let table = spec_lanes(Some(TestWindow {
+                route,
+                position: 10,
+                seed: 77,
+                drafts: Vec::new(),
+            }));
+            assert_eq!(validate(&plan_of(&[ar(1, 0, 77, 10)]), &table), Ok(vec![11]), "{route:?}");
         }
+        // A window routed at another position is stale.
+        let stale = spec_lanes(Some(TestWindow {
+            route: LaneRoute::ArSynced,
+            position: 9,
+            seed: 77,
+            drafts: Vec::new(),
+        }));
+        refused_on(&[ar(1, 0, 77, 10)], &stale, "stale");
+        // A non-spec lane needs no window.
+        assert!(validate(&plan_of(&[ar(2, 1, 77, 20)]), &spec_lanes(None)).is_ok());
     }
 
     #[test]
@@ -827,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn the_row_budget_limits_ar_rows_only() {
+    fn the_row_budget_limits_decode_lanes_only() {
         let mut table = lanes();
         for (tag, slot) in [(4u64, 3usize)] {
             table.insert(
@@ -835,6 +1433,7 @@ mod tests {
                 Lane {
                     host: host(tag, slot, LaneStatus::Decoding, 5, 5),
                     position: 5,
+                    spec: None,
                 },
             );
         }
@@ -843,6 +1442,20 @@ mod tests {
         assert!(error.contains("row budget"), "{error}");
         // The prefill tile does not count against it.
         assert!(validate(&plan_of(&valid_entries()), &table).is_ok());
+        // A verify lane counts as one decode lane, however many rows it has.
+        let mut spec = spec_lanes(Some(batched_window()));
+        spec.insert(
+            epoch(4),
+            Lane {
+                host: host(4, 3, LaneStatus::Decoding, 5, 5),
+                position: 5,
+                spec: None,
+            },
+        );
+        let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10), ar(2, 1, 77, 20)]);
+        assert!(validate(&plan, &spec).is_ok());
+        let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10), ar(2, 1, 77, 20), ar(4, 3, 77, 5)]);
+        assert!(validate(&plan, &spec).unwrap_err().contains("row budget"));
     }
 
     #[test]
@@ -850,6 +1463,14 @@ mod tests {
         let mut table = lanes();
         table.get_mut(&epoch(1)).unwrap().position = CONTEXT;
         let error = validate(&plan_of(&[ar(1, 0, 77, CONTEXT)]), &table).unwrap_err();
+        assert!(error.contains("context"), "{error}");
+        // A verify block reaching past it is refused too.
+        let mut spec = spec_lanes(Some(TestWindow {
+            position: CONTEXT - 2,
+            ..batched_window()
+        }));
+        spec.get_mut(&epoch(1)).unwrap().position = CONTEXT - 2;
+        let error = validate(&plan_of(&[verify(1, 0, &[77, 5, 6], CONTEXT - 2)]), &spec).unwrap_err();
         assert!(error.contains("context"), "{error}");
     }
 
@@ -884,6 +1505,9 @@ mod tests {
         assert!(provisioned.check_forward(&other_key).is_err());
         assert!(provisioned.check_idle().is_err());
         assert!(LanePhase::Idle.check_idle().is_ok());
+        // Drafting needs an idle store.
+        assert!(LanePhase::Idle.check_draft().is_ok());
+        assert!(provisioned.check_draft().is_err());
         // Commit needs the forwarded phase, the same plan and the step id.
         assert!(provisioned.check_commit(&key, 0).is_err());
         let forwarded = LanePhase::Forwarded(key.clone(), 7);
@@ -921,5 +1545,18 @@ mod tests {
             (h.prefilled, h.status, h.pending_seed, h.generated.clone()),
             (10, LaneStatus::Decoding, Some(42), vec![42])
         );
+    }
+
+    #[test]
+    fn a_committed_verify_window_extends_the_lane_and_seeds_the_last_token() {
+        let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10)]);
+        assert!(wants_pick(&host(1, 0, LaneStatus::Decoding, 10, 10), &plan.requests[0]));
+        let mut h = host(1, 0, LaneStatus::Decoding, 10, 10);
+        h.generated = vec![77];
+        assert_eq!(commit_verify(&mut h, &[5, 6, 8]), Some(8));
+        assert_eq!((h.pending_seed, h.generated.clone()), (Some(8), vec![77, 5, 6, 8]));
+        // A window that committed nothing changes nothing.
+        assert_eq!(commit_verify(&mut h, &[]), None);
+        assert_eq!(h.generated, vec![77, 5, 6, 8]);
     }
 }
