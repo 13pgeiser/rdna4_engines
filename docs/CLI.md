@@ -256,7 +256,7 @@ Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarki
 
 - **Closed loop at K.** K client lanes drain one FIFO of N requests. A lane sends its next request the moment its previous one ends, so there is no burst barrier and no lane idles until the queue is empty. Request i is prompt `i mod len` of the shape's list, so every K sends the same multiset in the same order.
 - **Warmup discarded.** Before every sample, 8 separate warmup prompts run closed-loop at the same K with 64-token outputs. No measured prompt is ever a warmup prompt.
-- **No prefix-cache hits.** Each request's first message starts with a `Q<run>-<i>.` tag that is unique per sample and request, so a repeat never hits the daemon's prompt cache. `cached` reports any prompt tokens the daemon served from cache.
+- **No prefix-cache hits.** Each request's first message starts with a `Q<run>-<i>.` tag, unique per `--runs` round and request. Every K of a round therefore sends the same tokens, and a later round's repeat never hits the daemon's prompt cache. `cached` reports any prompt tokens the daemon served from cache.
 - **Chat turns, neutral sampling.** Requests carry `messages` (plus `prompt.system`, as `hipfire serve` injects it), thinking off unless `--reasoning-on`, and neutral penalties (`repeat_penalty` 1.0, `presence_penalty` 0, `min_p` 0).
 - **Levels are interleaved** across `--runs` (`1,2,4,8,1,2,4,8,…`), and the table reports each metric's median over the runs.
 

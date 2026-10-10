@@ -21,8 +21,9 @@
 //!   run closed-loop at the same K with 64-token outputs, so first use of a K
 //!   shape never lands in a sample and no measured prompt is warm.
 //! - **Per-run nonces.** Every request's first message starts with a
-//!   `Q<run>-<i>.` tag unique to the (sample, request), so a repeat never
-//!   hits the daemon's longest-common-prefix cache.
+//!   `Q<run>-<i>.` tag unique to the (`--runs` round, request): every K of a
+//!   round sends the same tokens, and a later round's repeat never hits the
+//!   daemon's longest-common-prefix cache.
 //! - **Chat turns, neutral sampling.** Requests carry `messages`, greedy
 //!   sampling and neutral penalties (`repeat_penalty` 1.0): a non-neutral
 //!   penalty takes the speculative decoders off their greedy routes.
@@ -392,9 +393,9 @@ pub struct Driver {
     engine: hipfire_client::Engine,
     max_concurrency: usize,
     reasoning_on: bool,
-    /// Monotonic sample counter: the per-run nonce, and part of every id so
-    /// attempt ids never repeat.
-    run_seq: usize,
+    /// Monotonic sample counter, part of every request id so attempt ids
+    /// never repeat.
+    sample_seq: usize,
 }
 
 impl Driver {
@@ -475,7 +476,7 @@ impl Driver {
             engine,
             max_concurrency,
             reasoning_on,
-            run_seq: 0,
+            sample_seq: 0,
         }
     }
 
@@ -642,16 +643,16 @@ struct Inflight {
 /// Run `items` through `k` closed-loop lanes and collect every request.
 ///
 /// Each item is one conversation of `turns` turns; turn 2 is sent on the
-/// same lane the moment turn 1 completes. Request ids carry the sample's
-/// run number and every first message carries `<tag><run>-<i>.`.
+/// same lane the moment turn 1 completes. Every first message carries
+/// `<nonce>-<i>.`; request ids carry the unique `sample` number.
 pub fn closed_loop(
     d: &Driver,
     items: &[Item],
     k: usize,
     sampling: &Sampling,
     turns: usize,
-    tag: char,
-    run: usize,
+    nonce: &str,
+    sample: usize,
 ) -> Result<Sample> {
     let label = d.label();
     let cap = d.max_inflight(k).max(1);
@@ -667,7 +668,7 @@ pub fn closed_loop(
     let mut inflight: HashMap<usize, Inflight> = HashMap::new();
     let mut next_item = 0usize;
 
-    let id_of = |conv: usize| format!("bench-{label}-{tag}{run}-{conv}");
+    let id_of = |conv: usize| format!("bench-{label}-{sample}-{nonce}-{conv}");
 
     // Queue turn `turn` of conversation `conv` with `messages`, sent at `t`.
     let push = |records: &mut Vec<RequestRecord>,
@@ -702,7 +703,7 @@ pub fn closed_loop(
         *next_item += 1;
         convs.push(with_nonce(
             &items[conv].messages,
-            &format!("{tag}{run}-{conv}."),
+            &format!("{nonce}-{conv}."),
         )?);
         Ok(Some(conv))
     };
@@ -1257,9 +1258,22 @@ pub fn sweep_backend(
         let mut by_k: BTreeMap<usize, Vec<SampleMetrics>> = BTreeMap::new();
         for (i, k) in sweep_order(points, runs).into_iter().enumerate() {
             d.check_k(k)?;
-            d.run_seq += 1;
-            let run = d.run_seq;
-            let warm = closed_loop(d, &workload.warmup, k, &workload.sampling, 1, 'W', run)?;
+            d.sample_seq += 1;
+            let sample = d.sample_seq;
+            // The nonce is per run (sweep round), not per sample: within a
+            // round every k sends the identical token multiset, and the next
+            // round's repeats differ from the first content token, so they
+            // cannot hit the daemon's prompt cache.
+            let round = i / points.len() + 1;
+            let warm = closed_loop(
+                d,
+                &workload.warmup,
+                k,
+                &workload.sampling,
+                1,
+                &format!("W{round}"),
+                sample,
+            )?;
             if let Some(e) = warm.records.iter().find_map(|r| r.err.as_ref()) {
                 bail!("{label}/{} k={k} warmup failed: {e}", arm.label());
             }
@@ -1269,14 +1283,14 @@ pub fn sweep_backend(
                 k,
                 &workload.sampling,
                 arm.turns(),
-                'Q',
-                run,
+                &format!("Q{round}"),
+                sample,
             )?;
             let m = SampleMetrics::from_sample(&sample);
             eprintln!(
                 "  {label}/{} k={k} run {}: {}",
                 arm.label(),
-                i / points.len() + 1,
+                round,
                 m.line()
             );
             if let Some(e) = m.errors.first() {
