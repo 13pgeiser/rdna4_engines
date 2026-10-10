@@ -8137,6 +8137,12 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::KvBackend => {
             serde_json::json!({ "type": "string", "enum": ["legacy", "vmm"] })
         }
+        ValueRule::AutoInteger { min, max } => serde_json::json!({
+            "type": ["integer", "string"],
+            "enum": ["auto"],
+            "minimum": min,
+            "maximum": max,
+        }),
         ValueRule::AutoBool => serde_json::json!({
             "type": ["boolean", "string"],
             "enum": [true, false, "auto"],
@@ -8182,6 +8188,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::Enum(_) => "enum",
         ValueRule::KvBackend => "kv-backend",
         ValueRule::AutoBool => "auto-bool",
+        ValueRule::AutoInteger { .. } => "auto|integer",
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
         ValueRule::NullableInteger { .. } => "integer|null",

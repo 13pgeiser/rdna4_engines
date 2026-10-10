@@ -22,13 +22,17 @@
 //!   qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref \
 //!                    --teacher ID_FILE --output REF.kldref [--top-k 256]
 //!   qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq \
-//!                    [--max-chunks N] [--decode]
+//!                    [--max-chunks N] [--decode] [--ple-hot BYTES]
 //! `--decode` scores the autoregressive route instead: each chunk prefills the
 //! unscored prefix, then runs one `forward_token` per scored position.
+//! `--ple-hot BYTES` attaches a fully filled PLE hot-row store of that budget
+//! (`<model>.plehot` sidecar) before scoring, so the identity gate covers rows
+//! served from the store.
 //! Reduce with `saddle-quant reduce DIR`.
 
 use hipfire_arch_qwen4::admit_hfqm_artifact;
-use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_arch_qwen4::bundle::{ple_hot_plan, PleHotFill, PleHotPlan, Qwen4Bundle};
+use hipfire_runtime::ple_hot_store::{FillThrottle, HotRowStore, PleHotRank};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
@@ -44,7 +48,45 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode]";
+/// Build the PLE hot-row store for `budget` bytes from `<model>.plehot`, fill
+/// it completely (unthrottled) and return it ready to attach.
+fn filled_hot_store(model: &Path, plan: PleHotPlan, budget: u64) -> Result<PleHotFill, String> {
+    let sidecar = PathBuf::from(format!("{}.plehot", model.display()));
+    let rank = PleHotRank::open(&sidecar, plan.padded_rows, &plan.fingerprint_hex)
+        .map_err(|e| format!("--ple-hot: sidecar {}: {e}", sidecar.display()))?;
+    let store = HotRowStore::new(rank, budget, plan.rows_per_shard, plan.encoded_row_bytes)?;
+    if store.tier_count() == 0 {
+        return Err("--ple-hot: the budget keeps no tier".into());
+    }
+    let started = Instant::now();
+    let handle = store.spawn_fill(
+        model,
+        plan.shard_offsets,
+        0,
+        FillThrottle {
+            load_bytes_per_s: 0,
+            min_bytes_per_s: 0,
+            adaptive: false,
+        },
+    );
+    store.release_throttle();
+    let hot = PleHotFill::new(store.clone(), handle);
+    while !store.fill_complete() {
+        if started.elapsed().as_secs() > 900 {
+            return Err("--ple-hot: fill did not complete in 900 s".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    eprintln!(
+        "qwen4_kld: ple hot store filled: {} tiers, {:.2} GiB, {:.1} s",
+        store.tier_count(),
+        store.resident_bytes() as f64 / (1u64 << 30) as f64,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(hot)
+}
+
+const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode] [--ple-hot BYTES]";
 
 struct Model {
     gpu: Gpu,
@@ -57,7 +99,9 @@ struct Model {
 
 impl Model {
     /// Same range-loaded path as the serve loader (`hipfire-loader` carriers).
-    fn load(path: &Path, n_ctx: usize) -> Result<Self, String> {
+    /// `ple_hot`: budget of a PLE hot-row store filled completely before the
+    /// first forward.
+    fn load(path: &Path, n_ctx: usize, ple_hot: Option<u64>) -> Result<Self, String> {
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -70,6 +114,15 @@ impl Model {
         }
         let mesh = DeviceMesh::single().map_err(|e| format!("qwen4 mesh: {e}"))?;
         let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let hot_plan = match ple_hot {
+            Some(_) => Some(
+                ple_hot_plan(&receipt.manifest, &receipt.ple, |name| {
+                    hfq.tensor_range(name).map_err(|e| e.to_string())
+                })?
+                .ok_or("--ple-hot: the PLE shards are not Q8F16")?,
+            ),
+            None => None,
+        };
         let source = HfqModelSource::from_hfq(hfq);
         let transaction = fulfill_manifest_from_payloads(
             &receipt.manifest.weights,
@@ -109,6 +162,9 @@ impl Model {
         bundle
             .attach_forward(&mut gpu, n_ctx)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
+        if let (Some(budget), Some(plan)) = (ple_hot, hot_plan) {
+            bundle.attach_ple_hot_store(filled_hot_store(path, plan, budget)?);
+        }
         let logits = gpu
             .zeros(&[n_ctx * vocab], DType::F32)
             .map_err(|e| e.to_string())?;
@@ -296,7 +352,7 @@ fn build_ref(
     top_k: usize,
     max_chunks: Option<usize>,
 ) -> Result<(), String> {
-    let mut m = Model::load(model, n_ctx)?;
+    let mut m = Model::load(model, n_ctx, None)?;
     let text =
         std::fs::read_to_string(slice).map_err(|e| format!("read {}: {e}", slice.display()))?;
     // Qwen tokenizers add no BOS: chunks are plain n_ctx windows of the stream.
@@ -409,6 +465,7 @@ fn score(
     output: &Path,
     max_chunks: Option<usize>,
     decode: bool,
+    ple_hot: Option<u64>,
 ) -> Result<(), String> {
     let reference = KldRef::open(ref_path).map_err(|e| e.to_string())?;
     let file = std::fs::File::open(ref_path).map_err(|e| e.to_string())?;
@@ -418,7 +475,7 @@ fn score(
     let (n_ctx, window) = (h.n_ctx, h.window);
     let n_chunk = h.n_chunk.min(max_chunks.unwrap_or(usize::MAX));
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
-    let mut m = Model::load(model, n_ctx)?;
+    let mut m = Model::load(model, n_ctx, ple_hot)?;
     if m.vocab != h.n_vocab {
         return Err(format!(
             "candidate vocab {} != reference vocab {}",
@@ -498,6 +555,13 @@ fn score(
         digest.finalize(),
         output.display()
     );
+    if let Some(store) = m.bundle.ple_hot_store() {
+        eprintln!(
+            "qwen4_kld eval: ple hot store served {} rows ({} pages)",
+            store.hot_rows(),
+            store.hot_pages()
+        );
+    }
     Ok(())
 }
 
@@ -507,6 +571,7 @@ fn run() -> Result<(), String> {
     let (mut model, mut slice, mut ref_path, mut output) = (None, None, None, None);
     let (mut logits, mut teacher) = (None, None);
     let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
+    let mut ple_hot = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -521,6 +586,7 @@ fn run() -> Result<(), String> {
             "--top-k" => top_k = number(value()?)?,
             "--max-chunks" => max_chunks = Some(number(value()?)?),
             "--decode" => decode = true,
+            "--ple-hot" => ple_hot = Some(number(value()?)? as u64),
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
@@ -529,7 +595,7 @@ fn run() -> Result<(), String> {
             build_ref(&model, &slice, &output, n_ctx, top_k, max_chunks)
         }
         ("eval", Some(model), None, Some(ref_path), Some(output)) => {
-            score(&model, &ref_path, &output, max_chunks, decode)
+            score(&model, &ref_path, &output, max_chunks, decode, ple_hot)
         }
         ("import", None, None, Some(template), Some(output)) => match (logits, teacher) {
             (Some(logits), Some(teacher)) => {

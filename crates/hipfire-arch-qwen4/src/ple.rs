@@ -281,6 +281,27 @@ impl PleHashMetadata {
         .expect("pinned Qwen4 PLE metadata must satisfy its invariants")
     }
 
+    /// Identity of the row layout: SHA-256 over the little-endian bytes of
+    /// `padded_rows` (u64), each multiplier (i64), each head vocabulary size
+    /// (u64), and each head offset (u64), in that order.  Sidecar files that
+    /// are indexed by global row id (the PLE hot-row rank) record this value so
+    /// a rank built for one hash layout is never applied to another.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.padded_rows.to_le_bytes());
+        for multiplier in self.multipliers {
+            hasher.update(multiplier.to_le_bytes());
+        }
+        for size in self.head_vocab_sizes {
+            hasher.update(size.to_le_bytes());
+        }
+        for offset in self.head_offsets {
+            hasher.update(offset.to_le_bytes());
+        }
+        hasher.finalize().into()
+    }
+
     /// Parse the canonical version-1 `qwen4_ple` object without converting
     /// typed integer arrays through floating point.
     ///
@@ -562,6 +583,36 @@ mod tests {
                 "padded_rows": 2048
             }
         })
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_layout_sensitive() {
+        use sha2::{Digest, Sha256};
+        let metadata = PleHashMetadata::qwen4();
+        let mut hasher = Sha256::new();
+        hasher.update(PLE_PADDED_ROWS.to_le_bytes());
+        for multiplier in PLE_MULTIPLIERS {
+            hasher.update(multiplier.to_le_bytes());
+        }
+        for size in PLE_HEAD_VOCAB_SIZES {
+            hasher.update(size.to_le_bytes());
+        }
+        for offset in PLE_HEAD_OFFSETS {
+            hasher.update(offset.to_le_bytes());
+        }
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(metadata.fingerprint(), expected);
+        assert_eq!(metadata.fingerprint(), PleHashMetadata::qwen4().fingerprint());
+        let mut multipliers = PLE_MULTIPLIERS;
+        multipliers[2] += 1;
+        let other = PleHashMetadata::from_stored(
+            multipliers,
+            PLE_HEAD_VOCAB_SIZES,
+            PLE_HEAD_OFFSETS,
+            PLE_PADDED_ROWS,
+        )
+        .unwrap();
+        assert_ne!(metadata.fingerprint(), other.fingerprint());
     }
 
     #[test]

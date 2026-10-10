@@ -33,9 +33,16 @@ mod quant_hfp4;
 mod quant_mq;
 mod quant_mq4v2_lloyd;
 mod quant_q4;
+mod ple_hot_rank;
 mod qwen4;
 mod reap_overlay;
 
 fn main() {
+    // `ple-hot-rank` is a standalone offline tool with its own flags; it never
+    // enters the quantize pipeline's argument surface.
+    let mut argv = std::env::args().skip(1);
+    if argv.next().as_deref() == Some("ple-hot-rank") {
+        std::process::exit(ple_hot_rank::run(argv.collect()));
+    }
     pipeline::run();
 }

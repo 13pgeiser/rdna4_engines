@@ -20,11 +20,12 @@
 //! little-endian BF16, whatever tier the shards store.
 
 use crate::model_source::{SourceError, SourceRangeDescriptor};
+use crate::ple_hot_store::HotRowStore;
 use rdna_compute::DType;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -245,6 +246,13 @@ pub struct RowCacheStats {
     pub outstanding_leases: usize,
     pub staging_in_use: usize,
     pub staging_high_water: usize,
+    /// Rows served from the attached PLE hot-row store (no page read, no
+    /// `cache_hits`/`cache_misses` accounting).
+    pub hot_rows: u64,
+    /// Pages whose every requested row the hot-row store served.
+    pub hot_pages: u64,
+    /// Logical bytes of the hot-row store's present tiers.
+    pub hot_resident_bytes: u64,
 }
 
 /// Proof returned by [`RowStore::quiesce`] and [`RowStore::unload`].
@@ -644,6 +652,7 @@ impl RowStore {
             epoch_started: AtomicBool::new(false),
             state: Mutex::new(RowStoreState::new(staging_bytes)),
             cv: Condvar::new(),
+            hot_store: OnceLock::new(),
         });
         let weak = Arc::downgrade(&inner);
         let worker = thread::Builder::new()
@@ -1068,6 +1077,35 @@ impl RowStore {
         self.inner.stats()
     }
 
+    /// Attach the PLE hot-row store.  Rows it holds are decoded from its
+    /// bytes (the model file's own encoded rows) instead of read from the
+    /// source; everything else takes the unchanged page path.  One store per
+    /// row store, attached once; the caller stops and joins the store's fill
+    /// before unloading this row store.  Errs (and attaches nothing) when the
+    /// store's geometry is not this table's.
+    pub fn attach_hot_store(&self, store: Arc<HotRowStore>) -> Result<(), String> {
+        let inner = &self.inner;
+        if store.padded_rows() != inner.padded_rows
+            || store.rows_per_shard() != inner.rows_per_shard
+            || store.encoded_row_bytes() != inner.encoded_row_bytes
+        {
+            return Err(format!(
+                "hot store geometry ({} rows, {} per shard, {} B/row) does not match the row \
+                 store ({} rows, {} per shard, {} B/row)",
+                store.padded_rows(),
+                store.rows_per_shard(),
+                store.encoded_row_bytes(),
+                inner.padded_rows,
+                inner.rows_per_shard,
+                inner.encoded_row_bytes,
+            ));
+        }
+        inner
+            .hot_store
+            .set(store)
+            .map_err(|_| "a hot store is already attached".to_string())
+    }
+
     /// Drop all immutable userspace pages.  The source reader intentionally
     /// has no mmap or fd-pinning contract; dropping these pages is therefore a
     /// portable best-effort eviction of this cache, while the counters make
@@ -1302,6 +1340,9 @@ struct RowStoreInner {
     stopped: AtomicBool,
     state: Mutex<RowStoreState>,
     cv: Condvar,
+    /// PLE hot-row store consulted before the page cache (see
+    /// [`RowStore::attach_hot_store`]).
+    hot_store: OnceLock<Arc<HotRowStore>>,
 }
 
 impl RowStoreInner {
@@ -1394,6 +1435,12 @@ impl RowStoreInner {
             outstanding_leases: state.active_leases,
             staging_in_use: state.staging_in_use,
             staging_high_water: state.staging_high_water,
+            hot_rows: self.hot_store.get().map_or(0, |store| store.hot_rows()),
+            hot_pages: self.hot_store.get().map_or(0, |store| store.hot_pages()),
+            hot_resident_bytes: self
+                .hot_store
+                .get()
+                .map_or(0, |store| store.resident_bytes()),
         }
     }
 
@@ -1515,6 +1562,10 @@ impl RowStoreInner {
         canceled: &AtomicBool,
         pending: &mut PendingPages,
     ) -> Result<(), RowStoreError> {
+        // Every PLE fetch (a prefill chunk or a decode step) pauses the hot
+        // store's fill until shortly after the last one returns, so the fill
+        // only runs while no request is being served.
+        let _busy = self.hot_store.get().map(|store| store.busy());
         if pages.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(RowStoreError::InvalidLease {
                 reason: "page plan is not strictly ascending".to_string(),
@@ -1541,6 +1592,18 @@ impl RowStoreInner {
                     page_offset: location.page_byte_offset,
                 });
         }
+
+        // Rows the hot store holds are decoded from its bytes; a page is
+        // skipped only when every row requested from it is served, so a
+        // partially hot page is read and decoded exactly as without the store.
+        let remaining_pages;
+        let pages = match self.hot_store.get().filter(|store| store.tier_count() > 0) {
+            Some(store) => {
+                remaining_pages = self.serve_hot_pages(store, pages, &requested, output, canceled)?;
+                remaining_pages.as_slice()
+            }
+            None => pages,
+        };
 
         let mut missing = Vec::new();
         for &page in pages {
@@ -1617,6 +1680,66 @@ impl RowStoreInner {
             self.read_group(&group, &requested, output, read_staging, canceled)?;
         }
         Ok(())
+    }
+
+    /// Decode every page whose requested rows are all in `store` straight
+    /// into `output`; returns the pages left for the cache/SSD path (ascending).
+    ///
+    /// The store's read guard is held for this loop only (decode, no I/O), so
+    /// a concurrent [`HotRowStore::release_lowest`] waits at most one pass.
+    fn serve_hot_pages(
+        &self,
+        store: &HotRowStore,
+        pages: &[PageKey],
+        requested: &HashMap<PageKey, Vec<RowCopy>>,
+        output: &mut [u8],
+        canceled: &AtomicBool,
+    ) -> Result<Vec<PageKey>, RowStoreError> {
+        if canceled.load(Ordering::Acquire) {
+            return Err(RowStoreError::Canceled);
+        }
+        let guard = store.read();
+        let mut remaining = Vec::with_capacity(pages.len());
+        let mut hot_rows: Vec<(usize, &[u8])> = Vec::new();
+        let (mut served_rows, mut served_pages) = (0u64, 0u64);
+        for &page in pages {
+            let Some(copies) = requested.get(&page).filter(|copies| !copies.is_empty()) else {
+                remaining.push(page);
+                continue;
+            };
+            let first_row = page.shard as u64 * self.rows_per_shard as u64
+                + (page.page * self.rows_per_page) as u64;
+            hot_rows.clear();
+            let mut complete = true;
+            for copy in copies {
+                let row = first_row + (copy.page_offset / self.encoded_row_bytes) as u64;
+                match store.get(&guard, row) {
+                    Some(bytes) => hot_rows.push((copy.output_offset, bytes)),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if !complete {
+                remaining.push(page);
+                continue;
+            }
+            for &(output_offset, bytes) in &hot_rows {
+                let end = output_offset
+                    .checked_add(self.decoded_row_bytes)
+                    .filter(|&end| end <= output.len())
+                    .ok_or_else(|| RowStoreError::InvalidLease {
+                        reason: "hot row output range is outside the lease".to_string(),
+                    })?;
+                self.encoding
+                    .decode_row(bytes, &mut output[output_offset..end])?;
+            }
+            served_rows += hot_rows.len() as u64;
+            served_pages += 1;
+        }
+        store.note_served(served_rows, served_pages);
+        Ok(remaining)
     }
 
     fn coalesce_pages(&self, pages: &[PageKey]) -> Result<Vec<Vec<PageKey>>, RowStoreError> {
@@ -3486,5 +3609,229 @@ mod tests {
         }
         drop(lease);
         assert!(unload.join().unwrap().unwrap().is_clean());
+    }
+
+    // ---- PLE hot-row store ------------------------------------------------
+
+    const HOT_ROWS_PER_SHARD: usize = 4096;
+    const HOT_PADDED_ROWS: u64 = 2 * HOT_ROWS_PER_SHARD as u64;
+
+    fn q8_source() -> Arc<MemoryRowSource> {
+        Arc::new(MemoryRowSource {
+            shards: rows_source_q8(2, HOT_ROWS_PER_SHARD),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        })
+    }
+
+    fn q8_row_store(source: &Arc<MemoryRowSource>) -> RowStore {
+        RowStore::from_test_source_encoded(
+            metadata_with_head_size(512, HOT_PADDED_ROWS),
+            HOT_ROWS_PER_SHARD,
+            ROWS_PER_PAGE,
+            RowEncoding::Q8F16,
+            source.clone(),
+        )
+        .unwrap()
+    }
+
+    /// A filled hot store keeping `kept` of the 256 buckets of a pseudo-random
+    /// ranking of the fixture table.
+    fn filled_hot_store(
+        source: &MemoryRowSource,
+        kept: u64,
+        group: usize,
+        seed: u64,
+    ) -> Arc<HotRowStore> {
+        use crate::ple_hot_store::test_support::{
+            fill_from_shards, synthetic_buckets, FINGERPRINT,
+        };
+        use crate::ple_hot_store::PleHotRank;
+        let rank = PleHotRank::from_buckets(
+            HOT_PADDED_ROWS,
+            FINGERPRINT,
+            synthetic_buckets(HOT_PADDED_ROWS as usize, seed),
+        );
+        let budget = HOT_PADDED_ROWS * 170 * kept / 256 + 1;
+        let hot = HotRowStore::new_with_group(rank, budget, HOT_ROWS_PER_SHARD, 170, group)
+            .unwrap();
+        fill_from_shards(&hot, &source.shards);
+        assert!(hot.fill_complete());
+        hot
+    }
+
+    fn fetch(rows: &RowStore, ids: &[u64]) -> Vec<u8> {
+        let ticket = rows.prefetch(0, ids.to_vec()).unwrap();
+        let lease = rows.wait_completed_lease(&ticket).unwrap();
+        assert_eq!(lease.row_ids(), ids);
+        lease.as_bytes().unwrap().to_vec()
+    }
+
+    fn expected_rows(ids: &[u64]) -> Vec<u8> {
+        ids.iter()
+            .flat_map(|&id| {
+                let shard = id as usize / HOT_ROWS_PER_SHARD;
+                let row = id as usize % HOT_ROWS_PER_SHARD;
+                expected_q8_row(shard, row, HOT_ROWS_PER_SHARD)
+            })
+            .collect()
+    }
+
+    /// Scattered ids with repeats, plus one contiguous run so many pages hold
+    /// both hot and cold requested rows.
+    fn mixed_ids() -> Vec<u64> {
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        let mut ids: Vec<u64> = (0..3000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % HOT_PADDED_ROWS
+            })
+            .collect();
+        ids.extend(100..260);
+        ids.extend(HOT_ROWS_PER_SHARD as u64 - 20..HOT_ROWS_PER_SHARD as u64 + 20);
+        ids
+    }
+
+    /// Output bytes are identical with and without the store for random row
+    /// sets (partially hot pages included), with an unready shard, and after
+    /// tiers were released; hot pages are counted separately from
+    /// hits/misses, which keep their meaning for the remaining pages.
+    #[test]
+    fn hot_store_output_is_byte_identical_with_partial_pages_and_unready_shards() {
+        let source = q8_source();
+        let ids = mixed_ids();
+        let want = expected_rows(&ids);
+        let distinct_pages: std::collections::BTreeSet<u64> =
+            ids.iter().map(|id| id / ROWS_PER_PAGE as u64).collect();
+
+        let plain = q8_row_store(&source);
+        assert_eq!(fetch(&plain, &ids), want);
+        let plain_stats = plain.cache_stats();
+        assert_eq!(plain_stats.cache_misses as usize, distinct_pages.len());
+        assert_eq!((plain_stats.hot_rows, plain_stats.hot_pages), (0, 0));
+
+        // Half the rows hot: many pages mix hot and cold requested rows.
+        let hot = filled_hot_store(&source, 128, 4, 77);
+        let hot_rows = q8_row_store(&source);
+        hot_rows.attach_hot_store(hot.clone()).unwrap();
+        assert_eq!(fetch(&hot_rows, &ids), want);
+        let stats = hot_rows.cache_stats();
+        assert!(stats.hot_pages > 0 && stats.hot_rows >= stats.hot_pages);
+        assert!((stats.hot_pages as usize) < distinct_pages.len(), "some pages stay cold");
+        assert_eq!(
+            stats.cache_misses + stats.hot_pages,
+            plain_stats.cache_misses,
+            "hot pages leave hits/misses untouched for every other page"
+        );
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.hot_resident_bytes, hot.resident_bytes());
+        assert_eq!(hot.hot_rows(), stats.hot_rows);
+
+        // Shard 1 not ready: none of its rows may come from the store.
+        let partial = filled_hot_store(&source, 256, 4, 5);
+        partial.set_shard_ready_for_test(1, false);
+        let rows = q8_row_store(&source);
+        rows.attach_hot_store(partial.clone()).unwrap();
+        assert_eq!(fetch(&rows, &ids), want);
+        let stats = rows.cache_stats();
+        let shard0_pages: std::collections::BTreeSet<u64> = ids
+            .iter()
+            .filter(|&&id| (id as usize) < HOT_ROWS_PER_SHARD)
+            .map(|id| id / ROWS_PER_PAGE as u64)
+            .collect();
+        let shard0_rows = ids.iter().filter(|&&id| (id as usize) < HOT_ROWS_PER_SHARD).count();
+        assert_eq!(stats.hot_pages as usize, shard0_pages.len(), "whole table is hot");
+        assert_eq!(stats.hot_rows as usize, shard0_rows);
+        assert!(stats.cache_misses > 0, "shard 1 pages were read");
+        // A request over rows that are all hot reads nothing.
+        let hot_only: Vec<u64> = (0..HOT_ROWS_PER_SHARD as u64).step_by(3).collect();
+        let reads_before = rows.cache_stats().reads;
+        assert_eq!(fetch(&rows, &hot_only), expected_rows(&hot_only));
+        assert_eq!(rows.cache_stats().reads, reads_before);
+
+        // Tiers released one by one: output never changes.
+        let released = filled_hot_store(&source, 200, 3, 91);
+        let rows_before_release = released.tier_count();
+        assert!(rows_before_release > 3);
+        while released.release_lowest() > 0 {
+            let rows = q8_row_store(&source);
+            rows.attach_hot_store(released.clone()).unwrap();
+            // The store's counters are cumulative across row stores: compare deltas.
+            let before = (released.hot_rows(), released.hot_pages());
+            assert_eq!(fetch(&rows, &ids), want);
+            if released.resident_bytes() == 0 {
+                assert_eq!((released.hot_rows(), released.hot_pages()), before, "an empty store serves nothing");
+            }
+        }
+    }
+
+    /// Releasing tiers while requests are in flight never changes a returned
+    /// byte: a request either takes a row from its tier or reads the source.
+    #[test]
+    fn release_during_in_flight_requests_keeps_output_identical() {
+        let source = q8_source();
+        let hot = filled_hot_store(&source, 256, 4, 13);
+        let rows = Arc::new(q8_row_store(&source));
+        rows.attach_hot_store(hot.clone()).unwrap();
+        let ids = mixed_ids();
+        let want = expected_rows(&ids);
+
+        let releaser = {
+            let hot = hot.clone();
+            std::thread::spawn(move || {
+                let mut released = 0u64;
+                loop {
+                    std::thread::sleep(Duration::from_micros(300));
+                    let bytes = hot.release_lowest();
+                    if bytes == 0 {
+                        return released;
+                    }
+                    released += bytes;
+                }
+            })
+        };
+        let mut rounds = 0;
+        while !releaser.is_finished() || rounds < 8 {
+            assert_eq!(fetch(&rows, &ids), want, "round {rounds}");
+            rows.evict_cached_pages();
+            rounds += 1;
+        }
+        let released = releaser.join().unwrap();
+        assert_eq!(released, HOT_PADDED_ROWS * 170);
+        assert_eq!(hot.resident_bytes(), 0);
+        let served = hot.hot_rows();
+        rows.evict_cached_pages();
+        assert_eq!(fetch(&rows, &ids), want);
+        assert_eq!(hot.hot_rows(), served, "a fully released store serves nothing");
+    }
+
+    /// A store whose geometry is not the table's is refused, as is a second
+    /// store; a zero-tier store attaches and changes nothing.
+    #[test]
+    fn attach_hot_store_validates_geometry() {
+        use crate::ple_hot_store::test_support::{synthetic_buckets, FINGERPRINT};
+        use crate::ple_hot_store::PleHotRank;
+        let source = q8_source();
+        let rows = q8_row_store(&source);
+        let rank = |padded: usize| {
+            PleHotRank::from_buckets(padded as u64, FINGERPRINT, synthetic_buckets(padded, 3))
+        };
+        let wrong_shards =
+            HotRowStore::new(rank(8192), 1 << 30, HOT_ROWS_PER_SHARD / 2, 170).unwrap();
+        assert!(rows.attach_hot_store(wrong_shards).is_err());
+        let wrong_rows = HotRowStore::new(rank(4096), 1 << 30, 2048, 170).unwrap();
+        assert!(rows.attach_hot_store(wrong_rows).is_err());
+
+        let empty = HotRowStore::new(rank(8192), 0, HOT_ROWS_PER_SHARD, 170).unwrap();
+        assert_eq!(empty.tier_count(), 0);
+        rows.attach_hot_store(empty).unwrap();
+        let ids = mixed_ids();
+        assert_eq!(fetch(&rows, &ids), expected_rows(&ids));
+        let stats = rows.cache_stats();
+        assert_eq!((stats.hot_rows, stats.hot_pages, stats.hot_resident_bytes), (0, 0, 0));
+        let second = HotRowStore::new(rank(8192), 1 << 30, HOT_ROWS_PER_SHARD, 170).unwrap();
+        assert!(rows.attach_hot_store(second).is_err());
     }
 }

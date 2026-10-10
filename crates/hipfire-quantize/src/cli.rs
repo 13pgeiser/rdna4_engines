@@ -11,7 +11,9 @@ use clap::Parser;
 #[command(
     name = "hipfire-quantize",
     version,
-    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ"
+    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ",
+    after_help = "SUBCOMMANDS:\n  ple-hot-rank  Rank Qwen4 PLE rows over a corpus and write the <model>.plehot \
+                  hot-row sidecar (run `hipfire-quantize ple-hot-rank --help`)"
 )]
 pub(crate) struct QuantizeArgs {
     /// Hugging Face model directory or model ID. A GGUF weight file is

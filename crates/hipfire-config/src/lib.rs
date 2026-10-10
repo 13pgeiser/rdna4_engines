@@ -330,6 +330,11 @@ pub enum ValueRule {
         min: i64,
         max: i64,
     },
+    /// The string `auto` or an integer in `min..=max`.
+    AutoInteger {
+        min: i64,
+        max: i64,
+    },
     NullableFloat {
         min: f64,
         max: f64,
@@ -390,6 +395,10 @@ impl ConfigField {
                 matches!(value, ConfigValue::Bool(_))
                     || matches!(value, ConfigValue::String(v) if v == "auto")
             }
+            ValueRule::AutoInteger { min, max } => {
+                matches!(value, ConfigValue::String(v) if v == "auto")
+                    || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+            }
             ValueRule::NullableString => {
                 matches!(value, ConfigValue::Null | ConfigValue::String(_))
             }
@@ -440,6 +449,10 @@ impl ConfigField {
             ValueRule::Float { .. } => raw.parse::<f64>().ok().map(ConfigValue::Float),
             ValueRule::AutoBool if raw == "auto" => Some(ConfigValue::String(raw.to_owned())),
             ValueRule::AutoBool => parse_bool(raw).map(ConfigValue::Bool),
+            ValueRule::AutoInteger { .. } if raw.eq_ignore_ascii_case("auto") => {
+                Some(ConfigValue::String("auto".to_owned()))
+            }
+            ValueRule::AutoInteger { .. } => raw.parse::<i64>().ok().map(ConfigValue::Integer),
             ValueRule::NullableString if raw.eq_ignore_ascii_case("null") => {
                 Some(ConfigValue::Null)
             }
@@ -1586,6 +1599,19 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_SESSION_CACHE_BYTES",
         "Byte budget for reusable prefill snapshots (session cache; Flash-Next). 0 disables the cache."
+    ),
+    process_field!(
+        "memory.ple_hot_store_bytes",
+        "ple_hot_store_bytes",
+        Memory,
+        DefaultValue::Integer(0),
+        ValueRule::AutoInteger {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_PLE_HOT_STORE_BYTES",
+        "Byte budget of the Qwen4 PLE hot-row store (frequency-ranked rows of the per-layer-embedding table kept in host RAM, served without SSD reads; unified-memory GPUs only, needs the `<model>.plehot` sidecar). Default 0 (off). `auto` uses 32 GB on a unified-memory GPU with a Qwen4 Q8F16 model and a sidecar present, else off. A budget is also capped by free host RAM at load, and the store yields to context growth and the session cache."
     ),
     process_bool_field!(
         "memory.prompt_cache_unbounded",
@@ -6661,7 +6687,7 @@ mod tests {
 /// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
 /// the qwen35 load path consumes them to pick `i_gpu_start`.
 pub mod memory {
-    use super::process_value;
+    use super::{developer_var, process_value};
 
     /// Resident-layer budget for partial GPU offload (`memory.gpu_layer_budget`,
     /// compat env `HIPFIRE_GPU_LAYER_BUDGET`). Resolved once at load.
@@ -6730,6 +6756,73 @@ pub mod memory {
         process_value("HIPFIRE_SESSION_CACHE_BYTES")
             .and_then(|value| value.parse().ok())
             .unwrap_or(8589934592)
+    }
+
+    /// Budget request of the PLE hot-row store (`memory.ple_hot_store_bytes`,
+    /// compat env `HIPFIRE_PLE_HOT_STORE_BYTES`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PleHotStoreBudget {
+        /// `auto`: the carrier picks the budget when the device, model and
+        /// sidecar allow it.
+        Auto,
+        /// An explicit byte budget; `0` (the default) is off.
+        Bytes(u64),
+    }
+
+    /// Pure parser behind [`ple_hot_store_bytes`]: unset and empty resolve
+    /// to off (`Bytes(0)`, the default), `auto` to [`PleHotStoreBudget::Auto`];
+    /// an integer is that budget; an unparseable value (the config layer
+    /// rejects those before they get here) fails closed to off.
+    pub fn parse_ple_hot_store_bytes(raw: Option<&str>) -> PleHotStoreBudget {
+        match raw.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("auto") => PleHotStoreBudget::Auto,
+            Some(v) if !v.is_empty() => v
+                .parse::<u64>()
+                .map(PleHotStoreBudget::Bytes)
+                .unwrap_or(PleHotStoreBudget::Bytes(0)),
+            _ => PleHotStoreBudget::Bytes(0),
+        }
+    }
+
+    /// Configured PLE hot-store budget from the process snapshot.
+    pub fn ple_hot_store_bytes() -> PleHotStoreBudget {
+        parse_ple_hot_store_bytes(process_value("HIPFIRE_PLE_HOT_STORE_BYTES").as_deref())
+    }
+
+    /// Optional override of the PLE hot-rank sidecar path
+    /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.
+    pub fn ple_hot_rank_file() -> Option<String> {
+        developer_var("HIPFIRE_PLE_HOT_RANK_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// PLE hot-store fill diagnostics on stderr (`HIPFIRE_PLE_HOT_DEBUG=1`,
+    /// developer variable).
+    pub fn ple_hot_debug() -> bool {
+        developer_var("HIPFIRE_PLE_HOT_DEBUG").is_ok_and(|v| v == "1")
+    }
+
+    /// Default PLE hot-store fill rate during the model load (bytes/s): 0,
+    /// the fill starts once the model is ready.  A throttled fill during
+    /// the load measured load 53 s → 63–213 s on Halo (gfx1151).
+    pub const PLE_HOT_FILL_LOAD_RATE_DEFAULT: u64 = 0;
+
+    /// Pure parser behind [`ple_hot_fill_load_rate`]: unset, empty and
+    /// unparseable values give the default; `0` is a valid value.
+    pub fn parse_ple_hot_fill_load_rate(raw: Option<&str>) -> u64 {
+        raw.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(PLE_HOT_FILL_LOAD_RATE_DEFAULT)
+    }
+
+    /// Rate (bytes/s) at which the PLE hot-store fill may read the model file
+    /// while the model is still loading (`HIPFIRE_PLE_HOT_FILL_LOAD_RATE`,
+    /// developer variable); `0` starts the fill only after the load. The
+    /// fill is unthrottled once the model is ready.
+    pub fn ple_hot_fill_load_rate() -> u64 {
+        parse_ple_hot_fill_load_rate(developer_var("HIPFIRE_PLE_HOT_FILL_LOAD_RATE").ok().as_deref())
     }
 
     /// Which engine executes the ops that read a spilled layer's weights
@@ -6895,6 +6988,39 @@ pub mod memory {
             // closed to full residency rather than forcing an offload.
             assert_eq!(parse_gpu_layer_budget(Some("banana")), GpuLayerBudget::Full);
             assert_eq!(parse_gpu_layer_budget(Some("-2")), GpuLayerBudget::Full);
+        }
+
+        #[test]
+        fn ple_hot_store_bytes_parse() {
+            assert_eq!(parse_ple_hot_store_bytes(None), PleHotStoreBudget::Bytes(0));
+            assert_eq!(parse_ple_hot_store_bytes(Some("")), PleHotStoreBudget::Bytes(0));
+            assert_eq!(parse_ple_hot_store_bytes(Some("auto")), PleHotStoreBudget::Auto);
+            assert_eq!(parse_ple_hot_store_bytes(Some("0")), PleHotStoreBudget::Bytes(0));
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some(" 16000000000 ")),
+                PleHotStoreBudget::Bytes(16_000_000_000)
+            );
+            assert_eq!(parse_ple_hot_store_bytes(Some("-1")), PleHotStoreBudget::Bytes(0));
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_hot_store_bytes")
+                .expect("ple_hot_store_bytes is in the schema");
+            assert!(field.validate(&crate::ConfigValue::String("auto".into())).is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_ok());
+            assert!(field.validate(&crate::ConfigValue::String("on".into())).is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
+            assert!(matches!(field.parse_cli("auto"), Ok(crate::ConfigValue::String(_))));
+            assert!(matches!(field.parse_cli("42"), Ok(crate::ConfigValue::Integer(42))));
+        }
+
+        #[test]
+        fn ple_hot_fill_load_rate_parse() {
+            assert_eq!(parse_ple_hot_fill_load_rate(None), 0);
+            assert_eq!(parse_ple_hot_fill_load_rate(Some("")), 0);
+            assert_eq!(parse_ple_hot_fill_load_rate(Some("junk")), 0);
+            assert_eq!(parse_ple_hot_fill_load_rate(Some("800000000")), 800_000_000);
+            assert_eq!(parse_ple_hot_fill_load_rate(Some("0")), 0);
+            assert_eq!(parse_ple_hot_fill_load_rate(Some(" 1500000000 ")), 1_500_000_000);
         }
 
         #[test]

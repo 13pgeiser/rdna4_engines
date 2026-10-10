@@ -28,8 +28,9 @@ use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
 use hipfire_runtime::sampler::{
     apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, PenaltyTable, SamplerConfig,
 };
+use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::session_cache::{
-    SessionCache, SessionRoute, SessionState, SnapshotParts, StateLayout,
+    memory_fits, SessionCache, SessionRoute, SessionState, SnapshotParts, StateLayout, YieldFirst,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -221,6 +222,10 @@ pub struct Qwen4Bundle {
     /// Prefill snapshot cache shared by every session (`attach_session_cache`);
     /// `None` = off.
     session: Option<SessionCache>,
+    /// PLE hot-row store and its fill thread (`attach_ple_hot_store`); `None`
+    /// = off. Dropping it stops and joins the fill; `free_gpu` does so before
+    /// the row store unloads.
+    ple_hot: Option<PleHotFill>,
     /// Committed live state kept for a continuation of the same conversation
     /// (`session_commit_live`); `None` = none. Cleared by `reset`,
     /// `session_clear`, `session_commit` and `session_begin` (it is consumed
@@ -538,6 +543,7 @@ impl Qwen4Bundle {
             weights,
             state,
             ple_rows,
+            ple_hot: None,
             ple_metadata: metadata,
             weight_store: AttachedWeightStore::new(transaction),
             execution: None,
@@ -1823,18 +1829,53 @@ impl Qwen4Bundle {
     /// snapshots until the growth through `end_position` fits: the cache
     /// never causes a context allocation to fail.
     pub(crate) fn release_session_for_growth(&mut self, gpu: &mut Gpu, end_position: usize) {
-        if self.session.is_none() || end_position <= self.state.mapped_context_tokens() {
+        if end_position <= self.state.mapped_context_tokens() {
+            return;
+        }
+        if self.session.is_none() && self.ple_hot.is_none() {
             return;
         }
         let (context, gather) = self.context_growth_bytes(gpu, end_position);
+        let need = context.saturating_add(gather);
+        // The PLE hot-row store yields first, lowest-ranked tier first: its
+        // rows are re-readable from the model file, a snapshot is not.
+        if let Some(hot) = self.ple_hot.as_ref() {
+            while memory_fits(gpu, need) == Some(false) && hot.store().release_lowest() > 0 {}
+        }
         if let Some(cache) = self.session.as_mut() {
-            cache.release_for(gpu, context.saturating_add(gather));
+            cache.release_for(gpu, need);
         }
     }
 
+    /// Attach the PLE hot-row store and its fill thread: the row store serves
+    /// hot rows from it, and the session cache (already attached, or attached
+    /// later) and context growth release its tiers before evicting snapshots.
+    /// A geometry mismatch is logged and the store is dropped (stopped and
+    /// joined).
+    pub fn attach_ple_hot_store(&mut self, hot: PleHotFill) {
+        if let Err(error) = self.ple_rows.attach_hot_store(hot.store().clone()) {
+            eprintln!("  qwen4 ple hot store: not attached to the row store ({error})");
+            return;
+        }
+        if let Some(cache) = self.session.as_mut() {
+            cache.set_yield_first(Some(hot.store().clone() as std::sync::Arc<dyn YieldFirst>));
+        }
+        self.ple_hot = Some(hot);
+    }
+
+    /// The attached PLE hot-row store, if any.
+    pub fn ple_hot_store(&self) -> Option<&std::sync::Arc<HotRowStore>> {
+        self.ple_hot.as_ref().map(PleHotFill::store)
+    }
+
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
-    /// then restores and captures whole-chunk snapshots through it.
-    pub fn attach_session_cache(&mut self, cache: SessionCache) {
+    /// then restores and captures whole-chunk snapshots through it. With a
+    /// PLE hot-row store attached the cache's memory guard releases its tiers
+    /// before evicting snapshots.
+    pub fn attach_session_cache(&mut self, mut cache: SessionCache) {
+        if let Some(hot) = self.ple_hot.as_ref() {
+            cache.set_yield_first(Some(hot.store().clone() as std::sync::Arc<dyn YieldFirst>));
+        }
         self.session = Some(cache);
     }
 
@@ -2213,6 +2254,7 @@ impl Qwen4Bundle {
             weights,
             state,
             ple_rows,
+            ple_hot,
             weight_store,
             execution,
             mtp,
@@ -2224,6 +2266,9 @@ impl Qwen4Bundle {
             lanes,
             ..
         } = self;
+        // The hot-row store's fill reads the model file and writes the tiers:
+        // stop and join it before the row store unloads.
+        drop(ple_hot);
         if let Some(mut session) = session {
             session.clear(gpu);
         }
@@ -2442,6 +2487,94 @@ fn validate_ple_metadata(metadata: &PleHashMetadata) -> Result<(), BundleError> 
         )));
     }
     Ok(())
+}
+
+/// Inputs of the PLE hot-row store's fill, resolved before the weight sweep
+/// from the manifest and the source index (no descriptors exist yet).
+pub struct PleHotPlan {
+    /// Absolute file offset of each PLE shard's first row, in shard order.
+    pub shard_offsets: Vec<u64>,
+    pub rows_per_shard: usize,
+    pub encoded_row_bytes: usize,
+    pub padded_rows: u64,
+    /// Lowercase hex of [`PleHashMetadata::fingerprint`], the sidecar's key.
+    pub fingerprint_hex: String,
+}
+
+/// The hot-row store's plan, or `None` when the artifact's PLE shards are not
+/// Q8F16 (the store holds raw 170-byte rows). `tensor_range` resolves a shard
+/// tensor's file range from the source index.
+pub fn ple_hot_plan(
+    manifest: &Qwen4Manifest,
+    metadata: &PleHashMetadata,
+    tensor_range: impl Fn(&str) -> Result<Option<SourceRangeDescriptor>, String>,
+) -> Result<Option<PleHotPlan>, String> {
+    validate_ple_metadata(metadata).map_err(|error| error.to_string())?;
+    let entries = ordered_ple_entries(manifest).map_err(|error| format!("{error:?}"))?;
+    let q8_row_bytes = RowEncoding::Q8F16.encoded_row_bytes(PLE_ROW_WIDTH);
+    let mut shard_offsets = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry.residency {
+            WeightResidency::ExternalRows { row_bytes, .. } if row_bytes == q8_row_bytes => {}
+            _ => return Ok(None),
+        }
+        let descriptor = tensor_range(&entry.name)?
+            .ok_or_else(|| format!("missing PLE shard '{}'", entry.name))?;
+        if RowEncoding::from_dtype(&descriptor.dtype) != Some(RowEncoding::Q8F16) {
+            return Ok(None);
+        }
+        if descriptor.length != (PLE_SHARD_ROWS * q8_row_bytes) as u64 {
+            return Err(format!(
+                "PLE shard '{}' is {} bytes, expected {}",
+                entry.name,
+                descriptor.length,
+                PLE_SHARD_ROWS * q8_row_bytes
+            ));
+        }
+        shard_offsets.push(descriptor.offset);
+    }
+    let fingerprint_hex = metadata
+        .fingerprint()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(Some(PleHotPlan {
+        shard_offsets,
+        rows_per_shard: PLE_SHARD_ROWS,
+        encoded_row_bytes: q8_row_bytes,
+        padded_rows: metadata.padded_rows(),
+        fingerprint_hex,
+    }))
+}
+
+/// A running PLE hot-row store and its fill thread. Dropping stops the fill
+/// and joins it (the fill holds its own `Arc`, so the store would otherwise
+/// keep filling), so every load error path and unload quiesces it.
+pub struct PleHotFill {
+    store: std::sync::Arc<HotRowStore>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PleHotFill {
+    pub fn new(store: std::sync::Arc<HotRowStore>, handle: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            store,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn store(&self) -> &std::sync::Arc<HotRowStore> {
+        &self.store
+    }
+}
+
+impl Drop for PleHotFill {
+    fn drop(&mut self) {
+        self.store.stop();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 fn ple_descriptors(
     transaction: &WeightLoadTransaction,
