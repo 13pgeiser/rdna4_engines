@@ -382,13 +382,7 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                 RAD_NOWEIGHTS),
                 {w.k, w.v}, {});
 
-    /* the SECOND residual: the attention output is itself normed (1 + w) before the add. */
-    op_post = rw(b, RAD_OP(b, "rmsnorm",
-                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                            RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
-                 RAD_WEIGHTS(w_post)),
-                {w.h}, {w.h});
-
+    /* o_proj is column-sharded: the rank's partial sum is reduced FIRST, then normed. */
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
                    RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
@@ -396,6 +390,13 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                               RAD_INT("min_bytes", g.wire_min_bytes)),
                    RAD_NOWEIGHTS),
                   {w.h}, {w.h});
+
+    /* the SECOND residual: the (reduced) attention output is itself normed before the add. */
+    op_post = rw(b, RAD_OP(b, "rmsnorm",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                            RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
+                 RAD_WEIGHTS(w_post)),
+                {w.h}, {w.h});
 
     op_add = rw(b, RAD_OP(b, "add",
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd), RAD_STR("dtype", g.dtype)),
@@ -436,8 +437,11 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch) const {
 
     ln_o.step(c, w.attn, w.h, T);
     trc_copy(c, trc_ring(rad_rank(c)), g.n_embd, layer, 1, w.h, T);  /* h_attn: pre-post-norm o-proj output */
-    RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
+    /* THE ALL-REDUCE BEFORE THE POST-NORM. o_proj is column-sharded, so each rank holds a PARTIAL
+     * sum here; the norm is of the whole output (HF, and vLLM's RowParallelLinear, reduce first).
+     * Normed per rank and then summed is sum_r rmsnorm(p_r), not rmsnorm(sum_r p_r). */
     if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
     RAD_ISSUE(c, op_add,  brows(w.x, T), brows(w.h, T), brows(w.x, T));
 }
 
@@ -488,11 +492,7 @@ int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                RAD_NOWEIGHTS),
               {w.gu}, {w.ffn});
-    op_post = rw(b, RAD_OP(b, "rmsnorm",
-               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
-                          RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
-               RAD_WEIGHTS(w_post)),
-              {w.h}, {w.h});
+    /* down_proj is column-sharded: reduce first, then the post-norm. */
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
                    RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
@@ -500,6 +500,11 @@ int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                               RAD_INT("min_bytes", g.wire_min_bytes)),
                    RAD_NOWEIGHTS),
                   {w.h}, {w.h});
+    op_post = rw(b, RAD_OP(b, "rmsnorm",
+               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                          RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
+               RAD_WEIGHTS(w_post)),
+              {w.h}, {w.h});
     op_add = rw(b, RAD_OP(b, "add",
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd), RAD_STR("dtype", g.dtype)),
                RAD_NOWEIGHTS),
@@ -514,8 +519,9 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_act,   brows(w.gu, T),  brows(w.ffn, T));
     ln_down.step(c, w.ffn, w.h, T);
     trc_copy(c, trc_ring(rad_rank(c)), g.n_embd, layer, 2, w.h, T);  /* h_mlp: pre-post-norm down-proj output */
-    RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
+    /* The all-reduce before the post-norm, as in the attention block: down_proj is column-sharded. */
     if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
     RAD_ISSUE(c, op_add,   brows(w.x, T),   brows(w.h, T),  brows(w.x, T));
 }
 
