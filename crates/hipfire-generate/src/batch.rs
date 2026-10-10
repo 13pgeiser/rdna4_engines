@@ -1900,6 +1900,107 @@ fn vmm_sampled_lane(msg: &serde_json::Value, m: &LoadedModel, sampling: &BatchSa
     )
 }
 
+/// The VMM driver's global per-step row budget for `batch_size` lanes.
+fn vmm_row_budget(
+    store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore,
+    params: &VmmBatchParams,
+    batch_size: usize,
+) -> usize {
+    store.row_budget().min(params.max_batch_tokens.max(batch_size))
+}
+
+/// The VMM driver's spec lane engines: MTP `(k, head_cap)` when the store's
+/// engine is staged and no n-gram modifier could change the singleton's
+/// windows; else DFlash `(block, ctx_capacity)` when staged and the row
+/// budget holds one full block (mutually exclusive with MTP at staging).
+type VmmLaneEngines = (Option<(usize, usize)>, Option<(usize, usize)>);
+fn vmm_lane_engines(m: &LoadedModel, params: &VmmBatchParams, gpu_arch: &str, row_budget: usize) -> VmmLaneEngines {
+    let store = m.qwen35().and_then(|b| b.vmm_store.as_ref());
+    let mtp = (params.spec
+        && !hipfire_config::mtp_ngram_enabled()
+        && !hipfire_config::mtp_ngram_enabled_for_arch(m.arch_id, gpu_arch))
+    .then(|| store.and_then(|s| s.spec_engine()).map(|e| (e.k(), e.head_cap())))
+    .flatten();
+    let dflash = (params.spec && mtp.is_none())
+        .then(|| store.and_then(|s| s.dflash_engine()).map(|e| (e.block_size(), e.ctx_capacity())))
+        .flatten()
+        .filter(|&(block, _)| row_budget >= block);
+    (mtp, dflash)
+}
+
+/// Whether the singleton's speculator would run a `prompt_len`-token
+/// request speculatively: prompt + fitted budget + one draft block within
+/// its context capacity (qwen.rs `spec_ctx_request_fits`; otherwise the
+/// singleton itself decodes AR).
+fn singleton_spec_fits(m: &LoadedModel, prompt_len: usize, max_tokens: usize) -> bool {
+    m.speculator.as_ref().is_some_and(|sp| {
+        crate::common::spec_ctx_request_fits(
+            prompt_len,
+            crate::common::fit_max_tokens(max_tokens, prompt_len, m.physical_cap),
+            sp.block_size(),
+            sp.ctx_capacity(),
+        )
+    })
+}
+
+/// Lane mode the VMM admission serves a SAMPLED request with at its rendered
+/// prompt length, or `None` (only the singleton route serves it exactly).
+/// `lane` is [`vmm_sampled_lane`]. A speculative singleton that falls back
+/// to AR itself is an AR lane; a spec lane needs the whole request inside
+/// the staged engine's cap (the MTP head is staged at
+/// `VMM_SPEC_LANE_CAP`, below the singleton speculator's context).
+fn sampled_admission_lane(
+    lane: Option<VmmLaneDecode>,
+    singleton_spec_fits: bool,
+    (spec_engine, dflash_engine): VmmLaneEngines,
+    prompt_len: usize,
+    max_tokens: usize,
+) -> Option<VmmLaneDecode> {
+    match lane? {
+        VmmLaneDecode::Ar => Some(VmmLaneDecode::Ar),
+        VmmLaneDecode::Mtp | VmmLaneDecode::Dflash if !singleton_spec_fits => Some(VmmLaneDecode::Ar),
+        VmmLaneDecode::Mtp => spec_engine
+            .filter(|&(k, cap)| prompt_len + max_tokens + k + 1 <= cap)
+            .map(|_| VmmLaneDecode::Mtp),
+        VmmLaneDecode::Dflash => dflash_engine
+            .filter(|&(block, cap)| dflash_lane_fits(prompt_len, max_tokens, block, cap))
+            .map(|_| VmmLaneDecode::Dflash),
+    }
+}
+
+/// Daemon, after rendering a VMM-eligible request's prompt and before
+/// enqueueing it (which puts its `gen_start` on the wire): whether the batch
+/// can serve it. A sampled request whose singleton mode has no lane at this
+/// prompt length (`sampled_admission_lane` is `None`) must take the singleton
+/// route now; once announced it could not be handed back.
+#[allow(clippy::too_many_arguments)]
+pub fn vmm_request_fits_batch(
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    sampling: &BatchSampling,
+    vmm_batch: Option<VmmBatchParams>,
+    batch_size: usize,
+    gpu_arch: &str,
+    prompt_len: usize,
+    max_tokens: usize,
+) -> bool {
+    if sampling.temp <= 0.0 {
+        return true;
+    }
+    let (Some(params), Some(store)) = (vmm_batch, m.qwen35().and_then(|b| b.vmm_store.as_ref())) else {
+        return true;
+    };
+    let engines = vmm_lane_engines(m, &params, gpu_arch, vmm_row_budget(store, &params, batch_size));
+    sampled_admission_lane(
+        vmm_sampled_lane(msg, m, sampling),
+        singleton_spec_fits(m, prompt_len, max_tokens),
+        engines,
+        prompt_len,
+        max_tokens,
+    )
+    .is_some()
+}
+
 /// The singleton's per-request AR sampler seed for a lane: the scheduler's
 /// u64 request RNG folded to u32 with the zero rule of
 /// `hipfire_engine::scheduler::request_seed_for` (xorshift state 0 is stuck).
@@ -2832,7 +2933,7 @@ pub fn drive_qwen_vmm_continuous_batch(
         let eos = b.config.eos_token;
         let mut stops = vec![eos];
         stops.extend(im_end);
-        (eos, stops, store.row_budget().min(params.max_batch_tokens.max(batch_size)))
+        (eos, stops, vmm_row_budget(store, &params, batch_size))
     };
     let im_end_tok = stop_ids.get(1).copied().unwrap_or(eos_tok);
     // Singleton constants of the think control and the ChatML trailer:
@@ -2880,34 +2981,10 @@ pub fn drive_qwen_vmm_continuous_batch(
     };
     let mut work: Vec<PendingWork> = (0..batch_size).map(idle_work).collect();
     let mut epochs: Vec<RequestEpoch> = vec![IDLE; batch_size];
-    // Spec lanes: greedy requests decoded by the store's MTP engine
-    // (`spec_cycle`), each window exactly the singleton MTP route's; never
-    // planned by the AR planner. `(k, head_cap)` when the engine is staged
-    // and no n-gram modifier could change the singleton's windows.
-    let spec_engine: Option<(usize, usize)> = if params.spec
-        && !hipfire_config::mtp_ngram_enabled()
-        && !hipfire_config::mtp_ngram_enabled_for_arch(model.arch_id, &gpu.arch)
-    {
-        vmm_bundle(&mut model.state)
-            .and_then(|b| b.vmm_store.as_ref())
-            .and_then(|s| s.spec_engine())
-            .map(|e| (e.k(), e.head_cap()))
-    } else {
-        None
-    };
-    // DFlash lanes: greedy requests the singleton greedy DFlash route would
-    // serve, decoded by the store's DFlash engine (exact block windows).
-    // `(block, ctx_capacity)` when the engine is staged and the global row
-    // budget holds one full block. Mutually exclusive with MTP at staging.
-    let dflash_engine: Option<(usize, usize)> = if params.spec && spec_engine.is_none() {
-        vmm_bundle(&mut model.state)
-            .and_then(|b| b.vmm_store.as_ref())
-            .and_then(|s| s.dflash_engine())
-            .map(|e| (e.block_size(), e.ctx_capacity()))
-            .filter(|&(block, _)| row_budget >= block)
-    } else {
-        None
-    };
+    // Spec lanes (`vmm_lane_engines`): MTP `(k, head_cap)` or DFlash
+    // `(block, ctx_capacity)`, each window exactly the singleton route's;
+    // never planned by the AR planner.
+    let (spec_engine, dflash_engine) = vmm_lane_engines(model, &params, &gpu.arch, row_budget);
     let mut lane_decode: Vec<VmmLaneDecode> = vec![VmmLaneDecode::Ar; batch_size];
     // Real per-lane speculation counters and the last DFlash window of each
     // lane (consumed-prefix bookkeeping for terminal repair).
@@ -3536,49 +3613,24 @@ pub fn drive_qwen_vmm_continuous_batch(
             // which run per committed token on AR lanes. MTP: head lane cap.
             // DFlash: the singleton greedy DFlash route's own selector and
             // the resolved context cap. A SAMPLED request is served in its
-            // singleton route's own mode only (`vmm_sampled_lane`, which
-            // already holds a think-budgeted or stop-string speculative
-            // request back at eligibility): an AR lane for an AR singleton;
+            // singleton route's own mode only (`sampled_admission_lane`): an
+            // AR lane for an AR singleton, or for a speculative singleton
+            // that falls back to AR itself (qwen.rs `spec_ctx_request_fits`);
             // an MTP/DFlash lane when the driver's engine cap holds;
             // otherwise it goes back to the singleton route
-            // (`sampled_handback`). A speculative
-            // singleton whose prompt + fitted budget + one draft block exceeds
-            // the speculator's context capacity falls back to AR itself
-            // (qwen.rs `spec_ctx_request_fits` guard), so that request is an
-            // AR lane here: the same algorithm the singleton runs.
+            // (`sampled_handback`).
             let mut sampled_handback = false;
-            let singleton_spec_fits = model.speculator.as_ref().is_some_and(|sp| {
-                crate::common::spec_ctx_request_fits(
-                    rendered.len(),
-                    crate::common::fit_max_tokens(lane_max_tokens(&key, sched), rendered.len(), model.physical_cap),
-                    sp.block_size(),
-                    sp.ctx_capacity(),
-                )
-            });
             let spec_pick: Option<(VmmLaneDecode, hipfire_runtime::spec::SpecRequestConfig)> = if s.temp > 0.0 {
-                match vmm_sampled_lane(&pending_req.original_msg, model, s) {
+                let max_tokens = lane_max_tokens(&key, sched);
+                match sampled_admission_lane(
+                    vmm_sampled_lane(&pending_req.original_msg, model, s),
+                    singleton_spec_fits(model, rendered.len(), max_tokens),
+                    (spec_engine, dflash_engine),
+                    rendered.len(),
+                    max_tokens,
+                ) {
                     Some(VmmLaneDecode::Ar) => None,
-                    Some(VmmLaneDecode::Mtp | VmmLaneDecode::Dflash) if !singleton_spec_fits => None,
-                    Some(VmmLaneDecode::Mtp) => match spec_engine {
-                        Some((k, cap)) if rendered.len() + lane_max_tokens(&key, sched) + k + 1 <= cap =>
-                        {
-                            Some((VmmLaneDecode::Mtp, spec_request_config(s, rng_state as u64)))
-                        }
-                        _ => {
-                            sampled_handback = true;
-                            None
-                        }
-                    },
-                    Some(VmmLaneDecode::Dflash) => match dflash_engine {
-                        Some((block, cap)) if dflash_lane_fits(rendered.len(), lane_max_tokens(&key, sched), block, cap) =>
-                        {
-                            Some((VmmLaneDecode::Dflash, spec_request_config(s, rng_state as u64)))
-                        }
-                        _ => {
-                            sampled_handback = true;
-                            None
-                        }
-                    },
+                    Some(mode) => Some((mode, spec_request_config(s, rng_state as u64))),
                     None => {
                         sampled_handback = true;
                         None
@@ -3606,14 +3658,21 @@ pub fn drive_qwen_vmm_continuous_batch(
                 // mechanism as a lonely request). Its `gen_start` must not be
                 // on the wire yet (a second start would be a duplicate); an
                 // already-announced request cannot move, so it fails visibly.
-                // Eligibility runs the same `vmm_sampled_lane` decision, so a
-                // think budget or stop strings never get an announced
-                // request here; only an engine/capacity mismatch between the
-                // singleton's speculator and the staged engine can.
+                // The daemon announces a request only after
+                // `vmm_request_fits_batch` ran this same decision on the same
+                // rendered prompt, so only a kept-conversation re-render
+                // (a different prompt length) can reach this.
                 if announced.borrow().contains(&key) {
+                    eprintln!(
+                        "[vmm-batch] id={} sampled request refused after announce: prompt {} (re-rendered) + max_tokens {} \
+                         no longer fits its singleton mode's lane",
+                        key.id,
+                        rendered.len(),
+                        lane_max_tokens(&key, sched),
+                    );
                     debug_assert!(
-                        !think.budgeted() && stops.is_empty(),
-                        "eligibility admitted a sampled request whose spec lane needs think control or stops"
+                        keep_conversations,
+                        "an announced sampled request failed the admission vmm_request_fits_batch admitted"
                     );
                     refuse(
                         stdout,
@@ -8603,8 +8662,9 @@ mod tests {
 
     #[test]
     fn sampled_lane_think_budget_keeps_spec_singleton_and_ar_a_lane() {
-        // The `--thinking off` sentinel cap 1 is a think budget: a sampled
-        // MTP/DFlash request stays singleton at eligibility (never admitted,
+        // A think budget (an explicit `max_think_tokens`, or the global
+        // total cap) is think control the MTP/DFlash lanes do not run: such
+        // a sampled request stays singleton at eligibility (never admitted,
         // so never refused after its start is announced); an AR lane runs
         // the singleton's think control and still batches.
         let r = GenerationRoute::QwenDflash;
@@ -8619,6 +8679,33 @@ mod tests {
             assert!(!request_think_budgeted(&serde_json::json!({"max_think_tokens": 0})));
             assert!(!request_think_budgeted(&serde_json::json!({})));
         }
+    }
+
+    #[test]
+    fn sampled_admission_lane_needs_the_whole_request_inside_the_engine_cap() {
+        let mtp = (Some((3, 32768)), None);
+        let df = (None, Some((16, 32768)));
+        let m = Some(VmmLaneDecode::Mtp);
+        let d = Some(VmmLaneDecode::Dflash);
+        // Inside the cap: the singleton's own mode.
+        assert_eq!(sampled_admission_lane(m, true, mtp, 100, 1000), m);
+        assert_eq!(sampled_admission_lane(d, true, df, 100, 1000), d);
+        // The serve harness's 81,920-token budget: the singleton speculator
+        // (context 262,144) runs MTP, the lane engine (head cap 32,768)
+        // cannot, so only the singleton route serves it.
+        assert_eq!(sampled_admission_lane(m, true, mtp, 25, 81920), None);
+        assert_eq!(sampled_admission_lane(d, true, df, 25, 81920), None);
+        // Exact boundary: prompt + max_tokens + k + 1 == cap fits.
+        assert_eq!(sampled_admission_lane(m, true, mtp, 100, 32768 - 104), m);
+        assert_eq!(sampled_admission_lane(m, true, mtp, 100, 32768 - 103), None);
+        // A singleton that falls back to AR itself is an AR lane.
+        assert_eq!(sampled_admission_lane(m, false, mtp, 25, 81920), Some(VmmLaneDecode::Ar));
+        // No engine for the singleton's mode: singleton.
+        assert_eq!(sampled_admission_lane(m, true, df, 100, 1000), None);
+        assert_eq!(sampled_admission_lane(d, true, mtp, 100, 1000), None);
+        // AR and non-lanes pass through.
+        assert_eq!(sampled_admission_lane(Some(VmmLaneDecode::Ar), true, (None, None), 1, 1 << 20), Some(VmmLaneDecode::Ar));
+        assert_eq!(sampled_admission_lane(None, true, mtp, 1, 1), None);
     }
 
     #[test]

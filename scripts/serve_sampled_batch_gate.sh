@@ -6,11 +6,12 @@
 # (`serve.batch_sampled`): eight concurrent sampled MTP clients with thinking
 # off must all get HTTP 200 and exactly one terminal.
 #
-# `--thinking off` sends the think-cap sentinel 1, a think budget that MTP
-# lanes do not run. Such a request must stay on the singleton route at
-# eligibility; it once entered the batch, could not be handed back after its
+# The harness sends its default max_tokens (81,920). The singleton MTP
+# speculator fits that, the batch's MTP lane engine (head cap 32,768) does
+# not, so such a request must take the singleton route before the daemon
+# announces it. It once entered the batch, could not be handed back after its
 # start was announced, and returned HTTP 400 ("sampled request cannot be
-# served exactly by the VMM batch route") on about 1 in 8 C8 requests.
+# served exactly by the VMM batch route") on 5 of 40 C8 requests.
 #
 # Usage: scripts/serve_sampled_batch_gate.sh MODEL [PORT]
 #   Binaries: target/release/{hipfire,daemon}; override with HIPFIRE_CLI_BIN /

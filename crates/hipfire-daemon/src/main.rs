@@ -3736,15 +3736,38 @@ fn main() {
                                 continue;
                             }
                         };
-                        if started_in_think && !vmm_route {
+                        // VMM route: a sampled request whose singleton mode has
+                        // no batch lane at this prompt length (an MTP/DFlash
+                        // request longer than the staged engine's cap) must
+                        // take the singleton route before its start is
+                        // announced at enqueue.
+                        let vmm_singleton_now = vmm_route
+                            && !hipfire_generate::batch::vmm_request_fits_batch(
+                                &msg,
+                                m,
+                                &sampling,
+                                vmm_batch,
+                                batch_scheduler.as_ref().map_or(0, |s| s.max_batch),
+                                &gpu.arch,
+                                prompt_tokens.len(),
+                                max_tokens,
+                            );
+                        if (started_in_think && !vmm_route) || vmm_singleton_now {
                             // Fixed-lane route: think-open prompts are sequential
-                            // barriers. Transfer any pre-latched abort exactly once
-                            // (transfer retires the batch entry and holds a tombstone until singleton cleanup).
+                            // barriers; VMM route: see above. Transfer any
+                            // pre-latched abort exactly once (transfer retires the
+                            // batch entry and holds a tombstone until singleton cleanup).
                             let _ = batch_transfer_abort_to_singleton_and_clear(
                                 id,
                                 gen_attempt_id,
                                 admission,
                             );
+                            // Like the not-eligible sequential path, the retired
+                            // key's scope is rebound so the sequential producer
+                            // takes the singleton claim.
+                            if vmm_singleton_now {
+                                batch_scope.rebind_for(gen_attempt_id);
+                            }
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
                             if !qwen4_lanes && (prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq) {

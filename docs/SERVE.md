@@ -121,9 +121,9 @@ Config and env owners for bind, idle, queue, and body limits:
    exact route, each in the lane mode its singleton route selects (AR, native
    MTP, FAST_SAMPLE selector-chain DFlash) and byte-identical to that
    singleton for the same wire seed. A sampled request the batch cannot serve
-   in its own mode (stop strings or a think budget on a speculative lane,
-   including thinking-off's `max_think_tokens: 1` sentinel; a lane cap
-   overflow) stays on the singleton route, never an AR substitute;
+   in its own mode (stop strings or a think budget on a speculative lane, or
+   a prompt + `max_tokens` beyond the lane engine's cap, 32,768 for the MTP
+   head) stays on the singleton route, never an AR substitute;
    sampled speculative singletons are not promoted mid-generation. The load
    ack reports `continuous_batch_sampling: "sampled"` and
    `continuous_batch_sampled_modes`; each batched request's
