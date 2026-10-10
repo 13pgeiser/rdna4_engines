@@ -1815,11 +1815,10 @@ fn vmm_singleton_route(msg: &serde_json::Value, m: &LoadedModel, sampling: &Batc
     select_generation_route(&route_inputs)
 }
 
-/// Sampled DFlash lanes. Gated on the DFlash prerequisites (the sampled
-/// selector-chain lane state, the bonus/target-law repair and the default
-/// graph identity): the DFlash slice flips this once they land. Until then a
-/// sampled request whose singleton route is DFlash stays singleton.
-const VMM_DFLASH_SAMPLED: bool = false;
+/// Sampled DFlash lanes share the production singleton selector, target-law,
+/// acceptance and commit seams. Admission still requires FAST_SAMPLE, an exact
+/// staged store and fixed selector-chain assets; unsupported modes stay singleton.
+const VMM_DFLASH_SAMPLED: bool = true;
 
 /// Lane mode the VMM batch serves a SAMPLED request with, or `None` (the
 /// request stays on the singleton route). The one capability decision used by
@@ -1858,6 +1857,13 @@ fn vmm_store_mtp_engine(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35V
     store.spec_engine().is_some() && !hipfire_config::mtp_ngram_enabled()
 }
 
+/// Only the production FAST_SAMPLE selector chain has shared sampled seams.
+/// Other DFlash laws remain singleton, even when a greedy engine is staged.
+fn vmm_store_dflash_sampled(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore) -> bool {
+    store.dflash_engine().is_some_and(|e| e.supports_sampled())
+        && hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0")
+}
+
 /// Whether the store serves sampled requests at all: staged with
 /// `serve.batch_sampled` on, and the byte-exact VMM route (the non-exact
 /// shared body makes no singleton-identity claim).
@@ -1873,7 +1879,7 @@ fn vmm_sampled_lane(msg: &serde_json::Value, m: &LoadedModel, sampling: &BatchSa
         vmm_singleton_route(msg, m, sampling),
         m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         vmm_store_mtp_engine(store),
-        store.dflash_engine().is_some(),
+        vmm_store_dflash_sampled(store),
         VMM_DFLASH_SAMPLED,
         vmm_store_sampled(store),
         request_has_stop(msg),
@@ -2609,7 +2615,7 @@ pub fn vmm_loaded_ack(
         Some(s) => {
             let mode = vmm_store_spec_mode(s);
             let rx = s.dflash_engine().map(|e| e.receipt());
-            let ack = (vmm_store_sampled(s), vmm_store_mtp_engine(s), s.dflash_engine().is_some());
+            let ack = (vmm_store_sampled(s), vmm_store_mtp_engine(s), vmm_store_dflash_sampled(s));
             (Some(s.receipt()), mode, rx, ack)
         }
         None => (None, VmmSpecMode::Off, None, (false, false, false)),
@@ -8560,8 +8566,8 @@ mod tests {
         assert_eq!(lane_for(r, false, false, true, true, true, false), Some(VmmLaneDecode::Dflash));
         assert_eq!(lane_for(r, false, false, false, true, true, false), None);
         assert_eq!(lane_for(r, false, false, true, true, true, true), None);
-        // The shipped gate keeps sampled DFlash singleton.
-        assert!(!VMM_DFLASH_SAMPLED);
+        // The shipped capability admits the supported sampled selector chain.
+        assert!(VMM_DFLASH_SAMPLED);
     }
 
     #[test]
@@ -8591,8 +8597,8 @@ mod tests {
         assert!(vmm_sampled_modes(false, true, true).is_empty());
         assert_eq!(vmm_sampled_modes(true, false, false), vec!["ar"]);
         assert_eq!(vmm_sampled_modes(true, true, false), vec!["ar", "mtp"]);
-        // Sampled DFlash is gated off: an engine alone advertises nothing.
-        assert_eq!(vmm_sampled_modes(true, true, true), vec!["ar", "mtp"]);
+        // The DFlash capability represents an admitted FAST_SAMPLE selector engine.
+        assert_eq!(vmm_sampled_modes(true, true, true), vec!["ar", "mtp", "dflash"]);
 
         let mut off = serde_json::json!({});
         attach_vmm_sampling_ack(&mut off, false, true, true);
@@ -8602,6 +8608,10 @@ mod tests {
         attach_vmm_sampling_ack(&mut on, true, true, false);
         assert_eq!(on["continuous_batch_sampling"], "sampled");
         assert_eq!(on["continuous_batch_sampled_modes"], serde_json::json!(["ar", "mtp"]));
+
+        let mut dflash = serde_json::json!({});
+        attach_vmm_sampling_ack(&mut dflash, true, false, true);
+        assert_eq!(dflash["continuous_batch_sampled_modes"], serde_json::json!(["ar", "dflash"]));
 
         let mut ar_only = serde_json::json!({});
         attach_vmm_sampling_ack(&mut ar_only, true, false, false);

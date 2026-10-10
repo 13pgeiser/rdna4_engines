@@ -745,6 +745,47 @@ fn dflash_prefill_finish(
     })
 }
 
+/// Prefill first-token policy shared by the singleton `prefill` and the VMM
+/// lane `dflash_prefill_lane_parts` (extracted verbatim from the singleton
+/// prefill body, originally dflash_spec.rs lines 890-913).
+///
+/// `cfg.temp <= 1e-6`: historical host argmax fold (first maximal index wins
+/// via strict `>`), no RNG draw. Otherwise: host softmax at `cfg.temp`, then
+/// `apply_host_ar_trunc(top_k, top_p)` ONLY when `chain` (DDTree SWOR honors
+/// temperature only; origin lines 905-910), then exactly one
+/// `xorshift_next_unit(rng)` draw and `sample_categorical` (origin lines
+/// 911-912). `cactus_delta` is not consulted. `scratch` holds the probability
+/// row (cleared/reserved by `softmax_temp_into`; identical to the singleton's
+/// former fresh `Vec`).
+pub(crate) fn dflash_first_token(
+    logits: &[f32],
+    chain: bool,
+    cfg: crate::speculative::DflashSampleCfg,
+    rng: &mut u64,
+    scratch: &mut Vec<f32>,
+) -> u32 {
+    if cfg.temp <= 1e-6 {
+        logits
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
+            })
+            .0
+    } else {
+        softmax_temp_into(logits, cfg.temp, scratch);
+        if chain {
+            apply_host_ar_trunc(scratch, cfg.top_k, cfg.top_p);
+        }
+        let u = xorshift_next_unit(rng);
+        sample_categorical(scratch, u)
+    }
+}
+
 // ─── DflashSpeculator ───────────────────────────────────────────────────
 
 /// Lower a qwen35 `SpecStepResult` onto the arch-generic `SpecStep`.
@@ -988,30 +1029,18 @@ impl Speculator for DflashSpeculator {
             prefill_start,
             resume_from,
         )?;
-        let first_token = if self.sample_temp <= 1e-6 {
-            first_logits
-                .iter()
-                .enumerate()
-                .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-                    if v > bv {
-                        (i as u32, v)
-                    } else {
-                        (best, bv)
-                    }
-                })
-                .0
-        } else {
-            let mut probs = Vec::with_capacity(first_logits.len());
-            softmax_temp_into(&first_logits, self.sample_temp, &mut probs);
-            // DDTree SWOR honors temperature only (matches step's tree arm).
-            // Chain mode applies the same AR truncation as `spec_step_dflash`
-            // so the seed is an AR draw.
-            if df.ddtree.is_none() {
-                apply_host_ar_trunc(&mut probs, self.sample_top_k, self.sample_top_p);
-            }
-            let u = xorshift_next_unit(&mut self.rng_state);
-            sample_categorical(&probs, u)
-        };
+        let first_token = dflash_first_token(
+            &first_logits,
+            df.ddtree.is_none(),
+            crate::speculative::DflashSampleCfg {
+                temp: self.sample_temp,
+                top_p: self.sample_top_p,
+                top_k: self.sample_top_k,
+                cactus_delta: self.sample_cactus,
+            },
+            &mut self.rng_state,
+            &mut Vec::new(),
+        );
         Ok(PrefillOutcome::Ready { first_token })
     }
 
@@ -1914,13 +1943,17 @@ impl DflashSpeculator {
 
 /// Cold DFlash prompt prefill over explicit trunk owners (a VMM lane): the
 /// singleton's seed → scatter → backfill → thlog seed → first-logits sequence
-/// with the same ring-piece scheduling. Greedy: the returned first token is
-/// the host argmax of the last prompt logits (`target.scratch.logits`).
-/// `checkpoints` is only used when `policy.resume_enabled`; `policy` is the
-/// CALLER's checkpoint cadence (a lane's, which may take none while nothing
-/// reads its checkpoints), not necessarily `assets.checkpoint`. Request
-/// cursors other than `checkpoints` (last-window mark, adaptive state) are
-/// the caller's.
+/// with the same ring-piece scheduling. The returned first token is
+/// `dflash_first_token` (the singleton's prefill first-token policy, chain
+/// mode) over the last prompt logits (`target.scratch.logits`): host argmax at
+/// `cfg.temp <= 1e-6`, else host softmax + top-k/nucleus and exactly one
+/// xorshift draw advancing `rng` (the lane's `rng_state`). `rng` MUST be
+/// initialised from the request seed before this call and the advanced value
+/// kept; `scratch` is reusable probability scratch. `checkpoints` is only used
+/// when `policy.resume_enabled`; `policy` is the CALLER's checkpoint cadence (a
+/// lane's, which may take none while nothing reads its checkpoints), not
+/// necessarily `assets.checkpoint`. Request cursors other than `checkpoints`
+/// (last-window mark, adaptive state) are the caller's.
 #[allow(clippy::too_many_arguments)]
 pub fn dflash_prefill_lane_parts(
     gpu: &mut Gpu,
@@ -1930,6 +1963,9 @@ pub fn dflash_prefill_lane_parts(
     df: &mut DflashState,
     checkpoints: &mut Vec<(usize, DeltaNetSnapshot)>,
     prompt: &[u32],
+    cfg: crate::speculative::DflashSampleCfg,
+    rng: &mut u64,
+    scratch: &mut Vec<f32>,
     abort: &dyn Fn() -> bool,
 ) -> Result<PrefillOutcome, String> {
     if !assets.matches_state(df) {
@@ -1970,17 +2006,9 @@ pub fn dflash_prefill_lane_parts(
         0,
         None,
     )?;
-    let first_token = first_logits
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
-        })
-        .0;
+    // Shared with the singleton prefill (lines 890-913 originally):
+    // `chain = true`, the lane runs the selector chain route.
+    let first_token = dflash_first_token(&first_logits, true, cfg, rng, scratch);
     Ok(PrefillOutcome::Ready { first_token })
 }
 

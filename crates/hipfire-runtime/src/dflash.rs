@@ -4323,8 +4323,62 @@ fn softmax_sample(scores: &[f32], temp: f32, uniform: f32) -> (usize, Vec<f32>) 
     (last, q)
 }
 
+/// Borrowed-readback selector scorer: the arithmetic of the former
+/// `propose_inner` (runtime lines 4275-4372 before this factoring), exposed so
+/// packed multi-lane readbacks can score each lane's span without a device or
+/// a copy of the projection/IDs/unaries.
+///
+/// Inputs are the raw device readbacks for ONE chain: `projection`
+/// `[rows*rank]` (hidden projection GEMM output), `ids` `[rows*K]` (raw GPU
+/// top-K IDs) and `unaries` `[rows*K]` (raw top-K values); `rank`/`K`/vocab
+/// come from `weights`. Scoring is sequential: predecessor starts at `anchor`
+/// and becomes the selected ID of each row; candidates are scored in readback
+/// order with the sequential f32 `pred_cb*projection*succ_cb` dot. With
+/// `temperature>0` `uniforms` (>= `rows`, one per row) are required.
+pub fn propose_candidates_from_rows(
+    weights: &DflashWeights,
+    projection: &[f32],
+    ids: &[u32],
+    unaries: &[f32],
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+) -> HipResult<DflashCandidateProposal> {
+    if rows == 0 {
+        return Err(hip_bridge::HipError::new(0, "rows must be >0"));
+    }
+    if !weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+    }
+    let rank = weights.selector_rank.unwrap_or(256);
+    let k = weights.selector_top_k.unwrap_or(16);
+    if k == 0 || k > 16 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector_top_k must be in [1,16]",
+        ));
+    }
+    if projection.len() != rows * rank {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "projection length != rows*rank",
+        ));
+    }
+    if ids.len() != rows * k || unaries.len() != rows * k {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "ids/unaries length != rows*K",
+        ));
+    }
+    let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
+    propose_inner(
+        vocab, weights, projection, ids, unaries, rows, k, rank, anchor, temperature, uniforms,
+    )
+}
+
 fn propose_inner(
-    cfg: &DflashConfig,
+    vocab_size: usize,
     weights: &DflashWeights,
     hidden_proj_host: &[f32], // [rows*rank] already projected, row-major
     top_ids: &[u32],          // [rows*K]
@@ -4370,7 +4424,7 @@ fn propose_inner(
         let mut scores = Vec::with_capacity(k);
         for j in 0..k {
             let cand = top_ids[id_off + j] as usize;
-            if cand >= cfg.vocab_size {
+            if cand >= vocab_size {
                 return Err(hip_bridge::HipError::new(
                     0,
                     "candidate id out of vocab range",
@@ -4508,35 +4562,12 @@ pub fn propose_candidates_host(
             top_vals.push(row[idxs[j]]);
         }
     }
-    propose_inner(
-        &DflashConfig {
-            n_layers: 0,
-            hidden: 0,
-            intermediate: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: vocab,
-            norm_eps: 0.0,
-            rope_theta: 0.0,
-            block_size: 0,
-            mask_token_id: 0,
-            target_layer_ids: vec![],
-            num_target_layers: 0,
-            declared_window: None,
-            all_layers_sliding: false,
-            conv_group_size: None,
-            conv_kernel_size: None,
-            selector_rank: Some(rank),
-            selector_top_k: Some(k),
-        },
+    propose_candidates_from_rows(
         weights,
         &host_proj,
         &top_ids,
         &top_vals,
         rows,
-        k,
-        rank,
         anchor,
         temperature,
         uniforms,
@@ -4628,35 +4659,12 @@ pub fn propose_candidates_device(
     for chunk in vals_bytes.chunks_exact(4) {
         top_vals.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    propose_inner(
-        &DflashConfig {
-            n_layers: 0,
-            hidden: 0,
-            intermediate: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: vocab,
-            norm_eps: 0.0,
-            rope_theta: 0.0,
-            block_size: 0,
-            mask_token_id: 0,
-            target_layer_ids: vec![],
-            num_target_layers: 0,
-            declared_window: None,
-            all_layers_sliding: false,
-            conv_group_size: None,
-            conv_kernel_size: None,
-            selector_rank: Some(rank),
-            selector_top_k: Some(k),
-        },
+    propose_candidates_from_rows(
         weights,
         &host_proj,
         &top_ids,
         &top_vals,
         rows,
-        k,
-        rank,
         anchor,
         temperature,
         uniforms,

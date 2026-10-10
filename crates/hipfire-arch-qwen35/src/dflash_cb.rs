@@ -33,15 +33,16 @@
 //!   state; returns `[seed, candidates..]`.
 //! * [`dflash_cb_head_argmax`] — the singleton DFlash verify head
 //!   (`dflash_enqueue_verify_lm_head_argmax` + one packed i32 D2H) over the
-//!   first `rows` rows of a shared [`VerifyScratch`]; a head over 64+ rows
-//!   (a wide chunk) runs the exact singleton-WMMA head, below 64 the product
-//!   head, byte-identical per row.
+//!   first `rows` rows of a shared [`VerifyScratch`], for greedy picks only.
+//!   Sampled lanes instead run a private Product head at their singleton b:
+//!   Product dispatch is not row-count-independent above 63 aggregate rows.
 //! * [`dflash_cb_verify`] — whole lanes packed into trunk chunks of at most
 //!   the effective cap (`<= 63` rows; up to 128 with
 //!   `HIPFIRE_CB_VERIFY_CHUNK128` on an admitted dense MQ4G256V2 gfx1201
 //!   target) (`forward_prefill_batch_multi`, ChainVerify fusion, each lane's
-//!   own hidden ring and tape at offset 0), ONE shared head + argmax + D2H
-//!   per chunk; each lane keeps its own picks until the greedy accept consumer.
+//!   own hidden ring and tape at offset 0). Greedy lanes share a packed head;
+//!   sampled lanes retain actual selector q and private FastTargetRows until
+//!   their shared singleton accept/commit consumer runs.
 
 use crate::dflash_spec::{
     DflashCheckpointPolicy, DflashLaneSnapshot, DflashState, DflashWindowMark,
@@ -56,7 +57,8 @@ use crate::qwen35::{Qwen35Config, Qwen35Weights};
 use crate::speculative::{
     dflash_download_verify_argmax, dflash_draft_batch_eligible, dflash_enqueue_verify_lm_head_argmax,
     draft_dflash_block_rank, draft_dflash_blocks_batched, DeltaNetSnapshot, DflashCbDraft, DflashDraftLane,
-    VerifyScratch, DFLASH_DRAFT_BATCH_MAX_ROWS,
+    dflash_sampled_selector_draft_into, dflash_target_rows_into, DflashSampleCfg, DflashSampledDraft,
+    FastTargetRows, VerifyScratch, DFLASH_DRAFT_BATCH_MAX_ROWS,
 };
 use hipfire_runtime::dflash::DflashScratch;
 use hip_bridge::{HipError, HipResult};
@@ -93,6 +95,12 @@ pub struct DflashVmmLaneState {
     /// Target picks of this lane's verified window (`B` ids), kept from the
     /// shared head until the greedy accept consumer runs.
     pub picks: Vec<u32>,
+    /// Request-owned normalized target rows, consumed before chunk scratch reuse.
+    pub sampled_target: FastTargetRows,
+    /// Shared singleton first-token / acceptance workspace.
+    pub sample_scratch: Vec<f32>,
+    /// Actual selector proposal and q, retained beside the planned verify.
+    pub sampled_draft: Option<DflashSampledDraft>,
     /// Remaining output budget `E` installed by the driver for the next
     /// window (`0` = not installed; a window needs `E >= 1`).
     pub max_emit: usize,
@@ -141,6 +149,9 @@ impl DflashVmmLaneState {
             policy,
             last_window,
             picks: Vec::with_capacity(block),
+            sampled_target: FastTargetRows { probs: Vec::new(), tau: Vec::new(), z: Vec::new() },
+            sample_scratch: Vec::new(),
+            sampled_draft: None,
             max_emit: 0,
             verified: false,
             last_emit: Vec::with_capacity(block),
@@ -201,6 +212,15 @@ impl DflashVmmLaneState {
         )
     }
 
+    pub fn sample_cfg(&self) -> DflashSampleCfg {
+        DflashSampleCfg {
+            temp: self.sample_temp,
+            top_p: self.sample_top_p,
+            top_k: self.sample_top_k,
+            cactus_delta: self.sample_cactus,
+        }
+    }
+
     /// Free every owned GPU object exactly once (shared draft weights go
     /// through `DflashState::free_gpu`'s final-owner release).
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -216,6 +236,9 @@ impl DflashVmmLaneState {
             policy: _,
             last_window: _,
             picks: _,
+            sampled_target: _,
+            sample_scratch: _,
+            sampled_draft: _,
             max_emit: _,
             verified: _,
             last_emit: _,
@@ -283,7 +306,8 @@ pub fn dflash_lane_draft(
 /// rows the product head is the singleton's own, except inside the PM FP8
 /// verify scope ([`verify_dense_math`]) where every row count takes the
 /// `*VerifyExact` head (FP8-routed). Call it inside the same scope as the
-/// trunk forward it follows.
+/// trunk forward it follows. Sampled callers do not consume these aggregate
+/// logits: their private head runs at exactly the singleton's own window size.
 pub fn dflash_cb_head_argmax(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -457,15 +481,16 @@ pub struct DflashCbDraftLane<'a> {
 }
 
 /// Draft phase over lanes. With `batched` (and the exact-gfx1201 MQ4 v2
-/// eligibility of [`dflash_draft_batch_eligible`]), full-block lanes are
+/// eligibility of [`dflash_draft_batch_eligible`]), greedy full-block lanes are
 /// packed in order into chunks of at most
 /// `min(DFLASH_DRAFT_BATCH_MAX_ROWS, cb.max_rows())` rows; each chunk of at
 /// least `cb.draft_min_lanes` lanes is ONE draft-model forward and ONE shared
 /// lm-head ([`draft_dflash_blocks_batched`]) with every lane keeping its own
 /// context rings, positions and hidden context. Every other lane (budget
 /// tails, lone lanes, ineligible machines/drafts, `batched == false`) runs
-/// the singleton call [`dflash_lane_draft`]. Returns each lane's
-/// `[seed, candidates..]`, byte-identical to `dflash_lane_draft` per lane.
+/// the singleton call [`dflash_lane_draft`]. Sampled lanes always use the shared
+/// singleton selector draft, retaining its genuine q receipt on the lane.
+/// Returns each lane's `[seed, candidates..]`.
 pub fn dflash_cb_draft(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -484,7 +509,7 @@ pub fn dflash_cb_draft(
         let mut rows = 0usize;
         let mut members: Vec<Vec<usize>> = Vec::new();
         for (i, l) in lanes.iter().enumerate() {
-            if l.b < 3 || l.b != l.state.df.block_size || l.b > cap {
+            if l.state.sample_temp > 1e-6 || l.b < 3 || l.b != l.state.df.block_size || l.b > cap {
                 continue;
             }
             if members.last().is_none() || rows + l.b > cap {
@@ -541,16 +566,28 @@ pub fn dflash_cb_draft(
                 cb.reserve_draft(gpu, &l.state.df.draft_config)?;
             }
             let lent = cb.lend_mq(&mut l.state.df.draft_scratch)?;
-            let r = dflash_lane_draft(
-                gpu,
-                weights,
-                config,
-                l.compact_offset,
-                &mut l.state.df,
-                l.position,
-                l.seed,
-                l.b,
-            );
+            let r = if l.state.sample_temp > 1e-6 {
+                let cfg = l.state.sample_cfg();
+                match l.state.sampled_draft.as_mut() {
+                    None => Err(HipError::new(0, "dflash_cb_draft: sampled receipt not reserved")),
+                    Some(receipt) => dflash_sampled_selector_draft_into(
+                        gpu, weights, &mut l.state.df, l.position, l.compact_offset,
+                        l.seed, l.b, config.vocab_size, cfg, &mut l.state.rng_state, receipt,
+                    )
+                    .map(|()| receipt.block.clone()),
+                }
+            } else {
+                dflash_lane_draft(
+                    gpu,
+                    weights,
+                    config,
+                    l.compact_offset,
+                    &mut l.state.df,
+                    l.position,
+                    l.seed,
+                    l.b,
+                )
+            };
             cb.reclaim_mq(&mut l.state.df.draft_scratch, lent);
             out[i] = Some(r?);
         }
@@ -573,9 +610,9 @@ pub struct DflashCbVerifyLane<'a> {
 /// ([`multi_chunk_pack_cap`] of `cb.max_rows()`: C1 `[16]`, C3 `[48]`, C4
 /// `[48,16]`, C8 `[48,48,32]` at 63 rows; C8 `[128]` with the wide route on a
 /// dense MQ4G256V2 gfx1201 target) with each lane's own ChainVerify fusion,
-/// hidden ring and tape (offset 0); per chunk ONE head + GPU argmax and ONE
-/// D2H of `4 * rows` bytes. Each lane's picks land in `state.picks`
-/// (`state.verified = true`) for `dflash_greedy_accept_commit_parts`.
+/// hidden ring and tape (offset 0). Greedy lanes share one head/argmax/D2H;
+/// sampled lanes use their own singleton-b Product head and materialize all b
+/// normalized target rows before scratch reuse. Outcomes remain lane-owned.
 ///
 /// Everything refusable is checked before the first snapshot is saved or row
 /// launched (capture/recording, block sizes, ring/tape capacity, batched-body
@@ -651,29 +688,56 @@ pub fn dflash_cb_verify(
                     hidden_rb: Some(&mut df.hidden_rb),
                 });
             }
+            // Trunk row-byte identity at aggregates 63/64/65/96/128, chunk128
+            // off/HIP/PM: cb/chunk128/STAGE4.md:39-58 (the aggregate probe
+            // freezes verify.final_hidden as well as logits against singleton).
             forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.head.final_hidden))
         };
+        // Greedy retains the packed head. Sampled acceptance reads every float:
+        // each sampled head must use Product with its singleton's own b.
+        let any_greedy = lanes[range.clone()].iter().any(|l| l.state.sample_temp <= 1e-6);
         let picks = match fwd {
-            Ok(()) => dflash_cb_head_argmax(gpu, weights, config, &cb.head, rows),
+            Ok(()) if any_greedy => dflash_cb_head_argmax(gpu, weights, config, &cb.head, rows).map(Some),
+            Ok(()) => Ok(None),
             Err(e) => Err(e),
         };
-        gpu.fp8_verify_exit(prev);
-        let picks = picks?;
-        let mut row = 0usize;
-        for lane in lanes[range].iter_mut() {
-            let b = lane.draft.verify_tokens.len();
-            let st = &mut *lane.state;
-            st.picks.clear();
-            st.picks.extend_from_slice(&picks[row..row + b]);
-            st.verified = true;
-            if cb.keep_lane_rows {
-                let v = &st.df.verify_scratch;
-                gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &cb.head.final_hidden.buf, row * dim * 4, b * dim * 4)?;
-                gpu.memcpy_dtod_at_auto(&v.logits.buf, 0, &cb.head.logits.buf, row * vocab * 4, b * vocab * 4)?;
-                gpu.memcpy_dtod_at_auto(&v.argmax.buf, 0, &cb.head.argmax.buf, row * 4, b * 4)?;
+        // Per-lane heads run inside the FP8 scope too (the singleton's verify
+        // head does); the scope is closed on every path.
+        let heads = picks.and_then(|picks| {
+            let mut row = 0usize;
+            for lane in lanes[range].iter_mut() {
+                let b = lane.draft.verify_tokens.len();
+                let st = &mut *lane.state;
+                st.picks.clear();
+                if st.sample_temp > 1e-6 {
+                    let cfg = st.sample_cfg();
+                    let v = &st.df.verify_scratch;
+                    gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &cb.head.final_hidden.buf, row * dim * 4, b * dim * 4)?;
+                    let hidden = v.final_hidden.sub_offset(0, b * dim);
+                    dflash_enqueue_verify_lm_head_argmax(
+                        gpu, &weights.output, &hidden, v, b, vocab, DenseBatchMath::Product,
+                    )?;
+                    st.picks = dflash_download_verify_argmax(gpu, v, b)?;
+                    let logits = v.logits.sub_offset(0, b * vocab);
+                    // Materialize all b rows now, before another chunk overwrites
+                    // shared hidden scratch (and before next draft reuses v.logits).
+                    dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                } else {
+                    st.picks.extend_from_slice(&picks.as_ref().expect("greedy head")[row..row + b]);
+                    if cb.keep_lane_rows {
+                        let v = &st.df.verify_scratch;
+                        gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &cb.head.final_hidden.buf, row * dim * 4, b * dim * 4)?;
+                        gpu.memcpy_dtod_at_auto(&v.logits.buf, 0, &cb.head.logits.buf, row * vocab * 4, b * vocab * 4)?;
+                        gpu.memcpy_dtod_at_auto(&v.argmax.buf, 0, &cb.head.argmax.buf, row * 4, b * 4)?;
+                    }
+                }
+                st.verified = true;
+                row += b;
             }
-            row += b;
-        }
+            Ok(())
+        });
+        gpu.fp8_verify_exit(prev);
+        heads?;
     }
     Ok(())
 }

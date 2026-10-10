@@ -5,14 +5,14 @@
 //! DFlash lanes of the VMM continuous-batching store.
 //!
 //! A DFlash lane is a request decoded exactly like the singleton DFlash route
-//! (`DflashSpeculator`, fixed block, greedy chain): its prompt is filled by
-//! the singleton DFlash prompt seed on the request's own KV/DeltaNet, then
-//! every decode window is a `RequestStepKind::Verify` request of an executor
-//! step — per-request draft (provision), the ChainVerify trunk and head shared
-//! with the other DFlash Verify lanes (forward), per-request greedy accept
-//! and state commit (commit). Per request the committed ids and the full
-//! state (trunk KV, DeltaNet, draft K/V, hidden ring, thlog) equal its
-//! isolated singleton DFlash run.
+//! (`DflashSpeculator`, fixed-block greedy or FAST_SAMPLE selector chain):
+//! its prompt is filled by the singleton DFlash prompt seed on the request's
+//! own KV/DeltaNet, then every decode window is a `RequestStepKind::Verify`
+//! executor request — per-request draft (provision), shared ChainVerify trunk
+//! (forward), singleton accept and state commit (commit). Sampled proposal,
+//! target rows and u64 RNG are private; its Product head uses singleton b.
+//! Per request the committed ids and full state (trunk KV, DeltaNet, draft K/V,
+//! hidden ring, thlog) equal its isolated singleton DFlash run.
 //!
 //! Window budget is DFlash's: with remaining output budget `E >= 1` the
 //! window is `B = min(block, max(E, 2))` rows and `max_accept = E - 1`
@@ -37,7 +37,9 @@ use crate::dflash_spec::{
 use crate::qwen35::prefill::multi::{multi_chunk_pack_cap, MULTI_CHUNK_MAX_LANE_ROWS};
 use crate::qwen35::{DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::speculative::{
-    dflash_greedy_accept_commit_parts, DeltaNetSnapshot, DflashCbDraft, DflashTargetParts, DflashVerifyOutput,
+    dflash_commit_decision_parts, dflash_eager_hip_verify_receipt, dflash_greedy_accept_commit_parts,
+    dflash_sampled_accept_rows, DeltaNetSnapshot, DflashCbDraft, DflashSampledDraft,
+    DflashTargetParts, DflashVerifyOutput,
 };
 use hip_bridge::HipError;
 use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind};
@@ -268,6 +270,12 @@ impl VmmDflashEngine {
         self.assets.ctx_capacity
     }
 
+    /// Sampled lanes use the production fixed-block DFlash2 selector chain.
+    /// Other draft laws remain on their singleton route.
+    pub fn supports_sampled(&self) -> bool {
+        self.assets.fixed_chain && self.assets.weights.has_candidate_selector()
+    }
+
     /// Rows one shared trunk chunk holds (the effective cap, `<= 63` or up to 128).
     pub fn max_rows(&self) -> usize {
         self.cb.max_rows()
@@ -337,8 +345,8 @@ impl Qwen35VmmStore {
     /// Make `epoch` a DFlash lane and fill its prompt by the singleton DFlash
     /// prompt seed (cold: fresh owners, positions from 0) on the request's own
     /// KV/DeltaNet. The lane's snapshot/DeltaNet-sized buffers come from the
-    /// REQUEST's own `DeltaNetState`. Returns `Ready { first_token }` (greedy
-    /// host argmax of the last prompt row's logits) and leaves it as the
+    /// REQUEST's own `DeltaNetState`. Returns `Ready { first_token }` using the
+    /// singleton first-token policy and leaves it as the
     /// lane's pending seed (also pushed to `history`) at position
     /// `prompt.len()`; `Aborted` leaves the lane fresh (position 0, no DFlash
     /// state — the caller retires it). A failure poisons the lane; the lane
@@ -359,6 +367,9 @@ impl Qwen35VmmStore {
             return Err("dflash prefill during an uncommitted step".into());
         }
         let engine = self.dflash_engine.as_ref().ok_or("dflash prefill: no DFlash engine staged")?;
+        if request.temp > 1e-6 && (!engine.supports_sampled() || !gpu.flags.dflash_fast_sample) {
+            return Err("dflash prefill: sampled lanes require FAST_SAMPLE selector chain".into());
+        }
         if prompt.is_empty() || prompt.len() >= engine.ctx_capacity() {
             return Err(format!("dflash prefill: prompt {} outside 1..{}", prompt.len(), engine.ctx_capacity()));
         }
@@ -375,13 +386,31 @@ impl Qwen35VmmStore {
         }
         let r = (|| -> Result<PrefillOutcome, String> {
             let lane_policy = engine.lane_checkpoint;
-            let mut df = new_dflash_lane_state(gpu, &engine.assets, config, &s.dn, DflashOwnerKind::VmmLane)
+            let df = new_dflash_lane_state(gpu, &engine.assets, config, &s.dn, DflashOwnerKind::VmmLane)
                 .map_err(|e| format!("dflash prefill: lane state: {e}"))?;
-            let mut checkpoints: Vec<(usize, DeltaNetSnapshot)> = Vec::new();
+            // Configure the private u64 stream before the first-token draw.
+            // This lane survives prefill; no post-prefill constructor reseeds it.
+            let mut lane = DflashVmmLaneState::cold(
+                df,
+                Vec::new(),
+                lane_policy,
+                prompt.len(),
+                &request,
+            );
+            let cfg = lane.sample_cfg();
+            if cfg.temp > 1e-6 {
+                let b = lane.df.block_size;
+                lane.sampled_draft = Some(DflashSampledDraft::new(b, config.vocab_size));
+                lane.sampled_target.probs.reserve(b * config.vocab_size);
+                lane.sampled_target.tau.reserve(b);
+                lane.sampled_target.z.reserve(b);
+                lane.sample_scratch.reserve(config.vocab_size);
+            }
             // The lane owns no FWHT rotation buffers: the engine lends its
             // own for the prompt prefill (the draft backfill GEMMs) and
             // takes them back on every path.
-            let outcome = engine.with_lent_mq(&mut df, |assets, df| {
+            let DflashVmmLaneState { df: lane_df, checkpoints, rng_state, sample_scratch, .. } = &mut lane;
+            let outcome = engine.with_lent_mq(lane_df, |assets, df| {
                 let mut target = DflashTargetParts {
                     weights,
                     config,
@@ -389,35 +418,32 @@ impl Qwen35VmmStore {
                     dn_state: &mut s.dn,
                     scratch,
                 };
-                dflash_prefill_lane_parts(gpu, &mut target, assets, lane_policy, df, &mut checkpoints, prompt, abort)
+                dflash_prefill_lane_parts(
+                    gpu, &mut target, assets, lane_policy, df, checkpoints,
+                    prompt, cfg, rng_state, sample_scratch, abort,
+                )
             });
             let outcome = match outcome {
                 Ok(o) => o,
                 Err(e) => {
-                    free_lane_parts(gpu, df, checkpoints);
+                    lane.free_gpu(gpu);
                     return Err(format!("dflash prefill: {e}"));
                 }
             };
             match outcome {
                 Ok(PrefillOutcome::Ready { first_token }) => {
-                    s.dflash = Some(DflashVmmLaneState::cold(
-                        df,
-                        checkpoints,
-                        lane_policy,
-                        prompt.len(),
-                        &request,
-                    ));
+                    s.dflash = Some(lane);
                     s.position = prompt.len();
                     s.pending_seed = Some(first_token);
                     s.history.push(first_token);
                     Ok(PrefillOutcome::Ready { first_token })
                 }
                 Ok(PrefillOutcome::Aborted) => {
-                    free_lane_parts(gpu, df, checkpoints);
+                    lane.free_gpu(gpu);
                     Ok(PrefillOutcome::Aborted)
                 }
                 Err(e) => {
-                    free_lane_parts(gpu, df, checkpoints);
+                    lane.free_gpu(gpu);
                     Err(format!("dflash prefill: {e}"))
                 }
             }
@@ -690,12 +716,13 @@ impl Qwen35VmmStore {
         Ok(())
     }
 
-    /// Provision: the greedy draft of every planned DFlash Verify lane on its
-    /// own draft state (epoch-tagged: the draft and its thlog mark are held
-    /// until commit/abort). Full-block lanes are drafted together through one
+    /// Provision: the singleton draft of every planned DFlash Verify lane on
+    /// its own state (epoch-tagged: draft, q and thlog mark wait until commit).
+    /// Greedy full-block lanes are drafted together through one
     /// draft-model forward and one shared lm-head ([`dflash_cb_draft`]; kill
     /// switch `HIPFIRE_CB_DFLASH_DRAFT_BATCH=0` drafts lane by lane with the
-    /// singleton call), byte-identical per lane. Touches only uncommitted
+    /// singleton call), byte-identical per lane. Sampled lanes use the singleton
+    /// selector forward/scorer per lane. Touches only uncommitted
     /// drafter state (projection watermarks, draft K/V of the window), never
     /// target state.
     pub(super) fn dflash_draft_planned(
@@ -782,8 +809,8 @@ impl Qwen35VmmStore {
     /// Forward: every planned DFlash Verify lane through the shared ChainVerify
     /// trunk (whole lanes in chunks of at most the effective cap: `<= 63` rows,
     /// or up to 128 when the wide verify route is admitted for the target) and
-    /// ONE head + argmax + D2H per chunk ([`dflash_cb_verify`]). Picks wait in
-    /// each lane for commit.
+    /// greedy shared head or sampled private Product heads ([`dflash_cb_verify`]).
+    /// Picks and exact normalized target receipts wait on each lane for commit.
     pub(super) fn dflash_verify_planned(
         &mut self,
         gpu: &mut Gpu,
@@ -832,10 +859,10 @@ impl Qwen35VmmStore {
         r
     }
 
-    /// Commit one verified DFlash window: the singleton greedy accept
-    /// consumer (`dflash_greedy_accept_commit_parts`: `eos=None` accept,
-    /// pre-commit `max_accept` clamp, hidden scatter/thlog append, snapshot
-    /// replay) over the lane's picks, then publish its window — position
+    /// Commit one verified DFlash window: singleton greedy prefix/clamp or
+    /// sampled host rejection over the genuine selector q and target rows,
+    /// followed by shared hidden scatter/thlog append and snapshot/tape repair.
+    /// Publish its window — position
     /// `+= accepted + 1`, pending seed = bonus, history `+= committed[1..]` —
     /// and keep the window mark for terminal-prefix repair.
     pub(super) fn dflash_commit_verify(
@@ -876,7 +903,22 @@ impl Qwen35VmmStore {
                 scratch,
             };
             let t0 = phase_start(gpu);
-            let r = dflash_greedy_accept_commit_parts(gpu, &mut target, &mut lane.df, &draft, &verified);
+            let r = if lane.sample_temp > 1e-6 {
+                let cfg = lane.sample_cfg();
+                let proposal = lane.sampled_draft.as_ref()
+                    .ok_or("commit_step: sampled DFlash verify without its proposal")?;
+                let decision = dflash_sampled_accept_rows(
+                    &draft.verify_tokens, proposal, Some(&lane.sampled_target), &[],
+                    config.vocab_size, cfg, draft.max_accept, &mut lane.rng_state,
+                    &mut lane.sample_scratch,
+                );
+                let receipt = dflash_eager_hip_verify_receipt(
+                    gpu, &target, &lane.df, draft.verify_tokens.len(),
+                );
+                dflash_commit_decision_parts(gpu, &mut target, &mut lane.df, &draft, decision, receipt)
+            } else {
+                dflash_greedy_accept_commit_parts(gpu, &mut target, &mut lane.df, &draft, &verified)
+            };
             phase_end(gpu, 2, t0);
             r.map_err(|e| format!("commit_step: DFlash accept: {e}"))?
         };
@@ -964,13 +1006,5 @@ fn phase_end(gpu: &mut Gpu, i: usize, t0: Option<std::time::Instant>) {
             v / vn.max(1) as f64,
             a / vn.max(1) as f64
         );
-    }
-}
-
-/// Free a lane's owners that never became a [`DflashVmmLaneState`].
-fn free_lane_parts(gpu: &mut Gpu, df: crate::dflash_spec::DflashState, checkpoints: Vec<(usize, DeltaNetSnapshot)>) {
-    df.free_gpu(gpu);
-    for (_, snap) in checkpoints {
-        snap.free_gpu(gpu);
     }
 }
