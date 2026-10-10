@@ -239,6 +239,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep), `--max-seq N` ([context](#bench-context-max_seq)). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead), the load's `max_seq`, and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`, except that the load's `max_seq` is sized to the matrix ([context](#bench-context-max_seq)); `--json` surfaces the effective loaded `kv_mode` and backend fields, and each row carries a `power` entry per run. |
 | `hipfire bench <model> --spec <m> ...` | Every bench generate sends greedy sampling with the neutral `repeat_penalty 1.0` (any other value routes the daemon to the plain AR decoder), so `--spec mtp\|dflash\|ngram\|dspark\|auto` measures the speculative decoder and `--spec off` the AR decoder on the same workload. JSON records `spec_requested`, a per-run `spec_route` (`"mtp"`, `"mtp+ngram"`, `"dflash"`, a daemon `spec` name, or `null` when AR ran) and per-run `spec_tau`; when `--spec` is not `off` but no run speculated, the bench prints a `warning:` and adds it to `warnings`. |
+| `hipfire bench <model> --concurrency 1,2,4,8 ...` | vLLM-style closed-loop serving sweep over the daemon wire: at each K, K lanes drain the same N requests, after a discarded warmup at that K. Reports output tok/s, steady-window tok/s, TTFT/TPOT p50/p99, achieved concurrency, τ, finish reasons and routes ([below](#bench-concurrency---concurrency)). |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
 | `hipfire --version` | Concise semver + build commit + source ref identity. |
@@ -248,6 +249,45 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire update --tag TAG` / `--commit SHA` | Install an immutable detached revision. A later explicit selector moves away from the pin. |
 
 Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md). Published tables are measured/historical: [BENCHMARKS.md](BENCHMARKS.md).
+
+### Bench concurrency (`--concurrency`)
+
+`hipfire bench <model> --concurrency 1,2,4,8 [--backend batch|noslots|slots|both] [--workload stateless|multiturn|both] [--bench-shape steady|betterbench] [--runs N]` measures serving throughput the way `vllm bench serve --max-concurrency K --request-rate inf --num-prompts N` does:
+
+- **Closed loop at K.** K client lanes drain one FIFO of N requests. A lane sends its next request the moment its previous one ends, so there is no burst barrier and no lane idles until the queue is empty. Request i is prompt `i mod len` of the shape's list, so every K sends the same multiset in the same order.
+- **Warmup discarded.** Before every sample, 8 separate warmup prompts run closed-loop at the same K with 64-token outputs. No measured prompt is ever a warmup prompt.
+- **No prefix-cache hits.** Each request's first message starts with a `Q<run>-<i>.` tag that is unique per sample and request, so a repeat never hits the daemon's prompt cache. `cached` reports any prompt tokens the daemon served from cache.
+- **Chat turns, neutral sampling.** Requests carry `messages` (plus `prompt.system`, as `hipfire serve` injects it), thinking off unless `--reasoning-on`, and neutral penalties (`repeat_penalty` 1.0, `presence_penalty` 0, `min_p` 0).
+- **Levels are interleaved** across `--runs` (`1,2,4,8,1,2,4,8,…`), and the table reports each metric's median over the runs.
+
+| Backend | What it loads and sends |
+|---|---|
+| `batch` | The VMM continuous-batching route `hipfire serve` runs with `serve.vmm_batch` on: `continuous_batch_size` = max K (at least 2) plus the `serve_vmm_batch` load object built from `serve.batch_spec`, `serve.batch_nonexact`, `serve.max_batch_tokens` and `serve.prefill_min_tokens`. Requests are the chat requests serve forwards, with `serve_continuous_batch`. The driver refuses a daemon that did not stage `continuous_batch_route: "vmm"`. A lone request takes the singleton route, as under serve. |
+| `noslots` | No batching. The daemon serves one request at a time and the other lanes wait client-side, as serve queues them with batching off. The wait counts in TTFT. |
+| `slots` | The experimental multi-slot engine (`experimental_multi_slot`). |
+| `both` | All three, one after another. Only one daemon is resident at a time. |
+
+The `multiturn` workload makes each request a two-turn chat. The follow-up ("Explain that again in one sentence.", with the first answer as the assistant turn) is sent on the same lane as soon as the first turn completes, and both turns count. On `slots`, a sample whose follow-ups recorded no prefix-cache hit is reported `[invalid]` and dropped.
+
+| Shape | Requests | Output length | Sampling |
+|---|---|---|---|
+| `steady` (default) | 64 long-answer code prompts (`--num-prompts N` cycles them), identical to the 0.4.2 concurrency audit's `conc_prompts.json` (measured-set md5 `f0b077a766edc166a0c3f18cf81c169c`) | `--max-tokens`, default 256 | greedy |
+| `betterbench` | BetterBench 0.6.0's concurrency workload: every prompt of `--bb-corpus DIR`'s `*.jsonl` files in sorted file order, request i = prompt `i mod len`, 48 requests (`--num-prompts`) | each prompt's own `max_tokens` (default 512); `--max-tokens` is refused | temperature 0.7, top-p 0.95, top-k 20, seed 42 |
+
+`--temperature` overrides either shape's temperature. The daemon has no `ignore_eos`, so `steady` fixes the output length by prompt choice: its prompts ask for answers longer than 256 tokens. Check that the `finish` column reads `length` only. Sampled requests (temperature > 0) are not batched: the VMM route serves greedy requests only, so a sampled `betterbench` sweep measures the singleton route queued K deep.
+
+Each sample prints one line on stderr: output tok/s, BetterBench aggregate, steady tok/s, TTFT and TPOT p50/p99, in-flight, τ, ok/total, tokens and duration, finish reasons, routes (`execution_mode/batched=`), cached prompt tokens, mean prompt tokens and the md5 of the decoded texts. The final table has one row per (backend, workload, K):
+
+- **out tok/s**: vLLM output throughput, output tokens ÷ (last completion − first send). The median of the runs, with min–max in brackets.
+- **bb agg tok/s** (`betterbench` only): BetterBench's `aggregate_tps`, output tokens ÷ closed-loop wall clock.
+- **steady tok/s**: tokens whose arrival falls in the steady window ÷ the window. The window runs from the moment all of the first K requests have a token to the first completion after the last send.
+- **TTFT**: first token − send. **TPOT**: (completion − first token) ÷ (tokens − 1). Both are the medians of the per-sample p50/p99.
+- **in-flight**: achieved concurrency, Σ request latency ÷ duration (SGLang's definition).
+- **τ**: output tokens per verify window, token-weighted over the sample.
+- **tokens**: median output tokens per sample.
+- **finish**, **batched**, **cached**, **errors**: summed over all samples. A failed request counts no tokens.
+
+A daemon that sends no frame for 300 s fails the sweep. Its in-flight requests are cancelled first.
 
 ### Bench context (`max_seq`)
 

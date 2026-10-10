@@ -592,9 +592,10 @@ pub(crate) struct BenchArgs {
     ctx: Vec<usize>,
     #[arg(long, default_value_t = 128)]
     tg: usize,
-    /// Generated tokens per standard-bench measurement run.
-    #[arg(long, default_value_t = 128)]
-    max_tokens: usize,
+    /// Generated tokens per measured request: default 128 on the standard
+    /// bench, 256 on the `--concurrency` `steady` shape.
+    #[arg(long)]
+    max_tokens: Option<usize>,
     #[arg(long)]
     sustained_tg: Option<usize>,
     #[arg(long, value_delimiter = ',', default_value = "128,8192")]
@@ -630,17 +631,37 @@ pub(crate) struct BenchArgs {
     /// Pair this with `--max-tokens` large enough for the span to close.
     #[arg(long = "reasoning-on")]
     reasoning_on: bool,
-    /// Sweep concurrent stream counts, e.g. `1,2,3,4`. Absent leaves bench
-    /// on its single-stream path, unchanged.
+    /// Sweep closed-loop concurrency levels, e.g. `1,2,4,8`: at each level K,
+    /// K client lanes drain the shape's N requests. Absent leaves bench on
+    /// its single-stream path, unchanged.
     #[arg(long)]
     concurrency: Option<String>,
-    /// Which backend to drive: slots (multi-slot engine), noslots (sequential
-    /// daemon baseline), batch (beta continuous batching), or both.
+    /// Which backend to drive: slots (multi-slot engine), noslots (one
+    /// request at a time, lanes queue), batch (the VMM continuous-batching
+    /// route of `hipfire serve` with `serve.vmm_batch`), or both (all three).
     #[arg(long, value_parser = ["slots", "noslots", "batch", "both"], default_value = "both")]
     backend: String,
-    /// Which workload arm to run: stateless, multiturn, or both.
+    /// Which workload arm to run: stateless, multiturn (two-turn chats, the
+    /// follow-up sent on the same lane), or both.
     #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
     workload: String,
+    /// `--concurrency` request population: `steady` (64 long-answer code
+    /// prompts, fixed --max-tokens, greedy) or `betterbench` (BetterBench
+    /// 0.6.0's concurrency workload over --bb-corpus).
+    #[arg(long, value_parser = ["steady", "betterbench"], default_value = "steady")]
+    bench_shape: String,
+    /// BetterBench corpus directory (`*.jsonl` per category) for
+    /// `--bench-shape betterbench`.
+    #[arg(long, value_name = "DIR")]
+    bb_corpus: Option<PathBuf>,
+    /// `--concurrency` measured requests per sample (default 64 `steady`,
+    /// 48 `betterbench`); request i is prompt i modulo the shape's list.
+    #[arg(long, value_name = "N")]
+    num_prompts: Option<usize>,
+    /// `--concurrency` sampling temperature (default 0 `steady`, 0.7
+    /// `betterbench`).
+    #[arg(long)]
+    temperature: Option<f64>,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -648,6 +669,13 @@ pub(crate) struct BenchArgs {
     /// no trimming). Mutually exclusive with positional PROMPT words.
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
+}
+
+impl BenchArgs {
+    /// `--max-tokens` on the standard (single-stream) bench, default 128.
+    fn standard_max_tokens(&self) -> usize {
+        self.max_tokens.unwrap_or(128)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -5287,7 +5315,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .unwrap_or("unknown")
     );
     eprintln!("  runs:   {}", args.runs);
-    eprintln!("  max_tokens: {}", args.max_tokens);
+    eprintln!("  max_tokens: {}", args.standard_max_tokens());
     eprintln!("  prompt_md5: {prompt_md5}");
     eprintln!("  prompt_chars: {prompt_chars}");
     print_bench_max_seq(&max_seq, &loaded);
@@ -5332,7 +5360,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             let done = bench_generate_with_reasoning(
                 &mut engine,
                 &prompt,
-                args.max_tokens as u64,
+                args.standard_max_tokens() as u64,
                 args.reasoning_on,
             )?;
             power_runs.push(sampler.finish());
@@ -5396,7 +5424,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "gpu": post_diag,
                 "vram_free_before_mb": pre_diag.get("vram_free_mb"),
                 "max_seq": max_seq_json,
-                "max_tokens": args.max_tokens,
+                "max_tokens": args.standard_max_tokens(),
                 "runs": args.runs,
                 "batch": 1,
                 "prompt_tokens": prompt_tokens,
@@ -5428,12 +5456,12 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     }
 }
 
-/// Concurrency sweep across both concurrent backends. Only reached when
-/// `--concurrency` is given; the single-stream path above is untouched.
+/// Closed-loop concurrency sweep (see `bench_concurrency`). Only reached
+/// when `--concurrency` is given; the single-stream path above is untouched.
 fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
     use crate::bench_concurrency::{
-        parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
-        DaemonDriver, Point, SequentialDriver, SlotDriver, WorkloadSel,
+        betterbench_workload, parse_concurrency, render_table, steady_workload, sweep_backend,
+        BackendSel, BenchShape, Driver, Point, WorkloadSel, STEADY_DEFAULT_MAX_TOKENS,
     };
 
     let points = parse_concurrency(spec)?;
@@ -5449,48 +5477,94 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         "multiturn" => vec![WorkloadSel::Multiturn],
         _ => vec![WorkloadSel::Stateless, WorkloadSel::Multiturn],
     };
+    let shape = match args.bench_shape.as_str() {
+        "betterbench" => BenchShape::BetterBench,
+        _ => BenchShape::Steady,
+    };
+    let mut workload = match shape {
+        BenchShape::Steady => {
+            if args.bb_corpus.is_some() {
+                bail!("--bb-corpus needs --bench-shape betterbench");
+            }
+            let max_tokens = args
+                .max_tokens
+                .map_or(STEADY_DEFAULT_MAX_TOKENS, |n| n as u64);
+            steady_workload(args.num_prompts, max_tokens)?
+        }
+        BenchShape::BetterBench => {
+            if args.max_tokens.is_some() {
+                bail!(
+                    "--max-tokens does not apply to --bench-shape betterbench: \
+                     every corpus prompt carries its own max_tokens"
+                );
+            }
+            let dir = args.bb_corpus.as_deref().ok_or_else(|| {
+                anyhow!("--bench-shape betterbench needs --bb-corpus <BetterBench corpus dir>")
+            })?;
+            betterbench_workload(dir, args.num_prompts)?
+        }
+    };
+    if let Some(t) = args.temperature {
+        workload.sampling.temperature = t;
+    }
+    // The load-time knobs `hipfire serve` reads from the same configuration:
+    // its default system prompt and the VMM batch route parameters.
+    let registry = load_registry(&paths.registry).registry;
+    let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
+        .unwrap_or((None, None));
+    let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
+    if let Some(system) = request_string(&resolved, "prompt.system", None)? {
+        workload.inject_system(&system);
+    }
 
-    eprintln!("hipfire bench — concurrency sweep");
+    eprintln!("hipfire bench — concurrency sweep (closed loop)");
     eprintln!("  model:       {}", args.model);
     eprintln!("  concurrency: {points:?}");
     eprintln!("  runs/point:  {}", args.runs);
-    eprintln!("  max_tokens:  {}", args.max_tokens);
+    eprintln!(
+        "  shape:       {} ({} requests/sample, source md5 {}, {} warmup requests of {} tokens/sample)",
+        shape.label(),
+        workload.measure.len(),
+        workload.source_md5,
+        workload.warmup.len(),
+        crate::bench_concurrency::WARMUP_TOKENS,
+    );
+    if shape == BenchShape::Steady {
+        eprintln!("  max_tokens:  {}", workload.measure[0].max_tokens);
+    }
+    eprintln!("  sampling:    {:?}", workload.sampling);
 
     let mut out: Vec<Point> = Vec::new();
 
-    // The two backends run STRICTLY SEQUENTIALLY, and the scope below is what
-    // enforces it. Each holds a full copy of the model's weights -- 18.7 GB for
-    // a 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
-    // box with no swap that is not "slower", it is an OOM kill. `SlotEngine`'s
-    // Drop closes its channel and joins the worker thread that owns the Gpu,
-    // weights and KV arenas, so leaving this scope is what actually frees the
-    // first model before the daemon loads the second.
+    // The backends run STRICTLY SEQUENTIALLY, and the scopes below enforce
+    // it. Each holds a full copy of the model's weights -- 18.7 GB for a
+    // 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
+    // box with no swap that is not "slower", it is an OOM kill. Dropping a
+    // driver drops its engine, which stops that daemon before the next loads.
     if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
         preflight_headroom_for_model(paths, &args.model)?;
         let mut slot_args = args.clone();
         slot_args.concurrency = None;
-        // 2048-token slots, not the serve default of 8192: the sweep's prompts
-        // are one short turn and --max-tokens is small, so a larger arena buys
-        // nothing and multiplies per-slot KV by four.
+        // Small per-slot arenas, not the serve default of 8192: the steady
+        // shape's turns stay under 1K tokens and BetterBench's under 4K, and a
+        // larger arena multiplies per-slot KV for nothing.
+        let slot_ctx = match shape {
+            BenchShape::Steady => 2048,
+            BenchShape::BetterBench => 4096,
+        };
         let (engine, loaded, _, _, _, max_seq) =
-            open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+            open_bench_engine_slots(paths, &slot_args, max_k, slot_ctx)?;
         print_bench_max_seq(&max_seq, &loaded);
         let slot_capable = loaded
             .get("experimental_multi_slot")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        match SlotDriver::start(engine, max_k, slot_capable) {
+        match Driver::slots(engine, max_k, slot_capable, args.reasoning_on) {
             Ok(mut d) => {
                 eprintln!("  slots backend up ({max_k} slots)");
-                let r = sweep_backend(
-                    &mut d as &mut dyn ConcurrencyBackend,
-                    &arms,
-                    &points,
-                    args.runs,
-                    args.max_tokens as u64,
-                    &mut out,
-                );
-                // Free the weights before the batch backend loads its own copy,
+                let r = sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out);
+                // Free the weights before the next backend loads its own copy,
                 // even on the error path.
                 drop(d);
                 r?;
@@ -5500,9 +5574,9 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         }
     }
 
-    // No-slots baseline: k requests one after another through the ordinary
-    // daemon path. Runs after the slots engine has been dropped, so only one
-    // copy of the weights is ever resident.
+    // No-batching baseline: the daemon serves one request at a time and the
+    // other lanes queue client-side, as `hipfire serve` queues them with
+    // batching off.
     if matches!(backend_sel, BackendSel::Sequential | BackendSel::Both) {
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
@@ -5510,16 +5584,9 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         let (engine, loaded, _, _, _, max_seq) =
             open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
         print_bench_max_seq(&max_seq, &loaded);
-        let mut d = SequentialDriver::start(engine, max_k)?;
-        eprintln!("  noslots backend up (sequential daemon path)");
-        let r = sweep_backend(
-            &mut d as &mut dyn ConcurrencyBackend,
-            &arms,
-            &points,
-            args.runs,
-            args.max_tokens as u64,
-            &mut out,
-        );
+        let mut d = Driver::sequential(engine, max_k, args.reasoning_on);
+        eprintln!("  noslots backend up (one request at a time)");
+        let r = sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out);
         drop(d);
         r?;
     }
@@ -5528,30 +5595,30 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut batch_args = args.clone();
         batch_args.concurrency = None;
+        // The VMM route needs at least two lanes; a lone request at k=1
+        // takes the singleton route either way, as it does under serve.
+        let lanes = max_k.max(2);
+        let vmm = crate::serve::VmmBatchFlags::from_config(&resolved)?;
+        let vmm_params = vmm.load_params(config_u64(&resolved, "serve.max_batch_tokens")?);
         let (engine, loaded, _, _, _, max_seq) =
-            open_bench_engine_batched(paths, &batch_args, max_k)?;
+            open_bench_engine_batched(paths, &batch_args, lanes, vmm_params)?;
         print_bench_max_seq(&max_seq, &loaded);
-        let capable = loaded
-            .get("continuous_batch_capable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        match DaemonDriver::start(engine, max_k, capable) {
+        match Driver::batch(engine, max_k, &loaded, args.reasoning_on) {
             Ok(mut d) => {
-                eprintln!("  batch backend up (continuous_batch_size={max_k})");
-                sweep_backend(
-                    &mut d as &mut dyn ConcurrencyBackend,
-                    &arms,
-                    &points,
-                    args.runs,
-                    args.max_tokens as u64,
-                    &mut out,
-                )?;
+                let field = |key: &str| loaded.get(key).cloned().unwrap_or_default();
+                eprintln!(
+                    "  batch backend up (VMM route, continuous_batch_size={lanes}, exact={}, spec_mode={}, row_budget={})",
+                    field("continuous_batch_exact"),
+                    field("continuous_batch_spec_mode"),
+                    field("continuous_batch_row_budget"),
+                );
+                sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out)?;
             }
             Err(e) => eprintln!("  batch backend unavailable: {e}"),
         }
     }
 
-    println!("{}", render_table(&out));
+    println!("{}", render_table(&out, shape));
     Ok(())
 }
 
@@ -5606,20 +5673,23 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
     Ok(())
 }
 
-/// `open_bench_engine`, but loading with `continuous_batch_size` set so the
-/// daemon allocates batch lanes and advertises `continuous_batch_capable`.
-/// The value is fixed per load, which is why the sweep holds it at max.
+/// `open_bench_engine`, loading the VMM continuous-batching route the way
+/// `hipfire serve` does with `serve.vmm_batch` on: `continuous_batch_size`
+/// lanes plus the `serve_vmm_batch` parameter object. Without the latter the
+/// daemon would batch on the legacy fixed-slot route serve never runs. The
+/// lane count is fixed per load, which is why the sweep holds it at max.
 fn open_bench_engine_batched(
     paths: &Paths,
     args: &BenchArgs,
     batch_size: usize,
+    vmm_batch: serde_json::Value,
 ) -> Result<BenchEngine> {
     open_bench_engine(
         paths,
         args,
         None,
         &BenchLoadOpts {
-            continuous_batch: Some(batch_size),
+            continuous_batch: Some((batch_size, vmm_batch)),
             ..Default::default()
         },
     )
@@ -5828,7 +5898,8 @@ fn print_bench_max_seq(max_seq: &BenchMaxSeq, loaded: &serde_json::Value) {
 #[derive(Default)]
 struct BenchLoadOpts {
     multi_slot: Option<(usize, usize)>,
-    continuous_batch: Option<usize>,
+    /// `continuous_batch_size` and the `serve_vmm_batch` load parameter.
+    continuous_batch: Option<(usize, serde_json::Value)>,
 }
 
 fn open_bench_engine(
@@ -5941,8 +6012,9 @@ fn open_bench_engine(
             }
         }
     }
-    if let Some(n) = load_opts.continuous_batch {
-        params["continuous_batch_size"] = serde_json::json!(n as u64);
+    if let Some((n, vmm_batch)) = &load_opts.continuous_batch {
+        params["continuous_batch_size"] = serde_json::json!(*n as u64);
+        params["serve_vmm_batch"] = vmm_batch.clone();
     }
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
@@ -6419,7 +6491,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
-            max_tokens: 128,
+            max_tokens: None,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
@@ -6434,6 +6506,10 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
+            bench_shape: "steady".to_owned(),
+            bb_corpus: None,
+            num_prompts: None,
+            temperature: None,
             prompt: Vec::new(),
             prompt_file: None,
         };
@@ -13779,7 +13855,7 @@ mod tests {
             pp: vec![128],
             ctx: vec![128],
             tg: 128,
-            max_tokens: 128,
+            max_tokens: None,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
@@ -13794,6 +13870,10 @@ mod tests {
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
+            bench_shape: "steady".to_owned(),
+            bb_corpus: None,
+            num_prompts: None,
+            temperature: None,
             prompt,
             prompt_file,
         }

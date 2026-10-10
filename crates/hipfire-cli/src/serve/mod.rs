@@ -256,6 +256,32 @@ pub(crate) struct VmmBatchFlags {
     pub(crate) prefill_min_tokens: u64,
 }
 
+impl VmmBatchFlags {
+    /// The `serve.vmm_batch` / `serve.batch_spec` / `serve.batch_nonexact`
+    /// / `serve.prefill_min_tokens` switches of a resolved configuration.
+    pub(crate) fn from_config(resolved: &hipfire_config::ResolvedConfig) -> Result<Self> {
+        Ok(Self {
+            enabled: config_bool(resolved, "serve.vmm_batch")?,
+            spec: config_bool(resolved, "serve.batch_spec")?,
+            nonexact: config_bool(resolved, "serve.batch_nonexact")?,
+            prefill_min_tokens: config_u64(resolved, "serve.prefill_min_tokens")?,
+        })
+    }
+
+    /// The `serve_vmm_batch` load parameter that stages the VMM
+    /// continuous-batching route (`parse_vmm_batch_params` in
+    /// `hipfire-engine`). `hipfire serve` sends it when `enabled`;
+    /// `hipfire bench --concurrency --backend batch` always does.
+    pub(crate) fn load_params(&self, max_batch_tokens: u64) -> serde_json::Value {
+        serde_json::json!({
+            "spec": self.spec,
+            "nonexact": self.nonexact,
+            "max_batch_tokens": max_batch_tokens,
+            "prefill_min_tokens": self.prefill_min_tokens,
+        })
+    }
+}
+
 pub(crate) struct ServeRuntime {
     pub(crate) engine: Engine,
     pub(crate) paths: Paths,
@@ -1395,12 +1421,7 @@ pub(crate) fn serve_foreground(
     if continuous_batch_size == 0 || continuous_batch_size > 256 {
         bail!("--continuous-batch-size must be between 1 and 256");
     }
-    let mut vmm_batch = VmmBatchFlags {
-        enabled: config_bool(&global, "serve.vmm_batch")?,
-        spec: config_bool(&global, "serve.batch_spec")?,
-        nonexact: config_bool(&global, "serve.batch_nonexact")?,
-        prefill_min_tokens: 1,
-    };
+    let vmm_batch = VmmBatchFlags::from_config(&global)?;
     let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
     let multi_slot_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4);
     let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
@@ -1410,8 +1431,7 @@ pub(crate) fn serve_foreground(
     // consumes both (row budget and prefill quantum); other standard routes
     // read them for startup validation only.
     let max_batch_tokens = config_u64(&global, "serve.max_batch_tokens")?;
-    let prefill_min_tokens = config_u64(&global, "serve.prefill_min_tokens")?;
-    vmm_batch.prefill_min_tokens = prefill_min_tokens;
+    let prefill_min_tokens = vmm_batch.prefill_min_tokens;
     // Aggregate queue byte budget and stalled-stream deadline (spec §5.3,
     // §5.4). Both are multi-slot route contracts: the standard route keeps
     // its count-only queue and its unbounded streaming wait.
@@ -1875,12 +1895,7 @@ impl ServeRuntime {
             }
             params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
             if self.vmm_batch.enabled {
-                params["serve_vmm_batch"] = serde_json::json!({
-                    "spec": self.vmm_batch.spec,
-                    "nonexact": self.vmm_batch.nonexact,
-                    "max_batch_tokens": self.max_batch_tokens,
-                    "prefill_min_tokens": self.vmm_batch.prefill_min_tokens,
-                });
+                params["serve_vmm_batch"] = self.vmm_batch.load_params(self.max_batch_tokens);
             }
             // Experimental multi-slot: daemon owns SlotEngine instead of ordinary
             // LoadedModel. Future continuous-batch integration is deferred.
