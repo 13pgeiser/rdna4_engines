@@ -1005,6 +1005,49 @@ TEST(the_drafter_name_survives_the_program_leaving_the_builder) {
     CHECK_EQ(p.drafter.depth, 3);
 }
 
+/* A HEAD THAT KEEPS NO CACHE OF ITS OWN (rad_drafter_shared_kv) is a property of a declared SERIAL
+ * drafter. With none declared, with a block drafter, or at a position no head sits at, the call is
+ * refused at declare -- a head staged the wrong way round costs acceptance and says nothing. */
+TEST(a_head_that_keeps_no_cache_of_its_own_is_a_serial_one) {
+    Registry reg;
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        CHECK_EQ(rad_drafter_shared_kv(&b, 0), RAD_E_STATE);   /* nothing declared */
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadBufDecl bd{};
+        bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 256; bd.shape[1] = 4;
+        const rad_buf prop = rad_decl_buffer(&b, "prop", &bd);
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_BLOCK; d.name = "df"; d.depth = 4; d.mask_token = 5;
+        d.proposal = prop; d.proposal_pitch = 4;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(rad_drafter_shared_kv(&b, 0), RAD_E_STATE);   /* a block drafter */
+        CHECK(!b.program().drafter_shared_kv);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 4;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(rad_drafter_shared_kv(&b, 2), RAD_E_INVAL);   /* no position a head sits at */
+        CHECK(!b.program().drafter_shared_kv);
+        CHECK_OK(rad_drafter_shared_kv(&b, 1));
+        CHECK(b.program().drafter_shared_kv);
+        CHECK_EQ(b.program().drafter_pos_offset, 1);
+    }
+    {
+        /* Every drafter that does not ask keeps the old shape. */
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 4;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK(!b.program().drafter_shared_kv);
+        CHECK_EQ(b.program().drafter_pos_offset, 0);
+    }
+}
+
 
 /* ================================================================== the enum name tables
  *

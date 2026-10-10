@@ -110,6 +110,14 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  "drafter's window is recomputed", (long long)draft_refill_);
     }
 
+    serial_shared_    = cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_SERIAL &&
+                        prog.drafter_shared_kv;
+    serial_rot_shift_ = serial_shared_ ? prog.drafter_pos_offset : 0;
+    if (serial_shared_)
+        RAD_INFO("serial drafter: reads the trunk's cache and keeps none -- no history pass, one "
+                 "row a drafting sequence, every round at the committed position%s",
+                 serial_rot_shift_ ? " (rotated one past it)" : "");
+
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
     /* THE ADAPTIVE WINDOW IS THE SERIAL DRAFTER'S POLICY (draft.h): it prices a draft as one more
@@ -2193,9 +2201,19 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         const int64_t owed_end = e.produces_token ? vstart : (int64_t)e.ctx_len + e.n_tokens;
         int64_t hs = s.draft_filled > e.ctx_len ? s.draft_filled : (int64_t)e.ctx_len;
         if (hs > owed_end) hs = owed_end;
-        const int64_t lead = owed_end - hs;
+        int64_t lead = owed_end - hs;
         const int64_t verified = e.produces_token ? e.n_spec + 1 : 0;
-        const int64_t hist_n = lead + verified;
+        int64_t hist_n = lead + verified;
+
+        /* A HEAD WITH NO CACHE OF ITS OWN IS OWED NO HISTORY (rad_drafter_shared_kv). Its one row
+         * is round 1's -- the committed position, whichever of the verified ones the card says it
+         * is -- and a sequence that does not draft has nothing to run at all. */
+        if (serial_shared_) {
+            if (!can_draft) continue;
+            hs = vstart;
+            lead = 0;
+            hist_n = 1;
+        }
 
         if (!can_draft && hist_n <= 0) continue;   /* nothing owed and nothing to draft */
 
@@ -2205,7 +2223,9 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         m.card       = e.card;
         m.hist_row   = (int32_t)(base + (hs - e.ctx_len));
         m.hist_n     = (int32_t)hist_n;
-        m.hist_pos   = hs;
+        /* The shared head's one row sits wherever the card's acceptance puts it; the host stages
+         * the furthest that can be, as it does for every round. */
+        m.hist_pos   = serial_shared_ ? head_max : hs;
         m.dev        = e.produces_token;
         m.dev_tok    = (int32_t)(base + (vstart - e.ctx_len));
         m.dev_out    = e.dev_out;
@@ -2264,8 +2284,10 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         e.card     = m.card;
         e.n_tokens = round == 0 ? m.hist_n : 1;
         /* A round's position is the card's; the host stages the furthest it can be, which is what
-         * every host-side ceiling reads. The history's are known here exactly. */
-        e.ctx_len  = (int32_t)(round == 0 ? m.hist_pos : m.base_pos + (round - 1));
+         * every host-side ceiling reads. The history's are known here exactly. A head with no
+         * cache of its own does not step forward, so neither does its ceiling. */
+        e.ctx_len  = (int32_t)(round == 0 ? m.hist_pos
+                                          : m.base_pos + (serial_shared_ ? 0 : round - 1));
         e.n_spec   = 0;
         /* One-based and constant: a head pass commits exactly the tokens it was handed. The head
          * issues no linear-state op, so nothing reads it; it is set rather than left at a value

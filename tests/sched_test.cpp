@@ -9,6 +9,7 @@
 #include "rad_test.h"
 
 #include "sched/scheduler.h"
+#include "sched/advance_impl.h"
 #include "sched/derive.h"
 #include "server/sink.h"
 
@@ -3012,6 +3013,202 @@ TEST(the_history_pass_carries_draft_round_one) {
     CHECK_EQ(r2->n_tok, 1);
     CHECK_EQ(r2->n_draft_out, 0);
     f.sch.serial_end(2);
+}
+
+/* THE SERIAL DRIVER'S TWO SHAPES, side by side over one verify step. A head with a cache of its own
+ * (every drafter but one) owes the history of every verified position and steps one position a
+ * round; a head that reads the trunk's cache and keeps none (rad_drafter_shared_kv) owes nothing,
+ * runs one row a drafting sequence, and does not step. The first half of this is the old path and
+ * must not move: it is what Qwen's MTP head is staged with. */
+namespace {
+struct SerialShape {
+    int     hist_tok = 0, hist_out = 0, hist_dout = 0;
+    int32_t hist_ctx = 0, hist_row = 0;
+    int32_t round_ctx[4] = {0, 0, 0, 0};
+};
+
+void serial_shape(bool shared, SerialShape& r) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 4;
+    f.prog.drafter_shared_kv = shared;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 4);
+
+    int rounds = 4;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK(hb->draft_pass < 0);
+    r.hist_tok  = (int)hb->n_tok;
+    r.hist_out  = (int)hb->n_out;
+    r.hist_dout = (int)hb->n_draft_out;
+    r.hist_ctx  = hb->ctx_lens[0];
+    r.hist_row  = hb->out_ids[0];
+    for (int rd = 2; rd <= 3; ++rd) {
+        const RadBatch* rb = f.sch.serial_batch(rd, 1);
+        REQUIRE(rb != nullptr);
+        CHECK_EQ(rb->n_tok, 1);
+        r.round_ctx[rd] = rb->ctx_lens[0];
+    }
+    f.sch.serial_end(3);
+}
+}  /* namespace */
+
+TEST(a_head_with_a_cache_of_its_own_is_staged_as_it_always_was) {
+    SerialShape o;
+    serial_shape(false, o);
+    CHECK_EQ(o.hist_tok, 5);                    /* every verified position */
+    CHECK_EQ(o.hist_out, 5);                    /* one trunk row each */
+    CHECK_EQ(o.hist_dout, 1);
+    CHECK_EQ(o.hist_ctx, 160);                  /* the history starts at the first verified one */
+    CHECK_EQ(o.hist_row, 0);                    /* the verify step's first row */
+    CHECK_EQ(o.round_ctx[2], 165);              /* the furthest round 2 can sit: one past the last */
+    CHECK_EQ(o.round_ctx[3], 166);              /* ...and the head steps one position a round */
+}
+
+TEST(a_head_with_no_cache_of_its_own_runs_one_row_and_stays_put) {
+    SerialShape s;
+    serial_shape(true, s);
+    CHECK_EQ(s.hist_tok, 1);                    /* round 1 alone */
+    CHECK_EQ(s.hist_out, 1);
+    CHECK_EQ(s.hist_dout, 1);
+    CHECK_EQ(s.hist_ctx, 164);                  /* the furthest the committed position can be */
+    CHECK_EQ(s.hist_row, 0);                    /* the run's first trunk row; the card adds acc */
+    CHECK_EQ(s.round_ctx[2], 164);              /* and every round stays there */
+    CHECK_EQ(s.round_ctx[3], 164);
+}
+
+/* A HEAD WITH NO CACHE OF ITS OWN IS OWED NO HISTORY: a prefill chunk that drafts nothing runs no
+ * pass for it at all, where a head with its own cache is given the whole chunk. */
+TEST(a_head_with_no_cache_of_its_own_runs_no_pass_when_nothing_drafts) {
+    for (int shared = 0; shared < 2; ++shared) {
+        Fixture f;
+        f.build(/*blocks=*/10, /*states=*/64);      /* exactly the prompt: nothing to look ahead into */
+        f.cfg.n_spec = 4;
+        f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+        f.prog.drafter.depth = 4;
+        f.prog.drafter_shared_kv = shared != 0;
+        CHECK_OK(f.start());
+        f.submit(160, 64);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        int rounds = 4;
+        Scheduler::SerialRow rows[4];
+        CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 0);
+        const RadBatch* hb = f.sch.serial_batch(0, 1);
+        if (shared) {
+            CHECK(hb == nullptr);
+        } else {
+            REQUIRE(hb != nullptr);
+            CHECK_EQ(hb->n_tok, 160);
+        }
+        f.sch.serial_end(0);
+    }
+}
+
+/* WHAT THE CARD WRITES INTO A DRAFT PASS, row by row (advance_impl.h), for both shapes. One verify
+ * step at positions 101..105 accepted two drafts, so the committed position is 103 and the trunk
+ * chose token 7003 there; the block table maps position p to slot p. A head with a cache of its own
+ * gets the verified run with its tail repeated and a context that runs to its end; a head with no
+ * cache of its own gets the committed position and a context that ends there, in every round. */
+namespace {
+struct AdvSlab {
+    alignas(16) int32_t w[512] = {};
+    rad::StepSlot st{};
+    int32_t src[8] = { 7001, 7002, 7003, 7004, 7005, 0, 0, 0 };
+    rad::AdvanceArgs a;
+
+    /* word offsets */
+    enum { ROWS = 0, TOK = 8, POS = 16, CTX = 24, ACC = 28, OUT = 32, SID = 40, CU = 44, Q = 48,
+           GRP = 64, SLOT = 96, USED = 104, BT = 112, FIRST = 128 };
+
+    AdvSlab(int mode, int n_rows, int round, bool shared, int shift) {
+        a.mode = mode;
+        a.round = round;
+        a.n_seq = 1;
+        a.n_groups = 1;
+        a.slab = reinterpret_cast<char*>(w);
+        a.row_off = ROWS * 4;  a.row_pitch = 1;
+        a.tok_off = TOK * 4;   a.pos_off = POS * 4; a.ctx_off = CTX * 4; a.acc_off = ACC * 4;
+        a.out_off = OUT * 4;   a.sid_off = SID * 4; a.cu_off = CU * 4;   a.q_off = Q * 4;
+        a.grp_off = GRP * 4;
+        a.st = &st;
+        a.src = src;
+        a.shared_kv = shared ? 1 : 0;
+        a.rot_shift = shift;
+        w[ROWS + 0] = 1;     /* a device row */
+        w[ROWS + 1] = 0;     /* its first verified token row */
+        w[ROWS + 2] = 0;     /* its first sampled row */
+        w[ROWS + 3] = 0;     /* no history before the verified positions */
+        w[SID] = 0; w[CU] = 0; w[Q] = n_rows;
+        w[OUT] = 40;         /* the host staged the run's first trunk row */
+        rad::AdvGroup g{};
+        g.block_size = 16; g.paged = 1; g.pitch = 16;
+        g.slot_off = SLOT * 4; g.used_off = USED * 4; g.bt_off = BT * 4; g.first_off = FIRST * 4;
+        std::memcpy(&w[GRP], &g, sizeof g);
+        for (int i = 0; i < 16; ++i) w[BT + i] = i;   /* block i holds positions 16i.. */
+        w[FIRST] = 0;
+        st.head = 103; st.acc = 2; st.ctx = 104; st.n_acc = 3; st.tok[0] = 7003;
+    }
+};
+}  /* namespace */
+
+TEST(the_card_stages_a_cacheless_head_at_the_committed_position) {
+    /* The history pass. */
+    {
+        AdvSlab o(rad::ADV_HIST, 5, 0, false, 0);
+        rad::adv_row(o.a, 0);
+        const int32_t pos[5] = { 101, 102, 103, 103, 103 }, tok[5] = { 7001, 7002, 7003, 7003, 7003 };
+        for (int j = 0; j < 5; ++j) {
+            CHECK_EQ(o.w[AdvSlab::POS + j], pos[j]);
+            CHECK_EQ(o.w[AdvSlab::TOK + j], tok[j]);
+            CHECK_EQ(o.w[AdvSlab::OUT + j], 40 + (j < 2 ? j : 2));
+            CHECK_EQ(o.w[AdvSlab::SLOT + j], pos[j]);
+        }
+        CHECK_EQ(o.w[AdvSlab::USED], 106);        /* the verify step's whole run */
+        CHECK_EQ(o.w[AdvSlab::CTX], 101);
+    }
+    for (int shift = 0; shift < 2; ++shift) {
+        AdvSlab s(rad::ADV_HIST, 1, 0, true, shift);
+        rad::adv_row(s.a, 0);
+        CHECK_EQ(s.w[AdvSlab::POS], 103 + shift);
+        CHECK_EQ(s.w[AdvSlab::TOK], 7003);
+        CHECK_EQ(s.w[AdvSlab::OUT], 42);
+        CHECK_EQ(s.w[AdvSlab::USED], 104);        /* the committed positions and no more */
+        CHECK_EQ(s.w[AdvSlab::CTX], 103);
+    }
+    /* Round 3: the old head two positions on, the cacheless one where it was. */
+    {
+        AdvSlab o(rad::ADV_ROUND, 1, 3, false, 0);
+        o.src[0] = 9001;
+        rad::adv_row(o.a, 0);
+        CHECK_EQ(o.w[AdvSlab::POS], 105);
+        CHECK_EQ(o.w[AdvSlab::USED], 106);
+        CHECK_EQ(o.w[AdvSlab::TOK], 9001);
+        CHECK_EQ(o.st.tok[2], 9001);
+    }
+    for (int shift = 0; shift < 2; ++shift) {
+        AdvSlab s(rad::ADV_ROUND, 1, 3, true, shift);
+        s.src[0] = 9001;
+        rad::adv_row(s.a, 0);
+        CHECK_EQ(s.w[AdvSlab::POS], 103 + shift);
+        CHECK_EQ(s.w[AdvSlab::USED], 104);
+        CHECK_EQ(s.w[AdvSlab::CTX], 103);
+        CHECK_EQ(s.w[AdvSlab::TOK], 9001);
+        CHECK_EQ(s.st.tok[2], 9001);
+    }
 }
 
 /* A STEP IS ISSUED AHEAD OF A COMMIT ONLY FOR A REQUEST WHOSE SPECULATION THAT COMMIT CANNOT

@@ -94,6 +94,13 @@ struct AdvanceArgs {
      * the host's position keeps the host's three components, which is what a media token needs. */
     int64_t rope_off = -1;
     int32_t rope_pitch = 0;
+    /* A SERIAL HEAD WITH NO CACHE OF ITS OWN (rad_drafter_shared_kv), read by ADV_HIST and
+     * ADV_ROUND alone: its history pass is one row a sequence at the committed position, and every
+     * round sits there too, its context ending at that position. `rot_shift` is where those rows
+     * sit for the rotary, 0 or 1 past the committed position. Zero for every other head, whose
+     * passes advance exactly as they always did. */
+    int32_t shared_kv = 0;
+    int32_t rot_shift = 0;
 };
 
 /* Issue one advance on `s`. The rows are independent, so the card runs them in parallel. */

@@ -191,8 +191,14 @@ public:
 
     /* The batch the last build produced for one rank; see BatchBuilder::batch_for. */
     const RadBatch* batch_for(int rank) const { return builder_.batch_for(rank); }
-    /* The advance's view of that build on one rank; see BatchBuilder::advance_args. */
-    AdvanceArgs advance_args(int rank) const { return builder_.advance_args(rank); }
+    /* The advance's view of that build on one rank; see BatchBuilder::advance_args. It carries
+     * the serial head's shape as well, which only the draft passes' modes read. */
+    AdvanceArgs advance_args(int rank) const {
+        AdvanceArgs a = builder_.advance_args(rank);
+        a.shared_kv = serial_shared_ ? 1 : 0;
+        a.rot_shift = serial_rot_shift_;
+        return a;
+    }
     void fini();
 
     /* ---------------------------------------------------------- off the step path */
@@ -522,6 +528,12 @@ private:
      * that point would give back more than two windows is kept whole. The drafter's window, or 0
      * where no hit can leave such a hole. */
     int64_t       draft_refill_ = 0;
+    /* A SERIAL HEAD WITH NO CACHE OF ITS OWN (rad_drafter_shared_kv), off the Program at init. It
+     * owes no history, so serial_begin gives it one row a drafting sequence and none to a sequence
+     * that does not draft, and its rounds stay at the committed position (advance.h). False and 0
+     * for every other drafter, whose passes are staged exactly as before. */
+    bool          serial_shared_ = false;
+    int32_t       serial_rot_shift_ = 0;
     BatchBuilder  builder_;
     DraftController draft_;
 

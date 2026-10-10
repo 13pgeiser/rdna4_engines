@@ -546,6 +546,31 @@ typedef struct RadDrafterDecl {
 
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
 
+/* A SERIAL HEAD WITH NO CACHE OF ITS OWN. Every attention layer of it reads one of the TRUNK's
+ * layers' K and V and writes none -- Gemma 4's assistant head, whose layers have a query
+ * projection and nothing else, reads the last sliding and the last global trunk layer. Called
+ * once, after rad_declare_drafter, by a plugin whose serial head is that shape. Additive export: a
+ * plugin that does not call it drafts exactly as before, and RAD_ABI_VERSION does not move.
+ *
+ * What it changes in the serial driver, and each item follows from the head writing nothing:
+ *
+ *   NO HISTORY IS OWED. A history pass exists to fill a head's own K and V, and there are none to
+ *   fill. The pass carries round 1 alone: ONE row a drafting sequence, at the committed position,
+ *   with the token the trunk chose after it and the trunk's hidden state there (out_ids). A
+ *   sequence that does not draft gets no row, and a step with nothing to draft no pass.
+ *
+ *   EVERY ROUND RUNS AT THAT SAME POSITION, OVER THE SAME CONTEXT. A head with a cache of its own
+ *   steps one position a round and attends to what it wrote there. This one has nowhere to write,
+ *   and the trunk's cache past the committed position holds the K and V of drafts the last verify
+ *   REJECTED, or of nothing. So every round's `seqused` ends at the committed position, and what
+ *   the head proposed travels forward in its hidden state and its next input token instead.
+ *
+ * `pos_offset` is where those rows sit for the rotary, as an offset from the committed position:
+ * 0 is the position of the trunk hidden state the head continues from, 1 the position of the token
+ * it embeds. It moves nothing else -- the context ends at the committed position either way -- and
+ * which one a checkpoint was trained with is the plugin's to know. */
+int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
+
 /* ================================================================== the encoder */
 /* A MEDIA ENCODER THE PLUGIN RUNS ON AN ENCODER PASS (RadBatch::enc), declared for the reason the
  * logits buffer and the drafter are: the core drives the pass and reads its result, so it has to

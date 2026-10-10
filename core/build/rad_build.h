@@ -134,6 +134,7 @@ public:
     int         declare_logits(rad_buf b);
     int         declare_pooled(rad_buf b);
     int         declare_drafter(const RadDrafterDecl* d);
+    int         drafter_shared_kv(int pos_offset);
     int         declare_encoder(const RadEncoderDecl* d);
     void        note_v       (const char* f, va_list ap);
 
