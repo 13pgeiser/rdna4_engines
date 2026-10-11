@@ -1,0 +1,27 @@
+# gemma4-31b-dense-bf16-w4a8.recipe -- Gemma 4 31B dense (text) from a bf16 checkpoint: Google's
+# gemma-4-31B-it, or any finetune of it, which ships no QAT form. Same grid and size as the CT
+# recipe (int4, an f16 scale a 128 columns, ~20 GiB with the assistant head), with the
+# least-squares scale search instead of absmax.
+#
+#   rad-convert <gemma-4-31B-it> --recipe data/recipes/gemma4-31b-dense-bf16-w4a8.recipe \
+#       --set quantization_config.quant_method=compressed-tensors \
+#       [--draft-model <gemma-4-31B-it-assistant>] -o gemma4-31b-dense-bf16-w4a8.rad
+#
+# The --set selects the gemma4 plugin (which serves both releases); the plugin maps the plain
+# `X.weight` names because the checkpoint's own quantization_config names no pack-quantized format.
+# Norms, the embedding/lm_head and the assistant head are kept bf16 (no rule matches them).
+#
+# Why from bf16 when a QAT release exists: the assistant head was trained against the bf16 trunk.
+# Served from this container it accepts 0.71/0.62/0.63 of its k=3 drafts on prose, against
+# 0.49/0.50/0.44 from the QAT container, at the same step time.
+#
+# A linear may be kept at int8 on the same grid (gemm_nt_q w8a8), e.g.
+#     blk.*.attn_o.weight  rtn  codes=i8 group=128 scale=f16
+# Measured with attention + down_proj at int8: acceptance unchanged, decode 20 % slower.
+
+blk.*.attn_q.weight       rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.attn_k.weight       rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.attn_v.weight       rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.attn_o.weight       rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.ffn_down.weight     rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16 rule=search

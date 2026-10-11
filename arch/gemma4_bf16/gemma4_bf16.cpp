@@ -109,6 +109,15 @@ static int g4_schedule(const RadModelMeta* m, int64_t n, int64_t interval,
     return RAD_OK;
 }
 
+/* THE CHECKPOINT'S NAME FOR A LINEAR'S WEIGHT. Google's CT-INT4 release stores the codes as
+ * `X.weight_packed` (compressed-tensors, format pack-quantized); the bf16 release -- and every
+ * finetune of it, which ships no QAT form -- stores `X.weight`. Read once in declare from the
+ * checkpoint's own quantization_config, so a bf16 source converted with
+ * `--set quantization_config.quant_method=compressed-tensors` (which selects this plugin) maps its
+ * plain names, and the recipe then decides the grid. At serve time the container's declared names
+ * are used and this is not consulted. */
+static const char* g_wsfx = "weight_packed";
+
 /* The two attention classes share the residual stream and the FFN but differ in head geometry,
  * the value path and the RoPE. The main Geom (from geom_from) is the slider; the global class is
  * read from the container head and folded in here. */
@@ -190,8 +199,13 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
      * w4a16 one -- the container serves unchanged; only the op dtype and the activation producer
      * differ. */
     const RadEncPlane* sc = rad_enc_plane(&enc, "scale");
+    /* An 8-bit weight on the same grid -- i8 codes, an f16 scale per [1 x 128] -- is the same
+     * pair at twice the radix: gemm_nt_q at w8a8 reads the identical int8 activation + per-row
+     * scale the w4a8 GEMM reads, so the quantiser declaration is shared. It is how a recipe keeps
+     * a linear the int4 grid hurts (the attention, down_proj) closer to the checkpoint. */
+    const uint32_t cdt = known && enc.n_planes > 0 ? enc.plane[0].dtype : 0;
     const bool w4 = known && rad_enc_is(&enc, "affine") && enc.n_planes == 2 && !enc.transform[0] &&
-                    enc.plane[0].dtype == RAD_I4 && enc.plane[0].block[1] == 1 &&
+                    (cdt == RAD_I4 || cdt == RAD_I8) && enc.plane[0].block[1] == 1 &&
                     sc && sc->dtype == RAD_F16 && sc->block[0] == 1 && sc->block[1] == 128;
     if (w4) {
         if (N % 16 || K % 128) {
@@ -201,7 +215,7 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
             return RAD_E_INVAL;
         }
         const char* sn = nm.f("%s.scale", base);
-        w  = decl_view(b, wn, nullptr, "codes", RAD_I4, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+        w  = decl_view(b, wn, nullptr, "codes", cdt, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
         ws = decl_view(b, sn, wn, "scale", RAD_F16, { N, K / 128 }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
         if (!w || !ws) return RAD_E_INVAL;
         q8 = decl_b(b, nm.f("%s.q8", base), RAD_I8,  { g.max_tok, K });
@@ -227,7 +241,7 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
                 { a }, { q8, s8 });
         op = rw(b, RAD_OP(b, "gemm_nt_q",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
-                               RAD_INT("group", 128), RAD_STR("dtype", "w4a8")),
+                               RAD_INT("group", 128), RAD_STR("dtype", cdt == RAD_I8 ? "w8a8" : "w4a8")),
                     RAD_WEIGHTS(w, ws)),
                 { q8, s8 }, { y });
         quant = true;
@@ -236,7 +250,7 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
 
     char en[256];
     rad_enc_format(&enc, en, sizeof en);
-    fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16 or w4a8 -- "
+    fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16, w4a8 or w8a8 -- "
                     "neither matches\n", wn, en);
     return RAD_E_DTYPE;
 }
@@ -301,17 +315,17 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
 
     /* the GEMM weights: bf16 or w4a8, probed by G4Linear. */
     RAD_ARCH_TRY(ln_q.declare(b, nm, g, nm.f("blk.%d.attn_q", l),
-                              { nm.ckpt("%s.%lld.self_attn.q_proj.weight_packed", pre, (long long)l) },
+                              { nm.ckpt("%s.%lld.self_attn.q_proj.%s", pre, (long long)l, g_wsfx) },
                               qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q));
     RAD_ARCH_TRY(ln_k.declare(b, nm, g, nm.f("blk.%d.attn_k", l),
-                              { nm.ckpt("%s.%lld.self_attn.k_proj.weight_packed", pre, (long long)l) },
+                              { nm.ckpt("%s.%lld.self_attn.k_proj.%s", pre, (long long)l, g_wsfx) },
                               kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.k));
     if (cls.has_v)
         RAD_ARCH_TRY(ln_v.declare(b, nm, g, nm.f("blk.%d.attn_v", l),
-                                  { nm.ckpt("%s.%lld.self_attn.v_proj.weight_packed", pre, (long long)l) },
+                                  { nm.ckpt("%s.%lld.self_attn.v_proj.%s", pre, (long long)l, g_wsfx) },
                                   kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.v));
     RAD_ARCH_TRY(ln_o.declare(b, nm, g, nm.f("blk.%d.attn_o", l),
-                              { nm.ckpt("%s.%lld.self_attn.o_proj.weight_packed", pre, (long long)l) },
+                              { nm.ckpt("%s.%lld.self_attn.o_proj.%s", pre, (long long)l, g_wsfx) },
                               g.n_embd, qd, RAD_SHARD_COL, grp_layer(l), w.attn, w.h));
 
     /* input norm: x_hat * w over the residual stream. */
@@ -482,12 +496,12 @@ int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
 
     /* the GEMM weights: bf16 or w4a8, probed by G4Linear. gate_up is the gate|up fusion. */
     RAD_ARCH_TRY(ln_gu.declare(b, nm, g, nm.f("blk.%d.ffn_gate_up", l),
-                               { nm.ckpt("%s.%lld.mlp.gate_proj.weight_packed", pre, (long long)l),
-                                 nm.ckpt("%s.%lld.mlp.up_proj.weight_packed",   pre, (long long)l) },
+                               { nm.ckpt("%s.%lld.mlp.gate_proj.%s", pre, (long long)l, g_wsfx),
+                                 nm.ckpt("%s.%lld.mlp.up_proj.%s",   pre, (long long)l, g_wsfx) },
                                2 * g.n_ff, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.gu,
                                { g.n_ff, g.n_ff }));
     RAD_ARCH_TRY(ln_down.declare(b, nm, g, nm.f("blk.%d.ffn_down", l),
-                                 { nm.ckpt("%s.%lld.mlp.down_proj.weight_packed", pre, (long long)l) },
+                                 { nm.ckpt("%s.%lld.mlp.down_proj.%s", pre, (long long)l, g_wsfx) },
                                  g.n_embd, g.n_ff, RAD_SHARD_COL, grp_layer(l), w.ffn, w.h));
 
     op_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -1132,6 +1146,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     Geom&  g  = m.g;
     Names& nm = m.nm;
+    {
+        const char* fm = rad_meta_gets(meta, "quantization_config.format", "");
+        g_wsfx = (fm && std::strstr(fm, "pack-quantized")) ? "weight_packed" : "weight";
+    }
 
     /* ---- geometry RadModelMeta does not name. */
     const int64_t kv_g_all    = g4_i(meta, "num_global_key_value_heads", 0);
