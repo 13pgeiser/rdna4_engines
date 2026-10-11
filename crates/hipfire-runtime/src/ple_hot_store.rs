@@ -24,8 +24,9 @@
 //! ready, a prewarm reads the pack's data from its start (hottest tier
 //! first), then reads tier 0 a second time so its pages are promoted to the
 //! active list and outlive the colder ones when the cache is reclaimed.  It
-//! runs while no request is being served: every PLE fetch holds `busy`, and
-//! the prewarm resumes `BUSY_QUIET` after the last one.
+//! runs while no request is being served: every PLE fetch holds the row
+//! store's [`FetchActivity`] busy (bound by `RowStore::attach_hot_store`), and
+//! the prewarm resumes `FETCH_QUIET` after the last one.
 //!
 //! # Public API (exact signatures)
 //!
@@ -41,13 +42,17 @@
 //!                   encoding: RowEncoding, encoded_row_bytes: usize, shard_offsets: &[u64],
 //!                   model_file_bytes: u64)
 //!     -> Result<Arc<HotRowStore>, String>
+//! HotRowStore::open_table(path: &Path) -> Result<Arc<HotRowStore>, String>
+//!                                            // rank-ordered ple-table: serves at once
 //! HotRowStore::spawn_worker(self: &Arc<Self>, model_path: &Path, shard_offsets: Vec<u64>)
 //!     -> JoinHandle<()>                      // verify, then prewarm once a budget is set
+//! HotRowStore::spawn_table_worker(self: &Arc<Self>) -> JoinHandle<()>
+//!                                            // table: the same prewarm, no verification
 //! HotRowStore::{set_prewarm_budget(bytes: u64), stop(), is_serving() -> bool,
 //!               verified() -> Option<bool>, pack_offset(row: u64) -> Option<u64>,
 //!               read_pack(offset: u64, dst: &mut [u8]) -> Result<(), SourceError>,
 //!               tier_count(), kept_buckets(), data_bytes(), prewarmed_bytes(),
-//!               prewarm_complete(), hot_rows(), hot_pages(), hot_reads()}
+//!               prewarm_complete(), hot_rows(), hot_pages(), hot_reads(), row_width()}
 //! mem_available_bytes() -> Option<u64>
 //! ```
 //!
@@ -68,15 +73,16 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::external_rows::RowEncoding;
+use crate::external_rows::{FetchActivity, RowEncoding, FETCH_QUIET};
 use crate::model_source::SourceError;
-use crate::ple_hot_pack::read_ple_hot_pack_header;
+use crate::ple_hot_pack::{read_ple_hot_pack_header, PackKind, PackOrder};
 
 const MAGIC: &[u8; 8] = b"HFPLEHT1";
 const VERSION: u64 = 1;
@@ -93,10 +99,9 @@ const BLOCK_ROWS: usize = 512;
 /// One aligned O_DIRECT read of the pack writer.
 pub(crate) const READ_CHUNK: usize = 16 << 20;
 pub(crate) const READ_ALIGN: u64 = 4096;
-/// The prewarm resumes once no PLE fetch ran for this long: longer than the
-/// compute between two prefill chunks' fetches (~4 s for an 8192-row chunk on
-/// Halo), so the prewarm only reads while no request is being served.
-const BUSY_QUIET: Duration = Duration::from_secs(5);
+/// The prewarm resumes once no PLE fetch ran for this long
+/// ([`FETCH_QUIET`]), so it only reads while no request is being served.
+const BUSY_QUIET: Duration = FETCH_QUIET;
 /// Bytes per prewarm read.
 const PREWARM_CHUNK: usize = 8 << 20;
 /// Kept rows spot-checked against the model file before the store serves.
@@ -116,7 +121,7 @@ const STATE_FAILED: u8 = 2;
 
 const TAG: &str = "qwen4 ple hot store";
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
@@ -476,6 +481,59 @@ fn fadvise(file: &File, advice: libc::c_int) {
 // The store
 // ---------------------------------------------------------------------------
 
+/// The row -> tier index of a rank: bucket -> tier, per-tier row counts before
+/// every 512-row block, and the rows of each tier.
+struct TierIndex {
+    tier_count: usize,
+    tier_of: [u8; BUCKETS],
+    /// `prefix[t][block]` = rows of tier `t` in rows `[0, block * BLOCK_ROWS)`.
+    prefix: Vec<Vec<u32>>,
+    tier_rows: Vec<u64>,
+}
+
+/// Index `buckets` for tiers of `group` buckets over buckets `0..kept`.
+fn build_tier_index(buckets: &[u8], group: usize, kept: usize) -> TierIndex {
+    let tier_count = kept.div_ceil(group);
+    let mut tier_of = [NO_TIER; BUCKETS];
+    for (bucket, slot) in tier_of.iter_mut().enumerate().take(kept) {
+        *slot = (bucket / group) as u8;
+    }
+    let blocks = buckets.len().div_ceil(BLOCK_ROWS);
+    let mut prefix: Vec<Vec<u32>> = (0..tier_count)
+        .map(|_| Vec::with_capacity(blocks))
+        .collect();
+    let mut counts = [0u32; BUCKETS];
+    for block in buckets.chunks(BLOCK_ROWS) {
+        for (tier, column) in prefix.iter_mut().enumerate() {
+            column.push(counts[tier]);
+        }
+        for &b in block {
+            counts[usize::from(tier_of[usize::from(b)])] += 1;
+        }
+    }
+    let tier_rows = counts[..tier_count].iter().map(|&n| u64::from(n)).collect();
+    TierIndex {
+        tier_count,
+        tier_of,
+        prefix,
+        tier_rows,
+    }
+}
+
+/// Absolute file offset of each tier's first row: tiers follow each other from
+/// `data_offset`, `tier_rows[t] * row_bytes` bytes each.
+fn tier_bases(data_offset: u64, tier_rows: &[u64], row_bytes: u64) -> Vec<u64> {
+    let mut base = data_offset;
+    tier_rows
+        .iter()
+        .map(|&rows| {
+            let at = base;
+            base += rows * row_bytes;
+            at
+        })
+        .collect()
+}
+
 /// The hot rows of the PLE table: where each kept row sits in the hot-row
 /// pack, and the open pack.
 ///
@@ -488,6 +546,8 @@ fn fadvise(file: &File, advice: libc::c_int) {
 pub struct HotRowStore {
     padded_rows: u64,
     rows_per_shard: usize,
+    /// Values per row.
+    row_width: usize,
     encoding: RowEncoding,
     encoded_row_bytes: usize,
     /// Buckets per tier.
@@ -519,26 +579,8 @@ pub struct HotRowStore {
     prewarm_done: AtomicBool,
     /// Bytes of tier 0 re-read by the prewarm's second phase.
     retouched: AtomicU64,
-    /// Time base of `busy_at_ms`.
-    created: Instant,
-    /// Milliseconds after `created` (plus one; 0 = never) at which the last
-    /// PLE fetch finished (see [`HotRowStore::busy`]).
-    busy_at_ms: AtomicU64,
-    /// PLE fetches in flight.
-    busy_active: AtomicUsize,
-}
-
-/// A PLE fetch in flight (from [`HotRowStore::busy`]); the prewarm stays
-/// paused until [`BUSY_QUIET`] after the last guard drops.
-pub(crate) struct BusyGuard<'a>(&'a HotRowStore);
-
-impl Drop for BusyGuard<'_> {
-    fn drop(&mut self) {
-        let store = self.0;
-        let at = store.created.elapsed().as_millis() as u64 + 1;
-        store.busy_at_ms.fetch_max(at, Ordering::AcqRel);
-        store.busy_active.fetch_sub(1, Ordering::AcqRel);
-    }
+    /// The row store's fetch activity (see [`HotRowStore::bind_activity`]).
+    activity: OnceLock<std::sync::Arc<FetchActivity>>,
 }
 
 impl HotRowStore {
@@ -558,6 +600,12 @@ impl HotRowStore {
     ) -> Result<std::sync::Arc<HotRowStore>, String> {
         let fail = |what: String| format!("ple hot pack {}: {what}", pack_path.display());
         let header = read_ple_hot_pack_header(pack_path)?;
+        if header.kind != PackKind::HotPack {
+            return Err(fail(
+                "is a PLE row table, not a hot pack (open it with HotRowStore::open_table)"
+                    .to_string(),
+            ));
+        }
         let PleHotRank {
             header: rank_header,
             padded_rows,
@@ -624,36 +672,21 @@ impl HotRowStore {
 
         let group = header.tier_group;
         let kept = header.kept_buckets;
-        let tier_count = kept.div_ceil(group);
-        let mut tier_of = [NO_TIER; BUCKETS];
-        for (bucket, slot) in tier_of.iter_mut().enumerate().take(kept) {
-            *slot = (bucket / group) as u8;
-        }
-        let blocks = (padded_rows as usize).div_ceil(BLOCK_ROWS);
-        let mut prefix: Vec<Vec<u32>> = (0..tier_count)
-            .map(|_| Vec::with_capacity(blocks))
-            .collect();
-        let mut counts = [0u32; BUCKETS];
-        for block in buckets.chunks(BLOCK_ROWS) {
-            for (tier, column) in prefix.iter_mut().enumerate() {
-                column.push(counts[tier]);
-            }
-            for &b in block {
-                counts[usize::from(tier_of[usize::from(b)])] += 1;
-            }
-        }
-        let tier_rows: Vec<u64> = counts[..tier_count].iter().map(|&n| u64::from(n)).collect();
-        if tier_rows != header.tier_rows {
+        let index = build_tier_index(&buckets, group, kept);
+        if index.tier_rows != header.tier_rows {
             return Err(fail(
                 "per-tier row counts differ from the sidecar's".to_string(),
             ));
         }
-        let mut tier_base = Vec::with_capacity(tier_count);
-        let mut base = header.data_offset;
-        for &rows in &tier_rows {
-            tier_base.push(base);
-            base += rows * encoded_row_bytes as u64;
-        }
+        let TierIndex {
+            tier_count,
+            tier_of,
+            prefix,
+            tier_rows,
+        } = index;
+        let tier_base = tier_bases(header.data_offset, &tier_rows, encoded_row_bytes as u64);
+        let row_width = usize::try_from(header.row_width)
+            .map_err(|_| fail(format!("row_width {} overflows", header.row_width)))?;
         let pack = File::open(pack_path).map_err(|e| fail(format!("open: {e}")))?;
         fadvise(&pack, libc::POSIX_FADV_RANDOM);
         let index_bytes =
@@ -667,6 +700,7 @@ impl HotRowStore {
         );
         Ok(std::sync::Arc::new(HotRowStore {
             padded_rows,
+            row_width,
             rows_per_shard,
             encoding,
             encoded_row_bytes,
@@ -691,10 +725,112 @@ impl HotRowStore {
             prewarmed: AtomicU64::new(0),
             prewarm_done: AtomicBool::new(false),
             retouched: AtomicU64::new(0),
-            created: Instant::now(),
-            busy_at_ms: AtomicU64::new(0),
-            busy_active: AtomicUsize::new(0),
+            activity: OnceLock::new(),
         }))
+    }
+
+    /// Open a rank-ordered PLE table (a `ple-table` of `order rank`, the
+    /// `<model>.ple-q4` derived with a rank): every row of the PLE table in
+    /// tier order, with the rank embedded.  Reads the header and the rank
+    /// (its sha256 must be the header's `rank_payload_sha256`), builds the same
+    /// row -> pack-offset index as [`HotRowStore::open`], and **serves at
+    /// once**: there is no model file to spot-check against, and the table's
+    /// own digests are the sidecar loader's business.  Every row has a pack
+    /// offset.  Errs on a hot pack or a row-ordered table, and on a rank that
+    /// is not the table's.
+    pub fn open_table(path: &Path) -> Result<std::sync::Arc<HotRowStore>, String> {
+        let fail = |what: String| format!("ple table {}: {what}", path.display());
+        let header = read_ple_hot_pack_header(path)?;
+        if header.kind != PackKind::PleTable {
+            return Err(fail(
+                "is a hot pack, not a PLE table (open it with HotRowStore::open)".to_string(),
+            ));
+        }
+        if header.order != PackOrder::Rank {
+            return Err(fail(
+                "is row-ordered: read it through the row store's shard descriptors".to_string(),
+            ));
+        }
+        let padded_rows = header.padded_rows;
+        if padded_rows > u64::from(u32::MAX) {
+            return Err(fail(format!("{padded_rows} rows exceed the index range")));
+        }
+        let to_usize = |name: &str, value: u64| {
+            usize::try_from(value).map_err(|_| fail(format!("`{name}` {value} overflows")))
+        };
+        let rows_per_shard = to_usize("rows_per_shard", header.rows_per_shard)?;
+        let row_width = to_usize("row_width", header.row_width)?;
+        let encoded_row_bytes = to_usize("encoded_row_bytes", header.encoded_row_bytes)?;
+        let pack = File::open(path).map_err(|e| fail(format!("open: {e}")))?;
+        let mut buckets = vec![0u8; to_usize("padded_rows", padded_rows)?];
+        read_exact_at(&pack, header.rank_offset, &mut buckets)
+            .map_err(|e| fail(format!("reading the embedded rank: {e}")))?;
+        let actual = hex(&Sha256::digest(&buckets));
+        if actual != header.rank_payload_sha256 {
+            return Err(fail(format!(
+                "embedded rank sha256 {actual} != header {}",
+                header.rank_payload_sha256
+            )));
+        }
+        let group = header.tier_group;
+        let kept = header.kept_buckets;
+        let index = build_tier_index(&buckets, group, kept);
+        if index.tier_rows != header.tier_rows {
+            return Err(fail(
+                "per-tier row counts differ from the embedded rank's".to_string(),
+            ));
+        }
+        let TierIndex {
+            tier_count,
+            tier_of,
+            prefix,
+            tier_rows,
+        } = index;
+        let tier_base = tier_bases(header.data_offset, &tier_rows, encoded_row_bytes as u64);
+        fadvise(&pack, libc::POSIX_FADV_RANDOM);
+        let index_bytes =
+            buckets.len() as u64 + prefix.iter().map(|c| c.len() as u64 * 4).sum::<u64>();
+        eprintln!(
+            "{TAG}: table {}: {} rows in {tier_count} tiers ({:.2} GiB, index {:.0} MiB); serving",
+            path.display(),
+            padded_rows,
+            gib(header.data_bytes),
+            mib(index_bytes),
+        );
+        Ok(std::sync::Arc::new(HotRowStore {
+            padded_rows,
+            row_width,
+            rows_per_shard,
+            encoding: header.row_encoding,
+            encoded_row_bytes,
+            group,
+            kept,
+            tier_count,
+            tier_of,
+            bucket: buckets.into_boxed_slice(),
+            prefix: prefix.into_iter().map(Vec::into_boxed_slice).collect(),
+            tier_base,
+            pack,
+            pack_path: path.to_path_buf(),
+            data_offset: header.data_offset,
+            data_bytes: header.data_bytes,
+            expected_sha: header.rank_payload_sha256,
+            state: AtomicU8::new(STATE_SERVING),
+            stop: AtomicBool::new(false),
+            hot_rows: AtomicU64::new(0),
+            hot_pages: AtomicU64::new(0),
+            hot_reads: AtomicU64::new(0),
+            prewarm_budget: AtomicU64::new(BUDGET_UNSET),
+            prewarmed: AtomicU64::new(0),
+            prewarm_done: AtomicBool::new(false),
+            retouched: AtomicU64::new(0),
+            activity: OnceLock::new(),
+        }))
+    }
+
+    /// Values per row (the row store's `row_width`).
+    pub fn row_width(&self) -> usize {
+        self.row_width
     }
 
     /// Tiers in the pack.
@@ -780,37 +916,30 @@ impl HotRowStore {
         self.hot_reads.fetch_add(reads, Ordering::Relaxed);
     }
 
-    /// The row store is serving a PLE fetch (a prefill chunk or a decode
-    /// step).  The prewarm pauses while the returned guard lives and for
-    /// [`BUSY_QUIET`] after the last one drops, so it never competes with a
-    /// request for the SSD.
-    pub(crate) fn busy(&self) -> BusyGuard<'_> {
-        self.busy_active.fetch_add(1, Ordering::AcqRel);
-        BusyGuard(self)
+    /// Use `activity` (the row store's [`FetchActivity`]) to pause the
+    /// prewarm: it waits while a PLE fetch (a prefill chunk or a decode step)
+    /// is in flight and for [`BUSY_QUIET`] after the last one, so it never
+    /// competes with a request for the SSD.  Binding the same activity again
+    /// is a no-op; another one errs.  Until bound, nothing pauses the
+    /// prewarm.
+    pub(crate) fn bind_activity(
+        &self,
+        activity: std::sync::Arc<FetchActivity>,
+    ) -> Result<(), String> {
+        let bound = self.activity.get_or_init(|| activity.clone());
+        if std::sync::Arc::ptr_eq(bound, &activity) {
+            Ok(())
+        } else {
+            Err("the hot store is already bound to another row store".to_string())
+        }
     }
 
     /// Sleep while a PLE fetch is in flight or finished less than
     /// [`BUSY_QUIET`] ago; `false` when the store was stopped meanwhile.
     fn wait_until_idle(&self) -> bool {
-        loop {
-            if self.stopped() {
-                return false;
-            }
-            if self.busy_active.load(Ordering::Acquire) > 0 {
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
-            }
-            let last = self.busy_at_ms.load(Ordering::Acquire);
-            if last == 0 {
-                return true;
-            }
-            let since = Duration::from_millis(
-                (self.created.elapsed().as_millis() as u64 + 1).saturating_sub(last),
-            );
-            if since >= BUSY_QUIET {
-                return true;
-            }
-            std::thread::sleep((BUSY_QUIET - since).min(Duration::from_millis(20)));
+        match self.activity.get() {
+            Some(activity) => activity.wait_idle(BUSY_QUIET, &self.stop),
+            None => !self.stopped(),
         }
     }
 
@@ -911,16 +1040,41 @@ impl HotRowStore {
                 return;
             }
         }
-        let budget = loop {
+        let Some(budget) = self.wait_for_budget() else {
+            return;
+        };
+        self.prewarm(budget);
+    }
+
+    /// Start the worker of a table store ([`HotRowStore::open_table`]): it
+    /// verifies nothing (the table serves from the start) and, once
+    /// [`HotRowStore::set_prewarm_budget`] was called, runs the same prewarm
+    /// as [`HotRowStore::spawn_worker`] over the table's tiers.  Call
+    /// [`HotRowStore::stop`] then join it before unloading the row store.
+    pub fn spawn_table_worker(self: &std::sync::Arc<Self>) -> JoinHandle<()> {
+        let store = self.clone();
+        std::thread::Builder::new()
+            .name("ple-table".to_string())
+            .spawn(move || {
+                if let Some(budget) = store.wait_for_budget() {
+                    store.prewarm(budget);
+                }
+            })
+            .expect("spawn ple table thread")
+    }
+
+    /// Sleep until a prewarm budget is set; `None` when the store was stopped
+    /// first.
+    fn wait_for_budget(&self) -> Option<u64> {
+        loop {
             if self.stopped() {
-                return;
+                return None;
             }
             match self.prewarm_budget.load(Ordering::Acquire) {
                 BUDGET_UNSET => std::thread::sleep(Duration::from_millis(50)),
-                budget => break budget,
+                budget => return Some(budget),
             }
-        };
-        self.prewarm(budget);
+        }
     }
 
     /// Sidecar payload hash, then [`VERIFY_SAMPLES`] kept rows compared byte
@@ -1456,9 +1610,12 @@ mod tests {
         let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 200, 5, 8);
         let store = &fixture.store;
         let tier0 = store.tier_base[1] - store.data_offset;
+        // The row store's activity, as `RowStore::attach_hot_store` binds it.
+        let activity = std::sync::Arc::new(FetchActivity::new());
+        store.bind_activity(activity.clone()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(store.prewarmed_bytes(), 0, "no budget, no prewarm");
-        let guard = store.busy();
+        let guard = activity.busy();
         let budget = store.data_bytes() / 2;
         assert!(budget > tier0, "the budget spans tier 0 and more");
         store.set_prewarm_budget(budget);
@@ -1521,6 +1678,21 @@ mod tests {
         );
     }
 
+    /// An activity binds once; rebinding the same one is fine.
+    #[test]
+    fn bind_activity_accepts_one_activity() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 32, 4, 2);
+        let store = &fixture.store;
+        let first = std::sync::Arc::new(FetchActivity::new());
+        store.bind_activity(first.clone()).unwrap();
+        store.bind_activity(first).unwrap();
+        let err = store
+            .bind_activity(std::sync::Arc::new(FetchActivity::new()))
+            .unwrap_err();
+        assert!(err.contains("another row store"), "{err}");
+    }
+
     /// `stop` ends a worker that is still waiting for its budget.
     #[test]
     fn stop_ends_the_worker() {
@@ -1529,6 +1701,181 @@ mod tests {
         fixture.store.stop();
         fixture.worker.take().unwrap().join().unwrap();
         assert!(!fixture.store.prewarm_complete());
+    }
+
+    // ---- rank-ordered PLE table store --------------------------------------
+
+    use crate::ple_hot_pack::table_support::write_test_table;
+    use crate::ple_hot_pack::{read_ple_hot_pack_header, PackOrder};
+
+    /// 90-byte (Q4LM-sized) rows cut from the 170-byte synthetic ones.
+    fn q4_sized_shards(shards: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .chunks_exact(ENCODED_ROW_BYTES)
+                    .flat_map(|row| row[..90].iter().copied())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn table_shards(encoding: RowEncoding) -> Vec<Vec<u8>> {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        match encoding {
+            RowEncoding::Q4Lm => q4_sized_shards(&shards),
+            _ => shards,
+        }
+    }
+
+    fn write_table(
+        dir: &Path,
+        order: PackOrder,
+        encoding: RowEncoding,
+        shards: &[Vec<u8>],
+    ) -> PathBuf {
+        let path = dir.join(format!(
+            "{}-{}.ple-table",
+            order.name(),
+            encoding.dtype_name()
+        ));
+        let buckets = synthetic_buckets(ROWS, 31);
+        write_test_table(
+            &path,
+            order,
+            encoding,
+            TEST_ROW_WIDTH,
+            ROWS_PER_SHARD,
+            shards,
+            (order == PackOrder::Rank).then_some(buckets.as_slice()),
+            DEFAULT_TIER_BUCKETS,
+        );
+        path
+    }
+
+    /// A table store serves at once, holds every row at a pack offset, and the
+    /// bytes at that offset are the natural-order row's.
+    #[test]
+    fn table_store_serves_every_row_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        for encoding in [RowEncoding::Q8F16, RowEncoding::Q4Lm] {
+            let shards = table_shards(encoding);
+            let row_bytes = shards[0].len() / ROWS_PER_SHARD;
+            let path = write_table(dir.path(), PackOrder::Rank, encoding, &shards);
+            let store = HotRowStore::open_table(&path).unwrap();
+            assert!(store.is_serving(), "serves before any worker ran");
+            assert_eq!(store.verified(), Some(true));
+            assert_eq!(store.padded_rows(), ROWS as u64);
+            assert_eq!(store.rows_per_shard(), ROWS_PER_SHARD);
+            assert_eq!(store.row_width(), TEST_ROW_WIDTH);
+            assert_eq!(store.encoding(), encoding);
+            assert_eq!(store.encoded_row_bytes(), row_bytes);
+            assert_eq!(store.kept_buckets(), BUCKETS);
+            assert_eq!(store.tier_count(), BUCKETS.div_ceil(DEFAULT_TIER_BUCKETS));
+            assert_eq!(store.data_bytes(), (ROWS * row_bytes) as u64);
+            let mut bytes = vec![0u8; row_bytes];
+            for row in 0..ROWS as u64 {
+                let offset = store.pack_offset(row).expect("every row is in a table");
+                store.read_pack(offset, &mut bytes).unwrap();
+                let shard = row as usize / ROWS_PER_SHARD;
+                let local = row as usize % ROWS_PER_SHARD;
+                assert_eq!(
+                    bytes,
+                    shards[shard][local * row_bytes..(local + 1) * row_bytes],
+                    "{encoding:?} row {row}"
+                );
+            }
+            assert_eq!(store.pack_offset(ROWS as u64), None);
+        }
+    }
+
+    /// A table is never taken for a hot pack and vice versa; a row-ordered
+    /// table has no rank to index; a rank that is not the table's is refused.
+    #[test]
+    fn table_and_hot_pack_openers_refuse_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let shards = table_shards(RowEncoding::Q8F16);
+        let table = write_table(dir.path(), PackOrder::Rank, RowEncoding::Q8F16, &shards);
+
+        let rank = PleHotRank::from_buckets(ROWS as u64, FINGERPRINT, synthetic_buckets(ROWS, 31));
+        let err = HotRowStore::open(
+            rank,
+            &table,
+            ROWS_PER_SHARD,
+            RowEncoding::Q8F16,
+            ENCODED_ROW_BYTES,
+            &[0u64; SHARDS],
+            0,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("PLE row table"), "{err}");
+
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 100, 5, 8);
+        let err = HotRowStore::open_table(&fixture.pack_path).err().unwrap();
+        assert!(err.contains("hot pack"), "{err}");
+
+        let row_ordered = write_table(dir.path(), PackOrder::Row, RowEncoding::Q8F16, &shards);
+        let err = HotRowStore::open_table(&row_ordered).err().unwrap();
+        assert!(err.contains("row-ordered"), "{err}");
+
+        let header = read_ple_hot_pack_header(&table).unwrap();
+        let mut bytes = std::fs::read(&table).unwrap();
+        bytes[header.rank_offset as usize + 3] ^= 0x55;
+        let tampered = dir.path().join("tampered.ple-table");
+        std::fs::write(&tampered, bytes).unwrap();
+        let err = HotRowStore::open_table(&tampered).err().unwrap();
+        assert!(err.contains("embedded rank sha256"), "{err}");
+
+        assert!(HotRowStore::open_table(&dir.path().join("absent")).is_err());
+    }
+
+    /// The table worker runs the shared prewarm: nothing before a budget, then
+    /// exactly the budget (capped at the data size); `stop` ends a worker that
+    /// is still waiting.
+    #[test]
+    fn table_worker_prewarms_under_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let shards = table_shards(RowEncoding::Q4Lm);
+        let path = write_table(dir.path(), PackOrder::Rank, RowEncoding::Q4Lm, &shards);
+
+        let store = HotRowStore::open_table(&path).unwrap();
+        let worker = store.spawn_table_worker();
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(store.prewarmed_bytes(), 0, "no budget, no prewarm");
+        assert!(!store.prewarm_complete());
+        let budget = store.data_bytes() / 2;
+        store.set_prewarm_budget(budget);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !store.prewarm_complete() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(store.prewarm_complete());
+        assert_eq!(store.prewarmed_bytes(), budget);
+        store.stop();
+        worker.join().unwrap();
+        assert!(
+            store.is_serving(),
+            "the worker never changes the serving state"
+        );
+
+        let capped = HotRowStore::open_table(&path).unwrap();
+        let worker = capped.spawn_table_worker();
+        capped.set_prewarm_budget(u64::MAX - 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !capped.prewarm_complete() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(capped.prewarmed_bytes(), capped.data_bytes());
+        capped.stop();
+        worker.join().unwrap();
+
+        let waiting = HotRowStore::open_table(&path).unwrap();
+        let worker = waiting.spawn_table_worker();
+        waiting.stop();
+        worker.join().unwrap();
+        assert!(!waiting.prewarm_complete());
     }
 
     #[test]

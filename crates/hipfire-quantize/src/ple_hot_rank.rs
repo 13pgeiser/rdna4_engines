@@ -15,7 +15,7 @@
 //! padded_rows` is written per row.
 
 use clap::Parser;
-use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory};
+use hipfire_arch_qwen4::{PleHashMetadata, PleHistory, Qwen4Config};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::ple_hot_store::write_ple_hot_rank;
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message};
@@ -109,14 +109,27 @@ fn run_inner(args: &HotRankArgs) -> Result<Value, String> {
     let window = usize::try_from(args.window).map_err(|_| "--window too large".to_string())?;
     let hfq = HfqFile::open(&args.model)
         .map_err(|e| format!("open model {}: {e}", args.model.display()))?;
-    let receipt =
-        admit_hfqm_artifact(&hfq).map_err(|e| format!("admit {}: {e}", args.model.display()))?;
-    let meta = &receipt.ple;
-    let eos = receipt.config.eos_token_id;
+    // The rank needs only the model's PLE hash metadata, its EOS id and its
+    // tokenizer/template, all in the base's metadata JSON: reading them
+    // directly (rather than through full artifact admission) makes the tool
+    // work on a split base, whose PLE rows live in a sidecar it never reads.
+    let meta = &PleHashMetadata::from_json(&hfq.metadata_json)
+        .map_err(|e| format!("PLE metadata of {}: {e}", args.model.display()))?;
+    if *meta != PleHashMetadata::qwen4() {
+        return Err(format!(
+            "{}: PLE metadata does not match the pinned Qwen4 contract",
+            args.model.display()
+        ));
+    }
+    let eos = Qwen4Config::from_metadata_json(&hfq.metadata_json)
+        .map_err(|e| format!("config of {}: {e}", args.model.display()))?
+        .eos_token_id;
     let padded_rows = meta.padded_rows();
     let padded = usize::try_from(padded_rows).map_err(|_| "padded_rows overflow".to_string())?;
     if padded_rows > u64::from(u32::MAX) {
-        return Err(format!("padded_rows {padded_rows} exceeds the u32 row index range"));
+        return Err(format!(
+            "padded_rows {padded_rows} exceeds the u32 row index range"
+        ));
     }
     let threads = args
         .threads
@@ -138,16 +151,33 @@ fn run_inner(args: &HotRankArgs) -> Result<Value, String> {
         let template = hfq
             .chat_template()
             .ok_or_else(|| "model has no embedded chat template".to_string())?;
-        count_corpus(&args.corpus, threads, window, meta, eos, &tokenizer, &template, padded, t0)?
+        count_corpus(
+            &args.corpus,
+            threads,
+            window,
+            meta,
+            eos,
+            &tokenizer,
+            &template,
+            padded,
+            t0,
+        )?
     };
 
     // Score = u64 sum of corpus counts and every --counts-in file.
-    let mut scores: Vec<u64> = counts.iter().map(|c| u64::from(c.load(Ordering::Relaxed))).collect();
+    let mut scores: Vec<u64> = counts
+        .iter()
+        .map(|c| u64::from(c.load(Ordering::Relaxed)))
+        .collect();
     drop(counts);
     scores.resize(padded, 0);
     for path in &args.counts_in {
         add_counts_file(path, &mut scores)?;
-        eprintln!("[{:.0}s] counts-in {}", t0.elapsed().as_secs_f64(), path.display());
+        eprintln!(
+            "[{:.0}s] counts-in {}",
+            t0.elapsed().as_secs_f64(),
+            path.display()
+        );
     }
 
     let buckets = assign_buckets(&scores);
@@ -208,7 +238,8 @@ fn count_corpus(
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 s.spawn(|| -> Result<Vec<SourceStat>, String> {
-                    let mut seen: Vec<u64> = Vec::with_capacity(window.saturating_mul(16).min(1 << 24));
+                    let mut seen: Vec<u64> =
+                        Vec::with_capacity(window.saturating_mul(16).min(1 << 24));
                     let mut stats = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -233,7 +264,10 @@ fn count_corpus(
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err("counting thread panicked".to_string())))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("counting thread panicked".to_string()))
+            })
             .collect()
     });
     let mut sources = Vec::new();
@@ -258,7 +292,13 @@ fn count_file(
 ) -> Result<SourceStat, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let reader = std::io::BufReader::with_capacity(1 << 20, file);
-    let mut stat = SourceStat { path: path.to_path_buf(), documents: 0, tokens: 0, windows: 0, bad: 0 };
+    let mut stat = SourceStat {
+        path: path.to_path_buf(),
+        documents: 0,
+        tokens: 0,
+        windows: 0,
+        bad: 0,
+    };
     for line in reader.lines() {
         let line = line.map_err(|e| format!("read {}: {e}", path.display()))?;
         if line.trim().is_empty() {
@@ -332,7 +372,10 @@ fn count_document(
 /// `scores.len()` entries.
 fn add_counts_file(path: &Path, scores: &mut [u64]) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let len = file.metadata().map_err(|e| format!("stat {}: {e}", path.display()))?.len();
+    let len = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
     let expected = scores.len() as u64 * 4;
     if len != expected {
         return Err(format!(
@@ -345,7 +388,9 @@ fn add_counts_file(path: &Path, scores: &mut [u64]) -> Result<(), String> {
     let mut buf = vec![0u8; 1 << 20];
     for chunk in scores.chunks_mut(buf.len() / 4) {
         let bytes = &mut buf[..chunk.len() * 4];
-        reader.read_exact(bytes).map_err(|e| format!("read {}: {e}", path.display()))?;
+        reader
+            .read_exact(bytes)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
         for (score, c) in chunk.iter_mut().zip(bytes.as_chunks::<4>().0) {
             *score += u64::from(u32::from_le_bytes(*c));
         }
@@ -359,9 +404,8 @@ fn assign_buckets(scores: &[u64]) -> Vec<u8> {
     let rows = scores.len();
     assert!(rows as u64 <= u64::from(u32::MAX), "row index must fit u32");
     let mut order: Vec<u32> = (0..rows as u32).collect();
-    order.par_sort_unstable_by(|&a, &b| {
-        scores[b as usize].cmp(&scores[a as usize]).then(a.cmp(&b))
-    });
+    order
+        .par_sort_unstable_by(|&a, &b| scores[b as usize].cmp(&scores[a as usize]).then(a.cmp(&b)));
     let mut buckets = vec![0u8; rows];
     for (rank, &row) in order.iter().enumerate() {
         buckets[row as usize] = (rank as u64 * BUCKETS / rows as u64) as u8;
@@ -371,10 +415,12 @@ fn assign_buckets(scores: &[u64]) -> Vec<u8> {
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 #[cfg(test)]

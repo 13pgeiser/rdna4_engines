@@ -33,6 +33,9 @@ pub enum SourceFormat {
     Hfq,
     /// A HuggingFace safetensors shard set.
     Safetensors,
+    /// A Flash-Next PLE row sidecar (`HFPLERW1` container, `<model>.ple-q4` /
+    /// `<model>.ple-q8`): one file whose manifest is the PLE shard row ranges.
+    PleRows,
 }
 
 /// File identity captured when a source is opened.

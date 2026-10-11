@@ -748,6 +748,8 @@ Two checks exist; only one is gated:
 | `memory.prompt_cache_unbounded` | `false` | Remove the capacity bound. Env: `HIPFIRE_PROMPT_CACHE_UNBOUNDED`. |
 | `memory.session_cache_bytes` | `8589934592` | int 0–1 TiB; byte budget (a ceiling, not a reservation) of the Qwen4 engine-owned session cache (cold-exact prefill snapshots shared across sessions, plus live continuation of the previous turn; `0` = off, cold prefill every turn). Snapshots take free device memory only while the context does not need it: they are skipped or evicted before VMM context growth would run short. Env: `HIPFIRE_SESSION_CACHE_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_hot_store_bytes` | `0` | `auto` or int 0–1 TiB; prewarm budget of the Qwen4 PLE hot-row store. The most frequently used rows of the per-layer-embedding table, ranked by the `<model>.plehot` sidecar (`hipfire-quantize ple-hot-rank`), are copied verbatim from the model file into the `<model>.plehotrows` hot-row pack (`hipfire-quantize ple-hot-pack`), grouped by rank. Rows the pack holds are read from it through the page cache and decoded by the same row decoder, so output is byte-identical to the model-file path. After load the first N bytes of the pack are read into the page cache (hottest tier first, then tier 0 once more so its pages are promoted to the active list) while no request runs: `auto` = `MemAvailable` minus 4 GiB at ready, an explicit N is that many bytes, both capped at the pack. The pack is clean page cache: the kernel drops it under memory pressure instead of swapping. Off by default (`0`); unified-memory GPUs only. Env: `HIPFIRE_PLE_HOT_STORE_BYTES`, paths `HIPFIRE_PLE_HOT_RANK_FILE` / `HIPFIRE_PLE_HOT_PACK_FILE` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (embedded in the monolithic `qwen3.8:flash-next-mq4-xts`, or the `<model>.ple-q8` sidecar of a split base); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, derived from the Q8 rows on first load when missing (about 1 minute, progress on stderr; `hipfire ple derive --format q4 <model>` does it ahead of time). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` = 15 GiB (the hottest rows, where the value per GB of warm rows is highest), capped at `MemAvailable` minus 8 GiB at ready and at the table; `0` = off (kill switch); an explicit N is that many bytes. The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
 
 Qwen AR and DFlash multi-turn reuse store each completed assistant turn as the
 **verbatim generated token span** (whole envelope: full body tokens, plus
@@ -769,6 +771,58 @@ think cap) mid-window, **RepairForTerminal** restores the pre-window recurrent
 state and replays only the consumed prefix so the prompt/prefix cache stays
 warm. The next turn prefills only the new suffix instead of a full cold
 prefill (the previous fail-closed path reset and invalidated the cache).
+
+### Qwen4 PLE row tables
+
+The Flash-Next (Qwen4) per-layer-embedding (PLE) n-gram table is 128 shard
+tensors of `[2,500,012, 160]` Q8F16 rows (54.4 GB). A load can read it from
+two interchangeable row files, chosen by `memory.ple_format`:
+
+- **`<model>.ple-q8`** — the exact Q8F16 rows.
+- **`<model>.ple-q4`** — 4-bit Lloyd-Max rows (28.8 GB) derived from the Q8
+  rows. Each 32-weight block is an f16 scale plus 16 bytes of 4-bit labels;
+  the decoded row equals the tested q4 table bit for bit.
+
+`memory.ple_format` (env `HIPFIRE_PLE_FORMAT`):
+
+- `auto` (default) — q4 on gfx1151 (the unified-memory Strix Halo), q8
+  elsewhere. `auto` never derives and never downloads: when the preferred
+  file is absent it uses the other available format and prints a note on
+  stderr naming how to get the preferred one.
+- `q4` — always 4-bit rows. If `<model>.ple-q4` is missing it is derived from
+  the local Q8 rows on first load (about 1 minute, progress on stderr).
+  `hipfire ple derive --format q4 <model>` does the same ahead of time.
+- `q8` — always exact rows (the kill switch for the q4 default on gfx1151). A split base needs `<model>.ple-q8`
+  (`hipfire pull <tag> --ple q8`; `hipfire serve` downloads it on demand for
+  registry models); a missing file is refused with that hint, never
+  substituted.
+
+The monolithic `qwen3.8:flash-next-mq4-xts` artifact keeps its PLE rows
+embedded: with `q8` (or `auto` off gfx1151) the embedded Q8 rows are read
+exactly as before; `q4` adds `<model>.ple-q4` next to it.
+
+**Split layout.** `hipfire ple split <model>` rewrites a monolithic model as
+`<model-stem>-base.<ext>` (everything except the 128 PLE shards, about
+70.9 GB, with a `hipfire_ple_rows` marker in its metadata) plus
+`<model-stem>-base.<ext>.ple-q8` (the exact Q8 rows), e.g.
+`qwen3.8-flash-next.mq4-xts` becomes `qwen3.8-flash-next-base.mq4-xts` and
+`qwen3.8-flash-next-base.mq4-xts.ple-q8`. A sidecar is bound to its base
+file: its header records the sha256 of the base's file header and tensor
+index (the bytes before the data section) and the base's file size, and a
+load refuses a sidecar whose binding does not match the base it sits next
+to (delete it and re-derive, or re-pull). A `.ple-q4` derived from a base
+is bound to that base the same way. A split base cannot load without the
+sidecar for the selected format.
+
+`memory.ple_hot_store_bytes` (above) also applies to the sidecars: the
+hot-row pack is cut from, and verified against, the rows file in use.
+With the q4 sidecar and no hot-row pack attached, the sidecar's data is
+read sequentially into the page cache after the model is ready, while no
+request runs; `memory.ple_prewarm_bytes` (env `HIPFIRE_PLE_PREWARM_BYTES`)
+sets the budget: `auto` (default) = `MemAvailable` minus 4 GiB at ready,
+capped at the sidecar's data bytes, `0` = off, an integer = that many
+bytes. The pages are ordinary clean page cache, dropped (never swapped)
+under memory pressure and not charged in admission.
 
 ---
 
@@ -850,6 +904,8 @@ uses ambient variables in engine hot paths.
 | `prompt_cache_unbounded` | `memory.prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | false |
 | `session_cache_bytes` | `memory.session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | 8589934592 (8 GiB; `0` off) |
 | `ple_hot_store_bytes` | `memory.ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | 0 (off; `auto` = prewarm `MemAvailable` − 4 GiB of the hot-row pack) |
+| `ple_format` | `memory.ple_format` | `HIPFIRE_PLE_FORMAT` | `auto` (q4 on gfx1151, q8 elsewhere; see [Qwen4 PLE row tables](#qwen4-ple-row-tables)) |
+| `ple_prewarm_bytes` | `memory.ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | `auto` (prewarm 15 GiB of the q4 PLE table, capped at `MemAvailable` − 8 GiB; `0` off) |
 | `devices` | `hardware.devices` | `HIPFIRE_DEVICES` (alias `HIPFIRE_DEVICE`) | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
@@ -903,7 +959,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 278 schema keys, plus the `developer.<name>` namespace.
+**Count:** 280 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -1102,7 +1158,9 @@ misspelled key is unknown and fails the load with
 | `memory.mmq.screen_threshold` | `mmq_screen_threshold` | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | stable |
 | `memory.offload_exec` | `offload_exec` | `HIPFIRE_OFFLOAD_EXEC` | stable |
 | `memory.oom_guard` | `oom_guard` | `HIPFIRE_OOM_GUARD` | stable |
+| `memory.ple_format` | `ple_format` | `HIPFIRE_PLE_FORMAT` | stable |
 | `memory.ple_hot_store_bytes` | `ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | stable |
+| `memory.ple_prewarm_bytes` | `ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | stable |
 | `memory.prompt_cache_capacity` | `prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | stable |
 | `memory.prompt_cache_unbounded` | `prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | experimental |
 | `memory.session_cache_bytes` | `session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | stable |

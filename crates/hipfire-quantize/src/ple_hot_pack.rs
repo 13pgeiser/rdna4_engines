@@ -15,9 +15,11 @@
 use clap::Parser;
 use hipfire_arch_qwen4::admit_hfqm_artifact;
 use hipfire_arch_qwen4::bundle::ple_hot_plan;
+use hipfire_arch_qwen4::Qwen4PleRows;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::ple_hot_pack::write_ple_hot_pack_with_progress;
 use hipfire_runtime::ple_hot_store::{PleHotRank, BUCKETS, DEFAULT_TIER_BUCKETS};
+use hipfire_runtime::ple_sidecar::{resolve_and_attach_ple_rows, ResolvePolicy};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -44,9 +46,17 @@ pub(crate) struct HotPackArgs {
     #[arg(long, value_name = "MODEL.mq4.plehot")]
     pub rank: Option<PathBuf>,
 
-    /// Destination pack (default `<model>.plehotrows`).
-    #[arg(long, value_name = "MODEL.mq4.plehotrows")]
+    /// Destination pack (default `<rows source>.plehotrows`: the model file,
+    /// or the chosen PLE sidecar).
+    #[arg(long, value_name = "ROWS.plehotrows")]
     pub out: Option<PathBuf>,
+
+    /// PLE rows to cut the pack from: `q4` / `q8` use the model's
+    /// `<model>.ple-q4` / `<model>.ple-q8` sidecar (a monolithic model's q8 rows
+    /// are its own shards).  Default: the model's embedded rows.  A rank-order
+    /// q4 table is its own pack and is refused.
+    #[arg(long, value_name = "q4|q8", value_parser = ["q4", "q8"])]
+    pub ple_format: Option<String>,
 
     /// Size budget of the pack's row data, GiB (2^30 bytes).
     #[arg(long, value_name = "GIB", default_value_t = 40.0)]
@@ -100,19 +110,53 @@ fn run_inner(args: &HotPackArgs) -> Result<Value, String> {
         .rank
         .clone()
         .unwrap_or_else(|| sibling(&args.model, ".plehot"));
+
+    let mut hfq = HfqFile::open(&args.model)
+        .map_err(|e| format!("open model {}: {e}", args.model.display()))?;
+    // Default: the model's own (embedded) PLE rows, as before sidecars
+    // existed.  `--ple-format` resolves a sidecar through the loader's rules
+    // (never deriving: run `hipfire ple derive` first); the GPU arch only
+    // matters for `auto`, which is not offered here.
+    if let Some(request) = args
+        .ple_format
+        .as_deref()
+        .and_then(hipfire_config::memory::PleFormatRequest::parse)
+    {
+        resolve_and_attach_ple_rows(
+            &mut hfq,
+            &args.model,
+            request,
+            "",
+            ResolvePolicy {
+                derive_missing_q4: false,
+                progress: None,
+            },
+        )
+        .map_err(|e| format!("PLE rows of {}: {e}", args.model.display()))?;
+    }
+    let receipt =
+        admit_hfqm_artifact(&hfq).map_err(|e| format!("admit {}: {e}", args.model.display()))?;
+    if let Qwen4PleRows::Sidecar { path, .. } = &receipt.ple_rows {
+        if receipt.ple_rows.rank_table().is_some() {
+            return Err(format!(
+                "{} is a rank-order PLE table: its rows are already stored hottest-first with \
+                 their rank, so it is its own hot-row pack and there is nothing to cut",
+                path.display()
+            ));
+        }
+    }
+    let descriptors = receipt
+        .ple_row_descriptors(&hfq)
+        .map_err(|e| format!("PLE rows of {}: {e}", args.model.display()))?;
+    let (rows_path, rows_bytes) = receipt
+        .ple_rows_source(&hfq)
+        .map_err(|e| format!("PLE rows of {}: {e}", args.model.display()))?;
+    let plan = ple_hot_plan(&receipt.ple, &descriptors, &rows_path, rows_bytes)?
+        .ok_or_else(|| "PLE rows are neither Q8F16 nor Q4LM".to_string())?;
     let out = args
         .out
         .clone()
-        .unwrap_or_else(|| sibling(&args.model, ".plehotrows"));
-
-    let hfq = HfqFile::open(&args.model)
-        .map_err(|e| format!("open model {}: {e}", args.model.display()))?;
-    let receipt =
-        admit_hfqm_artifact(&hfq).map_err(|e| format!("admit {}: {e}", args.model.display()))?;
-    let plan = ple_hot_plan(&receipt.manifest, &receipt.ple, |name| {
-        hfq.tensor_range(name).map_err(|e| e.to_string())
-    })?
-    .ok_or_else(|| "PLE shards are not Q8F16".to_string())?;
+        .unwrap_or_else(|| sibling(&plan.source_path, ".plehotrows"));
     let row_bytes = plan.encoded_row_bytes;
 
     let rank = PleHotRank::open(&rank_path, plan.padded_rows, &plan.fingerprint_hex)?;
@@ -140,7 +184,7 @@ fn run_inner(args: &HotPackArgs) -> Result<Value, String> {
     let mut next_percent = 5u64;
     let t_write = Instant::now();
     let header = write_ple_hot_pack_with_progress(
-        &args.model,
+        &plan.source_path,
         &plan.shard_offsets,
         plan.rows_per_shard,
         plan.row_encoding,
@@ -166,6 +210,8 @@ fn run_inner(args: &HotPackArgs) -> Result<Value, String> {
     Ok(json!({
         "out": out.display().to_string(),
         "model": args.model.display().to_string(),
+        "rows_source": plan.source_path.display().to_string(),
+        "row_encoding": plan.row_encoding.dtype_name(),
         "rank": rank_path.display().to_string(),
         "kept_buckets": header.kept_buckets,
         "tier_group": header.tier_group,
@@ -202,5 +248,23 @@ mod tests {
             sibling(std::path::Path::new("/m/x.mq4"), ".plehotrows"),
             PathBuf::from("/m/x.mq4.plehotrows")
         );
+    }
+
+    #[test]
+    fn ple_format_accepts_q4_and_q8_only() {
+        let parse = |extra: &[&str]| {
+            HotPackArgs::try_parse_from(["ple-hot-pack", "--model", "m.mq4"].iter().chain(extra))
+        };
+        assert_eq!(parse(&[]).unwrap().ple_format, None);
+        assert_eq!(
+            parse(&["--ple-format", "q4"])
+                .unwrap()
+                .ple_format
+                .as_deref(),
+            Some("q4")
+        );
+        assert!(parse(&["--ple-format", "q8"]).is_ok());
+        assert!(parse(&["--ple-format", "auto"]).is_err());
+        assert!(parse(&["--ple-format", "bf16"]).is_err());
     }
 }

@@ -21,7 +21,6 @@
 
 use crate::model_source::{SourceError, SourceRangeDescriptor};
 use crate::ple_hot_store::HotRowStore;
-use rdna_compute::DType;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -232,6 +231,103 @@ pub const MAX_STAGING_BUFFERS: usize = 2;
 /// until its lease is consumed or the request is cancelled.
 pub const READER_QUEUE_CAPACITY: usize = 64;
 
+/// A PLE fetch is idle once none ran for this long: longer than the compute
+/// between two prefill chunks' fetches (~4 s for an 8192-row chunk on Halo), so
+/// background readers only run while no request is being served.
+pub const FETCH_QUIET: Duration = Duration::from_secs(5);
+
+/// Whether a [`RowStore`] is serving fetches.  Every fetch (a prefill chunk or
+/// a decode step) holds a [`FetchGuard`]; background readers of the same table
+/// (the hot-row prewarm, the PLE rows prewarm) wait until the store has been
+/// idle for their quiet period.
+pub struct FetchActivity {
+    /// Time base of `last_ms`.
+    created: Instant,
+    /// Milliseconds after `created` (plus one; 0 = never) at which the last
+    /// fetch finished.
+    last_ms: AtomicU64,
+    /// Fetches in flight.
+    active: AtomicUsize,
+}
+
+/// A fetch in flight (from [`FetchActivity::busy`]); the store counts as busy
+/// until [`FETCH_QUIET`] (or the waiter's own quiet period) after the last
+/// guard drops.
+pub struct FetchGuard<'a>(&'a FetchActivity);
+
+impl Drop for FetchGuard<'_> {
+    fn drop(&mut self) {
+        let activity = self.0;
+        let at = activity.created.elapsed().as_millis() as u64 + 1;
+        activity.last_ms.fetch_max(at, Ordering::AcqRel);
+        activity.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl FetchActivity {
+    pub fn new() -> Self {
+        Self {
+            created: Instant::now(),
+            last_ms: AtomicU64::new(0),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    /// A fetch starts; the returned guard marks it finished when dropped.
+    pub fn busy(&self) -> FetchGuard<'_> {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        FetchGuard(self)
+    }
+
+    /// Fetches in flight.
+    pub fn in_flight(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// How long the store has been quiet: `None` while a fetch is in flight,
+    /// `Some(MAX)` when it never served one.
+    fn quiet_for(&self) -> Option<Duration> {
+        if self.in_flight() > 0 {
+            return None;
+        }
+        let last = self.last_ms.load(Ordering::Acquire);
+        if last == 0 {
+            return Some(Duration::MAX);
+        }
+        Some(Duration::from_millis(
+            (self.created.elapsed().as_millis() as u64 + 1).saturating_sub(last),
+        ))
+    }
+
+    /// No fetch is in flight and the last one finished at least `quiet` ago
+    /// (or none ever ran).
+    pub fn idle_for(&self, quiet: Duration) -> bool {
+        self.quiet_for().is_some_and(|since| since >= quiet)
+    }
+
+    /// Sleep until [`FetchActivity::idle_for`]`(quiet)`; `false` when `stop`
+    /// was raised meanwhile.
+    pub fn wait_idle(&self, quiet: Duration, stop: &AtomicBool) -> bool {
+        const POLL: Duration = Duration::from_millis(20);
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+            match self.quiet_for() {
+                None => std::thread::sleep(POLL),
+                Some(since) if since >= quiet => return true,
+                Some(since) => std::thread::sleep((quiet - since).min(POLL)),
+            }
+        }
+    }
+}
+
+impl Default for FetchActivity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Stored representation of one physical row.
 ///
 /// The artifact declares this through the shard dtype, so both tiers can be
@@ -246,6 +342,9 @@ pub enum RowEncoding {
     Bf16,
     /// Q8F16: `width / 32` blocks of `[f16 scale][32 x i8]`.
     Q8F16,
+    /// Q4LM: `width / 32` blocks of `[f16 scale][16 bytes of 4-bit Lloyd-Max
+    /// labels]` (18 bytes), the derived tier of [`crate::ple_q4`].
+    Q4Lm,
 }
 
 /// Bytes of one Q8F16 block: an f16 scale followed by 32 signed bytes.
@@ -254,20 +353,33 @@ const Q8_BLOCK_BYTES: usize = 34;
 const Q8_BLOCK_WEIGHTS: usize = 32;
 
 impl RowEncoding {
-    /// The storage dtype of this encoding.
-    pub const fn dtype(self) -> DType {
+    /// Encoded bytes of one physical row of `width` values, or `None` for a
+    /// width the encoding cannot hold (zero, or for the block encodings not a
+    /// whole number of 32-value blocks).  A partial block is refused rather
+    /// than padded: the encoders only ever write whole blocks.
+    pub const fn checked_encoded_row_bytes(self, width: usize) -> Option<usize> {
+        if width == 0 {
+            return None;
+        }
         match self {
-            Self::Bf16 => DType::BF16,
-            Self::Q8F16 => DType::Q8_0,
+            Self::Bf16 => Some(width * 2),
+            Self::Q8F16 if width % Q8_BLOCK_WEIGHTS == 0 => {
+                Some(width / Q8_BLOCK_WEIGHTS * Q8_BLOCK_BYTES)
+            }
+            Self::Q4Lm if width % Q8_BLOCK_WEIGHTS == 0 => {
+                Some(width / Q8_BLOCK_WEIGHTS * crate::ple_q4::Q4LM_BLOCK_BYTES)
+            }
+            _ => None,
         }
     }
 
     /// Encoded bytes of one physical row of `width` values.
     ///
     /// # Panics
-    /// If `width` is zero or, for Q8F16, not a whole number of 32-value blocks.
+    /// If `width` is zero or, for the block encodings, not a whole number of
+    /// 32-value blocks.
     pub fn encoded_row_bytes(self, width: usize) -> usize {
-        crate::weight_store::external_row_stride(self.dtype(), width)
+        self.checked_encoded_row_bytes(width)
             .expect("row width is a whole number of blocks")
     }
 
@@ -281,6 +393,7 @@ impl RowEncoding {
         match self {
             Self::Bf16 => "BF16",
             Self::Q8F16 => "Q8_0",
+            Self::Q4Lm => "Q4LM",
         }
     }
 
@@ -294,6 +407,7 @@ impl RowEncoding {
         match dtype.to_ascii_uppercase().as_str() {
             "BF16" | "BFLOAT16" => Some(Self::Bf16),
             "Q8_0" | "Q8F16" | "Q8" | "Q8_F16" => Some(Self::Q8F16),
+            "Q4LM" => Some(Self::Q4Lm),
             _ => None,
         }
     }
@@ -328,6 +442,15 @@ impl RowEncoding {
                     }
                 }
             }
+            Self::Q4Lm => {
+                if Some(encoded.len()) != self.checked_encoded_row_bytes(out.len() / 2) {
+                    return Err(RowStoreError::InvalidLease {
+                        reason: "Q4LM row length mismatch".to_string(),
+                    });
+                }
+                crate::ple_q4::decode_q4lm_row_bf16(encoded, out)
+                    .map_err(|reason| RowStoreError::InvalidLease { reason })?;
+            }
         }
         Ok(())
     }
@@ -345,7 +468,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 /// bit-identical to the
 /// narrowing the reference does.
 #[inline]
-fn f32_to_bf16_bits(value: f32) -> u16 {
+pub(crate) fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let rounding = 0x7fffu32 + ((bits >> 16) & 1);
     (bits.wrapping_add(rounding) >> 16) as u16
@@ -736,7 +859,8 @@ impl RowStore {
     ///
     /// All descriptors must refer to one immutable source identity, share one
     /// `[rows_per_shard, width]` shape and dtype, either BF16 (`2 * width`-byte
-    /// rows) or Q8F16 (`width / 32` 34-byte blocks), and be exactly
+    /// rows), Q8F16 (`width / 32` 34-byte blocks) or Q4LM (`width / 32` 18-byte
+    /// blocks), and be exactly
     /// `rows * encoded_row_bytes` bytes.  Global rows at or past `valid_rows`
     /// are padding: requests for them are refused, so padding can never be
     /// returned as an embedding.  `name` labels the reader thread.
@@ -767,6 +891,69 @@ impl RowStore {
             descriptors: descriptors.clone(),
         });
         Self::spawn(name, source, descriptors, layout, rows, wide_readers)
+    }
+
+    /// A row store over a rank-ordered PLE table ([`HotRowStore::open_table`]):
+    /// geometry and encoding come from the store, every fetch is served from
+    /// its pack (the store is attached as the hot store, which also binds this
+    /// store's [`FetchActivity`]), and the positional fallback source reads
+    /// single rows at their pack offsets.  `valid_rows`, `staging_rows` and
+    /// `wide_readers` are as for [`RowStore::with_staging_rows`].
+    pub fn from_table_store(
+        name: &str,
+        store: Arc<HotRowStore>,
+        valid_rows: u64,
+        staging_rows: usize,
+        wide_readers: bool,
+    ) -> Result<Self, RowStoreError> {
+        let invalid = |reason: String| RowStoreError::Descriptor { index: 0, reason };
+        let rows_per_shard = store.rows_per_shard();
+        let padded_rows = store.padded_rows();
+        if rows_per_shard == 0 || padded_rows == 0 || padded_rows % rows_per_shard as u64 != 0 {
+            return Err(invalid(format!(
+                "table of {padded_rows} rows is not a whole number of shards of {rows_per_shard}"
+            )));
+        }
+        let shard_count = usize::try_from(padded_rows / rows_per_shard as u64)
+            .map_err(|_| invalid("table shard count overflows".to_string()))?;
+        if valid_rows == 0 || valid_rows > padded_rows {
+            return Err(invalid(format!(
+                "valid rows {valid_rows} outside 1..={padded_rows} table rows"
+            )));
+        }
+        let encoding = store.encoding();
+        let row_width = store.row_width();
+        if encoding.checked_encoded_row_bytes(row_width) != Some(store.encoded_row_bytes()) {
+            return Err(invalid(format!(
+                "table rows of {row_width} {} values are not {} bytes",
+                encoding.dtype_name(),
+                store.encoded_row_bytes()
+            )));
+        }
+        let layout = Layout {
+            shard_count,
+            rows_per_shard,
+            rows_per_page: ROWS_PER_PAGE,
+            row_width,
+            valid_rows,
+            encoding,
+        };
+        let source: Arc<dyn PositionalRowSource> = Arc::new(TableRowSource {
+            store: store.clone(),
+            shard_count,
+            rows_per_shard: rows_per_shard as u64,
+            row_bytes: store.encoded_row_bytes(),
+        });
+        let rows = Self::spawn(
+            name,
+            source,
+            Vec::new().into(),
+            layout,
+            staging_rows,
+            wide_readers,
+        )?;
+        rows.attach_hot_store(store).map_err(invalid)?;
+        Ok(rows)
     }
 
     fn spawn(
@@ -808,6 +995,7 @@ impl RowStore {
             state: Mutex::new(RowStoreState::new(staging_bytes)),
             cv: Condvar::new(),
             hot_store: OnceLock::new(),
+            activity: Arc::new(FetchActivity::new()),
         });
         let weak = Arc::downgrade(&inner);
         let worker = thread::Builder::new()
@@ -1232,6 +1420,13 @@ impl RowStore {
         self.inner.stats()
     }
 
+    /// The store's fetch activity: every fetch holds it busy, so background
+    /// readers of the same table can wait for idleness (see
+    /// [`FetchActivity::wait_idle`]).
+    pub fn activity(&self) -> Arc<FetchActivity> {
+        self.inner.activity.clone()
+    }
+
     /// Attach the PLE hot-row store.  Rows its pack holds are read from the
     /// pack (the model file's own encoded rows, re-laid out by rank) and
     /// decoded instead of read from the source; everything else takes the
@@ -1259,6 +1454,7 @@ impl RowStore {
                 inner.encoding.dtype_name(),
             ));
         }
+        store.bind_activity(inner.activity.clone())?;
         inner
             .hot_store
             .set(store)
@@ -1502,6 +1698,9 @@ struct RowStoreInner {
     /// PLE hot-row store consulted before the page cache (see
     /// [`RowStore::attach_hot_store`]).
     hot_store: OnceLock<Arc<HotRowStore>>,
+    /// Fetch idle/busy tracking shared with background readers (see
+    /// [`RowStore::activity`]).
+    activity: Arc<FetchActivity>,
 }
 
 impl RowStoreInner {
@@ -1718,10 +1917,10 @@ impl RowStoreInner {
         canceled: &AtomicBool,
         pending: &mut PendingPages,
     ) -> Result<(), RowStoreError> {
-        // Every PLE fetch (a prefill chunk or a decode step) pauses the hot
-        // store's fill until shortly after the last one returns, so the fill
-        // only runs while no request is being served.
-        let _busy = self.hot_store.get().map(|store| store.busy());
+        // Every PLE fetch (a prefill chunk or a decode step) marks the row
+        // store busy, so background readers of the table (the hot store's
+        // fill, the rows prewarm) only run while no request is being served.
+        let _busy = self.activity.busy();
         if pages.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(RowStoreError::InvalidLease {
                 reason: "page plan is not strictly ascending".to_string(),
@@ -1965,13 +2164,15 @@ impl RowStoreInner {
                 .is_some_and(|copies| {
                     copies.iter().all(|copy| {
                         let row = first_row + (copy.page_offset / self.encoded_row_bytes) as u64;
-                        store.pack_offset(row).map(|pack_offset| {
-                            plan.items.push(HotItem {
-                                pack_offset,
-                                output_offset: copy.output_offset,
+                        store
+                            .pack_offset(row)
+                            .map(|pack_offset| {
+                                plan.items.push(HotItem {
+                                    pack_offset,
+                                    output_offset: copy.output_offset,
+                                })
                             })
-                        })
-                        .is_some()
+                            .is_some()
                     })
                 });
             if held {
@@ -1982,7 +2183,8 @@ impl RowStoreInner {
             }
         }
         plan.rows = plan.items.len() as u64;
-        plan.items.sort_unstable_by_key(|item| (item.pack_offset, item.output_offset));
+        plan.items
+            .sort_unstable_by_key(|item| (item.pack_offset, item.output_offset));
         // One read per run of consecutive pack rows (a row requested twice
         // is read once), bounded so one read stays a few OS pages.
         let row_bytes = self.encoded_row_bytes as u64;
@@ -2021,7 +2223,9 @@ impl RowStoreInner {
         buffer: &mut Vec<u8>,
     ) -> Result<(), RowStoreError> {
         buffer.resize(run.len, 0);
-        store.read_pack(run.offset, buffer).map_err(RowStoreError::Source)?;
+        store
+            .read_pack(run.offset, buffer)
+            .map_err(RowStoreError::Source)?;
         for item in &plan.items[run.items.clone()] {
             let at = (item.pack_offset - run.offset) as usize;
             let end = item
@@ -2333,10 +2537,7 @@ fn checked_row_ranges(
             reason: format!("requested row is outside page {page:?} or output"),
         });
     }
-    Ok((
-        row.page_offset..page_end,
-        row.output_offset..output_end,
-    ))
+    Ok((row.page_offset..page_end, row.output_offset..output_end))
 }
 
 /// The lease staging buffer shared by the scoped reader threads of one
@@ -2382,7 +2583,9 @@ impl<'a> SharedOutput<'a> {
         );
         // SAFETY: in bounds per the assert; exclusivity is the caller's
         // contract above.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(range.start), range.end - range.start) }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ptr.add(range.start), range.end - range.start)
+        }
     }
 }
 
@@ -2658,6 +2861,52 @@ impl PositionalRowSource for DescriptorRowSource {
     }
 }
 
+/// Positional source of a table store ([`RowStore::from_table_store`]): the
+/// table is rank-ordered, so a shard's rows are not contiguous in the file.
+/// Every read is split into rows and each row is read at its own pack offset.
+/// The row store takes pages whose requested rows the store holds straight
+/// from the pack, and every row is held, so this source only serves what that
+/// path leaves (nothing, today) and keeps the page path total.
+struct TableRowSource {
+    store: Arc<HotRowStore>,
+    shard_count: usize,
+    rows_per_shard: u64,
+    row_bytes: usize,
+}
+
+impl PositionalRowSource for TableRowSource {
+    fn read_at(&self, shard: usize, local_offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        let row_bytes = self.row_bytes as u64;
+        let first_local = local_offset / row_bytes;
+        let rows = dst.len() as u64 / row_bytes;
+        if shard >= self.shard_count
+            || local_offset % row_bytes != 0
+            || dst.len() as u64 % row_bytes != 0
+            || first_local + rows > self.rows_per_shard
+        {
+            return Err(SourceError::InvalidSource {
+                reason: format!(
+                    "table read of {} bytes at {local_offset} in shard {shard} is not whole rows \
+                     of {row_bytes} bytes inside the shard",
+                    dst.len()
+                ),
+            });
+        }
+        let first = shard as u64 * self.rows_per_shard + first_local;
+        for (index, row) in dst.chunks_exact_mut(self.row_bytes).enumerate() {
+            let global = first + index as u64;
+            let at = self
+                .store
+                .pack_offset(global)
+                .ok_or_else(|| SourceError::InvalidSource {
+                    reason: format!("table row {global} has no pack offset"),
+                })?;
+            self.store.read_pack(at, row)?;
+        }
+        Ok(())
+    }
+}
+
 struct CachedPage {
     bytes: Vec<u8>,
     last_used: u64,
@@ -2767,13 +3016,14 @@ fn validate_descriptors(
             reason: "at least one physical shard is required".to_string(),
         })?;
     // The declared dtype is the contract: BF16 shards are `2 * width`-byte raw
-    // rows and Q8F16 shards are `width / 32` 34-byte blocks per row. Nothing
-    // infers the tier from the byte count, so a mislabelled artifact is refused
-    // rather than decoded as the wrong width.
+    // rows, Q8F16 shards are `width / 32` 34-byte blocks per row and Q4LM
+    // shards `width / 32` 18-byte blocks per row. Nothing infers the tier from
+    // the byte count, so a mislabelled artifact is refused rather than decoded
+    // as the wrong width.
     let encoding =
         RowEncoding::from_dtype(first.dtype()).ok_or_else(|| RowStoreError::Descriptor {
             index: 0,
-            reason: format!("rows must be BF16 or Q8_0, got {}", first.dtype()),
+            reason: format!("rows must be BF16, Q8_0 or Q4LM, got {}", first.dtype()),
         })?;
     let shape = first.logical_shape();
     if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
@@ -2783,10 +3033,13 @@ fn validate_descriptors(
         });
     }
     let (rows, width) = (shape[0], shape[1]);
-    if encoding == RowEncoding::Q8F16 && width % Q8_BLOCK_WEIGHTS != 0 {
+    if encoding.checked_encoded_row_bytes(width).is_none() {
         return Err(RowStoreError::Descriptor {
             index: 0,
-            reason: format!("Q8F16 row width {width} is not a multiple of {Q8_BLOCK_WEIGHTS}"),
+            reason: format!(
+                "{} row width {width} is not a multiple of {Q8_BLOCK_WEIGHTS}",
+                encoding.dtype_name()
+            ),
         });
     }
     let expected_length = (rows as u64)
@@ -3345,7 +3598,10 @@ mod tests {
         let reads = source.reads.load(Ordering::Acquire);
         let mut fetch = RowFetch::begin_or_adopt(&rows, Some(ahead), ids.clone()).unwrap();
         assert_eq!(fetch.epoch(), 0);
-        assert_eq!(fetch.wait().unwrap().as_bytes().unwrap(), expected.as_slice());
+        assert_eq!(
+            fetch.wait().unwrap().as_bytes().unwrap(),
+            expected.as_slice()
+        );
         fetch.complete();
         drop(fetch);
         assert_eq!(rows.current_epoch(), 0);
@@ -3355,7 +3611,10 @@ mod tests {
         let ahead = rows.prefetch_tokens(0, 7, &[5]).unwrap();
         let mut fetch = RowFetch::begin_or_adopt(&rows, Some(ahead), ids.clone()).unwrap();
         assert_eq!(fetch.epoch(), 1);
-        assert_eq!(fetch.wait().unwrap().as_bytes().unwrap(), expected.as_slice());
+        assert_eq!(
+            fetch.wait().unwrap().as_bytes().unwrap(),
+            expected.as_slice()
+        );
         fetch.complete();
         drop(fetch);
 
@@ -3365,7 +3624,10 @@ mod tests {
         assert!(!rows.ticket_matches(&ahead, &ids));
         let mut fetch = RowFetch::begin_or_adopt(&rows, Some(ahead), ids.clone()).unwrap();
         assert_eq!(fetch.epoch(), 3);
-        assert_eq!(fetch.wait().unwrap().as_bytes().unwrap(), expected.as_slice());
+        assert_eq!(
+            fetch.wait().unwrap().as_bytes().unwrap(),
+            expected.as_slice()
+        );
         fetch.complete();
         drop(fetch);
         let ahead = rows.prefetch_tokens(3, 7, &[3, 4]).unwrap();
@@ -3508,6 +3770,26 @@ mod tests {
         crate::llama::f32_to_f16(value)
     }
 
+    /// Q4LM rows for the same fixture layout: each Q8F16 fixture row encoded by
+    /// [`crate::ple_q4::encode_q4lm_row_from_q8`].
+    fn rows_source_q4(shard_count: usize, rows_per_shard: usize) -> Vec<Vec<u8>> {
+        let q8_row_bytes = RowEncoding::Q8F16.encoded_row_bytes(ROW_WIDTH);
+        let q4_row_bytes = RowEncoding::Q4Lm.encoded_row_bytes(ROW_WIDTH);
+        rows_source_q8(shard_count, rows_per_shard)
+            .into_iter()
+            .map(|q8| {
+                let mut q4 = vec![0u8; rows_per_shard * q4_row_bytes];
+                for (src, dst) in q8
+                    .chunks_exact(q8_row_bytes)
+                    .zip(q4.chunks_exact_mut(q4_row_bytes))
+                {
+                    crate::ple_q4::encode_q4lm_row_from_q8(src, dst).unwrap();
+                }
+                q4
+            })
+            .collect()
+    }
+
     #[test]
     fn q8_rows_decode_to_bf16_lease_rows() {
         let rows_per_shard = 64;
@@ -3578,11 +3860,12 @@ mod tests {
         let ns_per_row = started.elapsed().as_secs_f64() * 1e9 / DECODES as f64;
 
         let mut arms = Vec::new();
-        for encoding in [RowEncoding::Bf16, RowEncoding::Q8F16] {
+        for encoding in [RowEncoding::Bf16, RowEncoding::Q8F16, RowEncoding::Q4Lm] {
             let rows_per_shard = 4096;
             let shards = match encoding {
                 RowEncoding::Bf16 => rows_source(2, rows_per_shard),
                 RowEncoding::Q8F16 => rows_source_q8(2, rows_per_shard),
+                RowEncoding::Q4Lm => rows_source_q4(2, rows_per_shard),
             };
             let tokens: Vec<u32> = (0..256).collect();
             let rows = RowStore::from_test_source_encoded(
@@ -3640,6 +3923,419 @@ mod tests {
         );
         assert_eq!(RowEncoding::Q8F16.encoded_row_bytes(ROW_WIDTH), 170);
         assert_eq!(RowEncoding::Q8F16.dtype_name(), "Q8_0");
+    }
+
+    #[test]
+    fn q4lm_encoding_is_declared_sized_and_decoded() {
+        assert_eq!(RowEncoding::from_dtype("Q4LM"), Some(RowEncoding::Q4Lm));
+        assert_eq!(RowEncoding::from_dtype("q4lm"), Some(RowEncoding::Q4Lm));
+        assert_eq!(RowEncoding::Q4Lm.dtype_name(), "Q4LM");
+        assert_eq!(RowEncoding::Q4Lm.encoded_row_bytes(ROW_WIDTH), 90);
+        assert_eq!(RowEncoding::Q4Lm.page_bytes(ROW_WIDTH), ROWS_PER_PAGE * 90);
+        for encoding in [RowEncoding::Q8F16, RowEncoding::Q4Lm] {
+            assert_eq!(encoding.checked_encoded_row_bytes(0), None);
+            assert_eq!(encoding.checked_encoded_row_bytes(33), None);
+        }
+        assert_eq!(RowEncoding::Bf16.checked_encoded_row_bytes(33), Some(66));
+        assert_eq!(RowEncoding::Bf16.checked_encoded_row_bytes(0), None);
+        assert_eq!(RowEncoding::Q8F16.checked_encoded_row_bytes(160), Some(170));
+
+        let shards = rows_source_q4(1, 2);
+        let row = &shards[0][..90];
+        let mut got = vec![0u8; ROW_BYTES];
+        RowEncoding::Q4Lm.decode_row(row, &mut got).unwrap();
+        let mut want = vec![0u8; ROW_BYTES];
+        crate::ple_q4::decode_q4lm_row_bf16(row, &mut want).unwrap();
+        assert_eq!(got, want);
+        assert!(RowEncoding::Q4Lm.decode_row(&row[..89], &mut got).is_err());
+        assert!(RowEncoding::Q4Lm.decode_row(row, &mut got[..318]).is_err());
+    }
+
+    /// Sealed single-file reader of the descriptor fixtures below.
+    struct FileRowReader {
+        identity: crate::model_source::SourceIdentity,
+        file: std::fs::File,
+    }
+
+    impl crate::model_source::SourceReaderImpl for FileRowReader {
+        fn identity(&self) -> &crate::model_source::SourceIdentity {
+            &self.identity
+        }
+
+        fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+            crate::model_source::read_file_exact_at(
+                &self.file,
+                &self.identity.files[0],
+                offset,
+                dst,
+            )
+        }
+    }
+
+    /// Sealed descriptors over `path`: one per `(offset, length)` range, each
+    /// declaring `dtype` and a `[rows_per_shard, width]` shape (the shape of a
+    /// sidecar's manifest).
+    fn file_descriptors(
+        path: &std::path::Path,
+        ranges: &[(u64, u64)],
+        dtype: &str,
+        rows_per_shard: usize,
+        width: usize,
+    ) -> Vec<SourceRangeDescriptor> {
+        use crate::model_source::{
+            capture_file_identity, SourceFormat, SourceIdentity, SourceReader,
+        };
+        let file_identity = capture_file_identity(path).unwrap();
+        let identity = Arc::new(SourceIdentity {
+            canonical_path: file_identity.canonical_path.clone(),
+            format: SourceFormat::PleRows,
+            files: vec![file_identity],
+            metadata_json: "{}".to_string(),
+            manifest: Vec::new(),
+        });
+        ranges
+            .iter()
+            .map(|&(offset, length)| {
+                let reader = SourceReader::from_inner(FileRowReader {
+                    identity: identity.as_ref().clone(),
+                    file: std::fs::File::open(path).unwrap(),
+                });
+                SourceRangeDescriptor::from_parts(
+                    identity.clone(),
+                    offset,
+                    length,
+                    dtype.to_string(),
+                    vec![rows_per_shard, width],
+                    reader,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// One file holding a 4 KiB stand-in header and then `shards` back to back,
+    /// and one sealed descriptor per shard (see [`file_descriptors`]).
+    fn shard_descriptors(
+        shards: &[Vec<u8>],
+        dtype: &str,
+        rows_per_shard: usize,
+        width: usize,
+    ) -> (tempfile::TempDir, Vec<SourceRangeDescriptor>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.ple-q4");
+        let mut file = vec![0u8; 4096];
+        let mut ranges = Vec::new();
+        for shard in shards {
+            ranges.push((file.len() as u64, shard.len() as u64));
+            file.extend_from_slice(shard);
+        }
+        std::fs::write(&path, &file).unwrap();
+        let descriptors = file_descriptors(&path, &ranges, dtype, rows_per_shard, width);
+        (dir, descriptors)
+    }
+
+    /// BF16 rows a Q4LM shard set decodes to for `ids`.
+    fn expected_q4_rows(shards: &[Vec<u8>], ids: &[u64], rows_per_shard: usize) -> Vec<u8> {
+        let row_bytes = RowEncoding::Q4Lm.encoded_row_bytes(ROW_WIDTH);
+        ids.iter()
+            .flat_map(|&id| {
+                let shard = id as usize / rows_per_shard;
+                let local = id as usize % rows_per_shard;
+                let row = &shards[shard][local * row_bytes..(local + 1) * row_bytes];
+                let mut out = vec![0u8; ROW_BYTES];
+                crate::ple_q4::decode_q4lm_row_bf16(row, &mut out).unwrap();
+                out
+            })
+            .collect()
+    }
+
+    /// A Q4LM descriptor set opens, refuses bad declarations, and serves
+    /// rows through the production constructor in request order.
+    #[test]
+    fn q4lm_descriptors_round_trip_through_the_row_store() {
+        let rows_per_shard = 64;
+        let shards = rows_source_q4(2, rows_per_shard);
+        let (_dir, descriptors) = shard_descriptors(&shards, "Q4LM", rows_per_shard, ROW_WIDTH);
+        let rows = RowStore::new("q4lm-test-reader", descriptors, 128).unwrap();
+        let ids = [0u64, 1, 5, 63, 64, 100, 127, 64, 0, 3];
+        assert_eq!(
+            fetch(&rows, &ids),
+            expected_q4_rows(&shards, &ids, rows_per_shard)
+        );
+        // Cached pages keep the compact 90-byte rows.
+        let location = rows.locate_row(100).unwrap();
+        assert_eq!(
+            rows.inner.page_len(location.page_key()).unwrap(),
+            RowEncoding::Q4Lm.page_bytes(ROW_WIDTH)
+        );
+        assert!(rows.unload().unwrap().is_clean());
+
+        let descriptor_reason = |shards: &[Vec<u8>], dtype: &str, width: usize| {
+            let (_dir, descriptors) = shard_descriptors(shards, dtype, 4, width);
+            match RowStore::new("q4lm-test-reader", descriptors, 4).err() {
+                Some(RowStoreError::Descriptor { reason, .. }) => reason,
+                other => panic!("expected a descriptor error, got {other:?}"),
+            }
+        };
+        // A width that is not a whole number of blocks.
+        let reason = descriptor_reason(&[vec![0u8; 4 * 18]], "Q4LM", 33);
+        assert!(reason.contains("Q4LM") && reason.contains("32"), "{reason}");
+        // A shard whose extent is not the declared dtype's.
+        let reason = descriptor_reason(&[vec![0u8; 4 * 170]], "Q4LM", ROW_WIDTH);
+        assert!(reason.contains("Q4LM"), "{reason}");
+        // A dtype with no decoder names the three that exist.
+        let reason = descriptor_reason(&[vec![0u8; 4 * 90]], "F32", ROW_WIDTH);
+        assert!(
+            reason.contains("BF16, Q8_0 or Q4LM") && reason.contains("F32"),
+            "{reason}"
+        );
+    }
+
+    fn q4_source() -> Arc<MemoryRowSource> {
+        Arc::new(MemoryRowSource {
+            shards: rows_source_q4(2, HOT_ROWS_PER_SHARD),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        })
+    }
+
+    fn q4_row_store(source: &Arc<MemoryRowSource>) -> RowStore {
+        RowStore::from_test_source_encoded(
+            metadata_with_head_size(512, HOT_PADDED_ROWS),
+            HOT_ROWS_PER_SHARD,
+            ROWS_PER_PAGE,
+            RowEncoding::Q4Lm,
+            source.clone(),
+        )
+        .unwrap()
+    }
+
+    /// Rows of a Q4LM hot pack decode identically to the row-store path.
+    #[test]
+    fn q4lm_hot_pack_rows_decode_like_the_row_store() {
+        let source = q4_source();
+        let ids = mixed_ids();
+        let want = expected_q4_rows(&source.shards, &ids, HOT_ROWS_PER_SHARD);
+        let plain = q4_row_store(&source);
+        assert_eq!(fetch(&plain, &ids), want);
+
+        // Half the rows hot: pages mix hot and cold requested rows.
+        let pack = PackFixture::with_encoding(
+            &source.shards,
+            HOT_ROWS_PER_SHARD,
+            128,
+            4,
+            77,
+            RowEncoding::Q4Lm,
+            ROW_WIDTH,
+        );
+        assert_eq!(pack.store.encoded_row_bytes(), 90);
+        let rows = q4_row_store(&source);
+        rows.attach_hot_store(pack.store.clone()).unwrap();
+        assert_eq!(fetch(&rows, &ids), want);
+        let stats = rows.cache_stats();
+        assert!(stats.hot_rows > 0 && stats.hot_pages > 0 && stats.cache_misses > 0);
+
+        // Every row hot: the source is not read at all.
+        let all = PackFixture::with_encoding(
+            &source.shards,
+            HOT_ROWS_PER_SHARD,
+            256,
+            4,
+            5,
+            RowEncoding::Q4Lm,
+            ROW_WIDTH,
+        );
+        let rows = q4_row_store(&source);
+        rows.attach_hot_store(all.store.clone()).unwrap();
+        assert_eq!(fetch(&rows, &ids), want);
+        let stats = rows.cache_stats();
+        assert_eq!((stats.reads, stats.cache_misses), (0, 0));
+        assert_eq!(stats.hot_rows as usize, ids.len());
+
+        // A Q8F16 table does not take a Q4LM pack.
+        let q8_table = q8_row_store(&q8_source());
+        let err = q8_table.attach_hot_store(all.store.clone()).unwrap_err();
+        assert!(err.contains("Q4LM") && err.contains("Q8_0"), "{err}");
+    }
+
+    /// A rank-ordered Q4LM table read through `RowStore::from_table_store`
+    /// returns the same decoded rows as a row-ordered table of the same rows
+    /// read through shard descriptors; it serves at once and never touches the
+    /// source path.
+    #[test]
+    fn rank_ordered_table_store_decodes_like_row_ordered_descriptors() {
+        use crate::ple_hot_pack::table_support::write_test_table;
+        use crate::ple_hot_pack::PackOrder;
+        use crate::ple_hot_store::test_support::synthetic_buckets;
+        use crate::ple_hot_store::DEFAULT_TIER_BUCKETS;
+
+        let shards = rows_source_q4(2, HOT_ROWS_PER_SHARD);
+        let buckets = synthetic_buckets(2 * HOT_ROWS_PER_SHARD, 17);
+        let dir = tempfile::tempdir().unwrap();
+        let rank_path = dir.path().join("rank.ple-q4");
+        let row_path = dir.path().join("row.ple-q4");
+        write_test_table(
+            &rank_path,
+            PackOrder::Rank,
+            RowEncoding::Q4Lm,
+            ROW_WIDTH,
+            HOT_ROWS_PER_SHARD,
+            &shards,
+            Some(&buckets),
+            DEFAULT_TIER_BUCKETS,
+        );
+        let row_header = write_test_table(
+            &row_path,
+            PackOrder::Row,
+            RowEncoding::Q4Lm,
+            ROW_WIDTH,
+            HOT_ROWS_PER_SHARD,
+            &shards,
+            None,
+            DEFAULT_TIER_BUCKETS,
+        );
+        let shard_bytes =
+            (HOT_ROWS_PER_SHARD * RowEncoding::Q4Lm.encoded_row_bytes(ROW_WIDTH)) as u64;
+        let ranges: Vec<(u64, u64)> = (0..2)
+            .map(|shard| (row_header.data_offset + shard * shard_bytes, shard_bytes))
+            .collect();
+        let descriptors =
+            file_descriptors(&row_path, &ranges, "Q4LM", HOT_ROWS_PER_SHARD, ROW_WIDTH);
+        let by_descriptors = RowStore::new("row-order", descriptors, HOT_PADDED_ROWS).unwrap();
+
+        let store = HotRowStore::open_table(&rank_path).unwrap();
+        assert!(store.is_serving(), "a table serves at once");
+        assert_eq!(store.row_width(), ROW_WIDTH);
+        assert_eq!(store.kept_buckets(), 256);
+        let by_table =
+            RowStore::from_table_store("rank-order", store.clone(), HOT_PADDED_ROWS, 0, true)
+                .unwrap();
+
+        let ids = mixed_ids();
+        let want = expected_q4_rows(&shards, &ids, HOT_ROWS_PER_SHARD);
+        assert_eq!(fetch(&by_descriptors, &ids), want);
+        assert_eq!(fetch(&by_table, &ids), want);
+        let one = [ids[7]];
+        assert_eq!(
+            fetch(&by_table, &one),
+            expected_q4_rows(&shards, &one, HOT_ROWS_PER_SHARD)
+        );
+        let twice = [ids[9], ids[9]];
+        assert_eq!(
+            fetch(&by_table, &twice),
+            expected_q4_rows(&shards, &twice, HOT_ROWS_PER_SHARD)
+        );
+        let stats = by_table.cache_stats();
+        assert_eq!(
+            (stats.reads, stats.cache_misses),
+            (0, 0),
+            "every row is in the pack"
+        );
+        assert_eq!(stats.hot_rows as usize, ids.len() + 3);
+        assert!(stats.hot_pages > 0);
+        let descriptor_stats = by_descriptors.cache_stats();
+        assert!(descriptor_stats.cache_misses > 0);
+        assert_eq!(descriptor_stats.hot_rows, 0);
+
+        // The row store's activity is the table's.
+        assert!(!by_table.activity().idle_for(Duration::from_secs(3600)));
+
+        // Bad valid-row counts, and a store binds one row store only.
+        assert!(RowStore::from_table_store("x", store.clone(), 0, 0, true).is_err());
+        assert!(
+            RowStore::from_table_store("x", store.clone(), HOT_PADDED_ROWS + 1, 0, true).is_err()
+        );
+        match RowStore::from_table_store("x", store.clone(), HOT_PADDED_ROWS, 0, true).err() {
+            Some(RowStoreError::Descriptor { reason, .. }) => {
+                assert!(reason.contains("another row store"), "{reason}")
+            }
+            other => panic!("expected the bound-store refusal, got {other:?}"),
+        }
+        assert!(by_table.unload().unwrap().is_clean());
+    }
+
+    /// The positional fallback of a table store reads whole rows at their pack
+    /// offsets and refuses anything else.
+    #[test]
+    fn table_row_source_reads_rows_from_the_pack() {
+        use crate::ple_hot_pack::table_support::write_test_table;
+        use crate::ple_hot_pack::PackOrder;
+        use crate::ple_hot_store::test_support::synthetic_buckets;
+        use crate::ple_hot_store::DEFAULT_TIER_BUCKETS;
+
+        const RPS: usize = 256;
+        let shards = rows_source_q4(3, RPS);
+        let buckets = synthetic_buckets(3 * RPS, 5);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rank.ple-q4");
+        write_test_table(
+            &path,
+            PackOrder::Rank,
+            RowEncoding::Q4Lm,
+            ROW_WIDTH,
+            RPS,
+            &shards,
+            Some(&buckets),
+            DEFAULT_TIER_BUCKETS,
+        );
+        let source = TableRowSource {
+            store: HotRowStore::open_table(&path).unwrap(),
+            shard_count: 3,
+            rows_per_shard: RPS as u64,
+            row_bytes: 90,
+        };
+        for (shard, first, count) in [
+            (0usize, 0usize, 1usize),
+            (1, 17, 5),
+            (2, 250, 6),
+            (0, 0, RPS),
+        ] {
+            let mut got = vec![0u8; count * 90];
+            source
+                .read_at(shard, (first * 90) as u64, &mut got)
+                .unwrap();
+            assert_eq!(
+                got,
+                shards[shard][first * 90..(first + count) * 90],
+                "{shard}/{first}+{count}"
+            );
+        }
+        let mut unaligned = vec![0u8; 90];
+        assert!(source.read_at(0, 1, &mut unaligned).is_err());
+        assert!(source.read_at(0, 0, &mut unaligned[..89]).is_err());
+        let mut past_shard = vec![0u8; 7 * 90];
+        assert!(source.read_at(2, 250 * 90, &mut past_shard).is_err());
+        assert!(source.read_at(3, 0, &mut unaligned).is_err());
+    }
+
+    /// Every fetch marks the row store's shared activity busy, with or without
+    /// a hot store, and the hot store pauses on that same activity.
+    #[test]
+    fn fetches_mark_the_shared_activity_busy() {
+        let source = q8_source();
+        let rows = q8_row_store(&source);
+        let activity = rows.activity();
+        assert!(Arc::ptr_eq(&activity, &rows.activity()));
+        assert!(
+            activity.idle_for(Duration::from_secs(3600)),
+            "never fetched"
+        );
+        fetch(&rows, &[1, 2, 3]);
+        assert_eq!(activity.in_flight(), 0);
+        assert!(
+            !activity.idle_for(Duration::from_secs(3600)),
+            "a fetch just ran"
+        );
+        assert!(activity.idle_for(Duration::ZERO));
+
+        let pack = hot_pack(&source, 64, 4, 3);
+        rows.attach_hot_store(pack.store.clone()).unwrap();
+        // Rebinding the same activity is fine, another row store's is not.
+        pack.store.bind_activity(activity.clone()).unwrap();
+        let other = q8_row_store(&source);
+        let err = other.attach_hot_store(pack.store.clone()).unwrap_err();
+        assert!(err.contains("another row store"), "{err}");
     }
 
     #[test]
@@ -3961,7 +4657,14 @@ mod tests {
         assert_eq!(fetch(&plain, &ids), want);
         let plain_stats = plain.cache_stats();
         assert_eq!(plain_stats.cache_misses as usize, distinct_pages.len());
-        assert_eq!((plain_stats.hot_rows, plain_stats.hot_pages, plain_stats.hot_reads), (0, 0, 0));
+        assert_eq!(
+            (
+                plain_stats.hot_rows,
+                plain_stats.hot_pages,
+                plain_stats.hot_reads
+            ),
+            (0, 0, 0)
+        );
 
         // Half the rows hot: many pages mix hot and cold requested rows.
         let pack = hot_pack(&source, 128, 4, 77);
@@ -3971,7 +4674,10 @@ mod tests {
         let stats = rows.cache_stats();
         assert!(stats.hot_pages > 0 && stats.hot_rows >= stats.hot_pages);
         assert!(stats.hot_reads > 0 && stats.hot_reads <= stats.hot_rows);
-        assert!((stats.hot_pages as usize) < distinct_pages.len(), "some pages stay cold");
+        assert!(
+            (stats.hot_pages as usize) < distinct_pages.len(),
+            "some pages stay cold"
+        );
         assert_eq!(
             stats.cache_misses + stats.hot_pages,
             plain_stats.cache_misses,
@@ -4001,7 +4707,10 @@ mod tests {
         rows.attach_hot_store(unverified.clone()).unwrap();
         assert_eq!(fetch(&rows, &ids), want);
         let stats = rows.cache_stats();
-        assert_eq!((stats.hot_rows, stats.hot_pages, stats.hot_reads), (0, 0, 0));
+        assert_eq!(
+            (stats.hot_rows, stats.hot_pages, stats.hot_reads),
+            (0, 0, 0)
+        );
         assert_eq!(stats.cache_misses, plain_stats.cache_misses);
     }
 
@@ -4018,7 +4727,10 @@ mod tests {
         let one = [ids[7]];
         assert_eq!(fetch(&rows, &one), expected_rows(&one));
         let same_row_twice = [ids[9], ids[9]];
-        assert_eq!(fetch(&rows, &same_row_twice), expected_rows(&same_row_twice));
+        assert_eq!(
+            fetch(&rows, &same_row_twice),
+            expected_rows(&same_row_twice)
+        );
         let stats = rows.cache_stats();
         assert_eq!(stats.reads, 0);
         assert_eq!(stats.cache_misses, 0);
@@ -4085,8 +4797,12 @@ mod tests {
             85,
         );
         assert_eq!(other_encoding.store.encoded_row_bytes(), 170);
-        let err = fresh.attach_hot_store(other_encoding.store.clone()).unwrap_err();
+        let err = fresh
+            .attach_hot_store(other_encoding.store.clone())
+            .unwrap_err();
         assert!(err.contains("BF16") && err.contains("Q8_0"), "{err}");
-        fresh.attach_hot_store(hot_pack(&source, 64, 4, 3).store.clone()).unwrap();
+        fresh
+            .attach_hot_store(hot_pack(&source, 64, 4, 3).store.clone())
+            .unwrap();
     }
 }

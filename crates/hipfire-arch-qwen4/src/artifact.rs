@@ -12,14 +12,23 @@
 
 use crate::config::{Qwen4Config, ARCH_ID};
 use crate::ple::PleHashMetadata;
-use crate::weights::{Qwen4Manifest, Qwen4Placement};
+use crate::weights::{
+    is_ple_shard_name, Qwen4Manifest, Qwen4Placement, PLE_ROW_WIDTH, PLE_SHARD_COUNT,
+    PLE_SHARD_ROWS,
+};
+use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
-use hipfire_runtime::model_source::{SourceFormat, SourceIdentity};
+use hipfire_runtime::model_source::{SourceFormat, SourceIdentity, SourceRangeDescriptor};
+use hipfire_runtime::ple_hot_pack::PackOrder;
+use hipfire_runtime::ple_hot_store::HotRowStore;
+use hipfire_runtime::ple_q4::{lm4_codebook_bits, lm4_scale_grid_bits};
+use hipfire_runtime::ple_sidecar::ple_shard_name;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::external_row_stride;
 use rdna_compute::DType;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const QWEN4_FORMAT_VERSION: u32 = 1;
@@ -52,6 +61,63 @@ const PLE_VOCAB_SIZES_NAME: &str =
 /// matching shape with a huge byte extent.
 const MAX_PLE_METADATA_BYTES: usize = 2048;
 
+/// Where an admitted artifact's PLE n-gram rows come from.
+///
+/// The rows are the only part of a Qwen4 model that can live outside the HFQM
+/// file the loader opens: [`Self::Sidecar`] is a `<model>.ple-q4` /
+/// `<model>.ple-q8` file attached with
+/// `hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows`.
+#[derive(Clone, Debug)]
+pub enum Qwen4PleRows {
+    /// The 128 shard tensors of the admitted HFQM file itself (the
+    /// monolithic artifact, read exactly as before sidecars existed).
+    Embedded,
+    /// An attached, validated sidecar rows file.
+    Sidecar {
+        path: PathBuf,
+        encoding: RowEncoding,
+        rows: SidecarRows,
+    },
+}
+
+/// How a sidecar's rows are served.
+#[derive(Clone)]
+pub enum SidecarRows {
+    /// Row-order table: the 128 ordered shard ranges under one sealed
+    /// single-file identity, read through the bounded row store like the
+    /// embedded shards.
+    Descriptors(Vec<SourceRangeDescriptor>),
+    /// Rank-order table: the rows are stored hottest-first with an embedded
+    /// rank, so the file is its own hot-row pack; the store serves rows
+    /// directly and the row store is built on top of it.
+    Table(Arc<HotRowStore>),
+}
+
+impl fmt::Debug for SidecarRows {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Descriptors(descriptors) => f
+                .debug_tuple("Descriptors")
+                .field(&descriptors.len())
+                .finish(),
+            Self::Table(_) => f.write_str("Table"),
+        }
+    }
+}
+
+impl Qwen4PleRows {
+    /// The rank-order table store, when the rows come from one.
+    pub fn rank_table(&self) -> Option<&Arc<HotRowStore>> {
+        match self {
+            Self::Sidecar {
+                rows: SidecarRows::Table(store),
+                ..
+            } => Some(store),
+            _ => None,
+        }
+    }
+}
+
 /// All declarations needed by the executable carrier and source evaluator.
 ///
 /// The receipt contains no GPU handle and no mutable source reader.  The
@@ -60,11 +126,17 @@ const MAX_PLE_METADATA_BYTES: usize = 2048;
 #[derive(Clone, Debug)]
 pub struct Qwen4HfqmArtifact {
     pub config: Qwen4Config,
+    /// The weight manifest.  With a sidecar the 128 PLE shard entries are
+    /// removed ([`Qwen4Manifest::without_ple_shards`]): their rows are read
+    /// from the sidecar, never fulfilled from the HFQM file.
     pub manifest: Qwen4Manifest,
     pub ple: PleHashMetadata,
     pub placements: Vec<Qwen4Placement>,
     pub source_tensor_count: usize,
     pub source_identity: Arc<SourceIdentity>,
+    /// The PLE rows source the bundle must be assembled with
+    /// (`Qwen4Bundle::assemble_with_ple_rows`).
+    pub ple_rows: Qwen4PleRows,
 }
 
 /// A checked artifact boundary failure.  Keeping the error owned and typed
@@ -617,9 +689,52 @@ fn validate_source_identity(hfq: &HfqFile) -> Result<Arc<SourceIdentity>, Qwen4A
     Ok(effective)
 }
 
+/// The base file's PLE shard tensors against what the rows source allows.
+///
+/// Returns the number of PLE shard tensors the index carries (and that the
+/// manifest therefore must not declare).  `sidecar` is whether a PLE rows
+/// sidecar is attached: then the base is either a split base (marker present,
+/// no shards) or the monolithic file (all shards, shadowed by the sidecar and
+/// never read).  Without a sidecar the manifest declares the shards, so a
+/// split base fails here with the actionable message instead of a bare
+/// missing-tensor error.
+fn validate_ple_shard_presence(hfq: &HfqFile, sidecar: bool) -> Result<usize, Qwen4ArtifactError> {
+    let present = hfq
+        .tensors()
+        .iter()
+        .filter(|tensor| is_ple_shard_name(&tensor.name))
+        .count();
+    let split = present == 0 && hfq.ple_rows_marker().is_some();
+    if !sidecar {
+        if split {
+            return Err(Qwen4ArtifactError::new(
+                "qwen4: this is a split base (its PLE n-gram rows live in a sidecar) but no PLE \
+                 rows file is attached; put <model>.ple-q4 or <model>.ple-q8 next to it \
+                 (`hipfire pull <model> --ple q4|q8`) and select the format with \
+                 memory.ple_format",
+            ));
+        }
+        return Ok(0);
+    }
+    if present != 0 && present != PLE_SHARD_COUNT {
+        return Err(Qwen4ArtifactError::new(format!(
+            "qwen4: source carries {present} of {PLE_SHARD_COUNT} PLE shard tensors; a PLE rows \
+             sidecar needs all of them (monolithic) or none (split base)"
+        )));
+    }
+    if present == 0 && !split {
+        return Err(Qwen4ArtifactError::new(
+            "qwen4: source has no PLE shard tensors and no hipfire_ple_rows split-base marker; \
+             a PLE rows sidecar cannot bind to it",
+        ));
+    }
+    Ok(present)
+}
+
 fn validate_manifest_inventory(
     hfq: &HfqFile,
     manifest: &Qwen4Manifest,
+    shadowed_ple_shards: usize,
 ) -> Result<usize, Qwen4ArtifactError> {
     let mut expected = BTreeMap::<String, Vec<u32>>::new();
     for entry in &manifest.weights {
@@ -674,10 +789,10 @@ fn validate_manifest_inventory(
             expected.len()
         )));
     }
-    if hfq.tensors().len() != manifest_count {
+    let hfq_declared = hfq.tensors().len() - shadowed_ple_shards;
+    if hfq_declared != manifest_count {
         return Err(Qwen4ArtifactError::new(format!(
-            "qwen4: HFQ source inventory has {} tensors but manifest declares {manifest_count}",
-            hfq.tensors().len()
+            "qwen4: HFQ source inventory has {hfq_declared} tensors but manifest declares {manifest_count}",
         )));
     }
     for tensor in hfq.tensors() {
@@ -686,6 +801,11 @@ fn validate_manifest_inventory(
                 "qwen4: vision tensor {} is not admitted by the text-only source boundary",
                 tensor.name
             )));
+        }
+        if shadowed_ple_shards != 0 && is_ple_shard_name(&tensor.name) {
+            // Shadowed by the attached sidecar: `HfqFile::attach_ple_rows`
+            // already bound their geometry to the sidecar header.
+            continue;
         }
         let Some(shape) = expected.remove(&tensor.name) else {
             return Err(Qwen4ArtifactError::new(format!(
@@ -757,10 +877,15 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
     let config = Qwen4Config::from_metadata_json(&hfq.metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
-    let manifest = Qwen4Manifest::build(&config).map_err(|error| {
+    let mut manifest = Qwen4Manifest::build(&config).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: manifest admission failed: {error}"))
     })?;
-    let source_tensor_count = validate_manifest_inventory(hfq, &manifest)?;
+    let sidecar = hfq.ple_rows().is_some();
+    let shadowed_ple_shards = validate_ple_shard_presence(hfq, sidecar)?;
+    if sidecar {
+        manifest = manifest.without_ple_shards();
+    }
+    let source_tensor_count = validate_manifest_inventory(hfq, &manifest, shadowed_ple_shards)?;
     let ple = PleHashMetadata::from_json(&hfq.metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: PLE metadata admission failed: {error}"))
     })?;
@@ -776,6 +901,7 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
     // later external-row reads.
     let source_identity = validate_source_identity(hfq)?;
     validate_ple_records(hfq, &canonical_ple)?;
+    let ple_rows = admit_ple_rows(hfq, &canonical_ple)?;
 
     let placements = manifest
         .resident_keys()
@@ -792,7 +918,223 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
         placements,
         source_tensor_count,
         source_identity,
+        ple_rows,
     })
+}
+
+/// The geometry facts of a PLE table header that admission checks against the
+/// canonical contract (a plain value so the checks are testable without
+/// building a container).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidecarGeometry {
+    rows_per_shard: u64,
+    row_width: u64,
+    padded_rows: u64,
+    encoding: RowEncoding,
+    encoded_row_bytes: u64,
+    codebook_f32_bits: Option<[u32; 16]>,
+    scale_grid_f32_bits: Option<[u32; 9]>,
+}
+
+impl SidecarGeometry {
+    fn from_header(
+        header: &hipfire_runtime::ple_hot_pack::PleHotPackHeader,
+    ) -> Result<Self, Qwen4ArtifactError> {
+        let table = header.table.as_ref().ok_or_else(|| {
+            Qwen4ArtifactError::new(
+                "qwen4: PLE rows sidecar geometry: the file is a hot-row pack, not a PLE table",
+            )
+        })?;
+        Ok(Self {
+            rows_per_shard: header.rows_per_shard,
+            row_width: header.row_width,
+            padded_rows: header.padded_rows,
+            encoding: header.row_encoding,
+            encoded_row_bytes: header.encoded_row_bytes,
+            codebook_f32_bits: table.codebook_f32_bits,
+            scale_grid_f32_bits: table.scale_grid_f32_bits,
+        })
+    }
+}
+
+/// The sidecar's geometry against the canonical PLE contract, and the row
+/// encoding it declares.
+///
+/// A sidecar is accepted only at the exact geometry the pinned metadata
+/// hashes into: [`PLE_SHARD_COUNT`] shards of [`PLE_SHARD_ROWS`] rows of
+/// [`PLE_ROW_WIDTH`] values, summing to the metadata's padded rows.  Q4LM
+/// must carry the exact LM4 codebook and scale grid the decoder is compiled
+/// with (the decoder has no way to read another), and Q8F16 carries neither.
+fn validate_sidecar_geometry(
+    geometry: &SidecarGeometry,
+    canonical: &PleHashMetadata,
+) -> Result<RowEncoding, Qwen4ArtifactError> {
+    let fail =
+        |what: String| Qwen4ArtifactError::new(format!("qwen4: PLE rows sidecar geometry: {what}"));
+    if geometry.rows_per_shard != PLE_SHARD_ROWS as u64
+        || geometry.row_width != PLE_ROW_WIDTH as u64
+    {
+        return Err(fail(format!(
+            "{} rows per shard x {} values, expected {PLE_SHARD_ROWS} x {PLE_ROW_WIDTH}",
+            geometry.rows_per_shard, geometry.row_width
+        )));
+    }
+    // Canonical rows per shard times `PLE_SHARD_COUNT` is the metadata's
+    // padded row count, so equality here pins the shard count too.
+    if geometry.padded_rows != canonical.padded_rows()
+        || geometry.padded_rows != (PLE_SHARD_ROWS * PLE_SHARD_COUNT) as u64
+    {
+        return Err(fail(format!(
+            "{} padded rows, PLE metadata has {} ({PLE_SHARD_COUNT} shards of {PLE_SHARD_ROWS})",
+            geometry.padded_rows,
+            canonical.padded_rows()
+        )));
+    }
+    let encoding = geometry.encoding;
+    if !matches!(encoding, RowEncoding::Q8F16 | RowEncoding::Q4Lm) {
+        return Err(fail(format!(
+            "row encoding {} is not Q8F16 or Q4LM",
+            encoding.dtype_name()
+        )));
+    }
+    let row_bytes = encoding.encoded_row_bytes(PLE_ROW_WIDTH) as u64;
+    if geometry.encoded_row_bytes != row_bytes {
+        return Err(fail(format!(
+            "{} rows are {} bytes, expected {row_bytes}",
+            encoding.dtype_name(),
+            geometry.encoded_row_bytes
+        )));
+    }
+    let (book, grid) = match encoding {
+        RowEncoding::Q4Lm => (Some(lm4_codebook_bits()), Some(lm4_scale_grid_bits())),
+        _ => (None, None),
+    };
+    if geometry.codebook_f32_bits != book || geometry.scale_grid_f32_bits != grid {
+        return Err(fail(format!(
+            "{} codebook/scale grid do not match this build's Lloyd-Max tables",
+            encoding.dtype_name()
+        )));
+    }
+    Ok(encoding)
+}
+
+/// The PLE rows source of `hfq`: its attached sidecar (validated) or, with
+/// none attached, its own embedded shard tensors.
+fn admit_ple_rows(
+    hfq: &HfqFile,
+    canonical: &PleHashMetadata,
+) -> Result<Qwen4PleRows, Qwen4ArtifactError> {
+    let Some(rows) = hfq.ple_rows() else {
+        return Ok(Qwen4PleRows::Embedded);
+    };
+    let path = rows.path();
+    let geometry = SidecarGeometry::from_header(rows.header())?;
+    let encoding = validate_sidecar_geometry(&geometry, canonical)?;
+    let sidecar_rows = match rows.order() {
+        PackOrder::Row => {
+            let descriptors = rows.shard_descriptors().map_err(|error| {
+                Qwen4ArtifactError::new(format!(
+                    "qwen4: PLE rows sidecar {} descriptors could not be sealed: {error}",
+                    path.display()
+                ))
+            })?;
+            if descriptors.len() != PLE_SHARD_COUNT {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: PLE rows sidecar {} yields {} shard descriptors, expected \
+                     {PLE_SHARD_COUNT}",
+                    path.display(),
+                    descriptors.len()
+                )));
+            }
+            SidecarRows::Descriptors(descriptors)
+        }
+        PackOrder::Rank => SidecarRows::Table(rows.open_table_store().map_err(|error| {
+            Qwen4ArtifactError::new(format!(
+                "qwen4: PLE rows sidecar {} could not be opened: {error}",
+                path.display()
+            ))
+        })?),
+    };
+    Ok(Qwen4PleRows::Sidecar {
+        path: path.to_path_buf(),
+        encoding,
+        rows: sidecar_rows,
+    })
+}
+
+impl Qwen4HfqmArtifact {
+    /// The [`PLE_SHARD_COUNT`] ordered shard descriptors of the PLE rows
+    /// source: the row-order sidecar's, or the artifact's own shard tensors
+    /// (`hfq` must be the file this receipt was admitted from).  A
+    /// rank-order table has none: it is its own hot-row pack and is read
+    /// through its store ([`Qwen4PleRows::rank_table`]).
+    pub fn ple_row_descriptors(
+        &self,
+        hfq: &HfqFile,
+    ) -> Result<Vec<SourceRangeDescriptor>, Qwen4ArtifactError> {
+        match &self.ple_rows {
+            Qwen4PleRows::Sidecar {
+                rows: SidecarRows::Descriptors(descriptors),
+                ..
+            } => Ok(descriptors.clone()),
+            Qwen4PleRows::Sidecar {
+                path,
+                rows: SidecarRows::Table(_),
+                ..
+            } => Err(Qwen4ArtifactError::new(format!(
+                "qwen4: PLE rows {} are a rank-order table; it has no row-order shard ranges",
+                path.display()
+            ))),
+            Qwen4PleRows::Embedded => (0..PLE_SHARD_COUNT)
+                .map(|shard| {
+                    let name = ple_shard_name(shard);
+                    hfq.tensor_range(&name)
+                        .map_err(|error| {
+                            Qwen4ArtifactError::new(format!(
+                                "qwen4: PLE shard range {name} could not be sealed: {error}"
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            Qwen4ArtifactError::new(format!("qwen4: PLE shard {name} is missing"))
+                        })
+                })
+                .collect(),
+        }
+    }
+
+    /// The file the PLE rows are read from and its length: the sidecar, or
+    /// the model file itself (path as opened).  A hot-row pack is cut from
+    /// and verified against exactly this file.
+    pub fn ple_rows_source(&self, hfq: &HfqFile) -> Result<(PathBuf, u64), Qwen4ArtifactError> {
+        match &self.ple_rows {
+            Qwen4PleRows::Embedded => {
+                let file = self.source_identity.files.first().ok_or_else(|| {
+                    Qwen4ArtifactError::new("qwen4: source identity has no backing file")
+                })?;
+                Ok((hfq.path().to_path_buf(), file.len))
+            }
+            Qwen4PleRows::Sidecar { path, rows, .. } => {
+                let bytes = match rows {
+                    SidecarRows::Descriptors(descriptors) => descriptors
+                        .first()
+                        .and_then(|descriptor| descriptor.source_identity().files.first())
+                        .map(|file| file.len)
+                        .ok_or_else(|| {
+                            Qwen4ArtifactError::new("qwen4: PLE rows sidecar has no backing file")
+                        })?,
+                    SidecarRows::Table(_) => std::fs::metadata(path)
+                        .map_err(|error| {
+                            Qwen4ArtifactError::new(format!(
+                                "qwen4: stat PLE rows {}: {error}",
+                                path.display()
+                            ))
+                        })?
+                        .len(),
+                };
+                Ok((path.clone(), bytes))
+            }
+        }
+    }
 }
 
 fn read_i64_record(
@@ -1125,6 +1467,321 @@ mod tests {
         assert!(
             error.to_string().contains("not an admitted source"),
             "{error}"
+        );
+    }
+
+    fn metadata_tensors() -> Vec<crate::weights::MetadataTensor> {
+        [
+            (PLE_MULTIPLIERS_NAME, 3),
+            (PLE_OFFSETS_NAME, 16),
+            (PLE_VOCAB_SIZES_NAME, 16),
+        ]
+        .into_iter()
+        .map(|(name, values)| crate::weights::MetadataTensor {
+            name: name.to_string(),
+            shape: vec![values],
+            source_dtype: "I64".to_string(),
+        })
+        .collect()
+    }
+
+    /// A manifest that declares only the three PLE metadata records, i.e.
+    /// what a sidecar-fed manifest reduces to once the 128 shards are trimmed
+    /// from a base whose other tensors are not under test.
+    fn trimmed_manifest() -> Qwen4Manifest {
+        Qwen4Manifest {
+            weights: Vec::new(),
+            state: Vec::new(),
+            metadata: metadata_tensors(),
+        }
+    }
+
+    /// Metadata JSON with (`split`) or without the split-base marker.
+    fn marked_metadata_json(split: bool) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&metadata_json()).unwrap();
+        if split {
+            value[hipfire_runtime::ple_sidecar::PLE_BASE_MARKER_KEY] = json!({
+                "version": 1,
+                "location": "sidecar",
+                "shard_count": PLE_SHARD_COUNT,
+                "rows_per_shard": PLE_SHARD_ROWS,
+                "row_width": PLE_ROW_WIDTH,
+                "q8_rows_sha256": "0".repeat(64),
+            });
+        }
+        value.to_string()
+    }
+
+    /// The three metadata records plus `shards` tiny Q8F16 shard tensors under
+    /// the canonical shard names (their geometry is not what the sidecar
+    /// seams under test look at).
+    fn write_base_fixture(path: &Path, split: bool, shards: usize) {
+        let canonical = PleHashMetadata::qwen4();
+        let i64s = |values: Vec<i64>| i64_bytes(&values);
+        let mut tensors = (0..shards)
+            .map(|shard| HfqMemTensor {
+                name: ple_shard_name(shard),
+                quant_type: QWEN4_QT_Q8F16,
+                shape: vec![1, 32],
+                group_size: 0,
+                data: vec![0u8; 34],
+            })
+            .collect::<Vec<_>>();
+        tensors.extend([
+            HfqMemTensor {
+                name: PLE_MULTIPLIERS_NAME.to_string(),
+                quant_type: QWEN4_QT_I64,
+                shape: vec![3],
+                group_size: 0,
+                data: i64s(canonical.multipliers().to_vec()),
+            },
+            HfqMemTensor {
+                name: PLE_OFFSETS_NAME.to_string(),
+                quant_type: QWEN4_QT_I64,
+                shape: vec![16],
+                group_size: 0,
+                data: i64s(canonical.head_offsets().iter().map(|&v| v as i64).collect()),
+            },
+            HfqMemTensor {
+                name: PLE_VOCAB_SIZES_NAME.to_string(),
+                quant_type: QWEN4_QT_I64,
+                shape: vec![16],
+                group_size: 0,
+                data: i64s(
+                    canonical
+                        .head_vocab_sizes()
+                        .iter()
+                        .map(|&v| v as i64)
+                        .collect(),
+                ),
+            },
+        ]);
+        write_hfqm_package_mem(path, ARCH_ID, &marked_metadata_json(split), &tensors).unwrap();
+    }
+
+    fn with_base_fixture<T>(
+        name: &str,
+        split: bool,
+        shards: usize,
+        check: impl FnOnce(&HfqFile) -> T,
+    ) -> T {
+        let path = fixture_path(name);
+        write_base_fixture(&path, split, shards);
+        let hfq = HfqFile::open(&path).unwrap();
+        let result = check(&hfq);
+        drop(hfq);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+        result
+    }
+
+    #[test]
+    fn split_base_without_sidecar_names_the_sidecar_and_the_setting() {
+        with_base_fixture("split-bare", true, 0, |hfq| {
+            let error = validate_ple_shard_presence(hfq, false)
+                .unwrap_err()
+                .to_string();
+            for needle in [".ple-q4", ".ple-q8", "memory.ple_format", "split base"] {
+                assert!(error.contains(needle), "{needle} missing from: {error}");
+            }
+        });
+    }
+
+    #[test]
+    fn plain_base_without_shards_keeps_the_missing_tensor_diagnostic() {
+        // No marker, no shards, no sidecar: not a split base; the inventory
+        // check (not this one) refuses it as before.
+        with_base_fixture("plain-bare", false, 0, |hfq| {
+            assert_eq!(validate_ple_shard_presence(hfq, false).unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn sidecar_requires_all_shards_or_a_split_marker() {
+        with_base_fixture("split-sidecar", true, 0, |hfq| {
+            assert_eq!(validate_ple_shard_presence(hfq, true).unwrap(), 0);
+        });
+        with_base_fixture("mono-sidecar", false, PLE_SHARD_COUNT, |hfq| {
+            assert_eq!(
+                validate_ple_shard_presence(hfq, true).unwrap(),
+                PLE_SHARD_COUNT
+            );
+            // Without a sidecar the same file is the grandfathered monolith.
+            assert_eq!(validate_ple_shard_presence(hfq, false).unwrap(), 0);
+        });
+        with_base_fixture("partial-sidecar", false, 5, |hfq| {
+            let error = validate_ple_shard_presence(hfq, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("5 of 128"), "{error}");
+        });
+        with_base_fixture("bare-sidecar", false, 0, |hfq| {
+            let error = validate_ple_shard_presence(hfq, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("hipfire_ple_rows"), "{error}");
+        });
+    }
+
+    #[test]
+    fn inventory_accepts_a_split_base_and_a_shadowed_monolith_under_a_sidecar() {
+        let manifest = trimmed_manifest();
+        assert_eq!(manifest.source_tensor_count(), 3);
+        // Split base: the index is exactly the trimmed manifest.
+        with_base_fixture("inv-split", true, 0, |hfq| {
+            let shadowed = validate_ple_shard_presence(hfq, true).unwrap();
+            assert_eq!(
+                validate_manifest_inventory(hfq, &manifest, shadowed).unwrap(),
+                3
+            );
+        });
+        // Monolith + sidecar: the 128 shard tensors are in the index, shadowed
+        // and ignored.
+        with_base_fixture("inv-mono", false, PLE_SHARD_COUNT, |hfq| {
+            let shadowed = validate_ple_shard_presence(hfq, true).unwrap();
+            assert_eq!(shadowed, PLE_SHARD_COUNT);
+            assert_eq!(
+                validate_manifest_inventory(hfq, &manifest, shadowed).unwrap(),
+                3
+            );
+            // The same index against the trimmed manifest without the shadow
+            // allowance is an inventory mismatch, never a silent pass.
+            let error = validate_manifest_inventory(hfq, &manifest, 0).unwrap_err();
+            assert!(error.to_string().contains("131 tensors"), "{error}");
+        });
+    }
+
+    #[test]
+    fn inventory_still_refuses_an_undeclared_tensor_next_to_a_sidecar() {
+        let path = fixture_path("inv-foreign");
+        let canonical = PleHashMetadata::qwen4();
+        let record = |name: &str, shape: u32, values: Vec<i64>| HfqMemTensor {
+            name: name.to_string(),
+            quant_type: QWEN4_QT_I64,
+            shape: vec![shape],
+            group_size: 0,
+            data: i64_bytes(&values),
+        };
+        let tensors = vec![
+            HfqMemTensor {
+                name: "model.unknown.weight".to_string(),
+                quant_type: QWEN4_QT_BF16,
+                shape: vec![1],
+                group_size: 0,
+                data: vec![0, 0],
+            },
+            record(PLE_MULTIPLIERS_NAME, 3, canonical.multipliers().to_vec()),
+            record(
+                PLE_OFFSETS_NAME,
+                16,
+                canonical.head_offsets().iter().map(|&v| v as i64).collect(),
+            ),
+            record(
+                PLE_VOCAB_SIZES_NAME,
+                16,
+                canonical
+                    .head_vocab_sizes()
+                    .iter()
+                    .map(|&v| v as i64)
+                    .collect(),
+            ),
+        ];
+        write_hfqm_package_mem(&path, ARCH_ID, &marked_metadata_json(true), &tensors).unwrap();
+        let hfq = HfqFile::open(&path).unwrap();
+        let error = validate_manifest_inventory(&hfq, &trimmed_manifest(), 0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("4 tensors but manifest declares 3"),
+            "{error}"
+        );
+        drop(hfq);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    fn sidecar_geometry(encoding: RowEncoding) -> SidecarGeometry {
+        let q4 = encoding == RowEncoding::Q4Lm;
+        SidecarGeometry {
+            rows_per_shard: PLE_SHARD_ROWS as u64,
+            row_width: PLE_ROW_WIDTH as u64,
+            padded_rows: PleHashMetadata::qwen4().padded_rows(),
+            encoding,
+            encoded_row_bytes: encoding.encoded_row_bytes(PLE_ROW_WIDTH) as u64,
+            codebook_f32_bits: q4.then(lm4_codebook_bits),
+            scale_grid_f32_bits: q4.then(lm4_scale_grid_bits),
+        }
+    }
+
+    #[test]
+    fn sidecar_geometry_admits_the_canonical_q8_and_q4_tables() {
+        let canonical = PleHashMetadata::qwen4();
+        for encoding in [RowEncoding::Q8F16, RowEncoding::Q4Lm] {
+            assert_eq!(
+                validate_sidecar_geometry(&sidecar_geometry(encoding), &canonical).unwrap(),
+                encoding
+            );
+        }
+        assert_eq!(RowEncoding::Q4Lm.encoded_row_bytes(PLE_ROW_WIDTH), 90);
+    }
+
+    #[test]
+    fn sidecar_geometry_refuses_each_deviation() {
+        let canonical = PleHashMetadata::qwen4();
+        let refused = |geometry: SidecarGeometry, needle: &str| {
+            let error = validate_sidecar_geometry(&geometry, &canonical)
+                .expect_err(needle)
+                .to_string();
+            assert!(error.contains(needle), "{needle} missing from: {error}");
+        };
+        let q8 = || sidecar_geometry(RowEncoding::Q8F16);
+        let q4 = || sidecar_geometry(RowEncoding::Q4Lm);
+        let mut geometry = q8();
+        geometry.rows_per_shard += 1;
+        refused(geometry, "rows per shard");
+        let mut geometry = q8();
+        geometry.row_width = 128;
+        refused(geometry, "rows per shard");
+        let mut geometry = q8();
+        geometry.padded_rows += 1;
+        refused(geometry, "padded rows");
+        let mut geometry = q8();
+        geometry.padded_rows /= 2;
+        refused(geometry, "padded rows");
+        let mut geometry = q8();
+        geometry.encoding = RowEncoding::Bf16;
+        refused(geometry, "not Q8F16 or Q4LM");
+        let mut geometry = q8();
+        geometry.encoded_row_bytes = 171;
+        refused(geometry, "bytes, expected 170");
+        let mut geometry = q4();
+        geometry.encoded_row_bytes = 170;
+        refused(geometry, "bytes, expected 90");
+        let mut geometry = q4();
+        geometry.codebook_f32_bits = None;
+        refused(geometry, "Lloyd-Max tables");
+        let mut geometry = q4();
+        geometry.codebook_f32_bits.as_mut().unwrap()[3] ^= 1;
+        refused(geometry, "Lloyd-Max tables");
+        let mut geometry = q4();
+        geometry.scale_grid_f32_bits.as_mut().unwrap()[0] ^= 1;
+        refused(geometry, "Lloyd-Max tables");
+        // A Q8F16 table must not carry a codebook.
+        let mut geometry = q8();
+        geometry.codebook_f32_bits = Some(lm4_codebook_bits());
+        refused(geometry, "Lloyd-Max tables");
+    }
+
+    #[test]
+    fn ple_fingerprint_helper_matches_the_metadata_fingerprint() {
+        let expected = PleHashMetadata::qwen4()
+            .fingerprint()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hipfire_runtime::ple_sidecar::ple_fingerprint_from_metadata(&metadata_json()).unwrap(),
+            expected
         );
     }
 }

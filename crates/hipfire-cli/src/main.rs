@@ -51,6 +51,7 @@ use std::{
 mod bench_concurrency;
 mod bench_power;
 mod kernel_pack;
+mod ple;
 mod serve;
 mod setup;
 use crate::serve::complete::next_attempt_id;
@@ -145,6 +146,8 @@ pub(crate) enum Commands {
     Stop(StopArgs),
     /// Stop and start the native HTTP service.
     Restart(ServeArgs),
+    /// Derive or split the Flash-Next PLE row sidecars (`<model>.ple-q4`, `<base>.ple-q8`).
+    Ple(ple::PleArgs),
 }
 
 #[derive(Args, Debug)]
@@ -396,6 +399,11 @@ pub(crate) struct PullArgs {
     /// Replace an existing target after downloading and verifying a new copy.
     #[arg(long)]
     force: bool,
+    /// Which PLE row sidecar a split model pulls next to its base: `auto`
+    /// (memory.ple_format, else q4 on gfx1151 and q8 elsewhere), `q4`, `q8`,
+    /// `all`, or `none` (fetched on first load).
+    #[arg(long, value_enum, default_value_t = ple::PleSelection::Auto)]
+    ple: ple::PleSelection,
 }
 
 #[derive(Args, Debug)]
@@ -812,6 +820,7 @@ fn run() -> Result<()> {
         Some(Commands::Registry(args)) => registry_command(&paths, args),
         Some(Commands::List(args)) => list_command(&paths, args),
         Some(Commands::Pull(args)) => pull_command(&paths, args),
+        Some(Commands::Ple(args)) => ple::ple_command(&paths, args),
         Some(Commands::Rm(args)) => rm_command(&paths, args),
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
@@ -1854,6 +1863,9 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     } else {
         true
     };
+    let ple_plan = entry
+        .has_ple_sidecars()
+        .then(|| ple::announce_pull_plan(paths, &loaded.registry, entry, args.ple, !needs_base));
     if needs_base {
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
@@ -1878,6 +1890,17 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
                     entry.size_bytes.expect("pinned size"),
                 )?;
             }
+        }
+    }
+    if let Some(plan) = &ple_plan {
+        for (format, sidecar) in &plan.sidecars {
+            ple::fetch_ple_sidecar(
+                entry,
+                *format,
+                sidecar,
+                &paths.models.join(&sidecar.file),
+                args.force,
+            )?;
         }
     }
     for (label, sidecar) in [
@@ -2280,6 +2303,13 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             );
         }
     }
+    // The PLE row sidecars (and their hot-row packs) ride with the model file
+    // that was resolved, whichever layout it is.
+    targets.extend(
+        ple::ple_sidecar_paths(&path)
+            .into_iter()
+            .filter(|sidecar| sidecar.is_file()),
+    );
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
         let kept = paths.models.join(file);
@@ -2336,6 +2366,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                 PullArgs {
                     model: args.model.clone(),
                     force: false,
+                    ple: ple::PleSelection::Auto,
                 },
             )?;
             // pull already verified either the downloaded canonical or legacy fallback.
@@ -2420,6 +2451,14 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             args.stats,
         );
     }
+    ple::ensure_ple_sidecar(
+        registry,
+        entry,
+        canonical.as_deref(),
+        &model_path,
+        ple::request_from_config(&resolved),
+        true,
+    )?;
 
     let daemon = find_daemon(paths).ok_or_else(|| {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
@@ -2722,6 +2761,7 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
                 PullArgs {
                     model: args.model.clone(),
                     force: false,
+                    ple: ple::PleSelection::Auto,
                 },
             )?;
             model_path = Some(paths.models.join(&entry.file));
@@ -3281,11 +3321,22 @@ pub(crate) fn resolve_model_path(
             .is_some_and(|(_, record)| record.path.as_ref().is_some_and(|path| path.is_file()))
     });
     if !explicit.is_file() && !model.contains('/') && !model.contains('\\') && !catalog_path {
-        if let Some((_, entry)) = registry
-            .model(model)
-            .filter(|(_, entry)| entry.is_flash_next_xts())
-        {
-            return migrate_flash_next_xts(paths, entry);
+        if let Some((_, entry)) = registry.model(model) {
+            if entry.is_flash_next_xts() {
+                return migrate_flash_next_xts(paths, entry);
+            }
+            // The split base is absent: verify (and link the legacy spelling of)
+            // the pinned monolithic it was cut from, exactly as its own tag does.
+            if entry.has_ple_sidecars() && !paths.models.join(&entry.file).is_file() {
+                if let Some((_, sibling)) = registry
+                    .monolithic_sibling(entry)
+                    .filter(|(_, sibling)| sibling.is_flash_next_xts())
+                {
+                    if let Some(path) = migrate_flash_next_xts(paths, sibling)? {
+                        return Ok(Some(path));
+                    }
+                }
+            }
         }
     }
     Ok(find_model_path(paths, registry, model))
@@ -3434,6 +3485,17 @@ pub(crate) fn find_model_path(
         .into_iter()
         .map(|file| paths.models.join(file))
         .find(|path| path.is_file());
+    }
+    if let Some((_, entry)) = registry
+        .model(model)
+        .filter(|(_, entry)| entry.has_ple_sidecars())
+    {
+        // A split tag serves its base, else the grandfathered monolithic it was
+        // cut from, so nobody is forced to re-download after the registry switch.
+        return ple::split_model_files(registry, entry)
+            .iter()
+            .map(|file| paths.models.join(file))
+            .find(|path| path.is_file());
     }
     // An exact on-disk spelling outranks a registry alias that would rewrite it.
     // The registry maps a model NAME to its canonical FILE, which is what makes
@@ -5786,6 +5848,7 @@ fn open_bench_engine(
             PullArgs {
                 model: args.model.clone(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )?;
         // Do not hash a payload twice after a verified pull.
@@ -5793,6 +5856,14 @@ fn open_bench_engine(
     }
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
+    ple::ensure_ple_sidecar(
+        &registry,
+        entry.as_ref(),
+        tag.as_deref(),
+        &path,
+        ple::request_from_config(&resolved),
+        true,
+    )?;
     let run_need = (args.matrix || args.redline).then(|| {
         bench_matrix_seq_need(
             &args.pp,
@@ -8008,6 +8079,8 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
                 entry.vae.as_ref(),
                 entry.dflash.as_ref(),
                 entry.vision.as_ref(),
+                entry.ple_q4.as_ref(),
+                entry.ple_q8.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -8024,7 +8097,8 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
 /// from `MODEL_SUFFIXES` (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a
 /// suffix-only test hides exactly those models.
 pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
-    is_model_file(name) || registry.models.values().any(|entry| entry.file == name)
+    !ple::is_ple_sidecar_name(name)
+        && (is_model_file(name) || registry.models.values().any(|entry| entry.file == name))
 }
 
 /// True when `name` can actually serve a completion, as opposed to merely
@@ -8051,7 +8125,7 @@ pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool 
 /// [`HfqFile::probe_arch_id`] reports a [`SERVE_TRUNK_ARCH_IDS`] id. The
 /// registry cannot answer for it — the catalog only knows the files it ships.
 pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1) -> bool {
-    if registry_sidecar_files(registry).contains(name) {
+    if ple::is_ple_sidecar_name(name) || registry_sidecar_files(registry).contains(name) {
         return false;
     }
     if !is_listable_model_file(name, registry) {
@@ -11090,6 +11164,9 @@ mod tests {
             }
         }
 
+        // `HIPFIRE_HF_BASE` is process-global: the pull tests point it at
+        // their local servers under the same lock.
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _hf_base = EnvRestore("HIPFIRE_HF_BASE", env::var_os("HIPFIRE_HF_BASE"));
         let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
@@ -14874,6 +14951,7 @@ mod tests {
             PullArgs {
                 model: "test-model".into(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )
         .unwrap();
@@ -14945,6 +15023,7 @@ mod tests {
             PullArgs {
                 model: "test-model".into(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )
         .unwrap();
@@ -15528,5 +15607,439 @@ mod tests {
         drop(early);
         let (status, _, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
         assert_eq!(status, 200);
+    }
+
+    // ---- PLE split layout: pull, on-demand, tag fallback, rm, listings --------
+
+    fn ple_sha(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    /// Serves exactly `files.len()` requests, matching the LAST path segment
+    /// exactly (the shared `tiny_http_server` matches substrings, which cannot
+    /// tell `x-base.mq4` from `x-base.mq4.ple-q8`).
+    fn exact_http_server(
+        files: std::collections::HashMap<String, Vec<u8>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let expected = files.len();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..expected {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let target = request
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.rsplit('/').next())
+                    .unwrap_or_default()
+                    .to_owned();
+                match files.get(&target) {
+                    Some(data) => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(data);
+                    }
+                    None => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+                let _ = stream.flush();
+            }
+        });
+        (base, handle)
+    }
+
+    const PLE_BASE: &[u8] = b"split-base-bytes";
+    const PLE_Q8: &[u8] = b"q8-rows-bytes";
+    const PLE_Q4: &[u8] = b"q4-rows";
+
+    /// `split-model` is the split entry (base + both slots); `split-model:mono`
+    /// is its non-pinned monolithic sibling.
+    fn split_registry_raw() -> String {
+        format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "split-model":{{
+                    "repo":"test/repo","file":"split-model-base.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},
+                    "ple_q8":{{"file":"split-model-base.mq4.ple-q8","sha256":"{}","size_bytes":{}}},
+                    "ple_q4":{{"file":"split-model-base.mq4.ple-q4","sha256":"{}","size_bytes":{}}}
+                }},
+                "split-model:mono":{{
+                    "repo":"test/repo","file":"split-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x"
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            ple_sha(PLE_BASE),
+            PLE_BASE.len(),
+            ple_sha(PLE_Q8),
+            PLE_Q8.len(),
+            ple_sha(PLE_Q4),
+            PLE_Q4.len(),
+        )
+    }
+
+    #[test]
+    fn pull_downloads_the_base_and_only_the_selected_ple_sidecars() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let cases = [
+            (ple::PleSelection::Q8, false, true),
+            (ple::PleSelection::Q4, true, false),
+            (ple::PleSelection::All, true, true),
+            (ple::PleSelection::Skip, false, false),
+        ];
+        for (index, (selection, want_q4, want_q8)) in cases.into_iter().enumerate() {
+            let paths = test_paths(&format!("ple-pull-{index}"));
+            write_test_registry_cache(&paths, &split_registry_raw());
+            let mut files = std::collections::HashMap::new();
+            files.insert("split-model-base.mq4".to_owned(), PLE_BASE.to_vec());
+            if want_q8 {
+                files.insert("split-model-base.mq4.ple-q8".to_owned(), PLE_Q8.to_vec());
+            }
+            if want_q4 {
+                files.insert("split-model-base.mq4.ple-q4".to_owned(), PLE_Q4.to_vec());
+            }
+            let (base, handle) = exact_http_server(files);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+            pull_command(
+                &paths,
+                PullArgs {
+                    model: "split-model".into(),
+                    force: false,
+                    ple: selection,
+                },
+            )
+            .unwrap();
+            handle.join().unwrap();
+            let models = &paths.models;
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4")).unwrap(),
+                PLE_BASE
+            );
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4.ple-q8")).ok(),
+                want_q8.then(|| PLE_Q8.to_vec()),
+                "{selection:?}"
+            );
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4.ple-q4")).ok(),
+                want_q4.then(|| PLE_Q4.to_vec()),
+                "{selection:?}"
+            );
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn pull_rejects_a_ple_sidecar_that_fails_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-pull-corrupt");
+        write_test_registry_cache(&paths, &split_registry_raw());
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4".to_owned(), PLE_BASE.to_vec());
+        files.insert(
+            "split-model-base.mq4.ple-q8".to_owned(),
+            b"tampered-rows".to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        let error = pull_command(
+            &paths,
+            PullArgs {
+                model: "split-model".into(),
+                force: false,
+                ple: ple::PleSelection::Q8,
+            },
+        )
+        .unwrap_err();
+        handle.join().unwrap();
+        assert!(format!("{error:#}").contains("mismatch"), "{error:#}");
+        assert!(
+            !paths.models.join("split-model-base.mq4.ple-q8").exists(),
+            "a failed verification must not leave the sidecar installed"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn on_demand_downloads_the_selected_sidecar_once_and_leaves_usable_files_alone() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let paths = test_paths("ple-on-demand");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple on-demand").unwrap();
+        let (tag, entry) = registry.model("split-model").unwrap();
+        let model = paths.models.join(&entry.file);
+        fs::write(&model, PLE_BASE).unwrap();
+        let q8 = paths.models.join("split-model-base.mq4.ple-q8");
+        let q4 = paths.models.join("split-model-base.mq4.ple-q4");
+
+        // q8 requested and absent: one verified download.
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4.ple-q8".to_owned(), PLE_Q8.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry),
+            Some(tag),
+            &model,
+            hipfire_config::memory::PleFormatRequest::Q8,
+            true,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(fs::read(&q8).unwrap(), PLE_Q8);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
+
+        // Present now: q8 and q4 requests, and auto, download nothing (no server).
+        for request in [
+            hipfire_config::memory::PleFormatRequest::Q8,
+            hipfire_config::memory::PleFormatRequest::Q4,
+            hipfire_config::memory::PleFormatRequest::Auto,
+        ] {
+            ple::ensure_ple_sidecar(&registry, Some(entry), Some(tag), &model, request, true)
+                .unwrap();
+        }
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
+        assert!(
+            !q4.exists(),
+            "q4 is derived locally from the q8 rows, never downloaded"
+        );
+
+        // q4 requested with neither file present: the q4 sidecar is fetched.
+        fs::remove_file(&q8).unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4.ple-q4".to_owned(), PLE_Q4.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry),
+            Some(tag),
+            &model,
+            hipfire_config::memory::PleFormatRequest::Q4,
+            true,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(fs::read(&q4).unwrap(), PLE_Q4);
+        assert!(!q8.exists());
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn split_tag_serves_a_local_monolithic_instead_of_forcing_a_download() {
+        let paths = test_paths("ple-tag-fallback");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple fallback").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            None
+        );
+        assert_eq!(find_model_path(&paths, &registry, "split-model"), None);
+
+        let mono = paths.models.join("split-model.mq4");
+        fs::write(&mono, b"monolithic").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            Some(mono.clone()),
+            "the split tag falls back to the local monolithic sibling"
+        );
+        // The sibling's own tag is unaffected.
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model:mono").unwrap(),
+            Some(mono.clone())
+        );
+
+        // Once the split base is installed it wins.
+        let base = paths.models.join("split-model-base.mq4");
+        fs::write(&base, PLE_BASE).unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            Some(base.clone())
+        );
+        assert_eq!(
+            find_model_path(&paths, &registry, "split-model"),
+            Some(base)
+        );
+        // The split tag never fuzzy-matches an unrelated local file.
+        fs::remove_file(paths.models.join("split-model-base.mq4")).unwrap();
+        fs::remove_file(&mono).unwrap();
+        fs::write(paths.models.join("split-model.mq4r"), b"other tier").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            None
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn split_tag_verifies_the_pinned_monolithic_like_its_own_tag() {
+        let paths = test_paths("ple-tag-fallback-pinned");
+        fs::create_dir_all(&paths.models).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{
+                "qwen3.8:flash-next":{
+                    "repo":"hipfire-models/qwen3.8-flash-next",
+                    "file":"qwen3.8-flash-next-base.mq4-xts","size_gb":70.9,"min_vram_gb":8,"desc":"split",
+                    "ple_q8":{"file":"qwen3.8-flash-next-base.mq4-xts.ple-q8"}
+                },
+                "qwen3.8:flash-next-mq4-xts":{
+                    "repo":"hipfire-models/qwen3.8-flash-next",
+                    "file":"qwen3.8-flash-next.mq4-xts","size_gb":125.29,"min_vram_gb":8,"desc":"pin",
+                    "sha256":"8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+                    "size_bytes":125288544792
+                }
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "ple pinned").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            None
+        );
+        // A wrong-size file under either grandfathered spelling is a verification
+        // error (never silently served), exactly as for the monolithic tag.
+        for name in [
+            "qwen3.8-flash-next.mq4-xts",
+            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
+        ] {
+            let path = paths.models.join(name);
+            fs::write(&path, b"not the pinned bytes").unwrap();
+            let error = resolve_model_path(&paths, &registry, "qwen3.8:flash-next")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("size mismatch"), "{name}: {error}");
+            fs::remove_file(&path).unwrap();
+        }
+        // With the split base installed the monolithic is never touched.
+        fs::write(
+            paths.models.join("qwen3.8-flash-next.mq4-xts"),
+            b"not the pinned bytes",
+        )
+        .unwrap();
+        let base = paths.models.join("qwen3.8-flash-next-base.mq4-xts");
+        fs::write(&base, b"base").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            Some(base)
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_ple_sidecars_with_either_layout() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-rm");
+        write_test_registry_cache(&paths, &split_registry_raw());
+        fs::create_dir_all(&paths.models).unwrap();
+        let split_files = [
+            "split-model-base.mq4",
+            "split-model-base.mq4.ple-q4",
+            "split-model-base.mq4.ple-q8",
+            "split-model-base.mq4.ple-q4.plehotrows",
+            "split-model-base.mq4.ple-q8.plehotrows",
+            "split-model-base.mq4.plehot",
+        ];
+        for file in split_files {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        fs::write(paths.models.join("untouched.mq4"), b"x").unwrap();
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "split-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        for file in split_files {
+            assert!(!paths.models.join(file).exists(), "{file} must be removed");
+        }
+        assert!(paths.models.join("untouched.mq4").exists());
+
+        // A monolithic served under the split tag takes its derived q4 with it.
+        for file in ["split-model.mq4", "split-model.mq4.ple-q4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "split-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("split-model.mq4").exists());
+        assert!(!paths.models.join("split-model.mq4.ple-q4").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn ple_sidecars_are_never_listed_or_served_as_models() {
+        let paths = test_paths("ple-listing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple listing").unwrap();
+        let sidecars = [
+            "split-model-base.mq4.ple-q4",
+            "split-model-base.mq4.ple-q8",
+            "split-model-base.mq4.plehot",
+            "split-model-base.mq4.plehotrows",
+            "split-model-base.mq4.ple-q8.plehotrows",
+            "split-model.mq4.ple-q4",
+            "unregistered-base.mq4.ple-q8",
+        ];
+        for name in sidecars {
+            assert!(!is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                !is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        for name in ["split-model-base.mq4", "split-model.mq4"] {
+            assert!(is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        for name in sidecars
+            .iter()
+            .chain(&["split-model-base.mq4", "split-model.mq4"])
+        {
+            fs::write(paths.models.join(name), b"x").unwrap();
+        }
+        let mut listed: Vec<String> = local_model_paths(&paths, &registry)
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        listed.sort();
+        assert_eq!(listed, ["split-model-base.mq4", "split-model.mq4"]);
+        assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q8"));
+        assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q4"));
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 }

@@ -11,6 +11,8 @@ Bare interactive `hipfire` launches the terminal UI when `hipfire-tui` is instal
 | Command | Purpose |
 |---|---|
 | `hipfire pull <tag>` | Download a registry model into `~/.hipfire/models/`. When the entry declares a DFlash draft (`dflash.file`), the pull also fetches that sidecar. Pull does **not** enable speculation: `dflash_mode` defaults to **`off`**. With `auto`, the loader uses the sidecar when present (otherwise AR); with `on`, load fails closed if the sidecar is missing. Override the path with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` (or `run --model-draft`). When the entry declares a vision tower (`vision.file`, e.g. every `qwen3.8:27b*` tier → `qwen3.8-27b-vision.hfq`), the pull also fetches that sidecar; override with `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR`. When the entry declares an MTP head (`mtp.file`, e.g. every Qwen3.8-27B trunk tier → `qwen3.8-27b.mtp`), the pull fetches it too, and because `mtp_mode` defaults to `auto`, the next load speculates with it ([MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). |
+| `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
+| `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
 | `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`.triattn*.bin`, `*.mtp`, matching DSpark). A declared DFlash draft is **shared**: several tags can name the same `dflash.file` (e.g. `qwen3.8:27b` / `qwen3.8:27b-mq4-pro` / `qwen3.8:27b-mq4-xt` → one `qwen38-27b-dflash-mq4.hfq`). If any *other* registry entry that declares the same draft still has its own target file on disk, `rm` **keeps** the sidecar and prints one stderr line; otherwise the draft is removed with the target. The `vision` tower sidecar and the `mtp` head follow the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one `qwen3.8-27b-vision.hfq`, and every trunk tier the one `qwen3.8-27b.mtp`). Confirms unless `-y`. |
 | `hipfire ps [-j\|--json]` | Running daemon / quantize / upload processes and whether the configured serve port is busy (process scan is Linux-oriented). |
@@ -30,6 +32,52 @@ when linking is unsupported or read-only, the verified old path is used.
 This does not download or copy the payload. Conflicting canonical files fail
 clearly; the historical RTN `.mq4` artifact is never migrated. See
 [MODELS.md](MODELS.md#qwen-38-flash-next-mq4-xts) for the compatibility window.
+
+### Flash-Next split PLE layout
+
+A split registry entry (`file` = `<name>-base.<ext>`, e.g.
+`qwen3.8-flash-next-base.mq4-xts`) ships the model without its 128 PLE n-gram
+shards plus swappable row files next to it: `<base>.ple-q8` (exact Q8F16 rows,
+~54.4 GB) and `<base>.ple-q4` (4-bit Lloyd-Max rows, ~28.8 GB, bit-identical in
+decode to the q4 the loader derives locally from the q8 rows).
+
+- **Pull.** `hipfire pull <tag> [--ple auto|q4|q8|all|none]` downloads the base
+  plus the chosen sidecar(s) after printing the plan (files, sizes). `auto`
+  (default) follows `memory.ple_format` (`HIPFIRE_PLE_FORMAT`), whose own `auto`
+  is q4 on gfx1151 and q8 elsewhere; an unknown GPU arch resolves to q8. `none`
+  fetches the base only. All files are SHA-256 verified; a failed sidecar fails
+  the pull.
+- **On-demand.** `run`, `bench` and `serve` download a missing sidecar before
+  loading (`ple: downloading <file> (<GB>) for memory.ple_format=<..>`): q8 when
+  q8 is requested; q4 only when neither `<base>.ple-q4` nor `<base>.ple-q8` is on
+  disk (the loader derives q4 from q8 locally). `auto` uses whichever of the two
+  is present and downloads the arch's preferred format only when neither is. A
+  serve *request* naming such a model downloads only when
+  `serve.allow_request_pull` is on; otherwise the load is refused with the pull
+  command.
+- **No forced migration.** A user who already has the monolithic
+  `qwen3.8-flash-next.mq4-xts` (or its legacy `…-gptq3.mq4` name) keeps serving
+  it under `qwen3.8:flash-next`: while the split base is absent the tag resolves
+  to the local monolithic (SHA-verified as before) and one note says
+  `hipfire ple split <tag>` or `hipfire pull <tag>` gets the split layout.
+- **`hipfire ple derive [--format q4] [--rank PATH] <model>`** writes
+  `<model>.ple-q4` from the model's Q8 rows (`<model>.ple-q8` when present, else
+  the embedded rows), ordered by `--rank` (default `<model>.plehot` when present,
+  else row order). `--format q8` is an error: q8 rows are the model's own rows or
+  the file `hipfire ple split` writes. Progress (percent, GB, MB/s) prints at
+  most every ~2 s; the summary lists output, sizes, elapsed time and the
+  `payload_sha256` / `q8_rows_sha256` digests.
+- **`hipfire ple split [--out PATH] [--keep-original] <model>`** converts a
+  monolithic model into `<base>` (default: `-base` inserted before the
+  extension) + `<base>.ple-q8`, verifies both outputs, then removes the original
+  (and its hardlinked legacy spelling) unless `--keep-original`. It refuses to
+  overwrite existing outputs and a non-monolithic input. `<model>.plehot*` files
+  belong to the monolithic layout and are left in place with a note. The summary
+  prints `base_index_sha256` and `q8_rows_sha256`.
+- **`rm` and listings.** `rm` also removes `<model>.ple-q4`, `<model>.ple-q8`,
+  their `.plehotrows` packs and `<model>.plehot`. `*.ple-q4`, `*.ple-q8`,
+  `*.plehot` and `*.plehotrows` files are sidecars: never listed or served as
+  models.
 
 ## Inference
 

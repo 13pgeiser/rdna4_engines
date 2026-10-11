@@ -421,11 +421,8 @@ impl Qwen4Manifest {
         // The head keeps the trunk's six/eight-bit rungs (artifacts written
         // with its earlier Q8F16 tier keep loading) but not the IU4 trunk's
         // four-bit one: four bits cost +0.014 KLD there.
-        let quant_head = DTypeConstraint::source_from_sources(vec![
-            DType::BF16,
-            DType::Q8_0,
-            DType::MQ6G256V2,
-        ]);
+        let quant_head =
+            DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0, DType::MQ6G256V2]);
         let model = |name: &str,
                      shape: Vec<usize>,
                      requested_dtype: DType,
@@ -864,6 +861,18 @@ impl Qwen4Manifest {
             .len()
             .saturating_sub(aliases)
             .saturating_add(self.metadata.len())
+    }
+
+    /// This manifest without the [`PLE_SHARD_COUNT`] n-gram PLE shard tensors.
+    ///
+    /// A sidecar rows file (`hipfire_runtime::ple_sidecar`) supplies the PLE
+    /// rows, so the source file's own shard tensors are neither declared nor
+    /// fulfilled: the base may lack them (a split base) or carry them,
+    /// shadowed and ignored (the monolithic artifact next to a derived q4
+    /// sidecar).  The three I64 PLE metadata records stay.
+    pub fn without_ple_shards(mut self) -> Self {
+        self.weights.retain(|entry| !is_ple_shard_name(&entry.name));
+        self
     }
 }
 
@@ -1539,11 +1548,18 @@ impl Qwen4Weights {
                 if !path.exists() {
                     continue;
                 }
-                let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                let bytes =
+                    std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
                 if k % 256 != 0 || bytes.len() != m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES {
-                    return Err(format!("{}: {} bytes is not a {m}x{k} QT44 matrix", path.display(), bytes.len()));
+                    return Err(format!(
+                        "{}: {} bytes is not a {m}x{k} QT44 matrix",
+                        path.display(),
+                        bytes.len()
+                    ));
                 }
-                let mut copy = gpu.upload_raw(&bytes, &[bytes.len()]).map_err(|error| error.to_string())?;
+                let mut copy = gpu
+                    .upload_raw(&bytes, &[bytes.len()])
+                    .map_err(|error| error.to_string())?;
                 copy.dtype = DType::MQ4G256V2;
                 copy
             } else {
@@ -1989,6 +2005,18 @@ fn build_moe_refs(
     })
 }
 
+/// Whether `name` is one of the [`PLE_SHARD_COUNT`] canonical n-gram PLE shard
+/// tensor names (`..ngram_embedding.shard_{0..127}.weight`, no leading zeros).
+pub fn is_ple_shard_name(name: &str) -> bool {
+    name.strip_prefix(hipfire_runtime::ple_sidecar::PLE_SHARD_PREFIX)
+        .and_then(|name| name.strip_suffix(hipfire_runtime::ple_sidecar::PLE_SHARD_SUFFIX))
+        .and_then(|digits| {
+            let index = digits.parse::<usize>().ok()?;
+            (index < PLE_SHARD_COUNT && index.to_string() == digits).then_some(index)
+        })
+        .is_some()
+}
+
 pub fn ple_valid_rows_for_shard(shard: usize) -> usize {
     crate::ple::PLE_VALID_ROWS
         .saturating_sub((shard as u64).saturating_mul(PLE_SHARD_ROWS as u64))
@@ -2083,6 +2111,47 @@ mod tests {
         let total: usize = (0..PLE_SHARD_COUNT).map(ple_valid_rows_for_shard).sum();
         assert_eq!(total, 320_001_446);
         assert_eq!(ple_valid_rows_for_shard(127), 2_499_922);
+    }
+
+    #[test]
+    fn sidecar_manifest_drops_exactly_the_ple_shards() {
+        let full = Qwen4Manifest::build(&pinned_config()).unwrap();
+        assert_eq!(full.external_entries().count(), PLE_SHARD_COUNT);
+        let trimmed = full.clone().without_ple_shards();
+        assert_eq!(full.weights.len() - trimmed.weights.len(), PLE_SHARD_COUNT);
+        assert_eq!(trimmed.external_entries().count(), 0);
+        assert_eq!(trimmed.metadata, full.metadata);
+        assert_eq!(trimmed.state, full.state);
+        assert_eq!(
+            full.source_tensor_count() - trimmed.source_tensor_count(),
+            PLE_SHARD_COUNT
+        );
+        // Every kept entry is untouched and none is a shard.
+        assert!(trimmed
+            .weights
+            .iter()
+            .all(|entry| !is_ple_shard_name(&entry.name)));
+        assert!(trimmed
+            .weights
+            .iter()
+            .all(|entry| full.weights.contains(entry)));
+    }
+
+    #[test]
+    fn ple_shard_name_predicate_is_canonical() {
+        let name = |index: &str| {
+            format!(
+                "{}{index}{}",
+                hipfire_runtime::ple_sidecar::PLE_SHARD_PREFIX,
+                hipfire_runtime::ple_sidecar::PLE_SHARD_SUFFIX
+            )
+        };
+        assert!(is_ple_shard_name(&name("0")));
+        assert!(is_ple_shard_name(&name("127")));
+        assert!(!is_ple_shard_name(&name("128")));
+        assert!(!is_ple_shard_name(&name("007")));
+        assert!(!is_ple_shard_name(&name("")));
+        assert!(!is_ple_shard_name("model.embed_tokens.weight"));
     }
     fn pinned_config() -> Qwen4Config {
         Qwen4Config {

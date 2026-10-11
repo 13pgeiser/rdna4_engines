@@ -147,7 +147,6 @@ pub struct SourceAdmissionOptions {
     pub pflash: bool,
 }
 
-
 /// Return whether a per-load adaptive-KV value requests the active controller.
 /// The CLI schema default is `Some("off")`, which must remain ordinary AR.
 /// Empty values are also inactive because daemon normalization drops them.
@@ -345,6 +344,72 @@ pub fn qwen4_memory_admission(
         )),
         _ => Ok(admission),
     }
+}
+
+/// Whether `hfq` carries the Qwen4 PLE n-gram table in either form: the 128
+/// shard tensors (monolithic) or the split-base marker.  Anything else is no
+/// PLE-bearing base at all and keeps failing in the artifact admission with
+/// its own inventory/config diagnostic instead of a PLE-rows one.
+fn qwen4_ple_rows_layout_present(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
+    hfq.ple_rows_marker().is_some()
+        || hfq
+            .tensors()
+            .iter()
+            .any(|tensor| hipfire_arch_qwen4::weights::is_ple_shard_name(&tensor.name))
+}
+
+/// Stderr progress of a PLE derive: one line per phase and per ~5% step, so a
+/// minutes-long derivation of the q4 rows is visible without flooding the log.
+pub fn ple_progress_printer() -> impl FnMut(&hipfire_runtime::ple_convert::PleProgress) + Send {
+    let mut last: Option<(&'static str, u64)> = None;
+    move |progress| {
+        let percent = match progress.total_bytes {
+            0 => 100,
+            total => progress.done_bytes.min(total).saturating_mul(100) / total,
+        };
+        let step = percent / 5 * 5;
+        if last == Some((progress.phase, step)) {
+            return;
+        }
+        last = Some((progress.phase, step));
+        eprintln!(
+            "  qwen4 ple {}: {percent}% ({:.1} of {:.1} GB)",
+            progress.phase,
+            progress.done_bytes as f64 / 1e9,
+            progress.total_bytes as f64 / 1e9
+        );
+    }
+}
+
+/// Resolve and attach the Qwen4 PLE rows source (`memory.ple_format`) on an
+/// opened HFQ source, deriving the q4 rows when they are missing and the
+/// request allows it.  Idempotent; a no-op for non-HFQ sources and for a
+/// source that is not a PLE-bearing Qwen4 base.  Returns the choice for the
+/// load log (`None` when nothing was resolved).
+pub fn resolve_qwen4_ple_rows(
+    source: &mut ModelSource,
+    path: &str,
+    gpu_arch: &str,
+) -> Result<Option<hipfire_runtime::ple_sidecar::PleRowsChoice>, String> {
+    let ModelSource::Hfq(hfq) = source else {
+        return Ok(None);
+    };
+    if !qwen4_ple_rows_layout_present(hfq) {
+        return Ok(None);
+    }
+    let mut progress = ple_progress_printer();
+    hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows(
+        hfq,
+        std::path::Path::new(path),
+        hipfire_config::memory::ple_format(),
+        gpu_arch,
+        hipfire_runtime::ple_sidecar::ResolvePolicy {
+            derive_missing_q4: true,
+            progress: Some(&mut progress),
+        },
+    )
+    .map(Some)
+    .map_err(|error| format!("qwen4: PLE rows: {error}"))
 }
 
 /// Validate a reserved arch-16 HFQM source without allocating weights.
@@ -1038,11 +1103,18 @@ pub fn admit_source_with_options(
                 hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
             ));
         }
-        let qwen4_kv = hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
+        let qwen4_kv =
+            hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
         crate::carrier_for(arch_id)
             .ok_or_else(|| "no carrier for qwen4".to_string())?
             .admit_options(draft_path, options)?;
+        // The PLE rows source is chosen (and a missing q4 derived from the
+        // q8 rows or the embedded shards) here, before the resident model is
+        // torn down: a refusal (missing sidecar, binding mismatch, no space)
+        // leaves the loaded model in place.  The attached sidecar travels
+        // with `source` to the carrier.
+        resolve_qwen4_ple_rows(&mut source, path, gpu_arch)?;
         let admitted = admit_qwen4_source(
             &source,
             hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
@@ -1571,10 +1643,26 @@ mod tests {
         assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 0));
         // Host-mapped experts: `auto` keeps AR off gfx1201, an explicit `on`
         // keeps MTP everywhere, and gfx1201 keeps the head under `auto`.
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 21));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1100", 21));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1201", 21));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1201", 21));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1100",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1100",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1201",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1201",
+            21
+        ));
     }
 
     mod qwen4_ddtree_admission {
@@ -2066,21 +2154,48 @@ mod tests {
             }
             assert_eq!(r(None, Some("lloyd3"), 5, 1), Some("lloyd3"));
             assert_eq!(r(None, Some("lloyd3"), 6, 1), Some("lloyd3"));
-            assert_eq!(r(Some("q8"), Some("lloyd3"), 5, 1), Some("q8"), "typed wins");
-            assert_eq!(r(Some(""), Some("lloyd3"), 5, 1), Some("lloyd3"), "empty typed = unset");
-            assert_eq!(r(None, Some("lloyd3"), 1, 1), None, "non-qwen35 ignores env");
+            assert_eq!(
+                r(Some("q8"), Some("lloyd3"), 5, 1),
+                Some("q8"),
+                "typed wins"
+            );
+            assert_eq!(
+                r(Some(""), Some("lloyd3"), 5, 1),
+                Some("lloyd3"),
+                "empty typed = unset"
+            );
+            assert_eq!(
+                r(None, Some("lloyd3"), 1, 1),
+                None,
+                "non-qwen35 ignores env"
+            );
             assert_eq!(r(None, Some("lloyd3"), 5, 2), None, "EP ignores env");
 
             let trunk = write_hfq("kv-v-once", 5, false);
             let admit = |kv_mode, kv_v| {
                 super::super::admit_source(
-                    trunk.to_str().unwrap(), 1, 1, KvBackendRequest::Automatic, None,
-                    "gfx1100", None, "auto", None, 4096,
-                    KvBackendHints { kv_mode: Some(kv_mode), kv_v, ..KvBackendHints::without_device() },
+                    trunk.to_str().unwrap(),
+                    1,
+                    1,
+                    KvBackendRequest::Automatic,
+                    None,
+                    "gfx1100",
+                    None,
+                    "auto",
+                    None,
+                    4096,
+                    KvBackendHints {
+                        kv_mode: Some(kv_mode),
+                        kv_v,
+                        ..KvBackendHints::without_device()
+                    },
                 )
                 .map(|a| a.kv_v)
             };
-            assert_eq!(admit("fwht3", Some("lloyd3")).unwrap().as_deref(), Some("lloyd3"));
+            assert_eq!(
+                admit("fwht3", Some("lloyd3")).unwrap().as_deref(),
+                Some("lloyd3")
+            );
             assert_eq!(admit("q8", Some("q8")).unwrap().as_deref(), Some("q8"));
             // The pair is validated at admission, before the resident model is
             // touched — not first discovered by the carrier.
@@ -2479,9 +2594,15 @@ mod tests {
         #[test]
         fn automatic_context_caps_at_the_largest_fit() {
             let free = 12 << 30;
-            let admission =
-                qwen4_memory_admission(CAPACITY, None, free, MTP_REQUEST, QWEN4_MEMORY_HEADROOM_BYTES, growth)
-                    .unwrap();
+            let admission = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                free,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap();
             let cap = admission.card_cap;
             assert!(cap > 0 && cap < CAPACITY);
             assert_eq!(admission.max_seq, cap);
@@ -2505,9 +2626,15 @@ mod tests {
             )
             .unwrap();
             assert_eq!(admission.max_seq, CAPACITY);
-            let short =
-                qwen4_memory_admission(8192, Some(8192), HALO_FREE, MTP_REQUEST, QWEN4_MEMORY_HEADROOM_BYTES, growth)
-                    .unwrap();
+            let short = qwen4_memory_admission(
+                8192,
+                Some(8192),
+                HALO_FREE,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap();
             assert_eq!(short.max_seq, 8192);
             assert_eq!(short.card_cap, 8192);
         }
@@ -2515,9 +2642,16 @@ mod tests {
         #[test]
         fn explicit_context_that_cannot_grow_refuses_at_load() {
             let free = 12 << 30;
-            let cap = qwen4_memory_admission(CAPACITY, None, free, MTP_REQUEST, QWEN4_MEMORY_HEADROOM_BYTES, growth)
-                .unwrap()
-                .card_cap;
+            let cap = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                free,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap()
+            .card_cap;
             let error = qwen4_memory_admission(
                 CAPACITY,
                 Some(CAPACITY),
@@ -2527,9 +2661,17 @@ mod tests {
                 growth,
             )
             .unwrap_err();
-            assert!(error.contains("max_seq 262144 does not fit device memory"), "{error}");
+            assert!(
+                error.contains("max_seq 262144 does not fit device memory"),
+                "{error}"
+            );
             assert!(error.contains(&format!("at most {cap}")), "{error}");
-            assert!(error.contains("15392 MiB QSA context + 512 MiB QSA gather workspace + 740 MiB native MTP"), "{error}");
+            assert!(
+                error.contains(
+                    "15392 MiB QSA context + 512 MiB QSA gather workspace + 740 MiB native MTP"
+                ),
+                "{error}"
+            );
         }
 
         #[test]
@@ -2543,7 +2685,10 @@ mod tests {
                 growth,
             )
             .unwrap_err();
-            assert!(error.contains("cannot hold an automatic context"), "{error}");
+            assert!(
+                error.contains("cannot hold an automatic context"),
+                "{error}"
+            );
         }
     }
 }

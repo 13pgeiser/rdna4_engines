@@ -13,6 +13,7 @@ use crate::model_source::{
     SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
     SourceReader, SourceReaderImpl,
 };
+use crate::ple_sidecar::PleRowsFile;
 use crate::weight_backend::{
     decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
     reupload_f16_as_f32, HfqBackend, WeightBackend,
@@ -569,6 +570,12 @@ pub struct HfqFile {
     /// (the common case), every read path is byte-identical to pre-overlay
     /// behavior — each overlay check is gated on `self.overlay.is_some()`.
     overlay: Option<Box<HfqFile>>,
+    /// Absolute file offset of the data section (see [`Self::data_offset`]).
+    data_offset: u64,
+    /// Optional PLE row sidecar bound by [`Self::attach_ple_rows`]. `None`
+    /// (the default) leaves every read path untouched; it takes no part in
+    /// the effective source identity, overlays, or `tensor_range`.
+    ple_rows: Option<PleRowsFile>,
 }
 
 impl HfqFile {
@@ -581,7 +588,6 @@ impl HfqFile {
     pub fn mq4v2_symmetric(&self) -> bool {
         self.mq4v2_symmetric
     }
-
 
     /// Header-only sibling of [`Self::open`]: read the 32-byte container
     /// header and return its `arch_id` — no mmap, no metadata JSON parse, no
@@ -749,6 +755,163 @@ impl HfqFile {
     /// True when an overlay is attached (its tensors shadow the base).
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
+    }
+
+    /// Absolute file offset of the data section (the end of the header,
+    /// metadata, tensor index and alignment padding).
+    pub fn data_offset(&self) -> u64 {
+        self.data_offset
+    }
+
+    /// Length of the container file as sealed when it was opened.
+    pub fn file_len(&self) -> u64 {
+        self.source_file_identity.len
+    }
+
+    /// sha256 of the file bytes `[0, data_offset)`: header, metadata JSON,
+    /// tensor index and padding. This is what a PLE sidecar's
+    /// `base_index_sha256` binds. Read with positional I/O from the open file,
+    /// so it works after [`Self::drop_mmap`]; the sealed file identity is
+    /// re-checked on every read.
+    pub fn index_sha256(&self) -> std::io::Result<[u8; 32]> {
+        const CHUNK: u64 = 1 << 20;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; self.data_offset.min(CHUNK) as usize];
+        let mut offset = 0u64;
+        while offset < self.data_offset {
+            let n = (self.data_offset - offset).min(buf.len() as u64) as usize;
+            read_file_exact_at(
+                &self._file,
+                &self.source_file_identity,
+                offset,
+                &mut buf[..n],
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            hasher.update(&buf[..n]);
+            offset += n as u64;
+        }
+        Ok(hasher.finalize().into())
+    }
+
+    /// The split-base marker object (`hipfire_ple_rows`) from the effective
+    /// metadata JSON, if present. Its fields are validated by
+    /// [`Self::attach_ple_rows`].
+    pub fn ple_rows_marker(&self) -> Option<serde_json::Value> {
+        let metadata: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+        metadata
+            .get(crate::ple_sidecar::PLE_BASE_MARKER_KEY)
+            .cloned()
+    }
+
+    /// Bind a PLE row sidecar to this base. The sidecar must have been built
+    /// for exactly this file: same length and same sha256 over
+    /// `[0, data_offset)`. A split base (marker, no shard tensors) must also
+    /// agree on the rows' source digest (`q8_rows_sha256 ==
+    /// source_rows_sha256`) and geometry; a monolithic base's embedded shard
+    /// tensors must match the sidecar's geometry (Q8_0 `[rows_per_shard,
+    /// row_width]`). One attach only. The sidecar takes no part in the
+    /// effective source identity, overlays or [`Self::tensor_range`].
+    pub fn attach_ple_rows(&mut self, rows: PleRowsFile) -> Result<(), String> {
+        use crate::ple_sidecar::{
+            embedded_shard_count, ple_shard_name, short_hex, PLE_BASE_MARKER_KEY, Q8_QUANT_TYPE,
+        };
+        let sidecar = rows.path().display().to_string();
+        let base = self.path.display().to_string();
+        let table = rows.table();
+        let (shard_count, rows_per_shard, row_width) =
+            (rows.shard_count(), rows.rows_per_shard(), rows.row_width());
+        let remedy = match rows.encoding() {
+            crate::external_rows::RowEncoding::Q4Lm => {
+                "delete it and run `hipfire ple derive --format q4 <model>` to rebuild it for this base, or re-pull the matching files with `hipfire pull <model tag> --ple q4`"
+            }
+            _ => "re-pull the matching base and sidecar files with `hipfire pull <model tag> --ple q8` (a q8 sidecar is bound to exactly one base file)",
+        };
+        if let Some(existing) = &self.ple_rows {
+            return Err(format!(
+                "{base}: PLE rows sidecar {} is already attached; refusing to attach {sidecar} as well",
+                existing.path().display()
+            ));
+        }
+        if self.file_len() != table.base_file_bytes {
+            return Err(format!(
+                "PLE sidecar {sidecar} was built for a base file of {} bytes, but {base} is {} bytes ({remedy})",
+                table.base_file_bytes,
+                self.file_len()
+            ));
+        }
+        let embedded = embedded_shard_count(&self.tensors).map_err(|e| format!("{base}: {e}"))?;
+        let marker = self.ple_rows_marker();
+        if embedded > 0 {
+            if marker.is_some() {
+                return Err(format!(
+                    "{base} carries `{PLE_BASE_MARKER_KEY}` (rows in a sidecar) but its index also holds {embedded} embedded PLE shard tensors; PLE sidecar {sidecar} cannot bind to it"
+                ));
+            }
+            if embedded != shard_count {
+                return Err(format!(
+                    "PLE sidecar {sidecar} has {} shards but {base} embeds {embedded} PLE shard tensors ({remedy})",
+                    shard_count
+                ));
+            }
+            for shard in 0..embedded {
+                let name = ple_shard_name(shard);
+                let info = &self.tensors[self.tensor_map[&name]];
+                let shape_ok = info.shape.len() == 2
+                    && info.shape[0] as usize == rows_per_shard
+                    && info.shape[1] as usize == row_width;
+                if info.quant_type != Q8_QUANT_TYPE || !shape_ok {
+                    return Err(format!(
+                        "PLE sidecar {sidecar} expects `{name}` to be Q8_0 [{}, {}] but {base} has quant type {} shape {:?} ({remedy})",
+                        rows_per_shard, row_width, info.quant_type, info.shape
+                    ));
+                }
+            }
+        } else {
+            let marker = marker.ok_or_else(|| {
+                format!(
+                    "{base} has neither embedded PLE shard tensors nor a `{PLE_BASE_MARKER_KEY}` marker, so PLE sidecar {sidecar} cannot bind to it ({remedy})"
+                )
+            })?;
+            let marker = crate::ple_sidecar::parse_base_marker(&marker)
+                .map_err(|e| format!("{base}: {e}"))?;
+            for (field, in_base, in_sidecar) in [
+                ("shard_count", marker.shard_count, shard_count),
+                ("rows_per_shard", marker.rows_per_shard, rows_per_shard),
+                ("row_width", marker.row_width, row_width),
+            ] {
+                if in_base != in_sidecar {
+                    return Err(format!(
+                        "PLE sidecar {sidecar} has {field} {in_sidecar} but {base} declares {field} {in_base} ({remedy})"
+                    ));
+                }
+            }
+            if marker.q8_rows_sha256 != table.source_rows_sha256 {
+                return Err(format!(
+                    "{base} was split from q8 rows {} but PLE sidecar {sidecar} was built from rows {} ({remedy})",
+                    short_hex(&marker.q8_rows_sha256),
+                    short_hex(&table.source_rows_sha256)
+                ));
+            }
+        }
+        let actual = crate::ple_sidecar::hex_lower(
+            &self
+                .index_sha256()
+                .map_err(|e| format!("{base}: hashing the container index: {e}"))?,
+        );
+        if actual != table.base_index_sha256 {
+            return Err(format!(
+                "PLE sidecar {sidecar} is bound to base index sha256 {} but {base} has {} ({remedy})",
+                short_hex(&table.base_index_sha256),
+                short_hex(&actual)
+            ));
+        }
+        self.ple_rows = Some(rows);
+        Ok(())
+    }
+
+    /// The attached PLE row sidecar, if any.
+    pub fn ple_rows(&self) -> Option<&PleRowsFile> {
+        self.ple_rows.as_ref()
     }
 
     /// Whether this source carries any AWQ scale sidecar. The carrier uses
@@ -1122,6 +1285,8 @@ impl HfqFile {
             evict_page_cache: true,
             pages_resident_memo: std::cell::Cell::new(0),
             overlay: None,
+            data_offset: data_abs,
+            ple_rows: None,
         };
 
         // Structural-pillar tripwire: a qwen3.5/3.6 checkpoint MUST carry
@@ -4324,5 +4489,90 @@ mod overlay_tests {
         let ov = HfqFile::open(&empty).unwrap();
         let err = f.attach_opened_head(ov, &empty).unwrap_err();
         assert!(err.contains("no tensors"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod ple_rows_binding_tests {
+    use super::hfq_test_fixture::write_min_hfq;
+    use super::*;
+
+    #[test]
+    fn index_hash_covers_exactly_the_bytes_before_the_data_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.hfq");
+        write_min_hfq(
+            &path,
+            16,
+            &[("a", 2, &[4], &[1u8; 16]), ("b", 2, &[2], &[2u8; 8])],
+        );
+        let raw = std::fs::read(&path).unwrap();
+        let mut f = HfqFile::open(&path).unwrap();
+        assert_eq!(f.file_len(), raw.len() as u64);
+        let data_offset = f.data_offset();
+        assert_eq!(data_offset % 4096, 0);
+        assert_eq!(f.tensors()[0].data_offset as u64, data_offset);
+        let expected = <[u8; 32]>::from(Sha256::digest(&raw[..data_offset as usize]));
+        assert_eq!(f.index_sha256().unwrap(), expected);
+        // pread-only: the mmap is gone but the hash is unchanged
+        f.drop_mmap();
+        assert_eq!(f.index_sha256().unwrap(), expected);
+        // tensor payload bytes are not part of the binding
+        let mut changed = raw.clone();
+        *changed.last_mut().unwrap() ^= 0xFF;
+        let other = dir.path().join("n.hfq");
+        std::fs::write(&other, changed).unwrap();
+        assert_eq!(
+            HfqFile::open(&other).unwrap().index_sha256().unwrap(),
+            expected
+        );
+        // an index byte is
+        let mut changed = raw;
+        changed[data_offset as usize - 1] ^= 1;
+        std::fs::write(&other, changed).unwrap();
+        assert_ne!(
+            HfqFile::open(&other).unwrap().index_sha256().unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn index_hash_refuses_a_replaced_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.hfq");
+        write_min_hfq(&path, 16, &[("a", 2, &[4], &[1u8; 16])]);
+        let f = HfqFile::open(&path).unwrap();
+        f.index_sha256().unwrap();
+        let replacement = dir.path().join("r.hfq");
+        write_min_hfq(&replacement, 16, &[("a", 2, &[4], &[1u8; 16])]);
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(f.index_sha256().is_err());
+    }
+
+    #[test]
+    fn no_sidecar_by_default_and_marker_is_read_from_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.hfq");
+        write_min_hfq(&path, 16, &[("a", 2, &[4], &[1u8; 16])]);
+        let f = HfqFile::open(&path).unwrap();
+        assert!(f.ple_rows().is_none());
+        assert!(f.ple_rows_marker().is_none());
+
+        let marked = dir.path().join("marked.hfq");
+        write_hfqm_package_mem(
+            &marked,
+            16,
+            r#"{"hipfire_ple_rows":{"version":1,"location":"sidecar"},"other":1}"#,
+            &[HfqMemTensor {
+                name: "a".to_string(),
+                quant_type: 2,
+                shape: vec![4],
+                group_size: 0,
+                data: vec![1u8; 16],
+            }],
+        )
+        .unwrap();
+        let marker = HfqFile::open(&marked).unwrap().ple_rows_marker().unwrap();
+        assert_eq!(marker["location"], "sidecar");
     }
 }

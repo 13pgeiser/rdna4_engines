@@ -13,6 +13,8 @@
 pub mod admission;
 pub mod artifact;
 pub mod bundle;
+#[cfg(any(test, feature = "reference-parity"))]
+pub mod cache_quality;
 pub mod config;
 pub mod expert_residency;
 pub mod gpu_forward;
@@ -33,8 +35,6 @@ pub mod reference_forward;
 pub mod reference_mtp;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
-pub mod cache_quality;
-#[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
 pub mod weights;
 
@@ -44,11 +44,14 @@ pub use admission::{
     Qwen4Artifact, Qwen4ArtifactFormat, Qwen4Capabilities, Qwen4Capability, Qwen4QuantGeometry,
     RequestKind,
 };
-pub use artifact::{admit_hfqm_artifact, Qwen4ArtifactError, Qwen4HfqmArtifact};
+pub use artifact::{
+    admit_hfqm_artifact, Qwen4ArtifactError, Qwen4HfqmArtifact, Qwen4PleRows, SidecarRows,
+};
 pub use config::{
     LayerType, Qwen4Config, Qwen4MtpConfig, RecurrentStateDType, SourceDType, ARCHITECTURE_NAME,
     ARCH_ID, MODEL_TYPE, QWEN4_DEFAULT_CONTEXT, QWEN4_MAX_CONTEXT, TEXT_MODEL_TYPE,
 };
+pub use kv_backend::{qwen4_vmm_refusal, qwen4_vmm_supported, Qwen4ContextCommit, Qwen4KvBackend};
 pub use ple::{
     PleHashMetadata, PleHistory, PleMetadataError, PleRowId, PLE_HEAD_COUNT, PLE_HEAD_OFFSETS,
     PLE_HEAD_VOCAB_SIZES, PLE_MULTIPLIERS, PLE_MULTIPLIER_COUNT, PLE_PADDED_ROWS,
@@ -56,4 +59,3 @@ pub use ple::{
 };
 pub use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
 pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qwen4StateFormat};
-pub use kv_backend::{qwen4_vmm_refusal, qwen4_vmm_supported, Qwen4ContextCommit, Qwen4KvBackend};

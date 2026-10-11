@@ -33,10 +33,11 @@
 
 use hipfire_arch_qwen4::admit_hfqm_artifact;
 use hipfire_arch_qwen4::bundle::{ple_hot_plan, PleHotPlan, PleHotWorker, Qwen4Bundle};
-use hipfire_runtime::ple_hot_store::{HotRowStore, PleHotRank};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::ple_hot_store::{HotRowStore, PleHotRank};
+use hipfire_runtime::ple_sidecar::{resolve_and_attach_ple_rows, PleRowsOrigin, ResolvePolicy};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -49,17 +50,19 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Open the PLE hot-row store from `<model>.plehot` and `<model>.plehotrows`,
-/// wait until its worker verified the pack, prewarm `prewarm` bytes of it,
-/// and return it ready to attach.
-fn verified_hot_store(model: &Path, plan: PleHotPlan, prewarm: u64) -> Result<PleHotWorker, String> {
+/// Open the PLE hot-row store from `<model>.plehot` and the
+/// `<rows source>.plehotrows` pack (`plan.source_path` is the model file or
+/// its PLE sidecar), wait until its worker verified the pack, prewarm
+/// `prewarm` bytes of it, and return it ready to attach.
+fn verified_hot_store(
+    model: &Path,
+    plan: PleHotPlan,
+    prewarm: u64,
+) -> Result<PleHotWorker, String> {
     let sidecar = PathBuf::from(format!("{}.plehot", model.display()));
-    let pack = PathBuf::from(format!("{}.plehotrows", model.display()));
+    let pack = PathBuf::from(format!("{}.plehotrows", plan.source_path.display()));
     let rank = PleHotRank::open(&sidecar, plan.padded_rows, &plan.fingerprint_hex)
         .map_err(|e| format!("--ple-hot: sidecar {}: {e}", sidecar.display()))?;
-    let model_bytes = std::fs::metadata(model)
-        .map_err(|e| format!("--ple-hot: stat {}: {e}", model.display()))?
-        .len();
     let store = HotRowStore::open(
         rank,
         &pack,
@@ -67,10 +70,10 @@ fn verified_hot_store(model: &Path, plan: PleHotPlan, prewarm: u64) -> Result<Pl
         plan.row_encoding,
         plan.encoded_row_bytes,
         &plan.shard_offsets,
-        model_bytes,
+        plan.source_file_bytes,
     )?;
     let started = Instant::now();
-    let handle = store.spawn_worker(model, plan.shard_offsets);
+    let handle = store.spawn_worker(&plan.source_path, plan.shard_offsets);
     let hot = PleHotWorker::new(store.clone(), handle);
     store.set_prewarm_budget(prewarm);
     loop {
@@ -113,22 +116,82 @@ impl Model {
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
             .map_err(|e| format!("tokenizer: {e}"))?;
         let arch_id = hfq.arch_id;
-        let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        // The GPU arch drives `memory.ple_format = auto`; initialising it
+        // allocates no model memory, so admission still precedes every upload.
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+        // The evaluator never derives a missing q4: derive it with
+        // `hipfire ple derive` (or a serve load) first.
+        let choice = resolve_and_attach_ple_rows(
+            &mut hfq,
+            path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+            ResolvePolicy {
+                derive_missing_q4: false,
+                progress: None,
+            },
+        )
+        .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
+        let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        // A rank-order table is served through its store (no shard
+        // descriptors); every other source reads through 128 descriptors.
+        let rank_table = receipt.ple_rows.rank_table().is_some();
+        let ple_descriptors = if rank_table {
+            None
+        } else {
+            Some(
+                receipt
+                    .ple_row_descriptors(&hfq)
+                    .map_err(|e| format!("qwen4 PLE rows: {e}"))?,
+            )
+        };
+        let (ple_rows_path, ple_rows_bytes) = receipt
+            .ple_rows_source(&hfq)
+            .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
+        let (rows_encoding, rows_total) = match (&receipt.ple_rows, hfq.ple_rows()) {
+            (hipfire_arch_qwen4::Qwen4PleRows::Sidecar { encoding, .. }, Some(rows)) => {
+                (encoding.dtype_name().to_string(), rows.header().data_bytes)
+            }
+            _ => {
+                let descriptors = ple_descriptors.as_deref().unwrap_or_default();
+                (
+                    descriptors
+                        .first()
+                        .map_or_else(String::new, |descriptor| descriptor.dtype.clone()),
+                    descriptors.iter().map(|descriptor| descriptor.length).sum(),
+                )
+            }
+        };
+        eprintln!(
+            "qwen4_kld: ple rows: {} from {} ({rows_encoding}, {} order, {:.1} GB)",
+            choice.format.name(),
+            match &choice.origin {
+                PleRowsOrigin::Embedded => "embedded model file".to_string(),
+                PleRowsOrigin::Sidecar(sidecar) => sidecar.display().to_string(),
+            },
+            if rank_table { "rank" } else { "row" },
+            rows_total as f64 / 1e9
+        );
+        if let Some(note) = &choice.note {
+            eprintln!("qwen4_kld: ple rows: {note}");
+        }
         if gpu.is_uma() {
             hfq.drop_mmap();
         }
         let mesh = DeviceMesh::single().map_err(|e| format!("qwen4 mesh: {e}"))?;
         let expected = WeightOrigin::for_single(&mesh, &gpu);
-        let hot_plan = match ple_hot {
-            Some(_) => Some(
-                ple_hot_plan(&receipt.manifest, &receipt.ple, |name| {
-                    hfq.tensor_range(name).map_err(|e| e.to_string())
-                })?
-                .ok_or("--ple-hot: the PLE shards are not Q8F16")?,
-            ),
-            None => None,
-        };
+        let hot_plan =
+            match (ple_hot, ple_descriptors.as_deref()) {
+                (Some(_), Some(descriptors)) => Some(
+                    ple_hot_plan(&receipt.ple, descriptors, &ple_rows_path, ple_rows_bytes)?
+                        .ok_or("--ple-hot: the PLE rows are neither Q8F16 nor Q4LM")?,
+                ),
+                (Some(_), None) => return Err(
+                    "--ple-hot: the PLE rows are a rank-order table, which is its own hot-row pack"
+                        .into(),
+                ),
+                (None, _) => None,
+            };
         let source = HfqModelSource::from_hfq(hfq);
         let transaction = fulfill_manifest_from_payloads(
             &receipt.manifest.weights,
@@ -154,13 +217,14 @@ impl Model {
             &receipt.config,
         )?;
         let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
-        let mut bundle = Qwen4Bundle::assemble_with_metadata(
+        let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
             receipt.config,
             transaction,
             &receipt.placements,
             &mut gpu,
             n_ctx,
             receipt.ple,
+            receipt.ple_rows,
             state_format,
             backend,
         )

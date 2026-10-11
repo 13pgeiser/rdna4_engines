@@ -844,7 +844,7 @@ impl Admission {
                 return Err(AdmissionError {
                     message: "cancelled".to_string(),
                     retry_after_seconds: self.retry_after_seconds(),
-                    });
+                });
             }
             {
                 let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1814,12 +1814,14 @@ impl ServeRuntime {
                 PullArgs {
                     model: model.to_owned(),
                     force: false,
+                    ple: crate::ple::PleSelection::Auto,
                 },
             )?;
             // pull has already verified the installed payload; avoid a second hash.
             path = find_model_path(&self.paths, &self.registry, model);
         }
-        let path = path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
+        let path =
+            path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
         if self.current_path.as_ref() != Some(&path) {
             if origin == ModelOrigin::Request && !self.request_may_load(&path, entry) {
@@ -1829,6 +1831,14 @@ impl ServeRuntime {
                 ))
                 .into());
             }
+            crate::ple::ensure_ple_sidecar(
+                &self.registry,
+                entry,
+                tag.as_deref(),
+                &path,
+                crate::ple::request_from_config(&resolved),
+                origin != ModelOrigin::Request || self.request_policy.allow_pull,
+            )?;
             let max_tokens = config_u64(&resolved, "generation.max_tokens")?;
             let mut params = load_params(
                 &resolved,
@@ -2079,7 +2089,9 @@ impl ServeRuntime {
                     return Ok(resident);
                 }
                 Err(error) => {
-                    eprintln!("[hipfire] daemon restart attempt {attempt}/{attempts} failed: {error:#}");
+                    eprintln!(
+                        "[hipfire] daemon restart attempt {attempt}/{attempts} failed: {error:#}"
+                    );
                 }
             }
             if attempt < attempts {
@@ -2207,9 +2219,7 @@ pub(crate) fn validate_multi_slot_startup(
     // zero-byte pool is a guaranteed load failure, not a silently-disabled
     // cache). Catch it at startup rather than per-request HTTP 500.
     if prefix_cache && prefix_cache_max_bytes == 0 {
-        return Err(
-            "serve.prefix_cache requires serve.prefix_cache_max_bytes > 0".to_owned(),
-        );
+        return Err("serve.prefix_cache requires serve.prefix_cache_max_bytes > 0".to_owned());
     }
     if multi_slot_enabled {
         let scratch_rows = prefill_chunk
@@ -3372,7 +3382,8 @@ mod tests {
         let err = validate_multi_slot_startup(true, 2, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("continuous_batch_size > 1"), "{err}");
         assert!(err.contains("deferred"), "{err}");
-        let err = validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
+        let err =
+            validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("serve.multi_slot"), "{err}");
     }
 
@@ -3400,7 +3411,8 @@ mod tests {
 
     #[test]
     fn multi_slot_startup_rejects_prefill_min_above_chunk() {
-        let err = validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2, false, 0).unwrap_err();
+        let err =
+            validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2, false, 0).unwrap_err();
         assert!(
             err.contains("must be <= serve.multi_slot_prefill_chunk"),
             "{err}"
@@ -3468,7 +3480,11 @@ mod tests {
             .acquire_for_with_bytes(true, Some("m"), 999_999_999)
             .unwrap_err();
         // Should be a timeout (queue wait), not a QueueFull byte error.
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
     }
 
     // ---- Permit released exactly once (spec §5.3) ----
@@ -3544,7 +3560,11 @@ mod tests {
         let err = admission
             .acquire_for_with_bytes(true, Some("m"), 300)
             .unwrap_err();
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
         // Queued bytes must be released on timeout.
         assert_eq!(admission.queued_bytes(), 0);
         assert_eq!(admission.inflight(), 1);
@@ -3628,7 +3648,11 @@ mod tests {
         ));
         let _holder = admission.acquire().unwrap();
         let err = admission.acquire().unwrap_err();
-        assert!(err.message.contains("queue wait exceeded"), "{}", err.message);
+        assert!(
+            err.message.contains("queue wait exceeded"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -3746,7 +3770,10 @@ mod capabilities_tests {
         assert!(caps["structured_output_subset"].is_null());
         assert_eq!(caps["prefix_cache"], false);
         let refused = caps["refused_request_fields"].as_array().unwrap();
-        assert!(refused.is_empty(), "the standard route refuses none of these fields");
+        assert!(
+            refused.is_empty(),
+            "the standard route refuses none of these fields"
+        );
         assert!(caps["stream_stall_timeout_ms"].is_null());
     }
 
@@ -3756,7 +3783,10 @@ mod capabilities_tests {
         assert_eq!(serve_ui_url("::", 11435), "http://[::1]:11435/ui");
         assert_eq!(serve_ui_url("::1", 8000), "http://[::1]:8000/ui");
         assert_eq!(serve_ui_url("192.168.1.5", 80), "http://192.168.1.5:80/ui");
-        assert_eq!(serve_ui_url("localhost", 11435), "http://localhost:11435/ui");
+        assert_eq!(
+            serve_ui_url("localhost", 11435),
+            "http://localhost:11435/ui"
+        );
     }
 
     #[test]
