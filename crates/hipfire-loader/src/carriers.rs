@@ -1138,21 +1138,28 @@ fn qwen4_placement_inputs(
 /// Free VRAM of every device in `devices` (HIP logical ids), in order, as
 /// `hipMemGetInfo` reports it before any rank of the load allocates. Run on
 /// the thread that owns `gpu` (the daemon thread): other devices are queried
-/// by switching the thread's current device, and `gpu`'s is restored.
+/// by switching the thread's current device, and `gpu`'s is restored with a
+/// raw `hipSetDevice` after every query. `Gpu::bind_thread` cannot restore it:
+/// its per-thread cache still names `gpu`'s device, so it would skip the call
+/// and leave every later rank-0 allocation on the last queried device.
 pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Vec<u64>, String> {
     let mut free = Vec::with_capacity(devices.len());
     for &device in devices {
         let bytes = if device == gpu.device_id {
             gpu.device_mem_info().map(|(free, _)| free)
         } else {
-            gpu.hip
+            let queried = gpu
+                .hip
                 .set_device(device)
                 .and_then(|_| gpu.hip.get_vram_info())
-                .map(|(free, _)| free)
+                .map(|(free, _)| free);
+            gpu.hip
+                .set_device(gpu.device_id)
+                .map_err(|error| format!("qwen4: restoring device {}: {error}", gpu.device_id))?;
+            queried
         };
         free.push(bytes.map_err(|error| format!("qwen4: device {device} memory query: {error}"))? as u64);
     }
-    gpu.bind_thread().map_err(|error| format!("qwen4: rebinding device {}: {error}", gpu.device_id))?;
     Ok(free)
 }
 
