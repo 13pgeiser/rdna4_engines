@@ -77,7 +77,8 @@ use hipfire_arch_qwen35::mtp_speculator::Qwen35MtpDrafter;
 use hipfire_arch_qwen35::dflash_cb::{dflash_cb_draft, dflash_cb_head_argmax, dflash_cb_verify, dflash_lane_draft, DflashCbDraftLane, DflashCbScratch, DflashCbVerifyLane, DflashVmmLaneState};
 use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, load_dflash_state, DflashSpeculator, DflashState};
 use hipfire_arch_qwen35::qwen35::prefill::multi::{
-    forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_row_cap, multi_chunk_wide_admitted, pack_whole_lanes, MultiChunkRequest,
+    dflash_iu4_verify_admitted, forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_row_cap, multi_chunk_wide_admitted,
+    pack_whole_lanes, MultiChunkRequest,
     MultiChunkScratch, MULTI_CHUNK_MAX_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
 use hipfire_arch_qwen35::speculative::{
@@ -3400,6 +3401,23 @@ fn assert_wide(exp: &WideExpect, chunks: &[usize], launches: &BTreeMap<&'static 
     )
 }
 
+/// The direct `forward_prefill_batch_multi` arm inside the DFlash IU4 verify
+/// scope exactly as `dflash_cb_verify` opens it (closed when the load does not
+/// run the IU4 verify), so the direct and product arms share the arithmetic of
+/// the isolated singleton reference.
+fn multi_scoped(
+    gpu: &mut Gpu,
+    slot: &ModelSlot,
+    mc: &MultiChunkScratch,
+    reqs: &mut [MultiChunkRequest<'_>],
+    final_hidden: &GpuTensor,
+) -> hip_bridge::HipResult<()> {
+    let prev = gpu.iu4_verify_enter(dflash_iu4_verify_admitted(gpu, &slot.weights, &slot.config));
+    let r = forward_prefill_batch_multi(gpu, &slot.weights, &slot.config, &slot.scratch, mc, reqs, Some(final_hidden));
+    gpu.iu4_verify_exit(prev);
+    r
+}
+
 /// Byte-compare `cand` against a peer run's frozen directory (both
 /// directions, by array file name).
 fn cmp_dir(d: &mut Diff, stage: &str, dir: &Path, cand: &Named) -> Result<()> {
@@ -3551,7 +3569,7 @@ fn dflash_verify_lanes(
             Route::Direct => {
                 let fw = {
                     let mut reqs = multi_requests(lanes, fusion)?;
-                    forward_prefill_batch_multi(gpu, &slot.weights, &slot.config, &slot.scratch, sc.mc, &mut reqs, Some(&sc.vs.final_hidden))
+                    multi_scoped(gpu, slot, sc.mc, &mut reqs, &sc.vs.final_hidden)
                 };
                 if let Err(e) = fw {
                     return Ok(Err(e.to_string()));
@@ -3657,7 +3675,7 @@ fn graph_arm_attempt(
         match route {
             Route::Direct => {
                 let mut reqs = multi_requests(lanes, qwen35::DflashFusionCtx::ChainVerify)?;
-                Ok(forward_prefill_batch_multi(gpu, &slot.weights, &slot.config, &slot.scratch, sc.mc, &mut reqs, Some(&sc.vs.final_hidden)).map_err(|e| e.to_string()))
+                Ok(multi_scoped(gpu, slot, sc.mc, &mut reqs, &sc.vs.final_hidden).map_err(|e| e.to_string()))
             }
             Route::Product => {
                 let mut vl = cb_lanes(lanes)?;
@@ -4118,7 +4136,7 @@ fn lone_row_control(
                 fusion: qwen35::DflashFusionCtx::ChainVerify,
                 hidden_rb: Some(&mut lane.df.hidden_rb),
             }];
-            forward_prefill_batch_multi(gpu, &slot.weights, &slot.config, &slot.scratch, sc.mc, &mut reqs, Some(&sc.vs.final_hidden))
+            multi_scoped(gpu, slot, sc.mc, &mut reqs, &sc.vs.final_hidden)
         };
         let launches = probe.finish();
         let after = refusal_state(gpu, &slot.config, &l.rs.kv, &l.rs.dn, &l.lane, l.position)?;
