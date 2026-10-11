@@ -2,6 +2,13 @@
 
 ## Unreleased (0.4.2)
 
+- **DFlash continuous-batching draft on gfx1201: lane-batched context fill and fc (`HIPFIRE_CB_DRAFT_LANE_CTX=0` is the developer kill switch).** The batched draft still projected each lane's newly committed target-hidden rows (fc) and each layer's context K/V rows lane by lane: rotate + GEMM (or GEMV) + norm + RoPE per lane, per layer.
+  - Rows are now packed by the arithmetic class of their ORIGINAL per-lane segment:
+    - ≥ 2-row segments go into shared overwrite-WMMA chunks of 2..=63 rows, per-row identical to the one-tile route.
+    - 1-row segments, whose singleton route is the R2 GEMV, go into one `gemv_mq4g256v2_multirow_r2_lanes` launch: the R2 body per z-plane, in its own source so the sha-pinned GEMV source is untouched.
+    - Then one norm and one K RoPE run over the packed rows, with one gather and one scatter.
+  - Same setup as the entries above, interleaved on one binary against `=0`, 4 per arm: draft phase 13.42 → 11.31 ms/step; C8 greedy 486.5 → 501.8 tok/s (+3.2 %, CS95 +1.82..+4.61 %, `predict ab` win on the 3 fast-mode rounds).
+  - Exactness: `draft_lane_rows_oracle` (lab) 640/640: the R2 twin bit-identical to the R2 GEMV per row on real draft shapes, gather/scatter bit copies with guards, and the R2-vs-WMMA negative control differs as expected. Serve C8 greedy md5 `fa168ee2…` (and C1), BetterBench sampled `91bde7c5…`, `cb_vmm_state_oracle` passes.
 - **DFlash continuous-batching verify on gfx1201: lane-batched DeltaNet and save-free rollback for unequal lane row counts (`HIPFIRE_CB_LANE_GDN_VARROWS=0` is the developer kill switch).** The lane-batched DeltaNet verify and the save-free rollback needed every lane of a chunk to verify the same number of rows. Any lane with a clipped window near its request's end therefore sent the whole chunk back to the per-lane route: 1,344 more launches plus the ~120 MB-per-lane state SAVE on that step.
   - Now each lane carries its own row count (1..=16; 2..=16 for save-free) in a new 80/104-byte lane table row. The new recurrence symbols `gated_delta_net_q8_fast_lanes_varrows[_from]` are the same kernel body, with `n_tokens` and the stochastic-rounding `frame_off` read from the row.
   - `frame_off` is the prefix sum of the earlier lanes' rows, i.e. exactly the frames the per-lane launch order reserves, and the host reserves the chunk total once.

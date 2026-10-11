@@ -133,6 +133,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_SELECTOR_LANES` | **on**; `0` opts out (developer) | Batched greedy DFlash2 draft on exact gfx1201 (draft overwrite route on): the candidate selector scores every lane of a draft chunk through ONE selector projection GEMM over the chunk's rows (row-independent overwrite route; inside the 64-row scope for a full chunk), ONE top-K and ONE download each of the projection, ids and values, then each lane's host scoring on its slices (`propose_candidates_lanes_device`), instead of a projection, top-K and three synchronous downloads per lane (3 host syncs per chunk instead of 24 at C8). Proposals byte-identical. `0` restores the per-lane calls. |
 | `HIPFIRE_DRAFT_NOISE_EMBED_BATCH` | **on**; `0` opts out (developer) | Batched DFlash draft on exact gfx1201, Q8_0 token embeddings: the draft block's noise embeddings (each lane's seed, then the mask token) are looked up for all rows of the chunk in one `embedding_q8_batched` launch, after one upload of the row ids. Previously it was one `embedding_q8` launch per row (64 at C8). Both kernels compute each element as `f16 scale × int8` with the same striding, so rows are byte-identical. gfx1100 keeps its fused-collapse builder. `0` restores the per-row loop. |
 | `HIPFIRE_CB_DRAFT_LANE_CONV` | **on**; `0` opts out (developer) | Batched DFlash2 draft on exact gfx1201 (no capture, replay recording or G0 observation; ≤ 16 lanes): each prepare/finish dynamic causal convolution runs as one `dynamic_causal_conv_f32_lanes` launch over all lanes. That kernel is the `dynamic_conv_f32` body per lane, with grid.z = lane, inputs rebased to the lane's rows and causal guards on the lane-local row. It replaces one launch per lane (160 → 20 per C8 step on the 27B draft). Every output byte is identical. `0` restores the per-lane launches. |
+| `HIPFIRE_CB_DRAFT_LANE_CTX` | **on**; `0` opts out (developer) | Batched DFlash2 draft on exact gfx1201 (ordered draft, no capture, replay recording or G0 observation; ≤ 9 new rows per lane, ≤ 72 packed rows, MQ4G256V2 fc/wk/wv). Each lane's new target-hidden fc rows and per-layer context K/V rows are packed by their ORIGINAL segment's arithmetic class. ≥ 2-row segments go into shared overwrite-WMMA chunks of 2..=63 rows, per-row identical to the one-tile route. 1-row segments go into one `gemv_mq4g256v2_multirow_r2_lanes` launch, the R2 GEMV body per z-plane. One norm and one RoPE run over the packed rows, then one gather/scatter. This replaces the per-lane rotate/GEMM/norm/RoPE launches. Every ring and state byte is identical; otherwise (or with `0`) the per-lane loops run. |
 | `HIPFIRE_DN_SNAPSHOT_BULK_OFF` | **unset**; `1` opts out | DeltaNet snapshot save/restore as one descriptor-driven byte-copy launch each (`dflash_state_bulk_copy_gfx1100`, pure byte copy) instead of one `hipMemcpy` per tensor. Default on exact gfx1100 and exact gfx1201 (railgun E0 port); DFlash and MTP share the snapshot. `1` restores the memcpy loops. |
 | `HIPFIRE_CB_TAPE_COPY_BATCH` | **on**; `0` opts out (developer) | VMM continuous-batching DFlash verify trunk (`forward_prefill_batch_multi`): each DeltaNet layer's GDN rollback-tape capture (pre-conv1d qkv rows + post-sigmoid α/β rows of every lane) runs as one `tape_copy_batched` launch (descriptor table in the kernarg segment, pure byte copy) after the layer's per-lane recurrence, instead of three `hipMemcpyDtoD` per lane per layer (1,152 → 48 launches per C8 step on the 27B). Tape bytes identical by construction. `0` restores the per-lane copies. |
 | `HIPFIRE_CB_LANE_GDN_BATCH` | **on**; `0` opts out (developer) | Exact gfx1201 VMM continuous-batching DFlash verify trunk. Admitted when every request of a chunk is a ChainVerify lane with a rollback tape (at most 16 lanes, fast Q8 GDN kernel, head dim 128, no capture/recording) and either all row counts are equal or `HIPFIRE_CB_LANE_GDN_VARROWS` admits ragged counts. Each DeltaNet layer then runs one launch per stage for all lanes instead of four per lane: the row-local sigmoid/alpha gate and Q/K norm-interleave over every row, `conv1d_silu_split_f32_lanes` (each lane's conv body verbatim over its rows and ring), and the lane-table recurrence `gated_delta_net_q8_fast_lanes_varrows` (single-lane body per lane, with each lane's own row count and frame offset = prefix of the earlier lanes' rows). 1,536 → 192 launches per C8 step on the 27B; every output and state byte is identical. Needs `HIPFIRE_CB_TAPE_COPY_BATCH` on. `0` restores the per-lane launches. |
@@ -594,7 +595,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1508
+**Count:** 1510
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -689,6 +690,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CB_DFLASH_DRAFT_BATCH` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/forward_slots/vmm/dflash.rs | developer |
 | `HIPFIRE_CB_DN_SAVE_FREE` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_cb.rs | developer |
 | `HIPFIRE_CB_DRAFT_LANE_CONV` | crates/hipfire-runtime/src/dflash/lanes.rs | developer |
+| `HIPFIRE_CB_DRAFT_LANE_CTX` | crates/hipfire-runtime/src/dflash.rs, crates/hipfire-runtime/src/dflash/lanes.rs | developer |
 | `HIPFIRE_CB_DRAFT_ROWS64` | crates/hipfire-arch-qwen35/src/speculative.rs | developer |
 | `HIPFIRE_CB_LANE_FA_BATCH` | crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |
 | `HIPFIRE_CB_LANE_GDN_BATCH` | crates/hipfire-arch-qwen35/src/dflash_cb.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |
@@ -1637,7 +1639,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PLE_LOAD_FILL_BYTES` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_PLE_PREWARM_BYTES` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_PM4_KERNARG_POOL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | experimental |
-| `HIPFIRE_PM_DECODE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
+| `HIPFIRE_PM_DECODE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/draft_lane_rows_oracle.rs | experimental |
 | `HIPFIRE_PORT` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_POST_LATCH_ANSWER_TOKENS` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/qwen.rs | developer |
 | `HIPFIRE_PP_DEVICES` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
@@ -1763,7 +1765,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_QSA_SELECT_EXACT` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/examples/qsa_select_pm_check.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SELECT_PM` | crates/rdna-compute/examples/qsa_select_pm_check.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QWEN4_QSA_WMMA_GATHER` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_ctx.rs, crates/hipfire-arch-qwen4/src/bundle.rs | developer |
-| `HIPFIRE_QWEN4_REQUANT` | crates/hipfire-arch-qwen4/src/weights.rs | developer |
+| `HIPFIRE_QWEN4_REQUANT` | crates/hipfire-arch-qwen4/src/artifact.rs, crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_ROUTER_FAST` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_ROUTE_TRACE` | crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_SHARED_DOWN_EPI` | crates/rdna-compute/src/gemm.rs | developer |

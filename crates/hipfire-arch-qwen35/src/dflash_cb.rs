@@ -405,7 +405,12 @@ impl DflashCbScratch {
     /// FWHT rotation buffers every lane borrows ([`Self::lend_mq`]).
     pub fn reserve_draft(&mut self, gpu: &mut Gpu, draft_config: &hipfire_runtime::dflash::DflashConfig) -> HipResult<()> {
         if self.draft.is_none() {
-            self.draft = Some(DflashScratch::new_with_mq(gpu, draft_config, dflash_draft_batch_max_rows(gpu), 1, true)?);
+            let mut ds = DflashScratch::new_with_mq(gpu, draft_config, dflash_draft_batch_max_rows(gpu), 1, true)?;
+            if let Err(e) = ds.enable_lane_workspace(gpu, draft_config) {
+                ds.free_gpu(gpu);
+                return Err(e);
+            }
+            self.draft = Some(ds);
         }
         Ok(())
     }
@@ -550,7 +555,12 @@ pub fn dflash_cb_draft(
     if n_chunks > 0 && cb.draft.is_none() {
         let cfg = lanes.iter().zip(&chunk_of).find(|(_, c)| c.is_some()).map(|(l, _)| l.state.df.draft_config.clone());
         if let Some(cfg) = cfg {
-            cb.draft = Some(DflashScratch::new_with_mq(gpu, &cfg, dflash_draft_batch_max_rows(gpu), 1, true)?);
+            let mut ds = DflashScratch::new_with_mq(gpu, &cfg, dflash_draft_batch_max_rows(gpu), 1, true)?;
+            if let Err(e) = ds.enable_lane_workspace(gpu, &cfg) {
+                ds.free_gpu(gpu);
+                return Err(e);
+            }
+            cb.draft = Some(ds);
         }
     }
     for c in 0..n_chunks {

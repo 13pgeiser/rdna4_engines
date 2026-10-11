@@ -1564,6 +1564,72 @@ pub fn ring_segments(start: usize, end: usize, modulus: usize) -> Vec<(usize, us
     out
 }
 
+/// Rows of the lane-batched ctx/fc workspace: eight lanes of at most nine new
+/// rows each (an accepted block of up to `b + 1` committed rows).
+pub const DRAFT_LANE_WS_ROWS: usize = 72;
+
+/// Preallocated packing buffers of the lane-batched context fill and `fc`
+/// projection (`draft_forward_lanes`). Allocated once per shared draft
+/// scratch, never per lane or per forward; contents are transient within one
+/// stage and carry no lane state.
+pub struct DraftLaneWorkspace {
+    /// Packed rows these tensors hold ([`DRAFT_LANE_WS_ROWS`]).
+    pub rows: usize,
+    /// Row stride of `input`: `max(num_extract × hidden, hidden)`.
+    pub input_width: usize,
+    /// `[rows, input_width]` gathered `target_hidden` (fc) / projected-hidden
+    /// (ctx) rows; shape subviews use the actual width of the stage.
+    pub input: GpuTensor,
+    /// `[rows, hidden]` fc output (post-norm before the scatter).
+    pub fc_out: GpuTensor,
+    /// `[rows, kv_dim]` packed context K.
+    pub k_out: GpuTensor,
+    /// `[rows, kv_dim]` packed context V.
+    pub v_out: GpuTensor,
+    /// `[rows]` i32 packed key positions (stored in an F32 tensor like every
+    /// `positions_*` plane).
+    pub positions: GpuTensor,
+}
+
+impl DraftLaneWorkspace {
+    /// Allocate every tensor or none: a failure frees the earlier ones.
+    fn alloc(gpu: &mut Gpu, cfg: &DflashConfig) -> HipResult<Self> {
+        let rows = DRAFT_LANE_WS_ROWS;
+        let h = cfg.hidden;
+        let kvd = cfg.kv_dim();
+        let input_width = std::cmp::max(cfg.num_extract() * h, h);
+        let mut live: Vec<GpuTensor> = Vec::with_capacity(5);
+        for len in [rows * input_width, rows * h, rows * kvd, rows * kvd, rows] {
+            match gpu.alloc_tensor(&[len], DType::F32) {
+                Ok(t) => live.push(t),
+                Err(e) => {
+                    for t in live {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let mut it = live.into_iter();
+        let mut next = || it.next().expect("five lane workspace tensors");
+        Ok(Self {
+            rows,
+            input_width,
+            input: next(),
+            fc_out: next(),
+            k_out: next(),
+            v_out: next(),
+            positions: next(),
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [self.input, self.fc_out, self.k_out, self.v_out, self.positions] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
 /// Activation buffers for one forward pass. Sized for up to
 /// `max_block_size` query positions and up to `max_ctx_len` context
 /// positions. A single scratch is reused across all speculative steps.
@@ -1672,6 +1738,11 @@ pub struct DflashScratch {
     /// this FFN subgraph does not, so it can replay across DFlash cycles.
     pub draft_ffn_graphs: Vec<HashMap<usize, (Graph, GraphExec, Vec<Vec<u8>>)>>,
     pub draft_ffn_warmed_up: Vec<HashSet<usize>>,
+
+    /// Lane-batched ctx/fc workspace of the shared continuous-batching draft
+    /// scratch (`None` elsewhere, and when the batched path is off). See
+    /// [`DflashScratch::enable_lane_workspace`].
+    pub lane_ws: Option<DraftLaneWorkspace>,
 }
 
 impl DflashScratch {
@@ -2031,9 +2102,28 @@ impl DflashScratch {
             v_cat_full: None,
             draft_ffn_graphs,
             draft_ffn_warmed_up,
+            lane_ws: None,
         };
         debug_assert!(live.iter().all(|s| s.is_none()));
         Ok(scratch)
+    }
+
+    /// Allocate the lane-batched ctx/fc workspace ([`DraftLaneWorkspace`]) on
+    /// this scratch (idempotent). Only the shared continuous-batching draft
+    /// scratch calls this. A no-op (`Ok`, nothing allocated) unless the batched
+    /// context path can ever be admitted: `HIPFIRE_CB_DRAFT_LANE_CTX` not `0`,
+    /// exact gfx1201, and an MQ scratch (`mq_x_rot` present). On `Err` nothing
+    /// is left allocated by this call; the caller still owns (and frees) `self`.
+    pub fn enable_lane_workspace(&mut self, gpu: &mut Gpu, cfg: &DflashConfig) -> HipResult<()> {
+        if self.lane_ws.is_some()
+            || self.mq_x_rot.is_none()
+            || !lanes::draft_lane_ctx_enabled()
+            || gpu.arch != "gfx1201"
+        {
+            return Ok(());
+        }
+        self.lane_ws = Some(DraftLaneWorkspace::alloc(gpu, cfg)?);
+        Ok(())
     }
 
     /// Reset the incremental-upload tracker for target_hidden. Call this
@@ -2125,6 +2215,9 @@ impl DflashScratch {
         .flatten()
         {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some(ws) = self.lane_ws {
+            ws.free_gpu(gpu);
         }
     }
 }
