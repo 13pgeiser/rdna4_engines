@@ -675,7 +675,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CASK_OFF` | crates/hipfire-arch-qwen35/tests/pm_decode_twins_hw.rs, scripts/redline_daemon_harness.py | deprecated |
 | `HIPFIRE_CASK_SIDECAR` | crates/hipfire-config/src/lib.rs | deprecated |
 | `HIPFIRE_CB_DFLASH_DRAFT_BATCH` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/forward_slots/vmm/dflash.rs | developer |
-| `HIPFIRE_CB_PHASES` | crates/hipfire-arch-qwen35/src/forward_slots/vmm/dflash.rs, crates/hipfire-generate/src/batch.rs | developer |
+| `HIPFIRE_CB_PHASES` | crates/hipfire-arch-qwen35/src/forward_slots/vmm/dflash.rs, crates/hipfire-generate/src/batch.rs, crates/hipfire-generate/src/fn_batch.rs | developer |
 | `HIPFIRE_CB_SEG_TWINS` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |
 | `HIPFIRE_CB_VERIFY_CHUNK128` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_cb.rs | developer |
 | `HIPFIRE_CB_VERIFY_FP8` | crates/hipfire-arch-qwen35/examples/pm_fp8_verify_kld.rs, crates/hipfire-arch-qwen35/examples/pm_fp8_verify_oracle.rs | developer |

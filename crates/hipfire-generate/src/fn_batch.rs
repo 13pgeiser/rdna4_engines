@@ -241,6 +241,47 @@ struct DraftFailure {
     epochs: Vec<RequestEpoch>,
 }
 
+/// `HIPFIRE_CB_PHASES=1` (developer diagnostic): one `[fn-lane-step]` stderr
+/// line per lane step. `host` is the wall time from the previous step's end
+/// to this plan (terminal decisions, inbox, admission); `plan` holds the
+/// batched draft (one D2H per draft step); `fwd` is provision + forward
+/// (synchronized by the pick download); then `commit` and `emit`. Rows by
+/// kind, decoding/active lanes, the queue and the committed tokens follow.
+struct StepTrace {
+    origin: Instant,
+    last: Instant,
+    step: u64,
+}
+
+impl StepTrace {
+    fn new() -> Option<Self> {
+        let now = Instant::now();
+        hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
+            .then_some(Self { origin: now, last: now, step: 0 })
+    }
+
+    /// `marks`: plan start, forward start, commit start, commit end.
+    fn line(&mut self, marks: [Instant; 4], plan: &BatchStepPlan, tokens: usize, accepted: usize, active: usize, queued: usize) {
+        let now = Instant::now();
+        let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f64() * 1000.0;
+        let (mut pf, mut pf_rows, mut ar, mut ver, mut ver_rows) = (0, 0, 0, 0, 0);
+        for r in &plan.requests {
+            match r.kind {
+                RequestStepKind::Prefill => { pf += 1; pf_rows += r.rows.len; }
+                RequestStepKind::Ar => ar += 1,
+                RequestStepKind::Verify { .. } => { ver += 1; ver_rows += r.rows.len; }
+                RequestStepKind::Forced => {}
+            }
+        }
+        eprintln!("[fn-lane-step] n={} t={:.1} host={:.2} plan={:.2} fwd={:.2} commit={:.2} emit={:.2} active={active} queued={queued} \
+            pf={pf} pf_rows={pf_rows} ar={ar} ver={ver} ver_rows={ver_rows} tokens={tokens} accepted={accepted}",
+            self.step, ms(self.origin, marks[0]), ms(self.last, marks[0]), ms(marks[0], marks[1]), ms(marks[1], marks[2]),
+            ms(marks[2], marks[3]), ms(marks[3], now));
+        self.step += 1;
+        self.last = now;
+    }
+}
+
 /// Build directly rather than using `BatchPlanner::forced_prefill_len`: that
 /// planner charges exact singleton prefill tiles against the AR row budget,
 /// so a tile larger than the budget could never run. Here only decode lanes
@@ -486,6 +527,7 @@ pub fn drive_qwen4_lane_batch(
     };
     let mut controls: Vec<Option<LaneCtl>> = (0..sched.max_batch).map(|_| None).collect();
     let mut cursor = 0;
+    let mut trace = StepTrace::new();
     let batch_size = sched.max_batch;
     // Requests already queued at entry; the promoted lane never passes the
     // inbox, so it is never handed back to the singleton.
@@ -609,6 +651,7 @@ pub fn drive_qwen4_lane_batch(
                 BatchLane::Running(l) | BatchLane::Seeding(l) => l.streamed_tokens.len(),
                 _ => 0,
             }).collect();
+            let t_plan = Instant::now();
             let plan = match plan_step(m, gpu, &mut controls, &streamed, row_budget, &mut cursor, max_lanes)? {
                 Ok(plan) => plan,
                 Err(failure) => {
@@ -625,15 +668,18 @@ pub fn drive_qwen4_lane_batch(
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
+            let t_fwd = Instant::now();
+            let mut t_commit = t_fwd;
             let stepped = {
                 let bundle = m.qwen4_mut().ok_or("qwen4 bundle disappeared")?;
                 let mut executor = bundle.lane_executor().map_err(|e| e.to_string())?;
                 let result = executor.provision_step(gpu, &plan)
                     .and_then(|()| executor.forward_step(gpu, &plan))
-                    .and_then(|out| executor.commit_step(gpu, &plan, out));
+                    .and_then(|out| { t_commit = Instant::now(); executor.commit_step(gpu, &plan, out) });
                 if result.is_err() { executor.abort_step(&plan); }
                 result
             };
+            let t_done = Instant::now();
             let advances = match stepped {
                 Ok(a) => a,
                 Err(error) => {
@@ -645,6 +691,9 @@ pub fn drive_qwen4_lane_batch(
                     continue;
                 }
             };
+            let decoded = trace.is_some().then(|| advances.iter()
+                .filter(|a| plan.requests.iter().any(|r| r.epoch == a.epoch && r.kind != RequestStepKind::Prefill))
+                .fold((0, 0), |(t, c), a| (t + a.committed_ids.len(), c + a.accepted_drafts)));
             for advance in advances {
                 let idx = controls.iter().position(|c| c.as_ref().is_some_and(|c| c.epoch == advance.epoch))
                     .ok_or("qwen4 advance has no request owner")?;
@@ -705,6 +754,10 @@ pub fn drive_qwen4_lane_batch(
                         }
                     }
                 }
+            }
+            if let (Some(trace), Some((tokens, accepted))) = (trace.as_mut(), decoded) {
+                let active = controls.iter().flatten().filter(|c| c.epoch.is_admitted()).count();
+                trace.line([t_plan, t_fwd, t_commit, t_done], &plan, tokens, accepted, active, sched.inbox.len());
             }
         }
     })();
