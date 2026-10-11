@@ -1,0 +1,608 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! fn_ep_oracle: Flash-Next expert-parallel exactness oracle (lab).
+//!
+//! Loads a Qwen4 model through `hipfire_loader::load_model` exactly as the
+//! daemon does (EP comes from `topology.ep` / the S1 env var, not from a flag
+//! here), prefills each prompt with `prefill_final`, then runs the daemon's
+//! greedy decode (`forward_token_or_argmax(None, logits)`) for `--tokens`
+//! steps. Everything the single-vs-EP comparison needs is written under
+//! `--out`:
+//!
+//! * `logits.jsonl` — one record per prompt per step (`step` 0 = after prefill,
+//!   `step` k = after k decode forwards): token, position, SHA-256 of the rank-0
+//!   logits row and (EP) of every peer's logits mirror.
+//! * `state.jsonl` — at each `--state-steps` step one record per rank with the
+//!   `Qwen4State::debug_digest` rows.
+//! * `logits-p<prompt>-s<step>.f32` — raw rank-0 logits at the state steps (and
+//!   step 0 / `--save-logits-steps`), for max-abs reporting.
+//! * `meta.json` — binary, model, environment, devices, prompt identity.
+//!
+//! Compare arms with `fn-ep/oracle/compare.py`.
+//!
+//! Usage:
+//! ```text
+//! fn_ep_oracle --model M.mq4 --prompt-file a.txt [--prompt-file b.ids ...] \
+//!     --max-seq 4096 --tokens 256 --out DIR --arm single \
+//!     [--state-steps 1,64,256] [--save-logits-steps 5,6] \
+//!     [--moe-dump-positions 0,1] [--perturb-rank R --perturb-step S] \
+//!     [--kv-mode M] [--state-quant Q] [--skip-model-hash] \
+//!     [--truncate-prompt-tokens N]
+//! ```
+//!
+//! `--moe-dump-positions` labels decode forwards 0-based (`position-<P>` under
+//! `HIPFIRE_MOE_DUMP_DIR`); with the dump enabled exactly one prompt is
+//! accepted and decoding stops after the last listed position (the dump hooks
+//! keep writing under the last context otherwise).
+//!
+//! `--perturb-*` (negative control): after step S is recorded, one mantissa bit
+//! of the first nonzero word of rank R's GDN layer-0 recurrent state is flipped
+//! (every following token reads it), so that rank must diverge from step S+1.
+
+use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_dispatch::pipeline::moe_dump;
+use rdna_compute::{DType, Gpu, GpuTensor};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+type R<T> = Result<T, String>;
+
+fn e<E: std::fmt::Display>(error: E) -> String {
+    error.to_string()
+}
+
+// ---------------------------------------------------------------- hashing
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+fn file_sha256(path: &Path) -> R<String> {
+    let mut file = std::fs::File::open(path).map_err(|x| format!("open {}: {x}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 8 << 20];
+    loop {
+        let n = file.read(&mut buffer).map_err(e)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// RFC 1321 MD5 (identity tags only, never a security boundary).
+fn md5_hex(data: &[u8]) -> String {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: Vec<u32> = (0..64)
+        .map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32)
+        .collect();
+    let (mut a0, mut b0, mut c0, mut d0) =
+        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    let mut message = data.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_le_bytes());
+    for chunk in message.chunks_exact(64) {
+        let m: Vec<u32> = chunk
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let rotated = a
+                .wrapping_add(f)
+                .wrapping_add(k[i])
+                .wrapping_add(m[g])
+                .rotate_left(S[i]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(rotated);
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = Vec::with_capacity(16);
+    for word in [a0, b0, c0, d0] {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    hex(&out)
+}
+
+// ------------------------------------------------------------------- args
+
+struct Args {
+    model: String,
+    prompt_files: Vec<String>,
+    max_seq: usize,
+    tokens: usize,
+    out: PathBuf,
+    arm: String,
+    state_steps: BTreeSet<usize>,
+    save_logits_steps: BTreeSet<usize>,
+    moe_dump_positions: BTreeSet<usize>,
+    perturb: Option<(usize, usize)>,
+    kv_mode: Option<String>,
+    state_quant: Option<String>,
+    skip_model_hash: bool,
+    truncate_prompt_tokens: Option<usize>,
+}
+
+fn usize_list(value: &str) -> R<BTreeSet<usize>> {
+    value
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| part.trim().parse::<usize>().map_err(|x| format!("bad number {part:?}: {x}")))
+        .collect()
+}
+
+fn parse_args() -> R<Args> {
+    let mut model = None;
+    let mut prompt_files = Vec::new();
+    let mut max_seq = None;
+    let mut tokens = 256usize;
+    let mut out = None;
+    let mut arm = None;
+    let mut state_steps = BTreeSet::new();
+    let mut save_logits_steps = BTreeSet::new();
+    let mut moe_dump_positions = BTreeSet::new();
+    let mut perturb_rank = None;
+    let mut perturb_step = None;
+    let mut kv_mode = None;
+    let mut state_quant = None;
+    let mut skip_model_hash = false;
+    let mut truncate_prompt_tokens = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
+        match flag.as_str() {
+            "--model" => model = Some(value("--model")?),
+            "--prompt-file" => prompt_files.push(value("--prompt-file")?),
+            "--max-seq" => max_seq = Some(value("--max-seq")?.parse::<usize>().map_err(e)?),
+            "--tokens" => tokens = value("--tokens")?.parse::<usize>().map_err(e)?,
+            "--out" => out = Some(PathBuf::from(value("--out")?)),
+            "--arm" => arm = Some(value("--arm")?),
+            "--state-steps" => state_steps = usize_list(&value("--state-steps")?)?,
+            "--save-logits-steps" => save_logits_steps = usize_list(&value("--save-logits-steps")?)?,
+            "--moe-dump-positions" => moe_dump_positions = usize_list(&value("--moe-dump-positions")?)?,
+            "--perturb-rank" => perturb_rank = Some(value("--perturb-rank")?.parse::<usize>().map_err(e)?),
+            "--perturb-step" => perturb_step = Some(value("--perturb-step")?.parse::<usize>().map_err(e)?),
+            "--kv-mode" => kv_mode = Some(value("--kv-mode")?),
+            "--state-quant" => state_quant = Some(value("--state-quant")?),
+            "--skip-model-hash" => skip_model_hash = true,
+            "--truncate-prompt-tokens" => {
+                truncate_prompt_tokens = Some(value("--truncate-prompt-tokens")?.parse::<usize>().map_err(e)?)
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let perturb = match (perturb_rank, perturb_step) {
+        (Some(rank), Some(step)) => Some((rank, step)),
+        (None, None) => None,
+        _ => return Err("--perturb-rank and --perturb-step go together".into()),
+    };
+    if prompt_files.is_empty() {
+        return Err("at least one --prompt-file is required".into());
+    }
+    Ok(Args {
+        model: model.ok_or("--model is required")?,
+        prompt_files,
+        max_seq: max_seq.ok_or("--max-seq is required")?,
+        tokens,
+        out: out.ok_or("--out is required")?,
+        arm: arm.ok_or("--arm is required")?,
+        state_steps,
+        save_logits_steps,
+        moe_dump_positions,
+        perturb,
+        kv_mode,
+        state_quant,
+        skip_model_hash,
+        truncate_prompt_tokens,
+    })
+}
+
+// ---------------------------------------------------------------- prompts
+
+struct Prompt {
+    path: String,
+    ids: Vec<u32>,
+    file_md5: String,
+    ids_md5: String,
+    kind: &'static str,
+    /// Token count before `--truncate-prompt-tokens` cut it.
+    full_token_count: usize,
+}
+
+fn ids_md5(ids: &[u32]) -> String {
+    let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+    md5_hex(&bytes)
+}
+
+fn load_prompt(
+    path: &str,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    truncate: Option<usize>,
+) -> R<Prompt> {
+    let bytes = std::fs::read(path).map_err(|x| format!("read {path}: {x}"))?;
+    let file_md5 = md5_hex(&bytes);
+    let (ids, kind) = if path.ends_with(".ids") {
+        let text = std::str::from_utf8(&bytes).map_err(|x| format!("{path}: {x}"))?;
+        let ids = text
+            .split_whitespace()
+            .map(|word| word.parse::<u32>().map_err(|x| format!("{path}: bad id {word:?}: {x}")))
+            .collect::<R<Vec<u32>>>()?;
+        (ids, "ids")
+    } else {
+        let text = std::str::from_utf8(&bytes).map_err(|x| format!("{path}: not UTF-8: {x}"))?;
+        (tokenizer.encode(text), "text")
+    };
+    let full_token_count = ids.len();
+    let mut ids = ids;
+    if let Some(limit) = truncate {
+        ids.truncate(limit);
+    }
+    if ids.is_empty() {
+        return Err(format!("{path}: empty prompt"));
+    }
+    Ok(Prompt {
+        full_token_count,
+        path: path.to_string(),
+        file_md5,
+        ids_md5: ids_md5(&ids),
+        ids,
+        kind,
+    })
+}
+
+// ----------------------------------------------------------------- device
+
+fn tensor_bytes(gpu: &Gpu, tensor: &GpuTensor) -> R<Vec<u8>> {
+    gpu.hip.device_synchronize().map_err(e)?;
+    gpu.download_raw_bytes(tensor).map_err(e)
+}
+
+fn device_info(gpu: &Gpu) -> Value {
+    json!({
+        "device_id": gpu.device_id,
+        "arch": gpu.arch,
+        "pci_bus_id": gpu.hip.device_pci_bus_id(gpu.device_id).unwrap_or_else(|x| format!("error: {x}")),
+    })
+}
+
+/// Flip one mantissa bit of the first nonzero 4-byte word of GDN layer 0's
+/// recurrent state (or plant `2.0f32` when the state is all zero).
+fn perturb_state(bundle: &mut Qwen4Bundle, gpu: &mut Gpu) -> R<Value> {
+    let layer = bundle
+        .state
+        .gdn
+        .first()
+        .ok_or("perturb: model has no GDN layer")?;
+    let mut bytes = tensor_bytes(gpu, &layer.recurrent)?;
+    let words = bytes.len() / 4;
+    let index = (0..words)
+        .find(|&i| bytes[4 * i..4 * i + 4] != [0, 0, 0, 0])
+        .unwrap_or(0);
+    let before = bytes[4 * index..4 * index + 4].to_vec();
+    if before == [0, 0, 0, 0] {
+        bytes[4 * index..4 * index + 4].copy_from_slice(&0x4000_0000u32.to_le_bytes());
+    } else {
+        bytes[4 * index + 2] ^= 0x40;
+    }
+    let after = bytes[4 * index..4 * index + 4].to_vec();
+    gpu.hip.memcpy_htod(&layer.recurrent.buf, &bytes).map_err(e)?;
+    gpu.hip.device_synchronize().map_err(e)?;
+    Ok(json!({
+        "tensor": "gdn[0].recurrent",
+        "word_index": index,
+        "before": hex(&before),
+        "after": hex(&after),
+    }))
+}
+
+// ------------------------------------------------------------------- main
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("[fn_ep_oracle] ERROR: {error}");
+        std::process::exit(1);
+    }
+}
+
+struct Sinks {
+    logits: std::fs::File,
+    state: std::fs::File,
+}
+
+fn emit(file: &mut std::fs::File, record: &Value) -> R<()> {
+    writeln!(file, "{record}").map_err(e)?;
+    file.flush().map_err(e)
+}
+
+fn run() -> R<()> {
+    let args = parse_args()?;
+    std::fs::create_dir_all(&args.out).map_err(|x| format!("create {}: {x}", args.out.display()))?;
+    let dump = moe_dump::enabled();
+    if dump {
+        if args.moe_dump_positions.is_empty() {
+            return Err("HIPFIRE_MOE_DUMP_DIR is set: pass --moe-dump-positions".into());
+        }
+        if args.prompt_files.len() != 1 {
+            return Err("MoE dump runs take exactly one --prompt-file".into());
+        }
+    }
+
+    eprintln!("[fn_ep_oracle] loading {}", args.model);
+    let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
+    let cask = hipfire_runtime::loader_api::CaskConfig::default();
+    let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
+    let mut model = hipfire_loader::load_model(
+        &args.model,
+        args.max_seq,
+        None,
+        args.kv_mode.as_deref(),
+        None,
+        args.state_quant.as_deref(),
+        &cask,
+        1,
+        spec_cfg,
+        &mut gpu,
+    )?;
+
+    let prompts = {
+        let tokenizer = model
+            .tokenizer
+            .as_ref()
+            .ok_or("loaded model has no tokenizer")?;
+        args.prompt_files
+            .iter()
+            .map(|path| load_prompt(path, tokenizer, args.truncate_prompt_tokens))
+            .collect::<R<Vec<Prompt>>>()?
+    };
+    for prompt in &prompts {
+        if prompt.ids.len() + args.tokens > args.max_seq {
+            return Err(format!(
+                "{}: {} prompt tokens + {} decode tokens exceed --max-seq {}",
+                prompt.path,
+                prompt.ids.len(),
+                args.tokens,
+                args.max_seq
+            ));
+        }
+    }
+
+    let bundle = model
+        .qwen4_mut()
+        .ok_or("loaded model is not a Qwen4 (Flash-Next) bundle")?;
+    let ranks = bundle.ranks();
+    if let Some((rank, _)) = args.perturb {
+        if rank >= ranks {
+            return Err(format!("--perturb-rank {rank} but the bundle has {ranks} rank(s)"));
+        }
+    }
+    let vocab = bundle.config.vocab_size;
+    let logits = gpu.zeros(&[vocab], DType::F32).map_err(e)?;
+
+    let mut devices = vec![device_info(&gpu)];
+    for rank in 1..ranks {
+        devices.push(bundle.with_rank_mut(&mut gpu, rank, |_, peer, _| Ok(device_info(peer)))?);
+    }
+
+    let model_sha = if args.skip_model_hash {
+        Value::Null
+    } else {
+        eprintln!("[fn_ep_oracle] hashing model (use --skip-model-hash to skip)");
+        Value::String(file_sha256(Path::new(&args.model))?)
+    };
+    let exe = std::fs::read("/proc/self/exe").map_err(e)?;
+    let env: serde_json::Map<String, Value> = std::env::vars()
+        .filter(|(key, _)| {
+            key.starts_with("HIPFIRE_")
+                || matches!(
+                    key.as_str(),
+                    "ROCR_VISIBLE_DEVICES" | "HIP_VISIBLE_DEVICES" | "FABRIC_CARDS" | "HOME"
+                )
+        })
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect();
+    let prompt_meta: Vec<Value> = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            json!({
+                "prompt": index,
+                "path": prompt.path,
+                "kind": prompt.kind,
+                "file_md5": prompt.file_md5,
+                "token_count": prompt.ids.len(),
+                "full_token_count": prompt.full_token_count,
+                "ids_md5": prompt.ids_md5,
+            })
+        })
+        .collect();
+    let mut meta = json!({
+        "arm": args.arm,
+        "binary": std::fs::read_link("/proc/self/exe").map(|p| p.display().to_string()).unwrap_or_default(),
+        "binary_md5": md5_hex(&exe),
+        "model_path": args.model,
+        "model_sha256": model_sha,
+        "env": env,
+        "ranks": ranks,
+        "devices": devices,
+        "max_seq": args.max_seq,
+        "tokens": args.tokens,
+        "vocab": vocab,
+        "state_steps": args.state_steps,
+        "moe_dump_positions": args.moe_dump_positions,
+        "perturb": args.perturb.map(|(rank, step)| json!({"rank": rank, "step": step})),
+        "prompts": prompt_meta,
+        "completed": false,
+    });
+    let write_meta = |meta: &Value| -> R<()> {
+        std::fs::write(args.out.join("meta.json"), serde_json::to_vec_pretty(meta).map_err(e)?)
+            .map_err(e)
+    };
+    write_meta(&meta)?;
+
+    let mut sinks = Sinks {
+        logits: std::fs::File::create(args.out.join("logits.jsonl")).map_err(e)?,
+        state: std::fs::File::create(args.out.join("state.jsonl")).map_err(e)?,
+    };
+    let last_dump = args.moe_dump_positions.iter().next_back().copied();
+    let mut perturb_note = Value::Null;
+    let mut steps_run = Vec::new();
+
+    for (prompt_index, prompt) in prompts.iter().enumerate() {
+        eprintln!(
+            "[fn_ep_oracle] prompt {prompt_index}: {} ({} tokens)",
+            prompt.path,
+            prompt.ids.len()
+        );
+        bundle.reset(&mut gpu).map_err(e)?;
+        bundle
+            .prefill_final(&mut gpu, &prompt.ids, 0, &logits)
+            .map_err(e)?;
+        let mut completed = 0usize;
+        for step in 0..=args.tokens {
+            let token = if step == 0 {
+                None
+            } else {
+                let forward = step - 1;
+                if dump {
+                    if Some(forward) > last_dump {
+                        break;
+                    }
+                    if args.moe_dump_positions.contains(&forward) {
+                        moe_dump::set_context(&args.arm, forward);
+                    } else {
+                        // Positions not listed would overwrite the last
+                        // context's files; a dump run must be contiguous.
+                        return Err(format!(
+                            "MoE dump: decode forward {forward} is not in --moe-dump-positions \
+                             (positions must be 0..=last, contiguous)"
+                        ));
+                    }
+                }
+                Some(
+                    bundle
+                        .forward_token_or_argmax(&mut gpu, None, &logits)
+                        .map_err(e)?,
+                )
+            };
+            completed = step;
+
+            let rank0 = tensor_bytes(&gpu, &logits)?;
+            let rank0_sha = sha256_hex(&rank0);
+            let mut record = json!({
+                "kind": "logits",
+                "prompt": prompt_index,
+                "step": step,
+                "token": token,
+                "position": bundle.state.position,
+                "logits_sha256": rank0_sha,
+            });
+            if ranks > 1 {
+                let mut rank_sha = vec![rank0_sha.clone()];
+                for rank in 1..ranks {
+                    let peer_bytes = bundle.with_rank_mut(&mut gpu, rank, |_, peer_gpu, mirrors| {
+                        let mirror = mirrors
+                            .logits()
+                            .ok_or_else(|| format!("rank {rank} has no logits mirror"))?;
+                        tensor_bytes(peer_gpu, mirror)
+                    })?;
+                    rank_sha.push(sha256_hex(&peer_bytes));
+                }
+                if rank_sha.iter().any(|sha| *sha != rank0_sha) {
+                    eprintln!(
+                        "[fn_ep_oracle] prompt {prompt_index} step {step}: RANK LOGITS DISAGREE {rank_sha:?}"
+                    );
+                }
+                record["rank_logits_sha256"] = json!(rank_sha);
+            }
+            emit(&mut sinks.logits, &record)?;
+            if step == 0 || args.state_steps.contains(&step) || args.save_logits_steps.contains(&step) {
+                std::fs::write(
+                    args.out.join(format!("logits-p{prompt_index}-s{step}.f32")),
+                    &rank0,
+                )
+                .map_err(e)?;
+            }
+
+            if args.state_steps.contains(&step) {
+                for rank in 0..ranks {
+                    let digest = if rank == 0 {
+                        bundle.state.debug_digest(&mut gpu).map_err(e)?
+                    } else {
+                        bundle.with_rank_mut(&mut gpu, rank, |peer, peer_gpu, _| {
+                            peer.state.debug_digest(peer_gpu).map_err(e)
+                        })?
+                    };
+                    let rows: Vec<Value> = digest
+                        .into_iter()
+                        .map(|(name, value)| json!([name, value]))
+                        .collect();
+                    emit(
+                        &mut sinks.state,
+                        &json!({
+                            "kind": "state",
+                            "prompt": prompt_index,
+                            "step": step,
+                            "rank": rank,
+                            "digest": rows,
+                        }),
+                    )?;
+                }
+            }
+
+            if let Some((rank, perturb_step)) = args.perturb {
+                if step == perturb_step {
+                    perturb_note = if rank == 0 {
+                        perturb_state(bundle, &mut gpu)?
+                    } else {
+                        bundle.with_rank_mut(&mut gpu, rank, |peer, peer_gpu, _| {
+                            perturb_state(peer, peer_gpu)
+                        })?
+                    };
+                    eprintln!(
+                        "[fn_ep_oracle] prompt {prompt_index}: perturbed rank {rank} after step {step}: {perturb_note}"
+                    );
+                }
+            }
+            if step % 32 == 0 && step > 0 {
+                eprintln!("[fn_ep_oracle] prompt {prompt_index}: step {step}/{}", args.tokens);
+            }
+        }
+        steps_run.push(completed);
+    }
+
+    meta["completed"] = json!(true);
+    meta["steps_run"] = json!(steps_run);
+    meta["perturb_applied"] = perturb_note;
+    write_meta(&meta)?;
+    eprintln!("[fn_ep_oracle] done: {}", args.out.display());
+    Ok(())
+}

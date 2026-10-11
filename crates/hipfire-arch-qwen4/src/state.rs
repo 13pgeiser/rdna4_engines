@@ -1439,6 +1439,119 @@ impl Qwen4State {
         self.qsa_mapped_tokens
     }
 
+    /// Read-only exactness digest of the request state, for the EP oracle
+    /// (`fn_ep_oracle`): `(name, value)` rows in a fixed order, identical
+    /// across ranks/arms that ran the same host calls.
+    ///
+    /// Device rows are `"<sha256 hex> bytes=<n>"` over the tensor's whole
+    /// accessible extent (`buf.size()`): the full allocation for legacy
+    /// arenas and fixed buffers, the mapped prefix for VMM context arenas
+    /// (page-granular and driven only by host calls, so equal across arms).
+    /// Covered: every GDN recurrent (the live ring-slot view) and conv
+    /// state, every QSA full K/V, raw/pooled index keys, partial K/V and
+    /// selected indices, PLE conv, hyper feedback, and the verify row-capture
+    /// rings/inputs/recurrence/output when allocated. Host rows are decimal:
+    /// position, PLE history, GDN live slot, row-capture rows, mapped
+    /// tokens, and every QSA length/position mark.
+    ///
+    /// Deliberately excluded: the snapshot arena contents (scratch copies
+    /// written only by `snapshot`, never by a forward); the row-capture
+    /// pointer table (device addresses differ per process); the process-local
+    /// `model_id` / `reset_epoch` / `transaction_generation` counters.
+    pub fn debug_digest(&self, gpu: &mut Gpu) -> Result<Vec<(String, String)>, StateError> {
+        use sha2::{Digest, Sha256};
+        gpu.hip.device_synchronize().map_err(StateError::Hip)?;
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let device = |rows: &mut Vec<(String, String)>,
+                      name: String,
+                      tensor: &GpuTensor|
+         -> Result<(), StateError> {
+            let bytes = tensor.buf.size();
+            let mut host = vec![0u8; bytes];
+            if bytes > 0 {
+                gpu.hip
+                    .memcpy_dtoh(&mut host, &tensor.buf)
+                    .map_err(StateError::Hip)?;
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(&host);
+            let hex: String = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            rows.push((name, format!("{hex} bytes={bytes}")));
+            Ok(())
+        };
+        rows.push(("position".into(), self.position.to_string()));
+        rows.push((
+            "ple_history.previous".into(),
+            format!("{:?}", self.ple_history.previous()),
+        ));
+        rows.push((
+            "ple_history.eos".into(),
+            self.ple_history.eos_token_id().to_string(),
+        ));
+        rows.push(("gdn_live".into(), self.gdn_live.to_string()));
+        rows.push((
+            "row_capture_rows".into(),
+            self.row_capture_rows.to_string(),
+        ));
+        rows.push((
+            "qsa_mapped_tokens".into(),
+            self.qsa_mapped_tokens.to_string(),
+        ));
+        for (index, layer) in self.qsa.iter().enumerate() {
+            let mark = layer.mark();
+            rows.push((
+                format!("qsa[{index}].marks"),
+                format!(
+                    "full={} raw={} pooled={} partial={} selected={} position={}",
+                    mark.full_len,
+                    mark.raw_len,
+                    mark.pooled_len,
+                    mark.partial_len,
+                    mark.selected_len,
+                    mark.position
+                ),
+            ));
+        }
+        for (index, layer) in self.gdn.iter().enumerate() {
+            device(&mut rows, format!("gdn[{index}].recurrent"), &layer.recurrent)?;
+            device(&mut rows, format!("gdn[{index}].conv"), &layer.conv)?;
+        }
+        for (index, layer) in self.qsa.iter().enumerate() {
+            for (what, tensor) in [
+                ("full_keys", &layer.full_keys),
+                ("full_values", &layer.full_values),
+                ("raw_index_keys", &layer.raw_index_keys),
+                ("pooled_keys", &layer.pooled_keys),
+                ("partial_keys", &layer.partial_keys),
+                ("partial_values", &layer.partial_values),
+                ("selected_indices", &layer.selected_indices),
+            ] {
+                device(&mut rows, format!("qsa[{index}].{what}"), tensor)?;
+            }
+        }
+        if let Some(ple_conv) = &self.ple_conv {
+            device(&mut rows, "ple_conv".into(), ple_conv)?;
+        }
+        device(&mut rows, "hyper_feedback".into(), &self.hyper_feedback)?;
+        for (index, (ring, inputs, recurrence)) in self.row_capture.iter().enumerate() {
+            device(&mut rows, format!("row_capture[{index}].ring"), ring)?;
+            device(&mut rows, format!("row_capture[{index}].inputs"), inputs)?;
+            device(
+                &mut rows,
+                format!("row_capture[{index}].recurrence"),
+                recurrence,
+            )?;
+        }
+        if let Some((output, _pointer_table)) = &self.row_capture_output {
+            device(&mut rows, "row_capture_output".into(), output)?;
+        }
+        Ok(rows)
+    }
+
     /// Storage of the QSA context arenas, fixed at construction.
     pub fn qsa_backend(&self) -> Qwen4KvBackend {
         self.qsa_backend

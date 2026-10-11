@@ -48,6 +48,11 @@ hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-diffusion = { path = "../hipfire-arch-diffusion" }
 serde_json.workspace = true
 
+# fn_ep_oracle (lab example) only: the MoE dump context hook and SHA-256.
+[dev-dependencies]
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+sha2.workspace = true
+
 # ---------------------------------------------------------------------------
 # Archived research probes.
 #
@@ -67,4 +72,8 @@ serde_json.workspace = true
 # ---------------------------------------------------------------------------
 [[example]]
 name = "dspark_qwen3_1window"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_ep_oracle"
 required-features = ["lab"]

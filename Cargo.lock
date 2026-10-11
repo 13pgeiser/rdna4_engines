@@ -1712,10 +1712,12 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-qwen4",
  "hipfire-config",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
  "saddle-core",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
