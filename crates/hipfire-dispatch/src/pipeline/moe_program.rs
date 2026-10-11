@@ -43,6 +43,10 @@ pub enum MoeStage {
     Activation,
     Down,
     MutationFence,
+    /// Expert-parallel copy-only exchange of peer-owned expanded rows
+    /// ([`MoeParams::ep_row_gather`]); lowered only between `MutationFence`
+    /// and `Combine` of an indexed decode that supplies a gather.
+    RowGather,
     Combine,
     HostExperts,
 }
@@ -395,6 +399,7 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::Activation => self.activation(gpu),
             MoeStage::Down => self.down(gpu),
             MoeStage::MutationFence => self.mutation_fence(gpu),
+            MoeStage::RowGather => self.row_gather(gpu),
             MoeStage::Combine => self.combine(gpu),
             MoeStage::HostExperts => self.host_experts(gpu),
         }
@@ -1087,6 +1092,32 @@ impl<'a> SealedMoeOp<'a> {
             MoeProtocol::GroupedPrefill => super::prefill_mutation_fence_stage(),
         }
     }
+
+    pub(super) fn row_gather(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.state.decode_parts()?;
+        let gather = params.ep_row_gather.ok_or_else(|| {
+            DispatchError::Hip("sealed moe: row gather lowered without a gather".into())
+        })?;
+        // The exchange waits on peer devices and a host barrier; neither can
+        // be recorded into a graph or retained body. EP decode is eager-only.
+        if gpu.graphs.capture_mode
+            || gpu.graphs.verify.capturing.is_some()
+            || gpu.graphs.replay.capturing.is_some()
+            || gpu.replay.is_recording()
+        {
+            return Err(DispatchError::Hip(
+                "sealed moe: expert-parallel row gather refused while a graph capture or replay record is armed".into(),
+            ));
+        }
+        let rows = params
+            .k
+            .checked_mul(params.hidden)
+            .ok_or_else(|| DispatchError::Hip("sealed moe: row gather extent overflows".into()))?;
+        let down_expanded = super::slice_moe_f32_view(params.down_expanded, 0, rows);
+        gather
+            .gather_rows(gpu, params.layer_idx, &down_expanded, params.topk_indices)
+            .map_err(|error| DispatchError::Hip(format!("sealed moe: EP row gather: {error}")))
+    }
 }
 
 /// Append one borrowed instruction without allowing SmallVec to spill.
@@ -1164,6 +1195,24 @@ fn lower_decode<'a>(
             && (selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
                 || !down_self_combines)
             && !params.defer_routed_combine;
+        if params.ep_row_gather.is_some() {
+            // The gather fills exactly the ten expanded rows the grouped
+            // indexed down wrote; every other decode lowering either folds
+            // inside its down kernel or follows a different EP contract.
+            let grouped = selection
+                .route
+                .is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
+            if !grouped
+                || !combine_after_down
+                || params.batch_size != 1
+                || params.ep_mode != crate::families::moe::MoeEpMode::None
+            {
+                return Err(DispatchError::Hip(
+                    "sealed moe: an EP row gather requires the one-row grouped QT44/QT53 decode with its canonical combine".into(),
+                ));
+            }
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::RowGather))?;
+        }
         if combine_after_down {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
         }
@@ -1171,6 +1220,11 @@ fn lower_decode<'a>(
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
     } else {
+        if params.ep_row_gather.is_some() {
+            return Err(DispatchError::Hip(
+                "sealed moe: an EP row gather requires GPU top-k routing".into(),
+            ));
+        }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::HostExperts))?;
         if params.recipe.shared_after_combine() && !params.skip_shared {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;

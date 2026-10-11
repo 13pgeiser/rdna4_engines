@@ -1708,6 +1708,7 @@ pub(crate) fn seal_moe_decode<'a>(
         topk_indices: scratch.topk_indices,
         topk_weights: scratch.topk_weights,
         down_expanded: scratch.down_expanded,
+        ep_row_gather: None,
     };
     let bound = BoundMoeExperts::from_cache(&runtime.table, &runtime.cache)
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("bound MoE experts: {error:?}")))?;

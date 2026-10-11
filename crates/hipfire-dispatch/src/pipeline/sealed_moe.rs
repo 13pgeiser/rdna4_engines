@@ -5828,6 +5828,7 @@ mod tests {
             topk_indices: dummy,
             topk_weights: dummy,
             down_expanded: dummy,
+            ep_row_gather: None,
         }
     }
 
@@ -6031,6 +6032,7 @@ mod tests {
             topk_indices: &s.topk_indices,
             topk_weights: &s.topk_weights,
             down_expanded: &s.down_expanded,
+            ep_row_gather: None,
         }
     }
 

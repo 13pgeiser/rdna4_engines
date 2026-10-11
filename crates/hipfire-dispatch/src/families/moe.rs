@@ -729,6 +729,24 @@ pub trait RoutedExpertWeights {
     }
 }
 
+/// Expert-parallel row exchange for the indexed decode MoE.
+///
+/// Invoked once per decode MoE call after the routed down producer wrote the
+/// `k` unweighted expanded rows into `down_expanded` and before the canonical
+/// combine reads them. The implementation must leave every slot whose expert
+/// this rank owns untouched and overwrite every other slot with the owning
+/// rank's bits (a copy, never arithmetic), so the unchanged combine folds
+/// exactly the rows a single device would have produced.
+pub trait MoeRowGather {
+    fn gather_rows(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        layer_idx: u16,
+        down_expanded: &GpuTensor,
+        topk_indices: &GpuTensor,
+    ) -> Result<(), String>;
+}
+
 /// Everything the MoE decode executor arm reads, marshaled by the model from
 /// its weight/config/scratch structs. Resolution is owned by the family
 /// (the model passes only the dtype snapshot + k); the executor computes
@@ -813,6 +831,11 @@ pub struct MoeParams<'a> {
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
     pub down_expanded: &'a GpuTensor,
+    /// Expert-parallel decode: copy peer-owned expanded rows into
+    /// `down_expanded` between the routed down producer and the combine.
+    /// `None` (every single-device caller) lowers exactly the historical
+    /// stage sequence.
+    pub ep_row_gather: Option<&'a dyn MoeRowGather>,
 }
 
 // ── DeepSeek-V4 bias-aware decode parameters ───────────

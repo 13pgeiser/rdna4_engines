@@ -361,6 +361,7 @@ fn decode_step_body(
                     topk_indices: &state.topk_indices,
                     topk_weights: &state.topk_weights,
                     down_expanded: &state.down_expanded,
+                    ep_row_gather: None,
                 };
                 let ctx = DispatchCtx::new(gpu);
                 let bound = BoundMoeExperts::from_cache(&m.sealed.table, &m.sealed.cache)

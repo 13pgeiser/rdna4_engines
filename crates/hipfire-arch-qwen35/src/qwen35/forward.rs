@@ -650,6 +650,7 @@ fn moe_params_for_decode<'a>(
         topk_indices: s.topk_indices,
         topk_weights: s.topk_weights,
         down_expanded: s.down_expanded,
+        ep_row_gather: None,
     }
 }
 

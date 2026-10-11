@@ -852,6 +852,7 @@ fn build_moe_decode<'a>(
         topk_indices: scratch.moe_topk_indices,
         topk_weights: scratch.moe_topk_weights,
         down_expanded: scratch.moe_down_expanded,
+        ep_row_gather: None,
     })
 }
 
