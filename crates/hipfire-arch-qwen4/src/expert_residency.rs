@@ -12,6 +12,7 @@
 //! read over PCIe (zero-copy) with no kernel or dispatch change: a decode
 //! token reads only its routed experts' bytes from host RAM.
 
+use crate::gpu_forward::Qwen4ForwardScratchMode;
 use crate::Qwen4Config;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::uma_memory::{
@@ -213,10 +214,18 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 /// admitted context does not size a VMM reserve; legacy arenas commit all
 /// of `max_seq`. Callers on a discrete card pass legacy storage whatever the
 /// backend ([`crate::Qwen4ContextCommit::for_expert_reserve`]).
+///
+/// `mode` is the scratch plan the forward will actually allocate
+/// ([`crate::gpu_forward::qwen4_forward_scratch_mode`]); only the current
+/// forward is charged in it. The measured baseline is a historical
+/// subtraction of the original layout and stays `Full` with its all-row
+/// speculative logits, so a compact plan's saving reaches the placement
+/// instead of being rebased away.
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
     context: &crate::Qwen4ContextCommit,
     chunk_rows: usize,
+    mode: Qwen4ForwardScratchMode,
     qsa_format: rdna_compute::tensor_ops::QsaKvFormat,
     mtp_bytes: Option<u64>,
     gather_bytes: Option<u64>,
@@ -233,17 +242,19 @@ pub fn auto_vram_reserve(
         .ok_or_else(|| overflow(AUTO_VRAM_RESERVE_MAX_SEQ))?;
     let context = committed.saturating_sub(measured_context);
     let overflow = || format!("forward resources for a {chunk_rows}-row chunk overflow");
-    let measured =
-        crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(config, AUTO_VRAM_RESERVE_CHUNK)
-            .ok()
-            .and_then(|scratch| {
-                let spec =
-                    AUTO_VRAM_RESERVE_CHUNK.checked_mul(config.vocab_size.checked_mul(4)? + 4)?;
-                scratch.checked_add(spec as u64)
-            })
-            .ok_or_else(overflow)?;
+    let measured = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
+        config,
+        AUTO_VRAM_RESERVE_CHUNK,
+        Qwen4ForwardScratchMode::Full,
+    )
+    .ok()
+    .and_then(|scratch| {
+        let spec = AUTO_VRAM_RESERVE_CHUNK.checked_mul(config.vocab_size.checked_mul(4)? + 4)?;
+        scratch.checked_add(spec as u64)
+    })
+    .ok_or_else(overflow)?;
     let forward =
-        crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows).ok_or_else(overflow)?;
+        crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode).ok_or_else(overflow)?;
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
         .and_then(|bytes| bytes.checked_add(forward))
@@ -411,6 +422,7 @@ pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_forward::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
     use hipfire_runtime::weight_manifest::ShardPolicy;
     use rdna_compute::tensor_ops::QsaKvFormat::{self, F32};
     use rdna_compute::DType;
@@ -455,7 +467,7 @@ mod tests {
         let config = crate::config::compact_test_config();
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
         let reserve =
-            |chunk| auto_vram_reserve(&config, &measured, chunk, F32, None, None).unwrap();
+            |chunk| auto_vram_reserve(&config, &measured, chunk, Full, F32, None, None).unwrap();
         // Verify-sized spec logits free 1472 logit rows of the measured
         // 1536-row layout: one layer past the measured N = 16 fits.
         let measured_chunk = reserve(AUTO_VRAM_RESERVE_CHUNK);
@@ -484,11 +496,44 @@ mod tests {
     }
 
     #[test]
+    fn compact_scratch_lowers_the_reserve_by_exactly_its_saving() {
+        let config = crate::config::compact_test_config();
+        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
+        let reserve = |rows, mode| {
+            auto_vram_reserve(&config, &measured, rows, mode, F32, None, None).unwrap()
+        };
+        let forward = |rows, mode| {
+            crate::gpu_forward::qwen4_forward_device_bytes(&config, rows, mode).unwrap()
+        };
+        // The 8192-row chunk's compact plan is 4240.125 MiB smaller, and the
+        // whole of it reaches the reserve: the historical baseline stays on
+        // the Full layout, so the saving is not subtracted from both sides.
+        let saving = forward(8192, Full) - forward(8192, FnSymGfx1201);
+        assert_eq!(saving, 4240 * (1 << 20) + (1 << 20) / 8);
+        assert_eq!(reserve(8192, Full) - reserve(8192, FnSymGfx1201), saving);
+        // The same holds at every chunk, including the measured layout's own
+        // 1536 rows.
+        for rows in [AUTO_VRAM_RESERVE_CHUNK, 2048, 4096] {
+            let delta = forward(rows, Full) - forward(rows, FnSymGfx1201);
+            assert!(delta > 0, "{rows} rows");
+            assert_eq!(reserve(rows, Full) - reserve(rows, FnSymGfx1201), delta, "{rows} rows");
+        }
+        // A compact 8192-row chunk costs no more than today's 4096-row chunk,
+        // so `auto` keeps at least the layers it keeps today.
+        assert!(reserve(8192, FnSymGfx1201) <= reserve(4096, Full));
+        let (free, weights, layer) = (32548u64 << 20, 5_364_000_000u64, 1_336_900_000u64);
+        let layers = |reserve| auto_vram_layers(free, weights, layer, 48, reserve);
+        assert!(layers(reserve(8192, FnSymGfx1201)) >= layers(reserve(4096, Full)));
+        assert!(layers(reserve(8192, FnSymGfx1201)) > layers(reserve(8192, Full)));
+    }
+
+    #[test]
     fn native_mtp_and_longer_context_grow_the_reserve() {
         let config = crate::config::compact_test_config();
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
         let base =
-            auto_vram_reserve(&config, &measured, AUTO_VRAM_RESERVE_CHUNK, F32, None, None).unwrap();
+            auto_vram_reserve(&config, &measured, AUTO_VRAM_RESERVE_CHUNK, Full, F32, None, None)
+                .unwrap();
         let native = |context: &crate::Qwen4ContextCommit, max_k, row_capture| {
             crate::mtp_spec::native_mtp_device_bytes(
                 &config,
@@ -506,6 +551,7 @@ mod tests {
             &config,
             &measured,
             AUTO_VRAM_RESERVE_CHUNK,
+            Full,
             F32,
             Some(mtp),
             None,
@@ -522,6 +568,7 @@ mod tests {
             &config,
             &measured,
             AUTO_VRAM_RESERVE_CHUNK,
+            Full,
             F32,
             None,
             Some(gather),
@@ -595,6 +642,7 @@ mod tests {
                 &config,
                 &crate::Qwen4ContextCommit::legacy(long_seq),
                 AUTO_VRAM_RESERVE_CHUNK,
+                Full,
                 format,
                 None,
                 None,
@@ -614,6 +662,7 @@ mod tests {
             &config,
             &crate::Qwen4ContextCommit::legacy(2048),
             AUTO_VRAM_RESERVE_CHUNK,
+            Full,
             QsaKvFormat::Fp8,
             None,
             None,
@@ -626,19 +675,21 @@ mod tests {
         let config = crate::config::compact_test_config();
         let chunk = AUTO_VRAM_RESERVE_CHUNK;
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
-        let base = auto_vram_reserve(&config, &measured, chunk, F32, None, None).unwrap();
+        let base = auto_vram_reserve(&config, &measured, chunk, Full, F32, None, None).unwrap();
         let vmm = |max_seq| {
             crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, max_seq, chunk, 2 << 20)
         };
         // The native logical context, virtual under VMM, does not size the
         // reserve; legacy storage at that context commits every arena.
         let native = crate::QWEN4_MAX_CONTEXT;
-        let vmm_native = auto_vram_reserve(&config, &vmm(native), chunk, F32, None, None).unwrap();
+        let vmm_native =
+            auto_vram_reserve(&config, &vmm(native), chunk, Full, F32, None, None).unwrap();
         assert_eq!(vmm_native, base);
         let legacy_native = auto_vram_reserve(
             &config,
             &crate::Qwen4ContextCommit::legacy(native),
             chunk,
+            Full,
             F32,
             None,
             None,
@@ -685,6 +736,7 @@ mod tests {
                 &config,
                 context,
                 chunk,
+                Full,
                 format,
                 Some(mtp(context) as u64),
                 Some(gather),

@@ -45428,6 +45428,7 @@ impl Gpu {
         grouped_rows: usize,
         x_src_rows: usize,
     ) -> HipResult<()> {
+        crate::moe::require_span(y_grouped, &[grouped_rows, m, 2], "gemm_mq4g256v2_moe_grouped_top10_bf16out grouped rows")?;
         self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
             expert_weight_ptrs,
             expert_tile_ids,
@@ -45467,6 +45468,7 @@ impl Gpu {
                 "SwiGLU gate/up epilogue needs m % 16 == 0",
             ));
         }
+        crate::moe::require_span(y_grouped, &[grouped_rows, m / 2, 2], "gemm_mq4g256v2_moe_grouped_top10_silu_bf16out grouped rows")?;
         self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
             expert_weight_ptrs,
             expert_tile_ids,
@@ -45506,6 +45508,7 @@ impl Gpu {
                 "gemm_mq4g256v2_moe_grouped_top10: x_row_div must be sealed top-k=10",
             ));
         }
+        crate::moe::require_span(y_grouped, &[grouped_rows, m, 4], "gemm_mq4g256v2_moe_grouped_top10 grouped rows")?;
         // gfx1151, >= 512 tokens: the F16 WMMA grouped GEMM (60 VGPRs, 16
         // waves/SIMD) beats the F32 O4×R8 kernel (9.6 vs 14.7 ms at 1131
         // tokens; slower below ~450).  Not bit-exact — F16 dequant/inputs —
@@ -46261,6 +46264,7 @@ impl Gpu {
         if x.dtype != DType::F32 {
             return Err(hip_bridge::HipError::new(0, "qwen4_moe_rotate256_i4: F32 input only"));
         }
+        crate::moe::require_span(x, &[rows, k, 4], "qwen4_moe_rotate256_i4 activations")?;
         let reservation = self.reserve_int4_mmq(k, rows)?;
         self.rotate_x_mq_i4_batched(x, None, None, reservation, k, rows)
     }
@@ -46284,6 +46288,8 @@ impl Gpu {
                 "qwen4_moe_rotate128_i4: need k % 128 == 0 and nonzero rows",
             ));
         }
+        crate::moe::require_span(h, &[grouped_rows, k, 2], "qwen4_moe_rotate128_i4 grouped BF16 rows")?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], "qwen4_moe_rotate128_i4 sorted slots")?;
         // Fold the grouped row into grid x (p = x / (k/128), group = x % (k/128)):
         // grid y is bounded at 65535 and grouped_rows can exceed it.
         let grid_x = u32::try_from((k / 128) * grouped_rows).map_err(|_| {
@@ -46381,6 +46387,8 @@ impl Gpu {
                 "gemm_qwen4_moe_gate_up_silu_iu4_sym: need m % 64 == 0 and k % 256 == 0",
             ));
         }
+        crate::moe::require_span(y, &[grouped_rows, m / 2, 2], "gemm_qwen4_moe_gate_up_silu_iu4_sym BF16 grouped rows")?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], "gemm_qwen4_moe_gate_up_silu_iu4_sym sorted slots")?;
         let (generation, live) = self.scratch.int4_mmq_live();
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
         self.qwen4_moe_sym_gemm(
@@ -46418,6 +46426,8 @@ impl Gpu {
                 "gemm_qwen4_moe_down_iu4_sym: need m % 64 == 0 and k % 128 == 0",
             ));
         }
+        crate::moe::require_span(y, &[grouped_rows, m, 2], "gemm_qwen4_moe_down_iu4_sym BF16 grouped rows")?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], "gemm_qwen4_moe_down_iu4_sym sorted slots")?;
         let (generation, live) = self.scratch.qwen4_moe_down_i4_live();
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
         self.qwen4_moe_sym_gemm(

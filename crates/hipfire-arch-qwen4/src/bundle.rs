@@ -13,7 +13,8 @@ use crate::artifact::{Qwen4PleRows, SidecarRows};
 use crate::config::{Qwen4Config, Qwen4PleConfig};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
-    qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
+    qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4OutputRows,
+    QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
@@ -722,7 +723,16 @@ impl Qwen4Bundle {
 
     /// Attach reusable ordinary-HIP execution resources after the manifest
     /// transaction and model state have assembled successfully.
-    pub fn attach_forward(&mut self, gpu: &mut Gpu, max_chunk: usize) -> Result<(), BundleError> {
+    ///
+    /// `mode` is the forward scratch plan the caller admitted and, for the
+    /// loader, already charged to the automatic expert placement; the chunk
+    /// rung search and the forward allocate exactly that plan.
+    pub fn attach_forward(
+        &mut self,
+        gpu: &mut Gpu,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+    ) -> Result<(), BundleError> {
         if self.execution.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 forward resources are already attached".to_string(),
@@ -794,13 +804,13 @@ impl Qwen4Bundle {
         let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
         let max_chunk = qwen4_prefill_chunk_rungs(requested)
             .find(|&rows| {
-                qwen4_forward_device_bytes(&self.config, rows)
+                qwen4_forward_device_bytes(&self.config, rows, mode)
                     .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
                     .is_some_and(|bytes| bytes <= free as u64)
             })
             .unwrap_or_else(|| requested.min(1536));
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
-        let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
+        let forward = Qwen4GpuForward::new(gpu, self, max_chunk, mode)
             .map_err(|error| BundleError::Forward(error.to_string()))?;
         let spec_rows = qwen4_spec_logit_rows(max_chunk);
         let logits_len = spec_rows

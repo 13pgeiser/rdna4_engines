@@ -15890,6 +15890,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        crate::moe::require_span(y_gate, &[batch_size, 10, m / 2, 4], "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched gate rows")?;
+        crate::moe::require_span(y_up, &[batch_size, 10, m / 2, 4], "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched up rows")?;
         const FUNC: &str = "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched";
         self.ensure_kernel(
             FUNC,

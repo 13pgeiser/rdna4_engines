@@ -55,6 +55,238 @@ fn require_geometry(p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
     }
 }
 
+const F32_BYTES: usize = std::mem::size_of::<f32>();
+const BF16_BYTES: usize = 2;
+/// Bytes the BF16 combine's rank-order scratch holds per route slot
+/// (`moe_combine_order_top10`: `tokens * 10 * 8`).
+const ORDER_BYTES_PER_SLOT: usize = 8;
+
+fn scratch_overflow() -> DispatchError {
+    DispatchError::Hip("qt44/qt53 grouped prefill: scratch extent overflows".into())
+}
+
+fn scratch_mul(a: usize, b: usize) -> Result<usize, DispatchError> {
+    a.checked_mul(b).ok_or_else(scratch_overflow)
+}
+
+/// Bytes of the six scratch buffers whose size depends on the route the call
+/// actually takes.  The same record is the requirement a route derives
+/// ([`ScratchRoute::requirement`]) and the capacity the call's tensors hold
+/// ([`ScratchBytes::held`]), so validation, lowering and the tests compare one
+/// type.  A buffer the route never touches requires 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScratchBytes {
+    pub(crate) gate_batch: usize,
+    pub(crate) up_batch: usize,
+    pub(crate) rot_batch: usize,
+    pub(crate) down_expanded: usize,
+    pub(crate) y_gate_up_grouped: usize,
+    pub(crate) y_down_grouped: usize,
+}
+
+impl ScratchBytes {
+    fn fields(&self) -> [(&'static str, usize); 6] {
+        [
+            ("gate_batch", self.gate_batch),
+            ("up_batch", self.up_batch),
+            ("rot_batch", self.rot_batch),
+            ("down_expanded", self.down_expanded),
+            ("y_gate_up_grouped", self.y_gate_up_grouped),
+            ("y_down_grouped", self.y_down_grouped),
+        ]
+    }
+
+    /// Physical bytes each scratch tensor of `p` can hold: the smaller of its
+    /// logical extent and its device buffer, so neither forged shape metadata
+    /// nor a short allocation passes.
+    pub(crate) fn held(p: &MoePrefillParams<'_>) -> Self {
+        Self {
+            gate_batch: tensor_bytes(p.gate_batch),
+            up_batch: tensor_bytes(p.up_batch),
+            rot_batch: tensor_bytes(p.rot_batch),
+            down_expanded: tensor_bytes(p.down_expanded),
+            y_gate_up_grouped: tensor_bytes(p.y_gate_up_grouped),
+            y_down_grouped: tensor_bytes(p.y_down_grouped),
+        }
+    }
+
+    /// `Err` naming the first buffer of `held` that is below this requirement.
+    pub(crate) fn require_within(&self, held: &Self) -> Result<(), DispatchError> {
+        for ((name, need), (_, have)) in self.fields().into_iter().zip(held.fields()) {
+            if have < need {
+                return Err(DispatchError::Hip(format!(
+                    "qt44/qt53 grouped prefill scratch: {name} holds {have} bytes, \
+                     the selected route needs {need}; refusing before launch"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn tensor_bytes(tensor: &GpuTensor) -> usize {
+    let logical = tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .and_then(|elements| elements.checked_mul(tensor.dtype.size()))
+        .unwrap_or(0);
+    logical.min(tensor.buf.size())
+}
+
+/// F32 `[rows, down_m]` shared-down rows, which the unfused shared down
+/// writes into `down_expanded` whenever the BF16 epilogue does not take it.
+fn shared_down_bytes(rows: usize, down_m: usize) -> Result<usize, DispatchError> {
+    scratch_mul(scratch_mul(rows, down_m)?, F32_BYTES)
+}
+
+/// Rank-order scratch of the BF16-row combine (`tokens * k_top * 8` bytes).
+fn combine_order_bytes(rows: usize, k_top: usize) -> Result<usize, DispatchError> {
+    scratch_mul(scratch_mul(rows, k_top)?, ORDER_BYTES_PER_SLOT)
+}
+
+/// Invocation geometry the byte requirements depend on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScratchDims {
+    pub(crate) rows: usize,
+    pub(crate) k_top: usize,
+    pub(crate) mi: usize,
+    pub(crate) down_m: usize,
+    /// Padded grouped rows (path 2 only; 0 on path 1).
+    pub(crate) grouped_rows: usize,
+    /// The call carries a shared expert, whose F32 down may land in
+    /// `down_expanded`.
+    pub(crate) shared_down: bool,
+}
+
+/// The kernel arms one invocation takes, from the same predicates the stage
+/// lowering below branches on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScratchRoute {
+    pub(crate) path2: bool,
+    pub(crate) sym_iu4: bool,
+    pub(crate) gateup_bf16: bool,
+    pub(crate) gateup_silu: bool,
+    pub(crate) down_wmma: bool,
+    pub(crate) indexed_down: bool,
+}
+
+impl ScratchRoute {
+    pub(crate) fn of(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> Self {
+        Self {
+            path2: use_path2,
+            sym_iu4: sym_iu4(gpu, p, use_path2),
+            gateup_bf16: use_path2 && gateup_bf16(gpu, p),
+            gateup_silu: use_path2 && gateup_silu(gpu, p),
+            down_wmma: use_path2 && down_wmma(gpu, p),
+            indexed_down: indexed_down(gpu, p, use_path2),
+        }
+    }
+
+    /// Exact bytes each scratch buffer must hold for this route at `dims`:
+    /// - symmetric IU4: BF16 `[G, mi]` SwiGLU rows, BF16 `[G, down_m]` down
+    ///   rows, the combine's rank order;
+    /// - path-2 F32 arms: F32 `[G, 2 mi]` / `[G, down_m]` (BF16 on the gfx11
+    ///   WMMA arms), plus the unscattered activation unless gate/up stores
+    ///   SwiGLU for the down's own unscatter;
+    /// - indexed down (<= 8 rows) and path 1: the `[rows * k_top, ...]`
+    ///   batch buffers and the expanded down rows;
+    /// - every route that has a shared expert: its F32 `[rows, down_m]` down
+    ///   in `down_expanded`, because the BF16 epilogue may decline at run time.
+    pub(crate) fn requirement(&self, dims: &ScratchDims) -> Result<ScratchBytes, DispatchError> {
+        let slots = scratch_mul(dims.rows, dims.k_top)?;
+        let activation = scratch_mul(scratch_mul(slots, dims.mi)?, F32_BYTES)?;
+        let expanded = scratch_mul(scratch_mul(slots, dims.down_m)?, F32_BYTES)?;
+        let grouped = dims.grouped_rows;
+        let mut need = ScratchBytes::default();
+        if dims.shared_down {
+            need.down_expanded = shared_down_bytes(dims.rows, dims.down_m)?;
+        }
+        if !self.path2 {
+            need.gate_batch = activation;
+            need.up_batch = activation;
+            need.rot_batch = activation;
+            need.down_expanded = need.down_expanded.max(expanded);
+            return Ok(need);
+        }
+        let grouped_bytes = |width: usize, elem: usize| -> Result<usize, DispatchError> {
+            scratch_mul(scratch_mul(grouped, width)?, elem)
+        };
+        let order = combine_order_bytes(dims.rows, dims.k_top)?;
+        if self.sym_iu4 {
+            need.y_gate_up_grouped = grouped_bytes(dims.mi, BF16_BYTES)?;
+            need.y_down_grouped = grouped_bytes(dims.down_m, BF16_BYTES)?;
+            need.down_expanded = need.down_expanded.max(order);
+        } else {
+            let gate_up_width = scratch_mul(2, dims.mi)?;
+            need.y_gate_up_grouped = match (self.gateup_bf16, self.gateup_silu) {
+                (true, true) => grouped_bytes(dims.mi, BF16_BYTES)?,
+                (true, false) => grouped_bytes(gate_up_width, BF16_BYTES)?,
+                (false, _) => grouped_bytes(gate_up_width, F32_BYTES)?,
+            };
+            if !self.gateup_silu {
+                need.rot_batch = activation;
+            }
+            if self.down_wmma {
+                need.y_down_grouped = grouped_bytes(dims.down_m, BF16_BYTES)?;
+                need.down_expanded = need.down_expanded.max(order);
+            } else if !self.indexed_down {
+                need.y_down_grouped = grouped_bytes(dims.down_m, F32_BYTES)?;
+            }
+        }
+        if self.indexed_down {
+            need.rot_batch = activation;
+            need.down_expanded = need.down_expanded.max(expanded);
+        }
+        Ok(need)
+    }
+}
+
+/// The bytes this invocation's route needs from the call's scratch, for the
+/// route [`ScratchRoute::of`] derives at `p`'s actual rows.
+pub(crate) fn scratch_requirement(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    grouped_rows: usize,
+) -> Result<ScratchBytes, DispatchError> {
+    require_geometry(p)?;
+    ScratchRoute::of(gpu, p, use_path2).requirement(&ScratchDims {
+        rows: p.batch_size,
+        k_top: p.k_top,
+        mi: p.mi,
+        down_m: p.down_m,
+        grouped_rows: if use_path2 { grouped_rows } else { 0 },
+        shared_down: p.prelude.shared.is_some(),
+    })
+}
+
+/// Preflight of one invocation: every scratch tensor holds the bytes the
+/// selected route needs.  Run before the call's first launch by
+/// `SealedMoeCall::validate_for_gpu`, and again by each stage that writes
+/// scratch.
+pub(crate) fn validate_scratch(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    scratch_requirement(gpu, p, use_path2, grouped_rows)?.require_within(&ScratchBytes::held(p))
+}
+
+/// `down_expanded` holds at least `need` bytes (the combine-order and
+/// shared-down stages, which know their own byte count only).
+fn require_expanded(p: &MoePrefillParams<'_>, need: usize, what: &str) -> Result<(), DispatchError> {
+    let have = tensor_bytes(p.down_expanded);
+    if have < need {
+        return Err(DispatchError::Hip(format!(
+            "qt44/qt53 grouped prefill scratch: down_expanded holds {have} bytes, \
+             {what} needs {need}; refusing before launch"
+        )));
+    }
+    Ok(())
+}
+
 /// Prepare the routed expert activation basis.  The route's router/shared
 /// projections are BF16 and consume the natural input, while routed QT44
 /// gate/up consumes the FWHT basis.
@@ -416,6 +648,9 @@ pub(crate) fn shared_down(
     use_path2: bool,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    // The unfused shared down writes F32 rows into `down_expanded`; the BF16
+    // epilogue below may decline at run time, so the fallback is always owed.
+    require_expanded(p, shared_down_bytes(p.batch_size, p.down_m)?, "the unfused shared down")?;
     let shared = p
         .prelude
         .shared
@@ -647,6 +882,7 @@ pub(crate) fn combine_order_only(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    validate_scratch(gpu, p, true, grouped_rows)?;
     hip(gpu.moe_combine_order_top10(
         p.inverse_perm,
         p.topk_indices,
@@ -794,6 +1030,7 @@ pub(crate) fn gate_up(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    validate_scratch(gpu, p, use_path2, grouped_rows)?;
     let gate_up_ptrs = p
         .expert_stage_ptrs
         .map_or(p.expert_gate_up_ptrs, |stage| stage.gate_up);
@@ -889,6 +1126,7 @@ pub(crate) fn unscatter(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    validate_scratch(gpu, p, true, grouped_rows)?;
     // Symmetric IU4: SiLU in the gate/up epilogue, rotation + A4 in `down`.
     if sym_iu4(gpu, p, true) {
         return Ok(());
@@ -1022,6 +1260,19 @@ pub(crate) fn down(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    validate_scratch(gpu, p, use_path2, grouped_rows)?;
+    down_stage(gpu, p, use_path2, grouped_rows)
+}
+
+/// [`down`] after its scratch preflight; the indexed arm re-enters on path 1
+/// with the same (already validated) buffers.
+fn down_stage(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    require_geometry(p)?;
     let down_ptrs = p
         .expert_stage_ptrs
         .map_or(p.expert_down_ptrs, |stage| stage.down);
@@ -1052,7 +1303,7 @@ pub(crate) fn down(
         return release_stage(gpu, p);
     }
     if indexed_down(gpu, p, use_path2) {
-        return down(gpu, p, false, grouped_rows);
+        return down_stage(gpu, p, false, grouped_rows);
     }
     if use_path2 && down_wmma(gpu, p) {
         // Rotation and GEMM in one stage: the rotated F16 rows live in the
@@ -1140,6 +1391,20 @@ pub(crate) fn combine(
     initial_zero: bool,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    validate_scratch(gpu, p, use_path2, grouped_rows)?;
+    combine_stage(gpu, p, use_path2, grouped_rows, initial_zero)
+}
+
+/// [`combine`] after its scratch preflight; the indexed arm re-enters on
+/// path 1 with the same (already validated) buffers.
+fn combine_stage(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    grouped_rows: usize,
+    initial_zero: bool,
+) -> Result<(), DispatchError> {
+    require_geometry(p)?;
     let target = p.routed_out.unwrap_or(p.x_batch);
     if initial_zero && !combine_initial_zero_applies(gpu, p, use_path2) {
         return Err(DispatchError::Hip(
@@ -1147,7 +1412,7 @@ pub(crate) fn combine(
         ));
     }
     if indexed_down(gpu, p, use_path2) {
-        return combine(gpu, p, false, grouped_rows, false);
+        return combine_stage(gpu, p, false, grouped_rows, false);
     }
     if use_path2 && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2)) {
         // Both downs store BF16 grouped rows. The rank order goes to
@@ -1193,4 +1458,260 @@ pub(crate) fn combine(
         hip(gpu.bf16_round_trip_f32(target))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    const MI: usize = 640;
+    const HIDDEN: usize = 2560;
+    const K_TOP: usize = 10;
+    const N_EXP: usize = 512;
+    const WORD: usize = 4;
+
+    fn dims(rows: usize) -> ScratchDims {
+        let slots = rows * K_TOP;
+        ScratchDims {
+            rows,
+            k_top: K_TOP,
+            mi: MI,
+            down_m: HIDDEN,
+            grouped_rows: grouped_rows(slots),
+            shared_down: true,
+        }
+    }
+
+    /// `checked_grouped_m_total_bound` for 16-row blocks: slots plus up to 15
+    /// padding rows per active expert.
+    fn grouped_rows(slots: usize) -> usize {
+        (slots + 15 * slots.min(N_EXP)).div_ceil(16) * 16
+    }
+
+    fn route(path2: bool) -> ScratchRoute {
+        ScratchRoute {
+            path2,
+            sym_iu4: false,
+            gateup_bf16: false,
+            gateup_silu: false,
+            down_wmma: false,
+            indexed_down: false,
+        }
+    }
+
+    fn sym() -> ScratchRoute {
+        ScratchRoute { sym_iu4: true, ..route(true) }
+    }
+
+    fn wmma() -> ScratchRoute {
+        ScratchRoute { gateup_bf16: true, gateup_silu: true, down_wmma: true, ..route(true) }
+    }
+
+    fn wmma_unfused() -> ScratchRoute {
+        ScratchRoute { gateup_bf16: true, down_wmma: true, ..route(true) }
+    }
+
+    fn indexed() -> ScratchRoute {
+        ScratchRoute { indexed_down: true, ..route(true) }
+    }
+
+    /// What the generic validator demands of a Full-width F32 scratch.
+    fn full_scratch(rows: usize) -> ScratchBytes {
+        let slots = rows * K_TOP;
+        let m_total = grouped_rows(slots);
+        ScratchBytes {
+            gate_batch: slots * MI * 4,
+            up_batch: slots * MI * 4,
+            rot_batch: slots * MI * 4,
+            down_expanded: slots * HIDDEN * 4,
+            y_gate_up_grouped: m_total * 2 * MI * 4,
+            y_down_grouped: m_total * HIDDEN * 4,
+        }
+    }
+
+    /// The frozen compact capacities (`c = min(n, 512)`) for chunk `n`.
+    fn compact_scratch(n: usize) -> ScratchBytes {
+        let c = n.min(512);
+        let (gc, gn) = (grouped_rows(c * K_TOP), grouped_rows(n * K_TOP));
+        ScratchBytes {
+            gate_batch: c * 10 * 640 * 4,
+            up_batch: c * 10 * 640 * 4,
+            rot_batch: c * 10 * 640 * 4,
+            down_expanded: (c * 10 * 2560 * 4).max(n * 2560 * 4).max(n * 10 * 8),
+            y_gate_up_grouped: (gc * 1280 * 4).max(gn * 640 * 2),
+            y_down_grouped: (gc * 2560 * 4).max(gn * 2560 * 2),
+        }
+    }
+
+    #[test]
+    fn symmetric_route_needs_bf16_grouped_rows_and_the_shared_down_fallback() {
+        let rows = 8192;
+        let g = grouped_rows(rows * K_TOP);
+        assert_eq!(g, 89_600);
+        let need = sym().requirement(&dims(rows)).unwrap();
+        assert_eq!(need.y_gate_up_grouped, g * MI * 2);
+        assert_eq!(need.y_down_grouped, g * HIDDEN * 2);
+        // The F32 shared-down fallback dominates the 80-byte-per-row order.
+        assert_eq!(need.down_expanded, rows * HIDDEN * 4);
+        assert!(need.down_expanded > rows * 80);
+        assert_eq!((need.gate_batch, need.up_batch, need.rot_batch), (0, 0, 0));
+    }
+
+    #[test]
+    fn combine_order_alone_is_eighty_bytes_per_row() {
+        let mut no_shared = dims(1024);
+        no_shared.shared_down = false;
+        assert_eq!(sym().requirement(&no_shared).unwrap().down_expanded, 1024 * 80);
+        assert_eq!(wmma().requirement(&no_shared).unwrap().down_expanded, 1024 * 80);
+    }
+
+    #[test]
+    fn f32_grouped_arms_keep_todays_full_sizes() {
+        let rows = 700;
+        let g = grouped_rows(rows * K_TOP);
+        let need = route(true).requirement(&dims(rows)).unwrap();
+        assert_eq!(need.y_gate_up_grouped, g * 2 * MI * 4);
+        assert_eq!(need.y_down_grouped, g * HIDDEN * 4);
+        assert_eq!(need.rot_batch, rows * K_TOP * MI * 4);
+        assert_eq!(need.down_expanded, rows * HIDDEN * 4);
+        assert_eq!((need.gate_batch, need.up_batch), (0, 0));
+    }
+
+    #[test]
+    fn wmma_arms_store_bf16_grouped_rows() {
+        let rows = 900;
+        let g = grouped_rows(rows * K_TOP);
+        let fused = wmma().requirement(&dims(rows)).unwrap();
+        assert_eq!(fused.y_gate_up_grouped, g * MI * 2);
+        assert_eq!(fused.y_down_grouped, g * HIDDEN * 2);
+        assert_eq!(fused.rot_batch, 0);
+        let unfused = wmma_unfused().requirement(&dims(rows)).unwrap();
+        assert_eq!(unfused.y_gate_up_grouped, g * 2 * MI * 2);
+        assert_eq!(unfused.rot_batch, rows * K_TOP * MI * 4);
+    }
+
+    #[test]
+    fn indexed_down_and_path1_need_the_batch_buffers() {
+        let rows = 8;
+        let slots = rows * K_TOP;
+        let few = indexed().requirement(&dims(rows)).unwrap();
+        assert_eq!(few.down_expanded, slots * HIDDEN * 4);
+        assert_eq!(few.rot_batch, slots * MI * 4);
+        assert_eq!(few.y_down_grouped, 0);
+        let path1 = route(false).requirement(&dims(rows)).unwrap();
+        assert_eq!(path1.gate_batch, slots * MI * 4);
+        assert_eq!(path1.up_batch, slots * MI * 4);
+        assert_eq!(path1.rot_batch, slots * MI * 4);
+        assert_eq!(path1.down_expanded, slots * HIDDEN * 4);
+        assert_eq!((path1.y_gate_up_grouped, path1.y_down_grouped), (0, 0));
+    }
+
+    #[test]
+    fn full_width_buffers_always_pass() {
+        for rows in [1, 8, 9, 64, 511, 512, 513, 4096, 8192] {
+            for r in [route(false), route(true), sym(), wmma(), wmma_unfused(), indexed()] {
+                let need = r.requirement(&dims(rows)).unwrap();
+                need.require_within(&full_scratch(rows))
+                    .unwrap_or_else(|e| panic!("rows={rows} route={r:?}: {e:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn buffers_short_by_one_word_are_rejected_naming_the_buffer() {
+        for rows in [8, 513, 4096] {
+            for r in [route(false), route(true), sym(), wmma(), wmma_unfused(), indexed()] {
+                let need = r.requirement(&dims(rows)).unwrap();
+                // Exactly the requirement passes.
+                need.require_within(&need).unwrap();
+                for (name, bytes) in need.fields() {
+                    if bytes == 0 {
+                        continue;
+                    }
+                    let mut held = need;
+                    match name {
+                        "gate_batch" => held.gate_batch -= WORD,
+                        "up_batch" => held.up_batch -= WORD,
+                        "rot_batch" => held.rot_batch -= WORD,
+                        "down_expanded" => held.down_expanded -= WORD,
+                        "y_gate_up_grouped" => held.y_gate_up_grouped -= WORD,
+                        "y_down_grouped" => held.y_down_grouped -= WORD,
+                        other => panic!("unknown buffer {other}"),
+                    }
+                    let err = need.require_within(&held).expect_err(name);
+                    let DispatchError::Hip(message) = err else {
+                        panic!("unexpected error kind for {name}");
+                    };
+                    assert!(message.contains(name), "{message}");
+                    assert!(message.contains(&bytes.to_string()), "{message}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_down_fallback_is_owed_beyond_the_combine_order() {
+        let rows = 2048;
+        let need = sym().requirement(&dims(rows)).unwrap();
+        let mut held = need;
+        // Room for the 80-byte-per-row order only.
+        held.down_expanded = rows * 80;
+        let DispatchError::Hip(message) = need.require_within(&held).unwrap_err() else {
+            panic!("unexpected error kind");
+        };
+        assert!(message.contains("down_expanded"), "{message}");
+    }
+
+    #[test]
+    fn compact_capacities_admit_the_proven_routes() {
+        let n = 8192;
+        let held = compact_scratch(n);
+        // Ordinary large prefill on the symmetric IU4 route.
+        sym().requirement(&dims(n)).unwrap().require_within(&held).unwrap();
+        // The same route at the 4096 chunk and every smaller row count.
+        for rows in [1, 8, 9, 64, 511, 512, 513, 4096, 8192] {
+            sym().requirement(&dims(rows)).unwrap().require_within(&held).unwrap();
+        }
+        // Fallback arms at <= 512 rows keep their F32 sizes inside the cap.
+        for rows in [1, 8, 9, 64, 511, 512] {
+            for r in [route(false), route(true), wmma(), wmma_unfused(), indexed()] {
+                r.requirement(&dims(rows)).unwrap().require_within(&held).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn compact_scratch_refuses_fallback_arms_above_the_cap() {
+        let held = compact_scratch(8192);
+        for r in [route(false), route(true)] {
+            assert!(
+                r.requirement(&dims(513)).unwrap().require_within(&held).is_err(),
+                "route {r:?} must be refused above 512 rows on compact scratch"
+            );
+        }
+        // The 4096 plan too: the F32 grouped writer needs more than the cap.
+        assert!(route(true).requirement(&dims(1024)).unwrap().require_within(&compact_scratch(4096)).is_err());
+    }
+
+    #[test]
+    fn tensor_bytes_takes_the_smaller_of_shape_and_allocation() {
+        let tensor = |bytes: usize, shape: &[usize]| GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(0x1000 as *mut std::ffi::c_void, bytes) },
+            shape: shape.to_vec(),
+            dtype: DType::F32,
+        };
+        assert_eq!(tensor_bytes(&tensor(64, &[16])), 64);
+        // Shape claims more than the allocation holds.
+        assert_eq!(tensor_bytes(&tensor(60, &[16])), 60);
+        // Allocation larger than the logical view.
+        assert_eq!(tensor_bytes(&tensor(128, &[16])), 64);
+        assert_eq!(tensor_bytes(&tensor(128, &[usize::MAX, 2])), 0);
+    }
+
+    #[test]
+    fn extents_that_overflow_are_errors() {
+        let mut huge = dims(1);
+        huge.rows = usize::MAX / 4;
+        assert!(sym().requirement(&huge).is_err());
+    }
 }

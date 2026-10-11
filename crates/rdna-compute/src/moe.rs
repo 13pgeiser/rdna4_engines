@@ -20,6 +20,26 @@ pub struct SharedExpertActivation<'a> {
     pub selectors: usize,
 }
 
+/// Physical-span guard shared by the launchers below and the IU4 launchers in
+/// `gemm.rs`: `Err` unless `tensor`'s device buffer holds at least the product
+/// of `dims` bytes (callers pass `[rows, width, ..., element_bytes]`).  It
+/// reads the allocation, not the tensor's logical shape, so a short buffer is
+/// refused before the launch rather than overrun by it.
+pub(crate) fn require_span(tensor: &GpuTensor, dims: &[usize], what: &str) -> HipResult<()> {
+    let need = dims
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{what}: byte span overflows")))?;
+    let have = tensor.buf.size();
+    if have < need {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{what}: buffer holds {have} bytes, the launch needs {need}"),
+        ));
+    }
+    Ok(())
+}
+
 impl Gpu {
     /// Combine pass for the atomic-free MoE down path. Sums K_TOP expert
     /// outputs per (token, m) weighted by topk_weights, accumulates into
@@ -1890,6 +1910,7 @@ impl Gpu {
         tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        require_span(expert_outputs, &[tokens, 10, hidden, 4], "moe_down_combine_top10_batched expert outputs")?;
         const FUNC: &str = "moe_down_combine_top10_batched";
         self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_SRC, FUNC)?;
         let ep = expert_outputs.buf.as_ptr();
@@ -1988,6 +2009,9 @@ impl Gpu {
                 "moe_down_combine_grouped_top10_bf16in: hidden % 8 != 0 or order scratch too small",
             ));
         }
+        require_span(grouped_down, &[grouped_rows, hidden, 2], "moe_down_combine_grouped_top10_bf16in grouped rows")?;
+        require_span(inverse_perm, &[tokens, 10, 4], "moe_down_combine_grouped_top10_bf16in inverse permutation")?;
+        require_span(residual, &[tokens, hidden, 4], "moe_down_combine_grouped_top10_bf16in target")?;
         const MODULE: &str = "moe_down_combine_grouped_top10";
         // H8a (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): `residual` is written, not
         // accumulated into; the caller then owes no preceding zero fill.
@@ -2070,6 +2094,8 @@ impl Gpu {
         tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        require_span(grouped_down, &[grouped_rows, hidden, 4], "moe_down_combine_grouped_top10 grouped rows")?;
+        require_span(inverse_perm, &[tokens, 10, 4], "moe_down_combine_grouped_top10 inverse permutation")?;
         const FUNC: &str = "moe_down_combine_grouped_top10";
         self.ensure_kernel(FUNC, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
         let gp = grouped_down.buf.as_ptr();
@@ -2199,6 +2225,9 @@ impl Gpu {
         tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        require_span(grouped_gate_up, &[grouped_rows, 2, mi, 4], "moe_gate_up_unscatter_top10 grouped rows")?;
+        require_span(gate, &[tokens, 10, mi, 4], "moe_gate_up_unscatter_top10 gate")?;
+        require_span(up, &[tokens, 10, mi, 4], "moe_gate_up_unscatter_top10 up")?;
         const FUNC: &str = "moe_gate_up_unscatter_top10";
         self.ensure_kernel(FUNC, kernels::MOE_GATE_UP_UNSCATTER_TOP10_SRC, FUNC)?;
         let yp = grouped_gate_up.buf.as_ptr();
@@ -2292,6 +2321,7 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
+        require_span(grouped_act, &[grouped_rows, mi, 2], "moe_unscatter_rotate128_f16 grouped rows")?;
         const FUNC: &str = "moe_unscatter_rotate128_f16";
         self.ensure_kernel(
             "moe_gate_up_unscatter_silu_top10",
@@ -2359,6 +2389,7 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
+        require_span(grouped_gate_up, &[grouped_rows, 2, mi, 4], "moe_gate_up_unscatter_silu_rotate128_top10 grouped rows")?;
         const FUNC: &str = "moe_gate_up_unscatter_silu_rotate128_top10";
         self.ensure_kernel(
             "moe_gate_up_unscatter_silu_top10",
@@ -2471,6 +2502,11 @@ impl Gpu {
         grouped_bf16: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        require_span(
+            grouped_gate_up,
+            &[grouped_rows, 2, mi, if grouped_bf16 { 2 } else { 4 }],
+            "moe_gate_up_unscatter_silu_top10 grouped rows",
+        )?;
         const FUNC: &str = "moe_gate_up_unscatter_silu_top10";
         let func = if grouped_bf16 {
             "moe_gate_up_unscatter_silu_top10_bf16in"
@@ -2673,6 +2709,8 @@ impl Gpu {
         n_exp: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        require_span(expert_outputs, &[batch_size, 10, m, 4], "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded outputs")?;
+        require_span(hidden_batch, &[batch_size, 10, k, 4], "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded activations")?;
         const FUNC: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
         self.ensure_kernel(
             FUNC,
@@ -2839,6 +2877,11 @@ impl Gpu {
         bf16_out: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        require_span(
+            y_grouped,
+            &[grouped_rows, m, if bf16_out { 2 } else { 4 }],
+            "gemm_mq4g128v2_moe_grouped_wmma_gfx1151 grouped rows",
+        )?;
         let func = if bf16_out {
             "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out"
         } else {
@@ -2915,6 +2958,7 @@ impl Gpu {
         n_exp: usize,
         o8_r16: bool,
     ) -> HipResult<()> {
+        require_span(y_grouped, &[grouped_rows, m, 4], "gemm_mq4g128v2_moe_grouped_top10 grouped rows")?;
         let (func, source, grid_x) = if o8_r16 {
             (
                 "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
@@ -3440,5 +3484,33 @@ mod tests {
                 assert_eq!(fast.1, incumbent.1, "weights differ (normalize={normalize}, round={round})");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod span_guard_tests {
+    use super::*;
+
+    fn tensor(bytes: usize) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(0x1000 as *mut c_void, bytes) },
+            shape: vec![bytes / 4],
+            dtype: DType::F32,
+        }
+    }
+
+    #[test]
+    fn exact_span_passes_and_one_word_short_is_refused() {
+        let (rows, width, bf16) = (89_600usize, 640usize, 2usize);
+        let need = rows * width * bf16;
+        require_span(&tensor(need), &[rows, width, bf16], "grouped").unwrap();
+        let err = require_span(&tensor(need - 4), &[rows, width, bf16], "grouped").unwrap_err();
+        let message = format!("{err:?}");
+        assert!(message.contains("grouped") && message.contains(&need.to_string()), "{message}");
+    }
+
+    #[test]
+    fn overflowing_span_is_refused() {
+        assert!(require_span(&tensor(64), &[usize::MAX, 2], "huge").is_err());
     }
 }

@@ -520,7 +520,9 @@ fn load(path: &Path, max_seq: usize) -> R<(HfqModelSource, World, Tokenizer)> {
         backend,
     )
     .map_err(e)?;
-    bundle.attach_forward(&mut gpu, max_seq).map_err(e)?;
+    bundle
+        .attach_forward(&mut gpu, max_seq, hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full)
+        .map_err(e)?;
     Ok((source, World { gpu, bundle, vocab }, tokenizer))
 }
 

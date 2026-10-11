@@ -191,6 +191,15 @@ fn load(turn_snapshots: bool) -> Loaded {
     let receipt = admit_hfqm_artifact(&hfq).expect("admission");
     let mut gpu = Gpu::init().expect("GPU");
     let domain = CacheDomain::for_model(&hfq, &tokenizer, None, "qwen4", gpu.device_id);
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .expect("scratch plan");
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -234,7 +243,9 @@ fn load(turn_snapshots: bool) -> Loaded {
     )
     .expect("assemble");
     bundle.set_turn_snapshots(turn_snapshots);
-    bundle.attach_forward(&mut gpu, MAX_SEQ).expect("forward");
+    bundle
+        .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
+        .expect("forward");
     bundle.attach_session_cache(SessionCache::new(domain, u64::MAX >> 1));
     Loaded {
         bundle,

@@ -840,6 +840,17 @@ impl Carrier for Qwen4Carrier {
         // An automatic context (omitted max_seq; unified memory only) is
         // sized after load from what is left (card_cap).
         let automatic = ctx.sequence.is_some_and(|sequence| sequence.automatic);
+        // The forward scratch plan, decided from the actual routed-expert
+        // payload while the mapping is still readable and before any
+        // placement input: `auto` charges exactly the plan `attach_forward`
+        // allocates below.
+        let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+            ctx.gpu, &hfq, &config, &manifest,
+        )
+        .map_err(|error| error.to_string())?;
+        if scratch_mode != hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full {
+            eprintln!("  qwen4 forward scratch: {scratch_mode:?} plan (symmetric routed experts proven from the payload)");
+        }
         let use_ranges = ctx.gpu.is_uma();
         if use_ranges {
             hfq.drop_mmap();
@@ -953,6 +964,7 @@ impl Carrier for Qwen4Carrier {
                 &config,
                 &context,
                 chunk_rows,
+                scratch_mode,
                 qsa_format,
                 mtp_bytes,
                 gather_bytes,
@@ -1252,7 +1264,7 @@ impl Carrier for Qwen4Carrier {
                 return Err(format!("qwen4: PLE hot store setup failed: {detail}"));
             }
         }
-        if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
+        if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq, scratch_mode) {
             let detail = error.to_string();
             let _ = bundle.free_gpu(ctx.gpu);
             return Err(format!("qwen4: forward setup failed: {detail}"));

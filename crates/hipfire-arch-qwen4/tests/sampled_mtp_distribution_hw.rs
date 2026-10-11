@@ -718,6 +718,15 @@ fn load(model: &Path) -> Result<Loaded, String> {
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
     let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(|e| e.to_string())?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -759,7 +768,7 @@ fn load(model: &Path) -> Result<Loaded, String> {
     )
     .map_err(|e| e.to_string())?;
     bundle
-        .attach_forward(&mut gpu, MAX_SEQ)
+        .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
         .map_err(|e| e.to_string())?;
     Ok(Loaded {
         gpu,

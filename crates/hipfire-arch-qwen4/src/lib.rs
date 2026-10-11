@@ -57,6 +57,10 @@ pub use config::{
     SourceDType, ARCHITECTURE_NAME, ARCH_ID, MODEL_TYPE, QWEN4_DEFAULT_CONTEXT, QWEN4_MAX_CONTEXT,
     TEXT_MODEL_TYPE,
 };
+pub use gpu_forward::{
+    qwen4_compact_scratch_possible, qwen4_forward_device_bytes, qwen4_forward_scratch_mode,
+    Qwen4ForwardScratchMode, QWEN4_COMPACT_FALLBACK_ROWS, QWEN4_COMPACT_SCRATCH_ENV,
+};
 pub use kv_backend::{qwen4_vmm_refusal, qwen4_vmm_supported, Qwen4ContextCommit, Qwen4KvBackend};
 pub use ple::{
     PleHashMetadata, PleHistory, PleMetadataError, PleRowId, PLE_HEAD_COUNT, PLE_HEAD_OFFSETS,

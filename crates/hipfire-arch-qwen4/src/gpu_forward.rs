@@ -116,11 +116,113 @@ pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
     QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
 }
 
+/// Allocation plan of one [`Qwen4GpuForwardScratch`].
+///
+/// `Full` is the historical plan: one dedicated allocation per field, every
+/// MoE buffer sized for `max_chunk` rows of the widest (F32) route.
+/// `FnSymGfx1201` is the proven-route plan of a gfx1201 Flash-Next artifact
+/// whose routed headers are all symmetric: the MoE buffers are sized for the
+/// symmetric IU4 prefill route plus a [`QWEN4_COMPACT_FALLBACK_ROWS`]-row F32
+/// fallback, and eight phase-disjoint fields borrow their storage from an
+/// owner (see [`Qwen4GpuForwardScratch::plan`]).  Both modes run identical
+/// arithmetic; the mode only changes where intermediates live, so it must be
+/// decided before expert placement and frozen for the forward's lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen4ForwardScratchMode {
+    Full,
+    FnSymGfx1201,
+}
+
+/// Rows the `FnSymGfx1201` plan sizes the F32 fallback MoE buffers for.  A
+/// larger MoE invocation that is not on the symmetric IU4 route has no buffer
+/// to run in; dispatch refuses it before its first launch.
+pub const QWEN4_COMPACT_FALLBACK_ROWS: usize = 512;
+
+/// Storage-only opt-in for the compact scratch (`1` on, default off; `0`
+/// leaves the IU4 math enabled and only keeps the full allocation plan).
+pub const QWEN4_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_QWEN4_COMPACT_SCRATCH";
+
+/// Pure predicate of [`qwen4_forward_scratch_mode`]: every term must hold
+/// for the compact plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompactScratchTerms {
+    pub knob: bool,
+    pub exact_gfx1201: bool,
+    pub grouped_gemm: bool,
+    pub sym_iu4_requested: bool,
+    pub source_symmetric: bool,
+    pub ple_key_value_bf16: bool,
+    pub flash_next_profile: bool,
+}
+
+impl CompactScratchTerms {
+    /// Exactly gfx1201: no other arch, and no family prefix match.
+    pub(crate) fn is_exact_gfx1201(arch: &str) -> bool {
+        arch == "gfx1201"
+    }
+
+    pub(crate) fn mode(self) -> Qwen4ForwardScratchMode {
+        if self.knob
+            && self.exact_gfx1201
+            && self.grouped_gemm
+            && self.sym_iu4_requested
+            && self.source_symmetric
+            && self.ple_key_value_bf16
+            && self.flash_next_profile
+        {
+            Qwen4ForwardScratchMode::FnSymGfx1201
+        } else {
+            Qwen4ForwardScratchMode::Full
+        }
+    }
+}
+
+/// The device, flag and profile terms of [`qwen4_forward_scratch_mode`]
+/// with the artifact-dependent terms assumed true.  `false` means the mode is
+/// `Full` whatever the artifact holds, so a caller can skip its payload
+/// header scan.
+pub fn qwen4_compact_scratch_possible(gpu: &Gpu, config: &Qwen4Config) -> bool {
+    qwen4_forward_scratch_mode(gpu, config, true, true) == Qwen4ForwardScratchMode::FnSymGfx1201
+}
+
+/// The scratch plan a load takes: `FnSymGfx1201` only for the opted-in exact
+/// gfx1201 Flash-Next symmetric-IU4 route.  `source_symmetric` is the proof
+/// from the artifact's actual routed payload headers
+/// ([`crate::artifact::routed_headers_symmetric`]), not metadata;
+/// `ple_key_value_bf16` states that the PLE key/value projections are BF16.
+/// Cheap arch/flag checks come first so a caller may skip its header scan
+/// when this would be `Full` regardless.  [`Qwen4GpuForward::new`] still
+/// confirms the symmetric proof on the loaded payloads and refuses a
+/// `FnSymGfx1201` forward the GPU check does not fully confirm.
+pub fn qwen4_forward_scratch_mode(
+    gpu: &Gpu,
+    config: &Qwen4Config,
+    source_symmetric: bool,
+    ple_key_value_bf16: bool,
+) -> Qwen4ForwardScratchMode {
+    static KNOB: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hipfire_config::developer_bool(QWEN4_COMPACT_SCRATCH_ENV, false));
+    CompactScratchTerms {
+        knob: *KNOB,
+        exact_gfx1201: CompactScratchTerms::is_exact_gfx1201(&gpu.arch),
+        grouped_gemm: gpu.flags.moe_grouped_gemm,
+        sym_iu4_requested: gpu.qwen4_moe_sym_iu4_requested(),
+        source_symmetric,
+        ple_key_value_bf16,
+        flash_next_profile: matches!(config.profile, crate::config::Qwen4Profile::FlashNext),
+    }
+    .mode()
+}
+
 /// Device bytes of the forward resources that scale with the chunk: the
 /// reusable scratch for `rows` rows plus the speculative logits and argmax.
 /// Load admission and the auto expert placement reserve size against this.
-pub fn qwen4_forward_device_bytes(config: &Qwen4Config, rows: usize) -> Option<u64> {
-    let scratch = Qwen4GpuForwardScratch::device_bytes(config, rows).ok()?;
+pub fn qwen4_forward_device_bytes(
+    config: &Qwen4Config,
+    rows: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> Option<u64> {
+    let scratch = Qwen4GpuForwardScratch::device_bytes(config, rows, mode).ok()?;
     let spec = qwen4_spec_logit_rows(rows)
         .checked_mul(config.vocab_size.checked_mul(4)?.checked_add(4)?)?;
     scratch.checked_add(spec as u64)
@@ -1616,10 +1718,152 @@ pub(crate) fn seal_moe_decode<'a>(
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}")))
 }
 
+/// Every device field of [`Qwen4GpuForwardScratch`], in allocation order.
+/// The order is the plan's index: `plan` refuses to push a slot out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScratchField {
+    TokenIds,
+    EmbeddingRot,
+    Embeddings,
+    Streams,
+    HcNormalized,
+    HcLow,
+    HcUp,
+    HcMixed,
+    HcGates,
+    Rotation,
+    Projection,
+    Projection2,
+    GdnA,
+    GdnB,
+    GdnGate,
+    GdnBeta,
+    GdnRecurrentOutput,
+    GdnBf16,
+    GdnZ,
+    GdnOutput,
+    QsaIndex,
+    QsaQgate,
+    QsaK,
+    QsaV,
+    QsaOutput,
+    QsaSelected,
+    AttentionOutput,
+    PleStaged,
+    PleRows,
+    PleKey,
+    PleValue,
+    PleQuery,
+    PleGated,
+    PleNormed,
+    PleOutput,
+    RouterLogits,
+    MoeXRot,
+    MoeGateUp,
+    MoeGate,
+    MoeUp,
+    MoeHidden,
+    FfnOutput,
+    MoeSharedOutput,
+    MoeGateBatch,
+    MoeUpBatch,
+    MoeRotBatch,
+    MoeTopkIndices,
+    MoeTopkWeights,
+    MoeDownExpanded,
+    MoeScalar,
+    MoeExpertTokenCounts,
+    MoeExpertOffsets,
+    MoeSortedSlotIndex,
+    MoeExpertTileIds,
+    MoeInversePerm,
+    MoeYGateUpGrouped,
+    MoeYDownGrouped,
+    Logits,
+}
+
+impl ScratchField {
+    pub(crate) const COUNT: usize = Self::Logits as usize + 1;
+}
+
+/// One field of a scratch plan.
+///
+/// `owner == None`: the field owns a device allocation of `elements` of
+/// `dtype`.  `owner == Some(o)`: the field is a borrowed, never-freed view of
+/// `o`'s allocation from offset zero with the same `dtype` and an honest
+/// `elements`; `o` itself always owns its allocation.
+///
+/// `pitch` is set for every member of an alias set (the owner included, except
+/// a pure-capacity owner such as the grouped-down buffer): the row pitch in
+/// elements that a lane segment base uses.  All members of one alias set share
+/// the owner's pitch, so segments of different members that are live at once
+/// occupy disjoint, identically addressed row ranges (see
+/// [`Qwen4GpuForwardScratch::segment_view`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScratchSlot {
+    pub elements: usize,
+    pub dtype: DType,
+    pub owner: Option<ScratchField>,
+    pub pitch: Option<usize>,
+}
+
+impl ScratchSlot {
+    fn bytes(&self) -> Result<usize, Qwen4GpuForwardError> {
+        self.elements
+            .checked_mul(self.dtype.size())
+            .ok_or_else(|| invalid("scratch field byte size overflows"))
+    }
+}
+
+fn scratch_mul(a: usize, b: usize) -> Result<usize, Qwen4GpuForwardError> {
+    a.checked_mul(b)
+        .ok_or_else(|| invalid("scratch size arithmetic overflows"))
+}
+
+/// `(offset, len)` in elements of lane segment `[begin, begin + rows)` of an
+/// alias-set member whose owner row pitch is `pitch` (`logical_width <=
+/// pitch` elements per row are live) inside an owner view of `owner_numel`
+/// elements.  The base is `begin * pitch`, never `begin * logical_width`, so
+/// two members of one set that are live for the same segment address the
+/// same rows and segments of different sizes cannot overlap.  The returned
+/// length is the segment's whole reservation, `rows * pitch`.
+pub(crate) fn owner_pitch_extent(
+    pitch: usize,
+    owner_numel: usize,
+    begin: usize,
+    rows: usize,
+    logical_width: usize,
+) -> Result<(usize, usize), Qwen4GpuForwardError> {
+    if logical_width > pitch {
+        return Err(invalid(format!(
+            "lane segment row width {logical_width} exceeds its owner row pitch {pitch}"
+        )));
+    }
+    let offset = scratch_mul(begin, pitch)?;
+    let len = scratch_mul(rows, pitch)?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| invalid("lane segment reservation overflows"))?;
+    if end > owner_numel {
+        return Err(invalid(format!(
+            "lane segment rows {begin}..{} at owner pitch {pitch} exceed the {owner_numel}-element owner",
+            begin.saturating_add(rows)
+        )));
+    }
+    Ok((offset, len))
+}
+
 /// Device buffers shared by one forward object.  All allocations happen in
 /// `new`; token/chunk execution only creates borrowed subviews.
+///
+/// In [`Qwen4ForwardScratchMode::FnSymGfx1201`] eight fields are borrowed
+/// views of another field's allocation (see [`Self::plan`]); only owners are
+/// allocated, charged by [`Self::device_bytes`] and freed.
 pub struct Qwen4GpuForwardScratch {
     pub max_chunk: usize,
+    pub mode: Qwen4ForwardScratchMode,
+    /// The plan this scratch was built from, in [`ScratchField`] order.
+    pub(crate) slots: Vec<ScratchSlot>,
     pub token_ids: GpuTensor,
     pub embedding_rot: GpuTensor,
     pub embeddings: GpuTensor,
@@ -1686,12 +1930,34 @@ pub struct Qwen4GpuForwardScratch {
 }
 
 impl Qwen4GpuForwardScratch {
-    /// Every device allocation of a `max_chunk`-row scratch as
-    /// `(elements, dtype)` in field order, plus the host PLE staging bytes.
+    /// Every field of a `max_chunk`-row scratch in [`ScratchField`] order
+    /// (allocation or borrowed view, with its dtype and element count), plus
+    /// the host PLE staging bytes.
+    ///
+    /// `Full` is one dedicated allocation per field.  `FnSymGfx1201` applies,
+    /// on top of the same field list, with `n = max_chunk`, `c = min(n,
+    /// QWEN4_COMPACT_FALLBACK_ROWS)` and `G(r)` the tile-padded grouped rows of
+    /// `r` rows:
+    /// - gate/up/rot batches: `c * top_k * moe_intermediate` F32;
+    /// - expanded down: `max(c*top_k*hidden*4, n*hidden*4, n*top_k*8)` bytes
+    ///   (the shared-down F32 fallback and combine-order bytes are reserved
+    ///   regardless of dtype or flags);
+    /// - grouped gate/up: `max(G(c)*2*moe*4, G(n)*moe*2)` bytes and grouped
+    ///   down `max(G(c)*hidden*4, G(n)*hidden*2)` bytes, kept as F32-typed
+    ///   facades of `bytes / 4` elements (the IU4 kernels read the pointers as
+    ///   BF16 storage);
+    /// - phase aliases: `hc_normalized`, `ple_query` -> `projection`;
+    ///   `hc_up`, `ple_key` -> `projection2`; `ple_gated` -> `rotation`;
+    ///   `ple_output` -> `moe_y_down_grouped`; `ple_value` ->
+    ///   `moe_shared_output`; `gdn_recurrent_output` -> `qsa_qgate`.
+    ///   `ple_normed` stays dedicated: partial verify rollback reads it after
+    ///   the forward.
     fn plan(
         config: &Qwen4Config,
         max_chunk: usize,
-    ) -> Result<(Vec<(usize, DType)>, usize), Qwen4GpuForwardError> {
+        mode: Qwen4ForwardScratchMode,
+    ) -> Result<(Vec<ScratchSlot>, usize), Qwen4GpuForwardError> {
+        use ScratchField as F;
         if max_chunk == 0 {
             return Err(invalid("max_chunk is zero"));
         }
@@ -1745,209 +2011,476 @@ impl Qwen4GpuForwardScratch {
         let tile_i32_bytes = (grouped_bound / 16)
             .checked_mul(i32_bytes)
             .ok_or_else(|| invalid("MoE grouped tile scratch overflow"))?;
-        let mut plan = Vec::new();
-        let mut alloc = |shape: &[usize], dtype: DType| -> Result<(), Qwen4GpuForwardError> {
+        let rows = |width: usize| scratch_mul(max_chunk, width);
+        let routed_width = scratch_mul(config.num_experts_per_tok, config.moe_intermediate_size)?;
+        let mut slots: Vec<ScratchSlot> = Vec::with_capacity(ScratchField::COUNT);
+        let mut alloc = |field: ScratchField,
+                         elements: usize,
+                         dtype: DType|
+         -> Result<(), Qwen4GpuForwardError> {
+            if slots.len() != field as usize {
+                return Err(invalid(format!(
+                    "scratch plan field {field:?} is out of order"
+                )));
+            }
             // Every planned buffer holds at least one element: MoE-only
             // extents are zero for a dense FFN.
-            plan.push((shape.iter().product::<usize>().max(1), dtype));
+            slots.push(ScratchSlot {
+                elements: elements.max(1),
+                dtype,
+                owner: None,
+                pitch: None,
+            });
             Ok(())
         };
         let result = (|| {
-            alloc(&[max_chunk * std::mem::size_of::<i32>()], DType::Raw)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * wide], DType::F32)?;
-            alloc(&[max_chunk * wide], DType::F32)?;
-            alloc(&[max_chunk * config.hc_lowrank], DType::F32)?;
-            alloc(&[max_chunk * wide], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * config.hc_count], DType::F32)?;
-            alloc(&[max_chunk * max_rotation], DType::F32)?;
-            alloc(&[max_chunk * max_projection], DType::F32)?;
-            alloc(&[max_chunk * max_projection], DType::F32)?;
-            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
-            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
-            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
-            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
-            alloc(&[max_chunk * gdn_value], DType::F32)?;
-            alloc(&[gdn_value.max(hidden).max(config.hc_lowrank)], DType::BF16)?;
-            alloc(&[max_chunk * gdn_value], DType::F32)?;
-            alloc(&[max_chunk * gdn_value], DType::F32)?;
-            alloc(&[max_chunk * qsa_index], DType::F32)?;
-            alloc(&[max_chunk * qsa_qgate], DType::F32)?;
+            alloc(F::TokenIds, rows(std::mem::size_of::<i32>())?, DType::Raw)?;
+            alloc(F::EmbeddingRot, rows(hidden)?, DType::F32)?;
+            alloc(F::Embeddings, rows(hidden)?, DType::F32)?;
+            alloc(F::Streams, rows(wide)?, DType::F32)?;
+            alloc(F::HcNormalized, rows(wide)?, DType::F32)?;
+            alloc(F::HcLow, rows(config.hc_lowrank)?, DType::F32)?;
+            alloc(F::HcUp, rows(wide)?, DType::F32)?;
+            alloc(F::HcMixed, rows(hidden)?, DType::F32)?;
+            alloc(F::HcGates, rows(config.hc_count)?, DType::F32)?;
+            alloc(F::Rotation, rows(max_rotation)?, DType::F32)?;
+            alloc(F::Projection, rows(max_projection)?, DType::F32)?;
+            alloc(F::Projection2, rows(max_projection)?, DType::F32)?;
+            alloc(F::GdnA, rows(config.linear_num_value_heads)?, DType::F32)?;
+            alloc(F::GdnB, rows(config.linear_num_value_heads)?, DType::F32)?;
+            alloc(F::GdnGate, rows(config.linear_num_value_heads)?, DType::F32)?;
+            alloc(F::GdnBeta, rows(config.linear_num_value_heads)?, DType::F32)?;
+            alloc(F::GdnRecurrentOutput, rows(gdn_value)?, DType::F32)?;
+            alloc(F::GdnBf16, gdn_value.max(hidden).max(config.hc_lowrank), DType::BF16)?;
+            alloc(F::GdnZ, rows(gdn_value)?, DType::F32)?;
+            alloc(F::GdnOutput, rows(gdn_value)?, DType::F32)?;
+            alloc(F::QsaIndex, rows(qsa_index)?, DType::F32)?;
+            alloc(F::QsaQgate, rows(qsa_qgate)?, DType::F32)?;
             alloc(
-                &[max_chunk * config.num_key_value_heads * config.head_dim],
+                F::QsaK,
+                rows(scratch_mul(config.num_key_value_heads, config.head_dim)?)?,
                 DType::F32,
             )?;
             alloc(
-                &[max_chunk * config.num_key_value_heads * config.head_dim],
+                F::QsaV,
+                rows(scratch_mul(config.num_key_value_heads, config.head_dim)?)?,
                 DType::F32,
             )?;
-            alloc(&[max_chunk * q_width], DType::F32)?;
-            alloc(&[qsa_selected_bytes], DType::Raw)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * ple_embed_dim], DType::BF16)?;
-            alloc(&[max_chunk * ple_embed_dim.max(hidden)], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
+            alloc(F::QsaOutput, rows(q_width)?, DType::F32)?;
+            alloc(F::QsaSelected, qsa_selected_bytes, DType::Raw)?;
+            alloc(F::AttentionOutput, rows(hidden)?, DType::F32)?;
+            alloc(F::PleStaged, rows(ple_embed_dim)?, DType::BF16)?;
+            alloc(F::PleRows, rows(ple_embed_dim.max(hidden))?, DType::F32)?;
+            alloc(F::PleKey, rows(ple_channels)?, DType::F32)?;
+            alloc(F::PleValue, rows(hidden)?, DType::F32)?;
+            alloc(F::PleQuery, rows(ple_channels)?, DType::F32)?;
+            alloc(F::PleGated, rows(ple_channels)?, DType::F32)?;
+            alloc(F::PleNormed, rows(ple_channels)?, DType::F32)?;
+            alloc(F::PleOutput, rows(ple_channels)?, DType::F32)?;
             // Viewed as `[rows, router_columns]` by every forward (one
             // placeholder column for a dense FFN).
-            alloc(&[max_chunk * router_columns(dims)], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * 2 * config.moe_intermediate_size], DType::F32)?;
+            alloc(F::RouterLogits, rows(router_columns(dims))?, DType::F32)?;
+            alloc(F::MoeXRot, rows(hidden)?, DType::F32)?;
             alloc(
-                &[max_chunk * config.shared_expert_intermediate_size],
+                F::MoeGateUp,
+                rows(2 * config.moe_intermediate_size)?,
                 DType::F32,
             )?;
             alloc(
-                &[max_chunk * config.shared_expert_intermediate_size],
+                F::MoeGate,
+                rows(config.shared_expert_intermediate_size)?,
                 DType::F32,
             )?;
             alloc(
-                &[max_chunk * config.shared_expert_intermediate_size],
+                F::MoeUp,
+                rows(config.shared_expert_intermediate_size)?,
                 DType::F32,
             )?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
+            alloc(
+                F::MoeHidden,
+                rows(config.shared_expert_intermediate_size)?,
+                DType::F32,
+            )?;
+            alloc(F::FfnOutput, rows(hidden)?, DType::F32)?;
+            alloc(F::MoeSharedOutput, rows(hidden)?, DType::F32)?;
             // Batched gate/up rows: routed slots * routed intermediate for a
             // MoE profile, rows * intermediate for a dense FFN (exactly one of
             // the two extents is nonzero); `Step::DenseFfn` borrows both.
-            alloc(&[ffn_batch_rows], DType::F32)?;
-            alloc(&[ffn_batch_rows], DType::F32)?;
+            alloc(F::MoeGateBatch, ffn_batch_rows, DType::F32)?;
+            alloc(F::MoeUpBatch, ffn_batch_rows, DType::F32)?;
+            alloc(F::MoeRotBatch, rows(routed_width)?, DType::F32)?;
+            alloc(F::MoeTopkIndices, route_i32_bytes, DType::Raw)?;
             alloc(
-                &[max_chunk * config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32,
-            )?;
-            alloc(&[route_i32_bytes], DType::Raw)?;
-            alloc(&[max_chunk * config.num_experts_per_tok], DType::F32)?;
-            alloc(
-                &[max_chunk * config.num_experts_per_tok * hidden],
+                F::MoeTopkWeights,
+                rows(config.num_experts_per_tok)?,
                 DType::F32,
             )?;
             alloc(
-                &[max_chunk * config.shared_expert_intermediate_size],
+                F::MoeDownExpanded,
+                rows(scratch_mul(config.num_experts_per_tok, hidden)?)?,
                 DType::F32,
             )?;
-            alloc(&[expert_i32_bytes], DType::Raw)?;
-            alloc(&[expert_offsets_bytes], DType::Raw)?;
-            alloc(&[grouped_i32_bytes], DType::Raw)?;
-            alloc(&[tile_i32_bytes], DType::Raw)?;
-            alloc(&[route_i32_bytes], DType::Raw)?;
             alloc(
-                &[grouped_bound * 2 * config.moe_intermediate_size],
+                F::MoeScalar,
+                rows(config.shared_expert_intermediate_size)?,
                 DType::F32,
             )?;
-            alloc(&[grouped_bound * hidden], DType::F32)?;
-            alloc(&[config.vocab_size], DType::F32)?;
+            alloc(F::MoeExpertTokenCounts, expert_i32_bytes, DType::Raw)?;
+            alloc(F::MoeExpertOffsets, expert_offsets_bytes, DType::Raw)?;
+            alloc(F::MoeSortedSlotIndex, grouped_i32_bytes, DType::Raw)?;
+            alloc(F::MoeExpertTileIds, tile_i32_bytes, DType::Raw)?;
+            alloc(F::MoeInversePerm, route_i32_bytes, DType::Raw)?;
+            alloc(
+                F::MoeYGateUpGrouped,
+                scratch_mul(grouped_bound, 2 * config.moe_intermediate_size)?,
+                DType::F32,
+            )?;
+            alloc(
+                F::MoeYDownGrouped,
+                scratch_mul(grouped_bound, hidden)?,
+                DType::F32,
+            )?;
+            alloc(F::Logits, config.vocab_size, DType::F32)?;
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         result?;
-        Ok((plan, max_ple_bytes))
+        if slots.len() != ScratchField::COUNT {
+            return Err(invalid("scratch plan does not cover every field"));
+        }
+        if mode == Qwen4ForwardScratchMode::FnSymGfx1201 {
+            if ple_channels != wide {
+                return Err(invalid(
+                    "compact scratch requires PLE channels equal to the hyper-connection width",
+                ));
+            }
+            let f32_bytes = std::mem::size_of::<f32>();
+            let bf16_bytes = DType::BF16.size();
+            let top_k = config.num_experts_per_tok;
+            let moe = config.moe_intermediate_size;
+            let fallback_rows = max_chunk.min(QWEN4_COMPACT_FALLBACK_ROWS);
+            let fallback_grouped = crate::program::grouped_m_total_bound(
+                scratch_mul(fallback_rows, top_k)?,
+                config.num_experts,
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+            // Elements of an F32-typed facade over `bytes` of storage.
+            let facade = |bytes: usize| bytes.div_ceil(f32_bytes);
+            let fallback_batch = scratch_mul(fallback_rows, routed_width)?;
+            for field in [F::MoeGateBatch, F::MoeUpBatch, F::MoeRotBatch] {
+                slots[field as usize].elements = fallback_batch;
+            }
+            let hidden_f32_bytes = scratch_mul(hidden, f32_bytes)?;
+            let expanded_bytes = scratch_mul(scratch_mul(fallback_rows, top_k)?, hidden_f32_bytes)?
+                .max(scratch_mul(max_chunk, hidden_f32_bytes)?)
+                .max(scratch_mul(scratch_mul(max_chunk, top_k)?, 8)?);
+            slots[F::MoeDownExpanded as usize].elements = facade(expanded_bytes);
+            let gate_up_f32 =
+                scratch_mul(fallback_grouped, scratch_mul(2 * moe, f32_bytes)?)?;
+            let gate_up_bf16 = scratch_mul(grouped_bound, scratch_mul(moe, bf16_bytes)?)?;
+            slots[F::MoeYGateUpGrouped as usize].elements = facade(gate_up_f32.max(gate_up_bf16));
+            let down_f32 = scratch_mul(fallback_grouped, hidden_f32_bytes)?;
+            let down_bf16 = scratch_mul(grouped_bound, scratch_mul(hidden, bf16_bytes)?)?;
+            slots[F::MoeYDownGrouped as usize].elements = facade(down_f32.max(down_bf16));
+
+            // `owner_pitch`: row pitch of the owner's lane segments (`None`
+            // for a pure-capacity owner); `view_pitch`: the views' pitch.
+            let mut bind = |owner: F,
+                            owner_pitch: Option<usize>,
+                            view_pitch: usize,
+                            views: &[F]|
+             -> Result<(), Qwen4GpuForwardError> {
+                let owner_slot = slots[owner as usize];
+                if owner_slot.owner.is_some() {
+                    return Err(invalid(format!(
+                        "scratch alias owner {owner:?} is itself a view"
+                    )));
+                }
+                if let Some(pitch) = owner_pitch {
+                    if owner_slot.elements < scratch_mul(max_chunk, pitch)? {
+                        return Err(invalid(format!(
+                            "scratch alias owner {owner:?} is smaller than {max_chunk} rows of pitch {pitch}"
+                        )));
+                    }
+                    slots[owner as usize].pitch = Some(pitch);
+                }
+                for &view in views {
+                    let slot = slots[view as usize];
+                    if slot.owner.is_some() || slot.dtype != owner_slot.dtype {
+                        return Err(invalid(format!(
+                            "scratch field {view:?} cannot alias {owner:?}"
+                        )));
+                    }
+                    if slot.elements > owner_slot.elements {
+                        return Err(invalid(format!(
+                            "scratch field {view:?} ({} elements) exceeds its owner {owner:?} ({} elements)",
+                            slot.elements, owner_slot.elements
+                        )));
+                    }
+                    if slot.elements > scratch_mul(max_chunk, view_pitch)? {
+                        return Err(invalid(format!(
+                            "scratch field {view:?} is wider than its owner pitch {view_pitch}"
+                        )));
+                    }
+                    slots[view as usize].owner = Some(owner);
+                    slots[view as usize].pitch = Some(view_pitch);
+                }
+                Ok(())
+            };
+            bind(
+                F::Projection,
+                Some(max_projection),
+                max_projection,
+                &[F::HcNormalized, F::PleQuery],
+            )?;
+            bind(
+                F::Projection2,
+                Some(max_projection),
+                max_projection,
+                &[F::HcUp, F::PleKey],
+            )?;
+            bind(F::Rotation, Some(max_rotation), max_rotation, &[F::PleGated])?;
+            bind(F::MoeYDownGrouped, None, ple_channels, &[F::PleOutput])?;
+            bind(F::MoeSharedOutput, Some(hidden), hidden, &[F::PleValue])?;
+            bind(
+                F::QsaQgate,
+                Some(qsa_qgate),
+                qsa_qgate,
+                &[F::GdnRecurrentOutput],
+            )?;
+        }
+        Ok((slots, max_ple_bytes))
     }
 
-    /// Device bytes [`Self::new`] allocates for `max_chunk` rows.
+    /// Device bytes [`Self::new`] allocates for `max_chunk` rows: the owning
+    /// slots only; borrowed views are not charged.
     pub(crate) fn device_bytes(
         config: &Qwen4Config,
         max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
     ) -> Result<u64, Qwen4GpuForwardError> {
-        let (plan, _) = Self::plan(config, max_chunk)?;
-        Ok(plan
+        let (slots, _) = Self::plan(config, max_chunk, mode)?;
+        slots
             .iter()
-            .map(|&(elements, dtype)| (elements * dtype.size()) as u64)
-            .sum())
+            .filter(|slot| slot.owner.is_none())
+            .try_fold(0u64, |total, slot| {
+                total
+                    .checked_add(slot.bytes()? as u64)
+                    .ok_or_else(|| invalid("scratch device bytes overflow"))
+            })
     }
 
     pub fn new(
         gpu: &mut Gpu,
         config: &Qwen4Config,
         max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
     ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
-        let (plan, max_ple_bytes) = Self::plan(config, max_chunk)?;
-        let mut allocated = Vec::with_capacity(plan.len());
-        for &(elements, dtype) in &plan {
-            match gpu.zeros(&[elements], dtype) {
-                Ok(tensor) => allocated.push(tensor),
+        let (slots, max_ple_bytes) = Self::plan(config, max_chunk, mode)?;
+        // Owners first; a view needs its owner's pointer.
+        let mut tensors: Vec<Option<GpuTensor>> = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            if slot.owner.is_some() {
+                tensors.push(None);
+                continue;
+            }
+            match gpu.zeros(&[slot.elements], slot.dtype) {
+                Ok(tensor) => tensors.push(Some(tensor)),
                 Err(error) => {
-                    for tensor in allocated {
+                    // Only owners are present: each is freed exactly once.
+                    for tensor in tensors.into_iter().flatten() {
                         let _ = gpu.free_tensor(tensor);
                     }
                     return Err(error.into());
                 }
             }
         }
-        let mut next = || allocated.remove(0);
+        for (index, slot) in slots.iter().enumerate() {
+            if let Some(owner) = slot.owner {
+                let view = tensors[owner as usize]
+                    .as_ref()
+                    .expect("plan validated that a view's owner owns its allocation")
+                    .sub_offset(0, slot.elements);
+                tensors[index] = Some(view);
+            }
+        }
+        let mut take = |field: ScratchField| {
+            tensors[field as usize]
+                .take()
+                .expect("every scratch field is bound exactly once")
+        };
+        use ScratchField as F;
+        let scratch = Self {
+            max_chunk,
+            mode,
+            token_ids: take(F::TokenIds),
+            embedding_rot: take(F::EmbeddingRot),
+            embeddings: take(F::Embeddings),
+            streams: take(F::Streams),
+            hc_normalized: take(F::HcNormalized),
+            hc_low: take(F::HcLow),
+            hc_up: take(F::HcUp),
+            hc_mixed: take(F::HcMixed),
+            hc_gates: take(F::HcGates),
+            rotation: take(F::Rotation),
+            projection: take(F::Projection),
+            projection2: take(F::Projection2),
+            gdn_a: take(F::GdnA),
+            gdn_b: take(F::GdnB),
+            gdn_gate: take(F::GdnGate),
+            gdn_beta: take(F::GdnBeta),
+            gdn_recurrent_output: take(F::GdnRecurrentOutput),
+            gdn_bf16: take(F::GdnBf16),
+            gdn_z: take(F::GdnZ),
+            gdn_output: take(F::GdnOutput),
+            qsa_index: take(F::QsaIndex),
+            qsa_qgate: take(F::QsaQgate),
+            qsa_k: take(F::QsaK),
+            qsa_v: take(F::QsaV),
+            qsa_output: take(F::QsaOutput),
+            qsa_selected: take(F::QsaSelected),
+            attention_output: take(F::AttentionOutput),
+            ple_staged: take(F::PleStaged),
+            ple_rows: take(F::PleRows),
+            ple_key: take(F::PleKey),
+            ple_value: take(F::PleValue),
+            ple_query: take(F::PleQuery),
+            ple_gated: take(F::PleGated),
+            ple_normed: take(F::PleNormed),
+            ple_output: take(F::PleOutput),
+            router_logits: take(F::RouterLogits),
+            moe_x_rot: take(F::MoeXRot),
+            moe_gate_up: take(F::MoeGateUp),
+            moe_gate: take(F::MoeGate),
+            moe_up: take(F::MoeUp),
+            moe_hidden: take(F::MoeHidden),
+            ffn_output: take(F::FfnOutput),
+            moe_shared_output: take(F::MoeSharedOutput),
+            moe_gate_batch: take(F::MoeGateBatch),
+            moe_up_batch: take(F::MoeUpBatch),
+            moe_rot_batch: take(F::MoeRotBatch),
+            moe_topk_indices: take(F::MoeTopkIndices),
+            moe_topk_weights: take(F::MoeTopkWeights),
+            moe_down_expanded: take(F::MoeDownExpanded),
+            moe_scalar: take(F::MoeScalar),
+            moe_expert_token_counts: take(F::MoeExpertTokenCounts),
+            moe_expert_offsets: take(F::MoeExpertOffsets),
+            moe_sorted_slot_index: take(F::MoeSortedSlotIndex),
+            moe_expert_tile_ids: take(F::MoeExpertTileIds),
+            moe_inverse_perm: take(F::MoeInversePerm),
+            moe_y_gate_up_grouped: take(F::MoeYGateUpGrouped),
+            moe_y_down_grouped: take(F::MoeYDownGrouped),
+            logits: take(F::Logits),
+            slots,
+        };
         Ok((
-            Self {
-                max_chunk,
-                token_ids: next(),
-                embedding_rot: next(),
-                embeddings: next(),
-                streams: next(),
-                hc_normalized: next(),
-                hc_low: next(),
-                hc_up: next(),
-                hc_mixed: next(),
-                hc_gates: next(),
-                rotation: next(),
-                projection: next(),
-                projection2: next(),
-                gdn_a: next(),
-                gdn_b: next(),
-                gdn_gate: next(),
-                gdn_beta: next(),
-                gdn_recurrent_output: next(),
-                gdn_bf16: next(),
-                gdn_z: next(),
-                gdn_output: next(),
-                qsa_index: next(),
-                qsa_qgate: next(),
-                qsa_k: next(),
-                qsa_v: next(),
-                qsa_output: next(),
-                qsa_selected: next(),
-                attention_output: next(),
-                ple_staged: next(),
-                ple_rows: next(),
-                ple_key: next(),
-                ple_value: next(),
-                ple_query: next(),
-                ple_gated: next(),
-                ple_normed: next(),
-                ple_output: next(),
-                router_logits: next(),
-                moe_x_rot: next(),
-                moe_gate_up: next(),
-                moe_gate: next(),
-                moe_up: next(),
-                moe_hidden: next(),
-                ffn_output: next(),
-                moe_shared_output: next(),
-                moe_gate_batch: next(),
-                moe_up_batch: next(),
-                moe_rot_batch: next(),
-                moe_topk_indices: next(),
-                moe_topk_weights: next(),
-                moe_down_expanded: next(),
-                moe_scalar: next(),
-                moe_expert_token_counts: next(),
-                moe_expert_offsets: next(),
-                moe_sorted_slot_index: next(),
-                moe_expert_tile_ids: next(),
-                moe_inverse_perm: next(),
-                moe_y_gate_up_grouped: next(),
-                moe_y_down_grouped: next(),
-                logits: next(),
-            },
+            scratch,
             vec![0; max_chunk * std::mem::size_of::<i32>()],
             vec![0; max_ple_bytes],
         ))
     }
 
+    /// The tensor of `field`: an owner's allocation or a borrowed view.
+    pub(crate) fn field_tensor(&self, field: ScratchField) -> &GpuTensor {
+        use ScratchField as F;
+        match field {
+            F::TokenIds => &self.token_ids,
+            F::EmbeddingRot => &self.embedding_rot,
+            F::Embeddings => &self.embeddings,
+            F::Streams => &self.streams,
+            F::HcNormalized => &self.hc_normalized,
+            F::HcLow => &self.hc_low,
+            F::HcUp => &self.hc_up,
+            F::HcMixed => &self.hc_mixed,
+            F::HcGates => &self.hc_gates,
+            F::Rotation => &self.rotation,
+            F::Projection => &self.projection,
+            F::Projection2 => &self.projection2,
+            F::GdnA => &self.gdn_a,
+            F::GdnB => &self.gdn_b,
+            F::GdnGate => &self.gdn_gate,
+            F::GdnBeta => &self.gdn_beta,
+            F::GdnRecurrentOutput => &self.gdn_recurrent_output,
+            F::GdnBf16 => &self.gdn_bf16,
+            F::GdnZ => &self.gdn_z,
+            F::GdnOutput => &self.gdn_output,
+            F::QsaIndex => &self.qsa_index,
+            F::QsaQgate => &self.qsa_qgate,
+            F::QsaK => &self.qsa_k,
+            F::QsaV => &self.qsa_v,
+            F::QsaOutput => &self.qsa_output,
+            F::QsaSelected => &self.qsa_selected,
+            F::AttentionOutput => &self.attention_output,
+            F::PleStaged => &self.ple_staged,
+            F::PleRows => &self.ple_rows,
+            F::PleKey => &self.ple_key,
+            F::PleValue => &self.ple_value,
+            F::PleQuery => &self.ple_query,
+            F::PleGated => &self.ple_gated,
+            F::PleNormed => &self.ple_normed,
+            F::PleOutput => &self.ple_output,
+            F::RouterLogits => &self.router_logits,
+            F::MoeXRot => &self.moe_x_rot,
+            F::MoeGateUp => &self.moe_gate_up,
+            F::MoeGate => &self.moe_gate,
+            F::MoeUp => &self.moe_up,
+            F::MoeHidden => &self.moe_hidden,
+            F::FfnOutput => &self.ffn_output,
+            F::MoeSharedOutput => &self.moe_shared_output,
+            F::MoeGateBatch => &self.moe_gate_batch,
+            F::MoeUpBatch => &self.moe_up_batch,
+            F::MoeRotBatch => &self.moe_rot_batch,
+            F::MoeTopkIndices => &self.moe_topk_indices,
+            F::MoeTopkWeights => &self.moe_topk_weights,
+            F::MoeDownExpanded => &self.moe_down_expanded,
+            F::MoeScalar => &self.moe_scalar,
+            F::MoeExpertTokenCounts => &self.moe_expert_token_counts,
+            F::MoeExpertOffsets => &self.moe_expert_offsets,
+            F::MoeSortedSlotIndex => &self.moe_sorted_slot_index,
+            F::MoeExpertTileIds => &self.moe_expert_tile_ids,
+            F::MoeInversePerm => &self.moe_inverse_perm,
+            F::MoeYGateUpGrouped => &self.moe_y_gate_up_grouped,
+            F::MoeYDownGrouped => &self.moe_y_down_grouped,
+            F::Logits => &self.logits,
+        }
+    }
+
+    /// Rows `[begin, begin + rows)` of `field` for one lane segment, each
+    /// row `logical_width` live elements wide.
+    ///
+    /// A dedicated field (no pitch) is addressed contiguously at its logical
+    /// width from row `begin` to its end.  An alias-set member is addressed at
+    /// its allocation owner's row pitch ([`owner_pitch_extent`]) and the view
+    /// is the segment's whole `rows * pitch` reservation, so every member of a
+    /// set maps one segment to the same rows of one owner.  The returned view
+    /// is an ordinary contiguous tensor: kernels get no strided ABI.
+    pub(crate) fn segment_view(
+        &self,
+        field: ScratchField,
+        begin: usize,
+        rows: usize,
+        logical_width: usize,
+    ) -> Result<GpuTensor, Qwen4GpuForwardError> {
+        let tensor = self.field_tensor(field);
+        let numel = tensor.numel();
+        match self.slots[field as usize].pitch {
+            None => {
+                let offset = scratch_mul(begin, logical_width)?;
+                if offset > numel {
+                    return Err(invalid("lane row view starts past its scratch tensor"));
+                }
+                Ok(tensor.sub_offset(offset, numel - offset))
+            }
+            Some(pitch) => {
+                let (offset, len) = owner_pitch_extent(pitch, numel, begin, rows, logical_width)?;
+                Ok(tensor.sub_offset(offset, len))
+            }
+        }
+    }
+
+    /// Free the owners.  Borrowed views are never freed: their allocation is
+    /// freed once, through its owner.
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let slots = self.slots;
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -2008,8 +2541,12 @@ impl Qwen4GpuForwardScratch {
             self.moe_y_down_grouped,
             self.logits,
         ];
+        debug_assert_eq!(tensors.len(), slots.len());
         let mut first = None;
-        for tensor in tensors {
+        for (tensor, slot) in tensors.into_iter().zip(slots) {
+            if slot.owner.is_some() {
+                continue;
+            }
             if let Err(error) = gpu.free_tensor(tensor) {
                 if first.is_none() {
                     first = Some(error);
@@ -2303,11 +2840,12 @@ impl Qwen4GpuForward {
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::admit_profile(&bundle.config)?;
         let flash_next = bundle.config.profile.is_flash_next();
         let (scratch, host_token_bytes, host_ple_bytes) =
-            Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk)?;
+            Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk, mode)?;
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
@@ -2326,6 +2864,30 @@ impl Qwen4GpuForward {
                     )?);
                 }
             }
+            let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
+            if compact {
+                // The compact plan was admitted before any weight was
+                // loaded; it is valid only for the exact route it sized.
+                if gpu.arch != "gfx1201"
+                    || !gpu.flags.moe_grouped_gemm
+                    || !gpu.qwen4_moe_sym_iu4_requested()
+                {
+                    return Err(invalid(
+                        "compact scratch requires gfx1201 with the grouped MoE GEMM and the \
+                         symmetric IU4 route requested",
+                    ));
+                }
+                for layer in &bundle.weights.layer_refs {
+                    if let Some(ple) = layer.ple.as_ref() {
+                        let ple = ple_desc(&bundle.weights, ple)?;
+                        if ple.key.dtype != DType::BF16 || ple.value.dtype != DType::BF16 {
+                            return Err(invalid(
+                                "compact scratch requires BF16 PLE key/value projections",
+                            ));
+                        }
+                    }
+                }
+            }
             // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`, default on for
             // gfx1151 and gfx1201, `=0` off): verify each layer's final
             // expert headers once, before any capture, and size the route's
@@ -2341,6 +2903,15 @@ impl Qwen4GpuForward {
                     "  qwen4 symmetric IU4 MoE: {verified}/{} layers verified symmetric",
                     moe.len()
                 );
+                // The compact scratch has no buffer for the F32 route of a
+                // layer that is not symmetric: never run it silently.
+                if compact && verified != moe.len() {
+                    return Err(invalid(format!(
+                        "compact scratch was selected from the artifact's source headers, but \
+                         the GPU check verified only {verified}/{} layers symmetric",
+                        moe.len()
+                    )));
+                }
                 if verified > 0 {
                     gpu.reserve_qwen4_moe_sym(
                         max_chunk,
@@ -4425,7 +4996,308 @@ mod capture_census_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::uploaded_ids_range;
+    use super::{
+        owner_pitch_extent, qwen4_forward_device_bytes, qwen4_spec_logit_rows, uploaded_ids_range,
+        CompactScratchTerms, Qwen4ForwardScratchMode as Mode, Qwen4GpuForwardScratch as Scratch,
+        ScratchField as F, ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS,
+    };
+    use crate::config::{compact_test_config, Qwen4Config};
+
+    fn fn_config() -> Qwen4Config {
+        compact_test_config()
+    }
+
+    fn scratch_bytes(rows: usize, mode: Mode) -> u64 {
+        Scratch::device_bytes(&fn_config(), rows, mode).expect("FN scratch bytes")
+    }
+
+    fn plan(rows: usize, mode: Mode) -> Vec<ScratchSlot> {
+        Scratch::plan(&fn_config(), rows, mode).expect("FN scratch plan").0
+    }
+
+    fn field_bytes(slots: &[ScratchSlot], field: F) -> u64 {
+        slots[field as usize].bytes().expect("field bytes") as u64
+    }
+
+    fn owned_bytes(slots: &[ScratchSlot]) -> u64 {
+        slots
+            .iter()
+            .filter(|slot| slot.owner.is_none())
+            .map(|slot| slot.bytes().expect("slot bytes") as u64)
+            .sum()
+    }
+
+    /// `G(r)`: tile-padded grouped rows of `r` rows, top-10 of 512 experts.
+    fn grouped_rows(rows: u64) -> u64 {
+        let slots = 10 * rows;
+        (slots + 15 * slots.min(512)).div_ceil(16) * 16
+    }
+
+    #[test]
+    fn fn_scratch_bytes_are_pinned() {
+        assert_eq!(scratch_bytes(4096, Mode::Full), 4_538_503_044);
+        assert_eq!(scratch_bytes(8192, Mode::Full), 8_957_998_980);
+        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 2_314_473_348);
+        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 4_511_905_668);
+        assert_eq!(
+            scratch_bytes(4096, Mode::Full) - scratch_bytes(4096, Mode::FnSymGfx1201),
+            2_224_029_696
+        );
+        assert_eq!(
+            scratch_bytes(8192, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
+            4_446_093_312
+        );
+        // The 8192-row compact scratch is smaller than today's 4096-row one.
+        assert!(scratch_bytes(8192, Mode::FnSymGfx1201) <= scratch_bytes(4096, Mode::Full));
+        assert_eq!(
+            scratch_bytes(4096, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
+            26_597_376
+        );
+        // The estimator adds the same 64-row speculative logits to either plan.
+        let config = fn_config();
+        let spec = |rows: usize| qwen4_spec_logit_rows(rows) as u64 * (248_320 * 4 + 4);
+        for (rows, mode) in [
+            (4096, Mode::Full),
+            (8192, Mode::Full),
+            (4096, Mode::FnSymGfx1201),
+            (8192, Mode::FnSymGfx1201),
+        ] {
+            assert_eq!(
+                qwen4_forward_device_bytes(&config, rows, mode),
+                Some(scratch_bytes(rows, mode) + spec(rows))
+            );
+        }
+        assert!(
+            qwen4_forward_device_bytes(&config, 8192, Mode::FnSymGfx1201)
+                <= qwen4_forward_device_bytes(&config, 4096, Mode::Full)
+        );
+    }
+
+    #[test]
+    fn compact_route_buffers_follow_the_frozen_capacities() {
+        // (rows, gate/up/rot batch, expanded down, grouped gate/up, grouped down)
+        for (rows, batch, expanded, gate_up, down) in [
+            (4096usize, 13_107_200u64, 52_428_800u64, 65_536_000u64, 249_036_800u64),
+            (8192, 13_107_200, 83_886_080, 114_688_000, 458_752_000),
+        ] {
+            let slots = plan(rows, Mode::FnSymGfx1201);
+            for field in [F::MoeGateBatch, F::MoeUpBatch, F::MoeRotBatch] {
+                assert_eq!(field_bytes(&slots, field), batch, "{field:?} at {rows}");
+            }
+            assert_eq!(field_bytes(&slots, F::MoeDownExpanded), expanded);
+            assert_eq!(field_bytes(&slots, F::MoeYGateUpGrouped), gate_up);
+            assert_eq!(field_bytes(&slots, F::MoeYDownGrouped), down);
+        }
+        // Today's plan at 8192: 200/200/200/800/437.5/875 MiB.
+        let full = plan(8192, Mode::Full);
+        for field in [F::MoeGateBatch, F::MoeUpBatch, F::MoeRotBatch] {
+            assert_eq!(field_bytes(&full, field), 209_715_200);
+        }
+        assert_eq!(field_bytes(&full, F::MoeDownExpanded), 838_860_800);
+        assert_eq!(field_bytes(&full, F::MoeYGateUpGrouped), 458_752_000);
+        assert_eq!(field_bytes(&full, F::MoeYDownGrouped), 917_504_000);
+    }
+
+    #[test]
+    fn compact_aliases_borrow_one_owner_each_and_ple_normed_stays_dedicated() {
+        let full = plan(8192, Mode::Full);
+        assert_eq!(full.len(), F::COUNT);
+        assert!(full.iter().all(|slot| slot.owner.is_none() && slot.pitch.is_none()));
+        let compact = plan(8192, Mode::FnSymGfx1201);
+        let owner = |field: F| compact[field as usize].owner;
+        assert_eq!(owner(F::HcNormalized), Some(F::Projection));
+        assert_eq!(owner(F::PleQuery), Some(F::Projection));
+        assert_eq!(owner(F::HcUp), Some(F::Projection2));
+        assert_eq!(owner(F::PleKey), Some(F::Projection2));
+        assert_eq!(owner(F::PleGated), Some(F::Rotation));
+        assert_eq!(owner(F::PleOutput), Some(F::MoeYDownGrouped));
+        assert_eq!(owner(F::PleValue), Some(F::MoeSharedOutput));
+        assert_eq!(owner(F::GdnRecurrentOutput), Some(F::QsaQgate));
+        assert_eq!(owner(F::PleNormed), None);
+        assert_eq!(compact.iter().filter(|slot| slot.owner.is_some()).count(), 8);
+        // Only owners are charged; no view's owner is itself a view and every
+        // view fits inside its owner.
+        assert_eq!(owned_bytes(&compact), scratch_bytes(8192, Mode::FnSymGfx1201));
+        assert_eq!(owned_bytes(&full), scratch_bytes(8192, Mode::Full));
+        for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
+            let owner = compact[slot.owner.unwrap() as usize];
+            assert!(owner.owner.is_none());
+            assert_eq!(owner.dtype, slot.dtype);
+            assert!(slot.elements <= owner.elements);
+        }
+        // Alias-set members share the owner's row pitch.
+        let pitch = |field: F| compact[field as usize].pitch;
+        for field in [F::Projection, F::HcNormalized, F::PleQuery] {
+            assert_eq!(pitch(field), Some(12_288), "{field:?}");
+        }
+        for field in [F::Projection2, F::HcUp, F::PleKey] {
+            assert_eq!(pitch(field), Some(12_288), "{field:?}");
+        }
+        for field in [F::QsaQgate, F::GdnRecurrentOutput] {
+            assert_eq!(pitch(field), Some(12_288), "{field:?}");
+        }
+        for field in [F::Rotation, F::PleGated, F::PleOutput] {
+            assert_eq!(pitch(field), Some(10_240), "{field:?}");
+        }
+        for field in [F::MoeSharedOutput, F::PleValue] {
+            assert_eq!(pitch(field), Some(2_560), "{field:?}");
+        }
+        assert_eq!(pitch(F::MoeYDownGrouped), None);
+        assert_eq!(pitch(F::PleNormed), None);
+    }
+
+    #[test]
+    fn compact_layout_holds_at_the_boundary_rows() {
+        for rows in [1usize, 8, 9, 64, 511, 512, 513, 4096, 8192] {
+            let full = plan(rows, Mode::Full);
+            let compact = plan(rows, Mode::FnSymGfx1201);
+            assert_eq!(owned_bytes(&full), scratch_bytes(rows, Mode::Full), "rows {rows}");
+            assert_eq!(
+                owned_bytes(&compact),
+                scratch_bytes(rows, Mode::FnSymGfx1201),
+                "rows {rows}"
+            );
+            assert!(owned_bytes(&compact) < owned_bytes(&full), "rows {rows}");
+
+            let n = rows as u64;
+            let c = rows.min(QWEN4_COMPACT_FALLBACK_ROWS) as u64;
+            for field in [F::MoeGateBatch, F::MoeUpBatch, F::MoeRotBatch] {
+                assert_eq!(field_bytes(&compact, field), c * 10 * 640 * 4);
+            }
+            assert_eq!(
+                field_bytes(&compact, F::MoeDownExpanded),
+                (c * 10 * 2560 * 4).max(n * 2560 * 4).max(n * 80)
+            );
+            assert_eq!(
+                field_bytes(&compact, F::MoeYGateUpGrouped),
+                (grouped_rows(c) * 1280 * 4).max(grouped_rows(n) * 640 * 2)
+            );
+            let down = field_bytes(&compact, F::MoeYDownGrouped);
+            assert_eq!(
+                down,
+                (grouped_rows(c) * 2560 * 4).max(grouped_rows(n) * 2560 * 2)
+            );
+            // The borrowed PLE output must fit inside the grouped-down owner.
+            assert!(down >= n * 10_240 * 4, "rows {rows}");
+            if rows <= QWEN4_COMPACT_FALLBACK_ROWS {
+                for field in [
+                    F::MoeGateBatch,
+                    F::MoeUpBatch,
+                    F::MoeRotBatch,
+                    F::MoeDownExpanded,
+                    F::MoeYGateUpGrouped,
+                    F::MoeYDownGrouped,
+                ] {
+                    assert_eq!(
+                        field_bytes(&compact, field),
+                        field_bytes(&full, field),
+                        "{field:?} at {rows} rows is the full F32 size"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_plan_refuses_zero_rows_and_overflow() {
+        let config = fn_config();
+        for mode in [Mode::Full, Mode::FnSymGfx1201] {
+            assert!(Scratch::device_bytes(&config, 0, mode).is_err());
+            assert!(Scratch::device_bytes(&config, usize::MAX, mode).is_err());
+            assert!(Scratch::device_bytes(&config, usize::MAX / 2, mode).is_err());
+            assert_eq!(qwen4_forward_device_bytes(&config, 0, mode), None);
+            assert_eq!(qwen4_forward_device_bytes(&config, usize::MAX, mode), None);
+        }
+    }
+
+    #[test]
+    fn compact_mode_needs_every_term() {
+        let all = CompactScratchTerms {
+            knob: true,
+            exact_gfx1201: true,
+            grouped_gemm: true,
+            sym_iu4_requested: true,
+            source_symmetric: true,
+            ple_key_value_bf16: true,
+            flash_next_profile: true,
+        };
+        assert_eq!(all.mode(), Mode::FnSymGfx1201);
+        let off = [
+            CompactScratchTerms { knob: false, ..all },
+            CompactScratchTerms { exact_gfx1201: false, ..all },
+            CompactScratchTerms { grouped_gemm: false, ..all },
+            CompactScratchTerms { sym_iu4_requested: false, ..all },
+            CompactScratchTerms { source_symmetric: false, ..all },
+            CompactScratchTerms { ple_key_value_bf16: false, ..all },
+            CompactScratchTerms { flash_next_profile: false, ..all },
+        ];
+        for terms in off {
+            assert_eq!(terms.mode(), Mode::Full, "{terms:?}");
+        }
+    }
+
+    #[test]
+    fn compact_mode_is_exact_gfx1201_only() {
+        assert!(CompactScratchTerms::is_exact_gfx1201("gfx1201"));
+        for arch in [
+            "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx940", "gfx941", "gfx942", "gfx12010", "gfx1201x", "gfx120", "",
+        ] {
+            assert!(!CompactScratchTerms::is_exact_gfx1201(arch), "{arch}");
+        }
+    }
+
+    #[test]
+    fn owner_pitch_segments_are_disjoint_and_bounded() {
+        let pitch = 12_288usize;
+        let numel = 8192 * pitch;
+        // Many small invocations (aggregate well past 512 rows) of unequal
+        // sizes, then one large segment, at nonzero row starts.
+        let mut segments = Vec::new();
+        let mut begin = 0usize;
+        for index in 0..700usize {
+            let rows = if index % 7 == 0 { 8 } else { 1 };
+            segments.push((begin, rows));
+            begin += rows;
+        }
+        segments.push((begin, 1500));
+        assert!(begin + 1500 > QWEN4_COMPACT_FALLBACK_ROWS);
+        for width in [12_288usize, 10_240, 6_144] {
+            let mut previous_end = 0usize;
+            for &(begin, rows) in &segments {
+                let (offset, len) = owner_pitch_extent(pitch, numel, begin, rows, width).unwrap();
+                assert_eq!(offset, begin * pitch);
+                assert_eq!(len, rows * pitch);
+                assert!(offset >= previous_end, "segment at row {begin} overlaps its predecessor");
+                previous_end = offset + len;
+            }
+            assert!(previous_end <= numel);
+        }
+        // Past the owner, wider than the pitch, or overflowing: refused.
+        assert!(owner_pitch_extent(pitch, numel, 8191, 2, 10_240).is_err());
+        assert!(owner_pitch_extent(pitch, numel, 0, 1, pitch + 1).is_err());
+        assert!(owner_pitch_extent(usize::MAX, usize::MAX, 2, 1, 1).is_err());
+        assert!(owner_pitch_extent(pitch, usize::MAX, usize::MAX, 1, 1).is_err());
+    }
+
+    #[test]
+    fn logical_width_bases_collide_where_owner_pitch_bases_do_not() {
+        // Two members of one alias set with different logical widths (a
+        // 12288-wide and a 10240-wide field) serving neighbouring segments
+        // A = rows 9..12 and B = row 12.
+        let (a_begin, a_rows, b_begin) = (9usize, 3usize, 12usize);
+        // Negative control: bases at each field's own logical width overlap.
+        let a_logical = (a_begin * 12_288, (a_begin + a_rows) * 12_288);
+        let b_logical_start = b_begin * 10_240;
+        assert!(a_logical.0 <= b_logical_start && b_logical_start < a_logical.1);
+        // Owner pitch: the same segments are disjoint.
+        let pitch = 12_288usize;
+        let numel = 64 * pitch;
+        let (a_offset, a_len) = owner_pitch_extent(pitch, numel, a_begin, a_rows, 12_288).unwrap();
+        let (b_offset, _) = owner_pitch_extent(pitch, numel, b_begin, 1, 10_240).unwrap();
+        assert!(a_offset + a_len <= b_offset);
+    }
 
     fn bytes(ids: &[u32]) -> Vec<u8> {
         ids.iter()
@@ -4535,7 +5407,8 @@ mod tests {
         let config = crate::config::compact_test_config();
         for rows in [1, 16, 1536] {
             assert_eq!(
-                super::Qwen4GpuForwardScratch::device_bytes(&config, rows).unwrap(),
+                super::Qwen4GpuForwardScratch::device_bytes(&config, rows, super::Qwen4ForwardScratchMode::Full)
+                    .unwrap(),
                 flash_next_plan_bytes(&config, rows),
                 "rows {rows}"
             );
@@ -4558,24 +5431,27 @@ mod tests {
     fn dense_scratch_is_profile_derived_and_never_empty() {
         let config = tiny_dense();
         let rows = 4;
-        let (plan, ple_bytes) = super::Qwen4GpuForwardScratch::plan(&config, rows).unwrap();
-        assert!(plan.iter().all(|&(elements, _)| elements >= 1));
+        let (plan, ple_bytes) =
+            super::Qwen4GpuForwardScratch::plan(&config, rows, super::Qwen4ForwardScratchMode::Full)
+                .unwrap();
+        assert!(plan.iter().all(|slot| slot.elements >= 1));
         let ple = config.ple.as_ref().unwrap();
         let embed = ple.head_count * ple.row_width;
         assert_eq!(ple_bytes, rows * embed * 2);
-        // Field order: gdn_bf16, ple_staged, ple_key, moe_gate_batch, moe_up_batch.
+        use super::ScratchField as F;
+        let slot = |field: F| (plan[field as usize].elements, plan[field as usize].dtype);
         let gdn_value = config.linear_num_value_heads * config.linear_value_head_dim;
         assert_eq!(
-            plan[17],
+            slot(F::GdnBf16),
             (
                 gdn_value.max(config.hidden_size).max(config.hc_lowrank),
                 rdna_compute::DType::BF16
             )
         );
-        assert_eq!(plan[27], (rows * embed, rdna_compute::DType::BF16));
-        assert_eq!(plan[29].0, rows * config.hidden_size * config.hc_count);
-        assert_eq!(plan[43].0, rows * 8);
-        assert_eq!(plan[44].0, rows * 8);
+        assert_eq!(slot(F::PleStaged), (rows * embed, rdna_compute::DType::BF16));
+        assert_eq!(slot(F::PleKey).0, rows * config.hidden_size * config.hc_count);
+        assert_eq!(slot(F::MoeGateBatch).0, rows * 8);
+        assert_eq!(slot(F::MoeUpBatch).0, rows * 8);
     }
 
     #[test]
@@ -4594,9 +5470,11 @@ mod tests {
         // plan holds no PLE staging bytes (every buffer still has an element).
         config.ple = None;
         super::Qwen4GpuForward::admit_profile(&config).expect("no PLE is admitted");
-        let (plan, ple_bytes) = super::Qwen4GpuForwardScratch::plan(&config, 4).unwrap();
+        let (plan, ple_bytes) =
+            super::Qwen4GpuForwardScratch::plan(&config, 4, super::Qwen4ForwardScratchMode::Full)
+                .unwrap();
         assert_eq!(ple_bytes, 0);
-        assert!(plan.iter().all(|&(elements, _)| elements >= 1));
+        assert!(plan.iter().all(|slot| slot.elements >= 1));
     }
 
     #[test]

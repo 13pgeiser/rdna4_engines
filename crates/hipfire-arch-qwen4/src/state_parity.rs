@@ -1503,6 +1503,11 @@ fn run_profile_inner(
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     let gpu_init_ns = profile_duration_ns(gpu_init_started);
     emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode =
+        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1568,7 +1573,7 @@ fn run_profile_inner(
     let attach_forward_started = Instant::now();
     let setup_result = (|| -> Result<(), String> {
         bundle
-            .attach_forward(&mut gpu, 1)
+            .attach_forward(&mut gpu, 1, scratch_mode)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
         Ok(())
     })();
@@ -1824,6 +1829,11 @@ pub fn run_state_parity(
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode =
+        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1855,7 +1865,7 @@ pub fn run_state_parity(
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let real = (|| {
         bundle
-            .attach_forward(&mut gpu, 2048)
+            .attach_forward(&mut gpu, 2048, scratch_mode)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
         bundle
             .attach_mtp(&mut gpu, 2048)
@@ -2169,6 +2179,11 @@ pub fn run_mtp_fill_digest(
         "qwen4",
         gpu.device_id,
     );
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode =
+        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -2201,7 +2216,7 @@ pub fn run_mtp_fill_digest(
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let run = (|| -> Result<Value, String> {
         bundle
-            .attach_forward(&mut gpu, max_seq)
+            .attach_forward(&mut gpu, max_seq, scratch_mode)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
         bundle
             .attach_mtp(&mut gpu, max_seq)
@@ -2654,6 +2669,12 @@ pub fn run_mtp_takeover_fill_oracle(
     let receipt = crate::admit_hfqm_artifact(&hfq)
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let mut gpu = Gpu::init().map_err(|error| format!("hardware oracle requires HIP GPU: {error}"))?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(
+        &gpu, &hfq, &receipt.config, &receipt.manifest,
+    )
+    .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -2694,7 +2715,7 @@ pub fn run_mtp_takeover_fill_oracle(
         n_max: 3,
     }));
     let run = (|| -> Result<Value, String> {
-        bundle.attach_forward(&mut gpu, max_seq).map_err(|error| error.to_string())?;
+        bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(|error| error.to_string())?;
         bundle.attach_mtp(&mut gpu, max_seq).map_err(|error| error.to_string())?;
         map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
         let dim = bundle.config.hc_count.checked_mul(bundle.config.hidden_size)

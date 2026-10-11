@@ -175,6 +175,15 @@ impl Model {
         if let Some(note) = &choice.note {
             eprintln!("qwen4_kld: ple rows: {note}");
         }
+        // The loader's forward scratch plan, decided from the actual payload
+        // while the mapping is readable.
+        let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+            &gpu,
+            &hfq,
+            &receipt.config,
+            &receipt.manifest,
+        )
+        .map_err(|e| e.to_string())?;
         if gpu.is_uma() {
             hfq.drop_mmap();
         }
@@ -238,7 +247,7 @@ impl Model {
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
         bundle
-            .attach_forward(&mut gpu, n_ctx)
+            .attach_forward(&mut gpu, n_ctx, scratch_mode)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
         if let (Some(prewarm), Some(plan)) = (ple_hot, hot_plan) {
             bundle

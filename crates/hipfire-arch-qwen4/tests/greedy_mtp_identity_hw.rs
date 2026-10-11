@@ -615,6 +615,15 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
     };
     let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(|e| e.to_string())?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -663,7 +672,7 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
     )
     .map_err(|e| e.to_string())?;
     bundle
-        .attach_forward(&mut gpu, MAX_SEQ)
+        .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
         .map_err(|e| e.to_string())?;
     let capture = native_mtp_row_capture(&gpu, &bundle.config);
     let head = hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")

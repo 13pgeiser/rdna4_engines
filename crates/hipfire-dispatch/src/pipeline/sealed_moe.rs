@@ -1999,6 +1999,22 @@ impl<'a> SealedMoeCall<'a> {
             }
         }
 
+        // The specialized QT44/QT53 route's scratch requirement depends on the
+        // arm this device and row count select; check it, with the bytes the
+        // tensors physically hold, before this invocation's first launch.
+        if let (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection)) =
+            (&self.params, &self.selection)
+        {
+            if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+                super::qt44_qt53_prefill::validate_scratch(
+                    gpu,
+                    params,
+                    selection.resolution.use_path2,
+                    selection.path2_m_total,
+                )?;
+            }
+        }
+
         if self.protocol == MoeProtocol::GroupedPrefill
             && self.router == MoeRouterInput::PrecomputedSoftmaxTopK
         {
@@ -3305,19 +3321,26 @@ fn validate_prefill(
         batch_hidden,
         "prefill rotated activation",
     )?;
-    let gate_capacity = total_slots
-        .checked_mul(params.mi)
-        .ok_or_else(|| invalid("prefill gate scratch capacity overflows"))?;
-    require_elements(params.gate_batch, gate_capacity, "prefill gate scratch")?;
-    require_elements(params.up_batch, gate_capacity, "prefill up scratch")?;
-    require_elements(params.rot_batch, gate_capacity, "prefill rotation scratch")?;
-    require_elements(
-        params.down_expanded,
-        total_slots
-            .checked_mul(params.down_m)
-            .ok_or_else(|| invalid("prefill expanded down capacity overflows"))?,
-        "prefill expanded down",
-    )?;
+    // The specialized QT44/QT53 route sizes these six buffers by the kernel
+    // arm it takes (BF16 grouped rows, shared-down fallback, fallback caps),
+    // which needs the executing GPU: `validate_for_gpu` checks them through
+    // `qt44_qt53_prefill::validate_scratch` before the first launch. Generic
+    // routes keep the full-width F32 requirement.
+    if params.route_policy.is_none() {
+        let gate_capacity = total_slots
+            .checked_mul(params.mi)
+            .ok_or_else(|| invalid("prefill gate scratch capacity overflows"))?;
+        require_elements(params.gate_batch, gate_capacity, "prefill gate scratch")?;
+        require_elements(params.up_batch, gate_capacity, "prefill up scratch")?;
+        require_elements(params.rot_batch, gate_capacity, "prefill rotation scratch")?;
+        require_elements(
+            params.down_expanded,
+            total_slots
+                .checked_mul(params.down_m)
+                .ok_or_else(|| invalid("prefill expanded down capacity overflows"))?,
+            "prefill expanded down",
+        )?;
+    }
     require_bytes(
         params.expert_token_counts,
         params
@@ -3358,26 +3381,28 @@ fn validate_prefill(
             .ok_or_else(|| invalid("prefill inverse permutation capacity overflows"))?,
         "prefill inverse permutation",
     )?;
-    require_elements(
-        params.y_gate_up_grouped,
-        params
-            .m_total_max
-            .checked_mul(
-                2usize
-                    .checked_mul(params.mi)
-                    .ok_or_else(|| invalid("prefill grouped gate/up capacity overflows"))?,
-            )
-            .ok_or_else(|| invalid("prefill grouped gate/up capacity overflows"))?,
-        "prefill grouped gate/up",
-    )?;
-    require_elements(
-        params.y_down_grouped,
-        params
-            .m_total_max
-            .checked_mul(params.down_m)
-            .ok_or_else(|| invalid("prefill grouped down capacity overflows"))?,
-        "prefill grouped down",
-    )?;
+    if params.route_policy.is_none() {
+        require_elements(
+            params.y_gate_up_grouped,
+            params
+                .m_total_max
+                .checked_mul(
+                    2usize
+                        .checked_mul(params.mi)
+                        .ok_or_else(|| invalid("prefill grouped gate/up capacity overflows"))?,
+                )
+                .ok_or_else(|| invalid("prefill grouped gate/up capacity overflows"))?,
+            "prefill grouped gate/up",
+        )?;
+        require_elements(
+            params.y_down_grouped,
+            params
+                .m_total_max
+                .checked_mul(params.down_m)
+                .ok_or_else(|| invalid("prefill grouped down capacity overflows"))?,
+            "prefill grouped down",
+        )?;
+    }
     if let Some(partial) = params.routed_out {
         require_elements(
             partial,

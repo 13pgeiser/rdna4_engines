@@ -761,6 +761,14 @@ fn main() -> Result<()> {
     let receipt = admit_hfqm_artifact(&hfq).map_err(err)?;
     let mut gpu = Gpu::init().map_err(err)?;
     eprintln!("gpu {} uma={} n_ctx={n_ctx}", gpu.arch, gpu.is_uma());
+    // The loader's forward scratch plan: decided from the actual routed-expert
+    // payload (while the mapping is readable) and charged to the auto
+    // placement and attached below alike.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu, &hfq, &receipt.config, &receipt.manifest,
+    )
+    .map_err(err)?;
+    eprintln!("forward scratch mode: {scratch_mode:?}");
     let use_ranges = gpu.is_uma();
     if use_ranges {
         hfq.drop_mmap();
@@ -801,7 +809,7 @@ fn main() -> Result<()> {
                     .then(|| rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(receipt.config.num_key_value_heads, context.tokens))
                     .flatten().map(|bytes| bytes as u64);
                 let reserve = residency::auto_vram_reserve(&receipt.config, &context,
-                    chunk, qsa_format, None, gather).map_err(err)?;
+                    chunk, scratch_mode, qsa_format, None, gather).map_err(err)?;
                 if (free as u64) < non_expert.saturating_add(reserve) {
                     return Err("not enough free VRAM for non-expert weights plus auto reserve".into());
                 }
@@ -851,7 +859,7 @@ fn main() -> Result<()> {
         backend,
     )
     .map_err(err)?;
-    bundle.attach_forward(&mut gpu, n_ctx).map_err(err)?;
+    bundle.attach_forward(&mut gpu, n_ctx, scratch_mode).map_err(err)?;
     // The tap reads every arena over its whole capacity, so map all of it
     // (VMM storage maps nothing at construction).
     bundle
