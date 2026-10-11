@@ -3624,3 +3624,19 @@ TEST(gemma4_dflash_taps_are_live_from_the_layer_that_writes_them) {
     }
     CHECK_EQ(taps, 3);
 }
+
+/* The sliding layers' attention reads q where the fused projection left it: no copy op between
+ * the qkv projection and the attention, and the attention's declared reads name the fused row. */
+TEST(gemma4_sliding_attention_reads_q_in_the_fused_row) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+    const int qkv = buf_named(b, "qkv_s");
+    REQUIRE(qkv > 0);
+    CHECK_EQ(buf_named(b, "q_s"), 0);
+    const RecOp* at = find_op(b, "attn_paged", 0);
+    REQUIRE(at != nullptr);
+    CHECK(std::find(at->reads.begin(), at->reads.end(), (rad_buf)qkv) != at->reads.end());
+    CHECK_EQ(count_op(b, "cast"), 0);   /* no drafter here, so no taps either */
+}

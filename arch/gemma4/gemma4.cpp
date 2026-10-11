@@ -211,7 +211,7 @@ struct Layer {
     int full = 0;
     /* attention */
     rad_weight w_anorm = 0, w_qkv = 0, w_q = 0, w_k = 0, w_qn = 0, w_kn = 0, w_o = 0, w_apost = 0;
-    rad_op op_anorm = 0, op_qkv = 0, op_qknr = 0, op_lift = 0;
+    rad_op op_anorm = 0, op_qkv = 0, op_qknr = 0;
     rad_op op_q = 0, op_k = 0, op_vnorm = 0, op_qn = 0, op_kn = 0, op_qrope = 0, op_krope = 0;
     rad_op op_store = 0, op_attn = 0, op_o = 0, op_ar_o = 0, op_apost = 0, op_add_a = 0;
     /* dense arm */
@@ -250,7 +250,7 @@ struct Model {
     double  escale = 1.0, softcap = 0.0;
 
     rad_buf b_x = 0, b_h = 0, b_o = 0;
-    rad_buf b_qkv = 0, b_qs = 0, b_atts = 0;               /* sliding */
+    rad_buf b_qkv = 0, b_atts = 0;                         /* sliding */
     rad_buf b_qf = 0, b_kf = 0, b_vf = 0, b_attf = 0;      /* full */
     rad_buf b_ff2 = 0, b_gu = 0, b_act = 0;                /* the arms' join; the dense arm */
     rad_buf b_rn = 0, b_logit = 0, b_ids = 0, b_ew = 0, b_es = 0, b_hx = 0;
@@ -834,7 +834,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_h    = decl_b(b, nm.f("h"),     RAD_BF16, {T, E});
     m.b_o    = decl_b(b, nm.f("o"),     RAD_BF16, {T, E});
     m.b_qkv  = decl_b(b, nm.f("qkv_s"), RAD_BF16, {T, qs + 2 * kvs});
-    m.b_qs   = decl_b(b, nm.f("q_s"),   RAD_BF16, {T, qs});
     m.b_atts = decl_b(b, nm.f("att_s"), RAD_BF16, {T, qs});
     m.b_qf   = decl_b(b, nm.f("q_f"),   RAD_BF16, {T, qf});
     m.b_kf   = decl_b(b, nm.f("k_f"),   RAD_BF16, {T, kvf});
@@ -1061,14 +1060,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                            RAD_F64("wadd", 0.0), RAD_INT("v_norm", 1)),
                                 RAD_WEIGHTS(y.w_qn, y.w_kn)),
                             {m.b_qkv}, {m.b_qkv});
-            /* libr4d's paged attention reads q as one dense [T, heads, head_dim] block, so q is
-             * lifted out of the fused row (rad_block_attn_fp8.h says why). */
-            y.op_lift = rw(b, RAD_OP(b, "cast",
-                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", k.q()),
-                                           RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
-                                RAD_NOWEIGHTS),
-                            {m.b_qkv}, {m.b_qs});
-            y.op_attn  = attn(k, m.b_qs, m.b_atts);
+            /* Q IS READ WHERE THE PROJECTION LEFT IT, a column slice of the fused [q|k|v] row:
+             * gemma4k's attention takes q at any row pitch, so there is no copy into a dense block
+             * -- a launch and a [T, q] round trip a sliding layer. libr4d's attention reads q only
+             * dense and refuses the slice by name (RAD_E_STRIDE), which is one more reason the
+             * order is `--kernels gemma4k,libr4d` for this model. */
+            y.op_attn  = attn(k, m.b_qkv, m.b_atts);
             y.op_store = kv_store(k, m.b_qkv, m.b_qkv);
             y.op_o     = gemm(T, E, k.q(), y.w_o, m.b_atts, m.b_o);
         } else {
@@ -1524,8 +1521,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
             RAD_ISSUE(c, y.op_qknr, brows(m.b_qkv, T), pos, RAD_W(y.w_qn), RAD_W(y.w_kn));
             RAD_ISSUE(c, y.op_store, bcol(m.b_qkv, qd, kvd, T), bcol(m.b_qkv, qd + kvd, kvd, T),
                       praw(slot, RAD_I32, T), kv_cache(k.kv, (int)li));
-            RAD_ISSUE(c, y.op_lift, bcol(m.b_qkv, 0, qd, T), brows(m.b_qs, T));
-            RAD_ISSUE_N(c, y.op_attn, batch->max_q_len, brows(m.b_qs, T), kv_cache(k.kv, (int)li),
+            RAD_ISSUE_N(c, y.op_attn, batch->max_q_len, bcol(m.b_qkv, 0, qd, T), kv_cache(k.kv, (int)li),
                         bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_atts, T));
             RAD_ISSUE(c, y.op_o, brows(m.b_atts, T), RAD_W(y.w_o), brows(m.b_o, T));
         } else {
