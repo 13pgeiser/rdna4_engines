@@ -49,7 +49,7 @@ use crate::dflash_spec::{
 };
 use crate::qwen35::prefill::multi::{
     cb_dn_save_free_enabled, dflash_iu4_verify_admitted, forward_prefill_batch_multi, lane_gdn_batch_ready,
-    multi_chunk_pack_cap, multi_chunk_scratch_rows, pack_whole_lanes, MultiChunkRequest,
+    lane_gdn_varrows_enabled, multi_chunk_pack_cap, multi_chunk_scratch_rows, pack_whole_lanes, MultiChunkRequest,
     MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
 use crate::qwen35::prefill::{fp8_verify_open, verify_dense_math, DenseBatchMath};
@@ -698,7 +698,7 @@ pub fn dflash_cb_verify(
             // `target_snap` owns A, the pre-window state. Verify then reads A
             // (the request's `dn_state_src`) and writes only the live bank:
             // the conv ring is copied A -> B (pure bytes) and the in-place conv
-            // kernel runs on B, and `gated_delta_net_q8_fast_ml_from` is the
+            // kernel runs on B, and `gated_delta_net_q8_fast_lanes_varrows_from` is the
             // in-place recurrence with only the first-use LOAD addresses
             // changed, so every byte the live bank ends with is the byte the
             // in-place verify of a SAVEd lane leaves. The existing commit then
@@ -817,9 +817,10 @@ pub fn dflash_cb_verify(
 ///   `HIPFIRE_CB_TAPE_COPY_BATCH`, `1..=CONV_LANES_MAX` lanes, exact gfx1201
 ///   head geometry, no capture / recording / G0 observation) and its chunk
 ///   half (Sequential, ChainVerify, tape per lane — all structural here —
-///   and EQUAL row count `b` on every lane, each within its tape);
-/// * `2 <= b <= 16` (the D8 replay's step bound, so every accept class can
-///   replay from the snapshot);
+///   and either EQUAL row counts or, unless `HIPFIRE_CB_LANE_GDN_VARROWS=0`,
+///   a per-lane count, each lane within its own tape);
+/// * per lane `2 <= b_i <= 16` (the D8 replay's step bound, checked against
+///   the lane's own count, so every accept class can replay from the snapshot);
 /// * no enabled retained Redline controller and no existing replay graph
 ///   (`replay_graph_count() == 0`: a graph's fast launch bypasses the
 ///   table re-fingerprinting an owner exchange relies on);
@@ -847,14 +848,14 @@ pub(crate) fn cb_dn_save_free_admitted(
     let Some(first) = lanes.first() else {
         return false;
     };
-    let b = first.draft.verify_tokens.len();
+    let b0 = first.draft.verify_tokens.len();
+    let varrows = lane_gdn_varrows_enabled();
     if !cb_dn_save_free_enabled()
         || !gpu.arch_caps.is_gfx1201()
         || !trunk.gdn_from_ready()
         || !lane_gdn_batch_ready(gpu, config, lanes.len())
         || gpu.replay.is_enabled()
         || gpu.graphs.replay_graph_count() != 0
-        || !(2..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&b)
     {
         return false;
     }
@@ -863,10 +864,12 @@ pub(crate) fn cb_dn_save_free_admitted(
         let df = &lane.state.df;
         let state: &DeltaNetState = &*lane.dn_state;
         let kv: &KvCache = &*lane.kv_cache;
-        if lane.draft.verify_tokens.len() != b
-            || b > df.gdn_tape.max_n
+        let b_i = lane.draft.verify_tokens.len();
+        if !(2..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&b_i)
+            || !(varrows || b_i == b0)
+            || b_i > df.gdn_tape.max_n
             || !df.gdn_tape.snapshot_source_armed()
-            || !df.gdn_tape.replay_from_snapshot_admits(gpu, state, &df.target_snap, b)
+            || !df.gdn_tape.replay_from_snapshot_admits(gpu, state, &df.target_snap, b_i)
             || !df.target_snap.cb_verify_owned_exact(state, config)
             || !(kv.quant_q8 || kv.quant_fp8)
             || kv.compact_offset != 0
