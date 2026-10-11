@@ -36,7 +36,6 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
 use hipfire_engine::emit::*;
 use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
@@ -88,7 +87,6 @@ mod slots;
 mod vision_ladder;
 mod weight_host_tenant;
 use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
-
 #[cfg(test)]
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -103,9 +101,7 @@ use hipfire_runtime::spec::{
 /// Must stay aligned with `lm_head_batched` + `prepare_decode_batch_inputs`
 /// in hipfire-arch-qwen35 — unsupported lm_head or F32 embedding must never
 /// advertise `continuous_batch_capable` or enter the batch route.
-
 pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
-
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Display) {
     emit_uncorrelated_error(stdout, None, &message.to_string(), "internal", false, false);
@@ -119,7 +115,6 @@ struct BatchTerminalCleanup {
     attempt_id: u64,
     admission: Option<BatchGeneration>,
 }
-
 impl Drop for BatchTerminalCleanup {
     fn drop(&mut self) {
         if let Some(admission) = self.admission {
@@ -165,7 +160,6 @@ fn parse_wire_attempt_id(value: Option<&serde_json::Value>) -> Option<u64> {
     }
     None
 }
-
 /// Require a present, nonzero numeric attempt_id on the wire.
 ///
 /// Zero is reserved for uncorrelated control-plane envelopes. It must never
@@ -180,7 +174,6 @@ fn require_wire_attempt_id(value: Option<&serde_json::Value>) -> Result<u64, &'s
         },
     }
 }
-
 /// Announce a generate key only after the command has a valid nonzero attempt.
 ///
 /// `None` means the request is malformed or uses reserved attempt zero and
@@ -202,7 +195,6 @@ fn announce_generate_terminal(
 
 // ── serve-fault-inject (test-only; compiled out of production) ─────────
 // Per-request fault arming lives in hipfire_generate::common::RequestFaultGuard.
-
 #[cfg(feature = "serve-fault-inject")]
 fn write_test_state_snapshot(
     stdout: &mut impl std::io::Write,
@@ -623,7 +615,6 @@ impl ResidentKvDiag {
         Self::from_admission(request, KvBackend::Legacy, automatic_reason)
     }
 }
-
 
 /// Pure gate for the deferred EP (tp>1) load handoff.
 ///
@@ -1067,7 +1058,6 @@ fn main() {
     // unload and empty handoff; preserved when a replacement fails and the prior
     // resident remains loaded.
     let mut resident_kv: Option<ResidentKvDiag> = None;
-
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
