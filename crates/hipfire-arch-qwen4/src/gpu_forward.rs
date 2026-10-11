@@ -817,6 +817,7 @@ pub(crate) struct Qwen4ExpertView {
 struct ExpertViewSet<'a> {
     experts: &'a [Qwen4ExpertView],
     identity: u64,
+    host_mapped: bool,
 }
 
 impl RoutedExpertWeights for ExpertViewSet<'_> {
@@ -835,7 +836,7 @@ impl RoutedExpertWeights for ExpertViewSet<'_> {
     }
 
     fn host_mapped(&self) -> bool {
-        self.experts.first().is_some_and(|expert| expert.gate_up.host_mapped)
+        self.host_mapped
     }
 }
 
@@ -871,6 +872,10 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// [`MoeRouteCapability::Qt44Qt53GroupedSymmetric`]. False unless the
     /// opt-in route was requested.
     symmetric: bool,
+    /// Whether this rank's own (local) resident expert tensors of the layer
+    /// are host-mapped: a layer-level property, so an EP rank reports the
+    /// same residency single would, never that of a dummy or a peer view.
+    host_mapped: bool,
 }
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
@@ -889,7 +894,7 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     }
 
     fn host_mapped(&self) -> bool {
-        self.experts.first().is_some_and(|expert| expert.gate_up.host_mapped)
+        self.host_mapped
     }
 }
 
@@ -1484,13 +1489,13 @@ impl Qwen4MoeLayerRuntime {
                 expected_down_bytes
             )));
         }
-        if !matches!(layout, Qwen4ExpertTableLayout::Single) {
-            if gate_up_source.buf.is_host_mapped() || down_source.buf.is_host_mapped() {
-                return Err(invalid(format!(
-                    "layer {layer_label} EP expert tensors must be device resident"
-                )));
-            }
-        }
+        // EP: owned experts keep this rank's residency. A host-mapped compact
+        // tensor is device-visible exactly as in the single route, a non-owned
+        // expert names the device dummy (decode) or the owner's compact tensor
+        // (chunk). Peer pointers into pinned host memory rely on ROCm's UVA:
+        // pinned host allocations are device-visible from every GPU, so a
+        // peer's host-mapped compact tensor is read through the same address.
+        let local_host_mapped = gate_up_source.buf.is_host_mapped();
         if matches!(layout, Qwen4ExpertTableLayout::Ep { .. })
             && (gate_up_dtype != DType::MQ4G256V2 || down_dtype != DType::MQ4G128V2)
         {
@@ -1681,6 +1686,7 @@ impl Qwen4MoeLayerRuntime {
         let expert_views = ExpertViewSet {
             experts: &experts,
             identity,
+            host_mapped: local_host_mapped,
         };
         if let Err(error) = cache.bind_live(
             &table,
@@ -1712,6 +1718,7 @@ impl Qwen4MoeLayerRuntime {
             expert_gate_up_entries: gate_entries,
             expert_down_entries: down_entries,
             symmetric: false,
+            host_mapped: local_host_mapped,
         })
     }
 
