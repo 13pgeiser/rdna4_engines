@@ -1,0 +1,17 @@
+# Gemma 4 31B-it: int4 trunk (GPTQ from the bf16 checkpoint) with int8 activations, Google's
+# assistant head merged in as the MTP drafter (depth 3), and the vision tower. Sampling defaults are
+# the checkpoint's generation_config; thinking is switched per request (chat_template_kwargs).
+# For the full 262,144-token context use --max-model-len 262144 --max-num-seqs 2.
+name: radiance-gemma4-31b-w4a8
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-gemma4-31b-w4a8
+    environment:
+      # Two-card IPC through KFD instead of DMA-buf; set on every measured run.
+      HSA_ENABLE_IPC_MODE_LEGACY: "1"
+    command: >
+      --model /models/gemma4-31b-w4a8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --p2p on --max-num-seqs 8 --max-model-len 65536 --kv-cache-dtype fp8
+      --num-speculative-tokens 3 --temp 1.0 --top-p 0.95 --top-k 64
