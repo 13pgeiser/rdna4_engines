@@ -80,6 +80,16 @@
 //!   bus id): exporter allocation adds ~W; importing adds well under 0.25 W
 //!   (no second physical copy); W stays resident after the exporter and after
 //!   B exit; usage returns to the baseline after the last exit.
+//! * Attribution diagnostics (never gating, nothing is signalled): at every
+//!   accounting sample `DIAG` lines list per-PID VRAM on the target card from
+//!   KFD (`/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>`) and from
+//!   `/proc/<pid>/fdinfo` (`drm-memory-vram`, deduplicated by client id), split
+//!   into our recorded PIDs (`who=A|B|C|I`) and every other accessible process
+//!   (`who=OTHER`, with comm). After each reaped child `PROC_ABSENT` confirms
+//!   `/proc/<pid>` is gone. The final sample is taken immediately and once more
+//!   after one fixed 100 ms delay (`ATTRIBUTION` lines compare both against the
+//!   baseline and against the change in other processes' VRAM); the final gate
+//!   still uses the immediate sample only.
 //!
 //! # Process/IPC ABI
 //!
@@ -1535,6 +1545,8 @@ struct Orch {
     roles: Vec<Role>,
     steps: u32,
     tmp: Option<PathBuf>,
+    /// Other recorded child PIDs (the identity process) for attribution/absence checks.
+    extra: Vec<(&'static str, i32)>,
 }
 
 impl Orch {
@@ -1565,6 +1577,7 @@ impl Orch {
     fn expect_exit(&mut self, role: &str, to: Duration, want_code: Option<i32>, want_signal: Option<i32>) -> Result<String, String> {
         let r = self.role(role)?;
         let st = r.wait_exit(to)?;
+        proc_absent(r.name, r.pid, r.start_ticks)?;
         let ok = match (want_code, want_signal) {
             (Some(c), _) => st.code() == Some(c),
             (None, Some(s)) => st.signal() == Some(s),
@@ -1655,13 +1668,27 @@ struct Accounting {
     mode: AcctMode,
     path: Option<PathBuf>,
     baseline: Option<u64>,
+    bdf: String,
+    /// KFD gpu_id of the target card (for per-PID KFD VRAM), if resolvable.
+    gpu_id: Option<String>,
 }
 
 impl Accounting {
     fn new(mode: AcctMode, bdf: &str) -> Accounting {
         let path = PathBuf::from(format!("/sys/bus/pci/devices/{bdf}/mem_info_vram_used"));
         let path = (mode != AcctMode::Off && path.exists()).then_some(path);
-        Accounting { mode, path, baseline: None }
+        let gpu_id = if mode == AcctMode::Off {
+            None
+        } else {
+            match kfd_gpu_id(bdf) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    println!("NOTE per-PID KFD attribution unavailable: {e}");
+                    None
+                }
+            }
+        };
+        Accounting { mode, path, baseline: None, bdf: bdf.to_string(), gpu_id }
     }
 
     fn read(&self) -> Option<u64> {
@@ -1697,6 +1724,206 @@ impl Accounting {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-PID VRAM attribution (diagnostics only; never gates, never signals)
+// ---------------------------------------------------------------------------
+
+/// After a role has been reaped (`Child::wait`), its `/proc/<pid>` must be gone
+/// (or the PID reused by a process with a different start time).
+fn proc_absent(name: &str, pid: i32, start_ticks: u64) -> Result<(), String> {
+    match read_start_ticks(pid) {
+        None => {
+            println!("PROC_ABSENT {name} pid={pid}");
+            Ok(())
+        }
+        Some(t) if t != start_ticks => {
+            println!("PROC_ABSENT {name} pid={pid} (pid reused by a different process, start differs)");
+            Ok(())
+        }
+        Some(_) => Err(format!("{name}: /proc/{pid} still present with the recorded start time after wait")),
+    }
+}
+
+/// (domain, KFD location_id) for a `dddd:bb:dd.f` PCI address.
+fn bdf_location(bdf: &str) -> Option<(u64, u64)> {
+    let mut p = bdf.split(':');
+    let dom = u64::from_str_radix(p.next()?, 16).ok()?;
+    let bus = u64::from_str_radix(p.next()?, 16).ok()?;
+    let (dev, func) = p.next()?.split_once('.')?;
+    let dev = u64::from_str_radix(dev, 16).ok()?;
+    let func = u64::from_str_radix(func, 16).ok()?;
+    Some((dom, (bus << 8) | (dev << 3) | func))
+}
+
+/// KFD `gpu_id` of the node whose PCI domain/location match `bdf`.
+fn kfd_gpu_id(bdf: &str) -> Result<String, String> {
+    let (dom, loc) = bdf_location(bdf).ok_or_else(|| format!("bad PCI address {bdf}"))?;
+    let nodes = "/sys/class/kfd/kfd/topology/nodes";
+    let rd = std::fs::read_dir(nodes).map_err(|e| format!("read_dir {nodes}: {e}"))?;
+    for entry in rd.flatten() {
+        let Ok(props) = std::fs::read_to_string(entry.path().join("properties")) else { continue };
+        let mut kv: HashMap<&str, &str> = HashMap::new();
+        for line in props.lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(k), Some(v), None) = (it.next(), it.next(), it.next()) {
+                kv.insert(k, v);
+            }
+        }
+        if kv.get("location_id").copied() == Some(loc.to_string().as_str())
+            && kv.get("domain").copied() == Some(dom.to_string().as_str())
+        {
+            let id = std::fs::read_to_string(entry.path().join("gpu_id"))
+                .map_err(|e| format!("read gpu_id: {e}"))?;
+            return Ok(id.trim().to_string());
+        }
+    }
+    Err(format!("no KFD node for PCI {bdf} (domain {dom}, location_id {loc})"))
+}
+
+/// Per-PID KFD VRAM on the target GPU: `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (bytes).
+fn kfd_vram_by_pid(gpu_id: &str) -> Result<Vec<(i32, u64)>, String> {
+    let dir = "/sys/class/kfd/kfd/proc";
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {dir}: {e}"))?;
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        let v = std::fs::read_to_string(entry.path().join(format!("vram_{gpu_id}")))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        if let Some(v) = v {
+            out.push((pid, v));
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// Per-PID `drm-memory-vram` (bytes) from `/proc/<pid>/fdinfo/*` entries whose
+/// `drm-pdev` is the target BDF, deduplicated by `drm-client-id`. Also returns
+/// how many processes' fdinfo directories were not readable (EACCES).
+fn fdinfo_vram_by_pid(bdf: &str) -> (Vec<(i32, u64)>, usize) {
+    let mut out = Vec::new();
+    let mut denied = 0usize;
+    let Ok(rd) = std::fs::read_dir("/proc") else { return (out, denied) };
+    for entry in rd.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        let fdinfo = match std::fs::read_dir(entry.path().join("fdinfo")) {
+            Ok(d) => d,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    denied += 1;
+                }
+                continue;
+            }
+        };
+        let mut clients: HashMap<String, u64> = HashMap::new();
+        for f in fdinfo.flatten() {
+            let Ok(txt) = std::fs::read_to_string(f.path()) else { continue };
+            if !txt.contains("drm-pdev:") {
+                continue;
+            }
+            let (mut pdev, mut client, mut vram_kib) = (None, None, 0u64);
+            for line in txt.lines() {
+                let Some((k, v)) = line.split_once(':') else { continue };
+                let v = v.trim();
+                match k.trim() {
+                    "drm-pdev" => pdev = Some(v.to_lowercase()),
+                    "drm-client-id" => client = Some(v.to_string()),
+                    "drm-memory-vram" => {
+                        vram_kib = v.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0)
+                    }
+                    _ => {}
+                }
+            }
+            if pdev.as_deref() == Some(bdf) {
+                let key = client.unwrap_or_else(|| f.file_name().to_string_lossy().into_owned());
+                let e = clients.entry(key).or_insert(0);
+                *e = (*e).max(vram_kib);
+            }
+        }
+        if !clients.is_empty() {
+            out.push((pid, clients.values().sum::<u64>() * 1024));
+        }
+    }
+    out.sort_unstable();
+    (out, denied)
+}
+
+fn proc_comm(pid: i32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().replace(' ', "_"))
+        .unwrap_or_else(|_| "?".into())
+}
+
+/// Print per-PID VRAM for own recorded PIDs and for every other process with
+/// VRAM on the target BDF (accessible ones only; nothing is signalled).
+/// Returns the KFD (own_sum, others_sum) when the KFD source is available.
+fn diag(orch: &mut Orch, acct: &Accounting, label: &str) -> Option<(u64, u64)> {
+    if acct.mode == AcctMode::Off {
+        return None;
+    }
+    let mut known: Vec<(String, i32, bool)> = Vec::new();
+    for r in &mut orch.roles {
+        let alive = r.poll_exit().is_none();
+        known.push((r.name.to_string(), r.pid, alive));
+    }
+    for (n, p) in &orch.extra {
+        known.push(((*n).to_string(), *p, false));
+    }
+    let who = |pid: i32| known.iter().find(|(_, p, _)| *p == pid);
+    let mut kfd_result = None;
+    match acct.gpu_id.as_deref() {
+        Some(gid) => match kfd_vram_by_pid(gid) {
+            Ok(list) => {
+                let (mut own, mut others, mut n_others) = (0u64, 0u64, 0usize);
+                for &(pid, v) in &list {
+                    match who(pid) {
+                        Some((name, _, alive)) => {
+                            own += v;
+                            println!("DIAG {label} src=kfd gpu_id={gid} who={name} pid={pid} alive={alive} vram_bytes={v}");
+                        }
+                        None => {
+                            others += v;
+                            if v > 0 {
+                                n_others += 1;
+                                println!("DIAG {label} src=kfd gpu_id={gid} who=OTHER pid={pid} comm={} vram_bytes={v}", proc_comm(pid));
+                            }
+                        }
+                    }
+                }
+                let listed_exited: Vec<String> = known
+                    .iter()
+                    .filter(|(_, p, alive)| !*alive && list.iter().any(|(lp, _)| lp == p))
+                    .map(|(n, p, _)| format!("{n}:{p}"))
+                    .collect();
+                println!(
+                    "DIAG {label} src=kfd own_sum={own} others_sum={others} others_with_vram={n_others} own_exited_but_still_listed=[{}]",
+                    listed_exited.join(",")
+                );
+                kfd_result = Some((own, others));
+            }
+            Err(e) => println!("DIAG {label} src=kfd unavailable: {e}"),
+        },
+        None => println!("DIAG {label} src=kfd unavailable (no KFD node for {})", acct.bdf),
+    }
+    let (list, denied) = fdinfo_vram_by_pid(&acct.bdf);
+    let (mut own, mut others) = (0u64, 0u64);
+    for &(pid, v) in &list {
+        match who(pid) {
+            Some((name, _, alive)) => {
+                own += v;
+                println!("DIAG {label} src=fdinfo who={name} pid={pid} alive={alive} drm_memory_vram_bytes={v}");
+            }
+            None => {
+                others += v;
+                println!("DIAG {label} src=fdinfo who=OTHER pid={pid} comm={} drm_memory_vram_bytes={v}", proc_comm(pid));
+            }
+        }
+    }
+    println!("DIAG {label} src=fdinfo own_sum={own} others_sum={others} processes_not_readable={denied}");
+    kfd_result
+}
+
 fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let to = a.step_timeout;
@@ -1728,6 +1955,8 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     if !id_exit?.success() {
         return Err("identity process failed".into());
     }
+    proc_absent("I", ident.pid, ident.start_ticks)?;
+    orch.extra.push(("I", ident.pid));
     let arch = get(&id_evt, "arch")?.to_string();
     let bdf = get(&id_evt, "bdf")?.to_string();
     orch.pass(
@@ -1748,6 +1977,7 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     let mut acct = Accounting::new(a.acct, &bdf);
     acct.baseline = acct.read();
     let baseline = acct.sample("baseline");
+    let base_diag = diag(orch, &acct, "baseline");
     if a.acct == AcctMode::Gate && !acct.gating() {
         println!("NOTE accounting gates skipped: sysfs mem_info_vram_used for {bdf} unavailable");
     }
@@ -1777,6 +2007,7 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
         ),
     );
     let after_ready = acct.sample("exporter_ready");
+    diag(orch, &acct, "exporter_ready");
     if let (Some(b), Some(r)) = (baseline, after_ready) {
         acct.gate(
             "ACCT_EXPORT_ALLOC_PHYSICAL",
@@ -1794,6 +2025,7 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     orch.role("B")?.expect("warm", to)?;
     orch.role("C")?.expect("warm", to)?;
     let after_warm = acct.sample("importers_warm");
+    diag(orch, &acct, "importers_warm");
 
     // --- serve / import ------------------------------------------------------
     orch.role("A")?.send("SERVE")?;
@@ -1812,6 +2044,7 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
         ),
     );
     let after_import = acct.sample("importers_imported");
+    diag(orch, &acct, "importers_imported");
     if let (Some(w0), Some(i1)) = (after_warm, after_import) {
         let d = i1 as i64 - w0 as i64;
         acct.gate(
@@ -1868,6 +2101,7 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     };
     orch.pass("EXPORTER_EXIT", &format!("mode={} status={exit_desc}", a.exit_mode.as_str()));
     let after_a_exit = acct.sample("exporter_exited");
+    diag(orch, &acct, "exporter_exited");
     if let (Some(b), Some(x)) = (baseline, after_a_exit) {
         acct.gate(
             "ACCT_EXPORTER_EXIT_W_RETAINED",
@@ -1884,6 +2118,7 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     orch.cmd("B", "EXIT", "exiting", to)?;
     let bst = orch.expect_exit("B", to, Some(0), None)?;
     let after_b_exit = acct.sample("importer_B_exited");
+    diag(orch, &acct, "importer_B_exited");
     for cmd in ["VERIFY".to_string(), format!("REPLAY {}", a.replays), format!("FRESH_GRAPH {}", a.replays)] {
         let want = cmd.split_whitespace().next().unwrap_or("").to_lowercase();
         let want_evt = if want == "verify" { "verified" } else { want.as_str() };
@@ -1901,6 +2136,28 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     let cst = orch.expect_exit("C", to, Some(0), None)?;
     orch.pass("IMPORTER_C_EXIT", &format!("C {cst}"));
     let fin = acct.sample("final");
+    let fin_diag = diag(orch, &acct, "final");
+    // One fixed, bounded delay (not a retry loop) to tell asynchronous driver
+    // reclamation from a persistent difference; the gate below uses `fin` only.
+    std::thread::sleep(Duration::from_millis(100));
+    let fin_delayed = acct.sample("final_delayed_100ms");
+    let fin_delayed_diag = diag(orch, &acct, "final_delayed_100ms");
+    if let (Some(b), Some(f), Some(fd)) = (baseline, fin, fin_delayed) {
+        println!(
+            "ATTRIBUTION final_minus_baseline={} delayed_100ms_minus_baseline={} async_reclaim_observed={}",
+            f as i64 - b as i64,
+            fd as i64 - b as i64,
+            f != fd
+        );
+        if let (Some((_, o0)), Some((own1, o1)), Some((own2, o2))) = (base_diag, fin_diag, fin_delayed_diag) {
+            println!(
+                "ATTRIBUTION kfd: others_sum baseline={o0} final={o1} delayed={o2}; others_delta_final={} others_delta_delayed={}; own_sum_at_final={own1} own_sum_at_delayed={own2}; final_minus_baseline_minus_others_delta={} (nonzero own_sum => our PID still listed)",
+                o1 as i64 - o0 as i64,
+                o2 as i64 - o0 as i64,
+                (f as i64 - b as i64) - (o1 as i64 - o0 as i64)
+            );
+        }
+    }
     if let (Some(b), Some(f)) = (baseline, fin) {
         let diff = f as i64 - b as i64;
         acct.gate(
@@ -1943,7 +2200,7 @@ fn main() {
             }
         }
     }
-    let mut orch = Orch { roles: Vec::new(), steps: 0, tmp: None };
+    let mut orch = Orch { roles: Vec::new(), steps: 0, tmp: None, extra: Vec::new() };
     let result = run(&mut orch, &a);
     orch.cleanup();
     match result {
