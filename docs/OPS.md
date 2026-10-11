@@ -294,12 +294,13 @@ rounding.
   -log(max_timescale) / max(n/2 - 1, 1))`, each step in f32 as the reference's torch expressions
   are, then rounded.
 
-### The sandwich-norm joins — no reference row
+### gemma4k's fusions: the sandwich-norm joins and `expert_scale` — no reference row
 
 | op | params | operands |
 |---|---|---|
 | `norm_add_norm` | `M`(range) `n` `eps`:f64 `dtype` | `a`, `w_a`w, `x`:inout, `w_y`w → `y` |
 | `join_add_scale` | `M`(range) `n` `eps`:f64 `dtype` | `d`, `w_d`w, `r`, `w_r`w, `w_j`w, `x`:inout, `s`w, `w_n`w? → `y`? |
+| `expert_scale` | `M`(range) `n_expert` `top_k` `dtype` | `ids`, `w_e`w, `ew`:inout |
 
 Gemma's sandwich norms, each one kernel in place of a chain of `rmsnorm`, `add` and `mul_weight`.
 `norm_add_norm` is `t = rmsnorm(a) * w_a; x += t; y = rmsnorm(x) * w_y` -- a post-norm, the
@@ -312,11 +313,16 @@ the activation dtype at the same point, so the two differ from the chain only in
 of squares is added in: with the same order they are bit-identical to it, and against a chain
 summed in another block width a norm factor can differ in its last bit.
 
-**libref has no row for either, on purpose.** An architecture asks for a join and declares the
+`expert_scale` is `ew[t, k] = ew[t, k] * w_e[ids[t, k]]` over `[M, top_k]`, `w_e` an `[n_expert]`
+table and an id outside it reading 0: Gemma 4's per_expert_scale on the renormalised routing
+weights, in place of an `embed_lookup` of the table by the ids and a `mul` into the weights. One
+product rounded once, so the pair's value bit for bit.
+
+**libref has no row for any of them, on purpose.** An architecture asks for a join and declares the
 chain where it does not resolve (`rad_op_resolved`), and a reference row would resolve it
 everywhere -- so a model loaded without the library that serves the join would resolve it to the
 reference and be refused at serve, instead of running the chain on libr4d or libavx. The
-`gemma4k` kernel library declares both (device and host rows); with no oracle, its kernels are held
+`gemma4k` kernel library declares them (device and host rows); with no oracle, its kernels are held
 to the chain bit for bit by `tests/g4k_emu`, and no row declares `replaces`, because rad-kbench
 assembles a replaced chain from the fusing library's own rows and gemma4k has none of the chain's
 ops.

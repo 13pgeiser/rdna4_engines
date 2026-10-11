@@ -27,7 +27,7 @@ endif()
 rad_add_plugin(gemma4k kernels
   SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/g4k_rows.cpp
   HIP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/g4k_attn.hip ${CMAKE_CURRENT_SOURCE_DIR}/g4k_pick.hip
-              ${CMAKE_CURRENT_SOURCE_DIR}/g4k_norm.hip
+              ${CMAKE_CURRENT_SOURCE_DIR}/g4k_norm.hip ${CMAKE_CURRENT_SOURCE_DIR}/g4k_escale.hip
   GPU_TARGETS ${_g4k_targets})
 string(REPLACE ";" " " _g4k_desc "${_g4k_targets}")
 target_compile_definitions(gemma4k PRIVATE "G4K_BUILD_TARGET=\"${_g4k_desc}\"")

@@ -85,6 +85,17 @@ static const RadOperandSpec oJas[] = {
     { "w_n", RAD_OPD_WEIGHT, 1 },
     { "y",   RAD_OPD_OUT,    1 },
 };
+static const RadParamSpec pEscale[] = {
+    { "M",        RAD_P_INT, RAD_REQUIRED, 0 },
+    { "n_expert", RAD_P_INT, RAD_REQUIRED, 0 },
+    { "top_k",    RAD_P_INT, RAD_REQUIRED, 0 },
+    { "dtype",    RAD_P_STR, RAD_REQUIRED, 0 },
+};
+static const RadOperandSpec oEscale[] = {
+    { "ids", RAD_OPD_IN,     0 },
+    { "w_e", RAD_OPD_WEIGHT, 0 },
+    { "ew",  RAD_OPD_INOUT,  0 },
+};
 static const RadOpSchema kSchemas[] = {
     { "pair_argmax", ROW(pPick), ROW(oPick),
       "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in the first "
@@ -100,6 +111,10 @@ static const RadOpSchema kSchemas[] = {
       "element; and with w_n and y, y = rmsnorm(x) * w_n over the x written. Rounding where the "
       "unfused chain rounds. Two arms' post-norms, their sum, its norm, the residual add, a "
       "per-layer scalar and the next layer's input norm (Gemma 4's feed-forward join)." },
+    { "expert_scale", ROW(pEscale), ROW(oEscale),
+      "ew[t, k] = ew[t, k] * w_e[ids[t, k]] over [M, top_k], w_e an [n_expert] table, an id outside "
+      "it reading 0; one product rounded once, so the embed_lookup + mul pair's value bit for bit. "
+      "Gemma 4's per_expert_scale on the renormalised routing weights." },
 };
 
 /* ==================================================================== operand descriptions
@@ -325,6 +340,31 @@ int join_add_scale_host(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* The host arm of expert_scale, the device kernel's one product in plain C++. */
+int expert_scale_host(const RadArgs* a, RadStream) {
+    if (!a || a->n_t < 3) return RAD_E_INVAL;
+    const int64_t k = rad_args_geti_or(a, "top_k", 0), ne = rad_args_geti_or(a, "n_expert", 0);
+    if (k <= 0 || ne <= 0) return RAD_E_SHAPE;
+    const RadTensor *I = rad_arg_in(a, 0), *S = rad_arg_in(a, 1), *W = rad_arg_in(a, 2);
+    if (!I || !S || !W) return RAD_E_INVAL;
+    if (I->dtype != RAD_I32 || S->dtype != RAD_BF16 || W->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (rad_tensor_numel(S) < ne || rad_tensor_lastdim(I) != k || rad_tensor_lastdim(W) != k)
+        return RAD_E_SHAPE;
+    if (I->stride[I->rank - 1] != 1 || W->stride[W->rank - 1] != 1) return RAD_E_STRIDE;
+    const int64_t rows = rad_tensor_rows(W);
+    if (rad_tensor_rows(I) < rows) return RAD_E_SHAPE;
+    const int64_t li = rad_tensor_row_pitch(I), lw = rad_tensor_row_pitch(W);
+    const uint16_t* sc = (const uint16_t*)S->data;
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < k; ++c) {
+            const int32_t id = ((const int32_t*)I->data)[r * li + c];
+            const float s = (id >= 0 && id < ne) ? hb2f(sc[id]) : 0.0f;
+            uint16_t* w = (uint16_t*)W->data + r * lw + c;
+            *w = hf2b(hb2f(*w) * s);
+        }
+    return RAD_OK;
+}
+
 /* ==================================================================== constraints
  *
  * The attention rows serve their (head_dim, gqa) at ANY q_len -- one kernel does decode, verify and
@@ -356,6 +396,8 @@ G4K_ATTN_C(cH512x8B, 512, 8, "bf16", 0) G4K_ATTN_C(cH512x8F, 512, 8, "fp8_e4m3",
 static const RadConstraint cJoin[]    = { C_GE("n", 1), C_LE("n", 6144), C_IN("dtype", "bf16") };
 static const RadConstraint cJoinHost[] = { C_GE("n", 1), C_IN("dtype", "bf16") };
 static const RadConstraint cPick[]    = { C_GE("n", 1), C_IN("dtype", "f32 fp32") };
+static const RadConstraint cEscale[]  = { C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1),
+                                          C_IN("dtype", "bf16") };
 
 /* ==================================================================== the rows */
 #define G4K_ATTN_ROW(HD, G, KVN, C, KVDOC)                                                         \
@@ -408,6 +450,20 @@ static const RadKernelInfo kKernels[] = {
       "bf16 activations, f32 gains, bf16 scalar",
       RAD_DOMAIN_HOST, 10, ROW(cJoinHost), NOTUNE,
       nullptr, nullptr, join_add_scale_host, nullptr, nullptr, nullptr, nullptr,
+      nullptr, nullptr, nullptr },
+    /* NO opd_shape, as the joins: no libref row, so no oracle; g4k_emu holds both arms to the
+     * embed_lookup + mul pair. */
+    { "expert_scale_bf16", "expert_scale", "moe",
+      "routing weight times its expert's scale, in place: one thread an element",
+      "any M, top_k <= 64, row pitches honoured", "i32 ids, bf16 table and weights",
+      RAD_DOMAIN_DEVICE, 10, ROW(cEscale), NOTUNE,
+      nullptr, nullptr, g4k_expert_scale_bf16, nullptr, nullptr, nullptr, nullptr,
+      nullptr, nullptr, nullptr },
+    { "expert_scale_bf16_host", "expert_scale", "moe",
+      "routing weight times its expert's scale, in place", "any M, top_k <= 64",
+      "i32 ids, bf16 table and weights",
+      RAD_DOMAIN_HOST, 10, ROW(cEscale), NOTUNE,
+      nullptr, nullptr, expert_scale_host, nullptr, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr },
     { "pair_argmax_f32_host", "pair_argmax", "select",
       "the top-1 of a row of (id, value) pairs, ties to the lower id, negative ids skipped",

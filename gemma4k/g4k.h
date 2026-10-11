@@ -30,6 +30,10 @@ int g4k_pair_argmax_f32(const RadArgs* a, RadStream s);
  *   norm_add_norm   operands a, w_a, x (inout), w_y, y
  *   join_add_scale  operands d, w_d, r, w_r, w_j, x (inout), s */
 int g4k_norm_add_norm_bf16(const RadArgs* a, RadStream s);
+
+/* expert_scale: each routing weight times its expert's scale, in place (g4k_escale.hip):
+ *   operands ids, w_e, ew (inout) */
+int g4k_expert_scale_bf16(const RadArgs* a, RadStream s);
 int g4k_join_add_scale_bf16(const RadArgs* a, RadStream s);
 
 #ifdef __cplusplus

@@ -237,6 +237,8 @@ struct Layer {
      * (`router_gemm_topk_scatter`) up to `router_fused_rows`. A pass past their rows issues the
      * separate ops, which are declared either way. */
     rad_op  op_topk_scatter = 0, op_router_fused = 0;
+    /* gemma4k's expert_scale: op_escale and op_emul in one launch, where it resolves */
+    rad_op  op_expert_scale = 0;
     int64_t topk_scatter_rows = 0, router_fused_rows = 0;
     /* the join */
     rad_weight w_fpost = 0, w_scalar = 0;
@@ -999,7 +1001,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* THE SANDWICH JOINS: asked of the kernel libraries as one op each (gemma4k serves them) and
      * declared as the chain where nothing does -- or where RADIANCE_GEMMA4_FUSE=0 asks for the
-     * chain, the A/B switch. The fused kernels round where the chain rounds (gemma4k/g4k_norm.hip).
+     * chain, the A/B switch, which turns off gemma4k's `expert_scale` with them. The fused kernels round where the chain rounds (gemma4k/g4k_norm.hip).
      * libref has no row for the joins on purpose, so "nothing serves them" stays reachable. */
     const char* fuse_env = std::getenv("RADIANCE_GEMMA4_FUSE");
     const bool fuse_joins = !(fuse_env && fuse_env[0] == '0');
@@ -1231,14 +1233,24 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                              RAD_STR("dtype", "bf16")),
                                   RAD_NOWEIGHTS),
                               {m.b_logit}, {m.b_ids, m.b_ew});
-            /* per_expert_scale[expert], gathered as a [n_expert, 1] table by the ids, then the
-             * routing weight times it. */
-            y.op_escale = rw(b, RAD_OP(b, "embed_lookup",
-                                  RAD_PARAMS(RAD_RANGE("M", 1, P * K), RAD_INT("n_embd", 1),
-                                             RAD_INT("n_vocab", m.n_expert), RAD_STR("dtype", "bf16")),
-                                  RAD_WEIGHTS(y.w_escale)),
-                              {m.b_ids}, {m.b_es});
-            y.op_emul   = binop("mul", P, K, m.b_ew, m.b_es, m.b_ew);
+            /* per_expert_scale[expert] times the routing weight: one launch where gemma4k serves
+             * `expert_scale`, and otherwise the table gathered as [n_expert, 1] by the ids and a
+             * `mul` -- the same bf16 product either way (docs/OPS.md). */
+            if (fuse_joins)
+                y.op_expert_scale = rw(b, RAD_OP(b, "expert_scale",
+                                           RAD_PARAMS(RAD_RANGE("M", 1, P),
+                                                      RAD_INT("n_expert", m.n_expert),
+                                                      RAD_INT("top_k", K), RAD_STR("dtype", "bf16")),
+                                           RAD_WEIGHTS(y.w_escale)),
+                                       {m.b_ids, m.b_ew}, {m.b_ew});
+            if (!y.op_expert_scale) {
+                y.op_escale = rw(b, RAD_OP(b, "embed_lookup",
+                                      RAD_PARAMS(RAD_RANGE("M", 1, P * K), RAD_INT("n_embd", 1),
+                                                 RAD_INT("n_vocab", m.n_expert), RAD_STR("dtype", "bf16")),
+                                      RAD_WEIGHTS(y.w_escale)),
+                                  {m.b_ids}, {m.b_es});
+                y.op_emul   = binop("mul", P, K, m.b_ew, m.b_es, m.b_ew);
+            }
             /* THE EXPERTS' INPUT: pre_feedforward_layernorm_2 of the stream -- for an fp8 gate_up,
              * normed and quantised in one pass (`rmsnorm_quant_fp8`), with no bf16 copy, since the
              * fp8 GEMM reads only the codes and their scales. */
@@ -1505,10 +1517,15 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T) {
         /* The ids and the gathered scales read as flat [n * K] vectors: the same bytes. */
         int32_t* ids = (int32_t*)rad_buf_ptr(c, m.b_ids);
         uint16_t* es = (uint16_t*)rad_buf_ptr(c, m.b_es);
-        RAD_ISSUE_N(c, y.op_escale, n * K, praw(ids ? ids + r0 * K : nullptr, RAD_I32, n * K),
-                    RAD_W(y.w_escale), praw2(es ? es + r0 * K : nullptr, RAD_BF16, n * K, 1));
-        RAD_ISSUE_N(c, y.op_emul, n, brow_slice(m.b_ew, r0, n, K), brow_slice(m.b_es, r0, n, K),
-                    brow_slice(m.b_ew, r0, n, K));
+        if (y.op_expert_scale) {
+            RAD_ISSUE_N(c, y.op_expert_scale, n, brow_slice(m.b_ids, r0, n, K), RAD_W(y.w_escale),
+                        brow_slice(m.b_ew, r0, n, K));
+        } else {
+            RAD_ISSUE_N(c, y.op_escale, n * K, praw(ids ? ids + r0 * K : nullptr, RAD_I32, n * K),
+                        RAD_W(y.w_escale), praw2(es ? es + r0 * K : nullptr, RAD_BF16, n * K, 1));
+            RAD_ISSUE_N(c, y.op_emul, n, brow_slice(m.b_ew, r0, n, K), brow_slice(m.b_es, r0, n, K),
+                        brow_slice(m.b_ew, r0, n, K));
+        }
         /* rmsnorm_quant_fp8's operands: x, residual (absent), w, q, scale, out_bf16 (absent). */
         if (y.gu_fp8)
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_NONE, RAD_W(y.w_enorm),

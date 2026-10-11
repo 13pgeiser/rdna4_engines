@@ -12,14 +12,16 @@ ABI=$2; G=$3; B=$4; N=${5:-40}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$B"
 F="-std=c++20 -O2 -ffp-contract=off -Wno-psabi -I$HERE/emu -I$ABI -I$G"
-for u in attn pick norm; do $CXX $F -x c++ -c "$G/g4k_$u.hip" -o "$B/k_$u.o"; done
+for u in attn pick norm escale; do $CXX $F -x c++ -c "$G/g4k_$u.hip" -o "$B/k_$u.o"; done
 $CXX $F -c "$G/g4k_rows.cpp" -o "$B/rows.o"
 $CXX $F -c "$HERE/emu/emu.cpp" -o "$B/emu.o"
-for t in attn pick norm; do
+for t in attn pick norm escale; do
     $CXX $F -c "$HERE/test_$t.cpp" -o "$B/test_$t.o"
-    $CXX "$B/test_$t.o" "$B/k_attn.o" "$B/k_pick.o" "$B/k_norm.o" "$B/rows.o" "$B/emu.o" -o "$B/test_$t"
+    $CXX "$B/test_$t.o" "$B/k_attn.o" "$B/k_pick.o" "$B/k_norm.o" "$B/k_escale.o" "$B/rows.o" \
+        "$B/emu.o" -o "$B/test_$t"
 done
 "$B/test_attn"
 "$B/test_attn" sweep "$N"
 "$B/test_pick"
 "$B/test_norm"
+"$B/test_escale"

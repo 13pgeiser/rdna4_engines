@@ -3699,7 +3699,30 @@ TEST(gemma4_routes_a_decode_step_in_one_launch) {
         CHECK_EQ(count_issued(issued, "router_topk"), refuse == 2 ? 6 : 0);
         CHECK_EQ(count_issued(issued, "moe_scatter"), refuse == 2 ? 6 : 0);
         /* the per-expert scale and the experts' gather run whichever form routed */
-        CHECK_EQ(count_issued(issued, "embed_lookup"), 1 + 6);
+        CHECK_EQ(count_issued(issued, "expert_scale"), 6);
         CHECK_EQ(count_issued(issued, "moe_gather"), 6);
+    }
+}
+
+/* The per-expert scale is one launch where gemma4k serves `expert_scale`, and the table lookup and
+ * the multiply where it does not -- the same buffers read and written either way. */
+TEST(gemma4_scales_the_routing_weights_in_one_launch) {
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        if (refuse) b.refuse.insert("expert_scale");
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> issued = issued_ops(b, c);
+        CHECK_EQ(count_issued(issued, "expert_scale"), refuse ? 0 : 6);
+        CHECK_EQ(count_issued(issued, "embed_lookup"), refuse ? 1 + 6 : 1);   /* + the token embedding */
+        CHECK_EQ(count_issued(issued, "mul"), refuse ? 6 : 0);
+        for (const auto& o : b.ops)
+            if (o.resolved) CHECK(o.uses_declared);
     }
 }

@@ -202,7 +202,8 @@ set(G4K_EMU ${CMAKE_CURRENT_SOURCE_DIR}/g4k_emu)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # no fiber switch for this ISA: nothing to register
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set(G4K_HIP ${G4K_DIR}/g4k_attn.hip ${G4K_DIR}/g4k_pick.hip ${G4K_DIR}/g4k_norm.hip)
+  set(G4K_HIP ${G4K_DIR}/g4k_attn.hip ${G4K_DIR}/g4k_pick.hip ${G4K_DIR}/g4k_norm.hip
+              ${G4K_DIR}/g4k_escale.hip)
   set_source_files_properties(${G4K_HIP} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
   add_library(g4k_emu_kernels OBJECT ${G4K_HIP} ${G4K_DIR}/g4k_rows.cpp ${G4K_EMU}/emu/emu.cpp)
   target_include_directories(g4k_emu_kernels PUBLIC ${G4K_EMU}/emu ${G4K_DIR})
@@ -210,7 +211,7 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   # As libr4d compiles every unit: the joins are held to the chain bit for bit, and a contracted
   # multiply-add is a different rounding.
   target_compile_options(g4k_emu_kernels PRIVATE -ffp-contract=off -Wno-psabi)
-  foreach(t attn pick norm)
+  foreach(t attn pick norm escale)
     add_executable(g4k_emu_${t} ${G4K_EMU}/test_${t}.cpp)
     target_link_libraries(g4k_emu_${t} PRIVATE g4k_emu_kernels)
     target_compile_options(g4k_emu_${t} PRIVATE -ffp-contract=off -Wno-psabi)
@@ -219,7 +220,7 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   endforeach()
   # The random sweep at a size the inner loop can afford; `g4k_emu_attn sweep 200` is the long one.
   add_test(NAME g4k_emu_attn_sweep COMMAND g4k_emu_attn sweep 40)
-  set_tests_properties(g4k_emu_attn g4k_emu_pick g4k_emu_norm g4k_emu_attn_sweep
+  set_tests_properties(g4k_emu_attn g4k_emu_pick g4k_emu_norm g4k_emu_escale g4k_emu_attn_sweep
                        PROPERTIES LABELS "g4k_emu" TIMEOUT 600)
 elseif(RAD_HIP_FOUND AND CMAKE_HIP_COMPILER_ID MATCHES "Clang")
   add_test(NAME g4k_emu
