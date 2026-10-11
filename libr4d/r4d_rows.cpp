@@ -3829,7 +3829,7 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_unary },
 
 { "logit_softcap_bf16", "logit_softcap", "elem",
-   "cap * tanh(x / cap), the final-logit softcap, grid-strided over the whole extent",
+   "cap * tanh(x / cap), the final-logit softcap, a row spread over up to 64 blocks",
    "any extent; contiguous in and out",
    "bf16 in and out, fp32 arithmetic",
    RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -3838,7 +3838,7 @@ static const RadKernelInfo kKernels[] = {
    r4d_shape_unary },
 
 { "logit_softcap_f32", "logit_softcap", "elem",
-   "cap * tanh(x / cap), the final-logit softcap, grid-strided over the whole extent",
+   "cap * tanh(x / cap), the final-logit softcap, a row spread over up to 64 blocks",
    "any extent; contiguous in and out",
    "f32 in and out — the 1.3.0 sampling chain carries the logits as f32 from the gemm",
    RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,

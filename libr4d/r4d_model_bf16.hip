@@ -688,13 +688,18 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
 // ref_logit_softcap: y = cap * tanh(x / cap), the final-logit softcap. THE ROW-WISE-WITH-A-PITCH
 // SHAPE IS COPIED FROM sigmoid on purpose: Gemma's arch issues it against the logits_gemm's output,
 // and the pitch form costs nothing on a contiguous buffer -- it is x_ld == n.
+//
+// A ROW IS SPREAD OVER gridDim.y BLOCKS, because a row is a vocabulary shard: 65536 wide at Gemma
+// 4's tp 4, and the step's rows are a decode's few. One block a row walked 256 elements a thread of
+// tanhf on a handful of CUs -- ~85 us at one row, --profile-ops on an R9700, for 256 KiB of f32.
+// Elementwise, so the spread moves no bits.
 __global__ __launch_bounds__(kThreads) void logit_softcap_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
-    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+    for (uint32_t i = blockIdx.y * kThreads + threadIdx.x; i < n; i += gridDim.y * kThreads)
         yr[i] = f32_to_bf16(cap * tanhf(bf2f(xr[i]) / cap));
 }
 
@@ -707,8 +712,14 @@ __global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
     const uint32_t m = blockIdx.x;
     const float* __restrict__ xr = x + (size_t)m * x_ld;
     float* __restrict__ yr = y + (size_t)m * y_ld;
-    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+    for (uint32_t i = blockIdx.y * kThreads + threadIdx.x; i < n; i += gridDim.y * kThreads)
         yr[i] = cap * tanhf(xr[i] / cap);
+}
+
+/* The blocks a softcap row is spread over: eight elements a thread, at most 64 blocks a row. */
+static uint32_t softcap_blocks_per_row(int n) {
+    uint32_t b = (uint32_t)((n + kThreads * 8 - 1) / (kThreads * 8));
+    return b < 1 ? 1 : (b > 64 ? 64 : b);
 }
 
 // ---------------------------------------------------------------------------- scale
@@ -1248,7 +1259,8 @@ extern "C" int r4d_logit_softcap_bf16(long x, long y, int M, int n, float cap,
     if (!(cap > 0.0f)) return -3;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(logit_softcap_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    hipLaunchKernelGGL(logit_softcap_kernel, dim3((uint32_t)M, softcap_blocks_per_row(n)),
+                       dim3(kThreads), 0,
                        (hipStream_t)stream,
                        (const uint16_t*)x, (uint16_t*)y, (uint32_t)n, cap,
                        (uint32_t)x_ld, (uint32_t)y_ld);
@@ -1262,7 +1274,8 @@ extern "C" int r4d_logit_softcap_f32(long x, long y, int M, int n, float cap,
     if (!(cap > 0.0f)) return -3;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(logit_softcap_kernel_f32, dim3((uint32_t)M), dim3(kThreads), 0,
+    hipLaunchKernelGGL(logit_softcap_kernel_f32, dim3((uint32_t)M, softcap_blocks_per_row(n)),
+                       dim3(kThreads), 0,
                        (hipStream_t)stream,
                        (const float*)x, (float*)y, (uint32_t)n, cap,
                        (uint32_t)x_ld, (uint32_t)y_ld);
