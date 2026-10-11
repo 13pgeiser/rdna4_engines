@@ -663,6 +663,12 @@ fn moe_ffn_decode_impl<'a>(
     moe_params: hipfire_dispatch::families::moe::MoeParams<'a>,
 ) -> HipResult<()> {
     let hidden = config.dim;
+    // MoE bisection dump (HIPFIRE_MOE_DUMP_DIR): the single-device post-MoE
+    // residual; root-routed EP is captured after `residual_finish` instead.
+    let dump_final = moe_params.ep_mode == MoeEpMode::None
+        && hipfire_dispatch::pipeline::moe_dump::enabled();
+    let dump_deferred = moe_params.defer_routed_combine;
+    let dump_x = moe_params.x_residual;
     let k = config.num_experts_per_tok;
     #[cfg(feature = "moe-oracle")]
     let oracle_x_residual = moe_params.x_residual;
@@ -683,6 +689,23 @@ fn moe_ffn_decode_impl<'a>(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
+    if dump_final {
+        let dumped = if dump_deferred {
+            hipfire_dispatch::pipeline::moe_dump::final_residual_deferred(
+                gpu,
+                ffn.layer_idx as usize,
+            )
+        } else {
+            hipfire_dispatch::pipeline::moe_dump::final_residual(
+                gpu,
+                ffn.layer_idx as usize,
+                dump_x,
+                hidden,
+                "moe_ffn_decode_impl",
+            )
+        };
+        dumped.map_err(HipError::from)?;
+    }
     #[cfg(feature = "moe-oracle")]
     {
         let oracle_pos =
@@ -6825,7 +6848,22 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         // to every rank before the root-combined routed partial is added.
         let s = self.s;
         gpu.add_inplace_f32(&s.x, partial)
-            .map_err(|e| DispatchError::Hip(e.to_string()))
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        if hipfire_dispatch::pipeline::moe_dump::enabled() {
+            let layer = match self.layer {
+                LayerWeights::DeltaNetMoe(l) => l.ffn.layer_idx,
+                LayerWeights::FullAttnMoe(l) => l.ffn.layer_idx,
+                _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
+            };
+            hipfire_dispatch::pipeline::moe_dump::final_residual(
+                gpu,
+                layer as usize,
+                &s.x,
+                self.config.dim,
+                "ep_add_into_residual",
+            )?;
+        }
+        Ok(())
     }
 
     fn ep_moe_combine_mode(&self) -> EpMoeCombineMode {

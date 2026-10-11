@@ -26,6 +26,7 @@ pub use sealed_moe::{
 pub(crate) mod moe_program;
 pub(crate) mod qt44_qt53_prefill;
 pub use moe_program::{MoeStage, SealedMoeOp};
+pub mod moe_dump;
 pub(crate) mod draft_head;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub(crate) mod layer_ops;
@@ -4379,7 +4380,9 @@ fn decode_combine_stage(
     target: &GpuTensor,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
-    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+    let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
+    let dump = moe_dump::fold_begin(gpu, p.layer_idx as usize, p.hidden, p.x_residual, target)?;
+    if grouped {
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
         hip!(gpu.moe_down_combine_top10_batched(
             &down_expanded,
@@ -4409,6 +4412,34 @@ fn decode_combine_stage(
     if p.recipe.bf16_round_trip() && !shared_add_follows {
         // One live row: the target may be allocated to the prefill chunk cap.
         hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(target, 0, p.hidden)))?;
+    }
+    if dump.is_some() {
+        // Dump-only: the rows the kernel above actually read (stride = its `m`).
+        let (slots, stride) = if grouped {
+            (10, p.hidden)
+        } else {
+            (p.k, p.routed_down_m)
+        };
+        moe_dump::fold_end(
+            gpu,
+            dump,
+            target,
+            p.routed_out.is_some(),
+            &moe_dump::FoldInfo {
+                path: if grouped {
+                    "expanded_top10_combine"
+                } else {
+                    "expanded_k8_combine"
+                },
+                ep_mode: &format!("{:?}", p.ep_mode),
+                hidden: p.hidden,
+                slots,
+                expanded: Some((p.down_expanded, stride)),
+                indices: p.topk_indices,
+                weights: p.topk_weights,
+                expanded_absent_reason: "",
+            },
+        )?;
     }
     Ok(())
 }

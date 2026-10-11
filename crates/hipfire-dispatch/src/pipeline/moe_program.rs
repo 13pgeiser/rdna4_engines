@@ -781,7 +781,17 @@ impl<'a> SealedMoeOp<'a> {
             } else {
                 params.routed_out.unwrap_or(params.x_residual)
             };
-            return super::decode_shared_down_stage(
+            let dump = if params.skip_shared {
+                None
+            } else {
+                super::moe_dump::shared_begin(
+                    gpu,
+                    params.layer_idx as usize,
+                    target,
+                    params.hidden,
+                )?
+            };
+            super::decode_shared_down_stage(
                 self.state.dispatch_ctx(),
                 gpu,
                 params,
@@ -790,6 +800,13 @@ impl<'a> SealedMoeOp<'a> {
                 target,
                 selection.router_shared_fuse,
                 selection.route,
+            )?;
+            return super::moe_dump::shared_end(
+                gpu,
+                dump,
+                target,
+                params.hidden,
+                !std::ptr::eq(target, params.x_residual),
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
@@ -907,7 +924,35 @@ impl<'a> SealedMoeOp<'a> {
     pub(super) fn down(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
             let target = params.routed_out.unwrap_or(params.x_residual);
-            return super::decode_down_stage(
+            // The down kernel itself folds into `target` (no expanded rows, no
+            // later combine stage) on these routes; observe that boundary here.
+            let fused_fold = if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial
+                || selection.route.is_some()
+            {
+                None
+            } else if selection.ninepath_d4 {
+                Some("ninepath_d4")
+            } else if selection.down_last_combine {
+                Some("down_last_combine")
+            } else if !crate::families::moe::moe_down_writes_expanded(
+                params.dtypes.routed_down,
+                params.expert_dtype_tags.is_some(),
+            ) {
+                Some("self_combining_down")
+            } else {
+                None
+            };
+            let dump = match fused_fold {
+                Some(_) => super::moe_dump::fold_begin(
+                    gpu,
+                    params.layer_idx as usize,
+                    params.hidden,
+                    params.x_residual,
+                    target,
+                )?,
+                None => None,
+            };
+            super::decode_down_stage(
                 gpu,
                 params,
                 selection.resolution,
@@ -918,7 +963,27 @@ impl<'a> SealedMoeOp<'a> {
                 selection.ninepath_mq6v2,
                 selection.down_last_combine,
                 selection.route,
-            );
+            )?;
+            if let Some(path) = fused_fold {
+                super::moe_dump::fold_end(
+                    gpu,
+                    dump,
+                    target,
+                    params.routed_out.is_some(),
+                    &super::moe_dump::FoldInfo {
+                        path,
+                        ep_mode: &format!("{:?}", params.ep_mode),
+                        hidden: params.hidden,
+                        slots: params.k,
+                        expanded: None,
+                        indices: params.topk_indices,
+                        weights: params.topk_weights,
+                        expanded_absent_reason:
+                            "down kernel fused the weighted fold; no expanded rows were written",
+                    },
+                )?;
+            }
+            return Ok(());
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {

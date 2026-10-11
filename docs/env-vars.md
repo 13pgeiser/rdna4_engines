@@ -316,6 +316,8 @@ harness exports pending their cleanup.
 | `HIPFIRE_EMULATE_GPUS` | **Developer-only logical GPU emulation.** A successfully parsed integer `>=2` enables; missing, malformed, `0`, and `1` disable. Requested logical IDs are aliased modulo the loaded physical count; this switch does not choose the EP rank count and is not a product admission. |
 | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` | Explicit peer all-reduce selector for logical EP decode proofs; do not set it to `0`. |
 | `HIPFIRE_EP_PEER_ALLREDUCE=1` | Explicit peer all-reduce selector for logical EP batched prefill/tick proofs; do not set it to `0`. |
+| `HIPFIRE_EP_ORACLE_DUMP` | Developer-only `route_oracle_mesh` snapshot directory. EP2-vs-single writes both arms' post-step state and root logits. `HIPFIRE_EP_ORACLE_DUMP_PRE_STEP=1` additionally writes the single arm's separately labeled pre-step replay snapshots. Dumps can occupy multiple GiB; delete them after preserving the bisection report. |
+| `HIPFIRE_MOE_DUMP_DIR` | Developer-only, default off: synchronizing host snapshots of per-layer decode MoE routes, expanded expert rows when materialized, fold input/output, shared-add boundaries and final residual. Use only with graph capture disabled (`HIPFIRE_GRAPH=0 HIPFIRE_AR_GRAPH=0`), never for performance measurements. `tools/ep_bisect.py --state-dir PATH --moe-dir PATH` compares the single and EP2 arms; fused paths explicitly identify unavailable expanded rows rather than dumping stale scratch. |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
@@ -954,6 +956,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_KV_MODE` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
 | `HIPFIRE_EP_KV_SEQ` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
 | `HIPFIRE_EP_ORACLE_DUMP` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
+| `HIPFIRE_EP_ORACLE_DUMP_PRE_STEP` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_EP_PEER_ALLREDUCE` | crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs | developer |
 | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` | crates/hipfire-runtime/src/ep.rs | developer |
 | `HIPFIRE_EP_PREFILL` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
@@ -1459,6 +1462,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MOE_DOWN_ROW2_CLUSTERED` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MOE_DOWN_ROW2_KERNEL` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MOE_DOWN_TIGHT_GRID` | crates/rdna-compute/src/gemv.rs | developer |
+| `HIPFIRE_MOE_DUMP_DIR` | crates/hipfire-dispatch/src/pipeline/moe_dump.rs | developer |
 | `HIPFIRE_MOE_EXPERTS_MQ5` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_MOE_EXPERTS_MQ6` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_MOE_EXPERT_STATS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
