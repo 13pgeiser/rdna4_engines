@@ -64,8 +64,9 @@ CAP=/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_
 $X contract --artifact $P/artifacts/gemv_mq4g256v2_residual --capture $CAP --out $P/artifacts/gemv_mq4g256v2_residual.contract.json
 # (odd/tail support: add --odd-tail-evidence-sha256 <sha of the Vulkan odd-tail receipt bucket> after step 7)
 
-# 6. Oracle framed inputs (existing example)
-pm_aco_oracle prepare --capture $CAP --out $P/prepare
+# 6. Oracle framed inputs (existing example, gated behind lab)
+ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 cargo build --release --offline -j 12 --manifest-path $W/Cargo.toml -p rdna-compute --features lab --example pm_aco_oracle
+$W/target/release/examples/pm_aco_oracle prepare --capture $CAP --out $P/prepare
 
 # 7. original Vulkan dispatch on the exact device -> aco-vulkan-ref-v1
 $F --class correct --card GPU-e475645fe0200397 --mem-gb 1 --hostmem-gb 2 -- \
@@ -78,8 +79,15 @@ capture does not contain exactly one ACO compile, or if anything is rejected. `r
 receipt unless the ACO binary re-compiled for the dispatch is byte-identical to `shader.bin`.
 
 After the producer/reference steps, build `pm-raw-census`, `aco_hsa_emit` (feature `toolchain`) and
-`pm_aco_oracle` with GPUs hidden and `-j 12`. Run `pm-raw-census shader.rawspec.json`, then
-`aco_hsa_emit shader.rawspec.json CONTRACT.json OUT`. The latter writes native ELF/bundle images,
+`pm_aco_oracle` (feature `lab`) with GPUs hidden and `-j 12`:
+
+```sh
+ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 cargo build --release --offline -j 12 --manifest-path $W/Cargo.toml -p hipfire-isa --features toolchain --example aco_hsa_emit
+ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 cargo build --release --offline -j 12 --manifest-path $W/Cargo.toml -p rdna-compute --features lab --example pm_aco_oracle
+```
+
+Run `pm-raw-census shader.rawspec.json`, then
+`$W/target/release/examples/aco_hsa_emit shader.rawspec.json CONTRACT.json OUT`. The latter writes native ELF/bundle images,
 their manifests, and `pm-aco-certificate-v1` with separately closed Raw/HSA obligations; it is
 static evidence, not a GPU receipt. Use the exercised Vulkan odd-tail bucket hash when generating
 an odd/tail-enabled contract. Do not edit a frozen artifact to add these external receipts.
@@ -91,6 +99,28 @@ eager/hipGraph replay. Only after PASS, register `predict add --needs-run --reas
 diagnostic"` with an explicit forecast/noise band, then run the separate `time` mode through
 `fabric-run.sh --class timing`, supplying `--parity-report REPORT/report.json`. This is one
 diagnostic comparison against the tuned hipcc and accepted native PM twin, not product admission.
+
+### Native PM twin vs hipcc: `twin-time` (no candidate)
+
+To check only whether the default-on native PM decode twin costs kernel time against the pinned
+hipcc object, run `pm_aco_oracle twin-time --capture CAP --out DIR [--iters N --reps R --warmup W
+--cache warm|cold]` (once per captured occurrence, e.g. `occ0` WO 5120x6144 and `occ127` DOWN
+5120x17408) through `fabric-run.sh --class timing` on the card under test, after registering the
+prediction. It needs no candidate, ACO manifest, Vulkan receipt or parity report and refuses those
+options. The inventory-verified hipcc object and the accepted twin (`pm_decode_twins`) are loaded,
+run eagerly and through hipGraph on the captured M/K/grid/block, and their whole A/x/y buffers
+plus guards must equal the captured real post bytes and each other (six comparisons, nonzero
+compared bytes, zero differing bytes); any mismatch fails closed and no timing is taken. Timing is
+exactly two arms, rep-major with the order alternating per rep (executed order recorded), event
+timing, no ACO arm. `DIR/twin-time-report.json` (schema `pm-twin-time-v1`) binds the executable
+(sha256/md5), card (device id, HIP UUID, PCI bus), capture meta/file hashes, arm images, shape
+geometry, parity counts and per-arm samples with `twin_over_hipcc`.
+
+This is a kernel-only residual-launch diagnostic. It is not the product A/B (`allpm_decode`
+default on vs off through the stock `hipfire bench` path, per
+`docs/methodology/perf-benchmarking.md`), which measures model-level decode speed and is
+never replaced by it. The existing `time` mode is unchanged and still requires the candidate,
+manifest and a passing `full` report.
 
 ## Artifact layout (`pm-aco-artifact-v1`)
 

@@ -43,6 +43,18 @@
 //!   captured geometry; the candidate image is timed whole, so any adapter
 //!   prologue cost is included). Requires a passing `full` report bound to the same
 //!   candidate/capture/twin. Diagnostic only, never a product speed claim.
+//! - `twin-time`: ONE hipcc-vs-accepted-twin timing pass for the default-on native PM decode
+//!   twin; needs only `--capture` and `--out` (no candidate, ACO manifest, Vulkan receipt or
+//!   parity report; `--iters/--reps/--warmup/--cache` as for `time`). The actual loaders
+//!   (`load_hipcc`, `load_twin`) re-verify the inventory source/object and the accepted twin
+//!   image. Before timing, both arms run eagerly and through a hipGraph on the captured
+//!   M/K/grid/block and their whole A/x/y buffers plus guards are compared against the captured
+//!   real post bytes and hipcc-vs-twin; any mismatch fails closed without timing. Timing is two
+//!   arms only, rep-major with the arm order alternating per rep (executed order recorded),
+//!   event timing, no ACO arm, no occupancy probes. Writes `twin-time-report.json`. This is a
+//!   kernel-only diagnostic of the residual launch at the captured shape; the product A/B
+//!   (`allpm_decode` default on/off at model level) is a separate measurement and is not
+//!   replaced by it.
 //!
 //! ```text
 //! pm_aco_oracle full --capture .../oracle-inputs/gemv_mq4g256v2_residual/occ0 \
@@ -1154,12 +1166,13 @@ fn md5_of(path: &Path) -> Value {
     }
 }
 
-fn run_time(gpu: &mut Gpu, cx: &Ctx, s: &Setup, cfg: &TimeCfg) -> Result<Value> {
-    let sh = fixture_shape(s.cap);
-    let arms: [&Arm; 3] = [&s.hipcc, &s.twin, &s.cand];
+/// Rep-major timing of `arms` on one shape; every arm gets its own freshly allocated pre-image
+/// frames. With `alternate`, odd reps run the arms in reverse order. Returns per-arm samples
+/// (indexed like `arms`) and the executed arm order of every rep.
+fn time_arms(gpu: &mut Gpu, cx: &Ctx, arms: &[&Arm], sh: &Shape, cfg: &TimeCfg, alternate: bool) -> Result<(Vec<Vec<f64>>, Vec<Vec<&'static str>>)> {
     let mut bufs: Vec<Bufs> = Vec::new();
     for _ in arms {
-        bufs.push(alloc_bufs(gpu, cx, &sh, &sh.pre)?);
+        bufs.push(alloc_bufs(gpu, cx, sh, &sh.pre)?);
     }
     let flush = if cfg.cold {
         let bytes = (256usize << 20).next_multiple_of(cx.gran);
@@ -1172,16 +1185,22 @@ fn run_time(gpu: &mut Gpu, cx: &Ctx, s: &Setup, cfg: &TimeCfg) -> Result<Value> 
     // Warmup (untimed), per arm.
     for (i, a) in arms.iter().enumerate() {
         for _ in 0..cfg.warmup {
-            launch(gpu, a, cx, &sh, &mut bufs[i].kernarg)?;
+            launch(gpu, a, cx, sh, &mut bufs[i].kernarg)?;
         }
         sync(gpu, cx)?;
     }
-    let mut full: Vec<Vec<f64>> = vec![Vec::new(); 3];
-    for _ in 0..cfg.reps {
-        for (i, a) in arms.iter().enumerate() {
-            let ms = time_sample(gpu, cx, a, &sh, &mut bufs[i].kernarg, flush.as_ref(), cfg)?;
+    let mut full: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
+    let mut order: Vec<Vec<&'static str>> = Vec::new();
+    for rep in 0..cfg.reps {
+        let mut idx: Vec<usize> = (0..arms.len()).collect();
+        if alternate && rep % 2 == 1 {
+            idx.reverse();
+        }
+        for &i in &idx {
+            let ms = time_sample(gpu, cx, arms[i], sh, &mut bufs[i].kernarg, flush.as_ref(), cfg)?;
             full[i].push(ms);
         }
+        order.push(idx.iter().map(|&i| arms[i].label).collect());
     }
     for b in bufs {
         free_bufs(gpu, b)?;
@@ -1189,6 +1208,21 @@ fn run_time(gpu: &mut Gpu, cx: &Ctx, s: &Setup, cfg: &TimeCfg) -> Result<Value> 
     if let Some(f) = flush {
         gpu.free_tensor(f).map_err(err)?;
     }
+    Ok((full, order))
+}
+
+fn cache_protocol(cfg: &TimeCfg) -> &'static str {
+    if cfg.cold {
+        "cold: 256 MiB memset before every launch, per-launch event pair"
+    } else {
+        "warm: back-to-back launches, one event pair per sample"
+    }
+}
+
+fn run_time(gpu: &mut Gpu, cx: &Ctx, s: &Setup, cfg: &TimeCfg) -> Result<Value> {
+    let sh = fixture_shape(s.cap);
+    let arms: [&Arm; 3] = [&s.hipcc, &s.twin, &s.cand];
+    let (full, _) = time_arms(gpu, cx, &arms, &sh, cfg, false)?;
     let med = |v: &Vec<f64>| {
         let mut c = v.clone();
         median(&mut c)
@@ -1201,7 +1235,7 @@ fn run_time(gpu: &mut Gpu, cx: &Ctx, s: &Setup, cfg: &TimeCfg) -> Result<Value> 
     Ok(json!({
         "protocol": {
             "iters_per_sample": cfg.iters, "samples_per_arm": cfg.reps, "warmup_launches": cfg.warmup,
-            "cache": if cfg.cold { "cold: 256 MiB memset before every launch, per-launch event pair" } else { "warm: back-to-back launches, one event pair per sample" },
+            "cache": cache_protocol(cfg),
             "order": "rep-major single pass: hipcc, twin, candidate per rep; no ABBA, no automatic expansion",
             "geometry": {"grid": sh.grid, "block": sh.block, "dynamic_lds": sh.lds, "M": sh.m, "K": sh.k},
             "prologue_cost_included": "each image is timed whole; any adapter prologue is inside the candidate code object",
@@ -1211,6 +1245,98 @@ fn run_time(gpu: &mut Gpu, cx: &Ctx, s: &Setup, cfg: &TimeCfg) -> Result<Value> 
         "arms": per_arm,
         "ratios_median": {"candidate_over_hipcc": ratio(2, 0), "candidate_over_twin": ratio(2, 1), "twin_over_hipcc": ratio(1, 0)},
     }))
+}
+
+// ---------------------------------------------------------------------------
+// twin-time: hipcc vs accepted native twin only (no candidate / Vulkan)
+
+/// Whole-buffer + guard parity of hipcc and twin on the captured fixture, eager and hipGraph,
+/// each against the captured real post bytes and twin-vs-hipcc. Six byte comparisons are
+/// REQUIRED to have run over a nonzero number of bytes.
+fn twin_parity(gpu: &mut Gpu, cx: &Ctx, hipcc: &Arm, twin: &Arm, sh: &Shape) -> Result<(usize, Value)> {
+    let exp = expected_callsite(sh).ok_or("fixture has no captured callsite post buffers")?;
+    let mut m = Matrix::new();
+    let mut runs: Vec<(&Arm, &str, RunOut)> = Vec::new();
+    for a in [hipcc, twin] {
+        for mode in ["eager", "graph"] {
+            let r = if mode == "eager" { run_eager(gpu, cx, a, sh, &sh.pre) } else { run_graph(gpu, cx, a, sh, &sh.pre) };
+            let name = format!("{} {mode}", a.label);
+            if run_check(&mut m, &name, &r) {
+                let r = r.unwrap();
+                m.eq(&format!("{name} vs captured real callsite (A/x pre==post, y post)"), &r.core, &exp, (a.label, "captured"));
+                runs.push((a, mode, r));
+            }
+        }
+    }
+    let find = |label: &str, mode: &str| runs.iter().find(|(a, md, _)| a.label == label && *md == mode).map(|(_, _, r)| r);
+    for mode in ["eager", "graph"] {
+        match (find("twin", mode), find("hipcc", mode)) {
+            (Some(t), Some(h)) => m.eq(&format!("twin {mode} vs hipcc {mode}"), &t.core, &h.core, ("twin", "hipcc")),
+            _ => m.flag(&format!("twin {mode} vs hipcc {mode}: both runs available"), false, json!(null)),
+        }
+    }
+    let (mut n, mut compared, mut differing) = (0usize, 0u64, 0u64);
+    for e in m.entries.iter().filter(|e| e["kind"] == "identical") {
+        n += 1;
+        differing += e["mismatch_bytes"].as_u64().unwrap_or(u64::MAX);
+        compared += e["buffers"].as_array().map_or(0, |b| b.iter().map(|x| x["bytes"].as_u64().unwrap_or(0)).sum::<u64>());
+    }
+    m.flag(
+        "six whole-buffer comparisons ran over nonzero bytes",
+        n == 6 && compared > 0,
+        json!({"comparisons": n, "compared_bytes": compared}),
+    );
+    Ok((
+        m.failures,
+        json!({
+            "comparisons": n, "compared_bytes": compared, "differing_bytes": differing,
+            "failures": m.failures, "matrix": m.entries,
+        }),
+    ))
+}
+
+fn run_twin_time(gpu: &mut Gpu, cx: &Ctx, hipcc: &Arm, twin: &Arm, cap: &Capture, cfg: &TimeCfg) -> Result<(usize, Value)> {
+    let sh = fixture_shape(cap);
+    let geometry = json!({
+        "name": sh.name, "M": sh.m, "K": sh.k, "grid": sh.grid, "block": sh.block, "dynamic_lds": sh.lds,
+        "buffer_bytes": sh.lens(), "kernarg_ptr_masked_sha256": sha256_hex(&sh.masked_kernarg()),
+    });
+    let (failures, parity) = twin_parity(gpu, cx, hipcc, twin, &sh)?;
+    if failures != 0 {
+        return Ok((failures, json!({"geometry": geometry, "parity": parity, "timing": "NOT RUN: hipcc/twin parity failed closed"})));
+    }
+    let arms = [hipcc, twin];
+    let (full, order) = time_arms(gpu, cx, &arms, &sh, cfg, true)?;
+    let mut per_arm = serde_json::Map::new();
+    for (i, a) in arms.iter().enumerate() {
+        per_arm.insert(a.label.to_owned(), json!({"identity": arm_identity(a, &sh), "launch": stats(&full[i])}));
+    }
+    let paired: Vec<f64> = full[1].iter().zip(&full[0]).map(|(t, h)| t / h).collect();
+    let med = |v: &Vec<f64>| {
+        let mut c = v.clone();
+        median(&mut c)
+    };
+    let mut paired_sorted = paired.clone();
+    Ok((
+        0,
+        json!({
+            "geometry": geometry,
+            "parity": parity,
+            "protocol": {
+                "iters_per_sample": cfg.iters, "samples_per_arm": cfg.reps, "warmup_launches": cfg.warmup,
+                "cache": cache_protocol(cfg),
+                "order": "rep-major, two arms (hipcc, twin), order alternates per rep (even reps hipcc,twin; odd reps twin,hipcc); executed order recorded; no ACO arm, no occupancy probes, no automatic expansion",
+                "executed_order_per_rep": order,
+                "diagnostic_only": "single-session kernel-only timing at the captured fixture; NOT a product speed claim and NOT the allpm_decode on/off product A/B",
+            },
+            "arms": per_arm,
+            "twin_over_hipcc": {
+                "median_of_arm_medians": med(&full[1]) / med(&full[0]),
+                "paired_per_rep": paired,
+                "paired_per_rep_median": median(&mut paired_sorted),
+            },
+        }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,7 +1360,7 @@ struct Opts {
     cold: bool,
 }
 
-const USAGE: &str = "usage: pm_aco_oracle <full|selftest|prepare|time> --capture DIR [--candidate CO --symbol S --candidate-manifest JSON --vulkan-receipt JSON] [--expect-spirv-sha256 H] [--expect-aco-binary-sha256 H] [--out DIR] [--label L] [--inventory JSON]\n  time: --parity-report PASSING_FULL_REPORT --candidate .. --candidate-manifest .. [--iters N=200] [--reps R=5] [--warmup W=20] [--cache warm|cold]";
+const USAGE: &str = "usage: pm_aco_oracle <full|selftest|prepare|time|twin-time> --capture DIR [--candidate CO --symbol S --candidate-manifest JSON --vulkan-receipt JSON] [--expect-spirv-sha256 H] [--expect-aco-binary-sha256 H] [--out DIR] [--label L] [--inventory JSON]\n  time: --parity-report PASSING_FULL_REPORT --candidate .. --candidate-manifest .. [--iters N=200] [--reps R=5] [--warmup W=20] [--cache warm|cold]\n  twin-time: --capture DIR --out DIR [--iters N=200] [--reps R=5] [--warmup W=20] [--cache warm|cold] (hipcc vs accepted twin only; rejects candidate/manifest/receipt/parity-report/pin options)";
 
 fn parse() -> Result<Opts> {
     let mut a = std::env::args().skip(1);
@@ -1447,6 +1573,45 @@ fn run() -> Result<usize> {
                 0
             }
         }
+        "twin-time" => {
+            if o.candidate.is_some()
+                || o.manifest.is_some()
+                || o.receipt.is_some()
+                || o.parity_report.is_some()
+                || o.pins.spirv.is_some()
+                || o.pins.aco_binary.is_some()
+                || o.symbol != SYMBOL
+            {
+                return Err("twin-time takes only --capture/--out (+ --iters/--reps/--warmup/--cache/--label/--inventory); candidate, manifest, receipt, parity-report, pin and symbol options are refused".into());
+            }
+            if o.out.is_none() {
+                return Err("twin-time requires --out".into());
+            }
+            let exe = std::env::current_exe().map_err(err)?;
+            let exe_bytes = std::fs::read(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+            report["schema"] = json!("pm-twin-time-v1");
+            report["identity"] = json!({
+                "hipcc": arm_identity(&hipcc, shape0), "twin": arm_identity(&twin, shape0),
+                "inventory": {
+                    "path": o.inventory.display().to_string(), "source_sha256": inc.source_sha256,
+                    "object_path": inc.object_path.display().to_string(), "object_sha256": inc.object_sha256, "recipe_flags": inc.flags,
+                },
+                "executable": {"path": exe.display().to_string(), "sha256": sha256_hex(&exe_bytes), "md5": md5_of(&exe)},
+                "card": {
+                    "device_id": gpu.device_id, "arch": gpu.arch,
+                    "uuid": gpu.hip.device_uuid(gpu.device_id).map_err(err)?,
+                    "pci_bus_id": gpu.hip.device_pci_bus_id(gpu.device_id).map_err(err)?,
+                },
+                "capture": {
+                    "dir": cap.dir.display().to_string(), "meta_sha256": cap.meta_sha256,
+                    "kernarg_hex": hex(&cap.kernarg), "files": cap.meta["files"],
+                },
+            });
+            let cfg = TimeCfg { iters: o.iters, reps: o.reps, warmup: o.warmup, cold: o.cold };
+            let (n, v) = run_twin_time(&mut gpu, &cx, &hipcc, &twin, &cap, &cfg)?;
+            report["result"] = v;
+            n
+        }
         other => return Err(format!("unknown command {other}\n{USAGE}")),
     };
     report["pass"] = json!(failures == 0);
@@ -1457,8 +1622,15 @@ fn run() -> Result<usize> {
             _ => "fixture",
         });
     }
+    if o.cmd == "twin-time" {
+        report["claim_scope"] = json!("kernel-only hipcc vs accepted native twin at the captured fixture geometry, eager event timing after eager+hipGraph whole-buffer parity; not a product speed claim");
+    }
     let text = serde_json::to_string_pretty(&report).map_err(err)?;
-    let file = if o.cmd == "time" { "time-report.json" } else { "report.json" };
+    let file = match o.cmd.as_str() {
+        "time" => "time-report.json",
+        "twin-time" => "twin-time-report.json",
+        _ => "report.json",
+    };
     std::fs::write(out_dir.join(file), &text).map_err(err)?;
     println!("{text}");
     println!("{}: {} {} -> {}", if failures == 0 { "PASS" } else { "FAIL" }, o.cmd, MODULE, out_dir.join(file).display());

@@ -7,7 +7,7 @@
 //! code object around the untouched ACO body out.
 //!
 //! ```text
-//! cargo run -p hipfire-isa --example aco_hsa_emit -- <artifact-dir>/shader.rawspec.json <contract.json> <out-dir>
+//! cargo run -p hipfire-isa --features toolchain --example aco_hsa_emit -- <artifact-dir>/shader.rawspec.json <contract.json> <out-dir>
 //! ```
 //!
 //! Stages, each a hard stop: `artifact.json` verification (every listed file present and hashed to
