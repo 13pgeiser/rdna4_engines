@@ -36,7 +36,7 @@ chat completions. Default bind is `127.0.0.1` (loopback only); set
 ```bash
 hipfire serve                         # foreground; Ctrl-C stops (default bind 127.0.0.1)
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
-hipfire serve -d                      # background (setsid/nohup); polls /health up to 300s
+hipfire serve -d                      # background (setsid/nohup); polls /health up to 60s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
 hipfire serve 0.0.0.0:11435 -d        # all-interfaces bind — unauthenticated; see Security
 hipfire serve --no-prewarm -d         # bind first; load on first request
@@ -50,6 +50,13 @@ hipfire stop --force                  # also pkill -x daemon + fuser -k <port>/t
 hipfire stop --all                    # --force plus pkill orphan quantize jobs
 hipfire restart -d                    # stop --force semantics, then serve again
 ```
+
+`serve -d` first checks `serve.pid` and `/health`. If a tracked server already
+answers on the same port it prints `hipfire serve already running (pid N, port
+P, log …)` and exits 0; a tracked server on another port, or a different
+process answering on the port, exits 1 with that reason. Readiness requires
+the `/health` `pid` to be the child it just spawned, and if the child exits
+early the error includes the last `FATAL`/`hipfire:` line from `serve.log`.
 
 **Destructive lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
 pid after ownership checks — use that by default. `--force`, `--all`, and
@@ -210,9 +217,19 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
   -d '{
     "model": "qwen3.5:9b",
     "messages": [{"role": "user", "content": "hi"}],
+    "max_tokens": 512,
+    "chat_template_kwargs": {"enable_thinking": false},
     "stream": true
   }'
 ```
+
+> **`max_tokens` includes reasoning.** Qwen tags think by default
+> (`thinking = "on"`), and the `<think>` span counts against `max_tokens`. With
+> a modest cap the whole budget can go to reasoning, so the response carries
+> only `reasoning_content`, `content` is `""`, and `finish_reason` is `length`.
+> Most OpenAI clients show only `content`, so this looks like a blank answer.
+> Send `"chat_template_kwargs": {"enable_thinking": false}` (as above) for
+> direct answers, or raise `max_tokens` / omit it to keep thinking.
 
 - **`stream: true`** (typical clients): SSE `data: {chat.completion.chunk}`
   lines until `data: [DONE]`. The `200` and the role chunk go out when
@@ -244,7 +261,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied. On the Qwen AR samplers (GPU kernel and the CPU sampler used by Flash-Next AR, grammar-constrained Qwen turns and the multi-slot VL first token) `top_k` keeps at most k candidates from a 64-wide gather (absent = 20; `0` or > 64 = 64) and `min_p` drops candidates below `min_p` × the top candidate's probability, both before `top_p`. At `temperature: 0` all three are no-ops. Other routes do not apply every field yet: Gemma4 eager, LFM2, Cohere2, MiniMax, DeepSeek V4 AR, LLaMA AR and single-slot Qwen3.5-VL image turns ignore the request `top_k`; those plus Muse Glimmer, DeepSeek V4 speculative and n-gram speculative decoding ignore `min_p`; Qwen2, Maple and dots.ocr text decode greedily. |
 | `seed` | OpenAI-compatible sampling seed: non-negative integer (≤ u64::MAX). Same seed is reproducible only when prompt, sampling parameters, and execution shape match. Cold vs prefix-resumed and solo vs co-batched shapes may differ until `serve.batch_invariant` is implemented; `null`/omitted = fresh entropy. Negative/fractional/non-integer values are rejected. |
 | `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |
-| `max_tokens` | Generation cap |
+| `max_tokens` | Generation cap, shared by the `<think>` span and the answer (see the note under the example above) |
 | `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), across token boundaries; streaming holds back a possible partial match, the stop text and everything after it are not returned, and `finish_reason` is `stop` (or `tool_calls` when a call completed before the match). Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP) and Flash-Next (`qwen4_ar`, `qwen4_spec` = native MTP); every other route answers 400 instead of ignoring it |
 | `tools` | Tool definitions (with structured `messages` when Jinja chat is on). Flash-Next accepts them with native MTP attached: greedy tool turns run on MTP and match AR byte for byte |
 | `response_format` | **Not enforced on the standard route.** Any value (`json_object`, `json_schema`, `text`, even an unknown type) is accepted unvalidated with HTTP 200 and is not forwarded to the daemon; the model output is unconstrained (a model asked for JSON may still wrap it in a code fence). Only `serve.multi_slot = true` enforces `json_schema` (pre-sampling grammar mask) and refuses `json_object` / unknown types with 400 |

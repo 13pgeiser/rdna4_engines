@@ -294,7 +294,7 @@ narrower than WSL2 on the same card. Known limits:
 ```bash
 git clone https://github.com/warpfront/hipfire
 cd hipfire
-cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release -p hipfire-daemon
 cargo build --release -p hipfire-cli
 cargo build --release -p hipfire-quantize
 # optional TUI:
@@ -361,6 +361,8 @@ under `refs/hipfire/backups/` and stashes dirty files with a recoverable
 hipfire pull qwen3.5:4b
 hipfire run  qwen3.5:4b "Explain FFT in one line"
 ```
+
+Which tag fits your card: [PICK-A-MODEL.md](PICK-A-MODEL.md).
 
 - `pull` downloads the registry artifact into `~/.hipfire/models/` (and published sidecars when the registry entry lists them).
 - `run` accepts a registry tag, alias, or path. **Recognized registry tags that are not local yet are auto-pulled** (can be multi-GB). Unresolved tags, aliases, or paths error with a `pull` / `list --remote` hint — they do not download.
@@ -453,7 +455,7 @@ regression.
 | Model not found | `hipfire list` / `hipfire list -r`; `hipfire pull <tag>` |
 | Port in use / stale serve | `hipfire ps`; `hipfire stop --force`; check `~/.hipfire/serve.pid` and (detached only) `serve.log` |
 | Draft pulled but no speedup | Expected: `dflash_mode` defaults to **off** |
-| Truncated answers on thinking models | Raise `max_tokens` / `thinking_budget`; see [MODELS.md](MODELS.md) thinking section |
+| Truncated answers, or empty `content` from an OpenAI client, on thinking models | `max_tokens` covers the `<think>` span too: raise `max_tokens` / `thinking_budget`, or send `"chat_template_kwargs": {"enable_thinking": false}` (see [SERVE.md](SERVE.md)); [MODELS.md](MODELS.md) thinking section |
 
 ```bash
 hipfire diag
@@ -464,6 +466,7 @@ tail -f ~/.hipfire/serve.log
 
 | Doc | When |
 |---|---|
+| [PICK-A-MODEL.md](PICK-A-MODEL.md) | Which tag and speculation setting for your VRAM |
 | [CLI.md](CLI.md) | Every subcommand and flag surface |
 | [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
 | [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |
