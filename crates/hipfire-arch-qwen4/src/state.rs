@@ -1443,16 +1443,23 @@ impl Qwen4State {
     /// (`fn_ep_oracle`): `(name, value)` rows in a fixed order, identical
     /// across ranks/arms that ran the same host calls.
     ///
-    /// Device rows are `"<sha256 hex> bytes=<n>"` over the tensor's whole
-    /// accessible extent (`buf.size()`): the full allocation for legacy
-    /// arenas and fixed buffers, the mapped prefix for VMM context arenas
-    /// (page-granular and driven only by host calls, so equal across arms).
-    /// Covered: every GDN recurrent (the live ring-slot view) and conv
-    /// state, every QSA full K/V, raw/pooled index keys, partial K/V and
-    /// selected indices, PLE conv, hyper feedback, and the verify row-capture
-    /// rings/inputs/recurrence/output when allocated. Host rows are decimal:
-    /// position, PLE history, GDN live slot, row-capture rows, mapped
-    /// tokens, and every QSA length/position mark.
+    /// Device rows are `"<sha256 hex> bytes=<n>"` (fixed-size state) or
+    /// `"<sha256 hex> bytes=<n> rows=<r>"` (QSA arenas):
+    /// * fixed-size state every forward fully owns, hashed whole
+    ///   (`buf.size()`): every GDN recurrent (the live ring-slot view) and
+    ///   conv, PLE conv, hyper feedback, and the verify row-capture
+    ///   rings/inputs/recurrence/output when allocated. All are zero-filled at
+    ///   allocation (`gpu.zeros`) and by `reset` (memset);
+    /// * QSA arenas, hashed over exactly the ACTIVE prefix the layer's marks
+    ///   name (rows beyond it, and freshly mapped VMM pages, are not
+    ///   guaranteed written): `full_keys` / `full_values` the first
+    ///   `full_len` rows, `raw_index_keys` `raw_len`, `pooled_keys`
+    ///   `pooled_len`, `partial_keys` / `partial_values` `partial_len`,
+    ///   `selected_indices` `selected_len` `i32`s; bytes per row is the
+    ///   arena's allocation geometry (`byte_size / capacity`).
+    ///
+    /// Host rows are decimal: position, PLE history, GDN live slot,
+    /// row-capture rows, mapped tokens, and every QSA length/position mark.
     ///
     /// Deliberately excluded: the snapshot arena contents (scratch copies
     /// written only by `snapshot`, never by a forward); the row-capture
@@ -1462,25 +1469,46 @@ impl Qwen4State {
         use sha2::{Digest, Sha256};
         gpu.hip.device_synchronize().map_err(StateError::Hip)?;
         let mut rows: Vec<(String, String)> = Vec::new();
-        let device = |rows: &mut Vec<(String, String)>,
-                      name: String,
-                      tensor: &GpuTensor|
-         -> Result<(), StateError> {
-            let bytes = tensor.buf.size();
+        // SHA-256 of the first `bytes` bytes of `tensor`, as a row value.
+        let hash_prefix = |tensor: &GpuTensor, bytes: usize| -> Result<String, StateError> {
+            if bytes > tensor.buf.size() {
+                return Err(StateError::SnapshotLength);
+            }
             let mut host = vec![0u8; bytes];
             if bytes > 0 {
                 gpu.hip
                     .memcpy_dtoh(&mut host, &tensor.buf)
                     .map_err(StateError::Hip)?;
             }
-            let mut hasher = Sha256::new();
-            hasher.update(&host);
-            let hex: String = hasher
-                .finalize()
+            Ok(Sha256::digest(&host)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
-                .collect();
+                .collect())
+        };
+        let device = |rows: &mut Vec<(String, String)>,
+                          name: String,
+                          tensor: &GpuTensor|
+         -> Result<(), StateError> {
+            let bytes = tensor.buf.size();
+            let hex = hash_prefix(tensor, bytes)?;
             rows.push((name, format!("{hex} bytes={bytes}")));
+            Ok(())
+        };
+        // The first `live` of `capacity` rows of an arena.
+        let active = |rows: &mut Vec<(String, String)>,
+                          name: String,
+                          tensor: &GpuTensor,
+                          capacity: usize,
+                          live: usize|
+         -> Result<(), StateError> {
+            if live > capacity {
+                return Err(StateError::SnapshotLength);
+            }
+            let bytes = arena_row_bytes(tensor, capacity)?
+                .checked_mul(live)
+                .ok_or(StateError::DimensionOverflow)?;
+            let hex = hash_prefix(tensor, bytes)?;
+            rows.push((name, format!("{hex} bytes={bytes} rows={live}")));
             Ok(())
         };
         rows.push(("position".into(), self.position.to_string()));
@@ -1521,16 +1549,16 @@ impl Qwen4State {
             device(&mut rows, format!("gdn[{index}].conv"), &layer.conv)?;
         }
         for (index, layer) in self.qsa.iter().enumerate() {
-            for (what, tensor) in [
-                ("full_keys", &layer.full_keys),
-                ("full_values", &layer.full_values),
-                ("raw_index_keys", &layer.raw_index_keys),
-                ("pooled_keys", &layer.pooled_keys),
-                ("partial_keys", &layer.partial_keys),
-                ("partial_values", &layer.partial_values),
-                ("selected_indices", &layer.selected_indices),
+            for (what, tensor, capacity, live) in [
+                ("full_keys", &layer.full_keys, layer.full_capacity, layer.full_len),
+                ("full_values", &layer.full_values, layer.full_capacity, layer.full_len),
+                ("raw_index_keys", &layer.raw_index_keys, layer.raw_capacity, layer.raw_len),
+                ("pooled_keys", &layer.pooled_keys, layer.pooled_capacity, layer.pooled_len),
+                ("partial_keys", &layer.partial_keys, layer.partial_capacity, layer.partial_len),
+                ("partial_values", &layer.partial_values, layer.partial_capacity, layer.partial_len),
+                ("selected_indices", &layer.selected_indices, layer.selected_capacity, layer.selected_len),
             ] {
-                device(&mut rows, format!("qsa[{index}].{what}"), tensor)?;
+                active(&mut rows, format!("qsa[{index}].{what}"), tensor, capacity, live)?;
             }
         }
         if let Some(ple_conv) = &self.ple_conv {
