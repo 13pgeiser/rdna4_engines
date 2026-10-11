@@ -139,6 +139,16 @@ pub fn routed_expert_bytes(
     weights: &[WeightEntry],
     bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
 ) -> Result<u64, String> {
+    routed_expert_bytes_ranks(weights, bytes_of, 1)
+}
+
+/// [`routed_expert_bytes`] for one rank of a `ranks`-way expert-parallel load
+/// (`1/ranks` of every routed expert stack).
+pub fn routed_expert_bytes_ranks(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+) -> Result<u64, String> {
     weights
         .iter()
         .filter(|entry| {
@@ -147,9 +157,9 @@ pub fn routed_expert_bytes(
                 && !matches!(entry.policy, ShardPolicy::Tied { .. })
         })
         .try_fold(0u64, |total, entry| {
-            bytes_of(entry)
-                .map(|bytes| total + bytes)
-                .ok_or_else(|| format!("no payload size for '{}'", entry.name))
+            let bytes =
+                bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+            Ok(total + rank_share(entry, bytes, ranks)?)
         })
 }
 
@@ -175,6 +185,17 @@ pub fn resident_split(
     weights: &[WeightEntry],
     bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
 ) -> Result<(u64, u64), String> {
+    resident_split_ranks(weights, bytes_of, 1)
+}
+
+/// [`resident_split`] for one rank of a `ranks`-way expert-parallel load: the
+/// non-expert bytes are replicated on every rank, the layer-0 routed-expert
+/// bytes are `1/ranks` of the single-device figure.
+pub fn resident_split_ranks(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+) -> Result<(u64, u64), String> {
     let mut non_expert = 0u64;
     let mut layer_experts = 0u64;
     for entry in weights {
@@ -185,7 +206,7 @@ pub fn resident_split(
         if !is_routed_expert(&entry.name) {
             non_expert += bytes;
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
-            layer_experts += bytes;
+            layer_experts += rank_share(entry, bytes, ranks)?;
         }
     }
     Ok((non_expert, layer_experts))
@@ -315,6 +336,197 @@ pub fn host_mapped_bytes(
         }
     }
     Ok(total)
+}
+
+/// Pinned host bytes one rank of a `ranks`-way expert-parallel load takes for
+/// its [`WeightResidency::HostMapped`] entries (`bytes_of` is the full source
+/// payload; a routed expert stack is `1/ranks` of it per rank), and the total
+/// across all ranks: every rank pins its own copy in the same host RAM, so
+/// [`check_host_ram`] and [`check_gtt_cap`] take the total. `ranks == 1` is
+/// [`host_mapped_bytes`].
+pub fn host_mapped_bytes_ranks(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+) -> Result<(u64, u64), String> {
+    let mut per_rank = 0u64;
+    for entry in weights {
+        if entry.residency == WeightResidency::HostMapped {
+            let bytes =
+                bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+            per_rank += rank_share(entry, bytes, ranks)? + HOST_MAPPED_PAD_BYTES;
+        }
+    }
+    Ok((per_rank, per_rank.saturating_mul(ranks as u64)))
+}
+
+/// One rank's share of an entry's payload: routed expert stacks split evenly
+/// across `ranks`, everything else is replicated.
+fn rank_share(entry: &WeightEntry, bytes: u64, ranks: usize) -> Result<u64, String> {
+    if ranks == 0 {
+        return Err("expert-parallel rank count must be at least 1".to_string());
+    }
+    if ranks == 1 || !is_routed_expert(&entry.name) {
+        return Ok(bytes);
+    }
+    let ranks = ranks as u64;
+    if bytes % ranks != 0 {
+        return Err(format!(
+            "'{}' has {bytes} bytes, which do not split across {ranks} ranks",
+            entry.name
+        ));
+    }
+    Ok(bytes / ranks)
+}
+
+/// MoE layers of the model: the trunk's plus the MTP head's.
+pub fn moe_layer_count(config: &Qwen4Config) -> usize {
+    config.num_hidden_layers + usize::from(config.mtp.is_some())
+}
+
+/// How many of the model's MoE layers (trunk first, the MTP layer last) one
+/// rank with `free_vram` keeps resident: all of them when the trunk, every
+/// layer's experts and the reserve fit, otherwise the trunk layers `auto`
+/// fits (the MTP layer is then always host-mapped, as in
+/// [`place_routed_experts`]). `layer_expert_bytes_per_rank` is one MoE
+/// layer's routed experts on one rank.
+pub fn ep_rank_layers(
+    config: &Qwen4Config,
+    free_vram: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+) -> usize {
+    let moe_layers = moe_layer_count(config);
+    let all_experts = layer_expert_bytes_per_rank.saturating_mul(moe_layers as u64);
+    if fits_fully_resident(free_vram, non_expert_bytes, all_experts, reserve_bytes) {
+        return moe_layers;
+    }
+    auto_vram_layers(
+        free_vram,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        config.num_hidden_layers,
+        reserve_bytes,
+    )
+}
+
+/// The expert VRAM split every rank of an expert-parallel load applies: the
+/// minimum over ranks of [`ep_rank_layers`], so each layer is resident on all
+/// ranks or on none (the full prefill table relies on equal residency per
+/// layer across ranks). A count of [`moe_layer_count`] means fully resident.
+/// `free_per_rank` is every rank's free VRAM before the load; the result is
+/// the `expert_vram_layers` override passed to every rank's load.
+pub fn ep_vram_layers(
+    config: &Qwen4Config,
+    free_per_rank: &[u64],
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+) -> usize {
+    free_per_rank
+        .iter()
+        .map(|&free| {
+            ep_rank_layers(
+                config,
+                free,
+                non_expert_bytes,
+                layer_expert_bytes_per_rank,
+                reserve_bytes,
+            )
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+/// One rank's line of the expert-parallel fit table: free VRAM, the
+/// replicated trunk, the rank's routed-expert bytes (`MoE layers` of
+/// `layer_expert_bytes_per_rank` each), the split applied (`applied_layers`
+/// of the MoE layers resident, the rest pinned host RAM; the MTP layer is the
+/// last), what this rank alone could keep, the reserve and the predicted
+/// headroom.
+pub fn ep_fit_rank_line(
+    config: &Qwen4Config,
+    rank: usize,
+    ranks: usize,
+    free_vram: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+    applied_layers: usize,
+) -> String {
+    let moe_layers = moe_layer_count(config);
+    let applied = applied_layers.min(moe_layers);
+    let own = ep_rank_layers(
+        config,
+        free_vram,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        reserve_bytes,
+    );
+    let resident_bytes = layer_expert_bytes_per_rank.saturating_mul(applied as u64);
+    let headroom = i128::from(free_vram)
+        - i128::from(non_expert_bytes)
+        - i128::from(resident_bytes)
+        - i128::from(reserve_bytes);
+    let gib = |bytes: u64| bytes as f64 / GIB;
+    format!(
+        "qwen4 EP rank {rank}/{ranks}: free {:.2} GiB | trunk {:.2} GiB | experts {:.2} GiB/rank \
+         ({moe_layers} MoE layers x {:.1} MiB) | resident expert layers {applied} of {moe_layers} \
+         ({} host-mapped; this rank alone fits {own}) | reserve {:.2} GiB | headroom {:+.2} GiB",
+        gib(free_vram),
+        gib(non_expert_bytes),
+        gib(layer_expert_bytes_per_rank.saturating_mul(moe_layers as u64)),
+        layer_expert_bytes_per_rank as f64 / (1u64 << 20) as f64,
+        moe_layers - applied,
+        gib(reserve_bytes),
+        headroom as f64 / GIB,
+    )
+}
+
+/// The expert-parallel fit table for `ranks` cards (`free_per_rank[r]` is rank
+/// `r`'s free VRAM): a header naming the context and chunk the reserve was
+/// sized for and the split every rank applies ([`ep_vram_layers`], the minimum
+/// over ranks), then one [`ep_fit_rank_line`] per rank at that split.
+/// `non_expert_bytes` is the replicated trunk, `layer_expert_bytes_per_rank`
+/// one MoE layer's routed experts on one rank (`resident_split_ranks`),
+/// `reserve_bytes` ([`auto_vram_reserve`]) what `auto` keeps free.
+pub fn ep_fit_report(
+    config: &Qwen4Config,
+    ranks: usize,
+    free_per_rank: &[u64],
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+    max_seq: usize,
+    chunk_rows: usize,
+) -> String {
+    let split = ep_vram_layers(
+        config,
+        free_per_rank,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        reserve_bytes,
+    );
+    let mut report = format!(
+        "qwen4 EP fit: {ranks} ranks, max_seq {max_seq}, prefill chunk {chunk_rows} rows, \
+         VRAM split {split} of {} MoE layers on every rank (minimum over ranks)",
+        moe_layer_count(config)
+    );
+    for (rank, free) in free_per_rank.iter().enumerate() {
+        report.push('\n');
+        report.push_str(&ep_fit_rank_line(
+            config,
+            rank,
+            ranks,
+            *free,
+            non_expert_bytes,
+            layer_expert_bytes_per_rank,
+            reserve_bytes,
+            split,
+        ));
+    }
+    report
 }
 
 /// Refuse before any allocation when the pinned experts would not leave
@@ -1003,5 +1215,138 @@ mod tests {
             ),
             config.num_hidden_layers
         );
+    }
+
+    #[test]
+    fn ep_ranks_split_only_the_routed_expert_bytes() {
+        let config = crate::config::compact_test_config();
+        let mut manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let (non_expert, layer_experts) =
+            resident_split(&manifest.weights, element_bytes).expect("split");
+        let experts = routed_expert_bytes(&manifest.weights, element_bytes).unwrap();
+        // ranks == 1 is the single-device arithmetic.
+        assert_eq!(
+            resident_split_ranks(&manifest.weights, element_bytes, 1),
+            Ok((non_expert, layer_experts))
+        );
+        assert_eq!(
+            routed_expert_bytes_ranks(&manifest.weights, element_bytes, 1),
+            Ok(experts)
+        );
+        for ranks in [2u64, 4] {
+            let r = ranks as usize;
+            // The trunk is replicated; experts are 1/ranks per rank.
+            assert_eq!(
+                resident_split_ranks(&manifest.weights, element_bytes, r),
+                Ok((non_expert, layer_experts / ranks))
+            );
+            assert_eq!(
+                routed_expert_bytes_ranks(&manifest.weights, element_bytes, r),
+                Ok(experts / ranks)
+            );
+            assert_eq!(layer_experts % ranks, 0);
+        }
+        // Every rank host-maps its own 1/N share: the total across ranks is
+        // N x the per-rank bytes, and ranks == 1 equals host_mapped_bytes.
+        let routed = manifest
+            .weights
+            .iter()
+            .filter(|entry| is_routed_expert(&entry.name))
+            .count();
+        assert_eq!(place_routed_experts(&mut manifest.weights, 0), routed);
+        let single = host_mapped_bytes(&manifest.weights, element_bytes).unwrap();
+        assert_eq!(
+            host_mapped_bytes_ranks(&manifest.weights, element_bytes, 1),
+            Ok((single, single))
+        );
+        for ranks in [2usize, 4] {
+            let (per_rank, total) =
+                host_mapped_bytes_ranks(&manifest.weights, element_bytes, ranks).unwrap();
+            // Payload bytes shrink by N; each tensor keeps its pad.
+            let pad = routed as u64 * HOST_MAPPED_PAD_BYTES;
+            assert_eq!(per_rank, (single - pad) / ranks as u64 + pad);
+            assert_eq!(total, per_rank * ranks as u64);
+        }
+        // An indivisible stack and a zero rank count are refused.
+        assert!(resident_split_ranks(&manifest.weights, element_bytes, 3).is_err());
+        assert!(routed_expert_bytes_ranks(&manifest.weights, element_bytes, 0).is_err());
+    }
+
+    #[test]
+    fn ep_auto_layers_use_the_per_rank_expert_bytes() {
+        let free = 30u64 << 30;
+        let non_expert = 5_990_000_000u64;
+        let layer = 1_336_900_000u64;
+        let reserve = 6_656u64 << 20;
+        let single = auto_vram_layers(free, non_expert, layer, 48, reserve);
+        let ep4 = auto_vram_layers(free, non_expert, layer / 4, 48, reserve);
+        let ep2 = auto_vram_layers(free, non_expert, layer / 2, 48, reserve);
+        assert!(single < ep2 && ep2 < ep4);
+        // EP4 at 30 GiB keeps every trunk layer resident; EP2 does not.
+        assert_eq!(ep4, 48);
+        assert!(ep2 < 48);
+    }
+
+    #[test]
+    fn ep_fit_report_prints_one_line_per_rank() {
+        let config = crate::config::compact_test_config();
+        let free = [30u64 << 30, 29 << 30, 30 << 30, 28 << 30];
+        let report = ep_fit_report(
+            &config,
+            4,
+            &free,
+            5_990_000_000,
+            334_225_000,
+            6_656u64 << 20,
+            32768,
+            1536,
+        );
+        let lines: Vec<_> = report.lines().collect();
+        assert_eq!(lines.len(), 5, "{report}");
+        assert!(lines[0].contains("4 ranks") && lines[0].contains("32768") && lines[0].contains("1536"));
+        for (rank, line) in lines[1..].iter().enumerate() {
+            assert!(line.starts_with(&format!("qwen4 EP rank {rank}/4:")), "{line}");
+            for part in ["free", "trunk", "experts", "resident expert layers", "reserve", "headroom"] {
+                assert!(line.contains(part), "{part} missing from {line}");
+            }
+            // 49 MoE layers incl. the MTP head.
+            assert!(line.contains("of 49"), "{line}");
+        }
+        // EP4 at 28..30 GiB free keeps all 49 MoE layers (the MTP layer too) resident.
+        assert!(lines[0].contains("VRAM split 49 of 49"), "{}", lines[0]);
+        assert!(lines[1].contains("resident expert layers 49 of 49 (0 host-mapped"), "{}", lines[1]);
+        // Headroom: 30 GiB - 5.99 GB trunk - 49 x 0.334 GB - 6.5 GiB reserve > 0 on rank 0.
+        assert!(lines[1].contains("headroom +"), "{}", lines[1]);
+        // A rank with too little VRAM for the reserve reports negative headroom.
+        let tight =
+            ep_fit_rank_line(&config, 1, 2, 8 << 30, 5_990_000_000, 668_450_000, 6_656u64 << 20, 0);
+        assert!(tight.contains("headroom -"), "{tight}");
+        assert!(tight.contains("resident expert layers 0 of 49"), "{tight}");
+    }
+
+    #[test]
+    fn ep_split_is_the_minimum_over_ranks_and_identical_everywhere() {
+        let config = crate::config::compact_test_config();
+        let (non_expert, layer, reserve) = (5_990_000_000u64, 668_450_000u64, 6_656u64 << 20);
+        let rank = |free| ep_rank_layers(&config, free, non_expert, layer, reserve);
+        // EP2-sized layers: 49 x 0.668 GB does not fit 30 GiB with the reserve.
+        let roomy = rank(30 << 30);
+        let tight = rank(24 << 30);
+        assert!(tight < roomy && roomy < 49 && tight > 0, "{tight} {roomy}");
+        assert_eq!(rank(64 << 30), 49, "everything fits");
+        assert_eq!(rank(1 << 30), 0, "reserve alone does not fit");
+        let free = [30u64 << 30, 24 << 30, 30 << 30, 29 << 30];
+        assert_eq!(ep_vram_layers(&config, &free, non_expert, layer, reserve), tight);
+        assert_eq!(ep_vram_layers(&config, &free[..1], non_expert, layer, reserve), roomy);
+        assert_eq!(ep_vram_layers(&config, &[], non_expert, layer, reserve), 0);
+        // The report applies the minimum to every rank.
+        let report = ep_fit_report(&config, 4, &free, non_expert, layer, reserve, 32768, 1536);
+        let lines: Vec<_> = report.lines().collect();
+        assert!(lines[0].contains(&format!("VRAM split {tight} of 49")), "{}", lines[0]);
+        for line in &lines[1..] {
+            assert!(line.contains(&format!("resident expert layers {tight} of 49")), "{line}");
+        }
+        assert!(lines[2].contains(&format!("this rank alone fits {tight}")), "{}", lines[2]);
+        assert!(lines[1].contains(&format!("this rank alone fits {roomy}")), "{}", lines[1]);
     }
 }

@@ -41,15 +41,21 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
 /// `memory.gpu_layer_budget` layer count) gets no retained default: its spilled
 /// layers' GEMVs run on the host between GPU launches, which a retained tape
-/// does not record.
+/// does not record. Expert parallelism (`ep` > 1, Flash-Next EP) runs one
+/// program per rank with a cross-device row gather between kernels, which a
+/// single-device retained tape cannot record, so it is never admitted.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
     model_path: &str,
     pp: usize,
     tp: usize,
+    ep: usize,
     has_drafter: bool,
 ) -> bool {
+    if ep != 1 {
+        return false;
+    }
     if model_arch.eq_ignore_ascii_case("muse_glimmer") {
         return false;
     }
@@ -243,8 +249,39 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{mq4r_redline_default, retained_redline_default, RuntimeConfig};
+    use super::{mq4r_redline_default, retained_redline_default as redline_with_ep, RuntimeConfig};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    /// The pre-EP call shape: every case below is a single-rank (`ep == 1`) load.
+    fn retained_redline_default(
+        gpu_arch: &str,
+        model_arch: &str,
+        model_path: &str,
+        pp: usize,
+        tp: usize,
+        has_drafter: bool,
+    ) -> bool {
+        redline_with_ep(gpu_arch, model_arch, model_path, pp, tp, 1, has_drafter)
+    }
+
+    #[test]
+    fn expert_parallel_never_admits_retained_redline() {
+        let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
+        assert!(redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, 1, false));
+        for ep in [2, 4] {
+            assert!(!redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, ep, false));
+            assert!(!redline_with_ep("gfx1201", "qwen3_5", fn_xts, 1, 1, ep, false));
+            assert!(!redline_with_ep(
+                "gfx1201",
+                "qwen4",
+                "/models/fn.mq4r",
+                1,
+                1,
+                ep,
+                false
+            ));
+        }
+    }
 
     #[test]
     fn npu_spillover_is_off_unless_process_snapshot_enables_it() {

@@ -2288,7 +2288,7 @@ fn main() {
                             arch,
                             path,
                             pp,
-                            tp,
+                            tp, hipfire_loader::admission::effective_ep(m.arch_id),
                             drafter.is_some(),
                         ) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
                             eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");

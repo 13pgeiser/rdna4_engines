@@ -16,6 +16,7 @@ use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 #[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
+use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_manifest::{
     DTypeConstraint, ExpertSourceLayout, PinTarget, PlacementHint, ShardPolicy, StateEntry,
     StateKind, WeightEntry,
@@ -1259,6 +1260,49 @@ impl Qwen4Manifest {
         self.weights.retain(|entry| !entry.residency.is_external());
         self
     }
+
+    /// This manifest declared for one rank of an expert-parallel mesh: every
+    /// routed expert stack (trunk layers and the MTP head, gate/up and down)
+    /// becomes `ShardPolicy::ExpertSharded { n_experts, Stride }`, so rank `r`
+    /// of `ranks` holds experts `e % ranks == r` compactly in ascending `e`
+    /// (local index `e / ranks`). The entries keep their logical shape
+    /// (`[n_experts, ..]`, which the manifest validator requires); the
+    /// fulfilled tensor is `[n_experts / ranks, ..]`. Everything else is
+    /// unchanged, and a manifest that is never passed through here (ep = 1)
+    /// stays byte-identical to the single-device declaration.
+    pub fn with_expert_parallel(mut self, ep: Qwen4EpPlacement) -> Result<Self, WeightError> {
+        if ep.ranks < 2 || ep.rank >= ep.ranks {
+            return Err(WeightError::EpPlacement(format!(
+                "rank {} of {} is not an expert-parallel placement",
+                ep.rank, ep.ranks
+            )));
+        }
+        let mut sharded = 0usize;
+        for entry in self
+            .weights
+            .iter_mut()
+            .filter(|entry| is_routed_expert_tensor(&entry.name))
+        {
+            let experts = entry.logical_shape.first().copied().unwrap_or(0);
+            if experts == 0 || experts % ep.ranks != 0 {
+                return Err(WeightError::EpPlacement(format!(
+                    "{}: {experts} routed experts do not divide across {} ranks",
+                    entry.name, ep.ranks
+                )));
+            }
+            entry.policy = ShardPolicy::ExpertSharded {
+                n_experts: experts,
+                assign: ExpertAssign::Stride,
+            };
+            sharded += 1;
+        }
+        if sharded == 0 {
+            return Err(WeightError::EpPlacement(
+                "the manifest declares no routed expert tensors (dense FFN)".to_string(),
+            ));
+        }
+        Ok(self)
+    }
 }
 
 fn mtp_entry(
@@ -1932,6 +1976,7 @@ impl Qwen4Weights {
                 actual: provided.len(),
             });
         }
+        let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, 0))?;
         let mut assembly = tx.begin_assembly();
         for placement in placements {
             if assembly
@@ -1967,7 +2012,7 @@ impl Qwen4Weights {
             root,
             layer_refs,
             mtp,
-            ep: None,
+            ep,
         })
     }
 
@@ -2568,6 +2613,59 @@ fn assembly_manifest(
     Qwen4Manifest::build_with_recipe(config, recipe.clone())
 }
 
+/// Whether `name` is a routed expert stack (trunk `…mlp.experts.*` or the MTP
+/// head's `mtp.layers.0.mlp.experts.*`): the only tensors expert parallelism
+/// shards.
+fn is_routed_expert_tensor(name: &str) -> bool {
+    name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+}
+
+/// The expert-parallel placement recorded in a transaction's projection
+/// census (`lookup(name, layer)` is its device-0 projection): `Some` iff every
+/// routed expert stack of `manifest` was fulfilled `ExpertCompact` for one
+/// `(rank, ranks)`, `None` iff none was. A mixture, or disagreeing
+/// placements, is a corrupt load and is refused before assembly takes handles.
+fn ep_from_projections<'a>(
+    manifest: &Qwen4Manifest,
+    lookup: impl Fn(&str, Option<usize>) -> Option<&'a hipfire_runtime::weight_store::WeightProjection>,
+) -> Result<Option<Qwen4EpPlacement>, WeightError> {
+    use hipfire_runtime::weight_store::WeightProjectionKind;
+    let mut placement: Option<Qwen4EpPlacement> = None;
+    let mut plain = 0usize;
+    let mut compact = 0usize;
+    for entry in manifest
+        .weights
+        .iter()
+        .filter(|entry| is_routed_expert_tensor(&entry.name))
+    {
+        let Some(projection) = lookup(&entry.name, entry.layer) else {
+            continue;
+        };
+        if projection.kind == WeightProjectionKind::ExpertCompact {
+            compact += 1;
+            let this = Qwen4EpPlacement {
+                rank: projection.rank,
+                ranks: projection.world_size,
+            };
+            if placement.is_some_and(|seen| seen != this) {
+                return Err(WeightError::EpPlacement(format!(
+                    "{}: placement {this:?} disagrees with {placement:?}",
+                    entry.name
+                )));
+            }
+            placement = Some(this);
+        } else {
+            plain += 1;
+        }
+    }
+    if compact > 0 && plain > 0 {
+        return Err(WeightError::EpPlacement(format!(
+            "{compact} routed expert tensors were fulfilled compactly and {plain} in full"
+        )));
+    }
+    Ok(placement)
+}
+
 /// Production builds never execute a developer profile.
 #[cfg(not(any(test, feature = "qwen4-dev-profiles")))]
 fn admit_synthetic_profile(config: &Qwen4Config) -> Result<(), WeightError> {
@@ -2773,6 +2871,9 @@ pub enum WeightError {
         profile: String,
         reason: String,
     },
+    /// An expert-parallel placement that is malformed, or a transaction whose
+    /// routed expert tensors do not agree on one.
+    EpPlacement(String),
 }
 
 impl fmt::Display for WeightError {
@@ -2817,6 +2918,7 @@ impl fmt::Display for WeightError {
             Self::UnsupportedProfile { profile, reason } => {
                 write!(f, "Qwen4 profile {profile:?} is not executable: {reason}")
             }
+            Self::EpPlacement(reason) => write!(f, "Qwen4 expert-parallel placement: {reason}"),
         }
     }
 }
@@ -2873,6 +2975,115 @@ mod tests {
         assert!(!is_ple_shard_name(&name("007")));
         assert!(!is_ple_shard_name(&name("")));
         assert!(!is_ple_shard_name("model.embed_tokens.weight"));
+    }
+
+    #[test]
+    fn expert_parallel_manifest_shards_only_routed_experts() {
+        use hipfire_runtime::device_mesh::DeviceMesh;
+        let base = Qwen4Manifest::build(&pinned_config()).unwrap();
+        // ep = 1 never passes through the transform: every expert stack stays
+        // `Replicate` (the byte-identical single-device declaration).
+        assert!(base
+            .weights
+            .iter()
+            .filter(|entry| is_routed_expert_tensor(&entry.name))
+            .all(|entry| entry.policy == ShardPolicy::Replicate));
+        for ranks in [2usize, 4] {
+            let rank = ranks - 1;
+            let ep = base
+                .clone()
+                .with_expert_parallel(Qwen4EpPlacement { rank, ranks })
+                .unwrap();
+            assert_eq!(ep.identity, base.identity);
+            assert_eq!(ep.state, base.state);
+            assert_eq!(ep.metadata, base.metadata);
+            assert_eq!(ep.weights.len(), base.weights.len());
+            let mut sharded = 0;
+            let mut mtp_sharded = 0;
+            for (before, after) in base.weights.iter().zip(&ep.weights) {
+                if is_routed_expert_tensor(&before.name) {
+                    assert_eq!(
+                        after.policy,
+                        ShardPolicy::ExpertSharded {
+                            n_experts: 512,
+                            assign: ExpertAssign::Stride
+                        },
+                        "{}",
+                        before.name
+                    );
+                    assert_eq!(after.logical_shape, before.logical_shape);
+                    assert_eq!(after.logical_shape[0], 512);
+                    sharded += 1;
+                    mtp_sharded += usize::from(before.name.starts_with("mtp.layers.0."));
+                } else {
+                    assert_eq!(before, after, "{} must be untouched", before.name);
+                }
+            }
+            // 48 trunk layers + the MTP head, gate_up and down each.
+            assert_eq!(sharded, 2 * 49);
+            assert_eq!(mtp_sharded, 2);
+            // The sharded declaration is a valid single-mesh manifest.
+            hipfire_runtime::weight_manifest::validate_manifest(
+                &ep.weights,
+                &DeviceMesh::single().unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn expert_parallel_manifest_refuses_bad_placements() {
+        let base = Qwen4Manifest::build(&pinned_config()).unwrap();
+        for (rank, ranks) in [(0, 1), (0, 0), (2, 2), (4, 4), (0, 3), (1, 5)] {
+            assert!(
+                matches!(
+                    base.clone().with_expert_parallel(Qwen4EpPlacement { rank, ranks }),
+                    Err(WeightError::EpPlacement(_))
+                ),
+                "rank {rank} of {ranks}"
+            );
+        }
+    }
+
+    #[test]
+    fn ep_placement_is_recovered_from_the_projection_census() {
+        use hipfire_runtime::weight_store::{WeightProjection, WeightProjectionKind};
+        let manifest = Qwen4Manifest::build(&pinned_config()).unwrap();
+        let projection = |kind, rank, world_size| WeightProjection {
+            kind,
+            axis: None,
+            rank,
+            world_size,
+            logical_shape: vec![512, 1, 1],
+            dtype: DType::MQ4G256V2,
+        };
+        let compact = projection(WeightProjectionKind::ExpertCompact, 1, 4);
+        let plain = projection(WeightProjectionKind::Static, 0, 1);
+        let other = projection(WeightProjectionKind::ExpertCompact, 2, 4);
+        assert_eq!(
+            ep_from_projections(&manifest, |_, _| Some(&compact)).unwrap(),
+            Some(Qwen4EpPlacement { rank: 1, ranks: 4 })
+        );
+        assert_eq!(ep_from_projections(&manifest, |_, _| Some(&plain)).unwrap(), None);
+        assert_eq!(ep_from_projections(&manifest, |_, _| None).unwrap(), None);
+        // A mixture of compact and full expert stacks is refused.
+        assert!(ep_from_projections(&manifest, |name, _| {
+            if name.ends_with("down_proj") {
+                Some(&plain)
+            } else {
+                Some(&compact)
+            }
+        })
+        .is_err());
+        // Two different placements are refused.
+        assert!(ep_from_projections(&manifest, |_, layer| {
+            if layer == Some(3) {
+                Some(&other)
+            } else {
+                Some(&compact)
+            }
+        })
+        .is_err());
     }
     fn pinned_config() -> Qwen4Config {
         crate::config::compact_test_config()

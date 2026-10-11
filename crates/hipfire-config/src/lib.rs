@@ -2058,6 +2058,18 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_DEVICES",
         "Device list for this process, in logical order: BDF-order index, gfxNNNN (first free card of that arch), GPU-<uuid>, or PCI address; resolved from the KFD topology and lowered to ROCr selectors plus HIP logical 0..N-1 before GPU initialization."
     ),
+    field!(
+        "topology.ep",
+        "ep",
+        Hardware,
+        ModelLoad,
+        DefaultValue::Integer(1),
+        ValueRule::Integer { min: 1, max: 4 },
+        false,
+        true,
+        Some("HIPFIRE_TOPOLOGY_EP"),
+        "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1201: 1 (default, single device), 2 or 4. Experts shard e % N across N visible gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
+    ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
         "uniform_vram_tolerance_gb",
@@ -6765,6 +6777,111 @@ mod tests {
                 raw.parse::<Deepseek4ComputePlacement>().is_err(),
                 "expected rejection for {raw}"
             );
+        }
+    }
+}
+
+/// Device topology policy: expert-parallel degree (`topology.ep`, compat env
+/// `HIPFIRE_TOPOLOGY_EP`) and the Qwen4 kill switch `HIPFIRE_QWEN4_EP=0`.
+/// Pure and GPU-independent; the loader resolves the degree once, before any
+/// teardown or allocation.
+pub mod topology {
+    use super::process_value;
+
+    /// Developer kill switch: `HIPFIRE_QWEN4_EP=0` forces Qwen4 to ep = 1
+    /// regardless of `topology.ep`.
+    pub const QWEN4_EP_KILL_SWITCH_ENV: &str = "HIPFIRE_QWEN4_EP";
+    /// Compatibility spelling of `topology.ep`.
+    pub const EP_ENV: &str = "HIPFIRE_TOPOLOGY_EP";
+    /// Expert-parallel degrees the schema admits (512 experts divide evenly).
+    pub const EP_DEGREES: [usize; 3] = [1, 2, 4];
+
+    /// Pure parser behind [`ep`]: unset or empty is 1 (the default); an
+    /// integer outside [`EP_DEGREES`] is a refusal naming the allowed set.
+    pub fn parse_ep(raw: Option<&str>) -> Result<usize, String> {
+        let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(1);
+        };
+        match raw.parse::<usize>() {
+            Ok(n) if EP_DEGREES.contains(&n) => Ok(n),
+            _ => Err(format!(
+                "topology.ep = {raw:?} is not a valid expert-parallel degree (allowed: 1, 2, 4)"
+            )),
+        }
+    }
+
+    /// True when the raw `HIPFIRE_QWEN4_EP` value is the kill switch (`0`).
+    pub fn qwen4_ep_killed(raw: Option<&str>) -> bool {
+        raw.map(str::trim) == Some("0")
+    }
+
+    /// Qwen4 degree from raw inputs: the kill switch wins over any (even
+    /// invalid) configured value.
+    pub fn resolve_qwen4_ep(configured: Option<&str>, kill_switch: Option<&str>) -> Result<usize, String> {
+        if qwen4_ep_killed(kill_switch) {
+            return Ok(1);
+        }
+        parse_ep(configured)
+    }
+
+    /// Configured `topology.ep` from the process snapshot.
+    pub fn ep() -> Result<usize, String> {
+        parse_ep(process_value(EP_ENV).as_deref())
+    }
+
+    /// Effective Qwen4 expert-parallel degree: `topology.ep` unless
+    /// `HIPFIRE_QWEN4_EP=0` forces 1.
+    pub fn qwen4_ep() -> Result<usize, String> {
+        resolve_qwen4_ep(
+            process_value(EP_ENV).as_deref(),
+            process_value(QWEN4_EP_KILL_SWITCH_ENV).as_deref(),
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_ep_defaults_and_allowed_set() {
+            assert_eq!(parse_ep(None), Ok(1));
+            assert_eq!(parse_ep(Some("")), Ok(1));
+            assert_eq!(parse_ep(Some("1")), Ok(1));
+            assert_eq!(parse_ep(Some(" 2 ")), Ok(2));
+            assert_eq!(parse_ep(Some("4")), Ok(4));
+            for bad in ["0", "3", "5", "8", "-1", "two", "2.0"] {
+                let err = parse_ep(Some(bad)).unwrap_err();
+                assert!(err.contains("topology.ep") && err.contains("1, 2, 4"), "{bad}: {err}");
+            }
+        }
+
+        #[test]
+        fn kill_switch_forces_one_regardless_of_config() {
+            assert_eq!(resolve_qwen4_ep(Some("4"), Some("0")), Ok(1));
+            assert_eq!(resolve_qwen4_ep(Some("2"), Some("0")), Ok(1));
+            // Even an invalid configured value is moot under the kill switch.
+            assert_eq!(resolve_qwen4_ep(Some("3"), Some("0")), Ok(1));
+            // Any other kill-switch spelling leaves the config in charge.
+            assert_eq!(resolve_qwen4_ep(Some("4"), Some("1")), Ok(4));
+            assert_eq!(resolve_qwen4_ep(Some("4"), Some("")), Ok(4));
+            assert_eq!(resolve_qwen4_ep(Some("4"), None), Ok(4));
+            assert_eq!(resolve_qwen4_ep(None, None), Ok(1));
+            assert!(resolve_qwen4_ep(Some("3"), None).is_err());
+        }
+
+        #[test]
+        fn schema_field_validates_range_and_defaults_to_one() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "topology.ep")
+                .expect("topology.ep is in the schema");
+            assert_eq!(field.env_compat, Some(EP_ENV));
+            assert!(field.validate(&crate::ConfigValue::Integer(1)).is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(4)).is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(5)).is_err());
+            assert!(matches!(field.parse_cli("2"), Ok(crate::ConfigValue::Integer(2))));
+            assert!(matches!(field.default, crate::DefaultValue::Integer(1)));
         }
     }
 }

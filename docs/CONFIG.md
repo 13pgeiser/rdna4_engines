@@ -94,6 +94,7 @@ Stable/default-on and safety controls:
 | Key | Default | Purpose |
 |---|---:|---|
 | `hardware.allow_mixed_arch` | `false` | Permit heterogeneous multi-GPU topology. |
+| `topology.ep` | `1` | Qwen4 (Flash-Next) expert-parallel degree on gfx1201: `1`, `2` or `4` cards (routed experts shard `e % N`; every card runs the unchanged single-device program; opt-in, ep > 1 refuses MTP/speculation/lanes/PFlash). `HIPFIRE_QWEN4_EP=0` forces `1`. |
 | `hardware.tp_use_rccl` | `true` | RCCL tensor-parallel all-reduce. |
 | `kernel.prefill_batched` | `true` | Batched prefill kernels. |
 | `speculation.draft_f16` | `true` | FP16 DFlash draft activations. |
@@ -1151,6 +1152,7 @@ misspelled key is unknown and fails the load with
 | `hardware.devices` | `devices` | `HIPFIRE_DEVICES` | stable |
 | `hardware.tp_use_rccl` | `tp_use_rccl` | `HIPFIRE_TP_USE_RCCL` | stable |
 | `hardware.uniform_vram_tolerance_gb` | `uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | stable |
+| `topology.ep` | `ep` | `HIPFIRE_TOPOLOGY_EP` | experimental |
 | `image.decode` | `image_decode` | `HIPFIRE_IMAGE_DECODE` | stable |
 | `kernel.attn_qresident` | `attn_qresident` | `HIPFIRE_ATTN_QRESIDENT` | stable |
 | `kernel.attn_qresident_v2` | `attn_qresident_v2` | `HIPFIRE_ATTN_QRESIDENT_V2` | stable |

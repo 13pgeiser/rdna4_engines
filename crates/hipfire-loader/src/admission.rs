@@ -159,15 +159,28 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 /// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
 /// owns the load instead: its tape is the single-row AR forward, which no MTP
 /// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
+/// Under expert parallelism (`ep` > 1) the head is never attached: `auto`
+/// stays AR and an explicit `Some(true)` refuses naming EP.
 pub(crate) fn qwen4_native_mtp(
     spec: SpecLoadCfg,
     gpu_arch: &str,
     path: &str,
     pp: usize,
     tp: usize,
+    ep: usize,
 ) -> Result<bool, String> {
-    let retained =
-        hipfire_runtime::config::retained_redline_default(gpu_arch, "qwen4", path, pp, tp, true);
+    if ep > 1 {
+        return match spec.mtp {
+            Some(true) => Err(format!(
+                "qwen4: native MTP is not supported with expert parallelism (topology.ep = {ep}); \
+                 unset speculation.mtp or set topology.ep = 1 (HIPFIRE_QWEN4_EP=0)"
+            )),
+            _ => Ok(false),
+        };
+    }
+    let retained = hipfire_runtime::config::retained_redline_default(
+        gpu_arch, "qwen4", path, pp, tp, ep, true,
+    );
     match spec.mtp {
         Some(false) => Ok(false),
         Some(true) if retained => Err(
@@ -282,13 +295,124 @@ pub fn qwen4_request_admission(
     if native_mtp && !capabilities.native_mtp {
         return Err("qwen4: native MTP is not supported by this source".into());
     }
-    if !effective_mesh.is_single() {
+    if !effective_mesh.is_qwen4_admitted() {
         return Err(format!(
-            "qwen4: only Single topology is admitted (pp={}, tp={}, ep={})",
+            "qwen4: only pp=1, tp=1 with expert-parallel ep in {{1, 2, 4}} is admitted (pp={}, tp={}, ep={})",
             effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
         ));
     }
+    if effective_mesh.ep > 1 && native_mtp {
+        return Err(format!(
+            "qwen4: native MTP is not supported with expert parallelism (topology.ep = {})",
+            effective_mesh.ep
+        ));
+    }
     Ok(())
+}
+
+/// Qwen4 expert parallelism needs exact gfx1201 cards (the EP gather and the
+/// grouped MoE route are certified there) and one visible device per rank.
+/// Pre-allocation check from what admission already knows: the daemon's own
+/// device architecture and the visible device count (`None` skips the count,
+/// as in [`visible_device_count`]). `ep <= 1` never refuses. Per-device
+/// architectures and peer access are checked with real devices by
+/// [`qwen4_ep_preflight`] at load.
+pub(crate) fn qwen4_ep_geometry_refusal(
+    ep: usize,
+    pp: usize,
+    tp: usize,
+    gpu_arch: &str,
+    n_devices: Option<usize>,
+) -> Option<String> {
+    if ep <= 1 {
+        return None;
+    }
+    if pp != 1 || tp != 1 {
+        return Some(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) cannot combine with pipeline/tensor parallelism (pp={pp}, tp={tp})"
+        ));
+    }
+    if gpu_arch != "gfx1201" {
+        return Some(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1201 on every rank; device 0 is {gpu_arch}"
+        ));
+    }
+    match n_devices {
+        Some(n) if n < ep => Some(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {n} visible \
+             (hardware.devices / HIPFIRE_DEVICES)"
+        )),
+        _ => None,
+    }
+}
+
+/// Pure core of [`qwen4_ep_preflight`]: `archs[r]` is rank `r`'s device
+/// architecture; `peer(a, b)` is whether device `a` can access device `b`.
+/// Every rank must be gfx1201 and every directed pair must be accessible.
+pub fn qwen4_ep_device_refusal(
+    ep: usize,
+    archs: &[String],
+    mut peer: impl FnMut(usize, usize) -> Result<bool, String>,
+) -> Result<(), String> {
+    if archs.len() < ep {
+        return Err(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {} visible",
+            archs.len()
+        ));
+    }
+    for (rank, arch) in archs.iter().take(ep).enumerate() {
+        if arch != "gfx1201" {
+            return Err(format!(
+                "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1201 on every rank; rank {rank} is {arch}"
+            ));
+        }
+    }
+    for from in 0..ep {
+        for to in 0..ep {
+            if from != to && !peer(from, to)? {
+                return Err(format!(
+                    "qwen4: expert parallelism (topology.ep = {ep}) needs peer access between every pair of ranks; \
+                     device {from} cannot access device {to}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Load-time EP device check with real devices: devices `0..ep` of this
+/// process's HIP view (the `hardware.devices` order) must be visible, all
+/// gfx1201, and every directed pair must report `hipDeviceCanAccessPeer`.
+/// Returns the rank → HIP device id table (`rank r` runs on device `r`).
+pub fn qwen4_ep_preflight(hip: &hip_bridge::HipRuntime, ep: usize) -> Result<Vec<i32>, String> {
+    let count = hip
+        .device_count()
+        .map_err(|error| format!("qwen4: EP device count: {error}"))?
+        .max(0) as usize;
+    let archs = (0..count.min(ep))
+        .map(|device| {
+            hip.get_arch(device as i32)
+                .map(|arch| arch.split(':').next().unwrap_or("").to_string())
+                .map_err(|error| format!("qwen4: EP device {device} arch: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    qwen4_ep_device_refusal(ep, &archs, |from, to| {
+        hip.can_access_peer(from as i32, to as i32)
+            .map_err(|error| format!("qwen4: EP peer query {from}->{to}: {error}"))
+    })?;
+    Ok((0..ep as i32).collect())
+}
+
+/// The expert-parallel degree a loaded model of `arch_id` runs with: `1`
+/// everywhere except Qwen4 with `topology.ep` > 1 (and no `HIPFIRE_QWEN4_EP=0`
+/// kill switch). An invalid configured value was refused at admission, so it
+/// reads as `1` here.
+pub fn effective_ep(arch_id: u32) -> usize {
+    if arch_id == QWEN4_ARCH_ID {
+        hipfire_config::topology::qwen4_ep().unwrap_or(1)
+    } else {
+        1
+    }
 }
 
 /// Device memory a Qwen4 load keeps free beyond the growth it can name
@@ -1203,11 +1327,18 @@ pub fn admit_source_with_options(
         }
         let qwen4_kv =
             hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
-        let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
+        // Expert-parallel degree: `topology.ep`, forced to 1 by the
+        // `HIPFIRE_QWEN4_EP=0` kill switch. Resolved once, before any
+        // teardown, and re-resolved identically by the carrier at load.
+        let ep = hipfire_config::topology::qwen4_ep()?;
+        let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp, ep)?;
         let spec_mtp = options.spec.mtp;
-        crate::carrier_for(arch_id)
-            .ok_or_else(|| "no carrier for qwen4".to_string())?
-            .admit_options(draft_path, options)?;
+        let carrier = crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
+        crate::carriers::qwen4_ep_option_refusal(ep, draft_path, &options)?;
+        carrier.admit_options(draft_path, options)?;
+        if let Some(refusal) = qwen4_ep_geometry_refusal(ep, pp, tp, gpu_arch, visible_device_count()) {
+            return Err(refusal);
+        }
         // The PLE rows source is chosen (and a missing q4 derived from the
         // q8 rows or the embedded shards) here, before the resident model is
         // torn down: a refusal (missing sidecar, binding mismatch, no space)
@@ -1216,7 +1347,7 @@ pub fn admit_source_with_options(
         resolve_qwen4_ple_rows(&mut source, path, gpu_arch)?;
         let admitted = admit_qwen4_source(
             &source,
-            hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
+            hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep),
             InputModality::Text,
             native_mtp,
             spec_mtp,
@@ -1711,26 +1842,110 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         let (hfq, mq4r) = ("m/qwen3.8-flash-next.mq4", "m/qwen3.8-flash-next.mq4r");
-        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1), Ok(true));
+        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1, 1), Ok(true));
         assert_eq!(
-            qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1),
+            qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1, 1),
             Ok(false)
         );
         assert_eq!(
-            qwen4_native_mtp(with(Some(true)), "gfx1151", hfq, 1, 1),
+            qwen4_native_mtp(with(Some(true)), "gfx1151", hfq, 1, 1, 1),
             Ok(true)
         );
         // A `.mq4r` load on a retained-default GPU is the retained AR route.
         assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1),
+            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1, 1),
             Ok(false)
         );
-        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1).is_err());
+        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1, 1).is_err());
         // Off the retained-default GPUs the name does not claim the load.
         assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1),
+            qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1, 1),
             Ok(true)
         );
+        // Expert parallelism never attaches the head: `auto`/off stay AR, an
+        // explicit `on` refuses and names EP.
+        for ep in [2, 4] {
+            assert_eq!(qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep), Ok(false));
+            assert_eq!(
+                qwen4_native_mtp(with(Some(false)), "gfx1201", hfq, 1, 1, ep),
+                Ok(false)
+            );
+            let error = qwen4_native_mtp(with(Some(true)), "gfx1201", hfq, 1, 1, ep).unwrap_err();
+            assert!(error.contains("expert parallelism"), "{error}");
+        }
+    }
+
+    #[test]
+    fn qwen4_request_admission_matrix_covers_ep_pp_tp() {
+        use hipfire_arch_qwen4::EffectiveMesh;
+        let admit = |pp, tp, ep, mtp| {
+            qwen4_request_admission(EffectiveMesh::new(pp, tp, ep), InputModality::Text, mtp)
+        };
+        for ep in [1, 2, 4] {
+            assert_eq!(admit(1, 1, ep, false), Ok(()), "ep {ep}");
+        }
+        assert_eq!(admit(1, 1, 1, true), Ok(()));
+        for ep in [0, 3, 5, 8] {
+            assert!(admit(1, 1, ep, false).unwrap_err().contains("ep in {1, 2, 4}"), "ep {ep}");
+        }
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4)] {
+            assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
+        }
+        for ep in [2, 4] {
+            let error = admit(1, 1, ep, true).unwrap_err();
+            assert!(error.contains("expert parallelism") && error.contains("MTP"), "{error}");
+        }
+    }
+
+    #[test]
+    fn qwen4_ep_geometry_refusal_names_the_missing_requirement() {
+        assert_eq!(qwen4_ep_geometry_refusal(1, 1, 1, "gfx1100", Some(1)), None);
+        assert_eq!(qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(4)), None);
+        assert_eq!(qwen4_ep_geometry_refusal(2, 1, 1, "gfx1201", None), None);
+        let arch = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1100", Some(4)).unwrap();
+        assert!(arch.contains("gfx1201") && arch.contains("expert parallelism"), "{arch}");
+        let count = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(2)).unwrap();
+        assert!(count.contains("4 visible devices") && count.contains("2 visible"), "{count}");
+        assert!(qwen4_ep_geometry_refusal(2, 2, 1, "gfx1201", Some(2)).is_some());
+        assert!(qwen4_ep_geometry_refusal(2, 1, 2, "gfx1201", Some(2)).is_some());
+    }
+
+    #[test]
+    fn qwen4_ep_device_refusal_checks_arch_count_and_every_directed_pair() {
+        let gfx1201 = |n: usize| vec!["gfx1201".to_string(); n];
+        let all = |_: usize, _: usize| Ok(true);
+        assert_eq!(qwen4_ep_device_refusal(4, &gfx1201(4), all), Ok(()));
+        assert_eq!(qwen4_ep_device_refusal(2, &gfx1201(4), all), Ok(()));
+        // Too few devices.
+        assert!(qwen4_ep_device_refusal(4, &gfx1201(3), all).unwrap_err().contains("3 visible"));
+        // A different arch on rank 2 refuses and names the rank.
+        let mut mixed = gfx1201(4);
+        mixed[2] = "gfx1100".to_string();
+        let error = qwen4_ep_device_refusal(4, &mixed, all).unwrap_err();
+        assert!(error.contains("rank 2") && error.contains("gfx1100"), "{error}");
+        // An arch beyond the rank count is not part of the mesh.
+        assert_eq!(qwen4_ep_device_refusal(2, &mixed, all), Ok(()));
+        // Every directed pair is probed; one missing direction refuses.
+        let mut probed = Vec::new();
+        qwen4_ep_device_refusal(4, &gfx1201(4), |a, b| {
+            probed.push((a, b));
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(probed.len(), 12);
+        let error =
+            qwen4_ep_device_refusal(4, &gfx1201(4), |a, b| Ok(!(a == 3 && b == 1))).unwrap_err();
+        assert!(error.contains("device 3 cannot access device 1"), "{error}");
+        // A failed query is an error, not "no peer".
+        assert!(qwen4_ep_device_refusal(2, &gfx1201(2), |_, _| Err("hip".to_string()))
+            .unwrap_err()
+            .contains("hip"));
+    }
+
+    #[test]
+    fn effective_ep_is_one_for_other_archs() {
+        assert_eq!(effective_ep(5), 1);
+        assert_eq!(effective_ep(9), 1);
     }
 
     #[test]
