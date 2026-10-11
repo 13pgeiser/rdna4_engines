@@ -3759,3 +3759,49 @@ TEST(gemma4_scales_the_routing_weights_in_one_launch) {
             if (o.resolved) CHECK(o.uses_declared);
     }
 }
+
+/* The drafter's head reads the container's block-fp8 copy of the target's table where it holds one
+ * -- `dflash.draft_head.weight` -- through quant_act_fp8 and gemm_nt_q, and the bf16 table through
+ * gemm_nt where it does not. The copy is declared only in the first case, so a container converted
+ * without the recipe line is served exactly as before. */
+TEST(gemma4_dflash_head_reads_the_fp8_copy_where_the_container_holds_one) {
+    const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    for (int fp8 = 0; fp8 < 2; ++fp8) {
+        RadModelMeta meta = gemma4_moe_meta();
+        meta.n_kv   = (int)keys.size();
+        meta.kv_key = keys.data();
+        meta.kv_val = vals.data();
+        RadBuilder b;
+        if (fp8)
+            b.encs = { { "dflash.draft_head", rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128) } };
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_spec = 15;
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        CHECK_EQ(find_w(b, "dflash.draft_head.weight") != nullptr, fp8 == 1);
+
+        const int dlog = buf_named(b, "df_dlog"), selh = buf_named(b, "df_selh");
+        REQUIRE(dlog > 0 && selh > 0);
+        const RecOp* head = nullptr;
+        for (const auto& o : b.ops)
+            if (o.resolved &&
+                std::find(o.writes.begin(), o.writes.end(), (rad_buf)dlog) != o.writes.end())
+                head = &o;
+        REQUIRE(head != nullptr);
+        CHECK_EQ(head->op, std::string(fp8 ? "gemm_nt_q" : "gemm_nt"));
+        const bool reads_selh =
+            std::find(head->reads.begin(), head->reads.end(), (rad_buf)selh) != head->reads.end();
+        CHECK_EQ(reads_selh, fp8 == 0);
+
+        /* and a draft pass issues it */
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        batch.draft_pass = 1;
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        int head_issues = 0;
+        for (const auto& i : c.issues)
+            if (b.op_of(i.op) == head) ++head_issues;
+        CHECK_EQ(head_issues, 1);
+    }
+}

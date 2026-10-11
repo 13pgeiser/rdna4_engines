@@ -293,6 +293,7 @@ struct Model {
     Dflash1::Wire dfw{};
     rad_kvgroup   kv_draft = 0;
     bool          have_df = false;
+    const char*   tok_src = nullptr;   /* the checkpoint's table, which the fp8 draft head copies */
 
     std::vector<Layer> layers;
 };
@@ -515,7 +516,8 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
      * pitch of `steps` -- and the engine reads it by the declaration below. */
     dw.tokens = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {sr, 1});
 
-    RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft", dw));
+    RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft", dw,
+                              m.tok_src));
     m.have_df = true;
 
     RadDrafterDecl drf{};
@@ -539,11 +541,14 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
     rad_note(b, "the DFlash drafter is declared: %lld layers at absolute %d..%d (%d full, %lld "
                 "sliding over %lld causal), %lld heads / %lld kv x %lld, ffn %lld, reading the "
                 "trunk at %d tap(s). ONE forward over %lld rows proposes %lld tokens; the head is "
-                "the target's tied bf16 table, argmax %s",
+                "%s, argmax %s",
              (long long)dg.n_layer, base_layer, base_layer + (int)dg.n_layer - 1, nfull,
              (long long)(dg.n_layer - nfull), (long long)dc.window, (long long)dg.n_head,
              (long long)dg.n_head_kv, (long long)dg.head_dim, (long long)dg.n_ff, m.n_taps,
              (long long)dc.block, (long long)dc.steps(),
+             m.df.fp8_head
+                 ? "the container's block-fp8 copy of the target's table (dflash.draft_head)"
+                 : "the target's tied bf16 table",
              Dflash1::head_sharded(dg) ? "per vocab shard, merged" : "over the whole vocabulary");
     return RAD_OK;
 }
@@ -561,10 +566,7 @@ static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
     *fmt = EXP_BF16;
     if (!weight_enc(b, wn, &e)) return RAD_OK;
     if (rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16) return RAD_OK;
-    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
-    if (rad_enc_is(&e, "affine") && e.n_planes == 2 && !e.transform[0] &&
-        e.plane[0].dtype == RAD_F8E4M3 && sc && sc->dtype == RAD_BF16 &&
-        sc->block[0] == RAD_FP8_BLOCK && sc->block[1] == RAD_FP8_BLOCK) {
+    if (block_fp8_128(e)) {
         *fmt = EXP_FP8;
         return RAD_OK;
     }
@@ -916,7 +918,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the vocabulary edges: ONE table, row-sharded with the vocabulary, read as the embedding
      * by `embed_lookup` and as the head by `logits_gemm` -- Gemma ties them, so storing the head
      * a second time would be 1.4 GiB for nothing. */
-    RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), nm.ckpt("%s.embed_tokens.weight", L)));
+    m.tok_src = nm.ckpt("%s.embed_tokens.weight", L);
+    RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), m.tok_src));
     RAD_ARCH_TRY(map_copy(b, nm.f("output_norm.weight"), nm.ckpt("%s.norm.weight", L)));
     m.w_tok   = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, E}, RAD_ACCESS_VOCAB,
                        RAD_SHARD_ROW, grp_model());

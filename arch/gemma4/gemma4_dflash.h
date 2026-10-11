@@ -49,9 +49,19 @@
  * `pair_argmax`; R = 2 because the gather moves 16-byte rows, see kTopR).
  *
  * Reading the bf16 head every draft pass is the expensive way to do it -- 262144 x 2816 x 2 bytes
- * over the ranks. The cheaper way is the 2-bit copy plus an exact rerank that DFlash2 uses, and
- * that needs the trunk's head in fp8 or int8, which a tied Gemma head is not. Stated rather than
- * hidden: it is the first thing to change once the model runs.
+ * over the ranks, 566 us of a 26B-A4B decode step at tp 4 (--profile-ops, 4x R9700), the widest
+ * read on the draft path. So where the CONTAINER holds a block-fp8 copy of the table under a name
+ * of its own -- `dflash.draft_head.weight`, one checkpoint tensor and two logical weights, as
+ * rad_block_dflash2.h does it, made by a recipe line
+ *
+ *     dflash.draft_head.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+ *
+ * -- the head is `gemm_nt_q` over that copy at fp8a8, half the bytes, and the argmax is taken over
+ * its coarser logits. Every draft is still verified, so the copy can change what is proposed and
+ * never what is accepted; draft_n_accepted is what says whether it proposes worse. A container
+ * without it, or with it in any other encoding, reads the bf16 table as before. The copy costs
+ * half the table's bytes again, 176 MiB a rank at tp 4. No rerank against the bf16 table yet:
+ * DFlash2's needs the target's head in fp8 or int8, which a tied Gemma head is not.
  *
  * ============================== THE LINEARS ARE FP8 ==============================
  *
@@ -71,6 +81,15 @@
 namespace gemma4 {
 
 using namespace rad::arch;
+
+/* Block fp8 as libr4d's fp8a8 GEMMs read it: fp8_e4m3 codes, a bf16 scale a 128x128 block, no
+ * transform -- a recipe's `rtn codes=fp8_e4m3 block=128x128 scale=bf16`. */
+inline bool block_fp8_128(const RadEncoding& e) {
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    return rad_enc_is(&e, "affine") && e.n_planes == 2 && !e.transform[0] &&
+           e.plane[0].dtype == RAD_F8E4M3 && sc && sc->dtype == RAD_BF16 &&
+           sc->block[0] == RAD_FP8_BLOCK && sc->block[1] == RAD_FP8_BLOCK;
+}
 
 struct Dflash1 {
     enum { MAX_LAYERS = 8 };
@@ -97,6 +116,7 @@ struct Dflash1 {
         rad_buf ffn = 0, ffq = 0, ffs = 0;     /* [qrows, n_ff] */
         /* the head, one row a draft position */
         rad_buf sel_h = 0;                     /* [srows, n_embd] */
+        rad_buf selq = 0, sels = 0;            /* [srows, n_embd] e4m3 | f32, the fp8 head's */
         rad_buf dlog = 0;                      /* [srows, n_vocab on this rank] bf16 */
         rad_buf cand = 0, unary = 0;           /* [srows, kTopR] i32 | f32 -- this rank's best */
         rad_buf dpair = 0, dgath = 0;          /* [srows, kTopR, 2] | [srows, world * kTopR, 2] f32 */
@@ -114,6 +134,8 @@ struct Dflash1 {
     DenseFP8   w_fc{};
     rad_weight w_hnorm = 0, w_norm = 0;
     rad_weight w_tok = 0;                     /* the TARGET's table: embedding AND head */
+    DenseFP8   w_dh{};                        /* its block-fp8 copy, the head where it is stored */
+    bool       fp8_head = false;
     rad_weight w_anorm[MAX_LAYERS] = {}, w_fnorm[MAX_LAYERS] = {};
     DenseFP8   w_q[MAX_LAYERS]{}, w_k[MAX_LAYERS]{}, w_v[MAX_LAYERS]{}, w_o[MAX_LAYERS]{};
     rad_weight w_qn[MAX_LAYERS] = {}, w_kn[MAX_LAYERS] = {};
@@ -129,7 +151,7 @@ struct Dflash1 {
     rad_op op_gu[MAX_LAYERS] = {}, op_gug[MAX_LAYERS] = {}, op_dn[MAX_LAYERS] = {};
     rad_op op_qrope = 0, op_krope = 0, op_store = 0, op_attn_swa = 0, op_attn_full = 0;
     rad_op op_act = 0, op_ar = 0, op_add = 0, op_final = 0;
-    rad_op op_gather = 0, op_head = 0, op_topk = 0, op_dgather = 0, op_pick = 0;
+    rad_op op_gather = 0, op_qsel = 0, op_head = 0, op_topk = 0, op_dgather = 0, op_pick = 0;
 
     /* CANDIDATES A RANK CONTRIBUTES under a sharded head. The draft needs one, but the gather moves
      * whole 16-byte words a row and an (int32 id, f32 value) pair is 8 bytes, so R = 1 is refused at
@@ -140,7 +162,8 @@ struct Dflash1 {
     static bool head_sharded(const Geom& g) { return vocab_head_sharded(g); }
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int base_layer,
-                 rad_kvgroup group, rad_weight tok_embd, const char* ck, const Wire& wire);
+                 rad_kvgroup group, rad_weight tok_embd, const char* ck, const Wire& wire,
+                 const char* tok_src);
     void context(RadCtx* c, const RadBatch* batch) const;
     void step(RadCtx* c, const RadBatch* batch) const;
 
@@ -168,9 +191,9 @@ private:
 
 inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c,
                             int base_layer, rad_kvgroup group, rad_weight tok_embd,
-                            const char* ck, const Wire& wire) {
+                            const char* ck, const Wire& wire, const char* tok_src) {
     g = geom; cfg = c; w = wire; first_layer = base_layer; kv = group; w_tok = tok_embd;
-    if (!ck || !w_tok) return RAD_E_INVAL;
+    if (!ck || !w_tok || !tok_src) return RAD_E_INVAL;
     if (g.n_layer <= 0 || g.n_layer > MAX_LAYERS) {
         fprintf(stderr, "radiance: gemma4: the drafter has %lld layers; this block carries at most "
                         "%d\n", (long long)g.n_layer, MAX_LAYERS);
@@ -443,11 +466,43 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                  RAD_STR("dtype", g.dtype)),
                       RAD_NOWEIGHTS),
                   {w.h}, {w.sel_h});
-    op_head = rw(b, RAD_OP(b, "gemm_nt",
-                    RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", g.n_vocab),
-                               RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
-                    RAD_WEIGHTS(w_tok)),
-                {w.sel_h}, {w.dlog});
+    /* THE FP8 COPY, where the container holds one (see the top of this file). The name map comes
+     * first -- it is how the encoding is looked up -- and a map whose weight is never declared is
+     * written by nothing: rad-convert walks the declared weights. The copy is row-sharded exactly
+     * as the table is, so this rank's rows are the same vocabulary slice and `vocab_off` holds. */
+    const char* dhn = nm.f("dflash.draft_head.weight");
+    RAD_ARCH_TRY(map_copy(b, dhn, tok_src));
+    RadEncoding he{};
+    fp8_head = weight_enc(b, dhn, &he) && block_fp8_128(he);
+    if (fp8_head) {
+        if (g.n_vocab % RAD_FP8_BLOCK || g.n_embd % RAD_FP8_BLOCK) {
+            fprintf(stderr, "radiance: gemma4: the fp8 draft head is %lldx%lld a rank, which "
+                            "is not whole %d-row scale blocks\n",
+                    (long long)g.n_vocab, (long long)g.n_embd, RAD_FP8_BLOCK);
+            return RAD_E_INVAL;
+        }
+        const int shard = g.world > 1 ? RAD_SHARD_ROW : RAD_SHARD_NONE;
+        w_dh.w = decl_view(b, dhn, nullptr, "codes", RAD_F8E4M3, { g.n_vocab, g.n_embd },
+                           RAD_ACCESS_PER_TOKEN, shard, grp_model());
+        w_dh.s = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale", RAD_BF16,
+                           { fp8_blocks(g.n_vocab), fp8_blocks(g.n_embd) }, RAD_ACCESS_PER_TOKEN,
+                           shard, grp_model());
+        if (!w_dh.w || !w_dh.s) return RAD_E_INVAL;
+        w.selq = decl_b(b, nm.f("df_selq"), RAD_F8E4M3, {srows, g.n_embd});
+        w.sels = decl_b(b, nm.f("df_sels"), RAD_F32,    {srows, fp8_blocks(g.n_embd)});
+        op_qsel = rw(b, RAD_OP(b, "quant_act_fp8",
+                         RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("n", g.n_embd),
+                                    RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                         RAD_NOWEIGHTS),
+                     {w.sel_h}, {w.selq, w.sels});
+        op_head = w_dh.gemm(b, srows, g.n_vocab, g.n_embd, {w.selq, w.sels}, {w.dlog});
+    } else {
+        op_head = rw(b, RAD_OP(b, "gemm_nt",
+                        RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", g.n_vocab),
+                                   RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                        RAD_WEIGHTS(w_tok)),
+                    {w.sel_h}, {w.dlog});
+    }
     if (sharded) {
         op_topk = rw(b, RAD_OP(b, "row_topk",
                         RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", g.n_vocab),
@@ -575,7 +630,13 @@ inline void Dflash1::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t S = batch->n_out;
     if (S <= 0) return;
     RAD_ISSUE_N(c, op_gather, S, RAD_B(w.h), praw(batch->out_ids, RAD_I32, S), brows(w.sel_h, S));
-    RAD_ISSUE_N(c, op_head, S, brows(w.sel_h, S), RAD_W(w_tok), brows(w.dlog, S));
+    if (fp8_head) {
+        RAD_ISSUE_N(c, op_qsel, S, brows(w.sel_h, S), brows(w.selq, S), brows(w.sels, S));
+        RAD_ISSUE_N(c, op_head, S, brows(w.selq, S), brows(w.sels, S), RAD_W(w_dh.w),
+                    RAD_W(w_dh.s), brows(w.dlog, S), RAD_NONE, w_dh.bref());
+    } else {
+        RAD_ISSUE_N(c, op_head, S, brows(w.sel_h, S), RAD_W(w_tok), brows(w.dlog, S));
+    }
     if (sharded) {
         RAD_ISSUE_N(c, op_topk, S, brows(w.dlog, S), brows(w.cand, S), brows(w.unary, S),
                     brows(w.dpair, S));

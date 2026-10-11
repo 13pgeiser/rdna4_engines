@@ -511,6 +511,15 @@ The drafter's head is vocab-sharded with the trunk's: each rank's top-2 are all-
 `pair_argmax` picks the winner (two a rank, because a row-interleaved `all_gather` moves 16-byte
 words and one pair is 8 bytes).
 
+**The draft head in fp8.** The drafter's head is the widest read on the draft path: the target's
+bf16 table, 352 MiB a rank at tp 4, every draft pass. A container converted with the line
+`dflash.draft_head.weight rtn codes=fp8_e4m3 block=128x128 scale=bf16` (the three `-df` recipes
+carry it) stores a block-fp8 copy of the table under that name, and the head reads the copy at
+fp8a8 instead -- half the bytes, for 176 MiB a rank more. Drafts are verified, so the coarser
+logits can change what is proposed and never what is accepted; `draft_n_accepted` says whether
+they propose worse. A container without the copy reads the bf16 table as before, and the startup
+note names which head is in use.
+
 **FP8 experts.** The experts are ~90% of the weight bytes, so each projection is served as the
 container holds it, per layer: bf16 by `moe_gemm`, block fp8 by `moe_gemm_q`. gate_up `[1408, 2816]`
 is whole 64-row tiles and 128-blocks. down `[2816, 704]` is not — the fp8 grouped GEMM reads K in
