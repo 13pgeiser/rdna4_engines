@@ -2,6 +2,12 @@
 
 ## Unreleased (0.4.2)
 
+- **VMM continuous-batching serve: fewer synchronous uploads per step (`HIPFIRE_CB_UPLOAD_COALESCE=0` is the developer kill switch).** Every step re-uploaded each KV layer's slot-descriptor table with a blocking `hipMemcpy`, 16 per step on the 27B, even when nothing changed. The multi-request verify trunk also uploaded positions once per lane. Each blocking upload drains the device before the host can queue more work.
+  - Descriptor tables are now uploaded only when their bytes differ from a host mirror of the last successful upload (mapping or owner changes).
+  - The verify trunk writes all lanes' positions in one copy.
+  - Same device bytes at the same addresses before every reader.
+  - Same setup as the tape-copy entry below, on top of the entries above; interleaved on one binary against `=0`, 5 per arm: conc_steady C8 greedy 471.8 → 473.8 tok/s, +0.45 %, CS95 +0.12..+0.79 % on the 4 rounds whose base ran in fast mode (`predict ab`, below its 1 % default bar).
+  - Exactness: serve C8 greedy md5 `fa168ee2…` (and C1), BetterBench sampled `91bde7c5…`, `cb_vmm_state_oracle` passes.
 - **DFlash continuous-batching verify on gfx1201: save-free DeltaNet rollback (`HIPFIRE_CB_DN_SAVE_FREE=0` is the developer kill switch).** Before every verify, each lane copied its whole DeltaNet state into the rollback snapshot: S, scales, EF residual and conv ring, about 120 MB per lane per step on the 27B. Now each lane's live and snapshot buffer owners are exchanged on the host, so the pre-verify state already is the snapshot. The verify trunk reads it as its source and writes the new live bank:
   - The conv ring is byte-copied A → B inside the layer's existing `tape_copy_batched` launch (~5 % of the bytes the save moved). The unchanged in-place lane conv then runs on B. A `_from` conv twin was rejected because its gfx1201 codegen differed by a few ulp.
   - The recurrence runs `gated_delta_net_q8_fast_ml_from`.

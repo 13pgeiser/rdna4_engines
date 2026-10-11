@@ -285,6 +285,25 @@ pub(crate) fn cb_dn_save_free_enabled() -> bool {
     *CB_DN_SAVE_FREE
 }
 
+/// `HIPFIRE_CB_UPLOAD_COALESCE` (developer var; `0` is the kill switch):
+/// whether the continuous-batching step may skip or merge the tiny
+/// synchronous H2D uploads it issues every step. Two sites read it: the VMM
+/// executor's per-layer slot-descriptor tables (re-uploaded only when their
+/// bytes differ from what the device already holds) and the multi-lane CB
+/// verify's per-lane position uploads (one upload of every lane's positions).
+/// The device bytes before every reading kernel are identical either way; off
+/// restores one upload per layer / per lane. The draft-lane key positions land
+/// in separate per-lane scratch buffers and are never coalesced, so this
+/// switch does not touch `draft_forward_lanes`.
+static CB_UPLOAD_COALESCE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_UPLOAD_COALESCE").map_or(true, |v| v.trim() != "0")
+});
+
+/// Is the CB upload coalescing enabled for this process?
+pub(crate) fn cb_upload_coalesce_enabled() -> bool {
+    *CB_UPLOAD_COALESCE
+}
+
 /// `HIPFIRE_CB_LANE_FA_BATCH=0` (developer kill switch): every request runs
 /// its own FullAttention prep + fp8 KV write + VerifyAttn tile + reduce per
 /// layer (4+ launches per lane) instead of one launch per stage per layer
@@ -1092,8 +1111,26 @@ pub fn forward_prefill_batch_multi(
 
     let tokens: Vec<u32> = reqs.iter().flat_map(|r| r.tokens.iter().copied()).collect();
     batch_chunk_embed_tokens(gpu, weights, &tokens, s, pbs, total, dim, dim * 4, true, false, false, None, None)?;
-    for (r, view) in reqs.iter().zip(&views) {
-        batch_chunk_upload_positions(gpu, view, sem, r.start_pos, r.tokens.len(), None, false)?;
+    if cb_upload_coalesce_enabled() {
+        // One upload of every lane's positions. Each per-lane call below (all
+        // Sequential, no tree ctx, no active mask, not pre-uploaded) is a
+        // single `memcpy_htod` of `start_pos..start_pos + n` into its row view
+        // of `pbs.positions`, and the views are contiguous in lane order
+        // (`offs` = cumulative rows), so the concatenation written at offset 0
+        // of `pbs.positions` is the same bytes at the same addresses.
+        // `rope_positions` is written only for a tree ctx (None here).
+        let positions: Vec<i32> = reqs
+            .iter()
+            .flat_map(|r| (0..r.tokens.len()).map(move |i| (r.start_pos + i) as i32))
+            .collect();
+        debug_assert_eq!(positions.len(), total);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, positions.len() * 4) };
+        gpu.hip.memcpy_htod(&pbs.positions.buf, bytes)?;
+    } else {
+        for (r, view) in reqs.iter().zip(&views) {
+            batch_chunk_upload_positions(gpu, view, sem, r.start_pos, r.tokens.len(), None, false)?;
+        }
     }
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
