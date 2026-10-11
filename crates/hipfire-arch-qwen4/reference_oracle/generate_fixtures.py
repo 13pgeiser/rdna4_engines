@@ -12,6 +12,13 @@ Upstream parity usage::
     python3 crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py \
         --upstream-reference --out .codeinsight+research/qwen4/oracle --seed 3800
 
+Tiny full-stack profile usage (clean CPU venv; see ``QWEN4_PROFILES.md``)::
+
+    HIPFIRE_QWEN4_ORACLE_CACHE=~/.hipfire/datasets/cachequality-qwen4-upstream \
+    s0-cpu-venv/bin/python -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py \
+        --tiny-profile tiny-moe --out /tmp/qwen4-tiny-moe --seed 3800
+    ... --tiny-profile tiny-dense-dev --hidden-size 5120 --layers 1 --out /tmp/qwen4-tiny-dense-5120
+
 The default path implements only small synthetic tensors (plus optional
 selected BF16 PLE rows).  ``--source-bf16-slices`` accepts an NPZ with
 ``ple_row_ids`` (int64, ``[tokens,16]``) and ``ple_rows_bf16`` (uint16 BF16
@@ -742,13 +749,44 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--upstream-reference", action="store_true", help="execute exact SHA-verified Transformers/vLLM source snapshots with torch and range-read checkpoint slices")
     parser.add_argument("--cache-dir", help="bounded upstream cache (under ~/.hipfire/datasets or .codeinsight+research)")
     parser.add_argument("--self-test", action="store_true", help="validate synthetic preservation and rejection guards")
+    tiny = parser.add_argument_group("tiny full-stack profiles (see QWEN4_PROFILES.md; needs the clean CPU venv with torch/transformers/safetensors/tokenizers)")
+    tiny.add_argument("--tiny-profile", choices=("tiny-moe", "tiny-dense-dev"), help="write a complete tiny checkpoint (config, tokenizer, BF16 safetensors, per-op dumps, MTP, manifest) under --out")
+    tiny.add_argument("--hidden-size", type=int, default=16, help="tiny profile hidden size (5120 is accepted with 1-2 layers and the reduced projections)")
+    tiny.add_argument("--layers", type=int, default=2, help="tiny profile decoder layers (default 2; 1 = linear-attention layer only, no cached runs)")
+    tiny.add_argument("--ffn-intermediate", type=int, default=8, help="dense intermediate_size / MoE expert intermediate size")
+    tiny.add_argument("--experts", type=int, default=3, help="tiny-moe routed expert count")
+    tiny.add_argument("--top-k", type=int, default=2, help="tiny-moe experts per token")
+    tiny.add_argument("--shared-intermediate", type=int, default=8, help="tiny-moe shared expert intermediate size")
+    tiny.add_argument("--no-norm-topk-prob", action="store_true", help="tiny-moe: do not renormalise the selected router weights")
+    tiny.add_argument("--no-controls", action="store_true", help="skip the negative-control reruns")
     return parser
+
+
+def _tiny_options(args: argparse.Namespace):
+    try:
+        from .tiny_profiles import ProfileOptions
+    except ImportError:  # direct execution from this directory
+        from tiny_profiles import ProfileOptions  # type: ignore
+    return ProfileOptions(
+        profile_id=args.tiny_profile,
+        seed=args.seed,
+        hidden_size=args.hidden_size,
+        num_layers=args.layers,
+        ffn_intermediate_size=args.ffn_intermediate,
+        num_experts=args.experts,
+        top_k=args.top_k,
+        shared_intermediate_size=args.shared_intermediate,
+        norm_topk_prob=not args.no_norm_topk_prob,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.self_test and args.upstream_reference:
         print("qwen4 reference fixture generation failed: --self-test and --upstream-reference are exclusive", file=sys.stderr)
+        return 2
+    if args.tiny_profile and (args.self_test or args.upstream_reference or args.source_path):
+        print("qwen4 reference fixture generation failed: --tiny-profile is exclusive with --self-test, --upstream-reference and --source-bf16-slices", file=sys.stderr)
         return 2
     if not args.self_test and not args.out:
         print("qwen4 reference fixture generation failed: --out is required unless --self-test is used", file=sys.stderr)
@@ -758,11 +796,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             self_test(args.cache_dir)
             print("qwen4 reference fixture self-test passed")
             return 0
+        if args.tiny_profile:
+            try:
+                from .tiny_profiles import generate_profile
+            except ImportError:  # direct execution from this directory
+                from tiny_profiles import generate_profile  # type: ignore
+            manifest = generate_profile(args.out, _tiny_options(args), cache_dir=args.cache_dir, controls=not args.no_controls)
+            print(f"wrote tiny profile {args.tiny_profile} ({manifest['checkpoint']['safetensors']['tensor_count']} tensors, {len(manifest['dumps'])} dump files) to {Path(args.out)}")
+            print(f"manifest: {Path(args.out) / 'manifest.json'}")
+            return 0
         if args.upstream_reference:
             manifest = generate_upstream(args.out, args.seed, args.cache_dir)
         else:
             if args.cache_dir:
-                raise FixtureError("--cache-dir is only valid with --upstream-reference or --self-test")
+                raise FixtureError("--cache-dir is only valid with --upstream-reference, --tiny-profile or --self-test")
             manifest = generate(args.out, args.seed, args.source_path)
     except (FixtureError, OSError, ValueError) as exc:
         print(f"qwen4 reference fixture generation failed: {exc}", file=sys.stderr)
