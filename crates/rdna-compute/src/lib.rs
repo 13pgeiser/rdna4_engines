@@ -87,6 +87,8 @@ pub use dispatch::{
     MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES, MQ4V2_GROUP_BYTES,
     MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES, VmmPrefixSet, VmmPrefixSpec, VmmResourceMove,
 };
+#[cfg(target_os = "linux")]
+pub use dispatch::{ExportedWeightAllocation, ImportedWeightAllocationDesc, EXPORT_WEIGHT_TAIL_PAD_BYTES};
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};
 use hipfire_config::developer_bool;
