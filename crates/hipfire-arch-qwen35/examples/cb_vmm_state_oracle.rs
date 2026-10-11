@@ -6,7 +6,13 @@
 //!     --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>]
 //!     [--phase all|singleton|probe] [--stop-repeats N] [--drift-cycles N]
 //!     [--spec off|mtp|dflash|mixed] [--mtp-head <path>]
-//!     [--dflash-draft <path>] [--dflash-probe-window <N>] [--dflash-block <4..16>]
+//!     [--dflash-draft <path>] [--dflash-probe-window <N>] [--dflash-block <4..16>] [--max-lanes <N>]
+//!
+//! `--dflash-block N` runs Gate 0 at proposal width N (`speculation.dflash_block`);
+//! every full block, aggregate and draft-batch expectation derives from it.
+//! `--max-lanes N` skips the cases that need more than N lanes open at once
+//! (at B=8 the 129-row over-cap control needs 17) and lists them in
+//! `lane_capped_cases`; the graph-refusal control is capped to N full blocks.
 //!
 //! DFlash Gate 0 (`--spec dflash|mixed`): a one-window replay probe. For each
 //! lane the isolated singleton `DflashSpeculator` (prefill + `N` full-block
@@ -152,6 +158,9 @@ struct Args {
     /// DFlash2 proposal width (`--dflash-block`, `speculation.dflash_block`;
     /// default 16). Every Gate 0 case derives its full block from it.
     dflash_block: usize,
+    /// Gate 0: skip cases needing more than N simultaneously open lanes
+    /// (`--max-lanes`, default unbounded); listed in `lane_capped_cases`.
+    max_lanes: Option<usize>,
     /// MTP head sidecar (default: model path with extension `mtp`).
     mtp_head: Option<PathBuf>,
     /// Aggregate verify-row totals of the wide-route fixtures (`--aggregates`,
@@ -191,7 +200,7 @@ fn parse_args() -> Result<Args> {
                  --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>] \
                  [--phase all|singleton|probe] [--stop-repeats N] [--drift-cycles N] \
                  [--spec off|mtp|dflash|mixed] [--mtp-head <path>] \
-                 [--dflash-draft <path>] [--dflash-probe-window <N>] [--dflash-block <4..16>] \
+                 [--dflash-draft <path>] [--dflash-probe-window <N>] [--dflash-block <4..16>] [--max-lanes <N>] \
                  [--aggregates 63,64,65,96,128|off] [--peer <other run's absolute artifacts dir>] \
                  [--emit-candidates 0|1] [--emit-refs 0|1]";
     let mut batch = true;
@@ -201,6 +210,7 @@ fn parse_args() -> Result<Args> {
     let mut ar_phase = true;
     let (mut dflash_draft, mut dflash_probe_window) = (None, None);
     let mut dflash_block: Option<usize> = None;
+    let mut max_lanes: Option<usize> = None;
     let mut aggregates = vec![63usize, 64, 65, 96, 128];
     let mut aggregates_given = false;
     let (mut peer, mut emit_candidates, mut emit_refs) = (None::<PathBuf>, false, false);
@@ -238,6 +248,7 @@ fn parse_args() -> Result<Args> {
                 }
                 dflash_block = Some(b);
             }
+            "--max-lanes" => max_lanes = Some(val.parse::<usize>()?.max(1)),
             "--aggregates" => {
                 aggregates_given = true;
                 aggregates = if val == "off" { Vec::new() } else { parse_list(val)? };
@@ -279,8 +290,8 @@ fn parse_args() -> Result<Args> {
         if !draft.is_file() {
             return Err(format!("--dflash-draft {} is not a file", draft.display()).into());
         }
-    } else if dflash_draft.is_some() || dflash_probe_window.is_some() || dflash_block.is_some() {
-        return Err("--dflash-draft / --dflash-probe-window / --dflash-block require --spec dflash|mixed".into());
+    } else if dflash_draft.is_some() || dflash_probe_window.is_some() || dflash_block.is_some() || max_lanes.is_some() {
+        return Err("--dflash-draft / --dflash-probe-window / --dflash-block / --max-lanes require --spec dflash|mixed".into());
     }
     let dflash_block = dflash_block.unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT);
     if !spec.dflash() && (aggregates_given || peer.is_some() || emit_candidates || emit_refs) {
@@ -299,7 +310,7 @@ fn parse_args() -> Result<Args> {
     }
     Ok(Args {
         model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats, drift_cycles,
-        spec, ar_phase, dflash_draft, dflash_probe_window, dflash_block, mtp_head, aggregates, peer, emit_candidates, emit_refs,
+        spec, ar_phase, dflash_draft, dflash_probe_window, dflash_block, max_lanes, mtp_head, aggregates, peer, emit_candidates, emit_refs,
     })
 }
 
@@ -4438,7 +4449,10 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
     // Graph-refusal-before-mutation: the largest admitted aggregate with the
     // capture / recording arms engaged on both explicit entries, then the
     // real window on the same lanes (a refusal must not have poisoned them).
-    let gtotal = if wide.route_cap() > MULTI_CHUNK_PRODUCT_MAX_ROWS { wide.route_cap() } else { MULTI_CHUNK_PRODUCT_MAX_ROWS };
+    let mut gtotal = if wide.route_cap() > MULTI_CHUNK_PRODUCT_MAX_ROWS { wide.route_cap() } else { MULTI_CHUNK_PRODUCT_MAX_ROWS };
+    if let Some(m) = args.max_lanes {
+        gtotal = gtotal.min(m * block);
+    }
     cases.push(G0CaseSpec {
         name: format!("ctl_graph_refusal_{gtotal}"),
         specs: lane_specs(&lane_blocks(gtotal, block)?, block, n),
@@ -4448,6 +4462,20 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
         arms: vec![GraphArm::CaptureMode, GraphArm::ReplayRecording],
         late: true,
     });
+    // `--max-lanes N`: cases needing more than N simultaneously open lanes
+    // (e.g. the 129-row over-cap control at B=8 = 17 lanes) are not run and
+    // are listed in the receipt; production steps never exceed the serve's
+    // `continuous_batch_size` lanes.
+    let mut lane_capped: Vec<String> = Vec::new();
+    if let Some(m) = args.max_lanes {
+        cases.retain(|c| {
+            let keep = c.specs.len() <= m;
+            if !keep {
+                lane_capped.push(format!("{} ({} lanes)", c.name, c.specs.len()));
+            }
+            keep
+        });
+    }
     let mut refs = G0Refs::default();
     let mut rows = Vec::new();
     let mut pass = true;
@@ -4499,16 +4527,17 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
         let late: Vec<&G0CaseSpec> = cases.iter().filter(|c| c.late).collect();
         run_err = run_case_list(&mut gpu, &mut slot, &mut d, &cfg, fx, &mut refs, &mut sc, &opts, &late, &mut rows, &mut pass);
     }
-    // Actual chunking at C8 (eight whole 16-row blocks = 128 rows): ONE
-    // 128-row chunk on the wide route, else the product packing.
-    let c8 = rows.iter().find(|c| c["case"] == "agg128_product").map(|c| c["wide"]["chunk_rows"].clone());
+    // Actual chunking at C8 (eight whole full blocks, 128 rows at B=16 and
+    // 64 at B=8): ONE chunk on the wide route, else the product packing.
+    let c8_rows = 8 * block;
+    let c8 = rows.iter().find(|c| c["case"] == format!("agg{c8_rows:03}_product").as_str()).map(|c| c["wide"]["chunk_rows"].clone());
     let c8_json = match &c8 {
         Some(got) => {
             let want: Vec<usize> = if wide.family != WideFamily::Off {
-                vec![128]
+                vec![c8_rows]
             } else {
                 let mut r = Vec::new();
-                match pack_whole_lanes(&vec![block; 128 / block], wide.route_cap(), &mut r) {
+                match pack_whole_lanes(&vec![block; 8], wide.route_cap(), &mut r) {
                     Ok(()) => r.iter().map(|x| (x.end - x.start) * block).collect(),
                     Err(_) => Vec::new(),
                 }
@@ -4564,6 +4593,7 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
         "cases": rows,
         "draft_batch": draft_rows,
         "error": run_err,
+        "lane_capped_cases": lane_capped,
         "unexercised": {
             "dflash_executor_k1_8": "not exercised by this probe: it drives the shared trunk/head/accept entries (direct and dflash_cb_verify product packing) over replayed pre-window states, not the VMM DFlash engine's planner/executor; engine-level and serve cases are the HTTP gates",
             "mixed_mtp_dflash_trunk": "MTP lanes (fusion=Off) in a shared DFlash chunk need the tagged driver (slice C)",
