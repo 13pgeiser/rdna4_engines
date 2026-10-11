@@ -1862,6 +1862,27 @@ pub struct Qwen4RootWeights {
     pub final_hyper: HyperConnectionReadWeights,
 }
 
+/// Expert-parallel placement of one rank: routed experts are sharded by id,
+/// expert `e` lives on rank `e % ranks` at compact local index `e / ranks`
+/// (owned experts in ascending id order). Everything else is replicated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4EpPlacement {
+    pub rank: usize,
+    pub ranks: usize,
+}
+
+impl Qwen4EpPlacement {
+    /// Whether this rank owns routed expert `expert`.
+    pub fn owns(self, expert: usize) -> bool {
+        expert % self.ranks == self.rank
+    }
+
+    /// Compact local index of an owned expert.
+    pub fn local_index(self, expert: usize) -> usize {
+        expert / self.ranks
+    }
+}
+
 /// Published resident ownership.  External PLE descriptors remain in the
 /// attached transaction census; no fake handle is stored here.
 pub struct Qwen4Weights {
@@ -1874,6 +1895,10 @@ pub struct Qwen4Weights {
     pub layer_refs: Vec<Qwen4LayerWeights>,
     /// `Some` iff `config.mtp` is declared.
     pub mtp: Option<Qwen4MtpWeights>,
+    /// `Some` iff the routed experts were uploaded expert-sharded for one
+    /// rank of an expert-parallel mesh (compact tensors of `512 / ranks`
+    /// experts); `None` on the single-device route.
+    ep: Option<Qwen4EpPlacement>,
 }
 
 impl Qwen4Weights {
@@ -1942,7 +1967,14 @@ impl Qwen4Weights {
             root,
             layer_refs,
             mtp,
+            ep: None,
         })
+    }
+
+    /// The expert-parallel placement these weights were assembled for, or
+    /// `None` on the single-device route.
+    pub fn ep_placement(&self) -> Option<Qwen4EpPlacement> {
+        self.ep
     }
 
     /// Resolve one immutable typed reference to its resident GPU buffer.
