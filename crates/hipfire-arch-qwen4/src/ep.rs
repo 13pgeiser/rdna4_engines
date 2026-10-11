@@ -25,7 +25,11 @@ use hipfire_dispatch::families::moe::MoeRowGather;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::ep_row_gather::{EpRowGather, EpRowGatherSpec};
 use hipfire_runtime::sampler::PenaltyTable;
-use hipfire_runtime::session_cache::SessionRoute;
+use hipfire_runtime::serve_contract::{
+    sha256_len_prefixed, ArchPolicy, CacheDomain, DeviceTopology, KvLayout, SharingNamespace,
+    TemplateIdentity, TokenizerIdentity,
+};
+use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -849,7 +853,8 @@ impl Qwen4Bundle {
                     let fingerprint = fingerprint.clone();
                     Box::new(move |rank: usize| {
                         let placement = Qwen4EpPlacement { rank, ranks };
-                        let (gpu, bundle) = loader(device, placement)?;
+                        let (gpu, mut bundle) = loader(device, placement)?;
+                        align_peer_session(&mut bundle, placement, &fingerprint);
                         let peer = Qwen4EpPeer {
                             rank,
                             gpu,
@@ -1251,6 +1256,58 @@ impl Qwen4Bundle {
             cap = lowest;
         }
     }
+}
+
+/// A peer loads without rank 0's tokenizer, so it has no session cache and no
+/// `<|im_end|>` id. Every rank plans prefill boundaries and snapshots from the
+/// same host configuration, so give the peer a cache of rank 0's budget and
+/// rank 0's turn settings. Its cache domain only keys that peer's own cache.
+fn align_peer_session(
+    bundle: &mut Qwen4Bundle,
+    placement: Qwen4EpPlacement,
+    rank0: &ReplicaFingerprint,
+) {
+    if rank0.session_cache && bundle.session_cache().is_none() {
+        let tag = format!("rank{}/{}", placement.rank, placement.ranks);
+        let digest = sha256_len_prefixed(&[b"qwen4-ep-peer-session-cache", tag.as_bytes()]);
+        let domain = CacheDomain {
+            model_content_digest: digest.clone(),
+            model_load_epoch: 1,
+            sidecar_digests: Vec::new(),
+            tokenizer: TokenizerIdentity {
+                vocab_digest: digest.clone(),
+                config_digest: digest.clone(),
+            },
+            template: TemplateIdentity {
+                template_digest: digest,
+                normalization_tag: "ep-peer".to_string(),
+            },
+            arch_policy: ArchPolicy {
+                arch_tag: "qwen4".to_string(),
+                state_abi_tag: String::new(),
+                position_attention_tag: String::new(),
+            },
+            kv_layout: KvLayout {
+                k_stride_bytes: Vec::new(),
+                v_stride_bytes: Vec::new(),
+                layout_tag: String::new(),
+            },
+            device: DeviceTopology {
+                device_id: format!("ep-{tag}"),
+                topology_id: "ep".to_string(),
+                allocation_epoch: 1,
+            },
+            namespace: SharingNamespace {
+                domain_id: "default".to_string(),
+            },
+        };
+        bundle.attach_session_cache(SessionCache::new(
+            domain,
+            hipfire_config::memory::session_cache_bytes(),
+        ));
+    }
+    bundle.set_turn_end_token(rank0.turn_end_token);
+    bundle.set_turn_snapshots(rank0.turn_snapshots);
 }
 
 fn rank_sources(bundle: &Qwen4Bundle) -> Result<Vec<Qwen4PeerExpertSource>, String> {
