@@ -4425,6 +4425,12 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.gfx12.hip");
+/// gfx12 MQ4G256V2 OVERWRITE twin of GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC
+/// (`Y = acc + 0.0f`, no pre-zero fill; byte-identical to memset + `Y += acc`).
+/// Symbol `gemm_mq4g256v2_overwrite_wmma_gfx12`. Used by the gfx1201 DFlash
+/// draft route (`dflash_draft_fusion.rs`).
+pub const GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_overwrite_wmma.gfx12.hip");
 /// gfx11 (RDNA3 / RDNA3.5) MQ4V2 residual WMMA — sister of
 /// GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC. Same dual-half header contract
 /// (136 B groups, [s0,z0,s1,z1] fp16 headers, payload +8, kt<8 half0) but
@@ -5560,6 +5566,13 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_VT_SRC: &str = concat!(
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_VT_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx12_vt_core.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx12_vt.hip"),
+);
+/// Verify-tile (16 < N < 64) overwrite twin of
+/// GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_VT_SRC; same symbol grid with prefix
+/// `gemm_mq4g256v2_overwrite_wmma_gfx12`.
+pub const GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_VT_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx12_vt_core.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_overwrite_wmma_gfx12_vt.hip"),
 );
 /// gfx11 (RDNA3 / RDNA3.5) MQ4V2 qkv WMMA — sister of
 /// GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract but

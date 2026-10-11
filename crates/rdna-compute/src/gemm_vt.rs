@@ -420,6 +420,35 @@ impl Gpu {
         )
     }
 
+    /// Overwrite twin of [`Self::gemm_mq4g256v2_residual_wmma_gfx12_vt`]
+    /// (`Y = W @ X`, no pre-zero fill; store is `acc + 0.0f`, bit-identical to
+    /// memset + `Y += acc`). Same symbol/geometry selection and ABI; used by
+    /// the gfx1201 DFlash draft route (`gemm_mq4g256v2_overwrite_gfx12_dflash`).
+    pub(crate) fn gemm_mq4g256v2_overwrite_wmma_gfx12_vt(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let x_f16 = self.ensure_fp16_x(x, batch_size * k)?;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4;
+        self.launch_gemm_vt(
+            "gemm_mq4g256v2_overwrite_wmma_gfx12_vt",
+            kernels::GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_VT_SRC,
+            vt_symbols!("gemm_mq4g256v2_overwrite_wmma_gfx12"),
+            m,
+            batch_size,
+            vec![a_raw.buf.as_ptr(), x_f16, y.buf.as_ptr()],
+            vec![m as i32, k as i32, batch_size as i32],
+            bytes,
+        )
+    }
+
     /// Rows of one aggregated exact verify chunk this GPU admits: 128 on exact
     /// gfx1201 when `HIPFIRE_CB_VERIFY_CHUNK128` (default off) and
     /// `HIPFIRE_WMMA_BATCH_TILES` are both on, otherwise the historical 63.

@@ -206,6 +206,29 @@ fn gemm_mq_batched_lmhead(
     }
 }
 
+/// [`gemm_mq_batched_lmhead`] for the DFlash **draft** head: first the draft
+/// GEMM layer's overwrite route ([`dflash::draft_lm_head_overwrite`], exact
+/// gfx1201 MQ4G256V2, byte-identical to the memset + residual pair it
+/// replaces; `HIPFIRE_DRAFT_COLLAPSE_OFF=1` vetoes it), else the shared
+/// launcher.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn gemm_mq_batched_lmhead_draft(
+    gpu: &mut Gpu,
+    dtype: rdna_compute::DType,
+    w_buf: &GpuTensor,
+    rotated: &GpuTensor,
+    logits: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+) -> HipResult<()> {
+    if dflash::draft_lm_head_overwrite(gpu, dtype, w_buf, rotated, logits, m, k, batch)? {
+        return Ok(());
+    }
+    gemm_mq_batched_lmhead(gpu, dtype, w_buf, rotated, logits, m, k, batch)
+}
+
 fn dflash_moe_verify_graph_lmhead_enabled_from_env_value(value: Option<&str>) -> bool {
     match value {
         Some(v) => {
@@ -6104,7 +6127,7 @@ pub(crate) fn draft_dflash_block_rank(
                 );
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gemm_mq_batched_lmhead(
+                gemm_mq_batched_lmhead_draft(
                     gpu,
                     w_out.gpu_dtype,
                     &w_out.buf,
@@ -6420,7 +6443,7 @@ pub fn draft_dflash_blocks_batched(
     let logits_all = head.logits.sub_offset(0, rows * vocab);
     let rotated = head.rot.sub_offset(0, rows * h);
     llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_all, &rotated, h, rows)?;
-    gemm_mq_batched_lmhead(gpu, w_out.gpu_dtype, &w_out.buf, &rotated, &logits_all, w_out.m, w_out.k, rows)?;
+    gemm_mq_batched_lmhead_draft(gpu, w_out.gpu_dtype, &w_out.buf, &rotated, &logits_all, w_out.m, w_out.k, rows)?;
 
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
     if draft_weights.has_candidate_selector() {
@@ -6896,7 +6919,7 @@ pub fn spec_step_dflash(
                     );
                     let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                     llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gemm_mq_batched_lmhead(
+                    gemm_mq_batched_lmhead_draft(
                         gpu,
                         w_out.gpu_dtype,
                         &w_out.buf,
@@ -8635,7 +8658,7 @@ fn run_dflash_draft_for_logits(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gemm_mq_batched_lmhead(
+            let r2 = gemm_mq_batched_lmhead_draft(
                 gpu,
                 w_out.gpu_dtype,
                 &w_out.buf,
@@ -8988,7 +9011,7 @@ fn run_dflash_draft_for_topk_gpu(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gemm_mq_batched_lmhead(
+            let r2 = gemm_mq_batched_lmhead_draft(
                 gpu,
                 w_out.gpu_dtype,
                 &w_out.buf,

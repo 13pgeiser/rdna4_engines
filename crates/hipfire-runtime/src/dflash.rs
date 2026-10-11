@@ -2224,6 +2224,30 @@ fn gemm_dispatch_mq4_collapsed(
     chunked
 }
 
+/// Draft lm_head on FWHT-rotated draft rows (`rotated` `[rows, k]` → `logits`
+/// `[rows, m]`), routed through this draft-GEMM layer like [`gemm_dispatch`]'s
+/// MQ4G256V2 arm: on exact gfx1201 an MQ4G256V2 head runs the in-kernel-zeroing
+/// overwrite twin (`Gpu::gemm_mq4g256v2_overwrite_gfx12_dflash`, bit-identical to
+/// the `hipMemset` pre-zero + residual lm_head it replaces;
+/// `HIPFIRE_DRAFT_COLLAPSE_OFF=1` vetoes it). `Ok(false)` = not admitted and
+/// nothing launched: the caller runs its batched lm_head launcher unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_lm_head_overwrite(
+    gpu: &mut Gpu,
+    dtype: DType,
+    w_buf: &GpuTensor,
+    rotated: &GpuTensor,
+    logits: &GpuTensor,
+    m: usize,
+    k: usize,
+    rows: usize,
+) -> HipResult<bool> {
+    if dtype != DType::MQ4G256V2 {
+        return Ok(false);
+    }
+    gpu.gemm_mq4g256v2_overwrite_gfx12_dflash(w_buf, rotated, logits, m, k, rows)
+}
+
 /// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
 /// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
 /// HFQ4-G256 GEMM kernel against the pre-rotated weights.
@@ -2359,9 +2383,11 @@ fn gemm_dispatch(
             // correct; rotation is identical FWHT path.
             // S7: per-chunk route — chunks that hit the gfx1100 ksplit tier
             // (batch 2..=16, default policy) rotate to F16 and run the
-            // overwrite ksplit GEMM; everything else (n==1 GEMV tails,
-            // chunked first-call prefixes, capture/replay, kill switch)
-            // keeps the legacy loop byte-for-byte.
+            // overwrite ksplit GEMM. On gfx1201 the `Off` branch first tries
+            // the in-kernel-zeroing overwrite WMMA twin (batch 2..=63, no
+            // memset); everything else (n==1 GEMV tails, chunked first-call
+            // prefixes, capture/replay, kill switch) keeps the legacy loop
+            // byte-for-byte.
             let scratch_f16 = mq_x_rot_f16;
             let max_chunk = (mq_x_rot
                 .expect("MQ4V2 dispatch requires mq_x_rot scratch")
@@ -2394,11 +2420,26 @@ fn gemm_dispatch(
                             chunked = Err(e);
                             break;
                         }
-                        if let Err(e) = gpu
-                            .gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
-                        {
-                            chunked = Err(e);
-                            break;
+                        // gfx1201: overwrite twin of the one-tile / verify-tile
+                        // residual kernel (no pre-zero fill, byte-identical).
+                        // `Ok(false)` = not admitted, device untouched: run the
+                        // legacy memset + residual lm_head launcher unchanged.
+                        match gpu.gemm_mq4g256v2_overwrite_gfx12_dflash(
+                            &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Err(e) = gpu.gemm_mq4g256v2_batched_lmhead(
+                                    &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
+                                ) {
+                                    chunked = Err(e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                chunked = Err(e);
+                                break;
+                            }
                         }
                     } else {
                         let scratch =

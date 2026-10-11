@@ -586,7 +586,9 @@ pub struct FeatureFlags {
     pub gdn_pre_fuse_off: bool,
     /// S6: `HIPFIRE_FA_BATCH_FUSE_OFF=1` restores unbatched FA prep/KV writes.
     pub fa_batch_fuse_off: bool,
-    /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings.
+    /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings. Also
+    /// vetoes the gfx1201 DFlash draft overwrite-GEMM route
+    /// (`gemm_mq4g256v2_overwrite_gfx12_dflash`), restoring memset + residual.
     pub draft_collapse_off: bool,
     /// S8: `HIPFIRE_DDTREE_TOPK_DIRECT_OFF=1` restores full-logits top-K.
     pub ddtree_topk_direct_off: bool,

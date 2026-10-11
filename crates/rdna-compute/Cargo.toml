@@ -893,6 +893,10 @@ name = "mq4_rows_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "draft_overwrite_gfx12_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_mq4_x4_pm_oracle"
 required-features = ["lab"]
 
