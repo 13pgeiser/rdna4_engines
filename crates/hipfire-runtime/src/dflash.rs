@@ -1537,6 +1537,11 @@ pub struct DflashScratch {
     // Positions (i32).
     pub positions_q: GpuTensor, // [B]       i32
     pub positions_k: GpuTensor, // [L + B]   i32
+    /// Host staging of the concatenated query positions of a batched lane
+    /// draft (`draft_forward_lanes` on the shared scratch). Capacity
+    /// `max_block_size`, reserved once and never grown, so the upload source
+    /// has a stable owned address (a captured upload bakes it).
+    pub lane_positions_q: Vec<i32>,
 
     // FWHT rotation scratch for MQ4 weight paths. Sized to the largest
     // single-call requirement: max(max_ctx × num_extract*hidden,
@@ -1946,6 +1951,7 @@ impl DflashScratch {
 
             positions_q: take!(i_positions_q),
             positions_k: take!(i_positions_k),
+            lane_positions_q: Vec::with_capacity(b),
 
             mq_x_rot: i_mq_x_rot.map(|j| take!(j)),
             mq_x_rot_f16: i_mq_x_rot_f16.map(|j| take!(j)),
@@ -2694,10 +2700,54 @@ fn upload_slice_f32(gpu: &Gpu, dst: &GpuTensor, data: &[f32]) -> HipResult<()> {
 }
 
 /// Upload i32 slice into a GPU tensor (interpreted as i32 by kernels).
+/// Synchronous outside hipGraph capture; while capturing it is enqueued on
+/// the capturing stream (`Gpu::memcpy_htod_auto`), which bakes `data`'s host
+/// address into the graph: a replaying owner keeps that storage alive and
+/// rewrites it in place before each launch.
 fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    gpu.hip.memcpy_htod(&dst.buf, bytes)
+    gpu.memcpy_htod_auto(&dst.buf, bytes)
+}
+
+/// `HIPFIRE_DFLASH_ORDERED_DRAFT=0` (developer kill switch): the draft
+/// body's D2D copies (residual saves, context/noise K/V concatenation) go
+/// back to the synchronous `hipMemcpy` on the null stream, and the batched
+/// lane draft uploads its key positions between the lane fc GEMMs again.
+/// Default on: the copies are enqueued on the execution stream
+/// (`Gpu::memcpy_dtod_at_ordered_async`) ahead of their consumer kernels and
+/// the host no longer drains the queue per copy. Same bytes, same ranges,
+/// same order on the stream as every producer and consumer kernel.
+static ORDERED_DRAFT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_ORDERED_DRAFT").map_or(true, |v| v.trim() != "0")
+});
+
+/// Whether the draft body runs its D2D copies stream-ordered
+/// ([`ORDERED_DRAFT`]); resolved once per process.
+pub(crate) fn ordered_draft() -> bool {
+    *ORDERED_DRAFT
+}
+
+/// One draft-body D2D copy. `ordered`: enqueued on the active stream (the
+/// null stream when none is set), where every producer of `src` and every
+/// consumer of `dst` in the draft body also runs, so no host wait is needed
+/// and the source cannot be rewritten before the copy executes. Otherwise
+/// the historical host-synchronous copy.
+#[track_caller]
+fn draft_dtod_at(
+    gpu: &Gpu,
+    ordered: bool,
+    dst: &DeviceBuffer,
+    dst_offset: usize,
+    src: &DeviceBuffer,
+    src_offset: usize,
+    bytes: usize,
+) -> HipResult<()> {
+    if ordered {
+        gpu.memcpy_dtod_at_ordered_async(dst, dst_offset, src, src_offset, bytes)
+    } else {
+        gpu.hip.memcpy_dtod_at(dst, dst_offset, src, src_offset, bytes)
+    }
 }
 
 /// Rows per chunk for the windowed-mode post-seed backfill.
@@ -3137,6 +3187,7 @@ pub fn draft_forward_opts(
     // ── 2. Per-layer decoder ─────────────────────────────────────────────
     // DFlash2 all-sliding detection for windowed mode branching.
     let is_all_sliding_windowed = windowed && cfg.all_layers_sliding;
+    let ordered = ordered_draft();
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
 
@@ -3154,8 +3205,7 @@ pub fn draft_forward_opts(
             )?;
         } else {
             // Residual.
-            gpu.hip
-                .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+            draft_dtod_at(gpu, ordered, &scratch.residual.buf, 0, &scratch.x.buf, 0, (b * h) * 4)?;
             // attn_norm.
             gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
         }
@@ -3412,14 +3462,18 @@ pub fn draft_forward_opts(
         let mut cat_off = 0usize;
         for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
             let seg_bytes = len * kvd * 4;
-            gpu.hip.memcpy_dtod_at(
+            draft_dtod_at(
+                gpu,
+                ordered,
                 &k_cat_l.buf,
                 cat_off,
                 &k_cache_layer.buf,
                 slot0 * kvd * 4,
                 seg_bytes,
             )?;
-            gpu.hip.memcpy_dtod_at(
+            draft_dtod_at(
+                gpu,
+                ordered,
                 &v_cat_l.buf,
                 cat_off,
                 &v_cache_layer.buf,
@@ -3428,10 +3482,8 @@ pub fn draft_forward_opts(
             )?;
             cat_off += seg_bytes;
         }
-        gpu.hip
-            .memcpy_dtod_at(&k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
-        gpu.hip
-            .memcpy_dtod_at(&v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
+        draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
+        draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
 
         if let Some(t) = t1 {
             gpu.hip.device_synchronize()?;
@@ -3601,8 +3653,7 @@ pub fn draft_forward_opts(
                     eps,
                 )?;
             } else {
-                gpu.hip
-                    .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+                draft_dtod_at(gpu, ordered, &scratch.residual.buf, 0, &scratch.x.buf, 0, (b * h) * 4)?;
                 gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
             }
             let k = cfg.conv_kernel_size.unwrap_or(2);

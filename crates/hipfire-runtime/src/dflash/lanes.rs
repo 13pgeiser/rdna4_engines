@@ -6,8 +6,8 @@
 //! store's DFlash lanes). See [`draft_forward_lanes`].
 
 use super::{
-    draft_ffn_layer, gemm_dispatch, ring_segments, upload_slice_i32, DflashConfig, DflashLayerWeights,
-    DflashScratch, DflashWeights, DraftCtxMode,
+    draft_dtod_at, draft_ffn_layer, gemm_dispatch, ordered_draft, ring_segments, upload_slice_i32, DflashConfig,
+    DflashLayerWeights, DflashScratch, DflashWeights, DraftCtxMode,
 };
 use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
@@ -41,6 +41,16 @@ struct LaneGeo {
     pos_base: usize,
     /// `thlog.proj_cached_rows()` at entry.
     cached_rows: usize,
+}
+
+/// The key positions a lane uploads: from `l - w_full` on in windowed mode
+/// (the windowed `positions_k` holds the full-window span), the whole
+/// `[l + b]` array in legacy mode.
+fn lane_key_positions<'p>(ls: &DflashScratch, positions_k: &'p [i32], l: usize) -> &'p [i32] {
+    match ls.ctx_mode {
+        DraftCtxMode::Legacy => positions_k,
+        DraftCtxMode::Windowed { w_full, .. } => &positions_k[l.saturating_sub(w_full)..],
+    }
 }
 
 /// Context fill of one layer of one lane: the incremental K/V projection of
@@ -133,6 +143,7 @@ fn lane_attention(
     shared: &DflashScratch,
     li: usize,
     g: &LaneGeo,
+    ordered: bool,
 ) -> HipResult<()> {
     let kvd = cfg.kv_dim();
     let qd = cfg.q_dim();
@@ -164,16 +175,12 @@ fn lane_attention(
     let mut cat_off = 0usize;
     for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
         let seg_bytes = len * kvd * 4;
-        gpu.hip
-            .memcpy_dtod_at(&k_cat_l.buf, cat_off, &k_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
-        gpu.hip
-            .memcpy_dtod_at(&v_cat_l.buf, cat_off, &v_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
+        draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &k_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
+        draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &v_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
         cat_off += seg_bytes;
     }
-    gpu.hip
-        .memcpy_dtod_at(&k_cat_l.buf, cat_off, &shared.k_noise.buf, g.off * kvd * 4, noise_bytes)?;
-    gpu.hip
-        .memcpy_dtod_at(&v_cat_l.buf, cat_off, &shared.v_noise.buf, g.off * kvd * 4, noise_bytes)?;
+    draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &shared.k_noise.buf, g.off * kvd * 4, noise_bytes)?;
+    draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &shared.v_noise.buf, g.off * kvd * 4, noise_bytes)?;
     let q_view = shared.q.sub_offset(g.off * qd, b * qd);
     let out_view = shared.attn_out.sub_offset(g.off * qd, b * qd);
     let is_swa_layer = g.windowed && (g.all_sliding_windowed || !is_full_layer);
@@ -259,8 +266,25 @@ pub fn draft_forward_lanes(
     assert!(total <= shared.max_block_size, "lane rows > shared scratch max");
 
     // ── Per-lane geometry, key positions, context projection ─────────────
+    let ordered = ordered_draft();
+    // Owned staging (capacity `max_block_size >= total`, never grown).
+    shared.lane_positions_q.clear();
+    for lane in lanes.iter() {
+        shared.lane_positions_q.extend_from_slice(lane.positions_q);
+    }
+    if ordered {
+        // Every host position upload precedes the draft body, so no
+        // synchronous H2D drains the queue between the lane fc GEMMs. The fc
+        // GEMMs and hidden norms read no positions; every position reader
+        // (context RoPE, query/noise RoPE) still runs after its upload.
+        for lane in lanes.iter() {
+            assert_eq!(lane.positions_k.len(), lane.ctx_len + lane.b, "positions_k size");
+            let ls = &*lane.scratch;
+            upload_slice_i32(gpu, &ls.positions_k, lane_key_positions(ls, lane.positions_k, lane.ctx_len))?;
+        }
+        upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
+    }
     let mut geos: Vec<LaneGeo> = Vec::with_capacity(lanes.len());
-    let mut positions_q: Vec<i32> = Vec::with_capacity(total);
     let mut off = 0usize;
     for lane in lanes.iter_mut() {
         let (b, l) = (lane.b, lane.ctx_len);
@@ -287,11 +311,8 @@ pub fn draft_forward_lanes(
                 );
             }
         }
-        positions_q.extend_from_slice(lane.positions_q);
-        if windowed {
-            upload_slice_i32(gpu, &ls.positions_k, &lane.positions_k[pos_base..])?;
-        } else {
-            upload_slice_i32(gpu, &ls.positions_k, lane.positions_k)?;
+        if !ordered {
+            upload_slice_i32(gpu, &ls.positions_k, lane_key_positions(ls, lane.positions_k, l))?;
         }
         let cached_rows = ls.thlog.proj_cached_rows();
         let fc_start = cached_rows.max(l.saturating_sub(swa_w));
@@ -324,7 +345,9 @@ pub fn draft_forward_lanes(
         });
         off += b;
     }
-    upload_slice_i32(gpu, &shared.positions_q, &positions_q)?;
+    if !ordered {
+        upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
+    }
 
     // ── Per-layer decoder ────────────────────────────────────────────────
     let rows = total;
@@ -335,8 +358,7 @@ pub fn draft_forward_lanes(
     };
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
-        gpu.hip
-            .memcpy_dtod(&shared.residual.buf, &shared.x.buf, (rows * h) * 4)?;
+        draft_dtod_at(gpu, ordered, &shared.residual.buf, 0, &shared.x.buf, 0, (rows * h) * 4)?;
         gpu.rmsnorm_batched(&shared.x, &layer.attn_norm, &shared.x_norm, rows, h, eps)?;
 
         // DFlash2 prepare convolution (causal across the rows of ONE block ⇒
@@ -417,7 +439,7 @@ pub fn draft_forward_lanes(
         )?;
 
         for (lane, g_) in lanes.iter().zip(&geos) {
-            lane_attention(gpu, cfg, lane.scratch, shared, li, g_)?;
+            lane_attention(gpu, cfg, lane.scratch, shared, li, g_, ordered)?;
         }
 
         // wo lands in x (the non-fused route), then the DFlash2 finish
@@ -455,8 +477,7 @@ pub fn draft_forward_lanes(
             &shared.conv_dynamic,
             &shared.conv_temp,
         ) {
-            gpu.hip
-                .memcpy_dtod(&shared.residual.buf, &shared.x.buf, (rows * h) * 4)?;
+            draft_dtod_at(gpu, ordered, &shared.residual.buf, 0, &shared.x.buf, 0, (rows * h) * 4)?;
             gpu.rmsnorm_batched(&shared.x, &layer.ffn_norm, &shared.x_norm, rows, h, eps)?;
             let (k, g, groups, stride) = conv_kgs();
             let dyn_all = dyn_buf.sub_offset(0, rows * stride);
