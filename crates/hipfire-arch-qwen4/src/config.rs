@@ -1570,6 +1570,13 @@ impl Qwen4Config {
             .count()
     }
 
+    /// RoPE width of the full-attention q/k rows: `head_dim *
+    /// partial_rotary_factor` (64 for Flash-Next).  Validation guarantees an
+    /// even integer >= 2.
+    pub fn rotary_dim(&self) -> usize {
+        (self.head_dim as f64 * self.partial_rotary_factor).round() as usize
+    }
+
     /// Number of values in each sharded n-gram row (0 without PLE).
     pub fn ple_row_width(&self) -> usize {
         self.ple.as_ref().map_or(0, |ple| ple.row_width)

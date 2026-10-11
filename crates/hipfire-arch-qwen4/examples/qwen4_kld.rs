@@ -226,6 +226,7 @@ impl Model {
         let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
         let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
             receipt.config,
+            &receipt.manifest.identity.recipe,
             transaction,
             &receipt.placements,
             &mut gpu,
@@ -240,7 +241,9 @@ impl Model {
             .attach_forward(&mut gpu, n_ctx)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
         if let (Some(prewarm), Some(plan)) = (ple_hot, hot_plan) {
-            bundle.attach_ple_hot_store(verified_hot_store(path, plan, prewarm)?);
+            bundle
+                .attach_ple_hot_store(verified_hot_store(path, plan, prewarm)?)
+                .map_err(|e| format!("qwen4 PLE hot store: {e}"))?;
         }
         let logits = gpu
             .zeros(&[n_ctx * vocab], DType::F32)

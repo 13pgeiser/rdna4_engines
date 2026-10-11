@@ -683,23 +683,42 @@ impl Carrier for Qwen4Carrier {
         // The PLE rows source (`memory.ple_format`).  Admission already
         // resolved and attached a sidecar on this source; resolving again is
         // idempotent and yields the choice for the load log (and covers a
-        // source that reaches the carrier without admission).
-        let choice = {
-            let mut progress = crate::admission::ple_progress_printer();
-            hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows(
-                &mut hfq,
-                std::path::Path::new(ctx.path),
-                hipfire_config::memory::ple_format(),
-                &ctx.gpu.arch,
-                hipfire_runtime::ple_sidecar::ResolvePolicy {
-                    derive_missing_q4: true,
-                    progress: Some(&mut progress),
-                },
-            )
-            .map_err(|error| format!("qwen4: PLE rows: {error}"))?
-        };
+        // source that reaches the carrier without admission).  A developer
+        // profile's embedded rows (or a profile without PLE) have no sidecar
+        // to resolve: `None`.
+        let choice =
+            crate::admission::resolve_qwen4_ple_rows_hfq(&mut hfq, ctx.path, &ctx.gpu.arch)?;
         let receipt =
             hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
+        // Refused before any allocation (source admission applies the same
+        // check): an inventory-valid developer profile the executor cannot
+        // run would otherwise fail after the weights were fulfilled.
+        hipfire_arch_qwen4::bundle::admit_executable_profile(&receipt.config)
+            .map_err(|error| format!("qwen4: {error}"))?;
+        // The profile is known: the head-free MTP and developer-PLE refusals
+        // happen here, before any allocation (source admission applies the
+        // same checks).
+        let requested_native_mtp = native_mtp;
+        native_mtp = crate::admission::qwen4_native_mtp_for_head(
+            native_mtp,
+            ctx.spec.mtp,
+            receipt.config.mtp.is_some(),
+            receipt.config.profile.id(),
+        )?;
+        if requested_native_mtp && !native_mtp {
+            eprintln!(
+                "  qwen4 native MTP: off (profile {} has no MTP head)",
+                receipt.config.profile.id()
+            );
+        }
+        if let Some(note) = crate::admission::qwen4_developer_ple_policy(
+            receipt.config.profile.is_flash_next(),
+            receipt.config.profile.id(),
+            hipfire_config::memory::ple_format(),
+            hipfire_config::memory::ple_hot_store_bytes(),
+        )? {
+            eprintln!("  qwen4 {note}");
+        }
         // A rank-order table is its own hot-row pack and is served through
         // its store; every other source reads through 128 shard descriptors.
         let rank_table = receipt.ple_rows.rank_table().cloned();
@@ -711,9 +730,12 @@ impl Carrier for Qwen4Carrier {
                     .map_err(|error| error.to_string())?,
             ),
         };
-        let (ple_rows_path, ple_rows_bytes) = receipt
-            .ple_rows_source(&hfq)
-            .map_err(|error| error.to_string())?;
+        let (ple_rows_path, ple_rows_bytes) = match &receipt.ple_rows {
+            hipfire_arch_qwen4::Qwen4PleRows::Absent => (std::path::PathBuf::new(), 0),
+            _ => receipt
+                .ple_rows_source(&hfq)
+                .map_err(|error| error.to_string())?,
+        };
         let (rows_encoding, rows_total) = match &receipt.ple_rows {
             hipfire_arch_qwen4::Qwen4PleRows::Absent => (String::new(), 0),
             hipfire_arch_qwen4::Qwen4PleRows::Sidecar { encoding, .. } => (
@@ -730,22 +752,36 @@ impl Carrier for Qwen4Carrier {
                 )
             }
         };
-        eprintln!(
-            "  qwen4 ple rows: {} from {} ({rows_encoding}, {} order, {:.1} GB)",
-            choice.format.name(),
-            match &choice.origin {
-                hipfire_runtime::ple_sidecar::PleRowsOrigin::Embedded => {
-                    "embedded model file".to_string()
+        match &choice {
+            Some(choice) => {
+                eprintln!(
+                    "  qwen4 ple rows: {} from {} ({rows_encoding}, {} order, {:.1} GB)",
+                    choice.format.name(),
+                    match &choice.origin {
+                        hipfire_runtime::ple_sidecar::PleRowsOrigin::Embedded => {
+                            "embedded model file".to_string()
+                        }
+                        hipfire_runtime::ple_sidecar::PleRowsOrigin::Sidecar(path) => {
+                            path.display().to_string()
+                        }
+                    },
+                    if rank_table.is_some() { "rank" } else { "row" },
+                    rows_total as f64 / 1e9
+                );
+                if let Some(note) = &choice.note {
+                    eprintln!("  qwen4 ple rows: {note}");
                 }
-                hipfire_runtime::ple_sidecar::PleRowsOrigin::Sidecar(path) => {
-                    path.display().to_string()
-                }
+            }
+            None => match &receipt.ple_rows {
+                hipfire_arch_qwen4::Qwen4PleRows::Absent => eprintln!(
+                    "  qwen4 ple rows: none (profile {} declares no PLE)",
+                    receipt.config.profile.id()
+                ),
+                _ => eprintln!(
+                    "  qwen4 ple rows: embedded developer rows ({rows_encoding}, {:.3} MB)",
+                    rows_total as f64 / 1e6
+                ),
             },
-            if rank_table.is_some() { "rank" } else { "row" },
-            rows_total as f64 / 1e9
-        );
-        if let Some(note) = &choice.note {
-            eprintln!("  qwen4 ple rows: {note}");
         }
         // The row-order q4 sidecar's data section, for the post-ready
         // page-cache prewarm (when no hot store attaches).
@@ -778,11 +814,13 @@ impl Carrier for Qwen4Carrier {
                 )
             },
         );
+        let recipe = receipt.recipe().clone();
         let config = receipt.config;
         let mut manifest = receipt.manifest;
-        let metadata = receipt.ple.ok_or_else(|| {
-            "qwen4: the FN runtime requires PLE hash metadata; this profile has no PLE".to_string()
-        })?;
+        let metadata = receipt.ple;
+        // A dense FFN has no routed experts: its gate/up/down are ordinary
+        // resident weights and the host-expert placement does not apply.
+        let routed_experts = !config.ffn.is_dense();
         let placements = receipt.placements;
         let ple_rows = receipt.ple_rows;
         let mut session_domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
@@ -868,7 +906,11 @@ impl Carrier for Qwen4Carrier {
             // host-mapped policy keeps it (exact gfx1201, or an explicit
             // `--spec mtp`); only then does it need VRAM.
             let mtp_kept = native_mtp
-                && crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, 1);
+                && crate::admission::qwen4_mtp_with_host_mapped_experts(
+                    ctx.spec,
+                    &ctx.gpu.arch,
+                    usize::from(routed_experts),
+                );
             let mtp_bytes = if mtp_kept {
                 let head = residency::language_head_dtype(&manifest.weights)
                     .ok_or("qwen4: manifest has no language head")?;
@@ -927,6 +969,10 @@ impl Carrier for Qwen4Carrier {
         };
         let explicit =
             residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
+        if !routed_experts {
+            residency::refuse_host_expert_request(explicit, config.profile.id())
+                .map_err(|error| format!("qwen4: {error}"))?;
+        }
         // Unset on a discrete card: fully resident only where every routed
         // expert, the non-expert weights and the `auto` reserve fit in free
         // VRAM; otherwise `auto` (an unconditional resident load would fail
@@ -980,6 +1026,12 @@ impl Carrier for Qwen4Carrier {
                 Ok(fits)
             })?
         };
+        if !routed_experts && placement.is_some() {
+            return Err(format!(
+                "qwen4: profile {} has a dense FFN (no routed experts to move to host RAM) and its resident weights do not fit device memory{unset_note}; free VRAM or lower memory.max_seq",
+                config.profile.id()
+            ));
+        }
         eprintln!(
             "  qwen4 expert placement: {}{unset_note}",
             match (explicit, placement) {
@@ -1122,17 +1174,20 @@ impl Carrier for Qwen4Carrier {
             };
             start_ple_table_worker(store, host_weight_bytes)
         });
-        let ple_hot = ple_descriptors.as_deref().and_then(|descriptors| {
-            start_ple_hot_store(
-                use_ranges,
-                &hfq,
-                &metadata,
-                descriptors,
-                &ple_rows_path,
-                ple_rows_bytes,
-                ctx.path,
-            )
-        });
+        let ple_hot = match (&metadata, ple_descriptors.as_deref()) {
+            (Some(metadata), Some(descriptors)) if config.profile.is_flash_next() => {
+                start_ple_hot_store(
+                    use_ranges,
+                    &hfq,
+                    metadata,
+                    descriptors,
+                    &ple_rows_path,
+                    ple_rows_bytes,
+                    ctx.path,
+                )
+            }
+            _ => None,
+        };
         let source = HfqModelSource::from_hfq(hfq);
         // Every allocation of the weight sweep is immutable model data: railgun
         // check mode verifies it unchanged instead of snapshotting it (§2.4).
@@ -1168,6 +1223,7 @@ impl Carrier for Qwen4Carrier {
         drop(weights_role);
         let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_ple_rows(
             config,
+            &recipe,
             transaction,
             &placements,
             ctx.gpu,
@@ -1190,7 +1246,11 @@ impl Carrier for Qwen4Carrier {
         // The row store reads the pack's rows from the pack once the worker
         // has verified it.
         if let Some(hot) = ple_hot {
-            bundle.attach_ple_hot_store(hot);
+            if let Err(error) = bundle.attach_ple_hot_store(hot) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: PLE hot store setup failed: {detail}"));
+            }
         }
         if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
@@ -1357,7 +1417,11 @@ impl Carrier for Qwen4Carrier {
                     available.map_or(0, |bytes| bytes / MIB),
                 );
             }
-            bundle.attach_ple_table_worker(worker);
+            if let Err(error) = bundle.attach_ple_table_worker(worker) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: PLE table worker setup failed: {detail}"));
+            }
         } else if let Some(store) = bundle.ple_hot_store() {
             let (budget, available) = ple_hot_prewarm_budget();
             store.set_prewarm_budget(budget);
@@ -1378,12 +1442,17 @@ impl Carrier for Qwen4Carrier {
                     ple_prewarm_off_reason(available, explicit_zero)
                 );
             } else {
-                match hipfire_runtime::ple_prewarm::PleRowsPrewarm::spawn(
-                    sidecar,
-                    *data_offset,
-                    *data_bytes,
-                    bundle.ple_rows().activity(),
-                ) {
+                match bundle
+                    .ple_rows()
+                    .ok_or_else(|| std::io::Error::other("the bundle has no PLE row store"))
+                    .and_then(|rows| {
+                        hipfire_runtime::ple_prewarm::PleRowsPrewarm::spawn(
+                            sidecar,
+                            *data_offset,
+                            *data_bytes,
+                            rows.activity(),
+                        )
+                    }) {
                     Ok(prewarm) => {
                         prewarm.set_budget(budget);
                         eprintln!(
@@ -1392,7 +1461,9 @@ impl Carrier for Qwen4Carrier {
                             data_bytes / MIB,
                             available.map_or(0, |bytes| bytes / MIB),
                         );
-                        bundle.attach_ple_prewarm(prewarm);
+                        if let Err(error) = bundle.attach_ple_prewarm(prewarm) {
+                            eprintln!("  qwen4 ple prewarm: off ({error})");
+                        }
                     }
                     Err(error) => eprintln!("  qwen4 ple prewarm: off ({error})"),
                 }

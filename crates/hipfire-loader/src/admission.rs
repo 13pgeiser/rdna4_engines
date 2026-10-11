@@ -179,6 +179,61 @@ pub(crate) fn qwen4_native_mtp(
     }
 }
 
+/// Native MTP once the profile is known: the head exists only where the
+/// profile declares one (`config.mtp`).  `auto` turns off for a head-free
+/// profile; an explicit `speculation.mtp = "on"` (`--spec mtp`) is refused
+/// rather than guessed, before any allocation.  A profile with the head keeps
+/// the policy decision [`qwen4_native_mtp`] made.
+pub(crate) fn qwen4_native_mtp_for_head(
+    native_mtp: bool,
+    spec_mtp: Option<bool>,
+    has_mtp_head: bool,
+    profile: &str,
+) -> Result<bool, String> {
+    match (has_mtp_head, spec_mtp) {
+        (true, _) => Ok(native_mtp),
+        (false, Some(true)) => Err(format!(
+            "qwen4: native MTP (--spec mtp) was requested, but profile {profile} has no MTP head; \
+             load a profile with an MTP head or leave speculation.mtp unset"
+        )),
+        (false, _) => Ok(false),
+    }
+}
+
+/// Sidecar PLE rows (`memory.ple_format`), the hot-row store
+/// (`memory.ple_hot_store_bytes`), the prewarm and the rank table are
+/// Flash-Next-only: a developer profile reads its embedded rows directly.  An
+/// explicit request for any of them on a developer profile is refused before
+/// allocation; `auto` is skipped, with the returned note for the load log.
+/// Flash-Next never reaches either arm.
+pub(crate) fn qwen4_developer_ple_policy(
+    flash_next: bool,
+    id: &str,
+    format: hipfire_config::memory::PleFormatRequest,
+    hot_store: hipfire_config::memory::PleHotStoreBudget,
+) -> Result<Option<String>, String> {
+    use hipfire_config::memory::{PleFormatRequest, PleHotStoreBudget};
+    if flash_next {
+        return Ok(None);
+    }
+    if format != PleFormatRequest::Auto {
+        return Err(format!(
+            "qwen4: memory.ple_format = {format:?} requests PLE sidecar rows, which are Flash-Next-only; \
+             developer profile {id} reads its embedded PLE rows (unset memory.ple_format)"
+        ));
+    }
+    match hot_store {
+        PleHotStoreBudget::Bytes(0) => Ok(None),
+        PleHotStoreBudget::Bytes(bytes) => Err(format!(
+            "qwen4: memory.ple_hot_store_bytes = {bytes} requests the PLE hot-row store, which is Flash-Next-only; \
+             developer profile {id} reads its embedded PLE rows (set it to 0)"
+        )),
+        PleHotStoreBudget::Auto => Ok(Some(format!(
+            "ple hot store and sidecar prewarm: off (developer profile {id} reads its embedded PLE rows)"
+        ))),
+    }
+}
+
 /// Whether an admitted Qwen4 native MTP head stays attached once
 /// `host_mapped_experts` routed-expert tensors were placed in pinned host RAM
 /// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Device-resident loads (Strix Halo:
@@ -394,6 +449,17 @@ pub fn resolve_qwen4_ple_rows(
     let ModelSource::Hfq(hfq) = source else {
         return Ok(None);
     };
+    resolve_qwen4_ple_rows_hfq(hfq, path, gpu_arch)
+}
+
+/// [`resolve_qwen4_ple_rows`] on an opened HFQ file.  A base without the
+/// Flash-Next PLE layout (a developer profile's embedded rows, or a profile
+/// without PLE) has no sidecar to resolve and yields `None`.
+pub fn resolve_qwen4_ple_rows_hfq(
+    hfq: &mut hipfire_runtime::hfq::HfqFile,
+    path: &str,
+    gpu_arch: &str,
+) -> Result<Option<hipfire_runtime::ple_sidecar::PleRowsChoice>, String> {
     if !qwen4_ple_rows_layout_present(hfq) {
         return Ok(None);
     }
@@ -422,6 +488,7 @@ pub fn admit_qwen4_source(
     effective_mesh: hipfire_arch_qwen4::EffectiveMesh,
     modality: InputModality,
     native_mtp: bool,
+    spec_mtp: Option<bool>,
 ) -> Result<Qwen4SourceAdmission, String> {
     qwen4_request_admission(effective_mesh, modality, native_mtp)?;
     let ModelSource::Hfq(hfq) = source else {
@@ -431,6 +498,25 @@ pub fn admit_qwen4_source(
     };
     let receipt =
         hipfire_arch_qwen4::admit_hfqm_artifact(hfq).map_err(|error| error.to_string())?;
+    // An inventory-valid developer profile the executor cannot run (a
+    // synthetic MoE, a RoPE base the QSA kernels lack, a build without
+    // `qwen4-dev-profiles`) is refused here, not after the weights upload.
+    hipfire_arch_qwen4::bundle::admit_executable_profile(&receipt.config)
+        .map_err(|error| format!("qwen4: {error}"))?;
+    // The profile is known now: the head-free and developer-PLE refusals
+    // happen here, before any weight is allocated or any model torn down.
+    let native_mtp = qwen4_native_mtp_for_head(
+        native_mtp,
+        spec_mtp,
+        receipt.config.mtp.is_some(),
+        receipt.config.profile.id(),
+    )?;
+    qwen4_developer_ple_policy(
+        receipt.config.profile.is_flash_next(),
+        receipt.config.profile.id(),
+        hipfire_config::memory::ple_format(),
+        hipfire_config::memory::ple_hot_store_bytes(),
+    )?;
     Ok(Qwen4SourceAdmission {
         config: receipt.config,
         effective_mesh,
@@ -1118,6 +1204,7 @@ pub fn admit_source_with_options(
         let qwen4_kv =
             hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
+        let spec_mtp = options.spec.mtp;
         crate::carrier_for(arch_id)
             .ok_or_else(|| "no carrier for qwen4".to_string())?
             .admit_options(draft_path, options)?;
@@ -1132,6 +1219,7 @@ pub fn admit_source_with_options(
             hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
             InputModality::Text,
             native_mtp,
+            spec_mtp,
         )?;
         let positions = admitted.config.max_position_embeddings;
         if max_seq > positions {
@@ -1675,6 +1763,81 @@ mod tests {
             "gfx1201",
             21
         ));
+    }
+
+    #[test]
+    fn qwen4_head_free_profile_turns_auto_mtp_off_and_refuses_an_explicit_request() {
+        // A profile with the head keeps the policy decision.
+        assert_eq!(qwen4_native_mtp_for_head(true, None, true, "p"), Ok(true));
+        assert_eq!(
+            qwen4_native_mtp_for_head(false, Some(false), true, "p"),
+            Ok(false)
+        );
+        assert_eq!(
+            qwen4_native_mtp_for_head(true, Some(true), true, "p"),
+            Ok(true)
+        );
+        // No head: auto and `off` resolve to AR, `--spec mtp` is refused.
+        assert_eq!(qwen4_native_mtp_for_head(true, None, false, "p"), Ok(false));
+        assert_eq!(
+            qwen4_native_mtp_for_head(false, Some(false), false, "p"),
+            Ok(false)
+        );
+        let error = qwen4_native_mtp_for_head(true, Some(true), false, "tiny-dense").unwrap_err();
+        assert!(
+            error.contains("--spec mtp")
+                && error.contains("tiny-dense")
+                && error.contains("no MTP head"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn qwen4_developer_profiles_refuse_explicit_sidecar_and_hot_store_requests() {
+        use hipfire_config::memory::{PleFormatRequest, PleHotStoreBudget};
+        // Flash-Next is never touched by the developer policy.
+        for format in [
+            PleFormatRequest::Auto,
+            PleFormatRequest::Q4,
+            PleFormatRequest::Q8,
+        ] {
+            for hot in [
+                PleHotStoreBudget::Auto,
+                PleHotStoreBudget::Bytes(0),
+                PleHotStoreBudget::Bytes(1 << 30),
+            ] {
+                assert_eq!(
+                    qwen4_developer_ple_policy(true, "fn", format, hot),
+                    Ok(None)
+                );
+            }
+        }
+        // A developer profile: defaults pass, `auto` hot store is skipped with
+        // a note, explicit sidecar/hot requests are refused.
+        let dev = |format, hot| qwen4_developer_ple_policy(false, "tiny-dense", format, hot);
+        assert_eq!(
+            dev(PleFormatRequest::Auto, PleHotStoreBudget::Bytes(0)),
+            Ok(None)
+        );
+        let note = dev(PleFormatRequest::Auto, PleHotStoreBudget::Auto)
+            .unwrap()
+            .expect("note");
+        assert!(
+            note.contains("tiny-dense") && note.contains("off"),
+            "{note}"
+        );
+        for format in [PleFormatRequest::Q4, PleFormatRequest::Q8] {
+            let error = dev(format, PleHotStoreBudget::Bytes(0)).unwrap_err();
+            assert!(
+                error.contains("memory.ple_format") && error.contains("tiny-dense"),
+                "{error}"
+            );
+        }
+        let error = dev(PleFormatRequest::Auto, PleHotStoreBudget::Bytes(4096)).unwrap_err();
+        assert!(
+            error.contains("memory.ple_hot_store_bytes") && error.contains("tiny-dense"),
+            "{error}"
+        );
     }
 
     mod qwen4_ddtree_admission {

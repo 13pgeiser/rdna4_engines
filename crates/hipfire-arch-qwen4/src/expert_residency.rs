@@ -83,6 +83,31 @@ pub fn resolve_expert_vram_layers(
     }
 }
 
+/// A profile without routed experts (a dense FFN) has nothing to place in
+/// host RAM: its gate/up/down projections are ordinary resident weights, so
+/// the placement is always fully resident (`resident_split` counts them as
+/// non-expert bytes, `routed_expert_bytes` is 0).  An explicit
+/// [`EXPERT_VRAM_LAYERS_ENV`] request (a layer count or `auto`) is refused
+/// instead of being honored by moving dense weights as fake experts; unset
+/// is fine.
+pub fn refuse_host_expert_request(
+    policy: Option<ExpertVramLayers>,
+    profile: &str,
+) -> Result<(), String> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let value = match policy {
+        ExpertVramLayers::Layers(layers) => layers.to_string(),
+        ExpertVramLayers::Auto => "auto".to_string(),
+    };
+    Err(format!(
+        "{EXPERT_VRAM_LAYERS_ENV}={value} requests host-mapped routed experts, but profile \
+         {profile} has a dense FFN with no routed experts (its gate/up/down are resident \
+         weights); unset {EXPERT_VRAM_LAYERS_ENV}"
+    ))
+}
+
 /// Whether every routed expert (`expert_bytes`), the non-expert weights and
 /// `reserve` ([`auto_vram_reserve`]) fit in `free_vram`.
 pub fn fits_fully_resident(free_vram: u64, non_expert_bytes: u64, expert_bytes: u64, reserve: u64) -> bool {
@@ -812,5 +837,119 @@ mod tests {
         // No card known, or one whose memory kind is not known.
         assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &[]));
         assert!(!keeps_host_memory_out_of_reclaim(crate::ARCH_ID, &["gfx90a"]));
+    }
+
+    /// Total payload bytes of a manifest entry at 2 bytes per element.
+    fn element_bytes(entry: &WeightEntry) -> Option<u64> {
+        Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)
+    }
+
+    #[test]
+    fn dense_profile_has_no_routed_experts_and_places_nothing() {
+        use crate::config::Qwen4FfnConfig;
+        let config = crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 8,
+            },
+            16,
+            4,
+            true,
+            true,
+        );
+        let mut manifest = crate::weights::Qwen4Manifest::build(&config).expect("dense manifest");
+        assert!(config.ffn.is_dense());
+        assert_eq!(routed_expert_bytes(&manifest.weights, element_bytes), Ok(0));
+        let (non_expert, layer_experts) =
+            resident_split(&manifest.weights, element_bytes).expect("split");
+        assert_eq!(layer_experts, 0);
+        // The dense gate/up/down are resident non-expert weights.
+        let dense_ffn: u64 = manifest
+            .weights
+            .iter()
+            .filter(|entry| {
+                entry.name.ends_with(".mlp.gate_proj.weight")
+                    || entry.name.ends_with(".mlp.up_proj.weight")
+                    || entry.name.ends_with(".mlp.down_proj.weight")
+            })
+            .map(|entry| {
+                assert_eq!(entry.residency, WeightResidency::Resident, "{}", entry.name);
+                element_bytes(entry).unwrap()
+            })
+            .sum();
+        assert!(dense_ffn > 0 && non_expert >= dense_ffn);
+        // Fully resident, no division by the zero per-layer expert bytes,
+        // nothing host-mapped under any placement.
+        assert!(fits_fully_resident(
+            non_expert + (1 << 20),
+            non_expert,
+            0,
+            1 << 20
+        ));
+        assert!(!fits_fully_resident(
+            non_expert + (1 << 20) - 1,
+            non_expert,
+            0,
+            1 << 20
+        ));
+        assert_eq!(auto_vram_layers(1 << 40, non_expert, 0, 4, 1 << 20), 4);
+        assert_eq!(auto_vram_layers(0, non_expert, 0, 4, 1 << 20), 4);
+        for vram_layers in [0, 2, 4] {
+            assert_eq!(place_routed_experts(&mut manifest.weights, vram_layers), 0);
+        }
+        assert_eq!(host_mapped_bytes(&manifest.weights, element_bytes), Ok(0));
+        assert!(manifest
+            .weights
+            .iter()
+            .all(|entry| entry.residency != WeightResidency::HostMapped));
+    }
+
+    #[test]
+    fn host_expert_requests_are_refused_for_a_dense_profile_only_when_explicit() {
+        assert_eq!(refuse_host_expert_request(None, "dense-dev"), Ok(()));
+        for policy in [
+            ExpertVramLayers::Auto,
+            ExpertVramLayers::Layers(0),
+            ExpertVramLayers::Layers(12),
+        ] {
+            let error = refuse_host_expert_request(Some(policy), "dense-dev").unwrap_err();
+            assert!(
+                error.contains(EXPERT_VRAM_LAYERS_ENV)
+                    && error.contains("dense-dev")
+                    && error.contains("no routed experts"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn flash_next_placement_is_unchanged_by_the_dense_path() {
+        // The pinned MoE manifest still counts every routed expert (trunk and
+        // MTP) as an expert, none as non-expert, and host-maps exactly them.
+        let config = crate::config::compact_test_config();
+        let mut manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        assert!(config.ffn.is_moe());
+        let routed = manifest
+            .weights
+            .iter()
+            .filter(|entry| is_routed_expert(&entry.name))
+            .count();
+        assert_eq!(routed, 2 * (config.num_hidden_layers + 1));
+        let (non_expert, layer_experts) =
+            resident_split(&manifest.weights, element_bytes).expect("split");
+        assert!(layer_experts > 0);
+        let experts = routed_expert_bytes(&manifest.weights, element_bytes).unwrap();
+        assert!(experts > layer_experts && non_expert > 0);
+        assert_eq!(place_routed_experts(&mut manifest.weights, 0), routed);
+        assert!(host_mapped_bytes(&manifest.weights, element_bytes).unwrap() > 0);
+        assert_eq!(
+            auto_vram_layers(
+                u64::MAX / 2,
+                non_expert,
+                layer_experts,
+                config.num_hidden_layers,
+                0
+            ),
+            config.num_hidden_layers
+        );
     }
 }

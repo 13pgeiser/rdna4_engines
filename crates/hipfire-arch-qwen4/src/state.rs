@@ -126,11 +126,11 @@ fn arena_regions<'a>(
             });
         }
     }
-    copies.push(pair(
-        &state.ple_conv,
-        &arena.ple_conv,
-        state.ple_conv.byte_size(),
-    ));
+    // A profile without PLE has no PLE conv state, live or saved; the two
+    // sides are validated to agree (`validate_layout`) before any copy.
+    if let (Some(live), Some(saved)) = (&state.ple_conv, &arena.ple_conv) {
+        copies.push(pair(live, saved, live.byte_size()));
+    }
     copies.push(pair(
         &state.hyper_feedback,
         &arena.hyper_feedback,
@@ -590,7 +590,7 @@ pub(crate) struct Qwen4StateSnapshotArena {
     qsa_partial_values: Vec<GpuTensor>,
     qsa_raw_circular: Vec<GpuTensor>,
     qsa_selected: Vec<GpuTensor>,
-    ple_conv: GpuTensor,
+    ple_conv: Option<GpuTensor>,
     hyper_feedback: GpuTensor,
     qsa_marks: Vec<QsaMark>,
     ple_history: PleHistory,
@@ -608,7 +608,7 @@ impl Qwen4StateSnapshotArena {
         gpu: &mut Gpu,
         gdn: &[GdnGpuState],
         qsa: &[QsaGpuState],
-        ple_conv: &GpuTensor,
+        ple_conv: Option<&GpuTensor>,
         hyper_feedback: &GpuTensor,
         model_id: u64,
         ple_history: PleHistory,
@@ -653,10 +653,12 @@ impl Qwen4StateSnapshotArena {
                         .map_err(StateError::Hip)?,
                 );
             }
-            allocated.push(
-                gpu.zeros(&ple_conv.shape, DType::F32)
-                    .map_err(StateError::Hip)?,
-            );
+            if let Some(ple_conv) = ple_conv {
+                allocated.push(
+                    gpu.zeros(&ple_conv.shape, DType::F32)
+                        .map_err(StateError::Hip)?,
+                );
+            }
             allocated.push(
                 gpu.zeros(&hyper_feedback.shape, DType::F32)
                     .map_err(StateError::Hip)?,
@@ -686,7 +688,7 @@ impl Qwen4StateSnapshotArena {
             qsa_raw_circular.push(next());
             qsa_selected.push(next());
         }
-        let ple_conv = next();
+        let ple_conv = ple_conv.map(|_| next());
         let hyper_feedback = next();
         if !allocated.is_empty() {
             for tensor in allocated {
@@ -743,7 +745,7 @@ impl Qwen4StateSnapshotArena {
             mix(layer.partial_values.numel());
             mix(layer.selected_indices.buf.size());
         }
-        mix(state.ple_conv.numel());
+        mix(state.ple_conv.as_ref().map_or(0, GpuTensor::numel));
         mix(state.hyper_feedback.numel());
         SnapshotDimensions {
             gdn_count: state.gdn.len(),
@@ -805,7 +807,8 @@ impl Qwen4StateSnapshotArena {
                 return Err(StateError::SnapshotShape);
             }
         }
-        if self.ple_conv.numel() != state.ple_conv.numel()
+        if self.ple_conv.as_ref().map(GpuTensor::numel)
+            != state.ple_conv.as_ref().map(GpuTensor::numel)
             || self.hyper_feedback.numel() != state.hyper_feedback.numel()
         {
             return Err(StateError::SnapshotShape);
@@ -853,7 +856,8 @@ impl Qwen4StateSnapshotArena {
             .chain(self.qsa_partial_values)
             .chain(self.qsa_raw_circular)
             .chain(self.qsa_selected)
-            .chain([self.ple_conv, self.hyper_feedback]);
+            .chain(self.ple_conv)
+            .chain([self.hyper_feedback]);
         let mut first = None;
         for tensor in tensors {
             if let Err(error) = gpu.free_tensor(tensor) {
@@ -868,7 +872,12 @@ impl Qwen4StateSnapshotArena {
 pub struct Qwen4State {
     pub gdn: Vec<GdnGpuState>,
     pub qsa: Vec<QsaGpuState>,
-    pub ple_conv: GpuTensor,
+    /// The PLE short-convolution history; `None` exactly when the profile
+    /// declares no PLE (`config.ple`).  `hyper_feedback` below is not PLE
+    /// state (its width is `hc_count * hidden_size` whatever the profile,
+    /// and no PLE step reads or writes it), so it is allocated for every
+    /// profile and the Flash-Next layout does not depend on this option.
+    pub ple_conv: Option<GpuTensor>,
     pub hyper_feedback: GpuTensor,
     pub ple_history: PleHistory,
     pub position: usize,
@@ -1056,18 +1065,23 @@ impl Qwen4State {
                     }
                 }
             }
-            let ple_channels = config
-                .ple_embed_dim
-                .checked_mul(config.hc_count)
-                .ok_or(StateError::DimensionOverflow)?;
-            let ple_elements = config
-                .ple_conv_history_rows()
-                .checked_mul(ple_channels)
-                .ok_or(StateError::DimensionOverflow)?;
-            allocated.push(
-                gpu.zeros(&[ple_elements], DType::F32)
-                    .map_err(StateError::Hip)?,
-            );
+            // PLE channels are the HC-wide rows of the key projection:
+            // `hidden_size * hc_count` (`ple_embed_dim` is its input width).
+            // A profile without PLE has no convolution history to hold.
+            if config.ple.is_some() {
+                let ple_channels = config
+                    .hidden_size
+                    .checked_mul(config.hc_count)
+                    .ok_or(StateError::DimensionOverflow)?;
+                let ple_elements = config
+                    .ple_conv_history_rows()
+                    .checked_mul(ple_channels)
+                    .ok_or(StateError::DimensionOverflow)?;
+                allocated.push(
+                    gpu.zeros(&[ple_elements], DType::F32)
+                        .map_err(StateError::Hip)?,
+                );
+            }
             let feedback_elements = config
                 .hc_count
                 .checked_mul(config.hidden_size)
@@ -1093,7 +1107,7 @@ impl Qwen4State {
                 LayerType::FullAttention => 7,
             })
             .sum::<usize>()
-            .checked_add(2)
+            .checked_add(1 + usize::from(config.ple.is_some()))
             .ok_or(StateError::DimensionOverflow)?;
         if allocated.len() != expected_tensors {
             for tensor in allocated {
@@ -1151,7 +1165,7 @@ impl Qwen4State {
                 }
             }
         }
-        let ple_conv = next_tensor();
+        let ple_conv = config.ple.is_some().then(|| next_tensor());
         let hyper_feedback = next_tensor();
         let model_id = next_qwen4_model_id();
         let ple_history = PleHistory::new(config.eos_token_id);
@@ -1159,7 +1173,7 @@ impl Qwen4State {
             gpu,
             &gdn,
             &qsa,
-            &ple_conv,
+            ple_conv.as_ref(),
             &hyper_feedback,
             model_id,
             ple_history,
@@ -1184,7 +1198,9 @@ impl Qwen4State {
                         let _ = gpu.free_tensor(tensor);
                     }
                 }
-                let _ = gpu.free_tensor(ple_conv);
+                if let Some(ple_conv) = ple_conv {
+                    let _ = gpu.free_tensor(ple_conv);
+                }
                 let _ = gpu.free_tensor(hyper_feedback);
                 return Err(error);
             }
@@ -1265,7 +1281,7 @@ impl Qwen4State {
             .checked_mul(format.qsa.index_dtype().size())?;
         let ple = config
             .ple_conv_history_rows()
-            .checked_mul(config.ple_embed_dim)?
+            .checked_mul(config.hidden_size)?
             .checked_mul(config.hc_count)?
             .checked_mul(f32_bytes)?;
         let feedback = config
@@ -1329,9 +1345,11 @@ impl Qwen4State {
             layer.selected_len = 0;
             layer.position = 0;
         }
-        gpu.hip
-            .memset(&self.ple_conv.buf, 0, self.ple_conv.buf.size())
-            .map_err(StateError::Hip)?;
+        if let Some(ple_conv) = &self.ple_conv {
+            gpu.hip
+                .memset(&ple_conv.buf, 0, ple_conv.buf.size())
+                .map_err(StateError::Hip)?;
+        }
         gpu.hip
             .memset(&self.hyper_feedback.buf, 0, self.hyper_feedback.buf.size())
             .map_err(StateError::Hip)?;
@@ -1452,7 +1470,9 @@ impl Qwen4State {
             }
             fixed.push(whole_part(&layer.selected_indices));
         }
-        fixed.push(whole_part(&self.ple_conv));
+        if let Some(ple_conv) = &self.ple_conv {
+            fixed.push(whole_part(ple_conv));
+        }
         fixed.push(whole_part(&self.hyper_feedback));
         Ok(StateLayout { fixed, rows })
     }
@@ -1463,13 +1483,12 @@ impl Qwen4State {
         if self.row_capture_armed {
             return Err(StateError::SnapshotBusy);
         }
-        let [ple0, ple1] = self.ple_history.previous();
-        let mut words = vec![
-            self.model_id,
-            self.position as u64,
-            ple0.into(),
-            ple1.into(),
-        ];
+        let mut words = vec![self.model_id, self.position as u64];
+        // The PLE token context is session state only where a PLE step reads it.
+        if self.ple_conv.is_some() {
+            let [ple0, ple1] = self.ple_history.previous();
+            words.extend([u64::from(ple0), u64::from(ple1)]);
+        }
         let mut marks = Vec::with_capacity(self.qsa.len());
         for layer in &self.qsa {
             let mark = layer.mark();
@@ -1490,10 +1509,20 @@ impl Qwen4State {
         Ok((meta_bytes(&words), self.session_layout(&marks)?))
     }
 
-    /// Byte length of a [`Self::session_parts`] meta: model id, position and
-    /// PLE context, then six words per QSA layer.
+    /// Byte length of a [`Self::session_parts`] meta: model id and position,
+    /// the PLE context (two words, only with PLE), then six words per QSA
+    /// layer.
     pub(crate) fn session_meta_bytes(&self) -> usize {
-        8 * (4 + 6 * self.qsa.len())
+        8 * (2 + self.session_ple_words() + 6 * self.qsa.len())
+    }
+
+    /// Meta words of the PLE token context: two with PLE, none without.
+    fn session_ple_words(&self) -> usize {
+        if self.ple_conv.is_some() {
+            2
+        } else {
+            0
+        }
     }
 
     /// Position, PLE context and QSA marks of a [`Self::session_parts`] meta.
@@ -1506,11 +1535,16 @@ impl Qwen4State {
         if words.len() * 8 != self.session_meta_bytes() || words[0] != self.model_id {
             return Err(StateError::SnapshotShape);
         }
-        let ple = PleHistory::from_previous(
-            self.ple_history.eos_token_id(),
-            [to_u32(words[2])?, to_u32(words[3])?],
-        );
-        let marks = words[4..]
+        let ple_words = self.session_ple_words();
+        let ple = if ple_words == 0 {
+            self.ple_history
+        } else {
+            PleHistory::from_previous(
+                self.ple_history.eos_token_id(),
+                [to_u32(words[2])?, to_u32(words[3])?],
+            )
+        };
+        let marks = words[2 + ple_words..]
             .chunks_exact(6)
             .map(|w| QsaMark {
                 full_len: w[0] as usize,
@@ -1744,7 +1778,9 @@ impl Qwen4State {
             free(layer.partial_values);
             free(layer.selected_indices);
         }
-        free(self.ple_conv);
+        if let Some(ple_conv) = self.ple_conv {
+            free(ple_conv);
+        }
         free(self.hyper_feedback);
         for (ring, inputs, recurrence) in self.row_capture {
             free(ring);
@@ -2003,7 +2039,21 @@ impl Qwen4State {
         }
         self.set_gdn_live(base + keep - 1);
         let arena = &self.snapshot_arena;
-        let row_bytes = self.ple_conv.byte_size() / ple_history_rows;
+        let ple_rollback = match (&self.ple_conv, &arena.ple_conv) {
+            (Some(live), Some(saved)) => {
+                if ple_history_rows == 0 {
+                    return Err(StateError::Length {
+                        what: "PLE rollback history rows",
+                        expected: 1,
+                        actual: 0,
+                    });
+                }
+                Some((live, saved))
+            }
+            (None, None) => None,
+            _ => return Err(StateError::SnapshotShape),
+        };
+        let row_bytes = ple_rollback.map_or(0, |(live, _)| live.byte_size() / ple_history_rows);
         let mut copies =
             Vec::with_capacity(self.gdn.len() * conv_history + self.qsa.len() + ple_history_rows);
         // Convolution history slot `position % conv_history`: the kept verify
@@ -2035,20 +2085,22 @@ impl Qwen4State {
                 layer.selected_indices.byte_size(),
             ));
         }
-        for row in 0..ple_history_rows {
-            let source = keep + row;
-            let (src, src_offset) = if source < ple_history_rows {
-                (&arena.ple_conv.buf, source * row_bytes)
-            } else {
-                (&ple_normed.buf, (source - ple_history_rows) * row_bytes)
-            };
-            copies.push(CopyRegion {
-                dst: &self.ple_conv.buf,
-                dst_offset: row * row_bytes,
-                src,
-                src_offset,
-                bytes: row_bytes,
-            });
+        if let Some((live, saved)) = ple_rollback {
+            for row in 0..ple_history_rows {
+                let source = keep + row;
+                let (src, src_offset) = if source < ple_history_rows {
+                    (&saved.buf, source * row_bytes)
+                } else {
+                    (&ple_normed.buf, (source - ple_history_rows) * row_bytes)
+                };
+                copies.push(CopyRegion {
+                    dst: &live.buf,
+                    dst_offset: row * row_bytes,
+                    src,
+                    src_offset,
+                    bytes: row_bytes,
+                });
+            }
         }
         copy_regions(gpu, &copies).map_err(StateError::Hip)?;
         for (index, layer) in self.qsa.iter_mut().enumerate() {
@@ -2225,6 +2277,32 @@ mod tests {
             Qwen4State::device_bytes(&config, Qwen4StateFormat::F32, &context),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn device_bytes_without_ple_budgets_no_conv_history() {
+        use crate::config::{synthetic_test_config, Qwen4FfnConfig};
+        let build = |with_ple| {
+            synthetic_test_config(
+                Qwen4FfnConfig::Dense {
+                    intermediate_size: 8,
+                },
+                16,
+                4,
+                with_ple,
+                false,
+            )
+        };
+        let (with, without) = (build(true), build(false));
+        let context = Qwen4ContextCommit::legacy(64);
+        let bytes = |config: &Qwen4Config| {
+            Qwen4State::device_bytes(config, Qwen4StateFormat::F32, &context).expect("state bytes")
+        };
+        // Live conv history plus its snapshot-arena mirror, nothing else
+        // differs: `hyper_feedback` is allocated for every profile.
+        let ple = with.ple_conv_history_rows() * with.hidden_size * with.hc_count * 4;
+        assert!(ple > 0 && without.ple_conv_history_rows() == 0);
+        assert_eq!(bytes(&with) - bytes(&without), 2 * ple);
     }
 
     #[test]

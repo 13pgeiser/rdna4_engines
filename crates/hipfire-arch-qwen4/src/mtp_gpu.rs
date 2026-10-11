@@ -11,20 +11,23 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    dense_ref, hyper_desc, hyper_read_desc, qsa_desc, seal_moe_decode, Qwen4GpuForwardError,
-    Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode,
+    Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
-use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights, Qwen4QsaWeights};
+use crate::program::{
+    Qwen4FfnDims, Qwen4HyperReadWeights, Qwen4HyperWriteWeights, Qwen4QsaWeights,
+    QWEN4_QSA_KERNEL_ROPE_THETA,
+};
 use crate::state::{meta_bytes, meta_words, whole_part};
-use crate::weights::{Qwen4Weights, WeightError};
+use crate::weights::{Qwen4FfnWeights, Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::{
-    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
-    DraftHeadRequestState,
-    DraftHeadPolicy, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, Step,
+    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DenseFfnOp, DenseFfnRecipe,
+    DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp,
+    HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
+    MixerPhase, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
@@ -41,7 +44,9 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::fmt;
 
-const MTP_BRANCHES: usize = 4;
+/// HC branches of the Flash-Next batched Append route
+/// (`Qwen4MtpGpu::append_rows`); every other MTP path takes `config.hc_count`.
+const MTP_APPEND_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
 /// Metadata words of an MTP head session snapshot: model id and the state mark.
@@ -190,7 +195,7 @@ pub struct MtpGpuScratch {
     moe_gate: GpuTensor,
     moe_up: GpuTensor,
     moe_hidden: GpuTensor,
-    moe_output: GpuTensor,
+    ffn_output: GpuTensor,
     moe_gate_batch: GpuTensor,
     moe_up_batch: GpuTensor,
     moe_rot_batch: GpuTensor,
@@ -208,7 +213,8 @@ impl MtpGpuScratch {
     /// Element count and dtype of each scratch tensor, in field order.
     fn shapes(config: &Qwen4Config) -> Result<[(usize, DType); MTP_SCRATCH_TENSORS], MtpGpuError> {
         let hidden = config.hidden_size;
-        let wide = MTP_BRANCHES
+        let wide = config
+            .hc_count
             .checked_mul(hidden)
             .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
         let q_width = config
@@ -224,9 +230,36 @@ impl MtpGpuScratch {
             .ok_or_else(|| invalid("MTP index width overflow"))?;
         let hc_up = hc_up_elements(MTP_HC_ROWS, wide, config.hc_lowrank)
             .ok_or_else(|| invalid("MTP HC up scratch overflow"))?;
-        let max_rotation = wide.max(hidden).max(config.hc_lowrank).max(q_width);
-        let routed = config.num_experts_per_tok * config.moe_intermediate_size;
-        Ok([
+        // FFN extents come from the typed dims: a MoE profile's routed and
+        // shared widths, or a dense profile's one intermediate width (MoE
+        // extents are zero for dense, dense for MoE; every buffer is then
+        // raised to one element below).
+        let (num_experts, top_k, moe_intermediate, shared_intermediate, dense_intermediate) =
+            match program_dims(config).ffn {
+                Qwen4FfnDims::Moe {
+                    num_experts,
+                    experts_per_token,
+                    intermediate,
+                    shared_intermediate,
+                } => (
+                    num_experts,
+                    experts_per_token,
+                    intermediate,
+                    shared_intermediate,
+                    0,
+                ),
+                Qwen4FfnDims::Dense { intermediate } => (0, 0, 0, 0, intermediate),
+            };
+        let max_rotation = wide
+            .max(hidden)
+            .max(config.hc_lowrank)
+            .max(q_width)
+            .max(dense_intermediate);
+        let routed = top_k * moe_intermediate;
+        // One-token gate/up rows: routed slots * intermediate for MoE (the
+        // per-token batch scratch), the dense intermediate otherwise.
+        let ffn_batch = routed.max(dense_intermediate);
+        let mut shapes = [
             (std::mem::size_of::<i32>(), DType::Raw),
             (hidden, DType::F32),
             (hidden, DType::F32),
@@ -255,24 +288,26 @@ impl MtpGpuScratch {
                 config.qsa_selected_capacity() * std::mem::size_of::<i32>(),
                 DType::Raw,
             ),
-            (config.num_experts, DType::F32),
+            (num_experts, DType::F32),
             (hidden, DType::F32),
-            (2 * config.moe_intermediate_size, DType::F32),
-            (config.moe_intermediate_size, DType::F32),
-            (config.moe_intermediate_size, DType::F32),
-            (config.moe_intermediate_size, DType::F32),
+            (2 * moe_intermediate, DType::F32),
+            (moe_intermediate, DType::F32),
+            (moe_intermediate, DType::F32),
+            (moe_intermediate, DType::F32),
             (hidden, DType::F32),
+            (ffn_batch, DType::F32),
+            (ffn_batch, DType::F32),
             (routed, DType::F32),
-            (routed, DType::F32),
-            (routed, DType::F32),
-            (config.num_experts_per_tok, DType::F32),
-            (config.num_experts_per_tok, DType::F32),
-            (
-                config.num_experts_per_tok * hidden + hidden.div_ceil(4),
-                DType::F32,
-            ),
-            (config.shared_expert_intermediate_size.max(1), DType::F32),
-        ])
+            (top_k, DType::F32),
+            (top_k, DType::F32),
+            (top_k * hidden + hidden.div_ceil(4), DType::F32),
+            (shared_intermediate, DType::F32),
+        ];
+        for shape in &mut shapes {
+            // Every buffer holds at least one element.
+            shape.0 = shape.0.max(1);
+        }
+        Ok(shapes)
     }
 
     /// Device bytes [`Self::new`] allocates.
@@ -328,7 +363,7 @@ impl MtpGpuScratch {
             moe_gate: next(),
             moe_up: next(),
             moe_hidden: next(),
-            moe_output: next(),
+            ffn_output: next(),
             moe_gate_batch: next(),
             moe_up_batch: next(),
             moe_rot_batch: next(),
@@ -370,7 +405,7 @@ impl MtpGpuScratch {
             self.moe_gate,
             self.moe_up,
             self.moe_hidden,
-            self.moe_output,
+            self.ffn_output,
             self.moe_gate_batch,
             self.moe_up_batch,
             self.moe_rot_batch,
@@ -393,7 +428,7 @@ impl MtpGpuScratch {
 #[derive(Clone, Copy)]
 struct AppendWidths {
     hidden: usize,
-    /// `MTP_BRANCHES * hidden`: one row of the HC streams.
+    /// `hc_count * hidden`: one row of the HC streams.
     wide: usize,
     /// Index query heads then index key: `(indexer_n_heads + indexer_kv_heads) * indexer_head_dim`.
     index_width: usize,
@@ -408,7 +443,7 @@ impl AppendWidths {
             .checked_mul(config.indexer_head_dim)?;
         Some(Self {
             hidden: config.hidden_size,
-            wide: MTP_BRANCHES.checked_mul(config.hidden_size)?,
+            wide: config.hc_count.checked_mul(config.hidden_size)?,
             index_width: config
                 .indexer_n_heads
                 .checked_mul(config.indexer_head_dim)?
@@ -635,13 +670,28 @@ struct AppendWeights<'a> {
     qsa: Qwen4QsaWeights<'a>,
 }
 
+/// The bound native MTP head; a profile without one has no MTP executor.
+fn bound_mtp(weights: &Qwen4Weights) -> Result<&crate::weights::Qwen4MtpWeights, MtpGpuError> {
+    weights
+        .mtp
+        .as_ref()
+        .ok_or_else(|| invalid("profile has no native MTP head"))
+}
+
 impl<'a> AppendWeights<'a> {
     fn resolve(
         weights: &'a Qwen4Weights,
         config: &Qwen4Config,
         w: &AppendWidths,
     ) -> Result<Self, MtpGpuError> {
-        if config.hc_count != MTP_BRANCHES {
+        if !config.profile.is_flash_next() {
+            return Err(invalid(format!(
+                "MTP batched append is the Flash-Next route (K = 2560 staged Q8_0 \
+                 projections, {MTP_APPEND_BRANCHES} HC branches); profile {} takes the per-row route",
+                config.profile.id()
+            )));
+        }
+        if config.hc_count != MTP_APPEND_BRANCHES {
             return Err(invalid("MTP batched append needs four HC branches"));
         }
         let check = |label: &str,
@@ -662,17 +712,36 @@ impl<'a> AppendWeights<'a> {
         if embedding.dtype != DType::Q8_0 {
             return Err(invalid("MTP batched append needs a Q8_0 embedding table"));
         }
-        let fc_embedding = dense_ref(weights, &weights.mtp.fc_embedding)?;
-        check("fc_embedding", &fc_embedding, DType::BF16, w.hidden, w.hidden)?;
-        let fc_hidden = dense_ref(weights, &weights.mtp.fc_hidden)?;
+        let mtp = bound_mtp(weights)?;
+        let fc_embedding = dense_ref(weights, &mtp.fc_embedding)?;
+        check(
+            "fc_embedding",
+            &fc_embedding,
+            DType::BF16,
+            w.hidden,
+            w.hidden,
+        )?;
+        let fc_hidden = dense_ref(weights, &mtp.fc_hidden)?;
         check("fc_hidden", &fc_hidden, DType::BF16, w.hidden, w.hidden)?;
-        let hc = hyper_desc(weights, &weights.mtp.attn_hyper)?.read;
+        let hc = hyper_desc(weights, &mtp.attn_hyper)?.read;
         if !w.wide.is_multiple_of(32) {
             return Err(invalid("MTP batched append HC down needs K % 32 == 0"));
         }
-        check("HC down", &hc.input_mix_down, DType::BF16, config.hc_lowrank, w.wide)?;
-        check("HC up", &hc.input_mix_up, DType::BF16, w.wide, config.hc_lowrank)?;
-        let qsa = qsa_desc(weights, &weights.mtp.attention)?;
+        check(
+            "HC down",
+            &hc.input_mix_down,
+            DType::BF16,
+            config.hc_lowrank,
+            w.wide,
+        )?;
+        check(
+            "HC up",
+            &hc.input_mix_up,
+            DType::BF16,
+            w.wide,
+            config.hc_lowrank,
+        )?;
+        let qsa = qsa_desc(weights, &mtp.attention)?;
         // The tiled Q8_0 projection is the K = 2560 staged kernel.
         if w.hidden != 2560 {
             return Err(invalid("MTP batched append Q8_0 projections need hidden 2560"));
@@ -682,8 +751,8 @@ impl<'a> AppendWeights<'a> {
         check("v_proj", &qsa.v, DType::Q8_0, w.kv_width, w.hidden)?;
         Ok(Self {
             embedding,
-            norm_embedding: weights.resident(&weights.mtp.pre_fc_norm_embedding)?,
-            norm_hidden: weights.resident(&weights.mtp.pre_fc_norm_hidden)?,
+            norm_embedding: weights.resident(&mtp.pre_fc_norm_embedding)?,
+            norm_hidden: weights.resident(&mtp.pre_fc_norm_hidden)?,
             fc_embedding,
             fc_hidden,
             hc,
@@ -1013,7 +1082,8 @@ impl MtpGpuState {
             .checked_mul(std::mem::size_of::<i32>())?
             .checked_add(std::mem::size_of::<i32>())?
             .checked_add(
-                MTP_BRANCHES
+                config
+                    .hc_count
                     .checked_mul(config.hidden_size)?
                     .checked_mul(std::mem::size_of::<f32>())?,
             )?;
@@ -1057,7 +1127,7 @@ impl MtpGpuState {
                 false,
             ),
             (std::mem::size_of::<i32>(), DType::Raw, false),
-            (MTP_BRANCHES * config.hidden_size, DType::F32, false),
+            (config.hc_count * config.hidden_size, DType::F32, false),
         ];
         let mut allocated = Vec::with_capacity(shapes.len());
         for (elements, dtype, context) in shapes {
@@ -1692,7 +1762,8 @@ pub fn lab_head_items(gpu: &Gpu, head: &MtpGpuState) -> Result<Vec<(String, Vec<
 pub struct Qwen4MtpGpu {
     pub(crate) scratch: MtpGpuScratch,
     pub(crate) state: MtpGpuState,
-    pub(crate) moe: Qwen4MoeLayerRuntime,
+    /// The MTP layer's routed-expert runtime: `Some` exactly for a MoE FFN.
+    pub(crate) moe: Option<Qwen4MoeLayerRuntime>,
     pub(crate) max_seq: usize,
     /// Draft ranking (`HIPFIRE_MTP_DRAFT_HEAD=mq2..mq6[r]`, default `mq2r`;
     /// anything else = the model's own head). On the shipped Q8_0 head an
@@ -1722,13 +1793,28 @@ pub(crate) enum MtpStep {
     Append,
 }
 
+/// The FFN call of one non-Append MTP step, in the profile's FFN kind.
+enum MtpFfnCall<'a> {
+    Moe(hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>),
+    Dense(DenseFfnOp<'a>),
+}
+
 /// Draft ranking policy (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`) and row
-/// layout of the MTP draft head.
+/// layout of the MTP draft head. Only the Flash-Next head takes the
+/// quantized ranking copy (its requant and re-score kernels are K = 2560 /
+/// 256-group shaped); a developer profile ranks the model's own head.
 fn draft_head_config(config: &Qwen4Config) -> (DraftHeadPolicy, DraftHeadLayout) {
-    let policy = DraftHeadPolicy::parse(
-        &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
-            .unwrap_or_else(|_| "mq2r".to_string()),
-    );
+    let policy = if config.profile.is_flash_next() {
+        DraftHeadPolicy::parse(
+            &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
+                .unwrap_or_else(|_| "mq2r".to_string()),
+        )
+    } else {
+        DraftHeadPolicy {
+            copy: None,
+            rescore: false,
+        }
+    };
     let layout = DraftHeadLayout {
         vocab: config.vocab_size,
         hidden: config.hidden_size,
@@ -1737,6 +1823,62 @@ fn draft_head_config(config: &Qwen4Config) -> (DraftHeadPolicy, DraftHeadLayout)
         full_hold: DRAFT_FULL_HOLD,
     };
     (policy, layout)
+}
+
+/// The config half of [`admit_mtp`]: the profile declares a head and its RoPE
+/// base is the one the QSA kernels implement. Flash-Next keeps its pinned
+/// `Qwen4MtpConfig::validate` contract unchanged.
+fn admit_mtp_config(config: &Qwen4Config) -> Result<(), MtpGpuError> {
+    let mtp = config
+        .mtp
+        .as_ref()
+        .ok_or_else(|| invalid("profile has no native MTP head"))?;
+    if config.profile.is_flash_next() {
+        mtp.validate().map_err(MtpGpuError::Invalid)?;
+    } else {
+        mtp.validate_shape().map_err(MtpGpuError::Invalid)?;
+        // The MTP QSA runs the trunk's RoPE kernels, which hard-code the base.
+        if mtp.rope_theta != QWEN4_QSA_KERNEL_ROPE_THETA {
+            return Err(invalid(format!(
+                "profile {} MTP rope_theta {} differs from the {} base hard-coded in the QSA RoPE kernels",
+                config.profile.id(),
+                mtp.rope_theta,
+                QWEN4_QSA_KERNEL_ROPE_THETA
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Admit the head before anything is allocated: the config contract of
+/// [`admit_mtp_config`] and FFN weights of the profile's FFN kind and width.
+fn admit_mtp(weights: &Qwen4Weights, config: &Qwen4Config) -> Result<(), MtpGpuError> {
+    admit_mtp_config(config)?;
+    let head = bound_mtp(weights)?;
+    match (&config.ffn, &head.ffn) {
+        (crate::config::Qwen4FfnConfig::Moe { .. }, Qwen4FfnWeights::Moe(_)) => Ok(()),
+        (
+            crate::config::Qwen4FfnConfig::Dense { intermediate_size },
+            Qwen4FfnWeights::Dense(dense),
+        ) => {
+            let gate = dense_ref(weights, &dense.gate)?;
+            let up = dense_ref(weights, &dense.up)?;
+            let down = dense_ref(weights, &dense.down)?;
+            if (gate.m, gate.k) != (*intermediate_size, config.hidden_size)
+                || (up.m, up.k) != (*intermediate_size, config.hidden_size)
+                || (down.m, down.k) != (config.hidden_size, *intermediate_size)
+            {
+                return Err(invalid(format!(
+                    "MTP dense FFN is gate {}x{} / up {}x{} / down {}x{}, profile expects intermediate {intermediate_size} and hidden {}",
+                    gate.m, gate.k, up.m, up.k, down.m, down.k, config.hidden_size
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(invalid(
+            "MTP FFN weights are not of the profile's FFN kind (dense/MoE)",
+        )),
+    }
 }
 
 impl Qwen4MtpGpu {
@@ -1769,15 +1911,11 @@ impl Qwen4MtpGpu {
         max_seq: usize,
         backend: Qwen4KvBackend,
     ) -> Result<Self, MtpGpuError> {
-        config
-            .mtp
-            .as_ref()
-            .ok_or_else(|| invalid("profile has no native MTP head"))?
-            .validate()
-            .map_err(MtpGpuError::Invalid)?;
+        admit_mtp(weights, config)?;
         if max_seq == 0 || max_seq > config.max_position_embeddings {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
+        let head = bound_mtp(weights)?;
         let scratch = MtpGpuScratch::new(gpu, config)?;
         let state = match MtpGpuState::new_with_backend(gpu, config, max_seq, backend) {
             Ok(state) => state,
@@ -1786,13 +1924,18 @@ impl Qwen4MtpGpu {
                 return Err(error);
             }
         };
-        let moe = match Qwen4MoeLayerRuntime::from_moe(gpu, weights, &weights.mtp.moe, 0, config) {
-            Ok(moe) => moe,
-            Err(error) => {
-                let _ = state.free_gpu(gpu);
-                let _ = scratch.free_gpu(gpu);
-                return Err(error.into());
+        let moe = match head.ffn.moe() {
+            Some(moe_weights) => {
+                match Qwen4MoeLayerRuntime::from_moe(gpu, weights, moe_weights, 0, config) {
+                    Ok(moe) => Some(moe),
+                    Err(error) => {
+                        let _ = state.free_gpu(gpu);
+                        let _ = scratch.free_gpu(gpu);
+                        return Err(error.into());
+                    }
+                }
             }
+            None => None,
         };
         let (policy, layout) = draft_head_config(config);
         let draft = weights
@@ -1802,7 +1945,7 @@ impl Qwen4MtpGpu {
         let draft = match draft {
             Ok(draft) => draft,
             Err(error) => {
-                let _ = moe.free_gpu(gpu);
+                let _ = moe.map(|moe| moe.free_gpu(gpu));
                 let _ = state.free_gpu(gpu);
                 let _ = scratch.free_gpu(gpu);
                 return Err(error);
@@ -1828,7 +1971,7 @@ impl Qwen4MtpGpu {
         let draft_error = draft.free_gpu(gpu);
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
-        let moe_error = moe.free_gpu(gpu);
+        let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
         draft_error
             .or(scratch_error)
             .or(state_error)
@@ -1846,7 +1989,7 @@ impl Qwen4MtpGpu {
             &self.scratch.moe_gate,
             &self.scratch.moe_up,
             &self.scratch.moe_hidden,
-            &self.scratch.moe_output,
+            &self.scratch.ffn_output,
             &self.scratch.moe_gate_batch,
             &self.scratch.moe_up_batch,
             &self.scratch.moe_rot_batch,
@@ -2120,7 +2263,8 @@ impl Qwen4MtpGpu {
         fresh_qsa_selection: bool,
         step: MtpStep,
     ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
-        let wide = MTP_BRANCHES
+        let wide = config
+            .hc_count
             .checked_mul(config.hidden_size)
             .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
         if let Some(hidden) = backbone_hidden {
@@ -2159,16 +2303,17 @@ impl Qwen4MtpGpu {
             .copy_from_slice(&(token as i32).to_ne_bytes());
         gpu.memcpy_htod_auto(&self.scratch.token_ids.buf, &self.scratch.host_token_bytes)?;
 
+        let mtp = bound_mtp(weights)?;
         let lengths = {
             let scratch = &self.scratch;
             let state = &self.state;
             let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
             let hidden = config.hidden_size;
             let ctx = DispatchCtx::new(gpu);
-            let attn = hyper_desc(weights, &weights.mtp.attn_hyper)?;
-            let mlp = hyper_desc(weights, &weights.mtp.mlp_hyper)?;
-            let final_read = hyper_read_desc(weights, &weights.mtp.final_hyper)?;
-            let qsa = qsa_desc(weights, &weights.mtp.attention)?;
+            let attn = hyper_desc(weights, &mtp.attn_hyper)?;
+            let mlp = hyper_desc(weights, &mtp.mlp_hyper)?;
+            let final_read = hyper_read_desc(weights, &mtp.final_hyper)?;
+            let qsa = qsa_desc(weights, &mtp.attention)?;
             let mode = match (step, fresh_qsa_selection) {
                 (MtpStep::Append, _) => IndexedAttentionMode::AppendOnly,
                 (_, true) => IndexedAttentionMode::Full,
@@ -2223,6 +2368,7 @@ impl Qwen4MtpGpu {
                 heads: config.num_attention_heads,
                 kv_heads: config.num_key_value_heads,
                 head_dim: config.head_dim,
+                rotary_dim: config.rotary_dim(),
                 input_width: hidden,
                 rotation: &scratch.rotation,
                 mode,
@@ -2230,35 +2376,61 @@ impl Qwen4MtpGpu {
                 phase: MixerPhase::Whole,
             };
             let lengths = attention.next_lengths()?;
-            let moe = if step == MtpStep::Append {
+            // The MTP layer's FFN is the trunk's kind (`attach` refuses a
+            // head whose FFN weights disagree with the profile).
+            let ffn = if step == MtpStep::Append {
                 None
             } else {
-                Some(seal_moe_decode(
-                    &ctx,
-                    config,
-                    0,
-                    &self.moe,
-                    &scratch.hc_mixed,
-                    &scratch.moe_output,
-                    Qwen4MoeScratch {
-                        router_logits: &scratch.router_logits,
-                        scalar_buf: &scratch.moe_scalar,
-                        x_rot_local: &scratch.moe_x_rot,
-                        gate_up_buf: &scratch.moe_gate_up,
-                        gate_buf: &scratch.moe_gate,
-                        up_buf: &scratch.moe_up,
-                        ffn_hidden: &scratch.moe_hidden,
-                        // The shared down projection must not overwrite the
-                        // routed accumulator.
-                        ffn_out: &scratch.projected_embedding,
-                        gate_batch: &scratch.moe_gate_batch,
-                        up_batch: &scratch.moe_up_batch,
-                        rot_batch: &scratch.moe_rot_batch,
-                        topk_indices: &scratch.moe_topk_indices,
-                        topk_weights: &scratch.moe_topk_weights,
-                        down_expanded: &scratch.moe_down_expanded,
-                    },
-                )?)
+                Some(match (&mtp.ffn, self.moe.as_ref()) {
+                    (Qwen4FfnWeights::Moe(_), Some(runtime)) => {
+                        MtpFfnCall::Moe(seal_moe_decode(
+                            &ctx,
+                            config,
+                            0,
+                            runtime,
+                            &scratch.hc_mixed,
+                            &scratch.ffn_output,
+                            Qwen4MoeScratch {
+                                router_logits: &scratch.router_logits,
+                                scalar_buf: &scratch.moe_scalar,
+                                x_rot_local: &scratch.moe_x_rot,
+                                gate_up_buf: &scratch.moe_gate_up,
+                                gate_buf: &scratch.moe_gate,
+                                up_buf: &scratch.moe_up,
+                                ffn_hidden: &scratch.moe_hidden,
+                                // The shared down projection must not
+                                // overwrite the routed accumulator.
+                                ffn_out: &scratch.projected_embedding,
+                                gate_batch: &scratch.moe_gate_batch,
+                                up_batch: &scratch.moe_up_batch,
+                                rot_batch: &scratch.moe_rot_batch,
+                                topk_indices: &scratch.moe_topk_indices,
+                                topk_weights: &scratch.moe_topk_weights,
+                                down_expanded: &scratch.moe_down_expanded,
+                            },
+                        )?)
+                    }
+                    (Qwen4FfnWeights::Dense(dense), None) => {
+                        let gate = dense_ref(weights, &dense.gate)?;
+                        MtpFfnCall::Dense(DenseFfnOp {
+                            recipe: DenseFfnRecipe::SiluBf16Source,
+                            intermediate: gate.m,
+                            gate,
+                            up: dense_ref(weights, &dense.up)?,
+                            down: dense_ref(weights, &dense.down)?,
+                            input: &scratch.hc_mixed,
+                            // The MoE batch scratch, sized to the dense
+                            // intermediate for a dense profile.
+                            gate_scratch: &scratch.moe_gate_batch,
+                            up_scratch: &scratch.moe_up_batch,
+                            output: &scratch.ffn_output,
+                            rotation: &scratch.rotation,
+                            rows: 1,
+                            hidden,
+                        })
+                    }
+                    _ => return Err(invalid("MTP FFN weights and runtime disagree")),
+                })
             };
             let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
             steps.push(Step::Embed(EmbeddingOp {
@@ -2271,14 +2443,14 @@ impl Qwen4MtpGpu {
             }));
             steps.push(Step::HyperNorm(HyperNormOp {
                 input: &scratch.token_embedding,
-                norm_weight: weights.resident(&weights.mtp.pre_fc_norm_embedding)?,
+                norm_weight: weights.resident(&mtp.pre_fc_norm_embedding)?,
                 normalized: &scratch.embedding_norm,
                 branches: 1,
                 hidden,
                 state_bf16: false,
             }));
             steps.push(Step::Project(ProjectOp {
-                weight: dense_ref(weights, &weights.mtp.fc_embedding)?,
+                weight: dense_ref(weights, &mtp.fc_embedding)?,
                 input: &scratch.embedding_norm,
                 output: &scratch.projected_embedding,
                 rows: 1,
@@ -2286,30 +2458,30 @@ impl Qwen4MtpGpu {
             }));
             steps.push(Step::HyperNorm(HyperNormOp {
                 input: backbone_hidden,
-                norm_weight: weights.resident(&weights.mtp.pre_fc_norm_hidden)?,
+                norm_weight: weights.resident(&mtp.pre_fc_norm_hidden)?,
                 normalized: &scratch.hidden_norm,
-                branches: MTP_BRANCHES,
+                branches: config.hc_count,
                 hidden,
                 state_bf16: false,
             }));
             // Both branch rows in one projection (each bitwise its own).
             steps.push(Step::Project(ProjectOp {
-                weight: dense_ref(weights, &weights.mtp.fc_hidden)?,
+                weight: dense_ref(weights, &mtp.fc_hidden)?,
                 input: &scratch.hidden_norm,
                 output: &scratch.projected_hidden,
-                rows: MTP_BRANCHES,
+                rows: config.hc_count,
                 rotation: Some(&scratch.rotation),
             }));
             steps.push(Step::BroadcastAdd(BroadcastAddOp {
                 rows_input: &scratch.projected_hidden,
                 row: &scratch.projected_embedding,
                 output: &scratch.wide,
-                rows: MTP_BRANCHES,
+                rows: config.hc_count,
                 width: hidden,
             }));
             steps.push(Step::HyperRead(hc_read(&attn.read, scratch, config)));
             steps.push(Step::IndexedAttention(attention));
-            if let Some(moe) = moe {
+            if let Some(ffn) = ffn {
                 steps.push(Step::HyperWrite(hc_write(
                     &attn.write,
                     &scratch.projected_embedding,
@@ -2317,14 +2489,19 @@ impl Qwen4MtpGpu {
                     config,
                 )));
                 steps.push(Step::HyperRead(hc_read(&mlp.read, scratch, config)));
-                steps.push(Step::Clear(ClearOp {
-                    tensor: &scratch.moe_output,
-                    elements: hidden,
-                }));
-                steps.push(Step::Moe(moe));
+                match ffn {
+                    MtpFfnCall::Moe(moe) => {
+                        steps.push(Step::Clear(ClearOp {
+                            tensor: &scratch.ffn_output,
+                            elements: hidden,
+                        }));
+                        steps.push(Step::Moe(moe));
+                    }
+                    MtpFfnCall::Dense(dense) => steps.push(Step::DenseFfn(dense)),
+                }
                 steps.push(Step::HyperWrite(hc_write(
                     &mlp.write,
-                    &scratch.moe_output,
+                    &scratch.ffn_output,
                     scratch,
                     config,
                 )));
@@ -2362,7 +2539,7 @@ impl Qwen4MtpGpu {
     /// kernel with a rows grid, or a multi-row kernel whose per-row
     /// reduction order is the single-row kernel's.
     ///
-    /// `hidden` holds at least `tokens.len()` rows of `MTP_BRANCHES * hidden`
+    /// `hidden` holds at least `tokens.len()` rows of `hc_count * hidden`
     /// F32. Draft request state sees every token in order, as `forward_token`
     /// observes each; the QSA state commits `position + tokens.len()` rows.
     /// `wide_hidden`, the selection and its length are not touched (the
@@ -2526,26 +2703,26 @@ impl Qwen4MtpGpu {
                 input: &backbone,
                 norm_weight: mw.norm_hidden,
                 normalized: &hidden_norm,
-                branches: MTP_BRANCHES,
+                branches: config.hc_count,
                 hidden: w.hidden,
                 state_bf16: false,
             },
         )?;
         // The four branch rows of a token are four projection rows
-        // (per-row: `gemv_bf16_xf32_x4_rows` over rows = MTP_BRANCHES).
+        // (per-row: `gemv_bf16_xf32_x4_rows` over rows = hc_count).
         gpu.gemm_bf16_xf32_multirow(
             mw.fc_hidden.buf,
             &hidden_norm,
             &projected_hidden,
             mw.fc_hidden.m,
             mw.fc_hidden.k,
-            rows * MTP_BRANCHES,
+            rows * config.hc_count,
         )?;
         gpu.broadcast_add_rows_f32(
             &projected_hidden,
             &projected_embedding,
             &wide,
-            MTP_BRANCHES,
+            config.hc_count,
             w.hidden,
             rows,
         )?;
@@ -2660,6 +2837,100 @@ impl Qwen4MtpGpu {
         state.selected_len = 0;
         state.step_index = state.step_index.wrapping_add(rows);
         Ok(())
+    }
+}
+
+/// One developer-profile MTP head row read back to the host
+/// ([`crate::bundle::Qwen4Bundle::mtp_dev_row`]).
+#[cfg(feature = "qwen4-dev-profiles")]
+pub struct MtpDevRow {
+    /// The draft token the head ranked.
+    pub draft_token: u32,
+    /// Head logits over the vocabulary (the model's own LM head, token order).
+    pub logits: Vec<f32>,
+    /// The mixed `[hidden]` row the LM head reads (after the final HC read).
+    pub sample_hidden: Vec<f32>,
+    /// The `[hc_count * hidden]` streams after the layer's MLP HC write.
+    pub multi_hidden: Vec<f32>,
+}
+
+#[cfg(feature = "qwen4-dev-profiles")]
+impl crate::bundle::Qwen4Bundle {
+    /// Developer-profile direct input of the native MTP head: one Predict
+    /// step of `token` at `position` (the head's next position) conditioned
+    /// on the caller's `[hc_count * hidden]` backbone streams `backbone`
+    /// instead of the head's own previous hidden, with a fresh QSA
+    /// selection. The step is the production `forward_token`; only the
+    /// hidden source and the read-back are different. Refused for the
+    /// pinned Flash-Next profile.
+    pub fn mtp_dev_row(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        backbone: &[f32],
+        position: usize,
+    ) -> Result<MtpDevRow, crate::bundle::BundleError> {
+        use crate::bundle::BundleError;
+        let forward = |message: String| BundleError::Forward(message);
+        if self.config.profile.is_flash_next() {
+            return Err(forward(
+                "the direct MTP row feed is for developer profiles only".into(),
+            ));
+        }
+        let wide = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| forward("MTP wide dimension overflow".into()))?;
+        if backbone.len() != wide {
+            return Err(forward(format!(
+                "MTP backbone row has {} values, expected {wide}",
+                backbone.len()
+            )));
+        }
+        let mtp = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| forward("Qwen4 MTP resources are not attached".into()))?;
+        let required = position
+            .checked_add(1)
+            .ok_or_else(|| forward("Qwen4 MTP position overflows".into()))?;
+        mtp.ensure_mapped_capacity(gpu, required)
+            .map_err(|error| forward(error.to_string()))?;
+        let input = gpu
+            .upload_f32(backbone, &[wide])
+            .map_err(BundleError::Hip)?;
+        let step = mtp.forward_token(
+            gpu,
+            &self.weights,
+            &self.config,
+            token,
+            Some(&input),
+            position,
+            true,
+            MtpStep::Predict,
+        );
+        let freed = gpu.free_tensor(input);
+        let draft_token = step
+            .map_err(|error| forward(error.to_string()))?
+            .ok_or_else(|| forward("MTP prediction requested but no token produced".into()))?;
+        freed.map_err(BundleError::Hip)?;
+        gpu.hip.device_synchronize().map_err(BundleError::Hip)?;
+        let mut row = MtpDevRow {
+            draft_token,
+            logits: Vec::new(),
+            sample_hidden: Vec::new(),
+            multi_hidden: Vec::new(),
+        };
+        for (tensor, out) in [
+            (mtp.draft.logits(), &mut row.logits),
+            (&mtp.scratch.hc_mixed, &mut row.sample_hidden),
+            (&mtp.state.wide_hidden, &mut row.multi_hidden),
+        ] {
+            gpu.download_f32_into(tensor, out)
+                .map_err(BundleError::Hip)?;
+        }
+        Ok(row)
     }
 }
 
@@ -2879,7 +3150,7 @@ mod tests {
     fn mtp_scratch_hc_up_is_one_row_census() {
         let config = compact_test_config();
         let shapes = MtpGpuScratch::shapes(&config).expect("canonical scratch shapes");
-        let wide = MTP_BRANCHES * config.hidden_size;
+        let wide = config.hc_count * config.hidden_size;
         assert_eq!(shapes[11], (wide, DType::F32), "hc_up is rows x W F32");
         let bytes = MtpGpuScratch::device_bytes(&config).expect("scratch bytes");
         assert_eq!(bytes, 659_824);
@@ -2888,13 +3159,126 @@ mod tests {
         assert_eq!((former - bytes) as f64 / (1u64 << 20) as f64, 12.4609375);
     }
 
+    fn flash_next_mtp_plan_bytes(config: &Qwen4Config) -> usize {
+        // The pre-profile-derived plan, written out from the MoE scalars: 36
+        // tensors, F32 unless noted.
+        let h = config.hidden_size;
+        let w = config.hc_count * h;
+        let q = config.num_attention_heads * config.head_dim;
+        let kv = config.num_key_value_heads * config.head_dim;
+        let index = (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+        let hc_up = hc_up_elements(1, w, config.hc_lowrank).unwrap();
+        let rotation = w.max(h).max(config.hc_lowrank).max(q);
+        let routed = config.num_experts_per_tok * config.moe_intermediate_size;
+        let bf16 = h.max(config.hc_lowrank).max(q).max(kv);
+        let raw = 4 + config.qsa_selected_capacity() * 4;
+        let f32_elements = h
+            + h
+            + h
+            + w
+            + h
+            + w
+            + w
+            + w
+            + w
+            + config.hc_lowrank
+            + hc_up
+            + h
+            + config.hc_count
+            + rotation
+            + index
+            + 2 * q
+            + kv
+            + kv
+            + q
+            + config.num_experts
+            + h
+            + 2 * config.moe_intermediate_size
+            + 3 * config.moe_intermediate_size
+            + h
+            + 3 * routed
+            + 2 * config.num_experts_per_tok
+            + config.num_experts_per_tok * h
+            + h.div_ceil(4)
+            + config.shared_expert_intermediate_size;
+        f32_elements * 4 + raw + bf16 * 2
+    }
+
+    #[test]
+    fn flash_next_mtp_scratch_bytes_are_unchanged() {
+        let config = compact_test_config();
+        assert_eq!(
+            MtpGpuScratch::device_bytes(&config).unwrap(),
+            flash_next_mtp_plan_bytes(&config)
+        );
+    }
+
+    fn tiny_dense() -> Qwen4Config {
+        crate::config::synthetic_test_config(
+            crate::config::Qwen4FfnConfig::Dense {
+                intermediate_size: 8,
+            },
+            16,
+            4,
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn dense_mtp_scratch_is_profile_derived_and_never_empty() {
+        let config = tiny_dense();
+        let shapes = MtpGpuScratch::shapes(&config).unwrap();
+        assert!(shapes.iter().all(|&(elements, _)| elements >= 1));
+        // Two HC branches, not the Flash-Next four.
+        let wide = config.hc_count * config.hidden_size;
+        assert_eq!(wide, 32);
+        assert_eq!(shapes[7], (wide, DType::F32), "wide streams");
+        assert_eq!(shapes[8], (wide, DType::F32), "backbone hidden");
+        // Dense gate/up rows reuse the batch scratch at the intermediate width.
+        assert_eq!(shapes[29], (8, DType::F32));
+        assert_eq!(shapes[30], (8, DType::F32));
+        // MoE-only buffers are the one-element floor.
+        for index in [22, 24, 25, 26, 27, 31, 32, 33, 35] {
+            assert_eq!(shapes[index].0, 1, "tensor {index}");
+        }
+        // The FWHT basis scratch covers the dense intermediate width.
+        assert!(shapes[15].0 >= 8);
+        assert!(MtpGpuScratch::device_bytes(&config).is_ok());
+    }
+
+    #[test]
+    fn mtp_refuses_a_rope_base_the_qsa_kernels_do_not_implement() {
+        let mut config = tiny_dense();
+        let message = admit_mtp_config(&config).unwrap_err().to_string();
+        assert!(
+            message.contains("10000 ")
+                && message.contains(&QWEN4_QSA_KERNEL_ROPE_THETA.to_string()),
+            "{message}"
+        );
+        config.mtp.as_mut().unwrap().rope_theta = QWEN4_QSA_KERNEL_ROPE_THETA;
+        admit_mtp_config(&config).expect("kernel base admitted");
+        config.mtp = None;
+        assert!(admit_mtp_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("no native MTP head"));
+        admit_mtp_config(&compact_test_config()).expect("Flash-Next head admitted");
+    }
+
+    #[test]
+    fn developer_profiles_rank_their_own_head() {
+        let (policy, _) = draft_head_config(&tiny_dense());
+        assert_eq!((policy.copy, policy.rescore), (None, false));
+    }
+
     /// Every subview the shared HC read takes from `up` must fit the
     /// scratch: a second row (either the F32 projection or the BF16 packing
     /// view), a rank wider than the row, or a non-F32 buffer is refused.
     #[test]
     fn hc_up_subview_larger_than_scratch_is_rejected() {
         let config = compact_test_config();
-        let wide = MTP_BRANCHES * config.hidden_size;
+        let wide = config.hc_count * config.hidden_size;
         let rank = config.hc_lowrank;
         let up = descriptor(
             hc_up_elements(MTP_HC_ROWS, wide, rank).expect("one-row extent"),
@@ -2932,7 +3316,7 @@ mod tests {
         };
         let config = compact_test_config();
         let scratch = MtpGpuScratch::new(&mut gpu, &config).expect("canonical MTP scratch");
-        let wide = MTP_BRANCHES * config.hidden_size;
+        let wide = config.hc_count * config.hidden_size;
         assert_eq!(scratch.hc_up.numel(), wide);
         assert_eq!(scratch.hc_up.buf.size(), wide * 4);
         let shapes = MtpGpuScratch::shapes(&config).expect("shapes");
@@ -2965,7 +3349,7 @@ mod tests {
             &scratch.moe_gate,
             &scratch.moe_up,
             &scratch.moe_hidden,
-            &scratch.moe_output,
+            &scratch.ffn_output,
             &scratch.moe_gate_batch,
             &scratch.moe_up_batch,
             &scratch.moe_rot_batch,

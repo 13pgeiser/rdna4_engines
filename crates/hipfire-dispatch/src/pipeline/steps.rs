@@ -105,6 +105,10 @@ pub enum Step<'a> {
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
     /// Per-row broadcast add of one activation row.
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
+    /// Dense gated feed-forward block (gate/up projections, SiLU product,
+    /// down projection) with the source's BF16 storage boundaries.  Opaque to
+    /// fusion: no HC read/write pairing or epilogue fold crosses it.
+    DenseFfn(crate::pipeline::layer_ops::DenseFfnOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -136,6 +140,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Project(_)
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
+        | Step::DenseFfn(_)
         | Step::MoeStage(..) => None,
     }
 }
@@ -757,6 +762,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
+            Step::DenseFfn(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
@@ -1484,6 +1490,7 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
+        Step::DenseFfn(op) => crate::pipeline::layer_ops::execute_dense_ffn(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
     }

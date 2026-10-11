@@ -2092,6 +2092,13 @@ pub struct IndexedAttentionOp<'a> {
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    /// RoPE width of the queries, keys and the indexer
+    /// (`head_dim * partial_rotary_factor`; Flash-Next: 64).  Even, within
+    /// `2..=min(head_dim, index_dim)`.  The one-launch decode prologue and
+    /// the pooled-key RoPE kernel derive `min(dim, 64)` themselves: a width
+    /// they would not derive runs the batched launches (queries/keys) or is
+    /// refused (pooled keys).
+    pub rotary_dim: usize,
     pub input_width: usize,
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
@@ -2118,6 +2125,36 @@ impl IndexedAttentionOp<'_> {
                 "indexed attention selection reuse and K/V-only append need the whole mixer op"
                     .into(),
             ));
+        }
+        Ok(())
+    }
+
+    /// The RoPE width ([`Self::rotary_dim`]) against the op's geometry and the
+    /// fixed width the pooled-key RoPE kernel rotates.
+    fn validate_rotary(&self) -> Result<(), DispatchError> {
+        if self.rotary_dim < 2
+            || self.rotary_dim % 2 != 0
+            || self.rotary_dim > self.head_dim
+            || self.rotary_dim > self.index_dim
+        {
+            return Err(DispatchError::Hip(format!(
+                "indexed attention rotary width {} must be even and within 2..=min(head_dim {}, index_dim {})",
+                self.rotary_dim, self.head_dim, self.index_dim
+            )));
+        }
+        // The pooled-key RoPE kernel rotates `min(index_kv_width, 64)` channels
+        // and only runs with the core.
+        let pooled = checked_mul(
+            self.index_kv_heads,
+            self.index_dim,
+            "indexed attention index KV",
+        )?
+        .min(64);
+        if matches!(self.phase, MixerPhase::Whole | MixerPhase::Core) && self.rotary_dim != pooled {
+            return Err(DispatchError::Hip(format!(
+                "indexed attention rotary width {} differs from the pooled-key RoPE kernel's {pooled}",
+                self.rotary_dim
+            )));
         }
         Ok(())
     }
@@ -2187,6 +2224,7 @@ impl IndexedAttentionOp<'_> {
             self.index_dim,
             "indexed attention index KV",
         )?;
+        self.validate_rotary()?;
         let q_width = checked_mul(self.heads, self.head_dim, "indexed attention Q width")?;
         let qgate_width = checked_mul(2, q_width, "indexed attention Q/G width")?;
         let kv_width = checked_mul(self.kv_heads, self.head_dim, "indexed attention KV width")?;
@@ -2595,7 +2633,15 @@ pub fn execute_indexed_attention_hc(
         return qsa_project_output(gpu, op, &qsa_output_batch, hc, fused);
     }
 
-    if gpu.route_rows(op.rows) <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
+    // The prologue's kernel rotates `min(dim, 64)` channels of the queries,
+    // keys and indexer; any other width takes the batched launches below.
+    let prologue_rotary =
+        op.rotary_dim == op.head_dim.min(64) && op.rotary_dim == op.index_dim.min(64);
+    if gpu.route_rows(op.rows) <= 8
+        && op.index_dim <= 256
+        && op.head_dim <= 256
+        && prologue_rotary
+    {
         // Decode / few-row verify: the norms, RoPE, cache append and
         // index-key round trip and copy below, in one launch.
         hip(indexed_attention_decode_prologue(
@@ -2634,7 +2680,7 @@ pub fn execute_indexed_attention_hc(
                 head_dim: op.index_dim,
                 head_stride: op.index_dim,
                 position_start: initial_position,
-                rotary_dim: op.index_dim.min(64),
+                rotary_dim: op.rotary_dim,
             },
         ))?;
         if op.state.format.index_dtype() == DType::BF16 {
@@ -2691,7 +2737,7 @@ pub fn execute_indexed_attention_hc(
                 head_dim: op.head_dim,
                 head_stride: 2 * op.head_dim,
                 position_start: initial_position,
-                rotary_dim: op.head_dim.min(64),
+                rotary_dim: op.rotary_dim,
             },
         ))?;
         hip(indexed_attention_norm_rope_batch(
@@ -2705,7 +2751,7 @@ pub fn execute_indexed_attention_hc(
                 head_dim: op.head_dim,
                 head_stride: op.head_dim,
                 position_start: initial_position,
-                rotary_dim: op.head_dim.min(64),
+                rotary_dim: op.rotary_dim,
             },
         ))?;
         hip(indexed_attention_cache_append_batch(
@@ -2866,9 +2912,10 @@ pub struct GroupedDepthwiseOp<'a> {
     /// The HC streams hold BF16 bits for this forward
     /// ([`Gpu::qwen4_bf16_streams`]).
     pub state_bf16: bool,
-    /// `rows_tensor` already holds the PLE rows as F16 (first `rows * hidden`
+    /// `rows_tensor` already holds the PLE rows as F16 (first `rows * embed_dim`
     /// halves of its storage; `HIPFIRE_QWEN4_PLE_FUSE`'s F16 gather): the key
     /// and value projections read them directly and the fused tail must run.
+    /// Only admitted when `embed_dim == hidden`.
     pub rows_f16: bool,
     pub key: WeightRef<'a>,
     pub value: WeightRef<'a>,
@@ -2888,6 +2935,9 @@ pub struct GroupedDepthwiseOp<'a> {
     pub rows: usize,
     pub branches: usize,
     pub hidden: usize,
+    /// Width of the staged PLE rows: the key/value projections' K
+    /// (`ple_embed_dim`; Flash-Next: equal to `hidden`).
+    pub embed_dim: usize,
     pub kernel_size: usize,
     pub dilation: usize,
     pub epsilon: f32,
@@ -2898,7 +2948,12 @@ pub struct GroupedDepthwiseOp<'a> {
 
 impl GroupedDepthwiseOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate_layout()
+    }
+
+    fn validate_layout(&self) -> Result<(), DispatchError> {
         if self.rows == 0
+            || self.embed_dim == 0
             || self.branches == 0
             || self.hidden == 0
             || self.kernel_size == 0
@@ -2913,6 +2968,7 @@ impl GroupedDepthwiseOp<'_> {
             checked_mul(self.kernel_size - 1, self.dilation, "grouped history rows")?;
         let rows_channels = checked_mul(self.rows, channels, "grouped row channels")?;
         let rows_hidden = checked_mul(self.rows, self.hidden, "grouped row hidden")?;
+        let rows_embed = checked_mul(self.rows, self.embed_dim, "grouped row embeddings")?;
         let conv_elements = checked_mul(channels, self.kernel_size, "grouped convolution")?;
         let state_elements = checked_mul(history_rows, channels, "grouped state")?;
         require_tensor(self.streams, rows_channels, DType::F32, "grouped streams")?;
@@ -2926,7 +2982,12 @@ impl GroupedDepthwiseOp<'_> {
         require_tensor(self.gated, rows_channels, DType::F32, "grouped gated")?;
         require_tensor(self.normed, rows_channels, DType::F32, "grouped normed")?;
         require_tensor(self.output, rows_channels, DType::F32, "grouped output")?;
-        require_tensor(self.rows_tensor, rows_hidden, DType::F32, "grouped rows")?;
+        if self.rows_f16 && self.embed_dim != self.hidden {
+            return Err(DispatchError::Hip(
+                "grouped PLE F16 rows need the embedding width to equal hidden".into(),
+            ));
+        }
+        require_tensor(self.rows_tensor, rows_embed, DType::F32, "grouped rows")?;
         require_tensor(
             self.value_scratch,
             rows_hidden,
@@ -2943,8 +3004,8 @@ impl GroupedDepthwiseOp<'_> {
             "grouped convolution norm",
         )?;
         require_tensor(self.conv, conv_elements, DType::BF16, "grouped convolution")?;
-        require_weight(&self.key, channels, self.hidden, "grouped key")?;
-        require_weight(&self.value, self.hidden, self.hidden, "grouped value")?;
+        require_weight(&self.key, channels, self.embed_dim, "grouped key")?;
+        require_weight(&self.value, self.hidden, self.embed_dim, "grouped value")?;
         Ok(())
     }
 }
@@ -2978,16 +3039,17 @@ pub fn execute_grouped_depthwise(
         ));
     }
     if op.rows_f16 {
-        // SAFETY: `rows_tensor` holds `rows * hidden` F32 elements, so its first
-        // `rows * hidden * 2` bytes hold the F16 rows; the view is non-owning.
+        // SAFETY: `rows_tensor` holds `rows * embed_dim` F32 elements
+        // (`embed_dim == hidden`, validated), so its first
+        // `rows * embed_dim * 2` bytes hold the F16 rows; the view is non-owning.
         let x_f16 = GpuTensor {
             buf: unsafe {
                 hip_bridge::DeviceBuffer::from_raw(
                     op.rows_tensor.buf.as_ptr(),
-                    op.rows * op.hidden * 2,
+                    op.rows * op.embed_dim * 2,
                 )
             },
-            shape: vec![op.rows * op.hidden],
+            shape: vec![op.rows * op.embed_dim],
             dtype: DType::F16,
         };
         for (weight, out) in [(&op.key, &key), (&op.value, &value)] {
@@ -3279,6 +3341,117 @@ impl ProjectOp<'_> {
 
 pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> {
     project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)
+}
+
+/// Dense feed-forward recipe: which source equation and storage boundaries
+/// [`execute_dense_ffn`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseFfnRecipe {
+    /// `down(silu(gate(x)) * up(x))` with BF16 storage after the gate
+    /// projection, the up projection, the SiLU, the product and the down
+    /// projection.
+    SiluBf16Source,
+}
+
+/// Dense gated FFN over `rows` row-major rows of `hidden`: gate and up
+/// projections of `input` (`m = intermediate`, `k = hidden`), the recipe's
+/// activation, and the down projection (`m = hidden`, `k = intermediate`) into
+/// `output`.  `gate_scratch` and `up_scratch` must be distinct tensors; the
+/// op writes both and `output`, and reads `input` only before it writes
+/// `output`.
+pub struct DenseFfnOp<'a> {
+    pub recipe: DenseFfnRecipe,
+    pub gate: WeightRef<'a>,
+    pub up: WeightRef<'a>,
+    pub down: WeightRef<'a>,
+    /// F32, at least `rows * hidden`.
+    pub input: &'a GpuTensor,
+    /// F32, at least `rows * intermediate`.
+    pub gate_scratch: &'a GpuTensor,
+    /// F32, at least `rows * intermediate`.
+    pub up_scratch: &'a GpuTensor,
+    /// F32, at least `rows * hidden`.
+    pub output: &'a GpuTensor,
+    /// FWHT basis scratch, at least `rows * max(hidden, intermediate)`; read
+    /// only for payloads that carry an FWHT basis.
+    pub rotation: &'a GpuTensor,
+    pub rows: usize,
+    pub hidden: usize,
+    pub intermediate: usize,
+}
+
+impl DenseFfnOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate_layout()
+    }
+
+    fn validate_layout(&self) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.hidden == 0 || self.intermediate == 0 {
+            return Err(DispatchError::Hip("dense FFN has empty geometry".into()));
+        }
+        require_weight(&self.gate, self.intermediate, self.hidden, "dense FFN gate")?;
+        require_weight(&self.up, self.intermediate, self.hidden, "dense FFN up")?;
+        require_weight(&self.down, self.hidden, self.intermediate, "dense FFN down")?;
+        let wide = checked_mul(self.rows, self.hidden, "dense FFN hidden rows")?;
+        let inner = checked_mul(self.rows, self.intermediate, "dense FFN intermediate rows")?;
+        require_tensor(self.input, wide, DType::F32, "dense FFN input")?;
+        require_tensor(
+            self.gate_scratch,
+            inner,
+            DType::F32,
+            "dense FFN gate scratch",
+        )?;
+        require_tensor(self.up_scratch, inner, DType::F32, "dense FFN up scratch")?;
+        require_tensor(self.output, wide, DType::F32, "dense FFN output")?;
+        if [&self.gate, &self.up, &self.down]
+            .iter()
+            .any(|weight| rotation_basis(weight.dtype).is_some())
+        {
+            let rotated = checked_mul(
+                self.rows,
+                self.hidden.max(self.intermediate),
+                "dense FFN rotation",
+            )?;
+            require_tensor(self.rotation, rotated, DType::F32, "dense FFN rotation")?;
+        }
+        Ok(())
+    }
+}
+
+/// Run a [`DenseFfnOp`].  `SiluBf16Source` order, each step on exact-length
+/// views, no allocation:
+///
+/// 1. gate and up projections of `input` (`project_weights`);
+/// 2. BF16 round trip of gate, then of up (storage after each projection);
+/// 3. `gate = silu(gate)`, BF16 round trip (storage after the activation);
+/// 4. `gate = gate * up`, BF16 round trip (storage after the product);
+/// 5. down projection of the product into `output`;
+/// 6. BF16 round trip of `output` (storage after the down projection).
+///
+/// The element-wise kernels read each element before writing it, so the
+/// in-place SiLU and product are safe.
+pub fn execute_dense_ffn(gpu: &mut Gpu, op: &DenseFfnOp<'_>) -> Result<(), DispatchError> {
+    let DenseFfnRecipe::SiluBf16Source = op.recipe;
+    let wide = checked_mul(op.rows, op.hidden, "dense FFN hidden rows")?;
+    let inner = checked_mul(op.rows, op.intermediate, "dense FFN intermediate rows")?;
+    let gate = view(op.gate_scratch, 0, inner);
+    let up = view(op.up_scratch, 0, inner);
+    let output = view(op.output, 0, wide);
+    project_weights(
+        gpu,
+        op.input,
+        op.rows,
+        Some(op.rotation),
+        &[(&op.gate, &gate), (&op.up, &up)],
+    )?;
+    hip(gpu.bf16_round_trip_f32(&gate))?;
+    hip(gpu.bf16_round_trip_f32(&up))?;
+    hip(gpu.silu_f32(&gate, &gate))?;
+    hip(gpu.bf16_round_trip_f32(&gate))?;
+    hip(gpu.mul_f32(&gate, &up, &gate))?;
+    hip(gpu.bf16_round_trip_f32(&gate))?;
+    project_weight(gpu, &op.down, &gate, &output, op.rows, Some(op.rotation))?;
+    hip(gpu.bf16_round_trip_f32(&output))
 }
 
 /// `output[r] = rows_input[r] + row` for every one of `rows` rows of `width`.
@@ -3590,6 +3763,7 @@ mod tests {
             lloyd_lut_c16: None,
         };
         IndexedAttentionOp {
+            rotary_dim: 2,
             indexer_qk: weight,
             indexer_q_norm: t,
             indexer_k_norm: t,
@@ -3924,5 +4098,249 @@ mod tests {
             lloyd_lut_f16: None,
             lloyd_lut_c16: None,
         }
+    }
+
+    fn dense_ffn_fixture(rows: usize, hidden: usize, intermediate: usize) -> [GpuTensor; 7] {
+        [
+            tensor(hidden * intermediate, DType::BF16),
+            tensor(hidden * intermediate, DType::BF16),
+            tensor(hidden * intermediate, DType::BF16),
+            tensor(rows * hidden, DType::F32),
+            tensor(rows * intermediate, DType::F32),
+            tensor(rows * intermediate, DType::F32),
+            tensor(rows * hidden, DType::F32),
+        ]
+    }
+
+    fn dense_ffn_op<'a>(
+        t: &'a [GpuTensor; 7],
+        rotation: &'a GpuTensor,
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> DenseFfnOp<'a> {
+        DenseFfnOp {
+            recipe: DenseFfnRecipe::SiluBf16Source,
+            gate: plain_weight(&t[0], DType::BF16, intermediate, hidden),
+            up: plain_weight(&t[1], DType::BF16, intermediate, hidden),
+            down: plain_weight(&t[2], DType::BF16, hidden, intermediate),
+            input: &t[3],
+            gate_scratch: &t[4],
+            up_scratch: &t[5],
+            output: &t[6],
+            rotation,
+            rows,
+            hidden,
+            intermediate,
+        }
+    }
+
+    /// Message of the refusal `op` must produce.
+    fn dense_ffn_refusal(op: &DenseFfnOp<'_>) -> String {
+        op.validate_layout()
+            .expect_err("dense FFN op must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn dense_ffn_geometry_validation() {
+        let (rows, hidden, intermediate) = (3, 16, 8);
+        let t = dense_ffn_fixture(rows, hidden, intermediate);
+        let rotation = tensor(1, DType::F32);
+        let op = || dense_ffn_op(&t, &rotation, rows, hidden, intermediate);
+        assert!(op().validate_layout().is_ok());
+
+        let mut bad = op();
+        bad.rows = 0;
+        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
+        let mut bad = op();
+        bad.hidden = 0;
+        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
+        let mut bad = op();
+        bad.intermediate = 0;
+        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
+
+        // Transposed or mis-sized projection geometry.
+        let mut bad = op();
+        bad.gate = plain_weight(&t[0], DType::BF16, hidden, intermediate);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN gate"));
+        let mut bad = op();
+        bad.up = plain_weight(&t[1], DType::BF16, intermediate, intermediate);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN up"));
+        let mut bad = op();
+        bad.down = plain_weight(&t[2], DType::BF16, intermediate, hidden);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN down"));
+
+        // A weight buffer smaller than its geometry, and an unprojectable dtype.
+        let short = tensor(hidden * intermediate - 1, DType::BF16);
+        let mut bad = op();
+        bad.down = plain_weight(&short, DType::BF16, hidden, intermediate);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN down"));
+        let mut bad = op();
+        bad.gate = plain_weight(&t[0], DType::F32, intermediate, hidden);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN gate"));
+    }
+
+    #[test]
+    fn dense_ffn_scratch_validation() {
+        let (rows, hidden, intermediate) = (3, 16, 8);
+        let rotation = tensor(1, DType::F32);
+        let small_wide = tensor(rows * hidden - 1, DType::F32);
+        let small_inner = tensor(rows * intermediate - 1, DType::F32);
+        let wrong_dtype = tensor(rows * hidden, DType::BF16);
+        let t = dense_ffn_fixture(rows, hidden, intermediate);
+        let op = || dense_ffn_op(&t, &rotation, rows, hidden, intermediate);
+
+        let mut bad = op();
+        bad.input = &small_wide;
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN input"));
+        let mut bad = op();
+        bad.input = &wrong_dtype;
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN input"));
+        let mut bad = op();
+        bad.gate_scratch = &small_inner;
+        assert!(dense_ffn_refusal(&bad).contains("gate scratch"));
+        let mut bad = op();
+        bad.up_scratch = &small_inner;
+        assert!(dense_ffn_refusal(&bad).contains("up scratch"));
+        let mut bad = op();
+        bad.output = &small_wide;
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN output"));
+
+        // Rotation scratch is owed only to FWHT payloads, and then at
+        // rows * max(hidden, intermediate).
+        let mut bad = op();
+        bad.down = plain_weight(&t[2], DType::MQ4G256V2, hidden, intermediate);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN rotation"));
+        let enough = tensor(rows * hidden, DType::F32);
+        let mut fwht = dense_ffn_op(&t, &enough, rows, hidden, intermediate);
+        fwht.down = plain_weight(&t[2], DType::MQ4G256V2, hidden, intermediate);
+        assert!(fwht.validate_layout().is_ok());
+    }
+
+    #[test]
+    fn indexed_attention_rotary_validation() {
+        let t = tensor(1, DType::F32);
+        let base = || indexed_attention(&t, 1, 8, 0, IndexedAttentionMode::Full);
+        assert!(base().validate_rotary().is_ok());
+        for (rotary, head_dim, index_dim, why) in [
+            (0usize, 8usize, 8usize, "zero"),
+            (3, 8, 8, "odd"),
+            (6, 4, 8, "above head_dim"),
+            (4, 8, 2, "above index_dim"),
+        ] {
+            let mut op = base();
+            (op.rotary_dim, op.head_dim, op.index_dim) = (rotary, head_dim, index_dim);
+            let error = op.validate_rotary().expect_err(why);
+            assert!(
+                error.to_string().contains("must be even and within"),
+                "{why}: {error}"
+            );
+        }
+        // The pooled-key kernel's fixed width: refused whenever the core runs,
+        // accepted for a projection-only phase.
+        let mut op = base();
+        (op.rotary_dim, op.head_dim, op.index_dim) = (2, 8, 8);
+        let error = op.validate_rotary().expect_err("pooled-key width");
+        assert!(error.to_string().contains("pooled-key"), "{error}");
+        op.phase = MixerPhase::InProj;
+        assert!(op.validate_rotary().is_ok());
+        // Flash-Next geometry: 64 of 256 / 128.
+        let mut op = base();
+        (op.rotary_dim, op.head_dim, op.index_dim) = (64, 256, 128);
+        assert!(op.validate_rotary().is_ok());
+        // A partial-rotary tiny profile: 4 of 8 / 4.
+        let mut op = base();
+        (op.rotary_dim, op.head_dim, op.index_dim) = (4, 8, 4);
+        assert!(op.validate_rotary().is_ok());
+    }
+
+    #[test]
+    fn grouped_depthwise_validates_embedding_width() {
+        // hidden 16, 2 branches (32 channels), PLE rows 8 wide, kernel 2.
+        let (rows, hidden, branches, embed) = (3usize, 16usize, 2usize, 8usize);
+        let channels = branches * hidden;
+        let f32s = |n: usize| tensor(n, DType::F32);
+        let bf16s = |n: usize| tensor(n, DType::BF16);
+        let (key_w, value_w) = (bf16s(channels * embed), bf16s(hidden * embed));
+        let (norm_key, norm_query, norm_conv) = (bf16s(channels), bf16s(channels), bf16s(channels));
+        let conv = bf16s(channels * 2);
+        let (state, streams) = (f32s(channels), f32s(rows * channels));
+        let rows_tensor = f32s(rows * embed);
+        let (query, key_scratch, value_scratch) = (
+            f32s(rows * channels),
+            f32s(rows * channels),
+            f32s(rows * hidden),
+        );
+        let (gated, normed, output) = (
+            f32s(rows * channels),
+            f32s(rows * channels),
+            f32s(rows * channels),
+        );
+        let rotation = f32s(1);
+        let op = || GroupedDepthwiseOp {
+            state_bf16: false,
+            rows_f16: false,
+            key: plain_weight(&key_w, DType::BF16, channels, embed),
+            value: plain_weight(&value_w, DType::BF16, hidden, embed),
+            norm_key: &norm_key,
+            norm_query: &norm_query,
+            norm_conv: &norm_conv,
+            conv: &conv,
+            state: &state,
+            streams: &streams,
+            rows_tensor: &rows_tensor,
+            query: &query,
+            key_scratch: &key_scratch,
+            value_scratch: &value_scratch,
+            gated: &gated,
+            normed: &normed,
+            output: &output,
+            rows,
+            branches,
+            hidden,
+            embed_dim: embed,
+            kernel_size: 2,
+            dilation: 1,
+            epsilon: 1e-6,
+            rotation: &rotation,
+        };
+        assert!(op().validate_layout().is_ok());
+
+        let refusal = |op: &GroupedDepthwiseOp<'_>| {
+            op.validate_layout()
+                .expect_err("must be refused")
+                .to_string()
+        };
+        let mut bad = op();
+        bad.embed_dim = 0;
+        assert!(refusal(&bad).contains("invalid geometry"));
+        // Key/value K must be the embedding width, not hidden.
+        let mut bad = op();
+        bad.key = plain_weight(&key_w, DType::BF16, channels, hidden);
+        assert!(refusal(&bad).contains("grouped key"));
+        let mut bad = op();
+        bad.value = plain_weight(&value_w, DType::BF16, hidden, hidden);
+        assert!(refusal(&bad).contains("grouped value"));
+        // The staged rows hold rows * embed_dim, not rows * hidden.
+        let short = f32s(rows * embed - 1);
+        let mut bad = op();
+        bad.rows_tensor = &short;
+        assert!(refusal(&bad).contains("grouped rows"));
+        // F16 rows are only defined for embed_dim == hidden.
+        let mut bad = op();
+        bad.rows_f16 = true;
+        assert!(refusal(&bad).contains("F16 rows"));
+        // embed_dim == hidden (Flash-Next): hidden-wide rows and K, F16 admitted.
+        let wide_rows = f32s(rows * hidden);
+        let (wide_key, wide_value) = (bf16s(channels * hidden), bf16s(hidden * hidden));
+        let mut fn_like = op();
+        fn_like.embed_dim = hidden;
+        fn_like.rows_tensor = &wide_rows;
+        fn_like.key = plain_weight(&wide_key, DType::BF16, channels, hidden);
+        fn_like.value = plain_weight(&wide_value, DType::BF16, hidden, hidden);
+        assert!(fn_like.validate_layout().is_ok());
+        fn_like.rows_f16 = true;
+        assert!(fn_like.validate_layout().is_ok());
     }
 }

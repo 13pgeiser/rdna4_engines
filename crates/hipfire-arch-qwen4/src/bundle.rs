@@ -10,7 +10,7 @@
 //! local may outlive publication as a second owner.
 
 use crate::artifact::{Qwen4PleRows, SidecarRows};
-use crate::config::Qwen4Config;
+use crate::config::{Qwen4Config, Qwen4PleConfig};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
     qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
@@ -21,8 +21,8 @@ use crate::ple::PleHashMetadata;
 use crate::state::Qwen4StateFormat;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
-    ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4Weights, WeightError,
-    PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
+    ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, Qwen4Weights,
+    WeightError, PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
 };
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
@@ -192,15 +192,36 @@ fn session_boundaries(
     boundaries
 }
 
+/// The PLE rows owner of a bundle: present exactly when the profile declares
+/// PLE (`config.ple`), so a profile without it holds no row store, hash
+/// metadata, hot store or prewarm — and no placeholder for them.
+pub(crate) struct Qwen4BundlePle {
+    /// Bounded model-owned PLE reader/cache.  It must quiesce before source
+    /// descriptors and the attached transaction are dropped.
+    pub(crate) rows: RowStore,
+    pub(crate) metadata: PleHashMetadata,
+    /// Where the PLE rows come from: the model file itself or the sidecar
+    /// whose descriptors the row store was built from (never
+    /// [`Qwen4PleRows::Absent`]).
+    source: Qwen4PleRows,
+    /// PLE hot-row store and its worker thread (`attach_ple_hot_store`);
+    /// `None` = off. Dropping it stops and joins the worker; `free_gpu` does
+    /// so before the row store unloads.
+    hot: Option<PleHotWorker>,
+    /// Page-cache prewarm of a Q4LM PLE sidecar (`attach_ple_prewarm`); `None`
+    /// = off.  Like `hot` it reads the sidecar, so dropping it stops and
+    /// joins its thread, and `free_gpu` does so before the row store unloads.
+    prewarm: Option<hipfire_runtime::ple_prewarm::PleRowsPrewarm>,
+}
+
 /// Published Qwen4 architecture owner.
 pub struct Qwen4Bundle {
     pub config: Qwen4Config,
     pub weights: Qwen4Weights,
     pub state: Qwen4State,
-    /// Bounded model-owned PLE reader/cache.  It must quiesce before source
-    /// descriptors and the attached transaction are dropped.
-    pub(crate) ple_rows: RowStore,
-    pub(crate) ple_metadata: PleHashMetadata,
+    /// PLE rows, hash metadata and their attachments; `None` exactly when
+    /// `config.ple` is `None`.
+    pub(crate) ple: Option<Qwen4BundlePle>,
     /// Canonical load census and external descriptors.  This is deliberately
     /// not left in the loader or carrier after publication.
     pub(crate) weight_store: AttachedWeightStore,
@@ -224,17 +245,6 @@ pub struct Qwen4Bundle {
     /// Prefill snapshot cache shared by every session (`attach_session_cache`);
     /// `None` = off.
     session: Option<SessionCache>,
-    /// PLE hot-row store and its worker thread (`attach_ple_hot_store`);
-    /// `None` = off. Dropping it stops and joins the worker; `free_gpu` does
-    /// so before the row store unloads.
-    ple_hot: Option<PleHotWorker>,
-    /// Page-cache prewarm of a Q4LM PLE sidecar (`attach_ple_prewarm`); `None`
-    /// = off.  Like `ple_hot` it reads the sidecar, so dropping it stops and
-    /// joins its thread, and `free_gpu` does so before the row store unloads.
-    ple_prewarm: Option<hipfire_runtime::ple_prewarm::PleRowsPrewarm>,
-    /// Where the PLE rows come from: the model file itself or the sidecar
-    /// whose descriptors the row store was built from.
-    ple_source: Qwen4PleRows,
     /// Committed live state kept for a continuation of the same conversation
     /// (`session_commit_live`); `None` = none. Cleared by `reset`,
     /// `session_clear`, `session_commit` and `session_begin` (it is consumed
@@ -309,7 +319,7 @@ pub fn session_snapshot_bytes(
         + selected;
     let ple = config
         .ple_conv_history_rows()
-        .checked_mul(config.ple_embed_dim)?
+        .checked_mul(config.hidden_size)?
         .checked_mul(config.hc_count)?
         .checked_mul(4)?;
     let feedback = config
@@ -449,12 +459,15 @@ impl SessionState for Qwen4Bundle {
 
 impl Qwen4Bundle {
     /// Assemble a complete Single bundle using metadata parsed from the
-    /// artifact's canonical `qwen4_ple` object. `state_format` is the request
-    /// state's storage ([`crate::resolve_state_format`]); `backend` the QSA
-    /// context storage load admission resolved, shared by target and MTP.
+    /// artifact's canonical `qwen4_ple` object. `recipe` is the recipe the
+    /// artifact was admitted under (`Qwen4HfqmArtifact::recipe()`).
+    /// `state_format` is the request state's storage
+    /// ([`crate::resolve_state_format`]); `backend` the QSA context storage
+    /// load admission resolved, shared by target and MTP.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble(
         config: Qwen4Config,
+        recipe: &Qwen4TierRecipe,
         transaction: WeightLoadTransaction,
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
@@ -465,6 +478,7 @@ impl Qwen4Bundle {
     ) -> Result<Self, BundleError> {
         Self::assemble_with_metadata(
             config,
+            recipe,
             transaction,
             placements,
             gpu,
@@ -478,11 +492,13 @@ impl Qwen4Bundle {
     /// Assemble with validated metadata read from the artifact's exact I64
     /// arrays.  The transaction is consumed so no load-side owner can remain
     /// live after this method publishes the bundle.
-    /// Accepts required or optional admission metadata; profiles without PLE
-    /// are refused by the FN runtime before assembling weights or state.
+    /// `metadata` is `Some` exactly when the profile declares PLE (the
+    /// admission receipt's `ple`): the rows are then the embedded shard
+    /// tensors; a profile without PLE passes `None` and gets no rows source.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_with_metadata(
         config: Qwen4Config,
+        recipe: &Qwen4TierRecipe,
         transaction: WeightLoadTransaction,
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
@@ -491,14 +507,21 @@ impl Qwen4Bundle {
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
     ) -> Result<Self, BundleError> {
+        let metadata = metadata.into();
+        let ple_source = if metadata.is_some() {
+            Qwen4PleRows::Embedded
+        } else {
+            Qwen4PleRows::Absent
+        };
         Self::assemble_with_ple_rows(
             config,
+            recipe,
             transaction,
             placements,
             gpu,
             max_seq_len,
             metadata,
-            Qwen4PleRows::Embedded,
+            ple_source,
             state_format,
             backend,
         )
@@ -509,12 +532,18 @@ impl Qwen4Bundle {
     /// `transaction` (the monolithic artifact, exactly the pre-sidecar path);
     /// [`Qwen4PleRows::Sidecar`] builds the row store from the sidecar's
     /// descriptors, and `transaction` then carries no PLE shards (the
-    /// admitted manifest was trimmed).
-    /// [`Qwen4PleRows::Absent`] and missing metadata are refused before
-    /// assembling weights or allocating runtime state.
+    /// admitted manifest was trimmed).  The row geometry (shards, rows per
+    /// shard, row width, heads) is the profile's `config.ple`.
+    /// A profile without PLE takes `None` metadata and
+    /// [`Qwen4PleRows::Absent`] and builds no PLE owner; any other pairing of
+    /// the profile with the metadata and rows source, and a sidecar for a
+    /// developer profile (sidecar rows, the hot store and the rank table are
+    /// Flash-Next-only), is refused before weights are assembled or state is
+    /// allocated.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_with_ple_rows(
         config: Qwen4Config,
+        recipe: &Qwen4TierRecipe,
         mut transaction: WeightLoadTransaction,
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
@@ -524,17 +553,13 @@ impl Qwen4Bundle {
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
     ) -> Result<Self, BundleError> {
-        let metadata = metadata.into().ok_or_else(|| {
-            BundleError::Weights(WeightError::DescriptorMismatch(
-                "qwen4: the FN runtime requires PLE hash metadata; this profile has no PLE".into(),
-            ))
-        })?;
-        if matches!(ple_source, Qwen4PleRows::Absent) {
-            return Err(BundleError::Weights(WeightError::DescriptorMismatch(
-                "qwen4: the FN runtime requires a PLE rows source; this profile has no PLE".into(),
-            )));
-        }
-        let weights = match Qwen4Weights::assemble(&mut transaction, &config, placements) {
+        let ple_inputs = match admit_ple_inputs(&config, metadata.into(), ple_source) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                return Err(cleanup_transaction(error, transaction.rollback(gpu)));
+            }
+        };
+        let weights = match Qwen4Weights::assemble(&mut transaction, &config, recipe, placements) {
             Ok(weights) => weights,
             Err(error) => {
                 return Err(cleanup_transaction(
@@ -543,26 +568,40 @@ impl Qwen4Bundle {
                 ));
             }
         };
-        // One prefill chunk prefetches `rows * PLE_HEAD_COUNT` n-gram rows in
-        // a single row-store request, so staging holds the requested chunk.
-        let staging_rows =
-            qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len) * crate::ple::PLE_HEAD_COUNT;
-        let ple_rows = match build_ple_row_store(
-            &ple_source,
-            &transaction,
-            &weights.manifest,
-            &metadata,
-            staging_rows,
-            // `HIPFIRE_QWEN4_PLE_WIDE_READERS=0` keeps 16 concurrent reads
-            // for every PLE request, including a whole prefill chunk.
-            hipfire_config::developer_bool("HIPFIRE_QWEN4_PLE_WIDE_READERS", true),
-        ) {
-            Ok(rows) => rows,
-            Err(error) => {
-                let weight_result = weights.free_gpu(gpu);
-                let cleanup = transaction.rollback(gpu);
-                return Err(cleanup_bundle_failure(error, weight_result, cleanup));
+        let ple = match (ple_inputs, config.ple.as_ref()) {
+            (Some(inputs), Some(ple_config)) => {
+                // One prefill chunk prefetches `rows * head_count` n-gram rows
+                // in a single row-store request, so staging holds the
+                // requested chunk.
+                let staging_rows =
+                    qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len) * ple_config.head_count;
+                match build_ple_row_store(
+                    &inputs.source,
+                    &transaction,
+                    &weights.manifest,
+                    ple_config,
+                    &inputs.metadata,
+                    staging_rows,
+                    // `HIPFIRE_QWEN4_PLE_WIDE_READERS=0` keeps 16 concurrent
+                    // reads for every PLE request, including a whole prefill
+                    // chunk.
+                    hipfire_config::developer_bool("HIPFIRE_QWEN4_PLE_WIDE_READERS", true),
+                ) {
+                    Ok(rows) => Some(Qwen4BundlePle {
+                        rows,
+                        metadata: inputs.metadata,
+                        source: inputs.source,
+                        hot: None,
+                        prewarm: None,
+                    }),
+                    Err(error) => {
+                        let weight_result = weights.free_gpu(gpu);
+                        let cleanup = transaction.rollback(gpu);
+                        return Err(cleanup_bundle_failure(error, weight_result, cleanup));
+                    }
+                }
             }
+            _ => None,
         };
         let mut state =
             match Qwen4State::new_with_backend(gpu, &config, max_seq_len, state_format, backend) {
@@ -570,7 +609,9 @@ impl Qwen4Bundle {
                 Err(error) => {
                     // `unload` consumes the reader and joins its worker even on a
                     // quiesce error, so source descriptors cannot outlive failure.
-                    let _ = ple_rows.unload();
+                    if let Some(ple) = ple {
+                        let _ = ple.rows.unload();
+                    }
                     let weight_result = weights.free_gpu(gpu);
                     let cleanup = transaction.rollback(gpu);
                     return Err(cleanup_bundle_failure(
@@ -585,11 +626,7 @@ impl Qwen4Bundle {
             config,
             weights,
             state,
-            ple_rows,
-            ple_hot: None,
-            ple_prewarm: None,
-            ple_source,
-            ple_metadata: metadata,
+            ple,
             weight_store: AttachedWeightStore::new(transaction),
             execution: None,
             mtp: None,
@@ -627,19 +664,21 @@ impl Qwen4Bundle {
     /// This strict accessor is useful to admission and diagnostics callers;
     /// the bundle's own reader already owns the same sealed descriptors.
     pub fn ple_descriptors(&self) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
-        match &self.ple_source {
-            Qwen4PleRows::Absent => Err(BundleError::Weights(WeightError::DescriptorMismatch(
-                "qwen4: the FN runtime requires a PLE rows source; this profile has no PLE".into(),
-            ))),
+        let (Some(ple), Some(ple_config)) = (&self.ple, self.config.ple.as_ref()) else {
+            return Err(no_ple_rows());
+        };
+        match &ple.source {
+            Qwen4PleRows::Absent => Err(no_ple_rows()),
             Qwen4PleRows::Embedded => ple_descriptors(
                 &self.weight_store.transaction,
                 self.manifest(),
-                &self.ple_metadata,
+                ple_config,
+                &ple.metadata,
             ),
             Qwen4PleRows::Sidecar {
                 rows: SidecarRows::Descriptors(descriptors),
                 ..
-            } => sidecar_ple_descriptors(descriptors, &self.ple_metadata),
+            } => sidecar_ple_descriptors(descriptors, &ple.metadata),
             Qwen4PleRows::Sidecar {
                 path,
                 rows: SidecarRows::Table(_),
@@ -654,17 +693,19 @@ impl Qwen4Bundle {
         }
     }
 
-    /// Where this bundle's PLE rows come from.
-    pub fn ple_source(&self) -> &Qwen4PleRows {
-        &self.ple_source
+    /// Where this bundle's PLE rows come from; `None` for a profile without
+    /// PLE.
+    pub fn ple_source(&self) -> Option<&Qwen4PleRows> {
+        self.ple.as_ref().map(|ple| &ple.source)
     }
 
-    pub fn ple_rows(&self) -> &RowStore {
-        &self.ple_rows
+    /// The PLE row store; `None` for a profile without PLE.
+    pub fn ple_rows(&self) -> Option<&RowStore> {
+        self.ple.as_ref().map(|ple| &ple.rows)
     }
 
-    pub fn ple_rows_mut(&mut self) -> &mut RowStore {
-        &mut self.ple_rows
+    pub fn ple_rows_mut(&mut self) -> Option<&mut RowStore> {
+        self.ple.as_mut().map(|ple| &mut ple.rows)
     }
 
     pub fn attached_origin(&self) -> Option<hipfire_runtime::weight_store::WeightOrigin> {
@@ -693,8 +734,13 @@ impl Qwen4Bundle {
             ));
         }
         // A chunk's PLE prefetch is one row-store request: the staging sized
-        // at assembly bounds it.
-        let ple_rows_cap = self.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT;
+        // at assembly bounds it.  A profile without PLE has no row store.
+        let ple_rows_cap = match (&self.ple, &self.config.ple) {
+            (Some(ple), Some(ple_config)) => {
+                ple.rows.max_rows_per_prefetch() / ple_config.head_count
+            }
+            _ => usize::MAX,
+        };
         let requested = qwen4_prefill_chunk_requested(&gpu.arch, max_chunk).min(ple_rows_cap);
         if requested == 0 {
             return Err(BundleError::Forward(
@@ -793,6 +839,7 @@ impl Qwen4Bundle {
     }
     /// Attach the reusable native MTP head and its bounded GPU state.
     pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
+        Self::require_mtp_head(self.config.profile.id(), self.weights.mtp.is_some())?;
         if self.mtp.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 MTP resources are already attached".to_string(),
@@ -808,6 +855,19 @@ impl Qwen4Bundle {
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
         Ok(())
+    }
+
+    /// Native MTP attaches only where the profile's weights carry an MTP head
+    /// (`weights.mtp`); a head-free profile is refused with a typed error
+    /// before any allocation.
+    fn require_mtp_head(profile: &str, has_head: bool) -> Result<(), BundleError> {
+        if has_head {
+            Ok(())
+        } else {
+            Err(BundleError::NoMtpHead {
+                profile: profile.to_string(),
+            })
+        }
     }
 
     pub(crate) fn ensure_spec_hidden(
@@ -1244,8 +1304,10 @@ impl Qwen4Bundle {
     /// committed history, in order) will need, so a forward over them later
     /// finds them cached. Best effort: a failure only loses the head start.
     pub(crate) fn warm_ple_rows(&self, tokens: &[u32]) {
-        let ids = self.state.ple_history.row_ids(&self.ple_metadata, tokens);
-        let _ = self.ple_rows.warm(ids);
+        if let Some(ple) = &self.ple {
+            let ids = self.state.ple_history.row_ids(&ple.metadata, tokens);
+            let _ = ple.rows.warm(ids);
+        }
     }
 
     pub(crate) fn spec_capture_token(
@@ -1943,13 +2005,19 @@ impl Qwen4Bundle {
     /// Name the tokens the next prefill forward is followed by, so it warms
     /// their PLE rows while its own chunk runs. Best effort; bytes unchanged.
     pub(crate) fn set_ple_lookahead(&mut self, tokens: &[u32]) {
+        if self.ple.is_none() {
+            return;
+        }
         if let Some(forward) = self.execution.as_mut() {
             forward.set_ple_lookahead(tokens);
         }
     }
 
     fn invalidate_ple_epoch(&self) -> Result<(), BundleError> {
-        self.ple_rows
+        let Some(ple) = &self.ple else {
+            return Ok(());
+        };
+        ple.rows
             .reset_epoch(PLE_RESET_TIMEOUT)
             .map(|_| ())
             .map_err(BundleError::PleRows)
@@ -1960,11 +2028,14 @@ impl Qwen4Bundle {
     /// `invalidate_ple_epoch` instead so work from the discarded state cannot
     /// publish after the state transition.
     fn quiesce_ple(&self) -> Result<(), BundleError> {
-        self.ple_rows
+        let Some(ple) = &self.ple else {
+            return Ok(());
+        };
+        ple.rows
             .quiesce(PLE_RESET_TIMEOUT)
             .map(|_| ())
             .map_err(BundleError::PleRows)?;
-        self.ple_rows.resume().map_err(BundleError::PleRows)
+        ple.rows.resume().map_err(BundleError::PleRows)
     }
 
     /// Reset every owner for a cold prefill.
@@ -2042,30 +2113,38 @@ impl Qwen4Bundle {
 
     /// Attach the PLE hot-row store and its worker thread: the row store reads
     /// the rows its pack holds from the pack.  A geometry mismatch is logged
-    /// and the store is dropped (stopped and joined).
-    pub fn attach_ple_hot_store(&mut self, hot: PleHotWorker) {
-        if let Err(error) = self.ple_rows.attach_hot_store(hot.store().clone()) {
+    /// and the store is dropped (stopped and joined).  The hot store, the
+    /// prewarm and the rank table are Flash-Next-only: a profile without PLE
+    /// or a developer profile refuses (and drops the worker).
+    pub fn attach_ple_hot_store(&mut self, hot: PleHotWorker) -> Result<(), BundleError> {
+        let ple = self.ple_attachment_owner("hot-row store")?;
+        if let Err(error) = ple.rows.attach_hot_store(hot.store().clone()) {
             eprintln!("  qwen4 ple hot store: not attached to the row store ({error})");
-            return;
+            return Ok(());
         }
-        self.ple_hot = Some(hot);
+        ple.hot = Some(hot);
+        Ok(())
     }
 
     /// The attached PLE hot-row store, if any.
     pub fn ple_hot_store(&self) -> Option<&std::sync::Arc<HotRowStore>> {
-        self.ple_hot.as_ref().map(PleHotWorker::store)
+        self.ple.as_ref()?.hot.as_ref().map(PleHotWorker::store)
     }
 
     /// Attach the page-cache prewarm of a Q4LM PLE sidecar (see
     /// `hipfire_runtime::ple_prewarm`).  The bundle owns it from here:
     /// `free_gpu` stops and joins it before the row store unloads.
-    pub fn attach_ple_prewarm(&mut self, prewarm: hipfire_runtime::ple_prewarm::PleRowsPrewarm) {
-        self.ple_prewarm = Some(prewarm);
+    pub fn attach_ple_prewarm(
+        &mut self,
+        prewarm: hipfire_runtime::ple_prewarm::PleRowsPrewarm,
+    ) -> Result<(), BundleError> {
+        self.ple_attachment_owner("sidecar prewarm")?.prewarm = Some(prewarm);
+        Ok(())
     }
 
     /// The attached PLE sidecar prewarm, if any.
     pub fn ple_prewarm(&self) -> Option<&hipfire_runtime::ple_prewarm::PleRowsPrewarm> {
-        self.ple_prewarm.as_ref()
+        self.ple.as_ref()?.prewarm.as_ref()
     }
 
     /// Keep the prewarm worker of a rank-order PLE table
@@ -2074,8 +2153,21 @@ impl Qwen4Bundle {
     /// [`Self::attach_ple_hot_store`] nothing is attached to the row store:
     /// it was built over this very store at assembly.  `free_gpu` stops and
     /// joins the worker before the row store unloads.
-    pub fn attach_ple_table_worker(&mut self, worker: PleHotWorker) {
-        self.ple_hot = Some(worker);
+    pub fn attach_ple_table_worker(&mut self, worker: PleHotWorker) -> Result<(), BundleError> {
+        self.ple_attachment_owner("rank-table worker")?.hot = Some(worker);
+        Ok(())
+    }
+
+    /// The PLE owner an attachment (hot store, prewarm, rank-table worker)
+    /// hangs from, or the refusal for a bundle that cannot carry one.
+    fn ple_attachment_owner(&mut self, what: &str) -> Result<&mut Qwen4BundlePle, BundleError> {
+        if !self.config.profile.is_flash_next() {
+            return Err(BundleError::Config(format!(
+                "the PLE {what} is Flash-Next-only; profile {} reads its embedded PLE rows directly",
+                self.config.profile.id()
+            )));
+        }
+        self.ple.as_mut().ok_or_else(no_ple_rows)
     }
 
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
@@ -2744,9 +2836,7 @@ impl Qwen4Bundle {
         let Qwen4Bundle {
             weights,
             state,
-            ple_rows,
-            ple_hot,
-            ple_prewarm,
+            ple,
             weight_store,
             execution,
             mtp,
@@ -2758,15 +2848,23 @@ impl Qwen4Bundle {
             lanes,
             ..
         } = self;
-        // The hot-row store's worker reads the pack and the model file: stop
-        // and join it before the row store unloads.
-        drop(ple_hot);
-        // The sidecar prewarm reads the sidecar the row store also reads.
-        drop(ple_prewarm);
+        let ple_rows = ple.map(|ple| {
+            let Qwen4BundlePle {
+                rows, hot, prewarm, ..
+            } = ple;
+            // The hot-row store's worker reads the pack and the model file:
+            // stop and join it before the row store unloads.
+            drop(hot);
+            // The sidecar prewarm reads the sidecar the row store also reads.
+            drop(prewarm);
+            rows
+        });
         if let Some(mut session) = session {
             session.clear(gpu);
         }
-        let ple_result = ple_rows.unload().map(|_| ()).map_err(BundleError::PleRows);
+        let ple_result = ple_rows
+            .map(|rows| rows.unload().map(|_| ()).map_err(BundleError::PleRows))
+            .unwrap_or(Ok(()));
         let execution_result = execution
             .map(|forward| forward.free_gpu(gpu).map_err(BundleError::Hip))
             .unwrap_or(Ok(()));
@@ -2890,12 +2988,20 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 }
 
-const PLE_SHARD_NAME_PREFIX: &str =
-    "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_";
+/// Name prefix of the PLE shard tensors of `ple`
+/// (`model.language_model.layers.{layer}.ple...ngram_embedding.shard_`); the
+/// Flash-Next layer is 1.
+fn ple_shard_name_prefix(ple: &Qwen4PleConfig) -> String {
+    format!(
+        "model.language_model.layers.{}.ple.ple_embedding.ngram_embedding.shard_",
+        ple.layer
+    )
+}
 
-fn ple_shard_index(name: &str) -> Result<usize, WeightError> {
+fn ple_shard_index(ple: &Qwen4PleConfig, name: &str) -> Result<usize, WeightError> {
+    let prefix = ple_shard_name_prefix(ple);
     let suffix = name
-        .strip_prefix(PLE_SHARD_NAME_PREFIX)
+        .strip_prefix(prefix.as_str())
         .and_then(|name| name.strip_suffix(".weight"))
         .ok_or_else(|| {
             WeightError::DescriptorMismatch(format!("invalid PLE shard name '{name}'"))
@@ -2908,7 +3014,7 @@ fn ple_shard_index(name: &str) -> Result<usize, WeightError> {
     let index = suffix
         .parse::<usize>()
         .map_err(|_| WeightError::DescriptorMismatch(format!("invalid PLE shard name '{name}'")))?;
-    if index >= PLE_SHARD_COUNT || index.to_string() != suffix {
+    if index >= ple.shard_count || index.to_string() != suffix {
         return Err(WeightError::DescriptorMismatch(format!(
             "PLE shard index {index} is outside canonical range in '{name}'"
         )));
@@ -2918,19 +3024,20 @@ fn ple_shard_index(name: &str) -> Result<usize, WeightError> {
 
 fn ordered_ple_entries<'a>(
     manifest: &'a Qwen4Manifest,
+    ple: &Qwen4PleConfig,
 ) -> Result<Vec<&'a WeightEntry>, WeightError> {
     let entries = manifest.external_entries().collect::<Vec<_>>();
-    if entries.len() != PLE_SHARD_COUNT {
+    if entries.len() != ple.shard_count {
         return Err(WeightError::PleShardCount {
-            expected: PLE_SHARD_COUNT,
+            expected: ple.shard_count,
             actual: entries.len(),
         });
     }
-    let mut ordered = vec![None; PLE_SHARD_COUNT];
+    let mut ordered = vec![None; ple.shard_count];
     for entry in entries {
-        let index = ple_shard_index(&entry.name)?;
-        if entry.layer != Some(1)
-            || entry.logical_shape.as_slice() != [PLE_SHARD_ROWS, PLE_ROW_WIDTH]
+        let index = ple_shard_index(ple, &entry.name)?;
+        if entry.layer != Some(ple.layer)
+            || entry.logical_shape.as_slice() != [ple.shard_rows, ple.row_width]
         {
             return Err(WeightError::DescriptorMismatch(entry.name.clone()));
         }
@@ -2949,6 +3056,102 @@ fn ordered_ple_entries<'a>(
             })
         })
         .collect()
+}
+
+/// [`validate_ple_metadata`] for an explicit profile geometry: the stored
+/// head tables must match the profile's head count and its physical row
+/// layout (`shard_count * shard_rows` padded rows, per-shard valid rows).
+fn validate_ple_geometry(
+    ple: &Qwen4PleConfig,
+    metadata: &PleHashMetadata,
+) -> Result<(), BundleError> {
+    let mismatch = |message: String| BundleError::Weights(WeightError::DescriptorMismatch(message));
+    if metadata.head_count() != ple.head_count {
+        return Err(mismatch(format!(
+            "PLE metadata has {} head tables; the profile declares {}",
+            metadata.head_count(),
+            ple.head_count
+        )));
+    }
+    let physical_rows = (ple.shard_rows as u64)
+        .checked_mul(ple.shard_count as u64)
+        .ok_or_else(|| mismatch("PLE physical row count overflow".to_string()))?;
+    if metadata.padded_rows() != physical_rows {
+        return Err(mismatch(format!(
+            "PLE metadata padded rows {} do not match physical rows {physical_rows}",
+            metadata.padded_rows()
+        )));
+    }
+    let valid_rows = (0..ple.shard_count).try_fold(0u64, |sum, shard| {
+        sum.checked_add(ple.shard_valid_rows(shard) as u64)
+            .ok_or_else(|| mismatch("PLE valid row count overflow".to_string()))
+    })?;
+    if metadata.valid_rows() != valid_rows {
+        return Err(mismatch(format!(
+            "PLE metadata valid rows {} do not match canonical rows {valid_rows}",
+            metadata.valid_rows()
+        )));
+    }
+    Ok(())
+}
+
+/// The refusal of a PLE operation on a profile that declares no PLE.
+fn no_ple_rows() -> BundleError {
+    BundleError::Weights(WeightError::DescriptorMismatch(
+        "qwen4: this profile declares no PLE; it has no PLE rows source".into(),
+    ))
+}
+
+/// Whether the Qwen4 executor can run `config` at all: the weights binder's
+/// profile admission (a developer profile only under the
+/// `qwen4-dev-profiles` feature, and only a dense FFN) and the forward's
+/// (the RoPE base the QSA kernels implement).  Both refusals otherwise
+/// surface after the weights were fulfilled onto the device; a loader calls
+/// this right after artifact admission, before any allocation.
+pub fn admit_executable_profile(config: &Qwen4Config) -> Result<(), BundleError> {
+    crate::weights::admit_executable_profile(config).map_err(BundleError::Weights)?;
+    Qwen4GpuForward::admit_profile(config).map_err(|error| BundleError::Forward(error.to_string()))
+}
+
+/// What a PLE-declaring profile builds its [`Qwen4BundlePle`] from.
+struct PleInputs {
+    metadata: PleHashMetadata,
+    source: Qwen4PleRows,
+}
+
+/// The profile, the PLE hash metadata and the rows source must agree before
+/// anything is assembled: `config.ple` `None` <=> no metadata <=> no rows
+/// source.  Sidecar rows (and with them the hot store, the prewarm and the
+/// rank table) are Flash-Next-only; a developer profile reads its embedded
+/// rows.  The metadata must match the profile's PLE geometry.
+fn admit_ple_inputs(
+    config: &Qwen4Config,
+    metadata: Option<PleHashMetadata>,
+    source: Qwen4PleRows,
+) -> Result<Option<PleInputs>, BundleError> {
+    let refuse = |message: String| BundleError::Weights(WeightError::DescriptorMismatch(message));
+    let profile = config.profile.id();
+    match (config.ple.as_ref(), metadata, source) {
+        (None, None, Qwen4PleRows::Absent) => Ok(None),
+        (None, _, _) => Err(refuse(format!(
+            "qwen4: profile {profile} declares no PLE, so it takes no PLE hash metadata and no PLE rows source"
+        ))),
+        (Some(_), None, _) => Err(refuse(format!(
+            "qwen4: profile {profile} declares PLE but no PLE hash metadata was provided"
+        ))),
+        (Some(_), Some(_), Qwen4PleRows::Absent) => Err(refuse(format!(
+            "qwen4: profile {profile} declares PLE but no PLE rows source was provided"
+        ))),
+        (Some(ple), Some(metadata), source) => {
+            if !config.profile.is_flash_next() && !matches!(source, Qwen4PleRows::Embedded) {
+                return Err(refuse(format!(
+                    "qwen4: PLE sidecar rows are Flash-Next-only; profile {profile} reads its embedded PLE rows"
+                )));
+            }
+            validate_ple_geometry(ple, &metadata)?;
+            Ok(Some(PleInputs { metadata, source }))
+        }
+    }
 }
 
 fn validate_ple_metadata(metadata: &PleHashMetadata) -> Result<(), BundleError> {
@@ -3220,17 +3423,14 @@ fn build_ple_row_store(
     source: &Qwen4PleRows,
     transaction: &WeightLoadTransaction,
     manifest: &Qwen4Manifest,
+    ple: &Qwen4PleConfig,
     metadata: &PleHashMetadata,
     staging_rows: usize,
     wide_readers: bool,
 ) -> Result<RowStore, BundleError> {
     let descriptors = match source {
-        Qwen4PleRows::Absent => {
-            return Err(BundleError::Weights(WeightError::DescriptorMismatch(
-                "qwen4: the FN runtime requires a PLE rows source; this profile has no PLE".into(),
-            )));
-        }
-        Qwen4PleRows::Embedded => ple_descriptors(transaction, manifest, metadata)?,
+        Qwen4PleRows::Absent => return Err(no_ple_rows()),
+        Qwen4PleRows::Embedded => ple_descriptors(transaction, manifest, ple, metadata)?,
         Qwen4PleRows::Sidecar {
             rows: SidecarRows::Descriptors(descriptors),
             ..
@@ -3263,10 +3463,11 @@ fn build_ple_row_store(
 fn ple_descriptors(
     transaction: &WeightLoadTransaction,
     manifest: &Qwen4Manifest,
+    ple: &Qwen4PleConfig,
     metadata: &PleHashMetadata,
 ) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
-    validate_ple_metadata(metadata)?;
-    let entries = ordered_ple_entries(manifest).map_err(BundleError::Weights)?;
+    validate_ple_geometry(ple, metadata)?;
+    let entries = ordered_ple_entries(manifest, ple).map_err(BundleError::Weights)?;
     let mut descriptors: Vec<SourceRangeDescriptor> = Vec::with_capacity(entries.len());
     let mut valid_rows_total = 0u64;
     for (index, entry) in entries.into_iter().enumerate() {
@@ -3297,13 +3498,11 @@ fn ple_descriptors(
         // fulfilled. Here the declaration only has to name a tier the reader
         // decodes, so a sealed BF16-PLE artifact stays loadable next to a
         // Q8F16 one.
-        if ![
-            RowEncoding::Bf16.encoded_row_bytes(PLE_ROW_WIDTH),
-            RowEncoding::Q8F16.encoded_row_bytes(PLE_ROW_WIDTH),
-        ]
-        .contains(&row_bytes)
-            || valid_rows != ple_valid_rows_for_shard(index)
-        {
+        let accepted = [RowEncoding::Bf16, RowEncoding::Q8F16]
+            .into_iter()
+            .filter_map(|encoding| encoding.checked_encoded_row_bytes(ple.row_width))
+            .collect::<Vec<_>>();
+        if !accepted.contains(&row_bytes) || valid_rows != ple.shard_valid_rows(index) {
             return Err(BundleError::Weights(WeightError::DescriptorMismatch(
                 entry.name.clone(),
             )));
@@ -3417,6 +3616,10 @@ pub enum BundleError {
         error: hip_bridge::HipError,
     },
     Transaction(WeightStoreError),
+    /// Native MTP was requested for a profile whose weights carry no MTP head.
+    NoMtpHead {
+        profile: String,
+    },
 }
 
 impl From<WeightError> for BundleError {
@@ -3444,6 +3647,10 @@ impl fmt::Display for BundleError {
                 write!(f, "Qwen4 bundle cleanup after {cause}: {error}")
             }
             Self::Transaction(error) => write!(f, "Qwen4 bundle transaction: {error}"),
+            Self::NoMtpHead { profile } => write!(
+                f,
+                "Qwen4 bundle: profile {profile} has no MTP head; native MTP cannot attach"
+            ),
         }
     }
 }
@@ -3790,5 +3997,215 @@ mod tests {
         // A re-rendered history that rewrote the assistant turn diverges.
         let rewritten = [1u32, 2, 3, 70, 8, 11, 12];
         assert_eq!(live_start(Some(&rec), &rewritten, AR, 5, None, false), None);
+    }
+
+    use crate::config::Qwen4FfnConfig;
+
+    fn dense_config(with_ple: bool, with_mtp: bool) -> Qwen4Config {
+        crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 8,
+            },
+            16,
+            4,
+            with_ple,
+            with_mtp,
+        )
+    }
+
+    fn ple_metadata_of(config: &Qwen4Config) -> PleHashMetadata {
+        PleHashMetadata::from_json_for(
+            &config.developer_metadata_json(),
+            config.ple.as_ref().expect("a PLE profile"),
+        )
+        .expect("developer PLE metadata")
+    }
+
+    #[test]
+    fn ple_inputs_must_agree_with_the_profile() {
+        let pled = dense_config(true, true);
+        let bare = dense_config(false, false);
+        let metadata = ple_metadata_of(&pled);
+        let sidecar = || Qwen4PleRows::Sidecar {
+            path: PathBuf::from("/models/dev.ple-q8"),
+            encoding: RowEncoding::Q8F16,
+            rows: SidecarRows::Descriptors(Vec::new()),
+        };
+        // PLE <=> metadata <=> rows source.
+        assert!(matches!(
+            admit_ple_inputs(&pled, Some(metadata.clone()), Qwen4PleRows::Embedded),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            admit_ple_inputs(&bare, None, Qwen4PleRows::Absent),
+            Ok(None)
+        ));
+        let refused = |result: Result<Option<PleInputs>, BundleError>| match result {
+            Ok(_) => panic!("expected a refusal"),
+            Err(error) => error.to_string(),
+        };
+        assert!(refused(admit_ple_inputs(
+            &bare,
+            Some(metadata.clone()),
+            Qwen4PleRows::Absent
+        ))
+        .contains("declares no PLE"));
+        assert!(
+            refused(admit_ple_inputs(&bare, None, Qwen4PleRows::Embedded))
+                .contains("declares no PLE")
+        );
+        assert!(
+            refused(admit_ple_inputs(&pled, None, Qwen4PleRows::Embedded))
+                .contains("no PLE hash metadata")
+        );
+        assert!(refused(admit_ple_inputs(
+            &pled,
+            Some(metadata.clone()),
+            Qwen4PleRows::Absent
+        ))
+        .contains("no PLE rows source"));
+        // Sidecar rows are Flash-Next-only.
+        assert!(
+            refused(admit_ple_inputs(&pled, Some(metadata), sidecar())).contains("Flash-Next-only")
+        );
+        // The metadata must be this profile's geometry: the pinned Flash-Next
+        // tables have 16 heads, the tiny profile 2.
+        assert!(refused(admit_ple_inputs(
+            &pled,
+            Some(PleHashMetadata::qwen4()),
+            Qwen4PleRows::Embedded
+        ))
+        .contains("head tables"));
+    }
+
+    #[test]
+    fn flash_next_geometry_checks_equal_the_pinned_constants() {
+        let config = crate::config::compact_test_config();
+        let ple = config.ple.as_ref().expect("Flash-Next declares PLE");
+        assert_eq!(
+            (
+                ple.shard_count,
+                ple.shard_rows,
+                ple.row_width,
+                ple.head_count
+            ),
+            (
+                PLE_SHARD_COUNT,
+                PLE_SHARD_ROWS,
+                PLE_ROW_WIDTH,
+                PLE_HEAD_COUNT
+            )
+        );
+        let metadata = PleHashMetadata::qwen4();
+        validate_ple_geometry(ple, &metadata)
+            .expect("the pinned metadata fits the pinned geometry");
+        validate_ple_metadata(&metadata).expect("the Flash-Next sidecar/hot check agrees");
+        assert!(matches!(
+            admit_ple_inputs(&config, Some(metadata.clone()), Qwen4PleRows::Embedded),
+            Ok(Some(_))
+        ));
+        // A different padded row count fails both checks the same way.
+        let mut other = ple.clone();
+        other.shard_rows -= 1;
+        assert!(validate_ple_geometry(&other, &metadata).is_err());
+        // The shard tensors are the pinned layer-1 names.
+        assert_eq!(
+            ple_shard_name_prefix(ple),
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_"
+        );
+        let manifest = Qwen4Manifest::build(&config).expect("FN manifest");
+        let entries = ordered_ple_entries(&manifest, ple).expect("128 ordered shards");
+        assert_eq!(entries.len(), PLE_SHARD_COUNT);
+        assert!(entries.iter().all(|entry| entry.layer == Some(1)
+            && entry.logical_shape == [PLE_SHARD_ROWS, PLE_ROW_WIDTH]));
+    }
+
+    #[test]
+    fn synthetic_shards_follow_the_profile_geometry() {
+        let config = dense_config(true, true);
+        let ple = config.ple.as_ref().expect("PLE profile");
+        let prefix = ple_shard_name_prefix(ple);
+        assert!(
+            prefix.contains(&format!(".layers.{}.ple.", ple.layer)),
+            "{prefix}"
+        );
+        let name = |index: usize| format!("{prefix}{index}.weight");
+        assert_eq!(ple_shard_index(ple, &name(0)).unwrap(), 0);
+        assert!(ple_shard_index(ple, &name(ple.shard_count)).is_err());
+        assert!(ple_shard_index(ple, &format!("{prefix}00.weight")).is_err());
+        let manifest = Qwen4Manifest::build(&config).expect("synthetic manifest");
+        let entries = ordered_ple_entries(&manifest, ple).expect("ordered synthetic shards");
+        assert_eq!(entries.len(), ple.shard_count);
+        for entry in &entries {
+            assert_eq!(entry.layer, Some(ple.layer));
+            assert_eq!(entry.logical_shape, [ple.shard_rows, ple.row_width]);
+        }
+        validate_ple_geometry(ple, &ple_metadata_of(&config)).expect("synthetic metadata");
+        // The staged prefetch width comes from the profile, not the pinned 16.
+        assert_eq!(ple.head_count, 2);
+    }
+
+    #[test]
+    fn session_snapshots_omit_the_absent_ple_parts() {
+        use crate::state::Qwen4StateFormat;
+        let with = dense_config(true, true);
+        let without = dense_config(false, true);
+        let format = Qwen4StateFormat::F32;
+        let part = |bytes: usize| bytes.next_multiple_of(256);
+        let ple_bytes = with.ple_conv_history_rows() * with.hidden_size * with.hc_count * 4;
+        assert!(ple_bytes > 0 && without.ple_conv_history_rows() == 0);
+        for p in [1usize, 3, 8] {
+            let with_ple = session_snapshot_bytes(&with, format, false, p).expect("with PLE");
+            let no_ple = session_snapshot_bytes(&without, format, false, p).expect("without PLE");
+            assert_eq!(with_ple - no_ple, part(ple_bytes) as u64, "p={p}");
+        }
+    }
+
+    #[test]
+    fn a_head_free_profile_refuses_native_mtp_with_a_typed_error() {
+        assert!(Qwen4Bundle::require_mtp_head("tiny-dense", true).is_ok());
+        match Qwen4Bundle::require_mtp_head("tiny-dense", false) {
+            Err(error @ BundleError::NoMtpHead { .. }) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("tiny-dense") && text.contains("no MTP head"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected NoMtpHead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn executable_profile_admission_runs_before_any_allocation() {
+        // Flash-Next and a dense developer profile (with the kernel RoPE base)
+        // are executable, with and without PLE and MTP.
+        admit_executable_profile(&crate::config::compact_test_config()).expect("Flash-Next");
+        for (with_ple, with_mtp) in [(true, true), (false, false), (true, false), (false, true)] {
+            let mut config = dense_config(with_ple, with_mtp);
+            config.rope_theta = crate::program::QWEN4_QSA_KERNEL_ROPE_THETA;
+            admit_executable_profile(&config)
+                .unwrap_or_else(|error| panic!("dense ple={with_ple} mtp={with_mtp}: {error}"));
+        }
+        // A RoPE base the QSA kernels do not implement is the forward's refusal.
+        let error = admit_executable_profile(&dense_config(true, true)).unwrap_err();
+        assert!(matches!(error, BundleError::Forward(_)), "{error}");
+        // A synthetic MoE has no sealed route: the weights refusal text.
+        let moe = crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Moe {
+                num_experts: 8,
+                top_k: 2,
+                intermediate_size: 64,
+                shared_intermediate_size: Some(64),
+                norm_topk_prob: true,
+            },
+            256,
+            4,
+            true,
+            true,
+        );
+        let error = admit_executable_profile(&moe).unwrap_err();
+        assert!(matches!(error, BundleError::Weights(_)), "{error}");
+        assert!(error.to_string().contains("no sealed MoE route"), "{error}");
     }
 }

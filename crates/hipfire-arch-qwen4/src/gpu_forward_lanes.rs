@@ -57,16 +57,14 @@ use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::{
     decode_copy, dense_ref, hyper_read_desc, invalid, layer_desc, matrix_view, ple_desc,
-    program_dims, qwen4_ple_rows_f16, view, Qwen4GpuForward, Qwen4GpuForwardError,
-    Qwen4GpuForwardScratch,
-    DECODE_Q8_PER_LAYER, EPSILON,
+    program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4GpuForward,
+    Qwen4GpuForwardError, Qwen4GpuForwardScratch, DECODE_Q8_PER_LAYER, EPSILON,
 };
-use crate::ple::{PLE_HEAD_COUNT, PLE_ROW_WIDTH};
 use crate::ple_stage::ple_async_upload;
 use crate::program::{
     execute_final_hyper, execute_lm_head, seal_moe_for_layer, validate_final_hyper,
-    validate_lm_head, Qwen4AttentionWeights, Qwen4LayerDescription, Qwen4LayerScratch,
-    Qwen4ProgramDims,
+    validate_lm_head, Qwen4AttentionWeights, Qwen4FfnBinding, Qwen4LayerDescription,
+    Qwen4LayerScratch, Qwen4ProgramDims,
 };
 use crate::state::Qwen4State;
 use hipfire_dispatch::context::DispatchCtx;
@@ -503,7 +501,7 @@ struct SegViews {
     qsa_v: GpuTensor,
     qsa_output: GpuTensor,
     attention_output: GpuTensor,
-    moe_output: GpuTensor,
+    ffn_output: GpuTensor,
     router_logits: GpuTensor,
     ple_rows: GpuTensor,
     ple_query: GpuTensor,
@@ -538,6 +536,7 @@ impl SegViews {
         vocab: usize,
         out: Option<&LaneOutputs<'_>>,
         seg: Segment,
+        ple_embed_dim: usize,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let b = seg.begin;
         let wide = dims.wide();
@@ -578,9 +577,9 @@ impl SegViews {
             qsa_v: rows_from(&scratch.qsa_v, b, dims.kv_width())?,
             qsa_output: rows_from(&scratch.qsa_output, b, dims.q_width())?,
             attention_output: rows_from(&scratch.attention_output, b, hidden)?,
-            moe_output: rows_from(&scratch.moe_output, b, hidden)?,
-            router_logits: matrix_view(&scratch.router_logits, seg.rows, dims.num_experts)?,
-            ple_rows: rows_from(&scratch.ple_rows, b, hidden)?,
+            ffn_output: rows_from(&scratch.ffn_output, b, hidden)?,
+            router_logits: matrix_view(&scratch.router_logits, seg.rows, router_columns(dims))?,
+            ple_rows: rows_from(&scratch.ple_rows, b, ple_embed_dim)?,
             ple_query: rows_from(&scratch.ple_query, b, wide)?,
             ple_key: rows_from(&scratch.ple_key, b, wide)?,
             ple_value: rows_from(&scratch.ple_value, b, hidden)?,
@@ -625,7 +624,7 @@ impl SegViews {
             qsa_v: &self.qsa_v,
             qsa_output: &self.qsa_output,
             attention_output: &self.attention_output,
-            moe_output: &self.moe_output,
+            ffn_output: &self.ffn_output,
             moe_shared_output: &s.moe_shared_output,
             moe_router_logits: &self.router_logits,
             moe_x_rot: &s.moe_x_rot,
@@ -807,6 +806,14 @@ fn forward_lanes_scoped(
     out: &StepOutputs<'_>,
     policy: &LaneStagePolicy,
 ) -> Result<(), Qwen4GpuForwardError> {
+    // Lanes are the Flash-Next route: the stage policy, row sharing and
+    // decode copies are evidenced for its recipe only.
+    if !bundle.config.profile.is_flash_next() {
+        return Err(invalid(format!(
+            "lane steps run only the Flash-Next profile, not {}",
+            bundle.config.profile.id()
+        )));
+    }
     policy.validate().map_err(invalid)?;
     if lanes.is_empty() {
         return Err(invalid("a lane step needs at least one lane"));
@@ -946,6 +953,11 @@ fn forward_lanes_scoped(
         .and_then(|id| id.checked_sub(1))
         .filter(|&layer| layer < config.num_hidden_layers)
         .ok_or_else(|| invalid("PLE layer id missing or outside the trunk"))?;
+    let ple_geometry = config
+        .ple
+        .as_ref()
+        .ok_or_else(|| invalid("PLE geometry missing"))?;
+    let (ple_head_count, ple_row_width) = (ple_geometry.head_count, ple_geometry.row_width);
     let lane_segs = lane_segments(&rows);
     let group_segs = if prefill {
         // One launch covers every wave row.
@@ -1009,12 +1021,21 @@ fn forward_lanes_scoped(
         }
     }
     // PLE rows: one fetch of every lane's ids (each hashed from its own
-    // history), started now so it overlaps the program build.
+    // history), started now so it overlaps the program build.  The lane
+    // route is Flash-Next-only, which always carries PLE.
+    let ple_owner = bundle
+        .ple
+        .as_ref()
+        .ok_or_else(|| invalid("the lane forward requires a profile with PLE"))?;
     let ple_ids: Vec<u64> = lanes
         .iter()
-        .flat_map(|lane| lane.state.ple_history.row_ids(&bundle.ple_metadata, lane.tokens))
+        .flat_map(|lane| {
+            lane.state
+                .ple_history
+                .row_ids(&ple_owner.metadata, lane.tokens)
+        })
         .collect();
-    let mut ple = RowFetch::begin_or_adopt(&bundle.ple_rows, fwd.ple_ahead.take(), ple_ids)
+    let mut ple = RowFetch::begin_or_adopt(&ple_owner.rows, fwd.ple_ahead.take(), ple_ids)
         .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
     // The ids this forward uploads are not a whole-row mirror of a singleton
     // upload: no later singleton forward may claim them.
@@ -1031,7 +1052,14 @@ fn forward_lanes_scoped(
         let scratch = &fwd.scratch;
         let mut views = Vec::with_capacity(all_segs.len());
         for seg in &all_segs {
-            views.push(SegViews::new(scratch, dims, vocab, ar_out, *seg)?);
+            views.push(SegViews::new(
+                scratch,
+                dims,
+                vocab,
+                ar_out,
+                *seg,
+                ple_head_count * ple_row_width,
+            )?);
         }
         let seg_scratch: Vec<Qwen4LayerScratch<'_>> =
             views.iter().map(|view| view.layer_scratch(scratch)).collect();
@@ -1053,7 +1081,7 @@ fn forward_lanes_scoped(
                 descs.push(layer_desc(
                     &bundle.weights,
                     &bundle.weights.layer_refs[layer_index],
-                    &fwd.moe[layer_index],
+                    fwd.moe.get(layer_index),
                     config,
                     &fwd.decode_q8,
                     rows,
@@ -1229,7 +1257,11 @@ fn forward_lanes_scoped(
                                 norm_weight: write.norm,
                                 block_inject: write.block_inject,
                                 normalized: &v.hc_normalized,
-                                mixed: if mlp { &v.moe_output } else { &v.attention_output },
+                                mixed: if mlp {
+                                    &v.ffn_output
+                                } else {
+                                    &v.attention_output
+                                },
                                 gates: &v.hc_gates,
                                 output: &v.streams,
                                 rows: r,
@@ -1252,7 +1284,10 @@ fn forward_lanes_scoped(
                                 norm_query: ple_w.norm_query,
                                 norm_conv: ple_w.norm_conv,
                                 conv: ple_w.conv,
-                                state: &state.ple_conv,
+                                state: state
+                                    .ple_conv
+                                    .as_ref()
+                                    .ok_or_else(|| invalid("PLE conv state missing"))?,
                                 streams: &v.streams,
                                 rows_tensor: &v.ple_rows,
                                 query: &v.ple_query,
@@ -1264,6 +1299,7 @@ fn forward_lanes_scoped(
                                 rows: r,
                                 branches: dims.hc_count,
                                 hidden: config.hidden_size,
+                                embed_dim: ple_head_count * ple_row_width,
                                 kernel_size: dims.ple_conv_kernel_dim,
                                 dilation: config.ple_conv_dilation(),
                                 epsilon: EPSILON,
@@ -1381,6 +1417,7 @@ fn forward_lanes_scoped(
                                 heads: dims.num_attention_heads,
                                 kv_heads: dims.num_key_value_heads,
                                 head_dim: dims.head_dim,
+                                rotary_dim: config.rotary_dim(),
                                 input_width: dims.hidden,
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,
@@ -1408,21 +1445,17 @@ fn forward_lanes_scoped(
                             // AR lanes route by their real rows (`rr == r`); a
                             // prefill wave seals at its routed rows so a 1-row
                             // lane takes the prefill MoE under the profile.
-                            let sealed = seal_moe_for_layer(
-                                &ctx,
-                                dims,
-                                &descs[layer],
-                                &seg_scratch[i],
-                                r,
-                                rr,
-                            )
-                            .map_err(|error| {
-                                Qwen4GpuForwardError::Dispatch(format!(
-                                    "seal lane MoE: {error:?}"
-                                ))
-                            })?;
+                            let Qwen4FfnBinding::Moe(moe) = descs[layer].ffn else {
+                                return Err(invalid("lane steps run only the Flash-Next MoE FFN"));
+                            };
+                            let sealed = seal_moe_for_layer(&ctx, dims, moe, &seg_scratch[i], r, rr)
+                                .map_err(|error| {
+                                    Qwen4GpuForwardError::Dispatch(format!(
+                                        "seal lane MoE: {error:?}"
+                                    ))
+                                })?;
                             steps.push(Step::Clear(ClearOp {
-                                tensor: &v.moe_output,
+                                tensor: &v.ffn_output,
                                 elements: r * config.hidden_size,
                             }));
                             steps.push(Step::Moe(sealed));
@@ -1497,7 +1530,7 @@ fn forward_lanes_scoped(
             .as_bytes()
             .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?
             .len();
-        let staged = view(&scratch.ple_staged, 0, n * PLE_HEAD_COUNT * PLE_ROW_WIDTH);
+        let staged = view(&scratch.ple_staged, 0, n * ple_head_count * ple_row_width);
         let buffer = fwd.host_ple.stage_buffer(gpu, upload_len)?;
         lease
             .stage_into(buffer)
@@ -1517,24 +1550,24 @@ fn forward_lanes_scoped(
         let ple_rows_segs = if ple_rows_f16 { 0..lane_segs.len() } else { segs_for(rows_share) };
         for i in ple_rows_segs {
             let (seg, v) = (&all_segs[i], &views[i]);
-            let row_width = PLE_HEAD_COUNT * PLE_ROW_WIDTH;
+            let row_width = ple_head_count * ple_row_width;
             let staged_rows = view(&staged, seg.begin * row_width, seg.rows * row_width);
-            let dest = view(&v.ple_rows, 0, seg.rows * config.hidden_size);
+            let dest = view(&v.ple_rows, 0, seg.rows * row_width);
             if ple_rows_f16 {
                 gpu.grouped_gather_convert_bf16_f16(
                     &staged_rows,
                     &dest,
                     seg.rows,
-                    PLE_HEAD_COUNT,
-                    PLE_ROW_WIDTH,
+                    ple_head_count,
+                    ple_row_width,
                 )?;
             } else {
                 gpu.grouped_gather_convert_bf16(
                     &staged_rows,
                     &dest,
                     seg.rows,
-                    PLE_HEAD_COUNT,
-                    PLE_ROW_WIDTH,
+                    ple_head_count,
+                    ple_row_width,
                 )?;
             }
         }

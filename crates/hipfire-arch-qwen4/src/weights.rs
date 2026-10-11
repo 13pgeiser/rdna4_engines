@@ -11,7 +11,7 @@
 //! runtime's [`WeightLoadTransaction`] remains the only allocation owner until
 //! this module finalizes handles into [`Qwen4Weights`].
 
-use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig};
+use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig, Qwen4Profile};
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 #[cfg(test)]
@@ -1793,6 +1793,37 @@ pub struct MoeWeights {
     pub shared_gate_scalar: TensorRef,
 }
 
+/// Dense gated-MLP projections: `down(silu(gate(x)) * up(x))`.
+#[derive(Clone, Debug)]
+pub struct DenseFfnWeights {
+    pub gate: TensorRef,
+    pub up: TensorRef,
+    pub down: TensorRef,
+}
+
+/// The FFN block of one decoder layer (or of the MTP layer).
+#[derive(Clone, Debug)]
+pub enum Qwen4FfnWeights {
+    Dense(DenseFfnWeights),
+    Moe(MoeWeights),
+}
+
+impl Qwen4FfnWeights {
+    pub fn moe(&self) -> Option<&MoeWeights> {
+        match self {
+            Self::Moe(moe) => Some(moe),
+            Self::Dense(_) => None,
+        }
+    }
+
+    pub fn dense(&self) -> Option<&DenseFfnWeights> {
+        match self {
+            Self::Dense(dense) => Some(dense),
+            Self::Moe(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Qwen4LayerWeights {
     pub layer: usize,
@@ -1802,7 +1833,7 @@ pub struct Qwen4LayerWeights {
     pub attention: Option<QsaWeights>,
     pub gdn: Option<GdnWeights>,
     pub ple: Option<PleWeights>,
-    pub moe: MoeWeights,
+    pub ffn: Qwen4FfnWeights,
 }
 
 #[derive(Clone, Debug)]
@@ -1814,7 +1845,7 @@ pub struct Qwen4MtpWeights {
     pub attn_hyper: HyperConnectionWeights,
     pub mlp_hyper: HyperConnectionWeights,
     pub attention: QsaWeights,
-    pub moe: MoeWeights,
+    pub ffn: Qwen4FfnWeights,
     pub final_hyper: HyperConnectionReadWeights,
 }
 
@@ -1841,17 +1872,27 @@ pub struct Qwen4Weights {
     taken_by_name: HashMap<String, Vec<usize>>,
     pub root: Qwen4RootWeights,
     pub layer_refs: Vec<Qwen4LayerWeights>,
-    pub mtp: Qwen4MtpWeights,
+    /// `Some` iff `config.mtp` is declared.
+    pub mtp: Option<Qwen4MtpWeights>,
 }
 
 impl Qwen4Weights {
+    /// Publish the resident weights of `tx` for `config` under the manifest
+    /// the artifact was admitted with: `recipe` is `Qwen4HfqmArtifact::recipe()`
+    /// (the manifest identity's recipe), so the declaration is rebuilt
+    /// exactly as admission built it instead of from `config` alone.  For
+    /// Flash-Next the recipe is the single `FlashNextPacked` carrying the
+    /// trunk-tier and MTP-source knobs resolved at admission, which is what
+    /// [`Qwen4Manifest::build`] resolved from the same environment before.  A
+    /// recipe the profile cannot be declared under is refused by
+    /// [`Qwen4Manifest::build_with_recipe`].
     pub fn assemble(
         tx: &mut WeightLoadTransaction,
         config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
         placements: &[Qwen4Placement],
     ) -> Result<Self, WeightError> {
-        require_executable_profile(config)?;
-        let manifest = Qwen4Manifest::build(config)?;
+        let manifest = assembly_manifest(config, recipe)?;
         let expected = manifest
             .resident_keys()
             .map(|(name, layer)| (name.to_string(), layer))
@@ -1889,7 +1930,11 @@ impl Qwen4Weights {
         }
         let root = build_root_refs(config)?;
         let layer_refs = build_layer_refs(config)?;
-        let mtp = build_mtp_refs(config)?;
+        let mtp = config
+            .mtp
+            .is_some()
+            .then(|| build_mtp_refs(config))
+            .transpose()?;
         Ok(Self {
             manifest,
             taken,
@@ -2129,6 +2174,7 @@ fn build_hyper_read_refs(
 fn build_hyper_refs(
     prefix: &str,
     layer: Option<usize>,
+    hc_count: usize,
     hc_wide: usize,
     hc_rank: usize,
 ) -> Result<HyperConnectionWeights, WeightError> {
@@ -2137,7 +2183,7 @@ fn build_hyper_refs(
         format!("{prefix}.block_inject_weight.weight"),
         TensorRole::HyperConnectionBlockInject,
         layer,
-        vec![4, hc_wide],
+        vec![hc_count, hc_wide],
         DType::BF16,
     )?;
     Ok(HyperConnectionWeights {
@@ -2159,19 +2205,20 @@ fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, Weig
     let gdn_qk = config.linear_num_key_heads * config.linear_key_head_dim;
     let gdn_v = config.linear_num_value_heads * config.linear_value_head_dim;
     let gdn_qkv = 2 * gdn_qk + gdn_v;
-    let moe_shape = executor_moe_shape(config)?;
     let mut refs = Vec::with_capacity(config.num_hidden_layers);
     for (layer, kind) in config.layer_types.iter().copied().enumerate() {
         let prefix = format!("model.language_model.layers.{layer}");
         let attn_hyper = build_hyper_refs(
             &format!("{prefix}.attn_hyper_connection"),
             Some(layer),
+            config.hc_count,
             hc_wide,
             hc_rank,
         )?;
         let mlp_hyper = build_hyper_refs(
             &format!("{prefix}.mlp_hyper_connection"),
             Some(layer),
+            config.hc_count,
             hc_wide,
             hc_rank,
         )?;
@@ -2216,7 +2263,7 @@ fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, Weig
             }
             _ => None,
         };
-        let moe = build_moe_refs(&format!("{prefix}.mlp"), Some(layer), hidden, &moe_shape)?;
+        let ffn = build_ffn_refs(&format!("{prefix}.mlp"), Some(layer), hidden, config)?;
         refs.push(Qwen4LayerWeights {
             layer,
             kind,
@@ -2225,20 +2272,15 @@ fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, Weig
             attention,
             gdn,
             ple,
-            moe,
+            ffn,
         });
     }
     Ok(refs)
 }
 
+/// Bind the native MTP head; the caller binds it only when `config.mtp` is
+/// declared.
 fn build_mtp_refs(config: &Qwen4Config) -> Result<Qwen4MtpWeights, WeightError> {
-    if config.mtp.is_none() {
-        return Err(WeightError::UnsupportedProfile {
-            profile: config.profile.id().to_string(),
-            reason: "profile has no native MTP head".to_string(),
-        });
-    }
-    let moe_shape = executor_moe_shape(config)?;
     let hidden = config.hidden_size;
     let hc_wide = config.hc_count * hidden;
     let hc_rank = config.hc_lowrank;
@@ -2275,8 +2317,20 @@ fn build_mtp_refs(config: &Qwen4Config) -> Result<Qwen4MtpWeights, WeightError> 
             vec![hc_wide],
             DType::BF16,
         )?,
-        attn_hyper: build_hyper_refs("mtp.layers.0.attn_hyper_connection", None, hc_wide, hc_rank)?,
-        mlp_hyper: build_hyper_refs("mtp.layers.0.mlp_hyper_connection", None, hc_wide, hc_rank)?,
+        attn_hyper: build_hyper_refs(
+            "mtp.layers.0.attn_hyper_connection",
+            None,
+            config.hc_count,
+            hc_wide,
+            hc_rank,
+        )?,
+        mlp_hyper: build_hyper_refs(
+            "mtp.layers.0.mlp_hyper_connection",
+            None,
+            config.hc_count,
+            hc_wide,
+            hc_rank,
+        )?,
         attention: build_qsa_refs(
             "mtp.layers.0.self_attn",
             None,
@@ -2286,7 +2340,7 @@ fn build_mtp_refs(config: &Qwen4Config) -> Result<Qwen4MtpWeights, WeightError> 
             indexer_qk_dim,
             config,
         )?,
-        moe: build_moe_refs("mtp.layers.0.mlp", None, hidden, &moe_shape)?,
+        ffn: build_ffn_refs("mtp.layers.0.mlp", None, hidden, config)?,
         final_hyper: build_hyper_read_refs("mtp.hyper_connection_mixer", None, hc_wide, hc_rank)?,
     })
 }
@@ -2430,116 +2484,196 @@ fn build_ple_refs(
     })
 }
 
-/// The MoE geometry the Flash-Next executor binds.  The executor consumes the
-/// sealed shared-expert MoE only; a dense FFN or a MoE without a shared expert
-/// is an inventory profile whose binder does not exist yet.
-struct ExecutorMoeShape {
-    experts: usize,
-    intermediate: usize,
-    shared: usize,
+/// Refuse, before any allocation or placement, every profile the typed
+/// executor cannot run.  Header-only developer inventories are admitted by
+/// `artifact` independently of this executor admission.
+///
+/// * Flash-Next: the pinned shared-expert MoE with PLE and the native MTP head.
+/// * Synthetic developer profiles: only under `cfg(test)` or the
+///   `qwen4-dev-profiles` feature, and only a dense FFN (PLE and MTP optional
+///   at this layer).  A synthetic MoE has no sealed route (see
+///   [`admit_synthetic_profile`]).
+pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), WeightError> {
+    let unsupported = |reason: &str| WeightError::UnsupportedProfile {
+        profile: config.profile.id().to_string(),
+        reason: reason.to_string(),
+    };
+    match &config.profile {
+        Qwen4Profile::FlashNext => {
+            if !matches!(
+                &config.ffn,
+                Qwen4FfnConfig::Moe {
+                    shared_intermediate_size: Some(_),
+                    ..
+                }
+            ) {
+                return Err(unsupported(
+                    "the Qwen4 executor binds only the shared-expert MoE FFN",
+                ));
+            }
+            if config.ple.is_none() {
+                return Err(unsupported("the Qwen4 executor requires PLE"));
+            }
+            if config.mtp.is_none() {
+                return Err(unsupported(
+                    "the Qwen4 executor requires the native MTP head",
+                ));
+            }
+            Ok(())
+        }
+        Qwen4Profile::Synthetic(_) => admit_synthetic_profile(config),
+    }
 }
 
-fn executor_moe_shape(config: &Qwen4Config) -> Result<ExecutorMoeShape, WeightError> {
+/// The declaration [`Qwen4Weights::assemble`] publishes against: the profile
+/// must be executable, and the manifest is the one `recipe` declares for it
+/// (the admitted artifact's own recipe), never a rebuild from `config` alone.
+fn assembly_manifest(
+    config: &Qwen4Config,
+    recipe: &Qwen4TierRecipe,
+) -> Result<Qwen4Manifest, WeightError> {
+    admit_executable_profile(config)?;
+    Qwen4Manifest::build_with_recipe(config, recipe.clone())
+}
+
+/// Production builds never execute a developer profile.
+#[cfg(not(any(test, feature = "qwen4-dev-profiles")))]
+fn admit_synthetic_profile(config: &Qwen4Config) -> Result<(), WeightError> {
+    Err(WeightError::UnsupportedProfile {
+        profile: config.profile.id().to_string(),
+        reason: "developer profiles execute only in builds with the qwen4-dev-profiles feature"
+            .to_string(),
+    })
+}
+
+#[cfg(any(test, feature = "qwen4-dev-profiles"))]
+fn admit_synthetic_profile(config: &Qwen4Config) -> Result<(), WeightError> {
     match &config.ffn {
+        Qwen4FfnConfig::Dense { .. } => Ok(()),
+        Qwen4FfnConfig::Moe {
+            num_experts,
+            top_k,
+            shared_intermediate_size: None,
+            ..
+        } => Err(WeightError::UnsupportedProfile {
+            profile: config.profile.id().to_string(),
+            reason: format!(
+                "MoE without a shared expert has no executor (experts={num_experts}, top_k={top_k})"
+            ),
+        }),
+        Qwen4FfnConfig::Moe {
+            num_experts, top_k, ..
+        } => Err(WeightError::UnsupportedProfile {
+            profile: config.profile.id().to_string(),
+            reason: format!(
+                "no sealed MoE route exists for this geometry (experts={num_experts}, top_k={top_k}): \
+                 the canonical qt44/qt53 route pins 512 experts, top-10, hidden 2560 and intermediate 640, \
+                 and there is no BF16 routed-expert route or top-k other than 8/10"
+            ),
+        }),
+    }
+}
+
+/// Bind one FFN block's typed references: dense gate/up/down, or the pinned
+/// shared-expert MoE.
+fn build_ffn_refs(
+    prefix: &str,
+    layer: Option<usize>,
+    hidden: usize,
+    config: &Qwen4Config,
+) -> Result<Qwen4FfnWeights, WeightError> {
+    let tr = |suffix: &str, role: TensorRole, shape: Vec<usize>, dtype: DType| {
+        TensorRef::new(format!("{prefix}.{suffix}"), role, layer, shape, dtype)
+    };
+    match &config.ffn {
+        Qwen4FfnConfig::Dense { intermediate_size } => {
+            let intermediate = *intermediate_size;
+            Ok(Qwen4FfnWeights::Dense(DenseFfnWeights {
+                gate: tr(
+                    "gate_proj.weight",
+                    TensorRole::DenseFfnGate,
+                    vec![intermediate, hidden],
+                    DType::BF16,
+                )?,
+                up: tr(
+                    "up_proj.weight",
+                    TensorRole::DenseFfnUp,
+                    vec![intermediate, hidden],
+                    DType::BF16,
+                )?,
+                down: tr(
+                    "down_proj.weight",
+                    TensorRole::DenseFfnDown,
+                    vec![hidden, intermediate],
+                    DType::BF16,
+                )?,
+            }))
+        }
         Qwen4FfnConfig::Moe {
             num_experts,
             intermediate_size,
             shared_intermediate_size: Some(shared),
             ..
-        } => Ok(ExecutorMoeShape {
-            experts: *num_experts,
-            intermediate: *intermediate_size,
-            shared: *shared,
-        }),
-        _ => Err(WeightError::UnsupportedProfile {
+        } => {
+            let (experts, intermediate, shared) = (*num_experts, *intermediate_size, *shared);
+            Ok(Qwen4FfnWeights::Moe(MoeWeights {
+                experts_down: tr(
+                    "experts.down_proj",
+                    TensorRole::RoutedDown,
+                    vec![experts, hidden, intermediate],
+                    ROUTED_DOWN_DTYPE,
+                )?,
+                experts_gate_up: tr(
+                    "experts.gate_up_proj",
+                    TensorRole::RoutedGateUp,
+                    vec![experts, 2 * intermediate, hidden],
+                    ROUTED_GATE_UP_DTYPE,
+                )?,
+                expert_source_layout: ExpertSourceLayout::PackedFused {
+                    gate_up: format!("{prefix}.experts.gate_up_proj"),
+                    down: format!("{prefix}.experts.down_proj"),
+                    sidecars: Vec::new(),
+                },
+                gate: tr(
+                    "gate.weight",
+                    TensorRole::Router,
+                    vec![experts, hidden],
+                    DType::BF16,
+                )?,
+                shared_down: tr(
+                    "shared_expert.down_proj.weight",
+                    TensorRole::SharedExpertDown,
+                    vec![hidden, shared],
+                    DType::BF16,
+                )?,
+                shared_gate: tr(
+                    "shared_expert.gate_proj.weight",
+                    TensorRole::SharedExpertGate,
+                    vec![shared, hidden],
+                    DType::BF16,
+                )?,
+                shared_up: tr(
+                    "shared_expert.up_proj.weight",
+                    TensorRole::SharedExpertUp,
+                    vec![shared, hidden],
+                    DType::BF16,
+                )?,
+                shared_gate_scalar: tr(
+                    "shared_expert_gate.weight",
+                    TensorRole::SharedExpertGateScalar,
+                    vec![1, hidden],
+                    DType::BF16,
+                )?,
+            }))
+        }
+        Qwen4FfnConfig::Moe {
+            shared_intermediate_size: None,
+            ..
+        } => Err(WeightError::UnsupportedProfile {
             profile: config.profile.id().to_string(),
             reason: "the Qwen4 executor binds only the shared-expert MoE FFN".to_string(),
         }),
     }
-}
-
-/// Refuse, before any allocation or placement, every profile the typed
-/// executor cannot run.  Header-only developer inventories of other profiles
-/// are admitted by `artifact`; binding their tensors needs the dense/optional
-/// PLE/MTP executor, which must not be approximated by Flash-Next binders.
-fn require_executable_profile(config: &Qwen4Config) -> Result<(), WeightError> {
-    let unsupported = |reason: &str| WeightError::UnsupportedProfile {
-        profile: config.profile.id().to_string(),
-        reason: reason.to_string(),
-    };
-    if !config.profile.is_flash_next() {
-        return Err(unsupported(
-            "the Qwen4 executor runs only the pinned Flash-Next profile",
-        ));
-    }
-    executor_moe_shape(config)?;
-    if config.ple.is_none() {
-        return Err(unsupported("the Qwen4 executor requires PLE"));
-    }
-    if config.mtp.is_none() {
-        return Err(unsupported("the Qwen4 executor requires the native MTP head"));
-    }
-    Ok(())
-}
-
-fn build_moe_refs(
-    prefix: &str,
-    layer: Option<usize>,
-    hidden: usize,
-    config: &ExecutorMoeShape,
-) -> Result<MoeWeights, WeightError> {
-    let tr = |suffix: &str, role: TensorRole, shape: Vec<usize>, dtype: DType| {
-        TensorRef::new(format!("{prefix}.{suffix}"), role, layer, shape, dtype)
-    };
-    Ok(MoeWeights {
-        experts_down: tr(
-            "experts.down_proj",
-            TensorRole::RoutedDown,
-            vec![config.experts, hidden, config.intermediate],
-            ROUTED_DOWN_DTYPE,
-        )?,
-        experts_gate_up: tr(
-            "experts.gate_up_proj",
-            TensorRole::RoutedGateUp,
-            vec![config.experts, 2 * config.intermediate, hidden],
-            ROUTED_GATE_UP_DTYPE,
-        )?,
-        expert_source_layout: ExpertSourceLayout::PackedFused {
-            gate_up: format!("{prefix}.experts.gate_up_proj"),
-            down: format!("{prefix}.experts.down_proj"),
-            sidecars: Vec::new(),
-        },
-        gate: tr(
-            "gate.weight",
-            TensorRole::Router,
-            vec![config.experts, hidden],
-            DType::BF16,
-        )?,
-        shared_down: tr(
-            "shared_expert.down_proj.weight",
-            TensorRole::SharedExpertDown,
-            vec![hidden, config.shared],
-            DType::BF16,
-        )?,
-        shared_gate: tr(
-            "shared_expert.gate_proj.weight",
-            TensorRole::SharedExpertGate,
-            vec![config.shared, hidden],
-            DType::BF16,
-        )?,
-        shared_up: tr(
-            "shared_expert.up_proj.weight",
-            TensorRole::SharedExpertUp,
-            vec![config.shared, hidden],
-            DType::BF16,
-        )?,
-        shared_gate_scalar: tr(
-            "shared_expert_gate.weight",
-            TensorRole::SharedExpertGateScalar,
-            vec![1, hidden],
-            DType::BF16,
-        )?,
-    })
 }
 
 /// Whether `name` is one of the [`PLE_SHARD_COUNT`] canonical Flash-Next
@@ -3568,20 +3702,147 @@ mod tests {
     }
 
     #[test]
-    fn executor_refuses_every_profile_without_a_binder() {
-        require_executable_profile(&pinned_config()).expect("Flash-Next is executable");
+    fn executor_admits_flash_next_and_dense_and_refuses_synthetic_moe() {
+        admit_executable_profile(&pinned_config()).expect("Flash-Next is executable");
         for config in [
-            synthetic(small_moe(Some(64)), 256, 4, true, true),
             synthetic(dense_ffn(), 5120, 64, true, true),
+            synthetic(dense_ffn(), 256, 4, false, false),
         ] {
-            let error = require_executable_profile(&config).unwrap_err();
-            assert!(matches!(error, WeightError::UnsupportedProfile { .. }), "{error}");
+            admit_executable_profile(&config).expect("dense developer profile is executable");
         }
-        // The typed refs refuse a profile with no binder instead of binding
-        // Flash-Next tensors to it.
-        let dense = synthetic(dense_ffn(), 5120, 64, false, false);
-        assert!(build_layer_refs(&dense).is_err());
-        assert!(build_mtp_refs(&dense).is_err());
+        for shared in [Some(64), None] {
+            let config = synthetic(small_moe(shared), 256, 4, true, true);
+            let error = admit_executable_profile(&config).unwrap_err();
+            let WeightError::UnsupportedProfile { profile, reason } = &error else {
+                panic!("{error}");
+            };
+            assert_eq!(profile, config.profile.id());
+            assert!(
+                reason.contains("experts=") && reason.contains("top_k="),
+                "{reason}"
+            );
+            if shared.is_some() {
+                assert!(reason.contains("no sealed MoE route"), "{reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn assembly_declares_the_admitted_recipes_manifest() {
+        // A packed synthetic artifact is declared packed, not as the
+        // profile's default source-exact manifest `build` returns.
+        let config = synthetic(dense_ffn(), 5120, 64, true, true);
+        let default = Qwen4Manifest::build(&config).expect("default manifest");
+        assert_eq!(
+            default.identity.recipe,
+            Qwen4TierRecipe::SyntheticSourceBf16
+        );
+        let packed = Qwen4Manifest::build_with_recipe(&config, Qwen4TierRecipe::SyntheticPacked)
+            .expect("packed manifest");
+        let assembled = assembly_manifest(&config, &packed.identity.recipe).expect("assembly");
+        assert_eq!(assembled, packed);
+        assert_eq!(assembled.identity.recipe, Qwen4TierRecipe::SyntheticPacked);
+        assert_ne!(
+            assembled.weights, default.weights,
+            "the packed recipe declares packed formats"
+        );
+        // Same tensors, so the placement set is unchanged by the recipe.
+        assert_eq!(
+            assembled.resident_keys().collect::<Vec<_>>(),
+            default.resident_keys().collect::<Vec<_>>()
+        );
+        // The source-exact recipe reproduces `build` exactly.
+        let source = assembly_manifest(&config, &default.identity.recipe).expect("source assembly");
+        assert_eq!(source, default);
+        // A recipe the profile cannot be declared under is refused.
+        let flash_next = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let error = assembly_manifest(&config, &flash_next).unwrap_err();
+        assert!(
+            matches!(error, WeightError::UnsupportedProfile { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn flash_next_assembly_manifest_is_exactly_the_default_build() {
+        // The recipe admission recorded (carrying the trunk-tier and
+        // MTP-source knobs) rebuilds the manifest `Qwen4Manifest::build`
+        // declares, tier overrides included.
+        let config = pinned_config();
+        let built = Qwen4Manifest::build(&config).expect("pinned manifest");
+        let assembled = assembly_manifest(&config, &built.identity.recipe).expect("assembly");
+        assert_eq!(assembled, built);
+        for tier in [DType::Q8_0, DType::MQ6G256V2] {
+            let tiered = Qwen4Manifest::build_with_trunk_tier(&config, tier).expect("tiered");
+            let assembled =
+                assembly_manifest(&config, &tiered.identity.recipe).expect("tiered assembly");
+            assert_eq!(assembled, tiered);
+            assert_eq!(
+                assembled.resident_keys().collect::<Vec<_>>(),
+                built.resident_keys().collect::<Vec<_>>()
+            );
+        }
+        // A synthetic recipe cannot declare Flash-Next.
+        let error = assembly_manifest(&config, &Qwen4TierRecipe::SyntheticPacked).unwrap_err();
+        assert!(
+            matches!(error, WeightError::UnsupportedProfile { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn assembly_refuses_a_synthetic_moe_with_the_executor_text() {
+        let config = synthetic(small_moe(Some(64)), 256, 4, true, true);
+        let error = assembly_manifest(&config, &Qwen4TierRecipe::SyntheticSourceBf16).unwrap_err();
+        let WeightError::UnsupportedProfile { reason, .. } = &error else {
+            panic!("{error}");
+        };
+        assert!(reason.contains("no sealed MoE route"), "{reason}");
+    }
+
+    #[test]
+    fn dense_binders_follow_the_profile_geometry() {
+        let config = synthetic(dense_ffn(), 256, 4, true, true);
+        let Qwen4FfnConfig::Dense { intermediate_size } = config.ffn else {
+            panic!("dense profile");
+        };
+        let manifest = Qwen4Manifest::build(&config).expect("dense manifest");
+        let layers = build_layer_refs(&config).expect("dense layer refs");
+        let mtp = build_mtp_refs(&config).expect("dense mtp refs");
+        let check = |reference: &TensorRef| {
+            let entry = manifest
+                .entry(&reference.name, reference.layer)
+                .unwrap_or_else(|| panic!("manifest lacks {}", reference.name));
+            assert_eq!(entry.logical_shape, reference.shape, "{}", reference.name);
+        };
+        for layer in &layers {
+            let dense = layer.ffn.dense().expect("dense FFN binding");
+            assert!(layer.ffn.moe().is_none());
+            assert_eq!(
+                dense.gate.shape,
+                vec![intermediate_size, config.hidden_size]
+            );
+            assert_eq!(
+                dense.down.shape,
+                vec![config.hidden_size, intermediate_size]
+            );
+            for reference in [&dense.gate, &dense.up, &dense.down] {
+                check(reference);
+            }
+            check(&layer.mlp_hyper.block_inject);
+            assert_eq!(
+                layer.mlp_hyper.block_inject.shape,
+                vec![config.hc_count, config.hc_count * config.hidden_size]
+            );
+        }
+        let dense = mtp.ffn.dense().expect("dense MTP FFN binding");
+        for reference in [&dense.gate, &dense.up, &dense.down] {
+            check(reference);
+        }
+        check(&mtp.mlp_hyper.block_inject);
     }
 
     #[test]
@@ -3705,7 +3966,8 @@ mod tests {
         }
 
         let layers = build_layer_refs(&config).expect("Qwen4 layer references");
-        match &layers[0].moe.expert_source_layout {
+        let moe = layers[0].ffn.moe().expect("Flash-Next binds the MoE FFN");
+        match &moe.expert_source_layout {
             ExpertSourceLayout::PackedFused {
                 gate_up,
                 down,

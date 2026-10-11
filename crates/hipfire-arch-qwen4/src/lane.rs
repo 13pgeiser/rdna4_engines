@@ -617,6 +617,12 @@ impl Qwen4LaneStore {
         row_budget: usize,
         spec: Option<LaneSpecConfig>,
     ) -> Result<Self, String> {
+        if !bundle.config.profile.is_flash_next() {
+            return Err(format!(
+                "lane store: lanes run only the Flash-Next profile, not {}",
+                bundle.config.profile.id()
+            ));
+        }
         if max_lanes == 0 || max_lanes > MAX_LANES {
             return Err(format!("lane store: max_lanes {max_lanes} outside 1..={MAX_LANES}"));
         }
