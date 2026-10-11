@@ -8683,12 +8683,12 @@ mod tests {
                 .parse()
                 .unwrap_or_else(|_| panic!("{k} not an integer"))
         };
-        let raw_fd = env("HIPFIRE_S2_IMPORT_FD") as i32;
+        let raw_fd = env("WH_S2_IMPORT_FD") as i32;
         eprintln!("S2_IMPORTER pid={} fd={raw_fd}", std::process::id());
         let desc = super::ImportedWeightAllocationDesc {
-            physical_bytes: env("HIPFIRE_S2_PHYSICAL_BYTES"),
-            logical_bytes: env("HIPFIRE_S2_LOGICAL_BYTES"),
-            granularity: env("HIPFIRE_S2_GRANULARITY"),
+            physical_bytes: env("WH_S2_PHYSICAL_BYTES"),
+            logical_bytes: env("WH_S2_LOGICAL_BYTES"),
+            granularity: env("WH_S2_GRANULARITY"),
         };
         // SAFETY: the exporter's pre_exec cleared CLOEXEC on this inherited FD, which
         // nothing else in this process owns; this OwnedFd closes it.
@@ -8720,7 +8720,7 @@ mod tests {
     /// Cross-process shared weight ownership on real hardware (gfx1201, Linux).
     ///
     /// Run exactly (exporter role; it re-execs this binary as the importer, which
-    /// is selected by `HIPFIRE_S2_IMPORT_FD`):
+    /// is selected by `WH_S2_IMPORT_FD`):
     /// `cargo test --release -p rdna-compute --lib -- --ignored --exact
     ///  dispatch::tests::shared_weight_owner_cross_process --nocapture`
     ///
@@ -8738,7 +8738,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut gpu = super::Gpu::init().expect("GPU initialization must succeed");
         assert_eq!(gpu.arch, "gfx1201", "test is gated to gfx1201");
-        if std::env::var("HIPFIRE_S2_IMPORT_FD").is_ok() {
+        if std::env::var("WH_S2_IMPORT_FD").is_ok() {
             s2_importer(&mut gpu);
             return;
         }
@@ -8809,10 +8809,10 @@ mod tests {
             "--ignored",
             "--nocapture",
         ])
-        .env("HIPFIRE_S2_IMPORT_FD", raw.to_string())
-        .env("HIPFIRE_S2_PHYSICAL_BYTES", exp.physical_bytes.to_string())
-        .env("HIPFIRE_S2_LOGICAL_BYTES", exp.logical_bytes.to_string())
-        .env("HIPFIRE_S2_GRANULARITY", exp.granularity.to_string());
+        .env("WH_S2_IMPORT_FD", raw.to_string())
+        .env("WH_S2_PHYSICAL_BYTES", exp.physical_bytes.to_string())
+        .env("WH_S2_LOGICAL_BYTES", exp.logical_bytes.to_string())
+        .env("WH_S2_GRANULARITY", exp.granularity.to_string());
         // SAFETY: runs in the forked child before exec; only async-signal-safe fcntl.
         unsafe {
             cmd.pre_exec(move || {
