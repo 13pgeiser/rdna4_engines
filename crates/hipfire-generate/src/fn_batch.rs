@@ -27,14 +27,17 @@
 //! window's own tokens. A draft-step failure errors every lane it named. The
 //! done value carries the lane's MTP counters (`mtp`, `mtp_windows`,
 //! `ar_windows`, `mtp_retired`, `mtp_drafts`, `mtp_accepted`).
-//! No lane session cache, promotion or parking is performed here.
+//! A running singleton is promoted into a lane when a second request arrives
+//! (`generate_spec` hands a `Qwen4PromotedRequest`, adopted before the loop
+//! under the same AttemptKey; its already-streamed pending seed is not
+//! emitted again). No lane session cache or parking is performed here.
 //! Timing fields measure this execution and are not byte-identical wall-clock
 //! values. `cached_tokens` is zero: S3 uses cold lane state, not singleton
 //! session restore. Content/reasoning bytes and semantic finish classification
 //! use the singleton code; compute-ID identity is the lane executor's oracle.
 
 use crate::ar::*;
-use crate::batch::{drain_qwen_batch_inbox, handoff_started_in_think, is_vmm_batch_request_eligible};
+use crate::batch::{drain_qwen_batch_inbox, handoff_started_in_think, is_vmm_batch_request_eligible, Qwen4PromotedRequest};
 use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::lane::LaneStatus;
 use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute};
@@ -53,6 +56,14 @@ use std::time::{Duration, Instant};
 const ROUTE: GenerationRoute = GenerationRoute::Qwen4Ar;
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// The next request epoch of a lane owner: shared by admission and the
+/// singleton promotion, so tags never collide.
+pub(crate) fn next_lane_epoch() -> Result<RequestEpoch, String> {
+    let tag = NEXT_EPOCH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| "qwen4 lane epoch exhausted".to_string())?;
+    Ok(RequestEpoch { request_tag: tag, owner_generation: 1 })
+}
+
 struct LaneCtl {
     epoch: RequestEpoch,
     slot: usize,
@@ -66,6 +77,9 @@ struct LaneCtl {
     decode_start: Option<Instant>,
     prefill_ms: f64,
     cache: Option<(QwenArCacheAction, Vec<u32>)>,
+    /// A promoted lane's pending seed was already streamed by the singleton:
+    /// its first decode advance does not emit the plan seed again.
+    skip_first_forward: bool,
 }
 
 fn release(model: &mut LoadedModel, ctl: &mut LaneCtl) -> Result<(), String> {
@@ -76,6 +90,77 @@ fn release(model: &mut LoadedModel, ctl: &mut LaneCtl) -> Result<(), String> {
         .release_lane(&ctl.epoch).map_err(|e| e.to_string())?;
     ctl.epoch.owner_generation = 0;
     Ok(())
+}
+
+/// The tokens a decode advance forwarded: the plan seed, then every committed
+/// id but the last (the next pending seed). `skip_seed` drops the plan seed
+/// (a promoted lane's was streamed by the singleton).
+fn forwarded_tokens(seed: u32, committed: &[u32], skip_seed: bool) -> Vec<u32> {
+    let window = &committed[..committed.len().saturating_sub(1)];
+    if skip_seed {
+        window.to_vec()
+    } else {
+        std::iter::once(seed).chain(window.iter().copied()).collect()
+    }
+}
+
+/// A promoted request that cannot continue anywhere (its singleton state
+/// already left the resident owners): release its lane and emit one
+/// generation error for the key.
+fn fail_promoted(
+    model: &mut LoadedModel,
+    stdout: &mut Stdout,
+    key: &AttemptKey,
+    admission: BatchGeneration,
+    epoch: &RequestEpoch,
+    message: &str,
+) {
+    let released = model.qwen4_mut().ok_or("qwen4 bundle disappeared".to_string())
+        .and_then(|b| b.release_lane(epoch).map_err(|e| e.to_string()));
+    let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+    emit_generation_error(ROUTE, stdout, Some(&key.id), message, "internal", false, released.is_ok());
+    batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+}
+
+/// Install a promoted singleton as a Running lane under its AttemptKey (no
+/// new `gen_start`). On failure the lane is released and one generation error
+/// is emitted for the key; the request cannot continue anywhere.
+fn adopt_promoted(
+    sched: &mut ContinuousBatchScheduler,
+    model: &mut LoadedModel,
+    controls: &mut [Option<LaneCtl>],
+    stdout: &mut Stdout,
+    promoted: Qwen4PromotedRequest,
+) {
+    let Qwen4PromotedRequest { pending, progress, producer, epoch, slot, seed_emitted, max_tokens } = promoted;
+    let key = pending.key.clone();
+    let admission = pending.admission;
+    let started_in_think = pending.started_in_think;
+    let max_think_tokens = pending.max_think_tokens;
+    let start = progress.created_at;
+    // The request's decode began on the resident singleton at its prefill end,
+    // not at adoption: the done-event decode rate spans the whole decode.
+    let decode_start = progress.prefill_done_at.unwrap_or_else(Instant::now);
+    let prefill_ms = progress.prefill_done_at
+        .map_or(0.0, |t| t.saturating_duration_since(start).as_secs_f64() * 1000.0);
+    let bytes = model.tokenizer.as_ref().map(|tokenizer| {
+        let mut bytes = Vec::new();
+        for &token in &progress.streamed_tokens {
+            tokenizer.decode_token_bytes_into(token, &mut bytes);
+        }
+        bytes
+    });
+    let adopted = bytes.and_then(|bytes| sched.adopt_running(pending, progress).map(|ticket| (ticket, bytes)));
+    let Some((ticket, bytes)) = adopted else {
+        fail_promoted(model, stdout, &key, admission, &epoch,
+            "qwen4 lane promotion failed: no lane or tokenizer for the promoted request");
+        return;
+    };
+    controls[ticket.lane] = Some(LaneCtl {
+        epoch, slot, semantic: Some(producer), bytes, budget: ThinkBudget::new(max_think_tokens),
+        forced: VecDeque::new(), started_in_think, max_tokens, start, decode_start: Some(decode_start),
+        prefill_ms, cache: None, skip_first_forward: seed_emitted,
+    });
 }
 
 fn lane_error(
@@ -370,6 +455,9 @@ fn finish_lane(
 
 /// Serve concurrently admitted greedy Qwen4 requests using the exact lane
 /// executor. All terminal ownership remains in `ContinuousBatchScheduler`.
+/// `promoted` is a running singleton moved into a lane (`generate_spec`): it
+/// is adopted as a Running lane before the loop and continues from its
+/// pending seed.
 pub fn drive_qwen4_lane_batch(
     sched: &mut ContinuousBatchScheduler,
     gpu: &mut Gpu,
@@ -377,19 +465,34 @@ pub fn drive_qwen4_lane_batch(
     params: VmmBatchParams,
     stdout: &mut Stdout,
     inbox: &mut DaemonInbox,
+    promoted: Option<Qwen4PromotedRequest>,
 ) -> Result<(), BatchDriveError> {
-    let bundle = m.qwen4().ok_or_else(|| BatchDriveError::Gpu("lane model is not qwen4".into()))?;
-    let store = bundle.lanes().ok_or_else(|| BatchDriveError::Gpu("qwen4 lanes not staged".into()))?;
-    let max_lanes = store.max_lanes();
-    let row_budget = store.row_budget().min(params.max_batch_tokens);
-    let eos = bundle.config.eos_token_id;
-    if row_budget == 0 || sched.max_batch > max_lanes {
-        return Err(BatchDriveError::Gpu("qwen4 lane scheduler/budget does not match staged store".into()));
-    }
+    let setup = m.qwen4().ok_or("lane model is not qwen4").and_then(|bundle| {
+        let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
+        let (max_lanes, row_budget) = (store.max_lanes(), store.row_budget().min(params.max_batch_tokens));
+        if row_budget == 0 || sched.max_batch > max_lanes {
+            return Err("qwen4 lane scheduler/budget does not match staged store");
+        }
+        Ok((max_lanes, row_budget, bundle.config.eos_token_id))
+    });
+    let (max_lanes, row_budget, eos) = match setup {
+        Ok(setup) => setup,
+        Err(message) => {
+            if let Some(p) = &promoted {
+                fail_promoted(m, stdout, &p.pending.key, p.pending.admission, &p.epoch, message);
+            }
+            return Err(BatchDriveError::Gpu(message.into()));
+        }
+    };
     let mut controls: Vec<Option<LaneCtl>> = (0..sched.max_batch).map(|_| None).collect();
     let mut cursor = 0;
     let batch_size = sched.max_batch;
+    // Requests already queued at entry; the promoted lane never passes the
+    // inbox, so it is never handed back to the singleton.
     let initial: HashSet<_> = sched.inbox.iter().cloned().collect();
+    if let Some(promoted) = promoted {
+        adopt_promoted(sched, m, &mut controls, stdout, promoted);
+    }
     let result = (|| -> Result<(), String> {
         loop {
             // Terminal decisions must not block other lanes' GPU work.
@@ -479,9 +582,7 @@ pub fn drive_qwen4_lane_batch(
                     continue;
                 }
                 let stop = hipfire_runtime::stop_sequence::parse_stop_field(req.original_msg.get("stop")).map_err(|e| e.to_string())?;
-                let tag = NEXT_EPOCH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                    .map_err(|_| "qwen4 lane epoch exhausted")?;
-                let epoch = RequestEpoch { request_tag: tag, owner_generation: 1 };
+                let epoch = next_lane_epoch()?;
                 let slot = match m.qwen4_mut().ok_or("qwen4 bundle disappeared")?.admit_lane(gpu, epoch, prompt.clone()) {
                     Ok(slot) => slot,
                     Err(e) => {
@@ -496,6 +597,7 @@ pub fn drive_qwen4_lane_batch(
                     epoch, slot, semantic: Some(QwenArSemanticProducer::new_with_tool_protocol(&key.id, started, tools).with_stop(&stop)),
                     bytes: Vec::new(), budget: ThinkBudget::new(req.max_think_tokens), forced: VecDeque::new(),
                     started_in_think: started, max_tokens, start: Instant::now(), decode_start: None, prefill_ms: 0.0, cache: None,
+                    skip_first_forward: false,
                 });
                 let BatchLane::Running(lane) = &mut sched.lanes[ticket.lane] else { return Err("assigned lane is not running".into()); };
                 lane.prompt_len = prompt.len();
@@ -567,16 +669,23 @@ pub fn drive_qwen4_lane_batch(
                     }
                 }
                 // Forwarded tokens: the plan seed, then every committed id but
-                // the last (the next pending seed). One entry for an AR row.
-                let forwarded: Vec<u32> = std::iter::once(plan.batch.tokens[request.rows.begin])
-                    .chain(advance.committed_ids.iter().take(advance.committed_ids.len().saturating_sub(1)).copied())
-                    .collect();
+                // the last (the next pending seed). One entry for an AR row. A
+                // promoted lane's first plan seed was streamed by the singleton.
+                let skip_seed = controls[idx].as_mut().is_some_and(|c| std::mem::take(&mut c.skip_first_forward));
+                let forwarded = forwarded_tokens(plan.batch.tokens[request.rows.begin], &advance.committed_ids, skip_seed);
                 let length_finish = advance.finish.as_deref() == Some("length");
                 let _scope = match &sched.lanes[idx] {
                     BatchLane::Running(lane) => BatchAttemptScope::enter_for_generation(
                         &lane.key.id, lane.key.attempt_id, lane.ticket.admission),
                     _ => return Err("advanced lane is not running".into()),
                 };
+                if forwarded.is_empty() && length_finish {
+                    // The already-streamed promoted seed was the only forwarded token.
+                    if let Err(error) = finish_lane(sched, m, &mut controls, idx, stdout, true) {
+                        lane_error(sched, m, &mut controls, idx, stdout, &error, "validation")?;
+                    }
+                    continue;
+                }
                 for (i, &token) in forwarded.iter().enumerate() {
                     let BatchLane::Running(lane) = &mut sched.lanes[idx] else { return Err("advanced lane is not running".into()); };
                     let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
@@ -615,4 +724,23 @@ pub fn drive_qwen4_lane_batch(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forwarded_tokens;
+
+    #[test]
+    fn forwarded_tokens_are_seed_then_all_committed_but_last() {
+        assert_eq!(forwarded_tokens(7, &[8, 9, 10], false), vec![7, 8, 9]);
+        // An AR row commits one id: only the plan seed was forwarded.
+        assert_eq!(forwarded_tokens(7, &[8], false), vec![7]);
+    }
+
+    #[test]
+    fn promoted_first_advance_drops_the_streamed_plan_seed() {
+        assert_eq!(forwarded_tokens(7, &[8, 9, 10], true), vec![8, 9]);
+        assert!(forwarded_tokens(7, &[8], true).is_empty());
+        assert!(forwarded_tokens(7, &[], true).is_empty());
+    }
 }

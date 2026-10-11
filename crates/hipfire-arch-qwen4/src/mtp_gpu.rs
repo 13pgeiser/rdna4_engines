@@ -1265,6 +1265,12 @@ impl MtpGpuState {
         self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
+
+    /// A snapshot ticket of this state's arena is outstanding.
+    pub(crate) fn snapshot_active(&self) -> bool {
+        self.snapshot_arena.active
+    }
+
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         let dimensions = MtpGpuStateSnapshotArena::dimensions(self);
         let mark = self.mark();

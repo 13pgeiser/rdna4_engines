@@ -6,7 +6,7 @@
 //!
 //! fn_lane_oracle MODEL.mq4 TEXT.txt OUT_DIR [--ks 1,2,4,8] [--contexts 512,2048,8192]
 //!     [--steps 64] [--max-seq 16384] [--policy production|per-lane|<spec>]
-//!     [--g0] [--controls] [--bench N] [--spec ar|mtp] [--k K] [--routes floor|cycle|batched]
+//!     [--g0] [--controls] [--bench N] [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--promote P]
 //!
 //! The model loads once. Request `i` gets a unique prompt of exactly
 //! `contexts[i % len]` tokens (TEXT tokens from offset `i * 997`, wrapping).
@@ -49,6 +49,19 @@
 //! `--controls` re-runs a two-lane cycle case with ring rollback skipped (must
 //! fail) next to the positive cycle control (rejected windows must match);
 //! `--bench N` times lane steps (draft + verify) beside the AR numbers.
+//!
+//! `--spec mtp --promote P` (fn-batch S6, P >= 1): request 0 does not start as
+//! a lane. It runs on the resident singleton (fresh `Qwen4MtpDrafter`,
+//! `mtp_prefill`, then P windows of `mtp_step` at depth `k`, recorded as
+//! `Batched { k_max: k }` windows), while the other requests are admitted and
+//! prefilled as lanes. At the first step where every other lane has finished
+//! prefill `prepare_promotion` + `commit_promotion` move request 0 into a lane
+//! and it joins the remaining windows. Request 0's checkpoints are taken right
+//! after the promotion, after its first lane window and after the last window;
+//! the reference phase replays its whole window list (singleton windows, then
+//! lane windows) on a fresh singleton. `--controls` adds a 2-lane run that
+//! zeroes the promoted lane's pending hidden right after the promotion (must
+//! fail the comparison).
 //!
 //! Exit 0 only when every compared run passes and every control is detected.
 //! Nothing is written outside OUT_DIR.
@@ -104,6 +117,7 @@ struct Args {
     spec_mtp: bool,
     k: usize,
     routes: RoutesArg,
+    promote: Option<usize>,
 }
 
 fn parse_list(s: &str, what: &str) -> R<Vec<usize>> {
@@ -117,7 +131,7 @@ fn parse_args() -> R<Args> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: fn_lane_oracle MODEL.mq4 TEXT.txt OUT_DIR [--ks 1,2,4,8] [--contexts 512,2048,8192] \
                  [--steps 64] [--max-seq 16384] [--policy production|per-lane|<spec>] [--g0] [--controls] [--bench N] \
-                 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched]";
+                 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--promote P]";
     let mut pos = Vec::new();
     let mut a = Args {
         model: PathBuf::new(),
@@ -134,6 +148,7 @@ fn parse_args() -> R<Args> {
         spec_mtp: false,
         k: 3,
         routes: RoutesArg::Cycle,
+        promote: None,
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> R<String> {
@@ -157,6 +172,7 @@ fn parse_args() -> R<Args> {
             }
             "--k" => a.k = value(&mut i, "--k")?.parse().map_err(e)?,
             "--routes" => a.routes = RoutesArg::parse(&value(&mut i, "--routes")?)?,
+            "--promote" => a.promote = Some(value(&mut i, "--promote")?.parse().map_err(e)?),
             "--g0" => a.g0 = true,
             "--controls" => a.controls = true,
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}\n{usage}")),
@@ -185,6 +201,17 @@ fn parse_args() -> R<Args> {
         }
         if a.g0 {
             return Err("--g0 probes the AR lane stages; use it with --spec ar".into());
+        }
+    }
+    if let Some(p) = a.promote {
+        if !a.spec_mtp {
+            return Err("--promote needs --spec mtp".into());
+        }
+        if p == 0 {
+            return Err("--promote must be >= 1".into());
+        }
+        if p >= a.steps {
+            return Err(format!("--promote {p} must be below --steps {} (the lane needs a window)", a.steps));
         }
     }
     Ok(a)
@@ -1208,6 +1235,19 @@ struct SpecWin {
     accepted: usize,
     /// Target picks of the window's rows (verify picks for `Batched`).
     picks: Vec<u32>,
+    /// Drafts the window offered: `drafts.len()` for a lane window; a
+    /// singleton window records only the count.
+    offered: usize,
+    /// Ran on the resident singleton before the promotion.
+    singleton: bool,
+}
+
+/// Request 0 under `--promote P`: `windows` windows ran on the resident
+/// singleton, then the request moved into a lane at `position`.
+struct Promote {
+    windows: usize,
+    position: usize,
+    done: bool,
 }
 
 struct SpecLane {
@@ -1221,6 +1261,7 @@ struct SpecLane {
     wins: Vec<SpecWin>,
     /// Lane checkpoints on disk: step = window number (0 = after prefill).
     ckpts: Vec<RefCkpt>,
+    promote: Option<Promote>,
 }
 
 impl SpecLane {
@@ -1238,6 +1279,16 @@ impl SpecLane {
     fn retired_by(&self, windows: usize) -> bool {
         self.wins[..windows.min(self.wins.len())].iter().any(|w| w.route == LaneRoute::ArRetired)
     }
+
+    /// Request 0 under `--promote`, still on the resident singleton.
+    fn pending_promotion(&self) -> bool {
+        self.promote.as_ref().is_some_and(|p| !p.done)
+    }
+
+    /// `window` is the first lane window after the promotion.
+    fn first_after_promotion(&self, window: usize) -> bool {
+        self.promote.as_ref().is_some_and(|p| p.windows + 1 == window)
+    }
 }
 
 struct SpecRun {
@@ -1246,6 +1297,10 @@ struct SpecRun {
     error: Option<String>,
     release_errors: Vec<String>,
     steps_run: usize,
+    /// Request 0's resident singleton drafter until its promotion.
+    drafter: Option<Qwen4MtpDrafter>,
+    /// Negative control: zero the promoted lane's pending hidden right after the promotion.
+    zero_pending: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1270,9 +1325,9 @@ fn spec_stats(lanes: &[SpecLane]) -> SpecStats {
             match w.route {
                 LaneRoute::Batched { .. } => {
                     s.batched += 1;
-                    s.drafts += w.drafts.len();
+                    s.drafts += w.offered;
                     s.accepted += w.accepted;
-                    if w.accepted < w.drafts.len() {
+                    if w.accepted < w.offered {
                         s.rejected += 1;
                     }
                 }
@@ -1421,6 +1476,8 @@ fn absorb_spec(
                     committed: adv.committed_ids.clone(),
                     accepted: adv.accepted_drafts,
                     picks: res.picks.get(rr.rows.begin..rr.rows.end()).map(|s| s.to_vec()).unwrap_or_default(),
+                    offered: d.drafts.len(),
+                    singleton: false,
                 };
                 let n = win.committed.len();
                 let ok = match rr.kind {
@@ -1433,7 +1490,7 @@ fn absorb_spec(
                         l.req,
                         l.wins.len() + 1,
                         win.route,
-                        win.drafts.len()
+                        win.offered
                     ));
                 }
                 l.wins.push(win);
@@ -1448,7 +1505,7 @@ fn absorb_spec(
                     ));
                 }
                 let n = l.wins.len();
-                if ckpt_windows.contains(&n) {
+                if ckpt_windows.contains(&n) || l.first_after_promotion(n) {
                     lane_checkpoint(w, dir, l, n)?;
                 }
             }
@@ -1456,6 +1513,95 @@ fn absorb_spec(
         }
     }
     Ok(())
+}
+
+/// Request 0 on the resident singleton: fresh greedy `Qwen4MtpDrafter`,
+/// `mtp_prefill`, then `windows` windows of `mtp_step` at depth `k`, recorded as
+/// `Batched { k_max: k }`. Returns the live drafter, the prompt pick and the windows.
+fn singleton_phase(
+    w: &mut World,
+    prompt: &[u32],
+    k: usize,
+    max_seq: usize,
+    windows: usize,
+) -> R<(Qwen4MtpDrafter, u32, Vec<SpecWin>)> {
+    let World { gpu, bundle, .. } = w;
+    bundle.reset(gpu).map_err(e)?;
+    let mut drafter = Qwen4MtpDrafter::new(k, max_seq, None);
+    drafter.configure_request(SpecRequestConfig::default());
+    let result = (|| -> R<(u32, Vec<SpecWin>)> {
+        let seed = drafter.mtp_prefill(gpu, &mut *bundle, prompt, prompt, 0, false, &|| false)?;
+        let eos = bundle.config.eos_token_id;
+        let mut emitted = vec![seed];
+        let mut pending = seed;
+        let mut wins = Vec::with_capacity(windows);
+        for n in 1..=windows {
+            let position = bundle.state.position;
+            let got = drafter.mtp_step(gpu, &mut *bundle, position, pending, &emitted, k, eos, None)?;
+            pending = *got.committed.last().ok_or_else(|| format!("singleton window {n} committed nothing"))?;
+            emitted.extend_from_slice(&got.committed);
+            wins.push(SpecWin {
+                route: LaneRoute::Batched { k_max: k },
+                drafts: Vec::new(),
+                committed: got.committed,
+                accepted: got.accepted,
+                picks: Vec::new(),
+                offered: got.drafts_generated,
+                singleton: true,
+            });
+        }
+        Ok((seed, wins))
+    })();
+    match result {
+        Ok((seed, wins)) => Ok((drafter, seed, wins)),
+        Err(m) => {
+            Box::new(drafter).mtp_free(gpu);
+            Err(m)
+        }
+    }
+}
+
+/// Promote request 0 (lane `idx`) from the resident singleton into its lane:
+/// `prepare_promotion` + `commit_promotion`, then the checkpoint right after
+/// the promotion (after the optional pending-hidden zeroing control).
+fn promote_lane(w: &mut World, run: &mut SpecRun, idx: usize, prompt: Vec<u32>, dir: &Path) -> R<()> {
+    let drafter = run.drafter.take().ok_or("the promoted request has no singleton drafter")?;
+    let zero = run.zero_pending;
+    let l = &mut run.lanes[idx];
+    let stream = l.stream();
+    let epoch = l.epoch;
+    let moved = (|| -> R<(usize, usize)> {
+        let pending = *stream.last().ok_or("the promoted request has no pending seed")?;
+        let position = w.bundle.state.position;
+        let expect = l.prompt_len + l.wins.iter().map(|x| x.committed.len()).sum::<usize>();
+        if position != expect {
+            return Err(format!("req {}: singleton position {position} expected {expect} at the promotion", l.req));
+        }
+        let parts = drafter.promotion_parts()?;
+        let slot = w
+            .bundle
+            .prepare_promotion(&mut w.gpu, epoch, prompt, stream, pending, position, Some(parts))
+            .map_err(|x| format!("prepare_promotion: {x}"))?;
+        w.bundle.commit_promotion(&mut w.gpu, &epoch).map_err(|x| format!("commit_promotion: {x}"))?;
+        Ok((slot, position))
+    })();
+    Box::new(drafter).mtp_free(&mut w.gpu);
+    let (slot, position) = moved?;
+    l.slot = slot;
+    let windows = {
+        let p = l.promote.as_mut().ok_or("the promoted lane has no promotion record")?;
+        p.done = true;
+        p.position = position;
+        p.windows
+    };
+    if zero {
+        w.bundle
+            .lanes_mut()
+            .ok_or("lane store vanished")?
+            .lab_zero_pending_hidden(&mut w.gpu, &l.epoch)
+            .map_err(e)?;
+    }
+    lane_checkpoint(w, dir, l, windows)
 }
 
 /// The lane phase: prefill tiles (one per step, first unfinished lane) with
@@ -1476,12 +1622,21 @@ fn drive_spec(
         }
         let all_prefilled = run.lanes.iter().all(|l| l.prefilled == l.prompt_len);
         let pre = run.lanes.iter().position(|l| l.prefilled < l.prompt_len);
+        if pre.is_none() {
+            if let Some(i) = run.lanes.iter().position(|l| l.pending_promotion()) {
+                let prompt = prompts[run.lanes[i].req].clone();
+                promote_lane(w, run, i, prompt, dir)?;
+            }
+        }
         let dec: Vec<usize> = run
             .lanes
             .iter()
             .enumerate()
             .filter(|(_, l)| {
-                l.prefilled == l.prompt_len && l.wins.len() < steps && (all_prefilled || l.wins.len() < early_cap)
+                l.prefilled == l.prompt_len
+                    && !l.pending_promotion()
+                    && l.wins.len() < steps
+                    && (all_prefilled || l.wins.len() < early_cap)
             })
             .map(|(i, _)| i)
             .collect();
@@ -1557,6 +1712,8 @@ fn write_windows(dir: &Path, l: &SpecLane) -> R<()> {
                 "route": route_name(x.route),
                 "k_max": match x.route { LaneRoute::Batched { k_max } => k_max, _ => 0 },
                 "drafts": x.drafts,
+                "offered": x.offered,
+                "singleton": x.singleton,
                 "committed": x.committed,
                 "accepted": x.accepted,
                 "picks": x.picks,
@@ -1644,7 +1801,7 @@ impl App {
                 let label = format!("req {req} window {n} ({})", route_name(win.route));
                 diff.id_lists(&format!("{label} committed"), &got.committed, &win.committed);
                 if matches!(win.route, LaneRoute::Batched { .. }) {
-                    diff.counts(&format!("{label} drafts offered"), got.drafts_generated, win.drafts.len());
+                    diff.counts(&format!("{label} drafts offered"), got.drafts_generated, win.offered);
                     diff.counts(&format!("{label} drafts accepted"), got.accepted, win.accepted);
                 }
                 if diff.bad > before {
@@ -1685,6 +1842,8 @@ impl App {
         label: &str,
         routes: RoutesArg,
         skip_rollback: bool,
+        promote: Option<usize>,
+        zero_pending: bool,
     ) -> SpecReport {
         let started = Instant::now();
         let mut run = SpecRun {
@@ -1693,6 +1852,8 @@ impl App {
             error: None,
             release_errors: Vec::new(),
             steps_run: 0,
+            drafter: None,
+            zero_pending,
         };
         let mut ckpt_windows = vec![0, 1, steps];
         ckpt_windows.sort_unstable();
@@ -1702,7 +1863,27 @@ impl App {
             store.set_stage_policy(policy);
             store.lab_set_routes(routes.lab());
             store.lab_set_skip_rollback(skip_rollback);
-            for req in 0..lanes {
+            let mut first_lane = 0;
+            if let Some(p) = promote {
+                self.tag += 1;
+                let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
+                let prompt_len = self.prompts[0].len();
+                let (drafter, seed, wins) = singleton_phase(&mut self.w, &self.prompts[0], k, self.max_seq, p)?;
+                run.drafter = Some(drafter);
+                run.lanes.push(SpecLane {
+                    req: 0,
+                    epoch,
+                    slot: 0,
+                    prompt_len,
+                    prefilled: prompt_len,
+                    first: Some(seed),
+                    wins,
+                    ckpts: Vec::new(),
+                    promote: Some(Promote { windows: p, position: 0, done: false }),
+                });
+                first_lane = 1;
+            }
+            for req in first_lane..lanes {
                 self.tag += 1;
                 let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
                 let prompt = self.prompts[req].clone();
@@ -1721,12 +1902,16 @@ impl App {
                     first: None,
                     wins: Vec::new(),
                     ckpts: Vec::new(),
+                    promote: None,
                 });
             }
             drive_spec(&mut self.w, &self.prompts, &mut run, steps, k, &ckpt_windows, &self.lanes_dir)
         })();
         if let Err(m) = res {
             run.error = Some(m);
+        }
+        if let Some(d) = run.drafter.take() {
+            Box::new(d).mtp_free(&mut self.w.gpu);
         }
         for l in &run.lanes {
             if let Err(m) = write_windows(&self.lanes_dir, l) {
@@ -1745,7 +1930,7 @@ impl App {
                 })
             })
             .collect();
-        for l in &run.lanes {
+        for l in run.lanes.iter().filter(|l| !l.pending_promotion()) {
             if let Err(x) = self.w.bundle.release_lane(&l.epoch) {
                 run.release_errors.push(format!("release request {}: {x}", l.req));
             }
@@ -1799,6 +1984,8 @@ impl App {
             "k": lanes,
             "spec": "mtp",
             "spec_k": k,
+            "promote": promote,
+            "promotion_position": run.lanes.first().and_then(|l| l.promote.as_ref()).filter(|p| p.done).map(|p| p.position),
             "routes": routes.name(),
             "policy": label,
             "control": control,
@@ -1826,8 +2013,13 @@ impl App {
             "release_errors": run.release_errors,
             "wall_s": started.elapsed().as_secs_f64(),
         });
+        let promo = match run.lanes.first().and_then(|l| l.promote.as_ref()) {
+            Some(p) if p.done => format!(" promote={}@{}", p.windows, p.position),
+            Some(p) => format!(" promote={} (not reached)", p.windows),
+            None => String::new(),
+        };
         let mut line = format!(
-            "run lanes={lanes} spec=mtp k={k} routes={} policy={label}{}: {} (windows {} [batched {}, ar_synced {}, \
+            "run lanes={lanes} spec=mtp k={k} routes={} policy={label}{promo}{}: {} (windows {} [batched {}, ar_synced {}, \
              ar_retired {}], rejected {}, drafts {} accepted {}, tau {:?}, state checkpoints {})",
             routes.name(),
             if skip_rollback { " control=skip_rollback" } else { "" },
@@ -1946,7 +2138,7 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
 
     // ── main matrix ────────────────────────────────────────────────
     for &lanes in &args.ks {
-        let r = app.run_spec_lanes(lanes, args.steps, k, primary, &args.policy, args.routes, false);
+        let r = app.run_spec_lanes(lanes, args.steps, k, primary, &args.policy, args.routes, false, args.promote, false);
         app.log.say(r.line.clone());
         all_pass &= r.pass;
         runs.push(r.json);
@@ -1959,7 +2151,7 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
             return Err("--controls needs --steps >= 4".into());
         }
         // Positive: cycle routes with rejected verify windows and ring rollback must match.
-        let r = app.run_spec_lanes(2, short_steps, k, primary, &args.policy, RoutesArg::Cycle, false);
+        let r = app.run_spec_lanes(2, short_steps, k, primary, &args.policy, RoutesArg::Cycle, false, None, false);
         app.log.say(r.line.clone());
         let exercised = r.stats.rejected > 0 && r.stats.batched > 0;
         let ok = r.pass && exercised;
@@ -1978,7 +2170,7 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
             "run": r.json,
         }));
         // Negative: a rejected verify keeps its full rows; the comparison must fail.
-        let r = app.run_spec_lanes(2, short_steps, k, primary, &args.policy, RoutesArg::Cycle, true);
+        let r = app.run_spec_lanes(2, short_steps, k, primary, &args.policy, RoutesArg::Cycle, true, None, false);
         app.log.say(r.line.clone());
         let exercised = r.stats.rejected > 0;
         let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
@@ -1998,6 +2190,33 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
             "rejected_windows": r.stats.rejected,
             "run": r.json,
         }));
+        if let Some(p) = args.promote {
+            // Negative: the promoted lane's pending hidden is zeroed right after the promotion; the comparison must fail.
+            let p = p.min(short_steps - 1);
+            let r = app.run_spec_lanes(2, short_steps, k, primary, &args.policy, args.routes, false, Some(p), true);
+            app.log.say(r.line.clone());
+            let promoted = r.run.lanes.first().and_then(|l| l.promote.as_ref()).is_some_and(|x| x.done);
+            let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
+            let (detected, how) = if !promoted {
+                (false, "control was not exercised (the promotion did not happen)".to_string())
+            } else if diverged {
+                (true, format!("comparison failed: {}", r.first.clone().unwrap_or_default()))
+            } else {
+                (false, "comparison still passed".to_string())
+            };
+            all_pass &= detected;
+            app.log.say(format!(
+                "control promote_zero_pending: {} ({how})",
+                if detected { "detected" } else { "MISSED" }
+            ));
+            controls_json.push(json!({
+                "control": "promote_zero_pending",
+                "detected": detected,
+                "how": how,
+                "promote": p,
+                "run": r.json,
+            }));
+        }
     }
 
     // ── bench ──────────────────────────────────────────────────────
@@ -2047,7 +2266,7 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
             "ks": args.ks, "contexts": args.contexts, "steps": args.steps, "max_seq": args.max_seq,
             "policy": args.policy, "policy_described": primary.describe(), "g0": false,
             "controls": args.controls, "bench": args.bench,
-            "spec": "mtp", "k": args.k, "routes": args.routes.name(),
+            "spec": "mtp", "k": args.k, "routes": args.routes.name(), "promote": args.promote,
         },
         "policy_evidence": primary.evidence(),
         "requests": app.prompts.iter().map(|p| json!({"context": p.len()})).collect::<Vec<_>>(),

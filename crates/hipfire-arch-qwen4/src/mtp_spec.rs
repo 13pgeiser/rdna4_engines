@@ -1364,6 +1364,18 @@ impl SampledVerify {
     }
 }
 
+/// What a promoted singleton's drafter hands its lane
+/// ([`Qwen4MtpDrafter::promotion_parts`]).
+pub struct Qwen4PromotionParts<'a> {
+    /// The next window's row-0 hidden (F32, `hc_count * hidden`).
+    pub pending_hidden: &'a GpuTensor,
+    /// Per-depth agreement (performance only).
+    pub agreement: [(f32, f32); 10],
+    /// The floor retired the request: the head lags, the lane must stay
+    /// `ArRetired`.
+    pub retired: bool,
+}
+
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
 /// pending target-hidden row needed to seed each MTP window.
@@ -2008,6 +2020,25 @@ impl Qwen4MtpDrafter {
     /// external takeover must pass before it runs.
     pub(crate) fn floor_takeover_blocked(&self) -> bool {
         self.floor.retired || self.floor_needs_calibration()
+    }
+
+    /// What a promoted singleton hands its lane: the next window's row-0
+    /// hidden, the per-depth agreement and whether the floor retired the
+    /// request (the head then lags the target, so the lane must stay
+    /// head-free). Err when no prefill ran (the drafter holds no pending
+    /// hidden). The drafter keeps no window state between windows; an
+    /// active target snapshot in its verify scratch is a ticket of the
+    /// bundle's trunk arena, which `Qwen4Bundle::prepare_promotion` refuses
+    /// (the scratch cannot be downcast through `&self`).
+    pub fn promotion_parts(&self) -> Result<Qwen4PromotionParts<'_>, String> {
+        let pending_hidden = self.pending_hidden.as_ref().ok_or_else(|| {
+            "Qwen4 MTP promotion: the drafter holds no request resources".to_string()
+        })?;
+        Ok(Qwen4PromotionParts {
+            pending_hidden,
+            agreement: self.agreement,
+            retired: self.floor_enabled && self.floor.retired,
+        })
     }
 
     /// Developer-forced route that bypasses the floor.

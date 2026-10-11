@@ -27,7 +27,7 @@ use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::lane_exec::LanePhase;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState, MTP_FILL_ROWS};
 use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy, PendingWindow};
-use crate::mtp_spec::{mtp_batched_fill_enabled, native_mtp_row_capture};
+use crate::mtp_spec::{mtp_batched_fill_enabled, native_mtp_row_capture, Qwen4PromotionParts};
 use crate::state::{Qwen4State, Qwen4StateFormat};
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::slot_batch::RequestEpoch;
@@ -198,6 +198,58 @@ impl LaneSpec {
         self.stats = LaneSpecStats::default();
         Ok(())
     }
+
+    /// Start this (kept or fresh) lane spec from a promoted singleton's
+    /// `parts`: its pending hidden copied in, the window policy started from
+    /// its agreement and retirement, no window, fresh counters. The head and
+    /// draft request state are the singleton's own and swap in at commit.
+    fn promote(
+        &mut self,
+        gpu: &mut Gpu,
+        k: usize,
+        parts: &Qwen4PromotionParts<'_>,
+    ) -> Result<(), String> {
+        let bytes = self.pending_hidden.byte_size();
+        if parts.pending_hidden.byte_size() != bytes {
+            return Err(format!(
+                "pending hidden is {} bytes, the lane's is {bytes}",
+                parts.pending_hidden.byte_size()
+            ));
+        }
+        gpu.copy_d2d(parts.pending_hidden, &self.pending_hidden, bytes)
+            .map_err(|e| format!("pending hidden copy: {e}"))?;
+        self.draft = DraftHeadRequestState::default();
+        self.policy = LaneSpecPolicy::promoted(k, parts.agreement, parts.retired);
+        self.window = None;
+        self.stats = LaneSpecStats::default();
+        Ok(())
+    }
+}
+
+/// A fresh slot's payload: a lane trunk state and, with `spec_cfg`, its MTP
+/// state (a failure frees what was allocated).
+fn new_payload(
+    gpu: &mut Gpu,
+    bundle: &Qwen4Bundle,
+    slot: usize,
+    spec_cfg: Option<(LaneSpecConfig, usize, Qwen4KvBackend)>,
+) -> Result<(Qwen4State, Option<LaneSpec>), String> {
+    let mut state = bundle
+        .new_lane_state(gpu)
+        .map_err(|e| format!("admit: allocate lane {slot}: {e}"))?;
+    let spec = match spec_cfg {
+        None => None,
+        Some((config, head_max_seq, backend)) => {
+            match LaneSpec::new(gpu, bundle, config, head_max_seq, backend, &mut state) {
+                Ok(spec) => Some(spec),
+                Err(error) => {
+                    let _ = state.free_gpu(gpu);
+                    return Err(format!("admit: allocate lane {slot}: {error}"));
+                }
+            }
+        }
+    };
+    Ok((state, spec))
 }
 
 /// One admitted request's whole device state.
@@ -285,15 +337,41 @@ impl<C: LaneCell> LaneTable<C> {
             .collect()
     }
 
-    /// Admit `epoch` into the lowest free slot. `prepare(slot, existing)` is
-    /// called exactly once: with the slot's kept payload cell (it must reset
-    /// it in place and return `Ok(None)`), or with `None` when the slot has
-    /// never held one (it must return the new payload). The new host entry
-    /// is published only after `prepare` succeeded.
+    /// Admit `epoch` into the lowest free slot as a request about to prefill.
+    /// `prepare(slot, existing)` is called exactly once: with the slot's kept
+    /// payload cell (it must reset it in place and return `Ok(None)`), or
+    /// with `None` when the slot has never held one (it must return the new
+    /// payload). The new host entry is published only after `prepare`
+    /// succeeded.
     fn admit(
         &mut self,
         epoch: RequestEpoch,
         prompt: Vec<u32>,
+        prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
+    ) -> Result<usize, String> {
+        self.admit_host(epoch, prompt, None, prepare)
+    }
+
+    /// Admit `epoch` as an already-decoding request (a promoted singleton):
+    /// the whole `prompt` is prefilled, `generated` picks are committed and
+    /// `pending_seed` is the next AR row's token. Same `prepare` contract and
+    /// refusals as [`Self::admit`].
+    fn admit_decoding(
+        &mut self,
+        epoch: RequestEpoch,
+        prompt: Vec<u32>,
+        generated: Vec<u32>,
+        pending_seed: u32,
+        prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
+    ) -> Result<usize, String> {
+        self.admit_host(epoch, prompt, Some((generated, pending_seed)), prepare)
+    }
+
+    fn admit_host(
+        &mut self,
+        epoch: RequestEpoch,
+        prompt: Vec<u32>,
+        decoding: Option<(Vec<u32>, u32)>,
         prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
     ) -> Result<usize, String> {
         if !epoch.is_admitted() {
@@ -308,14 +386,18 @@ impl<C: LaneCell> LaneTable<C> {
         let Some(slot) = self.live.iter().position(|live| !*live) else {
             return Err(format!("admit: all {} lanes are busy", self.max_lanes()));
         };
+        let (prefilled, generated, pending_seed, status) = match decoding {
+            Some((generated, seed)) => (prompt.len(), generated, Some(seed), LaneStatus::Decoding),
+            None => (0, Vec::new(), None, LaneStatus::Prefilling),
+        };
         let host = LaneHost {
             epoch,
             slot,
             prompt,
-            prefilled: 0,
-            generated: Vec::new(),
-            pending_seed: None,
-            status: LaneStatus::Prefilling,
+            prefilled,
+            generated,
+            pending_seed,
+            status,
             stamp: self.next_stamp,
         };
         match self.cells[slot].as_mut() {
@@ -689,26 +771,80 @@ impl Qwen4LaneStore {
                 }
                 Ok(None)
             }
-            None => {
-                let mut state = bundle
-                    .new_lane_state(gpu)
-                    .map_err(|e| format!("admit: allocate lane {slot}: {e}"))?;
-                let spec = match spec_cfg {
-                    None => None,
-                    Some((config, head_max_seq, backend)) => {
-                        match LaneSpec::new(gpu, bundle, config, head_max_seq, backend, &mut state)
-                        {
-                            Ok(spec) => Some(spec),
-                            Err(error) => {
-                                let _ = state.free_gpu(gpu);
-                                return Err(format!("admit: allocate lane {slot}: {error}"));
-                            }
+            None => new_payload(gpu, bundle, slot, spec_cfg).map(Some),
+        })
+    }
+
+    /// Admit `epoch` straight into Decoding (a promoted singleton): `prompt`
+    /// is fully prefilled, `generated` picks are committed, `pending_seed`
+    /// is the next AR row. The lane's trunk and head states are not touched
+    /// here (the bundle swaps the singleton's in at commit); a fresh slot
+    /// allocates them like [`Self::admit`]. An MTP store takes the singleton's
+    /// pending hidden (one device copy) and the lane policy started from
+    /// `parts`; an AR store takes none. Refused while a step is in flight.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_promoted(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        epoch: RequestEpoch,
+        prompt: Vec<u32>,
+        generated: Vec<u32>,
+        pending_seed: u32,
+        parts: Option<Qwen4PromotionParts<'_>>,
+    ) -> Result<usize, String> {
+        if self.phase != LanePhase::Idle {
+            return Err("admit_promoted: a step is in flight".to_string());
+        }
+        let spec_cfg = self
+            .spec
+            .as_ref()
+            .map(|s| (s.config, s.head_max_seq, s.backend));
+        match (spec_cfg.is_some(), parts.is_some()) {
+            (true, false) => {
+                return Err("admit_promoted: an MTP lane store needs the drafter's parts".to_string());
+            }
+            (false, true) => {
+                return Err("admit_promoted: an AR lane store takes no drafter parts".to_string());
+            }
+            _ => {}
+        }
+        self.table
+            .admit_decoding(epoch, prompt, generated, pending_seed, |slot, existing| match existing {
+                Some(cell) => {
+                    match (spec_cfg, cell.spec.as_mut(), parts.as_ref()) {
+                        (Some((config, _, _)), Some(spec), Some(parts)) => spec
+                            .promote(gpu, config.k, parts)
+                            .map_err(|e| format!("admit_promoted: lane {slot}: {e}"))?,
+                        (None, None, None) => {}
+                        _ => {
+                            return Err(format!(
+                                "admit_promoted: lane {slot} spec state does not match the store"
+                            ));
                         }
                     }
-                };
-                Ok(Some((state, spec)))
-            }
-        })
+                    cell.state.row_capture_armed = false;
+                    Ok(None)
+                }
+                None => {
+                    let (state, mut spec) = new_payload(gpu, bundle, slot, spec_cfg)?;
+                    let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
+                        (Some((config, _, _)), Some(spec), Some(parts)) => {
+                            spec.promote(gpu, config.k, parts)
+                        }
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = seeded {
+                        let _ = state.free_gpu(gpu);
+                        if let Some(spec) = spec {
+                            let _ = spec.head.free_gpu(gpu);
+                            let _ = gpu.free_tensor(spec.pending_hidden);
+                        }
+                        return Err(format!("admit_promoted: lane {slot}: {error}"));
+                    }
+                    Ok(Some((state, spec)))
+                }
+            })
     }
 
     /// Free `epoch`'s lane (its device state stays allocated for reuse).
@@ -795,6 +931,25 @@ impl Qwen4LaneStore {
         if let Some(spec) = self.spec.as_mut() {
             spec.skip_rollback = on;
         }
+    }
+
+    /// Negative control (lab): zero `epoch`'s pending hidden (the next
+    /// window's row-0 head hidden), as if a promotion had lost the copy.
+    #[cfg(feature = "lab")]
+    pub fn lab_zero_pending_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &RequestEpoch,
+    ) -> Result<(), String> {
+        let spec = self
+            .lane(epoch)
+            .ok_or_else(|| format!("lab_zero_pending_hidden: unknown or stale epoch {epoch:?}"))?
+            .spec
+            .as_ref()
+            .ok_or_else(|| "lab_zero_pending_hidden: AR lane".to_string())?;
+        gpu.hip
+            .memset(&spec.pending_hidden.buf, 0, spec.pending_hidden.buf.size())
+            .map_err(|e| format!("lab_zero_pending_hidden: {e}"))
     }
 
     /// Every byte family of `epoch`'s MTP head state
@@ -1056,6 +1211,90 @@ mod tests {
             .contains("busy"));
         assert_eq!(made, 2);
         assert_eq!(table.active(), 2);
+    }
+
+    /// Promoted admission with a counting payload factory.
+    fn admit_decoding(
+        table: &mut LaneTable<TestCell>,
+        epoch: RequestEpoch,
+        prompt: &[u32],
+        made: &mut usize,
+    ) -> Result<usize, String> {
+        table.admit_decoding(epoch, prompt.to_vec(), vec![4, 5], 6, |slot, existing| {
+            match existing {
+                Some(cell) => {
+                    cell.payload += 100;
+                    Ok(None)
+                }
+                None => {
+                    *made += 1;
+                    Ok(Some(slot as u32))
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn promoted_admission_publishes_a_decoding_lane() {
+        let mut table = LaneTable::<TestCell>::new(2);
+        let mut made = 0;
+        assert_eq!(admit_decoding(&mut table, epoch(1, 1), &[7, 8, 9], &mut made), Ok(0));
+        let host = &table.get(&epoch(1, 1)).unwrap().host;
+        assert_eq!(host.status, LaneStatus::Decoding);
+        assert_eq!(host.prompt, vec![7, 8, 9]);
+        assert_eq!(host.prefilled, 3);
+        assert_eq!(host.generated, vec![4, 5]);
+        assert_eq!(host.pending_seed, Some(6));
+        assert_eq!((host.slot, host.stamp), (0, 0));
+        assert_eq!(table.active(), 1);
+        // A plain admission still starts Prefilling next to it, in order.
+        assert_eq!(admit(&mut table, epoch(2, 1), &[7], &mut made), Ok(1));
+        assert_eq!(table.get(&epoch(2, 1)).unwrap().host.status, LaneStatus::Prefilling);
+        assert_eq!(table.get(&epoch(2, 1)).unwrap().host.stamp, 1);
+        // The slot's payload is kept across a release and reused by a
+        // promoted admission without remaking it.
+        table.release(&epoch(1, 1)).unwrap();
+        assert_eq!(admit_decoding(&mut table, epoch(3, 1), &[9, 9], &mut made), Ok(0));
+        assert_eq!(made, 2);
+        let cell = table.get(&epoch(3, 1)).unwrap();
+        assert_eq!(cell.payload, 100);
+        assert_eq!(cell.host.status, LaneStatus::Decoding);
+        assert_eq!(cell.host.prefilled, 2);
+        assert_eq!(cell.host.stamp, 2);
+    }
+
+    #[test]
+    fn promoted_admission_refusals() {
+        let mut table = LaneTable::<TestCell>::new(2);
+        let mut made = 0;
+        assert!(admit_decoding(&mut table, epoch(1, 0), &[7], &mut made)
+            .unwrap_err()
+            .contains("generation 0"));
+        assert!(admit_decoding(&mut table, epoch(1, 1), &[], &mut made)
+            .unwrap_err()
+            .contains("empty prompt"));
+        assert_eq!((made, table.active(), table.next_stamp), (0, 0, 0));
+        admit_decoding(&mut table, epoch(1, 1), &[7], &mut made).unwrap();
+        assert!(admit_decoding(&mut table, epoch(1, 1), &[7], &mut made)
+            .unwrap_err()
+            .contains("already live"));
+        // A live plain admission is a duplicate too.
+        admit(&mut table, epoch(2, 1), &[7], &mut made).unwrap();
+        assert!(admit_decoding(&mut table, epoch(2, 1), &[7], &mut made)
+            .unwrap_err()
+            .contains("already live"));
+        assert!(admit_decoding(&mut table, epoch(3, 1), &[7], &mut made)
+            .unwrap_err()
+            .contains("busy"));
+        assert_eq!((made, table.active(), table.next_stamp), (2, 2, 2));
+        // A failed prepare leaves no half-published lane.
+        table.release(&epoch(2, 1)).unwrap();
+        let error = table
+            .admit_decoding(epoch(4, 1), vec![7], vec![1], 2, |_, _| Err("no memory".to_string()))
+            .unwrap_err();
+        assert_eq!(error, "no memory");
+        assert!(table.get(&epoch(4, 1)).is_none());
+        assert_eq!((table.active(), table.next_stamp), (1, 2));
     }
 
     #[test]

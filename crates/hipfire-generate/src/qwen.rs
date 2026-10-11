@@ -4555,7 +4555,70 @@ pub fn generate_spec(
         // only: this path reseeds and substitutes AR, which a sampled
         // speculative request must never undergo.
         if promo_shape_ok && pending_seed_committable && semantic_stop.is_none() && m.eviction.is_none() {
-            if let Some(permit) = crate::batch::promotion_permit()
+            // Qwen4 (Flash-Next): the running singleton moves into an exact
+            // lane — trunk/head/draft states and the drafter's pending hidden
+            // — and the daemon drives it in `drive_qwen4_lane_batch`.
+            let qwen4_lanes = slot
+                .as_any_mut()
+                .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+                .is_some_and(|b| b.lanes().is_some());
+            if qwen4_lanes {
+                if let Some(permit) = crate::batch::promotion_permit()
+                    .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))
+                {
+                    let promoted = {
+                        let drafter = spec
+                            .drafter_any_mut()
+                            .and_then(|a| a.downcast_mut::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+                            .map(|d| &*d);
+                        match slot.as_any_mut().downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>() {
+                            Some(bundle) => crate::batch::promote_qwen4_singleton(
+                                gpu,
+                                bundle,
+                                drafter,
+                                crate::batch::Qwen4Boundary {
+                                    id,
+                                    permit,
+                                    tokenizer,
+                                    started_in_think: promo_started_in_think,
+                                    prompt_tokens: &prompt_tokens,
+                                    emitted: &emitted,
+                                    position,
+                                    seed_token,
+                                    max_tokens,
+                                    created_at: t0,
+                                    prefill_done_at: t_prefill,
+                                },
+                            ),
+                            None => Err("spec target is not a qwen4 bundle".to_string()),
+                        }
+                    };
+                    match promoted {
+                        Ok(promoted) => {
+                            // The resident state moved into the lane: host
+                            // caches and the drafter's request state belong to
+                            // it, so drop them (the guard restores the bundle).
+                            m.seq_pos = 0;
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                            free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                            if let Err(e) = spec.reset(gpu) {
+                                eprintln!("[fn-lanes-promote] speculator reset after promotion: {e}");
+                            }
+                            crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+                            gpu.replay.rearm_after_layout_growth();
+                            eprintln!(
+                                "[fn-lanes-promote] id={id} promoted at generated={generated} position={position}"
+                            );
+                            crate::batch::put_promoted_qwen4(promoted);
+                            drop(guard);
+                            return None;
+                        }
+                        Err(e) => eprintln!("[fn-lanes-promote] id={id} stays on spec: {e}"),
+                    }
+                }
+            } else if let Some(permit) = crate::batch::promotion_permit()
                 .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))
             {
                 let attempt = hipfire_engine::terminal::active_attempt_id();

@@ -1284,6 +1284,11 @@ impl Qwen4State {
             .checked_add(per_request)
     }
 
+    /// A snapshot ticket of this state's arena is outstanding.
+    pub(crate) fn snapshot_active(&self) -> bool {
+        self.snapshot_arena.active
+    }
+
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();

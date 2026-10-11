@@ -1576,6 +1576,23 @@ impl PromotedDecode {
     }
 }
 
+/// A running Qwen4 singleton moved into an exact lane (`promote_qwen4_singleton`):
+/// the lane already holds the singleton's trunk/head/draft states under
+/// `epoch` in bundle lane `slot`; the daemon hands this to
+/// `fn_batch::drive_qwen4_lane_batch`, which adopts it as a Running lane
+/// under the same AttemptKey with no new `gen_start`.
+pub struct Qwen4PromotedRequest {
+    pub pending: BatchPendingRequest,
+    pub progress: QwenBatchLane,
+    pub producer: QwenArSemanticProducer,
+    pub epoch: hipfire_runtime::slot_batch::RequestEpoch,
+    pub slot: usize,
+    /// The pending seed was already streamed to the client (the spec route
+    /// emits at pick); the lane must not emit it again when it forwards it.
+    pub seed_emitted: bool,
+    pub max_tokens: usize,
+}
+
 /// Decode mode of one VMM batch lane.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum VmmLaneDecode {
@@ -2079,6 +2096,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static PROMOTED: std::cell::RefCell<Option<PromotedRequest>> =
         const { std::cell::RefCell::new(None) };
+    static QWEN4_PROMOTED: std::cell::RefCell<Option<Qwen4PromotedRequest>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Daemon: grant (Some) or clear (None) promotion for the next `generate()`.
@@ -2111,6 +2130,15 @@ pub(crate) fn put_promoted(p: PromotedRequest) {
 /// Daemon, after `generate()` returns: the promoted request to drive.
 pub fn take_promoted() -> Option<PromotedRequest> {
     PROMOTED.with(|slot| slot.borrow_mut().take())
+}
+
+pub(crate) fn put_promoted_qwen4(p: Qwen4PromotedRequest) {
+    QWEN4_PROMOTED.with(|slot| *slot.borrow_mut() = Some(p));
+}
+
+/// Daemon, after `generate()` returns: the promoted Qwen4 request to drive.
+pub fn take_promoted_qwen4() -> Option<Qwen4PromotedRequest> {
+    QWEN4_PROMOTED.with(|slot| slot.borrow_mut().take())
 }
 
 /// Rebuild the AR semantic producer a spec-decoded request would have had:
@@ -2252,6 +2280,114 @@ pub(crate) fn promote_singleton(
         max_active_lanes: 1,
     };
     Ok((pending, progress, state))
+}
+
+/// Qwen4 singleton loop state at a committed window boundary: the next row to
+/// feed is `seed_token` at `position`.
+pub(crate) struct Qwen4Boundary<'a> {
+    pub id: &'a str,
+    pub permit: PromotionPermit,
+    pub tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
+    pub started_in_think: bool,
+    pub prompt_tokens: &'a [u32],
+    /// Every committed token, ending with the pending seed.
+    pub emitted: &'a [u32],
+    pub position: usize,
+    pub seed_token: u32,
+    pub max_tokens: usize,
+    pub created_at: Instant,
+    pub prefill_done_at: Instant,
+}
+
+/// Move a Qwen4 singleton generation into an exact lane: replay its AR
+/// producer, prepare the lane (the resident state is untouched), transfer the
+/// terminal transaction (`singleton_handoff_to_batch`), then commit the move
+/// (state swap + resident reset). On `Err` nothing changed: the lane is
+/// released and the singleton keeps its state and transaction. `drafter` is
+/// required when the lane store carries the MTP engine. The caller resets the
+/// host/speculator state and hands the result to the daemon via
+/// [`put_promoted_qwen4`].
+pub(crate) fn promote_qwen4_singleton(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    drafter: Option<&hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>,
+    b: Qwen4Boundary<'_>,
+) -> Result<Qwen4PromotedRequest, String> {
+    if b.emitted.last() != Some(&b.seed_token) {
+        return Err("pending seed is not the last committed token".into());
+    }
+    let spec_store = bundle.lanes().ok_or("qwen4 lanes not staged")?.spec().is_some();
+    let (producer, bytes_fed) = replay_ar_producer(b.id, b.started_in_think, b.tokenizer, b.emitted)?;
+    let epoch = crate::fn_batch::next_lane_epoch()?;
+    let parts = if spec_store {
+        let drafter = drafter.ok_or("lane store carries MTP but the singleton has no MTP drafter")?;
+        Some(drafter.promotion_parts()?)
+    } else {
+        None
+    };
+    let slot = bundle
+        .prepare_promotion(gpu, epoch, b.prompt_tokens.to_vec(), b.emitted.to_vec(), b.seed_token, b.position, parts)
+        .map_err(|e| e.to_string())?;
+    let attempt_id = active_attempt_id();
+    let Some(admission) = singleton_handoff_to_batch(b.id, attempt_id) else {
+        return Err(match bundle.abort_promotion(&epoch) {
+            Ok(()) => "terminal transaction not transferable".to_string(),
+            Err(e) => format!("terminal transaction not transferable; lane release: {e}"),
+        });
+    };
+    if let Err(e) = bundle.commit_promotion(gpu, &epoch) {
+        eprintln!("[fn-lanes-promote] id={} resident reset after promotion: {e}", b.id);
+    }
+    let key = AttemptKey::new(b.id, attempt_id);
+    let pending = BatchPendingRequest {
+        key: key.clone(),
+        admission,
+        original_msg: b.permit.original_msg,
+        prompt: String::new(),
+        prompt_tokens: Vec::new(),
+        started_in_think: b.started_in_think,
+        system: None,
+        assistant_prefix: b.permit.assistant_prefix,
+        max_think_tokens: b.permit.max_think_tokens,
+        max_tokens: b.permit.max_tokens,
+        client_seed: b.permit.client_seed,
+        sampling: b.permit.sampling.clone(),
+    };
+    let rng_state = request_seed_for(&key, b.permit.client_seed);
+    let mut conversation = Vec::with_capacity(b.prompt_tokens.len() + b.emitted.len());
+    conversation.extend_from_slice(b.prompt_tokens);
+    conversation.extend_from_slice(b.emitted);
+    let progress = QwenBatchLane {
+        key,
+        ticket: LaneTicket {
+            lane: usize::MAX,
+            generation: u64::MAX,
+            admission,
+        },
+        sampling: b.permit.sampling,
+        prompt_len: b.prompt_tokens.len(),
+        // The lane driver counts one per committed token (as admission:
+        // prompt length, then +1 each), so it is the conversation length.
+        seq_pos: conversation.len(),
+        next_token: Some(b.seed_token),
+        rng_state: u64::from(rng_state),
+        conversation_tokens: conversation,
+        streamed_tokens: b.emitted.to_vec(),
+        bytes_fed_to_filter: bytes_fed,
+        created_at: b.created_at,
+        prefill_done_at: Some(b.prefill_done_at),
+        first_token_at: Some(b.prefill_done_at),
+        max_active_lanes: 1,
+    };
+    Ok(Qwen4PromotedRequest {
+        pending,
+        progress,
+        producer,
+        epoch,
+        slot,
+        seed_emitted: true,
+        max_tokens: b.max_tokens,
+    })
 }
 
 /// Per-lane singleton semantics the VMM driver carries beside the
@@ -2817,7 +2953,7 @@ pub fn drive_staged_continuous_batch(
     if m.qwen4().is_some() {
         return match vmm_batch {
             Some(params) => {
-                crate::fn_batch::drive_qwen4_lane_batch(sched, gpu, m, params, stdout, inbox)
+                crate::fn_batch::drive_qwen4_lane_batch(sched, gpu, m, params, stdout, inbox, None)
             }
             None => Err(BatchDriveError::Gpu(
                 "Qwen4 continuous batch requires the fn-lanes route (serve.vmm_batch)".to_string(),
@@ -2848,15 +2984,18 @@ pub fn arm_promotion(
     client_seed: Option<u64>,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
 ) {
-    // Qwen4 never promotes: its lane store has no singleton hand-off.
+    // Qwen4 is armed iff its lane store is staged (the promoted request moves
+    // into a lane); qwen35 needs only the eligible request.
     let sampling = resolve_batch_sampling(msg, m);
     // A sampled request promotes only as an AR lane: the AR singleton
     // boundary moves its advanced rng/history/sampler. A sampled speculative
-    // singleton would be continued as AR (reseeded), never promoted.
+    // singleton would be continued as AR (reseeded), never promoted. Qwen4
+    // lanes are greedy-only, so a sampled Qwen4 request never promotes.
     let permit = (armed
-        && m.qwen4().is_none()
+        && m.qwen4().is_none_or(|b| b.lanes().is_some())
         && is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active)
-        && (sampling.temp <= 0.0 || vmm_sampled_lane(msg, m, &sampling) == Some(VmmLaneDecode::Ar)))
+        && (sampling.temp <= 0.0
+            || (m.qwen4().is_none() && vmm_sampled_lane(msg, m, &sampling) == Some(VmmLaneDecode::Ar))))
     .then(|| PromotionPermit {
         original_msg: msg.clone(),
         sampling,
@@ -2886,10 +3025,16 @@ pub fn drive_promoted(
     inbox: &mut DaemonInbox,
 ) -> Option<Result<(), BatchDriveError>> {
     set_promotion_permit(None);
-    // Qwen4 lanes have no singleton→lane promotion and no qwen35 prefix-pool
-    // parking (per-lane session cache is out of scope for AR lanes).
+    // Qwen4 lanes have no qwen35 prefix-pool parking (per-lane session cache
+    // is out of scope for AR lanes); a promoted singleton continues in a lane.
     if m.qwen4().is_some() {
-        return None;
+        let promoted = take_promoted_qwen4()?;
+        return Some(match (sched, vmm_batch) {
+            (Some(sched), Some(params)) => {
+                crate::fn_batch::drive_qwen4_lane_batch(sched, gpu, m, params, stdout, inbox, Some(promoted))
+            }
+            _ => Err(BatchDriveError::Gpu("promoted request without a staged fn-lanes route".into())),
+        });
     }
     let Some(promoted) = take_promoted() else {
         if vmm_batch.is_some() {

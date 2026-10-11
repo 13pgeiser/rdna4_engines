@@ -214,6 +214,9 @@ pub(crate) struct LaneSpecPolicy {
     calibrated: bool,
     /// Windows routed under a lab route mode (the cycle's position).
     lab_windows: usize,
+    /// A promoted singleton whose floor already retired it: the head lags
+    /// the trunk, so the lane is head-free AR for good (every route mode).
+    promoted_retired: bool,
 }
 
 impl LaneSpecPolicy {
@@ -230,6 +233,28 @@ impl LaneSpecPolicy {
             max_k: k.min(MTP_MAX_DEPTH),
             calibrated: false,
             lab_windows: 0,
+            promoted_retired: false,
+        }
+    }
+
+    /// The policy of a promoted singleton: the drafter's per-depth
+    /// `agreement` seeds the lane (performance only); `retired` (the
+    /// singleton's floor retired it) keeps the lane `ArRetired`, otherwise
+    /// the lane floor starts fresh like any admitted lane.
+    pub(crate) fn promoted(k: usize, agreement: Agreement, retired: bool) -> Self {
+        Self::promoted_with_floor(k, agreement, retired, floor_env_enabled())
+    }
+
+    fn promoted_with_floor(
+        k: usize,
+        agreement: Agreement,
+        retired: bool,
+        floor_enabled: bool,
+    ) -> Self {
+        Self {
+            agreement,
+            promoted_retired: retired,
+            ..Self::with_floor(k, floor_enabled)
         }
     }
 
@@ -240,12 +265,15 @@ impl LaneSpecPolicy {
 
     /// The floor retired this lane to head-free AR (sticky).
     pub(crate) fn retired(&self) -> bool {
-        self.floor_enabled && self.floor.retired()
+        self.promoted_retired || (self.floor_enabled && self.floor.retired())
     }
 
     /// Route the lane's next window; `budget` is the most drafts it may
     /// carry (0 = AR). Retired lanes stay `ArRetired`.
     pub(crate) fn route(&mut self, budget: usize, lab: LabRoutes) -> LaneRoute {
+        if self.promoted_retired {
+            return LaneRoute::ArRetired;
+        }
         if lab != LabRoutes::Floor {
             return self.lab_route(budget, lab);
         }
@@ -979,6 +1007,63 @@ mod tests {
         assert!(!policy.retired());
         // A zero budget observes nothing.
         policy.observe_ar_synced(&window(1, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_promoted_retired_policy_stays_ar_retired_in_every_mode() {
+        for floor_enabled in [true, false] {
+            let mut policy = LaneSpecPolicy::promoted_with_floor(
+                3,
+                [(0.9, 1.0); MTP_MAX_DEPTH],
+                true,
+                floor_enabled,
+            );
+            assert!(policy.retired());
+            for lab in [LabRoutes::Floor, LabRoutes::Batched, LabRoutes::Cycle] {
+                for budget in [0, 1, 3] {
+                    assert_eq!(policy.route(budget, lab), LaneRoute::ArRetired);
+                }
+            }
+            policy.observe_batched(&window(4, 3, 3), 0.5, 3);
+            policy.observe_ar_synced(&window(1, 0, 0), 3);
+            assert!(policy.retired());
+            assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
+        }
+    }
+
+    #[test]
+    fn a_promoted_live_policy_routes_like_a_fresh_one_with_the_given_agreement() {
+        let low = [(0.0, 2.0); MTP_MAX_DEPTH];
+        let mut promoted = LaneSpecPolicy::promoted_with_floor(3, low, false, true);
+        assert!(!promoted.retired());
+        assert_eq!(promoted.agreement, low);
+        assert_eq!(batched_depth(&promoted.agreement, 3), 0);
+        let mut fresh = LaneSpecPolicy::with_floor(3, true);
+        fresh.agreement = low;
+        assert_eq!(
+            promoted.route(3, LabRoutes::Floor),
+            fresh.route(3, LabRoutes::Floor)
+        );
+        assert_eq!(promoted.route(0, LabRoutes::Floor), LaneRoute::ArSynced);
+        // The floor starts fresh: it still retires on costly probe windows.
+        let mut probing = LaneSpecPolicy::promoted_with_floor(
+            3,
+            [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
+            false,
+            true,
+        );
+        assert_ne!(probing.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
+        for _ in 0..3 {
+            probing.observe_batched(&window(1, 0, 1), 6.0, 3);
+        }
+        assert!(probing.retired());
+        assert_eq!(probing.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
+        // Lab modes still bypass the floor on a live promoted lane.
+        let mut lab = LaneSpecPolicy::promoted_with_floor(3, low, false, true);
+        assert_eq!(
+            lab.route(2, LabRoutes::Batched),
+            LaneRoute::Batched { k_max: 2 }
+        );
     }
 
     #[test]

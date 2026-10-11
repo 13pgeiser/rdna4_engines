@@ -2327,6 +2327,153 @@ impl Qwen4Bundle {
         self.with_lanes(|store, _| store.force_seed(epoch, token))
     }
 
+    /// The resident owners must be at a clean window boundary to move into a
+    /// lane: no armed GDN ring and no outstanding trunk or head snapshot.
+    fn promotion_resident_ready(&self) -> Result<(), String> {
+        if self.state.row_capture_armed {
+            return Err("promotion: the resident GDN ring is armed".to_string());
+        }
+        if self.state.snapshot_active() {
+            return Err("promotion: the resident trunk has an active snapshot ticket".to_string());
+        }
+        if self
+            .mtp
+            .as_ref()
+            .is_some_and(|mtp| mtp.state.snapshot_active())
+        {
+            return Err("promotion: the resident MTP head has an active snapshot ticket".to_string());
+        }
+        Ok(())
+    }
+
+    /// Promotion step 1 (fallible, resident untouched): admit `epoch` into a
+    /// free lane as Decoding with `prompt`, the `generated` picks and
+    /// `pending_seed` (the next AR row's token), `prefilled = prompt.len()`,
+    /// allocating the slot's states if it has none. On an MTP lane store the
+    /// singleton drafter's `parts` seed the lane: its pending hidden is
+    /// copied in and the lane policy starts from its agreement (a retired
+    /// request stays `ArRetired`); an AR store takes `None`. Refused: lanes
+    /// not staged, a step in flight, no free lane, `position` not the
+    /// resident `state.position`, an armed ring or an active snapshot ticket
+    /// on the resident owners, a spec store without `parts` (or an AR store
+    /// with), and `state.position != head.position` unless retired. Pair
+    /// with [`Self::commit_promotion`] or [`Self::abort_promotion`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_promotion(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: hipfire_runtime::slot_batch::RequestEpoch,
+        prompt: Vec<u32>,
+        generated: Vec<u32>,
+        pending_seed: u32,
+        position: usize,
+        parts: Option<crate::mtp_spec::Qwen4PromotionParts<'_>>,
+    ) -> Result<usize, BundleError> {
+        let spec = self
+            .lanes
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 lanes are not staged".to_string()))?
+            .spec();
+        if position != self.state.position {
+            return Err(BundleError::Forward(format!(
+                "promotion: position {position} is not the resident state's {}",
+                self.state.position
+            )));
+        }
+        self.promotion_resident_ready().map_err(BundleError::Forward)?;
+        match (spec, parts.as_ref()) {
+            (Some(_), None) => {
+                return Err(BundleError::Forward(
+                    "promotion: an MTP lane store needs the drafter's parts".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(BundleError::Forward(
+                    "promotion: an AR lane store takes no drafter parts".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        if let (Some(spec), Some(parts)) = (spec, parts.as_ref()) {
+            let head = self.mtp.as_ref().ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?;
+            if !parts.retired && head.position() != self.state.position {
+                return Err(BundleError::Forward(format!(
+                    "promotion: the MTP head is at {}, the resident state at {}",
+                    head.position(),
+                    self.state.position
+                )));
+            }
+            // The lane keeps the resident state's GDN ring: size it for the
+            // lane's windows (bytes unchanged; a no-op once large enough).
+            self.state
+                .ensure_row_capture(gpu, spec.k + 1, self.config.linear_conv_kernel_dim - 1)
+                .map_err(|e| BundleError::Forward(format!("promotion: resident ring: {e}")))?;
+        }
+        self.with_lanes(|store, bundle| {
+            store.admit_promoted(gpu, bundle, epoch, prompt, generated, pending_seed, parts)
+        })
+    }
+
+    /// Undo a prepared promotion: release `epoch`'s lane. The resident state
+    /// was never touched by [`Self::prepare_promotion`].
+    pub fn abort_promotion(
+        &mut self,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+    ) -> Result<(), BundleError> {
+        self.with_lanes(|store, _| store.release(epoch))
+    }
+
+    /// Promotion step 3: swap the resident trunk state (and, on an MTP lane
+    /// store, the resident head state and draft request state) into the
+    /// prepared lane `epoch`, then reset the resident owners for the next
+    /// singleton request ([`Self::reset`]: session live record and turn
+    /// dropped). Every refusal comes before the swap and leaves both sides
+    /// untouched; once the lane holds the moved states only the reset can
+    /// fail, and its error is returned with the lane already live.
+    pub fn commit_promotion(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+    ) -> Result<(), BundleError> {
+        self.with_lanes(|store, bundle| {
+            if store.phase != crate::lane_exec::LanePhase::Idle {
+                return Err("promotion: a lane step is in flight".to_string());
+            }
+            let ring_rows = store.spec().map(|spec| spec.k + 1);
+            bundle.promotion_resident_ready()?;
+            let lane = store
+                .lane_mut(epoch)
+                .ok_or_else(|| format!("promotion: unknown or stale epoch {epoch:?}"))?;
+            if lane.host.status != crate::lane::LaneStatus::Decoding {
+                return Err(format!(
+                    "promotion: lane {epoch:?} is {:?}, not Decoding",
+                    lane.host.status
+                ));
+            }
+            if lane.spec.is_some() != bundle.mtp.is_some() {
+                return Err("promotion: the lane's MTP state does not match the bundle".to_string());
+            }
+            if let Some(rows) = ring_rows {
+                if bundle.state.row_capture_rows() < rows {
+                    return Err(format!(
+                        "promotion: the resident ring holds {} rows, the lane needs {rows}",
+                        bundle.state.row_capture_rows()
+                    ));
+                }
+            }
+            std::mem::swap(&mut bundle.state, &mut lane.state);
+            if let (Some(spec), Some(mtp)) = (lane.spec.as_mut(), bundle.mtp.as_mut()) {
+                std::mem::swap(&mut mtp.state, &mut spec.head);
+                spec.draft = mtp.draft.request_state();
+                mtp.draft.reset_request_state();
+            }
+            Ok(())
+        })?;
+        self.reset(gpu)
+    }
+
     /// A fresh lane trunk state: the resident state's formats, QSA backend
     /// and context bound, allocated through the same constructor.
     pub(crate) fn new_lane_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
