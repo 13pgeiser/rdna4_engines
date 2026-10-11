@@ -88,11 +88,14 @@ fn kernarg_abi_matches_hipcc_metadata() {
     }
 }
 
-/// MQ4 differs from MQ6 only in the weight format: 136-byte groups, one b32 of
-/// eight nibbles per lane per K-step (at `8 + 8*kt`), 4-bit extracts and no
-/// `v_perm_b32`; the WMMA chain and the epilogue are shared.
+/// MQ4 differs from MQ6 in the weight format (136-byte groups, one b32 of
+/// eight nibbles per lane per K-step at `8 + 8*kt`, 4-bit extracts) and in the
+/// dequant form: MQ4 runs eight scalar chains per K-step, MQ6 the packed
+/// pairs (four `v_perm_b32` / `v_and_or_b32` / `v_pk_add_f16` / `v_pk_fma_f16`,
+/// two `v_lshl_or_b32`, two more pair selectors); the WMMA chain and the
+/// epilogue are shared.
 #[test]
-fn mq4_entries_differ_from_mq6_only_in_the_weight_format() {
+fn mq4_entries_differ_from_mq6_in_weight_format_and_dequant_form() {
     use hipfire_isa::kernels::qwen4_mq6_x4_gfx11 as mq6;
     let count = |text: &str, pat: &str| text.lines().filter(|l| l.trim_start().starts_with(pat)).count();
     let stride = |text: &str, imm: &str| text.lines().any(|l| l.trim().starts_with("s_mul_i32") && l.trim().ends_with(&format!(", {imm}")));
@@ -102,9 +105,19 @@ fn mq4_entries_differ_from_mq6_only_in_the_weight_format() {
         let tag = format!("w{wr} {kind:?}");
         assert_eq!(a.shape.wmma, b.shape.wmma, "{tag}");
         assert_eq!(a.shape.barriers, b.shape.barriers, "{tag}");
-        // 17 dequant sites in the text (prologue + 16 in the loop body), two v_perm_b32 each in MQ6.
-        assert_eq!(count(&b.s_text, "v_perm_b32"), count(&a.s_text, "v_perm_b32") + 34, "{tag}: v_perm_b32");
-        for name in ["v_bfe_u32", "v_cvt_f32_ubyte0", "v_cvt_f16_f32", "v_fma_f16", "v_wmma_f32_16x16x16_f16", "v_permlanex16_b32", "v_cndmask_b32"] {
+        // 17 dequant sites in the text (prologue + 16 in the loop body).
+        assert_eq!(count(&b.s_text, "v_perm_b32"), count(&a.s_text, "v_perm_b32") + 4 * 17, "{tag}: v_perm_b32");
+        assert_eq!(count(&b.s_text, "v_and_or_b32"), count(&a.s_text, "v_and_or_b32") + 4 * 17, "{tag}: v_and_or_b32");
+        assert_eq!(count(&b.s_text, "v_lshl_or_b32"), count(&a.s_text, "v_lshl_or_b32") + 2 * 17, "{tag}: v_lshl_or_b32");
+        for name in ["v_pk_add_f16", "v_pk_fma_f16"] {
+            assert_eq!((count(&a.s_text, name), count(&b.s_text, name)), (0, 4 * 17), "{tag}: {name}");
+        }
+        for name in ["v_bfe_u32", "v_cvt_f32_ubyte0", "v_cvt_f16_f32", "v_fma_f16"] {
+            assert_eq!(count(&a.s_text, name), count(&b.s_text, name) + 8 * 17, "{tag}: {name}");
+        }
+        // MQ6 sets four pair selectors in the prologue, MQ4 the two scalar ones.
+        assert_eq!(count(&b.s_text, "v_cndmask_b32"), count(&a.s_text, "v_cndmask_b32") + 2, "{tag}: v_cndmask_b32");
+        for name in ["v_wmma_f32_16x16x16_f16", "v_permlanex16_b32"] {
             assert_eq!(count(&a.s_text, name), count(&b.s_text, name), "{tag}: {name}");
         }
         assert!(stride(&a.s_text, "0x88") && !stride(&a.s_text, "0xc8"), "{tag}: 136-byte groups");

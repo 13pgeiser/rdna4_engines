@@ -11,14 +11,20 @@
 //! Exactness (byte-identical outputs): every 16x16 output tile runs the same
 //! chain of `v_wmma_f32_16x16x16_f16` over ascending 16-K steps, C chained
 //! from +0.0, with the same A and B operands as hipcc, so no output depends
-//! on the tiling. A is dequantized op for op as hipcc does it: 6-bit field
-//! extract, `v_cvt_f32_ubyte0`, `v_cvt_f16_f32`, one `v_fma_f16` (sc*q+zp,
-//! single rounding) with the group header's f16 scale / zero point (hA for
-//! K-steps 0..7 of a 256-group, hB for 8..15); lane `l` and `l+16` hold the
-//! same weight row (own eight values, `v_permlanex16` for the other half's,
-//! `v_cndmask` into the 8-VGPR fragment, hipcc's construction). The epilogue
-//! swaps accumulator halves exactly as hipcc (pure bit moves) and stores
-//! `0.0f + acc` (`v_add_f32 0, acc`).
+//! on the tiling. A has the same f16 values as hipcc's dequantization, element
+//! for element (`sc*q + zp`, one RNE rounding, with the group header's f16
+//! scale / zero point: hA for K-steps 0..7 of a 256-group, hB for 8..15), but
+//! two codes at a time: the 6-bit codes of a pair are placed in the mantissas
+//! of two f16 with a constant exponent (`1024 + q`, `64 + q` or `256 + q`,
+//! all exact for q < 64), `v_pk_add_f16` of the bias recovers `q` exactly
+//! (the same f16 as `v_cvt_f32_ubyte0` + `v_cvt_f16_f32`), and one
+//! `v_pk_fma_f16` (operands sc, q, zp; sc and zp read from the header halves
+//! with `op_sel`) is the same fused expression as hipcc's `v_fma_f16`. Lane
+//! `l` and `l+16` hold the same weight row (own eight values,
+//! `v_permlanex16` for the other half's, `v_cndmask` into the 8-VGPR
+//! fragment, hipcc's construction), so every fragment element has hipcc's
+//! bits and lane placement. The epilogue swaps accumulator halves exactly as
+//! hipcc (pure bit moves) and stores `0.0f + acc` (`v_add_f32 0, acc`).
 //!
 //! Freedom used (tiling, layout and scheduling only):
 //!  * a wave owns 16 rows x 256 tokens (16 accumulator tiles, 128 VGPRs), so
@@ -30,7 +36,7 @@
 //!    four loaded four WMMAs ahead; the next K-step's A dequant is
 //!    interleaved with the current WMMAs;
 //!  * each lane loads only its own 48 code bits per K-step (a b64 at
-//!    `12j + 4*lane_half`) and selects them with `v_perm_b32`;
+//!    `12j + 4*lane_half`) and gathers them with `v_perm_b32` (MQ6: four, one per code pair);
 //!  * X loads go through a descriptor bounded at `N*K*2` bytes, so tokens
 //!    past N read zeros (their outputs are never stored).
 //!
@@ -149,6 +155,11 @@ impl Cfg {
     fn lo(&self) -> u8 { self.q() + 8 }
     fn d1(&self) -> u8 { self.q() + 9 }
     fn xr(&self) -> u8 { self.q() + 10 }
+    /// MQ6 packed dequant: the `v_perm_b32` selector VGPR of code pair `p`.
+    /// Pairs 0 and 1 take the lane-constant slots the scalar dequant's
+    /// selectors used; pairs 2 and 3 take its `lo` / `d1` temporaries (live
+    /// over the main loop only, which is where the selectors are read).
+    fn pair_sel(&self, p: u8) -> u8 { match p { 0 => SELLO, 1 => SELD1, 2 => self.lo(), _ => self.d1() } }
     fn park(&self) -> u8 { self.xr() + 4 * self.xpt() }
     /// Highest VGPR used, plus one.
     fn vgprs_used(&self) -> u16 { u16::from(self.xr()) + 4 * u16::from(self.xpt()) + u16::from(self.hcw()) }
@@ -206,6 +217,10 @@ const HS: u8 = 56; const HG: u8 = 58; const HBF: u8 = 60;
 const SM4: u8 = 61; const SBR1: u8 = 62; const SBR2: u8 = 63; const SBR3: u8 = 64; const SSTEPS: u8 = 65;
 const SIT: u8 = 66; const STOK: u8 = 67; const SROWB: u8 = 68;
 const SRD_S: u8 = 72; const SRD_G: u8 = 76;
+/// MQ6 packed-dequant constants (live from the prologue to the end): field
+/// masks of the even / odd code pairs and the `v_pk_add_f16` constants that
+/// remove the exponent bias (`-1024` / `-64` and `-256` per half).
+const PK_MASKE: u8 = 80; const PK_MASKO: u8 = 81; const PK_CE: u8 = 82; const PK_CO: u8 = 83;
 
 /// Epilogue VGPRs (live only from `epi`): they alias the dead main loop's ring
 /// and everything after it.
@@ -235,8 +250,13 @@ fn plan(spec: &Cfg) -> Result<RegPlan, String> {
     for c in 0..4u8 { for j in 0..2u8 { p.v::<2>("codes", spec.code(c) + 2 * j, dead())?; } }
     for h in 0..2 { p.v::<2>("header", spec.hdr(h), dead())?; }
     p.v::<8>("dequant_q", spec.q(), dead())?;
-    p.v::<1>("dequant_temp", spec.lo(), dead())?;
-    p.v::<1>("dequant_temp", spec.d1(), dead())?;
+    if spec.fmt == Fmt::Mq6 {
+        p.v::<1>("pair_sel", spec.lo(), dead())?;
+        p.v::<1>("pair_sel", spec.d1(), dead())?;
+    } else {
+        p.v::<1>("dequant_temp", spec.lo(), dead())?;
+        p.v::<1>("dequant_temp", spec.d1(), dead())?;
+    }
     for i in 0..spec.xpt() { p.v::<4>("x_stage", spec.xr() + 4 * i, dead())?; }
     if spec.hcw() { p.v::<1>("park_addr", spec.park(), w())?; }
     if spec.vgprs() > spec.vgprs_used() { p.v::<1>("granule_pad", (spec.vgprs() - 1) as u8, w())?; }
@@ -262,6 +282,9 @@ fn plan(spec: &Cfg) -> Result<RegPlan, String> {
     for n in YSTEP..=SK2 { p.s::<1>("scalar", n, w())?; }
     for m in [MASK0, MASK1, MASKB, LHM] { p.s::<2>("lane_mask", m, w())?; }
     p.s::<1>("permlane_sel", PSEL, w())?;
+    if spec.fmt == Fmt::Mq6 {
+        for n in PK_MASKE..=PK_CO { p.s::<1>("pk_const", n, w())?; }
+    }
     match spec.kind {
         Kind::Regions => {
             p.s::<8>("raw_a", R_A0, w())?;
@@ -340,39 +363,77 @@ fn emit_fill(b: &mut Builder, spec: &Cfg, f: &Fill) -> R {
 }
 fn xstore(spec: &Cfg, slot: usize, i: u8) -> Fill { Fill::XStore { slot, i, imm: u32::from(i) * spec.xrow_step() * PITCH } }
 
+/// MQ6 `v_perm_b32` selectors (lane half 0, lane half 1) of the four code
+/// pairs: the lane's 48-bit window is bytes `2*lh ..` of its 8 loaded bytes.
+/// Pair `p` (codes 2p and 2p+1, window bits 12p..12p+11) is gathered into a
+/// dword whose two 16-bit halves each hold one six-bit field within the low
+/// five bits of the half (the other bytes are zeroed or ignored by the mask):
+///  * pairs 0 and 2 (byte-aligned codes 2p at offset 0, 2p+1 at offset 6):
+///    `u = [b0, b1, 0, 0]` of the pair's two bytes; `(u << 10) | u` moves
+///    code 2p+1 to bit 16 (code 2p stays at bit 0);
+///  * pairs 1 and 3 (code 2p at byte offset 4, code 2p+1 at offset 2 of the
+///    next byte): `[b0, b1, b1, 0]` already puts code 2p at bit 4 of the low
+///    half and code 2p+1 at bit 18 of the high half.
+const PAIR_SEL: [(u32, u32); 4] = [
+    (0x0c0c_0100, 0x0c0c_0302), (0x0c02_0201, 0x0c04_0403),
+    (0x0c0c_0403, 0x0c0c_0605), (0x0c05_0504, 0x0c07_0706),
+];
+
 /// Dequantize one K-step into A fragment `a` (8 VGPRs, both lane halves hold
 /// the full row) from header dword `h` (sc in .l, zp in .h) and the codes at
 /// `w`. MQ6: two dwords, this lane half's 48 bits at bit 0 for lane half 0,
 /// bit 16 for lane half 1. MQ4: one dword, this lane half's eight nibbles.
-/// Breadth-first order: eight independent per-value chains into the packed
-/// values m[0..3] (q0..q3), their `permlanex16` o[0..3] (q4..q7), then hipcc's
-/// selects `A[k] = lh ? o[k] : m[k]`, `A[k+4] = lh ? m[k] : o[k]`.
+///
+/// MQ6 runs packed pairs (exact: the same f16 values as `sc*q + zp` per code
+/// with one `v_fma_f16` rounding): the code pair is placed in the mantissas
+/// of two f16 with a constant exponent (`v_and_or_b32` against the pair's
+/// field mask and exponent bits: `0x6400 | q` is `1024 + q` for a field at
+/// bit 0, `0x5400 | q << 4` is `64 + q` for a field at bit 4,
+/// `0x5c00 | q << 2` is `256 + q` for a field at bit 2), `v_pk_add_f16` of
+/// the bias recovers `q` exactly, and `v_pk_fma_f16` (sc and zp straight from
+/// the header halves through `op_sel`, operand order sc, q, zp) gives the
+/// packed values m[k] (codes 2k, 2k+1) in q0..q3. MQ4 runs eight per-value
+/// chains (`v_bfe_u32`, `v_cvt_f32_ubyte0`, `v_cvt_f16_f32`, `v_fma_f16`)
+/// into m[0..3]. Then, breadth-first, their `permlanex16` o[0..3] (q4..q7)
+/// and hipcc's selects `A[k] = lh ? o[k] : m[k]`, `A[k+4] = lh ? m[k] : o[k]`.
 fn dequant(spec: &Cfg, w: u8, h: u8, a: u8) -> Vec<Fill> {
     let q = spec.q();
     let mut out = Vec::new();
     let mut f = |text: String, defs: Vec<RegRef>, uses: Vec<RegRef>| out.push(Fill::Valu { text, defs, uses });
     match spec.fmt {
         Fmt::Mq6 => {
-            let (lo, d1) = (spec.lo(), spec.d1());
-            // lo = codes 0..4 (+ low bits of 5); d1 = bits 24..47 (codes 4..7 at 0,6,12,18).
-            f(format!("v_perm_b32 v{lo}, v{}, v{w}, v{SELLO}", w + 1), vec![v(lo)], vec![v(w), v(w + 1), v(SELLO)]);
-            f(format!("v_perm_b32 v{d1}, v{}, v{w}, v{SELD1}", w + 1), vec![v(d1)], vec![v(w), v(w + 1), v(SELD1)]);
-            for i in 0..8u8 {
-                let src = if i < 4 { lo } else { d1 };
-                f(format!("v_bfe_u32 v{}, v{src}, {}, 6", q + i, 6 * (i % 4)), vec![v(q + i)], vec![v(src)]);
+            for p in 0..4u8 {
+                let sel = spec.pair_sel(p);
+                f(format!("v_perm_b32 v{}, v{}, v{w}, v{sel}", q + p, w + 1), vec![v(q + p)], vec![v(w), v(w + 1), v(sel)]);
+            }
+            for p in [0u8, 2] {
+                f(format!("v_lshl_or_b32 v{0}, v{0}, 10, v{0}", q + p), vec![v(q + p)], vec![v(q + p)]);
+            }
+            for p in 0..4u8 {
+                let (mask, exp) = if p % 2 == 0 { (PK_MASKE, 0x6400_6400u32) } else { (PK_MASKO, 0x5c00_5400) };
+                f(format!("v_and_or_b32 v{0}, v{0}, s{mask}, {1}", q + p, lit(exp)), vec![v(q + p)], vec![v(q + p), s(mask)]);
+            }
+            for p in 0..4u8 {
+                let bias = if p % 2 == 0 { PK_CE } else { PK_CO };
+                f(format!("v_pk_add_f16 v{0}, v{0}, s{bias}", q + p), vec![v(q + p)], vec![v(q + p), s(bias)]);
+            }
+            for p in 0..4u8 {
+                f(format!("v_pk_fma_f16 v{0}, v{h}, v{0}, v{h} op_sel:[0,0,1] op_sel_hi:[0,1,1]", q + p), vec![v(q + p)], vec![v(h), v(q + p)]);
             }
         }
-        // Code i of the lane half's dword sits at bits 4i..4i+3.
-        Fmt::Mq4 => for i in 0..8u8 {
-            f(format!("v_bfe_u32 v{}, v{w}, {}, 4", q + i, 4 * i), vec![v(q + i)], vec![v(w)]);
-        },
-    }
-    for i in 0..8u8 { f(format!("v_cvt_f32_ubyte0_e32 v{0}, v{0}", q + i), vec![v(q + i)], vec![v(q + i)]); }
-    for i in 0..8u8 { f(format!("v_cvt_f16_f32_e64 v{0}.l, v{0}", q + i), vec![v(q + i)], vec![v(q + i)]); }
-    for i in 0..8u8 {
-        let d = q + i / 2;
-        let (half, sel) = if i % 2 == 0 { ("l", "op_sel:[0,0,1,0]") } else { ("h", "op_sel:[0,0,1,1]") };
-        f(format!("v_fma_f16 v{d}.{half}, v{h}.l, v{}.l, v{h}.h {sel}", q + i), vec![v(d)], vec![v(d), v(h), v(q + i)]);
+        Fmt::Mq4 => {
+            // Code i of the lane half's dword sits at bits 4i..4i+3.
+            for i in 0..8u8 {
+                f(format!("v_bfe_u32 v{}, v{w}, {}, 4", q + i, 4 * i), vec![v(q + i)], vec![v(w)]);
+            }
+            for i in 0..8u8 { f(format!("v_cvt_f32_ubyte0_e32 v{0}, v{0}", q + i), vec![v(q + i)], vec![v(q + i)]); }
+            for i in 0..8u8 { f(format!("v_cvt_f16_f32_e64 v{0}.l, v{0}", q + i), vec![v(q + i)], vec![v(q + i)]); }
+            for i in 0..8u8 {
+                let d = q + i / 2;
+                let (half, sel) = if i % 2 == 0 { ("l", "op_sel:[0,0,1,0]") } else { ("h", "op_sel:[0,0,1,1]") };
+                f(format!("v_fma_f16 v{d}.{half}, v{h}.l, v{}.l, v{h}.h {sel}", q + i), vec![v(d)], vec![v(d), v(h), v(q + i)]);
+            }
+        }
     }
     for k in 0..4u8 {
         f(format!("v_permlanex16_b32 v{}, v{}, s{PSEL}, 0xfedcba98", q + 4 + k, q + k), vec![v(q + 4 + k)], vec![v(q + k), s(PSEL)]);
@@ -517,11 +578,23 @@ fn prologue(b: &mut Builder, spec: &Cfg) -> R {
         op(b, format!("v_mad_u32_u24 v{}, v{t0}, {}, v{t5}", spec.park(), lit(PARK_ROW)), &[v(spec.park())], &[v(t0), v(t5)])?;
     }
     op(b, format!("v_cmp_ne_u32_e64 s{LHM}, 0, v{t1}"), &[s(LHM)], &[v(t1)])?;
-    op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(0x0302_0100)), &[v(t5)], &[])?;
-    op(b, format!("v_cndmask_b32_e64 v{SELLO}, v{t5}, {}, s{LHM}", lit(0x0504_0302)), &[v(SELLO)], &[v(t5), s(LHM)])?;
-    op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(0x0c05_0403)), &[v(t5)], &[])?;
-    op(b, format!("v_cndmask_b32_e64 v{SELD1}, v{t5}, {}, s{LHM}", lit(0x0c07_0605)), &[v(SELD1)], &[v(t5), s(LHM)])?;
-    sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
+    if spec.fmt == Fmt::Mq6 {
+        for (p, (l0, l1)) in PAIR_SEL.into_iter().enumerate() {
+            let sel = spec.pair_sel(p as u8);
+            op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(l0)), &[v(t5)], &[])?;
+            op(b, format!("v_cndmask_b32_e64 v{sel}, v{t5}, {}, s{LHM}", lit(l1)), &[v(sel)], &[v(t5), s(LHM)])?;
+        }
+        sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
+        for (n, c) in [(PK_MASKE, 0x003f_003fu32), (PK_MASKO, 0x00fc_03f0), (PK_CE, 0xe400_e400), (PK_CO, 0xdc00_d400)] {
+            sop(b, format!("s_mov_b32 s{n}, {}", lit(c)), &[n], &[])?;
+        }
+    } else {
+        op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(0x0302_0100)), &[v(t5)], &[])?;
+        op(b, format!("v_cndmask_b32_e64 v{SELLO}, v{t5}, {}, s{LHM}", lit(0x0504_0302)), &[v(SELLO)], &[v(t5), s(LHM)])?;
+        op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(0x0c05_0403)), &[v(t5)], &[])?;
+        op(b, format!("v_cndmask_b32_e64 v{SELD1}, v{t5}, {}, s{LHM}", lit(0x0c07_0605)), &[v(SELD1)], &[v(t5), s(LHM)])?;
+        sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
+    }
     for n in 0..8 * BT { op(b, format!("v_mov_b32_e32 v{}, 0", spec.acc() + n), &[v(spec.acc() + n)], &[])?; }
     b.wait(Counter::Lgkm, 0)?;
     if spec.kind == Kind::Regions {

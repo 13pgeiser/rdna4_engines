@@ -50,7 +50,7 @@
       "kind": "embedded",
       "module": "qwen4_mq6_x4_pm_gfx1151",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_mq6_x4_pm_gfx1151.hxaco",
-      "sha256": "24aa35df635e08bb04df422bbb0faaa9dc491579d13619794fa9d77c122b7b01",
+      "sha256": "3af58382793bddf8ab25d9c8ec7ced94e8444a55cf2c47ad77b815ba91104500",
       "symbols": [
         "qwen4_mq6_x4_pm_gfx1151_w8_bf16out",
         "qwen4_mq6_x4_pm_gfx1151_w8_regions"

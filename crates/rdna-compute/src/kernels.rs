@@ -4249,7 +4249,7 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen
 /// (plain F32), `_{w4,w8}_bf16out`, `_w8_regions` and `_w8_hcw`; the runtime
 /// launches only `_w8`, `_w8_bf16out` and `_w8_regions`, from M >= 2560 and
 /// N >= 2048 (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps hipcc).
-/// SHA-256 24aa35df635e08bb04df422bbb0faaa9dc491579d13619794fa9d77c122b7b01
+/// SHA-256 3af58382793bddf8ab25d9c8ec7ced94e8444a55cf2c47ad77b815ba91104500
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
 /// Certified builder module of the gfx1151 Flash-Next lane-step row kernels
