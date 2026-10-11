@@ -320,6 +320,8 @@ extern "C" void* rad_buf_ptr   (RadCtx* c, rad_buf    b) { (void)c; return (void
 #include "../arch/llama_fp8/llama_fp8.cpp"
 /* Gemma 4 dense: two attention classes (sliding-window + proportional-RoPE global) on one stream. */
 #include "../arch/gemma4_bf16/gemma4_bf16.cpp"
+/* And the bf16 / fp8-expert Gemma 4 plugin: the 26B-A4B's dense and routed arms side by side. */
+#include "../arch/gemma4/gemma4.cpp"
 /* The PLE block on its own: no architecture in this file declares it, and what its step() hands
  * the two windowed ops is a contract of its own (rad_block_ple.h). */
 #include <arch/rad_block_ple.h>
@@ -3373,4 +3375,252 @@ TEST(a_gemma4_decode_step_runs_both_classes_in_order) {
         else if (o->op == "gather_rows" || o->op == "logits_gemm" || o->op == "logit_softcap")
             CHECK_EQ(i.n, (int64_t)batch.n_out);
     }
+}
+
+/* ===================== gemma4: the 26B-A4B, a dense and a routed arm side by side ===================== */
+
+namespace {
+
+/* gemma-4-26B-A4B-it's text geometry cut to SIX layers -- five sliding then one full, the model's
+ * own 5:1 -- with the routed arm on. The keys are the checkpoint's (text_config flattened), which
+ * is what arch/gemma4 reads, and quant is empty: the container this plugin claims. */
+const char* k_g4moe_keys[] = {
+    "hidden_size", "num_attention_heads", "num_key_value_heads", "head_dim", "global_head_dim",
+    "num_global_key_value_heads", "attention_k_eq_v", "vocab_size", "intermediate_size",
+    "rms_norm_eps", "sliding_window", "final_logit_softcapping", "hidden_activation", "layer_types",
+    "rope_parameters.sliding_attention.rope_theta", "rope_parameters.sliding_attention.rope_type",
+    "rope_parameters.full_attention.rope_theta", "rope_parameters.full_attention.rope_type",
+    "rope_parameters.full_attention.partial_rotary_factor", "enable_moe_block", "num_experts",
+    "top_k_experts", "moe_intermediate_size",
+};
+const char* k_g4moe_vals[] = {
+    "2816", "16", "8", "256", "512",
+    "2", "true", "262144", "2112",
+    "1e-06", "1024", "30.0", "gelu_pytorch_tanh",
+    "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+    "\"sliding_attention\", \"full_attention\"]",
+    "10000.0", "default",
+    "1000000.0", "proportional",
+    "0.25", "true", "128",
+    "8", "704",
+};
+static_assert(sizeof(k_g4moe_keys) == sizeof(k_g4moe_vals), "one value a key");
+
+RadModelMeta gemma4_moe_meta() {
+    RadModelMeta m{};
+    m.arch_id     = "gemma4";
+    m.name        = "test-gemma4-26b-a4b";
+    m.quant       = "";
+    m.n_layers    = 6;
+    m.n_embd      = 2816;
+    m.n_head      = 16;
+    m.n_head_kv   = 8;
+    m.head_dim    = 256;
+    m.n_ff        = 2112;
+    m.n_vocab     = 262144;
+    m.n_ctx_train = 262144;
+    m.rms_eps     = 1e-6f;
+    m.n_kv        = (int)(sizeof(k_g4moe_keys) / sizeof(k_g4moe_keys[0]));
+    m.kv_key      = k_g4moe_keys;
+    m.kv_val      = k_g4moe_vals;
+    return m;
+}
+
+int count_resolved(const RadBuilder& b, const std::string& name) {
+    int n = 0;
+    for (const auto& o : b.ops) if (o.op == name && o.resolved) ++n;
+    return n;
+}
+
+int count_issued(const std::vector<std::string>& v, const std::string& name) {
+    return (int)std::count(v.begin(), v.end(), name);
+}
+
+}  /* namespace */
+
+TEST(a_gemma4_moe_trunk_declares_both_arms_and_the_joins) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    CHECK_EQ(count_op(b, "attn_paged"), 6);
+    CHECK_EQ(count_op(b, "kv_store"),   6);
+    /* One join after attention and one after the two feed-forward arms, a layer. */
+    CHECK_EQ(count_resolved(b, "norm_add_norm"),  6);
+    CHECK_EQ(count_resolved(b, "join_add_scale"), 6);
+    /* The routed arm: experts served bf16 where the container holds no encoding for them. */
+    CHECK(count_op(b, "moe_gemm") > 0);
+    CHECK_EQ(count_op(b, "moe_gemm_q"), 0);
+    CHECK_EQ(count_op(b, "logit_softcap"), 1);
+    CHECK_EQ(count_op(b, "all_reduce"),    0);   /* world 1 */
+
+    for (const auto& o : b.ops)
+        if (o.resolved) CHECK(o.uses_declared);
+    for (const auto& w : b.weights)
+        CHECK(find_map(b, w.name) != nullptr);
+}
+
+/* THE SLIDING GROUP IS FULL, with the window on the attention op: a WINDOW group is not
+ * prefix-cached, and FULL keeps a hit (arch/gemma4/gemma4.cpp, the KV groups). */
+TEST(gemma4_moe_kv_groups_are_both_full_and_the_window_rides_the_op) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    REQUIRE((int)b.kv_groups.size() == 2);
+    for (const auto& g : b.kv_groups) {
+        CHECK_EQ((int)g.d.kind, RAD_KV_FULL);
+        CHECK_EQ(g.d.window, 0);
+    }
+    const RecOp* sl = find_op(b, "attn_paged", 0);
+    REQUIRE(sl != nullptr);
+    CHECK_EQ(pint(sl, "head_dim"), 256);
+    CHECK_EQ(pint(sl, "window"),   1024);
+    const RecOp* fu = find_op(b, "attn_paged", 5);
+    REQUIRE(fu != nullptr);
+    CHECK_EQ(pint(fu, "head_dim"), 512);
+    CHECK_EQ(pint(fu, "gqa"),      8);
+    CHECK_EQ(pint(fu, "window"),   0);
+}
+
+/* PROPORTIONAL ROPE IS NOT A PARTIAL ROTARY: the full layers rotate the whole 512-wide head as a
+ * NeoX pair (j, j + 256), with every frequency past pair 63 divided away by the YaRN ramp. A
+ * rotary_dim of 128 would pair (j, j + 64) -- fluent, and wrong. */
+TEST(gemma4_full_rope_is_the_whole_head_with_the_frequencies_past_64_pairs_cut) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    int full = 0;
+    for (const auto& o : b.ops) {
+        if (o.op != "rope" || pint(&o, "head_dim") != 512) continue;
+        ++full;
+        CHECK_EQ(pint(&o, "rotary_dim"), 512);
+        CHECK_EQ(pstr(&o, "mode"), std::string("neox"));
+        CHECK_NEAR(pflt(&o, "theta"),     1e6, 1.0);
+        CHECK_NEAR(pflt(&o, "yarn_low"),  63.5, 1e-9);
+        CHECK_NEAR(pflt(&o, "yarn_high"), 64.0, 1e-9);
+        CHECK(pflt(&o, "yarn_factor") >= 1e30);
+    }
+    CHECK(full > 0);
+}
+
+/* Where no kernel library serves a join, the plugin declares the rmsnorm / add chain instead and
+ * issues that -- and libref has no row for the joins precisely so that this path stays reachable
+ * (docs/OPS.md). */
+TEST(gemma4_falls_back_to_the_chain_where_no_join_resolves) {
+    std::vector<std::string> fused, chain;
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        if (refuse) { b.refuse.insert("norm_add_norm"); b.refuse.insert("join_add_scale"); }
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        (refuse ? chain : fused) = issued_ops(b, c);
+    }
+    CHECK_EQ(count_issued(fused, "norm_add_norm"),  6);
+    CHECK_EQ(count_issued(fused, "join_add_scale"), 6);
+    CHECK_EQ(count_issued(chain, "norm_add_norm"),  0);
+    CHECK_EQ(count_issued(chain, "join_add_scale"), 0);
+    CHECK_EQ(count_issued(fused, "attn_paged"), 6);
+    CHECK_EQ(count_issued(chain, "attn_paged"), 6);
+    /* The chain is longer, by the norms and adds the joins fold in. */
+    CHECK(count_issued(chain, "rmsnorm") > count_issued(fused, "rmsnorm"));
+    CHECK(count_issued(chain, "add") > count_issued(fused, "add"));
+}
+
+/* Both Gemma 4 plugins state the model's reply format, and it is one declaration. */
+TEST(both_gemma4_plugins_export_one_reply_format) {
+    RadModelMeta moe = gemma4_moe_meta(), dense = gemma4_meta();
+    CHECK(gemma4::chat_format(&moe) == rad::arch::gemma4_chat_format());
+    CHECK(gemma4_bf16::chat_format(&dense) == rad::arch::gemma4_chat_format());
+}
+
+/* ================== gemma4 + DFlash: the drafter's taps, live where they are written ================== */
+
+namespace {
+
+/* The MoE trunk above with z-lab's DFlash drafter merged: five layers, four sliding and one full,
+ * reading the trunk at layers 1, 3 and 5. */
+std::vector<const char*> g4df_keys() {
+    std::vector<const char*> k(std::begin(k_g4moe_keys), std::end(k_g4moe_keys));
+    for (const char* s : { "draft.architectures", "draft.num_hidden_layers", "draft.head_dim",
+                           "draft.num_attention_heads", "draft.num_key_value_heads",
+                           "draft.intermediate_size", "draft.rms_norm_eps", "draft.rope_theta",
+                           "draft.hidden_size", "draft.vocab_size", "draft.block_size",
+                           "draft.dflash_config.target_layer_ids",
+                           "draft.dflash_config.mask_token_id", "draft.layer_types",
+                           "draft.sliding_window" })
+        k.push_back(s);
+    return k;
+}
+std::vector<const char*> g4df_vals() {
+    std::vector<const char*> v(std::begin(k_g4moe_vals), std::end(k_g4moe_vals));
+    for (const char* s : { "[\"DFlashDraftModel\"]", "5", "128", "32", "8", "5632", "1e-06",
+                           "1000000.0", "2816", "262144", "16", "[1, 3, 5]", "4",
+                           "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+                           "\"sliding_attention\", \"full_attention\"]",
+                           "2048" })
+        v.push_back(s);
+    return v;
+}
+
+int buf_named(const RadBuilder& b, const char* name) {
+    for (size_t i = 0; i < b.bufs.size(); ++i)
+        if (b.bufs[i].name == name) return (int)i + 1;
+    return 0;
+}
+
+}  /* namespace */
+
+/* THE TAP IS DECLARED WHERE IT IS ISSUED. The buffer planner takes liveness from declaration order,
+ * so `dflash_src` is live from its first DECLARED write. A tap op declared once after the whole
+ * trunk -- and issued inside it, at each tap layer -- made the buffer look born at the end, and the
+ * plan was free to put it on top of `moe_edn`, which every MoE layer writes. At --max-num-seqs 16
+ * it did: every layer after a tap overwrote what the drafter reads, and acceptance fell to 2% with
+ * the reply still fluent. The two ranges must overlap, so no plan can share them. */
+TEST(gemma4_dflash_taps_are_live_from_the_layer_that_writes_them) {
+    const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    RadModelMeta meta = gemma4_moe_meta();
+    meta.n_kv   = (int)keys.size();
+    meta.kv_key = keys.data();
+    meta.kv_val = vals.data();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_spec = 15;
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    const int src = buf_named(b, "dflash_src"), edn = buf_named(b, "moe_edn");
+    REQUIRE(src > 0 && edn > 0);
+    int first_src = -1, last_edn = -1;
+    for (size_t i = 0; i < b.ops.size(); ++i)
+        for (rad_buf w : b.ops[i].writes) {
+            if ((int)w == src && first_src < 0) first_src = (int)i;
+            if ((int)w == edn) last_edn = (int)i;
+        }
+    REQUIRE(first_src >= 0 && last_edn >= 0);
+    CHECK(first_src < last_edn);
+
+    /* And a trunk step writes each tap once: three taps, three copies into `dflash_src`. */
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+    RadBatch batch = decode_batch();
+    c.batch = &batch;
+    gemma4::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    int taps = 0;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (o && std::find(o->writes.begin(), o->writes.end(), (rad_buf)src) != o->writes.end())
+            ++taps;
+    }
+    CHECK_EQ(taps, 3);
 }
