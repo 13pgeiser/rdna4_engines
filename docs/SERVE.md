@@ -47,8 +47,8 @@ hipfire serve --max-seq 32768 -d      # KV context for every load (replaces memo
 
 hipfire ps                            # daemons / quantize / uploads + port state (Linux)
 hipfire stop                          # SIGTERM tracked pid in serve.pid (safe default)
-# Destructive — inspect first (hipfire ps, curl /health, port owner):
-hipfire stop --force                  # also pkill -x daemon + fuser -k <port>/tcp
+# Forceful — inspect first (hipfire ps, curl /health):
+hipfire stop --force                  # also kill this install's untracked daemons (TERM, KILL after 5s)
 hipfire stop --all                    # --force plus pkill orphan quantize jobs
 hipfire restart -d                    # stop --force semantics, then serve again
 ```
@@ -60,13 +60,15 @@ process answering on the port, exits 1 with that reason. Readiness requires
 the `/health` `pid` to be the child it just spawned, and if the child exits
 early the error includes the last `FATAL`/`hipfire:` line from `serve.log`.
 
-**Destructive lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
+**Forceful lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
 pid after ownership checks — use that by default. `--force`, `--all`, and
-`restart` call `reapOrphans`: system-wide `pkill -x daemon` (exact name), and
-`fuser -k <port>/tcp` which **SIGKILLs whichever process owns the port**.
-`--all` also runs `pkill -f` against release quantize binaries. Before using
-them, run `hipfire ps`, `curl -s http://127.0.0.1:<port>/health`, and confirm
-the port owner so you do not kill an unrelated daemon or listener.
+`restart` also stop this install's other daemons: PIDs from the pidfile and
+the GPU lock, each verified by command line (this install's daemon binary)
+and matching `HIPFIRE_HOME`, sent SIGTERM and then SIGKILL after 5 s. They no
+longer kill processes by name or by port; if something else still holds the
+port, the CLI prints `port N is still in use by a process that is not this
+install's hipfire; not killing it`. `--all` also runs `pkill -f` against
+release quantize binaries.
 
 Flags (also accepted by `restart`):
 
@@ -711,11 +713,10 @@ policy).
 ## Multi-process notes
 
 - One listener per bind; second serve on the same host/port exits.
-- Prefer plain `hipfire stop` when the pidfile is healthy. Reach for
-  `hipfire stop --force` / `restart` only after `hipfire ps` and `/health`
-  show a stuck orphan or port holder — those paths are destructive
-  (system-wide `pkill -x daemon` + `fuser -k` on the port). Avoid ad-hoc
-  `pkill` unless you know the exact process tree.
+- Prefer plain `hipfire stop` when the pidfile is healthy. `hipfire stop
+  --force` / `restart` also reap this install's untracked daemons, but never
+  another install's or a non-hipfire port holder. Avoid ad-hoc `pkill` unless
+  you know the exact process tree.
 - `hipfire chat` starts a tracked detached native service if none is healthy;
   stop it explicitly with `hipfire stop` when the session is done.
 

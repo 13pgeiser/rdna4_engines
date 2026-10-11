@@ -162,8 +162,8 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | `--kv-mode <m>` | KV mode preset for this process (same contract as `run`). |
 | `--kv-backend <legacy\|vmm>` | KV allocation backend (same as `run`; `contiguous` rejected → use `legacy`). |
 | `--kv-k <name>` / `--kv-v <name>` | Qwen-family K/V axis overrides (same as `run`). |
-| `--max-seq <n>` | KV context for every model this service loads (512–1048576); replaces the configured/automatic `memory.max_seq` (same contract as `run`). |
-| `--spec <m>` / `--speculation <m>` | Speculation mode for every model this service loads: `off` \| `auto` \| `ngram` \| `dflash` \| `mtp` \| `dspark`. Overrides `speculation.mode` and per-model speculation settings; `--spec off` turns MTP and DFlash off (plain AR), e.g. for an A/B. Unset: config (default `auto`). |
+| `--max-seq <n>` | KV context for every ordinary model load of this service (512–1048576); replaces the configured/automatic `memory.max_seq` (same contract as `run`). A multi-slot load keeps its per-slot context. Forwarded by `serve -d`. |
+| `--spec <m>` / `--speculation <m>` | Speculation mode for every model this service loads: `off` \| `auto` \| `ngram` \| `dflash` \| `mtp` \| `dspark` (other values fail at parse). Applied per load after the config selector, so it overrides `speculation.mode` and per-model speculation; `dflash` / `auto` also resolve the registry draft. `--spec off` turns MTP and DFlash off (plain AR), e.g. for an A/B. Unset: config (default `auto`). Forwarded by `serve -d`. |
 | `--idle-timeout <s>` | Unload after idle seconds (`0` = never; max `86400`). |
 | `--no-prewarm` | Lazy-load on first request. |
 | `--tp N` | Expert-parallel across N GPUs (supported MoE paths only; `1..64`). |
