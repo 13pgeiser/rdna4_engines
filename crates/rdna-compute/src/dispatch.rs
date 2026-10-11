@@ -361,6 +361,68 @@ const HOST_TAIL_PAD_BYTES: usize = 1024 * 1024;
 /// than uniformly applying FP8 everywhere.
 pub(crate) const FP8_GEMV_MIN_M: usize = 4096;
 
+/// Zero tail every exported weight allocation carries past its logical bytes.
+/// GEMV/attention kernels issue phantom header/vector reads beyond the exact
+/// tensor size; hipMalloc absorbed those in allocator slack, a device VMM
+/// mapping does not. Same rationale as [`HOST_TAIL_PAD_BYTES`], sized for VRAM.
+#[cfg(target_os = "linux")]
+pub const EXPORT_WEIGHT_TAIL_PAD_BYTES: usize = 64 * 1024;
+
+/// Extents of one shared weight allocation, as received by an importer.
+/// `physical_bytes` is the exporter's fully mapped, granularity-aligned size and
+/// must be at least `logical_bytes + EXPORT_WEIGHT_TAIL_PAD_BYTES`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedWeightAllocationDesc {
+    pub physical_bytes: usize,
+    pub logical_bytes: usize,
+    pub granularity: usize,
+}
+
+/// Result of [`Gpu::create_exportable_weight_copy`]: the registered read-only VMM
+/// owner, the POSIX FD of its single physical allocation, and the exact extents.
+#[cfg(target_os = "linux")]
+pub struct ExportedWeightAllocation {
+    pub owner: GpuTensor,
+    pub fd: std::os::fd::OwnedFd,
+    pub physical_bytes: usize,
+    pub logical_bytes: usize,
+    pub granularity: usize,
+}
+
+/// Pure extent check shared by export and import: positive sizes and granularity,
+/// aligned physical size, and `physical >= logical + EXPORT_WEIGHT_TAIL_PAD_BYTES`
+/// (checked add, so it also implies `logical <= physical`).
+#[cfg(target_os = "linux")]
+fn validate_weight_extents(
+    physical_bytes: usize,
+    logical_bytes: usize,
+    granularity: usize,
+) -> HipResult<()> {
+    let bad = |what: &str| {
+        Err(HipError::new(
+            0,
+            &format!(
+                "invalid weight allocation extents (physical {physical_bytes}, logical \
+                 {logical_bytes}, granularity {granularity}): {what}"
+            ),
+        ))
+    };
+    if physical_bytes == 0 || logical_bytes == 0 || granularity == 0 {
+        return bad("sizes and granularity must be positive");
+    }
+    if physical_bytes % granularity != 0 {
+        return bad("physical bytes are not granularity aligned");
+    }
+    match logical_bytes.checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES) {
+        None => bad("logical bytes plus tail pad overflows"),
+        Some(required) if physical_bytes < required => {
+            bad("physical bytes are smaller than logical bytes plus the tail pad")
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
@@ -4720,6 +4782,133 @@ impl Gpu {
         })
     }
 
+    /// Copy `source` (its logical/accessed `buf.size()` bytes, not shape*dtype) into
+    /// a new exportable single-allocation VMM owner and return it with a POSIX FD.
+    /// The allocation is `logical + EXPORT_WEIGHT_TAIL_PAD_BYTES` rounded up to the
+    /// arena granularity; the zeroed tail stands in for the hipMalloc slack that
+    /// kernels' phantom header/vector reads past the exact size rely on.
+    ///
+    /// The old `source` is untouched; the caller promotes aliases and then calls
+    /// [`Self::release_weight_source_immediate`]. The new owner is registered as a
+    /// `Raw [logical_bytes]` VMM owner and published read-only. Any failure after the
+    /// arena exists retires it through the orphan machinery; the FD closes on drop.
+    /// No pool retry: a map failure is returned as-is.
+    #[cfg(target_os = "linux")]
+    pub fn create_exportable_weight_copy(
+        &mut self,
+        source: &GpuTensor,
+    ) -> HipResult<ExportedWeightAllocation> {
+        self.bind_thread()?;
+        let logical = source.buf.size();
+        if source.buf.as_ptr().is_null() || logical == 0 {
+            return Err(HipError::new(
+                0,
+                "exportable weight copy needs a non-null, non-empty source",
+            ));
+        }
+        // Producer streams may still be writing the source.
+        self.hip.device_synchronize()?;
+        let reserve_bytes = logical.checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES).ok_or_else(|| {
+            HipError::new(0, "exportable weight size plus tail pad overflows")
+        })?;
+        let mut arena = VmmArena::reserve_exportable(&self.hip, self.device_id, reserve_bytes)?;
+        let fd = match self.fill_exportable_weight_arena(&mut arena, &source.buf, logical) {
+            Ok(fd) => fd,
+            Err(err) => return Err(self.retain_failed_vmm_arena(arena, err)),
+        };
+        let physical_bytes = arena.mapped_bytes();
+        let granularity = arena.granularity();
+        // On error the arena is retained by register_vmm_arena and `fd` drops.
+        let owner = self.register_vmm_arena(arena, logical, &[logical], DType::Raw)?;
+        Ok(ExportedWeightAllocation {
+            owner,
+            fd,
+            physical_bytes,
+            logical_bytes: logical,
+            granularity,
+        })
+    }
+
+    /// Map the single RW allocation, copy, zero the whole `[logical, physical)` tail
+    /// (at least [`EXPORT_WEIGHT_TAIL_PAD_BYTES`]), synchronize, publish read-only
+    /// and export the FD.
+    #[cfg(target_os = "linux")]
+    fn fill_exportable_weight_arena(
+        &self,
+        arena: &mut VmmArena,
+        source: &DeviceBuffer,
+        logical: usize,
+    ) -> HipResult<std::os::fd::OwnedFd> {
+        arena.map_next(&self.hip, arena.reserved_bytes(), &[])?;
+        let physical = arena.mapped_bytes();
+        validate_weight_extents(physical, logical, arena.granularity())?;
+        let dst = arena.buffer(logical)?;
+        self.hip.memcpy_dtod(&dst, source, logical)?;
+        let tail = physical - logical;
+        if tail > 0 {
+            // SAFETY: [base+logical, base+physical) lies inside the mapped RW arena.
+            let tail_view = unsafe {
+                DeviceBuffer::from_raw((arena.base_address() + logical) as *mut c_void, tail)
+            };
+            self.hip.memset(&tail_view, 0, tail)?;
+        }
+        self.hip.device_synchronize()?;
+        arena.publish_read_only(&self.hip)?;
+        arena.export_posix(&self.hip)
+    }
+
+    /// Import a shared weight allocation as a read-only `Raw [logical_bytes]` VMM owner.
+    ///
+    /// Extents are validated (pure, checked) before any HIP import. `fd` is borrowed
+    /// and left open. A granularity/size mismatch or registration failure retires the
+    /// imported arena through the orphan machinery.
+    #[cfg(target_os = "linux")]
+    pub fn import_weight_allocation(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        allocation: &ImportedWeightAllocationDesc,
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        validate_weight_extents(
+            allocation.physical_bytes,
+            allocation.logical_bytes,
+            allocation.granularity,
+        )?;
+        let arena =
+            VmmArena::import_posix(&self.hip, self.device_id, fd, allocation.physical_bytes)?;
+        if arena.granularity() != allocation.granularity
+            || arena.mapped_bytes() != allocation.physical_bytes
+        {
+            let err = HipError::new(
+                0,
+                &format!(
+                    "imported weight allocation mismatch: granularity {} vs {}, mapped {} vs {}",
+                    arena.granularity(),
+                    allocation.granularity,
+                    arena.mapped_bytes(),
+                    allocation.physical_bytes
+                ),
+            );
+            return Err(self.retain_failed_vmm_arena(arena, err));
+        }
+        let logical = allocation.logical_bytes;
+        let owner = self.register_vmm_arena(arena, logical, &[logical], DType::Raw)?;
+        if !owner.buf.is_vmm_owner() || owner.buf.size() != logical {
+            let err = HipError::new(
+                0,
+                &format!(
+                    "imported weight owner has {} bytes, expected {logical}",
+                    owner.buf.size()
+                ),
+            );
+            return Err(match self.free_tensor(owner) {
+                Ok(()) => err,
+                Err(cleanup) => HipError::new(0, &format!("{err}; cleanup also failed: {cleanup}")),
+            });
+        }
+        Ok(owner)
+    }
+
     /// Allocate a **host-mapped** tensor: system RAM the GPU reads directly over PCIe.
     ///
     /// This is the primitive partial GPU offload uses for spilled weights, and the
@@ -6194,6 +6383,38 @@ impl Gpu {
             self.hip.stream_synchronize(stream)?;
         }
         self.hip.free(tensor.buf)
+    }
+
+    /// Release the old hipMalloc owner of a weight that was promoted to a shared
+    /// VMM allocation, physically and immediately (never parked in the pool).
+    ///
+    /// Order is load-bearing: bind the thread, reject anything that is not a
+    /// `hipMalloc` owner, then synchronize the whole device (every stream, so no
+    /// producer kernel or async copy can still touch the source). A
+    /// synchronization error leaves `source` completely unchanged. Only after
+    /// the sync succeeds is the owner taken out of `source`, which is replaced by
+    /// an empty borrowed `Raw [0]` descriptor, and handed to the HIP free path.
+    ///
+    /// A HIP free error is terminal for the old owner: the descriptor is already
+    /// gone from `source` and there is no retry. The caller must treat the
+    /// weight host as `Failed` and never publish. [`Self::release_tensor_immediate`]
+    /// is unchanged.
+    pub fn release_weight_source_immediate(&mut self, source: &mut GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = source.buf.as_ptr() as usize;
+        if !source.buf.is_hip_allocation() {
+            return Err(HipError::new(
+                0,
+                &format!("refusing to release non-hipMalloc weight source at 0x{key:x}"),
+            ));
+        }
+        self.hip.device_synchronize()?;
+        // SAFETY: an empty (null, 0) borrowed descriptor never reaches HIP.
+        let empty = unsafe { DeviceBuffer::from_raw(std::ptr::null_mut(), 0) };
+        let owner = std::mem::replace(&mut source.buf, empty);
+        source.shape = vec![0];
+        source.dtype = DType::Raw;
+        self.hip.free(owner)
     }
 
     /// Host→device `upload_f32` calls since process start. A hot loop that
@@ -8254,5 +8475,364 @@ mod tests {
         })
         .expect_err("query errors must propagate");
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    // ---- S2 shared weight ownership -------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_accept_aligned_physical_with_tail_pad() {
+        let g = 4096usize;
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        let mib = 1usize << 20;
+        assert_eq!(p, 64 * 1024);
+        assert!(super::validate_weight_extents(p + g, 1, g).is_ok());
+        assert!(super::validate_weight_extents(p + g, g, g).is_ok(), "exact logical + pad");
+        assert!(super::validate_weight_extents(p + 2 * g, g + 1, g).is_ok());
+        assert!(super::validate_weight_extents(64 * mib + p, 64 * mib, g).is_ok());
+        assert!(super::validate_weight_extents(2 * p + g, 1, g).is_ok(), "not exact ceil");
+        assert!(super::validate_weight_extents(2 * mib, 1, 2 * mib).is_ok());
+        assert!(super::validate_weight_extents(66 * mib, 64 * mib, 2 * mib).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_reject_zero_values() {
+        let g = 4096usize;
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        assert!(super::validate_weight_extents(0, 1, g).is_err());
+        assert!(super::validate_weight_extents(p + g, 0, g).is_err());
+        assert!(super::validate_weight_extents(p + g, 1, 0).is_err());
+        assert!(super::validate_weight_extents(0, 0, 0).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_reject_physical_without_full_tail_pad() {
+        let g = 4096usize;
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        let mib = 1usize << 20;
+        assert!(super::validate_weight_extents(p, 1, g).is_err());
+        assert!(super::validate_weight_extents(p + g, g + 1, g).is_err());
+        assert!(super::validate_weight_extents(64 * mib, 64 * mib, g).is_err(), "no tail");
+        assert!(super::validate_weight_extents(g, g + 1, g).is_err(), "logical beyond physical");
+        assert!(super::validate_weight_extents(64 * mib, 64 * mib, 2 * mib).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_reject_unaligned_physical() {
+        let g = 4096usize;
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        assert!(super::validate_weight_extents(p + g + 1, 1, g).is_err());
+        assert!(super::validate_weight_extents(p + g - 1, 1, g).is_err());
+        assert!(super::validate_weight_extents(3 * (2usize << 20) + 4096, 1, 2usize << 20).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weight_extents_check_tail_pad_addition_overflow() {
+        let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
+        assert!(super::validate_weight_extents(usize::MAX, usize::MAX, 1).is_err());
+        assert!(super::validate_weight_extents(usize::MAX, usize::MAX - p + 1, 1).is_err());
+        assert!(super::validate_weight_extents(usize::MAX, usize::MAX - p, 1).is_ok());
+        assert!(super::validate_weight_extents(usize::MAX, usize::MAX - p, 2).is_err());
+        let half = 1usize << (usize::BITS - 1);
+        assert!(super::validate_weight_extents(half, half, half).is_err());
+        assert!(super::validate_weight_extents(half, half - p, half).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn s2_pattern(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i.wrapping_mul(0x9E37_79B1) >> 13) ^ (i >> 7) ^ (i >> 21)) as u8)
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn s2_read(gpu: &super::Gpu, buf: &hip_bridge::DeviceBuffer, off: usize, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        gpu.hip
+            .memcpy_dtoh_at(&mut out, buf, off)
+            .expect("bridge readback");
+        out
+    }
+
+    /// Every logical byte of `owner` equals the deterministic pattern.
+    #[cfg(target_os = "linux")]
+    fn s2_check_pattern(gpu: &super::Gpu, owner: &super::GpuTensor, logical: usize) {
+        let pattern = s2_pattern(logical);
+        let chunk = 4usize << 20;
+        let mut off = 0;
+        while off < logical {
+            let n = chunk.min(logical - off);
+            let got = s2_read(gpu, &owner.buf, off, n);
+            if let Some(i) = (0..n).find(|&i| got[i] != pattern[off + i]) {
+                panic!("byte {} differs: got {} want {}", off + i, got[i], pattern[off + i]);
+            }
+            off += n;
+        }
+    }
+
+    /// Padding in `[logical, physical)` reads back zero.
+    #[cfg(target_os = "linux")]
+    fn s2_check_tail_zero(gpu: &super::Gpu, owner: &super::GpuTensor, logical: usize, physical: usize) {
+        let tail = physical - logical;
+        if tail == 0 {
+            return;
+        }
+        // SAFETY: [base+logical, base+physical) is inside the published mapping.
+        let view = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                (owner.buf.as_ptr() as usize + logical) as *mut std::ffi::c_void,
+                tail,
+            )
+        };
+        let got = s2_read(gpu, &view, 0, tail);
+        assert!(got.iter().all(|&b| b == 0), "padding tail is not zero");
+    }
+
+    /// Real VMM owner: Raw `[logical]`, registered, read-only, owner access = read.
+    #[cfg(target_os = "linux")]
+    fn s2_assert_owner(gpu: &super::Gpu, owner: &super::GpuTensor, logical: usize) {
+        assert!(owner.buf.is_vmm_owner());
+        assert_eq!(owner.dtype, super::DType::Raw);
+        assert_eq!(owner.shape, vec![logical]);
+        assert_eq!(owner.buf.size(), logical);
+        let arena = gpu
+            .vmm_arenas
+            .get(&(owner.buf.as_ptr() as usize))
+            .expect("owner registered");
+        assert!(arena.is_read_only());
+        assert_eq!(arena.owner_access_flags(&gpu.hip).expect("access flags"), 1);
+    }
+
+    /// Freeing a borrowed view of a registered owner is refused and leaves the
+    /// registration (and the orphan table) untouched.
+    #[cfg(target_os = "linux")]
+    fn s2_assert_borrowed_free_rejected(gpu: &mut super::Gpu, owner: &super::GpuTensor, logical: usize) {
+        let key = owner.buf.as_ptr() as usize;
+        let before = (gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len());
+        let view = || super::GpuTensor {
+            // SAFETY: non-owning alias of a live owner; only passed to a free that must refuse.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(owner.buf.as_ptr(), logical) },
+            shape: vec![logical],
+            dtype: super::DType::Raw,
+        };
+        let err = gpu.free_tensor(view()).expect_err("borrowed free must fail");
+        assert!(err.to_string().contains("borrowed VMM view"), "{err}");
+        let err = gpu
+            .release_tensor_immediate(view())
+            .expect_err("immediate borrowed free must fail");
+        assert!(err.to_string().contains("borrowed VMM view"), "{err}");
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), before);
+        assert!(gpu.vmm_arenas.contains_key(&key));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn s2_vram_used() -> i64 {
+        std::fs::read_to_string("/sys/bus/pci/devices/0000:13:00.0/mem_info_vram_used")
+            .expect("read mem_info_vram_used")
+            .trim()
+            .parse()
+            .expect("parse mem_info_vram_used")
+    }
+
+    #[cfg(target_os = "linux")]
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    #[cfg(target_os = "linux")]
+    const S2_F_GETFD: i32 = 1;
+    #[cfg(target_os = "linux")]
+    const S2_F_SETFD: i32 = 2;
+    #[cfg(target_os = "linux")]
+    const S2_FD_CLOEXEC: i32 = 1;
+
+    /// Nonaligned source: the rounded padding tail is zeroed and logical bytes match.
+    #[cfg(target_os = "linux")]
+    fn s2_small_nonaligned_case(gpu: &mut super::Gpu) {
+        let logical = (3usize << 20) + 12_345;
+        let pattern = s2_pattern(logical);
+        let mut src = gpu.upload_raw(&pattern, &[logical]).expect("upload small source");
+        let exp = gpu.create_exportable_weight_copy(&src).expect("export small");
+        assert_eq!(exp.logical_bytes, logical);
+        assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
+        assert_eq!(
+            exp.physical_bytes,
+            (logical + super::EXPORT_WEIGHT_TAIL_PAD_BYTES).next_multiple_of(exp.granularity)
+        );
+        s2_assert_owner(gpu, &exp.owner, logical);
+        s2_check_pattern(gpu, &exp.owner, logical);
+        s2_check_tail_zero(gpu, &exp.owner, logical, exp.physical_bytes);
+        gpu.release_weight_source_immediate(&mut src).expect("release small source");
+        let super::ExportedWeightAllocation { owner, fd, .. } = exp;
+        gpu.free_tensor(owner).expect("free small owner");
+        drop(fd);
+        gpu.ensure_vmm_cleaned().expect("clean after small case");
+    }
+
+    /// Child role: import the inherited FD, verify, free, clean.
+    #[cfg(target_os = "linux")]
+    fn s2_importer(gpu: &mut super::Gpu) {
+        use std::os::fd::{AsFd, FromRawFd};
+        let env = |k: &str| -> usize {
+            std::env::var(k)
+                .unwrap_or_else(|_| panic!("{k} unset"))
+                .parse()
+                .unwrap_or_else(|_| panic!("{k} not an integer"))
+        };
+        let raw_fd = env("HIPFIRE_S2_IMPORT_FD") as i32;
+        eprintln!("S2_IMPORTER pid={} fd={raw_fd}", std::process::id());
+        let desc = super::ImportedWeightAllocationDesc {
+            physical_bytes: env("HIPFIRE_S2_PHYSICAL_BYTES"),
+            logical_bytes: env("HIPFIRE_S2_LOGICAL_BYTES"),
+            granularity: env("HIPFIRE_S2_GRANULARITY"),
+        };
+        // SAFETY: the exporter's pre_exec cleared CLOEXEC on this inherited FD, which
+        // nothing else in this process owns; this OwnedFd closes it.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+        let vram_before = s2_vram_used();
+        let owner = gpu
+            .import_weight_allocation(fd.as_fd(), &desc)
+            .expect("import weight allocation");
+        let vram_imported = s2_vram_used();
+        s2_assert_owner(gpu, &owner, desc.logical_bytes);
+        s2_check_pattern(gpu, &owner, desc.logical_bytes);
+        s2_assert_borrowed_free_rejected(gpu, &owner, desc.logical_bytes);
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (1, 0));
+        gpu.free_tensor(owner).expect("free imported owner");
+        drop(fd);
+        eprintln!(
+            "S2_IMPORTER pid={} vram_used before_import={vram_before} after_import={vram_imported} after_free={}",
+            std::process::id(),
+            s2_vram_used()
+        );
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (0, 0));
+        gpu.ensure_vmm_cleaned().expect("importer clean");
+        println!(
+            "S2_IMPORTER_OK logical={} physical={} granularity={}",
+            desc.logical_bytes, desc.physical_bytes, desc.granularity
+        );
+    }
+
+    /// Cross-process shared weight ownership on real hardware (gfx1201, Linux).
+    ///
+    /// Run exactly (exporter role; it re-execs this binary as the importer, which
+    /// is selected by `HIPFIRE_S2_IMPORT_FD`):
+    /// `cargo test --release -p rdna-compute --lib -- --ignored --exact
+    ///  dispatch::tests::shared_weight_owner_cross_process --nocapture`
+    ///
+    /// Raw FD inheritance through a child-only `pre_exec` is test-only; production
+    /// transfers FDs with SCM_RIGHTS (S1). GPU init failure fails the test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs an idle gfx1201 at 0000:13:00.0 under the approved experiment lock"]
+    fn shared_weight_owner_cross_process() {
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::process::CommandExt;
+
+        let _guard = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut gpu = super::Gpu::init().expect("GPU initialization must succeed");
+        assert_eq!(gpu.arch, "gfx1201", "test is gated to gfx1201");
+        if std::env::var("HIPFIRE_S2_IMPORT_FD").is_ok() {
+            s2_importer(&mut gpu);
+            return;
+        }
+
+        s2_small_nonaligned_case(&mut gpu);
+
+        let logical = 64usize << 20;
+        let mut src = gpu.upload_raw(&s2_pattern(logical), &[logical]).expect("upload source");
+        let exp = gpu.create_exportable_weight_copy(&src).expect("create exportable copy");
+        assert_eq!(exp.logical_bytes, logical);
+        assert_eq!(exp.granularity, 4096, "weight arenas use the minimum granularity");
+        assert_eq!(exp.physical_bytes, logical + super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
+        assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
+        eprintln!(
+            "S2_EXPORTER pid={} logical={} physical={} granularity={} vram_used={}",
+            std::process::id(),
+            exp.logical_bytes,
+            exp.physical_bytes,
+            exp.granularity,
+            s2_vram_used()
+        );
+        s2_assert_owner(&gpu, &exp.owner, logical);
+        s2_check_pattern(&gpu, &exp.owner, logical);
+        s2_check_tail_zero(&gpu, &exp.owner, logical, exp.physical_bytes);
+        s2_assert_borrowed_free_rejected(&mut gpu, &exp.owner, logical);
+
+        // A descriptor failing pure validation must be refused before any HIP import.
+        let arenas = (gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len());
+        // No tail pad: refused by pure validation before any HIP import.
+        let bad = super::ImportedWeightAllocationDesc {
+            physical_bytes: logical,
+            logical_bytes: logical,
+            granularity: exp.granularity,
+        };
+        gpu.import_weight_allocation(exp.fd.as_fd(), &bad)
+            .err()
+            .expect("physical without tail pad must be rejected");
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), arenas);
+
+        // Old hipMalloc owner is physically released, not parked.
+        let before = s2_vram_used();
+        gpu.release_weight_source_immediate(&mut src).expect("release old owner");
+        assert!(src.buf.is_borrowed() && src.buf.size() == 0 && src.shape == vec![0]);
+        gpu.release_weight_source_immediate(&mut src)
+            .expect_err("emptied source is not a hipMalloc owner");
+        // One fixed settle for driver accounting after the synchronized HIP free; no polling.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let after = s2_vram_used();
+        println!(
+            "S2_VRAM_USED before_release={before} after_release={after} drop={}",
+            before - after
+        );
+        assert!(
+            before - after >= logical as i64,
+            "old owner release must return >= 64 MiB (before {before}, after {after})"
+        );
+        s2_check_pattern(&gpu, &exp.owner, logical);
+
+        // Child-only FD inheritance; the exporter's own FD stays CLOEXEC.
+        let raw = exp.fd.as_raw_fd();
+        // SAFETY: F_GETFD on an FD this process owns.
+        let flags = unsafe { fcntl(raw, S2_F_GETFD) };
+        assert!(flags >= 0 && flags & S2_FD_CLOEXEC != 0, "exported FD must be CLOEXEC");
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([
+            "--exact",
+            "dispatch::tests::shared_weight_owner_cross_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("HIPFIRE_S2_IMPORT_FD", raw.to_string())
+        .env("HIPFIRE_S2_PHYSICAL_BYTES", exp.physical_bytes.to_string())
+        .env("HIPFIRE_S2_LOGICAL_BYTES", exp.logical_bytes.to_string())
+        .env("HIPFIRE_S2_GRANULARITY", exp.granularity.to_string());
+        // SAFETY: runs in the forked child before exec; only async-signal-safe fcntl.
+        unsafe {
+            cmd.pre_exec(move || {
+                if fcntl(raw, S2_F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let status = cmd.status().expect("spawn importer");
+        assert!(status.success(), "importer failed: {status:?}");
+        // SAFETY: as above; the child's pre_exec cannot change the parent's descriptor flags.
+        let flags = unsafe { fcntl(raw, S2_F_GETFD) };
+        assert!(flags >= 0 && flags & S2_FD_CLOEXEC != 0, "exporter FD lost CLOEXEC");
+
+        let super::ExportedWeightAllocation { owner, fd, .. } = exp;
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (1, 0));
+        gpu.free_tensor(owner).expect("free exported owner");
+        drop(fd);
+        assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (0, 0));
+        gpu.ensure_vmm_cleaned().expect("exporter clean");
     }
 }
