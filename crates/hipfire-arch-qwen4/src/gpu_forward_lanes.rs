@@ -411,6 +411,13 @@ fn group_segments(rows: &[usize]) -> Vec<Segment> {
     groups
 }
 
+/// The once-over-all-rows groups a step of decode lanes with these per-lane
+/// row counts runs ([`StageShare::OnceAllRows`] stages launch once per
+/// group).
+pub(crate) fn row_group_count(rows: &[usize]) -> usize {
+    group_segments(rows).len()
+}
+
 /// The row views one segment's operations bind: every row-indexed scratch
 /// tensor offset to the segment's first row, extending to the end of its
 /// allocation (exactly what a singleton forward of these rows sees from row

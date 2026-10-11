@@ -52,142 +52,139 @@ use rdna_compute::{Gpu, GpuTensor};
 // Lane cost model
 // ---------------------------------------------------------------------------
 
-/// Prior `α` (µs, the pure-AR cost of a step) for 1..=8 decoding lanes
-/// (measured, gfx1151; `fn-batch/S5-CONTRACT.md`, lane floor).
-const COST_ALPHA_PRIOR_US: [f64; 8] = [
-    30_240.0, 43_180.0, 54_080.0, 64_980.0, 79_700.0, 94_430.0, 109_160.0, 123_890.0,
-];
-/// Prior growth of `α` per lane above 8.
-const COST_ALPHA_STEP_US: f64 = 15_490.0;
-/// Prior `m` (µs): the marginal cost of one verified draft row.
-const COST_M_PRIOR_US: f64 = 14_700.0;
+/// Prior `[F, a, r, G]` (µs): the fixed cost of a step, the cost per
+/// decoding lane, per verified draft row, and per row-group spill. From the
+/// C2 and C8 serve step traces on gfx1151 (PM rows on): 8 AR lanes 91.7 ms
+/// median, 8 lanes with one 2.7-draft window 137.4 ms, 2 lanes going from
+/// one to two windows +17.2 ms; it reproduces 8 lanes all drafting (295.5 ms)
+/// and 7 (269.8 ms).
+const COST_PRIOR_US: [f64; 4] = [16_900.0, 9_700.0, 8_200.0, 18_500.0];
+/// Weight of the ridge prior (never decays), in typical observations.
+const COST_PRIOR_WEIGHT: f64 = 8.0;
+/// Per-parameter scale of the prior's weight: the squared typical regressor
+/// (`C` about 8, `e` about 3 per window, `s` about 1), so each parameter's
+/// prior counts about [`COST_PRIOR_WEIGHT`] observations.
+const COST_PRIOR_SCALE: [f64; 4] = [1.0, 64.0, 9.0, 1.0];
 /// Weight kept per later observation.
-const COST_DECAY: f64 = 0.95;
-/// The prior's second pseudo-observation sits at this many verified drafts
-/// (the first at zero).
-const COST_PRIOR_ROWS: f64 = 4.0;
-/// `α` never fits below this.
+const COST_DECAY: f64 = 0.99;
+/// `α(C)` never fits below this.
 const COST_ALPHA_FLOOR_US: f64 = 1_000.0;
 
-fn alpha_prior(lanes: usize) -> f64 {
-    match lanes {
-        0 | 1 => COST_ALPHA_PRIOR_US[0],
-        2..=8 => COST_ALPHA_PRIOR_US[lanes - 1],
-        _ => COST_ALPHA_PRIOR_US[7] + COST_ALPHA_STEP_US * (lanes - 8) as f64,
-    }
-}
-
-/// Decayed sums of `(1, e, e², W, e·W)` over the observations of one lane
-/// count.
-#[derive(Clone, Copy, Debug)]
-struct Moments {
-    w: f64,
-    e: f64,
-    ee: f64,
-    y: f64,
-    ey: f64,
-}
-
-impl Moments {
-    fn empty() -> Self {
-        Self {
-            w: 0.0,
-            e: 0.0,
-            ee: 0.0,
-            y: 0.0,
-            ey: 0.0,
-        }
-    }
-
-    /// The prior as two pseudo-observations: `W = α` at `e = 0` and
-    /// `W = α + 4m` at `e = 4`, weight one each.
-    fn prior(lanes: usize) -> Self {
-        let alpha = alpha_prior(lanes);
-        let mut moments = Self::empty();
-        moments.add(0.0, alpha);
-        moments.add(COST_PRIOR_ROWS, alpha + COST_PRIOR_ROWS * COST_M_PRIOR_US);
-        moments
-    }
-
-    fn add(&mut self, e: f64, y: f64) {
-        self.w += 1.0;
-        self.e += e;
-        self.ee += e * e;
-        self.y += y;
-        self.ey += e * y;
-    }
-
-    /// One more observation: everything seen so far decays first.
-    fn observe(&mut self, e: f64, y: f64) {
-        self.w *= COST_DECAY;
-        self.e *= COST_DECAY;
-        self.ee *= COST_DECAY;
-        self.y *= COST_DECAY;
-        self.ey *= COST_DECAY;
-        self.add(e, y);
-    }
-
-    /// Least-squares `(α, m)` of `W = α + m·e`: `m ≥ 0`, then `α ≥ 1000`,
-    /// then `m ≤ 4α`. All verified counts equal (no spread) keeps the prior
-    /// `m`.
-    fn fit(&self) -> (f64, f64) {
-        let det = self.w * self.ee - self.e * self.e;
-        let mut m = if det > 1e-9 * self.w * self.ee {
-            (self.w * self.ey - self.e * self.y) / det
-        } else {
-            COST_M_PRIOR_US
-        };
-        m = m.max(0.0);
-        let alpha = ((self.y - m * self.e) / self.w).max(COST_ALPHA_FLOOR_US);
-        (alpha, m.min(4.0 * alpha))
-    }
-}
-
-/// Store-level model of a pure-decode step's wall time: per decoding-lane
-/// count `C`, a decayed regression `W = α_C + m_C · e` of the step wall `W`
-/// (µs, draft start to accept end, synced) on `e`, the verified drafts the
-/// step carries. A lane's AR row costs its proportional share `a = α_C / C`
-/// (the unit of every lane floor); a depth-`d` window costs
-/// `1 + d · m_C / a` units.
+/// Store-level model of a pure-decode step's wall time `W` (µs, draft start
+/// to accept end, synced):
+///
+/// `W = F + a·C + r·e + G·s`
+///
+/// with `C` the decoding lanes of the step (AR and Verify), `e` its verified
+/// drafts (the sum of the `draft_len`s) and `s` its spill: the row groups of
+/// its decode lanes (`gpu_forward_lanes::row_group_count`) beyond the first.
+/// One fit is pooled over every lane count: decayed sufficient statistics
+/// `Σ λⁿ x xᵀ` and `Σ λⁿ x W` of `x = [1, C, e, s]`, plus a constant ridge
+/// prior [`COST_PRIOR_US`] (weight `P = 8 · diag(1, 64, 9, 1)`, never
+/// decaying), solved as `(XᵀX + P) θ = XᵀW + P θ₀`; then `a, r, G ≥ 0`.
+///
+/// A lane's AR row costs its proportional share `α(C) / C` of the AR step
+/// `α(C) = F + a·C` (floored): the unit of every lane floor. A Batched
+/// window of `d` verified drafts that carries `share` of the step's spill
+/// costs `1 + (r·d + G·share) / (α(C) / C)` units.
+///
+/// The cost a Verify window adds depends on `C` through the row groups: the
+/// once-over-all-rows stages run in groups of at most `LANE_MAX_ROWS` rows,
+/// and eight lanes plus one window overflow the first group. The C2 trace
+/// (no spill) fits 0.76 ms per window, the C8 trace 14.6 ms. The
+/// per-lane-count fit `W = α_C + m_C·e` this replaced could not see that: at
+/// C8 every lane drafts, so `e` barely varies and `α_8` and `m_8` traded off
+/// (`window_units(8, 3)` swung 1.16–5.42 on the C8 trace, and lanes kept or
+/// retired MTP by chance). With the priors a 3-draft window prices at about
+/// `1 + (24.6 + 18.5·share) / 11.8` units at C8, so AR wins, while at C2 (no
+/// spill) it prices at about 2.4 units for about 3.1 tokens.
 #[derive(Clone, Debug)]
 pub(crate) struct LaneCostModel {
-    per_lanes: Vec<Moments>,
+    xtx: [[f64; 4]; 4],
+    xty: [f64; 4],
 }
 
 impl LaneCostModel {
-    pub(crate) fn new(max_lanes: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            per_lanes: (1..=max_lanes.max(1)).map(Moments::prior).collect(),
+            xtx: [[0.0; 4]; 4],
+            xty: [0.0; 4],
         }
     }
 
-    fn index(&self, lanes: usize) -> usize {
-        lanes.clamp(1, self.per_lanes.len()) - 1
-    }
-
-    /// One finished pure-decode step of `lanes` decoding lanes carrying
-    /// `verified` drafts in all, `wall_us` long. An unusable wall is dropped.
-    pub(crate) fn observe(&mut self, lanes: usize, verified: usize, wall_us: f32) {
+    /// One finished pure-decode step of `lanes` decoding lanes, `spill` row
+    /// groups beyond the first and `verified` verified drafts in all,
+    /// `wall_us` long. An unusable wall is dropped.
+    pub(crate) fn observe(&mut self, lanes: usize, spill: usize, verified: usize, wall_us: f32) {
         if !(wall_us.is_finite() && wall_us > 0.0) {
             return;
         }
-        let index = self.index(lanes);
-        self.per_lanes[index].observe(verified as f64, f64::from(wall_us));
+        let x = [1.0, lanes as f64, verified as f64, spill as f64];
+        let y = f64::from(wall_us);
+        for i in 0..4 {
+            self.xty[i] = self.xty[i] * COST_DECAY + x[i] * y;
+            for j in 0..4 {
+                self.xtx[i][j] = self.xtx[i][j] * COST_DECAY + x[i] * x[j];
+            }
+        }
     }
 
-    /// `(α_C, m_C)` in µs.
+    /// The ridge fit `[F, a, r, G]` (µs), `a, r, G` clamped at zero.
+    fn solve(&self) -> [f64; 4] {
+        // Augmented `[XᵀX + P | XᵀW + P θ₀]`, eliminated with partial
+        // pivoting; the matrix is symmetric positive definite.
+        let mut m = [[0.0f64; 5]; 4];
+        for i in 0..4 {
+            let prior = COST_PRIOR_WEIGHT * COST_PRIOR_SCALE[i];
+            m[i][..4].copy_from_slice(&self.xtx[i]);
+            m[i][i] += prior;
+            m[i][4] = self.xty[i] + prior * COST_PRIOR_US[i];
+        }
+        for col in 0..4 {
+            let pivot = (col..4)
+                .max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))
+                .unwrap_or(col);
+            m.swap(col, pivot);
+            for row in col + 1..4 {
+                let factor = m[row][col] / m[col][col];
+                for k in col..5 {
+                    m[row][k] -= factor * m[col][k];
+                }
+            }
+        }
+        let mut theta = [0.0f64; 4];
+        for i in (0..4).rev() {
+            let tail: f64 = (i + 1..4).map(|j| m[i][j] * theta[j]).sum();
+            theta[i] = (m[i][4] - tail) / m[i][i];
+        }
+        if theta.iter().any(|t| !t.is_finite()) {
+            theta = COST_PRIOR_US;
+        }
+        for t in &mut theta[1..] {
+            *t = t.max(0.0);
+        }
+        theta
+    }
+
+    /// The clamped `(F, a, r, G)` in µs.
     #[cfg(test)]
-    pub(crate) fn fit(&self, lanes: usize) -> (f32, f32) {
-        let (alpha, m) = self.per_lanes[self.index(lanes)].fit();
-        (alpha as f32, m as f32)
+    pub(crate) fn fit(&self) -> (f64, f64, f64, f64) {
+        let [f, a, r, g] = self.solve();
+        (f, a, r, g)
     }
 
-    /// Cost of a window with `drafts` verified drafts in a step of `lanes`
-    /// decoding lanes, in AR-row units (`1 + d · m / (α / C)`).
-    pub(crate) fn window_units(&self, lanes: usize, drafts: usize) -> f32 {
-        let (alpha, m) = self.per_lanes[self.index(lanes)].fit();
+    /// Cost of a window with `drafts` verified drafts carrying `spill_share`
+    /// of its step's spill, in a step of `lanes` decoding lanes, in AR-row
+    /// units: `1 + (r·d + G·share) / (α(C) / C)`, and exactly `1` without
+    /// drafts.
+    pub(crate) fn window_units(&self, lanes: usize, drafts: usize, spill_share: f64) -> f32 {
+        if drafts == 0 {
+            return 1.0;
+        }
+        let [f, a, r, g] = self.solve();
+        let alpha = (f + a * lanes as f64).max(COST_ALPHA_FLOOR_US);
         let share = alpha / lanes.max(1) as f64;
-        (1.0 + drafts as f64 * m / share) as f32
+        (1.0 + (r * drafts as f64 + g * spill_share) / share) as f32
     }
 }
 
@@ -843,100 +840,165 @@ mod tests {
         }
     }
 
-    /// Feed `observations` `(lanes, e, W)` `rounds` times.
-    fn feed(model: &mut LaneCostModel, lanes: usize, alpha: f64, m: f64, rounds: usize) {
-        for round in 0..rounds {
-            let e = round % 6;
-            model.observe(lanes, e, (alpha + m * e as f64) as f32);
+    /// A deterministic spread of pure-decode step shapes `(C, e, s)`:
+    /// `C` in `1..=8`, `e` in `0..=3C`, `s` in `0..=3`.
+    fn step_shape(k: usize) -> (usize, usize, usize) {
+        let lanes = 1 + (k * 5) % 8;
+        let verified = (k * 7 + k / 3) % (3 * lanes + 1);
+        let spill = (k * 3 + k / 5) % 4;
+        (lanes, verified, spill)
+    }
+
+    /// The noise-free wall `F + a·C + r·e + G·s` of a `[F, a, r, G]` truth.
+    fn truth_wall(truth: [f64; 4], (lanes, verified, spill): (usize, usize, usize)) -> f64 {
+        truth[0] + truth[1] * lanes as f64 + truth[2] * verified as f64 + truth[3] * spill as f64
+    }
+
+    /// Feed `steps` steps of `truth`, starting at shape index `from`.
+    fn feed(model: &mut LaneCostModel, truth: [f64; 4], from: usize, steps: usize) {
+        for k in from..from + steps {
+            let shape = step_shape(k);
+            model.observe(shape.0, shape.2, shape.1, truth_wall(truth, shape) as f32);
         }
+    }
+
+    fn fit_array(model: &LaneCostModel) -> [f64; 4] {
+        let (f, a, r, g) = model.fit();
+        [f, a, r, g]
+    }
+
+    /// Worst relative error of the fit's predicted wall against `truth`
+    /// over the held-out step shapes `from..from + steps`.
+    fn worst_wall_error(model: &LaneCostModel, truth: [f64; 4], from: usize, steps: usize) -> f64 {
+        let fit = fit_array(model);
+        (from..from + steps)
+            .map(|k| {
+                let shape = step_shape(k);
+                (truth_wall(fit, shape) / truth_wall(truth, shape) - 1.0).abs()
+            })
+            .fold(0.0, f64::max)
     }
 
     #[test]
     fn a_fresh_model_reproduces_its_priors() {
-        let model = LaneCostModel::new(12);
-        for (lanes, alpha) in [(1, 30_240.0), (2, 43_180.0), (8, 123_890.0), (9, 139_380.0), (12, 185_850.0)] {
-            let (a, m) = model.fit(lanes);
-            assert!((f64::from(a) - alpha).abs() < alpha * 1e-4, "alpha {lanes}: {a}");
-            assert!((m - 14_700.0).abs() < 14_700.0 * 1e-4, "m {lanes}: {m}");
+        let model = LaneCostModel::new();
+        let fit = fit_array(&model);
+        for (got, want) in fit.iter().zip(COST_PRIOR_US) {
+            assert!((got - want).abs() < want * 1e-9, "{fit:?} vs {COST_PRIOR_US:?}");
         }
-        // A window of d drafts costs 1 + d m C / alpha units.
-        let units = model.window_units(2, 3);
-        let want = 1.0 + 3.0 * 14_700.0 / (43_180.0 / 2.0);
-        assert!((f64::from(units) - want).abs() < 1e-3, "{units} vs {want}");
-        assert!((model.window_units(4, 0) - 1.0).abs() < 1e-6);
+        // A window of d drafts costs 1 + (r d + G share) / (alpha(C) / C).
+        let units = model.window_units(8, 3, 0.375);
+        let want = 1.0 + (3.0 * 8_200.0 + 18_500.0 * 0.375) / ((16_900.0 + 8.0 * 9_700.0) / 8.0);
+        assert!((f64::from(units) - want).abs() < 1e-4, "{units} vs {want}");
     }
 
     #[test]
-    fn regression_recovers_alpha_and_m_from_synthetic_steps() {
-        let mut model = LaneCostModel::new(8);
-        feed(&mut model, 3, 52_000.0, 9_000.0, 400);
-        let (alpha, m) = model.fit(3);
-        assert!((f64::from(alpha) - 52_000.0).abs() < 520.0, "alpha {alpha}");
-        assert!((f64::from(m) - 9_000.0).abs() < 90.0, "m {m}");
-        // Other lane counts keep their priors.
-        let (alpha4, m4) = model.fit(4);
-        assert!((f64::from(alpha4) - 64_980.0).abs() < 10.0);
-        assert!((f64::from(m4) - 14_700.0).abs() < 10.0);
-        // Units follow the fit: share a = alpha / C.
-        let units = model.window_units(3, 2);
-        let want = 1.0 + 2.0 * 9_000.0 / (52_000.0 / 3.0);
-        assert!((f64::from(units) - want).abs() < 0.02, "{units} vs {want}");
+    fn the_priors_keep_mtp_at_c2_and_retire_it_at_c8() {
+        // A 3-draft window earns about 3.1 tokens. At C2 (no spill) it
+        // costs less than that in AR rows; at C8 (one window spills a row
+        // group over eight lanes) it costs more.
+        let model = LaneCostModel::new();
+        let c2 = model.window_units(2, 3, 0.0);
+        let c8 = model.window_units(8, 3, 0.375);
+        assert!(c2 < 3.1, "C2 window {c2}");
+        assert!(c8 > 3.1, "C8 window {c8}");
+    }
+
+    #[test]
+    fn regression_recovers_the_pooled_model_from_synthetic_steps() {
+        // The ridge prior (a constant eight observations' weight) keeps the
+        // fit from reaching a truth far from it exactly: after 400 steps
+        // (about 100 effective under the decay) it lands within 15% of each
+        // parameter, well inside the prior's own distance, and predicts
+        // held-out walls within 10%.
+        let truth = [24_000.0, 12_000.0, 6_000.0, 25_000.0];
+        let mut model = LaneCostModel::new();
+        feed(&mut model, truth, 0, 400);
+        let fit = fit_array(&model);
+        for i in 0..4 {
+            let err = (fit[i] / truth[i] - 1.0).abs();
+            let prior_err = (COST_PRIOR_US[i] / truth[i] - 1.0).abs();
+            assert!(err < 0.15, "param {i}: {fit:?} vs {truth:?}");
+            assert!(err < 0.6 * prior_err, "param {i} barely left the prior: {fit:?}");
+        }
+        let wall_err = worst_wall_error(&model, truth, 400, 200);
+        assert!(wall_err < 0.10, "held-out wall error {wall_err}");
+        // Units follow the fit: share a = alpha(C) / C.
+        let units = f64::from(model.window_units(8, 3, 0.5));
+        let want = 1.0 + (3.0 * truth[2] + 0.5 * truth[3]) / ((truth[0] + 8.0 * truth[1]) / 8.0);
+        assert!((units / want - 1.0).abs() < 0.15, "{units} vs {want}");
     }
 
     #[test]
     fn the_fit_tracks_a_drifting_cost_through_the_decay() {
-        let mut model = LaneCostModel::new(2);
-        feed(&mut model, 1, 30_000.0, 14_000.0, 200);
-        feed(&mut model, 1, 45_000.0, 6_000.0, 300);
-        let (alpha, m) = model.fit(1);
-        assert!((f64::from(alpha) - 45_000.0).abs() < 450.0, "alpha {alpha}");
-        assert!((f64::from(m) - 6_000.0).abs() < 60.0, "m {m}");
+        let before = [24_000.0, 12_000.0, 6_000.0, 25_000.0];
+        let after = [30_000.0, 7_000.0, 4_000.0, 12_000.0];
+        let mut model = LaneCostModel::new();
+        feed(&mut model, before, 0, 400);
+        feed(&mut model, after, 400, 400);
+        let to_after = worst_wall_error(&model, after, 800, 200);
+        let to_before = worst_wall_error(&model, before, 800, 200);
+        assert!(to_after < 0.20, "wall error against the new truth {to_after}");
+        assert!(
+            to_after < 0.5 * to_before,
+            "fit still follows the old truth: {to_after} vs {to_before}"
+        );
     }
 
     #[test]
     fn the_fit_respects_the_clamps() {
-        // W falls with e: the slope clamps at zero, alpha is the mean.
-        let mut model = LaneCostModel::new(2);
-        for round in 0..300 {
-            let e = round % 6;
-            model.observe(2, e, (60_000.0 - 5_000.0 * e as f64) as f32);
-        }
-        let (alpha, m) = model.fit(2);
-        assert_eq!(m, 0.0);
-        assert!(alpha >= 1_000.0 && alpha < 60_000.0, "alpha {alpha}");
-        // A near-zero wall cannot take alpha below the floor.
-        let mut tiny = LaneCostModel::new(1);
-        for round in 0..400 {
-            tiny.observe(1, round % 6, 10.0);
-        }
-        let (alpha, m) = tiny.fit(1);
-        assert_eq!(alpha, 1_000.0);
-        assert!(m <= 4.0 * alpha + 1e-3, "m {m} above 4 alpha");
-        // A steep slope clamps at 4 alpha.
-        let mut steep = LaneCostModel::new(1);
-        for round in 0..400 {
-            let e = round % 6;
-            steep.observe(1, e, (2_000.0 + 40_000.0 * e as f64) as f32);
-        }
-        let (alpha, m) = steep.fit(1);
-        assert!(m <= 4.0 * alpha + 1e-3, "m {m} alpha {alpha}");
+        // A truth with a negative per-draft cost fits r = 0 (the unclamped
+        // solution is negative), and the other parameters stay usable.
+        let mut model = LaneCostModel::new();
+        feed(&mut model, [24_000.0, 12_000.0, -2_500.0, 25_000.0], 0, 400);
+        let (f, a, r, g) = model.fit();
+        assert_eq!(r, 0.0);
+        assert!(f.is_finite() && a >= 0.0 && g >= 0.0, "{:?}", (f, a, r, g));
+        let units = model.window_units(8, 3, 0.5);
+        assert!(units.is_finite() && units > 1.0, "{units}");
     }
 
     #[test]
-    fn unusable_walls_and_a_lone_verified_count_do_not_break_the_fit() {
-        let mut model = LaneCostModel::new(2);
-        let before = model.fit(1);
-        for wall in [f32::NAN, f32::INFINITY, -4.0, 0.0] {
-            model.observe(1, 2, wall);
+    fn unusable_walls_are_ignored() {
+        let mut model = LaneCostModel::new();
+        feed(&mut model, [24_000.0, 12_000.0, 6_000.0, 25_000.0], 0, 50);
+        let before = model.fit();
+        let units = model.window_units(8, 3, 0.5);
+        for wall in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -4.0, 0.0] {
+            model.observe(8, 1, 24, wall);
         }
-        assert_eq!(model.fit(1), before);
-        // Every observation at one verified count: the slope keeps the prior.
-        for _ in 0..2_000 {
-            model.observe(1, 0, 31_000.0);
+        assert_eq!(model.fit(), before);
+        assert_eq!(model.window_units(8, 3, 0.5), units);
+    }
+
+    #[test]
+    fn collinear_steps_leave_the_draft_cost_near_its_prior() {
+        // Every lane drafts every step (C = 8, one spill group) and e barely
+        // varies: the per-draft cost cannot be told apart from the
+        // intercept. The prior holds the fit; `window_units(8, 3, ..)`
+        // stays a sane price.
+        let mut model = LaneCostModel::new();
+        for k in 0..400 {
+            let verified = 22 + k % 3;
+            let wall = 1.1 * truth_wall(COST_PRIOR_US, (8, verified, 1));
+            model.observe(8, 1, verified, wall as f32);
         }
-        let (alpha, m) = model.fit(1);
-        assert!(alpha.is_finite() && m.is_finite() && m >= 0.0);
-        assert!((f64::from(alpha) - 31_000.0).abs() < 400.0, "alpha {alpha}");
+        let (_, _, r, _) = model.fit();
+        assert!((r / COST_PRIOR_US[2] - 1.0).abs() < 0.25, "r {r}");
+        let units = model.window_units(8, 3, 0.375);
+        assert!(units.is_finite() && units > 1.0, "{units}");
+    }
+
+    #[test]
+    fn a_window_without_drafts_costs_one_unit() {
+        let mut model = LaneCostModel::new();
+        for lanes in 0..=16 {
+            assert_eq!(model.window_units(lanes, 0, 0.5), 1.0, "fresh, C {lanes}");
+        }
+        feed(&mut model, [24_000.0, 12_000.0, 6_000.0, 25_000.0], 0, 200);
+        for lanes in 0..=16 {
+            assert_eq!(model.window_units(lanes, 0, 0.5), 1.0, "fed, C {lanes}");
+        }
     }
 
     #[test]

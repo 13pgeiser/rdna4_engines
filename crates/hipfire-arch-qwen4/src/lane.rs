@@ -556,7 +556,7 @@ impl SpecStore {
             draft_top1,
             draft_top1_host: vec![0; top1_bytes],
             append_scratch,
-            cost: LaneCostModel::new(max_lanes),
+            cost: LaneCostModel::new(),
             routes: LabRoutes::Floor,
             skip_rollback: false,
         })

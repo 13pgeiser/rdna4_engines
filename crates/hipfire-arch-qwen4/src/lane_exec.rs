@@ -72,7 +72,7 @@
 
 use crate::bundle::Qwen4Bundle;
 use crate::gpu_forward_lanes::{
-    forward_lanes, LaneOutputs, LaneRowKind, LaneRows, LANE_MAX_ROWS,
+    forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, LANE_MAX_ROWS,
 };
 use crate::lane::{
     LaneHost, LaneSpecConfig, LaneStatus, Qwen4LaneState, Qwen4LaneStore, SpecStore, StepParts,
@@ -811,15 +811,21 @@ fn forward_inner(
     // Plan order, with each decode request's first row among the step's
     // decode rows.
     let mut entries: Vec<Entry<'_>> = Vec::with_capacity(plan.requests.len());
-    let (mut n_dec, mut n_prefill, mut decode_lanes, mut verified) = (0usize, 0usize, 0usize, 0usize);
+    let (mut n_dec, mut n_prefill, mut decode_lanes, mut verify_windows, mut verified) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    // Row counts of the decode requests in entry order: what `forward_lanes`
+    // groups into once-over-all-rows launches.
+    let mut dec_rows: Vec<usize> = Vec::with_capacity(plan.requests.len());
     for (r, lane) in plan.requests.iter().zip(lanes) {
         let dec = match r.kind {
             RequestStepKind::Ar | RequestStepKind::Verify { .. } => {
                 if let RequestStepKind::Verify { draft_len } = r.kind {
+                    verify_windows += 1;
                     verified += draft_len;
                 }
                 let first = n_dec;
                 n_dec += r.rows.len;
+                dec_rows.push(r.rows.len);
                 decode_lanes += 1;
                 Some(first)
             }
@@ -1025,10 +1031,14 @@ fn forward_inner(
     // step; every MTP lane's policy observes its window either way.
     if let Some(cost) = cost {
         if decode_lanes > 0 {
+            // Row groups beyond the first are the step's spill; each Batched
+            // window is priced at its share of it.
+            let spill = row_group_count(&dec_rows).saturating_sub(1);
+            let spill_per_window = spill as f64 / verify_windows.max(1) as f64;
             if !prefill_ran {
                 gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
                 let wall_us = started.elapsed().as_secs_f64() * 1e6;
-                cost.observe(decode_lanes, verified, wall_us as f32);
+                cost.observe(decode_lanes, spill, verified, wall_us as f32);
             }
             for e in entries.iter_mut() {
                 if e.dec.is_none() {
@@ -1046,7 +1056,11 @@ fn forward_inner(
                 };
                 match window.route {
                     LaneRoute::Batched { .. } => {
-                        let units = cost.window_units(decode_lanes, outcome.drafts_generated);
+                        let units = cost.window_units(
+                            decode_lanes,
+                            outcome.drafts_generated,
+                            spill_per_window,
+                        );
                         policy.observe_batched(outcome, units, window.budget);
                         stats.windows += 1;
                         stats.drafts += outcome.drafts_generated as u64;
