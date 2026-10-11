@@ -133,6 +133,15 @@ fn mq4_rows_x4(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=mq4_rows_x4::emit(Spec{arch})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
+/// gfx1151 Flash-Next shared-expert gate/up (fused GEMM + BF16-recipe SwiGLU + selector sigmoid + F16 hidden):
+/// `--epi w8|w4` one entry, `all` the module.
+fn qwen4_shared_gu_gfx11(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::qwen4_shared_gu_gfx11::{self,Spec};
+ if epi=="all"{let (_,text,proof)=qwen4_shared_gu_gfx11::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let wr=match epi{"w4"=>4,"w8"=>8,_=>return Err(format!("qwen4_shared_gu_gfx11 --epi {epi} (w4|w8|all)"))};
+ let e=qwen4_shared_gu_gfx11::emit(Spec{arch,wr})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
 /// gfx1201 MQ4G256V2 wide exact-verify twins of hipcc's `_vt{4,8}w{4,8}_k32`
 /// entries: `--epi <op>_bt<4|8>w<4|8>` one entry, `all` (default) the module.
 fn mq4_verify_specs(epi:&str,arch:Arch)->Result<Vec<hipfire_isa::kernels::mq4_verify::Spec>,String>{
@@ -268,6 +277,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "qwen4_lane_rows"=>qwen4_lane_rows(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq4_x4_gfx11"=>qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mq4_rows_x4"=>mq4_rows_x4(epi.as_deref().unwrap_or("all"),arch)?,
+  "qwen4_shared_gu_gfx11"=>qwen4_shared_gu_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mq4_verify"=>mq4_verify(epi.as_deref().unwrap_or("all"),arch)?,
   "mq4_fp8_verify"=>mq4_fp8_verify(epi.as_deref().unwrap_or("all"),arch)?,
   "fp8_gemm"=>fp8_gemm(scale.as_deref().ok_or("missing --scale")?,epi.as_deref().ok_or("missing --epi")?,arch)?,

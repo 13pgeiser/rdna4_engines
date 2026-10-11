@@ -734,7 +734,11 @@ impl<'a> SealedMoeOp<'a> {
         }
         let (params, selection) = self.state.prefill_parts()?;
         if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
-            return super::qt44_qt53_prefill::shared_gate_up(gpu, params);
+            return super::qt44_qt53_prefill::shared_gate_up(
+                gpu,
+                params,
+                selection.resolution.use_path2,
+            );
         }
         super::prefill_shared_gate_up_stage(self.state.dispatch_ctx(), gpu, params)
     }
@@ -794,13 +798,22 @@ impl<'a> SealedMoeOp<'a> {
             // shared down's GEMM epilogue when this call admits it.
             if let Some(hc) = self.state.hc_write.take() {
                 let row_fold = hc.row_fold.is_some();
-                if super::qt44_qt53_prefill::shared_down_hc(gpu, params, &hc)? {
+                if super::qt44_qt53_prefill::shared_down_hc(
+                    gpu,
+                    params,
+                    &hc,
+                    selection.resolution.use_path2,
+                )? {
                     self.state.hc_folded.set(true);
                     self.state.hc_row_folded.set(row_fold);
                     return Ok(());
                 }
             }
-            return super::qt44_qt53_prefill::shared_down(gpu, params);
+            return super::qt44_qt53_prefill::shared_down(
+                gpu,
+                params,
+                selection.resolution.use_path2,
+            );
         }
         super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params)
     }

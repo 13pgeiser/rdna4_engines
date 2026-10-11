@@ -206,6 +206,31 @@ static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(
 static QWEN4_MQ6_X4_PM: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ6_X4_PM", true)
 });
+/// `HIPFIRE_QWEN4_SHARED_GU_PM` (on unless `0`) runs gfx1151's Flash-Next shared-expert
+/// gate/up (the gate and up F16 WMMA GEMMs, `shared_expert_activation_bf16_f32` and the
+/// shared down's F32 -> F16 hidden conversion) as one launch of the certified builder module
+/// `kernels::QWEN4_SHARED_GU_PM_GFX1151`, byte-identical (F16 hidden, post-sigmoid selector,
+/// everything downstream). `0` keeps the chain. Read once.
+static QWEN4_SHARED_GU_PM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_GU_PM", true)
+});
+/// Waves (16 channels each) per workgroup of the entry the route launches: the
+/// `_w8` entry (128 channels x 128 tokens per workgroup). The `_w4` entry is the oracle's
+/// comparison arm.
+pub const QWEN4_SHARED_GU_PM_WAVES: u8 = 8;
+/// Shape limits of the fused shared gate/up kernel: `m` channels a multiple of 16, `k` a
+/// multiple of 64 (at least 64), at least one token, and the weight and X byte extents
+/// below 2^31 (32-bit buffer offsets).
+pub const fn qwen4_shared_gu_pm_shape(m: usize, k: usize, n: usize) -> bool {
+    m > 0
+        && m % 16 == 0
+        && k >= 64
+        && k % 64 == 0
+        && n > 0
+        && (m as u128) * (k as u128) * 2 < (1u128 << 31)
+        && (n as u128) * (k as u128) * 2 < (1u128 << 31)
+        && (n as u128) * (m as u128) * 2 < (1u128 << 31)
+}
 /// gfx1151 selective PM route (`HIPFIRE_QWEN4_MQ6_X4_PM`): the MQ6 X-LDS overwrite
 /// launches (F32, BF16 output, and the a/b/z regions fold, all 128-row `_w8` entries of
 /// `kernels::QWEN4_MQ6_X4_PM_GFX1151`, 256-token tiles) run from the certified builder
@@ -28000,6 +28025,141 @@ impl Gpu {
         })
     }
 
+    /// `x` (F32, `[n_elems]`) as its F16 conversion (the uncached `convert_f32_to_f16`
+    /// launch the F16 WMMA GEMMs of F32 operands issue ahead of themselves) in the
+    /// shared F16 scratch, as an F16 view. Valid until the next conversion. The
+    /// byte oracle of the fused shared gate/up (`examples/qwen4_shared_gu_pm.rs`)
+    /// uses it to launch the chain's own conversion.
+    pub fn qwen4_convert_f16_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<GpuTensor> {
+        let ptr = self.convert_fp16_x_uncached(x, n_elems)?;
+        Ok(GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr, n_elems * 2) },
+            shape: vec![n_elems],
+            dtype: DType::F16,
+        })
+    }
+
+    /// The F16 `[n_elems]` input of a Qwen4 F16 WMMA GEMM: `x` itself when its
+    /// producer already left it as F16 (the fused shared gate/up's hidden,
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm`]), else the
+    /// (uncached) F32 -> F16 conversion of `x` in the shared F16 scratch. The
+    /// choice is the tensor's dtype: no hidden state.
+    pub(crate) fn f16_x_or_convert(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        if x.dtype == DType::F16 {
+            assert!(x.numel() >= n_elems, "F16 GEMM input holds {} of {n_elems} elements", x.numel());
+            return Ok(x.buf.as_ptr());
+        }
+        self.convert_fp16_x_uncached(x, n_elems)
+    }
+
+    /// Whether the fused shared-expert gate/up kernel
+    /// ([`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm`]) applies to the BF16
+    /// `[m × k]` gate and up weights at `batch_size` rows: exact gfx1151,
+    /// `HIPFIRE_QWEN4_SHARED_GU_PM` on (default), both weights on the Qwen4
+    /// F16 WMMA route (the chain's own GEMM: >= `QWEN4_F16_WMMA_MIN_TOKENS`
+    /// rows, no recorder or capture) and the kernel's shape limits
+    /// ([`qwen4_shared_gu_pm_shape`]).
+    pub fn qwen4_shared_gu_pm_applies(&self, gate: &GpuTensor, up: &GpuTensor, m: usize, k: usize, batch_size: usize) -> bool {
+        *QWEN4_SHARED_GU_PM
+            && self.arch_caps.is_gfx1151()
+            && qwen4_shared_gu_pm_shape(m, k, batch_size)
+            && self.qwen4_f16_wmma_applies(gate, k, batch_size)
+            && self.qwen4_f16_wmma_applies(up, k, batch_size)
+    }
+
+    /// One launch of the certified shared gate/up module's entry `wr` (4 or 8 waves
+    /// of 16 channels): `hidden` (F16 `[batch_size, m]`) and the in-place
+    /// post-sigmoid `selector` (F32 `[batch_size]`) from F16 `x16` (`[batch_size, k]`) and the
+    /// BF16 `gate` / `up` weights' F16 shadows, bitwise what the chain of the gate GEMM, the up
+    /// GEMM, `shared_expert_activation_bf16_f32` and the F32 -> F16 conversion of the hidden
+    /// leaves. The caller gates with [`Gpu::qwen4_shared_gu_pm_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen4_shared_gu_pm_launch(
+        &mut self,
+        wr: u8,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x16: &GpuTensor,
+        hidden: &GpuTensor,
+        selector: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(matches!(wr, 4 | 8), "shared gate/up PM entries are w4 and w8");
+        assert!(qwen4_shared_gu_pm_shape(m, k, batch_size), "shared gate/up PM shape {m}x{k}x{batch_size}");
+        assert_eq!((x16.dtype, hidden.dtype, selector.dtype), (DType::F16, DType::F16, DType::F32));
+        assert!(x16.numel() >= batch_size * k && hidden.numel() >= batch_size * m && selector.numel() >= batch_size);
+        self.bind_thread()?;
+        let entry = if wr == 8 { "qwen4_shared_gu_pm_gfx1151_w8" } else { "qwen4_shared_gu_pm_gfx1151_w4" };
+        let (wg, wu) = (self.ensure_bf16_f16_shadow(gate, m, k)?, self.ensure_bf16_f16_shadow(up, m, k)?);
+        self.ensure_embedded_kernel("qwen4_shared_gu_pm_gfx1151", kernels::QWEN4_SHARED_GU_PM_GFX1151, entry)?;
+        let (mut wgp, mut wup, mut xp) = (wg, wu, x16.buf.as_ptr());
+        let (mut yp, mut sp) = (hidden.buf.as_ptr(), selector.buf.as_ptr());
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, batch_size as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wgp as *mut _ as *mut c_void,
+            &mut wup as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = [m.div_ceil(16 * usize::from(wr)) as u32, batch_size.div_ceil(128) as u32, 1];
+        let bytes = 2 * m * k * 2 + batch_size * k * 2 + batch_size * m * 2 + batch_size * 8;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", entry, bytes);
+        let result = self.launch_maybe_blob(entry, grid, [32 * u32::from(wr), 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wgp);
+            b.push_ptr(wup);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_ptr(sp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// The Flash-Next shared-expert gate/up in one launch: the router's and the selector's
+    /// F16 WMMA GEMMs (the groups `[router]`, `[selector]`, off one F16 conversion of `x`,
+    /// exactly as [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_groups`] launches them), then
+    /// [`Gpu::qwen4_shared_gu_pm_launch`] over that conversion in place of the gate and up
+    /// GEMMs, the activation and the hidden's conversion. `hidden` is the F16 `[batch_size, m]`
+    /// destination (the shared down reads it as its F16 input). Returns `false` with nothing
+    /// launched unless the route applies ([`Gpu::qwen4_shared_gu_pm_applies`] and the groups'
+    /// own conditions).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm(
+        &mut self,
+        router: (&GpuTensor, &GpuTensor, usize),
+        selector: (&GpuTensor, &GpuTensor, usize),
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        hidden: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.qwen4_shared_gu_pm_applies(gate, up, m, k, batch_size)
+            || !self.gemm_bf16_xf32_f16_wmma_qwen4_groups(&[&[router][..], &[selector][..]], x, k, batch_size)?
+        {
+            return Ok(false);
+        }
+        // Nothing since the groups' conversion wrote the F16 scratch: the view is the same bytes.
+        let x16 = self.qwen4_f16_x_scratch(batch_size * k)?;
+        self.qwen4_shared_gu_pm_launch(QWEN4_SHARED_GU_PM_WAVES, gate, up, &x16, hidden, selector.1, m, k, batch_size)?;
+        Ok(true)
+    }
+
     /// `Y[b, m] = Σ_k W[m, k]·X[b, k]` for a BF16 weight through a
     /// model-lifetime F16 shadow and the LDS-staged F16 WMMA GEMM, X already
     /// F16.  2.5-5x the BF16 multirow kernel on gfx1151, 4-30x on gfx1201.
@@ -28252,7 +28412,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let wp = self.ensure_bf16_f16_shadow(weight, m, k)?;
-        let xp = self.convert_fp16_x_uncached(x, rows * k)?;
+        let xp = self.f16_x_or_convert(x, rows * k)?;
         if self.arch_caps.is_gfx1201() {
             const ENTRY: &str = "qwen4_wmma_lds_128_256_32_64_k64_bsr";
             self.ensure_kernel("gemm_wmma_lds_splitk", kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC, ENTRY)?;
@@ -28345,7 +28505,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
-        let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
+        let x16 = self.f16_x_or_convert(x, batch_size * k)?;
         const ENTRY: &str = "gemm_wmma_lds_128_256_32_64_k64_hcsd";
         let (module, source) = self.lds256_tile_module(ENTRY);
         self.ensure_kernel(module, source, ENTRY)?;
@@ -28428,7 +28588,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
-        let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
+        let x16 = self.f16_x_or_convert(x, batch_size * k)?;
         const ENTRY: &str = "gemm_wmma_lds_128_256_32_64_k64_bf16st";
         let (module, source) = self.lds256_tile_module(ENTRY);
         self.ensure_kernel(module, source, ENTRY)?;
@@ -47321,6 +47481,24 @@ mod tests {
         }
         assert!(!mq6_x4_pm_gfx1151_shape(10240, 1131));
         assert!(!mq6_x4_pm_gfx1151_shape(10240, 512));
+    }
+
+    /// The fused shared gate/up kernel's shape limits: 16-channel rows, 64-multiple K,
+    /// a token, and 32-bit byte extents of the weights, X and the hidden.
+    #[test]
+    fn qwen4_shared_gu_pm_shape_limits() {
+        // The Flash-Next shape, the K4 stress shape and the smallest legal one.
+        for (m, k, n) in [(640usize, 2560usize, 8192usize), (192, 256, 520), (16, 64, 1), (640, 2560, 1)] {
+            assert!(qwen4_shared_gu_pm_shape(m, k, n), "{m}x{k}x{n}");
+        }
+        for (m, k, n) in [(0usize, 2560usize, 8192usize), (648, 2560, 8192), (640, 0, 8192), (640, 2560 + 32, 8192), (640, 2560, 0), (640, 32, 8192)] {
+            assert!(!qwen4_shared_gu_pm_shape(m, k, n), "{m}x{k}x{n}");
+        }
+        // 2^31 byte extents: X (n * k * 2), weights (m * k * 2), hidden (n * m * 2).
+        assert!(!qwen4_shared_gu_pm_shape(640, 2560, 1 << 20));
+        assert!(!qwen4_shared_gu_pm_shape(1 << 20, 2560, 8192));
+        assert!(!qwen4_shared_gu_pm_shape(1 << 20, 64, 1 << 10));
+        assert_eq!(QWEN4_SHARED_GU_PM_WAVES, 8);
     }
 
     /// gfx1151: the builder-module `_w8` and `_w8_bf16out` entries (selected through

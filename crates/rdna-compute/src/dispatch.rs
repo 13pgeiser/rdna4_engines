@@ -439,6 +439,20 @@ impl GpuTensor {
             dtype: self.dtype,
         }
     }
+
+    /// Non-owning F16 view of the first `len_elems` 2-byte elements of this
+    /// tensor's buffer, whatever its own dtype (a producer that writes F16 into
+    /// a larger F32 scratch it owns). The returned tensor is a view — do NOT
+    /// free it.
+    pub fn prefix_as_f16(&self, len_elems: usize) -> GpuTensor {
+        let byte_len = len_elems.checked_mul(2).expect("F16 view length overflow");
+        assert!(byte_len <= self.buf.size(), "F16 view exceeds accessible buffer prefix");
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(self.buf.as_ptr(), byte_len) },
+            shape: vec![len_elems],
+            dtype: DType::F16,
+        }
+    }
 }
 
 /// Byte alignment of every frontier entry inside a [`VmmPrefixSet`] slab.

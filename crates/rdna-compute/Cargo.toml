@@ -61,6 +61,10 @@ name = "qwen4_mq6_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_shared_gu_pm"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_trunk_iu4"
 required-features = ["lab"]
 
