@@ -248,6 +248,14 @@ pub const QWEN4_EXPERT_STAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE";
 /// smaller ones, decode and verify keep the mapped reads.
 pub const QWEN4_EXPERT_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS";
 
+/// Whether a long forward that captures wide hidden rows (the native-MTP
+/// prompt fill's trunk tiles) stages like any other long forward. `0` keeps
+/// those tiles on the mapped reads; unset or `1` stages them. The capture
+/// only copies the trunk's output streams after the program has run, on the
+/// compute stream, and never reads an expert, so it is byte-identical either
+/// way. Verify forwards capture too but stay below the row threshold.
+pub const QWEN4_EXPERT_STAGE_CAPTURE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE";
+
 /// A 1,336,934,400-byte layer copy takes 23.5 ms (card B, gfx1201). A
 /// 2048-row forward already hides it: pp2048 went from 1057 to 1377 tok/s,
 /// and the restore that was not hidden cost 18 ms of that chunk. Smaller
@@ -1797,6 +1805,9 @@ enum DonorState {
 pub(crate) struct Qwen4ExpertStage {
     /// Forwards of at least this many rows stage.
     min_rows: usize,
+    /// Long forwards with a wide-hidden capture stage too
+    /// ([`QWEN4_EXPERT_STAGE_CAPTURE_ENV`]).
+    capture: bool,
     /// Donor trunk layer per parity.
     donors: [usize; 2],
     /// Borrowed device views of each donor's gate/up and down experts,
@@ -1910,6 +1921,7 @@ impl Qwen4ExpertStage {
         gpu.ensure_capture_stream()?;
         let mut stage = Self {
             min_rows: qwen4_expert_stage_min_rows(),
+            capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors,
             donor_views: Vec::with_capacity(4),
             mirrors: Vec::with_capacity(4),
@@ -1960,12 +1972,13 @@ impl Qwen4ExpertStage {
             return Err(error);
         }
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} ({} MiB pinned restore copies)",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} ({} MiB pinned restore copies; wide-hidden capture forwards {})",
             stage.min_rows,
             moe.len(),
             donors[0],
             donors[1],
-            2 * layer_bytes >> 20
+            2 * layer_bytes >> 20,
+            if stage.capture { "stage" } else { "mapped" }
         );
         Ok(Some(stage))
     }
@@ -4650,14 +4663,18 @@ impl Qwen4GpuForward {
                 "Qwen4 generic layer program inline capacity exhausted",
             ));
         }
-        // Decode, small chunks and MTP's wide-hidden verify keep mapped reads.
-        // The parity observer also keeps its historical unsplit transport. A
-        // stream capture keeps them too: a staged forward forks a copy stream
-        // and its failure recovery synchronizes the device.
+        // Decode, small chunks and MTP's few-row wide-hidden verify keep
+        // mapped reads (below `min_rows`). A long forward that captures wide
+        // hidden rows (the MTP prompt fill) stages unless
+        // `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE=0`: the capture is a copy of
+        // the output streams after the program, on the compute stream. The
+        // parity observer keeps its historical unsplit transport. A stream
+        // capture keeps mapped reads too: a staged forward forks a copy
+        // stream and its failure recovery synchronizes the device.
         let expert_stage = match self.expert_stage.as_ref() {
             Some(stage)
                 if n >= stage.min_rows
-                    && wide_hidden_capture.is_none()
+                    && (stage.capture || wide_hidden_capture.is_none())
                     && self.qsa_tap.is_none() =>
             {
                 let capturing = match gpu.active_stream.as_ref() {
