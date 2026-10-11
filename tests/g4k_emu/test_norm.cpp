@@ -194,6 +194,9 @@ int main() {
     fails += case_nan(3, 1000, 24, 1) + case_jas(3, 1000, 24, 1);
     fails += case_nan(2, 6144, 0, 0) + case_jas(2, 6144, 16, 0);
     fails += case_nan(5, 256, 8, 1) + case_jas(5, 5376, 0, 1);
+    /* the edge between the 12-a-thread kernels and the 24: 3072 the last of the first */
+    fails += case_nan(2, 3072, 0, 1) + case_nan(2, 3073, 8, 1);
+    fails += case_jas(2, 3072, 0, 1, true) + case_jas(2, 3073, 8, 1, true) + case_jas(3, 3073, 0, 1);
     /* and with the next layer's input norm folded in */
     for (int M : Ms) fails += case_jas(M, 2816, M % 2 ? 64 : 0, 2, true);
     fails += case_jas(3, 1000, 24, 1, true) + case_jas(2, 6144, 16, 0, true);

@@ -22,7 +22,15 @@
  *
  * One 256-thread block a row: a decode step is a handful of rows, so the row is latency-bound and
  * a block's three reductions beat seven launches. Values a later stage reuses stay in registers
- * (kMaxPer a thread, so n <= 256 * kMaxPer; the row table says so).
+ * (PER a thread, 12 to n = 3072 and kMaxPer = 24 to 6144; the row table says so).
+ *
+ * EVERY LOAD IS ISSUED FIRST. A barrier is a fence, so a load written after a reduction waits for
+ * it: the first version fetched the gains, the residual and the layer scalar phase by phase and
+ * paid a global round trip for each on top of the reductions -- 17.8 us for join_add_scale and 13.2
+ * for norm_add_norm at decode under --profile-ops, against ~7 for a launch that does nothing. Now
+ * the row's every operand is in flight at once, the two arm norms share one barrier pair, and a
+ * thread holds the elements it touches and no more. Nothing about the arithmetic moved: the same
+ * expressions in the same order, a sum's extra terms past n were +0.
  */
 #include <hip/hip_runtime.h>
 
@@ -62,6 +70,20 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
     for (int w = 0; w < kWaves; ++w) s += lds[w];
     return s;
 }
+/* two block sums for one barrier pair: each value takes block_sum's butterfly and wave order */
+__device__ __forceinline__ void block_sum2(float& a, float& b, float* lds) {
+#pragma unroll
+    for (int d = 16; d >= 1; d >>= 1) { a += shfl_xor(a, d); b += shfl_xor(b, d); }
+    const int lane = lane_id(), wave = (int)(threadIdx.x >> 5);
+    __syncthreads();
+    if (lane == 0) { lds[wave] = a; lds[kWaves + wave] = b; }
+    __syncthreads();
+    float sa = 0.0f, sb = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kWaves; ++w) { sa += lds[w]; sb += lds[kWaves + w]; }
+    a = sa;
+    b = sb;
+}
 __device__ __forceinline__ float norm_factor(float ss, int n, float eps) {
     return rsqrtf(ss / (float)n + eps);
 }
@@ -82,6 +104,7 @@ struct NormArgs {
 };
 
 /* t = norm(a) * w_a;  x += t;  y = norm(x) * w_y */
+template <int PER>
 __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
     __shared__ float lds[kWaves];
     const int tid = (int)threadIdx.x, n = A.n;
@@ -90,82 +113,96 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
     uint16_t* xr = A.x + m * A.x_ld;
     uint16_t* yr = A.y + m * A.y_ld;
 
-    float av[kMaxPer], xv[kMaxPer];
+    /* every operand of the row in flight at once: the block output, the residual, both gains */
+    float av[PER], xv[PER], wa[PER], wy[PER];
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int i = tid + k * kThreads;
+        const bool in = i < n;
+        av[k] = in ? bf2f(ar[i]) : 0.0f;
+        xv[k] = in ? bf2f(xr[i]) : 0.0f;
+        wa[k] = in ? A.w0[i] : 0.0f;
+        wy[k] = in ? A.w1[i] : 0.0f;
+    }
     float ss = 0.0f;
 #pragma unroll
-    for (int k = 0; k < kMaxPer; ++k) {
-        const int i = tid + k * kThreads;
-        av[k] = i < n ? bf2f(ar[i]) : 0.0f;
-        ss += av[k] * av[k];
-    }
+    for (int k = 0; k < PER; ++k) ss += av[k] * av[k];
     const float sa = norm_factor(block_sum(ss, lds), n, A.eps);
     ss = 0.0f;
 #pragma unroll
-    for (int k = 0; k < kMaxPer; ++k) {
+    for (int k = 0; k < PER; ++k) {
         const int i = tid + k * kThreads;
         if (i < n) {
-            const float t = rbf((av[k] * sa) * A.w0[i]);
-            xv[k] = rbf(bf2f(xr[i]) + t);
+            const float t = rbf((av[k] * sa) * wa[k]);
+            xv[k] = rbf(xv[k] + t);
             xr[i] = f2bf(xv[k]);
-        } else {
-            xv[k] = 0.0f;
         }
         ss += xv[k] * xv[k];
     }
     const float sx = norm_factor(block_sum(ss, lds), n, A.eps);
 #pragma unroll
-    for (int k = 0; k < kMaxPer; ++k) {
+    for (int k = 0; k < PER; ++k) {
         const int i = tid + k * kThreads;
-        if (i < n) yr[i] = f2bf((xv[k] * sx) * A.w1[i]);
+        if (i < n) yr[i] = f2bf((xv[k] * sx) * wy[k]);
     }
 }
 
 /* x = (x + norm(norm(d) * w_d + norm(r) * w_r) * w_j) * s, and with NEXT y = norm(x) * w_n: the
  * next layer's input norm taken over the bf16 x this stores, which is what that norm would read. */
-template <bool NEXT>
+template <int PER, bool NEXT>
 __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
-    __shared__ float lds[kWaves];
+    __shared__ float lds[2 * kWaves];
     const int tid = (int)threadIdx.x, n = A.n;
     const long long m = (long long)blockIdx.x;
     const uint16_t* dr = A.d + m * A.d_ld;
     const uint16_t* rr = A.r + m * A.r_ld;
     uint16_t* xr = A.x + m * A.x_ld;
 
-    float dv[kMaxPer], rv[kMaxPer];
+    /* every operand of the row in flight at once: both arms, the residual, the three gains (four
+     * with the next norm's) and the layer scalar */
+    float dv[PER], rv[PER], xo[PER], wd[PER], wr[PER], wj[PER], wn[NEXT ? PER : 1];
+    const float sc = bf2f(*A.s);
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int i = tid + k * kThreads;
+        const bool in = i < n;
+        dv[k] = in ? bf2f(dr[i]) : 0.0f;
+        rv[k] = in ? bf2f(rr[i]) : 0.0f;
+        xo[k] = in ? bf2f(xr[i]) : 0.0f;
+        wd[k] = in ? A.w0[i] : 0.0f;
+        wr[k] = in ? A.w1[i] : 0.0f;
+        wj[k] = in ? A.w2[i] : 0.0f;
+        if constexpr (NEXT) wn[k] = in ? A.w3[i] : 0.0f;
+    }
     float sd2 = 0.0f, sr2 = 0.0f;
 #pragma unroll
-    for (int k = 0; k < kMaxPer; ++k) {
-        const int i = tid + k * kThreads;
-        dv[k] = i < n ? bf2f(dr[i]) : 0.0f;
-        rv[k] = i < n ? bf2f(rr[i]) : 0.0f;
+    for (int k = 0; k < PER; ++k) {
         sd2 += dv[k] * dv[k];
         sr2 += rv[k] * rv[k];
     }
-    const float sd = norm_factor(block_sum(sd2, lds), n, A.eps);
-    const float sr = norm_factor(block_sum(sr2, lds), n, A.eps);
+    block_sum2(sd2, sr2, lds);
+    const float sd = norm_factor(sd2, n, A.eps);
+    const float sr = norm_factor(sr2, n, A.eps);
     /* the join, kept in dv */
     float ss = 0.0f;
 #pragma unroll
-    for (int k = 0; k < kMaxPer; ++k) {
+    for (int k = 0; k < PER; ++k) {
         const int i = tid + k * kThreads;
         if (i < n) {
-            const float u = rbf((dv[k] * sd) * A.w0[i]);
-            const float v = rbf((rv[k] * sr) * A.w1[i]);
+            const float u = rbf((dv[k] * sd) * wd[k]);
+            const float v = rbf((rv[k] * sr) * wr[k]);
             dv[k] = rbf(u + v);
-        } else {
-            dv[k] = 0.0f;
         }
         ss += dv[k] * dv[k];
     }
     const float sj = norm_factor(block_sum(ss, lds), n, A.eps);
-    const float sc = bf2f(*A.s);
     ss = 0.0f;
 #pragma unroll
-    for (int k = 0; k < kMaxPer; ++k) {
+    for (int k = 0; k < PER; ++k) {
         const int i = tid + k * kThreads;
         if (i < n) {
-            const float j = rbf((dv[k] * sj) * A.w2[i]);
-            const float x1 = rbf(bf2f(xr[i]) + j);
+            const float j = rbf((dv[k] * sj) * wj[k]);
+            const float x1 = rbf(xo[k] + j);
             const uint16_t xn = f2bf(x1 * sc);
             xr[i] = xn;
             rv[k] = bf2f(xn);                        /* the new x, kept for the next norm */
@@ -178,9 +215,9 @@ __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
         const float sn = norm_factor(block_sum(ss, lds), n, A.eps);
         uint16_t* yr = A.y + m * A.y_ld;
 #pragma unroll
-        for (int k = 0; k < kMaxPer; ++k) {
+        for (int k = 0; k < PER; ++k) {
             const int i = tid + k * kThreads;
-            if (i < n) yr[i] = f2bf((rv[k] * sn) * A.w3[i]);
+            if (i < n) yr[i] = f2bf((rv[k] * sn) * wn[k]);
         }
     }
 }
@@ -234,7 +271,12 @@ int g4k_norm_add_norm_bf16(const RadArgs* a, RadStream stream) {
     P.y = (uint16_t*)Y->data;        P.y_ld = ly;
     P.w0 = (const float*)Wa->data;   P.w1 = (const float*)Wy->data;
     P.n = (int)n; P.eps = eps;
-    G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel), dim3((unsigned)M), dim3(kThreads), (hipStream_t)stream, P);
+    if (n <= (int64_t)kThreads * 12)
+        G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel<12>), dim3((unsigned)M), dim3(kThreads),
+                   (hipStream_t)stream, P);
+    else
+        G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel<kMaxPer>), dim3((unsigned)M), dim3(kThreads),
+                   (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -270,12 +312,19 @@ int g4k_join_add_scale_bf16(const RadArgs* a, RadStream stream) {
     P.s = (const uint16_t*)Sc->data;
     if (Y) { P.w3 = (const float*)Wn->data; P.y = (uint16_t*)Y->data; P.y_ld = ly; }
     P.n = (int)n; P.eps = eps;
-    if (Y)
-        G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel<true>), dim3((unsigned)M), dim3(kThreads),
+    const bool narrow = n <= (int64_t)kThreads * 12;
+    if (narrow && Y)
+        G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel<12, true>), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
+    else if (narrow)
+        G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel<12, false>), dim3((unsigned)M), dim3(kThreads),
+                   (hipStream_t)stream, P);
+    else if (Y)
+        G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel<kMaxPer, true>), dim3((unsigned)M),
+                   dim3(kThreads), (hipStream_t)stream, P);
     else
-        G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel<false>), dim3((unsigned)M), dim3(kThreads),
-                   (hipStream_t)stream, P);
+        G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel<kMaxPer, false>), dim3((unsigned)M),
+                   dim3(kThreads), (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
