@@ -28,6 +28,10 @@ sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
+[build-dependencies]
+# build.rs: shared-weight loader ABI identity (hashes the loader closure).
+sha2.workspace = true
+
 [dev-dependencies]
 # `tests/gpu_gemv_parity.rs`: drives the production GEMV launcher against the
 # CPU transcription on identical inputs. Lives here (not in hipfire-cpu) so the
