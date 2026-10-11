@@ -6,7 +6,7 @@
 //! run --model M --prompt FILE --max-seq N --out NEW_DIR [--prompt-tokens N]
 //!     [--gen 256] [--arm NAME] [--rep N] [--barrier DIR] [--keep-raw]
 //! compare BASE_DIR CANDIDATE_DIR
-//! weights --model M --out NEW_DIR [--max-seq N]      (G1 per-owner hashes)
+//! weights --model M --out NEW_DIR [--max-seq N] [--keep-raw] [--hold DIR]   (G1)
 //! compare-weights BASE_DIR CANDIDATE_DIR
 //!
 //! `run` loads through the production `load_qwen35_bundle` (explicit max_seq,
@@ -559,13 +559,29 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
         .map_err(|e| format!("load_qwen35_bundle: {e}"))?)
 }
 
+/// Start time of this process in clock ticks since boot (`/proc/self/stat`
+/// field 22), so a parent can pin pid identity.
+fn proc_starttime() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// G1: hash every visited dense tensor's accessible bytes, keyed by stable role.
+/// `--keep-raw` also writes each role's bytes for a literal byte compare.
+/// `--hold DIR` keeps the weights mapped after readback: writes
+/// `DIR/held.<pid>` (with the partial record) and waits for `DIR/release`
+/// before freeing, so a parent can sample live fdinfo and start a second
+/// importer while this one is still mapped.
 fn weights(raw: &[String]) -> Result<()> {
     let args = Args::parse(raw)?;
     let model = args.req("model")?.to_owned();
     let max_seq: usize = args.usize_or("max-seq", 512)?;
     let out = PathBuf::from(args.req("out")?);
+    let keep_raw = args.flag("keep-raw");
     fs::create_dir(&out)?;
+    if keep_raw {
+        fs::create_dir(out.join("raw"))?;
+    }
     let mut gpu = Gpu::init()?;
     let (start_free, total) = mem_free(&gpu)?;
     let t = Instant::now();
@@ -585,25 +601,66 @@ fn weights(raw: &[String]) -> Result<()> {
                 unique += 1;
                 unique_bytes += bytes;
             }
+            let file = if keep_raw {
+                let name = format!("raw/{:05}.bin", tensors.len());
+                fs::write(out.join(&name), &host)
+                    .map_err(|e| hip_bridge::HipError::new(0, &format!("{name}: {e}")))?;
+                Value::String(name)
+            } else {
+                Value::Null
+            };
             tensors.insert(
                 role.to_owned(),
-                json!({ "bytes": bytes, "sha256": sha256(&host), "borrowed": borrowed }),
+                json!({ "bytes": bytes, "sha256": sha256(&host), "borrowed": borrowed, "raw": file }),
             );
             Ok(())
         };
         bundle.weights.for_each_dense_tensor(&mut visit)?;
     }
+    let (after_readback_free, _) = mem_free(&gpu)?;
+    let identity = json!({ "pid": std::process::id(), "starttime_ticks": proc_starttime() });
+    let hold = match args.opt("hold") {
+        Some(dir) => {
+            let dir = Path::new(dir);
+            let held = dir.join(format!("held.{}", std::process::id()));
+            fs::write(
+                &held,
+                serde_json::to_vec(&json!({
+                    "identity": identity, "unique_owners": unique,
+                    "unique_logical_bytes": unique_bytes, "after_readback_free": after_readback_free,
+                }))?,
+            )?;
+            eprintln!("G1_HELD {}", held.display());
+            let release = dir.join("release");
+            let deadline = Instant::now() + Duration::from_secs(3600);
+            while !release.exists() {
+                if Instant::now() > deadline {
+                    return Err(format!("hold {} timed out (weights still mapped)", release.display()).into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            json!({ "dir": dir.display().to_string(), "released": true })
+        }
+        None => Value::Null,
+    };
     let free_result = free_qwen35_bundle(bundle, &mut gpu);
+    let (end_free, _) = mem_free(&gpu)?;
     let record = json!({
         "schema": "hipfire.g1.weights.v1",
         "model": model,
+        "identity": identity,
         "env": recorded_env(),
         "load_ms": load_ms,
-        "mem": { "total": total, "start_free": start_free, "after_load_free": after_load_free },
+        "mem": {
+            "total": total, "start_free": start_free, "after_load_free": after_load_free,
+            "after_readback_free": after_readback_free, "end_free": end_free,
+        },
+        "hold": hold,
         "unique_owners": unique,
         "unique_logical_bytes": unique_bytes,
         "tensors": Value::Object(tensors),
         "free_ok": free_result.is_ok(),
+        "free_error": free_result.as_ref().err(),
     });
     fs::write(out.join("weights.json"), serde_json::to_vec_pretty(&record)?)?;
     eprintln!("G1_WEIGHTS unique_owners={unique} unique_logical_bytes={unique_bytes}");
@@ -614,22 +671,34 @@ fn compare_weights(raw: &[String]) -> Result<()> {
     let [a, b] = raw else {
         return Err("compare-weights BASE_DIR CANDIDATE_DIR".into());
     };
-    let read = |d: &str| -> Result<Value> {
-        Ok(serde_json::from_slice(&fs::read(Path::new(d).join("weights.json"))?)?)
+    let (da, db) = (Path::new(a), Path::new(b));
+    let read = |d: &Path| -> Result<Value> {
+        Ok(serde_json::from_slice(&fs::read(d.join("weights.json"))?)?)
     };
-    let (ra, rb) = (read(a)?, read(b)?);
+    let (ra, rb) = (read(da)?, read(db)?);
     let empty = Map::new();
     let ta = ra["tensors"].as_object().unwrap_or(&empty);
     let tb = rb["tensors"].as_object().unwrap_or(&empty);
     let roles: std::collections::BTreeSet<&String> = ta.keys().chain(tb.keys()).collect();
-    let diffs: Vec<Value> = roles
-        .into_iter()
-        .filter(|r| {
-            !matches!((ta.get(*r), tb.get(*r)), (Some(x), Some(y))
-                if x["sha256"] == y["sha256"] && x["bytes"] == y["bytes"])
-        })
-        .map(|r| json!({ "role": r, "base": ta.get(r), "candidate": tb.get(r) }))
-        .collect();
+    let mut diffs = Vec::new();
+    let (mut raw_compared, mut raw_bytes) = (0usize, 0usize);
+    for r in roles {
+        let (x, y) = (ta.get(r), tb.get(r));
+        let digest_equal = matches!((x, y), (Some(x), Some(y))
+            if x["sha256"] == y["sha256"] && x["bytes"] == y["bytes"]);
+        // Literal byte compare whenever both sides kept raw bytes.
+        let raw_diff = match (x.and_then(|v| v["raw"].as_str()), y.and_then(|v| v["raw"].as_str())) {
+            (Some(p), Some(q)) => {
+                raw_compared += 1;
+                raw_bytes += x.and_then(|v| v["bytes"].as_u64()).unwrap_or(0) as usize;
+                raw_first_diff(&da.join(p), &db.join(q))?
+            }
+            _ => None,
+        };
+        if !digest_equal || raw_diff.is_some() {
+            diffs.push(json!({ "role": r, "base": x, "candidate": y, "first_diff_byte": raw_diff }));
+        }
+    }
     let equal = diffs.is_empty();
     println!(
         "{}",
@@ -638,6 +707,7 @@ fn compare_weights(raw: &[String]) -> Result<()> {
             "base_unique_owners": ra["unique_owners"], "candidate_unique_owners": rb["unique_owners"],
             "base_unique_logical_bytes": ra["unique_logical_bytes"],
             "candidate_unique_logical_bytes": rb["unique_logical_bytes"],
+            "raw_roles_compared": raw_compared, "raw_bytes_compared": raw_bytes,
             "diffs": diffs,
         }))?
     );
