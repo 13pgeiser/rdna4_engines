@@ -1340,6 +1340,36 @@ static const RadOperandSpec oRmsNormQuantI8[] = {
     { "scalar",   RAD_OPD_WEIGHT, 1 },   /* [1], multiplies the sum; needs the residual */
 };
 
+/* `qkv_norm_rope` is `qk_norm_rope` over SEPARATE q, k and v projections rather than one fused row:
+ * the per-head q and k norms, the weightless value norm and the rotary of q and k, in one
+ * dispatch -- Gemma 4's attention prologue, whose projections are three GEMMs. `v_from_k` 1 is its
+ * global class (k == v): v is the value norm of the RAW k, written before the k norm rewrites it.
+ * The rotary parameters are `rope`'s (`ladder` included), the norm parameters `rmsnorm`'s, and the
+ * op is byte-identical to rmsnorm_p + rmsnorm + rmsnorm + rope + rope. */
+static const RadParamSpec pQkvNormRope[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "n_head",     RAD_P_INT, RAD_REQUIRED },
+    { "n_head_kv",  RAD_P_INT, RAD_REQUIRED },
+    P_F64("theta"),
+    P_F64("eps"),
+    P_F64O("scale"),
+    { "mode",       RAD_P_STR, RAD_OPTIONAL },
+    { "rotary_dim", RAD_P_INT, RAD_OPTIONAL },
+    { "ladder",     RAD_P_STR, RAD_OPTIONAL },
+    P_F64O("wadd"),
+    { "v_from_k",   RAD_P_INT, RAD_OPTIONAL },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oQkvNormRope[] = {
+    { "q",         RAD_OPD_INOUT,  0 },
+    { "k",         RAD_OPD_INOUT,  0 },
+    { "v",         RAD_OPD_INOUT,  0 },   /* written from the raw k under v_from_k */
+    { "positions", RAD_OPD_IN,     0 },
+    { "q_w",       RAD_OPD_WEIGHT, 0 },
+    { "k_w",       RAD_OPD_WEIGHT, 0 },
+};
+
 static const RadParamSpec pGatedQuantFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -2333,6 +2363,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm_quant_i8", pRmsNormQuantI8, oRmsNormQuantI8,
            "RMS norm and the per-row int8 quantiser the w4a8 skinny GEMM reads, in one pass; with "
            "a residual the norm is of residual + x (+ a post-norm of x, x a scalar), stored back."),
+    SCHEMA("qkv_norm_rope", pQkvNormRope, oQkvNormRope,
+           "per-head q and k RMS norms, the weightless v norm and the rotary of q and k over separate "
+           "q, k and v projections, in one dispatch; v from the raw k under v_from_k."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
     SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
@@ -3191,6 +3224,10 @@ static const RadConstraint cQuantActI8[] = {
  * as bf16 for the cross-thread fragment store, which the shim bounds. */
 static const RadConstraint cRmsNormQuantI8[] = {
     C_DIV("n", 16), C_IN("dtype", "bf16"),
+};
+/* head_dim 256 or 512: a workgroup is one head, a thread one channel. */
+static const RadConstraint cQkvNormRope[] = {
+    C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cHadQuantActI8[] = {
     C_DIV("n", 16), C_DIV("n", 128), C_LE("group", 512), C_IN("dtype", "bf16"),
@@ -5587,6 +5624,18 @@ static const RadKernelInfo kKernels[] = {
   ROW(cRmsNormQuantI8), NOTUNE,
   nullptr, nullptr, r4d_rad_rmsnorm_quant_i8, nullptr, nullptr, nullptr,
   nullptr, nullptr, nullptr, r4d_rad_rmsnorm_quant_i8_describe },
+
+{ "qkv_norm_rope_bf16", "qkv_norm_rope", "attn",
+  "per-head RMS norms of separate q and k projections, the weightless norm of v (or of the raw k), "
+  "and the rotary of q and k, in place, in one dispatch",
+  "head_dim 256 or 512; neox, `rotary` or `head` ladder, one position component, no YaRN; one "
+  "workgroup a (token, head), a thread a channel",
+  "bf16 q/k/v and gains (or f32 gains), i32 positions; byte-identical to rmsnorm_p + rmsnorm x2 + "
+  "rope x2, each norm taken by its standalone kernel's partition",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkvNormRope), NOTUNE,
+  nullptr, nullptr, r4d_rad_qkv_norm_rope, nullptr, nullptr, nullptr,
+  nullptr, nullptr, nullptr, r4d_rad_qkv_norm_rope_describe },
 
 { "had_quant_act_i8", "had_quant_act_i8", "quant",
   "block Hadamard along K then per-row symmetric int8 quantisation; the rotation is what makes "

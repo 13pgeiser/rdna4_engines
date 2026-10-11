@@ -301,6 +301,8 @@ int64_t r4d_rad_moe_gather_scratch (const RadArgs*);
 /* -- quantisation, norms and the fusions (r4d_*quant*.hip, r4d_qk_norm_rope_gate.hip) -- */
 int r4d_rad_quant_act_i8          (const RadArgs*, RadStream);
 int r4d_rad_quant_act_i8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_qkv_norm_rope         (const RadArgs*, RadStream);
+int r4d_rad_qkv_norm_rope_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_rmsnorm_quant_i8      (const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_quant_i8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_had_quant_act_i8      (const RadArgs*, RadStream);

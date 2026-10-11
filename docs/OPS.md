@@ -453,6 +453,7 @@ that folds dequantisation into its epilogue still receives them.
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt | `qkv`:inout, `positions` |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`, `q_w`w, `k_w`w |
+| `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
 
 **`attn_local_rel`** is Gemma 4's audio attention: local, with a relative-position term and a
 softcap. Query row `i` of a segment sees the key rows `j` of the same segment with `0 <= i - j <=
@@ -484,6 +485,11 @@ non-causal, when `|i - j| < window` -- and 0 is no window. A bidirectional encod
 of radius `r` (`|i - j| <= r`) is `window = r + 1`. `q`, `k` and `v` may each be `[tokens, heads, head_dim]` or
 `[tokens, heads * head_dim]`, and the second form may be a column slice of a fused projection read
 at that projection's row pitch -- which is how a tower's `[q|k|v]` row reaches it without a copy.
+
+**`qkv_norm_rope`** is the same prologue over SEPARATE `q`, `k` and `v` projections (Gemma 4's text
+attention, three GEMMs): the q and k norms, the unit-gain value norm and the rotary in one dispatch.
+`v_from_k` 1 takes v from the RAW k before the k norm (the k == v global class). The rotary parameters
+are `rope`'s, `ladder` included; byte-identical to `rmsnorm_p` + `rmsnorm` x2 + `rope` x2.
 
 **`qk_norm_rope`'s `v_norm`** set to 1 also RMS-norms every v head of the fused row with a UNIT
 gain and does not rotate it: Gemma 4's value norm, which has no weight to name.

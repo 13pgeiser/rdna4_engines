@@ -4922,6 +4922,92 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
     }
 }
 
+/* ---- qkv_norm_rope, against the five ops it replaces ------------------------------------------
+ *
+ * rmsnorm_p (v, or the raw k under v_from_k), rmsnorm over the q heads and over the k heads, then
+ * rope over q and over k -- kernel by kernel, against the one dispatch. Both of Gemma 4 31B's
+ * classes at one rank of two: sliding (head_dim 256, 16 q over 8 kv heads, full rotary, separate v)
+ * and global (512, 16 over 2, the proportional `head` ladder over 128, k == v), at batch heights
+ * that put the q/k norms at every width r4d_act_threads answers -- including 256 at head_dim 512,
+ * where a thread of the standalone norm folds two channels. */
+static void qkv_norm_rope_numeric(const Plugin& pl) {
+    const RadKernelInfo* np  = find(pl, "rmsnorm_p_bf16");
+    const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
+    const RadKernelInfo* rp  = find(pl, "rope_bf16");
+    const RadKernelInfo* fz  = find(pl, "qkv_norm_rope_bf16");
+    if (!np || !nrm || !rp || !fz) { ok("qkv_norm_rope vs its five", false, "rows absent"); return; }
+    struct Cls { int64_t hd, nq, nkv, rot; const char* ladder; double theta; bool vk; };
+    for (const Cls& cl : { Cls{ 256, 16, 8, 256, "rotary", 10000.0, false },
+                           Cls{ 512, 16, 2, 128, "head", 1000000.0, true } }) {
+        for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)40 }) {
+            const int64_t QD = cl.nq * cl.hd, KD = cl.nkv * cl.hd;
+            std::vector<uint16_t> hq((size_t)M * QD), hk((size_t)M * KD), hv((size_t)M * KD);
+            std::vector<uint16_t> hqw((size_t)cl.hd), hkw((size_t)cl.hd);
+            std::vector<int32_t>  hp((size_t)M);
+            for (size_t i = 0; i < hq.size(); ++i) hq[i] = h_to_bf16(0.031f * (float)((i * 37) % 97) - 1.4f);
+            for (size_t i = 0; i < hk.size(); ++i) hk[i] = h_to_bf16(0.027f * (float)((i * 53) % 89) - 1.1f);
+            for (size_t i = 0; i < hv.size(); ++i) hv[i] = h_to_bf16(0.023f * (float)((i * 29) % 83) - 0.9f);
+            for (int64_t c = 0; c < cl.hd; ++c) {
+                hqw[(size_t)c] = h_to_bf16(0.6f + 0.004f * (float)((c * 19) % 51));
+                hkw[(size_t)c] = h_to_bf16(0.5f + 0.005f * (float)((c * 11) % 47));
+            }
+            for (int64_t m = 0; m < M; ++m) hp[(size_t)m] = (int32_t)(1000 + 7 * m);
+            void* dq[2] = { dalloc(hq.size() * 2), dalloc(hq.size() * 2) };
+            void* dk[2] = { dalloc(hk.size() * 2), dalloc(hk.size() * 2) };
+            void* dv[2] = { dalloc(hv.size() * 2), dalloc(hv.size() * 2) };
+            void* dqw = dalloc(hqw.size() * 2);
+            void* dkw = dalloc(hkw.size() * 2);
+            void* dp  = dalloc(hp.size() * 4);
+            if (!dq[1] || !dk[1] || !dv[1] || !dqw || !dkw || !dp) { ok("qkv_norm_rope alloc", false, "hipMalloc failed"); return; }
+            for (int j = 0; j < 2; ++j) {
+                st_memcpy(dq[j], hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(dk[j], hk.data(), hk.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(dv[j], hv.data(), hv.size() * 2, hipMemcpyHostToDevice);
+            }
+            st_memcpy(dqw, hqw.data(), hqw.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dkw, hkw.data(), hkw.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dp, hp.data(), hp.size() * 4, hipMemcpyHostToDevice);
+            const double eps = 1e-6, wadd = 0.0;
+            /* --- the five, in the order the unfused block issues them --- */
+            int rc = launch_row(np, { T(cl.vk ? dk[0] : dv[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dv[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
+                                { PI("M", M * cl.nkv), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16") });
+            if (rc == RAD_OK)
+                rc = launch_row(nrm, { T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }), T(dqw, RAD_BF16, { cl.hd }), T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }) },
+                                { PI("M", M * cl.nq), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
+            if (rc == RAD_OK)
+                rc = launch_row(nrm, { T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dkw, RAD_BF16, { cl.hd }), T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
+                                { PI("M", M * cl.nkv), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
+            for (int j = 0; j < 2 && rc == RAD_OK; ++j)
+                rc = launch_row(rp, { T(j ? dk[0] : dq[0], RAD_BF16, { M, (j ? cl.nkv : cl.nq) * cl.hd }), T(dp, RAD_I32, { M }) },
+                                { PI("M", M), PI("head_dim", cl.hd), PI("n_head", j ? cl.nkv : cl.nq), PI("n_head_kv", 0),
+                                  PF("theta", cl.theta), PF("scale", 1.0), PS("mode", "neox"), PI("rotary_dim", cl.rot),
+                                  PS("ladder", cl.ladder) });
+            /* --- the one --- */
+            if (rc == RAD_OK)
+                rc = launch_row(fz, { T(dq[1], RAD_BF16, { M, QD }), T(dk[1], RAD_BF16, { M, KD }), T(dv[1], RAD_BF16, { M, KD }),
+                                      T(dp, RAD_I32, { M }), T(dqw, RAD_BF16, { cl.hd }), T(dkw, RAD_BF16, { cl.hd }) },
+                                { PI("M", M), PI("head_dim", cl.hd), PI("n_head", cl.nq), PI("n_head_kv", cl.nkv),
+                                  PF("theta", cl.theta), PF("eps", eps), PF("scale", 1.0), PS("mode", "neox"),
+                                  PI("rotary_dim", cl.rot), PS("ladder", cl.ladder), PF("wadd", wadd),
+                                  PI("v_from_k", cl.vk ? 1 : 0), PS("dtype", "bf16") });
+            const std::string what = std::string("qkv_norm_rope hd=") + std::to_string(cl.hd) + " M=" + std::to_string(M);
+            if (rc != RAD_OK) { ok((what + " vs its five").c_str(), false, "rc=" + std::to_string(rc)); continue; }
+            int nd = 0, moved = 0;
+            for (int t = 0; t < 3; ++t) {
+                void* const* d = t == 0 ? dq : (t == 1 ? dk : dv);
+                const size_t n = t == 0 ? hq.size() : hk.size();
+                std::vector<uint16_t> a(n), b(n);
+                st_memcpy(a.data(), d[0], n * 2, hipMemcpyDeviceToHost);
+                st_memcpy(b.data(), d[1], n * 2, hipMemcpyDeviceToHost);
+                const std::vector<uint16_t>& h0 = t == 0 ? hq : (t == 1 ? hk : hv);
+                for (size_t i = 0; i < n; ++i) { nd += a[i] != b[i]; moved += b[i] != h0[i]; }
+            }
+            ok((what + " is byte-identical to rmsnorm_p + rmsnorm x2 + rope x2").c_str(), nd == 0 && moved > 0,
+               "differs " + std::to_string(nd) + ", changed from the input " + std::to_string(moved));
+        }
+    }
+}
+
 /* ---- rmsnorm_quant_i8, against the chain it replaces ------------------------------------------
  *
  * Byte-identical, for the reason the fp8 fusions above give, in all three forms a sandwich-norm
@@ -13472,6 +13558,10 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
+    }
+    if (sel("qkv_norm_rope_bf16")) {
+        if (!g_case) std::printf("\nqkv_norm_rope, against the five ops it replaces\n");
+        qkv_norm_rope_numeric(pl);
     }
     if (sel("rmsnorm_quant_i8")) {
         if (!g_case) std::printf("\nrmsnorm_quant_i8, against the chain it replaces\n");
