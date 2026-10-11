@@ -16,6 +16,7 @@ pub mod bundle;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod cache_quality;
 pub mod config;
+pub mod ep;
 pub mod expert_residency;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;

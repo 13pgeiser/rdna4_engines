@@ -11,6 +11,7 @@
 
 use crate::artifact::{Qwen4PleRows, SidecarRows};
 use crate::config::{Qwen4Config, Qwen4PleConfig};
+use crate::ep::{Qwen4EpMesh, ReplicaFingerprint};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
     qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4OutputRows,
@@ -263,6 +264,10 @@ pub struct Qwen4Bundle {
     /// Exact AR lane store of the Flash-Next batch route (`stage_lanes`);
     /// `None` = not staged. Lane steps never touch `state` or `mtp`.
     pub(crate) lanes: Option<crate::lane::Qwen4LaneStore>,
+    /// Expert-parallel mesh (`attach_ep_mesh`): this bundle is rank 0 and every
+    /// daemon-facing call is replicated on the peer ranks. `None` = single
+    /// device (the default; no behaviour change).
+    pub(crate) ep: Option<Box<Qwen4EpMesh>>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -643,6 +648,7 @@ impl Qwen4Bundle {
             turn_end_token: None,
             state_format,
             lanes: None,
+            ep: None,
         })
     }
 
@@ -849,6 +855,7 @@ impl Qwen4Bundle {
     }
     /// Attach the reusable native MTP head and its bounded GPU state.
     pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
+        self.ep_refuse("native MTP")?;
         Self::require_mtp_head(self.config.profile.id(), self.weights.mtp.is_some())?;
         if self.mtp.is_some() {
             return Err(BundleError::Forward(
@@ -885,6 +892,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         rows: usize,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("speculative decoding (spec hidden rows)")?;
         if rows == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 spec hidden capacity is zero".to_string(),
@@ -971,7 +979,17 @@ impl Qwen4Bundle {
     /// live prefills), in the session-cache scope `.../turns`. `None` keeps
     /// chunk multiples only.
     pub fn set_turn_end_token(&mut self, token: Option<u32>) {
-        self.turn_end_token = token;
+        // Host-only; every rank must plan session boundaries identically.
+        let set = |bundle: &mut Self| {
+            bundle.turn_end_token = token;
+            Ok(())
+        };
+        if let Err(error) = self.ep_fanout("set_turn_end_token", set, &|bundle, _, _| {
+            bundle.turn_end_token = token;
+            Ok(())
+        }) {
+            eprintln!("  qwen4 EP: set_turn_end_token: {error}");
+        }
     }
 
     /// Force message-end snapshots on or off regardless of the environment
@@ -979,7 +997,16 @@ impl Qwen4Bundle {
     /// at assembly). Changing it changes the snapshot scope, so call it before
     /// the first prefill that fills the cache.
     pub fn set_turn_snapshots(&mut self, on: bool) {
-        self.turn_snapshots = on;
+        let set = |bundle: &mut Self| {
+            bundle.turn_snapshots = on;
+            Ok(())
+        };
+        if let Err(error) = self.ep_fanout("set_turn_snapshots", set, &|bundle, _, _| {
+            bundle.turn_snapshots = on;
+            Ok(())
+        }) {
+            eprintln!("  qwen4 EP: set_turn_snapshots: {error}");
+        }
     }
 
     pub(crate) fn spec_forward_rows(
@@ -1015,6 +1042,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
+        self.ep_refuse("speculative decoding (spec prefill)")?;
         if tokens.is_empty() {
             return Err(BundleError::Forward(
                 "Qwen4 spec forward cannot process an empty block".to_string(),
@@ -1068,6 +1096,7 @@ impl Qwen4Bundle {
         output_rows: Qwen4OutputRows,
         prefill: bool,
     ) -> Result<Vec<u32>, BundleError> {
+        self.ep_refuse("speculative decoding (spec verify forward)")?;
         if tokens.is_empty() {
             return Err(BundleError::Forward(
                 "Qwen4 spec forward cannot process an empty block".to_string(),
@@ -1258,6 +1287,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         ple_normed: &GpuTensor,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("speculative decoding (verify rollback)")?;
         self.state
             .rollback_rows_retain(
                 gpu,
@@ -1339,6 +1369,7 @@ impl Qwen4Bundle {
     /// allocation); the row's logits stay in row 0 of `spec_logits` for a
     /// sampled follow-up. Clears any stale PLE lookahead first.
     pub(crate) fn spec_ar_token(&mut self, gpu: &mut Gpu, token: u32) -> Result<u32, BundleError> {
+        self.ep_refuse("speculative decoding (spec AR token)")?;
         let vocab = self.config.vocab_size;
         let logits = self
             .spec_logits
@@ -1513,6 +1544,9 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         if table.is_noop() {
             return Ok(());
+        }
+        if self.ep.is_some() {
+            return self.ep_apply_penalty_table(gpu, logits, table);
         }
         gpu.apply_penalty_table(
             &mut self.penalty_stage,
@@ -1908,6 +1942,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_forward_token(gpu, token, logits, top1);
+        }
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -1927,6 +1964,9 @@ impl Qwen4Bundle {
         token: Option<u32>,
         logits: &GpuTensor,
     ) -> Result<u32, BundleError> {
+        if self.ep.is_some() {
+            return self.ep_forward_token_or_argmax(gpu, token, logits);
+        }
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -1947,6 +1987,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_forward_chunk(gpu, tokens, logits, top1, false);
+        }
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -1971,6 +2014,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_forward_chunk(gpu, tokens, logits, top1, true);
+        }
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -2000,6 +2046,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
+        self.ep_refuse("silent chunk forward outside a replicated call")?;
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -2050,6 +2097,9 @@ impl Qwen4Bundle {
 
     /// Reset every owner for a cold prefill.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_reset(gpu);
+        }
         self.live = None;
         self.turn = None;
         self.invalidate_ple_epoch()?;
@@ -2194,6 +2244,9 @@ impl Qwen4Bundle {
     /// Drop every session snapshot, pending ones included, releasing their
     /// device buffers. No-op without a cache.
     pub fn session_clear(&mut self, gpu: &mut Gpu) {
+        if self.ep.is_some() {
+            return self.ep_session_clear(gpu);
+        }
         self.live = None;
         self.turn = None;
         if let Some(cache) = self.session.as_mut() {
@@ -2222,6 +2275,38 @@ impl Qwen4Bundle {
         )
     }
 
+    /// [`ArchModel::session_plan`](hipfire_runtime::arch_model::ArchModel::session_plan)
+    /// restricted to reuse points `<= cap` (the plan over the first `cap + 1`
+    /// prompt tokens). With `cap = prompt.len()` it is the plain plan; the EP
+    /// mesh lowers `cap` until every rank agrees on one reuse point.
+    pub(crate) fn session_plan_capped(
+        &self,
+        prompt: &[u32],
+        route: SessionRoute,
+        cap: usize,
+    ) -> usize {
+        self.session.as_ref().map_or(0, |cache| {
+            let head = &prompt[..prompt.len().min(cap.saturating_add(1))];
+            plan_start(
+                cache.plan(self, head, route),
+                self.live_hit(prompt, route).filter(|&live| live <= cap),
+            )
+        })
+    }
+
+    /// The host-visible request configuration every EP rank must share.
+    pub(crate) fn ep_replication_fingerprint(&self) -> ReplicaFingerprint {
+        ReplicaFingerprint {
+            session_cache: self.session.is_some(),
+            chunk_rows: self.spec_chunk_rows(),
+            state_format: self.state_format,
+            turn_end_token: self.turn_end_token,
+            turn_snapshots: self.turn_snapshots,
+            has_mtp: self.mtp.is_some(),
+            has_lanes: self.lanes.is_some(),
+        }
+    }
+
     /// Start a prefill of `prompt` on `route` that skips `reused` tokens:
     /// - live: `reused` is the end of the committed live state (this
     ///   conversation's previous turn); every owner and position is kept, no
@@ -2239,6 +2324,7 @@ impl Qwen4Bundle {
         reused: usize,
         route: SessionRoute,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("session_begin outside a replicated call")?;
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
         let live =
@@ -2283,6 +2369,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         prefix: &[u32],
     ) -> Result<(), BundleError> {
+        self.ep_refuse("session_at_boundary outside a replicated call")?;
         self.with_session(|cache, bundle| cache.at_boundary(gpu, bundle, prefix))
             .unwrap_or(Ok(()))
             .map_err(BundleError::Forward)
@@ -2300,6 +2387,9 @@ impl Qwen4Bundle {
         reused: usize,
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_prefill_final(gpu, prompt, reused, logits);
+        }
         self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
         let mut pos = reused;
         while let Some(boundary) = self.session_next_boundary() {
@@ -2335,6 +2425,7 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("continuous-batch lanes")?;
         if self.lanes.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 lanes are already staged".to_string(),
@@ -2590,6 +2681,7 @@ impl Qwen4Bundle {
     /// A fresh lane trunk state: the resident state's formats, QSA backend
     /// and context bound, allocated through the same constructor.
     pub(crate) fn new_lane_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
+        self.ep_refuse("continuous-batch lane/wave states")?;
         Qwen4State::new_with_backend(
             gpu,
             &self.config,
@@ -2721,6 +2813,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         final_logits: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("continuous-batch lane prefill")?;
         self.with_lane(state, None, |bundle| {
             let mut forward = bundle.execution.take().ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
@@ -2772,6 +2865,7 @@ impl Qwen4Bundle {
         top1: Option<&GpuTensor>,
         policy: &crate::gpu_forward_lanes::LaneStagePolicy,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("continuous-batch wave prefill")?;
         for lane in lanes.iter_mut() {
             let end = lane
                 .state
@@ -2795,6 +2889,7 @@ impl Qwen4Bundle {
     }
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
+        self.ep_refuse("state snapshots")?;
         self.quiesce_ple()?;
         self.state.snapshot(gpu).map_err(BundleError::State)
     }
@@ -2804,6 +2899,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("state restore")?;
         self.invalidate_ple_epoch()?;
         self.state
             .restore(gpu, snapshot)
@@ -2814,6 +2910,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("state restore")?;
         self.quiesce_ple()?;
         self.state
             .restore_retain(gpu, snapshot)
@@ -2835,6 +2932,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("state commit")?;
         self.quiesce_ple()?;
         self.state.commit(snapshot, gpu).map_err(BundleError::State)
     }
@@ -2842,7 +2940,10 @@ impl Qwen4Bundle {
     /// Teardown is deliberately ordered: stop/quiesce PLE reads and release
     /// leases/page-cache resources, free mutable GPU state, free finalized
     /// resident weights, then drain the attached transaction/census.
-    pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), BundleError> {
+    pub fn free_gpu(mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        // Peers drain and free first: their gather events and P2P reads end
+        // before rank 0's buffers go.
+        let ep_result = self.ep_close(gpu);
         let Qwen4Bundle {
             weights,
             state,
@@ -2907,7 +3008,7 @@ impl Qwen4Bundle {
         let state_result = lanes_result.and(state.free_gpu(gpu).map_err(BundleError::State));
         let weight_result = weights.free_gpu(gpu).map_err(BundleError::Hip);
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);
-        first_bundle_error([
+        let freed = first_bundle_error([
             ple_result,
             execution_result,
             mtp_result,
@@ -2915,7 +3016,8 @@ impl Qwen4Bundle {
             state_result,
             weight_result,
             store_result,
-        ])
+        ]);
+        ep_result.and(freed)
     }
 }
 
@@ -2949,6 +3051,9 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+        if self.ep.is_some() {
+            return self.ep_session_plan(prompt, route);
+        }
         self.session.as_ref().map_or(0, |cache| {
             plan_start(
                 cache.plan(self, prompt, route),
@@ -2958,6 +3063,9 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn session_commit(&mut self) {
+        if self.ep.is_some() {
+            return self.ep_session_commit(None);
+        }
         if let Some(cache) = self.session.as_mut() {
             cache.commit();
         }
@@ -2972,6 +3080,9 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     /// decode lineage); the snapshots just published stay cold-exact because a
     /// live turn captures none unless message-end snapshots are active.
     fn session_commit_live(&mut self, consumed: &[u32]) {
+        if self.ep.is_some() {
+            return self.ep_session_commit(Some(consumed));
+        }
         let Some(cache) = self.session.as_mut() else {
             self.live = None;
             self.turn = None;
