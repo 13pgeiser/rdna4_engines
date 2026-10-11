@@ -1758,9 +1758,10 @@ mod tests {
         // 8K-128K prefill, MTP and serve rows), the 32 Qwen3.5-MoE modules
         // (tests/fixtures/kernel-trace-qwen35.tsv) and the Qwen4 penalty
         // prepass `logit_penalty_table`, plus eight dense 27B DFlash cold
-        // helpers and the four gfx12 MQ4V2 verify-tile (`*_vt`) dense GEMM
-        // modules. Those 136 keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 136, "unexpected gfx1201 inventory size");
+        // helpers, the four gfx12 MQ4V2 verify-tile (`*_vt`) dense GEMM
+        // modules and the Flash-Next expert-parallel row gather
+        // `ep_gather_rows_by_owner`. Those 137 keys are additional to P0's 92.
+        assert_eq!(registry.len(), count + 137, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
