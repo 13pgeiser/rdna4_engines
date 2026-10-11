@@ -9,10 +9,11 @@
 //! shared across HTTP workers so transport changes stay isolated.
 
 use crate::{
-    apply_kv_axis_overrides, config_bool, config_f64, config_i64, config_string, config_u64,
-    find_daemon, find_model_path, http_get_json, list_local_models, load_params, probe_host,
-    pull_command, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs, Paths,
-    PullArgs, ServeArgs, StopArgs,
+    apply_kv_axis_overrides, apply_speculation_selector, config_bool, config_f64, config_i64,
+    config_string, config_u64, find_daemon, find_model_path, http_get_json, list_local_models,
+    load_params, port_in_use, probe_host, pull_command, reap_install_daemons,
+    resolve_dflash_sidecar, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs,
+    Paths, PullArgs, ServeArgs, StopArgs,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
@@ -310,6 +311,12 @@ pub(crate) struct ServeRuntime {
     /// `vision_mode=off`.
     pub(crate) vision_override: Option<PathBuf>,
     pub(crate) tp: Option<u64>,
+    /// `serve --spec`: the speculation selector applied to every model load
+    /// after the configured one, exactly as `run --spec` / `bench --spec`.
+    pub(crate) speculation_override: Option<String>,
+    /// `serve --max-seq`: `params["max_seq"]` for every ordinary model load,
+    /// exactly as `run --max-seq` / `bench --max-seq`.
+    pub(crate) max_seq_override: Option<u64>,
     pub(crate) continuous_batch_size: u64,
     /// VMM continuous-batching route (`serve.vmm_batch` and its spec /
     /// nonexact sub-switches). Projected on load only when enabled, so the
@@ -1323,6 +1330,12 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
             .arg("--continuous-batch-size")
             .arg(batch.to_string());
     }
+    if let Some(selector) = &args.speculation {
+        command.arg("--spec").arg(selector);
+    }
+    if let Some(max_seq) = args.max_seq {
+        command.arg("--max-seq").arg(max_seq.to_string());
+    }
     if args.ui || args.open {
         // --open is a one-shot launcher action in the parent; the detached
         // child only needs the route enabled.
@@ -1637,6 +1650,8 @@ pub(crate) fn serve_foreground(
             kv_backend_override: args.kv_backend.clone(),
             vision_override: args.vision.clone(),
             tp: args.tp,
+            speculation_override: args.speculation.clone(),
+            max_seq_override: args.max_seq,
             continuous_batch_size,
             vmm_batch,
             multi_slot_enabled,
@@ -1942,6 +1957,21 @@ impl ServeRuntime {
                 self.kv_k_override.as_deref(),
                 self.kv_v_override.as_deref(),
             )?;
+            if let Some(selector) = self.speculation_override.as_deref() {
+                apply_speculation_selector(&mut params, selector)?;
+                // Registry draft for a final dflash/auto selector the
+                // config-time load_params could not see (`serve --spec dflash`).
+                resolve_dflash_sidecar(
+                    &mut params,
+                    entry,
+                    &self.paths.models,
+                    &path,
+                    tag.as_deref(),
+                )?;
+            }
+            if let Some(max_seq) = self.max_seq_override {
+                params["max_seq"] = serde_json::json!(max_seq);
+            }
             resolve_mtp_sidecar(
                 &mut params,
                 entry,
@@ -2540,16 +2570,30 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
         let port = args
             .port
             .unwrap_or(config_u64(&resolved, "serve.port")? as u16);
-        let _ = Command::new("pkill").args(["-x", "daemon"]).status();
+        // Only this install's daemons (pidfile/GPU-lock PIDs whose cmdline is
+        // this install's daemon binary and whose HIPFIRE_HOME is this home);
+        // never `pkill -x daemon`, which hit every user's process named daemon.
+        let reaped = reap_install_daemons(paths)?;
         if args.all {
             let _ = Command::new("pkill")
                 .args(["-f", "target/release/hipfire-quantize"])
                 .status();
         }
-        let _ = Command::new("fuser")
-            .args(["-k", &format!("{port}/tcp")])
-            .status();
-        println!("reaped orphan daemon processes and freed port {port}");
+        if reaped.is_empty() {
+            println!("no orphan daemon processes for this install");
+        } else {
+            let pids = reaped.iter().map(u32::to_string).collect::<Vec<_>>();
+            println!("reaped orphan daemon processes (PID {})", pids.join(", "));
+        }
+        let host = config_string(&resolved, "serve.host").unwrap_or_else(|_| "127.0.0.1".into());
+        if port_in_use(probe_host(&host), port) {
+            println!(
+                "port {port} is still in use by a process that is not this install's hipfire; \
+                 not killing it"
+            );
+        } else {
+            println!("port {port} is free");
+        }
     }
     Ok(())
 }
@@ -3351,6 +3395,8 @@ mod tests {
             kv_backend_override: None,
             vision_override: None,
             tp: None,
+            speculation_override: None,
+            max_seq_override: None,
             continuous_batch_size: 1,
             vmm_batch: VmmBatchFlags::default(),
             multi_slot_enabled: false,

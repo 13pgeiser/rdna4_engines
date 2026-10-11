@@ -1108,10 +1108,6 @@ fn main() {
                                 command = kind,
                                 "daemon control command received"
                             );
-                            eprintln!(
-                                "[daemon-control] received {} for id={} attempt_id={}",
-                                kind, id, attempt_id
-                            );
                             apply_terminal_control(kind, id, attempt_id);
                             batch_apply_terminal_control(kind, id, attempt_id);
                         }

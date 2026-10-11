@@ -16,8 +16,8 @@ use hipfire_client::{
 use hipfire_config::{
     apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
     field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
-    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
-    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
+    unknown_key, write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer,
+    ConfigPaths, ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
@@ -101,6 +101,7 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
+    /// View or change settings (global or per-model); no arguments opens the TUI.
     Config(ConfigArgs),
     /// Inspect or refresh the signed-model-registry migration surface.
     Registry(RegistryArgs),
@@ -461,6 +462,10 @@ struct RunArgs {
     /// Tensor/expert-parallel degree for this model load (same admission as `serve --tp` / `bench --tp`).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// KV context (`max_seq`) for this model load, within the `memory.max_seq`
+    /// bounds; overrides the configured/automatic context.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -777,6 +782,19 @@ pub(crate) struct ServeArgs {
     /// Tensor/expert-parallel degree.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// Speculation mode for models loaded by this service: off, auto, ngram,
+    /// dflash, mtp, or dspark. Overrides `speculation.mode` and per-model
+    /// speculation settings; `--spec off` disables MTP/DFlash.
+    #[arg(
+        long = "spec",
+        alias = "speculation",
+        value_parser = ["off", "auto", "ngram", "dflash", "mtp", "dspark"]
+    )]
+    speculation: Option<String>,
+    /// KV context (`max_seq`) for models loaded by this service, within the
+    /// `memory.max_seq` bounds; overrides the configured/automatic context.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
     continuous_batch_size: Option<u64>,
@@ -840,6 +858,24 @@ fn run() -> Result<()> {
             argument
         }
     }));
+    // Print-only commands die quietly on a closed stdout (`hipfire list -r |
+    // head -1`) like any Unix filter instead of panicking in `println!`.
+    // Commands that drive a daemon, server or child over pipes keep Rust's
+    // ignored SIGPIPE so a dead peer is an EPIPE error, not a silent exit.
+    if matches!(
+        cli.command,
+        Some(
+            Commands::List(_)
+                | Commands::Registry(_)
+                | Commands::Config(_)
+                | Commands::Ps(_)
+                | Commands::Version(_)
+                | Commands::Rm(_)
+        )
+    ) {
+        // SAFETY: restores the default disposition before any thread starts.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let paths = Paths::discover();
     match cli.command {
         None => launch_tui(&paths, &[]),
@@ -993,8 +1029,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         }
         ConfigAction::Get { key, output } => {
             let (_, resolved) = resolved_global(paths, true)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let schema = field(&canonical);
             let value = resolved
                 .get(&canonical)
@@ -1018,8 +1053,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             let mut loaded = load_global(&paths.config)?;
             loaded.layer.set_cli(&key, &value)?;
             write_global_toml(&paths.config, &loaded.layer)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let value = loaded
                 .layer
                 .get(&canonical)
@@ -1037,8 +1071,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         ConfigAction::Reset { key } => {
             let mut loaded = load_global(&paths.config)?;
             if let Some(key) = key {
-                let canonical = canonical_config_key(&key)
-                    .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
                 let existed = loaded.layer.remove(&canonical)?.is_some();
                 write_global_toml(&paths.config, &loaded.layer)?;
                 if existed {
@@ -1054,8 +1087,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         }
         ConfigAction::Explain { key, output } => {
             let (loaded, resolved) = resolved_global(paths, true)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(&canonical)
                 .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
@@ -1107,8 +1139,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 }
                 return Ok(());
             }
-            let schema = field(&canonical)
-                .ok_or_else(|| anyhow!("unknown configuration key '{canonical}'"))?;
+            let schema = field(&canonical).ok_or_else(|| unknown_key(&canonical))?;
             if output.json {
                 println!(
                     "{}",
@@ -1378,7 +1409,7 @@ fn model_config_command(
                 bail!("developer configuration is global process policy; omit the model argument");
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
-            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(schema.key)
                 .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
@@ -1418,8 +1449,7 @@ fn model_config_command(
                     record.registry_tag = tag.clone();
                 }
                 record.overrides.set_cli(&key, &value)?;
-                let schema =
-                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
                 let saved = record
                     .overrides
                     .get(schema.key)
@@ -1450,8 +1480,7 @@ fn model_config_command(
                 anyhow!("model '{model_name}' has no catalog entry for id '{id}'")
             })?;
             if let Some(key) = key {
-                let schema =
-                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
                 let existed = record.overrides.remove(schema.key)?.is_some();
                 if existed {
                     println!("{id} {} override removed", schema.key);
@@ -1470,7 +1499,7 @@ fn model_config_command(
                 bail!("developer configuration is global process policy; omit the model argument");
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
-            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(schema.key)
                 .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
@@ -1600,7 +1629,7 @@ fn registry_command(paths: &Paths, args: RegistryArgs) -> Result<()> {
                     let (canonical, entry) = loaded
                         .registry
                         .model(&tag)
-                        .ok_or_else(|| anyhow!("unknown model '{tag}'"))?;
+                        .ok_or_else(|| unknown_model_error(&loaded.registry, &tag))?;
                     if output.json {
                         println!(
                             "{}",
@@ -1706,7 +1735,7 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
         return Ok(());
     }
     if local.is_empty() {
-        println!("No local models. Pull one:\n  hipfire pull qwen3.6:35b-a3b-mq4r");
+        println!("No local models. Pull one:\n  hipfire pull qwen3.5:4b");
     } else {
         println!("Local models:\n");
         for model in &local {
@@ -1859,7 +1888,7 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     let (tag, entry) = loaded
         .registry
         .model(&args.model)
-        .ok_or_else(|| anyhow!("unknown model '{}'", args.model))?;
+        .ok_or_else(|| unknown_model_error(&loaded.registry, &args.model))?;
     if entry.repo.is_empty() {
         bail!(
             "cannot pull {tag}: registry entry is local-only; place {} in {}",
@@ -2166,6 +2195,12 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
+        if let Some((tag, _)) = registry.model(&args.model) {
+            bail!("{tag} is not downloaded; nothing to remove");
+        }
+        if !args.model.contains(std::path::MAIN_SEPARATOR) {
+            return Err(unknown_model_error(registry, &args.model));
+        }
         bail!("model not found: {}", path.display());
     }
     let mut targets = BTreeSet::from([path.clone()]);
@@ -2401,7 +2436,13 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             model_path = find_model_path(paths, registry, &args.model);
         }
     }
-    let model_path = model_path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let model_path = model_path.ok_or_else(|| {
+        anyhow!(
+            "model not found: {}{}",
+            args.model,
+            model_suggestions(registry, &args.model)
+        )
+    })?;
     if let Some(image) = &args.image {
         if !image.is_file() {
             bail!("image not found: {}", image.display());
@@ -2458,7 +2499,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         args.prompt.join(" ")
     };
     let host = config_string(&resolved, "serve.host")?;
-    let port = config_u64(&resolved, "serve.port")? as u16;
+    let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
     let force_local = run_should_force_local(&args);
     if !force_local && service_ready(&host, port, Duration::from_millis(150)) {
         return run_via_http(
@@ -2520,6 +2561,10 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     // daemon takes the EP/dense-TP route instead of the single-GPU one.
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
+    }
+    // `--max-seq` replaces any configured value, exactly as `bench --max-seq`.
+    if let Some(max_seq) = args.max_seq {
+        params["max_seq"] = serde_json::json!(max_seq);
     }
     apply_speculation_selector(&mut params, &selector)?;
     // Final effective selector wins: re-project inherited draft only when DFlash
@@ -2653,15 +2698,26 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
 
     let mut content = String::new();
     let stream = !args.no_stream && !args.json;
+    // End the streamed answer's line at `commit_ready`, before the commit is
+    // sent, so later daemon stderr never lands on the answer's line.
+    let mut line_ended = false;
     let done = engine.generate(&request, |event| {
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
-            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                content.push_str(text);
-                if stream {
-                    print!("{text}");
-                    std::io::stdout().flush()?;
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("token") => {
+                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                    content.push_str(text);
+                    if stream {
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
                 }
             }
+            Some("commit_ready") if stream && !line_ended => {
+                println!();
+                std::io::stdout().flush()?;
+                line_ended = true;
+            }
+            _ => {}
         }
         Ok(())
     })?;
@@ -2677,7 +2733,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         );
     } else if args.no_stream {
         println!("{content}");
-    } else {
+    } else if !line_ended {
         println!();
     }
     if args.stats && !args.json {
@@ -2913,6 +2969,7 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
         || args.kv_v.is_some()
         || args.kv_backend.is_some()
         || args.tp.is_some_and(|tp| tp > 1)
+        || args.max_seq.is_some()
         || args.head.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
@@ -3097,6 +3154,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             vision: None,
             idle_timeout: None,
             tp: None,
+            speculation: None,
+            max_seq: None,
             continuous_batch_size: None,
             foreground_child: false,
             ui: false,
@@ -3887,7 +3946,7 @@ pub(crate) fn load_params(
 /// really lives, not the models directory the draft was pulled into — then
 /// next to the target. An explicit draft always wins; a final `off` never
 /// carries a draft (`project_dflash_draft` strips it) and returns early.
-fn resolve_dflash_sidecar(
+pub(crate) fn resolve_dflash_sidecar(
     params: &mut serde_json::Value,
     entry: Option<&ModelEntry>,
     models_dir: &Path,
@@ -3907,7 +3966,7 @@ fn resolve_dflash_sidecar(
     let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
         if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
             bail!(
-                "DFlash draft required (dflash_mode=on) but {} is not a registry-managed artifact; pass developer.dflash_draft or use the registry tag",
+                "DFlash needs a draft model: {} is not a registry-managed artifact; add --model-draft <draft.hfq>, or run the model by its registry tag (which pairs its draft)",
                 model_path.display()
             );
         }
@@ -4161,7 +4220,10 @@ fn developer_dflash_draft(resolved: &hipfire_config::ResolvedConfig) -> Option<&
     }
 }
 
-fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
+pub(crate) fn apply_speculation_selector(
+    params: &mut serde_json::Value,
+    selector: &str,
+) -> Result<()> {
     match selector {
         "off" => {
             params["dflash_mode"] = serde_json::json!("off");
@@ -5050,7 +5112,7 @@ fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
 fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
-    let port = config_u64(&resolved, "serve.port")? as u16;
+    let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
     let pid_path = paths.root.join("serve.pid");
     let pid_record = fs::read_to_string(&pid_path)
         .ok()
@@ -8018,6 +8080,222 @@ fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> 
     candidates.into_iter().find(|path| path.is_file())
 }
 
+/// The hipfire home a process runs under, read from its environment with the
+/// `ConfigPaths::discover` rule (`HIPFIRE_HOME`, else `$HOME/.hipfire`).
+/// `None` when the environment is unreadable (another user's process).
+fn process_hipfire_home(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut hipfire_home = None;
+    let mut home = None;
+    for var in environ.split(|byte| *byte == 0) {
+        if let Some(value) = var.strip_prefix(b"HIPFIRE_HOME=") {
+            hipfire_home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+        } else if let Some(value) = var.strip_prefix(b"HOME=") {
+            home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+        }
+    }
+    hipfire_home.or_else(|| home.map(|home| home.join(".hipfire")))
+}
+
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// A live (non-zombie) process whose `argv[0]` is `daemon` (this install's
+/// daemon binary) and whose hipfire home is `root`.
+fn is_install_daemon(pid: u32, daemon: &Path, root: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    !argv0.is_empty()
+        && same_file_path(Path::new(std::ffi::OsStr::from_bytes(argv0)), daemon)
+        && process_hipfire_home(pid).is_some_and(|home| same_file_path(&home, root))
+}
+
+fn process_gone(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the parenthesised command name; `Z` is a zombie.
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        Err(_) => true,
+    }
+}
+
+/// PIDs this install may own a daemon under: the daemon pidfiles
+/// (`daemon*.pid` in the home and in `$HOME/.hipfire`, where the daemon writes
+/// them), the GPU-lock holders, and the children of the recorded serve PID.
+/// Every candidate is still verified by [`is_install_daemon`].
+fn install_daemon_candidates(paths: &Paths) -> BTreeSet<u32> {
+    let mut candidates = BTreeSet::new();
+    let first_pid = |raw: &str| raw.split_whitespace().next()?.parse::<u32>().ok();
+    let mut pid_dirs = vec![paths.root.clone()];
+    if let Some(home) = env::var_os("HOME") {
+        pid_dirs.push(PathBuf::from(home).join(".hipfire"));
+    }
+    let lock_dirs = match env::var_os("HIPFIRE_LOCK_DIR") {
+        Some(dir) => vec![PathBuf::from(dir)],
+        None => vec![
+            PathBuf::from("/run/lock/hipfire"),
+            PathBuf::from("/tmp/hipfire-locks"),
+        ],
+    };
+    let scan = |dir: &Path, prefix: &str, suffix: &str, out: &mut BTreeSet<u32>| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(prefix) && name.ends_with(suffix) {
+                if let Some(pid) = fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|raw| first_pid(&raw))
+                {
+                    out.insert(pid);
+                }
+            }
+        }
+    };
+    for dir in &pid_dirs {
+        scan(dir, "daemon", ".pid", &mut candidates);
+    }
+    for dir in &lock_dirs {
+        scan(dir, "gpu-", ".lock", &mut candidates);
+    }
+    if let Some(serve) = fs::read_to_string(paths.root.join("serve.pid"))
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw))
+    {
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", serve.pid)) {
+            for task in tasks.flatten() {
+                if let Ok(children) = fs::read_to_string(task.path().join("children")) {
+                    candidates.extend(
+                        children
+                            .split_whitespace()
+                            .filter_map(|pid| pid.parse::<u32>().ok()),
+                    );
+                }
+            }
+        }
+    }
+    candidates
+}
+
+/// `stop --force`: stop only this install's daemon processes — candidates from
+/// its pidfiles/GPU locks whose `argv[0]` is this install's daemon binary and
+/// whose hipfire home is this home. SIGTERM, then SIGKILL after 5 s for the
+/// ones still running (re-verified first). Returns the signalled PIDs.
+pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
+    let Some(daemon) = find_daemon(paths) else {
+        return Ok(Vec::new());
+    };
+    let own = std::process::id();
+    let targets = install_daemon_candidates(paths)
+        .into_iter()
+        .filter(|&pid| pid != own && is_install_daemon(pid, &daemon, &paths.root))
+        .collect::<Vec<_>>();
+    for &pid in &targets {
+        // SAFETY: plain kill(2) on a verified positive PID.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !targets.iter().all(|&pid| process_gone(pid)) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    for &pid in &targets {
+        if !process_gone(pid) && is_install_daemon(pid, &daemon, &paths.root) {
+            eprintln!("daemon PID {pid} ignored SIGTERM for 5 s; sending SIGKILL");
+            // SAFETY: as above, re-verified immediately before signalling.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+    Ok(targets)
+}
+
+/// Something accepts TCP connections on `host:port`.
+pub(crate) fn port_in_use(host: &str, port: u16) -> bool {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs().is_ok_and(|mut addrs| {
+        addrs.any(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+        })
+    })
+}
+
+/// Port of the running serve: the live `serve.pid` record's port (a serve
+/// started with a host:port positional or `-d` on another port), else
+/// `serve.port`.
+fn serve_probe_port(paths: &Paths, configured: u16) -> u16 {
+    fs::read_to_string(paths.root.join("serve.pid"))
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw))
+        .filter(|record| Path::new(&format!("/proc/{}", record.pid)).exists())
+        .and_then(|record| record.port)
+        .unwrap_or(configured)
+}
+
+/// Levenshtein distance over chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b = b.chars().collect::<Vec<_>>();
+    let mut row = (0..=b.len()).collect::<Vec<_>>();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != *cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+/// Up to three registry tags/aliases close to `input` (case-insensitive edit
+/// distance), then a pointer to the full list. Empty for path-like input.
+fn model_suggestions(registry: &RegistryV1, input: &str) -> String {
+    if input.contains(std::path::MAIN_SEPARATOR) {
+        return String::new();
+    }
+    let needle = input.to_lowercase();
+    let limit = (needle.chars().count() / 4).max(2);
+    let mut close = registry
+        .models
+        .keys()
+        .chain(registry.aliases.keys())
+        .map(|tag| (edit_distance(&needle, &tag.to_lowercase()), tag.as_str()))
+        .filter(|(distance, _)| *distance <= limit)
+        .collect::<Vec<_>>();
+    close.sort_unstable();
+    close.dedup_by(|a, b| a.1 == b.1);
+    let mut message = String::new();
+    if !close.is_empty() {
+        let tags = close
+            .iter()
+            .take(3)
+            .map(|(_, tag)| *tag)
+            .collect::<Vec<_>>();
+        message.push_str(&format!("\n  did you mean: {}?", tags.join(", ")));
+    }
+    message.push_str("\n  see: hipfire list -r");
+    message
+}
+
+fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
+    anyhow!(
+        "unknown model '{input}'{}",
+        model_suggestions(registry, input)
+    )
+}
+
 pub(crate) fn request_f64(
     resolved: &hipfire_config::ResolvedConfig,
     key: &str,
@@ -10595,6 +10873,78 @@ mod tests {
     }
 
     #[test]
+    fn unknown_model_suggests_close_tags_and_list() {
+        let registry = rm_test_registry(&[
+            ("qwen3.5:4b", "qwen3.5-4b.mq4", None),
+            ("qwen3.5:9b", "qwen3.5-9b.mq4", None),
+            ("qwen3.8:27b-mq4", "qwen3.8-27b.mq4", None),
+        ]);
+        let message = unknown_model_error(&registry, "qwen3.5:4bb").to_string();
+        assert!(
+            message.starts_with("unknown model 'qwen3.5:4bb'"),
+            "{message}"
+        );
+        assert!(message.contains("did you mean: qwen3.5:4b"), "{message}");
+        assert!(message.ends_with("see: hipfire list -r"), "{message}");
+        let message = unknown_model_error(&registry, "QWEN35:4B").to_string();
+        assert!(message.contains("did you mean: qwen3.5:4b"), "{message}");
+        let message = unknown_model_error(&registry, "llama3:8b").to_string();
+        assert!(!message.contains("did you mean"), "{message}");
+        assert!(message.contains("see: hipfire list -r"), "{message}");
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn rm_of_known_tag_not_downloaded_says_so() {
+        let paths = test_paths("rm-not-downloaded");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b", "qwen3.8-27b.mq4", None)]);
+        let rm = |model: &str| {
+            rm_with_registry(
+                &paths,
+                &registry,
+                RmArgs {
+                    model: model.into(),
+                    yes: true,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert_eq!(
+            rm("qwen3.8:27b"),
+            "qwen3.8:27b is not downloaded; nothing to remove"
+        );
+        assert!(rm("qwen3.8:27bb").contains("did you mean: qwen3.8:27b"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn serve_and_run_accept_spec_and_max_seq() {
+        let parsed =
+            Cli::try_parse_from(["hipfire", "serve", "--spec", "off", "--max-seq", "8192"])
+                .unwrap();
+        let Some(Commands::Serve(args)) = parsed.command else {
+            panic!("expected serve command")
+        };
+        assert_eq!(args.speculation.as_deref(), Some("off"));
+        assert_eq!(args.max_seq, Some(8192));
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--spec", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--max-seq", "1"]).is_err());
+        let parsed =
+            Cli::try_parse_from(["hipfire", "run", "qwen3.5:4b", "--max-seq", "4096", "hi"])
+                .unwrap();
+        let Some(Commands::Run(args)) = parsed.command else {
+            panic!("expected run command")
+        };
+        assert_eq!(args.max_seq, Some(4096));
+        assert!(
+            run_should_force_local(&args),
+            "--max-seq needs a local load"
+        );
+    }
+
+    #[test]
     fn rm_keeps_shared_dflash_sidecar_while_sibling_target_present() {
         // The hw-gate regression on PR #686: `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`,
         // and `qwen3.8:27b-mq4-xt` all declare `qwen38-27b-dflash-mq4.hfq`.
@@ -11149,7 +11499,7 @@ mod tests {
             message.contains("not a registry-managed artifact"),
             "{message}"
         );
-        assert!(message.contains("developer.dflash_draft"), "{message}");
+        assert!(message.contains("--model-draft"), "{message}");
         let resolved = resolved_with_dflash_mode("auto", None);
         let params = load_params(
             &resolved,
@@ -12629,6 +12979,8 @@ mod tests {
                     kv_backend_override: None,
                     vision_override: None,
                     tp: None,
+                    speculation_override: None,
+                    max_seq_override: None,
                     continuous_batch_size: 1,
                     vmm_batch: crate::serve::VmmBatchFlags::default(),
                     multi_slot_enabled: false,
@@ -15152,6 +15504,7 @@ mod tests {
             head: Some("q4k".into()),
             kv_backend: None,
             tp: None,
+            max_seq: None,
             speculation: None,
             model_draft: None,
             vision: None,
