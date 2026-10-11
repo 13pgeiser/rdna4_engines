@@ -234,6 +234,11 @@ struct Layer {
      * routed layer's fpost1 + fpost2 + fsum + fpost + add_f + scale. Zero where not served, and
      * then the chain above is declared and issued instead. */
     rad_op op_join_a = 0, op_join_f = 0;
+    /* op_join_f also writes the NEXT norm -- the following layer's input norm, or the final norm
+     * after the last layer -- into `h`, with that norm's gain `w_next`; the norm it replaces is
+     * then neither declared nor issued. */
+    bool next_norm = false;
+    rad_weight w_next = 0;
     /* the drafter's tap, on a layer the drafter reads (see declare) */
     rad_op op_tap = 0;
 };
@@ -989,6 +994,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     int n_joins = 0;
 
     const int A = RAD_ACCESS_PER_TOKEN, N = RAD_SHARD_NONE;
+    /* EVERY LAYER'S INPUT NORM GAIN, AHEAD OF THE LAYERS: a feed-forward join writes the next
+     * layer's input norm (join_add_scale's `y`) and so names that layer's gain before the layer
+     * itself is declared. */
+    for (int64_t l = 0; l < m.n_layer; ++l) {
+        const long long ll = (long long)l;
+        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_norm.weight", ll),
+                              nm.ckpt("%s.layers.%lld.input_layernorm.weight", L, ll)));
+        m.layers[(size_t)l].w_anorm = decl_w(b, nm.f("blk.%lld.attn_norm.weight", ll), RAD_F32,
+                                             {E}, A, N, grp_layer((int)l));
+    }
+
     for (int64_t l = 0; l < m.n_layer; ++l) {
         Layer& y = m.layers[(size_t)l];
         y.full = full[(size_t)l];
@@ -1000,13 +1016,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(rad_bind_layer_kv(b, li, k.kv));
 
         /* ------------------------------------------------ attention: weights */
-        RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_norm.weight", ll), src("input_layernorm.weight")));
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_q_norm.weight", ll), src("self_attn.q_norm.weight")));
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_k_norm.weight", ll), src("self_attn.k_norm.weight")));
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_output.weight", ll), src("self_attn.o_proj.weight")));
         RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.attn_post_norm.weight", ll),
                               src("post_attention_layernorm.weight")));
-        y.w_anorm = decl_w(b, nm.f("blk.%lld.attn_norm.weight", ll), RAD_F32, {E}, A, N, gl);
         /* bf16 gains: `qk_norm_rope` reads its gains at the activation's width. */
         y.w_qn    = decl_w(b, nm.f("blk.%lld.attn_q_norm.weight", ll), RAD_BF16, {k.hd}, A, N, gl);
         y.w_kn    = decl_w(b, nm.f("blk.%lld.attn_k_norm.weight", ll), RAD_BF16, {k.hd}, A, N, gl);
@@ -1049,7 +1063,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         /* ------------------------------------------------ attention: ops, in issue order (the
          * attention op is declared ahead of its kv_store, which reads the block size off it). */
-        y.op_anorm = rmsnorm(T, E, y.w_anorm, 1.0, m.b_x, m.b_h);
+        if (!(l > 0 && m.layers[(size_t)l - 1].next_norm))
+            y.op_anorm = rmsnorm(T, E, y.w_anorm, 1.0, m.b_x, m.b_h);
         if (!y.full) {
             y.op_qkv  = gemm(T, k.q() + 2 * k.kv_dim(), E, y.w_qkv, m.b_h, m.b_qkv);
             y.op_qknr = rw(b, RAD_OP(b, "qk_norm_rope",
@@ -1294,11 +1309,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (!y.op_enorm || !y.op_egu || !y.op_edn || (y.dn_fp8 && !y.op_eq)) return RAD_E_INVAL;
             if (W > 1) y.op_ar_f = allreduce(2 * T * E, m.b_ff2);
             if (fuse_joins)
+            {
+                /* ...and the norm that reads the x it writes: the next layer's input norm, or the
+                 * final norm after the last layer -- one launch and one read of x the less. */
+                const rad_weight w_next = l + 1 < m.n_layer ? m.layers[(size_t)l + 1].w_anorm
+                                                            : m.w_onorm;
                 y.op_join_f = rw(b, RAD_OP(b, "join_add_scale",
                                         RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
                                                    RAD_F64("eps", eps), RAD_STR("dtype", "bf16")),
-                                        RAD_WEIGHTS(y.w_fpost1, y.w_fpost2, y.w_fpost, y.w_scalar)),
-                                 {m.b_ff2, m.b_x}, {m.b_x});
+                                        RAD_WEIGHTS(y.w_fpost1, y.w_fpost2, y.w_fpost, y.w_scalar,
+                                                    w_next)),
+                                 {m.b_ff2, m.b_x}, {m.b_x, m.b_h});
+                if (y.op_join_f) { y.next_norm = true; y.w_next = w_next; }
+            }
             if (!y.op_join_f) {
                 y.op_fpost1 = rmsnorm(T, E, y.w_fpost1, 1.0, m.b_ff2, m.b_ff2);
                 y.op_fpost2 = rmsnorm(T, E, y.w_fpost2, 1.0, m.b_ff2, m.b_ff2);
@@ -1335,7 +1358,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               {m.b_x}, {m.b_dfsrc});
     }
 
-    m.op_onorm  = rmsnorm(T, E, m.w_onorm, 1.0, m.b_x, m.b_h);
+    if (m.layers.empty() || !m.layers.back().next_norm)
+        m.op_onorm = rmsnorm(T, E, m.w_onorm, 1.0, m.b_x, m.b_h);
     m.op_gather = rw(b, RAD_OP(b, "gather_rows",
                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", E),
                                      RAD_STR("dtype", "bf16")),
@@ -1514,7 +1538,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const RadOperand bt  = praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0);
         const RadOperand su  = praw(used, RAD_I32, batch->n_seq);
 
-        RAD_ISSUE(c, y.op_anorm, brows(m.b_x, T), RAD_W(y.w_anorm), brows(m.b_h, T));
+        if (y.op_anorm) RAD_ISSUE(c, y.op_anorm, brows(m.b_x, T), RAD_W(y.w_anorm), brows(m.b_h, T));
         if (!y.full) {
             const int64_t qd = k.q(), kvd = k.kv_dim();
             RAD_ISSUE(c, y.op_qkv, brows(m.b_h, T), RAD_W(y.w_qkv), brows(m.b_qkv, T));
@@ -1559,7 +1583,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
             if (y.op_join_f) {
                 RAD_ISSUE(c, y.op_join_f, brows(m.b_ff2, T), RAD_W(y.w_fpost1),
                           brow_slice(m.b_ff2, T, T, E), RAD_W(y.w_fpost2), RAD_W(y.w_fpost),
-                          brows(m.b_x, T), RAD_W(y.w_scalar));
+                          brows(m.b_x, T), RAD_W(y.w_scalar), RAD_W(y.w_next), brows(m.b_h, T));
             } else {
                 RAD_ISSUE(c, y.op_fpost1, brows(m.b_ff2, T), RAD_W(y.w_fpost1), brows(m.b_ff2, T));
                 RAD_ISSUE(c, y.op_fpost2, brow_slice(m.b_ff2, T, T, E), RAD_W(y.w_fpost2),
@@ -1585,7 +1609,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         }
     }
 
-    RAD_ISSUE(c, m.op_onorm, brows(m.b_x, T), RAD_W(m.w_onorm), brows(m.b_h, T));
+    if (m.op_onorm) RAD_ISSUE(c, m.op_onorm, brows(m.b_x, T), RAD_W(m.w_onorm), brows(m.b_h, T));
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.b_h, T),
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.b_hout, batch->n_out));

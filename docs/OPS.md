@@ -299,13 +299,15 @@ rounding.
 | op | params | operands |
 |---|---|---|
 | `norm_add_norm` | `M`(range) `n` `eps`:f64 `dtype` | `a`, `w_a`w, `x`:inout, `w_y`w → `y` |
-| `join_add_scale` | `M`(range) `n` `eps`:f64 `dtype` | `d`, `w_d`w, `r`, `w_r`w, `w_j`w, `x`:inout, `s`w |
+| `join_add_scale` | `M`(range) `n` `eps`:f64 `dtype` | `d`, `w_d`w, `r`, `w_r`w, `w_j`w, `x`:inout, `s`w, `w_n`w? → `y`? |
 
 Gemma's sandwich norms, each one kernel in place of a chain of `rmsnorm`, `add` and `mul_weight`.
 `norm_add_norm` is `t = rmsnorm(a) * w_a; x += t; y = rmsnorm(x) * w_y` -- a post-norm, the
 residual add, the next pre-norm. `join_add_scale` is `x = (x + rmsnorm(rmsnorm(d) * w_d +
 rmsnorm(r) * w_r) * w_j) * s` -- two arms' post-norms, their sum, its norm, the residual add and a
-one-element layer scalar (Gemma 4's MoE feed-forward). Every value the chain stores is rounded to
+one-element layer scalar (Gemma 4's MoE feed-forward) -- and, given `w_n` and `y` (both or
+neither), `y = rmsnorm(x) * w_n` over the `x` it writes: the next layer's input norm, or the final
+norm after the last layer, which would otherwise be a launch of its own reading that `x` back. Every value the chain stores is rounded to
 the activation dtype at the same point, so the two differ from the chain only in the order a sum
 of squares is added in: with the same order they are bit-identical to it, and against a chain
 summed in another block width a norm factor can differ in its last bit.

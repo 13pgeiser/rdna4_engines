@@ -82,6 +82,8 @@ static const RadOperandSpec oJas[] = {
     { "w_j", RAD_OPD_WEIGHT, 0 },
     { "x",   RAD_OPD_INOUT,  0 },
     { "s",   RAD_OPD_WEIGHT, 0 },
+    { "w_n", RAD_OPD_WEIGHT, 1 },
+    { "y",   RAD_OPD_OUT,    1 },
 };
 static const RadOpSchema kSchemas[] = {
     { "pair_argmax", ROW(pPick), ROW(oPick),
@@ -95,8 +97,9 @@ static const RadOpSchema kSchemas[] = {
       "point. A post-norm, the residual add and the next pre-norm (Gemma's sandwich)." },
     { "join_add_scale", ROW(pJoin), ROW(oJas),
       "x = (x + rmsnorm(rmsnorm(d) * w_d + rmsnorm(r) * w_r) * w_j) * s, over [M, n] rows, s one "
-      "element; rounding where the unfused chain rounds. Two arms' post-norms, their sum, its norm, "
-      "the residual add and a per-layer scalar (Gemma 4's feed-forward join)." },
+      "element; and with w_n and y, y = rmsnorm(x) * w_n over the x written. Rounding where the "
+      "unfused chain rounds. Two arms' post-norms, their sum, its norm, the residual add, a "
+      "per-layer scalar and the next layer's input norm (Gemma 4's feed-forward join)." },
 };
 
 /* ==================================================================== operand descriptions
@@ -279,6 +282,9 @@ int norm_add_norm_host(const RadArgs* a, RadStream) {
 
 int join_add_scale_host(const RadArgs* a, RadStream) {
     if (!a || a->n_t < 7) return RAD_E_INVAL;
+    const RadTensor *Wn = a->n_t > 7 ? rad_arg_in(a, 7) : nullptr,
+                    *Y  = a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
+    if (!Wn != !Y) return RAD_E_INVAL;
     const int64_t n = rad_args_geti_or(a, "n", 0);
     const double eps = rad_args_getf_or(a, "eps", 1e-6);
     const RadTensor *D = rad_arg_in(a, 0), *Wd = rad_arg_in(a, 1), *R = rad_arg_in(a, 2),
@@ -287,9 +293,11 @@ int join_add_scale_host(const RadArgs* a, RadStream) {
     if (n <= 0 || !D || !R || !X || !Sc) return RAD_E_INVAL;
     if (!hgain(Wd, n) || !hgain(Wr, n) || !hgain(Wj, n)) return RAD_E_DTYPE;
     if (Sc->dtype != RAD_BF16 || rad_tensor_numel(Sc) != 1) return RAD_E_DTYPE;
-    int64_t rd, ld, rr, lr, rx, lx;
+    if (Wn && !hgain(Wn, n)) return RAD_E_DTYPE;
+    int64_t rd, ld, rr, lr, rx, lx, ry = 0, ly = 0;
     if (!hrows(D, n, &rd, &ld) || !hrows(R, n, &rr, &lr) || !hrows(X, n, &rx, &lx)) return RAD_E_SHAPE;
-    if (rd < rx || rr < rx) return RAD_E_SHAPE;
+    if (Y && !hrows(Y, n, &ry, &ly)) return RAD_E_SHAPE;
+    if (rd < rx || rr < rx || (Y && ry < rx)) return RAD_E_SHAPE;
     const float *wd = (const float*)Wd->data, *wr = (const float*)Wr->data, *wj = (const float*)Wj->data;
     const float sc = hb2f(*(const uint16_t*)Sc->data);
     std::vector<float> dv((size_t)n), rv((size_t)n);
@@ -305,6 +313,13 @@ int join_add_scale_host(const RadArgs* a, RadStream) {
         for (int64_t i = 0; i < n; ++i) {
             const float x1 = hrbf(hb2f(xr[i]) + hrbf((dv[(size_t)i] * sj) * wj[i]));
             xr[i] = hf2b(x1 * sc);
+            rv[(size_t)i] = hb2f(xr[i]);
+        }
+        if (Y) {
+            const float* wn = (const float*)Wn->data;
+            uint16_t* yr = (uint16_t*)Y->data + m * ly;
+            const float sn = hnorm(rv.data(), n, eps);
+            for (int64_t i = 0; i < n; ++i) yr[i] = hf2b((rv[(size_t)i] * sn) * wn[i]);
         }
     }
     return RAD_OK;

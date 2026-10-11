@@ -7,9 +7,10 @@
  *   norm_add_norm    the attention's join:   t = norm(a) * w_a;  x += t;  y = norm(x) * w_y
  *                    (post_attention_layernorm, the residual add, pre_feedforward_layernorm)
  *   join_add_scale   the feed-forward's:     d' = norm(d) * w_d;  r' = norm(r) * w_r;
- *                    j = norm(d' + r') * w_j;  x = (x + j) * s
+ *                    j = norm(d' + r') * w_j;  x = (x + j) * s;  and optionally y = norm(x) * w_n
  *                    (post_feedforward_layernorm_1 and _2, the arms' sum, post_feedforward_layernorm,
- *                    the residual add, layer_scalar)
+ *                    the residual add, layer_scalar -- and the NEXT layer's input_layernorm, or the
+ *                    final norm after the last layer, which read the x this writes)
  *
  * THE SAME FUNCTION AS THE CHAIN, ROUNDING FOR ROUNDING. Every value the chain stores as bf16 is
  * rounded to bf16 here at the same point, and every element is computed with libr4d's own
@@ -74,6 +75,7 @@ struct NormArgs {
     const float*    w0;                     /* w_a, or w_d */
     const float*    w1;                     /* w_y, or w_r */
     const float*    w2;                     /*        w_j */
+    const float*    w3;                     /*        w_n, the next norm's gain (or null) */
     const uint16_t* s;                      /*        the layer scalar, bf16, one element */
     int   n;
     float eps;
@@ -118,7 +120,9 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
     }
 }
 
-/* x = (x + norm(norm(d) * w_d + norm(r) * w_r) * w_j) * s */
+/* x = (x + norm(norm(d) * w_d + norm(r) * w_r) * w_j) * s, and with NEXT y = norm(x) * w_n: the
+ * next layer's input norm taken over the bf16 x this stores, which is what that norm would read. */
+template <bool NEXT>
 __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
     __shared__ float lds[kWaves];
     const int tid = (int)threadIdx.x, n = A.n;
@@ -155,13 +159,28 @@ __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
     }
     const float sj = norm_factor(block_sum(ss, lds), n, A.eps);
     const float sc = bf2f(*A.s);
+    ss = 0.0f;
 #pragma unroll
     for (int k = 0; k < kMaxPer; ++k) {
         const int i = tid + k * kThreads;
         if (i < n) {
             const float j = rbf((dv[k] * sj) * A.w2[i]);
             const float x1 = rbf(bf2f(xr[i]) + j);
-            xr[i] = f2bf(x1 * sc);
+            const uint16_t xn = f2bf(x1 * sc);
+            xr[i] = xn;
+            rv[k] = bf2f(xn);                        /* the new x, kept for the next norm */
+        } else {
+            rv[k] = 0.0f;
+        }
+        if (NEXT) ss += rv[k] * rv[k];
+    }
+    if (NEXT) {
+        const float sn = norm_factor(block_sum(ss, lds), n, A.eps);
+        uint16_t* yr = A.y + m * A.y_ld;
+#pragma unroll
+        for (int k = 0; k < kMaxPer; ++k) {
+            const int i = tid + k * kThreads;
+            if (i < n) yr[i] = f2bf((rv[k] * sn) * A.w3[i]);
         }
     }
 }
@@ -219,7 +238,7 @@ int g4k_norm_add_norm_bf16(const RadArgs* a, RadStream stream) {
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
-/* operands: d, w_d, r, w_r, w_j, x (inout), s */
+/* operands: d, w_d, r, w_r, w_j, x (inout), s, w_n?, y? -- the last two both or neither */
 int g4k_join_add_scale_bf16(const RadArgs* a, RadStream stream) {
     using namespace g4kn;
     if (!a || a->n_t < 7) return RAD_E_INVAL;
@@ -232,20 +251,31 @@ int g4k_join_add_scale_bf16(const RadArgs* a, RadStream stream) {
     if (!D || !R || !X || !Sc) return RAD_E_INVAL;
     if (!gain(Wd, n) || !gain(Wr, n) || !gain(Wj, n)) return RAD_E_DTYPE;
     if (Sc->dtype != RAD_BF16 || rad_tensor_numel(Sc) != 1) return RAD_E_DTYPE;
-    int64_t rd = 0, ld = 0, rr = 0, lr = 0, rx = 0, lx = 0;
+    const RadTensor *Wn = a->n_t > 7 ? rad_arg_in(a, 7) : nullptr,
+                    *Y  = a->n_t > 8 ? rad_arg_in(a, 8) : nullptr;
+    if (!Wn != !Y) return RAD_E_INVAL;
+    if (Wn && !gain(Wn, n)) return RAD_E_DTYPE;
+    int64_t rd = 0, ld = 0, rr = 0, lr = 0, rx = 0, lx = 0, ry = 0, ly = 0;
     if (!rows_of(D, n, &rd, &ld) || !rows_of(R, n, &rr, &lr) || !rows_of(X, n, &rx, &lx))
         return RAD_E_SHAPE;
+    if (Y && !rows_of(Y, n, &ry, &ly)) return RAD_E_SHAPE;
     const int64_t M = rx;                            /* the step's rows: the stream's view */
     if (M <= 0) return RAD_OK;
-    if (rd < M || rr < M || M > 0x7fffffff) return RAD_E_SHAPE;
+    if (rd < M || rr < M || (Y && ry < M) || M > 0x7fffffff) return RAD_E_SHAPE;
     NormArgs P{};
     P.d = (const uint16_t*)D->data;  P.d_ld = ld;
     P.r = (const uint16_t*)R->data;  P.r_ld = lr;
     P.x = (uint16_t*)X->data;        P.x_ld = lx;
     P.w0 = (const float*)Wd->data;   P.w1 = (const float*)Wr->data;   P.w2 = (const float*)Wj->data;
     P.s = (const uint16_t*)Sc->data;
+    if (Y) { P.w3 = (const float*)Wn->data; P.y = (uint16_t*)Y->data; P.y_ld = ly; }
     P.n = (int)n; P.eps = eps;
-    G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel), dim3((unsigned)M), dim3(kThreads), (hipStream_t)stream, P);
+    if (Y)
+        G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel<true>), dim3((unsigned)M), dim3(kThreads),
+                   (hipStream_t)stream, P);
+    else
+        G4K_LAUNCH(G4K_KNAME(join_add_scale_kernel<false>), dim3((unsigned)M), dim3(kThreads),
+                   (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

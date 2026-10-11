@@ -3640,3 +3640,39 @@ TEST(gemma4_sliding_attention_reads_q_in_the_fused_row) {
     CHECK(std::find(at->reads.begin(), at->reads.end(), (rad_buf)qkv) != at->reads.end());
     CHECK_EQ(count_op(b, "cast"), 0);   /* no drafter here, so no taps either */
 }
+
+/* The feed-forward join writes the next layer's input norm: with the joins served, the only
+ * rmsnorm from the residual `x` into `h` is layer 0's (nothing precedes it), the final norm is the
+ * last join's, and every join writes `h`. Refused, the chain declares all of them again. */
+TEST(gemma4_feed_forward_join_writes_the_next_input_norm) {
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        if (refuse) { b.refuse.insert("norm_add_norm"); b.refuse.insert("join_add_scale"); }
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        const int x = buf_named(b, "x"), h = buf_named(b, "h");
+        REQUIRE(x > 0 && h > 0);
+        int x_to_h = 0, joins_to_h = 0;
+        for (const auto& o : b.ops) {
+            if (!o.resolved) continue;
+            const bool rx = std::find(o.reads.begin(), o.reads.end(), (rad_buf)x) != o.reads.end();
+            const bool wh = std::find(o.writes.begin(), o.writes.end(), (rad_buf)h) != o.writes.end();
+            if (o.op == "rmsnorm" && rx && wh) ++x_to_h;
+            if (o.op == "join_add_scale" && wh) ++joins_to_h;
+        }
+        /* fused: layer 0's input norm. Chained: six input norms, six pre-feedforward norms, the
+         * final norm. */
+        CHECK_EQ(x_to_h, refuse ? 13 : 1);
+        CHECK_EQ(joins_to_h, refuse ? 0 : 6);
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> issued = issued_ops(b, c);
+        CHECK_EQ(count_issued(issued, "join_add_scale"), refuse ? 0 : 6);
+        CHECK_EQ(count_issued(issued, "logits_gemm"), 1);
+    }
+}
