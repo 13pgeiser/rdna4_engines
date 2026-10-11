@@ -48,7 +48,7 @@ use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::external_rows::{RowFetch, RowTicket};
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
-use rdna_compute::replay::{ReplayState, ShadowBodyRoute};
+use rdna_compute::replay::{ReplayController, ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
@@ -4041,6 +4041,41 @@ impl Qwen4GpuForward {
     }
 }
 
+/// A recorded capture body that cannot become a prepared tape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureCensusError {
+    /// The recorder saw a different number of launches than the body issued
+    /// (#397-style truncated tape).
+    LaunchMismatch { launched: usize, recorded: usize },
+}
+
+impl fmt::Display for CaptureCensusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LaunchMismatch { launched, recorded } => write!(
+                f,
+                "qwen4 capture census mismatch: {launched} launched, {recorded} recorded \
+                 (truncated tape refused)"
+            ),
+        }
+    }
+}
+
+/// Fail closed on a census mismatch: poison the retained route (sticky HIP
+/// fallback) so the tape is never closed, prepared or installed.
+fn gate_capture_census(
+    replay: &mut ReplayController,
+    launched: usize,
+    recorded: usize,
+) -> Result<(), CaptureCensusError> {
+    if launched == recorded {
+        return Ok(());
+    }
+    let error = CaptureCensusError::LaunchMismatch { launched, recorded };
+    replay.poison(error.to_string());
+    Err(error)
+}
+
 /// Close a recorded Qwen4 body: census, then install the prepared plan, or refuse
 /// it for a measurement-only capture.
 ///
@@ -4082,6 +4117,12 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
         eprintln!("[redline] qwen4: {reason}");
         return;
     }
+    // A truncated tape must never be prepared: refuse before the sync, close
+    // and prepare below so no plan can be installed from it.
+    if let Err(error) = gate_capture_census(&mut gpu.replay, computed, recorded) {
+        eprintln!("[redline] falling back to HIP: {error}");
+        return;
+    }
     if let Err(reason) = gpu.hip.device_synchronize() {
         let reason = format!("qwen4 capture sync failed: {reason:?}");
         gpu.replay.poison(reason.clone());
@@ -4113,6 +4154,39 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
             gpu.replay.poison(reason.clone());
             eprintln!("[redline] falling back to HIP: {reason}");
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_census_tests {
+    use super::{gate_capture_census, CaptureCensusError};
+    use rdna_compute::replay::{ReplayBackendRequest, ReplayController, ReplayState};
+
+    #[test]
+    fn census_mismatch_poisons_route_and_refuses_tape() {
+        let mut replay = ReplayController::new(ReplayBackendRequest::Auto);
+        assert_eq!(replay.state(), ReplayState::RecordingWarmup);
+        let error = gate_capture_census(&mut replay, 7, 5).unwrap_err();
+        assert_eq!(
+            error,
+            CaptureCensusError::LaunchMismatch { launched: 7, recorded: 5 }
+        );
+        let text = error.to_string();
+        assert!(text.contains("7 launched") && text.contains("5 recorded"), "{text}");
+        // Poisoned: the route is on HIP, the capture can no longer be closed
+        // into a tape, and the reason carries both counts.
+        assert_eq!(replay.state(), ReplayState::Fallback);
+        assert!(replay.finish_capture().is_err());
+        let reason = replay.fallback_reason().expect("fallback reason");
+        assert!(reason.contains("7 launched") && reason.contains("5 recorded"), "{reason}");
+    }
+
+    #[test]
+    fn census_equal_is_accepted_without_touching_route() {
+        let mut replay = ReplayController::new(ReplayBackendRequest::Auto);
+        assert_eq!(gate_capture_census(&mut replay, 5, 5), Ok(()));
+        assert_eq!(replay.state(), ReplayState::RecordingWarmup);
+        assert!(replay.fallback_reason().is_none());
     }
 }
 

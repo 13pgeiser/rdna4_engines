@@ -716,6 +716,14 @@ Two fresh processes, `.mq4r` artifact, greedy, two different prompt lengths:
 `launched` is an independent count from `hip_bridge::launch_counters` (every
 launch, funnel or raw), so the comparison is not the recorder grading itself.
 
+The finalization hook treats an unequal census as a typed capture refusal:
+it poisons the retained route before closing or preparing the tape, logs the
+launched and recorded counts plus the HIP fallback, and leaves the completed
+warmup output intact. Later forwards use ordinary HIP. A matching census is
+necessary, not sufficient: effect and binding validation still gate preparation.
+Shared launchers, including `Gpu::silu_f32`, use `launch_maybe_blob` so graph
+capture and retained recording own their kernarg bytes rather than stack pointers.
+
 **What the census found.** Three things, only one of which was expected:
 
 1. **A recorder gap G1 missed.** The first run reconciled at 2786/2787: one kernel
