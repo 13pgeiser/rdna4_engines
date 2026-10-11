@@ -21,9 +21,11 @@
 //! The pack is ordinary file data: page-cache pages of it are clean, so under
 //! memory pressure the kernel drops them (and reads them again from the pack
 //! when needed) instead of writing anything to swap.  After the model is
-//! ready, a prewarm reads the pack's hottest prefix sequentially while no
-//! request is being served: every PLE fetch holds `busy`, and the prewarm
-//! resumes `BUSY_QUIET` after the last one.
+//! ready, a prewarm reads the pack's data from its start (hottest tier
+//! first), then reads tier 0 a second time so its pages are promoted to the
+//! active list and outlive the colder ones when the cache is reclaimed.  It
+//! runs while no request is being served: every PLE fetch holds `busy`, and
+//! the prewarm resumes `BUSY_QUIET` after the last one.
 //!
 //! # Public API (exact signatures)
 //!
@@ -515,6 +517,8 @@ pub struct HotRowStore {
     prewarm_budget: AtomicU64,
     prewarmed: AtomicU64,
     prewarm_done: AtomicBool,
+    /// Bytes of tier 0 re-read by the prewarm's second phase.
+    retouched: AtomicU64,
     /// Time base of `busy_at_ms`.
     created: Instant,
     /// Milliseconds after `created` (plus one; 0 = never) at which the last
@@ -686,6 +690,7 @@ impl HotRowStore {
             prewarm_budget: AtomicU64::new(BUDGET_UNSET),
             prewarmed: AtomicU64::new(0),
             prewarm_done: AtomicBool::new(false),
+            retouched: AtomicU64::new(0),
             created: Instant::now(),
             busy_at_ms: AtomicU64::new(0),
             busy_active: AtomicUsize::new(0),
@@ -743,9 +748,14 @@ impl HotRowStore {
         self.prewarmed.load(Ordering::Relaxed)
     }
 
-    /// The prewarm read its whole budget.
+    /// The prewarm read its budget (phase 1) and re-touched tier 0 (phase 2).
     pub fn prewarm_complete(&self) -> bool {
         self.prewarm_done.load(Ordering::Acquire)
+    }
+
+    /// Bytes of tier 0 the prewarm's second phase has re-read so far.
+    pub fn retouched_bytes(&self) -> u64 {
+        self.retouched.load(Ordering::Relaxed)
     }
 
     /// Rows served from the pack.
@@ -994,8 +1004,16 @@ impl HotRowStore {
         ))
     }
 
-    /// Read the first `budget` bytes of the pack's rows (the hottest tiers)
-    /// sequentially, so the page cache holds them, pausing while requests run.
+    /// Prewarm the pack's hottest `budget` bytes into the page cache while no
+    /// request is being served.  Reads only the pack (`pack_path`,
+    /// `data_offset`, `tier_base`), never the source model file.
+    ///
+    /// Phase 1 reads the pack's data from its start, hottest tier first, so
+    /// early requests hit sooner after load.  Phase 2 then reads tier 0 (the
+    /// first `tier_base[1]` bytes, clipped to the budget) a second time: a
+    /// page touched twice is promoted to the kernel's active list, so the
+    /// hottest rows stay resident when the cache is reclaimed.  Both phases
+    /// pause while a PLE fetch runs ([`HotRowStore::busy`]).
     fn prewarm(&self, budget: u64) {
         if budget == 0 {
             self.prewarm_done.store(true, Ordering::Release);
@@ -1012,39 +1030,82 @@ impl HotRowStore {
         let started = Instant::now();
         let mut paused = Duration::ZERO;
         let mut buffer = vec![0u8; PREWARM_CHUNK];
-        let end = self.data_offset + budget;
-        let mut offset = self.data_offset;
-        while offset < end {
-            let idle_from = Instant::now();
-            if !self.wait_until_idle() {
-                return;
-            }
-            paused += idle_from.elapsed();
-            let len = ((end - offset) as usize).min(PREWARM_CHUNK);
-            if let Err(error) = read_exact_at(&file, offset, &mut buffer[..len]) {
-                eprintln!(
-                    "{TAG}: prewarm stopped at {:.2} GiB: {error}",
-                    gib(offset - self.data_offset)
-                );
-                return;
-            }
-            offset += len as u64;
-            self.prewarmed
-                .store(offset - self.data_offset, Ordering::Relaxed);
+        let budget = budget.min(self.data_bytes);
+        let tier0_end = self
+            .tier_base
+            .get(1)
+            .copied()
+            .unwrap_or(self.data_offset + self.data_bytes);
+        let (fill, touch) = prewarm_spans(self.data_offset, tier0_end, budget);
+        if !self.read_span(&file, &mut buffer, &mut paused, fill, &self.prewarmed) {
+            return;
+        }
+        let filled = started.elapsed();
+        if !self.read_span(&file, &mut buffer, &mut paused, touch, &self.retouched) {
+            return;
         }
         self.prewarm_done.store(true, Ordering::Release);
         let reading = started.elapsed().saturating_sub(paused).as_secs_f64();
+        let retouched = self.retouched.load(Ordering::Relaxed);
         eprintln!(
-            "{TAG}: prewarm complete: {:.2} GiB of {:.2} GiB in {:.1} s ({:.2} GB/s reading, {:.1} s \
-             paused for requests), MemAvailable {:.1} GiB",
+            "{TAG}: prewarm complete: {:.2} GiB of {:.2} GiB (hottest first) in {:.1} s, then tier 0 \
+             re-touched ({:.2} GiB, {:.1} s); {:.2} GB/s reading, {:.1} s paused for requests, \
+             MemAvailable {:.1} GiB",
             gib(budget),
             gib(self.data_bytes),
-            started.elapsed().as_secs_f64(),
-            budget as f64 / 1e9 / reading.max(1e-9),
+            filled.as_secs_f64(),
+            gib(retouched),
+            (started.elapsed() - filled).as_secs_f64(),
+            (budget + retouched) as f64 / 1e9 / reading.max(1e-9),
             paused.as_secs_f64(),
             mem_available_bytes().map_or(f64::NAN, gib),
         );
     }
+
+    /// Read the pack bytes `span` (absolute offsets) in [`PREWARM_CHUNK`]
+    /// reads, publishing the bytes read so far in `progress`, pausing while a
+    /// fetch runs.  `false` = stopped by [`HotRowStore::stop`] or a read
+    /// failed.
+    fn read_span(
+        &self,
+        file: &File,
+        buffer: &mut [u8],
+        paused: &mut Duration,
+        span: std::ops::Range<u64>,
+        progress: &AtomicU64,
+    ) -> bool {
+        let mut offset = span.start;
+        while offset < span.end {
+            let idle_from = Instant::now();
+            if !self.wait_until_idle() {
+                return false;
+            }
+            *paused += idle_from.elapsed();
+            let len = ((span.end - offset) as usize).min(PREWARM_CHUNK);
+            if let Err(error) = read_exact_at(file, offset, &mut buffer[..len]) {
+                eprintln!(
+                    "{TAG}: prewarm stopped at {:.2} GiB: {error}",
+                    gib(offset - self.data_offset)
+                );
+                return false;
+            }
+            offset += len as u64;
+            progress.store(offset - span.start, Ordering::Relaxed);
+        }
+        true
+    }
+}
+
+/// The prewarm's two spans (absolute pack offsets): phase 1 the first
+/// `budget` bytes of the data from `data_offset`; phase 2 tier 0
+/// (`data_offset..tier0_end`), clipped to the budget.
+fn prewarm_spans(
+    data_offset: u64,
+    tier0_end: u64,
+    budget: u64,
+) -> (std::ops::Range<u64>, std::ops::Range<u64>) {
+    let end = data_offset + budget;
+    (data_offset..end, data_offset..tier0_end.min(end))
 }
 
 #[cfg(test)]
@@ -1386,17 +1447,20 @@ mod tests {
         assert!((0..ROWS as u64).all(|row| store.pack_offset(row).is_none()));
     }
 
-    /// The prewarm waits for a budget, reads exactly that many bytes, and
-    /// pauses while a fetch is in flight.
+    /// The prewarm waits for a budget, pauses while a fetch is in flight,
+    /// then reads exactly that many bytes (phase 1, from the start of the
+    /// pack's data) and re-reads tier 0 once (phase 2).
     #[test]
     fn prewarm_reads_its_budget_while_idle() {
         let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
         let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 200, 5, 8);
         let store = &fixture.store;
+        let tier0 = store.tier_base[1] - store.data_offset;
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(store.prewarmed_bytes(), 0, "no budget, no prewarm");
         let guard = store.busy();
         let budget = store.data_bytes() / 2;
+        assert!(budget > tier0, "the budget spans tier 0 and more");
         store.set_prewarm_budget(budget);
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
@@ -1404,6 +1468,7 @@ mod tests {
             0,
             "a fetch in flight pauses the prewarm"
         );
+        assert_eq!(store.retouched_bytes(), 0);
         drop(guard);
         // Resumes BUSY_QUIET after the fetch; wait it out.
         let deadline = Instant::now() + BUSY_QUIET + Duration::from_secs(10);
@@ -1411,7 +1476,49 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(store.prewarm_complete());
+        assert_eq!(store.prewarmed_bytes(), budget, "phase 1 reads the budget");
+        assert_eq!(store.retouched_bytes(), tier0, "phase 2 reads tier 0");
+    }
+
+    /// A budget inside tier 0 re-reads only that much of it; a budget of 0
+    /// reads nothing.
+    #[test]
+    fn prewarm_retouch_is_clipped_to_the_budget() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 200, 5, 8);
+        let store = &fixture.store;
+        let tier0 = store.tier_base[1] - store.data_offset;
+        let budget = tier0 / 2;
+        store.set_prewarm_budget(budget);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !store.prewarm_complete() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(store.prewarm_complete());
         assert_eq!(store.prewarmed_bytes(), budget);
+        assert_eq!(store.retouched_bytes(), budget);
+
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 200, 5, 8);
+        let store = &fixture.store;
+        store.set_prewarm_budget(0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !store.prewarm_complete() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(store.prewarm_complete());
+        assert_eq!((store.prewarmed_bytes(), store.retouched_bytes()), (0, 0));
+    }
+
+    #[test]
+    fn prewarm_spans_cover_the_budget_and_tier_0() {
+        assert_eq!(
+            prewarm_spans(4096, 4096 + 1000, 5000),
+            (4096..9096, 4096..5096)
+        );
+        assert_eq!(
+            prewarm_spans(4096, 4096 + 1000, 600),
+            (4096..4696, 4096..4696)
+        );
     }
 
     /// `stop` ends a worker that is still waiting for its budget.
