@@ -602,6 +602,11 @@ pub struct FeatureFlags {
     /// Default-on gfx1201 Flash-Next dense GDN prefill scan (architecture and
     /// admission are gated by the runtime); `HIPFIRE_FN_GDN_DENSE_SCAN=0` opts out.
     pub fn_gdn_dense_scan: bool,
+    /// Flash-Next lane-step PeaceMaker row kernels (`HIPFIRE_FN_LANE_PM_ROWS`):
+    /// multi-column GEMVs that keep every column byte-identical to the 1-row
+    /// incumbent while sharing activation loads across weight rows. Developer
+    /// opt-in, default off; exact gfx1151 and the lane step only.
+    pub fn_lane_pm_rows: bool,
 }
 
 impl FeatureFlags {
@@ -1050,6 +1055,7 @@ impl FeatureFlags {
             select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
+            fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(false),
         }
     }
 
@@ -1109,6 +1115,14 @@ impl FeatureFlags {
     /// Exact gfx1151 only.
     pub fn qwen4_gdn_q8_inline_enabled(&self) -> bool {
         self.qwen4_gdn_q8_inline && self.arch == "gfx1151"
+    }
+
+    /// Flash-Next lane step: the gfx1151 PeaceMaker multi-column row kernels
+    /// (`HIPFIRE_FN_LANE_PM_ROWS`, default off). Exact gfx1151 only; the
+    /// runtime additionally requires the lane-step scope
+    /// ([`crate::Gpu::lane_rows_pm_enabled`]).
+    pub fn fn_lane_pm_rows_enabled(&self) -> bool {
+        self.fn_lane_pm_rows && self.arch == "gfx1151"
     }
 
     /// H4: Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`, 0 = off):
@@ -1455,6 +1469,7 @@ impl FeatureFlags {
             select_regrid_off: false,
             dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
+            fn_lane_pm_rows: false,
         }
     }
 }
@@ -1492,6 +1507,24 @@ mod tests {
             });
             assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
+    }
+
+    /// The lane-rows PM kernels are a developer opt-in: unset / `0` is off,
+    /// `1` admits them on exact gfx1151 only.
+    #[test]
+    fn fn_lane_pm_rows_is_opt_in_and_exact_gfx1151() {
+        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201"] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_FN_LANE_PM_ROWS" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            assert!(!flags(None).fn_lane_pm_rows_enabled(), "{arch}: unset");
+            assert!(!flags(Some("0")).fn_lane_pm_rows_enabled(), "{arch}: 0");
+            assert_eq!(flags(Some("1")).fn_lane_pm_rows_enabled(), arch == "gfx1151", "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
     }
 
     #[test]

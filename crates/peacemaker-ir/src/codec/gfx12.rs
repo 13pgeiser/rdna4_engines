@@ -395,8 +395,14 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
     if matches!(row.form,Form::Vmem(_)) {
         let off=field_value(arch, "IOFFSET", row, words);
         if off!=0 {
-            let bits = if arch == Arch::Gfx1201 { 24 } else if row.form == Form::Vmem(crate::inst::VmemForm::Buffer) { 12 } else { 13 };
-            operands.push(Operand::Imm(ImmField::VmemOffset(((off << (32-bits)) as i32) >> (32-bits))));
+            // gfx11 MUBUF OFFSET is an unsigned 12-bit byte offset (0..=4095);
+            // FLAT/GLOBAL/SCRATCH (13-bit) and gfx12 (24-bit) offsets are signed.
+            if arch != Arch::Gfx1201 && row.form == Form::Vmem(crate::inst::VmemForm::Buffer) {
+                operands.push(Operand::Imm(ImmField::VmemOffset(off as i32)));
+            } else {
+                let bits = if arch == Arch::Gfx1201 { 24 } else { 13 };
+                operands.push(Operand::Imm(ImmField::VmemOffset(((off << (32-bits)) as i32) >> (32-bits))));
+            }
         }
         if row.form == Form::Vmem(crate::inst::VmemForm::Buffer) && field_value(arch, "OFFEN", row, words)==1 {
             operands.push(Operand::Vmem(VmemToken::Offen));

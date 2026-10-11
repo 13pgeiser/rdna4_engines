@@ -666,7 +666,12 @@ pub(crate) fn forward_lanes(
         .take()
         .ok_or_else(|| invalid("Qwen4 forward resources are not attached"))?;
     let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
+    // The lane step's row-local launchers may take the gfx1151 PM row
+    // kernels (`HIPFIRE_FN_LANE_PM_ROWS`, column-identical to the 1-row
+    // incumbents); every other forward keeps the incumbents.
+    let rows_scope = std::mem::replace(&mut gpu.lane_rows_scope, true);
     let result = forward_lanes_scoped(gpu, &mut forward, bundle, lanes, out, policy);
+    gpu.lane_rows_scope = rows_scope;
     gpu.qwen4_scope = scope;
     bundle.execution = Some(forward);
     result

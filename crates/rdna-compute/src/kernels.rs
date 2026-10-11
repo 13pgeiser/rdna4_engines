@@ -4252,6 +4252,21 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen
 /// SHA-256 24aa35df635e08bb04df422bbb0faaa9dc491579d13619794fa9d77c122b7b01
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
+/// Certified builder module of the gfx1151 Flash-Next lane-step row kernels
+/// (`hipfire-isa emit --kernel qwen4_lane_rows --arch gfx1151`, M7
+/// obligation-free): four multi-column (1..=8 activation columns) GEMVs that
+/// keep every column byte-identical to the 1-row HIP incumbent while sharing
+/// the activation loads across weight rows: `gemv_mq6g256v2_xbatch_pm`,
+/// `gemv_mq6g256v2_x4_xbatch_pm`, `gemv_q8_0_k8_xbatch_pm` and
+/// `gemv_q8_0_k320_xbatch_pm` (`crate::lane_rows_pm`). Routed from the four
+/// incumbent rows launchers only inside the lane step (typed flag
+/// `fn_lane_pm_rows`, default off).
+/// SHA-256 pin: [`QWEN4_LANE_ROWS_PM_GFX1151_SHA256`]
+/// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
+pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_lane_rows_pm_gfx1151.hxaco");
+/// SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1151`], verified before the first load
+/// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
+pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str = "31efa309145ce2cf7ed481bacfe5fb26b99db503cd4a71113d9c53162421b62a";
 /// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block.
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with

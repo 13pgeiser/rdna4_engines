@@ -18524,6 +18524,9 @@ impl Gpu {
                 "gemv_q8_0_k8_rows needs K % 256 == 0 and 1..=8 rows",
             ));
         }
+        if self.lane_rows_pm_enabled() && crate::lane_rows_pm::q8_k8_admits(m, k, rows) {
+            return self.gemv_q8_0_k8_xbatch_pm(weight, x, y, m, k, hc_act_scale, rows);
+        }
         self.bind_thread()?;
         let func = FUNCS[rows - 2];
         self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
@@ -18700,6 +18703,12 @@ impl Gpu {
     ) -> HipResult<()> {
         if !self.gemv_q8_0_staged_rows_supported(k, rows) {
             return Err(hip_bridge::HipError::new(1, "gemv_q8_0_staged_rows shape"));
+        }
+        if (2..=8).contains(&rows)
+            && self.lane_rows_pm_enabled()
+            && crate::lane_rows_pm::q8_k320_admits(m, k, rows)
+        {
+            return self.gemv_q8_0_k320_xbatch_pm(a_raw, x, y, m, rows);
         }
         self.bind_thread()?;
         if k != 2560 && k != 320 {
@@ -19246,6 +19255,11 @@ impl Gpu {
                 1,
                 "MQ6 F32 rows x4 needs 2..=8 rows, K % 256 == 0",
             ));
+        }
+        if self.lane_rows_pm_enabled()
+            && crate::lane_rows_pm::mq6_x4_admits(parts.map(|(_, _, m)| m), k, rows)
+        {
+            return self.gemv_mq6g256v2_x4_xbatch_pm(parts, x, k, rows);
         }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
@@ -21176,6 +21190,9 @@ impl Gpu {
                 1,
                 "MQ6 F32 rows tensor view too small",
             ));
+        }
+        if self.lane_rows_pm_enabled() && crate::lane_rows_pm::mq6_admits(m, k, rows) {
+            return self.gemv_mq6g256v2_xbatch_pm(a_raw, x, y, m, k, rows);
         }
         self.bind_thread()?;
         self.ensure_kernel(

@@ -44,6 +44,7 @@ pub mod fn_gdn_dense;
 pub mod norm;
 pub mod pm_decode_twins;
 pub mod pm_xbatch;
+pub mod lane_rows_pm;
 pub mod verify_twins;
 pub mod page_pool;
 pub mod pool;

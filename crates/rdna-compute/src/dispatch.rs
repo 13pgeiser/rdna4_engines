@@ -1177,6 +1177,11 @@ pub struct Gpu {
     /// on prefill chunks of >= 512 rows).  An explicit value of those
     /// variables applies everywhere, as before.
     pub qwen4_scope: bool,
+    /// True while the Flash-Next lane step runs (set by the lane-step driver):
+    /// together with the `fn_lane_pm_rows` flag it routes the four incumbent
+    /// rows launchers to the gfx1151 PeaceMaker lane-rows kernels
+    /// ([`Gpu::lane_rows_pm_enabled`]).
+    pub lane_rows_scope: bool,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -1987,6 +1992,7 @@ impl Gpu {
             capture_names: HashMap::new(),
             hessian_capture: None,
             qwen4_scope: false,
+            lane_rows_scope: false,
         })
         .map(|mut gpu| {
             if gpu.flags.force_blob_path {
