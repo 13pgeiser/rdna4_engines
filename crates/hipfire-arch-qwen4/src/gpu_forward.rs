@@ -3737,6 +3737,20 @@ impl Qwen4GpuForward {
                 return Err(invalid("Qwen4 retained body with deferred PLE staging"));
             }
             let routed = if pm4_route {
+                // Forced non-default retained route: HIP PLE staging (evidence
+                // 54ba6c5a6) is outside the PM4 queue's ordering, so drain the
+                // staging stream (not the device) before replay.
+                let staging_sync = match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu.hip.stream_synchronize(stream),
+                    None => gpu.hip.stream_synchronize_default(),
+                };
+                if let Err(error) = staging_sync {
+                    gpu.replay
+                        .poison(format!("Qwen4 PM4 staging-stream sync failed: {error}"));
+                    return Err(invalid(format!(
+                        "Qwen4 retained replay refused: staging-stream sync before PM4 replay failed: {error}"
+                    )));
+                }
                 // SAFETY: the boundary above staged every host input the tape's
                 // recorded launches read, and every pointer in the tape is owned by
                 // this bundle for the plan's lifetime. `replay_pm4_routed` is the

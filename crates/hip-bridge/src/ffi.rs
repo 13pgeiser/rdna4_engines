@@ -2016,6 +2016,15 @@ impl HipRuntime {
         self.check(code, "hipStreamSynchronize")
     }
 
+    /// Synchronize the legacy default (NULL) stream: the stream HIP uses when a
+    /// caller passes no stream. Same fault injection and `stream_sync` counter as
+    /// [`Self::stream_synchronize`]. It waits on that one stream only, never the
+    /// whole device. `Stream` has no `Drop`, so the temporary NULL handle is never
+    /// destroyed.
+    pub fn stream_synchronize_default(&self) -> HipResult<()> {
+        self.stream_synchronize(&Stream(ptr::null_mut()))
+    }
+
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller

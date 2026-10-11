@@ -1173,6 +1173,12 @@ Append-only. One line per landed change with the commit hash once it exists.
   `qwen3.8-flash-next.mq4`: gates 1–6 and 8 collected, gate 7 at context 128
   only (0.994); model swap no longer blocked. No promotion rule, no admission
   (see "Certification re-run").
+- 2026-10-11 — **Forced PM4 pre-replay staging-stream sync (forced/dev route only).**
+  Evidence `54ba6c5a6` isolated a race between HIP PLE staging and the independent
+  PM4 queue. Before each Qwen4 PM4 replay (forced PM4 or shadow plan route) the
+  forward synchronizes the active stream, or the default stream when none is set
+  (`stream_synchronize_default`); never the device. Failure poisons the route and
+  returns the typed forward error. Default HIP decode and Qwen3.5 are untouched.
 
 ### Next
 
