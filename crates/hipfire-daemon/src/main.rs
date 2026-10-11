@@ -1193,7 +1193,7 @@ fn main() {
                 eprintln!("[weight-host] {reason}; reload against a live host");
                 (resident_kv, batch_scheduler, vmm_batch) = (None, None, None);
                 continuous_batch_size = 1;
-                batch_clear_all_terminals();
+                // No lane is live; keep this command's admitted terminal so it can answer.
             }
         }
         let request_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
