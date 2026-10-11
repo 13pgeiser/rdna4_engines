@@ -141,6 +141,33 @@ impl Shared {
     }
 }
 
+/// Peers load one after another in ascending rank order: the loader's host-RAM
+/// check for pinned experts assumes the lower ranks have already pinned theirs.
+/// A failed load releases every later rank without loading it.
+struct Baton {
+    /// Index of the worker allowed to construct next; `None` once one failed.
+    turn: Mutex<Option<usize>>,
+    changed: Condvar,
+}
+
+impl Baton {
+    fn wait(&self, index: usize) -> bool {
+        let mut turn = lock(&self.turn);
+        while matches!(*turn, Some(next) if next < index) {
+            turn = self
+                .changed
+                .wait(turn)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *turn == Some(index)
+    }
+
+    fn pass(&self, index: usize, built: bool) {
+        *lock(&self.turn) = built.then_some(index + 1);
+        self.changed.notify_all();
+    }
+}
+
 struct Worker<P: 'static> {
     tx: Sender<Msg<P>>,
     handle: Option<JoinHandle<Result<(), String>>>,
@@ -176,19 +203,28 @@ fn worker_main<P: 'static>(
     rx: Receiver<Msg<P>>,
     ready: Sender<(usize, Result<(), String>)>,
     shared: Arc<Shared>,
+    baton: Arc<Baton>,
     teardown: fn(P) -> Result<(), String>,
 ) -> Result<(), String> {
+    let index = rank - 1;
+    if !baton.wait(index) {
+        let _ = ready.send((rank, Err("not loaded: an earlier rank failed to load".to_string())));
+        return Ok(());
+    }
     let mut peer = match catch_unwind(AssertUnwindSafe(|| init(rank))) {
         Ok(Ok(peer)) => {
             let _ = ready.send((rank, Ok(())));
+            baton.pass(index, true);
             peer
         }
         Ok(Err(error)) => {
             let _ = ready.send((rank, Err(error)));
+            baton.pass(index, false);
             return Ok(());
         }
         Err(payload) => {
             let _ = ready.send((rank, Err(format!("panicked: {}", panic_message(&*payload)))));
+            baton.pass(index, false);
             return Ok(());
         }
     };
@@ -217,8 +253,9 @@ fn worker_main<P: 'static>(
 
 impl<P: 'static> PeerPool<P> {
     /// Spawn one worker per `init`; worker `i` is rank `i + 1` and builds its
-    /// peer by calling `init(rank)` on its own thread. Returns once every peer
-    /// exists, or the first construction error (after stopping the rest).
+    /// peer by calling `init(rank)` on its own thread, one rank at a time in
+    /// ascending order. Returns once every peer exists, or the first
+    /// construction error (after stopping the rest).
     /// `teardown` consumes a peer on its thread at close/drop.
     pub(crate) fn spawn(
         inits: Vec<Box<dyn FnOnce(usize) -> Result<P, String> + Send>>,
@@ -229,6 +266,10 @@ impl<P: 'static> PeerPool<P> {
             abort: OnceLock::new(),
         });
         let (ready_tx, ready_rx) = channel();
+        let baton = Arc::new(Baton {
+            turn: Mutex::new(Some(0)),
+            changed: Condvar::new(),
+        });
         let count = inits.len();
         let mut pool = Self {
             workers: Vec::with_capacity(count),
@@ -240,9 +281,10 @@ impl<P: 'static> PeerPool<P> {
             let (tx, rx) = channel();
             let ready = ready_tx.clone();
             let shared = shared.clone();
+            let baton = baton.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("hipfire-qwen4-ep-rank{rank}"))
-                .spawn(move || worker_main(rank, init, rx, ready, shared, teardown))
+                .spawn(move || worker_main(rank, init, rx, ready, shared, baton, teardown))
                 .map_err(|error| format!("spawn rank {rank} worker: {error}"))?;
             pool.workers.push(Worker {
                 tx,
@@ -1556,7 +1598,51 @@ mod tests {
         ];
         let error = PeerPool::spawn(inits, count).err().expect("spawn fails");
         assert!(error.contains("rank 2") && error.contains("load failed"), "{error}");
-        assert_eq!(TORN_DOWN.load(Ordering::SeqCst), 2);
+        // Rank 1 built and is torn down; rank 3 never loads after rank 2 failed.
+        assert_eq!(TORN_DOWN.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn peers_construct_one_at_a_time_in_ascending_rank_order() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let inits: Vec<Box<dyn FnOnce(usize) -> Result<Fake, String> + Send>> = (0..4)
+            .map(|_| {
+                let order = order.clone();
+                let active = active.clone();
+                Box::new(move |rank: usize| {
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0, "two loads overlapped");
+                    std::thread::sleep(std::time::Duration::from_millis(10 * (5 - rank as u64)));
+                    lock(&order).push(rank);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(Fake { rank, value: 0 })
+                }) as Box<dyn FnOnce(usize) -> Result<Fake, String> + Send>
+            })
+            .collect();
+        let pool = PeerPool::spawn(inits, teardown_ok).expect("spawn");
+        assert_eq!(*lock(&order), vec![1, 2, 3, 4]);
+        pool.close().expect("close");
+    }
+
+    #[test]
+    fn a_failed_load_skips_the_later_ranks() {
+        let loaded = Arc::new(AtomicUsize::new(0));
+        let inits: Vec<Box<dyn FnOnce(usize) -> Result<Fake, String> + Send>> = (0..3)
+            .map(|_| {
+                let loaded = loaded.clone();
+                Box::new(move |rank: usize| {
+                    loaded.fetch_add(1, Ordering::SeqCst);
+                    if rank == 2 {
+                        Err("out of host memory".to_string())
+                    } else {
+                        Ok(Fake { rank, value: 0 })
+                    }
+                }) as Box<dyn FnOnce(usize) -> Result<Fake, String> + Send>
+            })
+            .collect();
+        let error = PeerPool::spawn(inits, teardown_ok).err().expect("fails");
+        assert!(error.contains("rank 2") && error.contains("out of host memory"), "{error}");
+        assert_eq!(loaded.load(Ordering::SeqCst), 2, "rank 3 must not load");
     }
 
     #[test]

@@ -1009,20 +1009,40 @@ pub fn open_qwen4_rank_source(shared: &Qwen4RankShared, gpu_arch: &str) -> Resul
 /// attaches it to `bundle` (rank 0). On `Err` the carrier frees rank 0's GPU
 /// state; the owner must free any peer it already loaded.
 ///
-/// Until the mesh owner lands there is nothing to host peer ranks, so the load
-/// refuses instead of serving rank 0's compact experts alone.
+/// Peers load on their own worker threads, one rank at a time in ascending
+/// order (the host-RAM check of pinned experts assumes it), each at the agreed
+/// expert split `plan.expert_vram_layers`; the mesh then builds the row-gather
+/// transport, enables P2P and installs every rank's EP tables
+/// (`Qwen4Bundle::attach_ep_mesh`).
 pub fn attach_qwen4_ep_peers(
     bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
     gpu: &mut rdna_compute::Gpu,
     plan: &Qwen4EpPlan,
 ) -> Result<(), String> {
-    let _ = (bundle, gpu);
-    Err(format!(
-        "qwen4: expert parallelism (topology.ep = {}) loaded rank 0 on device {}, but this build \
-         has no EP mesh owner to host peer ranks 1..{} on devices {:?}; set topology.ep = 1 \
-         (HIPFIRE_QWEN4_EP=0)",
-        plan.ranks, plan.devices[0], plan.ranks, &plan.devices[1..]
-    ))
+    let shared = plan.shared.clone();
+    let expert_vram_layers = plan.expert_vram_layers;
+    let loader: std::sync::Arc<hipfire_arch_qwen4::ep::PeerLoadFn> =
+        std::sync::Arc::new(move |device, placement| {
+            let mut peer_gpu = rdna_compute::Gpu::init_with_device(device)
+                .map_err(|error| format!("init HIP device {device}: {error:?}"))?;
+            let loaded = open_qwen4_rank_source(&shared, &peer_gpu.arch).and_then(|source| {
+                load_qwen4_rank(
+                    &mut peer_gpu,
+                    Some(placement),
+                    &shared,
+                    Some(expert_vram_layers),
+                    None,
+                    source,
+                )
+            });
+            match loaded {
+                Ok(load) => Ok((peer_gpu, load.bundle)),
+                Err(error) => Err(format!("load on device {device}: {error}")),
+            }
+        });
+    bundle
+        .attach_ep_mesh(gpu, &plan.devices[1..], loader)
+        .map_err(|error| format!("qwen4: expert parallelism mesh setup failed: {error}"))
 }
 
 /// What the expert placement is sized from, for one rank of a `ranks`-way
