@@ -27,6 +27,15 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 pub enum ConfigError {
     #[error("unknown configuration key '{0}'")]
     UnknownKey(String),
+    #[error(
+        "configuration key '{key}' was removed in {removed_in} ({reason}); it has no effect — \
+         delete it from config.toml if it is still set"
+    )]
+    RetiredKey {
+        key: &'static str,
+        removed_in: &'static str,
+        reason: &'static str,
+    },
     #[error("invalid value for {key}: {message}")]
     InvalidValue { key: String, message: String },
     #[error("failed to read {path}: {source}")]
@@ -3649,6 +3658,19 @@ pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
         .find(|retired| retired.key == key || retired.legacy_key == key)
 }
 
+/// The error for a key that is not in the schema: the removal message for a
+/// [`RETIRED_CONFIG_KEYS`] entry, otherwise [`ConfigError::UnknownKey`].
+pub fn unknown_key(key: &str) -> ConfigError {
+    match retired_config_key(key) {
+        Some(retired) => ConfigError::RetiredKey {
+            key: retired.key,
+            removed_in: retired.removed_in,
+            reason: retired.reason,
+        },
+        None => ConfigError::UnknownKey(key.to_owned()),
+    }
+}
+
 impl RetiredConfigKey {
     fn warning(&self, path: &Path) -> String {
         format!(
@@ -3682,7 +3704,7 @@ impl ConfigLayer {
         } else if is_developer_key(key) {
             self.values.insert(key.to_owned(), value);
         } else {
-            return Err(ConfigError::UnknownKey(key.to_owned()));
+            return Err(unknown_key(key));
         }
         Ok(())
     }
@@ -3695,7 +3717,7 @@ impl ConfigLayer {
             // distinguish enum-like values such as `on` from boolean `1`.
             self.set(key, ConfigValue::String(raw.to_owned()))
         } else {
-            Err(ConfigError::UnknownKey(key.to_owned()))
+            Err(unknown_key(key))
         }
     }
 
@@ -3705,7 +3727,7 @@ impl ConfigLayer {
 
     pub fn remove(&mut self, key: &str) -> Result<Option<ConfigValue>> {
         let key =
-            canonical_config_key(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
+            canonical_config_key(key).ok_or_else(|| unknown_key(key))?;
         Ok(self.values.remove(&key))
     }
 
@@ -4727,7 +4749,7 @@ fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
             });
         }
         let Some(schema) = field(key) else {
-            return Err(ConfigError::UnknownKey(key.clone()));
+            return Err(unknown_key(key));
         };
         if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
             return Err(ConfigError::InvalidValue {
@@ -5986,9 +6008,19 @@ mod tests {
                 layer: loaded.layer,
             }])
             .is_ok());
-            // Setting a retired key is still refused: it has no effect.
+            // Setting a retired key is still refused: it has no effect. The
+            // error names the removal instead of calling the key unknown.
+            let err = ConfigLayer::default()
+                .set_cli("kernel.mw16", "true")
+                .unwrap_err();
+            assert!(matches!(err, ConfigError::RetiredKey { key: "kernel.mw16", .. }));
+            assert!(err.to_string().contains("removed in 0.4.1"), "{err}");
             assert!(matches!(
-                ConfigLayer::default().set_cli("kernel.mw16", "true"),
+                ConfigLayer::default().set_cli("mw16", "true"),
+                Err(ConfigError::RetiredKey { .. })
+            ));
+            assert!(matches!(
+                ConfigLayer::default().set_cli("kernel.mw17", "true"),
                 Err(ConfigError::UnknownKey(_))
             ));
             let _ = fs::remove_dir_all(root);
