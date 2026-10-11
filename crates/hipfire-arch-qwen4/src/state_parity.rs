@@ -2095,7 +2095,36 @@ fn bundle_family_json(gpu: &Gpu, bundle: &crate::bundle::Qwen4Bundle) -> Result<
         .as_ref()
         .map(|mtp| mtp_families(gpu, &bundle.config, mtp.parity_state()))
         .transpose()?;
-    Ok(json!({"target": target, "mtp": mtp}))
+    // The draft head's request state (observed-token history the batched
+    // and per-row fills both feed).
+    let draft = bundle.mtp.as_ref().map(|mtp| {
+        let state = mtp.draft.request_state();
+        json!({"full_steps": state.full_steps, "margin_bits": state.margin.to_bits()})
+    });
+    Ok(json!({"target": target, "mtp": mtp, "draft_request_state": draft}))
+}
+
+/// The hardware oracles' routed-expert placement: every expert resident
+/// unless `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` asks for layers `0..N` in VRAM
+/// and the rest host-mapped (a discrete card that cannot hold them all, and
+/// the only way to reach the long-prefill staging route). `auto` is refused:
+/// an oracle's arms must share one fixed placement.
+fn oracle_expert_placement(gpu: &Gpu, weights: &[WeightEntry]) -> Result<Vec<WeightEntry>, String> {
+    let mut weights = weights.to_vec();
+    match crate::expert_residency::expert_vram_layers_from_env()? {
+        None => {}
+        Some(crate::expert_residency::ExpertVramLayers::Layers(layers)) => {
+            if gpu.is_uma() {
+                return Err("host-mapped experts are only for discrete GPUs".to_string());
+            }
+            let moved = crate::expert_residency::place_routed_experts(&mut weights, layers);
+            eprintln!("routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped");
+        }
+        Some(crate::expert_residency::ExpertVramLayers::Auto) => {
+            return Err("hardware oracles take a fixed expert layer count, not auto".to_string());
+        }
+    }
+    Ok(weights)
 }
 
 fn read_state_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
@@ -2147,12 +2176,15 @@ fn read_state_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
 }
 
 /// Native-MTP prompt fill digests for each prompt length: the MTP head and
-/// target state families after `mtp_prefill`, the pending hidden row, the
-/// seed, and one following draft window. Run once per
-/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` setting and compare the two outputs; the
-/// route is read once per process.
+/// target state families after `mtp_prefill`, the final prompt row's
+/// logits, the pending hidden row, the seed, and one following draft
+/// window. Run once per route setting (e.g.
+/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL`) and compare the two outputs; routes are
+/// read once per process.
 ///
-/// `warm_chunks == 0` fills each length cold. Otherwise each length is the
+/// `warm_chunks == 0` fills each length cold: the first `length` tokens of
+/// `prompt_text` (tokenized without a template) when given, else a
+/// deterministic spread over the vocabulary. Otherwise each length is the
 /// suffix of a session-cache hit: a cold fill of a warm prompt of
 /// `P = warm_chunks * chunk_rows` tokens (plus one row) publishes the
 /// snapshot at `P`, then a prompt sharing those `P` tokens and followed by
@@ -2163,6 +2195,7 @@ pub fn run_mtp_fill_digest(
     lengths: &[usize],
     max_seq: usize,
     warm_chunks: usize,
+    prompt_text: Option<&str>,
 ) -> Result<Value, String> {
     use hipfire_runtime::arch_model::ArchModel;
     use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
@@ -2171,6 +2204,7 @@ pub fn run_mtp_fill_digest(
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|error| format!("tokenizer: {error}"))?;
+    let prompt_ids = prompt_text.map(|text| tokenizer.encode(text));
     let receipt = crate::admit_hfqm_artifact(&hfq)
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
@@ -2196,9 +2230,10 @@ pub fn run_mtp_fill_digest(
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
         .map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
@@ -2283,10 +2318,29 @@ pub fn run_mtp_fill_digest(
                     &|| false,
                 )?
             } else {
-                let prompt = tokens(length as u64, length);
+                let prompt = match prompt_ids.as_deref() {
+                    Some(ids) => ids
+                        .get(..length)
+                        .ok_or_else(|| {
+                            format!("prompt text has {} tokens, fewer than {length}", ids.len())
+                        })?
+                        .to_vec(),
+                    None => tokens(length as u64, length),
+                };
                 drafter.mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?
             };
             let after_fill = bundle_family_json(&gpu, &bundle)?;
+            // The prompt's last row: the final chunk's LM head writes it.
+            let mut final_logits = Family::new();
+            append_f32(
+                &gpu,
+                &mut final_logits,
+                bundle
+                    .spec_logits
+                    .as_ref()
+                    .ok_or("qwen4 spec logits are not attached")?,
+                bundle.config.vocab_size,
+            )?;
             let mut pending = Family::new();
             append_f32(
                 &gpu,
@@ -2302,6 +2356,7 @@ pub fn run_mtp_fill_digest(
             rows.push(json!({
                 "length": length,
                 "seed": seed,
+                "final_logits": final_logits.finish(),
                 "pending_hidden": pending.finish(),
                 "families_after_fill": after_fill,
                 "window_committed": window.committed,
@@ -2703,8 +2758,9 @@ pub fn run_mtp_takeover_fill_oracle(
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let weights = oracle_expert_placement(&gpu, &receipt.manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
+        &weights,
         &mesh,
         receipt.config.num_hidden_layers,
         &mut gpu,
