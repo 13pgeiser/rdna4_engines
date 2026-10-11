@@ -3328,13 +3328,19 @@ impl WideExpect {
 fn assert_wide(exp: &WideExpect, chunks: &[usize], launches: &BTreeMap<&'static str, usize>, refused: bool) -> (bool, Value) {
     let mut want: BTreeMap<(WideOp, usize), usize> = BTreeMap::new();
     let mut wide_chunks = 0usize;
-    if !refused && !exp.iu4 {
+    if !refused {
         for &r in chunks {
             if r > MULTI_CHUNK_PRODUCT_MAX_ROWS {
                 wide_chunks += 1;
                 let bt = if r == 64 { 4 } else { 8 };
-                for op in WideOp::ALL {
-                    *want.entry((op, bt)).or_insert(0) += exp.per_chunk(op);
+                if exp.iu4 {
+                    // IU4 verify trunk; only the lm_head stays on the F16 wide
+                    // family (one launch per wide chunk).
+                    *want.entry((WideOp::Residual, bt)).or_insert(0) += 1;
+                } else {
+                    for op in WideOp::ALL {
+                        *want.entry((op, bt)).or_insert(0) += exp.per_chunk(op);
+                    }
                 }
             }
         }
@@ -3365,19 +3371,18 @@ fn assert_wide(exp: &WideExpect, chunks: &[usize], launches: &BTreeMap<&'static 
         }
     }
     let counts_ok = want == got;
-    let family_ok = if exp.iu4 {
-        // IU4 verify: no F16 wide symbol, and IU4 GEMMs whenever a chunk ran.
-        hip_n + pm_n == 0 && (refused || chunks.is_empty() || iu4_n > 0)
-    } else {
-        match exp.family {
-            WideFamily::Pm => hip_n == 0,
-            WideFamily::Hip => pm_n == 0,
-            WideFamily::Off => hip_n + pm_n == 0,
-        }
-    };
+    let family_ok = match exp.family {
+        WideFamily::Pm => hip_n == 0,
+        WideFamily::Hip => pm_n == 0,
+        WideFamily::Off => hip_n + pm_n == 0,
+    } && (!exp.iu4 || refused || chunks.is_empty() || iu4_n > 0);
     let silent_when_refused = !refused || launches.is_empty();
-    // Every shared chunk runs one qkvza launch per DeltaNet layer on any route.
-    let chunks_by_qkvza = (exp.n_dn > 0 && qkvza_all % exp.n_dn == 0).then(|| qkvza_all / exp.n_dn);
+    // Every shared chunk runs one qkvza launch per DeltaNet layer on the F16
+    // routes; under the IU4 verify it runs 7 IU4 GEMMs per DeltaNet layer
+    // (qkvza 4 SET, F1-lite gate/up+SwiGLU, down, wo) and 6 per FullAttention
+    // layer (qkv 3 SET, gate/up+SwiGLU, down, wo).
+    let (per_chunk, seen) = if exp.iu4 { (7 * exp.n_dn + 6 * exp.n_fa, iu4_n) } else { (exp.n_dn, qkvza_all) };
+    let chunks_by_qkvza = (per_chunk > 0 && seen % per_chunk == 0).then(|| seen / per_chunk);
     let chunk_count_ok = refused || chunks_by_qkvza == Some(chunks.len());
     let ok = counts_ok && family_ok && forbidden.is_empty() && silent_when_refused && (wide_chunks == 0 || chunk_count_ok);
     let table: Vec<Value> = WideOp::ALL
