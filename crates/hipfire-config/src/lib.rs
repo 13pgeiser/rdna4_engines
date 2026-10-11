@@ -1382,6 +1382,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Opt in to the DFlash trailing-τ adaptive verify-block width (default fixed block)."
     ),
     field!(
+        "speculation.dflash_block",
+        "dflash_block",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(16),
+        ValueRule::AutoInteger { min: 4, max: 16 },
+        true,
+        true,
+        Some("HIPFIRE_DFLASH_BLOCK"),
+        "DFlash2 proposal width per serving configuration, never per live batch (batched lanes stay byte-identical to the singleton). `auto` = 8 on a `serve.vmm_batch` serve with `continuous_batch_size` >= 4, else 16; legacy DFlash drafts keep their declared width."
+    ),
+    field!(
         "speculation.dflash",
         "dflash_mode",
         Speculation,

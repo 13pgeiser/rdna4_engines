@@ -370,6 +370,10 @@ pub fn load_dflash_state(
     // True when adaptive KV is engaged for this load (tier-switching cache).
     // Must be false for retained-PM4 admission.
     adaptive_kv: bool,
+    // `speculation.dflash_block`, resolved per serving configuration
+    // (`DflashBlockPolicy::resolve`). Fixes the proposal width of the
+    // singleton AND of every VMM lane built from this state.
+    dflash_block: usize,
 ) -> Result<DflashState, String> {
     let requested_ctx = ctx_capacity;
     // Open the draft container up-front: its declared SWA window is the
@@ -484,10 +488,10 @@ pub fn load_dflash_state(
         };
     }
     let draft_weights = or_free!(DflashWeights::load(gpu, &draft_hfq, &draft_config), "");
-    let block_size = draft_config.runtime_block_size();
+    let block_size = draft_config.runtime_block_size(dflash_block);
     if block_size != draft_config.block_size {
         eprintln!(
-            "  DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",
+            "  DFlash2 runtime block: {} -> {} (speculation.dflash_block; selector/conv path is length-generic)",
             draft_config.block_size, block_size
         );
     }
@@ -2241,10 +2245,10 @@ pub fn load_dflash_speculator_dense_tp2(
     if !draft_config.all_layers_sliding {
         return Err("dense TP DFlash requires a DFlash2 all-sliding draft".into());
     }
-    if draft_config.runtime_block_size() != 16 {
+    if draft_config.runtime_block_size(block_size) != 16 {
         return Err(format!(
             "dense TP DFlash requires runtime B=16 (draft runtime {})",
-            draft_config.runtime_block_size()
+            draft_config.runtime_block_size(block_size)
         ));
     }
     // Window posture mirrors `load_dflash_state` (declared window by default,

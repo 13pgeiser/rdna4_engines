@@ -48,6 +48,62 @@ const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
+/// Default DFlash2 runtime proposal width (`speculation.dflash_block`).
+pub const DFLASH_BLOCK_DEFAULT: usize = 16;
+/// `speculation.dflash_block = "auto"` width on a batching serve
+/// (`serve.vmm_batch` with at least [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes):
+/// the draft's trained width, which keeps a full C8 verify step at 64 rows.
+pub const DFLASH_BLOCK_AUTO_BATCHED: usize = 8;
+/// Lane count from which `auto` picks [`DFLASH_BLOCK_AUTO_BATCHED`].
+pub const DFLASH_BLOCK_AUTO_MIN_LANES: usize = 4;
+/// Admitted fixed widths of `speculation.dflash_block`.
+pub const DFLASH_BLOCK_MIN: usize = 4;
+pub const DFLASH_BLOCK_MAX: usize = 16;
+
+/// `speculation.dflash_block`: the DFlash2 proposal width of one load.
+///
+/// The width is a property of the serving configuration, resolved once at
+/// load, never of the live batch: a load-dependent width would move window
+/// boundaries with server load and break batched == singleton output. Every
+/// request of a load (singleton or batched lane) runs the same width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DflashBlockPolicy {
+    /// [`DFLASH_BLOCK_AUTO_BATCHED`] on a VMM batching serve with at least
+    /// [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes, else [`DFLASH_BLOCK_DEFAULT`].
+    Auto,
+    /// A fixed width in `DFLASH_BLOCK_MIN..=DFLASH_BLOCK_MAX`.
+    Fixed(usize),
+}
+
+impl DflashBlockPolicy {
+    /// Parse the `dflash_block` load param: `"auto"` or an integer in range.
+    /// Absent = [`DFLASH_BLOCK_DEFAULT`].
+    pub fn from_param(value: Option<&serde_json::Value>) -> Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(Self::Fixed(DFLASH_BLOCK_DEFAULT));
+        };
+        if value.as_str() == Some("auto") {
+            return Ok(Self::Auto);
+        }
+        match value.as_u64().map(|v| v as usize) {
+            Some(b) if (DFLASH_BLOCK_MIN..=DFLASH_BLOCK_MAX).contains(&b) => Ok(Self::Fixed(b)),
+            _ => Err(format!(
+                "dflash_block must be \"auto\" or an integer {DFLASH_BLOCK_MIN}..={DFLASH_BLOCK_MAX} (got {value})"
+            )),
+        }
+    }
+
+    /// The width of a load: `vmm_batch` = the VMM continuous-batching route
+    /// is staged, `lanes` = its `continuous_batch_size`.
+    pub fn resolve(self, vmm_batch: bool, lanes: usize) -> usize {
+        match self {
+            Self::Fixed(b) => b,
+            Self::Auto if vmm_batch && lanes >= DFLASH_BLOCK_AUTO_MIN_LANES => DFLASH_BLOCK_AUTO_BATCHED,
+            Self::Auto => DFLASH_BLOCK_DEFAULT,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DflashConfig {
     pub n_layers: usize,
@@ -103,14 +159,16 @@ impl DflashConfig {
         self.n_heads * self.head_dim
     }
 
-    /// Runtime proposal width. DFlash2's selector and dynamic convolutions are
-    /// length-generic even though the published checkpoint declares B=8.
-    /// B=16 removes the B=8 acceptance ceiling and wins on both the canonical
-    /// merge-sort and prose fixtures on gfx1201; legacy DFlash retains its
-    /// artifact-declared width.
-    pub fn runtime_block_size(&self) -> usize {
-        if self.selector_rank.is_some() && self.block_size == 8 {
-            16
+    /// Runtime proposal width for the configured `speculation.dflash_block`
+    /// width `requested` (already resolved by [`DflashBlockPolicy::resolve`]).
+    /// DFlash2's selector and dynamic convolutions are length-generic even
+    /// though the published checkpoint declares B=8, so a DFlash2 draft runs
+    /// at `requested` (default [`DFLASH_BLOCK_DEFAULT`] = 16, which removes the
+    /// B=8 acceptance ceiling at C1 on gfx1201). Legacy DFlash is not
+    /// length-generic and always runs its artifact-declared width.
+    pub fn runtime_block_size(&self, requested: usize) -> usize {
+        if self.selector_rank.is_some() {
+            requested
         } else {
             self.block_size
         }
@@ -3852,6 +3910,61 @@ mod ring_tests {
         assert_eq!(log.abs_positions(), &[0, 1, 2, 3]);
         assert_eq!(log.proj_cached_rows(), 3);
         assert_eq!(log.full_cached_rows(), 4);
+    }
+}
+
+#[cfg(test)]
+mod block_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn param_parses_auto_fixed_and_absent() {
+        assert_eq!(DflashBlockPolicy::from_param(None), Ok(DflashBlockPolicy::Fixed(16)));
+        assert_eq!(DflashBlockPolicy::from_param(Some(&json!("auto"))), Ok(DflashBlockPolicy::Auto));
+        assert_eq!(DflashBlockPolicy::from_param(Some(&json!(8))), Ok(DflashBlockPolicy::Fixed(8)));
+        for bad in [json!(3), json!(17), json!("8"), json!(true), json!(-1)] {
+            assert!(DflashBlockPolicy::from_param(Some(&bad)).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn auto_depends_on_serving_configuration_only() {
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 8), 8);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 4), 8);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 3), 16);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(false, 8), 16);
+        assert_eq!(DflashBlockPolicy::Fixed(12).resolve(true, 8), 12);
+        assert_eq!(DflashBlockPolicy::Fixed(8).resolve(false, 1), 8);
+    }
+
+    #[test]
+    fn legacy_drafts_keep_their_declared_width() {
+        let mut cfg = DflashConfig {
+            n_layers: 1,
+            hidden: 8,
+            intermediate: 16,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 8,
+            vocab_size: 8,
+            norm_eps: 1e-6,
+            rope_theta: 1.0,
+            block_size: 8,
+            mask_token_id: 0,
+            target_layer_ids: vec![0],
+            num_target_layers: 1,
+            declared_window: None,
+            all_layers_sliding: true,
+            conv_group_size: Some(16),
+            conv_kernel_size: Some(2),
+            selector_rank: Some(256),
+            selector_top_k: Some(16),
+        };
+        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_DEFAULT), 16);
+        assert_eq!(cfg.runtime_block_size(8), 8);
+        cfg.selector_rank = None;
+        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_DEFAULT), 8);
     }
 }
 

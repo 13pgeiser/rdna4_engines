@@ -1729,6 +1729,22 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
+                // DFlash2 proposal width (`speculation.dflash_block`): one
+                // width per serving configuration, resolved here from the
+                // staged route (`auto` = 8 on a VMM batching serve with >= 4
+                // lanes, else 16) and never from the live batch, so batched
+                // lanes stay byte-identical to the singleton.
+                let dflash_block = match hipfire_runtime::dflash::DflashBlockPolicy::from_param(
+                    msg.get("params").and_then(|p| p.get("dflash_block")),
+                ) {
+                    Ok(policy) => policy.resolve(parsed_vmm_batch.is_some(), parsed_continuous_batch_size),
+                    Err(e) => {
+                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
                 // daemon's typed process policy instead of ambient env.
@@ -1781,6 +1797,7 @@ fn main() {
                     mtp: hipfire_config::parse_tri_state(&mtp_mode),
                     mtp_k: Some(mtp_k),
                     dflash_adaptive_b: Some(adaptive_b),
+                    dflash_block: Some(dflash_block),
                 };
 
                 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes

@@ -6,7 +6,7 @@
 //!     --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>]
 //!     [--phase all|singleton|probe] [--stop-repeats N] [--drift-cycles N]
 //!     [--spec off|mtp|dflash|mixed] [--mtp-head <path>]
-//!     [--dflash-draft <path>] [--dflash-probe-window <N>]
+//!     [--dflash-draft <path>] [--dflash-probe-window <N>] [--dflash-block <4..16>]
 //!
 //! DFlash Gate 0 (`--spec dflash|mixed`): a one-window replay probe. For each
 //! lane the isolated singleton `DflashSpeculator` (prefill + `N` full-block
@@ -149,6 +149,9 @@ struct Args {
     dflash_draft: Option<PathBuf>,
     /// Gate 0: full windows run before the probed window (0 = prefill boundary).
     dflash_probe_window: Option<usize>,
+    /// DFlash2 proposal width (`--dflash-block`, `speculation.dflash_block`;
+    /// default 16). Every Gate 0 case derives its full block from it.
+    dflash_block: usize,
     /// MTP head sidecar (default: model path with extension `mtp`).
     mtp_head: Option<PathBuf>,
     /// Aggregate verify-row totals of the wide-route fixtures (`--aggregates`,
@@ -188,7 +191,7 @@ fn parse_args() -> Result<Args> {
                  --steps 256 --out <absolute.json> [--short 256] [--artifacts <absolute dir>] \
                  [--phase all|singleton|probe] [--stop-repeats N] [--drift-cycles N] \
                  [--spec off|mtp|dflash|mixed] [--mtp-head <path>] \
-                 [--dflash-draft <path>] [--dflash-probe-window <N>] \
+                 [--dflash-draft <path>] [--dflash-probe-window <N>] [--dflash-block <4..16>] \
                  [--aggregates 63,64,65,96,128|off] [--peer <other run's absolute artifacts dir>] \
                  [--emit-candidates 0|1] [--emit-refs 0|1]";
     let mut batch = true;
@@ -197,6 +200,7 @@ fn parse_args() -> Result<Args> {
     let (mut spec, mut mtp_head) = (SpecMode::Off, None);
     let mut ar_phase = true;
     let (mut dflash_draft, mut dflash_probe_window) = (None, None);
+    let mut dflash_block: Option<usize> = None;
     let mut aggregates = vec![63usize, 64, 65, 96, 128];
     let mut aggregates_given = false;
     let (mut peer, mut emit_candidates, mut emit_refs) = (None::<PathBuf>, false, false);
@@ -227,6 +231,13 @@ fn parse_args() -> Result<Args> {
             "--mtp-head" => mtp_head = Some(PathBuf::from(val)),
             "--dflash-draft" => dflash_draft = Some(PathBuf::from(val)),
             "--dflash-probe-window" => dflash_probe_window = Some(val.parse::<usize>()?),
+            "--dflash-block" => {
+                let b = val.parse::<usize>()?;
+                if !(hipfire_runtime::dflash::DFLASH_BLOCK_MIN..=hipfire_runtime::dflash::DFLASH_BLOCK_MAX).contains(&b) {
+                    return Err(format!("--dflash-block {b} outside 4..=16").into());
+                }
+                dflash_block = Some(b);
+            }
             "--aggregates" => {
                 aggregates_given = true;
                 aggregates = if val == "off" { Vec::new() } else { parse_list(val)? };
@@ -268,9 +279,10 @@ fn parse_args() -> Result<Args> {
         if !draft.is_file() {
             return Err(format!("--dflash-draft {} is not a file", draft.display()).into());
         }
-    } else if dflash_draft.is_some() || dflash_probe_window.is_some() {
-        return Err("--dflash-draft / --dflash-probe-window require --spec dflash|mixed".into());
+    } else if dflash_draft.is_some() || dflash_probe_window.is_some() || dflash_block.is_some() {
+        return Err("--dflash-draft / --dflash-probe-window / --dflash-block require --spec dflash|mixed".into());
     }
+    let dflash_block = dflash_block.unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT);
     if !spec.dflash() && (aggregates_given || peer.is_some() || emit_candidates || emit_refs) {
         return Err("--aggregates / --peer / --emit-candidates / --emit-refs require --spec dflash|mixed".into());
     }
@@ -287,7 +299,7 @@ fn parse_args() -> Result<Args> {
     }
     Ok(Args {
         model, ks, contexts: contexts.ok_or(usage)?, short, steps, out, artifacts, batch, stop_repeats, drift_cycles,
-        spec, ar_phase, dflash_draft, dflash_probe_window, mtp_head, aggregates, peer, emit_candidates, emit_refs,
+        spec, ar_phase, dflash_draft, dflash_probe_window, dflash_block, mtp_head, aggregates, peer, emit_candidates, emit_refs,
     })
 }
 
@@ -4275,13 +4287,23 @@ fn draft_case(
 fn draft_batch_cases(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, cfg: &G0Cfg, fx: &[Fixture], refs: &mut G0Refs, cb: &mut DflashCbScratch) -> Result<(Vec<Value>, bool)> {
     let n = fx.len();
     let fxl = |k: usize| -> Vec<usize> { (0..k).map(|i| i % n).collect() };
+    // Full-block lanes pack in order into chunks of at most
+    // `min(DFLASH_DRAFT_BATCH_MAX_ROWS, cb rows)` rows; a chunk below
+    // `min_lanes` runs the singleton draft. Expected batched lanes at this
+    // run's block (3 of 4 at B=16 / min 2; all 4 at B=8).
+    let cap = hipfire_arch_qwen35::speculative::DFLASH_DRAFT_BATCH_MAX_ROWS.min(cb.max_rows());
+    let per_chunk = (cap / cfg.block).max(1);
+    let batched = |k: usize, min_lanes: usize| -> usize {
+        let rem = k % per_chunk;
+        (k - rem) + if rem >= min_lanes.max(1) { rem } else { 0 }
+    };
     // (name, lanes, min_lanes, expected batched lanes)
     let cases: Vec<(&str, usize, usize, usize)> = vec![
-        ("draft_n1_batched16", 1, 1, 1),
-        ("draft_n2", 2, 1, 2),
-        ("draft_n3", 3, 1, 3),
-        ("draft_n4_min1", 4, 1, 4),
-        ("draft_n4_prod", 4, 2, 3),
+        ("draft_n1_batched", 1, 1, batched(1, 1)),
+        ("draft_n2", 2, 1, batched(2, 1)),
+        ("draft_n3", 3, 1, batched(3, 1)),
+        ("draft_n4_min1", 4, 1, batched(4, 1)),
+        ("draft_n4_prod", 4, 2, batched(4, 2)),
     ];
     let mut rows = Vec::new();
     let mut pass = true;
@@ -4361,8 +4383,11 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
         kv.quant_q8 && !kv.quant_fwht && !kv.quant_asym2 && !kv.quant_asym3 && !kv.quant_asym4 && matches!(kv.v_mode, hipfire_runtime::llama::VMode::Q8)
     };
     let draft_str = draft_path.to_str().ok_or("--dflash-draft is not UTF-8")?;
-    let df = load_dflash_state(draft_str, ctx_cap, &slot.config, &slot.dn_state, &mut gpu, None, None, false, &slot.weights, kv_q8, true, false)?;
-    eprintln!("gate0: DFlash draft loaded: layers={} hidden={} block={}", df.draft_config.n_layers, df.draft_config.hidden, df.draft_config.block_size);
+    let df = load_dflash_state(draft_str, ctx_cap, &slot.config, &slot.dn_state, &mut gpu, None, None, false, &slot.weights, kv_q8, true, false, args.dflash_block)?;
+    eprintln!(
+        "gate0: DFlash draft loaded: layers={} hidden={} block={} runtime_block={}",
+        df.draft_config.n_layers, df.draft_config.hidden, df.draft_config.block_size, df.block_size
+    );
     let mut d: Box<dyn Speculator> = build_dflash_speculator(df, true, false);
     let block = d.block_size();
     let (draft_bytes, draft_sha) = file_sha(draft_path)?;

@@ -3849,6 +3849,12 @@ pub(crate) fn load_params(
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "vision_mode": config_string(resolved, "vision.mode")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
+        // `auto` or a fixed width (schema-validated); the daemon resolves
+        // `auto` against the route it actually stages.
+        "dflash_block": match config_value(resolved, "speculation.dflash_block")? {
+            hipfire_config::ConfigValue::Integer(b) => serde_json::json!(b),
+            _ => serde_json::json!("auto"),
+        },
         "mtp_mode": config_string(resolved, "speculation.mtp")?,
         "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
         "ngram_draft": matches!(config_string(resolved, "speculation.ngram")?.as_str(), "on" | "auto"),

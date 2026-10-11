@@ -732,7 +732,7 @@ impl Rig {
             hipfire_runtime::hfq::HfqFile::open(p)
                 .ok()
                 .and_then(|h| hipfire_runtime::dflash::DflashConfig::from_hfq(&h))
-                .map(|c| c.runtime_block_size())
+                .map(|c| c.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT))
         });
         if cfg.dflash_required && cfg.dflash_draft.is_some() && dflash_block.is_none() {
             return Err(format!(

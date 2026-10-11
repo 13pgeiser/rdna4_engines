@@ -2230,11 +2230,14 @@ fn finish_qwen35_load(
             // Upstream also suppresses DFlash when adaptive is Some; this keeps
             // admission honest if a future path reaches load_dflash_state.
             bundle.kv_adaptive.is_some(),
+            ctx.spec
+                .dflash_block
+                .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT),
         ) {
             Ok(s) => {
                 eprintln!(
-                    "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
-                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size
+                    "  DFlash draft loaded: {} (layers={}, hidden={}, block={}, runtime_block={})",
+                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size, s.block_size
                 );
                 Some(s)
             }
