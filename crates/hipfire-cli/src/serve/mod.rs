@@ -1240,11 +1240,50 @@ pub(crate) fn parse_bind(
 pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Result<()> {
     fs::create_dir_all(&paths.root)?;
     let log_path = paths.root.join("serve.log");
+    let pid_path = paths.root.join("serve.pid");
+    let health_host = probe_host(host);
+    // An existing server must be reported, not raced: a second child would
+    // die on the GPU lock or the bind while the old server's /health made
+    // the readiness loop below report a false success.
+    if let Some(record) = fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw))
+    {
+        let tracked_port = record.port.unwrap_or(port);
+        if validate_serve_pid(&record, health_host, tracked_port).is_ok() {
+            if tracked_port == port {
+                println!(
+                    "hipfire serve already running (pid {}, port {port}, log {})",
+                    record.pid,
+                    log_path.display()
+                );
+                return Ok(());
+            }
+            bail!(
+                "hipfire serve already running (pid {}, port {tracked_port}); \
+                 run `hipfire stop` before serving on port {port}",
+                record.pid
+            );
+        }
+    }
+    if let Some(health) = http_get_json(health_host, port, "/health") {
+        match health.get("pid").and_then(serde_json::Value::as_u64) {
+            Some(pid) => bail!(
+                "port {port} is already served by hipfire (pid {pid}) not tracked by {}; \
+                 stop that server or choose another port",
+                pid_path.display()
+            ),
+            None => bail!("port {port} is in use by another process; choose another port"),
+        }
+    }
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;
+    // serve.log accumulates across runs; only this child's output may explain
+    // an early exit.
+    let log_start = log.metadata().map(|meta| meta.len()).unwrap_or(0);
     let executable = env::current_exe().context("failed to resolve native hipfire binary")?;
     let mut command = Command::new(executable);
     command
@@ -1290,19 +1329,27 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
         command.arg("--ui");
     }
     let mut child = command.spawn().context("failed to detach native serve")?;
-    let probe_host = match host {
-        "0.0.0.0" => "127.0.0.1",
-        "::" => "::1",
-        other => other,
-    };
-    for _ in 0..600 {
+    let child_pid = u64::from(child.id());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
-            bail!(
-                "native serve exited before readiness ({status}); see {}",
-                log_path.display()
-            );
+            match last_failure_line(&log_path, log_start) {
+                Some(reason) => bail!(
+                    "native serve exited before readiness ({status}): {reason}\nsee {}",
+                    log_path.display()
+                ),
+                None => bail!(
+                    "native serve exited before readiness ({status}); see {}",
+                    log_path.display()
+                ),
+            }
         }
-        if health_ready(probe_host, port) {
+        // Only this child counts as ready: another responder on the port
+        // must not turn a failed spawn into a reported success.
+        let ours = http_get_json(health_host, port, "/health").is_some_and(|health| {
+            health.get("pid").and_then(serde_json::Value::as_u64) == Some(child_pid)
+        });
+        if ours {
             println!(
                 "hipfire serve running at http://{}:{} (PID {}, log {})",
                 host,
@@ -1339,21 +1386,21 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
     )
 }
 
-pub(crate) fn health_ready(host: &str, port: u16) -> bool {
-    let url = if host.contains(':') {
-        format!("http://[{host}]:{port}/health")
-    } else {
-        format!("http://{host}:{port}/health")
-    };
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_millis(100)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    agent
-        .get(&url)
-        .call()
-        .is_ok_and(|response| response.status().is_success())
+/// Most specific failure reason this run wrote to serve.log after byte
+/// `start`: the last `FATAL` line (daemon), else the last `hipfire:` line
+/// (serve's own error exit).
+fn last_failure_line(log_path: &Path, start: u64) -> Option<String> {
+    let raw = fs::read(log_path).ok()?;
+    let tail = raw.get(usize::try_from(start).ok()?..)?;
+    failure_line_in(&String::from_utf8_lossy(tail))
+}
+
+fn failure_line_in(text: &str) -> Option<String> {
+    let lines = || text.lines().map(str::trim).rev();
+    lines()
+        .find(|line| line.starts_with("FATAL"))
+        .or_else(|| lines().find(|line| line.starts_with("hipfire:")))
+        .map(str::to_owned)
 }
 
 /// Browser-facing URL for the embedded chat UI. Wildcard binds are not
@@ -2599,6 +2646,23 @@ mod tests {
         assert_eq!(json.pid, 43);
         assert_eq!(json.token.as_deref(), Some("old"));
         assert!(!json.legacy);
+    }
+
+    #[test]
+    fn detach_failure_line_prefers_fatal_then_hipfire() {
+        let gpu_lock = "[daemon] loading\n\
+                        FATAL: failed to install process configuration: GPU 1 reserved by holder PID 7\n\
+                        hipfire: daemon closed its output (status exit status: 1)\n";
+        assert_eq!(
+            failure_line_in(gpu_lock).as_deref(),
+            Some("FATAL: failed to install process configuration: GPU 1 reserved by holder PID 7")
+        );
+        let bind = "[hipfire] listening\n  hipfire: failed to bind 127.0.0.1:11537: Address already in use (os error 98)\n";
+        assert_eq!(
+            failure_line_in(bind).as_deref(),
+            Some("hipfire: failed to bind 127.0.0.1:11537: Address already in use (os error 98)")
+        );
+        assert_eq!(failure_line_in("[hipfire] starting\n"), None);
     }
 
     #[test]
