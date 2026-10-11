@@ -38,7 +38,7 @@
 #include <vector>
 #include <chrono>
 
-static_assert(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS == 20971520,
+static_assert(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS == 268435456,
               "r4d_rows.cpp restates this bound; libr4d changed it");
 static_assert(R4D_MAX_RANKS == 8, "the 8-rank entry point names exactly seven peers");
 

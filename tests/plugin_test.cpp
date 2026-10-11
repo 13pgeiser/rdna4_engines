@@ -901,13 +901,18 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
     CHECK_EQ(names(bands(2, 1, chunk)),
              "524288:ar_oneshot_2rank_exact 5242880:ar_oneshot_2rank_exact ");
 
-    /* Above the two-shot's cap the one-shot takes the message back. */
+    /* A 16384-token chunk is two-shot to its end: the two-shot's bound is a guard on its word
+     * offsets, not a prefill size, and a chunk past the old 20971520 went back to the one-shot's
+     * twice-as-heavy send. */
     CHECK_EQ(names(bands(4, 1, 16384)),
-             "524288:ar_oneshot_4rank_exact 20971520:ar_twoshot_4rank_exact "
-             "41943040:ar_oneshot_4rank_exact ");
+             "524288:ar_oneshot_4rank_exact 41943040:ar_twoshot_4rank_exact ");
     CHECK_EQ(names(bands(3, 1, 16384)),
-             "524288:ar_oneshot_3rank_exact 20971520:ar_twoshot_3rank_exact "
-             "41943040:ar_oneshot_3rank_exact ");
+             "524288:ar_oneshot_3rank_exact 41943040:ar_twoshot_3rank_exact ");
+
+    /* Above the two-shot's bound the one-shot takes the message back. */
+    CHECK_EQ(names(bands(4, 1, 131072)),
+             "524288:ar_oneshot_4rank_exact 268435456:ar_twoshot_4rank_exact "
+             "335544320:ar_oneshot_4rank_exact ");
 
     /* A step that never exceeds the bound has one band, and it is the one-shot's. */
     CHECK_EQ(names(bands(4, 1, 128)), "327680:ar_oneshot_4rank_exact ");

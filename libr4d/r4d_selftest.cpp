@@ -11241,7 +11241,7 @@ static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs, const 
  * sums correctly. This one gives every element its own value, so a word reduced by the wrong
  * owner, gathered from the wrong slot or dropped at a short shard's end is a wrong number at a
  * known index. The sizes walk the uneven split: words % 3 of 0, 1 and 2, from a 16-word message
- * to the row's 20971520-element ceiling, in place (how every block issues it) and once out of
+ * to past the old 20971520 ceiling, in place (how every block issues it) and once out of
  * place, back to back on ONE instance so the slot parity and the changing block count are
  * exercised the way a step's mixed messages exercise them. The oracle is the fold the kernel
  * claims -- fp32 in ascending rank order, rounded once -- so it is bit for bit, and so it is also
@@ -11320,8 +11320,9 @@ static void ar_three_rank_pattern(const Plugin& pl, const std::vector<int>& devs
     struct Run { const char* dtype; std::vector<int64_t> sizes; int oop; };
     const std::vector<Run> runs = {
         /* bf16, the residual: words = numel / 8. 2048 x 2048 rows is words % 3 == 2, x 2049 is
-         * 0, x 2050 is 1; 128 is 16 words (1), 24008 is 3001 (1); 20971520 the ceiling (1). */
-        { "bf16", { 4194304, 128, 4196352, 24008, 4198400, 20971520, 4194304 }, 2 },
+         * 0, x 2050 is 1; 128 is 16 words (1), 24008 is 3001 (1); 20971520 the old ceiling (1);
+         * 46137344, Gemma 4's feed-forward reduce at an 8192-token chunk, past it (1). */
+        { "bf16", { 4194304, 128, 4196352, 24008, 4198400, 20971520, 46137344, 4194304 }, 2 },
         /* fp32: words = numel / 4. 8196 -> 2049 (0), 4100 -> 1025 (2), 1048580 -> 262145 (2). */
         { "fp32", { 8196, 4100, 1048580 }, 0 },
     };

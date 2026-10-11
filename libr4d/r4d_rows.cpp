@@ -71,7 +71,7 @@
 
 /* libr4d's R4D_AR_TWOSHOT_WIDE_MAX_ELEMS, restated because this file must not include r4d.h.
  * r4d_ar_entry.hip static_asserts the two against each other. */
-#define R4D_AR_TWOSHOT_WIDE_MAX_ELEMS 20971520
+#define R4D_AR_TWOSHOT_WIDE_MAX_ELEMS 268435456
 
 /* The largest message, in elements, a 4- or 8-rank exact all-reduce keeps on the one-shot; above it
  * the two-shot rows take it. 1 MiB of a 16-bit payload. The one-shot sends (ws-1)*N bytes a rank

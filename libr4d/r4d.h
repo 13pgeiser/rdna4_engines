@@ -418,8 +418,12 @@ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
 // Shards are as even as the word count allows (the first n16 % ws take one more word), so a
 // message need not divide by the rank count -- at three it almost never does. Regions A and B sit
 // at 0 and the longest shard, so the slot stride must hold twice that. Above this bound the caller
-// falls back:
-enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 20971520 };  // a 4096-token hidden-5120 prefill chunk
+// falls back to the one-shot. The bound guards the kernel's int word offsets (the message, the
+// slot stride) and nothing else: 2^28 elements is 2^26 words at fp32. It was 20971520 -- a
+// 4096-token chunk of a 5120-wide residual -- which handed every larger prefill chunk back to the
+// one-shot and its (ws-1)*N send: an 8192-token chunk at Gemma 4's 2816 is 23M elements at the
+// attention's reduce and 46M at the feed-forward's, which carries both branches.
+enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 268435456 };
 void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long peer_flags0,
                                 long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
