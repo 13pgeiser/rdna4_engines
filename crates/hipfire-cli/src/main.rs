@@ -5309,6 +5309,17 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && (args.matrix || args.redline) {
         bail!("--exp cannot be combined with matrix or Redline options");
     }
+    // The matrix is the synthetic `bench_prefill`/`bench_decode` protocol:
+    // its prefill rows are fixed token ids on the plain prefill route, never a
+    // prompt and never the speculative prompt prefill `serve` runs. Refuse a
+    // prompt instead of silently measuring something else.
+    if (args.matrix || args.redline) && (args.prompt_file.is_some() || !args.prompt.is_empty()) {
+        bail!(
+            "--matrix/--redline measure synthetic token ids (bench_prefill) and cannot take a prompt; \
+             for a prompt's prefill with the configured speculation use the standard bench \
+             (`hipfire bench MODEL --prompt-file FILE --max-tokens 1`)"
+        );
+    }
     if args.ttft && args.matrix {
         bail!("--ttft cannot be combined with --matrix (it measures the standard generate path)");
     }
@@ -5360,7 +5371,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp {
         return bench_experimental(paths, &args);
     }
-    let (mut engine, loaded, pre_diag, post_diag, devices_spec, max_seq) =
+    let (mut engine, loaded, pre_diag, post_diag, devices_spec, max_seq, load_speculation) =
         open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
     let max_seq_json = max_seq.json(&loaded);
     let prompt = resolve_bench_prompt(&args)?;
@@ -5396,6 +5407,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             &post_diag,
             &power,
             &max_seq_json,
+            &load_speculation,
         )
     } else if args.ttft {
         bench_ttft(
@@ -5506,6 +5518,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "wall_tok_s": sample_stats(&wall),
                 "ttft_ms": sample_stats(&ttft),
                 "spec_requested": args.speculation,
+                "load_speculation": load_speculation,
                 "spec_route": spec_routes,
                 "spec_tau": spec_tau,
                 "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
@@ -5621,7 +5634,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
             BenchShape::Steady => 2048,
             BenchShape::BetterBench => 4096,
         };
-        let (engine, loaded, _, _, _, max_seq) =
+        let (engine, loaded, _, _, _, max_seq, _) =
             open_bench_engine_slots(paths, &slot_args, max_k, slot_ctx)?;
         print_bench_max_seq(&max_seq, &loaded);
         let slot_capable = loaded
@@ -5649,7 +5662,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
         seq_args.concurrency = None;
-        let (engine, loaded, _, _, _, max_seq) =
+        let (engine, loaded, _, _, _, max_seq, _) =
             open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
         print_bench_max_seq(&max_seq, &loaded);
         let mut d = Driver::sequential(engine, max_k, args.reasoning_on);
@@ -5668,7 +5681,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         let lanes = max_k.max(2);
         let vmm = crate::serve::VmmBatchFlags::from_config(&resolved)?;
         let vmm_params = vmm.load_params(config_u64(&resolved, "serve.max_batch_tokens")?);
-        let (engine, loaded, _, _, _, max_seq) =
+        let (engine, loaded, _, _, _, max_seq, _) =
             open_bench_engine_batched(paths, &batch_args, lanes, vmm_params)?;
         print_bench_max_seq(&max_seq, &loaded);
         match Driver::batch(engine, max_k, &loaded, args.reasoning_on) {
@@ -5786,7 +5799,8 @@ fn open_bench_engine_slots(
 /// `open_bench_engine`'s result: the engine, its `loaded` reply, `diag`
 /// before and after the load, the `hardware.devices` selector the daemon
 /// was configured with (the bench's power sampler resolves the same card),
-/// and how the load's `max_seq` was chosen.
+/// how the load's `max_seq` was chosen, and the speculation the load asked
+/// for ([`bench_load_speculation`]).
 type BenchEngine = (
     Engine,
     serde_json::Value,
@@ -5794,7 +5808,22 @@ type BenchEngine = (
     serde_json::Value,
     Option<String>,
     BenchMaxSeq,
+    serde_json::Value,
 );
+
+/// The speculation selectors of a bench load's params (`mtp_mode`,
+/// `dflash_mode`, `dspark_mode`, `ngram_draft`; null when the params leave
+/// one unset), so a report states which speculative route the loaded model
+/// could take.
+fn bench_load_speculation(params: &serde_json::Value) -> serde_json::Value {
+    let field = |key: &str| params.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "mtp_mode": field("mtp_mode"),
+        "dflash_mode": field("dflash_mode"),
+        "dspark_mode": field("dspark_mode"),
+        "ngram_draft": field("ngram_draft"),
+    })
+}
 
 /// Positions past the measured ones that the daemon's `bench_prefill` and
 /// `bench_decode` guards require (`tokens + 32 <= physical_cap`).
@@ -6092,10 +6121,11 @@ fn open_bench_engine(
         params["experimental_multi_slot_slots"] = serde_json::json!(slots as u64);
         params["experimental_multi_slot_ctx"] = serde_json::json!(ctx as u64);
     }
+    let load_speculation = bench_load_speculation(&params);
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let devices_spec = process_config.legacy_value("HIPFIRE_DEVICES");
-    Ok((engine, loaded, pre_diag, post_diag, devices_spec, max_seq))
+    Ok((engine, loaded, pre_diag, post_diag, devices_spec, max_seq, load_speculation))
 }
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
@@ -6362,6 +6392,7 @@ fn bench_matrix(
     diag: &serde_json::Value,
     power: &bench_power::PowerProbe,
     max_seq: &serde_json::Value,
+    load_speculation: &serde_json::Value,
 ) -> Result<()> {
     for size in &args.pp {
         let _ = bench_probe(
@@ -6486,6 +6517,11 @@ fn bench_matrix(
             "max_seq": max_seq,
             "redline_pm4": args.redline,
             "kv_mode": args.kv_mode,
+            "spec_requested": args.speculation,
+            "load_speculation": load_speculation,
+            // `bench_prefill` never drafts: the prompt prefill of a
+            // speculative load (MTP's head fill) is not what these rows time.
+            "prefill_route": "bench_prefill (synthetic ids, no speculative prompt fill)",
             "runs": args.runs,
             "warnings": warnings,
             "power_device": power.device_json(),
@@ -6504,7 +6540,7 @@ fn bench_matrix(
 fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
     let mut rows = Vec::new();
     for variant in 1..=5 {
-        let (mut engine, _, _, diag, _, _) =
+        let (mut engine, _, _, diag, _, _, _) =
             open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
         let arch = diag
             .get("arch")
@@ -6581,7 +6617,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             prompt: Vec::new(),
             prompt_file: None,
         };
-        let (mut engine, _, _, _, _, _) =
+        let (mut engine, _, _, _, _, _, _) =
             open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
         engine
@@ -14648,6 +14684,25 @@ mod tests {
             err.to_string().contains("--prompt-file"),
             "conflict error should name the flag: {err}"
         );
+    }
+
+    #[test]
+    fn bench_matrix_refuses_a_prompt() {
+        for (prompt, prompt_file) in [
+            (Vec::new(), Some(PathBuf::from("prompt.txt"))),
+            (vec!["hello".to_owned()], None),
+        ] {
+            for redline in [false, true] {
+                let mut args = bench_args_for_test(prompt.clone(), prompt_file.clone());
+                args.matrix = !redline;
+                args.redline = redline;
+                let err = bench_command(&test_paths("bench-matrix-prompt"), args).unwrap_err();
+                assert!(
+                    err.to_string().contains("cannot take a prompt"),
+                    "matrix with a prompt must be refused before any load: {err}"
+                );
+            }
+        }
     }
 
     #[test]
