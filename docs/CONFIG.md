@@ -572,6 +572,8 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `ddtree_budget` | `0` | int 0–64 | `0` = chain DFlash (no tree). |
 | `ddtree_topk` | `4` | int 1–8 | |
 
+**DFlash IU4 verify at `dflash_block` 8.** When a DFlash load's proposal width resolves to 8 (the `auto` width of a batching serve), its target verify runs on gfx1201 with 4-bit (A4) activations: the IU4 verify. **Numerics differ from the F16 verify; quality is tied on task evals** (Qwen3.8-27B paired greedy DFlash: HumanEval 157 → 156, GSM8K 5-shot 1,282 → 1,282, MMLU-Pro subset 871 → 871). F16 == IU4 is not promised; batched == singleton stays byte-identical within the configuration. C8 +9.9 %, BetterBench T0.7 C8 +3.9 %, and a lone request on that serve −7.7 % (R9700, L8). Width-16 loads keep the F16 verify. `HIPFIRE_CB_VERIFY_IU4=0` is the kill switch, `=1` forces it on at any width; `HIPFIRE_CB_VERIFY_FP8=1` takes precedence over the default and cannot be combined with `=1` ([`env-vars.md`](env-vars.md)).
+
 Legacy compatibility input still wins at the top of the startup ladder for
 the corresponding knobs, but the engine receives only the resolved immutable
 snapshot. Full aliases: [`env-vars.md`](env-vars.md).
