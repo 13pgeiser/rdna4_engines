@@ -11243,6 +11243,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.iu4_verify_note_f16();
         self.bind_thread()?;
         if self.fp8_verify_scope {
             return self.gemm_qkvza_mq4g256v2_verify_fp8(
@@ -20955,6 +20956,7 @@ impl Gpu {
             // LDS: 20480 B (A/W double-buffered + ping-pong DS/SZ; store
             // slots overlap).
             let lds_bytes: u32 = 20480;
+            self.iu4_verify_note_iu4(batch_size);
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
@@ -32279,6 +32281,7 @@ impl Gpu {
         // An owed residual add must land before any further GEMM.
         self.flush_residual_fold()?;
         self.ensure_embedded_kernel(module, image, symbol)?;
+        self.iu4_verify_note_iu4(n);
         let mut ptrs = [a_qkv, a_z_fold].map(|t| t.buf.as_ptr());
         let mut xq_ptr = xq;
         let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
@@ -32748,6 +32751,7 @@ impl Gpu {
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
             );
         }
+        self.iu4_verify_note_f16();
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_i8(a_q, xq, y_q, q_m, k, batch_size)?;
@@ -33387,6 +33391,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.iu4_verify_note_f16();
         self.bind_thread()?;
         if self.fp8_verify_scope {
             return self.gemm_gate_up_mq4g256v2_verify_fp8(
@@ -34594,6 +34599,7 @@ impl Gpu {
                 0, "bf16 h requires the production gfx1201 IU4 b1 SiLU object",
             ));
         }
+        self.iu4_verify_note_iu4(n);
         let slab = self.scratch.int4_mmq_slab_at(xq);
         if slab && !isa {
             return Err(hip_bridge::HipError::new(
@@ -35997,6 +36003,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.iu4_verify_note_f16();
         self.bind_thread()?;
         if self.fp8_verify_scope {
             return self.gemm_mq4g256v2_residual_verify_fp8(a_raw, x, y, m, k, batch_size);

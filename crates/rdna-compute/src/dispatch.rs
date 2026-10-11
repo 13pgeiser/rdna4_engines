@@ -1110,6 +1110,12 @@ pub(crate) struct ResidualFold {
     pub n: usize,
 }
 
+/// IU4 verify route receipts (see [`Gpu::iu4_verify_exit`]).
+static IU4_VERIFY_SCOPE_IU4: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IU4_VERIFY_SCOPE_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IU4_VERIFY_SCOPE_F16: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IU4_VERIFY_SCOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 ///
 /// Tape completeness invariant: for any body executed via `Gpu`,
@@ -1180,6 +1186,17 @@ pub struct Gpu {
     /// family or fails; F16-input producers error. Always false when the flag
     /// is off.
     pub fp8_verify_scope: bool,
+    /// IU4 verify scope (`HIPFIRE_DFLASH_IU4_VERIFY=1`, default off; a
+    /// numerics opt-in): set by the DFlash target verify call sites for the
+    /// duration of the verify trunk when [`Gpu::iu4_verify_route_admitted`].
+    /// While set, the gfx1201 A4 producer gates
+    /// (`iu4_producer_quant_fused_active`, `iu4_silu_quant_fused_active`)
+    /// admit any batch >= 1 and the A8 / FP8-stream projection routes are
+    /// off, so every verify row count (the C1 16-row singleton and the
+    /// batched 17..=128-row trunk alike) takes the same A4 producers + IU4
+    /// GEMMs, whose output rows do not depend on the row count. lm_head is
+    /// untouched (F16). See [`Gpu::iu4_verify_enter`].
+    pub iu4_verify_scope: bool,
     /// Qwen4 symmetric MQ4 trunk verified for the dense IU4 route
     /// (`HIPFIRE_QWEN4_TRUNK_IU4`); set by the Qwen4 forward after every
     /// trunk header passed [`Gpu::qwen4_trunk_sym_check`]. See
@@ -2029,6 +2046,7 @@ impl Gpu {
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
             fp8_verify_scope: false,
+            iu4_verify_scope: false,
             qwen4_trunk_iu4: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
@@ -4247,9 +4265,12 @@ impl Gpu {
         prepared.checked_ptr(generation, ptr, k, n)
     }
 
+    /// The A8 projection route. Off inside the IU4 verify scope, whose
+    /// producers must not depend on the row count.
     pub fn a8_prefill_active(&self, n: usize, k: usize) -> bool {
         self.flags.a8_prefill_enabled()
             && self.mq4v2_symmetric
+            && !self.iu4_verify_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && n >= 64 && k > 0 && k % 256 == 0
@@ -4269,10 +4290,11 @@ impl Gpu {
     }
     /// True when the gfx1201 slice-1 silu+quant fusion is live for this call:
     /// IU4 + exact gfx1201 + eager (no replay/capture) + K constraint of the
-    /// iu4 MMQ consumer. Any batch >= 64: every producer grid is row-parallel
-    /// in batch (one row per workgroup), and the gfx1201 iu4 MMQ consumer
-    /// handles partial 128-row tiles natively (zero-filled slab / guarded
-    /// writeback), so the old %128 multiple was grid convenience only.
+    /// iu4 MMQ consumer. Any batch >= 64 (any batch >= 1 inside the IU4
+    /// verify scope): every producer grid is row-parallel in batch (one row
+    /// per workgroup), and the gfx1201 iu4 MMQ consumer handles partial
+    /// 128-row tiles natively (zero-filled slab / guarded writeback), so the
+    /// old %128 multiple was grid convenience only.
     /// Default on for the IU4 route (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
     pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_silu_quant_fused_enabled()
@@ -4280,25 +4302,91 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
     }
     /// True when a gfx1201 slices-2-4 producer+quant fusion is live for this
     /// call: IU4 + `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 +
     /// eager (no replay/capture) + K constraint of the iu4 MMQ consumer. Any
-    /// batch >= 64, same row-parallel justification as
-    /// `iu4_silu_quant_fused_active`; the GDN fused producer additionally
-    /// requires head_dim == 128 at its callsite helper.
+    /// batch >= 64 (any batch >= 1 inside the IU4 verify scope), same
+    /// row-parallel justification as `iu4_silu_quant_fused_active`; the GDN
+    /// fused producer additionally requires head_dim == 128 at its callsite
+    /// helper.
     pub fn iu4_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_producer_quant_fused_enabled()
             && !self.a8_prefill_active(batch, k)
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
+    }
+
+    /// Whether `HIPFIRE_DFLASH_IU4_VERIFY=1` (developer, default off) asks for
+    /// the IU4 (A4-activation) DFlash verify for this process. A numerics
+    /// opt-in: verify logits come from int4 activations instead of F16.
+    pub fn dflash_iu4_verify_requested() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_bool("HIPFIRE_DFLASH_IU4_VERIFY", false)
+        });
+        *ON
+    }
+
+    /// The device/flag half of the IU4 verify admission: exact gfx1201 with
+    /// the IU4 route and both gfx1201 A4 producer fusions on (the verify trunk
+    /// has no other A4 producer for its out-projections and FFN down). The
+    /// target half (dense MQ4G256V2 weights) is the caller's.
+    pub fn iu4_verify_route_admitted(&self) -> bool {
+        Self::dflash_iu4_verify_requested()
+            && self.arch == "gfx1201"
+            && self.mq4v2_symmetric
+            && self.flags.iu4_prefill_enabled()
+            && self.flags.gfx12_producer_quant_fused_enabled()
+            && self.flags.gfx12_silu_quant_fused_enabled()
+    }
+
+    /// Open the IU4 verify scope (`admitted` = the caller's full admission);
+    /// returns the previous scope for [`Self::iu4_verify_exit`]. Graph
+    /// capture and Redline recording never run inside the scope: the A4
+    /// producers are eager-only, and the verify callers take their eager
+    /// route while it is set.
+    pub fn iu4_verify_enter(&mut self, admitted: bool) -> bool {
+        let prev = self.iu4_verify_scope;
+        self.iu4_verify_scope = admitted;
+        prev
+    }
+
+    /// Close the scope. The first 3 closed scopes (and every 1000th) print the
+    /// route receipt: IU4 GEMM launches and F16 MQ4V2 GEMM calls inside them.
+    pub fn iu4_verify_exit(&mut self, prev: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.iu4_verify_scope && !prev {
+            let iu4 = IU4_VERIFY_SCOPE_IU4.swap(0, Relaxed);
+            let rows = IU4_VERIFY_SCOPE_ROWS.swap(0, Relaxed);
+            let f16 = IU4_VERIFY_SCOPE_F16.swap(0, Relaxed);
+            let i = IU4_VERIFY_SCOPES.fetch_add(1, Relaxed);
+            if i < 3 || i % 1000 == 0 {
+                eprintln!("[dflash-iu4-verify] scope #{i}: {iu4} IU4 GEMM launches ({rows} rows total), {f16} F16 MQ4V2 GEMM calls");
+            }
+        }
+        self.iu4_verify_scope = prev;
+    }
+
+    /// Route receipt: one IU4 GEMM launch over `n` rows (inside the scope only).
+    pub fn iu4_verify_note_iu4(&self, n: usize) {
+        if self.iu4_verify_scope {
+            IU4_VERIFY_SCOPE_IU4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            IU4_VERIFY_SCOPE_ROWS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Route receipt: one F16 MQ4V2 GEMM call (inside the scope only).
+    pub fn iu4_verify_note_f16(&self) {
+        if self.iu4_verify_scope {
+            IU4_VERIFY_SCOPE_F16.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     /// True when a gfx11 sigmoid/gated-norm producer+quant fusion is live
     /// for this call: IU4 + `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` on
@@ -4326,6 +4414,7 @@ impl Gpu {
     pub fn fp8_stream_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_fp8_stream_enabled()
             && !self.a8_prefill_active(batch, k)
+            && !self.iu4_verify_scope
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode

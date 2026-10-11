@@ -4176,25 +4176,28 @@ fn dflash_commit_decision_borrowed(
         }
     } else {
         let replay_tokens = &committed[..accept_len + 1];
-        // Batched-forward rollback replay: inside the PM FP8 verify scope so the
-        // rewritten KV/DeltaNet rows are the verify's FP8 rows (n >= 2; the
-        // per-token n == 1 fallback inside is the decode GEMV).
+        // Batched-forward rollback replay: inside the PM FP8 / IU4 verify scope
+        // so the rewritten KV/DeltaNet rows are the verify's FP8 / IU4 rows
+        // (n >= 2; the per-token n == 1 fallback inside is the decode GEMV).
         let fp8 = fp8_verify_target(target.weights, target.config, target.kv_cache);
+        let iu4 = qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target.weights, target.config);
         fp8_verify_scoped(gpu, fp8, |gpu| {
-            qwen35::forward_prefill_batch(
-                gpu,
-                target.weights,
-                target.config,
-                replay_tokens,
-                position,
-                target.kv_cache,
-                target.dn_state,
-                target.scratch,
-                None,
-                None,
-                None,
-                None,
-            )
+            iu4_verify_scoped(gpu, iu4, |gpu| {
+                qwen35::forward_prefill_batch(
+                    gpu,
+                    target.weights,
+                    target.config,
+                    replay_tokens,
+                    position,
+                    target.kv_cache,
+                    target.dn_state,
+                    target.scratch,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
         })?;
     }
     Ok((
@@ -4439,12 +4442,35 @@ pub(crate) fn fp8_verify_scoped<T>(
     r
 }
 
+/// Run `f` inside the IU4 verify scope when `admitted`
+/// ([`qwen35::prefill::multi::dflash_iu4_verify_admitted`]), closing it on
+/// every path. For DFlash target forwards that re-commit state after a verify,
+/// so they reproduce the verify's IU4 rows.
+pub(crate) fn iu4_verify_scoped<T>(
+    gpu: &mut Gpu,
+    admitted: bool,
+    f: impl FnOnce(&mut Gpu) -> HipResult<T>,
+) -> HipResult<T> {
+    let prev = gpu.iu4_verify_enter(admitted);
+    let r = f(gpu);
+    gpu.iu4_verify_exit(prev);
+    r
+}
+
 /// Target verify trunk + verify lm_head/argmax inside the PM FP8 verify GEMM
 /// scope (`HIPFIRE_CB_VERIFY_FP8`, see `qwen35::prefill::fp8_verify_target`):
 /// one MQ4G256V2 -> E4M3 arithmetic for every row count, so this singleton ==
 /// the batched continuous-batching verify byte-for-byte. The scope covers the
 /// HIP-graph capture/replay and eager arms and the lm_head enqueue, and is
 /// closed on every path. A tree verify never opens it.
+///
+/// `HIPFIRE_DFLASH_IU4_VERIFY` (numerics opt-in, default off; mutually
+/// exclusive with `HIPFIRE_CB_VERIFY_FP8`, refused at load): a chain verify
+/// of an admitted target runs inside the IU4 verify scope (see
+/// `Gpu::iu4_verify_enter`), the same A4 producers + IU4 GEMMs as the
+/// multi-request verify trunk; lm_head stays F16. The scope is eager-only:
+/// the body takes no HipGraph route while it is set, and the retained PM4
+/// route is never armed with it (`dflash_spec`).
 #[allow(clippy::too_many_arguments)]
 fn verify_dflash_block_inner(
     gpu: &mut Gpu,
@@ -4464,7 +4490,13 @@ fn verify_dflash_block_inner(
     } else {
         fp8_verify_target(&target.weights, &target.config, &target.kv_cache)
     };
+    // A retained route that stands down (`HipAuto`, e.g. PM4 disabled) runs
+    // the ordinary HIP body; prime/capture/PM4 windows are never IU4-scoped.
+    let iu4 = tree_verify.is_none()
+        && retained.as_ref().is_none_or(|c| c.selected == DflashVerifyRoute::HipAuto)
+        && qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, &target.weights, &target.config);
     let prev = gpu.fp8_verify_enter(fp8)?;
+    let prev_iu4 = gpu.iu4_verify_enter(iu4);
     let r = verify_dflash_block_inner_body(
         gpu,
         target,
@@ -4478,6 +4510,7 @@ fn verify_dflash_block_inner(
         skip_argmax_d2h,
         retained,
     );
+    gpu.iu4_verify_exit(prev_iu4);
     gpu.fp8_verify_exit(prev);
     r
 }
@@ -4645,7 +4678,10 @@ fn verify_dflash_block_inner_body(
                 | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
         )
         && verify_scratch.prefill_batch.is_some()
-        && pbs_eligible;
+        && pbs_eligible
+        // IU4 verify: the gfx1201 A4 producers are eager-only (their gates
+        // refuse capture), so the scoped verify always runs eager.
+        && !gpu.iu4_verify_scope;
 
     // Per-cycle timing for verify-graph A/B diagnostic
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the

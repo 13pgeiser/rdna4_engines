@@ -48,7 +48,8 @@ use crate::dflash_spec::{
     DflashCheckpointPolicy, DflashLaneSnapshot, DflashState, DflashWindowMark,
 };
 use crate::qwen35::prefill::multi::{
-    forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_scratch_rows, pack_whole_lanes, MultiChunkRequest,
+    dflash_iu4_verify_admitted, forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_scratch_rows,
+    pack_whole_lanes, MultiChunkRequest,
     MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
 use crate::qwen35::prefill::{fp8_verify_open, verify_dense_math, DenseBatchMath};
@@ -691,7 +692,13 @@ pub fn dflash_cb_verify(
             // Trunk row-byte identity at aggregates 63/64/65/96/128, chunk128
             // off/HIP/PM: cb/chunk128/STAGE4.md:39-58 (the aggregate probe
             // freezes verify.final_hidden as well as logits against singleton).
-            forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.head.final_hidden))
+            // `HIPFIRE_DFLASH_IU4_VERIFY`: the trunk runs inside the IU4 verify
+            // scope, the same A4 producers + IU4 GEMMs as the singleton verify;
+            // the heads below stay F16.
+            let iu4 = gpu.iu4_verify_enter(dflash_iu4_verify_admitted(gpu, weights, config));
+            let r = forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.head.final_hidden));
+            gpu.iu4_verify_exit(iu4);
+            r
         };
         // Greedy retains the packed head. Sampled acceptance reads every float:
         // each sampled head must use Product with its singleton's own b.

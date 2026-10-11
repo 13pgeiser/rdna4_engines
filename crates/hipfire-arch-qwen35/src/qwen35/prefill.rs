@@ -1103,10 +1103,53 @@ pub(crate) enum BatchEpilogue<'a> {
 /// It is MQ4G256V2-only: any other weight dtype, a `Partial` epilogue or a
 /// prepared/in-place producer request is a pre-mutation error, never a
 /// fallback to the quantized product arithmetic.
+///
+/// `Iu4Verify` (`HIPFIRE_DFLASH_IU4_VERIFY=1`, a numerics opt-in) is the
+/// DFlash verify inside `Gpu::iu4_verify_scope`, for the singleton verify
+/// and the multi-request verify trunk at any combined row count alike: every
+/// projection takes a gfx1201 A4 producer (AWQ RMSNorm/FWHT, gated-norm,
+/// sigmoid, SwiGLU or F1-lite h, slab layout) and its IU4 GEMM (`_b1s` SET /
+/// ADD, the F1-lite gate/up+SwiGLU), which the scope admits at any row count
+/// and whose output rows do not depend on it. An F16 projection fallback
+/// inside it is an error, never a silent mixed route. Stages reached with
+/// `Product` inside the scope run as `Iu4Verify` ([`Self::resolve`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DenseBatchMath {
     Product,
     SingletonWmma,
+    Iu4Verify,
+}
+
+impl DenseBatchMath {
+    /// The math a stage runs: `Product` inside the IU4 verify scope is
+    /// `Iu4Verify`. `SingletonWmma` inside the scope and `Iu4Verify` outside
+    /// it are caller errors.
+    pub(crate) fn resolve(self, gpu: &Gpu, site: &str) -> HipResult<Self> {
+        match (self, gpu.iu4_verify_scope) {
+            (Self::Product, true) | (Self::Iu4Verify, true) => Ok(Self::Iu4Verify),
+            (Self::Product, false) => Ok(Self::Product),
+            (Self::SingletonWmma, false) => Ok(Self::SingletonWmma),
+            (Self::SingletonWmma, true) => Err(HipError::new(
+                0,
+                &format!("{site}: SingletonWmma verify math inside the IU4 verify scope"),
+            )),
+            (Self::Iu4Verify, false) => Err(HipError::new(
+                0,
+                &format!("{site}: Iu4Verify math outside the IU4 verify scope"),
+            )),
+        }
+    }
+}
+
+/// `Iu4Verify`: the A4 producer for this projection must have run.
+fn require_iu4_verify_prep(math: DenseBatchMath, site: &str, produced: bool) -> HipResult<()> {
+    if math == DenseBatchMath::Iu4Verify && !produced {
+        return Err(HipError::new(
+            0,
+            &format!("{site}: IU4 verify math requires the gfx1201 A4 producer, which was not admitted"),
+        ));
+    }
+    Ok(())
 }
 
 fn require_singleton_wmma_mq4v2(site: &str, dtypes: &[DType]) -> HipResult<()> {
@@ -1198,6 +1241,10 @@ fn dispatch_batched_gemm_epilogue(
 ) -> HipResult<()> {
     let m = w.m;
     let k = w.k;
+    let math = math.resolve(gpu, "dispatch_batched_gemm_epilogue")?;
+    // Every IU4 verify residual GEMM consumes its A4 producer's prepared
+    // activations; reaching this F32-input dispatch means none ran.
+    require_iu4_verify_prep(math, "dispatch_batched_gemm_epilogue", false)?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2("dispatch_batched_gemm_epilogue", &[w.gpu_dtype])?;
         if !matches!(epilogue, BatchEpilogue::Residual) {
@@ -5696,6 +5743,10 @@ fn batch_chunk_delta_net_input_projection(
     math: DenseBatchMath,
 ) -> HipResult<bool> {
     let _ = fusion;
+    let math = math.resolve(gpu, "batch_chunk_delta_net_input_projection")?;
+    // IU4 verify keeps the plain SET consumers: the fused QKVZ + GDN-prep
+    // epilogue was not row-count checked, and the caller runs the prep.
+    let gdn = if math == DenseBatchMath::Iu4Verify { None } else { gdn };
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2(
             "batch_chunk_delta_net_input_projection",
@@ -5940,6 +5991,7 @@ fn batch_chunk_delta_net_input_projection(
         )?;
     }
 
+    require_iu4_verify_prep(math, "batch_chunk_delta_net_input_projection", iu4_prep.is_some())?;
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.wqkv.k, n)?;
@@ -6647,6 +6699,9 @@ fn s4_residual_fast(
         && w_dtype == DType::MQ4G256V2
         && matches!(epilogue, BatchEpilogue::Residual)
         && (1..=16).contains(&n)
+        // IU4 verify: the out-projections take the A4 producer + IU4 GEMM
+        // at every row count, never this 1..=16-row F16 arm.
+        && !gpu.iu4_verify_scope
 }
 
 /// Producer that [`batch_chunk_delta_net_output_projection`] selects for the
@@ -6699,6 +6754,9 @@ fn gdn_scan_out_fmt(
 ) -> HipResult<GdnScanOut> {
     match gdn_out_reader(gpu, layer, config, n, n_v_heads, epilogue, fusion) {
         GdnOutReader::Fp8Stream => gpu.gdn_scan_out(GdnScanOut::F32),
+        // IU4 verify: the GDN scan plane stays F32 (the verify change is the
+        // GEMM activations only, and the multi-request trunk reads F32).
+        GdnOutReader::Gfx12Iu4 if gpu.iu4_verify_scope => Ok(GdnScanOut::F32),
         GdnOutReader::Gfx12Iu4 => gpu.gdn_scan_out(GdnScanOut::Bf16),
         GdnOutReader::F32Only => Ok(GdnScanOut::F32),
     }
@@ -6724,6 +6782,7 @@ fn batch_chunk_delta_net_output_projection(
     x_fmt: GdnScanOut,
     math: DenseBatchMath,
 ) -> HipResult<()> {
+    let math = math.resolve(gpu, "batch_chunk_delta_net_output_projection")?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2(
             "batch_chunk_delta_net_output_projection",
@@ -7516,6 +7575,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
     math: DenseBatchMath,
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
+    let math = math.resolve(gpu, "batch_chunk_delta_net_ffn_gate_up")?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2(
             "batch_chunk_delta_net_ffn_gate_up",
@@ -7697,6 +7757,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
         )?;
     }
 
+    require_iu4_verify_prep(math, "batch_chunk_delta_net_ffn_gate_up", iu4_prep.is_some())?;
     // Batched gate+up projection.
     // #397 Ship 5.2 slice 2: fused gate+up dtypes → FusedQkvFamily
     // (batched-prefill gate+up variant) via run_fused_gate_up_key.
@@ -8022,6 +8083,7 @@ fn batch_chunk_delta_net_ffn_down(
     h_source: FfnGateOutput,
     math: DenseBatchMath,
 ) -> HipResult<()> {
+    let math = math.resolve(gpu, "batch_chunk_delta_net_ffn_down")?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2("batch_chunk_delta_net_ffn_down", &[layer.w_down.gpu_dtype])?;
         if h_source != FfnGateOutput::Separate
@@ -8316,6 +8378,7 @@ fn batch_chunk_full_attn_input_projection(
     math: DenseBatchMath,
 ) -> HipResult<()> {
     let _ = fusion;
+    let math = math.resolve(gpu, "batch_chunk_full_attn_input_projection")?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2(
             "batch_chunk_full_attn_input_projection",
@@ -8508,6 +8571,7 @@ fn batch_chunk_full_attn_input_projection(
         )?;
     }
 
+    require_iu4_verify_prep(math, "batch_chunk_full_attn_input_projection", iu4_prep.is_some())?;
     // 2. Batched 3-way QKV projection (wq+wk+wv).
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.wq.k, n)?;
@@ -9074,6 +9138,15 @@ fn batch_chunk_full_attn_output_projection(
     a4_epi: Option<rdna_compute::Int4MmqPrepared>,
     math: DenseBatchMath,
 ) -> HipResult<()> {
+    let math = math.resolve(gpu, "batch_chunk_full_attn_output_projection")?;
+    if math == DenseBatchMath::Iu4Verify && (fa_gate_in_place || a4_epi.is_some()) {
+        // The DFlash chain verify never takes the fp8q FA prep (in-place gate
+        // / A4 attention epilogue); those are not row-count checked.
+        return Err(HipError::new(
+            0,
+            "batch_chunk_full_attn_output_projection: IU4 verify math has no in-place gate/A4 attention epilogue",
+        ));
+    }
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2(
             "batch_chunk_full_attn_output_projection",
@@ -10022,6 +10095,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
     math: DenseBatchMath,
 ) -> HipResult<FfnGateOutput> {
     let _ = fusion;
+    let math = math.resolve(gpu, "batch_chunk_full_attn_ffn_gate_up")?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2(
             "batch_chunk_full_attn_ffn_gate_up",
@@ -10201,6 +10275,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
             config.norm_eps,
         )?;
     }
+    require_iu4_verify_prep(math, "batch_chunk_full_attn_ffn_gate_up", iu4_prep.is_some())?;
     // #397 Ship 5.2 slice 2: FA-FFN fused gate+up → FusedQkvFamily
     // (batched-prefill gate+up variant), mirroring the LA-FFN block
     // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
@@ -10523,6 +10598,7 @@ fn batch_chunk_full_attn_ffn_down(
     h_source: FfnGateOutput,
     math: DenseBatchMath,
 ) -> HipResult<()> {
+    let math = math.resolve(gpu, "batch_chunk_full_attn_ffn_down")?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2("batch_chunk_full_attn_ffn_down", &[layer.w_down.gpu_dtype])?;
         if h_source != FfnGateOutput::Separate

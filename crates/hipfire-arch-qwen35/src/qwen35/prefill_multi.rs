@@ -110,6 +110,15 @@ fn multi_chunk_wide_route(arch: &str, flags: &rdna_compute::FeatureFlags) -> boo
         && Gpu::mq4_verify_singleton_chain_for(arch, flags)
 }
 
+/// IU4 DFlash verify (`HIPFIRE_DFLASH_IU4_VERIFY=1`, a numerics opt-in) for
+/// this target: [`Gpu::iu4_verify_route_admitted`] and a dense MQ4G256V2
+/// trunk + head. The DFlash verify call sites (singleton and multi-request)
+/// open `Gpu::iu4_verify_scope` with this, so both run the same A4 producers
+/// and IU4 GEMMs ([`DenseBatchMath::Iu4Verify`]).
+pub fn dflash_iu4_verify_admitted(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+    gpu.iu4_verify_route_admitted() && multi_chunk_dense_mq4v2_target(weights, config)
+}
+
 /// The target half of [`multi_chunk_wide_admitted`] (also the dense-target
 /// half of the PM FP8 verify admission, `prefill::fp8_verify_target`).
 pub(crate) fn multi_chunk_dense_mq4v2_target(weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
@@ -419,12 +428,20 @@ pub fn forward_prefill_batch_multi(
     // Aggregate 64+ rows: the default projection route is quantized and not
     // the singleton's arithmetic; only the exact verify GEMMs of a dense
     // MQ4G256V2 target whose singleton runs the one-tile F16-WMMA chain
-    // reproduce it. Refused before any state write.
+    // reproduce it. Refused before any state write. Inside the IU4 verify
+    // scope every row count (singleton included) runs the A4 producers +
+    // IU4 GEMMs instead, whose rows do not depend on the count.
     let wide = total > MULTI_CHUNK_PRODUCT_MAX_ROWS;
     if wide && !multi_chunk_wide_admitted(gpu, weights, config) {
         return refuse("64+ rows need the exact wide verify route: a dense MQ4G256V2 gfx1201 target whose singleton runs the one-tile F16-WMMA chain");
     }
-    let math = if wide { DenseBatchMath::SingletonWmma } else { verify_dense_math(gpu) };
+    let math = if gpu.iu4_verify_scope {
+        DenseBatchMath::Iu4Verify
+    } else if wide {
+        DenseBatchMath::SingletonWmma
+    } else {
+        verify_dense_math(gpu)
+    };
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         return refuse("graph capture / replay recording is not supported");
     }

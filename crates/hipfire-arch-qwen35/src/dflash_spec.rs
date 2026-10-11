@@ -375,6 +375,15 @@ pub fn load_dflash_state(
     // singleton AND of every VMM lane built from this state.
     dflash_block: usize,
 ) -> Result<DflashState, String> {
+    // The IU4 and PM FP8 verify opt-ins are two different verify arithmetics;
+    // both set has no defined route, so the load fails before any allocation.
+    if gpu.flags.cb_verify_fp8 && Gpu::dflash_iu4_verify_requested() {
+        return Err(
+            "HIPFIRE_DFLASH_IU4_VERIFY=1 and HIPFIRE_CB_VERIFY_FP8=1 are mutually exclusive \
+             (two different verify arithmetics); unset one of them"
+                .to_string(),
+        );
+    }
     let requested_ctx = ctx_capacity;
     // Open the draft container up-front: its declared SWA window is the
     // DEFAULT window (below), so the artifact must be parsed before the
@@ -648,6 +657,13 @@ pub fn load_dflash_state(
         hidden_rb.max_batch,
         gdn_tape.max_n,
     ) {
+        // The IU4 verify producers are eager-only; a recorded PM4 tape would
+        // refuse them, so the opt-in keeps the HIP verify route.
+        Ok(()) if qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target_weights, target_config) => {
+            let reason = "HIPFIRE_DFLASH_IU4_VERIFY=1 (the IU4 verify is eager-only)";
+            eprintln!("  DFlash verify PM4: disabled ({reason})");
+            DflashVerifyPm4::disabled(reason)
+        }
         Ok(()) => {
             eprintln!(
                 "  DFlash verify PM4: armed (B={}, exact {})",
