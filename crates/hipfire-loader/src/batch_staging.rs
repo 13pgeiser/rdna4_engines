@@ -707,11 +707,27 @@ fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize, row_bud
         return;
     };
     let route = hipfire_arch_qwen35::mtp_spec::MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
-    match hipfire_arch_qwen35::forward_slots::vmm::spec::VmmSpecEngine::new(gpu, &b.config, head, k, lanes, route) {
+    // AR's penalty window bound: the resident scratch's `repeat_buf` (what
+    // `spec_prefill` passes every lane).
+    let ar_cap = b.scratch.repeat_buf.buf.size() / 4;
+    match hipfire_arch_qwen35::forward_slots::vmm::spec::VmmSpecEngine::new(
+        gpu,
+        &b.config,
+        &b.dn_state,
+        head,
+        k,
+        lanes,
+        route,
+        ar_cap,
+    ) {
         Ok(engine) => {
+            let lane_bytes = engine.lane_bytes();
             let store = b.vmm_store.as_mut().expect("staged above");
             match store.install_spec(engine) {
-                Ok(()) => eprintln!("[daemon] VMM spec lanes staged: MTP K={k} lane_cap={cap}"),
+                Ok(()) => {
+                    eprintln!("[daemon] VMM MTP lane footprint: lane_state={lane_bytes} B");
+                    eprintln!("[daemon] VMM spec lanes staged: MTP K={k} lane_cap={cap}");
+                }
                 Err(engine) => engine.free_gpu(gpu),
             }
         }

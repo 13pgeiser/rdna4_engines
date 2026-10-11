@@ -4579,13 +4579,15 @@ pub fn generate_spec(
                         // A DFlash drafter's lane (draft K/V, hidden ring,
                         // checkpoints, cursors) moves into the batch lane.
                         // Capture BEFORE the irreversible target transfer
-                        // below; a refused promotion restores it.
+                        // below; a refused promotion restores it. The
+                        // singleton is left vacant (no replacement lane
+                        // state is allocated; its next prefill rebuilds it).
                         let df_snap = if permit.dflash_lane {
                             match spec
                                 .drafter_any_mut()
                                 .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
                             {
-                                Some(df) => match df.take_vmm_lane(gpu, &ms.config, &ms.dn_state, position) {
+                                Some(df) => match df.take_vmm_lane(gpu, position) {
                                     Ok(snap) => Some(snap),
                                     Err(e) => {
                                         eprintln!("[vmm-promote] id={id} no DFlash lane state ({e}); continues as AR");

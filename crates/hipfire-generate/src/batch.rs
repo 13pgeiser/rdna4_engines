@@ -1674,9 +1674,10 @@ fn dflash_lane_fits(prompt_len: usize, max_tokens: usize, block: usize, cap: usi
 /// (vLLM's scheduler likewise leaves a waiting request queued when its
 /// blocks do not fit). A lone request always proceeds (no lane admitted:
 /// the singleton route or the first lane). Otherwise the head is charged
-/// its DeltaNet state, its prompt KV, and, when it can become a DFlash lane
-/// (a DFlash engine is staged and it is greedy), the probed DFlash lane
-/// state and checkpoint bound, with growth reserved to `prompt + max_tokens`
+/// its DeltaNet state, its prompt KV, and, when it can become a spec lane
+/// (an MTP or DFlash engine is staged, `engine_kind`, and it is greedy: the
+/// same predicate `spec_pick` starts from), the probed MTP lane state, or the
+/// probed DFlash lane state and checkpoint bound, with growth reserved to `prompt + max_tokens`
 /// (`Qwen35VmmStore::admission_check`); it waits while that would leave
 /// the admitted lanes unable to complete. `wait` remembers the waiting head
 /// so each wait is logged once. A failed memory query admits (the provision
@@ -1686,7 +1687,7 @@ fn vmm_head_admissible(
     gpu: &rdna_compute::Gpu,
     sched: &ContinuousBatchScheduler,
     any_admitted: bool,
-    dflash_engine: bool,
+    engine_kind: hipfire_arch_qwen35::forward_slots::vmm::VmmLaneSpec,
     wait: &mut Option<AttemptKey>,
 ) -> bool {
     let (Some(key), true) = (sched.inbox.front(), any_admitted) else {
@@ -1700,8 +1701,12 @@ fn vmm_head_admissible(
     };
     let prompt = req.prompt_tokens.len();
     let end = prompt + req.max_tokens + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
-    let dflash = dflash_engine && req.sampling.temp <= 0.0;
-    match store.admission_check(gpu, &b.kv_cache, &b.dn_state, prompt, end, dflash) {
+    let lane = if req.sampling.temp <= 0.0 {
+        engine_kind
+    } else {
+        hipfire_arch_qwen35::forward_slots::vmm::VmmLaneSpec::Ar
+    };
+    match store.admission_check(gpu, &b.weights, &b.config, &b.kv_cache, &b.dn_state, prompt, end, lane) {
         Ok(a) if a.fits => {
             if wait.as_ref() == Some(key) {
                 eprintln!("[vmm-admit] id={} admitted after waiting for device memory", key.id);
@@ -2764,6 +2769,17 @@ pub fn drive_qwen_vmm_continuous_batch(
     // Queue head waiting for device memory (`vmm_head_admissible`), logged
     // once per wait.
     let mut memory_wait: Option<AttemptKey> = None;
+    // Most lanes admitted at once so far in this run (`[vmm-budget]` log).
+    let mut resident_high_water = 0usize;
+    // The lane kind a greedy queue head would take (`vmm_head_admissible`):
+    // the MTP engine wins over DFlash, as in `spec_pick` below.
+    let admission_kind = if spec_engine.is_some() {
+        hipfire_arch_qwen35::forward_slots::vmm::VmmLaneSpec::Mtp
+    } else if dflash_engine.is_some() {
+        hipfire_arch_qwen35::forward_slots::vmm::VmmLaneSpec::Dflash
+    } else {
+        hipfire_arch_qwen35::forward_slots::vmm::VmmLaneSpec::Ar
+    };
     // First generated ids of spec lanes prefilled this iteration, emitted
     // with this iteration's commits (the singleton emits the seed first).
     let mut spec_seeds: Vec<hipfire_runtime::slot_batch::RequestAdvance> = Vec::new();
@@ -3264,7 +3280,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                 gpu,
                 sched,
                 epochs.iter().any(|e| e.is_admitted()),
-                dflash_engine.is_some(),
+                admission_kind,
                 &mut memory_wait,
             ))
         .then(|| sched.try_assign_one())
@@ -3486,6 +3502,17 @@ pub fn drive_qwen_vmm_continuous_batch(
             };
             announce(stdout, &key, ticket.admission, started_in_think);
             epochs[lane_idx] = epoch;
+            // Resident-lane evidence: itemize the budget once per new high
+            // water of simultaneously admitted lanes in this driver run.
+            let resident = epochs.iter().filter(|e| e.is_admitted()).count();
+            if resident > resident_high_water {
+                resident_high_water = resident;
+                let report = vmm_bundle(&mut model.state)
+                    .and_then(|b| b.vmm_store.as_ref())
+                    .map(|s| s.budget_report(gpu))
+                    .unwrap_or_default();
+                eprintln!("[vmm-budget] resident lanes={resident} (high water) {report}");
+            }
             lane_decode[lane_idx] = match (spec_seed, spec_pick_kind) {
                 (Some(_), Some(kind)) => kind,
                 _ => VmmLaneDecode::Ar,

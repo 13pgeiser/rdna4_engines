@@ -63,6 +63,7 @@
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config, StateQuant};
 use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, Qwen35VmmStore, VmmRequestInit, VmmRoute};
 use hipfire_arch_qwen35::forward_slots::vmm::spec::VmmSpecEngine;
+use hipfire_arch_qwen35::forward_slots::vmm::dflash::DFLASH_LANE_CHECKPOINT_READERS;
 use hipfire_arch_qwen35::mtp_head::{load_mtp_head, MtpKvMode, Qwen35MtpHead};
 use hipfire_arch_qwen35::mtp_spec::cb::{mtp_cb_cycle, MtpCbLane, MtpCbScratch};
 use hipfire_arch_qwen35::mtp_spec::{prefill_trunk_and_mtp_cache, MtpPromptRoute, MtpSamplingConfig, MtpSpecState};
@@ -2130,7 +2131,8 @@ fn spec_exec_cases(gpu: &mut Gpu, slot: &mut ModelSlot, args: &Args, fx: &[Fixtu
     let mut store = Qwen35VmmStore::new(gpu, &slot.config, &slot.kv_cache, EXEC_WIDTH, EXEC_WIDTH * (k + 1), budget_kv, VmmRoute::Exact)?;
     let head = load_mtp_head(head_path, gpu, cap)?;
     let route = MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
-    let engine = VmmSpecEngine::new(gpu, &slot.config, head, k, EXEC_WIDTH, route)?;
+    let ar_cap = slot.scratch.repeat_buf.buf.size() / 4;
+    let engine = VmmSpecEngine::new(gpu, &slot.config, &slot.dn_state, head, k, EXEC_WIDTH, route, ar_cap)?;
     if store.install_spec(engine).is_err() {
         return Err("install_spec refused".into());
     }
@@ -2537,9 +2539,15 @@ fn spec_batch_case(gpu: &mut Gpu, slot: &mut ModelSlot, head: &Qwen35MtpHead, k:
 // Every lane's pre-window state is produced by the SAME deterministic
 // singleton trajectory (prefill + `--dflash-probe-window` full windows) on
 // that lane's own VMM KV/DeltaNet, then its draft owners are moved out with
-// `take_vmm_lane`/`from_snapshot`. The pre-window bytes of every lane are
-// compared with a separately produced reference trajectory (determinism +
-// lossless-transfer check) before the window is replayed.
+// `take_vmm_lane`/`from_snapshot` and shaped like an engine lane: the
+// singleton's FWHT rotation buffers and verify `prefill_batch` are shed
+// (`shed_vmm_lane_scratch`; the lane's draft GEMMs then borrow the shared
+// `DflashCbScratch` buffers) and its checkpoints dropped (a VMM lane takes
+// none). The pre-window bytes of every lane are compared with a separately
+// produced reference trajectory (determinism + lossless-transfer check)
+// before the window is replayed; the reference lanes keep their own scratch,
+// so the shared-buffer lane draft is proven byte-identical to the isolated
+// singleton's own-buffer draft.
 
 type Named = Vec<(String, Vec<u8>)>;
 type Frozen = Vec<(String, PathBuf)>;
@@ -2736,10 +2744,17 @@ fn dflash_walk(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>,
     // sizes of the DeltaNet that runs. A fresh request DN's pooled tensors can
     // be larger than the resident one's (`Qwen35RequestState::copy_dn_from`
     // documents it): re-size the speculator's live state from the DN about
-    // to run by moving it out and back (`take_vmm_lane` allocates its
-    // replacement from the `dn` passed) and dropping the moved-out copy.
-    let resized = dflash_of(d)?.take_vmm_lane(gpu, &slot.config, &slot.dn_state, 0)?;
-    resized.free_gpu(gpu);
+    // to run by vacating it (`take_vmm_lane` moves the owners out and
+    // allocates no replacement; the moved-out copy is dropped) so that the
+    // `prefill` below rebuilds it from the `dn` it runs on (`ensure_live`).
+    // An already vacant speculator (the previous walk's lane moved out) needs
+    // no vacating.
+    {
+        let spec = dflash_of(d)?;
+        if !spec.is_vacant() {
+            spec.take_vmm_lane(gpu, 0)?.free_gpu(gpu);
+        }
+    }
     d.configure_request(SpecRequestConfig::default());
     slot.dn_state.reset(gpu)?;
     slot.kv_cache.compact_offset = 0;
@@ -2761,11 +2776,40 @@ fn dflash_walk(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>,
 }
 
 /// Move the speculator's live draft owners out as a lane (`take_vmm_lane` +
-/// `from_snapshot`); returns the lane and the snapshot's reported rows.
-fn take_lane(gpu: &mut Gpu, slot: &ModelSlot, d: &mut Box<dyn Speculator>, position: usize) -> Result<(DflashVmmLaneState, usize)> {
-    let snap = dflash_of(d)?.take_vmm_lane(gpu, &slot.config, &slot.dn_state, position)?;
+/// `from_snapshot`); returns the lane, the snapshot's reported rows and the
+/// singleton's own checkpoint positions (read before they move out).
+///
+/// The returned lane is shaped like a VMM lane's state after `dflash_adopt`:
+/// its (dead) checkpoints are freed and its cadence follows
+/// `DFLASH_LANE_CHECKPOINT_READERS`, so `lane.checkpoints` is EMPTY and every
+/// `checkpoints.positions` array of a lane compares against empty. With `shed`
+/// the singleton's rotation buffers and `prefill_batch` are freed too, as the
+/// engine does for a promoted lane (the lane's draft calls must then borrow a
+/// `DflashCbScratch`'s buffers: `lend_mq`, or `dflash_cb_draft`); reference
+/// lanes keep them so the isolated singleton draft runs on its own buffers.
+fn take_lane(gpu: &mut Gpu, d: &mut Box<dyn Speculator>, position: usize, shed: bool) -> Result<(DflashVmmLaneState, usize, Vec<usize>)> {
+    let singleton_ckpts = d.checkpoint_positions();
+    let snap = dflash_of(d)?.take_vmm_lane(gpu, position)?;
     let rows = snap.rows();
-    Ok((DflashVmmLaneState::from_snapshot(snap), rows))
+    let mut lane = DflashVmmLaneState::from_snapshot(snap);
+    for (_, ck) in lane.checkpoints.drain(..) {
+        ck.free_gpu(gpu);
+    }
+    lane.policy.resume_enabled &= DFLASH_LANE_CHECKPOINT_READERS.any();
+    if shed {
+        if let Err(e) = lane.df.shed_vmm_lane_scratch(gpu) {
+            lane.free_gpu(gpu);
+            return Err(e.into());
+        }
+    }
+    Ok((lane, rows, singleton_ckpts))
+}
+
+/// The singleton's own checkpoint positions as a named array (pre-window
+/// reference vs lane-walk compare: both sides are singleton trajectories, so
+/// the singleton's checkpoint compare is unchanged).
+fn singleton_ckpt_array(ck: &[usize]) -> (String, Vec<u8>) {
+    ("singleton.checkpoints.positions".into(), le_u64s(&ck.iter().map(|&p| p as u64).collect::<Vec<_>>()))
 }
 
 fn ctx_mode_str(df: &DflashState) -> String {
@@ -2813,8 +2857,11 @@ fn ensure_pre(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>, 
     }
     eprintln!("gate0 trace: ref_pre walk {}", fx[fi].name());
     let w = dflash_walk(gpu, slot, d, &fx[fi], cfg.windows)?;
-    let (lane, rows) = take_lane(gpu, slot, d, w.position)?;
-    let set = full_state(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, &lane, w.position);
+    let (lane, rows, singleton_ck) = take_lane(gpu, d, w.position, false)?;
+    let set = full_state(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, &lane, w.position).map(|mut v| {
+        v.push(singleton_ckpt_array(&singleton_ck));
+        v
+    });
     let ctx_mode = ctx_mode_str(&lane.df);
     lane.free_gpu(gpu);
     let frozen = freeze(&cfg.dir.join(format!("ref_pre_{}", fx[fi].name())), &set?)?;
@@ -2845,7 +2892,7 @@ fn ensure_post(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>,
     let new_pos = w.position + s.emit.len();
     // Target side (singleton owners) before the draft owners move out.
     let mut set = state_bytes(gpu, &slot.config, &slot.kv_cache, &slot.dn_state, new_pos)?;
-    let (lane, _rows) = take_lane(gpu, slot, d, new_pos)?;
+    let (lane, _rows, _singleton_ck) = take_lane(gpu, d, new_pos, false)?;
     let df_set = (|| -> Result<Named> {
         let ck: Vec<usize> = lane.checkpoints.iter().map(|(p, _)| *p).collect();
         let mut v = df_arrays(gpu, &lane.df, &ck)?;
@@ -2920,18 +2967,22 @@ fn g0_lane_open(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Speculator>
             return Err(err);
         }
     };
-    // The lane moves out with the singleton's NATIVE DeltaNet sizing: every
-    // replacement state `take_vmm_lane` allocates is sized from the `dn`
-    // passed here, so the resident `slot.dn_state` (not the swapped request
-    // owner) keeps all trajectories' snapshots interchangeable.
-    let (lane, snapshot_rows) = match take_lane(gpu, slot, d, w.position) {
+    // The lane moves out like an engine lane (shed scratch, no checkpoints).
+    // Its DeltaNet snapshot already has the request owner's sizing: the walk's
+    // `prefill` rebuilt the singleton's vacated state (`ensure_live`) from the
+    // request DN that was swapped in. No replacement state is allocated for
+    // the singleton here; it stays vacant until the next walk's prefill.
+    let (lane, snapshot_rows, singleton_ck) = match take_lane(gpu, d, w.position, true) {
         Ok(v) => v,
         Err(err) => {
             rs.free_gpu(gpu)?;
             return Err(err);
         }
     };
-    let pre_set = match full_state(gpu, &slot.config, &rs.kv, &rs.dn, &lane, w.position) {
+    let pre_set = match full_state(gpu, &slot.config, &rs.kv, &rs.dn, &lane, w.position).map(|mut v| {
+        v.push(singleton_ckpt_array(&singleton_ck));
+        v
+    }) {
         Ok(v) => v,
         Err(err) => {
             lane.free_gpu(gpu);
@@ -3390,11 +3441,18 @@ fn cb_lanes(lanes: &mut [LaneRun]) -> Result<Vec<DflashCbVerifyLane<'_>>> {
 
 /// Per-lane singleton draft and pre-verify DeltaNet snapshot (as the singleton
 /// saves it right after the draft).
-fn dflash_draft_lanes(gpu: &mut Gpu, slot: &ModelSlot, lanes: &mut [LaneRun]) -> Result<()> {
+fn dflash_draft_lanes(gpu: &mut Gpu, slot: &ModelSlot, cb: &mut DflashCbScratch, lanes: &mut [LaneRun]) -> Result<()> {
     for l in lanes.iter_mut() {
         let mark = l.lane.df.draft_scratch.thlog.mark();
         let compact = l.rs.kv.compact_offset as i32;
-        let drafted = dflash_lane_draft(gpu, &slot.weights, &slot.config, compact, &mut l.lane.df, l.position, l.seed, l.b)?;
+        // A lane owns no FWHT rotation buffers (as an engine lane): borrow the
+        // cb scratch's for the isolated singleton draft call, give them back
+        // on every path.
+        cb.reserve_draft(gpu, &l.lane.df.draft_config)?;
+        let lent = cb.lend_mq(&mut l.lane.df.draft_scratch)?;
+        let drafted = dflash_lane_draft(gpu, &slot.weights, &slot.config, compact, &mut l.lane.df, l.position, l.seed, l.b);
+        cb.reclaim_mq(&mut l.lane.df.draft_scratch, lent);
+        let drafted = drafted?;
         l.lane.df.target_snap.save_from(&l.rs.dn, gpu)?;
         l.draft = Some(DflashCbDraft { position: l.position, seed: l.seed, verify_tokens: drafted, max_accept: l.e - 1, thlog_mark: mark });
     }
@@ -3686,7 +3744,7 @@ fn g0_case(
         } else {
             Vec::new()
         };
-        dflash_draft_lanes(gpu, slot, &mut lanes)?;
+        dflash_draft_lanes(gpu, slot, &mut *sc.cb, &mut lanes)?;
         // Graph-refusal controls: each explicit verify entry must refuse before
         // any launch or state write while capture/recording is engaged.
         let mut graph: Vec<Value> = Vec::new();
@@ -4074,7 +4132,7 @@ fn ensure_draft_ref(gpu: &mut Gpu, slot: &mut ModelSlot, d: &mut Box<dyn Specula
     }
     eprintln!("draftbatch trace: ref_draft walk {}", fx[fi].name());
     let w = dflash_walk(gpu, slot, d, &fx[fi], cfg.windows)?;
-    let (mut lane, _rows) = take_lane(gpu, slot, d, w.position)?;
+    let (mut lane, _rows, _singleton_ck) = take_lane(gpu, d, w.position, false)?;
     let compact = slot.kv_cache.compact_offset as i32;
     let r = (|| -> Result<(Vec<u32>, Named)> {
         let tokens = dflash_lane_draft(gpu, &slot.weights, &slot.config, compact, &mut lane.df, w.position, w.seed, cfg.block)?;

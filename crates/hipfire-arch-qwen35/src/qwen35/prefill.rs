@@ -1706,7 +1706,7 @@ pub(crate) const WIDENED_COMMIT_ROWS: usize = 512;
 ///
 /// Staged GEMM-width rungs. Merging powers of two limits new GEMM widths to
 /// these five; a requested ceiling snaps down to the largest rung it covers.
-const WIDENED_RUNGS: [usize; 5] = [512, 1024, 2048, 4096, 8192];
+pub(crate) const WIDENED_RUNGS: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 ///
 /// Performance ceiling for the staged rungs above: `prefill.chunk_rows`
 /// (config file or `HIPFIRE_PREFILL_CHUNK_ROWS`, default 8192 on
@@ -2128,6 +2128,7 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
 /// owner needs no allocation, and a smaller owner is freed before replacement.
 /// The query follows model+KV mapping and request-state allocation.
 /// Falls back to 512 when no enlarged rung fits.
+#[allow(clippy::too_many_arguments)]
 fn memory_admitted_rung(
     gpu: &Gpu,
     config: &Qwen35Config,
@@ -2136,6 +2137,7 @@ fn memory_admitted_rung(
     lean: bool,
     native_mq4: bool,
     cached: Option<&PrefillBatchScratch>,
+    free_deduction: usize,
 ) -> HipResult<usize> {
     if perf_rows <= WIDENED_COMMIT_ROWS {
         return Ok(WIDENED_COMMIT_ROWS.min(perf_rows));
@@ -2152,7 +2154,7 @@ fn memory_admitted_rung(
     {
         return Ok(WIDENED_COMMIT_ROWS);
     }
-    let (free_bytes, _) = gpu.device_mem_info()?;
+    let free_bytes = gpu.device_mem_info()?.0.saturating_sub(free_deduction);
     let q_dim = config.n_heads.checked_mul(config.head_dim).unwrap_or(0);
     // Only a selectable gfx11 whole-chunk FA2 route needs more than the
     // incumbent 512-row Q16 scratch. Charge each candidate rung separately.
@@ -2256,9 +2258,28 @@ pub fn ordinary_prefill_chunk_limit(
     kv_cache: &llama::KvCache,
     pbs: Option<&PrefillBatchScratch>,
 ) -> HipResult<usize> {
-    ordinary_prefill_chunk_limit_with_cache(gpu, weights, config, dn_state, kv_cache, pbs, None)
+    ordinary_prefill_chunk_limit_with_cache(gpu, weights, config, dn_state, kv_cache, pbs, None, 0)
+}
+///
+/// [`ordinary_prefill_chunk_limit`] as it will read after `free_deduction`
+/// more device bytes are allocated: the byte admission sees
+/// `free - free_deduction` (saturating). The query is monotone in free
+/// bytes, so the result is a lower bound on the ceiling taken once that
+/// allocation has happened, provided nothing else shrinks free memory
+/// further. Lets a caller bound a prefill's chunk plan before the prefill's
+/// owners exist (VMM lane admission).
+pub fn ordinary_prefill_chunk_limit_deducting(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    kv_cache: &llama::KvCache,
+    free_deduction: usize,
+) -> HipResult<usize> {
+    ordinary_prefill_chunk_limit_with_cache(gpu, weights, config, dn_state, kv_cache, None, None, free_deduction)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ordinary_prefill_chunk_limit_with_cache(
     gpu: &Gpu,
     weights: &Qwen35Weights,
@@ -2267,6 +2288,7 @@ fn ordinary_prefill_chunk_limit_with_cache(
     kv_cache: &llama::KvCache,
     pbs: Option<&PrefillBatchScratch>,
     cached: Option<&PrefillBatchScratch>,
+    free_deduction: usize,
 ) -> HipResult<usize> {
     let legacy = prefill_max_batch_for_model(gpu, weights);
     let Some(perf) = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state) else {
@@ -2277,7 +2299,7 @@ fn ordinary_prefill_chunk_limit_with_cache(
     }
     let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
     let mut admitted = memory_admitted_rung(
-        gpu, config, kv_cache, perf, lean, native_mq4_widened_route(gpu, weights), cached,
+        gpu, config, kv_cache, perf, lean, native_mq4_widened_route(gpu, weights), cached, free_deduction,
     )?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
@@ -3225,6 +3247,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             kv_cache,
             None,
             cached.as_ref().filter(|_| widened_pbs_grow_only(gpu)),
+            0,
         )?
     } else {
         max_batch

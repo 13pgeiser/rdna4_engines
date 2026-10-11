@@ -56,12 +56,16 @@ fn lane_key_positions<'p>(ls: &DflashScratch, positions_k: &'p [i32], l: usize) 
 /// Context fill of one layer of one lane: the incremental K/V projection of
 /// the rows past the layer's watermark into the lane's own K/V ring. Verbatim
 /// the context block of `draft_forward_opts` (`q_dummy` is the ignored query
-/// operand of the K-only RoPE).
+/// operand of the K-only RoPE). The FWHT rotation temporaries of the two
+/// GEMMs come from `shared` (see [`draft_forward_lanes`]), never from the
+/// lane: a lane scratch may be allocated without them.
+#[allow(clippy::too_many_arguments)]
 fn lane_ctx_fill(
     gpu: &mut Gpu,
     cfg: &DflashConfig,
     layer: &DflashLayerWeights,
     ls: &DflashScratch,
+    shared: &DflashScratch,
     q_dummy: &GpuTensor,
     li: usize,
     g: &LaneGeo,
@@ -111,8 +115,8 @@ fn lane_ctx_fill(
             &layer.wk,
             &k_slot,
             step,
-            ls.mq_x_rot.as_ref(),
-            ls.mq_x_rot_f16.as_ref(),
+            shared.mq_x_rot.as_ref(),
+            shared.mq_x_rot_f16.as_ref(),
         )?;
         gemm_dispatch(
             gpu,
@@ -120,8 +124,8 @@ fn lane_ctx_fill(
             &layer.wv,
             &v_slot,
             step,
-            ls.mq_x_rot.as_ref(),
-            ls.mq_x_rot_f16.as_ref(),
+            shared.mq_x_rot.as_ref(),
+            shared.mq_x_rot_f16.as_ref(),
         )?;
         gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, step * cfg.n_kv_heads, hd, eps)?;
         let fill_positions = ls.positions_k.sub_offset(row - g.pos_base, step);
@@ -240,6 +244,20 @@ fn lane_attention(
 /// row-count independent for the row counts used (`sum b_i`); the caller owns
 /// that proof (exact gfx1201 MQ4 v2 below 64 rows). Requires the non-fused
 /// (non-gfx1100) draft route, `ctx_slice = None` geometry and no FFN graph.
+///
+/// FWHT rotation scratch: the per-lane GEMMs (the `fc` projection and the
+/// context-fill `wk`/`wv`) rotate their activation into `shared.mq_x_rot`
+/// / `shared.mq_x_rot_f16`, NOT into the lane's own buffers (a lane may be
+/// allocated without them). This is byte-exact: the rotation buffer is a
+/// per-`gemm_dispatch`-call temporary (each call writes the rotated rows,
+/// the GEMM reads them, in the same call and on the single stream, and
+/// nothing reads it afterwards), and `gemm_dispatch` chunks by the element
+/// count of the buffer, which is identical for every `DflashScratch`
+/// (`MQ_X_ROT_CHUNK_ROWS × max(inter, q_dim, num_extract × hidden)`,
+/// independent of block/context size) — so chunking, kernels and row order
+/// are unchanged. A lane that does own a rotation buffer must match the
+/// shared one in shape (checked), and MQ draft weights with no shared
+/// rotation buffer are an error, not a panic.
 pub fn draft_forward_lanes(
     gpu: &mut Gpu,
     weights: &DflashWeights,
@@ -249,6 +267,25 @@ pub fn draft_forward_lanes(
 ) -> HipResult<()> {
     if lanes.is_empty() {
         return Ok(());
+    }
+    // Checked before any launch: the per-lane GEMMs borrow the shared
+    // rotation scratch (see the doc comment).
+    if weights.has_mq && shared.mq_x_rot.is_none() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "draft_forward_lanes: MQ draft weights need the shared FWHT rotation scratch (shared.mq_x_rot is None)",
+        ));
+    }
+    if let Some(sh) = shared.mq_x_rot.as_ref() {
+        if lanes
+            .iter()
+            .any(|ln| ln.scratch.mq_x_rot.as_ref().is_some_and(|t| t.shape != sh.shape))
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "draft_forward_lanes: a lane's own FWHT rotation scratch differs in size from the shared one",
+            ));
+        }
     }
     if gpu.draft_collapse_fused_enabled() {
         return Err(hip_bridge::HipError::new(
@@ -326,8 +363,8 @@ pub fn draft_forward_lanes(
                     &weights.fc,
                     &thp_slice,
                     len,
-                    ls.mq_x_rot.as_ref(),
-                    ls.mq_x_rot_f16.as_ref(),
+                    shared.mq_x_rot.as_ref(),
+                    shared.mq_x_rot_f16.as_ref(),
                 )?;
                 gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
             }
@@ -422,7 +459,7 @@ pub fn draft_forward_lanes(
 
         // Context K/V of every lane into its own ring.
         for (lane, g_) in lanes.iter().zip(&geos) {
-            lane_ctx_fill(gpu, cfg, layer, lane.scratch, &shared.q, li, g_)?;
+            lane_ctx_fill(gpu, cfg, layer, lane.scratch, shared, &shared.q, li, g_)?;
         }
 
         gpu.rmsnorm_batched(&shared.q, &layer.q_norm, &shared.q, rows * cfg.n_heads, hd, eps)?;

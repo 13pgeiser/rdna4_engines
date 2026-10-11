@@ -157,6 +157,45 @@ pub struct VmmLaneNeed {
     pub remaining: usize,
 }
 
+/// Kind of lane an admission check charges: AR (no speculation state), a
+/// DFlash lane or an MTP lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmmLaneSpec {
+    Ar,
+    Dflash,
+    Mtp,
+}
+
+/// Device bytes of a lane's speculation state: nothing for AR, the probed
+/// MTP lane state for MTP, the probed DFlash lane state plus `checkpoints`
+/// DeltaNet snapshots for DFlash.
+pub fn vmm_spec_bytes(
+    kind: VmmLaneSpec,
+    mtp_lane_bytes: usize,
+    dflash_lane_bytes: usize,
+    snapshot_bytes: usize,
+    checkpoints: usize,
+) -> usize {
+    match kind {
+        VmmLaneSpec::Ar => 0,
+        VmmLaneSpec::Mtp => mtp_lane_bytes,
+        VmmLaneSpec::Dflash => dflash_lane_bytes + checkpoints * snapshot_bytes,
+    }
+}
+
+/// Slack on top of a new lane's charged owners (prompt KV, DeltaNet state,
+/// lane state) when predicting the free device bytes of its prompt seed's
+/// chunk-ceiling query: VMM granule rounding, small scratch and any
+/// allocation the charge does not itemize.
+pub const VMM_SEED_CEILING_MARGIN_BYTES: usize = 256 << 20;
+
+/// Free bytes the lane's own allocations take between its admission check
+/// and its prompt seed's chunk-ceiling query: `fixed_held` (the lane's
+/// charged bytes before checkpoints) plus the margin.
+pub fn vmm_seed_free_deduction(fixed_held: usize) -> usize {
+    fixed_held.saturating_add(VMM_SEED_CEILING_MARGIN_BYTES)
+}
+
 /// Banker's-algorithm safety of a set of lanes: some completion order
 /// exists in which every lane's remaining KV growth fits the device room
 /// and the KV budget, each completed lane returning what it holds. Lanes
@@ -964,13 +1003,23 @@ impl Qwen35VmmStore {
 
     /// What `st` holds on the device and may still map. Held: mapped KV,
     /// DeltaNet state, and a DFlash lane's state at the engine's probed
-    /// footprint plus its checkpoints. Remaining: KV growth up to
+    /// footprint plus its checkpoints, or an MTP lane's state at the MTP
+    /// engine's probed footprint. Remaining: KV growth up to
     /// `reserve_end` (never below the current position).
     fn lane_need(&self, gpu: &Gpu, st: &Qwen35RequestState) -> Result<VmmLaneNeed, String> {
         let held_kv = owner_mapped_bytes(&st.kv, self.kv_layer_ids.len())?;
-        let spec = match (&st.dflash, &self.dflash_engine) {
-            (Some(lane), Some(engine)) => engine.lane_bytes() + lane.checkpoints.len() * engine.snapshot_bytes(),
-            _ => 0,
+        let spec = if let (Some(lane), Some(engine)) = (&st.dflash, &self.dflash_engine) {
+            vmm_spec_bytes(
+                VmmLaneSpec::Dflash,
+                0,
+                engine.lane_bytes(),
+                engine.snapshot_bytes(),
+                lane.checkpoints.len(),
+            )
+        } else if let (Some(_), Some(engine)) = (&st.mtp, &self.spec) {
+            vmm_spec_bytes(VmmLaneSpec::Mtp, engine.lane_bytes(), 0, 0, 0)
+        } else {
+            0
         };
         let end = st.reserve_end.max(st.position).min(st.kv.vmm_logical_bound());
         let remaining = st
@@ -1004,18 +1053,38 @@ impl Qwen35VmmStore {
 
     /// Admission of a new request owner shaped like `template_kv` /
     /// `template_dn` (the resident singleton's) with `prompt_len` prompt
-    /// rows that may grow to `reserve_end` positions, as a DFlash lane when
-    /// `dflash` (its lane state and a checkpoint bound are charged). Fits
-    /// when the room holds the lane after its prompt fill and every lane,
-    /// the new one included, can still complete ([`vmm_admission_fits`]).
+    /// rows that may grow to `reserve_end` positions, as a lane of kind
+    /// `lane` (a DFlash lane is charged its lane state and a checkpoint
+    /// bound, an MTP lane its probed MTP state). Fits when the room holds the
+    /// lane after its prompt fill and every lane, the new one included, can
+    /// still complete ([`vmm_admission_fits`]).
+    ///
+    /// DFlash checkpoint bound. The lane's prompt seed takes its checkpoints
+    /// at the ends of outer chunks whose ceiling is memory-admitted at the
+    /// seed's plan time (`dflash_seed_ceiling`), so the old
+    /// `ceil(prompt/interval)` over-charges. Here the ceiling is queried now
+    /// with `free_deduction` = the bytes charged for the lane before its
+    /// checkpoints (prompt KV, DeltaNet state, lane state) plus
+    /// [`VMM_SEED_CEILING_MARGIN_BYTES`]. Soundness: between this check and
+    /// the seed's plan the driver allocates exactly those owners
+    /// (`new_like`, KV provision, lane state; synchronous), so device free
+    /// at plan time is at least free now minus the deduction; the byte
+    /// admission is monotone in free bytes, so the actual ceiling is at least
+    /// the queried one (`min_ceiling`) and, being a staged rung or
+    /// `min_ceiling` itself, one of the candidates the bound maximizes over
+    /// (the checkpoint count is not monotone in the ceiling). A failed
+    /// ceiling query falls back to the whole-prompt bound.
+    #[allow(clippy::too_many_arguments)]
     pub fn admission_check(
         &self,
         gpu: &Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
         template_kv: &KvCache,
         template_dn: &DeltaNetState,
         prompt_len: usize,
         reserve_end: usize,
-        dflash: bool,
+        lane: VmmLaneSpec,
     ) -> Result<VmmAdmission, String> {
         let bound = template_kv.vmm_logical_bound();
         let planned = |positions: usize| {
@@ -1025,12 +1094,35 @@ impl Qwen35VmmStore {
         };
         let kv_prompt = planned(prompt_len)?;
         let kv_end = planned(reserve_end.max(prompt_len))?;
-        let spec = match (&self.dflash_engine, dflash) {
-            (Some(engine), true) => engine.lane_bytes() + engine.checkpoint_bound(prompt_len) * engine.snapshot_bytes(),
-            _ => 0,
+        let dn = dn_state_bytes(template_dn);
+        let spec = match lane {
+            VmmLaneSpec::Ar => 0,
+            VmmLaneSpec::Mtp => self
+                .spec
+                .as_ref()
+                .map_or(0, |e| vmm_spec_bytes(VmmLaneSpec::Mtp, e.lane_bytes(), 0, 0, 0)),
+            VmmLaneSpec::Dflash => match &self.dflash_engine {
+                None => 0,
+                Some(engine) => {
+                    let lane_state = engine.lane_bytes();
+                    let deduction = vmm_seed_free_deduction(kv_prompt + dn + lane_state);
+                    let bound = match crate::speculative::dflash_seed_ceiling(
+                        gpu,
+                        weights,
+                        config,
+                        template_dn,
+                        template_kv,
+                        deduction,
+                    ) {
+                        Ok(min_ceiling) => engine.checkpoint_bound(prompt_len, min_ceiling),
+                        Err(_) => engine.checkpoint_bound_unplanned(prompt_len),
+                    };
+                    vmm_spec_bytes(VmmLaneSpec::Dflash, 0, lane_state, engine.snapshot_bytes(), bound)
+                }
+            },
         };
         let need = VmmLaneNeed {
-            held: kv_prompt + dn_state_bytes(template_dn) + spec,
+            held: kv_prompt + dn + spec,
             held_kv: kv_prompt,
             remaining: kv_end - kv_prompt,
         };
@@ -1108,8 +1200,9 @@ impl Qwen35VmmStore {
         let free = gpu.device_mem_info().map_or(0, |(f, _)| f);
         let (lane_bytes, snapshot_bytes) =
             self.dflash_engine.as_ref().map_or((0, 0), |e| (e.lane_bytes(), e.snapshot_bytes()));
+        let mtp_lane_bytes = self.spec.as_ref().map_or(0, |e| e.lane_bytes());
         let mut s = format!(
-            "kv_budget={} mapped_kv={} device_free={free} pool_parked={} map_reserve={VMM_MAP_DEVICE_RESERVE_BYTES} dflash_lane_bytes={lane_bytes} dn_snapshot_bytes={snapshot_bytes} lanes=[",
+            "kv_budget={} mapped_kv={} device_free={free} pool_parked={} map_reserve={VMM_MAP_DEVICE_RESERVE_BYTES} dflash_lane_bytes={lane_bytes} mtp_lane_bytes={mtp_lane_bytes} dn_snapshot_bytes={snapshot_bytes} lanes=[",
             self.kv_budget_bytes,
             self.mapped_kv_bytes().unwrap_or(usize::MAX),
             gpu.pool_parked_bytes(),
@@ -1833,5 +1926,36 @@ mod tests {
         // Its prompt KV is charged to the staged KV budget as well.
         assert!(!vmm_admission_fits(usize::MAX, 2 * CHUNK - 1, &[], new));
         assert!(vmm_admission_fits(usize::MAX, 3 * CHUNK, &[], new));
+    }
+
+    #[test]
+    fn spec_bytes_charge_the_lane_kind_state() {
+        // AR lanes hold no speculation state, whatever the engines probed.
+        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Ar, 7, 11, 13, 3), 0);
+        // MTP: the probed MTP lane state only.
+        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Mtp, 7, 11, 13, 3), 7);
+        // DFlash: lane state plus one snapshot per checkpoint.
+        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Dflash, 7, 11, 13, 3), 11 + 3 * 13);
+        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Dflash, 7, 11, 13, 0), 11);
+    }
+
+    #[test]
+    fn seed_free_deduction_covers_the_lane_owners_and_a_margin() {
+        let (kv, dn, lane_state) = (3 * CHUNK, 120_324_096, 1_038_090_240);
+        assert_eq!(vmm_seed_free_deduction(kv + dn + lane_state), kv + dn + lane_state + 256 * MIB);
+        assert_eq!(vmm_seed_free_deduction(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn mtp_lane_charge_enters_admission() {
+        // A running MTP lane holds its probed state; a new one is refused
+        // when the room cannot hold it after its prompt.
+        let mtp = 600 * MIB;
+        let held = vmm_spec_bytes(VmmLaneSpec::Mtp, mtp, 0, 0, 0) + 120_324_096 + 3 * CHUNK;
+        let new = lane(held, 3 * CHUNK, 0);
+        assert!(vmm_admission_fits(held, usize::MAX, &[], new));
+        assert!(!vmm_admission_fits(held - 1, usize::MAX, &[], new));
+        // Uncharged (the old behaviour) it would have fit.
+        assert!(held - mtp < held);
     }
 }

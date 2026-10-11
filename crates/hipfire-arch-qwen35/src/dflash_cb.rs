@@ -9,7 +9,22 @@
 //! request-local cursors the singleton [`DflashSpeculator`] keeps beside it.
 //! It is built by consuming a [`DflashLaneSnapshot`] (`take_vmm_lane`, which
 //! transfers every owner and cursor losslessly) or cold, from a lane
-//! `DflashState` (`new_dflash_lane_state`) after the lane prompt prefill.
+//! `DflashState` (`new_dflash_lane_state` with `DflashOwnerKind::VmmLane`)
+//! after the lane prompt prefill.
+//!
+//! A VMM lane owns NO FWHT rotation scratch (`mq_x_rot`/`mq_x_rot_f16`) and
+//! no `VerifyScratch::prefill_batch` (the batched verify runs on the shared
+//! trunk scratch; the lane never runs a target forward through its own
+//! scratch). The rotation buffers are a per-GEMM-call temporary of the draft
+//! forward, identical in size for every draft scratch, so the engine's ONE
+//! shared draft scratch ([`DflashCbScratch::reserve_draft`]) owns them: the
+//! batched draft borrows them directly (`draft_forward_lanes`), and every
+//! other lane-draft path (the singleton-call fallback, the lane prompt
+//! prefill backfill) lends them to the lane for the duration of the call
+//! ([`DflashCbScratch::lend_mq`] / [`DflashCbScratch::reclaim_mq`]). All
+//! calls run on the single stream, so the borrowed temporary is never live
+//! across two calls. A lane promoted from the singleton arrives with the
+//! singleton's own buffers, which `DflashState::shed_vmm_lane_scratch` frees.
 //!
 //! The in-crate halves of the shared DFlash verify:
 //!
@@ -305,9 +320,11 @@ pub struct DflashCbScratch {
     /// argmax) into its own `df.verify_scratch` (the oracle's proof arrays).
     /// Greedy production leaves this off.
     pub keep_lane_rows: bool,
-    /// Row scratch of the batched draft forward, allocated once on the first
-    /// batched chunk (the shared draft activations; lane draft state stays in
-    /// each lane).
+    /// Row scratch of the batched draft forward, allocated by
+    /// [`Self::reserve_draft`] (or on the first draft call that needs it): the
+    /// shared draft activations (lane draft state stays in each lane) and the
+    /// ONE set of FWHT rotation buffers every VMM lane borrows
+    /// ([`Self::lend_mq`]).
     draft: Option<DflashScratch>,
     /// Fewest lanes a draft chunk needs to take the batched forward (a lone
     /// lane runs the singleton call; the oracle sets 1 to prove the batched
@@ -349,12 +366,54 @@ impl DflashCbScratch {
 
     /// Allocate the batched-draft row scratch now (idempotent), so a serving
     /// engine never allocates inside a step; `dflash_cb_draft` otherwise
-    /// allocates it on the first batched chunk.
+    /// allocates it on the first batched chunk. The scratch also OWNS the
+    /// FWHT rotation buffers every lane borrows ([`Self::lend_mq`]).
     pub fn reserve_draft(&mut self, gpu: &mut Gpu, draft_config: &hipfire_runtime::dflash::DflashConfig) -> HipResult<()> {
         if self.draft.is_none() {
             self.draft = Some(DflashScratch::new_with_mq(gpu, draft_config, DFLASH_DRAFT_BATCH_MAX_ROWS, 1, true)?);
         }
         Ok(())
+    }
+
+    /// Lend the shared FWHT rotation buffers to `lane` (a lane draft scratch
+    /// allocated without them) so a lane-local draft call can run its
+    /// `gemm_dispatch`es. `Ok(false)`: the lane owns its own buffers (a
+    /// singleton-origin scratch), nothing moved. `Ok(true)`: both buffers
+    /// moved from the shared scratch into the lane; the caller MUST call
+    /// [`Self::reclaim_mq`] with the returned flag on every path (success and
+    /// error) before the lane or the engine is used again. `Err` when no
+    /// shared draft scratch (or no rotation buffers in it) exists.
+    ///
+    /// Exact: the buffers have the same element count as a lane's own would
+    /// (`MQ_X_ROT_CHUNK_ROWS × max(inter, q_dim, num_extract × hidden)`), so
+    /// `gemm_dispatch` chunks identically, and each call rotates into them
+    /// before its GEMM reads them (a per-call temporary, single stream).
+    pub fn lend_mq(&mut self, lane: &mut DflashScratch) -> HipResult<bool> {
+        if lane.mq_x_rot.is_some() {
+            return Ok(false);
+        }
+        let shared = self
+            .draft
+            .as_mut()
+            .ok_or_else(|| HipError::new(0, "lend_mq: no shared draft scratch to lend rotation buffers from"))?;
+        if shared.mq_x_rot.is_none() || shared.mq_x_rot_f16.is_none() {
+            return Err(HipError::new(0, "lend_mq: the shared draft scratch has no FWHT rotation buffers"));
+        }
+        lane.mq_x_rot = shared.mq_x_rot.take();
+        lane.mq_x_rot_f16 = shared.mq_x_rot_f16.take();
+        Ok(true)
+    }
+
+    /// Return buffers lent by [`Self::lend_mq`] (`lent` is its `Ok` value) to
+    /// the shared scratch. No-op when nothing was lent.
+    pub fn reclaim_mq(&mut self, lane: &mut DflashScratch, lent: bool) {
+        if !lent {
+            return;
+        }
+        if let Some(shared) = self.draft.as_mut() {
+            shared.mq_x_rot = lane.mq_x_rot.take();
+            shared.mq_x_rot_f16 = lane.mq_x_rot_f16.take();
+        }
     }
 
     /// Rows one trunk chunk can hold (the effective cap: `<= 63`, or up to
@@ -472,7 +531,14 @@ pub fn dflash_cb_draft(
     }
     for (i, l) in lanes.iter_mut().enumerate() {
         if out[i].is_none() {
-            out[i] = Some(dflash_lane_draft(
+            // A VMM lane has no rotation buffers of its own: borrow the
+            // shared scratch's for this call and hand them back on EVERY
+            // path (no `?` between lend and reclaim).
+            if cb.draft.is_none() && l.state.df.draft_scratch.mq_x_rot.is_none() {
+                cb.reserve_draft(gpu, &l.state.df.draft_config)?;
+            }
+            let lent = cb.lend_mq(&mut l.state.df.draft_scratch)?;
+            let r = dflash_lane_draft(
                 gpu,
                 weights,
                 config,
@@ -481,7 +547,9 @@ pub fn dflash_cb_draft(
                 l.position,
                 l.seed,
                 l.b,
-            )?);
+            );
+            cb.reclaim_mq(&mut l.state.df.draft_scratch, lent);
+            out[i] = Some(r?);
         }
     }
     Ok(out.into_iter().map(|t| t.expect("every lane drafted")).collect())

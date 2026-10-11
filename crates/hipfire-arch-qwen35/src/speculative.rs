@@ -5789,10 +5789,23 @@ pub fn draft_dflash_blocks_batched(
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
     if draft_weights.has_candidate_selector() {
         let mut off = 0usize;
-        for l in lanes.iter() {
+        for l in lanes.iter_mut() {
             let batch = l.b - 1;
             let hidden_rows = shared.x.sub_offset((off + 1) * h, batch * h);
             let logits_batch = head.logits.sub_offset((off + 1) * vocab, batch * vocab);
+            // The selector's hidden projection is a lane-scratch GEMM
+            // (`propose_candidates_device` rotates through the scratch's FWHT
+            // buffers). A VMM lane owns none: lend the shared scratch's for
+            // this call and hand them back before looking at the result
+            // (per-call temporary, identical element count, single stream).
+            let lent = l.df.draft_scratch.mq_x_rot.is_none();
+            if lent {
+                if shared.mq_x_rot.is_none() || shared.mq_x_rot_f16.is_none() {
+                    return err("the shared draft scratch has no FWHT rotation buffers for the lane selector".into());
+                }
+                l.df.draft_scratch.mq_x_rot = shared.mq_x_rot.take();
+                l.df.draft_scratch.mq_x_rot_f16 = shared.mq_x_rot_f16.take();
+            }
             let proposal = dflash::propose_candidates_device(
                 gpu,
                 &draft_weights,
@@ -5803,7 +5816,12 @@ pub fn draft_dflash_blocks_batched(
                 l.seed,
                 0.0,
                 None,
-            )?;
+            );
+            if lent {
+                shared.mq_x_rot = l.df.draft_scratch.mq_x_rot.take();
+                shared.mq_x_rot_f16 = l.df.draft_scratch.mq_x_rot_f16.take();
+            }
+            let proposal = proposal?;
             let mut drafted = vec![l.seed];
             apply_dflash2_selector_proposal(
                 proposal,
@@ -9835,6 +9853,86 @@ pub fn take_dn_checkpoint(
     cks.push((pos, snap));
 }
 
+/// Outer chunk ceiling of the DFlash prompt seed ([`SeedPrefill::plan`]):
+/// the legacy 256 rows under `HIPFIRE_DFLASH_LEGACY_PREFILL=1`, else AR's
+/// memory-admitted `ordinary_prefill_chunk_limit` evaluated as if
+/// `free_deduction` more device bytes were already allocated (`0` = now; see
+/// `ordinary_prefill_chunk_limit_deducting`). Taken once per prompt. Shared
+/// by the seed itself and by VMM lane admission, which predicts the seed's
+/// chunk plan (and so its checkpoint count) before the lane exists.
+pub fn dflash_seed_ceiling(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    kv_cache: &KvCache,
+    free_deduction: usize,
+) -> HipResult<usize> {
+    if dflash_legacy_prefill() {
+        return Ok(qwen35::PREFILL_MAX_BATCH);
+    }
+    qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        free_deduction,
+    )
+}
+
+/// Rows of the next outer seed chunk with `remaining` prompt rows left under
+/// `ceiling`: AR's `ordinary_serve_prefill_chunk_len`.
+fn dflash_seed_outer_chunk_len(remaining: usize, ceiling: usize) -> usize {
+    qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, ceiling)
+        .unwrap_or(remaining.min(ceiling).max(1))
+}
+
+/// DeltaNet checkpoints a cold DFlash prompt seed of `prompt_len` rows takes
+/// under outer-chunk `ceiling` (the ring's final length): mirrors
+/// `seed_target_hidden_from_prompt_abortable_parts`, which runs outer chunks of
+/// [`dflash_seed_outer_chunk_len`] and calls [`take_dn_checkpoint`] at the end
+/// of each. That call skips `cap == 0`, skips a position below the last
+/// checkpoint plus `interval`, and at `cap` recycles the oldest, so the ring
+/// length never exceeds `cap`. (A failed snapshot allocation only lowers the
+/// real count.)
+pub fn dflash_seed_checkpoint_count(prompt_len: usize, ceiling: usize, interval: usize, cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let (mut pos, mut last, mut len) = (0usize, None::<usize>, 0usize);
+    while pos < prompt_len {
+        pos += dflash_seed_outer_chunk_len(prompt_len - pos, ceiling);
+        if last.is_some_and(|p| pos < p.saturating_add(interval)) {
+            continue;
+        }
+        len = (len + 1).min(cap);
+        last = Some(pos);
+    }
+    len
+}
+
+/// Upper bound on [`dflash_seed_checkpoint_count`] for every outer-chunk
+/// ceiling the seed can take at least `min_ceiling`: the maximum over
+/// `min_ceiling` and each staged rung `>= min_ceiling` (the count is not
+/// monotone in the ceiling, so every larger candidate is evaluated). Valid
+/// whenever the seed's actual ceiling is `>= min_ceiling` and a staged rung or
+/// `min_ceiling` itself, which holds for [`dflash_seed_ceiling`] evaluated
+/// with a free-byte deduction that covers everything allocated before the
+/// seed's own query (admission is monotone in free bytes, and a ceiling that
+/// does not depend on memory equals `min_ceiling`).
+pub fn dflash_seed_checkpoint_bound(prompt_len: usize, min_ceiling: usize, interval: usize, cap: usize) -> usize {
+    qwen35::prefill::WIDENED_RUNGS
+        .iter()
+        .copied()
+        .filter(|&r| r >= min_ceiling)
+        .chain(std::iter::once(min_ceiling))
+        .map(|ceiling| dflash_seed_checkpoint_count(prompt_len, ceiling, interval, cap))
+        .max()
+        .unwrap_or(0)
+        .min(cap)
+}
+
 pub fn seed_target_hidden_from_prompt(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -9906,30 +10004,25 @@ struct SeedPrefill {
 
 impl SeedPrefill {
     fn plan(gpu: &Gpu, target: &DflashTargetParts<'_>) -> Self {
-        let ceiling = if dflash_legacy_prefill() {
-            qwen35::PREFILL_MAX_BATCH
-        } else {
-            match qwen35::ordinary_prefill_chunk_limit(
-                gpu,
-                target.weights,
-                target.config,
-                target.dn_state,
-                target.kv_cache,
-                None,
-            ) {
-                Ok(limit) => limit,
-                Err(e) => {
-                    eprintln!("dflash seed: chunk-limit query failed ({e}); keeping legacy ceiling");
-                    qwen35::prefill_max_batch(gpu)
-                }
+        let ceiling = match dflash_seed_ceiling(
+            gpu,
+            target.weights,
+            target.config,
+            target.dn_state,
+            target.kv_cache,
+            0,
+        ) {
+            Ok(limit) => limit,
+            Err(e) => {
+                eprintln!("dflash seed: chunk-limit query failed ({e}); keeping legacy ceiling");
+                qwen35::prefill_max_batch(gpu)
             }
         };
         Self { ceiling, pbs: None }
     }
 
     fn next_len(&self, remaining: usize) -> usize {
-        qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, self.ceiling)
-            .unwrap_or(remaining.min(self.ceiling).max(1))
+        dflash_seed_outer_chunk_len(remaining, self.ceiling)
     }
 
     /// Rows of the next forward call inside an outer chunk with `remaining`
@@ -10269,6 +10362,54 @@ pub fn apply_eviction_retain_to_draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_checkpoint_count_follows_the_outer_chunk_plan() {
+        // interval 2048, cap 8: a checkpoint at each outer chunk end at least
+        // `interval` past the previous one.
+        let count = |p, ceiling| dflash_seed_checkpoint_count(p, ceiling, 2048, 8);
+        assert_eq!(count(8316, 8192), 1);
+        assert_eq!(count(8316, 4096), 2);
+        assert_eq!(count(8316, 2048), 4);
+        assert_eq!(count(8316, 512), 4);
+        assert_eq!(count(4300, 2048), 2);
+        assert_eq!(count(4300, 4096), 1);
+        // A prompt inside one chunk checkpoints once, at its end.
+        assert_eq!(count(100, 8192), 1);
+        assert_eq!(count(0, 8192), 0);
+    }
+
+    #[test]
+    fn seed_checkpoint_count_respects_cap_and_policy() {
+        // Ring recycling never exceeds the cap.
+        assert_eq!(dflash_seed_checkpoint_count(8316, 512, 512, 3), 3);
+        assert_eq!(dflash_seed_checkpoint_count(8316, 512, 512, 100), 16);
+        // Resume off (cap 0) takes none.
+        assert_eq!(dflash_seed_checkpoint_count(8316, 512, 512, 0), 0);
+        // A tail chunk shorter than the interval does not add one.
+        assert_eq!(dflash_seed_checkpoint_count(4100, 2048, 2048, 8), 2);
+    }
+
+    #[test]
+    fn seed_checkpoint_bound_is_the_max_over_larger_ceilings() {
+        // Not monotone in the ceiling: P=4100, interval 2048. 2048-row chunks
+        // end at 2048 and 4096 (both taken): 2; a 4096-row ceiling ends at
+        // 4096 only: 1.
+        assert_eq!(dflash_seed_checkpoint_count(4100, 4096, 2048, 8), 1);
+        // Bound from min_ceiling 4096 covers 4096 and 8192 only.
+        assert_eq!(dflash_seed_checkpoint_bound(4100, 4096, 2048, 8), 1);
+        // From 512 every rung is a candidate: the worst is 2.
+        assert_eq!(dflash_seed_checkpoint_bound(4100, 512, 2048, 8), 2);
+        // A bound is never below the count at its own minimum and respects cap.
+        for p in [1, 511, 512, 2047, 2049, 4300, 8316, 20000] {
+            for min in [512, 1024, 2048, 4096, 8192] {
+                let b = dflash_seed_checkpoint_bound(p, min, 1024, 4);
+                assert!(b >= dflash_seed_checkpoint_count(p, min, 1024, 4));
+                assert!(b <= 4);
+            }
+        }
+        assert_eq!(dflash_seed_checkpoint_bound(8316, 512, 2048, 0), 0);
+    }
 
     /// `sample_residual_point_mass` must equal `sample_residual` against an
     /// explicit one-hot row, bit for bit, and never return the excluded token

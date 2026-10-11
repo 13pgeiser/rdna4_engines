@@ -21,18 +21,20 @@ use crate::mtp_spec::cb::{
 use crate::mtp_spec::MtpDraftOutput;
 use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, MtpPrefillTarget, MtpPromptRoute};
 use crate::mtp_speculator::{new_qwen35_mtp_lane_state, Qwen35MtpDrafter};
-use crate::qwen35::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use crate::qwen35::{DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind};
 use hipfire_runtime::spec::{SpecRequestConfig, Speculator};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// The store's MTP engine: its own head copy (KV sized `head_cap`), the
-/// window size `k`, and the shared verify scratch.
+/// window size `k`, the shared verify scratch, and the probed device bytes of
+/// one lane's MTP state (charged by memory admission).
 pub struct VmmSpecEngine {
     head: Qwen35MtpHead,
     k: usize,
     cb: MtpCbScratch,
     route: MtpPromptRoute,
+    lane_bytes: usize,
 }
 
 impl VmmSpecEngine {
@@ -41,22 +43,60 @@ impl VmmSpecEngine {
     /// `max_lanes * (k + 1)` plans the shared verify scratch rows, clamped to
     /// the effective chunk cap (63, or up to 128 on the wide verify route with
     /// `HIPFIRE_CB_VERIFY_CHUNK128`; [`MtpCbScratch::new`]).
+    ///
+    /// One lane's MTP state is probed for the store's memory admission:
+    /// allocated shaped from `template_dn` exactly as a lane is
+    /// ([`new_qwen35_mtp_lane_state`], greedy default request, penalty window
+    /// bound `ar_cap` = the AR `repeat_buf` capacity in ids), the live-byte
+    /// drop (HIP free plus pool-parked) is measured, then it is freed (the
+    /// buffers park in the pool, where the first lane reuses them).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gpu: &mut Gpu,
         config: &Qwen35Config,
+        template_dn: &DeltaNetState,
         head: Qwen35MtpHead,
         k: usize,
         max_lanes: usize,
         route: MtpPromptRoute,
+        ar_cap: usize,
     ) -> Result<Self, String> {
         let k = k.clamp(1, 8);
-        match MtpCbScratch::new(gpu, config, max_lanes * (k + 1)) {
-            Ok(cb) => Ok(Self { head, k, cb, route }),
+        let cb = match MtpCbScratch::new(gpu, config, max_lanes * (k + 1)) {
+            Ok(cb) => cb,
             Err(e) => {
                 head.free_gpu(gpu);
-                Err(format!("VMM spec engine: verify scratch: {e}"))
+                return Err(format!("VMM spec engine: verify scratch: {e}"));
+            }
+        };
+        let live = |gpu: &Gpu| gpu.device_mem_info().map(|(f, _)| f + gpu.pool_parked_bytes());
+        let probed = (|| -> Result<usize, String> {
+            let before = live(gpu).map_err(|e| e.to_string())?;
+            let st =
+                new_qwen35_mtp_lane_state(gpu, config, template_dn, &head, k, SpecRequestConfig::default(), ar_cap)?;
+            let after = live(gpu).map_err(|e| e.to_string());
+            st.free_gpu(gpu);
+            Ok(before.saturating_sub(after?))
+        })();
+        match probed {
+            Ok(lane_bytes) => Ok(Self {
+                head,
+                k,
+                cb,
+                route,
+                lane_bytes,
+            }),
+            Err(e) => {
+                let _ = cb.free_gpu(gpu);
+                head.free_gpu(gpu);
+                Err(format!("VMM spec engine: lane footprint probe: {e}"))
             }
         }
+    }
+
+    /// Probed device bytes of one lane's MTP state.
+    pub fn lane_bytes(&self) -> usize {
+        self.lane_bytes
     }
 
     pub fn k(&self) -> usize {
