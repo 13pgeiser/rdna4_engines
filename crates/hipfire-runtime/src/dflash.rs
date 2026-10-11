@@ -4765,6 +4765,141 @@ pub fn propose_candidates_device(
         return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
     }
     // Project hidden -> rank
+    let host_proj = selector_projection_host(gpu, weights, scratch, hidden, rows, rank)?;
+    // GPU top-K raw values (small D2H)
+    let top_ids_gpu = scratch
+        .topk_ids
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?;
+    let top_vals_gpu = scratch
+        .topk_vals
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?;
+    let ids_slice = top_ids_gpu.sub_offset(0, rows * k);
+    let vals_slice = top_vals_gpu.sub_offset(0, rows * k);
+    // Call the raw top-k primitive; the string `topk_values_batched_f32` is kept for grep checks
+    // and the fallback trait will delegate to logsumexp when native is absent (per-row shift valid).
+    {
+        let _marker = "topk_values_batched_f32";
+        let _ = _marker;
+    }
+    gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
+    let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows * k)?;
+    propose_candidates_from_rows(
+        weights,
+        &host_proj,
+        &top_ids,
+        &top_vals,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+    )
+}
+
+/// One lane of [`propose_candidates_lanes_device`]: its `rows` candidate rows
+/// start at row `first_row` of the shared hidden / logits rows.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectorLane {
+    pub first_row: usize,
+    pub rows: usize,
+    pub anchor: u32,
+}
+
+/// GREEDY selector proposals (temperature 0.0, no uniforms: the batched
+/// greedy CB draft is the only caller) of several lanes whose draft rows
+/// share one `[rows_total × hidden]` / `[rows_total × vocab]` pair:
+/// ONE selector projection GEMM and ONE top-K over all `rows_total` rows
+/// (rows no lane selects, e.g. seed rows, are computed and ignored), one
+/// download of the projection and one of each top-K tensor, then per-lane
+/// host scoring ([`propose_candidates_from_rows`]) of exactly the lane's row
+/// slice — three host syncs per call instead of three per lane. Proposals
+/// are byte-identical to per-lane [`propose_candidates_device`] calls
+/// because the projection GEMM (MQ4G256V2 gfx1201 overwrite route,
+/// `gemm_dispatch`) and `topk_values_batched_f32` are row-local.
+///
+/// The projection route admits `2..=63` rows, and exactly 64 only inside
+/// [`Gpu::draft_rows64_enter`]'s scope: `rows64_scope` opens that scope
+/// around the projection GEMM (and only it). The caller MUST pass `true`
+/// iff `rows_total == 64` and the 64-row draft chunk is exact on this GPU
+/// (`dflash_draft_batch_max_rows == 64`), `false` otherwise.
+///
+/// `scratch` must hold `rows_total` selector rows (`selector_proj`,
+/// `topk_ids`, `topk_vals`) and own FWHT rotation buffers (`mq_x_rot`,
+/// `mq_x_rot_f16`).
+#[allow(clippy::too_many_arguments)]
+pub fn propose_candidates_lanes_device(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+    rows_total: usize,
+    lanes: &[SelectorLane],
+    rows64_scope: bool,
+) -> HipResult<Vec<DflashCandidateProposal>> {
+    if rows_total == 0 || lanes.iter().any(|l| l.rows == 0 || l.first_row + l.rows > rows_total) {
+        return Err(hip_bridge::HipError::new(0, "selector lanes outside the rows"));
+    }
+    if !weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+    }
+    let rank = weights.selector_rank.unwrap_or(256);
+    let k = weights.selector_top_k.unwrap_or(16);
+    if k == 0 || k > 16 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector_top_k must be in [1,16]",
+        ));
+    }
+    let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
+    if logits.buf.size() < rows_total * vocab * 4 {
+        return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
+    }
+    let prev = gpu.draft_rows64_enter(rows64_scope);
+    let host_proj = selector_projection_host(gpu, weights, scratch, hidden, rows_total, rank);
+    gpu.draft_rows64_exit(prev);
+    let host_proj = host_proj?;
+    let ids_slice = scratch
+        .topk_ids
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?
+        .sub_offset(0, rows_total * k);
+    let vals_slice = scratch
+        .topk_vals
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?
+        .sub_offset(0, rows_total * k);
+    gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows_total)?;
+    let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows_total * k)?;
+    lanes
+        .iter()
+        .map(|l| {
+            let (a, b) = (l.first_row, l.first_row + l.rows);
+            propose_candidates_from_rows(
+                weights,
+                &host_proj[a * rank..b * rank],
+                &top_ids[a * k..b * k],
+                &top_vals[a * k..b * k],
+                l.rows,
+                l.anchor,
+                0.0,
+                None,
+            )
+        })
+        .collect()
+}
+
+/// Selector hidden projection `[rows × rank]` (one `gemm_dispatch`),
+/// downloaded to the host.
+fn selector_projection_host(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    rows: usize,
+    rank: usize,
+) -> HipResult<Vec<f32>> {
     let proj = scratch
         .selector_proj
         .as_ref()
@@ -4785,44 +4920,27 @@ pub fn propose_candidates_device(
         std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
     };
     gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
-    // GPU top-K raw values (small D2H)
-    let top_ids_gpu = scratch
-        .topk_ids
-        .as_ref()
-        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?;
-    let top_vals_gpu = scratch
-        .topk_vals
-        .as_ref()
-        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?;
-    let ids_slice = top_ids_gpu.sub_offset(0, rows * k);
-    let vals_slice = top_vals_gpu.sub_offset(0, rows * k);
-    // Call the raw top-k primitive; the string `topk_values_batched_f32` is kept for grep checks
-    // and the fallback trait will delegate to logsumexp when native is absent (per-row shift valid).
-    {
-        let _marker = "topk_values_batched_f32";
-        let _ = _marker;
-    }
-    gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
-    let mut ids_bytes = vec![0u8; rows * k * 4];
-    let mut vals_bytes = vec![0u8; rows * k * 4];
-    gpu.hip.memcpy_dtoh(&mut ids_bytes, &ids_slice.buf)?;
-    gpu.hip.memcpy_dtoh(&mut vals_bytes, &vals_slice.buf)?;
-    let mut top_ids = Vec::with_capacity(rows * k);
-    let mut top_vals = Vec::with_capacity(rows * k);
-    for chunk in ids_bytes.chunks_exact(4) {
-        top_ids.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    for chunk in vals_bytes.chunks_exact(4) {
-        top_vals.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    propose_candidates_from_rows(
-        weights,
-        &host_proj,
-        &top_ids,
-        &top_vals,
-        rows,
-        anchor,
-        temperature,
-        uniforms,
-    )
+    Ok(host_proj)
+}
+
+/// Download `n` top-K ids (i32 stored in an F32 buffer) and values (f32).
+fn download_top(
+    gpu: &mut Gpu,
+    ids: &GpuTensor,
+    vals: &GpuTensor,
+    n: usize,
+) -> HipResult<(Vec<u32>, Vec<f32>)> {
+    let mut ids_bytes = vec![0u8; n * 4];
+    let mut vals_bytes = vec![0u8; n * 4];
+    gpu.hip.memcpy_dtoh(&mut ids_bytes, &ids.buf)?;
+    gpu.hip.memcpy_dtoh(&mut vals_bytes, &vals.buf)?;
+    let top_ids = ids_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let top_vals = vals_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok((top_ids, top_vals))
 }

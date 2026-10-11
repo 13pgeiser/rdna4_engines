@@ -6289,6 +6289,26 @@ static DRAFT_ROWS64_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| 
     hipfire_config::developer_var("HIPFIRE_CB_DRAFT_ROWS64").map_or(true, |v| v.trim() != "0")
 });
 
+/// `HIPFIRE_DFLASH_SELECTOR_LANES=0` (developer kill switch): score the
+/// batched draft's candidate selector per lane (one projection / top-K /
+/// three host syncs each) instead of once per chunk through
+/// [`dflash::propose_candidates_lanes_device`]. Default on.
+static SELECTOR_LANES_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_SELECTOR_LANES").map_or(true, |v| v.trim() != "0")
+});
+
+/// Whether the lane-batched selector applies: switch on, exact gfx1201 with
+/// the draft-collapse overwrite route enabled (the only route whose
+/// projection is per-row identical across row counts), and the shared draft
+/// scratch owns the FWHT rotation buffer the projection rotates through.
+fn selector_lanes_batched(gpu: &Gpu, shared: &DflashScratch) -> bool {
+    *SELECTOR_LANES_ON
+        && gpu.arch == "gfx1201"
+        && !gpu.flags.draft_collapse_off
+        && shared.mq_x_rot.is_some()
+        && shared.mq_x_rot_f16.is_some()
+}
+
 /// Rows one batched draft forward holds on this GPU: 64 when the 64-row chunk
 /// is exact, else [`DFLASH_DRAFT_BATCH_MAX_ROWS`]. The 64-row chunk is exact
 /// only through the scoped overwrite route
@@ -6493,7 +6513,48 @@ pub fn draft_dflash_blocks_batched(
     scoped?;
 
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
-    if draft_weights.has_candidate_selector() {
+    if draft_weights.has_candidate_selector() && selector_lanes_batched(gpu, shared) {
+        // ONE selector projection GEMM, top-K and download for every lane
+        // (3 host syncs per chunk instead of 3 per lane), then per-lane host
+        // scoring of each lane's rows `off+1 .. off+b` (seed row excluded) —
+        // exactly the slices the per-lane loop below hands
+        // `propose_candidates_device`. Byte-exact: the projection is the MQ4
+        // v2 draft GEMM, whose gfx1201 overwrite route is per-row identical
+        // for 2..=63 rows and, inside the 64-row draft scope (`rows64`, the
+        // same predicate as the forward above), for exactly 64; the top-K is
+        // one block per row. Both are row-local, so running them over every
+        // row (seed rows included, ignored) yields each candidate row's
+        // bytes from the lane-sized launches. Rotates through the shared
+        // scratch's own FWHT buffers, so no lending.
+        let mut sel: Vec<dflash::SelectorLane> = Vec::with_capacity(lanes.len());
+        let mut off = 0usize;
+        for l in lanes.iter() {
+            sel.push(dflash::SelectorLane { first_row: off + 1, rows: l.b - 1, anchor: l.seed });
+            off += l.b;
+        }
+        let proposals = dflash::propose_candidates_lanes_device(
+            gpu,
+            &draft_weights,
+            shared,
+            &hidden_all,
+            &logits_all,
+            rows,
+            &sel,
+            rows64,
+        )?;
+        for (l, proposal) in lanes.iter().zip(&proposals) {
+            let mut drafted = vec![l.seed];
+            apply_dflash2_selector_proposal(
+                proposal,
+                vocab,
+                false,
+                &mut drafted,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )?;
+            out.push(drafted);
+        }
+    } else if draft_weights.has_candidate_selector() {
         let mut off = 0usize;
         for l in lanes.iter_mut() {
             let batch = l.b - 1;
