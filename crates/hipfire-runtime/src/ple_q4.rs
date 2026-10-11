@@ -553,6 +553,184 @@ mod tests {
         assert!(bf16_cells(&out).iter().all(|&c| c & 0x7fff == 0));
     }
 
+    // ---- property tests -----------------------------------------------------
+    //
+    // Same semantics as `check_block` / `decode_of_encode_equals_the_emulation_bit_for_bit`:
+    // an encoded block must decode to the emulation's requantised BF16 bits; a
+    // refused block must be one the emulation leaves at its plain Q8F16 values.
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Q8F16 scale bit patterns: the edge values the deterministic test
+        /// uses, typical small normals, subnormals, negatives, near-max, and
+        /// arbitrary finite bits.
+        fn scale_bits() -> impl Strategy<Value = u16> {
+            prop_oneof![
+                3 => Just(0u16).boxed(),
+                3 => prop::sample::select(vec![
+                    0x8000u16, 1, 0x3ff, 0x0400, 0x8001, 0x83ff, 0x3c00, 0xbc00, 0x7bff,
+                    0xfbff, 0x5640,
+                ]).boxed(),
+                // typical: small positive normals
+                8 => (1e-4f32..0.05f32).prop_map(crate::llama::f32_to_f16).boxed(),
+                // any normal-range positive scale
+                2 => (0.0f32..4.0f32).prop_map(crate::llama::f32_to_f16).boxed(),
+                // subnormal f16
+                2 => (1u16..0x400).boxed(),
+                // negative scales
+                2 => (0.0f32..0.1f32).prop_map(|v| 0x8000 | crate::llama::f32_to_f16(v)).boxed(),
+                // near the f16 maximum
+                2 => (0x7bc0u16..=0x7bff).boxed(),
+                // fully random finite bits
+                4 => (any::<u16>()).prop_map(|b| b & 0xfbff).boxed(),
+            ]
+        }
+
+        /// 32 Q8 integers: all-zero, +-127 extremes, lone spike, small, uniform
+        /// full range (incl. -128), and roughly-normal.
+        fn ints() -> impl Strategy<Value = Vec<i8>> {
+            prop_oneof![
+                1 => Just(vec![0i8; 32]).boxed(),
+                1 => prop::collection::vec(prop::bool::ANY.prop_map(|b| if b { 127i8 } else { -127 }), 32).boxed(),
+                1 => (0usize..32).prop_map(|at| (0..32).map(|i| if i == at { 127i8 } else { 0 }).collect()).boxed(),
+                1 => prop::collection::vec(-1i8..=2, 32).boxed(),
+                2 => prop::collection::vec(any::<i8>(), 32).boxed(),
+                2 => prop::collection::vec(-127i8..=127, 32)
+                    .prop_map(|v| v.into_iter().map(|x| (x / 3).clamp(-127, 127)).collect())
+                    .boxed(),
+            ]
+        }
+
+        fn block() -> impl Strategy<Value = [u8; Q8_BLOCK_BYTES]> {
+            (scale_bits(), ints()).prop_map(|(scale, ints)| block_with(scale, |i| ints[i]))
+        }
+
+        /// 1..=40 blocks; 5 blocks is the real 160-wide PLE row, 32 blocks a
+        /// 1024-wide row.
+        fn row() -> impl Strategy<Value = Vec<[u8; Q8_BLOCK_BYTES]>> {
+            prop_oneof![
+                3 => Just(5usize).boxed(),
+                1 => Just(32usize).boxed(),
+                4 => (1usize..=40).boxed(),
+            ]
+            .prop_flat_map(|n| prop::collection::vec(block(), n))
+        }
+
+        /// Sorted, deduplicated interior cut points in `1..len`, plus both ends.
+        fn boundaries(raw: &[usize], len: usize) -> Vec<usize> {
+            let mut b: Vec<usize> = raw
+                .iter()
+                .filter(|_| len > 1)
+                .map(|c| 1 + c % (len - 1))
+                .collect();
+            b.push(0);
+            b.push(len);
+            b.sort_unstable();
+            b.dedup();
+            b
+        }
+
+        fn flat(blocks: &[[u8; Q8_BLOCK_BYTES]]) -> Vec<u8> {
+            blocks.iter().flatten().copied().collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// (1) + (3): per block, encode succeeds => decode(encode) is the
+            /// emulation's requantised BF16 bits; encode refuses => the emulation
+            /// left the block at its plain Q8F16 values. A row is refused iff some
+            /// block is, and a row that encodes decodes to the emulation row.
+            #[test]
+            fn prop_decode_of_encode_equals_the_emulation(blocks in row()) {
+                let q8 = flat(&blocks);
+                let width = blocks.len() * Q8_BLOCK_WEIGHTS;
+                let mut any_refused = false;
+                for (index, b) in blocks.iter().enumerate() {
+                    let (plain, want) = oracle_block(b);
+                    let mut q4 = [0u8; Q4LM_BLOCK_BYTES];
+                    match encode_q4lm_row_from_q8(b, &mut q4) {
+                        Ok(()) => {
+                            let mut out = [0u8; 64];
+                            decode_q4lm_row_bf16(&q4, &mut out).unwrap();
+                            prop_assert_eq!(bf16_cells(&out), want.to_vec(), "block {} {:02x?}", index, b);
+                        }
+                        Err(error) => {
+                            any_refused = true;
+                            prop_assert_eq!(plain, want, "block {} {:02x?}: {}", index, b, error);
+                        }
+                    }
+                }
+                let mut q4 = vec![0u8; q4lm_row_bytes(width).unwrap()];
+                let encoded = encode_q4lm_row_from_q8(&q8, &mut q4);
+                prop_assert_eq!(encoded.is_err(), any_refused, "row refusal must equal any-block refusal");
+                if encoded.is_ok() {
+                    let mut out = vec![0u8; width * 2];
+                    decode_q4lm_row_bf16(&q4, &mut out).unwrap();
+                    let want: Vec<u16> = blocks.iter().flat_map(|b| oracle_block(b).1).collect();
+                    prop_assert_eq!(bf16_cells(&out), want);
+                }
+            }
+
+            /// (2) Row partition invariance: encoding a row equals the
+            /// concatenation of encoding each block independently, and equals the
+            /// concatenation of encoding random contiguous chunks; decode is
+            /// likewise chunk-invariant.
+            #[test]
+            fn prop_row_encode_is_partition_invariant(
+                blocks in row(),
+                cuts in prop::collection::vec(any::<usize>(), 0..5),
+            ) {
+                let q8 = flat(&blocks);
+                let n = blocks.len();
+                let mut full = vec![0u8; n * Q4LM_BLOCK_BYTES];
+                let full_res = encode_q4lm_row_from_q8(&q8, &mut full);
+
+                let mut per_block = Vec::with_capacity(full.len());
+                let mut all_ok = true;
+                for b in &blocks {
+                    let mut q4 = [0u8; Q4LM_BLOCK_BYTES];
+                    match encode_q4lm_row_from_q8(b, &mut q4) {
+                        Ok(()) => per_block.extend_from_slice(&q4),
+                        Err(_) => all_ok = false,
+                    }
+                }
+                prop_assert_eq!(full_res.is_ok(), all_ok);
+
+                let bounds = boundaries(&cuts, n);
+                let mut chunked = Vec::with_capacity(full.len());
+                let mut chunks_ok = true;
+                for w in bounds.windows(2) {
+                    let (lo, hi) = (w[0], w[1]);
+                    let mut part = vec![0u8; (hi - lo) * Q4LM_BLOCK_BYTES];
+                    match encode_q4lm_row_from_q8(&q8[lo * Q8_BLOCK_BYTES..hi * Q8_BLOCK_BYTES], &mut part) {
+                        Ok(()) => chunked.extend_from_slice(&part),
+                        Err(_) => chunks_ok = false,
+                    }
+                }
+                prop_assert_eq!(full_res.is_ok(), chunks_ok, "partition {:?}", bounds);
+
+                if full_res.is_ok() {
+                    prop_assert_eq!(&full, &per_block);
+                    prop_assert_eq!(&full, &chunked, "partition {:?}", bounds);
+                    // Decode partition invariance.
+                    let mut whole = vec![0u8; n * Q4LM_BLOCK_WEIGHTS * 2];
+                    decode_q4lm_row_bf16(&full, &mut whole).unwrap();
+                    let mut stitched = Vec::with_capacity(whole.len());
+                    for w in bounds.windows(2) {
+                        let (lo, hi) = (w[0], w[1]);
+                        let mut part = vec![0u8; (hi - lo) * Q4LM_BLOCK_WEIGHTS * 2];
+                        decode_q4lm_row_bf16(&full[lo * Q4LM_BLOCK_BYTES..hi * Q4LM_BLOCK_BYTES], &mut part).unwrap();
+                        stitched.extend_from_slice(&part);
+                    }
+                    prop_assert_eq!(whole, stitched, "decode partition {:?}", bounds);
+                }
+            }
+        }
+    }
+
     /// Real rows against the oracle.
     ///
     ///   HIPFIRE_PROBE_MODEL=/path/to/model.mq4-xts [HIPFIRE_PROBE_ROWS=100000] \
