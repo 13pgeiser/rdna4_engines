@@ -1379,6 +1379,12 @@ fn run_singleton(
                 let ref_items = rig.capture_state_resident()?;
                 let dir = rig_ref_dir(args).join(format!("singleton_req{}", req.idx));
                 let ckpt = write_ckpt(&dir, &ref_items)?;
+                if args.keep_raw {
+                    // Product-route bytes for cross-build identity (diff two builds' OUT_DIR/ref).
+                    fs::write(dir.join("logits.bin"), &ref_out.logits).map_err(e)?;
+                    let ids: Vec<u8> = ref_out.top1.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    fs::write(dir.join("top1.bin"), ids).map_err(e)?;
+                }
                 let rf = RefReq { out: ref_out, ckpt };
                 // Candidate: the same request as a one-lane wave.
                 rig.prep(0, &req.prefix)?;
