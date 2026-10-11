@@ -27,7 +27,6 @@
 //! children is pinned, so eviction only ever removes leaves.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 
 use hip_bridge::DeviceBuffer;
 use rdna_compute::tensor_ops::{copy_regions, CopyRegion};
@@ -185,20 +184,9 @@ struct Turn {
     boundaries: VecDeque<usize>,
 }
 
-/// A memory tenant the session cache yields to before it evicts snapshots
-/// (the PLE hot-row store: host RAM that is cheap to give back, whereas a
-/// snapshot is expensive prefill work).
-pub trait YieldFirst: Send + Sync {
-    /// Release the tenant's least valuable unit of memory. Returns the bytes
-    /// freed, 0 when nothing is left to release.
-    fn release_one(&self) -> u64;
-}
-
 pub struct SessionCache {
     pool: CheckpointPool<StoredSnapshot>,
     domain: CacheDomain,
-    /// Released before any snapshot is evicted for the memory guard.
-    yield_first: Option<Arc<dyn YieldFirst>>,
     /// Captured this turn in ascending boundary order, published by
     /// [`Self::commit`].
     pending: Vec<(Key, StoredSnapshot)>,
@@ -233,7 +221,7 @@ fn free_buffer(gpu: &mut Gpu, snapshot: StoredSnapshot) {
 /// pool the device allocates from (`Gpu::device_mem_info`: VRAM, a
 /// unified-memory APU's carve-out, or its GTT clamped to `MemAvailable` plus
 /// TTM's page pool); `None` when the free-memory query itself fails.
-pub fn memory_fits(gpu: &mut Gpu, need: u64) -> Option<bool> {
+fn memory_fits(gpu: &mut Gpu, need: u64) -> Option<bool> {
     let (free, _) = gpu.device_mem_info().ok()?;
     let headroom = if gpu.is_uma() {
         UMA_DEVICE_HEADROOM
@@ -248,19 +236,11 @@ impl SessionCache {
         Self {
             pool: CheckpointPool::new(budget_bytes),
             domain,
-            yield_first: None,
             pending: Vec::new(),
             release: Vec::new(),
             children: HashMap::new(),
             turn: None,
         }
-    }
-
-    /// Attach (or detach) the tenant released first when the memory guard
-    /// fails, before any snapshot is evicted. The budget (`over_budget`)
-    /// path never consults it: the tenant does not count against the budget.
-    pub fn set_yield_first(&mut self, yield_first: Option<Arc<dyn YieldFirst>>) {
-        self.yield_first = yield_first;
     }
 
     /// Longest cached prefix of `prompt` (always shorter than the prompt, so
@@ -594,17 +574,7 @@ impl SessionCache {
             if !over_budget {
                 match memory_fits(gpu, bytes + growth) {
                     Some(true) => break,
-                    // The yield-first tenant gives memory back before any
-                    // snapshot is evicted.
-                    Some(false) => {
-                        if self
-                            .yield_first
-                            .as_ref()
-                            .is_some_and(|tenant| tenant.release_one() > 0)
-                        {
-                            continue;
-                        }
-                    }
+                    Some(false) => {}
                     // Evicting cannot help a query that fails.
                     None => {
                         fits = Err("memory query failed");
@@ -736,32 +706,21 @@ impl SessionCache {
     /// needs. Returns the bytes freed.
     pub fn release_for(&mut self, gpu: &mut Gpu, need: u64) -> u64 {
         let mut freed = 0;
-        let mut yielded = 0;
         loop {
             // A failed query cannot be helped by evicting.
             if memory_fits(gpu, need) != Some(false) {
                 break;
             }
-            // Displaced snapshots are already dead: free them first. Then
-            // the yield-first tenant, then live snapshots.
             let snapshot = match self.release.pop() {
                 Some(snapshot) => {
                     freed += snapshot.bytes;
                     free_buffer(gpu, snapshot);
                     continue;
                 }
-                None => {
-                    if let Some(tenant) = &self.yield_first {
-                        let bytes = tenant.release_one();
-                        if bytes > 0 {
-                            yielded += bytes;
-                            continue;
-                        }
-                    }
-                    self.pool
-                        .pop_lru()
-                        .or_else(|| self.pending.pop().map(|entry| entry.1))
-                }
+                None => self
+                    .pool
+                    .pop_lru()
+                    .or_else(|| self.pending.pop().map(|entry| entry.1)),
             };
             let Some(snapshot) = snapshot else {
                 break;
@@ -775,7 +734,7 @@ impl SessionCache {
                 freed >> 20
             );
         }
-        freed + yielded
+        freed
     }
 }
 

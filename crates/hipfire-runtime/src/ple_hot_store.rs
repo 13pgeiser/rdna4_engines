@@ -2,18 +2,28 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! PLE hot-row store: raw encoded PLE rows kept in host RAM on unified-memory
-//! GPUs, so the most frequently used rows of the external row table are served
-//! without SSD reads.
+//! PLE hot-row store: the most frequently used rows of the external PLE row
+//! table, read from a rank-ordered copy of them (the hot-row pack) through the
+//! kernel page cache, so on unified-memory GPUs most rows a request needs come
+//! from RAM without SSD reads, and the memory they use stays reclaimable.
 //!
 //! The Qwen4 PLE table is ~320M padded rows of 170 B (Q8F16) stored in shards
 //! inside the model file.  A frequency rank of the rows (the `.plehot`
-//! sidecar, one bucket byte per row, bucket 0 = hottest) selects which rows to
-//! keep.  Rows are copied *verbatim from the model file* and decoded by the
-//! same `RowEncoding::decode_row` the SSD path uses, so the store never changes
-//! the bytes a request returns, only where they come from.  The fill runs only
-//! while no request is being served: every PLE fetch holds `busy`, and the
-//! fill resumes `BUSY_QUIET` after the last one.
+//! sidecar, one bucket byte per row, bucket 0 = hottest) selects which rows
+//! are hot.  `hipfire-quantize ple-hot-pack` copies the rows of the hottest
+//! buckets *verbatim from the model file* into `<model>.plehotrows`
+//! ([`crate::ple_hot_pack`]), grouped in tiers of buckets with each tier's
+//! rows in ascending row order, so the hottest rows share OS pages (24 rows
+//! per 4 KiB page instead of 24 random-rank rows).  Rows are decoded by the
+//! same `RowEncoding::decode_row` the model-file path uses, so the store never
+//! changes the bytes a request returns, only where they come from.
+//!
+//! The pack is ordinary file data: page-cache pages of it are clean, so under
+//! memory pressure the kernel drops them (and reads them again from the pack
+//! when needed) instead of writing anything to swap.  After the model is
+//! ready, a prewarm reads the pack's hottest prefix sequentially while no
+//! request is being served: every PLE fetch holds `busy`, and the prewarm
+//! resumes `BUSY_QUIET` after the last one.
 //!
 //! # Public API (exact signatures)
 //!
@@ -25,18 +35,18 @@
 //!              verify() -> Result<(), String>}
 //! write_ple_hot_rank(path: &Path, padded_rows: u64, fingerprint_hex: &str, buckets: &[u8],
 //!                    rank_meta: serde_json::Value) -> Result<(), String>
-//! HotRowStore::new(rank: PleHotRank, budget_bytes: u64, rows_per_shard: usize,
-//!                  encoded_row_bytes: usize) -> Result<Arc<HotRowStore>, String>
-//! HotRowStore::new_with_group(.., tier_group: usize)   // tier = `tier_group` buckets (default 5)
-//! HotRowStore::spawn_fill(self: &Arc<Self>, model_path: &Path, shard_file_offsets: Vec<u64>,
-//!                         floor_bytes: u64, throttle: FillThrottle) -> JoinHandle<()>
-//! FillThrottle { load_bytes_per_s: u64, min_bytes_per_s: u64, adaptive: bool }
-//! HotRowStore::{stop(), tier_count(), kept_buckets(), resident_bytes() -> u64,
-//!               filled_bytes() -> u64, release_throttle(), release_lowest() -> u64,
-//!               released_tiers(), fill_complete(),
-//!               sha_verified() -> Option<bool>, hot_rows() -> u64, hot_pages() -> u64,
-//!               read() -> HotGuard, get(&HotGuard, row: u64) -> Option<&[u8]>}
-//! impl session_cache::YieldFirst for HotRowStore
+//! HotRowStore::open(rank: PleHotRank, pack_path: &Path, rows_per_shard: usize,
+//!                   encoding: RowEncoding, encoded_row_bytes: usize, shard_offsets: &[u64],
+//!                   model_file_bytes: u64)
+//!     -> Result<Arc<HotRowStore>, String>
+//! HotRowStore::spawn_worker(self: &Arc<Self>, model_path: &Path, shard_offsets: Vec<u64>)
+//!     -> JoinHandle<()>                      // verify, then prewarm once a budget is set
+//! HotRowStore::{set_prewarm_budget(bytes: u64), stop(), is_serving() -> bool,
+//!               verified() -> Option<bool>, pack_offset(row: u64) -> Option<u64>,
+//!               read_pack(offset: u64, dst: &mut [u8]) -> Result<(), SourceError>,
+//!               tier_count(), kept_buckets(), data_bytes(), prewarmed_bytes(),
+//!               prewarm_complete(), hot_rows(), hot_pages(), hot_reads()}
+//! mem_available_bytes() -> Option<u64>
 //! ```
 //!
 //! # Sidecar format (`<model>.plehot`)
@@ -53,45 +63,54 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock, RwLockReadGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::session_cache::YieldFirst;
+use crate::external_rows::RowEncoding;
+use crate::model_source::SourceError;
+use crate::ple_hot_pack::read_ple_hot_pack_header;
 
 const MAGIC: &[u8; 8] = b"HFPLEHT1";
 const VERSION: u64 = 1;
 /// Frequency buckets in a sidecar.
 pub const BUCKETS: usize = 256;
-/// Encoded bytes of one Q8F16 PLE row (160 values = 5 blocks of 34 B).
+/// Encoded bytes of one Q8F16 PLE row (160 values = 5 blocks of 34 B): the
+/// informational `encoded_row_bytes` a sidecar records and the row size of the
+/// test fixtures.  Neither the sidecar reader nor the pack depends on it.
 pub const ENCODED_ROW_BYTES: usize = 170;
-/// Buckets per tier (tier = release unit).
+/// Buckets per tier of a hot-row pack.
 pub const DEFAULT_TIER_BUCKETS: usize = 5;
 /// Rows per prefix-count block of the slot index.
 const BLOCK_ROWS: usize = 512;
-/// One aligned read of the fill.
-const READ_CHUNK: usize = 16 << 20;
-const READ_ALIGN: u64 = 4096;
-const FILL_THREADS: usize = 4;
-/// Copied bytes between two host-availability checks of one fill thread.
-const PRESSURE_INTERVAL_BYTES: u64 = 256 << 20;
-/// The fill resumes once no PLE fetch ran for this long: longer than the
+/// One aligned O_DIRECT read of the pack writer.
+pub(crate) const READ_CHUNK: usize = 16 << 20;
+pub(crate) const READ_ALIGN: u64 = 4096;
+/// The prewarm resumes once no PLE fetch ran for this long: longer than the
 /// compute between two prefill chunks' fetches (~4 s for an 8192-row chunk on
-/// Halo), so the fill only runs while no request is being served.
+/// Halo), so the prewarm only reads while no request is being served.
 const BUSY_QUIET: Duration = Duration::from_secs(5);
+/// Bytes per prewarm read.
+const PREWARM_CHUNK: usize = 8 << 20;
+/// Kept rows spot-checked against the model file before the store serves.
+const VERIFY_SAMPLES: usize = 4096;
+/// Threads of the spot check (its reads are random 170-B reads).
+const VERIFY_THREADS: usize = 16;
 /// Sanity bound on a sidecar header.
 const MAX_HEADER_BYTES: u64 = 16 << 20;
 /// `tier_of` value of a bucket that is not kept.
 const NO_TIER: u8 = u8::MAX;
+/// `prewarm_budget` before [`HotRowStore::set_prewarm_budget`].
+const BUDGET_UNSET: u64 = u64::MAX;
 
-const SHA_UNKNOWN: u8 = 0;
-const SHA_OK: u8 = 1;
-const SHA_FAILED: u8 = 2;
+const STATE_VERIFYING: u8 = 0;
+const STATE_SERVING: u8 = 1;
+const STATE_FAILED: u8 = 2;
 
 const TAG: &str = "qwen4 ple hot store";
 
@@ -191,9 +210,9 @@ impl PleHotRank {
             ));
         }
         let row_bytes = field_u64("encoded_row_bytes")?;
-        if row_bytes != ENCODED_ROW_BYTES as u64 {
+        if row_bytes == 0 {
             return Err(format!(
-                "ple hot rank {}: encoded_row_bytes {row_bytes}, expected {ENCODED_ROW_BYTES}",
+                "ple hot rank {}: encoded_row_bytes is zero",
                 path.display()
             ));
         }
@@ -321,7 +340,8 @@ pub fn write_ple_hot_rank(
         "payload_sha256": hex(&Sha256::digest(buckets)),
         "rank": rank_meta,
     });
-    let header_bytes = serde_json::to_vec(&header).map_err(|e| format!("ple hot rank header: {e}"))?;
+    let header_bytes =
+        serde_json::to_vec(&header).map_err(|e| format!("ple hot rank header: {e}"))?;
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(format!(".tmp.{}", std::process::id()));
     let tmp = PathBuf::from(tmp_name);
@@ -342,94 +362,17 @@ pub fn write_ple_hot_rank(
 }
 
 // ---------------------------------------------------------------------------
-// Tier storage
+// O_DIRECT model reads (the pack writer)
 // ---------------------------------------------------------------------------
 
-/// One tier's rows: a zero-initialised allocation committed lazily by the
-/// kernel (`calloc` -> anonymous mmap for these sizes; never pre-touched).
-///
-/// It is a raw allocation rather than a `Box<[u8]>` because the fill thread
-/// writes rows of not-yet-ready shards while readers hold `&` access to rows
-/// of ready shards: only row-sized slices are ever materialised (see
-/// [`TierBuf::row`] / [`TierBuf::write_row`]), never a whole-tier `&[u8]`.
-struct TierBuf {
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-// SAFETY: the buffer is plain bytes owned by this value; concurrent access is
-// disciplined by the `ready` protocol documented at `HotRowStore`.
-unsafe impl Send for TierBuf {}
-unsafe impl Sync for TierBuf {}
-
-impl TierBuf {
-    /// Align 16 keeps `alloc_zeroed` on the `calloc` path (a larger alignment
-    /// falls back to allocate-then-memset, which would touch every page).
-    const ALIGN: usize = 16;
-
-    fn zeroed(len: usize) -> Option<TierBuf> {
-        if len == 0 {
-            return Some(TierBuf {
-                ptr: NonNull::dangling(),
-                len: 0,
-            });
-        }
-        let layout = Layout::from_size_align(len, Self::ALIGN).ok()?;
-        // SAFETY: `layout` has non-zero size.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
-        Some(TierBuf { ptr, len })
-    }
-
-    /// Copy `src` to byte `offset`.
-    ///
-    /// The caller guarantees no other thread reads or writes `offset..+len`
-    /// concurrently: the fill writes only rows of shards that are not yet
-    /// `ready`, readers read only rows of ready shards, and each row has
-    /// exactly one writer (its shard's fill thread).
-    fn write_row(&self, offset: usize, src: &[u8]) {
-        assert!(
-            offset.checked_add(src.len()).is_some_and(|end| end <= self.len),
-            "hot row write outside its tier"
-        );
-        // SAFETY: bounds checked above; exclusivity per the contract above.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr().add(offset), src.len()) }
-    }
-
-    /// Borrow `len` bytes at `offset`.  Only called for rows of ready shards,
-    /// which the fill never writes again.
-    fn row(&self, offset: usize, len: usize) -> &[u8] {
-        assert!(
-            offset.checked_add(len).is_some_and(|end| end <= self.len),
-            "hot row read outside its tier"
-        );
-        // SAFETY: in bounds; the row is immutable once its shard is ready
-        // (published with Release, observed with Acquire by the caller).
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
-    }
-}
-
-impl Drop for TierBuf {
-    fn drop(&mut self) {
-        if self.len > 0 {
-            // SAFETY: allocated in `zeroed` with this exact layout.
-            unsafe {
-                dealloc(
-                    self.ptr.as_ptr(),
-                    Layout::from_size_align_unchecked(self.len, Self::ALIGN),
-                )
-            }
-        }
-    }
-}
-
 /// A sector-aligned read buffer for O_DIRECT.
-struct AlignedBuf {
+pub(crate) struct AlignedBuf {
     ptr: NonNull<u8>,
     len: usize,
 }
 
 impl AlignedBuf {
-    fn new(len: usize) -> AlignedBuf {
+    pub(crate) fn new(len: usize) -> AlignedBuf {
         let layout = Layout::from_size_align(len, READ_ALIGN as usize).expect("read buffer layout");
         // SAFETY: non-zero size.
         let ptr = unsafe { alloc_zeroed(layout) };
@@ -439,7 +382,7 @@ impl AlignedBuf {
         }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: owned, initialised (zeroed) allocation of `len` bytes.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
@@ -466,231 +409,27 @@ pub(crate) trait ShardRead: Sync {
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<usize>;
 }
 
-struct FileRead(File);
-
-impl ShardRead for FileRead {
-    fn read_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.0.read_at(dst, offset) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                other => return other,
-            }
+/// Open `path` for O_DIRECT reads, falling back to buffered reads on a
+/// filesystem that refuses the flag.
+pub(crate) fn open_direct(path: &Path) -> io::Result<File> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+    {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            eprintln!(
+                "{TAG}: O_DIRECT unsupported on {}; using buffered reads",
+                path.display()
+            );
+            File::open(path)
         }
+        other => other,
     }
 }
 
-/// Pacing of a fill that overlaps the model load (see
-/// [`HotRowStore::spawn_fill`]).  The four fill threads share one token bucket
-/// (a read of up to 16 MiB takes that many tokens first), so the fill's read
-/// rate is bounded however many threads it uses, until
-/// [`HotRowStore::release_throttle`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FillThrottle {
-    /// Fill rate ceiling while the load runs, bytes/s.  `0` = do not read at
-    /// all until [`HotRowStore::release_throttle`] (post-load fill).
-    pub load_bytes_per_s: u64,
-    /// Floor of the adaptive rate, bytes/s.  Also the starting rate when
-    /// `adaptive` (the load gets a clean read-rate baseline first, then the
-    /// fill ramps up by 25% per second).
-    pub min_bytes_per_s: u64,
-    /// Back the rate off when the load's own read rate drops, ramp up
-    /// otherwise.  `false` = a fixed `load_bytes_per_s`.
-    pub adaptive: bool,
-}
-
-/// Outcome of asking the bucket for tokens.
-#[derive(Debug, PartialEq)]
-enum Take {
-    Granted,
-    /// Seconds until enough tokens exist at the current rate.
-    Wait(f64),
-    /// Rate is 0: nothing is granted until the throttle is released.
-    Blocked,
-}
-
-/// Token-bucket arithmetic over an explicit clock (seconds), so it can be
-/// tested without sleeping.
-struct BucketState {
-    /// Bytes per second.
-    rate: f64,
-    tokens: f64,
-    last_s: f64,
-    /// Largest balance (the burst).
-    cap: f64,
-}
-
-impl BucketState {
-    fn new(rate: f64, cap: f64) -> Self {
-        BucketState {
-            rate,
-            tokens: 0.0,
-            last_s: 0.0,
-            cap,
-        }
-    }
-
-    fn refill(&mut self, now_s: f64) {
-        let elapsed = (now_s - self.last_s).max(0.0);
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.cap);
-        self.last_s = self.last_s.max(now_s);
-    }
-
-    fn set_rate(&mut self, now_s: f64, rate: f64) {
-        self.refill(now_s);
-        self.rate = rate;
-    }
-
-    fn try_take(&mut self, now_s: f64, bytes: f64) -> Take {
-        self.refill(now_s);
-        if self.rate <= 0.0 {
-            return Take::Blocked;
-        }
-        let bytes = bytes.min(self.cap);
-        // Tolerance: refill by f64 products can land a hair under `bytes`,
-        // and a wait of that hair is below the clock's resolution.
-        if self.tokens >= bytes - 1e-6 {
-            self.tokens -= bytes;
-            Take::Granted
-        } else {
-            Take::Wait((bytes - self.tokens) / self.rate)
-        }
-    }
-}
-
-/// The fill's shared token bucket.  Unthrottled until
-/// [`TokenBucket::configure`]; [`TokenBucket::release`] ends the throttle.
-struct TokenBucket {
-    /// A throttle is in force (configured and not yet released).
-    active: AtomicBool,
-    epoch: Instant,
-    state: Mutex<BucketState>,
-    /// The configured throttle and when it was configured.
-    meta: Mutex<Option<(FillThrottle, Instant)>>,
-}
-
-impl TokenBucket {
-    fn new() -> Self {
-        TokenBucket {
-            active: AtomicBool::new(false),
-            epoch: Instant::now(),
-            state: Mutex::new(BucketState::new(0.0, (FILL_THREADS * READ_CHUNK) as f64)),
-            meta: Mutex::new(None),
-        }
-    }
-
-    fn now_s(&self) -> f64 {
-        self.epoch.elapsed().as_secs_f64()
-    }
-
-    fn state(&self) -> std::sync::MutexGuard<'_, BucketState> {
-        self.state.lock().unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    /// Start rate: the floor when adaptive, the fixed rate otherwise.
-    fn configure(&self, throttle: FillThrottle) {
-        let ceiling = throttle.load_bytes_per_s;
-        let start = if throttle.adaptive {
-            throttle.min_bytes_per_s.min(ceiling)
-        } else {
-            ceiling
-        };
-        self.state().set_rate(self.now_s(), start as f64);
-        *self.meta.lock().unwrap_or_else(|poison| poison.into_inner()) =
-            Some((throttle, Instant::now()));
-        self.active.store(true, Ordering::Release);
-    }
-
-    fn throttle(&self) -> Option<FillThrottle> {
-        let meta = *self.meta.lock().unwrap_or_else(|poison| poison.into_inner());
-        meta.map(|(throttle, _)| throttle)
-    }
-
-    fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
-    }
-
-    fn set_rate(&self, rate: f64) {
-        self.state().set_rate(self.now_s(), rate);
-    }
-
-    fn rate(&self) -> f64 {
-        self.state().rate
-    }
-
-    fn try_take(&self, bytes: u64) -> Take {
-        if !self.is_active() {
-            return Take::Granted;
-        }
-        self.state().try_take(self.now_s(), bytes as f64)
-    }
-
-    /// End the throttle.  `Some(configured_at)` on the call that ended it.
-    fn release(&self) -> Option<Instant> {
-        if !self.active.swap(false, Ordering::AcqRel) {
-            return None;
-        }
-        let meta = *self.meta.lock().unwrap_or_else(|poison| poison.into_inner());
-        meta.map(|(_, configured_at)| configured_at)
-    }
-}
-
-/// Load-read rate (bytes/s) below which the sweep is considered not reading
-/// (GPU upload phases): the fill rate is kept.
-const SWEEP_IDLE_BYTES_PER_S: f64 = 100e6;
-/// A load rate under this fraction of its recent peak means the fill slows it.
-const SLOWDOWN_RATIO: f64 = 0.85;
-/// Per-sample decay of the load-rate peak.
-const PEAK_DECAY: f64 = 0.97;
-/// Multiplicative ramp-up of the fill rate per unslowed sample.
-const RAMP_UP: f64 = 1.25;
-
-/// The adaptive rate rule, one [`AdaptiveRate::step`] per second.
-struct AdaptiveRate {
-    rate: f64,
-    min: f64,
-    max: f64,
-    peak: f64,
-}
-
-impl AdaptiveRate {
-    fn new(start: f64, min: f64, max: f64) -> Self {
-        AdaptiveRate {
-            rate: start.clamp(min, max),
-            min,
-            max,
-            peak: 0.0,
-        }
-    }
-
-    /// Feed the load's read rate over the last interval; returns the new fill
-    /// rate.  Reading but under [`SLOWDOWN_RATIO`] of the peak: halve (not
-    /// below `min`); reading at full pace: +25% (not above `max`); not
-    /// reading: unchanged.
-    fn step(&mut self, load_bytes_per_s: f64) -> f64 {
-        self.peak = (self.peak * PEAK_DECAY).max(load_bytes_per_s);
-        if load_bytes_per_s > SWEEP_IDLE_BYTES_PER_S {
-            self.rate = if load_bytes_per_s < SLOWDOWN_RATIO * self.peak {
-                (self.rate * 0.5).max(self.min)
-            } else {
-                (self.rate * RAMP_UP).min(self.max)
-            };
-        }
-        self.rate
-    }
-}
-
-/// Bytes this process has read from storage (`/proc/self/io` `read_bytes`).
-fn proc_io_read_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/self/io").ok()?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("read_bytes:"))
-        .and_then(|value| value.trim().parse().ok())
-}
-
-/// `/proc/meminfo` `MemAvailable` in bytes.  The store's budget and the
-/// fill's floor use this alone, not `uma_memory::host_available_bytes` (which
-/// adds an estimate of TTM's page pool): the pool estimate let a full store
-/// leave 0.8 GiB `MemAvailable` on Strix Halo.
+/// `/proc/meminfo` `MemAvailable` in bytes (page cache counts as available,
+/// so a prewarmed pack does not lower it).
 pub fn mem_available_bytes() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kib: u64 = text
@@ -704,79 +443,78 @@ pub fn mem_available_bytes() -> Option<u64> {
     Some(kib * 1024)
 }
 
-fn debug_enabled() -> bool {
-    hipfire_config::memory::ple_hot_debug()
+/// Read exactly `dst.len()` bytes at `offset`, retrying interrupted and short
+/// reads; a read that hits end of file is a `ShortRead`.
+fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+    let mut done = 0;
+    while done < dst.len() {
+        let at = offset + done as u64;
+        match file.read_at(&mut dst[done..], at) {
+            Ok(0) => {
+                return Err(SourceError::ShortRead {
+                    offset,
+                    expected: dst.len(),
+                    actual: done,
+                })
+            }
+            Ok(n) => done += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) => return Err(SourceError::Io { offset: at, source }),
+        }
+    }
+    Ok(())
 }
 
-/// Parameters of one fill run (production values via `spawn_fill`).
-pub(crate) struct FillParams<'a> {
-    /// Yield tiers while host availability is below this.
-    pub floor_bytes: u64,
-    /// Copied bytes between availability checks (per fill thread).
-    pub pressure_interval_bytes: u64,
-    /// Host availability probe.
-    pub avail: &'a (dyn Fn() -> Option<u64> + Sync),
-    /// Process storage-read counter probe (the adaptive throttle's input).
-    pub io_read_bytes: &'a (dyn Fn() -> Option<u64> + Sync),
-    /// Time between adaptive-rate samples.
-    pub adapt_interval: Duration,
+fn fadvise(file: &File, advice: libc::c_int) {
+    // SAFETY: a valid open descriptor; advice only.
+    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) };
 }
 
 // ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
-/// Read access to the tiers.  Hold it only for the copy loop (no I/O under
-/// it): [`HotRowStore::release_lowest`] waits for outstanding guards.
-pub struct HotGuard<'a>(RwLockReadGuard<'a, Vec<Option<TierBuf>>>);
-
-/// Raw encoded PLE rows of the hottest buckets, resident in host RAM.
+/// The hot rows of the PLE table: where each kept row sits in the hot-row
+/// pack, and the open pack.
 ///
-/// # Concurrency protocol
-///
-/// `ready[s]` (one flag per shard) is set with `Release` by the fill thread
-/// after every kept row of shard `s` has been copied, and read with `Acquire`
-/// by [`HotRowStore::get`].  Fill threads write only rows of shards that are
-/// not ready; readers return only rows of ready shards, and a ready shard is
-/// never written again.  A tier is dropped under the write lock; fill and
-/// readers hold the read lock only around their copy loops.
+/// A row is kept when its sidecar bucket is below the pack's `kept_buckets`;
+/// its tier is `bucket / tier_group`, and its pack offset is the tier's base
+/// plus its slot (the tier's rows with a smaller global row index) times the
+/// row size.  Nothing is served until the worker thread has checked the
+/// sidecar payload hash and spot-checked [`VERIFY_SAMPLES`] kept rows against
+/// the model file.
 pub struct HotRowStore {
     padded_rows: u64,
     rows_per_shard: usize,
+    encoding: RowEncoding,
     encoded_row_bytes: usize,
     /// Buckets per tier.
     group: usize,
-    /// Kept buckets `K`: buckets `0..K` are stored.
+    /// Kept buckets `K`: buckets `0..K` are in the pack.
     kept: usize,
     tier_count: usize,
     /// Bucket -> tier (`NO_TIER` when not kept).
     tier_of: [u8; BUCKETS],
-    /// The sidecar payload (empty when nothing is kept).
+    /// The sidecar payload.
     bucket: Box<[u8]>,
     /// `prefix[t][block]` = rows of tier `t` in rows `[0, block * 512)`.
     prefix: Vec<Box<[u32]>>,
-    /// Rows per tier (read by the tests' slot/fill checks).
-    #[cfg_attr(not(test), allow(dead_code))]
-    tier_rows: Vec<u64>,
-    /// Lowest-ranked present tier is released first; released tiers are
-    /// `None` and never re-filled.
-    tiers: RwLock<Vec<Option<TierBuf>>>,
-    ready: Box<[AtomicBool]>,
-    stop: AtomicBool,
+    /// Absolute pack offset of each tier's first row.
+    tier_base: Vec<u64>,
+    /// The pack, opened for random reads (no readahead).
+    pack: File,
+    pack_path: PathBuf,
+    data_offset: u64,
+    data_bytes: u64,
     expected_sha: String,
-    sha_state: AtomicU8,
-    fill_done: AtomicBool,
-    released: AtomicUsize,
+    state: AtomicU8,
+    stop: AtomicBool,
     hot_rows: AtomicU64,
     hot_pages: AtomicU64,
-    /// Throttle shared by the fill threads (unthrottled until `spawn_fill`).
-    throttle_bucket: TokenBucket,
-    /// Bytes the fill read from the model file.
-    bytes_read: AtomicU64,
-    /// Bytes of rows copied into tiers still present.
-    filled: AtomicU64,
-    /// Per-tier share of `filled`.
-    tier_filled: Box<[AtomicU64]>,
+    hot_reads: AtomicU64,
+    prewarm_budget: AtomicU64,
+    prewarmed: AtomicU64,
+    prewarm_done: AtomicBool,
     /// Time base of `busy_at_ms`.
     created: Instant,
     /// Milliseconds after `created` (plus one; 0 = never) at which the last
@@ -786,8 +524,8 @@ pub struct HotRowStore {
     busy_active: AtomicUsize,
 }
 
-/// A PLE fetch in flight (from [`HotRowStore::busy`]); the fill stays paused
-/// until [`BUSY_QUIET`] after the last guard drops.
+/// A PLE fetch in flight (from [`HotRowStore::busy`]); the prewarm stays
+/// paused until [`BUSY_QUIET`] after the last guard drops.
 pub(crate) struct BusyGuard<'a>(&'a HotRowStore);
 
 impl Drop for BusyGuard<'_> {
@@ -800,155 +538,166 @@ impl Drop for BusyGuard<'_> {
 }
 
 impl HotRowStore {
-    /// Build the index for `rank` under `budget_bytes` (tiers of
-    /// [`DEFAULT_TIER_BUCKETS`] buckets).  A budget too small for one bucket
-    /// yields a store with no tiers, which is a no-op everywhere.  Errors on
-    /// a geometry mismatch only.  Allocates tier memory lazily; copies
-    /// nothing until [`HotRowStore::spawn_fill`].
-    pub fn new(
+    /// Open the hot-row pack at `pack_path` for `rank` and build the row ->
+    /// pack-offset index.  Errors when the pack was not cut from this model
+    /// (PLE fingerprint, shard offsets, model file size), from this rank
+    /// (sidecar payload hash, per-tier row counts), or for this geometry.
+    /// Serves nothing until [`HotRowStore::spawn_worker`] has verified it.
+    pub fn open(
         rank: PleHotRank,
-        budget_bytes: u64,
+        pack_path: &Path,
         rows_per_shard: usize,
+        encoding: RowEncoding,
         encoded_row_bytes: usize,
+        shard_offsets: &[u64],
+        model_file_bytes: u64,
     ) -> Result<std::sync::Arc<HotRowStore>, String> {
-        Self::new_with_group(
-            rank,
-            budget_bytes,
-            rows_per_shard,
-            encoded_row_bytes,
-            DEFAULT_TIER_BUCKETS,
-        )
-    }
-
-    /// [`HotRowStore::new`] with an explicit tier size in buckets (>= 2).
-    pub fn new_with_group(
-        rank: PleHotRank,
-        budget_bytes: u64,
-        rows_per_shard: usize,
-        encoded_row_bytes: usize,
-        tier_group: usize,
-    ) -> Result<std::sync::Arc<HotRowStore>, String> {
+        let fail = |what: String| format!("ple hot pack {}: {what}", pack_path.display());
+        let header = read_ple_hot_pack_header(pack_path)?;
         let PleHotRank {
+            header: rank_header,
             padded_rows,
             payload_sha256,
             buckets,
-            ..
         } = rank;
-        if encoded_row_bytes != ENCODED_ROW_BYTES {
-            return Err(format!(
-                "ple hot store: row store rows are {encoded_row_bytes} B, sidecar rows are \
-                 {ENCODED_ROW_BYTES} B"
-            ));
+        if encoded_row_bytes == 0
+            || header.row_encoding != encoding
+            || header.encoded_row_bytes != encoded_row_bytes as u64
+        {
+            return Err(fail(format!(
+                "rows are {} B {} in the pack and {encoded_row_bytes} B {} in the row store",
+                header.encoded_row_bytes,
+                header.row_encoding.dtype_name(),
+                encoding.dtype_name()
+            )));
         }
-        if rows_per_shard == 0 || padded_rows == 0 || padded_rows % rows_per_shard as u64 != 0 {
-            return Err(format!(
-                "ple hot store: {padded_rows} padded rows is not a whole number of \
-                 {rows_per_shard}-row shards"
-            ));
+        if rows_per_shard == 0
+            || header.rows_per_shard != rows_per_shard as u64
+            || header.padded_rows != padded_rows
+            || padded_rows != shard_offsets.len() as u64 * rows_per_shard as u64
+        {
+            return Err(fail(format!(
+                "geometry {} rows in shards of {}, model {padded_rows} rows in {} shards of \
+                 {rows_per_shard}",
+                header.padded_rows,
+                header.rows_per_shard,
+                shard_offsets.len()
+            )));
         }
         if padded_rows > u64::from(u32::MAX) {
-            return Err(format!("ple hot store: {padded_rows} rows exceed the index range"));
+            return Err(fail(format!("{padded_rows} rows exceed the index range")));
         }
-        if !(2..=BUCKETS).contains(&tier_group) {
-            return Err(format!("ple hot store: tier group {tier_group} outside 2..=256"));
+        let rank_fingerprint = rank_header
+            .get("ple_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !header
+            .ple_fingerprint
+            .eq_ignore_ascii_case(rank_fingerprint)
+        {
+            return Err(fail(format!(
+                "PLE fingerprint {} is not the model's {rank_fingerprint}",
+                header.ple_fingerprint
+            )));
         }
-        let shards = (padded_rows / rows_per_shard as u64) as usize;
-        let ready: Box<[AtomicBool]> = (0..shards).map(|_| AtomicBool::new(false)).collect();
+        if header.rank_payload_sha256 != payload_sha256 {
+            return Err(fail(format!(
+                "cut from rank {} but the sidecar is {payload_sha256}",
+                header.rank_payload_sha256
+            )));
+        }
+        if header.shard_offsets != shard_offsets {
+            return Err(fail(
+                "PLE shard offsets differ from the model's".to_string(),
+            ));
+        }
+        if header.model_file_bytes != model_file_bytes {
+            return Err(fail(format!(
+                "cut from a {} B model file, this one is {model_file_bytes} B",
+                header.model_file_bytes
+            )));
+        }
 
-        let kept = if budget_bytes == 0 {
-            0
-        } else {
-            let rows_fit = u128::from(budget_bytes) * BUCKETS as u128
-                / (encoded_row_bytes as u128 * u128::from(padded_rows));
-            rows_fit.min(BUCKETS as u128) as usize
-        };
-        let tier_count = kept.div_ceil(tier_group);
-
+        let group = header.tier_group;
+        let kept = header.kept_buckets;
+        let tier_count = kept.div_ceil(group);
         let mut tier_of = [NO_TIER; BUCKETS];
         for (bucket, slot) in tier_of.iter_mut().enumerate().take(kept) {
-            *slot = (bucket / tier_group) as u8;
+            *slot = (bucket / group) as u8;
         }
-
-        let (bucket, prefix, tier_rows) = if kept == 0 {
-            (Box::default(), Vec::new(), Vec::new())
-        } else {
-            let blocks = (padded_rows as usize).div_ceil(BLOCK_ROWS);
-            let mut prefix: Vec<Vec<u32>> = (0..tier_count).map(|_| Vec::with_capacity(blocks)).collect();
-            let mut counts = [0u32; BUCKETS];
-            for block in buckets.chunks(BLOCK_ROWS) {
-                for (tier, column) in prefix.iter_mut().enumerate() {
-                    column.push(counts[tier]);
-                }
-                for &b in block {
-                    counts[usize::from(tier_of[usize::from(b)])] += 1;
-                }
+        let blocks = (padded_rows as usize).div_ceil(BLOCK_ROWS);
+        let mut prefix: Vec<Vec<u32>> = (0..tier_count)
+            .map(|_| Vec::with_capacity(blocks))
+            .collect();
+        let mut counts = [0u32; BUCKETS];
+        for block in buckets.chunks(BLOCK_ROWS) {
+            for (tier, column) in prefix.iter_mut().enumerate() {
+                column.push(counts[tier]);
             }
-            let tier_rows: Vec<u64> = counts[..tier_count].iter().map(|&n| u64::from(n)).collect();
-            (
-                buckets.into_boxed_slice(),
-                prefix.into_iter().map(Vec::into_boxed_slice).collect(),
-                tier_rows,
-            )
-        };
-
-        let mut tiers: Vec<Option<TierBuf>> = Vec::with_capacity(tier_count);
-        let mut logical = 0u64;
+            for &b in block {
+                counts[usize::from(tier_of[usize::from(b)])] += 1;
+            }
+        }
+        let tier_rows: Vec<u64> = counts[..tier_count].iter().map(|&n| u64::from(n)).collect();
+        if tier_rows != header.tier_rows {
+            return Err(fail(
+                "per-tier row counts differ from the sidecar's".to_string(),
+            ));
+        }
+        let mut tier_base = Vec::with_capacity(tier_count);
+        let mut base = header.data_offset;
         for &rows in &tier_rows {
-            let bytes = rows * encoded_row_bytes as u64;
-            let tier = usize::try_from(bytes).ok().and_then(TierBuf::zeroed);
-            if tier.is_some() {
-                logical += bytes;
-            } else {
-                eprintln!("{TAG}: allocating a {:.0} MiB tier failed; tier disabled", mib(bytes));
-            }
-            tiers.push(tier);
+            tier_base.push(base);
+            base += rows * encoded_row_bytes as u64;
         }
-        let index_bytes = bucket.len() as u64
-            + prefix.iter().map(|column| column.len() as u64 * 4).sum::<u64>();
+        let pack = File::open(pack_path).map_err(|e| fail(format!("open: {e}")))?;
+        fadvise(&pack, libc::POSIX_FADV_RANDOM);
+        let index_bytes =
+            buckets.len() as u64 + prefix.iter().map(|c| c.len() as u64 * 4).sum::<u64>();
         eprintln!(
-            "{TAG}: budget {:.2} GiB -> kept {kept}/{BUCKETS} buckets in {tier_count} tiers \
-             ({:.2} GiB logical, index {:.0} MiB), {padded_rows} rows in {shards} shards",
-            gib(budget_bytes),
-            gib(logical),
+            "{TAG}: pack {}: kept {kept}/{BUCKETS} buckets in {tier_count} tiers ({:.2} GiB, index \
+             {:.0} MiB)",
+            pack_path.display(),
+            gib(header.data_bytes),
             mib(index_bytes),
         );
-
         Ok(std::sync::Arc::new(HotRowStore {
             padded_rows,
             rows_per_shard,
+            encoding,
             encoded_row_bytes,
-            group: tier_group,
+            group,
             kept,
             tier_count,
             tier_of,
-            bucket,
-            prefix,
-            tier_rows,
-            tiers: RwLock::new(tiers),
-            ready,
-            stop: AtomicBool::new(false),
+            bucket: buckets.into_boxed_slice(),
+            prefix: prefix.into_iter().map(Vec::into_boxed_slice).collect(),
+            tier_base,
+            pack,
+            pack_path: pack_path.to_path_buf(),
+            data_offset: header.data_offset,
+            data_bytes: header.data_bytes,
             expected_sha: payload_sha256,
-            sha_state: AtomicU8::new(SHA_UNKNOWN),
-            fill_done: AtomicBool::new(false),
-            released: AtomicUsize::new(0),
+            state: AtomicU8::new(STATE_VERIFYING),
+            stop: AtomicBool::new(false),
             hot_rows: AtomicU64::new(0),
             hot_pages: AtomicU64::new(0),
-            throttle_bucket: TokenBucket::new(),
-            bytes_read: AtomicU64::new(0),
-            filled: AtomicU64::new(0),
-            tier_filled: (0..tier_count).map(|_| AtomicU64::new(0)).collect(),
+            hot_reads: AtomicU64::new(0),
+            prewarm_budget: AtomicU64::new(BUDGET_UNSET),
+            prewarmed: AtomicU64::new(0),
+            prewarm_done: AtomicBool::new(false),
             created: Instant::now(),
             busy_at_ms: AtomicU64::new(0),
             busy_active: AtomicUsize::new(0),
         }))
     }
 
-    /// Tiers this store was built with (0 = no-op store).
+    /// Tiers in the pack.
     pub fn tier_count(&self) -> usize {
         self.tier_count
     }
 
-    /// Buckets (of 256) kept under the budget.
+    /// Buckets (of 256) in the pack.
     pub fn kept_buckets(&self) -> usize {
         self.kept
     }
@@ -965,114 +714,73 @@ impl HotRowStore {
         self.encoded_row_bytes
     }
 
-    /// Logical bytes of the tiers still present (includes pages the fill has
-    /// not touched yet).
-    pub fn resident_bytes(&self) -> u64 {
-        self.read_tiers()
-            .iter()
-            .flatten()
-            .map(|tier| tier.len as u64)
-            .sum()
+    /// Row encoding of the pack (equal to the row store's).
+    pub fn encoding(&self) -> RowEncoding {
+        self.encoding
     }
 
-    /// Bytes of rows copied so far into tiers that are still present
-    /// (released tiers subtract what they held).  Unlike
-    /// [`HotRowStore::resident_bytes`] this counts only what the fill wrote.
-    pub fn filled_bytes(&self) -> u64 {
-        self.filled.load(Ordering::Acquire)
+    /// Row bytes in the pack.
+    pub fn data_bytes(&self) -> u64 {
+        self.data_bytes
     }
 
-    /// Put the throttle in force (the fill threads of `spawn_fill`).
-    pub(crate) fn configure_throttle(&self, throttle: FillThrottle) {
-        self.throttle_bucket.configure(throttle);
+    /// The pack passed verification and serves rows.
+    pub fn is_serving(&self) -> bool {
+        self.state.load(Ordering::Acquire) == STATE_SERVING
     }
 
-    /// The model load is done: from now on the fill runs unthrottled (a
-    /// `load_bytes_per_s == 0` fill starts reading).  Logs once.
-    pub fn release_throttle(&self) {
-        let Some(configured_at) = self.throttle_bucket.release() else {
-            return;
-        };
-        let seconds = configured_at.elapsed().as_secs_f64();
-        eprintln!(
-            "{TAG}: throttle released after {seconds:.1} s ({:.2} GiB filled, {:.2} GB/s \
-             average while throttled)",
-            gib(self.filled_bytes()),
-            self.bytes_read.load(Ordering::Relaxed) as f64 / 1e9 / seconds.max(1e-9),
-        );
-    }
-
-    /// Release lowest-ranked tiers until the bytes still to be filled fit in
-    /// `available - headroom` (`available` = `MemAvailable` now, after the
-    /// load).  The load-start budget can only estimate the load's footprint;
-    /// this sizes the store from what the load actually left.  Returns the
-    /// tiers released.
-    pub fn fit_to_headroom(&self, available: u64, headroom: u64) -> usize {
-        let room = available.saturating_sub(headroom);
-        let mut released = 0;
-        while self.resident_bytes().saturating_sub(self.filled_bytes()) > room {
-            if self.release_lowest() == 0 {
-                break;
-            }
-            released += 1;
-        }
-        if released > 0 {
-            eprintln!(
-                "{TAG}: sized to {:.2} GiB after load ({released} tiers released; {:.2} GiB \
-                 MemAvailable, {:.2} GiB headroom kept)",
-                gib(self.resident_bytes()),
-                gib(available),
-                gib(headroom),
-            );
-        }
-        released
-    }
-
-    /// Tiers dropped so far.
-    pub fn released_tiers(&self) -> usize {
-        self.released.load(Ordering::Acquire)
-    }
-
-    /// Every shard was read and its rows copied.
-    pub fn fill_complete(&self) -> bool {
-        self.fill_done.load(Ordering::Acquire)
-    }
-
-    /// Sidecar payload hash result: `None` until the fill thread checked it.
-    pub fn sha_verified(&self) -> Option<bool> {
-        match self.sha_state.load(Ordering::Acquire) {
-            SHA_OK => Some(true),
-            SHA_FAILED => Some(false),
+    /// `None` while the worker is still verifying, then whether it passed.
+    pub fn verified(&self) -> Option<bool> {
+        match self.state.load(Ordering::Acquire) {
+            STATE_SERVING => Some(true),
+            STATE_FAILED => Some(false),
             _ => None,
         }
     }
 
-    /// Rows served from the store.
+    /// Bytes of the pack read by the prewarm so far.
+    pub fn prewarmed_bytes(&self) -> u64 {
+        self.prewarmed.load(Ordering::Relaxed)
+    }
+
+    /// The prewarm read its whole budget.
+    pub fn prewarm_complete(&self) -> bool {
+        self.prewarm_done.load(Ordering::Acquire)
+    }
+
+    /// Rows served from the pack.
     pub fn hot_rows(&self) -> u64 {
         self.hot_rows.load(Ordering::Relaxed)
     }
 
-    /// Pages served entirely from the store.
+    /// Pages whose every requested row the pack served.
     pub fn hot_pages(&self) -> u64 {
         self.hot_pages.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn note_served(&self, rows: u64, pages: u64) {
+    /// Reads issued against the pack (a read covers a run of consecutive
+    /// pack rows).
+    pub fn hot_reads(&self) -> u64 {
+        self.hot_reads.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_served(&self, rows: u64, pages: u64, reads: u64) {
         self.hot_rows.fetch_add(rows, Ordering::Relaxed);
         self.hot_pages.fetch_add(pages, Ordering::Relaxed);
+        self.hot_reads.fetch_add(reads, Ordering::Relaxed);
     }
 
     /// The row store is serving a PLE fetch (a prefill chunk or a decode
-    /// step).  The fill pauses while the returned guard lives and for
+    /// step).  The prewarm pauses while the returned guard lives and for
     /// [`BUSY_QUIET`] after the last one drops, so it never competes with a
-    /// request for the SSD, CPU or memory.
+    /// request for the SSD.
     pub(crate) fn busy(&self) -> BusyGuard<'_> {
         self.busy_active.fetch_add(1, Ordering::AcqRel);
         BusyGuard(self)
     }
 
     /// Sleep while a PLE fetch is in flight or finished less than
-    /// [`BUSY_QUIET`] ago; `false` when the fill was stopped meanwhile.
+    /// [`BUSY_QUIET`] ago; `false` when the store was stopped meanwhile.
     fn wait_until_idle(&self) -> bool {
         loop {
             if self.stopped() {
@@ -1096,9 +804,8 @@ impl HotRowStore {
         }
     }
 
-    /// Ask a running fill to stop at its next read; pair with joining the
-    /// handle `spawn_fill` returned.  Dropping the last `Arc` does not stop
-    /// the fill (the fill thread holds one).
+    /// Ask the worker to stop at its next read; pair with joining the handle
+    /// [`HotRowStore::spawn_worker`] returned.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
@@ -1107,24 +814,10 @@ impl HotRowStore {
         self.stop.load(Ordering::Acquire)
     }
 
-    fn read_tiers(&self) -> RwLockReadGuard<'_, Vec<Option<TierBuf>>> {
-        self.tiers.read().unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    /// Read access for a run of [`HotRowStore::get`] calls.
-    pub fn read(&self) -> HotGuard<'_> {
-        HotGuard(self.read_tiers())
-    }
-
-    /// The `encoded_row_bytes` encoded bytes of global `row`, when its shard
-    /// is ready and its tier present.  Never returns padding-garbage: an
-    /// unready shard or released tier is `None`.
-    pub fn get<'g>(&self, guard: &'g HotGuard<'_>, row: u64) -> Option<&'g [u8]> {
-        if row >= self.padded_rows || self.kept == 0 {
-            return None;
-        }
-        let shard = (row / self.rows_per_shard as u64) as usize;
-        if !self.ready[shard].load(Ordering::Acquire) {
+    /// Absolute pack offset of global `row`'s encoded bytes when the pack
+    /// holds it and serves.
+    pub fn pack_offset(&self, row: u64) -> Option<u64> {
+        if row >= self.padded_rows || !self.is_serving() {
             return None;
         }
         let tier = self.tier_of[usize::from(self.bucket[row as usize])];
@@ -1132,9 +825,25 @@ impl HotRowStore {
             return None;
         }
         let tier = usize::from(tier);
-        let buffer = guard.0[tier].as_ref()?;
-        let offset = self.slot(row, tier) as usize * self.encoded_row_bytes;
-        Some(buffer.row(offset, self.encoded_row_bytes))
+        Some(self.tier_base[tier] + self.slot(row, tier) * self.encoded_row_bytes as u64)
+    }
+
+    /// Read `dst.len()` bytes of the pack at absolute `offset`.
+    pub fn read_pack(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        let end = offset
+            .checked_add(dst.len() as u64)
+            .ok_or(SourceError::Overflow {
+                offset,
+                length: dst.len() as u64,
+            })?;
+        if offset < self.data_offset || end > self.data_offset + self.data_bytes {
+            return Err(SourceError::RangeOutOfBounds {
+                offset,
+                length: dst.len() as u64,
+                source_len: self.data_offset + self.data_bytes,
+            });
+        }
+        read_exact_at(&self.pack, offset, dst)
     }
 
     /// Index of `row` inside tier `tier` (rows of the tier in ascending global
@@ -1152,448 +861,196 @@ impl HotRowStore {
         u64::from(self.prefix[tier][block]) + before as u64
     }
 
-    /// Tier of `row` when its bucket is kept.
-    #[cfg(test)]
-    pub(crate) fn tier_of_row(&self, row: u64) -> Option<usize> {
-        match self.tier_of[usize::from(*self.bucket.get(row as usize)?)] {
-            NO_TIER => None,
-            tier => Some(usize::from(tier)),
-        }
+    /// Bytes of the pack to prewarm once the model is ready (capped at the
+    /// pack's size; 0 = none).  The worker starts reading at once if it has
+    /// verified the pack, else right after.
+    pub fn set_prewarm_budget(&self, bytes: u64) {
+        self.prewarm_budget
+            .store(bytes.min(self.data_bytes), Ordering::Release);
     }
 
-    /// Rows of each tier that precede global `row` (the fill cursors for a
-    /// shard that starts at `row`).
-    fn cursors_at(&self, row: u64) -> Vec<u64> {
-        let row = row as usize;
-        let block = row / BLOCK_ROWS;
-        let mut cursors: Vec<u64> = self
-            .prefix
-            .iter()
-            .map(|column| u64::from(column[block]))
-            .collect();
-        for &b in &self.bucket[block * BLOCK_ROWS..row] {
-            let tier = self.tier_of[usize::from(b)];
-            if tier != NO_TIER {
-                cursors[usize::from(tier)] += 1;
-            }
-        }
-        cursors
-    }
-
-    /// Drop the lowest-ranked present tier and return its bytes (0 when none
-    /// is left).  Waits for readers to leave their copy loop; the memory is
-    /// back with the kernel when this returns.
-    pub fn release_lowest(&self) -> u64 {
-        let started = Instant::now();
-        let released = {
-            let mut tiers = self.tiers.write().unwrap_or_else(|poison| poison.into_inner());
-            let found = tiers
-                .iter_mut()
-                .enumerate()
-                .rev()
-                .find_map(|(index, slot)| match slot.take() {
-                    // An empty tier frees nothing and would read as "none left".
-                    Some(tier) if tier.len > 0 => Some((index, tier)),
-                    _ => None,
-                });
-            // The fill adds to these only under the read lock, so under the
-            // write lock the tier's count is final.
-            if let Some((index, _)) = &found {
-                let copied = self.tier_filled[*index].swap(0, Ordering::AcqRel);
-                self.filled.fetch_sub(copied, Ordering::AcqRel);
-            }
-            found
-        };
-        let Some((index, tier)) = released else {
-            return 0;
-        };
-        let bytes = tier.len as u64;
-        // Unmapping a touched ~1 GiB tier takes milliseconds: outside the lock.
-        drop(tier);
-        self.released.fetch_add(1, Ordering::AcqRel);
-        eprintln!(
-            "{TAG}: released tier {index} ({:.0} MiB) in {:.1} ms",
-            mib(bytes),
-            started.elapsed().as_secs_f64() * 1e3
-        );
-        bytes
-    }
-
-    fn release_all(&self) {
-        while self.release_lowest() > 0 {}
-    }
-
-    /// Force a shard's readiness (tests: simulate a fill that has not reached it).
-    #[cfg(test)]
-    pub(crate) fn set_shard_ready_for_test(&self, shard: usize, ready: bool) {
-        self.ready[shard].store(ready, Ordering::Release);
-    }
-
-    /// Verify the sidecar payload, then read the PLE shards of `model_path`
-    /// (sequentially, O_DIRECT, 4 threads) and keep every row of a present
-    /// tier.  `shard_file_offsets[s]` is the absolute file offset of shard `s`
-    /// (`rows_per_shard` rows of `encoded_row_bytes`; padding rows included).
-    /// While host availability is below `floor_bytes` the lowest tiers are
-    /// released.  The fill is paced by `throttle` (shared token bucket, see
-    /// [`FillThrottle`]) until [`HotRowStore::release_throttle`].  Returns at
-    /// once; the work runs on the returned thread.
-    /// Call [`HotRowStore::stop`] then join it before unloading the row store.
-    pub fn spawn_fill(
+    /// Start the worker: check the sidecar payload hash and spot-check
+    /// [`VERIFY_SAMPLES`] kept rows of the pack against the model file
+    /// (`shard_offsets[s]` = file offset of PLE shard `s`), then serve; once
+    /// [`HotRowStore::set_prewarm_budget`] was called, read that many bytes of
+    /// the pack's hottest tiers sequentially into the page cache while no
+    /// request is being served.  Call [`HotRowStore::stop`] then join it
+    /// before unloading the row store.
+    pub fn spawn_worker(
         self: &std::sync::Arc<Self>,
         model_path: &Path,
-        shard_file_offsets: Vec<u64>,
-        floor_bytes: u64,
-        throttle: FillThrottle,
+        shard_offsets: Vec<u64>,
     ) -> JoinHandle<()> {
         let store = self.clone();
-        let path = model_path.to_path_buf();
-        // Before the thread exists, so a release right after this call
-        // cannot be overtaken by the configuration.
-        self.configure_throttle(throttle);
+        let model_path = model_path.to_path_buf();
         std::thread::Builder::new()
-            .name("ple-hot-fill".to_string())
-            .spawn(move || store.run_fill(&path, &shard_file_offsets, floor_bytes))
-            .expect("spawn ple hot fill thread")
+            .name("ple-hot-pack".to_string())
+            .spawn(move || store.run_worker(&model_path, &shard_offsets))
+            .expect("spawn ple hot pack thread")
     }
 
-    fn run_fill(&self, path: &Path, offsets: &[u64], floor_bytes: u64) {
-        if self.tier_count == 0 {
+    fn run_worker(&self, model_path: &Path, shard_offsets: &[u64]) {
+        match self.verify(model_path, shard_offsets) {
+            Ok(summary) => {
+                eprintln!("{TAG}: {summary}; serving");
+                self.state.store(STATE_SERVING, Ordering::Release);
+            }
+            Err(error) => {
+                eprintln!("{TAG}: {error}; the pack is not used");
+                self.state.store(STATE_FAILED, Ordering::Release);
+                return;
+            }
+        }
+        let budget = loop {
+            if self.stopped() {
+                return;
+            }
+            match self.prewarm_budget.load(Ordering::Acquire) {
+                BUDGET_UNSET => std::thread::sleep(Duration::from_millis(50)),
+                budget => break budget,
+            }
+        };
+        self.prewarm(budget);
+    }
+
+    /// Sidecar payload hash, then [`VERIFY_SAMPLES`] kept rows compared byte
+    /// for byte between the pack and the model file.
+    fn verify(&self, model_path: &Path, shard_offsets: &[u64]) -> Result<String, String> {
+        let started = Instant::now();
+        let actual = hex(&Sha256::digest(&self.bucket));
+        if actual != self.expected_sha {
+            return Err(format!(
+                "sidecar payload sha256 {actual} != {}",
+                self.expected_sha
+            ));
+        }
+        let model = File::open(model_path).map_err(|e| {
+            format!(
+                "opening {} for the spot check failed: {e}",
+                model_path.display()
+            )
+        })?;
+        fadvise(&model, libc::POSIX_FADV_RANDOM);
+        // Deterministic sample: pseudo-random rows, kept ones only.
+        let mut rows = Vec::with_capacity(VERIFY_SAMPLES);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..VERIFY_SAMPLES * 64 {
+            if rows.len() == VERIFY_SAMPLES {
+                break;
+            }
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let row = state % self.padded_rows;
+            if self.tier_of[usize::from(self.bucket[row as usize])] != NO_TIER {
+                rows.push(row);
+            }
+        }
+        let row_bytes = self.encoded_row_bytes;
+        let per_thread = rows.len().div_ceil(VERIFY_THREADS).max(1);
+        let mismatch = std::thread::scope(|scope| {
+            let handles: Vec<_> = rows
+                .chunks(per_thread)
+                .map(|chunk| {
+                    let model = &model;
+                    scope.spawn(move || -> Result<(), String> {
+                        let mut from_pack = vec![0u8; row_bytes];
+                        let mut from_model = vec![0u8; row_bytes];
+                        for &row in chunk {
+                            let tier =
+                                usize::from(self.tier_of[usize::from(self.bucket[row as usize])]);
+                            let offset =
+                                self.tier_base[tier] + self.slot(row, tier) * row_bytes as u64;
+                            read_exact_at(&self.pack, offset, &mut from_pack)
+                                .map_err(|e| format!("pack read of row {row}: {e}"))?;
+                            let shard = (row / self.rows_per_shard as u64) as usize;
+                            let local = row % self.rows_per_shard as u64;
+                            read_exact_at(
+                                model,
+                                shard_offsets[shard] + local * row_bytes as u64,
+                                &mut from_model,
+                            )
+                            .map_err(|e| format!("model read of row {row}: {e}"))?;
+                            if from_pack != from_model {
+                                return Err(format!(
+                                    "row {row} differs between the pack and the model"
+                                ));
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("ple hot pack verify thread panicked"))
+                .collect::<Result<Vec<()>, String>>()
+        });
+        mismatch?;
+        Ok(format!(
+            "sidecar sha256 ok, {} pack rows match the model ({:.0} ms)",
+            rows.len(),
+            started.elapsed().as_secs_f64() * 1e3
+        ))
+    }
+
+    /// Read the first `budget` bytes of the pack's rows (the hottest tiers)
+    /// sequentially, so the page cache holds them, pausing while requests run.
+    fn prewarm(&self, budget: u64) {
+        if budget == 0 {
+            self.prewarm_done.store(true, Ordering::Release);
             return;
         }
-        if !self.verify_sidecar() {
-            self.release_all();
-            return;
-        }
-        let file = match open_direct(path) {
+        let file = match File::open(&self.pack_path) {
             Ok(file) => file,
             Err(error) => {
-                eprintln!("{TAG}: opening {} failed: {error}; releasing the store", path.display());
-                self.release_all();
+                eprintln!("{TAG}: prewarm: opening the pack failed: {error}");
                 return;
             }
         };
-        self.fill_with(
-            &FileRead(file),
-            offsets,
-            &FillParams {
-                floor_bytes,
-                pressure_interval_bytes: PRESSURE_INTERVAL_BYTES,
-                avail: &mem_available_bytes,
-                io_read_bytes: &proc_io_read_bytes,
-                adapt_interval: Duration::from_secs(1),
-            },
-        );
-    }
-
-    /// Hash the retained sidecar payload; `false` (and a log) on mismatch.
-    fn verify_sidecar(&self) -> bool {
+        fadvise(&file, libc::POSIX_FADV_SEQUENTIAL);
         let started = Instant::now();
-        let actual = hex(&Sha256::digest(&self.bucket));
-        let ok = actual == self.expected_sha;
-        self.sha_state
-            .store(if ok { SHA_OK } else { SHA_FAILED }, Ordering::Release);
-        if ok {
-            eprintln!(
-                "{TAG}: sidecar sha256 ok ({:.0} ms)",
-                started.elapsed().as_secs_f64() * 1e3
-            );
-        } else {
-            eprintln!(
-                "{TAG}: sidecar sha256 FAILED (payload {actual}, header {}); releasing the store",
-                self.expected_sha
-            );
-        }
-        ok
-    }
-
-    /// The fill proper, over any positional reader (production: the O_DIRECT
-    /// model file; tests: memory).
-    pub(crate) fn fill_with(&self, reader: &dyn ShardRead, offsets: &[u64], params: &FillParams<'_>) {
-        let shards = self.ready.len();
-        if offsets.len() != shards {
-            eprintln!(
-                "{TAG}: {} shard offsets for {shards} shards; releasing the store",
-                offsets.len()
-            );
-            self.release_all();
-            return;
-        }
-        let started = Instant::now();
-        let read_at_start = self.bytes_read.load(Ordering::Relaxed);
-        let rows_copied = AtomicU64::new(0);
-        let failed = AtomicBool::new(false);
-        let pressure = Mutex::new(());
-        let workers = FILL_THREADS.min(shards);
-        let running = AtomicUsize::new(workers);
-        std::thread::scope(|scope| {
-            for worker in 0..workers {
-                let (rows_copied, failed, pressure, running) =
-                    (&rows_copied, &failed, &pressure, &running);
-                scope.spawn(move || {
-                    let work = || {
-                        let mut buffer = AlignedBuf::new(READ_CHUNK);
-                        let mut since_check = 0u64;
-                        let mut shard = worker;
-                        while shard < shards {
-                            if self.stopped() || failed.load(Ordering::Acquire) {
-                                return;
-                            }
-                            let outcome = self.fill_shard(
-                                shard,
-                                offsets[shard],
-                                reader,
-                                &mut buffer,
-                                params,
-                                &mut since_check,
-                                pressure,
-                            );
-                            match outcome {
-                                Ok(Some(copied)) => {
-                                    rows_copied.fetch_add(copied, Ordering::Relaxed);
-                                    self.ready[shard].store(true, Ordering::Release);
-                                }
-                                Ok(None) => return,
-                                Err(error) => {
-                                    eprintln!("{TAG}: fill of shard {shard} failed: {error}");
-                                    failed.store(true, Ordering::Release);
-                                    return;
-                                }
-                            }
-                            shard += FILL_THREADS;
-                        }
-                    };
-                    work();
-                    running.fetch_sub(1, Ordering::AcqRel);
-                });
+        let mut paused = Duration::ZERO;
+        let mut buffer = vec![0u8; PREWARM_CHUNK];
+        let end = self.data_offset + budget;
+        let mut offset = self.data_offset;
+        while offset < end {
+            let idle_from = Instant::now();
+            if !self.wait_until_idle() {
+                return;
             }
-            scope.spawn(|| self.run_rate_controller(params, &running));
-        });
-        let seconds = started.elapsed().as_secs_f64();
-        let complete = !failed.load(Ordering::Acquire)
-            && !self.stopped()
-            && self.ready.iter().all(|flag| flag.load(Ordering::Acquire));
-        if complete {
-            self.fill_done.store(true, Ordering::Release);
+            paused += idle_from.elapsed();
+            let len = ((end - offset) as usize).min(PREWARM_CHUNK);
+            if let Err(error) = read_exact_at(&file, offset, &mut buffer[..len]) {
+                eprintln!(
+                    "{TAG}: prewarm stopped at {:.2} GiB: {error}",
+                    gib(offset - self.data_offset)
+                );
+                return;
+            }
+            offset += len as u64;
+            self.prewarmed
+                .store(offset - self.data_offset, Ordering::Relaxed);
         }
-        let bytes = self.bytes_read.load(Ordering::Relaxed) - read_at_start;
+        self.prewarm_done.store(true, Ordering::Release);
+        let reading = started.elapsed().saturating_sub(paused).as_secs_f64();
         eprintln!(
-            "{TAG}: fill {}: {} tiers present, {:.2} GiB resident, {} rows, {seconds:.1} s \
-             ({:.2} GB/s read), {} tiers released",
-            if complete { "complete" } else { "stopped early" },
-            self.tier_count - self.released_tiers().min(self.tier_count),
-            gib(self.resident_bytes()),
-            rows_copied.load(Ordering::Relaxed),
-            bytes as f64 / 1e9 / seconds.max(1e-9),
-            self.released_tiers(),
+            "{TAG}: prewarm complete: {:.2} GiB of {:.2} GiB in {:.1} s ({:.2} GB/s reading, {:.1} s \
+             paused for requests), MemAvailable {:.1} GiB",
+            gib(budget),
+            gib(self.data_bytes),
+            started.elapsed().as_secs_f64(),
+            budget as f64 / 1e9 / reading.max(1e-9),
+            paused.as_secs_f64(),
+            mem_available_bytes().map_or(f64::NAN, gib),
         );
-    }
-
-    /// Block until the throttle grants `bytes` of tokens; `false` when the
-    /// fill was stopped meanwhile.
-    fn acquire_tokens(&self, bytes: u64) -> bool {
-        loop {
-            if self.stopped() {
-                return false;
-            }
-            let nap = match self.throttle_bucket.try_take(bytes) {
-                Take::Granted => return true,
-                // Short naps so a rate change, release or stop is noticed.
-                Take::Wait(seconds) => Duration::from_secs_f64(seconds)
-                    .clamp(Duration::from_millis(1), Duration::from_millis(50)),
-                Take::Blocked => Duration::from_millis(20),
-            };
-            std::thread::sleep(nap);
-        }
-    }
-
-    /// Once per `adapt_interval`: the load's read rate (process storage reads
-    /// minus the fill's own) drives [`AdaptiveRate`], whose rate goes to the
-    /// bucket.  Returns when the fill threads are done, stopped, or the
-    /// throttle was released.
-    fn run_rate_controller(&self, params: &FillParams<'_>, running: &AtomicUsize) {
-        let Some(throttle) = self.throttle_bucket.throttle() else {
-            return;
-        };
-        if !throttle.adaptive || throttle.load_bytes_per_s == 0 {
-            return;
-        }
-        let max = throttle.load_bytes_per_s as f64;
-        let min = (throttle.min_bytes_per_s as f64).min(max);
-        let mut rate = AdaptiveRate::new(self.throttle_bucket.rate(), min, max);
-        let debug = debug_enabled();
-        let mut last_io = (params.io_read_bytes)();
-        let mut last_fill = self.bytes_read.load(Ordering::Relaxed);
-        let mut last_at = Instant::now();
-        while running.load(Ordering::Acquire) > 0 && !self.stopped() && self.throttle_bucket.is_active() {
-            std::thread::sleep(Duration::from_millis(10).min(params.adapt_interval));
-            if last_at.elapsed() < params.adapt_interval {
-                continue;
-            }
-            let io = (params.io_read_bytes)();
-            let fill = self.bytes_read.load(Ordering::Relaxed);
-            let seconds = last_at.elapsed().as_secs_f64();
-            last_at = Instant::now();
-            if let (Some(io), Some(before)) = (io, last_io) {
-                let load_bytes = io
-                    .saturating_sub(before)
-                    .saturating_sub(fill.saturating_sub(last_fill));
-                let load_rate = load_bytes as f64 / seconds.max(1e-9);
-                let previous = rate.rate;
-                let next = rate.step(load_rate);
-                if next != previous {
-                    self.throttle_bucket.set_rate(next);
-                    if debug {
-                        eprintln!(
-                            "{TAG}: fill rate {:.0} -> {:.0} MB/s (load reads {:.0} MB/s, peak \
-                             {:.0} MB/s)",
-                            previous / 1e6,
-                            next / 1e6,
-                            load_rate / 1e6,
-                            rate.peak / 1e6,
-                        );
-                    }
-                }
-            }
-            last_io = io;
-            last_fill = fill;
-        }
-    }
-
-    /// Fill one shard.  `Ok(Some(rows))` when every row was visited,
-    /// `Ok(None)` when stopped or nothing is left to fill.
-    #[allow(clippy::too_many_arguments)]
-    fn fill_shard(
-        &self,
-        shard: usize,
-        file_offset: u64,
-        reader: &dyn ShardRead,
-        buffer: &mut AlignedBuf,
-        params: &FillParams<'_>,
-        since_check: &mut u64,
-        pressure: &Mutex<()>,
-    ) -> Result<Option<u64>, String> {
-        let row_bytes = self.encoded_row_bytes as u64;
-        let rows = self.rows_per_shard as u64;
-        let first_global = shard as u64 * rows;
-        let shard_end = file_offset + rows * row_bytes;
-        let mut cursors = self.cursors_at(first_global);
-        let mut copied_per_tier = vec![0u64; self.tier_count];
-        let mut next = 0u64;
-        let mut copied_total = 0u64;
-        while next < rows {
-            if self.stopped() {
-                return Ok(None);
-            }
-            // Aligned window starting at or before the first unread row.
-            let start = (file_offset + next * row_bytes) & !(READ_ALIGN - 1);
-            let end = (start + READ_CHUNK as u64).min(shard_end.next_multiple_of(READ_ALIGN));
-            let want = (end - start) as usize;
-            if !self.wait_until_idle() || !self.acquire_tokens(want as u64) {
-                return Ok(None);
-            }
-            let dst = &mut buffer.as_mut_slice()[..want];
-            let mut filled = 0usize;
-            while filled < want {
-                let n = reader
-                    .read_at(start + filled as u64, &mut dst[filled..])
-                    .map_err(|e| format!("read at {}: {e}", start + filled as u64))?;
-                if n == 0 {
-                    break;
-                }
-                filled += n;
-            }
-            self.bytes_read.fetch_add(filled as u64, Ordering::Relaxed);
-            let available_end = start + filled as u64;
-            let rows_end = (available_end.saturating_sub(file_offset) / row_bytes).min(rows);
-            if rows_end <= next {
-                return Err(format!(
-                    "unexpected end of file at byte {available_end} (shard rows {next}..{rows})"
-                ));
-            }
-            let mut copied = 0u64;
-            {
-                let guard = self.read_tiers();
-                if guard.iter().all(Option::is_none) {
-                    return Ok(None);
-                }
-                for row in next..rows_end {
-                    let global = first_global + row;
-                    let tier = self.tier_of[usize::from(self.bucket[global as usize])];
-                    if tier == NO_TIER {
-                        continue;
-                    }
-                    let tier = usize::from(tier);
-                    debug_assert_eq!(cursors[tier], self.slot(global, tier), "cursor == slot");
-                    if let Some(buf) = &guard[tier] {
-                        let at = (file_offset + row * row_bytes - start) as usize;
-                        buf.write_row(
-                            cursors[tier] as usize * self.encoded_row_bytes,
-                            &dst[at..at + self.encoded_row_bytes],
-                        );
-                        copied += 1;
-                        copied_per_tier[tier] += row_bytes;
-                    }
-                    cursors[tier] += 1;
-                }
-                // Under the read lock: `release_lowest` reads the tier's
-                // count only under the write lock.
-                for (tier, bytes) in copied_per_tier.iter_mut().enumerate() {
-                    if *bytes > 0 {
-                        self.tier_filled[tier].fetch_add(*bytes, Ordering::AcqRel);
-                        self.filled.fetch_add(*bytes, Ordering::AcqRel);
-                        *bytes = 0;
-                    }
-                }
-            }
-            copied_total += copied;
-            next = rows_end;
-            *since_check += copied * row_bytes;
-            if *since_check >= params.pressure_interval_bytes {
-                *since_check = 0;
-                self.yield_under_pressure(params, pressure);
-            }
-        }
-        Ok(Some(copied_total))
-    }
-
-    /// Release the lowest tiers while host memory is below the floor.
-    fn yield_under_pressure(&self, params: &FillParams<'_>, pressure: &Mutex<()>) {
-        // One thread at a time: the next one re-reads availability after the
-        // previous release instead of releasing again for the same shortfall.
-        let _serial = pressure.lock().unwrap_or_else(|poison| poison.into_inner());
-        while (params.avail)().is_some_and(|available| available < params.floor_bytes) {
-            if self.release_lowest() == 0 {
-                break;
-            }
-        }
-    }
-}
-
-impl YieldFirst for HotRowStore {
-    fn release_one(&self) -> u64 {
-        self.release_lowest()
-    }
-}
-
-/// Open `path` for O_DIRECT reads, falling back to buffered reads on a
-/// filesystem that refuses the flag.
-fn open_direct(path: &Path) -> io::Result<File> {
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-    {
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
-            eprintln!("{TAG}: O_DIRECT unsupported on {}; using buffered reads", path.display());
-            File::open(path)
-        }
-        other => other,
     }
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use std::sync::Arc;
 
     /// A model "file" in memory.
     pub(crate) struct SliceReader(pub Vec<u8>);
@@ -1605,24 +1062,6 @@ pub(crate) mod test_support {
             dst[..n].copy_from_slice(&self.0[begin..begin + n]);
             Ok(n)
         }
-    }
-
-    /// Fill `store` from per-shard encoded bytes laid out at unaligned file
-    /// offsets, with a floor that never triggers.
-    pub(crate) fn fill_from_shards(store: &HotRowStore, shards: &[Vec<u8>]) -> Vec<u64> {
-        let (file, offsets) = layout_shards(shards);
-        store.fill_with(
-            &SliceReader(file),
-            &offsets,
-            &FillParams {
-                floor_bytes: 0,
-                pressure_interval_bytes: u64::MAX,
-                avail: &|| None,
-                io_read_bytes: &|| None,
-                adapt_interval: Duration::from_millis(20),
-            },
-        );
-        offsets
     }
 
     /// Concatenate shards behind a 13-byte prefix and 7 bytes of padding
@@ -1646,7 +1085,9 @@ pub(crate) mod test_support {
                 for r in 0..rows_per_shard {
                     let global = (s * rows_per_shard + r) as u64;
                     for i in 0..ENCODED_ROW_BYTES as u64 {
-                        bytes.push((global.wrapping_mul(0x9E37_79B9).wrapping_add(i * 31) >> 3) as u8);
+                        bytes.push(
+                            (global.wrapping_mul(0x9E37_79B9).wrapping_add(i * 31) >> 3) as u8,
+                        );
                     }
                 }
                 bytes
@@ -1671,469 +1112,346 @@ pub(crate) mod test_support {
         buckets
     }
 
+    /// Values per row of the test fixtures' Q8F16 rows ([`ENCODED_ROW_BYTES`] bytes).
+    pub(crate) const TEST_ROW_WIDTH: usize = 160;
+
     pub(crate) const FINGERPRINT: &str =
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// A model file and its hot-row pack on disk, and the opened store.
+    pub(crate) struct PackFixture {
+        pub dir: tempfile::TempDir,
+        pub model_path: PathBuf,
+        pub pack_path: PathBuf,
+        pub offsets: Vec<u64>,
+        pub buckets: Vec<u8>,
+        pub store: Arc<HotRowStore>,
+        pub worker: Option<JoinHandle<()>>,
+    }
+
+    impl PackFixture {
+        /// Write `shards` as a model file, pack its rows of buckets
+        /// `0..kept` (tiers of `group`) under a pseudo-random rank, open the
+        /// store and wait until its worker verified the pack.
+        pub(crate) fn new(
+            shards: &[Vec<u8>],
+            rows_per_shard: usize,
+            kept: usize,
+            group: usize,
+            seed: u64,
+        ) -> Self {
+            Self::with_encoding(
+                shards,
+                rows_per_shard,
+                kept,
+                group,
+                seed,
+                RowEncoding::Q8F16,
+                TEST_ROW_WIDTH,
+            )
+        }
+
+        /// [`PackFixture::new`] for shards of `encoding` rows of `row_width`
+        /// values (the shard bytes are opaque to the pack).
+        pub(crate) fn with_encoding(
+            shards: &[Vec<u8>],
+            rows_per_shard: usize,
+            kept: usize,
+            group: usize,
+            seed: u64,
+            encoding: RowEncoding,
+            row_width: usize,
+        ) -> Self {
+            let row_bytes = crate::ple_hot_pack::checked_row_bytes(encoding, row_width).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let (file, offsets) = layout_shards(shards);
+            let model_path = dir.path().join("model.mq4");
+            std::fs::write(&model_path, &file).unwrap();
+            let rows = shards.len() * rows_per_shard;
+            let buckets = synthetic_buckets(rows, seed);
+            let rank = PleHotRank::from_buckets(rows as u64, FINGERPRINT, buckets.clone());
+            let pack_path = dir.path().join("model.mq4.plehotrows");
+            crate::ple_hot_pack::write_pack_with(
+                &SliceReader(file.clone()),
+                file.len() as u64,
+                &offsets,
+                rows_per_shard,
+                encoding,
+                row_width,
+                FINGERPRINT,
+                &rank,
+                kept,
+                group,
+                &pack_path,
+                &mut |_, _| {},
+            )
+            .unwrap();
+            let store = HotRowStore::open(
+                rank,
+                &pack_path,
+                rows_per_shard,
+                encoding,
+                row_bytes,
+                &offsets,
+                file.len() as u64,
+            )
+            .unwrap();
+            let worker = store.spawn_worker(&model_path, offsets.clone());
+            while store.verified().is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(store.verified(), Some(true));
+            PackFixture {
+                dir,
+                model_path,
+                pack_path,
+                offsets,
+                buckets,
+                store,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for PackFixture {
+        fn drop(&mut self) {
+            self.store.stop();
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
     use super::*;
-    use std::sync::Arc;
 
     const ROWS_PER_SHARD: usize = 1000;
     const SHARDS: usize = 7;
     const ROWS: usize = ROWS_PER_SHARD * SHARDS;
 
-    /// A throttle that never limits in practice (adaptive on, so the rate
-    /// controller runs and must end with the fill).
-    fn fast_throttle() -> FillThrottle {
-        FillThrottle {
-            load_bytes_per_s: 1 << 40,
-            min_bytes_per_s: 1 << 30,
-            adaptive: true,
-        }
+    fn model_row(shards: &[Vec<u8>], row: u64) -> &[u8] {
+        let shard = row as usize / ROWS_PER_SHARD;
+        let local = row as usize % ROWS_PER_SHARD;
+        &shards[shard][local * ENCODED_ROW_BYTES..(local + 1) * ENCODED_ROW_BYTES]
     }
 
-    fn store(budget_fraction_256: u64, group: usize, seed: u64) -> Arc<HotRowStore> {
-        let rank = PleHotRank::from_buckets(ROWS as u64, FINGERPRINT, synthetic_buckets(ROWS, seed));
-        // Budget for `budget_fraction_256` buckets of the table.
-        let budget = ROWS as u64 * ENCODED_ROW_BYTES as u64 * budget_fraction_256 / 256 + 1;
-        HotRowStore::new_with_group(rank, budget, ROWS_PER_SHARD, ENCODED_ROW_BYTES, group).unwrap()
-    }
-
-    /// The fill's per-tier cursor equals `slot(row)` for every kept row (the
-    /// fill itself debug-asserts it per copy), slots are dense and unique per
-    /// tier, and every served row is the model file's bytes.
+    /// Every kept row's pack bytes are the model's bytes; rows of buckets the
+    /// pack does not keep have no pack offset.
     #[test]
-    fn slot_matches_fill_cursor_and_rows_are_the_file_bytes() {
-        let hot = store(200, 3, 7);
-        assert!(hot.tier_count() > 2);
+    fn pack_offsets_return_the_model_rows() {
         let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
-        fill_from_shards(&hot, &shards);
-        assert!(hot.fill_complete());
-
-        let mut seen: Vec<Vec<bool>> = hot.tier_rows.iter().map(|&n| vec![false; n as usize]).collect();
-        let guard = hot.read();
-        let mut served = 0usize;
-        for row in 0..ROWS as u64 {
-            let bucket = hot.bucket[row as usize] as usize;
-            let want = &shards[row as usize / ROWS_PER_SHARD]
-                [(row as usize % ROWS_PER_SHARD) * ENCODED_ROW_BYTES..][..ENCODED_ROW_BYTES];
-            if bucket < hot.kept_buckets() {
-                let tier = hot.tier_of_row(row).unwrap();
-                assert_eq!(tier, bucket / 3);
-                let slot = hot.slot(row, tier) as usize;
-                assert!(!seen[tier][slot], "slot {slot} of tier {tier} assigned twice");
-                seen[tier][slot] = true;
-                assert_eq!(hot.get(&guard, row), Some(want), "row {row}");
-                served += 1;
-            } else {
-                assert_eq!(hot.get(&guard, row), None, "cold row {row}");
-            }
-        }
-        assert!(served > 0);
-        assert!(seen.iter().flatten().all(|&used| used), "tier slots are dense");
-        // Rows are in ascending global order inside a tier.
-        for tier in 0..hot.tier_count() {
-            let mut previous = None;
-            for row in (0..ROWS as u64).filter(|&r| hot.tier_of_row(r) == Some(tier)) {
-                let slot = hot.slot(row, tier);
-                assert!(previous.map_or(true, |p| slot == p + 1));
-                previous = Some(slot);
-            }
-        }
-    }
-
-    /// A row of an unready shard is never served, a ready one is.
-    #[test]
-    fn unready_shards_and_released_tiers_serve_nothing() {
-        let hot = store(256, 4, 3);
-        let guard = hot.read();
-        assert!((0..ROWS as u64).all(|row| hot.get(&guard, row).is_none()));
-        drop(guard);
-        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
-        fill_from_shards(&hot, &shards);
-        let top = hot.tier_count() - 1;
-        let victim = (0..ROWS as u64).find(|&row| hot.tier_of_row(row) == Some(top)).unwrap();
-        let other = (0..ROWS as u64).find(|&row| hot.tier_of_row(row) == Some(0)).unwrap();
-        assert!(hot.get(&hot.read(), victim).is_some());
-        let before = hot.resident_bytes();
-        let freed = hot.release_lowest();
-        assert_eq!(freed, hot.tier_rows[top] * ENCODED_ROW_BYTES as u64);
-        assert_eq!(hot.resident_bytes(), before - freed);
-        assert_eq!(hot.released_tiers(), 1);
-        let guard = hot.read();
-        assert_eq!(hot.get(&guard, victim), None);
-        assert!(hot.get(&guard, other).is_some());
-        drop(guard);
-        let mut total = freed;
-        loop {
-            let bytes = hot.release_one();
-            if bytes == 0 {
-                break;
-            }
-            total += bytes;
-        }
-        assert_eq!(hot.resident_bytes(), 0);
-        assert_eq!(total, before);
-        assert_eq!(hot.release_lowest(), 0);
-    }
-
-    /// Budget arithmetic: K = floor(B/170*256/rows), tiers = ceil(K/G), and a
-    /// budget below one bucket is a 0-tier no-op store.
-    #[test]
-    fn budget_selects_kept_buckets_and_tiers() {
-        let rank = |seed| PleHotRank::from_buckets(ROWS as u64, FINGERPRINT, synthetic_buckets(ROWS, seed));
-        let row = ENCODED_ROW_BYTES as u64;
-        let small = HotRowStore::new(rank(1), row * ROWS as u64 / 256 - 1, ROWS_PER_SHARD, 170).unwrap();
-        assert_eq!((small.kept_buckets(), small.tier_count()), (0, 0));
-        assert_eq!(small.resident_bytes(), 0);
-        assert!(small.get(&small.read(), 0).is_none());
-        let full = HotRowStore::new(rank(1), u64::MAX / 2, ROWS_PER_SHARD, 170).unwrap();
-        assert_eq!(full.kept_buckets(), 256);
-        assert_eq!(full.tier_count(), 256usize.div_ceil(DEFAULT_TIER_BUCKETS));
-        assert_eq!(full.resident_bytes(), ROWS as u64 * row);
-        let geometry = HotRowStore::new(rank(1), 1 << 30, 999, 170);
-        assert!(geometry.is_err());
-        let row_size = HotRowStore::new(rank(1), 1 << 30, ROWS_PER_SHARD, 320);
-        assert!(row_size.is_err());
-    }
-
-    /// Host-memory pressure during the fill releases the lowest tiers.
-    #[test]
-    fn fill_yields_tiers_under_memory_pressure() {
-        let hot = store(256, 4, 11);
-        let tiers = hot.tier_count();
-        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
-        let (file, offsets) = layout_shards(&shards);
-        hot.fill_with(
-            &SliceReader(file),
-            &offsets,
-            &FillParams {
-                floor_bytes: 1 << 30,
-                pressure_interval_bytes: 1,
-                avail: &|| Some(0),
-                io_read_bytes: &|| None,
-                adapt_interval: Duration::from_millis(20),
-            },
-        );
-        assert_eq!(hot.released_tiers(), tiers);
-        assert_eq!(hot.resident_bytes(), 0);
-        assert!(!hot.fill_complete());
-        assert_eq!(hot.filled_bytes(), 0, "released tiers subtract what they held");
-    }
-
-    /// `stop` ends a fill without marking it complete.
-    #[test]
-    fn stop_halts_the_fill() {
-        let hot = store(128, 4, 5);
-        hot.stop();
-        fill_from_shards(&hot, &synthetic_shards(SHARDS, ROWS_PER_SHARD));
-        assert!(!hot.fill_complete());
-        let guard = hot.read();
-        assert!((0..ROWS as u64).all(|row| hot.get(&guard, row).is_none()));
-    }
-
-    /// `fit_to_headroom` releases lowest tiers until the unfilled bytes fit
-    /// the room left above the headroom, and nothing when they already fit.
-    #[test]
-    fn fit_to_headroom_releases_until_the_store_fits() {
-        let hot = store(256, 4, 19);
-        let total = hot.resident_bytes();
-        assert_eq!(hot.fit_to_headroom(total + 100, 100), 0);
-        let room = total / 2;
-        let released = hot.fit_to_headroom(room + 100, 100);
-        assert!(released > 0);
-        assert!(hot.resident_bytes() <= room);
-        assert_eq!(hot.released_tiers(), released);
-    }
-
-    /// Before any fetch the fill runs at once; a fetch pauses it while its
-    /// guard lives and for `BUSY_QUIET` after; a stop ends the pause.
-    #[test]
-    fn fill_waits_for_idle() {
-        let hot = store(128, 2, 17);
-        let started = Instant::now();
-        assert!(hot.wait_until_idle());
-        assert!(started.elapsed() < Duration::from_millis(100));
-
-        let held = Duration::from_millis(200);
-        let guard = hot.busy();
-        let started = Instant::now();
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(held);
-                drop(guard);
-            });
-            assert!(hot.wait_until_idle());
-        });
-        assert!(started.elapsed() >= held + BUSY_QUIET - Duration::from_millis(5));
-
-        let _guard = hot.busy();
-        hot.stop();
-        assert!(!hot.wait_until_idle());
-    }
-
-    /// `filled_bytes` is the copied bytes of the tiers still present: equal to
-    /// the resident bytes after a full fill, and reduced by each release.
-    #[test]
-    fn filled_bytes_tracks_the_fill_and_releases() {
-        let hot = store(256, 4, 13);
-        assert_eq!(hot.filled_bytes(), 0);
-        fill_from_shards(&hot, &synthetic_shards(SHARDS, ROWS_PER_SHARD));
-        assert!(hot.fill_complete());
-        assert_eq!(hot.filled_bytes(), ROWS as u64 * ENCODED_ROW_BYTES as u64);
-        assert_eq!(hot.filled_bytes(), hot.resident_bytes());
-        let freed = hot.release_lowest();
-        assert!(freed > 0);
-        assert_eq!(hot.filled_bytes(), hot.resident_bytes());
-        assert_eq!(hot.filled_bytes(), ROWS as u64 * ENCODED_ROW_BYTES as u64 - freed);
-        while hot.release_one() > 0 {}
-        assert_eq!(hot.filled_bytes(), 0);
-
-        let partial = store(100, 3, 17);
-        fill_from_shards(&partial, &synthetic_shards(SHARDS, ROWS_PER_SHARD));
-        assert_eq!(partial.filled_bytes(), partial.resident_bytes());
-        assert!(partial.filled_bytes() > 0);
-    }
-
-    /// The bucket grants no more than `rate` bytes per second (fake clock):
-    /// 5000 B at 1000 B/s take 5 s, the burst is capped, a rate change and a
-    /// zero rate apply at once.
-    #[test]
-    fn token_bucket_limits_the_rate() {
-        let mut bucket = BucketState::new(1000.0, 400.0);
-        let mut now = 0.0;
-        for _ in 0..50 {
-            loop {
-                match bucket.try_take(now, 100.0) {
-                    Take::Granted => break,
-                    Take::Wait(seconds) => {
-                        assert!(seconds > 0.0 && seconds <= 0.1 + 1e-9, "{seconds}");
-                        now += seconds;
+        for (kept, group) in [(100, 5), (256, 4), (7, 2)] {
+            let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, kept, group, 41);
+            let store = &fixture.store;
+            assert_eq!(store.kept_buckets(), kept);
+            assert_eq!(store.tier_count(), kept.div_ceil(group));
+            let mut held = 0u64;
+            let mut bytes = vec![0u8; ENCODED_ROW_BYTES];
+            for row in 0..ROWS as u64 {
+                match store.pack_offset(row) {
+                    Some(offset) => {
+                        assert!(usize::from(fixture.buckets[row as usize]) < kept);
+                        store.read_pack(offset, &mut bytes).unwrap();
+                        assert_eq!(bytes, model_row(&shards, row), "row {row}");
+                        held += 1;
                     }
-                    Take::Blocked => panic!("blocked at a positive rate"),
+                    None => assert!(usize::from(fixture.buckets[row as usize]) >= kept),
                 }
             }
+            assert_eq!(held * ENCODED_ROW_BYTES as u64, store.data_bytes());
+            assert_eq!(store.pack_offset(ROWS as u64), None);
         }
-        assert!((now - 5.0).abs() < 1e-6, "5000 B at 1000 B/s took {now} s");
-
-        // Idle for a long time: the balance is capped at the burst.
-        now += 100.0;
-        assert_eq!(bucket.try_take(now, 400.0), Take::Granted);
-        assert_eq!(bucket.try_take(now, 100.0), Take::Wait(0.1));
-        // A request above the burst is clamped to it instead of waiting forever.
-        now += 100.0;
-        assert_eq!(bucket.try_take(now, 10_000.0), Take::Granted);
-
-        // Rate change: a larger rate shortens the wait; zero blocks.
-        bucket.set_rate(now, 2000.0);
-        assert_eq!(bucket.try_take(now, 100.0), Take::Wait(0.05));
-        bucket.set_rate(now, 0.0);
-        assert_eq!(bucket.try_take(now + 50.0, 100.0), Take::Blocked);
     }
 
-    /// The adaptive rule: ramp +25% while the load reads at pace, halve (down
-    /// to the floor) when it falls under 85% of its peak, hold while it is
-    /// not reading.
+    /// Reads outside the pack's row region are refused.
     #[test]
-    fn adaptive_rate_ramps_halves_and_holds() {
-        let (min, max) = (200e6, 800e6);
-        let mut rate = AdaptiveRate::new(min, min, max);
-        assert_eq!(rate.step(1.4e9), 250e6);
-        let mut previous = 250e6;
-        for _ in 0..20 {
-            let next = rate.step(1.4e9);
-            assert!(next >= previous && next <= max);
-            previous = next;
-        }
-        assert_eq!(previous, max, "ramp stops at the ceiling");
-        // Slowed but still reading: halve.
-        assert_eq!(rate.step(1.0e9), 400e6);
-        // Within 85% of the peak: ramp again.
-        assert_eq!(rate.step(1.3e9), 500e6);
-        // Not reading (GPU upload phase): hold, however low.
-        assert_eq!(rate.step(50e6), 500e6);
-        assert_eq!(rate.step(0.0), 500e6);
-        // Persistently slowed: halve to the floor, never below.
-        for _ in 0..6 {
-            rate.step(0.5e9);
-        }
-        assert_eq!(rate.rate, min);
-    }
-
-    /// A throttled fill reads no faster than its rate.
-    #[test]
-    fn throttled_fill_respects_the_rate() {
-        let hot = store(256, 4, 19);
+    fn read_pack_is_bounded_to_the_rows() {
         let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
-        let rate = 4_000_000u64;
-        hot.configure_throttle(FillThrottle {
-            load_bytes_per_s: rate,
-            min_bytes_per_s: rate,
-            adaptive: false,
-        });
-        let started = Instant::now();
-        let (file, offsets) = layout_shards(&shards);
-        let none = || -> Option<u64> { None };
-        hot.fill_with(
-            &SliceReader(file),
-            &offsets,
-            &FillParams {
-                floor_bytes: 0,
-                pressure_interval_bytes: u64::MAX,
-                avail: &none,
-                io_read_bytes: &none,
-                adapt_interval: Duration::from_millis(20),
-            },
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 64, 5, 3);
+        let store = &fixture.store;
+        let mut bytes = vec![0u8; ENCODED_ROW_BYTES];
+        assert!(
+            store.read_pack(0, &mut bytes).is_err(),
+            "header bytes are not rows"
         );
-        let elapsed = started.elapsed().as_secs_f64();
-        let bytes = hot.bytes_read.load(Ordering::Relaxed) as f64;
-        assert!(hot.fill_complete());
-        assert!(bytes > 1.0e6, "{bytes}");
-        // The bucket starts empty: every byte read was granted by the rate.
-        assert!(elapsed >= 0.95 * bytes / rate as f64, "{bytes} B in {elapsed} s at {rate} B/s");
-        assert_eq!(hot.filled_bytes(), hot.resident_bytes());
+        let end = store.data_offset + store.data_bytes();
+        assert!(store.read_pack(end - 10, &mut bytes).is_err());
+        assert!(store
+            .read_pack(end - ENCODED_ROW_BYTES as u64, &mut bytes)
+            .is_ok());
     }
 
-    /// A 0-rate fill reads nothing until `release_throttle`, then completes;
-    /// releasing twice is harmless.
+    /// A pack cut from another rank, another model size, or other shard
+    /// offsets is refused at open.
     #[test]
-    fn release_throttle_unblocks_a_zero_rate_fill() {
-        let hot = store(256, 4, 23);
-        hot.configure_throttle(FillThrottle {
-            load_bytes_per_s: 0,
-            min_bytes_per_s: 200_000_000,
-            adaptive: true,
-        });
+    fn open_refuses_a_pack_from_another_rank_or_model() {
         let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
-        let (file, offsets) = layout_shards(&shards);
-        let reader = SliceReader(file);
-        let none = || -> Option<u64> { None };
-        let params = FillParams {
-            floor_bytes: 0,
-            pressure_interval_bytes: u64::MAX,
-            avail: &none,
-            io_read_bytes: &none,
-            adapt_interval: Duration::from_millis(20),
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 64, 5, 3);
+        let model_bytes = std::fs::metadata(&fixture.model_path).unwrap().len();
+        let other_rank =
+            || PleHotRank::from_buckets(ROWS as u64, FINGERPRINT, synthetic_buckets(ROWS, 99));
+        let same_rank =
+            || PleHotRank::from_buckets(ROWS as u64, FINGERPRINT, fixture.buckets.clone());
+        let open = |rank, offsets: &[u64], bytes| {
+            HotRowStore::open(
+                rank,
+                &fixture.pack_path,
+                ROWS_PER_SHARD,
+                RowEncoding::Q8F16,
+                ENCODED_ROW_BYTES,
+                offsets,
+                bytes,
+            )
         };
-        std::thread::scope(|scope| {
-            let fill = scope.spawn(|| hot.fill_with(&reader, &offsets, &params));
-            std::thread::sleep(Duration::from_millis(200));
-            assert_eq!(hot.bytes_read.load(Ordering::Relaxed), 0, "no read before release");
-            assert_eq!(hot.filled_bytes(), 0);
-            assert!(!hot.fill_complete());
-            hot.release_throttle();
-            fill.join().unwrap();
-        });
-        hot.release_throttle();
-        assert!(hot.fill_complete());
-        assert_eq!(hot.filled_bytes(), ROWS as u64 * ENCODED_ROW_BYTES as u64);
+        assert!(open(same_rank(), &fixture.offsets, model_bytes).is_ok());
+        assert!(open(other_rank(), &fixture.offsets, model_bytes).is_err());
+        assert!(open(same_rank(), &fixture.offsets, model_bytes + 1).is_err());
+        let mut moved = fixture.offsets.clone();
+        moved[1] += 1;
+        assert!(open(same_rank(), &moved, model_bytes).is_err());
     }
 
-    fn write_rank(path: &Path, buckets: &[u8]) {
-        write_ple_hot_rank(
-            path,
-            buckets.len() as u64,
-            FINGERPRINT,
-            buckets,
-            serde_json::json!({"window_tokens": 8192, "generator": "test"}),
+    /// A pack whose row encoding or row size differs from the row store's is
+    /// refused at open.
+    #[test]
+    fn open_refuses_a_pack_of_another_row_encoding_or_size() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 64, 5, 3);
+        let model_bytes = std::fs::metadata(&fixture.model_path).unwrap().len();
+        let open = |encoding, row_bytes| {
+            HotRowStore::open(
+                PleHotRank::from_buckets(ROWS as u64, FINGERPRINT, fixture.buckets.clone()),
+                &fixture.pack_path,
+                ROWS_PER_SHARD,
+                encoding,
+                row_bytes,
+                &fixture.offsets,
+                model_bytes,
+            )
+        };
+        let store = open(RowEncoding::Q8F16, ENCODED_ROW_BYTES).unwrap();
+        assert_eq!(store.encoding(), RowEncoding::Q8F16);
+        assert_eq!(store.encoded_row_bytes(), ENCODED_ROW_BYTES);
+        // Right size, wrong encoding.
+        let err = open(RowEncoding::Bf16, ENCODED_ROW_BYTES).err().unwrap();
+        assert!(err.contains("row store"), "{err}");
+        // Right encoding, wrong size.
+        let err = open(RowEncoding::Q8F16, 160).err().unwrap();
+        assert!(err.contains("row store"), "{err}");
+        let err = open(RowEncoding::Q8F16, 0).err().unwrap();
+        assert!(err.contains("row store"), "{err}");
+        // A BF16 row store of 160 values is 320 B rows: not this pack either.
+        assert!(open(RowEncoding::Bf16, 2 * TEST_ROW_WIDTH).is_err());
+    }
+
+    /// A pack whose rows were altered after it was written fails the spot
+    /// check and never serves.
+    #[test]
+    fn a_corrupted_pack_fails_verification_and_serves_nothing() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 256, 4, 5);
+        // Flip one byte in every row of the pack.
+        let header = read_ple_hot_pack_header(&fixture.pack_path).unwrap();
+        let mut bytes = std::fs::read(&fixture.pack_path).unwrap();
+        for row in 0..(header.data_bytes / ENCODED_ROW_BYTES as u64) {
+            bytes[(header.data_offset + row * ENCODED_ROW_BYTES as u64) as usize] ^= 0x5A;
+        }
+        std::fs::write(&fixture.pack_path, &bytes).unwrap();
+        let rank = PleHotRank::from_buckets(ROWS as u64, FINGERPRINT, fixture.buckets.clone());
+        let model_bytes = std::fs::metadata(&fixture.model_path).unwrap().len();
+        let store = HotRowStore::open(
+            rank,
+            &fixture.pack_path,
+            ROWS_PER_SHARD,
+            RowEncoding::Q8F16,
+            ENCODED_ROW_BYTES,
+            &fixture.offsets,
+            model_bytes,
         )
         .unwrap();
+        assert!(!store.is_serving());
+        assert_eq!(
+            store.pack_offset(0),
+            None,
+            "nothing is served before verification"
+        );
+        store
+            .spawn_worker(&fixture.model_path, fixture.offsets.clone())
+            .join()
+            .unwrap();
+        assert_eq!(store.verified(), Some(false));
+        assert!((0..ROWS as u64).all(|row| store.pack_offset(row).is_none()));
     }
 
-    /// Sidecar round trip, plus rejection of a bad fingerprint, row count,
-    /// magic, truncation, and a payload whose sha does not match.
+    /// The prewarm waits for a budget, reads exactly that many bytes, and
+    /// pauses while a fetch is in flight.
+    #[test]
+    fn prewarm_reads_its_budget_while_idle() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 200, 5, 8);
+        let store = &fixture.store;
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(store.prewarmed_bytes(), 0, "no budget, no prewarm");
+        let guard = store.busy();
+        let budget = store.data_bytes() / 2;
+        store.set_prewarm_budget(budget);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            store.prewarmed_bytes(),
+            0,
+            "a fetch in flight pauses the prewarm"
+        );
+        drop(guard);
+        // Resumes BUSY_QUIET after the fetch; wait it out.
+        let deadline = Instant::now() + BUSY_QUIET + Duration::from_secs(10);
+        while !store.prewarm_complete() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(store.prewarm_complete());
+        assert_eq!(store.prewarmed_bytes(), budget);
+    }
+
+    /// `stop` ends a worker that is still waiting for its budget.
+    #[test]
+    fn stop_ends_the_worker() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let mut fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 32, 4, 2);
+        fixture.store.stop();
+        fixture.worker.take().unwrap().join().unwrap();
+        assert!(!fixture.store.prewarm_complete());
+    }
+
     #[test]
     fn sidecar_round_trip_and_rejections() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("m.mq4.plehot");
-        let buckets = synthetic_buckets(ROWS, 9);
-        write_rank(&path, &buckets);
-        assert!(!dir.path().read_dir().unwrap().any(|e| {
-            e.unwrap().file_name().to_string_lossy().contains(".tmp.")
-        }));
-
+        let path = dir.path().join("m.plehot");
+        let buckets = synthetic_buckets(ROWS, 7);
+        write_ple_hot_rank(
+            &path,
+            ROWS as u64,
+            FINGERPRINT,
+            &buckets,
+            serde_json::json!({"k": 1}),
+        )
+        .unwrap();
         let rank = PleHotRank::open(&path, ROWS as u64, FINGERPRINT).unwrap();
-        assert_eq!(rank.padded_rows(), ROWS as u64);
         assert_eq!(rank.buckets(), buckets.as_slice());
-        assert_eq!(rank.header()["rank"]["generator"], "test");
-        assert_eq!(rank.header()["version"], 1);
+        assert_eq!(rank.header()["rank"]["k"], 1);
         rank.verify().unwrap();
-        assert!(PleHotRank::open(&path, ROWS as u64, &FINGERPRINT.to_ascii_uppercase()).is_ok());
-
-        let other = "ff".repeat(32);
-        let error = PleHotRank::open(&path, ROWS as u64, &other).err().unwrap();
-        assert!(error.contains("fingerprint"), "{error}");
-        let error = PleHotRank::open(&path, ROWS as u64 + 1, FINGERPRINT).err().unwrap();
-        assert!(error.contains("padded_rows"), "{error}");
-
-        let raw = std::fs::read(&path).unwrap();
-        let tampered = dir.path().join("tampered.plehot");
-        let mut bad = raw.clone();
-        *bad.last_mut().unwrap() ^= 1;
-        std::fs::write(&tampered, &bad).unwrap();
-        let rank = PleHotRank::open(&tampered, ROWS as u64, FINGERPRINT).unwrap();
-        assert!(rank.verify().unwrap_err().contains("sha256"));
-
-        let magic = dir.path().join("magic.plehot");
-        let mut bad = raw.clone();
-        bad[0] = b'X';
-        std::fs::write(&magic, &bad).unwrap();
-        assert!(PleHotRank::open(&magic, ROWS as u64, FINGERPRINT).err().unwrap().contains("magic"));
-
-        let short = dir.path().join("short.plehot");
-        std::fs::write(&short, &raw[..raw.len() - 1]).unwrap();
-        assert!(PleHotRank::open(&short, ROWS as u64, FINGERPRINT).is_err());
-
-        assert!(write_ple_hot_rank(&path, ROWS as u64 + 1, FINGERPRINT, &buckets, serde_json::json!({})).is_err());
-        assert!(write_ple_hot_rank(&path, ROWS as u64, "xyz", &buckets, serde_json::json!({})).is_err());
-    }
-
-    /// Through the real thread + file path: a tampered sidecar releases the
-    /// whole store, a good one fills it with the model file's bytes.
-    #[test]
-    fn spawn_fill_verifies_sha_and_reads_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let buckets = synthetic_buckets(ROWS, 21);
-        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
-        let (file_bytes, offsets) = layout_shards(&shards);
-        let model = dir.path().join("model.bin");
-        std::fs::write(&model, &file_bytes).unwrap();
-        let budget = ROWS as u64 * ENCODED_ROW_BYTES as u64 * 100 / 256;
-
-        let good = dir.path().join("good.plehot");
-        write_rank(&good, &buckets);
-        let rank = PleHotRank::open(&good, ROWS as u64, FINGERPRINT).unwrap();
-        let hot = HotRowStore::new_with_group(rank, budget, ROWS_PER_SHARD, 170, 4).unwrap();
-        hot.spawn_fill(&model, offsets.clone(), 0, fast_throttle()).join().unwrap();
-        assert_eq!(hot.sha_verified(), Some(true));
-        assert!(hot.fill_complete());
-        let guard = hot.read();
-        let mut served = 0;
-        for row in 0..ROWS as u64 {
-            if let Some(bytes) = hot.get(&guard, row) {
-                let r = row as usize;
-                let want = &shards[r / ROWS_PER_SHARD][(r % ROWS_PER_SHARD) * 170..][..170];
-                assert_eq!(bytes, want);
-                served += 1;
-            }
-        }
-        drop(guard);
-        assert!(served > 0);
-
-        let bad = dir.path().join("bad.plehot");
-        let mut raw = std::fs::read(&good).unwrap();
-        *raw.last_mut().unwrap() ^= 0x40;
-        std::fs::write(&bad, &raw).unwrap();
-        let rank = PleHotRank::open(&bad, ROWS as u64, FINGERPRINT).unwrap();
-        let hot = HotRowStore::new_with_group(rank, budget, ROWS_PER_SHARD, 170, 4).unwrap();
-        assert!(hot.tier_count() > 0);
-        hot.spawn_fill(&model, offsets, 0, fast_throttle()).join().unwrap();
-        assert_eq!(hot.sha_verified(), Some(false));
-        assert!(!hot.fill_complete());
-        assert_eq!(hot.resident_bytes(), 0);
-        assert!((0..ROWS as u64).all(|row| hot.get(&hot.read(), row).is_none()));
+        assert!(PleHotRank::open(&path, ROWS as u64 + 1, FINGERPRINT).is_err());
+        let other = FINGERPRINT.replace('0', "f");
+        assert!(PleHotRank::open(&path, ROWS as u64, &other).is_err());
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let tampered = PleHotRank::open(&path, ROWS as u64, FINGERPRINT).unwrap();
+        assert!(tampered.verify().is_err());
+        bytes.pop();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(PleHotRank::open(&path, ROWS as u64, FINGERPRINT).is_err());
     }
 }

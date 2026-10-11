@@ -30,7 +30,7 @@ use hipfire_runtime::sampler::{
 };
 use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::session_cache::{
-    memory_fits, SessionCache, SessionRoute, SessionState, SnapshotParts, StateLayout, YieldFirst,
+    SessionCache, SessionRoute, SessionState, SnapshotParts, StateLayout,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -222,10 +222,10 @@ pub struct Qwen4Bundle {
     /// Prefill snapshot cache shared by every session (`attach_session_cache`);
     /// `None` = off.
     session: Option<SessionCache>,
-    /// PLE hot-row store and its fill thread (`attach_ple_hot_store`); `None`
-    /// = off. Dropping it stops and joins the fill; `free_gpu` does so before
-    /// the row store unloads.
-    ple_hot: Option<PleHotFill>,
+    /// PLE hot-row store and its worker thread (`attach_ple_hot_store`);
+    /// `None` = off. Dropping it stops and joins the worker; `free_gpu` does
+    /// so before the row store unloads.
+    ple_hot: Option<PleHotWorker>,
     /// Committed live state kept for a continuation of the same conversation
     /// (`session_commit_live`); `None` = none. Cleared by `reset`,
     /// `session_clear`, `session_commit` and `session_begin` (it is consumed
@@ -1829,53 +1829,34 @@ impl Qwen4Bundle {
     /// snapshots until the growth through `end_position` fits: the cache
     /// never causes a context allocation to fail.
     pub(crate) fn release_session_for_growth(&mut self, gpu: &mut Gpu, end_position: usize) {
-        if end_position <= self.state.mapped_context_tokens() {
-            return;
-        }
-        if self.session.is_none() && self.ple_hot.is_none() {
+        if self.session.is_none() || end_position <= self.state.mapped_context_tokens() {
             return;
         }
         let (context, gather) = self.context_growth_bytes(gpu, end_position);
-        let need = context.saturating_add(gather);
-        // The PLE hot-row store yields first, lowest-ranked tier first: its
-        // rows are re-readable from the model file, a snapshot is not.
-        if let Some(hot) = self.ple_hot.as_ref() {
-            while memory_fits(gpu, need) == Some(false) && hot.store().release_lowest() > 0 {}
-        }
         if let Some(cache) = self.session.as_mut() {
-            cache.release_for(gpu, need);
+            cache.release_for(gpu, context.saturating_add(gather));
         }
     }
 
-    /// Attach the PLE hot-row store and its fill thread: the row store serves
-    /// hot rows from it, and the session cache (already attached, or attached
-    /// later) and context growth release its tiers before evicting snapshots.
-    /// A geometry mismatch is logged and the store is dropped (stopped and
-    /// joined).
-    pub fn attach_ple_hot_store(&mut self, hot: PleHotFill) {
+    /// Attach the PLE hot-row store and its worker thread: the row store reads
+    /// the rows its pack holds from the pack.  A geometry mismatch is logged
+    /// and the store is dropped (stopped and joined).
+    pub fn attach_ple_hot_store(&mut self, hot: PleHotWorker) {
         if let Err(error) = self.ple_rows.attach_hot_store(hot.store().clone()) {
             eprintln!("  qwen4 ple hot store: not attached to the row store ({error})");
             return;
-        }
-        if let Some(cache) = self.session.as_mut() {
-            cache.set_yield_first(Some(hot.store().clone() as std::sync::Arc<dyn YieldFirst>));
         }
         self.ple_hot = Some(hot);
     }
 
     /// The attached PLE hot-row store, if any.
     pub fn ple_hot_store(&self) -> Option<&std::sync::Arc<HotRowStore>> {
-        self.ple_hot.as_ref().map(PleHotFill::store)
+        self.ple_hot.as_ref().map(PleHotWorker::store)
     }
 
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
-    /// then restores and captures whole-chunk snapshots through it. With a
-    /// PLE hot-row store attached the cache's memory guard releases its tiers
-    /// before evicting snapshots.
-    pub fn attach_session_cache(&mut self, mut cache: SessionCache) {
-        if let Some(hot) = self.ple_hot.as_ref() {
-            cache.set_yield_first(Some(hot.store().clone() as std::sync::Arc<dyn YieldFirst>));
-        }
+    /// then restores and captures whole-chunk snapshots through it.
+    pub fn attach_session_cache(&mut self, cache: SessionCache) {
         self.session = Some(cache);
     }
 
@@ -2266,8 +2247,8 @@ impl Qwen4Bundle {
             lanes,
             ..
         } = self;
-        // The hot-row store's fill reads the model file and writes the tiers:
-        // stop and join it before the row store unloads.
+        // The hot-row store's worker reads the pack and the model file: stop
+        // and join it before the row store unloads.
         drop(ple_hot);
         if let Some(mut session) = session {
             session.clear(gpu);
@@ -2489,12 +2470,17 @@ fn validate_ple_metadata(metadata: &PleHashMetadata) -> Result<(), BundleError> 
     Ok(())
 }
 
-/// Inputs of the PLE hot-row store's fill, resolved before the weight sweep
-/// from the manifest and the source index (no descriptors exist yet).
+/// Inputs of the PLE hot-row store, resolved before the weight sweep from the
+/// manifest and the source index (no descriptors exist yet).
 pub struct PleHotPlan {
     /// Absolute file offset of each PLE shard's first row, in shard order.
     pub shard_offsets: Vec<u64>,
     pub rows_per_shard: usize,
+    /// Row encoding of the PLE shards (Q8F16 today: `ple_hot_plan` returns
+    /// `None` for any other).
+    pub row_encoding: RowEncoding,
+    /// Values per PLE row.
+    pub row_width: usize,
     pub encoded_row_bytes: usize,
     pub padded_rows: u64,
     /// Lowercase hex of [`PleHashMetadata::fingerprint`], the sidecar's key.
@@ -2541,21 +2527,23 @@ pub fn ple_hot_plan(
     Ok(Some(PleHotPlan {
         shard_offsets,
         rows_per_shard: PLE_SHARD_ROWS,
+        row_encoding: RowEncoding::Q8F16,
+        row_width: PLE_ROW_WIDTH,
         encoded_row_bytes: q8_row_bytes,
         padded_rows: metadata.padded_rows(),
         fingerprint_hex,
     }))
 }
 
-/// A running PLE hot-row store and its fill thread. Dropping stops the fill
-/// and joins it (the fill holds its own `Arc`, so the store would otherwise
-/// keep filling), so every load error path and unload quiesces it.
-pub struct PleHotFill {
+/// A PLE hot-row store and its worker thread (verification, then prewarm).
+/// Dropping stops the worker and joins it (the worker holds its own `Arc`),
+/// so every load error path and unload quiesces it.
+pub struct PleHotWorker {
     store: std::sync::Arc<HotRowStore>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl PleHotFill {
+impl PleHotWorker {
     pub fn new(store: std::sync::Arc<HotRowStore>, handle: std::thread::JoinHandle<()>) -> Self {
         Self {
             store,
@@ -2568,7 +2556,7 @@ impl PleHotFill {
     }
 }
 
-impl Drop for PleHotFill {
+impl Drop for PleHotWorker {
     fn drop(&mut self) {
         self.store.stop();
         if let Some(handle) = self.handle.take() {

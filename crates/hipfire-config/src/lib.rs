@@ -1611,7 +1611,7 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_HOT_STORE_BYTES",
-        "Byte budget of the Qwen4 PLE hot-row store (frequency-ranked rows of the per-layer-embedding table kept in host RAM, served without SSD reads; unified-memory GPUs only, needs the `<model>.plehot` sidecar). Default 0 (off). `auto` uses 32 GB on a unified-memory GPU with a Qwen4 Q8F16 model and a sidecar present, else off. A budget is also capped by free host RAM at load, and the store yields to context growth and the session cache."
+        "Prewarm budget of the Qwen4 PLE hot-row store (bytes of the frequency-ranked `<model>.plehotrows` hot-row pack read into the page cache after load; rows the pack holds are read from it, everything else from the model file; unified-memory GPUs only, needs the `<model>.plehot` sidecar and the pack from `hipfire-quantize ple-hot-pack`). Default 0 (off). `auto` prewarms MemAvailable minus 4 GiB at ready, capped at the pack. The pack's pages are ordinary reclaimable page cache: they are dropped, never swapped, under memory pressure."
     ),
     process_bool_field!(
         "memory.prompt_cache_unbounded",
@@ -6758,12 +6758,12 @@ pub mod memory {
             .unwrap_or(8589934592)
     }
 
-    /// Budget request of the PLE hot-row store (`memory.ple_hot_store_bytes`,
-    /// compat env `HIPFIRE_PLE_HOT_STORE_BYTES`).
+    /// Prewarm budget request of the PLE hot-row store
+    /// (`memory.ple_hot_store_bytes`, compat env `HIPFIRE_PLE_HOT_STORE_BYTES`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum PleHotStoreBudget {
-        /// `auto`: the carrier picks the budget when the device, model and
-        /// sidecar allow it.
+        /// `auto`: the carrier picks the budget from `MemAvailable` when the
+        /// device, model, sidecar and pack allow it.
         Auto,
         /// An explicit byte budget; `0` (the default) is off.
         Bytes(u64),
@@ -6797,32 +6797,19 @@ pub mod memory {
             .filter(|v| !v.trim().is_empty())
     }
 
-    /// PLE hot-store fill diagnostics on stderr (`HIPFIRE_PLE_HOT_DEBUG=1`,
-    /// developer variable).
+    /// Optional override of the PLE hot-row pack path
+    /// (`HIPFIRE_PLE_HOT_PACK_FILE`); empty or unset means
+    /// `<model>.plehotrows`.
+    pub fn ple_hot_pack_file() -> Option<String> {
+        developer_var("HIPFIRE_PLE_HOT_PACK_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// PLE fetch timing on stderr, one line per prefill-chunk fetch
+    /// (`HIPFIRE_PLE_HOT_DEBUG=1`, developer variable).
     pub fn ple_hot_debug() -> bool {
         developer_var("HIPFIRE_PLE_HOT_DEBUG").is_ok_and(|v| v == "1")
-    }
-
-    /// Default PLE hot-store fill rate during the model load (bytes/s): 0,
-    /// the fill starts once the model is ready.  A throttled fill during
-    /// the load measured load 53 s → 63–213 s on Halo (gfx1151).
-    pub const PLE_HOT_FILL_LOAD_RATE_DEFAULT: u64 = 0;
-
-    /// Pure parser behind [`ple_hot_fill_load_rate`]: unset, empty and
-    /// unparseable values give the default; `0` is a valid value.
-    pub fn parse_ple_hot_fill_load_rate(raw: Option<&str>) -> u64 {
-        raw.map(str::trim)
-            .filter(|v| !v.is_empty())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(PLE_HOT_FILL_LOAD_RATE_DEFAULT)
-    }
-
-    /// Rate (bytes/s) at which the PLE hot-store fill may read the model file
-    /// while the model is still loading (`HIPFIRE_PLE_HOT_FILL_LOAD_RATE`,
-    /// developer variable); `0` starts the fill only after the load. The
-    /// fill is unthrottled once the model is ready.
-    pub fn ple_hot_fill_load_rate() -> u64 {
-        parse_ple_hot_fill_load_rate(developer_var("HIPFIRE_PLE_HOT_FILL_LOAD_RATE").ok().as_deref())
     }
 
     /// Which engine executes the ops that read a spilled layer's weights
@@ -7011,16 +6998,6 @@ pub mod memory {
             assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
             assert!(matches!(field.parse_cli("auto"), Ok(crate::ConfigValue::String(_))));
             assert!(matches!(field.parse_cli("42"), Ok(crate::ConfigValue::Integer(42))));
-        }
-
-        #[test]
-        fn ple_hot_fill_load_rate_parse() {
-            assert_eq!(parse_ple_hot_fill_load_rate(None), 0);
-            assert_eq!(parse_ple_hot_fill_load_rate(Some("")), 0);
-            assert_eq!(parse_ple_hot_fill_load_rate(Some("junk")), 0);
-            assert_eq!(parse_ple_hot_fill_load_rate(Some("800000000")), 800_000_000);
-            assert_eq!(parse_ple_hot_fill_load_rate(Some("0")), 0);
-            assert_eq!(parse_ple_hot_fill_load_rate(Some(" 1500000000 ")), 1_500_000_000);
         }
 
         #[test]

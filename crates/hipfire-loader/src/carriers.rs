@@ -57,46 +57,33 @@ fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
     hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
 }
 
-/// Auto budget of the Qwen4 PLE hot-row store (`memory.ple_hot_store_bytes =
-/// auto`) before the host-RAM cap.
-const PLE_HOT_AUTO_BUDGET_BYTES: u64 = 32_000_000_000;
-/// Host RAM the store never takes (budget = available now - planned load -
-/// this).
-const PLE_HOT_LOAD_RESERVE_BYTES: u64 = 6 << 30;
-/// Host RAM the load takes beyond its weights (state, workspaces, runtime),
-/// added to the planned load.
-const PLE_HOT_STATE_BYTES: u64 = 4 << 30;
-/// `MemAvailable` (without the TTM pool estimate) below which the fill stops
-/// and releases tiers, so a full store keeps at least this much headroom.
-const PLE_HOT_FILL_FLOOR_BYTES: u64 = 4 << 30;
-/// Lowest rate (bytes/s) the adaptive fill throttle backs off to while the
-/// weight sweep is reading.
-const PLE_HOT_FILL_MIN_RATE: u64 = 200_000_000;
+/// `MemAvailable` the automatic prewarm of the PLE hot-row pack leaves at
+/// ready (`memory.ple_hot_store_bytes = auto`: budget = `MemAvailable` - this,
+/// capped at the pack). The pack's pages are clean page cache, counted in
+/// `MemAvailable` and dropped (never swapped) under pressure; the reserve
+/// covers what a request allocates without first reclaiming prewarmed pages.
+const PLE_HOT_PREWARM_RESERVE_BYTES: u64 = 4 << 30;
 
-/// Start the PLE hot-row store before the weight sweep. By default its fill
-/// reads nothing until the model is ready (`HIPFIRE_PLE_HOT_FILL_LOAD_RATE`
-/// = 0; a throttled fill during the load measured load 53 s → 63–213 s on
-/// Halo, an unthrottled one 50.7 s → 82–130 s). The caller
-/// attaches the result to the bundle after assembly and calls
-/// `release_throttle` once the model is ready; dropping it stops and joins
-/// the fill, so every load error path quiesces it.
+/// Open the PLE hot-row store before the weight sweep: the `<model>.plehot`
+/// rank sidecar and the `<model>.plehotrows` hot-row pack cut from it
+/// (`hipfire-quantize ple-hot-pack`). Its worker verifies the pack against
+/// the model during the load; the row store reads the pack's rows from the
+/// pack once verified. The caller attaches the result to the bundle after
+/// assembly and sets the prewarm budget once the model is ready; dropping it
+/// stops and joins the worker, so every load error path quiesces it.
 ///
-/// `None` = off: the kill switch (`0`), a non-unified-memory GPU, an HFQ
-/// overlay, non-Q8F16 PLE shards, a missing or unusable sidecar, or no host
-/// RAM to spare. `auto` is silent when it does not apply; an explicit budget
-/// says why not. Budget = min(configured, host available now - planned load -
-/// reserve), where the planned load is the index size of every non-external
-/// weight the load places plus a fixed state allowance.
+/// `None` = off: the kill switch (`0`, the default), a non-unified-memory
+/// GPU, an HFQ overlay, non-Q8F16 PLE shards, or a missing or unusable
+/// sidecar or pack. `auto` is silent when it does not apply; an explicit
+/// budget says why not.
 fn start_ple_hot_store(
     uma: bool,
     hfq: &hipfire_runtime::hfq::HfqFile,
     manifest: &hipfire_arch_qwen4::weights::Qwen4Manifest,
     metadata: &hipfire_arch_qwen4::ple::PleHashMetadata,
     model_path: &str,
-) -> Option<hipfire_arch_qwen4::bundle::PleHotFill> {
+) -> Option<hipfire_arch_qwen4::bundle::PleHotWorker> {
     use hipfire_config::memory::PleHotStoreBudget;
-    use hipfire_runtime::weight_manifest::ShardPolicy;
-    const MIB: u64 = 1 << 20;
     let started = std::time::Instant::now();
     let explicit = match hipfire_config::memory::ple_hot_store_bytes() {
         PleHotStoreBudget::Bytes(0) => return None,
@@ -132,46 +119,24 @@ fn start_ple_hot_store(
     let sidecar = hipfire_config::memory::ple_hot_rank_file()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(format!("{model_path}.plehot")));
+    let pack = hipfire_config::memory::ple_hot_pack_file()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{model_path}.plehotrows")));
     if !sidecar.is_file() {
         skip(&format!("no sidecar at {}", sidecar.display()));
         return None;
     }
-    let configured = explicit.unwrap_or(PLE_HOT_AUTO_BUDGET_BYTES);
-    let Some(available) = rdna_compute::uma_memory::host_available_bytes() else {
-        eprintln!("  qwen4 ple hot store: off (host memory availability unreadable)");
-        return None;
-    };
-    // The sweep's own host footprint: every resident (non-external, non-tied)
-    // weight the load places, sized from the index; entries the index cannot
-    // size are skipped.
-    let planned_load = manifest
-        .weights
-        .iter()
-        .filter(|entry| {
-            !entry.residency.is_external() && !matches!(entry.policy, ShardPolicy::Tied { .. })
-        })
-        .filter_map(|entry| hfq.find_tensor_info(&entry.name).map(|info| info.data_size as u64))
-        .fold(PLE_HOT_STATE_BYTES, u64::saturating_add);
-    let budget = configured.min(
-        available
-            .saturating_sub(planned_load)
-            .saturating_sub(PLE_HOT_LOAD_RESERVE_BYTES),
-    );
-    let inputs = format!(
-        "configured {} MiB ({}), {} MiB host available, {} MiB planned load, {} MiB reserve; budget {} MiB; sidecar {}",
-        configured / MIB,
-        if explicit.is_some() { "memory.ple_hot_store_bytes" } else { "auto" },
-        available / MIB,
-        planned_load / MIB,
-        PLE_HOT_LOAD_RESERVE_BYTES / MIB,
-        budget / MIB,
-        sidecar.display()
-    );
-    if budget == 0 {
-        eprintln!("  qwen4 ple hot store inputs: {inputs}");
-        eprintln!("  qwen4 ple hot store: off (no host RAM to spare)");
+    if !pack.is_file() {
+        skip(&format!("no hot-row pack at {}", pack.display()));
         return None;
     }
+    let model_file_bytes = match std::fs::metadata(model_path) {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            eprintln!("  qwen4 ple hot store: off (stat {model_path}: {error})");
+            return None;
+        }
+    };
     let rank = match hipfire_runtime::ple_hot_store::PleHotRank::open(
         &sidecar,
         plan.padded_rows,
@@ -179,43 +144,45 @@ fn start_ple_hot_store(
     ) {
         Ok(rank) => rank,
         Err(error) => {
-            eprintln!("  qwen4 ple hot store inputs: {inputs}");
             eprintln!("  qwen4 ple hot store: off (sidecar {}: {error})", sidecar.display());
             return None;
         }
     };
-    let store = match hipfire_runtime::ple_hot_store::HotRowStore::new(
+    let store = match hipfire_runtime::ple_hot_store::HotRowStore::open(
         rank,
-        budget,
+        &pack,
         plan.rows_per_shard,
+        plan.row_encoding,
         plan.encoded_row_bytes,
+        &plan.shard_offsets,
+        model_file_bytes,
     ) {
         Ok(store) => store,
         Err(error) => {
-            eprintln!("  qwen4 ple hot store inputs: {inputs}");
             eprintln!("  qwen4 ple hot store: off ({error})");
             return None;
         }
     };
     eprintln!(
-        "  qwen4 ple hot store inputs: {inputs}; setup {} ms",
+        "  qwen4 ple hot store: sidecar {}, setup {} ms",
+        sidecar.display(),
         started.elapsed().as_millis()
     );
-    if store.tier_count() == 0 {
-        eprintln!("  qwen4 ple hot store: off (budget keeps no tier)");
-        return None;
-    }
-    let handle = store.spawn_fill(
-        std::path::Path::new(model_path),
-        plan.shard_offsets,
-        PLE_HOT_FILL_FLOOR_BYTES,
-        hipfire_runtime::ple_hot_store::FillThrottle {
-            load_bytes_per_s: hipfire_config::memory::ple_hot_fill_load_rate(),
-            min_bytes_per_s: PLE_HOT_FILL_MIN_RATE,
-            adaptive: true,
-        },
-    );
-    Some(hipfire_arch_qwen4::bundle::PleHotFill::new(store, handle))
+    let handle = store.spawn_worker(std::path::Path::new(model_path), plan.shard_offsets);
+    Some(hipfire_arch_qwen4::bundle::PleHotWorker::new(store, handle))
+}
+
+/// Bytes of the PLE hot-row pack to prewarm now that the model is ready: an
+/// explicit `memory.ple_hot_store_bytes`, or (`auto`) `MemAvailable` minus
+/// [`PLE_HOT_PREWARM_RESERVE_BYTES`]; the store caps it at the pack's size.
+fn ple_hot_prewarm_budget() -> (u64, Option<u64>) {
+    let available = hipfire_runtime::ple_hot_store::mem_available_bytes();
+    let budget = match hipfire_config::memory::ple_hot_store_bytes() {
+        hipfire_config::memory::PleHotStoreBudget::Bytes(bytes) => bytes,
+        hipfire_config::memory::PleHotStoreBudget::Auto => available
+            .map_or(0, |available| available.saturating_sub(PLE_HOT_PREWARM_RESERVE_BYTES)),
+    };
+    (budget, available)
 }
 
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
@@ -873,10 +840,10 @@ impl Carrier for Qwen4Carrier {
             .map_or(usize::MAX, |bytes| bytes >> 20);
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
-        // The PLE hot-row store starts before the weight sweep (while the
-        // source index is in hand); its fill waits for `release_throttle`
-        // once the model is ready (or, with a nonzero load rate, overlaps the
-        // load throttled). Dropping it on an error path stops and joins the fill.
+        // The PLE hot-row store opens before the weight sweep (while the
+        // source index is in hand); its worker verifies the pack meanwhile
+        // and prewarms it once the model is ready. Dropping it on an error
+        // path stops and joins the worker.
         let ple_hot = start_ple_hot_store(use_ranges, &hfq, &manifest, &metadata, ctx.path);
         let source = HfqModelSource::from_hfq(hfq);
         // Every allocation of the weight sweep is immutable model data: railgun
@@ -930,8 +897,8 @@ impl Carrier for Qwen4Carrier {
                 ctx.max_seq
             ),
         })?;
-        // The store's fill has been running through the sweep; the row store
-        // serves its ready shards from here on.
+        // The row store reads the pack's rows from the pack once the worker
+        // has verified it.
         if let Some(hot) = ple_hot {
             bundle.attach_ple_hot_store(hot);
         }
@@ -953,14 +920,8 @@ impl Carrier for Qwen4Carrier {
         // load left free (`device_mem_info`: GTT clamped to host RAM): an
         // automatic context is the model's, capped by what fits (card_cap);
         // an explicit one must fit whole. The session cache is not charged:
-        // its snapshots yield to context growth. The PLE hot-row store is not
-        // charged either: the memory it has committed so far is added back to
-        // free (it yields its lowest-ranked tiers to context growth), so
-        // card_cap equals what it would be without the store; it is read
-        // before the free-memory query so the add-back never exceeds what the
-        // fill took before that measurement. A discrete GPU keeps its
+        // its snapshots yield to context growth. A discrete GPU keeps its
         // requested context unchecked, as before.
-        let ple_yieldable = bundle.ple_hot_store().map_or(0, |store| store.filled_bytes());
         let admission = ctx.sequence.is_some().then(|| -> Result<crate::admission::Qwen4MemoryAdmission, String> {
             let mtp_request = if native_mtp {
                 let config = &bundle.config;
@@ -985,7 +946,7 @@ impl Carrier for Qwen4Carrier {
             crate::admission::qwen4_memory_admission(
                 ctx.max_seq,
                 (!automatic).then_some(ctx.max_seq),
-                free as u64 + ple_yieldable,
+                free as u64,
                 mtp_request,
                 crate::admission::QWEN4_MEMORY_HEADROOM_BYTES,
                 |tokens| bundle.context_growth_bytes(gpu, tokens),
@@ -994,14 +955,9 @@ impl Carrier for Qwen4Carrier {
         let max_seq = match admission {
             None => ctx.max_seq,
             Some(Ok(admission)) => {
-                let yieldable_note = if ple_yieldable > 0 {
-                    format!(" (+ {} MiB yieldable PLE hot store)", ple_yieldable / MIB)
-                } else {
-                    String::new()
-                };
                 eprintln!(
-                    "  qwen4 memory admission: {} MiB free after load{yieldable_note}; a {}-token context commits {} MiB more ({} MiB QSA context + {} MiB gather workspace + {} MiB MTP request) + {} MiB headroom; card_cap {} tokens",
-                    admission.free.saturating_sub(ple_yieldable) / MIB,
+                    "  qwen4 memory admission: {} MiB free after load; a {}-token context commits {} MiB more ({} MiB QSA context + {} MiB gather workspace + {} MiB MTP request) + {} MiB headroom; card_cap {} tokens",
+                    admission.free / MIB,
                     admission.max_seq,
                     admission.growth() / MIB,
                     admission.context_growth / MIB,
@@ -1083,18 +1039,18 @@ impl Carrier for Qwen4Carrier {
                 );
             }
         }
-        // The model is loaded and admitted: the PLE hot-row store's fill now
-        // runs unthrottled in the background while no request is served
-        // (every PLE fetch pauses it); requests before it finishes use
-        // whatever shards are done.
+        // The model is loaded and admitted: the PLE hot-row store's worker
+        // now prewarms the pack's hottest rows into the page cache while no
+        // request is served (every PLE fetch pauses it).
         if let Some(store) = bundle.ple_hot_store() {
-            // Size the store from what the load actually left: keep the
-            // reserve of `MemAvailable` (the fill's floor stops it 2 GiB
-            // lower still).
-            if let Some(available) = hipfire_runtime::ple_hot_store::mem_available_bytes() {
-                store.fit_to_headroom(available, PLE_HOT_LOAD_RESERVE_BYTES);
-            }
-            store.release_throttle();
+            let (budget, available) = ple_hot_prewarm_budget();
+            store.set_prewarm_budget(budget);
+            eprintln!(
+                "  qwen4 ple hot store: prewarm budget {} MiB of a {} MiB pack (MemAvailable {} MiB)",
+                budget.min(store.data_bytes()) / MIB,
+                store.data_bytes() / MIB,
+                available.map_or(0, |bytes| bytes / MIB),
+            );
         }
         match bundle.qsa_context_committed_bytes(ctx.gpu) {
             Ok((target, mtp)) => eprintln!(

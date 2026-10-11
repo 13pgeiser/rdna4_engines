@@ -25,14 +25,15 @@
 //!                    [--max-chunks N] [--decode] [--ple-hot BYTES]
 //! `--decode` scores the autoregressive route instead: each chunk prefills the
 //! unscored prefix, then runs one `forward_token` per scored position.
-//! `--ple-hot BYTES` attaches a fully filled PLE hot-row store of that budget
-//! (`<model>.plehot` sidecar) before scoring, so the identity gate covers rows
-//! served from the store.
+//! `--ple-hot BYTES` attaches the PLE hot-row store (`<model>.plehot` sidecar
+//! and `<model>.plehotrows` pack), verified and with BYTES of the pack
+//! prewarmed, before scoring, so the identity gate covers rows read from the
+//! pack.
 //! Reduce with `saddle-quant reduce DIR`.
 
 use hipfire_arch_qwen4::admit_hfqm_artifact;
-use hipfire_arch_qwen4::bundle::{ple_hot_plan, PleHotFill, PleHotPlan, Qwen4Bundle};
-use hipfire_runtime::ple_hot_store::{FillThrottle, HotRowStore, PleHotRank};
+use hipfire_arch_qwen4::bundle::{ple_hot_plan, PleHotPlan, PleHotWorker, Qwen4Bundle};
+use hipfire_runtime::ple_hot_store::{HotRowStore, PleHotRank};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
@@ -48,39 +49,44 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Build the PLE hot-row store for `budget` bytes from `<model>.plehot`, fill
-/// it completely (unthrottled) and return it ready to attach.
-fn filled_hot_store(model: &Path, plan: PleHotPlan, budget: u64) -> Result<PleHotFill, String> {
+/// Open the PLE hot-row store from `<model>.plehot` and `<model>.plehotrows`,
+/// wait until its worker verified the pack, prewarm `prewarm` bytes of it,
+/// and return it ready to attach.
+fn verified_hot_store(model: &Path, plan: PleHotPlan, prewarm: u64) -> Result<PleHotWorker, String> {
     let sidecar = PathBuf::from(format!("{}.plehot", model.display()));
+    let pack = PathBuf::from(format!("{}.plehotrows", model.display()));
     let rank = PleHotRank::open(&sidecar, plan.padded_rows, &plan.fingerprint_hex)
         .map_err(|e| format!("--ple-hot: sidecar {}: {e}", sidecar.display()))?;
-    let store = HotRowStore::new(rank, budget, plan.rows_per_shard, plan.encoded_row_bytes)?;
-    if store.tier_count() == 0 {
-        return Err("--ple-hot: the budget keeps no tier".into());
-    }
+    let model_bytes = std::fs::metadata(model)
+        .map_err(|e| format!("--ple-hot: stat {}: {e}", model.display()))?
+        .len();
+    let store = HotRowStore::open(
+        rank,
+        &pack,
+        plan.rows_per_shard,
+        plan.row_encoding,
+        plan.encoded_row_bytes,
+        &plan.shard_offsets,
+        model_bytes,
+    )?;
     let started = Instant::now();
-    let handle = store.spawn_fill(
-        model,
-        plan.shard_offsets,
-        0,
-        FillThrottle {
-            load_bytes_per_s: 0,
-            min_bytes_per_s: 0,
-            adaptive: false,
-        },
-    );
-    store.release_throttle();
-    let hot = PleHotFill::new(store.clone(), handle);
-    while !store.fill_complete() {
-        if started.elapsed().as_secs() > 900 {
-            return Err("--ple-hot: fill did not complete in 900 s".into());
+    let handle = store.spawn_worker(model, plan.shard_offsets);
+    let hot = PleHotWorker::new(store.clone(), handle);
+    store.set_prewarm_budget(prewarm);
+    loop {
+        match store.verified() {
+            Some(true) if store.prewarm_complete() => break,
+            Some(false) => return Err("--ple-hot: the pack failed verification".into()),
+            _ if started.elapsed().as_secs() > 900 => {
+                return Err("--ple-hot: verification and prewarm did not finish in 900 s".into())
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     eprintln!(
-        "qwen4_kld: ple hot store filled: {} tiers, {:.2} GiB, {:.1} s",
-        store.tier_count(),
-        store.resident_bytes() as f64 / (1u64 << 30) as f64,
+        "qwen4_kld: ple hot store verified, {:.2} of {:.2} GiB of the pack prewarmed, {:.1} s",
+        store.prewarmed_bytes() as f64 / (1u64 << 30) as f64,
+        store.data_bytes() as f64 / (1u64 << 30) as f64,
         started.elapsed().as_secs_f64()
     );
     Ok(hot)
@@ -99,8 +105,8 @@ struct Model {
 
 impl Model {
     /// Same range-loaded path as the serve loader (`hipfire-loader` carriers).
-    /// `ple_hot`: budget of a PLE hot-row store filled completely before the
-    /// first forward.
+    /// `ple_hot`: bytes of the PLE hot-row pack to prewarm; the store is
+    /// attached verified before the first forward.
     fn load(path: &Path, n_ctx: usize, ple_hot: Option<u64>) -> Result<Self, String> {
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
@@ -162,8 +168,8 @@ impl Model {
         bundle
             .attach_forward(&mut gpu, n_ctx)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
-        if let (Some(budget), Some(plan)) = (ple_hot, hot_plan) {
-            bundle.attach_ple_hot_store(filled_hot_store(path, plan, budget)?);
+        if let (Some(prewarm), Some(plan)) = (ple_hot, hot_plan) {
+            bundle.attach_ple_hot_store(verified_hot_store(path, plan, prewarm)?);
         }
         let logits = gpu
             .zeros(&[n_ctx * vocab], DType::F32)
@@ -557,9 +563,10 @@ fn score(
     );
     if let Some(store) = m.bundle.ple_hot_store() {
         eprintln!(
-            "qwen4_kld eval: ple hot store served {} rows ({} pages)",
+            "qwen4_kld eval: ple hot store served {} rows ({} pages, {} pack reads)",
             store.hot_rows(),
-            store.hot_pages()
+            store.hot_pages(),
+            store.hot_reads()
         );
     }
     Ok(())

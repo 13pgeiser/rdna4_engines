@@ -58,6 +58,7 @@ pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;
 pub mod paro;
+pub mod ple_hot_pack;
 pub mod ple_hot_store;
 pub mod prefix;
 pub mod prefix_index;

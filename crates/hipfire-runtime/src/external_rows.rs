@@ -24,7 +24,7 @@ use crate::ple_hot_store::HotRowStore;
 use rdna_compute::DType;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -65,6 +65,160 @@ const READS_PER_READER: usize = 64;
 /// Readers for `groups` scattered page-group reads, at most `max_readers`.
 fn reader_count(groups: usize, max_readers: usize) -> usize {
     (groups / READS_PER_READER).clamp(PARALLEL_READERS, max_readers)
+}
+
+/// Pages inserted into the cache per state-lock hold when a multi-group
+/// request's reads are published.
+const PUBLISH_BATCH: usize = 512;
+/// Longest run of consecutive hot-row pack rows read with one `pread`.
+const HOT_RUN_MAX_BYTES: u64 = 16 * 1024;
+
+/// One requested row served from the hot-row pack.
+#[derive(Debug, Clone, Copy)]
+struct HotItem {
+    /// Absolute offset of the row in the pack file.
+    pack_offset: u64,
+    /// Byte offset of the decoded row in the lease.
+    output_offset: usize,
+}
+
+/// One `pread` of consecutive pack rows.
+#[derive(Debug, Clone)]
+struct HotRun {
+    offset: u64,
+    len: usize,
+    /// The `HotPlan::items` this read serves.
+    items: std::ops::Range<usize>,
+}
+
+/// The pack reads of one fetch: the rows of every page whose requested rows
+/// the pack all holds, sorted by pack offset.
+#[derive(Debug, Default)]
+struct HotPlan {
+    items: Vec<HotItem>,
+    runs: Vec<HotRun>,
+    /// Pages served from the pack.
+    pages: u64,
+    /// Requested rows served from the pack.
+    rows: u64,
+}
+
+/// The shared work of one multi-read fetch.
+struct ReadWork<'a> {
+    /// Source page groups, ascending by file offset.
+    groups: &'a [Vec<PageKey>],
+    group_cursor: AtomicUsize,
+    hot: &'a HotPlan,
+    hot_cursor: AtomicUsize,
+    store: Option<&'a HotRowStore>,
+}
+
+/// One reader's result of a multi-read fetch.
+#[derive(Default)]
+struct ReaderShare {
+    /// Source pages read (for [`RowStoreInner::publish_pending`]).
+    pages: Vec<(PageKey, Vec<u8>)>,
+    /// When this reader found the source groups exhausted.
+    groups_done: Duration,
+}
+
+/// Per-fetch timing of a large PLE fetch, logged under
+/// `HIPFIRE_PLE_HOT_DEBUG=1` (one line per fetch of >= `FetchTrace::MIN_ROWS`
+/// rows, i.e. prefill chunks, not decode steps).
+struct FetchTrace {
+    started: Instant,
+    rows: usize,
+    pages: usize,
+    hot_pages: u64,
+    hot_rows: u64,
+    hot_reads: usize,
+    classified_ms: f64,
+    cache_hits: usize,
+    misses: usize,
+    groups: usize,
+    scanned_ms: f64,
+    readers: usize,
+    groups_done_ms: f64,
+    parallel_ms: f64,
+    inline_read_ms: f64,
+}
+
+impl FetchTrace {
+    const MIN_ROWS: usize = 4096;
+
+    fn start(rows: usize, pages: usize) -> Option<FetchTrace> {
+        (rows >= Self::MIN_ROWS && hipfire_config::memory::ple_hot_debug()).then(|| FetchTrace {
+            started: Instant::now(),
+            rows,
+            pages,
+            hot_pages: 0,
+            hot_rows: 0,
+            hot_reads: 0,
+            classified_ms: 0.0,
+            cache_hits: 0,
+            misses: 0,
+            groups: 0,
+            scanned_ms: 0.0,
+            readers: 0,
+            groups_done_ms: 0.0,
+            parallel_ms: 0.0,
+            inline_read_ms: 0.0,
+        })
+    }
+
+    fn ms_since(at: Instant) -> f64 {
+        at.elapsed().as_secs_f64() * 1e3
+    }
+
+    fn mark_classified(&mut self, hot: &HotPlan) {
+        self.hot_pages = hot.pages;
+        self.hot_rows = hot.rows;
+        self.hot_reads = hot.runs.len();
+        self.classified_ms = Self::ms_since(self.started);
+    }
+
+    fn mark_cache_scanned(&mut self, hits: usize, misses: usize, groups: usize) {
+        self.cache_hits = hits;
+        self.misses = misses;
+        self.groups = groups;
+        self.scanned_ms = Self::ms_since(self.started);
+    }
+
+    fn parallel(&mut self, started: Instant, readers: usize, shares: &[ReaderShare]) {
+        self.parallel_ms = Self::ms_since(started);
+        self.readers = readers;
+        self.groups_done_ms = shares
+            .iter()
+            .map(|share| share.groups_done.as_secs_f64() * 1e3)
+            .fold(0.0, f64::max);
+    }
+
+    fn inline_reads(&mut self, started: Instant) {
+        self.inline_read_ms = Self::ms_since(started);
+    }
+
+    fn finish(self) {
+        eprintln!(
+            "  ple fetch: {} rows {} pages | pack {} pages {} rows {} reads | classified at {:.1} ms | \
+             cache {} hits {} misses {} groups, scanned at {:.1} ms | parallel {:.1} ms with {} \
+             readers, source groups done at {:.1} ms | inline reads {:.1} ms | total {:.1} ms",
+            self.rows,
+            self.pages,
+            self.hot_pages,
+            self.hot_rows,
+            self.hot_reads,
+            self.classified_ms,
+            self.cache_hits,
+            self.misses,
+            self.groups,
+            self.scanned_ms,
+            self.parallel_ms,
+            self.readers,
+            self.groups_done_ms,
+            self.inline_read_ms,
+            Self::ms_since(self.started),
+        );
+    }
 }
 
 /// Default byte budget of one coalesced read or one staging buffer.  The
@@ -246,13 +400,14 @@ pub struct RowCacheStats {
     pub outstanding_leases: usize,
     pub staging_in_use: usize,
     pub staging_high_water: usize,
-    /// Rows served from the attached PLE hot-row store (no page read, no
+    /// Rows served from the attached PLE hot-row pack (no page read, no
     /// `cache_hits`/`cache_misses` accounting).
     pub hot_rows: u64,
-    /// Pages whose every requested row the hot-row store served.
+    /// Pages whose every requested row the hot-row pack served.
     pub hot_pages: u64,
-    /// Logical bytes of the hot-row store's present tiers.
-    pub hot_resident_bytes: u64,
+    /// Reads issued against the hot-row pack (one per run of consecutive
+    /// pack rows).
+    pub hot_reads: u64,
 }
 
 /// Proof returned by [`RowStore::quiesce`] and [`RowStore::unload`].
@@ -1077,27 +1232,31 @@ impl RowStore {
         self.inner.stats()
     }
 
-    /// Attach the PLE hot-row store.  Rows it holds are decoded from its
-    /// bytes (the model file's own encoded rows) instead of read from the
-    /// source; everything else takes the unchanged page path.  One store per
-    /// row store, attached once; the caller stops and joins the store's fill
-    /// before unloading this row store.  Errs (and attaches nothing) when the
-    /// store's geometry is not this table's.
+    /// Attach the PLE hot-row store.  Rows its pack holds are read from the
+    /// pack (the model file's own encoded rows, re-laid out by rank) and
+    /// decoded instead of read from the source; everything else takes the
+    /// unchanged page path.  One store per row store, attached once; the
+    /// caller stops and joins the store's worker before unloading this row
+    /// store.  Errs (and attaches nothing) when the store's geometry or row
+    /// encoding is not this table's.
     pub fn attach_hot_store(&self, store: Arc<HotRowStore>) -> Result<(), String> {
         let inner = &self.inner;
         if store.padded_rows() != inner.padded_rows
             || store.rows_per_shard() != inner.rows_per_shard
             || store.encoded_row_bytes() != inner.encoded_row_bytes
+            || store.encoding() != inner.encoding
         {
             return Err(format!(
-                "hot store geometry ({} rows, {} per shard, {} B/row) does not match the row \
-                 store ({} rows, {} per shard, {} B/row)",
+                "hot store geometry ({} rows, {} per shard, {} B/row, {}) does not match the row \
+                 store ({} rows, {} per shard, {} B/row, {})",
                 store.padded_rows(),
                 store.rows_per_shard(),
                 store.encoded_row_bytes(),
+                store.encoding().dtype_name(),
                 inner.padded_rows,
                 inner.rows_per_shard,
                 inner.encoded_row_bytes,
+                inner.encoding.dtype_name(),
             ));
         }
         inner
@@ -1437,10 +1596,7 @@ impl RowStoreInner {
             staging_high_water: state.staging_high_water,
             hot_rows: self.hot_store.get().map_or(0, |store| store.hot_rows()),
             hot_pages: self.hot_store.get().map_or(0, |store| store.hot_pages()),
-            hot_resident_bytes: self
-                .hot_store
-                .get()
-                .map_or(0, |store| store.resident_bytes()),
+            hot_reads: self.hot_store.get().map_or(0, |store| store.hot_reads()),
         }
     }
 
@@ -1593,17 +1749,28 @@ impl RowStoreInner {
                 });
         }
 
-        // Rows the hot store holds are decoded from its bytes; a page is
-        // skipped only when every row requested from it is served, so a
-        // partially hot page is read and decoded exactly as without the store.
+        // Pages whose every requested row the hot-row pack holds are read from
+        // the pack (rank-ordered rows, through the page cache); a page with any
+        // other requested row takes the unchanged page path, so a partially
+        // hot page is read and decoded exactly as without the pack.
+        let mut trace = FetchTrace::start(locations.len(), pages.len());
+        let store: Option<&HotRowStore> = self
+            .hot_store
+            .get()
+            .map(|store| &**store)
+            .filter(|store| store.is_serving());
         let remaining_pages;
-        let pages = match self.hot_store.get().filter(|store| store.tier_count() > 0) {
+        let mut hot = HotPlan::default();
+        let pages = match store {
             Some(store) => {
-                remaining_pages = self.serve_hot_pages(store, pages, &requested, output, canceled)?;
+                (hot, remaining_pages) = self.plan_hot_reads(store, pages, &requested);
                 remaining_pages.as_slice()
             }
             None => pages,
         };
+        if let Some(trace) = trace.as_mut() {
+            trace.mark_classified(&hot);
+        }
 
         let mut missing = Vec::new();
         for &page in pages {
@@ -1630,116 +1797,255 @@ impl RowStoreInner {
         }
 
         let groups = self.coalesce_pages(&missing)?;
-        if groups.len() > 1 {
+        if let Some(trace) = trace.as_mut() {
+            trace.mark_cache_scanned(pages.len() - missing.len(), missing.len(), groups.len());
+        }
+        let result = if groups.len() + hot.runs.len() > 1 {
             // Rows are drawn at random over the table, so the groups are
             // scattered single-page reads: issued serially each one waits a
             // full device round trip (~64 reads = 10-15 ms per few-token
             // request on NVMe), issued together the device overlaps them.
-            // Each reader decodes its pages' requested rows into the output
-            // right after its read, so assembly overlaps the reads instead of
-            // following them serially.
-            let per_thread = groups
-                .len()
-                .div_ceil(reader_count(groups.len(), self.max_readers));
+            // Each reader decodes its reads' requested rows into the output
+            // right after the read, so assembly overlaps the reads instead of
+            // following them serially.  The readers take the source groups
+            // first (ascending file offset), then the pack reads.
+            let readers = reader_count(groups.len() + hot.runs.len(), self.max_readers);
+            let work = ReadWork {
+                groups: &groups,
+                group_cursor: AtomicUsize::new(0),
+                hot: &hot,
+                hot_cursor: AtomicUsize::new(0),
+                store,
+            };
+            let work = &work;
             let shared = SharedOutput::new(&mut *output);
             let shared = &shared;
             let requested = &requested;
-            let read = std::thread::scope(|scope| -> Result<PendingPages, RowStoreError> {
-                let handles: Vec<_> = groups
-                    .chunks(per_thread)
-                    .map(|chunk| {
-                        scope.spawn(move || self.read_and_copy_groups(chunk, requested, shared))
-                    })
+            let started = Instant::now();
+            let shares = std::thread::scope(|scope| -> Result<Vec<ReaderShare>, RowStoreError> {
+                let handles: Vec<_> = (0..readers)
+                    .map(|_| scope.spawn(move || self.run_reader(work, requested, shared, started)))
                     .collect();
-                let mut read = Vec::with_capacity(handles.len());
-                for handle in handles {
-                    read.push(handle.join().expect("row reader thread panicked")?);
-                }
-                Ok(read)
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("row reader thread panicked"))
+                    .collect()
             })?;
-            let read_bytes: usize = read.iter().flatten().map(|(_, bytes)| bytes.len()).sum();
+            let read_bytes: usize = shares
+                .iter()
+                .flat_map(|share| share.pages.iter())
+                .map(|(_, bytes)| bytes.len())
+                .sum();
             {
                 let mut state = self.state.lock().expect("row store state mutex poisoned");
                 state.cache.reads += groups.len() as u64;
                 state.cache.coalesced_reads += groups.len() as u64;
                 state.cache.read_bytes += read_bytes as u64;
             }
+            if let Some(store) = store {
+                store.note_served(hot.rows, hot.pages, hot.runs.len() as u64);
+            }
+            if let Some(trace) = trace.as_mut() {
+                trace.parallel(started, readers, &shares);
+            }
             // Pages are cached even under cancellation: the reads are done
             // and a later request (or the warm-up's owner) wants them cached.
             // The worker inserts them once this ticket is completed.
-            *pending = read;
+            *pending = shares.into_iter().map(|share| share.pages).collect();
             if canceled.load(Ordering::Acquire) {
-                return Err(RowStoreError::Canceled);
+                Err(RowStoreError::Canceled)
+            } else {
+                Ok(())
             }
-            return Ok(());
-        }
-        for group in groups {
-            if canceled.load(Ordering::Acquire) {
-                return Err(RowStoreError::Canceled);
+        } else {
+            let started = Instant::now();
+            let result = match (groups.first(), hot.runs.first(), store) {
+                (Some(group), _, _) => {
+                    self.read_group(group, &requested, output, read_staging, canceled)
+                }
+                (None, Some(run), Some(store)) => {
+                    let shared = SharedOutput::new(&mut *output);
+                    let read = self.read_hot_run(store, &hot, run, &shared, read_staging);
+                    if read.is_ok() {
+                        store.note_served(hot.rows, hot.pages, 1);
+                    }
+                    read
+                }
+                _ => Ok(()),
+            };
+            if let Some(trace) = trace.as_mut() {
+                trace.inline_reads(started);
             }
-            self.read_group(&group, &requested, output, read_staging, canceled)?;
+            result
+        };
+        if let Some(trace) = trace {
+            trace.finish();
         }
-        Ok(())
+        result
     }
 
-    /// Decode every page whose requested rows are all in `store` straight
-    /// into `output`; returns the pages left for the cache/SSD path (ascending).
-    ///
-    /// The store's read guard is held for this loop only (decode, no I/O), so
-    /// a concurrent [`HotRowStore::release_lowest`] waits at most one pass.
-    fn serve_hot_pages(
+    /// One reader of a multi-read request: take the next source group from
+    /// the shared cursor (groups ascend by file offset, so the reads in flight
+    /// stay clustered: ~1.08x the IOPS of per-reader spans on the Halo host's
+    /// DRAM-less NVMe), read it and decode its requested rows straight into
+    /// the shared output; once the groups are exhausted, do the same for the
+    /// pack reads.  Returns the source pages it read for
+    /// [`Self::publish_pending`].  A group of one page hands its read buffer
+    /// over without a copy.
+    fn run_reader(
+        &self,
+        work: &ReadWork<'_>,
+        requested: &HashMap<PageKey, Vec<RowCopy>>,
+        output: &SharedOutput<'_>,
+        started: Instant,
+    ) -> Result<ReaderShare, RowStoreError> {
+        let mut share = ReaderShare::default();
+        loop {
+            let index = work.group_cursor.fetch_add(1, Ordering::Relaxed);
+            let Some(group) = work.groups.get(index) else {
+                break;
+            };
+            let mut bytes = Vec::new();
+            self.read_group_bytes(group, &mut bytes)?;
+            let single = group.len() == 1;
+            let mut offset = 0usize;
+            for &page in group {
+                let length = self.page_len(page)?;
+                let page_bytes = &bytes[offset..offset + length];
+                if let Some(rows) = requested.get(&page) {
+                    copy_requested_rows_shared(
+                        self.encoding,
+                        self.encoded_row_bytes,
+                        self.decoded_row_bytes,
+                        page,
+                        page_bytes,
+                        rows,
+                        output,
+                    )?;
+                }
+                if !single {
+                    share.pages.push((page, page_bytes.to_vec()));
+                }
+                offset += length;
+            }
+            if single {
+                share.pages.push((group[0], bytes));
+            }
+        }
+        share.groups_done = started.elapsed();
+        if let Some(store) = work.store {
+            let mut buffer = Vec::new();
+            loop {
+                let index = work.hot_cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(run) = work.hot.runs.get(index) else {
+                    break;
+                };
+                self.read_hot_run(store, work.hot, run, output, &mut buffer)?;
+            }
+        }
+        Ok(share)
+    }
+
+    /// Partition `pages` (ascending) into the pages whose every requested row
+    /// `store` holds, planned as pack reads, and the rest (ascending).
+    fn plan_hot_reads(
         &self,
         store: &HotRowStore,
         pages: &[PageKey],
         requested: &HashMap<PageKey, Vec<RowCopy>>,
-        output: &mut [u8],
-        canceled: &AtomicBool,
-    ) -> Result<Vec<PageKey>, RowStoreError> {
-        if canceled.load(Ordering::Acquire) {
-            return Err(RowStoreError::Canceled);
-        }
-        let guard = store.read();
-        let mut remaining = Vec::with_capacity(pages.len());
-        let mut hot_rows: Vec<(usize, &[u8])> = Vec::new();
-        let (mut served_rows, mut served_pages) = (0u64, 0u64);
+    ) -> (HotPlan, Vec<PageKey>) {
+        let mut plan = HotPlan::default();
+        let mut rest = Vec::with_capacity(pages.len());
         for &page in pages {
-            let Some(copies) = requested.get(&page).filter(|copies| !copies.is_empty()) else {
-                remaining.push(page);
-                continue;
-            };
-            let first_row = page.shard as u64 * self.rows_per_shard as u64
-                + (page.page * self.rows_per_page) as u64;
-            hot_rows.clear();
-            let mut complete = true;
-            for copy in copies {
-                let row = first_row + (copy.page_offset / self.encoded_row_bytes) as u64;
-                match store.get(&guard, row) {
-                    Some(bytes) => hot_rows.push((copy.output_offset, bytes)),
-                    None => {
-                        complete = false;
-                        break;
-                    }
+            let start = plan.items.len();
+            let first_row = self.first_row_of(page);
+            let held = requested
+                .get(&page)
+                .filter(|copies| !copies.is_empty())
+                .is_some_and(|copies| {
+                    copies.iter().all(|copy| {
+                        let row = first_row + (copy.page_offset / self.encoded_row_bytes) as u64;
+                        store.pack_offset(row).map(|pack_offset| {
+                            plan.items.push(HotItem {
+                                pack_offset,
+                                output_offset: copy.output_offset,
+                            })
+                        })
+                        .is_some()
+                    })
+                });
+            if held {
+                plan.pages += 1;
+            } else {
+                plan.items.truncate(start);
+                rest.push(page);
+            }
+        }
+        plan.rows = plan.items.len() as u64;
+        plan.items.sort_unstable_by_key(|item| (item.pack_offset, item.output_offset));
+        // One read per run of consecutive pack rows (a row requested twice
+        // is read once), bounded so one read stays a few OS pages.
+        let row_bytes = self.encoded_row_bytes as u64;
+        let mut index = 0;
+        while index < plan.items.len() {
+            let start = index;
+            let offset = plan.items[index].pack_offset;
+            let mut end = offset + row_bytes;
+            index += 1;
+            while let Some(item) = plan.items.get(index) {
+                if item.pack_offset + row_bytes == end {
+                    index += 1;
+                } else if item.pack_offset == end && end + row_bytes - offset <= HOT_RUN_MAX_BYTES {
+                    end += row_bytes;
+                    index += 1;
+                } else {
+                    break;
                 }
             }
-            if !complete {
-                remaining.push(page);
-                continue;
-            }
-            for &(output_offset, bytes) in &hot_rows {
-                let end = output_offset
-                    .checked_add(self.decoded_row_bytes)
-                    .filter(|&end| end <= output.len())
-                    .ok_or_else(|| RowStoreError::InvalidLease {
-                        reason: "hot row output range is outside the lease".to_string(),
-                    })?;
-                self.encoding
-                    .decode_row(bytes, &mut output[output_offset..end])?;
-            }
-            served_rows += hot_rows.len() as u64;
-            served_pages += 1;
+            plan.runs.push(HotRun {
+                offset,
+                len: (end - offset) as usize,
+                items: start..index,
+            });
         }
-        store.note_served(served_rows, served_pages);
-        Ok(remaining)
+        (plan, rest)
+    }
+
+    /// Read one run of pack rows and decode its requested rows into `output`.
+    fn read_hot_run(
+        &self,
+        store: &HotRowStore,
+        plan: &HotPlan,
+        run: &HotRun,
+        output: &SharedOutput<'_>,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), RowStoreError> {
+        buffer.resize(run.len, 0);
+        store.read_pack(run.offset, buffer).map_err(RowStoreError::Source)?;
+        for item in &plan.items[run.items.clone()] {
+            let at = (item.pack_offset - run.offset) as usize;
+            let end = item
+                .output_offset
+                .checked_add(self.decoded_row_bytes)
+                .filter(|&end| end <= output.len())
+                .ok_or_else(|| RowStoreError::InvalidLease {
+                    reason: "hot row output range is outside the lease".to_string(),
+                })?;
+            // SAFETY: as at `copy_requested_rows_shared`: each request
+            // position is one `HotItem` or one `RowCopy` of a source page,
+            // never both (hot and source pages partition the request's
+            // pages), positions are `decoded_row_bytes` apart, and every run
+            // is decoded by exactly one reader.
+            let destination = unsafe { output.range_mut(item.output_offset..end) };
+            self.encoding
+                .decode_row(&buffer[at..at + self.encoded_row_bytes], destination)?;
+        }
+        Ok(())
+    }
+
+    /// Global row of the first row of `page`.
+    fn first_row_of(&self, page: PageKey) -> u64 {
+        page.shard as u64 * self.rows_per_shard as u64 + (page.page * self.rows_per_page) as u64
     }
 
     fn coalesce_pages(&self, pages: &[PageKey]) -> Result<Vec<Vec<PageKey>>, RowStoreError> {
@@ -1872,55 +2178,17 @@ impl RowStoreInner {
             .map_err(RowStoreError::Source)
     }
 
-    /// One reader thread's share of a multi-group request: read each group,
-    /// decode its requested rows straight into the shared output, and return
-    /// the pages (in group order) for [`Self::publish_pending`].  A group of
-    /// one page hands its read buffer over without a copy.
-    fn read_and_copy_groups(
-        &self,
-        groups: &[Vec<PageKey>],
-        requested: &HashMap<PageKey, Vec<RowCopy>>,
-        output: &SharedOutput<'_>,
-    ) -> Result<Vec<(PageKey, Vec<u8>)>, RowStoreError> {
-        let mut pages = Vec::with_capacity(groups.iter().map(Vec::len).sum());
-        for group in groups {
-            let mut bytes = Vec::new();
-            self.read_group_bytes(group, &mut bytes)?;
-            let single = group.len() == 1;
-            let mut cursor = 0usize;
-            for &page in group {
-                let length = self.page_len(page)?;
-                let page_bytes = &bytes[cursor..cursor + length];
-                if let Some(rows) = requested.get(&page) {
-                    copy_requested_rows_shared(
-                        self.encoding,
-                        self.encoded_row_bytes,
-                        self.decoded_row_bytes,
-                        page,
-                        page_bytes,
-                        rows,
-                        output,
-                    )?;
-                }
-                if !single {
-                    pages.push((page, page_bytes.to_vec()));
-                }
-                cursor += length;
-            }
-            if single {
-                pages.push((group[0], bytes));
-            }
-        }
-        Ok(pages)
-    }
-
-    /// Insert pages read by a multi-group request into the cache, in the order
-    /// the serial publish used to, taking the state lock once per reader's
-    /// list rather than holding it across the whole request.
+    /// Insert pages read by a multi-group request into the cache in ascending
+    /// page order (the order the serial publish used to), taking the state
+    /// lock once per `PUBLISH_BATCH` pages rather than across the whole
+    /// request.
     fn publish_pending(&self, pending: PendingPages) {
-        for pages in pending {
+        let mut pages: Vec<(PageKey, Vec<u8>)> = pending.into_iter().flatten().collect();
+        pages.sort_unstable_by_key(|(page, _)| *page);
+        let mut pages = pages.into_iter().peekable();
+        while pages.peek().is_some() {
             let mut state = self.state.lock().expect("row store state mutex poisoned");
-            for (page, bytes) in pages {
+            for (page, bytes) in pages.by_ref().take(PUBLISH_BATCH) {
                 state.cache.insert(page, bytes);
             }
         }
@@ -3635,29 +3903,12 @@ mod tests {
         .unwrap()
     }
 
-    /// A filled hot store keeping `kept` of the 256 buckets of a pseudo-random
-    /// ranking of the fixture table.
-    fn filled_hot_store(
-        source: &MemoryRowSource,
-        kept: u64,
-        group: usize,
-        seed: u64,
-    ) -> Arc<HotRowStore> {
-        use crate::ple_hot_store::test_support::{
-            fill_from_shards, synthetic_buckets, FINGERPRINT,
-        };
-        use crate::ple_hot_store::PleHotRank;
-        let rank = PleHotRank::from_buckets(
-            HOT_PADDED_ROWS,
-            FINGERPRINT,
-            synthetic_buckets(HOT_PADDED_ROWS as usize, seed),
-        );
-        let budget = HOT_PADDED_ROWS * 170 * kept / 256 + 1;
-        let hot = HotRowStore::new_with_group(rank, budget, HOT_ROWS_PER_SHARD, 170, group)
-            .unwrap();
-        fill_from_shards(&hot, &source.shards);
-        assert!(hot.fill_complete());
-        hot
+    use crate::ple_hot_store::test_support::PackFixture;
+
+    /// A model file holding `source`'s shards, its hot-row pack of `kept` of
+    /// the 256 buckets of a pseudo-random ranking, and the verified store.
+    fn hot_pack(source: &MemoryRowSource, kept: usize, group: usize, seed: u64) -> PackFixture {
+        PackFixture::new(&source.shards, HOT_ROWS_PER_SHARD, kept, group, seed)
     }
 
     fn fetch(rows: &RowStore, ids: &[u64]) -> Vec<u8> {
@@ -3694,12 +3945,12 @@ mod tests {
         ids
     }
 
-    /// Output bytes are identical with and without the store for random row
-    /// sets (partially hot pages included), with an unready shard, and after
-    /// tiers were released; hot pages are counted separately from
-    /// hits/misses, which keep their meaning for the remaining pages.
+    /// Output bytes are identical with and without the pack for random row
+    /// sets (partially hot pages included) and with an unverified pack; hot
+    /// pages are counted separately from hits/misses, which keep their
+    /// meaning for the remaining pages.
     #[test]
-    fn hot_store_output_is_byte_identical_with_partial_pages_and_unready_shards() {
+    fn hot_store_output_is_byte_identical_with_partial_pages() {
         let source = q8_source();
         let ids = mixed_ids();
         let want = expected_rows(&ids);
@@ -3710,15 +3961,16 @@ mod tests {
         assert_eq!(fetch(&plain, &ids), want);
         let plain_stats = plain.cache_stats();
         assert_eq!(plain_stats.cache_misses as usize, distinct_pages.len());
-        assert_eq!((plain_stats.hot_rows, plain_stats.hot_pages), (0, 0));
+        assert_eq!((plain_stats.hot_rows, plain_stats.hot_pages, plain_stats.hot_reads), (0, 0, 0));
 
         // Half the rows hot: many pages mix hot and cold requested rows.
-        let hot = filled_hot_store(&source, 128, 4, 77);
-        let hot_rows = q8_row_store(&source);
-        hot_rows.attach_hot_store(hot.clone()).unwrap();
-        assert_eq!(fetch(&hot_rows, &ids), want);
-        let stats = hot_rows.cache_stats();
+        let pack = hot_pack(&source, 128, 4, 77);
+        let rows = q8_row_store(&source);
+        rows.attach_hot_store(pack.store.clone()).unwrap();
+        assert_eq!(fetch(&rows, &ids), want);
+        let stats = rows.cache_stats();
         assert!(stats.hot_pages > 0 && stats.hot_rows >= stats.hot_pages);
+        assert!(stats.hot_reads > 0 && stats.hot_reads <= stats.hot_rows);
         assert!((stats.hot_pages as usize) < distinct_pages.len(), "some pages stay cold");
         assert_eq!(
             stats.cache_misses + stats.hot_pages,
@@ -3726,112 +3978,115 @@ mod tests {
             "hot pages leave hits/misses untouched for every other page"
         );
         assert_eq!(stats.cache_hits, 0);
-        assert_eq!(stats.hot_resident_bytes, hot.resident_bytes());
-        assert_eq!(hot.hot_rows(), stats.hot_rows);
+        assert_eq!(pack.store.hot_rows(), stats.hot_rows);
 
-        // Shard 1 not ready: none of its rows may come from the store.
-        let partial = filled_hot_store(&source, 256, 4, 5);
-        partial.set_shard_ready_for_test(1, false);
+        // A pack that was not verified serves nothing.
+        let rank = crate::ple_hot_store::PleHotRank::from_buckets(
+            HOT_PADDED_ROWS,
+            crate::ple_hot_store::test_support::FINGERPRINT,
+            pack.buckets.clone(),
+        );
+        let model_bytes = std::fs::metadata(&pack.model_path).unwrap().len();
+        let unverified = HotRowStore::open(
+            rank,
+            &pack.pack_path,
+            HOT_ROWS_PER_SHARD,
+            RowEncoding::Q8F16,
+            170,
+            &pack.offsets,
+            model_bytes,
+        )
+        .unwrap();
         let rows = q8_row_store(&source);
-        rows.attach_hot_store(partial.clone()).unwrap();
+        rows.attach_hot_store(unverified.clone()).unwrap();
         assert_eq!(fetch(&rows, &ids), want);
         let stats = rows.cache_stats();
-        let shard0_pages: std::collections::BTreeSet<u64> = ids
-            .iter()
-            .filter(|&&id| (id as usize) < HOT_ROWS_PER_SHARD)
-            .map(|id| id / ROWS_PER_PAGE as u64)
-            .collect();
-        let shard0_rows = ids.iter().filter(|&&id| (id as usize) < HOT_ROWS_PER_SHARD).count();
-        assert_eq!(stats.hot_pages as usize, shard0_pages.len(), "whole table is hot");
-        assert_eq!(stats.hot_rows as usize, shard0_rows);
-        assert!(stats.cache_misses > 0, "shard 1 pages were read");
-        // A request over rows that are all hot reads nothing.
-        let hot_only: Vec<u64> = (0..HOT_ROWS_PER_SHARD as u64).step_by(3).collect();
-        let reads_before = rows.cache_stats().reads;
-        assert_eq!(fetch(&rows, &hot_only), expected_rows(&hot_only));
-        assert_eq!(rows.cache_stats().reads, reads_before);
-
-        // Tiers released one by one: output never changes.
-        let released = filled_hot_store(&source, 200, 3, 91);
-        let rows_before_release = released.tier_count();
-        assert!(rows_before_release > 3);
-        while released.release_lowest() > 0 {
-            let rows = q8_row_store(&source);
-            rows.attach_hot_store(released.clone()).unwrap();
-            // The store's counters are cumulative across row stores: compare deltas.
-            let before = (released.hot_rows(), released.hot_pages());
-            assert_eq!(fetch(&rows, &ids), want);
-            if released.resident_bytes() == 0 {
-                assert_eq!((released.hot_rows(), released.hot_pages()), before, "an empty store serves nothing");
-            }
-        }
+        assert_eq!((stats.hot_rows, stats.hot_pages, stats.hot_reads), (0, 0, 0));
+        assert_eq!(stats.cache_misses, plain_stats.cache_misses);
     }
 
-    /// Releasing tiers while requests are in flight never changes a returned
-    /// byte: a request either takes a row from its tier or reads the source.
+    /// With every bucket in the pack nothing is read from the source, for a
+    /// large fetch, a single row, and a single run of consecutive pack rows.
     #[test]
-    fn release_during_in_flight_requests_keeps_output_identical() {
+    fn an_all_hot_request_reads_only_the_pack() {
         let source = q8_source();
-        let hot = filled_hot_store(&source, 256, 4, 13);
+        let pack = hot_pack(&source, 256, 4, 5);
+        let rows = q8_row_store(&source);
+        rows.attach_hot_store(pack.store.clone()).unwrap();
+        let ids = mixed_ids();
+        assert_eq!(fetch(&rows, &ids), expected_rows(&ids));
+        let one = [ids[7]];
+        assert_eq!(fetch(&rows, &one), expected_rows(&one));
+        let same_row_twice = [ids[9], ids[9]];
+        assert_eq!(fetch(&rows, &same_row_twice), expected_rows(&same_row_twice));
+        let stats = rows.cache_stats();
+        assert_eq!(stats.reads, 0);
+        assert_eq!(stats.cache_misses, 0);
+        assert_eq!(stats.hot_rows as usize, ids.len() + 3);
+    }
+
+    /// Concurrent requests through one row store with a pack attached all
+    /// return the source's bytes.
+    #[test]
+    fn concurrent_requests_with_a_pack_are_byte_identical() {
+        let source = q8_source();
+        let pack = hot_pack(&source, 200, 3, 13);
         let rows = Arc::new(q8_row_store(&source));
-        rows.attach_hot_store(hot.clone()).unwrap();
+        rows.attach_hot_store(pack.store.clone()).unwrap();
         let ids = mixed_ids();
         let want = expected_rows(&ids);
-
-        let releaser = {
-            let hot = hot.clone();
-            std::thread::spawn(move || {
-                let mut released = 0u64;
-                loop {
-                    std::thread::sleep(Duration::from_micros(300));
-                    let bytes = hot.release_lowest();
-                    if bytes == 0 {
-                        return released;
+        std::thread::scope(|scope| {
+            for round in 0..4 {
+                let rows = rows.clone();
+                let (ids, want) = (&ids, &want);
+                scope.spawn(move || {
+                    for _ in 0..4 {
+                        assert_eq!(&fetch(&rows, ids), want, "round {round}");
+                        rows.evict_cached_pages();
                     }
-                    released += bytes;
-                }
-            })
-        };
-        let mut rounds = 0;
-        while !releaser.is_finished() || rounds < 8 {
-            assert_eq!(fetch(&rows, &ids), want, "round {rounds}");
-            rows.evict_cached_pages();
-            rounds += 1;
-        }
-        let released = releaser.join().unwrap();
-        assert_eq!(released, HOT_PADDED_ROWS * 170);
-        assert_eq!(hot.resident_bytes(), 0);
-        let served = hot.hot_rows();
-        rows.evict_cached_pages();
-        assert_eq!(fetch(&rows, &ids), want);
-        assert_eq!(hot.hot_rows(), served, "a fully released store serves nothing");
+                });
+            }
+        });
     }
 
     /// A store whose geometry is not the table's is refused, as is a second
-    /// store; a zero-tier store attaches and changes nothing.
+    /// store.
     #[test]
     fn attach_hot_store_validates_geometry() {
-        use crate::ple_hot_store::test_support::{synthetic_buckets, FINGERPRINT};
-        use crate::ple_hot_store::PleHotRank;
         let source = q8_source();
         let rows = q8_row_store(&source);
-        let rank = |padded: usize| {
-            PleHotRank::from_buckets(padded as u64, FINGERPRINT, synthetic_buckets(padded, 3))
-        };
-        let wrong_shards =
-            HotRowStore::new(rank(8192), 1 << 30, HOT_ROWS_PER_SHARD / 2, 170).unwrap();
-        assert!(rows.attach_hot_store(wrong_shards).is_err());
-        let wrong_rows = HotRowStore::new(rank(4096), 1 << 30, 2048, 170).unwrap();
-        assert!(rows.attach_hot_store(wrong_rows).is_err());
-
-        let empty = HotRowStore::new(rank(8192), 0, HOT_ROWS_PER_SHARD, 170).unwrap();
-        assert_eq!(empty.tier_count(), 0);
-        rows.attach_hot_store(empty).unwrap();
-        let ids = mixed_ids();
-        assert_eq!(fetch(&rows, &ids), expected_rows(&ids));
-        let stats = rows.cache_stats();
-        assert_eq!((stats.hot_rows, stats.hot_pages, stats.hot_resident_bytes), (0, 0, 0));
-        let second = HotRowStore::new(rank(8192), 1 << 30, HOT_ROWS_PER_SHARD, 170).unwrap();
-        assert!(rows.attach_hot_store(second).is_err());
+        // Same bytes cut into shards of half the size.
+        let halves: Vec<Vec<u8>> = source
+            .shards
+            .iter()
+            .flat_map(|shard| {
+                let half = shard.len() / 2;
+                [shard[..half].to_vec(), shard[half..].to_vec()]
+            })
+            .collect();
+        let wrong_shards = PackFixture::new(&halves, HOT_ROWS_PER_SHARD / 2, 64, 4, 3);
+        assert!(rows.attach_hot_store(wrong_shards.store.clone()).is_err());
+        let wrong_rows = PackFixture::new(&source.shards[..1], HOT_ROWS_PER_SHARD, 64, 4, 3);
+        assert!(rows.attach_hot_store(wrong_rows.store.clone()).is_err());
+        let pack = hot_pack(&source, 64, 4, 3);
+        rows.attach_hot_store(pack.store.clone()).unwrap();
+        let second = hot_pack(&source, 32, 4, 3);
+        assert!(rows.attach_hot_store(second.store.clone()).is_err());
+        // Same geometry and row size, other row encoding: BF16 rows of 85
+        // values are 170 B too, but are not the table's Q8F16 rows.
+        let fresh = q8_row_store(&source);
+        let other_encoding = PackFixture::with_encoding(
+            &source.shards,
+            HOT_ROWS_PER_SHARD,
+            64,
+            4,
+            3,
+            RowEncoding::Bf16,
+            85,
+        );
+        assert_eq!(other_encoding.store.encoded_row_bytes(), 170);
+        let err = fresh.attach_hot_store(other_encoding.store.clone()).unwrap_err();
+        assert!(err.contains("BF16") && err.contains("Q8_0"), "{err}");
+        fresh.attach_hot_store(hot_pack(&source, 64, 4, 3).store.clone()).unwrap();
     }
 }
