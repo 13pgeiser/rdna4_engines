@@ -1255,6 +1255,44 @@ pub struct SpecStepResult {
     pub committed: Vec<u32>,
 }
 
+/// Exact LOGICAL per-layer byte extents of the four DeltaNet state families
+/// for one config's Q8 + error-feedback state: what the kernels write (see
+/// [`DeltaNetSnapshot::cb_verify_owned_exact`], which allows pool-rounded
+/// scales / conv rings of equal size on both banks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DnCbExtents {
+    n_layers: usize,
+    s: usize,
+    scales: usize,
+    conv: usize,
+    ef: usize,
+}
+
+impl DnCbExtents {
+    /// `None` unless the geometry is the one the exact save-free kernels
+    /// cover: 128-wide heads and conv kernel dimension 4 (3 ring slots).
+    fn for_config(config: &Qwen35Config) -> Option<Self> {
+        if config.conv_kernel_dim != 4 || config.linear_key_head_dim != 128 || config.linear_value_head_dim != 128 {
+            return None;
+        }
+        let hv = config.linear_num_value_heads;
+        let hk = config.linear_num_key_heads;
+        let n_layers = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == qwen35::LayerType::LinearAttention)
+            .count();
+        let conv_channels = 2 * hk * 128 + hv * 128;
+        Some(Self {
+            n_layers,
+            s: hv * 128 * 128,
+            scales: hv * 128 * 4,
+            conv: conv_channels * 3 * 4,
+            ef: hv * 128 * 128 * 2,
+        })
+    }
+}
+
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
@@ -1547,6 +1585,140 @@ impl DeltaNetSnapshot {
             && same(&state.s_scales, &self.s_scale_bufs)
             && same(&state.conv_states, &self.conv_state_bufs)
             && same(&state.s_ef_residual, &self.s_ef_residual_bufs)
+    }
+
+    /// Slice S (save-free CB verify): is this snapshot + `state` an exact,
+    /// exchangeable pair of owned allocations for `config`? Whole-pair
+    /// preflight, host-only, never touches the device.
+    ///
+    /// * `config` has a Q8 + error-feedback DeltaNet geometry the exact
+    ///   kernels cover (conv kernel dimension 4, 128-wide heads) and `state`
+    ///   is Q8;
+    /// * all four families of both sides hold exactly the config's DeltaNet
+    ///   layer count (EF complete, so a snapshot mirrors the state);
+    /// * per layer and family the live buffer and its snapshot buffer have
+    ///   the SAME allocated size, and it is at least the exact logical extent
+    ///   the kernels write (S = Hv*128^2, scales = Hv*128*4, conv =
+    ///   (2*Hk+Hv)*128*3*4, EF = Hv*128^2*2). S and EF are exact; scales and
+    ///   conv rings may be pool-rounded up (the kernels write only the
+    ///   logical extent). Equal sizes mean an exchange keeps every owner's
+    ///   capacity unchanged. `GpuTensor::byte_size` is NOT used: the Q8 S
+    ///   container's metadata is F32;
+    /// * every buffer on both sides is a HIP-owned allocation (no borrowed
+    ///   lane view, VMM arena or host-mapped buffer), so exchanging the
+    ///   owning handles keeps "freed exactly once through its own owner".
+    ///
+    /// Cross-lane pointer distinctness is the caller's whole-chunk check
+    /// ([`Self::push_owner_ptrs`]).
+    pub(crate) fn cb_verify_owned_exact(&self, state: &DeltaNetState, config: &Qwen35Config) -> bool {
+        let Some(ext) = DnCbExtents::for_config(config) else {
+            return false;
+        };
+        self.exact_extents(state, &ext) && self.all_hip_owned(state)
+    }
+
+    /// Family lengths and per-layer extents of both sides (see
+    /// [`Self::cb_verify_owned_exact`]); pure metadata.
+    fn exact_extents(&self, state: &DeltaNetState, ext: &DnCbExtents) -> bool {
+        /// Equal live/backup size per layer, each at least `logical`
+        /// (`exact`: exactly `logical`).
+        fn fam_ok(live: &[GpuTensor], back: &[DeviceBuffer], n: usize, logical: usize, exact: bool) -> bool {
+            live.len() == n
+                && back.len() == n
+                && live.iter().zip(back).all(|(l, b)| {
+                    let sz = l.buf.size();
+                    sz == b.size() && if exact { sz == logical } else { sz >= logical }
+                })
+        }
+        let n = ext.n_layers;
+        n != 0
+            && state.quant == qwen35::StateQuant::Q8
+            && fam_ok(&state.s_matrices, &self.s_matrix_bufs, n, ext.s, true)
+            && fam_ok(&state.s_scales, &self.s_scale_bufs, n, ext.scales, false)
+            && fam_ok(&state.conv_states, &self.conv_state_bufs, n, ext.conv, false)
+            && fam_ok(&state.s_ef_residual, &self.s_ef_residual_bufs, n, ext.ef, true)
+    }
+
+    /// Every buffer of `state` and of this snapshot is a HIP-owned allocation.
+    fn all_hip_owned(&self, state: &DeltaNetState) -> bool {
+        state
+            .s_matrices
+            .iter()
+            .chain(&state.s_scales)
+            .chain(&state.conv_states)
+            .chain(&state.s_ef_residual)
+            .all(|t| t.buf.is_hip_allocation())
+            && self.backup_buffers().all(|b| b.is_hip_allocation())
+    }
+
+    /// Append every device pointer of `state` and of this snapshot (all four
+    /// families, both sides) to `out`: the caller sorts the whole chunk's
+    /// pointers to prove no allocation is shared between lanes or between a
+    /// lane's two banks before it exchanges owners.
+    pub(crate) fn push_owner_ptrs(&self, state: &DeltaNetState, out: &mut Vec<u64>) {
+        out.extend(
+            state
+                .s_matrices
+                .iter()
+                .chain(&state.s_scales)
+                .chain(&state.conv_states)
+                .chain(&state.s_ef_residual)
+                .map(|t| t.buf.as_ptr() as u64),
+        );
+        out.extend(self.backup_buffers().map(|b| b.as_ptr() as u64));
+    }
+
+    /// Snapshot-side device pointers of DeltaNet layer `la`, ordered
+    /// `[S, scales, conv, EF]`; `0` for a family without that layer (EF off).
+    pub(crate) fn layer_state_ptrs(&self, la: usize) -> [u64; 4] {
+        let p = |v: &[DeviceBuffer]| v.get(la).map_or(0, |b| b.as_ptr() as u64);
+        [
+            p(&self.s_matrix_bufs),
+            p(&self.s_scale_bufs),
+            p(&self.conv_state_bufs),
+            p(&self.s_ef_residual_bufs),
+        ]
+    }
+
+    /// Slice S: exchange the owned device-buffer handles of the four state
+    /// families between `state` (A, the live allocations) and this snapshot
+    /// (B). Afterwards the canonical `state` owns B and this snapshot owns A;
+    /// `GpuTensor` shape/dtype and `DeltaNetState::quant` are untouched, and
+    /// no byte moves. Host-only, allocation-free and infallible: the caller
+    /// has already run the whole-chunk preflight ([`Self::cb_verify_owned_exact`]),
+    /// so every family mirrors and each handle is exchanged exactly once.
+    ///
+    /// The bulk save/restore descriptor tables are bound to (live, backup)
+    /// pointer pairs. If they are valid for `state` right now they are
+    /// inverted rather than rebuilt: the old reverse table (backup B -> live
+    /// A) is exactly the new forward SAVE (new live B -> new backup A), and
+    /// the old forward table (A -> B) is exactly the new RESTORE (new backup
+    /// A -> new live B); the fingerprint is recomputed for the new live
+    /// owners. If they are stale (they were built against another live
+    /// state) the route is disarmed (`bulk_n_items = 0`): the memcpy loops
+    /// then serve every save/restore, never a descriptor bound to the wrong
+    /// allocations. Allocations behind the descriptor buffers stay owned
+    /// until [`Self::free_gpu`].
+    pub(crate) fn exchange_buffers(&mut self, state: &mut DeltaNetState) {
+        let bulk_valid = self.bulk_n_items != 0
+            && self.bulk_fwd.is_some()
+            && self.bulk_rev.is_some()
+            && Self::bulk_fingerprint(state) == self.bulk_fingerprint;
+        fn swap_family(live: &mut [GpuTensor], back: &mut [DeviceBuffer]) {
+            for (l, b) in live.iter_mut().zip(back.iter_mut()) {
+                std::mem::swap(&mut l.buf, b);
+            }
+        }
+        swap_family(&mut state.s_matrices, &mut self.s_matrix_bufs);
+        swap_family(&mut state.s_scales, &mut self.s_scale_bufs);
+        swap_family(&mut state.conv_states, &mut self.conv_state_bufs);
+        swap_family(&mut state.s_ef_residual, &mut self.s_ef_residual_bufs);
+        if bulk_valid {
+            std::mem::swap(&mut self.bulk_fwd, &mut self.bulk_rev);
+            self.bulk_fingerprint = Self::bulk_fingerprint(state);
+        } else {
+            self.bulk_n_items = 0;
+        }
     }
 
     /// Railgun D8: every backup buffer, family by family (fingerprinting).
@@ -2161,6 +2333,21 @@ impl GdnTape {
             && snap.mirrors(dn_state)
     }
 
+    /// Are this tape's D8 snapshot-source tables armed (`ml.from` exists)?
+    /// [`Self::replay_from_snapshot_admits`] alone does not prove it: a
+    /// capture-only tape, or a DFlash tape built with
+    /// `HIPFIRE_DN_SNAPSHOT_FLIP=0`, has no `from` tables, and an admitted
+    /// snapshot-source replay on it is an error. The save-free CB verify
+    /// (which commits through that replay) requires this before it exchanges
+    /// any owner. Reads the existing `replay_ml` under its existing lock.
+    pub fn snapshot_source_armed(&self) -> bool {
+        self.replay_ml
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|ml| ml.from.is_some())
+    }
+
     /// Railgun D8: [`Self::replay_gdn`] for `n_steps` that reads the
     /// pre-verify state (conv ring, S, scales, EF residual) from `snap`'s
     /// buffers and writes the advanced state to `dn_state`, in the same two
@@ -2199,54 +2386,74 @@ impl GdnTape {
             }
             h
         };
-        let stale = ml.from.as_ref().map(|f| f.fingerprint) != Some(Some(fp));
-        if stale {
-            let (pre, gdn) = self.replay_ml_rows(ml, weights, config, dn_state);
-            let pre: Vec<_> = pre
-                .into_iter()
-                .enumerate()
-                .map(|(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
-                    base,
-                    conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
-                })
-                .collect();
-            let gdn: Vec<_> = gdn
-                .into_iter()
-                .enumerate()
-                .map(|(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
-                    base,
-                    s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
-                    s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
-                    ef_src: snap
-                        .s_ef_residual_bufs
-                        .get(la)
-                        .map_or(0, |b| b.as_ptr() as u64),
-                })
-                .collect();
-            let Some(from) = ml.from.as_mut() else {
-                unreachable!("armed at construction")
-            };
-            // Tables may still be read by an in-flight replay: drain first.
-            if from.fingerprint.is_some() {
-                gpu.hip.device_synchronize()?;
+        // The owner exchange alternates two pointer configurations per lane, so
+        // `GdnReplayMlFrom` keeps a table pair per configuration: a step whose
+        // fingerprint is in either slot launches that slot's tables with no
+        // drain and no upload; only a configuration seen for the first time
+        // (or evicted) rewrites the least recently used slot.
+        let lookup = match ml.from.as_ref() {
+            Some(from) => from.slots.lookup(&fp),
+            None => unreachable!("armed at construction"),
+        };
+        let slot = match lookup {
+            Ok(slot) => {
+                if let Some(from) = ml.from.as_mut() {
+                    from.slots.mark_used(slot);
+                }
+                slot
             }
-            gpu.hip.memcpy_htod(
-                &from.pre_table,
-                rdna_compute::dflash_gdn_replay::table_bytes(&pre),
-            )?;
-            gpu.hip.memcpy_htod(
-                &from.gdn_table,
-                rdna_compute::dflash_gdn_replay::table_bytes(&gdn),
-            )?;
-            from.fingerprint = Some(fp);
-        }
+            Err(victim) => {
+                let (pre, gdn) = self.replay_ml_rows(ml, weights, config, dn_state);
+                let pre: Vec<_> = pre
+                    .into_iter()
+                    .enumerate()
+                    .map(|(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
+                        base,
+                        conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
+                    })
+                    .collect();
+                let gdn: Vec<_> = gdn
+                    .into_iter()
+                    .enumerate()
+                    .map(|(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
+                        base,
+                        s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
+                        s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
+                        ef_src: snap
+                            .s_ef_residual_bufs
+                            .get(la)
+                            .map_or(0, |b| b.as_ptr() as u64),
+                    })
+                    .collect();
+                let Some(from) = ml.from.as_mut() else {
+                    unreachable!("armed at construction")
+                };
+                // Tables may still be read by an in-flight replay: drain first.
+                if from.slots.written(victim) {
+                    gpu.hip.device_synchronize()?;
+                }
+                // Unkeyed while its tables are rewritten: a failed upload never
+                // leaves a fingerprint over half-written tables.
+                from.slots.take(victim);
+                gpu.hip.memcpy_htod(
+                    &from.pre_tables[victim],
+                    rdna_compute::dflash_gdn_replay::table_bytes(&pre),
+                )?;
+                gpu.hip.memcpy_htod(
+                    &from.gdn_tables[victim],
+                    rdna_compute::dflash_gdn_replay::table_bytes(&gdn),
+                )?;
+                from.slots.set(victim, fp);
+                victim
+            }
+        };
         ml.order(gpu)?;
         let Some(from) = ml.from.as_ref() else {
             unreachable!("armed at construction")
         };
         let hd = self.key_head_dim;
         gpu.dflash_gdn_replay_pre_ml_from(
-            from.pre_table.as_ptr() as *const _,
+            from.pre_tables[slot].as_ptr() as *const _,
             n_la,
             self.n_v_heads,
             self.n_key_heads,
@@ -2258,7 +2465,7 @@ impl GdnTape {
             config.norm_eps,
         )?;
         gpu.gated_delta_net_q8_fast_ml_from(
-            from.gdn_table.as_ptr() as *const _,
+            from.gdn_tables[slot].as_ptr() as *const _,
             n_la,
             n_steps,
             self.n_v_heads,
@@ -2558,18 +2765,92 @@ struct GdnReplayMl {
     from: Option<GdnReplayMlFrom>,
 }
 
+/// Two-slot cache bookkeeping with least-recently-used replacement: each slot
+/// holds the key its device table currently matches (`None` = never written, or
+/// invalidated). It owns no device memory; the caller keeps the per-slot
+/// buffers and writes slot `victim` only on a miss.
+///
+/// The save-free CB verify exchanges the live and snapshot owners of every
+/// lane before each step, so the pointer-keyed tables of one lane alternate
+/// between exactly two configurations. One slot would miss (drain + upload)
+/// every step; two hit after the first two steps.
+pub(crate) struct TwoSlot<K> {
+    keys: [Option<K>; 2],
+    /// The slot used most recently.
+    mru: usize,
+}
+
+impl<K> TwoSlot<K> {
+    pub(crate) fn new() -> Self {
+        Self {
+            keys: [None, None],
+            mru: 0,
+        }
+    }
+
+    /// `Ok(slot)` when `hit` accepts that slot's key; `Err(victim)` otherwise:
+    /// the slot to overwrite (an unwritten slot first, else the one not used
+    /// most recently). Pure: neither outcome changes the recency.
+    pub(crate) fn lookup_by(&self, mut hit: impl FnMut(&K) -> bool) -> Result<usize, usize> {
+        for slot in [self.mru, 1 - self.mru] {
+            if self.keys[slot].as_ref().is_some_and(|k| hit(k)) {
+                return Ok(slot);
+            }
+        }
+        Err(if self.keys[0].is_none() {
+            0
+        } else if self.keys[1].is_none() {
+            1
+        } else {
+            1 - self.mru
+        })
+    }
+
+    /// Record a hit on `slot`.
+    pub(crate) fn mark_used(&mut self, slot: usize) {
+        self.mru = slot;
+    }
+
+    /// Key `slot` to its freshly written table and mark it used.
+    pub(crate) fn set(&mut self, slot: usize, key: K) {
+        self.keys[slot] = Some(key);
+        self.mru = slot;
+    }
+
+    /// Unkey `slot` (its table is about to be rewritten, or is unusable);
+    /// returns the old key.
+    pub(crate) fn take(&mut self, slot: usize) -> Option<K> {
+        self.keys[slot].take()
+    }
+
+    /// Has `slot` been written (so in-flight work may still read its table)?
+    pub(crate) fn written(&self, slot: usize) -> bool {
+        self.keys[slot].is_some()
+    }
+}
+
+impl<K: PartialEq> TwoSlot<K> {
+    /// [`Self::lookup_by`] for a slot whose key equals `key`.
+    pub(crate) fn lookup(&self, key: &K) -> Result<usize, usize> {
+        self.lookup_by(|k| k == key)
+    }
+}
+
 /// Railgun D8: device tables of [`GdnTape::replay_gdn_from_snapshot`]
 /// (`DflashReplayPreLayerFrom` / `GdnLayerTableFrom` rows). They reuse
-/// [`GdnReplayMl`]'s q/k/v/out scratch. `fingerprint` covers the live state,
-/// the conv weights and the snapshot buffers; `None` until first written.
+/// [`GdnReplayMl`]'s q/k/v/out scratch. Two table pairs, one per slot of
+/// `slots` (see [`TwoSlot`]): the save-free owner exchange alternates the
+/// live/snapshot pointer sets, so each configuration keeps its own pair. A
+/// slot's key is the fingerprint of the live state, the conv weights and the
+/// snapshot buffers its pair was written for; unkeyed until first written.
 struct GdnReplayMlFrom {
-    pre_table: DeviceBuffer,
-    gdn_table: DeviceBuffer,
-    fingerprint: Option<u64>,
+    pre_tables: [DeviceBuffer; 2],
+    gdn_tables: [DeviceBuffer; 2],
+    slots: TwoSlot<u64>,
 }
 
 impl GdnReplayMlFrom {
-    /// JIT both snapshot-source kernels and allocate the two tables. Any
+    /// JIT both snapshot-source kernels and allocate the two table pairs. Any
     /// failure frees what was allocated and returns the error.
     fn arm(gpu: &mut Gpu, n_la: usize) -> HipResult<Self> {
         gpu.ensure_dflash_gdn_replay_ml_from()?;
@@ -2577,24 +2858,36 @@ impl GdnReplayMlFrom {
             * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom>();
         let gdn_bytes =
             n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTableFrom>();
-        let pre_table = gpu.hip.malloc(pre_bytes)?;
-        let gdn_table = match gpu.hip.malloc(gdn_bytes) {
-            Ok(g) => g,
+        let alloc_pair = |gpu: &mut Gpu| -> HipResult<(DeviceBuffer, DeviceBuffer)> {
+            let pre_table = gpu.hip.malloc(pre_bytes)?;
+            match gpu.hip.malloc(gdn_bytes) {
+                Ok(gdn_table) => Ok((pre_table, gdn_table)),
+                Err(e) => {
+                    let _ = gpu.hip.free(pre_table);
+                    Err(e)
+                }
+            }
+        };
+        let (pre0, gdn0) = alloc_pair(gpu)?;
+        let (pre1, gdn1) = match alloc_pair(gpu) {
+            Ok(p) => p,
             Err(e) => {
-                let _ = gpu.hip.free(pre_table);
+                let _ = gpu.hip.free(pre0);
+                let _ = gpu.hip.free(gdn0);
                 return Err(e);
             }
         };
         Ok(Self {
-            pre_table,
-            gdn_table,
-            fingerprint: None,
+            pre_tables: [pre0, pre1],
+            gdn_tables: [gdn0, gdn1],
+            slots: TwoSlot::new(),
         })
     }
 
     fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.hip.free(self.pre_table);
-        let _ = gpu.hip.free(self.gdn_table);
+        for t in self.pre_tables.into_iter().chain(self.gdn_tables) {
+            let _ = gpu.hip.free(t);
+        }
     }
 }
 
@@ -10928,6 +11221,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn two_slot_alternating_keys_hit_after_two_misses() {
+        let mut s = TwoSlot::<u64>::new();
+        // Cold: slot 0, then slot 1 (an unwritten slot is always the victim).
+        assert_eq!(s.lookup(&10), Err(0));
+        assert!(!s.written(0));
+        s.set(0, 10);
+        assert_eq!(s.lookup(&20), Err(1));
+        s.set(1, 20);
+        // A/B alternation now hits in either slot, forever.
+        for _ in 0..4 {
+            assert_eq!(s.lookup(&10), Ok(0));
+            s.mark_used(0);
+            assert_eq!(s.lookup(&20), Ok(1));
+            s.mark_used(1);
+        }
+        assert!(s.written(0) && s.written(1));
+    }
+
+    #[test]
+    fn two_slot_miss_evicts_the_least_recently_used_slot() {
+        let mut s = TwoSlot::<u64>::new();
+        s.set(0, 10);
+        s.set(1, 20);
+        // Slot 1 is most recent: a third key evicts slot 0.
+        assert_eq!(s.lookup(&30), Err(0));
+        s.set(0, 30);
+        // Now slot 0 is most recent: the next new key evicts slot 1.
+        assert_eq!(s.lookup(&40), Err(1));
+        // A hit refreshes recency: touching slot 1 makes slot 0 the victim.
+        assert_eq!(s.lookup(&20), Ok(1));
+        s.mark_used(1);
+        assert_eq!(s.lookup(&40), Err(0));
+        // The evicted key no longer hits.
+        s.set(0, 40);
+        assert_eq!(s.lookup(&30), Err(1));
+        assert_eq!(s.lookup(&40), Ok(0));
+    }
+
+    #[test]
+    fn two_slot_unkeyed_slot_is_the_next_victim_and_not_written() {
+        let mut s = TwoSlot::<u64>::new();
+        s.set(0, 10);
+        s.set(1, 20);
+        // An unkeyed slot (failed upload) is the next victim and no longer hits.
+        assert_eq!(s.take(1), Some(20));
+        assert!(!s.written(1));
+        assert_eq!(s.lookup(&20), Err(1));
+        assert_eq!(s.lookup(&10), Ok(0));
+        // `lookup_by` sees only written slots.
+        assert_eq!(s.lookup_by(|&k| k == 10), Ok(0));
+        assert_eq!(s.lookup_by(|_| true), Ok(0));
+    }
+
+    #[test]
     fn seed_checkpoint_count_follows_the_outer_chunk_plan() {
         // interval 2048, cap 8: a checkpoint at each outer chunk end at least
         // `interval` past the previous one.
@@ -11563,5 +11910,247 @@ mod tests {
             assert!(v.abs() < 1e-3, "EF[{i}] must be zero after reset, got {v}");
         }
         state.free_gpu(&mut gpu);
+    }
+}
+
+/// Host-only tests of the save-free CB verify ownership API
+/// ([`DeltaNetSnapshot::exchange_buffers`] and friends): fake device
+/// addresses, never dereferenced or freed.
+#[cfg(test)]
+mod dn_exchange_tests {
+    use super::*;
+
+    const EXT: DnCbExtents = DnCbExtents { n_layers: 2, s: 64, scales: 16, conv: 24, ef: 128 };
+    const LIVE: usize = 0x10_0000;
+    const SNAP: usize = 0x20_0000;
+    const FWD0: usize = 0xF0_0000;
+    const REV0: usize = 0xE0_0000;
+
+    fn buf(addr: usize, size: usize) -> DeviceBuffer {
+        // SAFETY: a borrowed handle to a fake address; host-only tests never
+        // dereference or free it.
+        unsafe { DeviceBuffer::from_raw(addr as *mut std::ffi::c_void, size) }
+    }
+
+    fn addr(base: usize, fam: usize, layer: usize) -> usize {
+        base + fam * 0x1000 + layer * 0x100
+    }
+
+    fn fam_bytes(fam: usize) -> usize {
+        [EXT.s, EXT.scales, EXT.conv, EXT.ef][fam]
+    }
+
+    fn fam_dtype(fam: usize) -> DType {
+        if fam == 3 {
+            DType::F16
+        } else {
+            DType::F32
+        }
+    }
+
+    fn state(base: usize) -> DeltaNetState {
+        let fam = |f: usize| -> Vec<GpuTensor> {
+            (0..EXT.n_layers)
+                .map(|l| GpuTensor { buf: buf(addr(base, f, l), fam_bytes(f)), shape: vec![fam_bytes(f)], dtype: fam_dtype(f) })
+                .collect()
+        };
+        DeltaNetState {
+            s_matrices: fam(0),
+            s_scales: fam(1),
+            conv_states: fam(2),
+            s_ef_residual: fam(3),
+            quant: qwen35::StateQuant::Q8,
+        }
+    }
+
+    fn snapshot(base: usize, live: &DeltaNetState) -> DeltaNetSnapshot {
+        let fam = |f: usize| -> Vec<DeviceBuffer> {
+            (0..EXT.n_layers).map(|l| buf(addr(base, f, l), fam_bytes(f))).collect()
+        };
+        DeltaNetSnapshot {
+            s_matrix_bufs: fam(0),
+            s_scale_bufs: fam(1),
+            conv_state_bufs: fam(2),
+            s_ef_residual_bufs: fam(3),
+            bulk_fwd: Some(buf(FWD0, 8)),
+            bulk_rev: Some(buf(REV0, 8)),
+            bulk_n_items: 3,
+            bulk_fingerprint: DeltaNetSnapshot::bulk_fingerprint(live),
+        }
+    }
+
+    fn live_ptrs(s: &DeltaNetState, layer: usize) -> [u64; 4] {
+        [
+            s.s_matrices[layer].buf.as_ptr() as u64,
+            s.s_scales[layer].buf.as_ptr() as u64,
+            s.conv_states[layer].buf.as_ptr() as u64,
+            s.s_ef_residual[layer].buf.as_ptr() as u64,
+        ]
+    }
+
+    fn expect(base: usize, layer: usize) -> [u64; 4] {
+        [0, 1, 2, 3].map(|f| addr(base, f, layer) as u64)
+    }
+
+    #[test]
+    fn exchange_swaps_every_family_and_keeps_metadata() {
+        let mut st = state(LIVE);
+        let mut sn = snapshot(SNAP, &st);
+        sn.exchange_buffers(&mut st);
+        for l in 0..EXT.n_layers {
+            assert_eq!(live_ptrs(&st, l), expect(SNAP, l), "live now owns the old snapshot bank");
+            assert_eq!(sn.layer_state_ptrs(l), expect(LIVE, l), "snapshot now owns the old live bank");
+        }
+        // Handle sizes, tensor shape/dtype and quant mode are untouched.
+        for f in 0..4 {
+            let fam = [&st.s_matrices, &st.s_scales, &st.conv_states, &st.s_ef_residual][f];
+            for t in fam.iter() {
+                assert_eq!(t.buf.size(), fam_bytes(f));
+                assert_eq!(t.shape, vec![fam_bytes(f)]);
+                assert_eq!(t.dtype, fam_dtype(f));
+            }
+        }
+        assert_eq!(st.quant, qwen35::StateQuant::Q8);
+        assert!(sn.exact_extents(&st, &EXT), "still an exact pair after the exchange");
+    }
+
+    #[test]
+    fn two_exchanges_restore_the_original_owners() {
+        let mut st = state(LIVE);
+        let mut sn = snapshot(SNAP, &st);
+        let fp0 = sn.bulk_fingerprint;
+        sn.exchange_buffers(&mut st);
+        sn.exchange_buffers(&mut st);
+        for l in 0..EXT.n_layers {
+            assert_eq!(live_ptrs(&st, l), expect(LIVE, l));
+            assert_eq!(sn.layer_state_ptrs(l), expect(SNAP, l));
+        }
+        assert_eq!(sn.bulk_fingerprint, fp0);
+        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
+        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
+        assert_eq!(sn.bulk_n_items, 3);
+    }
+
+    #[test]
+    fn bulk_descriptors_invert_and_refingerprint() {
+        let mut st = state(LIVE);
+        let mut sn = snapshot(SNAP, &st);
+        sn.exchange_buffers(&mut st);
+        // Old reverse (backup -> live) is the new forward SAVE; old forward is
+        // the new RESTORE.
+        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
+        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
+        assert_eq!(sn.bulk_n_items, 3);
+        assert_eq!(sn.bulk_fingerprint, DeltaNetSnapshot::bulk_fingerprint(&st), "valid for the new live owners");
+    }
+
+    #[test]
+    fn stale_descriptors_are_disarmed_not_blessed() {
+        let mut st = state(LIVE);
+        let mut sn = snapshot(SNAP, &st);
+        sn.bulk_fingerprint ^= 1; // built against some other live state
+        sn.exchange_buffers(&mut st);
+        assert_eq!(sn.bulk_n_items, 0, "stale tables must not be re-fingerprinted into validity");
+        // Allocations stay owned (freed by `free_gpu`), directions not swapped.
+        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
+        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
+        // The exchange itself still happened.
+        assert_eq!(live_ptrs(&st, 0), expect(SNAP, 0));
+        // Disarmed stays disarmed across a second exchange.
+        sn.exchange_buffers(&mut st);
+        assert_eq!(sn.bulk_n_items, 0);
+    }
+
+    #[test]
+    fn size_and_shape_refusals() {
+        let st = state(LIVE);
+        let sn = snapshot(SNAP, &st);
+        assert!(sn.exact_extents(&st, &EXT));
+
+        let mut bad = state(LIVE);
+        bad.conv_states[1].buf = buf(addr(LIVE, 2, 1), EXT.conv + 4096);
+        assert!(!sn.exact_extents(&bad, &EXT), "live conv ring rounded but the snapshot's is not (unequal banks)");
+
+        let mut bad = state(LIVE);
+        bad.s_scales[0].buf = buf(addr(LIVE, 1, 0), EXT.scales - 4);
+        let mut bad_snap = snapshot(SNAP, &st);
+        bad_snap.s_scale_bufs[0] = buf(addr(SNAP, 1, 0), EXT.scales - 4);
+        assert!(!bad_snap.exact_extents(&bad, &EXT), "equal banks below the logical scales extent");
+
+        let mut bad = state(LIVE);
+        bad.s_matrices[0].buf = buf(addr(LIVE, 0, 0), EXT.s + 4096);
+        let mut bad_snap = snapshot(SNAP, &st);
+        bad_snap.s_matrix_bufs[0] = buf(addr(SNAP, 0, 0), EXT.s + 4096);
+        assert!(!bad_snap.exact_extents(&bad, &EXT), "S must stay exact");
+
+        let mut bad = state(LIVE);
+        bad.s_ef_residual[0].buf = buf(addr(LIVE, 3, 0), EXT.ef + 4096);
+        let mut bad_snap = snapshot(SNAP, &st);
+        bad_snap.s_ef_residual_bufs[0] = buf(addr(SNAP, 3, 0), EXT.ef + 4096);
+        assert!(!bad_snap.exact_extents(&bad, &EXT), "EF must stay exact");
+
+        let mut bad = state(LIVE);
+        bad.s_ef_residual.pop();
+        assert!(!sn.exact_extents(&bad, &EXT), "EF family incomplete");
+
+        let mut bad = state(LIVE);
+        bad.s_ef_residual.clear();
+        assert!(!sn.exact_extents(&bad, &EXT), "EF off");
+
+        let mut bad = state(LIVE);
+        bad.quant = qwen35::StateQuant::FP32;
+        assert!(!sn.exact_extents(&bad, &EXT), "non-Q8 state");
+
+        let mut bad_snap = snapshot(SNAP, &st);
+        bad_snap.s_matrix_bufs[0] = buf(addr(SNAP, 0, 0), EXT.s * 2);
+        assert!(!bad_snap.exact_extents(&st, &EXT), "oversized snapshot S");
+
+        let mut bad_snap = snapshot(SNAP, &st);
+        bad_snap.s_scale_bufs.pop();
+        assert!(!bad_snap.exact_extents(&st, &EXT), "snapshot scales family short");
+
+        let other = DnCbExtents { n_layers: 3, ..EXT };
+        assert!(!sn.exact_extents(&st, &other), "layer count differs from the config's");
+        let none = DnCbExtents { n_layers: 0, ..EXT };
+        assert!(!sn.exact_extents(&st, &none));
+    }
+
+    /// Pool-rounded scales / conv rings (both banks the same rounded size) are
+    /// admitted: the kernels write only the logical extent.
+    #[test]
+    fn equal_pool_rounded_scales_and_conv_are_admitted() {
+        let mut st = state(LIVE);
+        let mut sn = snapshot(SNAP, &st);
+        for l in 0..EXT.n_layers {
+            st.s_scales[l].buf = buf(addr(LIVE, 1, l), EXT.scales + 8192);
+            sn.s_scale_bufs[l] = buf(addr(SNAP, 1, l), EXT.scales + 8192);
+            st.conv_states[l].buf = buf(addr(LIVE, 2, l), EXT.conv + 8192);
+            sn.conv_state_bufs[l] = buf(addr(SNAP, 2, l), EXT.conv + 8192);
+        }
+        assert!(sn.exact_extents(&st, &EXT));
+        sn.exchange_buffers(&mut st);
+        assert!(sn.exact_extents(&st, &EXT), "equal sizes: an exchange keeps every owner's capacity");
+        assert_eq!(st.conv_states[0].buf.size(), EXT.conv + 8192);
+        assert_eq!(sn.conv_state_bufs[0].size(), EXT.conv + 8192);
+    }
+
+    #[test]
+    fn borrowed_buffers_are_never_owned_exact() {
+        // Every fake handle above is a `from_raw` borrowed view: none may be
+        // exchanged as an owner.
+        let st = state(LIVE);
+        let sn = snapshot(SNAP, &st);
+        assert!(!sn.all_hip_owned(&st));
+    }
+
+    #[test]
+    fn owner_pointers_cover_both_banks_distinctly() {
+        let st = state(LIVE);
+        let sn = snapshot(SNAP, &st);
+        let mut ptrs = Vec::new();
+        sn.push_owner_ptrs(&st, &mut ptrs);
+        assert_eq!(ptrs.len(), 2 * 4 * EXT.n_layers);
+        ptrs.sort_unstable();
+        assert!(ptrs.windows(2).all(|w| w[0] != w[1]));
     }
 }

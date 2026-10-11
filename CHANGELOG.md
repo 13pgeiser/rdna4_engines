@@ -2,6 +2,18 @@
 
 ## Unreleased (0.4.2)
 
+- **DFlash continuous-batching verify on gfx1201: save-free DeltaNet rollback (`HIPFIRE_CB_DN_SAVE_FREE=0` is the developer kill switch).** Before every verify, each lane copied its whole DeltaNet state into the rollback snapshot: S, scales, EF residual and conv ring, about 120 MB per lane per step on the 27B. Now each lane's live and snapshot buffer owners are exchanged on the host, so the pre-verify state already is the snapshot. The verify trunk reads it as its source and writes the new live bank:
+  - The conv ring is byte-copied A → B inside the layer's existing `tape_copy_batched` launch (~5 % of the bytes the save moved). The unchanged in-place lane conv then runs on B. A `_from` conv twin was rejected because its gfx1201 codegen differed by a few ulp.
+  - The recurrence runs `gated_delta_net_q8_fast_ml_from`.
+  - Commit and terminal repair are unchanged: a short accept replays from the snapshot (D8).
+  - The snapshot-source tables (verify lane table and D8 replay tables) are cached in two slots, so the alternating banks re-upload nothing.
+  - Admission is all-or-nothing per chunk: lane-batched GDN admitted, equal row count 2..=16, D8 replay admitted, Q8 + EF, equal-size HIP-owned banks at least the logical extent, pairwise distinct owners, no Redline/replay graph. Otherwise the save runs as before.
+  - Same setup as the tape-copy entry below, on top of the entries above; interleaved A/B on the same binary with `=0`, 6 per arm, `predict ab`: conc_steady C8 greedy 453.8 → 471.0 tok/s (+3.69 %, CS95 +3.07..+4.31 %), verify phase 51.9 → 48.9 ms/step (CS95 +5.55..+6.13 %), accept phase unchanged. BetterBench v1 T0.7 C8 is unresolved at 3 per arm (sampled lanes take the per-lane draft path).
+  - Exactness:
+    - `lane_gdn_oracle` 40/40: arm C = ring copy + in-place conv + `_from` recurrence from a separate source bank, against the per-lane sequence, every output row and state byte, source bank untouched.
+    - `cb_vmm_state_oracle` (block 8, IU4, 8 lanes) passes.
+    - Serve md5s: C8 greedy `fa168ee2…` (and C1), BetterBench sampled `91bde7c5…`.
+    - `dn_exchange` / `two_slot` unit tests pass.
 - **DFlash continuous-batching draft on gfx1201: lane-batched candidate selector (`HIPFIRE_DFLASH_SELECTOR_LANES=0` is the developer kill switch).** The batched greedy draft now scores every lane's candidates in one selector pass (`propose_candidates_lanes_device`) instead of one pass per lane. It is byte-identical per lane, including ties.
   - Draft phase −6.5 % (CS95 +3.3..+9.7 %, `predict ab`).
   - On top of the lane-batched attention entry below, fast-mode C8 greedy medians are 447.8 → 453.5 tok/s. Alone, no tok/s gain was resolved (421.3 vs 424.4 in fast mode; host slow-mode contamination).

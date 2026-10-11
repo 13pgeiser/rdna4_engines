@@ -598,6 +598,7 @@ pub fn mtp_cb_verify(
                     gdn_tape: Some(&lane.state.trunk_gdn_tape),
                     fusion: crate::qwen35::DflashFusionCtx::Off,
                     hidden_rb: None,
+                    dn_state_src: None,
                 });
             }
             forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.hidden))

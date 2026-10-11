@@ -48,8 +48,8 @@ use crate::dflash_spec::{
     DflashCheckpointPolicy, DflashLaneSnapshot, DflashState, DflashWindowMark,
 };
 use crate::qwen35::prefill::multi::{
-    dflash_iu4_verify_admitted, forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_scratch_rows,
-    pack_whole_lanes, MultiChunkRequest,
+    cb_dn_save_free_enabled, dflash_iu4_verify_admitted, forward_prefill_batch_multi, lane_gdn_batch_ready,
+    multi_chunk_pack_cap, multi_chunk_scratch_rows, pack_whole_lanes, MultiChunkRequest,
     MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
 use crate::qwen35::prefill::{fp8_verify_open, verify_dense_math, DenseBatchMath};
@@ -622,8 +622,11 @@ pub struct DflashCbVerifyLane<'a> {
     pub draft: &'a DflashCbDraft,
 }
 
-/// Verify phase over drafted lanes: the pre-verify DeltaNet snapshot of each
-/// lane (right after its draft, as the singleton), then whole lanes in order
+/// Verify phase over drafted lanes: the pre-verify DeltaNet state of each
+/// lane is preserved (right after its draft, as the singleton) either by a
+/// SAVE copy into its `target_snap` or, on an admitted chunk, by the
+/// save-free owner exchange ([`cb_dn_save_free_admitted`]); then whole lanes
+/// in order
 /// through `forward_prefill_batch_multi` chunks of at most the packing cap
 /// ([`multi_chunk_pack_cap`] of `cb.max_rows()`: C1 `[16]`, C3 `[48]`, C4
 /// `[48,16]`, C8 `[48,48,32]` at 63 rows; C8 `[128]` with the wide route on a
@@ -632,10 +635,12 @@ pub struct DflashCbVerifyLane<'a> {
 /// sampled lanes use their own singleton-b Product head and materialize all b
 /// normalized target rows before scratch reuse. Outcomes remain lane-owned.
 ///
-/// Everything refusable is checked before the first snapshot is saved or row
-/// launched (capture/recording, block sizes, ring/tape capacity, batched-body
-/// eligibility). A later failure leaves the lanes of executed chunks
-/// advanced: the caller poisons the participants.
+/// Everything refusable is checked before the first snapshot is saved (or
+/// owner exchanged) or row launched (capture/recording, block sizes,
+/// ring/tape capacity, batched-body eligibility). A later failure leaves the
+/// lanes of executed chunks advanced (after an exchange, also the failing
+/// chunk's lanes with their live bank unwritten): the caller poisons the
+/// participants, and nothing here undoes an exchange.
 pub fn dflash_cb_verify(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -683,14 +688,46 @@ pub fn dflash_cb_verify(
     for ci in 0..cb.ranges.len() {
         let range = cb.ranges[ci].clone();
         let rows: usize = cb.rows[range.clone()].iter().sum();
-        for lane in lanes[range.clone()].iter_mut() {
-            lane.state.df.target_snap.save_from(lane.dn_state, gpu)?;
+        // One decision per packed chunk, never per lane (no half admission).
+        let save_free = cb_dn_save_free_admitted(gpu, config, &cb.trunk, &lanes[range.clone()]);
+        if save_free {
+            // Save-free DeltaNet verify (`HIPFIRE_CB_DN_SAVE_FREE`). Instead of
+            // copying every lane's live state A into its snapshot B, exchange
+            // the owners of the four state families, so the canonical live
+            // `dn_state` owns the old snapshot bank and the canonical
+            // `target_snap` owns A, the pre-window state. Verify then reads A
+            // (the request's `dn_state_src`) and writes only the live bank:
+            // the conv ring is copied A -> B (pure bytes) and the in-place conv
+            // kernel runs on B, and `gated_delta_net_q8_fast_ml_from` is the
+            // in-place recurrence with only the first-use LOAD addresses
+            // changed, so every byte the live bank ends with is the byte the
+            // in-place verify of a SAVEd lane leaves. The existing commit then
+            // runs unchanged on the canonical fields: full accept keeps the
+            // live bank, partial / zero accept replay snapshot A -> live bank
+            // (D8), and A stays the pre-window state terminal repair restores.
+            // One stream drain before the exchange (everything queued on the
+            // active stream, incl. the previous step's commit, has finished
+            // with the old owners). The exchange itself runs below, after the
+            // last fallible step that precedes the forward, and is host-only
+            // and infallible after the whole-chunk preflight.
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.stream_synchronize(stream)?;
+            }
+        } else {
+            for lane in lanes[range.clone()].iter_mut() {
+                lane.state.df.target_snap.save_from(lane.dn_state, gpu)?;
+            }
         }
         // PM FP8 verify scope (`HIPFIRE_CB_VERIFY_FP8`): trunk + head run the one
         // E4M3 verify arithmetic at every row count, so this batched chunk equals
         // each lane's singleton verify (same admission: the lanes share target
         // and KV tier); closed on every path below.
         let prev = fp8_verify_open(gpu, weights, config, &*lanes[range.start].kv_cache)?;
+        if save_free {
+            for lane in lanes[range.clone()].iter_mut() {
+                lane.state.df.target_snap.exchange_buffers(&mut *lane.dn_state);
+            }
+        }
         let fwd = {
             let mut reqs: Vec<MultiChunkRequest<'_>> = Vec::with_capacity(range.len());
             for lane in lanes[range.clone()].iter_mut() {
@@ -704,6 +741,7 @@ pub fn dflash_cb_verify(
                     gdn_tape: Some(&df.gdn_tape),
                     fusion: DflashFusionCtx::ChainVerify,
                     hidden_rb: Some(&mut df.hidden_rb),
+                    dn_state_src: if save_free { Some(&df.target_snap) } else { None },
                 });
             }
             // Trunk row-byte identity at aggregates 63/64/65/96/128, chunk128
@@ -764,6 +802,81 @@ pub fn dflash_cb_verify(
         heads?;
     }
     Ok(())
+}
+
+/// Whole-chunk admission of the save-free DeltaNet verify for one packed chunk
+/// (`lanes` = the chunk's lanes), checked BEFORE any owner is exchanged. All
+/// of the following must hold, otherwise the chunk takes today's SAVE route
+/// unchanged:
+///
+/// * `HIPFIRE_CB_DN_SAVE_FREE` on (`cb_dn_save_free_enabled`), exact gfx1201;
+/// * the shared scratch armed its snapshot-source lane table
+///   ([`MultiChunkScratch::gdn_from_ready`]);
+/// * the lane-batched GDN admission's process half
+///   ([`lane_gdn_batch_ready`]: `HIPFIRE_CB_LANE_GDN_BATCH` /
+///   `HIPFIRE_CB_TAPE_COPY_BATCH`, `1..=CONV_LANES_MAX` lanes, exact gfx1201
+///   head geometry, no capture / recording / G0 observation) and its chunk
+///   half (Sequential, ChainVerify, tape per lane — all structural here —
+///   and EQUAL row count `b` on every lane, each within its tape);
+/// * `2 <= b <= 16` (the D8 replay's step bound, so every accept class can
+///   replay from the snapshot);
+/// * no enabled retained Redline controller and no existing replay graph
+///   (`replay_graph_count() == 0`: a graph's fast launch bypasses the
+///   table re-fingerprinting an owner exchange relies on);
+/// * per lane: D8 on + the replay-ML route admitted for `b` steps + the
+///   snapshot mirrors the state ([`GdnTape::replay_from_snapshot_admits`]),
+///   the tape's snapshot-source tables armed
+///   ([`GdnTape::snapshot_source_armed`]), all four families exact: Q8 + EF,
+///   conv kernel dimension 4, the config's DeltaNet layer count, per-layer
+///   equal-size banks each at least the exact logical extent (pool rounding
+///   allowed) and HIP-owned buffers on both banks
+///   ([`DeltaNetSnapshot::cb_verify_owned_exact`]), and an uncompacted Q8/fp8
+///   KV cache (the batched forward's own admission, so it cannot refuse after
+///   the exchange);
+/// * the chunk's `2 * 4 * n_layers` owner pointers per lane are pairwise
+///   distinct across all lanes and both banks.
+///
+/// Host-only: one small pointer vector, no device access.
+pub(crate) fn cb_dn_save_free_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    trunk: &MultiChunkScratch,
+    lanes: &[DflashCbVerifyLane<'_>],
+) -> bool {
+    use rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS;
+    let Some(first) = lanes.first() else {
+        return false;
+    };
+    let b = first.draft.verify_tokens.len();
+    if !cb_dn_save_free_enabled()
+        || !gpu.arch_caps.is_gfx1201()
+        || !trunk.gdn_from_ready()
+        || !lane_gdn_batch_ready(gpu, config, lanes.len())
+        || gpu.replay.is_enabled()
+        || gpu.graphs.replay_graph_count() != 0
+        || !(2..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&b)
+    {
+        return false;
+    }
+    let mut ptrs: Vec<u64> = Vec::with_capacity(lanes.len() * 8 * config.n_layers);
+    for lane in lanes {
+        let df = &lane.state.df;
+        let state: &DeltaNetState = &*lane.dn_state;
+        let kv: &KvCache = &*lane.kv_cache;
+        if lane.draft.verify_tokens.len() != b
+            || b > df.gdn_tape.max_n
+            || !df.gdn_tape.snapshot_source_armed()
+            || !df.gdn_tape.replay_from_snapshot_admits(gpu, state, &df.target_snap, b)
+            || !df.target_snap.cb_verify_owned_exact(state, config)
+            || !(kv.quant_q8 || kv.quant_fp8)
+            || kv.compact_offset != 0
+        {
+            return false;
+        }
+        df.target_snap.push_owner_ptrs(state, &mut ptrs);
+    }
+    ptrs.sort_unstable();
+    ptrs.windows(2).all(|w| w[0] != w[1])
 }
 
 #[cfg(test)]

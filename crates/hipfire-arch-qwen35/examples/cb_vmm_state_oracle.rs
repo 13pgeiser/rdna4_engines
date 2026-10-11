@@ -3484,6 +3484,7 @@ fn multi_requests(lanes: &mut [LaneRun], fusion: qwen35::DflashFusionCtx) -> Res
             gdn_tape: Some(&lane.df.gdn_tape),
             fusion,
             hidden_rb: Some(&mut lane.df.hidden_rb),
+            dn_state_src: None,
         });
     }
     Ok(reqs)
@@ -3499,8 +3500,9 @@ fn cb_lanes(lanes: &mut [LaneRun]) -> Result<Vec<DflashCbVerifyLane<'_>>> {
     Ok(v)
 }
 
-/// Per-lane singleton draft and pre-verify DeltaNet snapshot (as the singleton
-/// saves it right after the draft).
+/// Per-lane singleton draft (the pre-verify DeltaNet snapshot is NOT taken
+/// here: Direct saves it in [`dflash_verify_lanes`], the Product route inside
+/// `dflash_cb_verify`).
 fn dflash_draft_lanes(gpu: &mut Gpu, slot: &ModelSlot, cb: &mut DflashCbScratch, lanes: &mut [LaneRun]) -> Result<()> {
     for l in lanes.iter_mut() {
         let mark = l.lane.df.draft_scratch.thlog.mark();
@@ -3513,7 +3515,6 @@ fn dflash_draft_lanes(gpu: &mut Gpu, slot: &ModelSlot, cb: &mut DflashCbScratch,
         let drafted = dflash_lane_draft(gpu, &slot.weights, &slot.config, compact, &mut l.lane.df, l.position, l.seed, l.b);
         cb.reclaim_mq(&mut l.lane.df.draft_scratch, lent);
         let drafted = drafted?;
-        l.lane.df.target_snap.save_from(&l.rs.dn, gpu)?;
         l.draft = Some(DflashCbDraft { position: l.position, seed: l.seed, verify_tokens: drafted, max_accept: l.e - 1, thlog_mark: mark });
     }
     gpu.hip.device_synchronize()?;
@@ -3568,6 +3569,18 @@ fn dflash_verify_lanes(
         before.push(tail_guard_rows(gpu, &slot.config, &l.rs.kv, l.position + l.b)?);
     }
     gpu.hip.device_synchronize()?;
+    // Direct prepares the pre-verify snapshot explicitly (the singleton's save
+    // right after its draft; outside the launch probe, as before). The Product
+    // route saves INSIDE `dflash_cb_verify` itself: either its own SAVE loop or
+    // the save-free owner exchange (`HIPFIRE_CB_DN_SAVE_FREE`), so no
+    // harness-side save may precede it, or the exchange would be hidden behind a
+    // copy this oracle issued outside the verify span.
+    if route == Route::Direct {
+        for l in lanes.iter_mut() {
+            l.lane.df.target_snap.save_from(&l.rs.dn, gpu)?;
+        }
+        gpu.hip.device_synchronize()?;
+    }
     let probe = LaunchProbe::start();
     let run = (|| -> Result<std::result::Result<Vec<Vec<u32>>, String>> {
         match route {
@@ -4140,6 +4153,7 @@ fn lone_row_control(
                 gdn_tape: Some(&lane.df.gdn_tape),
                 fusion: qwen35::DflashFusionCtx::ChainVerify,
                 hidden_rb: Some(&mut lane.df.hidden_rb),
+                dn_state_src: None,
             }];
             multi_scoped(gpu, slot, sc.mc, &mut reqs, &sc.vs.final_hidden)
         };
