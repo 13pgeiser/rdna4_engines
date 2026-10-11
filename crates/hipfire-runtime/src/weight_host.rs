@@ -3037,6 +3037,52 @@ mod tests {
         FD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    const FD_ISOLATED_ENV: &str = "HIPFIRE_WH_FD_ISOLATED_CHILD";
+
+    /// Process-wide descriptor counts are only meaningful when nothing else in
+    /// the process opens or closes fds. The lib test binary runs unrelated modules
+    /// in parallel threads, so every test asserting an exact `/proc/self/fd` count
+    /// re-executes itself alone (`--exact --test-threads=1`) in a child process.
+    /// Returns `true` in the parent once the child passed (caller returns early),
+    /// `false` in the child (caller runs the body and its leak assertions).
+    fn fd_isolated(probe_type_name: &str) -> bool {
+        if std::env::var_os(FD_ISOLATED_ENV).is_some() {
+            return false;
+        }
+        let path = probe_type_name
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.strip_suffix("::probe"))
+            .unwrap_or_else(|| panic!("unexpected probe type name {probe_type_name}"));
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([path, "--exact", "--test-threads=1", "--nocapture"])
+            .env(FD_ISOLATED_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "isolated child for {path} failed ({}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status
+        );
+        true
+    }
+
+    /// First statement of every exact-fd-count test.
+    macro_rules! isolate_fd {
+        () => {{
+            fn probe() {}
+            fn name_of<T>(_: &T) -> &'static str {
+                std::any::type_name::<T>()
+            }
+            if fd_isolated(name_of(&probe)) {
+                return;
+            }
+        }};
+    }
+
     /// Temp dir pinned to 0700: the socket rules reject any group/other access and
     /// `tempfile` follows the process umask on some hosts.
     fn private_tempdir() -> tempfile::TempDir {
@@ -3503,6 +3549,7 @@ mod tests {
 
     #[test]
     fn full_lifecycle_with_real_memfds() {
+        isolate_fd!();
         let _g = fd_lock();
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
@@ -3570,6 +3617,7 @@ mod tests {
 
     #[test]
     fn exact_batch_totals_across_32_fd_boundaries() {
+        isolate_fd!();
         let _g = fd_lock();
         for n in [1usize, 31, 32, 33, 64, 65] {
             let dir = private_tempdir();
@@ -3634,6 +3682,7 @@ mod tests {
 
     #[test]
     fn dropped_lease_is_eof_never_a_fabricated_ack() {
+        isolate_fd!();
         let _g = fd_lock();
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
@@ -3708,6 +3757,7 @@ mod tests {
 
     #[test]
     fn identity_mismatch_rejected_before_any_fd() {
+        isolate_fd!();
         let _g = fd_lock();
         let before = open_fd_count();
         type Mutator = Box<dyn Fn(&mut HostHello)>;
@@ -3740,6 +3790,7 @@ mod tests {
 
     #[test]
     fn admission_callback_denial_rejects_client() {
+        isolate_fd!();
         let _g = fd_lock();
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
@@ -3940,6 +3991,7 @@ mod tests {
 
     #[test]
     fn malicious_hosts_fail_closed_without_fd_leaks() {
+        isolate_fd!();
         let _g = fd_lock();
         type Script = Box<dyn FnOnce(&Conn, &HostHello) + Send>;
         let cases: Vec<(&str, Script, fn(&WeightHostError) -> bool)> = vec![
@@ -4212,6 +4264,7 @@ mod tests {
 
     #[test]
     fn host_rejects_bad_clients_without_sending_fds() {
+        isolate_fd!();
         let _g = fd_lock();
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
@@ -4293,6 +4346,7 @@ mod tests {
 
     #[test]
     fn from_listener_poll_release_and_drain() {
+        isolate_fd!();
         let _g = fd_lock();
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
