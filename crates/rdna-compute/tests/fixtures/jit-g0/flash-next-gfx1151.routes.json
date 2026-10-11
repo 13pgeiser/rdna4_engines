@@ -1202,7 +1202,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "02bd1ce360522bd6c5616fd95c0f9e01c709971c2ba91d0ea5949cf827057a65",
+      "sha256": "61ee5e4c93d9f03f8faa3504da90bb8b674821275cb49ec3e8a949011e93bf92",
       "symbols": [
         "gated_delta_conv_qknorm_bf16_f32_batched_k4",
         "gdn_state_f32_to_q8",
