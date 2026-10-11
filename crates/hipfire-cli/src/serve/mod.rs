@@ -33,10 +33,12 @@ use std::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod anthropic;
 pub(crate) mod metrics;
 
 pub mod complete;
 pub mod http;
+pub(crate) mod responses;
 pub(crate) mod ui;
 
 #[derive(Debug)]

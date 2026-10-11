@@ -150,6 +150,8 @@ Implemented paths (anything else → `404`):
 | `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
 | `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
+| `POST` | `/v1/messages` | Anthropic Messages API (stream or non-stream), adapted onto chat completions |
+| `POST` | `/v1/responses` | OpenAI Responses API (stream or non-stream), adapted onto chat completions |
 | `GET` | `/ui`, `/ui/*` | Embedded chat UI (opt-in; see below) |
 
 There is **no** `/v1/completions` route in the current CLI serve.
@@ -252,6 +254,138 @@ through to per-model / registry / daemon defaults when omitted):
 | `reasoning.effort` / `reasoning_effort` | **Semantic effort only** — prompt strength. Never mapped to a think-token budget. Family ladders differ; unsupported/cross-family values are dropped with a warning (see below). |
 | `reasoning.max_tokens` / `max_think_tokens` | Explicit **integer** think-span cap on Qwen Jinja contracts. `0` or omitted = uncapped. DeepSeek, Gemma, Glimmer, and unsupported contracts drop it with a warning. Independent of effort. |
 | `thinking_budget` / `reasoning.budget` | Legacy **named** cap preset only on non-effort-native Qwen templates that still accept it. Dropped+warned elsewhere. |
+
+### `POST /v1/messages` (Anthropic Messages API)
+
+An adapter onto the chat-completions route, not a second generation path.
+The request becomes a chat-completions body, which then goes through the
+same admission (batching eligibility and model lease), tool gate, worker,
+tool-call parser, think routing and stop handling as `/v1/chat/completions`.
+Serve sends the daemon the same `generate` request as the matching chat
+request, so batching and the session cache behave the same. The response is
+rendered back as an Anthropic `message` object or SSE events.
+
+```bash
+curl -N http://127.0.0.1:11435/v1/messages \
+  -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "qwen3.5:4b",
+    "max_tokens": 512,
+    "system": "Be brief.",
+    "messages": [{"role": "user", "content": "hi"}],
+    "stream": true
+  }'
+```
+
+| Messages field | Chat-completions equivalent |
+|---|---|
+| `model`, `max_tokens` (required) | `model`, `max_tokens` |
+| `system` (string or text blocks) | A leading `system` message. Text blocks are concatenated with no separator, as chat content parts are |
+| `messages[]` `text` blocks | Plain-string `content`. Text-only turns keep the plain-string shape the batch routes require |
+| `image` block (base64; `url` source) | One `image_url` part (only base64 PNG/JPEG is accepted, as on chat) |
+| assistant `thinking` blocks | `reasoning_content` (replayed as for chat; `signature` ignored). `redacted_thinking` is dropped |
+| assistant `tool_use` blocks | `tool_calls` (input serialized as the arguments string) |
+| user `tool_result` blocks | `tool` messages with `tool_call_id = tool_use_id`, placed before the turn's text. `is_error: true` prefixes the result with `Error: ` |
+| `tools` (`name`, `description`, `input_schema`) | Function tools. Server tools (`type` other than `custom`) → 400 |
+| `tool_choice` `auto` / `any` / `tool` / `none` | `auto` / `required` / named function / `none`. `disable_parallel_tool_use` is not enforced, like chat's `parallel_tool_calls` |
+| `thinking` `enabled` (+ `budget_tokens`) / `adaptive` / `disabled` | `thinking.type` enabled/disabled; `budget_tokens` → `max_think_tokens` |
+| `thinking` absent | Thinking **off** (the Messages API default). Send `thinking` to enable it |
+| `stop_sequences` | `stop` (same limits: up to 4, each ≤ 64 characters; an empty list is not forwarded) |
+| `temperature`, `top_p`, `top_k` | Same fields |
+| `stream` | SSE (below) |
+| `metadata`, `service_tier`, `cache_control` | Ignored |
+
+Refused with 400 rather than silently changed: a final assistant message
+(response prefill), `document` and other unsupported block types, images
+inside `tool_result`, server tools and `mcp_servers`.
+
+Response: `content` holds a `thinking` block (reasoning, `signature: ""`),
+then a `text` block, then the released `tool_use` blocks. Each appears only
+when it has content. Tool ids are the daemon's or `toolu_<request>_<n>`.
+`stop_reason`: `end_turn` (stop), `max_tokens` (length), `tool_use` (released
+tool calls). The daemon's terminal does not say which stop sequence matched,
+so a stop-sequence stop also reports `end_turn` with `stop_sequence: null`.
+`usage`: `input_tokens` is the prompt minus session-cache hits,
+`cache_read_input_tokens` is the cache hits, `cache_creation_input_tokens` is
+always 0, and `output_tokens` is the chat `completion_tokens`. `timings` and
+`hipfire` carry the same evidence as on chat.
+
+Streaming: `message_start`, then one `content_block_start` /
+`content_block_delta` (`thinking_delta` or `text_delta`) / `content_block_stop`
+run per thinking or text span, as generated. The released `tool_use` blocks
+follow at the end, each with one `input_json_delta` holding the full arguments.
+Then `message_delta` (`stop_reason`, `usage`) and `message_stop`. The
+`message_start` usage is zero, because token counts are known only at the
+terminal, and `message_delta` carries the real counts. Commit timing,
+keepalives and the pre-commit JSON errors work as on chat. A failure after
+commit ends the stream with `event: error`.
+
+Errors use the Anthropic shape `{"type": "error", "error": {"type", "message"}}`
+with chat's status mapping: 400 `invalid_request_error`, 404
+`not_found_error`, 413 `request_too_large`, 503 `overloaded_error` (with
+`Retry-After`), 500 `api_error`. `POST /v1/messages/count_tokens` is not
+implemented (404).
+
+### `POST /v1/responses` (OpenAI Responses API)
+
+An adapter onto the chat-completions route, like `/v1/messages`: same
+admission, batching eligibility, session cache, tool parsing, think routing
+and stop handling. Serve stores no responses. The client resends the
+conversation in `input` (`store` is always reported `false`).
+
+```bash
+curl -N http://127.0.0.1:11435/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5:4b",
+    "instructions": "Be brief.",
+    "input": "hi",
+    "max_output_tokens": 512,
+    "stream": true
+  }'
+```
+
+| Responses field | Chat-completions equivalent |
+|---|---|
+| `instructions` | A leading `system` message |
+| `input` string | One `user` message |
+| `input` message items (`user` / `system` / `developer` / `assistant`; `input_text` / `output_text` parts; `input_image` with `image_url`) | Chat messages with plain-string content (an image keeps the array form, as on chat) |
+| `reasoning` items | `reasoning_content` of the following assistant turn (`content` text, else the `summary` text) |
+| `function_call` items | `tool_calls` of the current assistant turn (`call_id` → id) |
+| `function_call_output` items | `tool` messages (`call_id` → `tool_call_id`) |
+| `tools` (`type: "function"`) | Function tools. Hosted tools → 400 |
+| `tool_choice` `auto` / `none` / `required` / `{type: function, name}` | Same |
+| `max_output_tokens` | `max_tokens` (omitted: fitted to the context as on chat) |
+| `temperature`, `top_p`; extensions `top_k`, `stop` | Same fields |
+| `reasoning.effort` | `reasoning_effort` (absent: the server's reasoning default, as on chat) |
+| `text.format` `json_schema` / `json_object` | `response_format` (enforced only where chat enforces it) |
+| `include`, `store`, `metadata`, `user`, `parallel_tool_calls`, `truncation` | Accepted; not enforced (`parallel_tool_calls` is ignored, as on chat) |
+
+Refused with 400: `previous_response_id`, `conversation`, `prompt`,
+`item_reference` items, `background: true`, hosted tools and `input_file`.
+
+Response: `output` holds a `reasoning` item (`content[0].reasoning_text`,
+empty `summary`), then a `message` item (`output_text`), then the released
+`function_call` items. Each appears only when it has content. Call ids are the
+daemon's or `call_<request>_<n>`. `status` is `completed`, or `incomplete`
+with `incomplete_details.reason: "max_output_tokens"` on length. `usage` has
+`input_tokens` (session-cache hits included and reported in
+`input_tokens_details.cached_tokens`), `output_tokens` and `total_tokens`.
+Reasoning tokens are not counted separately, so `output_tokens_details` is
+omitted.
+
+Streaming: `response.created`, `response.in_progress`, then per reasoning
+span `response.output_item.added` / `response.reasoning_text.delta` /
+`response.reasoning_text.done` / `response.output_item.done`, and per text
+span `output_item.added` / `content_part.added` / `output_text.delta` /
+`output_text.done` / `content_part.done` / `output_item.done`. Released
+function calls follow (`output_item.added`,
+`function_call_arguments.delta` with the full arguments,
+`function_call_arguments.done`, `output_item.done`), then
+`response.completed` (or `response.incomplete`) with the full response. Every
+event carries `sequence_number`. A failure after commit sends `error`, then
+`response.failed`. Errors before commit are OpenAI-shaped `{"error": {...}}`
+with chat's status mapping.
 
 ### `POST /v1/images/generations`
 

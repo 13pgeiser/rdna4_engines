@@ -13295,10 +13295,17 @@ mod tests {
     /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
     #[cfg(unix)]
     fn raw_nonstream_post(port: u16, body: &serde_json::Value) -> (u16, Vec<u8>) {
+        raw_post(port, "/v1/chat/completions", body)
+    }
+
+    /// Raw `POST path` with `Connection: close`: HTTP status and the
+    /// de-chunked body (a whole SSE stream for streaming requests).
+    #[cfg(unix)]
+    fn raw_post(port: u16, path: &str, body: &serde_json::Value) -> (u16, Vec<u8>) {
         use std::net::TcpStream;
         let payload = body.to_string();
         let request = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\n\
+            "POST {path} HTTP/1.1\r\n\
              Host: 127.0.0.1:{port}\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
@@ -13361,6 +13368,395 @@ mod tests {
             remaining = &remaining[size + 2..];
         }
         (status, decoded)
+    }
+
+    /// `(event, data)` pairs of a named-event SSE body (keepalives skipped).
+    #[cfg(unix)]
+    fn named_sse_events(bytes: &[u8]) -> Vec<(String, serde_json::Value)> {
+        String::from_utf8(bytes.to_vec())
+            .expect("SSE body is UTF-8")
+            .split("\n\n")
+            .filter(|frame| !frame.trim().is_empty() && !frame.starts_with(':'))
+            .map(|frame| {
+                let mut event = None;
+                let mut data = None;
+                for line in frame.lines() {
+                    if let Some(name) = line.strip_prefix("event: ") {
+                        event = Some(name.to_owned());
+                    } else if let Some(json) = line.strip_prefix("data: ") {
+                        data = Some(serde_json::from_str(json).expect("SSE data is JSON"));
+                    }
+                }
+                (
+                    event.unwrap_or_else(|| panic!("frame without event: {frame}")),
+                    data.unwrap_or_else(|| panic!("frame without data: {frame}")),
+                )
+            })
+            .collect()
+    }
+
+    /// The last `generate` the fake daemon received, minus its per-request
+    /// wire ids, so two HTTP requests can be compared as daemon requests.
+    #[cfg(unix)]
+    fn last_generate_without_ids(h: &Task11HttpHarness) -> serde_json::Value {
+        let log = h.read_requests_log();
+        let mut generate = (*Task11HttpHarness::ops_of_type(&log, "generate")
+            .last()
+            .expect("a generate reached the daemon"))
+        .clone();
+        let obj = generate.as_object_mut().unwrap();
+        obj.remove("id");
+        obj.remove("attempt_id");
+        generate
+    }
+
+    /// A Messages or Responses request reaches the daemon as exactly the
+    /// generate its chat-completions twin sends: same messages, sampling,
+    /// stops and reasoning controls. Admission, batching eligibility and the
+    /// session cache all key on that request, so they behave identically.
+    #[cfg(unix)]
+    #[test]
+    fn messages_and_responses_reach_the_daemon_as_their_chat_twin() {
+        let h = Task11HttpHarness::spawn("adapter-twins");
+        let chat = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "messages": [
+                { "role": "system", "content": "Be brief." },
+                { "role": "user", "content": "t11-stop-text please" },
+            ],
+            "stop": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+            "thinking": { "type": "disabled" },
+        });
+        assert_eq!(raw_post(h.port(), "/v1/chat/completions", &chat).0, 200);
+        let chat_generate = last_generate_without_ids(&h);
+
+        let messages = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "system": "Be brief.",
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "t11-stop-text please" }] }],
+            "stop_sequences": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+        });
+        assert_eq!(raw_post(h.port(), "/v1/messages", &messages).0, 200);
+        assert_eq!(last_generate_without_ids(&h), chat_generate);
+
+        let mut chat_effort = chat.clone();
+        chat_effort.as_object_mut().unwrap().remove("thinking");
+        chat_effort["reasoning_effort"] = serde_json::json!("low");
+        assert_eq!(
+            raw_post(h.port(), "/v1/chat/completions", &chat_effort).0,
+            200
+        );
+        let chat_generate = last_generate_without_ids(&h);
+        let responses = serde_json::json!({
+            "model": h.model(),
+            "max_output_tokens": 64,
+            "instructions": "Be brief.",
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "t11-stop-text please" }] }],
+            "stop": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+            "reasoning": { "effort": "low" },
+        });
+        assert_eq!(raw_post(h.port(), "/v1/responses", &responses).0, 200);
+        assert_eq!(last_generate_without_ids(&h), chat_generate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anthropic_messages_nonstream_and_stream_shapes() {
+        let h = Task11HttpHarness::spawn("anthropic-messages");
+        let body = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "messages": [{ "role": "user", "content": "t21-think-text please" }],
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &body);
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{message}");
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["role"], "assistant");
+        assert!(message["id"].as_str().unwrap().starts_with("msg_"));
+        assert_eq!(
+            message["content"],
+            serde_json::json!([
+                { "type": "thinking", "thinking": "plan it", "signature": "" },
+                { "type": "text", "text": "answer text" },
+            ])
+        );
+        assert_eq!(message["stop_reason"], "end_turn");
+        assert_eq!(
+            message["usage"],
+            serde_json::json!({ "input_tokens": 9, "cache_creation_input_tokens": 0,
+                                "cache_read_input_tokens": 2, "output_tokens": 5 })
+        );
+
+        let mut stream_body = body.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        let thinking: String = events
+            .iter()
+            .filter_map(|(_, data)| data.pointer("/delta/thinking").and_then(|t| t.as_str()))
+            .collect();
+        let text: String = events
+            .iter()
+            .filter_map(|(_, data)| data.pointer("/delta/text").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            (thinking.as_str(), text.as_str()),
+            ("plan it", "answer text")
+        );
+        assert_eq!(events[9].1["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[9].1["usage"]["output_tokens"], 5);
+
+        // Errors keep the Anthropic shape and the chat route's status mapping.
+        let (status, bytes) = raw_post(
+            h.port(),
+            "/v1/messages",
+            &serde_json::json!({ "model": h.model(), "messages": [] }),
+        );
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 400);
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        let mut unknown = body.clone();
+        unknown["model"] = serde_json::json!("qwen3.5:0.8b");
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &unknown);
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(error["error"]["type"], "not_found_error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anthropic_messages_tool_use_round_trip() {
+        let h = Task11HttpHarness::spawn("anthropic-tools");
+        let tools = serde_json::json!([{
+            "name": "read_file",
+            "description": "read a file",
+            "input_schema": { "type": "object", "properties": { "path": { "type": "string" } } },
+        }]);
+        let first = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "t11-mixed-tool please" }],
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &first);
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{message}");
+        assert_eq!(message["stop_reason"], "tool_use");
+        let content = message["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({ "type": "text", "text": "I'll look that up." })
+        );
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["name"], "read_file");
+        assert_eq!(
+            content[1]["input"],
+            serde_json::json!({ "path": "mixed.rs" })
+        );
+        let tool_id = content[1]["id"].as_str().unwrap().to_owned();
+
+        let mut stream_body = first.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[4].1["content_block"]["type"], "tool_use");
+        assert_eq!(events[4].1["index"], 1);
+        assert_eq!(
+            events[5].1["delta"],
+            serde_json::json!({ "type": "input_json_delta", "partial_json": "{\"path\":\"mixed.rs\"}" })
+        );
+        assert_eq!(events[7].1["delta"]["stop_reason"], "tool_use");
+
+        // Send the tool result back: the daemon gets the chat tool turn.
+        let second = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "tools": tools,
+            "messages": [
+                { "role": "user", "content": "t11-mixed-tool please" },
+                { "role": "assistant", "content": message["content"] },
+                { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": tool_id, "content": "fn main() {}" }] },
+            ],
+        });
+        assert_eq!(raw_post(h.port(), "/v1/messages", &second).0, 200);
+        let generate = last_generate_without_ids(&h);
+        let sent = generate["messages"].as_array().unwrap();
+        assert_eq!(sent[1]["role"], "assistant");
+        assert_eq!(sent[1]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(
+            sent[1]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "path": "mixed.rs" })
+        );
+        assert_eq!(sent[1]["tool_calls"][0]["id"], serde_json::json!(tool_id));
+        assert_eq!(sent[2]["role"], "tool");
+        assert_eq!(sent[2]["content"], "fn main() {}");
+        assert_eq!(sent[2]["tool_call_id"], serde_json::json!(tool_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openai_responses_shapes_and_function_call_round_trip() {
+        let h = Task11HttpHarness::spawn("openai-responses");
+        let body = serde_json::json!({
+            "model": h.model(),
+            "input": "t21-think-text please",
+            "max_output_tokens": 64,
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &body);
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["status"], "completed");
+        assert!(response["id"].as_str().unwrap().starts_with("resp_"));
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "plan it");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "answer text");
+        assert_eq!(
+            response["usage"],
+            serde_json::json!({ "input_tokens": 11, "input_tokens_details": { "cached_tokens": 2 },
+                                "output_tokens": 5, "total_tokens": 16 })
+        );
+
+        let mut stream_body = body.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        for (seq, (_, data)) in events.iter().enumerate() {
+            assert_eq!(data["sequence_number"], serde_json::json!(seq));
+        }
+        assert_eq!(events[11].1["text"], "answer text");
+
+        let tools = serde_json::json!([{
+            "type": "function",
+            "name": "read_file",
+            "description": "read a file",
+            "parameters": { "type": "object", "properties": { "path": { "type": "string" } } },
+        }]);
+        let call = serde_json::json!({ "model": h.model(), "input": "t11-pure-tool please", "tools": tools });
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &call);
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{response}");
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["name"], "read_file");
+        assert_eq!(output[0]["arguments"], "{\"path\":\"a.rs\"}");
+        let call_id = output[0]["call_id"].as_str().unwrap().to_owned();
+
+        let mut stream_call = call.clone();
+        stream_call["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &stream_call);
+        assert_eq!(status, 200);
+        let names: Vec<String> = named_sse_events(&bytes)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let mut input =
+            vec![serde_json::json!({ "role": "user", "content": "t11-pure-tool please" })];
+        input.extend(output.iter().cloned());
+        input.push(serde_json::json!({ "type": "function_call_output", "call_id": call_id, "output": "fn main() {}" }));
+        let round_trip = serde_json::json!({ "model": h.model(), "input": input, "tools": tools });
+        assert_eq!(raw_post(h.port(), "/v1/responses", &round_trip).0, 200);
+        let generate = last_generate_without_ids(&h);
+        let sent = generate["messages"].as_array().unwrap();
+        assert_eq!(
+            sent[1]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "path": "a.rs" })
+        );
+        assert_eq!(sent[1]["tool_calls"][0]["id"], serde_json::json!(call_id));
+        assert_eq!(sent[2]["role"], "tool");
+        assert_eq!(sent[2]["tool_call_id"], serde_json::json!(call_id));
+
+        let (status, bytes) = raw_post(
+            h.port(),
+            "/v1/responses",
+            &serde_json::json!({ "model": h.model(), "input": "x", "previous_response_id": "resp_1" }),
+        );
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 400);
+        assert_eq!(error["error"]["type"], "invalid_request_error");
     }
 
     /// Write a non-stream request and return the live TCP stream without reading status.
