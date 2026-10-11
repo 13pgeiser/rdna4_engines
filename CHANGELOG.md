@@ -2,6 +2,10 @@
 
 ## Unreleased (0.4.2)
 
+- **DFlash continuous-batching draft on gfx1201: lane-batched candidate selector (`HIPFIRE_DFLASH_SELECTOR_LANES=0` is the developer kill switch).** The batched greedy draft now scores every lane's candidates in one selector pass (`propose_candidates_lanes_device`) instead of one pass per lane. It is byte-identical per lane, including ties.
+  - Draft phase −6.5 % (CS95 +3.3..+9.7 %, `predict ab`).
+  - On top of the lane-batched attention entry below, fast-mode C8 greedy medians are 447.8 → 453.5 tok/s. Alone, no tok/s gain was resolved (421.3 vs 424.4 in fast mode; host slow-mode contamination).
+  - Exactness: serve C8 greedy md5 `fa168ee2…` (and C1), BetterBench sampled `91bde7c5…`, `cb_vmm_state_oracle` passes.
 - **DFlash continuous-batching verify on gfx1201: lane-batched FullAttention chain (`HIPFIRE_CB_LANE_FA_BATCH=0` is the developer kill switch).** Each FullAttention layer of the multi-request verify trunk ran seven launches per lane: Q deinterleave+norm, K norm, RoPE, fp8 K and V cache writes, verify attention and reduce. When every lane is a ChainVerify lane on the fp8 VerifyAttn route (≤ 16 lanes, ≤ 32 rows each), the row-local stages run once over all rows. They are followed by one lane K/V cache write (`kv_cache_write_fp8_e4m3_lanes`), one `attention_verify_gqa_fp8_lanes_gfx1201` (the `va_verify_gqa` template per lane, grid.z = lane, each tile writing its own partial slot) and one lane reduce. Lane partials live in a dedicated, grown-on-demand scratch (≤ 1 GiB).
   - Same setup as the tape-copy entry below, interleaved, `predict ab`: verify phase 56.6 → 51.9 ms/step (+9.05 %, CS95 +8.3..+9.8 %); fast-mode C8 greedy medians 424.4 → 447.8 tok/s. The tok/s A/B itself was unresolved because of host slow-mode runs in the base arm.
   - Exactness: `lane_fa_oracle` 18/18 bit-identical outputs and KV rows, serve C8 greedy md5 `fa168ee2…` (and C1), BetterBench sampled `91bde7c5…`, `cb_vmm_state_oracle` passes.
