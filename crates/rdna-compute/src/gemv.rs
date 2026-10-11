@@ -18792,8 +18792,13 @@ impl Gpu {
     /// activation rows (x row stride 2560, y row stride M) in one launch of
     /// grid `[m, ceil(rows / 8)]`: each block stages its weight row once and
     /// dots it with its tile of eight rows (the last tile holds the rest);
-    /// each output row is bitwise the single-row staged kernel's. gfx1151
-    /// only, like the single-row path. Prompt fill.
+    /// each output row is bitwise the single-row staged kernel's. Exact
+    /// gfx1151 and gfx1201 only (Qwen4 MTP prompt fill). The single-row
+    /// reference is the staged kernel on gfx1151 and the unstaged
+    /// `gemv_q8_0` on gfx1201, whose dot (f16 scale, signed-byte
+    /// conversion, one accumulator over the blocks in order, shuffle tree
+    /// 16..1) the staged body repeats after copying the weight row to LDS;
+    /// the fill oracle (`qwen4_mtp_fill`, batched vs per-row) checks both.
     pub fn gemv_q8_0_k2560_staged_rows_tiled(
         &mut self,
         a: &GpuTensor,
@@ -18805,7 +18810,10 @@ impl Gpu {
         const FUNC: &str = "gemv_q8_0_k2560_staged_rows_tiled";
         const TILE: usize = 8;
         let tiles = rows.div_ceil(TILE);
-        if !self.arch_caps.is_gfx1151() || rows == 0 || tiles > 65_535 {
+        if !(self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201())
+            || rows == 0
+            || tiles > 65_535
+        {
             return Err(hip_bridge::HipError::new(
                 1,
                 "gemv_q8_0_k2560_staged_rows_tiled shape",

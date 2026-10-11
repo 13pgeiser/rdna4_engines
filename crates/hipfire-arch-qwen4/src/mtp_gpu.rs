@@ -2522,15 +2522,16 @@ impl Qwen4MtpGpu {
     }
 
     /// Whether [`Self::append_rows`] can run for this model on this GPU:
-    /// gfx1151 only (the tiled Q8_0 projection is the K = 2560 staged GEMV
-    /// the per-row path takes there; other arches run `gemv_q8_0` and have no
-    /// batched twin) and the shipped weight formats and shapes.
+    /// exact gfx1151 or gfx1201 (the tiled Q8_0 projection repeats the dot
+    /// of the per-row Q8_0 GEMV there: the K = 2560 staged GEMV on gfx1151,
+    /// `gemv_q8_0` on gfx1201; other arches have no proven batched twin)
+    /// and the shipped weight formats and shapes.
     pub(crate) fn append_rows_supported(
         gpu: &Gpu,
         weights: &Qwen4Weights,
         config: &Qwen4Config,
     ) -> bool {
-        gpu.arch_caps.is_gfx1151()
+        (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
             && AppendWidths::new(config)
                 .is_some_and(|w| AppendWeights::resolve(weights, config, &w).is_ok())
     }
@@ -2586,8 +2587,8 @@ impl Qwen4MtpGpu {
                 "MTP batched append hidden must be F32 with at least {hidden_elements} elements"
             )));
         }
-        if !gpu.arch_caps.is_gfx1151() {
-            return Err(invalid("MTP batched append is gfx1151 only"));
+        if !(gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) {
+            return Err(invalid("MTP batched append needs exact gfx1151 or gfx1201"));
         }
         if position != self.state.position {
             return Err(invalid(format!(

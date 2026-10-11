@@ -3709,10 +3709,10 @@ pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
 }
 
 /// Whether a native MTP request on this GPU allocates the batched
-/// prompt-fill scratch (`MtpAppendScratch`): exact gfx1151 with
+/// prompt-fill scratch (`MtpAppendScratch`): exact gfx1151 or gfx1201 with
 /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` on.
 pub fn native_mtp_batched_fill(gpu: &Gpu) -> bool {
-    gpu.arch_caps.is_gfx1151() && mtp_batched_fill_enabled()
+    (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && mtp_batched_fill_enabled()
 }
 
 /// Device bytes native MTP adds to a load whose QSA context storage is
