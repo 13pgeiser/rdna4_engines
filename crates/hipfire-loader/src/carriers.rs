@@ -641,6 +641,7 @@ impl Carrier for Qwen4Carrier {
             .ple_rows_source(&hfq)
             .map_err(|error| error.to_string())?;
         let (rows_encoding, rows_total) = match &receipt.ple_rows {
+            hipfire_arch_qwen4::Qwen4PleRows::Absent => (String::new(), 0),
             hipfire_arch_qwen4::Qwen4PleRows::Sidecar { encoding, .. } => (
                 encoding.dtype_name().to_string(),
                 hfq.ple_rows().map_or(0, |rows| rows.header().data_bytes),
@@ -705,7 +706,9 @@ impl Carrier for Qwen4Carrier {
         );
         let config = receipt.config;
         let mut manifest = receipt.manifest;
-        let metadata = receipt.ple;
+        let metadata = receipt.ple.ok_or_else(|| {
+            "qwen4: the FN runtime requires PLE hash metadata; this profile has no PLE".to_string()
+        })?;
         let placements = receipt.placements;
         let ple_rows = receipt.ple_rows;
         let mut session_domain = hipfire_runtime::serve_contract::CacheDomain::for_model(

@@ -145,13 +145,16 @@ fn run_inner(args: &HotPackArgs) -> Result<Value, String> {
             ));
         }
     }
+    let metadata = receipt.ple.as_ref().ok_or_else(|| {
+        "PLE hot-pack generation requires PLE hash metadata; this profile has no PLE".to_string()
+    })?;
     let descriptors = receipt
         .ple_row_descriptors(&hfq)
         .map_err(|e| format!("PLE rows of {}: {e}", args.model.display()))?;
     let (rows_path, rows_bytes) = receipt
         .ple_rows_source(&hfq)
         .map_err(|e| format!("PLE rows of {}: {e}", args.model.display()))?;
-    let plan = ple_hot_plan(&receipt.ple, &descriptors, &rows_path, rows_bytes)?
+    let plan = ple_hot_plan(metadata, &descriptors, &rows_path, rows_bytes)?
         .ok_or_else(|| "PLE rows are neither Q8F16 nor Q4LM".to_string())?;
     let out = args
         .out

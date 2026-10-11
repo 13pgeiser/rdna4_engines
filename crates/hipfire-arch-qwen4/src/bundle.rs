@@ -478,6 +478,8 @@ impl Qwen4Bundle {
     /// Assemble with validated metadata read from the artifact's exact I64
     /// arrays.  The transaction is consumed so no load-side owner can remain
     /// live after this method publishes the bundle.
+    /// Accepts required or optional admission metadata; profiles without PLE
+    /// are refused by the FN runtime before assembling weights or state.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_with_metadata(
         config: Qwen4Config,
@@ -485,7 +487,7 @@ impl Qwen4Bundle {
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
         max_seq_len: usize,
-        metadata: PleHashMetadata,
+        metadata: impl Into<Option<PleHashMetadata>>,
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
     ) -> Result<Self, BundleError> {
@@ -508,6 +510,8 @@ impl Qwen4Bundle {
     /// [`Qwen4PleRows::Sidecar`] builds the row store from the sidecar's
     /// descriptors, and `transaction` then carries no PLE shards (the
     /// admitted manifest was trimmed).
+    /// [`Qwen4PleRows::Absent`] and missing metadata are refused before
+    /// assembling weights or allocating runtime state.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_with_ple_rows(
         config: Qwen4Config,
@@ -515,11 +519,21 @@ impl Qwen4Bundle {
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
         max_seq_len: usize,
-        metadata: PleHashMetadata,
+        metadata: impl Into<Option<PleHashMetadata>>,
         ple_source: Qwen4PleRows,
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
     ) -> Result<Self, BundleError> {
+        let metadata = metadata.into().ok_or_else(|| {
+            BundleError::Weights(WeightError::DescriptorMismatch(
+                "qwen4: the FN runtime requires PLE hash metadata; this profile has no PLE".into(),
+            ))
+        })?;
+        if matches!(ple_source, Qwen4PleRows::Absent) {
+            return Err(BundleError::Weights(WeightError::DescriptorMismatch(
+                "qwen4: the FN runtime requires a PLE rows source; this profile has no PLE".into(),
+            )));
+        }
         let weights = match Qwen4Weights::assemble(&mut transaction, &config, placements) {
             Ok(weights) => weights,
             Err(error) => {
@@ -614,6 +628,9 @@ impl Qwen4Bundle {
     /// the bundle's own reader already owns the same sealed descriptors.
     pub fn ple_descriptors(&self) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
         match &self.ple_source {
+            Qwen4PleRows::Absent => Err(BundleError::Weights(WeightError::DescriptorMismatch(
+                "qwen4: the FN runtime requires a PLE rows source; this profile has no PLE".into(),
+            ))),
             Qwen4PleRows::Embedded => ple_descriptors(
                 &self.weight_store.transaction,
                 self.manifest(),
@@ -2796,6 +2813,11 @@ fn build_ple_row_store(
     wide_readers: bool,
 ) -> Result<RowStore, BundleError> {
     let descriptors = match source {
+        Qwen4PleRows::Absent => {
+            return Err(BundleError::Weights(WeightError::DescriptorMismatch(
+                "qwen4: the FN runtime requires a PLE rows source; this profile has no PLE".into(),
+            )));
+        }
         Qwen4PleRows::Embedded => ple_descriptors(transaction, manifest, metadata)?,
         Qwen4PleRows::Sidecar {
             rows: SidecarRows::Descriptors(descriptors),
@@ -3118,7 +3140,7 @@ mod tests {
     #[test]
     fn rejects_metadata_with_same_padding_but_different_valid_rows() {
         let canonical = PleHashMetadata::qwen4();
-        let mut sizes = *canonical.head_vocab_sizes();
+        let mut sizes: [u64; PLE_HEAD_COUNT] = canonical.head_vocab_sizes().try_into().unwrap();
         sizes[PLE_HEAD_COUNT - 1] -= 1;
         let mut offsets = [0u64; PLE_HEAD_COUNT];
         for head in 1..PLE_HEAD_COUNT {

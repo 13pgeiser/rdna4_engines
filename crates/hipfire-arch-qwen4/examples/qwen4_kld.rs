@@ -183,7 +183,14 @@ impl Model {
         let hot_plan =
             match (ple_hot, ple_descriptors.as_deref()) {
                 (Some(_), Some(descriptors)) => Some(
-                    ple_hot_plan(&receipt.ple, descriptors, &ple_rows_path, ple_rows_bytes)?
+                    ple_hot_plan(
+                        receipt.ple.as_ref().ok_or(
+                            "--ple-hot requires PLE hash metadata; this profile has no PLE",
+                        )?,
+                        descriptors,
+                        &ple_rows_path,
+                        ple_rows_bytes,
+                    )?
                         .ok_or("--ple-hot: the PLE rows are neither Q8F16 nor Q4LM")?,
                 ),
                 (Some(_), None) => return Err(

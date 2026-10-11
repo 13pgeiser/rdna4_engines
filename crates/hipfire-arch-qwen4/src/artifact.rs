@@ -10,19 +10,15 @@
 //! is value-only: it owns validated declarations and a source seal, but never
 //! allocates GPU memory or starts a reader worker.
 
-use crate::config::{Qwen4Config, ARCH_ID};
+use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
 use crate::ple::PleHashMetadata;
-use crate::weights::{
-    is_ple_shard_name, Qwen4Manifest, Qwen4Placement, PLE_ROW_WIDTH, PLE_SHARD_COUNT,
-    PLE_SHARD_ROWS,
-};
+use crate::weights::{is_ple_shard_name_within, Qwen4Manifest, Qwen4Placement};
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::model_source::{SourceFormat, SourceIdentity, SourceRangeDescriptor};
 use hipfire_runtime::ple_hot_pack::PackOrder;
 use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::ple_q4::{lm4_codebook_bits, lm4_scale_grid_bits};
-use hipfire_runtime::ple_sidecar::ple_shard_name;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::external_row_stride;
 use rdna_compute::DType;
@@ -50,16 +46,34 @@ const QWEN4_QT_MFP4G32E8SOA: u8 = 35;
 /// or read unrotated activations.
 const QWEN4_MFP4G32E8SOA_K_ALIGNMENT: usize = 256;
 
-const PLE_MULTIPLIERS_NAME: &str =
-    "model.language_model.layers.1.ple.ple_embedding.layer_multipliers";
-const PLE_OFFSETS_NAME: &str =
-    "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets";
-const PLE_VOCAB_SIZES_NAME: &str =
-    "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes";
 /// PLE metadata is deliberately tiny.  Refuse an unexpectedly large record
 /// before allocating a host read buffer, even if a corrupt index advertises a
 /// matching shape with a huge byte extent.
 const MAX_PLE_METADATA_BYTES: usize = 2048;
+
+/// Zero-based layer PLE shard tensors and I64 records live under.
+fn ple_tensor_prefix(layer: usize) -> String {
+    format!("model.language_model.layers.{layer}.ple")
+}
+
+/// Name of PLE shard `shard` of the PLE block at `layer`.
+fn ple_shard_tensor_name(layer: usize, shard: usize) -> String {
+    format!(
+        "{}.ple_embedding.ngram_embedding.shard_{shard}.weight",
+        ple_tensor_prefix(layer)
+    )
+}
+
+/// The three I64 PLE records of the PLE block at `layer`:
+/// `[layer_multipliers, ngram_heads_offsets, ngram_heads_vocab_sizes]`.
+fn ple_record_names(layer: usize) -> [String; 3] {
+    let base = format!("{}.ple_embedding", ple_tensor_prefix(layer));
+    [
+        format!("{base}.layer_multipliers"),
+        format!("{base}.ngram_heads_offsets"),
+        format!("{base}.ngram_heads_vocab_sizes"),
+    ]
+}
 
 /// Where an admitted artifact's PLE n-gram rows come from.
 ///
@@ -69,8 +83,11 @@ const MAX_PLE_METADATA_BYTES: usize = 2048;
 /// `hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows`.
 #[derive(Clone, Debug)]
 pub enum Qwen4PleRows {
-    /// The 128 shard tensors of the admitted HFQM file itself (the
-    /// monolithic artifact, read exactly as before sidecars existed).
+    /// The profile declares no PLE: there are no rows, no shard tensors, no
+    /// I64 records and no sidecar.
+    Absent,
+    /// The shard tensors of the admitted HFQM file itself (the monolithic
+    /// artifact, read exactly as before sidecars existed).
     Embedded,
     /// An attached, validated sidecar rows file.
     Sidecar {
@@ -126,16 +143,19 @@ impl Qwen4PleRows {
 #[derive(Clone, Debug)]
 pub struct Qwen4HfqmArtifact {
     pub config: Qwen4Config,
-    /// The weight manifest.  With a sidecar the 128 PLE shard entries are
+    /// The weight manifest.  With a sidecar the PLE shard entries are
     /// removed ([`Qwen4Manifest::without_ple_shards`]): their rows are read
     /// from the sidecar, never fulfilled from the HFQM file.
     pub manifest: Qwen4Manifest,
-    pub ple: PleHashMetadata,
+    /// The validated PLE hash metadata; `None` exactly when the profile
+    /// declares no PLE.
+    pub ple: Option<PleHashMetadata>,
     pub placements: Vec<Qwen4Placement>,
     pub source_tensor_count: usize,
     pub source_identity: Arc<SourceIdentity>,
     /// The PLE rows source the bundle must be assembled with
-    /// (`Qwen4Bundle::assemble_with_ple_rows`).
+    /// (`Qwen4Bundle::assemble_with_ple_rows`); [`Qwen4PleRows::Absent`] when
+    /// the profile has no PLE.
     pub ple_rows: Qwen4PleRows,
 }
 
@@ -698,11 +718,29 @@ fn validate_source_identity(hfq: &HfqFile) -> Result<Arc<SourceIdentity>, Qwen4A
 /// never read).  Without a sidecar the manifest declares the shards, so a
 /// split base fails here with the actionable message instead of a bare
 /// missing-tensor error.
-fn validate_ple_shard_presence(hfq: &HfqFile, sidecar: bool) -> Result<usize, Qwen4ArtifactError> {
+///
+/// The shard count is the profile's: a profile without PLE has no shards, no
+/// split-base marker and no sidecar, and an artifact that carries either is
+/// refused rather than ignored.
+fn validate_ple_shard_presence(
+    hfq: &HfqFile,
+    sidecar: bool,
+    ple: Option<&Qwen4PleConfig>,
+) -> Result<usize, Qwen4ArtifactError> {
+    let Some(ple) = ple else {
+        if sidecar || hfq.ple_rows_marker().is_some() {
+            return Err(Qwen4ArtifactError::new(
+                "qwen4: this profile declares no PLE, but the artifact carries a PLE rows \
+                 sidecar or split-base marker",
+            ));
+        }
+        return Ok(0);
+    };
+    let shard_count = ple.shard_count;
     let present = hfq
         .tensors()
         .iter()
-        .filter(|tensor| is_ple_shard_name(&tensor.name))
+        .filter(|tensor| is_ple_shard_name_within(&tensor.name, shard_count))
         .count();
     let split = present == 0 && hfq.ple_rows_marker().is_some();
     if !sidecar {
@@ -716,9 +754,16 @@ fn validate_ple_shard_presence(hfq: &HfqFile, sidecar: bool) -> Result<usize, Qw
         }
         return Ok(0);
     }
-    if present != 0 && present != PLE_SHARD_COUNT {
+    if ple.layer != 1 {
         return Err(Qwen4ArtifactError::new(format!(
-            "qwen4: source carries {present} of {PLE_SHARD_COUNT} PLE shard tensors; a PLE rows \
+            "qwen4: PLE rows sidecars address the PLE block at layer 1; this profile's PLE is \
+             at layer {}",
+            ple.layer
+        )));
+    }
+    if present != 0 && present != shard_count {
+        return Err(Qwen4ArtifactError::new(format!(
+            "qwen4: source carries {present} of {shard_count} PLE shard tensors; a PLE rows \
              sidecar needs all of them (monolithic) or none (split base)"
         )));
     }
@@ -731,10 +776,19 @@ fn validate_ple_shard_presence(hfq: &HfqFile, sidecar: bool) -> Result<usize, Qw
     Ok(present)
 }
 
+/// The complete expected inventory against an HFQ tensor index: exact names,
+/// shapes, quant tags, group sizes and byte extents.  It reads only index
+/// records, so it runs identically over a real container and over a
+/// header-only dry inventory, and every refusal happens before any allocation
+/// proportional to tensor payloads.
+///
+/// `shadowed_ple_shards` is how many index records a PLE rows sidecar shadows
+/// (`shadow_shard_count` is the profile's shard count for recognising them).
 fn validate_manifest_inventory(
-    hfq: &HfqFile,
+    tensors: &[HfqTensorInfo],
     manifest: &Qwen4Manifest,
     shadowed_ple_shards: usize,
+    shadow_shard_count: usize,
 ) -> Result<usize, Qwen4ArtifactError> {
     let mut expected = BTreeMap::<String, Vec<u32>>::new();
     for entry in &manifest.weights {
@@ -789,20 +843,23 @@ fn validate_manifest_inventory(
             expected.len()
         )));
     }
-    let hfq_declared = hfq.tensors().len() - shadowed_ple_shards;
+    let hfq_declared = tensors.len().checked_sub(shadowed_ple_shards).ok_or_else(|| {
+        Qwen4ArtifactError::new("qwen4: more shadowed PLE shards than index records")
+    })?;
     if hfq_declared != manifest_count {
         return Err(Qwen4ArtifactError::new(format!(
             "qwen4: HFQ source inventory has {hfq_declared} tensors but manifest declares {manifest_count}",
         )));
     }
-    for tensor in hfq.tensors() {
+    for tensor in tensors {
         if is_vision_tensor(&tensor.name) {
             return Err(Qwen4ArtifactError::new(format!(
                 "qwen4: vision tensor {} is not admitted by the text-only source boundary",
                 tensor.name
             )));
         }
-        if shadowed_ple_shards != 0 && is_ple_shard_name(&tensor.name) {
+        if shadowed_ple_shards != 0 && is_ple_shard_name_within(&tensor.name, shadow_shard_count)
+        {
             // Shadowed by the attached sidecar: `HfqFile::attach_ple_rows`
             // already bound their geometry to the sidecar header.
             continue;
@@ -825,11 +882,17 @@ fn validate_manifest_inventory(
             "qwen4: source inventory is missing manifest tensor {name}"
         )));
     }
+    // Every index name is unique and declared at this point, so a by-name
+    // index is exact.
+    let by_name: BTreeMap<&str, &HfqTensorInfo> = tensors
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect();
     for entry in &manifest.weights {
         if matches!(&entry.policy, ShardPolicy::Tied { .. }) {
             continue;
         }
-        let info = hfq.find_tensor_info(&entry.name).ok_or_else(|| {
+        let info = by_name.get(entry.name.as_str()).copied().ok_or_else(|| {
             Qwen4ArtifactError::new(format!(
                 "qwen4: source tensor {} disappeared while validating geometry",
                 entry.name
@@ -838,7 +901,7 @@ fn validate_manifest_inventory(
         validate_weight_geometry(entry, info)?;
     }
     for metadata in &manifest.metadata {
-        let info = hfq.find_tensor_info(&metadata.name).ok_or_else(|| {
+        let info = by_name.get(metadata.name.as_str()).copied().ok_or_else(|| {
             Qwen4ArtifactError::new(format!(
                 "qwen4: metadata tensor {} disappeared while validating geometry",
                 metadata.name
@@ -849,6 +912,126 @@ fn validate_manifest_inventory(
     Ok(manifest_count)
 }
 
+/// The PLE hash metadata of `metadata_json` against the profile's PLE.
+///
+/// A profile without PLE has no `qwen4_ple` object (one present is refused).
+/// Flash-Next must equal the pinned canonical metadata exactly; a synthetic
+/// profile is checked against its own explicit geometry.
+fn admit_ple_metadata(
+    metadata_json: &str,
+    config: &Qwen4Config,
+) -> Result<Option<PleHashMetadata>, Qwen4ArtifactError> {
+    let Some(ple_config) = config.ple.as_ref() else {
+        let value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
+            Qwen4ArtifactError::new(format!("qwen4: PLE metadata admission failed: {error}"))
+        })?;
+        if value.get("qwen4_ple").is_some() {
+            return Err(Qwen4ArtifactError::new(
+                "qwen4: this profile declares no PLE, but the metadata carries a qwen4_ple object",
+            ));
+        }
+        return Ok(None);
+    };
+    if config.profile.is_flash_next() {
+        let ple = PleHashMetadata::from_json(metadata_json).map_err(|error| {
+            Qwen4ArtifactError::new(format!("qwen4: PLE metadata admission failed: {error}"))
+        })?;
+        if ple != PleHashMetadata::qwen4() {
+            return Err(Qwen4ArtifactError::new(
+                "qwen4: PLE metadata does not match the pinned manifest contract",
+            ));
+        }
+        return Ok(Some(ple));
+    }
+    let ple = PleHashMetadata::from_json_for(metadata_json, ple_config).map_err(|error| {
+        Qwen4ArtifactError::new(format!("qwen4: PLE metadata admission failed: {error}"))
+    })?;
+    ple_config.check_hash_metadata(&ple).map_err(|error| {
+        Qwen4ArtifactError::new(format!(
+            "qwen4: PLE metadata does not match the profile's PLE geometry: {error}"
+        ))
+    })?;
+    Ok(Some(ple))
+}
+
+/// Production admission parses with the production parser, which refuses every
+/// `hipfire_profile` marker.  Only a build with the explicit
+/// `qwen4-dev-profiles` feature routes the developer marker to the developer
+/// parser; there is no environment or config key that does.
+fn parse_artifact_config(metadata_json: &str) -> Result<Qwen4Config, Qwen4ArtifactError> {
+    #[cfg(feature = "qwen4-dev-profiles")]
+    let parsed = Qwen4Config::from_developer_metadata_json(metadata_json);
+    #[cfg(not(feature = "qwen4-dev-profiles"))]
+    let parsed = Qwen4Config::from_metadata_json(metadata_json);
+    parsed.map_err(|error| Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}")))
+}
+
+/// Receipt of a header-only inventory admission: no container, payload,
+/// source seal or GPU is involved, so it states exactly one thing — the
+/// declared index is the profile's exact inventory.
+#[derive(Clone, Debug)]
+pub struct Qwen4InventoryReceipt {
+    pub config: Qwen4Config,
+    pub manifest: Qwen4Manifest,
+    pub ple: Option<PleHashMetadata>,
+    pub source_tensor_count: usize,
+}
+
+fn admit_inventory(
+    arch_id: u32,
+    config: Qwen4Config,
+    metadata_json: &str,
+    tensors: &[HfqTensorInfo],
+) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+    if arch_id != ARCH_ID {
+        return Err(Qwen4ArtifactError::new(format!(
+            "qwen4: source arch_id={arch_id} does not match reserved arch_id={ARCH_ID}"
+        )));
+    }
+    let manifest = Qwen4Manifest::build(&config).map_err(|error| {
+        Qwen4ArtifactError::new(format!("qwen4: manifest admission failed: {error}"))
+    })?;
+    let source_tensor_count = validate_manifest_inventory(tensors, &manifest, 0, 0)?;
+    let ple = admit_ple_metadata(metadata_json, &config)?;
+    Ok(Qwen4InventoryReceipt {
+        config,
+        manifest,
+        ple,
+        source_tensor_count,
+    })
+}
+
+/// Header-only dry inventory admission under the **production** parser: the
+/// declared index of a Flash-Next artifact must be the exact pinned inventory
+/// (names, shapes, quant tags, group sizes, byte extents).  A config carrying
+/// a developer profile marker is refused.
+pub fn admit_inventory_headers(
+    arch_id: u32,
+    metadata_json: &str,
+    tensors: &[HfqTensorInfo],
+) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+    let config = Qwen4Config::from_metadata_json(metadata_json).map_err(|error| {
+        Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
+    })?;
+    admit_inventory(arch_id, config, metadata_json, tensors)
+}
+
+/// Explicit developer admission of a header-only dry inventory: Flash-Next
+/// (no marker) or a synthetic developer profile (explicit marker).  The index
+/// must still be the profile's exact inventory.  It proves inventory only; it
+/// does not make a synthetic profile executable.
+#[cfg(feature = "qwen4-dev-profiles")]
+pub fn admit_developer_inventory_headers(
+    arch_id: u32,
+    metadata_json: &str,
+    tensors: &[HfqTensorInfo],
+) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+    let config = Qwen4Config::from_developer_metadata_json(metadata_json).map_err(|error| {
+        Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
+    })?;
+    admit_inventory(arch_id, config, metadata_json, tensors)
+}
+
 /// Validate one exact Qwen4 HFQM artifact before any GPU allocation.
 ///
 /// The check covers the immutable container/index identity, the complete
@@ -856,6 +1039,15 @@ fn validate_manifest_inventory(
 /// three signed-I64 PLE metadata records.  It intentionally accepts only the
 /// executable text HFQM contract; safetensors, overlays, vision records, and
 /// unknown quant tags fail closed.
+///
+/// Feature boundary: a default build (no `qwen4-dev-profiles`) is
+/// production-strict — the production parser refuses every config carrying a
+/// `hipfire_profile` marker, so a synthetic artifact never reaches the loader.
+/// A build compiled with the explicit `qwen4-dev-profiles` feature routes the
+/// same call through the developer parser, which additionally admits a
+/// synthetic profile that carries the explicit developer marker (never one
+/// inferred from geometry), still under its exact inventory and extents.  No
+/// environment variable or config key crosses this boundary.
 pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
     if hfq.arch_id != ARCH_ID {
         return Err(Qwen4ArtifactError::new(format!(
@@ -874,34 +1066,35 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
             "qwen4: REAP/head overlays are not admitted for exact HFQM inventory",
         ));
     }
-    let config = Qwen4Config::from_metadata_json(&hfq.metadata_json).map_err(|error| {
-        Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
-    })?;
+    let config = parse_artifact_config(&hfq.metadata_json)?;
     let mut manifest = Qwen4Manifest::build(&config).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: manifest admission failed: {error}"))
     })?;
+    let ple_config = config.ple.as_ref();
     let sidecar = hfq.ple_rows().is_some();
-    let shadowed_ple_shards = validate_ple_shard_presence(hfq, sidecar)?;
+    let shadowed_ple_shards = validate_ple_shard_presence(hfq, sidecar, ple_config)?;
     if sidecar {
         manifest = manifest.without_ple_shards();
     }
-    let source_tensor_count = validate_manifest_inventory(hfq, &manifest, shadowed_ple_shards)?;
-    let ple = PleHashMetadata::from_json(&hfq.metadata_json).map_err(|error| {
-        Qwen4ArtifactError::new(format!("qwen4: PLE metadata admission failed: {error}"))
-    })?;
-    let canonical_ple = PleHashMetadata::qwen4();
-    if ple != canonical_ple {
-        return Err(Qwen4ArtifactError::new(
-            "qwen4: PLE metadata does not match the pinned manifest contract",
-        ));
-    }
+    let source_tensor_count = validate_manifest_inventory(
+        hfq.tensors(),
+        &manifest,
+        shadowed_ple_shards,
+        ple_config.map_or(0, |ple| ple.shard_count),
+    )?;
+    let ple = admit_ple_metadata(&hfq.metadata_json, &config)?;
 
     // Seal every descriptor before reading the three tiny records.  This
     // keeps the bounded host reads tied to the same source identity as all
     // later external-row reads.
     let source_identity = validate_source_identity(hfq)?;
-    validate_ple_records(hfq, &canonical_ple)?;
-    let ple_rows = admit_ple_rows(hfq, &canonical_ple)?;
+    let ple_rows = match (ple_config, &ple) {
+        (Some(ple_config), Some(ple)) => {
+            validate_ple_records(hfq, ple_config, ple)?;
+            admit_ple_rows(hfq, ple_config, ple)?
+        }
+        _ => Qwen4PleRows::Absent,
+    };
 
     let placements = manifest
         .resident_keys()
@@ -957,37 +1150,42 @@ impl SidecarGeometry {
     }
 }
 
-/// The sidecar's geometry against the canonical PLE contract, and the row
+/// The sidecar's geometry against the profile's PLE contract, and the row
 /// encoding it declares.
 ///
-/// A sidecar is accepted only at the exact geometry the pinned metadata
-/// hashes into: [`PLE_SHARD_COUNT`] shards of [`PLE_SHARD_ROWS`] rows of
-/// [`PLE_ROW_WIDTH`] values, summing to the metadata's padded rows.  Q4LM
-/// must carry the exact LM4 codebook and scale grid the decoder is compiled
-/// with (the decoder has no way to read another), and Q8F16 carries neither.
+/// A sidecar is accepted only at the exact geometry the profile's metadata
+/// hashes into: `ple.shard_count` shards of `ple.shard_rows` rows of
+/// `ple.row_width` values, summing to the metadata's padded rows (for
+/// Flash-Next 128 x 2,500,012 x 160).  Q4LM must carry the exact LM4 codebook
+/// and scale grid the decoder is compiled with (the decoder has no way to read
+/// another), and Q8F16 carries neither.
 fn validate_sidecar_geometry(
     geometry: &SidecarGeometry,
+    ple: &Qwen4PleConfig,
     canonical: &PleHashMetadata,
 ) -> Result<RowEncoding, Qwen4ArtifactError> {
     let fail =
         |what: String| Qwen4ArtifactError::new(format!("qwen4: PLE rows sidecar geometry: {what}"));
-    if geometry.rows_per_shard != PLE_SHARD_ROWS as u64
-        || geometry.row_width != PLE_ROW_WIDTH as u64
+    if geometry.rows_per_shard != ple.shard_rows as u64
+        || geometry.row_width != ple.row_width as u64
     {
         return Err(fail(format!(
-            "{} rows per shard x {} values, expected {PLE_SHARD_ROWS} x {PLE_ROW_WIDTH}",
-            geometry.rows_per_shard, geometry.row_width
+            "{} rows per shard x {} values, expected {} x {}",
+            geometry.rows_per_shard, geometry.row_width, ple.shard_rows, ple.row_width
         )));
     }
-    // Canonical rows per shard times `PLE_SHARD_COUNT` is the metadata's
-    // padded row count, so equality here pins the shard count too.
+    // Rows per shard times the shard count is the metadata's padded row
+    // count, so equality here pins the shard count too.
+    let declared_padded = (ple.shard_rows as u64).checked_mul(ple.shard_count as u64);
     if geometry.padded_rows != canonical.padded_rows()
-        || geometry.padded_rows != (PLE_SHARD_ROWS * PLE_SHARD_COUNT) as u64
+        || Some(geometry.padded_rows) != declared_padded
     {
         return Err(fail(format!(
-            "{} padded rows, PLE metadata has {} ({PLE_SHARD_COUNT} shards of {PLE_SHARD_ROWS})",
+            "{} padded rows, PLE metadata has {} ({} shards of {})",
             geometry.padded_rows,
-            canonical.padded_rows()
+            canonical.padded_rows(),
+            ple.shard_count,
+            ple.shard_rows
         )));
     }
     let encoding = geometry.encoding;
@@ -997,7 +1195,7 @@ fn validate_sidecar_geometry(
             encoding.dtype_name()
         )));
     }
-    let row_bytes = encoding.encoded_row_bytes(PLE_ROW_WIDTH) as u64;
+    let row_bytes = encoding.encoded_row_bytes(ple.row_width) as u64;
     if geometry.encoded_row_bytes != row_bytes {
         return Err(fail(format!(
             "{} rows are {} bytes, expected {row_bytes}",
@@ -1022,6 +1220,7 @@ fn validate_sidecar_geometry(
 /// none attached, its own embedded shard tensors.
 fn admit_ple_rows(
     hfq: &HfqFile,
+    ple: &Qwen4PleConfig,
     canonical: &PleHashMetadata,
 ) -> Result<Qwen4PleRows, Qwen4ArtifactError> {
     let Some(rows) = hfq.ple_rows() else {
@@ -1029,7 +1228,7 @@ fn admit_ple_rows(
     };
     let path = rows.path();
     let geometry = SidecarGeometry::from_header(rows.header())?;
-    let encoding = validate_sidecar_geometry(&geometry, canonical)?;
+    let encoding = validate_sidecar_geometry(&geometry, ple, canonical)?;
     let sidecar_rows = match rows.order() {
         PackOrder::Row => {
             let descriptors = rows.shard_descriptors().map_err(|error| {
@@ -1038,12 +1237,12 @@ fn admit_ple_rows(
                     path.display()
                 ))
             })?;
-            if descriptors.len() != PLE_SHARD_COUNT {
+            if descriptors.len() != ple.shard_count {
                 return Err(Qwen4ArtifactError::new(format!(
-                    "qwen4: PLE rows sidecar {} yields {} shard descriptors, expected \
-                     {PLE_SHARD_COUNT}",
+                    "qwen4: PLE rows sidecar {} yields {} shard descriptors, expected {}",
                     path.display(),
-                    descriptors.len()
+                    descriptors.len(),
+                    ple.shard_count
                 )));
             }
             SidecarRows::Descriptors(descriptors)
@@ -1063,16 +1262,18 @@ fn admit_ple_rows(
 }
 
 impl Qwen4HfqmArtifact {
-    /// The [`PLE_SHARD_COUNT`] ordered shard descriptors of the PLE rows
-    /// source: the row-order sidecar's, or the artifact's own shard tensors
-    /// (`hfq` must be the file this receipt was admitted from).  A
-    /// rank-order table has none: it is its own hot-row pack and is read
-    /// through its store ([`Qwen4PleRows::rank_table`]).
+    /// The ordered shard descriptors of the PLE rows source (one per
+    /// `config.ple.shard_count`): the row-order sidecar's, or the artifact's
+    /// own shard tensors (`hfq` must be the file this receipt was admitted
+    /// from).  A rank-order table has none: it is its own hot-row pack and is
+    /// read through its store ([`Qwen4PleRows::rank_table`]).  A profile
+    /// without PLE has no rows source and yields no descriptors.
     pub fn ple_row_descriptors(
         &self,
         hfq: &HfqFile,
     ) -> Result<Vec<SourceRangeDescriptor>, Qwen4ArtifactError> {
         match &self.ple_rows {
+            Qwen4PleRows::Absent => Ok(Vec::new()),
             Qwen4PleRows::Sidecar {
                 rows: SidecarRows::Descriptors(descriptors),
                 ..
@@ -1085,20 +1286,27 @@ impl Qwen4HfqmArtifact {
                 "qwen4: PLE rows {} are a rank-order table; it has no row-order shard ranges",
                 path.display()
             ))),
-            Qwen4PleRows::Embedded => (0..PLE_SHARD_COUNT)
-                .map(|shard| {
-                    let name = ple_shard_name(shard);
-                    hfq.tensor_range(&name)
-                        .map_err(|error| {
-                            Qwen4ArtifactError::new(format!(
-                                "qwen4: PLE shard range {name} could not be sealed: {error}"
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            Qwen4ArtifactError::new(format!("qwen4: PLE shard {name} is missing"))
-                        })
-                })
-                .collect(),
+            Qwen4PleRows::Embedded => {
+                let ple = self.config.ple.as_ref().ok_or_else(|| {
+                    Qwen4ArtifactError::new("qwen4: embedded PLE rows without a PLE profile")
+                })?;
+                (0..ple.shard_count)
+                    .map(|shard| {
+                        let name = ple_shard_tensor_name(ple.layer, shard);
+                        hfq.tensor_range(&name)
+                            .map_err(|error| {
+                                Qwen4ArtifactError::new(format!(
+                                    "qwen4: PLE shard range {name} could not be sealed: {error}"
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                Qwen4ArtifactError::new(format!(
+                                    "qwen4: PLE shard {name} is missing"
+                                ))
+                            })
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -1107,6 +1315,9 @@ impl Qwen4HfqmArtifact {
     /// and verified against exactly this file.
     pub fn ple_rows_source(&self, hfq: &HfqFile) -> Result<(PathBuf, u64), Qwen4ArtifactError> {
         match &self.ple_rows {
+            Qwen4PleRows::Absent => Err(Qwen4ArtifactError::new(
+                "qwen4: this profile has no PLE rows source",
+            )),
             Qwen4PleRows::Embedded => {
                 let file = self.source_identity.files.first().ok_or_else(|| {
                     Qwen4ArtifactError::new("qwen4: source identity has no backing file")
@@ -1191,15 +1402,17 @@ fn read_i64_record(
 
 fn validate_ple_records(
     hfq: &HfqFile,
+    ple: &Qwen4PleConfig,
     canonical: &PleHashMetadata,
 ) -> Result<(), Qwen4ArtifactError> {
-    let multipliers = read_i64_record(hfq, PLE_MULTIPLIERS_NAME, 3)?;
+    let [multipliers_name, offsets_name, vocab_sizes_name] = ple_record_names(ple.layer);
+    let multipliers = read_i64_record(hfq, &multipliers_name, ple.multiplier_count)?;
     if multipliers.as_slice() != canonical.multipliers().as_slice() {
         return Err(Qwen4ArtifactError::new(
             "qwen4: PLE I64 multipliers payload does not match canonical metadata",
         ));
     }
-    let offsets = read_i64_record(hfq, PLE_OFFSETS_NAME, 16)?;
+    let offsets = read_i64_record(hfq, &offsets_name, ple.head_count)?;
     let expected_offsets = canonical
         .head_offsets()
         .iter()
@@ -1210,7 +1423,7 @@ fn validate_ple_records(
             "qwen4: PLE I64 head_offsets payload does not match canonical metadata",
         ));
     }
-    let vocab_sizes = read_i64_record(hfq, PLE_VOCAB_SIZES_NAME, 16)?;
+    let vocab_sizes = read_i64_record(hfq, &vocab_sizes_name, ple.head_count)?;
     let expected_vocab_sizes = canonical
         .head_vocab_sizes()
         .iter()
@@ -1229,7 +1442,25 @@ mod tests {
     use super::*;
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
     use serde_json::json;
+    use crate::weights::{
+        Qwen4ManifestIdentity, Qwen4TierRecipe, PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
+    };
+    use hipfire_runtime::ple_sidecar::ple_shard_name;
     use std::path::{Path, PathBuf};
+
+    const PLE_MULTIPLIERS_NAME: &str =
+        "model.language_model.layers.1.ple.ple_embedding.layer_multipliers";
+    const PLE_OFFSETS_NAME: &str =
+        "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets";
+    const PLE_VOCAB_SIZES_NAME: &str =
+        "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes";
+
+    /// The Flash-Next PLE geometry as the typed config declares it.
+    fn canonical_ple() -> Qwen4PleConfig {
+        crate::config::compact_test_config()
+            .ple
+            .expect("Flash-Next declares PLE")
+    }
 
     fn i64_bytes(values: &[i64]) -> Vec<u8> {
         values
@@ -1308,7 +1539,8 @@ mod tests {
         multipliers[1] += 1;
         write_ple_fixture(&path, &multipliers);
         let hfq = HfqFile::open(&path).unwrap();
-        let error = validate_ple_records(&hfq, &PleHashMetadata::qwen4()).unwrap_err();
+        let error = validate_ple_records(&hfq, &canonical_ple(), &PleHashMetadata::qwen4())
+            .unwrap_err();
         assert!(
             error.to_string().contains("multipliers"),
             "payload mismatch must identify the signed I64 record: {error}"
@@ -1322,7 +1554,7 @@ mod tests {
         let path = fixture_path("canonical");
         write_ple_fixture(&path, PleHashMetadata::qwen4().multipliers());
         let hfq = HfqFile::open(&path).unwrap();
-        validate_ple_records(&hfq, &PleHashMetadata::qwen4()).unwrap();
+        validate_ple_records(&hfq, &canonical_ple(), &PleHashMetadata::qwen4()).unwrap();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(path.parent().unwrap());
     }
@@ -1490,6 +1722,16 @@ mod tests {
     /// from a base whose other tensors are not under test.
     fn trimmed_manifest() -> Qwen4Manifest {
         Qwen4Manifest {
+            identity: Qwen4ManifestIdentity {
+                profile_id: "qwen3.8-flash-next".to_string(),
+                developer_only: false,
+                equation_source: "pinned-upstream",
+                ffn_kind: "moe",
+                recipe: Qwen4TierRecipe::FlashNextPacked {
+                    trunk_tier: DType::Q8_0,
+                    mtp_source: false,
+                },
+            },
             weights: Vec::new(),
             state: Vec::new(),
             metadata: metadata_tensors(),
@@ -1578,7 +1820,7 @@ mod tests {
     #[test]
     fn split_base_without_sidecar_names_the_sidecar_and_the_setting() {
         with_base_fixture("split-bare", true, 0, |hfq| {
-            let error = validate_ple_shard_presence(hfq, false)
+            let error = validate_ple_shard_presence(hfq, false, Some(&canonical_ple()))
                 .unwrap_err()
                 .to_string();
             for needle in [".ple-q4", ".ple-q8", "memory.ple_format", "split base"] {
@@ -1592,31 +1834,40 @@ mod tests {
         // No marker, no shards, no sidecar: not a split base; the inventory
         // check (not this one) refuses it as before.
         with_base_fixture("plain-bare", false, 0, |hfq| {
-            assert_eq!(validate_ple_shard_presence(hfq, false).unwrap(), 0);
+            assert_eq!(
+                validate_ple_shard_presence(hfq, false, Some(&canonical_ple())).unwrap(),
+                0
+            );
         });
     }
 
     #[test]
     fn sidecar_requires_all_shards_or_a_split_marker() {
         with_base_fixture("split-sidecar", true, 0, |hfq| {
-            assert_eq!(validate_ple_shard_presence(hfq, true).unwrap(), 0);
+            assert_eq!(
+                validate_ple_shard_presence(hfq, true, Some(&canonical_ple())).unwrap(),
+                0
+            );
         });
         with_base_fixture("mono-sidecar", false, PLE_SHARD_COUNT, |hfq| {
             assert_eq!(
-                validate_ple_shard_presence(hfq, true).unwrap(),
+                validate_ple_shard_presence(hfq, true, Some(&canonical_ple())).unwrap(),
                 PLE_SHARD_COUNT
             );
             // Without a sidecar the same file is the grandfathered monolith.
-            assert_eq!(validate_ple_shard_presence(hfq, false).unwrap(), 0);
+            assert_eq!(
+                validate_ple_shard_presence(hfq, false, Some(&canonical_ple())).unwrap(),
+                0
+            );
         });
         with_base_fixture("partial-sidecar", false, 5, |hfq| {
-            let error = validate_ple_shard_presence(hfq, true)
+            let error = validate_ple_shard_presence(hfq, true, Some(&canonical_ple()))
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("5 of 128"), "{error}");
         });
         with_base_fixture("bare-sidecar", false, 0, |hfq| {
-            let error = validate_ple_shard_presence(hfq, true)
+            let error = validate_ple_shard_presence(hfq, true, Some(&canonical_ple()))
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("hipfire_ple_rows"), "{error}");
@@ -1629,24 +1880,30 @@ mod tests {
         assert_eq!(manifest.source_tensor_count(), 3);
         // Split base: the index is exactly the trimmed manifest.
         with_base_fixture("inv-split", true, 0, |hfq| {
-            let shadowed = validate_ple_shard_presence(hfq, true).unwrap();
+            let shadowed =
+                validate_ple_shard_presence(hfq, true, Some(&canonical_ple())).unwrap();
             assert_eq!(
-                validate_manifest_inventory(hfq, &manifest, shadowed).unwrap(),
+                validate_manifest_inventory(hfq.tensors(), &manifest, shadowed, PLE_SHARD_COUNT)
+                    .unwrap(),
                 3
             );
         });
         // Monolith + sidecar: the 128 shard tensors are in the index, shadowed
         // and ignored.
         with_base_fixture("inv-mono", false, PLE_SHARD_COUNT, |hfq| {
-            let shadowed = validate_ple_shard_presence(hfq, true).unwrap();
+            let shadowed =
+                validate_ple_shard_presence(hfq, true, Some(&canonical_ple())).unwrap();
             assert_eq!(shadowed, PLE_SHARD_COUNT);
             assert_eq!(
-                validate_manifest_inventory(hfq, &manifest, shadowed).unwrap(),
+                validate_manifest_inventory(hfq.tensors(), &manifest, shadowed, PLE_SHARD_COUNT)
+                    .unwrap(),
                 3
             );
             // The same index against the trimmed manifest without the shadow
             // allowance is an inventory mismatch, never a silent pass.
-            let error = validate_manifest_inventory(hfq, &manifest, 0).unwrap_err();
+            let error =
+                validate_manifest_inventory(hfq.tensors(), &manifest, 0, PLE_SHARD_COUNT)
+                    .unwrap_err();
             assert!(error.to_string().contains("131 tensors"), "{error}");
         });
     }
@@ -1688,7 +1945,8 @@ mod tests {
         ];
         write_hfqm_package_mem(&path, ARCH_ID, &marked_metadata_json(true), &tensors).unwrap();
         let hfq = HfqFile::open(&path).unwrap();
-        let error = validate_manifest_inventory(&hfq, &trimmed_manifest(), 0).unwrap_err();
+        let error =
+            validate_manifest_inventory(hfq.tensors(), &trimmed_manifest(), 0, 0).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1718,7 +1976,8 @@ mod tests {
         let canonical = PleHashMetadata::qwen4();
         for encoding in [RowEncoding::Q8F16, RowEncoding::Q4Lm] {
             assert_eq!(
-                validate_sidecar_geometry(&sidecar_geometry(encoding), &canonical).unwrap(),
+                validate_sidecar_geometry(&sidecar_geometry(encoding), &canonical_ple(), &canonical)
+                    .unwrap(),
                 encoding
             );
         }
@@ -1729,7 +1988,7 @@ mod tests {
     fn sidecar_geometry_refuses_each_deviation() {
         let canonical = PleHashMetadata::qwen4();
         let refused = |geometry: SidecarGeometry, needle: &str| {
-            let error = validate_sidecar_geometry(&geometry, &canonical)
+            let error = validate_sidecar_geometry(&geometry, &canonical_ple(), &canonical)
                 .expect_err(needle)
                 .to_string();
             assert!(error.contains(needle), "{needle} missing from: {error}");
@@ -1783,5 +2042,479 @@ mod tests {
             hipfire_runtime::ple_sidecar::ple_fingerprint_from_metadata(&metadata_json()).unwrap(),
             expected
         );
+    }
+
+    /// Index records of `manifest`'s exact inventory, with every byte extent
+    /// from a literal row formula (Q8F16 34 B per 32 weights, MQ4G256V2 136 B
+    /// per 256, MQ4G128V2 68 B per 128, MQ6G256V2 200 B per 256, BF16 2 B, I64
+    /// 8 B) rather than from the admission code under test.
+    fn oracle_headers(manifest: &Qwen4Manifest) -> Vec<HfqTensorInfo> {
+        let mut headers = Vec::new();
+        for entry in &manifest.weights {
+            if matches!(entry.policy, ShardPolicy::Tied { .. }) {
+                continue;
+            }
+            let (&k, lead) = entry.logical_shape.split_last().expect("non-empty shape");
+            let rows: usize = lead.iter().product();
+            let (quant_type, group_size, bytes) = match entry.dtype {
+                DType::BF16 => (16u8, 0u32, rows * k * 2),
+                DType::Q8_0 => (3, 32, rows * (k / 32) * 34),
+                DType::MQ4G256V2 => (44, 256, rows * (k / 256) * 136),
+                DType::MQ4G128V2 => (53, 128, rows * (k / 128) * 68),
+                DType::MQ6G256V2 => (47, 256, rows * (k / 256) * 200),
+                other => panic!("oracle has no byte formula for {other:?}"),
+            };
+            headers.push(HfqTensorInfo {
+                name: entry.name.clone(),
+                quant_type,
+                shape: entry.logical_shape.iter().map(|&d| d as u32).collect(),
+                group_size,
+                data_offset: 0,
+                data_size: bytes,
+            });
+        }
+        for record in &manifest.metadata {
+            headers.push(HfqTensorInfo {
+                name: record.name.clone(),
+                quant_type: 54,
+                shape: record.shape.iter().map(|&d| d as u32).collect(),
+                group_size: 0,
+                data_offset: 0,
+                data_size: record.shape.iter().product::<usize>() * 8,
+            });
+        }
+        headers
+    }
+
+    fn flash_next_json() -> String {
+        crate::config::compact_test_config().developer_metadata_json()
+    }
+
+    fn flash_next_headers() -> Vec<HfqTensorInfo> {
+        let config = crate::config::compact_test_config();
+        oracle_headers(&Qwen4Manifest::build(&config).expect("pinned manifest"))
+    }
+
+    #[test]
+    fn flash_next_header_inventory_admits_with_exact_extents() {
+        let headers = flash_next_headers();
+        assert_eq!(headers.len(), 1325, "1,658 source records minus 333 vision");
+        let receipt = admit_inventory_headers(ARCH_ID, &flash_next_json(), &headers)
+            .expect("the exact pinned inventory is admitted");
+        assert_eq!(receipt.source_tensor_count, 1325);
+        assert_eq!(receipt.ple, Some(PleHashMetadata::qwen4()));
+        assert_eq!(receipt.manifest.identity.profile_id, "qwen3.8-flash-next");
+        assert!(!receipt.manifest.identity.developer_only);
+        // Literal spot checks of the extents the oracle produced.
+        let extent = |name: &str| {
+            headers
+                .iter()
+                .find(|header| header.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .data_size
+        };
+        assert_eq!(
+            extent("model.language_model.embed_tokens.weight"),
+            248320 * (2560 / 32) * 34
+        );
+        assert_eq!(extent("lm_head.weight"), 248320 * (2560 / 256) * 200);
+        assert_eq!(
+            extent("model.language_model.layers.0.mlp.experts.gate_up_proj"),
+            512 * 1280 * (2560 / 256) * 136
+        );
+        assert_eq!(
+            extent("model.language_model.layers.0.mlp.experts.down_proj"),
+            512 * 2560 * (640 / 128) * 68
+        );
+        assert_eq!(
+            extent("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight"),
+            2_500_012 * 170
+        );
+    }
+
+    #[test]
+    fn flash_next_header_inventory_refuses_each_deviation_before_any_allocation() {
+        let json = flash_next_json();
+        let refused = |mutate: &dyn Fn(&mut Vec<HfqTensorInfo>), needle: &str| {
+            let mut headers = flash_next_headers();
+            mutate(&mut headers);
+            let error = admit_inventory_headers(ARCH_ID, &json, &headers)
+                .expect_err(needle)
+                .to_string();
+            assert!(error.contains(needle), "{needle} missing from: {error}");
+        };
+        let position = |headers: &[HfqTensorInfo], name: &str| {
+            headers
+                .iter()
+                .position(|header| header.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let q = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let experts = "model.language_model.layers.3.mlp.experts.gate_up_proj";
+        refused(&|headers| { headers.remove(position(headers, q)); }, "tensors but manifest declares");
+        refused(
+            &|headers| {
+                let index = position(headers, q);
+                headers[index].name = "model.language_model.layers.0.linear_attn.qkv.weight".into();
+            },
+            "is not declared by the manifest",
+        );
+        refused(
+            &|headers| {
+                let index = position(headers, q);
+                headers[index].shape[0] += 1;
+            },
+            "has shape",
+        );
+        refused(
+            &|headers| {
+                let index = position(headers, q);
+                headers[index].data_size += 1;
+            },
+            "data_size",
+        );
+        refused(
+            &|headers| {
+                let index = position(headers, q);
+                headers[index].group_size = 64;
+            },
+            "group_size",
+        );
+        refused(
+            &|headers| {
+                let index = position(headers, experts);
+                headers[index].quant_type = 99;
+            },
+            "unsupported HFQM quant_type=99",
+        );
+        // gate_up (K=2560) retagged MQ4G128V2 is byte-for-byte the same extent
+        // as MQ4G256V2 (20 x 68 == 10 x 136) and its source set admits both,
+        // so that is a legitimately equal payload, not a deviation.  down
+        // (K=640) is not a whole number of 256-groups: retagging it qt44 must
+        // be refused by the aligned-K rule.
+        refused(
+            &|headers| {
+                let index = position(headers, "model.language_model.layers.3.mlp.experts.down_proj");
+                headers[index].quant_type = QWEN4_QT_MQ4G256V2;
+                headers[index].group_size = 256;
+            },
+            "multiple of 256",
+        );
+        refused(
+            &|headers| {
+                // A vision record in place of a declared tensor: the count is
+                // right, so only the text-only boundary can refuse it.
+                let index = position(headers, q);
+                headers[index].name = "model.visual.patch_embed.weight".into();
+            },
+            "vision tensor",
+        );
+        refused(
+            &|headers| {
+                let index = position(headers, "lm_head.weight");
+                headers[index].data_size = usize::MAX;
+            },
+            "data_size",
+        );
+        // A different identity is refused before the inventory is looked at.
+        let error = admit_inventory_headers(ARCH_ID + 1, &json, &flash_next_headers())
+            .expect_err("wrong arch id")
+            .to_string();
+        assert!(error.contains("arch_id"), "{error}");
+        let error = admit_inventory_headers(ARCH_ID, "{\"config\": {}}", &flash_next_headers())
+            .expect_err("wrong identity")
+            .to_string();
+        assert!(error.contains("config admission failed"), "{error}");
+    }
+
+    #[test]
+    fn extent_arithmetic_reports_overflow_instead_of_panicking() {
+        let overflowing = [u32::MAX; 4];
+        let error = quantized_extent(&overflowing, "x", DType::Q8_0, 1)
+            .expect_err("row count overflow")
+            .to_string();
+        assert!(error.contains("overflows usize"), "{error}");
+        let error = shape_elements(&[u32::MAX; 5], "x")
+            .expect_err("element count overflow")
+            .to_string();
+        assert!(error.contains("overflows usize"), "{error}");
+        let error = shape_elements(&[4, 0], "x").expect_err("zero dim").to_string();
+        assert!(error.contains("zero-sized"), "{error}");
+    }
+
+    #[cfg(feature = "qwen4-dev-profiles")]
+    mod developer_profiles {
+        use super::*;
+        use crate::config::{Qwen4Config, Qwen4FfnConfig};
+
+        fn dense() -> Qwen4FfnConfig {
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 17_408,
+            }
+        }
+
+        fn small_moe(shared: Option<usize>) -> Qwen4FfnConfig {
+            Qwen4FfnConfig::Moe {
+                num_experts: 8,
+                top_k: 2,
+                intermediate_size: 64,
+                shared_intermediate_size: shared,
+                norm_topk_prob: true,
+            }
+        }
+
+        fn admit(config: &Qwen4Config) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+            let manifest = Qwen4Manifest::build(config).expect("developer manifest");
+            admit_developer_inventory_headers(
+                ARCH_ID,
+                &config.developer_metadata_json(),
+                &oracle_headers(&manifest),
+            )
+        }
+
+        #[test]
+        fn flash_next_is_admitted_identically_by_the_developer_path() {
+            let production = admit_inventory_headers(ARCH_ID, &flash_next_json(), &flash_next_headers())
+                .expect("production admission");
+            let developer = admit_developer_inventory_headers(
+                ARCH_ID,
+                &flash_next_json(),
+                &flash_next_headers(),
+            )
+            .expect("developer admission");
+            assert_eq!(developer.source_tensor_count, production.source_tensor_count);
+            assert_eq!(developer.manifest, production.manifest);
+            assert_eq!(developer.ple, production.ple);
+        }
+
+        #[test]
+        fn dense_64_layer_hidden_5120_header_inventories_admit_with_and_without_ple_mtp() {
+            for (ple, mtp) in [(false, false), (true, false), (false, true), (true, true)] {
+                let config =
+                    crate::config::synthetic_test_config(dense(), 5120, 64, ple, mtp);
+                let receipt = admit(&config).expect("exact dense inventory");
+                assert_eq!(receipt.manifest.identity.ffn_kind, "dense");
+                assert!(receipt.manifest.identity.developer_only);
+                assert_eq!(receipt.ple.is_some(), ple);
+                assert_eq!(
+                    receipt.source_tensor_count,
+                    receipt.manifest.source_tensor_count()
+                );
+                // The dry admission is honest about what it proves: roles are
+                // declared, nothing is bound.
+                assert!(receipt
+                    .manifest
+                    .weights
+                    .iter()
+                    .any(|entry| entry.name.ends_with(".mlp.down_proj.weight")));
+            }
+        }
+
+        #[test]
+        fn small_moe_header_inventories_admit() {
+            for shared in [Some(64usize), None] {
+                let config =
+                    crate::config::synthetic_test_config(small_moe(shared), 256, 4, true, true);
+                let receipt = admit(&config).expect("exact small-MoE inventory");
+                assert_eq!(receipt.manifest.identity.ffn_kind, "moe");
+                assert!(receipt.ple.is_some());
+            }
+        }
+
+        #[test]
+        fn developer_inventories_refuse_missing_extra_and_mis_sized_tensors() {
+            let config = crate::config::synthetic_test_config(dense(), 5120, 64, true, true);
+            let manifest = Qwen4Manifest::build(&config).expect("manifest");
+            let json = config.developer_metadata_json();
+            let refuse = |mutate: &dyn Fn(&mut Vec<HfqTensorInfo>), needle: &str| {
+                let mut headers = oracle_headers(&manifest);
+                mutate(&mut headers);
+                let error = admit_developer_inventory_headers(ARCH_ID, &json, &headers)
+                    .expect_err(needle)
+                    .to_string();
+                assert!(error.contains(needle), "{needle} missing from: {error}");
+            };
+            let down = "model.language_model.layers.7.mlp.down_proj.weight";
+            let find = |headers: &[HfqTensorInfo], name: &str| {
+                headers.iter().position(|h| h.name == name).expect(name)
+            };
+            refuse(&|h| { h.remove(find(h, down)); }, "tensors but manifest declares");
+            refuse(
+                &|h| {
+                    let index = find(h, down);
+                    h[index].data_size -= 2;
+                },
+                "data_size",
+            );
+            refuse(
+                &|h| {
+                    let index = find(h, down);
+                    h[index].quant_type = 99;
+                },
+                "unsupported HFQM quant_type=99",
+            );
+            // A packed tag on a synthetic role is refused: nothing but BF16 is
+            // admitted until a role format is executable.
+            refuse(
+                &|h| {
+                    let index = find(h, down);
+                    h[index].quant_type = QWEN4_QT_Q8F16;
+                    h[index].group_size = 32;
+                    h[index].data_size = 5120 * (17_408 / 32) * 34;
+                },
+                "must use HFQM quant_type=16",
+            );
+            refuse(
+                &|h| {
+                    h.push(HfqTensorInfo {
+                        name: "model.language_model.layers.0.mlp.gate.weight".into(),
+                        quant_type: QWEN4_QT_BF16,
+                        shape: vec![8, 5120],
+                        group_size: 0,
+                        data_offset: 0,
+                        data_size: 8 * 5120 * 2,
+                    });
+                },
+                "tensors but manifest declares",
+            );
+        }
+
+        #[test]
+        fn pleless_profile_refuses_a_ple_metadata_object_and_pled_one_requires_it() {
+            let no_ple = crate::config::synthetic_test_config(dense(), 5120, 64, false, false);
+            let headers = oracle_headers(&Qwen4Manifest::build(&no_ple).expect("manifest"));
+            let mut value: serde_json::Value =
+                serde_json::from_str(&no_ple.developer_metadata_json()).unwrap();
+            value["qwen4_ple"] = serde_json::from_str::<serde_json::Value>(&metadata_json())
+                .unwrap()["qwen4_ple"]
+                .clone();
+            let error = admit_developer_inventory_headers(ARCH_ID, &value.to_string(), &headers)
+                .expect_err("a PLE-less profile must not carry PLE metadata")
+                .to_string();
+            assert!(error.contains("declares no PLE"), "{error}");
+
+            let with_ple = crate::config::synthetic_test_config(dense(), 5120, 64, true, false);
+            let headers = oracle_headers(&Qwen4Manifest::build(&with_ple).expect("manifest"));
+            let mut value: serde_json::Value =
+                serde_json::from_str(&with_ple.developer_metadata_json()).unwrap();
+            value.as_object_mut().unwrap().remove("qwen4_ple");
+            let error = admit_developer_inventory_headers(ARCH_ID, &value.to_string(), &headers)
+                .expect_err("a PLE profile needs its hash metadata")
+                .to_string();
+            assert!(error.contains("PLE metadata admission failed"), "{error}");
+        }
+
+        /// Real container, real admission: a tiny PLE-less/MTP-less synthetic
+        /// dense artifact is admitted through `admit_hfqm_artifact` when the
+        /// feature is compiled in, and the absent PLE is typed absence.
+        #[test]
+        fn tiny_dense_container_without_ple_admits_with_absent_ple_rows() {
+            let config = crate::config::synthetic_test_config(dense(), 256, 4, false, false);
+            let manifest = Qwen4Manifest::build(&config).expect("manifest");
+            let tensors = oracle_headers(&manifest)
+                .into_iter()
+                .map(|header| HfqMemTensor {
+                    name: header.name,
+                    quant_type: header.quant_type,
+                    shape: header.shape,
+                    group_size: header.group_size,
+                    data: vec![0u8; header.data_size],
+                })
+                .collect::<Vec<_>>();
+            let path = fixture_path("tiny-dense");
+            write_hfqm_package_mem(&path, ARCH_ID, &config.developer_metadata_json(), &tensors)
+                .unwrap();
+            let hfq = HfqFile::open(&path).unwrap();
+            let admitted = admit_hfqm_artifact(&hfq).expect("developer container admitted");
+            assert!(matches!(admitted.ple_rows, Qwen4PleRows::Absent));
+            assert!(admitted.ple.is_none());
+            assert!(admitted.ple_row_descriptors(&hfq).unwrap().is_empty());
+            assert!(admitted.ple_rows_source(&hfq).is_err());
+            assert_eq!(admitted.placements.len(), admitted.manifest.weights.len());
+            drop(hfq);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir(path.parent().unwrap());
+        }
+    }
+
+    /// Without the explicit feature a synthetic developer artifact never
+    /// reaches the inventory: the production parser refuses its marker, for
+    /// the header-only path and for a real container alike.
+    #[cfg(not(feature = "qwen4-dev-profiles"))]
+    #[test]
+    fn default_build_refuses_a_synthetic_developer_artifact() {
+        use crate::config::Qwen4FfnConfig;
+        let config = crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 17_408,
+            },
+            256,
+            4,
+            false,
+            false,
+        );
+        let json = config.developer_metadata_json();
+        assert!(json.contains("hipfire_profile"), "fixture must carry the marker");
+        let headers = oracle_headers(&Qwen4Manifest::build(&config).expect("manifest"));
+        let error = admit_inventory_headers(ARCH_ID, &json, &headers)
+            .expect_err("production header admission must refuse the marker")
+            .to_string();
+        assert!(error.contains("config admission failed"), "{error}");
+
+        let path = fixture_path("default-refuses-synthetic");
+        write_hfqm_package_mem(&path, ARCH_ID, &json, &[]).unwrap();
+        let hfq = HfqFile::open(&path).unwrap();
+        let error = admit_hfqm_artifact(&hfq)
+            .expect_err("production container admission must refuse the marker")
+            .to_string();
+        assert!(error.contains("config admission failed"), "{error}");
+        drop(hfq);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    /// With the feature a marker is accepted (and then judged by its exact
+    /// inventory), but a marker that is not the explicit developer marker, or
+    /// a synthetic config smuggled without one, is still refused by the config
+    /// parser, never inferred from geometry.
+    #[cfg(feature = "qwen4-dev-profiles")]
+    #[test]
+    fn feature_build_judges_a_synthetic_container_by_inventory_not_by_marker() {
+        use crate::config::Qwen4FfnConfig;
+        let config = crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 17_408,
+            },
+            256,
+            4,
+            false,
+            false,
+        );
+        let path = fixture_path("feature-empty-synthetic");
+        write_hfqm_package_mem(&path, ARCH_ID, &config.developer_metadata_json(), &[]).unwrap();
+        let hfq = HfqFile::open(&path).unwrap();
+        let error = admit_hfqm_artifact(&hfq)
+            .expect_err("an empty index is not the profile's inventory")
+            .to_string();
+        assert!(
+            !error.contains("config admission failed"),
+            "the explicit marker must pass the parser: {error}"
+        );
+        assert!(error.contains("tensors but manifest declares"), "{error}");
+        drop(hfq);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+
+        // Marker stripped: the same geometry is not recognised as synthetic.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&config.developer_metadata_json()).unwrap();
+        value.as_object_mut().unwrap().remove("hipfire_profile");
+        if let Some(inner) = value.get_mut("config").and_then(|c| c.as_object_mut()) {
+            inner.remove("hipfire_profile");
+        }
+        let error = admit_developer_inventory_headers(ARCH_ID, &value.to_string(), &[])
+            .expect_err("synthetic geometry without the marker is not admitted")
+            .to_string();
+        assert!(error.contains("config admission failed"), "{error}");
     }
 }

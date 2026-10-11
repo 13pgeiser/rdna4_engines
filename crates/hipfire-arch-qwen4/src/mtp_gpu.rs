@@ -1682,7 +1682,12 @@ impl Qwen4MtpGpu {
         max_seq: usize,
         backend: Qwen4KvBackend,
     ) -> Result<Self, MtpGpuError> {
-        config.mtp.validate().map_err(MtpGpuError::Invalid)?;
+        config
+            .mtp
+            .as_ref()
+            .ok_or_else(|| invalid("profile has no native MTP head"))?
+            .validate()
+            .map_err(MtpGpuError::Invalid)?;
         if max_seq == 0 || max_seq > config.max_position_embeddings {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
