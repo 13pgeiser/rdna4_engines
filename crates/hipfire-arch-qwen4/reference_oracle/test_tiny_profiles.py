@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import struct
 import tempfile
@@ -286,6 +287,100 @@ class DenseEquationTests(unittest.TestCase):
     def test_label_is_non_upstream(self) -> None:
         self.assertEqual(equations.DENSE_FFN_EQUATION_SOURCE, "non-upstream-dense")
         self.assertIn("NON-UPSTREAM", equations.dense_ffn_non_upstream.__doc__)
+
+
+class QsaScreenTests(unittest.TestCase):
+    @staticmethod
+    def _row(source: str, position: int, scores: list[float]) -> dict:
+        return {"source": source, "layer": 1 if source == "main" else 0, "position": position, "blocks": len(scores), "block_topk": 2, "scores": scores}
+
+    def test_margin_predicate(self) -> None:
+        # kth > 0 and kth - next >= max(0.05, 0.05 * kth)
+        self.assertTrue(tp.qsa_margin_row([1.0, 0.5, 0.2], 2)["passed"])
+        self.assertEqual(tp.qsa_margin_row([1.0, 0.5, 0.2], 2)["required_margin"], 0.05)
+        self.assertTrue(tp.qsa_margin_row([1.0, 0.5, 0.4375], 2)["passed"])  # margin 0.0625 >= absolute 0.05
+        self.assertFalse(tp.qsa_margin_row([1.0, 0.5, 0.49], 2)["passed"])
+        self.assertFalse(tp.qsa_margin_row([1.0, 0.0, 0.0], 2)["passed"])  # kth == 0 (relu tie of zeros)
+        self.assertFalse(tp.qsa_margin_row([2.0, 0.0, -1.0], 2)["passed"])
+        # relative term dominates for large kth: required = 0.05 * 100 = 5
+        big = tp.qsa_margin_row([200.0, 100.0, 94.0], 2)
+        self.assertEqual((big["kth"], big["next"], big["required_margin"], big["observed_margin"], big["passed"]), (100.0, 94.0, 5.0, 6.0, True))
+        self.assertFalse(tp.qsa_margin_row([200.0, 100.0, 96.0], 2)["passed"])
+        # order independent; k is the 1-based boundary rank
+        self.assertEqual(tp.qsa_margin_row([0.2, 1.0, 0.5], 2), tp.qsa_margin_row([1.0, 0.5, 0.2], 2))
+        with self.assertRaises(FixtureError):
+            tp.qsa_margin_row([1.0, 0.5], 2)  # no boundary: not a selecting row
+        with self.assertRaises(FixtureError):
+            tp.qsa_margin_row([1.0, float("nan"), 0.5], 2)
+
+    def test_evaluated_rows_carry_manifest_fields(self) -> None:
+        row = tp.evaluate_qsa_rows([self._row("mtp", 6, [1.0, 0.5, 0.2])])[0]
+        for key in ("source", "layer", "position", "complete_blocks", "block_topk", "block_scores", "kth", "next", "required_margin", "observed_margin", "passed"):
+            self.assertIn(key, row)
+        self.assertEqual((row["source"], row["layer"], row["position"], row["complete_blocks"], row["block_topk"]), ("mtp", 0, 6, 3, 2))
+
+    def _screen(self, per_seed: dict, options: "tp.ProfileOptions", max_seeds: int = 8) -> dict:
+        seen: list[int] = []
+
+        def fake(opts, sources, tokens, seed):
+            seen.append(seed)
+            return tp.evaluate_qsa_rows(per_seed(seed))
+
+        with mock.patch.object(tp, "qsa_candidate_rows", fake):
+            result = tp.screen_qsa_seed(options, None, [], max_seeds=max_seeds)
+        self.assertEqual(seen, list(range(options.seed, result["effective_seed"] + 1)), "sequential seeds, none skipped")
+        return result
+
+    def test_seed_search_is_sequential_and_records_metadata(self) -> None:
+        good = lambda: [self._row("main", 5, [1.0, 0.5, 0.2]), self._row("mtp", 5, [1.0, 0.5, 0.2])]
+
+        def per_seed(seed: int) -> list[dict]:
+            if seed == 3801:
+                return good()
+            if seed == 3802:  # main passes, MTP row ties: still rejected (main-only is not enough)
+                return [self._row("main", 5, [1.0, 0.5, 0.2]), self._row("mtp", 5, [1.0, 0.5, 0.5])]
+            if seed == 3803:  # a main row ties
+                return [self._row("main", 5, [1.0, 0.5, 0.5]), self._row("mtp", 5, [1.0, 0.5, 0.2])]
+            if seed == 3804:  # kth == 0
+                return [self._row("main", 5, [1.0, 0.0, 0.0]), self._row("mtp", 5, [1.0, 0.5, 0.2])]
+            return good()
+
+        # 3800 is not special here: the search starts at the requested seed and 3801 is the first accepted one
+        result = self._screen(lambda s: per_seed(3803 if s == 3800 else s), tp.ProfileOptions(seed=3800))
+        self.assertEqual((result["start_seed"], result["effective_seed"], result["rejected_count"]), (3800, 3801, 1))
+        self.assertEqual(result["rule"], "tie-screened seed")
+        self.assertEqual([item["seed"] for item in result["rejected"]], [3800])
+        self.assertEqual(result["rejected"][0]["first_failing_row"]["source"], "main")
+        self.assertNotIn("block_scores", result["rejected"][0]["first_failing_row"])
+        result = self._screen(per_seed, tp.ProfileOptions(seed=3802))
+        self.assertEqual((result["start_seed"], result["effective_seed"], result["rejected_count"]), (3802, 3805, 3))
+        self.assertEqual([item["seed"] for item in result["rejected"]], [3802, 3803, 3804])
+        self.assertEqual(result["rejected"][0]["first_failing_row"]["source"], "mtp")
+        self.assertTrue(all(row["passed"] for row in result["rows"]))
+        self.assertEqual({row["source"] for row in result["rows"]}, {"main", "mtp"})
+
+    def test_search_has_no_fallback_and_requires_main_and_mtp_rows(self) -> None:
+        tie = lambda seed: [self._row("main", 5, [1.0, 0.5, 0.5]), self._row("mtp", 5, [1.0, 0.5, 0.2])]
+        with self.assertRaisesRegex(FixtureError, "no seed in"):
+            self._screen(tie, tp.ProfileOptions(seed=3801), max_seeds=3)
+        main_only = lambda seed: [self._row("main", 5, [1.0, 0.5, 0.2])]
+        with self.assertRaisesRegex(FixtureError, "needs selecting rows"):
+            self._screen(main_only, tp.ProfileOptions(seed=3801))
+        self._screen(main_only, tp.ProfileOptions(seed=3801, with_mtp=False))  # no MTP head: main rows are all there is
+        for bad in (0, -1, True, 1.5):
+            with self.assertRaisesRegex(FixtureError, "max seeds"):
+                tp.screen_qsa_seed(tp.ProfileOptions(), None, [], max_seeds=bad)
+
+    def test_cli_screening_flags_are_opt_in(self) -> None:
+        parsed = generate_fixtures._parser().parse_args(["--tiny-profile", "tiny-dense-dev", "--out", "x"])
+        self.assertEqual((parsed.screen_qsa_ties, parsed.screen_qsa_max_seeds, parsed.seed), (False, None, 3800))
+        parsed = generate_fixtures._parser().parse_args(["--tiny-profile", "tiny-dense-dev", "--out", "x", "--seed", "3801", "--screen-qsa-ties", "--screen-qsa-max-seeds", "64"])
+        self.assertEqual((parsed.screen_qsa_ties, parsed.screen_qsa_max_seeds, generate_fixtures._tiny_options(parsed).seed), (True, 64, 3801))
+        with tempfile.TemporaryDirectory() as temp:
+            out = str(Path(temp) / "x")
+            self.assertEqual(generate_fixtures.main(["--out", out, "--screen-qsa-ties"]), 2)  # needs --tiny-profile
+            self.assertEqual(generate_fixtures.main(["--tiny-profile", "tiny-dense-dev", "--out", out, "--screen-qsa-max-seeds", "4"]), 2)  # needs --screen-qsa-ties
+        self.assertIs(inspect.signature(tp.generate_profile).parameters["qsa_tie_screen"].default, False)
 
 
 class SourcePinTests(unittest.TestCase):
@@ -746,6 +841,23 @@ class FullStackTests(unittest.TestCase):
                     hashlib.sha256((again / name).read_bytes()).hexdigest(),
                     name,
                 )
+
+    def test_qsa_tap_captures_real_selecting_rows_and_defaults_are_unscreened(self) -> None:
+        options = tp.ProfileOptions(profile_id="tiny-dense-dev")
+        tokens = tp.build_tokenizer(options)[2]
+        rows = tp.qsa_candidate_rows(options, self.sources, tokens, 3800)
+        main = [row for row in rows if row["source"] == "main"]
+        mtp = [row for row in rows if row["source"] == "mtp"]
+        # budget 4 / ratio 2 -> block_topk 2: a query selects once it sees >= 3 complete blocks (>= 6 visible tokens).
+        self.assertEqual([(row["layer"], row["position"], row["complete_blocks"]) for row in main], [(1, 5, 3), (1, 6, 3), (1, 7, 4), (1, 8, 4)])
+        self.assertEqual([(row["layer"], row["position"], row["complete_blocks"]) for row in mtp], [(0, 5, 3), (0, 6, 3), (0, 7, 4)])
+        for row in rows:
+            self.assertEqual(row["block_topk"], 2)
+            self.assertEqual(len(row["block_scores"]), row["complete_blocks"])
+            self.assertEqual(row["kth"], sorted(row["block_scores"], reverse=True)[1])
+        # unscreened generation leaves the manifest untouched (seed used exactly, no screen key)
+        self.assertNotIn("qsa_tie_screen", self.dense)
+        self.assertEqual(self.dense["seed"]["requested"], self.dense["seed"]["effective"])
 
     def test_seed_is_used_exactly(self) -> None:
         self.assertEqual(self.moe["seed"]["requested"], 3800)

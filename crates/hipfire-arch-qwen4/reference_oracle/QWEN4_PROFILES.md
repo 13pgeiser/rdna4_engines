@@ -85,14 +85,36 @@ Constraints the shrink must respect (all enforced by pinned HF validation or obs
   Selection only bites with >= 3 complete blocks (>= 6 visible tokens): the fixed text has 9 tokens.
 - MoE: HF needs `num_experts > 0` and a shared expert; `top_k < experts` so the router boundary exists.
 - Fixed text `hi<|endoftext|>to hi.` -> 9 ids, EOS (id 2) mid-sequence to exercise EOS-aware n-gram history.
-- The requested seed is used exactly. QSA/router top-k boundary ties are not screened: selection is whatever pinned
-  `torch.topk` does on CPU, deterministic within the pinned environment.
+- The requested seed is used exactly by default. QSA/router top-k boundary ties are not screened: selection is whatever pinned
+  `torch.topk` does on CPU, deterministic within the pinned environment. Opt-in QSA screening: see "QSA tie-screened seeds" below (router ties stay unscreened).
 - Linear-attention-only stacks (1 layer) cannot run cached/chunked decode in pinned HF
   (`DynamicCache.get_seq_length` needs an attention layer): no `prefill.*`/`chunked.*` states. `states.npz` is still emitted with
   `captured.layer<L>.{conv_state0,recurrent_state0,conv_state1,conv_state2}` derived from the helper captures (GDN conv input and
   final recurrent state, PLE short-conv input, last token ids); with a cache these are asserted bit-equal to the `DynamicCache` states.
 - Width 5120 is bounded to 1-2 layers; every projection except the hidden axis is reduced. The two
   `[H,H]` MTP fusion projections (2 x 5120^2 = 52M elements, ~105 MB BF16) are the structural floor; guard 80M elements.
+
+## QSA tie-screened seeds (opt-in, `--screen-qsa-ties`)
+
+Default generation is unchanged (seed used exactly, `manifest.seed.requested == effective`, no `qsa_tie_screen` key; the seed-3800 fixtures are not touched).
+With `--screen-qsa-ties`, `--seed` is the **start** seed: seeds `start, start+1, ...` are tried sequentially (none skipped) and the first seed whose
+every selecting QSA query row passes is used. A row is *selecting* when `num_complete_blocks > block_topk` (block_topk = budget/ratio = 2), in every QSA layer of
+the main forward **and** in MTP step 0 (both are required when MTP is present; main-only is accepted only with `--no-mtp`). A row passes when the k-th selected
+block score is `> 0` and `kth - (k+1)th >= max(0.05, 0.05 * kth)`. The scores are the exact pre-`topk` tensors of the pinned HF `Qwen4ExpTextQSAIndexer.forward`
+(relu/sum/sqrt scores over the causally visible complete blocks), captured by wrapping `torch.Tensor.topk` for calls made from that function: nothing is re-implemented.
+The search is bounded (`--screen-qsa-max-seeds`, default 4096); exhausting it, or a geometry with no selecting row (e.g. `--layers 1`), is an error, never a fallback seed.
+Variants are screened independently (a `--no-ple` or different-RoPE run chooses its own seed). The written run's scores are re-captured and must equal the screened run's.
+
+Manifest (screened runs only): `seed = {requested: <start>, effective, init}` and `qsa_tie_screen = {rule: "tie-screened seed", start_seed, effective_seed,
+rejected_count, rejected: [{seed, failing_rows, first_failing_row}], predicate, score_source, rows: [{source: "main"|"mtp", layer, position, complete_blocks,
+block_topk, block_scores, kth, next, required_margin, observed_margin, passed}]}` (MTP layer is the MTP head's own layer index 0).
+
+```bash
+$PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-dense-dev --out /tmp/tiny-dense-dev-gpu-screened \
+    --seed 3801 --rope-theta 10000000 --max-position-embeddings 1024 --screen-qsa-ties
+$PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-dense-dev --out /tmp/tiny-dense-dev-gpu-nople-screened \
+    --seed 3801 --rope-theta 10000000 --max-position-embeddings 1024 --no-ple --screen-qsa-ties
+```
 
 ## Source / dense boundary
 
@@ -118,7 +140,7 @@ Constraints the shrink must respect (all enforced by pinned HF validation or obs
 `identity_rebuild`, `gdn_output_gate` (sigmoid<->silu), `ple_eos_history`, `ple_cached_history` (same suffix, different cached prefix),
 MoE: `moe_router_gate`, `moe_norm_topk_prob`, `bf16_vs_f32_rounding`; dense: `dense_ffn_rounding`, `dense_gate_projection`.
 Controls for an absent component are listed with `status: skipped, passed: null` and a reason (`--no-ple`: `ple_eos_history`, `ple_cached_history`); `--no-mtp` has no MTP control to skip.
-The exact requested seed is used (no seed search): tiny-moe and tiny-dense-dev at `--seed 3800` pass every control on torch 2.9.1+cpu, 1 thread.
+The exact requested seed is used (no seed search) unless `--screen-qsa-ties` is given: tiny-moe and tiny-dense-dev at `--seed 3800` pass every control on torch 2.9.1+cpu, 1 thread.
 Dumps are bit-stable on one torch build/thread count; cross-build comparison should use BF16 unit roundoff (2^-7).
 
 ## Exact KL quality method (`quality.py`)

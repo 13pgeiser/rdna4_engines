@@ -763,6 +763,8 @@ def _parser() -> argparse.ArgumentParser:
     tiny.add_argument("--no-ple", action="store_true", help="tiny profile without PLE: no PLE layer/tensors/buffers/config marker, ple_layer_ids=[] and absent PLE scalars (default: PLE present)")
     tiny.add_argument("--no-mtp", action="store_true", help="tiny profile without native MTP: no MTP head is built; no mtp.* tensors, text_config.mtp or mtp_step0 dump (default: MTP present)")
     tiny.add_argument("--no-controls", action="store_true", help="skip the negative-control reruns")
+    tiny.add_argument("--screen-qsa-ties", action="store_true", help="opt-in QSA tie screen: --seed becomes the START seed; the smallest seed >= start whose main and MTP-step-0 QSA rows all have a clear top-k boundary margin is used (default: off, the seed is used exactly)")
+    tiny.add_argument("--screen-qsa-max-seeds", type=int, default=None, help="upper bound on screened candidate seeds (default 4096); exhausting it is an error, never a fallback seed")
     return parser
 
 
@@ -799,6 +801,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.tiny_profile and (args.no_ple or args.no_mtp):
         print("qwen4 reference fixture generation failed: --no-ple and --no-mtp are only valid with --tiny-profile", file=sys.stderr)
         return 2
+    if not args.tiny_profile and (args.screen_qsa_ties or args.screen_qsa_max_seeds is not None):
+        print("qwen4 reference fixture generation failed: --screen-qsa-ties and --screen-qsa-max-seeds are only valid with --tiny-profile", file=sys.stderr)
+        return 2
+    if args.screen_qsa_max_seeds is not None and not args.screen_qsa_ties:
+        print("qwen4 reference fixture generation failed: --screen-qsa-max-seeds requires --screen-qsa-ties", file=sys.stderr)
+        return 2
     if not args.self_test and not args.out:
         print("qwen4 reference fixture generation failed: --out is required unless --self-test is used", file=sys.stderr)
         return 2
@@ -812,8 +820,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 from .tiny_profiles import generate_profile
             except ImportError:  # direct execution from this directory
                 from tiny_profiles import generate_profile  # type: ignore
-            manifest = generate_profile(args.out, _tiny_options(args), cache_dir=args.cache_dir, controls=not args.no_controls)
+            screen_kwargs: dict[str, object] = {}
+            if args.screen_qsa_ties:
+                screen_kwargs["qsa_tie_screen"] = True
+                if args.screen_qsa_max_seeds is not None:
+                    screen_kwargs["qsa_screen_max_seeds"] = args.screen_qsa_max_seeds
+            manifest = generate_profile(args.out, _tiny_options(args), cache_dir=args.cache_dir, controls=not args.no_controls, **screen_kwargs)
             print(f"wrote tiny profile {args.tiny_profile} ({manifest['checkpoint']['safetensors']['tensor_count']} tensors, {len(manifest['dumps'])} dump files) to {Path(args.out)}")
+            screen = manifest.get("qsa_tie_screen")
+            if screen is not None:
+                print(f"qsa tie screen: start seed {screen['start_seed']} effective seed {screen['effective_seed']} rejected {screen['rejected_count']}")
             print(f"manifest: {Path(args.out) / 'manifest.json'}")
             return 0
         if args.upstream_reference:

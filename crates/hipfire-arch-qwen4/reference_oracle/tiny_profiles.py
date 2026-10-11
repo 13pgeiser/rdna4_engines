@@ -1950,12 +1950,197 @@ def optional_component_report(assembly: Assembly, checkpoint: Mapping[str, Any],
     return report
 
 
+# ---------------------------------------------------------------------------
+# Opt-in QSA tie-screened seed search
+# ---------------------------------------------------------------------------
+#
+# The pinned QSA indexer picks `scores.topk(block_topk)` over per-query block scores.  A near-tie at the k-th/(k+1)-th
+# boundary makes the selected block set depend on the arithmetic of the executing backend (CPU torch vs a GPU kernel).
+# The default profiles do NOT screen this (seed 3800 is used exactly).  `screen_qsa_seed` is the opt-in alternative: it
+# walks seeds start, start+1, ... sequentially and accepts the first one whose every selecting QSA row, in the main
+# model AND in MTP step 0, has a clear margin.  The scores are the exact pre-topk tensors of the pinned HF indexer
+# (captured by wrapping `torch.Tensor.topk` for calls made from `Qwen4ExpTextQSAIndexer.forward`), not a re-implementation.
+
+QSA_SCREEN_RULE = "tie-screened seed"
+QSA_SCREEN_MARGIN_ABS = 0.05
+QSA_SCREEN_MARGIN_REL = 0.05
+QSA_SCREEN_MAX_SEEDS = 4096  # hard search bound; exhausting it is an error, never a fallback seed
+QSA_SCORE_SOURCE = (
+    "pinned HF Qwen4ExpTextQSAIndexer.forward `scores` tensor (relu(q.k_block).sum/sqrt(index_head_dim) over the complete causally "
+    "visible blocks of one query row) captured at its `scores.topk(...)` call"
+)
+
+
+def qsa_margin_row(scores: Sequence[float], block_topk: int) -> dict[str, Any]:
+    """Pure predicate: boundary margin of one query row's block scores.
+
+    Requires ``len(scores) > block_topk`` (otherwise nothing is excluded and there is no boundary).  The row passes when the
+    k-th best score is positive and ``kth - (k+1)th >= max(0.05, 0.05 * kth)``.
+    """
+
+    if isinstance(block_topk, bool) or not isinstance(block_topk, int) or block_topk < 1:
+        raise FixtureError("block_topk must be a positive integer")
+    values = [float(value) for value in scores]
+    if len(values) <= block_topk:
+        raise FixtureError(f"a QSA boundary needs more complete blocks ({len(values)}) than block_topk ({block_topk})")
+    if any(math.isnan(value) for value in values):
+        raise FixtureError("QSA block scores contain NaN")
+    ordered = sorted(values, reverse=True)
+    kth = ordered[block_topk - 1]
+    next_best = ordered[block_topk]
+    required = max(QSA_SCREEN_MARGIN_ABS, QSA_SCREEN_MARGIN_REL * kth)
+    observed = kth - next_best
+    return {
+        "kth": kth,
+        "next": next_best,
+        "required_margin": required,
+        "observed_margin": observed,
+        "passed": bool(kth > 0.0 and observed >= required),
+    }
+
+
+def evaluate_qsa_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Manifest rows (layer, main/MTP, position, block counts, kth/next/required/observed margin, scores) for captured rows."""
+
+    evaluated: list[dict[str, Any]] = []
+    for row in rows:
+        verdict = qsa_margin_row(row["scores"], row["block_topk"])
+        evaluated.append(
+            {
+                "source": row["source"],
+                "layer": row["layer"],
+                "position": row["position"],
+                "complete_blocks": row["blocks"],
+                "block_topk": row["block_topk"],
+                "block_scores": [float(value) for value in row["scores"]],
+                **verdict,
+            }
+        )
+    return evaluated
+
+
+class QsaScoreTap:
+    """Records the pre-topk block scores of every selecting QSA row (``num_complete_blocks > block_topk``)."""
+
+    def __init__(self, torch: Any, modeling_module: Any) -> None:
+        self.torch = torch
+        self.indexer_cls = modeling_module.Qwen4ExpTextQSAIndexer
+        self.rows: list[dict[str, Any]] = []
+
+    @contextlib.contextmanager
+    def record(self, source: str) -> Iterator[None]:
+        """Record rows labelled ``source`` ("main" or "mtp") while the context is active."""
+
+        torch = self.torch
+        tensor_cls = torch.Tensor
+        had_own = "topk" in tensor_cls.__dict__
+        original = tensor_cls.topk
+        tap = self
+
+        def topk(scores: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original(scores, *args, **kwargs)
+            frame = sys._getframe(1)
+            owner = frame.f_locals.get("self")
+            if frame.f_code.co_name == "forward" and isinstance(owner, tap.indexer_cls):
+                local = frame.f_locals
+                blocks = int(local["num_complete_blocks"])
+                if scores.dim() != 1 or int(scores.shape[0]) != blocks:
+                    raise FixtureError("QSA indexer topk input is not the per-block score vector of the visible complete blocks")
+                if blocks != int(local["local_visible_indices"].shape[-1]) // owner.compress_ratio:
+                    raise FixtureError("QSA block count disagrees with the causal visible-token count")
+                if int(local["batch_idx"]) != 0:
+                    raise FixtureError("QSA screening supports batch 0 only")
+                if blocks > owner.block_topk:
+                    values = [float(value) for value in scores.detach().float().cpu().tolist()]
+                    if float(result.values[-1]) != sorted(values, reverse=True)[owner.block_topk - 1]:
+                        raise FixtureError("captured QSA scores disagree with the k-th value returned by the pinned topk")
+                    tap.rows.append(
+                        {
+                            "source": source,
+                            "layer": int(owner.layer_idx),
+                            "position": int(local["query_idx"]),
+                            "blocks": blocks,
+                            "block_topk": int(owner.block_topk),
+                            "scores": values,
+                        }
+                    )
+            return result
+
+        tensor_cls.topk = topk
+        try:
+            yield
+        finally:
+            if had_own:
+                tensor_cls.topk = original
+            else:
+                del tensor_cls.topk
+
+
+def qsa_candidate_rows(options: ProfileOptions, sources: VerifiedSources, tokens: Sequence[int], seed: int) -> list[dict[str, Any]]:
+    """Run the real main forward and MTP step 0 for ``seed`` and return the evaluated selecting QSA rows."""
+
+    assembly = build_assembly(options, sources, seed=seed)
+    tap = QsaScoreTap(assembly.torch, sources.modeling_module)
+    with tap.record("main"):
+        forward = run_forward(assembly, tokens)
+    if options.with_mtp:
+        with tap.record("mtp"):
+            run_mtp_step0(assembly, forward)
+    return evaluate_qsa_rows(tap.rows)
+
+
+def screen_qsa_seed(
+    options: ProfileOptions,
+    sources: VerifiedSources,
+    tokens: Sequence[int],
+    *,
+    max_seeds: int = QSA_SCREEN_MAX_SEEDS,
+) -> dict[str, Any]:
+    """Smallest seed ``>= options.seed`` whose main and MTP-step-0 QSA rows all pass :func:`qsa_margin_row`; no fallback."""
+
+    if isinstance(max_seeds, bool) or not isinstance(max_seeds, int) or max_seeds < 1:
+        raise FixtureError("qsa screen max seeds must be a positive integer")
+    start = options.seed
+    rejected: list[dict[str, Any]] = []
+    for seed in range(start, start + max_seeds):
+        rows = qsa_candidate_rows(options, sources, tokens, seed)
+        present = {row["source"] for row in rows}
+        required_sources = {"main", "mtp"} if options.with_mtp else {"main"}
+        if not required_sources <= present:
+            raise FixtureError(
+                f"QSA tie screening needs selecting rows (blocks > block_topk) in {sorted(required_sources)}; "
+                f"seed {seed} produced rows only in {sorted(present)} (profile geometry has no QSA boundary to screen)"
+            )
+        failing = [row for row in rows if not row["passed"]]
+        if not failing:
+            return {
+                "rule": QSA_SCREEN_RULE,
+                "start_seed": start,
+                "effective_seed": seed,
+                "rejected_count": len(rejected),
+                "rejected": rejected,
+                "predicate": {
+                    "rule": "kth selected block score > 0 and kth - (k+1)th >= max(abs, rel * kth)",
+                    "margin_abs": QSA_SCREEN_MARGIN_ABS,
+                    "margin_rel": QSA_SCREEN_MARGIN_REL,
+                    "rows": "every query row of every QSA layer in the main forward and of MTP step 0 with complete_blocks > block_topk",
+                    "search": f"sequential seeds start, start+1, ... (bound {max_seeds}); exhausting the bound is an error",
+                },
+                "score_source": QSA_SCORE_SOURCE,
+                "rows": rows,
+            }
+        rejected.append({"seed": seed, "failing_rows": len(failing), "first_failing_row": {k: v for k, v in failing[0].items() if k != "block_scores"}})
+    raise FixtureError(f"no seed in [{start}, {start + max_seeds - 1}] passed the QSA tie screen ({max_seeds} candidates rejected)")
+
+
 def generate_profile(
     out: str | Path,
     options: ProfileOptions,
     *,
     cache_dir: str | Path | None = None,
     controls: bool = True,
+    qsa_tie_screen: bool = False,
+    qsa_screen_max_seeds: int = QSA_SCREEN_MAX_SEEDS,
 ) -> dict[str, object]:
     """Write one tiny profile directory (checkpoint, dumps, manifest) and return the manifest."""
 
@@ -1970,9 +2155,22 @@ def generate_profile(
         _tokenizer_raw, _tokenizer_config, tokens = build_tokenizer(options)
         cache_supported = has_attention_layer(options)
         chunk_sizes = [len(tokens) - 3, 1, 1, 1]
+        screen: dict[str, Any] | None = None
+        if qsa_tie_screen:
+            screen = screen_qsa_seed(options, sources, tokens, max_seeds=qsa_screen_max_seeds)
+            options = options.with_overrides(seed=screen["effective_seed"])
         assembly = build_assembly(options, sources, seed=options.seed)
-        forward = run_forward(assembly, tokens)
-        mtp_dumps = run_mtp_step0(assembly, forward) if options.with_mtp else None
+        tap = QsaScoreTap(torch, sources.modeling_module) if screen is not None else None
+        with tap.record("main") if tap is not None else contextlib.nullcontext():
+            forward = run_forward(assembly, tokens)
+        mtp_dumps = None
+        if options.with_mtp:
+            with tap.record("mtp") if tap is not None else contextlib.nullcontext():
+                mtp_dumps = run_mtp_step0(assembly, forward)
+        if tap is not None:
+            regenerated = evaluate_qsa_rows(tap.rows)
+            if regenerated != screen["rows"]:
+                raise FixtureError("QSA block scores of the written fixture differ from the screened candidate run (non-deterministic run)")
         state_dumps: dict[str, Any] = captured_states(assembly, forward)
         chunk_difference = prefill_difference = None
         if cache_supported:
@@ -2005,11 +2203,20 @@ def generate_profile(
         "options": {
             k: v for k, v in options.__dict__.items() if k not in _MANIFEST_OMITTED_DEFAULTS or v != _MANIFEST_OMITTED_DEFAULTS[k]
         },
-        "seed": {
-            "requested": options.seed,
-            "effective": assembly.effective_seed,
-            "init": "per-tensor torch.Generator seeded by sha256(seed|tensor name); BF16 parameters; exactly the requested seed",
-        },
+        "seed": (
+            {
+                "requested": options.seed,
+                "effective": assembly.effective_seed,
+                "init": "per-tensor torch.Generator seeded by sha256(seed|tensor name); BF16 parameters; exactly the requested seed",
+            }
+            if screen is None
+            else {
+                "requested": screen["start_seed"],
+                "effective": assembly.effective_seed,
+                "init": "per-tensor torch.Generator seeded by sha256(seed|tensor name); BF16 parameters; effective seed = smallest "
+                "seed >= requested that passes the QSA tie screen (see qsa_tie_screen)",
+            }
+        ),
         "equation_sources": {
             "main_model": envelope["equation_source"],
             "ffn": (
@@ -2081,6 +2288,8 @@ def generate_profile(
         }
     if not (options.with_ple and options.with_mtp):
         manifest["optional_components"] = components  # only variants add this key: default manifests stay byte-identical
+    if screen is not None:  # only screened runs add this key and change seed.requested: unscreened manifests stay byte-identical
+        manifest["qsa_tie_screen"] = screen
     manifest_path = destination / "manifest.json"
     write_json(manifest_path, manifest)
     manifest["manifest_sha256"] = sha256_file(manifest_path)
