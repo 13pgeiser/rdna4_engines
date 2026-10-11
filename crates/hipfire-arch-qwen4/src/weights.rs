@@ -285,6 +285,177 @@ fn qwen4_trunk_target(name: &str, shape: &[usize], requested: DType, trunk_tier:
     }
 }
 
+/// Metadata key naming the recipe a developer artifact was written under.
+/// A Flash-Next artifact's key predates the typed recipe and carries no `id`;
+/// only a synthetic profile reads or requires one.
+pub const RECIPE_METADATA_KEY: &str = "qwen4_recipe";
+/// `id` of [`Qwen4TierRecipe::SyntheticSourceBf16`] in artifact metadata.
+pub const SYNTHETIC_SOURCE_BF16_RECIPE_ID: &str = "synthetic-source-bf16";
+/// `id` of [`Qwen4TierRecipe::SyntheticPacked`] in artifact metadata.
+pub const SYNTHETIC_PACKED_RECIPE_ID: &str = "synthetic-packed";
+
+impl Qwen4TierRecipe {
+    /// Stable artifact-metadata id of a synthetic recipe; `None` for the
+    /// Flash-Next recipe, which is never selected by metadata.
+    pub const fn synthetic_id(&self) -> Option<&'static str> {
+        match self {
+            Self::FlashNextPacked { .. } => None,
+            Self::SyntheticSourceBf16 => Some(SYNTHETIC_SOURCE_BF16_RECIPE_ID),
+            Self::SyntheticPacked => Some(SYNTHETIC_PACKED_RECIPE_ID),
+        }
+    }
+
+    /// The synthetic recipe an artifact-metadata `id` names.
+    pub fn from_synthetic_id(id: &str) -> Option<Self> {
+        match id {
+            SYNTHETIC_SOURCE_BF16_RECIPE_ID => Some(Self::SyntheticSourceBf16),
+            SYNTHETIC_PACKED_RECIPE_ID => Some(Self::SyntheticPacked),
+            _ => None,
+        }
+    }
+}
+
+/// What [`Qwen4TierRecipe::SyntheticPacked`] declares for one tensor, with the
+/// role class and, when the role stays source-exact BF16, the reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyntheticPackDecision {
+    pub dtype: DType,
+    pub class: &'static str,
+    /// Empty when the role is packed.
+    pub reason: &'static str,
+}
+
+/// The synthetic packed recipe's per-role target: the Flash-Next formats at
+/// the role's own reduction width `K` (the last dimension), declared only where
+/// `K` tiles the format and a consumer reads it, BF16 otherwise.
+///
+/// - token embedding: Q8F16 when `K % 32 == 0`;
+/// - language head: MQ6G256V2 when `K % 256 == 0`, else Q8F16 when `K % 32 == 0`;
+/// - trunk attention/GDN projections (rank 2): Q8F16 when `K % 128 == 0`, the
+///   Flash-Next trunk rule, without the `HIPFIRE_QWEN4_TRUNK_TIER` knob;
+/// - dense FFN gate/up/down: Q8F16 when `K % 32 == 0`;
+/// - routed experts: gate/up MQ4G256V2 and down MQ4G128V2, **both or neither**
+///   (the sealed routed route reads the qt44/qt53 pair): packed only when the
+///   hidden width is a multiple of 256 and the expert width of 128;
+/// - everything else (hyper-connection mixers, router, shared expert, PLE
+///   projections, MTP connectors, norms, convolutions) stays BF16 exactly as in
+///   the Flash-Next recipe.
+pub fn synthetic_packed_decision(name: &str, shape: &[usize]) -> SyntheticPackDecision {
+    let k = shape.last().copied().unwrap_or(0);
+    let packed = |dtype: DType, class: &'static str| SyntheticPackDecision {
+        dtype,
+        class,
+        reason: "",
+    };
+    let exact = |class: &'static str, reason: &'static str| SyntheticPackDecision {
+        dtype: DType::BF16,
+        class,
+        reason,
+    };
+    const Q8_BLOCK: &str = "K is not a multiple of the 32-weight Q8F16 block";
+    if shape.len() == 2 && name == QWEN4_LM_HEAD {
+        return if k % 256 == 0 {
+            packed(DType::MQ6G256V2, "language head")
+        } else if k % 32 == 0 {
+            packed(DType::Q8_0, "language head")
+        } else {
+            exact("language head", Q8_BLOCK)
+        };
+    }
+    if shape.len() == 2 && qwen4_q8_dtype(name) {
+        return if k % 32 == 0 {
+            packed(DType::Q8_0, "token embedding")
+        } else {
+            exact("token embedding", Q8_BLOCK)
+        };
+    }
+    if shape.len() == 2 && name.contains(".ple_embedding.ngram_embedding.shard_") {
+        return if synthetic_packed_ple_row_dtype(k) == DType::Q8_0 {
+            packed(DType::Q8_0, "PLE rows")
+        } else {
+            exact("PLE rows", Q8_BLOCK)
+        };
+    }
+    let gate_up = name.ends_with(".experts.gate_up_proj");
+    let down = name.ends_with(".experts.down_proj");
+    if shape.len() == 3 && (gate_up || down) {
+        let class = if gate_up { "routed gate/up" } else { "routed down" };
+        // gate_up is [experts, 2 * intermediate, hidden]; down is
+        // [experts, hidden, intermediate].
+        let (hidden, intermediate) = if gate_up {
+            if shape[1] % 2 != 0 {
+                return exact(class, "stacked gate/up rows are not an even pair");
+            }
+            (shape[2], shape[1] / 2)
+        } else {
+            (shape[1], shape[2])
+        };
+        return if hidden % 256 != 0 {
+            exact(
+                class,
+                "hidden width is not a multiple of the 256-weight MQ4G256V2 group \
+                 (routed gate/up and down pack together)",
+            )
+        } else if intermediate % 128 != 0 {
+            exact(
+                class,
+                "expert intermediate width is not a multiple of the 128-weight MQ4G128V2 group \
+                 (routed gate/up and down pack together)",
+            )
+        } else if gate_up {
+            packed(ROUTED_GATE_UP_DTYPE, class)
+        } else {
+            packed(ROUTED_DOWN_DTYPE, class)
+        };
+    }
+    if shape.len() == 2
+        && !name.contains(".shared_expert.")
+        && name.contains(".mlp.")
+        && (name.ends_with(".mlp.gate_proj.weight")
+            || name.ends_with(".mlp.up_proj.weight")
+            || name.ends_with(".mlp.down_proj.weight"))
+    {
+        return if k % 32 == 0 {
+            packed(DType::Q8_0, "dense FFN")
+        } else {
+            exact("dense FFN", Q8_BLOCK)
+        };
+    }
+    if shape.len() == 2 && (name.contains(".linear_attn.") || name.contains(".self_attn.")) {
+        return if k % 128 == 0 {
+            packed(DType::Q8_0, "trunk projection")
+        } else {
+            exact("trunk projection", "K is not a multiple of 128 (the Flash-Next trunk rule)")
+        };
+    }
+    const KEPT: &str = "the Flash-Next recipe keeps this role source-exact";
+    let class = if name.contains("hyper_connection") {
+        "hyper-connection mixer"
+    } else if name.contains(".shared_expert") {
+        "shared expert"
+    } else if name.ends_with(".mlp.gate.weight") {
+        "router"
+    } else if name.contains(".ple.") {
+        "PLE projection"
+    } else if name.starts_with("mtp.fc_") {
+        "MTP connector"
+    } else {
+        "source-exact parameter"
+    };
+    exact(class, KEPT)
+}
+
+/// Row tier of one synthetic-packed PLE table: Q8F16 rows when the row width
+/// is a multiple of the 32-weight block (the reader's own addressing rule),
+/// BF16 rows otherwise.
+pub fn synthetic_packed_ple_row_dtype(row_width: usize) -> DType {
+    if row_width % 32 == 0 {
+        DType::Q8_0
+    } else {
+        DType::BF16
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum TensorRole {
     TokenEmbedding,
@@ -402,6 +573,12 @@ pub enum Qwen4TierRecipe {
     /// format has an executable consumer, a producer and a proof.  No
     /// environment knob moves this recipe.
     SyntheticSourceBf16,
+    /// Developer-only synthetic profiles with the Flash-Next per-role packed
+    /// formats, declared only where a role's reduction width tiles the format
+    /// ([`synthetic_packed_decision`]); every other role stays source-exact
+    /// BF16.  Each role admits exactly the one representation declared for it,
+    /// so an artifact's recipe identity is its bytes, not a negotiation.
+    SyntheticPacked,
 }
 
 /// Profile and recipe identity carried by every manifest.
@@ -480,7 +657,7 @@ impl Qwen4Manifest {
     /// The one inventory generator.  Names, logical shapes, optional PLE/MTP,
     /// the FFN family and the recipe identity all come from the typed profile
     /// in `config`; nothing here reintroduces a hard-coded Flash-Next count.
-    fn build_with_recipe(
+    pub fn build_with_recipe(
         config: &Qwen4Config,
         recipe: Qwen4TierRecipe,
     ) -> Result<Self, WeightError> {
@@ -490,8 +667,11 @@ impl Qwen4Manifest {
                 trunk_tier,
                 mtp_source,
             } => (true, *trunk_tier, *mtp_source),
-            Qwen4TierRecipe::SyntheticSourceBf16 => (false, DType::BF16, false),
+            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
+                (false, DType::BF16, false)
+            }
         };
+        let synthetic_packed = matches!(recipe, Qwen4TierRecipe::SyntheticPacked);
         if packed != config.profile.is_flash_next() {
             return Err(WeightError::UnsupportedProfile {
                 profile: config.profile.id().to_string(),
@@ -515,11 +695,16 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             if !packed {
+                let dtype = if synthetic_packed {
+                    synthetic_packed_decision(name, &shape).dtype
+                } else {
+                    DType::BF16
+                };
                 return WeightEntry::model_with_dtype_constraint(
                     name,
                     shape,
-                    DType::BF16,
-                    bf16.clone(),
+                    dtype,
+                    DTypeConstraint::source_exact(dtype),
                     policy,
                 );
             }
@@ -544,12 +729,17 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             if !packed {
+                let dtype = if synthetic_packed {
+                    synthetic_packed_decision(name, &shape).dtype
+                } else {
+                    DType::BF16
+                };
                 return WeightEntry::layer_with_dtype_constraint(
                     name,
                     layer_idx,
                     shape,
-                    DType::BF16,
-                    bf16.clone(),
+                    dtype,
+                    DTypeConstraint::source_exact(dtype),
                     policy,
                 );
             }
@@ -585,6 +775,7 @@ impl Qwen4Manifest {
                 source,
                 packed,
                 mtp_source,
+                synthetic_packed,
             )
         };
         let mtp_layer = |name: &str,
@@ -603,6 +794,7 @@ impl Qwen4Manifest {
                 source,
                 packed,
                 mtp_source,
+                synthetic_packed,
             )
         };
         let hidden = positive("hidden_size", config.hidden_size)?;
@@ -863,6 +1055,7 @@ impl Qwen4Manifest {
                         channels,
                         ple,
                         packed,
+                        synthetic_packed,
                         &bf16,
                     );
                 }
@@ -1076,14 +1269,22 @@ fn mtp_entry(
     source: &DTypeConstraint,
     packed: bool,
     mtp_source: bool,
+    synthetic_packed: bool,
 ) -> WeightEntry {
-    // A synthetic profile never packs: every MTP tensor is source-exact BF16.
+    // A synthetic profile never takes the Flash-Next tier knobs: its MTP
+    // tensors are source-exact BF16, or the synthetic packed recipe's per-role
+    // decision when that recipe is declared.
     if !packed {
+        let dtype = if synthetic_packed {
+            synthetic_packed_decision(name, &shape).dtype
+        } else {
+            DType::BF16
+        };
         return WeightEntry::model_with_dtype_constraint(
             name,
             shape,
-            DType::BF16,
-            DTypeConstraint::source_exact(DType::BF16),
+            dtype,
+            DTypeConstraint::source_exact(dtype),
             policy,
         );
     }
@@ -1408,8 +1609,10 @@ where
 /// One PLE block.  Every dimension (channel width, conv kernel, shard count,
 /// shard rows, row width, valid rows) comes from the typed [`Qwen4PleConfig`];
 /// the Flash-Next values are that config's canonical instance, not constants
-/// here.  `packed` is the recipe: the Flash-Next recipe ships Q8F16 rows and
-/// still admits BF16 ones, a synthetic recipe ships and admits BF16 rows only.
+/// here.  `packed` is the Flash-Next recipe: it ships Q8F16 rows and still
+/// admits BF16 ones.  `synthetic_packed` ships exactly the one tier the row
+/// width allows ([`synthetic_packed_ple_row_dtype`]); any other synthetic recipe
+/// ships and admits BF16 rows only.
 fn push_ple_entries<F>(
     weights: &mut Vec<WeightEntry>,
     layer: &F,
@@ -1419,6 +1622,7 @@ fn push_ple_entries<F>(
     ple_channels: usize,
     config: &Qwen4PleConfig,
     packed: bool,
+    synthetic_packed: bool,
     bf16: &DTypeConstraint,
 ) where
     F: Fn(&str, usize, Vec<usize>, DType, ShardPolicy, &DTypeConstraint) -> WeightEntry,
@@ -1479,6 +1683,12 @@ fn push_ple_entries<F>(
     let (ple_rows, row_dtype, encoding) = if packed {
         (
             DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::BF16]),
+            DType::Q8_0,
+            RowEncoding::Q8F16,
+        )
+    } else if synthetic_packed && synthetic_packed_ple_row_dtype(config.row_width) == DType::Q8_0 {
+        (
+            DTypeConstraint::source_exact(DType::Q8_0),
             DType::Q8_0,
             RowEncoding::Q8F16,
         )

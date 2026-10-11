@@ -12,7 +12,9 @@
 
 use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
 use crate::ple::PleHashMetadata;
-use crate::weights::{is_ple_shard_name_within, Qwen4Manifest, Qwen4Placement};
+use crate::weights::{
+    is_ple_shard_name_within, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, RECIPE_METADATA_KEY,
+};
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::model_source::{SourceFormat, SourceIdentity, SourceRangeDescriptor};
@@ -977,6 +979,58 @@ pub struct Qwen4InventoryReceipt {
     pub source_tensor_count: usize,
 }
 
+/// The manifest an artifact's metadata declares.
+///
+/// A Flash-Next profile has exactly one recipe (its manifest comes from
+/// [`Qwen4Manifest::build`]) and its `qwen4_recipe` object, which predates
+/// recipe ids, must not carry one.  A synthetic developer profile declares its
+/// recipe by `qwen4_recipe.id`: absent means source-exact BF16, the only recipe
+/// before packed synthetic artifacts existed; an unknown or non-string id is
+/// refused rather than guessed.  The declared recipe is explicit and exact: the
+/// manifest then admits only the formats and extents that recipe declares.
+fn manifest_for_metadata(
+    config: &Qwen4Config,
+    metadata_json: &str,
+) -> Result<Qwen4Manifest, Qwen4ArtifactError> {
+    let value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
+        Qwen4ArtifactError::new(format!("qwen4: recipe metadata admission failed: {error}"))
+    })?;
+    let declared = value.get(RECIPE_METADATA_KEY);
+    let id = match declared {
+        None => None,
+        Some(recipe) => match recipe.get("id") {
+            None => None,
+            Some(id) => Some(id.as_str().ok_or_else(|| {
+                Qwen4ArtifactError::new(format!(
+                    "qwen4: {RECIPE_METADATA_KEY}.id must be a string"
+                ))
+            })?),
+        },
+    };
+    let manifest = if config.profile.is_flash_next() {
+        if id.is_some() {
+            return Err(Qwen4ArtifactError::new(format!(
+                "qwen4: {RECIPE_METADATA_KEY}.id is a developer-profile recipe selector; the \
+                 Flash-Next profile has exactly one recipe"
+            )));
+        }
+        Qwen4Manifest::build(config)
+    } else {
+        let recipe = match id {
+            None => Qwen4TierRecipe::SyntheticSourceBf16,
+            Some(id) => Qwen4TierRecipe::from_synthetic_id(id).ok_or_else(|| {
+                Qwen4ArtifactError::new(format!(
+                    "qwen4: {RECIPE_METADATA_KEY}.id {id:?} is not a synthetic-profile recipe"
+                ))
+            })?,
+        };
+        Qwen4Manifest::build_with_recipe(config, recipe)
+    };
+    manifest.map_err(|error| {
+        Qwen4ArtifactError::new(format!("qwen4: manifest admission failed: {error}"))
+    })
+}
+
 fn admit_inventory(
     arch_id: u32,
     config: Qwen4Config,
@@ -988,9 +1042,7 @@ fn admit_inventory(
             "qwen4: source arch_id={arch_id} does not match reserved arch_id={ARCH_ID}"
         )));
     }
-    let manifest = Qwen4Manifest::build(&config).map_err(|error| {
-        Qwen4ArtifactError::new(format!("qwen4: manifest admission failed: {error}"))
-    })?;
+    let manifest = manifest_for_metadata(&config, metadata_json)?;
     let source_tensor_count = validate_manifest_inventory(tensors, &manifest, 0, 0)?;
     let ple = admit_ple_metadata(metadata_json, &config)?;
     Ok(Qwen4InventoryReceipt {
@@ -1067,9 +1119,7 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
         ));
     }
     let config = parse_artifact_config(&hfq.metadata_json)?;
-    let mut manifest = Qwen4Manifest::build(&config).map_err(|error| {
-        Qwen4ArtifactError::new(format!("qwen4: manifest admission failed: {error}"))
-    })?;
+    let mut manifest = manifest_for_metadata(&config, &hfq.metadata_json)?;
     let ple_config = config.ple.as_ref();
     let sidecar = hfq.ple_rows().is_some();
     let shadowed_ple_shards = validate_ple_shard_presence(hfq, sidecar, ple_config)?;
@@ -1262,6 +1312,15 @@ fn admit_ple_rows(
 }
 
 impl Qwen4HfqmArtifact {
+    /// The recipe the artifact was admitted under (selected by its metadata,
+    /// see [`RECIPE_METADATA_KEY`]).  [`Self::manifest`] is already built under
+    /// it; a consumer must take the manifest from here, never rebuild one from
+    /// `config` with [`Qwen4Manifest::build`], which declares the default recipe
+    /// of the profile and would misread a synthetic-packed artifact.
+    pub fn recipe(&self) -> &Qwen4TierRecipe {
+        &self.manifest.identity.recipe
+    }
+
     /// The ordered shard descriptors of the PLE rows source (one per
     /// `config.ple.shard_count`): the row-order sidecar's, or the artifact's
     /// own shard tensors (`hfq` must be the file this receipt was admitted
@@ -2246,6 +2305,7 @@ mod tests {
     mod developer_profiles {
         use super::*;
         use crate::config::{Qwen4Config, Qwen4FfnConfig};
+        use crate::weights::{Qwen4TierRecipe, RECIPE_METADATA_KEY};
 
         fn dense() -> Qwen4FfnConfig {
             Qwen4FfnConfig::Dense {
@@ -2308,6 +2368,158 @@ mod tests {
                     .iter()
                     .any(|entry| entry.name.ends_with(".mlp.down_proj.weight")));
             }
+        }
+
+        fn packed_manifest(config: &Qwen4Config) -> Qwen4Manifest {
+            Qwen4Manifest::build_with_recipe(config, Qwen4TierRecipe::SyntheticPacked)
+                .expect("synthetic packed manifest")
+        }
+
+        fn dtype_of(manifest: &Qwen4Manifest, name: &str) -> DType {
+            manifest
+                .weights
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("manifest declares {name}"))
+                .dtype
+        }
+
+        fn metadata_with_recipe(config: &Qwen4Config, id: Option<serde_json::Value>) -> String {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&config.developer_metadata_json()).unwrap();
+            if let Some(id) = id {
+                value[RECIPE_METADATA_KEY] = serde_json::json!({ "id": id });
+            }
+            value.to_string()
+        }
+
+        /// The packed recipe is selected by `qwen4_recipe.id` and by nothing
+        /// else: the same packed inventory is refused without the id, admitted
+        /// with it, and every other id spelling is refused.
+        #[test]
+        fn packed_recipe_admits_only_under_its_explicit_metadata_id() {
+            let config = crate::config::synthetic_test_config(dense(), 5120, 4, true, true);
+            let manifest = packed_manifest(&config);
+            assert_eq!(manifest.identity.recipe, Qwen4TierRecipe::SyntheticPacked);
+            assert!(manifest.weights.iter().any(|entry| entry.dtype != DType::BF16));
+            let headers = oracle_headers(&manifest);
+
+            let error = admit_developer_inventory_headers(
+                ARCH_ID,
+                &metadata_with_recipe(&config, None),
+                &headers,
+            )
+            .expect_err("packed tags without the recipe id are refused");
+            assert!(error.to_string().contains("tensor"), "{error}");
+
+            let receipt = admit_developer_inventory_headers(
+                ARCH_ID,
+                &metadata_with_recipe(
+                    &config,
+                    Some(serde_json::json!(crate::weights::SYNTHETIC_PACKED_RECIPE_ID)),
+                ),
+                &headers,
+            )
+            .expect("packed inventory under its recipe id");
+            assert_eq!(receipt.manifest, manifest);
+
+            let source_exact = admit_developer_inventory_headers(
+                ARCH_ID,
+                &metadata_with_recipe(
+                    &config,
+                    Some(serde_json::json!(crate::weights::SYNTHETIC_SOURCE_BF16_RECIPE_ID)),
+                ),
+                &oracle_headers(&Qwen4Manifest::build(&config).unwrap()),
+            )
+            .expect("explicit source-exact id");
+            assert_eq!(source_exact.manifest.identity.recipe, Qwen4TierRecipe::SyntheticSourceBf16);
+
+            for bad in [
+                serde_json::json!("flash-next"),
+                serde_json::json!("Synthetic-Packed"),
+                serde_json::json!(7),
+            ] {
+                let error = admit_developer_inventory_headers(
+                    ARCH_ID,
+                    &metadata_with_recipe(&config, Some(bad)),
+                    &headers,
+                )
+                .expect_err("unknown recipe id")
+                .to_string();
+                assert!(error.contains(RECIPE_METADATA_KEY), "{error}");
+            }
+        }
+
+        /// Flash-Next has exactly one recipe: a recipe id on its metadata is
+        /// refused instead of being ignored.
+        #[test]
+        fn flash_next_refuses_a_recipe_id() {
+            let mut value: serde_json::Value = serde_json::from_str(&flash_next_json()).unwrap();
+            value[RECIPE_METADATA_KEY] = serde_json::json!({
+                "id": crate::weights::SYNTHETIC_PACKED_RECIPE_ID
+            });
+            let error = admit_developer_inventory_headers(ARCH_ID, &value.to_string(), &flash_next_headers())
+                .expect_err("Flash-Next must not take a recipe selector")
+                .to_string();
+            assert!(error.contains("exactly one recipe"), "{error}");
+        }
+
+        /// Each role packs at its own reduction width, and the routed gate/up
+        /// and down matrices pack together or not at all.
+        #[test]
+        fn packed_recipe_decides_per_role_and_packs_routed_experts_as_a_pair() {
+            let moe = |intermediate: usize| Qwen4FfnConfig::Moe {
+                num_experts: 4,
+                top_k: 2,
+                intermediate_size: intermediate,
+                shared_intermediate_size: Some(intermediate),
+                norm_topk_prob: true,
+            };
+            let layer = |role: &str| format!("model.language_model.layers.0.mlp.{role}");
+            // hidden 256, expert width 128: both routed matrices pack.
+            let config = crate::config::synthetic_test_config(moe(128), 256, 4, true, true);
+            let manifest = packed_manifest(&config);
+            assert_eq!(dtype_of(&manifest, &layer("experts.gate_up_proj")), DType::MQ4G256V2);
+            assert_eq!(dtype_of(&manifest, &layer("experts.down_proj")), DType::MQ4G128V2);
+            assert_eq!(dtype_of(&manifest, "model.language_model.embed_tokens.weight"), DType::Q8_0);
+            assert_eq!(dtype_of(&manifest, "lm_head.weight"), DType::MQ6G256V2);
+            // The router, shared expert and hyper-connection mixers stay BF16.
+            assert_eq!(dtype_of(&manifest, &layer("gate.weight")), DType::BF16);
+            assert_eq!(dtype_of(&manifest, &layer("shared_expert.gate_proj.weight")), DType::BF16);
+            assert_eq!(
+                dtype_of(&manifest, "model.language_model.hyper_connection_mixer.hc_norm.weight"),
+                DType::BF16
+            );
+            assert_eq!(dtype_of(&manifest, "mtp.fc_embedding.weight"), DType::BF16);
+            // Expert width 64 is not a MQ4G128V2 group: gate/up must not pack alone.
+            let config = crate::config::synthetic_test_config(moe(64), 256, 4, true, true);
+            let manifest = packed_manifest(&config);
+            assert_eq!(dtype_of(&manifest, &layer("experts.gate_up_proj")), DType::BF16);
+            assert_eq!(dtype_of(&manifest, &layer("experts.down_proj")), DType::BF16);
+            // Hidden 128 is not a MQ4G256V2 group: neither packs, down included.
+            let config = crate::config::synthetic_test_config(moe(128), 128, 4, true, true);
+            let manifest = packed_manifest(&config);
+            assert_eq!(dtype_of(&manifest, &layer("experts.gate_up_proj")), DType::BF16);
+            assert_eq!(dtype_of(&manifest, &layer("experts.down_proj")), DType::BF16);
+            // A dense FFN packs gate/up where K tiles Q8F16 and keeps a narrow down BF16.
+            let config = crate::config::synthetic_test_config(
+                Qwen4FfnConfig::Dense { intermediate_size: 8 },
+                256,
+                4,
+                false,
+                false,
+            );
+            let manifest = packed_manifest(&config);
+            assert_eq!(dtype_of(&manifest, &layer("gate_proj.weight")), DType::Q8_0);
+            assert_eq!(dtype_of(&manifest, &layer("up_proj.weight")), DType::Q8_0);
+            assert_eq!(dtype_of(&manifest, &layer("down_proj.weight")), DType::BF16);
+            // Hidden 16: nothing tiles any packed format.
+            let config = crate::config::synthetic_test_config(moe(8), 16, 4, true, true);
+            let manifest = packed_manifest(&config);
+            assert!(
+                manifest.weights.iter().all(|entry| entry.dtype == DType::BF16),
+                "no role of a width-16 profile can pack"
+            );
         }
 
         #[test]
