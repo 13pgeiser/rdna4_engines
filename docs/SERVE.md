@@ -42,6 +42,8 @@ hipfire serve 0.0.0.0:11435 -d        # all-interfaces bind — unauthenticated;
 hipfire serve --no-prewarm -d         # bind first; load on first request
 hipfire serve --kv-mode q8 --idle-timeout 0 -d
 hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
+hipfire serve --spec off -d           # plain AR (no MTP/DFlash) for every load, e.g. an A/B
+hipfire serve --max-seq 32768 -d      # KV context for every load (replaces memory.max_seq)
 
 hipfire ps                            # daemons / quantize / uploads + port state (Linux)
 hipfire stop                          # SIGTERM tracked pid in serve.pid (safe default)
