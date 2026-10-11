@@ -5,7 +5,7 @@
 //!
 //! The kernels are precompiled into `native/gpu_bw_gfx1151.co` and loaded through the shared lazy
 //! HIP runtime (`railgun::npu::hip_runtime`, `dlopen` only); nothing here needs the ROCm compiler. The
-//! runtime selects PCI `0000:bf:00.0` before the module is loaded and the arch is gated to
+//! runtime selects the Halo iGPU (`railgun::npu::fclk::igpu_pci`, env `NPU_IGPU_PCI`, default `0000:bf:00.0`) before the module is loaded and the arch is gated to
 //! `gfx1151` before the (gfx1151-only) code object is touched. `HIP_VISIBLE_DEVICES` is not needed.
 //!
 //! Module symbols `read_bw` / `write_bw` take the same 32-byte kernarg blob: `ptr@0`, `count@8`
@@ -22,7 +22,6 @@
 use railgun::npu::hip_runtime::{HipBuffer, HipEvent, HipFunction, HipMemoryKind, HipRuntime};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const PCI_BUS_ID: &str = "0000:bf:00.0";
 const ARCH: &str = "gfx1151";
 const CODE_OBJECT: &[u8] = include_bytes!("../native/gpu_bw_gfx1151.co");
 const THREADS: u32 = 256;
@@ -56,7 +55,7 @@ checksums of all loaded elements (checksum verification, not full-byte-exact). F
 verify_fail line and an error exit. Result rows carry verification=checksum (read) or
 verification=byte-exact (write). An unsupported allocation prints alloc_fail and continues;
 a run that completes nothing is an error.
-Device is selected by PCI bus ID 0000:bf:00.0 (gfx1151 only); HIP_VISIBLE_DEVICES is not needed.
+Device is selected by PCI bus ID $NPU_IGPU_PCI, default 0000:bf:00.0 (gfx1151 only); HIP_VISIBLE_DEVICES is not needed.
 GB/s = 1e9 bytes/s. Background timestamps are CLOCK_REALTIME nanoseconds.";
 
 // ---------------------------------------------------------------------------------------------
@@ -470,18 +469,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let options = parse_args(args)?;
 
-    let rt = HipRuntime::load_for_pci(PCI_BUS_ID)?;
+    let pci = railgun::npu::fclk::igpu_pci();
+    let rt = HipRuntime::load_for_pci(&pci)?;
     let arch = rt.device_arch()?;
     if arch != ARCH {
         return Err(format!(
-            "device {PCI_BUS_ID} reports arch {arch:?}; this gpu-bw code object is {ARCH}-only"
+            "device {pci} reports arch {arch:?}; this gpu-bw code object is {ARCH}-only"
         ));
     }
     let cus = rt.compute_units()?;
     if cus == 0 {
         return Err("device reports no compute units".to_string());
     }
-    println!("device gcnArchName={arch} pci={PCI_BUS_ID} CUs={cus}");
+    println!("device gcnArchName={arch} pci={pci} CUs={cus}");
 
     let blocks = cus.checked_mul(BLOCKS_PER_CU).ok_or("grid size overflows u32")?;
     let total_threads = usize::try_from(u64::from(blocks) * u64::from(THREADS)).map_err(|_| "thread count overflows usize")?;
