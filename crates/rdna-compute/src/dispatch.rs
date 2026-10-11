@@ -4782,15 +4782,19 @@ impl Gpu {
         })
     }
 
-    /// Copy `source` (its logical/accessed `buf.size()` bytes, not shape*dtype) into
-    /// a new exportable single-allocation VMM owner and return it with a POSIX FD.
+    /// Copy exactly `source.buf.size()` bytes (not shape*dtype) into a new
+    /// exportable single-allocation VMM owner and return it with a POSIX FD.
+    /// Borrowed sources are accepted: callers must supply a bounded view when
+    /// typed logical bytes are shorter than the owning allocation's capacity.
     /// The allocation is `logical + EXPORT_WEIGHT_TAIL_PAD_BYTES` rounded up to the
     /// arena granularity; the zeroed tail stands in for the hipMalloc slack that
     /// kernels' phantom header/vector reads past the exact size rely on.
     ///
-    /// The old `source` is untouched; the caller promotes aliases and then calls
-    /// [`Self::release_weight_source_immediate`]. The new owner is registered as a
-    /// `Raw [logical_bytes]` VMM owner and published read-only. Any failure after the
+    /// `source` is untouched and never freed here; the caller promotes aliases
+    /// and releases the actual owning tensor with
+    /// [`Self::release_weight_source_immediate`], not the borrowed source view.
+    /// The new owner is registered as a `Raw [logical_bytes]` VMM owner and
+    /// published read-only. Any failure after the
     /// arena exists retires it through the orphan machinery; the FD closes on drop.
     /// No pool retry: a map failure is returned as-is.
     #[cfg(target_os = "linux")]
@@ -8650,13 +8654,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     const S2_FD_CLOEXEC: i32 = 1;
 
-    /// Nonaligned source: the rounded padding tail is zeroed and logical bytes match.
+    /// Bounded borrowed source: copy only its logical prefix, not owner capacity.
     #[cfg(target_os = "linux")]
     fn s2_small_nonaligned_case(gpu: &mut super::Gpu) {
         let logical = (3usize << 20) + 12_345;
-        let pattern = s2_pattern(logical);
-        let mut src = gpu.upload_raw(&pattern, &[logical]).expect("upload small source");
-        let exp = gpu.create_exportable_weight_copy(&src).expect("export small");
+        let mut pattern = s2_pattern(logical);
+        pattern.extend_from_slice(&[0xa5; 256]);
+        let mut src = gpu.upload_raw(&pattern, &[pattern.len()]).expect("upload small source");
+        let view = src.sub_offset(0, logical);
+        assert!(view.buf.is_borrowed());
+        let exp = gpu.create_exportable_weight_copy(&view).expect("export bounded small source");
+        drop(view);
         assert_eq!(exp.logical_bytes, logical);
         assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
         assert_eq!(
