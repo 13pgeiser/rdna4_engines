@@ -9084,24 +9084,7 @@ fn batch_chunk_full_attn_prepare(
         // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
         // global-memory round trip. K-norm, triattn tap, and RoPE below are
         // unchanged.
-        gpu.deinterleave_q_rmsnorm_f32_batched(
-            &pbs.fa_q_full_batch,
-            &pbs.fa_q_batch,
-            &pbs.fa_gate_batch,
-            &layer.q_norm,
-            config.n_heads,
-            config.head_dim,
-            n,
-            config.norm_eps,
-        )?;
-        gpu.rmsnorm_batched(
-            &pbs.fa_k_batch,
-            &layer.k_norm,
-            &pbs.fa_k_batch,
-            n * config.n_kv_heads,
-            config.head_dim,
-            config.norm_eps,
-        )?;
+        fa_prep_unfused_qk_norm(gpu, layer, config, pbs, n)?;
 
         if hipfire_runtime::triattn::tap_enabled() {
             // Try GPU path first: dispatches a reduce kernel on the
@@ -9144,7 +9127,6 @@ fn batch_chunk_full_attn_prepare(
         // pos_offset = compact_offset so new Q/K rotate at ABSOLUTE phase
         // after eviction (cached keys are absolute-phased); pbs.positions
         // stays physical for the KV-write below. 0 when no compaction.
-        let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
         // 39aa358: in DDTree verify, rotate at DEPTH positions (correct
         // sibling phases); KV writes below still use flat physical
         // slots. Linear path unchanged.
@@ -9153,24 +9135,75 @@ fn batch_chunk_full_attn_prepare(
         } else {
             &pbs.positions
         };
-        gpu.rope_partial_interleaved_f32_batched(
-            &pbs.fa_q_batch,
-            &pbs.fa_k_batch,
-            rope_pos_buf,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            n_rot,
-            config.rope_theta,
-            n,
-            kv_cache.compact_offset as i32,
-        )?;
+        fa_prep_unfused_rope(gpu, config, pbs, rope_pos_buf, n, kv_cache.compact_offset as i32)?;
     }
 
     // 6–7. (F2 split: the KV write + flash attention dispatch now lives in
     // the caller via `batch_chunk_fa_attend`, so a pair of chunks can share
     // one merged 1024-row attend step. Single-chunk order is unchanged.)
     Ok(())
+}
+
+/// The unfused FullAttention prep's row-local norm stage over the first `n`
+/// rows of `pbs`: fused deinterleave + Q-rmsnorm (`fa_q_full_batch` ->
+/// `fa_q_batch` / `fa_gate_batch`), then the in-place K rmsnorm. Row-local
+/// kernels: one call over a multi-request chunk's combined rows equals one
+/// call per request over that request's rows (the multi-request lane route
+/// of `prefill_multi.rs` relies on this).
+pub(crate) fn fa_prep_unfused_qk_norm(
+    gpu: &mut Gpu,
+    layer: &FullAttnLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+) -> HipResult<()> {
+    // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
+    // global-memory round trip.
+    gpu.deinterleave_q_rmsnorm_f32_batched(
+        &pbs.fa_q_full_batch,
+        &pbs.fa_q_batch,
+        &pbs.fa_gate_batch,
+        &layer.q_norm,
+        config.n_heads,
+        config.head_dim,
+        n,
+        config.norm_eps,
+    )?;
+    gpu.rmsnorm_batched(
+        &pbs.fa_k_batch,
+        &layer.k_norm,
+        &pbs.fa_k_batch,
+        n * config.n_kv_heads,
+        config.head_dim,
+        config.norm_eps,
+    )
+}
+
+/// The unfused FullAttention prep's batched partial-interleaved RoPE over the
+/// first `n` rows of `pbs` (per-row positions from `rope_pos_buf`, plus
+/// `pos_offset` = the cache's `compact_offset`). Row-local, like
+/// [`fa_prep_unfused_qk_norm`].
+pub(crate) fn fa_prep_unfused_rope(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    rope_pos_buf: &GpuTensor,
+    n: usize,
+    pos_offset: i32,
+) -> HipResult<()> {
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    gpu.rope_partial_interleaved_f32_batched(
+        &pbs.fa_q_batch,
+        &pbs.fa_k_batch,
+        rope_pos_buf,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+        n,
+        pos_offset,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

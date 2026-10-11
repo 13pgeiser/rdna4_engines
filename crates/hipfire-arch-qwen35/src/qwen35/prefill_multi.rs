@@ -37,6 +37,13 @@
 //! FFN run once at the combined count there; on other arches a layer where
 //! any request's singleton would take the S4 arm runs those stages per request
 //! view instead.
+//!
+//! Lane-batched FullAttention (exact gfx1201, every request a ChainVerify lane
+//! on native fp8 KV, see [`lane_fa_chunk_admitted`]): the per-request unfused
+//! prep + fp8 KV write + VerifyAttn tile/reduce of each FA layer collapse to
+//! the row-local prep once over all rows plus one launch per stage for all
+//! lanes (`rdna_compute::lane_fa`), byte-identical per request;
+//! `HIPFIRE_CB_LANE_FA_BATCH=0` keeps the per-request loop.
 
 use super::*;
 
@@ -237,6 +244,24 @@ static LANE_GDN_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_CB_LANE_GDN_BATCH").map_or(true, |v| v.trim() != "0")
 });
 
+/// `HIPFIRE_CB_LANE_FA_BATCH=0` (developer kill switch): every request runs
+/// its own FullAttention prep + fp8 KV write + VerifyAttn tile + reduce per
+/// layer (4+ launches per lane) instead of one launch per stage per layer
+/// for all lanes of the chunk (see [`lane_fa_chunk_admitted`]). Default on;
+/// every output and KV byte is identical either way.
+static LANE_FA_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_LANE_FA_BATCH").map_or(true, |v| v.trim() != "0")
+});
+
+/// Largest lane-batched FA partials buffer (f32 elements, 1 GiB): a chunk whose
+/// lanes would need more (very long contexts x many rows) keeps the per-lane
+/// route, which reuses the model scratch's one-row-group partials.
+const LANE_FA_PARTIALS_MAX_FLOATS: usize = (1usize << 30) / 4;
+
+/// Growth granule of the lane-batched FA partials buffer (64 MiB of f32), so a
+/// context creeping one tile at a time does not reallocate every step.
+const LANE_FA_PARTIALS_GROW_FLOATS: usize = (64usize << 20) / 4;
+
 /// Bytes of one layer's device GDN lane table (`CONV_LANES_MAX` rows).
 const GDN_LANE_TABLE_LAYER_BYTES: usize =
     rdna_compute::lane_gdn::CONV_LANES_MAX * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTable>();
@@ -254,6 +279,12 @@ pub struct MultiChunkScratch {
     /// `&MultiChunkScratch`, hence the lock. The table is re-uploaded only
     /// when a chunk's rows differ (lane membership / order change).
     gdn_lane_table_host: std::sync::Mutex<Vec<rdna_compute::dflash_gdn_replay::GdnLayerTable>>,
+    /// Disjoint per-lane VerifyAttn partials of the lane-batched FullAttention
+    /// route (`Gpu::lane_fa_partials_len` f32 elements), grown on demand
+    /// ([`Self::lane_fa_partials_acquire`]); `None` until a chunk takes the
+    /// route. The model scratch's `flash_partials` holds only one row group
+    /// of one singleton launch, so lanes cannot share it.
+    lane_fa_partials: std::sync::Mutex<Option<GpuTensor>>,
 }
 
 impl MultiChunkScratch {
@@ -280,6 +311,7 @@ impl MultiChunkScratch {
                 attn_segs,
                 gdn_lane_table,
                 gdn_lane_table_host: std::sync::Mutex::new(Vec::new()),
+                lane_fa_partials: std::sync::Mutex::new(None),
             }),
             Err(e) => {
                 let _ = gpu.free_tensor(attn_segs);
@@ -296,7 +328,11 @@ impl MultiChunkScratch {
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
         self.pbs.free_gpu(gpu)?;
         gpu.free_tensor(self.attn_segs)?;
-        gpu.free_tensor(self.gdn_lane_table)
+        gpu.free_tensor(self.gdn_lane_table)?;
+        match self.lane_fa_partials.into_inner() {
+            Ok(Some(t)) => gpu.free_tensor(t),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -335,6 +371,126 @@ fn lane_gdn_chunk_admitted(
                 && r.tokens.len() == n0
                 && r.gdn_tape.is_some_and(|t| n0 <= t.max_n)
         })
+}
+
+impl MultiChunkScratch {
+    /// The lane-batched FA partials buffer holding at least `floats` f32
+    /// elements, locked for the caller's use (the guard keeps a concurrent
+    /// chunk from reallocating it). Grows by freeing the old buffer (an
+    /// implicit device sync on the stream's earlier users) and allocating the
+    /// requirement rounded up to [`LANE_FA_PARTIALS_GROW_FLOATS`]. `None` on a
+    /// poisoned lock or when the (re)allocation fails: the chunk then keeps
+    /// the per-lane route.
+    fn lane_fa_partials_acquire(
+        &self,
+        gpu: &mut Gpu,
+        floats: usize,
+    ) -> Option<std::sync::MutexGuard<'_, Option<GpuTensor>>> {
+        let mut guard = self.lane_fa_partials.lock().ok()?;
+        if guard.as_ref().map_or(true, |t| t.numel() < floats) {
+            if let Some(old) = guard.take() {
+                gpu.free_tensor(old).ok()?;
+            }
+            let rounded = floats.next_multiple_of(LANE_FA_PARTIALS_GROW_FLOATS);
+            *guard = Some(gpu.alloc_tensor(&[rounded], rdna_compute::DType::F32).ok()?);
+        }
+        Some(guard)
+    }
+}
+
+/// Does this lane's singleton route reach `kv_cache_write_fp8_e4m3_batched`
+/// + the VerifyAttn tile (`AttnFp8E4m3KvBatchedMasked` with
+/// `verify_tile_attend`)? [`attn_fp8_twin_eligible`] without its context /
+/// fusion limits: the same tier-plan derivation `execute_fa_attend_step` does.
+fn lane_fa_plan_ok(gpu: &Gpu, s: &Qwen35Scratch, kv: &llama::KvCache, start_pos: usize, n: usize) -> bool {
+    KvTierPlan::derive(KvTierInputs {
+        pos: start_pos,
+        flash_mode: s.flash_mode as usize,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: n,
+        is_tree: false,
+        ..kv.tier_inputs()
+    })
+    .is_ok_and(|p| {
+        p.attend_key == hipfire_dispatch::types::KernelKey::AttnFp8E4m3KvBatchedMasked
+            && p.write_key == hipfire_dispatch::types::KernelKey::KvWriteFp8E4m3Batched
+    })
+}
+
+/// May this chunk's FullAttention layers run the lane-batched route (the
+/// row-local prep launches once over all rows, then one fp8 KV write per
+/// side, one VerifyAttn tile and one reduce for all requests, instead of the
+/// per-request prep + write + attend)? The lane route reproduces exactly the
+/// route each request's singleton takes, so every one of these must hold:
+///
+/// * process/device: `HIPFIRE_CB_LANE_FA_BATCH` not `0`, sequential batch
+///   semantics, [`Gpu::lane_fa_batch_admitted`] (exact gfx1201, VerifyAttn on,
+///   head_dim 256 GQA group 6 tile 128, no capture / recording / G0
+///   observation, every request 1..=32 rows), at most `LANE_FA_MAX` requests,
+///   no triattn tap (it would interleave per-request recording with the prep);
+/// * no request on the segment-twin arm (`twin_attn`);
+/// * per request: ChainVerify (prep unfused: `gfx12_fa_prep_admitted` false;
+///   attend via `verify_tile_attend`), native fp8 KV with `compact_offset 0`
+///   (the rope offset is then 0 for every row), `2..64` rows (below every
+///   FA2 / packet / Q-resident arm, which start at 64 rows), not the Q8
+///   multirow arm, the paired fp8 write + fp8 batched-masked attend tier
+///   plan, and the model scratch's partials able to hold one singleton row
+///   (the singleton's own VerifyAttn admission);
+/// * the lanes' disjoint partials fit [`LANE_FA_PARTIALS_MAX_FLOATS`].
+fn lane_fa_chunk_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    reqs: &[MultiChunkRequest<'_>],
+    sem: BatchSemantics<'_>,
+    twin_attn: &[bool],
+) -> bool {
+    if !*LANE_FA_BATCH
+        || !matches!(sem, BatchSemantics::Sequential)
+        || reqs.is_empty()
+        || reqs.len() > rdna_compute::lane_fa::LANE_FA_MAX
+        || twin_attn.iter().any(|&t| t)
+        || hipfire_runtime::triattn::tap_enabled()
+    {
+        return false;
+    }
+    let rows: Vec<usize> = reqs.iter().map(|r| r.tokens.len()).collect();
+    if !gpu.lane_fa_batch_admitted(config.n_heads, config.n_kv_heads, config.head_dim, &rows) {
+        return false;
+    }
+    let tile = gpu.attn_tile_size();
+    let mut shape = Vec::with_capacity(reqs.len());
+    for r in reqs {
+        let n = r.tokens.len();
+        let kv = &*r.kv_cache;
+        let max_ctx_len = r.start_pos + n;
+        let multirow = q8_multirow_attn_admitted(
+            gpu.arch_caps.arch(),
+            kv.quant_q8,
+            config.head_dim,
+            n,
+            max_ctx_len,
+            fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+            false,
+            false,
+            false,
+            false,
+        );
+        if r.fusion != DflashFusionCtx::ChainVerify
+            || !kv.quant_fp8
+            || kv.compact_offset != 0
+            || !(MIN_BATCH..64).contains(&n)
+            || gfx12_fa_prep_admitted(gpu, config, r.fusion, n)
+            || multirow
+            || !lane_fa_plan_ok(gpu, s, kv, r.start_pos, n)
+            || s.flash_partials.numel()
+                < config.n_heads * max_ctx_len.div_ceil(tile) * (2 + config.head_dim)
+        {
+            return false;
+        }
+        shape.push((n, max_ctx_len));
+    }
+    Gpu::lane_fa_partials_len(config.n_heads, &shape) <= LANE_FA_PARTIALS_MAX_FLOATS
 }
 
 /// Make the device GDN lane table hold this chunk's recurrence rows: row
@@ -744,6 +900,16 @@ pub fn forward_prefill_batch_multi(
     if lane_gdn {
         stage_gdn_lane_table(gpu, scratch, config, reqs, &views)?;
     }
+    // Lane-batched FullAttention route (see `lane_fa_chunk_admitted`): decided
+    // once per chunk; the disjoint per-lane partials are held (locked) for the
+    // whole forward.
+    let mut lane_fa_guard = None;
+    if lane_fa_chunk_admitted(gpu, config, s, reqs, sem, &twin_attn) {
+        let shape: Vec<(usize, usize)> =
+            reqs.iter().map(|r| (r.tokens.len(), r.start_pos + r.tokens.len())).collect();
+        lane_fa_guard = scratch.lane_fa_partials_acquire(gpu, Gpu::lane_fa_partials_len(config.n_heads, &shape));
+    }
+    let lane_fa_partials: Option<&GpuTensor> = lane_fa_guard.as_ref().and_then(|g| (**g).as_ref());
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
@@ -919,47 +1085,106 @@ pub fn forward_prefill_batch_multi(
                         gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, math,
                     )?;
                 }
-                for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
-                    let n = r.tokens.len();
-                    let max_ctx_len = r.start_pos + n;
-                    let rctx = if r.fusion == DflashFusionCtx::ChainVerify { &chain_ctx } else { &ctx };
-                    let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, r.fusion, n);
-                    let multirow = q8_multirow_attn_admitted(
-                        gpu.arch_caps.arch(),
-                        r.kv_cache.quant_q8,
+                if let Some(lane_partials) = lane_fa_partials {
+                    // Lane-batched route: the unfused prep's row-local stages
+                    // once over all rows (every lane's rows are contiguous
+                    // rows of the shared scratch, each position row uploaded
+                    // with its own start_pos; `compact_offset` is 0 for every
+                    // lane, see `lane_fa_chunk_admitted`), then one KV write
+                    // per side and one VerifyAttn tile + reduce for all
+                    // lanes. Per request this is exactly the unfused prep +
+                    // `batch_chunk_fa_attend` (fp8 write, then the
+                    // `verify_tile_attend` tile + reduce).
+                    fa_prep_unfused_qk_norm(gpu, layer, config, pbs, total)?;
+                    fa_prep_unfused_rope(gpu, config, pbs, &pbs.positions, total, 0)?;
+                    let k_writes: Vec<rdna_compute::lane_fa::LaneFaWrite<'_>> = reqs
+                        .iter()
+                        .zip(&views)
+                        .map(|(r, view)| rdna_compute::lane_fa::LaneFaWrite {
+                            cache: &r.kv_cache.k_gpu[layer_idx],
+                            src: &view.fa_k_batch,
+                            positions: &view.positions,
+                            rows: r.tokens.len(),
+                        })
+                        .collect();
+                    gpu.kv_cache_write_fp8_e4m3_lanes(&k_writes, config.n_kv_heads, config.head_dim)?;
+                    let v_writes: Vec<rdna_compute::lane_fa::LaneFaWrite<'_>> = reqs
+                        .iter()
+                        .zip(&views)
+                        .map(|(r, view)| rdna_compute::lane_fa::LaneFaWrite {
+                            cache: &r.kv_cache.v_gpu[layer_idx],
+                            src: &view.fa_v_batch,
+                            positions: &view.positions,
+                            rows: r.tokens.len(),
+                        })
+                        .collect();
+                    gpu.kv_cache_write_fp8_e4m3_lanes(&v_writes, config.n_kv_heads, config.head_dim)?;
+                    let attends: Vec<rdna_compute::lane_fa::LaneFaAttend<'_>> = reqs
+                        .iter()
+                        .zip(&views)
+                        .map(|(r, view)| rdna_compute::lane_fa::LaneFaAttend {
+                            q: &view.fa_q_batch,
+                            k_cache: &r.kv_cache.k_gpu[layer_idx],
+                            v_cache: &r.kv_cache.v_gpu[layer_idx],
+                            out: &view.fa_attn_out_batch,
+                            positions: &view.positions,
+                            rows: r.tokens.len(),
+                            max_ctx_len: r.start_pos + r.tokens.len(),
+                            physical_cap: r.kv_cache.physical_cap,
+                        })
+                        .collect();
+                    gpu.attention_verify_gqa_fp8_lanes(
+                        &attends,
+                        lane_partials,
+                        config.n_heads,
+                        config.n_kv_heads,
                         config.head_dim,
-                        n,
-                        r.start_pos + n,
-                        fa_pertoken_min_ctx(gpu.arch_caps.arch()),
-                        false,
-                        false,
-                        false,
-                        false,
-                    );
-                    batch_chunk_full_attn_prepare(
-                        gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None,
-                        kv_layer_idx, layer_idx, r.fusion, gfx12_fa_prep, false, false,
                     )?;
-                    if twin {
-                        // The singleton attend's paired write; the attention
-                        // itself runs in the segment twin below.
-                        for (cache, src) in
-                            [(&r.kv_cache.k_gpu[layer_idx], &view.fa_k_batch), (&r.kv_cache.v_gpu[layer_idx], &view.fa_v_batch)]
-                        {
-                            gpu.kv_cache_write_fp8_e4m3_batched(
-                                cache,
-                                src,
-                                &view.positions,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                n,
+                    gpu.attention_verify_reduce_lanes(&attends, lane_partials, config.n_heads)?;
+                } else {
+                    for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
+                        let n = r.tokens.len();
+                        let max_ctx_len = r.start_pos + n;
+                        let rctx = if r.fusion == DflashFusionCtx::ChainVerify { &chain_ctx } else { &ctx };
+                        let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, r.fusion, n);
+                        let multirow = q8_multirow_attn_admitted(
+                            gpu.arch_caps.arch(),
+                            r.kv_cache.quant_q8,
+                            config.head_dim,
+                            n,
+                            r.start_pos + n,
+                            fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+                            false,
+                            false,
+                            false,
+                            false,
+                        );
+                        batch_chunk_full_attn_prepare(
+                            gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem,
+                            None, kv_layer_idx, layer_idx, r.fusion, gfx12_fa_prep, false, false,
+                        )?;
+                        if twin {
+                            // The singleton attend's paired write; the attention
+                            // itself runs in the segment twin below.
+                            for (cache, src) in [
+                                (&r.kv_cache.k_gpu[layer_idx], &view.fa_k_batch),
+                                (&r.kv_cache.v_gpu[layer_idx], &view.fa_v_batch),
+                            ] {
+                                gpu.kv_cache_write_fp8_e4m3_batched(
+                                    cache,
+                                    src,
+                                    &view.positions,
+                                    config.n_kv_heads,
+                                    config.head_dim,
+                                    n,
+                                )?;
+                            }
+                        } else {
+                            batch_chunk_fa_attend(
+                                gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None,
+                                layer_idx, multirow, None, false,
                             )?;
                         }
-                    } else {
-                        batch_chunk_fa_attend(
-                            gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None, layer_idx,
-                            multirow, None, false,
-                        )?;
                     }
                 }
                 if let Some(cap) = twin_cap.filter(|_| !twin_ctx.is_empty()) {

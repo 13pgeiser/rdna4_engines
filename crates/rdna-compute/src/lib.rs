@@ -60,6 +60,7 @@ pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
 pub mod lane_gdn;
+pub mod lane_fa;
 pub mod tape_copy;
 pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared,
