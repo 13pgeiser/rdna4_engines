@@ -47,6 +47,12 @@ BOOTSTRAP_ENV = {
     # contending for a card must read the same ambient dir before either has
     # its own config.
     "HIPFIRE_LOCK_DIR",
+    # Shared-weight host opt-in, its socket and the dev-fabric admission
+    # token: read before install_process_config() because they select the
+    # GPU claim kind (shared vs exclusive), exactly like HIPFIRE_LOCK_DIR.
+    "HIPFIRE_WEIGHT_HOST",
+    "HIPFIRE_WEIGHT_HOST_SOCKET",
+    "HIPFIRE_FABRIC_ADMISSION",
 }
 CENTRAL_CONFIG_READERS = {
     "crates/hipfire-config/src/lib.rs",
