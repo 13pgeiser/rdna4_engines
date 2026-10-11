@@ -708,7 +708,7 @@ int ref_logit_softcap(const RadArgs* a, RadStream) {
     #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < nel; ++i) {
         const float v = ldt(x, offlin(x, i));
-        stt(y, offlin(y, i), cap * std::tanhf(v / cap));
+        stt(y, offlin(y, i), cap * std::tanh(v / cap));
     }
     return RAD_OK;
 }

@@ -692,7 +692,7 @@ AVX_KERNEL(logit_softcap) {
         AVX_PARALLEL_FOR_IF(nel >= AVX_PAR_MIN)
         for (int64_t i = 0; i < nel; ++i) {
             const float v = ldt(x, offlin(x, i));
-            stt(y, offlin(y, i), cap * std::tanhf(v / cap));
+            stt(y, offlin(y, i), cap * std::tanh(v / cap));
         }
         return RAD_OK;
     }
@@ -713,7 +713,7 @@ AVX_KERNEL(logit_softcap) {
         for (; i + VF_N <= m; i += VF_N)
             vf_storeu(so + i, vf_fma(c2, vf_sigmoid(vf_mul(vf_loadu(v + i), z)), c1));
         for (; i < m; ++i)
-            so[i] = cap * std::tanhf(v[i] / cap);
+            so[i] = cap * std::tanh(v[i] / cap);
         out_row(y, off, m, so);
     }
     return RAD_OK;
