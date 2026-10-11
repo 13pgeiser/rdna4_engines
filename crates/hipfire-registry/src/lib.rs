@@ -2103,14 +2103,16 @@ mod tests {
 
     #[test]
     fn bundled_vision_sidecar_is_shared_across_qwen38_tiers() {
-        // Every `qwen3.8:27b*` tier declares the same vision-tower sidecar
-        // (`qwen3.8-27b-vision.hfq`) so each text quant tier serves images
-        // without requantizing the trunk. Unlike dflash, the vision file is
-        // standalone: no registry entry's `file` names it.
+        // Every non-draft `qwen3.8:27b*` target tier declares the same
+        // vision-tower sidecar (`qwen3.8-27b-vision.hfq`) so each text quant
+        // tier serves images without requantizing the trunk. `-draft*` tags
+        // are text-only DFlash controller sidecars and carry no vision. Unlike
+        // dflash, the vision file is standalone: no registry entry's `file`
+        // names it.
         let registry = bundled().unwrap();
         let mut declared = 0;
         for (tag, entry) in &registry.models {
-            if !tag.starts_with("qwen3.8:27b") {
+            if !tag.starts_with("qwen3.8:27b") || tag.contains("-draft") {
                 continue;
             }
             let sidecar = entry
