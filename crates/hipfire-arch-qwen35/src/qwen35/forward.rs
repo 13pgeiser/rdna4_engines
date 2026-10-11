@@ -1694,6 +1694,9 @@ pub fn forward_scratch(
     }
     if gpu.replay.should_route_pm4() {
         let copy_started = rdna_compute::gap_timing::now();
+        // Load-bearing HIP -> PM4 fence: this synchronous legacy-NULL copy drains
+        // embedding/staging on NULL and blocking streams. Do not make it async
+        // or install non-blocking producers without an explicit queue dependency.
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
