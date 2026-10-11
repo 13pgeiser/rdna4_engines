@@ -4922,6 +4922,119 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
     }
 }
 
+/* ---- rmsnorm_quant_i8, against the chain it replaces ------------------------------------------
+ *
+ * Byte-identical, for the reason the fp8 fusions above give, in all three forms a sandwich-norm
+ * model issues: the plain norm + quantiser (a first block's entry), the junction without a scalar
+ * (attention -> feed-forward) and with one (feed-forward -> the next layer). The unfused chain is
+ * rmsnorm(x; w_post) -> add(residual) -> scale -> rmsnorm(residual; w) -> quant_act_i8, run here
+ * kernel by kernel. bf16 gains, which is what Gemma's checkpoint stores, and two batch heights so
+ * both of r4d_act_threads' widths a decode step meets are covered (1024 at M <= 32, 512 above). */
+static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
+    const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
+    const RadKernelInfo* ad  = find(pl, "add_bf16");
+    const RadKernelInfo* scl = find(pl, "scale_bf16");
+    const RadKernelInfo* qz  = find(pl, "quant_act_i8");
+    const RadKernelInfo* rq  = find(pl, "rmsnorm_quant_i8");
+    if (!nrm || !ad || !scl || !qz || !rq) { ok("rmsnorm_quant_i8 vs its chain", false, "rows absent"); return; }
+    for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)40 }) {
+        const int64_t K = 5376;   /* Gemma 4 31B's hidden width: 336 sixteen-byte k steps, not a power of two */
+        std::vector<uint16_t> hx((size_t)M * K), hr((size_t)M * K), hw((size_t)K), hp((size_t)K);
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t c = 0; c < K; ++c) {
+                const float m = std::ldexp(1.0f, (int)((c / 384) % 6) - 3);
+                const float v = m * (0.037f * (float)((r * 29 + c * 13) % 71) - 1.3f);
+                hx[(size_t)r * K + c] = h_to_bf16(c == (r * 37) % K ? v * 19.0f : v);
+                hr[(size_t)r * K + c] = h_to_bf16(0.019f * (float)((r * 13 + c * 29) % 67) - 0.6f);
+            }
+        for (int64_t c = 0; c < K; ++c) {
+            hw[(size_t)c] = h_to_bf16(0.004f * (float)((c * 19) % 51) - 0.1f);
+            hp[(size_t)c] = h_to_bf16(0.9f + 0.003f * (float)((c * 7) % 41));
+        }
+        const uint16_t hs = h_to_bf16(0.373f);
+        void* d_x = dalloc((size_t)M * K * 2);
+        void* d_w = dalloc((size_t)K * 2);
+        void* d_p = dalloc((size_t)K * 2);
+        void* d_sc = dalloc(4);
+        void* d_t = dalloc((size_t)M * K * 2);
+        void* d_r[2] = { dalloc((size_t)M * K * 2), dalloc((size_t)M * K * 2) };
+        void* d_y[2] = { dalloc((size_t)M * K * 2), dalloc((size_t)M * K * 2) };
+        void* d_q[2] = { dalloc((size_t)M * K), dalloc((size_t)M * K) };
+        void* d_s[2] = { dalloc((size_t)M * 4), dalloc((size_t)M * 4) };
+        if (!d_x || !d_w || !d_p || !d_sc || !d_t || !d_r[1] || !d_y[1] || !d_q[1] || !d_s[1]) {
+            ok("rmsnorm_quant_i8 alloc", false, "hipMalloc failed");
+            return;
+        }
+        st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_p, hp.data(), hp.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_sc, &hs, 2, hipMemcpyHostToDevice);
+        const double eps = 1e-6, wadd = 0.0;
+        const std::vector<RadParam> pn = { PI("M", M), PI("n", K), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) };
+        const std::vector<RadParam> pe = { PI("M", M), PI("n", K), PS("dtype", "bf16") };
+        const std::vector<RadParam> pq = { PI("M", M), PI("n", K), PI("group", K), PS("dtype", "bf16") };
+
+        auto compare = [&](const std::string& what, bool res) {
+            std::vector<uint16_t> y0((size_t)M * K), y1((size_t)M * K), r0((size_t)M * K), r1((size_t)M * K);
+            std::vector<uint8_t>  q0((size_t)M * K), q1((size_t)M * K);
+            std::vector<float>    s0((size_t)M), s1((size_t)M);
+            st_memcpy(y0.data(), d_y[0], y0.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(y1.data(), d_y[1], y1.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(q0.data(), d_q[0], q0.size(), hipMemcpyDeviceToHost);
+            st_memcpy(q1.data(), d_q[1], q1.size(), hipMemcpyDeviceToHost);
+            st_memcpy(s0.data(), d_s[0], s0.size() * 4, hipMemcpyDeviceToHost);
+            st_memcpy(s1.data(), d_s[1], s1.size() * 4, hipMemcpyDeviceToHost);
+            st_memcpy(r0.data(), d_r[0], r0.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(r1.data(), d_r[1], r1.size() * 2, hipMemcpyDeviceToHost);
+            int ny = 0, nq = 0, ns = 0, nr = 0, nz = 0;
+            for (size_t i = 0; i < y0.size(); ++i) ny += y0[i] != y1[i];
+            for (size_t i = 0; i < q0.size(); ++i) nq += q0[i] != q1[i];
+            for (size_t i = 0; i < s0.size(); ++i) ns += std::memcmp(&s0[i], &s1[i], 4) != 0;
+            if (res) for (size_t i = 0; i < r0.size(); ++i) nr += r0[i] != r1[i];
+            for (size_t i = 0; i < q1.size(); ++i) nz += q1[i] != 0;
+            ok((what + " M=" + std::to_string(M)).c_str(), ny == 0 && nq == 0 && ns == 0 && nr == 0 && nz > (int)q1.size() / 2,
+               "bf16 differs " + std::to_string(ny) + ", codes " + std::to_string(nq) + ", scales " +
+               std::to_string(ns) + ", residual " + std::to_string(nr) + ", nonzero codes " + std::to_string(nz));
+        };
+        auto norm_quant = [&](void* src) {   /* rmsnorm(src; w) -> quant_act_i8, into slot 0 */
+            int rc = launch_row(nrm, { T(src, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { K }), T(d_y[0], RAD_BF16, { M, K }) }, pn);
+            if (rc == RAD_OK)
+                rc = launch_row(qz, { T(d_y[0], RAD_BF16, { M, K }), T(d_q[0], RAD_I8, { M, K }),
+                                      T(d_s[0], RAD_F32, { M }), T(nullptr, RAD_F32, {}) }, pq);
+            return rc;
+        };
+
+        /* --- the plain form --- */
+        int rc = norm_quant(d_x);
+        if (rc == RAD_OK)
+            rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }), T(nullptr, RAD_BF16, {}), T(d_w, RAD_BF16, { K }),
+                                  T(d_q[1], RAD_I8, { M, K }), T(d_s[1], RAD_F32, { M }), T(d_y[1], RAD_BF16, { M, K }),
+                                  T(nullptr, RAD_BF16, {}), T(nullptr, RAD_BF16, {}) }, pn);
+        if (rc != RAD_OK) ok("rmsnorm_quant_i8 vs rmsnorm + quant_act_i8", false, "rc=" + std::to_string(rc));
+        else compare("rmsnorm_quant_i8 is byte-identical to rmsnorm + quant_act_i8", false);
+
+        /* --- the junction, without and with the scalar --- */
+        for (const bool with_sc : { false, true }) {
+            st_memcpy(d_r[0], hr.data(), hr.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_r[1], hr.data(), hr.size() * 2, hipMemcpyHostToDevice);
+            rc = launch_row(nrm, { T(d_x, RAD_BF16, { M, K }), T(d_p, RAD_BF16, { K }), T(d_t, RAD_BF16, { M, K }) }, pn);
+            if (rc == RAD_OK)
+                rc = launch_row(ad, { T(d_r[0], RAD_BF16, { M, K }), T(d_t, RAD_BF16, { M, K }), T(d_r[0], RAD_BF16, { M, K }) }, pe);
+            if (rc == RAD_OK && with_sc)
+                rc = launch_row(scl, { T(d_r[0], RAD_BF16, { M, K }), T(d_sc, RAD_BF16, { 1 }), T(d_r[0], RAD_BF16, { M, K }) }, pe);
+            if (rc == RAD_OK) rc = norm_quant(d_r[0]);
+            if (rc == RAD_OK)
+                rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }), T(d_r[1], RAD_BF16, { M, K }), T(d_w, RAD_BF16, { K }),
+                                      T(d_q[1], RAD_I8, { M, K }), T(d_s[1], RAD_F32, { M }), T(d_y[1], RAD_BF16, { M, K }),
+                                      T(d_p, RAD_BF16, { K }),
+                                      with_sc ? T(d_sc, RAD_BF16, { 1 }) : T(nullptr, RAD_BF16, {}) }, pn);
+            const std::string what = with_sc ? "rmsnorm_quant_i8 junction with scalar" : "rmsnorm_quant_i8 junction";
+            if (rc != RAD_OK) ok((what + " vs rmsnorm + add + scale + rmsnorm + quant_act_i8").c_str(), false, "rc=" + std::to_string(rc));
+            else compare(what + " is byte-identical to its chain", true);
+        }
+    }
+}
+
 /* THE fp8 lm_head, end to end through its OWN hooks.
  *
  * The arrangement is the odd one in this library -- E4M3 codes with the row's own bf16 scales in
@@ -13359,6 +13472,10 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
+    }
+    if (sel("rmsnorm_quant_i8")) {
+        if (!g_case) std::printf("\nrmsnorm_quant_i8, against the chain it replaces\n");
+        rmsnorm_quant_i8_numeric(pl);
     }
 
     /* The MTP head's fc is K=10240; the DFlash2 drafter's is 25600, the largest K any shape in

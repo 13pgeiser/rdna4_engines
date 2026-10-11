@@ -141,6 +141,7 @@ set(R4D_UNITS
   "r4d_model_bf16|"
   "r4d_sample_stages_f32|"
   "r4d_quant_act_i8|"
+  "r4d_rmsnorm_quant_i8|"
   "r4d_had_quant_act_i8|"
   "r4d_rmsnorm_had_quant_i8|"
   "r4d_ar_ln_had_quant_i8|"

@@ -1314,6 +1314,32 @@ static const RadOperandSpec oArRmsNormQuantFp8[] = {
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
 
+/* `rmsnorm_quant_i8` is the norm with r4d_gemm_w4a8_nt_m64's own activation producer on its pass:
+ * int8 codes in the GEMM's fragment order and ONE f32 scale per row -- quant_act_i8's grid, not
+ * quant_act_i8g's per-group one and not the rotated rmsnorm_had_quant_i8's. Its first six operands
+ * are rmsnorm_quant_fp8's, so the residual is the fused_add_rms_norm form; two optional weights
+ * after them make it a sandwich-norm model's whole residual junction: `w_post` normalises the
+ * branch output BEFORE the add and `scalar` multiplies the sum after it (Gemma's per-layer
+ * scalar). Every stage rounds to bf16 where the chain it replaces stores bf16, so the op is
+ * byte-identical to that chain. */
+static const RadParamSpec pRmsNormQuantI8[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
+};
+static const RadOperandSpec oRmsNormQuantI8[] = {
+    { "x",        RAD_OPD_IN,     0 },
+    { "residual", RAD_OPD_INOUT,  1 },   /* present = the norm is of residual + (post-normed) x */
+    { "w",        RAD_OPD_WEIGHT, 0 },
+    { "q",        RAD_OPD_OUT,    0 },
+    { "scale",    RAD_OPD_OUT,    0 },
+    { "out_bf16", RAD_OPD_OUT,    1 },
+    { "w_post",   RAD_OPD_WEIGHT, 1 },   /* rmsnorm(x; w_post) before the add; needs the residual */
+    { "scalar",   RAD_OPD_WEIGHT, 1 },   /* [1], multiplies the sum; needs the residual */
+};
+
 static const RadParamSpec pGatedQuantFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -2304,6 +2330,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm_quant_fp8", pRmsNormQuantFp8, oRmsNormQuantFp8,
            "RMS norm and the fp8 activation quantiser in one pass over the row. The bf16 norm "
            "output the unfused pair wrote is still written, and the codes are taken over it."),
+    SCHEMA("rmsnorm_quant_i8", pRmsNormQuantI8, oRmsNormQuantI8,
+           "RMS norm and the per-row int8 quantiser the w4a8 skinny GEMM reads, in one pass; with "
+           "a residual the norm is of residual + x (+ a post-norm of x, x a scalar), stored back."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
     SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
@@ -3156,6 +3185,11 @@ static const RadConstraint cSampleChain[] = {
 };
 
 static const RadConstraint cQuantActI8[] = {
+    C_DIV("n", 16), C_IN("dtype", "bf16"),
+};
+/* `n DIV 16`: a k step of the fragment order is sixteen bytes of one row. The row is staged in LDS
+ * as bf16 for the cross-thread fragment store, which the shim bounds. */
+static const RadConstraint cRmsNormQuantI8[] = {
     C_DIV("n", 16), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cHadQuantActI8[] = {
@@ -5541,6 +5575,18 @@ static const RadKernelInfo kKernels[] = {
   ROW(cQuantActI8), NOTUNE,
   nullptr, nullptr, r4d_rad_quant_act_i8, nullptr, nullptr, nullptr,
   r4d_shape_quant_act_i8 , nullptr, nullptr, r4d_rad_quant_act_i8_describe },
+
+{ "rmsnorm_quant_i8", "rmsnorm_quant_i8", "quant",
+  "RMS norm and quant_act_i8's quantiser in one pass over the row; optionally the residual "
+  "junction in front of it -- a post-norm on x, the add into the residual and a scalar on the sum",
+  "n a multiple of 16 and n*2 bytes within LDS; one workgroup per row at rmsnorm_bf16's width; "
+  "the gains f32 or bf16, read off the operand; w_post and scalar need the residual",
+  "bf16 in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale, optional bf16 "
+  "out; every stored intermediate rounded to bf16 as the unfused chain stores it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsNormQuantI8), NOTUNE,
+  nullptr, nullptr, r4d_rad_rmsnorm_quant_i8, nullptr, nullptr, nullptr,
+  nullptr, nullptr, nullptr, r4d_rad_rmsnorm_quant_i8_describe },
 
 { "had_quant_act_i8", "had_quant_act_i8", "quant",
   "block Hadamard along K then per-row symmetric int8 quantisation; the rotation is what makes "

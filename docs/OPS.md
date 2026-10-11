@@ -387,6 +387,14 @@ spelling of `act`, not the vocabulary's.
 | `had_quant_act_i8g` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `gated_had_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
+| `rmsnorm_quant_i8` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+
+`rmsnorm_quant_i8` is `rmsnorm` with `quant_act_i8`'s quantiser on its pass — fragment-order int8
+codes and one f32 scale per row, the grid `gemm_nt_q` reads at `dtype=w4a8`. With `residual` the
+norm is of `residual + x`, stored back; `w_post` normalises `x` before that add and `scalar` (`[1]`)
+multiplies the sum after it, which together are a sandwich-norm model's residual junction
+(`rmsnorm` → `add` → `scale` → `rmsnorm` → `quant_act_i8`). Byte-identical to that chain: every
+intermediate the chain stores is rounded to bf16, and both sums of squares take `rmsnorm`'s partition.
 
 `gemm_nt_q_gated` is the row above pulled into the projection that feeds it: `gemm_nt_q` over a
 `[N, K]` gate_up plane — `N` is the WEIGHT's rows, twice the fused width, gate half first — with
