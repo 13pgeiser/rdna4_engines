@@ -112,25 +112,34 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
-    /* THE ADAPTIVE WINDOW IS THE SERIAL DRAFTER'S POLICY (draft.h): it prices a draft as one more
-     * round of the head. A block drafter proposes its block in one pass and prompt lookup runs no
-     * pass at all, so for either the window stays fixed -- decided here, once, before any step
-     * has counted an acceptance, and said, because a flag that changes nothing reads exactly
-     * like a flag that made no difference. */
+    /* THE ADAPTIVE WINDOW (draft.h) prices a draft by what the step it adds to costs, measured.
+     * For a serial head that is a round of the head and a verify row. For a BLOCK drafter the
+     * block is proposed in one pass whatever is verified, but each verified draft is still a
+     * verify row -- and on a model whose verify streams weights per row, a MoE that reads the
+     * experts every row routes to, a row is not free: sixteen rows read ten times the experts one
+     * does. So a block drafter takes the same policy with its rounds fixed: each sequence verifies
+     * the first min(D, its stop) of the block, its stop from its own measured acceptance, and D
+     * from the measured step times. Deep where the text is predictable (code, JSON, greedy), a few
+     * drafts where it is not (prose at temperature 1, where a point-mass draft survives a position
+     * with probability p(x) and a fifteen-token chain dies after one or two). Prompt lookup runs
+     * no pass and keeps the fixed window, decided here, once, and said, because a flag that
+     * changes nothing reads exactly like a flag that made no difference. */
     if (cfg.draft_window == DraftWindow::Adaptive) {
         const RadDrafterDecl& dd = prog.drafter;
         if (cfg.n_spec <= 0)
             RAD_WARN("--draft-window adaptive: this deployment does not speculate "
                      "(--num-speculative-tokens %d), so there is no window to adapt", cfg.n_spec);
-        else if (dd.kind != RAD_DRAFT_SERIAL || dd.depth <= 0)
-            RAD_WARN("--draft-window adaptive: the window is fixed at %d with %s -- the adaptive "
-                     "window prices the rounds of a serial draft head, which this deployment does "
-                     "not run", cfg.n_spec,
-                     dd.kind == RAD_DRAFT_BLOCK ? "a block drafter, which proposes its block in one "
-                                                  "pass"
-                                                : "prompt lookup only");
-        else
+        else if ((dd.kind != RAD_DRAFT_SERIAL && dd.kind != RAD_DRAFT_BLOCK) || dd.depth <= 0)
+            RAD_WARN("--draft-window adaptive: the window is fixed at %d with prompt lookup only "
+                     "-- the adaptive window prices draft passes and verify rows, and prompt "
+                     "lookup runs no pass", cfg.n_spec);
+        else {
             dp.adapt = true;
+            if (dd.kind == RAD_DRAFT_BLOCK)
+                RAD_INFO("--draft-window adaptive with a block drafter: the block of %d is "
+                         "proposed whole, and each sequence verifies the first min(D, its stop) "
+                         "of it", dd.depth);
+        }
     }
     RAD_TRY(draft_.configure(dp));
     draft_est_.clear();

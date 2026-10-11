@@ -2170,10 +2170,10 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(h.plan_step(hone, 0, 3), 2);
 }
 
-/* THE FLAG, AND ONLY FOR A SERIAL HEAD. --draft-window adaptive with a block drafter, with prompt
- * lookup alone, or with no speculation keeps the configured depth and says so at startup; the
- * proposal then reaches the step uncut. The default is the fixed window. */
-TEST(the_adaptive_window_is_a_flag_for_a_serial_drafter_and_said_when_it_is_not) {
+/* THE FLAG, FOR A DRAFTING HEAD -- SERIAL OR BLOCK. --draft-window adaptive with prompt lookup
+ * alone, or with no speculation, keeps the configured depth and says so at startup; the proposal
+ * then reaches the step uncut. The default is the fixed window. */
+TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_none) {
     {
         Fixture f;
         adaptive_fixture(f, 4);
@@ -2192,18 +2192,50 @@ TEST(the_adaptive_window_is_a_flag_for_a_serial_drafter_and_said_when_it_is_not)
         Config d;
         CHECK(d.draft_window == kDraftWindowDefault);      /* the default */
     }
-    for (int kind : { (int)RAD_DRAFT_BLOCK, (int)RAD_DRAFT_NONE }) {
+    /* A BLOCK DRAFTER TAKES THE POLICY WITH ITS ROUNDS FIXED. It proposes its whole block in one
+     * pass, and each sequence verifies the first of it up to its own window: the whole block while
+     * its estimate is the prior, one draft once its drafts stop being taken. Startup says so. */
+    {
         Fixture f;
         adaptive_fixture(f, 4);
-        f.prog.drafter.kind = (decltype(f.prog.drafter.kind))kind;
-        if (kind == RAD_DRAFT_NONE) f.prog.drafter.depth = 0;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        int st = RAD_E_STATE;
+        const std::string log = stderr_of([&] { st = f.start(); });
+        CHECK_OK(st);
+        CHECK(f.sch.draft().adaptive());
+        CHECK(log.find("ADAPTIVE") != std::string::npos);
+        CHECK(log.find("with a block drafter") != std::string::npos);
+        CHECK(log.find("the window is fixed") == std::string::npos);
+
+        const uint64_t a = f.submit(160, 2000);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[4] = { 21, 22, 23, 24 };
+        CHECK_OK(f.sch.set_draft(a, draft, 4));
+        CHECK_EQ(f.sch.find(a)->n_draft, 4);
+        for (int t = 0; t < 64; ++t) {               /* no draft is ever taken */
+            REQUIRE(f.sch.step() != nullptr);
+            f.commit_plain(9);
+            CHECK_OK(f.sch.set_draft(a, draft, 4));
+        }
+        CHECK_EQ(f.sch.find(a)->n_draft, 1);
+        REQUIRE(f.sch.step() != nullptr);
+        for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, 1);
+        CHECK(f.sch.metrics().draft_adaptive);
+        CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
+        CHECK(f.sch.metrics().draft_verify_depth[1] > 0);
+    }
+    {
+        Fixture f;
+        adaptive_fixture(f, 4);
+        f.prog.drafter.kind = RAD_DRAFT_NONE;
+        f.prog.drafter.depth = 0;
         int st = RAD_E_STATE;
         const std::string log = stderr_of([&] { st = f.start(); });
         CHECK_OK(st);
         CHECK(!f.sch.draft().adaptive());
         CHECK(log.find("--draft-window adaptive: the window is fixed at 4") != std::string::npos);
-        CHECK(log.find(kind == RAD_DRAFT_BLOCK ? "a block drafter" : "prompt lookup only") !=
-              std::string::npos);
+        CHECK(log.find("prompt lookup only") != std::string::npos);
 
         const uint64_t a = f.submit(160, 64);
         CHECK(f.sch.step() != nullptr);
