@@ -358,6 +358,12 @@ add_subdirectory(libquant)
 if(RAD_HIP_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libr4d/CMakeLists.txt)
   add_subdirectory(libr4d)
 endif()
+# gemma4k: Gemma 4's kernels beyond libr4d -- paged attention at head_dim 256/512, pair_argmax,
+# and the two sandwich-norm joins (docs/OPS.md). gfx12 only, and ahead of libr4d for Gemma 4:
+# `--kernels gemma4k,libr4d,...` (gemma4k/g4k_rows.cpp says why).
+if(RAD_HIP_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/gemma4k/CMakeLists.txt)
+  add_subdirectory(gemma4k)
+endif()
 # libavx: the conventional op vocabulary in hand-written x86 SIMD, runtime-dispatched by CPU
 # feature -- the production HOST kernels, built wherever libref is, on x86-64. An op the placement
 # puts on the host needs a host kernel that is not the oracle (rad_gate_reference_kernels refuses

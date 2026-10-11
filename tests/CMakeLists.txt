@@ -200,6 +200,11 @@ set(RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libref.so)
 if(RAD_HIP_FOUND AND TARGET libr4d)
   list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
 endif()
+# gemma4k declares two ops no other library does (the sandwich joins), so without it their rows
+# would be "unchecked" on every machine.
+if(RAD_HIP_FOUND AND TARGET gemma4k)
+  list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/gemma4k.so)
+endif()
 add_test(NAME ops_doc
          COMMAND ${CMAKE_SOURCE_DIR}/tools/ops_doc_check.sh
                  ${CMAKE_SOURCE_DIR}/docs/OPS.md $<TARGET_FILE:rad-schemas>
