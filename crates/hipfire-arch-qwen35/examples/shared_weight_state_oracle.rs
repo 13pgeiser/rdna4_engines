@@ -23,7 +23,7 @@
 //! there is no tolerance.
 
 use hipfire_arch_qwen35::qwen35::{self, LayerType, Qwen35Config};
-use hipfire_arch_qwen35::{free_qwen35_bundle, load_qwen35_bundle, Qwen35Bundle};
+use hipfire_arch_qwen35::{free_qwen35_bundle, load_qwen35_bundle, shared_weights, Qwen35Bundle};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
@@ -588,34 +588,91 @@ fn weights(raw: &[String]) -> Result<()> {
     let bundle = load_bundle(&model, max_seq, &mut gpu)?;
     let load_ms = t.elapsed().as_secs_f64() * 1e3;
     let (after_load_free, _) = mem_free(&gpu)?;
+    let route = match std::env::var("HIPFIRE_WEIGHT_HOST").as_deref() {
+        Ok("1") => "import",
+        _ => "private",
+    };
+    let typed = shared_weights::dense_typed_tensor_lengths(&bundle.weights, &bundle.config, &gpu)
+        .map_err(|e| format!("dense_typed_tensor_lengths: {e}"))?;
     let mut tensors = Map::new();
-    let (mut unique, mut unique_bytes) = (0usize, 0usize);
+    let (mut unique, mut unique_typed, mut unique_alloc, mut slack_total) = (0usize, 0usize, 0usize, 0usize);
+    let (mut tail_checked, mut tail_nonzero) = (0usize, 0usize);
     {
-        let hip = &gpu.hip;
+        let gpu_ref = &gpu;
+        let err = |m: String| hip_bridge::HipError::new(0, &m);
         let mut visit = |role: &str, tensor: &GpuTensor| -> hip_bridge::HipResult<()> {
-            let bytes = tensor.buf.size();
-            let mut host = vec![0u8; bytes];
-            hip.memcpy_dtoh(&mut host, &tensor.buf)?;
+            let typed_bytes = *typed
+                .get(role)
+                .ok_or_else(|| err(format!("{role}: no typed length")))?;
+            let allocated = tensor.buf.size();
+            if typed_bytes > allocated {
+                return Err(err(format!("{role}: typed {typed_bytes} > allocated {allocated}")));
+            }
+            let mut host = vec![0u8; typed_bytes];
+            gpu_ref.hip.memcpy_dtoh(&mut host, &tensor.buf)?;
             let borrowed = tensor.buf.is_borrowed();
             if !borrowed {
                 unique += 1;
-                unique_bytes += bytes;
+                unique_typed += typed_bytes;
+                unique_alloc += allocated;
+                slack_total += allocated - typed_bytes;
             }
+            // Imported owners: the registered mapped extent must be the frozen
+            // physical size, and [typed, physical) must read back all zero.
+            let tail = if route == "import" && !borrowed {
+                let mapped = gpu_ref
+                    .vmm_mapped_bytes(tensor)
+                    .ok_or_else(|| err(format!("{role}: imported owner is not a registered VMM arena")))?;
+                let granularity = gpu_ref
+                    .vmm_granularity(tensor)
+                    .ok_or_else(|| err(format!("{role}: no VMM granularity")))?;
+                let expected = shared_weights::expected_physical_bytes(typed_bytes as u64, granularity as u64);
+                if expected != Some(mapped as u64) {
+                    return Err(err(format!(
+                        "{role}: mapped {mapped} != expected physical {expected:?} (typed {typed_bytes}, granularity {granularity})"
+                    )));
+                }
+                let tail_len = mapped - typed_bytes;
+                let mut bytes = vec![0u8; tail_len];
+                // SAFETY: [ptr+typed, ptr+mapped) lies inside this owner's live,
+                // registered mapping; the borrowed view is dropped before the owner.
+                let view = unsafe {
+                    hip_bridge::DeviceBuffer::from_raw(
+                        tensor.buf.as_ptr().wrapping_byte_add(typed_bytes),
+                        tail_len,
+                    )
+                };
+                gpu_ref.hip.memcpy_dtoh(&mut bytes, &view)?;
+                drop(view);
+                let first_nonzero = bytes.iter().position(|&b| b != 0);
+                tail_checked += 1;
+                tail_nonzero += usize::from(first_nonzero.is_some());
+                json!({ "checked": true, "physical_bytes": mapped, "granularity": granularity,
+                        "zero": first_nonzero.is_none(), "first_nonzero": first_nonzero })
+            } else {
+                json!({ "checked": false, "physical_bytes": null, "zero": null, "first_nonzero": null })
+            };
             let file = if keep_raw {
                 let name = format!("raw/{:05}.bin", tensors.len());
-                fs::write(out.join(&name), &host)
-                    .map_err(|e| hip_bridge::HipError::new(0, &format!("{name}: {e}")))?;
+                fs::write(out.join(&name), &host).map_err(|e| err(format!("{name}: {e}")))?;
                 Value::String(name)
             } else {
                 Value::Null
             };
             tensors.insert(
                 role.to_owned(),
-                json!({ "bytes": bytes, "sha256": sha256(&host), "borrowed": borrowed, "raw": file }),
+                json!({
+                    "typed_bytes": typed_bytes, "allocated_bytes": allocated,
+                    "slack_bytes": allocated - typed_bytes, "sha256": sha256(&host),
+                    "borrowed": borrowed, "raw": file, "tail": tail,
+                }),
             );
             Ok(())
         };
         bundle.weights.for_each_dense_tensor(&mut visit)?;
+    }
+    if tensors.len() != typed.len() {
+        return Err(format!("visited {} roles but typed map has {}", tensors.len(), typed.len()).into());
     }
     let (after_readback_free, _) = mem_free(&gpu)?;
     let identity = json!({ "pid": std::process::id(), "starttime_ticks": proc_starttime() });
@@ -627,7 +684,8 @@ fn weights(raw: &[String]) -> Result<()> {
                 &held,
                 serde_json::to_vec(&json!({
                     "identity": identity, "unique_owners": unique,
-                    "unique_logical_bytes": unique_bytes, "after_readback_free": after_readback_free,
+                    "unique_typed_bytes": unique_typed, "after_readback_free": after_readback_free,
+                    "tail_checked_owners": tail_checked, "tail_nonzero_owners": tail_nonzero,
                 }))?,
             )?;
             eprintln!("G1_HELD {}", held.display());
@@ -646,7 +704,7 @@ fn weights(raw: &[String]) -> Result<()> {
     let free_result = free_qwen35_bundle(bundle, &mut gpu);
     let (end_free, _) = mem_free(&gpu)?;
     let record = json!({
-        "schema": "hipfire.g1.weights.v1",
+        "schema": "hipfire.g1.weights.v2",
         "model": model,
         "identity": identity,
         "env": recorded_env(),
@@ -656,14 +714,22 @@ fn weights(raw: &[String]) -> Result<()> {
             "after_readback_free": after_readback_free, "end_free": end_free,
         },
         "hold": hold,
+        "route": route,
         "unique_owners": unique,
-        "unique_logical_bytes": unique_bytes,
+        "unique_typed_bytes": unique_typed,
+        "unique_allocated_bytes": unique_alloc,
+        "total_slack_bytes": slack_total,
+        "tail_checked_owners": tail_checked,
+        "tail_nonzero_owners": tail_nonzero,
         "tensors": Value::Object(tensors),
         "free_ok": free_result.is_ok(),
         "free_error": free_result.as_ref().err(),
     });
     fs::write(out.join("weights.json"), serde_json::to_vec_pretty(&record)?)?;
-    eprintln!("G1_WEIGHTS unique_owners={unique} unique_logical_bytes={unique_bytes}");
+    eprintln!(
+        "G1_WEIGHTS route={route} unique_owners={unique} unique_typed_bytes={unique_typed} \
+         tail_checked={tail_checked} tail_nonzero={tail_nonzero}"
+    );
     free_result.map_err(|e| format!("free_qwen35_bundle: {e}").into())
 }
 
@@ -681,33 +747,53 @@ fn compare_weights(raw: &[String]) -> Result<()> {
     let tb = rb["tensors"].as_object().unwrap_or(&empty);
     let roles: std::collections::BTreeSet<&String> = ta.keys().chain(tb.keys()).collect();
     let mut diffs = Vec::new();
-    let (mut raw_compared, mut raw_bytes) = (0usize, 0usize);
+    let (mut raw_compared, mut raw_bytes, mut size_mismatch) = (0usize, 0usize, 0usize);
     for r in roles {
         let (x, y) = (ta.get(r), tb.get(r));
-        let digest_equal = matches!((x, y), (Some(x), Some(y))
-            if x["sha256"] == y["sha256"] && x["bytes"] == y["bytes"]);
+        let (Some(xv), Some(yv)) = (x, y) else {
+            diffs.push(json!({ "role": r, "reason": "missing", "base": x, "candidate": y, "first_diff_byte": null }));
+            continue;
+        };
+        let mut reasons = Vec::new();
+        if xv["typed_bytes"] != yv["typed_bytes"] {
+            size_mismatch += 1;
+            reasons.push("typed_bytes");
+        }
+        if xv["sha256"] != yv["sha256"] {
+            reasons.push("sha256");
+        }
         // Literal byte compare whenever both sides kept raw bytes.
-        let raw_diff = match (x.and_then(|v| v["raw"].as_str()), y.and_then(|v| v["raw"].as_str())) {
+        let raw_diff = match (xv["raw"].as_str(), yv["raw"].as_str()) {
             (Some(p), Some(q)) => {
                 raw_compared += 1;
-                raw_bytes += x.and_then(|v| v["bytes"].as_u64()).unwrap_or(0) as usize;
+                raw_bytes += xv["typed_bytes"].as_u64().unwrap_or(0) as usize;
                 raw_first_diff(&da.join(p), &db.join(q))?
             }
             _ => None,
         };
-        if !digest_equal || raw_diff.is_some() {
-            diffs.push(json!({ "role": r, "base": x, "candidate": y, "first_diff_byte": raw_diff }));
+        if raw_diff.is_some() {
+            reasons.push("raw");
+        }
+        if yv["tail"]["checked"] == true && yv["tail"]["zero"] != true {
+            reasons.push("tail");
+        }
+        for reason in reasons {
+            diffs.push(json!({ "role": r, "reason": reason, "base": xv, "candidate": yv,
+                               "first_diff_byte": raw_diff }));
         }
     }
-    let equal = diffs.is_empty();
+    let tail_nonzero = rb["tail_nonzero_owners"].as_u64().unwrap_or(0);
+    let equal = diffs.is_empty() && tail_nonzero == 0;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "schema": "hipfire.g1.compare.v1", "equal": equal,
+            "schema": "hipfire.g1.compare.v2", "equal": equal,
             "base_unique_owners": ra["unique_owners"], "candidate_unique_owners": rb["unique_owners"],
-            "base_unique_logical_bytes": ra["unique_logical_bytes"],
-            "candidate_unique_logical_bytes": rb["unique_logical_bytes"],
+            "base_unique_typed_bytes": ra["unique_typed_bytes"],
+            "candidate_unique_typed_bytes": rb["unique_typed_bytes"],
             "raw_roles_compared": raw_compared, "raw_bytes_compared": raw_bytes,
+            "typed_size_mismatches": size_mismatch,
+            "tail_nonzero_owners": tail_nonzero,
             "diffs": diffs,
         }))?
     );
