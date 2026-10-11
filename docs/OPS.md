@@ -595,6 +595,7 @@ and adding 0.0f is exact, so a block sum over 8 wave partials and over 32 are th
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
+| `pair_argmax` | `M`(range) `n` `dtype` | `pairs` → `idx`, `val`? |
 | `logit_rerank` | `M`(range) `R` `n_vocab` `n_embd` `vocab_off`/opt `dtype` | `x`, `head`w, `idx_in` → `idx`, `val`, `pairs`? |
 
 `row_topk` and `row_topk_merge` are a pair, and the second only means anything with the first's
@@ -609,6 +610,14 @@ its own shard's top-R, and both stages break ties on the lower id, so the result
 over the unsharded plane element for element. A slot a shard could not fill carries id -1 in
 `pairs` and is dropped -- a sentinel rather than a -inf value, because a masked logit takes that
 value legitimately.
+
+`pair_argmax` is the merge at R = 1, for a vocab-sharded draft head that wants each position's
+winner as a proposal: `idx` gets the id of the largest value among a row's `n` gathered pairs,
+ties to the lower id, a negative id skipped, -1 (and -inf in `val`) when nothing is valid --
+written one element a row at the output's own pitch, which is what a block drafter's contiguous
+proposal needs. It is not `row_topk_merge` with R = 1 because a rank still sends R >= 2 pairs: a
+row-interleaved `all_gather` moves whole 16-byte words and one pair is 8 bytes, so `n` is
+`world_size * R` and the op takes the top-1 of all of them.
 
 `logit_rerank` is the second half of a COARSE top-R. A speculative step can afford a cheap draft
 head -- the target verifies every proposal, so a worse draft costs acceptance and never a token --

@@ -344,6 +344,7 @@ std::vector<Case> build_cases() {
         add("row_topk",    { HI("M", 5), HI("N", 97), HI("R", 4), HI("vocab_off", 0),
                              HS("dtype", dt) });
         add("row_topk_merge", { HI("M", 5), HI("R", 4), HI("world_size", 2), HS("dtype", dt) });
+        add("pair_argmax", { HI("M", 5), HI("n", 8), HS("dtype", dt) });
         /* "sorted" and not "slot": libref refuses any other spelling with RAD_E_UNSUPPORTED, and a
            case at a spelling both plugins decline is a case that proves nothing. */
         for (const char* order : { "token", "sorted" }) {

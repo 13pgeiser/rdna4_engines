@@ -273,7 +273,7 @@ TEST(op_vocabulary) {
         "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
         "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
-        "row_topk_merge", "logit_rerank",
+        "row_topk_merge", "pair_argmax", "logit_rerank",
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
         "all_reduce", "all_gather",
@@ -602,6 +602,43 @@ TEST(op_scale) {
     T y2(RAD_F32, {5});
     A b; b.t(x).t(s0).t(y2).i("M", 1).i("n", 5).s("dtype", "f32");
     CHECK(run("scale", b) != RAD_OK);
+}
+
+/* The sharded draft head's merge at R = 1, on paper: three rows of four gathered pairs, each case
+ * one rule. Row 0 ties on 2.0 between ids 9 and 3 (the lower id wins, whatever slot it sits in)
+ * beside a pad carrying the row's largest value (dropped: a pad is a negative id, not a value);
+ * row 1 is all pads (-1 and -inf, nothing invented); row 2 is all negative values (the largest is
+ * still the answer). `idx` is written at a pitch of two, as a proposal lands in a token buffer laid
+ * out for something else, and the slots between are left alone. */
+TEST(op_pair_argmax) {
+    struct P { int32_t id; float v; };
+    const P rows[3][4] = {
+        { { 5, 1.0f }, { 9, 2.0f }, { 3, 2.0f }, { -1, 7.0f } },
+        { { -1, 9.0f }, { -1, 9.0f }, { -1, 9.0f }, { -1, 9.0f } },
+        { { 7, -3.0f }, { 2, -4.0f }, { 11, -1.0f }, { 4, -1.5f } },
+    };
+    T pairs(RAD_F32, {3, 4, 2});
+    float* pf = (float*)pairs.t.data;
+    for (int m = 0; m < 3; ++m)
+        for (int j = 0; j < 4; ++j) {
+            std::memcpy(&pf[(m * 4 + j) * 2], &rows[m][j].id, 4);
+            pf[(m * 4 + j) * 2 + 1] = rows[m][j].v;
+        }
+    T idx(RAD_I32, {3, 2}); idx.n({ 100, 100, 100, 100, 100, 100 });
+    idx.t.shape[1] = 1;                     /* [3, 1] at a row pitch of 2 */
+    T val(RAD_F32, {3});
+    A a; a.t(pairs).t(idx).t(val).i("M", 3).i("n", 4).s("dtype", "f32");
+    CHECK_OK(run("pair_argmax", a));
+    CHECK_EQ(idx.iat(0), 3);   CHECK_EQ(val.at(0), 2.0f);
+    CHECK_EQ(idx.iat(2), -1);  CHECK(std::isinf(val.at(1)) && val.at(1) < 0);
+    CHECK_EQ(idx.iat(4), 11);  CHECK_EQ(val.at(2), -1.0f);
+    CHECK_EQ(idx.iat(1), 100); CHECK_EQ(idx.iat(3), 100);
+
+    /* `val` is optional, and the ids do not depend on it. */
+    T idx2(RAD_I32, {3});
+    A b; b.t(pairs).t(idx2).tnull().i("M", 3).i("n", 4).s("dtype", "f32");
+    CHECK_OK(run("pair_argmax", b));
+    CHECK_EQ(idx2.iat(0), 3); CHECK_EQ(idx2.iat(1), -1); CHECK_EQ(idx2.iat(2), 11);
 }
 
 /* The quantised gather. Three things, and the scale is the least interesting of them.

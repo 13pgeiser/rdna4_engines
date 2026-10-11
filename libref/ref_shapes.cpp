@@ -1476,6 +1476,19 @@ int ref_row_topk_merge_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return o.finish("row_topk_merge", operand, out);
 }
 
+/* The same plane at R = 1 a row, and fillable for the same reason the merge's is: the value lane
+ * draws proper floats and the id lane their bit patterns, so pads are dropped, ids compared and
+ * copied, and ties do not occur. */
+int ref_pair_argmax_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, n, 2 });             /* pairs */
+    o.t((uint32_t)RAD_I32, { M });                   /* idx */
+    o.t((uint32_t)RAD_F32, { M });                   /* val */
+    return o.finish("pair_argmax", operand, out);
+}
+
 
 
 /* logit_rerank DESCRIBES ITSELF, AND THE READER THAT NEEDS IT INVERTS FIRST.

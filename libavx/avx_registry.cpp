@@ -348,6 +348,8 @@ static const RadOperandSpec oRowTopk[] = { OPD("x"), OUT("idx"), OUT("val"), OUT
 static const RadParamSpec pRowTopkMerge[]   = { P_INT("M"), P_INT("R"), P_INT("world_size"),
                                                 P_STR("dtype") };
 static const RadOperandSpec oRowTopkMerge[] = { OPD("gathered"), OUT("idx"), OUT("val") };
+static const RadParamSpec pPairArgmax[]     = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oPairArgmax[]   = { OPD("pairs"), OUT("idx"), OUT_O("val") };
 
 /* Mirrors libref's row exactly: R candidates rescored against the full-precision head, ties to the
  * lower id, pads sort last. libref's shape hook declines to describe this op, so the checker skips
@@ -610,6 +612,8 @@ static const RadOpSchema kSchemas[] = {
 { "row_topk", ARR(pRowTopk), ARR(oRowTopk), "exact per-row top-R." },
 { "row_topk_merge", ARR(pRowTopkMerge), ARR(oRowTopkMerge),
   "the global top-R of the gathered per-rank candidate sets." },
+{ "pair_argmax", ARR(pPairArgmax), ARR(oPairArgmax),
+  "the global top-1 of a row of gathered (id, value) pairs, one id a row." },
 { "logit_rerank", ARR(pLogitRerank), ARR(oLogitRerank),
   "R candidates a row rescored exactly against the full-precision head." },
 { "gdn_conv_prep", ARR(pConvPrep), ARR(oConvPrep),
@@ -832,6 +836,9 @@ SIMPLE("avx_moe_gather", "moe_gather", "moe", "weighted scatter back to token or
 SIMPLE("avx_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, L(row_topk)),
 SIMPLE("avx_row_topk_merge", "row_topk_merge", "moe",
        "the global top-R of the gathered per-rank candidate sets", DT_FLOAT, L(row_topk_merge)),
+SIMPLE("avx_pair_argmax", "pair_argmax", "moe",
+       "the global top-1 of a row of gathered (id, value) pairs, one id a row", DT_FLOAT,
+       L(pair_argmax)),
 SIMPLE("avx_logit_rerank", "logit_rerank", "moe",
        "R candidates a row rescored exactly against the full-precision head", DT_FLOAT,
        L(logit_rerank)),
