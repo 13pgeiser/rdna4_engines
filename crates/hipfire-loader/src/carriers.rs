@@ -1065,6 +1065,7 @@ fn qwen4_placement_inputs(
     native_mtp: bool,
     routed_experts: bool,
     state_format: hipfire_arch_qwen4::Qwen4StateFormat,
+    scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
     ranks: usize,
 ) -> Result<(u64, u64, u64, Option<u64>, Option<u64>), String> {
     use hipfire_arch_qwen4::expert_residency as residency;
@@ -1127,6 +1128,7 @@ fn qwen4_placement_inputs(
         config,
         &context,
         chunk_rows,
+        scratch_mode,
         qsa_format,
         mtp_bytes,
         gather_bytes,
@@ -1197,6 +1199,12 @@ pub fn qwen4_ep_vram_layers(
         gpu,
         &config,
     )?;
+    // The plan every rank's `load_qwen4_rank` derives from its own source and
+    // attaches; the reserve charges that plan, not a hardcoded `Full`.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        gpu, hfq, &config, &manifest,
+    )
+    .map_err(|error| error.to_string())?;
     let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
         hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
     };
@@ -1214,6 +1222,7 @@ pub fn qwen4_ep_vram_layers(
         false,
         !config.ffn.is_dense(),
         state_format,
+        scratch_mode,
         ranks,
     )?;
     Ok(hipfire_arch_qwen4::expert_residency::ep_vram_layers(
@@ -1545,6 +1554,7 @@ pub fn load_qwen4_rank(
                     native_mtp,
                     routed_experts,
                     state_format,
+                    scratch_mode,
                     ep_ranks,
                 )?;
             Ok((
