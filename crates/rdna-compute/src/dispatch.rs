@@ -6734,6 +6734,105 @@ impl Gpu {
         )
     }
 
+    /// Flash-Next expert-parallel row all-gather: one copy-only launch that
+    /// fills every row owned by another rank from that owner's buffer.
+    ///
+    /// For slot `s` in `0..n_slots`, `e = slot_experts[s]` (i32, device memory);
+    /// when `e >= 0` and `owner = e % n_ranks != self_rank`, row `s`
+    /// (`n16` uint4 = `n16 * 16` bytes) is copied from `src[owner]` to `dst` at
+    /// the same row offset. Owned rows and negative-id slots are never written.
+    /// Pure uint4 load/store, so the copy is bit-exact for every bit pattern.
+    ///
+    /// `src[r]` is rank `r`'s row-buffer base as a device address (valid on this
+    /// device through P2P); entries `>= n_ranks` may be 0. The launch goes on the
+    /// Gpu's active stream (null stream when none), like every other launcher.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ep_gather_rows_by_owner(
+        &mut self,
+        slot_experts: &GpuTensor,
+        src: [usize; 4],
+        dst: usize,
+        n_slots: usize,
+        n_ranks: usize,
+        self_rank: usize,
+        n16: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !(2..=4).contains(&n_ranks) || self_rank >= n_ranks {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_owner: n_ranks must be 2..=4 and self_rank < n_ranks",
+            ));
+        }
+        if n_slots == 0 || n16 == 0 {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_owner: n_slots and n16 must be non-zero",
+            ));
+        }
+        let slot_bytes = n_slots
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| HipError::new(0, "ep_gather_rows_by_owner: n_slots overflow"))?;
+        if slot_experts.buf.size() < slot_bytes {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_owner: slot_experts holds fewer than n_slots ids",
+            ));
+        }
+        let mut slots_i32 = i32::try_from(n_slots)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_owner: n_slots exceeds i32"))?;
+        let mut ranks_i32 = n_ranks as i32;
+        let mut self_i32 = self_rank as i32;
+        let mut n16_i32 = i32::try_from(n16)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_owner: n16 exceeds i32"))?;
+        self.ensure_kernel(
+            "ep_gather_rows_by_owner",
+            crate::kernels::EP_GATHER_ROWS_BY_OWNER_SRC,
+            "ep_gather_rows_by_owner",
+        )?;
+        let ids = slot_experts.buf.as_ptr();
+        let s0 = src[0] as *mut c_void;
+        let s1 = src[1] as *mut c_void;
+        let s2 = src[2] as *mut c_void;
+        let s3 = src[3] as *mut c_void;
+        let d = dst as *mut c_void;
+        let mut params: [*mut c_void; 10] = [
+            &ids as *const _ as *mut c_void,
+            &s0 as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &s3 as *const _ as *mut c_void,
+            &d as *const _ as *mut c_void,
+            &mut slots_i32 as *mut _ as *mut c_void,
+            &mut ranks_i32 as *mut _ as *mut c_void,
+            &mut self_i32 as *mut _ as *mut c_void,
+            &mut n16_i32 as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(ids);
+            blob.push_ptr(s0);
+            blob.push_ptr(s1);
+            blob.push_ptr(s2);
+            blob.push_ptr(s3);
+            blob.push_ptr(d);
+            blob.push_i32(slots_i32);
+            blob.push_i32(ranks_i32);
+            blob.push_i32(self_i32);
+            blob.push_i32(n16_i32);
+            blob
+        };
+        let grid_x = (n16 as u32).div_ceil(256);
+        self.launch_maybe_blob(
+            "ep_gather_rows_by_owner",
+            [grid_x, n_slots as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
+
     /// 2D strided F32 row copy, one launch for `n_rows` rows:
     ///
     /// ```text

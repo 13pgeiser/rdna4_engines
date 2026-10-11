@@ -729,3 +729,7 @@ required-features = ["lab"]
 [[example]]
 name = "a13_repro"
 required-features = ["lab"]
+
+[[example]]
+name = "ep_row_gather_probe"
+required-features = ["lab"]

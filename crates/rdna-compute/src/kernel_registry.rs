@@ -505,6 +505,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     // every kernel the arch's object defines.
     if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
         add!("copy_f32_buffer", kernels::COPY_F32_BUFFER_SRC, ["copy_f32_buffer", "copy_f32_strided_slot_buffer"]);
+        add!("ep_gather_rows_by_owner", kernels::EP_GATHER_ROWS_BY_OWNER_SRC, ["ep_gather_rows_by_owner"]);
         add!("gemm_bf16_xf32_multirow", kernels::GEMM_BF16_XF32_MULTIROW_SRC, [
             "convert_bf16_to_f16", "gemm_bf16_xf32_multirow", "gemm_bf16_xf32_multirow_pto2", "gemm_bf16_xf32_multirow_rows3",
         ]);

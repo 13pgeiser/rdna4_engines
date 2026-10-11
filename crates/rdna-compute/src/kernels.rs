@@ -9643,6 +9643,12 @@ pub const SWA_VISIBILITY_STAGE_BATCHED_SRC: &str =
 /// launch recorder; these kernels make the dependency explicit and auditable.
 pub const COPY_F32_BUFFER_SRC: &str = include_str!("../../../kernels/src/copy_f32_buffer.hip");
 
+/// Flash-Next expert-parallel row all-gather (copy only): fills every expanded
+/// row owned by another rank (`slot_experts[s] % n_ranks`) from the owner's
+/// peer-mapped buffer, bit-exact uint4 load/store.
+pub const EP_GATHER_ROWS_BY_OWNER_SRC: &str =
+    include_str!("../../../kernels/src/ep_gather_rows_by_owner.hip");
+
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.
 /// Replaces the per-row `copy_d2d` loop in the FLUX.1 MMDiT single block's
