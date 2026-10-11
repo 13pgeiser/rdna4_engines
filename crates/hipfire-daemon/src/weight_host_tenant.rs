@@ -107,24 +107,31 @@ pub(crate) fn load_refusal(opted_in: bool, msg: &serde_json::Value) -> Option<St
 
 /// A weight-host tenant whose host closed the lease unloads the imported
 /// model before the next command runs (the current request already finished:
-/// commands are sequential). Returns the reason when it unloaded.
+/// commands are sequential; the caller only asks while no batch lane is live,
+/// and keeps this command's admitted terminal so it can still answer).
+/// Returns true when it unloaded; the caller then drops its model-bound state.
 pub(crate) fn reconcile_lease(
     model: &mut Option<LoadedModel>,
     gpu: &mut rdna_compute::Gpu,
-) -> Option<String> {
-    let status = model
+) -> bool {
+    let Some(status) = model
         .as_mut()
         .and_then(|m| m.qwen35_mut())
         .and_then(|b| b.weight_lease.as_ref())
-        .map(|lease| lease.host_alive())?;
+        .map(|lease| lease.host_alive())
+    else {
+        return false;
+    };
     let reason = match status {
-        Ok(true) => return None,
+        Ok(true) => return false,
         Ok(false) => "weight host closed the lease".to_string(),
         Err(error) => format!("weight host lease check failed: {error}"),
     };
     let unload = model.take().map(|m| hipfire_loader::unload_model(m, gpu));
-    Some(match unload {
-        Some(Err(error)) => format!("{reason}; imported model unload incomplete: {error}"),
-        _ => format!("{reason}; imported model unloaded"),
-    })
+    let outcome = match unload {
+        Some(Err(error)) => format!("imported model unload incomplete: {error}"),
+        _ => "imported model unloaded".to_string(),
+    };
+    eprintln!("[weight-host] {reason}; {outcome}; reload against a live host");
+    true
 }

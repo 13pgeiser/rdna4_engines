@@ -147,3 +147,8 @@ required-features = ["deltanet", "moe-oracle"]
 name = "host_offload_smoke"
 path = "examples/host_offload_smoke.rs"
 required-features = ["lab"]
+
+[[example]]
+name = "shared_weight_state_oracle"
+path = "examples/shared_weight_state_oracle.rs"
+required-features = ["lab", "deltanet"]

@@ -974,7 +974,6 @@ fn main() {
     else {
         return;
     };
-    // Weight-host opt-in (HIPFIRE_WEIGHT_HOST=1, bootstrap env) picks the claim kind.
     let (weight_host, mut gpu_locks) = weight_host_tenant::open_locks().unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
@@ -1186,15 +1185,10 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        // Weight-host tenant: a lost lease unloads the imported model between commands.
         let idle = !batch_scheduler.as_ref().is_some_and(|s| s.active_count() > 0);
-        if weight_host.is_some() && idle && !matches!(msg_type, "ping" | "diag") {
-            if let Some(reason) = weight_host_tenant::reconcile_lease(&mut model, &mut gpu) {
-                eprintln!("[weight-host] {reason}; reload against a live host");
-                (resident_kv, batch_scheduler, vmm_batch) = (None, None, None);
-                continuous_batch_size = 1;
-                // No lane is live; keep this command's admitted terminal so it can answer.
-            }
+        let quiet = weight_host.is_some() && idle && !matches!(msg_type, "ping" | "diag");
+        if quiet && weight_host_tenant::reconcile_lease(&mut model, &mut gpu) {
+            (resident_kv, batch_scheduler, vmm_batch, continuous_batch_size) = (None, None, None, 1);
         }
         let request_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let command_span = tracing::info_span!(
