@@ -348,6 +348,8 @@ struct Compiled {
     object: Vec<u8>,
     /// Err: the certifier rejected the object (it ships without a record).
     receipt: Result<railgun_cert::Receipt>,
+    /// The Radiowave manifest the runtime reads beside a packaged object.
+    radiowave_json: String,
     headers: BTreeSet<String>,
 }
 
@@ -410,7 +412,13 @@ fn compile_and_certify(compiler: &KernelCompiler, entry: &KernelEntry, dir: &Pat
     let _ = std::fs::remove_file(&obj);
     compiler.compile_to_paths(entry.module, entry.source(), &src, &obj).map_err(|e| format!("{}: {e}", entry.module))?;
     let object = std::fs::read(&obj).map_err(|e| format!("{}: {e}", obj.display()))?;
-    let receipt = railgun_cert::certify(&object, None).map_err(|e| e.to_string());
+    // Without the manifest Redline types the launch with no resource effects and
+    // keeps a wait + acquire railgun's certified facts prove unneeded.
+    let manifest = dir.join(format!("{}.radiowave.json", entry.module));
+    let _ = std::fs::remove_file(&manifest);
+    compiler.certify_radiowave(entry.module, &src, &obj, &manifest).map_err(|e| format!("{}: radiowave: {e}", entry.module))?;
+    let radiowave_json = std::fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
+    let receipt = railgun_cert::certify(&object, Some(&radiowave_json)).map_err(|e| e.to_string());
     if let Ok(receipt) = &receipt {
         let missing: Vec<&str> = entry.symbols.iter().copied().filter(|s| !receipt.railgun.kernels.iter().any(|k| k.symbol == *s)).collect();
         if !missing.is_empty() {
@@ -418,7 +426,7 @@ fn compile_and_certify(compiler: &KernelCompiler, entry: &KernelEntry, dir: &Pat
         }
     }
     let headers = headers(&compiler.jit_argv(entry.module, entry.source(), &src, &obj), compiler.rocm_env_root())?;
-    Ok(Compiled { object, receipt, headers })
+    Ok(Compiled { object, receipt, radiowave_json, headers })
 }
 
 fn git_revision() -> String {
@@ -483,7 +491,10 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
             let artifact = sha256_hex(&compiled.object);
             let symbols: Vec<String> = entry.symbols.iter().map(|s| (*s).to_owned()).collect();
             let object_src = dir.join(format!("{}.hsaco", entry.module));
-            compiler.publish_package(entry.module, entry.source(), &symbols, &object_src, &staging.join("pack").join(arch))?;
+            let pack_dir = staging.join("pack").join(arch);
+            compiler.publish_package(entry.module, entry.source(), &symbols, &object_src, &pack_dir)?;
+            std::fs::write(pack_dir.join(format!("{}.radiowave.json", entry.module)), &compiled.radiowave_json)
+                .map_err(|e| e.to_string())?;
             let source_rel = staging.join("sources").join(arch).join(format!("{}.hip", entry.module));
             std::fs::create_dir_all(source_rel.parent().unwrap()).map_err(|e| e.to_string())?;
             std::fs::write(&source_rel, entry.source()).map_err(|e| e.to_string())?;
