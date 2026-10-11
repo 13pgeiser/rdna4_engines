@@ -3676,3 +3676,30 @@ TEST(gemma4_feed_forward_join_writes_the_next_input_norm) {
         CHECK_EQ(count_issued(issued, "logits_gemm"), 1);
     }
 }
+
+/* At decode heights the router, its top-k and the sort are one launch (libr4d's
+ * router_gemm_topk_scatter); refused, the pair (router_topk_scatter) behind the router GEMM; both
+ * refused, the three separate ops as before. The routing's buffers are the same either way. */
+TEST(gemma4_routes_a_decode_step_in_one_launch) {
+    for (int refuse = 0; refuse < 3; ++refuse) {
+        RadBuilder b;
+        if (refuse >= 1) b.refuse.insert("router_gemm_topk_scatter");
+        if (refuse >= 2) b.refuse.insert("router_topk_scatter");
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> issued = issued_ops(b, c);
+        CHECK_EQ(count_issued(issued, "router_gemm_topk_scatter"), refuse == 0 ? 6 : 0);
+        CHECK_EQ(count_issued(issued, "router_topk_scatter"), refuse == 1 ? 6 : 0);
+        CHECK_EQ(count_issued(issued, "router_topk"), refuse == 2 ? 6 : 0);
+        CHECK_EQ(count_issued(issued, "moe_scatter"), refuse == 2 ? 6 : 0);
+        /* the per-expert scale and the experts' gather run whichever form routed */
+        CHECK_EQ(count_issued(issued, "embed_lookup"), 1 + 6);
+        CHECK_EQ(count_issued(issued, "moe_gather"), 6);
+    }
+}

@@ -105,6 +105,12 @@ namespace gemma4 {
 
 using namespace rad::arch;
 
+/* The fused router's two bounds, as rad_block_moe_fp8.h states them: the most routing slots
+ * libr4d's sort serves in one workgroup (its kScatterSmall), and the skinny bf16 GEMM's decode
+ * band, where the fused op's GEMM is that GEMM's own arithmetic. */
+static const int64_t kMoeSortRows = 1024;
+static const int64_t kMoeRouterFusedRows = 64;
+
 /* ============================================================== metadata */
 /* Gemma4ForConditionalGeneration nests the text model's config under `text_config`; a
  * Gemma4ForCausalLM checkpoint does not. rad-convert flattens nested keys with dots, so every key
@@ -226,6 +232,12 @@ struct Layer {
     bool gu_fp8 = false, dn_fp8 = false;
     rad_op op_rnorm = 0, op_router = 0, op_topk = 0, op_escale = 0, op_emul = 0, op_enorm = 0;
     rad_op op_scatter = 0, op_egu = 0, op_eact = 0, op_eq = 0, op_edn = 0, op_gather = 0;
+    /* libr4d's fused forms of the router, its top-k and the sort, where they resolve: the pair
+     * (`router_topk_scatter`) up to `topk_scatter_rows`, and the router GEMM in front of it
+     * (`router_gemm_topk_scatter`) up to `router_fused_rows`. A pass past their rows issues the
+     * separate ops, which are declared either way. */
+    rad_op  op_topk_scatter = 0, op_router_fused = 0;
+    int64_t topk_scatter_rows = 0, router_fused_rows = 0;
     /* the join */
     rad_weight w_fpost = 0, w_scalar = 0;
     rad_op op_ar_f = 0, op_fpost1 = 0, op_fpost2 = 0, op_fsum = 0, op_fpost = 0, op_add_f = 0;
@@ -1246,6 +1258,41 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                               RAD_INT("expert_base", m.expert_base)),
                                    RAD_NOWEIGHTS),
                                {m.b_ids}, {m.b_sorted, m.b_eoff, m.b_ecnt});
+            /* THE ROUTER, ITS TOP-K AND THE SORT IN ONE LAUNCH at decode heights. At a decode step
+             * each of the three is one small workgroup's work behind a full dispatch, and libr4d
+             * fuses them: `router_topk_scatter` for the pair, bounded by the sort's single-workgroup
+             * form (kMoeSortRows routing slots), and `router_gemm_topk_scatter` with the router's
+             * GEMM in front, up to the skinny GEMM's decode band -- byte-identical to the launches
+             * they stand in for (docs/OPS.md), so the routing does not move. The per-expert scale
+             * and the experts' input norm sit between them in the issue order and read only the ids
+             * and weights the fused op writes. Declared here, after every buffer they name: a late
+             * declaration only lengthens a buffer's planned life (rad_block_moe_fp8.h). */
+            {
+                const int64_t sort_rows = P * K <= kMoeSortRows ? P : kMoeSortRows / K;
+                if (sort_rows > 0)
+                    y.op_topk_scatter = rw(b, RAD_OP(b, "router_topk_scatter",
+                                               RAD_PARAMS(RAD_RANGE("M", 1, sort_rows),
+                                                          RAD_INT("n_expert", m.n_expert),
+                                                          RAD_INT("n_local", NL), RAD_INT("top_k", K),
+                                                          RAD_INT("norm", 1), RAD_STR("dtype", "bf16"),
+                                                          RAD_INT("expert_base", m.expert_base)),
+                                               RAD_NOWEIGHTS),
+                                           {m.b_logit}, {m.b_ids, m.b_ew, m.b_sorted, m.b_eoff, m.b_ecnt});
+                if (y.op_topk_scatter) {
+                    y.topk_scatter_rows = sort_rows;
+                    const int64_t fr = sort_rows < kMoeRouterFusedRows ? sort_rows : kMoeRouterFusedRows;
+                    y.op_router_fused = rw(b, RAD_OP(b, "router_gemm_topk_scatter",
+                                               RAD_PARAMS(RAD_RANGE("M", 1, fr), RAD_INT("K", E),
+                                                          RAD_INT("n_expert", m.n_expert),
+                                                          RAD_INT("n_local", NL), RAD_INT("top_k", K),
+                                                          RAD_INT("norm", 1), RAD_STR("dtype", "bf16"),
+                                                          RAD_INT("expert_base", m.expert_base)),
+                                               RAD_WEIGHTS(y.w_router)),
+                                           {m.b_rn},
+                                           {m.b_logit, m.b_ids, m.b_ew, m.b_sorted, m.b_eoff, m.b_ecnt});
+                    if (y.op_router_fused) y.router_fused_rows = fr;
+                }
+            }
             /* THE TWO GROUPED GEMMs DISAGREE ABOUT a_order, and must: gate_up reads the block
              * input, a row a TOKEN, gathered through sorted_tok; down reads gate_up's product,
              * already a row a (token, slot) in the scatter's order (rad_block_moe_fp8.h). */
@@ -1436,10 +1483,25 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T) {
         const RadOperand ecnt = counts ? praw(counts, RAD_I32, NL) : brows(m.b_ecnt, NL);
         RAD_ISSUE_N(c, y.op_rnorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_rscale),
                     brow_slice(m.b_rn, r0, n, E));
-        RAD_ISSUE_N(c, y.op_router, n, brow_slice(m.b_rn, r0, n, E), RAD_W(y.w_router),
-                    brow_slice(m.b_logit, r0, n, NE));
-        RAD_ISSUE_N(c, y.op_topk, n, brow_slice(m.b_logit, r0, n, NE),
-                    brow_slice(m.b_ids, r0, n, K), brow_slice(m.b_ew, r0, n, K));
+        /* One launch, two or three: the router, its top-k and the sort (see declare). */
+        const bool rfused = y.op_router_fused && n <= y.router_fused_rows;
+        const bool pair = !rfused && y.op_topk_scatter && n <= y.topk_scatter_rows;
+        if (rfused) {
+            RAD_ISSUE_N(c, y.op_router_fused, n, brow_slice(m.b_rn, r0, n, E), RAD_W(y.w_router),
+                        RAD_NONE, brow_slice(m.b_logit, r0, n, NE),
+                        brow_slice(m.b_ids, r0, n, K), brow_slice(m.b_ew, r0, n, K),
+                        brows(m.b_sorted, n * K), brows(m.b_eoff, NL + 1), ecnt, RAD_NONE);
+        } else {
+            RAD_ISSUE_N(c, y.op_router, n, brow_slice(m.b_rn, r0, n, E), RAD_W(y.w_router),
+                        brow_slice(m.b_logit, r0, n, NE));
+            if (pair)
+                RAD_ISSUE_N(c, y.op_topk_scatter, n, brow_slice(m.b_logit, r0, n, NE),
+                            brow_slice(m.b_ids, r0, n, K), brow_slice(m.b_ew, r0, n, K),
+                            brows(m.b_sorted, n * K), brows(m.b_eoff, NL + 1), ecnt);
+            else
+                RAD_ISSUE_N(c, y.op_topk, n, brow_slice(m.b_logit, r0, n, NE),
+                            brow_slice(m.b_ids, r0, n, K), brow_slice(m.b_ew, r0, n, K));
+        }
         /* The ids and the gathered scales read as flat [n * K] vectors: the same bytes. */
         int32_t* ids = (int32_t*)rad_buf_ptr(c, m.b_ids);
         uint16_t* es = (uint16_t*)rad_buf_ptr(c, m.b_es);
@@ -1455,8 +1517,9 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T) {
         else
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_enorm),
                         brow_slice(m.b_hx, r0, n, E));
-        RAD_ISSUE_N(c, y.op_scatter, n, brow_slice(m.b_ids, r0, n, K), brows(m.b_sorted, n * K),
-                    brows(m.b_eoff, NL + 1), ecnt);
+        if (!rfused && !pair)
+            RAD_ISSUE_N(c, y.op_scatter, n, brow_slice(m.b_ids, r0, n, K), brows(m.b_sorted, n * K),
+                        brows(m.b_eoff, NL + 1), ecnt);
         /* An fp8 projection's tables: the first handle of each parity's run and its length --
          * even codes, even scales, odd codes, odd scales (declare). */
         const int64_t H = NL / 2;
