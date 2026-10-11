@@ -2,7 +2,7 @@
  * name and ONE object in a dialect of JSON.
  *
  * Gemma 4's template is one llama.cpp reads with a hand-written handler, so the template analysis
- * finds no format in it and the plugin declares one (arch/gemma4_bf16/gemma4_chat_format.h):
+ * finds no format in it and the plugins declare one (arch/common/rad_gemma4_chat.h):
  *
  *   <|channel>thought\n ... <channel|>                         reasoning
  *   <|tool_call>call:NAME{key:<|"|>text<|"|>,n:3}<tool_call|>   a call, repeated for more
@@ -28,7 +28,7 @@
 #include "text/chatparse.h"
 #include "text/tokenizer.h"
 
-#include "../arch/gemma4_bf16/gemma4_chat_format.h"
+#include <arch/rad_gemma4_chat.h>
 
 #include <nlohmann/json.hpp>
 
@@ -60,7 +60,7 @@ static std::string fixture() {
 static const Model& gemma() {
     static const Model m = { "gemma4", "gemma4", "<bos>", "<eos>",
                              { "<eos>", "<turn|>", "<|tool_response>" },
-                             gemma4_bf16::chat_format_decl() };
+                             rad::arch::gemma4_chat_format() };
     return m;
 }
 
@@ -136,7 +136,7 @@ static std::shared_ptr<const ReplyParser> parser(const std::string& gp, bool too
         ChatFormat f;
         std::string why;
         std::shared_ptr<const ReplyFormat> r;
-        if (chat_format_from_abi(gemma4_bf16::chat_format_decl(), &f, &why) < 0 ||
+        if (chat_format_from_abi(rad::arch::gemma4_chat_format(), &f, &why) < 0 ||
             ReplyFormat::compile(f, &r, &why) < 0)
             ::radtest::fail(__FILE__, __LINE__, "gemma4 format: " + why);
         return r;
@@ -167,7 +167,7 @@ static const std::string kAfter = "<|channel>thought\n";
 TEST(the_declaration_is_a_format_the_parser_runs) {
     ChatFormat f;
     std::string why;
-    CHECK_OK(chat_format_from_abi(gemma4_bf16::chat_format_decl(), &f, &why));
+    CHECK_OK(chat_format_from_abi(rad::arch::gemma4_chat_format(), &f, &why));
     CHECK_OK(chat_format_check(f, &why));
     CHECK(f.object_args());
     CHECK(f.reasoning_anywhere);
@@ -189,7 +189,7 @@ TEST(the_declaration_is_a_format_the_parser_runs) {
  * the tagged family, no dialect, reasoning at the start only -- and Gemma's declaration read that
  * way is refused by name rather than run wrongly. */
 TEST(an_older_struct_reads_the_object_fields_as_zero) {
-    RadChatFormat c = *gemma4_bf16::chat_format_decl();
+    RadChatFormat c = *rad::arch::gemma4_chat_format();
     c.struct_size = (uint32_t)offsetof(RadChatFormat, args_form);
     ChatFormat f;
     std::string why;
@@ -204,7 +204,7 @@ TEST(an_older_struct_reads_the_object_fields_as_zero) {
 
 TEST(an_object_format_the_parser_cannot_read_is_refused_by_name) {
     auto refused = [](void (*edit)(RadChatFormat&), const char* word) {
-        RadChatFormat c = *gemma4_bf16::chat_format_decl();
+        RadChatFormat c = *rad::arch::gemma4_chat_format();
         edit(c);
         ChatFormat f;
         std::string why;
@@ -662,7 +662,7 @@ static int admits(const std::string& gbnf, const std::string& prefix, const std:
 static std::string grammar_for(const ChatGrammarRequest& gq) {
     ChatFormat f;
     std::string why;
-    CHECK_OK(chat_format_from_abi(gemma4_bf16::chat_format_decl(), &f, &why));
+    CHECK_OK(chat_format_from_abi(rad::arch::gemma4_chat_format(), &f, &why));
     ChatGrammar g;
     CHECK_OK(chat_format_grammar(f, gq, &g, &why));
     return g.text;
@@ -678,7 +678,7 @@ TEST(the_call_grammar_admits_what_the_model_writes_and_refuses_the_rest) {
     gq.generation_prompt = b->prompt().generation_prompt;
     ChatFormat f;
     std::string why;
-    CHECK_OK(chat_format_from_abi(gemma4_bf16::chat_format_decl(), &f, &why));
+    CHECK_OK(chat_format_from_abi(rad::arch::gemma4_chat_format(), &f, &why));
     ChatGrammar g;
     CHECK_OK(chat_format_grammar(f, gq, &g, &why));
     CHECK(g.lazy);
@@ -791,7 +791,7 @@ TEST(the_chat_bridge_serves_gemma_from_its_declaration) {
     REQUIRE(v != nullptr);
     CHECK(v->is_eog(6));     /* <|tool_response>: after its calls the model stops there */
     server::ChatTemplateBridge br;
-    CHECK_OK(br.init(*v, gemma4_bf16::chat_format_decl(), "gemma4_bf16"));
+    CHECK_OK(br.init(*v, rad::arch::gemma4_chat_format(), "gemma4_bf16"));
     CHECK(br.supports_tools());
     CHECK(br.tool_refusal().empty());
 

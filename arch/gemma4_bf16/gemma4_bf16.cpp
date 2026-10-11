@@ -9,8 +9,7 @@
  * cap * tanh(x / cap).
  */
 #include <arch/rad_arch.h>
-
-#include "gemma4_chat_format.h"
+#include <arch/rad_gemma4_chat.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -881,8 +880,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
-/* The reply format: gemma4_chat_format.h. */
-const RadChatFormat* chat_format(const RadModelMeta*) { return chat_format_decl(); }
+/* The reply format: the model's, shared with arch/gemma4 (arch/rad_gemma4_chat.h). */
+const RadChatFormat* chat_format(const RadModelMeta*) { return gemma4_chat_format(); }
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
