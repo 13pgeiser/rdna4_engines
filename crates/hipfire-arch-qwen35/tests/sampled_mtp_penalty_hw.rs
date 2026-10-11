@@ -110,8 +110,8 @@
 //! (`none` = absent), `_MIN_P` 0, `_TOKENS` 4 (>= 4), `_REPEAT_PENALTY` 1.0,
 //! `_REPEAT_WINDOW` 128, `_PRESENCE_PENALTY` 0, `_FREQUENCY_PENALTY` 0, all
 //! parsed strictly (a typo panics rather than running the neutral config).
-//! `HIPFIRE_SAMPLED_MTP_PROMPT`: `both` (default: a prose case and a
-//! repetition-heavy case), `prose`, `repetition`, or any other text, used as
+//! `HIPFIRE_SAMPLED_MTP_PROMPT`: `both` (default: an `animals` list case and
+//! an `integers` list case), `animals`, `integers`, or any other text, used as
 //! the user message of a single `custom` case. `_REPEAT_WINDOW` may be 0 or
 //! above the 2048-cell buffer: AR normalizes it, MTP receives it raw.
 //!
@@ -194,8 +194,12 @@ const ARM_ENV: &str = "HIPFIRE_SAMPLED_MTP_ARM";
 const CONFIG_ENV: &str = "HIPFIRE_SAMPLED_MTP_CONFIG";
 const ARM_TEST: &str = "sampled_mtp_penalty_arm";
 
-const PROSE: &str = "Write a four-sentence story about a lighthouse keeper who finds something unexpected washed up on the rocks.";
-const REPETITION: &str = "Repeat the following line exactly twelve times, one copy per line, with no other words: the tide comes in and the tide goes out.";
+// Open-ended list prompts: every early position has real diversity under the
+// certification sampling (a TRIALS=40 pilot on qwen3.8-27b kept 2-4 cells per
+// position, n_eff ~0.5-0.75 n). A fixed story or a "repeat this line" prompt
+// is near-deterministic for the first tokens and fails the degeneracy guard.
+const ANIMALS: &str = "Name ten random animals, one per line, and nothing else.";
+const INTEGERS: &str = "Write twenty random integers between 1 and 1000, separated by spaces, with no other text.";
 
 const MAX_SEQ: usize = 4096;
 /// `ModelSlotConfig::repeat_window`: sizes `scratch.repeat_buf` (F32 cells).
@@ -368,20 +372,20 @@ fn strict_top_k() -> Result<Option<u32>, String> {
 }
 
 fn cases_from_env() -> Result<Vec<Case>, String> {
-    let prose = Case {
-        name: "prose".into(),
-        user: PROSE.into(),
+    let animals = Case {
+        name: "animals".into(),
+        user: ANIMALS.into(),
     };
-    let repetition = Case {
-        name: "repetition".into(),
-        user: REPETITION.into(),
+    let integers = Case {
+        name: "integers".into(),
+        user: INTEGERS.into(),
     };
     match std::env::var(PROMPT_ENV) {
-        Err(_) => Ok(vec![prose, repetition]),
+        Err(_) => Ok(vec![animals, integers]),
         Ok(v) => match v.as_str() {
-            "both" => Ok(vec![prose, repetition]),
-            "prose" => Ok(vec![prose]),
-            "repetition" => Ok(vec![repetition]),
+            "both" => Ok(vec![animals, integers]),
+            "animals" => Ok(vec![animals]),
+            "integers" => Ok(vec![integers]),
             "" => Err(format!("{PROMPT_ENV} is set but empty")),
             text => Ok(vec![Case {
                 name: "custom".into(),
