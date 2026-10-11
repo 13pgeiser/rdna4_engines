@@ -2097,6 +2097,19 @@ fn gated_delta_conv_batched_impl(
     }
     args.pad_to(16);
     let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
+    // Compact 1-D grid: `conv_blocks * row_grid` convolution tiles (block `i`
+    // is channel block `i % conv_blocks`, row block `i / conv_blocks`), then the
+    // parameter blocks.  The kernel re-derives the split from rows / channels,
+    // so the grid depends only on those and the heads, fixed at capture.
+    let conv_tiles = checked_product(
+        grid as usize,
+        row_grid as usize,
+        "GDN batched convolution tile grid",
+    )?;
+    let total_grid = checked_u32(
+        checked_add(conv_tiles, param_grid as usize, "GDN batched convolution launch grid")?,
+        "GDN batched convolution launch grid",
+    )?;
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
     // re-derives it at the replay position.
@@ -2108,7 +2121,7 @@ fn gated_delta_conv_batched_impl(
     }];
     gpu.launch_blob_recorded(
         kernel,
-        [grid + param_grid, row_grid, 1],
+        [total_grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -5294,6 +5307,136 @@ mod tests {
         gpu.free_tensor(kernel).expect("free");
     }
 
+    /// The compact 1-D grid of the conv + parameter launch: the convolution
+    /// output and ring must equal the convolution-only launch, and gate / beta
+    /// the stand-alone batched parameter kernel's, with a ragged channel block
+    /// (300 channels), rows that are not multiples of 16, several row blocks
+    /// (3 .. 512) and several parameter blocks (the 48-head Flash-Next shape).
+    #[test]
+    fn gdn_conv_params_compact_grid_is_bit_identical_to_split_launches() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (channels, heads) = (300usize, 48usize);
+        let mut kernel = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(1, channels * 4, 1.0)), &[channels * 4 * 2])
+            .expect("kernel");
+        kernel.dtype = DType::BF16;
+        kernel.shape = vec![channels * 4];
+        let mut a_log = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(11, heads, 1.0)), &[heads * 2])
+            .expect("a_log");
+        a_log.dtype = DType::BF16;
+        a_log.shape = vec![heads];
+        let mut dt_bias = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(12, heads, 1.0)), &[heads * 2])
+            .expect("dt_bias");
+        dt_bias.dtype = DType::BF16;
+        dt_bias.shape = vec![heads];
+        let history = test_wave(2, channels * 3, 2.0);
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for (rows, start_cursor) in [(37usize, 2usize), (513, 1), (8192, 0)] {
+            let input = gpu
+                .upload_f32(&test_wave(3 + rows, rows * channels, 3.0), &[rows * channels])
+                .expect("input");
+            let a = gpu
+                .upload_f32(&test_wave(9, rows * heads, 2.0), &[rows * heads])
+                .expect("a");
+            let b = gpu
+                .upload_f32(&test_wave(10, rows * heads, 2.0), &[rows * heads])
+                .expect("b");
+            // Split launches: convolution only, then the stand-alone parameters.
+            let hist_a = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let out_a = gpu.zeros(&[rows * channels], DType::F32).expect("out");
+            let gate_a = gpu.zeros(&[rows * heads], DType::F32).expect("gate");
+            let beta_a = gpu.zeros(&[rows * heads], DType::F32).expect("beta");
+            gated_delta_conv_batched(
+                &mut gpu,
+                &GatedDeltaConvBatched {
+                    input: &input,
+                    kernel: &kernel,
+                    history: &hist_a,
+                    output: &out_a,
+                    next_history: &hist_a,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+            )
+            .expect("conv");
+            gated_delta_params_batched(
+                &mut gpu,
+                &GatedDeltaParamsBatched {
+                    a: &a,
+                    b: &b,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    gate: &gate_a,
+                    beta: &beta_a,
+                    rows,
+                    heads,
+                },
+            )
+            .expect("params");
+            // One launch over the compact grid.
+            let hist_b = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let out_b = gpu.zeros(&[rows * channels], DType::F32).expect("out");
+            let gate_b = gpu.zeros(&[rows * heads], DType::F32).expect("gate");
+            let beta_b = gpu.zeros(&[rows * heads], DType::F32).expect("beta");
+            gated_delta_conv_params_batched(
+                &mut gpu,
+                &GatedDeltaConvBatched {
+                    input: &input,
+                    kernel: &kernel,
+                    history: &hist_b,
+                    output: &out_b,
+                    next_history: &hist_b,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+                &GatedDeltaParamsBatched {
+                    a: &a,
+                    b: &b,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    gate: &gate_b,
+                    beta: &beta_b,
+                    rows,
+                    heads,
+                },
+            )
+            .expect("conv + params");
+            assert!(
+                bits(&gpu, &gate_a).iter().any(|v| *v != 0),
+                "rows {rows}: gate reference is all zero"
+            );
+            assert_eq!(bits(&gpu, &out_a), bits(&gpu, &out_b), "rows {rows}: output");
+            assert_eq!(bits(&gpu, &hist_a), bits(&gpu, &hist_b), "rows {rows}: history");
+            assert_eq!(bits(&gpu, &gate_a), bits(&gpu, &gate_b), "rows {rows}: gate");
+            assert_eq!(bits(&gpu, &beta_a), bits(&gpu, &beta_b), "rows {rows}: beta");
+            for tensor in [
+                input, a, b, hist_a, out_a, gate_a, beta_a, hist_b, out_b, gate_b, beta_b,
+            ] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        for tensor in [kernel, a_log, dt_bias] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
     /// The fused HC norm + BF16 gate projection must equal hyper_norm followed
     /// by the multi-row BF16 GEMM bit for bit, at the production width.
     #[test]
@@ -6970,7 +7113,16 @@ mod tests {
             eprintln!("skip: needs gfx1151 and the F16 WMMA route");
             return;
         }
-        let (key_heads, value_heads, dim, rows) = (16usize, 16usize, 128usize, 530usize);
+        // 530: ragged last row tile (34 row blocks); 8192: the Flash-Next
+        // prefill chunk (512 row blocks), where the compact 1-D conv grid is
+        // 24 channel blocks x 512 row blocks + 512 parameter blocks.
+        for rows in [530usize, 8192] {
+            gdn_conv_qknorm_hookup_case(&mut gpu, rows);
+        }
+    }
+
+    fn gdn_conv_qknorm_hookup_case(gpu: &mut Gpu, rows: usize) {
+        let (key_heads, value_heads, dim) = (16usize, 16usize, 128usize);
         let qk = key_heads * dim;
         let value = value_heads * dim;
         let qkv = 2 * qk + value;
@@ -7096,14 +7248,38 @@ mod tests {
             }
             values
         };
-        let plain = run(&mut gpu, false, false);
-        let fused = run(&mut gpu, true, false);
-        let kept = run(&mut gpu, true, true);
+        let plain = run(gpu, false, false);
+        let fused = run(gpu, true, false);
+        let kept = run(gpu, true, true);
         for (i, label) in ["gated output", "state", "conv ring", "gate", "beta"].iter().enumerate() {
             assert!(plain[i] == fused[i], "{label} differs (qk columns dropped)");
             assert!(plain[i] == kept[i], "{label} differs (qk columns kept)");
         }
         assert!(plain[5] == kept[5], "convolution output differs with keep_qk_conv");
+        // Gate / beta against the stand-alone parameter kernel (a separate
+        // grid), so the compact conv + parameter grid is not only compared to
+        // itself: `rows * value_heads` spans several parameter blocks.
+        let ref_gate = gpu.zeros(&[rows * value_heads], DType::F32).expect("ref gate");
+        let ref_beta = gpu.zeros(&[rows * value_heads], DType::F32).expect("ref beta");
+        gated_delta_params_batched(
+            gpu,
+            &GatedDeltaParamsBatched {
+                a: &a,
+                b: &b,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                gate: &ref_gate,
+                beta: &ref_beta,
+                rows,
+                heads: value_heads,
+            },
+        )
+        .expect("stand-alone params");
+        assert!(bytes(gpu, &ref_gate) == plain[3], "rows {rows}: gate vs stand-alone params");
+        assert!(bytes(gpu, &ref_beta) == plain[4], "rows {rows}: beta vs stand-alone params");
+        for tensor in [ref_gate, ref_beta] {
+            gpu.free_tensor(tensor).expect("free");
+        }
         let (row_bytes, v_from) = (qkv * 2, 2 * qk * 2);
         for r in 0..rows {
             assert!(
