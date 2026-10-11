@@ -4335,6 +4335,7 @@ impl Gpu {
     /// is off. `Err` when both verify opt-ins are forced on (two different
     /// verify arithmetics).
     pub fn iu4_verify_load_decision(flags: &crate::FeatureFlags, dflash_block: usize) -> Result<bool, String> {
+        // bind_thread: skip — pure flag decision, no HIP call or device state.
         match flags.cb_verify_iu4 {
             Some(true) if flags.cb_verify_fp8 => Err(
                 "HIPFIRE_CB_VERIFY_IU4=1 and HIPFIRE_CB_VERIFY_FP8=1 are mutually exclusive \
@@ -4352,6 +4353,7 @@ impl Gpu {
     /// verify trunk has no other A4 producer for its out-projections and FFN
     /// down). The target half (dense MQ4G256V2 weights) is the caller's.
     pub fn iu4_verify_route_admitted(&self) -> bool {
+        // bind_thread: skip — pure host-side flag/property query, no HIP call.
         self.iu4_verify_load
             && self.arch == "gfx1201"
             && self.mq4v2_symmetric
@@ -4366,6 +4368,7 @@ impl Gpu {
     /// producers are eager-only, and the verify callers take their eager
     /// route while it is set.
     pub fn iu4_verify_enter(&mut self, admitted: bool) -> bool {
+        // bind_thread: skip — updates a CPU-side scope flag, no device call.
         let prev = self.iu4_verify_scope;
         self.iu4_verify_scope = admitted;
         prev
@@ -4374,6 +4377,7 @@ impl Gpu {
     /// Close the scope. The first 3 closed scopes (and every 1000th) print the
     /// route receipt: IU4 GEMM launches and F16 MQ4V2 GEMM calls inside them.
     pub fn iu4_verify_exit(&mut self, prev: bool) {
+        // bind_thread: skip — CPU-side scope/counter updates and logging, no HIP call.
         use std::sync::atomic::Ordering::Relaxed;
         if self.iu4_verify_scope && !prev {
             let iu4 = IU4_VERIFY_SCOPE_IU4.swap(0, Relaxed);
@@ -4389,6 +4393,7 @@ impl Gpu {
 
     /// Route receipt: one IU4 GEMM launch over `n` rows (inside the scope only).
     pub fn iu4_verify_note_iu4(&self, n: usize) {
+        // bind_thread: skip — updates host-side receipt counters, no device call.
         if self.iu4_verify_scope {
             IU4_VERIFY_SCOPE_IU4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             IU4_VERIFY_SCOPE_ROWS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -4397,6 +4402,7 @@ impl Gpu {
 
     /// Route receipt: one F16 MQ4V2 GEMM call (inside the scope only).
     pub fn iu4_verify_note_f16(&self) {
+        // bind_thread: skip — updates a host-side receipt counter, no device call.
         if self.iu4_verify_scope {
             IU4_VERIFY_SCOPE_F16.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
