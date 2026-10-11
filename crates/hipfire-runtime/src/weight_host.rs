@@ -3037,6 +3037,14 @@ mod tests {
         FD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Temp dir pinned to 0700: the socket rules reject any group/other access and
+    /// `tempfile` follows the process umask on some hosts.
+    fn private_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     fn open_fd_count() -> usize {
         let names: Vec<_> = std::fs::read_dir("/proc/self/fd").unwrap().map(|e| e.unwrap().file_name()).collect();
         names.len()
@@ -3372,7 +3380,7 @@ mod tests {
     #[test]
     fn source_certificate_rules() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let src = dir.path().join("model.hfq");
         let cert_path = dir.path().join("model.cert");
         ro_file(&src, b"0123456789abcdef");
@@ -3439,6 +3447,7 @@ mod tests {
 
     #[test]
     fn peer_credential_rules() {
+        let _g = fd_lock();
         let me = PeerCredentials { pid: 42, uid: euid(), gid: 0 };
         assert!(verify_peer(&me, None).is_ok());
         assert!(verify_peer(&me, Some(42)).is_ok());
@@ -3495,7 +3504,7 @@ mod tests {
     #[test]
     fn full_lifecycle_with_real_memfds() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let before = open_fd_count();
         {
@@ -3563,7 +3572,7 @@ mod tests {
     fn exact_batch_totals_across_32_fd_boundaries() {
         let _g = fd_lock();
         for n in [1usize, 31, 32, 33, 64, 65] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_tempdir();
             let sock = dir.path().join("h.sock");
             let before = open_fd_count();
             {
@@ -3596,7 +3605,7 @@ mod tests {
     #[test]
     fn pipe_descriptors_travel_too() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let (r, w) = pipe_read_end();
         let (model, abi) = digests();
@@ -3626,7 +3635,7 @@ mod tests {
     #[test]
     fn dropped_lease_is_eof_never_a_fabricated_ack() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let before = open_fd_count();
         {
@@ -3657,21 +3666,22 @@ mod tests {
     #[test]
     fn ack_wait_times_out_without_ack() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
         let s2 = server.clone();
-        let host = thread::spawn(move || -> Result<(), WeightHostError> {
+        let host = thread::spawn(move || -> Result<HostSession, WeightHostError> {
             let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
             sess.send_allocations()?;
             let e = sess.wait_import_ack(Some(Duration::from_millis(50))).unwrap_err();
             assert!(matches!(e, WeightHostError::Timeout(_)), "got {e:?}");
             assert_eq!(sess.state(), HostSessionState::Failed);
-            Ok(())
+            Ok(sess)
         });
         let lease = WeightHostClient::connect(&sock, hello_for(&f)).unwrap();
-        host.join().unwrap().unwrap();
+        // keep the host session (and its socket) alive past the join
+        let _sess = host.join().unwrap().unwrap();
         // host_alive is still Ok: the host kept the socket open
         assert!(lease.host_alive().unwrap());
     }
@@ -3679,7 +3689,7 @@ mod tests {
     #[test]
     fn host_exit_is_visible_to_live_lease() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
@@ -3710,7 +3720,7 @@ mod tests {
             ("card.device_arch", Box::new(|h| h.card.device_arch = "gfx1100".into())),
         ];
         for (field, mutate) in cases {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_tempdir();
             let sock = dir.path().join("h.sock");
             {
                 let f = fixture(2);
@@ -3731,7 +3741,7 @@ mod tests {
     #[test]
     fn admission_callback_denial_rejects_client() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let before = open_fd_count();
         {
@@ -3751,7 +3761,7 @@ mod tests {
     #[test]
     fn expected_pid_checks_on_both_sides() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         // client expects a different host pid: fails before sending Hello
@@ -3787,7 +3797,7 @@ mod tests {
     #[test]
     fn socket_filesystem_rules() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap();
@@ -3814,6 +3824,7 @@ mod tests {
 
     #[test]
     fn hello_limits_enforced_before_connecting() {
+        let _g = fd_lock();
         let f = fixture(1);
         let mut h = hello_for(&f);
         h.admission_token = "x".repeat(MAX_ADMISSION_TOKEN_BYTES + 1);
@@ -3831,6 +3842,7 @@ mod tests {
 
     #[test]
     fn publication_validation() {
+        let _g = fd_lock();
         let (model, abi) = digests();
         let mk = |fds: Vec<OwnedFd>, epoch: Epoch| {
             WeightPublication::new(epoch, card(), model, abi, base_recipe(), wide_manifest(2), fds)
@@ -3863,7 +3875,7 @@ mod tests {
     #[test]
     fn host_rejects_unsupported_client_version() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
@@ -4064,7 +4076,7 @@ mod tests {
                     send_ready(c, &good_ready(h, 1));
                     send_batch(c, BatchMsg { index: 0, total: 1, first: 0, count: 1 }, 0, &[]);
                 }),
-                |e| matches!(e, WeightHostError::FdCount { expected: 0, .. } | WeightHostError::Protocol(_)),
+                |e| matches!(e, WeightHostError::FdCount { expected: 1, got: 0 }),
             ),
             (
                 "extra fd beyond header",
@@ -4168,7 +4180,7 @@ mod tests {
 
         let f = fixture(1);
         for (label, script, ok) in cases {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_tempdir();
             let sock = dir.path().join("h.sock");
             let before = open_fd_count();
             let mut hello = hello_for(&f);
@@ -4184,7 +4196,7 @@ mod tests {
     #[test]
     fn handshake_deadline_is_absolute() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         // host accepts and reads Hello, then dribbles nothing: client must time out
@@ -4201,7 +4213,7 @@ mod tests {
     #[test]
     fn host_rejects_bad_clients_without_sending_fds() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let before = open_fd_count();
@@ -4228,7 +4240,7 @@ mod tests {
     #[test]
     fn accept_wait_is_bounded() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap();
@@ -4239,7 +4251,7 @@ mod tests {
     #[test]
     fn sessions_enforce_state_order() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
@@ -4260,7 +4272,7 @@ mod tests {
     #[test]
     fn tenant_wrong_ack_identity_fails_host_session() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
@@ -4282,7 +4294,7 @@ mod tests {
     #[test]
     fn from_listener_poll_release_and_drain() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let before = open_fd_count();
         {
@@ -4346,7 +4358,7 @@ mod tests {
     #[test]
     fn eof_without_release_is_peer_closed_not_released() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
@@ -4378,7 +4390,7 @@ mod tests {
     #[test]
     fn release_after_host_hangup_never_fabricates_delivery() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
@@ -4439,6 +4451,7 @@ mod tests {
 
     #[test]
     fn tail_pad_exact_boundary_is_accepted() {
+        let _g = fd_lock();
         let mut m = base_manifest();
         m.allocations[0].logical_bytes = 77_824 - EXPORT_WEIGHT_TAIL_PAD_BYTES;
         m.views[0].byte_extent = 8000;
@@ -4482,7 +4495,7 @@ mod tests {
     #[test]
     fn identity_is_deterministic_across_processes() {
         let _g = fd_lock();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let out = dir.path().join("child-identity.txt");
         let module = module_path!().split_once("::").unwrap().1;
         let status = std::process::Command::new(std::env::current_exe().unwrap())
