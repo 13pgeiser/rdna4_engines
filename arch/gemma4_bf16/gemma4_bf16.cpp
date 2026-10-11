@@ -1,4 +1,4 @@
-/* gemma4_bf16.cpp -- Gemma 4 dense, text-only, bf16.
+/* gemma4_bf16.cpp -- Gemma 4 dense, bf16, with its vision tower (gemma4_vision.h).
  *
  * Two attention classes over ONE residual stream, alternating by layer. A "sliding" layer is
  * sliding-window attention over head_dim 256 with a v projection and standard RoPE; a "global"
@@ -18,6 +18,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include "gemma4_vision.h"
 
 namespace gemma4_bf16 {
 
@@ -1215,6 +1217,11 @@ struct Model {
     Gemma4Head head{};
     bool       have_head = false;
 
+    /* The vision tower (gemma4_vision.h), declared when the container carries one and the
+     * deployment serves media; `op_mm` writes its rows over the placeholders' embeddings. */
+    Vision     vis{};
+    rad_op     op_mm = 0;
+
     G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
     bool       fuse = false;
     bool       fuse_ar = false;   /* every junction also carries the all-reduce in front of it */
@@ -1429,6 +1436,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
                                RAD_NOWEIGHTS),
                           {m.b_x}, {m.b_x});
+    /* An image's rows over its placeholders' embeddings, after the (all-reduced) lookup and
+     * before the first block reads the stream: the reference scales the token embeddings by
+     * sqrt(n_embd) and scatters the image features in unscaled. */
+    if (Vision::present(meta) && ctx->max_enc_patches > 0)
+        m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
+                               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                          RAD_STR("dtype", "bf16")),
+                               RAD_NOWEIGHTS),
+                     {m.b_x}, {m.b_x});
 
     /* ---- the layers. This loop is the model card. */
     Gemma4Attn::Wire sw{}; sw.x = m.b_x; sw.h = m.b_h; sw.q = m.b_qs; sw.k = m.b_ks; sw.v = m.b_vs;        sw.attn = m.b_attns;
@@ -1535,6 +1551,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(rad_drafter_shared_kv(b, kHeadPosOffset));
     }
 
+    /* ---- the vision tower, its weight groups past the trunk's and the head's (whether or not
+     * this deployment declares the head, so the groups do not move with max_spec). */
+    {
+        const int64_t head_groups = has_assistant(meta) ? hd_i(meta, "num_hidden_layers", 0) + 1 : 0;
+        RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, g.n_embd, (int)(m.n_main + head_groups)));
+    }
+
     rad_note(b, "rank %d/%d: %lld layers (%lld global, %lld sliding), sliding window %lld, "
                 "slider %lld heads x %lld, global %lld heads x %lld, soft-capped logits",
              g.rank, g.world, (long long)g.n_layer, (long long)n_global,
@@ -1554,6 +1577,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
 
+    /* AN ENCODER PASS RUNS THE TOWER AND NOTHING ELSE. */
+    if (batch->enc) {
+        m.vis.step(c, batch);
+        return;
+    }
     /* A DRAFT PASS RUNS THE HEAD AND NOTHING ELSE. The trunk already ran this step and left its
      * final-normed hidden state in `h`, which the head's history pass gathers from. */
     if (batch->draft_pass != 0) {
@@ -1584,6 +1612,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
     if (m.op_embed_ar)
         RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
                     brows(m.b_x, batch->n_tok), RAD_NONE);
+    if (m.op_mm && batch->n_mm_rows > 0)
+        RAD_ISSUE_N(c, m.op_mm, batch->n_mm_rows,
+                    praw2(batch->mm_embd, RAD_BF16, batch->n_mm_rows, m.g.n_embd),
+                    praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, batch->n_tok));
     trc_copy(c, m.trc, m.g.n_embd, 0, 0, m.b_x, batch->n_tok);   /* site x0: post-embedding */
 
     const int64_t T = batch->n_tok;
@@ -1642,12 +1674,17 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         out->draft_depth = kHeadDepth;
         out->draft_depth_fixed = 0;
     }
+    /* The tower's pooling window, so a pass size the core picks itself is whole windows. */
+    if (Vision::present(meta)) {
+        const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
+        if (k > 0) out->enc_merge = k * k;
+    }
     return RAD_OK;
 }
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
-                "Gemma 4 dense (text-only), w4a8 from its CT-INT4 (compressed-tensors) release: "
+                "Gemma 4 dense (text and images), w4a8 from its CT-INT4 (compressed-tensors) release: "
                 "sliding-window and proportional-RoPE global attention over a GemmaRMSNorm stream "
                 "with GELU feed-forward, per-layer scalar scaling and soft-capped logits")
 RAD_ARCH_CHAT_FORMAT(gemma4_bf16)

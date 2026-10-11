@@ -2801,7 +2801,7 @@ static const RadConstraint cAttnDenseH512G4[] = {
 /* A head in a wave's registers with a rotary pair in one lane: head_dim a multiple of 32 up to
  * 1024. The shim refuses a rotary_dim whose half is not a multiple of 32 (neox) by name. */
 static const RadConstraint cQkNormRope[] = {
-    C_LE("head_dim", 1024), C_DIV("head_dim", 32),
+    C_LE("head_dim", 1024), C_DIV("head_dim", 2),
 };
 
 /* ---- gated delta net ----------------------------------------------------------------------- */
@@ -3778,9 +3778,10 @@ static const RadKernelInfo kKernels[] = {
 
 { "qk_norm_rope_bf16", "qk_norm_rope", "attn",
   "per-head RMS norm of q and k (and optionally v, unit gain) with rotary on q and k, in place",
-  "head_dim a multiple of 32 up to 1024, neox (rotary_dim / 2 a multiple of 32), gptj, or "
-  "blocks (sections of 16 or a multiple of 32 pairs, each starting on a 32-channel slice); one "
-  "workgroup a token and a wave a head, sin/cos computed once for all its heads",
+  "head_dim up to 1024, a multiple of 32 for neox (rotary_dim / 2 a multiple of 32) and gptj; "
+  "blocks at any even head_dim and section size (sections of 16 or a multiple of 32 pairs, each "
+  "on a 32-channel slice, in registers; others a lane a pair); one workgroup a token and a wave "
+  "a head, sin/cos computed once for all its heads",
   "bf16 qkv and gains, i32 positions, f32 arithmetic, the norm rounded before the rotation",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQkNormRope), NOTUNE,
