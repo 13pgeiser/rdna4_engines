@@ -6429,6 +6429,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     tape_offset: usize,
     delta_layer_idx: usize,
     fusion: DflashFusionCtx,
+    tape_sink: Option<&mut Vec<rdna_compute::tape_copy::TapeCopy>>,
 ) -> HipResult<Option<&'a GpuTensor>> {
     let _ = fusion;
     // S5-gdn-pre-tape-fusion fast path: one launch for sigmoid(alpha/beta) +
@@ -6542,7 +6543,12 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // for this layer into the per-layer tape slots. The next LA
     // layer's fused_qkvza / fused_sigmoid_alpha_gate will overwrite
     // dn_qkv_batch / dn_{alpha,beta}_batch, so capture must happen
-    // now (after sigmoid_alpha_gate, before conv1d consumes qkv).
+    // now (after sigmoid_alpha_gate, before conv1d consumes qkv) —
+    // or, with a `tape_sink` (the multi-request verify trunk), be
+    // deferred: the three copies are queued and the caller issues
+    // one batched launch for every lane of the layer before the
+    // next layer's producers run. Nothing on this path writes the
+    // source rows after the sigmoid, so the tape bytes are equal.
     if let Some(tape) = gdn_tape.as_ref() {
         let qkv_row_bytes = tape.qkv_dim * 4;
         let alpha_row_bytes = n_v_heads * 4;
@@ -6550,27 +6556,34 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
         let off_a = tape_offset * alpha_row_bytes;
         let copy_qkv = n * qkv_row_bytes;
         let copy_a = n * alpha_row_bytes;
-        gpu.memcpy_dtod_at_auto(
-            &tape.qkv_bufs[delta_layer_idx].buf,
-            off_qkv,
-            &pbs.dn_qkv_batch.buf,
-            0,
-            copy_qkv,
-        )?;
-        gpu.memcpy_dtod_at_auto(
-            &tape.alpha_bufs[delta_layer_idx].buf,
-            off_a,
-            &pbs.dn_alpha_batch.buf,
-            0,
-            copy_a,
-        )?;
-        gpu.memcpy_dtod_at_auto(
-            &tape.beta_bufs[delta_layer_idx].buf,
-            off_a,
-            &pbs.dn_beta_batch.buf,
-            0,
-            copy_a,
-        )?;
+        if let Some(sink) = tape_sink {
+            use rdna_compute::tape_copy::TapeCopy;
+            sink.push(TapeCopy::new(&tape.qkv_bufs[delta_layer_idx].buf, off_qkv, &pbs.dn_qkv_batch.buf, 0, copy_qkv));
+            sink.push(TapeCopy::new(&tape.alpha_bufs[delta_layer_idx].buf, off_a, &pbs.dn_alpha_batch.buf, 0, copy_a));
+            sink.push(TapeCopy::new(&tape.beta_bufs[delta_layer_idx].buf, off_a, &pbs.dn_beta_batch.buf, 0, copy_a));
+        } else {
+            gpu.memcpy_dtod_at_auto(
+                &tape.qkv_bufs[delta_layer_idx].buf,
+                off_qkv,
+                &pbs.dn_qkv_batch.buf,
+                0,
+                copy_qkv,
+            )?;
+            gpu.memcpy_dtod_at_auto(
+                &tape.alpha_bufs[delta_layer_idx].buf,
+                off_a,
+                &pbs.dn_alpha_batch.buf,
+                0,
+                copy_a,
+            )?;
+            gpu.memcpy_dtod_at_auto(
+                &tape.beta_bufs[delta_layer_idx].buf,
+                off_a,
+                &pbs.dn_beta_batch.buf,
+                0,
+                copy_a,
+            )?;
+        }
     }
 
     // Tree-aware dispatch gate: when the caller provides
@@ -7335,6 +7348,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         tape_offset,
         delta_layer_idx,
         fusion,
+        None,
     )?;
 
     // Gated Delta Net — tree variant reads per-token S from

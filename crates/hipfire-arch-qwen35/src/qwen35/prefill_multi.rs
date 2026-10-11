@@ -219,6 +219,15 @@ static SEG_TWINS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_CB_SEG_TWINS").map_or(true, |v| v.trim() != "0")
 });
 
+/// `HIPFIRE_CB_TAPE_COPY_BATCH=0` (developer kill switch): every request
+/// snaps its GDN rollback tape with its own three `hipMemcpyDtoD` per layer
+/// (the singleton's copies) instead of one batched descriptor-copy launch per
+/// layer for all requests of the chunk ([`Gpu::tape_copy_batched`]). Default
+/// on; the tape bytes are identical either way.
+static TAPE_COPY_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_TAPE_COPY_BATCH").map_or(true, |v| v.trim() != "0")
+});
+
 /// Shared scratch of a multi-request chunk: the row scratch every request's
 /// rows live in, and the segment-twin tables (one per FullAttention layer).
 pub struct MultiChunkScratch {
@@ -587,6 +596,10 @@ pub fn forward_prefill_batch_multi(
 
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
+    // Deferred tape-capture copies of one DeltaNet layer (all requests),
+    // issued as one batched launch after the layer's per-request recurrence.
+    let mut tape_copies: Vec<rdna_compute::tape_copy::TapeCopy> =
+        Vec::with_capacity(if *TAPE_COPY_BATCH && tapes { 3 * reqs.len() } else { 0 });
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
@@ -605,9 +618,10 @@ pub fn forward_prefill_batch_multi(
                 }
                 for (r, view) in reqs.iter_mut().zip(&views) {
                     let n = r.tokens.len();
+                    let sink = (*TAPE_COPY_BATCH).then_some(&mut tape_copies);
                     let parents = batch_chunk_delta_net_pre_gdn(
                         gpu, layer, config, view, r.dn_state, n, k_dim, v_dim, n_v_heads, hd, sem, None, r.gdn_tape, 0,
-                        delta_layer_idx, r.fusion,
+                        delta_layer_idx, r.fusion, sink,
                     )?;
                     if parents.is_some() {
                         return refuse("tree recurrence in a linear verify");
@@ -627,6 +641,13 @@ pub fn forward_prefill_batch_multi(
                         config.linear_value_head_dim,
                         d.ef_residual(delta_layer_idx),
                     )?;
+                }
+                // The deferred tape copies read rows of dn_qkv/alpha/beta that
+                // no kernel since each request's sigmoid has written; the next
+                // layer's producers have not run yet.
+                if !tape_copies.is_empty() {
+                    gpu.tape_copy_batched(&tape_copies)?;
+                    tape_copies.clear();
                 }
                 if split_proj
                     || any_lane_s4(gpu, reqs, layer.wo.gpu_dtype)
