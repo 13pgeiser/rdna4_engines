@@ -810,6 +810,11 @@ fn forward_lanes_scoped(
     out: &StepOutputs<'_>,
     policy: &LaneStagePolicy,
 ) -> Result<(), Qwen4GpuForwardError> {
+    if fwd.ep_placement().is_some() {
+        return Err(invalid(
+            "lane steps do not run under expert parallelism (EP forwards are one-row decode and chunk forwards only)",
+        ));
+    }
     // Lanes are the Flash-Next route: the stage policy, row sharing and
     // decode copies are evidenced for its recipe only.
     if !bundle.config.profile.is_flash_next() {

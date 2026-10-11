@@ -25,15 +25,15 @@ use crate::program::{
 };
 use crate::projection::{row_stride, ProjectionView};
 use crate::weights::{
-    HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights, Qwen4FfnWeights,
-    Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
+    HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights, Qwen4EpPlacement,
+    Qwen4FfnWeights, Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeRouteCapability,
-    MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy, MoeSharedDecode, MoeSharedDtypes,
-    MoeSharedWeights, MoeStageTables, RoutedExpertWeights,
+    MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy, MoeRowGather, MoeSharedDecode,
+    MoeSharedDtypes, MoeSharedWeights, MoeStageTables, RoutedExpertWeights,
 };
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
@@ -56,6 +56,7 @@ use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) const EPSILON: f32 = 1.0e-6;
@@ -790,6 +791,7 @@ pub(crate) fn layer_desc<'a>(
                 expert_down_entries: &moe.expert_down_entries,
                 layer_idx: layer.layer as u16,
                 norm_topk_prob: config.norm_topk_prob,
+                row_gather: None,
             })
         }
         _ => {
@@ -891,13 +893,544 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     }
 }
 
+/// Gather buffers one EP rank owns: parity `L % 2` over the trunk layers plus
+/// one for the MTP head, each `num_experts_per_tok * hidden` F32.
+pub const QWEN4_EP_GATHER_BUFFERS: usize = 3;
+
+/// Which EP gather buffer a MoE invocation uses: trunk layer `L` uses
+/// `L % 2`; the MTP head (a layer index at or past the trunk layer count)
+/// uses buffer 2.
+pub(crate) fn qwen4_ep_buffer_index(layer_idx: usize, trunk_layers: usize) -> usize {
+    if layer_idx >= trunk_layers {
+        2
+    } else {
+        layer_idx % 2
+    }
+}
+
+/// Device pointers and byte lengths of one rank's compact routed-expert
+/// tensors of one MoE layer (`512 / ranks` experts, local index `e / ranks`).
+/// The same shape describes the per-rank zero dummy expert (one expert).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4PeerExpertSource {
+    pub gate_up_base: usize,
+    pub gate_up_bytes: usize,
+    pub down_base: usize,
+    pub down_bytes: usize,
+}
+
+/// How one rank's per-layer expert pointer table is populated.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Qwen4ExpertTableLayout<'a> {
+    /// Every expert from the layer's resident tensors (one device).
+    Single,
+    /// EP decode table: owned experts name the compact local tensors,
+    /// every other expert names the rank's zero dummy expert.
+    Ep {
+        placement: Qwen4EpPlacement,
+        dummy: Qwen4PeerExpertSource,
+    },
+    /// EP chunk table: owned experts name the local compact tensors, every
+    /// other expert names the owning peer's compact tensors (P2P), `peers`
+    /// indexed by rank.
+    Full {
+        placement: Qwen4EpPlacement,
+        peers: &'a [Qwen4PeerExpertSource],
+    },
+}
+
+/// The allocation one expert-table entry names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen4ExpertOrigin {
+    /// This rank's resident (compact) expert tensors.
+    Local,
+    /// This rank's zero dummy expert.
+    Dummy,
+    /// The compact expert tensors of the named peer rank.
+    Peer(usize),
+}
+
+/// Host pointer entries of one expert in the gate/up and down tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Qwen4ExpertEntry {
+    pub(crate) origin: Qwen4ExpertOrigin,
+    pub(crate) gate_up_ptr: usize,
+    pub(crate) down_ptr: usize,
+}
+
+fn validate_ep_placement(
+    placement: Qwen4EpPlacement,
+    num_experts: usize,
+) -> Result<(), Qwen4GpuForwardError> {
+    if placement.ranks == 0 || placement.rank >= placement.ranks {
+        return Err(invalid(format!(
+            "EP placement rank {} is outside {} ranks",
+            placement.rank, placement.ranks
+        )));
+    }
+    if num_experts % placement.ranks != 0 {
+        return Err(invalid(format!(
+            "{num_experts} experts do not shard evenly over {} EP ranks",
+            placement.ranks
+        )));
+    }
+    Ok(())
+}
+
+impl Qwen4ExpertTableLayout<'_> {
+    /// Experts the layer's own resident tensors hold under this layout.
+    fn local_experts(&self, num_experts: usize) -> Result<usize, Qwen4GpuForwardError> {
+        match self {
+            Self::Single => Ok(num_experts),
+            Self::Ep { placement, .. } | Self::Full { placement, .. } => {
+                validate_ep_placement(*placement, num_experts)?;
+                Ok(num_experts / placement.ranks)
+            }
+        }
+    }
+}
+
+/// Device address of expert slot `index` of a tensor `(base, total)` bytes
+/// long holding `expert_bytes` per slot; the whole slot must lie inside the
+/// tensor.
+fn expert_slot_ptr(
+    what: &str,
+    base: usize,
+    total: usize,
+    index: usize,
+    expert_bytes: usize,
+) -> Result<usize, Qwen4GpuForwardError> {
+    let offset = index
+        .checked_mul(expert_bytes)
+        .ok_or_else(|| invalid(format!("{what} expert {index} offset overflows")))?;
+    let end = offset
+        .checked_add(expert_bytes)
+        .ok_or_else(|| invalid(format!("{what} expert {index} end overflows")))?;
+    if base == 0 {
+        return Err(invalid(format!("{what} base pointer is null")));
+    }
+    if end > total {
+        return Err(invalid(format!(
+            "{what} expert slot {index} [{offset}, {end}) exceeds the {total}-byte tensor"
+        )));
+    }
+    base.checked_add(offset)
+        .ok_or_else(|| invalid(format!("{what} expert {index} address overflows")))
+}
+
+/// Pure arithmetic behind every expert pointer table: the host entry of each
+/// global expert under `layout`. `local` names this rank's own resident
+/// tensors (all experts under `Single`, the compact `num_experts / ranks`
+/// under EP). Nothing here touches a device.
+pub(crate) fn qwen4_expert_table_entries(
+    layout: &Qwen4ExpertTableLayout<'_>,
+    local: Qwen4PeerExpertSource,
+    num_experts: usize,
+    gate_up_expert_bytes: usize,
+    down_expert_bytes: usize,
+) -> Result<Vec<Qwen4ExpertEntry>, Qwen4GpuForwardError> {
+    let mut entries = Vec::with_capacity(num_experts);
+    match layout {
+        Qwen4ExpertTableLayout::Single => {
+            for expert in 0..num_experts {
+                entries.push(Qwen4ExpertEntry {
+                    origin: Qwen4ExpertOrigin::Local,
+                    gate_up_ptr: expert_slot_ptr(
+                        "gate/up",
+                        local.gate_up_base,
+                        local.gate_up_bytes,
+                        expert,
+                        gate_up_expert_bytes,
+                    )?,
+                    down_ptr: expert_slot_ptr(
+                        "down",
+                        local.down_base,
+                        local.down_bytes,
+                        expert,
+                        down_expert_bytes,
+                    )?,
+                });
+            }
+        }
+        Qwen4ExpertTableLayout::Ep { placement, dummy } => {
+            let per_rank = layout.local_experts(num_experts)?;
+            check_exact_compact(local, per_rank, gate_up_expert_bytes, down_expert_bytes)?;
+            if dummy.gate_up_bytes != gate_up_expert_bytes || dummy.down_bytes != down_expert_bytes
+            {
+                return Err(invalid(format!(
+                    "EP dummy expert holds {}+{} bytes, one expert is {gate_up_expert_bytes}+{down_expert_bytes}",
+                    dummy.gate_up_bytes, dummy.down_bytes
+                )));
+            }
+            for expert in 0..num_experts {
+                entries.push(if placement.owns(expert) {
+                    let slot = placement.local_index(expert);
+                    Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Local,
+                        gate_up_ptr: expert_slot_ptr(
+                            "gate/up",
+                            local.gate_up_base,
+                            local.gate_up_bytes,
+                            slot,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "down",
+                            local.down_base,
+                            local.down_bytes,
+                            slot,
+                            down_expert_bytes,
+                        )?,
+                    }
+                } else {
+                    Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Dummy,
+                        gate_up_ptr: expert_slot_ptr(
+                            "dummy gate/up",
+                            dummy.gate_up_base,
+                            dummy.gate_up_bytes,
+                            0,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "dummy down",
+                            dummy.down_base,
+                            dummy.down_bytes,
+                            0,
+                            down_expert_bytes,
+                        )?,
+                    }
+                });
+            }
+        }
+        Qwen4ExpertTableLayout::Full { placement, peers } => {
+            let per_rank = layout.local_experts(num_experts)?;
+            check_exact_compact(local, per_rank, gate_up_expert_bytes, down_expert_bytes)?;
+            if peers.len() != placement.ranks {
+                return Err(invalid(format!(
+                    "EP full table needs {} peer sources, got {}",
+                    placement.ranks,
+                    peers.len()
+                )));
+            }
+            if peers[placement.rank] != local {
+                return Err(invalid(format!(
+                    "EP peer source of rank {} does not name this rank's own expert tensors",
+                    placement.rank
+                )));
+            }
+            for expert in 0..num_experts {
+                let owner = expert % placement.ranks;
+                let slot = expert / placement.ranks;
+                entries.push(if owner == placement.rank {
+                    Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Local,
+                        gate_up_ptr: expert_slot_ptr(
+                            "gate/up",
+                            local.gate_up_base,
+                            local.gate_up_bytes,
+                            slot,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "down",
+                            local.down_base,
+                            local.down_bytes,
+                            slot,
+                            down_expert_bytes,
+                        )?,
+                    }
+                } else {
+                    let peer = peers[owner];
+                    Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Peer(owner),
+                        gate_up_ptr: expert_slot_ptr(
+                            "peer gate/up",
+                            peer.gate_up_base,
+                            peer.gate_up_bytes,
+                            slot,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "peer down",
+                            peer.down_base,
+                            peer.down_bytes,
+                            slot,
+                            down_expert_bytes,
+                        )?,
+                    }
+                });
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// An EP rank's resident tensors hold exactly `per_rank` experts.
+fn check_exact_compact(
+    local: Qwen4PeerExpertSource,
+    per_rank: usize,
+    gate_up_expert_bytes: usize,
+    down_expert_bytes: usize,
+) -> Result<(), Qwen4GpuForwardError> {
+    let gate_up = checked_bytes(per_rank, gate_up_expert_bytes)?;
+    let down = checked_bytes(per_rank, down_expert_bytes)?;
+    if local.gate_up_bytes != gate_up || local.down_bytes != down {
+        return Err(invalid(format!(
+            "EP compact expert tensors hold {}+{} bytes, expected exactly {per_rank} experts = {gate_up}+{down}",
+            local.gate_up_bytes, local.down_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// A non-owning whole-allocation window over a peer rank's expert tensor,
+/// only ever cut into per-expert views (never freed by this rank).
+fn foreign_packed_source(base: usize, bytes: usize, dtype: DType) -> GpuTensor {
+    GpuTensor {
+        // SAFETY: `base` names a live peer allocation of `bytes` bytes (the
+        // peer's resident expert tensor, P2P-mapped before any launch), and
+        // the wrapper is `Borrowed`, so neither this rank's `free_tensor`
+        // nor a drop releases it.
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(base as *mut std::ffi::c_void, bytes) },
+        shape: vec![bytes],
+        dtype,
+    }
+}
+
+/// One per-rank zero-filled expert in the routed format (QT44 gate/up, QT53
+/// down), shared by every layer's EP decode table for the experts the rank
+/// does not own.
+///
+/// All-zero bytes dequantize to exactly 0, so the producers (which run
+/// unchanged on all ten slots) emit zero rows for non-owned slots, which the
+/// row gather then overwrites with the owner's bits:
+/// * gate/up (`qwen4_gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip`): the
+///   group header is f16 `sc`, f16 `zp` read from bytes `[0,4)` / `[4,8)`;
+///   every weight is `sc * nibble + zp` = `0 * 0 + 0` = +0.0 in f32, so each
+///   product is `+-0 * x` (x is a finite rotated activation) and every
+///   accumulator (initialised to +0.0) stays +0.0;
+/// * down (`gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip`):
+///   `scale`, `zero` are the f16 at group bytes `[0,2)` / `[2,4)`; the same
+///   arithmetic gives `acc = +0.0`, written to the expanded row.
+/// No division, reciprocal or NaN/inf source exists in either dequant.
+pub(crate) struct Qwen4EpDummyExpert {
+    gate_up: GpuTensor,
+    down: GpuTensor,
+}
+
+impl Qwen4EpDummyExpert {
+    /// Encoded bytes of one routed expert `(gate_up, down)`.
+    fn expert_bytes(config: &Qwen4Config) -> Result<(usize, usize), Qwen4GpuForwardError> {
+        let gate_up = checked_bytes(
+            2 * config.moe_intermediate_size,
+            row_stride(DType::MQ4G256V2, config.hidden_size),
+        )?;
+        let down = checked_bytes(
+            config.hidden_size,
+            row_stride(DType::MQ4G128V2, config.moe_intermediate_size),
+        )?;
+        if gate_up % 4 != 0 || down % 4 != 0 {
+            return Err(invalid("EP dummy expert byte size is not a multiple of 4"));
+        }
+        Ok((gate_up, down))
+    }
+
+    fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Self, Qwen4GpuForwardError> {
+        let (gate_up_bytes, down_bytes) = Self::expert_bytes(config)?;
+        let gate_up = gpu.zeros(&[gate_up_bytes / 4], DType::F32)?;
+        let down = match gpu.zeros(&[down_bytes / 4], DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(gate_up);
+                return Err(error.into());
+            }
+        };
+        Ok(Self { gate_up, down })
+    }
+
+    fn source(&self) -> Qwen4PeerExpertSource {
+        Qwen4PeerExpertSource {
+            gate_up_base: self.gate_up.buf.as_ptr() as usize,
+            gate_up_bytes: self.gate_up.buf.size(),
+            down_base: self.down.buf.as_ptr() as usize,
+            down_bytes: self.down.buf.size(),
+        }
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for tensor in [self.gate_up, self.down] {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
+/// Expert-parallel state of one rank's forward (present iff the bundle's
+/// weights carry an EP placement).
+struct Qwen4ForwardEp {
+    placement: Qwen4EpPlacement,
+    dummy: Qwen4EpDummyExpert,
+    /// Per-layer full (P2P) tables for chunk forwards; empty until
+    /// [`Qwen4GpuForward::attach_ep`].
+    moe_full: Vec<Qwen4MoeLayerRuntime>,
+    /// Expanded-row exchange buffers, see [`qwen4_ep_buffer_index`].
+    buffers: [GpuTensor; QWEN4_EP_GATHER_BUFFERS],
+    /// Row gather the one-row forwards install, once attached.
+    gather: Option<Arc<dyn MoeRowGather + Send + Sync>>,
+}
+
+impl Qwen4ForwardEp {
+    fn new(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        validate_ep_placement(placement, config.num_experts)?;
+        let elements = config
+            .num_experts_per_tok
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| invalid("EP gather buffer size overflows"))?;
+        let dummy = Qwen4EpDummyExpert::new(gpu, config)?;
+        let mut buffers = Vec::with_capacity(QWEN4_EP_GATHER_BUFFERS);
+        for _ in 0..QWEN4_EP_GATHER_BUFFERS {
+            match gpu.zeros(&[elements], DType::F32) {
+                Ok(tensor) => buffers.push(tensor),
+                Err(error) => {
+                    for tensor in buffers {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    let _ = dummy.free_gpu(gpu);
+                    return Err(error.into());
+                }
+            }
+        }
+        let buffers: [GpuTensor; QWEN4_EP_GATHER_BUFFERS] = match buffers.try_into() {
+            Ok(buffers) => buffers,
+            Err(_) => return Err(invalid("EP gather buffer count")),
+        };
+        let state = Self {
+            placement,
+            dummy,
+            moe_full: Vec::new(),
+            buffers,
+            gather: None,
+        };
+        // The zero fills are stream-ordered; peers read the buffers over P2P
+        // on their own streams.
+        if let Err(error) = gpu.hip.device_synchronize() {
+            let _ = state.free_gpu(gpu);
+            return Err(error.into());
+        }
+        Ok(state)
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for layer in self.moe_full {
+            if let Some(error) = layer.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        for tensor in self.buffers {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some(error) = self.dummy.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
+        first
+    }
+}
+
 impl Qwen4MoeLayerRuntime {
+    /// Single-device runtime: the layer's resident tensors hold every expert.
     pub(crate) fn from_moe(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
         moe: &MoeWeights,
         layer_label: usize,
         config: &Qwen4Config,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::build(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            Qwen4ExpertTableLayout::Single,
+            None,
+        )
+    }
+
+    /// EP decode runtime: the resident expert tensors are this rank's compact
+    /// `num_experts / ranks` experts; owned experts name them, every other
+    /// expert names `dummy`.
+    pub(crate) fn from_moe_ep(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        dummy: &Qwen4EpDummyExpert,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::build(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            Qwen4ExpertTableLayout::Ep {
+                placement,
+                dummy: dummy.source(),
+            },
+            Some(dummy),
+        )
+    }
+
+    /// EP chunk runtime: owned experts name the local compact tensors, every
+    /// other expert names the owning peer's compact tensors
+    /// (`peers_for_layer[rank]`).
+    pub(crate) fn from_moe_full(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        peers_for_layer: &[Qwen4PeerExpertSource],
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::build(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            Qwen4ExpertTableLayout::Full {
+                placement,
+                peers: peers_for_layer,
+            },
+            None,
+        )
+    }
+
+    /// Every table is one single-owner (rank 0 of 1) dispatch table whose
+    /// views mirror the host pointer entries; EP tables differ only in which
+    /// allocation an entry names, so dispatch validates and seals them like
+    /// the single-device table.
+    fn build(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        layout: Qwen4ExpertTableLayout<'_>,
+        dummy: Option<&Qwen4EpDummyExpert>,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let router_source = weights.resident(&moe.gate)?;
         let scalar_source = weights.resident(&moe.shared_gate_scalar)?;
@@ -932,8 +1465,9 @@ impl Qwen4MoeLayerRuntime {
         let down_row_stride = row_stride(down_dtype, config.moe_intermediate_size);
         let gate_up_expert_bytes = checked_bytes(gate_up_rows, gate_up_row_stride)?;
         let down_expert_bytes = checked_bytes(config.hidden_size, down_row_stride)?;
-        let expected_gate_up_bytes = checked_bytes(config.num_experts, gate_up_expert_bytes)?;
-        let expected_down_bytes = checked_bytes(config.num_experts, down_expert_bytes)?;
+        let source_experts = layout.local_experts(config.num_experts)?;
+        let expected_gate_up_bytes = checked_bytes(source_experts, gate_up_expert_bytes)?;
+        let expected_down_bytes = checked_bytes(source_experts, down_expert_bytes)?;
         if gate_up_source.buf.size() < expected_gate_up_bytes {
             return Err(invalid(format!(
                 "layer {} gate/up packed bytes {} < expected {}",
@@ -950,6 +1484,20 @@ impl Qwen4MoeLayerRuntime {
                 expected_down_bytes
             )));
         }
+        if !matches!(layout, Qwen4ExpertTableLayout::Single) {
+            if gate_up_source.buf.is_host_mapped() || down_source.buf.is_host_mapped() {
+                return Err(invalid(format!(
+                    "layer {layer_label} EP expert tensors must be device resident"
+                )));
+            }
+        }
+        if matches!(layout, Qwen4ExpertTableLayout::Ep { .. })
+            && (gate_up_dtype != DType::MQ4G256V2 || down_dtype != DType::MQ4G128V2)
+        {
+            return Err(invalid(format!(
+                "layer {layer_label} EP dummy expert is QT44/QT53 but the experts are {gate_up_dtype:?}/{down_dtype:?}"
+            )));
+        }
 
         let (gate_up_source_name, down_source_name) = match &moe.expert_source_layout {
             ExpertSourceLayout::PackedFused { gate_up, down, .. } => {
@@ -962,13 +1510,70 @@ impl Qwen4MoeLayerRuntime {
                 )));
             }
         };
+        let local = Qwen4PeerExpertSource {
+            gate_up_base: gate_up_source.buf.as_ptr() as usize,
+            gate_up_bytes: gate_up_source.buf.size(),
+            down_base: down_source.buf.as_ptr() as usize,
+            down_bytes: down_source.buf.size(),
+        };
+        let table_entries = qwen4_expert_table_entries(
+            &layout,
+            local,
+            config.num_experts,
+            gate_up_expert_bytes,
+            down_expert_bytes,
+        )
+        .map_err(|error| match error {
+            Qwen4GpuForwardError::Invalid(message) => {
+                invalid(format!("layer {layer_label}: {message}"))
+            }
+            other => other,
+        })?;
+        // Whole-tensor windows over each peer rank's compact experts; the
+        // per-expert views below are cut from them. `qwen4_expert_table_entries`
+        // proved every slot lies inside its window.
+        let peer_sources: Vec<(GpuTensor, GpuTensor)> = match layout {
+            Qwen4ExpertTableLayout::Full { peers, .. } => peers
+                .iter()
+                .map(|peer| {
+                    (
+                        foreign_packed_source(peer.gate_up_base, peer.gate_up_bytes, gate_up_dtype),
+                        foreign_packed_source(peer.down_base, peer.down_bytes, down_dtype),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let mut experts = Vec::with_capacity(config.num_experts);
         let mut metadata = Vec::with_capacity(config.num_experts);
-        for expert in 0..config.num_experts {
-            let gate_up_offset = expert * gate_up_expert_bytes;
-            let down_offset = expert * down_expert_bytes;
+        for (expert, entry) in table_entries.iter().enumerate() {
+            let (gate_up_backing, gate_up_offset, down_backing, down_offset) = match entry.origin {
+                Qwen4ExpertOrigin::Local => (
+                    gate_up_source,
+                    entry.gate_up_ptr - local.gate_up_base,
+                    down_source,
+                    entry.down_ptr - local.down_base,
+                ),
+                Qwen4ExpertOrigin::Dummy => {
+                    let dummy = dummy.ok_or_else(|| {
+                        invalid(format!("layer {layer_label}: EP table without a dummy expert"))
+                    })?;
+                    (&dummy.gate_up, 0, &dummy.down, 0)
+                }
+                Qwen4ExpertOrigin::Peer(rank) => {
+                    let (peer_gate_up, peer_down) = peer_sources.get(rank).ok_or_else(|| {
+                        invalid(format!("layer {layer_label}: peer rank {rank} has no source"))
+                    })?;
+                    (
+                        peer_gate_up,
+                        entry.gate_up_ptr - peer_gate_up.buf.as_ptr() as usize,
+                        peer_down,
+                        entry.down_ptr - peer_down.buf.as_ptr() as usize,
+                    )
+                }
+            };
             let gate_up = ProjectionView::from_packed(
-                gate_up_source,
+                gate_up_backing,
                 gate_up_offset,
                 gate_up_expert_bytes,
                 gate_up_dtype,
@@ -976,13 +1581,20 @@ impl Qwen4MoeLayerRuntime {
                 config.hidden_size,
             );
             let down = ProjectionView::from_packed(
-                down_source,
+                down_backing,
                 down_offset,
                 down_expert_bytes,
                 down_dtype,
                 config.hidden_size,
                 config.moe_intermediate_size,
             );
+            if gate_up.tensor.buf.as_ptr() as usize != entry.gate_up_ptr
+                || down.tensor.buf.as_ptr() as usize != entry.down_ptr
+            {
+                return Err(invalid(format!(
+                    "layer {layer_label} expert {expert} view disagrees with its table entry"
+                )));
+            }
             experts.push(Qwen4ExpertView { gate_up, down });
 
             let gate_up_resource = ExpertResource::new(
@@ -2645,6 +3257,12 @@ pub struct Qwen4GpuForward {
     token_readback: Option<TokenReadback>,
     pub(crate) moe: Vec<Qwen4MoeLayerRuntime>,
     expert_stage: Option<Qwen4ExpertStage>,
+    /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
+    /// placement): the zero dummy expert, the full per-layer tables for chunk
+    /// forwards, the row-gather buffers and the installed gather. Under EP
+    /// `moe` holds the per-layer decode tables, there is no G2 expert stage,
+    /// and no forward records or replays a retained body.
+    ep: Option<Qwen4ForwardEp>,
     /// `DECODE_Q8_PER_LAYER` per layer [HC attn down, attn up, mlp down, mlp
     /// up, shared gate, up, down]: BF16 matrices requantized to Q8_0 for
     /// single-token forwards (gfx1151). Batch-1 decode streams every weight
@@ -2851,18 +3469,36 @@ impl Qwen4GpuForward {
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
         let mut expert_stage = None;
+        let mut ep: Option<Qwen4ForwardEp> = None;
         let mut trunk_zba = Vec::new();
         let mut trunk_a4 = Vec::new();
         let result = (|| {
-            for layer in &bundle.weights.layer_refs {
-                if let Some(weights) = layer.ffn.moe() {
-                    moe.push(Qwen4MoeLayerRuntime::from_moe(
-                        gpu,
-                        &bundle.weights,
-                        weights,
-                        layer.layer,
-                        &bundle.config,
-                    )?);
+            if let Some(placement) = bundle.weights.ep_placement() {
+                let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
+                for layer in &bundle.weights.layer_refs {
+                    if let Some(weights) = layer.ffn.moe() {
+                        moe.push(Qwen4MoeLayerRuntime::from_moe_ep(
+                            gpu,
+                            &bundle.weights,
+                            weights,
+                            layer.layer,
+                            &bundle.config,
+                            placement,
+                            &state.dummy,
+                        )?);
+                    }
+                }
+            } else {
+                for layer in &bundle.weights.layer_refs {
+                    if let Some(weights) = layer.ffn.moe() {
+                        moe.push(Qwen4MoeLayerRuntime::from_moe(
+                            gpu,
+                            &bundle.weights,
+                            weights,
+                            layer.layer,
+                            &bundle.config,
+                        )?);
+                    }
                 }
             }
             let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
@@ -2895,7 +3531,9 @@ impl Qwen4GpuForward {
             // scratch for the chunk cap. Layers that fail (every layer of an
             // asymmetric artifact) keep the F16 route; nothing runs (and no new
             // module loads) unless the route was requested.
-            if !moe.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
+            // (An EP rank verifies its full chunk tables in `attach_ep`, once
+            // every peer's experts are mapped.)
+            if ep.is_none() && !moe.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
                 let mut verified = 0usize;
                 for layer in &mut moe {
                     verified += usize::from(layer.verify_symmetric(gpu, &bundle.config)?);
@@ -2925,7 +3563,9 @@ impl Qwen4GpuForward {
             }
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
-                expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
+                if ep.is_none() {
+                    expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
+                }
             } else {
                 gpu.qwen4_trunk_iu4 = false;
             }
@@ -2990,6 +3630,9 @@ impl Qwen4GpuForward {
             for layer in moe {
                 let _ = layer.free_gpu(gpu);
             }
+            if let Some(ep) = ep {
+                let _ = ep.free_gpu(gpu);
+            }
             gpu.qwen4_trunk_iu4 = false;
             for tensor in decode_q8.into_iter().chain(trunk_zba.into_iter().flatten()) {
                 let _ = gpu.free_tensor(tensor);
@@ -3002,6 +3645,7 @@ impl Qwen4GpuForward {
         }
         Ok(Self {
             expert_stage,
+            ep,
             scratch,
             host_token_bytes,
             uploaded_id_rows: 0,
@@ -3037,6 +3681,150 @@ impl Qwen4GpuForward {
         }
     }
 
+    /// This rank's expert-parallel placement, `None` on the single-device route.
+    pub(crate) fn ep_placement(&self) -> Option<Qwen4EpPlacement> {
+        self.ep.as_ref().map(|ep| ep.placement)
+    }
+
+    /// Device pointers of this rank's compact routed-expert tensors, one per
+    /// trunk MoE layer in layer order (what every peer's full table names).
+    pub(crate) fn ep_expert_sources(
+        &self,
+        bundle: &Qwen4Bundle,
+    ) -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
+        if self.ep.is_none() {
+            return Err(invalid("EP expert sources of a forward without an EP placement"));
+        }
+        let mut sources = Vec::with_capacity(self.moe.len());
+        for layer in &bundle.weights.layer_refs {
+            if let Some(weights) = layer.ffn.moe() {
+                let gate_up = bundle.weights.resident(&weights.experts_gate_up)?;
+                let down = bundle.weights.resident(&weights.experts_down)?;
+                sources.push(Qwen4PeerExpertSource {
+                    gate_up_base: gate_up.buf.as_ptr() as usize,
+                    gate_up_bytes: gate_up.buf.size(),
+                    down_base: down.buf.as_ptr() as usize,
+                    down_bytes: down.buf.size(),
+                });
+            }
+        }
+        if sources.len() != self.moe.len() {
+            return Err(invalid(format!(
+                "EP expert sources cover {} layers, the forward has {}",
+                sources.len(),
+                self.moe.len()
+            )));
+        }
+        Ok(sources)
+    }
+
+    /// The expanded-row gather buffers, indexed by [`qwen4_ep_buffer_index`].
+    pub(crate) fn ep_gather_buffers(&self) -> Option<[&GpuTensor; QWEN4_EP_GATHER_BUFFERS]> {
+        self.ep.as_ref().map(|ep| {
+            let [first, second, third] = &ep.buffers;
+            [first, second, third]
+        })
+    }
+
+    /// After every rank is loaded and P2P is enabled on every rank: build this
+    /// rank's full (P2P) chunk tables from all ranks' sources
+    /// (`peers[rank][moe_layer]`), take the symmetric-IU4 verdict a single
+    /// device takes at construction, and install the row gather the one-row
+    /// forwards use.
+    pub(crate) fn attach_ep(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        peers: &[Vec<Qwen4PeerExpertSource>],
+        gather: Arc<dyn MoeRowGather + Send + Sync>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let layers = self.moe.len();
+        let max_chunk = self.scratch.max_chunk;
+        let Some(ep) = self.ep.as_mut() else {
+            return Err(invalid("attach_ep on a forward without an EP placement"));
+        };
+        if !ep.moe_full.is_empty() || ep.gather.is_some() {
+            return Err(invalid("EP is already attached"));
+        }
+        let placement = ep.placement;
+        if peers.len() != placement.ranks {
+            return Err(invalid(format!(
+                "attach_ep got {} peer source sets for {} ranks",
+                peers.len(),
+                placement.ranks
+            )));
+        }
+        for (rank, sources) in peers.iter().enumerate() {
+            if sources.len() != layers {
+                return Err(invalid(format!(
+                    "attach_ep rank {rank} lists {} MoE layers, expected {layers}",
+                    sources.len()
+                )));
+            }
+        }
+        let config = &bundle.config;
+        let mut full: Vec<Qwen4MoeLayerRuntime> = Vec::with_capacity(layers);
+        let result = (|| -> Result<(), Qwen4GpuForwardError> {
+            let mut ordinal = 0usize;
+            for layer in &bundle.weights.layer_refs {
+                if let Some(weights) = layer.ffn.moe() {
+                    let layer_peers = peers
+                        .iter()
+                        .map(|sources| {
+                            sources.get(ordinal).copied().ok_or_else(|| {
+                                invalid(format!("attach_ep is missing MoE layer {ordinal}"))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    full.push(Qwen4MoeLayerRuntime::from_moe_full(
+                        gpu,
+                        &bundle.weights,
+                        weights,
+                        layer.layer,
+                        config,
+                        placement,
+                        &layer_peers,
+                    )?);
+                    ordinal += 1;
+                }
+            }
+            // The single-device construction's symmetric-IU4 verdict, taken
+            // on the full tables so a chunk forward takes the same route
+            // (symmetric IU4 or F16) as one device.
+            if !full.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
+                let mut verified = 0usize;
+                for layer in &mut full {
+                    verified += usize::from(layer.verify_symmetric(gpu, config)?);
+                }
+                eprintln!(
+                    "  qwen4 symmetric IU4 MoE (ep rank {}/{}): {verified}/{} layers verified symmetric",
+                    placement.rank,
+                    placement.ranks,
+                    full.len()
+                );
+                if verified > 0 {
+                    gpu.reserve_qwen4_moe_sym(
+                        max_chunk,
+                        config.num_experts_per_tok,
+                        config.num_experts,
+                        config.hidden_size,
+                        config.moe_intermediate_size,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for layer in full {
+                let _ = layer.free_gpu(gpu);
+            }
+            return Err(error);
+        }
+        ep.moe_full = full;
+        ep.gather = Some(gather);
+        Ok(())
+    }
+
     /// Name the tokens that follow the next forward (at most one chunk is
     /// kept); see the `ple_lookahead` field.
     pub(crate) fn set_ple_lookahead(&mut self, tokens: &[u32]) {
@@ -3055,6 +3843,7 @@ impl Qwen4GpuForward {
             host_ple,
             moe,
             expert_stage,
+            ep,
             token_readback,
             decode_q8,
             route_trace,
@@ -3065,7 +3854,7 @@ impl Qwen4GpuForward {
         // A donor a failed forward left overwritten is not restored: the
         // bundle attaches its forward once and frees it only right before
         // the weights (`Qwen4Bundle::free_gpu`), so nothing reads it again.
-        if expert_stage.is_some() {
+        if expert_stage.is_some() || ep.is_some() {
             gpu.hip.device_synchronize()?;
         }
         // The PLE staging bytes may still be read by an enqueued upload:
@@ -3106,6 +3895,11 @@ impl Qwen4GpuForward {
                 if first.is_none() {
                     first = Some(error);
                 }
+            }
+        }
+        if let Some(ep) = ep {
+            if let Some(error) = ep.free_gpu(gpu) {
+                first.get_or_insert(error);
             }
         }
         first.map_or(Ok(()), Err)
@@ -3812,6 +4606,37 @@ impl Qwen4GpuForward {
         // The row count every routing decision below sees (`n` unless the
         // invariant prefill profile is on); launch extents keep `n`.
         let route_n = gpu.route_rows(n);
+        // Expert parallelism picks the MoE table per forward by routing row
+        // count, identically on every rank: one row runs the rank's decode
+        // table with the row gather installed and a parity gather buffer as
+        // the expanded-row scratch; chunks run the full (P2P) table, no gather.
+        let ep = self.ep.as_ref();
+        if let Some(ep) = ep {
+            if route_n == 1 {
+                if n != 1 {
+                    return Err(invalid("an EP decode forward carries exactly one row"));
+                }
+                if ep.gather.is_none() {
+                    return Err(invalid(
+                        "EP decode forward before attach_ep: the row gather is not installed",
+                    ));
+                }
+            } else if ep.moe_full.len() != self.moe.len() {
+                return Err(invalid(
+                    "EP chunk forward before attach_ep: the full expert tables are not built",
+                ));
+            }
+        }
+        let ep_gather: Option<&dyn MoeRowGather> = ep
+            .filter(|_| route_n == 1)
+            .and_then(|ep| ep.gather.as_deref().map(|gather| gather as &dyn MoeRowGather));
+        let ep_scratches: Option<[Qwen4LayerScratch<'_>; QWEN4_EP_GATHER_BUFFERS]> =
+            ep.filter(|_| route_n == 1).map(|ep| {
+                std::array::from_fn(|parity| Qwen4LayerScratch {
+                    moe_down_expanded: &ep.buffers[parity],
+                    ..layer_scratch(&self.scratch, &router_logits)
+                })
+            });
         if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
         {
             return Err(invalid(
@@ -3898,15 +4723,24 @@ impl Qwen4GpuForward {
                 }));
             }
 
-            let description = layer_desc(
+            let layer_moe = match ep {
+                Some(ep) if route_n > 1 => ep.moe_full.get(layer_index),
+                _ => self.moe.get(layer_index),
+            };
+            let mut description = layer_desc(
                 &bundle.weights,
                 layer,
-                self.moe.get(layer_index),
+                layer_moe,
                 &config,
                 &self.decode_q8,
                 route_n,
                 expert_stage,
             )?;
+            if let (Some(gather), Qwen4FfnBinding::Moe(binding)) =
+                (ep_gather, &mut description.ffn)
+            {
+                binding.row_gather = Some(gather);
+            }
             let attn_read = &description.attn_hyper.read;
             if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
                 return Err(invalid(
@@ -4110,7 +4944,9 @@ impl Qwen4GpuForward {
                         &ctx,
                         dims,
                         *moe,
-                        &scratch_desc,
+                        ep_scratches.as_ref().map_or(&scratch_desc, |parity| {
+                            &parity[qwen4_ep_buffer_index(layer_index, config.num_hidden_layers)]
+                        }),
                         n,
                         route_n,
                     )
@@ -4465,6 +5301,7 @@ impl Qwen4GpuForward {
             // recorded on tiny-dense-dev-gpu, card B) and the per-row GDN conv
             // carries a position kernarg linear AQL cannot rebind.
             let eligible = n == 1
+                && self.ep.is_none()
                 && config.profile.is_flash_next()
                 && !self.lane_scope
                 && !gpu.prefill_invariant_scope
@@ -4992,6 +5829,235 @@ mod capture_census_tests {
         assert_eq!(gate_capture_census(&mut replay, 5, 5), Ok(()));
         assert_eq!(replay.state(), ReplayState::RecordingWarmup);
         assert!(replay.fallback_reason().is_none());
+    }
+}
+
+#[cfg(test)]
+mod ep_table_tests {
+    use super::{
+        qwen4_ep_buffer_index, qwen4_expert_table_entries, Qwen4EpPlacement, Qwen4ExpertEntry,
+        Qwen4ExpertOrigin, Qwen4ExpertTableLayout, Qwen4GpuForwardError, Qwen4PeerExpertSource,
+        QWEN4_EP_GATHER_BUFFERS,
+    };
+
+    const EXPERTS: usize = 512;
+    const GATE_UP: usize = 1_740_800;
+    const DOWN: usize = 870_400;
+
+    fn compact(base: usize, gate_up_base: usize, experts: usize) -> Qwen4PeerExpertSource {
+        Qwen4PeerExpertSource {
+            gate_up_base: gate_up_base + base,
+            gate_up_bytes: experts * GATE_UP,
+            down_base: 0x4000_0000 + base,
+            down_bytes: experts * DOWN,
+        }
+    }
+
+    fn dummy() -> Qwen4PeerExpertSource {
+        Qwen4PeerExpertSource {
+            gate_up_base: 0x9000_0000,
+            gate_up_bytes: GATE_UP,
+            down_base: 0x9800_0000,
+            down_bytes: DOWN,
+        }
+    }
+
+    fn entries(
+        layout: &Qwen4ExpertTableLayout<'_>,
+        local: Qwen4PeerExpertSource,
+    ) -> Result<Vec<Qwen4ExpertEntry>, Qwen4GpuForwardError> {
+        qwen4_expert_table_entries(layout, local, EXPERTS, GATE_UP, DOWN)
+    }
+
+    fn message(result: Result<Vec<Qwen4ExpertEntry>, Qwen4GpuForwardError>) -> String {
+        match result {
+            Err(Qwen4GpuForwardError::Invalid(message)) => message,
+            other => panic!("expected an Invalid error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gather_buffer_index_alternates_over_the_trunk_and_isolates_the_mtp_head() {
+        assert_eq!(QWEN4_EP_GATHER_BUFFERS, 3);
+        assert_eq!(qwen4_ep_buffer_index(0, 48), 0);
+        assert_eq!(qwen4_ep_buffer_index(1, 48), 1);
+        assert_eq!(qwen4_ep_buffer_index(2, 48), 0);
+        assert_eq!(qwen4_ep_buffer_index(47, 48), 1);
+        assert_eq!(qwen4_ep_buffer_index(48, 48), 2);
+        assert_eq!(qwen4_ep_buffer_index(1000, 48), 2);
+    }
+
+    #[test]
+    fn single_table_is_the_contiguous_expert_walk() {
+        let local = compact(0, 0x1000_0000, EXPERTS);
+        let table = entries(&Qwen4ExpertTableLayout::Single, local).unwrap();
+        assert_eq!(table.len(), EXPERTS);
+        for (expert, entry) in table.iter().enumerate() {
+            assert_eq!(entry.origin, Qwen4ExpertOrigin::Local);
+            assert_eq!(entry.gate_up_ptr, local.gate_up_base + expert * GATE_UP);
+            assert_eq!(entry.down_ptr, local.down_base + expert * DOWN);
+        }
+    }
+
+    #[test]
+    fn single_table_refuses_a_short_tensor() {
+        let mut local = compact(0, 0x1000_0000, EXPERTS);
+        local.down_bytes -= 1;
+        let text = message(entries(&Qwen4ExpertTableLayout::Single, local));
+        assert!(text.contains("down expert slot 511") && text.contains("exceeds"), "{text}");
+    }
+
+    #[test]
+    fn ep_table_maps_owned_to_compact_local_and_the_rest_to_the_dummy() {
+        for (ranks, rank) in [(2usize, 0usize), (2, 1), (4, 0), (4, 3)] {
+            let placement = Qwen4EpPlacement { rank, ranks };
+            let local = compact(0, 0x1000_0000, EXPERTS / ranks);
+            let layout = Qwen4ExpertTableLayout::Ep {
+                placement,
+                dummy: dummy(),
+            };
+            let table = entries(&layout, local).unwrap();
+            assert_eq!(table.len(), EXPERTS);
+            let mut owned = 0;
+            for (expert, entry) in table.iter().enumerate() {
+                if expert % ranks == rank {
+                    owned += 1;
+                    assert_eq!(entry.origin, Qwen4ExpertOrigin::Local);
+                    assert_eq!(
+                        entry.gate_up_ptr,
+                        local.gate_up_base + (expert / ranks) * GATE_UP
+                    );
+                    assert_eq!(entry.down_ptr, local.down_base + (expert / ranks) * DOWN);
+                } else {
+                    assert_eq!(entry.origin, Qwen4ExpertOrigin::Dummy);
+                    assert_eq!(entry.gate_up_ptr, dummy().gate_up_base);
+                    assert_eq!(entry.down_ptr, dummy().down_base);
+                }
+            }
+            assert_eq!(owned, EXPERTS / ranks);
+        }
+    }
+
+    #[test]
+    fn ep_table_requires_exactly_the_compact_expert_count_and_one_dummy_expert() {
+        let placement = Qwen4EpPlacement { rank: 1, ranks: 4 };
+        let layout = Qwen4ExpertTableLayout::Ep {
+            placement,
+            dummy: dummy(),
+        };
+        // A single-device tensor (all 512 experts) is not a compact source.
+        let text = message(entries(&layout, compact(0, 0x1000_0000, EXPERTS)));
+        assert!(text.contains("exactly 128 experts"), "{text}");
+        // One expert short.
+        let text = message(entries(&layout, compact(0, 0x1000_0000, 127)));
+        assert!(text.contains("exactly 128 experts"), "{text}");
+        let mut big_dummy = dummy();
+        big_dummy.down_bytes += 4;
+        let layout = Qwen4ExpertTableLayout::Ep {
+            placement,
+            dummy: big_dummy,
+        };
+        let text = message(entries(&layout, compact(0, 0x1000_0000, 128)));
+        assert!(text.contains("dummy expert"), "{text}");
+    }
+
+    #[test]
+    fn ep_placement_must_shard_evenly() {
+        let local = compact(0, 0x1000_0000, EXPERTS / 4);
+        for placement in [
+            Qwen4EpPlacement { rank: 4, ranks: 4 },
+            Qwen4EpPlacement { rank: 0, ranks: 0 },
+            Qwen4EpPlacement { rank: 0, ranks: 3 },
+        ] {
+            let layout = Qwen4ExpertTableLayout::Ep {
+                placement,
+                dummy: dummy(),
+            };
+            assert!(entries(&layout, local).is_err(), "{placement:?}");
+        }
+    }
+
+    fn peers(ranks: usize) -> Vec<Qwen4PeerExpertSource> {
+        (0..ranks)
+            .map(|rank| {
+                let mut source = compact(0, 0x1000_0000 + rank * 0x1_0000_0000, EXPERTS / ranks);
+                source.down_base += rank * 0x1_0000_0000;
+                source
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_table_maps_owned_local_and_non_owned_into_the_owner_peer() {
+        for (ranks, rank) in [(2usize, 0usize), (2, 1), (4, 2)] {
+            let placement = Qwen4EpPlacement { rank, ranks };
+            let peers = peers(ranks);
+            let layout = Qwen4ExpertTableLayout::Full {
+                placement,
+                peers: &peers,
+            };
+            let table = entries(&layout, peers[rank]).unwrap();
+            assert_eq!(table.len(), EXPERTS);
+            for (expert, entry) in table.iter().enumerate() {
+                let owner = expert % ranks;
+                let slot = expert / ranks;
+                let expected_origin = if owner == rank {
+                    Qwen4ExpertOrigin::Local
+                } else {
+                    Qwen4ExpertOrigin::Peer(owner)
+                };
+                assert_eq!(entry.origin, expected_origin, "expert {expert}");
+                assert_eq!(
+                    entry.gate_up_ptr,
+                    peers[owner].gate_up_base + slot * GATE_UP,
+                    "expert {expert}"
+                );
+                assert_eq!(
+                    entry.down_ptr,
+                    peers[owner].down_base + slot * DOWN,
+                    "expert {expert}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_table_refuses_inconsistent_or_short_peers() {
+        let placement = Qwen4EpPlacement { rank: 0, ranks: 2 };
+        let good = peers(2);
+        let layout = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: &good,
+        };
+        // Peer list for the wrong rank count.
+        let wrong_count = &good[..1];
+        let layout_count = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: wrong_count,
+        };
+        let text = message(entries(&layout_count, good[0]));
+        assert!(text.contains("needs 2 peer sources"), "{text}");
+        // `peers[rank]` must be this rank's own tensors.
+        let text = message(entries(&layout, good[1]));
+        assert!(text.contains("does not name this rank's own"), "{text}");
+        // A peer whose tensor is one expert short is caught by the slot bounds.
+        let mut short = good.clone();
+        short[1].gate_up_bytes -= GATE_UP;
+        let layout_short = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: &short,
+        };
+        let text = message(entries(&layout_short, short[0]));
+        assert!(text.contains("peer gate/up expert slot 255") && text.contains("exceeds"), "{text}");
+        // A null peer base is refused rather than mapped.
+        let mut null = good.clone();
+        null[1].down_base = 0;
+        let layout_null = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: &null,
+        };
+        let text = message(entries(&layout_null, null[0]));
+        assert!(text.contains("null"), "{text}");
     }
 }
 

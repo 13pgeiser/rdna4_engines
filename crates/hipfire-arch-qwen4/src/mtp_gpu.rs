@@ -1912,6 +1912,11 @@ impl Qwen4MtpGpu {
         backend: Qwen4KvBackend,
     ) -> Result<Self, MtpGpuError> {
         admit_mtp(weights, config)?;
+        if weights.ep_placement().is_some() {
+            return Err(invalid(
+                "the MTP head does not run under expert parallelism (EP weights are rank-compact)",
+            ));
+        }
         if max_seq == 0 || max_seq > config.max_position_embeddings {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
