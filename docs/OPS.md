@@ -388,6 +388,9 @@ spelling of `act`, not the vocabulary's.
 | `gated_had_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `rmsnorm_quant_i8` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+| `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
+
+`gelu_mul_quant_i8` is `gelu_mul` with the same quantiser on its pass, byte-identical to the pair.
 
 `rmsnorm_quant_i8` is `rmsnorm` with `quant_act_i8`'s quantiser on its pass — fragment-order int8
 codes and one f32 scale per row, the grid `gemm_nt_q` reads at `dtype=w4a8`. With `residual` the

@@ -4922,6 +4922,55 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
     }
 }
 
+/* ---- gelu_mul_quant_i8, against gelu_mul + quant_act_i8 -------------------------------------
+ * Gemma 4 31B's per-rank feed-forward width (10752 of 21504 at two ranks), both batch widths. */
+static void gelu_mul_quant_i8_numeric(const Plugin& pl) {
+    const RadKernelInfo* gm = find(pl, "gelu_mul_bf16");
+    const RadKernelInfo* qz = find(pl, "quant_act_i8");
+    const RadKernelInfo* fz = find(pl, "gelu_mul_quant_i8");
+    if (!gm || !qz || !fz) { ok("gelu_mul_quant_i8 vs its pair", false, "rows absent"); return; }
+    for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)40 }) {
+        const int64_t n = 10752;
+        std::vector<uint16_t> hgu((size_t)M * 2 * n);
+        for (size_t i = 0; i < hgu.size(); ++i)
+            hgu[i] = h_to_bf16(std::ldexp(1.0f, (int)((i / 512) % 5) - 2) * (0.029f * (float)((i * 41) % 103) - 1.5f));
+        void* dgu = dalloc(hgu.size() * 2);
+        void* dy[2] = { dalloc((size_t)M * n * 2), dalloc((size_t)M * n * 2) };
+        void* dq[2] = { dalloc((size_t)M * n), dalloc((size_t)M * n) };
+        void* ds[2] = { dalloc((size_t)M * 4), dalloc((size_t)M * 4) };
+        if (!dgu || !dy[1] || !dq[1] || !ds[1]) { ok("gelu_mul_quant_i8 alloc", false, "hipMalloc failed"); return; }
+        st_memcpy(dgu, hgu.data(), hgu.size() * 2, hipMemcpyHostToDevice);
+        int rc = launch_row(gm, { T(dgu, RAD_BF16, { M, 2 * n }), T(dy[0], RAD_BF16, { M, n }) },
+                            { PI("M", M), PI("n", n), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(qz, { T(dy[0], RAD_BF16, { M, n }), T(dq[0], RAD_I8, { M, n }), T(ds[0], RAD_F32, { M }),
+                                  T(nullptr, RAD_F32, {}) },
+                            { PI("M", M), PI("n", n), PI("group", n), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(fz, { T(dgu, RAD_BF16, { M, 2 * n }), T(dq[1], RAD_I8, { M, n }), T(ds[1], RAD_F32, { M }),
+                                  T(dy[1], RAD_BF16, { M, n }) },
+                            { PI("M", M), PI("n", n), PS("dtype", "bf16") });
+        const std::string what = "gelu_mul_quant_i8 M=" + std::to_string(M);
+        if (rc != RAD_OK) { ok((what + " vs gelu_mul + quant_act_i8").c_str(), false, "rc=" + std::to_string(rc)); continue; }
+        std::vector<uint16_t> y0((size_t)M * n), y1((size_t)M * n);
+        std::vector<uint8_t>  q0((size_t)M * n), q1((size_t)M * n);
+        std::vector<float>    s0((size_t)M), s1((size_t)M);
+        st_memcpy(y0.data(), dy[0], y0.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(y1.data(), dy[1], y1.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(q0.data(), dq[0], q0.size(), hipMemcpyDeviceToHost);
+        st_memcpy(q1.data(), dq[1], q1.size(), hipMemcpyDeviceToHost);
+        st_memcpy(s0.data(), ds[0], s0.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(s1.data(), ds[1], s1.size() * 4, hipMemcpyDeviceToHost);
+        int ny = 0, nq = 0, ns = 0, nz = 0;
+        for (size_t i = 0; i < y0.size(); ++i) ny += y0[i] != y1[i];
+        for (size_t i = 0; i < q0.size(); ++i) { nq += q0[i] != q1[i]; nz += q1[i] != 0; }
+        for (size_t i = 0; i < s0.size(); ++i) ns += std::memcmp(&s0[i], &s1[i], 4) != 0;
+        ok((what + " is byte-identical to gelu_mul + quant_act_i8").c_str(), ny == 0 && nq == 0 && ns == 0 && nz > (int)q1.size() / 2,
+           "bf16 differs " + std::to_string(ny) + ", codes " + std::to_string(nq) + ", scales " + std::to_string(ns) +
+           ", nonzero codes " + std::to_string(nz));
+    }
+}
+
 /* ---- qkv_norm_rope, against the five ops it replaces ------------------------------------------
  *
  * rmsnorm_p (v, or the raw k under v_from_k), rmsnorm over the q heads and over the k heads, then
@@ -13558,6 +13607,10 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
+    }
+    if (sel("gelu_mul_quant_i8")) {
+        if (!g_case) std::printf("\ngelu_mul_quant_i8, against the pair it replaces\n");
+        gelu_mul_quant_i8_numeric(pl);
     }
     if (sel("qkv_norm_rope_bf16")) {
         if (!g_case) std::printf("\nqkv_norm_rope, against the five ops it replaces\n");

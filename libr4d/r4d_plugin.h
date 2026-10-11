@@ -303,6 +303,8 @@ int r4d_rad_quant_act_i8          (const RadArgs*, RadStream);
 int r4d_rad_quant_act_i8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_qkv_norm_rope         (const RadArgs*, RadStream);
 int r4d_rad_qkv_norm_rope_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_gelu_mul_quant_i8     (const RadArgs*, RadStream);
+int r4d_rad_gelu_mul_quant_i8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_rmsnorm_quant_i8      (const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_quant_i8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_had_quant_act_i8      (const RadArgs*, RadStream);

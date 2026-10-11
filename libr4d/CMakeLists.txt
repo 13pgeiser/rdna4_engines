@@ -143,6 +143,7 @@ set(R4D_UNITS
   "r4d_quant_act_i8|"
   "r4d_rmsnorm_quant_i8|"
   "r4d_qkv_norm_rope|"
+  "r4d_gelu_mul_quant_i8|"
   "r4d_had_quant_act_i8|"
   "r4d_rmsnorm_had_quant_i8|"
   "r4d_ar_ln_had_quant_i8|"

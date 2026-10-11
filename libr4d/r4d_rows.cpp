@@ -1370,6 +1370,20 @@ static const RadOperandSpec oQkvNormRope[] = {
     { "k_w",       RAD_OPD_WEIGHT, 0 },
 };
 
+/* `gelu_mul_quant_i8` is `gelu_mul` with quant_act_i8's quantiser on its pass: the down projection
+ * input of a GELU-gated feed-forward on the w4a8 grid, byte-identical to the pair. */
+static const RadParamSpec pGeluMulQuantI8[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGeluMulQuantI8[] = {
+    { "gate_up",  RAD_OPD_IN,  0 },
+    { "q",        RAD_OPD_OUT, 0 },
+    { "scale",    RAD_OPD_OUT, 0 },
+    { "out_bf16", RAD_OPD_OUT, 1 },
+};
+
 static const RadParamSpec pGatedQuantFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -2366,6 +2380,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("qkv_norm_rope", pQkvNormRope, oQkvNormRope,
            "per-head q and k RMS norms, the weightless v norm and the rotary of q and k over separate "
            "q, k and v projections, in one dispatch; v from the raw k under v_from_k."),
+    SCHEMA("gelu_mul_quant_i8", pGeluMulQuantI8, oGeluMulQuantI8,
+           "gelu(gate) * up (tanh form) and the per-row int8 quantiser the w4a8 skinny GEMM reads, in "
+           "one pass."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
     SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
@@ -3228,6 +3245,9 @@ static const RadConstraint cRmsNormQuantI8[] = {
 /* head_dim 256 or 512: a workgroup is one head, a thread one channel. */
 static const RadConstraint cQkvNormRope[] = {
     C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cGeluMulQuantI8[] = {
+    C_DIV("n", 16), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cHadQuantActI8[] = {
     C_DIV("n", 16), C_DIV("n", 128), C_LE("group", 512), C_IN("dtype", "bf16"),
@@ -5636,6 +5656,16 @@ static const RadKernelInfo kKernels[] = {
   ROW(cQkvNormRope), NOTUNE,
   nullptr, nullptr, r4d_rad_qkv_norm_rope, nullptr, nullptr, nullptr,
   nullptr, nullptr, nullptr, r4d_rad_qkv_norm_rope_describe },
+
+{ "gelu_mul_quant_i8", "gelu_mul_quant_i8", "quant",
+  "gelu(gate) * up, the tanh form, and quant_act_i8's quantiser in one pass over the row",
+  "n a multiple of 16 and n*2 bytes within LDS; one workgroup per row",
+  "bf16 gate_up in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale, optional "
+  "bf16 out; the codes taken over the bf16-rounded product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGeluMulQuantI8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gelu_mul_quant_i8, nullptr, nullptr, nullptr,
+  nullptr, nullptr, nullptr, r4d_rad_gelu_mul_quant_i8_describe },
 
 { "had_quant_act_i8", "had_quant_act_i8", "quant",
   "block Hadamard along K then per-row symmetric int8 quantisation; the rotation is what makes "
