@@ -96,3 +96,87 @@ Constraints the shrink must respect (all enforced by pinned HF validation or obs
 MoE: `moe_router_gate`, `moe_norm_topk_prob`, `bf16_vs_f32_rounding`; dense: `dense_ffn_rounding`, `dense_gate_projection`.
 The exact requested seed is used (no seed search): tiny-moe and tiny-dense-dev at `--seed 3800` pass every control on torch 2.9.1+cpu, 1 thread.
 Dumps are bit-stable on one torch build/thread count; cross-build comparison should use BF16 unit roundoff (2^-7).
+
+## Exact KL quality method (`quality.py`)
+
+Teacher = the pinned **source checkpoint** (unquantized routed experts) executed by the layer-major source engine; metric =
+teacher-to-candidate full-vocabulary KL, nats per scored next-token position, temperature 1, no top-k/top-p/penalties. The
+canonical 17-token top-32 path (`--source-reference` / `--compare`, `hipfire.qwen4.quality.v1`) is unchanged and remains the
+regression; its top-32 uniform-tail `compare` is **not** the exact estimator. Do not subtract a floor KL from a candidate KL.
+
+### Corpus manifest `hipfire.qwen4.kl_corpus.v1`
+
+```json
+{"schema":"hipfire.qwen4.kl_corpus.v1","name":"pilot-v0","seed":1234,
+ "sequences":[
+  {"id":"text-000","stratum":"text","tokens":[...],"score_positions":[0,1,2],"reset":true,"meta":{"source":"..","half":0}},
+  {"id":"asst-000","stratum":"assistant","tokens":[...],"role_mask":[0,0,1,1,1],"score_range":[2,4]}]}
+```
+
+- `stratum` is `text` or `assistant`; every sequence is independent: all attention/conv/recurrent/PLE state starts at position 0 and
+  nothing crosses sequences (`reset` must be true/omitted; intra-sequence resets are not supported).
+- Scored items are **input positions** `p in [0, n-2]` predicting `tokens[p+1]`; the last token never has a target (rejected). Give
+  exactly one of `score_positions`, `score_mask` (n x {0,1}) or `score_range` `[start,end)`. Optional `targets` must equal `tokens[p+1]`.
+- `assistant` requires `role_mask` (1 = assistant content) and every scored target must be assistant content. `text` ignores it.
+- Large corpora may use `token_payload {path (relative), sha256}` (u32le) with per-sequence `offset`/`length` instead of `tokens`.
+- Optional `meta.half` (0/1) declares the predeclared split halves (default: alternating documents within a stratum).
+- Identity: per-sequence token / score-position / role-mask sha256 plus a `corpus_sha256` over them (names and `meta` excluded).
+
+### Commands
+
+Runtime limits (CPU mode, the default): `--threads <= 16`, `RLIMIT_AS <= 64 GiB` (`--memory-limit-gib`, default 64), niceness >= 10,
+CUDA/HIP hidden. Run pilots as `nice -n10 python quality.py ...` (the CLI also self-nices). `--device cuda[:N]` (ROCm uses `cuda`)
+disables the AS limit unless `--memory-limit-gib N>0` is given and records peak host RSS plus per-layer device peak instead; one decoder layer's
+weights and expert slices live on the device at a time. Always pass `--local-dir <source safetensors dir>` for a no-network run.
+
+```bash
+cd <worktree>/crates/hipfire-arch-qwen4/reference_oracle
+# CPU pilot: native + reverse-experts in lockstep over ONE weight traversal, then floor compare (+ native-vs-native zero check)
+nice -n10 $PY quality.py --exact-floor --corpus pilot.json --out-dir out/pilot --local-dir /data/qwen4-src --threads 16 --memory-limit-gib 64
+# GPU rental
+$PY quality.py --paired-floor --corpus pilot.json --out-dir out/pilot --local-dir /data/qwen4-src --device cuda --logits-storage bf16 --memory-limit-gib 0
+# single teacher export, then compare with any export of the same corpus (e.g. a candidate in the same layout)
+$PY quality.py --exact-export --corpus pilot.json --out-dir out/teacher --reduction-order native --local-dir /data/qwen4-src
+$PY quality.py --exact-compare --reference out/teacher/native --candidate out/cand --out out/ordinary.json --bootstrap 2000 --seed 20260101
+# paired per-position difference (e.g. ordinary minus teacher-ID-forced) from two compare outputs
+$PY quality.py --exact-paired --positions-a out/ordinary.positions.npz --positions-b out/forced.positions.npz --reference out/teacher/native --out out/paired.json
+$PY -I -m unittest test_quality_exact   # CPU-only unit tests (no checkpoint, no network)
+```
+
+Useful knobs: `--pass-tokens N` (default 0 = whole corpus in a single layer-major pass; every extra pass re-reads all weights),
+`--head-rows`, `--expert-cache-gib` (per-layer expert RAM/device cache cap, default 8), `--max-layers K` (timing/artifact probe only: the export is
+labelled `truncated_layers`, `--exact-floor` returns status `truncated_timing_probe_no_quality` and runs no floor/self comparison, and
+`--exact-compare` raises on any truncated export, so a partial layer prefix can never be imported as BF16 teacher quality), `--export-hidden`, `--no-hash-files`, `--remote-byte-budget-gb` /
+`--stream-disk-gb` (forwarded to the shared checkpoint reader), `--corpus canonical` (the 17-token sequence through the exact path).
+
+### Outputs (`out-dir/<reduction-order>/`)
+
+| file | content |
+|---|---|
+| `score_index.u32le` | `[N,3]` `(sequence, input position, target token)` per scored row, corpus order |
+| `logits.f32le` / `logits.bf16le` | `[N,V]` actual forward logits; bf16 stores the forward's own bf16 words (accepted only if the head matmul dtype is bfloat16 and the F32 widening round-trips bit-exactly; the scorer widens exactly) |
+| `route_ids.u16le`, `route_scores.f32le` | `[L,P,K]` layer-major tapes over **all** input positions (`P` = corpus input tokens, sequences concatenated in corpus order): ordered expert IDs and F32 router scores captured once per routed forward through the `route_sink` |
+| `final_hidden.<dtype>le` | optional `[N,H]` final hidden rows (`--export-hidden`) |
+| `export.json` | `identity` (corpus hashes, source/operator provenance incl. variant AST + diff hash, device/torch/HIP versions, file shapes + sha256) with `identity_sha256`, and `runtime` (see below) |
+
+`--exact-floor` also writes `floor_native_vs_reverse.json` / `.positions.npz` and `floor_self_native.json` (zero sanity). Compare reports
+hold, per `text`, `assistant` and the equal-weight `mixture` (0.5 text + 0.5 assistant): mean KL with a **document-bootstrap** 95% CI
+(independent fixed-seed generator per stratum, >= 100 replicates, 2000 default), p50/p95/p99, teacher/candidate NLL + PPL, NLL delta, top-1 agreement,
+teacher top-1 = target, routing agreement (exact ordered / set overlap), context-length strata, split-half agreement and the **stability
+gate** (CI half-width <= 0.002 nat, and <= 5% of the mean once the mean >= 0.02). Per-position values (KL, NLL, top-1, route agreement) are
+persisted in the `.positions.npz`.
+
+### Exactness
+
+KL is computed in float64 from the actual logits with one streamed online pass over vocabulary blocks: `KL = W/S - (lse_T - lse_C)` with
+`W = sum exp(a-m_T)(a-b)`, `S = sum exp(a-m_T)`; nothing is rounded or clipped, non-finite logits fail, and a KL below `-1e-9` raises rather
+than being clamped. Identical logits give exactly 0; `test_quality_exact.py` checks the toy distribution, extremes, block sizes, bf16 storage
+and NLL against independent recomputations.
+
+### Runtime artifacts
+
+`export.json:runtime.timing` has per-layer wall, I/O (fetch + decode + host-to-device) and arithmetic seconds, input tokens/s per variant,
+bytes read and expert hits/misses, current and peak RSS, per-layer device peak/allocated/reserved bytes (GPU), head seconds, the checkpoint reader's
+`transfer_stats`/`coverage_report`, and `projection_327680` (I/O charged per pass, arithmetic per forwarded token per variant; an estimate that
+ignores superlinear attention growth). Lockstep variants share one set of timings. CUDA timings synchronize before every clock read.
+Not implemented here: teacher-ID-forced replay (`--exact-paired` only compares existing per-position outputs) and MTP.
