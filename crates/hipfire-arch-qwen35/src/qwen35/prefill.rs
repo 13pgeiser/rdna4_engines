@@ -548,29 +548,89 @@ fn try_gfx12_rmsnorm_quant_fused_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 MQ4v2 FP8-WMMA consumer family fed by an FP8-stream producer.
+/// The family's `HIPFIRE_GFX12_MQ4V2_FP8_*` opt-out decides the activation
+/// format of both halves of the producer/consumer pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fp8StreamConsumer {
+    /// LA 4-way qkvza (`HIPFIRE_GFX12_MQ4V2_FP8_QKVZA`).
+    Qkvza,
+    /// FFN gate/up (`HIPFIRE_GFX12_MQ4V2_FP8_GATEUP`).
+    GateUp,
+    /// FA 3-way qkv (`HIPFIRE_GFX12_MQ4V2_FP8_QKV`).
+    Qkv,
+    /// Down / out-proj residual (`HIPFIRE_GFX12_MQ4V2_FP8_RESID`).
+    Residual,
+}
+
+/// Whether `consumer` over weights `dtypes` takes the FP8 prepared route.
+/// An admitted FP8-stream producer emits only the FP8 planes (in-register
+/// producers leave the f32 `x_rot` unwritten), so it may run only when this
+/// holds. Uniform MQ4G256V2 consumers have an F16 route behind their family
+/// flag (gate/up also behind the `HIPFIRE_HFQ4G256_LDSSTAGE` WMMA); Lloyd
+/// consumers are FP8-only, so the family flags never route them elsewhere.
+/// Mixed or non-MQ4v2 sets have no FP8 prepared consumer.
+fn fp8_stream_consumer_takes_fp8(
+    flags: &rdna_compute::FeatureFlags,
+    consumer: Fp8StreamConsumer,
+    dtypes: &[DType],
+) -> bool {
+    if dtypes.is_empty() {
+        return false;
+    }
+    if all_mq4v2_lloyd(dtypes) {
+        return true;
+    }
+    if !dtypes.iter().all(|d| *d == DType::MQ4G256V2) {
+        return false;
+    }
+    match consumer {
+        Fp8StreamConsumer::Qkvza => flags.gfx12_mq4v2_fp8_qkvza,
+        Fp8StreamConsumer::GateUp => {
+            flags.gfx12_mq4v2_fp8_gateup && !flags.hfq4g256_ldsstage_wmma
+        }
+        Fp8StreamConsumer::Qkv => flags.gfx12_mq4v2_fp8_qkv,
+        Fp8StreamConsumer::Residual => flags.gfx12_mq4v2_fp8_resid,
+    }
+}
+
+/// Single admission for every gfx1201 FP8-stream producer and for each
+/// decision that anticipates one (gate/up h epilogue, FA gate in place, GDN
+/// scan-out format): the consumer takes FP8 and the per-call
+/// `fp8_stream_active` gate holds.
+fn gfx12_fp8_stream_admitted(
+    gpu: &Gpu,
+    consumer: Fp8StreamConsumer,
+    dtypes: &[DType],
+    n: usize,
+    k: usize,
+) -> bool {
+    fp8_stream_consumer_takes_fp8(&gpu.flags, consumer, dtypes) && gpu.fp8_stream_active(n, k)
+}
+
 /// gfx1201 FP8-stream: RMSNorm/FWHT producer that emits byte-identical
-/// `prepare_mq4v2_fp8_x_f32` (scale_mode=1) planes for Lloyd-weight fp8
-/// GEMMs. `None` → caller keeps the incumbent producer + standalone-pack
-/// path. Admission is uniform `MQ4G256V2Lloyd` next-linear plus the shared
-/// `fp8_stream_active` gate (exact gfx1201, eager, batch >= 64,
-/// K % 256 == 0; partial N tiles are masked in-kernel, so odd tails run
-/// unpadded). On `HIPFIRE_FP8_PROD_INREG=1` the producer leaves `x_rot`
-/// untouched; the admitted consumer reads only the prepared FP8 planes.
+/// `prepare_mq4v2_fp8_x_f32` (scale_mode=1) planes for the `consumer`
+/// projection over `consumer_dtypes`. `None` → caller keeps the incumbent
+/// producer + standalone-pack path. Admission is
+/// [`gfx12_fp8_stream_admitted`] (consumer takes FP8; exact gfx1201, eager,
+/// batch >= 64, K % 256 == 0; partial N tiles are masked in-kernel, so odd
+/// tails run unpadded). On `HIPFIRE_FP8_PROD_INREG=1` the producer leaves
+/// `x_rot` untouched; the admitted consumer reads only the prepared FP8
+/// planes.
+#[allow(clippy::too_many_arguments)]
 fn try_gfx12_fp8_stream_rmsnorm_prepared(
     gpu: &mut Gpu,
     x: &GpuTensor,
     norm_weight: &GpuTensor,
     next_linear: &hipfire_runtime::llama::WeightTensor,
+    consumer: Fp8StreamConsumer,
+    consumer_dtypes: &[DType],
     x_rot: &GpuTensor,
     k: usize,
     eps: f32,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
-    if !matches!(
-        next_linear.gpu_dtype,
-        DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
-    ) || !gpu.fp8_stream_active(n, k)
-    {
+    if !gfx12_fp8_stream_admitted(gpu, consumer, consumer_dtypes, n, k) {
         return Ok(None);
     }
     let prep = gpu.fused_rmsnorm_rotate_mq_fp8_gfx12_batched(
@@ -599,9 +659,7 @@ fn try_gfx12_fp8_stream_silu_prepared(
     n: usize,
     h_ready: bool,
 ) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
-    if !matches!(w_down.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
-        || !gpu.fp8_stream_active(n, k)
-    {
+    if !gfx12_fp8_stream_admitted(gpu, Fp8StreamConsumer::Residual, &[w_down.gpu_dtype], n, k) {
         return Ok(None);
     }
     let prep = if h_ready {
@@ -711,9 +769,7 @@ fn try_gfx12_fp8_stream_sigmoid_prepared(
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
-    if !matches!(wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
-        || !gpu.fp8_stream_active(n, k)
-    {
+    if !gfx12_fp8_stream_admitted(gpu, Fp8StreamConsumer::Residual, &[wo.gpu_dtype], n, k) {
         return Ok(None);
     }
     let prep =
@@ -823,10 +879,9 @@ fn gfx12_fp8_stream_gdn_admitted(
     k: usize,
     n: usize,
 ) -> bool {
-    matches!(wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
-        && head_dim == 128
+    head_dim == 128
         && n_heads * head_dim == k
-        && gpu.fp8_stream_active(n, k)
+        && gfx12_fp8_stream_admitted(gpu, Fp8StreamConsumer::Residual, &[wo.gpu_dtype], n, k)
 }
 
 /// gfx1201 FP8-stream LA output producer.  Replaces gated_norm + AWQ/FWHT
@@ -5776,6 +5831,13 @@ fn batch_chunk_delta_net_input_projection(
                 &pbs.x_batch,
                 &layer.attn_norm,
                 &layer.wqkv,
+                Fp8StreamConsumer::Qkvza,
+                &[
+                    layer.wqkv.gpu_dtype,
+                    layer.wz.gpu_dtype,
+                    layer.w_beta.gpu_dtype,
+                    layer.w_alpha.gpu_dtype,
+                ],
                 &pbs.x_rot_batch,
                 dim,
                 config.norm_eps,
@@ -6151,7 +6213,8 @@ fn batch_chunk_delta_net_input_projection(
         && layer.wz.gpu_dtype == DType::MQ4G256V2
         && layer.w_beta.gpu_dtype == DType::MQ4G256V2
         && layer.w_alpha.gpu_dtype == DType::MQ4G256V2
-        && gpu.flags.gfx12_mq4v2_fp8_qkvza
+        // Producer admission already required the QKVZA family to take FP8
+        // (`gfx12_fp8_stream_admitted`); fp8_prep must be consumed here.
         && fp8_prep.is_some()
     {
         // gfx1201 FP8-stream (uniform): the producer already emitted the
@@ -7526,6 +7589,8 @@ fn batch_chunk_delta_net_ffn_gate_up(
                 &pbs.x_batch,
                 &layer.ffn_norm,
                 &layer.w_gate,
+                Fp8StreamConsumer::GateUp,
+                &[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype],
                 &pbs.x_rot_batch,
                 dim,
                 config.norm_eps,
@@ -7805,8 +7870,8 @@ fn batch_chunk_delta_net_ffn_gate_up(
         ));
     } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
         && layer.w_up.gpu_dtype == DType::MQ4G256V2
-        && gpu.flags.gfx12_mq4v2_fp8_gateup
-        && !gpu.flags.hfq4g256_ldsstage_wmma
+        // Producer admission already required the gate/up family to take
+        // FP8 (`gfx12_fp8_stream_admitted`); fp8_prep must be consumed here.
         && fp8_prep.is_some()
     {
         // gfx1201 FP8-stream (uniform): the producer already emitted the
@@ -7816,7 +7881,13 @@ fn batch_chunk_delta_net_ffn_gate_up(
         // producer-side ordering: fp8_prep implies iu4_prep is None).
         let silu_h = gpu.fp8_silu_h_active(n, layer.w_gate.k, layer.w_gate.m, layer.w_up.m)
             && layer.w_down.gpu_dtype == DType::MQ4G256V2
-            && gpu.fp8_stream_active(n, layer.w_down.k);
+            && gfx12_fp8_stream_admitted(
+                gpu,
+                Fp8StreamConsumer::Residual,
+                &[layer.w_down.gpu_dtype],
+                n,
+                layer.w_down.k,
+            );
         gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
             &layer.w_gate.buf,
             &layer.w_up.buf,
@@ -8329,6 +8400,8 @@ fn batch_chunk_full_attn_input_projection(
                 &pbs.x_batch,
                 &layer.attn_norm,
                 &layer.wq,
+                Fp8StreamConsumer::Qkv,
+                &[layer.wq.gpu_dtype, layer.wk.gpu_dtype, layer.wv.gpu_dtype],
                 &pbs.x_rot_batch,
                 dim,
                 config.norm_eps,
@@ -8604,7 +8677,8 @@ fn batch_chunk_full_attn_input_projection(
     } else if layer.wq.gpu_dtype == DType::MQ4G256V2
         && layer.wk.gpu_dtype == DType::MQ4G256V2
         && layer.wv.gpu_dtype == DType::MQ4G256V2
-        && gpu.flags.gfx12_mq4v2_fp8_qkv
+        // Producer admission already required the QKV family to take FP8
+        // (`gfx12_fp8_stream_admitted`); fp8_prep must be consumed here.
         && fp8_prep.is_some()
     {
         // gfx1201 FP8-stream (uniform): the producer already emitted the
@@ -9724,16 +9798,21 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // gate in place: the gfx1201 IU4 AWQ producer (A4, unless
     // `HIPFIRE_A4_FA_GATE_IL=0`) or the FP8-stream producer. Mirrors their
     // admission: A8 is excluded by `iu4_producer_quant_fused_active` /
-    // `fp8_stream_active`, the IU4 producer is tried first and the gfx11
+    // `gfx12_fp8_stream_admitted` (which also honours the residual family
+    // opt-out), the IU4 producer is tried first and the gfx11
     // fusion only after it; gfx1100 S4 needs `gfx12_fa_prep`'s gfx1201 false.
     let fa_gate_in_place = gfx12_fa_prep_fp8q
         && layer.wo.k == q_dim
         && if gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue) {
             a4_fa_gate_in_place_enabled()
         } else {
-            matches!(layer.wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
-                && gpu.fp8_stream_active(n, layer.wo.k)
-                && !gpu.iu4_producer_quant_fused_active(n, layer.wo.k)
+            gfx12_fp8_stream_admitted(
+                gpu,
+                Fp8StreamConsumer::Residual,
+                &[layer.wo.gpu_dtype],
+                n,
+                layer.wo.k,
+            ) && !gpu.iu4_producer_quant_fused_active(n, layer.wo.k)
         };
     // A4 attention epilogue: when the gate stays in place for the gfx1201 IU4
     // AWQ sigmoid producer on the slab route, the fp8q attention itself
@@ -10011,6 +10090,8 @@ fn batch_chunk_full_attn_ffn_gate_up(
                 &pbs.x_batch,
                 &layer.ffn_norm,
                 &layer.w_gate,
+                Fp8StreamConsumer::GateUp,
+                &[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype],
                 &pbs.x_rot_batch,
                 dim,
                 config.norm_eps,
@@ -10286,8 +10367,8 @@ fn batch_chunk_full_attn_ffn_gate_up(
         ));
     } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
         && layer.w_up.gpu_dtype == DType::MQ4G256V2
-        && gpu.flags.gfx12_mq4v2_fp8_gateup
-        && !gpu.flags.hfq4g256_ldsstage_wmma
+        // Producer admission already required the gate/up family to take
+        // FP8 (`gfx12_fp8_stream_admitted`); fp8_prep must be consumed here.
         && fp8_prep.is_some()
     {
         // gfx1201 FP8-stream (uniform): the producer already emitted the
@@ -10297,7 +10378,13 @@ fn batch_chunk_full_attn_ffn_gate_up(
         // producer-side ordering: fp8_prep implies iu4_prep is None).
         let silu_h = gpu.fp8_silu_h_active(n, layer.w_gate.k, layer.w_gate.m, layer.w_up.m)
             && layer.w_down.gpu_dtype == DType::MQ4G256V2
-            && gpu.fp8_stream_active(n, layer.w_down.k);
+            && gfx12_fp8_stream_admitted(
+                gpu,
+                Fp8StreamConsumer::Residual,
+                &[layer.w_down.gpu_dtype],
+                n,
+                layer.w_down.k,
+            );
         gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
             &layer.w_gate.buf,
             &layer.w_up.buf,
@@ -14358,6 +14445,71 @@ mod tests {
         routed_codebook_grouped_supported, routed_uniform_mqv2_grouped_supported, MoePrefillDtypes,
     };
     use rdna_compute::DType;
+
+    /// ECSQ-5 §6 regression: `HIPFIRE_IU4_PREFILL=0` plus
+    /// `HIPFIRE_GFX12_MQ4V2_FP8_{GATEUP,RESID,QKVZA,QKV}=0` gave WT2 KLD 11.74
+    /// because the FP8-stream producers (gated only on
+    /// `HIPFIRE_GFX12_FP8_STREAM`) still emitted FP8-only planes for consumers
+    /// that had moved to F16 and read the unwritten `x_rot`. Every subset of
+    /// family opt-outs must disable exactly its own producers.
+    #[test]
+    fn fp8_stream_producer_follows_consumer_family_opt_out() {
+        use Fp8StreamConsumer::*;
+        const U: DType = DType::MQ4G256V2;
+        const L: DType = DType::MQ4G256V2Lloyd;
+        let families: [(Fp8StreamConsumer, &[DType]); 4] = [
+            (Qkvza, &[U, U, U, U]),
+            (GateUp, &[U, U]),
+            (Qkv, &[U, U, U]),
+            (Residual, &[U]),
+        ];
+        for mask in 0u8..16 {
+            for v2 in [true, false] {
+                let mut f = rdna_compute::FeatureFlags::for_test("gfx1201");
+                f.gfx12_fp8_stream = true;
+                f.gfx12_mq4v2_fp8_v2 = v2;
+                f.gfx12_mq4v2_fp8_qkvza = mask & 1 != 0;
+                f.gfx12_mq4v2_fp8_gateup = mask & 2 != 0;
+                f.gfx12_mq4v2_fp8_qkv = mask & 4 != 0;
+                f.gfx12_mq4v2_fp8_resid = mask & 8 != 0;
+                for (consumer, dtypes) in families {
+                    let consumer_fp8 = match consumer {
+                        Qkvza => f.gfx12_mq4v2_fp8_qkvza,
+                        GateUp => f.gfx12_mq4v2_fp8_gateup,
+                        Qkv => f.gfx12_mq4v2_fp8_qkv,
+                        Residual => f.gfx12_mq4v2_fp8_resid,
+                    };
+                    assert_eq!(
+                        fp8_stream_consumer_takes_fp8(&f, consumer, dtypes),
+                        consumer_fp8,
+                        "mask={mask:04b} v2={v2} consumer={consumer:?}"
+                    );
+                    // Lloyd consumers are FP8-only: the family flags never
+                    // move them to F16, so the producer stays admitted.
+                    let lloyd = vec![L; dtypes.len()];
+                    assert!(fp8_stream_consumer_takes_fp8(&f, consumer, &lloyd));
+                }
+            }
+        }
+        // Default gfx1201 route (all families on) is unchanged.
+        let mut on = rdna_compute::FeatureFlags::for_test("gfx1201");
+        on.gfx12_mq4v2_fp8_qkvza = true;
+        on.gfx12_mq4v2_fp8_gateup = true;
+        on.gfx12_mq4v2_fp8_qkv = true;
+        on.gfx12_mq4v2_fp8_resid = true;
+        for (consumer, dtypes) in families {
+            assert!(fp8_stream_consumer_takes_fp8(&on, consumer, dtypes), "{consumer:?}");
+        }
+        // gate/up under the LDS-stage WMMA has no FP8 prepared consumer.
+        on.hfq4g256_ldsstage_wmma = true;
+        assert!(!fp8_stream_consumer_takes_fp8(&on, GateUp, &[U, U]));
+        assert!(fp8_stream_consumer_takes_fp8(&on, Residual, &[U]));
+        // Mixed, non-MQ4v2, or empty weight sets never admit a producer.
+        assert!(!fp8_stream_consumer_takes_fp8(&on, Qkvza, &[U, U, U, DType::Q8_0]));
+        assert!(!fp8_stream_consumer_takes_fp8(&on, GateUp, &[U, L]));
+        assert!(!fp8_stream_consumer_takes_fp8(&on, Residual, &[DType::MQ4G256]));
+        assert!(!fp8_stream_consumer_takes_fp8(&on, Residual, &[]));
+    }
 
     #[test]
     fn packed_mq4_ffn_gate_up_route_is_exact_and_opt_in() {
