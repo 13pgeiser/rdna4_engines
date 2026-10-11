@@ -13700,6 +13700,7 @@ static void device_phase(const Plugin& pl) {
      * at every one of the 128 sites, and the generated text is compared byte for byte against a
      * build that issues the pair instead. */
     skip_pair("ar_rmsnorm_quant_fp8", "two-rank fusion: needs a peer rank");
+    skip_pair("ar_rmsnorm_quant_i8", "two-rank fusion: needs a peer rank");
 
     dfree_all();
 }

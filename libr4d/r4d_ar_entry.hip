@@ -1231,6 +1231,62 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
+/* THE ALL-REDUCE AND THE SANDWICH-NORM JUNCTION AFTER IT, int8 out: `all_reduce` (exact) of `x`, then
+ * `rmsnorm_quant_i8` -- post-norm of the reduced x, the residual add, the scalar, the norm and the
+ * per-row int8 quantiser the w4a8 skinny GEMM reads. Operands are rmsnorm_quant_i8's with `x`
+ * INOUT, because it is the message and the reduced sum lands back in it. The exact wire only: a
+ * deployment that allows the lossy one keeps the standalone all-reduce. Width and block count as
+ * ar_rmsnorm_quant_fp8 resolves them, for the same reasons: the norm's width from M, one block a
+ * row. */
+enum { AQ8_X = 0, AQ8_RES, AQ8_W, AQ8_Q, AQ8_S, AQ8_Y, AQ8_WP, AQ8_SC };
+
+extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+    const RadTensor* x  = r4d_opt(a, AQ8_X);
+    const RadTensor* rs = r4d_opt(a, AQ8_RES);
+    const RadTensor* w  = r4d_opt(a, AQ8_W);
+    const RadTensor* q  = r4d_opt(a, AQ8_Q);
+    const RadTensor* sc = r4d_opt(a, AQ8_S);
+    const RadTensor* ob = r4d_opt(a, AQ8_Y);
+    const RadTensor* wp = r4d_opt(a, AQ8_WP);
+    const RadTensor* sl = r4d_opt(a, AQ8_SC);
+    if (!x || !w || !q || !sc) return RAD_E_INVAL;
+    if ((wp || sl) && !rs) return RAD_E_INVAL;
+    if (!r4d_contig(w) || (wp && !r4d_contig(wp))) return RAD_E_STRIDE;
+    if (x->dtype != RAD_BF16 || q->dtype != RAD_I8 || sc->dtype != RAD_F32) return RAD_E_DTYPE;
+    long long M = 0, K = 0;
+    if (r4d_rows_of(x, &M, &K) != RAD_OK) return RAD_E_SHAPE;
+    if (M * K > in->max_numel) return RAD_E_SHAPE;
+    if (K % 16) return RAD_E_SHAPE;
+    if (r4d_numel(w) != K || (w->dtype != RAD_F32 && w->dtype != RAD_BF16)) return RAD_E_DTYPE;
+    if (wp && (r4d_numel(wp) != K || wp->dtype != w->dtype)) return RAD_E_SHAPE;
+    if (sl && (r4d_numel(sl) != 1 || (sl->dtype != RAD_F32 && sl->dtype != RAD_BF16))) return RAD_E_SHAPE;
+    if (r4d_numel(q) != M * K || !r4d_contig(q)) return RAD_E_SHAPE;
+    if (r4d_numel(sc) != M || !r4d_contig(sc)) return RAD_E_SHAPE;
+    if (ob && r4d_numel(ob) != M * K) return RAD_E_SHAPE;
+    if (rs && r4d_numel(rs) != M * K) return RAD_E_SHAPE;
+    const long long xp = r4d_row_pitch(x), yp = ob ? r4d_row_pitch(ob) : 0, rp = rs ? r4d_row_pitch(rs) : 0;
+    if (xp != K || yp < 0 || rp < 0) return RAD_E_STRIDE;   /* x is the message: tight */
+    if (r4d_geti_or(a, "wire", 0) != 0) return RAD_E_INVAL;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : (int)M;
+    if (nblocks > (int)M) nblocks = (int)M;
+    if (nblocks > 256) nblocks = 256;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    if (nblocks < 1) nblocks = 1;
+    const int e = r4d_ar_rmsnorm_quant_i8(
+        in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
+        in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(wp), r4d_addr(sl),
+        sl ? (sl->dtype == RAD_F32) : 0, r4d_addr(ob), r4d_addr(q), r4d_addr(sc), (int)M, (int)K,
+        (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0), w->dtype == RAD_F32,
+        (int)rp, (int)yp, (long)(uintptr_t)s, nblocks, cfgv.drain, cfgv.acq);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
 /* THE ALL-REDUCE WITH THE GATED RESIDUAL'S WRITE IN IT: `all_reduce` of `y` and then `hc_write`
  * of the reduced `y` into `h`, one kernel. A block whose output feeds a hyper-connection write
  * skips its own collective when this runs, and the write carries it.

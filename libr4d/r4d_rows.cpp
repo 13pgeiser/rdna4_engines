@@ -1384,6 +1384,27 @@ static const RadOperandSpec oGeluMulQuantI8[] = {
     { "out_bf16", RAD_OPD_OUT, 1 },
 };
 
+/* `ar_rmsnorm_quant_i8` is rmsnorm_quant_i8 with the two-rank exact all-reduce of `x` in front:
+ * same operands, `x` INOUT because the reduced sum lands back in it, plus `world_size`. */
+static const RadParamSpec pArRmsNormQuantI8[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "n",          RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "world_size", RAD_P_INT, RAD_REQUIRED },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
+};
+static const RadOperandSpec oArRmsNormQuantI8[] = {
+    { "x",        RAD_OPD_INOUT,  0 },
+    { "residual", RAD_OPD_INOUT,  1 },
+    { "w",        RAD_OPD_WEIGHT, 0 },
+    { "q",        RAD_OPD_OUT,    0 },
+    { "scale",    RAD_OPD_OUT,    0 },
+    { "out_bf16", RAD_OPD_OUT,    1 },
+    { "w_post",   RAD_OPD_WEIGHT, 1 },
+    { "scalar",   RAD_OPD_WEIGHT, 1 },
+};
+
 static const RadParamSpec pGatedQuantFp8[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
@@ -2383,6 +2404,8 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("gelu_mul_quant_i8", pGeluMulQuantI8, oGeluMulQuantI8,
            "gelu(gate) * up (tanh form) and the per-row int8 quantiser the w4a8 skinny GEMM reads, in "
            "one pass."),
+    SCHEMA("ar_rmsnorm_quant_i8", pArRmsNormQuantI8, oArRmsNormQuantI8,
+           "the two-rank exact all-reduce of x and rmsnorm_quant_i8 after it, in one kernel."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
     SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
@@ -3248,6 +3271,10 @@ static const RadConstraint cQkvNormRope[] = {
 };
 static const RadConstraint cGeluMulQuantI8[] = {
     C_DIV("n", 16), C_IN("dtype", "bf16"),
+};
+/* x is the message, pushed as 16B words, and the row is staged in LDS for the fragment store. */
+static const RadConstraint cArRmsNormQuantI8[] = {
+    C_DIV("n", 16), C_IN("dtype", "bf16"), C_EQ("world_size", 2), C_P2P,
 };
 static const RadConstraint cHadQuantActI8[] = {
     C_DIV("n", 16), C_DIV("n", 128), C_LE("group", 512), C_IN("dtype", "bf16"),
@@ -5666,6 +5693,17 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGeluMulQuantI8), NOTUNE,
   nullptr, nullptr, r4d_rad_gelu_mul_quant_i8, nullptr, nullptr, nullptr,
   nullptr, nullptr, nullptr, r4d_rad_gelu_mul_quant_i8_describe },
+
+{ "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8", "quant",
+  "the two-rank exact all-reduce and the junction after it -- post-norm of the reduced sum, residual "
+  "add, scalar, RMS norm and quant_act_i8's quantiser -- in one kernel",
+  "exactly 2 ranks; n a multiple of 16, x unpitched (it is the message); one block a row; exact wire",
+  "bf16 in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale; the reduced sum "
+  "rounded to bf16 as the standalone exact all-reduce stores it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArRmsNormQuantI8), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_quant_i8, nullptr, nullptr, nullptr,
+  nullptr },
 
 { "had_quant_act_i8", "had_quant_act_i8", "quant",
   "block Hadamard along K then per-row symmetric int8 quantisation; the rotation is what makes "

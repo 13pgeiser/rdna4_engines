@@ -798,6 +798,15 @@ int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flag
                               long loc_pack, long loc_scale_off);
 int  r4d_ar_rmsnorm_quant_fp8_chunk_elems(void);
 
+// The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of the
+// reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8 GEMM's
+// per-row int8 quantiser. Exact wire only; `x` is the message and takes no pitch.
+int  r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
+                             long seq_ctrs, long slot_stride16, long x, long res, long w, long wp,
+                             long sc, int sc_f32, long y, long q, long s, int M, int n, float eps,
+                             float wadd, int w_f32, int r_ld, int y_ld, long stream, int nblocks,
+                             int drain, int acq);
+
 // ---- sampling ----------------------------------------------------------------------------------
 //
 // One workgroup a position: temperature, softmax, top_k, top_p, min_p, renormalise and the draw, in
