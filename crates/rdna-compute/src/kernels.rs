@@ -4260,7 +4260,7 @@ pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen
 /// `gemv_mq6g256v2_x4_xbatch_pm`, `gemv_q8_0_k8_xbatch_pm` and
 /// `gemv_q8_0_k320_xbatch_pm` (`crate::lane_rows_pm`). Routed from the four
 /// incumbent rows launchers only inside the lane step (typed flag
-/// `fn_lane_pm_rows`, default off).
+/// `fn_lane_pm_rows`, gfx1151 default on, `0` kills it).
 /// SHA-256 pin: [`QWEN4_LANE_ROWS_PM_GFX1151_SHA256`]
 /// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
 pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_lane_rows_pm_gfx1151.hxaco");

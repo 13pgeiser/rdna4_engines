@@ -604,8 +604,8 @@ pub struct FeatureFlags {
     pub fn_gdn_dense_scan: bool,
     /// Flash-Next lane-step PeaceMaker row kernels (`HIPFIRE_FN_LANE_PM_ROWS`):
     /// multi-column GEMVs that keep every column byte-identical to the 1-row
-    /// incumbent while sharing activation loads across weight rows. Developer
-    /// opt-in, default off; exact gfx1151 and the lane step only.
+    /// incumbent while sharing activation loads across weight rows. Default on
+    /// for gfx1151 (`0` is the kill switch); exact gfx1151 and the lane step only.
     pub fn_lane_pm_rows: bool,
 }
 
@@ -1055,7 +1055,7 @@ impl FeatureFlags {
             select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
-            fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(false),
+            fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
         }
     }
 
@@ -1118,7 +1118,7 @@ impl FeatureFlags {
     }
 
     /// Flash-Next lane step: the gfx1151 PeaceMaker multi-column row kernels
-    /// (`HIPFIRE_FN_LANE_PM_ROWS`, default off). Exact gfx1151 only; the
+    /// (`HIPFIRE_FN_LANE_PM_ROWS`, gfx1151: on unless `0`). Exact gfx1151 only; the
     /// runtime additionally requires the lane-step scope
     /// ([`crate::Gpu::lane_rows_pm_enabled`]).
     pub fn fn_lane_pm_rows_enabled(&self) -> bool {
@@ -1509,10 +1509,10 @@ mod tests {
         }
     }
 
-    /// The lane-rows PM kernels are a developer opt-in: unset / `0` is off,
-    /// `1` admits them on exact gfx1151 only.
+    /// The lane-rows PM kernels default on for exact gfx1151 only: `0` is the
+    /// kill switch, and no other arch admits them whatever the variable says.
     #[test]
-    fn fn_lane_pm_rows_is_opt_in_and_exact_gfx1151() {
+    fn fn_lane_pm_rows_defaults_on_exact_gfx1151_and_zero_kills() {
         for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201"] {
             let flags = |raw: Option<&str>| {
                 FeatureFlags::from_lookup(arch, |name| match raw {
@@ -1520,7 +1520,7 @@ mod tests {
                     _ => Err(()),
                 })
             };
-            assert!(!flags(None).fn_lane_pm_rows_enabled(), "{arch}: unset");
+            assert_eq!(flags(None).fn_lane_pm_rows_enabled(), arch == "gfx1151", "{arch}: unset");
             assert!(!flags(Some("0")).fn_lane_pm_rows_enabled(), "{arch}: 0");
             assert_eq!(flags(Some("1")).fn_lane_pm_rows_enabled(), arch == "gfx1151", "{arch}: 1");
         }

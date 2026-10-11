@@ -1072,7 +1072,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-lane-rows-pm",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS=1 (default off), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes) and `!is_recording() && !capture_mode`",
+        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS (gfx1151 default on, 0 kills), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes) and `!is_recording() && !capture_mode`",
         effect: KernelSelection,
         switches: "eager lane step: qwen4_lane_rows_pm (gemv_mq6g256v2_xbatch_pm, its x4 form, gemv_q8_0_k8_xbatch_pm, gemv_q8_0_k320_xbatch_pm) at rows 2..=8; recorded: incumbent rows kernels",
         kernels: &["gemm_mq6g256v2_f32_rows", "gemm_mq6g256v2_f32_rows_x4", "gemv_q8_0_k8_rows", "gemv_q8_0_staged_rows"],
