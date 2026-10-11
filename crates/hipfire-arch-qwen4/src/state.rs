@@ -768,22 +768,25 @@ impl Qwen4StateSnapshotArena {
         {
             return Err(StateError::SnapshotShape);
         }
+        // Compare the tensors' own extents (numel, dtype, byte_size), never
+        // `buf.size()`: a pooled allocation may hand back a larger buffer of
+        // the same power-of-2 bucket, and the ring views the GDN states move
+        // to are exact, so two equal-shaped tensors can differ in buffer size.
+        // Every region copy is `byte_size()` long.
         for (layer, backup) in state.gdn.iter().zip(&self.recurrent) {
-            if backup.numel() != layer.recurrent.numel()
-                || backup.buf.size() != layer.recurrent.buf.size()
-            {
+            if backup.numel() != layer.recurrent.numel() || backup.dtype != layer.recurrent.dtype {
                 return Err(StateError::SnapshotShape);
             }
         }
         for (layer, backup) in state.gdn.iter().zip(&self.conv) {
-            if backup.numel() != layer.conv.numel() || backup.buf.size() != layer.conv.buf.size() {
+            if backup.numel() != layer.conv.numel() || backup.dtype != layer.conv.dtype {
                 return Err(StateError::SnapshotShape);
             }
         }
         for (index, layer) in state.qsa.iter().enumerate() {
             if self.qsa_partial_keys[index].numel() != layer.partial_keys.numel()
                 || self.qsa_partial_values[index].numel() != layer.partial_values.numel()
-                || self.qsa_selected[index].buf.size() != layer.selected_indices.buf.size()
+                || self.qsa_selected[index].byte_size() != layer.selected_indices.byte_size()
             {
                 return Err(StateError::SnapshotShape);
             }
