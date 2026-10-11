@@ -4464,8 +4464,8 @@ pub(crate) fn iu4_verify_scoped<T>(
 /// HIP-graph capture/replay and eager arms and the lm_head enqueue, and is
 /// closed on every path. A tree verify never opens it.
 ///
-/// `HIPFIRE_DFLASH_IU4_VERIFY` (numerics opt-in, default off; mutually
-/// exclusive with `HIPFIRE_CB_VERIFY_FP8`, refused at load): a chain verify
+/// DFlash IU4 verify (the load's decision: default on at `dflash_block` 8,
+/// `HIPFIRE_CB_VERIFY_IU4` forces/kills; never with `HIPFIRE_CB_VERIFY_FP8`): a chain verify
 /// of an admitted target runs inside the IU4 verify scope (see
 /// `Gpu::iu4_verify_enter`), the same A4 producers + IU4 GEMMs as the
 /// multi-request verify trunk; lm_head stays F16. The scope is eager-only:

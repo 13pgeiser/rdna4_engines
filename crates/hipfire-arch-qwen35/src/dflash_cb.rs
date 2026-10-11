@@ -692,7 +692,7 @@ pub fn dflash_cb_verify(
             // Trunk row-byte identity at aggregates 63/64/65/96/128, chunk128
             // off/HIP/PM: cb/chunk128/STAGE4.md:39-58 (the aggregate probe
             // freezes verify.final_hidden as well as logits against singleton).
-            // `HIPFIRE_DFLASH_IU4_VERIFY`: the trunk runs inside the IU4 verify
+            // DFlash IU4 verify (this load's decision): the trunk runs inside the IU4 verify
             // scope, the same A4 producers + IU4 GEMMs as the singleton verify;
             // the heads below stay F16.
             let iu4 = gpu.iu4_verify_enter(dflash_iu4_verify_admitted(gpu, weights, config));

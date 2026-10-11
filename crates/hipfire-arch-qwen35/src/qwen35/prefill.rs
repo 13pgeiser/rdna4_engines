@@ -1104,7 +1104,8 @@ pub(crate) enum BatchEpilogue<'a> {
 /// prepared/in-place producer request is a pre-mutation error, never a
 /// fallback to the quantized product arithmetic.
 ///
-/// `Iu4Verify` (`HIPFIRE_DFLASH_IU4_VERIFY=1`, a numerics opt-in) is the
+/// `Iu4Verify` (DFlash IU4 verify: default on at `dflash_block` 8,
+/// `HIPFIRE_CB_VERIFY_IU4`; numerics differ from F16) is the
 /// DFlash verify inside `Gpu::iu4_verify_scope`, for the singleton verify
 /// and the multi-request verify trunk at any combined row count alike: every
 /// projection takes a gfx1201 A4 producer (AWQ RMSNorm/FWHT, gated-norm,

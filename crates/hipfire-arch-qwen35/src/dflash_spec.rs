@@ -376,14 +376,9 @@ pub fn load_dflash_state(
     dflash_block: usize,
 ) -> Result<DflashState, String> {
     // The IU4 and PM FP8 verify opt-ins are two different verify arithmetics;
-    // both set has no defined route, so the load fails before any allocation.
-    if gpu.flags.cb_verify_fp8 && Gpu::dflash_iu4_verify_requested() {
-        return Err(
-            "HIPFIRE_DFLASH_IU4_VERIFY=1 and HIPFIRE_CB_VERIFY_FP8=1 are mutually exclusive \
-             (two different verify arithmetics); unset one of them"
-                .to_string(),
-        );
-    }
+    // both forced on has no defined route, so the load fails before any
+    // allocation (the final decision below uses the runtime block).
+    Gpu::iu4_verify_load_decision(&gpu.flags, dflash_block)?;
     let requested_ctx = ctx_capacity;
     // Open the draft container up-front: its declared SWA window is the
     // DEFAULT window (below), so the artifact must be parsed before the
@@ -504,6 +499,21 @@ pub fn load_dflash_state(
             draft_config.block_size, block_size
         );
     }
+    // IU4 verify (numerics differ from the F16 verify; quality tied on task
+    // evals): on by default when this load's proposal width is 8 (a batching
+    // serve), `HIPFIRE_CB_VERIFY_IU4` forces/kills, FP8 opt-in wins the
+    // default. Batched == singleton stays byte-identical within the config.
+    // Only the both-forced case errs, refused above before any allocation.
+    gpu.iu4_verify_load = Gpu::iu4_verify_load_decision(&gpu.flags, block_size).unwrap_or(false);
+    eprintln!(
+        "  DFlash verify IU4: {} (block {block_size}, HIPFIRE_CB_VERIFY_IU4={})",
+        if gpu.iu4_verify_load { "on" } else { "off" },
+        match gpu.flags.cb_verify_iu4 {
+            None => "unset",
+            Some(true) => "1",
+            Some(false) => "0",
+        }
+    );
     // DDTree verify batches up to `budget + 1` slots (seed + budget nodes), which
     // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
     // staging for the larger of the two so ddtree-mode serve doesn't overflow
@@ -658,9 +668,9 @@ pub fn load_dflash_state(
         gdn_tape.max_n,
     ) {
         // The IU4 verify producers are eager-only; a recorded PM4 tape would
-        // refuse them, so the opt-in keeps the HIP verify route.
+        // refuse them, so an IU4-verify load keeps the HIP verify route.
         Ok(()) if qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target_weights, target_config) => {
-            let reason = "HIPFIRE_DFLASH_IU4_VERIFY=1 (the IU4 verify is eager-only)";
+            let reason = "IU4 verify is on for this load (eager-only; HIPFIRE_CB_VERIFY_IU4=0 turns it off)";
             eprintln!("  DFlash verify PM4: disabled ({reason})");
             DflashVerifyPm4::disabled(reason)
         }

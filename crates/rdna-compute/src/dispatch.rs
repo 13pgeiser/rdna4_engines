@@ -1186,17 +1186,21 @@ pub struct Gpu {
     /// family or fails; F16-input producers error. Always false when the flag
     /// is off.
     pub fp8_verify_scope: bool,
-    /// IU4 verify scope (`HIPFIRE_DFLASH_IU4_VERIFY=1`, default off; a
-    /// numerics opt-in): set by the DFlash target verify call sites for the
-    /// duration of the verify trunk when [`Gpu::iu4_verify_route_admitted`].
-    /// While set, the gfx1201 A4 producer gates
-    /// (`iu4_producer_quant_fused_active`, `iu4_silu_quant_fused_active`)
-    /// admit any batch >= 1 and the A8 / FP8-stream projection routes are
-    /// off, so every verify row count (the C1 16-row singleton and the
-    /// batched 17..=128-row trunk alike) takes the same A4 producers + IU4
-    /// GEMMs, whose output rows do not depend on the row count. lm_head is
-    /// untouched (F16). See [`Gpu::iu4_verify_enter`].
+    /// IU4 verify scope (DFlash; numerics differ from the F16 verify): set by
+    /// the DFlash target verify call sites for the duration of the verify
+    /// trunk when [`Gpu::iu4_verify_route_admitted`]. While set, the gfx1201
+    /// A4 producer gates (`iu4_producer_quant_fused_active`,
+    /// `iu4_silu_quant_fused_active`) admit any batch >= 1 and the A8 /
+    /// FP8-stream projection routes are off, so every verify row count (the
+    /// singleton and the batched trunk up to 128 rows alike) takes the same
+    /// A4 producers + IU4 GEMMs, whose output rows do not depend on the row
+    /// count. lm_head is untouched (F16). See [`Gpu::iu4_verify_enter`].
     pub iu4_verify_scope: bool,
+    /// The current DFlash load's IU4 verify decision (`load_dflash_state`):
+    /// `HIPFIRE_CB_VERIFY_IU4` forced, or by default on when the load's
+    /// `speculation.dflash_block` resolves to 8 and `HIPFIRE_CB_VERIFY_FP8`
+    /// is off. Read by [`Gpu::iu4_verify_route_admitted`].
+    pub iu4_verify_load: bool,
     /// Qwen4 symmetric MQ4 trunk verified for the dense IU4 route
     /// (`HIPFIRE_QWEN4_TRUNK_IU4`); set by the Qwen4 forward after every
     /// trunk header passed [`Gpu::qwen4_trunk_sym_check`]. See
@@ -2047,6 +2051,7 @@ impl Gpu {
             mq4v2_symmetric: false,
             fp8_verify_scope: false,
             iu4_verify_scope: false,
+            iu4_verify_load: false,
             qwen4_trunk_iu4: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
@@ -4324,22 +4329,30 @@ impl Gpu {
             && k % 256 == 0
     }
 
-    /// Whether `HIPFIRE_DFLASH_IU4_VERIFY=1` (developer, default off) asks for
-    /// the IU4 (A4-activation) DFlash verify for this process. A numerics
-    /// opt-in: verify logits come from int4 activations instead of F16.
-    pub fn dflash_iu4_verify_requested() -> bool {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            hipfire_config::developer_bool("HIPFIRE_DFLASH_IU4_VERIFY", false)
-        });
-        *ON
+    /// The IU4 verify decision of a DFlash load whose proposal width resolved
+    /// to `dflash_block`: `HIPFIRE_CB_VERIFY_IU4=0` off, `=1` on, unset = on
+    /// iff `dflash_block == 8` (a batching serve) and `HIPFIRE_CB_VERIFY_FP8`
+    /// is off. `Err` when both verify opt-ins are forced on (two different
+    /// verify arithmetics).
+    pub fn iu4_verify_load_decision(flags: &crate::FeatureFlags, dflash_block: usize) -> Result<bool, String> {
+        match flags.cb_verify_iu4 {
+            Some(true) if flags.cb_verify_fp8 => Err(
+                "HIPFIRE_CB_VERIFY_IU4=1 and HIPFIRE_CB_VERIFY_FP8=1 are mutually exclusive \
+                 (two different verify arithmetics); unset one of them"
+                    .to_string(),
+            ),
+            Some(on) => Ok(on),
+            None => Ok(dflash_block == 8 && !flags.cb_verify_fp8),
+        }
     }
 
-    /// The device/flag half of the IU4 verify admission: exact gfx1201 with
-    /// the IU4 route and both gfx1201 A4 producer fusions on (the verify trunk
-    /// has no other A4 producer for its out-projections and FFN down). The
-    /// target half (dense MQ4G256V2 weights) is the caller's.
+    /// The device/flag half of the IU4 verify admission: this load's
+    /// decision ([`Self::iu4_verify_load`]), exact gfx1201, a symmetric MQ4V2
+    /// artifact, the IU4 route and both gfx1201 A4 producer fusions on (the
+    /// verify trunk has no other A4 producer for its out-projections and FFN
+    /// down). The target half (dense MQ4G256V2 weights) is the caller's.
     pub fn iu4_verify_route_admitted(&self) -> bool {
-        Self::dflash_iu4_verify_requested()
+        self.iu4_verify_load
             && self.arch == "gfx1201"
             && self.mq4v2_symmetric
             && self.flags.iu4_prefill_enabled()

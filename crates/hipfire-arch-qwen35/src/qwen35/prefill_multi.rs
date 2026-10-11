@@ -110,8 +110,8 @@ fn multi_chunk_wide_route(arch: &str, flags: &rdna_compute::FeatureFlags) -> boo
         && Gpu::mq4_verify_singleton_chain_for(arch, flags)
 }
 
-/// IU4 DFlash verify (`HIPFIRE_DFLASH_IU4_VERIFY=1`, a numerics opt-in) for
-/// this target: [`Gpu::iu4_verify_route_admitted`] and a dense MQ4G256V2
+/// IU4 DFlash verify for this target (the load's decision, default on at
+/// `dflash_block` 8; `HIPFIRE_CB_VERIFY_IU4`): [`Gpu::iu4_verify_route_admitted`] and a dense MQ4G256V2
 /// trunk + head. The DFlash verify call sites (singleton and multi-request)
 /// open `Gpu::iu4_verify_scope` with this, so both run the same A4 producers
 /// and IU4 GEMMs ([`DenseBatchMath::Iu4Verify`]).

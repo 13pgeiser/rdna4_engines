@@ -332,6 +332,13 @@ pub struct FeatureFlags {
     /// forward; the scope entry fails closed otherwise. Not the PM F16
     /// family: `HIPFIRE_CB_VERIFY_PM` does not apply.
     pub cb_verify_fp8: bool,
+    /// `HIPFIRE_CB_VERIFY_IU4` (developer): DFlash IU4 (A4-activation) verify.
+    /// `None` (unset) = the per-load default (on when `speculation.dflash_block`
+    /// resolves to 8, i.e. a batching serve, unless `HIPFIRE_CB_VERIFY_FP8` is
+    /// on); `Some(false)` = the kill switch; `Some(true)` = forced on (with
+    /// `HIPFIRE_CB_VERIFY_FP8=1` the DFlash load fails). The decision is taken
+    /// in `load_dflash_state` (`Gpu::iu4_verify_load`).
+    pub cb_verify_iu4: Option<bool>,
     /// Staged-tile v2 selector for the four gfx1201 FP8-WMMA MQ4v2 prefill
     /// routes (`HIPFIRE_GFX12_MQ4V2_FP8_V2`, `kernel.gfx12_mq4v2_fp8_v2`).
     /// Default ON on exact gfx1201; `=0` selects the s2bt8/BT symbols.
@@ -917,6 +924,7 @@ impl FeatureFlags {
             cb_verify_chunk128: parse_bool("HIPFIRE_CB_VERIFY_CHUNK128").unwrap_or(false),
             cb_verify_pm: parse_bool("HIPFIRE_CB_VERIFY_PM").unwrap_or(true),
             cb_verify_fp8: parse_bool("HIPFIRE_CB_VERIFY_FP8").unwrap_or(false),
+            cb_verify_iu4: parse_bool("HIPFIRE_CB_VERIFY_IU4"),
             gfx12_mq4v2_fp8_v2: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_V2")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_gdn_pre_fused: parse_bool("HIPFIRE_GFX12_GDN_PRE_FUSED")
@@ -1411,6 +1419,7 @@ impl FeatureFlags {
             cb_verify_chunk128: false,
             cb_verify_pm: true,
             cb_verify_fp8: false,
+            cb_verify_iu4: None,
             gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
@@ -1830,6 +1839,40 @@ mod tests {
         assert!(flags(Some("1")).cb_verify_pm);
         assert!(!FeatureFlags::for_test("gfx1201").cb_verify_fp8);
         assert!(!FeatureFlags::for_test("gfx1100").cb_verify_fp8);
+    }
+
+    #[test]
+    fn cb_verify_iu4_is_tri_state() {
+        let flags = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_CB_VERIFY_IU4", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        assert_eq!(flags(None).cb_verify_iu4, None);
+        assert_eq!(flags(Some("1")).cb_verify_iu4, Some(true));
+        assert_eq!(flags(Some("0")).cb_verify_iu4, Some(false));
+        assert_eq!(FeatureFlags::for_test("gfx1201").cb_verify_iu4, None);
+    }
+
+    #[test]
+    fn cb_verify_iu4_load_decision() {
+        let decide = |iu4: Option<bool>, fp8: bool, block: usize| {
+            let mut f = FeatureFlags::for_test("gfx1201");
+            f.cb_verify_iu4 = iu4;
+            f.cb_verify_fp8 = fp8;
+            crate::Gpu::iu4_verify_load_decision(&f, block)
+        };
+        // Default: on exactly at the batching width 8, and FP8 wins it.
+        assert_eq!(decide(None, false, 8), Ok(true));
+        assert_eq!(decide(None, false, 16), Ok(false));
+        assert_eq!(decide(None, true, 8), Ok(false));
+        // Kill switch and forced on, any width.
+        assert_eq!(decide(Some(false), false, 8), Ok(false));
+        assert_eq!(decide(Some(true), false, 16), Ok(true));
+        // Both forced on: refused.
+        assert!(decide(Some(true), true, 8).is_err());
+        assert_eq!(decide(Some(false), true, 8), Ok(false));
     }
 
     #[test]

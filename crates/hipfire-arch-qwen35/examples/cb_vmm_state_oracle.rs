@@ -3251,6 +3251,10 @@ struct WideExpect {
     n_dn: usize,
     n_fa: usize,
     n_layers: usize,
+    /// This load runs the DFlash IU4 verify (`Gpu::iu4_verify_load`, default
+    /// at `dflash_block` 8): every non-refused chunk launches IU4 GEMMs and
+    /// no F16 wide verify symbol, at any row count.
+    iu4: bool,
 }
 
 impl WideExpect {
@@ -3276,6 +3280,7 @@ impl WideExpect {
             n_dn: lt.iter().filter(|t| **t == LayerType::LinearAttention).count(),
             n_fa: lt.iter().filter(|t| **t == LayerType::FullAttention).count(),
             n_layers: lt.len(),
+            iu4: hipfire_arch_qwen35::qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, &slot.weights, &slot.config),
         }
     }
 
@@ -3302,7 +3307,7 @@ impl WideExpect {
 
     fn json(&self) -> Value {
         json!({
-            "family": self.family.name(), "multi_chunk_row_cap": self.cap, "route_cap": self.route_cap(),
+            "family": self.family.name(), "iu4_verify": self.iu4, "multi_chunk_row_cap": self.cap, "route_cap": self.route_cap(),
             "wide_admitted": self.admitted, "pm_requested": self.pm_requested,
             "n_deltanet_layers": self.n_dn, "n_full_attn_layers": self.n_fa, "n_layers": self.n_layers,
             "per_wide_chunk": {
@@ -3322,7 +3327,7 @@ impl WideExpect {
 fn assert_wide(exp: &WideExpect, chunks: &[usize], launches: &BTreeMap<&'static str, usize>, refused: bool) -> (bool, Value) {
     let mut want: BTreeMap<(WideOp, usize), usize> = BTreeMap::new();
     let mut wide_chunks = 0usize;
-    if !refused {
+    if !refused && !exp.iu4 {
         for &r in chunks {
             if r > MULTI_CHUNK_PRODUCT_MAX_ROWS {
                 wide_chunks += 1;
@@ -3334,7 +3339,7 @@ fn assert_wide(exp: &WideExpect, chunks: &[usize], launches: &BTreeMap<&'static 
         }
     }
     let mut got: BTreeMap<(WideOp, usize), usize> = BTreeMap::new();
-    let (mut hip_n, mut pm_n, mut qkvza_all) = (0usize, 0usize, 0usize);
+    let (mut hip_n, mut pm_n, mut qkvza_all, mut iu4_n) = (0usize, 0usize, 0usize, 0usize);
     let mut wide_syms: BTreeMap<String, usize> = BTreeMap::new();
     let mut forbidden: Vec<String> = Vec::new();
     for (name, &n) in launches {
@@ -3347,7 +3352,11 @@ fn assert_wide(exp: &WideExpect, chunks: &[usize], launches: &BTreeMap<&'static 
             }
             wide_syms.insert(name.to_string(), n);
         }
-        if name.contains("mmq_iu4") || name.contains("quantize_int4") || name.contains("block_i4") {
+        let quantized = name.contains("mmq_iu4") || name.contains("quantize_int4") || name.contains("block_i4");
+        if name.contains("mmq_iu4") {
+            iu4_n += n;
+        }
+        if quantized && !exp.iu4 {
             forbidden.push(format!("{name} x{n}"));
         }
         if name.contains("qkvza") {
@@ -3355,10 +3364,15 @@ fn assert_wide(exp: &WideExpect, chunks: &[usize], launches: &BTreeMap<&'static 
         }
     }
     let counts_ok = want == got;
-    let family_ok = match exp.family {
-        WideFamily::Pm => hip_n == 0,
-        WideFamily::Hip => pm_n == 0,
-        WideFamily::Off => hip_n + pm_n == 0,
+    let family_ok = if exp.iu4 {
+        // IU4 verify: no F16 wide symbol, and IU4 GEMMs whenever a chunk ran.
+        hip_n + pm_n == 0 && (refused || chunks.is_empty() || iu4_n > 0)
+    } else {
+        match exp.family {
+            WideFamily::Pm => hip_n == 0,
+            WideFamily::Hip => pm_n == 0,
+            WideFamily::Off => hip_n + pm_n == 0,
+        }
     };
     let silent_when_refused = !refused || launches.is_empty();
     // Every shared chunk runs one qkvza launch per DeltaNet layer on any route.
@@ -3378,7 +3392,7 @@ fn assert_wide(exp: &WideExpect, chunks: &[usize], launches: &BTreeMap<&'static 
         json!({
             "ok": ok, "family_expected": exp.family.name(), "wide_chunks": wide_chunks, "chunk_rows": chunks,
             "counts_ok": counts_ok, "family_ok": family_ok, "hip_launches": hip_n, "pm_launches": pm_n,
-            "forbidden_quantized_launches": forbidden, "silent_when_refused": silent_when_refused,
+            "forbidden_quantized_launches": forbidden, "iu4_launches": iu4_n, "silent_when_refused": silent_when_refused,
             "qkvza_launches": qkvza_all, "chunks_by_qkvza": chunks_by_qkvza, "chunk_count_ok": chunk_count_ok,
             "expected_vs_observed": table, "wide_symbols": wide_syms, "launch_kinds": launches.len(),
             "launches_total": launches.values().sum::<usize>(),
