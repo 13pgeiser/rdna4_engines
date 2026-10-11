@@ -33,6 +33,10 @@ from schema import FixtureError, read_npz, tensor
 _FULL_STACK = all(importlib.util.find_spec(name) is not None for name in ("torch", "transformers", "safetensors", "tokenizers"))
 
 
+def _dump_names(manifest: dict, dump: str) -> set[str]:
+    return {item["name"] for entry in manifest["dumps"] if entry["name"] == dump for item in entry["arrays"]}
+
+
 def _safetensors_header(path: Path) -> dict[str, object]:
     with path.open("rb") as handle:
         (length,) = struct.unpack("<Q", handle.read(8))
@@ -178,6 +182,53 @@ class EnvelopeTests(unittest.TestCase):
             for flag, value in (("--rope-theta", "0"), ("--max-position-embeddings", "0")):
                 code = generate_fixtures.main(["--tiny-profile", "tiny-moe", "--out", str(Path(temp) / "x"), flag, value, "--no-controls"])
                 self.assertEqual(code, 2, flag)
+
+    def test_optional_components_default_present_and_s1_absence_in_config(self) -> None:
+        defaults = tp.ProfileOptions()
+        self.assertEqual((defaults.with_ple, defaults.with_mtp), (True, True))
+        baseline = tp.text_config_dict(defaults)
+        self.assertEqual(baseline, tp.text_config_dict(tp.ProfileOptions(with_ple=True, with_mtp=True)))
+        self.assertEqual(baseline["ple_layer_ids"], [1])
+        self.assertEqual(baseline["mtp_num_hidden_layers"], 1)
+        # S1 PLE absence: ple_layer_ids == [] and every PLE scalar absent; nothing else changes (MTP kept).
+        no_ple = tp.text_config_dict(tp.ProfileOptions(with_ple=False))
+        expected = {key: value for key, value in baseline.items() if key not in tp.PLE_COMPANION_KEYS}
+        expected["ple_layer_ids"] = []
+        self.assertEqual(no_ple, expected)
+        for key in ("ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram", "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "split_ngram_parts"):
+            self.assertNotIn(key, no_ple)
+        self.assertEqual(no_ple["mtp"], baseline["mtp"])
+        # S1 MTP absence: no mtp block, no mtp_num_hidden_layers / mtp_use_dedicated_embeddings (PLE kept).
+        no_mtp = tp.text_config_dict(tp.ProfileOptions(with_mtp=False))
+        self.assertEqual(no_mtp, {key: value for key, value in baseline.items() if key not in ("mtp", "mtp_num_hidden_layers", "mtp_use_dedicated_embeddings")})
+        self.assertEqual(no_mtp["ple_layer_ids"], [1])
+        # The root carries no PLE marker unless a PLE table was instantiated.
+        for options in (tp.ProfileOptions(with_ple=False), tp.ProfileOptions(profile_id="tiny-dense-dev", with_ple=False, with_mtp=False)):
+            root = tp.full_config_dict(options)
+            self.assertNotIn("qwen4_ple", root)
+            self.assertNotIn("ple", root["hipfire_profile"])
+        # pinned HF gets the same PLE-free text config in memory.
+        self.assertEqual(tp._hf_text_config_dict(tp.ProfileOptions(with_ple=False))["ple_layer_ids"], [])
+        both = tp.text_config_dict(tp.ProfileOptions(profile_id="tiny-dense-dev", rope_theta=10_000_000.0, max_position_embeddings=1024, with_ple=False, with_mtp=False))
+        self.assertEqual((both["rope_parameters"]["rope_theta"], both["max_position_embeddings"], both["intermediate_size"]), (10_000_000.0, 1024, 8))
+        self.assertEqual((both["ple_layer_ids"], "mtp" in both, "mtp_num_hidden_layers" in both), ([], False, False))
+        self.assertLess(tp.estimated_parameter_elements(tp.ProfileOptions(with_mtp=False)), tp.estimated_parameter_elements(defaults))
+        self.assertEqual(defaults.with_overrides(with_ple=False).with_ple, False)
+        for knob in ("with_ple", "with_mtp"):
+            for bad in (0, 1, "no", None):
+                with self.assertRaisesRegex(FixtureError, knob):
+                    tp.ProfileOptions(**{knob: bad}).validate()
+
+    def test_cli_optional_component_switches(self) -> None:
+        def options(*flags: str):
+            return generate_fixtures._tiny_options(generate_fixtures._parser().parse_args(["--tiny-profile", "tiny-dense-dev", "--out", "x", *flags]))
+
+        for flags, expected in (((), (True, True)), (("--no-ple",), (False, True)), (("--no-mtp",), (True, False)), (("--no-ple", "--no-mtp"), (False, False))):
+            parsed = options(*flags)
+            self.assertEqual((parsed.with_ple, parsed.with_mtp), expected, flags)
+        with tempfile.TemporaryDirectory() as temp:
+            for flag in ("--no-ple", "--no-mtp"):
+                self.assertEqual(generate_fixtures.main(["--out", str(Path(temp) / "x"), flag]), 2, flag)
 
     def test_layer_schedule(self) -> None:
         self.assertEqual(tp.layer_types_for(1), ["linear_attention"])
@@ -501,6 +552,124 @@ class FullStackTests(unittest.TestCase):
                 self.assertNotEqual((out / name).read_bytes(), (self.moe_dir / name).read_bytes(), name)
             with self.assertRaisesRegex(FixtureError, "below the 9 fixed tokens"):
                 tp.generate_profile(Path(temp) / "short", tp.ProfileOptions(max_position_embeddings=8), controls=False)
+
+    def test_default_manifest_has_no_optional_component_keys(self) -> None:
+        for manifest in (self.moe, self.dense):
+            self.assertNotIn("optional_components", manifest)
+            self.assertNotIn("with_ple", manifest["options"])
+            self.assertNotIn("with_mtp", manifest["options"])
+            self.assertIn("mtp", manifest["equation_sources"])
+            self.assertTrue(manifest["mtp"]["pinned_hf_mtp_support"] is False and "vllm_contract" in manifest["mtp"])
+            self.assertEqual([item["name"] for item in manifest["dumps"]], ["forward", "states", "mtp_step0"])
+
+    def test_without_ple_variant_has_no_ple_tensors_buffers_markers_or_states(self) -> None:
+        options = tp.ProfileOptions(profile_id="tiny-dense-dev", rope_theta=10_000_000.0, max_position_embeddings=1024, with_ple=False)
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "nople"
+            manifest = tp.generate_profile(out, options)
+            config = json.loads((out / "config.json").read_text())
+            text = config["text_config"]
+            self.assertEqual(text["ple_layer_ids"], [])
+            for key in tp.PLE_COMPANION_KEYS:
+                self.assertNotIn(key, text)
+            self.assertNotIn("qwen4_ple", config)
+            self.assertNotIn("ple", config["hipfire_profile"])
+            self.assertIn("mtp", text)  # MTP is kept
+            names = {item["name"] for item in manifest["checkpoint"]["inventory"]}
+            self.assertEqual(names, set(_safetensors_header(out / "model.safetensors")) - {"__metadata__"})
+            for name in names:
+                for fragment in (".ple.", "ngram", "layer_multipliers"):
+                    self.assertNotIn(fragment, name)
+            self.assertNotIn("ple", manifest["checkpoint"]["inventory_component_counts"])
+            self.assertIn("mtp.fc_embedding.weight", names)
+            self.assertIsNone(manifest["shrink"]["ple"])
+            for dump in ("forward", "states", "mtp_step0"):
+                for name in _dump_names(manifest, dump):
+                    self.assertNotIn(".ple.", name, dump)
+            states = _dump_names(manifest, "states")
+            for name in states:
+                self.assertNotRegex(name, r"conv_state[12]$")
+            for required in ("captured.layer0.conv_state0", "captured.layer0.recurrent_state0", "prefill.state.layer0.conv_state0", "chunked.state.layer0.recurrent_state0"):
+                self.assertIn(required, states)
+            self.assertTrue(manifest["chunked_decode"]["supported"])
+            components = manifest["optional_components"]
+            self.assertEqual(components["ple"]["present"], False)
+            self.assertEqual((components["ple"]["layers"], components["ple"]["inventory_tensors"], components["ple"]["cache_state_slots"]), ([], 0, 1))
+            self.assertEqual(components["ple"]["text_config_ple_layer_ids"], [])
+            self.assertTrue(components["mtp"]["present"] and components["mtp"]["inventory_tensors"] > 0)
+            self.assertEqual(manifest["options"]["with_ple"], False)
+            self.assertNotIn("with_mtp", manifest["options"])
+            controls = {item["name"]: item for item in manifest["negative_controls"]}
+            for name in ("ple_eos_history", "ple_cached_history"):
+                self.assertEqual((controls[name]["status"], controls[name]["passed"], controls[name]["reason"]), ("skipped", None, tp.PLE_ABSENT_REASON))
+            for name in ("identity_rebuild", "gdn_output_gate", "dense_ffn_rounding", "dense_gate_projection"):
+                self.assertTrue(controls[name]["passed"], name)
+            self.assertIn("mtp_layer_self_attn_config", manifest["rope"]["checked"])
+
+    def test_without_mtp_variant_builds_no_mtp_and_keeps_the_backbone_bit_identical(self) -> None:
+        options = tp.ProfileOptions(profile_id="tiny-moe", with_mtp=False)
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "nomtp"
+            manifest = tp.generate_profile(out, options, controls=False)
+            config = json.loads((out / "config.json").read_text())
+            text = config["text_config"]
+            for key in tp.MTP_CONFIG_KEYS:
+                self.assertNotIn(key, text)
+            self.assertEqual(text["ple_layer_ids"], [1])  # PLE kept, marker kept
+            self.assertIn("qwen4_ple", config)
+            names = {item["name"] for item in manifest["checkpoint"]["inventory"]}
+            self.assertEqual(names, set(_safetensors_header(out / "model.safetensors")) - {"__metadata__"})
+            self.assertFalse([name for name in names if name.startswith("mtp.")])
+            self.assertNotIn("mtp", manifest["checkpoint"]["inventory_component_counts"])
+            self.assertIn("model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight", names)
+            # No empty or fabricated MTP dump: only the actual forward and states exist.
+            self.assertEqual([item["name"] for item in manifest["dumps"]], ["forward", "states"])
+            self.assertEqual(sorted(path.name for path in out.glob("*.npz")), ["forward.npz", "states.npz"])
+            self.assertEqual(manifest["mtp"]["present"], False)
+            self.assertEqual(manifest["mtp"]["constructed"], False)
+            self.assertNotIn("vllm_contract", manifest["mtp"])
+            self.assertNotIn("mtp", manifest["equation_sources"])
+            components = manifest["optional_components"]
+            self.assertEqual((components["mtp"]["present"], components["mtp"]["inventory_tensors"]), (False, 0))
+            self.assertEqual(components["mtp"]["omitted"]["dumps"], ["mtp_step0"])
+            self.assertEqual((components["ple"]["present"], components["ple"]["layers"], components["ple"]["cache_state_slots"]), (True, [0], 3))
+            states = _dump_names(manifest, "states")
+            for required in ("captured.layer0.conv_state1", "captured.layer0.conv_state2", "prefill.state.layer0.conv_state2"):
+                self.assertIn(required, states)
+            # The backbone is the same model: per-tensor name-keyed init makes forward/states bit-identical to the default.
+            for name in ("forward.npz", "states.npz"):
+                self.assertEqual((out / name).read_bytes(), (self.moe_dir / name).read_bytes(), name)
+
+    def test_without_both_constructs_no_mtp_and_runs_every_remaining_control(self) -> None:
+        options = tp.ProfileOptions(profile_id="tiny-dense-dev", rope_theta=10_000_000.0, max_position_embeddings=1024, with_ple=False, with_mtp=False)
+        with mock.patch.object(tp, "_make_mtp_head_cls", side_effect=AssertionError("MTP head constructed")) as factory:
+            assembly = tp.build_assembly(options, self.sources, seed=options.seed)
+        factory.assert_not_called()
+        self.assertIsNone(assembly.mtp_head)
+        self.assertIsNone(assembly.mtp_config)
+        self.assertFalse([name for name, _ in assembly.model.named_parameters() if name.startswith("mtp")])
+        self.assertEqual(tp.shrink_evidence(assembly)["parameter_elements"], sum(parameter.numel() for parameter in assembly.model.parameters()))
+        self.assertIsNone(tp.derived_ple_geometry(assembly))
+        self.assertTrue(all(layer.ple is None for layer in assembly.text_model.layers))
+        evidence = tp.rope_evidence(assembly)
+        self.assertEqual(evidence["checked"], ["main_rotary_embedding_config", "main_text_config", "rotary_inv_freq_recomputed"])
+        self.assertNotIn("mtp_rotary_source", evidence)
+        with self.assertRaisesRegex(FixtureError, "no MTP head"):
+            tp.run_mtp_step0(assembly, None)
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "bare"
+            manifest = tp.generate_profile(out, options)
+            self.assertEqual([item["name"] for item in manifest["dumps"]], ["forward", "states"])
+            controls = {item["name"]: item for item in manifest["negative_controls"]}
+            self.assertEqual({name for name, item in controls.items() if item.get("status") == "skipped"}, {"ple_eos_history", "ple_cached_history"})
+            for name, item in controls.items():
+                if item.get("status") != "skipped":
+                    self.assertTrue(item["passed"], name)
+            self.assertEqual(manifest["optional_components"]["ple"]["present"], False)
+            self.assertEqual(manifest["optional_components"]["mtp"]["present"], False)
+            self.assertEqual((manifest["options"]["with_ple"], manifest["options"]["with_mtp"]), (False, False))
+            names = {item["name"] for item in manifest["checkpoint"]["inventory"]}
+            self.assertFalse([name for name in names if name.startswith("mtp.") or ".ple." in name])
 
     def test_dense_equation_agrees_with_reusable_mlp_math(self) -> None:
         check = self.dense["dense_equation_cross_check"]

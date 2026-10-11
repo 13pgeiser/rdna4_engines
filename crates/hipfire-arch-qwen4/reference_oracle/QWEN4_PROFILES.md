@@ -14,6 +14,9 @@ $PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-pr
 $PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-dense-dev --out /tmp/q4-tiny-dense --seed 3800
 # GPU-compatible variant (same seed/dims/tokens): RoPE base 1e7 and context 1024 on the main AND MTP config; marker id stays tiny-moe
 $PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-moe --out /tmp/q4-tiny-moe-gpu --seed 3800 --rope-theta 10000000 --max-position-embeddings 1024
+# optional components (both default present, byte-identical default output): drop PLE and/or native MTP
+$PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-dense-dev --out /tmp/q4-dense-nople  --seed 3800 --no-ple
+$PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-dense-dev --out /tmp/q4-dense-nomtp  --seed 3800 --no-mtp
 # width-5120 knob (1-2 layers only; reduced projections/FFN)
 $PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-dense-dev --hidden-size 5120 --layers 1 --out /tmp/q4-dense-5120
 $PY -I -m unittest discover -s crates/hipfire-arch-qwen4/reference_oracle -p 'test_*.py'   # run from the repo root
@@ -63,6 +66,17 @@ runs add `manifest.rope`, built from the instantiated main config, MTP config, M
 (the MTP step feeds the main `rotary_emb` cos/sin to the cloned layer); any disagreement is refused. `rope_theta` must be finite and > 0;
 `max_position_embeddings` an integer >= the 9 fixed tokens. The profile id/marker is unchanged; name the output directory for the variant.
 
+Optional components (`--no-ple`, `--no-mtp`; `ProfileOptions.with_ple` / `with_mtp`, default true). Pinned HF supports a PLE-free model
+(`ple_layer_ids` empty, one cache state slot); the MTP head is built here, outside HF, so `--no-mtp` constructs nothing. Absence follows the S1 schema and is
+cross-checked against the instantiated model, the written inventory and the written `config.json` (a disagreement aborts generation):
+
+- `--no-ple`: `text_config.ple_layer_ids = []`, the seven PLE scalars (`ple_embed_dim`, `ple_conv_kernel_size`, `ngram_size`, `heads_per_ngram`,
+  `ngram_vocab_size_base`, `make_ngram_vocab_size_divisible_by`, `split_ngram_parts`) absent, no `qwen4_ple`, no `hipfire_profile.ple`; no PLE layer, tensor or buffer;
+  no `conv_state1`/`conv_state2` states; `ple_eos_history` and `ple_cached_history` are recorded as `status: skipped` with the reason, not omitted. `seed` is kept (not in the S1 PLE list).
+- `--no-mtp`: no `text_config.mtp`, `mtp_num_hidden_layers` or `mtp_use_dedicated_embeddings`; no `mtp.*` tensor; no `mtp_step0.npz` (no empty or fabricated dump: `forward.npz` and
+  `states.npz` are the real backbone dumps, bit-identical to the default's for the same options); `manifest.mtp = {present: false, constructed: false, ...}`, no `equation_sources.mtp`, RoPE evidence lists no MTP checks.
+- Variants add `manifest.options.with_ple|with_mtp` (non-default only) and `manifest.optional_components` (`ple.layers`, inventory tensor counts, `cache_state_slots`, omissions); default manifests are unchanged.
+
 Constraints the shrink must respect (all enforced by pinned HF validation or observed):
 
 - PLE: `ple_embed_dim % ((ngram_size-1)*heads_per_ngram) == 0` (16 % 2); PLE only on linear layers; eos id required.
@@ -103,6 +117,7 @@ Constraints the shrink must respect (all enforced by pinned HF validation or obs
 
 `identity_rebuild`, `gdn_output_gate` (sigmoid<->silu), `ple_eos_history`, `ple_cached_history` (same suffix, different cached prefix),
 MoE: `moe_router_gate`, `moe_norm_topk_prob`, `bf16_vs_f32_rounding`; dense: `dense_ffn_rounding`, `dense_gate_projection`.
+Controls for an absent component are listed with `status: skipped, passed: null` and a reason (`--no-ple`: `ple_eos_history`, `ple_cached_history`); `--no-mtp` has no MTP control to skip.
 The exact requested seed is used (no seed search): tiny-moe and tiny-dense-dev at `--seed 3800` pass every control on torch 2.9.1+cpu, 1 thread.
 Dumps are bit-stable on one torch build/thread count; cross-build comparison should use BF16 unit roundoff (2^-7).
 

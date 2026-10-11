@@ -95,6 +95,23 @@ FIXED_TEXT = "hi<|endoftext|>to hi."
 DEFAULT_ROPE_THETA = 10000.0
 DEFAULT_MAX_POSITION_EMBEDDINGS = 64
 _ROPE_OPTION_DEFAULTS = {"rope_theta": DEFAULT_ROPE_THETA, "max_position_embeddings": DEFAULT_MAX_POSITION_EMBEDDINGS}
+# S1 absence schema.  Without PLE the checkpoint declares `text_config.ple_layer_ids = []` and carries none of these PLE
+# scalars (plus no `qwen4_ple` / `hipfire_profile.ple` marker); without MTP the checkpoint has no `text_config.mtp`
+# block, no `mtp_num_hidden_layers` / `mtp_use_dedicated_embeddings` and no `mtp.*` tensors.
+PLE_COMPANION_KEYS = (
+    "ple_embed_dim",
+    "ple_conv_kernel_size",
+    "ngram_size",
+    "heads_per_ngram",
+    "ngram_vocab_size_base",
+    "make_ngram_vocab_size_divisible_by",
+    "split_ngram_parts",
+)
+MTP_CONFIG_KEYS = ("mtp_num_hidden_layers", "mtp_use_dedicated_embeddings", "mtp")
+PLE_ABSENT_REASON = "PLE is absent from this profile (with_ple=false): no PLE layer, tensors, buffers, config marker or state slots exist"
+MTP_ABSENT_REASON = "native MTP is absent from this profile (with_mtp=false): no MTP head is constructed, no mtp.* tensors, config block or dump exist"
+# Option values that are omitted from manifest["options"] (and keep default manifests byte-identical) while at their default.
+_MANIFEST_OMITTED_DEFAULTS = {**_ROPE_OPTION_DEFAULTS, "with_ple": True, "with_mtp": True}
 MAX_CALLS_PER_MODULE = 128
 # Hard bound on instantiated parameter elements.  The 5120-wide knob passes
 # because every projection other than the hidden axis is reduced; the two
@@ -149,6 +166,10 @@ class ProfileOptions:
     # gate construction; GPU-compatible variants override them (e.g. 10_000_000.0 / 1024) without a new profile id.
     rope_theta: float = DEFAULT_ROPE_THETA
     max_position_embeddings: int = DEFAULT_MAX_POSITION_EMBEDDINGS
+    # Optional components.  Pinned HF supports a PLE-free model (`ple_layer_ids` empty); the native MTP head is built here
+    # only when requested, so `with_mtp=False` constructs and allocates no MTP module, tensor, config block or dump.
+    with_ple: bool = True
+    with_mtp: bool = True
 
     def validate(self) -> None:
         if self.profile_id not in PROFILE_IDS:
@@ -169,6 +190,9 @@ class ProfileOptions:
             raise FixtureError("max_position_embeddings must be an integer")
         if self.max_position_embeddings < 1:
             raise FixtureError("max_position_embeddings must be >= 1")
+        for knob in ("with_ple", "with_mtp"):
+            if not isinstance(getattr(self, knob), bool):
+                raise FixtureError(f"{knob} must be a bool")
         if self.ffn_intermediate_size <= 0:
             raise FixtureError("ffn_intermediate_size must be positive")
         if self.output_gate_type not in ("sigmoid", "silu"):
@@ -269,6 +293,13 @@ def text_config_dict(options: ProfileOptions) -> dict[str, Any]:
             "rope_theta": float(options.rope_theta),
         },
     }
+    if not options.with_ple:
+        config["ple_layer_ids"] = []
+        for key in PLE_COMPANION_KEYS:
+            del config[key]
+    if not options.with_mtp:
+        for key in MTP_CONFIG_KEYS:
+            del config[key]
     if options.profile_id == "tiny-moe":
         config.update(
             {
@@ -326,13 +357,18 @@ def profile_envelope(options: ProfileOptions) -> dict[str, Any]:
     return {"id": options.profile_id, "developer_only": True, "equation_source": source, "ffn": ffn}
 
 
-def derived_ple_geometry(assembly: "Assembly") -> dict[str, Any]:
+def derived_ple_geometry(assembly: "Assembly") -> dict[str, Any] | None:
     """Stored PLE geometry read from the instantiated pinned ``Qwen4ExpTextNGramEmbedding`` (not constants).
 
     The config marker schema (``qwen4_ple`` + ``hipfire_profile.ple.valid_rows``) describes exactly one PLE table.
+    A model without PLE (``with_ple=False``) has no table and no marker: returns ``None``.
     """
 
     tables = [layer.ple.ple_embedding for layer in assembly.text_model.layers if layer.ple is not None]
+    if not assembly.options.with_ple:
+        if tables:
+            raise FixtureError(f"with_ple=False but the model instantiated {len(tables)} PLE table(s)")
+        return None
     if len(tables) != 1:
         raise FixtureError(f"the config PLE marker describes exactly one PLE table; the model has {len(tables)}")
     table = tables[0]
@@ -415,7 +451,7 @@ def estimated_parameter_elements(options: ProfileOptions) -> int:
     )
     # MTP: two [H, H] fusion projections (fc_embedding, fc_hidden) are the only
     # H^2 tensors the pinned structure forces; plus one reduced decoder layer.
-    mtp = 2 * h * h + per_layer
+    mtp = 2 * h * h + per_layer if options.with_mtp else 0
     return options.num_layers * per_layer + mtp + 3 * options.vocab_size * h + 4 * wide
 
 
@@ -810,8 +846,8 @@ class Assembly:
     torch: Any
     model: Any
     config: Any
-    mtp_config: Any
-    mtp_head: Any
+    mtp_config: Any | None  # None when the profile has no MTP head (nothing is constructed)
+    mtp_head: Any | None
     effective_seed: int
     dense_cls: type | None
 
@@ -869,35 +905,47 @@ def build_assembly(
     config._experts_implementation = "eager"
     if dense_cls is not None:
         config.text_config.hipfire_dense_intermediate_size = options.ffn_intermediate_size
-    mtp_text = dict(text_dict)
-    mtp_text.update(
-        {
-            "num_hidden_layers": 1,
-            "layer_types": ["full_attention"],
-            "ple_layer_ids": [],
-            "mtp": None,
-        }
-    )
-    mtp_text.pop("mtp")
-    mtp_config = cm.Qwen4ExpTextConfig(**mtp_text)
-    mtp_config._attn_implementation = "eager"
-    mtp_config._experts_implementation = "eager"
-    if dense_cls is not None:
-        mtp_config.hipfire_dense_intermediate_size = options.ffn_intermediate_size
+    mtp_config = None
+    if options.with_mtp:
+        mtp_text = dict(text_dict)
+        mtp_text.update(
+            {
+                "num_hidden_layers": 1,
+                "layer_types": ["full_attention"],
+                "ple_layer_ids": [],
+                "mtp": None,
+            }
+        )
+        mtp_text.pop("mtp")
+        mtp_config = cm.Qwen4ExpTextConfig(**mtp_text)
+        mtp_config._attn_implementation = "eager"
+        mtp_config._experts_implementation = "eager"
+        if dense_cls is not None:
+            mtp_config.hipfire_dense_intermediate_size = options.ffn_intermediate_size
     target = torch.bfloat16 if dtype == "bfloat16" else torch.float32
     if dtype != "bfloat16":
         text_dict["dtype"] = "float32"
         config.dtype = "float32"
         config.text_config.dtype = "float32"
-        mtp_config.dtype = "float32"
+        if mtp_config is not None:
+            mtp_config.dtype = "float32"
+    head = None
     with _default_dtype(torch, target), _patched_sparse_block(sources, dense_cls):
         model = modeling.Qwen4ExpForConditionalGeneration(config)
-        head = _make_mtp_head_cls(torch)(sources, mtp_config)
+        if mtp_config is not None:
+            head = _make_mtp_head_cls(torch)(sources, mtp_config)
     model.eval()
-    head.eval()
     hidden = options.hidden_size
     _initialise(torch, model, effective_seed, hidden)
-    _initialise(torch, head, effective_seed, hidden, prefix="mtp.")
+    if head is not None:
+        head.eval()
+        _initialise(torch, head, effective_seed, hidden, prefix="mtp.")
+    ple_layers = [index for index, layer in enumerate(model.model.language_model.layers) if layer.ple is not None]
+    if bool(ple_layers) != options.with_ple or bool(config.text_config.ple_layer_ids) != options.with_ple:
+        raise FixtureError(
+            f"with_ple={options.with_ple} but pinned HF built PLE layers {ple_layers} "
+            f"for ple_layer_ids={list(config.text_config.ple_layer_ids)}"
+        )
     assembly = Assembly(options, sources, torch, model, config, mtp_config, head, effective_seed, dense_cls)
     rope_evidence(assembly)  # refuses a main/MTP rope or context mismatch before any dump is produced
     return assembly
@@ -916,14 +964,14 @@ def rope_evidence(assembly: Assembly) -> dict[str, Any]:
     expected_theta = float(options.rope_theta)
     main = assembly.config.text_config
     mtp = assembly.mtp_config
-    layer_config = assembly.mtp_head.layers[0].self_attn.config
+    has_mtp = assembly.mtp_head is not None
     rotary = assembly.text_model.rotary_emb
-    observed = {
-        "main_text_config": (main.rope_parameters["rope_theta"], main.max_position_embeddings),
-        "mtp_config": (mtp.rope_parameters["rope_theta"], mtp.max_position_embeddings),
-        "mtp_layer_self_attn_config": (layer_config.rope_parameters["rope_theta"], layer_config.max_position_embeddings),
-        "main_rotary_embedding_config": (rotary.config.rope_parameters["rope_theta"], rotary.config.max_position_embeddings),
-    }
+    observed = {"main_text_config": (main.rope_parameters["rope_theta"], main.max_position_embeddings)}
+    if has_mtp:
+        layer_config = assembly.mtp_head.layers[0].self_attn.config
+        observed["mtp_config"] = (mtp.rope_parameters["rope_theta"], mtp.max_position_embeddings)
+        observed["mtp_layer_self_attn_config"] = (layer_config.rope_parameters["rope_theta"], layer_config.max_position_embeddings)
+    observed["main_rotary_embedding_config"] = (rotary.config.rope_parameters["rope_theta"], rotary.config.max_position_embeddings)
     for where, (theta, positions) in observed.items():
         if float(theta) != expected_theta or int(positions) != options.max_position_embeddings:
             raise FixtureError(
@@ -931,21 +979,24 @@ def rope_evidence(assembly: Assembly) -> dict[str, Any]:
                 f"expected {expected_theta} / {options.max_position_embeddings}"
             )
     partial = main.rope_parameters.get("partial_rotary_factor", 1.0)
-    if mtp.rope_parameters.get("partial_rotary_factor", 1.0) != partial:
-        raise FixtureError("MTP config partial_rotary_factor differs from the main text config")
-    if float(text_config_dict(options)["mtp"]["rope_theta"]) != expected_theta:
-        raise FixtureError("config.json mtp.rope_theta differs from rope_theta")
+    if has_mtp:
+        if mtp.rope_parameters.get("partial_rotary_factor", 1.0) != partial:
+            raise FixtureError("MTP config partial_rotary_factor differs from the main text config")
+        if float(text_config_dict(options)["mtp"]["rope_theta"]) != expected_theta:
+            raise FixtureError("config.json mtp.rope_theta differs from rope_theta")
     dim = int(main.head_dim * partial)
     inv_freq = 1.0 / (expected_theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
     if not torch.equal(rotary.inv_freq.detach().cpu(), inv_freq):
         raise FixtureError("main rotary inv_freq (shared by the MTP layer) does not match rope_theta")
-    return {
+    evidence = {
         "rope_theta": expected_theta,
         "max_position_embeddings": options.max_position_embeddings,
         "partial_rotary_factor": partial,
-        "checked": sorted(observed) + ["config_json_mtp_rope_theta", "rotary_inv_freq_recomputed"],
-        "mtp_rotary_source": "main text_model.rotary_emb (cos/sin fed to the cloned HF decoder layer)",
+        "checked": sorted(observed) + (["config_json_mtp_rope_theta"] if has_mtp else []) + ["rotary_inv_freq_recomputed"],
     }
+    if has_mtp:
+        evidence["mtp_rotary_source"] = "main text_model.rotary_emb (cos/sin fed to the cloned HF decoder layer)"
+    return evidence
 
 
 # ---------------------------------------------------------------------------
@@ -1211,8 +1262,9 @@ def captured_states(assembly: Assembly, forward: ForwardRun) -> dict[str, Any]:
     torch = assembly.torch
     config = assembly.config.text_config
     kernel = int(config.linear_conv_kernel_dim)
-    ple_length = (int(config.ple_conv_kernel_size) - 1) * int(config.ngram_size)
-    context = int(config.ngram_size) - 1
+    ple_active = bool(config.ple_layer_ids)  # PLE-free models have no conv_state1/conv_state2 slots at all
+    ple_length = (int(config.ple_conv_kernel_size) - 1) * int(config.ngram_size) if ple_active else 0
+    context = int(config.ngram_size) - 1 if ple_active else 0
     eos = _eos_id(assembly)
     states: dict[str, Any] = {}
     for key, value in forward.dumps.items():
@@ -1294,6 +1346,8 @@ def _causal_float_mask(torch: Any, length: int, dtype: Any) -> Any:
 def run_mtp_step0(assembly: Assembly, forward: ForwardRun) -> dict[str, Any]:
     """MTP step 0 over the fixed tokens: draft input token ``t+1`` with the backbone's multi-stream hidden at ``t``."""
 
+    if assembly.mtp_head is None:
+        raise FixtureError("this profile has no MTP head (with_mtp=false); there is no MTP step to run")
     torch = assembly.torch
     sources = assembly.sources
     verify_vllm_mtp_contract(sources.vllm_text)
@@ -1474,8 +1528,9 @@ def checkpoint_tensors(assembly: Assembly) -> dict[str, Any]:
                 tensors[f"{stem}shard_{shard}.weight"] = value[shard * step : (shard + 1) * step].clone()
             continue
         tensors[name] = value.detach().clone()
-    for name, value in assembly.mtp_head.state_dict().items():
-        tensors[f"mtp.{name}"] = value.detach().clone()
+    if assembly.mtp_head is not None:
+        for name, value in assembly.mtp_head.state_dict().items():
+            tensors[f"mtp.{name}"] = value.detach().clone()
     del options
     return tensors
 
@@ -1660,44 +1715,48 @@ def run_negative_controls(
         changed_keys(base.dumps, flipped.dumps, torch),
     )
 
-    ple_tokens = list(tokens)
-    eos = options.eos_token_id
-    if eos not in ple_tokens[:-1]:
-        raise FixtureError("fixed tokens must contain an EOS before the last position to exercise PLE history")
-    replaced = [tokens[0] if value == eos else value for value in tokens]
-    other = run_forward(build_assembly(options, sources, seed=base_seed), replaced)
-    record(
-        "ple_eos_history",
-        "replacing the in-sequence EOS changes the EOS-aware n-gram ids and every downstream PLE dump",
-        ["op.model.language_model.layers.0.ple.ple_embedding.ngram_embedding.in0", "op.model.language_model.layers.0.ple.out0"],
-        changed_keys(base.dumps, other.dumps, torch),
-    )
-
-    # Cached PLE history: same suffix chunk, different prefix => different 2-token context ids.
-    if not has_attention_layer(options):
-        results.append(
-            {
-                "name": "ple_cached_history",
-                "status": "skipped",
-                "passed": None,
-                "reason": CACHE_UNSUPPORTED_REASON,
-            }
-        )
+    if not options.with_ple:
+        for name in ("ple_eos_history", "ple_cached_history"):
+            results.append({"name": name, "status": "skipped", "passed": None, "reason": PLE_ABSENT_REASON})
     else:
-        suffix = list(tokens[-3:])
-        prefix_a = [tokens[1], tokens[3], tokens[4]]
-        prefix_b = [tokens[4], tokens[3], tokens[0]]
-        runs = []
-        for prefix in (prefix_a, prefix_b):
-            run_assembly = build_assembly(options, sources, seed=base_seed)
-            dumps, _ = run_cached(run_assembly, prefix + suffix, [len(prefix), len(suffix)], capture_ple=True)
-            runs.append(dumps)
+        ple_tokens = list(tokens)
+        eos = options.eos_token_id
+        if eos not in ple_tokens[:-1]:
+            raise FixtureError("fixed tokens must contain an EOS before the last position to exercise PLE history")
+        replaced = [tokens[0] if value == eos else value for value in tokens]
+        other = run_forward(build_assembly(options, sources, seed=base_seed), replaced)
         record(
-            "ple_cached_history",
-            "identical suffix chunk after a different cached prefix changes the PLE n-gram ids (cache history is state)",
-            ["ple.model.language_model.layers.0.ple.ple_embedding.ngram_embedding.in0.call1", "ple.model.language_model.layers.0.ple.ple_embedding.ngram_embedding.in0"],
-            changed_keys(runs[0], runs[1], torch, prefix="ple."),
+            "ple_eos_history",
+            "replacing the in-sequence EOS changes the EOS-aware n-gram ids and every downstream PLE dump",
+            ["op.model.language_model.layers.0.ple.ple_embedding.ngram_embedding.in0", "op.model.language_model.layers.0.ple.out0"],
+            changed_keys(base.dumps, other.dumps, torch),
         )
+
+        # Cached PLE history: same suffix chunk, different prefix => different 2-token context ids.
+        if not has_attention_layer(options):
+            results.append(
+                {
+                    "name": "ple_cached_history",
+                    "status": "skipped",
+                    "passed": None,
+                    "reason": CACHE_UNSUPPORTED_REASON,
+                }
+            )
+        else:
+            suffix = list(tokens[-3:])
+            prefix_a = [tokens[1], tokens[3], tokens[4]]
+            prefix_b = [tokens[4], tokens[3], tokens[0]]
+            runs = []
+            for prefix in (prefix_a, prefix_b):
+                run_assembly = build_assembly(options, sources, seed=base_seed)
+                dumps, _ = run_cached(run_assembly, prefix + suffix, [len(prefix), len(suffix)], capture_ple=True)
+                runs.append(dumps)
+            record(
+                "ple_cached_history",
+                "identical suffix chunk after a different cached prefix changes the PLE n-gram ids (cache history is state)",
+                ["ple.model.language_model.layers.0.ple.ple_embedding.ngram_embedding.in0.call1", "ple.model.language_model.layers.0.ple.ple_embedding.ngram_embedding.in0"],
+                changed_keys(runs[0], runs[1], torch, prefix="ple."),
+            )
 
     if options.profile_id == "tiny-moe":
         # Router gate: permute router rows of layer 0.
@@ -1826,7 +1885,9 @@ def shrink_evidence(assembly: Assembly) -> dict[str, object]:
                 "split_ngram_parts": int(cfg.split_ngram_parts),
             }
             break
-    parameters = sum(p.numel() for p in assembly.model.parameters()) + sum(p.numel() for p in assembly.mtp_head.parameters())
+    parameters = sum(p.numel() for p in assembly.model.parameters())
+    if assembly.mtp_head is not None:
+        parameters += sum(p.numel() for p in assembly.mtp_head.parameters())
     return {
         "parameter_elements": int(parameters),
         "bounded_memory_estimate": estimated_parameter_elements(options),
@@ -1836,6 +1897,57 @@ def shrink_evidence(assembly: Assembly) -> dict[str, object]:
         "qsa_index_budget_tokens": int(cfg.indexer_budget),
         "qsa_compress_ratio": int(cfg.indexer_compress_ratio),
     }
+
+
+def optional_component_report(assembly: Assembly, checkpoint: Mapping[str, Any], directory: Path) -> dict[str, Any]:
+    """Presence of the optional PLE / MTP components, read from the instantiated model, the written inventory and the
+    written ``config.json``.  Raises when any of them disagrees with ``options.with_ple`` / ``options.with_mtp``."""
+
+    options = assembly.options
+    text = assembly.config.text_config
+    counts = checkpoint["inventory_component_counts"]
+    ple_layers = [index for index, layer in enumerate(assembly.text_model.layers) if layer.ple is not None]
+    ple_tensors = int(counts.get("ple", 0))
+    mtp_tensors = int(counts.get("mtp", 0))
+    mtp_built = assembly.mtp_head is not None
+    config = json.loads((directory / checkpoint["config"]["path"]).read_text())
+    written_text = config["text_config"]
+    ple_config_present = {
+        "text_config.ple_layer_ids": bool(written_text.get("ple_layer_ids")),
+        "qwen4_ple": "qwen4_ple" in config,
+        "hipfire_profile.ple": "ple" in config["hipfire_profile"],
+        **{f"text_config.{key}": key in written_text for key in PLE_COMPANION_KEYS},
+    }
+    mtp_config_present = {f"text_config.{key}": key in written_text for key in MTP_CONFIG_KEYS}
+    if not (bool(ple_layers) == (ple_tensors > 0) == options.with_ple == bool(text.ple_layer_ids)):
+        raise FixtureError(f"with_ple={options.with_ple} disagrees with model layers {ple_layers} / {ple_tensors} PLE tensors")
+    if any(present != options.with_ple for present in ple_config_present.values()):
+        raise FixtureError(f"with_ple={options.with_ple} disagrees with config.json: {ple_config_present}")
+    if not (mtp_built == (mtp_tensors > 0) == options.with_mtp):
+        raise FixtureError(f"with_mtp={options.with_mtp} disagrees with the model ({mtp_built}) / {mtp_tensors} mtp.* tensors")
+    if any(present != options.with_mtp for present in mtp_config_present.values()):
+        raise FixtureError(f"with_mtp={options.with_mtp} disagrees with config.json: {mtp_config_present}")
+    report: dict[str, Any] = {
+        "ple": {
+            "present": bool(ple_layers),
+            "layers": ple_layers,
+            "inventory_tensors": ple_tensors,
+            "text_config_ple_layer_ids": list(text.ple_layer_ids),
+            "cache_state_slots": int(text.number_of_conv_states),
+        },
+        "mtp": {"present": mtp_built, "inventory_tensors": mtp_tensors},
+        "derived_from": "instantiated pinned HF layers/config, the written safetensors inventory and the written config.json",
+    }
+    if not ple_layers:
+        report["ple"]["omitted"] = {
+            "reason": PLE_ABSENT_REASON,
+            "config": ["text_config." + key for key in PLE_COMPANION_KEYS] + ["qwen4_ple", "hipfire_profile.ple"],
+            "states": ["captured.layer<L>.conv_state1", "captured.layer<L>.conv_state2", "*.state.layer<L>.conv_state1", "*.state.layer<L>.conv_state2"],
+            "negative_controls": ["ple_eos_history", "ple_cached_history"],
+        }
+    if not mtp_built:
+        report["mtp"]["omitted"] = {"reason": MTP_ABSENT_REASON, "config": list(MTP_CONFIG_KEYS), "dumps": ["mtp_step0"]}
+    return report
 
 
 def generate_profile(
@@ -1860,7 +1972,7 @@ def generate_profile(
         chunk_sizes = [len(tokens) - 3, 1, 1, 1]
         assembly = build_assembly(options, sources, seed=options.seed)
         forward = run_forward(assembly, tokens)
-        mtp_dumps = run_mtp_step0(assembly, forward)
+        mtp_dumps = run_mtp_step0(assembly, forward) if options.with_mtp else None
         state_dumps: dict[str, Any] = captured_states(assembly, forward)
         chunk_difference = prefill_difference = None
         if cache_supported:
@@ -1873,14 +1985,16 @@ def generate_profile(
             state_dumps.update({f"chunked.{k}": v for k, v in chunked_dumps.items()})
 
         checkpoint = write_checkpoint(destination, assembly)
+        components = optional_component_report(assembly, checkpoint, destination)
         dump_files = [
             write_dump_file(destination, "forward", torch, forward.dumps),
             write_dump_file(destination, "states", torch, state_dumps),
-            write_dump_file(destination, "mtp_step0", torch, mtp_dumps),
         ]
+        if mtp_dumps is not None:  # never an empty/fabricated mtp_step0 for an MTP-free profile
+            dump_files.append(write_dump_file(destination, "mtp_step0", torch, mtp_dumps))
         control_results = run_negative_controls(assembly, forward, tokens, sources) if controls else []
         dense_check = dense_equation_cross_check(assembly, forward) if options.profile_id == "tiny-dense-dev" else None
-        contract = verify_vllm_mtp_contract(sources.vllm_text)
+        contract = verify_vllm_mtp_contract(sources.vllm_text) if options.with_mtp else None
     finally:
         torch.set_num_threads(previous_threads)
 
@@ -1889,7 +2003,7 @@ def generate_profile(
         "schema": TINY_SCHEMA,
         "hipfire_profile": envelope,
         "options": {
-            k: v for k, v in options.__dict__.items() if k not in _ROPE_OPTION_DEFAULTS or v != _ROPE_OPTION_DEFAULTS[k]
+            k: v for k, v in options.__dict__.items() if k not in _MANIFEST_OMITTED_DEFAULTS or v != _MANIFEST_OMITTED_DEFAULTS[k]
         },
         "seed": {
             "requested": options.seed,
@@ -1952,6 +2066,21 @@ def generate_profile(
     }
     if any(getattr(options, key) != default for key, default in _ROPE_OPTION_DEFAULTS.items()):
         manifest["rope"] = rope_evidence(assembly)  # only non-default variants add this key: default manifests stay byte-identical
+    if not options.with_mtp:
+        del manifest["equation_sources"]["mtp"]
+        manifest["mtp"] = {
+            "present": False,
+            "constructed": False,
+            "pinned_hf_mtp_support": False,
+            "reason": MTP_ABSENT_REASON,
+            "omitted": [
+                "text_config.mtp, mtp_num_hidden_layers and mtp_use_dedicated_embeddings",
+                "mtp.* tensors",
+                "mtp_step0 dump (no empty or fabricated MTP dump is written; forward.npz and states.npz are the real backbone forward and layer states)",
+            ],
+        }
+    if not (options.with_ple and options.with_mtp):
+        manifest["optional_components"] = components  # only variants add this key: default manifests stay byte-identical
     manifest_path = destination / "manifest.json"
     write_json(manifest_path, manifest)
     manifest["manifest_sha256"] = sha256_file(manifest_path)

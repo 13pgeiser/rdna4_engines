@@ -760,6 +760,8 @@ def _parser() -> argparse.ArgumentParser:
     tiny.add_argument("--no-norm-topk-prob", action="store_true", help="tiny-moe: do not renormalise the selected router weights")
     tiny.add_argument("--rope-theta", type=float, default=10000.0, help="tiny profile RoPE base, applied to the main and MTP configs (default 10000; GPU variant 10000000)")
     tiny.add_argument("--max-position-embeddings", type=int, default=64, help="tiny profile max_position_embeddings, applied to the main and MTP configs (default 64; GPU variant 1024)")
+    tiny.add_argument("--no-ple", action="store_true", help="tiny profile without PLE: no PLE layer/tensors/buffers/config marker, ple_layer_ids=[] and absent PLE scalars (default: PLE present)")
+    tiny.add_argument("--no-mtp", action="store_true", help="tiny profile without native MTP: no MTP head is built; no mtp.* tensors, text_config.mtp or mtp_step0 dump (default: MTP present)")
     tiny.add_argument("--no-controls", action="store_true", help="skip the negative-control reruns")
     return parser
 
@@ -781,6 +783,8 @@ def _tiny_options(args: argparse.Namespace):
         norm_topk_prob=not args.no_norm_topk_prob,
         rope_theta=args.rope_theta,
         max_position_embeddings=args.max_position_embeddings,
+        with_ple=not args.no_ple,
+        with_mtp=not args.no_mtp,
     )
 
 
@@ -791,6 +795,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.tiny_profile and (args.self_test or args.upstream_reference or args.source_path):
         print("qwen4 reference fixture generation failed: --tiny-profile is exclusive with --self-test, --upstream-reference and --source-bf16-slices", file=sys.stderr)
+        return 2
+    if not args.tiny_profile and (args.no_ple or args.no_mtp):
+        print("qwen4 reference fixture generation failed: --no-ple and --no-mtp are only valid with --tiny-profile", file=sys.stderr)
         return 2
     if not args.self_test and not args.out:
         print("qwen4 reference fixture generation failed: --out is required unless --self-test is used", file=sys.stderr)
