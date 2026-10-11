@@ -92,6 +92,9 @@ EQUATION_SOURCE_UPSTREAM = "pinned-upstream"
 EQUATION_SOURCE_DENSE = equations.DENSE_FFN_EQUATION_SOURCE  # "non-upstream-dense"
 MTP_EQUATION_SOURCE = "pinned-vllm-mtp-forward+hf-operators"
 FIXED_TEXT = "hi<|endoftext|>to hi."
+DEFAULT_ROPE_THETA = 10000.0
+DEFAULT_MAX_POSITION_EMBEDDINGS = 64
+_ROPE_OPTION_DEFAULTS = {"rope_theta": DEFAULT_ROPE_THETA, "max_position_embeddings": DEFAULT_MAX_POSITION_EMBEDDINGS}
 MAX_CALLS_PER_MODULE = 128
 # Hard bound on instantiated parameter elements.  The 5120-wide knob passes
 # because every projection other than the hidden axis is reduced; the two
@@ -142,6 +145,10 @@ class ProfileOptions:
     output_gate_type: str = "sigmoid"
     vocab_size: int = 32
     eos_token_id: int = 2
+    # RoPE base and context length shared by the main text config and the cloned MTP config.  Defaults are the declared
+    # gate construction; GPU-compatible variants override them (e.g. 10_000_000.0 / 1024) without a new profile id.
+    rope_theta: float = DEFAULT_ROPE_THETA
+    max_position_embeddings: int = DEFAULT_MAX_POSITION_EMBEDDINGS
 
     def validate(self) -> None:
         if self.profile_id not in PROFILE_IDS:
@@ -154,6 +161,14 @@ class ProfileOptions:
             raise FixtureError(
                 f"hidden_size {self.hidden_size} is bounded to 1-2 layers (memory guard); got {self.num_layers}"
             )
+        if isinstance(self.rope_theta, bool) or not isinstance(self.rope_theta, (int, float)):
+            raise FixtureError("rope_theta must be a number")
+        if not math.isfinite(self.rope_theta) or self.rope_theta <= 0:
+            raise FixtureError("rope_theta must be a positive finite number")
+        if isinstance(self.max_position_embeddings, bool) or not isinstance(self.max_position_embeddings, int):
+            raise FixtureError("max_position_embeddings must be an integer")
+        if self.max_position_embeddings < 1:
+            raise FixtureError("max_position_embeddings must be >= 1")
         if self.ffn_intermediate_size <= 0:
             raise FixtureError("ffn_intermediate_size must be positive")
         if self.output_gate_type not in ("sigmoid", "silu"):
@@ -215,8 +230,8 @@ def text_config_dict(options: ProfileOptions) -> dict[str, Any]:
         "attention_bias": False,
         "attention_dropout": 0.0,
         "initializer_range": 0.02,
-        "max_position_embeddings": 64,
-        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5},
+        "max_position_embeddings": options.max_position_embeddings,
+        "rope_parameters": {"rope_type": "default", "rope_theta": float(options.rope_theta), "partial_rotary_factor": 0.5},
         "layer_types": layer_types_for(options.num_layers),
         "full_attention_interval": 2,
         "linear_num_key_heads": 1,
@@ -251,7 +266,7 @@ def text_config_dict(options: ProfileOptions) -> dict[str, Any]:
             "num_hidden_layers": 1,
             "layer_types": ["full_attention"],
             "hybrid": True,
-            "rope_theta": 10000.0,
+            "rope_theta": float(options.rope_theta),
         },
     }
     if options.profile_id == "tiny-moe":
@@ -883,7 +898,54 @@ def build_assembly(
     hidden = options.hidden_size
     _initialise(torch, model, effective_seed, hidden)
     _initialise(torch, head, effective_seed, hidden, prefix="mtp.")
-    return Assembly(options, sources, torch, model, config, mtp_config, head, effective_seed, dense_cls)
+    assembly = Assembly(options, sources, torch, model, config, mtp_config, head, effective_seed, dense_cls)
+    rope_evidence(assembly)  # refuses a main/MTP rope or context mismatch before any dump is produced
+    return assembly
+
+
+def rope_evidence(assembly: Assembly) -> dict[str, Any]:
+    """RoPE / context values read from the instantiated pinned objects; refuses any main/MTP disagreement.
+
+    The MTP step computes cos/sin from the main ``text_model.rotary_emb`` and feeds the cloned HF decoder layer, so
+    the clone's own ``self_attn.config`` and the MTP config are checked against the same knobs, and the rotary
+    ``inv_freq`` is recomputed from the stated ``rope_theta`` (not trusted from the JSON ``mtp.rope_theta`` field).
+    """
+
+    torch = assembly.torch
+    options = assembly.options
+    expected_theta = float(options.rope_theta)
+    main = assembly.config.text_config
+    mtp = assembly.mtp_config
+    layer_config = assembly.mtp_head.layers[0].self_attn.config
+    rotary = assembly.text_model.rotary_emb
+    observed = {
+        "main_text_config": (main.rope_parameters["rope_theta"], main.max_position_embeddings),
+        "mtp_config": (mtp.rope_parameters["rope_theta"], mtp.max_position_embeddings),
+        "mtp_layer_self_attn_config": (layer_config.rope_parameters["rope_theta"], layer_config.max_position_embeddings),
+        "main_rotary_embedding_config": (rotary.config.rope_parameters["rope_theta"], rotary.config.max_position_embeddings),
+    }
+    for where, (theta, positions) in observed.items():
+        if float(theta) != expected_theta or int(positions) != options.max_position_embeddings:
+            raise FixtureError(
+                f"{where} has rope_theta={theta} max_position_embeddings={positions}; "
+                f"expected {expected_theta} / {options.max_position_embeddings}"
+            )
+    partial = main.rope_parameters.get("partial_rotary_factor", 1.0)
+    if mtp.rope_parameters.get("partial_rotary_factor", 1.0) != partial:
+        raise FixtureError("MTP config partial_rotary_factor differs from the main text config")
+    if float(text_config_dict(options)["mtp"]["rope_theta"]) != expected_theta:
+        raise FixtureError("config.json mtp.rope_theta differs from rope_theta")
+    dim = int(main.head_dim * partial)
+    inv_freq = 1.0 / (expected_theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+    if not torch.equal(rotary.inv_freq.detach().cpu(), inv_freq):
+        raise FixtureError("main rotary inv_freq (shared by the MTP layer) does not match rope_theta")
+    return {
+        "rope_theta": expected_theta,
+        "max_position_embeddings": options.max_position_embeddings,
+        "partial_rotary_factor": partial,
+        "checked": sorted(observed) + ["config_json_mtp_rope_theta", "rotary_inv_freq_recomputed"],
+        "mtp_rotary_source": "main text_model.rotary_emb (cos/sin fed to the cloned HF decoder layer)",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1371,13 +1433,15 @@ def build_tokenizer(options: ProfileOptions) -> tuple[bytes, dict[str, object], 
     tokenizer.pre_tokenizer = pre_tokenizers.Split(Regex("."), behavior="isolated")
     tokenizer.add_special_tokens([AddedToken(token, special=True) for token in specials])
     ids = tokenizer.encode(FIXED_TEXT).ids
+    if len(ids) > options.max_position_embeddings:
+        raise FixtureError(f"max_position_embeddings {options.max_position_embeddings} is below the {len(ids)} fixed tokens")
     raw = tokenizer.to_str(pretty=True).encode("utf-8")
     config = {
         "tokenizer_class": "PreTrainedTokenizerFast",
         "pad_token": "<|pad|>",
         "bos_token": "<|bos|>",
         "eos_token": "<|endoftext|>",
-        "model_max_length": 64,
+        "model_max_length": options.max_position_embeddings,
         "hipfire_note": "deterministic developer-only word-level tokenizer; no chat template",
     }
     return raw, config, ids
@@ -1824,7 +1888,9 @@ def generate_profile(
     manifest: dict[str, object] = {
         "schema": TINY_SCHEMA,
         "hipfire_profile": envelope,
-        "options": {k: v for k, v in options.__dict__.items()},
+        "options": {
+            k: v for k, v in options.__dict__.items() if k not in _ROPE_OPTION_DEFAULTS or v != _ROPE_OPTION_DEFAULTS[k]
+        },
         "seed": {
             "requested": options.seed,
             "effective": assembly.effective_seed,
@@ -1884,6 +1950,8 @@ def generate_profile(
             "integer_dump": "byte exact",
         },
     }
+    if any(getattr(options, key) != default for key, default in _ROPE_OPTION_DEFAULTS.items()):
+        manifest["rope"] = rope_evidence(assembly)  # only non-default variants add this key: default manifests stay byte-identical
     manifest_path = destination / "manifest.json"
     write_json(manifest_path, manifest)
     manifest["manifest_sha256"] = sha256_file(manifest_path)

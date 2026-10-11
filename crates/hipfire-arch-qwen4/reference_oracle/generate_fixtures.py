@@ -758,6 +758,8 @@ def _parser() -> argparse.ArgumentParser:
     tiny.add_argument("--top-k", type=int, default=2, help="tiny-moe experts per token")
     tiny.add_argument("--shared-intermediate", type=int, default=8, help="tiny-moe shared expert intermediate size")
     tiny.add_argument("--no-norm-topk-prob", action="store_true", help="tiny-moe: do not renormalise the selected router weights")
+    tiny.add_argument("--rope-theta", type=float, default=10000.0, help="tiny profile RoPE base, applied to the main and MTP configs (default 10000; GPU variant 10000000)")
+    tiny.add_argument("--max-position-embeddings", type=int, default=64, help="tiny profile max_position_embeddings, applied to the main and MTP configs (default 64; GPU variant 1024)")
     tiny.add_argument("--no-controls", action="store_true", help="skip the negative-control reruns")
     return parser
 
@@ -777,6 +779,8 @@ def _tiny_options(args: argparse.Namespace):
         top_k=args.top_k,
         shared_intermediate_size=args.shared_intermediate,
         norm_topk_prob=not args.no_norm_topk_prob,
+        rope_theta=args.rope_theta,
+        max_position_embeddings=args.max_position_embeddings,
     )
 
 

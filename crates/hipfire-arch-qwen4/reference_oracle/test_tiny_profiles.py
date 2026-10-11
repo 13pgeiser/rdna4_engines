@@ -141,6 +141,44 @@ class EnvelopeTests(unittest.TestCase):
         self.assertGreater(tp.estimated_parameter_elements(tp.ProfileOptions(hidden_size=8192, num_layers=1)), tp.MAX_PARAMETER_ELEMENTS)
         self.assertLess(tp.estimated_parameter_elements(tp.ProfileOptions(hidden_size=5120, num_layers=2)), tp.MAX_PARAMETER_ELEMENTS)
 
+    def test_rope_knobs_default_to_the_declared_construction_and_reach_main_and_mtp_config(self) -> None:
+        defaults = tp.ProfileOptions()
+        self.assertEqual((defaults.rope_theta, defaults.max_position_embeddings), (10000.0, 64))
+        variant = tp.ProfileOptions(rope_theta=10_000_000.0, max_position_embeddings=1024)
+        variant.validate()
+        text = tp.text_config_dict(variant)
+        self.assertEqual(text["rope_parameters"], {"rope_type": "default", "rope_theta": 10_000_000.0, "partial_rotary_factor": 0.5})
+        self.assertEqual(text["max_position_embeddings"], 1024)
+        self.assertEqual(text["mtp"]["rope_theta"], 10_000_000.0)
+        self.assertEqual(tp.text_config_dict(tp.ProfileOptions(rope_theta=10_000_000))["mtp"]["rope_theta"], 10_000_000.0)
+        self.assertEqual(tp.full_config_dict(variant)["hipfire_profile"]["id"], "tiny-moe")
+        self.assertEqual(tp._hf_text_config_dict(variant)["rope_parameters"]["rope_theta"], 10_000_000.0)
+        dense = tp.ProfileOptions(profile_id="tiny-dense-dev", rope_theta=10_000_000.0, max_position_embeddings=1024)
+        self.assertEqual(tp._hf_text_config_dict(dense)["max_position_embeddings"], 1024)
+        self.assertEqual(tp.text_config_dict(defaults), tp.text_config_dict(tp.ProfileOptions(rope_theta=10000, max_position_embeddings=64)))
+
+    def test_rope_knob_guards(self) -> None:
+        for bad in (0.0, -1.0, float("nan"), float("inf"), True, "1e7"):
+            with self.assertRaisesRegex(FixtureError, "rope_theta"):
+                tp.ProfileOptions(rope_theta=bad).validate()
+        for bad in (0, -64, 64.0, True):
+            with self.assertRaisesRegex(FixtureError, "max_position_embeddings"):
+                tp.ProfileOptions(max_position_embeddings=bad).validate()
+
+    def test_cli_rope_knobs_reach_profile_options(self) -> None:
+        args = generate_fixtures._parser().parse_args(["--tiny-profile", "tiny-moe", "--out", "x"])
+        options = generate_fixtures._tiny_options(args)
+        self.assertEqual((options.rope_theta, options.max_position_embeddings), (10000.0, 64))
+        args = generate_fixtures._parser().parse_args(
+            ["--tiny-profile", "tiny-dense-dev", "--out", "x", "--rope-theta", "10000000", "--max-position-embeddings", "1024"]
+        )
+        options = generate_fixtures._tiny_options(args)
+        self.assertEqual((options.profile_id, options.rope_theta, options.max_position_embeddings), ("tiny-dense-dev", 10_000_000.0, 1024))
+        with tempfile.TemporaryDirectory() as temp:
+            for flag, value in (("--rope-theta", "0"), ("--max-position-embeddings", "0")):
+                code = generate_fixtures.main(["--tiny-profile", "tiny-moe", "--out", str(Path(temp) / "x"), flag, value, "--no-controls"])
+                self.assertEqual(code, 2, flag)
+
     def test_layer_schedule(self) -> None:
         self.assertEqual(tp.layer_types_for(1), ["linear_attention"])
         self.assertEqual(tp.layer_types_for(2), ["linear_attention", "full_attention"])
@@ -421,6 +459,48 @@ class FullStackTests(unittest.TestCase):
         width = mixer_in.shape[-1]
         self.assertEqual(stream.data, mixer_in.data[: (mixer_in.shape[1] - 1) * width])
         self.assertEqual(list(mtp["mtp.in.token_ids"].data), self.moe["fixed_tokens"]["ids"][1:])
+
+    def test_gpu_rope_variant_reaches_main_and_cloned_mtp_layer(self) -> None:
+        variant = tp.ProfileOptions(profile_id="tiny-moe", rope_theta=10_000_000.0, max_position_embeddings=1024)
+        assembly = tp.build_assembly(variant, self.sources, seed=variant.seed)
+        evidence = tp.rope_evidence(assembly)
+        self.assertEqual((evidence["rope_theta"], evidence["max_position_embeddings"]), (10_000_000.0, 1024))
+        mtp_attention_config = assembly.mtp_head.layers[0].self_attn.config
+        self.assertEqual(mtp_attention_config.rope_parameters["rope_theta"], 10_000_000.0)
+        self.assertEqual(mtp_attention_config.max_position_embeddings, 1024)
+        self.assertEqual(assembly.mtp_config.rope_parameters["rope_theta"], 10_000_000.0)
+        self.assertEqual(assembly.text_model.rotary_emb.config.max_position_embeddings, 1024)
+        # A clone that kept the JSON value but not the effective rope config is refused.
+        assembly.mtp_config.rope_parameters = {**assembly.mtp_config.rope_parameters, "rope_theta": 10000.0}
+        with self.assertRaisesRegex(FixtureError, "mtp_config has rope_theta=10000.0"):
+            tp.rope_evidence(assembly)
+
+    def test_gpu_rope_variant_profile_output_and_default_manifest_unchanged(self) -> None:
+        self.assertNotIn("rope", self.moe)
+        self.assertNotIn("rope_theta", self.moe["options"])
+        self.assertNotIn("max_position_embeddings", self.moe["options"])
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "gpu"
+            options = tp.ProfileOptions(profile_id="tiny-moe", rope_theta=10_000_000.0, max_position_embeddings=1024)
+            manifest = tp.generate_profile(out, options, controls=False)
+            config = json.loads((out / "config.json").read_text())
+            self.assertEqual(config["hipfire_profile"]["id"], "tiny-moe")
+            text = config["text_config"]
+            self.assertEqual((text["rope_parameters"]["rope_theta"], text["max_position_embeddings"]), (10_000_000.0, 1024))
+            self.assertEqual(text["rope_parameters"]["partial_rotary_factor"], 0.5)
+            self.assertEqual(text["mtp"]["rope_theta"], 10_000_000.0)
+            self.assertEqual(json.loads((out / "tokenizer_config.json").read_text())["model_max_length"], 1024)
+            self.assertEqual(manifest["options"]["rope_theta"], 10_000_000.0)
+            self.assertEqual(manifest["options"]["max_position_embeddings"], 1024)
+            self.assertEqual(manifest["rope"]["rope_theta"], 10_000_000.0)
+            self.assertEqual(manifest["rope"]["max_position_embeddings"], 1024)
+            self.assertIn("mtp_layer_self_attn_config", manifest["rope"]["checked"])
+            self.assertEqual(manifest["fixed_tokens"], self.moe["fixed_tokens"])
+            self.assertEqual(manifest["seed"], self.moe["seed"])
+            for name in ("forward.npz", "mtp_step0.npz"):
+                self.assertNotEqual((out / name).read_bytes(), (self.moe_dir / name).read_bytes(), name)
+            with self.assertRaisesRegex(FixtureError, "below the 9 fixed tokens"):
+                tp.generate_profile(Path(temp) / "short", tp.ProfileOptions(max_position_embeddings=8), controls=False)
 
     def test_dense_equation_agrees_with_reusable_mlp_math(self) -> None:
         check = self.dense["dense_equation_cross_check"]

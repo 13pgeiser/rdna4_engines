@@ -12,6 +12,8 @@ export HIPFIRE_QWEN4_ORACLE_CACHE=$HOME/.hipfire/datasets/cachequality-qwen4-ups
 PY=/home/kaden/qcal/release-0.4.2/qwen4-27b/s0-cpu-venv/bin/python
 $PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-moe       --out /tmp/q4-tiny-moe   --seed 3800
 $PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-dense-dev --out /tmp/q4-tiny-dense --seed 3800
+# GPU-compatible variant (same seed/dims/tokens): RoPE base 1e7 and context 1024 on the main AND MTP config; marker id stays tiny-moe
+$PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-moe --out /tmp/q4-tiny-moe-gpu --seed 3800 --rope-theta 10000000 --max-position-embeddings 1024
 # width-5120 knob (1-2 layers only; reduced projections/FFN)
 $PY -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py --tiny-profile tiny-dense-dev --hidden-size 5120 --layers 1 --out /tmp/q4-dense-5120
 $PY -I -m unittest discover -s crates/hipfire-arch-qwen4/reference_oracle -p 'test_*.py'   # run from the repo root
@@ -54,6 +56,13 @@ hidden16 vocab32 depth2 heads2/kv1 head8; GDN key1/value2 dims 8/8 conv2; layers
 experts3 top2 intermediate8 shared8; HC2 lowrank4; PLE on layer 1 (embed16, ngram3, heads/ngram1,
 vocab-base7, divisible-by8, split1, conv2, eos2); QSA heads1 kv1 dim4 budget4 ratio2; rope
 theta 10000 partial .5; max positions 64; output gate sigmoid; eager attention.
+
+`--rope-theta` / `--max-position-embeddings` (defaults 10000 / 64, byte-identical output) override both for the main and the
+cloned MTP config (`text_config.rope_parameters.rope_theta`, `max_position_embeddings`, `mtp.rope_theta`, tokenizer `model_max_length`); non-default
+runs add `manifest.rope`, built from the instantiated main config, MTP config, MTP layer `self_attn.config` and a recomputed rotary `inv_freq`
+(the MTP step feeds the main `rotary_emb` cos/sin to the cloned layer); any disagreement is refused. `rope_theta` must be finite and > 0;
+`max_position_embeddings` an integer >= the 9 fixed tokens. The profile id/marker is unchanged; name the output directory for the variant.
+
 Constraints the shrink must respect (all enforced by pinned HF validation or observed):
 
 - PLE: `ple_embed_dim % ((ngram_size-1)*heads_per_ngram) == 0` (16 % 2); PLE only on linear layers; eos id required.
