@@ -37,6 +37,20 @@ static double g4_f(const RadModelMeta* m, const char* bare, double dflt) {
     return v;
 }
 
+/* THE RESIDUAL JUNCTIONS AS ONE OP EACH. A w4a8 block opens with rmsnorm -> quant_act_i8 and closes
+ * with rmsnorm (post) -> add -> [scale], so between two blocks the stream runs five single-row
+ * dispatches -- the previous block's post-norm, the add, the layer scalar, this block's norm and
+ * its quantiser. libr4d's `rmsnorm_quant_i8` is that chain in one dispatch, byte-identical to it,
+ * and q, k and v read one quantised pair instead of three; `qkv_norm_rope` does the same for the
+ * attention prologue's five ops, `gelu_mul_quant_i8` for down's input, and at two ranks
+ * `ar_rmsnorm_quant_i8` folds the all-reduce in front of each junction into it. A kernel set without
+ * an op keeps that op's chain. RADIANCE_G4_FUSE=0 keeps every unfused chain -- an A/B of the fused
+ * ops against the same build, which must give the same bytes. */
+static inline bool g4_fuse() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_G4_FUSE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
 static constexpr int TRC_SITES = 5;   /* x0, h_attn, h_mlp, x_l, h_fin */
 static inline bool trc_on() { static const bool on = std::getenv("RADIANCE_TRACE_RESID") != nullptr; return on; }
 struct Model;                 /* forward; defined below -- the trace ring lives in Model */
@@ -153,20 +167,30 @@ struct G4Linear {
     rad_buf    q8 = 0, s8 = 0;     /* the int8 pair (i8 codes + f32 row scale) the quantiser writes */
     int64_t    N = 0, K = 0;
     bool       quant = false;   /* true: w4a8 */
+    /* READS ANOTHER LINEAR'S INT8 PAIR. q, k and v quantise the same norm output into the same
+     * per-row grid (quant_act_i8 over [T, n_embd]), so three quantisers write three identical
+     * pairs. With `in_from` set at declare this linear reads that linear's pair and declares no
+     * quantiser of its own: the GEMM's input bytes are the same bytes, one dispatch instead of
+     * three. */
+    bool       shared_in = false;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
                  std::initializer_list<const char*> src,
                  int64_t n_out, int64_t n_in, int shard, RadWeightGroup grp,
                  rad_buf a, rad_buf y,
-                 std::initializer_list<int64_t> row_parts = {});
+                 std::initializer_list<int64_t> row_parts = {},
+                 const G4Linear* in_from = nullptr);
     void step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const;
+    /* the GEMM alone, for a caller that wrote the int8 pair itself (a fused norm + quantiser) */
+    void gemm(RadCtx* c, rad_buf y, int64_t T) const;
 };
 
 inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
                             std::initializer_list<const char*> src,
                             int64_t n_out, int64_t n_in, int shard, RadWeightGroup grp,
                             rad_buf a, rad_buf y,
-                            std::initializer_list<int64_t> row_parts) {
+                            std::initializer_list<int64_t> row_parts,
+                            const G4Linear* in_from) {
     N = n_out; K = n_in;
     if (N <= 0 || K <= 0 || src.size() == 0) return RAD_E_INVAL;
     const char* wn = nm.f("%s.weight", base);
@@ -218,8 +242,14 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
         w  = decl_view(b, wn, nullptr, "codes", cdt, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
         ws = decl_view(b, sn, wn, "scale", RAD_F16, { N, K / 128 }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
         if (!w || !ws) return RAD_E_INVAL;
-        q8 = decl_b(b, nm.f("%s.q8", base), RAD_I8,  { g.max_tok, K });
-        s8 = decl_b(b, nm.f("%s.s8", base), RAD_F32, { g.max_tok, 1 });
+        if (in_from && in_from->quant && in_from->q8 && in_from->K == K) {
+            q8 = in_from->q8;
+            s8 = in_from->s8;
+            shared_in = true;
+        } else {
+            q8 = decl_b(b, nm.f("%s.q8", base), RAD_I8,  { g.max_tok, K });
+            s8 = decl_b(b, nm.f("%s.s8", base), RAD_F32, { g.max_tok, 1 });
+        }
         if (!q8 || !s8) return RAD_E_INVAL;
         /* quant_act_i8, NOT quant_act_i8g: the w4a8 GEMM's A fragment reads a byte-shuffled plane
          * (r4d_gemm_w4a8_nt_m64.hip:46-52, "the quantiser writes it") and applies an f32 per-ROW
@@ -234,18 +264,19 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
          * the host ngrp=1 (one scale per row, the [M,1] buffer the arch declares) and is a no-op on
          * the device, so the same declaration is self-consistent on both backends. group=128 left
          * the host quantiser refusing the [M,1] scale (it wants [M, K/128]). */
-        op_q = rw(b, RAD_OP(b, "quant_act_i8",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
-                               RAD_INT("group", K), RAD_STR("dtype", "bf16")),
-                    RAD_NOWEIGHTS),
-                { a }, { q8, s8 });
+        if (!shared_in)
+            op_q = rw(b, RAD_OP(b, "quant_act_i8",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
+                                   RAD_INT("group", K), RAD_STR("dtype", "bf16")),
+                        RAD_NOWEIGHTS),
+                    { a }, { q8, s8 });
         op = rw(b, RAD_OP(b, "gemm_nt_q",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
                                RAD_INT("group", 128), RAD_STR("dtype", cdt == RAD_I8 ? "w8a8" : "w4a8")),
                     RAD_WEIGHTS(w, ws)),
                 { q8, s8 }, { y });
         quant = true;
-        return (op_q && op) ? RAD_OK : RAD_E_INVAL;
+        return ((op_q || shared_in) && op) ? RAD_OK : RAD_E_INVAL;
     }
 
     char en[256];
@@ -262,11 +293,16 @@ inline void G4Linear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
          * quant_act_i8's schema is 4 operands -- x, q, scale, asum -- and `asum` (the per-group row
          * sums the asymmetric grids subtract) is absent on this symmetric grid, so it is passed as
          * a null tensor, not dropped: operands are positional (issue.cpp). */
-        RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T), RAD_NONE);
-        RAD_ISSUE_N(c, op, T, brows(q8, T), brows(s8, T), RAD_W(w), RAD_W(ws),
-                    brows(y, T), RAD_NONE, RAD_NONE);
+        if (!shared_in)
+            RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T), RAD_NONE);
+        gemm(c, y, T);
     } else
         RAD_ISSUE(c, op, brows(a, T), RAD_W(w), brows(y, T));
+}
+
+inline void G4Linear::gemm(RadCtx* c, rad_buf y, int64_t T) const {
+    RAD_ISSUE_N(c, op, T, brows(q8, T), brows(s8, T), RAD_W(w), RAD_W(ws),
+                brows(y, T), RAD_NONE, RAD_NONE);
 }
 
 /* ---- one attention block, parameterised by class. */
@@ -283,10 +319,15 @@ struct Gemma4Attn {
     G4Linear   ln_q{}, ln_k{}, ln_v{}, ln_o{};              /* the GEMM weights (bf16 or w4a8) */
     rad_op op_norm = 0, op_vn = 0, op_qn = 0, op_kn = 0,
            op_rq = 0, op_rk = 0, op_attn = 0, op_kv = 0, op_post = 0, op_ar = 0, op_add = 0;
+    /* the five prologue ops (v norm, q norm, k norm, two rotaries) as one, where it resolves */
+    rad_op op_qnr = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
                  rad_kvgroup group, const Wire& wire, const char* pre);
-    void step(RadCtx* c, const RadBatch* batch) const;
+    /* `entry_done`: a junction op already wrote this block's quantised input (ln_q's pair).
+     * `tail_fused`: the caller issues the post-norm and the add as a junction op. */
+    void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
+              bool ar_fused = false) const;
 };
 
 int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
@@ -317,13 +358,14 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     RAD_ARCH_TRY(ln_q.declare(b, nm, g, nm.f("blk.%d.attn_q", l),
                               { nm.ckpt("%s.%lld.self_attn.q_proj.%s", pre, (long long)l, g_wsfx) },
                               qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q));
+    const G4Linear* qin = g4_fuse() ? &ln_q : nullptr;   /* k and v read q's int8 pair */
     RAD_ARCH_TRY(ln_k.declare(b, nm, g, nm.f("blk.%d.attn_k", l),
                               { nm.ckpt("%s.%lld.self_attn.k_proj.%s", pre, (long long)l, g_wsfx) },
-                              kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.k));
+                              kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.k, {}, qin));
     if (cls.has_v)
         RAD_ARCH_TRY(ln_v.declare(b, nm, g, nm.f("blk.%d.attn_v", l),
                                   { nm.ckpt("%s.%lld.self_attn.v_proj.%s", pre, (long long)l, g_wsfx) },
-                                  kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.v));
+                                  kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.v, {}, qin));
     RAD_ARCH_TRY(ln_o.declare(b, nm, g, nm.f("blk.%d.attn_o", l),
                               { nm.ckpt("%s.%lld.self_attn.o_proj.%s", pre, (long long)l, g_wsfx) },
                               g.n_embd, qd, RAD_SHARD_COL, grp_layer(l), w.attn, w.h));
@@ -395,6 +437,23 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                    RAD_NOWEIGHTS),
                   {w.q}, {w.attn});
 
+    /* THE PROLOGUE AS ONE OP: libr4d's `qkv_norm_rope` is rmsnorm_p + rmsnorm + rmsnorm + rope +
+     * rope over the three separate projections, byte-identical to them, one workgroup a (token,
+     * head). Declared beside the unfused five and used only where it resolves; a multi-component
+     * or YaRN rotary keeps the five. */
+    if (g4_fuse() && !g.rope_mc && g.yarn.factor == 0.0f)
+        op_qnr = rw(b, RAD_OP(b, "qkv_norm_rope",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
+                                 RAD_INT("n_head", cls.n_head), RAD_INT("n_head_kv", cls.n_head_kv),
+                                 RAD_F64("theta", cls.theta), RAD_F64("eps", g.eps),
+                                 RAD_F64("scale", cls.scale), RAD_STR("mode", "neox"),
+                                 RAD_INT("rotary_dim", cls.n_rot),
+                                 RAD_STR("ladder", cls.head_ladder ? "head" : "rotary"),
+                                 RAD_F64("wadd", g.wadd_qk), RAD_INT("v_from_k", cls.has_v ? 0 : 1),
+                                 RAD_STR("dtype", g.dtype)),
+                      RAD_WEIGHTS(w_qn, w_kn)),
+                    {w.q, w.k, w.v}, {w.q, w.k, w.v});
+
     op_kv = rw(b, RAD_OP(b, "kv_store",
                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
                            RAD_INT("n_head_kv", cls.n_head_kv),
@@ -426,25 +485,37 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     return RAD_OK;
 }
 
-void Gemma4Attn::step(RadCtx* c, const RadBatch* batch) const {
+void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tail_fused,
+                      bool ar_fused) const {
     const RadKVGroupBatch* kvb = kv_batch(batch, kv);
     const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
     const int32_t* table = kvb ? kvb->block_table  : nullptr;
     const int32_t* used  = kvb ? kvb->seqused      : nullptr;
     const int64_t T = batch->n_tok;
 
-    RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
-    ln_q.step(c, w.h, w.q, T);
-    ln_k.step(c, w.h, w.k, T);
-    if (cls.has_v) ln_v.step(c, w.h, w.v, T);
+    if (entry_done) {
+        ln_q.gemm(c, w.q, T);
+        ln_k.gemm(c, w.k, T);
+        if (cls.has_v) ln_v.gemm(c, w.v, T);
+    } else {
+        RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
+        ln_q.step(c, w.h, w.q, T);
+        ln_k.step(c, w.h, w.k, T);
+        if (cls.has_v) ln_v.step(c, w.h, w.v, T);
+    }
 
-    /* normalise v FIRST: on a k_eq_v class v is derived from the raw k, before k_norm rewrites it. */
-    RAD_ISSUE_N(c, op_vn, T * cls.n_head_kv, brows(cls.has_v ? w.v : w.k, T), brows(w.v, T));
-    RAD_ISSUE_N(c, op_qn, T * cls.n_head,    brows(w.q, T), RAD_W(w_qn), brows(w.q, T));
-    RAD_ISSUE_N(c, op_kn, T * cls.n_head_kv, brows(w.k, T), RAD_W(w_kn), brows(w.k, T));
+    if (op_qnr) {
+        RAD_ISSUE(c, op_qnr, brows(w.q, T), brows(w.k, T), brows(w.v, T), rope_posmc(g, batch, T),
+                  RAD_W(w_qn), RAD_W(w_kn));
+    } else {
+        /* normalise v FIRST: on a k_eq_v class v is derived from the raw k, before k_norm rewrites it. */
+        RAD_ISSUE_N(c, op_vn, T * cls.n_head_kv, brows(cls.has_v ? w.v : w.k, T), brows(w.v, T));
+        RAD_ISSUE_N(c, op_qn, T * cls.n_head,    brows(w.q, T), RAD_W(w_qn), brows(w.q, T));
+        RAD_ISSUE_N(c, op_kn, T * cls.n_head_kv, brows(w.k, T), RAD_W(w_kn), brows(w.k, T));
 
-    RAD_ISSUE(c, op_rq, brows(w.q, T), rope_posmc(g, batch, T));
-    RAD_ISSUE(c, op_rk, brows(w.k, T), rope_posmc(g, batch, T));
+        RAD_ISSUE(c, op_rq, brows(w.q, T), rope_posmc(g, batch, T));
+        RAD_ISSUE(c, op_rk, brows(w.k, T), rope_posmc(g, batch, T));
+    }
 
     RAD_ISSUE(c, op_kv, brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
 
@@ -461,7 +532,8 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch) const {
     /* THE ALL-REDUCE BEFORE THE POST-NORM. o_proj is column-sharded, so each rank holds a PARTIAL
      * sum here; the norm is of the whole output (HF, and vLLM's RowParallelLinear, reduce first).
      * Normed per rank and then summed is sum_r rmsnorm(p_r), not rmsnorm(sum_r p_r). */
-    if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    if (tail_fused) return;
     RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
     RAD_ISSUE(c, op_add,  brows(w.x, T), brows(w.h, T), brows(w.x, T));
 }
@@ -476,9 +548,12 @@ struct Gemma4Mlp {
     rad_weight w_norm = 0, w_post = 0;   /* the norms (always bf16) */
     G4Linear   ln_gu{}, ln_down{};      /* the GEMM weights (bf16 or w4a8) */
     rad_op op_norm = 0, op_act = 0, op_post = 0, op_ar = 0, op_add = 0;
+    /* gelu_mul and down's quantiser as one, where it resolves (libr4d `gelu_mul_quant_i8`) */
+    rad_op op_gq = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre);
-    void step(RadCtx* c, const RadBatch* batch) const;
+    void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
+              bool ar_fused = false) const;
 };
 
 int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre) {
@@ -513,6 +588,11 @@ int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                RAD_NOWEIGHTS),
               {w.gu}, {w.ffn});
+    if (g4_fuse() && ln_down.quant && !ln_down.shared_in)
+        op_gq = rw(b, RAD_OP(b, "gelu_mul_quant_i8",
+                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
+                     RAD_NOWEIGHTS),
+                   {w.gu}, {ln_down.q8, ln_down.s8});
     /* down_proj is column-sharded: reduce first, then the post-norm. */
     if (g.world > 1)
         op_ar = rw(b, RAD_OP(b, "all_reduce",
@@ -533,18 +613,77 @@ int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
     return RAD_OK;
 }
 
-void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch) const {
+void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tail_fused,
+                     bool ar_fused) const {
     const int64_t T = batch->n_tok;
-    RAD_ISSUE(c, op_norm,  brows(w.x, T),   RAD_W(w_norm),  brows(w.h, T));
-    ln_gu.step(c, w.h, w.gu, T);
-    RAD_ISSUE(c, op_act,   brows(w.gu, T),  brows(w.ffn, T));
-    ln_down.step(c, w.ffn, w.h, T);
+    if (entry_done) {
+        ln_gu.gemm(c, w.gu, T);
+    } else {
+        RAD_ISSUE(c, op_norm,  brows(w.x, T),   RAD_W(w_norm),  brows(w.h, T));
+        ln_gu.step(c, w.h, w.gu, T);
+    }
+    if (op_gq) {
+        RAD_ISSUE_N(c, op_gq, T, brows(w.gu, T), brows(ln_down.q8, T), brows(ln_down.s8, T), RAD_NONE);
+        ln_down.gemm(c, w.h, T);
+    } else {
+        RAD_ISSUE(c, op_act,   brows(w.gu, T),  brows(w.ffn, T));
+        ln_down.step(c, w.ffn, w.h, T);
+    }
     trc_copy(c, trc_ring(rad_rank(c)), g.n_embd, layer, 2, w.h, T);  /* h_mlp: pre-post-norm down-proj output */
     /* The all-reduce before the post-norm, as in the attention block: down_proj is column-sharded. */
-    if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    if (tail_fused) return;
     RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
     RAD_ISSUE(c, op_add,   brows(w.x, T),   brows(w.h, T),  brows(w.x, T));
 }
+
+/* ---- one residual junction as one op: [post-norm of the branch `x`, the add into `res`, the
+ * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`). `res`
+ * null is the plain form, the norm of `x` itself -- the first block's entry. */
+struct G4Junction {
+    rad_op     op = 0;
+    rad_op     op_ar = 0;   /* the same with the two-rank exact all-reduce of `x` in front, or 0 */
+    rad_buf    x = 0, res = 0, q8 = 0, s8 = 0;
+    rad_weight w = 0, wp = 0, sc = 0;
+
+    int declare(RadBuilder* b, const Geom& g, rad_buf x_, rad_buf res_, rad_weight w_,
+                rad_weight wp_, rad_weight sc_, const G4Linear& into) {
+        x = x_; res = res_; w = w_; wp = wp_; sc = sc_; q8 = into.q8; s8 = into.s8;
+        if (!into.quant || into.shared_in || !q8 || !s8 || !w || (sc && !wp) || ((wp || sc) && !res))
+            return RAD_E_INVAL;
+        const RadParam p[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                               RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                               RAD_F64("wadd", g.wadd) };
+        const rad_weight ws[3] = { w, wp, sc };
+        const int nw = sc ? 3 : (wp ? 2 : 1);
+        op = rad_decl_op(b, "rmsnorm_quant_i8", p, (int)(sizeof p / sizeof p[0]), ws, nw);
+        if (!op) return RAD_OK;   /* not resolved: the caller keeps the unfused chain */
+        const rad_buf rd[2] = { x, res };
+        const rad_buf wr[3] = { q8, s8, res };
+        rad_op_reads (b, op, rd, res ? 2 : 1);
+        rad_op_writes(b, op, wr, res ? 3 : 2);
+        /* THE ALL-REDUCE IN FRONT, at two ranks on the exact wire: `x` is then a rank's partial sum
+         * of a column-sharded linear, the message as well as the input. A deployment that allows
+         * the lossy wire keeps the standalone all-reduce, which may pick it. */
+        if (res && g4_fuse() && g.world == 2 && g.wire_exact) {
+            const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                    RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
+                                    RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd) };
+            op_ar = rad_decl_op(b, "ar_rmsnorm_quant_i8", pa, (int)(sizeof pa / sizeof pa[0]), ws, nw);
+            if (op_ar) {
+                const rad_buf wa[4] = { x, q8, s8, res };
+                rad_op_reads (b, op_ar, rd, 2);
+                rad_op_writes(b, op_ar, wa, 4);
+            }
+        }
+        return RAD_OK;
+    }
+    void step(RadCtx* c, int64_t T, bool with_ar = false) const {
+        RAD_ISSUE_N(c, with_ar ? op_ar : op, T, brows(x, T), res ? brows(res, T) : RAD_NONE, RAD_W(w),
+                    brows(q8, T), brows(s8, T), RAD_NONE,
+                    wp ? RAD_W(wp) : RAD_NONE, sc ? RAD_W(sc) : RAD_NONE);
+    }
+};
 
 /* ==================================================================== the assistant head
  *
@@ -1043,6 +1182,10 @@ struct Layer {
     Gemma4Mlp  mlp{};
     rad_weight w_scalar = 0;   /* the per-layer [1] residual scalar, `cur = cur * scalar` */
     rad_op     op_scale = 0;
+    /* the fused junctions (see g4_fuse): attention -> this layer's feed-forward, and this layer's
+     * feed-forward -> the next layer's attention, scalar included. The last layer has no j_ma: its
+     * stream goes to the final norm, which feeds the lm_head and not a quantiser. */
+    G4Junction j_am{}, j_ma{};
 };
 
 struct Model {
@@ -1071,6 +1214,10 @@ struct Model {
      * speculates (`max_spec` > 0). */
     Gemma4Head head{};
     bool       have_head = false;
+
+    G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
+    bool       fuse = false;
+    bool       fuse_ar = false;   /* every junction also carries the all-reduce in front of it */
 };
 
 static Model g_model[MAX_RANKS];
@@ -1311,6 +1458,38 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            {mw.x}, {mw.x});
     }
 
+    /* ---- the junctions, declared once every layer exists (j_ma reads the next layer's gain). Used
+     * only when every one of them resolved and every block input is the w4a8 grid; otherwise
+     * the blocks keep their own norms, quantisers, post-norms and adds. */
+    if (g4_fuse() && m.n_main > 0) {
+        bool ok = true;
+        for (const Layer& lay : m.layers)
+            ok = ok && lay.attn.ln_q.quant && lay.mlp.ln_gu.quant;
+        if (ok) {
+            RAD_ARCH_TRY(m.j0.declare(b, g, m.b_x, 0, m.layers[0].attn.w_norm, 0, 0, m.layers[0].attn.ln_q));
+            ok = m.j0.op != 0;
+            for (int64_t l = 0; ok && l < m.n_main; ++l) {
+                Layer& lay = m.layers[(size_t)l];
+                RAD_ARCH_TRY(lay.j_am.declare(b, g, m.b_h, m.b_x, lay.mlp.w_norm, lay.attn.w_post, 0,
+                                              lay.mlp.ln_gu));
+                ok = lay.j_am.op != 0;
+                if (ok && l + 1 < m.n_main) {
+                    const Layer& nx = m.layers[(size_t)l + 1];
+                    RAD_ARCH_TRY(lay.j_ma.declare(b, g, m.b_h, m.b_x, nx.attn.w_norm, lay.mlp.w_post,
+                                                  lay.w_scalar, nx.attn.ln_q));
+                    ok = lay.j_ma.op != 0;
+                }
+            }
+        }
+        m.fuse = ok;
+        bool ar = ok && g.world == 2;
+        for (int64_t l = 0; ar && l < m.n_main; ++l) {
+            const Layer& lay = m.layers[(size_t)l];
+            ar = lay.j_am.op_ar != 0 && (l + 1 >= m.n_main || lay.j_ma.op_ar != 0);
+        }
+        m.fuse_ar = ar;
+    }
+
     /* ---- the tail: final norm, the sampled rows, the lm_head, and the soft-cap. */
     m.op_final = rw(b, RAD_OP(b, "rmsnorm",
                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
@@ -1407,9 +1586,20 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     brows(m.b_x, batch->n_tok), RAD_NONE);
     trc_copy(c, m.trc, m.g.n_embd, 0, 0, m.b_x, batch->n_tok);   /* site x0: post-embedding */
 
-    for (const Layer& l : m.layers) {
-        l.attn.step(c, batch);
-        l.mlp.step(c, batch);
+    const int64_t T = batch->n_tok;
+    if (m.fuse) m.j0.step(c, T);
+    for (size_t li = 0; li < m.layers.size(); ++li) {
+        const Layer& l = m.layers[li];
+        const bool last = li + 1 == m.layers.size();
+        l.attn.step(c, batch, m.fuse, m.fuse, m.fuse_ar);
+        if (m.fuse) l.j_am.step(c, T, m.fuse_ar);
+        l.mlp.step(c, batch, m.fuse, m.fuse && !last, m.fuse_ar);
+        if (m.fuse && !last) {
+            /* [all-reduce,] post-norm, add, the layer scalar, the next block's norm and quantiser: one op */
+            l.j_ma.step(c, T, m.fuse_ar);
+            trc_copy(c, m.trc, m.g.n_embd, l.attn.layer, 3, m.b_x, batch->n_tok);  /* site x_l */
+            continue;
+        }
         /* the per-layer scalar: `cur = cur * scalar`, the [1] bf16 over the residual stream,
          * applied at the end of each layer (after the mlp add) -- exactly the vLLM oracle's
          * `hidden_states = hidden_states * self.layer_scalar`. The checkpoint's values (0.03-0.99,

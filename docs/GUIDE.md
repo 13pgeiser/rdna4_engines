@@ -1860,7 +1860,8 @@ run a second time on the same inputs, to ask whether a kernel is a function of t
 instruments, not features; grep `getenv` if you need one, and read the comment beside it first.
 `libr4d` keeps the same culture under `R4D_DIAG` (master switch for selection/store/hidden-state
 traces), `R4D_VERIFY_ATTN` and `R4D_VERIFY_OFF` (device kernels recomputed on the host and diffed),
-and `RADIANCE_TRACE_RESID` (an arch-side residual ring); all default off.
+`RADIANCE_TRACE_RESID` (an arch-side residual ring) and `RADIANCE_G4_FUSE=0` (Gemma 4's decode
+step on the unfused chains, an A/B for the fused ops); all default off.
 
 ---
 

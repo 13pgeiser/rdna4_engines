@@ -3388,6 +3388,7 @@ TEST(gemma4_every_weight_has_a_name_map) {
 
 TEST(a_gemma4_decode_step_runs_both_classes_in_order) {
     RadBuilder b;
+    b.refuse.insert("qkv_norm_rope");   /* the unfused prologue; the fused one is checked below */
     RadModelMeta meta = gemma4_meta();
     RadBuildCtx  ctx  = build_ctx();
     CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
@@ -3429,6 +3430,97 @@ TEST(a_gemma4_decode_step_runs_both_classes_in_order) {
         else if (o->op == "gather_rows" || o->op == "logits_gemm" || o->op == "logit_softcap")
             CHECK_EQ(i.n, (int64_t)batch.n_out);
     }
+}
+
+/* THE w4a8 TRUNK FUSES ITS RESIDUAL JUNCTIONS: the first block's entry, every attention -> feed-forward
+ * and every feed-forward -> next attention is one `rmsnorm_quant_i8` (post-norm, add, layer scalar,
+ * norm and quantiser), and q, k and v read one quantised pair. The last layer's stream goes to the
+ * final norm unfused, and a kernel set that does not resolve the op keeps the whole unfused chain
+ * -- with the shared q/k/v pair, which needs nothing new. */
+static std::vector<std::string> gemma4_w4_step(const std::set<std::string>& refuse, int world = 1) {
+    RadBuilder b;
+    const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+    b.encs = { { "attn_q.", w4 }, { "attn_k.", w4 }, { "attn_v.", w4 }, { "attn_o.", w4 },
+               { "ffn_gate_up.", w4 }, { "ffn_down.", w4 } };
+    for (const auto& r : refuse) b.refuse.insert(r);
+    RadModelMeta meta = gemma4_meta();
+    RadBuildCtx  ctx  = build_ctx(0, world);
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+    RadCtx c; c.b = &b; c.rank = 0; c.world = world;
+    RadBatch batch = decode_batch();
+    c.batch = &batch;
+    gemma4_bf16::step(&c, &batch);
+    return issued_ops(b, c);
+}
+
+/* At two ranks the all-reduce in front of every junction is folded into it: the only standalone
+ * collectives left are the embedding's and the last layer's feed-forward, whose stream goes to the
+ * final norm rather than a quantiser. Without the fused collective the junctions keep their
+ * all-reduces in front of them. */
+TEST(a_gemma4_w4a8_step_at_two_ranks_folds_the_all_reduce_into_the_junction) {
+    std::vector<std::string> want = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
+    for (int l = 0; l < 12; ++l) {
+        const bool global = (l + 1) % 6 == 0;
+        for (int i = 0; i < (global ? 2 : 3); ++i) want.push_back("gemm_nt_q");
+        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
+                               "ar_rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
+            want.push_back(s);
+        if (l < 11) want.push_back("ar_rmsnorm_quant_i8");
+        else for (const char* s : { "all_reduce", "rmsnorm", "add", "scale" }) want.push_back(s);
+    }
+    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
+        want.push_back(s);
+    CHECK_EQ(join(gemma4_w4_step({}, 2)), join(want));
+
+    std::vector<std::string> plain = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
+    for (int l = 0; l < 12; ++l) {
+        const bool global = (l + 1) % 6 == 0;
+        for (int i = 0; i < (global ? 2 : 3); ++i) plain.push_back("gemm_nt_q");
+        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
+                               "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8",
+                               "gemm_nt_q", "all_reduce" })
+            plain.push_back(s);
+        if (l < 11) plain.push_back("rmsnorm_quant_i8");
+        else for (const char* s : { "rmsnorm", "add", "scale" }) plain.push_back(s);
+    }
+    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
+        plain.push_back(s);
+    CHECK_EQ(join(gemma4_w4_step({ "ar_rmsnorm_quant_i8" }, 2)), join(plain));
+}
+
+TEST(a_gemma4_w4a8_step_fuses_its_residual_junctions) {
+    std::vector<std::string> want = { "embed_lookup", "rmsnorm_quant_i8" };
+    for (int l = 0; l < 12; ++l) {
+        const bool global = (l + 1) % 6 == 0;
+        for (int i = 0; i < (global ? 2 : 3); ++i) want.push_back("gemm_nt_q");
+        for (const char* s : { "qkv_norm_rope", "kv_store",
+                               "attn_paged", "quant_act_i8", "gemm_nt_q", "rmsnorm_quant_i8",
+                               "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
+            want.push_back(s);
+        if (l < 11) want.push_back("rmsnorm_quant_i8");
+        else for (const char* s : { "rmsnorm", "add", "scale" }) want.push_back(s);
+    }
+    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
+        want.push_back(s);
+    CHECK_EQ(join(gemma4_w4_step({})), join(want));
+}
+
+TEST(a_gemma4_w4a8_step_without_the_fused_ops_keeps_the_chain_and_one_qkv_quantiser) {
+    std::vector<std::string> want = { "embed_lookup" };
+    for (int l = 0; l < 12; ++l) {
+        const bool global = (l + 1) % 6 == 0;
+        want.push_back("rmsnorm");
+        want.push_back("quant_act_i8");
+        for (int i = 0; i < (global ? 2 : 3); ++i) want.push_back("gemm_nt_q");
+        for (const char* s : { "rmsnorm_p", "rmsnorm", "rmsnorm", "rope", "rope", "kv_store",
+                               "attn_paged", "quant_act_i8", "gemm_nt_q", "rmsnorm", "add",
+                               "rmsnorm", "quant_act_i8", "gemm_nt_q", "gelu_mul", "quant_act_i8",
+                               "gemm_nt_q", "rmsnorm", "add", "scale" })
+            want.push_back(s);
+    }
+    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
+        want.push_back(s);
+    CHECK_EQ(join(gemma4_w4_step({ "rmsnorm_quant_i8", "qkv_norm_rope", "gelu_mul_quant_i8" })), join(want));
 }
 
 /* =============================== gemma4: the assistant (MTP) head =============================== */
