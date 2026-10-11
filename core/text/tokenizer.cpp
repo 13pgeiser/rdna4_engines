@@ -603,16 +603,27 @@ int Vocab::load(VocabBuild b) {
     if (b_.eos >= 0) eog_.push_back(b_.eos);
     if (b_.eot >= 0 && b_.eot != b_.eos) eog_.push_back(b_.eot);
     {
+        /* Gemma 4 ends a turn on `<turn|>` and a tool-calling turn on `<|tool_response>` -- the
+         * opener of the result the CALLER supplies, which the model writes after its last
+         * `<tool_call|>` -- and declares neither: its eos is `<eos>`. llama.cpp's loader lists
+         * both for it, and both are control tokens nothing else spells. */
         static const char* const kEogNames[] = {
             "<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>",
             "<|end|>", "<|EOT|>", "<|eom_id|>", "<|return|>", "<eos>", "</s>",
+            "<turn|>", "<|tool_response>",
         };
+        /* A vocabulary with `<|tool_response>` (Gemma 4) has `</s>` as ordinary text, as
+         * llama.cpp also concludes; ending on it would end a reply that writes the HTML tag. */
+        bool gemma4 = false;
+        for (int32_t id : special_)
+            if (b_.types[id] == RAD_TT_CONTROL && b_.tokens[id] == "<|tool_response>") gemma4 = true;
         std::string added;
         for (int32_t id : special_) {
             if (b_.types[id] != RAD_TT_CONTROL) continue;
             if (std::find(eog_.begin(), eog_.end(), id) != eog_.end()) continue;
             bool known = false;
             for (const char* n : kEogNames) if (b_.tokens[id] == n) { known = true; break; }
+            if (gemma4 && b_.tokens[id] == "</s>") known = false;
             if (!known) continue;
             eog_.push_back(id);
             added += (added.empty() ? "" : " ") + b_.tokens[id] + "=" + std::to_string(id);
