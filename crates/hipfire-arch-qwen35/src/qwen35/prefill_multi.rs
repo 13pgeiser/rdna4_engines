@@ -110,8 +110,9 @@ fn multi_chunk_wide_route(arch: &str, flags: &rdna_compute::FeatureFlags) -> boo
         && Gpu::mq4_verify_singleton_chain_for(arch, flags)
 }
 
-/// The target half of [`multi_chunk_wide_admitted`].
-fn multi_chunk_dense_mq4v2_target(weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+/// The target half of [`multi_chunk_wide_admitted`] (also the dense-target
+/// half of the PM FP8 verify admission, `prefill::fp8_verify_target`).
+pub(crate) fn multi_chunk_dense_mq4v2_target(weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
     use rdna_compute::DType::MQ4G256V2;
     config.num_experts == 0
         && weights.output.gpu_dtype == MQ4G256V2
@@ -395,8 +396,11 @@ fn capture_layer_rows(
 /// ring/tape bounds, Q8+EF DeltaNet, uncompacted Q8/fp8 KV, no capture or
 /// recording) is checked before any request state is mutated; the request is
 /// refused before the first launch otherwise. A combined count of 64 or more
-/// runs the shared stages with [`DenseBatchMath::SingletonWmma`]; at most 63
-/// rows keeps [`DenseBatchMath::Product`] exactly as before.
+/// runs the shared stages with [`DenseBatchMath::SingletonWmma`], as does any
+/// row count under the PM FP8 verify scope (`Gpu::fp8_verify_scope`, see
+/// [`verify_dense_math`]: the `*VerifyExact` keys route to the FP8 verify
+/// GEMMs at every row count); otherwise at most 63 rows keep
+/// [`DenseBatchMath::Product`] exactly as before.
 pub fn forward_prefill_batch_multi(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -420,7 +424,7 @@ pub fn forward_prefill_batch_multi(
     if wide && !multi_chunk_wide_admitted(gpu, weights, config) {
         return refuse("64+ rows need the exact wide verify route: a dense MQ4G256V2 gfx1201 target whose singleton runs the one-tile F16-WMMA chain");
     }
-    let math = if wide { DenseBatchMath::SingletonWmma } else { DenseBatchMath::Product };
+    let math = if wide { DenseBatchMath::SingletonWmma } else { verify_dense_math(gpu) };
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         return refuse("graph capture / replay recording is not supported");
     }

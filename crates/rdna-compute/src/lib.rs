@@ -23,6 +23,7 @@ pub mod flash_attn_ck;
 pub mod flux_fused;
 pub mod gap_timing;
 pub mod gemm;
+mod gemm_fp8_verify;
 mod gemm_vt;
 mod packed_mq4;
 mod gemma4_ext;
@@ -61,6 +62,10 @@ pub use scratch::{
     Int8MmqReservation, Mq4v2Fp8Prepared,
 };
 pub use gemm::F2GdnTargets;
+pub use gemm_fp8_verify::{
+    fp8_verify_symbol, fp8_verify_tile, Fp8VerifyOp, Fp8VerifyReceipt, Fp8VerifyTarget, Fp8VerifyTile,
+    Fp8VerifyX,
+};
 pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;

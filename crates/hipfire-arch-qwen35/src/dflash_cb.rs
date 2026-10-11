@@ -50,7 +50,7 @@ use crate::qwen35::prefill::multi::{
     forward_prefill_batch_multi, multi_chunk_pack_cap, multi_chunk_scratch_rows, pack_whole_lanes, MultiChunkRequest,
     MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
-use crate::qwen35::prefill::DenseBatchMath;
+use crate::qwen35::prefill::{fp8_verify_open, verify_dense_math, DenseBatchMath};
 use crate::qwen35::{self, DeltaNetState, DflashFusionCtx};
 use crate::qwen35::{Qwen35Config, Qwen35Weights};
 use crate::speculative::{
@@ -280,7 +280,10 @@ pub fn dflash_lane_draft(
 /// D2H. Logits land in `vs.logits[0..rows]`, picks in `vs.argmax[0..rows]`.
 /// A head over 64+ rows (only a wide chunk reaches it) uses the exact
 /// singleton-WMMA lm-head, whose rows equal the singleton head's; below 64
-/// rows the product head is the singleton's own.
+/// rows the product head is the singleton's own, except inside the PM FP8
+/// verify scope ([`verify_dense_math`]) where every row count takes the
+/// `*VerifyExact` head (FP8-routed). Call it inside the same scope as the
+/// trunk forward it follows.
 pub fn dflash_cb_head_argmax(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -292,7 +295,7 @@ pub fn dflash_cb_head_argmax(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
     let final_hidden = vs.final_hidden.sub_offset(0, rows * config.dim);
-    let math = if rows > MULTI_CHUNK_PRODUCT_MAX_ROWS { DenseBatchMath::SingletonWmma } else { DenseBatchMath::Product };
+    let math = if rows > MULTI_CHUNK_PRODUCT_MAX_ROWS { DenseBatchMath::SingletonWmma } else { verify_dense_math(gpu) };
     dflash_enqueue_verify_lm_head_argmax(
         gpu,
         &weights.output,
@@ -628,7 +631,12 @@ pub fn dflash_cb_verify(
         for lane in lanes[range.clone()].iter_mut() {
             lane.state.df.target_snap.save_from(lane.dn_state, gpu)?;
         }
-        {
+        // PM FP8 verify scope (`HIPFIRE_CB_VERIFY_FP8`): trunk + head run the one
+        // E4M3 verify arithmetic at every row count, so this batched chunk equals
+        // each lane's singleton verify (same admission: the lanes share target
+        // and KV tier); closed on every path below.
+        let prev = fp8_verify_open(gpu, weights, config, &*lanes[range.start].kv_cache)?;
+        let fwd = {
             let mut reqs: Vec<MultiChunkRequest<'_>> = Vec::with_capacity(range.len());
             for lane in lanes[range.clone()].iter_mut() {
                 let DflashCbVerifyLane { kv_cache, dn_state, state, draft } = lane;
@@ -643,9 +651,14 @@ pub fn dflash_cb_verify(
                     hidden_rb: Some(&mut df.hidden_rb),
                 });
             }
-            forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.head.final_hidden))?;
-        }
-        let picks = dflash_cb_head_argmax(gpu, weights, config, &cb.head, rows)?;
+            forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.head.final_hidden))
+        };
+        let picks = match fwd {
+            Ok(()) => dflash_cb_head_argmax(gpu, weights, config, &cb.head, rows),
+            Err(e) => Err(e),
+        };
+        gpu.fp8_verify_exit(prev);
+        let picks = picks?;
         let mut row = 0usize;
         for lane in lanes[range].iter_mut() {
             let b = lane.draft.verify_tokens.len();

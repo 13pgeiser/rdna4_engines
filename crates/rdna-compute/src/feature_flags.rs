@@ -320,6 +320,18 @@ pub struct FeatureFlags {
     /// PeaceMaker bundle; `=0` runs their byte-identical hipcc twins. Never
     /// selects IU4/FP8, and a missing PM image is a load error.
     pub cb_verify_pm: bool,
+    /// `HIPFIRE_CB_VERIFY_FP8=1` (developer, default OFF): the Qwen3.5
+    /// hybrid target verify (DFlash and MTP; singleton and continuous
+    /// batching) runs its dense MQ4G256V2 GEMMs, including the verify
+    /// lm_head, through the PeaceMaker FP8 verify family
+    /// (`crate::gemm_fp8_verify`): symmetric weights dequantized exactly to
+    /// E4M3, per-row E4M3 activations, `v_wmma_f32_16x16x16_fp8_fp8`, and a
+    /// per-output reduction order fixed for every row count 1..=128, so
+    /// batched rows are byte-identical to singleton rows by construction.
+    /// Needs exact gfx1201, symmetric MQ4G256V2 weights and an eligible
+    /// forward; the scope entry fails closed otherwise. Not the PM F16
+    /// family: `HIPFIRE_CB_VERIFY_PM` does not apply.
+    pub cb_verify_fp8: bool,
     /// Staged-tile v2 selector for the four gfx1201 FP8-WMMA MQ4v2 prefill
     /// routes (`HIPFIRE_GFX12_MQ4V2_FP8_V2`, `kernel.gfx12_mq4v2_fp8_v2`).
     /// Default ON on exact gfx1201; `=0` selects the s2bt8/BT symbols.
@@ -899,6 +911,7 @@ impl FeatureFlags {
             wmma_batch_tiles: parse_bool("HIPFIRE_WMMA_BATCH_TILES").unwrap_or(arch == "gfx1201"),
             cb_verify_chunk128: parse_bool("HIPFIRE_CB_VERIFY_CHUNK128").unwrap_or(false),
             cb_verify_pm: parse_bool("HIPFIRE_CB_VERIFY_PM").unwrap_or(true),
+            cb_verify_fp8: parse_bool("HIPFIRE_CB_VERIFY_FP8").unwrap_or(false),
             gfx12_mq4v2_fp8_v2: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_V2")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_gdn_pre_fused: parse_bool("HIPFIRE_GFX12_GDN_PRE_FUSED")
@@ -1383,6 +1396,7 @@ impl FeatureFlags {
             wmma_batch_tiles: false,
             cb_verify_chunk128: false,
             cb_verify_pm: true,
+            cb_verify_fp8: false,
             gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
@@ -1766,6 +1780,23 @@ mod tests {
         assert!(!flags(None, Some("0")).cb_verify_pm);
         assert!(flags(None, Some("1")).cb_verify_pm);
         assert!(!FeatureFlags::for_test("gfx1201").cb_verify_chunk128);
+    }
+
+    #[test]
+    fn cb_verify_fp8_defaults_off_and_parses() {
+        let flags = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_CB_VERIFY_FP8", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        assert!(!flags(None).cb_verify_fp8);
+        assert!(flags(Some("1")).cb_verify_fp8);
+        assert!(!flags(Some("0")).cb_verify_fp8);
+        // Independent of the PM F16 family flag and off in the test constructor.
+        assert!(flags(Some("1")).cb_verify_pm);
+        assert!(!FeatureFlags::for_test("gfx1201").cb_verify_fp8);
+        assert!(!FeatureFlags::for_test("gfx1100").cb_verify_fp8);
     }
 
     #[test]

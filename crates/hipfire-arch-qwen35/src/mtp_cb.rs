@@ -25,10 +25,12 @@ use crate::qwen35::prefill::multi::{
     forward_prefill_batch_multi, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS,
     MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
+use crate::qwen35::prefill::fp8_verify_open;
 
 /// Rows one MTP CB trunk chunk packs: the product cap. The wide 64..=128-row
 /// verify route is DFlash-only until a wide MTP state-oracle receipt exists,
-/// so MTP never takes `DenseBatchMath::SingletonWmma` or the exact wide head.
+/// so MTP never takes the exact wide head; inside the PM FP8 verify scope its
+/// shared stages run `DenseBatchMath::SingletonWmma` at these <= 63 rows.
 const MTP_CB_MAX_ROWS: usize = MULTI_CHUNK_PRODUCT_MAX_ROWS;
 
 /// Shared verify buffers for one CB engine: trunk scratch, post-norm hidden
@@ -318,7 +320,12 @@ pub fn mtp_cb_verify(
             let lane = &mut lanes[i];
             lane.state.trunk_snap.save_from(lane.dn_state, gpu)?;
         }
-        {
+        // PM FP8 verify scope (`HIPFIRE_CB_VERIFY_FP8`): trunk + verify head run the
+        // one E4M3 verify arithmetic at every row count, so this shared chunk equals
+        // each lane's singleton verify (same admission: the lanes share target and
+        // KV tier); closed on every path below.
+        let prev = fp8_verify_open(gpu, weights, config, &*lanes[chunk[0]].kv_cache)?;
+        let fwd = {
             let mut reqs: Vec<MultiChunkRequest<'_>> = Vec::with_capacity(chunk.len());
             let mut rest: &mut [MtpCbVerifyLane<'_>] = lanes;
             let mut base = 0usize;
@@ -337,10 +344,14 @@ pub fn mtp_cb_verify(
                     hidden_rb: None,
                 });
             }
-            forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.hidden))?;
-        }
+            forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.hidden))
+        };
         let logits = cb.logits.sub_offset(0, rows * vocab);
-        mtp_trunk_verify_lm_head(gpu, &weights.output, &cb.hidden, &cb.rot, &logits, rows, dim, vocab)?;
+        let head = fwd.and_then(|()| {
+            mtp_trunk_verify_lm_head(gpu, &weights.output, &cb.hidden, &cb.rot, &logits, rows, dim, vocab)
+        });
+        gpu.fp8_verify_exit(prev);
+        head?;
         let mut row = 0usize;
         for &i in &chunk {
             let n = lanes[i].draft.n_verify();

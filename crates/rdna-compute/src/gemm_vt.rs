@@ -632,6 +632,11 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return self.gemm_qkvza_mq4g256v2_verify_fp8(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, n,
+            );
+        }
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let plan = self.verify_exact_plan(&VERIFY_QKVZA, "gemm_qkvza_mq4g256v2_verify_exact", total_m, k, n)?;
         self.bind_thread()?;
@@ -679,6 +684,9 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return self.gemm_qkv_mq4g256v2_verify_fp8(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, n);
+        }
         let total_m = q_m + k_m + v_m;
         let plan = self.verify_exact_plan(&VERIFY_QKV, "gemm_qkv_mq4g256v2_verify_exact", total_m, k, n)?;
         self.bind_thread()?;
@@ -720,6 +728,9 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return self.gemm_gate_up_mq4g256v2_verify_fp8(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, n);
+        }
         let total_m = gate_m + up_m;
         let plan = self.verify_exact_plan(&VERIFY_GATE_UP, "gemm_gate_up_mq4g256v2_verify_exact", total_m, k, n)?;
         self.bind_thread()?;
@@ -748,6 +759,9 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return self.gemm_mq4g256v2_residual_verify_fp8(a, x, y, m, k, n);
+        }
         let plan = self.verify_exact_plan(&VERIFY_RESIDUAL, "gemm_mq4g256v2_residual_verify_exact", m, k, n)?;
         self.bind_thread()?;
         self.load_verify_plan(&plan)?;
@@ -769,6 +783,9 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return self.gemm_mq4g256v2_lmhead_verify_fp8(a, x, y, m, k, n);
+        }
         // Resolve and load before the memset so a refused or unloadable
         // launch leaves `y` untouched.
         let plan = self.verify_exact_plan(&VERIFY_RESIDUAL, "gemm_mq4g256v2_lmhead_verify_exact", m, k, n)?;

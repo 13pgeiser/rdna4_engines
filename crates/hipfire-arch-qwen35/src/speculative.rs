@@ -25,7 +25,7 @@ use crate::dflash_verify_pm4::{
 use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
-use crate::qwen35::prefill::DenseBatchMath;
+use crate::qwen35::prefill::{fp8_verify_target, verify_dense_math, DenseBatchMath};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
@@ -36,7 +36,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Fp8VerifyTarget, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3889,20 +3889,26 @@ pub fn dflash_greedy_accept_commit_parts(
         }
     } else {
         let replay_tokens = &committed[..accept_len + 1];
-        qwen35::forward_prefill_batch(
-            gpu,
-            target.weights,
-            target.config,
-            replay_tokens,
-            position,
-            target.kv_cache,
-            target.dn_state,
-            target.scratch,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        // Batched-forward rollback replay: inside the PM FP8 verify scope so the
+        // rewritten KV/DeltaNet rows are the verify's FP8 rows (n >= 2; the
+        // per-token n == 1 fallback inside is the decode GEMV).
+        let fp8 = fp8_verify_target(target.weights, target.config, target.kv_cache);
+        fp8_verify_scoped(gpu, fp8, |gpu| {
+            qwen35::forward_prefill_batch(
+                gpu,
+                target.weights,
+                target.config,
+                replay_tokens,
+                position,
+                target.kv_cache,
+                target.dn_state,
+                target.scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+        })?;
     }
 
     Ok(SpecStepResult {
@@ -3997,7 +4003,66 @@ pub fn verify_dflash_block_tree(
     )
 }
 
+/// Run `f` inside the PM FP8 verify scope opened for `target`
+/// (`Gpu::fp8_verify_enter`; closed unless the forward qualifies), closing it
+/// on every path. For target forwards that re-commit state after a verify, so
+/// they reproduce the verify's FP8 rows.
+pub(crate) fn fp8_verify_scoped<T>(
+    gpu: &mut Gpu,
+    target: Fp8VerifyTarget,
+    f: impl FnOnce(&mut Gpu) -> HipResult<T>,
+) -> HipResult<T> {
+    let prev = gpu.fp8_verify_enter(target)?;
+    let r = f(gpu);
+    gpu.fp8_verify_exit(prev);
+    r
+}
+
+/// Target verify trunk + verify lm_head/argmax inside the PM FP8 verify GEMM
+/// scope (`HIPFIRE_CB_VERIFY_FP8`, see `qwen35::prefill::fp8_verify_target`):
+/// one MQ4G256V2 -> E4M3 arithmetic for every row count, so this singleton ==
+/// the batched continuous-batching verify byte-for-byte. The scope covers the
+/// HIP-graph capture/replay and eager arms and the lm_head enqueue, and is
+/// closed on every path. A tree verify never opens it.
+#[allow(clippy::too_many_arguments)]
 fn verify_dflash_block_inner(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
+    tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
+    verify_scratch: &VerifyScratch,
+    skip_argmax_d2h: bool,
+    retained: Option<&mut RetainedCtx<'_>>,
+) -> HipResult<DflashVerifyOutput> {
+    let fp8 = if tree_verify.is_some() {
+        Fp8VerifyTarget::Ineligible
+    } else {
+        fp8_verify_target(&target.weights, &target.config, &target.kv_cache)
+    };
+    let prev = gpu.fp8_verify_enter(fp8)?;
+    let r = verify_dflash_block_inner_body(
+        gpu,
+        target,
+        draft_tokens,
+        start_pos,
+        hidden_rb,
+        gdn_tape,
+        want_full_logits,
+        tree_verify,
+        verify_scratch,
+        skip_argmax_d2h,
+        retained,
+    );
+    gpu.fp8_verify_exit(prev);
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_dflash_block_inner_body(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
     draft_tokens: &[u32],
@@ -4306,6 +4371,7 @@ fn verify_dflash_block_inner(
             );
             let r = if r.is_ok() && capture_lmhead_argmax {
                 r.and_then(|_| {
+                    let math = verify_dense_math(gpu);
                     dflash_enqueue_verify_lm_head_argmax(
                         gpu,
                         &target.weights.output,
@@ -4313,7 +4379,7 @@ fn verify_dflash_block_inner(
                         verify_scratch,
                         b,
                         vocab,
-                        DenseBatchMath::Product,
+                        math,
                     )
                 })
             } else {
@@ -4503,6 +4569,13 @@ pub(crate) fn dflash_verify_head(
     let mut argmax_per_pos: Vec<u32> = Vec::with_capacity(b);
 
     let try_batched = dflash_batched_lm_head_supported(w_out.gpu_dtype);
+    if gpu.fp8_verify_scope && !try_batched && !graph_includes_lmhead_argmax {
+        // Fail closed: the per-row GEMV fallback is not an FP8-verify arm.
+        return Err(HipError::new(
+            0,
+            "dflash_verify_head: fp8 verify scope needs a batched MQ4G256V2 lm_head",
+        ));
+    }
 
     if graph_includes_lmhead_argmax {
         debug_assert!(!want_full_logits);
@@ -4517,6 +4590,7 @@ pub(crate) fn dflash_verify_head(
         // HIPFIRE_DFLASH_Q8_LMHEAD_WMMA=0 to force the legacy scalar chunks.
         // MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
         // single-shot path.
+        let math = verify_dense_math(gpu);
         dflash_enqueue_verify_lm_head(
             gpu,
             w_out,
@@ -4524,7 +4598,7 @@ pub(crate) fn dflash_verify_head(
             verify_scratch,
             b,
             vocab,
-            DenseBatchMath::Product,
+            math,
         )?;
         if want_full_logits {
             // Rejection-sampling path needs full target distribution.
@@ -7226,20 +7300,25 @@ pub fn spec_step_dflash(
         }
     } else {
         let replay_tokens = &committed[..accept_len + 1];
-        qwen35::forward_prefill_batch(
-            gpu,
-            &target.weights,
-            &target.config,
-            replay_tokens,
-            position,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        // Batched-forward rollback replay inside the PM FP8 verify scope (same
+        // reason as `dflash_greedy_accept_commit_parts`).
+        let fp8 = fp8_verify_target(&target.weights, &target.config, &target.kv_cache);
+        fp8_verify_scoped(gpu, fp8, |gpu| {
+            qwen35::forward_prefill_batch(
+                gpu,
+                &target.weights,
+                &target.config,
+                replay_tokens,
+                position,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+        })?;
     }
     // Target state is now at position + accept_len + 1. KV cache has
     // written K/V at positions [position..position+accept_len]. The bonus

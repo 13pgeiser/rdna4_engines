@@ -11207,6 +11207,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.fp8_verify_scope {
+            return self.gemm_qkvza_mq4g256v2_verify_fp8(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+                alpha_m, k, batch_size,
+            );
+        }
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_i8(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
@@ -31800,6 +31806,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkvza_mq4g256v2_wmma"));
+        }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
@@ -32562,6 +32571,11 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return self.gemm_qkv_mq4g256v2_verify_fp8(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_i8(a_q, xq, y_q, q_m, k, batch_size)?;
@@ -32716,6 +32730,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkv_mq4g256v2_wmma"));
+        }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
@@ -33199,6 +33216,11 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.fp8_verify_scope {
+            return self.gemm_gate_up_mq4g256v2_verify_fp8(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_i8(a_gate, xq, y_gate, gate_m, k, batch_size)?;
@@ -33933,6 +33955,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_gate_up_mq4g256v2_wmma"));
+        }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
@@ -35801,6 +35826,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.fp8_verify_scope {
+            return self.gemm_mq4g256v2_residual_verify_fp8(a_raw, x, y, m, k, batch_size);
+        }
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             return self.gemm_mq4g256v2_mmq_add_prequant_i8(a_raw, xq, y, m, k, batch_size);
@@ -35972,6 +36000,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_mq4g256v2_residual_wmma"));
+        }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
@@ -37631,6 +37662,9 @@ impl Gpu {
         batch_size: usize,
         residual: bool,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_mq4g256v2_xbatch"));
+        }
         let (func, source) = if residual {
             (
                 "gemv_mq4g256v2_xbatch_residual",
@@ -37713,6 +37747,11 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.fp8_verify_scope {
+            // Every row count (including n == 1) runs the FP8 `set` op: no
+            // GEMV shortcut, no memset, no F16 arm.
+            return self.gemm_mq4g256v2_lmhead_verify_fp8(a_raw, x, y, m, k, batch_size);
+        }
         if batch_size == 1 {
             return self.gemv_mq4g256v2(a_raw, x, y, m, k);
         }

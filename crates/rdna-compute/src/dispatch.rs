@@ -1098,6 +1098,12 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
+    /// `HIPFIRE_CB_VERIFY_FP8` scope (see `crate::gemm_fp8_verify`): set by
+    /// [`Gpu::fp8_verify_enter`] for the duration of a target verify forward.
+    /// While true, every dense MQ4G256V2 verify GEMM runs the PeaceMaker FP8
+    /// family or fails; F16-input producers error. Always false when the flag
+    /// is off.
+    pub fp8_verify_scope: bool,
     /// Qwen4 symmetric MQ4 trunk verified for the dense IU4 route
     /// (`HIPFIRE_QWEN4_TRUNK_IU4`); set by the Qwen4 forward after every
     /// trunk header passed [`Gpu::qwen4_trunk_sym_check`]. See
@@ -1917,6 +1923,10 @@ impl Gpu {
                 mq4v2_fp8_half_sums_scratch_bytes: 0,
                 mq4v2_fp8_row_scales_scratch: None,
                 mq4v2_fp8_row_scales_scratch_bytes: 0,
+                fp8_verify_x8_scratch: None,
+                fp8_verify_x8_scratch_bytes: 0,
+                fp8_verify_scales_scratch: None,
+                fp8_verify_scales_scratch_bytes: 0,
                 fp8_f2_weights: None,
                 fp8_f2_weights_bytes: 0,
                 ksplit_det_partials: None,
@@ -1932,6 +1942,7 @@ impl Gpu {
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
+            fp8_verify_scope: false,
             qwen4_trunk_iu4: false,
             residual_fold_arm: None,
             residual_fold_pending: None,

@@ -1078,6 +1078,7 @@ use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::WeightTensor;
 use rdna_compute::DType;
+use rdna_compute::Fp8VerifyTarget;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 /// Row-parallel epilogue for dense-TP batched partials.
@@ -1119,6 +1120,52 @@ fn require_singleton_wmma_mq4v2(site: &str, dtypes: &[DType]) -> HipResult<()> {
             ),
         ))
     }
+}
+
+/// Dense-batch arithmetic of a target-verify forward: [`DenseBatchMath::SingletonWmma`]
+/// at every row count while the PM FP8 verify scope is open
+/// (`HIPFIRE_CB_VERIFY_FP8`, see `Gpu::fp8_verify_enter`) so every dense stage
+/// is an F32 producer + `*VerifyExact` key, which rdna routes to the FP8 verify
+/// GEMMs (batched == singleton by construction, no F16 fusion fast route);
+/// [`DenseBatchMath::Product`] (byte-identical to the pre-FP8 route) otherwise.
+#[inline]
+pub(crate) fn verify_dense_math(gpu: &Gpu) -> DenseBatchMath {
+    if gpu.fp8_verify_scope {
+        DenseBatchMath::SingletonWmma
+    } else {
+        DenseBatchMath::Product
+    }
+}
+
+/// Whether a target-verify forward over `weights` with KV tier `kv` can run
+/// inside the PM FP8 verify scope (`Gpu::fp8_verify_enter`): a dense
+/// MQ4G256V2 target whose batched attention takes the KV tier (FP8, Q8 or
+/// asym). A tree verify passes [`Fp8VerifyTarget::Ineligible`] itself.
+/// Singleton, batched and rollback forwards of one request share this
+/// answer, so they share the arithmetic.
+pub(crate) fn fp8_verify_target(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    kv: &llama::KvCache,
+) -> Fp8VerifyTarget {
+    let kv_batched = kv.quant_fp8 || kv.quant_q8 || kv.quant_asym4 || kv.quant_asym3 || kv.quant_asym2;
+    if kv_batched && multi::multi_chunk_dense_mq4v2_target(weights, config) {
+        Fp8VerifyTarget::Eligible
+    } else {
+        Fp8VerifyTarget::Ineligible
+    }
+}
+
+/// Open the PM FP8 verify scope for a target-verify forward (see
+/// [`fp8_verify_target`]); the caller closes it with
+/// `gpu.fp8_verify_exit(prev)` on every path.
+pub(crate) fn fp8_verify_open(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    kv: &llama::KvCache,
+) -> HipResult<bool> {
+    gpu.fp8_verify_enter(fp8_verify_target(weights, config, kv))
 }
 #[inline]
 fn zero_partial_for_residual(
@@ -5613,6 +5660,8 @@ pub(crate) fn batch_chunk_upload_positions(
 #[inline]
 fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, dim: usize) -> bool {
     matches!(fusion, DflashFusionCtx::ChainVerify)
+        // The PM FP8 verify scope never takes an F16-input projection route.
+        && !gpu.fp8_verify_scope
         && gpu.arch_caps.is_gfx1100()
         && !gpu.flags.mq_f16_projection_off
         && n >= 1
@@ -6590,6 +6639,9 @@ fn s4_residual_fast(
     n: usize,
 ) -> bool {
     fusion == DflashFusionCtx::ChainVerify
+        // The PM FP8 verify scope keeps the F32 producer + FP8 residual GEMM
+        // (batched == singleton by construction; no F16-input residual GEMM).
+        && !gpu.fp8_verify_scope
         && !gpu.flags.mq_f16_residual_off
         && gpu.arch_caps.supports_dflash_f16_residual_fusions()
         && w_dtype == DType::MQ4G256V2
@@ -7103,6 +7155,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         }
         _ => None,
     };
+    let math = verify_dense_math(gpu);
     let prep_fused = batch_chunk_delta_net_input_projection(
         gpu,
         layer,
@@ -7113,7 +7166,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         q8_wmma_arch,
         fusion,
         gdn_targets.as_ref(),
-        DenseBatchMath::Product,
+        math,
     )?;
 
     if let Some((q, k, v, a, segment_rows, scan_out, kkt_batched)) = gdn_chunk_scan_views {
@@ -7200,7 +7253,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
             epilogue,
             fusion,
             scan_out,
-            DenseBatchMath::Product,
+            math,
         )?;
         return Ok(());
     }
@@ -7433,7 +7486,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         epilogue,
         fusion,
         GdnScanOut::F32,
-        DenseBatchMath::Product,
+        math,
     )?;
 
     Ok(())
@@ -9800,7 +9853,11 @@ pub(crate) fn batch_chunk_full_attn_attn(
     let kv_dim = config.n_kv_heads * config.head_dim;
     let q_dim = config.n_heads * config.head_dim;
     let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, fusion, n);
+    let math = verify_dense_math(gpu);
+    // The PM FP8 verify scope has no in-place-gate / A4 out-projection arm
+    // (`SingletonWmma` refuses them), so the fp8q prep stays off there.
     let gfx12_fa_prep_fp8q = gfx12_fa_prep
+        && !gpu.fp8_verify_scope
         && gpu.flags.gfx12_fa_prep_fp8q
         && gpu.flags.attn_qresident
         && gpu.flags.attn_qresident_v2
@@ -9859,7 +9916,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         dim,
         q8_wmma_arch,
         fusion,
-        DenseBatchMath::Product,
+        math,
     )?;
 
     batch_chunk_full_attn_prepare(
@@ -9935,7 +9992,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         fusion,
         fa_gate_in_place,
         a4_epi,
-        DenseBatchMath::Product,
+        math,
     )?;
 
     Ok(())
@@ -13580,7 +13637,27 @@ pub(crate) fn forward_batch_chunk_impl(
 
     let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
     let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
+    // Dense FFN arithmetic of this forward: SingletonWmma under the PM FP8
+    // verify scope, Product otherwise.
+    let math = verify_dense_math(gpu);
+    // Fail closed: the PM FP8 verify scope covers only the dense batched
+    // DeltaNet / FullAttention layers (the MoE and per-token FullAttention
+    // fallback arms never reach a `*VerifyExact` key).
+    if gpu.fp8_verify_scope
+        && (!fa_batched_ok
+            || weights
+                .layers
+                .iter()
+                .any(|l| matches!(l, LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_))))
+    {
+        return Err(HipError::new(
+            0,
+            "forward_batch_chunk: fp8 verify scope needs dense batched DeltaNet/FullAttention layers",
+        ));
+    }
     let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
+        // The GDN chunk-scan arm has no `SingletonWmma` producer.
+        && !gpu.fp8_verify_scope
         && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
         && config.num_experts == 0
         && config.linear_num_key_heads == 16
@@ -13674,7 +13751,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     arch_has_wmma,
                     BatchEpilogue::Residual,
                     fusion,
-                    DenseBatchMath::Product,
+                    math,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -13720,7 +13797,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     arch_has_wmma,
                     BatchEpilogue::Residual,
                     fusion,
-                    DenseBatchMath::Product,
+                    math,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
