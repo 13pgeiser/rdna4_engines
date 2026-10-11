@@ -2,6 +2,9 @@
 
 ## Unreleased (0.4.2)
 
+- **DFlash continuous-batching draft on gfx1201: one batched noise-embedding lookup (`HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0` is the developer kill switch).** The batched draft looked up each row's noise embedding (the lane's seed, then the mask token) with its own `embedding_q8` launch: 64 per step at C8. It now uploads the row ids once and runs one `embedding_q8_batched`. Both kernels compute every element as `f16 scale × int8` with the same thread striding, so rows are byte-identical to the singleton draft's per-row lookups. gfx1100 keeps its fused-collapse builder.
+  - Same setup as the entry above: draft phase −1.8 % (CS95 +0.98..+2.68 %, `predict ab` win at a 0.5 % bar, fast-mode rounds). C8 greedy tok/s +0.19 % is unresolved.
+  - Exactness: serve C8 greedy md5 `fa168ee2…` (and C1), BetterBench sampled `91bde7c5…`, `cb_vmm_state_oracle` passes.
 - **VMM continuous-batching serve: fewer synchronous uploads per step (`HIPFIRE_CB_UPLOAD_COALESCE=0` is the developer kill switch).** Every step re-uploaded each KV layer's slot-descriptor table with a blocking `hipMemcpy`, 16 per step on the 27B, even when nothing changed. The multi-request verify trunk also uploaded positions once per lane. Each blocking upload drains the device before the host can queue more work.
   - Descriptor tables are now uploaded only when their bytes differ from a host mirror of the last successful upload (mapping or owner changes).
   - The verify trunk writes all lanes' positions in one copy.

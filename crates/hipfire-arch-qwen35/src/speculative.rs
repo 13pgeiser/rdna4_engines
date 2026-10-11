@@ -6602,6 +6602,30 @@ fn selector_lanes_batched(gpu: &Gpu, shared: &DflashScratch) -> bool {
         && shared.mq_x_rot_f16.is_some()
 }
 
+/// `HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0` (developer kill switch): keep the
+/// per-row `embedding_lookup_q8` loop for the batched draft's noise rows
+/// (64 launches at C8) instead of one `embedding_lookup_q8_batched` launch.
+/// Default on; every row byte is identical either way.
+static DRAFT_NOISE_EMBED_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DRAFT_NOISE_EMBED_BATCH").map_or(true, |v| v.trim() != "0")
+});
+
+/// Whether the batched draft's noise rows come from one batched Q8_0
+/// lookup: switch on, exact gfx1201, Q8_0 target embedding, and `rows` fit
+/// the shared `noise_tokens` plane (`max_block_size` ids). Independent of
+/// `draft_collapse_fused_enabled` (gfx1100 only). Exact: `embedding_q8` and
+/// `embedding_q8_batched` run the same per-element expression
+/// `(float)half(d) * (float)int8(q)` with the same 256-thread element
+/// striding — one block per row instead of one launch per row — so each
+/// row's bytes cannot differ.
+fn noise_embed_batch_admitted(gpu: &Gpu, target_weights: &Qwen35Weights, shared: &DflashScratch, rows: usize) -> bool {
+    *DRAFT_NOISE_EMBED_BATCH_ON
+        && gpu.arch == "gfx1201"
+        && matches!(target_weights.embd_format, llama::EmbeddingFormat::Q8_0)
+        && rows >= 1
+        && rows <= shared.max_block_size
+}
+
 /// Rows one batched draft forward holds on this GPU: 64 when the 64-row chunk
 /// is exact, else [`DFLASH_DRAFT_BATCH_MAX_ROWS`]. The 64-row chunk is exact
 /// only through the scoped overwrite route
@@ -6727,24 +6751,42 @@ pub fn draft_dflash_blocks_batched(
 
     // Noise embeddings of every lane's block into the shared rows (the
     // singleton's non-fused per-token lookup loop, `draft_dflash_forward_rank`).
-    let mut off = 0usize;
-    for l in lanes.iter() {
-        for i in 0..l.b {
-            let tok = if i == 0 { l.seed } else { draft_cfg.mask_token_id };
-            let dst = shared.x.sub_offset((off + i) * h, h);
-            match target_weights.embd_format {
-                llama::EmbeddingFormat::HFQ4G256 => {
-                    gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
-                }
-                llama::EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
-                }
-                llama::EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?,
-                llama::EmbeddingFormat::F32 => gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?,
-                _ => return err("unsupported target embedding format for noise lookup".into()),
+    if noise_embed_batch_admitted(gpu, target_weights, shared, rows) {
+        // One ids upload (the only host-sync H2D this adds, replacing 64
+        // launches) into the shared `noise_tokens` plane, then one batched
+        // lookup over all rows; row r = seed for each lane's row 0, else
+        // the mask token — the same ids the per-row loop below uses.
+        let mut ids: Vec<i32> = Vec::with_capacity(rows);
+        for l in lanes.iter() {
+            for i in 0..l.b {
+                ids.push((if i == 0 { l.seed } else { draft_cfg.mask_token_id }) as i32);
             }
         }
-        off += l.b;
+        let id_view = shared.noise_tokens.sub_offset(0, rows);
+        let id_bytes: &[u8] = unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, rows * 4) };
+        gpu.hip.memcpy_htod(&id_view.buf, id_bytes)?;
+        let out_view = shared.x.sub_offset(0, rows * h);
+        gpu.embedding_lookup_q8_batched(&target_weights.token_embd, &out_view, &id_view, rows, h)?;
+    } else {
+        let mut off = 0usize;
+        for l in lanes.iter() {
+            for i in 0..l.b {
+                let tok = if i == 0 { l.seed } else { draft_cfg.mask_token_id };
+                let dst = shared.x.sub_offset((off + i) * h, h);
+                match target_weights.embd_format {
+                    llama::EmbeddingFormat::HFQ4G256 => {
+                        gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
+                    }
+                    llama::EmbeddingFormat::HFQ4G128 => {
+                        gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
+                    }
+                    llama::EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?,
+                    llama::EmbeddingFormat::F32 => gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?,
+                    _ => return err("unsupported target embedding format for noise lookup".into()),
+                }
+            }
+            off += l.b;
+        }
     }
 
     // Per-lane positions (ctx_slice = None geometry of the singleton).
