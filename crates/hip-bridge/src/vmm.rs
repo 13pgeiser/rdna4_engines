@@ -17,7 +17,7 @@ use crate::{
     DeviceBuffer, HipError, HipMemAccessDesc, HipMemAllocationProp, HipMemGenericAllocationHandle,
     HipResult, HipRuntime, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
-use crate::ffi::HipMemLocation;
+use crate::ffi::{HipMemLocation, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM};
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -662,8 +662,13 @@ impl VmmArena {
 
         hip.set_device(owner_device)?;
         let prop = allocation_prop(kind, owner_device);
-        let granularity =
-            hip.mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)?;
+        let granularity_option = match kind {
+            VmmArenaKind::Default => HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+            // Exportable/imported owners use minimum rounding so small owners
+            // do not pay recommended-granularity padding.
+            _ => HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+        };
+        let granularity = hip.mem_get_allocation_granularity(&prop, granularity_option)?;
         if granularity == 0 {
             return Err(HipError::new(
                 0,
