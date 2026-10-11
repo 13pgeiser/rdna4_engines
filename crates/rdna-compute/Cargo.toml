@@ -897,6 +897,10 @@ name = "draft_overwrite_gfx12_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "draft_lane_conv_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_gdn_oracle"
 required-features = ["lab", "deltanet"]
 

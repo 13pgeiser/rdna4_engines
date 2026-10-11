@@ -11,6 +11,22 @@ use super::{
 };
 use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::draft_lane_conv::{DraftConvLane, DRAFT_CONV_LANES_MAX};
+
+/// `HIPFIRE_CB_DRAFT_LANE_CONV` (developer var; `0` is the kill switch):
+/// whether the DFlash2 prepare/finish convolutions of the batched lane draft
+/// run as one lane-batched launch per stage instead of one launch per lane
+/// (`Gpu::dynamic_causal_conv_f32_lanes`; exact gfx1201, never during graph
+/// capture, replay recording or G0 observation). Every output byte is
+/// identical either way; off restores the per-lane launches.
+static CB_DRAFT_LANE_CONV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_DRAFT_LANE_CONV").map_or(true, |v| v.trim() != "0")
+});
+
+/// Is the lane-batched draft convolution enabled for this process?
+fn draft_lane_conv_enabled() -> bool {
+    *CB_DRAFT_LANE_CONV
+}
 
 /// One lane of [`draft_forward_lanes`]: its own draft scratch (context rings,
 /// projection watermarks) and the singleton `draft_dflash_forward_rank`
@@ -393,6 +409,14 @@ pub fn draft_forward_lanes(
 
     // ── Per-layer decoder ────────────────────────────────────────────────
     let rows = total;
+    // Lane table of the lane-batched convolution, built once from the lane
+    // geometry. `None` (kill switch, non-gfx1201, capture/replay/G0, more
+    // lanes than the table holds) keeps the per-lane launches below.
+    let conv_lanes: Option<Vec<DraftConvLane>> = (draft_lane_conv_enabled()
+        && geos.len() <= DRAFT_CONV_LANES_MAX
+        && geos.iter().all(|g_| g_.b > 0)
+        && gpu.draft_lane_conv_admitted())
+    .then(|| geos.iter().map(|g_| DraftConvLane { row0: g_.off, rows: g_.b }).collect());
     let conv_kgs = || {
         let k = cfg.conv_kernel_size.unwrap_or(2);
         let g = cfg.conv_group_size.unwrap_or(16);
@@ -424,11 +448,15 @@ pub fn draft_forward_lanes(
                 shared.mq_x_rot.as_ref(),
                 shared.mq_x_rot_f16.as_ref(),
             )?;
-            for g_ in &geos {
-                let inp = shared.x_norm.sub_offset(g_.off * h, g_.b * h);
-                let out = tmp.sub_offset(g_.off * h, g_.b * h);
-                let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
-                gpu.dynamic_causal_conv_f32(&inp, base, &dy, &out, g_.b, h, k, g, stride, 0)?;
+            if let Some(cl) = &conv_lanes {
+                gpu.dynamic_causal_conv_f32_lanes(&shared.x_norm, base, dyn_buf, tmp, cl, h, k, g, stride, 0)?;
+            } else {
+                for g_ in &geos {
+                    let inp = shared.x_norm.sub_offset(g_.off * h, g_.b * h);
+                    let out = tmp.sub_offset(g_.off * h, g_.b * h);
+                    let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
+                    gpu.dynamic_causal_conv_f32(&inp, base, &dy, &out, g_.b, h, k, g, stride, 0)?;
+                }
             }
             tmp
         } else {
@@ -509,11 +537,15 @@ pub fn draft_forward_lanes(
         if let Some((base, _proj, dyn_buf, tmp)) = conv {
             let (k, g, groups, stride) = conv_kgs();
             let base_phase1 = base.sub_offset(k * h, k * h);
-            for g_ in &geos {
-                let inp = shared.x.sub_offset(g_.off * h, g_.b * h);
-                let out = tmp.sub_offset(g_.off * h, g_.b * h);
-                let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
-                gpu.dynamic_causal_conv_f32(&inp, &base_phase1, &dy, &out, g_.b, h, k, g, stride, k * groups)?;
+            if let Some(cl) = &conv_lanes {
+                gpu.dynamic_causal_conv_f32_lanes(&shared.x, &base_phase1, dyn_buf, tmp, cl, h, k, g, stride, k * groups)?;
+            } else {
+                for g_ in &geos {
+                    let inp = shared.x.sub_offset(g_.off * h, g_.b * h);
+                    let out = tmp.sub_offset(g_.off * h, g_.b * h);
+                    let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
+                    gpu.dynamic_causal_conv_f32(&inp, &base_phase1, &dy, &out, g_.b, h, k, g, stride, k * groups)?;
+                }
             }
             let tmp_v = tmp.sub_offset(0, rows * h);
             gpu.add_f32(&res_v, &tmp_v, &x_v)?;
@@ -541,11 +573,15 @@ pub fn draft_forward_lanes(
                 shared.mq_x_rot.as_ref(),
                 shared.mq_x_rot_f16.as_ref(),
             )?;
-            for g_ in &geos {
-                let inp = shared.x_norm.sub_offset(g_.off * h, g_.b * h);
-                let out = tmp.sub_offset(g_.off * h, g_.b * h);
-                let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
-                gpu.dynamic_causal_conv_f32(&inp, base, &dy, &out, g_.b, h, k, g, stride, 0)?;
+            if let Some(cl) = &conv_lanes {
+                gpu.dynamic_causal_conv_f32_lanes(&shared.x_norm, base, dyn_buf, tmp, cl, h, k, g, stride, 0)?;
+            } else {
+                for g_ in &geos {
+                    let inp = shared.x_norm.sub_offset(g_.off * h, g_.b * h);
+                    let out = tmp.sub_offset(g_.off * h, g_.b * h);
+                    let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
+                    gpu.dynamic_causal_conv_f32(&inp, base, &dy, &out, g_.b, h, k, g, stride, 0)?;
+                }
             }
             gemm_dispatch(
                 gpu,
@@ -579,11 +615,15 @@ pub fn draft_forward_lanes(
                 shared.mq_x_rot_f16.as_ref(),
             )?;
             let base_phase1 = base.sub_offset(k * h, k * h);
-            for g_ in &geos {
-                let inp = shared.x.sub_offset(g_.off * h, g_.b * h);
-                let out = tmp.sub_offset(g_.off * h, g_.b * h);
-                let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
-                gpu.dynamic_causal_conv_f32(&inp, &base_phase1, &dy, &out, g_.b, h, k, g, stride, k * groups)?;
+            if let Some(cl) = &conv_lanes {
+                gpu.dynamic_causal_conv_f32_lanes(&shared.x, &base_phase1, dyn_buf, tmp, cl, h, k, g, stride, k * groups)?;
+            } else {
+                for g_ in &geos {
+                    let inp = shared.x.sub_offset(g_.off * h, g_.b * h);
+                    let out = tmp.sub_offset(g_.off * h, g_.b * h);
+                    let dy = dyn_buf.sub_offset(g_.off * stride, g_.b * stride);
+                    gpu.dynamic_causal_conv_f32(&inp, &base_phase1, &dy, &out, g_.b, h, k, g, stride, k * groups)?;
+                }
             }
             let tmp_v = tmp.sub_offset(0, rows * h);
             gpu.add_f32(&res_v, &tmp_v, &x_v)?;

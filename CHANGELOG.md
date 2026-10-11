@@ -2,6 +2,10 @@
 
 ## Unreleased (0.4.2)
 
+- **DFlash continuous-batching draft on gfx1201: lane-batched dynamic causal convolution (`HIPFIRE_CB_DRAFT_LANE_CONV=0` is the developer kill switch).** Each DFlash2 prepare/finish convolution of the batched draft ran once per lane, 160 launches per C8 step. It now runs as one `dynamic_causal_conv_f32_lanes` launch per stage (20 per step). That kernel is the `dynamic_conv_f32` body per lane, with grid.z = lane, rows rebased to the lane and causal guards on the lane-local row, so lanes never see each other's predecessors.
+  - Same setup as the entries above, interleaved on one binary against `=0`, 4 per arm: draft phase 13.63 → 13.34 ms/step (−2.1 %, CS95 +1.86..+2.39 %, `predict ab` win); C8 greedy 476.5 → 479.1 tok/s (+0.54 %, CS95 −0.05..+1.13 %).
+  - A direct-ring lane draft attention was also built (byte-exact, 64/64 oracle) and dropped: no measurable draft-phase gain.
+  - Exactness: `draft_lane_conv_oracle` (lab) 854/854 cases bit-identical to the per-lane launches (k 1/2/3/5, unequal lane rows, both phases, poisoned guards, cross-lane negative control); serve C8 greedy md5 `fa168ee2…` (and C1), BetterBench sampled `91bde7c5…`, `cb_vmm_state_oracle` passes.
 - **DFlash continuous-batching draft on gfx1201: one batched noise-embedding lookup (`HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0` is the developer kill switch).** The batched draft looked up each row's noise embedding (the lane's seed, then the mask token) with its own `embedding_q8` launch: 64 per step at C8. It now uploads the row ids once and runs one `embedding_q8_batched`. Both kernels compute every element as `f16 scale × int8` with the same thread striding, so rows are byte-identical to the singleton draft's per-row lookups. gfx1100 keeps its fused-collapse builder.
   - Same setup as the entry above: draft phase −1.8 % (CS95 +0.98..+2.68 %, `predict ab` win at a 0.5 % bar, fast-mode rounds). C8 greedy tok/s +0.19 % is unresolved.
   - Exactness: serve C8 greedy md5 `fa168ee2…` (and C1), BetterBench sampled `91bde7c5…`, `cb_vmm_state_oracle` passes.
