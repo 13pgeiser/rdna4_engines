@@ -931,15 +931,265 @@ fn lut_bytes<const N: usize>(l: &[u32; N]) -> Vec<u8> {
     l.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+fn numel_checked(role: &str, shape: &[usize]) -> SwResult<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |a, &s| a.checked_mul(s))
+        .ok_or_else(|| SharedWeightError::invalid(format!("{role}: shape overflow")))
+}
+
+/// Typed bytes of a tensor whose logical content is exactly `shape` elements
+/// of `dtype` (byte-level dtypes count one byte per element). Valid only for
+/// plain tensors, byte blobs and `[bytes]`-shaped uploads; packed projection
+/// buffers use [`typed_weight_bytes`].
+fn generic_typed_bytes(role: &str, d: &GpuTensorDescriptor) -> SwResult<usize> {
+    numel_checked(role, &d.shape)?
+        .checked_mul(d.dtype.size())
+        .ok_or_else(|| SharedWeightError::invalid(format!("{role}: size overflow")))
+}
+
+/// Rows of a DeltaNet layer's Z owner after the loader's beta/alpha fold
+/// (`append_betaalpha_to_z`): `Some(total rows)` when the layer is folded.
+/// Mirrors the loader's predicate: resolved fold flag, all four projections
+/// MQ4G256V2, equal K.
+fn z_fold_rows(
+    flags: &DenseRecipeFlags,
+    wqkv: &WeightTensorDescriptor,
+    wz: &WeightTensorDescriptor,
+    w_beta: &WeightTensorDescriptor,
+    w_alpha: &WeightTensorDescriptor,
+) -> SwResult<Option<usize>> {
+    if !(flags.gdn_fold_gfx12 || flags.gdn_fold_gfx11) {
+        return Ok(None);
+    }
+    let all_mq4v2 = [wqkv.gpu_dtype, wz.gpu_dtype, w_beta.gpu_dtype, w_alpha.gpu_dtype] == [DType::MQ4G256V2; 4];
+    if !all_mq4v2 || [wz.k, w_beta.k, w_alpha.k] != [wqkv.k; 3] {
+        return Ok(None);
+    }
+    if flags.gdn_fold_gfx11 {
+        return Err(SharedWeightError::unsupported(format!(
+            "gfx11 beta/alpha fold (v1 admits {SUPPORTED_DEVICE_ARCH} only)"
+        )));
+    }
+    Ok(Some(Gpu::iu4_gdn_fold_rows(wz.m).0))
+}
+
+/// Typed bytes of a projection's `.buf`: `m` packed rows (the folded row
+/// count for a folded Z, whose upload shape is `[rows * row_bytes]`).
+fn typed_weight_bytes(role: &str, w: &WeightTensorDescriptor, fold_rows: Option<usize>) -> SwResult<usize> {
+    if w.row_stride == 0 {
+        if let Some(rb) = row_bytes_checked(w.gpu_dtype, w.k) {
+            let n = rb
+                .checked_mul(fold_rows.unwrap_or(w.m))
+                .ok_or_else(|| SharedWeightError::invalid(format!("{role}: row bytes overflow")))?;
+            // A folded Z is always a `[bytes]` Raw upload; any other Raw
+            // byte blob must also be exactly its typed bytes.
+            let blob = w.buf.dtype == DType::Raw && w.buf.shape.len() == 1;
+            if (fold_rows.is_some() || blob) && w.buf.shape.as_slice() != [n] {
+                return Err(SharedWeightError::invalid(format!(
+                    "{role}: raw packed shape {:?} != [{n}] (fold rows {fold_rows:?})",
+                    w.buf.shape
+                )));
+            }
+            return Ok(n);
+        }
+    }
+    generic_typed_bytes(role, &w.buf)
+}
+
+/// Typed bytes of an AWQ sidecar: `K x 3` f32 reciprocal planes (shape
+/// `[K, AWQ_RCP_ROWS]`) or the plain scale blob.
+fn typed_awq_bytes(role: &str, w: &WeightTensorDescriptor, d: &GpuTensorDescriptor) -> SwResult<usize> {
+    if d.shape.as_slice() == [w.k, rdna_compute::gemv::AWQ_RCP_ROWS] {
+        return w
+            .k
+            .checked_mul(rdna_compute::gemv::AWQ_RCP_ROWS * 4)
+            .ok_or_else(|| SharedWeightError::invalid(format!("{role}: size overflow")));
+    }
+    generic_typed_bytes(role, d)
+}
+
+/// Typed (semantic representation) bytes of every seal role, canonical order.
+/// A captured seal carries the accessible source size per role (the
+/// allocator may round it up); a normalized seal carries exactly this value.
+fn typed_lengths(seal: &Qwen35RankSeal, flags: &DenseRecipeFlags) -> SwResult<Vec<(String, usize)>> {
+    let mut folded: HashMap<String, usize> = HashMap::new();
+    for (i, layer) in seal.layer_seals.iter().enumerate() {
+        if let Qwen35LayerSeal::DeltaNet { wqkv, wz, w_alpha, w_beta, .. } = layer {
+            if let Some(rows) = z_fold_rows(flags, wqkv, wz, w_beta, w_alpha)? {
+                folded.insert(format!("layers.{i:04}.wz.buf"), rows);
+            }
+        }
+    }
+    let entries = seal_entries(seal);
+    let mut out = Vec::with_capacity(entries.len());
+    for e in &entries {
+        let n = if let Some((_, w)) = &e.awq_of {
+            typed_awq_bytes(&e.role, w, e.desc)?
+        } else if e.alias_of.is_some() {
+            generic_typed_bytes("token_embd", &seal.token_embd)?
+        } else if let Some(w) = e.weight {
+            typed_weight_bytes(&e.role, w, folded.get(&e.role).copied())?
+        } else {
+            generic_typed_bytes(&e.role, e.desc)?
+        };
+        out.push((e.role.clone(), n));
+    }
+    Ok(out)
+}
+
+fn visit_weight_desc_mut(
+    prefix: &str,
+    w: &mut WeightTensorDescriptor,
+    f: &mut dyn FnMut(String, &mut GpuTensorDescriptor),
+) {
+    f(format!("{prefix}.buf"), &mut w.buf);
+    if let Some(a) = w.awq_scale.as_mut() {
+        f(format!("{prefix}.awq_scale"), a);
+    }
+}
+
+/// Visit every tensor descriptor of the seal by role (same names as
+/// [`seal_entries`]).
+fn for_each_desc_mut(seal: &mut Qwen35RankSeal, f: &mut dyn FnMut(String, &mut GpuTensorDescriptor)) {
+    f("token_embd".into(), &mut seal.token_embd);
+    f("output_norm".into(), &mut seal.output_norm);
+    visit_weight_desc_mut("output", &mut seal.output, f);
+    for (i, layer) in seal.layer_seals.iter_mut().enumerate() {
+        let p = format!("layers.{i:04}");
+        let name = |n: &str| format!("{p}.{n}");
+        match layer {
+            Qwen35LayerSeal::DeltaNet {
+                attn_norm,
+                wqkv,
+                wz,
+                w_alpha,
+                w_beta,
+                a_log,
+                dt_bias,
+                conv_weight,
+                norm_weight,
+                wo,
+                ffn_norm,
+                w_gate,
+                w_up,
+                w_down,
+            } => {
+                f(name("attn_norm"), attn_norm);
+                visit_weight_desc_mut(&name("wqkv"), wqkv, f);
+                visit_weight_desc_mut(&name("wz"), wz, f);
+                visit_weight_desc_mut(&name("w_alpha"), w_alpha, f);
+                visit_weight_desc_mut(&name("w_beta"), w_beta, f);
+                f(name("a_log"), a_log);
+                f(name("dt_bias"), dt_bias);
+                f(name("conv_weight"), conv_weight);
+                f(name("norm_weight"), norm_weight);
+                visit_weight_desc_mut(&name("wo"), wo, f);
+                f(name("ffn_norm"), ffn_norm);
+                visit_weight_desc_mut(&name("w_gate"), w_gate, f);
+                visit_weight_desc_mut(&name("w_up"), w_up, f);
+                visit_weight_desc_mut(&name("w_down"), w_down, f);
+            }
+            Qwen35LayerSeal::FullAttn {
+                attn_norm,
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+                ffn_norm,
+                w_gate,
+                w_up,
+                w_down,
+            } => {
+                f(name("attn_norm"), attn_norm);
+                visit_weight_desc_mut(&name("wq"), wq, f);
+                visit_weight_desc_mut(&name("wk"), wk, f);
+                visit_weight_desc_mut(&name("wv"), wv, f);
+                visit_weight_desc_mut(&name("wo"), wo, f);
+                f(name("q_norm"), q_norm);
+                f(name("k_norm"), k_norm);
+                f(name("ffn_norm"), ffn_norm);
+                visit_weight_desc_mut(&name("w_gate"), w_gate, f);
+                visit_weight_desc_mut(&name("w_up"), w_up, f);
+                visit_weight_desc_mut(&name("w_down"), w_down, f);
+            }
+            // Dense validation rejects these before descriptors are consumed.
+            Qwen35LayerSeal::DeltaNetMoe { .. } | Qwen35LayerSeal::FullAttnMoe { .. } => {}
+        }
+    }
+}
+
+/// Canonicalize a captured dense seal for sharing: every descriptor's
+/// `byte_len` becomes the typed length of its role, never the accessible
+/// source size (pool buckets and the 256 B minimum round that up). A source
+/// smaller than its typed extent, or typed geometry that disagrees with the
+/// config/flags, is rejected. The result passes [`validate_dense_seal`].
+fn normalize_dense_seal(
+    source: &Qwen35RankSeal,
+    flags: &DenseRecipeFlags,
+    config: &Qwen35Config,
+) -> SwResult<Qwen35RankSeal> {
+    check_dense_config(config)?;
+    source.validate_dense().map_err(hip_err("typed dense seal"))?;
+    let lens = typed_lengths(source, flags)?;
+    let entries = seal_entries(source);
+    for ((role, typed), e) in lens.iter().zip(&entries) {
+        if e.desc.byte_len < *typed {
+            return Err(SharedWeightError::invalid(format!(
+                "{role}: accessible source {} B < typed {typed} B",
+                e.desc.byte_len
+            )));
+        }
+    }
+    let typed: HashMap<&str, usize> = lens.iter().map(|(r, n)| (r.as_str(), *n)).collect();
+    let mut sealed = source.clone();
+    let mut unmatched = Vec::new();
+    for_each_desc_mut(&mut sealed, &mut |role, d| match typed.get(role.as_str()) {
+        Some(&n) => d.byte_len = n,
+        None => unmatched.push(role),
+    });
+    if !unmatched.is_empty() || typed.len() != entries.len() {
+        return Err(SharedWeightError::invalid(format!(
+            "typed length roles drifted from seal roles (unmatched {unmatched:?})"
+        )));
+    }
+    validate_dense_seal(&sealed, flags, config)?;
+    Ok(sealed)
+}
+
+fn normalized_seal_of(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    flags: &DenseRecipeFlags,
+) -> SwResult<Qwen35RankSeal> {
+    let source = Qwen35RankSeal::capture_dense(weights).map_err(hip_err("dense seal capture"))?;
+    normalize_dense_seal(&source, flags, config)
+}
+
+/// Typed (semantic representation) byte length of every dense tensor role of
+/// a loaded graph, resolved against the live GPU's recipe flags: packed
+/// projections `m * row_bytes`, a folded Z `(m + fold rows) * row_bytes`, AWQ
+/// reciprocal planes `K * 3 * 4`, plain tensors `numel * dtype.size()`. Never
+/// the (possibly larger) accessible `buf.size()`; fails when any source
+/// buffer is smaller than its typed length. Includes a tied head's alias role.
+pub fn dense_typed_tensor_lengths(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    gpu: &Gpu,
+) -> Result<BTreeMap<String, usize>, SharedWeightError> {
+    let flags = resolve_dense_flags(gpu, config)?;
+    let seal = normalized_seal_of(weights, config, &flags)?;
+    Ok(seal_entries(&seal).into_iter().map(|e| (e.role, e.desc.byte_len)).collect())
+}
+
+/// Typed `elems`-wide F32 tensor; `d.byte_len` is its exact typed size.
 fn check_plain(role: &str, d: &GpuTensorDescriptor, elems: usize) -> SwResult<()> {
     let bytes = elems
         .checked_mul(4)
         .ok_or_else(|| SharedWeightError::invalid(format!("{role}: size overflow")))?;
-    let numel = d
-        .shape
-        .iter()
-        .try_fold(1usize, |a, &s| a.checked_mul(s))
-        .ok_or_else(|| SharedWeightError::invalid(format!("{role}: shape overflow")))?;
+    let numel = numel_checked(role, &d.shape)?;
     if d.dtype != DType::F32 || numel != elems || d.byte_len != bytes {
         return Err(SharedWeightError::invalid(format!(
             "{role}: expected F32 x{elems} ({bytes} B), found {:?} shape {:?} {} B",
@@ -952,8 +1202,6 @@ fn check_plain(role: &str, d: &GpuTensorDescriptor, elems: usize) -> SwResult<()
 struct WeightRule {
     m: usize,
     k: usize,
-    /// DeltaNet Z: the gfx12/gfx11 fold appends rows to the owner.
-    z_fold: bool,
 }
 
 fn check_weight(
@@ -961,7 +1209,6 @@ fn check_weight(
     w: &WeightTensorDescriptor,
     rule: &WeightRule,
     flags: &DenseRecipeFlags,
-    exact_bytes: bool,
 ) -> SwResult<()> {
     let bad = |msg: String| SharedWeightError::invalid(format!("{role}: {msg}"));
     if w.paro.is_some() {
@@ -989,25 +1236,6 @@ fn check_weight(
     } else if luts != 0 {
         return Err(bad(format!("{:?} weight carries Lloyd LUTs", w.gpu_dtype)));
     }
-    if exact_bytes && w.row_stride == 0 {
-        if let Some(rb) = row_bytes_checked(w.gpu_dtype, w.k) {
-            let base = rb.checked_mul(w.m).ok_or_else(|| bad("row bytes overflow".into()))?;
-            let n = w.buf.byte_len;
-            let folded_ok = rule.z_fold
-                && w.gpu_dtype == DType::MQ4G256V2
-                && ((flags.gdn_fold_gfx12 && n == base.saturating_add(128usize.saturating_mul(rb)))
-                    || (flags.gdn_fold_gfx11
-                        && n % rb == 0
-                        && n >= base.saturating_add(96usize.saturating_mul(rb))
-                        && n <= base.saturating_add((96 + 255usize).saturating_mul(rb))));
-            if n != base && !folded_ok {
-                return Err(bad(format!(
-                    "buffer {n} B != {} rows x {rb} B (flags {flags:?})",
-                    w.m
-                )));
-            }
-        }
-    }
     if let Some(a) = &w.awq_scale {
         if !w.gpu_dtype.supports_awq_sidecar() {
             return Err(bad(format!("{:?} cannot carry an AWQ sidecar", w.gpu_dtype)));
@@ -1025,9 +1253,12 @@ fn check_weight(
     Ok(())
 }
 
-/// Validate a decoded/captured dense seal against the local config and flags.
-/// Pure: no GPU, no FD. Covers layer topology, every tensor's geometry,
-/// sidecar sizes, Lloyd LUT completeness and tied-head alias rules.
+/// Validate a decoded/normalized dense seal against the local config and
+/// flags. Pure: no GPU, no FD. Covers layer topology, every tensor's geometry,
+/// sidecar sizes, Lloyd LUT completeness and tied-head alias rules. Every
+/// descriptor `byte_len` must equal the typed length of its role (see
+/// [`dense_typed_tensor_lengths`]); the exporter canonicalizes a captured
+/// seal before validating.
 pub fn validate_dense_seal(
     seal: &Qwen35RankSeal,
     flags: &DenseRecipeFlags,
@@ -1066,9 +1297,8 @@ pub fn validate_dense_seal(
     check_weight(
         "output",
         &seal.output,
-        &WeightRule { m: config.vocab_size, k: dim, z_fold: false },
+        &WeightRule { m: config.vocab_size, k: dim },
         flags,
-        !seal.lm_head_aliases_embd,
     )?;
     if seal.lm_head_aliases_embd && seal.output.buf.byte_len != tok.byte_len {
         return Err(SharedWeightError::invalid("tied output.buf extent != token_embd extent"));
@@ -1076,7 +1306,7 @@ pub fn validate_dense_seal(
 
     for (i, (layer, ty)) in seal.layer_seals.iter().zip(&config.layer_types).enumerate() {
         let r = |n: &str| format!("layers.{i:04}.{n}");
-        let w = |m: usize, k: usize| WeightRule { m, k, z_fold: false };
+        let w = |m: usize, k: usize| WeightRule { m, k };
         match (layer, ty) {
             (
                 Qwen35LayerSeal::DeltaNet {
@@ -1099,25 +1329,19 @@ pub fn validate_dense_seal(
             ) => {
                 let heads = config.linear_num_value_heads;
                 check_plain(&r("attn_norm"), attn_norm, dim)?;
-                check_weight(&r("wqkv"), wqkv, &w(qkv_dim, dim), flags, true)?;
-                check_weight(
-                    &r("wz"),
-                    wz,
-                    &WeightRule { m: d_inner, k: dim, z_fold: true },
-                    flags,
-                    true,
-                )?;
-                check_weight(&r("w_alpha"), w_alpha, &w(heads, dim), flags, true)?;
-                check_weight(&r("w_beta"), w_beta, &w(heads, dim), flags, true)?;
+                check_weight(&r("wqkv"), wqkv, &w(qkv_dim, dim), flags)?;
+                check_weight(&r("wz"), wz, &w(d_inner, dim), flags)?;
+                check_weight(&r("w_alpha"), w_alpha, &w(heads, dim), flags)?;
+                check_weight(&r("w_beta"), w_beta, &w(heads, dim), flags)?;
                 check_plain(&r("a_log"), a_log, heads)?;
                 check_plain(&r("dt_bias"), dt_bias, heads)?;
                 check_plain(&r("conv_weight"), conv_weight, conv_elems)?;
                 check_plain(&r("norm_weight"), norm_weight, config.linear_value_head_dim)?;
-                check_weight(&r("wo"), wo, &w(dim, d_inner), flags, true)?;
+                check_weight(&r("wo"), wo, &w(dim, d_inner), flags)?;
                 check_plain(&r("ffn_norm"), ffn_norm, dim)?;
-                check_weight(&r("w_gate"), w_gate, &w(hidden, dim), flags, true)?;
-                check_weight(&r("w_up"), w_up, &w(hidden, dim), flags, true)?;
-                check_weight(&r("w_down"), w_down, &w(dim, hidden), flags, true)?;
+                check_weight(&r("w_gate"), w_gate, &w(hidden, dim), flags)?;
+                check_weight(&r("w_up"), w_up, &w(hidden, dim), flags)?;
+                check_weight(&r("w_down"), w_down, &w(dim, hidden), flags)?;
             }
             (
                 Qwen35LayerSeal::FullAttn {
@@ -1136,22 +1360,31 @@ pub fn validate_dense_seal(
                 LayerType::FullAttention,
             ) => {
                 check_plain(&r("attn_norm"), attn_norm, dim)?;
-                check_weight(&r("wq"), wq, &w(q_out, dim), flags, true)?;
-                check_weight(&r("wk"), wk, &w(kv_dim, dim), flags, true)?;
-                check_weight(&r("wv"), wv, &w(kv_dim, dim), flags, true)?;
-                check_weight(&r("wo"), wo, &w(dim, o_in), flags, true)?;
+                check_weight(&r("wq"), wq, &w(q_out, dim), flags)?;
+                check_weight(&r("wk"), wk, &w(kv_dim, dim), flags)?;
+                check_weight(&r("wv"), wv, &w(kv_dim, dim), flags)?;
+                check_weight(&r("wo"), wo, &w(dim, o_in), flags)?;
                 check_plain(&r("q_norm"), q_norm, config.head_dim)?;
                 check_plain(&r("k_norm"), k_norm, config.head_dim)?;
                 check_plain(&r("ffn_norm"), ffn_norm, dim)?;
-                check_weight(&r("w_gate"), w_gate, &w(hidden, dim), flags, true)?;
-                check_weight(&r("w_up"), w_up, &w(hidden, dim), flags, true)?;
-                check_weight(&r("w_down"), w_down, &w(dim, hidden), flags, true)?;
+                check_weight(&r("w_gate"), w_gate, &w(hidden, dim), flags)?;
+                check_weight(&r("w_up"), w_up, &w(hidden, dim), flags)?;
+                check_weight(&r("w_down"), w_down, &w(dim, hidden), flags)?;
             }
             _ => {
                 return Err(SharedWeightError::invalid(format!(
                     "layer {i}: seal kind does not match config layer type {ty:?}"
                 )));
             }
+        }
+    }
+    // Every descriptor extent is the typed length of its role.
+    for ((role, typed), e) in typed_lengths(seal, flags)?.iter().zip(seal_entries(seal)) {
+        if e.desc.byte_len != *typed {
+            return Err(SharedWeightError::invalid(format!(
+                "{role}: descriptor {} B != typed {typed} B (flags {flags:?})",
+                e.desc.byte_len
+            )));
         }
     }
     Ok(())
@@ -1293,6 +1526,9 @@ struct Rec {
     ptr: usize,
     size: usize,
     borrowed: bool,
+    /// Typed (semantic) bytes of the role; `size` is the accessible
+    /// allocation, which may exceed it (allocator slack).
+    typed: usize,
     host: bool,
     vmm: bool,
     shape: Vec<usize>,
@@ -1305,7 +1541,12 @@ pub struct CensusOwner {
     pub owner_id: String,
     /// Traversal position (canonical order, not sorted order).
     pub order: usize,
+    /// Typed (semantic representation) bytes: what is sealed, exported and
+    /// imported. Never the accessible source size.
     pub logical_bytes: u64,
+    /// Accessible bytes of the live allocation (`logical_bytes` plus allocator
+    /// slack; equal once the owner is an exported VMM allocation).
+    pub source_bytes: u64,
     pub shape: Vec<usize>,
     pub dtype: DType,
 }
@@ -1325,8 +1566,14 @@ pub struct DenseCensus {
     /// Owners in canonical traversal order.
     pub owners: Vec<CensusOwner>,
     pub aliases: Vec<CensusAlias>,
+    /// Sum of owners' typed bytes.
     pub logical_bytes: u64,
     pub largest_owner_bytes: u64,
+    /// Sum of owners' accessible allocation bytes.
+    pub source_bytes: u64,
+    /// `source_bytes - logical_bytes`: allocator slack carried by the source
+    /// allocations, never sealed or exported.
+    pub source_slack_bytes: u64,
 }
 
 impl DenseCensus {
@@ -1338,16 +1585,25 @@ impl DenseCensus {
     }
 }
 
-fn collect_records(weights: &Qwen35Weights) -> SwResult<Vec<Rec>> {
+fn collect_records(weights: &Qwen35Weights, typed: &HashMap<String, usize>) -> SwResult<Vec<Rec>> {
     let mut recs = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     weights
         .for_each_dense_tensor(&mut |role, t| {
+            let typed_bytes = match typed.get(role) {
+                Some(&n) => n,
+                None => {
+                    missing.push(role.to_owned());
+                    0
+                }
+            };
             recs.push(Rec {
                 role: role.to_owned(),
                 order: recs.len(),
                 ptr: t.buf.as_ptr() as usize,
                 size: t.buf.size(),
                 borrowed: t.buf.is_borrowed(),
+                typed: typed_bytes,
                 host: t.buf.is_host_mapped(),
                 vmm: t.buf.is_vmm_owner(),
                 shape: t.shape.clone(),
@@ -1356,6 +1612,9 @@ fn collect_records(weights: &Qwen35Weights) -> SwResult<Vec<Rec>> {
             Ok(())
         })
         .map_err(hip_err("typed dense traversal"))?;
+    if !missing.is_empty() {
+        return Err(SharedWeightError::invalid(format!("live roles without a typed length: {missing:?}")));
+    }
     Ok(recs)
 }
 
@@ -1367,6 +1626,12 @@ fn census_from_records(recs: &[Rec], require_vmm: bool) -> SwResult<DenseCensus>
         }
         if r.ptr == 0 || r.size == 0 {
             return Err(SharedWeightError::invalid(format!("{}: null/empty owner", r.role)));
+        }
+        if r.size < r.typed {
+            return Err(SharedWeightError::invalid(format!(
+                "{}: accessible owner {} B < typed {} B",
+                r.role, r.size, r.typed
+            )));
         }
         if require_vmm && !r.vmm {
             return Err(SharedWeightError::invalid(format!("{}: owner is not a VMM allocation", r.role)));
@@ -1390,6 +1655,12 @@ fn census_from_records(recs: &[Rec], require_vmm: bool) -> SwResult<DenseCensus>
     for r in recs.iter().filter(|r| r.borrowed) {
         if r.ptr == 0 || r.size == 0 {
             return Err(SharedWeightError::invalid(format!("{}: null/empty alias", r.role)));
+        }
+        if r.size < r.typed {
+            return Err(SharedWeightError::invalid(format!(
+                "{}: accessible alias {} B < typed {} B",
+                r.role, r.size, r.typed
+            )));
         }
         let idx = sorted.partition_point(|o| o.ptr <= r.ptr);
         let owner = idx
@@ -1417,7 +1688,7 @@ fn census_from_records(recs: &[Rec], require_vmm: bool) -> SwResult<DenseCensus>
             order: r.order,
             owner_id: owner.role.clone(),
             byte_offset: (r.ptr - owner.ptr) as u64,
-            byte_extent: r.size as u64,
+            byte_extent: r.typed as u64,
         });
     }
     let mut owners: Vec<CensusOwner> = sorted
@@ -1425,21 +1696,42 @@ fn census_from_records(recs: &[Rec], require_vmm: bool) -> SwResult<DenseCensus>
         .map(|r| CensusOwner {
             owner_id: r.role.clone(),
             order: r.order,
-            logical_bytes: r.size as u64,
+            logical_bytes: r.typed as u64,
+            source_bytes: r.size as u64,
             shape: r.shape.clone(),
             dtype: r.dtype,
         })
         .collect();
     owners.sort_by_key(|o| o.order);
-    let logical_bytes = owners.iter().map(|o| o.logical_bytes).sum();
+    let logical_bytes: u64 = owners.iter().map(|o| o.logical_bytes).sum();
     let largest_owner_bytes = owners.iter().map(|o| o.logical_bytes).max().unwrap_or(0);
-    Ok(DenseCensus { owners, aliases, logical_bytes, largest_owner_bytes })
+    let source_bytes: u64 = owners.iter().map(|o| o.source_bytes).sum();
+    Ok(DenseCensus {
+        owners,
+        aliases,
+        logical_bytes,
+        largest_owner_bytes,
+        source_bytes,
+        source_slack_bytes: source_bytes - logical_bytes,
+    })
+}
+
+fn typed_map_of_seal(seal: &Qwen35RankSeal) -> HashMap<String, usize> {
+    seal_entries(seal).into_iter().map(|e| (e.role, e.desc.byte_len)).collect()
 }
 
 /// Complete unique-owner/alias census via typed traversal (no pointer
-/// scanning). Public so the oracle can hash/compare owners by id.
-pub fn census_dense_weights(weights: &Qwen35Weights) -> SwResult<DenseCensus> {
-    census_from_records(&collect_records(weights)?, false)
+/// scanning). Public so the oracle can hash/compare owners by id. Owner
+/// `logical_bytes` are typed lengths (see [`dense_typed_tensor_lengths`]);
+/// accessible allocation bytes and their slack are reported separately.
+pub fn census_dense_weights(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    gpu: &Gpu,
+) -> SwResult<DenseCensus> {
+    let flags = resolve_dense_flags(gpu, config)?;
+    let seal = normalized_seal_of(weights, config, &flags)?;
+    census_from_records(&collect_records(weights, &typed_map_of_seal(&seal))?, false)
 }
 
 /// Census equals the seal's role table: same roles/order, extents, shapes,
@@ -1455,7 +1747,7 @@ fn check_census_matches_seal(recs: &[Rec], census: &DenseCensus, seal: &Qwen35Ra
     }
     for (e, r) in entries.iter().zip(recs) {
         if e.role != r.role
-            || e.desc.byte_len != r.size
+            || e.desc.byte_len != r.typed
             || e.desc.shape != r.shape
             || e.desc.dtype != r.dtype
             || e.alias_of.is_some() != r.borrowed
@@ -1689,9 +1981,10 @@ fn export_prepare(
             "layout recipe does not match the recipe resolved from live GPU state",
         ));
     }
-    let seal = Qwen35RankSeal::capture_dense(weights).map_err(hip_err("dense seal capture"))?;
-    validate_dense_seal(&seal, &flags, config)?;
-    let recs = collect_records(weights)?;
+    // The captured seal carries accessible source sizes; the shared seal,
+    // census and every extent below use the typed lengths instead.
+    let seal = normalized_seal_of(weights, config, &flags)?;
+    let recs = collect_records(weights, &typed_map_of_seal(&seal))?;
     let census = census_from_records(&recs, false)?;
     check_census_matches_seal(&recs, &census, &seal)?;
     Ok(Prepared { flags, seal, census })
@@ -1708,10 +2001,17 @@ fn export_promote(
     ctx: &mut ExportCtx,
 ) -> SwResult<()> {
     let owner_ids: HashSet<&str> = census.owners.iter().map(|o| o.owner_id.as_str()).collect();
+    let owner_typed: HashMap<&str, usize> = census
+        .owners
+        .iter()
+        .map(|o| (o.owner_id.as_str(), o.logical_bytes as usize))
+        .collect();
     let mut alias_to_owner: HashMap<&str, &str> = HashMap::new();
+    let mut alias_extent: HashMap<&str, usize> = HashMap::new();
     let mut pending_aliases: HashMap<&str, usize> = HashMap::new();
     for a in &census.aliases {
         alias_to_owner.insert(a.role.as_str(), a.owner_id.as_str());
+        alias_extent.insert(a.role.as_str(), a.byte_extent as usize);
         *pending_aliases.entry(a.owner_id.as_str()).or_insert(0) += 1;
     }
     let mut new_ptr: HashMap<String, usize> = HashMap::new();
@@ -1730,7 +2030,8 @@ fn export_promote(
                     SharedWeightError::invalid(format!("{role}: alias visited before owner {owner}")),
                 );
             };
-            let size = slot.buf.size();
+            // The rebound view spans the typed extent of the new owner.
+            let size = alias_extent.get(role).copied().unwrap_or(0);
             *slot = GpuTensor {
                 // SAFETY: re-derived from the registered new VMM owner of `owner`.
                 buf: unsafe { DeviceBuffer::from_raw(ptr as *mut c_void, size) },
@@ -1756,7 +2057,28 @@ fn export_promote(
                 SharedWeightError::invalid(format!("{role}: traversal role missing from census")),
             );
         }
-        let exp = match gpu.create_exportable_weight_copy(&*slot) {
+        let typed_bytes = owner_typed.get(role).copied().unwrap_or(0);
+        if typed_bytes == 0 || typed_bytes > slot.buf.size() {
+            return fail(
+                &mut stage_error,
+                SharedWeightError::invalid(format!(
+                    "{role}: typed {typed_bytes} B vs accessible source {} B",
+                    slot.buf.size()
+                )),
+            );
+        }
+        // Copy only the typed prefix: a non-owning view bounded to
+        // `typed_bytes` of the live source owner, which stays in the graph
+        // (released once by `release_old`). The allocator slack beyond it is
+        // never exported; the new owner's tail past the typed bytes is zeroed.
+        let source_view = GpuTensor {
+            // SAFETY: `slot` owns at least `typed_bytes` valid bytes at this
+            // pointer and outlives the copy; a borrowed buffer never frees.
+            buf: unsafe { DeviceBuffer::from_raw(slot.buf.as_ptr() as *mut c_void, typed_bytes) },
+            shape: Vec::new(),
+            dtype: slot.dtype,
+        };
+        let exp = match gpu.create_exportable_weight_copy(&source_view) {
             Ok(exp) => exp,
             Err(e) => {
                 return fail(
@@ -1769,13 +2091,12 @@ fn export_promote(
         let (physical, logical, gran) = (physical_bytes as u64, logical_bytes as u64, granularity as u64);
         if let Err(e) = check_extents(role, physical, logical, gran)
             .and_then(|()| {
-                if logical_bytes == slot.buf.size() && owner.buf.size() == logical_bytes && owner.buf.is_vmm_owner() {
+                if logical_bytes == typed_bytes && owner.buf.size() == logical_bytes && owner.buf.is_vmm_owner() {
                     Ok(())
                 } else {
                     Err(SharedWeightError::invalid(format!(
-                        "{role}: exported owner extent {} != source {}",
-                        owner.buf.size(),
-                        slot.buf.size()
+                        "{role}: exported owner extent {} != typed {typed_bytes}",
+                        owner.buf.size()
                     )))
                 }
             })
@@ -1859,7 +2180,7 @@ fn export_finish(
     ctx: &mut ExportCtx,
 ) -> SwResult<(WeightManifest, DenseCensus)> {
     // The promoted graph must still match the seal and own only VMM owners.
-    let recs = collect_records(weights)?;
+    let recs = collect_records(weights, &typed_map_of_seal(&prepared.seal))?;
     let census = census_from_records(&recs, true)?;
     check_census_matches_seal(&recs, &census, &prepared.seal)?;
     if census.owners.len() != prepared.census.owners.len() || census.aliases != prepared.census.aliases {
@@ -2147,7 +2468,7 @@ fn import_inner(
                 mapped.len()
             )));
         }
-        let recs = collect_records(&weights)?;
+        let recs = collect_records(&weights, &typed_map_of_seal(&plan.meta.seal))?;
         let census = census_from_records(&recs, true)?;
         check_census_matches_seal(&recs, &census, &plan.meta.seal)?;
         if census.owners.len() != plan.owners.len() {
@@ -2461,6 +2782,88 @@ mod tests {
         assert!(validate_dense_seal(&s, &flags(), &c).is_err());
     }
 
+    /// Source seal as captured from a pool-allocated graph: every accessible
+    /// `byte_len` exceeds its typed length.
+    fn padded_source(typed: &Qwen35RankSeal) -> Qwen35RankSeal {
+        let mut s = typed.clone();
+        for_each_desc_mut(&mut s, &mut |_, d| d.byte_len += 256);
+        s
+    }
+
+    #[test]
+    fn f32_semantic_extent_ignores_allocator_slack() {
+        let slack = GpuTensorDescriptor { shape: vec![48], dtype: DType::F32, byte_len: 256 };
+        assert_eq!(generic_typed_bytes("a_log", &slack).unwrap(), 192);
+        // A sealed (typed) descriptor never carries slack.
+        assert!(check_plain("a_log", &slack, 48).is_err());
+        check_plain("a_log", &GpuTensorDescriptor { byte_len: 192, ..slack.clone() }, 48).unwrap();
+    }
+
+    #[test]
+    fn typed_lengths_cover_fold_planes_and_alias() {
+        let c = cfg();
+        let (dims, _) = delta_dims(&c).unwrap();
+        let rb = DType::MQ4G256V2.row_bytes(c.dim).unwrap();
+        let lens: HashMap<String, usize> =
+            typed_lengths(&seal(&c, false), &flags()).unwrap().into_iter().collect();
+        assert_eq!(lens["layers.0000.wz.buf"], (dims[1] + 128) * rb);
+        assert_eq!(lens["layers.0000.wqkv.buf"], dims[0] * rb);
+        assert_eq!(lens["layers.0000.wqkv.awq_scale"], c.dim * 12);
+        assert_eq!(lens["layers.0000.wz.awq_scale"], c.dim * 4);
+        assert_eq!(lens["layers.0000.a_log"], dims[2] * 4);
+        let tied: HashMap<String, usize> =
+            typed_lengths(&seal(&c, true), &flags()).unwrap().into_iter().collect();
+        assert_eq!(tied["output.buf"], tied["token_embd"]);
+    }
+
+    #[test]
+    fn normalize_accepts_allocator_padding_and_seals_typed_bytes() {
+        let c = cfg();
+        for tied in [false, true] {
+            let typed = seal(&c, tied);
+            let src = padded_source(&typed);
+            assert!(validate_dense_seal(&src, &flags(), &c).is_err());
+            let n = normalize_dense_seal(&src, &flags(), &c).expect("padded source normalizes");
+            assert_eq!(n, typed);
+        }
+    }
+
+    #[test]
+    fn normalize_rejects_short_sources_and_wrong_metadata() {
+        let c = cfg();
+        let typed = seal(&c, false);
+        // Every role: one byte short of its typed length is rejected.
+        for (role, n) in typed_lengths(&typed, &flags()).unwrap() {
+            let mut s = padded_source(&typed);
+            for_each_desc_mut(&mut s, &mut |r, d| {
+                if r == role {
+                    d.byte_len = n - 1;
+                }
+            });
+            assert!(normalize_dense_seal(&s, &flags(), &c).is_err(), "{role}");
+        }
+        // Folded Z whose shape is not its folded byte count.
+        let mut s = padded_source(&typed);
+        if let Qwen35LayerSeal::DeltaNet { wz, .. } = &mut s.layer_seals[0] {
+            wz.buf.shape = vec![wz.buf.shape[0] - 136];
+        }
+        assert!(normalize_dense_seal(&s, &flags(), &c).is_err());
+        // Fold rows present but the fold flag was not resolved.
+        let mut no_fold = flags();
+        no_fold.gdn_fold_gfx12 = false;
+        assert!(normalize_dense_seal(&padded_source(&typed), &no_fold, &c).is_err());
+        // Reciprocal planes present but the planes flag was not resolved.
+        let mut no_planes = flags();
+        no_planes.a4_rms_fdiv_planes = false;
+        assert!(normalize_dense_seal(&padded_source(&typed), &no_planes, &c).is_err());
+        // Wrong geometry.
+        let mut s = padded_source(&typed);
+        if let Qwen35LayerSeal::FullAttn { wk, .. } = &mut s.layer_seals[1] {
+            wk.m += 1;
+        }
+        assert!(normalize_dense_seal(&s, &flags(), &c).is_err());
+    }
+
     #[test]
     fn config_identity_is_exact_bits_and_topology() {
         let a = cfg();
@@ -2514,6 +2917,18 @@ mod tests {
         assert!(untied.iter().any(|(id, _)| id == "output.buf"));
     }
 
+    #[test]
+    fn census_records_slack_separately_from_typed_bytes() {
+        let mut slack = rec("token_embd", 0, 0x1000, 0x140, false);
+        slack.typed = 0x100;
+        let c = census_from_records(&[slack], false).unwrap();
+        assert_eq!((c.logical_bytes, c.source_bytes, c.source_slack_bytes), (0x100, 0x140, 0x40));
+        // An accessible allocation shorter than its typed length is rejected.
+        let mut short = rec("token_embd", 0, 0x1000, 0x100, false);
+        short.typed = 0x101;
+        assert!(census_from_records(&[short], false).is_err());
+    }
+
     fn rec(role: &str, order: usize, ptr: usize, size: usize, borrowed: bool) -> Rec {
         Rec {
             role: role.to_owned(),
@@ -2521,6 +2936,7 @@ mod tests {
             ptr,
             size,
             borrowed,
+            typed: size,
             host: false,
             vmm: !borrowed,
             shape: vec![size],
