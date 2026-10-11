@@ -1,0 +1,25 @@
+# gemma4-26b-a4b-df-pad768.recipe -- gemma-4-26B-A4B-it with its experts PADDED TO 768 wide, and
+# z-lab's DFlash drafter, as arch/gemma4 serves it.
+#
+#   rad-convert <padded gemma-4-26B-A4B-it checkpoint> --draft-model <gemma-4-26B-A4B-it-DFlash checkpoint> \
+#       --recipe data/recipes/gemma4-26b-a4b-df-pad768.recipe -o gemma4-26b-a4b-df-pad768.rad
+#
+# The padding happens BEFORE conversion, outside the engine: each expert's gate and up gain 64
+# zero rows (704 -> 768) and its down 64 zero columns, and moe_intermediate_size becomes 768. It is
+# exact -- gelu(0) * 0 = 0 in the added intermediate columns, which meet zero columns of down -- so
+# the padded model computes the original's function. 768 is six whole 128-blocks, which the fp8
+# grouped GEMM needs for down's K, and gate and up each start on a block boundary.
+#
+# Both expert projections block fp8. Everything else as gemma4-26b-a4b-df.recipe says.
+
+blk.*.ffn_gate_up_exps.*.weight      rtn codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down_exps.*.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The DFlash drafter's six linears: block fp8 (the drafter only proposes; the trunk verifies).
+dflash.fc.weight                     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight           rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight           rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight           rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight      rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight      rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16
