@@ -6407,12 +6407,46 @@ fn batch_chunk_delta_net_input_projection(
     Ok(false)
 }
 
-/// Queue one DeltaNet layer's DFlash tape-capture copies (pre-conv1d qkv rows,
+/// Default-on switch for the singleton chain-verify batched tape copy
+/// (`HIPFIRE_VERIFY_TAPE_COPY_BATCH=0` restores three `memcpy_dtod_at_auto`).
+fn verify_tape_copy_batch_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_VERIFY_TAPE_COPY_BATCH")
+            .map_or(true, |v| v.trim() != "0")
+    });
+    *ENABLED
+}
+
+/// One DeltaNet layer's DFlash tape-capture copies (pre-conv1d qkv rows,
 /// post-sigmoid alpha and beta rows of `pbs`'s rows `[0, n)`, into the layer's
 /// tape slots at `tape_offset`) as three descriptors for
 /// `Gpu::tape_copy_batched`. `pbs` may be a row view of a shared scratch: the
-/// source is its first row. Shared by the per-request pre-GDN sink branch and
-/// the lane-batched multi-request route, so both queue identical descriptors.
+/// source is its first row.
+fn gdn_tape_copy_descriptors(
+    tape: &crate::speculative::GdnTape,
+    pbs: &PrefillBatchScratch,
+    n_v_heads: usize,
+    tape_offset: usize,
+    n: usize,
+    delta_layer_idx: usize,
+) -> [rdna_compute::tape_copy::TapeCopy; 3] {
+    use rdna_compute::tape_copy::TapeCopy;
+    let qkv_row_bytes = tape.qkv_dim * 4;
+    let alpha_row_bytes = n_v_heads * 4;
+    let off_qkv = tape_offset * qkv_row_bytes;
+    let off_a = tape_offset * alpha_row_bytes;
+    let copy_qkv = n * qkv_row_bytes;
+    let copy_a = n * alpha_row_bytes;
+    [
+        TapeCopy::new(&tape.qkv_bufs[delta_layer_idx].buf, off_qkv, &pbs.dn_qkv_batch.buf, 0, copy_qkv),
+        TapeCopy::new(&tape.alpha_bufs[delta_layer_idx].buf, off_a, &pbs.dn_alpha_batch.buf, 0, copy_a),
+        TapeCopy::new(&tape.beta_bufs[delta_layer_idx].buf, off_a, &pbs.dn_beta_batch.buf, 0, copy_a),
+    ]
+}
+
+/// Queue the three descriptors of [`gdn_tape_copy_descriptors`] on `sink`.
+/// Shared by the per-request pre-GDN sink branch and the lane-batched
+/// multi-request route, so both queue identical descriptors.
 pub(crate) fn push_gdn_tape_copies(
     sink: &mut Vec<rdna_compute::tape_copy::TapeCopy>,
     tape: &crate::speculative::GdnTape,
@@ -6422,16 +6456,7 @@ pub(crate) fn push_gdn_tape_copies(
     n: usize,
     delta_layer_idx: usize,
 ) {
-    use rdna_compute::tape_copy::TapeCopy;
-    let qkv_row_bytes = tape.qkv_dim * 4;
-    let alpha_row_bytes = n_v_heads * 4;
-    let off_qkv = tape_offset * qkv_row_bytes;
-    let off_a = tape_offset * alpha_row_bytes;
-    let copy_qkv = n * qkv_row_bytes;
-    let copy_a = n * alpha_row_bytes;
-    sink.push(TapeCopy::new(&tape.qkv_bufs[delta_layer_idx].buf, off_qkv, &pbs.dn_qkv_batch.buf, 0, copy_qkv));
-    sink.push(TapeCopy::new(&tape.alpha_bufs[delta_layer_idx].buf, off_a, &pbs.dn_alpha_batch.buf, 0, copy_a));
-    sink.push(TapeCopy::new(&tape.beta_bufs[delta_layer_idx].buf, off_a, &pbs.dn_beta_batch.buf, 0, copy_a));
+    sink.extend(gdn_tape_copy_descriptors(tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx));
 }
 
 /// The pre-GDN fused sigmoid(beta) + alpha gate over rows `[0, n)` of `pbs`
@@ -6609,15 +6634,24 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // next layer's producers run. Nothing on this path writes the
     // source rows after the sigmoid, so the tape bytes are equal.
     if let Some(tape) = gdn_tape.as_ref() {
-        let qkv_row_bytes = tape.qkv_dim * 4;
-        let alpha_row_bytes = n_v_heads * 4;
-        let off_qkv = tape_offset * qkv_row_bytes;
-        let off_a = tape_offset * alpha_row_bytes;
-        let copy_qkv = n * qkv_row_bytes;
-        let copy_a = n * alpha_row_bytes;
         if let Some(sink) = tape_sink {
             push_gdn_tape_copies(sink, tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
+        } else if fusion == DflashFusionCtx::ChainVerify
+            && matches!(batch_semantics, BatchSemantics::Sequential)
+            && tree_verify.as_ref().and_then(|c| c.parent_indices).is_none()
+            && verify_tape_copy_batch_enabled()
+        {
+            // Singleton chain verify: one batched launch for the same three
+            // descriptors, issued at the original copy point (before conv).
+            let copies = gdn_tape_copy_descriptors(tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
+            gpu.tape_copy_batched(&copies)?;
         } else {
+            let qkv_row_bytes = tape.qkv_dim * 4;
+            let alpha_row_bytes = n_v_heads * 4;
+            let off_qkv = tape_offset * qkv_row_bytes;
+            let off_a = tape_offset * alpha_row_bytes;
+            let copy_qkv = n * qkv_row_bytes;
+            let copy_a = n * alpha_row_bytes;
             gpu.memcpy_dtod_at_auto(
                 &tape.qkv_bufs[delta_layer_idx].buf,
                 off_qkv,
