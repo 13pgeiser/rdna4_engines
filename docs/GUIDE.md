@@ -334,6 +334,12 @@ rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-27b -o swift-27b-fp8.rad \
     --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 --recipe data/recipes/q38-27b-fp8block-df2.recipe \
     --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
     --set "quantization_config.weight_block_size=128 128" --set quantization_config.activation_scheme=dynamic
+
+# gemma-4-26B-A4B-it with z-lab's DFlash drafter, the routed experts' gate_up as block fp8 (served by
+# arch/gemma4 with `--kernels gemma4k,libr4d,libavx` -- gemma4k FIRST; docs/ARCHITECTURES.md says
+# why, and why down stays bf16 unless the experts were padded to 768)
+rad-convert ~/models/google/gemma-4-26B-A4B-it -o gemma4-26b-a4b-df.rad \
+    --draft-model ~/models/z-lab/gemma-4-26B-A4B-it-DFlash --recipe data/recipes/gemma4-26b-a4b-df.recipe
 ```
 
 A checkpoint directory's `model.safetensors.index.json` decides which shard each tensor is read
@@ -1852,6 +1858,8 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct at al
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
+| `RADIANCE_G4K_WMMA` | `0` keeps `gemma4k`'s prefill attention on its scalar kernel instead of the WMMA one. An A/B switch and a way out if the matrix path misbehaves on a card; read once |
+| `RADIANCE_GEMMA4_FUSE` | `0` makes `arch/gemma4` declare the rmsnorm / add chain instead of `gemma4k`'s sandwich joins (`norm_add_norm`, `join_add_scale`). An A/B switch; read at declare |
 
 There is also a family of instruments for engine development — `RADIANCE_DEBUG_*` (residual probes,
 idle scrubs, routing and issue dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on

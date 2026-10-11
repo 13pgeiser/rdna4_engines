@@ -33,6 +33,8 @@ core/kld.*        the KL mode: --kld-record / --kld-ref
 core/engine*      the thing that ties them together, and `radiance` the binary
 libref/           every op, naively, correct, host domain: the fallback and the oracle
 libr4d/           the RDNA4 (gfx12xx) kernel library: kernels, rows, layouts, fusion claims
+gemma4k/          Gemma 4's kernels beyond libr4d (gfx12): its paged attention (ahead of libr4d
+                  for that model), pair_argmax, and the sandwich-norm joins
 libavx/           the same vocabulary in x86 SIMD, host domain: the production host kernels,
                   built on every x86-64 build because an op placed on the host cannot run on libref
 libquant/         the built-in quantisers rad-convert's recipes name: grids, transforms, rtn, gptq

@@ -14,7 +14,8 @@ into the id an architecture plugin claims.
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
-| `arch/gemma4_bf16` | `gemma4_bf16` | `i4` (group-128 codes, f16 scale) | Gemma 4 31B dense (text): two attention classes — sliding-window and proportional-RoPE global (`attention_k_eq_v`) — over one GemmaRMSNorm stream, GELU ffn, two KV groups, softcapped logits, tied scaled embedding; served from a CT-INT4 (QAT w4a16) checkpoint |
+| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense (text): two attention classes — sliding-window and proportional-RoPE global (`attention_k_eq_v`) — over one GemmaRMSNorm stream, GELU ffn, two KV groups, softcapped logits, tied scaled embedding; served from a CT-INT4 (QAT w4a16) checkpoint as group-128 int4 codes with an f16 scale |
+| `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint — the 26B-A4B MoE (a dense and a routed arm side by side) and the dense sizes without per-layer embeddings — with z-lab's DFlash drafter; routed experts bf16 or block fp8, as the recipe chose |
 
 This document is the geometry of each, and the handful of readings that are **arithmetically
 silent** — wrong in a way that produces fluent output and no error anywhere.
@@ -446,4 +447,96 @@ The traps:
 - **An audio clip's tokens are ceil(real frames / 4)**, real frames being those whose last sample
   is a real one; the processor stages exactly those plus zero frames to whole rows, which
   reproduces every row the reference keeps.
+
+---
+
+# `gemma4` — Gemma 4 text, and its DFlash drafter
+
+`arch/gemma4` serves a container converted from Google's bf16 checkpoint (`Gemma4ForConditionalGeneration`
+or `Gemma4ForCausalLM`), the recipe choosing what is fp8: gemma-4-26B-A4B-it, and the dense sizes
+without per-layer embeddings. The CT-INT4 31B release is `arch/gemma4_bf16`'s. A z-lab DFlash
+drafter is merged at convert time (`--draft-model`); the recipes are
+`data/recipes/gemma4-26b-a4b-df*.recipe`. The reference is transformers' `modeling_gemma4`.
+
+```
+gemma-4-26B-A4B-it
+  30 layers, hidden 2816, vocab 262144 tied to the embedding, rms_norm_eps 1e-6
+  layer_types: five sliding_attention then one full_attention, five times
+    sliding  16 heads / 8 kv x 256, rope theta 1e4 over the whole head, window 1024
+    full     16 heads / 2 kv x 512, PROPORTIONAL rope theta 1e6 over a quarter of it, K = V
+  attention scale 1: q and k RMS-normed per head with a gain, v with none
+  sandwich norms, plain gains (x_hat * w)
+  the feed-forward is two arms reading the same residual, summed:
+    dense    pre_feedforward_layernorm -> gate|up 2112 (gelu-tanh) -> down -> post_feedforward_layernorm_1
+    routed   router -> softmax -> top 8 of 128 -> renormalised -> * per_expert_scale[expert];
+             pre_feedforward_layernorm_2 -> 128 experts of 704 (gelu-tanh) -> post_feedforward_layernorm_2
+    sum -> post_feedforward_layernorm -> residual add
+  layer_scalar multiplies the residual stream at the end of every layer
+  embedding * sqrt(2816) as a bf16; final norm; tied head; final_logit_softcapping 30
+DFlash    a small Qwen3-shaped block drafter: an anchor and block - 1 mask tokens denoised in one
+          pass over the trunk's hidden states at target_layer_ids; drafts read off the TARGET's head
+```
+
+The readings that stay plausible when wrong:
+
+- **Proportional rope is not a partial rotary.** The full layers rotate the first 64 frequency
+  pairs of the 512-wide head at theta^(-2j/512) — the exponent divides by the HEAD — with pair j
+  channels (j, j + 256), and leave the other 192 pairs at frequency zero. `rope` with
+  `rotary_dim` 128 pairs (j, j + 64) at theta^(-2j/128): a different function that still produces
+  fluent text. The plugin declares a full-width NeoX `rope` whose frequencies past pair 63 are
+  divided by 1e30 through the YaRN ramp `rope` already carries, a step at 63.5..64.
+- **V on a full layer is the un-normed, un-rotated k projection**, RMS-normed with a unit gain, so
+  the value norm reads `k` before the key norm writes it.
+- **The router does not read the feed-forward's input.** It reads the residual stream through a
+  gainless norm times its own `scale` vector times hidden^-0.5, while the experts read
+  pre_feedforward_layernorm_2's output. `per_expert_scale` multiplies the weight AFTER the
+  renormalised top-k.
+- **The arms' two post-norms are per arm**, so under tensor parallel each arm's partial sum is
+  reduced before its norm. The partials share one [2T, hidden] buffer, dense rows first, so one
+  all-reduce carries both.
+- **The embedding scale is sqrt(hidden) rounded to bf16**: 53.0, not 53.066. The drafter reads the
+  same scaled embedding.
+- **The sliding layers' KV group is `RAD_KV_FULL`**, with the window on the attention op. A
+  `RAD_KV_WINDOW` group is not prefix-cached, so a hit on it reuses nothing and re-prefills; as
+  FULL the hit is kept. The planner gives every paged group the same block count, so the recycling
+  a window group would buy is worth nothing here.
+- **The drafter's sliding layers are causal and its full layer is not**, and its logits' softcap
+  is ignored on purpose: a draft is an argmax and the cap is strictly increasing.
+
+**Tensor parallel.** Heads split by rank, o and down by column with an all-reduce, the vocabulary
+by row. The full layers' two KV heads are replicated past two ranks. Routed experts are
+expert-parallel, 128 / world whole experts a rank, because a 704-wide expert has no block-aligned
+width split; the router is replicated, so every rank agrees on the routing without a collective.
+The drafter's head is vocab-sharded with the trunk's: each rank's top-2 are all-gathered and
+`pair_argmax` picks the winner (two a rank, because a row-interleaved `all_gather` moves 16-byte
+words and one pair is 8 bytes).
+
+**FP8 experts.** The experts are ~90% of the weight bytes, so each projection is served as the
+container holds it, per layer: bf16 by `moe_gemm`, block fp8 by `moe_gemm_q`. gate_up `[1408, 2816]`
+is whole 64-row tiles and 128-blocks. down `[2816, 704]` is not — the fp8 grouped GEMM reads K in
+whole 128-column blocks — so it stays bf16 unless the checkpoint's experts were padded to 768 before
+conversion (zero rows of gate and up, zero columns of down: exact). The fp8 tables are split by
+expert parity, so a rank holds an even number of experts.
+
+**Kernels.** `--kernels gemma4k,libr4d,libavx`, **gemma4k first.** It serves all of the trunk's
+attention -- the sliding layers (h256, gqa 2) and the full layers at gqa 8, 4 and 2 (one or two,
+four, eight ranks) -- plus `pair_argmax` and the two sandwich-norm joins (`norm_add_norm`,
+`join_add_scale`), which the plugin declares as the rmsnorm / add chain where nothing serves them;
+the startup note says how many were fused. libr4d has h256/gqa2 and h512/gqa8 rows as well,
+written for the dense 31B; with gemma4k first the 26B-A4B runs on the kernels it was measured with.
+Without `gemma4k` at all, the full layers have no kernel at four and eight ranks, and a drafter head
+sharded over more than one rank has no `pair_argmax`.
+
+**A drafter that is not working still writes fluent text.** Every draft is verified, so a broken
+drafter costs speed and nothing else: judge it by `draft_n_accepted` (about a third of `draft_n` on
+prose, at about two tokens a step), not by the reply. The trap that showed it: the buffer planner
+takes liveness from DECLARATION order, so the tap copy into `dflash_src` is declared at the end of
+the layer it taps, where it is issued. Declared once after the trunk, it let the planner share
+`dflash_src` with `moe_edn`, which every MoE layer writes, whenever the sizes allowed it
+(`--max-num-seqs 16` did): 2% acceptance, slower than no speculation, and nothing in the text to
+say so. arch_test holds the two live ranges to overlap.
+
+**Not declared.** The vision tower (`arch/embgemma2` declares Gemma 4's, for an encoder): a container
+that carries one is served with `--mm-max-patches 0`. An fp8 attention or dense arm — under a tenth
+of the weight bytes, and the dense arm's 2112 is not whole 128-blocks either.
 
