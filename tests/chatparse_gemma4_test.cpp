@@ -354,9 +354,9 @@ static std::vector<Shape> shapes() {
           { { "write", "{\"content\":\"a \\\"q\\\" \\\\ b\\n\\tc\\u0001 é 🚀\",\"path\":\"/x\"}" } },
           true, true },
         { "a string holding the format's own punctuation", kOff,
-          G("write", "content:" + S("{a:1,} [<|tool_call>call:x{}<tool_call|>] <channel|> <|\" .") +
+          G("write", "content:" + S("{a:1,} [<|tool_call>call:x()<tool_call|>] <channel|> <|\" .") +
                      ",path:" + S("/x")), "", "",
-          { { "write", "{\"content\":\"{a:1,} [<|tool_call>call:x{}<tool_call|>] <channel|> <|\\\" .\","
+          { { "write", "{\"content\":\"{a:1,} [<|tool_call>call:x()<tool_call|>] <channel|> <|\\\" .\","
                        "\"path\":\"/x\"}" } }, true, true },
         /* Text ending in the start of the delimiter reads as written. (No grammar of this shape
          * can write it -- llama.cpp's cannot either.) */
@@ -400,10 +400,55 @@ static std::vector<Shape> shapes() {
         /* leaving the object */
         { "a JSON string", kOff, G("bash", "command:\"ls -la\""), "", "",
           { { "bash", "{\"command\":\"ls -la\"}" } }, false, false },
-        { "JSON escapes, a pair and a stray surrogate", kOff,
-          G("bash", "command:\"a\\\"b\\\\c\\u00e9\\ud83d\\ude00\\ud800x\\q\""), "", "",
-          { { "bash", "{\"command\":\"a\\\"b\\\\c\\u00e9\\ud83d\\ude00\\ufffdx\\\\q\"}" } }, false,
+        /* Gemma's plain-quoted values are its own strings with, at most, the quotes escaped
+         * (measured: `code: "const s = \"a\nb\";"` for the JS `const s = "a\nb";`): an
+         * escaped quote is a quote, every other backslash is text. */
+        { "a plain-quoted value with its quotes escaped", kOff,
+          G("bash", "command:\"a\\\"b\\\\c\\u00e9\\n\\q\""), "", "",
+          { { "bash", "{\"command\":\"a\\\"b\\\\\\\\c\\\\u00e9\\\\n\\\\q\"}" } }, false,
           false },
+        { "a plain-quoted value written verbatim", kOff,
+          G("write", "content:\"const s = \"a\\nb\"; f(\"x\", {y: 1});\",path:" + S("/x")), "", "",
+          { { "write", "{\"content\":\"const s = \\\"a\\\\nb\\\"; f(\\\"x\\\", {y: 1});\",\"path\":\"/x\"}" } },
+          false, false },
+        /* Measured: asked for nested arguments, the model writes Python's quotes. */
+        { "single-quoted values, as served", kOff,
+          G("configure", "label: 'prod \"eu\"', extra: {note: 'x: {y}', tags: ['a,b', 'c}']}, mode: 'it\\'s'"),
+          "", "", { { "configure", "{\"label\":\"prod \\\"eu\\\"\",\"extra\":{\"note\":\"x: {y}\",\"tags\":[\"a,b\",\"c}\"]},"
+                                 "\"mode\":\"it's\"}" } }, false, false },
+        { "a plain quote closed by the dialect's delimiter", kOff, G("bash", "command:\"ls" + Q), "",
+          "", { { "bash", "{\"command\":\"ls\"}" } }, false, false },
+        /* The model leaves a string unclosed and writes the object's `}` and the call's close
+         * (measured: the close delimiter at p=0.86, `}` at p=0.08). The close ends the string and
+         * the call; the closers before it are the object's. */
+        { "a string the model left open, as served", kOff,
+          "<|tool_call>call:execute{code:" + Q + "const s = \"line1\\nline2\"; console.log(...);}"
+          "<tool_call|><tool_call|><|channel>thought\n<channel|><channel|>"
+          "<|tool_call>call:execute{code:" + Q + "const s = \"line1\\nline2\"; console.log(...);" + Q +
+          "}<tool_call|>", "", "",
+          { { "execute", "{\"code\":\"const s = \\\"line1\\\\nline2\\\"; console.log(...);\"}" },
+            { "execute", "{\"code\":\"const s = \\\"line1\\\\nline2\\\"; console.log(...);\"}" } },
+          false, false },
+        { "a string left open whose code ends in a brace", kOff,
+          "<|tool_call>call:bash{command:" + Q + "f() { return 1; }}<tool_call|>", "", "",
+          { { "bash", "{\"command\":\"f() { return 1; }\"}" } }, false, false },
+        { "a nested string left open", kOff,
+          "<|tool_call>call:configure{extra:{a:[" + Q + "x]}\n}<tool_call|>" + G("bash", "command:" + S("ls")),
+          "", "", { { "configure", "{\"extra\":{\"a\":[\"x\"]}}" }, { "bash", "{\"command\":\"ls\"}" } },
+          false, false },
+        /* Thinking on, measured: the close spelled as a plain quote, and text after the call. */
+        { "a string closed by a stray quote, text after the call", kOn,
+          "<|tool_call>call:bash{command:" + Q + "f(\"a\");\n\"}<tool_call|>end", "end", "",
+          { { "bash", "{\"command\":\"f(\\\"a\\\");\\n\"}" } }, false, false },
+        { "a string left open that ends in its own quote", kOff,
+          "<|tool_call>call:bash{command:" + Q + "say \"hi\"}<tool_call|>", "", "",
+          { { "bash", "{\"command\":\"say \\\"hi\\\"\"}" } }, false, false },
+        { "a string left open at the end of the reply", kOff,
+          "<|tool_call>call:bash{command:" + Q + "ls}<tool_call|>", "", "",
+          { { "bash", "{\"command\":\"ls\"}" } }, false, false },
+        { "code with quotes, backticks, a regex and braces", kOff,
+          G("bash", "command:" + S("const r = /\\d+\"}/g; `${a}` <b> '{'") + ",x:1"), "", "",
+          { { "bash", "{\"command\":\"const r = /\\\\d+\\\"}/g; `${a}` <b> '{'\",\"x\":1}" } }, true, true },
         { "Python literals", kOff, G("configure", "verbose:True,nothing:None"), "", "",
           { { "configure", "{\"verbose\":true,\"nothing\":null}" } }, false, false },
         { "a bare word", kOff, G("configure", "mode:fast,level:01"), "", "",
@@ -709,6 +754,9 @@ TEST(the_call_grammar_admits_what_the_model_writes_and_refuses_the_rest) {
         if (admits(g.text, "", calls) != 1)
             ::radtest::fail(__FILE__, __LINE__, std::string("refused: ") + s.what + " " + quote(calls));
     }
+    /* Python's quotes, as the model writes arguments it was handed as JSON. */
+    CHECK_EQ(admits(g.text, "", G("bash", "command:'echo \"hi\" \\' {x}'")), 1);
+    CHECK_EQ(admits(g.text, "", G("configure", "extra:{tags:['a,b', 'c}']}")), 1);
     for (const std::string& bad : {
              G("bash", "command:ls"),                              /* a bare word */
              G("bash", "command:\"ls\""),                          /* a JSON string */

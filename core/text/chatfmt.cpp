@@ -672,8 +672,14 @@ void add_object_rules(const common_grammar_builder& b, const ChatFormat& f) {
         b.add_rule("obj-string", "\"\\\"\" ( [^\"\\\\] | \"\\\\\" ( [\"\\\\/ bfnrt] | \"u\" "
                                  "[0-9a-fA-F]{4} ) )* \"\\\"\"");
     b.add_rule("obj-number", "\"-\"? (\"0\" | [1-9] [0-9]*) (\".\" [0-9]+)? ([eE] [+-]? [0-9]+)?");
-    b.add_rule("obj-value", "obj-object | obj-array | obj-string | obj-number | \"true\" | "
-                            "\"false\" | \"null\"");
+    /* A dialect with strings of its own still gets a value in Python's quotes, `'...'`, which
+     * is how Gemma 4 writes arguments it was handed as JSON (measured). Refused, the model
+     * takes the next token the grammar allows -- a `-` -- and every such string becomes a
+     * number; the parser reads the quoted text verbatim but for an escaped quote. */
+    const char* sq = so.empty() ? "" : " | obj-sqstring";
+    if (!so.empty()) b.add_rule("obj-sqstring", "\"'\" ( [^'\\\\] | \"\\\\\" [^\\x00] )* \"'\"");
+    b.add_rule("obj-value", std::string("obj-object | obj-array | obj-string") + sq +
+                            " | obj-number | \"true\" | \"false\" | \"null\"");
     b.add_rule("obj-array", "\"[\" space (\"]\" | obj-value (\",\" space obj-value)* space "
                             "\"]\")");
     if (f.object_bare_keys) {

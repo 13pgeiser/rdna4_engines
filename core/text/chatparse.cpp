@@ -758,6 +758,11 @@ struct ReplyFormat::Impl {
      * `,` `}` -- patterns 0..2 -- or at the call's close or end, which follow at the indices
      * below (-1: none). */
     Dfa obj_str, obj_bare, obj_key;
+    /* A value the model opened with a plain `"` -- or `'` (obj_sqstr) -- in a dialect that has
+     * strings of its own: read as that dialect's strings are, verbatim, to a quote the object's
+     * syntax goes on after. Patterns: the quote, the escaped quote, the dialect's string close,
+     * the call's close (if any). */
+    Dfa obj_qstr, obj_sqstr;
     int bare_cc = -1, bare_ce = -1, key_cc = -1, key_ce = -1;
 
     /* REASONING ANYWHERE: content is scanned for a later block's opener and a stray close too,
@@ -821,7 +826,18 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
         if (!f.object_string_open.empty()) {
             m.obj_lits.push_back(f.object_string_open);
             m.obj_lit_kind.push_back(Impl::LitString);
-            m.obj_str.build({ f.object_string_close });
+            /* The call's close inside a string: where a model left the string unclosed. */
+            std::vector<std::string> sp{ f.object_string_close };
+            std::vector<std::string> qp{ "\"", "\\\"", f.object_string_close };
+            std::vector<std::string> sq{ "'", "\\'", f.object_string_close };
+            if (!m.cc_core.empty()) {
+                sp.push_back(m.cc_core);
+                qp.push_back(m.cc_core);
+                sq.push_back(m.cc_core);
+            }
+            m.obj_str.build(sp);
+            m.obj_qstr.build(qp);
+            m.obj_sqstr.build(sq);
         }
         if (!m.cc_core.empty()) {
             m.obj_lits.push_back(m.cc_core);
@@ -1076,6 +1092,8 @@ enum class St : uint8_t {
     ObjValue,     /* where a value may begin, or an empty array's `]` */
     ObjLit,       /* the dialect's string opener, or the call's close or end, being matched */
     ObjStr,       /* a dialect string, to its close */
+    ObjQStr,      /* a value opened with a plain quote in a dialect with strings of its own */
+    ObjQLook,     /* after a plain quote there: does the object's syntax go on? */
     ObjJStr,      /* a JSON string, to its quote */
     ObjBare,      /* a bare value: a number, a literal, or a word read as a string */
     ObjAfter,     /* after a value: whitespace, then `,` or a closing bracket */
@@ -1162,6 +1180,15 @@ struct ReplyStream::Impl {
     /* A JSON string's escape being read -- the backslash, and a "u" escape's four hex digits,
      * in vheld -- and a high surrogate's escape, held until the low one shows it is a pair. */
     std::string jhi;
+    /* INSIDE A STRING: its trailing run of whitespace, closing brackets and quotes, held -- the
+     * brackets are the object's own if the call's close follows (srun) -- the quotes and
+     * backticks it has written (nq, nb), the bytes after a plain quote while they decide what it
+     * was (qtail), and how a plain-quoted value writes its quotes: 0 not yet seen, 1 as \" (one
+     * is unescaped), 2 as they are. */
+    std::string srun, qtail;
+    size_t      nq = 0, nb = 0, ns = 0;
+    uint8_t     qmode = 0;
+    char        qc = '"';
 
     /* published offsets, for the deltas */
     size_t sent_r = 0, sent_c = 0, sent_a = 0;
@@ -1510,6 +1537,7 @@ struct ReplyStream::Impl {
             obj_out("\"");
             ds = 0;
             hold.clear();
+            str_begin();
             st = St::ObjStr;
             return;
         }
@@ -1549,6 +1577,132 @@ struct ReplyStream::Impl {
         }
         if (!jhi.empty()) { lenient(); jhi.clear(); obj_out("\\ufffd"); }
         obj_out(e);
+    }
+
+    static constexpr size_t kRunKeep  = 16;   /* the closers a string's end may hold back */
+    static constexpr size_t kLookKeep = 32;   /* what deciding a close may read ahead */
+
+    static bool run_byte(char c) {
+        return c == '}' || c == ']' || c == '"' || c == '`' || c == '\'' || is_ws((unsigned char)c);
+    }
+
+    void str_begin() { srun.clear(); nq = nb = ns = 0; }
+    void str_emit(const char* q, size_t n) {
+        if (n == 0) return;
+        nq += (size_t)std::count(q, q + n, '"');
+        nb += (size_t)std::count(q, q + n, '`');
+        ns += (size_t)std::count(q, q + n, '\'');
+        touch(2);
+        json_escape_into(msg.calls.back().arguments, q, n);
+    }
+    void str_flush() { str_emit(srun.data(), srun.size()); srun.clear(); }
+
+    /* A string's text: all of it goes out but a trailing run of whitespace and closers. */
+    void str_text(const char* q, size_t n) {
+        size_t k = n;
+        while (k > 0 && run_byte(q[k - 1])) --k;
+        if (k > 0) { str_flush(); str_emit(q, k); }
+        srun.append(q + k, n - k);
+        if (srun.size() > kRunKeep) {
+            const size_t out = srun.size() - kRunKeep;
+            str_emit(srun.data(), out);
+            srun.erase(0, out);
+        }
+    }
+
+    /* Where the held run stops being text: the closers after it close every open bracket of the
+     * object, innermost first, as the model writes them before the call's close -- read from the
+     * end, the last closes the outermost. npos: they do not. */
+    size_t run_cut() const {
+        size_t i = srun.size(), k = 0;
+        while (i > 0 && k < ostack.size()) {
+            const char c = srun[i - 1];
+            if (is_ws((unsigned char)c)) { --i; continue; }
+            if (c != (ostack[k] == '{' ? '}' : ']')) break;
+            --i;
+            ++k;
+        }
+        return k == ostack.size() && k > 0 ? i : std::string::npos;
+    }
+
+    static bool starts(std::string_view a, std::string_view b) {
+        return a.size() >= b.size() && a.compare(0, b.size(), b) == 0;
+    }
+
+    /* The call's close in a string whose held run closes the whole object: the model left the
+     * string open (measured: the close delimiter at p=0.86, `}` at p=0.08), and this is where
+     * the call ends -- as vLLM's and HF's Gemma 4 parsers end it, at the first `}<tool_call|>`.
+     * The closers are the object's. A quote or backtick just before them that leaves the string
+     * with an odd count of its kind was the string's close, written in the wrong spelling. */
+    void cut_begin() {
+        const size_t cut = run_cut();
+        if (cut == std::string::npos) { str_flush(); str_emit(F.cc_core.data(), F.cc_core.size()); return; }
+        lenient();
+        size_t keep = cut;
+        if (keep > 0 && (srun[keep - 1] == '"' || srun[keep - 1] == '`' || srun[keep - 1] == '\'')) {
+            const char c = srun[keep - 1];
+            const size_t n = (c == '"' ? nq : c == '`' ? nb : ns) +
+                             (size_t)std::count(srun.begin(), srun.begin() + (long)keep, c);
+            if (n % 2 == 1) --keep;
+        }
+        str_emit(srun.data(), keep);
+        srun.clear();
+        if (!jhi.empty()) jhi.clear();
+        obj_out(okey ? "\":null" : "\"");
+        vpending = false;
+        ocomma = false;
+        /* As after a call's close of its own: a repeated close goes with it. */
+        end_call();
+    }
+
+    /* After a plain quote in a plain-quoted value: 0 not yet known, 1 it closed the value -- the
+     * object goes on with a member, an element, its closers and the call's close -- 2 it was
+     * text. */
+    int q_verdict() const {
+        const std::string& q = qtail;
+        if (q.size() > kLookKeep) return 2;
+        const size_t n = q.size();
+        size_t i = 0, top = ostack.size();
+        auto ws = [&] { while (i < n && is_ws((unsigned char)q[i])) ++i; };
+        ws();
+        while (i < n && top > 0 && q[i] == (ostack[top - 1] == '{' ? '}' : ']')) { --top; ++i; ws(); }
+        if (i == n) return 0;
+        const std::string& so = F.f.object_string_open;
+        std::string_view r(q.data() + i, n - i);
+        if (!F.cc_core.empty()) {
+            if (starts(r, F.cc_core)) return 1;
+            if (starts(F.cc_core, r)) return 0;
+        }
+        if (top == 0 || q[i] != ',') return 2;
+        ++i;
+        ws();
+        if (i == n) return 0;
+        r = std::string_view(q.data() + i, n - i);
+        const unsigned char c = (unsigned char)q[i];
+        if (starts(r, so)) return 1;
+        if (starts(so, r)) return 0;
+        if (ostack[top - 1] == '{') {
+            if (!(std::isalpha(c) || c == '_')) return 2;
+            while (i < n && (std::isalnum((unsigned char)q[i]) || q[i] == '_')) ++i;
+            ws();
+            if (i == n) return 0;
+            return q[i] == ':' ? 1 : 2;
+        }
+        return (c == '"' || c == '\'' || c == '{' || c == '[' || c == '-' || std::isdigit(c)) ? 1 : 2;
+    }
+
+    void q_done(bool closed) {
+        std::string again;
+        again.swap(qtail);
+        if (closed) {
+            str_flush();
+            obj_string_done();
+        } else {
+            if (qmode == 0) qmode = 2;
+            str_text(&qc, 1);
+            st = St::ObjQStr;
+        }
+        read_again(again);
     }
 
     /* A string or a key closed. */
@@ -2166,6 +2320,20 @@ struct ReplyStream::Impl {
                 obj_close_bracket(c);
                 return p + 1;
             }
+            if ((c == '"' || c == '\'') && !F.f.object_string_open.empty()) {
+                /* Measured on Gemma 4: such a quote -- `"`, or `'` as Python and JavaScript
+                 * write strings -- is followed by the text verbatim, or with only its quotes
+                 * escaped, never JSON's other escapes. */
+                obj_sep();
+                vpending = false;
+                lenient();
+                obj_out("\"");
+                qc = c;
+                qmode = 0;
+                str_begin();
+                st = St::ObjQStr;
+                return p + 1;
+            }
             if (c == '"') {
                 obj_sep();
                 vpending = false;
@@ -2199,12 +2367,32 @@ struct ReplyStream::Impl {
         }
 
         case St::ObjStr:
-            p = scan(F.obj_str, p, e, &hit, [this](const char* q, size_t n) {
-                touch(2);
-                json_escape_into(msg.calls.back().arguments, q, n);
-            });
-            if (hit >= 0) obj_string_done();
+            p = scan(F.obj_str, p, e, &hit, [this](const char* q, size_t n) { str_text(q, n); });
+            if (hit < 0) return p;
+            if (hit == 0) { str_flush(); obj_string_done(); }
+            else cut_begin();
             return p;
+
+        case St::ObjQStr:
+            p = scan(qc == '"' ? F.obj_qstr : F.obj_sqstr, p, e, &hit,
+                     [this](const char* q, size_t n) { str_text(q, n); });
+            if (hit < 0) return p;
+            if (hit == 0) { qtail.clear(); st = St::ObjQLook; }
+            else if (hit == 1) {
+                if (qmode == 0) qmode = 1;
+                const char esc[2] = { '\\', qc };
+                if (qmode == 1) str_text(&qc, 1);
+                else str_text(esc, 2);
+            } else if (hit == 2) { lenient(); str_flush(); obj_string_done(); }
+            else cut_begin();
+            return p;
+
+        case St::ObjQLook: {
+            qtail.push_back(*p);
+            const int v = q_verdict();
+            if (v) q_done(v == 1);
+            return p + 1;
+        }
 
         case St::ObjJStr: {
             const char* run = p;
@@ -2492,6 +2680,14 @@ struct ReplyStream::Impl {
     }
 
     void finish_all() {
+        /* The reply ended while a close was being decided: it was one. */
+        while (st == St::ObjQLook) {
+            q_done(true);
+            std::string again = std::move(refeed);
+            refeed.clear();
+            run(again, fed >= again.size() ? fed - again.size() : 0);
+        }
+        if (st == St::ObjStr || st == St::ObjQStr) str_flush();
         while (in_loose_attempt()) {
             fail_attempt();
             std::string again = std::move(refeed);
@@ -2601,6 +2797,7 @@ ReplyHeld ReplyStream::held() const {
                   (m.msg.reasoning.size() - m.sent_r) + (m.msg.content.size() - m.sent_c) +
                   (m.msg.calls.empty() ? 0 : m.msg.calls.back().arguments.size() - m.sent_a);
     h.space = m.content.held_space() + m.think_pend.size();
+    h.delimiter += m.srun.size() + m.qtail.size();
     h.structure = m.att.size() + m.name.size() + m.vheld.size() + m.val.held_container() +
                   m.jhi.size();
     return h;
