@@ -1729,20 +1729,13 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                // DFlash2 proposal width (`speculation.dflash_block`): one
-                // width per serving configuration, resolved here from the
-                // staged route (`auto` = 8 on a VMM batching serve with >= 4
-                // lanes, else 16) and never from the live batch, so batched
-                // lanes stay byte-identical to the singleton.
-                let dflash_block = match hipfire_runtime::dflash::DflashBlockPolicy::from_param(
-                    msg.get("params").and_then(|p| p.get("dflash_block")),
-                ) {
-                    Ok(policy) => policy.resolve(parsed_vmm_batch.is_some(), parsed_continuous_batch_size),
-                    Err(e) => {
-                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
+                let Some(dflash_block) = request_guards::dflash_block(
+                    &mut stdout,
+                    &msg,
+                    parsed_vmm_batch.is_some(),
+                    parsed_continuous_batch_size,
+                ) else {
+                    continue;
                 };
 
                 // Model-free n-gram policy normally arrives as per-load params
