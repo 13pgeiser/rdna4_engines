@@ -489,6 +489,9 @@ struct HfqRangeReader {
     identity: Arc<SourceIdentity>,
     file: File,
     file_identity: SourceFileIdentity,
+    /// The file's `evict_page_cache` policy when the range was taken: the
+    /// weight upload's bytes are dropped from the page cache after upload.
+    evict_after_upload: bool,
 }
 
 impl SourceReaderImpl for HfqRangeReader {
@@ -504,6 +507,14 @@ impl SourceReaderImpl for HfqRangeReader {
             verify_path_identity(expected)?;
         }
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
+
+    fn release_uploaded(&self, offset: u64, len: u64) {
+        #[cfg(unix)]
+        if self.evict_after_upload {
+            use std::os::unix::io::AsRawFd;
+            fadvise_dontneed(self.file.as_raw_fd(), offset as usize, len as usize);
+        }
     }
 }
 
@@ -558,6 +569,9 @@ pub struct HfqFile {
     /// repeat loads hit the page cache and kernel readahead works; measured
     /// 2026-08-22 on gfx1100: fadvise-per-tensor forces a full disk re-read
     /// of the model on every load (~1.3 GB/s effective vs multi-GB/s cache).
+    /// Range descriptors ([`Self::tensor_range`]) capture it: the weight
+    /// upload of a range drops each chunk after uploading it, while other
+    /// range reads (PLE rows) keep their pages.
     evict_page_cache: bool,
     /// Memoized result of [`Self::mostly_page_cached`] for THIS file:
     /// 0 = not probed, 1 = resident, 2 = not resident. Per-instance (not a
@@ -1996,6 +2010,7 @@ impl HfqFile {
             identity: source_identity.clone(),
             file,
             file_identity,
+            evict_after_upload: target.evict_page_cache,
         });
         SourceRangeDescriptor::from_parts(
             source_identity,
@@ -4045,6 +4060,86 @@ mod compact_qwen4_ple_tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod range_upload_release_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// Page-cache residency of every page of `path[offset..offset + len]`.
+    fn resident_pages(path: &Path, offset: u64, len: u64) -> Vec<bool> {
+        let file = File::open(path).unwrap();
+        let page = 4096u64;
+        let start = offset / page * page;
+        let map_len = (offset + len - start) as usize;
+        // SAFETY: a read-only shared mapping only handed to mincore, unmapped
+        // below; `vec` holds one byte per page.
+        unsafe {
+            let addr = libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                start as libc::off_t,
+            );
+            assert_ne!(addr, libc::MAP_FAILED);
+            let mut vec = vec![0u8; map_len.div_ceil(page as usize)];
+            assert_eq!(libc::mincore(addr, map_len, vec.as_mut_ptr()), 0);
+            libc::munmap(addr, map_len);
+            vec.into_iter().map(|state| state & 1 == 1).collect()
+        }
+    }
+
+    /// An evicting file's range drops the uploaded pages; a keeping one does
+    /// not; neither changes the bytes.  (Skipped where the file system keeps
+    /// every page, e.g. tmpfs.)
+    #[test]
+    fn range_upload_release_follows_the_eviction_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.hfq");
+        let data: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 251) as u8).collect();
+        let tensors = vec![HfqMemTensor {
+            name: "w".to_string(),
+            quant_type: 16,
+            shape: vec![512, 1024],
+            group_size: 0,
+            data: data.clone(),
+        }];
+        write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+        File::open(&path).unwrap().sync_all().unwrap();
+        for evict in [true, false] {
+            let mut hfq = HfqFile::open(&path).unwrap();
+            hfq.set_evict_page_cache(evict);
+            // As the unified-memory carriers do before the sweep: mapped
+            // pages are not dropped.
+            hfq.drop_mmap();
+            let range = hfq.tensor_range("w").unwrap().unwrap();
+            let mut bytes = vec![0u8; range.length as usize];
+            range.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, data);
+            // Interior pages only: fadvise keeps partial edge pages.
+            let (inner, inner_len) = (range.offset.div_ceil(4096) * 4096, 128 * 4096);
+            if !resident_pages(&path, inner, inner_len).iter().all(|&r| r) {
+                eprintln!("the file system did not cache the read; nothing to check");
+                return;
+            }
+            range.release_uploaded(range.offset, range.length);
+            let resident = resident_pages(&path, inner, inner_len);
+            if evict {
+                if resident.iter().all(|&r| r) {
+                    eprintln!("the file system keeps every page; nothing to check");
+                    return;
+                }
+                assert!(resident.iter().all(|&r| !r), "evicting range keeps pages");
+            } else {
+                assert!(resident.iter().all(|&r| r), "keeping range dropped pages");
+            }
+            range.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, data);
+        }
     }
 }
 #[cfg(test)]

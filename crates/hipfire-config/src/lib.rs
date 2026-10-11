@@ -1654,6 +1654,19 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PLE_PREWARM_BYTES",
         "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = 15 GiB (the hottest rows), capped at MemAvailable minus 8 GiB at ready and at the table. `0` turns the prewarm off; an explicit N is that many bytes. The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
     ),
+    process_field!(
+        "memory.ple_load_fill_bytes",
+        "ple_load_fill_bytes",
+        Memory,
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_PLE_LOAD_FILL_BYTES",
+        "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
+    ),
     process_bool_field!(
         "memory.prompt_cache_unbounded",
         "prompt_cache_unbounded",
@@ -6966,6 +6979,16 @@ pub mod memory {
         parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_PREWARM_BYTES").as_deref())
     }
 
+    /// Bytes of the rank-ordered q4 PLE table read during model load
+    /// (`memory.ple_load_fill_bytes`, compat env `HIPFIRE_PLE_LOAD_FILL_BYTES`;
+    /// parsed like [`parse_ple_prewarm_bytes`]): `Auto` (default) = 14 GiB,
+    /// `Bytes(0)` = off, `Bytes(n)` = that many bytes.  The loader caps it at
+    /// the table, an explicit prewarm budget and the host memory left after
+    /// the weights.
+    pub fn ple_load_fill_bytes() -> PleHotStoreBudget {
+        parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_LOAD_FILL_BYTES").as_deref())
+    }
+
     /// Path of the PLE sidecar of `model`: `<model file name>.ple-q4` /
     /// `.ple-q8`, appended to the full file name (extension included).
     pub fn ple_sidecar_path(model: &Path, format: PleFormat) -> PathBuf {
@@ -7386,6 +7409,36 @@ pub mod memory {
                 parse_ple_prewarm_bytes(
                     defaults
                         .legacy_value("HIPFIRE_PLE_PREWARM_BYTES")
+                        .as_deref()
+                ),
+                PleHotStoreBudget::Auto
+            );
+        }
+
+        #[test]
+        fn ple_load_fill_bytes_is_an_auto_integer_defaulting_to_auto() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_load_fill_bytes")
+                .expect("ple_load_fill_bytes is in the schema");
+            assert_eq!(field.legacy_key, "ple_load_fill_bytes");
+            assert_eq!(field.env_compat, Some("HIPFIRE_PLE_LOAD_FILL_BYTES"));
+            assert_eq!(
+                field.default.to_value(),
+                crate::ConfigValue::String("auto".into())
+            );
+            assert!(field
+                .validate(&crate::ConfigValue::String("auto".into()))
+                .is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).expect("empty resolve"))
+                    .expect("process");
+            assert_eq!(
+                parse_ple_prewarm_bytes(
+                    defaults
+                        .legacy_value("HIPFIRE_PLE_LOAD_FILL_BYTES")
                         .as_deref()
                 ),
                 PleHotStoreBudget::Auto

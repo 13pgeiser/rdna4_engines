@@ -237,6 +237,80 @@ fn ple_prewarm_budget() -> (u64, Option<u64>, bool) {
     }
 }
 
+/// `auto` in-load fill of a rank-ordered q4 PLE table: the hottest 14 GiB.
+/// That is B* of the offline row-hit curve of the shipped rank (2026-10-11,
+/// `plehot/hcurve_q4.py`): the smallest prefix whose modelled held-out prose
+/// and agentic 8K prefill (TTFT = 4,177 + (1 − h) × 1,135 ms) is within 1% of
+/// the 15 GiB prewarm's (prose h 0.923 vs 0.937, agentic 0.809 vs 0.836).
+const PLE_LOAD_FILL_AUTO_BYTES: u64 = 14 << 30;
+
+/// Read rate cap of the in-load fill: a small share of the NVMe's sequential
+/// bandwidth, so the weight upload keeps the drive.
+const PLE_LOAD_FILL_BYTES_PER_SEC: u64 = 200_000_000;
+
+/// Bytes of a rank-ordered q4 PLE table to read while the model loads: the
+/// `requested` `memory.ple_load_fill_bytes` (`auto` = [`PLE_LOAD_FILL_AUTO_BYTES`])
+/// capped at an explicit `memory.ple_prewarm_bytes`, at the table, and at the
+/// host RAM available now (`MemAvailable` plus TTM's page pool, which the
+/// weights' GTT allocations take first) minus the weights still to load into
+/// host RAM minus [`PLE_PREWARM_RESERVE_BYTES`] (0 when unknown).
+fn ple_load_fill_bytes(
+    requested: hipfire_config::memory::PleHotStoreBudget,
+    prewarm: hipfire_config::memory::PleHotStoreBudget,
+    host_available: Option<u64>,
+    host_weight_bytes: u64,
+    table_bytes: u64,
+) -> u64 {
+    use hipfire_config::memory::PleHotStoreBudget;
+    let requested = match requested {
+        PleHotStoreBudget::Bytes(bytes) => bytes,
+        PleHotStoreBudget::Auto => PLE_LOAD_FILL_AUTO_BYTES,
+    };
+    let prewarm = match prewarm {
+        PleHotStoreBudget::Bytes(bytes) => bytes,
+        PleHotStoreBudget::Auto => u64::MAX,
+    };
+    let host = host_available.map_or(0, |available| {
+        available
+            .saturating_sub(host_weight_bytes)
+            .saturating_sub(PLE_PREWARM_RESERVE_BYTES)
+    });
+    requested.min(prewarm).min(host).min(table_bytes)
+}
+
+/// Start the worker of a rank-ordered q4 PLE table before the weight sweep,
+/// with an in-load fill of its hottest prefix when
+/// [`ple_load_fill_bytes`] allows one. The worker prewarms on from there
+/// once the model is ready; dropping it stops and joins it.
+fn start_ple_table_worker(
+    store: &std::sync::Arc<hipfire_runtime::ple_hot_store::HotRowStore>,
+    host_weight_bytes: u64,
+) -> hipfire_arch_qwen4::bundle::PleHotWorker {
+    const MIB: u64 = 1 << 20;
+    let host_available = rdna_compute::uma_memory::host_available_bytes();
+    let bytes = ple_load_fill_bytes(
+        hipfire_config::memory::ple_load_fill_bytes(),
+        hipfire_config::memory::ple_prewarm_bytes(),
+        host_available,
+        host_weight_bytes,
+        store.data_bytes(),
+    );
+    eprintln!(
+        "  qwen4 ple load fill: {} MiB of a {} MiB q4 table while loading, at most {} MB/s \
+         (host available {} MiB incl. TTM pool, weights to host RAM {} MiB)",
+        bytes / MIB,
+        store.data_bytes() / MIB,
+        PLE_LOAD_FILL_BYTES_PER_SEC / 1_000_000,
+        host_available.map_or(0, |bytes| bytes / MIB),
+        host_weight_bytes / MIB,
+    );
+    let fill = (bytes > 0).then_some(hipfire_runtime::ple_hot_store::LoadFill {
+        bytes,
+        bytes_per_sec: PLE_LOAD_FILL_BYTES_PER_SEC,
+    });
+    hipfire_arch_qwen4::bundle::PleHotWorker::new(store.clone(), store.spawn_table_worker(fill))
+}
+
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
     match src {
         ModelSource::Hfq(hfq) => Ok(SourceMeta {
@@ -1025,10 +1099,29 @@ impl Carrier for Qwen4Carrier {
             .map_or(usize::MAX, |bytes| bytes >> 20);
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
-        // The PLE hot-row store opens before the weight sweep (while the
-        // source index is in hand); its worker verifies the pack meanwhile
-        // and prewarms it once the model is ready. Dropping it on an error
-        // path stops and joins the worker.
+        // A rank-order PLE table's worker starts now: it reads the table's
+        // hottest prefix at a capped rate while the weights load, and
+        // prewarms on from there once the model is ready. The PLE hot-row
+        // store also opens before the weight sweep (while the source index is
+        // in hand); its worker verifies the pack meanwhile and prewarms it
+        // once the model is ready. Dropping either on an error path stops and
+        // joins its worker.
+        let ple_table_worker = rank_table.as_ref().map(|store| {
+            // What the sweep puts in host RAM: on unified memory every
+            // uploaded weight (external PLE rows stay on disk), on a discrete
+            // card the host-mapped experts.
+            let host_weight_bytes = if use_ranges {
+                manifest
+                    .weights
+                    .iter()
+                    .filter(|entry| !entry.residency.is_external())
+                    .filter_map(|entry| bytes_of(entry))
+                    .sum()
+            } else {
+                residency::host_mapped_bytes(&manifest.weights, bytes_of).unwrap_or(0)
+            };
+            start_ple_table_worker(store, host_weight_bytes)
+        });
         let ple_hot = ple_descriptors.as_deref().and_then(|descriptors| {
             start_ple_hot_store(
                 use_ranges,
@@ -1241,30 +1334,30 @@ impl Carrier for Qwen4Carrier {
             }
         }
         // The model is loaded and admitted: a rank-order PLE table's worker
-        // (it serves from the start; the worker only prewarms), or the PLE
-        // hot-row store's worker, now prewarms the hottest rows into the page
-        // cache while no request is served (every PLE fetch pauses it).
-        if let Some(store) = &rank_table {
+        // (it serves from the start; the worker only reads ahead) ends its
+        // in-load fill and prewarms on from there, or the PLE hot-row store's
+        // worker prewarms the hottest rows into the page cache, while no
+        // request is served (every PLE fetch pauses it).
+        if let Some(worker) = ple_table_worker {
+            let store = worker.store().clone();
             let (budget, available, explicit_zero) = ple_prewarm_budget();
+            store.set_prewarm_budget(budget);
+            // The fill's own `load fill stopped at ready` line reports what it
+            // left resident; the prewarm continues from there.
             if budget == 0 {
                 eprintln!(
                     "  qwen4 ple prewarm: off ({})",
-                    ple_prewarm_off_reason(available, explicit_zero)
+                    ple_prewarm_off_reason(available, explicit_zero),
                 );
             } else {
-                let handle = store.spawn_table_worker();
-                store.set_prewarm_budget(budget);
                 eprintln!(
                     "  qwen4 ple prewarm: budget {} MiB of a {} MiB q4 sidecar (MemAvailable {} MiB)",
                     budget.min(store.data_bytes()) / MIB,
                     store.data_bytes() / MIB,
                     available.map_or(0, |bytes| bytes / MIB),
                 );
-                bundle.attach_ple_table_worker(hipfire_arch_qwen4::bundle::PleHotWorker::new(
-                    store.clone(),
-                    handle,
-                ));
             }
+            bundle.attach_ple_table_worker(worker);
         } else if let Some(store) = bundle.ple_hot_store() {
             let (budget, available) = ple_hot_prewarm_budget();
             store.set_prewarm_budget(budget);
@@ -4422,5 +4515,53 @@ mod qwen4_admission_tests {
         assert!(Qwen4Carrier
             .admit_options(Some("draft.hfq"), defaults)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod qwen4_ple_load_fill_tests {
+    use super::{ple_load_fill_bytes, PLE_LOAD_FILL_AUTO_BYTES, PLE_PREWARM_RESERVE_BYTES};
+    use hipfire_config::memory::PleHotStoreBudget::{Auto, Bytes};
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn auto_reads_b_star_when_the_host_has_room() {
+        // Halo at load start: ~112 GiB available, ~66 GiB of weights to load.
+        assert_eq!(
+            ple_load_fill_bytes(Auto, Auto, Some(112 * GIB), 66 * GIB, 27 * GIB),
+            PLE_LOAD_FILL_AUTO_BYTES
+        );
+    }
+
+    #[test]
+    fn caps_apply_in_every_mode() {
+        // The memory left after the weights and the reserve.
+        assert_eq!(
+            ple_load_fill_bytes(Auto, Auto, Some(80 * GIB), 66 * GIB, 27 * GIB),
+            80 * GIB - 66 * GIB - PLE_PREWARM_RESERVE_BYTES
+        );
+        assert_eq!(
+            ple_load_fill_bytes(Bytes(20 * GIB), Auto, Some(60 * GIB), 66 * GIB, 27 * GIB),
+            0
+        );
+        assert_eq!(ple_load_fill_bytes(Auto, Auto, None, 0, 27 * GIB), 0);
+        // An explicit prewarm budget, and the table.
+        assert_eq!(
+            ple_load_fill_bytes(Auto, Bytes(2 * GIB), Some(112 * GIB), 66 * GIB, 27 * GIB),
+            2 * GIB
+        );
+        assert_eq!(
+            ple_load_fill_bytes(Auto, Bytes(0), Some(112 * GIB), 66 * GIB, 27 * GIB),
+            0
+        );
+        assert_eq!(
+            ple_load_fill_bytes(Bytes(u64::MAX), Auto, Some(u64::MAX), 0, 27 * GIB),
+            27 * GIB
+        );
+        assert_eq!(
+            ple_load_fill_bytes(Bytes(0), Auto, Some(112 * GIB), 66 * GIB, 27 * GIB),
+            0
+        );
     }
 }
