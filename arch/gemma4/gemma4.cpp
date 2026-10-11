@@ -217,7 +217,7 @@ struct Layer {
     int full = 0;
     /* attention */
     rad_weight w_anorm = 0, w_qkv = 0, w_q = 0, w_k = 0, w_qn = 0, w_kn = 0, w_o = 0, w_apost = 0;
-    rad_op op_anorm = 0, op_qkv = 0, op_qknr = 0;
+    rad_op op_anorm = 0, op_qkv = 0, op_qknr = 0, op_lift = 0;
     rad_op op_q = 0, op_k = 0, op_vnorm = 0, op_qn = 0, op_kn = 0, op_qrope = 0, op_krope = 0;
     rad_op op_store = 0, op_attn = 0, op_o = 0, op_ar_o = 0, op_apost = 0, op_add_a = 0;
     /* dense arm */
@@ -269,7 +269,8 @@ struct Model {
     double  escale = 1.0, softcap = 0.0;
 
     rad_buf b_x = 0, b_h = 0, b_o = 0;
-    rad_buf b_qkv = 0, b_atts = 0;                         /* sliding */
+    rad_buf b_qkv = 0, b_qs = 0, b_atts = 0;               /* sliding; q_s where q is lifted */
+    int     qrow = -1;               /* attn_paged_qrow resolved: -1 not asked yet, then 0 or 1 */
     rad_buf b_qf = 0, b_kf = 0, b_vf = 0, b_attf = 0;      /* full */
     rad_buf b_ff2 = 0, b_gu = 0, b_act = 0;                /* the arms' join; the dense arm */
     rad_buf b_rn = 0, b_logit = 0, b_ids = 0, b_ew = 0, b_es = 0, b_hx = 0;
@@ -977,8 +978,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_NOWEIGHTS),
                   {buf}, {buf});
     };
-    auto attn = [&](const Kind& k, rad_buf q, rad_buf out) {
-        return rw(b, RAD_OP(b, "attn_paged",
+    auto attn = [&](const Kind& k, rad_buf q, rad_buf out, const char* op = "attn_paged") {
+        return rw(b, RAD_OP(b, op,
                          RAD_PARAMS(RAD_RANGE("q_len", 1, T), RAD_INT("head_dim", k.hd),
                                     RAD_INT("gqa", k.nh / k.nkv), RAD_INT("causal", 1),
                                     RAD_INT("window", k.window), RAD_INT("n_head", k.nh),
@@ -1001,7 +1002,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* THE SANDWICH JOINS: asked of the kernel libraries as one op each (gemma4k serves them) and
      * declared as the chain where nothing does -- or where RADIANCE_GEMMA4_FUSE=0 asks for the
-     * chain, the A/B switch, which turns off gemma4k's `expert_scale` with them. The fused kernels round where the chain rounds (gemma4k/g4k_norm.hip).
+     * chain, the A/B switch, which turns off gemma4k's `expert_scale` and `attn_paged_qrow` with
+     * them. The fused kernels round where the chain rounds (gemma4k/g4k_norm.hip).
      * libref has no row for the joins on purpose, so "nothing serves them" stays reachable. */
     const char* fuse_env = std::getenv("RADIANCE_GEMMA4_FUSE");
     const bool fuse_joins = !(fuse_env && fuse_env[0] == '0');
@@ -1089,12 +1091,30 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                            RAD_F64("wadd", 0.0), RAD_INT("v_norm", 1)),
                                 RAD_WEIGHTS(y.w_qn, y.w_kn)),
                             {m.b_qkv}, {m.b_qkv});
-            /* Q IS READ WHERE THE PROJECTION LEFT IT, a column slice of the fused [q|k|v] row:
-             * gemma4k's attention takes q at any row pitch, so there is no copy into a dense block
-             * -- a launch and a [T, q] round trip a sliding layer. libr4d's attention reads q only
-             * dense and refuses the slice by name (RAD_E_STRIDE), which is one more reason the
-             * order is `--kernels gemma4k,libr4d` for this model. */
-            y.op_attn  = attn(k, m.b_qkv, m.b_atts);
+            /* Q IS READ WHERE THE PROJECTION LEFT IT, a column slice of the fused [q|k|v] row, by
+             * `attn_paged_qrow` -- attn_paged with q at its own row pitch -- which only gemma4k
+             * declares, so no `--kernels` order can hand the slice to a library that reads q only
+             * dense (libr4d's refuses it with RAD_E_STRIDE, which stops the engine). That saves the
+             * lift: a launch and a [T, q] round trip a sliding layer. Where the op does not
+             * resolve, or RADIANCE_GEMMA4_FUSE=0 asks for the chain, q is lifted into a dense block
+             * for attn_paged, which every attention library takes. Asked once, because every
+             * sliding layer asks the same question; a miss is still the group's first op carrying
+             * a block_size, and answers rad_kv_block_size with the RAD_KV_BLOCK it declares. */
+            if (fuse_joins && m.qrow != 0) {
+                y.op_attn = attn(k, m.b_qkv, m.b_atts, "attn_paged_qrow");
+                m.qrow = y.op_attn ? 1 : 0;
+            }
+            if (!y.op_attn) {
+                /* declared here, not with the others: a buffer no op names is live for the whole
+                 * program, and where q is read in place nothing names this one */
+                if (!m.b_qs) m.b_qs = decl_b(b, nm.f("q_s"), RAD_BF16, {T, k.q()});
+                y.op_lift = rw(b, RAD_OP(b, "cast",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", k.q()),
+                                               RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
+                                    RAD_NOWEIGHTS),
+                                {m.b_qkv}, {m.b_qs});
+                y.op_attn = attn(k, m.b_qs, m.b_atts);
+            }
             y.op_store = kv_store(k, m.b_qkv, m.b_qkv);
             y.op_o     = gemm(T, E, k.q(), y.w_o, m.b_atts, m.b_o);
         } else {
@@ -1467,6 +1487,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              n_joins, (long long)(m.moe ? 2 * m.n_layer : m.n_layer),
              !fuse_joins ? " -- RADIANCE_GEMMA4_FUSE=0, the rmsnorm / add / mul_weight chain"
              : n_joins == 0 ? " -- not served (load gemma4k), the rmsnorm / add / mul_weight chain" : "");
+    if (m.ks.nh > 0)
+        rad_note(b, "sliding attention: q %s", m.qrow == 1
+                    ? "read in the fused qkv row (gemma4k attn_paged_qrow)"
+                    : "lifted into a dense block for attn_paged (attn_paged_qrow not served, or "
+                      "RADIANCE_GEMMA4_FUSE=0)");
     if (m.moe) {
         auto how = [&](int n_fp8) {
             return n_fp8 == m.n_layer ? "block fp8" : n_fp8 == 0 ? "bf16" : "mixed";
@@ -1625,8 +1650,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
             RAD_ISSUE(c, y.op_qknr, brows(m.b_qkv, T), pos, RAD_W(y.w_qn), RAD_W(y.w_kn));
             RAD_ISSUE(c, y.op_store, bcol(m.b_qkv, qd, kvd, T), bcol(m.b_qkv, qd + kvd, kvd, T),
                       praw(slot, RAD_I32, T), kv_cache(k.kv, (int)li));
-            RAD_ISSUE_N(c, y.op_attn, batch->max_q_len, bcol(m.b_qkv, 0, qd, T), kv_cache(k.kv, (int)li),
-                        bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_atts, T));
+            if (y.op_lift) RAD_ISSUE(c, y.op_lift, bcol(m.b_qkv, 0, qd, T), brows(m.b_qs, T));
+            RAD_ISSUE_N(c, y.op_attn, batch->max_q_len,
+                        y.op_lift ? brows(m.b_qs, T) : bcol(m.b_qkv, 0, qd, T),
+                        kv_cache(k.kv, (int)li), bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_atts, T));
             RAD_ISSUE(c, y.op_o, brows(m.b_atts, T), RAD_W(y.w_o), brows(m.b_o, T));
         } else {
             RAD_ISSUE(c, y.op_q, brows(m.b_h, T), RAD_W(y.w_q), brows(m.b_qf, T));

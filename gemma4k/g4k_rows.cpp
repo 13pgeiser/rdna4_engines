@@ -96,6 +96,38 @@ static const RadOperandSpec oEscale[] = {
     { "w_e", RAD_OPD_WEIGHT, 0 },
     { "ew",  RAD_OPD_INOUT,  0 },
 };
+/* attn_paged_qrow is attn_paged's schema restated field for field under a name only this library
+ * declares. The attention kernels below take q at any row pitch, so q can be read where a fused
+ * [q|k|v] projection left it; libr4d's paged attention reads q only dense and refuses the slice by
+ * name (RAD_E_STRIDE), which stops the engine at the first step. Under attn_paged, whichever
+ * library comes first in `--kernels` wins the op, so an architecture handing it the slice depends
+ * on an order it cannot see. Under its own name it resolves to this library or to nothing, and the
+ * architecture falls back to the lift and attn_paged where it is nothing. No libref row, as the
+ * joins, for the same reason. */
+static const RadParamSpec pAttnQrow[] = {
+    { "q_len",      RAD_P_INT, RAD_REQUIRED, 0 },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED, 0 },
+    { "gqa",        RAD_P_INT, RAD_REQUIRED, 0 },
+    { "block_size", RAD_P_INT, RAD_DERIVED,  0 },
+    { "causal",     RAD_P_INT, RAD_REQUIRED, 0 },
+    { "window",     RAD_P_INT, RAD_REQUIRED, 0 },
+    { "q_dtype",    RAD_P_STR, RAD_REQUIRED, 0 },
+    { "kv_dtype",   RAD_P_STR, RAD_REQUIRED, 0 },
+    { "scale",      RAD_P_F64, RAD_OPTIONAL, 0 },
+    { "max_ctx",    RAD_P_INT, RAD_OPTIONAL, 0 },
+    { "n_head",     RAD_P_INT, RAD_OPTIONAL, 0 },
+    { "max_seqs",   RAD_P_INT, RAD_OPTIONAL, 0 },
+};
+static const RadOperandSpec oAttnQrow[] = {
+    { "q",           RAD_OPD_IN,  0 },
+    { "kv_cache",    RAD_OPD_IN,  0 },
+    { "block_table", RAD_OPD_IN,  0 },
+    { "seqused",     RAD_OPD_IN,  0 },
+    { "k_descale",   RAD_OPD_IN,  1 },
+    { "v_descale",   RAD_OPD_IN,  1 },
+    { "cu_seqlens",  RAD_OPD_IN,  1 },
+    { "out",         RAD_OPD_OUT, 0 },
+};
 static const RadOpSchema kSchemas[] = {
     { "pair_argmax", ROW(pPick), ROW(oPick),
       "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in the first "
@@ -115,6 +147,10 @@ static const RadOpSchema kSchemas[] = {
       "ew[t, k] = ew[t, k] * w_e[ids[t, k]] over [M, top_k], w_e an [n_expert] table, an id outside "
       "it reading 0; one product rounded once, so the embed_lookup + mul pair's value bit for bit. "
       "Gemma 4's per_expert_scale on the renormalised routing weights." },
+    { "attn_paged_qrow", ROW(pAttnQrow), ROW(oAttnQrow),
+      "attn_paged, parameter for parameter and value for value, with q read at its own row pitch: "
+      "a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read where it "
+      "lies rather than lifted into a dense block first." },
 };
 
 /* ==================================================================== operand descriptions
@@ -411,10 +447,25 @@ static const RadConstraint cEscale[]  = { C_GE("top_k", 1), C_LE("top_k", 64), C
 #define G4K_ATTN_PAIR(HD, G)                                                                       \
     G4K_ATTN_ROW(HD, G, bf16kv, cH##HD##x##G##B, "bf16")                                          \
     G4K_ATTN_ROW(HD, G, fp8kv, cH##HD##x##G##F, "fp8-e4m3 (per-(seq,head) descales)")
+/* attn_paged_qrow: the same kernel and the same constraints. NO opd_shape -- no libref row, so no
+ * oracle; g4k_emu's attention cases already take q as a pitched slice of a wider row. */
+#define G4K_QROW_ROW(HD, G, KVN, C, KVDOC)                                                         \
+    { "attn_paged_qrow_h" #HD "_gqa" #G "_" #KVN, "attn_paged_qrow", "attn",                      \
+      "paged attention reading q at its own row pitch, any window, causal or not",                \
+      "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",           \
+      "bf16 query (any row pitch), " KVDOC " kv cache, bf16 out, f32 partials",                     \
+      RAD_DOMAIN_DEVICE, 10, ROW(C), NOTUNE,                                                       \
+      nullptr, nullptr, g4k_attn_h##HD##_gqa##G##_##KVN, g4k_attn_h##HD##_scratch, nullptr,      \
+      nullptr, nullptr, nullptr, nullptr, nullptr },
+#define G4K_QROW_PAIR(HD, G)                                                                       \
+    G4K_QROW_ROW(HD, G, bf16kv, cH##HD##x##G##B, "bf16")                                          \
+    G4K_QROW_ROW(HD, G, fp8kv, cH##HD##x##G##F, "fp8-e4m3 (per-(seq,head) descales)")
 
 static const RadKernelInfo kKernels[] = {
     G4K_ATTN_PAIR(256, 1) G4K_ATTN_PAIR(256, 2) G4K_ATTN_PAIR(256, 4) G4K_ATTN_PAIR(256, 8)
     G4K_ATTN_PAIR(512, 1) G4K_ATTN_PAIR(512, 2) G4K_ATTN_PAIR(512, 4) G4K_ATTN_PAIR(512, 8)
+    G4K_QROW_PAIR(256, 1) G4K_QROW_PAIR(256, 2) G4K_QROW_PAIR(256, 4) G4K_QROW_PAIR(256, 8)
+    G4K_QROW_PAIR(512, 1) G4K_QROW_PAIR(512, 2) G4K_QROW_PAIR(512, 4) G4K_QROW_PAIR(512, 8)
 
     /* Described as libref describes it, so rad-kbench runs both arms against the oracle. */
     { "pair_argmax_f32", "pair_argmax", "select",
@@ -472,6 +523,8 @@ static const RadKernelInfo kKernels[] = {
       nullptr, nullptr, pick_host, nullptr, nullptr, nullptr, shape_pick,
       nullptr, nullptr, nullptr },
 };
+#undef G4K_QROW_PAIR
+#undef G4K_QROW_ROW
 #undef G4K_ATTN_PAIR
 #undef G4K_ATTN_ROW
 

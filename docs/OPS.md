@@ -294,13 +294,14 @@ rounding.
   -log(max_timescale) / max(n/2 - 1, 1))`, each step in f32 as the reference's torch expressions
   are, then rounded.
 
-### gemma4k's fusions: the sandwich-norm joins and `expert_scale` — no reference row
+### gemma4k's fusions: the sandwich-norm joins, `expert_scale`, `attn_paged_qrow` — no reference row
 
 | op | params | operands |
 |---|---|---|
 | `norm_add_norm` | `M`(range) `n` `eps`:f64 `dtype` | `a`, `w_a`w, `x`:inout, `w_y`w → `y` |
 | `join_add_scale` | `M`(range) `n` `eps`:f64 `dtype` | `d`, `w_d`w, `r`, `w_r`w, `w_j`w, `x`:inout, `s`w, `w_n`w? → `y`? |
 | `expert_scale` | `M`(range) `n_expert` `top_k` `dtype` | `ids`, `w_e`w, `ew`:inout |
+| `attn_paged_qrow` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
 
 Gemma's sandwich norms, each one kernel in place of a chain of `rmsnorm`, `add` and `mul_weight`.
 `norm_add_norm` is `t = rmsnorm(a) * w_a; x += t; y = rmsnorm(x) * w_y` -- a post-norm, the
@@ -308,15 +309,25 @@ residual add, the next pre-norm. `join_add_scale` is `x = (x + rmsnorm(rmsnorm(d
 rmsnorm(r) * w_r) * w_j) * s` -- two arms' post-norms, their sum, its norm, the residual add and a
 one-element layer scalar (Gemma 4's MoE feed-forward) -- and, given `w_n` and `y` (both or
 neither), `y = rmsnorm(x) * w_n` over the `x` it writes: the next layer's input norm, or the final
-norm after the last layer, which would otherwise be a launch of its own reading that `x` back. Every value the chain stores is rounded to
-the activation dtype at the same point, so the two differ from the chain only in the order a sum
-of squares is added in: with the same order they are bit-identical to it, and against a chain
-summed in another block width a norm factor can differ in its last bit.
+norm after the last layer, which would otherwise be a launch of its own reading that `x` back.
+Every value the chain stores is rounded to the activation dtype at the same point, so the two
+differ from the chain only in the order a sum of squares is added in: with the same order they are
+bit-identical to it, and against a chain summed in another block width a norm factor can differ in
+its last bit.
 
 `expert_scale` is `ew[t, k] = ew[t, k] * w_e[ids[t, k]]` over `[M, top_k]`, `w_e` an `[n_expert]`
 table and an id outside it reading 0: Gemma 4's per_expert_scale on the renormalised routing
 weights, in place of an `embed_lookup` of the table by the ids and a `mul` into the weights. One
 product rounded once, so the pair's value bit for bit.
+
+`attn_paged_qrow` is `attn_paged` -- the same parameters, operands and values -- with `q` read at
+its own row pitch: a column slice of a wider row, the q part of a fused `[q|k|v]` projection, read
+where it lies instead of lifted into a dense block by a `cast` first. It is a name of its own
+because an `attn_paged` kernel may refuse a pitched `q` (libr4d's do, with `RAD_E_STRIDE`, at the
+first step), and under `attn_paged` whichever library is first in `--kernels` wins the op: an
+architecture handing it the slice would depend on an order it cannot see. Asked for by name, the op
+resolves to a library that reads the pitch or to nothing, and the architecture lifts `q` for
+`attn_paged` where it is nothing.
 
 **libref has no row for any of them, on purpose.** An architecture asks for a join and declares the
 chain where it does not resolve (`rad_op_resolved`), and a reference row would resolve it

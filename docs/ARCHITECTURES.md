@@ -520,10 +520,13 @@ expert parity, so a rank holds an even number of experts.
 
 **Kernels.** `--kernels gemma4k,libr4d,libavx`, **gemma4k first.** It serves all of the trunk's
 attention -- the sliding layers (h256, gqa 2) and the full layers at gqa 8, 4 and 2 (one or two,
-four, eight ranks) -- plus `pair_argmax` and the two sandwich-norm joins (`norm_add_norm`,
-`join_add_scale`), which the plugin declares as the rmsnorm / add chain where nothing serves them;
-the startup note says how many were fused. libr4d has h256/gqa2 and h512/gqa8 rows as well,
-written for the dense 31B; with gemma4k first the 26B-A4B runs on the kernels it was measured with.
+four, eight ranks) -- plus `pair_argmax` and the fusions: the two sandwich-norm joins
+(`norm_add_norm`, `join_add_scale`), `expert_scale`, and `attn_paged_qrow`, the sliding layers'
+attention reading q where the fused qkv projection left it. The plugin declares each one's unfused
+form where nothing serves it -- the rmsnorm / add chain, `embed_lookup` + `mul`, a `cast` lifting q
+for `attn_paged` -- and the startup notes say which were taken. libr4d has h256/gqa2 and h512/gqa8
+rows as well, written for the dense 31B; with gemma4k first the 26B-A4B runs on the kernels it was
+measured with.
 Without `gemma4k` at all, the full layers have no kernel at four and eight ranks, and a drafter head
 sharded over more than one rank has no `pair_argmax`.
 

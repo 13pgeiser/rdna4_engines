@@ -3444,7 +3444,9 @@ TEST(a_gemma4_moe_trunk_declares_both_arms_and_the_joins) {
     RadBuildCtx  ctx  = build_ctx();
     CHECK_OK(gemma4::declare(&b, &meta, &ctx));
 
-    CHECK_EQ(count_op(b, "attn_paged"), 6);
+    /* five sliding layers read q in the fused row (attn_paged_qrow), the full one attn_paged */
+    CHECK_EQ(count_op(b, "attn_paged_qrow"), 5);
+    CHECK_EQ(count_op(b, "attn_paged"),      1);
     CHECK_EQ(count_op(b, "kv_store"),   6);
     /* One join after attention and one after the two feed-forward arms, a layer. */
     CHECK_EQ(count_resolved(b, "norm_add_norm"),  6);
@@ -3474,11 +3476,11 @@ TEST(gemma4_moe_kv_groups_are_both_full_and_the_window_rides_the_op) {
         CHECK_EQ((int)g.d.kind, RAD_KV_FULL);
         CHECK_EQ(g.d.window, 0);
     }
-    const RecOp* sl = find_op(b, "attn_paged", 0);
+    const RecOp* sl = find_op(b, "attn_paged_qrow", 0);
     REQUIRE(sl != nullptr);
     CHECK_EQ(pint(sl, "head_dim"), 256);
     CHECK_EQ(pint(sl, "window"),   1024);
-    const RecOp* fu = find_op(b, "attn_paged", 5);
+    const RecOp* fu = find_op(b, "attn_paged", 0);
     REQUIRE(fu != nullptr);
     CHECK_EQ(pint(fu, "head_dim"), 512);
     CHECK_EQ(pint(fu, "gqa"),      8);
@@ -3531,8 +3533,10 @@ TEST(gemma4_falls_back_to_the_chain_where_no_join_resolves) {
     CHECK_EQ(count_issued(fused, "join_add_scale"), 6);
     CHECK_EQ(count_issued(chain, "norm_add_norm"),  0);
     CHECK_EQ(count_issued(chain, "join_add_scale"), 0);
-    CHECK_EQ(count_issued(fused, "attn_paged"), 6);
-    CHECK_EQ(count_issued(chain, "attn_paged"), 6);
+    for (const auto* v : { &fused, &chain }) {
+        CHECK_EQ(count_issued(*v, "attn_paged_qrow"), 5);
+        CHECK_EQ(count_issued(*v, "attn_paged"),      1);
+    }
     /* The chain is longer, by the norms and adds the joins fold in. */
     CHECK(count_issued(chain, "rmsnorm") > count_issued(fused, "rmsnorm"));
     CHECK(count_issued(chain, "add") > count_issued(fused, "add"));
@@ -3625,20 +3629,49 @@ TEST(gemma4_dflash_taps_are_live_from_the_layer_that_writes_them) {
     CHECK_EQ(taps, 3);
 }
 
-/* The sliding layers' attention reads q where the fused projection left it: no copy op between
- * the qkv projection and the attention, and the attention's declared reads name the fused row. */
+/* The sliding layers' attention reads q where the fused projection left it -- no copy between the
+ * qkv projection and the attention -- where attn_paged_qrow is served, and lifts q for attn_paged
+ * where it is not. */
 TEST(gemma4_sliding_attention_reads_q_in_the_fused_row) {
-    RadBuilder b;
-    RadModelMeta meta = gemma4_moe_meta();
-    RadBuildCtx  ctx  = build_ctx();
-    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
-    const int qkv = buf_named(b, "qkv_s");
-    REQUIRE(qkv > 0);
-    CHECK_EQ(buf_named(b, "q_s"), 0);
-    const RecOp* at = find_op(b, "attn_paged", 0);
-    REQUIRE(at != nullptr);
-    CHECK(std::find(at->reads.begin(), at->reads.end(), (rad_buf)qkv) != at->reads.end());
-    CHECK_EQ(count_op(b, "cast"), 0);   /* no drafter here, so no taps either */
+    /* Served, attn_paged_qrow reads the slice and nothing is lifted; refused -- a hierarchy without
+     * gemma4k -- q is lifted into q_s for attn_paged, and the slice reaches no attn_paged either
+     * way, since that op may resolve to a library that reads q only dense. */
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        if (refuse) b.refuse.insert("attn_paged_qrow");
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        const int qkv = buf_named(b, "qkv_s"), qs = buf_named(b, "q_s");
+        REQUIRE(qkv > 0);
+        CHECK_EQ(qs > 0, refuse == 1);
+        auto reads = [](const RecOp& o, int buf) {
+            return buf > 0 && std::find(o.reads.begin(), o.reads.end(), (rad_buf)buf) != o.reads.end();
+        };
+        int qrow = 0, paged_slice = 0, paged_lifted = 0;
+        for (const auto& o : b.ops) {
+            if (!o.resolved) continue;
+            if (o.op == "attn_paged_qrow" && reads(o, qkv)) ++qrow;
+            if (o.op == "attn_paged" && reads(o, qkv)) ++paged_slice;
+            if (o.op == "attn_paged" && reads(o, qs)) ++paged_lifted;
+        }
+        const int sliding = refuse ? paged_lifted : qrow;
+        CHECK(sliding > 0);
+        CHECK_EQ(refuse ? qrow : paged_lifted, 0);
+        CHECK_EQ(paged_slice, 0);
+        CHECK_EQ(count_op(b, "cast"), refuse ? sliding : 0);   /* the lifts; no drafter, no taps */
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> issued = issued_ops(b, c);
+        CHECK_EQ(count_issued(issued, "attn_paged_qrow"), refuse ? 0 : sliding);
+        CHECK_EQ(count_issued(issued, "cast"), refuse ? sliding : 0);
+        for (const auto& o : b.ops)
+            if (o.resolved) CHECK(o.uses_declared);
+    }
 }
 
 /* The feed-forward join writes the next layer's input norm: with the joins served, the only
