@@ -2716,9 +2716,13 @@ mod tests {
     fn lloyd_luts_must_be_complete_and_exclusive() {
         let c = cfg();
         let mut s = seal(&c, false);
-        if let Qwen35LayerSeal::DeltaNet { wqkv, .. } = &mut s.layer_seals[0] {
+        if let Qwen35LayerSeal::DeltaNet { wqkv, wz, .. } = &mut s.layer_seals[0] {
             wqkv.gpu_dtype = DType::MQ4G256V2Lloyd;
             wqkv.awq_scale = None;
+            // The loader folds Z only when all four projections are uniform V2.
+            let z_bytes = wz.m * wz.gpu_dtype.row_bytes(wz.k).unwrap();
+            wz.buf.byte_len = z_bytes;
+            wz.buf.shape = vec![z_bytes];
         }
         assert!(matches!(
             validate_dense_seal(&s, &flags(), &c),
