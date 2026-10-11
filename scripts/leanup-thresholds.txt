@@ -49,7 +49,10 @@ required_features_daemon    == 0
 # the Qwen4 think-budget/EOS serve fixes (163d26d5b0, 325f31cc1a); e4d816e6b2
 # already removed formatter churn. v0.4.1 shipped at 5392 with CI red on this
 # ratchet; recorded here in 0.4.1.1 rather than masking the gate.
-daemon_lines                <= 5392
+# RATCHET-RAISE 5392 -> 5398: the shared-weight host tenant (HIPFIRE_WEIGHT_HOST=1)
+# needs its claim-kind bootstrap, between-command lease reconcile and v1 load
+# envelope call in the command loop; the bodies live in weight_host_tenant.rs.
+daemon_lines                <= 5398
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
@@ -60,7 +63,9 @@ daemon_lines                <= 5392
 # RATCHET-RAISE 63 -> 64: v0.4.1 shipped at 64 (CI red on this ratchet); the
 # 0.4.1 cycle added QSA/PM oracles in rdna-compute/examples that their gates
 # invoke. Pay down by gating archived probes behind `lab` in 0.4.2.
-ungated_examples            <= 64
+# RATCHET-RAISE 64 -> 65: `hipfire-arch-qwen35/shared_weight_state_oracle`, the
+# shared-weight host G1/G3 byte oracle its gates invoke without `--features lab`.
+ungated_examples            <= 65
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is

@@ -86,6 +86,7 @@ use gpu_lock::GpuLocks;
 mod request_guards;
 mod slots;
 mod vision_ladder;
+mod weight_host_tenant;
 use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
 
 #[cfg(test)]
@@ -457,79 +458,6 @@ fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
         }
     }
     locks.write_pid_file()
-}
-
-/// Shared-correctness claim for a weight-host tenant: admitted by the dev
-/// fabric (`HIPFIRE_FABRIC_ADMISSION`, bootstrap env), never a private-load
-/// fallback.
-#[cfg(target_os = "linux")]
-fn open_weight_host_claim(socket: &std::path::Path) -> Result<GpuLocks, String> {
-    let token = std::env::var(gpu_lock::fabric::ADMISSION_ENV).map_err(|_| {
-        format!(
-            "HIPFIRE_WEIGHT_HOST=1 (socket {}) needs a dev-fabric correct-class admission: {} is unset",
-            socket.display(),
-            gpu_lock::fabric::ADMISSION_ENV
-        )
-    })?;
-    eprintln!("[weight-host] tenant mode: socket={}", socket.display());
-    GpuLocks::open_shared(&token)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn open_weight_host_claim(_socket: &std::path::Path) -> Result<GpuLocks, String> {
-    Err("HIPFIRE_WEIGHT_HOST=1 is supported on Linux only".into())
-}
-
-/// Weight-host v1 envelope (dense Qwen3.5 arch 5, single card, no drafter,
-/// MTP, vision, PFlash, head overlay or slot engine). Requests outside it are
-/// refused before any teardown: nothing may load privately once opted in.
-fn weight_host_load_refusal(msg: &serde_json::Value) -> Option<String> {
-    let params = msg.get("params");
-    let number = |key: &str| params.and_then(|p| p.get(key)).and_then(|v| v.as_u64()).unwrap_or(1);
-    let text = |key: &str| params.and_then(|p| p.get(key)).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-    let refuse = |what: &str| Some(format!("load refused: HIPFIRE_WEIGHT_HOST=1 does not support {what}"));
-    if number("tp") != 1 || number("pp") != 1 {
-        return refuse("tp/pp > 1");
-    }
-    if params.and_then(|p| p.get("experimental_multi_slot")).and_then(|v| v.as_bool()) == Some(true) {
-        return refuse("experimental_multi_slot");
-    }
-    for key in ["draft", "drafter", "prefill_drafter", "head", "vision"] {
-        if text(key).is_some() {
-            return refuse(&format!("params.{key}"));
-        }
-    }
-    // Resolved defaults may be `auto`; speculation must be explicitly off.
-    for key in ["mtp_mode", "dflash_mode", "dspark_mode"] {
-        if text(key) != Some("off") {
-            return Some(format!("load refused: HIPFIRE_WEIGHT_HOST=1 requires params.{key}=\"off\""));
-        }
-    }
-    None
-}
-
-/// A weight-host tenant whose host closed the lease unloads the imported
-/// model before the next command runs (the current request already finished:
-/// commands are sequential). Returns the reason when it unloaded.
-fn reconcile_weight_host_lease(
-    model: &mut Option<LoadedModel>,
-    gpu: &mut rdna_compute::Gpu,
-) -> Option<String> {
-    let status = model
-        .as_mut()
-        .and_then(|m| m.qwen35_mut())
-        .and_then(|b| b.weight_lease.as_ref())
-        .map(|lease| lease.host_alive())?;
-    let reason = match status {
-        Ok(true) => return None,
-        Ok(false) => "weight host closed the lease".to_string(),
-        Err(error) => format!("weight host lease check failed: {error}"),
-    };
-    let unload = model.take().map(|m| hipfire_loader::unload_model(m, gpu));
-    Some(match unload {
-        Some(Err(error)) => format!("{reason}; imported model unload incomplete: {error}"),
-        _ => format!("{reason}; imported model unloaded"),
-    })
 }
 
 /// Cap on the *encoded* base64 string length the daemon will accept on the
@@ -1046,19 +974,8 @@ fn main() {
     else {
         return;
     };
-    // Weight-host opt-in (HIPFIRE_WEIGHT_HOST=1) decides the claim kind, so it
-    // is a bootstrap read like the lock directory. Unset or `0`: the default
-    // exclusive claim, unchanged.
-    let weight_host = hipfire_arch_qwen35::carrier::weight_host_socket()
-        .unwrap_or_else(|error| {
-            eprintln!("FATAL: {error}");
-            std::process::exit(1);
-        });
-    let mut gpu_locks = match &weight_host {
-        None => GpuLocks::open(),
-        Some(socket) => open_weight_host_claim(socket),
-    }
-    .unwrap_or_else(|error| {
+    // Weight-host opt-in (HIPFIRE_WEIGHT_HOST=1, bootstrap env) picks the claim kind.
+    let (weight_host, mut gpu_locks) = weight_host_tenant::open_locks().unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
@@ -1269,19 +1186,13 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        // Weight-host tenant: a lost host lease unloads the imported model
-        // between commands (never under a live batch lane), so nothing keeps
-        // decoding against a host generation that is draining or gone.
-        if weight_host.is_some()
-            && !matches!(msg_type, "ping" | "diag")
-            && !batch_scheduler.as_ref().is_some_and(|s| s.active_count() > 0)
-        {
-            if let Some(reason) = reconcile_weight_host_lease(&mut model, &mut gpu) {
+        // Weight-host tenant: a lost lease unloads the imported model between commands.
+        let idle = !batch_scheduler.as_ref().is_some_and(|s| s.active_count() > 0);
+        if weight_host.is_some() && idle && !matches!(msg_type, "ping" | "diag") {
+            if let Some(reason) = weight_host_tenant::reconcile_lease(&mut model, &mut gpu) {
                 eprintln!("[weight-host] {reason}; reload against a live host");
-                resident_kv = None;
-                batch_scheduler = None;
+                (resident_kv, batch_scheduler, vmm_batch) = (None, None, None);
                 continuous_batch_size = 1;
-                vmm_batch = None;
                 batch_clear_all_terminals();
             }
         }
@@ -1307,12 +1218,10 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
-                if weight_host.is_some() {
-                    if let Some(refusal) = weight_host_load_refusal(&msg) {
-                        emit_uncorrelated_error(&mut stdout, None, &refusal, "validation", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
+                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg) {
+                    emit_uncorrelated_error(&mut stdout, None, &refusal, "validation", false, false);
+                    let _ = stdout.flush();
+                    continue;
                 }
                 // FIX #1 (transactional EP load): the unload of the prior model
                 // is deferred for the EP (tp>1) path until AFTER the new load
@@ -1706,18 +1615,6 @@ fn main() {
                 // (next to `apply_vision_mode_gate`).
                 let (vision_mode, vision_path, gated_off) = resolve_vision_ladder(&msg);
                 vision_gated_off = gated_off;
-                if weight_host.is_some() && vision_path.is_some() {
-                    emit_uncorrelated_error(
-                        &mut stdout,
-                        None,
-                        "load refused: HIPFIRE_WEIGHT_HOST=1 does not support a vision tower",
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    continue;
-                }
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
