@@ -118,6 +118,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | **kill switch**; `=0` forces the fixed full block, any other value or unset defers to the setting | Read through the `[developer]` namespace (lifecycle `developer`; it is **not** a schema alias — the schema key is `speculation.dflash_adaptive_b`, stable, default `false` = fixed block, listed in the [`CONFIG.md`](CONFIG.md#lifecycle-status) table with no env column). `=0` overrides an enabled `dflash_adaptive_b` load param/setting; it cannot turn adaptive on. Adaptive is also auto-suppressed on retained-PM4 verify loads (replay needs the fixed B=16 shape). |
+||||||| parent of 1d16adc85 (feat(dflash): speculation.dflash_block defaults to auto)
+| `HIPFIRE_DFLASH_BLOCK` | **`16`**; `auto` or `4`–`16` (experimental) | Schema alias of `speculation.dflash_block` ([`CONFIG.md`](CONFIG.md#mechanism-knobs)): the DFlash2 proposal width L of one load, chosen per serving configuration and never per live batch, so batched VMM lanes and singletons of the same load run the same L and stay byte-identical. `auto` = 8 on a `serve.vmm_batch` serve with `continuous_batch_size` ≥ 4, else 16 (resolved by the daemon from the staged route). Legacy DFlash drafts keep their declared width; the retained-PM4 verify route and dense TP2 need 16; experimental multi-slot admits only 16. |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash and MTP divergent-render resume |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | on unless `0` | Enables retained pre-window repair for strict-prefix speculative terminals; `0` keeps the conservative reset path. |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |
@@ -859,7 +861,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEVICE` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_DEVICES` | crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs, crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | stable |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
-| `HIPFIRE_DFLASH_BLOCK` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_DFLASH_BLOCK` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_slot.rs | deprecated |

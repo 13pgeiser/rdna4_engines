@@ -48,8 +48,10 @@ const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
-/// Default DFlash2 runtime proposal width (`speculation.dflash_block`).
-pub const DFLASH_BLOCK_DEFAULT: usize = 16;
+/// DFlash2 runtime proposal width without VMM batching: what `auto` (the
+/// `speculation.dflash_block` default) picks for a singleton-only load. 16
+/// removes the B=8 acceptance ceiling at C1 on gfx1201.
+pub const DFLASH_BLOCK_UNBATCHED: usize = 16;
 /// `speculation.dflash_block = "auto"` width on a batching serve
 /// (`serve.vmm_batch` with at least [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes):
 /// the draft's trained width, which keeps a full C8 verify step at 64 rows.
@@ -69,7 +71,8 @@ pub const DFLASH_BLOCK_MAX: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DflashBlockPolicy {
     /// [`DFLASH_BLOCK_AUTO_BATCHED`] on a VMM batching serve with at least
-    /// [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes, else [`DFLASH_BLOCK_DEFAULT`].
+    /// [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes, else [`DFLASH_BLOCK_UNBATCHED`].
+    /// The default.
     Auto,
     /// A fixed width in `DFLASH_BLOCK_MIN..=DFLASH_BLOCK_MAX`.
     Fixed(usize),
@@ -77,10 +80,10 @@ pub enum DflashBlockPolicy {
 
 impl DflashBlockPolicy {
     /// Parse the `dflash_block` load param: `"auto"` or an integer in range.
-    /// Absent = [`DFLASH_BLOCK_DEFAULT`].
+    /// Absent = [`Self::Auto`], the schema default.
     pub fn from_param(value: Option<&serde_json::Value>) -> Result<Self, String> {
         let Some(value) = value else {
-            return Ok(Self::Fixed(DFLASH_BLOCK_DEFAULT));
+            return Ok(Self::Auto);
         };
         if value.as_str() == Some("auto") {
             return Ok(Self::Auto);
@@ -99,7 +102,7 @@ impl DflashBlockPolicy {
         match self {
             Self::Fixed(b) => b,
             Self::Auto if vmm_batch && lanes >= DFLASH_BLOCK_AUTO_MIN_LANES => DFLASH_BLOCK_AUTO_BATCHED,
-            Self::Auto => DFLASH_BLOCK_DEFAULT,
+            Self::Auto => DFLASH_BLOCK_UNBATCHED,
         }
     }
 }
@@ -163,8 +166,7 @@ impl DflashConfig {
     /// width `requested` (already resolved by [`DflashBlockPolicy::resolve`]).
     /// DFlash2's selector and dynamic convolutions are length-generic even
     /// though the published checkpoint declares B=8, so a DFlash2 draft runs
-    /// at `requested` (default [`DFLASH_BLOCK_DEFAULT`] = 16, which removes the
-    /// B=8 acceptance ceiling at C1 on gfx1201). Legacy DFlash is not
+    /// at `requested` (8 or 16 under the `auto` default). Legacy DFlash is not
     /// length-generic and always runs its artifact-declared width.
     pub fn runtime_block_size(&self, requested: usize) -> usize {
         if self.selector_rank.is_some() {
@@ -3920,7 +3922,7 @@ mod block_policy_tests {
 
     #[test]
     fn param_parses_auto_fixed_and_absent() {
-        assert_eq!(DflashBlockPolicy::from_param(None), Ok(DflashBlockPolicy::Fixed(16)));
+        assert_eq!(DflashBlockPolicy::from_param(None), Ok(DflashBlockPolicy::Auto));
         assert_eq!(DflashBlockPolicy::from_param(Some(&json!("auto"))), Ok(DflashBlockPolicy::Auto));
         assert_eq!(DflashBlockPolicy::from_param(Some(&json!(8))), Ok(DflashBlockPolicy::Fixed(8)));
         for bad in [json!(3), json!(17), json!("8"), json!(true), json!(-1)] {
@@ -3961,10 +3963,10 @@ mod block_policy_tests {
             selector_rank: Some(256),
             selector_top_k: Some(16),
         };
-        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_DEFAULT), 16);
+        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 16);
         assert_eq!(cfg.runtime_block_size(8), 8);
         cfg.selector_rank = None;
-        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_DEFAULT), 8);
+        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 8);
     }
 }
 

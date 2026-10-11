@@ -1936,10 +1936,10 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     // (`auto` resolves to it: this route never stages VMM batching).
     match hipfire_runtime::dflash::DflashBlockPolicy::from_param(params.and_then(|p| p.get("dflash_block"))) {
         Err(e) => return Some(e),
-        Ok(policy) if policy.resolve(false, 1) != hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT => {
+        Ok(policy) if policy.resolve(false, 1) != hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED => {
             return Some(format!(
                 "speculation.dflash_block other than {} not supported in experimental multi-slot",
-                hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT
+                hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED
             ));
         }
         Ok(_) => {}

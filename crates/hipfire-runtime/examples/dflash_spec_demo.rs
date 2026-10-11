@@ -103,10 +103,10 @@ fn run_tp2_demo(a: Tp2RunArgs) {
             std::process::exit(1);
         }
     }
-    if draft_cfg.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT) != 16 {
+    if draft_cfg.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED) != 16 {
         eprintln!(
             "--tp 2 requires a B=16 runtime draft (runtime {})",
-            draft_cfg.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT)
+            draft_cfg.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED)
         );
         std::process::exit(1);
     }
@@ -1810,7 +1810,7 @@ fn main() {
         draft_cfg.block_size = b;
         eprintln!("block_size override: {orig} -> {b} (checkpoint declares {orig})");
     } else {
-        let runtime_b = draft_cfg.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT);
+        let runtime_b = draft_cfg.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED);
         if runtime_b != draft_cfg.block_size {
             eprintln!(
                 "DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",

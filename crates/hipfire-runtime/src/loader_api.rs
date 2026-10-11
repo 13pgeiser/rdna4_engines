@@ -234,8 +234,9 @@ pub struct SpecLoadCfg {
     pub dflash_adaptive_b: Option<bool>,
     /// DFlash2 proposal width of this load (`speculation.dflash_block`),
     /// already resolved per serving configuration by
-    /// [`crate::dflash::DflashBlockPolicy::resolve`]. `None` =
-    /// [`crate::dflash::DFLASH_BLOCK_DEFAULT`]. Legacy DFlash drafts keep
+    /// [`crate::dflash::DflashBlockPolicy::resolve`]. `None` (no daemon
+    /// resolution, e.g. a direct loader caller) =
+    /// [`crate::dflash::DFLASH_BLOCK_UNBATCHED`]. Legacy DFlash drafts keep
     /// their declared width.
     pub dflash_block: Option<usize>,
 }

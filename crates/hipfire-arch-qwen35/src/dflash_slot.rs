@@ -278,7 +278,7 @@ pub fn load_dflash_shared(
     }
     // The daemon admits only the default `speculation.dflash_block` on this
     // route (`validate_load_caps`).
-    let block_size = draft_config.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT);
+    let block_size = draft_config.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED);
     if block_size != draft_config.block_size {
         eprintln!(
             "  DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",

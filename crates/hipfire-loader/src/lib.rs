@@ -2232,7 +2232,7 @@ fn finish_qwen35_load(
             bundle.kv_adaptive.is_some(),
             ctx.spec
                 .dflash_block
-                .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT),
+                .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED),
         ) {
             Ok(s) => {
                 eprintln!(

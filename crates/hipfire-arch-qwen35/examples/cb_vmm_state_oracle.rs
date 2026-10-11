@@ -293,7 +293,7 @@ fn parse_args() -> Result<Args> {
     } else if dflash_draft.is_some() || dflash_probe_window.is_some() || dflash_block.is_some() || max_lanes.is_some() {
         return Err("--dflash-draft / --dflash-probe-window / --dflash-block / --max-lanes require --spec dflash|mixed".into());
     }
-    let dflash_block = dflash_block.unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_DEFAULT);
+    let dflash_block = dflash_block.unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED);
     if !spec.dflash() && (aggregates_given || peer.is_some() || emit_candidates || emit_refs) {
         return Err("--aggregates / --peer / --emit-candidates / --emit-refs require --spec dflash|mixed".into());
     }
