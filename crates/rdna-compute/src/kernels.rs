@@ -4237,7 +4237,7 @@ pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_se
 /// (64-row block of 128 threads) and `_w8` (128-row block of 256 threads),
 /// both over 256-token tiles (grid `[ceil(M/rows), ceil(N/256), 1]`).
 /// Default on (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps the hipcc kernel).
-/// SHA-256 1d2662aa9d16c3dba66603f83bd84a5234cd5c7d1b4d57141e2a0f6e88c952cf
+/// SHA-256 36f07dd7cc1e80dbfa28b8d5710972ab335f231f082c0176a8ccd9afb7a19b1f
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1201.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");
 /// Certified builder module of gfx1151's MQ6 trunk GEMM

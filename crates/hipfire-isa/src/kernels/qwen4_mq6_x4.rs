@@ -8,12 +8,18 @@
 //!
 //! Exactness (byte-identical outputs): every 16x16 output tile runs the same
 //! chain of `v_wmma_f32_16x16x16_f16` over ascending 16-K steps with the
-//! same A and B operands, so no output depends on the tiling. A is
-//! dequantized op for op as hipcc does it: 6-bit field extract,
-//! `v_cvt_f32_ubyte0`, `v_cvt_f16_f32`, one `v_fma_f16` (sc*q+zp, single
-//! rounding) with the group header's f16 scale / zero point (hA for K-steps
-//! 0..7 of a 256-group, hB for 8..15). The epilogue stores `0.0f + acc`
-//! (`v_add_f32 0, acc`), as hipcc's overwrite path.
+//! same A and B operands, so no output depends on the tiling. A has the same
+//! f16 values as hipcc's dequantization, element for element (`sc*q + zp`,
+//! one RNE rounding, with the group header's f16 scale / zero point: hA for
+//! K-steps 0..7 of a 256-group, hB for 8..15), but two codes at a time (the
+//! gfx1151 twin's construction): the 6-bit codes of a pair are placed in the
+//! mantissas of two f16 with a constant exponent (`1024 + q`, `64 + q` or
+//! `256 + q`, all exact for q < 64), `v_pk_add_f16` of the bias recovers `q`
+//! exactly (the same f16 as `v_cvt_f32_ubyte0` + `v_cvt_f16_f32`), and one
+//! `v_pk_fma_f16` (operands sc, q, zp; sc and zp read from the header halves
+//! with `op_sel`) is the same fused expression as hipcc's `v_fma_f16`. The
+//! epilogue stores `0.0f + acc` (`v_add_f32 0, acc`), as hipcc's overwrite
+//! path.
 //!
 //! Freedom used (tiling, layout and scheduling only):
 //!  * a wave owns 16 rows x 256 tokens (16 accumulator tiles), so one A
@@ -25,7 +31,7 @@
 //!    ahead (no per-WMMA `s_wait_dscnt 0`); the next K-step's A dequant is
 //!    interleaved with the current WMMAs;
 //!  * each lane loads only its own 48 code bits per K-step (two dwords at
-//!    `12j + 4*lane_half`) and selects them with `v_perm_b32`;
+//!    `12j + 4*lane_half`) and gathers them with four `v_perm_b32`;
 //!  * X loads go through a descriptor bounded at `N*K*2` bytes, so tokens
 //!    past N read zeros (their outputs are never stored).
 //!
@@ -83,10 +89,13 @@ fn lbl(spec: &Spec, name: &str) -> String { format!(".Lmq6w{}_{name}", spec.wr) 
 // VGPRs. v0 tid; v1..v15 lane constants; v16..v23 X buffer offsets;
 // v24..v151 accumulators (16 token tiles x 8); v152..v183 B ring (8 x 4);
 // v184..v191 A fragments (two); v192..v207 codes (four chunks: loaded two
-// chunks ahead); v208..v211 group headers (current, next); v212..v221
-// dequant temporaries; v224.. X staging (4*xpt).
+// chunks ahead); v208..v211 group headers (current, next); v212..v215
+// dequant temporaries (the four code pairs); v220..v221 two more lane
+// constants (code-pair selectors); v224.. X staging (4*xpt).
 const TID: u8 = 0;
-const SELLO: u8 = 1; const SELD1: u8 = 2; const ACODE: u8 = 3; const AHDR: u8 = 4;
+/// `v_perm_b32` byte selectors of the four code pairs (this lane half's window).
+const SEL: [u8; 4] = [1, 2, 220, 221];
+const ACODE: u8 = 3; const AHDR: u8 = 4;
 const LDST: u8 = 5; const LDRD: u8 = 6; const VTOK: u8 = 7; const VYOFF: u8 = 8; const VROW0: u8 = 9;
 const T0: u8 = 10; const T1: u8 = 11; const T2: u8 = 12; const T3: u8 = 13; const T4: u8 = 14; const T5: u8 = 15;
 const XOFF: u8 = 16;
@@ -95,7 +104,7 @@ const RINGB: u8 = 152;
 const AF: [u8; 2] = [184, 188];
 const CODE: [u8; 4] = [192, 196, 200, 204];
 const HDR: [u8; 2] = [208, 210];
-const Q: u8 = 212; const LO: u8 = 220; const D1: u8 = 221;
+const Q: u8 = 212;
 const XR: u8 = 224;
 
 // SGPRs.
@@ -109,18 +118,23 @@ const YSTEP: u8 = 40; const SNB: u8 = 41; const SMJ: u8 = 42; const SK2: u8 = 43
 /// Lane masks sit at even SGPRs with their odd neighbour unused: VOPC `_e64`
 /// destinations are encoded (and analysed) as SGPR pairs.
 const MASK0: u8 = 44; const MASK1: u8 = 46;
+/// Packed-dequant constants (live from the prologue to the end): field masks of
+/// the even / odd code pairs and the `v_pk_add_f16` constants that remove the
+/// exponent bias (`-1024` / `-64` and `-256` per half).
+const PK_MASKE: u8 = 48; const PK_MASKO: u8 = 49; const PK_CE: u8 = 50; const PK_CO: u8 = 51;
 
 fn plan(spec: &Spec) -> Result<RegPlan, String> {
-    let mut p = RegPlan::new(u16::from(XR) + 4 * u16::from(spec.xpt()), 48)?;
+    let mut p = RegPlan::new(u16::from(XR) + 4 * u16::from(spec.xpt()), 52)?;
     let w = || Live::Whole;
     for n in 0..16u8 { p.v::<1>("lane_constant", n, w())?; }
+    for n in SEL[2]..=SEL[3] { p.v::<1>("lane_constant", n, w())?; }
     for n in 0..spec.xpt() { p.v::<1>("x_offset", XOFF + n, w())?; }
     for t in 0..BT { p.v::<8>("acc", ACC + 8 * t, w())?; }
     for r in 0..RING { p.v::<4>("b_ring", RINGB + 4 * r, w())?; }
     for a in AF { p.v::<4>("a_frag", a, w())?; }
     for c in CODE { for j in 0..2u8 { p.v::<2>("codes", c + 2 * j, w())?; } }
     for h in HDR { p.v::<2>("header", h, w())?; }
-    for n in Q..=D1 { p.v::<1>("dequant_temp", n, w())?; }
+    for n in Q..Q + 4 { p.v::<1>("dequant_temp", n, w())?; }
     for i in 0..spec.xpt() { p.v::<4>("x_stage", XR + 4 * i, w())?; }
     p.s::<2>("kernarg_ptr", KARG, w())?;
     for srd in [SRD_A, SRD_X, SRD_Y] { p.s::<4>("srd", srd, w())?; }
@@ -128,6 +142,7 @@ fn plan(spec: &Spec) -> Result<RegPlan, String> {
     for n in SN..=SZERO { p.s::<1>("scalar", n, w())?; }
     for n in YSTEP..=SK2 { p.s::<1>("scalar", n, w())?; }
     for m in [MASK0, MASK1] { p.s::<2>("lane_mask", m, w())?; }
+    for n in PK_MASKE..=PK_CO { p.s::<1>("pk_const", n, w())?; }
     Ok(p)
 }
 
@@ -190,26 +205,55 @@ fn emit_fill(b: &mut Builder, f: &Fill) -> R {
 }
 fn xstore(spec: &Spec, slot: usize, i: u8) -> Fill { Fill::XStore { slot, i, imm: u32::from(i) * spec.xrow_step() * PITCH } }
 
+/// `v_perm_b32` selectors (lane half 0, lane half 1) of the four code pairs:
+/// the lane's 48-bit window is bytes `2*lh ..` of its 8 loaded bytes. Pair `p`
+/// (codes 2p and 2p+1, window bits 12p..12p+11) is gathered into a dword whose
+/// two 16-bit halves each hold one six-bit field within the low five bits of
+/// the half (the other bytes are zeroed or ignored by the mask):
+///  * pairs 0 and 2 (byte-aligned codes 2p at offset 0, 2p+1 at offset 6):
+///    `u = [b0, b1, 0, 0]` of the pair's two bytes; `(u << 10) | u` moves
+///    code 2p+1 to bit 16 (code 2p stays at bit 0);
+///  * pairs 1 and 3 (code 2p at byte offset 4, code 2p+1 at offset 2 of the
+///    next byte): `[b0, b1, b1, 0]` already puts code 2p at bit 4 of the low
+///    half and code 2p+1 at bit 18 of the high half.
+const PAIR_SEL: [(u32, u32); 4] = [
+    (0x0c0c_0100, 0x0c0c_0302), (0x0c02_0201, 0x0c04_0403),
+    (0x0c0c_0403, 0x0c0c_0605), (0x0c05_0504, 0x0c07_0706),
+];
+
 /// Dequantize one K-step: codes at `w` (two dwords: this lane half's 48 bits
 /// at bit 0 for lane half 0, bit 16 for lane half 1), header dword `h`
-/// (sc in .l, zp in .h) into A fragment `a`. Breadth-first order: eight
-/// independent per-value chains.
+/// (sc in .l, zp in .h) into A fragment `a` (codes 2p, 2p+1 in `a+p` .l/.h).
+/// Packed pairs (exact: same f16 values as `sc*q + zp` per code with one
+/// `v_fma_f16` rounding): the code pair is placed in the mantissas of two f16
+/// with a constant exponent (`v_and_or_b32` against the pair's field mask and
+/// exponent bits: `0x6400 | q` is `1024 + q` for a field at bit 0,
+/// `0x5400 | q << 4` is `64 + q` for a field at bit 4, `0x5c00 | q << 2` is
+/// `256 + q` for a field at bit 2), `v_pk_add_f16` of the bias recovers `q`
+/// exactly, and `v_pk_fma_f16` (sc and zp straight from the header halves
+/// through `op_sel`, operand order sc, q, zp) writes the fragment pair.
+/// Breadth-first order: four independent per-pair chains.
 fn dequant(w: u8, h: u8, a: u8) -> Vec<Fill> {
     let mut out = Vec::new();
     let mut f = |text: String, defs: Vec<RegRef>, uses: Vec<RegRef>| out.push(Fill::Valu { text, defs, uses });
-    // lo = codes 0..4 (+ low bits of 5); d1 = bits 24..47 (codes 4..7 at 0,6,12,18).
-    f(format!("v_perm_b32 v{LO}, v{}, v{w}, v{SELLO}", w + 1), vec![v(LO)], vec![v(w), v(w + 1), v(SELLO)]);
-    f(format!("v_perm_b32 v{D1}, v{}, v{w}, v{SELD1}", w + 1), vec![v(D1)], vec![v(w), v(w + 1), v(SELD1)]);
-    for i in 0..8u8 {
-        let src = if i < 4 { LO } else { D1 };
-        f(format!("v_bfe_u32 v{}, v{src}, {}, 6", Q + i, 6 * (i % 4)), vec![v(Q + i)], vec![v(src)]);
+    for p in 0..4u8 {
+        let sel = SEL[usize::from(p)];
+        f(format!("v_perm_b32 v{}, v{}, v{w}, v{sel}", Q + p, w + 1), vec![v(Q + p)], vec![v(w), v(w + 1), v(sel)]);
     }
-    for i in 0..8u8 { f(format!("v_cvt_f32_ubyte0_e32 v{0}, v{0}", Q + i), vec![v(Q + i)], vec![v(Q + i)]); }
-    for i in 0..8u8 { f(format!("v_cvt_f16_f32_e64 v{0}.l, v{0}", Q + i), vec![v(Q + i)], vec![v(Q + i)]); }
-    for i in 0..8u8 {
-        let d = a + i / 2;
-        let (half, sel) = if i % 2 == 0 { ("l", "op_sel:[0,0,1,0]") } else { ("h", "op_sel:[0,0,1,1]") };
-        f(format!("v_fma_f16 v{d}.{half}, v{h}.l, v{}.l, v{h}.h {sel}", Q + i), vec![v(d)], vec![v(d), v(h), v(Q + i)]);
+    for p in [0u8, 2] {
+        f(format!("v_lshl_or_b32 v{0}, v{0}, 10, v{0}", Q + p), vec![v(Q + p)], vec![v(Q + p)]);
+    }
+    for p in 0..4u8 {
+        let (mask, exp) = if p % 2 == 0 { (PK_MASKE, 0x6400_6400u32) } else { (PK_MASKO, 0x5c00_5400) };
+        f(format!("v_and_or_b32 v{0}, v{0}, s{mask}, {1}", Q + p, lit(exp)), vec![v(Q + p)], vec![v(Q + p), s(mask)]);
+    }
+    for p in 0..4u8 {
+        let bias = if p % 2 == 0 { PK_CE } else { PK_CO };
+        f(format!("v_pk_add_f16 v{0}, v{0}, s{bias}", Q + p), vec![v(Q + p)], vec![v(Q + p), s(bias)]);
+    }
+    for p in 0..4u8 {
+        f(format!("v_pk_fma_f16 v{}, v{h}, v{}, v{h} op_sel:[0,0,1] op_sel_hi:[0,1,1]", a + p, Q + p),
+            vec![v(a + p)], vec![v(h), v(Q + p)]);
     }
     out
 }
@@ -282,11 +326,15 @@ fn prologue(b: &mut Builder, spec: &Spec) -> R {
     op(b, format!("v_lshlrev_b32_e32 v{T4}, 4, v{T4}"), &[v(T4)], &[v(T4)])?;                 // (tid%4)*16
     op(b, format!("v_mad_u32_u24 v{LDST}, v{T3}, {}, v{T4}", lit(PITCH)), &[v(LDST)], &[v(T3), v(T4)])?;
     op(b, format!("v_cmp_ne_u32_e64 s{MASK0}, 0, v{T1}"), &[s(MASK0)], &[v(T1)])?;
-    op(b, format!("v_mov_b32_e32 v{T5}, {}", lit(0x0302_0100)), &[v(T5)], &[])?;
     wait_alu(b, "depctr_va_sdst(0)")?;
-    op(b, format!("v_cndmask_b32_e64 v{SELLO}, v{T5}, {}, s{MASK0}", lit(0x0504_0302)), &[v(SELLO)], &[v(T5), s(MASK0)])?;
-    op(b, format!("v_mov_b32_e32 v{T5}, {}", lit(0x0c05_0403)), &[v(T5)], &[])?;
-    op(b, format!("v_cndmask_b32_e64 v{SELD1}, v{T5}, {}, s{MASK0}", lit(0x0c07_0605)), &[v(SELD1)], &[v(T5), s(MASK0)])?;
+    for (p, (l0, l1)) in PAIR_SEL.into_iter().enumerate() {
+        let sel = SEL[p];
+        op(b, format!("v_mov_b32_e32 v{T5}, {}", lit(l0)), &[v(T5)], &[])?;
+        op(b, format!("v_cndmask_b32_e64 v{sel}, v{T5}, {}, s{MASK0}", lit(l1)), &[v(sel)], &[v(T5), s(MASK0)])?;
+    }
+    for (n, c) in [(PK_MASKE, 0x003f_003fu32), (PK_MASKO, 0x00fc_03f0), (PK_CE, 0xe400_e400), (PK_CO, 0xdc00_d400)] {
+        sop(b, format!("s_mov_b32 s{n}, {}", lit(c)), &[n], &[])?;
+    }
     for n in 0..8 * BT { op(b, format!("v_mov_b32_e32 v{}, 0", ACC + n), &[v(ACC + n)], &[])?; }
     b.wait(Counter::Km, 0)?;
     // M, K, N > 0 else exit; K < 256: no groups, store zeros.
