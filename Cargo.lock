@@ -1580,6 +1580,7 @@ dependencies = [
  "hipfire-pflash",
  "hipfire-runtime",
  "libc",
+ "parking_lot",
  "rdna-compute",
  "saddle-core",
  "serde_json",

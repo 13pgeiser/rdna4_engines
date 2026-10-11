@@ -4969,12 +4969,17 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
+    // Weight-host lease (imported weights): taken out before the bundle free
+    // so the infallible `ArchModel::free_gpu` cannot drop it; released at
+    // the end only when graphs, pool and VMM teardown are proven clean.
+    let mut weight_lease = None;
     if let Some(state) = m.state.as_mut().and_then(|s| {
         (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
     }) {
         if let Some(batch_state) = state.qwen35_decode_batch.take() {
             let _ = batch_state.free_gpu(gpu);
         }
+        weight_lease = state.weight_lease.take();
     }
     // Free arch-specific GPU state from the carrier bundle via `ArchModel::free_gpu`.
     if let Some(state) = m.state {
@@ -4991,9 +4996,14 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     // After ordinary frees/pool drain, retry any VMM arenas retained by a
     // failed free_tensor. Success is reported only when none remain.
     note(gpu.ensure_vmm_cleaned().map_err(|e| e.to_string()));
-    match first_err {
-        Some(err) => Err(err),
-        None => Ok(()),
+    match (first_err, weight_lease) {
+        (Some(err), Some(lease)) => {
+            drop(lease);
+            Err(format!("{err}; weight-host lease closed without release (teardown not proven clean)"))
+        }
+        (Some(err), None) => Err(err),
+        (None, Some(lease)) => lease.release(),
+        (None, None) => Ok(()),
     }
 }
 

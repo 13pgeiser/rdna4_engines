@@ -1081,6 +1081,18 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
+    // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
+    // (arch 5) on one device; anything else would be a private load, which
+    // the opt-in forbids. Refused before teardown, so the prior model stays.
+    if hipfire_arch_qwen35::carrier::weight_host_socket()?
+        .is_some()
+        && (arch_id != 5 || is_dir || tp != 1 || pp != 1)
+    {
+        return Err(format!(
+            "HIPFIRE_WEIGHT_HOST=1 supports only a single-device dense Qwen3.5 HFQ (arch 5, tp=pp=1); got arch {arch_id}{}, tp={tp}, pp={pp}",
+            if is_dir { " (directory source)" } else { "" }
+        ));
+    }
     // Qwen4 sequence on a unified-memory APU: an omitted max_seq is automatic
     // (the model's context, capped by the measured card capacity at load);
     // explicit values are honored within the limits below. A discrete GPU

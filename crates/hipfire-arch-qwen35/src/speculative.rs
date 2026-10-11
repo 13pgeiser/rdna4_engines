@@ -847,6 +847,12 @@ impl ModelSlot {
                     .into(),
             ));
         }
+        if bundle.weight_lease.is_some() {
+            return Err((
+                bundle,
+                "ModelSlot::from_bundle: weight-host imported weights are not admitted to speculative decode".into(),
+            ));
+        }
         let hfq = match HfqFile::open(path) {
             Ok(h) => h,
             Err(e) => return Err((bundle, format!("reopen model: {e}"))),
@@ -863,6 +869,7 @@ impl ModelSlot {
             vision_weights,
             qwen35_decode_batch: _,
             vmm_store: _,
+            weight_lease: _,
         } = bundle;
         debug_assert!(
             pp_scratch_set.is_none(),
@@ -902,6 +909,7 @@ impl ModelSlot {
             vision_weights: self.vision_weights,
             qwen35_decode_batch: None,
             vmm_store: None,
+            weight_lease: None,
         }
     }
 }

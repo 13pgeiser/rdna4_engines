@@ -57,3 +57,5 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 libc = "0.2"
+# hipfire-weight-host lease registry.
+parking_lot = "0.12"
