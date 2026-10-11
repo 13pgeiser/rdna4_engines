@@ -283,6 +283,7 @@ Use only when the claim class below names them. They are not universal.
 | Perf protocol | [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) | How to measure; not an executable gate. |
 | Redline certification ladder | [`docs/REDLINE.md`](REDLINE.md) | What evidence is required before Redline-attributed promotion. |
 | Path-specific parity / state oracle | Arch-owned example or test named by the change (when one exists) | Hidden-state, logit, KV/conv, or graph parity. If none exists for the surface → **blocked**. |
+| RADV/ACO MQ4 pilot | [`pm_aco_oracle`](../crates/rdna-compute/examples/pm_aco_oracle.rs), with the pinned offline producer under `tools/aco-export/` | Frozen artifact/config/entry-ABI identity; original Vulkan vs PM/HIP vs hipcc whole-buffer and guard equality, negative controls, eager and hipGraph replay. Native-writer relift and raw typed round-trip checks precede GPU execution. Separate matched-data timing is diagnostic only and requires a passing parity report; no product-route admission is implied. |
 
 ## Claim → route map
 
