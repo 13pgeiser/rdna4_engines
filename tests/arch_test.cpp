@@ -3972,8 +3972,9 @@ bool noted(const RadBuilder& b, const char* text) {
  * order and the work: every reduction rides lane 1 behind its producer and ahead of its consumer,
  * nothing else does, the cut is a whole number of routed passes, and the slices issue exactly the
  * rows the whole step issues -- the same routed passes, the drafter's taps -- which is what makes
- * the output the whole step's. A chunk under two passes, and a decode step, run whole on one
- * lane. */
+ * the output the whole step's. A chunk under two passes, and a decode step, run whole: their
+ * reductions on lane 0 and the dense arm on lane 1 beside the routed arm (trunk), with nothing
+ * unordered either. */
 TEST(a_gemma4_prefill_chunk_runs_as_two_slices_with_its_reductions_on_the_second_lane) {
     const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
     const int64_t E = 2816, L = 6;
@@ -4002,8 +4003,8 @@ TEST(a_gemma4_prefill_chunk_runs_as_two_slices_with_its_reductions_on_the_second
         RadBuilder b;
         CHECK_OK(model(b, false));
         CHECK(noted(b, "prefill overlap: a chunk of two routed passes"));
-        CHECK_EQ((int)b.concurrent.size(), 2);
-        for (const char* name : { "o", "ff2" })
+        CHECK_EQ((int)b.concurrent.size(), 5);
+        for (const char* name : { "o", "ff2", "h", "gate_up", "ffn" })
             CHECK(std::count(b.concurrent.begin(), b.concurrent.end(),
                              (rad_buf)buf_named(b, name)) == 1);
         RadBatch batch = one_prompt(k.T, out);
@@ -4013,17 +4014,20 @@ TEST(a_gemma4_prefill_chunk_runs_as_two_slices_with_its_reductions_on_the_second
         CHECK_EQ(c.lane, 0);
         CHECK_EQ(races(b, c), 0);
 
-        std::vector<int64_t> lane1;
+        std::vector<int64_t> lane1;   /* the reductions on lane 1 */
+        int dense1 = 0;               /* and the dense arm's launches */
         for (const auto& i : c.issues) {
             if (i.lane != 1) continue;
             const RecOp* o = b.op_of(i.op);
-            CHECK(o && o->op == "all_reduce");
-            lane1.push_back(i.n);
+            REQUIRE(o != nullptr);
+            if (o->op == "all_reduce") lane1.push_back(i.n);
+            else ++dense1;
         }
         if (k.cut == 0) {
             CHECK(lane1.empty());
-            CHECK(c.joins.empty());
+            CHECK_EQ(dense1, 3 * (int)L);    /* gate_up, act_mul, down: beside the routed arm */
         } else {
+            CHECK_EQ(dense1, 0);
             REQUIRE(lane1.size() == (size_t)(4 * L));
             for (int64_t l = 0; l < L; ++l) {
                 CHECK_EQ(lane1[4 * l + 0], k.cut * E);               /* attention, slice A */
@@ -4048,15 +4052,29 @@ TEST(a_gemma4_prefill_chunk_runs_as_two_slices_with_its_reductions_on_the_second
         CHECK_EQ((int)ns_of(b, c, "cast").size(), k.cut ? 6 : 3);   /* three taps, a slice each */
     }
 
-    /* A decode step never leaves lane 0. */
+    /* A decode step: the reductions on lane 0, the dense arm on lane 1 joined in before the
+     * feed-forward's, nothing unordered. */
     RadBuilder b;
     CHECK_OK(model(b, false));
+    CHECK(noted(b, "the two arms: in a step that runs whole"));
     RadBatch d = decode_batch();
     RadCtx c;
     run(b, c, d);
     CHECK(c.step_fail.empty());
-    CHECK(c.joins.empty());
-    for (const auto& i : c.issues) CHECK_EQ(i.lane, 0);
+    CHECK_EQ(c.lane, 0);
+    CHECK_EQ(races(b, c), 0);
+    int dense1 = 0;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        REQUIRE(o != nullptr);
+        if (o->op == "all_reduce") CHECK_EQ(i.lane, 0);
+        if (i.lane == 1) {
+            ++dense1;
+            CHECK(o->op == "gemm_nt" || o->op == "act_mul");
+        }
+    }
+    CHECK_EQ(dense1, 3 * (int)L);
+    CHECK_EQ((int)c.joins.size(), 2 * (int)L);
 }
 
 /* THE ATTENTION JOIN WRITES THE ROUTED ARM'S INPUTS on a layer whose gate_up is block fp8

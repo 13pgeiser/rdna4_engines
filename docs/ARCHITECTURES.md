@@ -520,8 +520,11 @@ are above every row band the sliced kernels have, so the step issues the same ke
 same rows and its output is the whole step's, bit for bit. On 4x R9700 the reductions were 47% of
 a 20K-token prefill under `--profile-ops`; a model of the measured times puts the overlap at up to
 a quarter off an unprofiled prefill. The per-op profile syncs every op, so it cannot show it --
-time a prefill without `--profile-ops`. `RADIANCE_GEMMA4_OVERLAP=0` runs every chunk whole, and the
-startup note says which. A decode step never takes the second lane.
+time a prefill without `--profile-ops`. A step that runs whole -- every decode and verify step --
+takes the second lane for the dense arm instead, beside the routed arm, which needs nothing of it
+until the feed-forward join: at decode the dense arm's GEMMs are a few rows, latency-bound and far
+from the bandwidth the experts take, and its reductions stay on lane 0. `RADIANCE_GEMMA4_OVERLAP=0`
+keeps every step on one stream, and the startup notes say which.
 
 **The draft head in fp8.** The drafter's head is the widest read on the draft path: the target's
 bf16 table, 352 MiB a rank at tp 4, every draft pass. A container converted with the line

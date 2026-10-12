@@ -273,6 +273,9 @@ struct Model {
     /* A prefill chunk of 2 * moe_rows tokens or more runs as two slices, the trunk's all-reduces
      * on the second lane beside the other slice's compute (trunk_overlap). Set at declare. */
     bool    overlap = false;
+    /* In a step that runs whole -- every decode and verify step -- the dense arm rides the second
+     * lane beside the routed arm (trunk). Set at declare. */
+    bool    arms = false;
     double  escale = 1.0, softcap = 0.0;
 
     rad_buf b_x = 0, b_h = 0, b_o = 0;
@@ -1481,10 +1484,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (const Layer& y : m.layers)
         m.overlap = m.overlap && (y.op_join_a || y.op_join_r) && y.op_join_f && y.next_norm &&
                     y.op_ar_o && y.op_ar_f;
-    if (m.overlap) {
-        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_o));
-        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ff2));
-    }
+    /* ---- THE TWO ARMS SIDE BY SIDE (trunk), in a step that runs whole: the dense arm on the
+     * second lane beside the routed arm, which needs nothing of it until the feed-forward join. At a
+     * decode step on 4x R9700 the dense arm is three launches, ~36 us under --profile-ops, behind
+     * the routed arm's ~120 in a layer, and its GEMMs at a few rows are latency-bound -- far from
+     * the bandwidth the experts take. No collective rides it, so the reductions keep lane 0. Off
+     * with the overlap's switch. The buffers the dense arm touches leave the arena's sharing. */
+    m.arms = m.moe && !ov_off;
+    if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_o));
+    if (m.overlap || m.arms) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ff2));
+    if (m.arms)
+        for (rad_buf bb : { m.b_h, m.b_gu, m.b_act }) RAD_ARCH_TRY(rad_buf_concurrent(b, bb));
 
     if (m.layers.empty() || !m.layers.back().next_norm)
         m.op_onorm = rmsnorm(T, E, m.w_onorm, 1.0, m.b_x, m.b_h);
@@ -1563,6 +1573,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         : !g.wire_exact ? "off (the lossy all-reduce wire)"
                         : T < 2 * m.moe_rows ? "off (a step holds fewer than two routed passes)"
                         : "off (the sandwich joins are not fused)");
+        rad_note(b, "the two arms: %s", m.arms
+                    ? "in a step that runs whole, the dense arm on a second stream beside the "
+                      "routed"
+                    : "one after the other (RADIANCE_GEMMA4_OVERLAP=0)");
     }
     if (m.kf.rot_pairs < m.kf.hd / 2)
         rad_note(b, "full layers: PROPORTIONAL rope -- %lld of %lld frequency pairs rotate at "
@@ -1712,9 +1726,10 @@ static void attend(RadCtx* c, const Model& m, const Layer& y, size_t li, const R
     }
 }
 
-/* The trunk over the whole step. */
+/* The trunk over the whole step, the dense arm beside the routed one where the model says so. */
 static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
     const int64_t T = batch->n_tok, E = m.E;
+    bool lanes_ok = true;
     for (size_t li = 0; li < m.layers.size(); ++li) {
         const Layer& y = m.layers[li];
         if (y.op_anorm) RAD_ISSUE(c, y.op_anorm, brows(m.b_x, T), RAD_W(y.w_anorm), brows(m.b_h, T));
@@ -1740,13 +1755,18 @@ static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
             RAD_ISSUE(c, y.op_fnorm, brows(m.b_x, T), RAD_W(y.w_fnorm), brows(m.b_h, T));
         }
 
-        /* dense arm -> rows [0, T) of the join */
+        /* dense arm -> rows [0, T) of the join: on lane 1 behind the attention join, where the arms
+         * run side by side, and lane 0 joins it back before the reduction reads them */
+        if (m.arms)
+            lanes_ok = lanes_ok && rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK;
         RAD_ISSUE(c, y.op_gu, brows(m.b_h, T), RAD_W(y.w_gu), brows(m.b_gu, T));
         RAD_ISSUE(c, y.op_act, bcol(m.b_gu, 0, m.n_ff, T), bcol(m.b_gu, m.n_ff, m.n_ff, T),
                   brows(m.b_act, T));
         RAD_ISSUE(c, y.op_dn, brows(m.b_act, T), RAD_W(y.w_dn), brows(m.b_ff2, T));
+        if (m.arms) lanes_ok = rad_lane(c, 0) == RAD_OK && lanes_ok;
         if (m.moe) {
             routed(c, m, y, T, 0, T, T);
+            if (m.arms) lanes_ok = rad_lane_join(c, 1, 0) == RAD_OK && lanes_ok;
             if (y.op_ar_f) RAD_ISSUE_N(c, y.op_ar_f, 2 * T * E, brows(m.b_ff2, 2 * T), RAD_NONE);
             if (y.op_join_f) {
                 RAD_ISSUE(c, y.op_join_f, brows(m.b_ff2, T), RAD_W(y.w_fpost1),
@@ -1776,6 +1796,9 @@ static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
                       bcol(m.b_dfsrc, (int64_t)t * E, E, T));
         }
     }
+    if (!lanes_ok)
+        rad_step_fail(c, "gemma4: the dense arm's second lane could not be ordered against the "
+                         "first (RADIANCE_GEMMA4_OVERLAP=0 keeps one)");
 }
 
 /* ============================================================== the prefill overlap */
