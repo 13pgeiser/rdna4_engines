@@ -63,6 +63,21 @@ pub fn run_q8_projection_fresh(
     }
 }
 
+/// MTP prompt-fill-only HFQ4G256-v1 route. The caller supplies already
+/// rotated MQ4 activations and its fast-fill/kill-switch decision. Other
+/// projection callers retain the incumbent dispatcher-entry behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mtp_fill_mq4(
+    gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+    m: usize, k: usize, n: usize, use_pm: bool,
+) -> hip_bridge::HipResult<()> {
+    if use_pm && gpu.supports_gemm_hfq4g256_rows_pm(m, k, n) {
+        gpu.gemm_hfq4g256_rows_pm(w, x, y, m, k, n)
+    } else {
+        gpu.gemm_hfq4g256(w, x, y, m, k, n)
+    }
+}
+
 /// Select the residual GEMM key for a packed weight container.
 pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
     match dtype {

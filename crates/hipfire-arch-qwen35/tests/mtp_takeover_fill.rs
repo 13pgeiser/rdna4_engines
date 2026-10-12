@@ -119,6 +119,10 @@
 //! HIPFIRE_MTP_FILL_ORACLE_A=/tmp/fill_off.json HIPFIRE_MTP_FILL_ORACLE_B=/tmp/fill_fast.json \
 //!   "$BIN" --exact mtp_fill_oracle_compare --ignored --nocapture --test-threads=1
 //! ```
+//! The same manual arms also certify the PM GEMM: keep `HIPFIRE_MTP_FILL_FAST=1`
+//! in both processes, change ONLY `HIPFIRE_MTP_FILL_PM_GEMM=0` / `=1`, then
+//! run `mtp_fill_oracle_compare`. The artifact records both effective switches;
+//! comparison refuses identical configurations and changing both switches.
 //!
 //! Single test thread is REQUIRED (`--test-threads=1`, and run GPU tests one
 //! at a time): every GPU test loads the full trunk and head, and two sessions
@@ -880,6 +884,7 @@ fn mtp_fill_oracle_arm() {
     let artifact = serde_json::json!({
         "schema": 1,
         "fill_fast_env": fill_env,
+        "fill_pm_gemm": hipfire_config::developer_bool("HIPFIRE_MTP_FILL_PM_GEMM", true),
         "gpu": format!("{}", gpu.arch),
         "model": model.display().to_string(),
         "head": head_path.display().to_string(),
@@ -956,9 +961,15 @@ fn compare_artifacts(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String
             failures.push(format!("arms differ in {key}: a={} b={}", a[key], b[key]));
         }
     }
-    if a["fill_fast_env"] == b["fill_fast_env"] {
-        failures.push(format!("both arms ran {FILL_ENV}={}: the oracle compared a mode with itself", a["fill_fast_env"]));
+    let fast_diff = a["fill_fast_env"] != b["fill_fast_env"];
+    let pm_diff = a["fill_pm_gemm"] != b["fill_pm_gemm"];
+    if fast_diff == pm_diff {
+        failures.push("oracle arms must differ in exactly one fill switch".into());
     }
+    if pm_diff && (a["fill_fast_env"] != "1" || b["fill_fast_env"] != "1") {
+        failures.push("PM GEMM oracle requires fast fill enabled in both arms".into());
+    }
+    println!("MTP_FILL_PM_GEMM a={} b={}", a["fill_pm_gemm"], b["fill_pm_gemm"]);
     let (da, db) = (&a["device"], &b["device"]);
     {
         const DEVICE_FIELDS: [&str; 9] =

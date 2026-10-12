@@ -1453,6 +1453,10 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
                 symbols: QWEN36_27B_GFX1201_B1S_SYMBOLS,
             };
             let mut embedded = vec![b1s];
+            if mtp {
+                let (module, image, symbols) = crate::pm_mtp_gemm::route_object();
+                embedded.push(PlannedKernel::Embedded { module, image, radiowave_json: None, symbols });
+            }
             // VMM exact route projections/lm_head: the accepted PM
             // multi-column objects under pm_decode, else the hipcc x-batch
             // GEMV their launchers fall back to (residual/multirow fall back
@@ -1984,5 +1988,57 @@ mod tests {
     #[test]
     fn qwen35_trace_is_packaged() {
         assert_trace_packaged(include_str!("../tests/fixtures/kernel-trace-qwen35.tsv"));
+    }
+
+    #[test]
+    fn native_mtp_plans_pm_fill_before_ready() {
+        use crate::DType;
+        let mut owned: Vec<(String, DType, Vec<usize>)> = vec![
+            ("lm_head.weight".into(), DType::MQ4G256V2, vec![248320, 5120]),
+            ("model.language_model.embed_tokens.weight".into(), DType::Q8_0, vec![248320, 5120]),
+        ];
+        for layer in 0..64 {
+            let p = format!("model.language_model.layers.{layer}");
+            for name in ["gate", "up", "down"] {
+                owned.push((format!("{p}.mlp.{name}_proj.weight"), DType::MQ4G256V2, vec![17408, 5120]));
+            }
+            if layer % 4 == 3 {
+                for name in ["q", "k", "v", "o"] {
+                    owned.push((format!("{p}.self_attn.{name}_proj.weight"), DType::MQ4G256V2, vec![12288, 5120]));
+                }
+            } else {
+                for name in ["qkv", "z", "a", "b"] {
+                    owned.push((format!("{p}.linear_attn.in_proj_{name}.weight"), DType::MQ4G256V2, vec![10240, 5120]));
+                }
+                owned.push((format!("{p}.linear_attn.out_proj.weight"), DType::MQ4G256V2, vec![5120, 5120]));
+            }
+        }
+        for (name, shape) in [
+            ("eh_proj", [5120, 10240]), ("wq", [12288, 5120]),
+            ("wk", [1024, 5120]), ("wv", [1024, 5120]), ("wo", [5120, 6144]),
+            ("ffn_gate", [17408, 5120]), ("ffn_up", [17408, 5120]), ("ffn_down", [5120, 17408]),
+        ] {
+            owned.push((name.into(), DType::MQ4G256, shape.to_vec()));
+        }
+        let tensors: Vec<_> = owned.iter().map(|(name, dtype, shape)|
+            KernelTensorMeta { name, dtype: *dtype, shape }).collect();
+        for pm_decode in [false, true] {
+            let mut flags = default_feature_flags("gfx1201").unwrap();
+            flags.pm_decode = pm_decode;
+            let mut input = RouteKernelInput {
+                arch: "gfx1201", model_arch: 5, tensors: &tensors,
+                n_heads: 24, n_kv_heads: 4, head_dim: 256, max_seq: 16448,
+                prefill_chunk_rows: 512, kv_k: "fp8", kv_v: "fp8", state_quant: "q8",
+                spec: KernelSpecRoute::NativeMtp, host_mapped_experts: false,
+                retained_decode: false, hipcc_extra_flags: "", flags: &flags,
+            };
+            let (module, image, symbols) = crate::pm_mtp_gemm::route_object();
+            let plan = route_entries(&input).expect("native MTP closed route");
+            assert!(plan.entries.iter().any(|e| matches!(e, PlannedKernel::Embedded {
+                module: m, image: i, symbols: s, ..
+            } if *m == module && *i == image && *s == symbols)));
+            input.spec = KernelSpecRoute::Ar;
+            assert!(!route_entries(&input).unwrap().entries.iter().any(|e| e.module() == module));
+        }
     }
 }
