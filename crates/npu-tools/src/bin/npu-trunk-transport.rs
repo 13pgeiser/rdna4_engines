@@ -3,7 +3,7 @@
 //! Production-size two-bank transport gate. No HIP VMM export, no SYNC_BO.
 use npu_tools::coop_gpu;
 use pm_npu::kernels::{gemm_g80, w8a8_epi::bf16_direct};
-use railgun::npu::{clflush, trunk::{NpuTrunkRuntime, LayerPanels, PanelProgram, Shape, Seq, WAIT_TIMEOUT}};
+use railgun::npu::{clflush, trunk::{monotonic_ns, NpuTrunkRuntime, LayerPanels, PanelProgram, Shape, Seq, WAIT_TIMEOUT, CHAIN_WATCHDOG}};
 use std::time::{Duration, Instant};
 const ROWS: usize = 8192;
 const K: usize = 2560;
@@ -20,6 +20,9 @@ fn sm(panel: usize, col: usize) -> (u16, i16) { (16384 + (col % CLASSES) as u16 
 fn percentile(values: &[f64], p: f64) -> f64 { values[((values.len() - 1) as f64 * p).ceil() as usize] }
 fn at<T>(round: Option<usize>, stage: &str, result: Result<T, String>) -> Result<T, String> {
     result.map_err(|e| format!("stage={stage} round={}: {e}", round.map_or_else(|| "none".into(), |r| r.to_string())))
+}
+fn resume_latency_ns(anchor_ns: u64, elapsed_ms: f32, done_ns: u64) -> i128 {
+    i128::from(anchor_ns) + (f64::from(elapsed_ms) * 1e6) as i128 - i128::from(done_ns)
 }
 fn consumer_columns(shape: Shape) -> [std::ops::Range<usize>; 4] {
     match shape {
@@ -57,6 +60,18 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
         let copy = at(None, "get-copy-kernel", module.function(coop_gpu::COPY))?;
         let stream = at(None, "create-stream", hip.stream())?;
         let end = at(None, "create-system-event", hip.system_event())?;
+        let anchor = at(None, "create-timing-anchor", hip.event())?;
+        let resumed = at(None, "create-resume-event", hip.event())?;
+        // Map the HIP event clock into the relay's CLOCK_MONOTONIC domain.
+        // Report the bracket width rather than pretending these are exact clocks.
+        at(None, "warm-anchor", hip.record_on(&anchor, Some(&stream)))?;
+        at(None, "warm-anchor-completion", hip.wait_event_timeout(&anchor, WAIT_TIMEOUT))?;
+        let anchor_before = monotonic_ns();
+        at(None, "record-anchor", hip.record_on(&anchor, Some(&stream)))?;
+        at(None, "anchor-completion", hip.wait_event_timeout(&anchor, WAIT_TIMEOUT))?;
+        let anchor_after = monotonic_ns();
+        let anchor_ns = anchor_before + (anchor_after - anchor_before) / 2;
+        let anchor_uncertainty_ns = anchor_after - anchor_before;
         let input = at(None, "allocate-input", hip.allocate(layout.a_bytes, None))?;
         let output = at(None, "allocate-output", hip.allocate(c_bytes, None))?;
         let poison = at(None, "allocate-poison", hip.allocate(c_bytes, None))?;
@@ -76,10 +91,11 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
         let mut scales = vec![(0u16, 0i16); ROWS];
         let mut reference = vec![0u16; panels_count * CLASSES * CLASSES * 3];
         let mut latencies = Vec::with_capacity(ROUNDS);
+        let mut resumes = Vec::with_capacity(ROUNDS);
         let mut busy = Duration::ZERO;
         let mut last_seq = [None; 2];
         let wall = Instant::now();
-        println!("transport shape={shape:?} layout=rowmajor pitch={} live={live} banks=2 panels={panels_count} rounds={ROUNDS} A={} C={c_bytes} bytes/bank timeout=3s shim_axi=default consumer_windows={columns:?}", shape.pitch(), layout.a_bytes);
+        println!("transport shape={shape:?} layout=rowmajor pitch={} live={live} banks=2 panels={panels_count} rounds={ROUNDS} A={} C={c_bytes} bytes/bank ready_timeout={WAIT_TIMEOUT:?} chain_watchdog={CHAIN_WATCHDOG:?} shim_axi=default consumer_windows={columns:?} anchor_uncertainty_ns={anchor_uncertainty_ns}", shape.pitch(), layout.a_bytes);
         for round in 0..ROUNDS {
             let bank = round % 2;
             for row in 0..ROWS {
@@ -106,11 +122,20 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             at(Some(round), "poison-C", gpu_copy(cv.device, poison.ptr(), c_bytes))?;
             at(Some(round), "GPU-write-A", gpu_copy(av.device, input.ptr(), layout.a_bytes))?;
             let seq = at(Some(round), "kick", unsafe { runtime.kick(0, shape, bank, ROWS, stream.raw()) })?;
-            let completion = at(Some(round), "wait-GPU", unsafe { runtime.wait_gpu(seq, stream.raw()) })?;
+            at(Some(round), "wait-GPU-enqueue-ahead", unsafe { runtime.wait_gpu(seq, stream.raw()) })?;
+            let wait_enqueue_ns = monotonic_ns();
+            at(Some(round), "record-GPU-resume", hip.record_on(&resumed, Some(&stream)))?;
             at(Some(round), "GPU-read-C", gpu_copy(output.ptr(), cv.device, c_bytes))?;
             at(Some(round), "retire-bank", unsafe { runtime.retire_bank(seq, stream.raw()) })?;
             last_seq[bank] = Some(seq);
             at(Some(round), "consumer-completion", drain())?;
+            let completion = at(Some(round), "check-terminal-completion", runtime.wait_host(seq))?;
+            at(Some(round), "check-runtime-error", runtime.check_error())?;
+            if wait_enqueue_ns >= completion.done_ns {
+                return at(Some(round), "enqueue-ahead-order", Err("GPU wait was not enqueued before NPU completion".into()));
+            }
+            let resume_ns = resume_latency_ns(anchor_ns, at(Some(round), "GPU-resume-time", hip.elapsed_ms(&anchor, &resumed))?, completion.done_ns);
+            resumes.push(resume_ns as f64 / 1000.0);
             at(Some(round), "download-C", hip.download(&output, &mut observed))?;
             // Also prove the entire GPU-written A aliases the anonymous pages.
             unsafe { clflush(av.host, av.len); }
@@ -131,11 +156,13 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             let ms = completion.kick_to_done.as_secs_f64() * 1000.0;
             busy += completion.npu_busy;
             latencies.push(ms);
-            println!("round={round:02} bank={bank} seq={} exact kick->done={ms:.3} ms npu_submit_wait={:.3} ms", seq.value, completion.npu_busy.as_secs_f64() * 1000.0);
+            println!("round={round:02} bank={bank} seq={} exact enqueue_ahead=true gpu_wait_enqueue_ns={wait_enqueue_ns} npu_done_ns={} kick->done={ms:.3} ms npu_submit_wait={:.3} ms npu_done->gpu_resume={:.3} us", seq.value, completion.done_ns, completion.npu_busy.as_secs_f64() * 1000.0, resume_ns as f64 / 1000.0);
         }
         latencies.sort_by(f64::total_cmp);
         println!("EXACT rounds={ROUNDS} p50={:.3} p99={:.3} max={:.3} ms npu_busy_envelope={:.3} ms wall={:.3} ms (busy=submit-to-timeline host envelope, wall includes CPU oracle/copies)",
             percentile(&latencies, 0.5), percentile(&latencies, 0.99), latencies[ROUNDS - 1], busy.as_secs_f64() * 1000.0, wall.elapsed().as_secs_f64() * 1000.0);
+        resumes.sort_by(f64::total_cmp);
+        println!("RESUME npu_done->GPU_event p50={:.3} p99={:.3} max={:.3} us anchor_uncertainty_ns={anchor_uncertainty_ns}", percentile(&resumes, 0.5), percentile(&resumes, 0.99), resumes[ROUNDS-1]);
         // Negative controls run only AFTER every exact round has reported.
         // This generation was never submitted; Shared::wait rejects it in
         // process, without a DRM wait, relay request or GPU wait.
@@ -162,18 +189,67 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             return at(None, "negative-missing-wait", Err("negative not distinguishable from reference".into()));
         }
         println!("negative missing-wait: detected poisoned C without replacement submission (all bytes)");
-        println!("PASS shape={shape:?} rounds={ROUNDS} negatives=2 consumer_padding_bounds=checked");
+        println!("EXACT_CONTROLS shape={shape:?} rounds={ROUNDS} negatives=2 consumer_padding_bounds=checked");
         Ok(())
     })();
     let teardown = at(None, "teardown", runtime.close());
-    outcome.and(teardown)
+    outcome.and(teardown)?;
+    // A separate runtime is intentional: a real timeout permanently poisons the
+    // relay, and can never be followed by success on that same transport.
+    watchdog_negative(pci, shape, design.pdi, design.insts)?;
+    println!("PASS shape={shape:?} rounds={ROUNDS} negatives=3 consumer_padding_bounds=checked");
+    Ok(())
+}
+fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Result<(), String> {
+    let layout = railgun::npu::trunk::ArenaLayout::new(ROWS)?;
+    // Valid zero operands/program, but a deliberately impossible chain budget:
+    // EXEC_CMD must return before its 1 ns deadline can be checked. This exercises
+    // production watchdog cancellation, not an environment-dependent test shim.
+    let panels = (0..shape.panels()).map(|_| vec![0; layout.b_bytes]).collect();
+    let runtime = at(None, "negative-timeout-open", NpuTrunkRuntime::open_with_watchdog(
+        vec![PanelProgram { shape, pdi, txn, padded_rows: ROWS }],
+        vec![LayerPanels { layer: 0, shape, panels }], 1, ROWS, pci, Duration::from_nanos(1)))?;
+    let outcome = (|| {
+        let hip = runtime.hip();
+        let stream = at(None, "negative-timeout-stream", hip.stream())?;
+        let resumed = at(None, "negative-timeout-resume-event", hip.system_event())?;
+        let start = Instant::now();
+        let seq = at(None, "negative-timeout-kick", unsafe { runtime.kick(0, shape, 0, ROWS, stream.raw()) })?;
+        at(None, "negative-timeout-wait-enqueue", unsafe { runtime.wait_gpu(seq, stream.raw()) })?;
+        at(None, "negative-timeout-resume-record", hip.record_on(&resumed, Some(&stream)))?;
+        // Record retirement even when a very fast timeout is already visible.
+        let retirement = unsafe { runtime.retire_bank(seq, stream.raw()) };
+        at(None, "negative-timeout-GPU-released", hip.wait_event_timeout(&resumed, CHAIN_WATCHDOG))?;
+        let elapsed = start.elapsed();
+        if elapsed > CHAIN_WATCHDOG { return Err(format!("timeout GPU release exceeded watchdog: {elapsed:?}")); }
+        let error = runtime.wait_host(seq).err().ok_or("forced watchdog unexpectedly succeeded")?;
+        if !error.contains("watchdog") { return Err(format!("unexpected forced-timeout error: {error}")); }
+        let sticky = runtime.check_error().err().ok_or("timeout did not poison runtime")?;
+        if !sticky.contains("watchdog") { return Err(format!("missing sticky watchdog error: {sticky}")); }
+        if let Err(e) = retirement {
+            if !e.contains("watchdog") { return Err(format!("unexpected retirement error: {e}")); }
+        }
+        let retire_error = unsafe { runtime.retire_bank(seq, stream.raw()) }.err()
+            .ok_or("retirement did not surface terminal timeout")?;
+        if !retire_error.contains("watchdog") { return Err(format!("missing retirement watchdog error: {retire_error}")); }
+        println!("negative forced-NPU-watchdog: GPU resumed in {:.3} ms (limit {:.3} ms); surfaced error ({error}); failed C never read", elapsed.as_secs_f64()*1000.0, CHAIN_WATCHDOG.as_secs_f64()*1000.0);
+        Ok(())
+    })();
+    // A failed runtime reports the sticky job error at checked teardown, too.
+    let teardown = runtime.close();
+    outcome?;
+    match teardown {
+        Err(e) if e.contains("watchdog") => Ok(()),
+        Err(e) => Err(format!("negative-timeout teardown: {e}")),
+        Ok(()) => Err("negative-timeout teardown lost sticky error".into()),
+    }
 }
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let pci = match args.as_slice() {
         [] => "0000:c0:00.0",
         [flag, pci] if flag == "--pci" => pci,
-        [flag] if flag == "--help" => { println!("npu-trunk-transport [--pci 0000:c0:00.0]\n8192 rows, row-major GdnIn + QsaIn (13/11 panels), 2 banks, 20 rounds/shape FIRST, negatives AFTER, 3 s waits, default shim AXI."); return; }
+        [flag] if flag == "--help" => { println!("npu-trunk-transport [--pci 0000:c0:00.0]\n8192 rows, row-major GdnIn + QsaIn (13/11 panels), 2 banks, 20 enqueue-ahead exact rounds/shape FIRST; negatives AFTER include forced chain timeout and bounded GPU release. Prints npu_done->GPU resume event latency; 3 s ready waits, 300 ms chain watchdog, default shim AXI."); return; }
         _ => { eprintln!("FAIL: stage=arguments round=none: usage: npu-trunk-transport [--pci PCI]"); std::process::exit(1); }
     };
     for shape in [Shape::GdnIn, Shape::QsaIn] {
@@ -184,6 +260,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resume_event_clock_conversion_preserves_signed_latency() {
+        assert_eq!(resume_latency_ns(1_000_000, 2.0, 2_900_000), 100_000);
+        assert_eq!(resume_latency_ns(1_000_000, 2.0, 3_100_000), -100_000);
+    }
 
     #[test]
     fn consumer_windows_exclude_panel_padding() {

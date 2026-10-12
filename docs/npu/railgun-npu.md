@@ -193,13 +193,22 @@ runtime dependency graph. HIP events/registrations remain !Send; only immutable 
 and event handles cross to the relay, which selects the original GPU on its own thread.
 `unsafe kick(layer, shape, bank, rows, raw_hip_stream)` records an explicit
 `hipEventReleaseToSystem` event after A production. Bounded event queries precede NPU submit.
-The chain's transaction drains all C channels; a 3 s timeline wait checks COMPLETED before
-CPU-alias invalidation and release-store/CLFLUSH of the bank's registered done word.
-`wait_host(Seq)` propagates submission, event and timeline errors. `unsafe wait_gpu(Seq, stream)`
-**first checks bounded host completion**, then queues `hipStreamWaitValue32(>= seq)` and a
-system-fenced event before C loads. This conservative v1 rejoin is host-gated, not a CPU-free
-wait: failed jobs cannot strand a queued GPU wait or silently admit stale C. Raw done waits
-outside this checked API are unsupported. Sequences never wrap (reopen at i32::MAX).
+The chain's transaction drains all C channels. A chain-only watchdog defaults to
+300 ms (`CHAIN_WATCHDOG`, five times the measured ~60 ms expected chain); explicit
+`open_with_watchdog` budgets must be positive and at most 3 s. GPU A-ready polling
+has a separate 3 s deadline. COMPLETED is checked before CPU-alias invalidation.
+`wait_host(Seq)` propagates submission, event, timeline and watchdog errors.
+`unsafe wait_gpu(Seq, stream)` immediately queues `hipStreamWaitValue32(>= seq)`
+and a system-fenced event before C loads: **no host-completion check or wait**.
+Every kicked generation gets a terminal release-store/CLFLUSH, including NPU
+errors, watchdog expiry, enqueue failures, relay unwinding and runtime shutdown.
+Failure is sticky and recorded before releasing its GPU wait; a late success
+cannot overwrite it. The signal means terminal, not necessarily successful.
+Retirement checks known runtime errors without host waiting, and the pair waits
+for its final already-enqueued chains and checks errors before head/capture work
+or state commits. Failed pairs return an error; their speculative results are
+never published or used. Raw signal waits bypassing this contract are unsupported.
+Per-bank sequences never wrap (reopen at i32::MAX).
 `unsafe retire_bank(Seq, stream)` records the last consumer's event. Before
 the next GPU producer writes A, `unsafe prepare_bank(bank, stream)` queues
 `hipStreamWaitEvent` on that retirement event; the following kick's A-ready
@@ -210,9 +219,20 @@ Serving records retirement after mixer Core (all direct arena readers), before
 OutProj. `prepare` waits retirement on the producer stream, A production follows,
 and kick's ready event follows both; the relay must observe ready before submit.
 This orders **all old C reads before the next C DMA write**, not merely A reuse.
-`close()` joins the relay (context before BOs), checks GPU retirement, then HIP
-unregisters before unmapping. On unretired/stuck GPU work, teardown reports an error and
-quarantines registrations/pages until process exit instead of freeing live operands.
+`close()` first cancels outstanding generations and releases all their GPU waits,
+then joins the relay (context before BOs), checks GPU retirement, and HIP
+unregisters before unmapping. It also reports the sticky NPU failure. On
+unretired/stuck GPU work, teardown reports an error and quarantines
+registrations/pages until process exit instead of freeing live operands.
+
+Host-side reuse protection remains at `prepare_bank`/`kick` so a bank's ready
+event is not re-recorded before its old NPU job observes it. These bounded waits
+depend only on a previously issued producer/chain, not an unqueued GPU fragment
+or the just-enqueued `G` fragment. For `prepare/kick(l+1,A)`, the old-chain wait
+is for NPU(l,A), whose terminal signal is a prerequisite of GPU G(l,A).
+Consequently this reuse check resolves no later than G(l,A)'s start; the host
+can enqueue wait(l,B)+G(l,B) while the GPU still runs G(l,A). Retirement is only
+a stream-enqueued event dependency, not a host wait for G(l,A).
 
 Visibility is deliberately stronger than a release-value fence:
 [coop-flashnext §3](coop-flashnext.md#3-buffer-ownership-and-visibility) requires compute
@@ -242,12 +262,22 @@ fresh poison without submitting a replacement job; a racing ungated read could l
 finish after NPU completion and is not a reliable negative. A deliberately unsubmitted host
 Seq must error immediately in process (no DRM wait or relay request). The former impossible
 DRM timeline probe was removed after the parent-reported j107 receive timeout hid all rounds.
-Expected output per shape: 20 `round=.. bank=.. seq=.. exact kick->done=..` lines,
-an `EXACT` timing summary, two negative-control lines and
-`PASS shape=GdnIn|QsaIn rounds=20 negatives=2 consumer_padding_bounds=checked`.
+Every exact round asserts `gpu_wait_enqueue_ns < npu_done_ns`. A timing event
+immediately after the terminal wait/system acquire measures NPU done to GPU
+resume; the `RESUME` p50/p99/max summary includes the host/HIP clock-anchor
+bracket uncertainty. A third negative opens a separate valid zero-operand runtime
+with a deliberately impossible 1 ns chain budget, exercising the real watchdog
+path after EXEC_CMD (no production fault-injection flags). Its post-wait event
+must complete within the normal 300 ms watchdog; `wait_host`, sticky error checks,
+retirement when already failed, and checked teardown must surface the failure.
+The failed C arena is never read. Expected output per shape: 20 enqueue-ahead
+exact round lines, `EXACT` and `RESUME` summaries, three negative-control lines,
+and `PASS shape=GdnIn|QsaIn rounds=20 negatives=3 consumer_padding_bounds=checked`.
 Busy is the host submit-to-timeline
 envelope, not an AIE hardware counter; wall includes CPU verification. Any mismatch/error
 exits 1 and identifies `stage=... round=...` (`round=none` for setup/negatives/teardown).
-Production-size visibility and host-registered done-word acceptance by HIP's beta stream-wait
-API remain **unmeasured until this gate runs**; its documented pointer requirement is signal
-memory. The old 4 KiB fixture proof is not evidence that this larger route has passed.
+The first-light transport route passed on Halo; enqueue-ahead ordering, forced
+watchdog release and resume latency in this updated gate remain **unmeasured
+until the parent runs it**. No hardware is opened by the CPU unit tests:
+`cargo test -p railgun --features npu --lib` and
+`cargo test -p npu-tools --bin npu-trunk-transport`.

@@ -363,6 +363,13 @@ impl NpuForward {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref().expect("on runtime");
         unsafe { rt.prepare_bank(bank,stream(gpu)).map_err(fail)?; }
+        if layer > 0 && !records.is_empty() {
+            // prepare_bank has already checked this generation. Harvest trace
+            // timestamps before kick replaces the bank's terminal record.
+            let r=&mut records[(layer-1)*2+bank];
+            let completion=rt.wait_host(Seq { bank, value:r.seq }).map_err(fail)?;
+            r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
+        }
         // Includes PLE (when present) and the attention HC read. Neither reads
         // recurrent/QSA state; bank B's input can be prepared ahead of bank A.
         execute(gpu,ctx,&program.steps[program.ranges[layer].start..index])?;
@@ -387,11 +394,10 @@ impl NpuForward {
     fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, layer: usize, bank: usize, seq: Seq, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref().expect("on runtime");
-        let completion=unsafe { rt.wait_gpu(seq,stream(gpu)).map_err(fail)? };
+        unsafe { rt.wait_gpu(seq,stream(gpu)).map_err(fail)?; }
         let wait_enqueue_ns=monotonic_ns();
         if !records.is_empty() {
             let r=&mut records[layer*2+bank];
-            r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
             r.wait_enqueue_ns=wait_enqueue_ns; r.consume_issue_ns=0;
             gpu.hip.event_record(&r.start,gpu.active_stream.as_ref())?;
         }
@@ -527,6 +533,18 @@ impl NpuForward {
                     seq[bank]=self.prepare(gpu,&ctx,&programs[bank],layer+1,bank,&mut records,if bank == 0 { stage.as_ref() } else { None })?;
                 }
             }
+            // Only already-enqueued chains are checked here. Failed terminal
+            // signals may have admitted speculative fragment work, but no pair
+            // output/head/capture or request state is published on that path.
+            let rt=self.runtime.as_ref().expect("on runtime");
+            for bank in 0..2 {
+                let completion=rt.wait_host(seq[bank]).map_err(fail)?;
+                if !records.is_empty() {
+                    let r=&mut records[(bundle.config.num_hidden_layers-1)*2+bank];
+                    r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
+                }
+            }
+            rt.check_error().map_err(fail)?;
             // Both trunks finish before prompt-end head/capture work.
             finish_bank(gpu,bundle,&owner.scratch,logits,top1,capture,0,rows[0],output)?;
             finish_bank(gpu,bundle,b,logits,top1,capture,1,rows[1],output)?;

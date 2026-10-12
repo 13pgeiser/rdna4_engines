@@ -10,6 +10,10 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Five times the measured ~60 ms full G80 chain envelope. GPU-ready polling
+/// has its separate WAIT_TIMEOUT budget; queued producer work is not NPU time.
+pub const EXPECTED_CHAIN_TIME: Duration = Duration::from_millis(60);
+pub const CHAIN_WATCHDOG: Duration = Duration::from_millis(300);
 pub const PANEL_N: usize = 1280;
 pub const PANEL_K: usize = 2560;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,28 +96,79 @@ struct Bank { a: Arena, c: [Arena; 2], control: Arena, ready: HipEvent, acquire:
 #[derive(Clone, Copy)]
 struct Binding { handle: u32, addr: u64 }
 #[derive(Clone, Copy)]
-struct BankPages { a: usize, a_len: usize, c: [usize; 2], c_len: [usize; 2], done: usize }
+struct BankPages { a: usize, a_len: usize, c: [usize; 2], c_len: [usize; 2] }
 struct Job { seq: Seq, layer: usize, shape: Shape, event: usize, start: Instant }
 struct Pending { value: u32, result: Option<Result<Completion, String>> }
-struct Shared { pending: Mutex<Vec<Pending>>, changed: Condvar }
+struct Status { pending: Vec<Pending>, failure: Option<String>, stopping: bool }
+struct Shared { status: Mutex<Status>, changed: Condvar, signals: Vec<usize> }
 impl Shared {
+    fn validate(&self, seq: Seq) -> Result<(), String> {
+        let status = self.status.lock();
+        let p = status.pending.get(seq.bank).ok_or("invalid sequence bank")?;
+        if seq.value == 0 || p.value != seq.value { return Err("unknown/stale sequence".into()); }
+        Ok(())
+    }
+    fn check_error(&self) -> Result<(), String> {
+        match &self.status.lock().failure { Some(e) => Err(e.clone()), None => Ok(()) }
+    }
     fn wait(&self, seq: Seq, timeout: Duration) -> Result<Completion, String> {
         let deadline = Instant::now() + timeout;
-        let mut pending = self.pending.lock();
+        let mut status = self.status.lock();
         loop {
-            let p = pending.get(seq.bank).ok_or("invalid sequence bank")?;
+            let p = status.pending.get(seq.bank).ok_or("invalid sequence bank")?;
             if seq.value == 0 || p.value != seq.value { return Err("unknown/stale sequence".into()); }
             if let Some(result) = &p.result { return result.clone(); }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() { return Err(format!("trunk host wait timed out: {seq:?}")); }
-            self.changed.wait_for(&mut pending, left);
+            self.changed.wait_for(&mut status, left);
         }
+    }
+    // First terminal result wins: shutdown cannot be overwritten by a late
+    // successful timeline observation. Record failure BEFORE releasing the GPU.
+    fn finish(&self, seq: Seq, result: Result<Completion, String>) {
+        let mut status = self.status.lock();
+        let Some(p) = status.pending.get(seq.bank) else { return; };
+        if p.value != seq.value || p.result.is_some() { return; }
+        if let Err(e) = &result {
+            if status.failure.is_none() { status.failure = Some(format!("trunk {seq:?}: {e}")); }
+        }
+        status.pending[seq.bank].result = Some(result);
+        self.publish(seq);
+        self.changed.notify_all();
+    }
+    fn publish(&self, seq: Seq) {
+        // No generation wrap or skipped reuse: both success and failure are
+        // terminal for this generation. The registered coherent line is alive
+        // until the relay has joined and all queued GPU consumers have retired.
+        let done = self.signals[seq.bank] as *mut AtomicU32;
+        unsafe { (*done).store(seq.value, Ordering::Release); super::clflush(done.cast(), 64); }
+    }
+    fn stop(&self, reason: &str) {
+        let mut status = self.status.lock();
+        status.stopping = true;
+        for bank in 0..status.pending.len() {
+            let p = &mut status.pending[bank];
+            if p.value == 0 || p.result.is_some() { continue; }
+            let seq = Seq { bank, value: p.value };
+            p.result = Some(Err(reason.into()));
+            if status.failure.is_none() { status.failure = Some(format!("trunk {seq:?}: {reason}")); }
+            self.publish(seq);
+        }
+        self.changed.notify_all();
+    }
+}
+struct Watchdog { deadline: Instant }
+impl Watchdog {
+    fn new(start: Instant, timeout: Duration) -> Self { Self { deadline: start + timeout } }
+    fn remaining(&self, now: Instant) -> Result<Duration, String> {
+        let remaining = self.deadline.saturating_duration_since(now);
+        if remaining.is_zero() { Err("NPU chain watchdog timed out".into()) } else { Ok(remaining) }
     }
 }
 struct BankState { generation: u32, kicked: bool, retired: bool, prepared: bool }
 
-/// Async kick, bounded host relay, checked GPU rejoin. No rows/addresses/commands
-/// are patched per kick; padded A rows MUST contain zero codes and zero scales.
+/// Async kick and enqueue-ahead GPU rejoin, with terminal failure signalling.
+/// No rows/addresses/commands are patched per kick; padded A MUST be zeroed.
 pub struct NpuTrunkRuntime {
     hip: HipRuntime,
     api: RelayApi,
@@ -131,6 +186,13 @@ impl NpuTrunkRuntime {
     /// Uses the existing dlopen HIP backend, without a link-time ROCm dependency
     /// or a second GPU runtime crate. pci identifies the same GPU as producer.
     pub fn open(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str) -> Result<Self, String> {
+        Self::open_with_watchdog(programs, layers, banks, rows_max, pci, CHAIN_WATCHDOG)
+    }
+    /// Override the chain-only watchdog for a different measured chain envelope.
+    /// The transport gate uses a 1 ns budget to force the real timeout path;
+    /// there are no production environment flags or injected success/failure hooks.
+    pub fn open_with_watchdog(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str, watchdog: Duration) -> Result<Self, String> {
+        if watchdog.is_zero() || watchdog > WAIT_TIMEOUT { return Err("chain watchdog outside (0, WAIT_TIMEOUT]".into()); }
         let layout = ArenaLayout::new(rows_max)?;
         if banks == 0 { return Err("trunk needs at least one bank".into()); }
         let mut shapes = Vec::new();
@@ -162,13 +224,16 @@ impl NpuTrunkRuntime {
         }
         let pages = storage.iter().map(|b| BankPages { a: b.a.pages.ptr as usize, a_len: b.a.pages.len,
             c: [b.c[0].pages.ptr as usize, b.c[1].pages.ptr as usize],
-            c_len: [b.c[0].pages.len, b.c[1].pages.len], done: b.control.pages.ptr as usize }).collect();
-        let shared = Arc::new(Shared { pending: Mutex::new((0..banks).map(|_| Pending { value: 0, result: None }).collect()), changed: Condvar::new() });
+            c_len: [b.c[0].pages.len, b.c[1].pages.len] }).collect();
+        let shared = Arc::new(Shared {
+            status: Mutex::new(Status { pending: (0..banks).map(|_| Pending { value: 0, result: None }).collect(), failure: None, stopping: false }),
+            changed: Condvar::new(), signals: storage.iter().map(|b| b.control.pages.ptr as usize).collect(),
+        });
         let (tx, rx) = mpsc::sync_channel(banks);
         let (init_tx, init_rx) = mpsc::sync_channel(1);
         let relay_shared = Arc::clone(&shared);
         let relay = thread::Builder::new().name("npu-trunk-relay".into()).spawn(move || {
-            relay_main(programs, layers, pages, api, layout, rx, init_tx, relay_shared);
+            relay_main(programs, layers, pages, api, layout, rx, init_tx, relay_shared, watchdog);
         }).map_err(|e| format!("spawn trunk relay: {e}"))?;
         // Construct the teardown guard before receiving: all early returns join
         // the relay (contexts/BOs) before unregistering/unmapping caller pages.
@@ -193,6 +258,9 @@ impl NpuTrunkRuntime {
         Ok(self.banks.get(bank).ok_or("invalid trunk bank")?.control.registration.ptr())
     }
 
+    /// Nonblocking sticky error check. A terminal failure releases its GPU wait,
+    /// but never licenses using that pair's outputs or committing request state.
+    pub fn check_error(&self) -> Result<(), String> { self.shared.check_error() }
     /// Enqueue retirement before writing the next A. Must precede producer pack.
     /// # Safety
     /// `stream` is live, belongs to this GPU, and carries the following producer.
@@ -212,6 +280,7 @@ impl NpuTrunkRuntime {
     /// relay work. Caller must not touch A/C until completion/consumer retirement.
     /// `stream` must be live and on the selected GPU; null selects its default stream.
     pub unsafe fn kick(&self, layer: usize, shape: Shape, bank: usize, rows: usize, stream: *mut c_void) -> Result<Seq, String> {
+        self.check_error()?;
         if rows == 0 || rows > self.rows_max { return Err("rows outside admitted extent".into()); }
         if !self.layers.contains(&(layer, shape)) { return Err("unknown layer/shape".into()); }
         let b = self.banks.get(bank).ok_or("invalid trunk bank")?;
@@ -226,8 +295,9 @@ impl NpuTrunkRuntime {
         let seq = Seq { bank, value: state.generation + 1 };
         let start = Instant::now();
         {
-            let mut pending = self.shared.pending.lock();
-            pending[bank] = Pending { value: seq.value, result: None };
+            let mut status = self.shared.status.lock();
+            if status.stopping { return Err("trunk runtime stopping".into()); }
+            status.pending[bank] = Pending { value: seq.value, result: None };
         }
         // Mark ownership before any fallible enqueue. Even on HIP/relay failure,
         // GPU A writes may already be queued by the caller: teardown must not
@@ -242,7 +312,7 @@ impl NpuTrunkRuntime {
                 .map_err(|e| format!("trunk relay queue: {e}"))
         })();
         if let Err(e) = enqueue {
-            finish(&self.shared, seq, Err(e.clone()));
+            self.shared.finish(seq, Err(e.clone()));
             return Err(e);
         }
         Ok(seq)
@@ -250,30 +320,33 @@ impl NpuTrunkRuntime {
     pub fn wait_host(&self, seq: Seq) -> Result<Completion, String> {
         self.shared.wait(seq, WAIT_TIMEOUT)
     }
-    /// Error-gated rejoin: first bounded host completion, then stream GEQ wait
-    /// and a system-fenced event (cache writeback/invalidate) before GPU C loads.
-    /// Do not queue a raw done wait yourself: a failed NPU job never publishes success.
-    pub unsafe fn wait_gpu(&self, seq: Seq, stream: *mut c_void) -> Result<Completion, String> {
-        let completion = self.wait_host(seq)?;
+    /// Enqueue the terminal GEQ signal wait immediately, without waiting for
+    /// host completion, then a system-fenced event before GPU C loads. Failures
+    /// also release this wait; callers MUST check errors before using pair outputs.
+    pub unsafe fn wait_gpu(&self, seq: Seq, stream: *mut c_void) -> Result<(), String> {
+        self.shared.validate(seq)?;
         let bank = &self.banks[seq.bank];
         unsafe {
             self.api.wait_value(stream, self.done_word(seq.bank)?, seq.value)?;
             self.hip.record_raw(&bank.acquire, stream)?;
         }
-        Ok(completion)
+        Ok(())
     }
     /// Call after enqueuing the LAST C consumer. Required before bank reuse or
     /// teardown. The event bounds retirement without synchronizing unrelated streams.
     pub unsafe fn retire_bank(&self, seq: Seq, stream: *mut c_void) -> Result<(), String> {
-        self.wait_host(seq)?;
+        self.shared.validate(seq)?;
         unsafe { self.hip.record_raw(&self.banks[seq.bank].retired, stream)?; }
         self.state.borrow_mut()[seq.bank].retired = true;
-        Ok(())
+        self.check_error()
     }
     /// Checked teardown. If a GPU consumer does not retire within 3 s, keeps
     /// registrations/pages alive rather than unmapping memory still in use.
     pub fn close(mut self) -> Result<(), String> { self.shutdown() }
     fn shutdown(&mut self) -> Result<(), String> {
+        // Release every outstanding GPU wait BEFORE joining/destructing the
+        // NPU context. A late completion cannot replace the cancellation result.
+        self.shared.stop("runtime shutdown before NPU completion");
         self.tx.take();
         let mut failure = None;
         if let Some(relay) = self.relay.take() {
@@ -299,10 +372,17 @@ impl NpuTrunkRuntime {
             return Err(e);
         }
         self.banks.clear();
+        self.check_error()?;
         Ok(())
     }
 }
-impl Drop for NpuTrunkRuntime { fn drop(&mut self) { if let Err(e) = self.shutdown() { eprintln!("npu-trunk teardown: {e}"); } } }
+impl Drop for NpuTrunkRuntime {
+    fn drop(&mut self) {
+        // close() already joined and either freed or quarantined every bank.
+        if self.banks.is_empty() && self.relay.is_none() { return; }
+        if let Err(e) = self.shutdown() { eprintln!("npu-trunk teardown: {e}"); }
+    }
+}
 
 // The order is intentional and tested below: ctx, chains, commands, operands,
 // instruction/PDI BOs. The enclosing Device drops only after this owner.
@@ -321,13 +401,8 @@ fn prepared_panel(dev: &Device, insts: &Bo, a: &Bo, b: &Bo, c: &Bo, c_offset: us
     super::write_words(&command.cmd, &words);
     Ok(command)
 }
-fn finish(shared: &Shared, seq: Seq, result: Result<Completion, String>) {
-    let mut pending = shared.pending.lock();
-    pending[seq.bank].result = Some(result);
-    shared.changed.notify_all();
-}
 fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<BankPages>, api: RelayApi, layout: ArenaLayout,
-    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<[Binding; 3]>, String>>, shared: Arc<Shared>) {
+    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<[Binding; 3]>, String>>, shared: Arc<Shared>, watchdog: Duration) {
     let dev = match Device::open().and_then(|mut d| { d.map_heap(64 << 20)?; Ok(d) }) {
         Ok(d) => d, Err(e) => { let _ = init.send(Err(e)); return; }
     };
@@ -368,13 +443,20 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
     })();
     let (resources, bindings) = match setup { Ok(r) => r, Err(e) => { let _ = init.send(Err(e)); return; } };
     if init.send(Ok(bindings)).is_err() { return; }
+    // Declared after resources, so unwinding releases waits before context/BO
+    // destruction (which may itself wait for a device job to be cancelled).
+    struct RelayExit<'a>(&'a Shared);
+    impl Drop for RelayExit<'_> { fn drop(&mut self) { self.0.stop("trunk relay exited before completion"); } }
+    let _exit = RelayExit(&shared);
     let mut fatal: Option<String> = None;
     for job in rx {
         let result = (|| {
             if let Some(e) = &fatal { return Err(format!("trunk relay poisoned: {e}")); }
+            if shared.status.lock().stopping { return Err("runtime shutdown before NPU completion".into()); }
             let deadline = job.start + WAIT_TIMEOUT;
             loop {
                 if Instant::now() >= deadline { return Err("GPU A-ready event timed out".into()); }
+                if shared.status.lock().stopping { return Err("runtime shutdown before GPU A-ready".into()); }
                 if api.query(job.event)? { break; }
                 thread::sleep(Duration::from_micros(20));
             }
@@ -384,24 +466,23 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             let layer = layers.iter().position(|l| l.layer == job.layer && l.shape == job.shape).ok_or("unknown relay layer")?;
             let chain = &resources.chains[layer * pages.len() + job.seq.bank];
             let start = Instant::now();
+            let chain_watchdog = Watchdog::new(start, watchdog);
             let submit_ns = monotonic_ns();
             let point = resources.ctx.submit_chain(chain)?;
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() { return Err("NPU deadline exhausted after submit".into()); }
-            let state = resources.ctx.wait_chain(chain, point, left.as_millis().max(1) as u64)?;
+            let left = chain_watchdog.remaining(Instant::now())?;
+            let state = resources.ctx.wait_chain(chain, point, left.as_millis().max(1) as u64)
+                .map_err(|e| format!("NPU chain completion failed (watchdog {watchdog:?}): {e}"))?;
             let done_ns = monotonic_ns();
+            chain_watchdog.remaining(Instant::now())?;
             let npu_busy = start.elapsed();
             if state != ERT_STATE_COMPLETED { return Err(format!("NPU chain state {state}, error index {}", chain.error_index())); }
             // Transaction tail synchronizes every C channel before timeline done.
-            // Flush CPU aliases, publish success with release ordering, flush the
-            // control line so the GPU's uncached wait observes it.
+            // Flush CPU aliases before the terminal signal/system acquire event.
             resources.c[job.seq.bank * 2 + job.shape.index()].flush();
-            let done = pages[job.seq.bank].done as *mut AtomicU32;
-            unsafe { (*done).store(job.seq.value, Ordering::Release); super::clflush(done.cast(), 64); }
             Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns })
         })();
         if let Err(e) = &result { fatal = Some(e.clone()); }
-        finish(&shared, job.seq, result);
+        shared.finish(job.seq, result);
     }
     drop(resources); // destroys context before any operand BO, even on timeout
 }
@@ -437,16 +518,76 @@ mod tests {
             assert_eq!((words[0] >> 23) & 31, 19);
         }
     }
+    #[repr(align(64))]
+    struct Signal(AtomicU32);
+    fn shared(signals: &[Signal], value: u32) -> Shared {
+        Shared { status: Mutex::new(Status {
+            pending: signals.iter().map(|_| Pending { value, result: None }).collect(),
+            failure: None, stopping: false,
+        }), changed: Condvar::new(), signals: signals.iter().map(|s| &s.0 as *const AtomicU32 as usize).collect() }
+    }
+    fn completion() -> Completion {
+        Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO, submit_ns: 1, done_ns: 2 }
+    }
     #[test] fn invalid_timeout_and_failed_sequences_are_bounded() {
-        let pending = Shared { pending: Mutex::new(vec![Pending { value: 3, result: None }]), changed: Condvar::new() };
+        let signals = [Signal(AtomicU32::new(2))];
+        let pending = shared(&signals, 3);
         let seq = Seq { bank: 0, value: 3 };
         assert!(pending.wait(Seq { bank: 0, value: 999 }, Duration::ZERO).unwrap_err().contains("unknown"));
         assert!(pending.wait(Seq { bank: 1, value: 3 }, Duration::ZERO).is_err());
         assert!(pending.wait(seq, Duration::from_millis(1)).unwrap_err().contains("timed out"));
-        finish(&pending, seq, Err("NPU timeout".into()));
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 2);
+        pending.finish(seq, Err("NPU timeout".into()));
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 3);
         assert_eq!(pending.wait(seq, Duration::ZERO).unwrap_err(), "NPU timeout");
-        finish(&pending, seq, Ok(Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO, submit_ns: 0, done_ns: 0 }));
-        assert!(pending.wait(seq, Duration::ZERO).is_ok());
+        assert!(pending.check_error().unwrap_err().contains("NPU timeout"));
+        pending.finish(seq, Ok(completion()));
+        assert_eq!(pending.wait(seq, Duration::ZERO).unwrap_err(), "NPU timeout");
+    }
+    #[test] fn terminal_signals_are_monotonic_and_stale_completions_are_ignored() {
+        let signals = [Signal(AtomicU32::new(0))];
+        let pending = shared(&signals, 1);
+        let seq = Seq { bank: 0, value: 1 };
+        pending.validate(seq).unwrap(); // enqueue-ahead validation needs no completion
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 0);
+        pending.finish(seq, Ok(completion()));
+        assert_eq!(pending.wait(seq, Duration::ZERO).unwrap().done_ns, 2);
+        pending.status.lock().pending[0] = Pending { value: 2, result: None };
+        pending.finish(seq, Err("stale".into()));
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 1);
+        pending.check_error().unwrap();
+        pending.finish(Seq { bank: 0, value: 2 }, Ok(completion()));
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 2);
+        pending.stop("shutdown");
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 2);
+        pending.check_error().unwrap();
+    }
+    #[test] fn shutdown_releases_every_bank_and_late_success_cannot_clear_failure() {
+        let signals = [Signal(AtomicU32::new(6)), Signal(AtomicU32::new(6))];
+        let pending = shared(&signals, 7);
+        pending.stop("runtime dropped");
+        for (bank, signal) in signals.iter().enumerate() {
+            let seq = Seq { bank, value: 7 };
+            assert_eq!(signal.0.load(Ordering::Acquire), 7);
+            pending.finish(seq, Ok(completion()));
+            assert_eq!(pending.wait(seq, Duration::ZERO).unwrap_err(), "runtime dropped");
+        }
+        assert!(pending.status.lock().stopping);
+        assert!(pending.check_error().unwrap_err().contains("runtime dropped"));
+    }
+    #[test] fn watchdog_deadline_is_chain_only_and_timeout_releases_wait() {
+        let start = Instant::now();
+        let watchdog = Watchdog::new(start, CHAIN_WATCHDOG);
+        assert_eq!(CHAIN_WATCHDOG, EXPECTED_CHAIN_TIME * 5);
+        assert_eq!(watchdog.remaining(start).unwrap(), CHAIN_WATCHDOG);
+        assert_eq!(watchdog.remaining(start + CHAIN_WATCHDOG - Duration::from_nanos(1)).unwrap(), Duration::from_nanos(1));
+        let signals = [Signal(AtomicU32::new(0))];
+        let pending = shared(&signals, 1);
+        let error = watchdog.remaining(start + CHAIN_WATCHDOG).unwrap_err();
+        pending.finish(Seq { bank: 0, value: 1 }, Err(error));
+        assert_eq!(signals[0].0.load(Ordering::Acquire), 1);
+        assert!(pending.check_error().unwrap_err().contains("watchdog timed out"));
+        assert!(watchdog.remaining(start + WAIT_TIMEOUT).is_err());
     }
     #[test] fn owning_fields_teardown_in_declared_order() {
         use std::rc::Rc;
