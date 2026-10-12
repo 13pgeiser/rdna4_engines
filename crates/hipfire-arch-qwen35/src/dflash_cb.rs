@@ -60,7 +60,7 @@ use crate::speculative::{
     draft_dflash_block_rank, draft_dflash_blocks_batched, DeltaNetSnapshot, DflashCbDraft, DflashDraftLane,
     dflash_sampled_selector_draft_into, dflash_target_rows_into, DflashSampleCfg, DflashSampledDraft,
     DflashSampledDraftLane, draft_dflash_sampled_blocks_batched,
-    dflash_draft_batch_max_rows, FastTargetRows, VerifyScratch,
+    dflash_draft_batch_max_rows, dflash_sparse_target_enabled, FastTargetRows, TargetRowsScratch, VerifyScratch,
 };
 use hipfire_runtime::dflash::DflashScratch;
 use hip_bridge::{HipError, HipResult};
@@ -68,6 +68,10 @@ use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::spec::{request_rng_state, SpecRequestConfig};
 use rdna_compute::Gpu;
 use std::ops::Range;
+
+static CB_SAMPLED_TARGET_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_TARGET_BATCH").ok().as_deref() != Some("0")
+});
 
 static CB_SAMPLED_PACKED_HEAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_PACKED_HEAD").ok().as_deref() != Some("0")
@@ -378,6 +382,35 @@ fn cb_sampled_packed_head_admitted(
         })
 }
 
+/// Number of consecutive lanes at the head of `lanes` that can share ONE
+/// sampled target-rows pass: sampled lanes whose `DflashSampleCfg`
+/// (temperature, top_p, top_k, CACTUS delta, compared bitwise) is identical
+/// and for which the sparse representation is active
+/// ([`dflash_sparse_target_enabled`]; CACTUS and the sparse kill switch stay
+/// on the per-lane dense route). `1` (a singleton) never batches.
+fn cb_sampled_target_run_len(lanes: &[DflashCbVerifyLane<'_>]) -> usize {
+    let Some(first) = lanes.first() else {
+        return 0;
+    };
+    if first.state.sample_temp <= 1e-6 {
+        return 1;
+    }
+    let c0 = first.state.sample_cfg();
+    if !dflash_sparse_target_enabled(&c0) {
+        return 1;
+    }
+    let same = |c: &DflashSampleCfg| {
+        c.temp.to_bits() == c0.temp.to_bits()
+            && c.top_p.to_bits() == c0.top_p.to_bits()
+            && c.top_k == c0.top_k
+            && c.cactus_delta.to_bits() == c0.cactus_delta.to_bits()
+    };
+    lanes
+        .iter()
+        .take_while(|l| l.state.sample_temp > 1e-6 && same(&l.state.sample_cfg()))
+        .count()
+}
+
 /// Shared verify buffers of one DFlash CB engine: the trunk row scratch, ONE
 /// head scratch (`final_hidden`/`logits`/`rot`/`argmax`, `draft_rows` rows,
 /// `hidden_k = dim.next_power_of_two()` like a singleton lane's), and the
@@ -409,6 +442,10 @@ pub struct DflashCbScratch {
     /// batched forward (the rest ran the singleton call); evidence for the
     /// oracle that the batched path, not its fallback, produced the drafts.
     pub draft_stats: (usize, usize),
+    /// Persistent grow-on-demand device buffers and run-level host rows of the
+    /// batched sampled target path ([`dflash_cb_verify`]); freed in
+    /// [`Self::free_gpu`].
+    target_rows: TargetRowsScratch,
 }
 
 impl DflashCbScratch {
@@ -440,6 +477,7 @@ impl DflashCbScratch {
             keep_lane_rows: false,
             draft: None,
             draft_min_lanes: 2,
+            target_rows: TargetRowsScratch::default(),
             draft_stats: (0, 0),
         })
     }
@@ -527,7 +565,9 @@ impl DflashCbScratch {
             draft,
             draft_min_lanes: _,
             draft_stats: _,
+            target_rows,
         } = self;
+        target_rows.free_gpu(gpu);
         if let Some(d) = draft {
             d.free_gpu(gpu);
         }
@@ -987,7 +1027,30 @@ pub fn dflash_cb_verify(
         // head does); the scope is closed on every path.
         let heads = picks.and_then(|picks| {
             let mut row = 0usize;
-            for lane in lanes[range].iter_mut() {
+            let chunk = &mut lanes[range];
+            // Lanes `< batched_until` already hold their target rows from one
+            // batched run (always the lane the run started at or later).
+            let mut batched_until = 0usize;
+            for li in 0..chunk.len() {
+                if packed_sampled && li >= batched_until && *CB_SAMPLED_TARGET_BATCH {
+                    let n = cb_sampled_target_run_len(&chunk[li..]);
+                    if n >= 2 {
+                        let end = li + n;
+                        let run_rows: usize = chunk[li..end].iter().map(|l| l.draft.verify_tokens.len()).sum();
+                        let cfg = chunk[li].state.sample_cfg();
+                        let logits = cb.head.logits.sub_offset(row * vocab, run_rows * vocab);
+                        cb.target_rows.run_sparse(gpu, &logits, run_rows, vocab, cfg)?;
+                        let mut r0 = 0usize;
+                        for l in chunk[li..end].iter_mut() {
+                            let b = l.draft.verify_tokens.len();
+                            cb.target_rows.split_lane_into(r0, b, vocab, &mut l.state.sampled_target)?;
+                            r0 += b;
+                        }
+                        batched_until = end;
+                    }
+                }
+                let in_run = li < batched_until;
+                let lane = &mut chunk[li];
                 let b = lane.draft.verify_tokens.len();
                 let st = &mut *lane.state;
                 st.picks.clear();
@@ -997,10 +1060,12 @@ pub fn dflash_cb_verify(
                     gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &cb.head.final_hidden.buf, row * dim * 4, b * dim * 4)?;
                     if packed_sampled {
                         st.picks.extend_from_slice(&picks.as_ref().expect("packed sampled head")[row..row + b]);
-                        let logits = cb.head.logits.sub_offset(row * vocab, b * vocab);
-                        // Keep normalization at the original lane point/order,
-                        // including SparseRows' request-owned representation.
-                        dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                        if !in_run {
+                            let logits = cb.head.logits.sub_offset(row * vocab, b * vocab);
+                            // Keep normalization at the original lane point/order,
+                            // including SparseRows' request-owned representation.
+                            dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                        }
                         if cb.keep_lane_rows {
                             gpu.memcpy_dtod_at_auto(&v.logits.buf, 0, &cb.head.logits.buf, row * vocab * 4, b * vocab * 4)?;
                             gpu.memcpy_dtod_at_auto(&v.argmax.buf, 0, &cb.head.argmax.buf, row * 4, b * 4)?;

@@ -4115,6 +4115,145 @@ fn download_tensor_bytes(gpu: &Gpu, t: &GpuTensor, dst: &mut [u8]) -> HipResult<
     gpu.hip.memcpy_dtoh(dst, &t.buf)
 }
 
+/// Device buffers of one target-rows pass over `rows` verify rows:
+/// `[probs (rows*vocab), tau (rows), z (rows)]`, plus
+/// `[counts (rows), idx (rows*cap), val (rows*cap)]` in sparse mode (six
+/// tensors). Each may be larger than the pass needs (a persistent scratch).
+fn alloc_target_bufs(
+    gpu: &mut Gpu,
+    rows: usize,
+    vocab: usize,
+    sparse: bool,
+) -> HipResult<Vec<GpuTensor>> {
+    let cap = DFLASH_SPARSE_CAP;
+    let mut shapes: Vec<usize> = vec![rows * vocab, rows, rows];
+    if sparse {
+        shapes.extend_from_slice(&[rows, rows * cap, rows * cap]);
+    }
+    let mut bufs: Vec<GpuTensor> = Vec::with_capacity(shapes.len());
+    for n in shapes {
+        match gpu.alloc_tensor(&[n], rdna_compute::DType::F32) {
+            Ok(t) => bufs.push(t),
+            Err(e) => {
+                free_target_bufs(gpu, &mut bufs);
+                return Err(e);
+            }
+        }
+    }
+    Ok(bufs)
+}
+
+fn free_target_bufs(gpu: &mut Gpu, bufs: &mut Vec<GpuTensor>) {
+    for t in bufs.drain(..) {
+        let _ = gpu.free_tensor(t);
+    }
+}
+
+/// Persistent, grow-on-demand device buffers plus the run-level host rows of
+/// the batched sampled target path (`dflash_cb_verify`). Grown only when a
+/// run needs more rows than any before (or the vocab changes); a steady-state
+/// step allocates and frees no device memory.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct TargetRowsScratch {
+    rows_cap: usize,
+    vocab: usize,
+    bufs: Vec<GpuTensor>,
+    host: FastTargetRows,
+}
+
+impl TargetRowsScratch {
+    /// Make the sparse-mode buffers hold at least `rows` rows of `vocab`.
+    fn ensure_sparse(&mut self, gpu: &mut Gpu, rows: usize, vocab: usize) -> HipResult<()> {
+        if self.bufs.len() == 6 && self.vocab == vocab && self.rows_cap >= rows {
+            return Ok(());
+        }
+        free_target_bufs(gpu, &mut self.bufs);
+        self.rows_cap = 0;
+        self.bufs = alloc_target_bufs(gpu, rows, vocab, true)?;
+        self.rows_cap = rows;
+        self.vocab = vocab;
+        Ok(())
+    }
+
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        free_target_bufs(gpu, &mut self.bufs);
+    }
+
+    /// Sparse target rows of `run_rows` consecutive verify rows of `logits`
+    /// (`[run_rows * vocab]`): ONE softmax, ONE compaction and one download of
+    /// tau/z/counts/idx/val (dense rows only for identity/overflow rows) into
+    /// the run-level host rows. Each lane's rows are then taken with
+    /// [`Self::split_lane_into`], exactly as the per-lane
+    /// [`dflash_target_rows_into`] would have left them. Every row is computed
+    /// by its own block with row-local state, so each lane's rows are
+    /// bit-identical to a per-lane call. Requires
+    /// `dflash_sparse_target_enabled(&cfg)`.
+    pub fn run_sparse(
+        &mut self,
+        gpu: &mut Gpu,
+        logits: &GpuTensor,
+        run_rows: usize,
+        vocab: usize,
+        cfg: DflashSampleCfg,
+    ) -> HipResult<()> {
+        if !dflash_sparse_target_enabled(&cfg) || run_rows == 0 {
+            return Err(HipError::new(0, "sparse target run: not a sparse run"));
+        }
+        self.ensure_sparse(gpu, run_rows, vocab)?;
+        dflash_target_rows_core(gpu, logits, &self.bufs, run_rows, vocab, cfg, &mut self.host)
+    }
+
+    /// Lane-owned copy of rows `r0..r0 + b` of the last [`Self::run_sparse`].
+    pub fn split_lane_into(&self, r0: usize, b: usize, vocab: usize, out: &mut FastTargetRows) -> HipResult<()> {
+        self.host.split_lane_into(r0, b, vocab, out)
+    }
+}
+
+impl FastTargetRows {
+    /// Sparse mode: the `b` rows `r0..r0 + b` of this run as a lane-owned
+    /// `FastTargetRows`, identical to what the per-lane download of those
+    /// rows produces (including its validation and dense-row slots).
+    fn split_lane_into(&self, r0: usize, b: usize, vocab: usize, out: &mut FastTargetRows) -> HipResult<()> {
+        let cap = self.capacity;
+        if cap == 0 || r0 + b > self.tau.len() || self.dense_slot.len() != self.tau.len() {
+            return Err(HipError::new(0, "sparse target run: inconsistent run rows"));
+        }
+        out.capacity = cap;
+        out.probs.clear();
+        out.tau.clear();
+        out.tau.extend_from_slice(&self.tau[r0..r0 + b]);
+        out.z.clear();
+        out.z.extend_from_slice(&self.z[r0..r0 + b]);
+        out.counts.clear();
+        out.counts.extend_from_slice(&self.counts[r0..r0 + b]);
+        out.idx.clear();
+        out.idx.extend_from_slice(&self.idx[r0 * cap..(r0 + b) * cap]);
+        out.val.clear();
+        out.val.extend_from_slice(&self.val[r0 * cap..(r0 + b) * cap]);
+        let n_dense = out.plan_dense_rows(vocab)?;
+        out.dense_rows.clear();
+        if n_dense == 0 {
+            return Ok(());
+        }
+        out.dense_rows.resize(n_dense * vocab, 0.0);
+        for i in 0..b {
+            let slot = out.dense_slot[i];
+            if slot == SPARSE_NONE {
+                continue;
+            }
+            let src = self.dense_slot[r0 + i];
+            if src == SPARSE_NONE {
+                return Err(HipError::new(0, "sparse target run: dense row classification mismatch"));
+            }
+            let (s, src) = (slot as usize, src as usize);
+            out.dense_rows[s * vocab..(s + 1) * vocab]
+                .copy_from_slice(&self.dense_rows[src * vocab..(src + 1) * vocab]);
+        }
+        Ok(())
+    }
+}
+
 /// FAST_SAMPLE materialization lifted from singleton lines 6802–6826:
 /// normalize all verify rows, then download tau, Z and the probabilities.
 /// `logits` may be a lane-owned view but must contain exactly its rows.
@@ -4133,32 +4272,27 @@ pub fn dflash_target_rows_into(
     cfg: DflashSampleCfg,
     out: &mut FastTargetRows,
 ) -> HipResult<()> {
-    let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
-    let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-    let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-    let res = dflash_target_rows_run(
-        gpu, logits, &probs_gpu, &tau_gpu, &z_gpu, b, vocab, cfg,
-        dflash_sparse_target_enabled(&cfg), out,
-    );
-    let _ = gpu.free_tensor(tau_gpu);
-    let _ = gpu.free_tensor(z_gpu);
-    let _ = gpu.free_tensor(probs_gpu);
+    let mut bufs = alloc_target_bufs(gpu, b, vocab, dflash_sparse_target_enabled(&cfg))?;
+    let res = dflash_target_rows_core(gpu, logits, &bufs, b, vocab, cfg, out);
+    free_target_bufs(gpu, &mut bufs);
     res
 }
 
+/// Rows-generic core of the target rows: `bufs` is
+/// [`alloc_target_bufs`]' layout (six tensors = sparse mode), each at least
+/// `b` rows. Writes `out` for the `b` rows of `logits`.
 #[allow(clippy::too_many_arguments)]
-fn dflash_target_rows_run(
+fn dflash_target_rows_core(
     gpu: &mut Gpu,
     logits: &GpuTensor,
-    probs_gpu: &GpuTensor,
-    tau_gpu: &GpuTensor,
-    z_gpu: &GpuTensor,
+    bufs: &[GpuTensor],
     b: usize,
     vocab: usize,
     cfg: DflashSampleCfg,
-    sparse: bool,
     out: &mut FastTargetRows,
 ) -> HipResult<()> {
+    let sparse = bufs.len() == 6;
+    let (probs_gpu, tau_gpu, z_gpu) = (&bufs[0], &bufs[1], &bufs[2]);
     gpu.softmax_temp_topp_batched_into_f32(
         logits,
         probs_gpu,
@@ -4171,8 +4305,9 @@ fn dflash_target_rows_run(
         cfg.top_k,
         0.0,
     )?;
-    gpu.download_f32_into(tau_gpu, &mut out.tau)?;
-    gpu.download_f32_into(z_gpu, &mut out.z)?;
+    // Exact-row views: a persistent scratch may be larger than this pass.
+    gpu.download_f32_into(&tau_gpu.sub_offset(0, b), &mut out.tau)?;
+    gpu.download_f32_into(&z_gpu.sub_offset(0, b), &mut out.z)?;
     if !sparse {
         out.capacity = 0;
         out.counts.clear();
@@ -4180,47 +4315,10 @@ fn dflash_target_rows_run(
         out.val.clear();
         out.dense_slot.clear();
         out.dense_rows.clear();
-        return gpu.download_f32_into(probs_gpu, &mut out.probs);
+        return gpu.download_f32_into(&probs_gpu.sub_offset(0, b * vocab), &mut out.probs);
     }
     let cap = DFLASH_SPARSE_CAP;
-    let counts_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
-    let idx_gpu = match gpu.alloc_tensor(&[b * cap], rdna_compute::DType::F32) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = gpu.free_tensor(counts_gpu);
-            return Err(e);
-        }
-    };
-    let val_gpu = match gpu.alloc_tensor(&[b * cap], rdna_compute::DType::F32) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = gpu.free_tensor(counts_gpu);
-            let _ = gpu.free_tensor(idx_gpu);
-            return Err(e);
-        }
-    };
-    let res = dflash_target_rows_sparse(
-        gpu, probs_gpu, tau_gpu, &counts_gpu, &idx_gpu, &val_gpu, b, vocab, cap, out,
-    );
-    let _ = gpu.free_tensor(counts_gpu);
-    let _ = gpu.free_tensor(idx_gpu);
-    let _ = gpu.free_tensor(val_gpu);
-    res
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dflash_target_rows_sparse(
-    gpu: &mut Gpu,
-    probs_gpu: &GpuTensor,
-    tau_gpu: &GpuTensor,
-    counts_gpu: &GpuTensor,
-    idx_gpu: &GpuTensor,
-    val_gpu: &GpuTensor,
-    b: usize,
-    vocab: usize,
-    cap: usize,
-    out: &mut FastTargetRows,
-) -> HipResult<()> {
+    let (counts_gpu, idx_gpu, val_gpu) = (&bufs[3], &bufs[4], &bufs[5]);
     gpu.sampled_rows_compact_into_f32(
         probs_gpu, tau_gpu, counts_gpu, idx_gpu, val_gpu, vocab, b, cap,
     )?;
@@ -4231,7 +4329,8 @@ fn dflash_target_rows_sparse(
     out.idx.resize(b * cap, 0);
     out.val.clear();
     out.val.resize(b * cap, 0.0);
-    // counts/idx are i32 buffers behind F32-typed tensors: raw byte copies.
+    // counts/idx are i32 buffers behind F32-typed tensors: raw byte copies
+    // (the copy length is the host slice, a prefix of the device buffer).
     download_tensor_bytes(gpu, counts_gpu, u32_bytes_mut(&mut out.counts))?;
     download_tensor_bytes(gpu, idx_gpu, u32_bytes_mut(&mut out.idx))?;
     download_tensor_bytes(gpu, val_gpu, f32_bytes_mut(&mut out.val))?;
