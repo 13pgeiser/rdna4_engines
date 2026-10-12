@@ -34,8 +34,8 @@
 //! * [`dflash_cb_head_argmax`] — the singleton DFlash verify head
 //!   (`dflash_enqueue_verify_lm_head_argmax` + one packed i32 D2H) over the
 //!   first `rows` rows of a shared [`VerifyScratch`], for greedy picks only.
-//!   Sampled lanes instead run a private Product head at their singleton b:
-//!   Product dispatch is not row-count-independent above 63 aggregate rows.
+//!   Admitted sampled CB chunks share the explicit exact F16 head; otherwise
+//!   each sampled lane retains its private singleton-b Product dispatch.
 //! * [`dflash_cb_verify`] — whole lanes packed into trunk chunks of at most
 //!   the effective cap (`<= 63` rows; up to 128 with
 //!   `HIPFIRE_CB_VERIFY_CHUNK128` on an admitted dense MQ4G256V2 gfx1201
@@ -67,6 +67,10 @@ use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::spec::{request_rng_state, SpecRequestConfig};
 use rdna_compute::Gpu;
 use std::ops::Range;
+
+static CB_SAMPLED_PACKED_HEAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_PACKED_HEAD").ok().as_deref() != Some("0")
+});
 
 /// The singleton's verify block for remaining output budget `max_emit`
 /// (`E > 0`): `B = min(block_size, max(E, 2))`. Even `E = 1` verifies two rows
@@ -307,8 +311,8 @@ pub fn dflash_lane_draft(
 /// rows the product head is the singleton's own, except inside the PM FP8
 /// verify scope ([`verify_dense_math`]) where every row count takes the
 /// `*VerifyExact` head (FP8-routed). Call it inside the same scope as the
-/// trunk forward it follows. Sampled callers do not consume these aggregate
-/// logits: their private head runs at exactly the singleton's own window size.
+/// trunk forward it follows. Admitted sampled packing instead explicitly
+/// requests SingletonWmma at every row count, never aggregate Product.
 pub fn dflash_cb_head_argmax(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -331,6 +335,38 @@ pub fn dflash_cb_head_argmax(
         math,
     )?;
     dflash_download_verify_argmax(gpu, vs, rows)
+}
+
+/// Packing sampled logits is legal only on the singleton's normal F16
+/// residual chain. Refusal leaves its original Product-b route untouched.
+fn cb_sampled_packed_head_admitted(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    lanes: &[DflashCbVerifyLane<'_>],
+    rows: usize,
+) -> bool {
+    let head = &weights.output;
+    *CB_SAMPLED_PACKED_HEAD
+        && lanes.len() > 1
+        && lanes.iter().any(|l| l.state.sample_temp > 1e-6)
+        && gpu.mq4_verify_singleton_chain()
+        && head.gpu_dtype == rdna_compute::DType::MQ4G256V2
+        && head.k > 0
+        && head.k % 256 == 0
+        && head.k == config.dim
+        && head.m == config.vocab_size
+        && head.m > 0
+        && (1..=128).contains(&rows)
+        && !gpu.fp8_verify_scope
+        && !gpu.iu4_verify_scope
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_recording()
+        && !gpu.replay.is_g0_observing()
+        && lanes.iter().all(|l| {
+            let b = l.draft.verify_tokens.len();
+            (2..=16).contains(&b) && !gpu.a8_prefill_active(b, head.k)
+        })
 }
 
 /// Shared verify buffers of one DFlash CB engine: the trunk row scratch, ONE
@@ -642,8 +678,9 @@ pub struct DflashCbVerifyLane<'a> {
 /// `[48,16]`, C8 `[48,48,32]` at 63 rows; C8 `[128]` with the wide route on a
 /// dense MQ4G256V2 gfx1201 target) with each lane's own ChainVerify fusion,
 /// hidden ring and tape (offset 0). Greedy lanes share one head/argmax/D2H;
-/// sampled lanes use their own singleton-b Product head and materialize all b
-/// normalized target rows before scratch reuse. Outcomes remain lane-owned.
+/// admitted sampled chunks share the exact F16 head, otherwise each sampled
+/// lane retains its singleton-b Product head. Target rows remain lane-owned
+/// and are materialized in original lane order before scratch reuse.
 ///
 /// Everything refusable is checked before the first snapshot is saved (or
 /// owner exchanged) or row launched (capture/recording, block sizes,
@@ -765,10 +802,19 @@ pub fn dflash_cb_verify(
             gpu.iu4_verify_exit(iu4);
             r
         };
-        // Greedy retains the packed head. Sampled acceptance reads every float:
-        // each sampled head must use Product with its singleton's own b.
+        // The admitted exact F16 family preserves every singleton Product-b
+        // logit; all other sampled routes retain their original private head.
+        let packed_sampled = rows <= cb.head.max_n
+            && rows * weights.output.k <= cb.head.max_n * cb.head.hidden_k
+            && cb_sampled_packed_head_admitted(gpu, weights, config, &lanes[range.clone()], rows);
         let any_greedy = lanes[range.clone()].iter().any(|l| l.state.sample_temp <= 1e-6);
         let picks = match fwd {
+            Ok(()) if packed_sampled => {
+                let hidden = cb.head.final_hidden.sub_offset(0, rows * dim);
+                dflash_enqueue_verify_lm_head_argmax(
+                    gpu, &weights.output, &hidden, &cb.head, rows, vocab, DenseBatchMath::SingletonWmma,
+                ).and_then(|()| dflash_download_verify_argmax(gpu, &cb.head, rows)).map(Some)
+            }
             Ok(()) if any_greedy => dflash_cb_head_argmax(gpu, weights, config, &cb.head, rows).map(Some),
             Ok(()) => Ok(None),
             Err(e) => Err(e),
@@ -785,15 +831,26 @@ pub fn dflash_cb_verify(
                     let cfg = st.sample_cfg();
                     let v = &st.df.verify_scratch;
                     gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &cb.head.final_hidden.buf, row * dim * 4, b * dim * 4)?;
-                    let hidden = v.final_hidden.sub_offset(0, b * dim);
-                    dflash_enqueue_verify_lm_head_argmax(
-                        gpu, &weights.output, &hidden, v, b, vocab, DenseBatchMath::Product,
-                    )?;
-                    st.picks = dflash_download_verify_argmax(gpu, v, b)?;
-                    let logits = v.logits.sub_offset(0, b * vocab);
-                    // Materialize all b rows now, before another chunk overwrites
-                    // shared hidden scratch (and before next draft reuses v.logits).
-                    dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                    if packed_sampled {
+                        st.picks.extend_from_slice(&picks.as_ref().expect("packed sampled head")[row..row + b]);
+                        let logits = cb.head.logits.sub_offset(row * vocab, b * vocab);
+                        // Keep normalization at the original lane point/order,
+                        // including SparseRows' request-owned representation.
+                        dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                        if cb.keep_lane_rows {
+                            gpu.memcpy_dtod_at_auto(&v.logits.buf, 0, &cb.head.logits.buf, row * vocab * 4, b * vocab * 4)?;
+                            gpu.memcpy_dtod_at_auto(&v.argmax.buf, 0, &cb.head.argmax.buf, row * 4, b * 4)?;
+                        }
+                    } else {
+                        let hidden = v.final_hidden.sub_offset(0, b * dim);
+                        dflash_enqueue_verify_lm_head_argmax(
+                            gpu, &weights.output, &hidden, v, b, vocab, DenseBatchMath::Product,
+                        )?;
+                        st.picks = dflash_download_verify_argmax(gpu, v, b)?;
+                        let logits = v.logits.sub_offset(0, b * vocab);
+                        // Materialize before shared scratch or v.logits reuse.
+                        dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                    }
                 } else {
                     st.picks.extend_from_slice(&picks.as_ref().expect("greedy head")[row..row + b]);
                     if cb.keep_lane_rows {
