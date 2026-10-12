@@ -1248,6 +1248,7 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-qwen35/src/qwen35/forward.rs", function: "forward_scratch", occurrences: 2, decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"] },
     Site { file: "hipfire-arch-qwen35/src/qwen35/forward.rs", function: "forward_scratch_dense_tp", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
     Site { file: "hipfire-arch-qwen35/src/qwen35/forward.rs", function: "kv_cache_attention_dispatch", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
+    Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "batch_chunk_fa_attend_ragged_fp8q", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
     Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "execute_fa_attend_step", occurrences: 2, decisions: &["kv-tier-capture-forces-flash"] },
     Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "fa_pair_merge_admitted", occurrences: 4, decisions: &["gfx1151-fa-pair-merge"] },
     Site { file: "hipfire-arch-qwen35/src/qwen35/prefill.rs", function: "forward_batch_chunk_impl", occurrences: 5, decisions: &["q8-multirow-verify-attention", "captured-batch-attention-physical-cap", "captured-verify-attention-physical-cap", "gdn-chunk-scan"] },
