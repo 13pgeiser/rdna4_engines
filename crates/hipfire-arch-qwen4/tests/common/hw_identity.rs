@@ -183,11 +183,11 @@ pub fn compiled_sources() -> &'static Value {
 
 /// Candidate resident-sampling levers: `(name suffix after the lever prefix,
 /// default when the binary declares it)`. These are the DECLARED candidate
-/// defaults (default-on, only an exact `0` disables, i.e. the resolver
-/// `hipfire_config::developer_var(NAME).as_deref() != Ok("0")`). That is a
+/// defaults (opt-in, only an exact `1` enables, i.e. the resolver
+/// `hipfire_config::developer_var(NAME).as_deref() == Ok("1")`). That is a
 /// contract this table assumes, not something read from a binary that lacks the
 /// flag: see [`lever_state`].
-const CANDIDATE_LEVERS: [(&str, bool); 2] = [("DEVICE_ACCEPT", true), ("SAMPLED_PICKS", true)];
+const CANDIDATE_LEVERS: [(&str, bool); 2] = [("DEVICE_ACCEPT", false), ("SAMPLED_PICKS", false)];
 
 /// Whether any embedded production source mentions `name` in a string literal.
 fn declared_in_compiled_source(name: &str) -> bool {
@@ -205,8 +205,8 @@ fn declared_in_compiled_source(name: &str) -> bool {
 /// - `declared_in_compiled_source: false` -> `status: "unsupported-baseline"`
 ///   and `effective: null`. The binary has no such switch; nothing is claimed
 ///   on or off, and a set env value is recorded but inert.
-/// - declared -> `effective: true/false` by the default-on rule (only an
-///   exact `0` disables; unset or any other value leaves it on) and
+/// - declared -> `effective: true/false` by the opt-in rule (only an exact
+///   `1` enables; unset or any other value leaves it off) and
 ///   `status: "on"` / `"off"`.
 ///
 /// Any other env variable under the lever prefix is listed under
@@ -249,7 +249,7 @@ pub fn lever_state(env: &BTreeMap<String, String>) -> Value {
         })
         .collect();
     json!({
-        "assumed_resolver": "developer_var(NAME) != Ok(\"0\") (default-on; only exact 0 disables)",
+        "assumed_resolver": "developer_var(NAME) == Ok(\"1\") (opt-in; only exact 1 enables)",
         "levers": levers,
         "unlisted_env": unlisted,
     })
@@ -524,19 +524,19 @@ mod lever_state_tests {
 
     /// A binary that does not declare a lever reports it unsupported and
     /// claims neither on nor off, whatever the env says; a binary that does
-    /// declare it resolves default-on with only an exact `0` disabling.
+    /// declare it resolves opt-in with only an exact `1` enabling.
     #[test]
-    fn lever_state_is_unsupported_unless_declared_and_default_on_when_declared() {
+    fn lever_state_is_unsupported_unless_declared_and_opt_in_when_declared() {
         let prefix = lever_prefix();
         for (suffix, default_on) in CANDIDATE_LEVERS {
-            assert!(default_on, "{suffix}: the candidate default is on");
+            assert!(!default_on, "{suffix}: the candidate default is off (opt-in)");
             let name = format!("{prefix}{suffix}");
             let declared = declared_in_compiled_source(&name);
             for (value, expect_on) in [
-                (None, true),
+                (None, false),
                 (Some("0"), false),
                 (Some("1"), true),
-                (Some("off"), true),
+                (Some("off"), false),
             ] {
                 let env = match value {
                     Some(value) => env_with(&[(name.as_str(), value)]),

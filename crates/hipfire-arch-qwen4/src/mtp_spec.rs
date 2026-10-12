@@ -1218,7 +1218,7 @@ struct SampledVerify {
     /// The current window took a device row build or device accept; read by
     /// the `accept_route` trace field. Reset by [`Self::begin_window`].
     route_device: bool,
-    /// `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS` is not `0`: a device-route window
+    /// `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS` is `1`: a device-route window
     /// downloads no argmax picks unless trace or phase timers need them
     /// ([`Self::device_skip_picks`]).
     sampled_picks: bool,
@@ -1482,17 +1482,19 @@ impl SampledVerify {
 
 /// `HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT`: sampled Leviathan windows build their
 /// target rows on the device from the verify's resident logits and run the
-/// ordered acceptance there (default on; `0` keeps the host rows and host
-/// accept). Read once per request by [`SampledVerify::new`].
+/// ordered acceptance there (opt-in: only an exact `1` enables; unset or any
+/// other value keeps the host rows and host accept). Read once per request
+/// by [`SampledVerify::new`].
 pub(crate) fn mtp_device_accept_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT").as_deref() != Ok("0")
+    hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT").as_deref() == Ok("1")
 }
 
 /// `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS`: a device-route sampled window skips the
-/// unused greedy argmax pick download (default on; `0` keeps it). Read once
-/// per request by [`SampledVerify::new`].
+/// unused greedy argmax pick download (opt-in: only an exact `1` enables;
+/// otherwise the picks download). Read once per request by
+/// [`SampledVerify::new`].
 fn mtp_sampled_picks_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_SAMPLED_PICKS").as_deref() != Ok("0")
+    hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_SAMPLED_PICKS").as_deref() == Ok("1")
 }
 
 /// Exact supported architecture with the resident device sampler available.
@@ -1634,7 +1636,7 @@ fn device_accept_result(drafts: &[u32], verdict: &DeviceVerdict) -> GreedyAccept
 
 /// `accept_route` field of the window traces: `device_parallel` when the
 /// window built target rows or accepted on the device, else `host` (greedy,
-/// naive, ineligible, unsupported and `HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT=0`).
+/// naive, ineligible, unsupported and `HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT` not `1`).
 fn accept_route_label(sampled: Option<&SampledVerify>) -> &'static str {
     if sampled.is_some_and(|s| s.route_device) {
         "device_parallel"
