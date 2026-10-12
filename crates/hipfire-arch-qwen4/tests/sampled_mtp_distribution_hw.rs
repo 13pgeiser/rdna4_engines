@@ -826,6 +826,11 @@ impl Loaded {
     /// `text` as one user message, thinking off, rendered as `hipfire serve`
     /// renders it.
     fn render(&self, text: &str) -> Result<Vec<u32>, String> {
+        self.render_with(text, false)
+    }
+
+    /// [`render`](Self::render) with the thinking switch given.
+    fn render_with(&self, text: &str, thinking: bool) -> Result<Vec<u32>, String> {
         let user = Message {
             role: Role::User,
             content: text.to_string(),
@@ -841,7 +846,7 @@ impl Loaded {
             template: &self.template,
             system: None,
             user: text,
-            enable_thinking: false,
+            enable_thinking: thinking,
             bos_token: None,
             reasoning_strength: None,
             reasoning_effort: None,
@@ -3038,4 +3043,279 @@ mod coverage_logic {
             assert_eq!(find(arm, INCREMENTAL_ENV), Some(None), "{arm}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Thinking termination
+// ---------------------------------------------------------------------------
+//
+// A sampled-speculation change must not stop a long thinking turn from
+// closing. `sampled_mtp_thinking_terminates_like_ar_on_flash_next` renders a
+// fixed built-in math prompt with thinking ON (the same chat frame as
+// `render`, only `enable_thinking` differs), decodes it in plain AR (host
+// sampler) and in sampled adaptive MTP (Leviathan) on the same binary with the
+// same sampling, penalties and budget, over a fixed seed cohort
+// (`trial_seed(salt, 0..seeds)`), and requires `</think>` in the decoded
+// output of EVERY seed of BOTH arms. Nothing is selected after the fact: every
+// seed counts, and a seed that does not close fails the test. No law,
+// sampler or routing is changed; the arms are the production AR sampler and
+// the production adaptive sampled MTP path (floor on, no route knob).
+//
+// Decoded text of every seed is written to `think_ar.think.txt` and
+// `think_adaptive.think.txt`; per-seed IDs / close index to `*.think.json`;
+// the MTP arm's per-window route / accepted / retirement counters to
+// `think_adaptive.evidence.json`. Results carry the same config / identity /
+// receipt sidecars as the other arms and are reused only under an equal config.
+// `HIPFIRE_SAMPLED_MTP_THINK_TOKENS` (default 3500) and
+// `HIPFIRE_SAMPLED_MTP_THINK_SEEDS` (default 4) change the declared budget and
+// cohort for both arms together.
+
+const THINK_AR_ARM: &str = "think_ar";
+const THINK_ADAPTIVE_ARM: &str = "think_adaptive";
+const THINK_ARM_TEST: &str = "sampled_mtp_think_arm";
+const THINK_TOKENS_ENV: &str = "HIPFIRE_SAMPLED_MTP_THINK_TOKENS";
+const THINK_SEEDS_ENV: &str = "HIPFIRE_SAMPLED_MTP_THINK_SEEDS";
+/// Generated IDs per request, shared by both arms; must leave room in `MAX_SEQ`.
+const THINK_TOKENS_DEFAULT: usize = 3500;
+const THINK_SEEDS_DEFAULT: usize = 4;
+const THINK_AR_SALT: u64 = 0x7A1A_A200;
+const THINK_MTP_SALT: u64 = 0x7A1A_5EC0;
+const THINK_CLOSE: &str = "</think>";
+/// A fixed counting problem with a cheap-to-verify answer (the answer is 400)
+/// that invites a long deliberate check; sent as one user message.
+const THINK_PROMPT: &str = "How many positive integers less than 1000 are divisible by 3 or by 5 but not by 15? Work it out carefully, then verify the count with a second, independent method before giving the final answer.";
+
+fn think_dims() -> Result<(usize, usize), String> {
+    let tokens: usize = strict_env(THINK_TOKENS_ENV, THINK_TOKENS_DEFAULT)?;
+    let seeds: usize = strict_env(THINK_SEEDS_ENV, THINK_SEEDS_DEFAULT)?;
+    if tokens == 0 || tokens + 512 > MAX_SEQ || seeds == 0 {
+        return Err(format!(
+            "{THINK_TOKENS_ENV}={tokens} / {THINK_SEEDS_ENV}={seeds}: need 0 < tokens <= {} and seeds >= 1",
+            MAX_SEQ - 512
+        ));
+    }
+    Ok((tokens, seeds))
+}
+
+fn think_config(
+    arm: &str,
+    identity: &Value,
+    settings: &DistSettings,
+    tokens: usize,
+    seeds: usize,
+) -> Value {
+    let mut config = config_base(
+        "think-termination",
+        arm,
+        &settings.pen,
+        Fixture::Prose,
+        identity,
+    );
+    config["fixture"] = json!("think");
+    config["prompt_sha256"] = json!(hw_identity::sha256_hex(THINK_PROMPT.as_bytes()));
+    config["temp"] = json!(settings.temp);
+    config["top_p"] = json!(settings.top_p);
+    config["top_k"] = json!(settings.top_k);
+    config["min_p"] = json!(settings.min_p);
+    config["tokens"] = json!(tokens);
+    config["seeds"] = json!(seeds);
+    config["salt"] = json!(if arm == THINK_AR_ARM {
+        THINK_AR_SALT
+    } else {
+        THINK_MTP_SALT
+    });
+    config["sampled_mode"] = json!("leviathan");
+    config
+}
+
+/// One arm in a fresh process; spawned by the termination test below.
+#[test]
+#[ignore = "child process of sampled_mtp_thinking_terminates_like_ar_on_flash_next"]
+fn sampled_mtp_think_arm() {
+    let Ok(arm) = std::env::var(ARM_ENV) else {
+        return;
+    };
+    if let Err(error) = run_think_arm(&arm, &model_path(), &out_dir()) {
+        panic!("{arm} arm: {error}");
+    }
+}
+
+fn run_think_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    if !matches!(arm, THINK_AR_ARM | THINK_ADAPTIVE_ARM) {
+        return Err(format!("unknown thinking arm {arm}"));
+    }
+    require_arm_env(arm, "leviathan")?;
+    let settings = DistSettings::from_env()?;
+    let (tokens, seeds) = think_dims()?;
+    let identity = own_identity(model, dir, &CONTROL_ENV)?;
+    let config = think_config(arm, &identity, &settings, tokens, seeds);
+    let ids_path = dir.join(format!("{arm}.ids.json"));
+    if ids_path.exists() {
+        check_config(&ids_path, &config)?;
+        println!("ARM {arm} already complete under this config");
+        return Ok(());
+    }
+    let DistSettings {
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        pen,
+        ..
+    } = settings;
+    let env = own_env(&CONTROL_ENV);
+    let mut loaded = load(model)?;
+    let prompt = loaded.render_with(THINK_PROMPT, true)?;
+    if prompt.len() + tokens + MTP_K + 1 > MAX_SEQ {
+        return Err(format!(
+            "prompt {} + {tokens} IDs does not fit MAX_SEQ {MAX_SEQ}",
+            prompt.len()
+        ));
+    }
+    let close_id = {
+        let ids = loaded.tokenizer.encode(THINK_CLOSE);
+        (ids.len() == 1).then(|| ids[0])
+    };
+    println!(
+        "ARM {arm} arch={} prompt_tokens={} tokens={tokens} seeds={seeds} close_token={close_id:?} route_class={} state={}",
+        loaded.gpu.arch,
+        prompt.len(),
+        hw_identity::route_class(&env),
+        loaded.state
+    );
+    println!("ARM {arm} config {config}");
+    let budget = floor_probe_budget()?;
+    let mut evidence = Evidence::with_samples(seeds);
+    let mut all_ids: Vec<Vec<u32>> = Vec::with_capacity(seeds);
+    let mut records: Vec<Value> = Vec::with_capacity(seeds);
+    let mut texts = String::new();
+    let started = std::time::Instant::now();
+    let logits = if arm == THINK_AR_ARM {
+        Some(
+            loaded
+                .gpu
+                .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let mut drafter = if arm == THINK_ADAPTIVE_ARM {
+        Some(new_drafter(&mut loaded)?)
+    } else {
+        None
+    };
+    for n in 0..seeds {
+        let (ids, seed) = match (logits.as_ref(), drafter.as_mut()) {
+            (Some(logits), None) => {
+                let seed = trial_seed(THINK_AR_SALT, n);
+                let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
+                (loaded.ar_ids(logits, &prompt, &cfg, seed as u32, tokens)?, seed)
+            }
+            (None, Some(drafter)) => {
+                let seed = trial_seed(THINK_MTP_SALT, n);
+                let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
+                let run = loaded.mtp_request(drafter, &prompt, cfg, tokens)?;
+                evidence.observe(n, seed, &run, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+                (run.ids, seed)
+            }
+            _ => return Err("thinking arm state".into()),
+        };
+        let text = loaded.tokenizer.decode(&ids);
+        let close_at = close_id.and_then(|id| ids.iter().position(|&token| token == id));
+        let closed = close_at.is_some() || text.contains(THINK_CLOSE);
+        println!(
+            "ARM {arm} seed#{n}: {} ids, closed={closed} close_index={close_at:?}, {:.0}s",
+            ids.len(),
+            started.elapsed().as_secs_f64()
+        );
+        texts.push_str(&format!(
+            "=== seed#{n} ({seed}): {} ids, closed={closed} ===\n{text}\n\n",
+            ids.len()
+        ));
+        records.push(json!({
+            "seed_index": n,
+            "seed": seed,
+            "ids": ids.len(),
+            "closed": closed,
+            "close_index": close_at,
+        }));
+        all_ids.push(ids);
+    }
+    if let Some(logits) = logits {
+        loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
+    }
+    if let Some(drafter) = drafter {
+        Box::new(drafter).mtp_free(&mut loaded.gpu);
+        evidence.write(dir, arm, budget, LATE_MARGINALS[0])?;
+    }
+    write_json(
+        &dir.join(format!("{arm}.think.json")),
+        &json!({ "prompt_tokens": prompt.len(), "close_token": close_id, "seeds": records }),
+    )?;
+    let text_path = dir.join(format!("{arm}.think.txt"));
+    fs::write(&text_path, &texts).map_err(|e| format!("{}: {e}", text_path.display()))?;
+    fs::write(
+        &ids_path,
+        serde_json::to_vec(&all_ids).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &config)?;
+    write_receipt(&ids_path, &hw_identity::receipt(&loaded.gpu, model))?;
+    loaded
+        .bundle
+        .free_gpu(&mut loaded.gpu)
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+#[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4)"]
+fn sampled_mtp_thinking_terminates_like_ar_on_flash_next() {
+    let model = model_path();
+    let dir = out_dir();
+    let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let (tokens, seeds) = think_dims().unwrap_or_else(|e| panic!("{e}"));
+    let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
+    let mut closed = [0usize; 2];
+    let mut report = format!(
+        "thinking termination: {seeds} seeds, {tokens} IDs, prompt sha256 {}\n",
+        hw_identity::sha256_hex(THINK_PROMPT.as_bytes())
+    );
+    for (slot, arm) in [THINK_AR_ARM, THINK_ADAPTIVE_ARM].into_iter().enumerate() {
+        let identity = arm_identity(arm, "leviathan", &model_id, &CONTROL_ENV);
+        let expected = think_config(arm, &identity, &settings, tokens, seeds);
+        let ids_path = dir.join(format!("{arm}.ids.json"));
+        if ids_path.exists() {
+            eprintln!("reusing {}", ids_path.display());
+        } else {
+            spawn_arm(THINK_ARM_TEST, arm, "leviathan", &model, &dir, None, arm)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
+        let think =
+            read_json(&dir.join(format!("{arm}.think.json"))).unwrap_or_else(|e| panic!("{e}"));
+        for record in think["seeds"].as_array().into_iter().flatten() {
+            closed[slot] += usize::from(record["closed"].as_bool().unwrap_or(false));
+            report.push_str(&format!("{arm}: {record}\n"));
+        }
+    }
+    report.push_str(&format!(
+        "closed {THINK_CLOSE}: ar {}/{seeds}, sampled adaptive MTP {}/{seeds}\n",
+        closed[0], closed[1]
+    ));
+    eprint!("{report}");
+    fs::write(dir.join("think-report.txt"), &report).unwrap();
+    // Decoded text of every seed: think_ar.think.txt, think_adaptive.think.txt.
+    assert!(
+        closed[0] == seeds,
+        "plain AR closed {THINK_CLOSE} in only {}/{seeds} seeds within {tokens} IDs (decoded text in {}/think_ar.think.txt): the shared budget is too small for this prompt, so the comparison is void; raise {THINK_TOKENS_ENV}",
+        closed[0],
+        dir.display()
+    );
+    assert!(
+        closed[1] == seeds,
+        "THINKING TERMINATION FAILURE: plain AR closed {THINK_CLOSE} in {seeds}/{seeds} seeds but sampled adaptive MTP in {}/{seeds} (decoded text in {}/think_adaptive.think.txt)",
+        closed[1],
+        dir.display()
+    );
 }
