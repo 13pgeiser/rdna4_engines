@@ -59,6 +59,7 @@ use crate::speculative::{
     dflash_download_verify_argmax, dflash_draft_batch_eligible, dflash_enqueue_verify_lm_head_argmax,
     draft_dflash_block_rank, draft_dflash_blocks_batched, DeltaNetSnapshot, DflashCbDraft, DflashDraftLane,
     dflash_sampled_selector_draft_into, dflash_target_rows_into, DflashSampleCfg, DflashSampledDraft,
+    DflashSampledDraftLane, draft_dflash_sampled_blocks_batched,
     dflash_draft_batch_max_rows, FastTargetRows, VerifyScratch,
 };
 use hipfire_runtime::dflash::DflashScratch;
@@ -70,6 +71,14 @@ use std::ops::Range;
 
 static CB_SAMPLED_PACKED_HEAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_PACKED_HEAD").ok().as_deref() != Some("0")
+});
+
+static CB_DFLASH_DRAFT_BATCH_MASTER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_DFLASH_DRAFT_BATCH").ok().as_deref() != Some("0")
+});
+
+static CB_SAMPLED_DRAFT_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_DRAFT_BATCH").ok().as_deref() != Some("0")
 });
 
 /// The singleton's verify block for remaining output budget `max_emit`
@@ -538,6 +547,77 @@ pub struct DflashCbDraftLane<'a> {
     pub compact_offset: i32,
 }
 
+/// Whether one sampled lane may join a batched sampled-draft run led by
+/// `first`'s shared draft assets (host-only; touches no device state).
+fn cb_sampled_draft_lane_eligible(l: &DflashCbDraftLane<'_>, first: &DflashCbDraftLane<'_>, cap: usize) -> bool {
+    let (df, f) = (&l.state.df, &first.state.df);
+    l.state.sample_temp > 1e-6
+        && l.state.sampled_draft.is_some()
+        && l.b >= 3
+        && l.b <= df.block_size
+        && l.b <= cap
+        && l.b <= df.draft_scratch.max_block_size
+        && df.draft_weights.has_candidate_selector()
+        && std::sync::Arc::ptr_eq(&df.draft_weights, &f.draft_weights)
+        && df.block_size == f.block_size
+        && df.draft_config.n_layers == f.draft_config.n_layers
+        && df.draft_config.hidden == f.draft_config.hidden
+        && df.draft_config.intermediate == f.draft_config.intermediate
+        && df.draft_config.vocab_size == f.draft_config.vocab_size
+        && df.draft_config.block_size == f.draft_config.block_size
+        && df.draft_config.mask_token_id == f.draft_config.mask_token_id
+}
+
+/// Strict normal-F16 overwrite admission of a sampled run on exact gfx1201:
+/// every MQ4G256V2 draft weight and the target head must admit the backend
+/// overwrite route at the packed row count (inside the 64-row scope when that
+/// is the run size) and at each lane's original `b` and `b - 1` row counts
+/// (the singleton forward and Product head classes). The backend predicate
+/// excludes FP8/IU4 scopes, A8, LDS-staged, capture/recording/G0 and the
+/// disabled-F16/WMMA flags. Decided before any device write.
+fn cb_sampled_draft_run_admitted(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    run: &[DflashCbDraftLane<'_>],
+    rows: usize,
+    cap: usize,
+) -> bool {
+    use rdna_compute::DType::MQ4G256V2;
+    if gpu.arch != "gfx1201" || rows == 0 || rows > cap || weights.output.gpu_dtype != MQ4G256V2 {
+        return false;
+    }
+    let dw = std::sync::Arc::clone(&run[0].state.df.draft_weights);
+    let mut ks: Vec<usize> = vec![weights.output.k];
+    let mut push = |w: &hipfire_runtime::llama::WeightTensor| {
+        if w.gpu_dtype == MQ4G256V2 {
+            ks.push(w.k);
+        }
+    };
+    push(&dw.fc);
+    for l in &dw.layers {
+        for w in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down] {
+            push(w);
+        }
+        if let Some(w) = l.attn_conv_proj.as_ref() {
+            push(w);
+        }
+        if let Some(w) = l.mlp_conv_proj.as_ref() {
+            push(w);
+        }
+    }
+    ks.sort_unstable();
+    ks.dedup();
+    let prev = gpu.draft_rows64_enter(rows == 64 && cap == 64);
+    let ok = ks.iter().all(|&k| {
+        gpu.draft_overwrite_gfx12_admitted(k, rows)
+            && run.iter().all(|l| {
+                gpu.draft_overwrite_gfx12_admitted(k, l.b) && gpu.draft_overwrite_gfx12_admitted(k, l.b - 1)
+            })
+    });
+    gpu.draft_rows64_exit(prev);
+    ok
+}
+
 /// Draft phase over lanes. With `batched` (and the exact-gfx1201 MQ4 v2
 /// eligibility of [`dflash_draft_batch_eligible`]), greedy full-block lanes are
 /// packed in order into chunks of at most
@@ -548,7 +628,17 @@ pub struct DflashCbDraftLane<'a> {
 /// context rings, positions and hidden context. Every other lane (budget
 /// tails, lone lanes, ineligible machines/drafts, `batched == false`) runs
 /// the singleton call [`dflash_lane_draft`]. Sampled lanes always use the shared
-/// singleton selector draft, retaining its genuine q receipt on the lane.
+/// singleton selector draft unless the batched-draft master switch
+/// (`HIPFIRE_CB_DFLASH_DRAFT_BATCH`, default on) and `HIPFIRE_CB_SAMPLED_DRAFT_BATCH`
+/// (default on) both stay enabled: then each contiguous run of at least
+/// `max(cb.draft_min_lanes, 2)` eligible sampled lanes (positive temperature,
+/// `3 <= b <= block_size`, shared draft weights/config/layout, selector and
+/// receipt present, normal F16 gfx1201 overwrite admission for every MQ4
+/// draft/head weight at the run, lane `b` and `b - 1` row counts) shares one
+/// draft forward and head ([`draft_dflash_sampled_blocks_batched`]) while each
+/// lane keeps its own selector, RNG and receipt in the original order. An
+/// ineligible sampled lane or any greedy lane ends a run; refused or short runs
+/// use the singleton selector draft, retaining its genuine q receipt on the lane.
 /// Returns each lane's `[seed, candidates..]`.
 pub fn dflash_cb_draft(
     gpu: &mut Gpu,
@@ -621,42 +711,116 @@ pub fn dflash_cb_draft(
             out[i] = Some(t);
         }
     }
-    for (i, l) in lanes.iter_mut().enumerate() {
-        if out[i].is_none() {
-            // A VMM lane has no rotation buffers of its own: borrow the
-            // shared scratch's for this call and hand them back on EVERY
-            // path (no `?` between lend and reclaim).
-            if cb.draft.is_none() && l.state.df.draft_scratch.mq_x_rot.is_none() {
-                cb.reserve_draft(gpu, &l.state.df.draft_config)?;
-            }
-            let lent = cb.lend_mq(&mut l.state.df.draft_scratch)?;
-            let r = if l.state.sample_temp > 1e-6 {
-                let cfg = l.state.sample_cfg();
-                match l.state.sampled_draft.as_mut() {
-                    None => Err(HipError::new(0, "dflash_cb_draft: sampled receipt not reserved")),
-                    Some(receipt) => dflash_sampled_selector_draft_into(
-                        gpu, weights, &mut l.state.df, l.position, l.compact_offset,
-                        l.seed, l.b, config.vocab_size, cfg, &mut l.state.rng_state, receipt,
-                    )
-                    .map(|()| receipt.block.clone()),
-                }
-            } else {
-                dflash_lane_draft(
-                    gpu,
-                    weights,
-                    config,
-                    l.compact_offset,
-                    &mut l.state.df,
-                    l.position,
-                    l.seed,
-                    l.b,
-                )
-            };
-            cb.reclaim_mq(&mut l.state.df.draft_scratch, lent);
-            out[i] = Some(r?);
+    let sampled_batch = batched
+        && n > 0
+        && *CB_DFLASH_DRAFT_BATCH_MASTER
+        && *CB_SAMPLED_DRAFT_BATCH
+        && dflash_draft_batch_eligible(gpu, weights, config, &lanes[0].state.df.draft_weights);
+    let sampled_cap = dflash_draft_batch_max_rows(gpu).min(cb.draft_rows);
+    let sampled_min_lanes = cb.draft_min_lanes.max(2);
+    let mut i = 0usize;
+    while i < n {
+        if out[i].is_some() {
+            i += 1;
+            continue;
         }
+        if sampled_batch {
+            // Contiguous run of eligible sampled lanes in the original
+            // traversal; any ineligible sampled lane or greedy lane ends it, so
+            // the per-lane RNG draw order matches the singleton fallback.
+            let mut j = i;
+            let mut rows = 0usize;
+            while j < n
+                && out[j].is_none()
+                && rows + lanes[j].b <= sampled_cap
+                && cb_sampled_draft_lane_eligible(&lanes[j], &lanes[0], sampled_cap)
+            {
+                rows += lanes[j].b;
+                j += 1;
+            }
+            if j - i >= sampled_min_lanes && cb_sampled_draft_run_admitted(gpu, weights, &lanes[i..j], rows, sampled_cap) {
+                if cb.draft.is_none() {
+                    cb.reserve_draft(gpu, &lanes[i].state.df.draft_config)?;
+                }
+                let mut dl: Vec<DflashSampledDraftLane<'_>> = Vec::with_capacity(j - i);
+                for l in lanes[i..j].iter_mut() {
+                    let st = &mut *l.state;
+                    let cfg = st.sample_cfg();
+                    let Some(receipt) = st.sampled_draft.as_mut() else {
+                        return Err(HipError::new(0, "dflash_cb_draft: sampled receipt not reserved"));
+                    };
+                    dl.push(DflashSampledDraftLane {
+                        draft: DflashDraftLane {
+                            df: &mut st.df,
+                            position: l.position,
+                            seed: l.seed,
+                            b: l.b,
+                            compact_offset: l.compact_offset,
+                        },
+                        cfg,
+                        rng: &mut st.rng_state,
+                        out: receipt,
+                    });
+                }
+                let DflashCbScratch { draft, head, .. } = &mut *cb;
+                let shared = draft.as_mut().ok_or_else(|| HipError::new(0, "dflash_cb_draft: no draft batch scratch"))?;
+                let toks = draft_dflash_sampled_blocks_batched(gpu, weights, config.vocab_size, shared, head, &mut dl)?;
+                drop(dl);
+                for (k, t) in toks.into_iter().enumerate() {
+                    out[i + k] = Some(t);
+                }
+                cb.draft_stats.0 += j - i;
+                cb.draft_stats.1 += 1;
+                i = j;
+                continue;
+            }
+        }
+        out[i] = Some(cb_draft_lane_singleton(gpu, weights, config, cb, &mut lanes[i])?);
+        i += 1;
     }
     Ok(out.into_iter().map(|t| t.expect("every lane drafted")).collect())
+}
+
+/// The singleton draft of one lane (sampled selector draft or greedy
+/// [`dflash_lane_draft`]) with the shared rotation buffers lent for the call.
+fn cb_draft_lane_singleton(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    cb: &mut DflashCbScratch,
+    l: &mut DflashCbDraftLane<'_>,
+) -> HipResult<Vec<u32>> {
+    // A VMM lane has no rotation buffers of its own: borrow the
+    // shared scratch's for this call and hand them back on EVERY
+    // path (no `?` between lend and reclaim).
+    if cb.draft.is_none() && l.state.df.draft_scratch.mq_x_rot.is_none() {
+        cb.reserve_draft(gpu, &l.state.df.draft_config)?;
+    }
+    let lent = cb.lend_mq(&mut l.state.df.draft_scratch)?;
+    let r = if l.state.sample_temp > 1e-6 {
+        let cfg = l.state.sample_cfg();
+        match l.state.sampled_draft.as_mut() {
+            None => Err(HipError::new(0, "dflash_cb_draft: sampled receipt not reserved")),
+            Some(receipt) => dflash_sampled_selector_draft_into(
+                gpu, weights, &mut l.state.df, l.position, l.compact_offset,
+                l.seed, l.b, config.vocab_size, cfg, &mut l.state.rng_state, receipt,
+            )
+            .map(|()| receipt.block.clone()),
+        }
+    } else {
+        dflash_lane_draft(
+            gpu,
+            weights,
+            config,
+            l.compact_offset,
+            &mut l.state.df,
+            l.position,
+            l.seed,
+            l.b,
+        )
+    };
+    cb.reclaim_mq(&mut l.state.df.draft_scratch, lent);
+    r
 }
 
 /// One drafted lane between verify and accept: its trunk owners, its private

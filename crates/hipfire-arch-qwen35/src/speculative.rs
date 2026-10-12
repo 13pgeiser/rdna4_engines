@@ -6860,11 +6860,10 @@ fn dflash_sampled_selector_draft_parts_into(
             batch, vocab, DenseBatchMath::Product,
         )?;
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
-        out.uniforms.extend((0..batch).map(|_| xorshift_next_unit(rng)));
-        dflash::propose_candidates_device(
-            gpu, draft_weights, draft_scratch, &hidden_rows,
-            &logits_batch, batch, seed, cfg.temp, Some(&out.uniforms),
-        )?
+        return dflash_sampled_selector_rows_into(
+            gpu, draft_weights, draft_scratch, &hidden_rows, &logits_batch,
+            seed, batch, vocab, cfg, rng, out,
+        );
     } else {
         let mut host_logits = Vec::with_capacity(batch * vocab);
         for i in 1..b {
@@ -6880,6 +6879,29 @@ fn dflash_sampled_selector_draft_parts_into(
             &host_logits, batch, seed, cfg.temp, Some(&out.uniforms),
         )?
     };
+    dflash_sampled_apply_proposal_into(proposal, vocab, cfg, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dflash_sampled_selector_rows_into(
+    gpu: &mut Gpu,
+    draft_weights: &DflashWeights,
+    draft_scratch: &mut DflashScratch,
+    hidden_rows: &GpuTensor,
+    logits_rows: &GpuTensor,
+    seed: u32,
+    rows: usize,
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    rng: &mut u64,
+    out: &mut DflashSampledDraft,
+) -> HipResult<()> {
+    out.uniforms.clear();
+    out.uniforms.extend((0..rows).map(|_| xorshift_next_unit(rng)));
+    let proposal = dflash::propose_candidates_device(
+        gpu, draft_weights, draft_scratch, hidden_rows, logits_rows,
+        rows, seed, cfg.temp, Some(&out.uniforms),
+    )?;
     dflash_sampled_apply_proposal_into(proposal, vocab, cfg, out)
 }
 
@@ -7355,6 +7377,88 @@ pub struct DflashDraftLane<'a> {
     pub compact_offset: i32,
 }
 
+/// One sampled lane of [`draft_dflash_sampled_blocks_batched`].
+pub struct DflashSampledDraftLane<'a> {
+    pub draft: DflashDraftLane<'a>,
+    pub cfg: DflashSampleCfg,
+    pub rng: &'a mut u64,
+    pub out: &'a mut DflashSampledDraft,
+}
+
+/// Share the admitted forward/head while retaining per-lane selector and RNG.
+///
+/// The caller must admit the normal F16 gfx1201 route before calling, with
+/// no capture/recording/G0 or FP8/IU4/A8/LDS scope, and respect the existing
+/// batch capacity and shared-asset/layout requirements. Every lane needs
+/// positive temperature and a selector. `b=2` must remain singleton: its
+/// one-candidate head and rank projection are GEMVs, not the batched WMMA.
+/// Receipts and returned blocks follow the original input-lane order.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_dflash_sampled_blocks_batched(
+    gpu: &mut Gpu,
+    target_weights: &Qwen35Weights,
+    vocab: usize,
+    shared: &mut DflashScratch,
+    head: &VerifyScratch,
+    lanes: &mut [DflashSampledDraftLane<'_>],
+) -> HipResult<Vec<Vec<u32>>> {
+    for (i, lane) in lanes.iter().enumerate() {
+        if lane.draft.b < 3 || lane.cfg.temp <= 0.0
+            || !lane.draft.df.draft_weights.has_candidate_selector()
+        {
+            return Err(HipError::new(0, &format!(
+                "draft_dflash_sampled_blocks_batched: lane {i} requires b>=3, temp>0 and selector"
+            )));
+        }
+    }
+    {
+        let mut drafts: Vec<DflashDraftLane<'_>> = lanes.iter_mut().map(|lane| {
+            DflashDraftLane {
+                df: &mut *lane.draft.df,
+                position: lane.draft.position,
+                seed: lane.draft.seed,
+                b: lane.draft.b,
+                compact_offset: lane.draft.compact_offset,
+            }
+        }).collect();
+        draft_dflash_forward_head_batched(gpu, target_weights, vocab, shared, head, &mut drafts)?;
+    }
+    let mut blocks = Vec::with_capacity(lanes.len());
+    let mut offset = 0usize;
+    for lane in lanes.iter_mut() {
+        let draft = &mut lane.draft;
+        let rows = draft.b - 1;
+        let h = draft.df.draft_config.hidden;
+        let hidden_rows = shared.x.sub_offset((offset + 1) * h, rows * h);
+        let logits_rows = head.logits.sub_offset((offset + 1) * vocab, rows * vocab);
+        let scratch = &mut draft.df.draft_scratch;
+        let lent = scratch.mq_x_rot.is_none();
+        if lent {
+            if shared.mq_x_rot.is_none() || shared.mq_x_rot_f16.is_none() {
+                return Err(HipError::new(0,
+                    "the shared draft scratch has no FWHT rotation buffers for the lane selector"));
+            }
+            scratch.mq_x_rot = shared.mq_x_rot.take();
+            scratch.mq_x_rot_f16 = shared.mq_x_rot_f16.take();
+        }
+        lane.out.block.clear();
+        lane.out.block.push(draft.seed);
+        let result = dflash_sampled_selector_rows_into(
+            gpu, &draft.df.draft_weights, scratch, &hidden_rows, &logits_rows,
+            draft.seed, rows, vocab, lane.cfg, lane.rng, lane.out,
+        );
+        // Restore the shared buffers even when projection/scoring failed.
+        if lent {
+            shared.mq_x_rot = scratch.mq_x_rot.take();
+            shared.mq_x_rot_f16 = scratch.mq_x_rot_f16.take();
+        }
+        result?;
+        blocks.push(lane.out.block.clone());
+        offset += draft.b;
+    }
+    Ok(blocks)
+}
+
 /// Whether the batched draft is exact for this machine / draft / target head:
 /// the non-fused (non-gfx1100) draft route, MoE-free target, every draft
 /// matmul an MQ4 v2 (or, for the DFlash2 convolution kernel projections,
@@ -7390,27 +7494,18 @@ pub fn dflash_draft_batch_eligible(
         })
 }
 
-/// Greedy chain drafts of several lanes through ONE draft-model forward
-/// (`dflash::draft_forward_lanes`) and ONE shared target lm-head GEMM, each
-/// lane keeping its own draft context rings, positions and hidden context:
-/// the batched counterpart of per-lane `draft_dflash_block_rank` calls (the
-/// singleton path is untouched). `shared` is the row scratch of the batched
-/// forward (`>= sum b` rows), `head` the head scratch (`max_n >= sum b`).
-/// Returns each lane's `[seed, candidates..]`. Preconditions:
-/// [`dflash_draft_batch_eligible`], `3 <= b` per lane, `sum b <=
-/// dflash_draft_batch_max_rows(gpu)`, one shared draft-weight asset.
 #[allow(clippy::too_many_arguments)]
-pub fn draft_dflash_blocks_batched(
+fn draft_dflash_forward_head_batched(
     gpu: &mut Gpu,
     target_weights: &Qwen35Weights,
     vocab: usize,
     shared: &mut DflashScratch,
     head: &VerifyScratch,
     lanes: &mut [DflashDraftLane<'_>],
-) -> HipResult<Vec<Vec<u32>>> {
+) -> HipResult<bool> {
     let err = |m: String| Err(HipError::new(0, &format!("draft_dflash_blocks_batched: {m}")));
     if lanes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(false);
     }
     let rows: usize = lanes.iter().map(|l| l.b).sum();
     let cap = dflash_draft_batch_max_rows(gpu);
@@ -7536,6 +7631,37 @@ pub fn draft_dflash_blocks_batched(
     })();
     gpu.draft_rows64_exit(prev);
     scoped?;
+    Ok(rows64)
+}
+
+/// Greedy chain drafts of several lanes through ONE draft-model forward
+/// (`dflash::draft_forward_lanes`) and ONE shared target lm-head GEMM, each
+/// lane keeping its own draft context rings, positions and hidden context:
+/// the batched counterpart of per-lane `draft_dflash_block_rank` calls (the
+/// singleton path is untouched). `shared` is the row scratch of the batched
+/// forward (`>= sum b` rows), `head` the head scratch (`max_n >= sum b`).
+/// Returns each lane's `[seed, candidates..]`. Preconditions:
+/// [`dflash_draft_batch_eligible`], `3 <= b` per lane, `sum b <=
+/// dflash_draft_batch_max_rows(gpu)`, one shared draft-weight asset.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_dflash_blocks_batched(
+    gpu: &mut Gpu,
+    target_weights: &Qwen35Weights,
+    vocab: usize,
+    shared: &mut DflashScratch,
+    head: &VerifyScratch,
+    lanes: &mut [DflashDraftLane<'_>],
+) -> HipResult<Vec<Vec<u32>>> {
+    if lanes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows64 = draft_dflash_forward_head_batched(gpu, target_weights, vocab, shared, head, lanes)?;
+    let err = |m: String| Err(HipError::new(0, &format!("draft_dflash_blocks_batched: {m}")));
+    let rows: usize = lanes.iter().map(|l| l.b).sum();
+    let draft_weights = std::sync::Arc::clone(&lanes[0].df.draft_weights);
+    let h = lanes[0].df.draft_config.hidden;
+    let hidden_all = shared.x.sub_offset(0, rows * h);
+    let logits_all = head.logits.sub_offset(0, rows * vocab);
 
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
     if draft_weights.has_candidate_selector() && selector_lanes_batched(gpu, shared) {
