@@ -2617,44 +2617,50 @@ pub fn mtp_head_forward_block_batched(
         rotated_x_scratch,
     )?;
 
-    // Save residual (inpSA) for the post-attn add.
-    gpu.hip
-        .memcpy_dtod_at(&scratch.residual.buf, 0, &scratch.cur.buf, 0, n * dim_bytes)?;
+    // Save residual (inpSA) for the post-attn add. kv_only returns before the
+    // post-attn add, so fast_fill skips it.
+    if !fast_fill {
+        gpu.hip
+            .memcpy_dtod_at(&scratch.residual.buf, 0, &scratch.cur.buf, 0, n * dim_bytes)?;
+    }
 
     // ── 4. Pre-attn norm + Q/K/V projections ─────────────────────────────
     let tmp_view = scratch.tmp.sub_offset(0, n * dim);
     gpu.rmsnorm_batched(&cur_view, &w.attn_norm, &tmp_view, n, dim, cfg.rms_norm_eps)?;
 
-    // wq emits 2 * q_dim per slot.
-    let q_full_view = scratch.q_full.sub_offset(0, n * 2 * q_dim);
-    weight_gemm_batched(gpu, &w.wq, &tmp_view, &q_full_view, n, rotated_x_scratch)?;
-
-    // Deinterleave per-head into Q + Gate. Output: [n × n_head × head_dim] each.
+    // wq emits 2 * q_dim per slot. fast_fill (kv_only) never consumes Q/gate,
+    // so the wq GEMM, deinterleave and per-head Q norm are skipped.
     let q_view = scratch.q.sub_offset(0, n * q_dim);
     let gate_view = scratch.gate.sub_offset(0, n * q_dim);
-    gpu.deinterleave_f32_batched(
-        &q_full_view,
-        &q_view,
-        &gate_view,
-        cfg.n_head,
-        cfg.head_dim,
-        n,
-    )?;
+    if !fast_fill {
+        let q_full_view = scratch.q_full.sub_offset(0, n * 2 * q_dim);
+        weight_gemm_batched(gpu, &w.wq, &tmp_view, &q_full_view, n, rotated_x_scratch)?;
 
-    // attn_q_norm: per-head normalization of Q.
-    // rmsnorm_batched treats `batch` as "rows of length n", and gates the
-    // single norm-weight broadcast across all rows. For per-head norm here,
-    // each Q row is `n_head` heads of length `head_dim`, so we want
-    // `batch = n * n_head`, `n = head_dim`. Same convention as the trunk's
-    // per-head q_norm at qwen35.rs.
-    gpu.rmsnorm_batched(
-        &q_view,
-        &w.attn_q_norm,
-        &q_view,
-        n * cfg.n_head,
-        cfg.head_dim,
-        cfg.rms_norm_eps,
-    )?;
+        // Deinterleave per-head into Q + Gate. Output: [n × n_head × head_dim] each.
+        gpu.deinterleave_f32_batched(
+            &q_full_view,
+            &q_view,
+            &gate_view,
+            cfg.n_head,
+            cfg.head_dim,
+            n,
+        )?;
+
+        // attn_q_norm: per-head normalization of Q.
+        // rmsnorm_batched treats `batch` as "rows of length n", and gates the
+        // single norm-weight broadcast across all rows. For per-head norm here,
+        // each Q row is `n_head` heads of length `head_dim`, so we want
+        // `batch = n * n_head`, `n = head_dim`. Same convention as the trunk's
+        // per-head q_norm at qwen35.rs.
+        gpu.rmsnorm_batched(
+            &q_view,
+            &w.attn_q_norm,
+            &q_view,
+            n * cfg.n_head,
+            cfg.head_dim,
+            cfg.rms_norm_eps,
+        )?;
+    }
 
     // K, V projections.
     let k_view = scratch.k.sub_offset(0, n * kv_dim);
@@ -2671,11 +2677,13 @@ pub fn mtp_head_forward_block_batched(
     )?;
 
     // ── 5. Batched RoPE on Q + K ─────────────────────────────────────────
+    // fast_fill (kv_only): Q is never consumed (return follows the K/V cache
+    // writes), so rope runs with zero Q heads over the same valid q_view.
     gpu.rope_partial_interleaved_f32_batched(
         &q_view,
         &k_view,
         &scratch.positions,
-        cfg.n_head,
+        if fast_fill { 0 } else { cfg.n_head },
         cfg.n_head_kv,
         cfg.head_dim,
         cfg.n_rot,
