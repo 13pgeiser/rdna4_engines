@@ -171,8 +171,10 @@ try {
 
 if ($GpuArch -eq "unknown") {
     Write-Host "  WARNING: Could not detect GPU architecture." -ForegroundColor Yellow
-    Write-Host "  Supported: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9060), gfx1201 (RX 9070),"
-    Write-Host "             gfx1103 (Radeon 780M), gfx1150 (Radeon 890M), gfx1151 (Radeon 8060S), gfx1152 (Radeon 860M)"
+    Write-Host "  Detected-name mappings: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9060), gfx1201 (RX 9070),"
+    Write-Host "                          gfx1103 (Radeon 780M), gfx1150 (Radeon 890M), gfx1151 (Radeon 8060S), gfx1152 (Radeon 860M)"
+    Write-Host "  Name detection is not hardware validation; gfx1103, gfx1150 and gfx1152 have no shipped prebuilt pack."
+    Write-Host "  Release packs: gfx1100, gfx1151, gfx1201, gfx906, gfx942; other arches require local hipcc."
     $GpuArch = Read-Host "  Enter your GPU arch [or Enter to skip]"
     if ([string]::IsNullOrWhiteSpace($GpuArch)) { $GpuArch = "unknown" }
 }
