@@ -24,13 +24,27 @@ fn activations()->(Vec<u16>,Vec<i8>,Vec<(u16,i16)>){
     }(x,a,ds)
 }
 fn sides(s:&[(u16,i16)])->Vec<u8>{s.iter().flat_map(|&(m,e)|m.to_le_bytes().into_iter().chain(e.to_le_bytes())).collect()}
-fn bytes(gpu:&mut Gpu,b:&[u8])->GpuTensor{gpu.upload_raw(b,&[b.len()]).expect("upload")}
+fn audit(label:&str,t:&GpuTensor){
+    assert_eq!(t.byte_size(),t.buf.size(),"{label}: shape {:?} dtype {:?} disagrees with allocation",t.shape,t.dtype);
+}
+fn bytes(gpu:&mut Gpu,b:&[u8])->GpuTensor{
+    let t=gpu.upload_raw(b,&[b.len()]).expect("upload");audit("raw upload",&t);t
+}
+fn typed(gpu:&mut Gpu,b:&[u8],shape:&[usize],dtype:DType)->GpuTensor{
+    assert_eq!(shape.iter().product::<usize>()*dtype.size(),b.len(),"typed upload byte count");
+    let mut t=gpu.upload_raw(b,shape).expect("typed upload");t.dtype=dtype;
+    audit("typed upload",&t);t
+}
 fn arena(gpu:&mut Gpu,n:usize)->GpuTensor{bytes(gpu,&vec![0xa5;n])}
+fn download(gpu:&Gpu,label:&str,t:&GpuTensor)->Vec<u8>{
+    audit(label,t);gpu.download_raw_bytes(t).expect(label)
+}
 fn compare(label:&str,got:&[u8],want:&[u8]){
     if let Some(i)=got.iter().zip(want).position(|(a,b)|a!=b){panic!("{label}: byte {i}: got {:02x}, expected {:02x}",got[i],want[i]);}
     assert_eq!(got.len(),want.len(),"{label} length");
 }
 fn timed(gpu:&mut Gpu,label:&str,mut f:impl FnMut(&mut Gpu)) {
+    eprintln!("PHASE timing {label}");
     f(gpu);gpu.hip.device_synchronize().unwrap();
     let start=gpu.hip.event_create().unwrap();let end=gpu.hip.event_create().unwrap();
     gpu.hip.event_record(&start,gpu.active_stream.as_ref()).unwrap();f(gpu);
@@ -39,25 +53,31 @@ fn timed(gpu:&mut Gpu,label:&str,mut f:impl FnMut(&mut Gpu)) {
     gpu.hip.event_destroy(start).unwrap();gpu.hip.event_destroy(end).unwrap();
 }
 fn run(){
+    eprintln!("PHASE GPU initialization");
     let mut gpu=Gpu::init().expect("GPU init");assert_eq!(gpu.arch,"gfx1151");
+    eprintln!("PHASE CPU activation and integer-dot references");
     let (xp,ap,dp)=activations();
     let wp:Vec<i8>=(0..WP*K).map(|i|(((i*73+(i/K)*31+(i%K)*(i%K)*3)%255) as i32-127) as i8).collect();
     let dots:Vec<i32>=(0..AP*WP).map(|i|ap[i/WP*K..(i/WP+1)*K].iter().zip(&wp[i%WP*K..(i%WP+1)*K]).map(|(&a,&w)|a as i32*w as i32).sum()).collect();
     // Frozen S1 full ColumnMaps, native projection widths in fused family order.
     for rows in [512usize,8192,4647] {
+        eprintln!("PHASE activation/A/D preparation rows={rows}");
         let p=rows.div_ceil(256)*256;
         let xbytes:Vec<u8>=(0..rows*K).flat_map(|i|xp[i%(AP*K)].to_le_bytes()).collect();
-        let mut x=bytes(&mut gpu,&xbytes);x.dtype=DType::F16;
+        let x=typed(&mut gpu,&xbytes,&[rows,K],DType::F16);
         let a_cpu:Vec<i8>=(0..p*K).map(|i|if i/K<rows {ap[i%(AP*K)]}else{0}).collect();
         let d_cpu:Vec<_>=(0..p).map(|t|if t<rows {dp[t%AP]}else{(0,0)}).collect();
         let layout=NpuBf16Layout{padded_rows:p,k:K,panels:1};
         let a=arena(&mut gpu,layout.a_bytes());let d=arena(&mut gpu,rows*4);
+        eprintln!("PHASE packed-A producer rows={rows}");
         gpu.npu_trunk_pack_a_bf16(&x,rows,layout,&a,&d).unwrap();gpu.hip.device_synchronize().unwrap();
+        eprintln!("PHASE packed-A and compact-D comparison rows={rows}");
         let design=gemm_g80::design_g80(p,1280,K,Epilogue::Bf16,Control::Fast);
-        compare("packed A (codes, replicated scales, padding)",&gpu.download_raw_bytes(&a).unwrap(),&gemm_g80::pack_a_bf16(&design,&a_cpu,&d_cpu));
-        compare("compact D",&gpu.download_raw_bytes(&d).unwrap(),&sides(&d_cpu[..rows]));
+        compare("packed A (codes, replicated scales, padding)",&download(&gpu,"packed A",&a),&gemm_g80::pack_a_bf16(&design,&a_cpu,&d_cpu));
+        compare("compact D",&download(&gpu,"compact D",&d),&sides(&d_cpu[..rows]));
         if rows==8192 {timed(&mut gpu,"pack rows8192 k2560",|g|g.npu_trunk_pack_a_bf16(&x,rows,layout,&a,&d).unwrap());}
         for (name,widths) in [("GdnIn",[10240usize,6144,48,48]),("QsaIn",[12288,512,512,640])] {
+            eprintln!("PHASE weight/scales/I32/synthetic-C preparation rows={rows} shape={name}");
             let n:usize=widths.iter().sum();let layout=NpuBf16Layout{panels:n.div_ceil(1280),..layout};
             let w=bytes(&mut gpu,&(0..n*K).map(|i|wp[i%(WP*K)] as u8).collect::<Vec<_>>());
             // Include zero weights scales, ties, underflow and overflow exponents.
@@ -71,28 +91,34 @@ fn run(){
             }}
             let c=bytes(&mut gpu,&synthetic);
             for dtype in [DType::BF16,DType::F32] {
+                eprintln!("PHASE native-output preparation rows={rows} shape={name} dtype={dtype:?}");
                 let tensors:Vec<_>=widths.iter().map(|&m|{
-                    let mut t=arena(&mut gpu,rows*m*dtype.size()+256);t.dtype=dtype;t
+                    let elements=rows*m+256/dtype.size();
+                    typed(&mut gpu,&vec![0xa5;elements*dtype.size()],&[elements],dtype)
                 }).collect();
                 let mut col0=0;let outs:Vec<_>=widths.iter().zip(&tensors).map(|(&cols,tensor)|{let o=NpuTrunkOutput{col0,cols,tensor};col0+=cols;o}).collect();
+                eprintln!("PHASE consume launch rows={rows} shape={name} dtype={dtype:?}");
                 gpu.npu_trunk_consume_bf16(&c,layout,&outs,rows).unwrap();gpu.hip.device_synchronize().unwrap();
                 for o in &outs {
+                    eprintln!("PHASE consume comparison rows={rows} shape={name} dtype={dtype:?} col0={} cols={}",o.col0,o.cols);
                     let mut expected=Vec::with_capacity(rows*o.cols*dtype.size()+256);
                     for t in 0..rows {for j in o.col0..o.col0+o.cols {
                         let bits=((t*131+j*37) as u16).wrapping_add(0x8000);
                         if dtype==DType::BF16 {expected.extend(bits.to_le_bytes())}else{expected.extend(((bits as u32)<<16).to_le_bytes())}
                     }}expected.extend([0xa5;256]);
-                    compare("consume and guard",&gpu.download_raw_bytes(o.tensor).unwrap(),&expected);
+                    compare("consume and guard",&download(&gpu,"consume output",o.tensor),&expected);
                 }
                 if rows==8192 {timed(&mut gpu,&format!("consume {name} padded_cols={} {dtype:?}",layout.padded_cols()),|g|g.npu_trunk_consume_bf16(&c,layout,&outs,rows).unwrap());}
+                eprintln!("PHASE emulate launch rows={rows} shape={name} dtype={dtype:?}");
                 gpu.npu_trunk_emulate_bf16(&a,&w,&s,&d,&sums,layout,rows,n,&outs).unwrap();gpu.hip.device_synchronize().unwrap();
                 for o in &outs {
+                    eprintln!("PHASE emulate comparison rows={rows} shape={name} dtype={dtype:?} col0={} cols={}",o.col0,o.cols);
                     let mut expected=Vec::with_capacity(rows*o.cols*dtype.size()+256);
                     for t in 0..rows {for j in o.col0..o.col0+o.cols {
                         let (sm,se)=scales[j];let (dm,de)=dp[t%AP];let bits=bf16_direct(dots[(t%AP)*WP+j%WP],sm,se,dm,de);
                         if dtype==DType::BF16 {expected.extend(bits.to_le_bytes())}else{expected.extend(((bits as u32)<<16).to_le_bytes())}
                     }}expected.extend([0xa5;256]);
-                    compare("emulate and guard",&gpu.download_raw_bytes(o.tensor).unwrap(),&expected);
+                    compare("emulate and guard",&download(&gpu,"emulate output",o.tensor),&expected);
                 }
                 println!("PASS rows={rows} shape={name} dtype={dtype:?}");
                 for t in tensors {gpu.free_tensor(t).unwrap();}
