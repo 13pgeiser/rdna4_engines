@@ -2899,7 +2899,17 @@ pub fn mtp_head_forward_block_batched(
                 && w.wv.awq_scale.is_none()
                 && w.wk.k == w.wv.k =>
         {
-            gpu.gemm_hfq4g256(&w.wv.buf, rot, &v_view, w.wv.m, w.wv.k, n)?;
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+                &w.wv.buf,
+                w.wv.gpu_dtype,
+                rot,
+                &v_view,
+                w.wv.m,
+                w.wv.k,
+                n,
+            )?;
         }
         _ => weight_gemm_batched(gpu, &w.wv, &tmp_view, &v_view, n, rotated_x_scratch)?,
     }
