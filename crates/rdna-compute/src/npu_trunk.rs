@@ -92,6 +92,26 @@ impl Gpu {
             self.npu_launch(symbol,[o.cols.div_ceil(32) as u32,rows as u32,1],32,b)?;
         } Ok(())
     }
+    /// Vector/LDS retile of native G80 BF16 into projection-owned row-major tensors.
+    /// The old PM consume remains the byte oracle; this bandwidth path uses HIP compilation.
+    pub fn npu_trunk_consume_bf16_fast(&mut self,c:&GpuTensor,layout:NpuBf16Layout,outs:&[NpuTrunkOutput<'_>],rows:usize)->HipResult<()> {
+        layout.validate()?;
+        need(c,layout.c_bytes())?;
+        unsafe {self.npu_trunk_consume_bf16_fast_ptr(c.buf.as_ptr(),layout,outs,rows)}
+    }
+    /// # Safety
+    /// `c` holds layout.c_bytes() readable GPU-visible bytes until stream completion,
+    /// and does not alias any output tensor.
+    pub unsafe fn npu_trunk_consume_bf16_fast_ptr(&mut self,c:*mut c_void,layout:NpuBf16Layout,outs:&[NpuTrunkOutput<'_>],rows:usize)->HipResult<()> {
+        outputs(layout,rows,outs)?;
+        if c.is_null(){return Err(HipError::new(1,"npu trunk: null C arena"));}
+        self.ensure_kernel_public("npu_trunk",kernels::NPU_TRUNK_SRC,"npu_trunk_consume_bf16_fast")?;
+        for o in outs {
+            let mut b=KernargBlob::new();b.push_ptr(c);b.push_ptr(o.tensor.buf.as_ptr());
+            for n in [layout.padded_rows,rows,o.col0,o.cols,usize::from(o.tensor.dtype==DType::BF16)]{b.push_i32(n as i32);}
+            self.npu_launch("npu_trunk_consume_bf16_fast",[(o.col0%80+o.cols).div_ceil(80) as u32,rows.div_ceil(128) as u32,1],256,b)?;
+        } Ok(())
+    }
     /// Exact signed-IU8 WMMA dot products from the producer's packed A.
     /// `w` is row-major [n,k] i8; `sums` is caller-owned [rows,n] I32 scratch.
     pub fn npu_trunk_emulate_i32(&mut self,a:&GpuTensor,w:&GpuTensor,sums:&GpuTensor,layout:NpuBf16Layout,rows:usize,n:usize)->HipResult<()> {
@@ -138,5 +158,28 @@ mod tests {
         assert!(NpuBf16Layout{k:2561,..l}.validate().is_err());
         assert!(NpuBf16Layout{panels:0,..l}.validate().is_err());
         assert!(NpuBf16Layout{padded_rows:65536,panels:51,..l}.validate().is_err());
+    }
+    #[test]
+    fn fast_uint4_lds_reorder_matches_g80_byte_offsets() {
+        use pm_npu::kernels::gemm_g80::bf16_output_offset;
+        for padded_rows in [4864usize,8192] {
+            let waves=padded_rows/256;
+            for panel in [0usize,1,12] {for tn in 0..16 {
+                for mt in [0usize,1,2,padded_rows/128-1] {
+                    let base=panel*padded_rows*1280
+                        +((tn/2)*waves*4+(mt%2)*waves*2+(mt/2)*2+tn%2)*10240;
+                    for i in 0..1280 {
+                        let micro=i/8;
+                        let r=(micro/10)*8+i%8;
+                        let j=(micro%10)*8;
+                        for k in 0..8 {
+                            let expected=panel*padded_rows*1280*2
+                                +bf16_output_offset(padded_rows,mt*128+r,tn*80+j+k);
+                            assert_eq!((base+i*8+k)*2,expected);
+                        }
+                    }
+                }
+            }}
+        }
     }
 }

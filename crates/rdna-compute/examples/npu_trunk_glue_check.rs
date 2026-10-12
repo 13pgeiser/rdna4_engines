@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Halo-only byte oracle. Run: cargo run --release -p rdna-compute --features lab --example npu_trunk_glue_check
+//! Prints old/fast consume event timings and effective read+write GB/s for both large row counts.
 use half::f16;
 use pm_npu::kernels::{gemm_g80::{self,bf16_output_offset},gemm_core::{Epilogue,Control},w8a8_epi::{grid15_up,bf16_direct}};
 use rdna_compute::{Gpu,GpuTensor,DType,npu_trunk::{NpuBf16Layout,NpuTrunkOutput}};
@@ -43,14 +44,16 @@ fn compare(label:&str,got:&[u8],want:&[u8]){
     if let Some(i)=got.iter().zip(want).position(|(a,b)|a!=b){panic!("{label}: byte {i}: got {:02x}, expected {:02x}",got[i],want[i]);}
     assert_eq!(got.len(),want.len(),"{label} length");
 }
-fn timed(gpu:&mut Gpu,label:&str,mut f:impl FnMut(&mut Gpu)) {
+fn timed(gpu:&mut Gpu,label:&str,mut f:impl FnMut(&mut Gpu))->f32 {
     eprintln!("PHASE timing {label}");
     f(gpu);gpu.hip.device_synchronize().unwrap();
     let start=gpu.hip.event_create().unwrap();let end=gpu.hip.event_create().unwrap();
     gpu.hip.event_record(&start,gpu.active_stream.as_ref()).unwrap();f(gpu);
     gpu.hip.event_record(&end,gpu.active_stream.as_ref()).unwrap();gpu.hip.event_synchronize(&end).unwrap();
-    println!("timing {label}: {:.4} ms",gpu.hip.event_elapsed_ms(&start,&end).unwrap());
+    let ms=gpu.hip.event_elapsed_ms(&start,&end).unwrap();
+    println!("timing {label}: {ms:.4} ms");
     gpu.hip.event_destroy(start).unwrap();gpu.hip.event_destroy(end).unwrap();
+    ms
 }
 fn run(){
     eprintln!("PHASE GPU initialization");
@@ -97,18 +100,37 @@ fn run(){
                     typed(&mut gpu,&vec![0xa5;elements*dtype.size()],&[elements],dtype)
                 }).collect();
                 let mut col0=0;let outs:Vec<_>=widths.iter().zip(&tensors).map(|(&cols,tensor)|{let o=NpuTrunkOutput{col0,cols,tensor};col0+=cols;o}).collect();
+                let fast_tensors:Vec<_>=widths.iter().map(|&m|{
+                    let elements=rows*m+256/dtype.size();
+                    typed(&mut gpu,&vec![0xa5;elements*dtype.size()],&[elements],dtype)
+                }).collect();
+                let fast_outs:Vec<_>=outs.iter().zip(&fast_tensors).map(|(o,tensor)|NpuTrunkOutput{col0:o.col0,cols:o.cols,tensor}).collect();
                 eprintln!("PHASE consume launch rows={rows} shape={name} dtype={dtype:?}");
                 gpu.npu_trunk_consume_bf16(&c,layout,&outs,rows).unwrap();gpu.hip.device_synchronize().unwrap();
-                for o in &outs {
+                gpu.npu_trunk_consume_bf16_fast(&c,layout,&fast_outs,rows).unwrap();gpu.hip.device_synchronize().unwrap();
+                for (o,fast) in outs.iter().zip(&fast_outs) {
                     eprintln!("PHASE consume comparison rows={rows} shape={name} dtype={dtype:?} col0={} cols={}",o.col0,o.cols);
                     let mut expected=Vec::with_capacity(rows*o.cols*dtype.size()+256);
                     for t in 0..rows {for j in o.col0..o.col0+o.cols {
                         let bits=((t*131+j*37) as u16).wrapping_add(0x8000);
                         if dtype==DType::BF16 {expected.extend(bits.to_le_bytes())}else{expected.extend(((bits as u32)<<16).to_le_bytes())}
                     }}expected.extend([0xa5;256]);
-                    compare("consume and guard",&download(&gpu,"consume output",o.tensor),&expected);
+                    let old=download(&gpu,"consume output",o.tensor);
+                    compare("consume and guard",&old,&expected);
+                    compare("fast consume vs PM and guard",&download(&gpu,"fast consume output",fast.tensor),&old);
                 }
-                if rows==8192 {timed(&mut gpu,&format!("consume {name} padded_cols={} {dtype:?}",layout.padded_cols()),|g|g.npu_trunk_consume_bf16(&c,layout,&outs,rows).unwrap());}
+                println!("consume_exact rows={rows} shape={name} dtype={dtype:?} old_vs_fast=byte-exact guards=ok");
+                if rows==8192 || rows==4647 {
+                    let old=timed(&mut gpu,&format!("consume-old {name} rows={rows} {dtype:?}"),|g|g.npu_trunk_consume_bf16(&c,layout,&outs,rows).unwrap());
+                    let fast=timed(&mut gpu,&format!("consume-fast {name} rows={rows} {dtype:?}"),|g|g.npu_trunk_consume_bf16_fast(&c,layout,&fast_outs,rows).unwrap());
+                    let traffic=(rows*n*(2+dtype.size())) as f64;
+                    println!("consume_bw rows={rows} shape={name} dtype={dtype:?} old_ms={old:.4} fast_ms={fast:.4} old_GBps={:.2} fast_GBps={:.2} speedup={:.2} target_GBps=180",
+                        traffic/(old as f64*1e6),traffic/(fast as f64*1e6),old/fast);
+                    // Check timed writes too, including untouched ragged-row/output guards.
+                    for (o,fast) in outs.iter().zip(&fast_outs) {
+                        compare("timed fast vs PM and guard",&download(&gpu,"timed fast",fast.tensor),&download(&gpu,"timed old",o.tensor));
+                    }
+                }
                 eprintln!("PHASE emulate launch rows={rows} shape={name} dtype={dtype:?}");
                 gpu.npu_trunk_emulate_bf16(&a,&w,&s,&d,&sums,layout,rows,n,&outs).unwrap();gpu.hip.device_synchronize().unwrap();
                 for o in &outs {
@@ -122,6 +144,7 @@ fn run(){
                 }
                 println!("PASS rows={rows} shape={name} dtype={dtype:?}");
                 for t in tensors {gpu.free_tensor(t).unwrap();}
+                for t in fast_tensors {gpu.free_tensor(t).unwrap();}
             }
             if rows==8192 {timed(&mut gpu,&format!("emulate GEMM {name} rows8192 k2560 n{n}"),|g|g.npu_trunk_emulate_i32(&a,&w,&sums,layout,rows,n).unwrap());}
             for t in [w,s,sums,c]{gpu.free_tensor(t).unwrap();}

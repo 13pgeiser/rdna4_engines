@@ -64,3 +64,46 @@ extern "C" __global__ __launch_bounds__(256) void npu_trunk_epi_bf16(
     if(bf16)((unsigned short*)out)[o]=bits;
     else ((unsigned int*)out)[o]=(unsigned int)bits<<16;
 }
+
+// One CTA reorders a native 128x80 tile. Consecutive lanes read consecutive uint4s
+// from the G80 stream, then LDS bridges to contiguous row-major uint4 stores.
+// The 88-element LDS pitch keeps every row 16-byte aligned without the 80-column
+// power-of-two bank alias. No floating-point conversion: preserve BF16 NaN bits.
+extern "C" __global__ __launch_bounds__(256) void npu_trunk_consume_bf16_fast(
+    const unsigned short* __restrict__ c, void* __restrict__ out,
+    int padded_rows, int rows, int col0, int cols, int bf16) {
+    __shared__ __align__(16) unsigned short tile[128][88];
+    const int tid=threadIdx.x, nt=col0/80+blockIdx.x;
+    const int panel=nt/16, tn=nt%16, mt=blockIdx.y;
+    const int waves=padded_rows/256;
+    const size_t base=(size_t)panel*padded_rows*1280
+        +((size_t)(tn/2)*waves*4+(mt%2)*waves*2+(mt/2)*2+tn%2)*10240;
+    for(int i=tid;i<1280;i+=256) {
+        // Native order: [row/8][col/8][row%8][8 BF16].
+        const int micro=i/8, r=(micro/10)*8+i%8, j=(micro%10)*8;
+        *((uint4*)&tile[r][j])=((const uint4*)(c+base))[i];
+    }
+    __syncthreads();
+    for(int i=tid;i<1280;i+=256) {
+        const int r=i/10, j=(i%10)*8, row=mt*128+r;
+        const int col=nt*80+j-col0;
+        if(row>=rows || col+8<=0 || col>=cols)continue;
+        const uint4 v=*((const uint4*)&tile[r][j]);
+        const size_t offset=(size_t)row*cols;
+        if(col>=0 && col+8<=cols && ((offset+col)&7)==0) {
+            if(bf16) ((uint4*)((unsigned short*)out+offset+col))[0]=v;
+            else {
+                uint4* dst=(uint4*)((unsigned int*)out+offset+col);
+                dst[0]=make_uint4(v.x<<16,v.x&0xffff0000u,v.y<<16,v.y&0xffff0000u);
+                dst[1]=make_uint4(v.z<<16,v.z&0xffff0000u,v.w<<16,v.w&0xffff0000u);
+            }
+        } else {
+            // Arbitrary projection boundaries keep the same API as the scalar oracle.
+            for(int k=0;k<8;k++)if(col+k>=0 && col+k<cols) {
+                const unsigned short bits=tile[r][j+k];
+                if(bf16)((unsigned short*)out)[offset+col+k]=bits;
+                else ((unsigned int*)out)[offset+col+k]=(unsigned int)bits<<16;
+            }
+        }
+    }
+}
