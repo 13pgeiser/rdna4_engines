@@ -67,7 +67,9 @@ use rdna_compute::spec_sampling_cpu_ar as sc;
 use rdna_compute::{DType, Gpu, GpuTensor, HipError, HipResult};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use hip_bridge::KernargBlob;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
@@ -98,8 +100,9 @@ impl RowsBackend {
             }
             RowsBackend::CanonicalParallelF32 => {
                 "canonical top-pool (higher logit, lower id on numeric ties), 64-leaf tree sums, \
-                 serial nucleus; checked against canonical_target(), NOT bit-equal to the \
-                 reference on tied supports"
+                 serial nucleus; checked against canonical_target() with weights from the \
+                 test-only HIP expf map (CPU f32::exp variant reported as diagnostic only), \
+                 NOT bit-equal to the reference on tied supports"
             }
         }
     }
@@ -128,6 +131,8 @@ fn n_kinds() -> usize {
 struct SparseDist {
     e: Vec<(u32, f32)>,
     rt: Option<RtDist>,
+    /// Canonical backend only: the oracle with host `f32::exp` weights.
+    diag: Option<Vec<(u32, f32)>>,
 }
 impl SparseDist {
     fn entries(&self) -> &[(u32, f32)] {
@@ -154,6 +159,7 @@ impl SparseDist {
         Self {
             e: r.entries().to_vec(),
             rt: Some(r),
+            diag: None,
         }
     }
     fn set_point_mass(&mut self, token: u32) {
@@ -174,6 +180,7 @@ impl SparseDist {
     /// Target row under the selected backend's law.
     fn build_from_logits(
         &mut self,
+        gpu: &mut Gpu,
         logits: &[f32],
         spec: SampleSpec,
         scr: &mut Vec<(u32, f32)>,
@@ -185,8 +192,15 @@ impl SparseDist {
                 *self = Self::from_rt(r);
             }
             RowsBackend::CanonicalParallelF32 => {
-                self.e = canonical_target(logits, spec, scr)?;
+                // Authoritative: weights from the device expf map.
+                let mut dev = |a: &[f32]| -> Result<Vec<f32>, String> { dev_exp(gpu, a) };
+                self.e = canonical_target(logits, spec, scr, &mut dev)?;
                 self.rt = None;
+                // Diagnostic: the same law with host f32::exp weights.
+                let mut cpu = |a: &[f32]| -> Result<Vec<f32>, String> {
+                    Ok(a.iter().map(|x| x.exp()).collect())
+                };
+                self.diag = Some(canonical_target(logits, spec, scr, &mut cpu)?);
             }
         }
         Ok(())
@@ -236,6 +250,7 @@ fn canonical_target(
     logits: &[f32],
     spec: SampleSpec,
     scr: &mut Vec<(u32, f32)>,
+    exp: &mut dyn FnMut(&[f32]) -> Result<Vec<f32>, String>,
 ) -> Result<Vec<(u32, f32)>, String> {
     if !(spec.temperature > 0.0 && spec.temperature.is_finite()) {
         return Err(format!("non-positive temperature {}", spec.temperature));
@@ -258,12 +273,16 @@ fn canonical_target(
         return Ok(vec![(0, 1.0)]);
     };
     let inv_temp = 1.0f32 / spec.temperature;
+    let args: Vec<f32> = scr.iter().map(|&(_, l)| (l - max_logit) * inv_temp).collect();
+    let ex = exp(&args)?;
+    if ex.len() != args.len() {
+        return Err(format!("exp map returned {} values for {}", ex.len(), args.len()));
+    }
     let mut w = [0f32; CAP];
     let mut ids = [u32::MAX; CAP];
-    for (i, &(id, l)) in scr.iter().enumerate() {
+    for (i, &(id, _)) in scr.iter().enumerate() {
         ids[i] = id;
-        let p = ((l - max_logit) * inv_temp).exp();
-        w[i] = if p.is_finite() { p } else { 0.0 };
+        w[i] = if ex[i].is_finite() { ex[i] } else { 0.0 };
     }
     let full = tree64(&w);
     if full <= 0.0 || !full.is_finite() {
@@ -320,6 +339,148 @@ fn canonical_target(
     }
     e.retain(|&(_, p)| p > 0.0);
     Ok(e)
+}
+
+// ── test-only device expf map ────────────────────────────────────────
+//
+// The canonical law's weights are `expf` on the device. Rather than pretend
+// host `f32::exp` has the same bits, the oracle computes the exact f32 exp
+// arguments `RN(RN(l-max)*RN(1/T))` on the CPU, evaluates `expf` with a
+// test-only HIP kernel (same plain HIP `expf`, `fp contract(off)` as the
+// production parallel kernel), and runs the rest of the law on the CPU over
+// those device weights. That output is the authoritative oracle.
+
+const EXP_MAP_MODULE: &str = "fn_sampled_oracle_expf_map";
+const EXP_MAP_SYMBOL: &str = "fn_oracle_expf_map_f32";
+const EXP_MAP_SRC: &str = r#"#include <hip/hip_runtime.h>
+#pragma clang fp contract(off)
+extern "C" __global__ __launch_bounds__(64) void fn_oracle_expf_map_f32(
+    const float* a, float* o, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) o[i] = expf(a[i]);
+}
+"#;
+const EXP_MAP_CAP: usize = 256;
+
+#[derive(Default)]
+struct ExpState {
+    cache: HashMap<u32, u32>,
+    args: Option<GpuTensor>,
+    out: Option<GpuTensor>,
+    prepared: bool,
+    unique: u64,
+    differ_from_host: u64,
+    launches: u64,
+    samples: Vec<String>,
+}
+thread_local! {
+    static EXP_STATE: RefCell<ExpState> = RefCell::new(ExpState::default());
+}
+
+fn exp_map_run(gpu: &mut Gpu, s: &mut ExpState, misses: &[u32]) -> R<()> {
+    if !s.prepared {
+        hip(
+            gpu.ensure_kernel_public(EXP_MAP_MODULE, EXP_MAP_SRC, EXP_MAP_SYMBOL),
+            "ensure expf map kernel",
+        )?;
+        s.args = Some(hip(gpu.alloc_tensor(&[EXP_MAP_CAP], DType::F32), "alloc expf args")?);
+        s.out = Some(hip(gpu.alloc_tensor(&[EXP_MAP_CAP], DType::F32), "alloc expf out")?);
+        s.prepared = true;
+    }
+    let (a, o) = match (s.args.as_ref(), s.out.as_ref()) {
+        (Some(a), Some(o)) => (a, o),
+        _ => return setup("expf map buffers missing".into()),
+    };
+    for chunk in misses.chunks(EXP_MAP_CAP) {
+        let n = chunk.len();
+        hip(gpu.memcpy_htod_auto(&a.buf, &u32_bytes(chunk)), "expf map h2d")?;
+        let mut blob = KernargBlob::new();
+        blob.push_ptr(a.buf.as_ptr());
+        blob.push_ptr(o.buf.as_ptr());
+        blob.push_i32(n as i32);
+        hip(
+            gpu.launch_kernel_blob(
+                EXP_MAP_SYMBOL,
+                [((n + 63) / 64) as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                blob.as_mut_slice(),
+            ),
+            "expf map launch",
+        )?;
+        sync(gpu)?;
+        let mut out = vec![0u8; n * 4];
+        hip(gpu.memcpy_dtoh_auto(&mut out, &o.buf), "expf map d2h")?;
+        s.launches += 1;
+        for (&abits, w) in chunk.iter().zip(bytes_u32(&out)) {
+            let host = f32::from_bits(abits).exp().to_bits();
+            s.unique += 1;
+            if host != w {
+                s.differ_from_host += 1;
+                if s.samples.len() < 8 {
+                    s.samples.push(format!(
+                        "expf({:#010x}={}) device {:#010x} host {:#010x}",
+                        abits,
+                        f32::from_bits(abits),
+                        w,
+                        host
+                    ));
+                }
+            }
+            s.cache.insert(abits, w);
+        }
+    }
+    Ok(())
+}
+
+/// Device `expf` of every argument, memoized by argument bits.
+fn dev_exp(gpu: &mut Gpu, args: &[f32]) -> Result<Vec<f32>, String> {
+    let mut s = EXP_STATE.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let mut misses: Vec<u32> = Vec::new();
+    for a in args {
+        let b = a.to_bits();
+        if !s.cache.contains_key(&b) && !misses.contains(&b) {
+            misses.push(b);
+        }
+    }
+    let res = if misses.is_empty() {
+        Ok(())
+    } else {
+        exp_map_run(gpu, &mut s, &misses)
+    };
+    let out = match res {
+        Ok(()) => Ok(args
+            .iter()
+            .map(|a| f32::from_bits(s.cache.get(&a.to_bits()).copied().unwrap_or(0)))
+            .collect()),
+        Err(f) => Err(f.msg),
+    };
+    EXP_STATE.with(|c| *c.borrow_mut() = s);
+    out
+}
+
+fn exp_diag_json(st: &Stats) -> Value {
+    let (unique, differ, launches, samples, prepared) = EXP_STATE.with(|c| {
+        let s = c.borrow();
+        (s.unique, s.differ_from_host, s.launches, s.samples.clone(), s.prepared)
+    });
+    json!({
+        "authoritative_check": "device rows == canonical_target() fed by the test-only HIP expf map \
+                                (exp args RN(RN(l-max)*RN(1/T)) on the CPU, expf on the device), bit exact, no tolerance",
+        "expf_map_used": prepared,
+        "expf_map_kernel_sha256": sha_hex(EXP_MAP_SRC.as_bytes()),
+        "expf_map_unique_args": unique,
+        "expf_map_launches": launches,
+        "cpu_exp_diagnostic": {
+            "meaning": "device rows vs the same oracle with host f32::exp weights; diagnostic only, \
+                        never a failure, host libm and HIP expf are different functions",
+            "host_vs_device_expf_unique_args_differing": differ,
+            "host_vs_device_expf_samples": samples,
+            "rows_compared": st.diag_rows,
+            "rows_differing": st.diag_row_mismatch,
+            "first_differing_rows": st.diag_first,
+        },
+    })
 }
 
 // ── accept law, local copy (used when a target row has no runtime twin) ──
@@ -384,7 +545,7 @@ fn local_law_selfcheck(seed: u64) -> R<u64> {
     let mut r = Rng(seed ^ 0xC0FFEE);
     let spec = SampleSpec::cpu_ar(1.0, 0.95, None, 0.0);
     let vocab = 50usize;
-    let mut mk = |r: &mut Rng| -> R<SparseDist> {
+    let mk = |r: &mut Rng| -> R<SparseDist> {
         let mut ids: Vec<u32> = Vec::new();
         while ids.len() < 8 {
             let t = r.below(vocab) as u32;
@@ -1198,6 +1359,7 @@ struct Spec {
 }
 
 fn build_window(
+    gpu: &mut Gpu,
     corpora: &[Corpus],
     pols: &[(SampleSpec, String)],
     sp: &Spec,
@@ -1215,7 +1377,7 @@ fn build_window(
     let mut ps = Vec::with_capacity(k + 1);
     for &ri in &rows {
         let mut d = SparseDist::default();
-        d.build_from_logits(&c.rows[ri], spec, &mut scr)
+        d.build_from_logits(gpu, &c.rows[ri], spec, &mut scr)
             .map_err(|e| Fail {
                 code: 2,
                 msg: format!("host p: {e}"),
@@ -1483,6 +1645,9 @@ struct Stats {
     enq_cand: u64,
     enq_accept: u64,
     enq_traffic: Tally,
+    diag_rows: u64,
+    diag_row_mismatch: u64,
+    diag_first: Vec<String>,
     cov: BTreeMap<String, u64>,
 }
 impl Stats {
@@ -1527,6 +1692,46 @@ fn check_rows(
         st.prob_bits_compared += e.len() as u64;
     }
     Ok(())
+}
+
+/// Diagnostic only, never a failure: compares the device rows with the
+/// canonical oracle evaluated with host `f32::exp` weights. HIP `expf` and the
+/// host libm are different functions, so a difference here is expected data,
+/// not evidence about the device law; the authoritative check is `check_rows`
+/// against the oracle fed by the device expf map.
+fn diag_cpu_rows(
+    label: &str,
+    counts: &[u32],
+    ids: &[u32],
+    probs: &[u32],
+    row0: usize,
+    dists: &[&SparseDist],
+    st: &mut Stats,
+) {
+    for (r, d) in dists.iter().enumerate() {
+        let Some(c) = d.diag.as_ref() else { continue };
+        let row = row0 + r;
+        st.diag_rows += 1;
+        let mut bad = counts[row] as usize != c.len();
+        if !bad {
+            for (i, &(t, p)) in c.iter().enumerate() {
+                if ids[row * CAP + i] != t || probs[row * CAP + i] != p.to_bits() {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if bad {
+            st.diag_row_mismatch += 1;
+            if st.diag_first.len() < 8 {
+                st.diag_first.push(format!(
+                    "{label}: device count {} vs cpu-exp oracle count {}",
+                    counts[row],
+                    c.len()
+                ));
+            }
+        }
+    }
 }
 
 struct DevRead {
@@ -1662,6 +1867,15 @@ fn check_window(
         &win.ps.iter().collect::<Vec<_>>(),
         st,
     )?;
+    diag_cpu_rows(
+        &format!("{ctx} target"),
+        &dev.t_counts,
+        &dev.t_ids,
+        &dev.t_probs,
+        0,
+        &win.ps.iter().collect::<Vec<_>>(),
+        st,
+    );
     check_rows(
         &format!("{ctx} draft"),
         &dev.d_counts,
@@ -1798,7 +2012,7 @@ fn run_distribution(
                 let mut scr = Vec::new();
                 for (ri, r) in chunk.iter().enumerate() {
                     let mut d = SparseDist::default();
-                    d.build_from_logits(r, *spec, &mut scr)
+                    d.build_from_logits(gpu, r, *spec, &mut scr)
                         .map_err(|e| Fail { code: 2, msg: e })?;
                     check_rows(
                         &format!("distribution vocab={vocab} policy[{pi}]({pname}) row {ri}"),
@@ -1809,6 +2023,15 @@ fn run_distribution(
                         &[&d],
                         st,
                     )?;
+                    diag_cpu_rows(
+                        &format!("distribution vocab={vocab} policy[{pi}]({pname}) row {ri}"),
+                        &counts,
+                        &ids,
+                        &probs,
+                        ri,
+                        &[&d],
+                        st,
+                    );
                 }
                 cases += 1;
             }
@@ -1899,7 +2122,7 @@ fn run_windows(
                     seed: seed_ctr,
                     fixed_u: None,
                 };
-                let win = build_window(corpora, pols, &sp, &mut dr, format!("directed:{name}:{}:p{pi}", c.name))?;
+                let win = build_window(gpu, corpora, pols, &sp, &mut dr, format!("directed:{name}:{}:p{pi}", c.name))?;
                 run_window(gpu, res, corpora, pols, &win, "directed", st)?;
                 directed += 1;
             }
@@ -1941,7 +2164,7 @@ fn run_windows(
             seed: seed_ctr,
             fixed_u: None,
         };
-        let win = build_window(corpora, pols, &sp, &mut dr, format!("random#{w}"))?;
+        let win = build_window(gpu, corpora, pols, &sp, &mut dr, format!("random#{w}"))?;
         run_window(gpu, res, corpora, pols, &win, "random", st)?;
         randomized += 1;
     }
@@ -2156,7 +2379,7 @@ fn run_graph_oracle(
             seed: args.seed ^ gi as u64,
             fixed_u: Some(fixed_u.clone()),
         };
-        let w0 = build_window(corpora, pols, &first, &mut dr, format!("graph{gi}:seed"))?;
+        let w0 = build_window(gpu, corpora, pols, &first, &mut dr, format!("graph{gi}:seed"))?;
         let qs0 = qs_host(&w0, spec);
         upload_window(gpu, &res, &corpora[0], &w0, &qs0)?;
         sync(gpu)?;
@@ -2176,7 +2399,7 @@ fn run_graph_oracle(
                 seed: dr.next(),
                 fixed_u: Some(fixed_u.clone()),
             };
-            let win = build_window(corpora, pols, &sp, &mut dr, format!("graph{gi}:replay{rp}"))?;
+            let win = build_window(gpu, corpora, pols, &sp, &mut dr, format!("graph{gi}:replay{rp}"))?;
             // Mutate every resident input, then replay the captured graph.
             let qs = qs_host(&win, spec);
             upload_window(gpu, &res, &corpora[0], &win, &qs)?;
@@ -2274,7 +2497,7 @@ fn run_timing_policy(
                 seed: dr.next(),
                 fixed_u: Some(fixed_u),
             };
-            let win = build_window(corpora, pols, &sp, &mut dr, format!("timing:k{k}:w{w}"))?;
+            let win = build_window(gpu, corpora, pols, &sp, &mut dr, format!("timing:k{k}:w{w}"))?;
             let qs = qs_host(&win, spec);
             let rf = host_reference(&win, &qs, win.eos)?;
             let accepted_eos = rf.hit_eos && rf.committed.len() == rf.accepted;
@@ -2612,6 +2835,7 @@ fn fill_stats(rec: &mut Map<String, Value>, st: &Stats) {
         }),
     );
     rec.insert("coverage".into(), json!(st.cov));
+    rec.insert("canonical_target_oracle".into(), exp_diag_json(st));
     rec.insert(
         "enqueue_calls".into(),
         json!({
