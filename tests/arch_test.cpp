@@ -4058,3 +4058,63 @@ TEST(a_gemma4_prefill_chunk_runs_as_two_slices_with_its_reductions_on_the_second
     CHECK(c.joins.empty());
     for (const auto& i : c.issues) CHECK_EQ(i.lane, 0);
 }
+
+/* THE ATTENTION JOIN WRITES THE ROUTED ARM'S INPUTS on a layer whose gate_up is block fp8
+ * (gemma4k norm_add_norm_route): the router's norm into moe_rn and the experts' codes into
+ * moe_hq / moe_hqs, so a step issues neither the router's rmsnorm nor rmsnorm_quant_fp8. Refused,
+ * norm_add_norm and the two launches. A tp-4 prefill through the overlap keeps every reduction
+ * ordered with the route form too. */
+TEST(gemma4_attention_join_writes_the_routed_inputs_on_fp8_experts) {
+    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    std::map<std::string, int> issued[2];
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", fp8 } };
+        if (refuse) b.refuse.insert("norm_add_norm_route");
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        CHECK_EQ(count_resolved(b, "norm_add_norm_route"), refuse ? 0 : 6);
+        CHECK_EQ(count_resolved(b, "norm_add_norm"), refuse ? 6 : 0);
+        CHECK(noted(b, refuse ? "routed inputs: 0 of 6" : "routed inputs: 6 of 6"));
+        if (!refuse) {
+            const RecOp* r = find_op(b, "norm_add_norm_route");
+            REQUIRE(r != nullptr);
+            for (const char* name : { "moe_rn", "moe_hq", "moe_hqs", "x", "h" })
+                CHECK(std::count(r->writes.begin(), r->writes.end(),
+                                 (rad_buf)buf_named(b, name)) == 1);
+        }
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        for (const auto& n : issued_ops(b, c)) ++issued[refuse][n];
+    }
+    CHECK_EQ(issued[0]["norm_add_norm_route"], 6);
+    CHECK_EQ(issued[0]["norm_add_norm"], 0);
+    CHECK_EQ(issued[0]["rmsnorm_quant_fp8"], 0);
+    CHECK_EQ(issued[1]["norm_add_norm_route"], 0);
+    CHECK_EQ(issued[1]["norm_add_norm"], 6);
+    CHECK_EQ(issued[1]["rmsnorm_quant_fp8"], 6);
+    CHECK_EQ(issued[1]["rmsnorm"] - issued[0]["rmsnorm"], 6);   /* the router's input norm */
+    CHECK_EQ(issued[0]["moe_gemm_q"], 6);
+
+    /* tp 4, an 8192-token chunk in two slices */
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", fp8 } };
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx(0, 4);
+    ctx.max_tok = 8192;
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+    CHECK(noted(b, "prefill overlap: a chunk of two routed passes"));
+    const int32_t out[1] = { 8191 };
+    RadBatch batch = one_prompt(8192, out);
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 4; c.batch = &batch;
+    gemma4::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    CHECK_EQ(races(b, c), 0);
+    CHECK_EQ(count_issued(issued_ops(b, c), "norm_add_norm_route"), 12);
+    CHECK_EQ(count_issued(issued_ops(b, c), "rmsnorm_quant_fp8"), 0);
+}

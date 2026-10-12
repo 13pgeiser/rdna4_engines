@@ -299,6 +299,7 @@ rounding.
 | op | params | operands |
 |---|---|---|
 | `norm_add_norm` | `M`(range) `n` `eps`:f64 `dtype` | `a`, `w_a`w, `x`:inout, `w_y`w → `y` |
+| `norm_add_norm_route` | `M`(range) `n` `eps`:f64 `dtype` `mult`:f64 `group` | `a`, `w_a`w, `x`:inout, `w_y`w → `y`; `w_r`w → `r`; `w_e`w → `q`, `qs` |
 | `join_add_scale` | `M`(range) `n` `eps`:f64 `dtype` | `d`, `w_d`w, `r`, `w_r`w, `w_j`w, `x`:inout, `s`w, `w_n`w? → `y`? |
 | `expert_scale` | `M`(range) `n_expert` `top_k` `dtype` | `ids`, `w_e`w, `ew`:inout |
 | `attn_paged_qrow` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
@@ -314,6 +315,14 @@ Every value the chain stores is rounded to the activation dtype at the same poin
 differ from the chain only in the order a sum of squares is added in: with the same order they are
 bit-identical to it, and against a chain summed in another block width a norm factor can differ in
 its last bit.
+
+`norm_add_norm_route` is `norm_add_norm` and, from the same norm of the `x` it writes, a MoE
+layer's two routed inputs: `r = rmsnorm(x) * w_r * mult` -- `rmsnorm`'s expression with `mult` --
+and `q`, `qs` = `rmsnorm_quant_fp8` of `x` under `w_e`: E4M3 codes of the bf16-rounded norm, an
+f32 scale per (row, `group` columns) of `amax / 448` (1 for an all-zero group), the value over it
+clamped to +-448. `n` is whole groups and `group` 128. In Gemma 4 it replaces the router's
+`rmsnorm` and the experts' `rmsnorm_quant_fp8`, two launches a layer that read back the `x` the
+join had just written.
 
 `expert_scale` is `ew[t, k] = ew[t, k] * w_e[ids[t, k]]` over `[M, top_k]`, `w_e` an `[n_expert]`
 table and an id outside it reading 0: Gemma 4's per_expert_scale on the renormalised routing

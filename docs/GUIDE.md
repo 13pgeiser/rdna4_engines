@@ -1859,7 +1859,7 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct at al
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 | `RADIANCE_G4K_WMMA` | `0` keeps `gemma4k`'s prefill attention on its scalar kernel instead of the WMMA one. An A/B switch and a way out if the matrix path misbehaves on a card; read once |
-| `RADIANCE_GEMMA4_FUSE` | `0` makes `arch/gemma4` declare the chains instead of `gemma4k`'s fusions: the rmsnorm / add chain for the sandwich joins (`norm_add_norm`, `join_add_scale`), `embed_lookup` + `mul` for `expert_scale`, and a `cast` lifting q for `attn_paged` for `attn_paged_qrow`. An A/B switch; read at declare |
+| `RADIANCE_GEMMA4_FUSE` | `0` makes `arch/gemma4` declare the chains instead of `gemma4k`'s fusions: the rmsnorm / add chain for the sandwich joins (`norm_add_norm`, `norm_add_norm_route`, `join_add_scale`), `embed_lookup` + `mul` for `expert_scale`, and a `cast` lifting q for `attn_paged` for `attn_paged_qrow`. An A/B switch; read at declare |
 | `RADIANCE_GEMMA4_OVERLAP` | `0` runs every `arch/gemma4` prefill chunk whole, its all-reduces on the compute stream, instead of as two slices whose all-reduces ride a second stream beside the other slice's compute. An A/B switch; read at declare |
 
 There is also a family of instruments for engine development — `RADIANCE_DEBUG_*` (residual probes,

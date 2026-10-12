@@ -11,6 +11,8 @@
  *   norm_add_norm and join_add_scale, ops this library DEFINES: Gemma 4's two sandwich-norm joins,
  *     each one kernel in place of a chain of rmsnorm / add / mul_weight launches, rounding where the
  *     chain rounds (g4k_norm.hip). The arch plugin asks for them and falls back to the chain.
+ *     norm_add_norm_route is the attention join writing the routed arm's two inputs as well -- the
+ *     router's norm and the experts' fp8 codes -- in place of an rmsnorm and an rmsnorm_quant_fp8.
  *
  * Put it AHEAD of libr4d for Gemma 4 (`--kernels gemma4k,libr4d,...`). The hierarchy is absolute,
  * and libr4d has rows at h256/gqa2 and h512/gqa8 too -- written for the dense 31B, which has no
@@ -40,6 +42,7 @@
 #define C_GE(k, v) { (k), RAD_C_GE, (long long)(v), nullptr }
 #define C_LE(k, v) { (k), RAD_C_LE, (long long)(v), nullptr }
 #define C_IN(k, s) { (k), RAD_C_IN, 0, (s) }
+#define C_DIV(k, v) { (k), RAD_C_DIV, (long long)(v), nullptr }
 
 namespace {
 
@@ -73,6 +76,26 @@ static const RadOperandSpec oNan[] = {
     { "x",   RAD_OPD_INOUT,  0 },
     { "w_y", RAD_OPD_WEIGHT, 0 },
     { "y",   RAD_OPD_OUT,    0 },
+};
+static const RadParamSpec pRoute[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED, 0 },
+    { "n",     RAD_P_INT, RAD_REQUIRED, 0 },
+    { "eps",   RAD_P_F64, RAD_REQUIRED, 0 },
+    { "dtype", RAD_P_STR, RAD_REQUIRED, 0 },
+    { "mult",  RAD_P_F64, RAD_REQUIRED, 0 },
+    { "group", RAD_P_INT, RAD_REQUIRED, 0 },
+};
+static const RadOperandSpec oRoute[] = {
+    { "a",   RAD_OPD_IN,     0 },
+    { "w_a", RAD_OPD_WEIGHT, 0 },
+    { "x",   RAD_OPD_INOUT,  0 },
+    { "w_y", RAD_OPD_WEIGHT, 0 },
+    { "y",   RAD_OPD_OUT,    0 },
+    { "w_r", RAD_OPD_WEIGHT, 0 },
+    { "r",   RAD_OPD_OUT,    0 },
+    { "w_e", RAD_OPD_WEIGHT, 0 },
+    { "q",   RAD_OPD_OUT,    0 },
+    { "qs",  RAD_OPD_OUT,    0 },
 };
 static const RadOperandSpec oJas[] = {
     { "d",   RAD_OPD_IN,     0 },
@@ -138,6 +161,11 @@ static const RadOpSchema kSchemas[] = {
       "t = rmsnorm(a) * w_a; x = x + t; y = rmsnorm(x) * w_y, over [M, n] rows; every value the "
       "unfused rmsnorm, add, rmsnorm chain stores is rounded to the activation dtype at the same "
       "point. A post-norm, the residual add and the next pre-norm (Gemma's sandwich)." },
+    { "norm_add_norm_route", ROW(pRoute), ROW(oRoute),
+      "norm_add_norm, then from the same rmsnorm of the x it writes r = rmsnorm(x) * w_r * mult "
+      "and the E4M3 codes q of rmsnorm(x) * w_e with an f32 scale qs per (row, `group` columns): "
+      "rmsnorm_quant_fp8's codes, taken over the bf16-rounded norm. A MoE layer's router input and "
+      "its experts' fp8 input, written by the attention join that already holds the norm." },
     { "join_add_scale", ROW(pJoin), ROW(oJas),
       "x = (x + rmsnorm(rmsnorm(d) * w_d + rmsnorm(r) * w_r) * w_j) * s, over [M, n] rows, s one "
       "element; and with w_n and y, y = rmsnorm(x) * w_n over the x written. Rounding where the "
@@ -301,17 +329,36 @@ static bool hgain(const RadTensor* w, int64_t n) {
     return w && w->dtype == RAD_F32 && rad_tensor_numel(w) == n;
 }
 
-int norm_add_norm_host(const RadArgs* a, RadStream) {
-    if (!a || a->n_t < 5) return RAD_E_INVAL;
+/* [rows..., n] of `dt`, dense last axis, for the route form's fp8 codes and f32 scales */
+static bool hrows_as(const RadTensor* t, uint32_t dt, int64_t n, int64_t* rows, int64_t* ld) {
+    if (!t || t->dtype != dt || t->rank < 1 || rad_tensor_lastdim(t) != n) return false;
+    if (t->stride[t->rank - 1] != 1) return false;
+    *rows = rad_tensor_rows(t);
+    *ld = rad_tensor_row_pitch(t);
+    return true;
+}
+
+/* norm_add_norm, and with `route` norm_add_norm_route's three more outputs */
+static int nan_host(const RadArgs* a, bool route) {
+    if (!a || a->n_t < (route ? 10 : 5)) return RAD_E_INVAL;
     const int64_t n = rad_args_geti_or(a, "n", 0);
     const double eps = rad_args_getf_or(a, "eps", 1e-6);
+    const float mult = (float)rad_args_getf_or(a, "mult", 1.0);
     const RadTensor *A_ = rad_arg_in(a, 0), *Wa = rad_arg_in(a, 1), *X = rad_arg_in(a, 2),
                     *Wy = rad_arg_in(a, 3), *Y = rad_arg_in(a, 4);
-    if (n <= 0 || !A_ || !X || !Y) return RAD_E_INVAL;
-    if (!hgain(Wa, n) || !hgain(Wy, n)) return RAD_E_DTYPE;
-    int64_t ra, la, rx, lx, ry, ly;
+    const RadTensor *Wr = route ? rad_arg_in(a, 5) : nullptr, *R = route ? rad_arg_in(a, 6) : nullptr;
+    const RadTensor *We = route ? rad_arg_in(a, 7) : nullptr, *Q = route ? rad_arg_in(a, 8) : nullptr;
+    const RadTensor *S = route ? rad_arg_in(a, 9) : nullptr;
+    if (n <= 0 || !A_ || !X || !Y || (route && (!R || !Q || !S))) return RAD_E_INVAL;
+    if (route && (n % 128 || rad_args_geti_or(a, "group", 0) != 128)) return RAD_E_SHAPE;
+    if (!hgain(Wa, n) || !hgain(Wy, n) || (route && (!hgain(Wr, n) || !hgain(We, n))))
+        return RAD_E_DTYPE;
+    int64_t ra, la, rx, lx, ry, ly, rr = 0, lr = 0, rq = 0, lq = 0, rs = 0, ls = 0;
     if (!hrows(A_, n, &ra, &la) || !hrows(X, n, &rx, &lx) || !hrows(Y, n, &ry, &ly)) return RAD_E_SHAPE;
-    if (ra < rx || ry < rx) return RAD_E_SHAPE;
+    if (route && (!hrows(R, n, &rr, &lr) || !hrows_as(Q, RAD_F8E4M3, n, &rq, &lq) ||
+                  !hrows_as(S, RAD_F32, n / 128, &rs, &ls)))
+        return RAD_E_SHAPE;
+    if (ra < rx || ry < rx || (route && (rr < rx || rq < rx || rs < rx))) return RAD_E_SHAPE;
     const float *wa = (const float*)Wa->data, *wy = (const float*)Wy->data;
     std::vector<float> v((size_t)n), xv((size_t)n);
     for (int64_t m = 0; m < rx; ++m) {
@@ -327,9 +374,33 @@ int norm_add_norm_host(const RadArgs* a, RadStream) {
         }
         const float sx = hnorm(xv.data(), n, eps);
         for (int64_t i = 0; i < n; ++i) yr[i] = hf2b((xv[(size_t)i] * sx) * wy[i]);
+        if (!route) continue;
+        /* the router's row, and the experts' as rmsnorm_quant_fp8 writes it (v holds it) */
+        const float *wr = (const float*)Wr->data, *we = (const float*)We->data;
+        uint16_t* rrow = (uint16_t*)R->data + m * lr;
+        uint8_t* qrow = (uint8_t*)Q->data + m * lq;
+        float* srow = (float*)S->data + m * ls;
+        for (int64_t i = 0; i < n; ++i) {
+            rrow[i] = hf2b(((xv[(size_t)i] * sx) * wr[i]) * mult);
+            v[(size_t)i] = hrbf((xv[(size_t)i] * sx) * we[i]);
+        }
+        for (int64_t g = 0; g < n / 128; ++g) {
+            float am = 0.0f;
+            for (int64_t i = g * 128; i < g * 128 + 128; ++i)
+                am = std::fmax(am, std::fabs(v[(size_t)i]));
+            const float sc = am > 0.0f ? am * (1.0f / 448.0f) : 1.0f;
+            const float inv = 1.0f / sc;
+            srow[g] = sc;
+            for (int64_t i = g * 128; i < g * 128 + 128; ++i) {
+                const float c = std::fmin(std::fmax(v[(size_t)i] * inv, -448.0f), 448.0f);
+                qrow[i] = rad_f32_to_fp8e4m3(c);
+            }
+        }
     }
     return RAD_OK;
 }
+int norm_add_norm_host(const RadArgs* a, RadStream) { return nan_host(a, false); }
+int norm_add_norm_route_host(const RadArgs* a, RadStream) { return nan_host(a, true); }
 
 int join_add_scale_host(const RadArgs* a, RadStream) {
     if (!a || a->n_t < 7) return RAD_E_INVAL;
@@ -431,6 +502,10 @@ G4K_ATTN_C(cH512x8B, 512, 8, "bf16", 0) G4K_ATTN_C(cH512x8F, 512, 8, "fp8_e4m3",
 /* the device kernels hold 24 elements a thread over a 256-thread block */
 static const RadConstraint cJoin[]    = { C_GE("n", 1), C_LE("n", 6144), C_IN("dtype", "bf16") };
 static const RadConstraint cJoinHost[] = { C_GE("n", 1), C_IN("dtype", "bf16") };
+static const RadConstraint cRoute[]    = { C_GE("n", 128), C_LE("n", 6144), C_DIV("n", 128),
+                                           C_EQ("group", 128), C_IN("dtype", "bf16") };
+static const RadConstraint cRouteHost[] = { C_GE("n", 128), C_DIV("n", 128), C_EQ("group", 128),
+                                            C_IN("dtype", "bf16") };
 static const RadConstraint cPick[]    = { C_GE("n", 1), C_IN("dtype", "f32 fp32") };
 static const RadConstraint cEscale[]  = { C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1),
                                           C_IN("dtype", "bf16") };
@@ -489,6 +564,20 @@ static const RadKernelInfo kKernels[] = {
       "bf16 activations, f32 gains",
       RAD_DOMAIN_HOST, 10, ROW(cJoinHost), NOTUNE,
       nullptr, nullptr, norm_add_norm_host, nullptr, nullptr, nullptr, nullptr,
+      nullptr, nullptr, nullptr },
+    { "norm_add_norm_route_bf16", "norm_add_norm_route", "norm",
+      "norm_add_norm, and the routed arm's router input and fp8 expert input from the same norm",
+      "n <= 6144 in whole 128-column groups, any M, row pitches honoured",
+      "bf16 activations, f32 gains; E4M3 codes with an f32 scale a 128 columns",
+      RAD_DOMAIN_DEVICE, 10, ROW(cRoute), NOTUNE,
+      nullptr, nullptr, g4k_norm_add_norm_route_bf16, nullptr, nullptr, nullptr, nullptr,
+      nullptr, nullptr, nullptr },
+    { "norm_add_norm_route_bf16_host", "norm_add_norm_route", "norm",
+      "norm_add_norm, and the routed arm's router input and fp8 expert input from the same norm",
+      "any [M, n] in whole 128-column groups",
+      "bf16 activations, f32 gains; E4M3 codes with an f32 scale a 128 columns",
+      RAD_DOMAIN_HOST, 10, ROW(cRouteHost), NOTUNE,
+      nullptr, nullptr, norm_add_norm_route_host, nullptr, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr },
     { "join_add_scale_bf16", "join_add_scale", "norm",
       "two arms' post-norms, sum, norm, residual add, layer scalar: one block a row",

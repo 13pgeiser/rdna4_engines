@@ -542,10 +542,13 @@ expert parity, so a rank holds an even number of experts.
 **Kernels.** `--kernels gemma4k,libr4d,libavx`, **gemma4k first.** It serves all of the trunk's
 attention -- the sliding layers (h256, gqa 2) and the full layers at gqa 8, 4 and 2 (one or two,
 four, eight ranks) -- plus `pair_argmax` and the fusions: the two sandwich-norm joins
-(`norm_add_norm`, `join_add_scale`), `expert_scale`, and `attn_paged_qrow`, the sliding layers'
-attention reading q where the fused qkv projection left it. The plugin declares each one's unfused
-form where nothing serves it -- the rmsnorm / add chain, `embed_lookup` + `mul`, a `cast` lifting q
-for `attn_paged` -- and the startup notes say which were taken. The drafter's residual add, norm
+(`norm_add_norm`, `join_add_scale`), `norm_add_norm_route` -- on a layer whose gate_up is block
+fp8, the attention join writing the router's input and the experts' fp8 codes from the norm it
+already takes, in place of an `rmsnorm` and an `rmsnorm_quant_fp8` -- `expert_scale`, and
+`attn_paged_qrow`, the sliding layers' attention reading q where the fused qkv projection left it.
+The plugin declares each one's unfused form where nothing serves it -- the rmsnorm / add chain,
+`embed_lookup` + `mul`, a `cast` lifting q for `attn_paged` -- and the startup notes say which
+were taken. The drafter's residual add, norm
 and fp8 quantiser of x are one libr4d `rmsnorm_quant_fp8` launch an input (ten a draft pass), and
 the `add` / `rmsnorm` / `quant_act_fp8` chain where nothing serves it. libr4d has h256/gqa2 and
 h512/gqa8 rows as well, written for the dense 31B; with gemma4k first the 26B-A4B runs on the

@@ -20,6 +20,16 @@
  * and, rarely, a bf16 output by one ulp. The arch plugin asks for these first and falls back to
  * the chain where nothing serves them (gemma4.cpp).
  *
+ * AND THE ROUTED ARM'S TWO INPUTS (norm_add_norm_route). The 26B-A4B's router reads norm(x) * w_r *
+ * hidden^-0.5 and its experts norm(x) * w_e, quantised to E4M3 -- two more launches a layer
+ * (`rmsnorm`, `rmsnorm_quant_fp8`), each reading back the x norm_add_norm has just written and
+ * taking the sum of squares norm_add_norm has just taken. The route form writes both from the norm
+ * factor it holds: the router's row by libr4d's rmsnorm expression, ((x * s) * w) * mult, and the
+ * experts' codes as libr4d's rmsnorm_quant_fp8 writes them -- the bf16-rounded norm, a scale of
+ * amax * (1 / 448) a 128 columns (1 where the group is all zero), the value times its reciprocal
+ * clamped to +-448, one v_cvt_pk_fp8_f32. Element i is thread i % 256 at slot i / 256, so a group
+ * is four waves at one slot: a wave's max, then the four.
+ *
  * One 256-thread block a row: a decode step is a handful of rows, so the row is latency-bound and
  * a block's three reductions beat seven launches. Values a later stage reuses stay in registers
  * (PER a thread, 12 to n = 3072 and kMaxPer = 24 to 6144; the row table says so).
@@ -99,22 +109,30 @@ struct NormArgs {
     const float*    w2;                     /*        w_j */
     const float*    w3;                     /*        w_n, the next norm's gain (or null) */
     const uint16_t* s;                      /*        the layer scalar, bf16, one element */
+    /* norm_add_norm_route: the router's input, the experts' codes and their scales; the router's
+     * gain is w2 and the experts' w3 */
+    uint16_t*       rt; long long rt_ld;
+    uint8_t*        q;  long long q_ld;
+    float*          qs; long long qs_ld;
+    float mult;
     int   n;
     float eps;
 };
 
-/* t = norm(a) * w_a;  x += t;  y = norm(x) * w_y */
-template <int PER>
+/* t = norm(a) * w_a;  x += t;  y = norm(x) * w_y -- and with ROUTE, from the same norm of x, the
+ * router's input norm(x) * w_r * mult and the experts' norm(x) * w_e as E4M3 codes and scales */
+template <int PER, bool ROUTE>
 __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
     __shared__ float lds[kWaves];
+    __shared__ float gmax[ROUTE ? PER * kWaves : 1];
     const int tid = (int)threadIdx.x, n = A.n;
     const long long m = (long long)blockIdx.x;
     const uint16_t* ar = A.a + m * A.a_ld;
     uint16_t* xr = A.x + m * A.x_ld;
     uint16_t* yr = A.y + m * A.y_ld;
 
-    /* every operand of the row in flight at once: the block output, the residual, both gains */
-    float av[PER], xv[PER], wa[PER], wy[PER];
+    /* every operand of the row in flight at once: the block output, the residual, the gains */
+    float av[PER], xv[PER], wa[PER], wy[PER], wr[ROUTE ? PER : 1], we[ROUTE ? PER : 1];
 #pragma unroll
     for (int k = 0; k < PER; ++k) {
         const int i = tid + k * kThreads;
@@ -123,6 +141,10 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
         xv[k] = in ? bf2f(xr[i]) : 0.0f;
         wa[k] = in ? A.w0[i] : 0.0f;
         wy[k] = in ? A.w1[i] : 0.0f;
+        if constexpr (ROUTE) {
+            wr[k] = in ? A.w2[i] : 0.0f;
+            we[k] = in ? A.w3[i] : 0.0f;
+        }
     }
     float ss = 0.0f;
 #pragma unroll
@@ -140,10 +162,45 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
         ss += xv[k] * xv[k];
     }
     const float sx = norm_factor(block_sum(ss, lds), n, A.eps);
+    uint16_t* rr = ROUTE ? A.rt + m * A.rt_ld : nullptr;
 #pragma unroll
     for (int k = 0; k < PER; ++k) {
         const int i = tid + k * kThreads;
-        if (i < n) yr[i] = f2bf((xv[k] * sx) * wy[k]);
+        if (i < n) {
+            yr[i] = f2bf((xv[k] * sx) * wy[k]);
+            if constexpr (ROUTE) {
+                rr[i] = f2bf(((xv[k] * sx) * wr[k]) * A.mult);
+                av[k] = rbf((xv[k] * sx) * we[k]);   /* the experts' row, as quantised */
+            }
+        } else if constexpr (ROUTE) {
+            av[k] = 0.0f;
+        }
+    }
+    if constexpr (ROUTE) {
+        /* group 2k + tid / 128 at slot k is waves 0..3 or 4..7: each wave's max, then its four */
+        const int wave = tid >> 5, half = tid >> 7;
+#pragma unroll
+        for (int k = 0; k < PER; ++k) {
+            float mx = fabsf(av[k]);
+#pragma unroll
+            for (int d = 16; d >= 1; d >>= 1) mx = fmaxf(mx, shfl_xor(mx, d));
+            if (lane_id() == 0) gmax[k * kWaves + wave] = mx;
+        }
+        __syncthreads();
+        uint8_t* qr = A.q + m * A.q_ld;
+        float* sr = A.qs + m * A.qs_ld;
+#pragma unroll
+        for (int k = 0; k < PER; ++k) {
+            const int i = tid + k * kThreads;
+            if (i >= n) continue;                    /* n is whole groups: a group is in or out */
+            const float* g = gmax + k * kWaves + 4 * half;
+            const float am = fmaxf(fmaxf(g[0], g[1]), fmaxf(g[2], g[3]));
+            const float sc = am > 0.0f ? am * (1.0f / 448.0f) : 1.0f;
+            const float inv = 1.0f / sc;
+            const float v = fminf(fmaxf(av[k] * inv, -448.0f), 448.0f);
+            qr[i] = (uint8_t)(__builtin_amdgcn_cvt_pk_fp8_f32(v, v, 0, false) & 0xff);
+            if ((tid & 127) == 0) sr[i >> 7] = sc;
+        }
     }
 }
 
@@ -224,13 +281,16 @@ __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
 
 /* ------------------------------------------------------------------ host: the launch adapters */
 
-/* [rows..., n] with a dense last axis: its row count and pitch, or false */
-static bool rows_of(const RadTensor* t, int64_t n, int64_t* rows, int64_t* ld) {
-    if (!t || t->dtype != RAD_BF16 || t->rank < 1) return false;
+/* [rows..., n] of `dt` with a dense last axis: its row count and pitch, or false */
+static bool rows_as(const RadTensor* t, uint32_t dt, int64_t n, int64_t* rows, int64_t* ld) {
+    if (!t || t->dtype != dt || t->rank < 1) return false;
     if (rad_tensor_lastdim(t) != n || (t->stride[t->rank - 1] != 1)) return false;
     *rows = rad_tensor_rows(t);
     *ld = rad_tensor_row_pitch(t);
     return *ld >= n || *rows <= 1;
+}
+static bool rows_of(const RadTensor* t, int64_t n, int64_t* rows, int64_t* ld) {
+    return rows_as(t, RAD_BF16, n, rows, ld);
 }
 static bool gain(const RadTensor* w, int64_t n) {
     return w && w->dtype == RAD_F32 && rad_tensor_numel(w) == n &&
@@ -272,11 +332,54 @@ int g4k_norm_add_norm_bf16(const RadArgs* a, RadStream stream) {
     P.w0 = (const float*)Wa->data;   P.w1 = (const float*)Wy->data;
     P.n = (int)n; P.eps = eps;
     if (n <= (int64_t)kThreads * 12)
-        G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel<12>), dim3((unsigned)M), dim3(kThreads),
+        G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel<12, false>), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
     else
-        G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel<kMaxPer>), dim3((unsigned)M), dim3(kThreads),
+        G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel<kMaxPer, false>), dim3((unsigned)M),
+                   dim3(kThreads), (hipStream_t)stream, P);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* operands: a, w_a, x (inout), w_y, y, w_r, r, w_e, q, qs */
+int g4k_norm_add_norm_route_bf16(const RadArgs* a, RadStream stream) {
+    using namespace g4kn;
+    if (!a || a->n_t < 10) return RAD_E_INVAL;
+    int64_t n = 0;
+    float eps = 0.0f;
+    if (int rc = params(a, &n, &eps)) return rc;
+    if (n % 128 || rad_args_geti_or(a, "group", 0) != 128) return RAD_E_SHAPE;
+    const RadTensor *A_ = rad_arg_in(a, 0), *Wa = rad_arg_in(a, 1), *X = rad_arg_in(a, 2),
+                    *Wy = rad_arg_in(a, 3), *Y = rad_arg_in(a, 4), *Wr = rad_arg_in(a, 5),
+                    *R = rad_arg_in(a, 6), *We = rad_arg_in(a, 7), *Q = rad_arg_in(a, 8),
+                    *S = rad_arg_in(a, 9);
+    if (!A_ || !X || !Y || !R || !Q || !S) return RAD_E_INVAL;
+    if (!gain(Wa, n) || !gain(Wy, n) || !gain(Wr, n) || !gain(We, n)) return RAD_E_DTYPE;
+    int64_t ra = 0, la = 0, rx = 0, lx = 0, ry = 0, ly = 0, rr = 0, lr = 0, rq = 0, lq = 0,
+            rs = 0, ls = 0;
+    if (!rows_of(A_, n, &ra, &la) || !rows_of(X, n, &rx, &lx) || !rows_of(Y, n, &ry, &ly) ||
+        !rows_of(R, n, &rr, &lr) || !rows_as(Q, RAD_F8E4M3, n, &rq, &lq) ||
+        !rows_as(S, RAD_F32, n / 128, &rs, &ls))
+        return RAD_E_SHAPE;
+    const int64_t M = rx;                            /* the step's rows: the stream's view */
+    if (M <= 0) return RAD_OK;
+    if (ra < M || ry < M || rr < M || rq < M || rs < M || M > 0x7fffffff) return RAD_E_SHAPE;
+    NormArgs P{};
+    P.a = (const uint16_t*)A_->data; P.a_ld = la;
+    P.x = (uint16_t*)X->data;        P.x_ld = lx;
+    P.y = (uint16_t*)Y->data;        P.y_ld = ly;
+    P.rt = (uint16_t*)R->data;       P.rt_ld = lr;
+    P.q = (uint8_t*)Q->data;         P.q_ld = lq;
+    P.qs = (float*)S->data;          P.qs_ld = ls;
+    P.w0 = (const float*)Wa->data;   P.w1 = (const float*)Wy->data;
+    P.w2 = (const float*)Wr->data;   P.w3 = (const float*)We->data;
+    P.mult = (float)rad_args_getf_or(a, "mult", 1.0);
+    P.n = (int)n; P.eps = eps;
+    if (n <= (int64_t)kThreads * 12)
+        G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel<12, true>), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
+    else
+        G4K_LAUNCH(G4K_KNAME(norm_add_norm_kernel<kMaxPer, true>), dim3((unsigned)M),
+                   dim3(kThreads), (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

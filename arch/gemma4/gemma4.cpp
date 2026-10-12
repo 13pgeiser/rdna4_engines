@@ -248,6 +248,10 @@ struct Layer {
      * routed layer's fpost1 + fpost2 + fsum + fpost + add_f + scale. Zero where not served, and
      * then the chain above is declared and issued instead. */
     rad_op op_join_a = 0, op_join_f = 0;
+    /* op_join_r: op_join_a writing the routed arm's two inputs as well -- the router's norm into
+     * b_rn and the experts' fp8 codes into b_hq / b_hqs (gemma4k norm_add_norm_route) -- where the
+     * layer's gate_up is block fp8. op_rnorm and op_enorm are then declared and not issued. */
+    rad_op op_join_r = 0;
     /* op_join_f also writes the NEXT norm -- the following layer's input norm, or the final norm
      * after the last layer -- into `h`, with that norm's gain `w_next`; the norm it replaces is
      * then neither declared nor issued. */
@@ -1013,7 +1017,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * libref has no row for the joins on purpose, so "nothing serves them" stays reachable. */
     const char* fuse_env = std::getenv("RADIANCE_GEMMA4_FUSE");
     const bool fuse_joins = !(fuse_env && fuse_env[0] == '0');
-    int n_joins = 0;
+    int n_joins = 0, n_route = 0;
 
     const int A = RAD_ACCESS_PER_TOKEN, N = RAD_SHARD_NONE;
     /* EVERY LAYER'S INPUT NORM GAIN, AHEAD OF THE LAYERS: a feed-forward join writes the next
@@ -1157,13 +1161,37 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* bf16 and one element: the reference multiplies the bf16 stream by it. */
         y.w_scalar = decl_w(b, nm.f("blk.%lld.layer_scalar", ll), RAD_BF16, {1}, A, N, gl);
 
-        if (fuse_joins)
+        /* The routed arm's two input norms -- the router's gain and the experts' pre-norm -- are
+         * declared here, ahead of the attention join, which writes both inputs where gemma4k
+         * serves `norm_add_norm_route` and an op names its weights after they are declared. */
+        if (m.moe) {
+            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_norm_exps.weight", ll),
+                                  src("pre_feedforward_layernorm_2.weight")));
+            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_gate_inp.scale", ll), src("router.scale")));
+            y.w_enorm  = decl_w(b, nm.f("blk.%lld.ffn_norm_exps.weight", ll), RAD_F32, {E}, A, N,
+                                gl);
+            y.w_rscale = decl_w(b, nm.f("blk.%lld.ffn_gate_inp.scale", ll), RAD_F32, {E}, A, N, gl);
+        }
+
+        /* THE ATTENTION JOIN, and on a layer whose gate_up is block fp8 the routed arm's two
+         * inputs with it: the router's norm (rmsnorm's expression, its mult hidden^-0.5) and the
+         * experts' E4M3 codes (rmsnorm_quant_fp8's) from the norm of x the join already takes --
+         * two launches a layer fewer, and two reads of x. Then norm_add_norm, then the chain. */
+        if (fuse_joins && m.moe && y.gu_fp8)
+            y.op_join_r = rw(b, RAD_OP(b, "norm_add_norm_route",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
+                                               RAD_F64("eps", eps), RAD_STR("dtype", "bf16"),
+                                               RAD_F64("mult", 1.0 / std::sqrt((double)E)),
+                                               RAD_INT("group", RAD_FP8_BLOCK)),
+                                    RAD_WEIGHTS(y.w_apost, y.w_fnorm, y.w_rscale, y.w_enorm)),
+                             {m.b_o, m.b_x}, {m.b_x, m.b_h, m.b_rn, m.b_hq, m.b_hqs});
+        if (fuse_joins && !y.op_join_r)
             y.op_join_a = rw(b, RAD_OP(b, "norm_add_norm",
                                     RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
                                                RAD_F64("eps", eps), RAD_STR("dtype", "bf16")),
                                     RAD_WEIGHTS(y.w_apost, y.w_fnorm)),
                              {m.b_o, m.b_x}, {m.b_x, m.b_h});
-        if (!y.op_join_a) {
+        if (!y.op_join_a && !y.op_join_r) {
             y.op_apost = rmsnorm(T, E, y.w_apost, 1.0, m.b_o, m.b_o);
             y.op_add_a = binop("add", T, E, m.b_x, m.b_o, m.b_x);
             y.op_fnorm = rmsnorm(T, E, y.w_fnorm, 1.0, m.b_x, m.b_h);
@@ -1180,19 +1208,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                   src("post_feedforward_layernorm_1.weight")));
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_post_norm2.weight", ll),
                                   src("post_feedforward_layernorm_2.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_norm_exps.weight", ll),
-                                  src("pre_feedforward_layernorm_2.weight")));
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_gate_inp.weight", ll), src("router.proj.weight")));
-            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_gate_inp.scale", ll), src("router.scale")));
             RAD_ARCH_TRY(map_copy(b, nm.f("blk.%lld.ffn_exp_scale", ll), src("router.per_expert_scale")));
             y.w_fpost1 = decl_w(b, nm.f("blk.%lld.ffn_post_norm1.weight", ll), RAD_F32, {E}, A, N, gl);
             y.w_fpost2 = decl_w(b, nm.f("blk.%lld.ffn_post_norm2.weight", ll), RAD_F32, {E}, A, N, gl);
-            y.w_enorm  = decl_w(b, nm.f("blk.%lld.ffn_norm_exps.weight", ll), RAD_F32, {E}, A, N, gl);
             /* THE ROUTER IS REPLICATED (rad_block_moe_fp8.h argues it): every rank routes every
              * token the same way from the same residual stream. */
             y.w_router = decl_w(b, nm.f("blk.%lld.ffn_gate_inp.weight", ll), RAD_BF16,
                                 {m.n_expert, E}, A, N, gl);
-            y.w_rscale = decl_w(b, nm.f("blk.%lld.ffn_gate_inp.scale", ll), RAD_F32, {E}, A, N, gl);
             y.w_escale = decl_w(b, nm.f("blk.%lld.ffn_exp_scale", ll), RAD_BF16, {m.n_expert}, A,
                                 N, gl);
             /* THE EXPERTS: whole experts, this rank's run of them (their name maps and encodings
@@ -1425,7 +1448,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    RAD_WEIGHTS(y.w_scalar)),
                                {m.b_x}, {m.b_x});
         }
-        n_joins += (y.op_join_a ? 1 : 0) + (y.op_join_f ? 1 : 0);
+        n_joins += (y.op_join_a || y.op_join_r ? 1 : 0) + (y.op_join_f ? 1 : 0);
+        n_route += y.op_join_r ? 1 : 0;
 
         /* THE TAP: a row copy of the layer's output into the column slice a tap owns, DECLARED
          * HERE, after the layer's last op, because that is where step() issues it. The buffer
@@ -1455,8 +1479,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const bool  ov_off = ov_env && ov_env[0] == '0';
     m.overlap = W > 1 && m.moe && g.wire_exact && T >= 2 * m.moe_rows && !ov_off;
     for (const Layer& y : m.layers)
-        m.overlap = m.overlap && y.op_join_a && y.op_join_f && y.next_norm && y.op_ar_o &&
-                    y.op_ar_f;
+        m.overlap = m.overlap && (y.op_join_a || y.op_join_r) && y.op_join_f && y.next_norm &&
+                    y.op_ar_o && y.op_ar_f;
     if (m.overlap) {
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_o));
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ff2));
@@ -1512,6 +1536,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              n_joins, (long long)(m.moe ? 2 * m.n_layer : m.n_layer),
              !fuse_joins ? " -- RADIANCE_GEMMA4_FUSE=0, the rmsnorm / add / mul_weight chain"
              : n_joins == 0 ? " -- not served (load gemma4k), the rmsnorm / add / mul_weight chain" : "");
+    if (m.moe && m.n_gu_fp8 > 0)
+        rad_note(b, "routed inputs: %d of %d fp8 layers take the router's norm and the experts' "
+                    "codes from the attention join (gemma4k norm_add_norm_route)%s",
+                 n_route, m.n_gu_fp8,
+                 n_route ? "" : " -- the rmsnorm and rmsnorm_quant_fp8 launches instead");
     if (m.ks.nh > 0)
         rad_note(b, "sliding attention: q %s", m.qrow == 1
                     ? "read in the fused qkv row (gemma4k attn_paged_qrow)"
@@ -1556,8 +1585,9 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
         const int64_t n = (end - r0 < m.moe_rows) ? (end - r0) : m.moe_rows;
         int32_t* const counts = rad_route_counts(c, (int)(&y - m.layers.data()), NL);
         const RadOperand ecnt = counts ? praw(counts, RAD_I32, NL) : brows(m.b_ecnt, NL);
-        RAD_ISSUE_N(c, y.op_rnorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_rscale),
-                    brow_slice(m.b_rn, r0, n, E));
+        if (!y.op_join_r)   /* the attention join wrote the router's input otherwise */
+            RAD_ISSUE_N(c, y.op_rnorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_rscale),
+                        brow_slice(m.b_rn, r0, n, E));
         /* One launch, two or three: the router, its top-k and the sort (see declare). */
         const bool rfused = y.op_router_fused && n <= y.router_fused_rows;
         const bool pair = !rfused && y.op_topk_scatter && n <= y.topk_scatter_rows;
@@ -1589,12 +1619,13 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
             RAD_ISSUE_N(c, y.op_emul, n, brow_slice(m.b_ew, r0, n, K), brow_slice(m.b_es, r0, n, K),
                         brow_slice(m.b_ew, r0, n, K));
         }
-        /* rmsnorm_quant_fp8's operands: x, residual (absent), w, q, scale, out_bf16 (absent). */
-        if (y.gu_fp8)
+        /* rmsnorm_quant_fp8's operands: x, residual (absent), w, q, scale, out_bf16 (absent) --
+         * where the attention join did not write the codes already. */
+        if (y.gu_fp8 && !y.op_join_r)
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_NONE, RAD_W(y.w_enorm),
                         brow_slice(m.b_hq, r0, n, E), brow_slice(m.b_hqs, r0, n, E / RAD_FP8_BLOCK),
                         RAD_NONE);
-        else
+        else if (!y.gu_fp8)
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_enorm),
                         brow_slice(m.b_hx, r0, n, E));
         if (!rfused && !pair)
@@ -1696,7 +1727,11 @@ static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
         attend(c, m, y, li, batch);
         RAD_ISSUE(c, y.op_o, brows(y.full ? m.b_attf : m.b_atts, T), RAD_W(y.w_o), brows(m.b_o, T));
         if (y.op_ar_o) RAD_ISSUE_N(c, y.op_ar_o, T * E, brows(m.b_o, T), RAD_NONE);
-        if (y.op_join_a) {
+        if (y.op_join_r) {
+            RAD_ISSUE(c, y.op_join_r, brows(m.b_o, T), RAD_W(y.w_apost), brows(m.b_x, T),
+                      RAD_W(y.w_fnorm), brows(m.b_h, T), RAD_W(y.w_rscale), brows(m.b_rn, T),
+                      RAD_W(y.w_enorm), brows(m.b_hq, T), brows(m.b_hqs, T));
+        } else if (y.op_join_a) {
             RAD_ISSUE(c, y.op_join_a, brows(m.b_o, T), RAD_W(y.w_apost), brows(m.b_x, T),
                       RAD_W(y.w_fnorm), brows(m.b_h, T));
         } else {
@@ -1804,8 +1839,14 @@ static void out_proj(RadCtx* c, const Model& m, const Layer& y, int64_t r0, int6
  * routed, so its feed-forward reduction is one run. */
 static void arms(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t r0, int64_t n) {
     const int64_t E = m.E, F = m.n_ff;
-    RAD_ISSUE_N(c, y.op_join_a, n, brow_slice(m.b_o, r0, n, E), RAD_W(y.w_apost),
-                brow_slice(m.b_x, r0, n, E), RAD_W(y.w_fnorm), brow_slice(m.b_h, r0, n, E));
+    if (y.op_join_r)
+        RAD_ISSUE_N(c, y.op_join_r, n, brow_slice(m.b_o, r0, n, E), RAD_W(y.w_apost),
+                    brow_slice(m.b_x, r0, n, E), RAD_W(y.w_fnorm), brow_slice(m.b_h, r0, n, E),
+                    RAD_W(y.w_rscale), brow_slice(m.b_rn, r0, n, E), RAD_W(y.w_enorm),
+                    brow_slice(m.b_hq, r0, n, E), brow_slice(m.b_hqs, r0, n, E / RAD_FP8_BLOCK));
+    else
+        RAD_ISSUE_N(c, y.op_join_a, n, brow_slice(m.b_o, r0, n, E), RAD_W(y.w_apost),
+                    brow_slice(m.b_x, r0, n, E), RAD_W(y.w_fnorm), brow_slice(m.b_h, r0, n, E));
     RAD_ISSUE_N(c, y.op_gu, n, brow_slice(m.b_h, r0, n, E), RAD_W(y.w_gu),
                 brow_slice(m.b_gu, r0, n, 2 * F));
     RAD_ISSUE_N(c, y.op_act, n, bcol_at(m.b_gu, r0, 2 * F, 0, F, n),

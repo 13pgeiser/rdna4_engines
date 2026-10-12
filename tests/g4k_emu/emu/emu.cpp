@@ -1,4 +1,5 @@
 #include "hip/hip_runtime.h"
+#include "rad_plugin.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -102,6 +103,11 @@ int emu_bpermute(int addr, int v) {
     return S.slot[w][par][(addr >> 2) & 31];
 }
 int emu_readlane(int v, int lane) { return emu_bpermute(lane << 2, v); }
+int emu_cvt_pk_fp8(float a, float b, int old, bool hi) {
+    const unsigned pk = (unsigned)rad_f32_to_fp8e4m3(a) | ((unsigned)rad_f32_to_fp8e4m3(b) << 8);
+    const unsigned o = (unsigned)old;
+    return (int)(hi ? ((o & 0xffffu) | (pk << 16)) : ((o & 0xffff0000u) | pk));
+}
 static short g_wa[64][2][32][8], g_wb[64][2][32][8];
 emu_v8f emu_wmma_bf16(emu_v8s a, emu_v8s b, emu_v8f c) {
     const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;

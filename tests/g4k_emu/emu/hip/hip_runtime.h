@@ -45,6 +45,11 @@ emu_v8f emu_wmma_bf16(emu_v8s a, emu_v8s b, emu_v8f c);
 typedef _Float16 emu_v8h __attribute__((ext_vector_type(8)));
 emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c);
 #define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) emu_wmma_f16((a), (b), (c))
+/* v_cvt_pk_fp8_f32 (gfx12, OCP E4M3): a and b as two codes into the low half of `old` (hi false)
+ * or its high half, the other half kept; round to nearest even. The project's saturating encoder,
+ * rad_f32_to_fp8e4m3, is the same function on the +-448 a kernel clamps to first. */
+int emu_cvt_pk_fp8(float a, float b, int old, bool hi);
+#define __builtin_amdgcn_cvt_pk_fp8_f32(a, b, old, hi) emu_cvt_pk_fp8((a), (b), (old), (hi))
 extern int emu_last_block;     /* threads a block of the last grid had: which kernel ran */
 
 struct alignas(8)  uint2  { unsigned x, y; };
