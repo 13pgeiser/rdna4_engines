@@ -33,6 +33,10 @@ half.workspace = true
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
 
+[[example]]
+name = "npu_trunk_consumers_check"
+required-features = ["lab"]
+
 # ---------------------------------------------------------------------------
 # Archived research probes.
 #

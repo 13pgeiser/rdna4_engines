@@ -13,6 +13,10 @@ use hip_bridge::{HipError, HipResult, KernargBlob};
 use crate::{DType, Gpu, GpuTensor};
 use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
 
+#[path = "npu_trunk_consumers.rs"]
+pub(crate) mod npu_arena;
+pub use npu_arena::*;
+
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/tensor_ops.hip")

@@ -482,6 +482,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("fused_rmsnorm_mq_rotate_awq_i4_fold_b8", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_B8_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_fold_b8"]);
         // Qwen4 chunked-GDN inline-Q8 recurrence (opt-in `HIPFIRE_QWEN4_GDN_Q8_INLINE`, exact gfx1151; tensor_ops.rs gated_delta_step_gate_wmma_arms).
         add!("gated_delta_chunk_q8_wmma", crate::tensor_ops::GATED_DELTA_CHUNK_Q8_WMMA_SRC, ["gated_delta_chunk_gate_q8_wmma"]);
+        add!("gated_delta_chunk_wmma_arena", crate::tensor_ops::npu_arena::CHUNK_ARENA_SRC, ["gated_delta_chunk_gate_wmma_arena"]);
+        add!("gated_delta_chunk_q8_wmma_arena", crate::tensor_ops::npu_arena::CHUNK_Q8_ARENA_SRC, ["gated_delta_chunk_gate_q8_wmma_arena"]);
+        add!("npu_trunk_consumers", crate::tensor_ops::npu_arena::ARENA_SRC, [
+            "gated_delta_conv_batched_arena", "gated_delta_conv_qknorm_batched_arena",
+            "gated_delta_params_batched_arena", "gated_delta_gate_arena",
+            "gated_delta_gate_batched_arena", "indexed_attention_norm_rope_batch_arena",
+            "gated_delta_gate_batched_rotate_arena",
+            "indexed_attention_cache_append_q8_batch_arena",
+        ]);
         add!("gated_norm_mq_rotate_awq_i4_gfx1151_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC, ["gated_norm_mq_rotate_awq_i4_gfx1151_v2"]);
         add!("gdn_chunk_scan_gfx1151", kernels::GDN_CHUNK_SCAN_GFX1151_SRC, ["gdn_chunk_scan_gfx1151"]);
         add!("gemm_mq4g256v2_residual_iu4_v2b_gfx11", kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC, ["gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_swz_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11"]);

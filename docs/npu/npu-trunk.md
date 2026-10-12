@@ -460,3 +460,74 @@ EP, compact scratch, calibrated `auto`, variable-size NPU programs and CPU-free 
 are outside this first-light route. CPU bookkeeping tests live under
 `gpu_forward::npu_forward::tests`; the full-model greedy comparison and trace
 overlap inspection remain the parent-run silicon acceptance gate.
+
+## Direct BF16 arena consumer interfaces
+
+`rdna_compute::tensor_ops::Bf16Arena { tensor, row_pitch_elems, col0_elems }`
+is an immutable BF16 view; pitch and column offset are **elements**, not bytes.
+The tensor can be a borrowed GPU-visible host-registered buffer and must remain
+alive through stream completion. `ColumnMap` is authoritative: GDN pitch 16640,
+qkv at 0, z at 10240, **a at 16384, b at 16432**; QSA pitch 14080,
+qgate at 0, k at 12288, v at 12800, index at 13312. Qgate is 24 repetitions of
+`q[256] | gate[256]`, not a global q/gate split. Index is `query[512] | key[128]`.
+
+All functions below take `gpu` first and return `HipResult<()>`. `p`, `conv`,
+`params`, `step`, and `gate` are the corresponding incumbent parameter structs;
+all non-projection arguments retain their meaning.
+
+| Variant signature after `gpu` | Projection/output convention | Implementation |
+| --- | --- | --- |
+| `gated_delta_conv_batched_arena(p, qkv)` | `p.input` ignored; output and history unchanged, including aliasing | hipcc compile-time twin |
+| `gated_delta_conv_params_batched_arena(conv, params, qkv, a, b)` | Input/a/b fields ignored; fused convolution and parameter blocks | hipcc compile-time twin |
+| `gated_delta_conv_params_qknorm_batched_arena(conv, params, step, keep_qk_conv, qkv, a, b)` | Same fusion; QN/KN go to the incumbent shared scratch | hipcc compile-time twin |
+| `gated_delta_params_batched_arena(p, a, b)` | `p.a/p.b` ignored; gate/beta remain contiguous F32 | hipcc |
+| `gated_delta_gate_arena(p, z)` | `p.z` ignored; single-row, read-only recurrent input | hipcc |
+| `gated_delta_gate_batched_arena(p, z)` | `p.z` ignored; rounded recurrent input updated as before | hipcc |
+| `gated_delta_gate_batched_rotate_arena(p, rotated, z)` | Non-chunk prefill: gate plus all FWHT rotation outputs; same prerotation marker | hipcc |
+| `gated_delta_step_gate_wmma_arena(step, gate, z)` | `gate.z` ignored; normal state/inline-Q8 selector retained | hipcc compile-time twin |
+| `gated_delta_step_gate_wmma_qknormed_arena(step, gate, z)` | Same, with convolution-provided QN/KN | hipcc compile-time twin |
+| `gated_delta_step_gate_q8_wmma_arena(step, gate, z)` | Explicit inline-Q8 arm, independent of inline selector | hipcc compile-time twin |
+| `indexed_attention_norm_rope_batch_arena(p, src)` | Immutable BF16 input; `p.values` is out-of-place F32 output, at `p.row_stride/p.head_stride` | hipcc |
+| `indexed_attention_cache_append_batch_arena(p, key: Option<Bf16Arena>, value)` | `Some(key)` reads BF16; `None` reads normalized contiguous F32 `p.key`; `p.value` ignored | PM for F32 caches; hipcc for Q8/FP8 |
+| `indexed_attention_index_key_append_batch_arena(p, index)` | `p.index_rows` is F32 output: query preserved, key tail written; raw keys may be BF16 or F32 | PM |
+
+The out-of-place norm copies untouched gates and index-key tails as it writes
+the normalized heads. Thus **attention reads its transformed F32 qgate output**
+and **index selection reads its transformed F32 index query**; neither reads a
+raw trunk projection, so neither needs an additional arena kernel. Cache append
+after K normalization uses `key=None` plus the original BF16 V view. Index append
+writes only the output tail and raw-key cache, never the source arena.
+
+`npu_trunk_copy_projection_arena(gpu, src, dst, rows, cols, dst_pitch,
+dst_col0, position_start)` is the PM row-copy primitive used for cache stores
+and the lab's exact old-path materialization. Its three certified gfx1151
+exports cover BF16→F32 (`bits << 16`), BF16→BF16 and F32→F32. The committed
+`npu_trunk_arena_pm_gfx1151.{s,co,hxaco,proof.json,m7.json}` carry M7 byte-exact
+lifts, empty obligations and zero ambiguous delays; the embedded image is
+SHA256-pinned. Hipcc exceptions have one entry per kernel in
+`/home/kaden/qcal/release-0.4.2/PM-GAPS.md`.
+
+### Parent's Halo consumer oracle
+
+```sh
+cd /home/kaden/ClaudeCode/warpfront/wt-npu-trunk
+HIPFIRE_QWEN4_GDN_PREFILL=wy HIPFIRE_QWEN4_F16_WMMA=1 \
+CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
+nice -n 19 cargo run --release -p rdna-compute --features lab \
+  --example npu_trunk_consumers_check -j 12
+```
+
+Run with GPUs visible on Halo, not in the CPU build environment. For 8192 and
+4647 rows at each family's pitch, this compares all output/state bytes:
+convolution history (including in-place aliasing), normalized QN/KN scratch,
+recurrent state (including inline-Q8 codes/scales and diagnostic F32 capture),
+non-chunk fused-gate FWHT rotation outputs,
+QSA gates/index tails, complete K/V caches and raw index keys with untouched
+prefix/suffix guards. It verifies the materializer independently against CPU
+bit widening, prints old timings including materialization versus direct reads,
+checks immutable arena bytes, and exits 1 on any mismatch. GPU parity/timings
+are parent-run silicon evidence, not implied by CPU build/test success.
+
+Replay follows the incumbent position contracts: cache/raw-key stores and
+RoPE positions are bound to replay position; compact F32 scratch-tail writes
+and the lab copy primitive's concrete destination offset remain position-independent.

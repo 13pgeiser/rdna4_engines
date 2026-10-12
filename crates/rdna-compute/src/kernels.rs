@@ -12,6 +12,10 @@ pub const NPU_TRUNK_SRC: &str = include_str!("../../../kernels/src/npu_trunk.hip
 pub const NPU_TRUNK_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/npu_trunk_pm_gfx1151.hxaco");
 pub const NPU_TRUNK_PM_GFX1151_SHA256: &str = "b39f1b52b5da2bf9ca04304655ea6fada7fedff05f7c96b993d7f379ff7cc353";
 
+/// Certified direct BF16/F32 row-major cache readers (M7, gfx1151).
+pub const NPU_TRUNK_ARENA_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/npu_trunk_arena_pm_gfx1151.hxaco");
+pub const NPU_TRUNK_ARENA_PM_GFX1151_SHA256: &str = "ba515981171b9ef533a2863ef386715bb2cc4f1956e40dcde8b97327709e49e7";
+
 /// GEMV F32: y = alpha * A * x + beta * y
 /// Uses shared memory reduction across wavefronts.
 pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");

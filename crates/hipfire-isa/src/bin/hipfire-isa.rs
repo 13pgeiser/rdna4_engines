@@ -312,6 +312,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "qwen4_mq6_x4"=>qwen4_mq6_x4(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4_gfx11"=>qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "npu_trunk"=>{if arch!=Arch::Gfx1151{return Err("npu_trunk is gfx1151 only".into())} let (_,text,proof)=hipfire_isa::npu_trunk::emit_module()?;(text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?)},
+  "npu_trunk_arena"=>{if arch!=Arch::Gfx1151{return Err("npu_trunk_arena is gfx1151 only".into())} let (_,text,proof)=hipfire_isa::npu_trunk_arena::emit_module()?;(text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?)},
   "qwen4_lane_rows"=>qwen4_lane_rows(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq4_x4_gfx11"=>qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mq4_rows_x4"=>mq4_rows_x4(epi.as_deref().unwrap_or("all"),arch)?,
@@ -326,7 +327,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  let pm_module=kernel.strip_prefix("pm_decode_");
  let mq4v=kernel=="mq4_verify";
  let mq4f8=kernel=="mq4_fp8_verify";
- let lane_rows=kernel=="qwen4_lane_rows"||kernel=="npu_trunk";
+ let lane_rows=kernel=="qwen4_lane_rows"||kernel=="npu_trunk"||kernel=="npu_trunk_arena";
  let spec_pm=kernel=="spec_sampling_rows_pm"||kernel=="spec_accept_pm";
  let mtp_q8=kernel=="mtp_q8_det_gfx11";
  let mtp_det=kernel=="mtp_dense_det_gfx11"||mtp_q8;
@@ -380,7 +381,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  if lane_rows {
   let path=co.as_deref().ok_or("missing --co")?;
   let mut receipts=serde_json::Map::new();
-  let symbols: &[&str] = if kernel=="npu_trunk" { &hipfire_isa::npu_trunk::SYMBOLS } else { &hipfire_isa::kernels::qwen4_lane_rows::SYMBOLS };
+  let symbols: &[&str] = if kernel=="npu_trunk" { &hipfire_isa::npu_trunk::SYMBOLS } else if kernel=="npu_trunk_arena" { &hipfire_isa::npu_trunk_arena::SYMBOLS } else { &hipfire_isa::kernels::qwen4_lane_rows::SYMBOLS };
   for &symbol in symbols {
    receipts.insert(symbol.to_owned(),hipfire_isa::pm_check::m7(std::path::Path::new(path),arch.name(),symbol)?);
   }

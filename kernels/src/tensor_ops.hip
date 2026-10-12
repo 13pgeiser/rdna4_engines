@@ -2174,6 +2174,24 @@ static __device__ __forceinline__ void gated_delta_params_flat(
     beta[flat] = 1.0f / (1.0f + expf(-bf16_to_f32(bf16_round(b[flat]))));
 }
 
+#ifdef NPU_TRUNK_ARENA
+static __device__ __forceinline__ void gated_delta_params_flat_arena(
+    const __hip_bfloat16* a, const __hip_bfloat16* b,
+    const __hip_bfloat16* a_log, const __hip_bfloat16* dt_bias,
+    float* gate, float* beta, int flat, int heads,
+    int a_pitch, int a_col0, int b_pitch, int b_col0) {
+    const int head = flat % heads;
+    const float al = bf16_to_f32(a_log[head]);
+    const float dt = bf16_to_f32(dt_bias[head]);
+    const float value = bf16_to_f32(a[(size_t)(flat / heads) * a_pitch + a_col0 + head]) + dt;
+    const float softplus = value > 20.0f
+        ? value
+        : (value < -20.0f ? expf(value) : log1pf(expf(value)));
+    gate[flat] = -expf(al) * softplus;
+    beta[flat] = 1.0f / (1.0f + expf(-bf16_to_f32(b[(size_t)(flat / heads) * b_pitch + b_col0 + head])));
+}
+#endif
+
 extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     const float* input,
     const __hip_bfloat16* kernel,
@@ -2194,7 +2212,12 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     float* gate,
     float* beta,
     int param_elements,
-    int heads) {
+    int heads
+#ifdef NPU_TRUNK_ARENA
+    , int input_pitch, int input_col0, int param_a_pitch, int param_a_col0,
+    int param_b_pitch, int param_b_col0
+#endif
+    ) {
     // Compact 1-D grid: blocks [0, conv_blocks * row_grid) are the convolution
     // tiles (bx = channel block, by = 16-row block), the trailing blocks are
     // the parameter blocks.
@@ -2203,7 +2226,13 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     if (blockIdx.x >= conv_total) {
         const int flat = (int)(blockIdx.x - conv_total) * 256 + (int)threadIdx.x;
         if (flat < param_elements)
+#ifdef NPU_TRUNK_ARENA
+            gated_delta_params_flat_arena((const __hip_bfloat16*)param_a,
+                (const __hip_bfloat16*)param_b, a_log, dt_bias, gate, beta, flat, heads,
+                param_a_pitch, param_a_col0, param_b_pitch, param_b_col0);
+#else
             gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
+#endif
         return;
     }
     const unsigned by = blockIdx.x / conv_blocks;
@@ -2218,7 +2247,11 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     auto in = [&](int j) {
         if (input_bf16) {
             __hip_bfloat16 b;
+#ifdef NPU_TRUNK_ARENA
+            b.data = ((const unsigned short*)input)[(size_t)j * input_pitch + input_col0 + channel];
+#else
             b.data = ((const unsigned short*)input)[j * channels + channel];
+#endif
             return b;
         }
         return bf16_round(input[j * channels + channel]);
@@ -2344,13 +2377,24 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
     int param_elements,
     int heads,
     __hip_bfloat16* qn,
-    __hip_bfloat16* kn) {
+    __hip_bfloat16* kn
+#ifdef NPU_TRUNK_ARENA
+    , int input_pitch, int input_col0, int param_a_pitch, int param_a_col0,
+    int param_b_pitch, int param_b_col0
+#endif
+    ) {
     const unsigned conv_blocks = (unsigned)(channels + 255) / 256u;
     const unsigned conv_total = conv_blocks * (((unsigned)rows + 15u) / 16u);
     if (blockIdx.x >= conv_total) {
         const int flat = (int)(blockIdx.x - conv_total) * 256 + (int)threadIdx.x;
         if (flat < param_elements)
+#ifdef NPU_TRUNK_ARENA
+            gated_delta_params_flat_arena((const __hip_bfloat16*)param_a,
+                (const __hip_bfloat16*)param_b, a_log, dt_bias, gate, beta, flat, heads,
+                param_a_pitch, param_a_col0, param_b_pitch, param_b_col0);
+#else
             gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
+#endif
         return;
     }
     const unsigned by = blockIdx.x / conv_blocks;
@@ -2376,7 +2420,11 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
         const unsigned short* kern_u16 = (const unsigned short*)kernel;
         auto in4 = [&](int j, __hip_bfloat16 (&o)[4]) {
             if (input_bf16) {
+#ifdef NPU_TRUNK_ARENA
+                const uint2 w = *(const uint2*)(in_u16 + (size_t)j * input_pitch + input_col0 + c0);
+#else
                 const uint2 w = *(const uint2*)(in_u16 + (size_t)j * channels + c0);
+#endif
                 o[0].data = (unsigned short)(w.x & 0xFFFFu);
                 o[1].data = (unsigned short)(w.x >> 16);
                 o[2].data = (unsigned short)(w.y & 0xFFFFu);
@@ -2471,7 +2519,11 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
     auto in = [&](int j) {
         if (input_bf16) {
             __hip_bfloat16 b;
+#ifdef NPU_TRUNK_ARENA
+            b.data = ((const unsigned short*)input)[(size_t)j * input_pitch + input_col0 + channel];
+#else
             b.data = ((const unsigned short*)input)[j * channels + channel];
+#endif
             return b;
         }
         return bf16_round(input[j * channels + channel]);
