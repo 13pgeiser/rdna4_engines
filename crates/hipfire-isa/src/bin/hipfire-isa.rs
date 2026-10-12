@@ -167,6 +167,15 @@ fn mtp_dense_det_gfx11(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=mtp_dense_det_gfx11::emit(Spec{arch})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
+/// gfx1151 MTP append DET Q8_0 -> F16 weight converter (`mtp_q8_0_to_f16_pm_gfx1151`; module `mtp_q8_det_pm_gfx1151`):
+/// `--epi convert|all`, both the one entry.
+fn mtp_q8_det_gfx11(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::mtp_q8_det_gfx11::{self,Spec};
+ if epi=="all"{let (_,text,proof)=mtp_q8_det_gfx11::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ if epi!="convert"{return Err(format!("mtp_q8_det_gfx11 --epi {epi} (convert|all)"))}
+ let e=mtp_q8_det_gfx11::emit(Spec{arch})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
 /// gfx1201 MQ4G256V2 wide exact-verify twins of hipcc's `_vt{4,8}w{4,8}_k32`
 /// entries: `--epi <op>_bt<4|8>w<4|8>` one entry, `all` (default) the module.
 fn mq4_verify_specs(epi:&str,arch:Arch)->Result<Vec<hipfire_isa::kernels::mq4_verify::Spec>,String>{
@@ -307,6 +316,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "mq4_rows_x4"=>mq4_rows_x4(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_shared_gu_gfx11"=>qwen4_shared_gu_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mtp_dense_det_gfx11"=>mtp_dense_det_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
+  "mtp_q8_det_gfx11"=>mtp_q8_det_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mq4_verify"=>mq4_verify(epi.as_deref().unwrap_or("all"),arch)?,
   "mq4_fp8_verify"=>mq4_fp8_verify(epi.as_deref().unwrap_or("all"),arch)?,
   "fp8_gemm"=>fp8_gemm(scale.as_deref().ok_or("missing --scale")?,epi.as_deref().ok_or("missing --epi")?,arch)?,
@@ -317,13 +327,14 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  let mq4f8=kernel=="mq4_fp8_verify";
  let lane_rows=kernel=="qwen4_lane_rows";
  let spec_pm=kernel=="spec_sampling_rows_pm"||kernel=="spec_accept_pm";
- let mtp_det=kernel=="mtp_dense_det_gfx11";
- if pm_module.is_none()&&!mq4v&&!mq4f8&&!lane_rows&&!spec_pm&&!mtp_det&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm and mtp_dense_det_gfx11 (--m7 only)".into())}
+ let mtp_q8=kernel=="mtp_q8_det_gfx11";
+ let mtp_det=kernel=="mtp_dense_det_gfx11"||mtp_q8;
+ if pm_module.is_none()&&!mq4v&&!mq4f8&&!lane_rows&&!spec_pm&&!mtp_det&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into())}
  if spec_pm&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into())}
  if lane_rows&&shape.is_some() {return Err("qwen4_lane_rows has no --shape contract (use --m7)".into())}
  if lane_rows&&co.is_none() {return Err("qwen4_lane_rows emission requires --co (M7 certifies the linked object)".into())}
- if mtp_det&&shape.is_some() {return Err("mtp_dense_det_gfx11 has no --shape (its contract is committed in kernels/; use --m7)".into())}
- if mtp_det&&co.is_none() {return Err("mtp_dense_det_gfx11 emission requires --co (M7 certifies the linked object)".into())}
+ if mtp_det&&shape.is_some() {return Err(format!("{kernel} has no --shape (its contract is committed in kernels/; use --m7)"))}
+ if mtp_det&&co.is_none() {return Err(format!("{kernel} emission requires --co (M7 certifies the linked object)"))}
  if pm_module.is_some()&&co.is_none() {return Err("pm_decode emission requires --co (M7 certifies the linked object)".into())}
  if mq4v&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq4_verify --shape/--m7 require --co (M7 certifies the linked object)".into())}
  if mq4f8&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq4_fp8_verify --shape/--m7 require --co (M7 certifies the linked object)".into())}
@@ -350,11 +361,11 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  }
  // MTP append DET dense GEMM: M7 on the single export of the linked object.
  #[cfg(not(feature="toolchain"))]
- if mtp_det {return Err("mtp_dense_det_gfx11 emission certifies with M7: build hipfire-isa with --features toolchain".into())}
+ if mtp_det {return Err(format!("{kernel} emission certifies with M7: build hipfire-isa with --features toolchain"))}
  #[cfg(feature="toolchain")]
  if mtp_det {
   let path=co.as_deref().ok_or("missing --co")?;
-  let symbol=hipfire_isa::kernels::mtp_dense_det_gfx11::Spec{arch}.symbol();
+  let symbol=if mtp_q8 {hipfire_isa::kernels::mtp_q8_det_gfx11::Spec{arch}.symbol()} else {hipfire_isa::kernels::mtp_dense_det_gfx11::Spec{arch}.symbol()};
   let mut receipts=serde_json::Map::new();
   receipts.insert(symbol.clone(),hipfire_isa::pm_check::m7(std::path::Path::new(path),arch.name(),&symbol)?);
   let receipts=serde_json::to_vec_pretty(&receipts).map_err(|e|e.to_string())?;

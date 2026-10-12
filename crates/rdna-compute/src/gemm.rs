@@ -237,6 +237,10 @@ pub const MTP_DENSE_DET_PM_TILE_M: usize = 128;
 pub const MTP_DENSE_DET_PM_TILE_N: usize = 256;
 /// Entry of the standalone MTP dense DET module (`kernels::MTP_DENSE_DET_PM_GFX1151`).
 pub const MTP_DENSE_DET_PM_ENTRY: &str = "mtp_dense_det_pm_gfx1151_w8";
+/// Module and entry of the MTP append DET Q8_0 -> F16 weight converter
+/// (`kernels::MTP_Q8_DET_PM_GFX1151`, launched by `Gpu::ensure_q8_0_f16_shadow`).
+pub const MTP_Q8_DET_PM_MODULE: &str = "mtp_q8_det_pm_gfx1151";
+pub const MTP_Q8_DET_PM_ENTRY: &str = "mtp_q8_0_to_f16_pm_gfx1151";
 /// Shape limits of the standalone MTP dense DET F16 WMMA kernel: `m` channels a multiple of 16,
 /// `k` a multiple of 64 (at least 64), at least one projection row, the A16 (`m*k*2`), X16
 /// (`n*k*2`) and Y32 (`n*m*4`) byte extents below 2^31 (32-bit buffer offsets) and the
@@ -28307,13 +28311,15 @@ impl Gpu {
         Ok(true)
     }
 
-    /// Checks shared by the DET dense wrapper and its launch-only hook: exact gfx1151, shape
-    /// limits ([`mtp_dense_det_pm_shape`]), operand dtypes (`weight` BF16, `x` of `x_dtype`, `y`
-    /// F32) and buffer capacities.
+    /// Checks shared by the DET dense wrappers and their launch-only hooks: exact gfx1151, shape
+    /// limits ([`mtp_dense_det_pm_shape`]), operand dtypes (`weight` of `weight_dtype`: BF16 or
+    /// F16 `[m, k]`, or Q8_0 packed 34-byte blocks; `x` of `x_dtype`; `y` F32) and buffer
+    /// capacities (a Q8_0 weight needs `m * k / 32 * 34` bytes).
     #[allow(clippy::too_many_arguments)]
     fn mtp_dense_det_pm_validate(
         &self,
         weight: &GpuTensor,
+        weight_dtype: DType,
         x: &GpuTensor,
         x_dtype: DType,
         y: &GpuTensor,
@@ -28330,14 +28336,15 @@ impl Gpu {
                 "shape M={m} K={k} N={n} outside the kernel's limits (M%16==0, K%64==0, N>=1, extents < 2^31)"
             )));
         }
-        if weight.dtype != DType::BF16 || x.dtype != x_dtype || y.dtype != DType::F32 {
+        if weight.dtype != weight_dtype || x.dtype != x_dtype || y.dtype != DType::F32 {
             return Err(err(format!(
-                "dtypes must be weight BF16, X {x_dtype:?}, Y F32 (got {:?}, {:?}, {:?})",
+                "dtypes must be weight {weight_dtype:?}, X {x_dtype:?}, Y F32 (got {:?}, {:?}, {:?})",
                 weight.dtype, x.dtype, y.dtype
             )));
         }
         let x_elem = if x_dtype == DType::F16 { 2 } else { 4 };
-        if weight.buf.size() < m * k * 2 || x.buf.size() < n * k * x_elem || y.buf.size() < n * m * 4 {
+        let weight_bytes = if weight_dtype == DType::Q8_0 { m * (k / 32) * 34 } else { m * k * 2 };
+        if weight.buf.size() < weight_bytes || x.buf.size() < n * k * x_elem || y.buf.size() < n * m * 4 {
             return Err(err("buffer capacity is too small".into()));
         }
         Ok(())
@@ -28362,9 +28369,43 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.mtp_dense_det_pm_validate(weight, x16, DType::F16, y, m, k, n)?;
+        self.mtp_dense_det_pm_validate(weight, DType::BF16, x16, DType::F16, y, m, k, n)?;
+        let ap = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        self.mtp_dense_det_pm_launch_a16(ap, x16, y, m, k, n)
+    }
+
+    /// [`Gpu::mtp_dense_det_pm_launch`] for an F16 `weight16` (`[m, k]`, used as A16 directly: no
+    /// shadow): the same kernel, entry, ABI and checks, so a row's bytes are those of the BF16 hook
+    /// over the same F16 values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_dense_det_pm_launch_f16(
+        &mut self,
+        weight16: &GpuTensor,
+        x16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight16, DType::F16, x16, DType::F16, y, m, k, n)?;
+        self.mtp_dense_det_pm_launch_a16(weight16.buf.as_ptr(), x16, y, m, k, n)
+    }
+
+    /// The one launch of `mtp_dense_det_pm_gfx1151_w8` over a validated F16 A16 device pointer
+    /// (an F16 weight or a model-lifetime shadow): 16-byte alignment, `y` non-overlap, grid and
+    /// kernarg. Callers validate dtypes, shape and capacities first.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_dense_det_pm_launch_a16(
+        &mut self,
+        mut ap: *mut c_void,
+        x16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
         let err = |msg: String| hip_bridge::HipError::new(0, &format!("mtp_dense_det_pm: {msg}"));
-        let mut ap = self.ensure_bf16_f16_shadow(weight, m, k)?;
         let (mut xp, mut yp) = (x16.buf.as_ptr(), y.buf.as_ptr());
         let (a_lo, x_lo, y_lo) = (ap as usize, xp as usize, yp as usize);
         if a_lo % 16 != 0 || x_lo % 16 != 0 || y_lo % 16 != 0 {
@@ -28414,7 +28455,8 @@ impl Gpu {
     /// [`Gpu::mtp_dense_det_pm_launch`] on the same stream: each output is one ascending K16 WMMA
     /// chain from +0 whatever `n` is, so a row's bytes do not depend on its batch. F16 has a
     /// narrower exponent range than BF16/F32: under/overflow is possible and this is explicitly
-    /// DET, not byte-equal to [`Gpu::gemm_bf16_xf32_multirow`]. No product route uses it yet.
+    /// DET, not byte-equal to [`Gpu::gemm_bf16_xf32_multirow`]. Called by the default-off
+    /// `HIPFIRE_QWEN4_MTP_APPEND_DET` prompt-fill append route (fc_embedding, fc_hidden, HC up).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf32_mtp_dense_det_pm(
         &mut self,
@@ -28426,7 +28468,7 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.mtp_dense_det_pm_validate(weight, x, DType::F32, y, m, k, n)?;
+        self.mtp_dense_det_pm_validate(weight, DType::BF16, x, DType::F32, y, m, k, n)?;
         let x16 = self.qwen4_convert_f16_x(x, n * k)?;
         self.mtp_dense_det_pm_launch(weight, &x16, y, m, k, n)
     }
@@ -28441,6 +28483,70 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(0, "mtp_dense_det_pm_weight_shadow: needs a BF16 weight of at least m*k elements"));
         }
         let ptr = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        Ok(GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr, m * k * 2) },
+            shape: vec![m * k],
+            dtype: DType::F16,
+        })
+    }
+
+    /// Standalone MTP dense DET projection `Y[n, m] = Σ_k W[m, k]·X[n, k]` for a Q8_0 weight (packed
+    /// 34-byte blocks, contiguous `[m, k]`) and F32 X / Y: [`Gpu::gemm_bf16_xf32_mtp_dense_det_pm`]'s
+    /// kernel and tile with the weight read from its model-lifetime F16 shadow
+    /// ([`Gpu::ensure_q8_0_f16_shadow`]: element `F16-RNE(f32(scale) * f32(q))`, created on first
+    /// use, keyed by the weight pointer, so the weight must stay alive). X F32 -> F16 RNE is
+    /// converted uncached on every call; each output is one ascending K16 WMMA chain from +0
+    /// whatever `n` is, so a row's bytes do not depend on its batch. Shapes as
+    /// [`mtp_dense_det_pm_shape`] (`m % 16 == 0`, `k % 64 == 0`, `n >= 1`). DET, not byte-equal to
+    /// the staged Q8_0 GEMV: F16 operands narrow the exponent range (under/overflow of either
+    /// the converted weight or X is possible).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_xf32_mtp_dense_det_pm(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight, DType::Q8_0, x, DType::F32, y, m, k, n)?;
+        let x16 = self.qwen4_convert_f16_x(x, n * k)?;
+        self.mtp_q8_det_pm_launch(weight, &x16, y, m, k, n)
+    }
+
+    /// Launch-only hook of the Q8_0 MTP dense DET GEMM, the Q8_0 analogue of
+    /// [`Gpu::mtp_dense_det_pm_launch`]: `y` (F32 `[n, m]`) from F16 `x16` (`[n, k]`) and the
+    /// model-lifetime F16 shadow of the Q8_0 `weight` ([`Gpu::ensure_q8_0_f16_shadow`], created on
+    /// first use, keyed by the weight pointer, so the weight must stay alive), then the one
+    /// dense launch. No X conversion is issued here, so one converted `x16` can feed several
+    /// projections of the same input. The shadow converter writes its own immutable tensor and
+    /// never touches the shared F16 X scratch, so `x16` may be converted before the weight's first
+    /// (lazy) shadow on the same stream. Errors (nothing launched) as the BF16 hook.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_q8_det_pm_launch(
+        &mut self,
+        weight: &GpuTensor,
+        x16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight, DType::Q8_0, x16, DType::F16, y, m, k, n)?;
+        let ap = self.ensure_q8_0_f16_shadow(weight, m, k)?;
+        self.mtp_dense_det_pm_launch_a16(ap, x16, y, m, k, n)
+    }
+
+    /// The model-lifetime F16 shadow of the Q8_0 `[m, k]` `weight` (created on first use, keyed
+    /// by the weight pointer) as a non-owning F16 `[m*k]` view: what
+    /// [`Gpu::gemm_q8_0_xf32_mtp_dense_det_pm`] reads as A16, for the DET harness's conversion
+    /// checks. Do not free the view; keep `weight` alive.
+    pub fn mtp_q8_det_pm_weight_shadow(&mut self, weight: &GpuTensor, m: usize, k: usize) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let ptr = self.ensure_q8_0_f16_shadow(weight, m, k)?;
         Ok(GpuTensor {
             buf: unsafe { DeviceBuffer::from_raw(ptr, m * k * 2) },
             shape: vec![m * k],

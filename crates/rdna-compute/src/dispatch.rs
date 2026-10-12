@@ -4742,6 +4742,85 @@ impl Gpu {
         Ok(ptr)
     }
 
+    /// Model-lifetime F16 shadow of a Q8_0 `[M × K]` weight for the MTP append DET dense GEMM
+    /// (`Gpu::gemm_q8_0_xf32_mtp_dense_det_pm`), keyed on the weight's device pointer like
+    /// [`Gpu::ensure_bf16_f16_shadow`] (weights are immutable after load; freed with the other
+    /// shadows on unload; the weight must stay alive and keep its shape).
+    ///
+    /// The shadow has the weight's contiguous row-major `[M, K]` layout. Element `i` is in Q8_0
+    /// block `i / 32` (34 bytes: F16 scale, then 32 signed int8) at slot `i % 32` and converts as
+    /// `F16-RNE(f32(scale) * f32(q))` on the PM-native converter (`kernels::MTP_Q8_DET_PM_GFX1151`,
+    /// entry `mtp_q8_0_to_f16_pm_gfx1151`; no HIP compile, no GEMM fallback). The F32 product of a
+    /// finite scale and an int8 is exact, so the only rounding is the single F16 RNE: a magnitude
+    /// of 65520 or more becomes Inf (overflow), a result under half the smallest F16 subnormal
+    /// becomes a signed zero, F16 subnormals are kept, a non-finite scale propagates (`Inf * 0`
+    /// and NaN scales give NaN). A model's Q8_0 scales are finite, so only overflow and
+    /// underflow of the exponent range can occur. DET numerics, not the incumbent staged GEMV's.
+    ///
+    /// Errors (nothing allocated or launched) off exact gfx1151, for a non-`Q8_0` tensor, `K` not
+    /// a multiple of 64, `M * K * 2` not below 2^31, a packed capacity below `M * K / 32 * 34`
+    /// bytes, or a cached shadow of a different size.
+    pub(crate) fn ensure_q8_0_f16_shadow(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let err = |msg: String| hip_bridge::HipError::new(0, &format!("ensure_q8_0_f16_shadow: {msg}"));
+        if self.arch != "gfx1151" {
+            return Err(err(format!("requires exact gfx1151 (device is {})", self.arch)));
+        }
+        if weight.dtype != DType::Q8_0 {
+            return Err(err(format!("needs a Q8_0 weight (got {:?})", weight.dtype)));
+        }
+        if m == 0 || k == 0 || k % 64 != 0 || (m as u128) * (k as u128) * 2 >= (1u128 << 31) {
+            return Err(err(format!("shape M={m} K={k} needs M >= 1, K % 64 == 0 and M*K*2 < 2^31")));
+        }
+        let elems = m * k;
+        let packed = elems / 32 * 34;
+        if weight.buf.size() < packed {
+            return Err(err(format!("packed capacity {} is below M*K/32*34 = {packed} bytes", weight.buf.size())));
+        }
+        let key = weight.buf.as_ptr() as usize;
+        if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
+            if shadow.buf.size() != elems * 2 {
+                return Err(err(format!("cached shadow is {} bytes, M*K*2 = {}", shadow.buf.size(), elems * 2)));
+            }
+            return Ok(shadow.buf.as_ptr());
+        }
+        self.ensure_embedded_kernel(
+            crate::gemm::MTP_Q8_DET_PM_MODULE,
+            kernels::MTP_Q8_DET_PM_GFX1151,
+            crate::gemm::MTP_Q8_DET_PM_ENTRY,
+        )?;
+        let fp16 = self.alloc_tensor(&[elems], DType::F16)?;
+        let ip = weight.buf.as_ptr();
+        let op = fp16.buf.as_ptr();
+        let nv = elems as i32;
+        let mut params = [
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            crate::gemm::MTP_Q8_DET_PM_ENTRY,
+            [elems.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(nv);
+                b
+            },
+        )?;
+        let ptr = fp16.buf.as_ptr();
+        self.fp16_shadow_cache.insert(key, fp16);
+        Ok(ptr)
+    }
+
     /// Ensure a model-lifetime FP16 shadow of a qt=35 MFP4G32E8SOA matrix.
     /// This entry is deliberately separate from the HFQ4 helper so adding the
     /// DeepSeek4 CDNA path cannot change any existing Qwen/HFQ4 dequant route.

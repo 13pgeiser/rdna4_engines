@@ -1106,7 +1106,7 @@ fn qwen4_placement_inputs(
                 max_k,
                 head,
                 row_capture,
-                hipfire_arch_qwen4::mtp_spec::native_mtp_batched_fill(gpu),
+                hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(gpu),
             )
             .ok_or("qwen4: native MTP device bytes overflow")?,
         )
@@ -1961,7 +1961,7 @@ pub fn load_qwen4_rank(
                         max_k,
                         hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, config)
                             .then_some(state_format.gdn),
-                        hipfire_arch_qwen4::mtp_spec::native_mtp_batched_fill(ctx.gpu),
+                        hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(ctx.gpu),
                     )
                     .ok_or("qwen4: native MTP request bytes overflow")?
                 } else {

@@ -4338,6 +4338,15 @@ pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/q
 /// lands (`kernels/mtp_dense_det_pm_gfx1151.hxaco`); its SHA-256 is recorded in the validation
 /// receipt.
 pub const MTP_DENSE_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp_dense_det_pm_gfx1151.hxaco");
+/// gfx1151 MTP append DET Q8_0 -> F16 weight converter (`hipfire-isa` kernel `mtp_q8_det_gfx11`,
+/// module `mtp_q8_det_pm_gfx1151`, entry `mtp_q8_0_to_f16_pm_gfx1151`): one element per lane,
+/// element `i` of a contiguous Q8_0 `[M, K]` weight (34-byte blocks: F16 scale + 32 int8) is
+/// `F16-RNE(f32(d) * f32(q))`; 20-byte kernarg (src, dst, elems), grid `[ceil(M*K/256), 1, 1]`,
+/// block 256. Reached only by `Gpu::ensure_q8_0_f16_shadow` (the model-lifetime F16 shadow the DET
+/// dense GEMM reads for Q8_0 weights); no product route, no env flag. The bundle is generated from
+/// the emitter after its source lands (`kernels/mtp_q8_det_pm_gfx1151.hxaco`); its SHA-256 is
+/// recorded in the validation receipt.
+pub const MTP_Q8_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp_q8_det_pm_gfx1151.hxaco");
 /// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block.
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with

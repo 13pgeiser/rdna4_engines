@@ -16,7 +16,10 @@
 //! consumed-row count, which adds the seed.
 
 use crate::bundle::{penalty_prepass_enabled, Qwen4Bundle};
-use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MTP_FILL_ROWS};
+use crate::mtp_gpu::{
+    mtp_append_det_enabled, mtp_append_det_requested, prompt_fill_uses_rows, MtpAppendScratch,
+    MtpFillContext, MtpGpuStateSnapshot, MTP_FILL_ROWS,
+};
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
@@ -2342,7 +2345,7 @@ impl Qwen4MtpDrafter {
                     .map_err(|error| format!("Qwen4 MTP row hidden allocation: {error}"))?,
             );
         }
-        if self.append_scratch.is_none() && mtp_batched_fill_enabled() {
+        if self.append_scratch.is_none() && mtp_fill_scratch_wanted(gpu) {
             let bundle = Self::bundle(target)?;
             if bundle.mtp_append_rows_supported(gpu) {
                 let rows = MTP_FILL_ROWS.min(prefill_rows);
@@ -3291,7 +3294,16 @@ impl Qwen4MtpDrafter {
                 .filter(|fill| consumed >= 2 && consumed <= fill.rows() && mtp_batched_fill_enabled());
             match fill {
                 Some(fill) => bundle
-                    .mtp_append_rows(gpu, fill, &block[..consumed], 0, None, None, position)
+                    .mtp_append_rows(
+                        gpu,
+                        MtpFillContext::DecodeFill,
+                        fill,
+                        &block[..consumed],
+                        0,
+                        None,
+                        None,
+                        position,
+                    )
                     .map_err(|error| error.to_string())?,
                 None => {
                     let row_hidden = self
@@ -3589,11 +3601,14 @@ fn mark_phase(timers: &mut Option<&mut MtpPhaseTimers>, gpu: &Gpu, label: &'stat
 /// The body of `mtp_prefill`'s chunk loop for the chunk `chunk` at `pos`:
 /// the trunk tile with wide-hidden capture (`spec_prefill_rows` when
 /// `needs_pick`, else `spec_prefill_rows_silent`), then the head append of
-/// every row (`append_scratch` given: batched sub-chunks of `scratch.rows()`,
-/// a lone row per-row; `None`: per-row), leaving `pending` on the chunk's last
+/// every row (`append_scratch` given and batched fill or the DET prompt fill
+/// on: sub-chunks of `scratch.rows()` rows, a lone row per-row except under
+/// DET, which takes it through the same rows kernels; otherwise per-row),
+/// leaving `pending` on the chunk's last
 /// row. Returns the trunk pick when `needs_pick`. The boundary, session and
 /// pick bookkeeping stay with the caller; `abort` is polled before every
-/// sub-chunk (or row) and a hit resets the target.
+/// sub-chunk (or row) and a hit resets the target. Every rows pass is
+/// [`MtpFillContext::PromptFill`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mtp_prefill_chunk(
     bundle: &mut Qwen4Bundle,
@@ -3618,7 +3633,14 @@ pub(crate) fn mtp_prefill_chunk(
             .map_err(|error| error.to_string())?;
         None
     };
-    if let Some(scratch) = append_scratch {
+    // The head's batched rows route: the incumbent batched fill
+    // (`HIPFIRE_QWEN4_MTP_BATCHED_FILL`, on by default), or the DET prompt
+    // fill (`HIPFIRE_QWEN4_MTP_APPEND_DET=1` on exact gfx1151), which uses
+    // the scratch even with batched fill off. Without a scratch (the head
+    // does not support the rows route) the chunk is per-row either way.
+    let det = mtp_append_det_enabled(gpu);
+    let batched = mtp_batched_fill_enabled();
+    if let Some(scratch) = append_scratch.filter(|_| batched || det) {
         // The chunk's ids upload once, here: the target forward's pick
         // readback has already drained the stream (a silent chunk
         // leaves the copy waiting for that forward, once per chunk
@@ -3643,22 +3665,26 @@ pub(crate) fn mtp_prefill_chunk(
         bundle
             .mtp_map_through(gpu, pos + chunk.len() - 1)
             .map_err(|error| error.to_string())?;
-        // One batched Append pass per sub-chunk of at most `scratch.rows()`
-        // rows; row `i` is still paired with spec hidden row `i`.
+        // One Append pass per sub-chunk of `prompt_fill_sub_rows` rows
+        // (`scratch.rows()` batched; one row at a time with batched fill
+        // off under DET); row `i` is still paired with spec hidden row `i`.
+        let sub_rows = prompt_fill_sub_rows(batched, scratch.rows());
         let mut off = 0;
         while off < chunk.len() {
             if abort() {
                 bundle.reset_recurrent(gpu)?;
                 return Err("Qwen4 native MTP prefill aborted".to_string());
             }
-            let n = (chunk.len() - off).min(scratch.rows());
+            let n = (chunk.len() - off).min(sub_rows);
             let position = pos
                 .checked_add(off)
                 .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-            if n == 1 {
-                // The multirow projections need two rows or more; a
-                // lone row is exactly the per-row Append (its token
-                // upload stays the per-row path's own, blocking one).
+            if !prompt_fill_uses_rows(det, n) {
+                // The incumbent multirow projections need two rows or
+                // more; a lone row is exactly the per-row Append (its
+                // token upload stays the per-row path's own, blocking
+                // one). Under DET a lone row takes the rows route below
+                // instead, through the same kernels as every other row.
                 bundle
                     .copy_spec_hidden_row_to(gpu, off, pending)
                     .map_err(|error| error.to_string())?;
@@ -3678,6 +3704,7 @@ pub(crate) fn mtp_prefill_chunk(
                 bundle
                     .mtp_append_rows(
                         gpu,
+                        MtpFillContext::PromptFill,
                         scratch,
                         &chunk[off..off + n],
                         off,
@@ -3946,11 +3973,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             .pending_hidden
             .as_ref()
             .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
-        let mut batched_scratch = if mtp_batched_fill_enabled() {
-            self.append_scratch.as_mut()
-        } else {
-            None
-        };
+        // Unfiltered: `mtp_prefill_chunk` decides per chunk whether the
+        // scratch is used (batched fill, or the DET prompt fill).
+        let mut batched_scratch = self.append_scratch.as_mut();
         let reuse_trunk_ids = mtp_reuse_prefill_ids_enabled();
         let mut first_token = None;
         // One chunked target forward per chunk instead of one single-row forward
@@ -4584,6 +4609,32 @@ pub(crate) fn mtp_batched_fill_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_BATCHED_FILL", true)
 }
 
+/// Whether this GPU's prompt fill wants the Append scratch: batched fill on,
+/// or the DET prompt fill in force (`HIPFIRE_QWEN4_MTP_APPEND_DET=1`, exact
+/// gfx1151, which uses the scratch even with batched fill off). The head's
+/// own support ([`Qwen4Bundle::mtp_append_rows_supported`]) still applies.
+pub(crate) fn mtp_fill_scratch_wanted(gpu: &Gpu) -> bool {
+    mtp_batched_fill_enabled() || mtp_append_det_enabled(gpu)
+}
+
+/// [`mtp_fill_scratch_wanted`] from the environment alone, for admission
+/// arithmetic that has no GPU: an upper bound on every arch.
+pub(crate) fn mtp_fill_scratch_requested() -> bool {
+    mtp_batched_fill_enabled() || mtp_append_det_requested()
+}
+
+/// Rows of one prompt-fill Append pass: `capacity` (the scratch rows) with
+/// batched fill on; with it off (the scratch is then only present for the DET
+/// prompt fill) one row at a time, which the DET kernels make byte-equal to
+/// the batched passes.
+fn prompt_fill_sub_rows(batched: bool, capacity: usize) -> usize {
+    if batched {
+        capacity
+    } else {
+        1
+    }
+}
+
 /// `HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS`: the prompt-fill head Append embeds
 /// from the token ids the trunk forward of the same chunk already uploaded
 /// (checked against the chunk's tokens), instead of uploading them again,
@@ -4637,11 +4688,13 @@ pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
         && config.linear_conv_kernel_dim == 4
 }
 
-/// Whether a native MTP request on this GPU allocates the batched
-/// prompt-fill scratch (`MtpAppendScratch`): exact gfx1151 or gfx1201 with
-/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` on.
-pub fn native_mtp_batched_fill(gpu: &Gpu) -> bool {
-    (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && mtp_batched_fill_enabled()
+/// Whether a native MTP request on this GPU allocates the prompt-fill Append
+/// scratch (`MtpAppendScratch`): exact gfx1151 or gfx1201 with
+/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` on, or exact gfx1151 with
+/// `HIPFIRE_QWEN4_MTP_APPEND_DET=1` (the DET prompt fill needs the scratch
+/// even with batched fill off).
+pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
+    (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && mtp_fill_scratch_wanted(gpu)
 }
 
 /// Device bytes native MTP adds to a load whose QSA context storage is
@@ -4654,7 +4707,7 @@ pub fn native_mtp_batched_fill(gpu: &Gpu) -> bool {
 /// is larger), the pending and row hidden carries, with `row_capture`
 /// (the GDN state format, where [`native_mtp_row_capture`]) the
 /// `max_k + 1`-row GDN capture in that format, and with `batched_fill`
-/// (where [`native_mtp_batched_fill`]) the batched prompt-fill scratch.
+/// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch.
 pub fn native_mtp_device_bytes(
     config: &crate::Qwen4Config,
     context: &crate::Qwen4ContextCommit,
@@ -4821,12 +4874,59 @@ mod tests {
         assert!(prefill_uploads_chunk_ids(false, 8192, 8192));
         assert!(prefill_uploads_chunk_ids(false, 1025, 8192));
         assert!(prefill_uploads_chunk_ids(false, 2, 8192));
-        // A lone row is the per-row Append, which never reads the upload.
+        // A lone row is the per-row Append, which never reads the upload (under
+        // DET it takes the rows route with the scratch's own upload).
         assert!(!prefill_uploads_chunk_ids(false, 1, 8192));
         // The reuse lever keeps its own ids.
         assert!(!prefill_uploads_chunk_ids(true, 8192, 8192));
         // A chunk past the buffer's capacity keeps the per-sub-chunk upload.
         assert!(!prefill_uploads_chunk_ids(false, 8193, 8192));
+    }
+
+    /// The sub-chunk sizes `mtp_prefill_chunk` walks for `chunk_rows`.
+    fn prompt_fill_passes(chunk_rows: usize, batched: bool, capacity: usize) -> Vec<usize> {
+        let sub_rows = prompt_fill_sub_rows(batched, capacity);
+        let mut passes = Vec::new();
+        let mut off = 0;
+        while off < chunk_rows {
+            let n = (chunk_rows - off).min(sub_rows);
+            passes.push(n);
+            off += n;
+        }
+        passes
+    }
+
+    #[test]
+    fn prompt_fill_sub_chunks_are_scratch_rows_batched_and_single_rows_otherwise() {
+        assert_eq!(prompt_fill_passes(2500, true, 1024), [1024, 1024, 452]);
+        assert_eq!(prompt_fill_passes(1, true, 1024), [1]);
+        assert_eq!(prompt_fill_passes(1025, true, 1024), [1024, 1]);
+        // Batched fill off (scratch present only for the DET prompt fill):
+        // one row at a time.
+        assert_eq!(prompt_fill_passes(3, false, 1024), [1, 1, 1]);
+        // Every pass covers the chunk exactly once, in order.
+        for batched in [true, false] {
+            for rows in [1usize, 2, 7, 1023, 1024, 1025, 4097] {
+                assert_eq!(prompt_fill_passes(rows, batched, 1024).iter().sum::<usize>(), rows);
+            }
+        }
+    }
+
+    #[test]
+    fn det_prompt_fill_sends_every_pass_through_rows_and_default_keeps_the_lone_row_per_row() {
+        // DET: a trailing lone row (1025 rows) and the row-at-a-time passes
+        // all take the rows route.
+        for batched in [true, false] {
+            assert!(prompt_fill_passes(1025, batched, 1024)
+                .into_iter()
+                .all(|n| crate::mtp_gpu::prompt_fill_uses_rows(true, n)));
+        }
+        // Default (DET off, batched on): only the lone trailing row stays per-row.
+        let uses_rows: Vec<bool> = prompt_fill_passes(1025, true, 1024)
+            .into_iter()
+            .map(|n| crate::mtp_gpu::prompt_fill_uses_rows(false, n))
+            .collect();
+        assert_eq!(uses_rows, [true, false]);
     }
 
     #[test]

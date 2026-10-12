@@ -36,7 +36,7 @@ use crate::lane_exec::{LaneDraft, LaneRoute};
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot};
 use crate::mtp_spec::{
     accept_native_greedy, batched_depth, draft_accept_estimate, draft_pairing,
-    finish_native_window, mtp_batched_fill_enabled, mtp_prefill_chunk,
+    finish_native_window, mtp_prefill_chunk,
     mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
     mtp_skip_intermediate_pick_enabled, observe_agreement, Agreement, DraftPairing, FloorRoute,
     MtpFloor, NativeFinish, NativeWindow, DRAFT_ACCEPT_MAX, MTP_AGREEMENT_PRIOR, MTP_MAX_DEPTH,
@@ -809,7 +809,7 @@ pub(crate) fn prefill_tile(
         host.prompt.len(),
         mtp_skip_intermediate_pick_enabled(),
     );
-    let scratch = append_scratch.filter(|_| mtp_batched_fill_enabled());
+    // `mtp_prefill_chunk` applies batched fill / the DET prompt fill to the scratch.
     let reuse = mtp_reuse_prefill_ids_enabled();
     lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
         mtp_prefill_chunk(
@@ -819,7 +819,7 @@ pub(crate) fn prefill_tile(
             start,
             needs_pick,
             pending_hidden,
-            scratch,
+            append_scratch,
             reuse,
             &|| false,
         )

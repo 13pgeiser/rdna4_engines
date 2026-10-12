@@ -18,7 +18,9 @@ use crate::gpu_forward::{
     QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
-use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
+use crate::mtp_gpu::{
+    MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu,
+};
 use crate::ple::PleHashMetadata;
 use crate::state::Qwen4StateFormat;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
@@ -1842,9 +1844,13 @@ impl Qwen4Bundle {
     /// exactly `tokens` as i32 (the caller's once-per-chunk upload, see
     /// `MtpAppendScratch::upload_prompt_ids`), and uploads its own copy when
     /// that is `None` too.
+    ///
+    /// `context` names the caller and is passed through unchanged: only
+    /// [`MtpFillContext::PromptFill`] can take the opt-in DET projections.
     pub(crate) fn mtp_append_rows(
         &mut self,
         gpu: &mut Gpu,
+        context: MtpFillContext,
         scratch: &mut MtpAppendScratch,
         tokens: &[u32],
         hidden_row0: usize,
@@ -1897,6 +1903,7 @@ impl Qwen4Bundle {
                 gpu,
                 &self.weights,
                 &self.config,
+                context,
                 scratch,
                 tokens,
                 &hidden,
