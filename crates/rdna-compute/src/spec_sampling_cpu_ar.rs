@@ -453,3 +453,134 @@ impl Gpu {
         )
     }
 }
+
+/// Kernel source of the parallel target-row builder. A separate module from
+/// [`SPEC_SAMPLING_CPU_AR_SRC`], so compiling it cannot change the reference
+/// code object.
+pub const SPEC_SAMPLING_CPU_AR_PARALLEL_SRC: &str =
+    include_str!("../../../kernels/src/spec_sampling_cpu_ar_parallel.hip");
+/// Module key of the parallel row builder.
+pub const SPEC_SAMPLING_CPU_AR_PARALLEL_MODULE: &str = "spec_sampling_cpu_ar_parallel";
+/// Device symbol of [`Gpu::spec_cpu_ar_rows_parallel_enqueue`].
+pub const SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL: &str = "spec_cpu_ar_rows_parallel_f32";
+
+/// Threads per workgroup of the parallel rows kernel (one workgroup per row).
+const ROWS_PARALLEL_BLOCK: u32 = 256;
+
+impl Gpu {
+    /// Load the parallel rows module and bind its kernel only. The unchanged
+    /// candidates and ordered-accept kernels still need
+    /// [`Gpu::spec_cpu_ar_precompile`].
+    pub fn spec_cpu_ar_rows_parallel_precompile(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            SPEC_SAMPLING_CPU_AR_PARALLEL_MODULE,
+            SPEC_SAMPLING_CPU_AR_PARALLEL_SRC,
+            SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL,
+        )?;
+        Ok(())
+    }
+
+    /// Parallel (one 256-thread workgroup per row) target-row builder, an
+    /// ungated API candidate with no production caller. It writes the same
+    /// [`SpecDistRows`] layout as [`Gpu::spec_cpu_ar_rows_enqueue`] but follows
+    /// a NEW law, not the host CPU-AR law: canonical selection (higher f32
+    /// logit first, equal numeric logits to the lower token id) and fixed-tree
+    /// aggregate sums. Output is not byte-equal to the serial reference, and
+    /// reference tied supports are not equivalent to it.
+    ///
+    /// `logits`: f32 `[row_count * vocab]`. `logits` must not alias any `rows`
+    /// buffer. There is no global scratch. The kernel has ten arguments in the
+    /// order `logits, counts, ids, probabilities, vocab, pool, cap, temperature,
+    /// top_p, min_p`, launched with grid `[row_count, 1, 1]`, block `[256, 1, 1]`
+    /// and no dynamic shared memory. No readback or synchronization is done;
+    /// launches are recorded through `launch_maybe_blob`.
+    pub fn spec_cpu_ar_rows_parallel_enqueue(
+        &mut self,
+        logits: &GpuTensor,
+        rows: &SpecDistRows,
+        vocab: usize,
+        row_count: usize,
+        policy: SpecCpuArPolicy,
+    ) -> HipResult<()> {
+        policy.validate("spec_cpu_ar_rows_parallel_enqueue")?;
+        if row_count == 0 || vocab == 0 {
+            return Err(err(format!(
+                "rows_parallel: row_count {row_count} and vocab {vocab} must be > 0"
+            )));
+        }
+        if vocab > i32::MAX as usize || row_count > u32::MAX as usize {
+            return Err(err("rows_parallel: vocab or row_count exceeds the launch range"));
+        }
+        let logit_bytes = row_count
+            .checked_mul(vocab)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| err("rows_parallel: row_count * vocab exceeds the addressable range"))?;
+        let out_words = row_count
+            .checked_mul(SPEC_CPU_AR_CAP)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| err("rows_parallel: row_count * 64 exceeds the addressable range"))?;
+        if row_count > rows.capacity_rows {
+            return Err(err(format!(
+                "rows_parallel: row_count {row_count} exceeds rows capacity {}",
+                rows.capacity_rows
+            )));
+        }
+        if logits.dtype != DType::F32 {
+            return Err(err(format!("rows_parallel: logits must be F32, got {:?}", logits.dtype)));
+        }
+        check_bytes("logits", logits, logit_bytes)?;
+        check_bytes("counts", &rows.counts, row_count * 4)?;
+        check_bytes("ids", &rows.ids, out_words)?;
+        check_bytes("probabilities", &rows.probabilities, out_words)?;
+        self.bind_thread()?;
+        self.ensure_kernel(
+            SPEC_SAMPLING_CPU_AR_PARALLEL_MODULE,
+            SPEC_SAMPLING_CPU_AR_PARALLEL_SRC,
+            SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL,
+        )?;
+        let lp = logits.buf.as_ptr();
+        let cp = rows.counts.buf.as_ptr();
+        let ip = rows.ids.buf.as_ptr();
+        let pp = rows.probabilities.buf.as_ptr();
+        let vocab_i = vocab as i32;
+        let pool_i = policy.pool as i32;
+        let cap_i = policy.cap as i32;
+        let temp = policy.temperature;
+        let top_p = policy.top_p;
+        let min_p = policy.min_p;
+        let mut params: [*mut c_void; 10] = [
+            &lp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &vocab_i as *const _ as *mut c_void,
+            &pool_i as *const _ as *mut c_void,
+            &cap_i as *const _ as *mut c_void,
+            &temp as *const _ as *mut c_void,
+            &top_p as *const _ as *mut c_void,
+            &min_p as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL,
+            [row_count as u32, 1, 1],
+            [ROWS_PARALLEL_BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(cp);
+                b.push_ptr(ip);
+                b.push_ptr(pp);
+                b.push_i32(vocab_i);
+                b.push_i32(pool_i);
+                b.push_i32(cap_i);
+                b.push_f32(temp);
+                b.push_f32(top_p);
+                b.push_f32(min_p);
+                b
+            },
+        )
+    }
+}
