@@ -193,6 +193,12 @@ impl Gpu {
         Ok(())
     }
 
+    /// Architecture admission for the experimental device sampler.
+    /// PM image availability is checked by the eventual production launcher.
+    pub fn spec_cpu_ar_device_supported(&self) -> bool {
+        matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+    }
+
     /// Build the target distribution of `row_count` contiguous logit rows
     /// (`logits`: f32 `[row_count * vocab]`, row index = token id) into rows
     /// `0..row_count` of `rows`, exactly as `SparseDist::build_from_logits`.
