@@ -58,6 +58,7 @@ members = [
     "crates/saddle-lab",
     "crates/hipfire-xdna",
     "crates/pm-npu",
+    "crates/hipfire-npu-trunk",
     "crates/npu-tools",
 ]
 

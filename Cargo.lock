@@ -1722,6 +1722,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-npu-trunk"
+version = "0.4.2"
+dependencies = [
+ "half",
+ "hipfire-config",
+ "pm-npu",
+ "rayon",
+]
+
+[[package]]
 name = "hipfire-pflash"
 version = "0.4.2"
 dependencies = [
