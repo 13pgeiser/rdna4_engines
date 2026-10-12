@@ -71,6 +71,15 @@ use hipfire_runtime::llama::{
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::{Path, PathBuf};
 
+/// Kill switch for the kv_only MTP fill concat acceleration
+/// (`HIPFIRE_MTP_FILL_FAST=0` restores the per-row D2D concat loop).
+pub(crate) fn mtp_fill_fast_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_MTP_FILL_FAST", true)
+    });
+    *ON
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2553,21 +2562,47 @@ pub fn mtp_head_forward_block_batched(
 
     // ── 3. Build concat = [e_norm | h_norm] per slot ─────────────────────
     // Layout: concat[i] = [e_norm[i, 0..dim], h_norm[i, 0..dim]] (length 2*dim).
-    for i in 0..n {
-        gpu.hip.memcpy_dtod_at(
+    let fast_fill = kv_only && mtp_fill_fast_enabled();
+    if fast_fill {
+        // Two pitched D2D copies replace the 2n per-row copies: e_norm rows go
+        // to concat[:, 0..dim], h_norm rows to concat[:, dim..2*dim].
+        gpu.memcpy_dtod_2d_at_ordered_async(
             &scratch.concat.buf,
-            i * 2 * dim_bytes,
+            0,
+            2 * dim_bytes,
             &scratch.e_norm.buf,
-            i * dim_bytes,
+            0,
             dim_bytes,
+            dim_bytes,
+            n,
         )?;
-        gpu.hip.memcpy_dtod_at(
+        gpu.memcpy_dtod_2d_at_ordered_async(
             &scratch.concat.buf,
-            i * 2 * dim_bytes + dim_bytes,
-            &scratch.h_norm.buf,
-            i * dim_bytes,
             dim_bytes,
+            2 * dim_bytes,
+            &scratch.h_norm.buf,
+            0,
+            dim_bytes,
+            dim_bytes,
+            n,
         )?;
+    } else {
+        for i in 0..n {
+            gpu.hip.memcpy_dtod_at(
+                &scratch.concat.buf,
+                i * 2 * dim_bytes,
+                &scratch.e_norm.buf,
+                i * dim_bytes,
+                dim_bytes,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &scratch.concat.buf,
+                i * 2 * dim_bytes + dim_bytes,
+                &scratch.h_norm.buf,
+                i * dim_bytes,
+                dim_bytes,
+            )?;
+        }
     }
 
     // cur = eh_proj @ concat (per-slot). w.eh_proj has m=n_embd, k=2*n_embd.

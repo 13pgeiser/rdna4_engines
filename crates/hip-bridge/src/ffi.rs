@@ -483,6 +483,18 @@ pub struct HipRuntime {
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
+    /// `hipMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind, stream)`.
+    /// Pitches and width are bytes; height is rows.
+    fn_memcpy_2d_async: unsafe extern "C" fn(
+        *mut c_void,
+        usize,
+        *const c_void,
+        usize,
+        usize,
+        usize,
+        c_uint,
+        HipStream,
+    ) -> u32,
     /// `hipMemcpyDtoD(dst, src, bytes)` (driver-style device pointers).
     fn_memcpy_dtod: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> u32>,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
@@ -981,6 +993,21 @@ impl HipRuntime {
                     unsafe extern "C" fn(
                         *mut c_void,
                         *const c_void,
+                        usize,
+                        c_uint,
+                        HipStream,
+                    ) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy_2d_async: unsafe { load_fn!(
+                    lib,
+                    "hipMemcpy2DAsync",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        usize,
+                        *const c_void,
+                        usize,
+                        usize,
                         usize,
                         c_uint,
                         HipStream,
@@ -2731,6 +2758,87 @@ impl HipRuntime {
         };
         memory_effects::dtod();
         self.check(code, "hipMemcpyAsync D2D offset default stream")
+    }
+
+    /// Host-asynchronous pitched D→D copy (`hipMemcpy2DAsync`) of `height`
+    /// rows of `width` bytes each, with a byte offset and a row pitch on
+    /// each side.
+    ///
+    /// Units: `*_offset`, `*_pitch` and `width` are bytes; `height` is a row
+    /// count. Row `r` copies `width` bytes from `src + src_offset +
+    /// r * src_pitch` to `dst + dst_offset + r * dst_pitch`.
+    ///
+    /// Empty copies (`width == 0` or `height == 0`) return `Ok(())` before
+    /// any pointer arithmetic, HIP call, counter or memory-effect update.
+    ///
+    /// Bounds: requires `width <= dst_pitch` and `width <= src_pitch`, and
+    /// each side's last-row span `offset + (height - 1) * pitch + width`
+    /// (not `height * pitch`) must fit in its buffer; overflow or violation
+    /// panics before HIP is invoked.
+    ///
+    /// Async/lifetime: the copy is enqueued on `stream` (`None` = legacy/null
+    /// stream) and may complete after this returns; both allocations must stay
+    /// live until it completes, and the caller owns same-device, non-overlap
+    /// and stream-ordering. This helper never synchronizes or allocates.
+    /// hipGraph capture requires an explicit `Some(stream)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn memcpy_dtod_2d_async_at(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        dst_pitch: usize,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        src_pitch: usize,
+        width: usize,
+        height: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        assert!(width <= dst_pitch, "memcpy_dtod_2d: width exceeds dst pitch");
+        assert!(width <= src_pitch, "memcpy_dtod_2d: width exceeds src pitch");
+        let dst_end = (height - 1)
+            .checked_mul(dst_pitch)
+            .and_then(|v| v.checked_add(width))
+            .and_then(|v| v.checked_add(dst_offset))
+            .expect("memcpy_dtod_2d: dst span overflows usize");
+        let src_end = (height - 1)
+            .checked_mul(src_pitch)
+            .and_then(|v| v.checked_add(width))
+            .and_then(|v| v.checked_add(src_offset))
+            .expect("memcpy_dtod_2d: src span overflows usize");
+        assert!(dst_end <= dst.size, "memcpy_dtod_2d: dst span exceeds buffer");
+        assert!(src_end <= src.size, "memcpy_dtod_2d: src span exceeds buffer");
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
+        let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations; the full strided span of
+        // both sides (last row ends at offset + (height-1)*pitch + width) was
+        // asserted to fit, and width <= both pitches. Same-device/stream and
+        // allocation lifetime until completion are the caller's contract; Rust
+        // does not deref device ptrs.
+        let code = unsafe {
+            (self.fn_memcpy_2d_async)(
+                dst_ptr,
+                dst_pitch,
+                src_ptr,
+                src_pitch,
+                width,
+                height,
+                MemcpyKind::DeviceToDevice as c_uint,
+                stream_raw,
+            )
+        };
+        crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
+        self.check(code, "hipMemcpy2DAsync D2D at offset")
     }
 
     // ── Graph capture & replay ──────────────────────────────────

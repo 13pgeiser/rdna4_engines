@@ -2941,6 +2941,58 @@ impl Gpu {
         }
     }
 
+    /// Pitched D→D copy (`hipMemcpy2DAsync`), host-asynchronous on the active
+    /// stream (legacy/null stream when none). Offsets, pitches and `width` are
+    /// bytes; `height` is rows; the last row needs only `width` bytes. Empty
+    /// copies are no-ops. See `HipRuntime::memcpy_dtod_2d_async_at`. Never
+    /// synchronizes; capture paths need an explicit active stream.
+    /// `HIPFIRE_DTOD_DUMP=1` prints `file:line` and geometry per copy.
+    #[track_caller]
+    #[allow(clippy::too_many_arguments)]
+    pub fn memcpy_dtod_2d_at_ordered_async(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        dst_pitch: usize,
+        src: &hip_bridge::DeviceBuffer,
+        src_offset: usize,
+        src_pitch: usize,
+        width: usize,
+        height: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        static DUMP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOD_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        let dump = *DUMP;
+        if dump {
+            let loc = std::panic::Location::caller();
+            eprintln!(
+                "dtod2d width={} height={} dst_pitch={} src_pitch={} at {}:{}",
+                width,
+                height,
+                dst_pitch,
+                src_pitch,
+                loc.file(),
+                loc.line()
+            );
+        }
+        self.hip.memcpy_dtod_2d_async_at(
+            dst,
+            dst_offset,
+            dst_pitch,
+            src,
+            src_offset,
+            src_pitch,
+            width,
+            height,
+            self.active_stream.as_ref(),
+        )
+    }
+
     /// D→D copy (whole buffer) that picks async on the active stream when set.
     ///
     /// `#[track_caller]` so `HIPFIRE_DTOD_DUMP` attributes the copy to the real
