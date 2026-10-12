@@ -9,6 +9,7 @@ mod memory;
 pub mod convert;
 pub mod trans;
 pub mod mma;
+#[cfg(test)] mod swmmac_fixtures;
 mod dot;
 mod wide;
 mod wmma;

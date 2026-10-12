@@ -4,9 +4,10 @@
 # A row means the interpreter has a model for the name; the model itself refuses every unmeasured modifier or
 # architecture at execution. Rows with an architecture-limited model: v_wmma_f32_16x16x16_bf16 (gfx1201 measured;
 # gfx1151 historical corpus only, fresh receipt pending), v_dot2_f32_f16/bf16 (gfx1201 only), and the gfx1201-only
-# v_swmmac_i32_16x16x32_iu8 (unsigned, no clamp) and v_swmmac_f32_16x16x32_f16/bf16 (index_key 0, default modifiers).
-# NO row, so a decoded program hard-errors at load: v_wmma_bf16_16x16x16_bf16, every other SWMMAC (iu4, iu4x64,
-# f16/bf16 out, FP8/BF8) and FP8/BF8 WMMA.
+# SWMMAC rows v_swmmac_f32_16x16x32_f16/bf16 and v_swmmac_i32_16x16x32_iu8/iu4/x64_iu4 (index_key 0/1, measured
+# neg_lo/neg_hi, integer two-half CLAMP; accumulator NEG[2], float CLAMP and other OPSEL bits refused).
+# NO row, so a decoded program hard-errors at load: v_wmma_bf16_16x16x16_bf16, the 16-bit-out SWMMAC
+# (f16/bf16 out) and every FP8/BF8 WMMA and SWMMAC.
 # See isa/emu/float_edges.md "Opcode-fill qualification (pending)".
 # v_log_f32_e32, v_rsq_f32_e32 and v_sqrt_f32_e32 are outside that gate;
 # their candidate numeric paths remain unqualified for the full input domain.
@@ -234,7 +235,9 @@ v_sub_nc_u16	alu
 v_subrev_co_u32	alu
 v_swmmac_f32_16x16x32_bf16	alu
 v_swmmac_f32_16x16x32_f16	alu
+v_swmmac_i32_16x16x32_iu4	alu
 v_swmmac_i32_16x16x32_iu8	alu
+v_swmmac_i32_16x16x64_iu4	alu
 v_wmma_f32_16x16x16_bf16	alu
 v_wmma_i32_16x16x16_iu8	alu
 v_xad_u32	alu

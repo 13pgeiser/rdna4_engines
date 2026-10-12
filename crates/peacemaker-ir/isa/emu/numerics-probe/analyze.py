@@ -35,8 +35,16 @@ class Receipt:
         self.ident = self.meta["identity"]
         self.arch = self.ident["compiled_arch"]
 
+    def raw_bytes(self, name):
+        """Bytes of <name>.bin, transparently reading <name>.bin.zst (receipts are kept zstd-compressed)."""
+        p = os.path.join(self.d, name + ".bin")
+        if os.path.exists(p):
+            return open(p, "rb").read()
+        import subprocess
+        return subprocess.run(["zstd", "-dc", p + ".zst"], check=True, capture_output=True).stdout
+
     def bin(self, name, dtype="<u4"):
-        return np.fromfile(os.path.join(self.d, name + ".bin"), dtype=dtype)
+        return np.frombuffer(self.raw_bytes(name), dtype=dtype)
 
     def results(self, kind, **want):
         for n, m in self.meta.items():
@@ -462,7 +470,7 @@ def cmd_wmma(r, args):
         inn = f"wmma.{op}.in"
         if inn not in r.meta:
             continue
-        cs = np.frombuffer(open(os.path.join(r.d, inn + ".bin"), "rb").read(), dtype=rec)
+        cs = np.frombuffer(r.raw_bytes(inn), dtype=rec)
         out16 = kind in (1, 2)
         fk = "bf16" if kind in (0, 1) else "f16"
         n_sub = r.meta[inn]["n_sub"]

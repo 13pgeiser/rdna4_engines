@@ -294,12 +294,20 @@ pub fn dot_i32(arch: Arch, a: &[i32], b: &[i32], c: i32, clamp: bool) -> Result<
     Ok(integer_dot(a, b, c, clamp))
 }
 
-/// Integer SWMMAC dot over the K expanded elements (32 or 64; the zeros of the 4:2 expansion contribute exact zero
-/// products): exact products and one final addition modulo 2^32, like the dense integer WMMA. CLAMP is not offered.
-pub fn swmmac_i32_iu(arch: Arch, a: &[i16], b: &[i16], c: i32) -> i32 {
+/// Integer SWMMAC dot over the compressed slots of one output element, in slot order (16 slots for IU8/IU4 x32, 32
+/// for IU4 x64; each slot's A value already paired with its selected B value). GFX1201 receipt `rcpt/gfx1201-C-r2`
+/// (0 mismatches / 38,400 words per kind): exact products; without CLAMP one wrap modulo 2^32; with CLAMP the
+/// accumulator saturates to i32 after `C + products(first half of the slots)` and again after the second half
+/// (groups of 1, 2, 4 and the other half-splits have 600-3,600 mismatches).
+pub fn swmmac_i32(arch: Arch, a: &[i16], b: &[i16], c: i32, clamp: bool) -> i32 {
     assert_eq!(arch, Arch::Gfx1201, "SWMMAC exists on GFX1201 only");
-    assert!(matches!(a.len(), 32 | 64), "integer SWMMAC K must be 32 or 64");
-    integer_dot(a, b, c, false)
+    assert!(matches!(a.len(), 16 | 32), "integer SWMMAC has 16 or 32 compressed slots");
+    if !clamp {
+        return integer_dot(a, b, c, false);
+    }
+    let half = a.len() / 2;
+    let first = integer_dot(&a[..half], &b[..half], c, true);
+    integer_dot(&a[half..], &b[half..], first, true)
 }
 
 #[cfg(test)]

@@ -171,122 +171,111 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
     Ok(())
 }
 
-/// `v_swmmac_i32_16x16x32_iu8` (gfx1201 wave32): `D = A(sparse 16x32) * B(32x16) + D`. The fragment, index and
-/// expansion maps are the silicon-confirmed ones (receipt `rcpt/gfx1201-C-r1`, one-hot discovery over 240 + 1024
-/// cases per index key, 0 deviations of this model, unsigned bytes, C = 0):
-/// * packed A: lane `l` is row `l & 15`; half `h = l >> 4` owns compressed slots `j = 8h + i` (`i` = byte 0..7 of
-///   its two VGPRs, VGPR `i >> 2`, byte `i & 3`).
-/// * index: read from the SAME lane `l`; the 2-bit selector of slot `i` is `idx[2i+1 : 2i]` (`index_key` 0).
-/// * expansion: slot `j` lands on dense K = `4 * (j >> 1) + selector`. Two slots of one K-group may carry equal
-///   selectors; both then contribute (no idx0/idx1 priority rule).
-/// * dense B: lane `l` is column `l & 15`; element `e` (0..15, VGPR `e >> 2`, byte `e & 3`) is K = `16 * (l >> 4) + e`.
-/// * C/D: WMMA accumulator layout; VDST is read as C. EXEC is ignored.
-/// Unmeasured and therefore refused: `index_key:1` (OPSEL[0] placement unknown), NEG_LO signedness, NEG_HI,
-/// CLAMP, and every other SWMMAC (iu4, iu4x64, 16-bit-out, FP8/BF8).
+/// Sparse WMMA (gfx1201 wave32): `D = A(sparse 16xK) * B(Kx16) + D`, K = 32 (64 for `iu4_x64`), 4:2 structured.
+///
+/// One layout rule serves every executing kind (receipts `rcpt/gfx1201-C-r1` one-hot discovery and `gfx1201-C-r2`
+/// random raw-image waves, 0 mismatches for each kind and variant):
+/// * A holds `nA` packed elements per lane (8 for the 16-bit float kinds, IU8 and IU4 x32, 16 for IU4 x64), element
+///   `i` in VGPR `i / (32/bits)`, field `i % (32/bits)`. Lane `l` is row `l & 15`, half `h = l >> 4`; its elements are
+///   the compressed slots `j = nA*h + i`.
+/// * index: the SAME lane's word. Selector of slot `i` = `(idx >> (16*key + 2*i)) & 3` for `nA == 8`, where
+///   `key = index_key` = OPSEL[0]; `(idx >> 2*i) & 3` for IU4 x64 (32 bits, no key).
+/// * slot `j` meets dense `K = 4*(j >> 1) + selector`. Slots of one K-group may carry equal selectors; both then
+///   contribute separately (no merging, zeros never enter).
+/// * B: lane `l` is column `l & 15`, `hb = l >> 4`; element `e` (VGPR `e / (32/bits)`, field `e % (32/bits)`) is
+///   `K = (Ktot/2)*hb + e`.
+/// * C/D: WMMA accumulator layout, VDST read as C, EXEC ignored.
+/// Float kinds (f32-out f16/bf16): the dense WMMA FP32 chain of [`mma`] over the 16 slots, term `c` taken from slot
+/// `(c&3)|((c&4)<<1)|((c&8)>>1)`; `neg_lo[0]`/`neg_hi[0]` negate A of even/odd SLOTS, `neg_lo[1]`/`neg_hi[1]` the
+/// selected B of even/odd slots (slot parity, not K parity). Integer kinds: `neg_lo[0]`/`neg_lo[1]` mark A/B signed;
+/// CLAMP is the two-half saturation of [`mma::swmmac_i32`].
+/// Refused as unmeasured: neg_lo[2]/neg_hi[2] (C), NEG_HI on integers, CLAMP on floats, any other OPSEL bit, and
+/// every other kind (16-bit-out accumulator and FP8/BF8 rounding/NaN are unresolved).
 fn swmmac(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
-    match (arch, name) {
-        (Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu8") => swmmac_iu8(arch, name, i, s),
-        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_f16" | "v_swmmac_f32_16x16x32_bf16") => swmmac_f32(arch, name, i, s),
-        _ => Err(format!("{name} on {arch:?}: no probed SWMMAC numerics/index model; refusing to approximate")),
-    }
-}
-
-/// Modifier policy shared by the measured SWMMAC forms: only the default modifiers were measured.
-fn swmmac_plain(name: &str, i: &Inst) -> Result<()> {
+    // (floating kind, bf16 inputs, bits per element, nA, A regs, B regs)
+    let (float, bf16, bits, n_a, a_regs, b_regs) = match (arch, name) {
+        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_f16") => (true, false, 16, 8, 4, 8),
+        (Arch::Gfx1201, "v_swmmac_f32_16x16x32_bf16") => (true, true, 16, 8, 4, 8),
+        (Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu8") => (false, false, 8, 8, 2, 4),
+        (Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu4") => (false, false, 4, 8, 1, 2),
+        (Arch::Gfx1201, "v_swmmac_i32_16x16x64_iu4") => (false, false, 4, 16, 2, 4),
+        _ => return Err(format!("{name} on {arch:?}: no probed SWMMAC numerics/index model; refusing to approximate")),
+    };
     let m = &i.mods;
     if m.neg != 0 || m.abs != 0 || m.omod != Omod::None || m.dpp.is_some() || m.sdwa.is_some() {
         return Err(format!("{name}: VOP3 neg/abs/omod/DPP/SDWA modifiers are not part of SWMMAC"));
     }
-    if m.op_sel != 0 || !matches!(m.op_sel_hi, 0 | 7) {
-        return Err(format!("{name}: op_sel={:#x} op_sel_hi={:#x}: index_key:1 placement is not measured", m.op_sel, m.op_sel_hi));
+    if !matches!(m.op_sel_hi, 0 | 7) {
+        return Err(format!("{name}: op_sel_hi={:#x} has no modeled SWMMAC meaning", m.op_sel_hi));
     }
-    if m.neg_lo != 0 || m.neg_hi != 0 {
-        return Err(format!("{name}: NEG_LO/NEG_HI of SWMMAC are not measured"));
+    let has_key = n_a == 8;
+    if m.op_sel & !u8::from(has_key) != 0 {
+        return Err(format!("{name}: op_sel={:#x}: only index_key (OPSEL[0], absent on the x64 form) is measured", m.op_sel));
     }
-    if m.clamp {
-        return Err(format!("{name}: CLAMP has no probed SWMMAC semantics"));
+    let key = usize::from(m.op_sel & 1);
+    if m.neg_lo & 4 != 0 || m.neg_hi & 4 != 0 {
+        return Err(format!("{name}: NEG[2]/NEG_HI[2] (accumulator) are not measured for SWMMAC"));
     }
-    if i.operands.len() != 4 { return Err(format!("{name}: expected vdst,A,B,index operands, got {}", i.operands.len())); }
-    Ok(())
-}
-
-/// `v_swmmac_f32_16x16x32_f16` / `_bf16` (gfx1201): receipt `rcpt/gfx1201-{B,C}-r1/swmmac.*.numerics` (0 mismatches
-/// over 76,800 random-selector and 76,800 dense-equivalent-selector words per kind) -- the dense WMMA FP32 chain of
-/// [`mma`] applied to the 16 COMPRESSED slots of a row in slot order, never merged and never padded with zeros:
-/// * packed A: lane `l` is row `l & 15`, half `h = l >> 4`; packed element `i` (0..7) is VGPR `i >> 1`, half `i & 1`
-///   and compressed slot `j = 8h + i`.
-/// * index: the same lane's word, selector of slot `i` = `(idx >> 2i) & 3` (`index_key` 0).
-/// * slot `j` pairs with `B[K = 4 * (j >> 1) + selector][col]`; dense B lane `l` (column `l & 15`), element `e` (VGPR
-///   `e >> 1`, half `e & 1`) is K = `16 * (l >> 4) + e`.
-/// * the chain consumes term `c` from slot `(c & 3) | ((c & 4) << 1) | ((c & 8) >> 1)` (the dense K-order swap of
-///   physical bits 2 and 3), C/D as the dense f32 WMMA, VDST read as C. EXEC is ignored.
-fn swmmac_f32(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
-    swmmac_plain(name, i)?;
+    if float && m.clamp {
+        return Err(format!("{name}: CLAMP of a floating-point SWMMAC is not measured"));
+    }
+    if !float && m.neg_hi != 0 {
+        return Err(format!("{name}: NEG_HI is undefined for integer SWMMAC"));
+    }
     let o = &i.operands;
+    if o.len() != 4 { return Err(format!("{name}: expected vdst,A,B,index operands, got {}", o.len())); }
     vgprs(&o[0], 8, "D")?;
-    vgprs(&o[1], 4, "A")?;
-    vgprs(&o[2], 8, "B")?;
+    vgprs(&o[1], a_regs, "A")?;
+    vgprs(&o[2], b_regs, "B")?;
     vgprs(&o[3], 1, "index")?;
-    let model = if name == "v_swmmac_f32_16x16x32_bf16" { mma::wmma_f32_bf16 } else { mma::wmma_f32_f16 };
+    let per = 32 / bits;
+    let field = |word: u32, n: usize| (word >> (bits * (n % per))) & ((1u32 << bits) - 1);
+    let k_total = 4 * n_a;
     let swap = |c: usize| (c & 3) | ((c & 4) << 1) | ((c & 8) >> 1);
+    let signed = [m.neg_lo & 1 != 0, m.neg_lo & 2 != 0];
+    let decode = |raw: u32, signed: bool| -> i16 {
+        let v = raw as i16;
+        if signed { (v << (16 - bits)) >> (16 - bits) } else { v }
+    };
     let mut out = [[0u32; 32]; 8];
     for row in 0..16 {
         // Compressed A slots of this row and the dense K each one selects.
-        let mut a_slot = [0u16; 16];
-        let mut k_slot = [0usize; 16];
-        for j in 0..16 {
-            let (lane, e) = (row + 16 * (j >> 3), j & 7);
-            a_slot[j] = (s.read(&o[1], lane, e >> 1)? >> (16 * (e & 1))) as u16;
-            k_slot[j] = 4 * (j >> 1) + (s.read(&o[3], lane, 0)? >> (2 * e)) as usize % 4;
+        let mut a_slot = [0u32; 32];
+        let mut k_slot = [0usize; 32];
+        for j in 0..2 * n_a {
+            let (lane, e) = (row + 16 * (j / n_a), j % n_a);
+            a_slot[j] = field(s.read(&o[1], lane, e / per)?, e);
+            let shift = if has_key { 16 * key + 2 * e } else { 2 * e };
+            k_slot[j] = 4 * (j >> 1) + (s.read(&o[3], lane, 0)? >> shift) as usize % 4;
         }
         for col in 0..16 {
-            let mut a = [0u16; 16];
-            let mut b = [0u16; 16];
-            for c in 0..16 {
-                let j = swap(c);
-                let (b_lane, e) = (col + 16 * (k_slot[j] >> 4), k_slot[j] & 15);
-                a[c] = a_slot[j];
-                b[c] = (s.read(&o[2], b_lane, e >> 1)? >> (16 * (e & 1))) as u16;
+            let mut b_slot = [0u32; 32];
+            for j in 0..2 * n_a {
+                let (b_lane, e) = (col + 16 * (k_slot[j] / (k_total / 2)), k_slot[j] % (k_total / 2));
+                b_slot[j] = field(s.read(&o[2], b_lane, e / per)?, e);
             }
             let (lane, vgpr) = acc_loc(arch, row, col);
-            out[vgpr][lane] = model(arch, &a, &b, s.read(&o[0], lane, vgpr)?);
-        }
-    }
-    for (vgpr, lanes) in out.iter().enumerate() {
-        for (lane, &value) in lanes.iter().enumerate() { s.put(&o[0], lane, vgpr, value)?; }
-    }
-    Ok(())
-}
-
-/// `v_swmmac_i32_16x16x32_iu8`: see [`swmmac`]'s documentation above.
-fn swmmac_iu8(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
-    swmmac_plain(name, i)?;
-    let o = &i.operands;
-    vgprs(&o[0], 8, "D")?;
-    vgprs(&o[1], 2, "A")?;
-    vgprs(&o[2], 4, "B")?;
-    vgprs(&o[3], 1, "index")?;
-    let mut a = [[0i16; 32]; 16];
-    for lane in 0..32 {
-        let (row, half) = (lane & 15, lane >> 4);
-        let index = s.read(&o[3], lane, 0)?;
-        for slot in 0..8 {
-            let value = (s.read(&o[1], lane, slot >> 2)? >> (8 * (slot & 3))) as u8;
-            let selector = (index >> (2 * slot)) as usize & 3;
-            a[row][4 * ((8 * half + slot) >> 1) + selector] += i16::from(value);
-        }
-    }
-    let mut b = [[0i16; 32]; 16];
-    for lane in 0..32 {
-        for e in 0..16 {
-            b[lane & 15][16 * (lane >> 4) + e] = i16::from((s.read(&o[2], lane, e >> 2)? >> (8 * (e & 3))) as u8);
-        }
-    }
-    let mut out = [[0u32; 32]; 8];
-    for row in 0..16 {
-        for col in 0..16 {
-            let (lane, vgpr) = acc_loc(arch, row, col);
-            out[vgpr][lane] = mma::swmmac_i32_iu(arch, &a[row], &b[col], s.read(&o[0], lane, vgpr)? as i32) as u32;
+            let c = s.read(&o[0], lane, vgpr)?;
+            out[vgpr][lane] = if float {
+                let flip = |lo: bool, hi: bool, j: usize| -> u16 {
+                    let negate = if j % 2 == 0 { lo } else { hi };
+                    if negate { 0x8000 } else { 0 }
+                };
+                let (mut a, mut b) = ([0u16; 16], [0u16; 16]);
+                for t in 0..16 {
+                    let j = swap(t);
+                    a[t] = a_slot[j] as u16 ^ flip(m.neg_lo & 1 != 0, m.neg_hi & 1 != 0, j);
+                    b[t] = b_slot[j] as u16 ^ flip(m.neg_lo & 2 != 0, m.neg_hi & 2 != 0, j);
+                }
+                (if bf16 { mma::wmma_f32_bf16 } else { mma::wmma_f32_f16 })(arch, &a, &b, c)
+            } else {
+                let (mut a, mut b) = ([0i16; 32], [0i16; 32]);
+                for j in 0..2 * n_a {
+                    a[j] = decode(a_slot[j], signed[0]);
+                    b[j] = decode(b_slot[j], signed[1]);
+                }
+                mma::swmmac_i32(arch, &a[..2 * n_a], &b[..2 * n_a], c as i32, m.clamp) as u32
+            };
         }
     }
     for (vgpr, lanes) in out.iter().enumerate() {
@@ -688,22 +677,132 @@ fn acc_loc(arch: Arch, row: usize, col: usize) -> (usize, usize) {
         }
     }
 
+    /// One SWMMAC wave from raw register images (register-major, lane-minor): returns the state after execution.
+    fn swmmac_wave(name: &str, m: Modifiers, regs: (u8, u8), a: &[u32], b: &[u32], idx: &[u32], c: &[u32]) -> State {
+        let mut st = state();
+        for lane in 0..32 {
+            for vgpr in 0..usize::from(regs.0) { st.v[usize::from(A) + vgpr][lane] = a[32 * vgpr + lane]; }
+            for vgpr in 0..usize::from(regs.1) { st.v[usize::from(B) + vgpr][lane] = b[32 * vgpr + lane]; }
+            for vgpr in 0..8 { st.v[usize::from(D) + vgpr][lane] = c[32 * vgpr + lane]; }
+            st.v[usize::from(IDX)][lane] = idx[lane];
+        }
+        let i = insn(Arch::Gfx1201, name, [reg(D, 8), reg(A, regs.0), reg(B, regs.1), reg(IDX, 1)], m);
+        execute(Arch::Gfx1201, name, &i, &mut st).unwrap();
+        st
+    }
+
+    // Recorded gfx1201 waves (rcpt/gfx1201-C-r2): modifier variants that change the result, including the integer
+    // two-half CLAMP (a single final saturation differs from hardware in 12 / 9 / 5 words of these waves).
+    #[test] fn swmmac_modifier_variants_reproduce_recorded_hardware_waves() {
+        use crate::emu::swmmac_fixtures as f;
+        let key1 = Modifiers { op_sel: 1, ..mods(0, 0) };
+        let neg_all = Modifiers { neg_lo: 3, neg_hi: 3, op_sel_hi: 7, ..Default::default() };
+        let signed_clamp = Modifiers { clamp: true, ..mods(3, 0) };
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, Modifiers, (u8, u8), &[u32], &[u32], &[u32], &[u32], &[u32]); 6] = [
+            ("v_swmmac_f32_16x16x32_f16", neg_all, (4, 8), &f::F16_NEG_A, &f::F16_NEG_B, &f::F16_NEG_IDX, &f::F16_NEG_C, &f::F16_NEG_D),
+            ("v_swmmac_f32_16x16x32_bf16", key1.clone(), (4, 8), &f::BF16_KEY1_A, &f::BF16_KEY1_B, &f::BF16_KEY1_IDX, &f::BF16_KEY1_C, &f::BF16_KEY1_D),
+            ("v_swmmac_i32_16x16x32_iu8", signed_clamp.clone(), (2, 4), &f::IU8_CLAMP_A, &f::IU8_CLAMP_B, &f::IU8_CLAMP_IDX, &f::IU8_CLAMP_C, &f::IU8_CLAMP_D),
+            ("v_swmmac_i32_16x16x32_iu4", key1, (1, 2), &f::IU4_KEY1_A, &f::IU4_KEY1_B, &f::IU4_KEY1_IDX, &f::IU4_KEY1_C, &f::IU4_KEY1_D),
+            ("v_swmmac_i32_16x16x32_iu4", signed_clamp.clone(), (1, 2), &f::IU4_CLAMP_A, &f::IU4_CLAMP_B, &f::IU4_CLAMP_IDX, &f::IU4_CLAMP_C, &f::IU4_CLAMP_D),
+            ("v_swmmac_i32_16x16x64_iu4", signed_clamp, (2, 4), &f::IU4X64_CLAMP_A, &f::IU4X64_CLAMP_B, &f::IU4X64_CLAMP_IDX, &f::IU4X64_CLAMP_C, &f::IU4X64_CLAMP_D),
+        ];
+        for (name, m, regs, a, b, idx, c, d) in cases {
+            let st = swmmac_wave(name, m, regs, a, b, idx, c);
+            for vgpr in 0..8 {
+                for lane in 0..32 { assert_eq!(st.v[usize::from(D) + vgpr][lane], d[32 * vgpr + lane], "{name} D vgpr {vgpr} lane {lane}"); }
+            }
+        }
+    }
+
+    // IU4 x32, hand-placed. Row 5 is lane 5 (half 0) / lane 21 (half 1). Half 1, element 3 (nibble 3 of VGPR 0) is
+    // slot 8+3 = 11 -> K-group 5; selector 2 (idx bits [7:6] of lane 21) -> K = 22. B[22][9]: hb = 1, e = 6 -> lane
+    // 16+9, VGPR 0, nibble 6. D[5][9]: lane 9, VGPR 5.
+    #[test] fn swmmac_iu4_x32_layout_and_index_key() {
+        let run = |m: Modifiers, a_nibble: u32, b_nibble: u32, idx: u32| {
+            let mut st = state();
+            put_nib(&mut st, A, 0, 21, 3, a_nibble);
+            st.v[usize::from(IDX)][21] = idx;
+            put_nib(&mut st, B, 0, 25, 6, b_nibble);
+            let i = insn(Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu4", [reg(D, 8), reg(A, 1), reg(B, 2), reg(IDX, 1)], m);
+            execute(Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu4", &i, &mut st).unwrap();
+            st
+        };
+        assert_eq!(only(&run(mods(0, 0), 3, 5, 2 << 6), (5, 9)) as i32, 15);
+        // index_key:1 reads the HIGH 16 bits: a selector there is ignored by key 0 and found by key 1.
+        let high = 2u32 << 22;
+        assert!(run(mods(0, 0), 3, 5, high).v[..8].iter().all(|r| r.iter().all(|&w| w == 0)));
+        assert_eq!(only(&run(Modifiers { op_sel: 1, ..mods(0, 0) }, 3, 5, high), (5, 9)) as i32, 15);
+        // Signed nibbles: A = 0xd (-3), B = 0xb (-5); NEG_LO[0] alone makes only A signed (B stays 11).
+        assert_eq!(only(&run(mods(3, 0), 0xd, 0xb, 2 << 6), (5, 9)) as i32, 15);
+        assert_eq!(only(&run(mods(1, 0), 0xd, 0xb, 2 << 6), (5, 9)) as i32, -3 * 11);
+        assert_eq!(only(&run(mods(2, 0), 0xd, 0xb, 2 << 6), (5, 9)) as i32, 13 * -5);
+    }
+
+    // IU4 x64: 16 elements per lane, no index_key, the whole 32-bit index word. Row 2 half 1 = lane 18; element 11
+    // (VGPR 1, nibble 3) is slot 16+11 = 27 -> K-group 13; selector at idx bits [23:22] = 1 -> K = 53. B[53][7]:
+    // hb = 1, e = 21 -> lane 16+7, VGPR 2, nibble 5. D[2][7]: lane 7, VGPR 2.
+    #[test] fn swmmac_iu4_x64_layout_uses_the_whole_index_word() {
+        let mut st = state();
+        put_nib(&mut st, A, 1, 18, 3, 6);
+        st.v[usize::from(IDX)][18] = 1 << 22;
+        put_nib(&mut st, B, 2, 23, 5, 7);
+        let i = insn(Arch::Gfx1201, "v_swmmac_i32_16x16x64_iu4", [reg(D, 8), reg(A, 2), reg(B, 4), reg(IDX, 1)], mods(0, 0));
+        execute(Arch::Gfx1201, "v_swmmac_i32_16x16x64_iu4", &i, &mut st).unwrap();
+        assert_eq!(only(&st, (2, 7)) as i32, 42);
+        // The x64 form has no index_key.
+        let keyed = insn(Arch::Gfx1201, "v_swmmac_i32_16x16x64_iu4", [reg(D, 8), reg(A, 2), reg(B, 4), reg(IDX, 1)], Modifiers { op_sel: 1, ..mods(0, 0) });
+        assert!(execute(Arch::Gfx1201, "v_swmmac_i32_16x16x64_iu4", &keyed, &mut st).is_err());
+    }
+
+    // Float NEG acts by compressed-SLOT parity, not by K parity. Row 0 lane 0: slot 0 (A = 2.0, selector 1 -> K = 1)
+    // and slot 1 (A = 4.0, selector 3 -> K = 3); B[1][0] = 3.0 (VGPR 0 high half), B[3][0] = 5.0 (VGPR 1 high half).
+    // Both K are odd, so a K-parity rule would not separate them; slot parity does.
+    #[test] fn swmmac_float_neg_follows_slot_parity() {
+        let run = |neg_lo: u8, neg_hi: u8| {
+            let mut st = state();
+            st.v[usize::from(A)][0] = 0x4000 | (0x4400 << 16); // f16 2.0 (slot 0), 4.0 (slot 1)
+            st.v[usize::from(IDX)][0] = 1 | (3 << 2);
+            st.v[usize::from(B)][0] = 0x4200 << 16; // e=1 = 3.0
+            st.v[usize::from(B) + 1][0] = 0x4500 << 16; // e=3 = 5.0
+            let m = Modifiers { neg_lo, neg_hi, op_sel_hi: 7, ..Default::default() };
+            let i = insn(Arch::Gfx1201, "v_swmmac_f32_16x16x32_f16", [reg(D, 8), reg(A, 4), reg(B, 8), reg(IDX, 1)], m);
+            execute(Arch::Gfx1201, "v_swmmac_f32_16x16x32_f16", &i, &mut st).unwrap();
+            f32::from_bits(st.v[0][0])
+        };
+        assert_eq!(run(0, 0), 2.0 * 3.0 + 4.0 * 5.0);
+        assert_eq!(run(1, 0), -2.0 * 3.0 + 4.0 * 5.0); // A of even slots
+        assert_eq!(run(0, 1), 2.0 * 3.0 - 4.0 * 5.0); // A of odd slots
+        assert_eq!(run(2, 0), -2.0 * 3.0 + 4.0 * 5.0); // selected B of even slots
+        assert_eq!(run(0, 2), 2.0 * 3.0 - 4.0 * 5.0);  // selected B of odd slots
+        assert_eq!(run(1, 2), -2.0 * 3.0 - 4.0 * 5.0);
+        assert_eq!(run(3, 0), 2.0 * 3.0 + 4.0 * 5.0); // A and B both negated on the even slot
+    }
+
     #[test] fn swmmac_refuses_unmeasured_modes_and_every_other_variant() {
         let mut st = state();
-        let mk = |name: &str, m: Modifiers| insn(Arch::Gfx1201, name, [reg(D, 8), reg(A, 2), reg(B, 4), reg(IDX, 1)], m);
-        let ok = mk("v_swmmac_i32_16x16x32_iu8", mods(0, 0));
-        assert!(execute(Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu8", &ok, &mut st).is_ok());
-        // index_key (OPSEL[0]), NEG_LO signedness, NEG_HI and CLAMP are not measured; gfx11 has no SWMMAC.
-        for m in [Modifiers { op_sel: 1, ..mods(0, 0) }, Modifiers { clamp: true, ..mods(0, 0) }, mods(3, 0), mods(0, 1)] {
-            let i = mk("v_swmmac_i32_16x16x32_iu8", m);
-            assert!(execute(Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu8", &i, &mut st).is_err());
+        let mk = |name: &str, regs: (u8, u8), m: Modifiers| insn(Arch::Gfx1201, name, [reg(D, 8), reg(A, regs.0), reg(B, regs.1), reg(IDX, 1)], m);
+        let iu8 = |m: Modifiers| mk("v_swmmac_i32_16x16x32_iu8", (2, 4), m);
+        let f16 = |m: Modifiers| mk("v_swmmac_f32_16x16x32_f16", (4, 8), m);
+        // Measured modes run.
+        for m in [mods(0, 0), Modifiers { op_sel: 1, ..mods(0, 0) }, Modifiers { clamp: true, ..mods(3, 0) }] {
+            assert!(execute(Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu8", &iu8(m), &mut st).is_ok());
         }
-        assert!(execute(Arch::Gfx1151, "v_swmmac_i32_16x16x32_iu8", &ok, &mut st).is_err());
-        // iu4 / iu4x64 maps, 16-bit-out and FP8/BF8 SWMMAC are unconfirmed: refused.
-        for name in ["v_swmmac_i32_16x16x32_iu4", "v_swmmac_i32_16x16x64_iu4",
-                     "v_swmmac_f16_16x16x32_f16", "v_swmmac_bf16_16x16x32_bf16", "v_swmmac_f32_16x16x32_fp8_fp8",
+        assert!(execute(Arch::Gfx1201, "v_swmmac_f32_16x16x32_f16", &f16(Modifiers { neg_lo: 3, neg_hi: 3, op_sel: 1, op_sel_hi: 7, ..Default::default() }), &mut st).is_ok());
+        // Unmeasured: other OPSEL bits, accumulator NEG[2]/NEG_HI[2], NEG_HI on integers, CLAMP on floats.
+        for m in [Modifiers { op_sel: 2, ..mods(0, 0) }, Modifiers { op_sel: 4, ..mods(0, 0) }, mods(4, 0), mods(0, 4), mods(0, 1)] {
+            assert!(execute(Arch::Gfx1201, "v_swmmac_i32_16x16x32_iu8", &iu8(m), &mut st).is_err());
+        }
+        for m in [Modifiers { neg_lo: 4, op_sel_hi: 7, ..Default::default() }, Modifiers { neg_hi: 4, op_sel_hi: 7, ..Default::default() }, Modifiers { clamp: true, ..mods(0, 0) }, Modifiers { op_sel: 2, ..mods(0, 0) }] {
+            assert!(execute(Arch::Gfx1201, "v_swmmac_f32_16x16x32_f16", &f16(m), &mut st).is_err());
+        }
+        // gfx11 has no SWMMAC.
+        assert!(execute(Arch::Gfx1151, "v_swmmac_i32_16x16x32_iu8", &iu8(mods(0, 0)), &mut st).is_err());
+        // 16-bit-out accumulation (inter-step truncation, 77-84% model match) and FP8/BF8 (rounding/NaN unprobed).
+        for name in ["v_swmmac_f16_16x16x32_f16", "v_swmmac_bf16_16x16x32_bf16", "v_swmmac_f32_16x16x32_fp8_fp8",
                      "v_swmmac_f32_16x16x32_fp8_bf8", "v_swmmac_f32_16x16x32_bf8_fp8", "v_swmmac_f32_16x16x32_bf8_bf8"] {
-            assert!(execute(Arch::Gfx1201, name, &ok, &mut st).is_err(), "{name}");
+            let i = iu8(mods(0, 0));
+            assert!(execute(Arch::Gfx1201, name, &i, &mut st).is_err(), "{name}");
         }
     }
     // Raw gfx1201 hardware wave (rcpt/gfx1201-C-r1 swmmac f32_16x16x32_f16 `numerics` case 7, random 2:4 positions, index_key 0),

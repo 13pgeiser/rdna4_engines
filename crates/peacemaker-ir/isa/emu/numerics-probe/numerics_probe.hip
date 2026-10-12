@@ -517,7 +517,33 @@ static WSet make_float_set(int kind, uint64_t seed) {
           s.cs.push_back(c);
         }
   f3(8000);
-  s.layout = "controls(3) F1(single-product) F4(subnormal rows) F5(C-tail window sweep) F3(random 2000)=[sub prefix] F2(two-product) F3(random 8000)";
+  // ---- F6: mid-step precision. Two products in DIFFERENT dot steps (K positions kA, kB): p0 = V[r]*V[c] (dense 16-bit
+  //          significands, every row/column pair), p1 = +-2^-s with s sweeping; C = +0. Where a carry/borrow of p1 into p0
+  //          appears reveals how many significand bits the inter-step accumulator keeps and how it is rounded.
+  {
+    static const int kc[12][2] = {{0, 4}, {0, 8}, {0, 12}, {4, 8}, {4, 12}, {8, 12}, {1, 5}, {2, 13}, {3, 4}, {3, 12}, {7, 8}, {11, 12}};
+    const int mant7[16] = {0, 1, 2, 3, 4, 8, 16, 32, 64, 96, 112, 120, 124, 126, 127, 85};
+    const int mant10[16] = {0, 1, 2, 3, 4, 8, 64, 256, 512, 768, 896, 960, 1008, 1020, 1022, 1023};
+    const int smax = bf ? 30 : 24;
+    auto pow2neg = [&](int sh, bool neg) -> uint16_t {
+      int e = bias - sh;
+      uint16_t v = e >= 1 ? uint16_t(e << fbits) : uint16_t(1u << (bias + fbits - 1 - sh));
+      return uint16_t(v | (neg ? 0x8000 : 0));
+    };
+    for (int ki = 0; ki < 12; ki++)
+      for (int sh = 0; sh <= smax; sh++)
+        for (int neg = 0; neg < 2; neg++) {
+          WCase c = zero_case();
+          for (int i = 0; i < 16; i++) {
+            uint16_t v = uint16_t(((bias) << fbits) | (bf ? mant7[i] : mant10[i]));
+            c.A[i * 16 + kc[ki][0]] = v; c.Bt[i * 16 + kc[ki][0]] = v;
+            c.A[i * 16 + kc[ki][1]] = uint16_t(bias << fbits);
+            c.Bt[i * 16 + kc[ki][1]] = pow2neg(sh, neg);
+          }
+          s.cs.push_back(c);
+        }
+  }
+  s.layout = "controls(3) F1(single-product) F4(subnormal rows) F5(C-tail window sweep) F3(random 2000)=[sub prefix] F2(two-product) F3(random 8000) F6(mid-step precision, last 12*(smax+1)*2 waves)";
   return s;
 }
 
@@ -561,6 +587,7 @@ static WSet make_iu8_set(uint64_t seed) {
   return s;
 }
 
+static bool np_lite() { const char* e = getenv("NP_LITE"); return e && *e == '1'; }
 static void run_wset(int kind, const WSet& s, const char* tag) {
   const bool iu = kind == 3;
   const int nv = iu ? NWV_I : (kind == 0 || kind == 4 ? 8 : NWV_F);
@@ -574,8 +601,7 @@ static void run_wset(int kind, const WSet& s, const char* tag) {
   for (int v = 0; v < nv; v++)
     for (int m = 0; m < NMODES; m++) {
       if (v && m) continue;
-      bool sub = (v != 0) || (m != 0 && true);
-      (void)sub;
+      if (np_lite() && (v || m)) continue;
       // modifier variants and non-default modes run on the sub-prefix only; V0/default runs the whole set
       uint32_t nn = (v == 0 && m == 0) ? n : s.n_sub;
       wmma_dispatch(kind, v, din, dout, nn, MODES[m], mo);
@@ -590,7 +616,14 @@ static void run_wset(int kind, const WSet& s, const char* tag) {
     }
 }
 
-static void suite_wmma() { for (int k : {0, 1, 2, 4}) run_wset(k, make_float_set(k, 0x57a000 + k), "float"); }
+// NP_KINDS="1,2" restricts the float WMMA kinds (0 bf16->f32, 1 bf16->bf16, 2 f16->f16, 4 f16->f32); NP_LITE=1 runs only the
+// base variant at the default MODE (receipts stay small when a focused re-run is needed).
+static void suite_wmma() {
+  const char* env = getenv("NP_KINDS");
+  std::string want = std::string(",") + (env ? env : "0,1,2,4") + ",";
+  for (int k : {0, 1, 2, 4})
+    if (want.find("," + std::to_string(k) + ",") != std::string::npos) run_wset(k, make_float_set(k, 0x57a000 + k), "float");
+}
 static void suite_iu8() { run_wset(3, make_iu8_set(0x1a8), "iu8"); }
 
 // ============================================================================================== SWMMAC (gfx12)
@@ -842,6 +875,61 @@ static void swmmac_numerics() {
   }
 }
 
+
+// Exact-value layout validation for every SWMMAC kind: raw register images whose element values are small exactly
+// representable numbers (floats) or arbitrary bits (integers), random per-lane index words. analyze.py decodes the images
+// with the discovered layout (see swmmac_layout in analyze.py) and requires bit-exact agreement with the exact sum.
+static std::vector<uint32_t> swmmac_vals(int kind, bool wide) {
+  switch (kind) {
+    case 0: case 2: return wide ? std::vector<uint32_t>{0x0000, 0x3c00, 0xbc00, 0x4000, 0xc000, 0x3800, 0xb800, 0x4200, 0xc200, 0x3400, 0x4400}
+                                : std::vector<uint32_t>{0x0000, 0x3c00, 0xbc00, 0x4000, 0xc000};
+    case 1: case 3: return wide ? std::vector<uint32_t>{0x0000, 0x3f80, 0xbf80, 0x4000, 0xc000, 0x3f00, 0xbf00, 0x4040, 0xc040, 0x3e80, 0x4080}
+                                : std::vector<uint32_t>{0x0000, 0x3f80, 0xbf80, 0x4000, 0xc000};
+    case 7: return {0x00, 0x38, 0xb8, 0x40, 0xc0, 0x30, 0xb0, 0x44, 0xc4, 0x28, 0x48};   // e4m3 first operand
+    case 8: return {0x00, 0x38, 0xb8, 0x40, 0xc0, 0x30, 0xb0, 0x44, 0xc4, 0x28, 0x48};
+    default: return {};
+  }
+}
+static uint32_t pick_elem(int kind, bool second, Rng& g) {
+  // second operand format of the mixed fp8/bf8 kinds: 9 = bf8(A) x fp8(B), 8 = fp8(A) x bf8(B), 7 fp8 x fp8, 10 bf8 x bf8
+  if (kind >= 7) {
+    static const uint32_t e4m3[] = {0x00, 0x38, 0xb8, 0x40, 0xc0, 0x30, 0xb0, 0x44, 0xc4, 0x28, 0x48};
+    static const uint32_t e5m2[] = {0x00, 0x3c, 0xbc, 0x40, 0xc0, 0x38, 0xb8, 0x42, 0xc2, 0x34, 0x44};
+    bool is_e4m3 = (kind == 7) || (kind == 8 && !second) || (kind == 9 && second);
+    return is_e4m3 ? e4m3[g.below(11)] : e5m2[g.below(11)];
+  }
+  if (kind <= 3) { auto v = swmmac_vals(kind, kind <= 1 || true); return v[g.below(v.size())]; }
+  return g.u32();  // integer kinds: arbitrary bits
+}
+static void swmmac_valid() {
+  for (int kind = 0; kind < NSK; kind++) {
+    Rng g(0xa11d + kind);
+    std::vector<SCase> cs;
+    const int bitsA = elem_bits(kind);
+    const int nsl = (kind == 6) ? 16 : 8;  // compressed slots per lane
+    (void)nsl;
+    for (int w = 0; w < 1000; w++) {
+      SCase c = zero_s();
+      for (int l = 0; l < 32; l++) {
+        c.idx[l] = g.u32();
+        for (int e = 0; e < SA[kind] * (32 / bitsA); e++) put_elem(&c.a[0][0], l, e, bitsA, pick_elem(kind, false, g));
+        for (int e = 0; e < SB[kind] * (32 / bitsA); e++) put_elem(&c.b[0][0], l, e, bitsA, pick_elem(kind, true, g));
+        for (int j = 0; j < SD[kind]; j++) {
+          if (kind >= 4 && kind <= 6) c.c[j][l] = g.below(3) == 0 ? I32_S[g.below(I32_S.size())] : g.below(2) ? g.u32() : uint32_t(int32_t(g.u32()) >> (8 + g.below(24)));
+          else if (kind <= 1 || kind >= 7) { float f = float(int(g.below(17)) - 8); memcpy(&c.c[j][l], &f, 4); }
+          else { auto v = swmmac_vals(kind, false); c.c[j][l] = v[g.below(v.size())] | (v[g.below(v.size())] << 16); }
+        }
+      }
+      cs.push_back(c);
+    }
+    std::vector<int> variants;
+    if (kind >= 7) variants = {0, 1};
+    else if (kind == 6) variants = {0, 2, 3, 4, 5, 6};
+    else variants = {0, 1, 2, 3, 4, 5, 6};
+    run_sset(kind, cs, "valid", variants, 0, "random raw images, exact small values (float kinds) / arbitrary bits (integer kinds); decode with analyze.py swmmac_layout");
+  }
+}
+
 static void suite_swmmac_map() {
 #if NP_GFX12
   discovery();
@@ -850,6 +938,11 @@ static void suite_swmmac_map() {
 static void suite_swmmac_num() {
 #if NP_GFX12
   swmmac_numerics();
+#endif
+}
+static void suite_swmmac_valid() {
+#if NP_GFX12
+  swmmac_valid();
 #endif
 }
 
@@ -871,7 +964,7 @@ static void suite_identity() {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 3) { fprintf(stderr, "usage: %s <outdir> <identity|dot|wmma|iu8|swmmac_map|swmmac_num|all>[,..]\n", argv[0]); return 2; }
+  if (argc < 3) { fprintf(stderr, "usage: %s <outdir> <identity|dot|wmma|iu8|swmmac_map|swmmac_num|swmmac_valid|all>[,..]\n", argv[0]); return 2; }
   OUT = argv[1];
   mkdir(OUT.c_str(), 0777);
   std::string suites = std::string(",") + argv[2] + ",";
@@ -882,6 +975,7 @@ int main(int argc, char** argv) {
   if (want("wmma")) suite_wmma();
   if (want("swmmac_map")) suite_swmmac_map();
   if (want("swmmac_num")) suite_swmmac_num();
+  if (want("swmmac_valid")) suite_swmmac_valid();
   std::string idx;
   for (auto& n : INDEX) idx += n + "\n";
   write_text(OUT + "/INDEX.txt", idx);
