@@ -21,6 +21,18 @@
 //! [`SpecDistRows`]/[`SpecDistScratch`]/tapes and call
 //! [`Gpu::spec_cpu_ar_precompile`] before capture or the timed window.
 //!
+//! Production kernels. [`Gpu::spec_cpu_ar_rows_parallel_enqueue`] (the canonical
+//! parallel target-row law) and [`Gpu::spec_accept_ordered_enqueue`] run the
+//! certified PeaceMaker (builder-emitted) images embedded in `kernels.rs`, with
+//! no hipcc fallback, on exactly gfx1151 and gfx1201
+//! ([`Gpu::spec_cpu_ar_device_supported`]); any other device is an error.
+//! [`Gpu::spec_cpu_ar_precompile`] binds only those two PM kernels and compiles
+//! nothing from HIP. The hipcc kernels stay as the explicit oracle twins:
+//! `spec_cpu_ar_rows_parallel_hip_twin_*`, `spec_accept_ordered_hip_twin_*`,
+//! the serial reference rows and the candidates kernel
+//! ([`Gpu::spec_cpu_ar_oracle_precompile`] binds the three serial HIP kernels,
+//! [`Gpu::spec_cpu_ar_candidates_precompile`] only the candidates kernel).
+//!
 //! The crate has no integer `DType`: `u32` buffers are `F32`-typed tensors of
 //! the same byte size (the convention of `sampled_rows_compact`); read them
 //! back as raw bytes.
@@ -178,10 +190,83 @@ fn check_bytes(name: &str, t: &GpuTensor, need: usize) -> HipResult<()> {
     Ok(())
 }
 
+/// The embedded certified builder images of one exact architecture.
+struct PmImages {
+    rows_module: &'static str,
+    rows_image: &'static [u8],
+    rows_symbol: &'static str,
+    accept_module: &'static str,
+    accept_image: &'static [u8],
+    accept_symbol: &'static str,
+}
+
+/// PM images of `arch` (the device's `gfx...` name, compared exactly), or
+/// `None` where no certified image ships.
+fn pm_images(arch: &str) -> Option<PmImages> {
+    match arch {
+        "gfx1151" => Some(PmImages {
+            rows_module: "spec_sampling_rows_parallel_pm_gfx1151",
+            rows_image: crate::kernels::SPEC_SAMPLING_ROWS_PARALLEL_PM_GFX1151,
+            rows_symbol: "spec_cpu_ar_rows_parallel_f32_pm_gfx1151",
+            accept_module: "spec_accept_ordered_pm_gfx1151",
+            accept_image: crate::kernels::SPEC_ACCEPT_ORDERED_PM_GFX1151,
+            accept_symbol: "spec_accept_ordered_u32_pm_gfx1151",
+        }),
+        "gfx1201" => Some(PmImages {
+            rows_module: "spec_sampling_rows_parallel_pm_gfx1201",
+            rows_image: crate::kernels::SPEC_SAMPLING_ROWS_PARALLEL_PM_GFX1201,
+            rows_symbol: "spec_cpu_ar_rows_parallel_f32_pm_gfx1201",
+            accept_module: "spec_accept_ordered_pm_gfx1201",
+            accept_image: crate::kernels::SPEC_ACCEPT_ORDERED_PM_GFX1201,
+            accept_symbol: "spec_accept_ordered_u32_pm_gfx1201",
+        }),
+        _ => None,
+    }
+}
+
+/// Device symbol of the PM parallel rows kernel on `arch` (`gfx1151` or
+/// `gfx1201`), `None` elsewhere.
+pub fn spec_cpu_ar_rows_parallel_pm_symbol(arch: &str) -> Option<&'static str> {
+    pm_images(arch).map(|p| p.rows_symbol)
+}
+
+/// Device symbol of the PM ordered-accept kernel on `arch` (`gfx1151` or
+/// `gfx1201`), `None` elsewhere.
+pub fn spec_accept_ordered_pm_symbol(arch: &str) -> Option<&'static str> {
+    pm_images(arch).map(|p| p.accept_symbol)
+}
+
 impl Gpu {
-    /// Load the module and bind all three kernels (call before graph capture
-    /// and before the timed window).
+    /// True exactly on gfx1151 and gfx1201, the architectures with an embedded
+    /// certified PM image of both the parallel rows and the ordered-accept
+    /// kernels (gfx1200 and every other architecture: false).
+    pub fn spec_cpu_ar_device_supported(&self) -> bool {
+        pm_images(&self.arch).is_some()
+    }
+
+    fn pm_images_required(&self, what: &str) -> HipResult<PmImages> {
+        pm_images(&self.arch).ok_or_else(|| {
+            err(format!(
+                "{what}: no certified PM image for {} (gfx1151 and gfx1201 only; no hipcc fallback)",
+                self.arch
+            ))
+        })
+    }
+
+    /// Production setup (call before graph capture and before the timed
+    /// window): load the PM modules and bind the parallel rows and
+    /// ordered-accept kernels. Nothing is compiled from HIP; the candidates
+    /// kernel ([`Gpu::spec_cpu_ar_candidates_precompile`]) and the serial
+    /// reference ([`Gpu::spec_cpu_ar_oracle_precompile`]) are not touched.
+    /// Fails off gfx1151 / gfx1201.
     pub fn spec_cpu_ar_precompile(&mut self) -> HipResult<()> {
+        self.spec_cpu_ar_rows_parallel_precompile()?;
+        self.spec_accept_ordered_precompile()
+    }
+
+    /// Explicit oracle setup: load the HIP module and bind the serial
+    /// reference rows, the candidates and the HIP ordered-accept kernels.
+    pub fn spec_cpu_ar_oracle_precompile(&mut self) -> HipResult<()> {
         self.bind_thread()?;
         for symbol in [
             SPEC_CPU_AR_ROWS_SYMBOL,
@@ -193,12 +278,15 @@ impl Gpu {
         Ok(())
     }
 
-    /// Architecture admission for the experimental device sampler.
-    /// PM image availability is checked by the eventual production launcher.
-    pub fn spec_cpu_ar_device_supported(&self) -> bool {
-        matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+    /// Load the HIP module and bind only the candidates kernel.
+    pub fn spec_cpu_ar_candidates_precompile(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            SPEC_SAMPLING_CPU_AR_MODULE,
+            SPEC_SAMPLING_CPU_AR_SRC,
+            SPEC_CPU_AR_CANDIDATES_SYMBOL,
+        )
     }
-
     /// Build the target distribution of `row_count` contiguous logit rows
     /// (`logits`: f32 `[row_count * vocab]`, row index = token id) into rows
     /// `0..row_count` of `rows`, exactly as `SparseDist::build_from_logits`.
@@ -384,9 +472,77 @@ impl Gpu {
     /// disables the EOS stop. The host's consumed draws are `accepted` after an
     /// accepted EOS, `accepted + 2` after a rejection, `k + 1` when all
     /// accepted.
+    ///
+    /// Production: runs the certified PM image (gfx1151 / gfx1201 only, no
+    /// hipcc fallback); [`Gpu::spec_accept_ordered_hip_twin_enqueue`] is the
+    /// explicit hipcc oracle with the same arguments and bytes.
     #[allow(clippy::too_many_arguments)]
     pub fn spec_accept_ordered_enqueue(
         &mut self,
+        target: &SpecDistRows,
+        draft: &SpecDistRows,
+        proposal_ids: &GpuTensor,
+        uniforms: &GpuTensor,
+        result: &GpuTensor,
+        k: usize,
+        eos: u32,
+    ) -> HipResult<()> {
+        let pm = self.pm_images_required("spec_accept_ordered_enqueue")?;
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(pm.accept_module, pm.accept_image, pm.accept_symbol)?;
+        self.spec_accept_ordered_launch(
+            pm.accept_symbol, target, draft, proposal_ids, uniforms, result, k, eos,
+        )
+    }
+
+    /// Load the PM ordered-accept module and bind its kernel only (gfx1151 /
+    /// gfx1201; error elsewhere).
+    pub fn spec_accept_ordered_precompile(&mut self) -> HipResult<()> {
+        let pm = self.pm_images_required("spec_accept_ordered_precompile")?;
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(pm.accept_module, pm.accept_image, pm.accept_symbol)
+    }
+
+    /// Load the HIP module and bind the hipcc ordered-accept kernel only (the
+    /// explicit oracle twin of [`Gpu::spec_accept_ordered_precompile`]).
+    pub fn spec_accept_ordered_hip_twin_precompile(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            SPEC_SAMPLING_CPU_AR_MODULE,
+            SPEC_SAMPLING_CPU_AR_SRC,
+            SPEC_ACCEPT_ORDERED_SYMBOL,
+        )
+    }
+
+    /// The hipcc `accept_sampled_prefix` kernel (explicit oracle twin of
+    /// [`Gpu::spec_accept_ordered_enqueue`]; identical arguments).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spec_accept_ordered_hip_twin_enqueue(
+        &mut self,
+        target: &SpecDistRows,
+        draft: &SpecDistRows,
+        proposal_ids: &GpuTensor,
+        uniforms: &GpuTensor,
+        result: &GpuTensor,
+        k: usize,
+        eos: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            SPEC_SAMPLING_CPU_AR_MODULE,
+            SPEC_SAMPLING_CPU_AR_SRC,
+            SPEC_ACCEPT_ORDERED_SYMBOL,
+        )?;
+        self.spec_accept_ordered_launch(
+            SPEC_ACCEPT_ORDERED_SYMBOL, target, draft, proposal_ids, uniforms, result, k, eos,
+        )
+    }
+
+    /// Validate and launch the (already bound) accept kernel `symbol`.
+    #[allow(clippy::too_many_arguments)]
+    fn spec_accept_ordered_launch(
+        &mut self,
+        symbol: &'static str,
         target: &SpecDistRows,
         draft: &SpecDistRows,
         proposal_ids: &GpuTensor,
@@ -406,12 +562,6 @@ impl Gpu {
         check_bytes("proposal_ids", proposal_ids, k * 4)?;
         check_bytes("uniforms", uniforms, (k + 1) * 4)?;
         check_bytes("result", result, 8)?;
-        self.bind_thread()?;
-        self.ensure_kernel(
-            SPEC_SAMPLING_CPU_AR_MODULE,
-            SPEC_SAMPLING_CPU_AR_SRC,
-            SPEC_ACCEPT_ORDERED_SYMBOL,
-        )?;
         let tc = target.counts.buf.as_ptr();
         let ti = target.ids.buf.as_ptr();
         let tp = target.probabilities.buf.as_ptr();
@@ -436,7 +586,7 @@ impl Gpu {
             &eos as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            SPEC_ACCEPT_ORDERED_SYMBOL,
+            symbol,
             [1, 1, 1],
             [1, 1, 1],
             0,
@@ -460,40 +610,54 @@ impl Gpu {
     }
 }
 
-/// Kernel source of the parallel target-row builder. A separate module from
+/// Kernel source of the parallel target-row builder: the explicit hipcc oracle
+/// twin of the production PM kernel. A separate module from
 /// [`SPEC_SAMPLING_CPU_AR_SRC`], so compiling it cannot change the reference
 /// code object.
 pub const SPEC_SAMPLING_CPU_AR_PARALLEL_SRC: &str =
     include_str!("../../../kernels/src/spec_sampling_cpu_ar_parallel.hip");
-/// Module key of the parallel row builder.
+/// Module key of the hipcc parallel row builder.
 pub const SPEC_SAMPLING_CPU_AR_PARALLEL_MODULE: &str = "spec_sampling_cpu_ar_parallel";
-/// Device symbol of [`Gpu::spec_cpu_ar_rows_parallel_enqueue`].
+/// Device symbol of the hipcc parallel rows kernel
+/// ([`Gpu::spec_cpu_ar_rows_parallel_hip_twin_enqueue`]); the production PM
+/// symbol is [`spec_cpu_ar_rows_parallel_pm_symbol`].
 pub const SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL: &str = "spec_cpu_ar_rows_parallel_f32";
 
 /// Threads per workgroup of the parallel rows kernel (one workgroup per row).
 const ROWS_PARALLEL_BLOCK: u32 = 256;
 
 impl Gpu {
-    /// Load the parallel rows module and bind its kernel only. The unchanged
-    /// candidates and ordered-accept kernels still need
-    /// [`Gpu::spec_cpu_ar_precompile`].
+    /// Production setup of the parallel rows kernel: load the PM module for
+    /// this device and bind its kernel only (gfx1151 / gfx1201; error
+    /// elsewhere, no hipcc fallback). The ordered-accept kernel is bound by
+    /// [`Gpu::spec_accept_ordered_precompile`]; [`Gpu::spec_cpu_ar_precompile`]
+    /// does both.
     pub fn spec_cpu_ar_rows_parallel_precompile(&mut self) -> HipResult<()> {
+        let pm = self.pm_images_required("spec_cpu_ar_rows_parallel_precompile")?;
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(pm.rows_module, pm.rows_image, pm.rows_symbol)
+    }
+
+    /// Load the hipcc parallel rows module and bind its kernel only (the
+    /// explicit oracle twin of [`Gpu::spec_cpu_ar_rows_parallel_precompile`]).
+    pub fn spec_cpu_ar_rows_parallel_hip_twin_precompile(&mut self) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
             SPEC_SAMPLING_CPU_AR_PARALLEL_MODULE,
             SPEC_SAMPLING_CPU_AR_PARALLEL_SRC,
             SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL,
-        )?;
-        Ok(())
+        )
     }
 
-    /// Parallel (one 256-thread workgroup per row) target-row builder, an
-    /// ungated API candidate with no production caller. It writes the same
-    /// [`SpecDistRows`] layout as [`Gpu::spec_cpu_ar_rows_enqueue`] but follows
-    /// a NEW law, not the host CPU-AR law: canonical selection (higher f32
-    /// logit first, equal numeric logits to the lower token id) and fixed-tree
-    /// aggregate sums. Output is not byte-equal to the serial reference, and
-    /// reference tied supports are not equivalent to it.
+    /// Parallel (one 256-thread workgroup per row) target-row builder: the
+    /// production PM kernel (certified builder image, gfx1151 / gfx1201 only,
+    /// no hipcc fallback). It writes the same [`SpecDistRows`] layout as
+    /// [`Gpu::spec_cpu_ar_rows_enqueue`] but follows the canonical law, not the
+    /// host CPU-AR law: canonical selection (higher f32 logit first, equal
+    /// numeric logits to the lower token id) and fixed-tree aggregate sums.
+    /// Output is not byte-equal to the serial reference, and reference tied
+    /// supports are not equivalent to it. The PM kernel is the byte twin of the
+    /// hipcc kernel run by [`Gpu::spec_cpu_ar_rows_parallel_hip_twin_enqueue`].
     ///
     /// `logits`: f32 `[row_count * vocab]`. `logits` must not alias any `rows`
     /// buffer. There is no global scratch. The kernel has ten arguments in the
@@ -509,42 +673,47 @@ impl Gpu {
         row_count: usize,
         policy: SpecCpuArPolicy,
     ) -> HipResult<()> {
-        policy.validate("spec_cpu_ar_rows_parallel_enqueue")?;
-        if row_count == 0 || vocab == 0 {
-            return Err(err(format!(
-                "rows_parallel: row_count {row_count} and vocab {vocab} must be > 0"
-            )));
-        }
-        if vocab > i32::MAX as usize || row_count > u32::MAX as usize {
-            return Err(err("rows_parallel: vocab or row_count exceeds the launch range"));
-        }
-        let logit_bytes = row_count
-            .checked_mul(vocab)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| err("rows_parallel: row_count * vocab exceeds the addressable range"))?;
-        let out_words = row_count
-            .checked_mul(SPEC_CPU_AR_CAP)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| err("rows_parallel: row_count * 64 exceeds the addressable range"))?;
-        if row_count > rows.capacity_rows {
-            return Err(err(format!(
-                "rows_parallel: row_count {row_count} exceeds rows capacity {}",
-                rows.capacity_rows
-            )));
-        }
-        if logits.dtype != DType::F32 {
-            return Err(err(format!("rows_parallel: logits must be F32, got {:?}", logits.dtype)));
-        }
-        check_bytes("logits", logits, logit_bytes)?;
-        check_bytes("counts", &rows.counts, row_count * 4)?;
-        check_bytes("ids", &rows.ids, out_words)?;
-        check_bytes("probabilities", &rows.probabilities, out_words)?;
+        const NAME: &str = "spec_cpu_ar_rows_parallel_enqueue";
+        policy.validate(NAME)?;
+        let pm = self.pm_images_required(NAME)?;
+        rows_parallel_check(logits, rows, vocab, row_count)?;
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(pm.rows_module, pm.rows_image, pm.rows_symbol)?;
+        self.rows_parallel_launch(pm.rows_symbol, logits, rows, vocab, row_count, policy)
+    }
+
+    /// The hipcc parallel rows kernel (`kernels/src/spec_sampling_cpu_ar_parallel.hip`):
+    /// the explicit oracle twin of [`Gpu::spec_cpu_ar_rows_parallel_enqueue`],
+    /// identical arguments, layout and law.
+    pub fn spec_cpu_ar_rows_parallel_hip_twin_enqueue(
+        &mut self,
+        logits: &GpuTensor,
+        rows: &SpecDistRows,
+        vocab: usize,
+        row_count: usize,
+        policy: SpecCpuArPolicy,
+    ) -> HipResult<()> {
+        policy.validate("spec_cpu_ar_rows_parallel_hip_twin_enqueue")?;
+        rows_parallel_check(logits, rows, vocab, row_count)?;
         self.bind_thread()?;
         self.ensure_kernel(
             SPEC_SAMPLING_CPU_AR_PARALLEL_MODULE,
             SPEC_SAMPLING_CPU_AR_PARALLEL_SRC,
             SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL,
         )?;
+        self.rows_parallel_launch(SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL, logits, rows, vocab, row_count, policy)
+    }
+
+    /// Launch the (already bound) parallel rows kernel `symbol`.
+    fn rows_parallel_launch(
+        &mut self,
+        symbol: &'static str,
+        logits: &GpuTensor,
+        rows: &SpecDistRows,
+        vocab: usize,
+        row_count: usize,
+        policy: SpecCpuArPolicy,
+    ) -> HipResult<()> {
         let lp = logits.buf.as_ptr();
         let cp = rows.counts.buf.as_ptr();
         let ip = rows.ids.buf.as_ptr();
@@ -568,7 +737,7 @@ impl Gpu {
             &min_p as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL,
+            symbol,
             [row_count as u32, 1, 1],
             [ROWS_PARALLEL_BLOCK, 1, 1],
             0,
@@ -589,4 +758,42 @@ impl Gpu {
             },
         )
     }
+}
+
+/// Shape checks shared by the PM and hipcc parallel rows launches.
+fn rows_parallel_check(
+    logits: &GpuTensor,
+    rows: &SpecDistRows,
+    vocab: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if row_count == 0 || vocab == 0 {
+        return Err(err(format!(
+            "rows_parallel: row_count {row_count} and vocab {vocab} must be > 0"
+        )));
+    }
+    if vocab > i32::MAX as usize || row_count > u32::MAX as usize {
+        return Err(err("rows_parallel: vocab or row_count exceeds the launch range"));
+    }
+    let logit_bytes = row_count
+        .checked_mul(vocab)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| err("rows_parallel: row_count * vocab exceeds the addressable range"))?;
+    let out_words = row_count
+        .checked_mul(SPEC_CPU_AR_CAP)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| err("rows_parallel: row_count * 64 exceeds the addressable range"))?;
+    if row_count > rows.capacity_rows {
+        return Err(err(format!(
+            "rows_parallel: row_count {row_count} exceeds rows capacity {}",
+            rows.capacity_rows
+        )));
+    }
+    if logits.dtype != DType::F32 {
+        return Err(err(format!("rows_parallel: logits must be F32, got {:?}", logits.dtype)));
+    }
+    check_bytes("logits", logits, logit_bytes)?;
+    check_bytes("counts", &rows.counts, row_count * 4)?;
+    check_bytes("ids", &rows.ids, out_words)?;
+    check_bytes("probabilities", &rows.probabilities, out_words)
 }

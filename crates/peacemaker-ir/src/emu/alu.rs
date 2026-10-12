@@ -244,6 +244,8 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
     match name {
         "v_readfirstlane_b32" => readfirstlane(i, s),
         "v_nop" => Ok(()),
+        "v_readlane_b32" => readlane(i, s),
+        "v_writelane_b32" => writelane(i, s),
         _ if name.starts_with("v_wmma") || name.starts_with("v_swmmac") => super::wmma::execute(arch, name, i, s),
         _ if name.starts_with("v_dot") => super::dot::execute(arch, name, i, s),
         _ if super::wide::handles(name) => super::wide::execute(arch, name, i, s),
@@ -345,6 +347,21 @@ fn readfirstlane(i: &Inst, s: &mut State) -> Result<()> {
     let lane = if s.exec == 0 { 0 } else { s.exec.trailing_zeros() as usize };
     let v = s.read(&i.operands[1], lane, 0)?;
     s.put(&i.operands[0], 0, 0, v)
+}
+
+/// `v_readlane_b32 sdst, vsrc, lane`: reads the lane selected by the low five bits of the third
+/// operand whatever EXEC says.
+fn readlane(i: &Inst, s: &mut State) -> Result<()> {
+    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? & 31) as usize;
+    let v = s.read(&i.operands[1], lane, 0)?;
+    s.put(&i.operands[0], 0, 0, v)
+}
+
+/// `v_writelane_b32 vdst, ssrc, lane`: writes one lane of `vdst`, whatever EXEC says.
+fn writelane(i: &Inst, s: &mut State) -> Result<()> {
+    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? & 31) as usize;
+    let v = s.read(&i.operands[1], 0, 0)?;
+    s.put(&i.operands[0], lane, 0, v)
 }
 
 fn dpp_fi(i: &Inst) -> bool {
@@ -705,6 +722,8 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
             (Class::Select, f(pick)?)
         }
         "v_add_nc_u32" | "v_dual_add_nc_u32" => (Class::Int, raw(0)?.wrapping_add(raw(1)?)),
+        // Lanes below this one set in the wave32 mask `src0`, plus `src1`.
+        "v_mbcnt_lo_u32_b32" => (Class::Int, raw(1)?.wrapping_add((raw(0)? & ((1u32 << lane) - 1)).count_ones())),
         "v_sub_nc_u32" => (Class::Int, raw(0)?.wrapping_sub(raw(1)?)),
         "v_subrev_nc_u32" => (Class::Int, raw(1)?.wrapping_sub(raw(0)?)),
         "v_add3_u32" => (Class::Int, raw(0)?.wrapping_add(raw(1)?).wrapping_add(raw(2)?)),
@@ -1516,6 +1535,7 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             let k = if o.len() > 3 { rd(s, 3)? } else { i.literal.ok_or("s_fmaak_f32: missing literal constant")? };
             (fin(num(a)?.mul_add(num(b)?, num(k)?))?, None)
         }
+        "s_bcnt1_i32_b32" => nonzero(a.count_ones()),
         _ => return Err(format!("unsupported scalar opcode {name}")),
     };
     s.put(&o[0], 0, 0, value)?;

@@ -361,7 +361,7 @@ fn udiv(b: &mut Builder, q: u8, n: u8, d: u8, vt: [u8; 3], t: [u8; 3]) -> Result
 }
 /// hipcc's `expf(x)` (or `expf(-x)` when `neg`) into `dst`; `t`, `r`, `lo`
 /// are temporaries and `m` a mask pair. `dst` may be `x`.
-fn expf(b: &mut Builder, dst: u8, x: u8, neg: bool, t: u8, r: u8, lo: u8, m: u8) -> Result<(), String> {
+pub(super) fn expf(b: &mut Builder, dst: u8, x: u8, neg: bool, t: u8, r: u8, lo: u8, m: u8) -> Result<(), String> {
     let (l2e, c2) = if neg { ("0xbfb8aa3b", "0xb2a5705f") } else { ("0x3fb8aa3b", "0x32a5705f") };
     op(b, format!("v_mul_f32_e32 v{t}, {l2e}, v{x}"), &[v(t)], &[v(x)])?;
     op(b, format!("v_fma_f32 v{lo}, {l2e}, v{x}, -v{t}"), &[v(lo)], &[v(x), v(t)])?;
@@ -382,7 +382,7 @@ fn expf(b: &mut Builder, dst: u8, x: u8, neg: bool, t: u8, r: u8, lo: u8, m: u8)
 }
 /// IEEE `dst = n / d` (hipcc's `v_div_scale` / `v_div_fmas` / `v_div_fixup`
 /// sequence); `t` holds five temporaries. VCC carries the scale flag.
-fn fdiv(b: &mut Builder, dst: u8, n: u8, d: u8, t: [u8; 5]) -> Result<(), String> {
+pub(super) fn fdiv(b: &mut Builder, dst: u8, n: u8, d: u8, t: [u8; 5]) -> Result<(), String> {
     let [ns, ds, rc, e, q] = t;
     op(b, format!("v_div_scale_f32 v{ns}, vcc_lo, v{n}, v{d}, v{n}"), &[v(ns)], &[v(n), v(d)])?;
     op(b, format!("v_div_scale_f32 v{ds}, null, v{d}, v{d}, v{n}"), &[v(ds)], &[v(d), v(n)])?;

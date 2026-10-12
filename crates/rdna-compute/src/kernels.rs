@@ -4235,6 +4235,23 @@ pub const DFLASH_SAMPLED_ACCEPT_PM_GFX1201: &[u8] = include_bytes!("../../../ker
 /// Default on (`HIPFIRE_QWEN4_QSA_SCORE_PM=0` / `HIPFIRE_QWEN4_QSA_SELECT_PM=0`
 /// keep the hipcc kernels).
 pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
+/// Certified builder (PeaceMaker) modules of the production CPU-AR sampling
+/// kernels, gfx1151 and gfx1201 only (`hipfire-isa emit --kernel
+/// spec_sampling_rows_pm|spec_accept_pm --arch ARCH`, M7 obligation-free,
+/// native bundle with the shipped `host-x86_64-unknown-linux-gnu-` host entry):
+/// the canonical parallel target-row sampler and the ordered sampled-prefix
+/// acceptance, each the byte twin of the hipcc kernel
+/// `spec_cpu_ar_rows_parallel_f32` /
+/// `spec_accept_ordered_u32`. The HIP sources stay as the explicit
+/// `*_hip_twin` oracle path.
+pub const SPEC_SAMPLING_ROWS_PARALLEL_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/spec_sampling_rows_parallel_pm_gfx1151.hxaco");
+pub const SPEC_SAMPLING_ROWS_PARALLEL_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/spec_sampling_rows_parallel_pm_gfx1201.hxaco");
+pub const SPEC_ACCEPT_ORDERED_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/spec_accept_ordered_pm_gfx1151.hxaco");
+pub const SPEC_ACCEPT_ORDERED_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/spec_accept_ordered_pm_gfx1201.hxaco");
 /// Certified builder module of gfx1201's MQ6 trunk overwrite GEMM
 /// (`hipfire-isa emit --kernel qwen4_mq6_x4 --epi all --arch gfx1201`, M7
 /// obligation-free; `hipfire peacemaker native-emit` writes the bundle): the
