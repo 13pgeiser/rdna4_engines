@@ -2683,14 +2683,25 @@ impl Qwen4MtpGpu {
                 state_bf16: false,
             },
         )?;
-        // G1 (byte identity vs the per-row `gemv_bf16_xf32`) governs every
-        // `gemm_bf16_xf32_multirow` below. On gfx1151 `gemm.rs` selects by
-        // (m, k, batch): (2560, 2560) is on the r16 allowlist for batch >= 64
-        // (`r16w4t` / `r16w4` / `r16`, documented bitwise to the four-row
-        // kernel) and the base four-row kernel below that; (10240, 320) is
-        // not on the allowlist and K = 320 takes the `pto2` tile
-        // (257..=512, LDS weights, also documented bitwise to the four-row
-        // kernel). If G1 shows any difference for a pair, replace that call
+        // G1 (byte identity vs the per-row reference) governs every
+        // `gemm_bf16_xf32_multirow` and tiled projection below; the reference
+        // is the per-row kernel of each operator on the running arch:
+        //   - fc_embedding and HC up: singleton `gemv_bf16_xf32` (gfx1201
+        //     runs the shipped `gemv_bf16_xf32` kernel);
+        //   - fc_hidden (four branch rows per token): on gfx1201
+        //     `gemv_bf16_xf32_x4_rows_r4`, not four singleton GEMVs;
+        //   - HC down: the K4 singleton (`gemv_bf16_xf32_k4`, scale 1/4);
+        //   - QSA indexer_qk / K / V (Q8_0): on gfx1151 the K = 2560 staged
+        //     `gemv_q8_0`, on gfx1201 the unstaged `gemv_q8_0` (the staged
+        //     tiled kernel repeats the same dot arithmetic).
+        // On gfx1151 `gemm.rs` selects by (m, k, batch): (2560, 2560) is on
+        // the r16 allowlist for batch >= 64 (`r16w4t` / `r16w4` / `r16`,
+        // documented bitwise to the four-row kernel) and the base four-row
+        // kernel below that; (10240, 320) is not on the allowlist and
+        // K = 320 takes the `pto2` tile (257..=512, LDS weights, also
+        // documented bitwise to the four-row kernel). The same selector
+        // runs on gfx1201 (the `r16*_gfx1151` names are not gfx1151-only).
+        // If G1 shows any difference for a pair, replace that call
         // with a rows-grid twin of the single-row kernel (`blockIdx.y`
         // token tile over `gemv_bf16_xf32_rows_body`) before tuning
         // anything. Never route these through `project_weight` /
