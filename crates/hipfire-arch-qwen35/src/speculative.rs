@@ -6745,6 +6745,63 @@ pub fn verify_dflash_block_retained(
     )
 }
 
+/// Prompt-only hidden scatter. Each pitched copy preserves the legacy byte
+/// mapping, splitting at both source and destination ring boundaries. Producers
+/// and consumers run on the same execution stream; no arithmetic or ring
+/// bookkeeping changes. Decode/terminal-repair scatters keep their old route.
+#[allow(clippy::too_many_arguments)]
+pub fn scatter_hidden_prefill_to_interleaved(
+    gpu: &Gpu,
+    hidden_rb: &HiddenStateRingBuffer,
+    dst: &GpuTensor,
+    dst_row_offset: usize,
+    block_size: usize,
+    n_rows: usize,
+    dst_modulus: usize,
+) -> HipResult<()> {
+    static FAST: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_DFLASH_PREFILL_SCATTER_FAST", true)
+    });
+    if !*FAST {
+        return scatter_hidden_block_to_interleaved(
+            gpu, hidden_rb, dst, dst_row_offset, block_size, n_rows, dst_modulus,
+        );
+    }
+    assert!(n_rows <= block_size, "scatter: n_rows > block_size");
+    let max_pos = hidden_rb.max_positions;
+    assert!(block_size <= hidden_rb.written.max(max_pos), "scatter: block_size > written");
+    let num_extract = hidden_rb.extract_layers.len();
+    let row_bytes = hidden_rb.hidden_dim * 4;
+    let r_skip = block_size.saturating_sub(max_pos);
+    let start_slot = (hidden_rb.head + max_pos - (block_size - r_skip)) % max_pos;
+    let mut r = r_skip;
+    while r < n_rows {
+        let slot = (start_slot + r - r_skip) % max_pos;
+        let absolute_dst = dst_row_offset + r;
+        let (dst_row, dst_remaining) = if dst_modulus == usize::MAX {
+            (absolute_dst, n_rows - r)
+        } else {
+            let row = absolute_dst % dst_modulus;
+            (row, dst_modulus - row)
+        };
+        let rows = (n_rows - r).min(max_pos - slot).min(dst_remaining);
+        for ext in 0..num_extract {
+            gpu.memcpy_dtod_2d_at_ordered_async(
+                &dst.buf,
+                (dst_row * num_extract + ext) * row_bytes,
+                num_extract * row_bytes,
+                &hidden_rb.layer_bufs[ext].buf,
+                slot * row_bytes,
+                row_bytes,
+                row_bytes,
+                rows,
+            )?;
+        }
+        r += rows;
+    }
+    Ok(())
+}
+
 /// Download extracted target hidden states for the most recent B positions
 /// from `hidden_rb` and concat them into a flat `[B × num_extract × hidden]`
 /// host vector in the order expected by `dflash::draft_forward` (per-position,

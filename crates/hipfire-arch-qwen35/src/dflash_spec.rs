@@ -14,7 +14,8 @@ use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
     apply_eviction_retain_to_draft, apply_host_ar_trunc, sample_categorical,
-    scatter_hidden_block_to_interleaved, seed_target_hidden_dense_tp2_abortable,
+    scatter_hidden_block_to_interleaved, scatter_hidden_prefill_to_interleaved,
+    seed_target_hidden_dense_tp2_abortable,
     seed_target_hidden_from_prompt_abortable, seed_target_hidden_from_prompt_abortable_parts,
     seed_target_hidden_suffix_abortable, seed_target_hidden_suffix_abortable_parts,
     softmax_temp_into, spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2,
@@ -734,7 +735,7 @@ fn dflash_prefill_finish(
     } else {
         (0, prompt_tokens.len())
     };
-    if let Err(e) = scatter_hidden_block_to_interleaved(
+    if let Err(e) = scatter_hidden_prefill_to_interleaved(
         gpu,
         &df.hidden_rb,
         &df.draft_scratch.target_hidden,
