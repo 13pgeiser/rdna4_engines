@@ -671,6 +671,28 @@ fn trace_rows(drafts: &[u32], picks: &[u32]) -> String {
 /// at most one head append plus this many windows.
 const MTP_FLOOR_PROBE_WINDOWS: usize = 3;
 
+/// Speculative windows a singleton request's floor observes before it may
+/// retire.  Measured routing still starts after [`MTP_FLOOR_PROBE_WINDOWS`];
+/// only the sticky retirement waits.  The first windows of a response accept
+/// poorly far more often than its body: on Strix Halo real-text serve, with
+/// retirement at the probe budget, 5 of 9 sampled 32K requests retired within
+/// their first windows and ran the whole response at AR speed (28–29 tok/s
+/// against 40–46 when drafting continued).  `HIPFIRE_MTP_FLOOR_MIN_WINDOWS=<n>`
+/// (n ≥ 1) overrides it; `3` restores retirement at the probe budget.
+/// Continuous-batching lanes keep retirement at the probe budget.
+const MTP_SINGLETON_FLOOR_MIN_WINDOWS: usize = 16;
+
+/// The singleton request's retirement threshold:
+/// `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` when it parses as an integer ≥ 1, else
+/// [`MTP_SINGLETON_FLOOR_MIN_WINDOWS`].
+fn singleton_floor_min_windows() -> usize {
+    hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_MIN_WINDOWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+}
+
 pub(crate) type Agreement = [(f32, f32); MTP_MAX_DEPTH];
 
 /// Route the floor picks for one native window.
@@ -788,6 +810,10 @@ pub(crate) struct MtpFloor {
     /// invalid.
     ar_us: f32,
     probes: usize,
+    /// Speculative windows observed (uncapped; the probe budget caps `probes`).
+    observed: usize,
+    /// `observed` a losing verdict needs before it retires the request.
+    retire_after: usize,
     retired: bool,
     /// Per actually drafted depth: decayed (wall us, windows).
     batched: [(f32, f32); MTP_WINDOW_COST.len()],
@@ -803,10 +829,18 @@ pub(crate) struct MtpFloor {
 
 impl MtpFloor {
     pub(crate) fn new() -> Self {
+        Self::with_retire_after(MTP_FLOOR_PROBE_WINDOWS)
+    }
+
+    /// A fresh floor that may retire only after `retire_after` observed
+    /// windows (at least the probe budget).
+    pub(crate) fn with_retire_after(retire_after: usize) -> Self {
         Self {
             calibrated: false,
             ar_us: 0.0,
             probes: 0,
+            observed: 0,
+            retire_after: retire_after.max(MTP_FLOOR_PROBE_WINDOWS),
             retired: false,
             batched: [(0.0, 0.0); MTP_WINDOW_COST.len()],
             interleaved: (0.0, 0.0),
@@ -836,6 +870,12 @@ impl MtpFloor {
 
     fn count_probe(&mut self) {
         self.probes = (self.probes + 1).min(MTP_FLOOR_PROBE_WINDOWS);
+        self.observed = self.observed.saturating_add(1);
+    }
+
+    /// Still inside the window count a losing verdict must wait for.
+    fn in_grace(&self) -> bool {
+        self.observed < self.retire_after
     }
 
     pub(crate) fn observe_calibration(&mut self, us: f32, agreement: &Agreement) {
@@ -935,8 +975,9 @@ impl MtpFloor {
         self.combined.1 > 0.0 && self.combined.0 / self.combined.1 < self.ar_us
     }
 
-    /// Retire when, after the probe budget, nothing measured beats AR, and
-    /// external windows are not alive on a mixture that beats AR.
+    /// Retire when, after the probe budget and at least `retire_after`
+    /// observed windows, nothing measured beats AR, and external windows are
+    /// not alive on a mixture that beats AR.
     fn decide(&mut self, agreement: &Agreement) {
         if self.retired || !self.calibrated || self.probing() {
             return;
@@ -950,7 +991,7 @@ impl MtpFloor {
         let native_wins = self
             .best_native(agreement, usize::MAX)
             .is_some_and(|(_, cost)| cost < self.ar_us);
-        if !native_wins && !(self.external_alive() && self.combined_wins()) {
+        if !native_wins && !(self.external_alive() && self.combined_wins()) && !self.in_grace() {
             self.retired = true;
         }
     }
@@ -962,7 +1003,10 @@ impl MtpFloor {
     /// when there is none (an external-only budget, `k` below every winning
     /// measured depth, a losing measured option, no valid AR price) the
     /// request retires, stickily, and runs AR: no unmeasured or losing route
-    /// is ever run after the budget.
+    /// is ever run after the budget.  Exception: inside the retirement grace
+    /// (`retire_after` observed windows) a request with a valid AR price keeps
+    /// drafting on its cheapest measured option within `k`, else the
+    /// provisional depth.
     pub(crate) fn route(
         &mut self,
         agreement: &Agreement,
@@ -988,6 +1032,15 @@ impl MtpFloor {
             // Losing native route kept alive for the external windows: the
             // cheapest measured option within `k`, else interleaved.
             return best.map_or(FloorRoute::Interleaved, |(route, _)| route);
+        }
+        if self.in_grace() && valid_us(self.ar_us) {
+            return best.map_or_else(
+                || match provisional {
+                    0 => FloorRoute::Interleaved,
+                    depth => FloorRoute::Batched(depth),
+                },
+                |(route, _)| route,
+            );
         }
         self.retired = true;
         FloorRoute::Ar
@@ -3572,7 +3625,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
     /// `HIPFIRE_MTP_SAMPLED_MODE=naive`; greedy requests keep the argmax match.
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
-        self.floor = MtpFloor::new();
+        self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows());
         self.floor_enabled =
             hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0");
         let sampled = self.sampled_enabled && cfg.temp.is_finite() && cfg.temp > 1.0e-6;
