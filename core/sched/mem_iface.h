@@ -56,6 +56,10 @@ struct IKVManager {
     /* A committed step: a WINDOW group gives back what no later query can read. A no-op for a
      * manager with no windowed group. See KVManager::trim_window. */
     virtual void trim_window(uint64_t seq, int64_t keep_from) { (void)seq; (void)keep_from; }
+    /* The window snapshot of a prefix hit (KVManager::has_window_snapshot / seed_window). The
+     * defaults are a manager with none: no hit on a windowed trunk is ever resumed. */
+    virtual bool has_window_snapshot() const { return false; }
+    virtual int  seed_window(uint64_t seq, int64_t pos) { (void)seq; (void)pos; return -1; }
 
     /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a whole multiple of the group's
      * block size -- a partial block is never shared, because the next token written into it would
@@ -294,6 +298,8 @@ struct KVBinding final : IKVManager {
     int  ensure(uint64_t s, int64_t n) override     { return m->ensure(s, n); }
     int  ensure_from(uint64_t s, int64_t n, int64_t k) override { return m->ensure(s, n, k); }
     void trim_window(uint64_t s, int64_t k) override { m->trim_window(s, k); }
+    bool has_window_snapshot() const override { return m->has_window_snapshot(); }
+    int  seed_window(uint64_t s, int64_t p) override { return m->seed_window(s, p); }
     int  adopt(uint64_t s, int32_t g, const std::vector<int32_t>& b, int64_t n) override {
         return m->adopt(s, g, b, n);
     }

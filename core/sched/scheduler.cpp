@@ -741,6 +741,7 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
     if (geo_.checkpoints()) {
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
+        if (geo_.window_ckpt) next = INT64_MAX;          /* a window snapshot: the tail only */
         if (n_computed + want > next) want = next - n_computed;
         if (n_computed + want == next) {
             if (checkpoint_pos) *checkpoint_pos = next;
@@ -786,6 +787,7 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
 bool Scheduler::last_checkpoint(int64_t pos, int64_t target) const {
     if (!geo_.checkpoints()) return false;
     const int64_t I = geo_.checkpoint_interval;
+    if (geo_.window_ckpt) { const int64_t t = tail_checkpoint(target); return t > 0 && t <= pos; }
     if ((pos / I + 1) * I <= target) return false;
     return tail_checkpoint(target) <= pos;
 }
@@ -797,6 +799,15 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
     const int64_t tail = target / Q * Q;
+    /* A WINDOW SNAPSHOT is taken at the tail of any prompt of an interval or more. */
+    /* A block short of the end: the next turn re-renders the last few tokens (a generation
+     * prompt it replaces with the reply), and a snapshot past where the two renderings part is
+     * one no hit can reach -- measured: every prompt whose length left fewer than ~8 tokens in
+     * its last block missed. */
+    if (geo_.window_ckpt) {
+        const int64_t t = (target - std::max<int64_t>(Q, 16)) / Q * Q;
+        return t >= I ? t : -1;
+    }
     return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
 
@@ -872,7 +883,7 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
         cap = std::max(cap, floor);
         const int64_t remaining = n_target - n_computed;
         int64_t span = remaining;                       /* where this run of chunks must end */
-        if (geo_.checkpoints()) {
+        if (geo_.checkpoints() && !geo_.window_ckpt) {
             const int64_t I = geo_.checkpoint_interval;
             span = std::min(span, ((n_computed / I) + 1) * I - n_computed);
         }
@@ -986,6 +997,11 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * snapshot to resume from -- that is every recurrent layer continuing from whatever the
          * slot last held, and it reads as fluent text rather than as a failure. */
         if (reuse > 0 && has_linear_state_ && h.checkpoint_slot < 0) reuse = 0;
+        /* A WINDOW SNAPSHOT COVERS THE TRUNK'S WINDOWED GROUPS -- at the checkpoint and nowhere
+         * else. The lookup clamped the hit to it (PrefixCache: a window counts as state there),
+         * so a hit with a slot is exactly at a snapshot; one without is no hit. */
+        const bool win_hit = geo_.window_ckpt && kv_->has_window_snapshot() && reuse > 0 &&
+                             h.checkpoint_slot >= 0 && reuse == h.n_linear_tokens;
 
         /* THE WINDOWED-GROUP CLAMP — a prefix hit on a model whose OWN (trunk) KV includes a
          * paged group the cache does not index. prefix.cpp skips RAD_KV_WINDOW groups — their
@@ -1003,7 +1019,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * scheduler.h) is repaired by draft refill, which CAPS the hit so the recompute covers
          * the drafter's window while the trunk reuses the rest; zeroing here would delete that
          * design. The trunk's hole, which no tail-recompute can fix, is this clamp's own. */
-        if (reuse > 0 && hit_holes_trunk_) {
+        if (reuse > 0 && hit_holes_trunk_ && !win_hit) {
             reuse = 0;
             RAD_DEBUG("admit %llu: prefix hit %lld zeroed — a trunk paged group is not "
                       "prefix-cached (windowed); re-prefilling", (unsigned long long)r.id,
@@ -1029,11 +1045,18 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                     break;
                 }
             }
+            /* The windowed groups start at the floor of the window behind the hit, in fresh
+             * blocks the entry's restore fills from the snapshot. */
+            if (reuse > 0 && win_hit && kv_->seed_window(r.id, reuse) < 0) {
+                kv_->preempt(r.id);
+                reuse = 0;
+            }
         }
 
         r.n_computed = reuse;
         r.n_cached = reuse;
-        s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens) ? h.checkpoint_slot : -1;
+        s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
+                      (has_linear_state_ || win_hit)) ? h.checkpoint_slot : -1;
         s.hit_attn = h.n_attn_tokens;
     }
 

@@ -226,6 +226,7 @@ private:
     /* Scratch for the checkpoint copies: the state slots of one sequence, reused so the step path
      * does not allocate. See state_slots_of. */
     std::vector<int32_t>          ckpt_slots_;
+    std::vector<int32_t>          ckpt_win_;    /* KVManager::window_rows, same reuse */
     bool state_slots_of(uint64_t seq, std::vector<int32_t>* out) const;
 
     int  load_vocab();
