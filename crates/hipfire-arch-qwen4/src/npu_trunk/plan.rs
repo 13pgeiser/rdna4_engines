@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Pure port of crossover_model.py (d50b20c6). No clock or hardware input.
+//! Pure deterministic crossover model. No clock or hardware input.
 use super::{Calibration, CalKey, Family, FamilyMask};
 use super::calibration::FAMILY_NAMES;
 use sha2::{Digest, Sha256};
@@ -52,9 +52,16 @@ pub fn bank_segments(cal: &Calibration, families: FamilyMask, rows: usize, prefi
     let f = rows as f64 / CHUNK as f64;
     let mut cols = [0; 2];
     let mut kept = [0.0; 2];
+    let mut consume = [0.0; 2];
     for (i, name) in FAMILY_NAMES.iter().enumerate() {
         let kind = usize::from(cal.families[*name].layer == "qsa");
-        if moved[i] { cols[kind] += cal.families[*name].cols; } else { kept[kind] += chunk.trunk[i]; }
+        if moved[i] {
+            let family = &cal.families[*name];
+            cols[kind] += family.cols;
+            if cal.glue.consume_mode == "retile" {
+                consume[kind] += cal.glue.consume_ms_per_col_8192[&family.out_dtype] * family.cols as f64;
+            }
+        } else { kept[kind] += chunk.trunk[i]; }
     }
     let fold = if cal.npu.epilogue == "i32" { cal.glue.fold_ms_per_col_8192 * f } else { 0.0 };
     let mut gpu = [chunk.gdn_rest + kept[0] / 36.0, chunk.qsa_rest + kept[1] / 12.0];
@@ -64,7 +71,7 @@ pub fn bank_segments(cal: &Calibration, families: FamilyMask, rows: usize, prefi
             gpu[k] += cal.glue.pack_ms_8192 * f;
             npu[k] = npu_ms(cal, rows, cols[k]) + cal.glue.sync_ms;
         }
-        gpu[k] += fold * cols[k] as f64;
+        gpu[k] += (fold * cols[k] as f64) + consume[k] * f;
     }
     BankSegments { gpu, npu, chunk }
 }
@@ -180,6 +187,67 @@ pub fn crossover(cal: &Calibration, families: FamilyMask) -> Option<usize> {
         else { first = None; }
     }
     first
+}
+
+pub const SELECTION_ROWS: [usize; 3] = [16384, 32768, 65536];
+/// One row of the load-time eligibility table, in ascending subset-bit order.
+#[derive(Clone, Debug)]
+pub struct SelectionRow {
+    pub families: FamilyMask,
+    pub t_pipe_ms: [f64; 3],
+    pub t_gpu_ms: [f64; 3],
+    pub relative: [f64; 3],
+    pub mean_relative: f64,
+    pub beats_margin_16384: bool,
+}
+#[derive(Clone, Debug)]
+pub struct SelectionReport {
+    pub subsets: Vec<SelectionRow>,
+    /// Minimum-mean candidate before the 16384-row margin gate.
+    pub best_families: FamilyMask,
+}
+impl SelectionRow {
+    pub fn family_names(&self) -> impl Iterator<Item = &'static str> {
+        FAMILY_NAMES.into_iter().zip(selected(self.families)).filter_map(|(name, yes)| yes.then_some(name))
+    }
+}
+fn subset_mask(bits: u8) -> FamilyMask {
+    let groups = [FamilyMask::from(Family::GdnQkv), FamilyMask::from_bits(0x0e),
+                  FamilyMask::from(Family::QsaQ), FamilyMask::from_bits(0xe0)];
+    groups.into_iter().enumerate().fold(FamilyMask::NONE, |mask, (i, group)| {
+        if bits & (1 << i) != 0 { mask | group } else { mask }
+    })
+}
+fn compare_selection(a: &SelectionRow, b: &SelectionRow) -> std::cmp::Ordering {
+    a.mean_relative.total_cmp(&b.mean_relative)
+        .then_with(|| a.family_names().count().cmp(&b.family_names().count()))
+        .then_with(|| {
+            let names = ["kvidx", "q", "qkv", "zab"];
+            names.into_iter().filter(|name| a.family_names().any(|n| n == *name))
+                .cmp(names.into_iter().filter(|name| b.family_names().any(|n| n == *name)))
+        })
+}
+/// Select the minimum mean T_pipe/T_gpu across the three fixed prompt sizes.
+/// Gate that winner (not a runner-up) by the strict 16384-row margin.
+pub fn select_families(cal: &Calibration) -> (FamilyMask, SelectionReport) {
+    let mut subsets = Vec::with_capacity(15);
+    for bits in 1..16 {
+        let families = subset_mask(bits);
+        let plans = SELECTION_ROWS.map(|rows| plan(cal, families, rows));
+        let t_pipe_ms = std::array::from_fn(|i| plans[i].t_pipe_ms);
+        let t_gpu_ms = std::array::from_fn(|i| plans[i].t_gpu_ms);
+        // A zero-cost GPU baseline has no possible strict improvement.
+        let relative = std::array::from_fn(|i| if t_gpu_ms[i] == 0.0 { 1.0 } else { t_pipe_ms[i] / t_gpu_ms[i] });
+        subsets.push(SelectionRow {
+            families, t_pipe_ms, t_gpu_ms, relative,
+            mean_relative: relative.iter().sum::<f64>() / 3.0,
+            beats_margin_16384: beats(cal, t_pipe_ms[0], t_gpu_ms[0]),
+        });
+    }
+    let best = subsets.iter().min_by(|a, b| compare_selection(a, b)).expect("15 nonempty subsets");
+    let families = if best.beats_margin_16384 { best.families } else { FamilyMask::NONE };
+    let best_families = best.families;
+    (families, SelectionReport { subsets, best_families })
 }
 /// Load-time log context, all caller-supplied deterministic state.
 pub struct LoadLogKey<'a> { pub current: &'a CalKey, pub mode: &'a str, pub families: FamilyMask }

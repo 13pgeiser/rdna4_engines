@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
-pub const CALIBRATION_SCHEMA_VERSION: u32 = 1;
+pub const CALIBRATION_SCHEMA_VERSION: u32 = 2;
 pub(crate) const FAMILY_NAMES: [&str; 4] = ["qkv", "zab", "q", "kvidx"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +29,8 @@ pub struct CalKey {
     pub model_sha256: String,
     /// `i32` or `bf16`, matching NpuCalibration::epilogue.
     pub epilogue: String,
+    /// GPU-native trunk identity: `stock` or `overlay:<artifact marker>`.
+    pub trunk_route: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,13 +46,15 @@ pub struct GpuCalibration {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FamilyCalibration { pub layer: String, pub cols: usize }
+pub struct FamilyCalibration { pub layer: String, pub cols: usize, pub out_dtype: String }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlueCalibration {
     pub pack_ms_8192: f64,
     pub fold_ms_per_col_8192: f64,
     pub sync_ms: f64,
+    pub consume_mode: String,
+    pub consume_ms_per_col_8192: BTreeMap<String, f64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,7 +91,7 @@ impl Calibration {
         let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         fs::write(path, json).map_err(|e| e.to_string())
     }
-    /// First mismatch in stable device/build/kernel/model/epilogue order. Caller
+    /// First mismatch in stable device/build/kernel/model/epilogue/trunk-route order. Caller
     /// must leave the route off and log this reason; never silently recalibrate.
     pub fn key_matches(&self, key: &CalKey) -> Result<(), String> {
         macro_rules! check { ($($field:ident).+) => {
@@ -97,7 +101,7 @@ impl Calibration {
         }; }
         check!(device.arch); check!(device.pci_bdf); check!(device.npu_fw_version);
         check!(build); check!(kernel.uname_release); check!(kernel.perfopt_armed);
-        check!(model_sha256); check!(epilogue);
+        check!(model_sha256); check!(epilogue); check!(trunk_route);
         Ok(())
     }
     pub fn validate(&self) -> Result<(), String> {
@@ -106,6 +110,19 @@ impl Calibration {
         if self.npu.panel_cols == 0 || self.gpu.min_bank_rows == 0 { return Err("panel_cols and min_bank_rows must be positive".into()); }
         if self.npu.epilogue != "i32" && self.npu.epilogue != "bf16" { return Err("npu.epilogue must be i32 or bf16".into()); }
         if self.key.epilogue != self.npu.epilogue { return Err("key.epilogue differs from npu.epilogue".into()); }
+        if self.key.trunk_route != "stock" && !self.key.trunk_route.strip_prefix("overlay:").is_some_and(|marker| !marker.trim().is_empty()) {
+            return Err("key.trunk_route must be stock or overlay:<marker>".into());
+        }
+        if self.glue.consume_mode != "retile" && self.glue.consume_mode != "direct" {
+            return Err("glue.consume_mode must be retile or direct".into());
+        }
+        if self.glue.consume_ms_per_col_8192.len() != 2 {
+            return Err("expected bf16,f32 consume_ms_per_col_8192".into());
+        }
+        for dtype in ["bf16", "f32"] {
+            let cost = self.glue.consume_ms_per_col_8192.get(dtype).ok_or_else(|| format!("missing glue.consume_ms_per_col_8192.{dtype}"))?;
+            if !cost.is_finite() || *cost < 0.0 { return Err(format!("invalid glue.consume_ms_per_col_8192.{dtype}")); }
+        }
         for (name, value) in [
             ("device.arch", self.key.device.arch.as_str()), ("device.pci_bdf", &self.key.device.pci_bdf),
             ("device.npu_fw_version", &self.key.device.npu_fw_version), ("build", &self.key.build),
@@ -116,6 +133,7 @@ impl Calibration {
         for (i, name) in FAMILY_NAMES.iter().enumerate() {
             let f = self.families.get(*name).ok_or_else(|| format!("missing families.{name}"))?;
             if f.cols == 0 || f.layer != if i < 2 { "gdn" } else { "qsa" } { return Err(format!("invalid families.{name}")); }
+            if f.out_dtype != "bf16" && f.out_dtype != "f32" { return Err(format!("invalid families.{name}.out_dtype")); }
             let cost = self.gpu.trunk_in_ms_per_8192.get(*name).ok_or_else(|| format!("missing gpu.trunk_in_ms_per_8192.{name}"))?;
             if !cost.is_finite() || *cost < 0.0 { return Err(format!("invalid gpu.trunk_in_ms_per_8192.{name}")); }
         }

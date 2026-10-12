@@ -18,7 +18,8 @@ pub use calibration::{
 };
 pub use plan::{
     alpha_extra, bank_segments, crossover, gpu_chunk, load_log_line, npu_ms, pair_time, plan,
-    request_log_line, BankSegments, GpuChunk, LoadLogKey, PairTime, Plan, Step, CHUNK,
+    request_log_line, select_families, BankSegments, GpuChunk, LoadLogKey, PairTime, Plan,
+    SelectionReport, SelectionRow, Step, CHUNK, SELECTION_ROWS,
 };
 pub use config::{NpuTrunkMode, NPU_TRUNK_DAEMON_KEY, NPU_TRUNK_ENV};
 pub use packing::{
@@ -27,3 +28,6 @@ pub use packing::{
 };
 pub use programs::{build_programs, build_programs_for_families, NpuPrograms, ShapeProgram};
 pub use shapes::{ColumnMap, EpilogueContract, Family, FamilyMask, Shape, PANEL_COLS, TRUNK_K};
+
+#[cfg(test)]
+mod plan_tests;

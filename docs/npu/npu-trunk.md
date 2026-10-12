@@ -219,20 +219,21 @@ and integer GEMMs; any mismatch exits 1. CPU layout/map tests:
 
 ## Stored calibration and deterministic planning (0.4.2)
 
-`Calibration::{load,store,validate,key_matches}` uses schema version 1 JSON.
+`Calibration::{load,store,validate,key_matches}` uses schema version 2 JSON.
 All fields are required; missing inputs, unknown fields, invalid numeric costs,
 unknown versions and inconsistent epilogues are errors. `CalKey` consists of
 `device.{arch,pci_bdf,npu_fw_version}`, caller-supplied `build` (the measured
 daemon git SHA/binary identity, not the calibration CLI's identity),
-`kernel.{uname_release,perfopt_armed}`, `model_sha256` (64 hex digits), and
-`epilogue` (`bf16` or `i32`). A key mismatch returns the first mismatching
-field in that order. The load caller must log `npu-trunk: off (reason)` and
+`kernel.{uname_release,perfopt_armed}`, `model_sha256` (64 hex digits),
+`epilogue` (`bf16` or `i32`), and `trunk_route` (`stock` or
+`overlay:<marker>`, e.g. `overlay:gfx1151-zab-v1`). A key mismatch returns the
+first mismatching field in that order. The load caller must log `npu-trunk: off (reason)` and
 leave the route off; loading never recalibrates or opens hardware.
 
 `plan(&Calibration, FamilyMask, rows) -> Plan` and
 `crossover(&Calibration, FamilyMask) -> Option<usize>` port the reference
 `npu-trunk/crossover_model.py`, SHA256
-`d50b20c66d1c62b243e88e1b23e956c3e072d31937b3352305b7ba126f4acc4a`.
+`7e7a23afb9df5546358a25141c06006c0bfc20d292ef2274ddb8882612192096`.
 The planner uses an 8192-row chunk DP, GPU-only/pair choices, 64-aligned
 tail rebalance, even re-banking with boundary tax, and a taxed single-chunk
 split. `Step::Gpu { chunk }` and `Step::Pipe { a, b }` carry exact half-open
@@ -242,6 +243,10 @@ has the reference's placement (rebalance, single split, and re-bank eligibility)
 GPU costs distinguish 36 GDN and 12 QSA layers and prefix-dependent attention;
 NPU time rounds fused columns up to `panel_cols`. Contention is a burst term
 `(alpha_overlap - 1) * min(G_other, N_this)`, not whole-prefill slowdown.
+GPU segments include pack once per moved layer shape and consume on each
+selected family's live (not panel-padded) columns. `consume_mode=retile`
+charges `rows/8192 * cols * consume_ms_per_col_8192[out_dtype]` per layer;
+`direct` charges zero. Consume is GPU work, not NPU time or fill.
 
 `margin` is a fraction in `[0,1)`. Every candidate must cost strictly less
 than `(1-margin)` times the GPU-only cost of the rows it replaces, including
@@ -258,6 +263,18 @@ has no calibrated attribution and stays GPU-only. Calibration column counts
 are used verbatim (the legacy lab examples differ from current packing widths).
 Never apply a legacy example key to a production model.
 
+`select_families(&Calibration) -> (FamilyMask, SelectionReport)` evaluates all
+15 nonempty subsets with `plan` at 16384, 32768, and 65536 rows. The winner
+minimizes mean `T_pipe/T_gpu`; exact ties prefer fewer groups, then the sorted
+family-name sequence lexicographically. That winner must strictly beat GPU-only
+by `margin` at 16384, otherwise the mask is empty (no runner-up substitution).
+The report includes all subset times/ratios and the pre-gate winner for logging.
+A zero-cost GPU baseline has ratio 1 and cannot pass the strict gate.
+Python prints the same table with
+`python3 crossover_model.py cal/g80bf16-overlay-v2.json select`;
+an optional final `retile|direct` argument overrides consume mode without
+changing the stored record.
+
 `load_log_line` takes a `LoadLogKey { current, mode, families }`, crossover,
 and plans at 16384/65536. It checks the key, hashes canonical serialized
 calibration JSON, and logs the INTERFACES.md §4 fields, with times as
@@ -273,11 +290,11 @@ hipfire calibrate-npu-trunk --from measurements.json --out cal.json
 
 This command assembles and validates an already measured record; it does **not**
 perform measurements, probe hardware, fit contention, or silently fill defaults.
-The measurements schema is the same as the schema-version-1 output record:
+The measurements schema is the same as the schema-version-2 output record:
 
-* `schema_version: 1`, `margin` and the complete current `key` described above.
+* `schema_version: 2`, `margin` and the complete current `key` described above.
   The collector supplies device/firmware, PerfOpt, measured build, model digest,
-  and epilogue identity. The CLI additionally checks `uname -r` against the
+  epilogue, and trunk-route identity. The CLI additionally checks `uname -r` against the
   collector's key and refuses a kernel mismatch. The eventual load caller must
   compare **all** key fields to its actual runtime identity.
 * `gpu.trunk_in_ms_per_8192`: required `qkv`, `zab`, `q`, `kvidx` millisecond
@@ -286,16 +303,20 @@ The measurements schema is the same as the schema-version-1 output record:
   `qsa_growth_per_layer_ms_per_8192_prefix`, `fixed_per_chunk_ms`,
   `boundary_tax_ms`, and `min_bank_rows` are required.
 * `families`: those four names, each with `layer` (`gdn` for qkv/zab,
-  `qsa` for q/kvidx) and positive fused `cols`.
+  `qsa` for q/kvidx), positive fused `cols`, and `out_dtype` (`bf16` for qkv,
+  `f32` for the other families in today's serving route).
 * `glue.pack_ms_8192`, `fold_ms_per_col_8192`, `sync_ms`: measured
-  pack/consume/fold costs (fold is charged only for the I32 contract).
+  pack/fold/sync costs (fold is charged only for the I32 contract).
+  `glue.consume_mode` is `retile|direct`; the required
+  `consume_ms_per_col_8192` object contains finite nonnegative `bf16` and `f32`
+  costs. Direct mode keeps those measurements but charges zero consume.
 * `npu.tops_corun`, `bytes_per_kop`, `epilogue`, `panel_cols`: measured
   co-running rate, measured or declared traffic, chosen output contract, padding.
 * `contention.alpha_overlap` (>=1) and `model`: fitted/measured overlap
   slowdown and the provenance/fit description. The planner consumes the alpha;
   it does not reinterpret the descriptive model string.
 
-Collect once per exact device/build/kernel/PerfOpt/model/epilogue tuple.
+Collect once per exact device/build/kernel/PerfOpt/model/epilogue/trunk-route tuple.
 The lab procedure is in `/home/kaden/qcal/release-0.4.2/npu-trunk/`:
 `ptrace.sh` attributes GPU kernel costs by layer/family; `contend.sh` measures
 co-run throughput and the contention fit; `tax.sh` measures the extra boundary
@@ -313,12 +334,21 @@ at 8192, 9319, 12288, 16384, 24576, 32768, 57544, 65536 and each crossover:
 90 exact-range vectors, 10 crossovers, relative time tolerance 1e-6.
 Tests adapt legacy fixture keys/version/margin and Python's absent-panel default
 (`panel_cols=1` for V8), not measured costs.
+`golden-v2.json` adds all-subset selection and half-bank consume vectors for
+stock/overlay × retile/direct, nonzero margins, I32 fold, and a zero-cost GPU
+baseline, plus 44 exact-range plans. The same tests run in the library and
+the `npu_trunk_plan` integration target.
+The migrated lab `g80bf16-{stock,overlay}-v2.json` records preserve measured
+costs and add Halo j110 consume rates: BF16 `2.85/16480`, F32 `4.60/16480`
+ms per column per 8192 rows. Overlay changes only trunk identity and zab
+GPU cost to 154 ms/chunk (`228 - 74` for the measured A4 tier); the NPU
+W8 stock-MQ6 numerical contract is unchanged.
 Run offline:
 
 ```sh
 ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
 CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
-nice -n 19 cargo test -p hipfire-arch-qwen4 --release npu_trunk -j 12 -- --nocapture
+nice -n 19 cargo test -p hipfire-arch-qwen4 --lib npu_trunk -j 12
 ```
 
 ## First-light serving route (Linux gfx1151, family B)
@@ -329,25 +359,40 @@ or trace-file opens. The ordinary chunk executor is unchanged except for
 inactive option checks. `auto` is explicitly refused until calibrated admission
 is wired; it is not a silent fallback from `on`.
 
-The opt-in route requires Flash-Next K=2560 and MQ6G256V2 for all eight
-input families. It packs the S1 `Bf16Direct` contract and uploads the exact
-row-major W8 and Sm/Se twin. The bundle retains resident GPU handles, not
-source byte owners, so preparation currently downloads each MQ6 matrix once.
-The load line records `download_ms`, `pack_ms`, actual resident weight bytes,
-mode/families/contract and runtime status. `on` additionally opens the unchanged
-8192-row G80 program, resident 13/11-panel chains and two registered A/C banks;
-any admission/open error fails the load. Calibration is deliberately bypassed,
-with a `first-light-force-pairs` load note.
+The opt-in route requires Flash-Next K=2560 and stock MQ6G256V2 for all eight
+input families. In `attach_forward`, preparation downloads each stock matrix
+once and packs the S1 `Bf16Direct` panels and exact row-major W8/Sm/Se twin
+**before** applying the pending trunk overlay or developer requantization.
+Raw MQ6 host bytes are released layer by layer. Only packed host results cross
+the overlay swap, then move into the forward/runtime; no extra stock GPU copies
+are retained. This moves the existing download/packing cost earlier without
+adding a transfer or a second preparation pass.
+
+Both arms still load the beta `<model>.trunk-overlay`. Covered z/a/b use W8 from
+the **stock MQ6**, never the replacement QT44 bytes. The existing load line adds
+`trunk_route=overlay(gfx1151-zab-v1)|stock` (only successfully applied overlays
+count) and `zab_source=stock-MQ6-DtoH-before-overlay|stock-MQ6-DtoH`, alongside
+`download_ms`, `pack_ms`, resident weight bytes and runtime status.
+`off` does no download, packing, allocation or new logging; its existing mode
+read moves before overlay application, whose payloads and native route are
+unchanged. `on` additionally opens the unchanged 8192-row G80 program, resident
+13/11-panel chains and two registered A/C banks; any admission/open error fails
+the load. Calibration is deliberately bypassed with `first-light-force-pairs`.
 
 Both `on` and `emulate` use the same deterministic, segment-local pair plan.
 Only paired banks use BF16-direct numerics: `on` consumes NPU results, while
 `emulate` executes the exact IU8 twin sequentially, one bank at a time.
 Unpaired chunks/tails, rows below 512, decode and uncovered paths retain the
-incumbent GPU projections in **both** modes. No paired input projection is
-computed twice: the MQ6 input GEMMs are skipped, with only pack/consume on the
-GPU under `on`. Out-projections and the GPU core/HC/MoE retain native kernels.
-QSA scratch is F32; GDN qkv is BF16 on the existing chunk-core route
-(otherwise exact widened F32); z/a/b are F32.
+incumbent GPU projections in **both** modes: z/a/b take the same A4/IU4 overlay
+route as `off` wherever that native route applies. No paired input projection
+is computed twice. Both covered executors call the mixer only with `Core` and
+`OutProj`; GDN's `Whole|InProj` guard encloses the entire `project_trunk` call,
+before dtype or `trunk_a4` selection, so it skips A4/IU4 **and** MQ6. A debug
+assertion checks every covered mixer dispatch, with a CPU phase-decision test.
+Uncovered steps retain `Whole` and the unchanged beta IU4 mask/dispatch.
+Under `on` the GPU only packs/consumes covered input projections; out-projections
+and the GPU core/HC/MoE remain native. QSA scratch is F32; GDN qkv is BF16 on
+the existing chunk-core route (otherwise exact widened F32); z/a/b are F32.
 
 ### Bank state and ordering
 
