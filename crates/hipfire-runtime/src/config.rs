@@ -126,7 +126,10 @@ pub struct RuntimeConfig {
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub mtp_mode: String,
-    pub mtp_k: usize,
+    /// Explicit numeric `HIPFIRE_MTP_K` / `speculation.mtp_k`. `None` = unset
+    /// or `auto`: the consumer applies its default (`hipfire_config::
+    /// mtp_k_default_for_arch` for native Qwen4 MTP, else `MTP_K_DEFAULT`).
+    pub mtp_k: Option<usize>,
     /// Opt-in gfx1151 XDNA NPU spillover (`kernel.npu_spillover`,
     /// `HIPFIRE_NPU_SPILLOVER`). Default false; snapshotted once here, never
     /// re-read from the environment on hot paths.
@@ -239,9 +242,7 @@ impl RuntimeConfig {
             uniform_vram_tolerance_gb: value("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
                 .and_then(|s| s.parse().ok()),
             mtp_mode: value("HIPFIRE_MTP_MODE").unwrap_or_else(|| "auto".into()),
-            mtp_k: value("HIPFIRE_MTP_K")
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(3),
+            mtp_k: value("HIPFIRE_MTP_K").and_then(|value| value.parse().ok()),
             npu_spillover: value("HIPFIRE_NPU_SPILLOVER").as_deref() == Some("1"),
         }
     }

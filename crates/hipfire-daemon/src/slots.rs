@@ -146,12 +146,21 @@ impl SlotLoadParams {
     pub fn from_load_msg(msg: &serde_json::Value) -> Self {
         let param = |k: &str| msg.get("params").and_then(|p| p.get(k));
         let param_str = |k: &str| param(k).and_then(|v| v.as_str());
-        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth (default 4).
+        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth. An integer param
+        // is explicit; the CLI's `"auto"` resolves to HIPFIRE_MTP_K/config, else
+        // MTP_K_DEFAULT (3); an absent param (non-CLI client) means 4.
         let mtp_mode = param_str("mtp_mode").unwrap_or("off");
         let mtp_k = if mtp_mode.is_empty() || mtp_mode == "off" {
             0
         } else {
-            param("mtp_k").and_then(|v| v.as_u64()).unwrap_or(4) as usize
+            match param("mtp_k") {
+                None => 4,
+                Some(v) => v.as_u64().map(|k| k as usize).unwrap_or_else(|| {
+                    hipfire_runtime::config::get()
+                        .mtp_k
+                        .unwrap_or(hipfire_config::MTP_K_DEFAULT)
+                }),
+            }
         };
         // Same precedence as the sequential loader: load param > env/config.
         let kv_mode_raw = param_str("kv_mode").unwrap_or("").to_string();

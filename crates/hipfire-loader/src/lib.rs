@@ -1082,7 +1082,7 @@ impl LoadedModel {
             minimax_eos_tok: 0,
             qwen35_eos_tok: 0,
             mtp_mode: "auto".to_string(),
-            mtp_k: 3,
+            mtp_k: hipfire_config::MTP_K_DEFAULT,
             mtp_weights_present: false,
             tokenizer: Some(tokenizer),
             seq_pos: 0,

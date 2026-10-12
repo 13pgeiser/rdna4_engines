@@ -3856,7 +3856,12 @@ pub(crate) fn load_params(
             _ => serde_json::json!("auto"),
         },
         "mtp_mode": config_string(resolved, "speculation.mtp")?,
-        "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
+        // `auto` or an explicit 1-10 (schema-validated); the daemon/loader
+        // resolves `auto` per model arch and GPU.
+        "mtp_k": match config_value(resolved, "speculation.mtp_k")? {
+            hipfire_config::ConfigValue::Integer(k) => serde_json::json!(k),
+            _ => serde_json::json!("auto"),
+        },
         "ngram_draft": matches!(config_string(resolved, "speculation.ngram")?.as_str(), "on" | "auto"),
         "ngram_k": config_u64(resolved, "speculation.ngram_k")?,
         "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,

@@ -1900,12 +1900,12 @@ pub static FIELDS: &[ConfigField] = &[
         "mtp_k",
         Speculation,
         ModelLoad,
-        DefaultValue::Integer(3),
-        ValueRule::Integer { min: 1, max: 10 },
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger { min: 1, max: 10 },
         true,
         false,
         Some("HIPFIRE_MTP_K"),
-        "MTP draft window."
+        "MTP draft window. Default `auto` = 4 for native Qwen4 MTP (Flash-Next, arch 16) on gfx1151, else 3; an explicit 1-10 overrides; `3` restores the previous gfx1151 cap."
     ),
     field!(
         "speculation.mtp_ngram",
@@ -4284,6 +4284,20 @@ fn mtp_ngram_enabled_for_arch_value(value: Option<&str>, model_arch: u32, gpu_ar
 fn ngram_mod_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
     model_arch == 16 && matches!(gpu_arch, "gfx1151" | "gfx1201")
 }
+/// Fallback MTP draft cap (`speculation.mtp_k` = `auto`): every model/GPU pair
+/// except [`mtp_k_default_for_arch`]'s admitted one.
+pub const MTP_K_DEFAULT: usize = 3;
+/// `auto` MTP draft cap. Native Qwen4 MTP (`model_arch == 16`, Flash-Next) on
+/// gfx1151 drafts 4; every other model/GPU keeps [`MTP_K_DEFAULT`]. An explicit
+/// `HIPFIRE_MTP_K` / `speculation.mtp_k` / `mtp_k` load param (including `3`)
+/// overrides this; callers apply it only when no explicit value is present.
+pub fn mtp_k_default_for_arch(model_arch: u32, gpu_arch: &str) -> usize {
+    if model_arch == 16 && gpu_arch == "gfx1151" {
+        4
+    } else {
+        MTP_K_DEFAULT
+    }
+}
 /// Sampled native-MTP enablement (`speculation.mtp_sampled`, env override
 /// `HIPFIRE_MTP_SAMPLED`, default on; `0` opts out). On, the Qwen4 MTP
 /// drafter verifies temperature > 0 requests by speculative rejection
@@ -5469,7 +5483,7 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("speculation.mode", ConfigValue::String("auto".to_owned())),
             ("speculation.dflash", ConfigValue::String("off".to_owned())),
             ("speculation.mtp", ConfigValue::String("auto".to_owned())),
-            ("speculation.mtp_k", ConfigValue::Integer(3)),
+            ("speculation.mtp_k", ConfigValue::String("auto".to_owned())),
             ("speculation.ngram", ConfigValue::String("off".to_owned())),
             ("serve.host", ConfigValue::String("127.0.0.1".to_owned())),
             ("serve.port", ConfigValue::Integer(11435)),
@@ -5730,6 +5744,24 @@ mod tests {
         };
         assert_eq!(ngram_mod_triple_resolve((5, 3, 3), env), (7, 3, 3));
         assert_eq!(ngram_mod_triple_resolve((24, 48, 64), env), (7, 48, 64));
+    }
+
+    #[test]
+    fn mtp_k_default_per_arch_and_auto_rule() {
+        assert_eq!(mtp_k_default_for_arch(16, "gfx1151"), 4);
+        assert_eq!(mtp_k_default_for_arch(16, "gfx1201"), MTP_K_DEFAULT);
+        assert_eq!(mtp_k_default_for_arch(16, "gfx1100"), MTP_K_DEFAULT);
+        assert_eq!(mtp_k_default_for_arch(5, "gfx1151"), MTP_K_DEFAULT);
+        assert_eq!(MTP_K_DEFAULT, 3);
+
+        let field = field("speculation.mtp_k").expect("speculation.mtp_k field");
+        assert!(field.validate(&ConfigValue::String("auto".into())).is_ok());
+        for k in 1..=10 {
+            assert!(field.validate(&ConfigValue::Integer(k)).is_ok(), "k={k}");
+        }
+        assert!(field.validate(&ConfigValue::Integer(0)).is_err());
+        assert!(field.validate(&ConfigValue::Integer(11)).is_err());
+        assert!(field.validate(&ConfigValue::String("fast".into())).is_err());
     }
 
     #[test]

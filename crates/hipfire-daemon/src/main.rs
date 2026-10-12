@@ -1701,12 +1701,12 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or(&hipfire_runtime::config::get().mtp_mode)
                     .to_string();
-                let mtp_k: usize = msg
+                let mtp_k: Option<usize> = msg
                     .get("params")
                     .and_then(|p| p.get("mtp_k"))
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize)
-                    .unwrap_or(hipfire_runtime::config::get().mtp_k);
+                    .or(hipfire_runtime::config::get().mtp_k);
                 let mtp_path = request_guards::mtp_sidecar_path(&msg, &mtp_mode);
 
                 // DFlash adaptive verify-block (opt-in, default off): clamp(ceil(τ̂)+2,
@@ -1778,7 +1778,7 @@ fn main() {
                     // DFlash mirrors mtp: on = fail closed on a missing/unloadable draft.
                     dflash: hipfire_config::parse_tri_state(dflash_mode),
                     mtp: hipfire_config::parse_tri_state(&mtp_mode),
-                    mtp_k: Some(mtp_k),
+                    mtp_k,
                     dflash_adaptive_b: Some(adaptive_b),
                     dflash_block: Some(dflash_block),
                 };
@@ -2320,9 +2320,9 @@ fn main() {
                         let vl = m.has_vision_encoder();
                         let (dim, layers, vocab) = m.ack_dims();
 
-                        // Apply MTP config from load-message params.
+                        // MTP config from load params; `None` (auto) keeps the carrier-resolved K (Qwen4 native MTP) else the skeleton MTP_K_DEFAULT.
                         m.mtp_mode = mtp_mode;
-                        m.mtp_k = mtp_k;
+                        m.mtp_k = mtp_k.unwrap_or(m.mtp_k);
                         // Detect whether MTP weights are present in the loaded
                         // model. Used by mtp_mode=auto to decide whether to
                         // enable spec-decode at generate time. Three sources:

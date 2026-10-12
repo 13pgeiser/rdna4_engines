@@ -428,7 +428,11 @@ pub fn generate_deepseek4_spec(
     let spec_k: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
         .ok()
         .and_then(|s| s.parse().ok())
-        .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
+        .or(Some(
+            hipfire_runtime::config::get()
+                .mtp_k
+                .unwrap_or(hipfire_config::MTP_K_DEFAULT),
+        ))
         .unwrap_or(2);
 
     // Prefix-cache plan (ds4 policy: forced-cold on partial, ring-safety length

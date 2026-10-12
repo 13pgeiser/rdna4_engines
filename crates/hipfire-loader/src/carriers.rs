@@ -655,7 +655,10 @@ impl Carrier for Qwen4Carrier {
         let max_k = ctx
             .spec
             .mtp_k
-            .unwrap_or(hipfire_runtime::config::get().mtp_k)
+            .or(hipfire_runtime::config::get().mtp_k)
+            .unwrap_or_else(|| {
+                hipfire_config::mtp_k_default_for_arch(hipfire_arch_qwen4::ARCH_ID, &ctx.gpu.arch)
+            })
             .clamp(1, 10);
         let options = crate::admission::SourceAdmissionOptions {
             spec: ctx.spec,
@@ -3511,7 +3514,11 @@ impl Carrier for Deepseek4Carrier {
             let max_n: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
+                .or(Some(
+                    hipfire_runtime::config::get()
+                        .mtp_k
+                        .unwrap_or(hipfire_config::MTP_K_DEFAULT),
+                ))
                 .unwrap_or(2);
             let ctx_capacity = config.max_position_embeddings;
             eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");

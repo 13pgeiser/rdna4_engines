@@ -1849,7 +1849,10 @@ fn spec_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ar_refs: &[Trace]) -> Resul
     let max_prefix = fx.iter().map(|f| f.prefix).max().unwrap_or(0);
     let cap = max_prefix + args.steps + 64;
     let head = load_mtp_head(&head_path, &mut gpu, cap)?;
-    let k = hipfire_runtime::config::get().mtp_k.clamp(1, 10);
+    let k = hipfire_runtime::config::get()
+        .mtp_k
+        .unwrap_or(hipfire_config::MTP_K_DEFAULT)
+        .clamp(1, 10);
     let mut d = Qwen35MtpDrafter::new(head, k, cap);
     let budget = args.steps + 1;
     let eos = slot.config.eos_token;
