@@ -142,6 +142,10 @@ impl Impl {
 static ROWS_IMPL: AtomicU8 = AtomicU8::new(0);
 static ACCEPT_IMPL: AtomicU8 = AtomicU8::new(0);
 static TWIN: AtomicBool = AtomicBool::new(false);
+static CAND_DEVICE: AtomicBool = AtomicBool::new(false);
+fn cand_device() -> bool {
+    CAND_DEVICE.load(Ordering::Relaxed)
+}
 fn rows_impl() -> Impl {
     if ROWS_IMPL.load(Ordering::Relaxed) == 1 {
         Impl::HipTwin
@@ -862,6 +866,10 @@ struct Args {
     accept_impl: Impl,
     /// Cross-check PM against its hipcc twin when the device has PM images.
     twin_cross_check: bool,
+    /// Draft q source: false = host-built exact q uploaded (shipping, no
+    /// candidates launch); true = device candidates enqueue, a non-shipping
+    /// diagnostic route that compares against host f32::exp and may differ.
+    candidate_q_device: bool,
 }
 
 fn parse_args() -> R<Args> {
@@ -884,6 +892,7 @@ fn parse_args() -> R<Args> {
         rows_impl: Impl::Pm,
         accept_impl: Impl::Pm,
         twin_cross_check: true,
+        candidate_q_device: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -916,6 +925,13 @@ fn parse_args() -> R<Args> {
             "--timing-windows" => a.timing_windows = num(&v, f)? as usize,
             "--rows-impl" => a.rows_impl = Impl::parse(&v, f)?,
             "--accept-impl" => a.accept_impl = Impl::parse(&v, f)?,
+            "--candidate-q" => {
+                a.candidate_q_device = match v.as_str() {
+                    "host" => false,
+                    "device" => true,
+                    other => return setup(format!("--candidate-q {other}: want host|device")),
+                }
+            }
             "--twin-cross-check" => {
                 a.twin_cross_check = match v.as_str() {
                     "on" => true,
@@ -1522,7 +1538,7 @@ fn build_window(
                     17 | 18 => outside_support(p, c.vocab, dr).unwrap_or(top),
                     _ => dr.below(c.vocab) as u32,
                 };
-                if kind == DKind::HostCand {
+                if kind == DKind::HostCand || !cand_device() {
                     (QSrc::Host(q), x)
                 } else {
                     (QSrc::Cand { ids, logits }, x)
@@ -2601,7 +2617,11 @@ fn run_graph_oracle(
         let vocab = corpora[0].vocab;
         let res = alloc_res(gpu, k, vocab)?;
         let fixed_u: Vec<f32> = (0..k).map(|_| dr.unit()).collect();
-        let cu: Vec<Option<f32>> = fixed_u.iter().map(|&u| Some(u)).collect();
+        // Shipping mode: q is host-built and uploaded, no candidates launch.
+        let cu: Vec<Option<f32>> = fixed_u
+            .iter()
+            .map(|&u| if cand_device() { Some(u) } else { None })
+            .collect();
         let eos_mode = eos.map_or(EosMode::None, EosMode::Fixed);
         // Seed the buffers with a valid window so the warm run is defined.
         let first = Spec {
@@ -2780,10 +2800,14 @@ fn run_timing_policy(
             sync(gpu)?;
             let none: Vec<Option<f32>> = vec![None; k];
             let g1 = capture(gpu, &tw.res, vocab, k, policy, EOS_NONE, &none)?;
-            let g2 = capture(gpu, &tw.res, vocab, k, policy, EOS_NONE, &cu)?;
+            let g2 = if cand_device() {
+                Some(capture(gpu, &tw.res, vocab, k, policy, EOS_NONE, &cu)?)
+            } else {
+                None
+            };
             tws.push(TW {
                 g_host_q: Some(g1),
-                g_cand: Some(g2),
+                g_cand: g2,
                 ..tw
             });
         }
@@ -2871,6 +2895,9 @@ fn run_timing_policy(
             ("device_graph_replay_host_q", 1),
             ("device_graph_replay_device_cand_q", 2),
         ] {
+            if mode == 2 && !cand_device() {
+                continue; // device candidate q is not a shipping route
+            }
             let mut total = Vec::new();
             let mut result_bytes = [0u8; 8];
             let mut t0 = tally();
@@ -2963,6 +2990,9 @@ fn run_timing_policy(
             "device_graph_replay_host_q",
             "device_graph_replay_device_cand_q",
         ] {
+            if !variants.contains_key(vn) {
+                continue;
+            }
             let p50 = variants[vn]["per_window"]["p50_us"].as_f64().unwrap_or(f64::NAN);
             within.insert(vn.into(), json!({"p50_us": p50, "within_0_2ms_budget": p50 <= BUDGET_US}));
         }
@@ -3137,6 +3167,7 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     ACCEPT_IMPL.store(args.accept_impl.code(), Ordering::Relaxed);
     let supported = gpu.spec_cpu_ar_device_supported();
     TWIN.store(supported && args.twin_cross_check, Ordering::Relaxed);
+    CAND_DEVICE.store(args.candidate_q_device, Ordering::Relaxed);
     {
         let isa = |name: &str| -> Value {
             let p = format!(
@@ -3154,6 +3185,9 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
                 "rows_impl_used_by_windows_when_canonical": args.rows_impl.name(),
                 "accept_impl_used_by_windows": args.accept_impl.name(),
                 "twin_cross_check": supported && args.twin_cross_check,
+                "candidate_q_mode": if args.candidate_q_device { "device (NON-shipping diagnostic: device candidates enqueue compared with host f32::exp q)" } else { "host (shipping: exact q built on the host and uploaded; spec_cpu_ar_candidates_enqueue is never launched)" },
+                "candidates_enqueue_launched": args.candidate_q_device,
+                "shipping_scope": "PM canonical rows + PM ordered accept; draft q uploaded from the host; device candidate q excluded",
                 "pm_rows_symbol": sc::spec_cpu_ar_rows_parallel_pm_symbol(&gpu.arch),
                 "pm_accept_symbol": sc::spec_accept_ordered_pm_symbol(&gpu.arch),
                 "rows_contract": isa("spec_sampling_rows_pm"),
@@ -3304,11 +3338,13 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     // 2. Windows: candidates + accept + RNG, direct enqueue.
     let cap_v = corpora.iter().map(|c| c.vocab).max().unwrap_or(1);
     let res = alloc_res(&mut gpu, MAX_K, cap_v)?;
-    match run_candidate_invalid(&mut gpu, &res, &pols, 37) {
-        Ok(v) => {
-            rec.insert("candidates_invalid".into(), v);
+    if cand_device() {
+        match run_candidate_invalid(&mut gpu, &res, &pols, 37) {
+            Ok(v) => {
+                rec.insert("candidates_invalid".into(), v);
+            }
+            Err(e) => return finish_fail(rec, "candidates_invalid(device q, NOT shipping)", e, &st),
         }
-        Err(e) => return finish_fail(rec, "candidates_invalid", e, &st),
     }
     match run_windows(&mut gpu, &res, &corpora, &pols, &args, &mut st) {
         Ok(v) => {
@@ -3319,7 +3355,7 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     free_res(&mut gpu, res);
     let missing: Vec<&&str> = REQUIRED_COVERAGE
         .iter()
-        .filter(|k| st.cov.get(**k).copied().unwrap_or(0) == 0)
+        .filter(|k| (cand_device() || **k != "visited_device_cand_q") && st.cov.get(**k).copied().unwrap_or(0) == 0)
         .collect();
     if !missing.is_empty() {
         let e = Fail {
