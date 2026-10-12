@@ -266,6 +266,9 @@ struct Model {
     bool    moe = false;
     int64_t n_expert = 0, n_local = 0, expert_base = 0, top_k = 0, n_ffe = 0;
     int64_t moe_rows = 0;    /* tokens a routed pass */
+    /* A prefill chunk of 2 * moe_rows tokens or more runs as two slices, the trunk's all-reduces
+     * on the second lane beside the other slice's compute (trunk_overlap). Set at declare. */
+    bool    overlap = false;
     double  escale = 1.0, softcap = 0.0;
 
     rad_buf b_x = 0, b_h = 0, b_o = 0;
@@ -1440,6 +1443,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               {m.b_x}, {m.b_dfsrc});
     }
 
+    /* ---- THE PREFILL OVERLAP (trunk_overlap): where there is a reduction to hide, a routed arm
+     * whose passes a slice can be a whole number of, and every join fused -- the slices issue the
+     * fused forms only. On the exact wire alone: nothing here shows the lossy one gives a slice
+     * the bits it gives the whole. RADIANCE_GEMMA4_OVERLAP=0 runs every chunk whole, the A/B
+     * switch. The two buffers the second lane reduces in place are taken out of the arena's
+     * sharing, which the runtime asks of every buffer a second lane touches (rad_buf_concurrent);
+     * both live across the whole trunk already, so what that costs is only the sharing with the
+     * drafter's and the head's buffers. */
+    const char* ov_env = std::getenv("RADIANCE_GEMMA4_OVERLAP");
+    const bool  ov_off = ov_env && ov_env[0] == '0';
+    m.overlap = W > 1 && m.moe && g.wire_exact && T >= 2 * m.moe_rows && !ov_off;
+    for (const Layer& y : m.layers)
+        m.overlap = m.overlap && y.op_join_a && y.op_join_f && y.next_norm && y.op_ar_o &&
+                    y.op_ar_f;
+    if (m.overlap) {
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_o));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ff2));
+    }
+
     if (m.layers.empty() || !m.layers.back().next_norm)
         m.op_onorm = rmsnorm(T, E, m.w_onorm, 1.0, m.b_x, m.b_h);
     m.op_gather = rw(b, RAD_OP(b, "gather_rows",
@@ -1504,6 +1526,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  (long long)m.n_local, (long long)m.expert_base, (long long)m.n_expert,
                  (long long)m.top_k, (long long)m.n_ffe, how(m.n_gu_fp8), m.n_gu_fp8,
                  (long long)m.n_layer, how(m.n_dn_fp8), m.n_dn_fp8, (long long)m.moe_rows);
+        if (W > 1)
+            rad_note(b, "prefill overlap: %s", m.overlap
+                        ? "a chunk of two routed passes or more runs as two slices, each slice's "
+                          "all-reduces on a second stream beside the other's compute"
+                        : ov_off ? "off (RADIANCE_GEMMA4_OVERLAP=0)"
+                        : !g.wire_exact ? "off (the lossy all-reduce wire)"
+                        : T < 2 * m.moe_rows ? "off (a step holds fewer than two routed passes)"
+                        : "off (the sandwich joins are not fused)");
     }
     if (m.kf.rot_pairs < m.kf.hd / 2)
         rad_note(b, "full layers: PROPORTIONAL rope -- %lld of %lld frequency pairs rotate at "
@@ -1515,10 +1545,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
 /* ============================================================== step */
 
-static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T) {
+/* The routed arm over rows [first, first + rows) of a T-token step, in passes of m.moe_rows, its
+ * partial into rows [dst, dst + rows) of the join: [T, 2T) for a whole step, and right after the
+ * slice's dense rows for a slice of one (trunk_overlap). */
+static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t first,
+                   int64_t rows, int64_t dst) {
     const int64_t E = m.E, K = m.top_k, NL = m.n_local, NE = m.n_expert;
-    for (int64_t r0 = 0; r0 < T; r0 += m.moe_rows) {
-        const int64_t n = (T - r0 < m.moe_rows) ? (T - r0) : m.moe_rows;
+    const int64_t end = first + rows;
+    for (int64_t r0 = first; r0 < end; r0 += m.moe_rows) {
+        const int64_t n = (end - r0 < m.moe_rows) ? (end - r0) : m.moe_rows;
         int32_t* const counts = rad_route_counts(c, (int)(&y - m.layers.data()), NL);
         const RadOperand ecnt = counts ? praw(counts, RAD_I32, NL) : brows(m.b_ecnt, NL);
         RAD_ISSUE_N(c, y.op_rnorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_rscale),
@@ -1592,10 +1627,10 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T) {
             RAD_ISSUE_N(c, y.op_edn, n, brows(m.b_eact, n * K), RAD_WTAB(y.w_edn[0], NL),
                         brows(m.b_sorted, n * K), brows(m.b_eoff, NL + 1), brows(m.b_edn, n * K));
         }
-        /* The routed partial into rows [T + r0, T + r0 + n) of the join. */
+        /* The routed partial into its rows of the join. */
         RAD_ISSUE_N(c, y.op_gather, n, brows(m.b_edn, n * K), brow_slice(m.b_ew, r0, n, K),
                     brows(m.b_sorted, n * K), RAD_NONE, RAD_NONE,
-                    brow_slice(m.b_ff2, T + r0, n, E));
+                    brow_slice(m.b_ff2, dst + (r0 - first), n, E));
         if (r0 + n >= T) {
             RadRouting rt{};
             rt.expert_ids    = ids;
@@ -1610,68 +1645,56 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T) {
     }
 }
 
-static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
-    if (batch->draft_pass != 0) {
-        if (!m.have_df) {
-            rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
-                             "container carries no DFlash `draft.` block, or declare ran at "
-                             "max_spec 0");
-            return;
-        }
-        if (batch->draft_pass > 0) m.df.step(c, batch);
-        else                       m.df.context(c, batch);
-        return;
-    }
-    if (batch->enc) {
-        rad_step_fail(c, "gemma4 declares no encoder; serve this container with --mm-max-patches 0");
-        return;
-    }
-    const int64_t T = batch->n_tok, E = m.E;
-    if (T <= 0) return;
+/* A layer's attention between its projections and its output projection, over the whole step:
+ * the norms and the rotaries, the cache write, the attention. */
+static void attend(RadCtx* c, const Model& m, const Layer& y, size_t li, const RadBatch* batch) {
+    const int64_t T = batch->n_tok;
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     const RadOperand cu  = praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1);
+    const Kind& k = y.full ? m.kf : m.ks;
+    const RadKVGroupBatch* kvb = kv_batch(batch, k.kv);
+    const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
+    const int32_t* table = kvb ? kvb->block_table  : nullptr;
+    const int32_t* used  = kvb ? kvb->seqused      : nullptr;
+    const RadOperand bt  = praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0);
+    const RadOperand su  = praw(used, RAD_I32, batch->n_seq);
 
-    RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_x, T));
-    if (m.op_embed_ar)
-        RAD_ISSUE_N(c, m.op_embed_ar, T * E, brows(m.b_x, T), RAD_NONE);
+    if (!y.full) {
+        const int64_t qd = k.q(), kvd = k.kv_dim();
+        RAD_ISSUE(c, y.op_qknr, brows(m.b_qkv, T), pos, RAD_W(y.w_qn), RAD_W(y.w_kn));
+        RAD_ISSUE(c, y.op_store, bcol(m.b_qkv, qd, kvd, T), bcol(m.b_qkv, qd + kvd, kvd, T),
+                  praw(slot, RAD_I32, T), kv_cache(k.kv, (int)li));
+        if (y.op_lift) RAD_ISSUE(c, y.op_lift, bcol(m.b_qkv, 0, qd, T), brows(m.b_qs, T));
+        RAD_ISSUE_N(c, y.op_attn, batch->max_q_len,
+                    y.op_lift ? brows(m.b_qs, T) : bcol(m.b_qkv, 0, qd, T),
+                    kv_cache(k.kv, (int)li), bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_atts, T));
+    } else {
+        RAD_ISSUE_N(c, y.op_vnorm, T * k.nkv, brows(m.b_kf, T), RAD_NONE, brows(m.b_vf, T));
+        RAD_ISSUE_N(c, y.op_qn, T * k.nh, brows(m.b_qf, T), RAD_W(y.w_qn), brows(m.b_qf, T));
+        RAD_ISSUE_N(c, y.op_kn, T * k.nkv, brows(m.b_kf, T), RAD_W(y.w_kn), brows(m.b_kf, T));
+        RAD_ISSUE(c, y.op_qrope, brows(m.b_qf, T), pos);
+        RAD_ISSUE(c, y.op_krope, brows(m.b_kf, T), pos);
+        RAD_ISSUE(c, y.op_store, brows(m.b_kf, T), brows(m.b_vf, T), praw(slot, RAD_I32, T),
+                  kv_cache(k.kv, (int)li));
+        RAD_ISSUE_N(c, y.op_attn, batch->max_q_len, brows(m.b_qf, T), kv_cache(k.kv, (int)li),
+                    bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_attf, T));
+    }
+}
 
+/* The trunk over the whole step. */
+static void trunk(RadCtx* c, const Model& m, const RadBatch* batch) {
+    const int64_t T = batch->n_tok, E = m.E;
     for (size_t li = 0; li < m.layers.size(); ++li) {
         const Layer& y = m.layers[li];
-        const Kind& k = y.full ? m.kf : m.ks;
-        const RadKVGroupBatch* kvb = kv_batch(batch, k.kv);
-        const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
-        const int32_t* table = kvb ? kvb->block_table  : nullptr;
-        const int32_t* used  = kvb ? kvb->seqused      : nullptr;
-        const RadOperand bt  = praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0);
-        const RadOperand su  = praw(used, RAD_I32, batch->n_seq);
-
         if (y.op_anorm) RAD_ISSUE(c, y.op_anorm, brows(m.b_x, T), RAD_W(y.w_anorm), brows(m.b_h, T));
         if (!y.full) {
-            const int64_t qd = k.q(), kvd = k.kv_dim();
             RAD_ISSUE(c, y.op_qkv, brows(m.b_h, T), RAD_W(y.w_qkv), brows(m.b_qkv, T));
-            RAD_ISSUE(c, y.op_qknr, brows(m.b_qkv, T), pos, RAD_W(y.w_qn), RAD_W(y.w_kn));
-            RAD_ISSUE(c, y.op_store, bcol(m.b_qkv, qd, kvd, T), bcol(m.b_qkv, qd + kvd, kvd, T),
-                      praw(slot, RAD_I32, T), kv_cache(k.kv, (int)li));
-            if (y.op_lift) RAD_ISSUE(c, y.op_lift, bcol(m.b_qkv, 0, qd, T), brows(m.b_qs, T));
-            RAD_ISSUE_N(c, y.op_attn, batch->max_q_len,
-                        y.op_lift ? brows(m.b_qs, T) : bcol(m.b_qkv, 0, qd, T),
-                        kv_cache(k.kv, (int)li), bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_atts, T));
-            RAD_ISSUE(c, y.op_o, brows(m.b_atts, T), RAD_W(y.w_o), brows(m.b_o, T));
         } else {
             RAD_ISSUE(c, y.op_q, brows(m.b_h, T), RAD_W(y.w_q), brows(m.b_qf, T));
             RAD_ISSUE(c, y.op_k, brows(m.b_h, T), RAD_W(y.w_k), brows(m.b_kf, T));
-            RAD_ISSUE_N(c, y.op_vnorm, T * k.nkv, brows(m.b_kf, T), RAD_NONE, brows(m.b_vf, T));
-            RAD_ISSUE_N(c, y.op_qn, T * k.nh, brows(m.b_qf, T), RAD_W(y.w_qn), brows(m.b_qf, T));
-            RAD_ISSUE_N(c, y.op_kn, T * k.nkv, brows(m.b_kf, T), RAD_W(y.w_kn), brows(m.b_kf, T));
-            RAD_ISSUE(c, y.op_qrope, brows(m.b_qf, T), pos);
-            RAD_ISSUE(c, y.op_krope, brows(m.b_kf, T), pos);
-            RAD_ISSUE(c, y.op_store, brows(m.b_kf, T), brows(m.b_vf, T), praw(slot, RAD_I32, T),
-                      kv_cache(k.kv, (int)li));
-            RAD_ISSUE_N(c, y.op_attn, batch->max_q_len, brows(m.b_qf, T), kv_cache(k.kv, (int)li),
-                        bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_attf, T));
-            RAD_ISSUE(c, y.op_o, brows(m.b_attf, T), RAD_W(y.w_o), brows(m.b_o, T));
         }
+        attend(c, m, y, li, batch);
+        RAD_ISSUE(c, y.op_o, brows(y.full ? m.b_attf : m.b_atts, T), RAD_W(y.w_o), brows(m.b_o, T));
         if (y.op_ar_o) RAD_ISSUE_N(c, y.op_ar_o, T * E, brows(m.b_o, T), RAD_NONE);
         if (y.op_join_a) {
             RAD_ISSUE(c, y.op_join_a, brows(m.b_o, T), RAD_W(y.w_apost), brows(m.b_x, T),
@@ -1688,7 +1711,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
                   brows(m.b_act, T));
         RAD_ISSUE(c, y.op_dn, brows(m.b_act, T), RAD_W(y.w_dn), brows(m.b_ff2, T));
         if (m.moe) {
-            routed(c, m, y, T);
+            routed(c, m, y, T, 0, T, T);
             if (y.op_ar_f) RAD_ISSUE_N(c, y.op_ar_f, 2 * T * E, brows(m.b_ff2, 2 * T), RAD_NONE);
             if (y.op_join_f) {
                 RAD_ISSUE(c, y.op_join_f, brows(m.b_ff2, T), RAD_W(y.w_fpost1),
@@ -1718,6 +1741,172 @@ static void step(RadCtx* c, const RadBatch* batch) {
                       bcol(m.b_dfsrc, (int64_t)t * E, E, T));
         }
     }
+}
+
+/* ============================================================== the prefill overlap */
+/* A PREFILL CHUNK IN TWO SLICES, each slice's all-reduces on the second lane (rad_lane) beside the
+ * other slice's compute. On gemma-4-26B-A4B at tp 4 on 4x R9700 the reductions were 47% of a
+ * 20K-token prefill under --profile-ops: a layer reduces T x E after attention and both arms' 2T x
+ * E after the feed-forward, at ~16.5 GB/s a rank on the link, against ~8 ms of compute a layer at
+ * the average chunk. Run whole, the two take turns. Cut in two, a slice's reduction runs while the
+ * other slice computes:
+ *
+ *   lane 0  o(A) o(B) . nan(A) ff(A) . nan(B) ff(B) . jas(A) qkv(A) . jas(B) qkv(B) attn o(A) ..
+ *   lane 1       ar_o(A)    ar_o(B)       ar_f(A)         ar_f(B)
+ *
+ * ATTENTION RUNS WHOLE: it reads every row's keys, and its batch bounds describe the whole step.
+ * The rest is a row at a time -- the projections, the joins, both arms -- and so is the reduction,
+ * which folds a word in fp32 in ascending rank order whichever message carries it.
+ *
+ * THE SAME KERNELS, SO THE SAME BITS (core/runtime/ctx.h, the second lane's rule FOUR). A cut is
+ * a whole number of routed passes from the step's first row, so the routed arm makes exactly the
+ * passes the whole step makes, and both slices are at least one pass (2048 rows): above every row
+ * band the projections, the joins, the activation and the reduction have -- the GEMM's at 16 and
+ * 64, the reduction's one-shot edge at 524288 elements. None of those kernels' row results
+ * depends on the row count, so the step's output is the whole step's.
+ *
+ * THE ORDER. Every reduction rides lane 1 behind a join from lane 0, which holds its producer;
+ * lane 0 waits for lane 1 before the reduction's consumer. A join orders behind EVERYTHING its
+ * lane has issued, so each wait goes in after the lane-0 work that does not need it and before
+ * the next reduction is issued -- which is what fixes the issue order below. The embedding's
+ * reduction stays on lane 0, ahead of everything lane 1 is first joined behind, so the
+ * collectives keep one order on every rank; the runtime joins lane 1 back at the end of a step. */
+
+/* The first row of slice B, or 0 for a step that runs whole: the whole number of routed passes
+ * nearest half the step. Both slices are then at least one pass. */
+static int64_t split_at(const Model& m, int64_t T) {
+    if (!m.overlap || T < 2 * m.moe_rows) return 0;
+    const int64_t P = m.moe_rows;
+    return P * ((T + P) / (2 * P));
+}
+
+/* Rows [r0, r0 + n) of a layer's projections: q|k|v on a sliding layer, q and k on a full one. */
+static void project(RadCtx* c, const Model& m, const Layer& y, int64_t r0, int64_t n) {
+    const RadOperand h = brow_slice(m.b_h, r0, n, m.E);
+    if (!y.full) {
+        RAD_ISSUE_N(c, y.op_qkv, n, h, RAD_W(y.w_qkv),
+                    brow_slice(m.b_qkv, r0, n, m.ks.q() + 2 * m.ks.kv_dim()));
+    } else {
+        RAD_ISSUE_N(c, y.op_q, n, h, RAD_W(y.w_q), brow_slice(m.b_qf, r0, n, m.kf.q()));
+        RAD_ISSUE_N(c, y.op_k, n, h, RAD_W(y.w_k), brow_slice(m.b_kf, r0, n, m.kf.kv_dim()));
+    }
+}
+
+/* Rows [r0, r0 + n) of the output projection. */
+static void out_proj(RadCtx* c, const Model& m, const Layer& y, int64_t r0, int64_t n) {
+    const int64_t q = y.full ? m.kf.q() : m.ks.q();
+    RAD_ISSUE_N(c, y.op_o, n, brow_slice(y.full ? m.b_attf : m.b_atts, r0, n, q), RAD_W(y.w_o),
+                brow_slice(m.b_o, r0, n, m.E));
+}
+
+/* Rows [r0, r0 + n) from the attention join to the arms' partials, once those rows' attention
+ * reduction is in. The slice's partials land in rows [2 r0, 2 r0 + 2n) of the join, dense then
+ * routed, so its feed-forward reduction is one run. */
+static void arms(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t r0, int64_t n) {
+    const int64_t E = m.E, F = m.n_ff;
+    RAD_ISSUE_N(c, y.op_join_a, n, brow_slice(m.b_o, r0, n, E), RAD_W(y.w_apost),
+                brow_slice(m.b_x, r0, n, E), RAD_W(y.w_fnorm), brow_slice(m.b_h, r0, n, E));
+    RAD_ISSUE_N(c, y.op_gu, n, brow_slice(m.b_h, r0, n, E), RAD_W(y.w_gu),
+                brow_slice(m.b_gu, r0, n, 2 * F));
+    RAD_ISSUE_N(c, y.op_act, n, bcol_at(m.b_gu, r0, 2 * F, 0, F, n),
+                bcol_at(m.b_gu, r0, 2 * F, F, F, n), brow_slice(m.b_act, r0, n, F));
+    RAD_ISSUE_N(c, y.op_dn, n, brow_slice(m.b_act, r0, n, F), RAD_W(y.w_dn),
+                brow_slice(m.b_ff2, 2 * r0, n, E));
+    routed(c, m, y, T, r0, n, 2 * r0 + n);
+}
+
+/* Rows [r0, r0 + n) of layer li's feed-forward join, once their reduction is in -- with the next
+ * norm it writes -- and the drafter's taps of those rows. */
+static void join_ff(RadCtx* c, const Model& m, size_t li, int64_t r0, int64_t n) {
+    const Layer& y = m.layers[li];
+    const int64_t E = m.E;
+    RAD_ISSUE_N(c, y.op_join_f, n, brow_slice(m.b_ff2, 2 * r0, n, E), RAD_W(y.w_fpost1),
+                brow_slice(m.b_ff2, 2 * r0 + n, n, E), RAD_W(y.w_fpost2), RAD_W(y.w_fpost),
+                brow_slice(m.b_x, r0, n, E), RAD_W(y.w_scalar), RAD_W(y.w_next),
+                brow_slice(m.b_h, r0, n, E));
+    for (int t = 0; t < m.n_taps && y.op_tap; ++t) {
+        if (m.tap_layer[t] != (int)li) continue;
+        RAD_ISSUE_N(c, y.op_tap, n, brow_slice(m.b_x, r0, n, E),
+                    bcol_at(m.b_dfsrc, r0, (int64_t)m.n_taps * E, (int64_t)t * E, E, n));
+    }
+}
+
+static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int64_t cut) {
+    const int64_t T = batch->n_tok, E = m.E;
+    const int64_t a0 = 0, an = cut, b0 = cut, bn = T - cut;
+    bool lanes_ok = true;
+    /* An all-reduce in place over `rows` rows of `buf` from `row`, on lane 1 behind everything
+     * lane 0 has issued -- its producer among it. */
+    auto reduce = [&](rad_op op, rad_buf buf, int64_t row, int64_t rows) {
+        lanes_ok = lanes_ok && rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK;
+        RAD_ISSUE_N(c, op, rows * E, brow_slice(buf, row, rows, E), RAD_NONE);
+        lanes_ok = rad_lane(c, 0) == RAD_OK && lanes_ok;
+    };
+    /* Lane 0 behind every reduction issued so far. */
+    auto join_back = [&] { lanes_ok = rad_lane_join(c, 1, 0) == RAD_OK && lanes_ok; };
+
+    const size_t L = m.layers.size();
+    for (size_t li = 0; li < L; ++li) {
+        const Layer& y = m.layers[li];
+        if (li == 0) {
+            RAD_ISSUE(c, y.op_anorm, brows(m.b_x, T), RAD_W(y.w_anorm), brows(m.b_h, T));
+            project(c, m, y, a0, an);
+            project(c, m, y, b0, bn);
+        } else {
+            join_ff(c, m, li - 1, a0, an);   /* its reduction was waited for last layer */
+            project(c, m, y, a0, an);
+            join_back();                     /* the last layer's feed-forward, slice B */
+            join_ff(c, m, li - 1, b0, bn);
+            project(c, m, y, b0, bn);
+        }
+        attend(c, m, y, li, batch);
+        out_proj(c, m, y, a0, an);
+        reduce(y.op_ar_o, m.b_o, a0, an);
+        out_proj(c, m, y, b0, bn);
+        join_back();                         /* attention, slice A */
+        reduce(y.op_ar_o, m.b_o, b0, bn);
+        arms(c, m, y, T, a0, an);
+        join_back();                         /* attention, slice B */
+        reduce(y.op_ar_f, m.b_ff2, 2 * a0, 2 * an);
+        arms(c, m, y, T, b0, bn);
+        join_back();                         /* the feed-forward, slice A */
+        reduce(y.op_ar_f, m.b_ff2, 2 * b0, 2 * bn);
+    }
+    join_ff(c, m, L - 1, a0, an);
+    join_back();                             /* the last feed-forward, slice B */
+    join_ff(c, m, L - 1, b0, bn);
+    if (!lanes_ok)
+        rad_step_fail(c, "gemma4: the prefill overlap could not order its second lane against "
+                         "the first (RADIANCE_GEMMA4_OVERLAP=0 runs every chunk on one)");
+}
+
+static void step(RadCtx* c, const RadBatch* batch) {
+    const Model& m = g_model[rad_rank(c)];
+    if (batch->draft_pass != 0) {
+        if (!m.have_df) {
+            rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
+                             "container carries no DFlash `draft.` block, or declare ran at "
+                             "max_spec 0");
+            return;
+        }
+        if (batch->draft_pass > 0) m.df.step(c, batch);
+        else                       m.df.context(c, batch);
+        return;
+    }
+    if (batch->enc) {
+        rad_step_fail(c, "gemma4 declares no encoder; serve this container with --mm-max-patches 0");
+        return;
+    }
+    const int64_t T = batch->n_tok, E = m.E;
+    if (T <= 0) return;
+
+    RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_x, T));
+    if (m.op_embed_ar)
+        RAD_ISSUE_N(c, m.op_embed_ar, T * E, brows(m.b_x, T), RAD_NONE);
+
+    const int64_t cut = split_at(m, T);
+    if (cut > 0) trunk_overlap(c, m, batch, cut);
+    else         trunk(c, m, batch);
 
     if (m.op_onorm) RAD_ISSUE(c, m.op_onorm, brows(m.b_x, T), RAD_W(m.w_onorm), brows(m.b_h, T));
     if (batch->n_out > 0) {

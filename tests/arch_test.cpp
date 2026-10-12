@@ -20,6 +20,7 @@
 
 #include <cstdarg>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -71,7 +72,10 @@ struct RecIssue {
     rad_op                  op = 0;
     std::vector<RadOperand> opd;
     int64_t                 n = 0;
+    int                     lane = 0;   /* the lane it was issued on (rad_lane) */
 };
+/* A rad_lane_join: `to` behind everything `from` issued before issue number `at`. */
+struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
 
 }  /* namespace */
 
@@ -90,6 +94,9 @@ struct RadBuilder {
 
     /* The buffer the plugin named as this step's logits (rad_declare_logits). */
     rad_buf logits = 0;
+
+    /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
+    std::vector<rad_buf> concurrent;
 
     /* The vision tower's declaration (rad_declare_encoder), when the plugin made one, and the
      * audio encoder's. */
@@ -113,6 +120,8 @@ struct RadCtx {
     std::vector<RecIssue> issues;
     std::vector<int>      routed_layers;
     std::string           step_fail;
+    int                   lane = 0;     /* where the next issue goes */
+    std::vector<RecJoin>  joins;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -212,8 +221,12 @@ extern "C" int rad_declare_logits(RadBuilder* b, rad_buf logits) {
     return RAD_OK;
 }
 
-/* Recorded as calls and nothing else: no test here reads a lane or a drafter declaration. */
-extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) { (void)b; (void)buf; return RAD_OK; }
+/* Recorded: the gemma4 prefill overlap names the buffers its second lane reduces in place. */
+extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
+    if (!b || !buf) return RAD_E_INVAL;
+    b->concurrent.push_back(buf);
+    return RAD_OK;
+}
 extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
     if (!b || w == 0 || w > b->weights.size()) return RAD_E_INVAL;
     if (lo < 0 || hi <= lo) return RAD_E_INVAL;
@@ -285,7 +298,19 @@ extern "C" int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd,
     r.op = op;
     r.n  = n;
     for (int i = 0; i < n_opd; ++i) r.opd.push_back(opd[i]);
+    r.lane = c->lane;
     c->issues.push_back(r);
+    return RAD_OK;
+}
+/* The second lane, recorded: the lane each issue went to, and where each join sits among them. */
+extern "C" int rad_lane(RadCtx* c, int lane) {
+    if (lane != 0 && lane != 1) return RAD_E_INVAL;
+    c->lane = lane;
+    return RAD_OK;
+}
+extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
+    if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
+    c->joins.push_back({ c->issues.size(), from, to });
     return RAD_OK;
 }
 /* A block that refuses the batch records the reason; the recorder is what the tests read. */
@@ -3804,4 +3829,184 @@ TEST(gemma4_dflash_head_reads_the_fp8_copy_where_the_container_holds_one) {
             if (b.op_of(i.op) == head) ++head_issues;
         CHECK_EQ(head_issues, 1);
     }
+}
+
+/* ============ gemma4: the prefill overlap -- two slices, the reductions on lane 1 ============ */
+
+namespace {
+
+/* The elements [lo, hi) of its buffer an operand can reach, whole rows at the declared width. False
+ * for an operand that is not a buffer. */
+bool reach(const RadBuilder& b, const RadOperand& o, rad_buf* buf, int64_t* lo, int64_t* hi) {
+    if (o.kind != RAD_OPK_BUF || o.handle == 0 || o.handle > b.bufs.size()) return false;
+    const RadBufDecl& d = b.bufs[o.handle - 1].d;
+    int64_t pitch = 1;
+    for (uint32_t i = 1; i < d.rank; ++i) pitch *= d.shape[i];
+    *buf = o.handle;
+    *lo  = o.offset - o.offset % pitch;
+    *hi  = *lo + (o.rows > 0 ? o.rows : d.shape[0]) * pitch;
+    return true;
+}
+
+/* Whether issue a runs before issue b (a < b): on one lane by issue order, across the two only
+ * through a join from a's lane to b's issued between them. */
+bool ordered(const RadCtx& c, size_t a, size_t b) {
+    const int la = c.issues[a].lane, lb = c.issues[b].lane;
+    if (la == lb) return true;
+    for (const RecJoin& j : c.joins)
+        if (j.from == la && j.to == lb && j.at > a && j.at <= b) return true;
+    return false;
+}
+
+/* Pairs of issues on different lanes that reach a common element with nothing ordering them.
+ * Every operand is taken as read and written, which can only over-count. */
+int races(const RadBuilder& b, const RadCtx& c) {
+    int n = 0;
+    for (size_t i = 0; i < c.issues.size(); ++i)
+        for (size_t j = i + 1; j < c.issues.size(); ++j) {
+            if (ordered(c, i, j)) continue;
+            bool meet = false;
+            for (const RadOperand& p : c.issues[i].opd)
+                for (const RadOperand& q : c.issues[j].opd) {
+                    rad_buf bp = 0, bq = 0;
+                    int64_t pl = 0, ph = 0, ql = 0, qh = 0;
+                    if (reach(b, p, &bp, &pl, &ph) && reach(b, q, &bq, &ql, &qh) && bp == bq &&
+                        pl < qh && ql < ph)
+                        meet = true;
+                }
+            n += meet ? 1 : 0;
+        }
+    return n;
+}
+
+/* One prompt of T tokens, its last sampled. */
+RadBatch one_prompt(int64_t T, const int32_t* out) {
+    RadBatch b{};
+    b.phase       = RAD_PHASE_PREFILL;
+    b.n_tok       = T;
+    b.n_seq       = 1;
+    b.max_q_len   = T;
+    b.max_ctx_len = T;
+    b.n_out       = 1;
+    b.out_ids     = out;
+    return b;
+}
+
+/* Rows issued, summed by op: a slice's n is its rows, a whole step's RAD_N_BATCH is T. */
+std::map<std::string, int64_t> rows_by_op(const RadBuilder& b, const RadCtx& c, int64_t T) {
+    std::map<std::string, int64_t> w;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        w[o ? o->op : "<null>"] += i.n < 0 ? T : i.n;
+    }
+    return w;
+}
+
+/* The n of each issue of one op, in issue order. */
+std::vector<int64_t> ns_of(const RadBuilder& b, const RadCtx& c, const char* op) {
+    std::vector<int64_t> v;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (o && o->op == op) v.push_back(i.n);
+    }
+    return v;
+}
+
+bool noted(const RadBuilder& b, const char* text) {
+    for (const auto& n : b.notes)
+        if (n.find(text) != std::string::npos) return true;
+    return false;
+}
+
+}  /* namespace */
+
+/* A PREFILL CHUNK IN TWO SLICES (arch/gemma4, trunk_overlap). What a recorder can check is the
+ * order and the work: every reduction rides lane 1 behind its producer and ahead of its consumer,
+ * nothing else does, the cut is a whole number of routed passes, and the slices issue exactly the
+ * rows the whole step issues -- the same routed passes, the drafter's taps -- which is what makes
+ * the output the whole step's. A chunk under two passes, and a decode step, run whole on one
+ * lane. */
+TEST(a_gemma4_prefill_chunk_runs_as_two_slices_with_its_reductions_on_the_second_lane) {
+    const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    const int64_t E = 2816, L = 6;
+    auto model = [&](RadBuilder& b, bool off) {
+        RadModelMeta meta = gemma4_moe_meta();
+        meta.n_kv   = (int)keys.size();
+        meta.kv_key = keys.data();
+        meta.kv_val = vals.data();
+        RadBuildCtx ctx = build_ctx(0, 4);
+        ctx.max_tok  = 8192;
+        ctx.max_spec = 15;
+        if (off) setenv("RADIANCE_GEMMA4_OVERLAP", "0", 1);
+        const int st = gemma4::declare(&b, &meta, &ctx);
+        if (off) unsetenv("RADIANCE_GEMMA4_OVERLAP");
+        return st;
+    };
+    auto run = [&](RadBuilder& b, RadCtx& c, RadBatch& batch) {
+        c.b = &b; c.rank = 0; c.world = 4; c.batch = &batch;
+        gemma4::step(&c, &batch);
+    };
+
+    struct Case { int64_t T, cut; };
+    for (const Case k : { Case{8192, 4096}, Case{6144, 4096}, Case{6143, 2048}, Case{4096, 2048},
+                          Case{4095, 0} }) {
+        const int32_t out[1] = { (int32_t)(k.T - 1) };
+        RadBuilder b;
+        CHECK_OK(model(b, false));
+        CHECK(noted(b, "prefill overlap: a chunk of two routed passes"));
+        CHECK_EQ((int)b.concurrent.size(), 2);
+        for (const char* name : { "o", "ff2" })
+            CHECK(std::count(b.concurrent.begin(), b.concurrent.end(),
+                             (rad_buf)buf_named(b, name)) == 1);
+        RadBatch batch = one_prompt(k.T, out);
+        RadCtx c;
+        run(b, c, batch);
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(c.lane, 0);
+        CHECK_EQ(races(b, c), 0);
+
+        std::vector<int64_t> lane1;
+        for (const auto& i : c.issues) {
+            if (i.lane != 1) continue;
+            const RecOp* o = b.op_of(i.op);
+            CHECK(o && o->op == "all_reduce");
+            lane1.push_back(i.n);
+        }
+        if (k.cut == 0) {
+            CHECK(lane1.empty());
+            CHECK(c.joins.empty());
+        } else {
+            REQUIRE(lane1.size() == (size_t)(4 * L));
+            for (int64_t l = 0; l < L; ++l) {
+                CHECK_EQ(lane1[4 * l + 0], k.cut * E);               /* attention, slice A */
+                CHECK_EQ(lane1[4 * l + 1], (k.T - k.cut) * E);       /* attention, slice B */
+                CHECK_EQ(lane1[4 * l + 2], 2 * k.cut * E);           /* both arms, slice A */
+                CHECK_EQ(lane1[4 * l + 3], 2 * (k.T - k.cut) * E);   /* both arms, slice B */
+            }
+        }
+
+        /* The whole step, with the switch off: the same rows by op, the same routed passes. */
+        RadBuilder w;
+        CHECK_OK(model(w, true));
+        CHECK(noted(w, "prefill overlap: off (RADIANCE_GEMMA4_OVERLAP=0)"));
+        CHECK(w.concurrent.empty());
+        RadBatch wbatch = one_prompt(k.T, out);
+        RadCtx wc;
+        run(w, wc, wbatch);
+        CHECK(wc.step_fail.empty());
+        CHECK(wc.joins.empty());
+        CHECK(rows_by_op(b, c, k.T) == rows_by_op(w, wc, k.T));
+        CHECK(ns_of(b, c, "moe_gather") == ns_of(w, wc, "moe_gather"));
+        CHECK_EQ((int)ns_of(b, c, "cast").size(), k.cut ? 6 : 3);   /* three taps, a slice each */
+    }
+
+    /* A decode step never leaves lane 0. */
+    RadBuilder b;
+    CHECK_OK(model(b, false));
+    RadBatch d = decode_batch();
+    RadCtx c;
+    run(b, c, d);
+    CHECK(c.step_fail.empty());
+    CHECK(c.joins.empty());
+    for (const auto& i : c.issues) CHECK_EQ(i.lane, 0);
 }

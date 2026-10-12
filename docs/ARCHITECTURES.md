@@ -492,8 +492,8 @@ The readings that stay plausible when wrong:
   pre_feedforward_layernorm_2's output. `per_expert_scale` multiplies the weight AFTER the
   renormalised top-k.
 - **The arms' two post-norms are per arm**, so under tensor parallel each arm's partial sum is
-  reduced before its norm. The partials share one [2T, hidden] buffer, dense rows first, so one
-  all-reduce carries both.
+  reduced before its norm. The partials share one [2T, hidden] buffer, dense rows first -- each
+  slice's own run of it when a prefill chunk is cut in two -- so one all-reduce carries both.
 - **The embedding scale is sqrt(hidden) rounded to bf16**: 53.0, not 53.066. The drafter reads the
   same scaled embedding.
 - **The sliding layers' KV group is `RAD_KV_FULL`**, with the window on the attention op. A
@@ -510,6 +510,18 @@ width split; the router is replicated, so every rank agrees on the routing witho
 The drafter's head is vocab-sharded with the trunk's: each rank's top-2 are all-gathered and
 `pair_argmax` picks the winner (two a rank, because a row-interleaved `all_gather` moves 16-byte
 words and one pair is 8 bytes).
+
+**The prefill overlap.** At more than one rank, a prefill chunk of two routed passes or more (4096
+tokens, at the 2048-token pass) runs as two slices, and the trunk's all-reduces ride the runtime's
+second lane beside the other slice's compute: slice A's attention reduction runs under slice B's
+output projection, slice B's under slice A's two arms, and so on through the layer. Attention runs
+whole, since it reads every row's keys. The cut is a whole number of routed passes and both slices
+are above every row band the sliced kernels have, so the step issues the same kernels over the
+same rows and its output is the whole step's, bit for bit. On 4x R9700 the reductions were 47% of
+a 20K-token prefill under `--profile-ops`; a model of the measured times puts the overlap at up to
+a quarter off an unprofiled prefill. The per-op profile syncs every op, so it cannot show it --
+time a prefill without `--profile-ops`. `RADIANCE_GEMMA4_OVERLAP=0` runs every chunk whole, and the
+startup note says which. A decode step never takes the second lane.
 
 **The draft head in fp8.** The drafter's head is the widest read on the draft path: the target's
 bf16 table, 352 MiB a rank at tp 4, every draft pass. A container converted with the line
