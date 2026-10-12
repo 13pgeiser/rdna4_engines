@@ -862,7 +862,9 @@ quant type, size and shape. Each payload's sha256 is verified when it is read
 for upload. A sidecar that fails any check, names an unknown default, is not
 for a Flash-Next profile, or sits next to a base that already carries a trunk
 default marker is refused with one `REFUSED` line on stderr and the base
-weights run; an absent sidecar logs nothing.
+weights run; an absent sidecar logs nothing. Like the PLE sidecars, it is looked
+up next to the model file `hipfire serve`/`run` resolve (symlinks followed), so
+a symlinked model needs its sidecar beside the link target.
 
 Env `HIPFIRE_QWEN4_TRUNK_OVERLAY` selects the policy: `auto` (default; also
 unset) applies the sidecar only on the architecture of its default (gfx1151),
