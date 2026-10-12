@@ -1454,8 +1454,9 @@ fn g80_bf16_multiple_k2560_waves_reuse() {
 fn g80_bf16_rowmajor_poison_traffic_cycles_and_reuse() {
     use pm_npu::kernels::gemm_g80::{design_g80_bf16_layout, Bf16Layout, pack_a_bf16, pack_b_bf16};
     use pm_npu::kernels::w8a8_epi::bf16_direct;
-    for (m, k, pitch, col0) in [(200, 64, 2624, 32), (513, 64, 16640, 1280),
-        (200, 2560, 14080, 2560), (300, 2560, 2624, 32)] {
+    for (m, k, pitch, col0) in [14080, 16640].into_iter().flat_map(|pitch|
+        [200, 300, 1545, 1801].map(move |m| (m, 64, pitch, 1280)))
+        .chain([(200, 2560, 14080, 2560), (300, 2560, 2624, 32)]) {
         let native = design_g80(m, N, k, Epilogue::Bf16, Control::Fast);
         let d = design_g80_bf16_layout(m, N, k, Epilogue::Bf16, Control::Fast,
             Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 });
@@ -1503,37 +1504,39 @@ fn g80_bf16_rowmajor_poison_traffic_cycles_and_reuse() {
 fn g80_bf16_rowmajor_adjacent_panels_one_design_base_offset() {
     use pm_npu::kernels::gemm_g80::{design_g80_bf16_layout, Bf16Layout, pack_a_bf16, pack_b_bf16};
     use pm_npu::kernels::w8a8_epi::bf16_direct;
-    let (m, k, pitch, col0) = (300, 64, 2 * N + 64, 32);
-    let d = design_g80_bf16_layout(m, N, k, Epilogue::Bf16, Control::Fast,
-        Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: 0 });
-    let (a, b0) = pattern_b(m, k, false); let (_, b1) = pattern_b(m, k, true);
-    let ds = bf16_scales(m, 0);
-    let mut ah = Vec::new(); let mut bh = Vec::new();
-    let mut expected = vec![POISON; d.args[2].bytes + GAP];
-    let mut txn = Txn::aie2p_8col();
-    for (panel, b) in [&b0, &b1].into_iter().enumerate() {
-        let ss = bf16_scales(N, panel + 3);
-        let base = [ah.len() as u64, bh.len() as u64, (2 * (col0 + panel * N)) as u64];
-        ah.extend(pack_a_bf16(&d, &a, &ds)); bh.extend(pack_b_bf16(&d, b, &ss));
-        if panel == 0 { d.append_run_body(&mut txn, base); }
-        else { d.append_lean_run_body_same_design(&mut txn, base, &[]).unwrap(); }
-        let raw = cpu_reference(&a, b, m, N, k);
-        for row in 0..d.waves() * WAVE_M { for col in 0..N {
-            let bits = if row < m {
-                let (sm, se) = ss[col]; let (dm, de) = ds[row];
-                bf16_direct(raw[row * N + col], sm, se, dm, de)
-            } else { 0 };
-            let off = 2 * (row * pitch + col0 + panel * N + col);
-            expected[off..off + 2].copy_from_slice(&bits.to_le_bytes());
-        } }
+    for pitch in [14080, 16640] {
+        let (m, k, col0) = (2041, 64, 32);
+        let d = design_g80_bf16_layout(m, N, k, Epilogue::Bf16, Control::Fast,
+            Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: 0 });
+        let (a, b0) = pattern_b(m, k, false); let (_, b1) = pattern_b(m, k, true);
+        let ds = bf16_scales(m, 0);
+        let mut ah = Vec::new(); let mut bh = Vec::new();
+        let mut expected = vec![POISON; d.args[2].bytes + GAP];
+        let mut txn = Txn::aie2p_8col();
+        for (panel, b) in [&b0, &b1].into_iter().enumerate() {
+            let ss = bf16_scales(N, panel + 3);
+            let base = [ah.len() as u64, bh.len() as u64, (2 * (col0 + panel * N)) as u64];
+            ah.extend(pack_a_bf16(&d, &a, &ds)); bh.extend(pack_b_bf16(&d, b, &ss));
+            if panel == 0 { d.append_run_body(&mut txn, base); }
+            else { d.append_lean_run_body_same_design(&mut txn, base, &[]).unwrap(); }
+            let raw = cpu_reference(&a, b, m, N, k);
+            for row in 0..d.waves() * WAVE_M { for col in 0..N {
+                let bits = if row < m {
+                    let (sm, se) = ss[col]; let (dm, de) = ds[row];
+                    bf16_direct(raw[row * N + col], sm, se, dm, de)
+                } else { 0 };
+                let off = 2 * (row * pitch + col0 + panel * N + col);
+                expected[off..off + 2].copy_from_slice(&bits.to_le_bytes());
+            } }
+        }
+        let mut args = vec![ah, bh, vec![POISON; expected.len()]];
+        let mut sim = fresh(&d);
+        sim.submit(&txn.to_bytes(), &mut args).unwrap();
+        assert_eq!(args[2], expected, "adjacent panels and trailing guard");
+        let read: u64 = traffic(&sim).iter().filter(|s| s.1 == Direction::Mm2s).map(|s| s.3).sum();
+        let written: u64 = traffic(&sim).iter().filter(|s| s.1 == Direction::S2mm).map(|s| s.3).sum();
+        assert_eq!([read, written], [2 * d.host_bytes_read(), 2 * d.host_bytes_written()]);
     }
-    let mut args = vec![ah, bh, vec![POISON; expected.len()]];
-    let mut sim = fresh(&d);
-    sim.submit(&txn.to_bytes(), &mut args).unwrap();
-    assert_eq!(args[2], expected, "adjacent panels and trailing guard");
-    let read: u64 = traffic(&sim).iter().filter(|s| s.1 == Direction::Mm2s).map(|s| s.3).sum();
-    let written: u64 = traffic(&sim).iter().filter(|s| s.1 == Direction::S2mm).map(|s| s.3).sum();
-    assert_eq!([read, written], [2 * d.host_bytes_read(), 2 * d.host_bytes_written()]);
 }
 
 #[test]
@@ -1547,5 +1550,121 @@ fn g80_bf16_rowmajor_builder_bounds() {
         let d = build_panel_program_rowmajor(65536, pitch, 0).unwrap();
         assert_eq!(d.args[2].bytes, 65536 * pitch * 2);
         assert_eq!(d.waves(), 256);
+    }
+}
+
+/// Exercise the maximal 256-wave deployment with one output allocation, not
+/// a second multi-GiB expected arena. Constant K rows give an independent
+/// exact dot oracle while varying every token/feature scale and wave's data.
+#[test]
+fn g80_bf16_rowmajor_256_waves_both_pitches() {
+    use pm_npu::kernels::gemm_g80::{design_g80_bf16_layout, Bf16Layout, pack_a_bf16, pack_b_bf16};
+    use pm_npu::kernels::w8a8_epi::bf16_direct;
+    let (m, k, col0) = (65529, 64, 1280);
+    let av = |row: usize| (row % 127) as i32 - 63;
+    let bv = |col: usize| (col % 31) as i32 - 15;
+    let a: Vec<i8> = (0..m * k).map(|i| av(i / k) as i8).collect();
+    let b: Vec<i8> = (0..k * N).map(|i| bv(i % N) as i8).collect();
+    let ds = bf16_scales(m, 2);
+    let ss = bf16_scales(N, 5);
+    for pitch in [14080, 16640] {
+        let d = design_g80_bf16_layout(m, N, k, Epilogue::Bf16, Control::Fast,
+            Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 });
+        let mut sim = fresh(&d);
+        let mut args = vec![pack_a_bf16(&d, &a, &ds), pack_b_bf16(&d, &b, &ss),
+            vec![POISON; d.args[2].bytes + GAP]];
+        let inputs = [signature(&args[0]), signature(&args[1])];
+        let before = traffic(&sim);
+        sim.submit(&d.insts, &mut args).unwrap();
+        for row in 0..65536 {
+            let out = &args[2][2 * row * pitch..2 * (row + 1) * pitch];
+            assert!(out[..2 * col0].iter().all(|&v| v == POISON));
+            assert!(out[2 * (col0 + N)..].iter().all(|&v| v == POISON));
+            for col in 0..N {
+                let want = if row < m {
+                    let (dm, de) = ds[row]; let (sm, se) = ss[col];
+                    bf16_direct(k as i32 * av(row) * bv(col), sm, se, dm, de)
+                } else { 0 };
+                let at = 2 * (col0 + col);
+                assert_eq!(u16::from_le_bytes(out[at..at + 2].try_into().unwrap()), want,
+                    "256 waves pitch={pitch} row={row} col={col}");
+            }
+        }
+        assert!(args[2][d.args[2].bytes..].iter().all(|&v| v == POISON));
+        assert_eq!([signature(&args[0]), signature(&args[1])], inputs);
+        for (&(col, dir, ch, was), (_, _, _, now)) in before.iter().zip(traffic(&sim)) {
+            let bytes = match (dir, ch) {
+                (Direction::Mm2s, 0) => 2 * 5504,
+                (Direction::Mm2s, 1) => if col < 4 { 256 * 4608 } else { 0 },
+                (Direction::S2mm, 0 | 1) => 256 * 2 * 20480,
+                _ => panic!("unexpected shim channel"),
+            };
+            assert_eq!(now - was, bytes as u64);
+        }
+    }
+}
+
+#[test]
+fn g80_bf16_rowmajor_batch_descriptor_budget_and_instruction_counts() {
+    use pm_npu::kernels::gemm_g80::{design_g80_bf16_layout, Bf16Layout};
+    let ids = [[1, 4, 6, 7, 8, 9, 10], [3, 5, 11, 12, 13, 14, 15]];
+    for pitch in [14080, 16640] {
+        for waves in [1usize, 2, 7, 8, 32, 256] {
+            let d = design_g80_bf16_layout(waves * WAVE_M, N, 64, Epilogue::Bf16, Control::Fast,
+                Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: 1280 });
+            let native = design_g80(waves * WAVE_M, N, 64, Epilogue::Bf16, Control::Fast);
+            let ops = parse_txn(&d.insts).unwrap();
+            let native_ops = parse_txn(&native.insts).unwrap();
+            let batches = waves.div_ceil(7);
+            let mut c_blocks = 0; let mut c_patches = 0; let mut c_tasks = 0; let mut c_cuts = 0;
+            for op in &ops {
+                match op {
+                    TxnOp::BlockWrite(a, words) if a & 0x1ffffff >= 0x1d000 && a & 0x1ffffff < 0x1d200 => {
+                        let id = ((a & 0x1ffffff) - 0x1d000) / 32;
+                        assert!(id < 16, "shared shim BD pool");
+                        if ids.iter().flatten().any(|&v| v == id) {
+                            c_blocks += 1;
+                            assert_eq!(words[0], 10240);
+                            assert_eq!(words[3], 40 << 20);
+                            assert_eq!(words[4] & 0xfffff, pitch as u32 / 2 - 1);
+                            assert_eq!((words[4] >> 20) & 1023, 128);
+                            assert_eq!(words[5], (2 << 24) | 39);
+                            assert_eq!(words[6], 0, "no mutable iteration current");
+                            let (pair, index) = ids.iter().enumerate().find_map(|(pair, ids)|
+                                ids.iter().position(|&v| v == id).map(|index| (pair, index))).unwrap();
+                            let next = if index + 1 < waves.min(7) {
+                                (1 << 26) | (ids[pair][index + 1] << 27)
+                            } else { 0 };
+                            assert_eq!(words[7], (1 << 25) | next);
+                        } else { assert!(id == 0 || id == 2, "A/B only"); }
+                    }
+                    TxnOp::DdrPatch { arg: 2, plus, .. } => {
+                        c_patches += 1;
+                        let elem = *plus as usize / 2;
+                        let row = elem / pitch;
+                        let col = elem % pitch;
+                        assert!(row < waves * WAVE_M);
+                        assert!(row % 128 == 0);
+                        assert!((1280..2560).contains(&col) && (col - 1280) % 160 == 0);
+                    }
+                    TxnOp::Write(a, _) if a & 0x1ffffff == 0x1d204 || a & 0x1ffffff == 0x1d20c => c_tasks += 1,
+                    TxnOp::Write(a, _) if a & 0x1ffffff >= 0x1d000 && a & 0x1ffffff < 0x1d200 => c_cuts += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(c_blocks, 16 * waves.min(7));
+            assert_eq!(c_patches, 16 * waves);
+            assert_eq!(c_tasks, 16 * batches);
+            let cuts = usize::from(waves > 7 && waves % 7 != 0) * 16;
+            assert_eq!(c_cuts, cuts);
+            assert_eq!(ops.iter().filter(|op| matches!(op, TxnOp::Sync { .. })).count(), 2 * batches);
+            let row_ops = 16 * waves.min(7) + 16 * waves + 18 * batches + cuts;
+            // Native shim C: 16 descriptors, patches, tasks and two SYNCs.
+            let old_ops = native_ops.len() - 50 + 82 * waves;
+            assert_eq!(ops.len(), native_ops.len() - 50 + row_ops);
+            assert!(ops.len() <= old_ops);
+            eprintln!("rowmajor pitch={pitch} W={waves}: {} ops / {} B; previous {old_ops} ops; native {} ops / {} B",
+                ops.len(), d.insts.len(), native_ops.len(), native.insts.len());
+        }
     }
 }

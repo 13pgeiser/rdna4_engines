@@ -139,8 +139,9 @@ M256/M8192 PDI/TXN hashes are pinned alongside the unchanged int8/I32 pins.
 No retile or additional DMA transfer: the memtile MM2S drain uses four
 inner-first `(step,wrap)` dimensions in 32-bit words:
 `(1,4), (32,10), (4,8), (320,0)`. These read the native 8x8 blocks in
-row order. The two shim tile BDs on each C channel then scatter each
-128x80 tile with `(1,40), (pitch/2,0)`; transfer length is 5120 words.
+row order. One shim BD per channel/wave scatters both 128x80 parity tiles
+with `(1,40), (pitch/2,128), (40,0)`; transfer length is 10240 words.
+The outer +40-word step returns to row zero at the adjacent 80-column tile.
 Fields are `Bd::memtile_words` words 2..5 (17-bit step-minus-one,
 10-bit wraps) and `Bd::shim_words` words 3..5 (20-bit step-minus-one,
 10-bit wraps), transcribed from aie-rt
@@ -149,11 +150,37 @@ and [`xaie_dma_aieml.c`](https://github.com/Xilinx/aie-rt/blob/release/main_aig/
 Unused outer wrap is zero; length terminates the outer dimension.
 
 At pitches 14080/16640, a 256-row wave step exceeds the shim's 20-bit
-stride/iteration field. The TXN therefore SYNCs both C channels per wave
-before rewriting/requeueing the same two-tile BD chains with the next row
-base. A/B are queued once for the entire submit. This supports all 256
-waves without descriptor/queue overflow; firmware command overhead is not
-covered by the phase-sum cycle estimate.
+stride/iteration field. The drain instead batches **K=7 waves**, with absolute
+DDR addresses for every wave. AIE2P has **16 shared shim BDs per tile**, not
+16 per channel (`Bd::address`, four-bit NEXT_BD in `Bd::shim_words`, and the
+[vendor register fields](https://github.com/Xilinx/aie-rt/blob/release/main_aig/driver/src/global/xaie2pgbl_params.h)).
+B=0 and A=2 remain live. C uses seven BDs per channel:
+S2MM0 `[1,4,6,7,8,9,10]`, S2MM1 `[3,5,11,12,13,14,15]`.
+All 16 BDs are used on A-injecting columns (15 otherwise). Two BDs per wave
+leave room for at most seven complete waves without borrowing A/B descriptors
+or changing stream bytes/order.
+
+Each channel gets one finite seven-wave chain/task and one completion token.
+Both C SYNCs precede every refresh. The first batch of every full or lean
+body writes its C descriptors; later batches refresh **DDR patches only**.
+Iteration wrap=1 keeps `current=0`. A partial final batch cuts its last
+links with two tail-word writes per column; the next body's initial writes
+restore the chain. Ring POLL/SENT/DONE temporarily borrow 4/5/6 outside the
+completed GEMM body, so initial C writes are never omitted by same-design
+lean bodies. A/B still queue once per submit; the API and panel base offsets
+are unchanged. No extra data transfer, channel, stage or memtile/core BD.
+
+For W waves and H=ceil(W/7), C drain TXN operations are
+`16*min(W,7) + 16*W + 18*H + 16*(W>7 && W%7!=0)`,
+versus the previous `82*W` and native-tile `50` (descriptor writes,
+patches, task writes, two aggregate SYNCs). At W=32 this is **730 vs 2624**
+C ops (72.2% fewer); SYNCs/tasks fall from 32 to 5 pairs (84.4% fewer)
+and descriptor block writes from 1024 to 112 (89.1% fewer).
+At W=256: **4890 vs 20992** C ops, 37 vs 256 SYNC/task pairs.
+TXN bytes/counts change; the PDI, native BF16 TXN and int8/I32 golden bytes
+remain unchanged. Expected firmware overhead is substantially reduced, but
+recovery of the measured 9% throughput loss is a silicon gate, not a claim.
+Firmware command overhead is not covered by the phase-sum cycle estimate.
 
 Build one design with col0=0 per pitch/row bound. All 11 QsaIn / 13 GdnIn
 panels can reuse its PDI and program; advance arg2's base by `2*panel*1280`
@@ -162,21 +189,27 @@ arena behind the offset, and enforce `panel_col0+1280 <= pitch`.
 Alternatively the explicit col0 builder changes DDR patch offsets only.
 Shim traffic remains A `4*W*kc*4608`, B `8*kc*2*5504`, C
 `8*W*4*20480` bytes: the phase-sum estimate is unchanged from native tiles.
-The exercised functional simulator reports identical row-major/native ticks:
-M200 K64 **102066**, M513 K64 **289334**, M200 K2560 **209386**,
-M300 K2560 **357502** (pitches 2624/16640/14080/2624 respectively).
-These are modelled timings, not firmware latency or silicon measurements.
+Simulator coverage includes 1, 2, K, K+1 and 256 waves at both fused pitches,
+full/lean reuse, adjacent panels sharing an offset arena, padded zeros,
+outside-window poison and exact shim bytes. Tests compare TXN op counts with
+the previous per-wave drain and native tiles; functional ticks are modelled
+timings, not firmware latency or silicon measurements.
 
-Silicon command (not run by this change):
+Silicon commands (not run by this change; repeat at pitch 14080):
 
 ```sh
+# Every live value, padded zero and outside-window poison checked.
 target/release/npu-gemm 8192 1280 2560 --variant G80 --epi bf16 \
   --rowmajor-pitch 16640 --rowmajor-col0 1280 --iters 3 --reuse-ctx
+# Same exact first/final-poison checks, with busy-region TOPS over 15 seconds.
+target/release/npu-gemm 8192 1280 2560 --variant G80 --epi bf16 \
+  --rowmajor-pitch 16640 --rowmajor-col0 1280 --loop 15
+target/release/npu-gemm 8192 1280 2560 --variant G80 --epi bf16 --loop 15
 ```
 
-The CLI checks every live value against `bf16_direct`, zero padded rows,
-and poison bytes outside the panel window. The row-major drain is proven on
-Halo at 15.05 TOPS; the serving cutover still requires the parent-run gates below.
+The previous per-wave row-major drain measured 15.05 TOPS on Halo versus
+16.48 TOPS native; the batched drain needs fresh silicon exactness/performance
+validation and the serving cutover still requires the parent-run gates below.
 
 ## GPU Bf16Direct glue
 
@@ -223,16 +256,33 @@ and integer GEMMs; any mismatch exits 1. CPU layout/map tests:
 
 ## Stored calibration and deterministic planning (0.4.2)
 
-`Calibration::{load,store,validate,key_matches}` uses schema version 2 JSON.
-All fields are required; missing inputs, unknown fields, invalid numeric costs,
-unknown versions and inconsistent epilogues are errors. `CalKey` consists of
-`device.{arch,pci_bdf,npu_fw_version}`, caller-supplied `build` (the measured
-daemon git SHA/binary identity, not the calibration CLI's identity),
-`kernel.{uname_release,perfopt_armed}`, `model_sha256` (64 hex digits),
-`epilogue` (`bf16` or `i32`), and `trunk_route` (`stock` or
-`overlay:<marker>`, e.g. `overlay:gfx1151-zab-v1`). A key mismatch returns the
-first mismatching field in that order. The load caller must log `npu-trunk: off (reason)` and
-leave the route off; loading never recalibrates or opens hardware.
+`Calibration::{load,store,validate,key_matches}` uses schema version **3** JSON.
+Measured fields are mandatory; only an omitted `key.build` defaults to the
+release contract. Unknown fields/versions and invalid costs are errors.
+Runtime `CalKey` derives:
+
+* `device.arch`: the selected GPU's architecture; `device.pci_bdf`: HIP's PCI
+  bus ID, lowercase; `device.npu_fw_version`: trimmed
+  `/sys/class/accel/accel0/device/fw_version` (the amdxdna device railgun opens).
+* `build`: `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`, shared by serving and
+  `calibrate-npu-trunk`; no git SHA and no binary hashing.
+* `kernel.uname_release`: trimmed `uname -r`. The recorded PerfOpt arming
+  signal is `AMD-Vi: PerfOpt armed` in privileged dmesg, not a readable
+  sysfs/proc ABI. Schema 3 therefore drops `perfopt_armed`, rather than inventing
+  a boolean from a kernel name. Recollect if boot arming changes under the same
+  release: this key cannot distinguish that case.
+* `model_index_sha256`: HFQ bytes `[0,data_offset)`, using
+  `HfqFile::index_sha256`, exactly the trunk-overlay binding convention.
+  The verified local `qwen3.8-flash-next-gptq3.mq4` has `data_offset=14442496`
+  and index SHA256 `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013`.
+  No 125-GB full-file hash is computed at load.
+* `epilogue`: serving uses `bf16`; `trunk_route`: `stock` or
+  `overlay:<marker>` from the **successful overlay outcome**, not its presence.
+
+Mismatch reasons name the first differing field in this order. Loading stored
+calibration never measures or recalibrates. The two `g80bf16-{stock,overlay}-v2.json`
+lab files and corresponding fixtures retain their historical filenames but now
+carry schema 3 identity; measured cost inputs and Python/Rust cost goldens are unchanged.
 
 `plan(&Calibration, FamilyMask, rows) -> Plan` and
 `crossover(&Calibration, FamilyMask) -> Option<usize>` port the reference
@@ -293,14 +343,14 @@ hipfire calibrate-npu-trunk --from measurements.json --out cal.json
 ```
 
 This command assembles and validates an already measured record; it does **not**
-perform measurements, probe hardware, fit contention, or silently fill defaults.
-The measurements schema is the same as the schema-version-2 output record:
+perform measurements, probe hardware, fit contention, or default measured costs.
+The measurements schema is the same as the schema-version-3 output record:
 
-* `schema_version: 2`, `margin` and the complete current `key` described above.
-  The collector supplies device/firmware, PerfOpt, measured build, model digest,
-  epilogue, and trunk-route identity. The CLI additionally checks `uname -r` against the
-  collector's key and refuses a kernel mismatch. The eventual load caller must
-  compare **all** key fields to its actual runtime identity.
+* `schema_version: 3`, `margin` and the current `key` described above.
+  The collector supplies device/firmware, kernel release, model **index** digest,
+  epilogue and trunk route. Omitted `key.build` uses the stable release/NPU
+  contract. The CLI checks `uname -r` and refuses a kernel mismatch. Serving
+  compares **all** key fields to its runtime identity.
 * `gpu.trunk_in_ms_per_8192`: required `qkv`, `zab`, `q`, `kvidx` millisecond
   totals across the respective 36/12 layers from kernel-trace attribution.
   `gpu.uniform_per_layer_ms`, `gdn_core_per_layer_ms`, `qsa_per_layer_ms`,
@@ -355,13 +405,37 @@ CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
 nice -n 19 cargo test -p hipfire-arch-qwen4 --lib npu_trunk -j 12
 ```
 
-## First-light serving route (Linux gfx1151, family B)
+## Calibrated serving route (Linux gfx1151, family B)
 
-`HIPFIRE_QWEN4_NPU_TRUNK=off|emulate|on` is resolved when the forward
-owner loads. `off` returns before packing, NPU/GPU allocations, device opens
-or trace-file opens. The ordinary chunk executor is unchanged except for
-inactive option checks. `auto` is explicitly refused until calibrated admission
-is wired; it is not a silent fallback from `on`.
+`HIPFIRE_QWEN4_NPU_TRUNK=off|auto|on|emulate` is resolved at load.
+`off` stays the default and returns before index hashing, calibration reads,
+packing, new allocations, device opens, trace opens or new logging.
+`fusions.npu_trunk_calibration` (alias `npu_trunk_calibration`, env
+`HIPFIRE_QWEN4_NPU_TRUNK_CAL`) defaults, when empty, to
+`<hipfire home>/npu-trunk/calibration.json`.
+
+| Mode | Calibration missing/invalid/key mismatch | Match: all selected | Match: subset/none |
+| --- | --- | --- | --- |
+| `off` | No I/O | GPU-only | GPU-only |
+| `auto` | Route off, one reason line | Admit stored plan | Route off, subset/none reason |
+| `on` | `calibration=none (forced)` | Log selection; force all families | Log selection; force all families |
+| `emulate` | Same as `on`, GPU twin | Same as `on`, GPU twin | Same as `on`, GPU twin |
+
+An auto key mismatch logs exactly `npu-trunk: off (calibration key mismatch: <field>)`.
+Matching records log `load_log_line` with selection, key/hash, crossover and
+predicted 16K/64K times. Subset execution is not implemented in 0.4.2.
+Auto derives n* once at load. Each request's uncached prompt segment runs
+`plan(cal, ALL, rows)` and logs `request_log_line` once. Only natural planned
+8192+B pairs, with B >= `max(512, cal.gpu.min_bank_rows)`, execute above n*.
+Split/rebalanced/rebanked ranges are projected to ordinary GPU chunks, never
+force-paired. The logged executable projection reflects those restrictions;
+snapshot boundaries may additionally veto a candidate pair.
+
+For both current stock and overlay records, executable pair starts/lengths are:
+8000 and 9000: none; 16343: `(0,16343)`; 20000: `(0,16384)`;
+57544: `(0,16384),(16384,16384),(32768,16384)` with a GPU tail;
+65536: those three plus `(49152,16384)`. n* is 6848 stock / 8256 overlay,
+but the executor cannot run the planner's smaller split-bank candidates.
 
 The opt-in route requires Flash-Next K=2560 and stock MQ6G256V2 for all eight
 input families. In `attach_forward`, preparation downloads each stock matrix
@@ -374,18 +448,18 @@ adding a transfer or a second preparation pass.
 
 Both arms still load the beta `<model>.trunk-overlay`. Covered z/a/b use W8 from
 the **stock MQ6**, never the replacement QT44 bytes. The existing load line adds
-`trunk_route=overlay(gfx1151-zab-v1)|stock` (only successfully applied overlays
+`trunk_route=overlay:gfx1151-zab-v1|stock` (only successfully applied overlays
 count) and `zab_source=stock-MQ6-DtoH-before-overlay|stock-MQ6-DtoH`, alongside
 `download_ms`, `pack_ms`, resident weight bytes and runtime status.
 `off` does no download, packing, allocation or new logging; its existing mode
 read moves before overlay application, whose payloads and native route are
-unchanged. `on` additionally opens two fixed 8192-row row-major G80 programs,
+unchanged. `on` and admitted `auto` open two fixed 8192-row row-major G80 programs,
 resident 13/11-panel chains, and two banks each with registered A plus separate
-GDN/QSA C arenas; any admission/open error fails
-the load. Calibration is deliberately bypassed with `first-light-force-pairs`.
+GDN/QSA C arenas; hardware open errors fail the load. Auto rejects an unsupported
+scratch/placement plan without opening the NPU.
 
 Both `on` and `emulate` use the same deterministic, segment-local pair plan.
-Only paired banks use BF16-direct numerics: `on` consumes NPU results, while
+Only paired banks use BF16-direct numerics: `on`/`auto` consume NPU results, while
 `emulate` executes the exact IU8 twin sequentially, one bank at a time.
 Unpaired chunks/tails, rows below 512, decode and uncovered paths retain the
 incumbent GPU projections in **both** modes: z/a/b take the same A4/IU4 overlay
@@ -449,8 +523,25 @@ event after that wait and pack; the relay queries this event to completion
 before submitting the next chain. Thus
 `old C reads -> retired -> prepare wait -> pack -> ready -> next NPU C writes`,
 even when the next layer changes shape. No arena is overwritten early.
-The transport's checked GPU wait remains host-gated; this is not a CPU-free
-rejoin and the relay submits NPU chains serially.
+`wait_gpu` now enqueues the per-bank monotonic GEQ terminal-signal wait and
+system acquire event immediately, without a host-completion gate; retirement
+also records its event without waiting on the host. The following complete `G`
+fragment is therefore issued ahead of NPU completion. The relay remains serial.
+Bounded host checks at bank reuse protect the ready-event generation, but depend
+only on previously issued A production/NPU work, never an unqueued fragment or
+the just-enqueued `G`. In `prepare/kick(l+1,A)` the checked chain is NPU(l,A),
+whose terminal signal must precede GPU G(l,A): this dependency resolves by
+G(l,A)'s start, leaving the host free to enqueue wait(l,B)+G(l,B) while G(l,A)
+runs. Retirement itself is a GPU stream dependency, not a host wait for G(l,A).
+
+Every kick receives a terminal signal, including relay errors, a 300 ms
+chain-only watchdog (5x the measured ~60 ms chain), relay unwind and shutdown.
+The registered signal is terminal rather than success-only; failures are sticky
+and stored before releasing the GPU. Retire checks known errors, and pair-end
+waits/checks finish before heads/capture or state commits. Failed pair results
+are discarded and the request errors; late success cannot clear a failure.
+Shutdown releases pending waits before joining the relay, then checks retirement
+before unregistering/freeing (or quarantines still-live operands).
 
 The exact live readers (pitch/col0 in BF16 elements) are:
 
@@ -494,13 +585,13 @@ generic target loops now offer up to two chunks to the target instead of
 pre-splitting every request at 8192. CLI TTFT bench and fresh singleton HTTP
 chat requests both dispatch through these same generate routes.
 
-Only `on` doubles `spec_hidden` to 16384 rows; verify windows and MTP append
+`on` and admitted `auto` double `spec_hidden` to 16384 rows; verify windows and MTP append
 scratch keep their original capacities. MTP head append still runs separate
 A/B subchunks with the original fill-row boundaries and prompt-ID uploads:
-bank B reads hidden rows starting at 8192 under `on`, or 0 after its separate
+bank B reads hidden rows starting at 8192 under `on`/`auto`, or 0 after its separate
 target forward under `emulate`. Pending hidden names the last row of B.
 Only the final bank of a prompt-ending pair runs the target pick; other pairs
-capture silently. Each request logs its first scheduled pair once:
+capture silently. Forced modes log their first scheduled pair once:
 `npu-trunk: pair rows=8192+8151 position=0` for a 16343-row fresh prompt.
 
 A pair may cross a session snapshot boundary **only at A's end**. The default
@@ -524,6 +615,12 @@ The mixer interval covers the complete `G` fragment, including HC/MoE.
 HIP timing events are resolved only after the pair, relative to a monotonic
 anchor calibrated after initialization and **before** pipeline work; its host
 bracket width is reported as uncertainty. There is no per-layer GPU sync.
+`gpu_wait_enqueue_ns` records the actual enqueue-ahead call and should precede
+`npu_done_ns` while work overlaps. Relay submit/done timestamps are harvested at
+the next bank reuse, before its generation changes, and at the final pair check;
+no host completion lookup is added at rejoin. The transport gate additionally
+asserts enqueue-before-done on every exact round and prints NPU-done→GPU-resume
+event latency with clock-anchor uncertainty, plus a forced-watchdog release test.
 No trace records are emitted for GPU-only tails or `emulate`.
 
 ### Parent's Halo gate
@@ -599,7 +696,7 @@ Continuous-batch/lane `prefill_wave` is not paired; its tiles retain the native
 GPU route in both arms. A singleton pair may cross a snapshot boundary only
 when it is exactly the A/B split. An interior A or B boundary still splits the
 schedule; message-end cadence and cache scope are unchanged. EP, compact scratch,
-calibrated `auto`, variable-size NPU programs and CPU-free waits remain outside first light.
+calibrated `auto` and variable-size NPU programs remain outside first light.
 CPU scheduling/capture/retirement tests live under
 `gpu_forward::npu_forward::tests`; existing MTP tests cover head append IDs
 and pick boundaries. Full-model greedy comparison and trace overlap

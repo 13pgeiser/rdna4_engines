@@ -1612,30 +1612,44 @@ fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3], bd_words: bool, s
             Task { direction, channel, bd, repeat, issue_token: token }.emit_txn(shim, txn);
         }
     }
-    if geo.topo.bf16_rowmajor().is_some() { emit_rowmajor_wave(txn, geo, base[2], 0); }
+    if geo.topo.bf16_rowmajor().is_some() { emit_rowmajor_batch(txn, geo, base[2], 0); }
 }
 
-/// Two tiles per C channel, row-major in the memtile stream. Only one wave's
-/// BDs is resident at a time: the shim's 20-bit outer stride cannot encode a
-/// 256-row jump at fused pitches 14080/16640. SYNC protects every rewrite.
-fn emit_rowmajor_wave(txn: &mut Txn, geo: &Geometry, base: u64, wave: usize) {
+/// The shim has 16 BDs TOTAL (not per channel). B=0 and A=2 stay live;
+/// fourteen C BDs hold seven waves, seven per channel. One BD scatters both
+/// 128x80 parity tiles: 40 words per row, 128 rows, then +40 words to parity1.
+/// No wave stride is encoded: every wave has an absolute DDR patch.
+const ROWMAJOR_BATCH_WAVES: usize = 7;
+const ROWMAJOR_C_BDS: [[u32; 7]; 2] = [[1, 4, 6, 7, 8, 9, 10], [3, 5, 11, 12, 13, 14, 15]];
+
+/// One finite chain per C channel, one completion token per batch. After
+/// both SYNCs, only addresses need refreshing: iteration wrap=1 leaves
+/// `current` at zero. A partial final batch cuts its last link only.
+/// Each body's first batch rewrites all active C words, also restoring links
+/// cut by the preceding run (including same-design lean/ring bodies).
+fn emit_rowmajor_batch(txn: &mut Txn, geo: &Geometry, base: u64, wave: usize) {
     let (pitch, col0) = geo.topo.bf16_rowmajor().unwrap();
+    let count = (geo.waves - wave).min(ROWMAJOR_BATCH_WAVES);
     for col in 0..geo.topo.cols {
         let shim = shim_loc(col as u32);
-        for pair in 0..2 {
-            let first = 1 + pair as u32 * 2;
-            for parity in 0..2 {
-                let id = if parity == 0 { first } else { 4 + pair as u32 };
-                let mut bd = Bd::new(0, 5120);
+        for (pair, ids) in ROWMAJOR_C_BDS.iter().enumerate() {
+            for index in 0..count {
+                let id = ids[index];
+                let mut bd = Bd::new(0, 10240);
                 bd.dims[0] = dma::Dim { step: 1, wrap: 40 };
-                bd.dims[1] = dma::Dim { step: (pitch / 2) as u32, wrap: 0 };
-                if parity == 0 { bd.next = Some(4 + pair as u32); }
-                bd.emit_txn(shim, id, txn);
-                let row = wave * G80_WAVE_M + pair * 128;
-                let column = col0 + (2 * col + parity) * 80;
+                bd.dims[1] = dma::Dim { step: (pitch / 2) as u32, wrap: 128 };
+                bd.dims[2] = dma::Dim { step: 40, wrap: 0 };
+                bd.next = (index + 1 < count).then(|| ids[index + 1]);
+                if wave == 0 {
+                    bd.emit_txn(shim, id, txn);
+                } else if index + 1 == count && count < ROWMAJOR_BATCH_WAVES {
+                    txn.write32(Bd::address(shim, id) + 28, bd.shim_words()[7]);
+                }
+                let row = (wave + index) * G80_WAVE_M + pair * 128;
+                let column = col0 + 2 * col * 80;
                 txn.ddr_patch(Bd::address(shim, id) + 4, 2, base + (2 * (row * pitch + column)) as u64);
             }
-            Task { direction: S2mm, channel: pair as u32, bd: first, repeat: 1, issue_token: true }.emit_txn(shim, txn);
+            Task { direction: S2mm, channel: pair as u32, bd: ids[0], repeat: 1, issue_token: true }.emit_txn(shim, txn);
         }
     }
 }
@@ -1643,8 +1657,8 @@ fn emit_rowmajor_wave(txn: &mut Txn, geo: &Geometry, base: u64, wave: usize) {
 fn emit_output_tail(txn: &mut Txn, geo: &Geometry, per_column: bool, base: u64) {
     emit_sync(txn, geo.topo, per_column);
     if geo.topo.bf16_rowmajor().is_some() {
-        for wave in 1..geo.waves {
-            emit_rowmajor_wave(txn, geo, base, wave);
+        for wave in (ROWMAJOR_BATCH_WAVES..geo.waves).step_by(ROWMAJOR_BATCH_WAVES) {
+            emit_rowmajor_batch(txn, geo, base, wave);
             emit_sync(txn, geo.topo, per_column);
         }
     }
