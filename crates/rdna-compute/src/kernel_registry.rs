@@ -416,6 +416,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("attention_flash_fp8_e4m3_tile_batched", assemble_asym(kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC), ["attention_flash_fp8_e4m3_tile_batched", "attention_flash_q8_0_tile_batched"]);
         add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
         add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
+        add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
         add!("dflash_gdn_replay_pre_ml", crate::dflash_gdn_replay::DFLASH_GDN_REPLAY_PRE_ML_SRC, ["dflash_gdn_replay_pre_ml"]);
         add!("fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_FDIV_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv"]);
         add!("fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast", kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_TOKFAST_SRC, ["fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast"]);
@@ -432,6 +433,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qwen35_fa_prep_fp8q_nogate_batched_gfx1201", crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1201_SRC, ["qwen35_fa_prep_batched_gfx1201", "qwen35_fa_prep_fp8q_batched_gfx1201", "qwen35_fa_prep_fp8q_nogate_batched_gfx1201"]);
         add!("select_regrid", crate::select_regrid::SELECT_REGRID_SRC, ["argmax_f32_batched_regrid", "topk_values_regrid_f32"]);
         add!("sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab", kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SLAB_SRC, ["sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab"]);
+        add!("sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab", kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SLAB_SRC, ["sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab"]);
         add!("topk_values_fixup_f32", crate::select_regrid::TOPK_VALUES_FIXUP_SRC, ["topk_values_fixup_f32"]);
     }
     if arch == "gfx1100" {
@@ -1285,6 +1287,7 @@ const QWEN36_27B_GFX1201_AR_HIP: &[RouteHip] = &[
     ("attention_flash_reduce_dsplit_gfx1201", &["attention_flash_reduce_dsplit_gfx1201"]),
     ("attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", &["attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201"]),
     ("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", &["attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201"]),
+    ("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201", &["attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201"]),
     ("attention_fp8_e4m3_kv_batched", &["attention_fp8_e4m3_kv_batched"]),
     ("attention_verify_gqa_gfx1201", &["attention_verify_gqa_fp8_gfx1201", "attention_verify_reduce_gfx1201"]),
     ("conv1d_silu_split_qknorm_b256", &["conv1d_silu_split_qknorm_b256"]),
@@ -1339,6 +1342,7 @@ const QWEN36_27B_GFX1201_AR_HIP: &[RouteHip] = &[
     ("sample_top_p_parallel_w64", &["sample_apply_repeat_penalty_w64", "sample_topk_partial_w64", "sample_topk_finalize_w64"]),
     ("sigmoid_mul", &["sigmoid_mul_f32"]),
     ("sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab", &["sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab"]),
+    ("sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab", &["sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab"]),
 ];
 
 /// Native-MTP additions to [`QWEN36_27B_GFX1201_AR_HIP`] for the sidecar
