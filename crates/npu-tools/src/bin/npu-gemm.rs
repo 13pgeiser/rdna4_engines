@@ -10,7 +10,7 @@
 //!        npu-gemm M N K --variant V1|V2|V3|V4|V5|V6|V6b [--core Fast|Serial|LockOnly|FastSlowCtl|ClockProbe] [--probe-iters N] [--iters I] [--timeout-ms T] [--dump-status]
 //!        npu-gemm M N K --variant V8|V9|V10 [--epi i32|int8] [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]
 //!        ... [--memory native|vmm-host|vmm-host-uncached] [--burst 0..3] [--axcache 0..15] [--axqos 0..15]
-//!        npu-gemm M 1280 K --variant G80 [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]   (int8 epilogue only, N exactly 1280, K a multiple of 64 up to 2560; `--b-prefix` is V10-only and exits 2)
+//!        npu-gemm M 1280 K --variant G80 [--epi i32|int8] [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]   (N exactly 1280, K a multiple of 64 up to 2560; `--epi i32` rejects `--shift`; `--b-prefix` is V10-only and exits 2)
 //!        npu-gemm M N K --variant V10 --b-prefix [same V8|V9|V10 options]             (B prefix mode; V10 only)
 //!        npu-gemm TOKENS FEATURES K --fold-contract ief15 [--iters N] [--loop SECS] [--reuse-ctx] [--lean] [--switch-with T2,F2,K2] [--timeout-ms T] [--dump-status]   (IEF15 N0 probe; K a multiple of 128 with 1..=136 epochs)
 //!        npu-gemm --ief15-probe [--col C] [--timeout-ms T] [--dump PATH] [--dump-status] [--expected-only]   (IEF15 N0 single-core semantics probe: expected bytes from the simulator running the exact PDI+TXN, one fresh-context submit, per-case MATCH/MISMATCH table; `--expected-only` never touches the hardware)
@@ -58,6 +58,10 @@
 //! `--variant V9` is the resident-B nw-outer design (`gemm_array::design_v9`, same pair core as V8, dynamic TXN,
 //! context reusable); it takes the same `--shift`/`--core`/`--ctl-probe`/`--reuse-ctx`/`--loop` controls as V8 but is
 //! Int8-epilogue only: `--epi i32` exits 2.
+//! `--variant G80` is the G80 design (`gemm_g80::design_g80`, N exactly 1280, K a multiple of 64 up to 2560;
+//! same `--core`/`--ctl-probe`/`--a-from-hip`/`--reuse-ctx`/`--loop` controls as V8). It takes `--epi int8` (default,
+//! `--shift S`) or `--epi i32` (exact int32 C, `--shift` rejected); every output word of either epilogue is compared with
+//! `ArrayDesign::reference`/`unpack_out`. The G80 i32 epilogue is verified on the simulator only: no silicon validation.
 //! `--variant V10` is the mw-outer both-operands-resident design (`gemm_array::design_v10`, same pair core and
 //! compact C as V9, dynamic TXN, context reusable): the whole B segment (`NW*kc*4096` words per row) stays resident in
 //! the memtile and is replayed for every M-wave while A is streamed per M-wave (wave order `w = mw*NW + nw`), so each
@@ -474,7 +478,7 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         });
         match opt_str(args, "--epi").unwrap_or("int8").to_ascii_lowercase().as_str() {
             "int8" => Some(Epilogue::Int8 { shift: shift.unwrap_or(12) }),
-            "i32" if v9 || v10 || g80 => { eprintln!("--variant {} supports --epi int8 only (the int32 epilogue is not implemented for V9/V10/G80)", variant.as_ref().map_or("V9", |v| v.name())); std::process::exit(2) }
+            "i32" if v9 || v10 => { eprintln!("--variant {} supports --epi int8 only (the int32 epilogue is not implemented for V9/V10)", variant.as_ref().map_or("V9", |v| v.name())); std::process::exit(2) }
             "i32" if shift.is_none() => Some(Epilogue::I32),
             "i32" => { eprintln!("--shift needs --epi int8"); std::process::exit(2) }
             other => { eprintln!("--epi must be i32 or int8, got {other:?}"); std::process::exit(2) }

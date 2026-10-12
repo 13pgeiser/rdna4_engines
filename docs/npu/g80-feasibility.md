@@ -3,7 +3,9 @@
 G80 is an explicit opt-in Rust-emitted int8 GEMM for XDNA2: `gemm_g80::design_g80(m,n,k,epi,ctl)` and
 `npu-gemm --variant G80`. It uses 32 cores, 128x80 core tiles and a 256x1280 array wave. N must equal 1280;
 K must be a positive multiple of 64 no greater than 2560; positive M is padded to 256-row waves (at most 256 waves).
-Only the int8 floor/shift/saturate epilogue is supported, with shift 0..31 and fixed core layout 0.
+The default epilogue is the int8 floor/shift/saturate SRS (shift 0..31); an opt-in simulator-only int32 epilogue
+(`Epilogue::I32`, `npu-gemm --variant G80 --epi i32`, no `--shift`) is described in "I32 epilogue (simulator-only)".
+Both use the fixed core layout 0.
 Fast, slow control, serial, nocompute and repeat probes use the existing pair-lock protocol.
 Nocompute/repeat are timing probes, not ordinary GEMM results.
 
@@ -651,6 +653,64 @@ more material. No new numeric GEMM, ABI, grouped-expert refill protocol or small
 In particular, overlapping the next expert's B fill with old expert replays would require independent
 retirement/EMPTY proofs; grouping a launch by itself does not authorize overwriting the400-KiB resident segment.
 
+## I32 epilogue (simulator-only)
+
+`gemm_g80::design_g80(m,n,k,Epilogue::I32,ctl)` and `npu-gemm M 1280 K --variant G80 --epi i32` (`--shift` rejected,
+V9/V10 still int8-only) store the exact int32 C instead of SRS int8 tiles. This is a simulator-level design: no
+hardware was accessed and no silicon validation or silicon rate is claimed. The int8 default is unchanged.
+
+Design contract (the emitted source is authoritative where it differs):
+
+- There is no SRS and no `Cout`. The core's C accumulator `[0, 0xa000)` is drained as two 20480 B stripes on BD4 then
+  BD5 then BD4 again. The core acquires `C_FULL` only for the first stripe and returns `C_EMPTY` only for the second.
+- The memtile holds a single slot per row at `0x4000 + r*0x5000`, ending at `0x18000`.
+- Finite producer chains (S2MM per core row, two BDs, stripe 0 then stripe 1) use BD IDs `[0,1]`, `[24,25]`, `[2,3]`,
+  `[26,27]` for rows 0..3 with task `repeat = mw`. Finite drains (MM2S0 rows 0/1, MM2S3 rows 2/3) use BDs `6..9` /
+  `32..35`: row 0 stripe 0 and 1, then row 1 stripe 0 and 1, also `repeat = mw`.
+- Locks are `8 + 2r` empty and `9 + 2r` full (range `8..15`); the bank split is even `< 24`, odd `>= 24`. Memtile BDs
+  10/11 and shim BDs 4/5/6 are untouched. Because the finite C tasks end idle and balanced, a lean TXN needs no int8
+  odd-wave C repair; it requeues the four producers and two drains (`repeat = mw`) on every submit.
+- Host C layout (little-endian int32, 4 B per output): column, then stream (row pair), then wave, then row parity,
+  then tile `(mb, nb)` of 8x8. `ArrayDesign::unpack_out` returns row-major `m*n` and drops M padding; B is read once
+  per submit.
+
+`npu-gemm` compares every element of `unpack_out` with `ArrayDesign::reference` (the plain int32 GEMM for `I32`) exactly
+as for V8.
+
+ESTIMATE (a model, never a measurement; the 4 B/cycle stream rate is an [INFERENCE], and no silicon guarantee is made):
+`gemm_g80::estimate` has no epilogue body and no overlap credit for I32. One 20480 B slot per row serialises every
+stripe hand-off, each phase `P = 20480 / 4 = 5120` cycles, and six serial phases (`30720` cycles per wave) are exposed
+before the core regains `C_EMPTY`, plus one final `5120`-cycle drain phase at the end. The int8 path instead pays the
+`663`-cycle epilogue plus the `2560`-cycle `Cout` drain (`3223` per wave) and overlaps the memtile-to-shim transfer.
+The I32 model is therefore `27497` cycles per wave longer than int8. At K = 2560 that lowers modelled throughput by
+roughly 25-27% versus int8; this cost is not hidden, and the six-phase count is an upper-end estimate of the drain.
+
+Observed simulator functional ticks (Fast control; not silicon cycles, not a performance measurement):
+
+| shape | waves | int8 ticks | I32 ticks | I32 - int8 per wave |
+|---|---:|---:|---:|---:|
+| 64x1280x2560 | 1 | 113393 | 140888 | 27495 |
+| 512x1280x2560 | 2 | 171948 (85974/wave) | 226923 (113461.5/wave) | 27487.5 |
+| 512x1280x64 | 2 | 18685 | 73154 | 27234.5 |
+
+The per-wave deltas (27234.5..27495) agree with the modelled `27497` to within about 1%. K = 2560 fits the I32 design
+with no fallback.
+
+This simple contiguous stripe layout is the accepted design; no layout or channel redesign is planned. The next hardware
+promotion gate (not exercised) is bit-exact output, at most 1.26 B/kop, and at least 20 TOPS in co-run. The earlier kill
+criterion of a drain penalty above 10% is dropped for the bytes-first pipeline.
+
+Declared shim accounting for the single-panel trunk shape M8192 N1280 K2560 (formula from the design's byte counts only;
+not a physical DRAM measurement and not hardware evidence): reads `24248320` B (A `20971520` + B `3276800`, B once per
+submit), writes `41943040` B (I32 C, 4 B per output), useful ops `2*8192*1280*2560 = 53687091200`. That is
+`66191360 / 53687091.2 kop = 1.23291015625` B/kop (about 1.233), the figure the 1.26 B/kop gate above is measured against.
+
+Exercised (CPU simulator only, no hardware): `ROCR_VISIBLE_DEVICES=-1 nice -n19 cargo test -p pm-npu --release --test g80
+--test golden_bytes --test lean --test ring -- --nocapture` passed: g80 84 tests (95.56 s), golden_bytes 1 (0.72 s),
+lean 27 (122.04 s), ring 15 (13.99 s). `ROCR_VISIBLE_DEVICES=-1 nice -n19 cargo build -p npu-tools --release --bin npu-gemm`
+passed (0.04 s). The all-bin build was blocked by the separately in-flight FP probe's missing module registration,
+not by G80; no all-bin build pass is claimed.
+
 ## Verification and final disposition
 
 The retained Phase1 offline proofs cover bank-model searches, reverse-SRS overlap/floor/saturation, legal routes,
@@ -665,7 +725,8 @@ The image was 441056 B; full/lean TXNs were 49424 B/22576 B. The smoke source an
 Offline CLI smoke exercised G80 M64/M160 groups and the M256 ring group without opening a device:
 E3 gate_up used 76176 B instructions, or 77412 B with the ring (two patch sites), with a 441056 B PDI.
 Per expert, packed A/B/C were 655360 B/3276800 B/327680 B. Default and explicit V9 offline output matched exactly.
-G80 down, M257, invalid design, i32 epilogue, wrong N and `--b-prefix` were rejected with exit 2.
+G80 down, M257, invalid design, wrong N and `--b-prefix` were rejected with exit 2; that smoke predates the I32 epilogue
+(its then-rejected i32 request is superseded by the section "I32 epilogue (simulator-only)").
 
 Compatibility gates passed: golden_bytes 1, levers3 10, lean 27, ring 11 and experts 14 tests.
 `cargo test --release -p pm-npu -- --skip vendor_decode_oracle_roundtrip` passed 105 tests

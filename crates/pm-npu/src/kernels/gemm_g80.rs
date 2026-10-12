@@ -9,7 +9,8 @@
 //! output tile with M block `r / 2` (rows `w*256 + (r/2)*128 ..+128`) and N tile `2c + r % 2` (columns
 //! `(2c + r%2)*80 ..+80`). The two cores of a vertical pair (core rows `2q`, `2q+1`) share one 128-row A block through
 //! neighbour data memory (`PairRole::Lower` row `2q` receives the even-`mb` half, `Upper` row `2q+1` the odd half; the
-//! peer lock protocol and the reverse int8 epilogue are [`gemm_core_g80`]'s). `Epilogue::Int8` only; `Control` may be
+//! peer lock protocol and the reverse int8 epilogue are [`gemm_core_g80`]'s). `Epilogue::Int8` or `Epilogue::I32` (raw C
+//! drained in two stripes, no SRS body); `Control` may be
 //! `Fast`, `Slow` or a `Probe` with `layout == 0` (`nocompute` and `repeat=N` are timing-only: the host packing, the
 //! DMA protocol and every byte count below are unchanged, only the C content is not a GEMM).
 //!
@@ -20,15 +21,18 @@
 //! * arg1 = B, **8 column segments** of `kc*10240` B (total `8*kc*10240`), chunk-major, per chunk `[even N tile 5120 B,
 //!   odd N tile 5120 B]` = N tiles `2c`, `2c+1`; each 5120 B tile is `(kb 0..8, nb 0..10)` 8x8 blocks. B is read from DDR
 //!   exactly once per submit, whatever `mw` is.
-//! * arg2 = C, **8 column segments** of `W*4*10240` B (total `8*W*4*10240`): the S2MM0 stream (core rows 0, 1) followed
-//!   by the S2MM1 stream (core rows 2, 3), each `(wave, rho % 2)` int8 tiles of 10240 B in `(mb 0..16, nb 0..10)` 8x8
-//!   blocks ([`Geometry::pair_c_offset`]). For `K = 2560, M = 4096`: A 10 MiB, B 3.125 MiB, C 5 MiB.
+//! * arg2 = C, **8 column segments** of `W*4*cb` B (total `8*W*4*cb`; `cb` = 10240 int8, 40960 I32): the S2MM0 stream (core
+//!   rows 0, 1) followed by the S2MM1 stream (core rows 2, 3), each `(wave, rho % 2)` tiles of `cb` B in `(mb 0..16, nb 0..10)`
+//!   8x8 blocks ([`Geometry::pair_c_offset`]): int8 values, or for `Epilogue::I32` little-endian i32 (the core's raw `C`; the
+//!   tile is its two 20480 B stripes back to back: `mb 0..8` then `mb 8..16`). Host unpack ([`unpack_c`]) is row-major with the
+//!   M padding discarded. For `K = 2560, M = 4096`: A 10 MiB, B 3.125 MiB, C 5 MiB int8 / 20 MiB I32.
 //!
 //! # Memtile map (own-view `MEM_BASE + off`, lock ids `MEM_LOCK + id`, per column)
 //! | region | half-open offsets |
 //! |---|---|
 //! | **reserved for the lean ring scratch (X `0x1000`, Y `0x3000`) and spare BD queues, never accessed by G80** | `[0, 0x4000)` |
-//! | C slot `s` row `r` (10240 B) | `0x4000 + s*0xa000 + r*0x2800`, both slots end `0x18000` |
+//! | C slot `s` row `r` (int8, 10240 B) | `0x4000 + s*0xa000 + r*0x2800`, both slots end `0x18000` |
+//! | C stage row `r` (**I32**, one 20480 B slot per row, both stripes) | `0x4000 + r*0x5000`, row 3 ends `0x18000` |
 //! | A ping / pong (4096 B live of an 8 KiB reservation each; columns 0..3 only) | `[0x18000,0x1a000)` / `[0x1a000,0x1c000)` |
 //! | B parity 0 (`kc*5120` B) | `[0x1c000, 0x1c000 + kc*5120)` |
 //! | B parity 1 (`kc*5120` B) | `[0x1c000 + kc*5120, 0x1c000 + 2*kc*5120)`, ends `<= 0x80000` (`= 0x80000` at `kc = 40`) |
@@ -41,17 +45,20 @@
 //! spare Q / DQ / P / SENT / D descriptors).
 //! | function | channel | BD ids | length | locks (memtile-local ids) |
 //! |---|---|---|---|---|
-//! | C producer row 0 / 1 / 2 / 3 | S2MM0 / 1 / 2 / 3 | `0<->1` / `24<->25` / `2<->3` / `26<->27` (slot 0 / 1, cyclic) | 2560 words | acquire `c_lock(slot,row)` (empty) -1, release `+1` (full); `c_lock = 8 + slot*8 + row*2` |
+//! | C producer row 0 / 1 / 2 / 3 (int8 only) | S2MM0 / 1 / 2 / 3 | `0<->1` / `24<->25` / `2<->3` / `26<->27` (slot 0 / 1, cyclic) | 2560 words | acquire `c_lock(slot,row)` (empty) -1, release `+1` (full); `c_lock = 8 + slot*8 + row*2` |
 //! | B fill | S2MM4 | `4 -> 5 -> end` (parity 0 / 1), **finite, task `repeat = kc`** | 1280 words each | BD 4 releases ready0 (`4`) +1, BD 5 releases ready1 (`6`) +1, no acquire |
 //! | A fill (cols 0..3) | S2MM5 | `28<->29` (ping / pong, cyclic) | 1024 words | acquire `A_EMPTY[s]` -1, release `A_FULL[s]` +1 |
-//! | C drain rows 0, 1 | MM2S0 | `6->7->8->9->6`: slot 0 row 0, slot 0 row 1, slot 1 row 0, slot 1 row 1 (cyclic) | 2560 words | acquire `c_lock+1` (full) -1, release `c_lock` +1 |
+//! | C drain rows 0, 1 | MM2S0 | `6->7->8->9->6`: slot 0 row 0, slot 0 row 1, slot 1 row 0, slot 1 row 1 (cyclic; int8 only, see the I32 rows below) | 2560 words | acquire `c_lock+1` (full) -1, release `c_lock` +1 |
 //! | C drain rows 2, 3 | MM2S3 | `32->33->34->35->32` (same pattern, rows 2, 3) | 2560 words | as above |
+//! | **I32** C producer row `r` | S2MM `r` | `0 -> 1` / `24 -> 25` / `2 -> 3` / `26 -> 27` (stripe 0 -> stripe 1), **finite, task `repeat = mw`**, second BD has no `next` | 5120 words each | both BDs: acquire `c_lock(0,r)` (empty) -1, release `+1` (full); `c_lock(0, r) = 8 + 2r`; both write the **same** stage address |
+//! | **I32** C drain rows 0, 1 / rows 2, 3 | MM2S0 / MM2S3 | `6->7->8->9` / `32->33->34->35`: row 0 stripe 0, row 0 stripe 1, row 1 stripe 0, row 1 stripe 1 (rows 2, 3), **finite, task `repeat = mw`**, last BD has no `next` | 5120 words each | acquire `c_lock+1` (full) -1, release `c_lock` (empty) +1 of its row; each stripe is staged and locked independently |
 //! | B parity 0 guard / whole | MM2S1 | `30` finite (`repeat = kc`), then `31` finite (`repeat = mw - 1`, omitted when `mw = 1`) | 1280 / `kc*1280` words | BD 30 acquires ready0 (`4`) -1; BD 31 no lock |
 //! | B parity 1 guard / whole | MM2S5 | `42` finite (`repeat = kc`), then `43` finite (`repeat = mw - 1`, omitted when `mw = 1`) | 1280 / `kc*1280` words | BD 42 acquires ready1 (`6`) -1; BD 43 no lock |
 //! | A replay (cols 0..3) | MM2S2 | `14<->15` (cyclic) | 1024 words | acquire `A_FULL[s]` -1, release `A_EMPTY[s]` +1 |
 //!
 //! Columns 4..7 have no A rows: 22 BDs and 18 locks there; columns 0..3 have the 26 BDs and 22 locks. Lock ids used:
-//! `0..3` (A), `4`, `6` (B ready), `8..23` (C). Initial values: every `*_EMPTY` 1, every `*_FULL` 0, ready0 = ready1 = 0.
+//! `0..3` (A), `4`, `6` (B ready), `8..23` (C int8) / `8..15` (C I32). Initial values: every `*_EMPTY` 1, every `*_FULL` 0,
+//! ready0 = ready1 = 0.
 //! A ready lock never exceeds `kc <= 40 < 63`.
 //!
 //! ## B fill, guarded read, whole read (iteration contract)
@@ -82,11 +89,16 @@
 //!   `14 + J%2`; `A_FULL = 0`; the S2MM parked BD holds the lookahead acquire (`A_EMPTY[J%2] = 0`, the other slot's empty 1).
 //!   Equivalent to S0 iff `J` is even. Minimal lean repair for odd `J` (slot 1): reset (CTRL bit1 pulse) both channels, restore only the
 //!   dropped lookahead credit `A_EMPTY[1] = 1` (the canonical full reset writes every A lock to its initial value), requeue BD 28 / 14.
-//! * **C producers S2MM0..3** (`{0,1}`, `{24,25}`, `{2,3}`, `{26,27}`) : `W` loads, parked at slot `W%2` with its empty-lock
+//! * **C producers S2MM0..3 (int8)** (`{0,1}`, `{24,25}`, `{2,3}`, `{26,27}`) : `W` loads, parked at slot `W%2` with its empty-lock
 //!   lookahead taken; **C drains MM2S0 / MM2S3**: `2W` loads, parked at BD `6 + 2*(W%2)` / `32 + 2*(W%2)`, full locks unacquired.
 //!   Equivalent to S0 iff `W` is even. Minimal lean repair for odd `W` (parked at slot 1): reset all six channels (S2MM0..3, MM2S0,
 //!   MM2S3), restore only the dropped slot-1 `EMPTY` lock of each row (`c_lock(1, r) = 1`), requeue BD `C_S2MM_BD[r][0]`, 6, 32.
 //!   C rings use no iteration, so there is no `current` to repair.
+//! * **`Epilogue::I32` C** (replaces the two items above for I32): producer S2MM `r` runs `W` passes of the two-BD chain, each
+//!   drain channel `W` passes of its four-BD chain; all finite, so after the last repeat they are idle, empty-queued, **not
+//!   parked**, with no lookahead credit. `c_lock(0, r)` is back at empty 1 / full 0 for any `W` parity (acquire / release
+//!   pairs balance), the BDs carry no iteration. A lean TXN therefore needs **no** C parity repair, but must requeue
+//!   `S2MM r BD C_S2MM_BD[r][0] repeat = W`, `MM2S0 BD 6 repeat = W`, `MM2S3 BD 32 repeat = W` on every submit.
 //! * **Cores**: `DONE`; always halt+reset, `CORE_PC = 0`, enable last, as the full TXN. Canonical full reset reloads every core lock
 //!   (`A/B_EMPTY = 1`, `C_EMPTY = 1`, rest 0); the minimal lean repair reloads only what the end state lost: the dropped pong
 //!   `A_EMPTY[1]` / `B_EMPTY[1]` lookahead credit when `J` is odd (`C_EMPTY` stays 1, FULL and PEER locks are 0). Core S2MM0 (A)
@@ -94,7 +106,7 @@
 //!   parks at BD 4 with `C_FULL` unacquired for any `W`.
 //! * **Shim**: finite BDs/tasks consumed (shim channels are never reset); BDs are rewritten with new DDR patches each submit.
 //! * **Streams**: no residue after the C tokens: the cores consume exactly `kc*W` A and B chunks, A/B shim BDs have drained,
-//!   the C streams carry exactly `W*2*10240` B per channel; every switch lane is empty.
+//!   the C streams carry exactly `W*2*cb` B per channel (`cb = 10240` int8, `40960` I32); every switch lane is empty.
 //!
 //! A lean TXN is valid **only** directly after a *completed* submit (both aggregate C SYNCs returned). After an interrupted or
 //! aborted run the state above does not hold and only the canonical full reset is valid: full channel resets, a rewrite of
@@ -103,17 +115,19 @@
 //! `repeat = kc` for fill and guard, `mw - 1` for whole) and applies only the parity repairs listed (`J` odd: A / core rings; `W`
 //! odd: C rings / drains). The ready locks 4 and 6 end at 0 and the completed finite fill holds **no** lookahead credit, so no lock
 //! write is needed for them: a forced reset of S2MM4 (POLL) or MM2S0 (DONE) by the lean ring does not touch locks 4 / 6 and needs no
-//! lock repair, only the requeue of BD 4 with `repeat = kc` (retain `kc`) and of all B tasks, and BD 6 for MM2S0 (valid only while
-//! the drain chain is parked at BD 6, i.e. `W` even; for odd `W` the parity plan above already resets and requeues it). Ring
+//! lock repair, only the requeue of BD 4 with `repeat = kc` (retain `kc`) and of all B tasks, and BD 6 for MM2S0 (int8: valid only
+//! while the drain chain is parked at BD 6, i.e. `W` even; for odd `W` the parity plan above already resets and requeues it; I32:
+//! the finite drain task `repeat = W` is requeued on every submit anyway and is kept as is). Ring
 //! scratch X / Y are never touched (`[0, 0x4000)`).
 //! A submit must start only after the previous submit's two aggregate C SYNCs returned (quiescent array) and the next
 //! expert's B is not overlapped with the previous submit: the B regions are single buffered per submit.
 //!
 //! # Shim (DDR patch points, built by `gemm_array`)
-//! Per column: BD 0 B on MM2S0 (`kc*2560` words, arg1 + `col*kc*10240`), BD 1 C stream 0 on S2MM0 (`W*5120` words, arg2 +
-//! `col*W*40960`, token), BD 2 A on MM2S1 (columns 0..3 only, `W*kc*1024` words, arg0 + `col*W*kc*4096`), BD 3 C stream 1 on
-//! S2MM1 (`W*5120` words, arg2 + `col*W*40960 + W*2*10240`, token). Each BD's address word (`Bd::address(shim, id) + 4`)
-//! is DDR-patched with `column_offset (+ arena_base[arg])` in the grouped launch.
+//! Per column: BD 0 B on MM2S0 (`kc*2560` words, arg1 + `col*kc*10240`), BD 1 C stream 0 on S2MM0 (`W*5120` words int8 /
+//! `W*20480` words I32, arg2 + `col*W*4*cb`, token), BD 2 A on MM2S1 (columns 0..3 only, `W*kc*1024` words, arg0 +
+//! `col*W*kc*4096`), BD 3 C stream 1 on S2MM1 (same words, arg2 + `col*W*4*cb + W*2*cb`, token), `cb` the tile bytes (10240 int8,
+//! 40960 I32). Each BD's address word (`Bd::address(shim, id) + 4`) is DDR-patched with `column_offset (+ arena_base[arg])` in
+//! the grouped launch.
 //!
 //! # Switch circuits (column `c`, lanes preserved, no master has two slaves)
 //! * shim: MM2S0 -> North0 (B), MM2S1 -> North1 (A, columns 0..3), North0 -> S2MM0 and North1 -> S2MM1 (C).
@@ -128,7 +142,9 @@
 //!
 //! # Estimate
 //! [`estimate`] is a model, never a measurement; see its documentation. It uses the explicit 128x80 geometry and the
-//! G80 core's issue cycles, not any TN64 constant.
+//! G80 core's issue cycles, not any TN64 constant. For `Epilogue::I32` it adds the serial single-slot stripe hand-off chain
+//! (six 5120-cycle stripe phases exposed per wave before the core regains `C_EMPTY`, no overlap credit) against the int8
+//! `2560`-cycle `Cout` drain plus `663`-cycle epilogue.
 use super::gemm_array::{self as array, ArrayDesign, CycleEstimate, Geometry, Kind, Topo, Variant, MAX_WAVES};
 use super::gemm_core::{self, Control, CoreVariant, Epilogue, PairRole};
 use super::gemm_core_g80 as g80_core;
@@ -194,6 +210,10 @@ const _: () = assert!(B_READY[0] == 4 && B_READY[1] == 6 && g80_core::MAX_KC < 6
 
 fn c_lock(slot: usize, row: usize) -> u32 { C_LOCK0 + (slot * 8 + row * 2) as u32 }
 fn c_off(slot: usize, row: usize) -> u32 { C_OFF + slot as u32 * C_SLOT_STRIDE + row as u32 * C_ROW_STRIDE }
+/// `Epilogue::I32` stage of row `r`: one 20480 B slot (`g80_core::C_STRIPE_BYTES`), rows contiguous from `0x4000`, ending `0x18000`.
+fn c_i32_off(row: usize) -> u32 { C_OFF + row as u32 * g80_core::C_STRIPE_BYTES as u32 }
+/// Serial single-slot stripe phases between `C_FULL` and the `C_EMPTY` return of the last row of a pair (see [`estimate`]).
+const I32_HANDOFF_PHASES: u64 = 6;
 fn b_off(kc: usize, parity: usize) -> u32 { B_OFF + (parity * kc * B_BYTES) as u32 }
 fn a_locks() -> ([u32; 2], [u32; 2]) { (gemm_core::A_EMPTY, gemm_core::A_FULL) }
 
@@ -204,6 +224,9 @@ fn shape(topo: Topo) -> (usize, usize) {
         other => panic!("gemm_g80 needs a G80 topology, got {other:?}"),
     }
 }
+
+/// `Epilogue::I32` topology (raw 40,960 B tiles, one 20,480 B memtile stage per row, finite C tasks).
+fn is_i32(topo: Topo) -> bool { matches!(topo.kind, Kind::G80 { epi: Epilogue::I32, .. }) }
 
 fn check_geometry(geo: &Geometry) -> (usize, usize) {
     let (kc, mw) = shape(geo.topo);
@@ -291,6 +314,32 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
         v.extend(array::ring(A_S2MM_BD, A_OFF, words, empty, full, true));
         v.extend(array::ring(A_MM2S_BD, A_OFF, words, empty, full, false));
     }
+    if is_i32(topo) {
+        // One 20480 B staging slot per row: the two stripe BDs of the producer and the two of the drain share its address and
+        // its empty / full lock pair, so every stripe hand-off is serialised through that one slot. Producers are finite
+        // two-BD chains (first -> second, second has no `next`), the drains finite four-BD chains (row 0 / 2 stripe 0, 1,
+        // row 1 / 3 stripe 0, 1); each is queued once per wave (`repeat = mw`).
+        let stripe_words = (g80_core::C_STRIPE_BYTES / 4) as u32;
+        let stripe = |addr: u32, acq: u32, rel: u32, next: Option<u32>| {
+            let mut bd = Bd::new((array::MEM_BASE + addr) as u64, stripe_words);
+            bd.locks = BdLocks { acq: Some((array::MEM_LOCK + acq, -1)), rel: Some((array::MEM_LOCK + rel, 1)) };
+            bd.next = next;
+            bd
+        };
+        for r in 0..ROWS {
+            let (empty, full) = (c_lock(0, r), c_lock(0, r) + 1);
+            for s in 0..2 {
+                v.push((C_S2MM_BD[r][s], stripe(c_i32_off(r), empty, full, (s == 0).then_some(C_S2MM_BD[r][1]))));
+            }
+        }
+        for g in 0..2 { for idx in 0..4usize {
+            let row = 2 * g + idx / 2;
+            let (empty, full) = (c_lock(0, row), c_lock(0, row) + 1);
+            let id = C_DRAIN_BD0[g] + idx as u32;
+            v.push((id, stripe(c_i32_off(row), full, empty, (idx < 3).then_some(id + 1))));
+        } }
+        return v;
+    }
     let words = (COUT_BYTES / 4) as u32;
     for r in 0..ROWS {
         let empty = [c_lock(0, r), c_lock(1, r)];
@@ -314,7 +363,9 @@ pub(crate) fn memtile_locks(topo: Topo, col: u32) -> Vec<(u32, u32)> {
         let (empty, full) = a_locks();
         for i in 0..2 { v.extend([(empty[i], 1), (full[i], 0)]); }
     }
-    for slot in 0..2 { for r in 0..ROWS {
+    // I32 has one stage per row (locks 8 + 2r empty, 9 + 2r full); int8 two slots (8 + 8s + 2r).
+    let c_slots = if is_i32(topo) { 1 } else { 2 };
+    for slot in 0..c_slots { for r in 0..ROWS {
         v.extend([(c_lock(slot, r), 1), (c_lock(slot, r) + 1, 0)]);
     } }
     v
@@ -334,10 +385,15 @@ pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
         v.push((tile, task(Mm2s, gemm_core::C_CHANNEL, gemm_core::C_BD)));
     }
     let mem = array::mem_loc(col);
-    for r in 0..ROWS { v.push((mem, task(S2mm, r as u32, C_S2MM_BD[r][0]))); }
+    for r in 0..ROWS {
+        // I32: finite two-stripe chain, one pass per wave.
+        v.push((mem, if is_i32(topo) { rep(S2mm, r as u32, C_S2MM_BD[r][0], mw as u32) } else { task(S2mm, r as u32, C_S2MM_BD[r][0]) }));
+    }
     v.push((mem, rep(S2mm, B_FILL_CH, B_FILL_BD[0], kc as u32)));
     if topo.has_a(col) { v.push((mem, task(S2mm, A_S2MM_CH, A_S2MM_BD[0]))); }
-    for g in 0..2 { v.push((mem, task(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g]))); }
+    for g in 0..2 {
+        v.push((mem, if is_i32(topo) { rep(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g], mw as u32) } else { task(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g]) }));
+    }
     for p in 0..2 {
         v.push((mem, rep(Mm2s, B_READ_CH[p], B_GUARD_BD[p], kc as u32)));
         if mw > 1 { v.push((mem, rep(Mm2s, B_READ_CH[p], B_WHOLE_BD[p], (mw - 1) as u32))); }
@@ -385,10 +441,13 @@ pub(crate) fn pack_b(geo: &Geometry, b: &[i8]) -> Vec<u8> {
     out
 }
 
-/// Row-major `m*n` C from the packed C stream (int8 tiles sign extended, M padding discarded).
+/// Row-major `m*n` C from the packed C stream (M padding discarded): int8 tiles are sign extended, `Epilogue::I32` tiles are
+/// 40960 B (stripe 0 = `mb 0..8`, stripe 1 = `mb 8..16`, contiguous) of little-endian i32 8x8 blocks in `(mb 0..16, nb 0..10)`
+/// order.
 pub(crate) fn unpack_c(geo: &Geometry, output: &[u8]) -> Vec<i32> {
     check_geometry(geo);
     assert_eq!(output.len(), geo.c_bytes(), "C stream size");
+    let i32_tiles = is_i32(geo.topo);
     let mut c = vec![0i32; geo.m * geo.n];
     for col in 0..COLS { for w in 0..geo.waves { for rho in 0..ROWS {
         let m0 = w * WAVE_M + (rho / 2) * TM;
@@ -401,7 +460,11 @@ pub(crate) fn unpack_c(geo: &Geometry, output: &[u8]) -> Vec<i32> {
             for j in 0..8 {
                 let cc = n0 + nb * 8 + j;
                 if cc >= geo.n { break; }
-                c[row * geo.n + cc] = output[base + (mb * NB + nb) * 64 + i * 8 + j] as i8 as i32;
+                let at = (mb * NB + nb) * 64 + i * 8 + j;
+                c[row * geo.n + cc] = if i32_tiles {
+                    let off = base + at * 4;
+                    i32::from_le_bytes(output[off..off + 4].try_into().unwrap())
+                } else { output[base + at] as i8 as i32 };
             }
         } } }
     } } }
@@ -419,14 +482,27 @@ const WAVEFRONT_BUNDLES: u64 = (32 * 5 * 8 + 35) as u64;
 
 /// ESTIMATE only (never a measurement). Per K64 chunk a core needs `max(issue, 1280)`: the G80 issue cycles
 /// ([`gemm_core::PAIR_CHUNK_CYCLES`] + [`CHUNK_GROWTH`], ping and pong averaged, per control discipline) against the
-/// 1280-cycle B stream of the core (5120 B at 4 B/cycle; the 1024-cycle A half is hidden). Per wave the core adds the
-/// reverse-epilogue issue cycles and the exposed `Cout` drain (`10240 / 4 = 2560` cycles: `Cout` shares the top of the i32 `C`,
-/// so chunk 0 of the next wave waits for the previous wave's drain). The memtile -> shim C transfer (2 channels x 4 B/cycle,
-/// two 10240 B tiles each = 5120 cycles) overlaps the next wave through the two memtile slots, so the wave period is
-/// `max(core wave cycles, shim C cycles)` and the last shim transfer is exposed; start-up is one B chunk (1280 cycles).
+/// 1280-cycle B stream of the core (5120 B at 4 B/cycle; the 1024-cycle A half is hidden).
+///
+/// `Epilogue::Int8`: per wave the core adds the reverse-epilogue issue cycles and the exposed `Cout` drain
+/// (`10240 / 4 = 2560` cycles: `Cout` shares the top of the i32 `C`, so chunk 0 of the next wave waits for the previous
+/// wave's drain). The memtile -> shim C transfer (2 channels x 4 B/cycle, two 10240 B tiles each = 5120 cycles) overlaps the
+/// next wave through the two memtile slots, so the wave period is `max(core wave cycles, shim C cycles)` and the last shim
+/// transfer is exposed.
+///
+/// `Epilogue::I32`: no epilogue body and **no overlap credit**. One 20480 B memtile slot per row serialises every stripe
+/// hand-off, each stripe phase taking `P = 20480 / 4 = 5120` cycles at 4 B/cycle. From `C_FULL` the `C_EMPTY` of core row 1
+/// (rows 1 and 3 gate their pair through the peer lock protocol) returns only after six chained phases: row 0 stripe 0 writes
+/// the slot; it drains; row 0 stripe 1 writes; it drains; row 1 stripe 0 drains (written concurrently with row 0 stripe 0 but
+/// drained behind row 0); row 1 stripe 1 writes, which is when the core DMA finishes and returns `C_EMPTY`. The seventh phase
+/// (row 1 stripe 1 drain) is hidden by the next wave's compute (`kc >= 3`) and exposed only after the last wave. The wave
+/// period is `max(kc * chunk + 6 P, 4 P)` and the total adds `7 P` for the last wave. Stripe phases are never overlapped
+/// beyond what the two independent row streams of a drain channel allow (row 1 stripe 0 write), so this is an upper-end
+/// estimate of the I32 drain.
 /// `Probe::no_compute` removes the compute and the epilogue body, `Probe::repeat = N` adds `N - 1` wavefronts to every
 /// later chunk. Ignores lock waits beyond this, bank conflicts, DDR contention and start-up beyond the first chunk.
-/// `output_dma_cycles` reports the per-wave epilogue plus exposed `Cout` drain cycles summed over the waves.
+/// `output_dma_cycles` reports the per-wave epilogue plus exposed `Cout` drain cycles summed over the waves (I32: the
+/// six-phase `C_EMPTY` stall per wave plus one final drain phase).
 pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEstimate {
     assert!(clock_hz > 0);
     let (kc, _) = check_geometry(geo);
@@ -440,17 +516,26 @@ pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEsti
         }
     };
     let [ping, pong] = gemm_core::PAIR_CHUNK_CYCLES[slow].map(chunk);
-    let epilogue = if probe.no_compute { 0 } else { EPILOGUE_CYCLES[slow] };
-    let cout_drain = (COUT_BYTES / 4) as u64;
-    let shim_c = (2 * COUT_BYTES / 4) as u64;
-    let wave_core = (kc * (ping + pong)).div_ceil(2) + epilogue + cout_drain;
-    let estimated_cycles = input_chunk + (waves - 1) * wave_core.max(shim_c) + wave_core + shim_c;
+    let compute = (kc * (ping + pong)).div_ceil(2);
+    let (estimated_cycles, output_dma_cycles) = if is_i32(geo.topo) {
+        let stripe = (g80_core::C_STRIPE_BYTES / 4) as u64;
+        let wave_core = compute + I32_HANDOFF_PHASES * stripe;
+        let shim_c = 4 * stripe;
+        (input_chunk + (waves - 1) * wave_core.max(shim_c) + compute + (I32_HANDOFF_PHASES + 1) * stripe,
+            (I32_HANDOFF_PHASES * waves + 1) * stripe)
+    } else {
+        let epilogue = if probe.no_compute { 0 } else { EPILOGUE_CYCLES[slow] };
+        let cout_drain = (COUT_BYTES / 4) as u64;
+        let shim_c = (2 * COUT_BYTES / 4) as u64;
+        let wave_core = compute + epilogue + cout_drain;
+        (input_chunk + (waves - 1) * wave_core.max(shim_c) + wave_core + shim_c, (epilogue + cout_drain) * waves)
+    };
     let estimated_seconds = estimated_cycles as f64 / clock_hz as f64;
     let useful_ops = 2.0 * geo.m as f64 * geo.n as f64 * geo.k as f64;
     CycleEstimate {
         ideal_mac_cycles: (TM * TN * CHUNK_K / 512) as u64 * kc * waves,
         input_dma_cycles: input_chunk * kc * waves,
-        output_dma_cycles: (epilogue + cout_drain) * waves,
+        output_dma_cycles,
         estimated_cycles,
         estimated_seconds,
         useful_tops: useful_ops / estimated_seconds / 1e12,
@@ -459,13 +544,10 @@ pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEsti
 }
 
 /// Build the G80 whole-array design (module header): `n = 1280`, `k` a multiple of 64 in `64..=2560`, `m >= 1` padded to 256
-/// rows per wave with at most 256 waves, `Epilogue::Int8 { shift <= 31 }` and a `Control` with `Probe::layout == 0`.
-/// Panics with an explanatory message on any other shape before emitting a byte.
+/// rows per wave with at most 256 waves, `Epilogue::Int8 { shift <= 31 }` or `Epilogue::I32` and a `Control` with
+/// `Probe::layout == 0`. Panics with an explanatory message on any other shape before emitting a byte.
 pub fn design_g80(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control) -> ArrayDesign {
-    match epi {
-        Epilogue::Int8 { shift } => assert!(shift <= 31, "G80 SRS shift {shift} exceeds 31"),
-        Epilogue::I32 => panic!("G80 supports only Epilogue::Int8: the int8 Cout buffer shares the top of the i32 C accumulator"),
-    }
+    if let Epilogue::Int8 { shift } = epi { assert!(shift <= 31, "G80 SRS shift {shift} exceeds 31"); }
     assert_eq!(ctl.probe().layout, 0, "G80 has one fixed data-memory map; Probe::layout={} is not defined", ctl.probe().layout);
     assert!(m > 0, "G80 needs M >= 1");
     assert_eq!(n, WAVE_N, "G80 needs N = {WAVE_N} exactly, got {n}");

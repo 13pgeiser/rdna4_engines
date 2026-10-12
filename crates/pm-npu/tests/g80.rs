@@ -17,6 +17,11 @@
 //!   * lean submits (`lean_insts`, `lean_insts_requeue`, `append_lean_run_body`): full -> 3 lean submits with fresh operands
 //!     are exact, byte-equal to a fresh full run with the same operands and leave `Config::state_snapshot` equal to a
 //!     fresh full run; full/lean interleaves; the E3 group with lean tail bodies equals the all-full group (bytes and state).
+//!   * `Epilogue::I32` (direct half-stripe int32 C, 40960 B per core tile, S2MM0/1 = `waves*2*40960`): every full / lean /
+//!     forced-requeue / grouped submit is exact against the independent `cpu_reference` AND its complete padded packed C arena
+//!     is rebuilt word by word by a test-local oracle (poisoned arena, padded rows included, every raw int32 bounded by
+//!     `k*16384`), operands unchanged, tile ranges tile the arena once, memtile descriptors / locks / queues parsed from the TXN
+//!     (`g80_i32_*`). The simulator timing comparison int8 vs I32 reports functional ticks only, never silicon cycles.
 //!
 //! Simulator limitations (not faked): `Config` has no consumer-delay / asymmetric drain pacing knob and no mid-run state
 //! inspection (`state_snapshot` is a between-submit fingerprint, `submit_with`'s producer only publishes host bytes), and
@@ -264,7 +269,13 @@ fn assert_all_rejected(cases:Vec<(String,bool)>) {
 #[test] fn g80_rejects_empty_and_more_than_256_waves() {
     assert_all_rejected([0usize,256*256+1,256*257].into_iter().map(|m|(format!("M={m}"),rejects(||{design_g80(m,N,64,int8(12),Control::Fast);}))).collect());
 }
-#[test] fn g80_rejects_i32_epilogue() {assert!(rejects(||{design_g80(256,N,64,Epilogue::I32,Control::Fast);}))}
+/// `Epilogue::I32` is a supported direct half-stripe epilogue (see the I32 section): the old rejection is gone and every
+/// boundary shape builds with the 40960 B/core tile layout; other bounds still reject for it (`g80_i32_rejects_*`).
+#[test] fn g80_accepts_i32_epilogue_boundary_shapes() {
+    for (m,k) in [(1,64),(1,2560),(256,2560),(257,64),(256*256,64),(256*256,2560)] {
+        for ctl in BOTH {check_layout32(&design32(m,k,ctl),m,k,&format!("I32 {ctl:?} boundary"))}
+    }
+}
 #[test] fn g80_rejects_probe_layouts_other_than_0() {
     assert_all_rejected((1u8..=3).map(|layout|(format!("layout={layout}"),rejects(||{design_g80(256,N,64,int8(12),Control::Probe(Probe{layout,..Probe::default()}));}))).collect());
 }
@@ -735,4 +746,506 @@ fn ring_poll_reset_omission_detected(ms:&[usize],k:usize,ctl:Control,layout:Ring
 }
 #[test] fn g80_grouped_ring_omitting_col0_s2mm4_reset_is_detected_e3() {
     for ctl in BOTH {ring_poll_reset_omission_detected(&[64,160,200],128,ctl,RingLayout{nslots:2},0,1)}
+}
+
+// ================================================================ Epilogue::I32: direct half-stripe int32 C
+// The host C arena of an I32 design holds `COLS * waves * 4` core tiles of 128x80 little-endian i32 (40960 B, `(mb 0..16,
+// nb 0..10)` 8x8 blocks) in the order column -> stream (core row pair) -> wave -> row parity -> tile. Everything below
+// rebuilds that layout and the exact values independently of `ArrayDesign::unpack_out` / `pair_c_offset`.
+const T32:usize=4*C_TILE;
+const POISONS:[u8;2]=[0xa5,0x5a];
+const MEM_C0:u32=0x4000;
+const MEM_C_ROW:u32=0x5000;
+const STRIPE_WORDS:u32=5120;
+const PROD_BD:[[u32;2];4]=[[0,1],[24,25],[2,3],[26,27]];
+const DRAIN_CH:[u32;2]=[0,3];
+const DRAIN_BD0:[u32;2]=[6,32];
+fn design32(m:usize,k:usize,ctl:Control)->ArrayDesign {design_g80(m,N,k,Epilogue::I32,ctl)}
+
+/// Argument sizes, host byte totals, and an independent check that the per-tile ranges tile the C arena exactly once with
+/// the documented offsets.
+fn check_layout32(d:&ArrayDesign,m:usize,k:usize,label:&str) {
+    let (kc,waves)=(k/64,m.div_ceil(WAVE_M));
+    assert_eq!(d.waves(),waves,"{label}: waves");assert_eq!(d.wave_m(),WAVE_M,"{label}: wave_m");
+    let sizes=[A_COLS*waves*kc*A_CHUNK,COLS*kc*B_CHUNK,COLS*waves*4*T32];
+    assert_eq!(d.args,vec![ArgSpec{bytes:sizes[0],kind:ArgKind::In},ArgSpec{bytes:sizes[1],kind:ArgKind::In},ArgSpec{bytes:sizes[2],kind:ArgKind::Out}],"{label}: args");
+    assert_eq!(d.host_bytes_read(),(sizes[0]+sizes[1]) as u64,"{label}");assert_eq!(d.host_bytes_written(),sizes[2] as u64,"{label}");
+    let tiles=d.output_tile_ranges();assert_eq!(tiles.len(),COLS*4,"{label}: output tiles");
+    let mut all:Vec<Range<usize>>=Vec::new();
+    for ((col,row),ranges) in &tiles {
+        assert_eq!(ranges.len(),waves,"{label}: tile ({col},{row}) ranges");let (col,rho)=(*col as usize,*row as usize-2);
+        for (w,r) in ranges.iter().enumerate() {
+            assert_eq!(r.len(),T32,"{label}: tile ({col},{rho}) range length");
+            assert_eq!(r.start,col*waves*4*T32+(rho/2)*waves*2*T32+(w*2+rho%2)*T32,"{label}: tile ({col},{rho}) wave {w} offset");
+            all.push(r.clone())
+        }
+    }
+    all.sort_by_key(|r|r.start);let mut end=0;
+    for r in &all {assert_eq!(r.start,end,"{label}: C tile ranges must tile arg2 exactly once");end=r.end}
+    assert_eq!(end,sizes[2],"{label}: C tile ranges cover arg2");
+}
+
+/// The complete padded packed C arena for the row-major `m*N` result `c`: every word of every tile of every wave, rows beyond
+/// `m` (the zero padding of the last wave) being 0. Panics if the construction does not write every word exactly once.
+fn oracle_arena(c:&[i32],m:usize,waves:usize)->Vec<u8> {
+    assert_eq!(c.len(),m*N);
+    let mut out=vec![0u8;COLS*waves*4*T32];let mut words=0usize;
+    for col in 0..COLS {for w in 0..waves {for rho in 0..4 {
+        let (m0,n0)=(w*WAVE_M+(rho/2)*128,(2*col+rho%2)*80);
+        let base=col*waves*4*T32+(rho/2)*waves*2*T32+(w*2+rho%2)*T32;
+        for mb in 0..16 {for nb in 0..10 {for i in 0..8 {for j in 0..8 {
+            let (row,cc)=(m0+mb*8+i,n0+nb*8+j);let v=if row<m {c[row*N+cc]} else {0};
+            let at=base+4*((mb*10+nb)*64+i*8+j);out[at..at+4].copy_from_slice(&v.to_le_bytes());words+=1;
+        }}}}
+    }}}
+    assert_eq!(words*4,out.len(),"oracle must write every word of the arena exactly once");out
+}
+
+/// Per-channel deltas of `runs` bodies moving `waves` waves in total: the int8 formula for everything but S2MM0/1, which
+/// move `waves*2*40960` B per column; 16 S2MM channels exist. Returns (read, written) of the delta.
+fn assert_traffic32(before:&Traffic,after:&Traffic,runs:usize,waves:usize,kc:usize,label:&str)->(u64,u64) {
+    assert_eq!(before.len(),after.len(),"{label}");
+    let (mut read,mut written,mut s2mm)=(0,0,0usize);
+    for (&(col,dir,ch,was),&(col1,dir1,ch1,now)) in before.iter().zip(after) {
+        assert_eq!((col,dir,ch),(col1,dir1,ch1),"{label}");let delta=now-was;
+        let want=match (dir,ch) {(Direction::S2mm,0)|(Direction::S2mm,1)=>(waves*2*T32) as u64,_=>expected_bytes(dir,ch,col,runs,waves,kc)};
+        assert_eq!(delta,want,"{label}: shim col {col} {dir:?} ch {ch} bytes");
+        match dir {Direction::Mm2s=>read+=delta,Direction::S2mm=>{written+=delta;s2mm+=1}}
+    }
+    assert_eq!(s2mm,2*COLS,"{label}: S2MM channels");(read,written)
+}
+
+struct Run32 {ticks:usize,busy:u64,wait:u64,read:u64,written:u64,c:Vec<u8>}
+/// One submit of `insts` (full or lean TXN of the I32 design `d`) on a possibly reused `Config`, C arena filled with `poison`.
+/// Proves: every raw int32 of the arena overwritten (none is the poison word) and bounded by `k*16384`; the arena equals the
+/// oracle word for word (padded rows 0); `unpack_out` and `d.reference` equal the independent `cpu_reference`; operands and
+/// packed inputs unchanged; exact per-channel shim bytes; shim written bytes == arena bytes (with the exact tile tiling of
+/// `check_layout32` no word can have been written twice).
+fn submit32(sim:&mut Config,d:&ArrayDesign,insts:&[u8],label:&str,m:usize,k:usize,a:&[i8],b:&[i8],poison:u8)->Run32 {
+    let (kc,waves)=(k/64,m.div_ceil(WAVE_M));
+    let [a_host,b_host]=d.pack_in(a,b);assert_eq!((a_host.len(),b_host.len()),(d.args[0].bytes,d.args[1].bytes),"{label}: packed sizes");
+    let (a0,b0)=(a.to_vec(),b.to_vec());let before=[signature(&a_host),signature(&b_host)];
+    let mut args=vec![a_host,b_host,vec![poison;d.args[2].bytes]];
+    let (t0,ticks0,(busy0,wait0))=(traffic(sim),sim.ticks,core_sum(sim));
+    sim.submit(insts,&mut args).unwrap_or_else(|e|panic!("{label} {m}x{N}x{k}: submit failed: {e}"));
+    let ticks=sim.ticks-ticks0;let (busy1,wait1)=core_sum(sim);
+    let (pw,bound)=(i32::from_le_bytes([poison;4]),k as i64*16384);
+    assert!((pw as i64).abs()>bound,"{label}: the poison word must lie outside the accumulator bound");
+    assert_eq!(args[2].len()%4,0,"{label}");
+    for (i,w) in args[2].chunks_exact(4).enumerate() {
+        let v=i32::from_le_bytes(w.try_into().unwrap());
+        assert!(v!=pw,"{label}: raw word {i} of the C arena was never written (still poison)");
+        assert!((v as i64).abs()<=bound,"{label}: raw word {i} = {v} exceeds the accumulator bound {bound}");
+    }
+    let cpu=cpu_reference(a,b,m,N,k);assert_eq!(d.reference(a,b),cpu,"{label}: design reference != independent reference");
+    let oracle=oracle_arena(&cpu,m,waves);assert_eq!(oracle.len(),args[2].len(),"{label}: arena size");
+    if let Some(at)=first_diff(&args[2],&oracle) {
+        let (word,tile)=(at/4,at/T32);panic!("{label} {m}x{N}x{k}: raw arena != oracle at byte {at} (word {word}, tile {tile}): got {} want {}",
+            i32::from_le_bytes(args[2][at&!3..(at&!3)+4].try_into().unwrap()),i32::from_le_bytes(oracle[at&!3..(at&!3)+4].try_into().unwrap()))
+    }
+    let got=d.unpack_out(&args[2]);assert_eq!(got.len(),cpu.len(),"{label}");
+    if let Some(i)=(0..got.len()).find(|&i|got[i]!=cpu[i]) {panic!("{label} {m}x{N}x{k}: unpack_out mismatch at ({},{}) got {} want {}",i/N,i%N,got[i],cpu[i])}
+    assert_eq!([signature(&args[0]),signature(&args[1])],before,"{label}: packed inputs changed");
+    assert!(a==&a0[..]&&b==&b0[..],"{label}: operands changed");
+    let (read,written)=assert_traffic32(&t0,&traffic(sim),1,waves,kc,label);
+    assert_eq!((read,written),(d.host_bytes_read(),d.host_bytes_written()),"{label}: host byte totals");
+    assert_eq!(written,args[2].len() as u64,"{label}: shim S2MM traffic must equal the arena bytes (no duplicate writes)");
+    let padded=(waves*WAVE_M-m)*N;
+    eprintln!("PASS {label} {m}x{N}x{k} I32: {} raw words == oracle ({padded} padded-row words overwritten with 0, all |v|<={bound}); {ticks} functional ticks (not hardware cycles), \
+        {:.1}/wave; core busy={} lock_wait={}; DRAM read={read} write={written} (per column S2MM0/1={} B)",args[2].len()/4,ticks as f64/waves as f64,busy1-busy0,wait1-wait0,waves*2*T32);
+    Run32{ticks,busy:busy1-busy0,wait:wait1-wait0,read,written,c:args.swap_remove(2)}
+}
+fn once32(d:&ArrayDesign,label:&str,m:usize,k:usize,a:&[i8],b:&[i8])->Run32 {submit32(&mut fresh(d),d,&d.insts,label,m,k,a,b,POISONS[0])}
+
+// ---------------------------------------------------------------- operands
+/// Rows alternate -128 / +127 (`flip` exchanges them), as do the columns: C = k*16384 (-128 x -128), -k*128*127 (mixed) and
+/// k*127*127 (+127 x +127) all occur, so K = 2560 reaches +41943040 and -41615360.
+fn signed_extremes(m:usize,k:usize,flip:bool)->(Vec<i8>,Vec<i8>) {
+    let a=(0..m*k).map(|x|if (x/k%2==0)^flip {-128} else {127}).collect();
+    let b=(0..k*N).map(|x|if (x%N%2==0)^flip {-128} else {127}).collect();(a,b)
+}
+type Operands=(Vec<i8>,Vec<i8>);
+
+// ---------------------------------------------------------------- exact full submits, two different operands per Config
+/// Two different operand sets on ONE `Config` (the second submit starts from the end state of the first: wave parity
+/// `waves%2`, `kc*waves%2`), each with a different poison byte; the two arenas differ and the second equals a fresh-`Config`
+/// run of the same operands byte for byte.
+fn pair32(label:&str,m:usize,k:usize,ctl:Control,ops:[Operands;2]) {
+    let d=design32(m,k,ctl);check_layout32(&d,m,k,label);let mut sim=fresh(&d);let waves=d.waves();let what=format!("{label} {ctl:?}");
+    let runs:Vec<Run32>=ops.iter().enumerate().map(|(i,(a,b))|submit32(&mut sim,&d,&d.insts,&format!("{what} submit{i} (waves {waves}, kc*waves {})",k/64*waves),m,k,a,b,POISONS[i])).collect();
+    assert!(runs[0].c!=runs[1].c,"{what}: different operands must give different C arenas");
+    let (a,b)=&ops[1];let fresh_run=once32(&d,&format!("{what} fresh Config, operands of submit1"),m,k,a,b);
+    if let Some(at)=first_diff(&runs[1].c,&fresh_run.c) {panic!("{what}: reused-Config arena != fresh-Config arena at byte {at}")}
+}
+fn random_pair(m:usize,k:usize)->[Operands;2] {[random(m,k,SEEDS[0]),random(m,k,SEEDS[1])]}
+#[test] fn g80_i32_exact_one_wave_m1_200_256_k64_128() {
+    for m in [1,200,256] {for k in [64,128] {for ctl in BOTH {pair32("G80 I32 one wave",m,k,ctl,random_pair(m,k))}}}
+}
+#[test] fn g80_i32_exact_multi_wave_m300_513_k64_128() {
+    for m in [300,513] {for k in [64,128] {for ctl in BOTH {pair32("G80 I32 multi wave",m,k,ctl,random_pair(m,k))}}}
+}
+#[test] fn g80_i32_exact_k2560_small_m() {
+    for m in [8,64] {for ctl in BOTH {pair32("G80 I32 K2560 small M",m,2560,ctl,random_pair(m,2560))}}
+}
+/// Waves 1..4 and padded M back to back: odd and even `waves` / `kc*waves` on one `Config` each.
+#[test] fn g80_i32_consecutive_submits_odd_and_even_wave_parity() {
+    for (m,k) in [(256,64),(512,64),(768,64),(1024,64),(200,128),(300,128),(513,64)] {
+        for ctl in BOTH {pair32("G80 I32 parity",m,k,ctl,random_pair(m,k))}
+    }
+}
+/// K = 2560 with -128 / +127 rows and columns reaches the accumulator bounds exactly (+41943040 / -41615360) in BOTH operand
+/// polarities, the second submit following the first on the same `Config`.
+#[test] fn g80_i32_signed_extremes_k2560_reach_exact_bounds() {
+    for m in [8,64] {
+        let k=2560;
+        for flip in [false,true] {
+            let (a,b)=signed_extremes(m,k,flip);let c=cpu_reference(&a,&b,m,N,k);
+            assert_eq!((c.iter().copied().max().unwrap(),c.iter().copied().min().unwrap()),(41943040,-41615360),"M={m} flip={flip}: extremes must reach the bounds");
+        }
+        for ctl in BOTH {pair32("G80 I32 K2560 extremes",m,k,ctl,[signed_extremes(m,k,false),signed_extremes(m,k,true)])}
+    }
+}
+/// The mixed -128 / 127 / -1 / 1 / 0 / alternating / pseudo-random classes of the int8 extremes test at raw int32 precision.
+#[test] fn g80_i32_extreme_classes_full_range() {
+    for (m,k) in [(200,128),(300,64),(256,640)] {
+        for ctl in BOTH {pair32("G80 I32 extreme classes",m,k,ctl,[extremes(m,k,0),extremes(m,k,3)])}
+    }
+}
+/// The int8 and I32 designs of one shape pack identical operands and differ only in the C stream (4x the bytes).
+#[test] fn g80_i32_layout_is_four_times_int8_c_and_same_inputs() {
+    for (m,k) in [(1,64),(200,128),(300,64),(513,128),(64,2560)] {
+        let (a,b)=random(m,k,SEEDS[2]);let (d8,d32)=(design(m,k,Control::Fast,12),design32(m,k,Control::Fast));check_layout32(&d32,m,k,"I32 layout");
+        assert_eq!(d8.pack_in(&a,&b),d32.pack_in(&a,&b),"M={m} K={k}: packed A / B must not depend on the epilogue");
+        assert_eq!(d32.args[2].bytes,4*d8.args[2].bytes,"M={m} K={k}: C bytes");assert_eq!((d8.args[0].bytes,d8.args[1].bytes),(d32.args[0].bytes,d32.args[1].bytes));
+    }
+}
+#[test] fn g80_i32_rejects_unsupported_shapes_and_probe_layouts() {
+    let mut cases:Vec<(String,bool)>=Vec::new();
+    for n in [0usize,1,640,1279,1281,2560] {cases.push((format!("N={n}"),rejects(||{design_g80(256,n,128,Epilogue::I32,Control::Fast);})))}
+    for k in [0usize,1,63,65,2559,2561,5120] {cases.push((format!("K={k}"),rejects(||{design_g80(256,N,k,Epilogue::I32,Control::Fast);})))}
+    for m in [0usize,256*256+1] {cases.push((format!("M={m}"),rejects(||{design_g80(m,N,64,Epilogue::I32,Control::Fast);})))}
+    for layout in 1u8..=3 {cases.push((format!("layout={layout}"),rejects(||{design_g80(256,N,64,Epilogue::I32,Control::Probe(Probe{layout,..Probe::default()}));})))}
+    assert_all_rejected(cases);
+}
+
+// ---------------------------------------------------------------- memtile descriptors, locks and queues parsed from the TXN
+// Contract: per column and core row `r` ONE 20480 B slot at memtile offset 0x4000 + r*0x5000 holds each of the two 20480 B
+// stripes of a wave in turn. Producer S2MM `r` runs the finite chain PROD_BD[r][0] -> [1] (5120 words each, `repeat = mw`),
+// the finite drain chain DRAIN_BD0[g]..+3 (MM2S0 rows 0, 1 / MM2S3 rows 2, 3: row0, row0, row1, row1, `repeat = mw`)
+// releases the slot back. Both chains of a row use the same empty / full lock pair (initial 1 / 0).
+#[derive(Debug,PartialEq,Clone,Copy)]
+struct MemBd {len:u32,addr:u32,next:Option<u32>,acq:Option<(u32,i32)>,rel:Option<(u32,i32)>}
+fn s7(v:u32)->i32 {(((v&0x7f)<<25) as i32)>>25}
+fn mem_bd_of(ops:&[TxnOp],col:u32,id:u32,what:&str)->MemBd {
+    let at=mem_bd_addr(col,id);
+    let found:Vec<&Vec<u32>>=ops.iter().filter_map(|o|match o {TxnOp::BlockWrite(a,w) if *a==at&&w.len()==8=>Some(w),_=>None}).collect();
+    assert_eq!(found.len(),1,"{what}: col {col} memtile BD{id} must be written exactly once");let w=found[0];
+    MemBd{len:w[0]&0x1ffff,addr:(w[1]&0x7ffff)*4,next:if w[1]>>19&1==1 {Some(w[1]>>20&0x3f)} else {None},
+        acq:if w[7]>>15&1==1 {Some((w[7]&0xff,s7(w[7]>>8)))} else {None},rel:Some((w[7]>>16&0xff,s7(w[7]>>24)))}
+}
+/// Memtile (row 1) start-queue writes of `(col, mm2s, ch)` as `(first BD, repeat)`.
+fn queue_writes(ops:&[TxnOp],col:u32,mm2s:bool,ch:u32)->Vec<(u32,u32)> {
+    let off=mem_queue_off(mm2s,ch);
+    ops.iter().filter_map(|o|match *o {TxnOp::Write(a,v) if a>>25==col&&(a>>20)&31==1&&a&0xfffff==off=>Some((v&0xffff,(v>>16&0xff)+1)),_=>None}).collect()
+}
+/// Every memtile start-queue write in the ops (all columns) queues a BD of the bank of its channel (even channel => id < 24,
+/// odd channel => id >= 24) and no BD id reaches 48; every memtile BD block write targets an id < 48.
+fn assert_bank_aware(ops:&[TxnOp],what:&str)->usize {
+    let mut n=0;
+    for o in ops {match *o {
+        TxnOp::Write(a,v) if (a>>20)&31==1&&(0xa0600..0xa0660).contains(&(a&0xfffff))&&(a&0xfffff)%8==4=>{
+            let idx=((a&0xfffff)-0xa0604)/8;assert!(idx<12,"{what}: queue register {a:#x}");let ch=if idx<6 {idx} else {idx-6};let bd=v&0xffff;
+            assert!(bd<48,"{what}: queue write {a:#x} queues BD{bd}");assert_eq!(bd>=24,ch%2==1,"{what}: memtile {} ch {ch} queued BD{bd}: BD bank != channel bank",if idx<6 {"S2MM"} else {"MM2S"});n+=1;
+        }
+        TxnOp::BlockWrite(a,ref w) if (a>>20)&31==1&&w.len()==8&&(0xa0000..0xa0600).contains(&(a&0xfffff))=>assert!(((a&0xfffff)-0xa0000)/0x20<48,"{what}: memtile BD {a:#x}"),
+        _=>{}
+    }}
+    n
+}
+/// The C-channel queues of every column: S2MM `r` queues PROD_BD[r][0] and MM2S 0 / 3 queue BD 6 / 32 with `repeat = mw`;
+/// every such write is that one (`once`: exactly one write, as in the full TXN).
+fn assert_c_queues(ops:&[TxnOp],mw:usize,once:bool,what:&str) {
+    let check=|got:Vec<(u32,u32)>,want:(u32,u32),label:String|{
+        assert!(!got.is_empty()&&got.iter().all(|&q|q==want),"{what}: {label}: queue writes {got:?}, want only {want:?}");
+        if once {assert_eq!(got.len(),1,"{what}: {label}: exactly one queue write")}
+    };
+    for col in 0..COLS as u32 {
+        for r in 0..4 {check(queue_writes(ops,col,false,r as u32).into_iter().filter(|q|PROD_BD[r].contains(&q.0)).collect(),(PROD_BD[r][0],mw as u32),format!("col {col} C producer S2MM{r}"))}
+        for g in 0..2 {check(queue_writes(ops,col,true,DRAIN_CH[g]),(DRAIN_BD0[g],mw as u32),format!("col {col} C drain MM2S{}",DRAIN_CH[g]))}
+    }
+}
+fn assert_i32_descriptors(m:usize,k:usize,ctl:Control) {
+    let d=design32(m,k,ctl);let mw=m.div_ceil(WAVE_M);let what=format!("G80 I32 descriptors {ctl:?} {m}x{N}x{k}");
+    let ops=parse_txn(&d.insts).unwrap();assert!(assert_bank_aware(&ops,&what)>0,"{what}: no memtile queue writes");
+    let mem_end=0x80000+0x18000;
+    for col in 0..COLS as u32 {
+        let mut pairs=Vec::new();
+        for r in 0..4usize {
+            let addr=0x80000+MEM_C0+r as u32*MEM_C_ROW;let w=format!("{what} col {col} row {r}");
+            let p=PROD_BD[r].map(|id|mem_bd_of(&ops,col,id,&w));
+            for (i,b) in p.iter().enumerate() {
+                assert_eq!((b.len,b.addr),(STRIPE_WORDS,addr),"{w}: producer BD{} length / address",PROD_BD[r][i]);assert!(b.addr+4*b.len<=mem_end,"{w}: C slot overlaps A / B regions");
+            }
+            assert_eq!((p[0].next,p[1].next),(Some(PROD_BD[r][1]),None),"{w}: finite producer chain");
+            assert_eq!(p[0].acq,p[1].acq,"{w}");assert_eq!(p[0].rel,p[1].rel,"{w}: both stripes use one empty / full pair");
+            let (empty,full)=(p[0].acq.expect("producer acquires empty"),p[0].rel.expect("producer releases full"));
+            assert_eq!((empty.1,full.1),(-1,1),"{w}: producer lock values");assert!((72..80).contains(&empty.0)&&(72..80).contains(&full.0),"{w}: only memtile locks 8..15 carry C: empty {} full {}",empty.0,full.0);
+            let (g,rr)=(r/2,(r%2) as u32);
+            for t in 0..2u32 {
+                let id=DRAIN_BD0[g]+2*rr+t;let b=mem_bd_of(&ops,col,id,&w);
+                assert_eq!((b.len,b.addr),(STRIPE_WORDS,addr),"{w}: drain BD{id} length / address");assert_eq!(b.acq,Some((full.0,-1)),"{w}: drain BD{id} acquires full");
+                assert_eq!(b.rel,Some((empty.0,1)),"{w}: drain BD{id} releases empty");
+            }
+            assert_eq!(PROD_BD[r][0]>=24,r%2==1,"{w}: producer bank");assert_eq!(DRAIN_BD0[g]>=24,DRAIN_CH[g]%2==1,"{w}: drain bank");
+            let local=(empty.0-64,full.0-64);
+            for (id,want) in [(local.0,1u32),(local.1,0)] {
+                let at=pm_npu::regs::tile(col,1,0xc0000+id*0x10);
+                let vals:Vec<u32>=ops.iter().filter_map(|o|match *o {TxnOp::Write(a,v) if a==at=>Some(v),_=>None}).collect();
+                assert_eq!(vals.last().copied(),Some(want),"{w}: memtile lock {id} initial value (writes {vals:?})");
+            }
+            pairs.push(local);
+        }
+        for g in 0..2 {
+            for t in 0..4u32 {
+                let b=mem_bd_of(&ops,col,DRAIN_BD0[g]+t,&format!("{what} col {col}"));
+                assert_eq!(b.next,if t<3 {Some(DRAIN_BD0[g]+t+1)} else {None},"{what} col {col}: drain chain {g} BD{} next",DRAIN_BD0[g]+t);
+            }
+        }
+        let mut ids:Vec<u32>=pairs.iter().flat_map(|p|[p.0,p.1]).collect();ids.sort();ids.dedup();assert_eq!(ids.len(),8,"{what} col {col}: four distinct lock pairs");
+        for id in 16..24u32 {
+            let at=pm_npu::regs::tile(col,1,0xc0000+id*0x10);
+            assert!(ops.iter().all(|o|!matches!(o,TxnOp::Write(a,_) if *a==at)),"{what} col {col}: memtile lock {id} (the removed second slot) must not be initialised");
+        }
+    }
+    assert_c_queues(&ops,mw,true,&what);
+    // lean and forced-requeue TXNs queue the same finite C tasks and obey the same bank rule
+    let lean=parse_txn(&lean_of(&d,&what)).unwrap();assert!(assert_bank_aware(&lean,&format!("{what} lean"))>0);assert_c_queues(&lean,mw,false,&format!("{what} lean"));
+    for extra in [vec![FORCE_B],vec![FORCE_C],vec![FORCE_B,FORCE_C]] {
+        let f=parse_txn(&d.lean_insts_requeue(&extra).unwrap_or_else(|e|panic!("{what}: lean_insts_requeue: {e}"))).unwrap();
+        assert_bank_aware(&f,&format!("{what} forced {extra:?}"));assert_c_queues(&f,mw,false,&format!("{what} forced {extra:?}"));
+    }
+    eprintln!("PASS {what}: per column 4 single 20480 B slots, producers {PROD_BD:?}, drains {DRAIN_BD0:?} (+3), repeat mw={mw}, locks parsed, banks checked");
+}
+#[test] fn g80_i32_memtile_descriptors_locks_and_queues_one_wave() {for (m,k) in [(256,64),(200,128),(1,64)] {for ctl in BOTH {assert_i32_descriptors(m,k,ctl)}}}
+#[test] fn g80_i32_memtile_descriptors_locks_and_queues_multi_wave() {for (m,k) in [(512,64),(513,128),(768,192)] {for ctl in BOTH {assert_i32_descriptors(m,k,ctl)}}}
+/// The int8 C descriptors are untouched: two 10240 B slots, cyclic producer rings and a cyclic four BD drain chain.
+#[test] fn g80_int8_c_descriptors_unchanged_next_to_i32() {
+    for (m,k) in [(256,64),(512,128)] {
+        let d=design(m,k,Control::Fast,12);let ops=parse_txn(&d.insts).unwrap();assert_bank_aware(&ops,"int8");
+        for col in 0..COLS as u32 {for r in 0..4usize {
+            let off=|slot:u32|0x80000+MEM_C0+slot*0xa000+r as u32*0x2800;let w=format!("int8 col {col} row {r}");
+            let p=PROD_BD[r].map(|id|mem_bd_of(&ops,col,id,&w));
+            assert_eq!((p[0].len,p[0].addr,p[1].len,p[1].addr),(2560,off(0),2560,off(1)),"{w}: producer slots");
+            assert_eq!((p[0].next,p[1].next),(Some(PROD_BD[r][1]),Some(PROD_BD[r][0])),"{w}: cyclic ring");
+            let (g,rr)=(r/2,(r%2) as u32);
+            for slot in 0..2u32 {
+                let id=DRAIN_BD0[g]+slot*2+rr;let b=mem_bd_of(&ops,col,id,&w);
+                assert_eq!((b.len,b.addr,b.next),(2560,off(slot),Some(DRAIN_BD0[g]+(slot*2+rr+1)%4)),"{w}: drain BD{id}");
+            }
+        }}
+    }
+}
+
+// ---------------------------------------------------------------- lean submits and forced requeues (I32 has no C parity repair)
+/// One submit of `insts` on `sim` for seed operands: exact (full oracle arena), byte-equal to a fresh full run (whose own
+/// retained state equals `initial`), and the retained state afterwards equals `initial`.
+macro_rules! lean_step32 {
+    ($sim:expr,$d:expr,$insts:expr,$initial:expr,$m:expr,$k:expr,$seed:expr,$what:expr) => {{
+        let (a,b)=random($m,$k,$seed);let what:String=$what;
+        let mut full=fresh($d);let reference=submit32(&mut full,$d,&$d.insts,&format!("{what} (fresh full oracle)"),$m,$k,&a,&b,POISONS[0]);
+        assert!(full.state_snapshot()==$initial,"{what}: fresh full run state != initial full state");
+        let run=submit32($sim,$d,$insts,&what,$m,$k,&a,&b,POISONS[1]);
+        if let Some(i)=first_diff(&run.c,&reference.c) {panic!("{what}: C bytes != fresh full TXN bytes at byte {i}")}
+        assert!($sim.state_snapshot()==$initial,"{what}: retained state != fresh full state");
+        eprintln!("MEASURED {what}: {} ticks vs fresh full {} ticks",run.ticks,reference.ticks);
+    }};
+}
+/// Full (zero operands) -> three lean submits with fresh operands on the SAME Config.
+fn lean_repeat32(m:usize,k:usize,ctl:Control) {
+    let d=design32(m,k,ctl);let what=format!("G80 I32 {ctl:?} {m}x{N}x{k}");let lean=lean_of(&d,&what);
+    let mut sim=primed(&d);let initial=sim.state_snapshot();
+    for (i,seed) in SEEDS.into_iter().enumerate() {lean_step32!(&mut sim,&d,&lean,initial,m,k,seed,format!("{what} lean #{i}"))}
+    eprintln!("PASS I32 lean x3 {what} (waves {}): exact oracle arenas, byte-equal to fresh full, state == fresh full; full {} B lean {} B",d.waves(),d.insts.len(),lean.len());
+}
+/// full -> lean -> full -> lean on one Config.
+fn lean_interleave32(m:usize,k:usize,ctl:Control) {
+    let d=design32(m,k,ctl);let what=format!("G80 I32 {ctl:?} {m}x{N}x{k}");let lean=lean_of(&d,&what);
+    let mut sim=primed(&d);let initial=sim.state_snapshot();
+    for (i,(seed,is_lean)) in [(SEEDS[0],false),(SEEDS[1],true),(SEEDS[2],false),(0xdeadbeef,true)].into_iter().enumerate() {
+        let label=format!("{what} interleave #{i} {}",if is_lean {"lean"} else {"full"});
+        lean_step32!(&mut sim,&d,if is_lean {&lean[..]} else {&d.insts[..]},initial,m,k,seed,label);
+    }
+    eprintln!("PASS I32 full->lean->full->lean {what}");
+}
+/// Forced MM2S0 / S2MM4 requeues keep every finite queue incl. the C tasks (`repeat = mw`) and give the fresh full state.
+fn forced_requeue32(m:usize,k:usize,ctl:Control) {
+    let d=design32(m,k,ctl);let what=format!("G80 I32 forced {ctl:?} {m}x{N}x{k}");let plain=lean_of(&d,&what);
+    let sets:[(&str,Vec<(u32,DmaDirection,u32)>);3]=[("B S2MM4",vec![FORCE_B]),("C MM2S0",vec![FORCE_C]),("B S2MM4 + C MM2S0",vec![FORCE_B,FORCE_C])];
+    for (label,extra) in sets {
+        let forced=d.lean_insts_requeue(&extra).unwrap_or_else(|e|panic!("{what} {label}: lean_insts_requeue: {e}"));
+        let mut sim=primed(&d);let initial=sim.state_snapshot();
+        for (i,seed) in SEEDS.into_iter().enumerate() {lean_step32!(&mut sim,&d,&forced,initial,m,k,seed,format!("{what} {label} #{i}"))}
+        lean_step32!(&mut sim,&d,&plain,initial,m,k,0xdeadbeef,format!("{what} plain lean after {label}"));
+        eprintln!("PASS I32 forced requeue {label} {what}: lean {} B forced {} B",plain.len(),forced.len());
+    }
+}
+/// Waves 1..3 (odd and even): the lean body needs no C parity repair, every wave count behaves like the full state.
+const LEAN32_SHAPES:[(usize,usize);6]=[(256,64),(256,128),(512,64),(768,64),(200,128),(513,64)];
+#[test] fn g80_i32_lean_three_submits_exact_and_state_restored() {for (m,k) in LEAN32_SHAPES {for ctl in BOTH {lean_repeat32(m,k,ctl)}}}
+#[test] fn g80_i32_lean_full_lean_interleave_exact_and_state_restored() {for (m,k) in LEAN32_SHAPES {for ctl in BOTH {lean_interleave32(m,k,ctl)}}}
+#[test] fn g80_i32_lean_forced_requeue_one_to_three_waves() {for (m,k) in [(256,64),(512,128),(768,64),(200,128)] {for ctl in BOTH {forced_requeue32(m,k,ctl)}}}
+#[test] fn g80_i32_lean_large_k() {for (m,k) in [(160,2560),(512,640)] {lean_repeat32(m,k,Control::Fast);lean_interleave32(m,k,Control::Fast)}}
+
+// ---------------------------------------------------------------- grouped launch (`append_run_body`) with I32 experts
+/// Experts with distinct M, all padding to the same wave count: operands, packed operands and the eager fresh-`Config` full run
+/// (itself a full oracle check). `shift` is unused for I32 (0).
+fn experts32(k:usize,ms:&[usize],ctl:Control,seed0:u32)->Vec<Expert> {
+    let waves=ms[0].div_ceil(WAVE_M);
+    ms.iter().enumerate().map(|(e,&m)|{
+        let d=design32(m,k,ctl);check_layout32(&d,m,k,"I32 expert");assert_eq!(d.waves(),waves,"expert M={m} must pad to {waves} wave(s)");
+        let (a,b)=random(m,k,seed0.wrapping_add(e as u32*0x9e37));let mut eager=fresh(&d);
+        let run=submit32(&mut eager,&d,&d.insts,&format!("G80 I32 eager expert {e} {ctl:?}"),m,k,&a,&b,POISONS[0]);
+        let packed=d.pack_in(&a,&b);Expert{m,k,shift:0,a,b,d,packed,eager_c:run.c,eager}
+    }).collect()
+}
+/// Group TXN on `sim`: every expert's C region is byte-equal to its eager bytes, equals the independent reference, holds no
+/// poison word and stays bounded; operands untouched, no byte outside the C regions written, S2MM bytes = the experts' arenas.
+fn run_group32(sim:&mut Config,ex:&[Expert],txn:&[u8],what:&str)->Vec<Vec<u8>> {
+    let mut args=group_args(ex);let before=args.clone();let (t0,ticks0)=(traffic(sim),sim.ticks);let waves=ex[0].d.waves();
+    sim.submit(txn,&mut args).unwrap_or_else(|e|panic!("{what}: group submit failed: {e}"));
+    let kc=ex[0].k/64;let (read,written)=assert_traffic32(&t0,&traffic(sim),ex.len(),ex.len()*waves,kc,what);
+    let mut owned=vec![false;args[2].len()];let pw=i32::from_le_bytes([POISON;4]);
+    for (e,x) in ex.iter().enumerate() {
+        let at=arena_off(ex,e,2) as usize;let r=at..at+x.d.args[2].bytes;let bound=x.k as i64*16384;
+        for (i,w) in args[2][r.clone()].chunks_exact(4).enumerate() {
+            let v=i32::from_le_bytes(w.try_into().unwrap());assert!(v!=pw&&(v as i64).abs()<=bound,"{what}: expert {e} (M={}) raw word {i} = {v}: unwritten or unbounded",x.m);
+        }
+        if let Some(i)=first_diff(&args[2][r.clone()],&x.eager_c) {panic!("{what}: expert {e} (M={}) C bytes != eager at byte {i}",x.m)}
+        let cpu=cpu_reference(&x.a,&x.b,x.m,N,x.k);assert_eq!(x.d.unpack_out(&args[2][r.clone()]),cpu,"{what}: expert {e} (M={}) != CPU reference",x.m);
+        assert!(args[2][r.clone()]==oracle_arena(&cpu,x.m,waves)[..],"{what}: expert {e} (M={}) arena != padded oracle",x.m);
+        for o in &mut owned[r] {*o=true}
+    }
+    assert!(args[0]==before[0]&&args[1]==before[1],"{what}: operand arenas (incl. guards) changed");
+    for (i,&o) in owned.iter().enumerate() {if !o {assert_eq!(args[2][i],POISON,"{what}: stray write outside every C region at byte {i}")}}
+    assert_eq!((read,written),(ex.iter().map(|x|x.d.host_bytes_read()).sum::<u64>(),ex.iter().map(|x|x.d.host_bytes_written()).sum::<u64>()),"{what}: summed host bytes");
+    eprintln!("PASS {what}: E={} M={:?}: every expert byte-equal to its eager fresh-Config C, CPU-exact and oracle-exact; {} group ticks; DRAM read={read} write={written}",
+        ex.len(),ex.iter().map(|x|x.m).collect::<Vec<_>>(),sim.ticks-ticks0);
+    args
+}
+/// E3 group of full bodies: exact, retained state of one full run, resubmit with new operands, then a standalone run.
+fn group_exact32(ms:&[usize],k:usize,ctl:Control) {
+    let ex=experts32(k,ms,ctl,0xc0ffee21);let txn=group_txn(&ex,false);let mut sim=fresh(&ex[0].d);let what=format!("G80 I32 group {ctl:?} M={ms:?} K={k}");
+    run_group32(&mut sim,&ex,&txn,&what);
+    assert!(sim.state_snapshot()==last_body_only(&ex).state_snapshot(),"{what}: retained state after the group != one fresh full run of the last body");
+    let ex2=experts32(k,ms,ctl,0xbadc0de4);assert_eq!(group_txn(&ex2,false),txn,"{what}: group TXN depends on operands");
+    run_group32(&mut sim,&ex2,&txn,&format!("{what} resubmit"));
+    let y=&ex2[0];submit32(&mut sim,&y.d,&y.d.insts,&format!("{what} standalone after group"),y.m,y.k,&y.a,&y.b,POISONS[1]);
+    assert!(sim.state_snapshot()==ex[0].eager.state_snapshot(),"{what}: retained state after the standalone run != after one full run");
+}
+/// Expert 0 full body then lean bodies equals the all-full group (bytes, state), shorter, and reusable.
+fn group_lean32(ms:&[usize],k:usize,ctl:Control) {
+    let ex=experts32(k,ms,ctl,0xc0ffee22);let (full,lean)=(group_txn(&ex,false),group_txn(&ex,true));let what=format!("G80 I32 lean group {ctl:?} M={ms:?} K={k}");
+    let (mut sim_l,mut sim_f)=(fresh(&ex[0].d),fresh(&ex[0].d));
+    let args_l=run_group32(&mut sim_l,&ex,&lean,&what);let args_f=run_group32(&mut sim_f,&ex,&full,&format!("{what} (all-full oracle)"));
+    for i in 0..3 {if let Some(at)=first_diff(&args_l[i],&args_f[i]) {panic!("{what}: arg{i} differs from the all-full group at byte {at}")}}
+    assert!(sim_l.state_snapshot()==sim_f.state_snapshot(),"{what}: retained state after the lean group != the all-full group");
+    assert!(sim_l.state_snapshot()==last_body_only(&ex).state_snapshot(),"{what}: retained state != one fresh full run of the last body");
+    let ex2=experts32(k,ms,ctl,0xbadc0de5);run_group32(&mut sim_l,&ex2,&lean,&format!("{what} resubmit"));
+    assert!(sim_l.state_snapshot()==sim_f.state_snapshot(),"{what}: state after the second lean group");
+    eprintln!("MEASURED {what}: lean group TXN {} B vs all-full {} B",lean.len(),full.len());
+}
+#[test] fn g80_i32_group_e3_mixed_m_exact() {for (k,ctl) in [(192,Control::Fast),(128,Control::Slow),(64,Control::Fast)] {group_exact32(&[64,160,200],k,ctl)}}
+#[test] fn g80_i32_group_e3_mixed_m_exact_k2560() {group_exact32(&[64,160,200],2560,Control::Fast)}
+#[test] fn g80_i32_group_two_waves_e3_exact() {group_exact32(&[300,512,257],128,Control::Fast)}
+#[test] fn g80_i32_group_lean_tail_equals_all_full() {for (k,ctl) in [(192,Control::Fast),(128,Control::Slow),(64,Control::Fast)] {group_lean32(&[64,160,200],k,ctl)}}
+#[test] fn g80_i32_group_lean_tail_two_waves_equals_all_full() {group_lean32(&[300,512,257],128,Control::Fast);group_lean32(&[512,300],64,Control::Slow)}
+#[test] fn g80_i32_group_lean_tail_k2560() {group_lean32(&[64,160,200],2560,Control::Fast)}
+
+// ---------------------------------------------------------------- `experts::grouped` with an I32 G80 design
+fn g80_groups32(ex:&[Expert],ctl:Control,k:usize)->(GroupedDesign,GroupedDesign) {
+    let plans=plans_of(ex);let rows=ex.iter().map(|x|x.m).max().unwrap().div_ceil(WAVE_M)*WAVE_M;
+    let d=design32(rows,k,ctl);let wave_m=d.waves()*d.wave_m();assert_eq!(wave_m,rows);
+    (grouped(d,wave_m,N,k,&plans,None),grouped_all_full(design32(rows,k,ctl),wave_m,N,k,&plans,None))
+}
+fn check_group_g32(g:&GroupedDesign,plans:&[ExpertPlan],ex:&[Expert],args:&[Vec<u8>],what:&str) {
+    let mut want_args=blank_g(g,None);put_g(&mut want_args,plans,ex);
+    if let Some(i)=first_diff(&args[0],&want_args[0]) {panic!("{what}: A arena modified at byte {i}")}
+    if let Some(i)=first_diff(&args[1],&want_args[1]) {panic!("{what}: B arena modified at byte {i}")}
+    let mut covered=vec![false;args[2].len()];
+    for (e,(p,x)) in plans.iter().zip(ex).enumerate() {
+        let c=c_range_g(g,p,e);
+        if let Some(i)=first_diff(&args[2][c.clone()],&x.eager_c) {panic!("{what}: expert {e} (m={}) C != eager I32 bytes of a fresh Config (byte {i})",p.m)}
+        assert_eq!(g.unpack_out(e,&args[2][c.clone()]),cpu_reference(&x.a,&x.b,x.m,N,x.k),"{what}: expert {e} C != CPU reference");
+        covered[c].fill(true);
+    }
+    assert!(args[2].iter().zip(&covered).all(|(&b,&c)|c||b==POISON),"{what}: C arena written outside the expert regions");
+}
+fn grouped_api_case32(ms:&[usize],k:usize,ctl:Control) {
+    let ex=experts32(k,ms,ctl,0xc0ffee31);let plans=plans_of(&ex);let (g,f)=g80_groups32(&ex,ctl,k);
+    assert!(g.patch_sites.is_empty()&&f.patch_sites.is_empty());assert!(g.pdi==f.pdi,"lean and all-full group load the same PDI");
+    assert_eq!(g.experts(),ex.len());
+    for (e,x) in ex.iter().enumerate() {
+        assert_eq!(g.pack_in(e,&x.a,&x.b),x.packed,"expert {e}: grouped packing == eager packing");
+        assert_eq!(g.reference(e,&x.a,&x.b),cpu_reference(&x.a,&x.b,x.m,N,x.k),"expert {e}: grouped reference == independent reference");
+        assert_eq!(g.unpack_out(e,&x.eager_c),cpu_reference(&x.a,&x.b,x.m,N,x.k),"expert {e}: grouped unpack of the eager C");
+        assert_eq!((g.a_bytes(e),g.b_bytes(e),g.c_bytes(e)),(x.d.args[0].bytes,x.d.args[1].bytes,x.d.args[2].bytes),"expert {e}: sizes");
+    }
+    let (mut sg,mut sf)=(Config::from_pdi(&g.pdi).unwrap(),Config::from_pdi(&f.pdi).unwrap());let ex2=experts32(k,ms,ctl,0xbadc0de6);
+    for (round,x) in [&ex,&ex2].into_iter().enumerate() {
+        let (mut ag,mut af)=(blank_g(&g,None),blank_g(&f,None));put_g(&mut ag,&plans,x);put_g(&mut af,&plans,x);
+        let (tg,tf,(g0,f0))=(traffic(&sg),traffic(&sf),(sg.ticks,sf.ticks));
+        sg.submit(&g.insts,&mut ag).unwrap_or_else(|e|panic!("lean group round {round}: {e}"));sf.submit(&f.insts,&mut af).unwrap_or_else(|e|panic!("all-full group round {round}: {e}"));
+        check_group_g32(&g,&plans,x,&ag,&format!("I32 lean group round {round}"));check_group_g32(&f,&plans,x,&af,&format!("I32 all-full group round {round}"));
+        for i in 0..3 {if let Some(at)=first_diff(&ag[i],&af[i]) {panic!("round {round}: lean group arg{i} != all-full group arg{i} at byte {at}")}}
+        let (kc,w)=(k/64,ex[0].d.waves());
+        let (rg,wg)=assert_traffic32(&tg,&traffic(&sg),ms.len(),w*ms.len(),kc,&format!("I32 lean group round {round}"));
+        let (rf,wf)=assert_traffic32(&tf,&traffic(&sf),ms.len(),w*ms.len(),kc,&format!("I32 all-full group round {round}"));assert_eq!((rg,wg),(rf,wf));
+        assert!(sg.state_snapshot()==sf.state_snapshot(),"round {round}: retained state after the lean group != the all-full group");
+        eprintln!("MEASURED G80 I32 grouped API {ctl:?} E={} M={ms:?} K={k} round {round}: TXN lean {} B vs all-full {} B; {} vs {} functional ticks (not hardware cycles); DRAM read={rg} write={wg}",
+            ms.len(),g.insts.len(),f.insts.len(),sg.ticks-g0,sf.ticks-f0);
+    }
+}
+#[test] fn g80_i32_grouped_api_e3_mixed_m() {for (k,ctl) in [(192,Control::Fast),(128,Control::Slow),(64,Control::Fast)] {grouped_api_case32(&[64,160,200],k,ctl)}}
+#[test] fn g80_i32_grouped_api_e4_boundary_m() {grouped_api_case32(&[1,256,200,64],128,Control::Fast)}
+#[test] fn g80_i32_grouped_api_two_waves_e3() {grouped_api_case32(&[300,512,257],192,Control::Fast);grouped_api_case32(&[512,300,400],64,Control::Slow)}
+#[test] fn g80_i32_grouped_api_e3_k2560() {grouped_api_case32(&[64,160,200],2560,Control::Fast)}
+
+// ---------------------------------------------------------------- simulator timing, int8 vs I32 (functional ticks, NOT silicon cycles)
+/// Same operands, same shape and control: int8 (shift 12) and I32 on fresh `Config`s. Both are checked exact; prints ticks per
+/// wave, core busy / lock_wait and the I32 - int8 deltas. The simulator's tick is a functional event step: the numbers say
+/// nothing about hardware clock cycles, only how the modelled lock / DMA protocol behaves.
+fn timing32(m:usize,k:usize,ctl:Control) {
+    let (kc,waves)=(k/64,m.div_ceil(WAVE_M));let (a,b)=random(m,k,SEEDS[0]);let what=format!("G80 {ctl:?} {m}x{N}x{k}");
+    let d8=design(m,k,ctl,12);let d32=design32(m,k,ctl);let mut s8=fresh(&d8);
+    let [a_host,b_host]=d8.pack_in(&a,&b);let mut args=vec![a_host,b_host,vec![POISON;d8.args[2].bytes]];
+    let (t0,ticks0,(busy0,wait0))=(traffic(&s8),s8.ticks,core_sum(&s8));
+    s8.submit(&d8.insts,&mut args).unwrap_or_else(|e|panic!("{what} int8: submit failed: {e}"));
+    let (t8,(busy1,wait1))=(s8.ticks-ticks0,core_sum(&s8));let (b8,w8)=(busy1-busy0,wait1-wait0);
+    assert_eq!(d8.unpack_out(&args[2]),want(&a,&b,m,k,12),"{what}: int8 exact");assert_traffic(&t0,&traffic(&s8),1,waves,kc,&what);
+    let r32=once32(&d32,&format!("{what} timing"),m,k,&a,&b);
+    assert!(t8>0&&r32.ticks>0,"{what}: both submits must run");assert_eq!(r32.written,4*d8.host_bytes_written(),"{what}: I32 writes 4x the int8 C bytes");assert_eq!(r32.read,d8.host_bytes_read(),"{what}: same input bytes");
+    let (p8,p32)=(t8 as f64/waves as f64,r32.ticks as f64/waves as f64);
+    eprintln!("MEASURED TIMING (simulator functional ticks, NOT silicon cycles) {what} waves={waves}: int8 {t8} ticks ({p8:.1}/wave) core busy={b8} lock_wait={w8}; \
+        I32 {} ticks ({p32:.1}/wave) core busy={} lock_wait={}; delta I32-int8 {:+} ticks ({:+.1}/wave) busy {:+} lock_wait {:+}; C bytes int8 {} I32 {}",
+        r32.ticks,r32.busy,r32.wait,r32.ticks as i64-t8 as i64,p32-p8,r32.busy as i64-b8 as i64,r32.wait as i64-w8 as i64,d8.host_bytes_written(),r32.written);
+}
+#[test] fn g80_i32_timing_vs_int8_k64() {for m in [512,768] {for ctl in BOTH {timing32(m,64,ctl)}}}
+#[test] fn g80_i32_timing_vs_int8_k2560() {timing32(64,2560,Control::Fast);timing32(512,2560,Control::Fast)}
+
+// ---------------------------------------------------------------- odd / even mw reuse and estimate (I32)
+/// full -> lean -> full -> lean and every forced requeue (S2MM4, MM2S0, both) for M = 200 (mw 1, odd) and M = 300 (mw 2, even)
+/// at kc 1 and 3: the finite C tasks (`repeat = mw`) leave no wave-parity state.
+#[test] fn g80_i32_lean_reuse_odd_and_even_mw_k64_k192() {
+    for (m,k) in [(200,64),(200,192),(300,64),(300,192)] {for ctl in BOTH {lean_interleave32(m,k,ctl);forced_requeue32(m,k,ctl)}}
+}
+/// Model numbers, not measurements: the I32 hand-off is `6P` per wave plus the final tail `P` with `P = 20480 / 4 = 5120`
+/// (`output_dma_cycles = (6*waves + 1) * P`); int8 Fast is `(663 + 2560) * waves`.
+#[test] fn g80_i32_estimate_drain_model_vs_int8() {
+    for waves in 1..=3usize {
+        let m=waves*WAVE_M;let (e32,e8)=(design32(m,128,Control::Fast).estimate(1_000_000_000),design(m,128,Control::Fast,12).estimate(1_000_000_000));
+        assert_eq!(e32.output_dma_cycles,(6*waves as u64+1)*5120,"I32 waves {waves}");
+        assert_eq!(e8.output_dma_cycles,(663+2560)*waves as u64,"int8 waves {waves}");
+        assert!(e32.estimated_cycles>e8.estimated_cycles,"waves {waves}: the serial single-slot I32 hand-off must cost more than int8 in the model");
+        eprintln!("MODEL (estimate, not measured) waves {waves}: I32 drain {} cycles, int8 {} cycles; estimated total I32 {} vs int8 {}",e32.output_dma_cycles,e8.output_dma_cycles,e32.estimated_cycles,e8.estimated_cycles);
+    }
 }

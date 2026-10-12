@@ -54,9 +54,11 @@
 //! | G80 B fill S2MM4 BD 4 -> 5 (finite, `repeat = kc`) | `kc` loads of each BD | idle, queue empty; BD 4 / 5 `current = kc mod kc = 0`; ready locks 4 / 6 `kc - kc = 0` | never: requeue `repeat = kc` |
 //! | G80 B guard MM2S1 BD 30 / MM2S5 BD 42 (finite, `repeat = kc`, ready lock -1) | `kc` loads | idle, queue empty; `current = 0` | never: requeue `repeat = kc` |
 //! | G80 B whole MM2S1 BD 31 / MM2S5 BD 43 (finite, `repeat = mw - 1`, no lock, no iteration) | `mw - 1` passes | idle, queue empty | requeue after its guard iff `MW > 1` (omit for `MW = 1`) |
-//! | C rows S2MM {0,1},{24,25},{2,3},{26,27} (V8 / G80: all rows; V9/V10 rows 0,2) | `W` tiles | BD `W mod 2`, `c_lock(W mod 2, r)` lookahead | `W` even |
+//! | C rows S2MM {0,1},{24,25},{2,3},{26,27} (V8 / G80 int8: all rows; V9/V10 rows 0,2) | `W` tiles | BD `W mod 2`, `c_lock(W mod 2, r)` lookahead | `W` even |
 //! | V9/V10 C rows 1,3 S2MM single BD 24/26, iteration wrap 2 | `W` (+1 lookahead acquire) | same BD; register `current = (W+1) mod 2`, latched `W mod 2`, shared pair lock `2 -> 1` | `W` even (odd: engine latch stale, register already 0) |
-//! | C drains MM2S0 {6..9}, MM2S3 {32..35} (two BDs per wave) | `2W` | BD `2W mod 4`, full locks unacquired | `W` even |
+//! | C drains MM2S0 {6..9}, MM2S3 {32..35} (V8 / G80 int8: two BDs per wave) | `2W` | BD `2W mod 4`, full locks unacquired | `W` even |
+//! | G80 I32 C producers S2MM {0,1},{24,25},{2,3},{26,27} (two-stripe chain, finite, `repeat = W`) | `W` passes | idle, queue empty; `c_lock(0, r)` back at 1 / 0 | never: requeue `repeat = W` |
+//! | G80 I32 C drains MM2S0 BD 6..9, MM2S3 BD 32..35 (four-stripe chain, finite, `repeat = W`) | `W` passes | idle, queue empty; full locks unacquired | never: requeue `repeat = W` |
 //!
 //! Locks at the end: every `*_FULL` and `PEER_*` lock is 0 (each release is matched by exactly one acquire, the
 //! pair protocol being symmetric), every `*_EMPTY` lock is initial except the single lookahead credit of each parked
@@ -84,11 +86,18 @@
 //!   on every submit: idempotent after a completed run, required if a reset ever interrupted a guard / fill mid-iteration.
 //!   The finite-queue shape (guard, whole) is the same for every `kc`, `mw` and J / W parity, so the lean state snapshot after
 //!   changing operands or odd / even J / W equals the full submit's.
-//! * **C** is the V8 non-shared pair: `W` odd resets S2MM0..3 and the drains MM2S0 / MM2S3 to BD `C_S2MM_BD[r][0]`, 6, 32 and
+//! * **C (int8)** is the V8 non-shared pair: `W` odd resets S2MM0..3 and the drains MM2S0 / MM2S3 to BD `C_S2MM_BD[r][0]`, 6, 32 and
 //!   returns the slot-1 empty lock `c_lock(1, r)` (initial 1). No shared pair C lock exists for G80, rows 1 and 3 included.
+//! * **C (`Epilogue::I32`)** is finite like B: per row the producer S2MM `r` runs the two-stripe chain `C_S2MM_BD[r][0] -> [1]`
+//!   and each drain MM2S0 / MM2S3 the four-stripe chain `6 -> 7 -> 8 -> 9` / `32 -> .. -> 35`, every task `repeat = W`. Each ends
+//!   idle with an empty queue (no BD is loaded after the last repeat, so no parked BD and no lookahead credit), the single-slot
+//!   `c_lock(0, r)` empty / full pairs are back at 1 / 0 for **every** wave parity, and the BDs carry no iteration. Hence no C
+//!   reset, no C lock write and no parity repair at all, but all six C tasks per column are requeued on every submit with
+//!   `repeat = W` (`W <= 256`); a forced MM2S0 / MM2S3 reset keeps that full-repeat requeue instead of one repeat of BD 6 / 32.
 //! * **Cores**: as every design (`J` odd resets A / B rings and returns `A_EMPTY[1]`, `B_EMPTY[1]`); the core C ring is parked
-//!   at BD 4 for any `W`; `C_EMPTY`, acquired before chunk 0 of each wave, is released back by the drain, so it is 1 at the end
-//!   and needs no write.
+//!   at BD 4 for any `W` (`Epilogue::I32`: the two-BD chain 4 -> 5 -> 4 completes `2W` loads and is parked at BD 4 with
+//!   `C_FULL` unacquired as well); `C_EMPTY`, acquired before chunk 0 of each wave, is released back by the drain (I32: by BD 5,
+//!   after both stripes), so it is 1 at the end and needs no write.
 //!
 //! ## IEF15 (`J = epochs * waves` via `geo.kc = epochs`, `W = waves`)
 //! The IEF15 memtile map, BD ids, locks and tasks are V8's streaming pair (`Topo` kind `Ief15` takes the V8 arms: no
@@ -225,6 +234,13 @@ impl ArrayDesign {
                     }
                 }
                 mem.currents.extend([B_S2MM_BD[0], B_S2MM_BD[1], gemm_g80::G80_B_GUARD_BD[0], gemm_g80::G80_B_GUARD_BD[1]]);
+                // G80 I32: the C producers (two-stripe chain per row) and the C drains (four-stripe chain per drain channel) are
+                // finite and run `mw` passes, like the B tasks: after a completed submit they are idle with empty queues and
+                // every C lock is back at its initial value (no lookahead, single slot), for every wave parity. Requeue them.
+                if topo.is_g80_i32() {
+                    for r in 0..ROWS { mem.requeues.push(task(S2mm, r as u32, C_S2MM_BD[r][0], geo.waves as u32)); }
+                    for g in 0..2 { mem.requeues.push(task(Mm2s, PAIR_C_MM2S_CH[g], PAIR_C_MM2S_BD0[g], geo.waves as u32)); }
+                }
             }
             None => if parity.chunks_odd {
                 mem.reset(S2mm, B_S2MM_CH, B_S2MM_BD[0]);
@@ -276,7 +292,7 @@ impl ArrayDesign {
                 }
             },
         }
-        if parity.waves_odd {
+        if parity.waves_odd && !topo.is_g80_i32() {
             for r in 0..ROWS { mem.reset(S2mm, r as u32, C_S2MM_BD[r][0]); }
             for g in 0..2 { mem.reset(Mm2s, PAIR_C_MM2S_CH[g], PAIR_C_MM2S_BD0[g]); }
             for r in 0..ROWS {

@@ -2,7 +2,7 @@
 // AIE2P instruction fields and scheduling are derived from Xilinx/llvm-aie
 // AIE2PGenInstrInfo.td and AIE2PGenSchedule.td (Apache-2.0 WITH LLVM-exception).
 //! G80 pair core: the V8 pair wavefront of [`gemm_core`] widened from a 128x64 to a 128x80 output tile (five N
-//! pairs per M pair, 40 groups of 32 cycles, 1,315-cycle wavefront), Int8 epilogue only.
+//! pairs per M pair, 40 groups of 32 cycles, 1,315-cycle wavefront), with the int8 epilogue or the raw i32 drain.
 //!
 //! Everything that does not depend on the tile width is reused from `gemm_core`: the [`Assembler`], the
 //! 9-step `PEER_FULL`/`PEER_EMPTY` chunk lock protocol ([`pair_acquire`]/[`pair_release`]), the
@@ -11,8 +11,11 @@
 //! the relocated data-memory map.
 //!
 //! ## Data-memory map (own-tile offsets, a single fixed map; `Probe::layout` must be 0)
-//! `C` i32 accumulator `0x0000..0xa000` (128 x 80 x 4 = 40,960 B); `Cout` int8 `0x7800..0xa000` (10,240 B, inside
-//! the top of `C`); A half slots `0xa000`/`0xb000` (4 KiB); B slots `0xc000`/`0xd400` (5 KiB).
+//! `C` i32 accumulator `0x0000..0xa000` (128 x 80 x 4 = 40,960 B); int8 `Cout` `0x7800..0xa000` (10,240 B, inside
+//! the top of `C`, `Epilogue::Int8` only); A half slots `0xa000`/`0xb000` (4 KiB); B slots `0xc000`/`0xd400` (5 KiB).
+//! `Epilogue::I32` has no `Cout`: the DMA drains `C` itself as two 20,480 B stripes (`[0, 0x5000)` then `[0x5000, 0xa000)`,
+//! core DMA BD 4 -> 5 -> 4, see [`tile_bds_pair`]). The int8 epilogue body is not emitted for I32, and `C_FULL` is released
+//! right after the last chunk (as the V8 I32 protocol of [`gemm_core::program_pair`]).
 //!
 //! ## Wavefront changes against the 128x64 core
 //! * B column stride is `128 * NP = 640` B (`NP = 5`), a C row is `512 * NP = 2560` B. The B pointer steps need the
@@ -26,8 +29,10 @@
 //!   post-modify, `VST.SRS.4x` with `-64 B` steps) so `Cout`, which overlaps the upper part of `C`, only
 //!   overwrites i32 blocks that were already loaded; the closest (store, load) pair is ten cycles apart.
 //! * `C_EMPTY` is acquired before chunk 0 of every wave (also with `Probe::no_compute`): `Cout` lives inside
-//!   `C`, so the previous wave's `Cout` DMA drain must be finished before the first chunk writes `C`. `C_FULL` is
-//!   released after the last `VST.SRS` has committed.
+//!   `C`, so the previous wave's `Cout` DMA drain must be finished before the first chunk writes `C`. For `Epilogue::I32`
+//!   the same acquire is the real stall: `C_EMPTY` is returned by the second stripe BD only after both 20,480 B stripes
+//!   were drained, so chunk 0 of the next wave waits for the whole 40,960 B drain. `C_FULL` is released after the last
+//!   `VST.SRS` has committed (int8) or after the last chunk (I32).
 //!
 //! Lane order of the dm accumulator vs the four bm quarters is the same simulator assumption as in `gemm_core`.
 use super::gemm_core::{self, descriptor, instruction, pair_acquire, pair_pointers, pair_release, Assembler, Control,
@@ -54,6 +59,10 @@ pub const C_ADDR: u32 = 0x0000;
 pub const COUT_ADDR: u32 = 0x7800;
 const LAYOUT: PairLayout = PairLayout { a: A_ADDR, b: B_ADDR, c: C_ADDR, cout: COUT_ADDR };
 const _: () = assert!(COUT_ADDR as usize + COUT_BYTES == C_ADDR as usize + C_BYTES && A_ADDR[0] as usize == C_BYTES);
+/// `Epilogue::I32` drains `C` as two stripes of half the tile (`[C_ADDR, +C_STRIPE_BYTES)` then the upper half) on core BD 4 -> 5.
+pub const C_STRIPE_BYTES: usize = C_BYTES / 2;
+pub const C_STRIPE_BD: [u32; 2] = [gemm_core::C_BD, gemm_core::C_BD + 1];
+const _: () = assert!(C_STRIPE_BYTES == 20480 && 2 * C_STRIPE_BYTES == C_BYTES);
 
 /// N pairs per M pair (each pair is 16 columns).
 const NP: i32 = 5;
@@ -236,23 +245,24 @@ fn epilogue(a: &mut Assembler) {
     a.serial = serial;
 }
 
-/// Validate the epilogue/control knobs shared by [`program_pair`] and [`tile_bds_pair`]; returns the SRS shift.
-fn check(epi: Epilogue, ctl: Control) -> u8 {
+/// Validate the epilogue/control knobs shared by [`program_pair`] and [`tile_bds_pair`]; returns the SRS shift (`None` for
+/// `Epilogue::I32`, which has no SRS conversion).
+fn check(epi: Epilogue, ctl: Control) -> Option<u8> {
     assert_eq!(ctl.probe().layout, 0,
         "G80 128x80 has one fixed data-memory map (C 0x0000, Cout 0x7800, A 0xa000/0xb000, B 0xc000/0xd400); layout={} is not defined",
         ctl.probe().layout);
     match epi {
-        Epilogue::Int8 { shift } => { assert!(shift <= 31, "SRS shift {shift}"); shift }
-        Epilogue::I32 => panic!("G80 128x80 supports only Epilogue::Int8: the int8 Cout buffer (0x7800, {COUT_BYTES} B) \
-            shares the top of the {C_BYTES} B i32 C accumulator, and no separate i32 drain path exists"),
+        Epilogue::Int8 { shift } => { assert!(shift <= 31, "SRS shift {shift}"); Some(shift) }
+        Epilogue::I32 => None,
     }
 }
 
-/// G80 pair core (128x80 tile, Int8 epilogue). Same chunk lock protocol, `Control` disciplines and `Probe` knobs
+/// G80 pair core (128x80 tile, int8 or i32 epilogue). Same chunk lock protocol, `Control` disciplines and `Probe` knobs
 /// (`serial`, `nocompute`, `repeat=N`) as [`gemm_core::program_pair`]; `kc` in `1..=MAX_KC`, `tiles` in `1..=256`,
 /// `Int8 { shift <= 31 }` with `clamp(c >> shift, -128, 127)` semantics, `Probe::layout == 0`.
 /// `C_EMPTY` is acquired before chunk 0 of every wave (also with `no_compute`, which skips only the chunk compute
-/// and the epilogue body); `C_FULL` is released after the epilogue stores retire.
+/// and the epilogue body). `Int8`: `C_FULL` is released after the epilogue stores retire. `I32`: no SRS setup and no
+/// epilogue body; `C_FULL` is released right after the last chunk and `C` is drained in place by the two stripe BDs.
 pub fn program_pair(kc: usize, tiles: usize, role: PairRole, epi: Epilogue, ctl: Control) -> Program {
     assert!((1..=MAX_KC).contains(&kc) && (1..=256).contains(&tiles), "G80 kc {kc} (1..={MAX_KC}) tiles {tiles} (1..=256)");
     let shift = check(epi, ctl);
@@ -261,8 +271,10 @@ pub fn program_pair(kc: usize, tiles: usize, role: PairRole, epi: Epilogue, ctl:
     a.serial = probe.serial;
     for (r, v) in [(0, -1i32 as u32), (1, 1), (2, SIGNED_8X8), (3, tiles as u32), (4, 0)] { a.mov(0, r, v); }
     for (m, v) in MODIFIERS.into_iter().enumerate() { a.mov(2, m, v as u32); }
-    a.set_cr("crSat", 1); a.set_cr("crRnd", 0); a.set_cr("crSRSMode", 0);
-    a.mov_named("s0", u32::from(shift));
+    if let Some(shift) = shift {
+        a.set_cr("crSat", 1); a.set_cr("crRnd", 0); a.set_cr("crSRSMode", 0);
+        a.mov_named("s0", u32::from(shift));
+    }
     let tiles_loop = a.label(); let accumulated = a.label(); let drain = a.label();
     a.bind(tiles_loop);
     a.lock(true, gemm_core::C_EMPTY);
@@ -284,18 +296,22 @@ pub fn program_pair(kc: usize, tiles: usize, role: PairRole, epi: Epilogue, ctl:
     pair_release(&mut a, role);
     a.branch(accumulated, Some((5, true))); a.delay();
     a.bind(drain);
-    if !probe.no_compute { epilogue(&mut a); }
+    if shift.is_some() && !probe.no_compute { epilogue(&mut a); }
     a.lock(false, gemm_core::C_FULL);
     a.add(3, -1); a.branch(tiles_loop, Some((3, true))); a.delay();
     a.emit(&[instruction!("DONE", &[])]);
     a.finish()
 }
 
-/// DMA-view descriptors of the G80 pair core: A halves (4 KiB) on S2MM0, B (5 KiB) on S2MM1, and the int8 `Cout`
-/// (10 KiB) on MM2S0, with the BD ids, channels and lock numbering of `gemm_core`.
-pub fn tile_bds_pair(epi: Epilogue, ctl: Control) -> [[u32; 6]; 5] {
-    check(epi, ctl);
-    let mut bds = [[0; 6]; 5];
+/// DMA-view descriptors of the G80 pair core, indexed by BD id, as a fixed six-slot backing array plus the number of valid BDs
+/// (`5` for `Int8`, `6` for `I32`; no heap allocation): A halves (4 KiB) on S2MM0 (BD 0, 1), B (5 KiB) on S2MM1 (BD 2, 3) and C on
+/// MM2S0, with the BD ids, channels and lock numbering of `gemm_core`. `Int8`: the int8 `Cout` (10 KiB) as the self-cyclic BD 4.
+/// `I32`: `C` drained in place as two [`C_STRIPE_BYTES`] stripes, BD 4 (`C` bytes `[0, 0x5000)`, acquires `C_FULL`) -> BD 5
+/// (`[0x5000, 0xa000)`, releases `C_EMPTY` only after it finished) -> BD 4; the two stripes make one 20,480 B memtile C staging
+/// slot per row sufficient. Emit only `bds[..len]` (the int8 image has no BD 5).
+pub fn tile_bds_pair(epi: Epilogue, ctl: Control) -> ([[u32; 6]; 6], usize) {
+    let shift = check(epi, ctl);
+    let mut bds = [[0; 6]; 6];
     for slot in 0..2 {
         bds[gemm_core::A_BD[slot] as usize] = dma::tile_bd(A_ADDR[slot], (A_HALF_BYTES / 4) as u32,
             BdLocks {acq: Some((gemm_core::A_EMPTY[slot], -1)), rel: Some((gemm_core::A_FULL[slot], 1))},
@@ -304,9 +320,18 @@ pub fn tile_bds_pair(epi: Epilogue, ctl: Control) -> [[u32; 6]; 5] {
             BdLocks {acq: Some((gemm_core::B_EMPTY[slot], -1)), rel: Some((gemm_core::B_FULL[slot], 1))},
             Some(gemm_core::B_BD[1 - slot]));
     }
-    bds[gemm_core::C_BD as usize] = dma::tile_bd(COUT_ADDR, (COUT_BYTES / 4) as u32,
-        BdLocks {acq: Some((gemm_core::C_FULL, -1)), rel: Some((gemm_core::C_EMPTY, 1))}, Some(gemm_core::C_BD));
-    bds
+    if shift.is_some() {
+        bds[gemm_core::C_BD as usize] = dma::tile_bd(COUT_ADDR, (COUT_BYTES / 4) as u32,
+            BdLocks {acq: Some((gemm_core::C_FULL, -1)), rel: Some((gemm_core::C_EMPTY, 1))}, Some(gemm_core::C_BD));
+        (bds, 5)
+    } else {
+        let words = (C_STRIPE_BYTES / 4) as u32;
+        bds[C_STRIPE_BD[0] as usize] = dma::tile_bd(C_ADDR, words,
+            BdLocks {acq: Some((gemm_core::C_FULL, -1)), rel: None}, Some(C_STRIPE_BD[1]));
+        bds[C_STRIPE_BD[1] as usize] = dma::tile_bd(C_ADDR + C_STRIPE_BYTES as u32, words,
+            BdLocks {acq: None, rel: Some((gemm_core::C_EMPTY, 1))}, Some(C_STRIPE_BD[0]));
+        (bds, 6)
+    }
 }
 
 /// Same lock numbering and initial values as `gemm_core` (`C_EMPTY` starts at 1, `PEER_*` at 0).

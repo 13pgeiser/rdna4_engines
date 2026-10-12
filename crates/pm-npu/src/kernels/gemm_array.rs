@@ -205,7 +205,9 @@
 //! of column `c` computes M tile `r/2`, N tile `2c + r%2` of 80 columns); only columns 0..4 inject A. This file only
 //! dispatches (`Kind::G80`): circuits, memtile BDs / locks / queued tasks, host packing and the estimate live in
 //! `gemm_g80`; CDO, TXN, shim BDs and the `emit_dynamic_body` reset / requeue sequence are shared with V8..V10, and every
-//! submit rewrites all G80 memtile BDs after the channel reset.
+//! submit rewrites all G80 memtile BDs after the channel reset. `Epilogue::I32` (raw 40,960 B tile per core, host unpack
+//! row-major) uses six core DMA BDs (two 20,480 B stripes) and one 20,480 B memtile C stage per row drained as two stripes,
+//! with finite C producer / drain tasks (`gemm_g80` module header).
 //!
 //! ## IEF15 ([`Variant::Ief15`], [`iu4_ief15`]): 64x32 core tile, 256 x 256 wave
 //! The V8 pair structure unchanged (circuits [`pair_column_circuits`], memtile map, BD ids, locks, tasks, lean parity plan with
@@ -543,7 +545,7 @@ pub(crate) enum Kind {
     /// core control discipline and data-memory layout (`Control::probe().layout`, see `gemm_core::PairLayout`);
     /// `resident` is the V9 / V10 memtile-resident data movement.
     Pair { epi: Epilogue, ctl: Control, resident: Option<Resident> },
-    /// G80: the V8 pair structure on the 128x80 core ([`gemm_core_g80`], int8 epilogue only). `kc` K64 chunks per tile and
+    /// G80: the V8 pair structure on the 128x80 core ([`gemm_core_g80`], int8 or i32 epilogue). `kc` K64 chunks per tile and
     /// `mw` M-waves fix the memtile B segments and replay counts (N is always one wave of 1280 columns).
     G80 { epi: Epilogue, ctl: Control, kc: usize, mw: usize },
     /// IEF15 ([`iu4_ief15`]): the V8 pair structure and memtile map on the 64x32 [`iu4_ief15_core`] tile (A/B chunks of 2176 B
@@ -570,6 +572,8 @@ impl Topo {
         Topo { rows: ROWS, cols: COLS, kind: Kind::G80 { epi, ctl, kc, mw } }
     }
     pub(crate) fn is_g80(self) -> bool { matches!(self.kind, Kind::G80 { .. }) }
+    /// G80 with the raw i32 epilogue (finite two-stripe C tasks, no C wave-parity state).
+    pub(crate) fn is_g80_i32(self) -> bool { matches!(self.kind, Kind::G80 { epi: Epilogue::I32, .. }) }
     /// IEF15 topology: `epochs` K128 epochs, `mw` x `nw` waves of 256 tokens x 256 features.
     pub(crate) fn ief15(ctl: Control, epochs: usize, mw: usize, nw: usize) -> Topo {
         Topo { rows: ROWS, cols: COLS, kind: Kind::Ief15 { ctl, epochs, mw, nw } }
@@ -583,10 +587,12 @@ impl Topo {
     }
     /// V10: A per M-wave and B resident, `w = mw*NW + nw`.
     fn mw_outer(self) -> bool { self.resident().is_some_and(|r| r.mode == ResidentMode::MwOuter) }
-    /// Bytes of one core C tile as it reaches the host (i32 `C_BYTES`, int8 `COUT_BYTES`, G80 128x80 int8).
+    /// Bytes of one core C tile as it reaches the host (i32 `C_BYTES`, int8 `COUT_BYTES`; G80 128x80: 40,960 B i32,
+    /// 10,240 B int8).
     pub(crate) fn c_tile_bytes(self) -> usize {
         match self.kind {
             Kind::Pair { epi: Epilogue::Int8 { .. }, .. } => COUT_BYTES,
+            Kind::G80 { epi: Epilogue::I32, .. } => gemm_core_g80::C_BYTES,
             Kind::G80 { .. } => gemm_core_g80::COUT_BYTES,
             Kind::Ief15 { .. } => iu4_ief15_core::COUT_BYTES,
             _ => C_BYTES,
@@ -623,9 +629,8 @@ pub(crate) struct Geometry {
 
 impl Geometry {
     /// G80 geometry: `n` is exactly one 1280-column wave, `k` a multiple of 64 up to `gemm_core_g80::MAX_KC` chunks,
-    /// `m` padded to 256-row M-waves (`waves = mw`, `nw = 1`). Int8 epilogue only.
+    /// `m` padded to 256-row M-waves (`waves = mw`, `nw = 1`). Int8 or i32 epilogue.
     pub(crate) fn g80(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control) -> Self {
-        assert!(matches!(epi, Epilogue::Int8 { .. }), "G80 supports the int8 epilogue only, got {epi:?}");
         assert!(m > 0, "empty GEMM");
         assert_eq!(n, G80_WAVE_N, "G80 needs N = {G80_WAVE_N}, got {n}");
         assert!(k % CHUNK_K == 0 && (CHUNK_K..=gemm_core_g80::MAX_KC * CHUNK_K).contains(&k),
@@ -1464,13 +1469,15 @@ fn channel_ctrl(loc: Location, direction: dma::Direction, channel: u32) -> u32 {
     Task { direction, channel, bd, repeat: 1, issue_token: false }.write(loc).0 - 4
 }
 
-/// Per-core DMA descriptors and initial lock values of `topo` (V8 uses the pair kernel's).
-fn core_config(topo: Topo) -> ([[u32; 6]; 5], [i32; 16]) {
+/// Per-core DMA descriptors as a fixed six-slot backing array (indexed by BD id) plus the valid count (G80 `Epilogue::I32` has
+/// six, every other design five; emit `bds[..len]`) and initial lock values of `topo` (V8 uses the pair kernel's).
+fn core_config(topo: Topo) -> (([[u32; 6]; 6], usize), [i32; 16]) {
+    let five = |b: [[u32; 6]; 5]| { let mut bds = [[0; 6]; 6]; bds[..5].copy_from_slice(&b); (bds, 5) };
     match topo.kind {
         Kind::G80 { epi, ctl, .. } => (gemm_core_g80::tile_bds_pair(epi, ctl), gemm_core_g80::initial_locks()),
-        Kind::Ief15 { .. } => (iu4_ief15_core::tile_bds(), gemm_core::initial_locks_pair()),
-        Kind::Pair { epi, ctl, .. } => (gemm_core::tile_bds_pair(epi, ctl), gemm_core::initial_locks_pair()),
-        _ => (gemm_core::tile_bds(), gemm_core::initial_locks()),
+        Kind::Ief15 { .. } => (five(iu4_ief15_core::tile_bds()), gemm_core::initial_locks_pair()),
+        Kind::Pair { epi, ctl, .. } => (five(gemm_core::tile_bds_pair(epi, ctl)), gemm_core::initial_locks_pair()),
+        _ => (five(gemm_core::tile_bds()), gemm_core::initial_locks()),
     }
 }
 
@@ -1484,7 +1491,7 @@ pub(crate) fn build_cdo(topo: Topo, programs: [&[u8]; 2], start: bool) -> Cdo {
     let words: Vec<Vec<u32>> = programs.iter().map(|program| program.chunks(4).map(|chunk| {
         let mut word = [0; 4]; word[..chunk.len()].copy_from_slice(chunk); u32::from_le_bytes(word)
     }).collect()).collect();
-    let (tile_bds, core_locks) = core_config(topo);
+    let ((tile_bds, bd_count), core_locks) = core_config(topo);
     for col in 0..topo.cols as u32 {
         for r in 0..topo.rows {
             let tile = core_loc(col, r);
@@ -1503,7 +1510,7 @@ pub(crate) fn build_cdo(topo: Topo, programs: [&[u8]; 2], start: bool) -> Cdo {
                     cdo.write(addr, value);
                 }
             }
-            for (id, bd) in tile_bds.iter().enumerate() {
+            for (id, bd) in tile_bds[..bd_count].iter().enumerate() {
                 cdo.dma_write(Bd::address(tile, id as u32), bd);
             }
         }
