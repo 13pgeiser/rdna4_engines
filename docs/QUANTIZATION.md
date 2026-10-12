@@ -368,6 +368,10 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 52 | MQ4G256V2L | **MQ4 V2 + per-tensor Lloyd codebook** — 136 B group + `lloyd_levels` F32[16] sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro` |
 | 53 | MQ4G128V2 | Row-local MQ4 V2, per-128 groups of 68 B (4.25 bpw) — passthrough; Qwen4 routed-expert `down_proj` |
 | 54 | QwenI64 | **Reserved in the register; not a quantized weight and no `QuantType` variant.** Raw signed-I64 metadata record (the three PLE hash arrays: multipliers, vocab sizes, prefix offsets) written by the Qwen4 producer |
+| 131 | MQ3I4G128R256 | MQ3-I4 gate/up — planar `[M·K·3/8 B codes][M·K/128 f16 scales]`, R256 FWHT (seeds 42/1042); **typed-qwen4 expert-slab only, no GPU kernels yet (loader refuses)** |
+| 132 | MQ3I4G128R128 | MQ3-I4 down — same planar W3 layout, R128 FWHT (seeds 43/1043); **typed-qwen4 expert-slab only, no GPU kernels yet (loader refuses)** |
+| 133 | MQ2I4G128R256 | MQ2-I4 gate/up — planar `[M·K/4 B codes][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, no GPU kernels yet (loader refuses)** |
+| 134 | MQ2I4G128R128 | MQ2-I4 down — same planar W2 layout, R128 FWHT; **typed-qwen4 expert-slab only, no GPU kernels yet (loader refuses)** |
 
 **Never-reuse reserved wire IDs:** 23 and 25–27 (deliberately unassigned). qt 54 is
 held in the register with disposition `reserved` for the Qwen4 I64 metadata
@@ -376,6 +380,12 @@ were reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt 42 and 53 are now live
 rows (above); qt **43 and 46** have no register row (43 is burned by the retired
 SEL codebook, 46 is the design-only hierarchical `mq4_k`). Do not invent slots —
 edit `qt-register.txt` to claim a number.
+
+IDs **131–134** (MQ3-I4 / MQ2-I4) are fresh allocations above qt130 (compact
+Hessian records, not a `QuantType`). They are planar (codes plane, then f16
+scale plane; codec in `crates/hipfire-runtime/src/mq_i4.rs`), valid only as
+per-expert entries of a Qwen4 artifact declaring `qwen4.expert_slabs` v1
+(`crates/hipfire-arch-qwen4/src/expert_slabs.rs`), and have no GPU kernels yet.
 
 ### PARO4G128 probe payload
 

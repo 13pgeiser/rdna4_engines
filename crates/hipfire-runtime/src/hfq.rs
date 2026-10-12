@@ -2172,6 +2172,10 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         54 => "I64",
         55 => "FP8E4M3B128",
         56 => "FP8E4M3PT",
+        131 => "MQ3I4G128R256",
+        132 => "MQ3I4G128R128",
+        133 => "MQ2I4G128R256",
+        134 => "MQ2I4G128R128",
         _ => "?",
     }
 }
@@ -4696,5 +4700,80 @@ mod ple_rows_binding_tests {
         .unwrap();
         let marker = HfqFile::open(&marked).unwrap().ple_rows_marker().unwrap();
         assert_eq!(marker["location"], "sidecar");
+    }
+}
+
+#[cfg(test)]
+mod mq_i4_header_tests {
+    use super::*;
+    use crate::mq_i4::{decode_tensor, encode_tensor, tensor_bytes, MqI4Profile, GROUP};
+
+    /// Tiny legal shape per profile: R256 profiles `[2,256]`, R128 `[2,128]`.
+    fn shape_for(profile: MqI4Profile) -> (usize, usize) {
+        (2, profile.rotation.width())
+    }
+
+    fn fixture(profile: MqI4Profile) -> (Vec<u8>, Vec<u16>, Vec<u8>) {
+        let (m, k) = shape_for(profile);
+        let levels = usize::from(profile.codec.levels()) + 1;
+        let codes: Vec<u8> = (0..m * k).map(|i| ((i * 5 + 1) % levels) as u8).collect();
+        let scales: Vec<u16> = (0..m * (k / GROUP))
+            .map(|g| 0x3C00 + g as u16)
+            .collect();
+        let bytes = encode_tensor(profile, m, k, &codes, &scales).unwrap();
+        (codes, scales, bytes)
+    }
+
+    #[test]
+    fn qt131_to_134_round_trip_through_hfqm_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqi4.hfq");
+
+        let mut tensors = Vec::new();
+        let mut expected = Vec::new();
+        for profile in MqI4Profile::ALL {
+            let (codes, scales, bytes) = fixture(profile);
+            let (m, k) = shape_for(profile);
+            assert_eq!(bytes.len(), tensor_bytes(profile, m, k).unwrap());
+            let name = format!("model.layers.0.mlp.experts.0.{}", profile.name());
+            tensors.push(HfqMemTensor {
+                name: name.clone(),
+                quant_type: profile.quant_type(),
+                shape: vec![m as u32, k as u32],
+                group_size: GROUP as u32,
+                data: bytes,
+            });
+            expected.push((name, profile, m, k, codes, scales));
+        }
+        write_hfqm_package_mem(&path, 16, r#"{"x":1}"#, &tensors).unwrap();
+
+        let f = HfqFile::open(&path).unwrap();
+        assert_eq!(f.tensors().len(), 4);
+        for (i, (name, profile, m, k, codes, scales)) in expected.iter().enumerate() {
+            let info = &f.tensors()[i];
+            assert_eq!(&info.name, name);
+            assert_eq!(info.quant_type, profile.quant_type());
+            assert_eq!(info.shape, vec![*m as u32, *k as u32]);
+            assert_eq!(info.group_size, 128);
+            assert_eq!(info.data_size, tensor_bytes(*profile, *m, *k).unwrap());
+            assert_eq!(quant_type_to_dtype(info.quant_type), profile.name());
+
+            let (_, payload) = f.tensor_data(name).expect("tensor payload");
+            assert_eq!(payload, &tensors[i].data[..]);
+            let decoded = decode_tensor(*profile, *m, *k, payload).unwrap();
+            assert_eq!(&decoded.codes, codes);
+            assert_eq!(&decoded.scale_bits, scales);
+        }
+    }
+
+    #[test]
+    fn quant_type_to_dtype_names_131_to_134() {
+        assert_eq!(quant_type_to_dtype(131), "MQ3I4G128R256");
+        assert_eq!(quant_type_to_dtype(132), "MQ3I4G128R128");
+        assert_eq!(quant_type_to_dtype(133), "MQ2I4G128R256");
+        assert_eq!(quant_type_to_dtype(134), "MQ2I4G128R128");
+        // Neighbours stay unknown (130 is the compact-Hessian record id).
+        assert_eq!(quant_type_to_dtype(130), "?");
+        assert_eq!(quant_type_to_dtype(135), "?");
     }
 }

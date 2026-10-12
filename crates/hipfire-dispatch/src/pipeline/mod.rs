@@ -61,6 +61,8 @@ pub use steps::{
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
 pub mod superop;
 
+/// Generic-pipeline refusal for the typed-only formats: MQ4G128V2 (qt=53) and
+/// the planar MQ3-I4 / MQ2-I4 dtypes (qt=131..=134).
 fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchError> {
     if dtype == DType::MQ4G128V2 {
         return Err(DispatchError::UnsupportedVariant {
@@ -69,6 +71,9 @@ fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchEr
             arch: "",
             quant: "MQ4G128V2",
         });
+    }
+    if dtype.is_mq_i4() {
+        return Err(reject_mq_i4(dtype, family));
     }
     Ok(())
 }
@@ -131,6 +136,23 @@ fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<
         || [dtypes.router, dtypes.routed_gate_up, dtypes.routed_down].contains(&DType::MQ4G128V2)
     {
         return reject_mq4g128v2(DType::MQ4G128V2, "moe");
+    }
+    let first_mq_i4 = dtypes
+        .per_expert_gate_up
+        .into_iter()
+        .chain(dtypes.per_expert_down)
+        .flatten()
+        .copied()
+        .chain(
+            dtypes
+                .shared
+                .into_iter()
+                .flat_map(|shared| [shared.selector, shared.gate, shared.up, shared.down]),
+        )
+        .chain([dtypes.router, dtypes.routed_gate_up, dtypes.routed_down])
+        .find(|dtype| dtype.is_mq_i4());
+    if let Some(dtype) = first_mq_i4 {
+        return reject_mq4g128v2(dtype, "moe");
     }
     Ok(())
 }

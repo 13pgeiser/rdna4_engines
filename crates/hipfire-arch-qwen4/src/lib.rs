@@ -19,6 +19,8 @@ pub mod chunk_dump;
 pub mod config;
 pub mod ep;
 pub mod expert_residency;
+/// Version-1 expert-slab container schema (qt=131..=134 / `(44,53)` per-expert entries).
+pub mod expert_slabs;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
 pub mod kv_backend;
