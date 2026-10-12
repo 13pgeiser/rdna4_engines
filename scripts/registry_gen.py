@@ -12,9 +12,7 @@ old CLIs that read {models, aliases} keep working unchanged; new fields are
 purely additive:
   top-level : schema_version, generated_at
   per-entry : sha256 (HF LFS oid), size_bytes, arch_id, quant
-  sidecars  : triattn/mtp/dflash gain sha256/size_bytes next to their `file`;
-              trunk_overlay keeps its curated sha256/size_bytes pin (the file is
-              not on HF yet) and must equal the HF LFS oid/size once it is listed
+  sidecars  : triattn/mtp/dflash gain sha256/size_bytes next to their `file`
 
 Fail-closed: ANY problem — repo unreachable, file missing from the repo
 tree, file not LFS (no sha256), size_bytes disagreeing with curated
@@ -63,18 +61,6 @@ FLASH_NEXT_XTS_LEGACY_FILE = "qwen3.8-flash-next-gptq3.mq4"
 FLASH_NEXT_XTS_CANONICAL_FILE = "qwen3.8-flash-next.mq4-xts"
 FLASH_NEXT_XTS_SHA256 = "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
 FLASH_NEXT_XTS_SIZE = 125288544792
-# Trunk overlay sidecar of the four stock XTS tags: pre-encoded QT44 trunk
-# tensors (`<canonical base>.trunk-overlay`) the Qwen4 loader applies on
-# gfx1151. The curated pin below is the content identity of the file built by
-# `hipfire-quantize trunk-overlay` from the stock XTS base and the 108 verified
-# zab payloads. The generator keeps the curated sha256/size verbatim while the
-# Hugging Face tree does not list the file yet; once it does, the tree's LFS
-# oid/size must match this pin exactly.
-FLASH_NEXT_TRUNK_OVERLAY_FILE = FLASH_NEXT_XTS_CANONICAL_FILE + ".trunk-overlay"
-FLASH_NEXT_TRUNK_OVERLAY_SHA256 = (
-    "df49bc0aa601c2e26556261effd680f0be5d216804a1c5976a8a07ccd66840fd"
-)
-FLASH_NEXT_TRUNK_OVERLAY_SIZE = 305543168
 FLASH_NEXT_XTS_WIRE_FILES = {
     "qwen3.8:flash-next": FLASH_NEXT_XTS_LEGACY_FILE,
     "qwen3.8:flash-next-mq4": FLASH_NEXT_XTS_LEGACY_FILE,
@@ -442,21 +428,6 @@ def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
         desc = entry.get("desc", "")
         if "MQ4 XTS" not in desc or "GPTQ3" in desc:
             errors.append(f"{tag}: user-facing recipe must be named MQ4 XTS")
-        expected_overlay = {
-            "file": FLASH_NEXT_TRUNK_OVERLAY_FILE,
-            "sha256": FLASH_NEXT_TRUNK_OVERLAY_SHA256,
-            "size_bytes": FLASH_NEXT_TRUNK_OVERLAY_SIZE,
-        }
-        if entry.get("trunk_overlay") != expected_overlay:
-            errors.append(f"{tag}: trunk_overlay must be {expected_overlay!r}")
-        if "HIPFIRE_QWEN4_TRUNK_OVERLAY=0" not in desc:
-            errors.append(f"{tag}: desc must document the HIPFIRE_QWEN4_TRUNK_OVERLAY=0 kill switch")
-
-    # The overlay is bound to the pinned XTS base bytes, so no other entry
-    # (rtn-asym, the local-only zab tier, ...) may declare one.
-    for tag, entry in models.items():
-        if tag not in FLASH_NEXT_XTS_WIRE_FILES and "trunk_overlay" in entry:
-            errors.append(f"{tag}: trunk_overlay is only valid on the stock XTS tags")
 
     # Renaming must not change load defaults, settings, sidecars or identity.
     base = models.get("qwen3.8:flash-next")
@@ -497,42 +468,6 @@ def annotate_sidecar(
         # Tiny non-LFS sidecars have no content sha256 on the HF API; record
         # size only. (All current sidecars are LFS — this is belt-and-braces.)
         out["size_bytes"] = item.get("size")
-    return out
-
-
-def pin_trunk_overlay(
-    sidecar: dict, tree: dict[str, dict], tag: str, errors: list[str]
-) -> dict:
-    """trunk_overlay sub-object: the curated sha256/size_bytes pin is authoritative.
-
-    The file is not on Hugging Face yet, so a tree that does not list it keeps
-    the curated pin verbatim (this is also how the offline reproducibility test
-    rebuilds registry/v1.json). A tree that lists it must carry exactly the
-    pinned LFS oid and size; any difference is drift and fails the run.
-    """
-    out = dict(sidecar)
-    fname = sidecar.get("file", "")
-    sha = sidecar.get("sha256")
-    size = sidecar.get("size_bytes")
-    if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)) or not (
-        isinstance(size, int) and not isinstance(size, bool) and size > 0
-    ):
-        errors.append(f"{tag}: trunk_overlay {fname!r} needs a curated sha256 and size_bytes pin")
-        return out
-    item = tree.get(fname)
-    if item is None:
-        log(f"{tag}: trunk_overlay {fname!r} not in the repo tree yet; keeping the curated pin")
-        return out
-    lfs = item.get("lfs")
-    if not lfs:
-        errors.append(f"{tag}: trunk_overlay {fname!r} is not LFS — no sha256 to compare with the pin")
-        return out
-    hf_size = lfs.get("size", item.get("size"))
-    if lfs["oid"] != sha or hf_size != size:
-        errors.append(
-            f"{tag}: trunk_overlay {fname!r} drifted from its pin — curated "
-            f"{sha}/{size} vs HF {lfs['oid']}/{hf_size}"
-        )
     return out
 
 
@@ -656,10 +591,6 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
             for kind in ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
-            if isinstance(entry.get("trunk_overlay"), dict):
-                new_entry["trunk_overlay"] = pin_trunk_overlay(
-                    entry["trunk_overlay"], tree, tag, errors
-                )
             # `heads` is a MAP of sidecars (alternative lm_head overlays), not a
             # single one — same annotation, once per entry, so a head that is
             # missing from the repo fails the run like any other sidecar.

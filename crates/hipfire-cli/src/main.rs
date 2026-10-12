@@ -21,7 +21,7 @@ use hipfire_config::{
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
-    Sidecar,
+    Sidecar, TrunkOverlayPin, TRUNK_OVERLAY_PINS,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::ToolCall;
@@ -1884,6 +1884,16 @@ pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<
 }
 
 pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
+    pull_with_overlay_pins(paths, args, TRUNK_OVERLAY_PINS)
+}
+
+/// [`pull_command`] with an explicit trunk-overlay pin table (production passes
+/// [`TRUNK_OVERLAY_PINS`]; tests inject fixture pins).
+fn pull_with_overlay_pins(
+    paths: &Paths,
+    args: PullArgs,
+    overlay_pins: &[TrunkOverlayPin],
+) -> Result<()> {
     let loaded = load_registry(&paths.registry);
     let (tag, entry) = loaded
         .registry
@@ -1971,33 +1981,21 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("CLIP", entry.clip.as_ref()),
         ("Qwen3", entry.qwen3.as_ref()),
         ("VAE", entry.vae.as_ref()),
-        ("Trunk overlay", entry.trunk_overlay.as_ref()),
     ] {
-        let Some(sidecar) = sidecar else {
-            continue;
-        };
-        let destination = paths.models.join(&sidecar.file);
-        if destination.exists() && !args.force {
-            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
-            {
-                eprintln!("  {label} sidecar already present: {}", sidecar.file);
-                continue;
-            }
-            eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
-        } else if destination.exists() && args.force {
-            // force always refreshes
+        if let Some(sidecar) = sidecar {
+            fetch_registry_sidecar(label, &entry.repo, sidecar, &paths.models, args.force);
         }
-        eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
-        let url = artifact_url(entry, &sidecar.file);
-        if let Err(error) = download_verified(
-            &url,
-            &destination,
-            sidecar.sha256.as_deref(),
-            sidecar.size_bytes,
-            true,
-        ) {
-            eprintln!("  warning: {label} sidecar unavailable: {error:#}");
-        }
+    }
+    // The trunk overlay is not a registry field: the client carries its pin,
+    // keyed by the exact base artifact (`TRUNK_OVERLAY_PINS`).
+    if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+        fetch_registry_sidecar(
+            "Trunk overlay",
+            overlay.repo,
+            &overlay.sidecar,
+            &paths.models,
+            args.force,
+        );
     }
     for (name, sidecar) in &entry.heads {
         let destination = paths.models.join(&sidecar.file);
@@ -2022,16 +2020,39 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     Ok(())
 }
 
+/// Fetch one optional registry sidecar into `models`: an existing valid file is
+/// kept, a stale one (or any under `force`) is refreshed through
+/// [`download_verified`]. A failed download only warns; the base stays usable.
+fn fetch_registry_sidecar(label: &str, repo: &str, sidecar: &Sidecar, models: &Path, force: bool) {
+    let destination = models.join(&sidecar.file);
+    if destination.exists() && !force {
+        if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes) {
+            eprintln!("  {label} sidecar already present: {}", sidecar.file);
+            return;
+        }
+        eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
+    }
+    eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
+    if let Err(error) = download_verified(
+        &artifact_url_in(repo, &sidecar.file),
+        &destination,
+        sidecar.sha256.as_deref(),
+        sidecar.size_bytes,
+        true,
+    ) {
+        eprintln!("  warning: {label} sidecar unavailable: {error:#}");
+    }
+}
+
 pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
+    artifact_url_in(&entry.repo, file)
+}
+
+fn artifact_url_in(repo: &str, file: &str) -> String {
     let base = env::var("HIPFIRE_HF_BASE")
         .or_else(|_| env::var("HF_ENDPOINT"))
         .unwrap_or_else(|_| "https://huggingface.co".into());
-    format!(
-        "{}/{}/resolve/main/{}",
-        base.trim_end_matches('/'),
-        entry.repo,
-        file
-    )
+    format!("{}/{}/resolve/main/{}", base.trim_end_matches('/'), repo, file)
 }
 
 #[cfg(test)]
@@ -2192,6 +2213,17 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
 /// the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one
 /// `qwen3.8-27b-vision.hfq`).
 fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
+    rm_with_overlay_pins(paths, registry, TRUNK_OVERLAY_PINS, args)
+}
+
+/// [`rm_with_registry`] with an explicit trunk-overlay pin table (production
+/// passes [`TRUNK_OVERLAY_PINS`]; tests inject fixture pins).
+fn rm_with_overlay_pins(
+    paths: &Paths,
+    registry: &RegistryV1,
+    overlay_pins: &[TrunkOverlayPin],
+    args: RmArgs,
+) -> Result<()> {
     let resolved = registry_entry_for_path(paths, registry, &args.model);
     let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
@@ -2226,13 +2258,18 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
                 &entry.t5,
                 &entry.clip,
                 &entry.vae,
-                &entry.trunk_overlay,
             ]
             .into_iter()
             .flatten()
             .map(|sidecar| paths.models.join(&sidecar.file))
             .filter(|path| path.is_file()),
         );
+        if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+            let overlay_path = paths.models.join(&overlay.sidecar.file);
+            if overlay_path.is_file() {
+                targets.insert(overlay_path);
+            }
+        }
         if let Some(sidecar) = entry.dflash.as_ref() {
             let sidecar_path = paths.models.join(&sidecar.file);
             if sidecar_path.is_file() {
@@ -2375,7 +2412,7 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             .into_iter()
             .filter(|sidecar| sidecar.is_file()),
     );
-    // A trunk overlay rides with its base: the registry-declared file (also
+    // A trunk overlay rides with its base: the pinned overlay file (also
     // reached through a legacy-named link) and `<resolved file>.trunk-overlay`.
     let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(&path);
     if overlay.is_file() {
@@ -8482,7 +8519,7 @@ fn is_model_file(name: &str) -> bool {
 /// `"tokenizer": "{}"`, so loading it as a trunk fails with
 /// `tokenizer metadata field missing or wrong type: model`.
 fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
-    registry
+    let mut files: BTreeSet<&str> = registry
         .models
         .values()
         .flat_map(|entry| {
@@ -8498,14 +8535,16 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
                 entry.vision.as_ref(),
                 entry.ple_q4.as_ref(),
                 entry.ple_q8.as_ref(),
-                entry.trunk_overlay.as_ref(),
             ]
             .into_iter()
             .flatten()
             .map(|sidecar: &Sidecar| sidecar.file.as_str())
             .chain(entry.heads.values().map(|sidecar| sidecar.file.as_str()))
         })
-        .collect()
+        .collect();
+    // The trunk overlays are compiled-in pins, not registry fields.
+    files.extend(TRUNK_OVERLAY_PINS.iter().map(|pin| pin.file));
+    files
 }
 
 /// True when `name` is a model file worth showing in a local listing.
@@ -17242,6 +17281,8 @@ mod tests {
     const OVERLAY_BASE: &[u8] = b"overlay-base-bytes";
     const OVERLAY_BYTES: &[u8] = b"pre-encoded-qt44-overlay-bytes";
 
+    /// The registry entry carries no overlay field: the overlay comes only from
+    /// the injected pin table, keyed by the base's sha256/size.
     fn overlay_registry_raw() -> String {
         format!(
             r#"{{
@@ -17250,27 +17291,36 @@ mod tests {
             "models":{{
                 "overlay-model":{{
                     "repo":"test/repo","file":"overlay-model.mq4","size_gb":0.001,
-                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},
-                    "trunk_overlay":{{"file":"overlay-model.mq4.trunk-overlay","sha256":"{}","size_bytes":{}}}
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{}
                 }}
             }},
             "aliases":{{}}
         }}"#,
             ple_sha(OVERLAY_BASE),
             OVERLAY_BASE.len(),
-            ple_sha(OVERLAY_BYTES),
-            OVERLAY_BYTES.len(),
         )
     }
 
+    fn overlay_pins() -> Vec<TrunkOverlayPin> {
+        vec![TrunkOverlayPin {
+            base_sha256: ple_sha(OVERLAY_BASE).leak(),
+            base_size: OVERLAY_BASE.len() as u64,
+            repo: "test/repo",
+            file: "overlay-model.mq4.trunk-overlay",
+            sha256: ple_sha(OVERLAY_BYTES).leak(),
+            size_bytes: OVERLAY_BYTES.len() as u64,
+        }]
+    }
+
     fn pull_overlay_model(paths: &Paths, force: bool) {
-        pull_command(
+        pull_with_overlay_pins(
             paths,
             PullArgs {
                 model: "overlay-model".into(),
                 force,
                 ple: ple::PleSelection::Auto,
             },
+            &overlay_pins(),
         )
         .unwrap();
     }
@@ -17353,16 +17403,16 @@ mod tests {
 
     #[test]
     fn rm_removes_the_trunk_overlay_with_its_base() {
-        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
-        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
         let paths = test_paths("overlay-rm");
-        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay rm").unwrap();
         fs::create_dir_all(&paths.models).unwrap();
         for file in ["overlay-model.mq4", "overlay-model.mq4.trunk-overlay", "untouched.mq4"] {
             fs::write(paths.models.join(file), b"x").unwrap();
         }
-        rm_command(
+        rm_with_overlay_pins(
             &paths,
+            &registry,
+            &overlay_pins(),
             RmArgs {
                 model: "overlay-model".into(),
                 yes: true,
@@ -17377,8 +17427,10 @@ mod tests {
         for file in ["local.mq4", "local.mq4.trunk-overlay"] {
             fs::write(paths.models.join(file), b"x").unwrap();
         }
-        rm_command(
+        rm_with_overlay_pins(
             &paths,
+            &registry,
+            &overlay_pins(),
             RmArgs {
                 model: "local.mq4".into(),
                 yes: true,
@@ -17407,7 +17459,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert!(registry_sidecar_files(&registry).contains("overlay-model.mq4.trunk-overlay"));
+        assert!(registry_sidecar_files(&registry).contains(TRUNK_OVERLAY_PINS[0].file));
         for name in overlays.iter().chain(&["overlay-model.mq4"]) {
             fs::write(paths.models.join(name), b"x").unwrap();
         }
