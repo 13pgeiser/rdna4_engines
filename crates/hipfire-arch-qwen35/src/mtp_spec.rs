@@ -2944,6 +2944,15 @@ where
         if start_pos > 0 && state.prev_hidden_pos == Some(start_pos - 1) {
             gpu.hip
                 .memcpy_dtod_at(&prompt_hidden.buf, 0, &state.prev_hidden.buf, 0, dim_bytes)?;
+        } else if mtp_head::mtp_fill_fast_enabled() {
+            gpu.bind_thread()?;
+            // D32 counts f32 words: zero only the first partner-hidden row.
+            gpu.hip.memset_d32_async(
+                &prompt_hidden.buf,
+                0,
+                dim,
+                gpu.active_stream.as_ref(),
+            )?;
         } else {
             gpu.hip.memcpy_htod(&prompt_hidden.buf, &vec![0u8; dim_bytes])?;
         }

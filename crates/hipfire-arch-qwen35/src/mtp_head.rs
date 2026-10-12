@@ -724,7 +724,31 @@ impl Qwen35MtpHeadKvCache {
     /// Reset positions to all-zeros. Q8 K/V slots are 34 B per 32-element
     /// block stored inside an F32-typed buffer; zeroing the underlying
     /// buffer is equivalent to "no positions written" at the kernel level.
+    /// With `HIPFIRE_MTP_FILL_FAST` enabled, allocation-free device zeroing
+    /// is ordered on the active stream and writes the exact same positive-zero
+    /// bytes across the full K/V buffers. Setting the flag to `0` preserves
+    /// the original host-zero allocation and H2D-copy path.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        if mtp_fill_fast_enabled() {
+            gpu.bind_thread()?;
+            for layer in 0..self.inner.k_gpu.len() {
+                let k_n = self.inner.k_gpu[layer].numel();
+                let v_n = self.inner.v_gpu[layer].numel();
+                gpu.hip.memset_d32_async(
+                    &self.inner.k_gpu[layer].buf,
+                    0,
+                    k_n,
+                    gpu.active_stream.as_ref(),
+                )?;
+                gpu.hip.memset_d32_async(
+                    &self.inner.v_gpu[layer].buf,
+                    0,
+                    v_n,
+                    gpu.active_stream.as_ref(),
+                )?;
+            }
+            return Ok(());
+        }
         for layer in 0..self.inner.k_gpu.len() {
             let k_n = self.inner.k_gpu[layer].numel();
             let v_n = self.inner.v_gpu[layer].numel();
