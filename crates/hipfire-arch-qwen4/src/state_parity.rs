@@ -1456,15 +1456,37 @@ impl ProfileReport {
     }
 }
 
-fn qwen4_range_payload(
-    source: &hipfire_runtime::hfq::HfqModelSource,
+/// Same policy as the product loader (`hipfire-loader` carriers.rs):
+/// UMA and external-residency entries stream bounded ranges; discrete
+/// non-external entries (including `HostMapped`, which the store rejects as a
+/// range) are borrowed from the resident source bytes.
+fn qwen4_use_range_payload(is_uma: bool, residency: WeightResidency) -> bool {
+    is_uma || residency.is_external()
+}
+
+fn qwen4_oracle_payload<'a>(
+    source: &'a hipfire_runtime::hfq::HfqModelSource,
     entry: &WeightEntry,
-) -> Result<hipfire_runtime::model_source::SourcePayload<'static>, String> {
-    source
-        .tensor_range(&entry.name)
-        .map_err(|error| error.to_string())?
-        .map(hipfire_runtime::model_source::SourcePayload::Range)
-        .ok_or_else(|| format!("missing tensor '{}'", entry.name))
+    use_ranges: bool,
+) -> Result<hipfire_runtime::model_source::SourcePayload<'a>, String> {
+    use hipfire_runtime::model_source::SourcePayload;
+    if qwen4_use_range_payload(use_ranges, entry.residency) {
+        return source
+            .tensor_range(&entry.name)
+            .map_err(|error| error.to_string())?
+            .map(SourcePayload::Range)
+            .ok_or_else(|| {
+                if entry.residency.is_external() {
+                    format!("missing external tensor '{}'", entry.name)
+                } else {
+                    format!("missing resident tensor '{}'", entry.name)
+                }
+            });
+    }
+    let (info, bytes) = source
+        .tensor_data(&entry.name)
+        .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+    Ok(SourcePayload::Borrowed { info, bytes })
 }
 
 /// Load the admitted production artifact, execute exactly one target token and
@@ -1521,6 +1543,7 @@ fn run_profile_inner(
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
         .map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let manifest_started = Instant::now();
     let source_progress = RefCell::new((0_u64, None::<Instant>, None::<Instant>));
@@ -1552,7 +1575,7 @@ fn run_profile_inner(
             };
             emit_profile_source_callback(index, entry, elapsed_ns, cumulative_ns);
 
-            qwen4_range_payload(&source, entry)
+            qwen4_oracle_payload(&source, entry, use_ranges)
         },
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
@@ -1846,6 +1869,7 @@ pub fn run_state_parity(
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
         .map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
         &manifest.weights,
@@ -1853,7 +1877,7 @@ pub fn run_state_parity(
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_range_payload(&source, entry),
+        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
@@ -2230,6 +2254,7 @@ pub fn run_mtp_fill_digest(
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
         .map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
     let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
@@ -2238,7 +2263,7 @@ pub fn run_mtp_fill_digest(
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_range_payload(&source, entry),
+        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
@@ -2385,6 +2410,18 @@ pub fn run_mtp_fill_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oracle_payload_policy_matches_product_loader() {
+        assert!(!qwen4_use_range_payload(false, WeightResidency::Resident));
+        assert!(!qwen4_use_range_payload(false, WeightResidency::HostMapped));
+        assert!(qwen4_use_range_payload(true, WeightResidency::Resident));
+        assert!(qwen4_use_range_payload(true, WeightResidency::HostMapped));
+        assert!(qwen4_use_range_payload(
+            false,
+            WeightResidency::external_rows(128, 1)
+        ));
+    }
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok().or_else(|| {
@@ -2757,6 +2794,7 @@ pub fn run_mtp_takeover_fill_oracle(
     }
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let weights = oracle_expert_placement(&gpu, &receipt.manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
@@ -2765,7 +2803,7 @@ pub fn run_mtp_takeover_fill_oracle(
         receipt.config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_range_payload(&source, entry),
+        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
     ).map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     // Match run_mtp_fill_digest: the reusable family walker uses logical
     // F32 row widths. This is a head-fill/rollback oracle, not a KV-format
