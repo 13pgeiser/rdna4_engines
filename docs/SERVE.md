@@ -477,6 +477,11 @@ map in [`CONFIG.md`](CONFIG.md). HTTP accepts the same meanings as CLI/config.
   positive integer cap (semantic effort stays independent of that cap). DeepSeek V4 and
   Muse Glimmer expose semantic effort but no independent parent-defined cap; cap fields
   are dropped+warned.
+- A request that omits effort (or sends `auto`) on Qwen3.8 or Ornith 1.5 defers to
+  configured effort, and if none is set resolves to hipfire's `medium` default (the
+  official template default is `xhigh`). An explicit non-`auto` `reasoning_effort` /
+  `reasoning.effort` in the request wins, so `"xhigh"` restores the old behavior.
+  Thinking off drops the effort. This default does not imply a cap.
 
 **Examples:**
 
@@ -488,14 +493,14 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
   "chat_template_kwargs": {"enable_thinking": false}
 }'
 
-# Qwen3.8 — semantic effort only (still uncapped unless max_think_tokens is set)
+# Qwen3.8 — semantic effort only; omitted/auto resolves to medium, xhigh is explicit (still uncapped unless max_think_tokens is set)
 curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen3.8:27b",
   "messages": [{"role": "user", "content": "plan a refactor"}],
-  "reasoning_effort": "medium"
+  "reasoning_effort": "xhigh"
 }'
 
-# Ornith 1.5 — Qwen3.8-compatible semantic effort (default xhigh; still uncapped unless max_think_tokens)
+# Ornith 1.5 — Qwen3.8-compatible semantic effort (omitted/auto resolves to medium; still uncapped unless max_think_tokens)
 curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "ornith-1.5:35b-a3b",
   "messages": [{"role": "user", "content": "plan a refactor"}],

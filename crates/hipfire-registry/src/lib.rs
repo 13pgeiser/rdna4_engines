@@ -1930,7 +1930,7 @@ mod tests {
         assert_eq!(settings.min_p, Some(0.0));
         assert_eq!(settings.presence_penalty, Some(0.0));
         assert_eq!(settings.repeat_penalty, Some(1.0));
-        assert_eq!(settings.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("medium"));
         assert!(
             settings.thinking_budget.is_none(),
             "effort-native: absence means uncapped"
@@ -1947,7 +1947,7 @@ mod tests {
         assert_eq!(general.min_p, Some(0.0));
         assert_eq!(general.presence_penalty, Some(0.0));
         assert_eq!(general.repeat_penalty, Some(1.0));
-        assert_eq!(general.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(general.reasoning_effort.as_deref(), Some("medium"));
         assert!(
             general.thinking_budget.is_none(),
             "effort-native: absence means uncapped"
@@ -1990,7 +1990,7 @@ mod tests {
         assert!(flash_layer.get("generation.max_tokens").is_none());
         assert_eq!(
             layer.get("reasoning.effort"),
-            Some(&ConfigValue::String("xhigh".into()))
+            Some(&ConfigValue::String("medium".into()))
         );
         // Original Qwen3 family (without .5/.6/.8) receives no automatic policy.
         let qwen3_raw = r#"{
@@ -2006,6 +2006,50 @@ mod tests {
         assert!(q3_layer.get("memory.kv_backend").is_none());
         assert!(q3_layer.get("memory.max_seq").is_none());
         assert!(q3_layer.get("generation.max_tokens").is_none());
+    }
+
+    /// Qwen3.8 dense tiers and both Ornith 1.5 artifacts share the effort-native
+    /// Qwen3.8 contract: the registry default and general profile are medium.
+    /// Flash-Next (Qwen4, arch_id=16), sidecar drafts, and the intentional
+    /// Ornith coding/instruct profiles are unchanged.
+    #[test]
+    fn bundled_qwen38_family_effort_defaults_medium() {
+        let registry = bundled().unwrap();
+        let mut tiers = 0;
+        for (tag, entry) in &registry.models {
+            let is_dense_trunk = tag.starts_with("qwen3.8:27b") && !tag.contains("-draft");
+            let is_ornith = tag.starts_with("ornith-1.5:");
+            if !is_dense_trunk && !is_ornith {
+                continue;
+            }
+            let settings = entry
+                .recommended_settings
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tag} must carry recommended_settings"));
+            assert_eq!(
+                settings.reasoning_effort.as_deref(),
+                Some("medium"),
+                "{tag} recommended_settings effort"
+            );
+            let general = entry
+                .sampling_profile("general")
+                .unwrap_or_else(|| panic!("{tag} must carry a general profile"));
+            assert_eq!(
+                general.reasoning_effort.as_deref(),
+                Some("medium"),
+                "{tag} general profile effort"
+            );
+            tiers += 1;
+        }
+        assert!(tiers >= 15, "13 Qwen3.8-27B tiers plus 2 Ornith artifacts");
+
+        // Flash-Next (arch_id=16) never carried an effort default.
+        let (_, flash) = registry.model("qwen3.8:flash-next").unwrap();
+        assert_eq!(flash.arch_id, Some(16));
+        assert!(!flash
+            .recommended_settings
+            .as_ref()
+            .is_some_and(|settings| settings.reasoning_effort.is_some()));
     }
 
     #[test]
@@ -2800,21 +2844,22 @@ mod tests {
             }
         }
 
-        // Both Ornith 1.5 artifacts share the release contract:
-        // default/general/coding xhigh, instruct none, and no named
+        // Both Ornith 1.5 artifacts share the Qwen3.8 effort-native contract:
+        // default/general medium (hipfire default; xhigh stays selectable),
+        // explicit coding profile xhigh, instruct none, and no named
         // thinking_budget (absence = uncapped).
         for tag in ["ornith-1.5:35b-a3b", "ornith-1.5:35b-a3b-mq4r"] {
             let (_, ornith) = registry
                 .model(tag)
                 .unwrap_or_else(|| panic!("{tag} must exist"));
             let ornith_rs = ornith.recommended_settings.as_ref().unwrap();
-            assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("xhigh"));
+            assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("medium"));
             assert!(
                 ornith_rs.thinking_budget.is_none(),
                 "{tag} effort-native: absence means uncapped"
             );
             let ornith_general = ornith.sampling_profile("general").unwrap();
-            assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("xhigh"));
+            assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("medium"));
             assert!(ornith_general.thinking_budget.is_none());
             let ornith_coding = ornith.sampling_profile("coding").unwrap();
             assert_eq!(ornith_coding.reasoning_effort.as_deref(), Some("xhigh"));

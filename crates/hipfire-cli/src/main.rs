@@ -4279,6 +4279,11 @@ pub(crate) struct ReasoningResolution {
     pub warnings: Vec<String>,
 }
 
+/// Concrete effort resolved for effort-native QwenJinja when the request/config
+/// leaves effort unset or `auto`. The raw Jinja templates still default to
+/// `xhigh`; this CLI resolution layer supplies the concrete value.
+const QWEN_JINJA_DEFAULT_EFFORT: &str = "medium";
+
 pub(crate) fn apply_http_reasoning_request(
     body: &serde_json::Value,
     resolved: &hipfire_config::ResolvedConfig,
@@ -4823,14 +4828,13 @@ pub(crate) fn apply_http_reasoning_request(
                 }
                 effective_effort = None;
             } else if has_explicit_effort || config_effort_is_explicit {
-                let raw = if let Some(value) = effort_raw {
-                    value.to_owned()
-                } else {
-                    config_effort.clone()
-                };
+                let raw = effort_raw
+                    .filter(|value| *value != "auto")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| config_effort.clone());
                 if raw == "auto" {
-                    effective_effort = Some("xhigh".to_string());
-                    request["reasoning_effort"] = serde_json::json!("xhigh");
+                    effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                    request["reasoning_effort"] = serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                 } else {
                     match raw.as_str() {
                         "low" | "medium" | "xhigh" => {
@@ -4839,8 +4843,9 @@ pub(crate) fn apply_http_reasoning_request(
                                     "reasoning_effort '{}' dropped: not in supported {:?}",
                                     raw, supported_efforts
                                 ));
-                                effective_effort = Some("xhigh".to_string());
-                                request["reasoning_effort"] = serde_json::json!("xhigh");
+                                effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                                request["reasoning_effort"] =
+                                    serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                             } else {
                                 effective_effort = Some(raw.clone());
                                 request["reasoning_effort"] = serde_json::json!(raw);
@@ -4851,21 +4856,23 @@ pub(crate) fn apply_http_reasoning_request(
                                 "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
                                 raw
                             ));
-                            effective_effort = Some("xhigh".to_string());
-                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                            request["reasoning_effort"] =
+                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                         }
                         other => {
                             push_warn(format!(
-                                "reasoning_effort '{}' normalized to qwen_jinja default xhigh",
-                                other
+                                "reasoning_effort '{}' normalized to qwen_jinja default {}",
+                                other, QWEN_JINJA_DEFAULT_EFFORT
                             ));
-                            effective_effort = Some("xhigh".to_string());
-                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                            request["reasoning_effort"] =
+                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                         }
                     }
                 }
             } else {
-                let default = "xhigh".to_string();
+                let default = QWEN_JINJA_DEFAULT_EFFORT.to_string();
                 effective_effort = Some(default.clone());
                 request["reasoning_effort"] = serde_json::json!(default);
             }
