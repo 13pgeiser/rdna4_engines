@@ -162,3 +162,8 @@ required-features = ["lab"]
 name = "shared_weight_state_oracle"
 path = "examples/shared_weight_state_oracle.rs"
 required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "prefill_ragged_oracle"
+path = "examples/prefill_ragged_oracle.rs"
+required-features = ["deltanet"]
