@@ -60,10 +60,10 @@ static QWEN4_QSA_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true)
 });
 /// Persistent per-QSA-layer F16 K/V for exact gfx1151 F32-state prefill.
-/// Enabled by default; `HIPFIRE_QWEN4_QSA_F16_ARENA=0` keeps per-launch
+/// Opt-in (`HIPFIRE_QWEN4_QSA_F16_ARENA=1`); off keeps per-launch
 /// conversion. Resolved once at load; decode keeps the F32 state.
 static QWEN4_QSA_F16_ARENA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_F16_ARENA", true)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_F16_ARENA", false)
 });
 /// `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM` (each on
 /// unless `0`) use the certified builder rows16 F32/BF16 score and

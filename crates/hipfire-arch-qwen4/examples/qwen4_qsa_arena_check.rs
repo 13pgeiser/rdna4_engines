@@ -989,8 +989,7 @@ fn run() -> Result<i32> {
     if decode < 2 {
         return Err("QSA_ORACLE_DECODE must be at least 2".into());
     }
-    let want_arena = std::env::var_os("HIPFIRE_QWEN4_QSA_F16_ARENA").is_none()
-        || env_flag("HIPFIRE_QWEN4_QSA_F16_ARENA")?;
+    let want_arena = env_flag("HIPFIRE_QWEN4_QSA_F16_ARENA")?;
 
     let mut hfq = HfqFile::open(model_path).map_err(err)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(err)?;
