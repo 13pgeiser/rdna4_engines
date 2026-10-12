@@ -609,7 +609,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1524
+**Count:** 1530
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -892,7 +892,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DETECTED_NAME` | scripts/_detect-gpu.sh | harness |
 | `HIPFIRE_DETECTED_VRAM_GB` | scripts/_detect-gpu.sh | harness |
 | `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | experimental |
-| `HIPFIRE_DEVICE` | crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_DEVICE` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_DEVICES` | crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs, crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | stable |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_BLOCK` | crates/hipfire-config/src/lib.rs | stable |
@@ -1585,7 +1585,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_BYTE_IDENTITY_MODEL` | crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs, crates/hipfire-arch-qwen35/tests/mtp_step_oracle.rs | harness |
 | `HIPFIRE_MTP_DEVICE_TOKEN_CHAIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_DRAFT_HEAD` | crates/hipfire-arch-qwen4/src/mtp_gpu.rs, crates/hipfire-arch-qwen4/tests/dev_mtp_hw.rs | developer |
-| `HIPFIRE_MTP_FILL_FAST` | crates/hipfire-arch-qwen35/src/mtp_head.rs | developer |
+| `HIPFIRE_MTP_FILL_FAST` | crates/hipfire-arch-qwen35/src/mtp_head.rs, crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | developer |
+| `HIPFIRE_MTP_FILL_ORACLE_A` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | harness |
+| `HIPFIRE_MTP_FILL_ORACLE_B` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | harness |
+| `HIPFIRE_MTP_FILL_ORACLE_DIR` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | harness |
+| `HIPFIRE_MTP_FILL_ORACLE_OUT` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | harness |
 | `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_GPU_ACCEPT` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_HEAD_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/mtp_head.rs | developer |
@@ -1596,7 +1600,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_INCREMENTAL` | crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_K` | crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_MTP_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
-| `HIPFIRE_MTP_NGRAM` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_MTP_NGRAM` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | stable |
 | `HIPFIRE_MTP_NGRAM_K` | scripts/serve_harness.py | harness |
 | `HIPFIRE_MTP_OWN_PREFILL` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs | developer |
 | `HIPFIRE_MTP_PAIRING` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | developer |
