@@ -134,40 +134,41 @@ pub fn binary_identity() -> &'static Value {
 /// Production sources the sampled / greedy MTP lane executes, embedded at
 /// compile time: the hash names the source the binary was built from even
 /// when the checkout is not available where the binary runs.
+static SOURCE_FILES: [(&str, &[u8]); 7] = [
+    (
+        "hipfire-arch-qwen4/src/mtp_spec.rs",
+        include_bytes!("../../src/mtp_spec.rs"),
+    ),
+    (
+        "hipfire-arch-qwen4/src/bundle.rs",
+        include_bytes!("../../src/bundle.rs"),
+    ),
+    (
+        "hipfire-arch-qwen4/src/mtp_gpu.rs",
+        include_bytes!("../../src/mtp_gpu.rs"),
+    ),
+    (
+        "hipfire-runtime/src/spec.rs",
+        include_bytes!("../../../hipfire-runtime/src/spec.rs"),
+    ),
+    (
+        "hipfire-runtime/src/spec_sampling.rs",
+        include_bytes!("../../../hipfire-runtime/src/spec_sampling.rs"),
+    ),
+    (
+        "hipfire-runtime/src/sampler.rs",
+        include_bytes!("../../../hipfire-runtime/src/sampler.rs"),
+    ),
+    (
+        "hipfire-dispatch/src/pipeline/draft_head.rs",
+        include_bytes!("../../../hipfire-dispatch/src/pipeline/draft_head.rs"),
+    ),
+];
+
 static SOURCES: LazyLock<Value> = LazyLock::new(|| {
-    let files: [(&str, &[u8]); 7] = [
-        (
-            "hipfire-arch-qwen4/src/mtp_spec.rs",
-            include_bytes!("../../src/mtp_spec.rs"),
-        ),
-        (
-            "hipfire-arch-qwen4/src/bundle.rs",
-            include_bytes!("../../src/bundle.rs"),
-        ),
-        (
-            "hipfire-arch-qwen4/src/mtp_gpu.rs",
-            include_bytes!("../../src/mtp_gpu.rs"),
-        ),
-        (
-            "hipfire-runtime/src/spec.rs",
-            include_bytes!("../../../hipfire-runtime/src/spec.rs"),
-        ),
-        (
-            "hipfire-runtime/src/spec_sampling.rs",
-            include_bytes!("../../../hipfire-runtime/src/spec_sampling.rs"),
-        ),
-        (
-            "hipfire-runtime/src/sampler.rs",
-            include_bytes!("../../../hipfire-runtime/src/sampler.rs"),
-        ),
-        (
-            "hipfire-dispatch/src/pipeline/draft_head.rs",
-            include_bytes!("../../../hipfire-dispatch/src/pipeline/draft_head.rs"),
-        ),
-    ];
     let mut combined = Sha256::new();
     let mut per_file = serde_json::Map::new();
-    for (name, bytes) in files {
+    for (name, bytes) in SOURCE_FILES {
         let sha = sha256_hex(bytes);
         combined.update(name.as_bytes());
         combined.update(sha.as_bytes());
@@ -178,6 +179,80 @@ static SOURCES: LazyLock<Value> = LazyLock::new(|| {
 
 pub fn compiled_sources() -> &'static Value {
     &SOURCES
+}
+
+/// Candidate resident-sampling levers: `(name suffix after the lever prefix,
+/// default when the binary declares it)`. These are the DECLARED candidate
+/// defaults (default-on, only an exact `0` disables, i.e. the resolver
+/// `hipfire_config::developer_var(NAME).as_deref() != Ok("0")`). That is a
+/// contract this table assumes, not something read from a binary that lacks the
+/// flag: see [`lever_state`].
+const CANDIDATE_LEVERS: [(&str, bool); 2] = [("DEVICE_ACCEPT", true), ("SAMPLED_PICKS", true)];
+
+/// Whether any embedded production source mentions `name` in a string literal.
+fn declared_in_compiled_source(name: &str) -> bool {
+    let literal = format!("\"{name}\"");
+    SOURCE_FILES.iter().any(|(_, bytes)| {
+        bytes
+            .windows(literal.len())
+            .any(|window| window == literal.as_bytes())
+    })
+}
+
+/// The resident-sampling lever state this binary and environment resolve to.
+///
+/// Each candidate is reported as:
+/// - `declared_in_compiled_source: false` -> `status: "unsupported-baseline"`
+///   and `effective: null`. The binary has no such switch; nothing is claimed
+///   on or off, and a set env value is recorded but inert.
+/// - declared -> `effective: true/false` by the default-on rule (only an
+///   exact `0` disables; unset or any other value leaves it on) and
+///   `status: "on"` / `"off"`.
+///
+/// Any other env variable under the lever prefix is listed under
+/// `unlisted_env` so a renamed or additional switch cannot hide.
+pub fn lever_state(env: &BTreeMap<String, String>) -> Value {
+    let prefix = lever_prefix();
+    let mut levers = serde_json::Map::new();
+    for (suffix, default_on) in CANDIDATE_LEVERS {
+        let name = format!("{prefix}{suffix}");
+        let declared = declared_in_compiled_source(&name);
+        let value = env.get(&name);
+        let (effective, status) = if declared {
+            let on = if default_on {
+                value.map(String::as_str) != Some("0")
+            } else {
+                value.map(String::as_str) == Some("1")
+            };
+            (json!(on), if on { "on" } else { "off" })
+        } else {
+            (Value::Null, "unsupported-baseline")
+        };
+        levers.insert(
+            name,
+            json!({
+                "candidate_default_on": default_on,
+                "declared_in_compiled_source": declared,
+                "env_value": value,
+                "effective": effective,
+                "status": status,
+            }),
+        );
+    }
+    let unlisted: BTreeMap<&String, &String> = env
+        .iter()
+        .filter(|(name, _)| name.starts_with(&prefix))
+        .filter(|(name, _)| {
+            !CANDIDATE_LEVERS
+                .iter()
+                .any(|(suffix, _)| **name == format!("{prefix}{suffix}"))
+        })
+        .collect();
+    json!({
+        "assumed_resolver": "developer_var(NAME) != Ok(\"0\") (default-on; only exact 0 disables)",
+        "levers": levers,
+        "unlisted_env": unlisted,
+    })
 }
 
 /// Size and full-file SHA-256 of one file. The hash is cached in
@@ -250,6 +325,7 @@ pub fn config_identity(env: &BTreeMap<String, String>, model: &Value) -> Value {
     json!({
         "env": env,
         "levers": levers,
+        "lever_state": lever_state(env),
         "floor": {
             "route_class": route_class(env),
             "HIPFIRE_MTP_AR_FLOOR": get("HIPFIRE_MTP_AR_FLOOR"),
@@ -433,4 +509,59 @@ pub fn require_same_config(config_path: &Path, expected: &Value) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lever_state_tests {
+    use super::*;
+
+    fn env_with(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    /// A binary that does not declare a lever reports it unsupported and
+    /// claims neither on nor off, whatever the env says; a binary that does
+    /// declare it resolves default-on with only an exact `0` disabling.
+    #[test]
+    fn lever_state_is_unsupported_unless_declared_and_default_on_when_declared() {
+        let prefix = lever_prefix();
+        for (suffix, default_on) in CANDIDATE_LEVERS {
+            assert!(default_on, "{suffix}: the candidate default is on");
+            let name = format!("{prefix}{suffix}");
+            let declared = declared_in_compiled_source(&name);
+            for (value, expect_on) in [
+                (None, true),
+                (Some("0"), false),
+                (Some("1"), true),
+                (Some("off"), true),
+            ] {
+                let env = match value {
+                    Some(value) => env_with(&[(name.as_str(), value)]),
+                    None => BTreeMap::new(),
+                };
+                let state = lever_state(&env);
+                let lever = &state["levers"][&name];
+                assert_eq!(lever["declared_in_compiled_source"], json!(declared));
+                assert_eq!(lever["env_value"], json!(value));
+                if declared {
+                    assert_eq!(lever["effective"], json!(expect_on), "{name}={value:?}");
+                    assert_eq!(lever["status"], json!(if expect_on { "on" } else { "off" }));
+                } else {
+                    assert_eq!(lever["effective"], Value::Null, "{name}={value:?}");
+                    assert_eq!(lever["status"], json!("unsupported-baseline"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unlisted_lever_prefix_env_is_reported() {
+        let other = format!("{}OTHER_SWITCH", lever_prefix());
+        let state = lever_state(&env_with(&[(other.as_str(), "1"), ("HIPFIRE_GRAPH", "1")]));
+        assert_eq!(state["unlisted_env"][&other], json!("1"));
+        assert!(state["unlisted_env"].get("HIPFIRE_GRAPH").is_none());
+    }
 }
