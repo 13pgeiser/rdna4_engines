@@ -3625,6 +3625,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Experimental Qwen4 trunk projection engine; off leaves every projection on the GPU."
     ),
     field!(
+        "fusions.npu_trunk_calibration",
+        "npu_trunk_calibration",
+        Fusions,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::String,
+        false,
+        true,
+        Some("HIPFIRE_QWEN4_NPU_TRUNK_CAL"),
+        "Stored NPU trunk calibration path; empty resolves to <hipfire home>/npu-trunk/calibration.json; never read when off."
+    ),
+    field!(
         "fusions.policy",
         "fusion_policy",
         Fusions,
@@ -4538,6 +4550,13 @@ pub struct LoadedCatalog {
     pub path: PathBuf,
     pub format: CatalogFormat,
     pub warnings: Vec<String>,
+}
+
+/// Resolve the opt-in trunk calibration path without reading the file.
+pub fn npu_trunk_calibration_path() -> PathBuf {
+    developer_var("HIPFIRE_QWEN4_NPU_TRUNK_CAL").ok()
+        .filter(|path| !path.trim().is_empty()).map(PathBuf::from)
+        .unwrap_or_else(|| ConfigPaths::discover().root.join("npu-trunk/calibration.json"))
 }
 
 #[derive(Clone, Debug)]
@@ -5949,6 +5968,22 @@ mod tests {
             );
         }
         assert!(field.parse_cli("sometimes").is_err());
+    }
+    #[test]
+    fn npu_trunk_calibration_schema_and_snapshot() {
+        let path_field = field("fusions.npu_trunk_calibration").unwrap();
+        assert_eq!(path_field.legacy_key, "npu_trunk_calibration");
+        assert_eq!(path_field.env_compat, Some("HIPFIRE_QWEN4_NPU_TRUNK_CAL"));
+        assert_eq!(path_field.default.to_value(), ConfigValue::String(String::new()));
+        assert_eq!(path_field.parse_cli("/tmp/cal.json").unwrap(), ConfigValue::String("/tmp/cal.json".into()));
+        let mut layer = ConfigLayer::default();
+        layer.values.insert(path_field.key.into(), ConfigValue::String("/tmp/cal.json".into()));
+        let process = ProcessConfig::from_resolved(&resolve([NamedLayer {
+            source: ConfigSource::LegacyEnv { name: "HIPFIRE_QWEN4_NPU_TRUNK_CAL".into() }, layer,
+        }]).unwrap()).unwrap();
+        assert_eq!(process.legacy_value("HIPFIRE_QWEN4_NPU_TRUNK_CAL"), Some("/tmp/cal.json".into()));
+        assert_eq!(ConfigPaths::under("/tmp/hipfire").root.join("npu-trunk/calibration.json"),
+            PathBuf::from("/tmp/hipfire/npu-trunk/calibration.json"));
     }
     #[test]
     fn npu_spillover_defaults_off_with_env_parse() {

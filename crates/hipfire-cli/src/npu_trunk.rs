@@ -16,7 +16,7 @@ pub(crate) struct CalibrateArgs {
     #[arg(long, value_name = "CAL.JSON")]
     out: PathBuf,
 }
-/// No defaults: missing measured quantities or key fields are errors.
+/// All measured costs are mandatory; only build defaults to the release contract.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Measurements {
@@ -32,9 +32,8 @@ struct Measurements {
 impl Measurements {
     fn assemble(self, uname_release: &str) -> Result<Calibration> {
         if self.schema_version != CALIBRATION_SCHEMA_VERSION { bail!("unsupported measurements schema_version"); }
-        // Device/fw, PerfOpt state and model/build identity are supplied by the
-        // measurement collector. Never substitute this CLI's binary for the
-        // caller's measured daemon/kernel build identity.
+        // Device/fw and index identity come from the measurement collector.
+        // CalKey defaults an omitted build to this release's stable NPU contract.
         if self.key.kernel.uname_release != uname_release {
             bail!("measurement key mismatch: kernel.uname_release (measured {}, current {})", self.key.kernel.uname_release, uname_release);
         }
@@ -71,10 +70,10 @@ mod tests {
     #[test]
     fn npu_trunk_measurements_reject_missing_fields() {
         assert!(serde_json::from_str::<Measurements>("{}").is_err());
-        assert!(serde_json::from_str::<Measurements>(r#"{"schema_version":2,"margin":0}"#).is_err());
+        assert!(serde_json::from_str::<Measurements>(r#"{"schema_version":3,"margin":0}"#).is_err());
     }
     #[test]
-    fn npu_trunk_measurements_accept_schema_v2_stock_and_overlay() {
+    fn npu_trunk_measurements_accept_schema_v3_stock_and_overlay() {
         for source in [
             include_str!("../../hipfire-arch-qwen4/tests/fixtures/npu_trunk/g80bf16-stock-v2.json"),
             include_str!("../../hipfire-arch-qwen4/tests/fixtures/npu_trunk/g80bf16-overlay-v2.json"),
@@ -82,7 +81,7 @@ mod tests {
             let input: Measurements = serde_json::from_str(source).unwrap();
             let release = input.key.kernel.uname_release.clone();
             let cal = input.assemble(&release).unwrap();
-            assert_eq!(cal.schema_version, 2);
+            assert_eq!(cal.schema_version, 3);
             assert_eq!(cal.families["qkv"].out_dtype, "bf16");
             assert_eq!(cal.families["zab"].out_dtype, "f32");
             assert_eq!(cal.glue.consume_mode, "retile");
@@ -93,6 +92,11 @@ mod tests {
             assert!(input.assemble(&release).is_ok());
             let input: Measurements = serde_json::from_str(source).unwrap();
             assert!(input.assemble("wrong-kernel").is_err());
+            let mut defaults: serde_json::Value = serde_json::from_str(source).unwrap();
+            defaults["key"].as_object_mut().unwrap().remove("build");
+            let input: Measurements = serde_json::from_value(defaults).unwrap();
+            assert_eq!(input.assemble(&release).unwrap().key.build,
+                hipfire_arch_qwen4::npu_trunk::calibration_build_identity());
             for (parent, field) in [("key", "trunk_route"), ("glue", "consume_mode"), ("glue", "consume_ms_per_col_8192")] {
                 let mut incomplete: serde_json::Value = serde_json::from_str(source).unwrap();
                 incomplete[parent].as_object_mut().unwrap().remove(field);

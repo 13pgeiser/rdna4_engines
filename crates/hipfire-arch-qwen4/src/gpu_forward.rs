@@ -3792,6 +3792,20 @@ impl Qwen4GpuForward {
         if let Some(npu)=&mut self.npu_trunk { npu.begin_request(); }
     }
 
+    pub(crate) fn plan_npu_trunk_request(&mut self, rows: usize, position: usize) {
+        #[cfg(target_os = "linux")]
+        if let Some(npu) = &mut self.npu_trunk { npu.plan_request(rows, position); }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (rows, position);
+    }
+
+    pub(crate) fn npu_trunk_pair_rows(&self, position: usize, remaining: usize, chunk: usize) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        { self.npu_trunk.as_ref().and_then(|n| n.selected_pair_rows(position, remaining, chunk)) }
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (position, remaining, chunk); None }
+    }
+
     pub(crate) fn note_npu_trunk_pair(&mut self, rows: usize, position: usize) {
         #[cfg(target_os = "linux")]
         if let Some(npu)=&mut self.npu_trunk {npu.note_pair(rows,position);}
@@ -4294,6 +4308,7 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_rows,
         )?;
+        self.plan_npu_trunk_request(tokens.len(), bundle.state.position);
         // Start the first tile's PLE rows now, ahead of the output-resource
         // preflight.
         self.prefetch_first_tile_ple(bundle, tokens);
@@ -4318,8 +4333,7 @@ impl Qwen4GpuForward {
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
             if offset>=covered_until {
-                if let Some(rows)=self.npu_trunk.as_ref()
-                    .and_then(|_|npu_forward::pair_rows(tokens.len()-offset,max_chunk))
+                if let Some(rows)=self.npu_trunk_pair_rows(bundle.state.position,tokens.len()-offset,max_chunk)
                 {
                     self.note_npu_trunk_pair(rows,bundle.state.position);
                     if self.npu_trunk_pipelined() {
@@ -4421,6 +4435,7 @@ impl Qwen4GpuForward {
     ) -> Result<(), Qwen4GpuForwardError> {
         let mut caller_lookahead = Some(std::mem::take(&mut self.ple_lookahead));
         self.validate_tokens(bundle, tokens)?;
+        self.plan_npu_trunk_request(tokens.len(), bundle.state.position);
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         if let Some((capture, wide)) = wide_hidden_capture.zip(capture_width) {
             let expected = tokens
@@ -4440,8 +4455,7 @@ impl Qwen4GpuForward {
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
             if offset>=covered_until {
-                if let Some(rows)=self.npu_trunk.as_ref()
-                    .and_then(|_|npu_forward::pair_rows(tokens.len()-offset,max_chunk))
+                if let Some(rows)=self.npu_trunk_pair_rows(bundle.state.position,tokens.len()-offset,max_chunk)
                 {
                     self.note_npu_trunk_pair(rows,bundle.state.position);
                     if self.npu_trunk_pipelined() {

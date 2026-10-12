@@ -1858,6 +1858,7 @@ pub fn load_qwen4_rank(
             }
             _ => None,
         };
+        let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq);
         let source = HfqModelSource::from_hfq(hfq);
         // Every allocation of the weight sweep is immutable model data: railgun
         // check mode verifies it unchanged instead of snapshotting it (§2.4).
@@ -1917,6 +1918,7 @@ pub fn load_qwen4_rank(
                 ctx.max_seq
             ),
         })?;
+        bundle.attach_npu_trunk_identity(npu_identity);
         // The assembled weights must report the placement this rank was
         // loaded for (derived from the fulfilled projection census).
         if bundle.weights.ep_placement() != ep {

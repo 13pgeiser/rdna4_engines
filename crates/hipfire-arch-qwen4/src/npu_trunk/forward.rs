@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Opt-in first-light scheduler. The ordinary forward never enters this module when off.
+//! Opt-in calibrated scheduler. The ordinary forward performs no new I/O when off.
 use super::*;
 use crate::npu_trunk::{self as trunk, Family, FamilyMask, Shape, NpuTrunkMode, EpilogueContract};
 use rdna_compute::npu_trunk::{NpuBf16Layout, NpuTrunkOutput};
@@ -23,6 +23,10 @@ pub(super) struct NpuForward {
     host_tokens: Vec<u8>,
     host_ple: Vec<u8>,
     pair_logged: bool,
+    calibration: Option<trunk::Calibration>,
+    n_star: Option<usize>,
+    request_plan: Option<trunk::Plan>,
+    request_origin: usize,
 }
 
 // SAFETY: this private owner exclusively owns the entire railgun HIP Rc graph;
@@ -116,8 +120,11 @@ impl NpuForward {
     pub(crate) fn prepare_stock(gpu: &mut Gpu, bundle: &Qwen4Bundle, pre_overlay: bool) -> Result<Option<PreparedTrunk>, Qwen4GpuForwardError> {
         let mode = NpuTrunkMode::from_env().map_err(fail)?;
         if mode.is_off() { return Ok(None); }
-        if mode == NpuTrunkMode::Auto { return Err(fail("auto requires calibrated admission; first light accepts on or emulate")); }
         if gpu.arch != "gfx1151" || !bundle.config.profile.is_flash_next() || bundle.config.hidden_size != 2560 {
+            if mode == NpuTrunkMode::Auto {
+                eprintln!("npu-trunk: off (requires Flash-Next family B, K=2560, gfx1151)");
+                return Ok(None);
+            }
             return Err(fail("requires Flash-Next family B, K=2560, gfx1151"));
         }
         // Download each stock MQ6 matrix exactly once, before any overlay swap.
@@ -172,7 +179,44 @@ impl NpuForward {
             None => Self::prepare_stock(gpu, bundle, false)?,
         }) else { return Ok(None); };
         let PreparedTrunk { mode, layers: packed, download_ms, mut pack_ms, pre_overlay, overlay_route } = prepared;
-        if mode == NpuTrunkMode::On && (rows != 8192 || scratch_mode != Qwen4ForwardScratchMode::Full || bundle.weights.ep_placement().is_some()) {
+        let trunk_route = overlay_route.map_or_else(|| "stock".to_owned(), |default| format!("overlay:{}", default.marker()));
+        let matched = (|| -> Result<(trunk::Calibration, trunk::CalKey, FamilyMask), String> {
+            let cal = trunk::Calibration::load(hipfire_config::npu_trunk_calibration_path())
+                .map_err(|e| format!("calibration unavailable: {e}"))?;
+            let index = bundle.npu_model_index.as_ref().ok_or("model index identity unavailable")?.as_ref().map_err(Clone::clone)?;
+            let pci = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| e.to_string())?;
+            let key = trunk::runtime_calibration_key(&gpu.arch, &pci, index, &trunk_route)?;
+            let selected = if mode == NpuTrunkMode::Auto {
+                trunk::auto_admission(&cal, &key)?
+            } else {
+                cal.key_matches(&key)?;
+                trunk::select_families(&cal).0
+            };
+            Ok((cal, key, selected))
+        })();
+        let (calibration, n_star) = match matched {
+            Ok((cal, key, selected)) => {
+                let n_star = trunk::crossover(&cal, selected);
+                eprintln!("{}", trunk::load_log_line(&cal, &trunk::LoadLogKey {
+                    current: &key, mode: &mode.to_string(), families: selected,
+                }, n_star, &trunk::plan(&cal, selected, 16384), &trunk::plan(&cal, selected, 65536)));
+                (Some(cal), n_star)
+            }
+            Err(reason) if mode == NpuTrunkMode::Auto => {
+                eprintln!("npu-trunk: off ({reason})");
+                return Ok(None);
+            }
+            Err(reason) => {
+                eprintln!("npu-trunk: mode={mode} calibration=none (forced) reason={reason}");
+                (None, None)
+            }
+        };
+        let physical = mode != NpuTrunkMode::Emulate;
+        if physical && (rows != 8192 || scratch_mode != Qwen4ForwardScratchMode::Full || bundle.weights.ep_placement().is_some()) {
+            if mode == NpuTrunkMode::Auto {
+                eprintln!("npu-trunk: off (requires two full 8192-row banks, full scratch and single-device placement)");
+                return Ok(None);
+            }
             return Err(fail("on requires two full 8192-row banks, full scratch and single-device placement"));
         }
         let started = Instant::now();
@@ -186,7 +230,7 @@ impl NpuForward {
                 let w = gpu.upload_raw(&codes, &[codes.len()])?; allocations.push(w.sub_offset(0, w.numel()));
                 let scales = gpu.upload_raw(&sidecars, &[sidecars.len()])?; allocations.push(scales.sub_offset(0, scales.numel()));
                 resident_bytes += codes.len() + sidecars.len()
-                    + if mode==NpuTrunkMode::On {b.panels.iter().map(Vec::len).sum::<usize>()}else{0};
+                    + if physical {b.panels.iter().map(Vec::len).sum::<usize>()}else{0};
                 resident.push(LayerPanels { layer: index, shape: transport_shape(shape), panels: b.panels });
                 layers.push(NpuLayer { shape, map: b.map, w, scales });
             }
@@ -198,7 +242,7 @@ impl NpuForward {
                 std::fs::OpenOptions::new().create(true).append(true).open(path).map(std::io::BufWriter::new).map_err(fail)
             }).transpose()?;
             pack_ms += started.elapsed().as_secs_f64() * 1000.0;
-            let runtime = if mode == NpuTrunkMode::On {
+            let runtime = if physical {
                 let programs = trunk::build_rowmajor_programs(8192).map_err(fail)?;
                 let programs = programs.per_shape.into_iter().map(|p| PanelProgram {
                     shape: transport_shape(p.shape), pdi: p.design.pdi, txn: p.design.insts, padded_rows: 8192,
@@ -212,23 +256,37 @@ impl NpuForward {
                     [registered_c_view(rt, 1, Shape::GdnIn)?, registered_c_view(rt, 1, Shape::QsaIn)?],
                 ])
             }).transpose()?;
-            let (bank_b,host_tokens,host_ple) = if mode == NpuTrunkMode::On {
+            let (bank_b,host_tokens,host_ple) = if physical {
                 let (scratch,ids,ple)=Qwen4GpuForwardScratch::new(gpu,&bundle.config,rows,scratch_mode)?;
                 (Some(scratch),ids,ple)
             } else { (None,Vec::new(),Vec::new()) };
-            let trunk_route = overlay_route.map_or_else(
-                || "stock".to_owned(), |default| format!("overlay({})", default.marker()));
             let zab_source = if pre_overlay { "stock-MQ6-DtoH-before-overlay" } else { "stock-MQ6-DtoH" };
-            eprintln!("npu-trunk: mode={mode} families=all contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} runtime={} raw=DtoH(no-retained-host-copy) calibration=first-light-force-pairs", if runtime.is_some() { "open" } else { "not-opened" });
-            Ok(Some(Self { mode, layers, a, scales: [d0,d1], sums, bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false }))
+            eprintln!("npu-trunk: mode={mode} families=all contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} runtime={} raw=DtoH(no-retained-host-copy)", if runtime.is_some() { "open" } else { "not-opened" });
+            Ok(Some(Self { mode, layers, a, scales: [d0,d1], sums, bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
+                calibration, n_star, request_plan: None, request_origin: 0 }))
         })();
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
         result
     }
-    pub(super) fn pipelined(&self) -> bool { self.mode == NpuTrunkMode::On }
-    pub(super) fn begin_request(&mut self) { self.pair_logged=false; }
+    pub(super) fn pipelined(&self) -> bool { self.mode != NpuTrunkMode::Emulate }
+    pub(super) fn begin_request(&mut self) { self.pair_logged=false; self.request_plan=None; }
+    pub(super) fn plan_request(&mut self, rows: usize, position: usize) {
+        if self.request_plan.is_some() || self.mode != NpuTrunkMode::Auto { return; }
+        let cal = self.calibration.as_ref().expect("auto requires matched calibration");
+        let planned = trunk::plan(cal, FamilyMask::ALL, rows);
+        let executable = trunk::executable_plan(cal, &planned, rows, self.n_star);
+        eprintln!("{}", trunk::request_log_line(rows, &executable));
+        self.request_origin = position;
+        self.request_plan = Some(executable);
+    }
+    pub(super) fn selected_pair_rows(&self, position: usize, remaining: usize, chunk: usize) -> Option<usize> {
+        if self.mode != NpuTrunkMode::Auto { return pair_rows(remaining, chunk); }
+        if chunk != trunk::CHUNK { return None; }
+        let rows = trunk::planned_pair_rows(self.request_plan.as_ref()?, position.checked_sub(self.request_origin)?)?;
+        (rows <= remaining).then_some(rows)
+    }
     pub(super) fn note_pair(&mut self, rows: usize, position: usize) {
-        if !self.pair_logged {
+        if !self.pair_logged && self.mode != NpuTrunkMode::Auto {
             eprintln!("npu-trunk: pair rows=8192+{} position={position}",rows-8192);
             self.pair_logged=true;
         }

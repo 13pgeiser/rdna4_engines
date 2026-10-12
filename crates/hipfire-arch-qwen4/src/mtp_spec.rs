@@ -551,6 +551,9 @@ impl SpecTarget for Qwen4Bundle {
             .scratch
             .max_chunk;
         self.begin_npu_trunk_request();
+        if let Some(forward) = &mut self.execution {
+            forward.plan_npu_trunk_request(tokens.len(), start_pos);
+        }
         let mut offset = 0usize;
         let mut last_argmax = None;
         while offset < tokens.len() {

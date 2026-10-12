@@ -249,6 +249,52 @@ pub fn select_families(cal: &Calibration) -> (FamilyMask, SelectionReport) {
     let best_families = best.families;
     (families, SelectionReport { subsets, best_families })
 }
+
+/// 0.4.2 can execute only the full four-family selection.
+pub fn auto_admission(cal: &Calibration, current: &CalKey) -> Result<FamilyMask, String> {
+    cal.key_matches(current)?;
+    let (families, _) = select_families(cal);
+    if families.is_empty() { return Err("calibration selects no families".into()); }
+    if families != FamilyMask::ALL { return Err("calibration selects a subset; 0.4.2 requires all four families".into()); }
+    Ok(families)
+}
+
+/// Project S5 onto the executor's existing natural chunk boundaries.
+/// Split/rebalanced/rebanked steps stay GPU-only; never substitute force-pairs.
+pub fn executable_plan(cal: &Calibration, planned: &Plan, rows: usize, n_star: Option<usize>) -> Plan {
+    let minimum = 512.max(cal.gpu.min_bank_rows);
+    let armed = n_star.is_some_and(|n| rows >= n);
+    let mut steps = Vec::with_capacity(rows.div_ceil(CHUNK));
+    let mut at = 0;
+    let mut t_pipe_ms = 0.0;
+    while at < rows {
+        let pair = armed.then(|| planned.steps.iter().find_map(|step| match step {
+            Step::Pipe { a, b } if a.start == at && a.start % CHUNK == 0
+                && a.len() == CHUNK && b.start == a.end
+                && (minimum..=CHUNK).contains(&b.len())
+                && b.end == (at + 2 * CHUNK).min(rows) => Some((a.clone(), b.clone())),
+            _ => None,
+        })).flatten();
+        if let Some((a, b)) = pair {
+            t_pipe_ms += pair_time(cal, FamilyMask::ALL, a.len(), a.start, b.len(), b.start).t;
+            at = b.end;
+            steps.push(Step::Pipe { a, b });
+        } else {
+            let end = (at + CHUNK).min(rows);
+            t_pipe_ms += gpu_chunk(cal, end - at, at).total;
+            steps.push(Step::Gpu { chunk: at..end });
+            at = end;
+        }
+    }
+    Plan { steps, t_gpu_ms: planned.t_gpu_ms, t_pipe_ms }
+}
+
+pub fn planned_pair_rows(planned: &Plan, offset: usize) -> Option<usize> {
+    planned.steps.iter().find_map(|step| match step {
+        Step::Pipe { a, b } if a.start == offset => Some(b.end - a.start),
+        _ => None,
+    })
+}
 /// Load-time log context, all caller-supplied deterministic state.
 pub struct LoadLogKey<'a> { pub current: &'a CalKey, pub mode: &'a str, pub families: FamilyMask }
 pub fn load_log_line(cal: &Calibration, key: &LoadLogKey<'_>, n_star: Option<usize>, t16384: &Plan, t65536: &Plan) -> String {

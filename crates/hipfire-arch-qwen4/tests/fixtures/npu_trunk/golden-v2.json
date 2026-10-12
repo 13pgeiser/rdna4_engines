@@ -55,14 +55,13 @@
           "pci_bdf": "0000:c0:00.0",
           "npu_fw_version": "1.1.2.65"
         },
-        "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+        "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
         "kernel": {
-          "uname_release": "7.3.0-rc7-perfopt+",
-          "perfopt_armed": true
+          "uname_release": "7.3.0-rc7-perfopt+"
         },
-        "model_sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
         "epilogue": "bf16",
-        "trunk_route": "stock"
+        "trunk_route": "stock",
+        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -74,7 +73,7 @@
         "alpha_overlap": 1.049,
         "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
       },
-      "schema_version": 2,
+      "schema_version": 3,
       "margin": 0.0
     },
     "selected": [
@@ -849,14 +848,13 @@
           "pci_bdf": "0000:c0:00.0",
           "npu_fw_version": "1.1.2.65"
         },
-        "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+        "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
         "kernel": {
-          "uname_release": "7.3.0-rc7-perfopt+",
-          "perfopt_armed": true
+          "uname_release": "7.3.0-rc7-perfopt+"
         },
-        "model_sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
         "epilogue": "bf16",
-        "trunk_route": "stock"
+        "trunk_route": "stock",
+        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -868,7 +866,7 @@
         "alpha_overlap": 1.049,
         "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
       },
-      "schema_version": 2,
+      "schema_version": 3,
       "margin": 0.0
     },
     "selected": [
@@ -1643,14 +1641,13 @@
           "pci_bdf": "0000:c0:00.0",
           "npu_fw_version": "1.1.2.65"
         },
-        "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+        "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
         "kernel": {
-          "uname_release": "7.3.0-rc7-perfopt+",
-          "perfopt_armed": true
+          "uname_release": "7.3.0-rc7-perfopt+"
         },
-        "model_sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
         "epilogue": "bf16",
-        "trunk_route": "overlay:gfx1151-zab-v1"
+        "trunk_route": "overlay:gfx1151-zab-v1",
+        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -1662,7 +1659,7 @@
         "alpha_overlap": 1.049,
         "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
       },
-      "schema_version": 2,
+      "schema_version": 3,
       "margin": 0.0
     },
     "selected": [
@@ -2425,14 +2422,13 @@
           "pci_bdf": "0000:c0:00.0",
           "npu_fw_version": "1.1.2.65"
         },
-        "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+        "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
         "kernel": {
-          "uname_release": "7.3.0-rc7-perfopt+",
-          "perfopt_armed": true
+          "uname_release": "7.3.0-rc7-perfopt+"
         },
-        "model_sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
         "epilogue": "bf16",
-        "trunk_route": "overlay:gfx1151-zab-v1"
+        "trunk_route": "overlay:gfx1151-zab-v1",
+        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -2444,7 +2440,7 @@
         "alpha_overlap": 1.049,
         "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
       },
-      "schema_version": 2,
+      "schema_version": 3,
       "margin": 0.0
     },
     "selected": [
@@ -3219,14 +3215,13 @@
           "pci_bdf": "0000:c0:00.0",
           "npu_fw_version": "1.1.2.65"
         },
-        "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+        "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
         "kernel": {
-          "uname_release": "7.3.0-rc7-perfopt+",
-          "perfopt_armed": true
+          "uname_release": "7.3.0-rc7-perfopt+"
         },
-        "model_sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
         "epilogue": "bf16",
-        "trunk_route": "overlay:gfx1151-zab-v1"
+        "trunk_route": "overlay:gfx1151-zab-v1",
+        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -3238,7 +3233,7 @@
         "alpha_overlap": 1.049,
         "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
       },
-      "schema_version": 2,
+      "schema_version": 3,
       "margin": 0.1
     },
     "selected": [],
@@ -4116,14 +4111,13 @@
           "pci_bdf": "0000:c0:00.0",
           "npu_fw_version": "1.1.2.65"
         },
-        "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+        "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
         "kernel": {
-          "uname_release": "7.3.0-rc7-perfopt+",
-          "perfopt_armed": true
+          "uname_release": "7.3.0-rc7-perfopt+"
         },
-        "model_sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
         "epilogue": "bf16",
-        "trunk_route": "overlay:gfx1151-zab-v1"
+        "trunk_route": "overlay:gfx1151-zab-v1",
+        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -4135,7 +4129,7 @@
         "alpha_overlap": 1.049,
         "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
       },
-      "schema_version": 2,
+      "schema_version": 3,
       "margin": 0.99
     },
     "selected": [],
@@ -5013,14 +5007,13 @@
           "pci_bdf": "0000:c0:00.0",
           "npu_fw_version": "1.1.2.65"
         },
-        "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+        "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
         "kernel": {
-          "uname_release": "7.3.0-rc7-perfopt+",
-          "perfopt_armed": true
+          "uname_release": "7.3.0-rc7-perfopt+"
         },
-        "model_sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
         "epilogue": "i32",
-        "trunk_route": "stock"
+        "trunk_route": "stock",
+        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -5032,7 +5025,7 @@
         "alpha_overlap": 1.049,
         "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
       },
-      "schema_version": 2,
+      "schema_version": 3,
       "margin": 0.0
     },
     "selected": [
@@ -5795,14 +5788,13 @@
           "pci_bdf": "0000:c0:00.0",
           "npu_fw_version": "1.1.2.65"
         },
-        "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+        "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
         "kernel": {
-          "uname_release": "7.3.0-rc7-perfopt+",
-          "perfopt_armed": true
+          "uname_release": "7.3.0-rc7-perfopt+"
         },
-        "model_sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
         "epilogue": "bf16",
-        "trunk_route": "stock"
+        "trunk_route": "stock",
+        "model_index_sha256": "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013"
       },
       "npu": {
         "tops_corun": 16.1,
@@ -5814,7 +5806,7 @@
         "alpha_overlap": 1.049,
         "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
       },
-      "schema_version": 2,
+      "schema_version": 3,
       "margin": 0.0
     },
     "selected": [],

@@ -278,6 +278,7 @@ pub struct Qwen4Bundle {
     /// Accepted trunk overlay sidecar (`attach_trunk_overlay`), consumed by
     /// `attach_forward`; `None` = none pending.
     pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
+    pub(crate) npu_model_index: Option<Result<String, String>>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -670,6 +671,7 @@ impl Qwen4Bundle {
             lanes: None,
             ep: None,
             trunk_overlay: None,
+            npu_model_index: None,
         })
     }
 
@@ -746,6 +748,11 @@ impl Qwen4Bundle {
 
     pub fn attached_external_rows_len(&self) -> usize {
         self.weight_store.external_rows_len()
+    }
+
+    /// Attach cheap base-HFQ identity captured before the source was moved.
+    pub fn attach_npu_trunk_identity(&mut self, identity: Option<Result<String, String>>) {
+        self.npu_model_index = identity;
     }
 
     /// Hand the bundle an accepted trunk overlay
@@ -1086,7 +1093,8 @@ impl Qwen4Bundle {
     pub(crate) fn prefill_schedule_rows(&self, position: usize, end: usize, chunk: usize) -> usize {
         let boundary = self.session_next_boundary();
         let rows = crate::gpu_forward::qwen4_prefill_segment_rows(
-            position, end, chunk, boundary, self.npu_trunk_planned(),
+            position, end, chunk, boundary,
+            self.execution.as_ref().is_some_and(|f| f.npu_trunk_pair_rows(position, end - position, chunk).is_some()),
         );
         if rows > chunk && boundary == Some(position + chunk) {
             if self.session.as_ref().and_then(|cache| cache.next_boundary_after(position + chunk))
@@ -2601,6 +2609,9 @@ impl Qwen4Bundle {
             }
         };
         if result.is_ok() {
+            if let Some(forward) = &mut self.execution {
+                forward.plan_npu_trunk_request(prompt.len() - reused, reused);
+            }
             self.turn = Some((prompt.to_vec(), route));
         } else {
             self.live = None;

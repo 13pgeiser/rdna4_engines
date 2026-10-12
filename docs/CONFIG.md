@@ -110,6 +110,8 @@ Stable/default-on and safety controls:
 | `fusions.qkv_bias` | `true` | Fold supported QKV bias launches. |
 | `kernel.rocblas_off` | `false` | Disable rocBLAS dispatch. |
 | `fusions.force_unfused` | `false` | Force supported projection paths unfused. |
+| `fusions.npu_trunk` | `"off"` | Opt-in Flash-Next gfx1151 trunk: `off|auto|on|emulate`. Auto requires matching stored calibration selecting all four families; forced modes retain all-family natural pairing. |
+| `fusions.npu_trunk_calibration` | `""` | Empty resolves to `<hipfire home>/npu-trunk/calibration.json`; alias `npu_trunk_calibration`, env `HIPFIRE_QWEN4_NPU_TRUNK_CAL`. No calibration/index I/O when trunk mode is off. See [NPU trunk](npu/npu-trunk.md). |
 | `speculation.dflash_tree` | `false` | Enable DDTree tree-SWOR verification. |
 | `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates only the host `MemAvailable` headroom check; the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
 
@@ -1178,6 +1180,8 @@ misspelled key is unknown and fails the load with
 | `experimental.graph.forward` | `graph_forward` | `HIPFIRE_GRAPH` | experimental |
 | `experimental.graph.moe` | `graph_moe` | `HIPFIRE_GRAPH_MOE` | experimental |
 | `fusions.force_unfused` | `force_unfused` | `HIPFIRE_FORCE_UNFUSED` | experimental |
+| `fusions.npu_trunk` | `npu_trunk` | `HIPFIRE_QWEN4_NPU_TRUNK` | experimental |
+| `fusions.npu_trunk_calibration` | `npu_trunk_calibration` | `HIPFIRE_QWEN4_NPU_TRUNK_CAL` | experimental |
 | `fusions.policy` | `fusion_policy` |  | stable |
 | `fusions.qkv_bias` | `fuse_qkv_bias` | `HIPFIRE_FUSE_QKV_BIAS` | stable |
 | `generation.loop_guard_threshold` | `ngram_loop_threshold` | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | stable |

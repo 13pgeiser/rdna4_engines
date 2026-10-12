@@ -3,7 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
-pub const CALIBRATION_SCHEMA_VERSION: u32 = 2;
+pub const CALIBRATION_SCHEMA_VERSION: u32 = 3;
+/// Change the contract suffix when serving numerics/transport change.
+pub fn calibration_build_identity() -> String {
+    format!("hipfire-{}:npu-trunk-bf16-rowmajor-v1", env!("CARGO_PKG_VERSION"))
+}
 pub(crate) const FAMILY_NAMES: [&str; 4] = ["qkv", "zab", "q", "kvidx"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,16 +21,17 @@ pub struct DeviceKey {
 #[serde(deny_unknown_fields)]
 pub struct KernelKey {
     pub uname_release: String,
-    pub perfopt_armed: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CalKey {
     pub device: DeviceKey,
-    /// Caller-supplied git SHA or binary identity of the measured serving build.
+    /// Stable release + NPU numerical/transport contract, never a git SHA.
+    #[serde(default = "calibration_build_identity")]
     pub build: String,
     pub kernel: KernelKey,
-    pub model_sha256: String,
+    /// SHA256 of HFQ bytes [0, data_offset), as in trunk-overlay binding.
+    pub model_index_sha256: String,
     /// `i32` or `bf16`, matching NpuCalibration::epilogue.
     pub epilogue: String,
     /// GPU-native trunk identity: `stock` or `overlay:<artifact marker>`.
@@ -100,8 +105,8 @@ impl Calibration {
             }
         }; }
         check!(device.arch); check!(device.pci_bdf); check!(device.npu_fw_version);
-        check!(build); check!(kernel.uname_release); check!(kernel.perfopt_armed);
-        check!(model_sha256); check!(epilogue); check!(trunk_route);
+        check!(build); check!(kernel.uname_release);
+        check!(model_index_sha256); check!(epilogue); check!(trunk_route);
         Ok(())
     }
     pub fn validate(&self) -> Result<(), String> {
@@ -128,7 +133,7 @@ impl Calibration {
             ("device.npu_fw_version", &self.key.device.npu_fw_version), ("build", &self.key.build),
             ("kernel.uname_release", &self.key.kernel.uname_release), ("contention.model", &self.contention.model),
         ] { if value.trim().is_empty() { return Err(format!("{name} must not be empty")); } }
-        if self.key.model_sha256.len() != 64 || !self.key.model_sha256.bytes().all(|c| c.is_ascii_hexdigit()) { return Err("model_sha256 must be 64 hex digits".into()); }
+        if self.key.model_index_sha256.len() != 64 || !self.key.model_index_sha256.bytes().all(|c| c.is_ascii_hexdigit()) { return Err("model_index_sha256 must be 64 hex digits".into()); }
         if self.families.len() != 4 || self.gpu.trunk_in_ms_per_8192.len() != 4 { return Err("expected qkv,zab,q,kvidx calibration families".into()); }
         for (i, name) in FAMILY_NAMES.iter().enumerate() {
             let f = self.families.get(*name).ok_or_else(|| format!("missing families.{name}"))?;
@@ -148,4 +153,38 @@ impl Calibration {
         if !self.contention.alpha_overlap.is_finite() || self.contention.alpha_overlap < 1.0 { return Err("alpha_overlap must be finite and >= 1".into()); }
         Ok(())
     }
+}
+
+/// Pure construction shared by runtime and CPU identity tests.
+pub fn calibration_key(arch: &str, pci_bdf: &str, firmware: &str, release: &str, index: &str, trunk_route: &str) -> CalKey {
+    CalKey {
+        device: DeviceKey { arch: arch.into(), pci_bdf: pci_bdf.to_ascii_lowercase(), npu_fw_version: firmware.trim().into() },
+        build: calibration_build_identity(),
+        kernel: KernelKey { uname_release: release.trim().into() },
+        model_index_sha256: index.into(), epilogue: "bf16".into(), trunk_route: trunk_route.into(),
+    }
+}
+
+/// Read only unprivileged metadata, never open a GPU/NPU or time work.
+pub fn runtime_calibration_key(arch: &str, pci_bdf: &str, index: &str, trunk_route: &str) -> Result<CalKey, String> {
+    // railgun opens accel0; key that exact device, not the first PCI directory.
+    let device = Path::new("/sys/class/accel/accel0/device");
+    let firmware = fs::read_to_string(device.join("fw_version")).map_err(|e| format!("NPU fw_version: {e}"))?;
+    let release = std::process::Command::new("uname").arg("-r").output().map_err(|e| format!("uname -r: {e}"))?;
+    if !release.status.success() { return Err("uname -r failed".into()); }
+    let release = std::str::from_utf8(&release.stdout).map_err(|e| e.to_string())?;
+    // PerfOpt's armed message is privileged dmesg, with no sysfs/proc ABI.
+    // Schema 3 deliberately keys kernel identity on uname_release alone.
+    Ok(calibration_key(arch, pci_bdf, &firmware, release, index, trunk_route))
+}
+
+/// Capture the base before it moves into the source owner. Off performs no I/O.
+pub fn model_index_identity(hfq: &hipfire_runtime::hfq::HfqFile) -> Option<Result<String, String>> {
+    if super::NpuTrunkMode::from_env().ok().is_none_or(|mode| mode.is_off()) { return None; }
+    Some(hfq.index_sha256().map(|hash| {
+        use std::fmt::Write;
+        let mut hex = String::with_capacity(64);
+        for byte in hash { write!(&mut hex, "{byte:02x}").expect("write to String"); }
+        hex
+    }).map_err(|e| format!("model index identity: {e}")))
 }

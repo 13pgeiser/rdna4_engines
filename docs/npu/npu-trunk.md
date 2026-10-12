@@ -437,6 +437,57 @@ For both current stock and overlay records, executable pair starts/lengths are:
 65536: those three plus `(49152,16384)`. n* is 6848 stock / 8256 overlay,
 but the executor cannot run the planner's smaller split-bank candidates.
 
+### Installing and testing auto on hipx (parent hardware gate)
+
+After CPU acceptance, install the **same** release CLI/daemon and matching
+schema-3 overlay calibration. These commands are for the parent, not the CPU worker:
+
+```sh
+ssh hipx 'mkdir -p /home/kaden/pm-wave/npu-trunk/bin-auto ~/.hipfire/npu-trunk'
+scp target/release/hipfire hipx:/home/kaden/pm-wave/npu-trunk/bin-auto/hipfire
+scp target/release/hipfire-daemon hipx:/home/kaden/pm-wave/npu-trunk/bin-auto/hipfire-daemon
+scp /home/kaden/qcal/release-0.4.2/npu-trunk/cal/g80bf16-overlay-v2.json \
+  hipx:/home/kaden/.hipfire/npu-trunk/calibration.json
+scp /home/kaden/qcal/release-0.4.2/npu-trunk/serve_ttft.py \
+  hipx:/home/kaden/pm-wave/npu-trunk/bin-auto/serve_ttft.py
+```
+
+On hipx, verify `uname -r` is `7.3.0-rc7-perfopt+`, GPU BDF is
+`0000:c0:00.0`, and `cat /sys/class/accel/accel0/device/fw_version` matches the
+record. Do not rewrite a measured device/kernel key to hide a mismatch.
+Use the verified overlay-bound model; for stock instead install the stock
+record and set `HIPFIRE_QWEN4_TRUNK_OVERLAY=off`.
+Do **not** inherit the CPU gate's visibility masks (`-1`); use the Halo device
+selection from the existing hipx campaign. Keep the default session cache.
+
+```sh
+export HIPFIRE_DAEMON_BIN=/home/kaden/pm-wave/npu-trunk/bin-auto/hipfire-daemon
+export HIPFIRE_QWEN4_NPU_TRUNK_CAL=/home/kaden/.hipfire/npu-trunk/calibration.json
+export MODEL=/home/kaden/pm-wave/npu-trunk/models-ov/qwen3.8-flash-next-gptq3.mq4
+export ROCR_VISIBLE_DEVICES=1  # recorded Halo campaign ordinal; require gfx1151/c0:00.0
+unset HIP_VISIBLE_DEVICES
+HIPFIRE_QWEN4_NPU_TRUNK=auto /home/kaden/pm-wave/npu-trunk/bin-auto/hipfire \
+  bench "$MODEL" --ttft --prompt-file /home/kaden/pm-wave/halofn/p16k.txt --runs 3
+for mode in auto off; do
+  for run in 1 2 3; do
+    HIPFIRE_QWEN4_NPU_TRUNK="$mode" python3 /home/kaden/pm-wave/npu-trunk/bin-auto/serve_ttft.py \
+      --hipfire /home/kaden/pm-wave/npu-trunk/bin-auto/hipfire --model "$MODEL" \
+      --prompt /home/kaden/pm-wave/halofn/p16k.txt --measured 1 --greedy \
+      --tag "$mode-$run" --out "/tmp/npu-auto-$mode-$run.json"
+  done
+done
+```
+
+Require load `mode=auto`, matching `cal_key`, all families and n*=8256,
+not an off/mismatch reason. Require the actual prompt row count and one request
+plan line; 16343 rows must select one 8192+8151 pair. Repeat fresh processes
+for `auto` and `off` at 16K/57K, and a greedy prefix-sharing second request
+through `serve_ttft.py --greedy` with the same model and default cache.
+Confirm short prompts stay GPU-only (8000/9000 have no executable pair), and
+that 57544's final rebalanced step is GPU-only. The previously documented
+snapshot and quality/TTFT gates still apply; CPU acceptance is not a silicon claim.
+
+
 The opt-in route requires Flash-Next K=2560 and stock MQ6G256V2 for all eight
 input families. In `attach_forward`, preparation downloads each stock matrix
 once and packs the S1 `Bf16Direct` panels and exact row-major W8/Sm/Se twin
