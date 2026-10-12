@@ -33,3 +33,8 @@ peacemaker-author = { path = "../peacemaker-author" }
 radiowave = { path = "../radiowave", optional = true }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-ir = { path = "../peacemaker-ir" }
+
+[dev-dependencies]
+# The bit-exact host twin of the device-accept kernel (`dflash_sampled_accept_reference`)
+# that `tests/dflash_accept_emu.rs` compares the builder kernel with on the CPU interpreter.
+rdna-compute = { path = "../rdna-compute" }

@@ -31,6 +31,41 @@ pub const DFLASH_SAMPLED_ACCEPT_MODULE: &str = "dflash_sampled_accept_sparse_q";
 pub const DFLASH_SAMPLED_ACCEPT_SYMBOL: &str = "dflash_sampled_accept_sparse_q_f32";
 /// Threads (= CDF segments) of the single block; `DSA_THREADS` in the kernel.
 pub const DFLASH_SAMPLED_ACCEPT_THREADS: usize = 256;
+/// Certified builder (PeaceMaker) module of the production gfx1201 kernel
+/// (`hipfire-isa emit --kernel dflash_accept --arch gfx1201`), same ABI, grid
+/// and output words as the hipcc oracle.
+pub const DFLASH_SAMPLED_ACCEPT_PM_MODULE: &str = "dflash_sampled_accept_pm_gfx1201";
+/// Device symbol of the production builder kernel.
+pub const DFLASH_SAMPLED_ACCEPT_PM_SYMBOL: &str = "dflash_sampled_accept_sparse_q_f32_pm_gfx1201";
+/// Largest probs extent the builder kernel addresses (32-bit raw buffer offsets).
+const DFLASH_ACCEPT_PM_MAX_PROBS_BYTES: u64 = 1 << 32;
+
+/// The production device accept runs from the certified builder module on
+/// gfx1201 only; there is no hipcc production fallback (the hipcc kernel is the
+/// retained oracle of [`Gpu::dflash_sampled_accept_sparse_q_f32_hip_oracle`]).
+pub fn dflash_accept_pm_arch(arch: &str) -> bool {
+    arch == "gfx1201"
+}
+
+/// The builder kernel's shape contract: at least one proposed row and one
+/// vocabulary id, and the `(n + 1)`-row probs buffer addressable by 32-bit
+/// byte offsets.
+pub fn dflash_accept_pm_fits(n: usize, vocab: usize) -> bool {
+    n >= 1
+        && vocab >= 1
+        && vocab <= i32::MAX as usize
+        && n <= i32::MAX as usize / 4
+        && ((n as u64 + 1) * vocab as u64 * 4) < DFLASH_ACCEPT_PM_MAX_PROBS_BYTES
+}
+
+/// Which kernel a launch uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AcceptKernel {
+    /// Production: the certified builder module.
+    Pm,
+    /// Non-production oracle: the hipcc source.
+    HipOracle,
+}
 
 const FLT_MIN: f32 = f32::MIN_POSITIVE;
 
@@ -419,9 +454,54 @@ impl Gpu {
     /// upload and the launch are enqueued on the Gpu's stream, behind the
     /// softmax; the single synchronizing step is the 16-byte result readback.
     /// No capture-safe: the readback refuses to run during capture.
+    ///
+    /// Production route: the certified builder kernel
+    /// ([`DFLASH_SAMPLED_ACCEPT_PM_SYMBOL`]), gfx1201 only. There is no hipcc
+    /// fallback: other architectures (and shapes outside
+    /// [`dflash_accept_pm_fits`]) are an error, and callers gate on
+    /// [`Gpu::dflash_device_accept_supported`].
     #[allow(clippy::too_many_arguments)]
     pub fn dflash_sampled_accept_sparse_q_f32(
         &mut self,
+        scratch: &DflashAcceptScratch,
+        probs: &GpuTensor,
+        tau: &GpuTensor,
+        z: &GpuTensor,
+        payload: &[u32],
+        n: usize,
+        vocab: usize,
+    ) -> HipResult<DflashDeviceDecision> {
+        self.dflash_sampled_accept_run(AcceptKernel::Pm, scratch, probs, tau, z, payload, n, vocab)
+    }
+
+    /// Whether the production device accept can run on this device (the
+    /// builder module exists for gfx1201 only).
+    pub fn dflash_device_accept_supported(&self) -> bool {
+        dflash_accept_pm_arch(&self.arch)
+    }
+
+    /// The retained hipcc kernel (`kernels/src/dflash_sampled_accept_sparse_q.hip`)
+    /// as a NON-PRODUCTION oracle for the builder kernel's equality tests; the
+    /// decision words are identical. No production path calls it.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_sampled_accept_sparse_q_f32_hip_oracle(
+        &mut self,
+        scratch: &DflashAcceptScratch,
+        probs: &GpuTensor,
+        tau: &GpuTensor,
+        z: &GpuTensor,
+        payload: &[u32],
+        n: usize,
+        vocab: usize,
+    ) -> HipResult<DflashDeviceDecision> {
+        self.dflash_sampled_accept_run(AcceptKernel::HipOracle, scratch, probs, tau, z, payload, n, vocab)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dflash_sampled_accept_run(
+        &mut self,
+        kernel: AcceptKernel,
         scratch: &DflashAcceptScratch,
         probs: &GpuTensor,
         tau: &GpuTensor,
@@ -457,11 +537,35 @@ impl Gpu {
             }
         }
         self.bind_thread()?;
-        self.ensure_kernel(
-            DFLASH_SAMPLED_ACCEPT_MODULE,
-            DFLASH_SAMPLED_ACCEPT_SRC,
-            DFLASH_SAMPLED_ACCEPT_SYMBOL,
-        )?;
+        let symbol = match kernel {
+            AcceptKernel::Pm => {
+                if !dflash_accept_pm_arch(&self.arch) {
+                    return Err(err(format!(
+                        "the production device accept is a gfx1201 builder module (device is {}); no hipcc fallback",
+                        self.arch
+                    )));
+                }
+                if !dflash_accept_pm_fits(n, vocab) {
+                    return Err(err(format!(
+                        "n {n} x vocab {vocab} outside the builder kernel's 32-bit probs extent"
+                    )));
+                }
+                self.ensure_embedded_kernel(
+                    DFLASH_SAMPLED_ACCEPT_PM_MODULE,
+                    crate::kernels::DFLASH_SAMPLED_ACCEPT_PM_GFX1201,
+                    DFLASH_SAMPLED_ACCEPT_PM_SYMBOL,
+                )?;
+                DFLASH_SAMPLED_ACCEPT_PM_SYMBOL
+            }
+            AcceptKernel::HipOracle => {
+                self.ensure_kernel(
+                    DFLASH_SAMPLED_ACCEPT_MODULE,
+                    DFLASH_SAMPLED_ACCEPT_SRC,
+                    DFLASH_SAMPLED_ACCEPT_SYMBOL,
+                )?;
+                DFLASH_SAMPLED_ACCEPT_SYMBOL
+            }
+        };
         if scratch.payload_cap < payload.len() {
             return Err(err(format!(
                 "scratch payload holds {} words, window needs {}",
@@ -470,7 +574,7 @@ impl Gpu {
             )));
         }
         let result = self.dflash_sampled_accept_enqueue(
-            probs, tau, z, payload, &scratch.payload, &scratch.out, n, vocab,
+            symbol, probs, tau, z, payload, &scratch.payload, &scratch.out, n, vocab,
         );
         if result.is_err() {
             // An async copy of `payload` may still be queued: drain it before
@@ -483,6 +587,7 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     fn dflash_sampled_accept_enqueue(
         &mut self,
+        symbol: &'static str,
         probs: &GpuTensor,
         tau: &GpuTensor,
         z: &GpuTensor,
@@ -519,11 +624,11 @@ impl Gpu {
         let timer = crate::profile::begin_timer(
             &self.hip,
             "dflash_sampled_accept",
-            DFLASH_SAMPLED_ACCEPT_SYMBOL,
+            symbol,
             payload.len() * 4 + 16,
         );
         let launched = self.launch_maybe_blob(
-            DFLASH_SAMPLED_ACCEPT_SYMBOL,
+            symbol,
             [1, 1, 1],
             [DFLASH_SAMPLED_ACCEPT_THREADS as u32, 1, 1],
             0,

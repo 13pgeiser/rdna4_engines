@@ -196,6 +196,11 @@ fn kernel_equals_twin(
             .unwrap_or_else(|e| panic!("{name} #{k}: {e}"));
         let twin = dflash_sampled_accept_reference(&rows.h_probs, &rows.h_tau, &rows.h_z, &payload, n, VOCAB);
         assert_eq!(dev, twin, "{name} #{k}: kernel != twin");
+        // The retained hipcc kernel is the non-production oracle of the builder kernel.
+        let oracle = gpu
+            .dflash_sampled_accept_sparse_q_f32_hip_oracle(scratch, &rows.probs, &rows.tau, &rows.z, &payload, n, VOCAB)
+            .unwrap_or_else(|e| panic!("{name} #{k} (hip oracle): {e}"));
+        assert_eq!(dev, oracle, "{name} #{k}: builder kernel != hipcc oracle");
         decisions.push(dev);
     }
     let rej = decisions.iter().filter(|d| d.rejected).count();
@@ -283,7 +288,7 @@ fn device_accept_kernel_equals_host_twin() {
     let mut probs = vec![1e-7f32; (n + 1) * VOCAB];
     for r in 0..=n {
         for j in 0..40 {
-            probs[r * VOCAB + 1000 * j + r] = 0.025;
+            probs[r * VOCAB + 800 * j + r] = 0.025;
         }
     }
     let flat = synthetic_rows(&mut gpu, &probs, &vec![0.025; n + 1], &vec![1.0; n + 1]);

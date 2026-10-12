@@ -4219,6 +4219,13 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
 /// (`hipfire peacemaker native-emit`).
 pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
 pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
+/// Certified builder module of the production sampled-DFlash device accept
+/// (`hipfire-isa emit --kernel dflash_accept --arch gfx1201`, M7
+/// obligation-free): `dflash_sampled_accept_sparse_q_f32_pm_gfx1201`, with the
+/// ABI, grid, payload and decision words of the retained hipcc oracle
+/// `kernels/src/dflash_sampled_accept_sparse_q.hip`. gfx1201 only, no hipcc
+/// production fallback.
+pub const DFLASH_SAMPLED_ACCEPT_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/dflash_sampled_accept_pm_gfx1201.hxaco");
 /// Certified builder module of the live QSA selector pair
 /// (`hipfire-isa emit --kernel qsa_select --epi all --arch gfx1151`, M7
 /// obligation-free): the rows16 F32 score and the select-from-scores kernels,

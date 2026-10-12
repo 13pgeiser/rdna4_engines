@@ -88,6 +88,12 @@ fn qsa_select(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=qsa_select::emit(Spec{arch,kind})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
+/// gfx1201 sampled-DFlash device accept (`dflash_sampled_accept_pm_gfx1201`, one symbol).
+fn dflash_accept(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ if epi!="all"{return Err(format!("dflash_accept --epi {epi} (all)"))}
+ let (_,text,proof)=hipfire_isa::kernels::dflash_accept::emit_module(arch)?;
+ Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))
+}
 /// gfx1201 MQ6 trunk GEMM twin: `--epi w4|w8` one entry, `all` the module.
 fn qwen4_mq6_x4(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  use hipfire_isa::kernels::qwen4_mq6_x4::{self,Spec};
@@ -272,6 +278,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "qwen4_moe_sym"=>qwen4_moe_sym(epi.as_deref().ok_or("missing --epi")?,arch)?,
   "qsa_gather"=>qsa_gather(epi.as_deref().unwrap_or("all"),arch)?,
   "qsa_select"=>qsa_select(epi.as_deref().unwrap_or("all"),arch)?,
+  "dflash_accept"=>dflash_accept(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4"=>qwen4_mq6_x4(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4_gfx11"=>qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_lane_rows"=>qwen4_lane_rows(epi.as_deref().unwrap_or("all"),arch)?,

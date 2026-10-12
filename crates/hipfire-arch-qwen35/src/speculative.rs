@@ -4382,6 +4382,8 @@ static DFLASH_DEVICE_ACCEPT_ON: std::sync::LazyLock<bool> = std::sync::LazyLock:
 });
 
 /// The kill switch of the device sampled accept ([`dflash_sampled_accept_device`]).
+/// The kernel is the certified builder module (gfx1201 only, no hipcc production
+/// fallback), so callers also require `Gpu::dflash_device_accept_supported()`.
 #[doc(hidden)]
 pub fn dflash_device_accept_enabled() -> bool {
     *DFLASH_DEVICE_ACCEPT_ON
@@ -8900,7 +8902,7 @@ pub fn spec_step_dflash(
                 if !gpu_accept
                     && fast_sample_active
                     && dflash_device_accept_eligible(
-                        dflash_device_accept_enabled(),
+                        dflash_device_accept_enabled() && gpu.dflash_device_accept_supported(),
                         &DflashSampleCfg { temp, top_p, top_k, cactus_delta },
                         r,
                         b,
