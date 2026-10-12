@@ -65,6 +65,7 @@ pub mod draft_lane_conv;
 pub mod draft_lane_rows;
 pub mod sampled_rows_compact;
 pub mod dflash_sampled_accept;
+pub mod spec_sampling_cpu_ar;
 pub mod tape_copy;
 pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared,
