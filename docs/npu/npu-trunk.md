@@ -339,11 +339,15 @@ mode/families/contract and runtime status. `on` additionally opens the unchanged
 any admission/open error fails the load. Calibration is deliberately bypassed,
 with a `first-light-force-pairs` load note.
 
-`emulate`, and every unpaired chunk under `on`, use the producer and exact IU8
-BF16-direct GPU twin for rows >=512. Smaller chunks and decode retain the
-ordinary projections. Out-projections retain their MQ6 route. QSA output
-scratch is F32; GDN qkv is BF16 only when the existing chunk-core route reads
-BF16 (otherwise it is exact widened F32); z/a/b are F32.
+Both `on` and `emulate` use the same deterministic, segment-local pair plan.
+Only paired banks use BF16-direct numerics: `on` consumes NPU results, while
+`emulate` executes the exact IU8 twin sequentially, one bank at a time.
+Unpaired chunks/tails, rows below 512, decode and uncovered paths retain the
+incumbent GPU projections in **both** modes. No paired input projection is
+computed twice: the MQ6 input GEMMs are skipped, with only pack/consume on the
+GPU under `on`. Out-projections and the GPU core/HC/MoE retain native kernels.
+QSA scratch is F32; GDN qkv is BF16 on the existing chunk-core route
+(otherwise exact widened F32); z/a/b are F32.
 
 ### Bank state and ordering
 
@@ -406,6 +410,32 @@ both banks finish do the head, requested wide-hidden/MTP capture, QSA metadata
 and global position/history publish; existing caller session snapshots remain
 outside the pair. Pairing never crosses a caller's session segment boundary.
 
+The serving entry points are `Qwen4MtpDrafter::mtp_prefill` (default native
+MTP), `SpecTarget::spec_advance` (generic speculative target prefill), and
+`Qwen4Bundle::prefill_final` (AR, including `--spec off`). The native MTP and
+generic target loops now offer up to two chunks to the target instead of
+pre-splitting every request at 8192. CLI TTFT bench and fresh singleton HTTP
+chat requests both dispatch through these same generate routes.
+
+Only `on` doubles `spec_hidden` to 16384 rows; verify windows and MTP append
+scratch keep their original capacities. MTP head append still runs separate
+A/B subchunks with the original fill-row boundaries and prompt-ID uploads:
+bank B reads hidden rows starting at 8192 under `on`, or 0 after its separate
+target forward under `emulate`. Pending hidden names the last row of B.
+Only the final bank of a prompt-ending pair runs the target pick; other pairs
+capture silently. Each request logs its first scheduled pair once:
+`npu-trunk: pair rows=8192+8151 position=0` for a 16343-row fresh prompt.
+
+A pair **never crosses a session snapshot boundary**. The default 8-GiB
+session cache attaches periodic 8192-row boundaries and therefore prevents
+pairing on these serving routes. Halo comparisons must set
+`HIPFIRE_SESSION_CACHE_BYTES=0` in both arms. Message-end boundaries are
+likewise respected when session turn snapshots are enabled; an ordinary chat
+template alone does not split the prompt when the cache is disabled.
+Snapshotting bank A inside a pair is deliberately not implemented.
+Generic resumed target advances that cannot report a pending snapshot from
+a full prompt prefix remain native until that snapshot is reported by its owner.
+
 ### Overlap trace
 
 With `HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk.jsonl`, successful pairs
@@ -430,12 +460,23 @@ Do not inherit the build-only `ROCR_VISIBLE_DEVICES=-1`/`HIP_VISIBLE_DEVICES=-1`
 ```sh
 export HIPFIRE_DAEMON_BIN="$PWD/target/release/daemon"
 export HIPFIRE_PREFILL_CHUNK_ROWS=8192
+export HIPFIRE_SESSION_CACHE_BYTES=0
 # MODEL must name the pinned MQ6 family-B artifact, not an MQ4 artifact.
 HIPFIRE_QWEN4_NPU_TRUNK=on \
 HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk-on.jsonl \
-  target/release/hipfire serve "$MODEL" 127.0.0.1 11435 --spec off --max-seq 32768
+  target/release/hipfire serve "$MODEL" 127.0.0.1 11435 --max-seq 32768
 ```
 
+For a fresh, non-streaming singleton chat request against that server:
+
+```sh
+jq -n --arg model "$MODEL" --rawfile prompt p16k \
+  '{model:$model,messages:[{role:"user",content:$prompt}],temperature:0,max_tokens:64,stream:false}' \
+  | curl -sS http://127.0.0.1:11435/v1/chat/completions \
+      -H 'Content-Type: application/json' --data-binary @-
+```
+
+Native MTP is enabled by default; repeat with `--spec off` for the AR route.
 In a separate terminal, then repeat in fresh processes with `emulate` and `off`:
 
 ```sh
@@ -446,7 +487,7 @@ HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk-bench.jsonl \
 for mode in on emulate off; do
   HIPFIRE_LOCAL=1 HIPFIRE_QWEN4_NPU_TRUNK="$mode" \
     target/release/hipfire run "$MODEL" --temp 0 --repeat-penalty 1 \
-    --spec off --no-stream --max-seq 32768 --max-tokens 64 "$(cat p16k)" \
+    --no-stream --max-seq 32768 --max-tokens 64 "$(cat p16k)" \
     > "/tmp/npu-trunk-$mode.txt"
 done
 cmp /tmp/npu-trunk-on.txt /tmp/npu-trunk-emulate.txt
@@ -454,12 +495,15 @@ cmp /tmp/npu-trunk-on.txt /tmp/npu-trunk-emulate.txt
 # not to emulate (emulate intentionally changes the trunk numerical contract).
 ```
 
-If a caller splits the prompt into individual lane tiles/session segments before
-the chunk owner receives it, only pairs within those segments can pipeline.
-EP, compact scratch, calibrated `auto`, variable-size NPU programs and CPU-free waits
-are outside this first-light route. CPU bookkeeping tests live under
-`gpu_forward::npu_forward::tests`; the full-model greedy comparison and trace
-overlap inspection remain the parent-run silicon acceptance gate.
+Continuous-batch/lane `prefill_wave` is not paired; its tiles retain the native
+GPU route in both arms. Prefix-cache/message/session segments can only pair
+within their own boundaries; the cache-disabled fresh-request gate above
+avoids snapshot segmentation. EP, compact scratch, calibrated `auto`,
+variable-size NPU programs and CPU-free waits remain outside first light.
+CPU scheduling/capture/retirement tests live under
+`gpu_forward::npu_forward::tests`; existing MTP tests cover head append IDs
+and pick boundaries. Full-model greedy comparison and trace overlap
+inspection remain the parent-run silicon acceptance gate.
 
 ## Direct BF16 arena consumer interfaces
 

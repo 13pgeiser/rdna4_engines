@@ -3333,6 +3333,8 @@ pub struct Qwen4GpuForward {
     /// batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`]). Never
     /// set for decode, MTP verify or the MTP head.
     pub(crate) prefill_scope: bool,
+    /// Only GPU-twin banks selected by the same pair plan may use IU8.
+    pub(crate) npu_covered_scope: bool,
     #[cfg(target_os = "linux")]
     npu_trunk: Option<npu_forward::NpuForward>,
 }
@@ -3742,9 +3744,36 @@ impl Qwen4GpuForward {
             qsa_tap: None,
             lane_scope: false,
             prefill_scope: false,
+            npu_covered_scope: false,
             #[cfg(target_os = "linux")]
             npu_trunk,
         })
+    }
+
+    pub(crate) fn npu_trunk_pipelined(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        { self.npu_trunk.as_ref().is_some_and(|n|n.pipelined()) }
+        #[cfg(not(target_os = "linux"))]
+        { false }
+    }
+
+    pub(crate) fn npu_trunk_planned(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        { self.npu_trunk.is_some() }
+        #[cfg(not(target_os = "linux"))]
+        { false }
+    }
+
+    pub(crate) fn begin_npu_trunk_request(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(npu)=&mut self.npu_trunk { npu.begin_request(); }
+    }
+
+    pub(crate) fn note_npu_trunk_pair(&mut self, rows: usize, position: usize) {
+        #[cfg(target_os = "linux")]
+        if let Some(npu)=&mut self.npu_trunk {npu.note_pair(rows,position);}
+        #[cfg(not(target_os = "linux"))]
+        let _=(rows,position);
     }
 
     /// Before a forward that is not this owner's chunk program (the lane
@@ -4262,18 +4291,25 @@ impl Qwen4GpuForward {
         )?;
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         let mut offset = 0usize;
+        let mut covered_until=0;
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
-            if let Some(rows)=self.npu_trunk.as_ref().filter(|n|n.pipelined())
-                .and_then(|_|npu_forward::pair_rows(tokens.len()-offset,max_chunk))
-            {
-                let final_pair=self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
-                let output=if output_rows==Qwen4OutputRows::All || final_pair {
-                    Qwen4OutputPolicy::Rows(output_rows)
-                } else { Qwen4OutputPolicy::None };
-                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,Some(logits),top1,wide_hidden_capture,output)?;
-                offset+=rows;
-                continue;
+            if offset>=covered_until {
+                if let Some(rows)=self.npu_trunk.as_ref()
+                    .and_then(|_|npu_forward::pair_rows(tokens.len()-offset,max_chunk))
+                {
+                    self.note_npu_trunk_pair(rows,bundle.state.position);
+                    if self.npu_trunk_pipelined() {
+                        let final_pair=self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
+                        let output=if output_rows==Qwen4OutputRows::All || final_pair {
+                            Qwen4OutputPolicy::Rows(output_rows)
+                        } else { Qwen4OutputPolicy::None };
+                        npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,Some(logits),top1,wide_hidden_capture,output)?;
+                        offset+=rows;
+                        continue;
+                    }
+                    covered_until=offset+rows;
+                }
             }
             let rows = (tokens.len() - offset).min(max_chunk);
             // The caller's lookahead belongs to the final tile; earlier tiles
@@ -4321,7 +4357,9 @@ impl Qwen4GpuForward {
             } else {
                 Qwen4OutputPolicy::None
             };
-            self.forward_chunk_inner(
+            let prior_covered=self.npu_covered_scope;
+            self.npu_covered_scope |= offset<covered_until;
+            let result=self.forward_chunk_inner(
                 bundle,
                 gpu,
                 &tokens[offset..offset + rows],
@@ -4330,7 +4368,9 @@ impl Qwen4GpuForward {
                 top1_chunk.as_ref(),
                 capture_chunk.as_ref(),
                 output_policy,
-            )?;
+            );
+            self.npu_covered_scope=prior_covered;
+            result?;
             offset = offset
                 .checked_add(rows)
                 .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
@@ -4370,15 +4410,22 @@ impl Qwen4GpuForward {
         self.prefetch_first_tile_ple(bundle, tokens);
         let max_chunk = self.scratch.max_chunk;
         let mut offset = 0usize;
+        let mut covered_until=0;
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
-            if let Some(rows)=self.npu_trunk.as_ref().filter(|n|n.pipelined())
-                .and_then(|_|npu_forward::pair_rows(tokens.len()-offset,max_chunk))
-            {
-                self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
-                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
-                offset+=rows;
-                continue;
+            if offset>=covered_until {
+                if let Some(rows)=self.npu_trunk.as_ref()
+                    .and_then(|_|npu_forward::pair_rows(tokens.len()-offset,max_chunk))
+                {
+                    self.note_npu_trunk_pair(rows,bundle.state.position);
+                    if self.npu_trunk_pipelined() {
+                        self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
+                        npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
+                        offset+=rows;
+                        continue;
+                    }
+                    covered_until=offset+rows;
+                }
             }
             let rows = (tokens.len() - offset).min(max_chunk);
             self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
@@ -4394,7 +4441,9 @@ impl Qwen4GpuForward {
                     Ok::<_, Qwen4GpuForwardError>(capture.sub_offset(capture_offset, capture_len))
                 })
                 .transpose()?;
-            self.forward_chunk_inner(
+            let prior_covered=self.npu_covered_scope;
+            self.npu_covered_scope |= offset<covered_until;
+            let result=self.forward_chunk_inner(
                 bundle,
                 gpu,
                 &tokens[offset..offset + rows],
@@ -4403,7 +4452,9 @@ impl Qwen4GpuForward {
                 None,
                 capture_chunk.as_ref(),
                 Qwen4OutputPolicy::None,
-            )?;
+            );
+            self.npu_covered_scope=prior_covered;
+            result?;
             offset = offset
                 .checked_add(rows)
                 .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
@@ -4795,7 +4846,8 @@ impl Qwen4GpuForward {
         // stream and its failure recovery synchronizes the device.
         let npu_armed = {
             #[cfg(target_os = "linux")]
-            { self.npu_trunk.is_some() && n >= 512 }
+            { self.npu_covered_scope && n>=512
+                && self.npu_trunk.as_ref().is_some_and(|n|!n.pipelined()) }
             #[cfg(not(target_os = "linux"))]
             { false }
         };
@@ -6746,4 +6798,20 @@ mod tests {
         assert_eq!(layout.dense_rows, 0);
         assert_eq!(layout.routed_rows, 4 * 10 * 640);
     }
+}
+
+/// A shared deterministic singleton/MTP schedule; never crosses a snapshot.
+pub(crate) fn qwen4_prefill_segment_rows(
+    position: usize, prompt_end: usize, chunk: usize,
+    boundary: Option<usize>, planned: bool,
+) -> usize {
+    let end=boundary.filter(|&b|b>position).unwrap_or(prompt_end).min(prompt_end);
+    let remaining=end.saturating_sub(position);
+    // A generic resumed advance may not own the full prefix needed to report
+    // a pending snapshot. Until its owner reports it, keep the native route;
+    // never infer later snapshot boundaries from an unadvanced cache cursor.
+    let planned=planned && boundary.is_none_or(|b|b>position);
+    if planned && chunk==8192 && remaining>=8192+512 {
+        remaining.min(16384)
+    } else { remaining.min(chunk) }
 }

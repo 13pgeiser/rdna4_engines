@@ -17,6 +17,7 @@ pub(super) struct NpuForward {
     trace: Option<std::io::BufWriter<std::fs::File>>,
     host_tokens: Vec<u8>,
     host_ple: Vec<u8>,
+    pair_logged: bool,
 }
 
 // SAFETY: this private owner exclusively owns the entire railgun HIP Rc graph;
@@ -108,12 +109,19 @@ impl NpuForward {
                 (Some(scratch),ids,ple)
             } else { (None,Vec::new(),Vec::new()) };
             eprintln!("npu-trunk: mode={mode} families=all contract=bf16_direct pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} runtime={} raw=DtoH(no-retained-host-copy) calibration=first-light-force-pairs", if runtime.is_some() { "open" } else { "not-opened" });
-            Ok(Some(Self { mode, layers, a, scales: [d0,d1], sums, bank_b, runtime, trace,host_tokens,host_ple }))
+            Ok(Some(Self { mode, layers, a, scales: [d0,d1], sums, bank_b, runtime, trace,host_tokens,host_ple,pair_logged:false }))
         })();
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
         result
     }
     pub(super) fn pipelined(&self) -> bool { self.mode == NpuTrunkMode::On }
+    pub(super) fn begin_request(&mut self) { self.pair_logged=false; }
+    pub(super) fn note_pair(&mut self, rows: usize, position: usize) {
+        if !self.pair_logged {
+            eprintln!("npu-trunk: pair rows=8192+{} position={position}",rows-8192);
+            self.pair_logged=true;
+        }
+    }
     pub(super) fn free(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
         let mut first = None;
         if let Some(rt) = self.runtime { if let Err(e) = rt.close() { first = Some(hip_bridge::HipError::new(1, &e)); } }
@@ -295,6 +303,7 @@ impl NpuForward {
         if let Some(qsa)=bundle.state.qsa.first().filter(|q|q.f16_arena.is_none()) {
             rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(gpu,qsa.format,bundle.config.num_key_value_heads,end)?;
         }
+        self.note_pair(tokens.len(),position);
         // No tape can contain relay/host operations. Decode retains its old route.
         gpu.replay.set_forward_eligible(false);
         owner.uploaded_id_rows=0;
@@ -435,9 +444,8 @@ fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScr
 
 /// Keep the numerical twin's 8192-row chunk boundary; bank B may be partial.
 pub(super) fn pair_rows(remaining: usize, chunk: usize) -> Option<usize> {
-    if chunk==8192 && remaining>=8192+512 {
-        Some(8192+(remaining-8192).min(8192))
-    } else { None }
+    let rows=qwen4_prefill_segment_rows(0,remaining,chunk,None,true);
+    (rows>chunk).then_some(rows)
 }
 
 #[cfg(test)]
@@ -472,6 +480,53 @@ mod tests {
         assert_eq!(pair_rows(8703,8192),None);
         assert_eq!(pair_rows(8704,8192),Some(8704));
         assert_eq!(pair_rows(32768,4096),None);
+    }
+    #[test] fn segments_preserve_snapshots_and_native_tails() {
+        // Both arms use this same schedule. Session and message boundaries
+        // split segments before pairing, never after bank A has run.
+        let schedule=|end:usize,boundaries:&[usize],planned:bool| {
+            let mut pos=0; let mut groups=Vec::new(); let mut banks=Vec::new();
+            while pos<end {
+                let boundary=boundaries.iter().copied().find(|b|*b>pos);
+                let rows=qwen4_prefill_segment_rows(pos,end,8192,boundary,planned);
+                assert!(rows>0);
+                let covered=rows>8192;
+                groups.push(pos..pos+rows);
+                for at in (pos..pos+rows).step_by(8192) {
+                    banks.push((at..(at+8192).min(pos+rows),covered));
+                }
+                assert!(boundary.is_none_or(|b|pos+rows<=b));
+                pos+=rows;
+            }
+            (groups,banks)
+        };
+        assert_eq!(schedule(16343,&[],true).0,vec![0..16343]);
+        assert_eq!(schedule(20000,&[],true).1,vec![
+            (0..8192,true),(8192..16384,true),(16384..20000,false),
+        ]);
+        assert_eq!(schedule(8703,&[],true).1,vec![(0..8192,false),(8192..8703,false)]);
+        assert_eq!(schedule(16343,&[8192,16343],true).0,vec![0..8192,8192..16343]);
+        assert_eq!(schedule(20000,&[12000,20000],true).0,vec![0..12000,12000..20000]);
+        assert_eq!(schedule(20000,&[4000,13000,20000],true).0,
+            vec![0..4000,4000..13000,13000..20000]);
+        assert_eq!(qwen4_prefill_segment_rows(8192,40000,8192,Some(8192),true),8192);
+        assert!(schedule(40000,&[],false).1.iter().all(|(_,covered)|!*covered));
+        for end in [16343,20000,40000] {
+            let (groups,banks)=schedule(end,&[],true);
+            let emulated:Vec<_>=groups.into_iter().flat_map(|group| {
+                let covered=group.len()>8192;
+                (group.start..group.end).step_by(8192)
+                    .map(move |at|(at..(at+8192).min(group.end),covered))
+            }).collect();
+            assert_eq!(banks,emulated);
+        }
+    }
+    #[test] fn capture_capacity_only_doubles_for_actual_pipeline() {
+        use crate::bundle::spec_hidden_capacity_rows;
+        assert_eq!(spec_hidden_capacity_rows(8192,8192,true),Some(16384));
+        assert_eq!(spec_hidden_capacity_rows(8192,8192,false),Some(8192));
+        assert_eq!(spec_hidden_capacity_rows(20000,8192,true),Some(20000));
+        assert_eq!(spec_hidden_capacity_rows(8192,usize::MAX,true),None);
     }
     #[test] fn arena_retirement_precedes_next_pack_and_state_order() {
         let mut operations=vec![(0,0,"pack"),(0,1,"pack")];

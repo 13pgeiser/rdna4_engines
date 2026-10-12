@@ -550,6 +550,7 @@ impl SpecTarget for Qwen4Bundle {
             .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?
             .scratch
             .max_chunk;
+        self.begin_npu_trunk_request();
         let mut offset = 0usize;
         let mut last_argmax = None;
         while offset < tokens.len() {
@@ -557,14 +558,41 @@ impl SpecTarget for Qwen4Bundle {
                 self.reset_recurrent(gpu)?;
                 return Ok(SpecAdvance::Aborted);
             }
-            let end = (offset + max_chunk).min(tokens.len());
-            self.set_ple_lookahead(&tokens[end..]);
-            // Only the final row's argmax is returned, so each chunk writes
-            // one logit row instead of one per chunk row.
-            let pick = self
-                .spec_prefill_rows(gpu, &tokens[offset..end], false)
-                .map_err(|error| error.to_string())?;
-            last_argmax = Some(pick);
+            let planned=self.npu_trunk_planned();
+            let rows=if planned {
+                self.prefill_schedule_rows(start_pos+offset,end_pos,max_chunk)
+            } else {(tokens.len()-offset).min(max_chunk)};
+            let end=offset+rows;
+            let covered=self.npu_trunk_planned() && rows>max_chunk;
+            if covered {self.note_npu_trunk_pair(rows,start_pos+offset);}
+            if covered && !self.npu_trunk_pipelined() {
+                // One numerical-twin bank at a time; hidden capacity stays at
+                // max_chunk. Uncovered advances retain the incumbent route.
+                for bank in (offset..end).step_by(max_chunk) {
+                    let bank_end=(bank+max_chunk).min(end);
+                    self.set_ple_lookahead(&tokens[bank_end..]);
+                    let pick=self.with_npu_trunk_coverage(true,|bundle| {
+                        if bank_end==tokens.len() {
+                            bundle.spec_prefill_rows(gpu,&tokens[bank..bank_end],false).map(Some)
+                        } else {
+                            bundle.spec_prefill_rows_without_pick(gpu,&tokens[bank..bank_end],false).map(|_|None)
+                        }
+                    }).map_err(|error|error.to_string())?;
+                    if pick.is_some() {last_argmax=pick;}
+                }
+            } else {
+                self.set_ple_lookahead(&tokens[end..]);
+                if covered && end<tokens.len() {
+                    self.spec_prefill_rows_without_pick(gpu,&tokens[offset..end],false)
+                        .map_err(|error|error.to_string())?;
+                } else {
+                    last_argmax=Some(self.spec_prefill_rows(gpu,&tokens[offset..end],false)
+                        .map_err(|error|error.to_string())?);
+                }
+            }
+            if planned && start_pos==0 && self.session_next_boundary()==Some(end) {
+                self.spec_advance_session_boundary(gpu,&tokens[..end]).map_err(|e|e.to_string())?;
+            }
             offset = end;
         }
         if self.state.position != end_pos {
@@ -3752,22 +3780,57 @@ pub(crate) fn mtp_prefill_chunk(
     pos: usize,
     needs_pick: bool,
     pending: &GpuTensor,
-    append_scratch: Option<&mut MtpAppendScratch>,
+    mut append_scratch: Option<&mut MtpAppendScratch>,
     reuse_trunk_ids: bool,
     abort: &dyn Fn() -> bool,
 ) -> Result<Option<u32>, String> {
-    let pick = if needs_pick {
-        Some(
-            bundle
-                .spec_prefill_rows(gpu, chunk, true)
-                .map_err(|error| error.to_string())?,
-        )
+    let max_chunk=bundle.spec_chunk_rows().unwrap_or(1).max(1);
+    let paired=bundle.npu_trunk_planned() && chunk.len()>max_chunk;
+    if paired {bundle.note_npu_trunk_pair(chunk.len(),pos);}
+    if paired && !bundle.npu_trunk_pipelined() {
+        let mut pick=None;
+        for (bank,tokens) in chunk.chunks(max_chunk).enumerate() {
+            let final_bank=(bank+1)*max_chunk>=chunk.len();
+            let bank_pick=bundle.with_npu_trunk_coverage(true,|bundle| {
+                mtp_prefill_target(bundle,gpu,tokens,needs_pick && final_bank)
+            })?;
+            if bank_pick.is_some() {pick=bank_pick;}
+            mtp_append_prefill_chunk(bundle,gpu,tokens,pos+bank*max_chunk,0,pending,
+                append_scratch.as_deref_mut(),reuse_trunk_ids,abort)?;
+        }
+        return Ok(pick);
+    }
+    let pick=mtp_prefill_target(bundle,gpu,chunk,needs_pick)?;
+    if paired {
+        // The target captured both banks together, but head append boundaries,
+        // prompt-id uploads and pending rows remain those of the sequential run.
+        for (bank,tokens) in chunk.chunks(max_chunk).enumerate() {
+            mtp_append_prefill_chunk(bundle,gpu,tokens,pos+bank*max_chunk,bank*max_chunk,
+                pending,append_scratch.as_deref_mut(),false,abort)?;
+        }
     } else {
-        bundle
-            .spec_prefill_rows_silent(gpu, chunk)
-            .map_err(|error| error.to_string())?;
-        None
-    };
+        mtp_append_prefill_chunk(bundle,gpu,chunk,pos,0,pending,append_scratch,
+            reuse_trunk_ids,abort)?;
+    }
+    Ok(pick)
+}
+
+fn mtp_prefill_target(
+    bundle: &mut Qwen4Bundle, gpu: &mut Gpu, chunk: &[u32], needs_pick: bool,
+) -> Result<Option<u32>,String> {
+    if needs_pick {
+        bundle.spec_prefill_rows(gpu,chunk,true).map(Some).map_err(|e|e.to_string())
+    } else {
+        bundle.spec_prefill_rows_silent(gpu,chunk).map(|_|None).map_err(|e|e.to_string())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mtp_append_prefill_chunk(
+    bundle: &mut Qwen4Bundle, gpu: &mut Gpu, chunk: &[u32], pos: usize,
+    hidden_row0: usize, pending: &GpuTensor, append_scratch: Option<&mut MtpAppendScratch>,
+    reuse_trunk_ids: bool, abort: &dyn Fn()->bool,
+) -> Result<(),String> {
     // The head's batched rows route: the incumbent batched fill
     // (`HIPFIRE_QWEN4_MTP_BATCHED_FILL`, on by default), or the DET prompt
     // fill (exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET` on unless `0`), which uses
@@ -3821,7 +3884,7 @@ pub(crate) fn mtp_prefill_chunk(
                 // one). Under DET a lone row takes the rows route below
                 // instead, through the same kernels as every other row.
                 bundle
-                    .copy_spec_hidden_row_to(gpu, off, pending)
+                    .copy_spec_hidden_row_to(gpu, hidden_row0+off, pending)
                     .map_err(|error| error.to_string())?;
                 bundle
                     .mtp_append_token(gpu, chunk[off], Some(pending), position)
@@ -3842,7 +3905,7 @@ pub(crate) fn mtp_prefill_chunk(
                         MtpFillContext::PromptFill,
                         scratch,
                         &chunk[off..off + n],
-                        off,
+                        hidden_row0+off,
                         prefill_trunk_ids_row(reuse_trunk_ids, off),
                         prompt_ids.as_ref(),
                         position,
@@ -3854,7 +3917,7 @@ pub(crate) fn mtp_prefill_chunk(
         // The per-row loop leaves `pending` on the chunk's last row: the
         // next draft step's row-0 hidden.
         bundle
-            .copy_spec_hidden_row_to(gpu, chunk.len() - 1, pending)
+            .copy_spec_hidden_row_to(gpu, hidden_row0+chunk.len()-1, pending)
             .map_err(|error| error.to_string())?;
     } else {
         for (index, &token) in chunk.iter().enumerate() {
@@ -3866,14 +3929,14 @@ pub(crate) fn mtp_prefill_chunk(
                 .checked_add(index)
                 .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
             bundle
-                .copy_spec_hidden_row_to(gpu, index, pending)
+                .copy_spec_hidden_row_to(gpu, hidden_row0+index, pending)
                 .map_err(|error| error.to_string())?;
             bundle
                 .mtp_append_token(gpu, token, Some(pending), position)
                 .map_err(|error| error.to_string())?;
         }
     }
-    Ok(pick)
+    Ok(())
 }
 
 /// What [`finish_native_window`] needs from a batched window's verify.
@@ -4041,6 +4104,7 @@ impl Qwen4MtpDrafter {
             Some((30.3, 14.8))
         } else {
             None
+
         }
     }
 
@@ -4700,10 +4764,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
             // A chunk ends at the session cache's next snapshot boundary when
             // one lies inside the natural chunk, else at the natural chunk end.
-            let natural = pos
-                .checked_add(chunk_rows)
-                .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?
-                .min(prompt_tokens.len());
+            let rows=Self::bundle(target)?.prefill_schedule_rows(pos,prompt_tokens.len(),chunk_rows);
+            let natural=pos.checked_add(rows)
+                .ok_or_else(||"Qwen4 native MTP prefill position overflow".to_string())?;
             let boundary = Self::bundle(target)?
                 .session_next_boundary()
                 .filter(|&boundary| boundary > pos && boundary <= natural);
@@ -4718,8 +4781,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             // Only the prompt's last chunk's pick is read (the seed): an
             // earlier chunk still captures its full wide hidden for the head
             // but skips the final hyper, LM head, argmax and readback.
-            let needs_pick =
-                mtp_prefill_chunk_needs_pick(end, prompt_tokens.len(), skip_intermediate_pick);
+            let needs_pick=if chunk.len()>chunk_rows {
+                end==prompt_tokens.len()
+            } else {mtp_prefill_chunk_needs_pick(end,prompt_tokens.len(),skip_intermediate_pick)};
             let pick = mtp_prefill_chunk(
                 Self::bundle(target)?,
                 gpu,
@@ -5150,7 +5214,8 @@ pub fn native_mtp_device_bytes(
 /// Device bytes the first speculative request of a native MTP load of
 /// `max_seq` tokens allocates once and keeps (after the head attached): the
 /// verify hidden rows (`max_k + 1` rows or one `chunk_rows` forward chunk,
-/// whichever is larger), the pending and row hidden carries, with
+/// whichever is larger; `on` reserves two chunks), the pending and row hidden
+/// carries, with
 /// `row_capture` the `max_k + 1`-row GDN capture in that format, and with
 /// `batched_fill` the batched prompt-fill scratch and one chunk of prompt ids.
 pub fn native_mtp_request_bytes(
@@ -5166,7 +5231,10 @@ pub fn native_mtp_request_bytes(
         .hc_count
         .checked_mul(config.hidden_size)?
         .checked_mul(std::mem::size_of::<f32>())?;
-    let verify_rows = rows.max(max_seq.min(chunk_rows));
+    let verify_rows = crate::bundle::spec_hidden_capacity_rows(
+        rows.max(max_seq.min(chunk_rows)),chunk_rows,
+        crate::npu_trunk::NpuTrunkMode::from_env().ok()==Some(crate::npu_trunk::NpuTrunkMode::On),
+    )?;
     let capture = match row_capture {
         Some(gdn) => crate::state::Qwen4State::row_capture_bytes(config, gdn, rows)?,
         None => 0,

@@ -967,6 +967,9 @@ impl Qwen4Bundle {
                 "Qwen4 spec hidden capacity is zero".to_string(),
             ));
         }
+        let rows=spec_hidden_capacity_rows(
+            rows,self.spec_chunk_rows().unwrap_or(rows),self.npu_trunk_pipelined(),
+        ).ok_or_else(||BundleError::Forward("spec hidden capacity overflow".into()))?;
         let width = self
             .config
             .hc_count
@@ -1030,6 +1033,46 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .map(|forward| forward.scratch.max_chunk)
+    }
+
+    pub(crate) fn npu_trunk_pipelined(&self) -> bool {
+        self.execution.as_ref().is_some_and(|f|f.npu_trunk_pipelined())
+    }
+
+    pub(crate) fn npu_trunk_planned(&self) -> bool {
+        self.execution.as_ref().is_some_and(|f|f.npu_trunk_planned())
+    }
+
+    pub(crate) fn begin_npu_trunk_request(&mut self) {
+        if let Some(forward)=&mut self.execution { forward.begin_npu_trunk_request(); }
+    }
+
+    pub(crate) fn note_npu_trunk_pair(&mut self, rows: usize, position: usize) {
+        if let Some(forward)=&mut self.execution {forward.note_npu_trunk_pair(rows,position);}
+    }
+
+    pub(crate) fn prefill_schedule_rows(&self, position: usize, end: usize, chunk: usize) -> usize {
+        crate::gpu_forward::qwen4_prefill_segment_rows(
+            position,end,chunk,self.session_next_boundary(),self.npu_trunk_planned(),
+        )
+    }
+
+    fn spec_prefill_capacity(&self, chunk: usize) -> usize {
+        if self.npu_trunk_pipelined() {chunk*2}else{chunk}
+    }
+
+    /// Scope a selected GPU-twin bank, restoring even when its forward fails.
+    pub(crate) fn with_npu_trunk_coverage<R>(
+        &mut self, covered: bool, run: impl FnOnce(&mut Self)->R,
+    ) -> R {
+        let prior=self.execution.as_mut().map(|f| {
+            let prior=f.npu_covered_scope; f.npu_covered_scope=covered; prior
+        });
+        let result=run(self);
+        if let (Some(prior),Some(f))=(prior,self.execution.as_mut()) {
+            f.npu_covered_scope=prior;
+        }
+        result
     }
 
     /// The `<|im_end|>` token message-end snapshots split after, when active.
@@ -1146,6 +1189,12 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
+        self.spec_prefill_rows_without_pick(gpu,tokens,true)
+    }
+
+    pub(crate) fn spec_prefill_rows_without_pick(
+        &mut self, gpu: &mut Gpu, tokens: &[u32], capture_hidden: bool,
+    ) -> Result<(),BundleError> {
         self.ep_refuse("speculative decoding (spec prefill)")?;
         if tokens.is_empty() {
             return Err(BundleError::Forward(
@@ -1160,32 +1209,28 @@ impl Qwen4Bundle {
             })?
             .scratch
             .max_chunk;
-        if tokens.len() > max_chunk {
+        let capacity=self.spec_prefill_capacity(max_chunk);
+        if tokens.len() > capacity {
             return Err(BundleError::Forward(format!(
-                "Qwen4 spec block length {} exceeds capacity {max_chunk}",
+                "Qwen4 spec block length {} exceeds capacity {capacity}",
                 tokens.len()
             )));
         }
-        let width = self
-            .config
-            .hc_count
-            .checked_mul(self.config.hidden_size)
-            .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
-        let hidden_len = tokens
-            .len()
-            .checked_mul(width)
-            .ok_or_else(|| BundleError::Forward("spec hidden row overflow".to_string()))?;
-        let hidden = self
-            .spec_hidden
-            .as_ref()
-            .ok_or_else(|| BundleError::Forward("Qwen4 spec hidden is not allocated".to_string()))?
-            .sub_offset(0, hidden_len);
+        let hidden=if capture_hidden {
+            let width=self.config.hc_count.checked_mul(self.config.hidden_size)
+                .ok_or_else(||BundleError::Forward("spec hidden width overflow".into()))?;
+            let len=tokens.len().checked_mul(width)
+                .ok_or_else(||BundleError::Forward("spec hidden row overflow".into()))?;
+            Some(self.spec_hidden.as_ref()
+                .ok_or_else(||BundleError::Forward("Qwen4 spec hidden is not allocated".into()))?
+                .sub_offset(0,len))
+        } else {None};
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
-            .forward_chunk_silent(self, gpu, tokens, Some(&hidden))
+            .forward_chunk_silent(self, gpu, tokens, hidden.as_ref())
             .map_err(|error| BundleError::Forward(error.to_string()));
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
@@ -1218,9 +1263,10 @@ impl Qwen4Bundle {
             })?
             .scratch
             .max_chunk;
-        if tokens.len() > max_chunk {
+        let capacity=if prefill {self.spec_prefill_capacity(max_chunk)}else{max_chunk};
+        if tokens.len() > capacity {
             return Err(BundleError::Forward(format!(
-                "Qwen4 spec block length {} exceeds capacity {max_chunk}",
+                "Qwen4 spec block length {} exceeds capacity {capacity}",
                 tokens.len()
             )));
         }
@@ -2256,6 +2302,7 @@ impl Qwen4Bundle {
         if self.ep.is_some() {
             return self.ep_reset(gpu);
         }
+        self.begin_npu_trunk_request();
         self.live = None;
         self.turn = None;
         // `None` while the cache itself resets (it drives `self` then).
@@ -2485,6 +2532,7 @@ impl Qwen4Bundle {
         route: SessionRoute,
     ) -> Result<(), BundleError> {
         self.ep_refuse("session_begin outside a replicated call")?;
+        self.begin_npu_trunk_request();
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
         let live =
@@ -2521,6 +2569,15 @@ impl Qwen4Bundle {
     /// Next absolute position the running prefill must stop at and report.
     pub(crate) fn session_next_boundary(&self) -> Option<usize> {
         self.session.as_ref()?.next_boundary()
+    }
+
+    pub(crate) fn spec_advance_session_boundary(
+        &mut self, gpu: &mut Gpu, prefix: &[u32],
+    ) -> Result<(),BundleError> {
+        if self.turn.as_ref().is_some_and(|(_,route)|*route==SessionRoute::Ar) {
+            self.session_at_boundary(gpu,prefix)?;
+        }
+        Ok(())
     }
 
     /// Report that every owner consumed exactly `prefix` (the boundary).
@@ -4502,4 +4559,10 @@ mod tests {
         assert!(matches!(error, BundleError::Weights(_)), "{error}");
         assert!(error.to_string().contains("no sealed MoE route"), "{error}");
     }
+}
+
+/// The correctness twin retains one-chunk capture; only actual NPU pipelining
+/// needs simultaneous A/B hidden rows.
+pub(crate) fn spec_hidden_capacity_rows(rows: usize, chunk: usize, pipelined: bool) -> Option<usize> {
+    if pipelined {Some(rows.max(chunk.checked_mul(2)?))}else{Some(rows)}
 }
