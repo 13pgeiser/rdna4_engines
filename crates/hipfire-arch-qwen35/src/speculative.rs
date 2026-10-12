@@ -524,6 +524,98 @@ pub(crate) fn dflash_download_verify_argmax(
     Ok(host_idx.into_iter().map(|idx| idx as u32).collect())
 }
 
+/// Shape guard shared by the dense and sparse selector-q materializers: the
+/// flattened candidate ids must cover every row's top-K, otherwise a sparse
+/// residual would subtract an incomplete q.
+fn selector_candidates_shape(proposal: &dflash::DflashCandidateProposal) -> HipResult<()> {
+    let rows = proposal.tokens.len();
+    let top_k = proposal.top_k;
+    if proposal.candidates.len() != rows * top_k {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "selector proposal candidates len {} != rows {} * top_k {}",
+                proposal.candidates.len(),
+                rows,
+                top_k
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The temperature>0 selector inputs: flattened normalized q (`[rows*top_k]`)
+/// and the per-row selected probability (`[rows]`), shape-checked.
+fn selector_temp_inputs(
+    proposal: &dflash::DflashCandidateProposal,
+) -> HipResult<(&[f32], &[f32])> {
+    let rows = proposal.tokens.len();
+    let top_k = proposal.top_k;
+    let probs = proposal.probabilities.as_ref().ok_or_else(|| {
+        hip_bridge::HipError::new(0, "selector proposal missing probabilities for temp>0")
+    })?;
+    if probs.len() != rows * top_k {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "selector proposal probabilities len {} != rows {} * top_k {}",
+                probs.len(),
+                rows,
+                top_k
+            ),
+        ));
+    }
+    let sel = proposal.selected_probabilities.as_ref().ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            "selector proposal missing selected_probabilities for temp>0",
+        )
+    })?;
+    if sel.len() != rows {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "selector proposal selected_probabilities len {} != rows {}",
+                sel.len(),
+                rows
+            ),
+        ));
+    }
+    Ok((probs.as_slice(), sel.as_slice()))
+}
+
+/// Sparse twin of [`apply_dflash2_selector_proposal`] for temperature>0: the
+/// selector's q rows are kept as (ascending id, value) pairs of their top-K
+/// support — no vocab-length allocation or fill. Duplicate candidate ids
+/// reproduce the dense row's last-write rule (`row[cand] = q` in candidate
+/// order), see [`SparseQRows::push_row`]. `q_rows` must have been
+/// [`SparseQRows::clear`]ed by the caller.
+fn apply_dflash2_selector_proposal_sparse(
+    proposal: &dflash::DflashCandidateProposal,
+    vocab: usize,
+    drafted: &mut Vec<u32>,
+    q_rows: &mut SparseQRows,
+    draft_probs_at_drafted: &mut Vec<f32>,
+) -> HipResult<()> {
+    let rows = proposal.tokens.len();
+    let top_k = proposal.top_k;
+    selector_candidates_shape(proposal)?;
+    let (probs, sel) = selector_temp_inputs(proposal)?;
+    drafted.extend_from_slice(&proposal.tokens);
+    draft_probs_at_drafted.clear();
+    draft_probs_at_drafted.reserve(rows);
+    for i in 0..rows {
+        let off = i * top_k;
+        q_rows.push_row(
+            &proposal.candidates[off..off + top_k],
+            &probs[off..off + top_k],
+            vocab,
+        )?;
+        draft_probs_at_drafted.push(sel[i]);
+    }
+    Ok(())
+}
+
 /// Fold a DFlash2 candidate-selector proposal into the chain draft buffers.
 ///
 /// Greedy: tokens only — no full-vocab D2H. Temperature: each sparse q row
@@ -546,48 +638,9 @@ fn apply_dflash2_selector_proposal(
     let top_k = proposal.top_k;
     // Flattened length guards — silently dropping tail masses would make the
     // sparse residual subtract an incomplete q and corrupt the bonus distribution.
-    if proposal.candidates.len() != rows * top_k {
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "selector proposal candidates len {} != rows {} * top_k {}",
-                proposal.candidates.len(),
-                rows,
-                top_k
-            ),
-        ));
-    }
+    selector_candidates_shape(proposal)?;
     if use_temp_sampling {
-        let probs = proposal.probabilities.as_ref().ok_or_else(|| {
-            hip_bridge::HipError::new(0, "selector proposal missing probabilities for temp>0")
-        })?;
-        if probs.len() != rows * top_k {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "selector proposal probabilities len {} != rows {} * top_k {}",
-                    probs.len(),
-                    rows,
-                    top_k
-                ),
-            ));
-        }
-        let sel = proposal.selected_probabilities.as_ref().ok_or_else(|| {
-            hip_bridge::HipError::new(
-                0,
-                "selector proposal missing selected_probabilities for temp>0",
-            )
-        })?;
-        if sel.len() != rows {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "selector proposal selected_probabilities len {} != rows {}",
-                    sel.len(),
-                    rows
-                ),
-            ));
-        }
+        let (probs, sel) = selector_temp_inputs(proposal)?;
         drafted.extend_from_slice(&proposal.tokens);
         if draft_softmaxes.len() < rows {
             draft_softmaxes.resize_with(rows, Vec::new);
@@ -3761,30 +3814,123 @@ pub struct DflashSampleCfg {
     pub cactus_delta: f32,
 }
 
+/// Sparse selector q rows of one sampled window: row `i` is the ascending
+/// (id, value) support of the dense vocab row the dense path would build
+/// (zeros outside the support, last write wins on duplicate candidate ids).
+/// Flat storage, reused across windows: no per-row or vocab-length allocation.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct SparseQRows {
+    off: Vec<u32>,
+    pub idx: Vec<u32>,
+    pub val: Vec<f32>,
+    stage: Vec<(u32, f32)>,
+}
+
+impl SparseQRows {
+    pub fn with_capacity(rows: usize, per_row: usize) -> Self {
+        let mut off = Vec::with_capacity(rows + 1);
+        off.push(0);
+        Self {
+            off,
+            idx: Vec::with_capacity(rows * per_row),
+            val: Vec::with_capacity(rows * per_row),
+            stage: Vec::with_capacity(per_row),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.off.clear();
+        self.off.push(0);
+        self.idx.clear();
+        self.val.clear();
+    }
+
+    pub fn rows(&self) -> usize {
+        self.off.len().saturating_sub(1)
+    }
+
+    /// Row `i`'s strictly ascending ids and their values.
+    pub fn row(&self, i: usize) -> (&[u32], &[f32]) {
+        let (a, b) = (self.off[i] as usize, self.off[i + 1] as usize);
+        (&self.idx[a..b], &self.val[a..b])
+    }
+
+    /// Append the row of candidate `cands[j]` ↦ `probs[j]`. The dense row is
+    /// `row[cands[j]] = probs[j]` for `j = 0..` over a zero row, so for a
+    /// repeated id the LAST candidate's value survives. A stable sort by id
+    /// keeps candidate order inside each id run; keeping the run's last
+    /// element is exactly that last write. A candidate with value 0.0 stays
+    /// an explicit entry (the dense row holds 0.0 there too).
+    pub fn push_row(&mut self, cands: &[u32], probs: &[f32], vocab: usize) -> HipResult<()> {
+        debug_assert_eq!(cands.len(), probs.len());
+        if self.off.is_empty() {
+            self.off.push(0);
+        }
+        self.stage.clear();
+        for (&c, &p) in cands.iter().zip(probs) {
+            if c as usize >= vocab {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("selector candidate id {} out of vocab {}", c, vocab),
+                ));
+            }
+            self.stage.push((c, p));
+        }
+        self.stage.sort_by_key(|e| e.0);
+        let n = self.stage.len();
+        let mut k = 0;
+        while k < n {
+            let mut e = k;
+            while e + 1 < n && self.stage[e + 1].0 == self.stage[k].0 {
+                e += 1;
+            }
+            self.idx.push(self.stage[e].0);
+            self.val.push(self.stage[e].1);
+            k = e + 1;
+        }
+        self.off.push(self.idx.len() as u32);
+        Ok(())
+    }
+}
+
 /// Reusable selector receipt from singleton lines 6136–6346 / 6460–6500.
 /// `block` includes the seed; q row i proposes `block[i + 1]`. Extra dense
 /// rows may be retained across short windows but are not part of this receipt.
+///
+/// q rows live in `sparse_q` when `sparse` (the FAST_SAMPLE default,
+/// [`dflash_sparse_target_enabled`]) and in `dense_q` otherwise.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct DflashSampledDraft {
     pub block: Vec<u32>,
     pub selected_q: Vec<f32>,
     pub dense_q: Vec<Vec<f32>>,
+    pub sparse_q: SparseQRows,
+    pub sparse: bool,
     pub proposal: Option<dflash::DflashCandidateProposal>,
     pub uniforms: Vec<f32>,
 }
 
 impl DflashSampledDraft {
     /// Reserve a request's maximum window without changing the selector law.
+    /// Sparse mode reserves only the top-K supports; dense rows (cactus or
+    /// `HIPFIRE_DFLASH_SPARSE_TARGET=0`) are allocated on first use.
     pub fn new(b: usize, vocab: usize) -> Self {
+        let rows = b.saturating_sub(1);
+        let dense_q = if *DFLASH_SPARSE_TARGET_ON {
+            Vec::new()
+        } else {
+            (0..rows).map(|_| Vec::with_capacity(vocab)).collect()
+        };
         Self {
             block: Vec::with_capacity(b),
-            selected_q: Vec::with_capacity(b.saturating_sub(1)),
-            dense_q: (0..b.saturating_sub(1))
-                .map(|_| Vec::with_capacity(vocab))
-                .collect(),
+            selected_q: Vec::with_capacity(rows),
+            dense_q,
+            sparse_q: SparseQRows::with_capacity(rows, 64),
+            sparse: false,
             proposal: None,
-            uniforms: Vec::with_capacity(b.saturating_sub(1)),
+            uniforms: Vec::with_capacity(rows),
         }
     }
 }
@@ -3799,21 +3945,181 @@ pub struct SampledWindowDecision {
     pub committed_len: usize,
 }
 
+/// Per-row capacity of the FAST_SAMPLE sparse target compaction (CAP256). A
+/// row whose kept set (`p >= tau`) is larger falls back to its dense row.
+pub const DFLASH_SPARSE_CAP: usize = 256;
+/// `dense_slot` marker: the row is held sparse.
+const SPARSE_NONE: u32 = u32::MAX;
+
+/// `HIPFIRE_DFLASH_SPARSE_TARGET=0` (developer kill switch): download the
+/// full `[rows * vocab]` target probabilities and keep selector q dense.
+/// Default on. Read through [`dflash_sparse_target_enabled`].
+static DFLASH_SPARSE_TARGET_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_SPARSE_TARGET").map_or(true, |v| v.trim() != "0")
+});
+
+/// The one switch of the sparse sampled-DFlash representation, shared by the
+/// singleton route and the continuous-batching lanes (target rows AND selector
+/// q): the kill switch is on and CACTUS is off. CACTUS rewrites the whole dense
+/// target row (`scale * v` everywhere) and so stays on the dense arithmetic.
+#[doc(hidden)]
+pub fn dflash_sparse_target_enabled(cfg: &DflashSampleCfg) -> bool {
+    *DFLASH_SPARSE_TARGET_ON && !(cfg.cactus_delta > 0.0)
+}
+
+/// One verify row of [`FastTargetRows`].
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum TargetRowRef<'a> {
+    /// The RAW temperature softmax row plus the kernel's `tau`/`z`; the
+    /// nucleus truncation [`apply_topp_trunc`] is still to be applied.
+    Dense { raw: &'a [f32], tau: f32, z: f32 },
+    /// The kept set `p >= tau` (`tau > 0`): ascending ids and RAW probs. The
+    /// truncated value of id `idx[k]` is `val[k] * inv_z`, every other id 0.
+    Sparse { idx: &'a [u32], val: &'a [f32], inv_z: f32 },
+}
+
 /// FAST_SAMPLE target rows of a sampled DFlash window, downloaded from the
-/// GPU: the temperature softmax of every verify row (`probs`, row-major
-/// `[rows * vocab]`) and the per-row AR cutoff `tau` and kept mass `z` from
-/// `softmax_temp_topp_batched_into_f32`.
+/// GPU. Every row is the temperature softmax with the per-row AR cutoff `tau`
+/// and kept mass `z` from `softmax_temp_topp_batched_into_f32`.
+///
+/// Dense mode (`capacity == 0`): `probs` is row-major `[rows * vocab]`.
+/// Sparse mode (`capacity > 0`): per row `counts[r]` kept entries in
+/// `idx/val[r * capacity ..]` (ascending ids, raw probs, from
+/// `sampled_rows_compact_into_f32`); rows that cannot be sparse — `tau <= 0`
+/// (identity truncation, kept set = everything) or `counts > capacity`
+/// (overflow) — are held dense and raw in `dense_rows` at `dense_slot[r]`.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct FastTargetRows {
     pub probs: Vec<f32>,
     pub tau: Vec<f32>,
     pub z: Vec<f32>,
+    pub capacity: usize,
+    pub counts: Vec<u32>,
+    pub idx: Vec<u32>,
+    pub val: Vec<f32>,
+    pub dense_slot: Vec<u32>,
+    pub dense_rows: Vec<f32>,
+}
+
+impl FastTargetRows {
+    /// Dense-mode rows.
+    pub fn dense(probs: Vec<f32>, tau: Vec<f32>, z: Vec<f32>) -> Self {
+        Self { probs, tau, z, ..Self::default() }
+    }
+
+    pub fn rows(&self) -> usize {
+        self.tau.len()
+    }
+
+    pub fn is_sparse(&self) -> bool {
+        self.capacity > 0
+    }
+
+    /// Reserve a lane's maximum window in the mode `cfg` selects.
+    pub fn reserve_rows(&mut self, rows: usize, vocab: usize, cfg: &DflashSampleCfg) {
+        self.tau.reserve(rows);
+        self.z.reserve(rows);
+        if dflash_sparse_target_enabled(cfg) {
+            self.counts.reserve(rows);
+            self.dense_slot.reserve(rows);
+            self.idx.reserve(rows * DFLASH_SPARSE_CAP);
+            self.val.reserve(rows * DFLASH_SPARSE_CAP);
+        } else {
+            self.probs.reserve(rows * vocab);
+        }
+    }
+
+    pub fn row(&self, row: usize, vocab: usize) -> TargetRowRef<'_> {
+        if self.capacity == 0 {
+            return TargetRowRef::Dense {
+                raw: &self.probs[row * vocab..(row + 1) * vocab],
+                tau: self.tau[row],
+                z: self.z[row],
+            };
+        }
+        let slot = self.dense_slot[row];
+        if slot != SPARSE_NONE {
+            let s = slot as usize;
+            return TargetRowRef::Dense {
+                raw: &self.dense_rows[s * vocab..(s + 1) * vocab],
+                tau: self.tau[row],
+                z: self.z[row],
+            };
+        }
+        let n = self.counts[row] as usize;
+        let o = row * self.capacity;
+        TargetRowRef::Sparse {
+            idx: &self.idx[o..o + n],
+            val: &self.val[o..o + n],
+            // The exact scale `apply_topp_trunc` multiplies by.
+            inv_z: 1.0f32 / self.z[row].max(f32::MIN_POSITIVE),
+        }
+    }
+
+    /// Sparse mode: classify rows after `tau`, `z`, `counts`, `idx`, `val`
+    /// are downloaded. Fills `dense_slot` (slots in ascending row order),
+    /// returns the number of dense rows, and validates every sparse row's ids
+    /// (ascending, `< vocab`) — the sequential-sum exactness of the sparse
+    /// arithmetic depends on that order.
+    pub fn plan_dense_rows(&mut self, vocab: usize) -> HipResult<usize> {
+        let rows = self.tau.len();
+        let cap = self.capacity;
+        if cap == 0
+            || self.z.len() != rows
+            || self.counts.len() != rows
+            || self.idx.len() != rows * cap
+            || self.val.len() != rows * cap
+        {
+            return Err(HipError::new(0, "sparse target rows: inconsistent compact arrays"));
+        }
+        self.dense_slot.clear();
+        let mut n_dense = 0usize;
+        for r in 0..rows {
+            let c = self.counts[r] as usize;
+            // `!(tau > 0)` also routes a NaN tau to the dense row, where
+            // `apply_topp_trunc` keeps its exact (all-compare-false) behavior.
+            if !(self.tau[r] > 0.0) || c > cap {
+                self.dense_slot.push(n_dense as u32);
+                n_dense += 1;
+                continue;
+            }
+            let ids = &self.idx[r * cap..r * cap + c];
+            let ok = ids.iter().all(|&i| (i as usize) < vocab)
+                && ids.windows(2).all(|w| w[0] < w[1]);
+            if !ok {
+                return Err(HipError::new(0, "sparse target rows: compact ids not ascending/in range"));
+            }
+            self.dense_slot.push(SPARSE_NONE);
+        }
+        Ok(n_dense)
+    }
+}
+
+fn f32_bytes_mut(v: &mut [f32]) -> &mut [u8] {
+    // SAFETY: any byte pattern is a valid f32; the slice covers exactly `v`.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+}
+
+fn u32_bytes_mut(v: &mut [u32]) -> &mut [u8] {
+    // SAFETY: any byte pattern is a valid u32; the slice covers exactly `v`.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+}
+
+fn download_tensor_bytes(gpu: &Gpu, t: &GpuTensor, dst: &mut [u8]) -> HipResult<()> {
+    gpu.bind_thread()?;
+    gpu.hip.memcpy_dtoh(dst, &t.buf)
 }
 
 /// FAST_SAMPLE materialization lifted from singleton lines 6802–6826:
-/// normalize all verify rows, then download tau, Z and probabilities in that
-/// order. `logits` may be a lane-owned view but must contain exactly its rows.
+/// normalize all verify rows, then download tau, Z and the probabilities.
+/// `logits` may be a lane-owned view but must contain exactly its rows.
+///
+/// With [`dflash_sparse_target_enabled`], the probabilities are compacted on
+/// the GPU (`sampled_rows_compact_into_f32`, per-row `tau`, CAP256) and only the
+/// small count/id/value arrays plus the identity (`tau <= 0`) and overflow
+/// rows' dense rows are downloaded; otherwise the whole `[b * vocab]` buffer.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn dflash_target_rows_into(
@@ -3827,11 +4133,34 @@ pub fn dflash_target_rows_into(
     let probs_gpu = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
     let tau_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
     let z_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+    let res = dflash_target_rows_run(
+        gpu, logits, &probs_gpu, &tau_gpu, &z_gpu, b, vocab, cfg,
+        dflash_sparse_target_enabled(&cfg), out,
+    );
+    let _ = gpu.free_tensor(tau_gpu);
+    let _ = gpu.free_tensor(z_gpu);
+    let _ = gpu.free_tensor(probs_gpu);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dflash_target_rows_run(
+    gpu: &mut Gpu,
+    logits: &GpuTensor,
+    probs_gpu: &GpuTensor,
+    tau_gpu: &GpuTensor,
+    z_gpu: &GpuTensor,
+    b: usize,
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    sparse: bool,
+    out: &mut FastTargetRows,
+) -> HipResult<()> {
     gpu.softmax_temp_topp_batched_into_f32(
         logits,
-        &probs_gpu,
-        &tau_gpu,
-        &z_gpu,
+        probs_gpu,
+        tau_gpu,
+        z_gpu,
         vocab,
         b,
         cfg.temp,
@@ -3839,19 +4168,125 @@ pub fn dflash_target_rows_into(
         cfg.top_k,
         0.0,
     )?;
-    gpu.download_f32_into(&tau_gpu, &mut out.tau)?;
-    gpu.download_f32_into(&z_gpu, &mut out.z)?;
-    gpu.download_f32_into(&probs_gpu, &mut out.probs)?;
-    let _ = gpu.free_tensor(tau_gpu);
-    let _ = gpu.free_tensor(z_gpu);
-    let _ = gpu.free_tensor(probs_gpu);
+    gpu.download_f32_into(tau_gpu, &mut out.tau)?;
+    gpu.download_f32_into(z_gpu, &mut out.z)?;
+    if !sparse {
+        out.capacity = 0;
+        out.counts.clear();
+        out.idx.clear();
+        out.val.clear();
+        out.dense_slot.clear();
+        out.dense_rows.clear();
+        return gpu.download_f32_into(probs_gpu, &mut out.probs);
+    }
+    let cap = DFLASH_SPARSE_CAP;
+    let counts_gpu = gpu.alloc_tensor(&[b], rdna_compute::DType::F32)?;
+    let idx_gpu = match gpu.alloc_tensor(&[b * cap], rdna_compute::DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = gpu.free_tensor(counts_gpu);
+            return Err(e);
+        }
+    };
+    let val_gpu = match gpu.alloc_tensor(&[b * cap], rdna_compute::DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = gpu.free_tensor(counts_gpu);
+            let _ = gpu.free_tensor(idx_gpu);
+            return Err(e);
+        }
+    };
+    let res = dflash_target_rows_sparse(
+        gpu, probs_gpu, tau_gpu, &counts_gpu, &idx_gpu, &val_gpu, b, vocab, cap, out,
+    );
+    let _ = gpu.free_tensor(counts_gpu);
+    let _ = gpu.free_tensor(idx_gpu);
+    let _ = gpu.free_tensor(val_gpu);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dflash_target_rows_sparse(
+    gpu: &mut Gpu,
+    probs_gpu: &GpuTensor,
+    tau_gpu: &GpuTensor,
+    counts_gpu: &GpuTensor,
+    idx_gpu: &GpuTensor,
+    val_gpu: &GpuTensor,
+    b: usize,
+    vocab: usize,
+    cap: usize,
+    out: &mut FastTargetRows,
+) -> HipResult<()> {
+    gpu.sampled_rows_compact_into_f32(
+        probs_gpu, tau_gpu, counts_gpu, idx_gpu, val_gpu, vocab, b, cap,
+    )?;
+    out.capacity = cap;
+    out.counts.clear();
+    out.counts.resize(b, 0);
+    out.idx.clear();
+    out.idx.resize(b * cap, 0);
+    out.val.clear();
+    out.val.resize(b * cap, 0.0);
+    // counts/idx are i32 buffers behind F32-typed tensors: raw byte copies.
+    download_tensor_bytes(gpu, counts_gpu, u32_bytes_mut(&mut out.counts))?;
+    download_tensor_bytes(gpu, idx_gpu, u32_bytes_mut(&mut out.idx))?;
+    download_tensor_bytes(gpu, val_gpu, f32_bytes_mut(&mut out.val))?;
+    out.probs.clear();
+    let n_dense = out.plan_dense_rows(vocab)?;
+    out.dense_rows.clear();
+    if n_dense == 0 {
+        return Ok(());
+    }
+    out.dense_rows.resize(n_dense * vocab, 0.0);
+    if n_dense == b {
+        return download_tensor_bytes(gpu, probs_gpu, f32_bytes_mut(&mut out.dense_rows));
+    }
+    for r in 0..b {
+        let slot = out.dense_slot[r];
+        if slot == SPARSE_NONE {
+            continue;
+        }
+        let s = slot as usize;
+        let view = probs_gpu.sub_offset(r * vocab, vocab);
+        download_tensor_bytes(
+            gpu,
+            &view,
+            f32_bytes_mut(&mut out.dense_rows[s * vocab..(s + 1) * vocab]),
+        )?;
+    }
     Ok(())
+}
+
+/// Selector q rows as the accept loop reads them.
+#[derive(Clone, Copy)]
+enum QRows<'a> {
+    Dense(&'a [Vec<f32>]),
+    Sparse(&'a SparseQRows),
 }
 
 /// Selector host rejection/bonus loop from singleton lines 6832–6907.
 /// Proposal uniforms have already been drawn; budget checks precede each
 /// acceptance draw, rejection draws one residual, and bonus draws only when
 /// there was no rejection. Dense q retains vocab-order residual arithmetic.
+///
+/// # Sparse exactness
+/// When the target row is sparse ([`TargetRowRef::Sparse`]), the q row is
+/// sparse and CACTUS is off, no vocab row is materialized. Every quantity of
+/// the dense loop is reproduced bit-for-bit, because the dense loop only
+/// ever adds, compares and returns at positions where its summand is
+/// non-zero:
+///  * target value `p(t)`: kept ids hold `val * inv_z` — the very product
+///    `apply_topp_trunc` computes — every other id is the literal `0.0`;
+///  * residual `d_i = p_i - q_i` is `0.0 - 0.0 = 0.0` (never `> 0`, never
+///    added) off the union of the two supports, so both sums walk the union
+///    in ascending id, i.e. the dense order, with identical f32 operands;
+///  * the final "last index" fallback returns `vocab - 1` like the dense one;
+///  * the degenerate fallback (`sum <= 0`) is the dense `argmax_u32` scan
+///    replayed over the implicit zeros ([`argmax_sparse`]).
+/// Mixed rows (dense target with sparse q, sparse target with dense q or
+/// CACTUS) rebuild the dense target row in `scratch` and use the dense or
+/// dense-p/sparse-q residual, which share the same operand sequence.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn dflash_sampled_accept_rows(
@@ -3865,8 +4300,13 @@ pub fn dflash_sampled_accept_rows(
     rng: &mut u64,
     scratch: &mut Vec<f32>,
 ) -> SampledWindowDecision {
+    let q_rows = if q.sparse {
+        QRows::Sparse(&q.sparse_q)
+    } else {
+        QRows::Dense(&q.dense_q)
+    };
     dflash_sampled_accept_q_rows(
-        block, &q.selected_q, &q.dense_q, fast, logits, vocab, cfg,
+        block, &q.selected_q, q_rows, fast, logits, vocab, cfg,
         max_accept, rng, scratch,
     )
 }
@@ -3875,7 +4315,7 @@ pub fn dflash_sampled_accept_rows(
 fn dflash_sampled_accept_q_rows(
     block: &[u32],
     selected_q: &[f32],
-    dense_q: &[Vec<f32>],
+    q: QRows<'_>,
     fast: Option<&FastTargetRows>,
     logits: &[f32],
     vocab: usize,
@@ -3892,11 +4332,32 @@ fn dflash_sampled_accept_q_rows(
         if accept_len >= max_accept {
             break;
         }
+        let t = block[i + 1] as usize;
+        let p_d = selected_q[i].max(f32::MIN_POSITIVE);
+        if !use_cactus {
+            if let (
+                Some(TargetRowRef::Sparse { idx: tidx, val: tval, inv_z }),
+                QRows::Sparse(qs),
+            ) = (fast.map(|f| f.row(i, vocab)), q)
+            {
+                let p_t = sparse_row_prob(tidx, tval, inv_z, block[i + 1]);
+                let u = xorshift_next_unit(rng);
+                if u * p_d <= p_t {
+                    accept_len += 1;
+                } else {
+                    let u2 = xorshift_next_unit(rng);
+                    let (qidx, qval) = qs.row(i);
+                    rejected_bonus = Some(sample_residual_sparse(
+                        tidx, tval, inv_z, qidx, qval, vocab, u2,
+                    ));
+                    break;
+                }
+                continue;
+            }
+        }
         sampled_target_row_into(
             scratch, i, vocab, fast, logits, cfg.temp, cfg.top_k, cfg.top_p,
         );
-        let t = block[i + 1] as usize;
-        let p_d = selected_q[i].max(f32::MIN_POSITIVE);
         let p_t = scratch[t];
         let accept_prob = if use_cactus {
             let bump = (2.0 * cfg.cactus_delta * p_t * (1.0 - p_t)).max(0.0).sqrt();
@@ -3924,7 +4385,13 @@ fn dflash_sampled_accept_q_rows(
                 }
             }
             let u2 = xorshift_next_unit(rng);
-            rejected_bonus = Some(sample_residual(scratch, &dense_q[i], u2));
+            rejected_bonus = Some(match q {
+                QRows::Dense(d) => sample_residual(scratch, &d[i], u2),
+                QRows::Sparse(s) => {
+                    let (qidx, qval) = s.row(i);
+                    sample_residual_dense_p_sparse_q(scratch, qidx, qval, u2)
+                }
+            });
             break;
         }
     }
@@ -3965,11 +4432,22 @@ pub fn sampled_target_row_into(
     top_p: f32,
 ) {
     match fast {
-        Some(fast) => {
-            out.clear();
-            out.extend_from_slice(&fast.probs[row * vocab..(row + 1) * vocab]);
-            apply_topp_trunc(out, fast.tau[row], fast.z[row]);
-        }
+        Some(fast) => match fast.row(row, vocab) {
+            TargetRowRef::Dense { raw, tau, z } => {
+                out.clear();
+                out.extend_from_slice(raw);
+                apply_topp_trunc(out, tau, z);
+            }
+            // Legacy dense consumers (CACTUS, dense q, tests): rebuild the
+            // truncated row — `val * inv_z` on the kept ids, 0.0 elsewhere.
+            TargetRowRef::Sparse { idx, val, inv_z } => {
+                out.clear();
+                out.resize(vocab, 0.0);
+                for (&i, &v) in idx.iter().zip(val) {
+                    out[i as usize] = v * inv_z;
+                }
+            }
+        },
         None => {
             softmax_temp_into(&logits[row * vocab..(row + 1) * vocab], temp, out);
             apply_host_ar_trunc(out, top_k, top_p);
@@ -3993,6 +4471,10 @@ pub fn sampled_target_bonus(
     top_p: f32,
     u: f32,
 ) -> u32 {
+    // A sparse FAST_SAMPLE row is drawn directly from its kept set (no vocab row).
+    if let Some(TargetRowRef::Sparse { idx, val, inv_z }) = fast.map(|f| f.row(row, vocab)) {
+        return sample_categorical_sparse(idx, val, inv_z, vocab, u);
+    }
     sampled_target_row_into(scratch, row, vocab, fast, logits, temp, top_k, top_p);
     sample_categorical(scratch, u)
 }
@@ -4053,6 +4535,194 @@ pub(crate) fn sample_residual_point_mass(p_target: &[f32], excluded: u32, u: f32
     let mut acc = 0.0f32;
     for i in 0..p_target.len() {
         let d = if i == ex { p_target[i] - 1.0 } else { p_target[i] };
+        if d > 0.0 {
+            acc += d;
+            if u_scaled < acc {
+                return i as u32;
+            }
+        }
+    }
+    (p_target.len() - 1) as u32
+}
+
+/// Truncated target probability of token `t` in a sparse row: `val * inv_z`
+/// when kept, the literal `0.0` of the dense row otherwise. `idx` ascending.
+#[inline]
+fn sparse_row_prob(idx: &[u32], val: &[f32], inv_z: f32, t: u32) -> f32 {
+    match idx.binary_search(&t) {
+        Ok(k) => val[k] * inv_z,
+        Err(_) => 0.0,
+    }
+}
+
+/// [`sample_categorical`] over a sparse truncated row without materializing it.
+///
+/// The dense scan adds `p_i` in id order and returns the first `i` with
+/// `u < acc`. Off the support `p_i = 0.0`, so `acc` is unchanged (`x + 0.0 == x`
+/// exactly) and a test that failed at the previous id fails again — the first
+/// success is therefore always a support id, found by walking the support in
+/// the same order with the same partial sums. The single exception is the
+/// very first id (`acc = 0.0 + p_0`): for `u < 0` it succeeds at id 0 even when
+/// `p_0 = 0`, so that case is returned explicitly (`u` from the xorshift
+/// stream is always `>= 0`; NaN compares false in both). Falling off the end
+/// returns the dense `len - 1` = `vocab - 1`.
+#[inline]
+fn sample_categorical_sparse(idx: &[u32], val: &[f32], inv_z: f32, vocab: usize, u: f32) -> u32 {
+    if u < 0.0 {
+        return 0;
+    }
+    let mut acc = 0.0f32;
+    for (&i, &v) in idx.iter().zip(val) {
+        acc += v * inv_z;
+        if u < acc {
+            return i;
+        }
+    }
+    (vocab - 1) as u32
+}
+
+/// [`argmax_u32`] of a sparse truncated row: the scan replayed over the
+/// virtual dense row. A run of implicit zeros between support ids is a run of
+/// equal values, of which only the first can win the strict `>` — so one
+/// candidate `(first id of the gap, 0.0)` per gap, the support entries in
+/// between, and a trailing gap, visited in ascending id.
+fn argmax_sparse(idx: &[u32], val: &[f32], inv_z: f32, vocab: usize) -> u32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    let mut pos = 0usize;
+    for (&i, &v) in idx.iter().zip(val) {
+        let i = i as usize;
+        if i > pos && 0.0 > best_v {
+            best_v = 0.0;
+            best = pos;
+        }
+        let x = v * inv_z;
+        if x > best_v {
+            best_v = x;
+            best = i;
+        }
+        pos = i + 1;
+    }
+    if pos < vocab && 0.0 > best_v {
+        best = pos;
+    }
+    best as u32
+}
+
+/// Visit the ascending union of a sparse target row (`val * inv_z`, 0.0 off
+/// support) and a sparse q row (0.0 off support) as `(p, q)`; stops and
+/// returns the id when `f` returns true.
+#[inline]
+fn walk_union(
+    tidx: &[u32],
+    tval: &[f32],
+    inv_z: f32,
+    qidx: &[u32],
+    qval: &[f32],
+    mut f: impl FnMut(f32, f32) -> bool,
+) -> Option<u32> {
+    let (mut a, mut b) = (0usize, 0usize);
+    while a < tidx.len() || b < qidx.len() {
+        let ti = tidx.get(a).copied().unwrap_or(u32::MAX);
+        let qi = qidx.get(b).copied().unwrap_or(u32::MAX);
+        let i = ti.min(qi);
+        let p = if ti == i {
+            let v = tval[a] * inv_z;
+            a += 1;
+            v
+        } else {
+            0.0
+        };
+        let q = if qi == i {
+            let v = qval[b];
+            b += 1;
+            v
+        } else {
+            0.0
+        };
+        if f(p, q) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// [`sample_residual`] of a sparse target row against a sparse q row, with no
+/// vocab row. The dense function skips every `d = p - q <= 0` (including
+/// `0.0 - 0.0` off both supports), adds the positive `d` in ascending id into
+/// `sum`, rescales `u`, and returns the first id whose running `acc` exceeds
+/// `u * sum`; `d` is positive only on the union of the supports, so walking
+/// the union ascending performs the identical f32 operations in the identical
+/// order (q needs no sign assumption: an off-target negative q entry gives
+/// `0.0 - q > 0` and is on the union). `sum <= 0` takes the dense degenerate
+/// `argmax` ([`argmax_sparse`]); running off the end returns `vocab - 1`.
+fn sample_residual_sparse(
+    tidx: &[u32],
+    tval: &[f32],
+    inv_z: f32,
+    qidx: &[u32],
+    qval: &[f32],
+    vocab: usize,
+    u: f32,
+) -> u32 {
+    let mut sum = 0.0f32;
+    walk_union(tidx, tval, inv_z, qidx, qval, |p, q| {
+        let d = p - q;
+        if d > 0.0 {
+            sum += d;
+        }
+        false
+    });
+    if sum <= 0.0 {
+        return argmax_sparse(tidx, tval, inv_z, vocab);
+    }
+    let u_scaled = u * sum;
+    let mut acc = 0.0f32;
+    let hit = walk_union(tidx, tval, inv_z, qidx, qval, |p, q| {
+        let d = p - q;
+        if d > 0.0 {
+            acc += d;
+            if u_scaled < acc {
+                return true;
+            }
+        }
+        false
+    });
+    match hit {
+        Some(i) => i,
+        None => (vocab - 1) as u32,
+    }
+}
+
+/// [`sample_residual`] against a sparse q row for a dense target row: the
+/// dense q is `0.0` off its support, so `p_i - q_i` is computed with the same
+/// operands at every id, without a q vocab row.
+fn sample_residual_dense_p_sparse_q(p_target: &[f32], qidx: &[u32], qval: &[f32], u: f32) -> u32 {
+    let q_at = |i: usize, k: &mut usize| -> f32 {
+        if *k < qidx.len() && qidx[*k] as usize == i {
+            let v = qval[*k];
+            *k += 1;
+            v
+        } else {
+            0.0
+        }
+    };
+    let mut sum = 0.0f32;
+    let mut k = 0usize;
+    for i in 0..p_target.len() {
+        let d = p_target[i] - q_at(i, &mut k);
+        if d > 0.0 {
+            sum += d;
+        }
+    }
+    if sum <= 0.0 {
+        return argmax_u32(p_target);
+    }
+    let u_scaled = u * sum;
+    let mut acc = 0.0f32;
+    let mut k = 0usize;
+    for i in 0..p_target.len() {
+        let d = p_target[i] - q_at(i, &mut k);
         if d > 0.0 {
             acc += d;
             if u_scaled < acc {
@@ -6210,11 +6880,31 @@ fn dflash_sampled_selector_draft_parts_into(
             &host_logits, batch, seed, cfg.temp, Some(&out.uniforms),
         )?
     };
+    dflash_sampled_apply_proposal_into(proposal, vocab, cfg, out)
+}
+
+fn dflash_sampled_apply_proposal_into(
+    proposal: dflash::DflashCandidateProposal,
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    out: &mut DflashSampledDraft,
+) -> HipResult<()> {
     out.block.truncate(1);
-    apply_dflash2_selector_proposal(
-        &proposal, vocab, true, &mut out.block, &mut out.dense_q,
-        &mut out.selected_q,
-    )?;
+    // Same switch as the target rows (`dflash_target_rows_into`): sparse q is
+    // the exact (id, value) support of the dense row below, minus its vocab fill.
+    out.sparse = dflash_sparse_target_enabled(&cfg);
+    if out.sparse {
+        out.sparse_q.clear();
+        apply_dflash2_selector_proposal_sparse(
+            &proposal, vocab, &mut out.block, &mut out.sparse_q,
+            &mut out.selected_q,
+        )?;
+    } else {
+        apply_dflash2_selector_proposal(
+            &proposal, vocab, true, &mut out.block, &mut out.dense_q,
+            &mut out.selected_q,
+        )?;
+    }
     out.proposal = Some(proposal);
     Ok(())
 }
@@ -7141,6 +7831,9 @@ pub fn spec_step_dflash(
     let mut drafted: Vec<u32> = vec![seed_token];
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
+    // Selector / PLD q rows in the sparse FAST_SAMPLE representation; `None`
+    // keeps the dense `draft_softmaxes` rows.
+    let mut q_receipt: Option<DflashSampledDraft> = None;
     let use_temp_sampling = temp > 0.0;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
     // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
@@ -7210,13 +7903,28 @@ pub fn spec_step_dflash(
             drafted.push(pld[i]);
         }
         if use_temp_sampling {
-            draft_probs_at_drafted.reserve(b - 1);
-            draft_softmaxes.reserve(b - 1);
-            for i in 0..b - 1 {
-                let mut probs = vec![0f32; vocab];
-                probs[pld[i] as usize] = 1.0;
-                draft_softmaxes.push(probs);
-                draft_probs_at_drafted.push(1.0);
+            let sample_cfg = DflashSampleCfg { temp, top_p, top_k, cactus_delta };
+            if dflash_sparse_target_enabled(&sample_cfg) {
+                // q = point mass at the PLD token: a one-entry sparse row,
+                // identical arithmetic to the one-hot vocab row below.
+                let mut r = DflashSampledDraft::default();
+                r.sparse = true;
+                r.sparse_q.clear();
+                r.selected_q.reserve(b - 1);
+                for i in 0..b - 1 {
+                    r.sparse_q.push_row(&[pld[i]], &[1.0], vocab)?;
+                    r.selected_q.push(1.0);
+                }
+                q_receipt = Some(r);
+            } else {
+                draft_probs_at_drafted.reserve(b - 1);
+                draft_softmaxes.reserve(b - 1);
+                for i in 0..b - 1 {
+                    let mut probs = vec![0f32; vocab];
+                    probs[pld[i] as usize] = 1.0;
+                    draft_softmaxes.push(probs);
+                    draft_probs_at_drafted.push(1.0);
+                }
             }
         }
     } else if use_temp_sampling && selector_mode {
@@ -7229,9 +7937,8 @@ pub fn spec_step_dflash(
             DflashSampleCfg { temp, top_p, top_k, cactus_delta },
             rng_state, &mut receipt,
         )?;
-        drafted = receipt.block;
-        draft_softmaxes = receipt.dense_q;
-        draft_probs_at_drafted = receipt.selected_q;
+        drafted = std::mem::take(&mut receipt.block);
+        q_receipt = Some(receipt);
     } else if !use_temp_sampling && !host_path_active {
         // Greedy fast path shared verbatim with the dense-TP mesh ranks
         // (byte-identical draft production through draft_dflash_block_rank).
@@ -7909,7 +8616,7 @@ pub fn spec_step_dflash(
             let _ = gpu.free_tensor(z_t_dev);
         } else {
             // ── Host accept path (PLD / fallback per-row) ──────────────────
-            debug_assert_eq!(draft_softmaxes.len(), b - 1);
+            debug_assert!(q_receipt.is_some() || draft_softmaxes.len() == b - 1);
             // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
             // all B rows and download the probs. The accept loop below then reads
             // `target_probs` from this buffer instead of calling the host
@@ -7930,10 +8637,13 @@ pub fn spec_step_dflash(
                 debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
                 None
             };
-            let q = DflashSampledDraft {
-                selected_q: draft_probs_at_drafted,
-                dense_q: draft_softmaxes,
-                ..DflashSampledDraft::default()
+            let q = match q_receipt.take() {
+                Some(r) => r,
+                None => DflashSampledDraft {
+                    selected_q: draft_probs_at_drafted,
+                    dense_q: draft_softmaxes,
+                    ..DflashSampledDraft::default()
+                },
             };
             let mut target_probs = Vec::with_capacity(vocab);
             let decision = dflash_sampled_accept_rows(
@@ -11259,6 +11969,449 @@ pub fn apply_eviction_retain_to_draft(
 }
 
 #[cfg(test)]
+mod sparse_target_tests {
+    //! Host-only exactness of the sparse FAST_SAMPLE target rows and sparse
+    //! selector q against the dense path (same uniforms ⇒ same decision, same
+    //! RNG state).
+    use super::*;
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 24
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn unit(&mut self) -> f32 {
+            (self.next_u64() & 0xFF_FFFF) as f32 / 16_777_216.0
+        }
+    }
+
+    /// Host twin of `sampled_rows_compact_f32` + the host assembly of
+    /// `dflash_target_rows_sparse`: kept = `p >= tau[r]` ascending, true
+    /// count, first `cap` stored, garbage past the count.
+    fn host_compact(
+        probs: &[f32],
+        tau: Vec<f32>,
+        z: Vec<f32>,
+        vocab: usize,
+        cap: usize,
+    ) -> FastTargetRows {
+        let rows = tau.len();
+        let mut counts = vec![0u32; rows];
+        let mut idx = vec![0xDEAD_BEEFu32; rows * cap];
+        let mut val = vec![f32::NAN; rows * cap];
+        for r in 0..rows {
+            let mut c = 0usize;
+            for j in 0..vocab {
+                let p = probs[r * vocab + j];
+                if p >= tau[r] {
+                    if c < cap {
+                        idx[r * cap + c] = j as u32;
+                        val[r * cap + c] = p;
+                    }
+                    c += 1;
+                }
+            }
+            counts[r] = c as u32;
+        }
+        let mut f = FastTargetRows {
+            tau,
+            z,
+            capacity: cap,
+            counts,
+            idx,
+            val,
+            ..FastTargetRows::default()
+        };
+        let n = f.plan_dense_rows(vocab).unwrap();
+        f.dense_rows = vec![0.0; n * vocab];
+        for r in 0..rows {
+            let s = f.dense_slot[r];
+            if s != SPARSE_NONE {
+                let s = s as usize;
+                f.dense_rows[s * vocab..(s + 1) * vocab]
+                    .copy_from_slice(&probs[r * vocab..(r + 1) * vocab]);
+            }
+        }
+        f
+    }
+
+    /// The kernel's `tau`/`Z` for a row, with identity rows, exact-tie
+    /// boundaries (tau = an existing probability) and AR-truncated rows.
+    fn row_tau_z(rng: &mut Lcg, raw: &[f32], top_p: f32, top_k: usize) -> (f32, f32) {
+        let vocab = raw.len();
+        match rng.below(10) {
+            0 => (0.0, 1.0),
+            1 => {
+                let t = raw[rng.below(vocab)];
+                (t, raw.iter().filter(|&&p| p >= t).sum())
+            }
+            _ => {
+                let mut ar = raw.to_vec();
+                apply_host_ar_trunc(&mut ar, top_k, top_p);
+                let t = (0..vocab)
+                    .filter(|&i| ar[i] > 0.0)
+                    .map(|i| raw[i])
+                    .fold(f32::INFINITY, f32::min);
+                if t.is_finite() {
+                    (t, raw.iter().filter(|&&p| p >= t).sum())
+                } else {
+                    (0.0, 1.0)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_accept_matches_dense_10k_cases() {
+        let mut rng = Lcg(0x5EED_0001);
+        let (mut full, mut zero, mut budget, mut rejected) = (0usize, 0usize, 0usize, 0usize);
+        let (mut dense_rows_seen, mut overflow_seen, mut sparse_rows_seen) = (0usize, 0usize, 0usize);
+        let mut empty_q_rows = 0usize;
+        for case in 0..10_000usize {
+            let vocab = 2 + rng.below(if case % 50 == 0 { 400 } else { 40 });
+            let b = 2 + rng.below(5);
+            let temp = [0.5f32, 0.8, 1.0][rng.below(3)];
+            let top_p = [1.0f32, 0.9, 0.5, 0.3][rng.below(4)];
+            let top_k = [0usize, 1, 3, 20, 64][rng.below(5)];
+            let cap = [DFLASH_SPARSE_CAP, DFLASH_SPARSE_CAP, 1, 2, 4, 8][rng.below(6)];
+            let quantized = rng.below(3) == 0;
+            let (mut probs, mut tau, mut z) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..b {
+                let logits: Vec<f32> = (0..vocab)
+                    .map(|_| {
+                        if quantized {
+                            rng.below(5) as f32 * 0.7
+                        } else {
+                            rng.unit() * 8.0 - 4.0
+                        }
+                    })
+                    .collect();
+                let mut row = Vec::new();
+                softmax_temp_into(&logits, temp, &mut row);
+                let (t, zz) = row_tau_z(&mut rng, &row, top_p, top_k);
+                tau.push(t);
+                z.push(zz);
+                probs.extend_from_slice(&row);
+            }
+            let dense_fast = FastTargetRows::dense(probs.clone(), tau.clone(), z.clone());
+            let sparse_fast = host_compact(&probs, tau.clone(), z.clone(), vocab, cap);
+            for r in 0..b {
+                if sparse_fast.dense_slot[r] == SPARSE_NONE {
+                    sparse_rows_seen += 1;
+                } else {
+                    dense_rows_seen += 1;
+                    if tau[r] > 0.0 && sparse_fast.counts[r] as usize > cap {
+                        overflow_seen += 1;
+                    }
+                }
+                // Rebuilt legacy rows are bit-identical to the dense rows.
+                let (mut a, mut c) = (Vec::new(), Vec::new());
+                sampled_target_row_into(&mut a, r, vocab, Some(&dense_fast), &[], temp, top_k, top_p);
+                sampled_target_row_into(&mut c, r, vocab, Some(&sparse_fast), &[], temp, top_k, top_p);
+                assert_eq!(a, c, "case {case} row {r}");
+            }
+
+            // Selector q: candidates with duplicates, zeros, overlap with the
+            // target support, and empty rows.
+            let (mut cands, mut cprobs, mut dq) = (Vec::new(), Vec::new(), Vec::new());
+            let mut sq = SparseQRows::default();
+            sq.clear();
+            for i in 0..b - 1 {
+                let k = rng.below(7);
+                let (mut c, mut p) = (Vec::new(), Vec::new());
+                for _ in 0..k {
+                    let mut id = rng.below(vocab);
+                    if rng.below(10) < 6 && tau[i] > 0.0 {
+                        let start = rng.below(vocab);
+                        for j in 0..vocab {
+                            let cand = (start + j) % vocab;
+                            if probs[i * vocab + cand] >= tau[i] {
+                                id = cand;
+                                break;
+                            }
+                        }
+                    }
+                    c.push(id as u32);
+                    p.push(match rng.below(10) {
+                        0 => 0.0,
+                        1 => 1.0,
+                        2 => rng.unit() * 3.0,
+                        _ => rng.unit() * 0.5,
+                    });
+                }
+                if k == 0 {
+                    empty_q_rows += 1;
+                }
+                // The dense row's last-write rule.
+                let mut row = vec![0.0f32; vocab];
+                for (&id, &v) in c.iter().zip(&p) {
+                    row[id as usize] = v;
+                }
+                sq.push_row(&c, &p, vocab).unwrap();
+                dq.push(row);
+                cands.push(c);
+                cprobs.push(p);
+            }
+            let mut block = vec![rng.below(vocab) as u32];
+            let mut selected = Vec::new();
+            for i in 0..b - 1 {
+                let tok = if !cands[i].is_empty() && rng.below(2) == 0 {
+                    cands[i][rng.below(cands[i].len())]
+                } else {
+                    rng.below(vocab) as u32
+                };
+                block.push(tok);
+                selected.push(if rng.below(10) == 0 { 0.0 } else { rng.unit() });
+            }
+            let cfg = DflashSampleCfg {
+                temp,
+                top_p,
+                top_k,
+                cactus_delta: if rng.below(8) == 0 { 0.1 } else { 0.0 },
+            };
+            let max_accept = if rng.below(10) < 7 { usize::MAX } else { rng.below(b + 1) };
+            let seed = rng.next_u64() | 1;
+            let q_dense = DflashSampledDraft {
+                selected_q: selected.clone(),
+                dense_q: dq,
+                ..DflashSampledDraft::default()
+            };
+            let q_sparse = DflashSampledDraft {
+                selected_q: selected,
+                sparse_q: sq,
+                sparse: true,
+                ..DflashSampledDraft::default()
+            };
+            let run = |fast: &FastTargetRows, q: &DflashSampledDraft, scratch: &mut Vec<f32>| {
+                let mut s = seed;
+                let d = dflash_sampled_accept_rows(
+                    &block, q, Some(fast), &[], vocab, cfg, max_accept, &mut s, scratch,
+                );
+                (d.accepted_drafts, d.bonus_token, d.committed_len, s)
+            };
+            let mut scr = Vec::new();
+            let reference = run(&dense_fast, &q_dense, &mut scr);
+            if reference.0 == b - 1 {
+                full += 1;
+            } else if reference.0 == 0 {
+                zero += 1;
+            }
+            if reference.0 == max_accept && max_accept < b - 1 {
+                budget += 1;
+            }
+            if reference.0 < b - 1 && reference.0 < max_accept {
+                rejected += 1;
+            }
+            let combos: [(&str, &FastTargetRows, &DflashSampledDraft); 3] = [
+                ("sparse/sparse", &sparse_fast, &q_sparse),
+                ("sparse/dense", &sparse_fast, &q_dense),
+                ("dense/sparse", &dense_fast, &q_sparse),
+            ];
+            for (name, f, q) in combos {
+                let mut s = Vec::new();
+                let got = run(f, q, &mut s);
+                assert_eq!(got, reference, "case {case} {name}");
+                let all_sparse = sparse_fast.dense_slot.iter().all(|&s| s == SPARSE_NONE);
+                if name == "sparse/sparse" && all_sparse && cfg.cactus_delta <= 0.0 {
+                    assert_eq!(s.capacity(), 0, "case {case}: sparse path built a vocab row");
+                }
+            }
+        }
+        assert!(full > 0 && zero > 0 && budget > 0 && rejected > 0, "coverage {full} {zero} {budget} {rejected}");
+        assert!(dense_rows_seen > 0 && overflow_seen > 0 && sparse_rows_seen > 0, "rows {dense_rows_seen} {overflow_seen} {sparse_rows_seen}");
+        assert!(empty_q_rows > 0);
+    }
+
+    #[test]
+    fn sparse_residual_categorical_match_dense_10k_cases() {
+        let mut rng = Lcg(0xC0FF_EE01);
+        for case in 0..10_000usize {
+            let vocab = 1 + rng.below(if case % 40 == 0 { 300 } else { 24 });
+            let inv_z = 1.0f32 / (0.2 + rng.unit());
+            let tied = rng.below(3) == 0;
+            let dens = 1 + rng.below(5);
+            let (mut tidx, mut tval) = (Vec::new(), Vec::new());
+            for j in 0..vocab {
+                if rng.below(dens) == 0 && rng.below(8) != 0 {
+                    tidx.push(j as u32);
+                    tval.push(if tied { (1 + rng.below(3)) as f32 * 0.07 } else { 0.01 + rng.unit() * 0.4 });
+                }
+            }
+            let (mut qidx, mut qval) = (Vec::new(), Vec::new());
+            for j in 0..vocab {
+                if rng.below(4) == 0 {
+                    qidx.push(j as u32);
+                    qval.push(match rng.below(6) {
+                        0 => 0.0,
+                        1 => rng.unit() * 3.0,
+                        2 => -rng.unit() * 0.2,
+                        3 if tied => (1 + rng.below(3)) as f32 * 0.07,
+                        _ => rng.unit() * 0.4,
+                    });
+                }
+            }
+            let mut p = vec![0.0f32; vocab];
+            for (&i, &v) in tidx.iter().zip(&tval) {
+                p[i as usize] = v * inv_z;
+            }
+            let mut qd = vec![0.0f32; vocab];
+            for (&i, &v) in qidx.iter().zip(&qval) {
+                qd[i as usize] = v;
+            }
+            let mut us = vec![
+                0.0f32,
+                -0.5,
+                f32::NAN,
+                f32::MIN_POSITIVE,
+                0.25,
+                0.5,
+                0.75,
+                1.0 - 1.0 / 16_777_216.0,
+                rng.unit(),
+                rng.unit(),
+            ];
+            let nudge = |us: &mut Vec<f32>, x: f32| {
+                if x > 0.0 && x.is_finite() {
+                    us.push(x);
+                    us.push(f32::from_bits(x.to_bits() - 1));
+                    us.push(f32::from_bits(x.to_bits() + 1));
+                }
+            };
+            // Categorical boundaries: u equal to each running sum.
+            let mut acc = 0.0f32;
+            for &x in &p {
+                acc += x;
+                nudge(&mut us, acc);
+            }
+            // Residual boundaries: u * sum equal to each running residual sum.
+            let mut rs = 0.0f32;
+            for i in 0..vocab {
+                let d = p[i] - qd[i];
+                if d > 0.0 {
+                    rs += d;
+                }
+            }
+            if rs > 0.0 {
+                let mut a = 0.0f32;
+                for i in 0..vocab {
+                    let d = p[i] - qd[i];
+                    if d > 0.0 {
+                        a += d;
+                        nudge(&mut us, a / rs);
+                    }
+                }
+            }
+            for &u in &us {
+                let dense = sample_residual(&p, &qd, u);
+                assert_eq!(
+                    dense,
+                    sample_residual_sparse(&tidx, &tval, inv_z, &qidx, &qval, vocab, u),
+                    "case {case} u {u} residual"
+                );
+                assert_eq!(
+                    dense,
+                    sample_residual_dense_p_sparse_q(&p, &qidx, &qval, u),
+                    "case {case} u {u} residual dense-p"
+                );
+                assert_eq!(
+                    sample_categorical(&p, u),
+                    sample_categorical_sparse(&tidx, &tval, inv_z, vocab, u),
+                    "case {case} u {u} categorical"
+                );
+            }
+            assert_eq!(argmax_u32(&p), argmax_sparse(&tidx, &tval, inv_z, vocab), "case {case} argmax");
+        }
+    }
+
+    #[test]
+    fn sparse_point_mass_residual_matches_dense_10k_cases() {
+        let mut rng = Lcg(0x90_1A7);
+        for case in 0..10_000usize {
+            let vocab = 1 + rng.below(30);
+            let (mut idx, mut val) = (Vec::new(), Vec::new());
+            let mut p = vec![0.0f32; vocab];
+            for j in 0..vocab {
+                if rng.below(3) == 0 {
+                    let v = if rng.below(4) == 0 { 1.0 } else { rng.unit() * 0.6 };
+                    idx.push(j as u32);
+                    val.push(v);
+                    p[j] = v;
+                }
+            }
+            let ex = rng.below(vocab) as u32;
+            for u in [0.0f32, 0.3, 0.999, rng.unit(), rng.unit()] {
+                assert_eq!(
+                    sample_residual_point_mass(&p, ex, u),
+                    sample_residual_sparse(&idx, &val, 1.0, &[ex], &[1.0], vocab, u),
+                    "case {case} u {u}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_q_rows_reproduce_last_write_and_reject_bad_ids() {
+        let mut q = SparseQRows::default();
+        q.clear();
+        q.push_row(&[5, 3, 5, 9, 3], &[0.1, 0.2, 0.3, 0.4, 0.5], 16).unwrap();
+        q.push_row(&[], &[], 16).unwrap();
+        q.push_row(&[7, 7], &[0.25, 0.0], 16).unwrap();
+        assert_eq!(q.rows(), 3);
+        assert_eq!(q.row(0), (&[3u32, 5, 9][..], &[0.5f32, 0.3, 0.4][..]));
+        assert_eq!(q.row(1), (&[0u32; 0][..], &[0f32; 0][..]));
+        assert_eq!(q.row(2), (&[7u32][..], &[0.0f32][..]));
+        assert!(q.push_row(&[16], &[0.5], 16).is_err());
+    }
+
+    #[test]
+    fn plan_dense_rows_routes_identity_overflow_and_rejects_unsorted() {
+        let vocab = 6usize;
+        // row0: tau 0 (identity), row1: 3 kept > cap 2 (overflow), row2: 1 kept.
+        let probs = [
+            0.2f32, 0.2, 0.2, 0.2, 0.1, 0.1, //
+            0.3, 0.3, 0.3, 0.05, 0.03, 0.02, //
+            0.9, 0.02, 0.02, 0.02, 0.02, 0.02,
+        ];
+        let f = host_compact(&probs, vec![0.0, 0.3, 0.5], vec![1.0, 0.9, 0.9], vocab, 2);
+        assert_eq!(f.dense_slot, vec![0, 1, SPARSE_NONE]);
+        match f.row(2, vocab) {
+            TargetRowRef::Sparse { idx, val, .. } => {
+                assert_eq!(idx, &[0u32][..]);
+                assert_eq!(val, &[0.9f32][..]);
+            }
+            _ => panic!("row 2 must be sparse"),
+        }
+        match f.row(1, vocab) {
+            TargetRowRef::Dense { raw, .. } => assert_eq!(raw, &probs[vocab..2 * vocab]),
+            _ => panic!("row 1 must be dense"),
+        }
+        let mut bad = FastTargetRows {
+            tau: vec![0.1],
+            z: vec![1.0],
+            capacity: 2,
+            counts: vec![2],
+            idx: vec![5, 3],
+            val: vec![0.5, 0.5],
+            ..FastTargetRows::default()
+        };
+        assert!(bad.plan_dense_rows(vocab).is_err());
+    }
+
+    #[test]
+    fn cactus_disables_the_sparse_representation() {
+        let cfg = DflashSampleCfg { temp: 0.8, top_p: 0.9, top_k: 20, cactus_delta: 0.1 };
+        assert!(!dflash_sparse_target_enabled(&cfg));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -11626,7 +12779,7 @@ mod tests {
                 z.push(row.iter().filter(|&&p| p >= t).sum());
                 probs.extend_from_slice(&row);
             }
-            let fast = FastTargetRows { probs, tau, z };
+            let fast = FastTargetRows::dense(probs, tau, z);
             for (fast, label) in [(Some(&fast), "fast"), (None, "host")] {
                 let mut law = Vec::new();
                 sampled_target_row_into(&mut law, 1, vocab, fast, &logits, temp, top_k, top_p);

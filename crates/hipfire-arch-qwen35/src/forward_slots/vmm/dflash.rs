@@ -401,9 +401,7 @@ impl Qwen35VmmStore {
             if cfg.temp > 1e-6 {
                 let b = lane.df.block_size;
                 lane.sampled_draft = Some(DflashSampledDraft::new(b, config.vocab_size));
-                lane.sampled_target.probs.reserve(b * config.vocab_size);
-                lane.sampled_target.tau.reserve(b);
-                lane.sampled_target.z.reserve(b);
+                lane.sampled_target.reserve_rows(b, config.vocab_size, &cfg);
                 lane.sample_scratch.reserve(config.vocab_size);
             }
             // The lane owns no FWHT rotation buffers: the engine lends its

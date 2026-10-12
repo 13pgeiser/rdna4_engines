@@ -150,7 +150,7 @@ impl DflashVmmLaneState {
             policy,
             last_window,
             picks: Vec::with_capacity(block),
-            sampled_target: FastTargetRows { probs: Vec::new(), tau: Vec::new(), z: Vec::new() },
+            sampled_target: FastTargetRows::default(),
             sample_scratch: Vec::new(),
             sampled_draft: None,
             max_emit: 0,
