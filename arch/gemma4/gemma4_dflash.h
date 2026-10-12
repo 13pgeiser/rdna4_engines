@@ -146,6 +146,11 @@ struct Dflash1 {
 
     rad_op op_embed = 0, op_embed_ar = 0, op_qh = 0, op_qat = 0, op_qff = 0;
     rad_op op_anorm[MAX_LAYERS] = {}, op_fnorm[MAX_LAYERS] = {};
+    /* THE RESIDUAL ADD, THE NORM AND THE QUANTISER IN ONE LAUNCH where `rmsnorm_quant_fp8` is
+     * served (libr4d): op_anq[i] the attention input's -- layer 0's with no add, x as the
+     * embedding left it -- and op_fnq[i] the feed-forward input's. Zero where it is not, and the
+     * `add` / `rmsnorm` / `quant_act_fp8` chain is issued instead. */
+    rad_op op_anq[MAX_LAYERS] = {}, op_fnq[MAX_LAYERS] = {};
     rad_op op_qp[MAX_LAYERS] = {}, op_kp[MAX_LAYERS] = {}, op_vp[MAX_LAYERS] = {};
     rad_op op_op[MAX_LAYERS] = {}, op_qn[MAX_LAYERS] = {}, op_kn[MAX_LAYERS] = {};
     rad_op op_gu[MAX_LAYERS] = {}, op_gug[MAX_LAYERS] = {}, op_dn[MAX_LAYERS] = {};
@@ -361,6 +366,19 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                    RAD_NOWEIGHTS),
                {w.ffn}, {w.ffq, w.ffs});
 
+    /* x's norm under `gain`, quantised into hq|hs, in one launch; with `add` the fused_add_rms_norm
+     * form, x += h first. The row is the chain's function exactly -- the norm of the bf16-rounded
+     * sum, the codes of the bf16-rounded norm (libr4d/r4d_rows.cpp) -- and a draft is verified
+     * whatever it is. */
+    auto norm_quant = [&](rad_weight gain, bool add) -> rad_op {
+        const rad_op h = RAD_OP(b, "rmsnorm_quant_fp8",
+                                RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_embd),
+                                           RAD_F64("eps", g.eps), RAD_INT("group", RAD_FP8_BLOCK),
+                                           RAD_STR("dtype", g.dtype), RAD_F64("wadd", 0.0)),
+                                RAD_WEIGHTS(gain));
+        return add ? rw(b, h, {w.h, w.x}, {w.x, w.hq, w.hs}) : rw(b, h, {w.x}, {w.hq, w.hs});
+    };
+
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
         op_anorm[i] = rw(b, RAD_OP(b, "rmsnorm",
@@ -369,6 +387,7 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                        RAD_STR("dtype", g.dtype)),
                             RAD_WEIGHTS(w_anorm[i])),
                         {w.x}, {w.h});
+        op_anq[i] = norm_quant(w_anorm[i], l > 0);
         op_qp[i] = w_q[i].gemm(b, qrows, qd, g.n_embd, {w.hq, w.hs}, {w.q});
         op_kp[i] = w_k[i].gemm(b, qrows, kvd, g.n_embd, {w.hq, w.hs}, {w.k});
         op_vp[i] = w_v[i].gemm(b, qrows, kvd, g.n_embd, {w.hq, w.hs}, {w.v});
@@ -391,6 +410,7 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                        RAD_STR("dtype", g.dtype)),
                             RAD_WEIGHTS(w_fnorm[i])),
                         {w.x}, {w.h});
+        op_fnq[i] = norm_quant(w_fnorm[i], true);
         op_gu[i] = w_gu[i].gemm(b, qrows, 2 * g.n_ff, g.n_embd, {w.hq, w.hs}, {w.gate_up});
         /* The gate_up|silu|quant fold where it resolves, the pair where it does not --
          * rad_block_dflash2.h's rule, band included. */
@@ -582,8 +602,15 @@ inline void Dflash1::step(RadCtx* c, const RadBatch* batch) const {
         const int i = (int)l;
         const rad_op op_attn = cfg.full[i] ? op_attn_full : op_attn_swa;
 
-        RAD_ISSUE_N(c, op_anorm[i], T, brows(w.x, T), RAD_W(w_anorm[i]), brows(w.h, T));
-        RAD_ISSUE_N(c, op_qh, T, brows(w.h, T), brows(w.hq, T), brows(w.hs, T));
+        /* The attention input, with the last layer's residual add where one launch takes both. */
+        if (op_anq[i]) {
+            RAD_ISSUE_N(c, op_anq[i], T, l > 0 ? brows(w.h, T) : brows(w.x, T),
+                        l > 0 ? brows(w.x, T) : RAD_NONE, RAD_W(w_anorm[i]), brows(w.hq, T),
+                        brows(w.hs, T), RAD_NONE);
+        } else {
+            RAD_ISSUE_N(c, op_anorm[i], T, brows(w.x, T), RAD_W(w_anorm[i]), brows(w.h, T));
+            RAD_ISSUE_N(c, op_qh, T, brows(w.h, T), brows(w.hq, T), brows(w.hs, T));
+        }
         RAD_ISSUE_N(c, op_qp[i], T, brows(w.hq, T), brows(w.hs, T),
                     RAD_W(w_q[i].w), RAD_W(w_q[i].s), brows(w.q, T), RAD_NONE, w_q[i].bref());
         RAD_ISSUE_N(c, op_kp[i], T, brows(w.hq, T), brows(w.hs, T),
@@ -605,10 +632,14 @@ inline void Dflash1::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_op[i], T, brows(w.atq, T), brows(w.ats, T),
                     RAD_W(w_o[i].w), RAD_W(w_o[i].s), brows(w.h, T), RAD_NONE, w_o[i].bref());
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
-        RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h, T), brows(w.x, T));
-
-        RAD_ISSUE_N(c, op_fnorm[i], T, brows(w.x, T), RAD_W(w_fnorm[i]), brows(w.h, T));
-        RAD_ISSUE_N(c, op_qh, T, brows(w.h, T), brows(w.hq, T), brows(w.hs, T));
+        if (op_fnq[i]) {
+            RAD_ISSUE_N(c, op_fnq[i], T, brows(w.h, T), brows(w.x, T), RAD_W(w_fnorm[i]),
+                        brows(w.hq, T), brows(w.hs, T), RAD_NONE);
+        } else {
+            RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h, T), brows(w.x, T));
+            RAD_ISSUE_N(c, op_fnorm[i], T, brows(w.x, T), RAD_W(w_fnorm[i]), brows(w.h, T));
+            RAD_ISSUE_N(c, op_qh, T, brows(w.h, T), brows(w.hq, T), brows(w.hs, T));
+        }
         if (op_gug[i] && T <= gated_rows) {
             RAD_ISSUE_N(c, op_gug[i], T, brows(w.hq, T), brows(w.hs, T),
                         RAD_W(w_gu[i].w), RAD_W(w_gu[i].s), brows(w.ffq, T), brows(w.ffs, T),
@@ -623,7 +654,9 @@ inline void Dflash1::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_dn[i], T, brows(w.ffq, T), brows(w.ffs, T),
                     RAD_W(w_dn[i].w), RAD_W(w_dn[i].s), brows(w.h, T), RAD_NONE, w_dn[i].bref());
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
-        RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h, T), brows(w.x, T));
+        /* the residual add, unless the next layer's input norm takes it */
+        if (l + 1 == g.n_layer || !op_anq[i + 1])
+            RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h, T), brows(w.x, T));
     }
     RAD_ISSUE_N(c, op_final, T, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
 

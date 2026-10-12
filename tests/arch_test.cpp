@@ -3831,6 +3831,54 @@ TEST(gemma4_dflash_head_reads_the_fp8_copy_where_the_container_holds_one) {
     }
 }
 
+/* THE DRAFTER'S RESIDUAL ADD, NORM AND QUANTISER IN ONE LAUNCH (`rmsnorm_quant_fp8`): ten a draft
+ * pass over five layers, each layer's two inputs, layer 0's attention input taking x as the
+ * embedding left it -- and one `add` left, the last layer's, ahead of the final norm. Refused, the
+ * chain: two adds and two quantisers of x a layer. */
+TEST(gemma4_dflash_folds_the_residual_add_norm_and_quantiser_into_one_launch) {
+    const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadModelMeta meta = gemma4_moe_meta();
+        meta.n_kv   = (int)keys.size();
+        meta.kv_key = keys.data();
+        meta.kv_val = vals.data();
+        RadBuilder b;
+        if (refuse) b.refuse.insert("rmsnorm_quant_fp8");
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_spec = 15;
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        batch.draft_pass = 1;
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> ops = issued_ops(b, c);
+        CHECK_EQ(count_issued(ops, "rmsnorm_quant_fp8"), refuse ? 0 : 10);
+        CHECK_EQ(count_issued(ops, "add"), refuse ? 10 : 1);
+        /* x's quantiser twice a layer in the chain; the attention output's once a layer always */
+        CHECK_EQ(count_issued(ops, "quant_act_fp8"), refuse ? 15 : 5);
+        if (refuse) continue;
+
+        /* the delta then the residual x past layer 0; layer 0 reads x and adds nothing */
+        const uint32_t x = (uint32_t)buf_named(b, "df_x"), h = (uint32_t)buf_named(b, "df_h");
+        int k = 0;
+        for (const auto& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "rmsnorm_quant_fp8") continue;
+            REQUIRE(i.opd.size() == 6);
+            if (k++ == 0) {
+                CHECK_EQ(i.opd[0].handle, x);
+                CHECK_EQ((int)i.opd[1].kind, (int)RAD_OPK_NONE);
+            } else {
+                CHECK_EQ(i.opd[0].handle, h);
+                CHECK_EQ(i.opd[1].handle, x);
+            }
+        }
+    }
+}
+
 /* ============ gemma4: the prefill overlap -- two slices, the reductions on lane 1 ============ */
 
 namespace {

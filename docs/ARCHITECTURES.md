@@ -545,9 +545,11 @@ four, eight ranks) -- plus `pair_argmax` and the fusions: the two sandwich-norm 
 (`norm_add_norm`, `join_add_scale`), `expert_scale`, and `attn_paged_qrow`, the sliding layers'
 attention reading q where the fused qkv projection left it. The plugin declares each one's unfused
 form where nothing serves it -- the rmsnorm / add chain, `embed_lookup` + `mul`, a `cast` lifting q
-for `attn_paged` -- and the startup notes say which were taken. libr4d has h256/gqa2 and h512/gqa8
-rows as well, written for the dense 31B; with gemma4k first the 26B-A4B runs on the kernels it was
-measured with.
+for `attn_paged` -- and the startup notes say which were taken. The drafter's residual add, norm
+and fp8 quantiser of x are one libr4d `rmsnorm_quant_fp8` launch an input (ten a draft pass), and
+the `add` / `rmsnorm` / `quant_act_fp8` chain where nothing serves it. libr4d has h256/gqa2 and
+h512/gqa8 rows as well, written for the dense 31B; with gemma4k first the 26B-A4B runs on the
+kernels it was measured with.
 Without `gemma4k` at all, the full layers have no kernel at four and eight ranks, and a drafter head
 sharded over more than one rank has no `pair_argmax`.
 
