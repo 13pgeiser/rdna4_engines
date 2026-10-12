@@ -15,6 +15,17 @@ teacher.
 Usage (ROCm/CUDA torch):
   python3 kld_teacher.py --checkpoint DIR --tokens-from REF.kldref \
       --output TEACHER.logits [--max-chunks N] [--device cuda]
+
+Conditions:
+  --checkpoint must contain the pinned source safetensors, including BF16
+  routed experts and the PLE shards; an MQ4 engine artifact is not a substitute.
+  For a CPU run, pass --device cpu. --max-chunks bounds the input corpus, not
+  the decoder depth: every selected chunk still traverses all source layers.
+  References with carry_kv enabled are unsupported; chunks start independently.
+  BF16 weights are used with F32 activations, not source-BF16 activation
+  rounding, so this is not a bf16/bf16 numerical-floor measurement.
+  Keep the raw logits for full-vocabulary analysis; qwen4_kld import reduces
+  them to a top-k HFKLDR reference.
 """
 
 from __future__ import annotations
