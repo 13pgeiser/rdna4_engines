@@ -47,12 +47,16 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * the same block size -- libr4d's is 16 for all of them -- but a hybrid model with a
      * sliding-window group served by a different kernel is exactly the case §7.2 is written for,
      * and lcm is the answer that is right for both. */
-    bool has_linear = false;
+    bool has_linear = false, has_window = false;
     for (const KVGroupInfo& kg : prog.kv_groups) {
         if (kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW) {
             if (kg.block_size > 0) {
                 g.attn_block = lcm64(g.attn_block, kg.block_size);
                 note(g.why, "attn_block", kg.block_size, kg.name.c_str());
+                /* A drafter's window is recomputed by draft refill; only the trunk's needs a
+                 * snapshot for a prefix hit to resume. */
+                if (kg.decl.kind == RAD_KV_WINDOW && !kg.layers.empty() && !kg.drafter)
+                    has_window = true;
             }
         } else {
             has_linear = true;
@@ -123,11 +127,14 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * because down can reach zero and because a longer interval costs retention, not correctness.
      *
      * No linear state means no checkpoints: the interval is a property of a state kind that this
-     * model does not have, and pretending otherwise would split chunks for nothing. */
-    if (has_linear && cfg.checkpoint_interval > 0)
+     * model does not have, and pretending otherwise would split chunks for nothing. The one
+     * exception is a trunk window under a prefix cache, which snapshots the window behind a
+     * prompt's tail (window_ckpt) and does not split chunks for it. */
+    if ((has_linear || (has_window && cfg.prefix_cache)) && cfg.checkpoint_interval > 0)
         g.checkpoint_interval = align_up(cfg.checkpoint_interval, g.quantum);
     else
         g.checkpoint_interval = 0;
+    g.window_ckpt = !has_linear && g.checkpoint_interval > 0;
 
     /* One full quantum has to fit in one step. Below that, every chunk is short, no chunk ever
      * ends on a boundary, and the checkpoint lands wherever the step happened to end -- which is
@@ -150,8 +157,10 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * always written, and that clamp comes FIRST. Printing only the budget would hide it -- every
      * budget above the interval runs the same chunk length, so a sweep over them reads as
      * "prefill is flat against the chunk" when nothing about the chunk changed. The clamp itself
-     * is correct; a budget that silently does nothing is what has to be visible. */
-    const int64_t eff = (g.checkpoint_interval > 0 && g.checkpoint_interval < cfg.max_tok)
+     * is correct; a budget that silently does nothing is what has to be visible. A window
+     * snapshot is taken at the prompt's tail and splits nothing. */
+    const int64_t eff = (g.checkpoint_interval > 0 && !g.window_ckpt &&
+                         g.checkpoint_interval < cfg.max_tok)
                       ? g.checkpoint_interval : cfg.max_tok;
     RAD_INFO("chunk geometry: quantum %lld (attn block %lld, state chunk %lld), checkpoint "
              "interval %lld, max_tok %lld -> prefill chunks of at most %lld%s",

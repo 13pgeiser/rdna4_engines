@@ -85,7 +85,8 @@ static const Flag g_flags[] = {
     { "--prefix-cache-host-mib", "N",   "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. 0 is off. Part of it holds\n"
-    "                                    linear-state snapshots on a hybrid model; startup says how many" },
+    "                                    snapshots on a hybrid or sliding-window model;\n"
+    "                                    startup says how many" },
     { "--prefix-cache-dir",   "DIR",    "where the disk tier keeps them. Not --weights-disk-tier, which is\n"
     "                                    about WEIGHTS" },
     { "--prefix-cache-disk-mib", "N",   "and copy them on to disk under --prefix-cache-dir, up to N MiB,\n"
@@ -104,7 +105,8 @@ static const Flag g_flags[] = {
      * 2 for the whole server rather than 2 x --max-num-seqs. At the default 8 slots and
      * 8 sequences that is one snapshot a sequence, which is what an append-only chat wants --
      * the next turn's hit lands at the end of the last one. */
-    { "--checkpoint-slots",   "N",      "linear-state snapshots retained IN TOTAL (not "
+    { "--checkpoint-slots",   "N",      "linear-state or sliding-window snapshots "
+                                          "retained IN TOTAL (not "
                                           "per sequence), in pinned host memory; compare "
                                           "against --max-num-seqs" },
     { "--no-prefix-cache",    nullptr,  "disable prefix caching" },

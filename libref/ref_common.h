@@ -418,6 +418,17 @@ static inline float act_gelu(float x) {
     return 0.5f * x * (1.0f + std::erf(x * 0.70710678118654752f));
 }
 
+/* The tanh approximation (PyTorch's gelu_tanh / gemma's gelu_pytorch_tanh) -- the form gated
+ * feed-forwards are trained with. The constants are the standard fit and are the same two the
+ * gemm_nt_bias "gelu_tanh" epilogue uses (ref_gemm.cpp), which is a GEMM-local copy of this same
+ * formula; both compute the identical function, so a GELU-gated FFN and a tanh-gelu epilogue agree
+ * to the last bit. Kept here rather than `#include`d into ref_gemm.cpp so the elementwise header
+ * stays self-contained. */
+static inline float act_gelu_tanh(float x) {
+    const float k0 = 0.7978845608028654f, k1 = 0.044715f;
+    return 0.5f * x * (1.0f + std::tanh(k0 * (x + k1 * x * x * x)));
+}
+
 /* softplus in the two-sided form, with the large-x cutoff FLA and libr4d both use: above the
  * threshold log1p(e^x) IS x to every bit f32 holds, and evaluating it costs an overflow. */
 static inline float act_softplus(float x, float thr) {

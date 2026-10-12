@@ -86,6 +86,11 @@ struct VocabBuild {
 
     /* Diagnostics only: what rad-convert thought it was reading. Not baked. */
     std::string source;
+
+    /* The ids the checkpoint's generation_config.json names as eos_token_id, which the container
+     * carries as metadata (`generation.eos_token_id`) rather than in the vocabulary section. The
+     * engine fills it from there before load(); not baked. */
+    std::vector<int32_t> eos_ids;
 };
 
 /* ================================================================== the loaded vocab */

@@ -623,6 +623,22 @@ int Vocab::load(VocabBuild b) {
             RAD_INFO("vocab: end-of-generation also on %s (a control token the container declares "
                      "neither as eos nor eot; without this a turn ending on it runs on)",
                      added.c_str());
+
+        /* AND WHAT THE CHECKPOINT ITSELF NAMES. generation_config.json's eos_token_id is the
+         * model's own list of tokens a generation ends on, and the one that is not a guess:
+         * Gemma 4 names <|tool_response> there beside <eos> and <turn|>, because after its calls
+         * the model writes it and waits for the response -- a turn that runs past it answers
+         * its own call. Every id in range is honoured, as transformers honours them. */
+        std::string named;
+        for (int32_t id : b_.eos_ids) {
+            if (id < 0 || id >= (int32_t)b_.tokens.size()) continue;
+            if (std::find(eog_.begin(), eog_.end(), id) != eog_.end()) continue;
+            eog_.push_back(id);
+            named += (named.empty() ? "" : " ") + b_.tokens[id] + "=" + std::to_string(id);
+        }
+        if (!named.empty())
+            RAD_INFO("vocab: end-of-generation also on %s (named by the checkpoint's "
+                     "generation_config.json)", named.c_str());
     }
 
     /* The encoder: the chain compiled and the tables flattened. A pattern the regex compiler

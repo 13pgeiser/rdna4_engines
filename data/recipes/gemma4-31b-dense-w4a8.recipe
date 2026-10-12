@@ -1,0 +1,27 @@
+# gemma4-31b-dense-w4a8.recipe -- Gemma 4 31B dense (text), from its CT-INT4 (w4a16)
+# checkpoint, as the w4a8 container serves it.
+#
+#   rad-convert <gemma-4-31B-it-qat-w4a16-ct checkpoint> \
+#       --recipe data/recipes/gemma4-31b-dense-w4a8.recipe -o gemma4-31b-dense-w4a8.rad
+#
+# The checkpoint's GEMM weights are CT-INT4 (group-32, a bf16 scale a 32 codes, no zero point),
+# imported as such (core/format/checkpoint.h); the rules re-quantise them to group-128 int4 with an
+# f16 scale, the grid the w4a8 kernels read. The norms
+# (input / post-attention / pre- and post-feedforward layernorms, the q/k head norms) and the
+# embedding + lm_head are bf16 and are kept as the checkpoint holds them -- a weight no rule
+# matches is served in its checkpoint form. A rank-1 weight a pattern happens to match is declined
+# by the quantiser and kept as it is, so the norms stay bf16 even under a broad pattern.
+#
+# With the assistant (draft) head merged in -- add `--draft-model <gemma-4-31B-it-assistant>` --
+# its weights are declared as `mtp.*` and no rule below matches them: the head is served bf16 as
+# Google ships it (0.9 GB). The patterns are anchored, so `blk.*` never reaches `mtp.blk.*`.
+# Its lm_head (`mtp.output.weight`, 0.5 GB, read once a draft round) may be made int8 with
+#     mtp.output.weight  rtn  codes=i8 group=128 scale=bf16 clamp=sym
+# and the head then reads it through logits_gemm_i8; a draft only proposes, the trunk verifies.
+
+blk.*.attn_q.weight       rtn  codes=i4 group=128 scale=f16
+blk.*.attn_k.weight       rtn  codes=i4 group=128 scale=f16
+blk.*.attn_v.weight       rtn  codes=i4 group=128 scale=f16
+blk.*.attn_o.weight       rtn  codes=i4 group=128 scale=f16
+blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16
+blk.*.ffn_down.weight     rtn  codes=i4 group=128 scale=f16

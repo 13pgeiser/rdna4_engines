@@ -14,6 +14,7 @@ into the id an architecture plugin claims.
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
+| `arch/gemma4_bf16` | `gemma4_bf16` | `i4` (group-128 codes, f16 scale) | Gemma 4 31B dense (text): two attention classes — sliding-window and proportional-RoPE global (`attention_k_eq_v`) — over one GemmaRMSNorm stream, GELU ffn, two KV groups, softcapped logits, tied scaled embedding; served from a CT-INT4 (QAT w4a16) checkpoint. Optional draft head: Google's assistant (`rad-convert --draft-model`), a serial head with no cache of its own (`rad_drafter_shared_kv`) |
 
 This document is the geometry of each, and the handful of readings that are **arithmetically
 silent** — wrong in a way that produces fluent output and no error anywhere.

@@ -73,6 +73,11 @@ struct KVGroupPlan {
     int64_t     bytes_per_state = 0;   /* LINEAR/CONV: per sequence, every layer */
     int64_t     conv_slots = 0;        /* CONV: conv_width - 1 + n_spec */
     int64_t     window_blocks = 0;     /* WINDOW: the per-sequence block cap */
+    /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot). Only a trunk
+     * group of a model with no linear state: a prefix hit there resumes at a checkpoint from the
+     * window behind it. A drafter's own window is recomputed by draft refill, and a model with
+     * linear state re-prefills a hit on a windowed trunk, so neither snapshot would ever be read. */
+    bool        win_snap = false;
 
     int64_t     n_blocks = 0;          /* paged groups: blocks carved from the pool */
     /* rad_kv_group_zero: this rank keeps no cache for the group. The plan exists for its position
@@ -207,8 +212,31 @@ public:
 
     /* Grow the sequence's mapping to cover `n_tokens` in every group. Unshares a shared partial
      * block first (copy-on-write) and appends the copy request to the pending list.
-     * RAD_E_FULL when a group's free list is empty -- the caller preempts and retries. */
-    int  ensure(uint64_t seq, int64_t n_tokens);
+     * RAD_E_FULL when a group's free list is empty -- the caller preempts and retries.
+     *
+     * `keep_from` is the position of the FIRST query the coming step runs (the scheduler's
+     * n_computed); -1 means the sequence's current end. A WINDOW group recycles only the blocks no
+     * query at or past it can read -- below keep_from - window + 1 -- and NOT the blocks below the
+     * window of the step's END: a prefill chunk longer than a block would otherwise lose the keys
+     * its first rows attend to (a chunk of C tokens from position 0 rebased the table at
+     * ceil(C/block) - window_blocks and left every position below it with no KV at all). */
+    int  ensure(uint64_t seq, int64_t n_tokens, int64_t keep_from = -1);
+
+    /* A WINDOW group's caps: a sequence holds its window behind the step's first query AND the
+     * step's own tokens (window_blocks + ceil(max_tok / block) + 1 at most), and one step carries
+     * at most max_tok tokens across every sequence in it, so the pool needs max_seqs windows plus
+     * one step's worth on top. */
+    int64_t window_seq_cap(const KVGroupPlan& p) const;
+    int64_t window_pool_cap(const KVGroupPlan& p) const;
+
+    /* GIVE BACK A FINISHED CHUNK'S BLOCKS once it is committed. ensure() keeps a chunk's own blocks
+     * beside the window behind its first query, and only the sequence's NEXT ensure() recycles
+     * them -- so a prefill waiting a step for its next chunk would sit on a whole chunk of window
+     * blocks while other sequences prefill, and eight of them exhaust the pool (measured on
+     * Gemma 4: "the KV pool cannot hold 12480 tokens" with eight 16K prompts). Called by the
+     * scheduler when it advances n_computed: keep_from is the new n_computed, the first query any
+     * later step can run. */
+    void trim_window(uint64_t seq, int64_t keep_from);
 
     /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a whole multiple of the group's
      * block size: a partial block is never shared, because the next token written into it would
@@ -462,8 +490,35 @@ public:
      * and the restore has to precede the step that consumes it, and both are ordered by the
      * stream rather than by waiting. One pitched copy a stateful group between the card and the
      * store, at the link's rate. RAD_E_INVAL on a bad slot or an unknown sequence. */
-    int checkpoint_save(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s);
-    int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s);
+    int checkpoint_save(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
+                        const std::vector<int32_t>* win = nullptr);
+    int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
+                           const std::vector<int32_t>* win = nullptr);
+
+    /* ---------------- window snapshots (the sliding-window half of a prefix hit) ----------------
+     * A WINDOW group keeps only the blocks its window can still read, so no block list from the
+     * prefix cache describes it. What a later prompt that extends a cached prefix at position P
+     * needs from it is exactly the window behind P: blocks [lo, P/B) with
+     * lo = max(0, P/B - (window_blocks - 1)) -- the floor recycle_window keeps for a query at P.
+     * A checkpoint slot therefore carries, after the linear state, window_blocks pages a WINDOW
+     * group (every layer, layer-major rows), and a hit at a checkpoint restores them into fresh
+     * blocks seeded at that floor.
+     *
+     * has_window_snapshot(): this rank's slot carries a window section. window_rows() names, from
+     * the LEADER's table, the block ids [lo, P/B) of every non-zero snapshot group (win_snap) in
+     * plans() order, each group padded with -1 to window_blocks -- one vector every rank addresses
+     * with its own pool, because followers keep no sequence tables. False when the sequence does
+     * not hold that range (it is gone, or its floor moved past lo). seed_window() gives a sequence
+     * with an empty table in each snapshot group the blocks [lo, P/B) a restore will fill, before
+     * the ensure that extends it; any other WINDOW group starts at the floor that ensure sets. */
+    bool has_window_snapshot() const { return window_ck_bytes_ > 0; }
+    bool window_rows(uint64_t seq, int64_t pos, std::vector<int32_t>* out) const;
+    int  seed_window(uint64_t seq, int64_t pos);
+    /* The floor and end (block indices) of the window a query at `pos` reads in a group. */
+    static int64_t window_lo(const KVGroupPlan& p, int64_t pos) {
+        const int64_t b = pos / p.block_size - (p.window_blocks - 1);
+        return b > 0 ? b : 0;
+    }
 
     /* Byte address of a state slot, for the slot-mapping builder. Null when the pool has no
      * host-visible base (a device pool), which is the normal case -- the offset is what the step
@@ -486,7 +541,7 @@ private:
 
     /* One traversal serving both checkpoint directions; see checkpoint_save. */
     int checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t ck_slot, bool save,
-                        RadStream s);
+                        RadStream s, const std::vector<int32_t>* win);
 
     struct Seq {
         uint64_t id = 0;
@@ -509,6 +564,8 @@ private:
     void drop_state(int32_t g, int32_t s);
     Seq* find(uint64_t seq);
     const Seq* find(uint64_t seq) const;
+    /* Recycle a WINDOW group's blocks no query at or past `keep_from` can read. */
+    void recycle_window(Seq* s, int64_t keep_from);
 
     std::vector<KVGroupPlan> plans_;
     std::vector<std::vector<int32_t>> free_blocks_;   /* per group */
@@ -524,6 +581,7 @@ private:
     HostArena* ck_store_ = nullptr;                   /* set_checkpoint_store */
     int64_t   ck_rank_off_ = 0;
     int64_t   checkpoint_bytes_ = 0;
+    int64_t   window_ck_bytes_ = 0;   /* the window section of checkpoint_bytes_ */
     std::vector<StateClear> clears_;                  /* grabbed slots the engine must zero */
     void*     pool_base_ = nullptr;
     BundleComparison bundling_;

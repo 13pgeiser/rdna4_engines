@@ -1272,6 +1272,32 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     return RAD_OK;
 }
 
+/* A SERIAL HEAD THAT READS THE TRUNK'S CACHE AND KEEPS NONE (rad_builder.h). Checked here for the
+ * reason declare_drafter checks everything: the driver only reaches the head once a request
+ * speculates, and a head staged the wrong way round costs acceptance and says nothing. */
+int Builder::drafter_shared_kv(int pos_offset) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_shared_kv after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_SERIAL) {
+        err(RAD_E_STATE, "drafter_shared_kv: %s. Only a SERIAL head runs round after round at one "
+                         "position; declare it with rad_declare_drafter first.",
+            prog_.drafter.kind == RAD_DRAFT_NONE ? "no drafter is declared"
+                                                 : "the declared drafter is a BLOCK drafter");
+        return RAD_E_STATE;
+    }
+    if (pos_offset != 0 && pos_offset != 1) {
+        err(RAD_E_INVAL, "drafter_shared_kv '%s': pos_offset %d. The rows sit at the committed "
+                         "position (0) or one past it (1); nothing else names a position the head "
+                         "was trained at.", prog_.drafter_name.c_str(), pos_offset);
+        return RAD_E_INVAL;
+    }
+    prog_.drafter_shared_kv  = true;
+    prog_.drafter_pos_offset = pos_offset;
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -1522,6 +1548,8 @@ void Builder::finish_kv_groups() {
             default: break;
         }
         std::sort(gi.layers.begin(), gi.layers.end());
+        gi.drafter = prog_.meta.n_layers > 0 && !gi.layers.empty() &&
+                     gi.layers.front() >= prog_.meta.n_layers;
 
         /* A group nothing is bound to is a group the block manager cannot size: how many state
          * instances a sequence owns is the layer count, and assuming one would make the page size
@@ -1628,6 +1656,19 @@ int Builder::finish() {
     finish_weight_uses();
     finish_layouts();
     finish_kv_groups();
+    /* A HEAD DECLARED TO KEEP NO CACHE OF ITS OWN (rad_drafter_shared_kv) is given no history pass:
+     * the scheduler owes it none. A KV group bound at one of its layers -- meta.n_layers and above
+     * are the drafter's -- would then be read without anything ever having written it. */
+    if (prog_.drafter_shared_kv)
+        for (size_t g = 1; g < prog_.kv_groups.size(); ++g)
+            for (int l : prog_.kv_groups[g].layers)
+                if (l >= prog_.meta.n_layers) {
+                    err(RAD_E_STATE, "drafter '%s' keeps no cache of its own (rad_drafter_shared_kv) "
+                                     "and its layer %d is bound to KV group '%s', which no pass "
+                                     "would ever write", prog_.drafter_name.c_str(), l,
+                        prog_.kv_groups[g].name.c_str());
+                    break;
+                }
     finish_buffer_liveness();
 
     int s = plan_buffers(prog_, &bufrep_);
@@ -1760,6 +1801,11 @@ int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
 int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_drafter(d);
+}
+
+int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_shared_kv(pos_offset);
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

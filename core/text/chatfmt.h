@@ -32,10 +32,21 @@
  * the raw text (optionally CDATA-wrapped), any other type is JSON, and text that does not parse as
  * JSON is taken raw -- a model writing into an XML tag writes Python as often as JSON.
  *
- * The analyser also recognises formats outside this family (a JSON object per call, JSON
- * arguments inside a tag, call ids). For those chat_format_from_template keeps the reasoning split
- * and names why tool calls are refused, and a model that needs one gets it by adding the shape to
- * the parser, not by a fallback. */
+ * THE OBJECT FAMILY writes a call as its name and one object holding the arguments
+ * (ChatArgs::Object):
+ *
+ *   Gemma 4              <|tool_call>call:NAME{key:<|"|>text<|"|>,n:3}<tool_call|>
+ *
+ * The object is JSON or a dialect of it -- strings between two declared delimiters with their
+ * text verbatim, keys written bare -- and the arguments a client receives are that object in
+ * JSON. Here the values carry their own types, so no schema is consulted to read them; a bare
+ * word that is no JSON literal or number is read as a string, as a typed argument that is not
+ * JSON is in the tagged family.
+ *
+ * The analyser also recognises formats outside these families (a JSON object per call with its
+ * name inside it, call ids). For those chat_format_from_template keeps the reasoning split and
+ * names why tool calls are refused, and a model that needs one gets it by adding the shape to the
+ * parser, not by a fallback. */
 #pragma once
 #include "rad_internal.h"
 
@@ -68,6 +79,12 @@ enum class ChatThink : uint32_t {
     Never      = 2,  /* the model opens its own block, if any */
 };
 
+/* How a call's arguments are written. The numbering is the ABI's (RAD_CHAT_ARGS_*). */
+enum class ChatArgs : uint32_t {
+    Tagged = 0,  /* each argument in its own tags: arg_prefix NAME .. VALUE arg_value_suffix */
+    Object = 1,  /* one object after the name: `{` key `:` value, ... `}` */
+};
+
 struct ChatFormat {
     std::string name;                 /* for logs: "plugin:<arch>" or "template" */
 
@@ -83,6 +100,10 @@ struct ChatFormat {
      * Must name the call opener (`call_open`) when non-empty. */
     std::vector<std::string> reasoning_breaks;
     ChatThink   reasoning_in_prompt = ChatThink::FromPrompt;
+    /* A block may also open later in the reply -- after the answer, between calls -- and is read
+     * as reasoning there; a close with no block open is dropped. Gemma 4 writes an empty block
+     * after its answer now and then, and a lone close. Needs `reasoning_open`. */
+    bool        reasoning_anywhere = false;
 
     /* ------------------------------------------------------------------ tool calls
      * `name_prefix` is what opens a call (after `call_open`, when there is one). Empty means the
@@ -94,8 +115,18 @@ struct ChatFormat {
     /* Around EACH call: "<tool_call>\n", "</tool_call>". When set, a call written without it --
      * name_prefix alone -- is still read as a call, leniently (chatparse.h). */
     std::string call_open, call_close;
-    std::string name_prefix, name_suffix;     /* "<function=", ">\n" */
-    std::string call_end;                     /* "</function>\n" */
+    /* "<function=", ">\n". In the object family name_suffix may be empty: the name then ends
+     * where the object begins, at its `{`. */
+    std::string name_prefix, name_suffix;
+    std::string call_end;                     /* "</function>\n"; may be empty for an object */
+
+    /* How the arguments are written. Object: the arg_* fields below are empty, and these three
+     * describe the object's dialect -- a string delimiter besides JSON's `"`, between which the
+     * text is verbatim ("<|\"|>" twice for Gemma 4; empty for JSON strings only), and whether a
+     * key may be written bare. */
+    ChatArgs    args_form = ChatArgs::Tagged;
+    std::string object_string_open, object_string_close;
+    bool        object_bare_keys = false;
 
     std::string arg_prefix;                   /* "<parameter=" */
     std::string arg_name_suffix;              /* ">\n"   (MiniCPM: empty, the value prefix ends it) */
@@ -115,6 +146,7 @@ struct ChatFormat {
 
     bool has_reasoning() const { return !reasoning_close.empty(); }
     bool has_tools() const { return !name_prefix.empty(); }
+    bool object_args() const { return args_form == ChatArgs::Object; }
 };
 
 /* Can the streaming parser run this format? RAD_OK, or RAD_E_UNSUPPORTED with *why naming the

@@ -41,7 +41,7 @@ add_library(rad_legacy_toolparse STATIC ${CMAKE_CURRENT_SOURCE_DIR}/legacy/toolp
                                         ${CMAKE_CURRENT_SOURCE_DIR}/legacy/chatdiff.cpp)
 target_link_libraries(rad_legacy_toolparse PUBLIC rad_core)
 target_include_directories(rad_legacy_toolparse PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/legacy)
-set(RAD_TESTS_WITH_LEGACY chatparse_test)
+set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 
 # relayout_parity_test holds each kernel library's relayout of libquant's planes to the recorded
 # hash of the bytes that library stores. libr4d needs a HIP toolchain to build and its layouts do

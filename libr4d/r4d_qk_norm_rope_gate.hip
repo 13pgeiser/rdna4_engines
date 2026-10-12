@@ -211,11 +211,12 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
 // addresses are never read.
 //
 // THE ARITHMETIC IS r4d_model_bf16.hip's rope_kernel, LINE FOR LINE, and that is what makes the
-// fusion bit-for-bit rather than merely close: `1.0f / powf(theta, 2i/rot)`, the position divided
-// by `rscale` in f32, `sincosf`, and the products consumed in f32 by the caller.  Changing any of
-// those here silently changes the model's output -- a different rope is a different model.
+// fusion bit-for-bit rather than merely close: `1.0f / powf(theta, 2i/den)`, where `den` is the
+// ladder's width (`rot` for `rotary`, `head_dim` for `head`), the position divided by `rscale`
+// in f32, `sincosf`, and the products consumed in f32 by the caller.  Changing any of those here
+// silently changes the model's output -- a different rope is a different model.
 __global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
-    const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, float theta,
+    const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, int den, float theta,
     float rscale, int cs_f32, int pos_i64, RadYarn yarn) {
   const int m = blockIdx.x;
   const long pp = pos_i64 ? ((const long*)POS)[m] : (long)((const int*)POS)[m];
@@ -227,7 +228,7 @@ __global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
   const float p = (float)pp / (rscale != 0.0f ? rscale : 1.0f);
   const size_t o = (size_t)pp * rot;
   for (int i = threadIdx.x; i < half; i += (int)blockDim.x) {
-    const float inv = yarn.frequency(1.0f / powf(theta, (float)(2 * i) / (float)rot), i);
+    const float inv = yarn.frequency(1.0f / powf(theta, (float)(2 * i) / (float)den), i);
     float c, s;
     sincosf(p * inv, &s, &c);
     if (yarn.factor != 0.0f) { c *= yarn.magnitude; s *= yarn.magnitude; }
@@ -396,12 +397,25 @@ static int rad_rope_table_body(const RadArgs* args, const R4dSink& sk) {
   if (M < 1 || rot < 2 || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
   if (r4d_numel(cs) % rot) return R4D_NO(RAD_E_SHAPE);
 
+  /* `ladder`: `rotary` (default) measures the base ladder in `rot`; `head` in `head_dim`, the
+   * proportional variant. `rope_table` has no head_dim by default, so `head` needs the parameter. */
+  const long long head_dim = r4d_geti_or(args, "head_dim", 0);
+  const char* lad = r4d_gets(args, "ladder");
+  long long den = rot;
+  if (lad) {
+      if (!std::strcmp(lad, "head")) {
+          if (head_dim <= 0) return R4D_NO(RAD_E_SHAPE);
+          den = head_dim;
+      } else if (std::strcmp(lad, "rotary") && std::strcmp(lad, "head"))
+          return R4D_NO(RAD_E_UNSUPPORTED);
+  }
+
   const float theta  = (float)r4d_getf(args, "theta", 10000.0);
   const float rscale = (float)r4d_getf(args, "scale", 1.0);
   const RadYarn yarn = rad_yarn_args(args);
   if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && rscale != 1.0f)) return R4D_NO(RAD_E_INVAL);
   return R4D_EMIT(sk, r4d_qk_rope_table_kernel, dim3((int)M), dim3(64), 0,
-                  r4d_p(po), r4d_wp(cs), (long)(r4d_numel(cs) / rot), (int)rot, theta, rscale,
-                  cs->dtype == RAD_F32 ? 1 : 0, po->dtype == RAD_I64 ? 1 : 0, yarn);
+                  r4d_p(po), r4d_wp(cs), (long)(r4d_numel(cs) / rot), (int)rot, (int)den, theta,
+                  rscale, cs->dtype == RAD_F32 ? 1 : 0, po->dtype == RAD_I64 ? 1 : 0, yarn);
 }
 R4D_ENTRY(r4d_rad_rope_table, rad_rope_table_body)

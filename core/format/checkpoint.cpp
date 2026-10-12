@@ -547,6 +547,44 @@ void Checkpoint::detect_import() {
         else
             import_why_ = "Quark's weight scheme here is not MXFP4 (fp4, per_group 32, e8m0 scales) "
                           "throughout, which is the one this reads";
+    } else if (qm == "compressed-tensors") {
+        /* COMPRESSED-TENSORS' PACK-QUANTIZED INT4, symmetric and grouped -- Google's Gemma 4 QAT
+         * release (w4a16-ct) is one. Every config group must say so: a zero point, act-order, a
+         * dynamic or activation scheme would each change what a code means. */
+        std::vector<std::string> groups;
+        const std::string cg = "quantization_config.config_groups.";
+        for (const std::string& k : meta_.keys)
+            if (k.rfind(cg, 0) == 0) {
+                const std::string g = k.substr(cg.size(), k.find('.', cg.size()) - cg.size());
+                if (std::find(groups.begin(), groups.end(), g) == groups.end()) groups.push_back(g);
+            }
+        std::string why;
+        int64_t group = 0;
+        if (qc("format") != "pack-quantized")
+            why = "its format is '" + qc("format") + "', and pack-quantized is the one this reads";
+        if (groups.empty() && why.empty()) why = "its quantization_config names no config group";
+        for (const std::string& g : groups) {
+            if (!why.empty()) break;
+            const std::string w = "config_groups." + g + ".weights.";
+            const std::string gs = qc(w + "group_size");
+            const long long gn = gs.empty() ? 0 : std::atoll(gs.c_str());
+            if (qc("config_groups." + g + ".format") != "pack-quantized" ||
+                qc(w + "num_bits") != "4" || qc(w + "type") != "int" || qc(w + "symmetric") != "1" ||
+                qc(w + "strategy") != "group" || qc(w + "dynamic") != "0" || gn <= 0 ||
+                !qc(w + "actorder").empty() || any_under("config_groups." + g + ".input_activations."))
+                why = "config group '" + g + "' is not symmetric 4-bit int weights in groups, packed, "
+                      "with no act-order and unquantised activations, which is the one this reads";
+            else if (group && gn != group)
+                why = "its config groups state different group sizes";
+            else
+                group = gn;
+        }
+        if (why.empty()) {
+            import_ = Import::CtInt4;
+            ct_group_ = group;
+        } else {
+            import_why_ = "compressed-tensors: " + why;
+        }
     }
     /* THE TOOL'S DESCRIPTION IS KEPT, UNDER ANOTHER NAME. A plugin reads quantization_config as
      * the statement of the format it serves (qwen35_fp8 checks quant_method is "fp8"), and an
@@ -590,6 +628,53 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         *codes = &sliced_.back();
         sliced_.push_back(std::move(x));
         *scale = &sliced_.back();
+        imported_[name] = { *codes, *scale };
+        return RAD_OK;
+    }
+
+    if (import_ == Import::CtInt4) {
+        /* CT-INT4: `X.weight` is shipped as X.weight_packed (i32 [N, K/8], eight codes a word from
+         * the low bits, unsigned about 8) and X.weight_scale ([N, K/group]). The words are the
+         * logical [N, K] code matrix in row order already; only the offset is left for the
+         * relayout. A layer the config ignores is an ordinary X.weight. */
+        const std::string suffix = ".weight";
+        if (name.size() <= suffix.size() ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            return RAD_E_NOTFOUND;
+        const SrcTensor* pk = find(name + "_packed");
+        if (!pk) return RAD_E_NOTFOUND;
+        const SrcTensor* sc = find(name + "_scale");
+        const std::string what = "'" + pk->name + "'";
+        if (pk->rad_dtype != RAD_I32 || pk->shape.size() != 2)
+            return refuse(RAD_E_FORMAT, what + " is not an int32 [N, K/8] matrix");
+        if (find(name + "_zero_point"))
+            return refuse(RAD_E_UNSUPPORTED, what + " has a zero point beside it, which a symmetric "
+                                             "config does not; an asymmetric weight is not read");
+        const int64_t N = pk->shape[0], K = pk->shape[1] * 8;
+        if (K % ct_group_)
+            return refuse(RAD_E_SHAPE, what + " has " + std::to_string(K) + " columns, not whole "
+                                       "groups of " + std::to_string(ct_group_));
+        if (!sc || sc->shape.size() != 2 || sc->shape[0] != N || sc->shape[1] != K / ct_group_ ||
+            (sc->rad_dtype != RAD_F16 && sc->rad_dtype != RAD_BF16 && sc->rad_dtype != RAD_F32))
+            return refuse(RAD_E_FORMAT, what + " has no float [" + std::to_string(N) + ", " +
+                                        std::to_string(K / ct_group_) + "] '" + name +
+                                        "_scale' beside it");
+        if (const SrcTensor* ws = find(name + "_shape")) {
+            int64_t dims[2] = { 0, 0 };
+            for (int i = 0; i < 2 && i < (int)ws->numel(); ++i)
+                dims[i] = (int64_t)rad_load_f32(ws->data, ws->rad_dtype, i);
+            if (ws->numel() != 2 || dims[0] != N || dims[1] != K)
+                return refuse(RAD_E_SHAPE, "'" + ws->name + "' does not state the [" +
+                                           std::to_string(N) + ", " + std::to_string(K) +
+                                           "] its codes hold");
+        }
+        SrcTensor c = *pk;
+        c.rad_dtype = RAD_I4;
+        c.shape = { N, K };
+        c.ct_group = ct_group_;
+        sliced_.push_back(std::move(c));
+        *codes = &sliced_.back();
+        *scale = sc;
         imported_[name] = { *codes, *scale };
         return RAD_OK;
     }
@@ -965,6 +1050,28 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
             rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
         }
+    } else if (p0.ct_group) {
+        /* CT-INT4, IMPORTED: one group throughout and joined only along rows, as GPTQ's. The codes
+         * become signed i4 (the offset flipped out at relayout) and the scale is the plane as
+         * shipped, one a group of K. A kernel reads that group or a recipe re-quantises it. */
+        out->imported = true;
+        for (size_t k = 1; k < out->pieces.size() && out->imported; ++k)
+            if (out->pieces[k]->ct_group != p0.ct_group ||
+                out->scales[k]->rad_dtype != out->scales[0]->rad_dtype) {
+                out->imported = false;
+                out->why = "its CT-INT4 pieces differ in group or scale dtype";
+            }
+        if (out->imported && d != 0 && out->pieces.size() > 1) {
+            out->imported = false;
+            out->why = "its CT-INT4 pieces are joined along a column, across their groups";
+        }
+        if (out->imported) {
+            rad_enc_clear(&out->enc);
+            rad_enc_copy_str(out->enc.scheme, "affine");
+            rad_enc_add_plane(&out->enc, "codes", RAD_I4, 1, 1);
+            rad_enc_add_plane(&out->enc, "scale", out->scales[0]->rad_dtype, 1, p0.ct_group);
+            out->why = "it is CT-INT4, which rad-convert imports -- serve the container it writes";
+        }
     } else if (!unscaled) {
         out->why = "some of its pieces carry a scale plane and some do not";
     } else if (dt == RAD_F8E4M3 || dt == RAD_F8E5M2) {
@@ -1077,6 +1184,18 @@ struct Joined {
 
 /* `n` elements of a stored-dtype piece from element `e`, as f32. */
 int piece_f32(const SrcTensor& t, int64_t e, int64_t n, float* out) {
+    if (t.ct_group) {
+        /* the signed code: element (row, k) of the logical [N, K] matrix is nibble k % 8 of word
+         * [row, k / 8], less 8 */
+        const int64_t K = t.shape[1];
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t row = (e + i) / K, k = (e + i) % K;
+            uint32_t w;
+            std::memcpy(&w, (const uint8_t*)t.data + (row * (K / 8) + k / 8) * 4, 4);
+            out[i] = (float)((int)((w >> ((k % 8) * 4)) & 0xFu) - 8);
+        }
+        return RAD_OK;
+    }
     if (t.gptq_bits) {
         /* the signed code: element (row, k) of the logical [N, K] matrix is field k % (32/bits)
          * of word [k / (32/bits), row], less its zero point */
@@ -1148,8 +1267,8 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
                                                               : "?")
                                             : std::string(rad_dtype_name(w.pieces[0]->rad_dtype))) +
                           ")");
-    /* A GPTQ-PACKED CODE TIMES ITS GROUP'S SCALE, the scale read as shipped: the scale tensor is
-     * [groups, N], so row r's scales are a column of it. */
+    /* AN IMPORTED CODE TIMES ITS GROUP'S SCALE, the scale read as shipped: GPTQ's scale tensor is
+     * [groups, N], so row r's scales are a column of it; CT-INT4's is [N, groups], a row. */
     if (w.imported) {
         int64_t base = 0;
         for (size_t k = 0; k < w.pieces.size(); ++k) {
@@ -1158,8 +1277,10 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
             const int64_t pr = pk.shape[0];
             for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + pr); ++r)
                 for (int64_t c = 0; c < w.cols; ++c)
-                    out[(r - r0) * w.cols + c] *=
-                        rad_load_f32(sk.data, sk.rad_dtype, (c / pk.gptq_group) * pr + (r - base));
+                    out[(r - r0) * w.cols + c] *= rad_load_f32(
+                        sk.data, sk.rad_dtype,
+                        pk.ct_group ? (r - base) * (w.cols / pk.ct_group) + c / pk.ct_group
+                                    : (c / pk.gptq_group) * pr + (r - base));
             base += pr;
         }
         return RAD_OK;
@@ -1212,6 +1333,24 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
             const SrcTensor& c = *w.pieces[p];
             const SrcTensor& s = *w.scales[p];
             const int64_t N = c.shape[0], K = c.shape[1];
+            if (c.ct_group) {
+                /* CT-INT4, RE-LAID: a row of codes is a row of the packed words, already two codes
+                 * a byte low nibble first, each offset to signed by flipping its top bit; a row of
+                 * scales is a row of the scale tensor, as shipped. */
+                for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + N); ++r) {
+                    const int64_t n = r - base;
+                    if (k == 0) {
+                        const uint8_t* q = (const uint8_t*)c.data + n * (K / 2);
+                        for (int64_t i = 0; i < K / 2; ++i) *o++ = q[i] ^ 0x88;
+                    } else {
+                        const int64_t g = K / c.ct_group, sb = rad_dtype_bits(s.rad_dtype) / 8;
+                        std::memcpy(o, (const uint8_t*)s.data + n * g * sb, (size_t)(g * sb));
+                        o += g * sb;
+                    }
+                }
+                base += N;
+                continue;
+            }
             const uint8_t flip = c.gptq_bits == 4 ? 0x88 : 0x80;
             for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + N); ++r) {
                 const int64_t n = r - base;

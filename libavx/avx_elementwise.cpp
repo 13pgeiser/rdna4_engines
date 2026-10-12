@@ -551,6 +551,39 @@ AVX_KERNEL(silu_mul) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ gelu_mul
+ *
+ * y[i] = gelu_tanh(gate_up[i]) * gate_up[n + i], the gate the FIRST half exactly as in silu_mul.
+ * The activation keeps libref's ONE definition of gelu_tanh (act_gelu_tanh, std::tanh): the tree's
+ * rule for a non-polynomial activation is a single source of truth, so this runs libref's scalar
+ * formula into the f32 scratch rather than a second vectorised tanh whose agreement with the first
+ * would be a property of its coefficients -- the same decision the unary gelu above makes. */
+AVX_KERNEL(gelu_mul) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *gu = &a->t[0], *y = &a->t[1];
+    const int64_t n = p_int(a, "n", numel(y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(gu) < rows * 2 * n) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        /* One in_row over the whole 2n row, as silu_mul does: the halves are adjacent and one
+         * conversion of 2n beats two of n. */
+        float* s = scratch_f32((size_t)(2 * n));
+        float* sy = scratch_f32_b((size_t)n);
+        const float* g = in_row(gu, rowoff(gu, r, 2 * n), 2 * n, s);
+        const float* u = g + n;
+        for (int64_t i = 0; i < n; ++i) {
+            const float x = g[i];
+            const float t = std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x));
+            sy[i] = 0.5f * x * (1.0f + t) * u[i];
+        }
+        out_row(y, rowoff(y, r, n), n, sy);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ gelu / silu / sigmoid
  *
  * These run over the whole tensor rather than row by row -- libref's `unary` does the same -- so
@@ -636,6 +669,95 @@ AVX_KERNEL(fill) {
     for (int64_t r = 0; r < M; ++r) {
         const int64_t yb = rowoff(y, r, n), ys = laststride(y);
         for (int64_t i = 0; i < n; ++i) stt(y, yb + i * ys, v);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ logit_softcap */
+/* y = cap * tanh(x / cap). Its own list entry rather than another unary<WHICH>, because WHICH is
+ * a compile-time choice and `cap` is a runtime parameter -- the template has nowhere to put it.
+ * The vector path keeps the tree's one definition of the non-polynomial part: tanh(z) is
+ * 2*sigmoid(2z) - 1, so the work is vf_sigmoid's existing minimax exp plus two multiplies. The
+ * scalar fallback is libm's tanhf, which is what libref's oracle computes. */
+AVX_KERNEL(logit_softcap) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[1];
+    const int64_t nel = numel(y);
+    if (nel <= 0 || numel(x) < nel) return RAD_E_SHAPE;
+    const float cap = p_f32(a, "cap", 30.0f);
+    if (!(cap > 0.0f)) return RAD_E_INVAL;
+
+    if (!dense_row(x) || !dense_row(y) || !rad_tensor_is_contiguous(x) ||
+        !rad_tensor_is_contiguous(y)) {
+        AVX_PARALLEL_FOR_IF(nel >= AVX_PAR_MIN)
+        for (int64_t i = 0; i < nel; ++i) {
+            const float v = ldt(x, offlin(x, i));
+            stt(y, offlin(y, i), cap * std::tanhf(v / cap));
+        }
+        return RAD_OK;
+    }
+
+    const int64_t TILE = 4096;
+    const int64_t ntile = (nel + TILE - 1) / TILE;
+    AVX_PARALLEL_FOR_IF(nel >= AVX_PAR_MIN)
+    for (int64_t t = 0; t < ntile; ++t) {
+        const int64_t off = t * TILE;
+        const int64_t m = (nel - off) < TILE ? (nel - off) : TILE;
+        float* s  = scratch_f32((size_t)TILE);
+        float* so = scratch_f32_b((size_t)TILE);
+        const float* v = in_row(x, off, m, s);
+        const vf z = vf_set1(2.0f / cap);   /* x / cap, doubled: the argument of the sigmoid */
+        const vf c2 = vf_set1(2.0f * cap);  /* 2*cap * sigmoid(...)      */
+        const vf c1 = vf_set1(-cap);        /* ... - cap                 */
+        int64_t i = 0;
+        for (; i + VF_N <= m; i += VF_N)
+            vf_storeu(so + i, vf_fma(c2, vf_sigmoid(vf_mul(vf_loadu(v + i), z)), c1));
+        for (; i < m; ++i)
+            so[i] = cap * std::tanhf(v[i] / cap);
+        out_row(y, off, m, so);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ scale */
+/* y = x * s, s a [1] weight broadcast over every element. A plain multiply by a scalar: the
+ * vector path is vf_mul against a broadcast, and the scalar fallback is a plain multiply. There is
+ * no non-polynomial part, so nothing is reused from the sigmoid path; it is its own list entry
+ * (rather than a `mul` with a [1] operand) for the same reason `mul` refuses a scalar broadcast --
+ * a silent choice between a row-broadcast and a scalar-broadcast is how a shape bug becomes a
+ * plausible number. The scalar is read once, outside the loop: a per-element reload of a [1]
+ * tensor is the same value every time and costs a load per element. */
+AVX_KERNEL(scale) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *s = &a->t[1], *y = &a->t[2];
+    const int64_t nel = numel(y);
+    if (nel <= 0 || numel(x) < nel || numel(s) < 1) return RAD_E_SHAPE;
+    const float sv = ldt(s, 0);
+
+    if (!dense_row(x) || !dense_row(y) || !rad_tensor_is_contiguous(x) ||
+        !rad_tensor_is_contiguous(y)) {
+        AVX_PARALLEL_FOR_IF(nel >= AVX_PAR_MIN)
+        for (int64_t i = 0; i < nel; ++i)
+            stt(y, offlin(y, i), ldt(x, offlin(x, i)) * sv);
+        return RAD_OK;
+    }
+
+    const int64_t TILE = 4096;
+    const int64_t ntile = (nel + TILE - 1) / TILE;
+    AVX_PARALLEL_FOR_IF(nel >= AVX_PAR_MIN)
+    for (int64_t t = 0; t < ntile; ++t) {
+        const int64_t off = t * TILE;
+        const int64_t m = (nel - off) < TILE ? (nel - off) : TILE;
+        float* sbuf  = scratch_f32((size_t)TILE);
+        float* so = scratch_f32_b((size_t)TILE);
+        const float* v = in_row(x, off, m, sbuf);
+        const vf sc = vf_set1(sv);
+        int64_t i = 0;
+        for (; i + VF_N <= m; i += VF_N)
+            vf_storeu(so + i, vf_mul(vf_loadu(v + i), sc));
+        for (; i < m; ++i)
+            so[i] = v[i] * sv;
+        out_row(y, off, m, so);
     }
     return RAD_OK;
 }

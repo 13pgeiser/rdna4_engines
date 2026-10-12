@@ -254,11 +254,11 @@ TEST(plugin_surface) {
  * which is a decision and not an oversight (docs/OPS.md). */
 TEST(op_vocabulary) {
     static const char* kOps[] = {
-        "rmsnorm", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "mtp_enter",
-        "layernorm", "add", "mul", "mul_weight", "silu_mul", "act_mul", "seg_mean", "pool_rows",
-        "relu", "clamp", "conv2d", "conv1d_dw", "rel_sinusoid", "attn_local_rel", "gelu", "silu",
-        "sigmoid", "fill", "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv",
-        "causal_conv1d",
+        "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "mtp_enter",
+        "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
+        "pool_rows", "relu", "clamp", "conv2d", "conv1d_dw", "rel_sinusoid", "attn_local_rel",
+        "gelu", "silu", "sigmoid", "logit_softcap", "scale", "fill",
+        "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv", "causal_conv1d",
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
@@ -450,6 +450,24 @@ TEST(op_rmsnorm) {
     CHECK_NEAR(y2.at(3), 4 * s, 1e-6);
 }
 
+/* The weightless rmsnorm: same normalisation as rmsnorm with no gain, so the row divides by its
+ * rms and stops. The literals are exactly op_rmsnorm's, because a plain norm IS rmsnorm whose gain
+ * is one. */
+TEST(op_rmsnorm_p) {
+    T x(RAD_F32, {1, 4}); x.f({1, 2, 3, 4});
+    T y(RAD_F32, {1, 4});
+    A a; a.t(x).t(y).i("M", 1).i("n", 4).d("eps", 0).s("dtype", "f32");
+    CHECK_OK(run("rmsnorm_p", a));
+    /* rms = sqrt((1+4+9+16)/4) = sqrt(7.5) = 2.7386128 */
+    const float s = 1.0f / 2.7386128f;
+    CHECK_NEAR(y.at(0), 1 * s, 1e-6);
+    CHECK_NEAR(y.at(3), 4 * s, 1e-6);
+
+    /* A non-positive n is not a normalisation, so it is refused rather than answered. */
+    A bb; bb.t(x).t(y).i("M", 1).i("n", 0).d("eps", 0).s("dtype", "f32");
+    CHECK(run("rmsnorm_p", bb) != RAD_OK);
+}
+
 TEST(op_rmsnorm_add) {
     T x(RAD_F32, {1, 2});   x.f({1, 3});
     T res(RAD_F32, {1, 2}); res.f({1, 1});
@@ -521,6 +539,70 @@ TEST(op_silu_mul_and_unary) {
     A c; c.t(x).t(s).i("M", 1).i("n", 2).s("dtype", "f32");
     CHECK_OK(run("silu", c));
     CHECK_NEAR(s.at(1), 0.73105858f, 1e-6);
+}
+
+/* Gemma's gated FFN, on paper: same fused layout as silu_mul (gate the first half, up the second)
+ * but the gate runs the tanh GELU, not silu. gelu_tanh matches the gemm_nt_bias tanh epilogue and
+ * differs from the unary `gelu` (exact erf) -- the check at 1.0 pins that difference: erf gelu(1) is
+ * 0.84134..., the tanh form is 0.84119.... */
+TEST(op_gelu_mul) {
+    T gu(RAD_F32, {1, 4}); gu.f({1, 2, 3, 4});      /* gate [1,2], up [3,4] */
+    T y(RAD_F32, {1, 2});
+    A a; a.t(gu).t(y).i("M", 1).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("gelu_mul", a));
+    CHECK_NEAR(y.at(0), 0.84119199f * 3.0f, 1e-6);   /* gelu_tanh(1) * up */
+    CHECK_NEAR(y.at(1), 1.95459769f * 4.0f, 1e-6);   /* gelu_tanh(2) * up */
+    /* And the negative side, where tanh gelu and erf gelu drift furthest. */
+    T gx(RAD_F32, {1, 4}); gx.f({-2, -1, 3, 4});     /* gate [-2,-1], up [3,4] */
+    T gy(RAD_F32, {1, 2});
+    A b; b.t(gx).t(gy).i("M", 1).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("gelu_mul", b));
+    CHECK_NEAR(gy.at(0), -0.04540231f * 3.0f, 1e-6); /* gelu_tanh(-2) * up */
+    CHECK_NEAR(gy.at(1), -0.15880801f * 4.0f, 1e-6); /* gelu_tanh(-1) * up */
+}
+
+/* The final-logit softcap, on paper. `cap` at 30 -- Gemma's value -- and the input the kernel
+ * actually sees after a logits_gemm, reduced to the five ratios the formula can take: 0, cap/2,
+ * both signs of cap, and 2 cap. Every ratio is exact in f32, so the literals below are tanh of a
+ * small integer, and the check is the f32 rounding of the product and nothing else. */
+TEST(op_logit_softcap) {
+    T x(RAD_F32, {5}); x.f({ 0.0f, 15.0f, 30.0f, -30.0f, 60.0f });
+    T y(RAD_F32, {5});
+    A a; a.t(x).t(y).i("M", 1).i("n", 5).d("cap", 30.0).s("dtype", "f32");
+    CHECK_OK(run("logit_softcap", a));
+    CHECK_EQ(y.at(0), 0.0f);
+    CHECK_NEAR(y.at(1), 30.0f * 0.4621171573f, 1e-5);   /* tanh(1/2) */
+    CHECK_NEAR(y.at(2), 30.0f * 0.7615941560f, 1e-5);   /* tanh(1)   */
+    CHECK_NEAR(y.at(3), -30.0f * 0.7615941560f, 1e-5);  /* tanh(-1)  */
+    CHECK_NEAR(y.at(4), 30.0f * 0.9640275801f, 1e-5);   /* tanh(2)   */
+
+    /* A non-positive cap is a division by zero in every lane, so it is refused, not answered. */
+    T y2(RAD_F32, {5});
+    A b; b.t(x).t(y2).i("M", 1).i("n", 5).d("cap", 0.0).s("dtype", "f32");
+    CHECK(run("logit_softcap", b) != RAD_OK);
+}
+
+/* The per-tensor scalar scale. `s` is a [1] weight broadcast over every element, so the answer is
+ * a literal times the literal -- not a second call into the same multiply. The negative case is a
+ * scalar with no element: that is a shape error, not a broadcast of zero (a zero scalar would be a
+ * plausible number, which is the thing this file's rule exists to rule out). */
+TEST(op_scale) {
+    T x(RAD_F32, {5}); x.f({ 0.0f, 2.0f, 4.0f, -6.0f, 8.0f });
+    T s(RAD_F32, {1}); s.f({ 3.0f });
+    T y(RAD_F32, {5});
+    A a; a.t(x).t(s).t(y).i("M", 1).i("n", 5).s("dtype", "f32");
+    CHECK_OK(run("scale", a));
+    CHECK_EQ(y.at(0), 0.0f);
+    CHECK_EQ(y.at(1), 6.0f);
+    CHECK_EQ(y.at(2), 12.0f);
+    CHECK_EQ(y.at(3), -18.0f);
+    CHECK_EQ(y.at(4), 24.0f);
+
+    /* A scalar with no element is a shape error, not a broadcast of zero. */
+    T s0(RAD_F32, {0});
+    T y2(RAD_F32, {5});
+    A b; b.t(x).t(s0).t(y2).i("M", 1).i("n", 5).s("dtype", "f32");
+    CHECK(run("scale", b) != RAD_OK);
 }
 
 /* The quantised gather. Three things, and the scale is the least interesting of them.
@@ -1704,6 +1786,16 @@ TEST(op_vocab_edges) {
     CHECK_EQ(x.at(2), 1.0f); CHECK_EQ(x.at(3), 2.0f);
     CHECK_EQ(x.at(4), 0.0f); CHECK_EQ(x.at(5), 0.0f);   /* a negative id is padding */
 
+    /* A runtime gather scale multiplies the rows that are found; a missed row stays zero, not
+     * zero times the scale. Absent it, the lookup is the plain gather (the first block). */
+    T xs(RAD_F32, {3, 2});
+    A as; as.t(tok).t(wte).t(xs).i("M", 3).i("n_embd", 2).i("n_vocab", 3)
+          .s("dtype", "f32").d("mult", 2.0);
+    CHECK_OK(run("embed_lookup", as));
+    CHECK_EQ(xs.at(0), 10.0f); CHECK_EQ(xs.at(1), 12.0f);
+    CHECK_EQ(xs.at(2), 2.0f);  CHECK_EQ(xs.at(3), 4.0f);
+    CHECK_EQ(xs.at(4), 0.0f);  CHECK_EQ(xs.at(5), 0.0f);
+
     /* An id at or above n_vocab fails the launch rather than returning a plausible row. */
     T bad(RAD_I32, {1}); bad.n({7});
     T x2(RAD_F32, {1, 2});
@@ -2450,6 +2542,51 @@ TEST(op_rope_multi_component) {
             const float ang = (c ? 9.0f : 5.0f) * inv;
             CHECK_NEAR(got.at(i), std::cos(ang) - std::sin(ang), 1e-6);
         }
+    }
+}
+
+/* THE PROPORTIONAL LADDER. With head_dim wider than rotary_dim, the two ladders give frequency 1 a
+ * different angle: `rotary` divides by rotary_dim, `head` by head_dim. And they pair different
+ * channels: `rotary` is a complete rotary of rotary_dim's own width, pair i = (i, i + rot/2) with
+ * the tail past rot untouched, while `head` is HF's proportional RoPE
+ * (_compute_proportional_rope_parameters + rotate_half over the WHOLE head): pair i is
+ * (i, i + head_dim/2) and every frequency past rot/2 is zero, so only those rot/2 pairs turn.
+ * Frequency 0 is theta^0 under both; frequency 1 pins the ladder, the partner index the pairing. */
+TEST(op_rope_ladder) {
+    const int64_t hd = 8, rot = 4;        /* two frequencies, a partial rotary (hd > rot) */
+    const float pos = 7.0f;
+    for (const char* lad : { "rotary", "head" }) {
+        const bool head = lad[0] == 'h';
+        const int64_t den = head ? hd : rot;
+        const int64_t poff = head ? hd / 2 : rot / 2;   /* where pair i's partner sits */
+        T got(RAD_F32, { 1, hd });
+        got.f(std::vector<float>(hd, 1.0f));
+        T p1(RAD_I32, { 1 }); p1.n({ 7 });
+        A a; a.t(got).t(p1).i("M", 1).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 0)
+              .d("theta", 100).d("scale", 1).s("mode", "neox").i("rotary_dim", rot)
+              .s("ladder", lad);
+        CHECK_OK(run("rope", a));
+        std::vector<bool> turned(hd, false);
+        for (int i = 0; i < rot / 2; ++i) {
+            const float inv = 1.0f / std::pow(100.0f, (float)(2 * i) / (float)den);
+            const float ang = pos * inv;
+            CHECK_NEAR(got.at(i), std::cos(ang) - std::sin(ang), 1e-5);
+            CHECK_NEAR(got.at(i + poff), std::sin(ang) + std::cos(ang), 1e-5);
+            turned[i] = turned[i + poff] = true;
+        }
+        for (int d = 0; d < hd; ++d)
+            if (!turned[d]) CHECK_EQ(got.at(d), 1.0f);   /* every other channel untouched */
+    }
+    /* absent ladder == rotary: the models that never set it keep the old angles bit-for-bit */
+    {
+        T got(RAD_F32, { 1, hd });
+        got.f(std::vector<float>(hd, 1.0f));
+        T p1(RAD_I32, { 1 }); p1.n({ 7 });
+        A a; a.t(got).t(p1).i("M", 1).i("head_dim", hd).i("n_head", 1).i("n_head_kv", 0)
+              .d("theta", 100).d("scale", 1).s("mode", "neox").i("rotary_dim", rot);
+        CHECK_OK(run("rope", a));
+        const float ang = pos * (1.0f / std::pow(100.0f, (float)(2 * 1) / (float)rot));
+        CHECK_NEAR(got.at(1), std::cos(ang) - std::sin(ang), 1e-5);
     }
 }
 

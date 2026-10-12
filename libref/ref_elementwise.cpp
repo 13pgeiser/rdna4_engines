@@ -57,6 +57,37 @@ int ref_rmsnorm(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ rmsnorm_p */
+/* y = x * rsqrt(mean(x^2) + eps) -- the SAME normalisation as rmsnorm with NO gain at all. It is
+ * its own op rather than a zeroed gain on rmsnorm because the gain is a real, weightless thing:
+ * Gemma's attention normalises the VALUE with a bare RMS (llama.cpp's ggml_rms_norm(V, eps), no
+ * tensor) while normalising the KEY with the k_norm gain, and there is no checkpoint plane to feed
+ * a `wadd`/`w` through for the value -- so an rmsnorm call would need a phantom all-zero weight to
+ * express it, which is a name map to a tensor that does not exist. The mean is accumulated in f32
+ * in ascending index order, exactly as rmsnorm does, so the two agree bit-for-bit where rmsnorm's
+ * gain happens to be one. */
+int ref_rmsnorm_p(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0);
+    const float eps = p_f32(a, "eps", 1e-6f);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || numel(y) < rows * n) return RAD_E_SHAPE;
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
+        const int64_t xs = laststride(x), ys = laststride(y);
+        float ss = 0.0f;
+        for (int64_t i = 0; i < n; ++i) { float v = ldt(x, xb + i * xs); ss += v * v; }
+        const float s = 1.0f / std::sqrt(ss / (float)n + eps);
+        for (int64_t i = 0; i < n; ++i)
+            stt(y, yb + i * ys, ldt(x, xb + i * xs) * s);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ rmsnorm_add */
 /* residual_out = x + residual;  y = rmsnorm(residual_out) * (w + w_add)
  *
@@ -657,6 +688,32 @@ int ref_rel_sinusoid(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ gelu_mul */
+/* y[.., i] = gelu_tanh(gate_up[.., i]) * gate_up[.., n + i] -- the tanh GELU, and the gate is the
+ * FIRST half, for the same order-locking reason as silu_mul. This is Gemma's gated FFN
+ * (down(gelu_tanh(gate(x)) * up(x)), activation gelu_pytorch_tanh in the checkpoint). It is not
+ * `gemm_nt`'s "gelu_tanh" EPLOGUE, which applies the activation to a whole GEMM's output and has no
+ * gate to multiply; gating needs the product of two halves of one fused plane, which is silu_mul's
+ * shape. The exact-erf form is the unary `gelu` op; a GELU-gated feed-forward in this family is
+ * trained with the tanh approximation, so this op is the tanh one on purpose and says so. */
+int ref_gelu_mul(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *gu = &a->t[0], *y = &a->t[1];
+    const int64_t n = p_int(a, "n", numel(y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(gu) < rows * 2 * n) return RAD_E_SHAPE;
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t gb = rowoff(gu, r, 2 * n), yb = rowoff(y, r, n);
+        const int64_t gs = laststride(gu), ys = laststride(y);
+        for (int64_t i = 0; i < n; ++i)
+            stt(y, yb + i * ys, act_gelu_tanh(ldt(gu, gb + i * gs)) * ldt(gu, gb + (n + i) * gs));
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ gelu / silu */
 static int unary(const RadArgs* a, int which) {
     if (!have(a, 2)) return RAD_E_INVAL;
@@ -700,6 +757,52 @@ int ref_fill(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ logit_softcap */
+/* y = cap * tanh(x / cap), Gemma's final-logit softcap: the logits_gemm's output is a nearly
+ * unbounded row and the sampler wants it bounded, so this is issued against the LOGITS, not the
+ * hidden stream. Its own op for the same reason sigmoid is -- the selector has to be able to name
+ * it -- and `cap` is a parameter of the call, which the which-switch above cannot carry. */
+int ref_logit_softcap(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[1];
+    const int64_t nel = numel(y);
+    if (nel <= 0 || numel(x) < nel) return RAD_E_SHAPE;
+    const float cap = p_f32(a, "cap", 30.0f);
+    if (!(cap > 0.0f)) return RAD_E_INVAL;
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < nel; ++i) {
+        const float v = ldt(x, offlin(x, i));
+        stt(y, offlin(y, i), cap * std::tanhf(v / cap));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ scale */
+/* y = x * s, where s is a [1] weight broadcast over every element of x.
+ *
+ * Gemma 4's per-layer scalar: the residual stream is scaled by a learned [1] value at the end of
+ * every layer (llama.cpp `out_scale`, `cur = cur * out_scale`). It is NOT `mul`, which broadcasts
+ * a single ROW down the rows (a bias's shape) -- this broadcasts a single SCALAR over the whole
+ * [M, n] tensor. `scale_rows` is the per-ROW version (one scalar a row); this is the per-TENSOR
+ * version (one scalar for all rows). Giving `mul` both rules would make them ambiguous exactly
+ * when rows == 1, so a silent choice between two broadcasts is how a shape bug becomes a
+ * plausible number -- the same reason `scale_rows` is its own op.
+ *
+ * `s` is a weight (a [1] tensor in the checkpoint), not a parameter: it varies per layer, so it
+ * is a declared weight the name map points at, not a call constant. Read once, outside the loop:
+ * a per-element reload of a [1] tensor is the same value every time and costs a load per element. */
+int ref_scale(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *s = &a->t[1], *y = &a->t[2];
+    const int64_t nel = numel(y);
+    if (nel <= 0 || numel(x) < nel || numel(s) < 1) return RAD_E_SHAPE;
+    const float sv = ldt(s, 0);
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < nel; ++i)
+        stt(y, offlin(y, i), ldt(x, offlin(x, i)) * sv);
+    return RAD_OK;
+}
 /* ------------------------------------------------------------------ gather_rows */
 /* y[i, :] = x[idx[i], :]. The op that turns "correct" into "affordable": without it a plugin runs
  * the lm_head GEMM over every token of a prefill chunk when the sampler wants one row per

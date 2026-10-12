@@ -49,6 +49,7 @@
 #include "r4d_fp8_wmma.h"
 
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -273,6 +274,29 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- rmsnorm_p
+// ref_rmsnorm_p: y = x * rsqrt(mean(x^2) + eps) -- the SAME normalisation as rmsnorm with NO gain.
+// It is the weightless value normalisation Gemma's attention uses on V (llama.cpp's
+// ggml_rms_norm(V, eps), no tensor); there is no checkpoint plane to feed a gain through, so an
+// rmsnorm call would need a phantom all-zero weight. Two passes over the row, the sum of squares
+// in f32; the second pass drops the gain multiply rmsnorm has. The mean accumulates in f32 in
+// ascending index order, exactly as rmsnorm does, so the two agree bit-for-bit where rmsnorm's
+// gain happens to be one.
+__global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint32_t n, float eps, uint32_t x_ld, uint32_t y_ld) {
+    __shared__ float lds[kThreads / kWave];
+    const uint32_t m = blockIdx.x;
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) { const float v = bf2f(xr[i]); ss += v * v; }
+    ss = block_sum<kThreads / kWave>(ss, lds);
+    const float s = rsqrtf(ss / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        yr[i] = f32_to_bf16(bf2f(xr[i]) * s);
+}
+
 // ---------------------------------------------------------------------------- add / mul
 // ref_add / ref_mul, including THE ONE BROADCAST RULE: an operand carrying exactly n elements
 // against an output of rows*n broadcasts along rows, and nothing else broadcasts at all.  That is
@@ -310,6 +334,53 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
         yr[i] = f32_to_bf16(1.0f / (1.0f + expf(-bf2f(xr[i]))));
 }
 
+// ---------------------------------------------------------------------------- logit_softcap
+// ref_logit_softcap: y = cap * tanh(x / cap), the final-logit softcap. THE ROW-WISE-WITH-A-PITCH
+// SHAPE IS COPIED FROM sigmoid on purpose: Gemma's arch issues it against the logits_gemm's output,
+// and the pitch form costs nothing on a contiguous buffer -- it is x_ld == n.
+__global__ __launch_bounds__(kThreads) void logit_softcap_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
+    const uint32_t m = blockIdx.x;
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        yr[i] = f32_to_bf16(cap * tanhf(bf2f(xr[i]) / cap));
+}
+
+/* The f32 leg: the 1.3.0 sampling chain carries the logits in f32 from the gemm, so the softcap
+ * is issued against f32 rows. The same row-with-pitch shape as the bf16 leg, and the math is the
+ * op's definition verbatim -- no rounding pass, the buffer already holds the arithmetic dtype. */
+__global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
+    const float* __restrict__ x, float* __restrict__ y,
+    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
+    const uint32_t m = blockIdx.x;
+    const float* __restrict__ xr = x + (size_t)m * x_ld;
+    float* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        yr[i] = cap * tanhf(xr[i] / cap);
+}
+
+// ---------------------------------------------------------------------------- scale
+// ref_scale: y = x * s, s a [1] weight broadcast over every element. THE ROW-WISE-WITH-A-PITCH
+// SHAPE IS COPIED FROM sigmoid on purpose: Gemma's arch issues it against the residual stream at
+// the end of every layer (the per-layer scalar), and the pitch form costs nothing on a contiguous
+// buffer -- it is x_ld == n. The scalar is read once per block (a single load, cached), not per
+// element: a per-element reload of a [1] tensor is the same value every time and costs a load per
+// element. `s` is f32 or bf16 (the layer_scalar weight is bf16 in the checkpoint); the branch is
+// on its dtype, so the op is dtype-generic in the scalar and the bf16 kernel is the residual
+// stream's, which is what a served Gemma 4 issues it against.
+__global__ __launch_bounds__(kThreads) void scale_kernel(
+    const uint16_t* __restrict__ x, const void* __restrict__ s, uint32_t s_dt,
+    uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld, uint32_t y_ld) {
+    const uint32_t m = blockIdx.x;
+    const float sv = (s_dt == RAD_F32) ? ((const float*)s)[0] : bf2f(((const uint16_t*)s)[0]);
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads)
+        yr[i] = f32_to_bf16(bf2f(xr[i]) * sv);
+}
+
 // ---------------------------------------------------------------------------- silu_mul
 // ref_silu_mul: y[.., i] = silu(gu[.., i]) * gu[.., n + i].  THE GATE IS THE FIRST HALF, which is
 // the order rad-convert fuses gate_proj and up_proj into one weight in; the two conventions cannot
@@ -343,6 +414,26 @@ __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- gelu_mul
+// ref_gelu_mul: y[.., i] = gelu_tanh(gu[.., i]) * gu[.., n + i]. THE GATE IS THE FIRST HALF, the
+// same order-lock as silu_mul. The tanh-approx GELU (gemma's gelu_pytorch_tanh), NOT the erf one:
+// gated feed-forwards are trained with the tanh form, and the constants are the standard fit the
+// gemm_nt_bias "gelu_tanh" epilogue uses (the identical function, so a GELU-gated FFN and a
+// tanh-gelu epilogue agree to the last bit).
+__global__ __launch_bounds__(kThreads) void gelu_mul_kernel(
+    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
+    uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+    const uint32_t m = blockIdx.x;
+    const uint16_t* __restrict__ gr = gu + (size_t)m * gu_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
+        const float g = bf2f(gr[i]);
+        const float k0 = 0.7978845608028654f, k1 = 0.044715f;
+        const float gelu = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+        yr[i] = f32_to_bf16(gelu * bf2f(gr[n + i]));
+    }
+}
+
 // ---------------------------------------------------------------------------- rope
 // ref_rope, in place over a fused [n_head + 2*n_head_kv] head row -- the V heads at the end are
 // left alone, which is the whole reason the op takes the fused projection rather than two tensors.
@@ -354,8 +445,10 @@ __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
 // (rad_block_attn_gated.h says so and says what would have to change first), so the shim maps it.
 //
 // PARTIAL ROTARY.  `rot` may be less than head_dim -- 64 of 256 on this target -- and the tail of
-// the head is untouched.  The frequency exponent divides by `rot`, not by head_dim: the rotated
-// prefix is a complete rotary of its own width.
+// the head is untouched.  The base ladder's exponent divides by `den`, which `ladder` resolves:
+// `rot` for `rotary` (the rotated prefix, a complete rotary of its own width) and `head_dim` for
+// `head` (the proportional variant, a prefix of the full-width table). `den` = `rot` on the
+// default path, so existing models are bit-for-bit unchanged.
 //
 // One thread a PAIR.  The pair's two loads and two stores are the whole body, so there is no
 // reduction and no LDS; the grid is (M, heads).
@@ -379,7 +472,7 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
 
 __global__ __launch_bounds__(kThreads) void rope_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos,
-    uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, int gptj,
+    uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, uint32_t nfreq, int den, int gptj,
     float theta, float rscale, uint32_t row_pitch,
     int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn) {
     const uint32_t m = blockIdx.x;
@@ -392,7 +485,7 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
          t += kThreads * gridDim.y) {
         const uint32_t h = t / half, i = t % half;
         uint16_t* __restrict__ hd = qkv + (size_t)m * row_pitch + (size_t)h * head_dim;
-        float inv = 1.0f / powf(theta, (float)(2 * i) / (float)rot);
+        float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
         float p = p0;
         if (plane) {
             uint32_t j = i;
@@ -402,6 +495,10 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
                 inv = 1.0f / powf(theta, (float)(2 * j) / (float)(2 * sec[c]));
         }
         inv = yarn.frequency(inv, (int)i);
+        /* THE PROPORTIONAL LADDER rotates the whole head with every frequency past nfreq zero
+         * (HF's _compute_proportional_rope_parameters), so pair i is (i, i + head_dim/2) and the
+         * pairs past nfreq turn by 0: cos 1, sin 0, the value back exactly. */
+        if (i >= nfreq) inv = 0.0f;
         const float ang = p * inv;
         float c, s;
         sincosf(ang, &s, &c);
@@ -638,6 +735,13 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
     return rc == RAD_OK ? 0 : -4;
 }
 
+extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,
+                                           int n_vocab, int vocab_off, int x_ld, float scale,
+                                           long stream) {
+    R4dSink sk; sk.stream = (RadStream)(uintptr_t)stream;
+    return embed_lookup_bf16_emit(tok, wte, x, M, n_embd, n_vocab, vocab_off, x_ld, scale, sk);
+}
+
 static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src_rows,
                                  int x_ld, int y_ld, const R4dSink& sk) {
     if (!x || !idx || !y) return -1;
@@ -734,6 +838,22 @@ extern "C" int r4d_rmsnorm_bf16(long x, long w, long y, int M, int n, float eps,
     return r4d_rmsnorm_mult_bf16(x, w, y, M, n, eps, wadd, 1.0f, w_f32, x_ld, y_ld, stream);
 }
 
+// The weightless norm: rmsnorm without the gain multiply.  It is not templated on a thread count
+// the way rmsnorm is, because rmsnorm's width is pinned to the fused rmsnorm_quant_fp8 by their
+// shared byte-identical requirement, and rmsnorm_p has no fused quantiser counterpart to match --
+// kThreads is the same choice the other non-templated row kernels (binary, sigmoid, silu_mul) make.
+extern "C" int r4d_rmsnorm_p_bf16(long x, long y, int M, int n, float eps,
+                                  int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(rmsnorm_p_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+                       (const uint16_t*)x, (uint16_t*)y, (uint32_t)n, eps,
+                       (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 // `op` is 0 for a sum and 1 for a product.  `b_ld` of 0 with the same n is the broadcast form: the
 // caller passes a b_ld of zero and every row reads the same n elements.
 // b_ld -1 is a ONE-ELEMENT b, the scalar broadcast; 0 is one row broadcast down the rows.
@@ -788,6 +908,48 @@ extern "C" int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long s
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+extern "C" int r4d_logit_softcap_bf16(long x, long y, int M, int n, float cap,
+                                      int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!(cap > 0.0f)) return -3;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(logit_softcap_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream,
+                       (const uint16_t*)x, (uint16_t*)y, (uint32_t)n, cap,
+                       (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_logit_softcap_f32(long x, long y, int M, int n, float cap,
+                                     int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!(cap > 0.0f)) return -3;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(logit_softcap_kernel_f32, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream,
+                       (const float*)x, (float*)y, (uint32_t)n, cap,
+                       (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_scale_bf16(long x, long s, uint32_t s_dt, long y, int M, int n,
+                              int x_ld, int y_ld, long stream) {
+    if (!x || !s || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (s_dt != RAD_F32 && s_dt != RAD_BF16) return -3;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(scale_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream,
+                       (const uint16_t*)x, (const void*)s, s_dt, (uint16_t*)y, (uint32_t)n,
+                       (uint32_t)x_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
     if (!gu || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -800,21 +962,38 @@ extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+// GELU-gated product, the gemma FFN activation.  Same shape and order-lock as silu_mul (the gate
+// is the first half of the fused [M, 2n] row); the only difference is the nonlinearity, which is
+// the tanh approximation, not the erf one, to match ref_gelu_mul's act_gelu_tanh.
+extern "C" int r4d_gelu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
+    if (!gu || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!gu_ld) gu_ld = 2 * n;
+    if (!y_ld) y_ld = n;
+    hipLaunchKernelGGL(gelu_mul_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+                       (const uint16_t*)gu, (uint16_t*)y, (uint32_t)n,
+                       (uint32_t)gu_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 // `n_rope_heads` is n_head + n_head_kv: the Q heads and the K heads of a fused projection, or just
 // the one buffer's heads when q and k are separate tensors (which is what the gated block does).
 extern "C" int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads,
                              int rot, int gptj, float theta, float rscale, int row_pitch,
                              long stream) {
-    return r4d_rope_mc_bf16(qkv, pos, M, head_dim, n_rope_heads, rot, gptj, theta, rscale,
+    return r4d_rope_mc_bf16(qkv, pos, M, head_dim, n_rope_heads, rot, rot, gptj, theta, rscale,
                             row_pitch, 0, nullptr, 0, 0, stream);
 }
 
 // THE ONE LAUNCH OF rope_kernel. `yarn` with factor 0 is the plain rotary: the kernel's YaRN
 // blend returns the frequency it was given and the magnitude is not applied, so the C entry points
-// below and the op without YaRN run the same arithmetic with the same arguments.
-static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot,
+// below and the op without YaRN run the same arithmetic with the same arguments. `den` is the
+// ladder's width (`rot` for `rotary`, `head_dim` for `head`) -- the multi-component form passes
+// the caller's, and the plain entry passes `rot`, as it always has.
+static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int den,
                        int gptj, float theta, float rscale, int row_pitch, int mode,
-                       const int* sec, int n_sec, int plane, RadYarn yarn, long stream) {
+                       const int* sec, int n_sec, int plane, RadYarn yarn, long stream,
+                       int nfreq = -1) {
     if (!qkv || !pos) return -1;
     if (M <= 0 || head_dim <= 0 || n_rope_heads <= 0) return -2;
     if (rot <= 0 || rot > head_dim || (rot & 1)) return -3;
@@ -823,9 +1002,11 @@ static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads
     const uint32_t pairs = (uint32_t)n_rope_heads * (uint32_t)(rot / 2);
     const uint32_t gy = (pairs + kThreads - 1) / kThreads;
     const int s0 = n_sec > 0 ? sec[0] : 0, s1 = n_sec > 1 ? sec[1] : 0, s2 = n_sec > 2 ? sec[2] : 0;
+    if (nfreq < 0) nfreq = rot / 2;
     hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0, (hipStream_t)stream,
                        (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)head_dim,
-                       (uint32_t)n_rope_heads, (uint32_t)rot, gptj, theta, rscale,
+                       (uint32_t)n_rope_heads, (uint32_t)rot, (uint32_t)nfreq, (int)den, gptj, theta,
+                       rscale,
                        (uint32_t)row_pitch, mode, s0, s1, s2, n_sec, (uint32_t)plane, yarn);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -833,10 +1014,11 @@ static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads
 // The multi-component form: `mode` 2 mrope, 3 imrope, 4 axial, `sec[0..n_sec)` the sections and
 // `plane` the component pitch of `pos`; plane 0 is the one-component rotary above.
 extern "C" int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads,
-                                int rot, int gptj, float theta, float rscale, int row_pitch,
-                                int mode, const int* sec, int n_sec, int plane, long stream) {
-    return rope_launch(qkv, pos, M, head_dim, n_rope_heads, rot, gptj, theta, rscale, row_pitch,
-                       mode, sec, n_sec, plane, RadYarn{}, stream);
+                                int rot, int den, int gptj, float theta, float rscale,
+                                int row_pitch, int mode, const int* sec, int n_sec, int plane,
+                                long stream) {
+    return rope_launch(qkv, pos, M, head_dim, n_rope_heads, rot, den, gptj, theta, rscale,
+                       row_pitch, mode, sec, n_sec, plane, RadYarn{}, stream);
 }
 
 extern "C" int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int head_dim,
@@ -1281,6 +1463,29 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
                                                                                  : RAD_E_DEVICE;
 }
 
+/* ------------------------------------------------------------------ rmsnorm_p */
+
+extern "C" int r4d_rad_rmsnorm_p(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(x));
+    R4D_NEED(dt_bf16(y));
+
+    const long long n = r4d_geti_or(a, "n", r4d_dim(x, (int)x->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    const long long y_ld = r4d_rows_pitch(y, n, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+
+    const float eps = (float)r4d_getf(a, "eps", 1e-6);
+    const int rc = r4d_rmsnorm_p_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, eps,
+                                      (int)x_ld, (int)y_ld, (long)(uintptr_t)s);
+    return rc == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
 /* ------------------------------------------------------------------ add / mul */
 
 enum { BI_A = 0, BI_B, BI_Y };
@@ -1393,6 +1598,76 @@ extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
                          (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
+/* ------------------------------------------------------------------ logit_softcap */
+
+extern "C" int r4d_rad_logit_softcap(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    /* Two legs, one op: bf16 (the logits buffer as the gemm writes it on the bf16 chain) and f32
+     * (the 1.3.0 sampling chain, where the gemm hands the sampler f32 rows). The dtype check
+     * moved from the entry to the call below because the legs differ, not the geometry. */
+    const bool leg_bf16 = (x->dtype == RAD_BF16) && (y->dtype == RAD_BF16);
+    const bool leg_f32  = (x->dtype == RAD_F32)  && (y->dtype == RAD_F32);
+    if (!leg_bf16 && !leg_f32) return R4D_NO(RAD_E_DTYPE);
+
+    /* `cap` is where the model lives: Gemma 4 issues it at 30.0. The default exists for the same
+     * reason every other one here does (a direct call with no declare in front), and the `> 0`
+     * test is load-bearing: a zero cap is a division by zero in every lane, not a bad answer. */
+    const float cap = (float)r4d_getf(a, "cap", 30.0);
+    if (!(cap > 0.0f)) return R4D_NO(RAD_E_INVAL);
+
+    /* ROW-WISE WITH A PITCH, same as sigmoid: issued against a column slice there is no contiguous
+     * extent to walk, and the contiguous case costs nothing. */
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    const long long y_ld = r4d_rows_pitch(y, n, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+
+    const int rc = leg_bf16
+        ? r4d_logit_softcap_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, cap,
+                                 (int)x_ld, (int)y_ld, (long)(uintptr_t)s)
+        : r4d_logit_softcap_f32(r4d_addr(x), r4d_addr(y), (int)M, (int)n, cap,
+                                (int)x_ld, (int)y_ld, (long)(uintptr_t)s);
+    return rc == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ------------------------------------------------------------------ scale */
+
+extern "C" int r4d_rad_scale(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* sc = r4d_opt(a, 1);
+    const RadTensor* y = r4d_opt(a, 2);
+    if (!x || !sc || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(x));
+    R4D_NEED(dt_bf16(y));
+
+    /* `s` is a [1] weight, f32 or bf16 (the layer_scalar weight is bf16 in the checkpoint). A
+     * scalar with no element is a shape error, not a broadcast of zero -- a zero scalar would be
+     * a plausible number, which is the thing the oracle rules out. Read on the device (the kernel
+     * reads s[0] once per block) rather than a host copy: a device-to-host copy of one element is
+     * a synchronisation on the step path, and the per-block read is cached. */
+    if (sc->dtype != RAD_F32 && sc->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (r4d_numel(sc) < 1) return R4D_NO(RAD_E_SHAPE);
+
+    /* ROW-WISE WITH A PITCH, same as sigmoid: issued against the residual stream at the end of a
+     * layer there is no contiguous extent to walk, and the contiguous case costs nothing. */
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    const long long y_ld = r4d_rows_pitch(y, n, &My);
+    if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
+
+    return r4d_scale_bf16(r4d_addr(x), r4d_addr(sc), sc->dtype, r4d_addr(y), (int)M, (int)n,
+                          (int)x_ld, (int)y_ld,
+                          (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
 /* ------------------------------------------------------------------ silu_mul */
 
 extern "C" int r4d_rad_silu_mul(const RadArgs* a, RadStream s) {
@@ -1414,6 +1689,28 @@ extern "C" int r4d_rad_silu_mul(const RadArgs* a, RadStream s) {
                              (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
+/* ------------------------------------------------------------------ gelu_mul */
+
+extern "C" int r4d_rad_gelu_mul(const RadArgs* a, RadStream s) {
+    const RadTensor* gu = r4d_opt(a, 0);
+    const RadTensor* y  = r4d_opt(a, 1);
+    if (!gu || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(gu));
+    R4D_NEED(dt_bf16(y));
+
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, Mg = 0;
+    const long long y_ld  = r4d_rows_pitch(y, n, &M);
+    const long long gu_ld = r4d_rows_pitch(gu, 2 * n, &Mg);
+    if (y_ld < 0 || gu_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || Mg < M) return R4D_NO(RAD_E_SHAPE);
+
+    const int rc = r4d_gelu_mul_bf16(r4d_addr(gu), r4d_addr(y), (int)M, (int)n, (int)gu_ld, (int)y_ld,
+                                     (long)(uintptr_t)s);
+    return rc == 0 ? RAD_OK : RAD_E_DEVICE;
+}
+
 /* ------------------------------------------------------------------ rope */
 
 enum { RP_QKV = 0, RP_POS };
@@ -1432,6 +1729,21 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     const long long rot       = r4d_geti_or(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0) return R4D_NO(RAD_E_SHAPE);
     if (rot <= 0 || rot > head_dim || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
+
+    /* `ladder`: `rotary` (default) measures the base ladder in `rot`; `head` in `head_dim`, the
+     * proportional variant. head_dim is already validated above, so `den = head_dim` is safe. */
+    const char* lad = r4d_gets(a, "ladder");
+    long long den = rot;
+    if (lad) {
+        if (!std::strcmp(lad, "head")) den = head_dim;
+        else if (std::strcmp(lad, "rotary") && std::strcmp(lad, "head"))
+            return R4D_NO(RAD_E_UNSUPPORTED);
+    }
+    /* `head` is HF's proportional RoPE: the rotation spans the WHOLE head (rotate_half over
+     * head_dim, so pair i is (i, i + head_dim/2)) and only the first rotary_dim/2 frequencies are
+     * non-zero. Rotating the first rotary_dim dims as a rotary of their own pairs (i, i + rot/2)
+     * instead -- Gemma 4's global layers, 128 of 512 -- turns the wrong channels, and long-range
+     * attention degrades with distance. */
 
     /* THE MODE, and with it how many components a position has. With [M] positions -- one
      * component a token -- mrope and imrope ARE neox: every frequency reads the same position and
@@ -1482,10 +1794,14 @@ extern "C" int r4d_rad_rope(const RadArgs* a, RadStream s) {
     if (yarn.factor != 0.0f && (mc == 4 || rscale != 1.0f)) return R4D_NO(RAD_E_UNSUPPORTED);
     /* The Q heads and the K heads rotate; the V heads that follow them do not, which is the whole
      * reason this op takes the fused projection rather than two tensors. */
+    long long rot_l = rot, nfreq = rot / 2;
+    if (den == head_dim && rot < head_dim && !multi && !gptj && mc == 0) rot_l = head_dim;
     return rope_launch(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,
-                       (int)(n_head + n_head_kv), (int)rot, gptj, theta, rscale, (int)pitch,
-                       mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s) == 0 ? RAD_OK
-                                                                          : RAD_E_DEVICE;
+                       (int)(n_head + n_head_kv), (int)rot_l, (int)den, gptj, theta, rscale,
+                       (int)pitch, mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s,
+                       (int)nfreq) == 0
+        ? RAD_OK
+        : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ kv_store */

@@ -48,6 +48,12 @@ struct ChunkGeometry {
     /* Every contributor by name, for the startup line and for the refusal. Built once. */
     std::string why;
 
+    /* NO LINEAR STATE, A SLIDING WINDOW: the checkpoint snapshots the window behind a prompt's
+     * tail (KVManager::has_window_snapshot) and nothing else. Chunks are not split at the
+     * interval -- a window snapshot in the middle of a prompt buys a later hit nothing its tail
+     * does not -- and the interval is only the shortest prompt worth a snapshot. */
+    bool window_ckpt = false;
+
     bool checkpoints() const { return checkpoint_interval > 0; }
 };
 

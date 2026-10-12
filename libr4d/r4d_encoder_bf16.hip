@@ -217,6 +217,61 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_kernel(
     }
 }
 
+// The `blocks` mode at any head_dim and section size (Gemma 4's vision tower: 72-wide heads, two
+// sections of 18 pairs) -- what the register layout above cannot hold. A wave a head and a lane a
+// rotated pair: the norm's sum of squares first, then each lane re-reads its pair, norms, gains,
+// rounds (the norm rounded before the rotation, as above) and rotates it. Channels past `rot`
+// are normed only; a v head (v_norm) is normed at unit gain.
+__global__ __launch_bounds__(kQkThreads) void qk_norm_rope_any_kernel(
+    uint16_t* __restrict__ qkv, const int* __restrict__ pos, const uint16_t* __restrict__ qw,
+    const uint16_t* __restrict__ kw, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
+    uint32_t rot, int v_norm, float theta, float eps, float rscale, float wadd, uint32_t ld,
+    QkBlocks blk, uint32_t pplane) {
+    __shared__ float cs_s[kQkMaxHalf], sn_s[kQkMaxHalf];
+    __shared__ int   pa_s[kQkMaxHalf], pb_s[kQkMaxHalf];
+    const uint32_t m = blockIdx.x;
+    const uint32_t n_rope = n_head + n_head_kv;
+    const uint32_t n_norm = n_rope + (v_norm ? n_head_kv : 0);
+    const uint32_t half = rot / 2;
+    uint16_t* row = qkv + (size_t)m * ld;
+    const float div = rscale != 0.0f ? rscale : 1.0f;
+    for (uint32_t i = threadIdx.x; i < half; i += kQkThreads) {
+        int c = 0, s0 = 0;
+        while (c + 1 < blk.n && (int)i >= s0 + blk.sec[c]) { s0 += blk.sec[c]; ++c; }
+        const float p = (float)pos[(size_t)blk.comp[c] * pplane + m] / div;
+        const float inv = 1.0f / powf(theta, (float)((int)i - s0) / (float)blk.sec[c]);
+        sincosf(p * inv, &sn_s[i], &cs_s[i]);
+        pa_s[i] = 2 * s0 + ((int)i - s0);
+        pb_s[i] = pa_s[i] + blk.sec[c];
+    }
+    __syncthreads();
+    const uint32_t lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    for (uint32_t hh = wave; hh < n_norm; hh += kQkThreads / 32) {
+        uint16_t* h = row + hh * head_dim;
+        float ss = 0.0f;
+        for (uint32_t e = lane; e < head_dim; e += 32) { const float v = bf2f(h[e]); ss += v * v; }
+        ss = r4d_wave_sum(ss);
+        const float sc = 1.0f / sqrtf(ss / (float)head_dim + eps);
+        const bool is_v = hh >= n_rope;
+        const uint16_t* w = hh < n_head ? qw : kw;
+        auto nrm = [&](uint32_t e) {
+            const float g = is_v ? 1.0f : bf2f(w[e]) + wadd;
+            return bf2f(f32_to_bf16(bf2f(h[e]) * sc * g));
+        };
+        if (is_v) {
+            for (uint32_t e = lane; e < head_dim; e += 32) h[e] = f32_to_bf16(nrm(e));
+            continue;
+        }
+        for (uint32_t i = lane; i < half; i += 32) {
+            const uint32_t a = (uint32_t)pa_s[i], b = (uint32_t)pb_s[i];
+            const float x0 = nrm(a), x1 = nrm(b);
+            h[a] = f32_to_bf16(x0 * cs_s[i] - x1 * sn_s[i]);
+            h[b] = f32_to_bf16(x0 * sn_s[i] + x1 * cs_s[i]);
+        }
+        for (uint32_t e = rot + lane; e < head_dim; e += 32) h[e] = f32_to_bf16(nrm(e));
+    }
+}
+
 // ---------------------------------------------------------------------------- pool_rows
 // ref_pool_rows: row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to
 // bf16, then times `mult` and rounded again. A workgroup an output row, a thread a column.
@@ -541,21 +596,32 @@ extern "C" int r4d_qk_norm_rope_bf16(long qkv, long pos, long qw, long kw, int M
                                      const QkBlocks* blk, int pplane, long stream) {
     if (!qkv || !pos || !qw || !kw) return -1;
     if (M <= 0 || head_dim <= 0 || n_head <= 0 || n_head_kv <= 0 || rot <= 0 || rot > head_dim ||
-        (rot & 1) || rot / 2 > (int)kQkMaxHalf || head_dim > 32 * kQkMaxE || head_dim % 32 ||
-        mode < 0 || mode > 2)
+        (rot & 1) || rot / 2 > (int)kQkMaxHalf || head_dim > 32 * kQkMaxE || mode < 0 || mode > 2)
         return -2;
+    if (mode != 2 && head_dim % 32) return -2;
     if (mode == 1 && head_dim % 64) return -2;
     if (mode == 0 && (rot / 2) % 32) return -2;
     QkBlocks b{};
+    bool any = false;   /* the blocks mode outside the register layout: qk_norm_rope_any_kernel */
     if (mode == 2) {
         if (!blk || blk->n <= 0 || blk->n > 8) return -2;
         b = *blk;
         int total = 0;
         for (int c = 0; c < b.n; ++c) {
-            if ((2 * total) % 32 || (b.sec[c] != 16 && b.sec[c] % 32)) return -2;
+            if (b.sec[c] <= 0) return -2;
+            if ((2 * total) % 32 || (b.sec[c] != 16 && b.sec[c] % 32)) any = true;
             total += b.sec[c];
         }
         if (2 * total != rot) return -2;
+        if (head_dim % 32) any = true;
+    }
+    if (any) {
+        hipLaunchKernelGGL(qk_norm_rope_any_kernel, dim3((uint32_t)M), dim3(kQkThreads), 0,
+                           (hipStream_t)stream, (uint16_t*)qkv, (const int*)pos,
+                           (const uint16_t*)qw, (const uint16_t*)kw, (uint32_t)head_dim,
+                           (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)rot, v_norm, theta,
+                           eps, rscale, wadd, (uint32_t)ld, b, (uint32_t)pplane);
+        return hipGetLastError() == hipSuccess ? 0 : -4;
     }
 #define R4D_QN(MD)                                                                              \
     hipLaunchKernelGGL(qk_norm_rope_kernel<MD>, dim3((uint32_t)M), dim3(kQkThreads), 0,         \
@@ -766,12 +832,14 @@ extern "C" int r4d_rad_qk_norm_rope(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_SHAPE);
     /* A head lives in a wave's registers with both halves of a rotary pair in one lane (or, for a
      * 16-pair block, in the two half-waves): head_dim a multiple of 32 up to 1024. */
-    if (hd % 32 || hd > 1024 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
+    if (hd > 1024 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
     const char* mode = r4d_gets(a, "mode");
     int md = 0;
     if (mode && !std::strcmp(mode, "gptj")) md = 1;
     else if (mode && !std::strcmp(mode, "blocks")) md = 2;
     else if (mode && std::strcmp(mode, "neox")) return R4D_NO(RAD_E_UNSUPPORTED);
+    /* Any head_dim in the blocks mode (qk_norm_rope_any_kernel); the others need multiples of 32. */
+    if (md != 2 && hd % 32) return R4D_NO(RAD_E_SHAPE);
     QkBlocks blk{};
     long long M = 0, pplane = 0;
     if (md == 2) {

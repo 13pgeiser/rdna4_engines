@@ -159,6 +159,7 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 | op | params | operands |
 |---|---|---|
 | `rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w? → `y` (no gain operand: a gain of one) |
+| `rmsnorm_p` | `M`(range) `n` `eps`:f64 `dtype` | `x` → `y` |
 | `rmsnorm_add` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`, `w`w → `y`, `residual_out` |
 | `hc_enter` | `M`(range) `n` `hc` `dtype` | `x` → `h` |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
@@ -178,10 +179,13 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 | `conv2d` | `M`(range) `width` `cin` `cout` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `dtype` | `x`, `w`w, `cu_seqlens`, `valid`? → `y` |
 | `conv1d_dw` | `M`(range) `n` `k` `cu_div`/opt `dtype` | `x`, `w`w, `cu_seqlens` → `y` |
 | `rel_sinusoid` | `M`(range) `n` `max_timescale`:f64/opt `dtype` | → `y` |
+| `gelu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gelu·up, tanh approx) |
 | `gelu` / `silu` | `M`(range) `n` `dtype` | `x` → `y` |
 | `cast` | `M`(range) `n` `from` `to` | `x` → `y` |
 | `softmax` | `M`(range) `n` `dtype` | `x` → `y` |
 | `sigmoid` | `M`(range) `n` `dtype` | `x` → `y` |
+| `logit_softcap` | `M`(range) `n` `cap`:f64 `dtype` | `x` → `y` |
+| `scale` | `M`(range) `n` `dtype` | `x`, `s`w → `y` |
 | `silu` | `M` `n` `dtype` | `x` → `y` |
 | `fill` | `M`(range) `n` `dtype` `value`:f64/opt | → `y` |
 
@@ -190,6 +194,15 @@ names one op.
 
 `rmsnorm_add` exists because the residual add and the next norm are one pass in every real
 implementation. A plugin asks for it first and falls back to `add` + `rmsnorm` (`spec.md` §2.3).
+
+`rmsnorm_p` is `rmsnorm` with the gain removed: `x * rsqrt(mean(x^2) + eps)` and no `w` at all.
+Gemma's attention normalises the value with a bare RMS (a weightless norm) while normalising the
+key with the `k_norm` gain in the same layer, and there is no checkpoint plane to feed the value
+through a gain -- `rmsnorm` would need a phantom all-zero weight to say the same thing.
+
+`gelu_mul` is `silu_mul` with the tanh GELU instead of silu -- Gemma's gated FFN is trained with
+`gelu_pytorch_tanh`, and gated feed-forwards ask for the tanh form rather than the unary `gelu`'s
+exact erf one. Both split the fused `gate_up` with the gate in the FIRST half.
 
 `hc_read` / `hc_write` are the GATED RESIDUAL pair, which is what a hyper-connection model has
 instead of a pre-norm and a residual add. The stream is `hc` times the model width and every block
@@ -375,6 +388,17 @@ spelling of `act`, not the vocabulary's.
 | `had_quant_act_i8g` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `gated_had_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
+| `rmsnorm_quant_i8` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+| `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
+
+`gelu_mul_quant_i8` is `gelu_mul` with the same quantiser on its pass, byte-identical to the pair.
+
+`rmsnorm_quant_i8` is `rmsnorm` with `quant_act_i8`'s quantiser on its pass — fragment-order int8
+codes and one f32 scale per row, the grid `gemm_nt_q` reads at `dtype=w4a8`. With `residual` the
+norm is of `residual + x`, stored back; `w_post` normalises `x` before that add and `scalar` (`[1]`)
+multiplies the sum after it, which together are a sandwich-norm model's residual junction
+(`rmsnorm` → `add` → `scale` → `rmsnorm` → `quant_act_i8`). Byte-identical to that chain: every
+intermediate the chain stores is rounded to bf16, and both sums of squares take `rmsnorm`'s partition.
 
 `gemm_nt_q_gated` is the row above pulled into the projection that feeds it: `gemm_nt_q` over a
 `[N, K]` gate_up plane — `N` is the WEIGHT's rows, twice the fused width, gate half first — with
@@ -430,9 +454,10 @@ that folds dequantisation into its epilogue still receives them.
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
-| `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `qkv`:inout, `positions` |
-| `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `positions` → `cos_sin` |
+| `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt | `qkv`:inout, `positions` |
+| `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`, `q_w`w, `k_w`w |
+| `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
 
 **`attn_local_rel`** is Gemma 4's audio attention: local, with a relative-position term and a
 softcap. Query row `i` of a segment sees the key rows `j` of the same segment with `0 <= i - j <=
@@ -465,6 +490,11 @@ of radius `r` (`|i - j| <= r`) is `window = r + 1`. `q`, `k` and `v` may each be
 `[tokens, heads * head_dim]`, and the second form may be a column slice of a fused projection read
 at that projection's row pitch -- which is how a tower's `[q|k|v]` row reaches it without a copy.
 
+**`qkv_norm_rope`** is the same prologue over SEPARATE `q`, `k` and `v` projections (Gemma 4's text
+attention, three GEMMs): the q and k norms, the unit-gain value norm and the rotary in one dispatch.
+`v_from_k` 1 takes v from the RAW k before the k norm (the k == v global class). The rotary parameters
+are `rope`'s, `ladder` included; byte-identical to `rmsnorm_p` + `rmsnorm` x2 + `rope` x2.
+
 **`qk_norm_rope`'s `v_norm`** set to 1 also RMS-norms every v head of the fused row with a UNIT
 gain and does not rotate it: Gemma 4's value norm, which has no weight to name.
 
@@ -484,6 +514,16 @@ owns: `mrope` gives contiguous runs of them to components 0, 1, ... (Qwen2-VL); 
 restarts the frequency ladder in each, `theta^(-2j / (2 s_c))` for the run's `j`-th frequency (a
 vision tower's 2-D rotary over row and column). With `[M]` positions every component is that one
 position, so `mrope` and `imrope` over a text batch are `neox` exactly.
+
+**`ladder` names the width the base frequency ladder is measured in.** Absent, or `rotary`, the
+exponent divides by `rotary_dim`: a partial rotary is a complete rotation of its own width, and
+every existing model is bit-for-bit unchanged. `head` divides by `head_dim` instead -- the
+**proportional** variant, where the `rotary_dim / 2` frequencies are a prefix of the full-width
+table rather than a table rescaled to the rotated width: at `head_dim 512, rotary_dim 128`,
+frequency `i = 1` wants `theta^(-1 / 256)`, not `theta^(-1 / 64)`. Only the base ladder moves
+(`axial` keeps its per-section ladders), and the tail of the head past `rotary_dim` is untouched
+either way. `rope_table` carries a `head_dim` param for the same reason: its angles must stay
+`rope`'s to the last operation.
 
 **`gemm_nt_bias`'s epilogue** is a linear layer's: the biased product rounded to `y`'s dtype, then
 `act` of it (`none`, `gelu` exact, `gelu_tanh`) rounded, then `res` added and rounded -- each step
@@ -883,6 +923,7 @@ by ~1 ULP, which breaks the replicated-state invariant. The build sets it global
 | op | params | operands |
 |---|---|---|
 | `ar_rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
+| `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
@@ -999,6 +1040,24 @@ holds only where the rank holds the WHOLE vocabulary -- `world_size` 1, not mere
 0. **Rank 0 of a vocab-parallel split has offset 0** and legitimately sees ids past its own slice
 on most steps, so a check keyed on the offset alone refuses correct calls. Bounding ids is the
 caller's, and the tokeniser and the sampler both already are.
+
+### `embed_lookup`'s runtime `mult`
+
+`mult` (optional f64, default 1) multiplies the rows that are FOUND: `x[m] = wte[id] * mult`.
+A missed row — negative padding or another rank's token — writes zero, not zero times the scale.
+Absent it is the plain gather the op has always been, which is what keeps every other caller in
+the tree bit-identical.
+
+**Not `wscale`.** `wscale` is the scale `embed_lookup_q`'s LAYOUT quantises with — a property of
+the stored table, read back as the dequant. `mult` is applied AFTER the gather, to the rows that
+come out of it; `embed_lookup_q` takes no `mult` at all, because its rows arrive already scaled by
+the table's own dequant.
+
+**Why it exists**: Gemma 4 scales its embedding by `sqrt(n_embd)` at the lookup — the reference's
+`build_inp_embd` and HF's `Gemma4TextScaledWordEmbedding` both do it there, and the checkpoint's
+table is plain. Baking it into the table instead would untie it from the head, which the model
+ties and which the checkpoint stores twice; scaling the lookup leaves the table and the head the
+same tensor the weights loader already maps.
 
 ### `embed_lookup_q`, the n-gram gather
 

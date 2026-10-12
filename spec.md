@@ -1472,6 +1472,12 @@ how a value is encoded — is plain data (`core/text/chatfmt.h`), and everything
 spelling is derived from it: the parser that reads the reply back, the lazy tool-call grammar and
 the literal words that trigger it, and the control tokens the decoder must render as text.
 
+Two families of call syntax are described. In the tagged one each argument has its own tags
+(Qwen's `<parameter=NAME>`, MiniCPM's `<param name="NAME">`) and is typed by the tool's schema. In
+the object one a call is its name and ONE object holding the arguments — JSON, or a dialect of
+it with strings between declared delimiters and bare keys, as Gemma 4 writes
+`call:NAME{path:<|"|>/a<|"|>,limit:3}` — and the values carry their own types.
+
 There are two producers, in order of precedence. An architecture plugin may declare the format
 through the optional `rad_arch_chat_format` export (`abi/rad_builder.h`) — a new model whose
 template the analysis cannot read is supported by stating its format once. Otherwise the format

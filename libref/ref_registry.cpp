@@ -155,6 +155,9 @@ static const RadParamSpec pMnD[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `scalar` 1 says `w` is one element rather than one row: a kernel reads that off the operand, and
  * the parameter is what lets a shape description say which of the two geometries it is. */
 static const RadParamSpec pMulWeight[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("scalar") };
+/* `cap` required and not optional: a softcap without a cap is a different op, and the one model in
+ * scope whose graph issues it (Gemma 4) has a value for it. */
+static const RadParamSpec pMnCap[] = { P_INT("M"), P_INT("n"), P_F64("cap"), P_STR("dtype") };
 static const RadOperandSpec oBinary[]  = { OPD("a"), OPD("b"), OUT("y") };
 static const RadOperandSpec oGateUp[]  = { OPD("gate_up"), OUT("y") };
 static const RadOperandSpec oMulWeight[] = { OPD("x"), WGT("w"), OUT("y") };
@@ -190,6 +193,7 @@ static const RadOperandSpec oAttnLocalRel[] = { OPD("q"), OPD("k"), OPD("v"), OP
 /* `fill` has no input: `value` is the whole of what it writes. */
 static const RadParamSpec pFill[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value") };
 static const RadOperandSpec oFill[] = { OUT("y") };
+static const RadOperandSpec oScale[]   = { OPD("x"), WGT("s"), OUT("y") };
 static const RadOperandSpec oGather[]  = { OPD("x"), OPD("idx"), OUT("y") };
 static const RadOperandSpec oScatterRows[] = { OPD("v"), OPD("idx"), INOUT("x") };
 
@@ -323,7 +327,8 @@ static const RadParamSpec pRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_he
                                       P_INT("n_head_kv"), P_F64("theta"), P_F64("scale"),
                                       P_STR("mode"), P_INTO("rotary_dim"), P_STRO("sections"),
                                       P_F64O("yarn_factor"), P_F64O("yarn_low"),
-                                      P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+                                      P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
+                                      P_STRO("ladder") };
 static const RadOperandSpec oRope[] = { INOUT("qkv"), OPD("positions") };
 
 /* The cos/sin plane a fused prologue reads instead of theta: written at each position's OWN row
@@ -332,7 +337,8 @@ static const RadOperandSpec oRope[] = { INOUT("qkv"), OPD("positions") };
 static const RadParamSpec pRopeTable[] = { P_INT("M"), P_INT("rot"), P_F64("theta"),
                                            P_F64("scale"), P_STR("dtype"),
                                            P_F64O("yarn_factor"), P_F64O("yarn_low"),
-                                           P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+                                           P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
+                                           P_INTO("head_dim"), P_STRO("ladder") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
 
 /* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
@@ -628,6 +634,11 @@ static const RadOpSchema kSchemas[] = {
   "Spelled `wadd` and not `w_add` because that is what libr4d's fused norms call it and one "
   "vocabulary cannot have two spellings of one parameter. `mult` (default 1) scales the row "
   "before its one rounding." },
+{ "rmsnorm_p", ARR(pLayernorm), ARR(oUnary),
+  "y = x * rsqrt(mean(x^2) + eps); an rmsnorm with NO gain tensor at all. wadd is 1 so the result "
+  "is a plain normalisation. Gemma's attention normalises the value with a bare RMS (a weightless "
+  "ggml_rms_norm) and the key with the k_norm gain in the same layer, which one op with a required "
+  "gain cannot express." },
 { "rmsnorm_add", ARR(pRmsnormAdd), ARR(oRmsnormAdd),
   "residual_out = x + residual, then y = rmsnorm(residual_out) * w. The variance is taken from "
   "the unrounded f32 sum; the multiply reads residual_out back AFTER it has been narrowed, which "
@@ -704,6 +715,10 @@ static const RadOpSchema kSchemas[] = {
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
   "y[i] = silu(gate_up[i]) * gate_up[n + i]. The GATE IS THE FIRST HALF, which is the order "
   "rad-convert fuses gate and up into one weight in." },
+{ "gelu_mul", ARR(pMnD), ARR(oGateUp),
+  "y[i] = gelu_tanh(gate_up[i]) * gate_up[n + i], the tanh approximation (gemma's "
+  "gelu_pytorch_tanh), and the GATE IS THE FIRST HALF as in silu_mul. Its own op, not gelu, because "
+  "gated feed-forwards are trained with the tanh form and the unary gelu is the exact erf one." },
 { "gelu", ARR(pMnD), ARR(oUnary),
   "y = 0.5x(1 + erf(x/sqrt(2))). The exact erf form, not the tanh approximation." },
 { "silu", ARR(pMnD), ARR(oUnary), "y = x * sigmoid(x)." },
@@ -712,6 +727,10 @@ static const RadOpSchema kSchemas[] = {
   "y = value, every element of an [M, n] extent (default 0), rounded once to y's dtype. The op a "
   "rank issues where it computes nothing and a reader downstream -- an all-reduce, a residual -- "
   "still expects a defined buffer." },
+{ "logit_softcap", ARR(pMnCap), ARR(oUnary), "y = cap * tanh(x / cap); the final-logit softcap." },
+{ "scale", ARR(pMnD), ARR(oScale),
+  "y = x * s, s a [1] weight broadcast over every element; the per-tensor scalar (per-layer scalar, "
+  "`mul` broadcasts a row, `scale_rows` a column-per-row)." },
 { "ple_gate", ARR(pPleGate), ARR(oPleGate),
   "Per-Layer Embedding's gate. K = grouped_rmsnorm(k) * (w_key + wadd) and Q likewise over `q`, "
   "one rsqrt per `n`-wide stream and one gain across all hc*n; s[c] = sum_d K[c][d]*Q[c][d] / "
@@ -1095,6 +1114,8 @@ static const RadOpSchema kSchemas[] = {
 static const RadKernelInfo kKernels[] = {
 SIMPLE("ref_rmsnorm", "rmsnorm", "norm", "root-mean-square norm with a gain", DT_FLOAT,
        ref_rmsnorm),
+SIMPLE("ref_rmsnorm_p", "rmsnorm_p", "norm", "weightless RMS norm (no gain, plain x/rms)", DT_FLOAT,
+       ref_rmsnorm_p),
 SIMPLE("ref_rmsnorm_add", "rmsnorm_add", "norm", "residual add then RMS norm", DT_FLOAT,
        ref_rmsnorm_add),
 SIMPLE("ref_hc_enter", "hc_enter", "norm", "gated residual entry: hc copies of x", DT_FLOAT,
@@ -1116,7 +1137,7 @@ SIMPLE("ref_grid_embed_aa", "grid_embed_aa", "elem",
 SIMPLE("ref_add", "add", "elem", "elementwise sum", DT_FLOAT, ref_add),
 SIMPLE("ref_mul", "mul", "elem", "elementwise product", DT_FLOAT, ref_mul),
 SIMPLE("ref_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", DT_FLOAT,
-       ref_silu_mul),
+        ref_silu_mul),
 SIMPLE("ref_act_mul", "act_mul", "elem", "act(a) * b over two operands", DT_FLOAT, ref_act_mul),
 SIMPLE("ref_mul_weight", "mul_weight", "elem", "x * a scalar or one-row weight", DT_FLOAT,
        ref_mul_weight),
@@ -1139,6 +1160,13 @@ SIMPLE("ref_gelu", "gelu", "elem", "exact erf gelu", DT_FLOAT, ref_gelu),
 SIMPLE("ref_silu", "silu", "elem", "silu", DT_FLOAT, ref_silu),
 SIMPLE("ref_sigmoid", "sigmoid", "elem", "logistic sigmoid", DT_FLOAT, ref_sigmoid),
 SIMPLE("ref_fill", "fill", "elem", "constant fill", DT_FLOAT, ref_fill),
+SIMPLE("ref_gelu_mul", "gelu_mul", "elem",
+       "tanh-gelu-gated product over a fused gate_up (gemma's gelu_pytorch_tanh)", DT_FLOAT,
+       ref_gelu_mul),
+SIMPLE("ref_logit_softcap", "logit_softcap", "elem", "final-logit softcap: cap * tanh(x / cap)",
+       DT_FLOAT, ref_logit_softcap),
+SIMPLE("ref_scale", "scale", "elem", "per-tensor scalar scale: y = x * s (s a [1] weight)",
+       DT_FLOAT, ref_scale),
 SIMPLE("ref_ngram_ids", "ngram_ids", "vocab", "hashed n-gram row ids for PLE", DT_ANY,
        ref_ngram_ids),
 SIMPLE("ref_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot, a signed sqrt",

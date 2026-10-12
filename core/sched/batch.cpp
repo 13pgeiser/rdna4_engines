@@ -185,8 +185,12 @@ void BatchBuilder::size_set(Set& s, const std::vector<KVGroupInfo>& groups) {
         s.groups[gi].block_size = e.block_size;
         int64_t mb = 1;
         if (e.paged) {
-            int64_t span = (e.kind == RAD_KV_WINDOW && e.window > 0 && e.window < max_ctx_)
-                         ? e.window : max_ctx_;
+            /* A WINDOW row holds the window behind the step's first query AND the step's own
+             * tokens (KVManager::ensure keeps both), so it is sized for a whole chunk past the
+             * window -- plus the speculative lookahead, which a verify row carries on top. */
+            const int64_t wspan = e.window + max_tok_ + 2 * ((int64_t)std::max(cfg_.n_spec, 0) + 1);
+            int64_t span = (e.kind == RAD_KV_WINDOW && e.window > 0 && wspan < max_ctx_)
+                         ? wspan : max_ctx_;
             mb = (span + e.block_size - 1) / e.block_size + 1;
         }
         s.groups[gi].max_blocks = mb;

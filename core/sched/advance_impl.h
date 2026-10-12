@@ -109,6 +109,22 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
         return;
     }
     case ADV_HIST: {
+        if (a.shared_kv) {
+            /* A HEAD THAT READS THE TRUNK'S CACHE AND KEEPS NONE (rad_drafter_shared_kv). There is
+             * no history to fill, so the pass is round 1 alone and its one row is the last one of
+             * the run below: the committed position, the trunk's row there, the token the trunk
+             * chose after it. Its context is the committed positions and NOT the verify step's
+             * whole run -- the cache past the committed position holds the K and V of the drafts
+             * this verify rejected. The host staged the run's first trunk row; the card adds the
+             * drafts it accepted. */
+            int32_t* out = adv_i32(a, a.out_off);
+            tok[k] = a.src[rout + S.acc];
+            adv_pos(a, pos, k, S.head + a.rot_shift);
+            out[k] += S.acc;
+            ctx[i] = S.head;
+            adv_groups(a, i, k, S.head, 1);
+            return;
+        }
         /* `aux` positions the host already knew the tokens of, then the verify step's own
          * positions up to the last one it committed, each with the token committed after it --
          * the sampler's pick there, since the drafts before it agreed with it. The pass has a
@@ -133,12 +149,14 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     }
     case ADV_ROUND: {
         /* Round 2 onward: round 1 is the history pass's last row (ADV_HIST above), so every
-         * round embeds the proposal of the round before it. */
-        const int32_t base = S.head + a.round - 1;
+         * round embeds the proposal of the round before it. A head with no cache of its own does
+         * not step forward: it stays at the committed position over the committed context, and
+         * what it proposed reaches the next round through its own hidden state. */
+        const int32_t base = a.shared_kv ? S.head : S.head + a.round - 1;
         const int32_t t = a.src[(int64_t)i * a.src_pitch];
         S.tok[a.round - 1] = t;
         tok[k] = t;
-        adv_pos(a, pos, k, base);
+        adv_pos(a, pos, k, a.shared_kv ? base + a.rot_shift : base);
         ctx[i] = base;
         adv_groups(a, i, k, base, 1);
         return;

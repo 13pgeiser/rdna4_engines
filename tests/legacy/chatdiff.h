@@ -13,6 +13,8 @@
 #include "text/chatparse.h"
 #include "toolparse_legacy.h"
 
+struct RadChatFormat;
+
 #include <nlohmann/json.hpp>
 
 #include <memory>
@@ -31,6 +33,9 @@ struct Model {
     std::string dir;                          /* under the fixture root */
     std::string bos, eos;
     std::vector<std::string> terminators;     /* its end-of-generation spellings */
+    /* The architecture plugin's reply format, when it declares one; null derives the format from
+     * the template, as the engine does. */
+    const RadChatFormat* declared = nullptr;
 };
 const std::vector<Model>& models();
 

@@ -254,6 +254,15 @@ extern "C" int r4d_rad_attn_prefill_h256_bf16(const RadArgs* a, RadStream s) {
  * step off its pothole doubles the splits at one count and not at the next. A step may carry any
  * count up to the bound, so the region is the largest over all of them. The laws are closed forms
  * and this runs at declare, so the sweep costs nothing a step. */
+// One hook per geometry but one shared (seqs x heads x rows) partial layout, so the worst-over-
+// the-batch sweep below asks each geometry its own bytes in one place instead of triplicating the
+// sweep. which: 0 = h256/gqa6, 1 = h128/gqa4, 2 = h256/gqa2 (the Gemma 4 windowed leg).
+static int64_t decode_scratch_bytes_of(const R4DArgs* r, int which) {
+    if (which == 1) return (int64_t)r4d_attn_decode_h128_gqa4_scratch_bytes(r);
+    if (which == 2) return (int64_t)r4d_attn_decode_h256_gqa2_scratch_bytes(r);
+    return (int64_t)r4d_attn_decode_h256_gqa6_scratch_bytes(r);
+}
+
 static int64_t decode_scratch(const RadArgs* a, int head_dim, int which) {
     const int sp = split_of(a);
     if (sp < 0) return R4D_NO(RAD_E_INVAL);
@@ -278,8 +287,7 @@ static int64_t decode_scratch(const RadArgs* a, int head_dim, int which) {
         int64_t worst = 0;
         for (long long n = 1; n <= max_seqs; ++n) {
             r.num_seqs = (int)n;
-            const int64_t need = which == 0 ? r4d_attn_decode_h256_gqa6_scratch_bytes(&r)
-                                            : r4d_attn_decode_h128_gqa4_scratch_bytes(&r);
+            const int64_t need = decode_scratch_bytes_of(&r, which);
             if (need > worst) worst = need;
         }
         return worst;
@@ -288,8 +296,7 @@ static int64_t decode_scratch(const RadArgs* a, int head_dim, int which) {
     int rc = fill_paged(a, &r, head_dim);
     if (rc != RAD_OK) return rc;
     r.splits = sp;
-    return which == 0 ? r4d_attn_decode_h256_gqa6_scratch_bytes(&r)
-                      : r4d_attn_decode_h128_gqa4_scratch_bytes(&r);
+    return decode_scratch_bytes_of(&r, which);
 }
 
 extern "C" int64_t r4d_rad_attn_decode_h256_scratch(const RadArgs* a) {
@@ -306,8 +313,7 @@ static int decode_common(const RadArgs* a, R4DArgs* r, int head_dim, int which) 
     int rc = fill_paged(a, r, head_dim);
     if (rc != RAD_OK) return rc;
     r->splits = sp;
-    const int64_t need = (which == 0) ? r4d_attn_decode_h256_gqa6_scratch_bytes(r)
-                                      : r4d_attn_decode_h128_gqa4_scratch_bytes(r);
+    const int64_t need = decode_scratch_bytes_of(r, which);
     if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
     return RAD_OK;
 }
@@ -342,4 +348,27 @@ extern "C" int r4d_rad_attn_decode_h128_bf16(const RadArgs* a, RadStream s) {
     int rc = decode_common(a, &r, 128, 1);
     if (rc != RAD_OK) return rc;
     return r4d_attn_decode_h128_gqa4_bf16kv(&r, (hipStream_t)s);
+}
+
+/* Gemma 4 dense sliding window -- head_dim 256, 2 queries per KV head, window 1024. Decode only;
+ * a prefill step does not match the row's q_len band and takes the caller's (windowed) fallback.
+ * Same shape as the drafter leg above (h128): one `which` routing to the gqa2 scratch law and the
+ * gqa2 decode launch, no check_dims_once because this is not the geometry that reports dims. */
+extern "C" int64_t r4d_rad_attn_decode_h256_gqa2_scratch(const RadArgs* a) {
+    return decode_scratch(a, 256, 2);
+}
+
+extern "C" int r4d_rad_attn_decode_h256_gqa2_fp8(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 2);
+    if (rc != RAD_OK) return rc;
+    /* Absent descales mean 1.0; see the prefill twin above. */
+    return r4d_attn_decode_h256_gqa2_fp8kv(&r, (hipStream_t)s);
+}
+
+extern "C" int r4d_rad_attn_decode_h256_gqa2_bf16(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 2);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h256_gqa2_bf16kv(&r, (hipStream_t)s);
 }

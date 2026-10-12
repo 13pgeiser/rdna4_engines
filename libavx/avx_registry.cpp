@@ -136,6 +136,8 @@ static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coor
 
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadParamSpec pMulWeight[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("scalar") };
+/* `cap` required, for the reason libref's pMnCap states: a softcap without a cap is a different op. */
+static const RadParamSpec pMnCap[]    = { P_INT("M"), P_INT("n"), P_F64("cap"), P_STR("dtype") };
 static const RadOperandSpec oBinary[] = { OPD("a"), OPD("b"), OUT("y") };
 static const RadOperandSpec oMulWeight[] = { OPD("x"), WGT("w"), OUT("y") };
 static const RadParamSpec pActMul[]   = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
@@ -167,6 +169,7 @@ static const RadOperandSpec oAttnLocalRel[] = { OPD("q"), OPD("k"), OPD("v"), OP
 /* `fill` has no input: `value` is the whole of what it writes. */
 static const RadParamSpec pFill[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("value") };
 static const RadOperandSpec oFill[] = { OUT("y") };
+static const RadOperandSpec oScale[]  = { OPD("x"), WGT("s"), OUT("y") };
 static const RadOperandSpec oGather[] = { OPD("x"), OPD("idx"), OUT("y") };
 static const RadOperandSpec oScatterRows[] = { OPD("v"), OPD("idx"), INOUT("x") };
 
@@ -255,13 +258,15 @@ static const RadParamSpec pRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_
                                         P_INT("n_head_kv"), P_F64("theta"), P_F64("scale"),
                                         P_STR("mode"), P_INTO("rotary_dim"), P_STRO("sections"),
                                         P_F64O("yarn_factor"), P_F64O("yarn_low"),
-                                        P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+                                        P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
+                                        P_STRO("ladder") };
 static const RadOperandSpec oRope[] = { INOUT("qkv"), OPD("positions") };
 
 static const RadParamSpec pRopeTable[]   = { P_INT("M"), P_INT("rot"), P_F64("theta"),
                                              P_F64("scale"), P_STR("dtype"),
                                              P_F64O("yarn_factor"), P_F64O("yarn_low"),
-                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
+                                             P_INTO("head_dim"), P_STRO("ladder") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
 
 /* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
@@ -481,6 +486,9 @@ static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). The sum of squares is a four-accumulator vector "
   "reduction, so it does not sum in libref's order and does not claim to." },
+{ "rmsnorm_p", ARR(pLayernorm), ARR(oUnary),
+  "y = x * rsqrt(mean(x^2) + eps), the rmsnorm with no gain at all. Same four-accumulator sum of "
+  "squares as rmsnorm; the only difference is there is no weight to widen, so the op has no `w`." },
 { "rmsnorm_add", ARR(pRmsnormAdd), ARR(oRmsnormAdd),
   "residual_out = x + residual, then y = rmsnorm(residual_out) * w. The variance is taken from the "
   "unrounded f32 sum and the multiply reads residual_out back AFTER narrowing -- both are libref's "
@@ -524,10 +532,15 @@ static const RadOpSchema kSchemas[] = {
   "y[r] = the mean of x's rows [r*k, r*k + k), rounded to y's dtype, times mult, rounded again." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
   "silu-gated product over a fused [M, 2n] gate_up: y = silu(gate) * up." },
+{ "gelu_mul", ARR(pMnD), ARR(oGateUp),
+  "gelu_mul over a fused [M, 2n] gate_up: y = gelu_tanh(gate) * up, gate the FIRST half, the tanh "
+  "form (libref's act_gelu_tanh, std::tanh) rather than the exact-erf gelu." },
 { "gelu", ARR(pMnD), ARR(oUnary), "exact erf gelu." },
 { "silu", ARR(pMnD), ARR(oUnary), "silu." },
 { "sigmoid", ARR(pMnD), ARR(oUnary), "logistic sigmoid." },
 { "fill", ARR(pFill), ARR(oFill), "y = value over [M, n], rounded once to y's dtype (default 0)." },
+{ "logit_softcap", ARR(pMnCap), ARR(oUnary), "cap * tanh(x / cap), the final-logit softcap." },
+{ "scale", ARR(pMnD), ARR(oScale), "y = x * s, s a [1] weight broadcast over every element." },
 { "ple_gate", ARR(pPleGate), ARR(oPleGate),
   "PLE gate: three grouped norms, a dot, a signed sqrt." },
 { "ple_conv", ARR(pPleConv), ARR(oPleConv),
@@ -692,6 +705,8 @@ AVX_OP_LIST(AVX_THUNK_DECL)
 
 static const RadKernelInfo kKernels[] = {
 SIMPLE("avx_rmsnorm", "rmsnorm", "norm", "root-mean-square norm with a gain", DT_FLOAT, L(rmsnorm)),
+SIMPLE("avx_rmsnorm_p", "rmsnorm_p", "norm", "weightless RMS norm (no gain)", DT_FLOAT,
+       L(rmsnorm_p)),
 SIMPLE("avx_rmsnorm_add", "rmsnorm_add", "norm", "residual add then RMS norm", DT_FLOAT,
        L(rmsnorm_add)),
 SIMPLE("avx_hc_enter", "hc_enter", "norm", "gated residual entry: hc copies of x", DT_FLOAT,
@@ -731,10 +746,15 @@ SIMPLE("avx_attn_local_rel", "attn_local_rel", "attn",
        L(attn_local_rel)),
 SIMPLE("avx_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", DT_FLOAT,
        L(silu_mul)),
+SIMPLE("avx_gelu_mul", "gelu_mul", "elem", "gelu_tanh-gated product over a fused gate_up", DT_FLOAT,
+       L(gelu_mul)),
 SIMPLE("avx_gelu", "gelu", "elem", "exact erf gelu", DT_FLOAT, L(gelu)),
 SIMPLE("avx_silu", "silu", "elem", "silu", DT_FLOAT, L(silu)),
 SIMPLE("avx_sigmoid", "sigmoid", "elem", "logistic sigmoid", DT_FLOAT, L(sigmoid)),
 SIMPLE("avx_fill", "fill", "elem", "constant fill", DT_FLOAT, L(fill)),
+SIMPLE("avx_logit_softcap", "logit_softcap", "elem", "final-logit softcap: cap * tanh(x / cap)",
+       DT_FLOAT, L(logit_softcap)),
+SIMPLE("avx_scale", "scale", "elem", "a [1] weight broadcast over every element", DT_FLOAT, L(scale)),
 SIMPLE("avx_gather_rows", "gather_rows", "elem", "y[i,:] = x[idx[i],:]", DT_ANY, L(gather_rows)),
 SIMPLE("avx_scatter_rows", "scatter_rows", "elem", "x[idx[i],:] = v[i,:]", DT_ANY,
        L(scatter_rows)),

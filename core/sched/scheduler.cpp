@@ -87,6 +87,21 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  n_paged, pc->cached_groups().size(),
                  hit_holes_draft_ ? "LEAVES a hole in a drafter's own KV" : "leaves no hole");
     }
+    /* THE TRUNK'S SHARE of that question: a paged group a TRUNK layer reads (a bound layer below
+     * the trunk's layer count — a drafter borrows from base_layer and above) that the cache does
+     * not index. Its hole is not repairable by recomputing the tail; see scheduler.h. */
+    hit_holes_trunk_ = false;
+    for (size_t i = 0; i < prog.kv_groups.size(); ++i) {
+        if (kv->block_tokens((int32_t)i) <= 0) continue;
+        bool trunk = false;
+        for (int l : prog.kv_groups[i].layers) if (l < prog.meta.n_layers) { trunk = true; break; }
+        if (!trunk) continue;
+        const std::vector<int32_t>& cg = pc->cached_groups();
+        if (std::find(cg.begin(), cg.end(), (int32_t)i) == cg.end()) { hit_holes_trunk_ = true; break; }
+    }
+    if (hit_holes_trunk_ && cfg.prefix_cache)
+        RAD_INFO("prefix cache: a trunk layer's windowed group is not prefix-cached -- a hit "
+                 "resumes from a window snapshot (a checkpoint slot) or re-prefills");
     draft_refill_ = 0;
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
         hit_holes_draft_) {
@@ -94,6 +109,14 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         RAD_INFO("draft refill: a prefix hit ends %lld tokens before the prompt's end, so the "
                  "drafter's window is recomputed", (long long)draft_refill_);
     }
+
+    serial_shared_    = cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_SERIAL &&
+                        prog.drafter_shared_kv;
+    serial_rot_shift_ = serial_shared_ ? prog.drafter_pos_offset : 0;
+    if (serial_shared_)
+        RAD_INFO("serial drafter: reads the trunk's cache and keeps none -- no history pass, one "
+                 "row a drafting sequence, every round at the committed position%s",
+                 serial_rot_shift_ ? " (rotated one past it)" : "");
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
@@ -726,6 +749,7 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
     if (geo_.checkpoints()) {
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
+        if (geo_.window_ckpt) next = INT64_MAX;          /* a window snapshot: the tail only */
         if (n_computed + want > next) want = next - n_computed;
         if (n_computed + want == next) {
             if (checkpoint_pos) *checkpoint_pos = next;
@@ -778,6 +802,7 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
 bool Scheduler::last_checkpoint(int64_t pos, int64_t target) const {
     if (!geo_.checkpoints()) return false;
     const int64_t I = geo_.checkpoint_interval;
+    if (geo_.window_ckpt) { const int64_t t = tail_checkpoint(target); return t > 0 && t <= pos; }
     if ((pos / I + 1) * I <= target) return false;
     return tail_checkpoint(target) <= pos;
 }
@@ -789,6 +814,15 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
     const int64_t tail = target / Q * Q;
+    /* A WINDOW SNAPSHOT is taken at the tail of any prompt of an interval or more. */
+    /* A block short of the end: the next turn re-renders the last few tokens (a generation
+     * prompt it replaces with the reply), and a snapshot past where the two renderings part is
+     * one no hit can reach -- measured: every prompt whose length left fewer than ~8 tokens in
+     * its last block missed. */
+    if (geo_.window_ckpt) {
+        const int64_t t = (target - std::max<int64_t>(Q, 16)) / Q * Q;
+        return t >= I ? t : -1;
+    }
     return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
 
@@ -864,7 +898,7 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
         cap = std::max(cap, floor);
         const int64_t remaining = n_target - n_computed;
         int64_t span = remaining;                       /* where this run of chunks must end */
-        if (geo_.checkpoints()) {
+        if (geo_.checkpoints() && !geo_.window_ckpt) {
             const int64_t I = geo_.checkpoint_interval;
             span = std::min(span, ((n_computed / I) + 1) * I - n_computed);
         }
@@ -978,6 +1012,36 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * snapshot to resume from -- that is every recurrent layer continuing from whatever the
          * slot last held, and it reads as fluent text rather than as a failure. */
         if (reuse > 0 && has_linear_state_ && h.checkpoint_slot < 0) reuse = 0;
+        /* A WINDOW SNAPSHOT COVERS THE TRUNK'S WINDOWED GROUPS -- at the checkpoint and nowhere
+         * else. The lookup clamped the hit to it (PrefixCache: a window counts as state there),
+         * so a hit with a slot is exactly at a snapshot; one without is no hit. */
+        const bool win_hit = geo_.window_ckpt && kv_->has_window_snapshot() && reuse > 0 &&
+                             h.checkpoint_slot >= 0 && reuse == h.n_linear_tokens;
+
+        /* THE WINDOWED-GROUP CLAMP — a prefix hit on a model whose OWN (trunk) KV includes a
+         * paged group the cache does not index. prefix.cpp skips RAD_KV_WINDOW groups — their
+         * blocks below the window are recycled, so no block list describes them; the comment
+         * there says a hit "costs the sequences ... a windowed layer whose cache starts where
+         * the hit ended" — this is that cost in KV corruption. The adopted blocks cover the
+         * cached groups ONLY, while `used = ctx_len + n_tokens` (batch.cpp) makes every
+         * windowed trunk layer read the positions below ctx_len that this sequence NEVER WROTE
+         * — and grab_block's min-heap (kv.cpp) hands this sequence the very blocks the most
+         * recent tenant wrote. The model then attends to the PREVIOUS REQUEST'S KV as its own
+         * prefix: fluent text carrying the last request's CONTENT. Zero the reuse; the whole
+         * prompt re-prefills, which is what a window snapshot (below) exists to avoid -- seconds
+         * to minutes of first-token time on a long agent turn.
+         *
+         * NOT the drafter's hole. A drafter's own group (bound at base_layer and above — see
+         * scheduler.h) is repaired by draft refill, which CAPS the hit so the recompute covers
+         * the drafter's window while the trunk reuses the rest; zeroing here would delete that
+         * design. The trunk's hole, which no tail-recompute can fix, is this clamp's own. */
+        if (reuse > 0 && hit_holes_trunk_ && !win_hit) {
+            reuse = 0;
+            RAD_DEBUG("admit %llu: prefix hit %lld zeroed -- a trunk paged group is not "
+                      "prefix-cached (windowed) and no window snapshot covers it; re-prefilling",
+                      (unsigned long long)r.id,
+                      (long long)h.n_attn_tokens);
+        }
 
         /* Claim the cached blocks. Without this the hit is only an accounting entry: the sequence
          * would skip computing those tokens and then attend to blocks it does not own. adopt()
@@ -998,11 +1062,18 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                     break;
                 }
             }
+            /* The windowed groups start at the floor of the window behind the hit, in fresh
+             * blocks the entry's restore fills from the snapshot. */
+            if (reuse > 0 && win_hit && kv_->seed_window(r.id, reuse) < 0) {
+                kv_->preempt(r.id);
+                reuse = 0;
+            }
         }
 
         r.n_computed = reuse;
         r.n_cached = reuse;
-        s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens) ? h.checkpoint_slot : -1;
+        s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
+                      (has_linear_state_ || win_hit)) ? h.checkpoint_slot : -1;
         s.hit_attn = h.n_attn_tokens;
     }
 
@@ -1026,7 +1097,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         /* THE CACHE GIVES WAY TO A NEW REQUEST as it does to a running one: with nothing running,
          * no other path would ever take blocks back from it, and the request would wait for good. */
         int rounds = 0;
-        while (kv_->ensure(r.id, r.n_computed + want) < 0) {
+        while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
             if (++rounds > 256 || !cfg_.prefix_cache || pc_->evict(256) <= 0) {
                 rc = RAD_E_NOMEM;
                 break;
@@ -1217,7 +1288,7 @@ const RadBatch* Scheduler::step() {
         static const int kMaxEvictRounds = 256;
         int evict_rounds = 0;
         bool failed = false;
-        while (kv_->ensure(r.id, r.n_computed + want) < 0) {
+        while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
             /* THE CACHE GIVES ITS BLOCKS BACK BEFORE A RUNNING REQUEST DOES. Everything the prefix
              * cache holds is a saving on work that has already been done once; everything a
              * running request holds is work in flight. Evicting first is therefore strictly the
@@ -1429,7 +1500,7 @@ const RadBatch* Scheduler::step() {
         int64_t ckpt = -1;
         const int64_t grown = e.ckpt_slot < 0 && limit > had
             ? plan_chunk(r.n_computed, s.seq_len(), limit, &ckpt, r.checkpoint_at) : had;
-        if (grown > had && kv_->ensure(r.id, r.n_computed + grown) >= 0) {
+        if (grown > had && kv_->ensure_from(r.id, r.n_computed + grown, r.n_computed) >= 0) {
             e.n_tokens = (int32_t)grown;
             e.produces_token = (r.n_computed + grown >= s.seq_len());
             if (ckpt > 0) {
@@ -1681,7 +1752,7 @@ const RadBatch* Scheduler::step_next_locked() {
         const int32_t d      = s.draft_next;
         const int64_t want   = 1 + d;
         if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_) return nullptr;
-        if (kv_->ensure(r.id, ctx_up + want) < 0) return nullptr;
+        if (kv_->ensure_from(r.id, ctx_up + want, r.n_computed) < 0) return nullptr;
 
         StepEntry n;
         n.req            = &r;
@@ -1822,6 +1893,10 @@ int Scheduler::commit(const StepResult& res) {
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
+            /* The chunk is committed: a window group gives its blocks below the window back now,
+             * not at this sequence's next ensure(), which may be steps away while others
+             * prefill. */
+            kv_->trim_window(r.id, r.n_computed);
             step_prefill_tok_ += e.n_tokens;
             server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
                                          r.n_cached);
@@ -2158,7 +2233,8 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
          * unwritten in the head's layer for good. The same goes for a row too near the end of the
          * context for its rounds, whose last positions do not exist. */
         if (can_draft && ctx_limit_ > 0 && head_max + *rounds > ctx_limit_) can_draft = false;
-        if (can_draft && kv_->ensure(r.id, head_max + *rounds) < 0) can_draft = false;
+        if (can_draft && kv_->ensure_from(r.id, head_max + *rounds, r.n_computed) < 0)
+            can_draft = false;
 
         /* THE HISTORY THIS STEP OWES, in two parts. Before the verified positions, the positions
          * the step computed whose next token the host holds -- a prefill chunk's prompt -- from
@@ -2179,9 +2255,19 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         const int64_t owed_end = e.produces_token ? vstart : (int64_t)e.ctx_len + e.n_tokens;
         int64_t hs = s.draft_filled > e.ctx_len ? s.draft_filled : (int64_t)e.ctx_len;
         if (hs > owed_end) hs = owed_end;
-        const int64_t lead = owed_end - hs;
+        int64_t lead = owed_end - hs;
         const int64_t verified = e.produces_token ? e.n_spec + 1 : 0;
-        const int64_t hist_n = lead + verified;
+        int64_t hist_n = lead + verified;
+
+        /* A HEAD WITH NO CACHE OF ITS OWN IS OWED NO HISTORY (rad_drafter_shared_kv). Its one row
+         * is round 1's -- the committed position, whichever of the verified ones the card says it
+         * is -- and a sequence that does not draft has nothing to run at all. */
+        if (serial_shared_) {
+            if (!can_draft) continue;
+            hs = vstart;
+            lead = 0;
+            hist_n = 1;
+        }
 
         if (!can_draft && hist_n <= 0) continue;   /* nothing owed and nothing to draft */
 
@@ -2191,7 +2277,9 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         m.card       = e.card;
         m.hist_row   = (int32_t)(base + (hs - e.ctx_len));
         m.hist_n     = (int32_t)hist_n;
-        m.hist_pos   = hs;
+        /* The shared head's one row sits wherever the card's acceptance puts it; the host stages
+         * the furthest that can be, as it does for every round. */
+        m.hist_pos   = serial_shared_ ? head_max : hs;
         m.dev        = e.produces_token;
         m.dev_tok    = (int32_t)(base + (vstart - e.ctx_len));
         m.dev_out    = e.dev_out;
@@ -2250,8 +2338,10 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         e.card     = m.card;
         e.n_tokens = round == 0 ? m.hist_n : 1;
         /* A round's position is the card's; the host stages the furthest it can be, which is what
-         * every host-side ceiling reads. The history's are known here exactly. */
-        e.ctx_len  = (int32_t)(round == 0 ? m.hist_pos : m.base_pos + (round - 1));
+         * every host-side ceiling reads. The history's are known here exactly. A head with no
+         * cache of its own does not step forward, so neither does its ceiling. */
+        e.ctx_len  = (int32_t)(round == 0 ? m.hist_pos
+                                          : m.base_pos + (serial_shared_ ? 0 : round - 1));
         e.n_spec   = 0;
         /* One-based and constant: a head pass commits exactly the tokens it was handed. The head
          * issues no linear-state op, so nothing reads it; it is set rather than left at a value
@@ -2409,7 +2499,8 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         /* The query block writes positions n_computed .. n_computed + block - 1, and none of them
          * may be at or past the end of the context. */
         const bool ok_ctx  = ctx_limit_ <= 0 || r.n_computed + block <= ctx_limit_;
-        const bool ok_kv   = ok_room && ok_ctx && kv_->ensure(r.id, r.n_computed + block) >= 0;
+        const bool ok_kv   = ok_room && ok_ctx &&
+                             kv_->ensure_from(r.id, r.n_computed + block, r.n_computed) >= 0;
         static const bool dbg = [] { const char* v = std::getenv("RADIANCE_DEBUG_DRAFT");
                                      return v && *v && *v != '0'; }();
         if (dbg) {

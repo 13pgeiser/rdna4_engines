@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstring>
 #include <functional>
@@ -45,6 +46,75 @@ bool starts_with(const std::string& s, const std::string& p) {
 
 std::string show(const std::string& s) { return nlohmann::json(s).dump(); }
 
+int refuse(std::string* why, const std::string& s) {
+    if (why) *why = s;
+    return RAD_E_UNSUPPORTED;
+}
+
+/* A byte that begins a bare word or a JSON value, or is the object's own punctuation. */
+bool object_byte(unsigned char c) {
+    return c == 0 || std::isalnum(c) || is_ws(c) || std::strchr("-+._'\"{}[],:", (int)c) != nullptr;
+}
+
+/* An argument object, as the streaming parser reads it (chatparse.cpp). Where a key or a value
+ * may begin, it tells three literals apart by their first bytes: a dialect string's opener, and
+ * the call's close and end, which a reply that leaves its object unclosed writes there. None may
+ * begin another. A bare word ends at the object's punctuation or at the call's close; one
+ * automaton finds both in the order they start only when the close holds none of it. */
+int object_check(const ChatFormat& f, std::string* why) {
+    const std::string& so = f.object_string_open;
+    const std::string& sc = f.object_string_close;
+    if (so.empty() != sc.empty())
+        return refuse(why, "object_string_open and object_string_close are set together or not "
+                           "at all");
+    if (!so.empty()) {
+        if (trim_ws(so) != so || trim_ws(sc) != sc)
+            return refuse(why, "an object string delimiter may not begin or end with "
+                               "whitespace");
+        if (object_byte((unsigned char)so[0]))
+            return refuse(why, "object_string_open " + show(so) + " begins with a byte that also "
+                               "begins a bare word, a JSON value or the object's punctuation");
+    }
+    std::vector<std::string> lits;
+    if (!so.empty()) lits.push_back(so);
+    const std::string cc = trim_ws(f.call_close), ce = trim_ws(f.call_end);
+    for (const std::string* s : { &cc, &ce }) {
+        if (s->empty()) continue;
+        for (char c : *s)
+            if (std::strchr(",:{}[]\"", c))
+                return refuse(why, "the call's close " + show(*s) + " holds " +
+                                   show(std::string(1, c)) + ", which is the argument object's "
+                                   "punctuation");
+        if (std::find(lits.begin(), lits.end(), *s) == lits.end()) lits.push_back(*s);
+        else if (!so.empty() && *s == so)
+            return refuse(why, show(*s) + " both opens an object string and closes the call");
+    }
+    for (size_t i = 0; i < lits.size(); ++i)
+        for (size_t j = 0; j < lits.size(); ++j)
+            if (i != j && (starts_with(lits[i], lits[j]) || occurs_inside(lits[j], lits[i])))
+                return refuse(why, show(lits[j]) + " and " + show(lits[i]) + " cannot be told "
+                                   "apart inside an argument object");
+    return RAD_OK;
+}
+
+/* Content is scanned for a later reasoning block's opener and for a stray close beside the call
+ * openers, in one automaton, which reports them in the order they start only when none occurs
+ * inside another or begins it. */
+int reasoning_anywhere_check(const ChatFormat& f, std::string* why) {
+    if (!f.reasoning_anywhere) return RAD_OK;
+    std::vector<std::string> d = { trim_ws(f.reasoning_open), trim_ws(f.reasoning_close) };
+    if (f.has_tools()) {
+        if (!f.call_open.empty()) d.push_back(trim_ws(f.call_open));
+        d.push_back(f.name_prefix);
+    }
+    for (size_t i = 0; i < d.size(); ++i)
+        for (size_t j = 0; j < d.size(); ++j)
+            if (i != j && (starts_with(d[i], d[j]) || occurs_inside(d[j], d[i])))
+                return refuse(why, show(d[j]) + " and " + show(d[i]) + " cannot be told apart in "
+                                   "content, which a reasoning block may open anywhere in");
+    return RAD_OK;
+}
+
 }  /* namespace */
 
 /* ================================================================== validity */
@@ -61,16 +131,24 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         return no("reasoning_close is only whitespace");
     if ((uint32_t)f.reasoning_in_prompt > (uint32_t)ChatThink::Never)
         return no("reasoning_in_prompt is not a RAD_CHAT_THINK_* value");
+    if ((uint32_t)f.args_form > (uint32_t)ChatArgs::Object)
+        return no("args_form is not a RAD_CHAT_ARGS_* value");
+    /* A block that opens later in the reply is found by its opener, in content. */
+    if (f.reasoning_anywhere && (!f.has_reasoning() || trim_ws(f.reasoning_open).empty()))
+        return no("reasoning_anywhere needs a reasoning block with an opener");
 
     if (!f.has_tools()) {
         for (const std::string* s : { &f.section_open, &f.section_close, &f.call_separator,
                                       &f.call_open, &f.call_close, &f.name_suffix, &f.call_end,
                                       &f.arg_prefix, &f.arg_name_suffix, &f.arg_value_prefix,
-                                      &f.arg_value_suffix })
+                                      &f.arg_value_suffix, &f.object_string_open,
+                                      &f.object_string_close })
             if (!s->empty()) return no("tool-call delimiters are set but name_prefix is empty");
+        if (f.object_args() || f.object_bare_keys)
+            return no("an argument object is described but name_prefix is empty");
         if (!f.reasoning_breaks.empty()) return no("reasoning_breaks without tool calls");
         if (!f.triggers.empty()) return no("grammar triggers without tool calls");
-        return RAD_OK;
+        return reasoning_anywhere_check(f, why);
     }
 
     if (!f.section_open.empty() || !f.section_close.empty())
@@ -81,22 +159,43 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
                   ") is not read by the streaming parser; tagged calls separate on whitespace");
     if (f.call_open.empty() && !f.call_close.empty())
         return no("call_close without call_open");
-    if (f.name_suffix.empty() || trim_ws(f.name_suffix).empty())
-        return no("name_suffix must end the function name with something besides whitespace");
-    if (is_ws((unsigned char)f.name_suffix[0]))
-        return no("name_suffix " + show(f.name_suffix) + " may not begin with whitespace");
-    if (f.call_end.empty()) return no("call_end is empty: a call must close with its own tag");
-    if (f.arg_prefix.empty()) return no("arg_prefix is empty");
-    if (f.arg_value_suffix.empty()) return no("arg_value_suffix is empty");
-    if (f.arg_name_suffix.empty() && f.arg_value_prefix.empty())
-        return no("nothing ends an argument name: arg_name_suffix and arg_value_prefix are empty");
-    if (!f.arg_name_suffix.empty() && !f.arg_value_prefix.empty())
-        return no("arg_name_suffix and arg_value_prefix are both set; the streaming parser reads "
-                  "one delimiter between an argument's name and its value");
-    if (f.string_value != ChatValue::Raw && f.string_value != ChatValue::Cdata)
-        return no("string_value must be RAD_CHAT_VALUE_RAW or RAD_CHAT_VALUE_CDATA");
-    if ((uint32_t)f.other_value > (uint32_t)ChatValue::Json)
-        return no("other_value is not a RAD_CHAT_VALUE_* value");
+    const bool object = f.object_args();
+    /* An object's own `{` may be what ends the name; anything else needs its suffix. */
+    if (!object || !f.name_suffix.empty()) {
+        if (f.name_suffix.empty() || trim_ws(f.name_suffix).empty())
+            return no("name_suffix must end the function name with something besides whitespace");
+        if (is_ws((unsigned char)f.name_suffix[0]))
+            return no("name_suffix " + show(f.name_suffix) + " may not begin with whitespace");
+    }
+    if (!object) {
+        if (f.call_end.empty()) return no("call_end is empty: a call must close with its own tag");
+        if (f.arg_prefix.empty()) return no("arg_prefix is empty");
+        if (f.arg_value_suffix.empty()) return no("arg_value_suffix is empty");
+        if (f.arg_name_suffix.empty() && f.arg_value_prefix.empty())
+            return no("nothing ends an argument name: arg_name_suffix and arg_value_prefix are "
+                      "empty");
+        if (!f.arg_name_suffix.empty() && !f.arg_value_prefix.empty())
+            return no("arg_name_suffix and arg_value_prefix are both set; the streaming parser "
+                      "reads one delimiter between an argument's name and its value");
+        if (f.string_value != ChatValue::Raw && f.string_value != ChatValue::Cdata)
+            return no("string_value must be RAD_CHAT_VALUE_RAW or RAD_CHAT_VALUE_CDATA");
+        if ((uint32_t)f.other_value > (uint32_t)ChatValue::Json)
+            return no("other_value is not a RAD_CHAT_VALUE_* value");
+        if (!f.object_string_open.empty() || !f.object_string_close.empty() ||
+            f.object_bare_keys)
+            return no("the object_* fields describe an argument object, and args_form is "
+                      "RAD_CHAT_ARGS_TAGGED");
+    } else {
+        for (const std::string* s : { &f.arg_prefix, &f.arg_name_suffix, &f.arg_value_prefix,
+                                      &f.arg_value_suffix })
+            if (!s->empty())
+                return no("the arg_* fields describe tagged arguments, and args_form is "
+                          "RAD_CHAT_ARGS_OBJECT");
+        if (!f.call_end.empty() && trim_ws(f.call_end).empty())
+            return no("call_end is only whitespace");
+        const int st = object_check(f, why);
+        if (st < 0) return st;
+    }
 
     /* A wrapped format's content is scanned for the wrapper's core and for name_prefix alone,
      * which opens a call written without its wrapper; the two must not be confusable. */
@@ -127,16 +226,19 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
                 return no("reasoning break " + show(b) + " overlaps reasoning_close " +
                           show(close));
     }
-    /* Inside a call the next tag is an argument or the close, and the close is recognised by its
-     * core as well: the whitespace around it is optional when a reply leaves the format. */
-    const std::string end = trim_ws(f.call_end);
-    if (end.empty()) return no("call_end is only whitespace");
-    for (const std::string* e : { &f.call_end, &end })
-        if (starts_with(f.arg_prefix, *e) || starts_with(*e, f.arg_prefix) ||
-            occurs_inside(f.arg_prefix, *e) || occurs_inside(*e, f.arg_prefix))
-            return no("arg_prefix " + show(f.arg_prefix) + " and call_end " + show(f.call_end) +
-                      " cannot be told apart");
-    return RAD_OK;
+    if (!object) {
+        /* Inside a call the next tag is an argument or the close, and the close is recognised by
+         * its core as well: the whitespace around it is optional when a reply leaves the
+         * format. */
+        const std::string end = trim_ws(f.call_end);
+        if (end.empty()) return no("call_end is only whitespace");
+        for (const std::string* e : { &f.call_end, &end })
+            if (starts_with(f.arg_prefix, *e) || starts_with(*e, f.arg_prefix) ||
+                occurs_inside(f.arg_prefix, *e) || occurs_inside(*e, f.arg_prefix))
+                return no("arg_prefix " + show(f.arg_prefix) + " and call_end " +
+                          show(f.call_end) + " cannot be told apart");
+    }
+    return reasoning_anywhere_check(f, why);
 }
 
 /* ================================================================== the plugin's declaration */
@@ -183,6 +285,11 @@ int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* 
     f.other_value     = (ChatValue)c.other_value;
     f.value_newlines  = c.value_newlines != 0;
     list(c.triggers, c.n_triggers, &f.triggers);
+    f.args_form       = (ChatArgs)c.args_form;
+    f.object_string_open  = s(c.object_string_open);
+    f.object_string_close = s(c.object_string_close);
+    f.object_bare_keys    = c.object_bare_keys != 0;
+    f.reasoning_anywhere  = c.reasoning_anywhere != 0;
     *out = std::move(f);
     return RAD_OK;
 }
@@ -286,13 +393,23 @@ int chat_format_from_template(const std::string& jinja, const std::string& bos,
 std::string chat_format_describe(const ChatFormat& f) {
     std::string s = f.name + ":";
     if (f.has_reasoning())
-        s += " reasoning " + show(f.reasoning_open) + ".." + show(f.reasoning_close);
+        s += " reasoning " + show(f.reasoning_open) + ".." + show(f.reasoning_close) +
+             (f.reasoning_anywhere ? " anywhere" : "");
     else
         s += " no reasoning";
-    if (f.has_tools()) {
+    if (f.has_tools() && f.object_args()) {
+        s += "; calls " + show(f.call_open) + show(f.name_prefix) + "NAME" + show(f.name_suffix) +
+             " {OBJECT";
+        if (!f.object_string_open.empty())
+            s += ", strings " + show(f.object_string_open) + ".." + show(f.object_string_close);
+        if (f.object_bare_keys) s += ", bare keys";
+        s += "} " + show(f.call_end) + show(f.call_close);
+    } else if (f.has_tools()) {
         s += "; calls " + show(f.call_open) + show(f.name_prefix) + "NAME" + show(f.name_suffix) +
              " " + show(f.arg_prefix) + "ARG" + show(f.arg_name_suffix) + show(f.arg_value_prefix) +
              "VALUE" + show(f.arg_value_suffix) + " " + show(f.call_end) + show(f.call_close);
+    }
+    if (f.has_tools()) {
         if (!f.triggers.empty()) {
             s += "; grammar on";
             for (const std::string& t : f.triggers) s += " " + show(t);
@@ -310,7 +427,8 @@ std::vector<std::string> chat_format_markers(const ChatFormat& f) {
     for (const std::string* s : { &f.reasoning_open, &f.reasoning_close, &f.section_open,
                                   &f.section_close, &f.call_open, &f.call_close, &f.name_prefix,
                                   &f.name_suffix, &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
-                                  &f.arg_value_prefix, &f.arg_value_suffix }) {
+                                  &f.arg_value_prefix, &f.arg_value_suffix,
+                                  &f.object_string_open, &f.object_string_close }) {
         const std::string t = trim_ws(*s);
         if (!t.empty() && std::find(out.begin(), out.end(), t) == out.end()) out.push_back(t);
     }
@@ -538,6 +656,46 @@ void add_json_rules(const common_grammar_builder& b) {
                              "json-null");
 }
 
+/* THE ARGUMENT OBJECT of the object family, in its dialect: JSON, or strings between the
+ * declared delimiters and keys written bare. As llama.cpp's own Gemma 4 grammar does, it fixes
+ * the syntax and leaves the values to the model: a tool's schema says what JSON a value must be,
+ * and the dialect is not JSON, so the schema converter has nothing to say about it. Whitespace
+ * goes where the dialect's writers put it -- after a separator and inside the brackets -- and
+ * nowhere else. */
+void add_object_rules(const common_grammar_builder& b, const ChatFormat& f) {
+    const std::string& so = f.object_string_open;
+    if (!so.empty())
+        b.add_rule("obj-string", gbnf_format_literal(so) + " " +
+                                 until_pattern({ f.object_string_close }) + " " +
+                                 gbnf_format_literal(f.object_string_close));
+    else
+        b.add_rule("obj-string", "\"\\\"\" ( [^\"\\\\] | \"\\\\\" ( [\"\\\\/ bfnrt] | \"u\" "
+                                 "[0-9a-fA-F]{4} ) )* \"\\\"\"");
+    b.add_rule("obj-number", "\"-\"? (\"0\" | [1-9] [0-9]*) (\".\" [0-9]+)? ([eE] [+-]? [0-9]+)?");
+    /* A dialect with strings of its own still gets a value in Python's quotes, `'...'`, which
+     * is how Gemma 4 writes arguments it was handed as JSON (measured). Refused, the model
+     * takes the next token the grammar allows -- a `-` -- and every such string becomes a
+     * number; the parser reads the quoted text verbatim but for an escaped quote. */
+    const char* sq = so.empty() ? "" : " | obj-sqstring";
+    if (!so.empty()) b.add_rule("obj-sqstring", "\"'\" ( [^'\\\\] | \"\\\\\" [^\\x00] )* \"'\"");
+    b.add_rule("obj-value", std::string("obj-object | obj-array | obj-string") + sq +
+                            " | obj-number | \"true\" | \"false\" | \"null\"");
+    b.add_rule("obj-array", "\"[\" space (\"]\" | obj-value (\",\" space obj-value)* space "
+                            "\"]\")");
+    if (f.object_bare_keys) {
+        /* A bare key: no whitespace, no punctuation, and not the string opener's first byte. */
+        std::string cls = "[^ \\t\\n\\r:,{}\\[\\]\"";
+        if (!so.empty()) cls += class_char((unsigned char)so[0]);
+        cls += "]+";
+        b.add_rule("obj-key", cls + " | obj-string");
+    } else {
+        b.add_rule("obj-key", "obj-string");
+    }
+    b.add_rule("obj-member", "obj-key \":\" space obj-value");
+    b.add_rule("obj-object", "\"{\" space (\"}\" | obj-member (\",\" space obj-member)* space "
+                             "\"}\")");
+}
+
 G optspace(const std::string& tag) {
     size_t a = 0, b = tag.size();
     while (a < b && is_ws((unsigned char)tag[a])) ++a;
@@ -644,6 +802,18 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                 const auto& fn = tool.at("function");
                 const std::string name = fn.at("name");
                 if (!req.only_tool.empty() && name != req.only_tool) continue;
+                if (f.object_args()) {
+                    /* The name, then the object; the object's own closing brace may be all
+                     * that ends the call. */
+                    G open = wrap(seq({ lit(f.name_prefix), wrap(lit(name)), lit(f.name_suffix) }));
+                    G func = f.call_end.empty()
+                                 ? seq({ open, rule_ref("obj-object") })
+                                 : seq({ open, rule_ref("obj-object"), space(),
+                                         wrap(lit(f.call_end)) });
+                    b.add_rule(rule_name("tool-" + name), render(func));
+                    choices.push_back(rule_ref(rule_name("tool-" + name)));
+                    continue;
+                }
                 auto params = fn.contains("parameters") ? fn.at("parameters") : ojson::object();
                 const auto properties = params.contains("properties") ? params.at("properties")
                                                                      : ojson::object();
@@ -704,7 +874,8 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
             if (choices.empty() && !req.only_tool.empty())
                 throw std::invalid_argument("no tool named \"" + req.only_tool + "\" to call");
             if (typed) add_json_rules(b);
-            if (!choices.empty()) b.add_rule("until-suffix", until_pattern({ f.arg_value_suffix }));
+            if (!choices.empty() && f.object_args()) add_object_rules(b, f);
+            else if (!choices.empty()) b.add_rule("until-suffix", until_pattern({ f.arg_value_suffix }));
 
             G choice = alt(choices);
             G calls;

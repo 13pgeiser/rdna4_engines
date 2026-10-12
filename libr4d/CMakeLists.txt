@@ -57,6 +57,13 @@ set(RAD_W4_GROUP 128 CACHE STRING "libr4d quantised-weight group size (must matc
 set(R4D_UNITS
   "r4d_attn_paged_h256_gqa6|"
   "r4d_attn_paged_h128_gqa4|"
+  # Gemma 4 dense sliding window: head_dim 256, 2 queries per KV head, windowed decode only
+  # (prefill falls to the caller's libref path). The windowed twin of the drafter leg above.
+  "r4d_attn_paged_h256_gqa2|"
+  # Gemma 4 dense global layers: head_dim 512, 8 queries per KV head, full attention (window 0).
+  # The head_dim the library had not compiled before -- the prefill KV tile drops to 16 to fit 64
+  # KiB of LDS, and the decode combine takes the head-generic merge (DPL 16 breaks the vector form).
+  "r4d_attn_paged_h512_gqa8|"
   # Eight queries per KV head, at both head widths: the routed 35B-A3B is 16 over 2 at 256
   # and MiniCPM5-2B is 16 over 2 at 128. Same device code, different instantiations.
   "r4d_attn_paged_gqa8|"
@@ -134,6 +141,9 @@ set(R4D_UNITS
   "r4d_model_bf16|"
   "r4d_sample_stages_f32|"
   "r4d_quant_act_i8|"
+  "r4d_rmsnorm_quant_i8|"
+  "r4d_qkv_norm_rope|"
+  "r4d_gelu_mul_quant_i8|"
   "r4d_had_quant_act_i8|"
   "r4d_rmsnorm_had_quant_i8|"
   "r4d_ar_ln_had_quant_i8|"

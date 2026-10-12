@@ -331,6 +331,15 @@ int ref_rmsnorm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
     return o.finish("rmsnorm", operand, out);
 }
 
+int ref_rmsnorm_p_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });          /* x */
+    o.t(D, { M, n });          /* y */
+    return o.finish("rmsnorm_p", operand, out);
+}
+
 int ref_rmsnorm_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -614,6 +623,15 @@ int ref_silu_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("silu_mul", operand, out);
 }
 
+int ref_gelu_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, 2 * n });      /* gate_up -- the gate is the FIRST half */
+    o.t(D, { M, n });          /* y */
+    return o.finish("gelu_mul", operand, out);
+}
+
 static int unary_shape(const RadParam* p, int n_p, int operand, const char* op, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -639,6 +657,20 @@ int ref_fill_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     Opd o;
     o.t(D, { M, n });          /* y */
     return o.finish("fill", operand, out);
+}
+
+int ref_logit_softcap_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return unary_shape(p, n_p, operand, "logit_softcap", out);
+}
+int ref_scale_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                /* x */
+    o.t(D, { 1 });                                   /* s -- one scalar, broadcast over everything */
+    o.t(D, { M, n });                                /* y */
+    return o.finish("scale", operand, out);
 }
 int ref_softmax_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return unary_shape(p, n_p, operand, "softmax", out);

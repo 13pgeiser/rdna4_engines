@@ -320,6 +320,9 @@ struct KVGroupInfo {
     int64_t         bytes_per_state = 0;   /* linear/conv: per sequence */
     std::vector<int> layers;
     bool            zero = false;       /* rad_kv_group_zero: declared for position, nothing carved */
+    /* Bound only at meta.n_layers and above: the drafter's own cache, which no trunk layer reads.
+     * Set at declare (Builder::finish_kv_groups). */
+    bool            drafter = false;
 };
 
 /* A RAD_KV_CONV GROUP'S WINDOW, IN ENTRIES: conv_width - 1 of history and one more for every
@@ -362,6 +365,12 @@ public:
      * RadDrafterDecl::name points into the plugin's own storage. */
     RadDrafterDecl drafter{};
     std::string    drafter_name;
+    /* A SERIAL HEAD WITH NO CACHE OF ITS OWN (rad_drafter_shared_kv): it reads the trunk's K and V
+     * and writes none, so the driver owes it no history and runs every round at the committed
+     * position. `drafter_pos_offset` is where those rows sit for the rotary, 0 or 1 past it. Both
+     * are false and 0 for every drafter that did not ask, which is every one that predates it. */
+    bool           drafter_shared_kv = false;
+    int32_t        drafter_pos_offset = 0;
 
     /* THE MEDIA ENCODER THIS PLUGIN DECLARED (rad_declare_encoder). `modalities == 0` when it
      * declared none, which is every text-only program and every deployment that asked for no

@@ -289,6 +289,10 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
                      "%d, drafter window %lld\n",
                      (long long)p.drafter.block, p.drafter.depth,
                      (int)p.drafter.mask_token, (long long)p.drafter.window);
+        if (p.drafter_shared_kv)
+            s += fmt("  cache      none of its own: it reads the trunk's, owes no history, and "
+                     "every round runs at the committed position%s\n",
+                     p.drafter_pos_offset ? " (rotated one past it)" : "");
         s += "\n";
     }
 

@@ -2910,15 +2910,17 @@ int Engine::configure_kv() {
             slot += ranks_[i]->kv.checkpoint_bytes();
         }
         const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
+        /* A slot holds linear state or a trunk's window, never both (KVGroupPlan::win_snap). */
+        const char* what = ranks_[0]->kv.has_window_snapshot() ? "sliding-window" : "linear-state";
         if (slot > 0 && n > 0 && cfg_.prefix_cache) {
             if (ck_store_.open(slot, slot * n) != RAD_OK) {
-                RAD_WARN("checkpoint slots: no pinned host memory for %lld snapshot(s) of %s; a "
-                         "hybrid session's prefix hits replay their linear layers from zero. "
-                         "Lower --checkpoint-slots.", (long long)n, humanb(slot).c_str());
+                RAD_WARN("checkpoint slots: no pinned host memory for %lld %s snapshot(s) of %s; "
+                         "a session's prefix hits prefill from the start. Lower "
+                         "--checkpoint-slots.", (long long)n, what, humanb(slot).c_str());
             } else {
-                RAD_INFO("checkpoint slots: %lld linear-state snapshot(s) of %s in pinned host "
-                         "memory (%s), none of it on the card", (long long)n,
-                         humanb(slot).c_str(), humanb(ck_store_.cap_bytes()).c_str());
+                RAD_INFO("checkpoint slots: %lld %s snapshot(s) of %s in pinned host memory (%s), "
+                         "none of it on the card", (long long)n, what, humanb(slot).c_str(),
+                         humanb(ck_store_.cap_bytes()).c_str());
             }
         }
         for (auto& r : ranks_)
@@ -3891,6 +3893,19 @@ int Engine::load_vocab() {
                  cfg_.override_chat_template.c_str(), t.size(),
                  vb.chat_template.empty() ? ", which carries none" : "");
         vb.chat_template = std::move(t);
+    }
+
+    /* The checkpoint's own end-of-generation list travels as metadata, flattened from
+     * generation_config.json -- a space-separated list, or one id. */
+    if (const char* ids = rad_meta_gets(&meta_, "generation.eos_token_id", nullptr)) {
+        const char* q = ids;
+        while (*q) {
+            char* end = nullptr;
+            const long v = std::strtol(q, &end, 10);
+            if (end == q) break;
+            if (v >= 0 && v <= INT32_MAX) vb.eos_ids.push_back((int32_t)v);
+            q = end;
+        }
     }
 
     auto v = std::make_shared<Vocab>();

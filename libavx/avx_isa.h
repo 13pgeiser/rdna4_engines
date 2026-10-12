@@ -84,15 +84,16 @@ int         avx_isa_force(int level);
  * suffix of every implementation symbol: avx_<name>_sc / _v1 / _v2 / _v3. */
 #define AVX_OP_LIST(X)                                                                            \
     /* ---- elementwise and norms */                                                              \
-    X(rmsnorm)              X(rmsnorm_add)          X(hc_enter)             X(hc_read)            \
-    X(hc_write)             X(mtp_enter)            X(layernorm)            X(add)                \
-    X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)                              \
-    X(mul)                  X(silu_mul)             X(gelu)                 X(silu)               \
-    X(sigmoid)              X(gather_rows)          X(scatter_rows)         X(ngram_ids)          \
+    X(rmsnorm)              X(rmsnorm_p)            X(rmsnorm_add)          X(hc_enter)           \
+    X(hc_read)              X(hc_write)             X(mtp_enter)            X(layernorm)          \
+    X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
+    X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
+    X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \
+    X(scatter_rows)         X(ngram_ids)                                                          \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \
-    X(scale_rows)           X(fill)                 X(act_mul)              X(seg_mean)           \
-    X(mul_weight)           X(pool_rows)            X(relu)                 X(clamp)              \
-    X(conv2d)               X(conv1d_dw)            X(rel_sinusoid)                               \
+    X(scale_rows)           X(scale)                X(fill)                 X(act_mul)            \
+    X(seg_mean)             X(mul_weight)           X(pool_rows)            X(relu)               \
+    X(clamp)                X(conv2d)               X(conv1d_dw)            X(rel_sinusoid)       \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(had_quant_act_i8)     X(quant_act_fp8)        X(had_quant_act_fp8)  \
     X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8)   X(dequant)            \

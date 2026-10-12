@@ -191,8 +191,14 @@ public:
 
     /* The batch the last build produced for one rank; see BatchBuilder::batch_for. */
     const RadBatch* batch_for(int rank) const { return builder_.batch_for(rank); }
-    /* The advance's view of that build on one rank; see BatchBuilder::advance_args. */
-    AdvanceArgs advance_args(int rank) const { return builder_.advance_args(rank); }
+    /* The advance's view of that build on one rank; see BatchBuilder::advance_args. It carries
+     * the serial head's shape as well, which only the draft passes' modes read. */
+    AdvanceArgs advance_args(int rank) const {
+        AdvanceArgs a = builder_.advance_args(rank);
+        a.shared_kv = serial_shared_ ? 1 : 0;
+        a.rot_shift = serial_rot_shift_;
+        return a;
+    }
     void fini();
 
     /* ---------------------------------------------------------- off the step path */
@@ -505,6 +511,18 @@ private:
      * also skips on a block-size mismatch. A bound like this lives in exactly one place; a second
      * copy is free to drift out of step with the first. */
     bool          hit_holes_draft_ = true;
+    /* DOES A HIT HOLE THE TRUNK ITSELF? hit_holes_draft_ is the drafter's guard, and draft_refill_
+     * repairs a drafter hole by recomputing the prompt's TAIL. A TRUNK group the cache does not
+     * index admits no such repair: the adopted blocks cover the cached groups only, while the
+     * windowed trunk layers read the positions below ctx_len this sequence never wrote — the KV of
+     * whoever held these blocks last. So a trunk hole refuses the hit outright.
+     *
+     * THE TRUNK IS WHICH GROUPS? The one a drafter borrows is bound at `base_layer` and above —
+     * the drafter's layers run after the trunk's (rad_bind_layer_kv at the drafter declare), so a
+     * group with a bound layer below meta.n_layers belongs to the trunk and a hit must cover it;
+     * a drafter's own group is the refill's business, not this clamp's. Read off the Program,
+     * which carries both the bindings and the trunk's layer count. */
+    bool          hit_holes_trunk_ = false;
     /* DRAFT REFILL. Where a hit leaves a hole in a WINDOWED block drafter's cache, the drafter is
      * declined until its window has slid past the hole, which on the follow-up turn of a chat --
      * the turn a prefix hit is for -- is most or all of the reply. So the hit is ended one window
@@ -514,6 +532,12 @@ private:
      * that point would give back more than two windows is kept whole. The drafter's window, or 0
      * where no hit can leave such a hole. */
     int64_t       draft_refill_ = 0;
+    /* A SERIAL HEAD WITH NO CACHE OF ITS OWN (rad_drafter_shared_kv), off the Program at init. It
+     * owes no history, so serial_begin gives it one row a drafting sequence and none to a sequence
+     * that does not draft, and its rounds stay at the committed position (advance.h). False and 0
+     * for every other drafter, whose passes are staged exactly as before. */
+    bool          serial_shared_ = false;
+    int32_t       serial_rot_shift_ = 0;
     BatchBuilder  builder_;
     DraftController draft_;
 

@@ -56,6 +56,12 @@ struct SrcTensor {
      * the K columns one row of its scale tensor covers. 0 for any other tensor. */
     int32_t              gptq_bits = 0;
     int64_t              gptq_group = 0;
+    /* CT-INT4 (compressed-tensors' pack-quantized int4, symmetric): `data` is X.weight_packed's
+     * int32 words [N, K / 8], eight codes a word along K from the low bits up, stored unsigned with
+     * the zero point 8. The tensor this describes is the logical [N, K] code matrix, `rad_dtype`
+     * RAD_I4; `ct_group` is the K columns one scale of X.weight_scale [N, K / group] covers. 0 for
+     * any other tensor. */
+    int64_t              ct_group = 0;
 
     int64_t numel() const {
         int64_t n = 1;
@@ -132,7 +138,7 @@ public:
      * this does not read stays None, with the reason in import_refusal(). */
     /* Its quantization_config keys are then renamed `imported_quantization_config.*`: they
      * describe the tool, not a served format, and a plugin reads the latter there. */
-    enum class Import { None, Gptq, QuarkMx };
+    enum class Import { None, Gptq, QuarkMx, CtInt4 };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 
@@ -164,6 +170,7 @@ private:
     int64_t fp8_br_ = 128, fp8_bc_ = 128;
     Import      import_ = Import::None;
     std::string import_why_;
+    int64_t     ct_group_ = 0;   /* CtInt4: the group every weight's config states */
     /* import_piece's answers by name, so a weight resolved twice reads one pair of views. */
     std::unordered_map<std::string, std::pair<const SrcTensor*, const SrcTensor*>> imported_;
 };

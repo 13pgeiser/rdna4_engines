@@ -9,6 +9,7 @@
 #include "rad_test.h"
 
 #include "sched/scheduler.h"
+#include "sched/advance_impl.h"
 #include "sched/derive.h"
 #include "server/sink.h"
 
@@ -499,7 +500,7 @@ struct Fixture {
     ~Fixture() { sch.fini(); for (void* p : owned) std::free(p); }
 
     void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512,
-               int64_t max_ctx = 4096) {
+               int64_t max_ctx = 4096, bool windowed = false) {
         g_gdn_ki = RadKernelInfo{};
         g_gdn_ki.name = "gdn_fake";
         g_gdn_ki.op = "gdn_chunked";
@@ -531,6 +532,25 @@ struct Fixture {
         conv.decl.kind = RAD_KV_CONV;
         conv.decl.conv_width = 4;
         prog.kv_groups.push_back(conv);
+
+        /* A WINDOWED paged group — the second half of the pair a sliding-window model declares
+         * (windowed layers + a full group; qwen35/llama windowed checkpoints declare these).
+         * Paged, block-aligned, and deliberately NOT prefix-cached: prefix.cpp indexes only the
+         * groups whose blocks below the window stay put. Tests that want a prefix cache over a
+         * WINDOW+FULL pair trim pc.groups to the cached ones. */
+        if (windowed) {
+            KVGroupInfo win;
+            win.name = "swa";
+            win.decl.kind = RAD_KV_WINDOW;
+            win.decl.window = 64;
+            win.block_size = 16;
+            win.layers = { 2 };   /* bound to a TRUNK layer — the group a trunk attention reads;
+                                   * a drafter's own group is bound at the trunk's layer count and
+                                   * above (rad_bind_layer_kv at the drafter declare) */
+            prog.kv_groups.push_back(win);
+            prog.meta.n_layers = 16;   /* trunk layers 0..15; the drafter tests' appended group
+                                        * stays unbound, and unbound is not trunk-owned */
+        }
 
         OpInfo op;
         op.op = "gdn_chunk_scan";
@@ -657,6 +677,39 @@ TEST(chunk_geometry_rounds_the_checkpoint_interval_up_to_a_legal_chunk) {
     f.cfg.checkpoint_interval = 200;      /* not a multiple of 64 */
     CHECK_OK(f.start());
     CHECK_EQ(f.sch.geometry().checkpoint_interval, 256);
+}
+
+/* A MODEL WITH NO LINEAR STATE CHECKPOINTS ONLY FOR A TRUNK WINDOW: the snapshot of the window
+ * behind a prompt's tail is what a prefix hit resumes from. A drafter's own window is recomputed
+ * by draft refill, so it takes no checkpoint and leaves the hit at any block. */
+TEST(chunk_geometry_snapshots_a_trunk_window_and_not_a_drafters) {
+    for (int drafter = 0; drafter < 2; ++drafter) {
+        Program prog;
+        prog.meta.n_layers = 16;
+        prog.kv_groups.emplace_back();
+        KVGroupInfo attn;
+        attn.name = "attn";
+        attn.decl.kind = RAD_KV_FULL;
+        attn.block_size = 16;
+        attn.layers = { 0 };
+        prog.kv_groups.push_back(attn);
+        KVGroupInfo win;
+        win.name = "swa";
+        win.decl.kind = RAD_KV_WINDOW;
+        win.decl.window = 64;
+        win.block_size = 16;
+        win.layers = { drafter ? 16 : 1 };
+        win.drafter = drafter != 0;
+        prog.kv_groups.push_back(win);
+        Config cfg;
+        cfg.max_tok = 512;
+        cfg.checkpoint_interval = 256;
+        cfg.prefix_cache = true;
+        ChunkGeometry g;
+        CHECK_OK(chunk_geometry_resolve(prog, cfg, &g));
+        CHECK_EQ(g.checkpoint_interval, drafter ? 0ll : 256ll);
+        CHECK(g.window_ckpt == !drafter);
+    }
 }
 
 TEST(chunk_geometry_refuses_a_budget_it_cannot_serve) {
@@ -991,6 +1044,50 @@ TEST(a_hit_that_no_checkpoint_covers_replays_from_zero) {
     CHECK(f.sch.step() != nullptr);
     CHECK_EQ(f.sch.find(a)->n_computed, 0);
     CHECK_EQ(f.sch.metrics().linear_cached_tokens, 0);
+}
+
+/* THE PREFIX CACHE CANNOT COVER A MODEL WITH A PAGED GROUP IT DOES NOT INDEX. The fixture's
+ * groups are FULL, LINEAR, CONV, WINDOW — the windowed group is paged, bound to a trunk layer,
+ * and a real cache skips it (prefix.cpp: its blocks below the window are recycled, so no block
+ * list describes them), which is what pc.groups = {0} reproduces: three paged groups, one
+ * cached. The cache below is seeded to a DEEP, checkpoint-covered hit — 304 attention blocks,
+ * the linear state at 256, a slot to restore from — the most legitimate hit there is: every
+ * clamp above the trunk one lets it through untouched. The adopted blocks cover group 0 ONLY,
+ * while used = ctx_len + n_tok makes the windowed trunk layers read the positions below ctx_len
+ * this sequence never wrote — and the pool hands out the most recently freed blocks, i.e. the
+ * previous tenant's. That is reading ANOTHER REQUEST'S KV AS YOUR OWN PREFIX: fluent text
+ * carrying the last request's content. No tail-recompute repairs a trunk hole (a drafter's own
+ * hole is another matter, and the refill tests above keep theirs); the hit is refused. */
+TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    f.pc.groups = {0};    /* a cache that indexes the FULL group only — windowed groups are not
+                           * prefix-cacheable; must precede start(), which reads it once */
+    CHECK_OK(f.start());
+    f.pc.seed(304);       /* a deep, block-aligned attention hit: 19 blocks */
+    f.pc.lin = 256;       /* its linear state checkpoints at 256 — the resume point exists */
+    f.pc.src = 3;         /* and names a snapshot, so no checkpoint clamp applies */
+
+    uint64_t a = f.submit(300, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+
+    /* The whole hit is refused, not trimmed: the request runs from zero. */
+    CHECK_EQ(f.sch.find(a)->n_computed, 0);
+    CHECK_EQ(f.sch.find(a)->n_cached, 0);
+    CHECK_EQ(b->ctx_lens[0], 0);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, -1);
+
+    /* NOTHING IS ADOPTED — the 16 blocks covering the 256-token chunk are all freshly grabbed. */
+    CHECK_EQ((int)f.kv.block_table(a, 0).size(), 16);
+    CHECK(std::find(f.pc.seeded[0].begin(), f.pc.seeded[0].end(),
+                    f.kv.block_table(a, 0)[0]) == f.pc.seeded[0].end());
+
+    /* THE CACHE STILL REPORTED THE MATCH, and the metrics say so: this is a real hit the
+     * scheduler refused, not a lookup that found nothing. */
+    SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.attn_cached_tokens, 304);
+    CHECK_EQ(m.linear_cached_tokens, 0);
 }
 
 /* ================================================================== preemption */
@@ -1358,7 +1455,11 @@ RefillRun refill_run(int n_prompt, int32_t seeded, int64_t ckpt_lo = 0) {
     f.cfg.n_spec = 7;
     f.prog.drafter.kind = RAD_DRAFT_BLOCK;
     f.prog.drafter.window = 512;
-    KVGroupInfo w;                 /* the drafter's own group: paged, windowed, not prefix-cached */
+    KVGroupInfo w;                 /* the drafter's own group: paged, windowed, not prefix-cached.
+                                    * UNBOUND, and a drafter group bound at the trunk's layer count
+                                    * and above is the same — the trunk clamp reads bound TRUNK
+                                    * layers (scheduler.h, hit_holes_trunk_) and does not fire on a
+                                    * drafter hole: the refill below is exactly its repair. */
     w.name = "draft";
     w.decl.kind = RAD_KV_WINDOW;
     w.decl.window = 512;
@@ -3012,6 +3113,202 @@ TEST(the_history_pass_carries_draft_round_one) {
     CHECK_EQ(r2->n_tok, 1);
     CHECK_EQ(r2->n_draft_out, 0);
     f.sch.serial_end(2);
+}
+
+/* THE SERIAL DRIVER'S TWO SHAPES, side by side over one verify step. A head with a cache of its own
+ * (every drafter but one) owes the history of every verified position and steps one position a
+ * round; a head that reads the trunk's cache and keeps none (rad_drafter_shared_kv) owes nothing,
+ * runs one row a drafting sequence, and does not step. The first half of this is the old path and
+ * must not move: it is what Qwen's MTP head is staged with. */
+namespace {
+struct SerialShape {
+    int     hist_tok = 0, hist_out = 0, hist_dout = 0;
+    int32_t hist_ctx = 0, hist_row = 0;
+    int32_t round_ctx[4] = {0, 0, 0, 0};
+};
+
+void serial_shape(bool shared, SerialShape& r) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 4;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = 4;
+    f.prog.drafter_shared_kv = shared;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 4);
+
+    int rounds = 4;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK(hb->draft_pass < 0);
+    r.hist_tok  = (int)hb->n_tok;
+    r.hist_out  = (int)hb->n_out;
+    r.hist_dout = (int)hb->n_draft_out;
+    r.hist_ctx  = hb->ctx_lens[0];
+    r.hist_row  = hb->out_ids[0];
+    for (int rd = 2; rd <= 3; ++rd) {
+        const RadBatch* rb = f.sch.serial_batch(rd, 1);
+        REQUIRE(rb != nullptr);
+        CHECK_EQ(rb->n_tok, 1);
+        r.round_ctx[rd] = rb->ctx_lens[0];
+    }
+    f.sch.serial_end(3);
+}
+}  /* namespace */
+
+TEST(a_head_with_a_cache_of_its_own_is_staged_as_it_always_was) {
+    SerialShape o;
+    serial_shape(false, o);
+    CHECK_EQ(o.hist_tok, 5);                    /* every verified position */
+    CHECK_EQ(o.hist_out, 5);                    /* one trunk row each */
+    CHECK_EQ(o.hist_dout, 1);
+    CHECK_EQ(o.hist_ctx, 160);                  /* the history starts at the first verified one */
+    CHECK_EQ(o.hist_row, 0);                    /* the verify step's first row */
+    CHECK_EQ(o.round_ctx[2], 165);              /* the furthest round 2 can sit: one past the last */
+    CHECK_EQ(o.round_ctx[3], 166);              /* ...and the head steps one position a round */
+}
+
+TEST(a_head_with_no_cache_of_its_own_runs_one_row_and_stays_put) {
+    SerialShape s;
+    serial_shape(true, s);
+    CHECK_EQ(s.hist_tok, 1);                    /* round 1 alone */
+    CHECK_EQ(s.hist_out, 1);
+    CHECK_EQ(s.hist_dout, 1);
+    CHECK_EQ(s.hist_ctx, 164);                  /* the furthest the committed position can be */
+    CHECK_EQ(s.hist_row, 0);                    /* the run's first trunk row; the card adds acc */
+    CHECK_EQ(s.round_ctx[2], 164);              /* and every round stays there */
+    CHECK_EQ(s.round_ctx[3], 164);
+}
+
+/* A HEAD WITH NO CACHE OF ITS OWN IS OWED NO HISTORY: a prefill chunk that drafts nothing runs no
+ * pass for it at all, where a head with its own cache is given the whole chunk. */
+TEST(a_head_with_no_cache_of_its_own_runs_no_pass_when_nothing_drafts) {
+    for (int shared = 0; shared < 2; ++shared) {
+        Fixture f;
+        f.build(/*blocks=*/10, /*states=*/64);      /* exactly the prompt: nothing to look ahead into */
+        f.cfg.n_spec = 4;
+        f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+        f.prog.drafter.depth = 4;
+        f.prog.drafter_shared_kv = shared != 0;
+        CHECK_OK(f.start());
+        f.submit(160, 64);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        int rounds = 4;
+        Scheduler::SerialRow rows[4];
+        CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 0);
+        const RadBatch* hb = f.sch.serial_batch(0, 1);
+        if (shared) {
+            CHECK(hb == nullptr);
+        } else {
+            REQUIRE(hb != nullptr);
+            CHECK_EQ(hb->n_tok, 160);
+        }
+        f.sch.serial_end(0);
+    }
+}
+
+/* WHAT THE CARD WRITES INTO A DRAFT PASS, row by row (advance_impl.h), for both shapes. One verify
+ * step at positions 101..105 accepted two drafts, so the committed position is 103 and the trunk
+ * chose token 7003 there; the block table maps position p to slot p. A head with a cache of its own
+ * gets the verified run with its tail repeated and a context that runs to its end; a head with no
+ * cache of its own gets the committed position and a context that ends there, in every round. */
+namespace {
+struct AdvSlab {
+    alignas(16) int32_t w[512] = {};
+    rad::StepSlot st{};
+    int32_t src[8] = { 7001, 7002, 7003, 7004, 7005, 0, 0, 0 };
+    rad::AdvanceArgs a;
+
+    /* word offsets */
+    enum { ROWS = 0, TOK = 8, POS = 16, CTX = 24, ACC = 28, OUT = 32, SID = 40, CU = 44, Q = 48,
+           GRP = 64, SLOT = 96, USED = 104, BT = 112, FIRST = 128 };
+
+    AdvSlab(int mode, int n_rows, int round, bool shared, int shift) {
+        a.mode = mode;
+        a.round = round;
+        a.n_seq = 1;
+        a.n_groups = 1;
+        a.slab = reinterpret_cast<char*>(w);
+        a.row_off = ROWS * 4;  a.row_pitch = 1;
+        a.tok_off = TOK * 4;   a.pos_off = POS * 4; a.ctx_off = CTX * 4; a.acc_off = ACC * 4;
+        a.out_off = OUT * 4;   a.sid_off = SID * 4; a.cu_off = CU * 4;   a.q_off = Q * 4;
+        a.grp_off = GRP * 4;
+        a.st = &st;
+        a.src = src;
+        a.shared_kv = shared ? 1 : 0;
+        a.rot_shift = shift;
+        w[ROWS + 0] = 1;     /* a device row */
+        w[ROWS + 1] = 0;     /* its first verified token row */
+        w[ROWS + 2] = 0;     /* its first sampled row */
+        w[ROWS + 3] = 0;     /* no history before the verified positions */
+        w[SID] = 0; w[CU] = 0; w[Q] = n_rows;
+        w[OUT] = 40;         /* the host staged the run's first trunk row */
+        rad::AdvGroup g{};
+        g.block_size = 16; g.paged = 1; g.pitch = 16;
+        g.slot_off = SLOT * 4; g.used_off = USED * 4; g.bt_off = BT * 4; g.first_off = FIRST * 4;
+        std::memcpy(&w[GRP], &g, sizeof g);
+        for (int i = 0; i < 16; ++i) w[BT + i] = i;   /* block i holds positions 16i.. */
+        w[FIRST] = 0;
+        st.head = 103; st.acc = 2; st.ctx = 104; st.n_acc = 3; st.tok[0] = 7003;
+    }
+};
+}  /* namespace */
+
+TEST(the_card_stages_a_cacheless_head_at_the_committed_position) {
+    /* The history pass. */
+    {
+        AdvSlab o(rad::ADV_HIST, 5, 0, false, 0);
+        rad::adv_row(o.a, 0);
+        const int32_t pos[5] = { 101, 102, 103, 103, 103 }, tok[5] = { 7001, 7002, 7003, 7003, 7003 };
+        for (int j = 0; j < 5; ++j) {
+            CHECK_EQ(o.w[AdvSlab::POS + j], pos[j]);
+            CHECK_EQ(o.w[AdvSlab::TOK + j], tok[j]);
+            CHECK_EQ(o.w[AdvSlab::OUT + j], 40 + (j < 2 ? j : 2));
+            CHECK_EQ(o.w[AdvSlab::SLOT + j], pos[j]);
+        }
+        CHECK_EQ(o.w[AdvSlab::USED], 106);        /* the verify step's whole run */
+        CHECK_EQ(o.w[AdvSlab::CTX], 101);
+    }
+    for (int shift = 0; shift < 2; ++shift) {
+        AdvSlab s(rad::ADV_HIST, 1, 0, true, shift);
+        rad::adv_row(s.a, 0);
+        CHECK_EQ(s.w[AdvSlab::POS], 103 + shift);
+        CHECK_EQ(s.w[AdvSlab::TOK], 7003);
+        CHECK_EQ(s.w[AdvSlab::OUT], 42);
+        CHECK_EQ(s.w[AdvSlab::USED], 104);        /* the committed positions and no more */
+        CHECK_EQ(s.w[AdvSlab::CTX], 103);
+    }
+    /* Round 3: the old head two positions on, the cacheless one where it was. */
+    {
+        AdvSlab o(rad::ADV_ROUND, 1, 3, false, 0);
+        o.src[0] = 9001;
+        rad::adv_row(o.a, 0);
+        CHECK_EQ(o.w[AdvSlab::POS], 105);
+        CHECK_EQ(o.w[AdvSlab::USED], 106);
+        CHECK_EQ(o.w[AdvSlab::TOK], 9001);
+        CHECK_EQ(o.st.tok[2], 9001);
+    }
+    for (int shift = 0; shift < 2; ++shift) {
+        AdvSlab s(rad::ADV_ROUND, 1, 3, true, shift);
+        s.src[0] = 9001;
+        rad::adv_row(s.a, 0);
+        CHECK_EQ(s.w[AdvSlab::POS], 103 + shift);
+        CHECK_EQ(s.w[AdvSlab::USED], 104);
+        CHECK_EQ(s.w[AdvSlab::CTX], 103);
+        CHECK_EQ(s.w[AdvSlab::TOK], 9001);
+        CHECK_EQ(s.st.tok[2], 9001);
+    }
 }
 
 /* A STEP IS ISSUED AHEAD OF A COMMIT ONLY FOR A REQUEST WHOSE SPECULATION THAT COMMIT CANNOT

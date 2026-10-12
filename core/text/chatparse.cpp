@@ -744,6 +744,30 @@ struct ReplyFormat::Impl {
     std::string cc_core;
     Dfa think, think_breaks, text, arg_name, value, junk, arg_name_loose, value_loose;
     size_t longest = 0;       /* the longest delimiter */
+
+    /* THE OBJECT FAMILY. `object`: a call's arguments are one object; `ns_object`: the object's
+     * own `{` is what ends the name (name_suffix empty), and ns_core is "{". */
+    bool object = false, ns_object = false;
+    /* Where a key or a value may begin, besides the object's punctuation: the dialect string's
+     * opener, and the call's close and end -- a reply that leaves its object unclosed writes them
+     * there. Read anchored, by their first bytes (chat_format_check keeps them apart). */
+    enum : uint8_t { LitString, LitClose, LitEnd };
+    std::vector<std::string> obj_lits;
+    std::vector<uint8_t>     obj_lit_kind;
+    /* A dialect string runs to its close. A bare value ends at `,` `}` `]` and a bare key at `:`
+     * `,` `}` -- patterns 0..2 -- or at the call's close or end, which follow at the indices
+     * below (-1: none). */
+    Dfa obj_str, obj_bare, obj_key;
+    /* A value the model opened with a plain `"` -- or `'` (obj_sqstr) -- in a dialect that has
+     * strings of its own: read as that dialect's strings are, verbatim, to a quote the object's
+     * syntax goes on after. Patterns: the quote, the escaped quote, the dialect's string close,
+     * the call's close (if any). */
+    Dfa obj_qstr, obj_sqstr;
+    int bare_cc = -1, bare_ce = -1, key_cc = -1, key_ce = -1;
+
+    /* REASONING ANYWHERE: content is scanned for a later block's opener and a stray close too,
+     * after the call openers (text_think) or alone when the request has no calls (think_only). */
+    Dfa text_think, think_only;
 };
 
 ReplyFormat::ReplyFormat() : impl_(std::make_unique<Impl>()) {}
@@ -773,6 +797,12 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
     if (f.call_open.empty()) m.openers = { f.name_prefix };
     else m.openers = { m.co_core, f.name_prefix };
     m.name_end = f.arg_name_suffix.empty() ? f.arg_value_prefix : f.arg_name_suffix;
+    m.object = f.has_tools() && f.object_args();
+    if (m.object && f.name_suffix.empty()) {
+        m.ns_object = true;
+        m.ns_core = "{";
+        m.ns_trail.clear();
+    }
 
     if (f.has_reasoning()) {
         m.think.build({ m.close_core });
@@ -780,7 +810,50 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
         for (const std::string& s : f.reasoning_breaks) b.push_back(s);
         m.think_breaks.build(b);
     }
-    if (f.has_tools()) {
+    if (f.reasoning_anywhere && f.has_reasoning()) {
+        std::vector<std::string> t;
+        if (f.has_tools()) t = m.openers;
+        t.push_back(m.open_core);
+        t.push_back(m.close_core);
+        m.text_think.build(t);
+        m.think_only.build({ m.open_core, m.close_core });
+    }
+    if (m.object) {
+        m.text.build(m.openers);
+        std::string trail;
+        split_ws(f.call_close, &m.cc_core, &trail);
+        std::vector<std::string> bare{ ",", "}", "]" }, key{ ":", ",", "}" };
+        if (!f.object_string_open.empty()) {
+            m.obj_lits.push_back(f.object_string_open);
+            m.obj_lit_kind.push_back(Impl::LitString);
+            /* The call's close inside a string: where a model left the string unclosed. */
+            std::vector<std::string> sp{ f.object_string_close };
+            std::vector<std::string> qp{ "\"", "\\\"", f.object_string_close };
+            std::vector<std::string> sq{ "'", "\\'", f.object_string_close };
+            if (!m.cc_core.empty()) {
+                sp.push_back(m.cc_core);
+                qp.push_back(m.cc_core);
+                sq.push_back(m.cc_core);
+            }
+            m.obj_str.build(sp);
+            m.obj_qstr.build(qp);
+            m.obj_sqstr.build(sq);
+        }
+        if (!m.cc_core.empty()) {
+            m.obj_lits.push_back(m.cc_core);
+            m.obj_lit_kind.push_back(Impl::LitClose);
+            m.bare_cc = (int)bare.size(); bare.push_back(m.cc_core);
+            m.key_cc = (int)key.size(); key.push_back(m.cc_core);
+        }
+        if (!m.end_core.empty() && m.end_core != m.cc_core) {
+            m.obj_lits.push_back(m.end_core);
+            m.obj_lit_kind.push_back(Impl::LitEnd);
+            m.bare_ce = (int)bare.size(); bare.push_back(m.end_core);
+            m.key_ce = (int)key.size(); key.push_back(m.end_core);
+        }
+        m.obj_bare.build(bare);
+        m.obj_key.build(key);
+    } else if (f.has_tools()) {
         m.text.build(m.openers);
         m.arg_name.build({ m.name_end });
         m.value.build({ f.arg_value_suffix });
@@ -800,7 +873,8 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
     const std::string* const delims[] = { &f.reasoning_open, &f.reasoning_close, &f.call_open,
                                           &f.call_close, &f.name_prefix, &f.name_suffix,
                                           &f.call_end, &f.arg_prefix, &m.name_end,
-                                          &f.arg_value_suffix };
+                                          &f.arg_value_suffix, &f.object_string_open,
+                                          &f.object_string_close };
     for (const std::string* s : delims) m.longest = std::max(m.longest, s->size());
     for (const std::string& s : f.reasoning_breaks) m.longest = std::max(m.longest, s.size());
     *out = std::move(r);
@@ -831,6 +905,9 @@ struct ReplyParser::Impl {
     bool         calls = false;    /* the request sent tools and the format has calls */
     bool         breaks = false;   /* an unclosed reasoning block ends at a call */
     bool         pure = false;     /* no reasoning, calls or document: every byte is content */
+    /* A reasoning block may open later in the reply too (ChatFormat::reasoning_anywhere), and
+     * this request extracts reasoning. */
+    bool         anywhere = false;
     std::vector<Tool> tools;
     std::unordered_map<std::string, size_t> by_name;
     std::vector<std::string> terminators;
@@ -897,9 +974,10 @@ static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParse
                     optional.push_back(pname);
                 }
                 /* A name the argument's own delimiter could end early would be read as a
-                 * different name. */
+                 * different name. An object's keys are delimited by its own punctuation, and
+                 * one that holds it is written as a string. */
                 const std::string probe = pname + F.name_end;
-                if (probe.find(F.name_end) != pname.size()) {
+                if (!F.object && probe.find(F.name_end) != pname.size()) {
                     *why = "parameter '" + pname + "' of tool '" + t.name + "' contains '" +
                            F.name_end + "', which this model's tool-call format uses to end an "
                            "argument name";
@@ -909,7 +987,8 @@ static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParse
             }
             t.arms.insert(t.arms.end(), optional.begin(), optional.end());
             if (t.name.find(F.ns_core) != std::string::npos ||
-                (t.name + F.f.name_suffix).find(F.f.name_suffix) != t.name.size()) {
+                (!F.ns_object &&
+                 (t.name + F.f.name_suffix).find(F.f.name_suffix) != t.name.size())) {
                 *why = "tool '" + t.name + "' has a name containing '" + F.ns_core +
                        "', which this model's tool-call format uses to end a function name";
                 return RAD_E_INVAL;
@@ -949,6 +1028,8 @@ int ReplyParser::create(std::shared_ptr<const ReplyFormat> fmt, const ReplyOptio
     P.calls  = want_calls && !opt.response_format;
     P.breaks = want_calls && F.f.has_reasoning() && !F.f.reasoning_breaks.empty();
     P.pure   = !F.f.has_reasoning() && !want_calls && !opt.response_format;
+    P.anywhere = F.f.reasoning_anywhere && F.f.has_reasoning() && opt.extract_reasoning &&
+                 !opt.response_format;
 
     if (F.f.has_reasoning()) {
         switch (F.f.reasoning_in_prompt) {
@@ -1004,6 +1085,19 @@ enum class St : uint8_t {
     RfClose,      /* "```" */
     RfEnd,        /* after the closing fence */
     RfRaw,        /* a reply that is not the document it was asked for: content */
+    ObjStart,     /* after a name_suffix: whitespace, then the argument object's `{` */
+    ObjKey,       /* where a key may begin, or the object's `}` */
+    ObjKeyBare,   /* a bare key, to its `:` */
+    ObjColon,     /* after a quoted key: whitespace, then `:` */
+    ObjValue,     /* where a value may begin, or an empty array's `]` */
+    ObjLit,       /* the dialect's string opener, or the call's close or end, being matched */
+    ObjStr,       /* a dialect string, to its close */
+    ObjQStr,      /* a value opened with a plain quote in a dialect with strings of its own */
+    ObjQLook,     /* after a plain quote there: does the object's syntax go on? */
+    ObjJStr,      /* a JSON string, to its quote */
+    ObjBare,      /* a bare value: a number, a literal, or a word read as a string */
+    ObjAfter,     /* after a value: whitespace, then `,` or a closing bracket */
+    ObjEnd,       /* after the object: whitespace, then call_end */
 };
 
 /* A function name the grammar does not know is still read as a call, up to this long. */
@@ -1018,7 +1112,19 @@ struct ReplyStream::Impl {
     explicit Impl(const ReplyParser::Impl& p) : P(p), F(p.fmt->impl()) {
         content.init(P.terminators.empty() ? nullptr : &P.terms, &P.terminators);
         st = P.pure ? St::Text : St::LeadWs;
+        if (P.anywhere) {
+            text_dfa = P.calls ? &F.text_think : &F.think_only;
+            n_open = P.calls ? F.openers.size() : 0;
+        } else if (P.calls) {
+            text_dfa = &F.text;
+            n_open = F.openers.size();
+        }
     }
+
+    /* What content is scanned with: the call openers when calls are on, then -- reasoning
+     * anywhere -- a later block's opener and a stray close. Null: content is every byte. */
+    const Dfa* text_dfa = nullptr;
+    size_t     n_open = 0;
 
     ReplyMessage msg;
     ContentOut   content;
@@ -1061,6 +1167,28 @@ struct ReplyStream::Impl {
     std::string vheld;
     size_t      vs_pos = 0;
     bool        fenced = false;
+
+    /* THE ARGUMENT OBJECT being read: its open brackets, whether a key (rather than a value) is
+     * being read, a separator read but not yet written -- it is written only once the next
+     * member shows the object goes on, so a trailing one never reaches the JSON -- whether the
+     * container was just opened, and whether a key's `:` went out with no value yet. */
+    std::vector<char> ostack;
+    bool        okey = false, ocomma = false, ofirst = false, vpending = false;
+    /* A bare value's first bytes, to tell at its end whether it was a JSON number or literal --
+     * which the grammar admits -- or a word read as a string, which it does not. */
+    std::string bare_txt;
+    /* A JSON string's escape being read -- the backslash, and a "u" escape's four hex digits,
+     * in vheld -- and a high surrogate's escape, held until the low one shows it is a pair. */
+    std::string jhi;
+    /* INSIDE A STRING: its trailing run of whitespace, closing brackets and quotes, held -- the
+     * brackets are the object's own if the call's close follows (srun) -- the quotes and
+     * backticks it has written (nq, nb), the bytes after a plain quote while they decide what it
+     * was (qtail), and how a plain-quoted value writes its quotes: 0 not yet seen, 1 as \" (one
+     * is unescaped), 2 as they are. */
+    std::string srun, qtail;
+    size_t      nq = 0, nb = 0, ns = 0;
+    uint8_t     qmode = 0;
+    char        qc = '"';
 
     /* published offsets, for the deltas */
     size_t sent_r = 0, sent_c = 0, sent_a = 0;
@@ -1202,7 +1330,7 @@ struct ReplyStream::Impl {
 
     bool declared_prefix(std::string_view n) const {
         for (const Tool& t : P.tools) {
-            const std::string full = t.name + F.f.name_suffix;
+            const std::string full = t.name + (F.ns_object ? F.ns_core : F.f.name_suffix);
             if (full.size() >= n.size() && full.compare(0, n.size(), n) == 0) return true;
         }
         return false;
@@ -1283,12 +1411,305 @@ struct ReplyStream::Impl {
         cur = -1;
         event(ReplyEvent::CallBegin, (uint32_t)msg.calls.size() - 1, msg.calls.back().name);
         depth = 0; in_str = false; esc = false;
-        args_out("{");
         argc = 0;
         ++calls;
         att.clear();
         post_call = false;
+        if (F.object) {
+            /* The arguments are the object's, and its `{` is written now: a reply that ends
+             * here is a call with no arguments yet, as in the tagged family. */
+            obj_out("{");
+            ostack.assign(1, '{');
+            okey = ocomma = vpending = false;
+            ofirst = true;
+            jhi.clear();
+            st = F.ns_object ? St::ObjKey : St::ObjStart;
+            return;
+        }
+        args_out("{");
         st = St::Body;
+    }
+
+    /* ------------------------------------------------------------ the argument object
+     *
+     * The object of the object family, read as it streams and written as JSON as it is read:
+     * brackets and separators as they come, a key as soon as its `:` shows it is one, a string
+     * as its bytes arrive, and a bare value as the tagged family writes a typed one (ValueOut,
+     * Raw): held while it could still be a literal or a number, else a string. What the dialect
+     * spells otherwise -- its string delimiters, its bare keys -- is respelled; what leaves it
+     * -- a missing separator, a trailing one, a bracket of the wrong kind, an object the call's
+     * close cuts off -- is repaired locally and said so (strict). The arguments a closed call
+     * reports are JSON whatever was written. */
+
+    void obj_out(std::string_view s) {
+        if (s.empty()) return;
+        touch(2);
+        msg.calls.back().arguments.append(s.data(), s.size());
+    }
+    void obj_flush() { if (!scratch.empty()) { obj_out(scratch); scratch.clear(); } }
+
+    /* A member or an element begins: the separator before it, if one was read, goes out now. */
+    void obj_sep() {
+        if (ocomma) { obj_out(","); ocomma = false; }
+        ofirst = false;
+    }
+
+    /* The outermost bracket closed: what follows the object. */
+    void obj_done() {
+        if (!F.end_core.empty()) { lpos = 0; lhold.clear(); st = St::ObjEnd; }
+        else end_call();
+    }
+
+    /* A closing bracket where a key, a value or a separator may stand. A separator before it is
+     * dropped, and a bracket of the other kind closes the open container all the same. */
+    void obj_close_bracket(char c) {
+        if (ocomma) { lenient(); ocomma = false; }
+        const char top = ostack.back();
+        if ((top == '{') != (c == '}')) lenient();
+        if (vpending) { lenient(); obj_out("null"); vpending = false; }
+        ostack.pop_back();
+        ofirst = false;
+        obj_out(top == '{' ? "}" : "]");
+        if (ostack.empty()) obj_done();
+        else st = St::ObjAfter;
+    }
+
+    /* The punctuation after a value. */
+    void obj_struct(char c) {
+        if (c != ',') { obj_close_bracket(c); return; }
+        if (ocomma) lenient();          /* `,,`: one separator */
+        ocomma = true;
+        ofirst = false;
+        okey = ostack.back() == '{';
+        st = okey ? St::ObjKey : St::ObjValue;
+    }
+
+    bool obj_lit_start(unsigned char c) const {
+        for (const std::string& l : F.obj_lits)
+            if ((unsigned char)l[0] == c) return true;
+        return false;
+    }
+
+    /* Bytes that open no string and close no call: a bare key or a bare value. */
+    void obj_bare_begin() {
+        ds = 0;
+        hold.clear();
+        if (okey) {
+            if (!F.f.object_bare_keys) lenient();
+            name.clear();
+            st = St::ObjKeyBare;
+            return;
+        }
+        obj_sep();
+        vpending = false;
+        bare_txt.clear();
+        val.begin(ValueOut::Raw, /*cdata=*/false, /*lead=*/false, /*trail=*/false, scratch);
+        obj_flush();
+        st = St::ObjBare;
+    }
+
+    static constexpr size_t kBareKeep = 64;   /* longer than any number a model writes */
+
+    /* A bare value ended: one that is no JSON number or literal was read by the recovery rule. */
+    void bare_done() {
+        std::string_view v(bare_txt);
+        while (!v.empty() && is_ws((unsigned char)v.back())) v.remove_suffix(1);
+        const bool json = bare_txt.size() < kBareKeep && !v.empty() &&
+                          (v == "true" || v == "false" || v == "null" ||
+                           ((v[0] == '-' || (v[0] >= '0' && v[0] <= '9')) &&
+                            nlohmann::json::accept(v)));
+        if (!json) lenient();
+    }
+
+    /* A JSON string, which is the dialect's own only when it declares no string delimiters. */
+    void json_string_begin() {
+        if (!F.f.object_string_open.empty()) lenient();
+        obj_out("\"");
+        vheld.clear();
+        st = St::ObjJStr;
+    }
+
+    /* One of the anchored literals matched where a key or a value may begin. */
+    void obj_lit_done(uint8_t kind) {
+        if (kind == ReplyFormat::Impl::LitString) {
+            obj_sep();
+            if (!okey) vpending = false;
+            obj_out("\"");
+            ds = 0;
+            hold.clear();
+            str_begin();
+            st = St::ObjStr;
+            return;
+        }
+        /* The call's close or end where the object wanted more: the reply left the object
+         * unclosed, and the call ends here with it closed. */
+        lenient();
+        ocomma = false;
+        if (kind == ReplyFormat::Impl::LitClose) end_call_at_close();
+        else end_core_done();
+    }
+
+    /* A JSON string's text goes out as it is, its escapes checked: one JSON has not is the
+     * backslash and the letter as text, a raw control character is escaped, and a surrogate
+     * escape that is not half of a pair is U+FFFD -- a client's JSON parser refuses all three. */
+    void jstr_char(const char* q, size_t n) {
+        if (n == 0) return;
+        if (!jhi.empty()) { lenient(); jhi.clear(); obj_out("\\ufffd"); }
+        touch(2);
+        json_escape_into(msg.calls.back().arguments, q, n);
+    }
+
+    void jstr_escape_done(const std::string& e) {
+        /* e: a complete two-character escape, or a "u" escape with its four digits. */
+        if (e.size() == 6) {
+            const unsigned long cp = std::strtoul(e.c_str() + 2, nullptr, 16);
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                if (!jhi.empty()) { lenient(); obj_out("\\ufffd"); }
+                jhi = e;
+                return;
+            }
+            if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                if (jhi.empty()) { lenient(); obj_out("\\ufffd"); return; }
+                obj_out(jhi + e);
+                jhi.clear();
+                return;
+            }
+        }
+        if (!jhi.empty()) { lenient(); jhi.clear(); obj_out("\\ufffd"); }
+        obj_out(e);
+    }
+
+    static constexpr size_t kRunKeep  = 16;   /* the closers a string's end may hold back */
+    static constexpr size_t kLookKeep = 32;   /* what deciding a close may read ahead */
+
+    static bool run_byte(char c) {
+        return c == '}' || c == ']' || c == '"' || c == '`' || c == '\'' || is_ws((unsigned char)c);
+    }
+
+    void str_begin() { srun.clear(); nq = nb = ns = 0; }
+    void str_emit(const char* q, size_t n) {
+        if (n == 0) return;
+        nq += (size_t)std::count(q, q + n, '"');
+        nb += (size_t)std::count(q, q + n, '`');
+        ns += (size_t)std::count(q, q + n, '\'');
+        touch(2);
+        json_escape_into(msg.calls.back().arguments, q, n);
+    }
+    void str_flush() { str_emit(srun.data(), srun.size()); srun.clear(); }
+
+    /* A string's text: all of it goes out but a trailing run of whitespace and closers. */
+    void str_text(const char* q, size_t n) {
+        size_t k = n;
+        while (k > 0 && run_byte(q[k - 1])) --k;
+        if (k > 0) { str_flush(); str_emit(q, k); }
+        srun.append(q + k, n - k);
+        if (srun.size() > kRunKeep) {
+            const size_t out = srun.size() - kRunKeep;
+            str_emit(srun.data(), out);
+            srun.erase(0, out);
+        }
+    }
+
+    /* Where the held run stops being text: the closers after it close every open bracket of the
+     * object, innermost first, as the model writes them before the call's close -- read from the
+     * end, the last closes the outermost. npos: they do not. */
+    size_t run_cut() const {
+        size_t i = srun.size(), k = 0;
+        while (i > 0 && k < ostack.size()) {
+            const char c = srun[i - 1];
+            if (is_ws((unsigned char)c)) { --i; continue; }
+            if (c != (ostack[k] == '{' ? '}' : ']')) break;
+            --i;
+            ++k;
+        }
+        return k == ostack.size() && k > 0 ? i : std::string::npos;
+    }
+
+    static bool starts(std::string_view a, std::string_view b) {
+        return a.size() >= b.size() && a.compare(0, b.size(), b) == 0;
+    }
+
+    /* The call's close in a string whose held run closes the whole object: the model left the
+     * string open (measured: the close delimiter at p=0.86, `}` at p=0.08), and this is where
+     * the call ends -- as vLLM's and HF's Gemma 4 parsers end it, at the first `}<tool_call|>`.
+     * The closers are the object's. A quote or backtick just before them that leaves the string
+     * with an odd count of its kind was the string's close, written in the wrong spelling. */
+    void cut_begin() {
+        const size_t cut = run_cut();
+        if (cut == std::string::npos) { str_flush(); str_emit(F.cc_core.data(), F.cc_core.size()); return; }
+        lenient();
+        size_t keep = cut;
+        if (keep > 0 && (srun[keep - 1] == '"' || srun[keep - 1] == '`' || srun[keep - 1] == '\'')) {
+            const char c = srun[keep - 1];
+            const size_t n = (c == '"' ? nq : c == '`' ? nb : ns) +
+                             (size_t)std::count(srun.begin(), srun.begin() + (long)keep, c);
+            if (n % 2 == 1) --keep;
+        }
+        str_emit(srun.data(), keep);
+        srun.clear();
+        if (!jhi.empty()) jhi.clear();
+        obj_out(okey ? "\":null" : "\"");
+        vpending = false;
+        ocomma = false;
+        /* As after a call's close of its own: a repeated close goes with it. */
+        end_call();
+    }
+
+    /* After a plain quote in a plain-quoted value: 0 not yet known, 1 it closed the value -- the
+     * object goes on with a member, an element, its closers and the call's close -- 2 it was
+     * text. */
+    int q_verdict() const {
+        const std::string& q = qtail;
+        if (q.size() > kLookKeep) return 2;
+        const size_t n = q.size();
+        size_t i = 0, top = ostack.size();
+        auto ws = [&] { while (i < n && is_ws((unsigned char)q[i])) ++i; };
+        ws();
+        while (i < n && top > 0 && q[i] == (ostack[top - 1] == '{' ? '}' : ']')) { --top; ++i; ws(); }
+        if (i == n) return 0;
+        const std::string& so = F.f.object_string_open;
+        std::string_view r(q.data() + i, n - i);
+        if (!F.cc_core.empty()) {
+            if (starts(r, F.cc_core)) return 1;
+            if (starts(F.cc_core, r)) return 0;
+        }
+        if (top == 0 || q[i] != ',') return 2;
+        ++i;
+        ws();
+        if (i == n) return 0;
+        r = std::string_view(q.data() + i, n - i);
+        const unsigned char c = (unsigned char)q[i];
+        if (starts(r, so)) return 1;
+        if (starts(so, r)) return 0;
+        if (ostack[top - 1] == '{') {
+            if (!(std::isalpha(c) || c == '_')) return 2;
+            while (i < n && (std::isalnum((unsigned char)q[i]) || q[i] == '_')) ++i;
+            ws();
+            if (i == n) return 0;
+            return q[i] == ':' ? 1 : 2;
+        }
+        return (c == '"' || c == '\'' || c == '{' || c == '[' || c == '-' || std::isdigit(c)) ? 1 : 2;
+    }
+
+    void q_done(bool closed) {
+        std::string again;
+        again.swap(qtail);
+        if (closed) {
+            str_flush();
+            obj_string_done();
+        } else {
+            if (qmode == 0) qmode = 2;
+            str_text(&qc, 1);
+            st = St::ObjQStr;
+        }
+        read_again(again);
+    }
+
+    /* A string or a key closed. */
+    void obj_string_done() {
+        if (!jhi.empty()) { lenient(); jhi.clear(); obj_out("\\ufffd"); }
+        obj_out("\"");
+        st = okey ? St::ObjColon : St::ObjAfter;
     }
 
     /* The core of call_end has matched. The whitespace the format writes after it is part of the
@@ -1306,8 +1727,18 @@ struct ReplyStream::Impl {
      * match, so no quote is ever pending here; a raw value that left a string open is passed
      * through as the model wrote it. */
     void end_call() {
-        std::string close((size_t)std::max(depth, 0), '}');
-        args_out(close);
+        if (F.object) {
+            /* What the object left open is closed, so the arguments are JSON: a key whose value
+             * never came is null, and each bracket gets its partner. */
+            std::string close = vpending ? "null" : "";
+            vpending = false;
+            for (auto it = ostack.rbegin(); it != ostack.rend(); ++it) close += *it == '{' ? '}' : ']';
+            ostack.clear();
+            obj_out(close);
+        } else {
+            std::string close((size_t)std::max(depth, 0), '}');
+            args_out(close);
+        }
         publish(2, true);
         msg.calls.back().closed = true;
         event(ReplyEvent::CallEnd, (uint32_t)msg.calls.size() - 1, {});
@@ -1499,14 +1930,22 @@ struct ReplyStream::Impl {
             return p;
 
         case St::Text:
-            if (!P.calls) {
+            if (!text_dfa) {
                 text_out(p, (size_t)(e - p));
                 return e;
             }
-            p = scan(F.text, p, e, &hit, [this](const char* q, size_t n) { text_out(q, n); });
-            if (hit >= 0) {
+            p = scan(*text_dfa, p, e, &hit, [this](const char* q, size_t n) { text_out(q, n); });
+            if (hit < 0) return p;
+            if ((size_t)hit < n_open) {
                 att_at = here(p) - F.openers[(size_t)hit].size();
                 begin_text_attempt(hit);
+            } else if ((size_t)hit == n_open) {
+                /* A reasoning block opens again, later in the reply. */
+                trail = 0;
+                st = St::ThinkOpenWs;
+            } else {
+                /* Its close with no block open: not part of the answer. */
+                lenient();
             }
             return p;
 
@@ -1558,12 +1997,18 @@ struct ReplyStream::Impl {
                 lpos = 0;
                 lhold.clear();
                 tag_end = att.size();
-                if (loose) st = St::OpenPeek;
+                if (loose && F.object) {
+                    /* A call written without its wrapper, in the object family: a declared
+                     * tool's name and the object's opening are what make it one. */
+                    if (tool < 0) { fail_attempt(); return p + 1; }
+                    begin_call(false);
+                } else if (loose) st = St::OpenPeek;
                 else if (F.ns_trail.empty()) begin_call(true);
                 else st = St::OpenTail;
                 return p + 1;
             }
-            if (name.size() > kMaxLooseName || (c == '<' && !declared_prefix(name))) {
+            if (name.size() > kMaxLooseName || (c == '<' && !declared_prefix(name)) ||
+                (loose && F.object && !declared_prefix(name))) {
                 fail_attempt();
                 return p + 1;
             }
@@ -1775,6 +2220,279 @@ struct ReplyStream::Impl {
             if (p < e) { post_call = true; ds = 0; hold.clear(); st = St::Text; }
             return p;
 
+        case St::ObjStart:
+            while (p < e && is_ws((unsigned char)*p)) ++p;
+            if (p == e) return p;
+            if (*p == '{') { ofirst = true; okey = true; st = St::ObjKey; return p + 1; }
+            /* No object after the name: the call takes none, and what stands there instead is
+             * read as what follows a call. */
+            lenient();
+            obj_done();
+            return p;
+
+        case St::ObjKey: {
+            while (p < e && is_ws((unsigned char)*p)) ++p;
+            if (p == e) return p;
+            const char c = *p;
+            okey = true;
+            if (c == '}' || c == ']') { obj_close_bracket(c); return p + 1; }
+            if (c == ',') { lenient(); return p + 1; }   /* an empty member */
+            if (c == '"') {
+                obj_sep();
+                json_string_begin();
+                return p + 1;
+            }
+            if (obj_lit_start((unsigned char)c)) { lhold.clear(); st = St::ObjLit; return p; }
+            obj_bare_begin();
+            return p;
+        }
+
+        case St::ObjKeyBare:
+            p = scan(F.obj_key, p, e, &hit, [this](const char* q, size_t n) { name.append(q, n); });
+            if (hit < 0) return p;
+            if (hit <= 2) {
+                std::string_view k(name);
+                while (!k.empty() && is_ws((unsigned char)k.back())) k.remove_suffix(1);
+                if (k.empty()) lenient();
+                obj_sep();
+                std::string out = json_quote(k);
+                name.clear();
+                if (hit == 0) {
+                    obj_out(out + ":");
+                    vpending = true;
+                    okey = false;
+                    st = St::ObjValue;
+                    return p;
+                }
+                /* A key with no value: it is null. */
+                lenient();
+                obj_out(out + ":null");
+                obj_struct(hit == 1 ? ',' : '}');
+                return p;
+            }
+            /* The call's close or end inside a key: the key had no value, and goes. */
+            name.clear();
+            lenient();
+            ocomma = false;
+            if (hit == F.key_cc) end_call_at_close();
+            else end_core_done();
+            return p;
+
+        case St::ObjColon:
+            while (p < e && is_ws((unsigned char)*p)) ++p;
+            if (p == e) return p;
+            vpending = true;
+            okey = false;
+            st = St::ObjValue;
+            if (*p == ':') { obj_out(":"); return p + 1; }
+            lenient();
+            obj_out(":");
+            return p;
+
+        case St::ObjValue: {
+            while (p < e && is_ws((unsigned char)*p)) ++p;
+            if (p == e) return p;
+            const char c = *p;
+            const bool in_array = ostack.back() == '[';
+            okey = false;
+            if (c == '{' || c == '[') {
+                obj_sep();
+                vpending = false;
+                obj_out(c == '{' ? "{" : "[");
+                ostack.push_back(c);
+                ofirst = true;
+                okey = c == '{';
+                st = c == '{' ? St::ObjKey : St::ObjValue;
+                return p + 1;
+            }
+            if (c == ']' && in_array && ofirst) { obj_close_bracket(c); return p + 1; }
+            if (c == '}' || c == ']' || c == ',') {
+                /* No value where one was due: a member's is null, and an array's gap is no
+                 * element. */
+                lenient();
+                if (!in_array) {
+                    obj_out("null");
+                    vpending = false;
+                    st = St::ObjAfter;
+                    return p;
+                }
+                if (c == ',') return p + 1;
+                obj_close_bracket(c);
+                return p + 1;
+            }
+            if ((c == '"' || c == '\'') && !F.f.object_string_open.empty()) {
+                /* Measured on Gemma 4: such a quote -- `"`, or `'` as Python and JavaScript
+                 * write strings -- is followed by the text verbatim, or with only its quotes
+                 * escaped, never JSON's other escapes. */
+                obj_sep();
+                vpending = false;
+                lenient();
+                obj_out("\"");
+                qc = c;
+                qmode = 0;
+                str_begin();
+                st = St::ObjQStr;
+                return p + 1;
+            }
+            if (c == '"') {
+                obj_sep();
+                vpending = false;
+                json_string_begin();
+                return p + 1;
+            }
+            if (obj_lit_start((unsigned char)c)) { lhold.clear(); st = St::ObjLit; return p; }
+            obj_bare_begin();
+            return p;
+        }
+
+        case St::ObjLit: {
+            const char c = *p;
+            lhold.push_back(c);
+            bool part = false;
+            for (size_t i = 0; i < F.obj_lits.size(); ++i) {
+                const std::string& l = F.obj_lits[i];
+                if (lhold.size() > l.size() || l.compare(0, lhold.size(), lhold) != 0) continue;
+                if (lhold.size() < l.size()) { part = true; continue; }
+                lhold.clear();
+                obj_lit_done(F.obj_lit_kind[i]);
+                return p + 1;
+            }
+            if (part) return p + 1;
+            /* None of them: the bytes begin a bare key or value. */
+            std::string again;
+            again.swap(lhold);
+            obj_bare_begin();
+            read_again(again);
+            return p + 1;
+        }
+
+        case St::ObjStr:
+            p = scan(F.obj_str, p, e, &hit, [this](const char* q, size_t n) { str_text(q, n); });
+            if (hit < 0) return p;
+            if (hit == 0) { str_flush(); obj_string_done(); }
+            else cut_begin();
+            return p;
+
+        case St::ObjQStr:
+            p = scan(qc == '"' ? F.obj_qstr : F.obj_sqstr, p, e, &hit,
+                     [this](const char* q, size_t n) { str_text(q, n); });
+            if (hit < 0) return p;
+            if (hit == 0) { qtail.clear(); st = St::ObjQLook; }
+            else if (hit == 1) {
+                if (qmode == 0) qmode = 1;
+                const char esc[2] = { '\\', qc };
+                if (qmode == 1) str_text(&qc, 1);
+                else str_text(esc, 2);
+            } else if (hit == 2) { lenient(); str_flush(); obj_string_done(); }
+            else cut_begin();
+            return p;
+
+        case St::ObjQLook: {
+            qtail.push_back(*p);
+            const int v = q_verdict();
+            if (v) q_done(v == 1);
+            return p + 1;
+        }
+
+        case St::ObjJStr: {
+            const char* run = p;
+            while (p < e) {
+                const unsigned char c = (unsigned char)*p;
+                if (vheld.size() == 1) {                /* after the backslash */
+                    if (c && std::strchr("\"\\/bfnrt", (int)c)) {
+                        vheld.push_back((char)c);
+                        jstr_escape_done(vheld);
+                        vheld.clear();
+                        run = ++p;
+                        continue;
+                    }
+                    if (c == 'u') { vheld.push_back('u'); run = ++p; continue; }
+                    /* No JSON escape: the backslash is text, and what follows it is read as
+                     * the string's next byte. */
+                    lenient();
+                    vheld.clear();
+                    jstr_char("\\", 1);
+                    run = p;
+                    continue;
+                }
+                if (!vheld.empty()) {                   /* a "u" escape's digits */
+                    if (std::isxdigit(c)) {
+                        vheld.push_back((char)c);
+                        if (vheld.size() == 6) { jstr_escape_done(vheld); vheld.clear(); }
+                        run = ++p;
+                        continue;
+                    }
+                    lenient();
+                    const std::string text = vheld;
+                    vheld.clear();
+                    jstr_char(text.data(), text.size());
+                    run = p;
+                    continue;
+                }
+                if (c != '"' && c != '\\') { ++p; continue; }
+                jstr_char(run, (size_t)(p - run));
+                ++p;
+                if (c == '"') { obj_string_done(); return p; }
+                vheld.assign(1, '\\');
+                run = p;
+            }
+            jstr_char(run, (size_t)(p - run));
+            return p;
+        }
+
+        case St::ObjBare:
+            p = scan(F.obj_bare, p, e, &hit, [this](const char* q, size_t n) {
+                if (bare_txt.size() < kBareKeep)
+                    bare_txt.append(q, std::min(n, kBareKeep - bare_txt.size()));
+                val.add(q, n, scratch);
+                obj_flush();
+            });
+            if (hit < 0) return p;
+            val.finish(false, scratch);
+            obj_flush();
+            bare_done();
+            if (hit <= 2) { obj_struct(",}]"[hit]); return p; }
+            lenient();
+            if (hit == F.bare_cc) end_call_at_close();
+            else end_core_done();
+            return p;
+
+        case St::ObjAfter: {
+            while (p < e && is_ws((unsigned char)*p)) ++p;
+            if (p == e) return p;
+            const char c = *p;
+            if (c == ',' || c == '}' || c == ']') { obj_struct(c); return p + 1; }
+            /* A key or a value with no separator before it: one is supplied. */
+            lenient();
+            ocomma = true;
+            ofirst = false;
+            okey = ostack.back() == '{';
+            st = okey ? St::ObjKey : St::ObjValue;
+            return p;
+        }
+
+        case St::ObjEnd: {
+            if (lpos == 0) {
+                while (p < e && is_ws((unsigned char)*p)) ++p;
+                if (p == e) return p;
+            }
+            const char c = *p;
+            if (c == F.end_core[lpos]) {
+                lhold.push_back(c);
+                if (++lpos == F.end_core.size()) { lhold.clear(); lpos = 0; end_core_done(); }
+                return p + 1;
+            }
+            /* The object is not followed by the call's end: the call ends with it all the same,
+             * and what stands there is read as what follows a call. */
+            lenient();
+            std::string again;
+            again.swap(lhold);
+            lpos = 0;
+            end_call();
+            read_again(again);
+            return p;
+        }
+
         case St::RfWs:
             while (p < e && is_ws((unsigned char)*p)) ++p;
             if (p < e) {
@@ -1962,6 +2680,14 @@ struct ReplyStream::Impl {
     }
 
     void finish_all() {
+        /* The reply ended while a close was being decided: it was one. */
+        while (st == St::ObjQLook) {
+            q_done(true);
+            std::string again = std::move(refeed);
+            refeed.clear();
+            run(again, fed >= again.size() ? fed - again.size() : 0);
+        }
+        if (st == St::ObjStr || st == St::ObjQStr) str_flush();
         while (in_loose_attempt()) {
             fail_attempt();
             std::string again = std::move(refeed);
@@ -1997,6 +2723,11 @@ struct ReplyStream::Impl {
             break;
         case St::ValJsonEnd:
             json_value_done(std::string_view(vheld).substr(0, vheld.size() - vs_pos));
+            break;
+        case St::ObjBare:
+            /* A bare value the reply was cut off inside: as it arrived. The call is open. */
+            val.finish(true, scratch);
+            obj_flush();
             break;
         default:
             break;
@@ -2066,7 +2797,9 @@ ReplyHeld ReplyStream::held() const {
                   (m.msg.reasoning.size() - m.sent_r) + (m.msg.content.size() - m.sent_c) +
                   (m.msg.calls.empty() ? 0 : m.msg.calls.back().arguments.size() - m.sent_a);
     h.space = m.content.held_space() + m.think_pend.size();
-    h.structure = m.att.size() + m.name.size() + m.vheld.size() + m.val.held_container();
+    h.delimiter += m.srun.size() + m.qtail.size();
+    h.structure = m.att.size() + m.name.size() + m.vheld.size() + m.val.held_container() +
+                  m.jhi.size();
     return h;
 }
 

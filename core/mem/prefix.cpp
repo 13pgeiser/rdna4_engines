@@ -158,6 +158,9 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     }
 
     interval_ = checkpoint_interval;
+    /* A WINDOW SNAPSHOT is state in the same sense: a hit is reusable at a checkpoint only, where
+     * the slot carries the window behind it (KVManager::has_window_snapshot). */
+    if (kv->has_window_snapshot() && interval_ > 0) has_linear_ = true;
     if (has_linear_) {
         if (interval_ <= 0) {
             RAD_ERR("checkpoint_interval is %lld but the model has linear-attention state. A "

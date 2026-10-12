@@ -704,13 +704,21 @@ int Engine::step_loop() {
                 for (const StepEntry& e : plan.e) {
                     if (e.ckpt_restore < 0) continue;
                     if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
+                    /* The window behind the hit, in the blocks admit_one seeded at its floor. */
+                    if (ranks_[0]->kv.has_window_snapshot() &&
+                        !ranks_[0]->kv.window_rows(e.seq, e.ctx_len, &ckpt_win_)) {
+                        RAD_ERR("sequence %llu: no window rows at %d to restore into",
+                                (unsigned long long)e.seq, (int)e.ctx_len);
+                        return RAD_E_STATE;
+                    }
                     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
                         auto& rk = ranks_[ri];
                         /* This rank's device, for its own stream and its own state slots. */
                         if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                         const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
                                                                 (int)ckpt_slots_.size(),
-                                                                e.ckpt_restore, rk->ctx.stream());
+                                                                e.ckpt_restore, rk->ctx.stream(),
+                                                                &ckpt_win_);
                         if (s < 0) {
                             RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
                                     "rank %d: %s", (unsigned long long)e.seq,
@@ -809,11 +817,23 @@ int Engine::step_loop() {
                 for (const StepEntry& e : plan.e) {
                     if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
                     if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
+                    /* The window behind the checkpoint position. The chunk that ends there
+                     * still holds it (its ensure kept the window behind the chunk's first
+                     * query), so a miss is a broken invariant -- and skipping would leave the
+                     * cache a slot it commits as valid with somebody else's pages in it. */
+                    if (ranks_[0]->kv.has_window_snapshot() &&
+                        !ranks_[0]->kv.window_rows(e.seq, e.ctx_len + e.ckpt_tok + 1,
+                                                   &ckpt_win_)) {
+                        RAD_ERR("sequence %llu: the window behind checkpoint %d is not held",
+                                (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
+                        return RAD_E_STATE;
+                    }
                     for (auto& rk : ranks_) {
                         if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                         const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
                                                              (int)ckpt_slots_.size(),
-                                                             e.ckpt_slot, rk->ctx.stream());
+                                                             e.ckpt_slot, rk->ctx.stream(),
+                                                             &ckpt_win_);
                         if (s < 0) {
                             RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
                                     "%d: %s", rk->index, (unsigned long long)e.seq,
@@ -1924,7 +1944,8 @@ bool Engine::state_slots_of(uint64_t seq, std::vector<int32_t>* out) const {
         (*out)[(size_t)g] = s;
         any = true;
     }
-    return any;
+    /* A window snapshot is a snapshot with no state slots (KVManager::has_window_snapshot). */
+    return any || (kv.has_window_snapshot() && kv.has_sequence(seq));
 }
 
 /* ------------------------------------------------------------------ the HTTP frontend */

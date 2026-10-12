@@ -22,6 +22,7 @@ If you wish to support the developement of the radiance engine you can do so [he
 | Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
+| Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `embeddinggemma2.yaml` |
@@ -34,6 +35,13 @@ file. Download one into your models directory (the transfer resumes if interrupt
 mkdir -p /srv/models/rad && cd /srv/models/rad
 curl -LC - -O https://huggingface.co/StillDeadcode/minicpm5-2b-fp8/resolve/main/minicpm5-2b-fp8.rad
 ```
+
+The Gemma 4 container is keptn42's: GPTQ calibrated in transformers, with an int8 lm_head; its
+repository has the recipe and the calibration step. To convert Google's bf16 checkpoint yourself,
+`data/recipes/gemma4-31b-dense-bf16-w4a8.recipe` quantises without calibration (round-to-nearest
+with a scale search, bf16 lm_head); see [Convert a checkpoint](#convert-a-checkpoint). On two R9700s
+that container decodes at 103 tok/s on prose and 141 on code, against 112 and 150 for keptn42's,
+and its drafts are accepted a little less often (0.46 against 0.50 of them on prose).
 
 ## Run with Docker
 
@@ -149,6 +157,10 @@ budgets, long context, speculative decoding and operating a server.
 build/bin/rad-convert ~/models/Qwen/Qwen3.8-27B -o qwen3.8-27b-bf16.rad \
     --recipe data/recipes/q38-27b-bf16.recipe
 build/bin/rad-convert ~/models/Qwen/Qwen3.8-Flash-Next -o qwen3.8-flash-next-bf16.rad --max-ctx 4096
+build/bin/rad-convert ~/models/google/gemma-4-31B-it -o gemma4-31b-w4a8.rad \
+    --recipe data/recipes/gemma4-31b-dense-bf16-w4a8.recipe \
+    --set quantization_config.quant_method=compressed-tensors \
+    --draft-model ~/models/google/gemma-4-31B-it-assistant
 ```
 
 With Docker, use `docker run --rm -v ~/models:/models --entrypoint rad-convert stilldeadcode/radiance ...`. In
