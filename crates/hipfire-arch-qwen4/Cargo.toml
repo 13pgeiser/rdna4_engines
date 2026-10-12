@@ -8,6 +8,7 @@ license.workspace = true
 description = "Qwen4/ Qwen3.8-Flash-Next text configuration, PLE hashing, admission, and manifest foundations"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }

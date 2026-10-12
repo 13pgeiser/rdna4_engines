@@ -122,3 +122,150 @@ costs are **58,555 / 86,035 / 148,116** ticks. Scaling 33.1 TOPS by these
 incremental ratios estimates **33.1 / 22.5277 / 13.0855 TOPS**.
 These derived warm-wave numbers, not the optimistic cold-submit ratios,
 are the relevant throughput warning for a resident multi-wave trunk.
+
+## GPU Bf16Direct glue
+
+`rdna_compute::npu_trunk` exposes an explicit `NpuBf16Layout` (padded rows,
+K64-compatible K, panel count) and native `NpuTrunkOutput` ranges. S1 maps bind
+destinations with `ColumnMap::gpu_output`; no fused output tensor is needed.
+The producer writes every packed A byte, including zero padding, directly to a
+device tensor or a device-accessible host-registered arena (`unsafe ..._ptr`).
+Compact scale sidecars are four bytes per token: LE u16 mantissa then LE i16
+exponent. Weight sidecars use the same encoding, indexed by fused column.
+
+`npu_trunk_emulate_bf16` reads exactly that packed A and row-major S1 W8 codes,
+uses caller-owned I32 `[rows,n]` scratch, then applies the lab's all-integer
+single-rounding BF16 epilogue into native outputs. The consumer reads panel-major
+G80 BF16 tiles without rounding; F32 stores are exact `bits << 16`. The producer
+requires finite F16 inputs, as does the screened lab contract. Geometry may be
+larger than the live token count; it must equal the submitted NPU program.
+
+The signed-IU8 WMMA GEMM and BF16/F32 scatter are certified PM gfx1151 kernels
+(`hipfire-isa emit --kernel npu_trunk`, committed image and M7 receipt).
+Activation grid `ceilf` and epilogue unsigned CLZ currently use hipcc, with the
+two missing ISA-table operations logged in release-0.4.2/PM-GAPS.md. This is an
+opt-in primitive API only: no scheduler, forward hook or NPU device open.
+
+Halo GPU byte oracle (do not hide the GPU for this command):
+
+```sh
+CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
+nice -n 19 cargo run --release -p rdna-compute --features lab -j 12 \
+  --example npu_trunk_glue_check
+```
+
+It compares packed bytes/compact scales to the CPU quantizer and G80 packer,
+every native output to exact CPU integer dots plus `bf16_direct`, and synthetic
+tile scatter including nonfinite/signed-zero bit patterns. Full GDN/QSA maps,
+both output dtypes, 512/8192/ragged-4647 tokens and poison tails are checked.
+Repeated deterministic input/weight rows cache CPU dots, never GPU answers.
+Typed upload shapes count elements (including guard elements), not bytes.
+The oracle checks shape/dtype byte counts against every allocation and before
+every download, and emits a phase label before launches and comparisons.
+It prints GPU-event timings for 8192-token K2560 pack, both full-width consumers
+and integer GEMMs; any mismatch exits 1. CPU layout/map tests:
+`cargo test --release -p hipfire-arch-qwen4 --lib npu_trunk::gpu::tests -j 12`.
+
+## Stored calibration and deterministic planning (0.4.2)
+
+`Calibration::{load,store,validate,key_matches}` uses schema version 1 JSON.
+All fields are required; missing inputs, unknown fields, invalid numeric costs,
+unknown versions and inconsistent epilogues are errors. `CalKey` consists of
+`device.{arch,pci_bdf,npu_fw_version}`, caller-supplied `build` (the measured
+daemon git SHA/binary identity, not the calibration CLI's identity),
+`kernel.{uname_release,perfopt_armed}`, `model_sha256` (64 hex digits), and
+`epilogue` (`bf16` or `i32`). A key mismatch returns the first mismatching
+field in that order. The load caller must log `npu-trunk: off (reason)` and
+leave the route off; loading never recalibrates or opens hardware.
+
+`plan(&Calibration, FamilyMask, rows) -> Plan` and
+`crossover(&Calibration, FamilyMask) -> Option<usize>` port the reference
+`npu-trunk/crossover_model.py`, SHA256
+`d50b20c66d1c62b243e88e1b23e956c3e072d31937b3352305b7ba126f4acc4a`.
+The planner uses an 8192-row chunk DP, GPU-only/pair choices, 64-aligned
+tail rebalance, even re-banking with boundary tax, and a taxed single-chunk
+split. `Step::Gpu { chunk }` and `Step::Pipe { a, b }` carry exact half-open
+prompt row ranges, including every pair of a re-banked plan. GPU wins ties;
+existing earlier pairing wins ties against rebalance/re-bank. `min_bank_rows`
+has the reference's placement (rebalance, single split, and re-bank eligibility).
+GPU costs distinguish 36 GDN and 12 QSA layers and prefix-dependent attention;
+NPU time rounds fused columns up to `panel_cols`. Contention is a burst term
+`(alpha_overlap - 1) * min(G_other, N_this)`, not whole-prefill slowdown.
+
+`margin` is a fraction in `[0,1)`. Every candidate must cost strictly less
+than `(1-margin)` times the GPU-only cost of the rows it replaces, including
+tax for splits/re-banking. At nonzero margin every re-bank pair must also pass
+its local margin test. Margin zero preserves the Python reference. The crossover
+is a **diagnostic**, not a hard-coded activation threshold: it scans
+1024..=49152 by 64 and finds the first point whose entire remaining scan
+suffix beats GPU-only. Route choice always comes from the prompt's plan.
+No live clock, throughput measurement, or previous request time is consulted.
+
+The measured families are grouped as `qkv`, `zab`, `q`, `kvidx`. Whole `zab`
+and `kvidx` groups map to the existing family mask; a partially selected group
+has no calibrated attribution and stays GPU-only. Calibration column counts
+are used verbatim (the legacy lab examples differ from current packing widths).
+Never apply a legacy example key to a production model.
+
+`load_log_line` takes a `LoadLogKey { current, mode, families }`, crossover,
+and plans at 16384/65536. It checks the key, hashes canonical serialized
+calibration JSON, and logs the INTERFACES.md §4 fields, with times as
+pipe/GPU milliseconds. `request_log_line(rows, &plan)` prints e.g.
+`npu-trunk: rows=16384 plan=[pipe 0..8192+8192..16384] predicted=-14.7%`.
+The key/hash plus stored calibration identify every deterministic model input.
+
+### Assembling measurements
+
+```sh
+hipfire calibrate-npu-trunk --from measurements.json --out cal.json
+```
+
+This command assembles and validates an already measured record; it does **not**
+perform measurements, probe hardware, fit contention, or silently fill defaults.
+The measurements schema is the same as the schema-version-1 output record:
+
+* `schema_version: 1`, `margin` and the complete current `key` described above.
+  The collector supplies device/firmware, PerfOpt, measured build, model digest,
+  and epilogue identity. The CLI additionally checks `uname -r` against the
+  collector's key and refuses a kernel mismatch. The eventual load caller must
+  compare **all** key fields to its actual runtime identity.
+* `gpu.trunk_in_ms_per_8192`: required `qkv`, `zab`, `q`, `kvidx` millisecond
+  totals across the respective 36/12 layers from kernel-trace attribution.
+  `gpu.uniform_per_layer_ms`, `gdn_core_per_layer_ms`, `qsa_per_layer_ms`,
+  `qsa_growth_per_layer_ms_per_8192_prefix`, `fixed_per_chunk_ms`,
+  `boundary_tax_ms`, and `min_bank_rows` are required.
+* `families`: those four names, each with `layer` (`gdn` for qkv/zab,
+  `qsa` for q/kvidx) and positive fused `cols`.
+* `glue.pack_ms_8192`, `fold_ms_per_col_8192`, `sync_ms`: measured
+  pack/consume/fold costs (fold is charged only for the I32 contract).
+* `npu.tops_corun`, `bytes_per_kop`, `epilogue`, `panel_cols`: measured
+  co-running rate, measured or declared traffic, chosen output contract, padding.
+* `contention.alpha_overlap` (>=1) and `model`: fitted/measured overlap
+  slowdown and the provenance/fit description. The planner consumes the alpha;
+  it does not reinterpret the descriptive model string.
+
+Collect once per exact device/build/kernel/PerfOpt/model/epilogue tuple.
+The lab procedure is in `/home/kaden/qcal/release-0.4.2/npu-trunk/`:
+`ptrace.sh` attributes GPU kernel costs by layer/family; `contend.sh` measures
+co-run throughput and the contention fit; `tax.sh` measures the extra boundary
+tax; `g80bf16.sh` measures the direct-BF16 NPU rate/traffic. Measure GPU glue
+separately and record costs on the same tuple. Preserve those source results
+alongside the record. Hardware measurement is a separately scheduled gate;
+the CLI performs only offline assembly and never claims to have measured.
+
+### Offline golden parity
+
+`tests/fixtures/npu_trunk` preserves all four original calibration JSONs plus
+`g80bf16-measured.json` unchanged. `golden.json` captures the actual Python CLI
+stdout and full-precision imported-model times/plans for both family sets,
+at 8192, 9319, 12288, 16384, 24576, 32768, 57544, 65536 and each crossover:
+90 exact-range vectors, 10 crossovers, relative time tolerance 1e-6.
+Tests adapt legacy fixture keys/version/margin and Python's absent-panel default
+(`panel_cols=1` for V8), not measured costs.
+Run offline:
+
+```sh
+ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
+CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
+nice -n 19 cargo test -p hipfire-arch-qwen4 --release npu_trunk -j 12 -- --nocapture
+```

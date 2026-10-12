@@ -51,6 +51,7 @@ use std::{
 mod bench_concurrency;
 mod bench_power;
 mod kernel_pack;
+mod npu_trunk;
 mod ple;
 mod serve;
 mod setup;
@@ -149,6 +150,8 @@ pub(crate) enum Commands {
     Restart(ServeArgs),
     /// Derive or split the Flash-Next PLE row sidecars (`<model>.ple-q4`, `<base>.ple-q8`).
     Ple(ple::PleArgs),
+    /// Write a keyed NPU trunk calibration from offline measurement inputs.
+    CalibrateNpuTrunk(npu_trunk::CalibrateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -885,6 +888,7 @@ fn run() -> Result<()> {
         Some(Commands::List(args)) => list_command(&paths, args),
         Some(Commands::Pull(args)) => pull_command(&paths, args),
         Some(Commands::Ple(args)) => ple::ple_command(&paths, args),
+        Some(Commands::CalibrateNpuTrunk(args)) => npu_trunk::calibrate_command(args),
         Some(Commands::Rm(args)) => rm_command(&paths, args),
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
