@@ -33,6 +33,10 @@ use hipfire_runtime::spec_sampling::{
 };
 use rdna_compute::profile::{unix_micros, Span, SpanProfiler};
 use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::spec_sampling_cpu_ar::{
+    spec_cpu_ar_alloc_f32, spec_cpu_ar_alloc_u32, SpecCpuArPolicy, SpecDistRows, SPEC_CPU_AR_CAP,
+    SPEC_CPU_AR_EOS_NONE,
+};
 use std::time::Instant;
 
 /// `HIPFIRE_MTP_PHASE_TIMING=1`: per-window phase lines on stderr.
@@ -1165,6 +1169,19 @@ struct SampledVerify {
     /// Point-mass `q`s of drafts that were not drawn from a distribution
     /// (`accept_leviathan` with `point_mass`), reused across windows.
     points: Vec<SparseDist>,
+    /// Resident Leviathan acceptance (`HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT`):
+    /// target rows built on the device from the verify's resident logits and
+    /// ordered acceptance there. `None` until `Qwen4MtpDrafter::ensure_resources`
+    /// provisions it for an eligible request; moved to the drafter's spares
+    /// by `configure_request` (it has no `Gpu`) and freed only by `mtp_free`.
+    device: Option<DeviceAccept>,
+    /// The request passes the device-accept predicate that needs no `Gpu`
+    /// ([`device_accept_eligible`] and the env switch); the architecture and
+    /// pool-capacity checks happen when `device` is provisioned.
+    device_eligible: bool,
+    /// The current window took a device row build or device accept; read by
+    /// the `accept_route` trace field. Reset by [`Self::begin_window`].
+    route_device: bool,
 }
 
 impl SampledVerify {
@@ -1177,8 +1194,18 @@ impl SampledVerify {
             hipfire_runtime::llama::reset_cpu_sampler_rng(cfg.rng_seed as u32);
         }
         let policy = naive_target_sampler(&cfg);
+        let spec = SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p);
+        let gpu_rows = PenaltyTable::flags_for(&policy) != 0 && penalty_prepass_enabled();
+        let device_eligible = mtp_device_accept_enabled()
+            && device_accept_eligible(
+                naive,
+                cfg.penalty_window(),
+                gpu_rows,
+                policy.blocked_tokens.is_empty(),
+                &spec,
+            );
         Self {
-            spec: SampleSpec::cpu_ar(cfg.temp, cfg.top_p, cfg.top_k, cfg.min_p),
+            spec,
             rng: SpecRng::new(cfg.rng_seed),
             drafts: if naive {
                 Vec::new()
@@ -1187,7 +1214,7 @@ impl SampledVerify {
             },
             points: Vec::new(),
             naive,
-            gpu_rows: PenaltyTable::flags_for(&policy) != 0 && penalty_prepass_enabled(),
+            gpu_rows,
             row_policy: policy.without_penalties(),
             policy,
             table: PenaltyTable::default(),
@@ -1196,6 +1223,9 @@ impl SampledVerify {
             host: Vec::new(),
             scratch: Vec::with_capacity(SampleSpec::MAX_POOL),
             target: SparseDist::default(),
+            device: None,
+            device_eligible,
+            route_device: false,
         }
     }
 
@@ -1207,6 +1237,7 @@ impl SampledVerify {
     /// Start a window: rebuild the penalty history from the emitted tokens
     /// (the pending seed included); returns the history length before drafts.
     fn begin_window(&mut self, emitted: &[u32]) -> usize {
+        self.route_device = false;
         self.history.begin_window(emitted)
     }
 
@@ -1348,6 +1379,9 @@ impl SampledVerify {
         if self.gpu_rows {
             self.penalize_rows(gpu, bundle, 0, 0..drafts.len() + 1)?;
         }
+        if self.device_ready(drafts.len()) {
+            return self.accept_leviathan_device(gpu, bundle, drafts, point_mass, eos);
+        }
         let SampledVerify {
             spec,
             rng,
@@ -1362,19 +1396,7 @@ impl SampledVerify {
             points,
             ..
         } = self;
-        let qs: &[SparseDist] = if point_mass {
-            if points.len() < drafts.len() {
-                points.resize_with(drafts.len(), SparseDist::default);
-            }
-            for (point, &draft) in points.iter_mut().zip(drafts) {
-                point.set_point_mass(draft);
-            }
-            &points[..drafts.len()]
-        } else {
-            draft_dists
-                .get(..drafts.len())
-                .ok_or_else(|| "Qwen4 sampled MTP: more drafts than K".to_string())?
-        };
+        let qs = leviathan_qs(&mut *points, &*draft_dists, drafts, point_mass)?;
         let history = &*history;
         let spec = *spec;
         let gpu_rows = *gpu_rows;
@@ -1414,6 +1436,661 @@ impl SampledVerify {
             picks[row] = draw;
             Ok(draw)
         })
+    }
+}
+
+/// `HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT`: sampled Leviathan windows build their
+/// target rows on the device from the verify's resident logits and run the
+/// ordered acceptance there (default on; `0` keeps the host rows and host
+/// accept). Read once per request by [`SampledVerify::new`].
+pub(crate) fn mtp_device_accept_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT").as_deref() != Ok("0")
+}
+
+/// Exact supported architecture with the resident device sampler available.
+fn mtp_device_sampler_supported(gpu: &Gpu) -> bool {
+    (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
+        && gpu.spec_cpu_ar_device_supported()
+}
+
+/// Device-accept eligibility that needs no `Gpu`: Leviathan (not naive), no
+/// penalty history window, no GPU penalty prepass, no blocked tokens, a
+/// positive finite temperature and a pool/cap the 64-entry device rows hold.
+fn device_accept_eligible(
+    naive: bool,
+    history_window: usize,
+    gpu_rows: bool,
+    no_blocked_tokens: bool,
+    spec: &SampleSpec,
+) -> bool {
+    !naive
+        && history_window == 0
+        && !gpu_rows
+        && no_blocked_tokens
+        && spec.temperature > 0.0
+        && spec.temperature.is_finite()
+        && (1..=SPEC_CPU_AR_CAP).contains(&spec.pool)
+        && (1..=spec.pool).contains(&spec.cap)
+}
+
+/// The window's draft distributions: the point mass of every draft, or the
+/// distributions the drafts were drawn from.
+fn leviathan_qs<'a>(
+    points: &'a mut Vec<SparseDist>,
+    draft_dists: &'a [SparseDist],
+    drafts: &[u32],
+    point_mass: bool,
+) -> Result<&'a [SparseDist], String> {
+    if point_mass {
+        if points.len() < drafts.len() {
+            points.resize_with(drafts.len(), SparseDist::default);
+        }
+        for (point, &draft) in points.iter_mut().zip(drafts) {
+            point.set_point_mass(draft);
+        }
+        Ok(&points[..drafts.len()])
+    } else {
+        draft_dists
+            .get(..drafts.len())
+            .ok_or_else(|| "Qwen4 sampled MTP: more drafts than K".to_string())
+    }
+}
+
+/// Advance `rng` by `draws` uniforms (the authoritative stream moves only by
+/// the draws a device acceptance consumed).
+fn advance_rng(rng: &mut SpecRng, draws: usize) {
+    for _ in 0..draws {
+        rng.next_u64();
+    }
+}
+
+/// The next `tape.len()` uniforms of `rng` in order, without advancing it:
+/// a clone draws them, so verdict `j` reads `tape[j]`, its residual
+/// `tape[j + 1]` and the bonus `tape[k]`, exactly the draws the host accept
+/// takes from the authoritative stream.
+fn fill_uniform_tape(rng: &SpecRng, tape: &mut [f32]) {
+    let mut clone = *rng;
+    for slot in tape.iter_mut() {
+        *slot = clone.next_f32();
+    }
+}
+
+/// What the two result words of an ordered device accept mean for a window
+/// of `k` proposals, with the real request EOS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceVerdict {
+    /// Proposals accepted, `0..=k`.
+    accepted: usize,
+    /// The residual replacement (rejection) or bonus (all accepted); `None`
+    /// when the kernel stopped on an accepted proposal equal to ITS `eos`
+    /// argument (no terminal draw).
+    terminal: Option<u32>,
+    /// Uniforms of the host stream the window consumed: `accepted` after a
+    /// stopping accept, `accepted + 2` after a rejection, `k + 1` when every
+    /// proposal was accepted. Independent of the real EOS.
+    consumed: usize,
+    /// The window hit the REQUEST's EOS: the last accepted proposal (stopping
+    /// accept) or the terminal token equals `eos`. A stop the kernel took for
+    /// a proposal that is not the request EOS (the incremental one-row
+    /// verdict passes `eos = proposal`) is not an EOS hit.
+    hit_eos: bool,
+}
+
+/// Decode the kernel's `[accepted, terminal]` words for `drafts` against the
+/// request's `eos`. `terminal == u32::MAX` is the stopping accept.
+fn decode_device_verdict(
+    drafts: &[u32],
+    words: [u32; 2],
+    eos: u32,
+) -> Result<DeviceVerdict, String> {
+    let k = drafts.len();
+    let accepted = words[0] as usize;
+    if accepted > k {
+        return Err(format!(
+            "Qwen4 sampled MTP device accept reported {accepted} accepted of {k} proposals"
+        ));
+    }
+    if words[1] == SPEC_CPU_AR_EOS_NONE {
+        if accepted == 0 {
+            return Err(
+                "Qwen4 sampled MTP device accept stopped with no accepted proposal".to_string(),
+            );
+        }
+        return Ok(DeviceVerdict {
+            accepted,
+            terminal: None,
+            consumed: accepted,
+            hit_eos: drafts[accepted - 1] == eos,
+        });
+    }
+    Ok(DeviceVerdict {
+        accepted,
+        terminal: Some(words[1]),
+        consumed: if accepted < k { accepted + 2 } else { k + 1 },
+        hit_eos: words[1] == eos,
+    })
+}
+
+/// The committed tokens of a decoded window: `drafts[..accepted]` then the
+/// terminal token, when there is one.
+fn device_accept_result(drafts: &[u32], verdict: &DeviceVerdict) -> GreedyAccept {
+    let mut committed = Vec::with_capacity(drafts.len() + 1);
+    committed.extend_from_slice(&drafts[..verdict.accepted]);
+    committed.extend(verdict.terminal);
+    GreedyAccept {
+        committed,
+        accepted: verdict.accepted,
+        hit_eos: verdict.hit_eos,
+    }
+}
+
+/// `accept_route` field of the window traces: `device_parallel` when the
+/// window built target rows or accepted on the device, else `host` (greedy,
+/// naive, ineligible, unsupported and `HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT=0`).
+fn accept_route_label(sampled: Option<&SampledVerify>) -> &'static str {
+    if sampled.is_some_and(|s| s.route_device) {
+        "device_parallel"
+    } else {
+        "host"
+    }
+}
+
+fn u32_bytes(words: &[u32]) -> &[u8] {
+    // SAFETY: any `u32` slice is valid as `len * 4` initialized bytes.
+    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
+}
+
+fn f32_bytes(words: &[f32]) -> &[u8] {
+    // SAFETY: any `f32` slice is valid as `len * 4` initialized bytes.
+    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
+}
+
+/// Whether queued device work may still read or write the host staging bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageState {
+    Idle,
+    /// Copies or kernels were queued and no fence covers them yet.
+    Enqueued,
+    /// The fence event was recorded behind every queued copy, kernel and
+    /// result readback.
+    Fenced,
+}
+
+/// Host staging of one device accept's uploads and result readback, reused
+/// by every window (allocated once with the buffers). Dropped while queued
+/// work may still touch it, its memory is leaked instead of freed.
+struct DeviceStaging {
+    counts: Vec<u32>,
+    ids: Vec<u32>,
+    probabilities: Vec<f32>,
+    proposals: Vec<u32>,
+    tape: Vec<f32>,
+    /// The 8 result bytes: the stable destination of the asynchronous
+    /// readback on an active stream.
+    result: Vec<u8>,
+    state: StageState,
+}
+
+impl Drop for DeviceStaging {
+    fn drop(&mut self) {
+        if self.state != StageState::Idle {
+            std::mem::forget(std::mem::take(&mut self.counts));
+            std::mem::forget(std::mem::take(&mut self.ids));
+            std::mem::forget(std::mem::take(&mut self.probabilities));
+            std::mem::forget(std::mem::take(&mut self.proposals));
+            std::mem::forget(std::mem::take(&mut self.tape));
+            std::mem::forget(std::mem::take(&mut self.result));
+        }
+    }
+}
+
+/// Device buffers and host staging of the resident Leviathan acceptance,
+/// sized once for `capacity` proposals (`capacity + 1` target rows) and
+/// reused by every window and every later request of the drafter. Allocated
+/// by `ensure_resources` outside the timed window and any graph capture.
+struct DeviceAccept {
+    /// Target rows `0..=capacity`.
+    target: SpecDistRows,
+    /// Draft rows `0..capacity`.
+    draft: SpecDistRows,
+    /// `u32[capacity]`.
+    proposals: GpuTensor,
+    /// `f32[capacity + 1]`.
+    uniforms: GpuTensor,
+    /// `u32[2]`: accepted count, terminal token.
+    result: GpuTensor,
+    capacity: usize,
+    staging: DeviceStaging,
+    /// Recorded behind the window's queued copies, accept kernel and (on an
+    /// active stream) result readback; waited on only to retire an
+    /// interrupted window.
+    fence: Option<hip_bridge::Event>,
+}
+
+impl DeviceAccept {
+    fn new(gpu: &mut Gpu, capacity: usize) -> Result<Self, String> {
+        let capacity = capacity.max(1);
+        let fail = |what: &str, error: &dyn std::fmt::Display| {
+            format!("Qwen4 sampled MTP device accept {what}: {error}")
+        };
+        gpu.spec_cpu_ar_precompile()
+            .map_err(|error| fail("precompile", &error))?;
+        gpu.spec_cpu_ar_rows_parallel_precompile()
+            .map_err(|error| fail("rows precompile", &error))?;
+        let target_rows = capacity + 1;
+        let cap = SPEC_CPU_AR_CAP;
+        // `u32`/`f32` words per buffer, in the order consumed below; the
+        // crate has no integer dtype, so every buffer is an F32-typed tensor.
+        let words = [
+            target_rows,
+            target_rows * cap,
+            target_rows * cap,
+            capacity,
+            capacity * cap,
+            capacity * cap,
+            capacity,
+            capacity + 1,
+            2,
+        ];
+        let mut tensors: Vec<GpuTensor> = Vec::with_capacity(words.len());
+        for (index, &n) in words.iter().enumerate() {
+            let tensor = if matches!(index, 2 | 5 | 7) {
+                spec_cpu_ar_alloc_f32(gpu, n)
+            } else {
+                spec_cpu_ar_alloc_u32(gpu, n)
+            };
+            match tensor {
+                Ok(tensor) => tensors.push(tensor),
+                Err(error) => {
+                    for tensor in tensors {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(fail("allocation", &error));
+                }
+            }
+        }
+        let fence = match gpu
+            .hip
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+        {
+            Ok(fence) => fence,
+            Err(error) => {
+                for tensor in tensors {
+                    let _ = gpu.free_tensor(tensor);
+                }
+                return Err(fail("fence", &error));
+            }
+        };
+        let mut it = tensors.into_iter();
+        let mut next = || it.next().expect("nine device accept buffers allocated above");
+        let target = SpecDistRows {
+            counts: next(),
+            ids: next(),
+            probabilities: next(),
+            capacity_rows: target_rows,
+        };
+        let draft = SpecDistRows {
+            counts: next(),
+            ids: next(),
+            probabilities: next(),
+            capacity_rows: capacity,
+        };
+        let proposals = next();
+        let uniforms = next();
+        let result = next();
+        Ok(Self {
+            target,
+            draft,
+            proposals,
+            uniforms,
+            result,
+            capacity,
+            staging: DeviceStaging {
+                counts: vec![0; capacity],
+                ids: vec![0; capacity * cap],
+                probabilities: vec![0.0; capacity * cap],
+                proposals: vec![0; capacity],
+                tape: vec![0.0; capacity + 1],
+                result: vec![0; 8],
+                state: StageState::Idle,
+            },
+            fence: Some(fence),
+        })
+    }
+
+    /// Wait until no queued work touches the staging bytes. On failure the
+    /// state is unchanged, so the bytes stay unwritable and the next call
+    /// retries. Idle after every successful accept (its result wait already
+    /// ordered everything), so the normal flow waits on nothing here.
+    fn drain(&mut self, gpu: &Gpu) -> Result<(), String> {
+        let wait = match (self.staging.state, self.fence.as_ref()) {
+            (StageState::Idle, _) => Ok(()),
+            (StageState::Fenced, Some(fence)) => gpu.hip.event_synchronize(fence),
+            // An unfenced enqueue (the fence record failed) or a lost fence:
+            // drain the whole device rather than trust the stream order.
+            _ => gpu.hip.device_synchronize(),
+        };
+        wait.map_err(|error| format!("Qwen4 sampled MTP device accept staging drain: {error}"))?;
+        self.staging.state = StageState::Idle;
+        Ok(())
+    }
+
+    /// Release the device buffers after retiring any pending copy. A drain
+    /// that fails leaks everything (nothing proves the device stopped reading).
+    fn free(mut self, gpu: &mut Gpu) {
+        if self.drain(gpu).is_err() {
+            std::mem::forget(self);
+            return;
+        }
+        let Self {
+            target,
+            draft,
+            proposals,
+            uniforms,
+            result,
+            fence,
+            ..
+        } = self;
+        let _ = target.free(gpu);
+        let _ = draft.free(gpu);
+        let _ = gpu.free_tensor(proposals);
+        let _ = gpu.free_tensor(uniforms);
+        let _ = gpu.free_tensor(result);
+        if let Some(fence) = fence {
+            let _ = gpu.hip.event_destroy(fence);
+        }
+    }
+
+    /// Enqueue the parallel target-row builder over `rows` resident logit
+    /// rows into target rows `0..rows`. Stream-ordered; no readback.
+    fn build_rows(
+        &self,
+        gpu: &mut Gpu,
+        logits: &GpuTensor,
+        vocab: usize,
+        rows: usize,
+        policy: SpecCpuArPolicy,
+    ) -> Result<(), String> {
+        if rows > self.target.capacity_rows {
+            return Err(format!(
+                "Qwen4 sampled MTP device accept needs {rows} target rows (capacity {})",
+                self.target.capacity_rows
+            ));
+        }
+        gpu.spec_cpu_ar_rows_parallel_enqueue(logits, &self.target, vocab, rows, policy)
+            .map_err(|error| format!("Qwen4 sampled MTP device target rows: {error}"))
+    }
+
+    /// One ordered accept over the resident target rows `0..=k`: uploads the
+    /// draft rows `qs`, the `proposals` and the next `k + 1` uniforms of `rng`
+    /// (the stream itself is not advanced) with stream-ordered asynchronous
+    /// copies, enqueues the accept kernel, records the fence behind it (and
+    /// behind the queued readback on an active stream) and reads the two
+    /// result words back: one blocking `memcpy_dtoh_auto` on the default
+    /// stream, or `memcpy_dtoh_async` plus one `stream_synchronize` on an
+    /// active stream. That readback is the window's only host wait.
+    /// `k == 0` is the bonus draw from target row 0. `eos` is the kernel's
+    /// stop token (`SPEC_CPU_AR_EOS_NONE` stops at none).
+    fn accept(
+        &mut self,
+        gpu: &mut Gpu,
+        qs: &[SparseDist],
+        proposals: &[u32],
+        rng: &SpecRng,
+        eos: u32,
+    ) -> Result<[u32; 2], String> {
+        let k = proposals.len();
+        if qs.len() != k || k > self.capacity {
+            return Err(format!(
+                "Qwen4 sampled MTP device accept got {} draft rows for {k} proposals (capacity {})",
+                qs.len(),
+                self.capacity
+            ));
+        }
+        self.drain(gpu)?;
+        let cap = SPEC_CPU_AR_CAP;
+        let staging = &mut self.staging;
+        for (row, q) in qs.iter().enumerate() {
+            let entries = q.entries();
+            if entries.len() > cap {
+                return Err(format!(
+                    "Qwen4 sampled MTP draft row {row} has {} entries (device rows hold {cap})",
+                    entries.len()
+                ));
+            }
+            let base = row * cap;
+            staging.counts[row] = entries.len() as u32;
+            for (slot, &(token, probability)) in entries.iter().enumerate() {
+                staging.ids[base + slot] = token;
+                staging.probabilities[base + slot] = probability;
+            }
+            staging.ids[base + entries.len()..base + cap].fill(0);
+            staging.probabilities[base + entries.len()..base + cap].fill(0.0);
+        }
+        staging.proposals[..k].copy_from_slice(proposals);
+        fill_uniform_tape(rng, &mut staging.tape[..k + 1]);
+        gpu.bind_thread()
+            .map_err(|error| format!("Qwen4 sampled MTP device accept bind: {error}"))?;
+        // Pending from before the first queued copy until the fence is
+        // recorded behind every queued operation.
+        staging.state = StageState::Enqueued;
+        let upload = |gpu: &Gpu, dst: &GpuTensor, src: &[u8]| -> Result<(), String> {
+            match gpu.active_stream.as_ref() {
+                Some(stream) => gpu.hip.memcpy_htod_async(&dst.buf, src, stream),
+                None => gpu.hip.memcpy_htod_async_default(&dst.buf, src),
+            }
+            .map_err(|error| format!("Qwen4 sampled MTP device accept upload: {error}"))
+        };
+        if k > 0 {
+            upload(gpu, &self.draft.counts, u32_bytes(&staging.counts[..k]))?;
+            upload(gpu, &self.draft.ids, u32_bytes(&staging.ids[..k * cap]))?;
+            upload(
+                gpu,
+                &self.draft.probabilities,
+                f32_bytes(&staging.probabilities[..k * cap]),
+            )?;
+            upload(gpu, &self.proposals, u32_bytes(&staging.proposals[..k]))?;
+        }
+        upload(gpu, &self.uniforms, f32_bytes(&staging.tape[..k + 1]))?;
+        gpu.spec_accept_ordered_enqueue(
+            &self.target,
+            &self.draft,
+            &self.proposals,
+            &self.uniforms,
+            &self.result,
+            k,
+            eos,
+        )
+        .map_err(|error| format!("Qwen4 sampled MTP device accept: {error}"))?;
+        let fence = self
+            .fence
+            .as_ref()
+            .ok_or_else(|| "Qwen4 sampled MTP device accept fence is missing".to_string())?;
+        match gpu.active_stream.as_ref() {
+            Some(stream) => {
+                gpu.hip
+                    .memcpy_dtoh_async(&mut staging.result, &self.result.buf, stream)
+                    .map_err(|error| {
+                        format!("Qwen4 sampled MTP device accept result queue: {error}")
+                    })?;
+                gpu.hip.event_record(fence, Some(stream)).map_err(|error| {
+                    format!("Qwen4 sampled MTP device accept fence record: {error}")
+                })?;
+                staging.state = StageState::Fenced;
+                gpu.hip.stream_synchronize(stream).map_err(|error| {
+                    format!("Qwen4 sampled MTP device accept result wait: {error}")
+                })?;
+            }
+            None => {
+                gpu.hip.event_record(fence, None).map_err(|error| {
+                    format!("Qwen4 sampled MTP device accept fence record: {error}")
+                })?;
+                staging.state = StageState::Fenced;
+                gpu.memcpy_dtoh_auto(&mut staging.result, &self.result.buf)
+                    .map_err(|error| {
+                        format!("Qwen4 sampled MTP device accept result: {error}")
+                    })?;
+            }
+        }
+        // The result wait ordered every queued copy, the kernel and the
+        // readback itself: nothing is left to drain.
+        staging.state = StageState::Idle;
+        let bytes = &staging.result;
+        Ok([
+            u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        ])
+    }
+}
+
+impl SampledVerify {
+    /// This window of `k` proposals runs on the device route: a Leviathan
+    /// request that passed [`device_accept_eligible`], has its resident
+    /// buffers provisioned (exact supported architecture) and `1 <= k <=` the
+    /// buffers' capacity. `k == 0` windows (the target-only draw) stay host.
+    /// The private verify/enqueue paths select on this: the resident logits
+    /// are consumed by `device_load_target` / `accept_leviathan`.
+    fn device_ready(&self, k: usize) -> bool {
+        k >= 1
+            && self.draws_drafts()
+            && self.device_eligible
+            && self.device.as_ref().is_some_and(|device| k <= device.capacity)
+    }
+
+    fn device_policy(&self) -> SpecCpuArPolicy {
+        SpecCpuArPolicy::new(
+            self.spec.temperature,
+            self.spec.top_p,
+            self.spec.pool as u32,
+            self.spec.cap as u32,
+            self.spec.min_p,
+        )
+    }
+
+    /// Device twin of [`Self::load_target`] for the one-row interleaved
+    /// windows: build physical verify row `row`'s `p` into device target row
+    /// 0, stream-ordered after the forward that wrote it. No readback.
+    fn device_load_target(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        row: usize,
+    ) -> Result<(), String> {
+        let policy = self.device_policy();
+        let logits = bundle
+            .spec_logits_rows(row, 1)
+            .map_err(|error| error.to_string())?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| "Qwen4 sampled MTP device accept is not provisioned".to_string())?;
+        device.build_rows(gpu, &logits, bundle.config.vocab_size, 1, policy)?;
+        self.route_device = true;
+        Ok(())
+    }
+
+    /// The one-row verdict of an interleaved window over the device target
+    /// row 0 ([`Self::device_load_target`]): `draft` against its `q` (the
+    /// window's draft distribution 0, or with `point_mass` the point mass on
+    /// `draft`). The kernel's stop token is the proposal itself, so an
+    /// accepted proposal never reads a bonus row; the caller applies the real
+    /// EOS rule. Consumes one uniform on accept, two on reject.
+    fn device_step_verdict(
+        &mut self,
+        gpu: &mut Gpu,
+        draft: u32,
+        point_mass: bool,
+    ) -> Result<DraftVerdict, String> {
+        let SampledVerify {
+            device,
+            rng,
+            drafts,
+            points,
+            route_device,
+            ..
+        } = self;
+        let q = if point_mass {
+            if points.is_empty() {
+                points.push(SparseDist::default());
+            }
+            points[0].set_point_mass(draft);
+            &points[0]
+        } else {
+            drafts
+                .first()
+                .ok_or_else(|| "Qwen4 sampled MTP has no draft distribution".to_string())?
+        };
+        let device = device
+            .as_mut()
+            .ok_or_else(|| "Qwen4 sampled MTP device accept is not provisioned".to_string())?;
+        let words = device.accept(gpu, std::slice::from_ref(q), &[draft], rng, draft)?;
+        let verdict = decode_device_verdict(&[draft], words, SPEC_CPU_AR_EOS_NONE)?;
+        advance_rng(rng, verdict.consumed);
+        *route_device = true;
+        Ok(match verdict.terminal {
+            None => DraftVerdict::Accept,
+            Some(token) => DraftVerdict::Reject(token),
+        })
+    }
+
+    /// The bonus draw of an interleaved window from device target row 0
+    /// ([`Self::device_load_target`]): one uniform.
+    fn device_bonus(&mut self, gpu: &mut Gpu) -> Result<u32, String> {
+        let SampledVerify {
+            device,
+            rng,
+            route_device,
+            ..
+        } = self;
+        let device = device
+            .as_mut()
+            .ok_or_else(|| "Qwen4 sampled MTP device accept is not provisioned".to_string())?;
+        let words = device.accept(gpu, &[], &[], rng, SPEC_CPU_AR_EOS_NONE)?;
+        let verdict = decode_device_verdict(&[], words, SPEC_CPU_AR_EOS_NONE)?;
+        advance_rng(rng, verdict.consumed);
+        *route_device = true;
+        verdict
+            .terminal
+            .ok_or_else(|| "Qwen4 sampled MTP device bonus returned no token".to_string())
+    }
+
+    /// Device twin of the host branch of [`Self::accept_leviathan`]: every
+    /// target row `0..=k` is built from the resident verify logits in one
+    /// launch, the draft rows, proposals and uniform tape are uploaded
+    /// stream-ordered, and one 8-byte result is read back. The authoritative
+    /// stream advances only by the consumed draws.
+    fn accept_leviathan_device(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
+        drafts: &[u32],
+        point_mass: bool,
+        eos: u32,
+    ) -> Result<GreedyAccept, String> {
+        let k = drafts.len();
+        let policy = self.device_policy();
+        let logits = bundle
+            .spec_logits_rows(0, k + 1)
+            .map_err(|error| error.to_string())?;
+        let vocab = bundle.config.vocab_size;
+        let SampledVerify {
+            device,
+            rng,
+            drafts: draft_dists,
+            points,
+            route_device,
+            ..
+        } = self;
+        let qs = leviathan_qs(&mut *points, &*draft_dists, drafts, point_mass)?;
+        let device = device
+            .as_mut()
+            .ok_or_else(|| "Qwen4 sampled MTP device accept is not provisioned".to_string())?;
+        device.build_rows(gpu, &logits, vocab, k + 1, policy)?;
+        let words = device.accept(gpu, qs, drafts, rng, eos)?;
+        let verdict = decode_device_verdict(drafts, words, eos)?;
+        advance_rng(rng, verdict.consumed);
+        *route_device = true;
+        Ok(device_accept_result(drafts, &verdict))
     }
 }
 
@@ -1496,6 +2173,10 @@ pub struct Qwen4MtpDrafter {
     /// Request-local wire counters surfaced by `request_stats`; reset only
     /// by `configure_request`.
     stats: MtpRequestStats,
+    /// Resident-accept buffers of earlier requests, kept for reuse because
+    /// `configure_request` has no `Gpu` to free them; adopted by the next
+    /// eligible sampled request and freed only by `mtp_free`.
+    device_spare: Vec<DeviceAccept>,
 }
 
 impl Qwen4MtpDrafter {
@@ -1524,6 +2205,7 @@ impl Qwen4MtpDrafter {
             floor: MtpFloor::new(),
             floor_enabled: true,
             stats: MtpRequestStats::default(),
+            device_spare: Vec::new(),
         }
     }
 
@@ -1611,6 +2293,60 @@ impl Qwen4MtpDrafter {
                 self.append_scratch = Some(scratch);
             }
         }
+        self.ensure_device_accept(gpu)?;
+        Ok(())
+    }
+
+    /// Provision the current sampled request's resident acceptance buffers
+    /// (and compile their kernels) before any timed window: a no-op unless
+    /// the request is device-eligible on an exact supported architecture.
+    /// Reuses the request's own buffers, then a spare of an earlier request;
+    /// grows (free, reallocate) only when the capacity is too small. Buffers
+    /// the current request cannot use stay in the spares (never dropped).
+    fn ensure_device_accept(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        let capacity = self.proposal_capacity();
+        let Some(sampled) = self.sampled.as_mut() else {
+            return Ok(());
+        };
+        if !sampled.device_eligible || !sampled.draws_drafts() {
+            return Ok(());
+        }
+        if sampled
+            .device
+            .as_ref()
+            .is_some_and(|device| device.capacity >= capacity)
+        {
+            return Ok(());
+        }
+        if !mtp_device_sampler_supported(gpu) {
+            return Ok(());
+        }
+        // Provision point-mass q storage before the first takeover window.
+        sampled.points.resize_with(capacity, || {
+            let mut point = SparseDist::default();
+            point.set_point_mass(0);
+            point
+        });
+        if let Some(small) = sampled.device.take() {
+            self.device_spare.push(small);
+        }
+        let found = self
+            .device_spare
+            .iter()
+            .position(|device| device.capacity >= capacity);
+        let device = match found {
+            Some(index) => self.device_spare.swap_remove(index),
+            None => {
+                // This request outgrows every spare: retire them first.
+                for small in std::mem::take(&mut self.device_spare) {
+                    small.free(gpu);
+                }
+                DeviceAccept::new(gpu, capacity)?
+            }
+        };
+        if let Some(sampled) = self.sampled.as_mut() {
+            sampled.device = Some(device);
+        }
         Ok(())
     }
 
@@ -1660,6 +2396,7 @@ impl Qwen4MtpDrafter {
         let mut token = seed;
         let mut accepted = 0usize;
         let mut row = 0usize;
+        let device_rows = sampled.as_deref().is_some_and(|s| s.device_ready(k));
         loop {
             let token_position = position
                 .checked_add(row)
@@ -1676,6 +2413,7 @@ impl Qwen4MtpDrafter {
                 Some(s) if !s.draws_drafts() => {
                     pick = s.naive_draw(gpu, Self::bundle(target)?, 0, row)?
                 }
+                Some(s) if device_rows => s.device_load_target(gpu, Self::bundle(target)?, 0)?,
                 Some(s) => s.load_target(gpu, Self::bundle(target)?, 0, row)?,
                 None => {}
             }
@@ -1704,6 +2442,7 @@ impl Qwen4MtpDrafter {
                         .map_err(|error| error.to_string())?;
                 }
                 committed.push(match sampled.as_deref_mut() {
+                    Some(s) if device_rows => s.device_bonus(gpu)?,
                     Some(s) if s.draws_drafts() => s.target.sample(s.rng.next_f32()),
                     _ => pick,
                 });
@@ -1725,7 +2464,11 @@ impl Qwen4MtpDrafter {
             let verdict = match sampled.as_deref_mut() {
                 Some(s) if s.draws_drafts() => {
                     draft = s.sample_draft(gpu, Self::bundle(target)?, 0, row)?;
-                    verify_sampled_draft(&s.target, &s.drafts[0], draft, &mut s.rng)
+                    if device_rows {
+                        s.device_step_verdict(gpu, draft, false)?
+                    } else {
+                        verify_sampled_draft(&s.target, &s.drafts[0], draft, &mut s.rng)
+                    }
                 }
                 _ if draft == pick => DraftVerdict::Accept,
                 _ => DraftVerdict::Reject(pick),
@@ -1789,13 +2532,15 @@ impl Qwen4MtpDrafter {
                 .collect::<Vec<_>>()
                 .join(",");
             eprintln!(
-                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}}}"
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}}}",
+                accept_route_label(sampled.as_deref())
             );
         }
         if timers.enabled() {
             let window_us = synced_wall_us(gpu, window_start);
             let fields = format!(
-                "\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"position\":{position},\"k\":{},\"accepted\":{accepted},\"emitted\":{},\"window_us\":{window_us:.1},\"pairing\":\"{}\",\"t_end\":{}",
+                "\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{},\"accepted\":{accepted},\"emitted\":{},\"window_us\":{window_us:.1},\"pairing\":\"{}\",\"t_end\":{}",
+                accept_route_label(sampled.as_deref()),
                 drafts.len(),
                 committed.len(),
                 match pairing {
@@ -2499,7 +3244,8 @@ impl Qwen4MtpDrafter {
                 .map_err(|error| error.to_string())?;
             if trace {
                 eprintln!(
-                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"batched\",\"position\":{position},\"k\":{n},\"accepted\":{},\"rows\":[{}],\"committed\":{:?},\"baseline\":true}}",
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{},\"rows\":[{}],\"committed\":{:?},\"baseline\":true}}",
+                    accept_route_label(sampled.as_deref()),
                     acceptance.accepted,
                     trace_rows(candidates, &target_picks),
                     acceptance.committed
@@ -2532,8 +3278,9 @@ impl Qwen4MtpDrafter {
             let probe_field = probe.map_or_else(String::new, |probe| {
                 format!("\"probe_us\":{:.1},", probe.probe_us)
             });
+            let accept_route = accept_route_label(sampled.as_deref());
             let fields = format!(
-                "\"source\":\"ngram\",\"verify_route\":\"batched\",{probe_field}\"position\":{position},\"k\":{n},\"accepted\":{accepted_drafts},\"emitted\":{emitted_len},\"window_us\":{window_us:.1},\"t_end\":{}",
+                "\"source\":\"ngram\",\"verify_route\":\"batched\",\"accept_route\":\"{accept_route}\",{probe_field}\"position\":{position},\"k\":{n},\"accepted\":{accepted_drafts},\"emitted\":{emitted_len},\"window_us\":{window_us:.1},\"t_end\":{}",
                 unix_micros()
             );
             timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
@@ -2621,6 +3368,7 @@ impl Qwen4MtpDrafter {
         let mut token = seed;
         let mut accepted = 0usize;
         let mut row = 0usize;
+        let device_rows = sampled.as_deref().is_some_and(|s| s.device_ready(n));
         loop {
             let token_position = position + row;
             timers.mark(gpu, "target_row");
@@ -2631,6 +3379,7 @@ impl Qwen4MtpDrafter {
                 Some(s) if !s.draws_drafts() => {
                     pick = s.naive_draw(gpu, Self::bundle(target)?, 0, row)?
                 }
+                Some(s) if device_rows => s.device_load_target(gpu, Self::bundle(target)?, 0)?,
                 Some(s) => s.load_target(gpu, Self::bundle(target)?, 0, row)?,
                 None => {}
             }
@@ -2651,6 +3400,7 @@ impl Qwen4MtpDrafter {
             }
             if row == n {
                 committed.push(match sampled.as_deref_mut() {
+                    Some(s) if device_rows => s.device_bonus(gpu)?,
                     Some(s) if s.draws_drafts() => s.target.sample(s.rng.next_f32()),
                     _ => pick,
                 });
@@ -2663,7 +3413,11 @@ impl Qwen4MtpDrafter {
                         s.points.push(SparseDist::default());
                     }
                     s.points[0].set_point_mass(candidate);
-                    verify_sampled_draft(&s.target, &s.points[0], candidate, &mut s.rng)
+                    if device_rows {
+                        s.device_step_verdict(gpu, candidate, true)?
+                    } else {
+                        verify_sampled_draft(&s.target, &s.points[0], candidate, &mut s.rng)
+                    }
                 }
                 _ if candidate == pick => DraftVerdict::Accept,
                 _ => DraftVerdict::Reject(pick),
@@ -2705,7 +3459,8 @@ impl Qwen4MtpDrafter {
         }
         if trace {
             eprintln!(
-                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"rows\":[{}],\"committed\":{committed:?}}}",
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"rows\":[{}],\"committed\":{committed:?}}}",
+                accept_route_label(sampled.as_deref()),
                 trace_rows(candidates, &picks)
             );
         }
@@ -2714,8 +3469,9 @@ impl Qwen4MtpDrafter {
             let probe_field = probe.map_or_else(String::new, |probe| {
                 format!("\"probe_us\":{:.1},", probe.probe_us)
             });
+            let accept_route = accept_route_label(sampled.as_deref());
             let fields = format!(
-                "\"source\":\"ngram\",\"verify_route\":\"interleaved\",{probe_field}\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"emitted\":{},\"window_us\":{window_us:.1},\"t_end\":{}",
+                "\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"accept_route\":\"{accept_route}\",{probe_field}\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"emitted\":{},\"window_us\":{window_us:.1},\"t_end\":{}",
                 committed.len(),
                 unix_micros()
             );
@@ -3435,7 +4191,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     .collect::<Vec<_>>()
                     .join(",");
                 eprintln!(
-                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"batched\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true}}",
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true}}",
+                    accept_route_label(sampled.as_ref()),
                     acceptance.committed
                 );
             }
@@ -3511,8 +4268,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         if timers.enabled() {
             let window_us = synced_wall_us(gpu, window_start);
+            let accept_route = accept_route_label(self.sampled.as_ref());
             let fields = format!(
-                "\"source\":\"mtp\",\"verify_route\":\"batched\",\"position\":{position},\"k\":{drafts_verified},\"accepted\":{accepted_drafts},\"emitted\":{emitted_len},\"window_us\":{window_us:.1},\"t_end\":{}",
+                "\"source\":\"mtp\",\"verify_route\":\"batched\",\"accept_route\":\"{accept_route}\",\"position\":{position},\"k\":{drafts_verified},\"accepted\":{accepted_drafts},\"emitted\":{emitted_len},\"window_us\":{window_us:.1},\"t_end\":{}",
                 unix_micros()
             );
             timers.finish(gpu, "QWEN4_MTP_PHASE", &fields);
@@ -3586,6 +4344,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
             scratch,
             pending_hidden,
             append_scratch,
+            sampled,
+            device_spare,
             ..
         } = *self;
         if let Some(scratch) = scratch {
@@ -3596,6 +4356,12 @@ impl MtpDrafter for Qwen4MtpDrafter {
         }
         if let Some(scratch) = append_scratch {
             let _ = scratch.free_gpu(gpu);
+        }
+        for device in device_spare
+            .into_iter()
+            .chain(sampled.and_then(|state| state.device))
+        {
+            device.free(gpu);
         }
     }
 
@@ -3628,6 +4394,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows());
         self.floor_enabled =
             hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0");
+        if let Some(device) = self.sampled.as_mut().and_then(|state| state.device.take()) {
+            self.device_spare.push(device);
+        }
         let sampled = self.sampled_enabled && cfg.temp.is_finite() && cfg.temp > 1.0e-6;
         self.sampled = match (sampled, &self.sampled_mode) {
             (true, Ok(mode)) => Some(SampledVerify::new(cfg, self.max_k, *mode)),
@@ -3852,6 +4621,7 @@ pub fn mtp_error(error: MtpError) -> String {
 mod tests {
     use super::*;
     use crate::reference_mtp::MtpQsaGeometry;
+    use hipfire_runtime::spec_sampling::sample_residual;
 
     /// The `mtp_prefill` chunk ends for a fill of `prompt_len` rows from
     /// `start`, with natural chunks of `chunk_rows` and capture boundaries at
@@ -4816,5 +5586,452 @@ mod tests {
         assert!(drafter.floor_off_depth(drafter.max_k) > 0);
         drafter.agreement = agreement(0.0, 2.0);
         assert_eq!(drafter.floor_off_depth(drafter.max_k), 0);
+    }
+
+    // ---- Resident Leviathan acceptance (`HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT`):
+    // the pure window law. The ordered-accept kernel is modeled on the host
+    // with the host-law primitives driven by the explicit uniform tape the
+    // device receives (`fill_uniform_tape`), and compared with
+    // `accept_sampled_prefix` / `verify_sampled_draft` over the same
+    // distributions: committed tokens, accepted count, EOS flag and the
+    // authoritative stream's later outputs. No GPU is involved.
+
+    const DEV_NO_EOS: u32 = 99;
+
+    fn dev_spec(top_k: Option<u32>) -> SampleSpec {
+        SampleSpec::cpu_ar(1.0, 1.0, top_k, 0.0)
+    }
+
+    fn dev_logits(salt: u32) -> Vec<f32> {
+        (0..10u32)
+            .map(|token| {
+                let hash = token
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(salt.wrapping_mul(40_503))
+                    >> 7;
+                (hash & 0xff) as f32 / 32.0
+            })
+            .collect()
+    }
+
+    /// All mass on `top` (every other probability below f32 resolution).
+    fn dev_peaked(top: usize) -> Vec<f32> {
+        let mut logits = vec![0.0f32; 10];
+        logits[top] = 30.0;
+        logits
+    }
+
+    fn dev_dist(logits: &[f32], spec: SampleSpec) -> SparseDist {
+        let mut dist = SparseDist::default();
+        dist.build_from_logits(logits, spec, &mut Vec::new())
+            .expect("test logits have finite mass");
+        dist
+    }
+
+    fn dev_point(token: u32) -> SparseDist {
+        let mut dist = SparseDist::default();
+        dist.set_point_mass(token);
+        dist
+    }
+
+    /// Host model of `spec_accept_ordered_u32`: row `j`'s verdict reads
+    /// `tape[j]`, its residual `tape[j + 1]`, the bonus `tape[k]`; an accepted
+    /// proposal equal to `eos` stops without a bonus (`terminal = u32::MAX`).
+    fn dev_simulate_accept(
+        target: &[SparseDist],
+        qs: &[SparseDist],
+        proposals: &[u32],
+        tape: &[f32],
+        eos: u32,
+    ) -> [u32; 2] {
+        let k = proposals.len();
+        for row in 0..k {
+            let (p, q, x) = (&target[row], &qs[row], proposals[row]);
+            let (qx, px) = (q.prob(x), p.prob(x));
+            if qx > 0.0 && tape[row] * qx < px {
+                if x == eos {
+                    return [(row + 1) as u32, SPEC_CPU_AR_EOS_NONE];
+                }
+            } else {
+                return [row as u32, sample_residual(p, q, tape[row + 1])];
+            }
+        }
+        [k as u32, target[k].sample(tape[k])]
+    }
+
+    /// One batched window: the device reconstruction against the host
+    /// accept over the same rows and the same stream.
+    fn dev_check_window(
+        target: &[SparseDist],
+        qs: &[SparseDist],
+        drafts: &[u32],
+        eos: u32,
+        seed: u64,
+    ) -> DeviceVerdict {
+        let k = drafts.len();
+        assert_eq!(target.len(), k + 1);
+        let base = SpecRng::new(seed);
+        let mut host_rng = base;
+        let mut scratch = SparseDist::default();
+        let want = accept_sampled_prefix(
+            drafts,
+            qs,
+            Some(eos),
+            &mut host_rng,
+            &mut scratch,
+            |row, out| {
+                *out = target[row].clone();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut tape = vec![0.0f32; k + 1];
+        fill_uniform_tape(&base, &mut tape);
+        let words = dev_simulate_accept(target, qs, drafts, &tape, eos);
+        let verdict = decode_device_verdict(drafts, words, eos).unwrap();
+        let got = device_accept_result(drafts, &verdict);
+        assert_eq!(got.committed, want.committed, "seed {seed}");
+        assert_eq!(got.accepted, want.accepted, "seed {seed}");
+        assert_eq!(got.hit_eos, want.hit_eos, "seed {seed}");
+        let mut device_rng = base;
+        advance_rng(&mut device_rng, verdict.consumed);
+        for _ in 0..4 {
+            assert_eq!(device_rng.next_u64(), host_rng.next_u64(), "seed {seed}");
+        }
+        verdict
+    }
+
+    /// `q == p` over the full pool on every row; proposals are each row's
+    /// most probable token, so every one is accepted for any `u < 1`.
+    fn dev_matched(k: usize) -> (Vec<SparseDist>, Vec<SparseDist>, Vec<u32>) {
+        let spec = dev_spec(None);
+        let target: Vec<SparseDist> = (0..=k as u32)
+            .map(|row| dev_dist(&dev_logits(row + 1), spec))
+            .collect();
+        let qs = target[..k].to_vec();
+        let drafts = (0..k).map(|row| target[row].entries()[0].0).collect();
+        (target, qs, drafts)
+    }
+
+    /// Like [`dev_matched`] but row `at`'s `p` keeps two candidates while its
+    /// `q` has the full pool, and its proposal lies outside `p`'s support:
+    /// rejected for every `u`.
+    fn dev_reject_at(k: usize, at: usize) -> (Vec<SparseDist>, Vec<SparseDist>, Vec<u32>) {
+        let (mut target, mut qs, mut drafts) = dev_matched(k);
+        let logits = dev_logits(at as u32 + 1);
+        target[at] = dev_dist(&logits, dev_spec(Some(2)));
+        qs[at] = dev_dist(&logits, dev_spec(None));
+        drafts[at] = qs[at]
+            .entries()
+            .iter()
+            .map(|entry| entry.0)
+            .find(|&token| target[at].prob(token) == 0.0)
+            .expect("a full pool holds a token outside a two-candidate pool");
+        (target, qs, drafts)
+    }
+
+    #[test]
+    fn device_accept_all_accepted_takes_the_bonus_and_consumes_k_plus_one() {
+        let (target, qs, drafts) = dev_matched(4);
+        for seed in 0..32 {
+            let verdict = dev_check_window(&target, &qs, &drafts, DEV_NO_EOS, seed);
+            assert_eq!(verdict.accepted, 4);
+            assert_eq!(verdict.consumed, 5);
+            assert!(verdict.terminal.is_some());
+            assert!(!verdict.hit_eos);
+        }
+    }
+
+    #[test]
+    fn device_accept_first_and_last_rejection_consume_accepted_plus_two() {
+        for (k, at) in [(4, 0), (4, 3), (3, 1)] {
+            let (target, qs, drafts) = dev_reject_at(k, at);
+            for seed in 0..32 {
+                let verdict = dev_check_window(&target, &qs, &drafts, DEV_NO_EOS, seed);
+                assert_eq!(verdict.accepted, at, "k {k} reject at {at}");
+                assert_eq!(verdict.consumed, at + 2);
+                let replacement = verdict.terminal.expect("a rejection carries a replacement");
+                assert!(target[at].prob(replacement) > 0.0);
+                let committed = device_accept_result(&drafts, &verdict).committed;
+                assert_eq!(committed.len(), at + 1);
+                assert_eq!(committed.last(), Some(&replacement));
+            }
+        }
+    }
+
+    #[test]
+    fn device_accept_stops_at_an_accepted_eos_without_a_bonus() {
+        let (target, qs, drafts) = dev_matched(4);
+        let eos = drafts[1];
+        let stop = drafts.iter().position(|&draft| draft == eos).unwrap();
+        for seed in 0..32 {
+            let verdict = dev_check_window(&target, &qs, &drafts, eos, seed);
+            assert_eq!(verdict.accepted, stop + 1);
+            assert_eq!(verdict.terminal, None);
+            assert_eq!(verdict.consumed, stop + 1);
+            assert!(verdict.hit_eos);
+            let committed = device_accept_result(&drafts, &verdict).committed;
+            assert_eq!(committed.len(), stop + 1);
+            assert_eq!(committed.last(), Some(&eos));
+        }
+    }
+
+    #[test]
+    fn device_accept_rejection_replacement_that_is_the_eos_hits_eos() {
+        // p = {0, 1} at one half each, q the full pool with 0 and 1 level:
+        // token 2 is outside p, rejected, and the residual is 0 or 1.
+        let mut logits0 = vec![0.0f32; 10];
+        logits0[0] = 5.0;
+        logits0[1] = 5.0;
+        let target = vec![
+            dev_dist(&logits0, dev_spec(Some(2))),
+            dev_dist(&dev_logits(9), dev_spec(None)),
+        ];
+        let qs = vec![dev_dist(&logits0, dev_spec(None))];
+        let drafts = [2u32];
+        let (mut hit, mut miss) = (false, false);
+        for seed in 0..256 {
+            let verdict = dev_check_window(&target, &qs, &drafts, 0, seed);
+            assert_eq!(verdict.accepted, 0);
+            assert_eq!(verdict.consumed, 2);
+            match verdict.terminal {
+                Some(0) => {
+                    hit = true;
+                    assert!(verdict.hit_eos);
+                }
+                Some(_) => {
+                    miss = true;
+                    assert!(!verdict.hit_eos);
+                }
+                None => panic!("a rejection has a terminal token"),
+            }
+        }
+        assert!(hit && miss, "both residual outcomes occur across 256 seeds");
+    }
+
+    #[test]
+    fn device_accept_point_mass_drafts_match_the_host_law() {
+        let tops = [2usize, 5, 3];
+        let mut target: Vec<SparseDist> = tops
+            .iter()
+            .map(|&top| dev_dist(&dev_peaked(top), dev_spec(None)))
+            .collect();
+        target.push(dev_dist(&dev_peaked(6), dev_spec(None)));
+        let accepted_drafts: Vec<u32> = tops.iter().map(|&top| top as u32).collect();
+        let qs: Vec<SparseDist> = accepted_drafts.iter().map(|&token| dev_point(token)).collect();
+        for seed in 0..32 {
+            let verdict = dev_check_window(&target, &qs, &accepted_drafts, DEV_NO_EOS, seed);
+            assert_eq!(verdict.accepted, 3);
+            assert_eq!(verdict.terminal, Some(6));
+            assert_eq!(verdict.consumed, 4);
+        }
+        // The last proposal is not the target's token: rejected, replaced by it.
+        let mut rejected = accepted_drafts.clone();
+        rejected[2] = 4;
+        let qs: Vec<SparseDist> = rejected.iter().map(|&token| dev_point(token)).collect();
+        for seed in 0..32 {
+            let verdict = dev_check_window(&target, &qs, &rejected, DEV_NO_EOS, seed);
+            assert_eq!(verdict.accepted, 2);
+            assert_eq!(verdict.terminal, Some(3));
+            assert_eq!(verdict.consumed, 4);
+        }
+    }
+
+    #[test]
+    fn device_accept_single_proposal_windows_match_the_host_law() {
+        let (target, qs, drafts) = dev_matched(1);
+        for seed in 0..32 {
+            let verdict = dev_check_window(&target, &qs, &drafts, DEV_NO_EOS, seed);
+            assert_eq!((verdict.accepted, verdict.consumed), (1, 2));
+        }
+        let (target, qs, drafts) = dev_reject_at(1, 0);
+        for seed in 0..32 {
+            let verdict = dev_check_window(&target, &qs, &drafts, DEV_NO_EOS, seed);
+            assert_eq!((verdict.accepted, verdict.consumed), (0, 2));
+        }
+    }
+
+    /// The incremental one-row verdict: the kernel is told `eos = proposal`
+    /// (so an accepted proposal never reads a bonus row) and the caller
+    /// applies the real EOS rule. Target row 1 is poisoned: it is never read.
+    fn dev_check_step(
+        p: &SparseDist,
+        q: &SparseDist,
+        draft: u32,
+        real_eos: u32,
+        seed: u64,
+    ) -> (DraftVerdict, DeviceVerdict) {
+        let base = SpecRng::new(seed);
+        let mut host_rng = base;
+        let want = verify_sampled_draft(p, q, draft, &mut host_rng);
+        let mut tape = [0.0f32; 2];
+        fill_uniform_tape(&base, &mut tape);
+        let target = [p.clone(), dev_point(9)];
+        let words = dev_simulate_accept(&target, std::slice::from_ref(q), &[draft], &tape, draft);
+        let verdict = decode_device_verdict(&[draft], words, real_eos).unwrap();
+        let got = match verdict.terminal {
+            None => DraftVerdict::Accept,
+            Some(token) => DraftVerdict::Reject(token),
+        };
+        assert_eq!(got, want, "seed {seed}");
+        let mut device_rng = base;
+        advance_rng(&mut device_rng, verdict.consumed);
+        for _ in 0..4 {
+            assert_eq!(device_rng.next_u64(), host_rng.next_u64(), "seed {seed}");
+        }
+        (want, verdict)
+    }
+
+    #[test]
+    fn device_incremental_verdict_real_eos_proposal_accepted_stops_and_consumes_one() {
+        let p = dev_dist(&dev_peaked(4), dev_spec(None));
+        let q = dev_point(4);
+        for seed in 0..16 {
+            let (verdict, decoded) = dev_check_step(&p, &q, 4, 4, seed);
+            assert_eq!(verdict, DraftVerdict::Accept);
+            assert_eq!(decoded.consumed, 1);
+            assert_eq!(decoded.terminal, None);
+            assert!(decoded.hit_eos, "the proposal is the request EOS");
+        }
+    }
+
+    #[test]
+    fn device_incremental_verdict_artificial_stop_is_not_an_eos_hit() {
+        let p = dev_dist(&dev_peaked(4), dev_spec(None));
+        let q = dev_point(4);
+        for seed in 0..16 {
+            let (verdict, decoded) = dev_check_step(&p, &q, 4, DEV_NO_EOS, seed);
+            assert_eq!(verdict, DraftVerdict::Accept);
+            assert_eq!(decoded.consumed, 1);
+            assert!(!decoded.hit_eos, "a kernel-only stop is not the request EOS");
+        }
+    }
+
+    #[test]
+    fn device_incremental_verdict_rejection_consumes_two_and_flags_a_replacement_eos() {
+        // The proposal 2 is not the target's token 4: rejected, replaced by 4.
+        let p = dev_dist(&dev_peaked(4), dev_spec(None));
+        let q = dev_point(2);
+        for seed in 0..16 {
+            let (verdict, decoded) = dev_check_step(&p, &q, 2, 4, seed);
+            assert_eq!(verdict, DraftVerdict::Reject(4));
+            assert_eq!(decoded.consumed, 2);
+            assert!(decoded.hit_eos, "the residual replacement is the request EOS");
+            let (_, decoded) = dev_check_step(&p, &q, 2, DEV_NO_EOS, seed);
+            assert_eq!(decoded.consumed, 2);
+            assert!(!decoded.hit_eos);
+            // A rejected proposal that is itself the request EOS is not an EOS hit.
+            let (_, decoded) = dev_check_step(&p, &q, 2, 2, seed);
+            assert!(!decoded.hit_eos);
+        }
+    }
+
+    #[test]
+    fn device_incremental_verdict_matches_the_host_law_on_general_rows() {
+        let spec = dev_spec(None);
+        for salt in 0..6u32 {
+            let p = dev_dist(&dev_logits(salt + 1), dev_spec(Some(3)));
+            let q = dev_dist(&dev_logits(salt + 20), spec);
+            for seed in 0..24 {
+                // Draw the proposal from q, as the window does.
+                let mut rng = SpecRng::new(seed + 1000);
+                let draft = q.sample(rng.next_f32());
+                let _ = dev_check_step(&p, &q, draft, DEV_NO_EOS, seed);
+                let _ = dev_check_step(&p, &q, draft, draft, seed);
+            }
+        }
+    }
+
+    #[test]
+    fn device_bonus_draws_from_row_zero_and_consumes_one() {
+        for salt in 0..6u32 {
+            let p = dev_dist(&dev_logits(salt + 3), dev_spec(None));
+            for seed in 0..24 {
+                let base = SpecRng::new(seed);
+                let mut host_rng = base;
+                let want = p.sample(host_rng.next_f32());
+                let mut tape = [0.0f32; 1];
+                fill_uniform_tape(&base, &mut tape);
+                let words = dev_simulate_accept(std::slice::from_ref(&p), &[], &[], &tape, SPEC_CPU_AR_EOS_NONE);
+                let verdict = decode_device_verdict(&[], words, SPEC_CPU_AR_EOS_NONE).unwrap();
+                assert_eq!(verdict.terminal, Some(want));
+                assert_eq!(verdict.consumed, 1);
+                let mut device_rng = base;
+                advance_rng(&mut device_rng, verdict.consumed);
+                assert_eq!(device_rng.next_u64(), host_rng.next_u64());
+            }
+        }
+        assert!(decode_device_verdict(&[], [0, SPEC_CPU_AR_EOS_NONE], DEV_NO_EOS).is_err());
+    }
+
+    #[test]
+    fn device_verdict_decoding_rejects_impossible_words() {
+        let drafts = [5u32, 6, 7];
+        let reject = decode_device_verdict(&drafts, [1, 4], DEV_NO_EOS).unwrap();
+        assert_eq!((reject.accepted, reject.consumed, reject.terminal), (1, 3, Some(4)));
+        let bonus = decode_device_verdict(&drafts, [3, 4], DEV_NO_EOS).unwrap();
+        assert_eq!((bonus.accepted, bonus.consumed, bonus.terminal), (3, 4, Some(4)));
+        let stop = decode_device_verdict(&drafts, [2, SPEC_CPU_AR_EOS_NONE], 6).unwrap();
+        assert_eq!((stop.accepted, stop.consumed, stop.terminal, stop.hit_eos), (2, 2, None, true));
+        let result = device_accept_result(&drafts, &stop);
+        assert_eq!((result.committed.as_slice(), result.accepted, result.hit_eos), (&[5u32, 6][..], 2, true));
+        assert!(decode_device_verdict(&drafts, [4, 1], DEV_NO_EOS).is_err());
+        assert!(decode_device_verdict(&drafts, [0, SPEC_CPU_AR_EOS_NONE], DEV_NO_EOS).is_err());
+    }
+
+    #[test]
+    fn uniform_tape_is_the_next_draws_and_leaves_the_stream_alone() {
+        let base = SpecRng::new(77);
+        let mut tape = [0.0f32; 5];
+        fill_uniform_tape(&base, &mut tape);
+        let mut walk = base;
+        for &slot in &tape {
+            assert_eq!(slot, walk.next_f32());
+        }
+        let mut untouched = base;
+        let mut reference = base;
+        assert_eq!(untouched.next_u64(), reference.next_u64());
+    }
+
+    #[test]
+    fn device_accept_eligibility_is_neutral_leviathan_only() {
+        let spec = SampleSpec::cpu_ar(0.7, 0.9, None, 0.0);
+        assert!(device_accept_eligible(false, 0, false, true, &spec));
+        assert!(!device_accept_eligible(true, 0, false, true, &spec), "naive");
+        assert!(!device_accept_eligible(false, 64, false, true, &spec), "history window");
+        assert!(!device_accept_eligible(false, 0, true, true, &spec), "gpu penalty rows");
+        assert!(!device_accept_eligible(false, 0, false, false, &spec), "blocked tokens");
+        for temperature in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let bad = SampleSpec { temperature, ..spec };
+            assert!(!device_accept_eligible(false, 0, false, true, &bad), "{temperature}");
+        }
+        let wide = SampleSpec::cpu_ar(0.7, 0.9, Some(0), 0.0);
+        assert!(device_accept_eligible(false, 0, false, true, &wide));
+        assert!(!device_accept_eligible(false, 0, false, true, &SampleSpec { pool: 65, cap: 65, ..spec }));
+        assert!(!device_accept_eligible(false, 0, false, true, &SampleSpec { cap: 0, ..spec }));
+        assert!(!device_accept_eligible(false, 0, false, true, &SampleSpec { cap: spec.pool + 1, ..spec }));
+    }
+
+    #[test]
+    fn sampled_verify_device_predicate_follows_request_and_resources() {
+        let neutral = SpecRequestConfig {
+            temp: 0.7,
+            ..SpecRequestConfig::default()
+        };
+        let s = SampledVerify::new(neutral, 4, SampledMode::Leviathan);
+        // Eligible by request, but nothing is provisioned without a `Gpu`.
+        assert!(s.device_eligible || !mtp_device_accept_enabled());
+        for k in 0..=4 {
+            assert!(!s.device_ready(k));
+        }
+        assert!(!SampledVerify::new(neutral, 4, SampledMode::Naive).device_eligible);
+        let penalized = SpecRequestConfig {
+            repeat_penalty: 1.15,
+            repeat_window: 64,
+            ..neutral
+        };
+        assert!(!SampledVerify::new(penalized, 4, SampledMode::Leviathan).device_eligible);
+        assert_eq!(accept_route_label(None), "host");
+        assert_eq!(accept_route_label(Some(&s)), "host");
     }
 }

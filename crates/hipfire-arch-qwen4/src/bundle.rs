@@ -1614,6 +1614,32 @@ impl Qwen4Bundle {
             .map_err(BundleError::Hip)
     }
 
+    /// Resident (no download) contiguous view of rows
+    /// `first_row..first_row + rows` of the last speculative forward's logits,
+    /// `rows * vocab` f32 words with row stride `vocab`. A non-owning view:
+    /// valid only until the next speculative forward, never freed.
+    pub(crate) fn spec_logits_rows(
+        &self,
+        first_row: usize,
+        rows: usize,
+    ) -> Result<GpuTensor, BundleError> {
+        let vocab = self.config.vocab_size;
+        let logits = self.spec_logits.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec logits are not attached".to_string())
+        })?;
+        first_row
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(vocab))
+            .filter(|&end| rows > 0 && end <= logits.numel())
+            .map(|_| logits.sub_offset(first_row * vocab, rows * vocab))
+            .ok_or_else(|| {
+                BundleError::Forward(format!(
+                    "Qwen4 spec logit rows {first_row}..{} are outside capacity",
+                    first_row.saturating_add(rows)
+                ))
+            })
+    }
+
     /// Row `row` of the last speculative forward's logits as `spec`'s
     /// truncated distribution, after `policy` (repeat/presence/frequency
     /// penalties and blocked tokens) is applied over `history` — the row's AR
