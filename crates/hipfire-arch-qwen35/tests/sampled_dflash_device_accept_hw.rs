@@ -33,7 +33,8 @@ use hipfire_arch_qwen35::speculative::{
     dflash_sampled_accept_device, DflashSampleCfg, DflashSampledDraft,
 };
 use rdna_compute::dflash_sampled_accept::{
-    dflash_accept_pack_payload, dflash_sampled_accept_reference, DflashDeviceDecision,
+    dflash_accept_pack_payload, dflash_sampled_accept_reference, DflashAcceptScratch,
+    DflashDeviceDecision,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -169,6 +170,7 @@ fn pack(
 /// Kernel vs twin over `TRIALS` windows of `n` rows. Returns the decisions.
 fn kernel_equals_twin(
     gpu: &mut Gpu,
+    scratch: &DflashAcceptScratch,
     name: &str,
     rows: &Rows,
     n: usize,
@@ -190,7 +192,7 @@ fn kernel_equals_twin(
         let u_fin = rng.unit();
         let payload = pack(&tokens, &us, u_fin, max_accept(k), &selq, &q);
         let dev = gpu
-            .dflash_sampled_accept_sparse_q_f32(&rows.probs, &rows.tau, &rows.z, &payload, n, VOCAB)
+            .dflash_sampled_accept_sparse_q_f32(scratch, &rows.probs, &rows.tau, &rows.z, &payload, n, VOCAB)
             .unwrap_or_else(|e| panic!("{name} #{k}: {e}"));
         let twin = dflash_sampled_accept_reference(&rows.h_probs, &rows.h_tau, &rows.h_z, &payload, n, VOCAB);
         assert_eq!(dev, twin, "{name} #{k}: kernel != twin");
@@ -207,11 +209,12 @@ fn kernel_equals_twin(
 fn device_accept_kernel_equals_host_twin() {
     let mut gpu = Gpu::init().expect("Gpu::init");
     let n = 4;
+    let scratch = DflashAcceptScratch::new(&mut gpu, 1, 1, 4 * n + 4 + 2 * 8 * n + 64).unwrap();
 
     // serve config rows (tau > 0, kept set <= cap).
     let lg = logits(n + 1, 1);
     let rows = softmax_rows(&mut gpu, &lg, n + 1, 0.9, 20);
-    let d = kernel_equals_twin(&mut gpu, "serve", &rows, n, |r| selector_q(&rows, n, 8, r), |_| n);
+    let d = kernel_equals_twin(&mut gpu, &scratch, "serve", &rows, n, |r| selector_q(&rows, n, 8, r), |_| n);
     assert!(d.iter().any(|d| d.rejected) && d.iter().any(|d| !d.rejected));
     assert!(d.iter().all(|d| d.fallback == 0));
 
@@ -227,6 +230,7 @@ fn device_accept_kernel_equals_host_twin() {
         .collect();
     let d = kernel_equals_twin(
         &mut gpu,
+        &scratch,
         "point_mass",
         &rows,
         n,
@@ -240,7 +244,7 @@ fn device_accept_kernel_equals_host_twin() {
     }
 
     // Budget bound: the bonus is drawn from the boundary row.
-    kernel_equals_twin(&mut gpu, "budget", &rows, n, |r| selector_q(&rows, n, 8, r), |k| [0, 2, n][k % 3]);
+    kernel_equals_twin(&mut gpu, &scratch, "budget", &rows, n, |r| selector_q(&rows, n, 8, r), |k| [0, 2, n][k % 3]);
 
     // Full support (tau = 0): the identity row, no kept-set cut at all.
     let mut probs = Vec::new();
@@ -252,7 +256,7 @@ fn device_accept_kernel_equals_host_twin() {
         probs.extend(r);
     }
     let full = synthetic_rows(&mut gpu, &probs, &vec![0.0; n + 1], &vec![1.0; n + 1]);
-    let d = kernel_equals_twin(&mut gpu, "full_support", &full, n, |r| selector_q(&full, n, 8, r), |_| n);
+    let d = kernel_equals_twin(&mut gpu, &scratch, "full_support", &full, n, |r| selector_q(&full, n, 8, r), |_| n);
     assert!(d.iter().any(|w| w.bonus as usize > VOCAB / 2), "draws must reach the whole vocabulary");
 
     // Degenerate residual: q puts more mass than p on the proposed id (p is a
@@ -264,6 +268,7 @@ fn device_accept_kernel_equals_host_twin() {
     let spike = synthetic_rows(&mut gpu, &probs, &vec![1.0; n + 1], &vec![1.0; n + 1]);
     let d = kernel_equals_twin(
         &mut gpu,
+        &scratch,
         "degenerate",
         &spike,
         n,
@@ -282,7 +287,7 @@ fn device_accept_kernel_equals_host_twin() {
         }
     }
     let flat = synthetic_rows(&mut gpu, &probs, &vec![0.025; n + 1], &vec![1.0; n + 1]);
-    kernel_equals_twin(&mut gpu, "tie_rows", &flat, n, |r| selector_q(&flat, n, 8, r), |_| n);
+    kernel_equals_twin(&mut gpu, &scratch, "tie_rows", &flat, n, |r| selector_q(&flat, n, 8, r), |_| n);
 }
 
 /// With one proposed row the committed token is the truncated target row's law.
@@ -290,6 +295,7 @@ fn device_accept_kernel_equals_host_twin() {
 #[ignore = "requires a real HIP GPU"]
 fn device_accept_committed_token_law() {
     let mut gpu = Gpu::init().expect("Gpu::init");
+    let scratch = DflashAcceptScratch::new(&mut gpu, 1, 1, 64).unwrap();
     let lg = logits(2, 9);
     let rows = softmax_rows(&mut gpu, &lg, 2, 0.9, 20);
     let inv = 1.0f32 / rows.h_z[0].max(f32::MIN_POSITIVE);
@@ -304,20 +310,31 @@ fn device_accept_committed_token_law() {
         let (x, qx) = draw(&q, rng.unit());
         let payload = pack(&[x], &[rng.unit()], rng.unit(), 1, &[qx], &[q.clone()]);
         let d = gpu
-            .dflash_sampled_accept_sparse_q_f32(&rows.probs, &rows.tau, &rows.z, &payload, 1, VOCAB)
+            .dflash_sampled_accept_sparse_q_f32(&scratch, &rows.probs, &rows.tau, &rows.z, &payload, 1, VOCAB)
             .unwrap();
         *counts.entry(if d.rejected { d.bonus } else { x }).or_default() += 1;
     }
     for (&tok, _) in &counts {
         assert!(target[tok as usize] > 0.0, "token {tok} is outside the kept set");
     }
+    let (mut chi, mut cells) = (0.0f64, 0usize);
     for c in 0..VOCAB {
         let p = target[c] as f64;
         let e = p * LAW_TRIALS as f64;
         let got = *counts.get(&(c as u32)).unwrap_or(&0) as f64;
         let sd = (e * (1.0 - p)).sqrt();
         assert!((got - e).abs() <= 6.0 * sd + 3.0, "token {c}: {got} draws, expected {e:.1} (sd {sd:.1})");
+        if e >= 5.0 {
+            chi += (got - e) * (got - e) / e;
+            cells += 1;
+        }
     }
+    // Pearson chi-square over the kept cells (every one expects >= 5): the
+    // Wilson-Hilferty normal score must stay below 4 (one-sided p > 3e-5).
+    let k = (cells - 1) as f64;
+    let z = ((chi / k).cbrt() - (1.0 - 2.0 / (9.0 * k))) / (2.0 / (9.0 * k)).sqrt();
+    println!("committed-token law: chi2 {chi:.1} over {cells} cells, WH z {z:.2}");
+    assert!(z < 4.0, "chi-square rejects the target law: chi2 {chi:.1}, {cells} cells, z {z:.2}");
 }
 
 /// End to end: softmax + pre-drawn uniforms + upload + launch + readback.
@@ -333,6 +350,8 @@ fn device_accept_entry_is_twin_exact_and_deterministic() {
     let rows = softmax_rows(&mut gpu, &lg, b, 0.9, 20);
 
     let mut rng = Lcg(2024);
+    // Starts empty and tiny: the entry must grow it on demand.
+    let mut slot: Option<DflashAcceptScratch> = None;
     for case in 0..200 {
         let q = selector_q(&rows, n, 8, &mut rng);
         let mut draft = DflashSampledDraft::default();
@@ -369,10 +388,10 @@ fn device_accept_entry_is_twin_exact_and_deterministic() {
         let twin = dflash_sampled_accept_reference(&rows.h_probs, &rows.h_tau, &rows.h_z, &payload, n, VOCAB);
 
         let mut r1 = seed;
-        let a = dflash_sampled_accept_device(&mut gpu, &logits_gpu, &draft.block, &draft, VOCAB, cfg, max_accept, &mut r1)
+        let a = dflash_sampled_accept_device(&mut gpu, &logits_gpu, &draft.block, &draft, VOCAB, cfg, max_accept, &mut r1, &mut slot)
             .unwrap();
         let mut r2 = seed;
-        let c = dflash_sampled_accept_device(&mut gpu, &logits_gpu, &draft.block, &draft, VOCAB, cfg, max_accept, &mut r2)
+        let c = dflash_sampled_accept_device(&mut gpu, &logits_gpu, &draft.block, &draft, VOCAB, cfg, max_accept, &mut r2, &mut slot)
             .unwrap();
         assert_eq!((a.accepted_drafts, a.bonus_token), (twin.accept_len, twin.bonus), "case {case}");
         assert_eq!((a.accepted_drafts, a.bonus_token, r1), (c.accepted_drafts, c.bonus_token, r2), "case {case}: not deterministic");

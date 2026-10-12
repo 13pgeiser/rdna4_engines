@@ -296,6 +296,119 @@ pub fn dflash_sampled_accept_reference(
     DflashDeviceDecision { accept_len: row, bonus: bonus as u32, rejected, fallback }
 }
 
+/// Reusable device buffers of the window accept: the verify rows' softmax
+/// (`probs`, `tau`, `z`: the caller enqueues
+/// [`Gpu::softmax_temp_topp_batched_into_f32`] into them), the payload and the
+/// four result words. Grow-only ([`Self::ensure`]); a session owns one, so a
+/// steady-state window allocates nothing.
+pub struct DflashAcceptScratch {
+    pub probs: GpuTensor,
+    pub tau: GpuTensor,
+    pub z: GpuTensor,
+    payload: GpuTensor,
+    out: GpuTensor,
+    rows_cap: usize,
+    vocab_cap: usize,
+    payload_cap: usize,
+    /// Host staging reused every window (pre-drawn uniforms, packed payload).
+    pub host_uniforms: Vec<f32>,
+    pub host_payload: Vec<u32>,
+}
+
+impl DflashAcceptScratch {
+    /// Scratch for windows of up to `rows` verify rows over `vocab` ids and
+    /// `payload_words` payload words.
+    pub fn new(gpu: &mut Gpu, rows: usize, vocab: usize, payload_words: usize) -> HipResult<Self> {
+        let probs = gpu.alloc_tensor(&[rows * vocab], DType::F32)?;
+        let tau = match gpu.alloc_tensor(&[rows], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(probs);
+                return Err(e);
+            }
+        };
+        let z = match gpu.alloc_tensor(&[rows], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(probs);
+                let _ = gpu.free_tensor(tau);
+                return Err(e);
+            }
+        };
+        let payload = match gpu.alloc_tensor(&[payload_words.max(1)], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(probs);
+                let _ = gpu.free_tensor(tau);
+                let _ = gpu.free_tensor(z);
+                return Err(e);
+            }
+        };
+        let out = match gpu.alloc_tensor(&[4], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(probs);
+                let _ = gpu.free_tensor(tau);
+                let _ = gpu.free_tensor(z);
+                let _ = gpu.free_tensor(payload);
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            probs,
+            tau,
+            z,
+            payload,
+            out,
+            rows_cap: rows,
+            vocab_cap: vocab,
+            payload_cap: payload_words.max(1),
+            host_uniforms: Vec::with_capacity(rows),
+            host_payload: Vec::with_capacity(payload_words),
+        })
+    }
+
+    /// Grow to hold a `rows` x `vocab` window with `payload_words` payload
+    /// words; a no-op when it already does. The previous buffers are
+    /// released only after the new ones exist, and only between windows (the
+    /// result readback synchronizes, so nothing still uses them).
+    pub fn ensure(
+        slot: &mut Option<Self>,
+        gpu: &mut Gpu,
+        rows: usize,
+        vocab: usize,
+        payload_words: usize,
+    ) -> HipResult<()> {
+        if let Some(s) = slot.as_ref() {
+            if s.rows_cap >= rows && s.vocab_cap >= vocab && s.payload_cap >= payload_words {
+                return Ok(());
+            }
+        }
+        let (r, v, p) = match slot.as_ref() {
+            Some(s) => (
+                s.rows_cap.max(rows),
+                s.vocab_cap.max(vocab),
+                s.payload_cap.max(payload_words),
+            ),
+            None => (rows, vocab, payload_words),
+        };
+        let new = Self::new(gpu, r, v, p)?;
+        if let Some(old) = slot.replace(new) {
+            old.free(gpu);
+        }
+        Ok(())
+    }
+
+    /// Release the buffers.
+    pub fn free(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.probs);
+        let _ = gpu.free_tensor(self.tau);
+        let _ = gpu.free_tensor(self.z);
+        let _ = gpu.free_tensor(self.payload);
+        let _ = gpu.free_tensor(self.out);
+    }
+}
+
 impl Gpu {
     /// Decide a sampled DFlash window on the device.
     ///
@@ -309,6 +422,7 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn dflash_sampled_accept_sparse_q_f32(
         &mut self,
+        scratch: &DflashAcceptScratch,
         probs: &GpuTensor,
         tau: &GpuTensor,
         z: &GpuTensor,
@@ -348,24 +462,21 @@ impl Gpu {
             DFLASH_SAMPLED_ACCEPT_SRC,
             DFLASH_SAMPLED_ACCEPT_SYMBOL,
         )?;
-        let payload_dev = self.alloc_tensor(&[payload.len()], DType::F32)?;
-        let out_dev = match self.alloc_tensor(&[4], DType::F32) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = self.free_tensor(payload_dev);
-                return Err(e);
-            }
-        };
+        if scratch.payload_cap < payload.len() {
+            return Err(err(format!(
+                "scratch payload holds {} words, window needs {}",
+                scratch.payload_cap,
+                payload.len()
+            )));
+        }
         let result = self.dflash_sampled_accept_enqueue(
-            probs, tau, z, payload, &payload_dev, &out_dev, n, vocab,
+            probs, tau, z, payload, &scratch.payload, &scratch.out, n, vocab,
         );
         if result.is_err() {
             // An async copy of `payload` may still be queued: drain it before
             // the caller's host buffer can go away.
             let _ = self.hip.device_synchronize();
         }
-        let _ = self.free_tensor(payload_dev);
-        let _ = self.free_tensor(out_dev);
         result
     }
 

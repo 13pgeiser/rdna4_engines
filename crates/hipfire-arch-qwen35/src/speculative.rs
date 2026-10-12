@@ -36,6 +36,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
+use rdna_compute::dflash_sampled_accept::DflashAcceptScratch;
 use rdna_compute::{DType, Fp8VerifyTarget, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3165,6 +3166,10 @@ pub struct VerifyScratch {
     /// constructor — `forward_prefill_batch` then falls back to allocating
     /// its own scratch.
     pub prefill_batch: Option<qwen35::PrefillBatchScratch>,
+    /// Reusable buffers of the singleton device sampled accept
+    /// (`HIPFIRE_DFLASH_DEVICE_ACCEPT`), grown on first sampled window. A
+    /// `Mutex` because the singleton step borrows `VerifyScratch` shared.
+    pub device_accept: std::sync::Mutex<Option<DflashAcceptScratch>>,
 }
 
 impl VerifyScratch {
@@ -3185,6 +3190,7 @@ impl VerifyScratch {
             rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
             argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
             prefill_batch: None,
+            device_accept: std::sync::Mutex::new(None),
         })
     }
 
@@ -3213,6 +3219,9 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.argmax);
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
+        }
+        if let Some(acc) = self.device_accept.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            acc.free(gpu);
         }
     }
 }
@@ -4410,6 +4419,8 @@ pub fn dflash_device_accept_eligible(
 /// fixed count per window, whatever the outcome) and reads back
 /// `{accept_len, bonus}`. `max_accept` bounds the accepted prefix exactly as
 /// the host loop does (the bonus is then drawn from the boundary row).
+/// `scratch` is the session's reusable buffers (grown on demand): a
+/// steady-state window allocates nothing.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn dflash_sampled_accept_device(
@@ -4421,19 +4432,24 @@ pub fn dflash_sampled_accept_device(
     cfg: DflashSampleCfg,
     max_accept: usize,
     rng: &mut u64,
+    scratch: &mut Option<DflashAcceptScratch>,
 ) -> HipResult<SampledWindowDecision> {
     let b = block.len();
     if !dflash_device_accept_eligible(true, &cfg, q, b) {
         return Err(HipError::new(0, "device sampled accept: ineligible window (cactus / dense q / receipt shape)"));
     }
     let n = b - 1;
-    let uniforms: Vec<f32> = (0..n).map(|_| xorshift_next_unit(rng)).collect();
+    let nnz = q.sparse_q.offsets()[n] as usize;
+    let payload_words = rdna_compute::dflash_sampled_accept::dflash_accept_payload_words(n, nnz);
+    DflashAcceptScratch::ensure(scratch, gpu, b, vocab, payload_words)?;
+    let s = scratch.as_mut().expect("scratch ensured above");
+    s.host_uniforms.clear();
+    s.host_uniforms.extend((0..n).map(|_| xorshift_next_unit(rng)));
     let u_fin = xorshift_next_unit(rng);
-    let mut payload = Vec::new();
     rdna_compute::dflash_sampled_accept::dflash_accept_pack_payload(
-        &mut payload,
+        &mut s.host_payload,
         &block[1..],
-        &uniforms,
+        &s.host_uniforms,
         u_fin,
         max_accept,
         &q.selected_q,
@@ -4444,31 +4460,14 @@ pub fn dflash_sampled_accept_device(
     .map_err(|e| HipError::new(0, &format!("device sampled accept: {e}")))?;
 
     let logits_batch = logits.sub_offset(0, b * vocab);
-    let probs = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
-    let tau = match gpu.alloc_tensor(&[b], rdna_compute::DType::F32) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = gpu.free_tensor(probs);
-            return Err(e);
-        }
-    };
-    let z = match gpu.alloc_tensor(&[b], rdna_compute::DType::F32) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = gpu.free_tensor(probs);
-            let _ = gpu.free_tensor(tau);
-            return Err(e);
-        }
-    };
-    let res = gpu
-        .softmax_temp_topp_batched_into_f32(
-            &logits_batch, &probs, &tau, &z, vocab, b, cfg.temp, cfg.top_p, cfg.top_k, 0.0,
-        )
-        .and_then(|()| gpu.dflash_sampled_accept_sparse_q_f32(&probs, &tau, &z, &payload, n, vocab));
-    let _ = gpu.free_tensor(probs);
-    let _ = gpu.free_tensor(tau);
-    let _ = gpu.free_tensor(z);
-    let d = res?;
+    // The scratch tensors may be larger than this window: kernels size by the
+    // explicit (rows, vocab) arguments, never by the tensor.
+    gpu.softmax_temp_topp_batched_into_f32(
+        &logits_batch, &s.probs, &s.tau, &s.z, vocab, b, cfg.temp, cfg.top_p, cfg.top_k, 0.0,
+    )?;
+    let d = gpu.dflash_sampled_accept_sparse_q_f32(
+        s, &s.probs, &s.tau, &s.z, &s.host_payload, n, vocab,
+    )?;
     Ok(SampledWindowDecision {
         accepted_drafts: d.accept_len,
         bonus_token: d.bonus,
@@ -8916,6 +8915,10 @@ pub fn spec_step_dflash(
                     DflashSampleCfg { temp, top_p, top_k, cactus_delta },
                     max_accept.unwrap_or(usize::MAX),
                     rng_state,
+                    &mut *verify_scratch
+                        .device_accept
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
                 )?)
             }
             _ => None,
