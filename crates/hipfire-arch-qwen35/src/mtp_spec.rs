@@ -2678,8 +2678,11 @@ impl MtpPromptRoute {
 /// of starting at the first generated token.
 ///
 /// The trunk chunk plan follows `route` (see [`MtpPromptRoute`]). The head
-/// fills in `<= prefill_max_batch` slices aligned to the start of the fill on
-/// either route, so a given set of hidden rows yields the same MTP KV.
+/// fills in slices of at most `head_rows` rows aligned to the start of the
+/// fill: `prefill_max_batch` by default, or (default ArRoute on gfx1201 with
+/// MQ4G256 `eh_proj`/`wk`/`wv`) the wider lean-scratch capacity fitting the
+/// legacy scratch+rotation byte budget. Each row is independent, so a given
+/// set of hidden rows yields the same MTP KV for any slice width.
 /// Callers observe a committed boundary after each trunk chunk. Adaptive KV
 /// never reaches this path (qwen generate refuses speculation under
 /// `kv_adaptive`).
@@ -2838,12 +2841,9 @@ where
 
     let dim = target.config.dim;
     let dim_bytes = dim * 4;
-    // The head pairs token `p` with the trunk hidden of position `p - 1`, as
-    // decode does. Row 0 holds the partner of the first fill token; row
-    // `j + 1` holds the hidden of position `start_pos + j`. Fill row `j`
-    // therefore pairs `prompt_tokens[j]` with row `j`.
-    let prompt_hidden = gpu.alloc_tensor(&[(prompt_tokens.len() + 1) * dim], DType::F32)?;
-    // The head fills in `head_rows` slices whatever the trunk chunk size.
+    // Pure support/eligibility metadata, decided before any head or hidden
+    // buffer takes memory. The head fills in `head_rows` slices whatever the
+    // trunk chunk size.
     let use_batched_mtp_fill = mtp_head::mtp_prompt_fill_uses_batched(
         state.mtp_kv.kv_mode,
         &[
@@ -2853,8 +2853,62 @@ where
             head.weights.wv.gpu_dtype,
         ],
     );
+    // Lean wide-slice fill: only the default single-GPU ArRoute on exact
+    // gfx1201 with plain MQ4G256 eh_proj/wk/wv (the projections the kv_only
+    // fill actually runs). Everything else keeps the legacy scratch and rows.
+    let fill_fast_wide = use_batched_mtp_fill
+        && mtp_head::mtp_fill_fast_enabled()
+        && route == MtpPromptRoute::ArRoute
+        && gpu.arch == "gfx1201"
+        && [
+            &head.weights.eh_proj,
+            &head.weights.wk,
+            &head.weights.wv,
+        ]
+        .iter()
+        .all(|w| w.gpu_dtype == DType::MQ4G256 && w.awq_scale.is_none());
+    let legacy_rotation_k = (2 * dim)
+        .max(head.config.n_ff)
+        .max(dim)
+        .max(head.config.n_head * head.config.head_dim);
+    let fill_rotation_k = head
+        .weights
+        .eh_proj
+        .k
+        .max(head.weights.wk.k)
+        .max(head.weights.wv.k);
+    // Slice capacity: the legacy rows unless the lean layout fits more rows in
+    // the legacy scratch+rotation byte budget (never above the trunk chunk
+    // ceiling queried above with the legacy rows, nor the prompt length).
+    let head_rows = if fill_fast_wide {
+        Qwen35MtpHeadBatchedScratch::prompt_fill_rows_for_budget(
+            &head.config,
+            head_rows,
+            trunk_chunk_max,
+            prompt_tokens.len(),
+            legacy_rotation_k,
+            fill_rotation_k,
+        )
+    } else {
+        head_rows
+    };
+    let rotation_k = if fill_fast_wide {
+        fill_rotation_k
+    } else {
+        legacy_rotation_k
+    };
+    // The head pairs token `p` with the trunk hidden of position `p - 1`, as
+    // decode does. Row 0 holds the partner of the first fill token; row
+    // `j + 1` holds the hidden of position `start_pos + j`. Fill row `j`
+    // therefore pairs `prompt_tokens[j]` with row `j`.
+    let prompt_hidden = gpu.alloc_tensor(&[(prompt_tokens.len() + 1) * dim], DType::F32)?;
     let mut mtp_prefill_scratch = if use_batched_mtp_fill {
-        match Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, head_rows) {
+        let created = if fill_fast_wide {
+            Qwen35MtpHeadBatchedScratch::new_for_prompt_fill(gpu, &head.config, head_rows)
+        } else {
+            Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, head_rows)
+        };
+        match created {
             Ok(scratch) => Some(scratch),
             Err(error) => {
                 let _ = gpu.free_tensor(prompt_hidden);
@@ -2865,11 +2919,7 @@ where
         None
     };
     let mtp_prefill_rot = if use_batched_mtp_fill {
-        let widest_k = (2 * dim)
-            .max(head.config.n_ff)
-            .max(dim)
-            .max(head.config.n_head * head.config.head_dim);
-        match gpu.alloc_tensor(&[head_rows * widest_k], DType::F32) {
+        match gpu.alloc_tensor(&[head_rows * rotation_k], DType::F32) {
             Ok(tensor) => Some(tensor),
             Err(error) => {
                 if let Some(scratch) = mtp_prefill_scratch.take() {
@@ -2949,7 +2999,7 @@ where
                 (mtp_prefill_scratch.as_mut(), mtp_prefill_rot.as_ref())
             {
                 // Slices end on multiples of `head_rows` from the fill start,
-                // so both routes feed the head identical slices.
+                // independent of the trunk chunk boundaries.
                 let mut slice_off = off;
                 while slice_off < end {
                     let slice_end = ((slice_off / head_rows + 1) * head_rows).min(end);
