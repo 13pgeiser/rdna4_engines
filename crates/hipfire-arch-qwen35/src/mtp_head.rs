@@ -2666,7 +2666,22 @@ pub fn mtp_head_forward_block_batched(
     let k_view = scratch.k.sub_offset(0, n * kv_dim);
     let v_view = scratch.v.sub_offset(0, n * kv_dim);
     weight_gemm_batched(gpu, &w.wk, &tmp_view, &k_view, n, rotated_x_scratch)?;
-    weight_gemm_batched(gpu, &w.wv, &tmp_view, &v_view, n, rotated_x_scratch)?;
+    // fast_fill: wk and wv share input tmp_view; when both are plain MQ4G256
+    // (no AWQ sidecar, same k) the rotation wk just wrote into rotated_x_scratch
+    // is bit-identical to what wv would recompute, so reuse it.
+    match rotated_x_scratch {
+        Some(rot)
+            if fast_fill
+                && w.wk.gpu_dtype == DType::MQ4G256
+                && w.wv.gpu_dtype == DType::MQ4G256
+                && w.wk.awq_scale.is_none()
+                && w.wv.awq_scale.is_none()
+                && w.wk.k == w.wv.k =>
+        {
+            gpu.gemm_hfq4g256(&w.wv.buf, rot, &v_view, w.wv.m, w.wv.k, n)?;
+        }
+        _ => weight_gemm_batched(gpu, &w.wv, &tmp_view, &v_view, n, rotated_x_scratch)?,
+    }
     gpu.rmsnorm_batched(
         &k_view,
         &w.attn_k_norm,
