@@ -618,7 +618,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1543
+**Count:** 1544
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -737,7 +737,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CK_TARGET_GFX1100` | experiments/flash-attn-ck-sidecar/build_sidecar.sh | harness |
 | `HIPFIRE_CK_TARGET_GFX1151` | experiments/flash-attn-ck-sidecar/build_sidecar.sh | harness |
 | `HIPFIRE_CK_TARGET_GFX1201` | experiments/flash-attn-ck-sidecar/build_sidecar.sh | harness |
-| `HIPFIRE_CLI_BIN` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_CLI_BIN` | benchmarks/scripts/mq4v2_k5120_abba.sh, competitors/halo-mtp-regress-20261012/mtp-append-det/append8k_profile.py | stable |
 | `HIPFIRE_COHERE2MOE_Q8_SCALAR` | crates/hipfire-arch-cohere2moe/src/forward.rs | developer |
 | `HIPFIRE_COHERENCE_MAX_SEQ` | scripts/coherence-gate-cohere2moe.sh | deprecated |
 | `HIPFIRE_COHERENCE_OUT` | scripts/coherence-gate-cohere2moe.sh, scripts/coherence-gate-deepseek4-mtp.sh | deprecated |
@@ -902,7 +902,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DETECTED_VRAM_GB` | scripts/_detect-gpu.sh | harness |
 | `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | experimental |
 | `HIPFIRE_DEVICE` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_DEVICES` | crates/hipfire-arch-qwen35/examples/prefill_ragged_oracle.rs, crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs | stable |
+| `HIPFIRE_DEVICES` | competitors/halo-mtp-regress-20261012/mtp-append-det/gatelib.py, crates/hipfire-arch-qwen35/examples/prefill_ragged_oracle.rs | stable |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_BLOCK` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
@@ -1033,7 +1033,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FA2_QRESIDENT` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_FA2_QRESIDENT_V2` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_FA2_QRESIDENT_V2_Q8` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_FABRIC_ADMISSION` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-daemon/src/gpu_lock.rs | developer |
+| `HIPFIRE_FABRIC_ADMISSION` | competitors/halo-mtp-regress-20261012/mtp-append-det/gatelib.py, crates/hipfire-arch-qwen35/src/carrier.rs | developer |
 | `HIPFIRE_FAST_SAMPLE` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_FAULT_HIP` | crates/hip-bridge/src/ffi.rs, crates/hipfire-runtime/examples/test_serve_prefix_cache.rs | developer |
 | `HIPFIRE_FAULT_MTP_FULL_REJECT` | crates/hipfire-runtime/examples/test_serve_prefix_cache.rs | harness |
@@ -1409,7 +1409,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_HIPCC` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/setup.rs | developer |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | .agents/skills/hipfire-autoheal/triage.sh, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_HIP_WAIT` | crates/rdna-compute/src/dispatch.rs | developer |
-| `HIPFIRE_HOME` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/serve/mod.rs | stable |
+| `HIPFIRE_HOME` | competitors/halo-mtp-regress-20261012/mtp-append-det/gatelib.py, crates/hipfire-cli/src/main.rs | stable |
 | `HIPFIRE_HOST` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-generate/src/qwen.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
 | `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs | stable |
@@ -1435,7 +1435,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_JIT_JOBS` | crates/hipfire-loader/src/lib.rs, crates/rdna-compute/src/compile_jobs.rs | developer |
-| `HIPFIRE_KERNEL_CACHE` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_KERNEL_CACHE` | benchmarks/scripts/mq4v2_k5120_abba.sh, competitors/halo-mtp-regress-20261012/mtp-append-det/gatelib.py | stable |
 | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs | harness |
 | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
@@ -1462,7 +1462,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LOAD_TIMEOUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_LOAD_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/load.rs | developer |
 | `HIPFIRE_LOCAL` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-cli/src/main.rs | stable |
-| `HIPFIRE_LOCK_DIR` | crates/hipfire-cli/src/main.rs, crates/hipfire-daemon/src/gpu_lock.rs | developer |
+| `HIPFIRE_LOCK_DIR` | competitors/halo-mtp-regress-20261012/mtp-append-det/append8k_profile.py, competitors/halo-mtp-regress-20261012/mtp-append-det/gatelib.py | developer |
 | `HIPFIRE_LOG` | crates/hipfire-daemon/src/main.rs | developer |
 | `HIPFIRE_LOG_FORMAT` | crates/hipfire-daemon/src/main.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_LOWBIT_WMMA_WAVES` | crates/rdna-compute/src/gemm.rs | developer |
@@ -1604,32 +1604,32 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_FILL_ORACLE_DIR` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | harness |
 | `HIPFIRE_MTP_FILL_ORACLE_OUT` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | harness |
 | `HIPFIRE_MTP_FILL_PM_GEMM` | crates/hipfire-arch-qwen35/src/mtp_head.rs, crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs | developer |
-| `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` | competitors/halo-mtp-regress-20261012/mtp-append-det/gatelib.py, competitors/halo-mtp-regress-20261012/mtp-append-det/serve_cells.py | developer |
 | `HIPFIRE_MTP_GPU_ACCEPT` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_HEAD_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/mtp_head.rs | developer |
 | `HIPFIRE_MTP_IDENTITY_ARM` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | harness |
 | `HIPFIRE_MTP_IDENTITY_CASE` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | harness |
-| `HIPFIRE_MTP_IDENTITY_MODEL` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | harness |
+| `HIPFIRE_MTP_IDENTITY_MODEL` | competitors/halo-mtp-regress-20261012/mtp-append-det/fill_state.py, competitors/halo-mtp-regress-20261012/mtp-append-det/sampled_arm.py | harness |
 | `HIPFIRE_MTP_IDENTITY_OUT` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | harness |
-| `HIPFIRE_MTP_INCREMENTAL` | crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_INCREMENTAL` | competitors/halo-mtp-regress-20261012/mtp-append-det/sampled_arm.py, crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs | developer |
 | `HIPFIRE_MTP_K` | crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_MTP_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
 | `HIPFIRE_MTP_NGRAM` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | stable |
 | `HIPFIRE_MTP_NGRAM_K` | scripts/serve_harness.py | harness |
 | `HIPFIRE_MTP_OWN_PREFILL` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs | developer |
 | `HIPFIRE_MTP_PAIRING` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | developer |
-| `HIPFIRE_MTP_PHASE_TIMING` | crates/hipfire-arch-qwen35/src/mtp_cb.rs, crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_PHASE_TIMING` | competitors/halo-mtp-regress-20261012/driver.py, crates/hipfire-arch-qwen35/src/mtp_cb.rs | developer |
 | `HIPFIRE_MTP_PROPOSAL_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_Q8_VERIFY_WMMA` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
-| `HIPFIRE_MTP_SAMPLED` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | stable |
-| `HIPFIRE_MTP_SAMPLED_MODE` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | developer |
+| `HIPFIRE_MTP_SAMPLED` | competitors/halo-mtp-regress-20261012/mtp-append-det/sampled_arm.py, crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | stable |
+| `HIPFIRE_MTP_SAMPLED_MODE` | competitors/halo-mtp-regress-20261012/mtp-append-det/sampled_arm.py, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_SMOKE_HEAD` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs | harness |
 | `HIPFIRE_MTP_SMOKE_TRUNK` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs | harness |
 | `HIPFIRE_MTP_SNAPSHOT_OVERLAP` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_TAKEOVER_FILL_ARM` | crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | harness |
 | `HIPFIRE_MTP_TAPE_REPLAY` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
-| `HIPFIRE_MTP_TRACE` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_MTP_TRACE` | competitors/halo-mtp-regress-20261012/driver.py, competitors/halo-mtp-regress-20261012/mtp-append-det/serve_cells.py | developer |
 | `HIPFIRE_MTP_VERIFY_DECOUPLE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_MUSE_QKVG_ALLOW_BITDIFF` | crates/rdna-compute/examples/test_gemm_qkvza_hfq4g256.rs | harness |
 | `HIPFIRE_MUSE_QKVG_TOL_ABS` | crates/rdna-compute/examples/test_gemm_qkvza_hfq4g256.rs | harness |
@@ -1643,9 +1643,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_NGRAM_MOD_N_MIN` | crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_NGRAM_WINDOW` | crates/hipfire-config/src/lib.rs, crates/hipfire-generate/src/ar.rs | stable |
 | `HIPFIRE_NORMALIZE_PROMPT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/build_kld_ref_native_gemma4.rs | stable |
-| `HIPFIRE_NO_DEVICE_COMPILER` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/compiler.rs | experimental |
+| `HIPFIRE_NO_DEVICE_COMPILER` | competitors/halo-mtp-regress-20261012/mtp-append-det/fill_state.py, competitors/halo-mtp-regress-20261012/mtp-append-det/gatelib.py | experimental |
 | `HIPFIRE_NO_Q8_ROUTER` | crates/hipfire-quantize/src/pipeline.rs | developer |
-| `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-cli/tests/run_stats.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_NO_REGISTRY_FETCH` | competitors/halo-mtp-regress-20261012/mtp-append-det/gatelib.py, crates/hipfire-cli/tests/run_stats.rs | stable |
 | `HIPFIRE_NO_SPILL` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_NPU_SPILLOVER` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_OFFLOAD_DEBUG` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/rdna-compute/src/dispatch.rs | developer |
@@ -1794,8 +1794,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_MQ6_X4_PM` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QWEN4_MQ6_X4_REGIONS` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MQ6_X4_TILE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_MTP_APPEND_DET` | crates/hipfire-arch-qwen4/src/mtp_gpu.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
-| `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | crates/hipfire-arch-qwen4/examples/qwen4_mtp_fill.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_QWEN4_MTP_APPEND_DET` | competitors/halo-mtp-regress-20261012/mtp-append-det/analyze_serve.py, competitors/halo-mtp-regress-20261012/mtp-append-det/append8k_profile.py | developer |
+| `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | competitors/halo-mtp-regress-20261012/mtp-append-det/fill_state.py, crates/hipfire-arch-qwen4/examples/qwen4_mtp_fill.rs | developer |
 | `HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
@@ -1972,13 +1972,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ROWS_GDN` | crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_S4_FLAG_PROBE_UNSET_OFF` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_S4_FLAG_PROBE_UNSET_ON` | crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_SAMPLED_MTP_ARM` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_ARM` | competitors/halo-mtp-regress-20261012/mtp-append-det/sampled_arm.py, crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_CONFIG` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_FREQUENCY_PENALTY` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_GREEDY_TOKENS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_LATE_TOKENS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_MIN_P` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
-| `HIPFIRE_SAMPLED_MTP_OUT` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_OUT` | competitors/halo-mtp-regress-20261012/mtp-append-det/sampled_arm.py, competitors/halo-mtp-regress-20261012/mtp-append-det/sampled_final.py | harness |
 | `HIPFIRE_SAMPLED_MTP_PRESENCE_PENALTY` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_PROMPT` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_RENDER` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
@@ -1991,7 +1991,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SAMPLED_MTP_TOKENS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOP_K` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOP_P` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
-| `HIPFIRE_SAMPLED_MTP_TRIALS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_TRIALS` | competitors/halo-mtp-regress-20261012/mtp-append-det/sampled_arm.py, crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLE_COMPARE` | crates/hipfire-runtime/src/llama.rs, crates/saddle-lab/examples/infer_qwen35.rs | developer |
 | `HIPFIRE_SAMPLE_FAST` | crates/hipfire-runtime/examples/sample_batch_exact_oracle.rs, crates/rdna-compute/examples/sample_parallel_stable_parity.rs | developer |
 | `HIPFIRE_SAMPLE_PARALLEL` | crates/hipfire-runtime/examples/sample_batch_exact_oracle.rs, crates/hipfire-runtime/src/batch_sampler.rs | developer |
