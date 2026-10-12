@@ -6,6 +6,12 @@
 
 use crate::arch_caps::ArchCaps;
 
+/// G80 activation producer and exact integer BF16 epilogue (logged PM gaps).
+pub const NPU_TRUNK_SRC: &str = include_str!("../../../kernels/src/npu_trunk.hip");
+/// Certified signed-IU8 WMMA and BF16/F32 scatter, exact gfx1151.
+pub const NPU_TRUNK_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/npu_trunk_pm_gfx1151.hxaco");
+pub const NPU_TRUNK_PM_GFX1151_SHA256: &str = "b39f1b52b5da2bf9ca04304655ea6fada7fedff05f7c96b993d7f379ff7cc353";
+
 /// GEMV F32: y = alpha * A * x + beta * y
 /// Uses shared memory reduction across wavefronts.
 pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");

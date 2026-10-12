@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! CPU-only weight preparation and program selection for the opt-in Flash-Next
-//! NPU trunk. Deployment and numerical references live in pm-npu; no device opens here.
+//! Weight preparation, program selection and thin GPU glue for the opt-in
+//! Flash-Next NPU trunk. References live in pm-npu; no device opens here.
 
 mod config;
+mod gpu;
 mod packing;
 mod programs;
 mod shapes;

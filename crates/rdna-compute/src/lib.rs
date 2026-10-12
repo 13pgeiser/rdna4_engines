@@ -46,6 +46,7 @@ pub mod pm_decode_twins;
 pub mod pm_xbatch;
 pub mod pm_mtp_gemm;
 pub mod lane_rows_pm;
+pub mod npu_trunk;
 pub mod verify_twins;
 pub mod page_pool;
 pub mod pool;

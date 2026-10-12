@@ -26,6 +26,12 @@ sha2.workspace = true
 
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }
+pm-npu = { path = "../pm-npu" }
+half.workspace = true
+
+[[example]]
+name = "npu_trunk_glue_check"
+required-features = ["lab"]
 
 # ---------------------------------------------------------------------------
 # Archived research probes.

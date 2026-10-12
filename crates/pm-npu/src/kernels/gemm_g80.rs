@@ -677,3 +677,17 @@ pub fn pack_b_bf16(design: &ArrayDesign, b: &[i8], scales: &[(u16, i16)]) -> Vec
     } } }
     out
 }
+
+/// Byte offset of one BF16 value in a G80 output panel, padded to M256.
+/// Panels are concatenated by the host; this offset is relative to one panel.
+pub fn bf16_output_offset(padded_rows: usize, row: usize, col: usize) -> usize {
+    assert!(padded_rows > 0 && padded_rows % WAVE_M == 0);
+    assert!(row < padded_rows && col < WAVE_N);
+    let waves = padded_rows / WAVE_M;
+    let tile = col / TN;
+    let rho = 2 * ((row % WAVE_M) / TM) + tile % 2;
+    let base = ((tile / 2) * waves * ROWS + (rho / 2) * waves * 2
+        + (row / WAVE_M) * 2 + rho % 2) * bf16::OUT_BYTES;
+    let (r, c) = (row % TM, col % TN);
+    base + 2 * ((r / 8 * NB + c / 8) * 64 + (r % 8) * 8 + c % 8)
+}
