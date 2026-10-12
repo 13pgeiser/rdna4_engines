@@ -7159,6 +7159,20 @@ pub mod memory {
         PathBuf::from(path)
     }
 
+    /// Suffix of a Flash-Next trunk overlay sidecar: pre-encoded QT44 trunk
+    /// tensors (an HFQM container bound to its base by size and index
+    /// sha256) that the Qwen4 loader substitutes for the base's tensors.
+    pub const TRUNK_OVERLAY_SIDECAR_SUFFIX: &str = ".trunk-overlay";
+
+    /// Path of the trunk overlay sidecar of `model`: `<model file
+    /// name>.trunk-overlay`, appended to the full file name (extension
+    /// included), the same placement as [`ple_sidecar_path`].
+    pub fn trunk_overlay_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(TRUNK_OVERLAY_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
     /// Optional override of the PLE hot-rank sidecar path
     /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.
     pub fn ple_hot_rank_file() -> Option<String> {
@@ -7441,6 +7455,18 @@ pub mod memory {
             assert_eq!(
                 ple_sidecar_path(Path::new("model"), PleFormat::Q4),
                 PathBuf::from("model.ple-q4")
+            );
+        }
+
+        #[test]
+        fn trunk_overlay_sidecar_path_appends_to_full_file_name() {
+            assert_eq!(
+                trunk_overlay_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
+                PathBuf::from("/m/qwen3.8-flash-next.mq4-xts.trunk-overlay")
+            );
+            assert_eq!(
+                trunk_overlay_sidecar_path(Path::new("model")),
+                PathBuf::from("model.trunk-overlay")
             );
         }
 

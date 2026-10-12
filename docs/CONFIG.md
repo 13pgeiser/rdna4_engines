@@ -847,6 +847,33 @@ warm; the prewarm continues after it. The pages are ordinary clean page
 cache, dropped (never swapped) under memory pressure and not charged in
 admission.
 
+### Qwen4 trunk overlay sidecar
+
+`<model>.trunk-overlay` (for the stock XTS artifact,
+`qwen3.8-flash-next.mq4-xts.trunk-overlay`, ~305 MB) holds pre-encoded QT44
+tensors that replace the base's MQ6 `linear_attn.in_proj_{z,a,b}` matrices at
+load and arm the trunk A4 route default its manifest names
+(`gfx1151-zab-v1`: the GDN Z, alpha and beta projections on exact gfx1151). It
+is an HFQM container whose metadata records the base it was built for, and a
+load binds it before using it: same architecture id, same base file size, same
+sha256 over the base's header and tensor index (the bytes before the data
+section), and every listed tensor present in the base with the recorded
+quant type, size and shape. Each payload's sha256 is verified when it is read
+for upload. A sidecar that fails any check, names an unknown default, is not
+for a Flash-Next profile, or sits next to a base that already carries a trunk
+default marker is refused with one `REFUSED` line on stderr and the base
+weights run; an absent sidecar logs nothing.
+
+Env `HIPFIRE_QWEN4_TRUNK_OVERLAY` selects the policy: `auto` (default; also
+unset) applies the sidecar only on the architecture of its default (gfx1151),
+`0` never applies it (kill switch: stock base weights, one log line), `1`
+applies it on any architecture (the A4 route still arms by default only on
+its exact architecture; elsewhere set `HIPFIRE_QWEN4_TRUNK_IU4`). Any other
+value fails the load. `HIPFIRE_QWEN4_TRUNK_IU4=0` keeps the overlay weights
+and disables the A4 route. `hipfire-quantize trunk-overlay` builds the file
+from a directory of QT44 payloads (`--base`, `--qt44-payload-dir`, `--suffix`
+(repeatable), `--trunk-iu4-default`, `--output`).
+
 ---
 
 ## Shared-weight host (developer, Linux, default off)

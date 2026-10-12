@@ -1322,6 +1322,15 @@ pub fn load_qwen4_rank(
         // run would otherwise fail after the weights were fulfilled.
         hipfire_arch_qwen4::bundle::admit_executable_profile(&receipt.config)
             .map_err(|error| format!("qwen4: {error}"))?;
+        // The trunk overlay sidecar (`<model>.trunk-overlay`): bound to this
+        // base while it is open, applied by `attach_forward`.  Only a bad
+        // `HIPFIRE_QWEN4_TRUNK_OVERLAY` value fails the load.
+        let trunk_overlay = hipfire_arch_qwen4::resolve_trunk_overlay(
+            &hfq,
+            std::path::Path::new(ctx.path),
+            &ctx.gpu.arch,
+            &receipt.config,
+        )?;
         // The profile is known: the head-free MTP and developer-PLE refusals
         // happen here, before any allocation (source admission applies the
         // same checks).
@@ -1924,6 +1933,13 @@ pub fn load_qwen4_rank(
                 let detail = error.to_string();
                 let _ = bundle.free_gpu(ctx.gpu);
                 return Err(format!("qwen4: PLE hot store setup failed: {detail}"));
+            }
+        }
+        if let Some(overlay) = trunk_overlay {
+            if let Err(error) = bundle.attach_trunk_overlay(overlay) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: trunk overlay setup failed: {detail}"));
             }
         }
         if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq, scratch_mode) {
