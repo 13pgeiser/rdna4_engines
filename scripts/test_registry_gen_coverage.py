@@ -181,6 +181,121 @@ def test_flash_next_xts_requires_both_names_and_new_tag():
         assert any("missing" in error for error in errors)
 
 
+STOCK_XTS_TAGS = tuple(rg.FLASH_NEXT_XTS_WIRE_FILES)
+
+
+def _overlay_pin() -> dict:
+    return {
+        "file": rg.FLASH_NEXT_TRUNK_OVERLAY_FILE,
+        "sha256": rg.FLASH_NEXT_TRUNK_OVERLAY_SHA256,
+        "size_bytes": rg.FLASH_NEXT_TRUNK_OVERLAY_SIZE,
+    }
+
+
+def test_trunk_overlay_is_declared_on_exactly_the_stock_xts_tags():
+    assert rg.FLASH_NEXT_TRUNK_OVERLAY_FILE == "qwen3.8-flash-next.mq4-xts.trunk-overlay"
+    for path in ("models.json", "v1.json"):
+        models = _load(REPO_ROOT / "registry" / path)["models"]
+        declared = sorted(tag for tag, entry in models.items() if "trunk_overlay" in entry)
+        assert declared == sorted(STOCK_XTS_TAGS), path
+        for tag in STOCK_XTS_TAGS:
+            assert models[tag]["trunk_overlay"] == _overlay_pin(), f"{path} {tag}"
+            assert "HIPFIRE_QWEN4_TRUNK_OVERLAY=0" in models[tag]["desc"], f"{path} {tag}"
+
+
+def _build_with_overlay_tree(monkeypatch, tree_extra, mutate_curated=None):
+    """build_registry over the committed catalog, the HF tree of the Flash-Next repo
+    rebuilt from v1.json plus `tree_extra` (path -> tree item)."""
+    v1 = _load(REPO_ROOT / "registry" / "v1.json")
+    curated = _load(REPO_ROOT / "registry" / "models.json")
+    if mutate_curated is not None:
+        mutate_curated(curated)
+    trees = _trees_from(v1)
+    trees[rg.FLASH_NEXT_XTS_REPO] = {**trees[rg.FLASH_NEXT_XTS_REPO], **tree_extra}
+
+    def fake_repo_tree(repo, token):
+        if repo not in trees:
+            raise RuntimeError(f"{repo}: not published")
+        return trees[repo]
+
+    messages = []
+    monkeypatch.setattr(rg, "repo_tree", fake_repo_tree)
+    monkeypatch.setattr(rg, "log", messages.append)
+    registry, errors = rg.build_registry(curated, None)
+    return registry, errors, messages
+
+
+def test_trunk_overlay_tree_without_the_file_keeps_the_curated_pin(monkeypatch):
+    # The overlay is not uploaded yet: the HF tree lacks it, the curated pin is
+    # kept verbatim and the run still succeeds (offline reproducibility relies on it).
+    registry, errors, messages = _build_with_overlay_tree(monkeypatch, {})
+    assert not errors, errors
+    assert sum("keeping the curated pin" in message for message in messages) == len(STOCK_XTS_TAGS)
+    for tag in STOCK_XTS_TAGS:
+        assert registry["models"][tag]["trunk_overlay"] == _overlay_pin()
+
+
+def test_trunk_overlay_tree_listing_the_pinned_file_is_accepted(monkeypatch):
+    pin = _overlay_pin()
+    item = _tree_item(pin["file"], pin["sha256"], pin["size_bytes"])
+    registry, errors, messages = _build_with_overlay_tree(monkeypatch, {pin["file"]: item})
+    assert not errors, errors
+    assert not any("keeping the curated pin" in message for message in messages)
+    for tag in STOCK_XTS_TAGS:
+        assert registry["models"][tag]["trunk_overlay"] == pin
+
+
+@pytest.mark.parametrize("drift", ["sha256", "size", "not_lfs"])
+def test_trunk_overlay_tree_drift_from_the_pin_fails_closed(monkeypatch, drift):
+    pin = _overlay_pin()
+    sha, size = pin["sha256"], pin["size_bytes"]
+    if drift == "sha256":
+        sha = "a" * 64
+    elif drift == "size":
+        size += 1
+    item = _tree_item(pin["file"], None if drift == "not_lfs" else sha, size)
+    registry, errors, _ = _build_with_overlay_tree(monkeypatch, {pin["file"]: item})
+    assert registry is None
+    for tag in STOCK_XTS_TAGS:
+        assert any(error.startswith(f"{tag}: trunk_overlay") for error in errors), errors
+
+
+@pytest.mark.parametrize("missing", ["sha256", "size_bytes"])
+def test_trunk_overlay_requires_a_curated_pin(monkeypatch, missing):
+    def drop(curated):
+        del curated["models"]["qwen3.8:flash-next-mq4-xts"]["trunk_overlay"][missing]
+
+    registry, errors, _ = _build_with_overlay_tree(monkeypatch, {}, drop)
+    assert registry is None
+    assert any(
+        error.startswith("qwen3.8:flash-next-mq4-xts: trunk_overlay")
+        and "needs a curated sha256 and size_bytes pin" in error
+        for error in errors
+    ), errors
+
+
+@pytest.mark.parametrize("key,value", [
+    ("file", "qwen3.8-flash-next-gptq3.mq4.trunk-overlay"),
+    ("sha256", "a" * 64),
+    ("size_bytes", rg.FLASH_NEXT_TRUNK_OVERLAY_SIZE - 1),
+])
+def test_trunk_overlay_stock_tag_drift_is_rejected(key, value):
+    models = _load(REPO_ROOT / "registry" / "v1.json")["models"]
+    models["qwen3.8:flash-next"]["trunk_overlay"][key] = value
+    errors = []
+    rg.validate_flash_next_xts(models, errors)
+    assert any("trunk_overlay must be" in error for error in errors), errors
+
+
+@pytest.mark.parametrize("tag", ["qwen3.8:flash-next-rtn-asym", "qwen3.8:flash-next-mq4-xts-zab"])
+def test_trunk_overlay_is_rejected_off_the_stock_tags(tag):
+    models = _load(REPO_ROOT / "registry" / "v1.json")["models"]
+    models[tag]["trunk_overlay"] = _overlay_pin()
+    errors = []
+    rg.validate_flash_next_xts(models, errors)
+    assert any(error.startswith(f"{tag}: trunk_overlay is only valid") for error in errors), errors
+
+
 def _rust_str_list(name: str) -> set[str]:
     src = (REPO_ROOT / "crates" / "hipfire-config" / "src" / "lib.rs").read_text()
     m = re.search(rf"const {name}: &\[&str\] = &\[(.*?)\];", src, re.S)

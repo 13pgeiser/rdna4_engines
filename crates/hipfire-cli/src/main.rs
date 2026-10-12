@@ -1971,6 +1971,7 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("CLIP", entry.clip.as_ref()),
         ("Qwen3", entry.qwen3.as_ref()),
         ("VAE", entry.vae.as_ref()),
+        ("Trunk overlay", entry.trunk_overlay.as_ref()),
     ] {
         let Some(sidecar) = sidecar else {
             continue;
@@ -2225,6 +2226,7 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
                 &entry.t5,
                 &entry.clip,
                 &entry.vae,
+                &entry.trunk_overlay,
             ]
             .into_iter()
             .flatten()
@@ -2373,6 +2375,12 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             .into_iter()
             .filter(|sidecar| sidecar.is_file()),
     );
+    // A trunk overlay rides with its base: the registry-declared file (also
+    // reached through a legacy-named link) and `<resolved file>.trunk-overlay`.
+    let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(&path);
+    if overlay.is_file() {
+        targets.insert(overlay);
+    }
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
         let kept = paths.models.join(file);
@@ -8490,6 +8498,7 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
                 entry.vision.as_ref(),
                 entry.ple_q4.as_ref(),
                 entry.ple_q8.as_ref(),
+                entry.trunk_overlay.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -8507,7 +8516,16 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
 /// suffix-only test hides exactly those models.
 pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
     !ple::is_ple_sidecar_name(name)
+        && !is_trunk_overlay_name(name)
         && (is_model_file(name) || registry.models.values().any(|entry| entry.file == name))
+}
+
+/// True for a Flash-Next trunk overlay sidecar (`<base>.trunk-overlay`): an
+/// HFQM container of pre-encoded QT44 tensors that belongs to its base and is
+/// never a model on its own.
+fn is_trunk_overlay_name(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .ends_with(hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX)
 }
 
 /// True when `name` can actually serve a completion, as opposed to merely
@@ -17216,6 +17234,189 @@ mod tests {
         assert_eq!(listed, ["split-model-base.mq4", "split-model.mq4"]);
         assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q8"));
         assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q4"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    // ---- Flash-Next trunk overlay sidecar: pull, rm, listings -----------------
+
+    const OVERLAY_BASE: &[u8] = b"overlay-base-bytes";
+    const OVERLAY_BYTES: &[u8] = b"pre-encoded-qt44-overlay-bytes";
+
+    fn overlay_registry_raw() -> String {
+        format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "overlay-model":{{
+                    "repo":"test/repo","file":"overlay-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},
+                    "trunk_overlay":{{"file":"overlay-model.mq4.trunk-overlay","sha256":"{}","size_bytes":{}}}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            ple_sha(OVERLAY_BASE),
+            OVERLAY_BASE.len(),
+            ple_sha(OVERLAY_BYTES),
+            OVERLAY_BYTES.len(),
+        )
+    }
+
+    fn pull_overlay_model(paths: &Paths, force: bool) {
+        pull_command(
+            paths,
+            PullArgs {
+                model: "overlay-model".into(),
+                force,
+                ple: ple::PleSelection::Auto,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pull_downloads_and_verifies_the_trunk_overlay_once() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-pull");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let overlay = paths.models.join("overlay-model.mq4.trunk-overlay");
+
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            OVERLAY_BYTES.to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        assert_eq!(
+            fs::read(paths.models.join("overlay-model.mq4")).unwrap(),
+            OVERLAY_BASE
+        );
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // A valid file on disk is not downloaded again (an empty server would
+        // refuse any request; the invocation counter proves none was made).
+        let (base, handle) = exact_http_server(std::collections::HashMap::new());
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+
+        // A stale overlay is refreshed and re-verified.
+        fs::write(&overlay, b"stale").unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            OVERLAY_BYTES.to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf3 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3));
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_never_installs_a_trunk_overlay_that_fails_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-pull-corrupt");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        // Same length as the pinned payload, different bytes: the digest rejects it.
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            vec![b'x'; OVERLAY_BYTES.len()],
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        assert!(paths.models.join("overlay-model.mq4").is_file());
+        assert!(
+            !paths.models.join("overlay-model.mq4.trunk-overlay").exists(),
+            "a failed verification must not leave the overlay installed"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_the_trunk_overlay_with_its_base() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-rm");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["overlay-model.mq4", "overlay-model.mq4.trunk-overlay", "untouched.mq4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "overlay-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("overlay-model.mq4").exists());
+        assert!(!paths.models.join("overlay-model.mq4.trunk-overlay").exists());
+        assert!(paths.models.join("untouched.mq4").exists());
+
+        // An unregistered base takes its `<file>.trunk-overlay` with it too.
+        for file in ["local.mq4", "local.mq4.trunk-overlay"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "local.mq4".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("local.mq4").exists());
+        assert!(!paths.models.join("local.mq4.trunk-overlay").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn trunk_overlays_are_never_listed_or_served_as_models() {
+        let paths = test_paths("overlay-listing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay listing").unwrap();
+        let overlays = [
+            "overlay-model.mq4.trunk-overlay",
+            "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            "unregistered.mq4.trunk-overlay",
+        ];
+        for name in overlays {
+            assert!(!is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                !is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        assert!(registry_sidecar_files(&registry).contains("overlay-model.mq4.trunk-overlay"));
+        for name in overlays.iter().chain(&["overlay-model.mq4"]) {
+            fs::write(paths.models.join(name), b"x").unwrap();
+        }
+        let listed: Vec<String> = local_model_paths(&paths, &registry)
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(listed, ["overlay-model.mq4"]);
         fs::remove_dir_all(&paths.root).unwrap();
     }
 }

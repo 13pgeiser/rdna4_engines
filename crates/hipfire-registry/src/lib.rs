@@ -271,6 +271,15 @@ pub struct ModelEntry {
     /// Same placement rules as `ple_q8`.
     #[serde(default)]
     pub ple_q4: Option<Sidecar>,
+    /// Flash-Next trunk overlay sidecar (`<file>.trunk-overlay`): pre-encoded
+    /// QT44 trunk tensors, an HFQM container bound to its base by size and
+    /// index sha256. The Qwen4 loader applies it by default on gfx1151
+    /// (`HIPFIRE_QWEN4_TRUNK_OVERLAY=0` is the kill switch). The file name must
+    /// be exactly `<base file>.trunk-overlay`; for the pinned XTS monolithic
+    /// the base file is the canonical name whichever legacy spelling the wire
+    /// entry uses, because upgraded clients normalize all four tags to it.
+    #[serde(default)]
+    pub trunk_overlay: Option<Sidecar>,
     /// Alternative `lm_head` carriers, keyed by short name (`q4k`, `bf16`).
     ///
     /// Each is a single-tensor `.hfq` from `hipfire-quantize --head-only` that
@@ -490,6 +499,7 @@ impl RegistryV1 {
                 &entry.vae,
                 &entry.ple_q4,
                 &entry.ple_q8,
+                &entry.trunk_overlay,
             ]
             .into_iter()
             .flatten()
@@ -518,6 +528,26 @@ impl RegistryV1 {
                 if sidecar.file != expected {
                     return Err(fail(format!(
                         "model '{tag}' {slot} file '{}' must be '{expected}'",
+                        sidecar.file
+                    )));
+                }
+            }
+            if let Some(sidecar) = &entry.trunk_overlay {
+                let base = if entry.is_flash_next_xts() {
+                    FLASH_NEXT_XTS_CANONICAL_FILE
+                } else {
+                    entry.file.as_str()
+                };
+                let expected = format!(
+                    "{base}{}",
+                    hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX
+                );
+                if sidecar.file.contains('/')
+                    || sidecar.file.contains('\\')
+                    || sidecar.file != expected
+                {
+                    return Err(fail(format!(
+                        "model '{tag}' trunk_overlay file '{}' must be '{expected}'",
                         sidecar.file
                     )));
                 }
@@ -1173,6 +1203,145 @@ mod tests {
                 }
             );
             assert_eq!(entry.recommended_settings, zab.recommended_settings);
+        }
+    }
+
+    const TRUNK_OVERLAY_FILE: &str = "qwen3.8-flash-next.mq4-xts.trunk-overlay";
+
+    fn trunk_overlay_sidecar(file: &str, sha256: &str) -> Sidecar {
+        Sidecar {
+            file: file.into(),
+            sha256: Some(sha256.into()),
+            size_bytes: Some(305_516_544),
+        }
+    }
+
+    fn parse_wire(wire: &RegistryV1) -> Result<RegistryV1> {
+        RegistryV1::parse(&serde_json::to_string(wire).unwrap(), "fixture")
+    }
+
+    #[test]
+    fn trunk_overlay_is_accepted_on_every_xts_spelling() {
+        let mut wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+        for entry in wire.models.values_mut() {
+            entry.trunk_overlay = Some(trunk_overlay_sidecar(TRUNK_OVERLAY_FILE, &digest('d')));
+        }
+        let parsed = parse_wire(&wire).unwrap();
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            let entry = &parsed.models[tag];
+            assert_eq!(entry.file, FLASH_NEXT_XTS_CANONICAL_FILE, "{tag}");
+            assert_eq!(
+                entry.trunk_overlay,
+                Some(trunk_overlay_sidecar(TRUNK_OVERLAY_FILE, &digest('d'))),
+                "{tag}"
+            );
+        }
+        // The sidecar slot survives a serialize/parse round trip.
+        assert_eq!(parse_wire(&parsed).unwrap().models, parsed.models);
+    }
+
+    #[test]
+    fn trunk_overlay_on_a_non_xts_entry_follows_its_own_file() {
+        let mut wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+        let mut entry = pinned_flash_next_entry("other-model.mq4");
+        entry.sha256 = None;
+        entry.size_bytes = None;
+        assert!(!entry.is_flash_next_xts());
+        entry.trunk_overlay = Some(trunk_overlay_sidecar(
+            "other-model.mq4.trunk-overlay",
+            &digest('d'),
+        ));
+        wire.models.insert("other:model".into(), entry);
+        assert!(parse_wire(&wire).is_ok());
+
+        let entry = wire.models.get_mut("other:model").unwrap();
+        entry.trunk_overlay = Some(trunk_overlay_sidecar(TRUNK_OVERLAY_FILE, &digest('d')));
+        let error = parse_wire(&wire).unwrap_err().to_string();
+        assert!(error.contains("must be 'other-model.mq4.trunk-overlay'"), "{error}");
+    }
+
+    #[test]
+    fn trunk_overlay_rejects_misnamed_files_and_malformed_digests() {
+        let misnamed = [
+            // legacy-spelled base: the overlay is named after the canonical file
+            "qwen3.8-flash-next-gptq3.mq4.trunk-overlay",
+            "qwen3.8-flash-next.mq4-xts",
+            "qwen3.8-flash-next.mq4-xts.ple-q8",
+            "other.trunk-overlay",
+            "sub/qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            "../qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            "sub\\qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            "/qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            "  ",
+        ];
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            for file in misnamed {
+                let mut wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+                wire.models.get_mut(tag).unwrap().trunk_overlay =
+                    Some(trunk_overlay_sidecar(file, &digest('d')));
+                let error = parse_wire(&wire).unwrap_err().to_string();
+                assert!(
+                    error.contains("must be") || error.contains("empty sidecar file"),
+                    "{tag} {file:?}: {error}"
+                );
+            }
+            for sha in ["8b15b6".to_owned(), "g".repeat(64), digest('d')[..63].to_owned()] {
+                let mut wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+                wire.models.get_mut(tag).unwrap().trunk_overlay =
+                    Some(trunk_overlay_sidecar(TRUNK_OVERLAY_FILE, &sha));
+                let error = parse_wire(&wire).unwrap_err().to_string();
+                assert!(error.contains("invalid SHA-256"), "{tag} {sha:?}: {error}");
+            }
+        }
+        let mut value = serde_json::to_value(flash_next_wire_registry("2099-01-01T00:00:00Z"))
+            .unwrap();
+        value["models"]["qwen3.8:flash-next"]["trunk_overlay"] = serde_json::json!({
+            "file": TRUNK_OVERLAY_FILE,
+            "unknown": 1
+        });
+        assert!(
+            RegistryV1::parse(&value.to_string(), "fixture").is_err(),
+            "the slot stays deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn bundled_registry_declares_trunk_overlay_on_exactly_the_stock_xts_tags() {
+        let wire: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        let curated: serde_json::Value =
+            serde_json::from_str(include_str!("../../../registry/models.json")).unwrap();
+        let mut declared = Vec::new();
+        for (tag, entry) in &wire.models {
+            if entry.trunk_overlay.is_some() {
+                declared.push(tag.as_str());
+            }
+        }
+        let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(declared, expected);
+        assert!(wire.models["qwen3.8:flash-next-rtn-asym"].trunk_overlay.is_none());
+        assert!(wire.models["qwen3.8:flash-next-mq4-xts-zab"]
+            .trunk_overlay
+            .is_none());
+        let first = wire.models["qwen3.8:flash-next"].trunk_overlay.clone().unwrap();
+        assert_eq!(first.file, TRUNK_OVERLAY_FILE);
+        assert!(first.sha256.is_some() && first.size_bytes.is_some());
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            let slot = wire.models[tag].trunk_overlay.as_ref().unwrap();
+            assert_eq!(slot, &first, "{tag}: one overlay pin for every stock tag");
+            let curated_slot: Sidecar =
+                serde_json::from_value(curated["models"][tag]["trunk_overlay"].clone()).unwrap();
+            assert_eq!(slot.file, curated_slot.file, "{tag}");
+            assert_eq!(slot.sha256, curated_slot.sha256, "{tag}");
+            assert_eq!(slot.size_bytes, curated_slot.size_bytes, "{tag}");
+            assert!(
+                wire.models[tag].desc.contains("HIPFIRE_QWEN4_TRUNK_OVERLAY=0"),
+                "{tag}"
+            );
+        }
+        let parsed = bundled().unwrap();
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            assert_eq!(parsed.models[tag].trunk_overlay.as_ref(), Some(&first));
         }
     }
 
