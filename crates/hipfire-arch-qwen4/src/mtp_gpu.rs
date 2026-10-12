@@ -2025,7 +2025,7 @@ impl Qwen4MtpGpu {
             ));
         }
         let ep_bound = ep.is_some();
-        if max_seq == 0 || max_seq > config.max_position_embeddings {
+        if max_seq == 0 || max_seq > config.context_limit() {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
         let head = bound_mtp(weights)?;
@@ -2504,6 +2504,7 @@ impl Qwen4MtpGpu {
                 kv_heads: config.num_key_value_heads,
                 head_dim: config.head_dim,
                 rotary_dim: config.rotary_dim(),
+                rope: config.rope(),
                 input_width: hidden,
                 rotation: &scratch.rotation,
                 mode,
@@ -3064,6 +3065,7 @@ impl Qwen4MtpGpu {
                     rows,
                     // The one MTP layer keeps the exact F32 QSA state.
                     format: QsaKvFormat::F32,
+                    yarn: config.rope().yarn(config.head_dim.min(64)),
                 },
             )?;
             // Pool exactly the blocks these rows complete, from raw keys the
@@ -3085,6 +3087,7 @@ impl Qwen4MtpGpu {
                             rows,
                         }),
                         grid_bound: state.pooled_capacity,
+                        yarn: config.rope().yarn(w.index_kv_width.min(64)),
                     },
                 )?;
             }
