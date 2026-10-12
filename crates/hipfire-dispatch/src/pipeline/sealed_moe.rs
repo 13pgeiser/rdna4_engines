@@ -6883,6 +6883,7 @@ mod tests {
             ninepath_mq3l: false,
             ninepath_mq4v2: false,
             ninepath_mq6v2: false,
+            cpu_deferred_experts: false,
         })
     }
 
@@ -6899,7 +6900,9 @@ mod tests {
             ),
             path2_m_total: 0,
             force_mq4_grouped_fp16: false,
+            coalesced_verify: false,
             route,
+            cpu_deferred_experts: false,
         })
     }
 
