@@ -387,6 +387,19 @@ scale plane; codec in `crates/hipfire-runtime/src/mq_i4.rs`), valid only as
 per-expert entries of a Qwen4 artifact declaring `qwen4.expert_slabs` v1
 (`crates/hipfire-arch-qwen4/src/expert_slabs.rs`), and have no GPU kernels yet.
 
+**Producing the artifact.** `qwen4_i4_slabs` (`crates/hipfire-quantize/src/bin/qwen4_i4_slabs.rs`, writer
+`hipfire_quantize::i4_slabs::write_i4_expert_slabs`) packs the pinned MQ4-XTS Flash-Next HFQ plus R1
+per-expert NPZ records (`L{L}/E{e}.npz`: `gds/gc/dds/dc/sd/bits/grid/scale_rule`) into the slab container:
+trunk expert entries first (layer, expert, gate_up then down; qt 131/132, 133/134 or the unchanged 44/53
+slices of the published aggregates, chosen per expert by an allocation point or `--uniform w3|w2|mq4`), then
+every other source tensor byte-identically (legacy MTP aggregate experts included), plus the
+`qwen4.expert_slabs` and `qwen4.expert_slabs_provenance` metadata keys. Import accepts only `grid=uniform`,
+`sd` exactly 1.0 and the scale rules `mqi4-canonical-v1-rne-tree128`, `mqi4-recover-s1-v1`,
+`mqi4-recover-s2-v1`; scales must be exact f16 values. Verification cannot be disabled: every expert is
+decoded back to its codes and scale bits, the output is reopened and every payload plus the whole file is
+re-hashed, and `--cross-check-packs-w3/-w2` additionally compares each slab byte-for-byte with the Python R1
+pack. `--receipt` writes the JSON receipt. An existing `--out` is never overwritten.
+
 ### PARO4G128 probe payload
 
 `quant_type=28` is **not** row-major HFQ4/MQ4. Each tensor stores ParoQuant
