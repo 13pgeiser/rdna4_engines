@@ -1084,9 +1084,15 @@ fn rollback_failure(
     }))
 }
 
+/// Position-zero cache hit refusal. A valid cache hit resumes a session
+/// snapshot at `0 < start_pos < prompt_len` with exactly the prompt suffix, so
+/// `start_pos == 0` with `cache_hit == true` is an invalid zero-length cached
+/// prefix (it is not an empty fill: the fill is the complete 3-token prompt).
 fn cache_suffix_refusal() -> Value {
+    // expect_err: a cache hit at position zero is invalid; valid suffix cache
+    // hits (0 < start_pos < prompt_len) are supported and are not exercised here.
     let refusal = validate_native_mtp_prefill_request(&[1, 2, 3], &[1, 2, 3], 0, true)
-        .expect_err("cache-hit suffix must be refused");
+        .expect_err("position-zero cache hit must be refused");
     json!({
         "case": "cache_suffix_refusal",
         "status": "pass",
@@ -2525,10 +2531,26 @@ mod tests {
             .find(|scenario| field(scenario, "case").as_str() == Some("cache_suffix_refusal"))
             .expect("cache suffix refusal scenario");
         assert_eq!(field(cache, "cache_hit").as_bool(), Some(true));
-        assert!(field(cache, "refusal")
-            .as_str()
-            .unwrap()
-            .contains("cache-hit suffix"));
+        assert_eq!(field(cache, "prompt_len").as_u64(), Some(3));
+        assert_eq!(field(cache, "fill_len").as_u64(), Some(3));
+        assert_eq!(
+            field(cache, "refusal").as_str(),
+            Some("Qwen4 native MTP cache hit at 0 needs a non-empty suffix of a 3-token prompt")
+        );
+    }
+
+    #[test]
+    fn cache_suffix_refusal_reports_position_zero_cache_hit_refusal() {
+        let report = cache_suffix_refusal();
+        assert_pass(&report);
+        assert_eq!(field(&report, "case").as_str(), Some("cache_suffix_refusal"));
+        assert_eq!(field(&report, "cache_hit").as_bool(), Some(true));
+        assert_eq!(field(&report, "prompt_len").as_u64(), Some(3));
+        assert_eq!(field(&report, "fill_len").as_u64(), Some(3));
+        assert_eq!(
+            field(&report, "refusal").as_str(),
+            Some("Qwen4 native MTP cache hit at 0 needs a non-empty suffix of a 3-token prompt")
+        );
     }
 }
 
