@@ -1249,3 +1249,203 @@ fn timing32(m:usize,k:usize,ctl:Control) {
         eprintln!("MODEL (estimate, not measured) waves {waves}: I32 drain {} cycles, int8 {} cycles; estimated total I32 {} vs int8 {}",e32.output_dma_cycles,e8.output_dma_cycles,e32.estimated_cycles,e8.estimated_cycles);
     }
 }
+
+// ---------------------------------------------------------------- integer direct BF16
+fn bf16_scales(count: usize, seed: usize) -> Vec<(u16, i16)> {
+    (0..count).map(|i| {
+        if (i + seed) % 17 == 0 { (0, 0) }
+        else { ((16384 + (i * 7919 + seed * 1237) % 16384) as u16,
+            [-163, -110, -90, -70, -35, -18, 0, 45, 110][(i + seed) % 9]) }
+    }).collect()
+}
+
+fn submit_bf16(sim: &mut Config, d: &ArrayDesign, insts: &[u8], m: usize, k: usize,
+    a: &[i8], b: &[i8], ds: &[(u16, i16)], ss: &[(u16, i16)]) -> usize
+{
+    use pm_npu::kernels::{gemm_g80::{pack_a_bf16, pack_b_bf16}, w8a8_epi::bf16_direct};
+    let ah = pack_a_bf16(d, a, ds);
+    let bh = pack_b_bf16(d, b, ss);
+    let before_inputs = [signature(&ah), signature(&bh)];
+    let mut args = vec![ah, bh, vec![POISON; d.args[2].bytes]];
+    let before = traffic(sim);
+    let t0 = sim.ticks;
+    sim.submit(insts, &mut args).unwrap();
+    assert_eq!([signature(&args[0]), signature(&args[1])], before_inputs);
+    let raw = cpu_reference(a, b, m, N, k);
+    let want: Vec<_> = raw.iter().enumerate().map(|(at, &i)| {
+        let (sm, se) = ss[at % N]; let (dm, de) = ds[at / N];
+        i32::from(bf16_direct(i, sm, se, dm, de))
+    }).collect();
+    let got = d.unpack_out(&args[2]);
+    if let Some(at) = got.iter().zip(&want).position(|(g, w)| g != w) {
+        panic!("BF16 m={m} k={k} at ({},{}): I={} S={:?} D={:?} got {:04x} want {:04x}",
+            at / N, at % N, raw[at], ss[at % N], ds[at / N], got[at], want[at]);
+    }
+    // Rebuild the complete native arena, including every padded token.
+    let mut arena = vec![0u8; d.args[2].bytes];
+    for ((col, row), ranges) in d.output_tile_ranges() {
+        let rho = row as usize - 2;
+        for (wave, range) in ranges.iter().enumerate() {
+            assert_eq!(range.len(), 20480);
+            let (m0, n0) = (wave * 256 + rho / 2 * 128, (2 * col as usize + rho % 2) * 80);
+            for mb in 0..16 { for nb in 0..10 { for i in 0..8 { for j in 0..8 {
+                let token = m0 + mb * 8 + i; let feature = n0 + nb * 8 + j;
+                let bits = if token < m { want[token * N + feature] as u16 } else { 0 };
+                let off = range.start + ((mb * 10 + nb) * 64 + i * 8 + j) * 2;
+                arena[off..off + 2].copy_from_slice(&bits.to_le_bytes());
+            } } } }
+        }
+    }
+    assert_eq!(args[2], arena, "BF16 complete poisoned arena");
+    let (waves, kc) = (m.div_ceil(256), k / 64);
+    let sizes = [4 * waves * kc * 4608, 8 * kc * 2 * 5504, 8 * waves * 4 * 20480];
+    assert_eq!(d.args.iter().map(|a| a.bytes).collect::<Vec<_>>(), sizes);
+    let mut totals = [0u64; 2];
+    for (&(col, dir, ch, was), (_, _, _, now)) in before.iter().zip(traffic(sim)) {
+        let bytes = now - was;
+        let expected = match (dir, ch) {
+            (Direction::Mm2s, 0) => kc * 2 * 5504,
+            (Direction::Mm2s, 1) => if col < 4 { waves * kc * 4608 } else { 0 },
+            (Direction::S2mm, 0 | 1) => waves * 2 * 20480,
+            _ => panic!("unexpected shim channel"),
+        };
+        assert_eq!(bytes, expected as u64);
+        totals[usize::from(dir == Direction::S2mm)] += bytes;
+    }
+    assert_eq!(totals, [d.host_bytes_read(), d.host_bytes_written()]);
+    let ticks = sim.ticks - t0;
+    eprintln!("BF16 {m}x{N}x{k}: {ticks} simulator-modelled cycles; read={} write={}", totals[0], totals[1]);
+    ticks
+}
+
+#[test]
+fn g80_bf16_one_and_multiple_waves_reuse_changed_operands() {
+    for ctl in BOTH {
+        for m in [200, 300] {
+            let k = 64;
+            let d = design_g80(m, N, k, Epilogue::Bf16, ctl);
+            let mut sim = fresh(&d);
+            let lean = d.lean_insts().unwrap();
+            for seed in 0..3 {
+                let (a, b) = random(m, k, SEEDS[seed]);
+                submit_bf16(&mut sim, &d, if seed == 0 { &d.insts } else { &lean },
+                    m, k, &a, &b, &bf16_scales(m, seed), &bf16_scales(N, seed + 3));
+            }
+        }
+    }
+}
+
+#[test]
+fn g80_bf16_exact_ties_carries_subnormals_and_zero_scales() {
+    let (m, k) = (256, 64);
+    let d = design_g80(m, N, k, Epilogue::Bf16, Control::Fast);
+    let mut a = vec![0i8; m * k]; let mut b = vec![0i8; k * N];
+    // I = 257,259,511 and their negatives. With Sm=Dm=2^14 and
+    // Se+De=-36 these are exact BF16 halfway points (even/odd/carry).
+    for token in 0..m {
+        let total: i32 = [257, 259, 511, -257, -259, -511, 0][token % 7];
+        let magnitude = total.unsigned_abs() as usize;
+        for at in 0..5 {
+            a[token * k + at] = (magnitude.saturating_sub(at * 127).min(127) as i8)
+                * if total < 0 { -1 } else { 1 };
+        }
+    }
+    for kk in 0..5 { b[kk * N..(kk + 1) * N].fill(1); }
+    let ds = vec![(16384, -18); m];
+    let mut ss = vec![(16384, -18); N];
+    // The same exact ties at the subnormal grid, plus overflow and Sm=0.
+    for (feature, exponent) in [(3, -144), (4, -143), (5, 109)] { ss[feature] = (16384, exponent); }
+    ss[6] = (0, 0);
+    let mut sim = fresh(&d);
+    submit_bf16(&mut sim, &d, &d.insts, m, k, &a, &b, &ds, &ss);
+}
+
+#[test]
+fn g80_bf16_k2560_signed_extremes_and_modelled_cycles() {
+    let (m, k) = (256, 2560);
+    let (a, b) = extremes(m, k, 0);
+    let ds = bf16_scales(m, 1); let ss = bf16_scales(N, 2);
+    let bf = design_g80(m, N, k, Epilogue::Bf16, Control::Fast);
+    let ticks_bf = submit_bf16(&mut fresh(&bf), &bf, &bf.insts, m, k, &a, &b, &ds, &ss);
+    let int8 = design(m, k, Control::Fast, 12);
+    let ticks_i8 = once(&int8, &case("BF16 cycle baseline int8", m, k, 12), &a, &b).ticks;
+    let i32 = design32(m, k, Control::Fast);
+    let ticks_i32 = submit32(&mut fresh(&i32), &i32, &i32.insts, "BF16 cycle baseline I32", m, k, &a, &b, POISON).ticks;
+    eprintln!("MODELLED wave cycles int8={ticks_i8} I32={ticks_i32} BF16={ticks_bf}; \
+        scaled 33.1 TOPS: int8=33.1 I32={:.4} BF16={:.4}; arithmetic group={} cycles/32",
+        33.1 * ticks_i8 as f64 / ticks_i32 as f64, 33.1 * ticks_i8 as f64 / ticks_bf as f64,
+        pm_npu::kernels::gemm_core_g80::bf16_group_cycles());
+}
+
+#[test]
+fn g80_bf16_descriptor_bounds_and_8192_host_bytes() {
+    let d = design_g80(8192, N, 2560, Epilogue::Bf16, Control::Fast);
+    let ops = parse_txn(&d.insts).unwrap();
+    assert_bank_aware(&ops, "BF16");
+    assert_c_queues(&ops, 32, true, "BF16");
+    for col in 0..8u32 {
+        for r in 0..4 {
+            let prod = mem_bd_of(&ops, col, PROD_BD[r][0], "BF16");
+            let drain = mem_bd_of(&ops, col, DRAIN_BD0[r / 2] + (r % 2) as u32, "BF16");
+            assert_eq!(prod.len, 5120);
+            assert_eq!(prod.addr, 0x80000 + 0x4000 + (r / 2 * 20480) as u32);
+            assert_eq!(drain.addr, prod.addr);
+            assert_eq!(drain.rel, Some((72 + 2 * (r as u32 ^ 1), 1)));
+            assert_eq!(prod.next, None);
+        }
+        let last_b = mem_bd_of(&ops, col, 5, "BF16");
+        assert!(last_b.addr + 40 * last_b.len * 4 <= 0x100000);
+    }
+    let bytes = d.host_bytes_read() + d.host_bytes_written();
+    let bkop = bytes as f64 * 1000.0 / d.useful_ops() as f64;
+    assert!(bkop <= 0.90, "{bkop}");
+    eprintln!("BF16 8192x1280x2560 host read={} write={} total={bytes}, B/kop={bkop:.9}",
+        d.host_bytes_read(), d.host_bytes_written());
+}
+
+#[test]
+fn g80_bf16_pack_near_i26_j56_and_random_grid() {
+    use pm_npu::kernels::{gemm_core_g80::bf16_pack_debug_program, w8a8_epi::bf16_direct};
+    let (program, offsets) = bf16_pack_debug_program();
+    let decoder = pm_npu::sim::decode::PreparedDecoder::new(&program).unwrap();
+    let mut state = 0x4781deabu32;
+    let mut next = || { state ^= state << 13; state ^= state >> 17; state ^= state << 5; state };
+    for iteration in 0..128 {
+        let mut tile = pm_npu::sim::Tile::new(program.clone()).unwrap();
+        let mut wants = [0u16; 32];
+        for lane in 0..32 {
+            let i = if lane < 2 { if lane == 0 { (1 << 26) - 1 } else { 1 - (1 << 26) } }
+                else { (next() as i32) >> 5 };
+            let sm = if lane < 2 { 32767 } else if lane == 2 { 0 } else { (16384 + (next() & 16383)) as u16 };
+            let dm = if lane < 2 { 32767 } else if lane == 3 { 0 } else { (16384 + (next() & 16383)) as u16 };
+            let se = (next() % 278) as i16 - 163;
+            let de = (next() % 278) as i16 - 163;
+            wants[lane] = bf16_direct(i, sm, se, dm, de);
+            tile.memory[4 * lane..4 * lane + 4].copy_from_slice(&i.to_le_bytes());
+            for (off, bits) in offsets.into_iter().zip([dm, de as u16, sm, se as u16]) {
+                let off = off as usize + 2 * lane;
+                tile.memory[off..off + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        let result = tile.run(&decoder, 100_000);
+        assert!(matches!(result, Ok(pm_npu::sim::Step::Done)), "{result:?}");
+        for (lane, want) in wants.into_iter().enumerate() {
+            let off = 0x5000 + 2 * lane;
+            let got = u16::from_le_bytes(tile.memory[off..off + 2].try_into().unwrap());
+            assert_eq!(got, want, "BF16 pack iteration={iteration} lane={lane}");
+        }
+    }
+}
+
+#[test]
+fn g80_bf16_multiple_k2560_waves_reuse() {
+    let (m, k) = (300, 2560);
+    let d = design_g80(m, N, k, Epilogue::Bf16, Control::Fast);
+    let mut sim = fresh(&d);
+    let lean = d.lean_insts().unwrap();
+    for seed in 0..2 {
+        let (a, b) = pattern_b(m, k, seed != 0);
+        submit_bf16(&mut sim, &d, if seed == 0 { &d.insts } else { &lean }, m, k, &a, &b,
+            &bf16_scales(m, seed), &bf16_scales(N, seed + 3));
+    }
+}

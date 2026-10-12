@@ -25,22 +25,11 @@ pub enum EpilogueContract {
     /// Raw I32 from the NPU, folded on the GPU: `y = (f32)(((f64)I * (f64)ws_n) * (f64)d_t)`.
     #[default]
     I32Fold,
-    /// BF16 straight from the NPU. Defined only after probe B0; until then a typed placeholder.
+    /// Exact integer product of I and grid15-up scales, rounded once to IEEE BF16.
     Bf16Direct,
 }
 
 impl EpilogueContract {
-    /// Exact error of the unsupported contract.
-    pub const BF16_DIRECT_PENDING: &'static str = "Bf16Direct pending probe B0";
-
-    /// `Ok` for the contract this build implements, the pending-probe error otherwise.
-    pub fn ensure_supported(self) -> Result<(), String> {
-        match self {
-            Self::I32Fold => Ok(()),
-            Self::Bf16Direct => Err(Self::BF16_DIRECT_PENDING.to_string()),
-        }
-    }
-
     /// Spelling used in load logs.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -415,12 +404,9 @@ mod tests {
     }
 
     #[test]
-    fn bf16_direct_is_rejected_with_exact_message() {
+    fn epilogue_contract_spellings() {
         assert_eq!(EpilogueContract::default(), EpilogueContract::I32Fold);
-        assert_eq!(EpilogueContract::I32Fold.ensure_supported(), Ok(()));
-        assert_eq!(
-            EpilogueContract::Bf16Direct.ensure_supported(),
-            Err("Bf16Direct pending probe B0".to_string())
-        );
+        assert_eq!(EpilogueContract::I32Fold.as_str(), "i32fold");
+        assert_eq!(EpilogueContract::Bf16Direct.as_str(), "bf16direct");
     }
 }

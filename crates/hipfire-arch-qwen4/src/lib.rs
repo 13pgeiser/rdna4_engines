@@ -26,6 +26,7 @@ pub mod lane_exec;
 pub mod mtp_gpu;
 pub mod mtp_lanes;
 pub mod mtp_spec;
+pub mod npu_trunk;
 pub mod ops;
 pub mod ple;
 pub(crate) mod ple_stage;

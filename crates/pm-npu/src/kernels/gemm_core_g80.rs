@@ -2,7 +2,7 @@
 // AIE2P instruction fields and scheduling are derived from Xilinx/llvm-aie
 // AIE2PGenInstrInfo.td and AIE2PGenSchedule.td (Apache-2.0 WITH LLVM-exception).
 //! G80 pair core: the V8 pair wavefront of [`gemm_core`] widened from a 128x64 to a 128x80 output tile (five N
-//! pairs per M pair, 40 groups of 32 cycles, 1,315-cycle wavefront), with the int8 epilogue or the raw i32 drain.
+//! pairs per M pair, 40 groups of 32 cycles, 1,315-cycle wavefront), with int8, raw i32 or integer direct-BF16 output.
 //!
 //! Everything that does not depend on the tile width is reused from `gemm_core`: the [`Assembler`], the
 //! 9-step `PEER_FULL`/`PEER_EMPTY` chunk lock protocol ([`pair_acquire`]/[`pair_release`]), the
@@ -10,12 +10,18 @@
 //! the `Control`/`Probe` knobs. This file owns the N=80 wavefront, its loop plan, the reverse int8 epilogue and
 //! the relocated data-memory map.
 //!
-//! ## Data-memory map (own-tile offsets, a single fixed map; `Probe::layout` must be 0)
+//! ## Legacy int8/I32 data-memory map (`Probe::layout` must be 0)
 //! `C` i32 accumulator `0x0000..0xa000` (128 x 80 x 4 = 40,960 B); int8 `Cout` `0x7800..0xa000` (10,240 B, inside
 //! the top of `C`, `Epilogue::Int8` only); A half slots `0xa000`/`0xb000` (4 KiB); B slots `0xc000`/`0xd400` (5 KiB).
 //! `Epilogue::I32` has no `Cout`: the DMA drains `C` itself as two 20,480 B stripes (`[0, 0x5000)` then `[0x5000, 0xa000)`,
 //! core DMA BD 4 -> 5 -> 4, see [`tile_bds_pair`]). The int8 epilogue body is not emitted for I32, and `C_FULL` is released
 //! right after the last chunk (as the V8 I32 protocol of [`gemm_core::program_pair`]).
+//!
+//! `Epilogue::Bf16` uses C's upper half `[0x5000,0xa000)` for descending 32-lane stores, A slots
+//! `0xa000/0xb200` (4608 B), B slots `0xc400/0xd980` (5504 B), and scratch `[0xef00,0x10000)`.
+//! One accumulating wavefront body follows a C-zero loop, leaving room for the integer epilogue in program memory.
+//! Sidecars are captured under input locks; DMA BD4 drains one whole 20480-B BF16 tile.
+//! See `docs/npu/npu-trunk.md` for the sidecar and shared memtile-stage contract. Simulator-only.
 //!
 //! ## Wavefront changes against the 128x64 core
 //! * B column stride is `128 * NP = 640` B (`NP = 5`), a C row is `512 * NP = 2560` B. The B pointer steps need the
@@ -42,6 +48,7 @@ use super::gemm_core::{emit_cycle, load_a, matrix, pointer, pointer_immediate, p
 use super::gemm_i8::SIGNED_8X8;
 use crate::{dma::{self, BdLocks}, isa::{self, bundle::encode_slot, gen::{Encoding, Slot}, Program}};
 use std::sync::LazyLock;
+use super::iu4_ief15_core::g80_bf16 as bf16;
 
 pub const TM: usize = 128;
 pub const TN: usize = 80;
@@ -253,7 +260,7 @@ fn check(epi: Epilogue, ctl: Control) -> Option<u8> {
         ctl.probe().layout);
     match epi {
         Epilogue::Int8 { shift } => { assert!(shift <= 31, "SRS shift {shift}"); Some(shift) }
-        Epilogue::I32 => None,
+        Epilogue::I32 | Epilogue::Bf16 => None,
     }
 }
 
@@ -265,6 +272,7 @@ fn check(epi: Epilogue, ctl: Control) -> Option<u8> {
 /// epilogue body; `C_FULL` is released right after the last chunk and `C` is drained in place by the two stripe BDs.
 pub fn program_pair(kc: usize, tiles: usize, role: PairRole, epi: Epilogue, ctl: Control) -> Program {
     assert!((1..=MAX_KC).contains(&kc) && (1..=256).contains(&tiles), "G80 kc {kc} (1..={MAX_KC}) tiles {tiles} (1..=256)");
+    if matches!(epi, Epilogue::Bf16) { return program_bf16(kc, tiles, role, ctl); }
     let shift = check(epi, ctl);
     let probe = ctl.probe();
     let mut a = Assembler::default();
@@ -312,16 +320,20 @@ pub fn program_pair(kc: usize, tiles: usize, role: PairRole, epi: Epilogue, ctl:
 pub fn tile_bds_pair(epi: Epilogue, ctl: Control) -> ([[u32; 6]; 6], usize) {
     let shift = check(epi, ctl);
     let mut bds = [[0; 6]; 6];
+    let direct = matches!(epi, Epilogue::Bf16);
+    let (aa, ab, ba, bb) = if direct { (bf16::A, bf16::A_BYTES, bf16::B, bf16::B_BYTES) }
+        else { (A_ADDR, A_HALF_BYTES, B_ADDR, B_BYTES) };
     for slot in 0..2 {
-        bds[gemm_core::A_BD[slot] as usize] = dma::tile_bd(A_ADDR[slot], (A_HALF_BYTES / 4) as u32,
+        bds[gemm_core::A_BD[slot] as usize] = dma::tile_bd(aa[slot], (ab / 4) as u32,
             BdLocks {acq: Some((gemm_core::A_EMPTY[slot], -1)), rel: Some((gemm_core::A_FULL[slot], 1))},
             Some(gemm_core::A_BD[1 - slot]));
-        bds[gemm_core::B_BD[slot] as usize] = dma::tile_bd(B_ADDR[slot], (B_BYTES / 4) as u32,
+        bds[gemm_core::B_BD[slot] as usize] = dma::tile_bd(ba[slot], (bb / 4) as u32,
             BdLocks {acq: Some((gemm_core::B_EMPTY[slot], -1)), rel: Some((gemm_core::B_FULL[slot], 1))},
             Some(gemm_core::B_BD[1 - slot]));
     }
-    if shift.is_some() {
-        bds[gemm_core::C_BD as usize] = dma::tile_bd(COUT_ADDR, (COUT_BYTES / 4) as u32,
+    if shift.is_some() || direct {
+        let (addr, bytes) = if direct { (bf16::OUT, bf16::OUT_BYTES) } else { (COUT_ADDR, COUT_BYTES) };
+        bds[gemm_core::C_BD as usize] = dma::tile_bd(addr, (bytes / 4) as u32,
             BdLocks {acq: Some((gemm_core::C_FULL, -1)), rel: Some((gemm_core::C_EMPTY, 1))}, Some(gemm_core::C_BD));
         (bds, 5)
     } else {
@@ -336,3 +348,44 @@ pub fn tile_bds_pair(epi: Epilogue, ctl: Control) -> ([[u32; 6]; 6], usize) {
 
 /// Same lock numbering and initial values as `gemm_core` (`C_EMPTY` starts at 1, `PEER_*` at 0).
 pub fn initial_locks() -> [i32; 16] { gemm_core::initial_locks_pair() }
+
+fn program_bf16(kc: usize, tiles: usize, role: PairRole, ctl: Control) -> Program {
+    assert_eq!(ctl.probe().layout, 0);
+    assert!(!ctl.probe().no_compute && ctl.probe().repeat <= 1, "BF16 requires ordinary GEMM compute");
+    let layout = PairLayout { a: bf16::A, b: bf16::B, c: C_ADDR, cout: bf16::OUT };
+    let mut a = Assembler::default();
+    a.serial = ctl.probe().serial;
+    for (r, v) in [(0, -1i32 as u32), (1, 1), (2, SIGNED_8X8), (3, tiles as u32), (4, 0)] { a.mov(0, r, v); }
+    bf16::initialize(&mut a);
+    let wave = a.label(); let chunks = a.label(); let captured = a.label(); let pong = a.label(); let copied = a.label();
+    a.bind(wave);
+    for (m, value) in MODIFIERS.into_iter().enumerate() { a.mov(2, m, value as u32); }
+    a.lock(true, gemm_core::C_EMPTY);
+    bf16::zero(&mut a);
+    a.mov(0, 5, kc as u32);
+    a.bind(chunks);
+    pair_acquire(&mut a, role, layout);
+    chunk(&mut a, false);
+    a.emit(&[instruction!("ADD_add_r_ri", &[("d0", 11), ("s0", 5), ("imm", 0x7f)])]);
+    a.nop(7); a.branch(captured, Some((11, true))); a.delay();
+    a.branch(pong, Some((4, true))); a.delay();
+    bf16::capture(&mut a, 0); a.branch(copied, None); a.delay();
+    a.bind(pong); bf16::capture(&mut a, 1);
+    a.bind(copied);
+    a.bind(captured);
+    pair_release(&mut a, role);
+    a.branch(chunks, Some((5, true))); a.delay();
+    bf16::epilogue(&mut a);
+    a.lock(false, gemm_core::C_FULL);
+    a.add(3, -1); a.branch(wave, Some((3, true))); a.delay();
+    a.emit(&[instruction!("DONE", &[])]);
+    a.finish()
+}
+
+/// Arithmetic issue cycles per 32-output BF16 pack group (simulator schedule).
+pub fn bf16_group_cycles() -> usize { bf16::group_cycles() }
+
+/// Standalone BF16 epilogue diagnostics, following the IEF15 pack probe.
+/// I32[32] at offset0, BF16[32] at0x5000; returns Dm/De/Sm/Se offsets.
+#[doc(hidden)]
+pub fn bf16_pack_debug_program() -> (Vec<u8>, [u32; 4]) { bf16::debug_program() }

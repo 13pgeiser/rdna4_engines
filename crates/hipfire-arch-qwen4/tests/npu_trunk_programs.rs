@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Metadata of `build_programs` / `build_programs_for_families`: G80 I32 argument sizes (computed here from the documented
-//! layout, not from the design), row bounds and rounding, the pending `Bf16Direct` contract, and masked panel counts.
+//! layout, not from the design), row bounds and rounding, direct BF16 sidecars, and masked panel counts.
 //! Nothing here runs the simulator or touches a device.
-use hipfire_npu_trunk::{
+use hipfire_arch_qwen4::npu_trunk::{
     build_programs, build_programs_for_families, EpilogueContract, Family, FamilyMask, NpuPrograms, Shape, PANEL_COLS, TRUNK_K,
 };
 
@@ -98,16 +98,21 @@ fn rows_outside_one_to_65536_are_rejected_without_building() {
 }
 
 #[test]
-fn bf16_direct_is_the_typed_pending_error() {
-    let want = EpilogueContract::Bf16Direct.ensure_supported().unwrap_err();
-    assert!(!want.is_empty());
+fn bf16_direct_builds_with_sidecar_byte_totals() {
     for rows in [1, 4096, 65536] {
-        assert_eq!(build_programs(EpilogueContract::Bf16Direct, rows).unwrap_err(), want);
-        assert_eq!(build_programs_for_families(EpilogueContract::Bf16Direct, rows, FamilyMask::GDN).unwrap_err(), want);
+        let progs = build_programs(EpilogueContract::Bf16Direct, rows).unwrap();
+        let waves = rows.div_ceil(256);
+        for shape in Shape::ALL {
+            let p = progs.get(shape);
+            let sizes = [4 * waves * 40 * 4608, 8 * 40 * 2 * 5504, 8 * waves * 4 * 20480];
+            assert_eq!(p.arg_bytes, sizes);
+            assert_eq!(p.design.epilogue(), Some(pm_npu::kernels::gemm_core::Epilogue::Bf16));
+            assert_eq!(p.host_bytes_read, (sizes[0] + sizes[1]) as u64);
+            assert_eq!(p.host_bytes_written, sizes[2] as u64);
+        }
+        assert!(build_programs_for_families(EpilogueContract::Bf16Direct, rows, FamilyMask::GDN).is_ok());
     }
-    // The contract error wins over the row bound: an unsupported contract never reaches the design builder.
-    assert_eq!(build_programs(EpilogueContract::Bf16Direct, 0).unwrap_err(), want);
-    assert!(EpilogueContract::I32Fold.ensure_supported().is_ok());
+    assert!(build_programs(EpilogueContract::Bf16Direct, 0).is_err());
 }
 
 #[test]

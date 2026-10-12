@@ -17,7 +17,7 @@
 //! Reference w8 is `pack_matrix` (its own oracle lives in tests/packing.rs); packing the panel and placing columns is what is
 //! being proven. Functional ticks are simulator ticks, never silicon cycles. Budget: a fixed number of submits of one wave,
 //! `tick_limit` as in the pm-npu harness (`Config` default, per wait, so a stall is an `Err`, not a hang).
-use hipfire_npu_trunk::{
+use hipfire_arch_qwen4::npu_trunk::{
     build_programs_for_families, pack_matrix, pack_shape, EpilogueContract, Family, FamilyMask, MatrixRef, PackedB, Shape,
     PANEL_COLS, TRUNK_K,
 };
@@ -154,7 +154,7 @@ fn expected_parts(shape: Shape, mask: FamilyMask) -> Vec<(Family, usize, usize)>
     parts
 }
 
-fn assert_map(shape: Shape, mask: FamilyMask) -> hipfire_npu_trunk::ColumnMap {
+fn assert_map(shape: Shape, mask: FamilyMask) -> hipfire_arch_qwen4::npu_trunk::ColumnMap {
     let map = shape.column_map(mask);
     let got: Vec<_> = map.parts.iter().map(|&(f, c0, n)| (f, c0 as usize, n as usize)).collect();
     assert_eq!(got, expected_parts(shape, mask), "{shape:?} column map");

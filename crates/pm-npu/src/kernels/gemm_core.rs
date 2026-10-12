@@ -147,7 +147,7 @@ pub enum PairRole { Lower, Upper }
 /// saturate, `crRnd = 0` floor, `crSRSMode = 0` 32-bit lanes, signed) into the 8 KiB `COUT_ADDR` buffer.
 /// CPU reference: `clamp(c >> shift, -128, 127)` with an arithmetic shift. `shift <= 31`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Epilogue { I32, Int8 { shift: u8 } }
+pub enum Epilogue { I32, Int8 { shift: u8 }, Bf16 }
 /// `Fast`: the Fast core's control spacing. `Slow`: FastSlowCtl discipline (seven-NOP gaps after every control
 /// instruction, NOP-filled branch delay slots); only the VLIW loops keep co-issue. `Probe`: control,
 /// layout and timing knobs ([`Probe`]); only `no_compute` and `repeat > 1` invalidate the GEMM result.
@@ -855,6 +855,7 @@ fn epilogue(a: &mut Assembler, c: u32, cout: u32) {
 /// `ctl.probe().layout` selects the [`PairLayout`] data-memory map (default 0: C 0x8000, Cout 0x6000).
 pub fn program_pair(kc: usize, tiles: usize, role: PairRole, epi: Epilogue, ctl: Control) -> Program {
     assert!((1..=MAX_KC).contains(&kc) && (1..=256).contains(&tiles));
+    assert!(!matches!(epi, Epilogue::Bf16), "direct BF16 is a G80-only epilogue");
     let probe = ctl.probe();
     let layout = pair_layout(probe.layout);
     let mut a = Assembler { serial: probe.serial, ..Assembler::default() };
@@ -920,7 +921,11 @@ pub fn tile_bds_pair(epi: Epilogue, ctl: Control) -> [[u32; 6]; 5] {
         bds[B_BD[slot] as usize] = dma::tile_bd(layout.b[slot], (B_BYTES / 4) as u32,
             BdLocks {acq: Some((B_EMPTY[slot], -1)), rel: Some((B_FULL[slot], 1))}, Some(B_BD[1 - slot]));
     }
-    let (address, bytes) = match epi { Epilogue::I32 => (layout.c, C_BYTES), Epilogue::Int8 { .. } => (layout.cout, COUT_BYTES) };
+    let (address, bytes) = match epi {
+        Epilogue::I32 => (layout.c, C_BYTES),
+        Epilogue::Int8 { .. } => (layout.cout, COUT_BYTES),
+        Epilogue::Bf16 => panic!("direct BF16 is a G80-only epilogue"),
+    };
     bds[C_BD as usize] = dma::tile_bd(address, (bytes / 4) as u32,
         BdLocks {acq: Some((C_FULL, -1)), rel: Some((C_EMPTY, 1))}, Some(C_BD));
     bds

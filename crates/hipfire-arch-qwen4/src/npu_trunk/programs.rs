@@ -2,15 +2,15 @@
 //! G80 program construction: one deployment image + command stream per trunk shape, CPU only (no device is opened).
 //!
 //! Every submit of a trunk program multiplies one 256-row-wave-padded A (`rows_max` rounded up to 256 rows, `K = 2560`) by
-//! ONE resident 1280-column B panel with exact int32 accumulation (`Epilogue::I32`, `Control::Fast`). A shape therefore
-//! needs `panel_count` submits per row block; the program itself is independent of the panel (B is an argument), so
+//! ONE resident 1280-column B panel, with exact int32 accumulation and either an I32 drain or integer BF16 epilogue.
+//! A shape needs `panel_count` submits per row block; the program is independent of the panel (B is an argument), so
 //! the per-shape design differs between shapes only through the bookkeeping recorded here.
 
 use pm_npu::kernels::gemm_array::ArrayDesign;
-use pm_npu::kernels::gemm_core::{Control, Epilogue};
-use pm_npu::kernels::gemm_g80::design_g80;
+use pm_npu::kernels::gemm_core::Epilogue;
+use pm_npu::kernels::gemm_g80::build_panel_program;
 
-use crate::shapes::{EpilogueContract, FamilyMask, Shape, PANEL_COLS, TRUNK_K};
+use super::shapes::{EpilogueContract, FamilyMask, Shape};
 
 /// Rows of one G80 M wave: every program is built for a whole number of these.
 const WAVE_ROWS: usize = 256;
@@ -20,7 +20,7 @@ const ROWS_LIMIT: usize = 256 * WAVE_ROWS;
 /// The program of one trunk shape.
 pub struct ShapeProgram {
     pub shape: Shape,
-    /// G80 design (PDI + TXN + argument layout), `M = rows_max` rounded, `N = 1280`, `K = 2560`, `Epilogue::I32`, `Control::Fast`.
+    /// G80 PDI/TXN and argument layout: rounded M, N1280, K2560, selected epilogue, Fast control.
     pub design: ArrayDesign,
     /// 1280-column B panels (submits per row block) of the selected families of this shape; 0 when none is selected.
     pub panel_count: usize,
@@ -30,7 +30,7 @@ pub struct ShapeProgram {
     pub arg_bytes: [usize; 3],
     /// Host bytes read by ONE submit (packed A + one packed B panel).
     pub host_bytes_read: u64,
-    /// Host bytes written by ONE submit (the packed int32 C arena).
+    /// Host bytes written by ONE submit (the native I32 or BF16 C arena).
     pub host_bytes_written: u64,
 }
 
@@ -81,20 +81,15 @@ pub fn build_programs(contract: EpilogueContract, rows_max: usize) -> Result<Npu
 
 /// Programs for the families in `families`: the panel counts and padded columns follow
 /// [`Shape::column_map`] of the mask, so they match the panels `pack_shape` produces for the same mask.
-/// `Err` for an unsupported contract, an empty mask, or `rows_max` outside `1..=65536`.
+/// `Err` for an empty mask or `rows_max` outside `1..=65536`.
 pub fn build_programs_for_families(
     contract: EpilogueContract,
     rows_max: usize,
     families: FamilyMask,
 ) -> Result<NpuPrograms, String> {
-    contract.ensure_supported()?;
     let epilogue = match contract {
         EpilogueContract::I32Fold => Epilogue::I32,
-        EpilogueContract::Bf16Direct => {
-            return Err(contract
-                .ensure_supported()
-                .expect_err("Bf16Direct must stay unsupported until its program exists"))
-        }
+        EpilogueContract::Bf16Direct => Epilogue::Bf16,
     };
     if !(1..=ROWS_LIMIT).contains(&rows_max) {
         return Err(format!("npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"));
@@ -105,7 +100,7 @@ pub fn build_programs_for_families(
     let rows = rows_max.div_ceil(WAVE_ROWS) * WAVE_ROWS;
     let program = |shape: Shape| {
         let map = shape.column_map(families);
-        let design = design_g80(rows, PANEL_COLS, TRUNK_K, epilogue, Control::Fast);
+        let design = build_panel_program(rows, epilogue).expect("validated G80 rows");
         let arg_bytes = [design.args[0].bytes, design.args[1].bytes, design.args[2].bytes];
         ShapeProgram {
             shape,

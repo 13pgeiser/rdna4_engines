@@ -9,12 +9,12 @@
 //! output tile with M block `r / 2` (rows `w*256 + (r/2)*128 ..+128`) and N tile `2c + r % 2` (columns
 //! `(2c + r%2)*80 ..+80`). The two cores of a vertical pair (core rows `2q`, `2q+1`) share one 128-row A block through
 //! neighbour data memory (`PairRole::Lower` row `2q` receives the even-`mb` half, `Upper` row `2q+1` the odd half; the
-//! peer lock protocol and the reverse int8 epilogue are [`gemm_core_g80`]'s). `Epilogue::Int8` or `Epilogue::I32` (raw C
-//! drained in two stripes, no SRS body); `Control` may be
-//! `Fast`, `Slow` or a `Probe` with `layout == 0` (`nocompute` and `repeat=N` are timing-only: the host packing, the
-//! DMA protocol and every byte count below are unchanged, only the C content is not a GEMM).
+//! peer lock protocol and reverse int8 epilogue are [`gemm_core_g80`]'s). Output is int8, two-stripe I32, or integer
+//! direct BF16. `Control` may be Fast or Slow; legacy paths also accept layout0 timing probes.
+//! The legacy layouts below remain byte-identical. BF16 sidecars, paired whole-tile C staging and byte totals are
+//! documented in `docs/npu/npu-trunk.md`; [`pack_a_bf16`] / [`pack_b_bf16`] supply the required scale metadata.
 //!
-//! # Host arguments (byte counts, `waves = W`, `kc`)
+//! # Legacy int8/I32 host arguments (byte counts, `waves = W`, `kc`)
 //! * arg0 = A, **4 segments** of `W*kc*4096` B, segment `c = 0..4` is injected by column `c`. Inside a segment: wave,
 //!   K chunk, one 4 KiB E/O half chunk (8 `mb_local` x 8 `kb` 8x8 blocks, [`Geometry::pack_a_half_chunk`]) of rows
 //!   `w*256 + q*128 ..` with `q = c/2`, half `h = c%2`. A total is `4*W*kc*4096`. Columns 4..7 read no A.
@@ -153,6 +153,7 @@ use crate::{
     dma::{Bd, BdLocks, Direction::{Mm2s, S2mm}, Iteration, Location, Task},
     route::{Circuit, Port, ShimDma},
 };
+use super::iu4_ief15_core::g80_bf16 as bf16;
 
 const TM: usize = g80_core::TM;
 const TN: usize = g80_core::TN;
@@ -228,6 +229,19 @@ fn shape(topo: Topo) -> (usize, usize) {
 /// `Epilogue::I32` topology (raw 40,960 B tiles, one 20,480 B memtile stage per row, finite C tasks).
 fn is_i32(topo: Topo) -> bool { matches!(topo.kind, Kind::G80 { epi: Epilogue::I32, .. }) }
 
+pub(crate) fn a_chunk_bytes(topo: Topo) -> usize {
+    if topo.is_g80_bf16() { bf16::A_BYTES } else { A_HALF_BYTES }
+}
+pub(crate) fn b_chunk_bytes(topo: Topo) -> usize {
+    if topo.is_g80_bf16() { bf16::B_BYTES } else { B_BYTES }
+}
+fn a_offsets(topo: Topo) -> [u32; 2] {
+    if topo.is_g80_bf16() { [0xe000, 0x10000] } else { A_OFF }
+}
+fn b_offset(topo: Topo, kc: usize, parity: usize) -> u32 {
+    if topo.is_g80_bf16() { 0x12000 + (parity * kc * bf16::B_BYTES) as u32 } else { b_off(kc, parity) }
+}
+
 fn check_geometry(geo: &Geometry) -> (usize, usize) {
     let (kc, mw) = shape(geo.topo);
     assert!(geo.kc == kc && geo.mw == mw && geo.nw == 1 && geo.waves == mw && geo.n == WAVE_N && geo.k == kc * CHUNK_K,
@@ -293,10 +307,10 @@ pub(crate) fn column_circuits(topo: Topo, col: u32) -> Vec<Circuit> {
 pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
     let (kc, _) = shape(topo);
     let mut v = Vec::new();
-    let chunk_words = (B_BYTES / 4) as u32;
+    let chunk_words = (b_chunk_bytes(topo) / 4) as u32;
     let iteration = Iteration { step: chunk_words, wrap: kc as u32, current: 0 };
     for p in 0..2 {
-        let addr = (array::MEM_BASE + b_off(kc, p)) as u64;
+        let addr = (array::MEM_BASE + b_offset(topo, kc, p)) as u64;
         let mut fill = Bd::new(addr, chunk_words);
         fill.iteration = iteration;
         fill.locks = BdLocks { acq: None, rel: Some((array::MEM_LOCK + B_READY[p], 1)) };
@@ -310,9 +324,31 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
     }
     if topo.has_a(col) {
         let (empty, full) = a_locks();
-        let words = (A_HALF_BYTES / 4) as u32;
-        v.extend(array::ring(A_S2MM_BD, A_OFF, words, empty, full, true));
-        v.extend(array::ring(A_MM2S_BD, A_OFF, words, empty, full, false));
+        let words = (a_chunk_bytes(topo) / 4) as u32;
+        v.extend(array::ring(A_S2MM_BD, a_offsets(topo), words, empty, full, true));
+        v.extend(array::ring(A_MM2S_BD, a_offsets(topo), words, empty, full, false));
+    }
+    if topo.is_g80_bf16() {
+        // A drain hands the shared whole-tile stage to its pair's other row.
+        let words = (bf16::OUT_BYTES / 4) as u32;
+        for r in 0..ROWS {
+            let addr = array::MEM_BASE + C_OFF + (r / 2 * bf16::OUT_BYTES) as u32;
+            let mut producer = Bd::new(addr as u64, words);
+            producer.locks = BdLocks {
+                acq: Some((array::MEM_LOCK + c_lock(0, r), -1)),
+                rel: Some((array::MEM_LOCK + c_lock(0, r) + 1, 1)),
+            };
+            v.push((C_S2MM_BD[r][0], producer));
+            let id = C_DRAIN_BD0[r / 2] + (r % 2) as u32;
+            let mut drain = Bd::new(addr as u64, words);
+            drain.locks = BdLocks {
+                acq: Some((array::MEM_LOCK + c_lock(0, r) + 1, -1)),
+                rel: Some((array::MEM_LOCK + c_lock(0, r ^ 1), 1)),
+            };
+            drain.next = (r % 2 == 0).then_some(id + 1);
+            v.push((id, drain));
+        }
+        return v;
     }
     if is_i32(topo) {
         // One 20480 B staging slot per row: the two stripe BDs of the producer and the two of the drain share its address and
@@ -364,9 +400,10 @@ pub(crate) fn memtile_locks(topo: Topo, col: u32) -> Vec<(u32, u32)> {
         for i in 0..2 { v.extend([(empty[i], 1), (full[i], 0)]); }
     }
     // I32 has one stage per row (locks 8 + 2r empty, 9 + 2r full); int8 two slots (8 + 8s + 2r).
-    let c_slots = if is_i32(topo) { 1 } else { 2 };
+    let c_slots = if is_i32(topo) || topo.is_g80_bf16() { 1 } else { 2 };
     for slot in 0..c_slots { for r in 0..ROWS {
-        v.extend([(c_lock(slot, r), 1), (c_lock(slot, r) + 1, 0)]);
+        let empty = u32::from(!topo.is_g80_bf16() || r % 2 == 0);
+        v.extend([(c_lock(slot, r), empty), (c_lock(slot, r) + 1, 0)]);
     } }
     v
 }
@@ -387,12 +424,12 @@ pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
     let mem = array::mem_loc(col);
     for r in 0..ROWS {
         // I32: finite two-stripe chain, one pass per wave.
-        v.push((mem, if is_i32(topo) { rep(S2mm, r as u32, C_S2MM_BD[r][0], mw as u32) } else { task(S2mm, r as u32, C_S2MM_BD[r][0]) }));
+        v.push((mem, if is_i32(topo) || topo.is_g80_bf16() { rep(S2mm, r as u32, C_S2MM_BD[r][0], mw as u32) } else { task(S2mm, r as u32, C_S2MM_BD[r][0]) }));
     }
     v.push((mem, rep(S2mm, B_FILL_CH, B_FILL_BD[0], kc as u32)));
     if topo.has_a(col) { v.push((mem, task(S2mm, A_S2MM_CH, A_S2MM_BD[0]))); }
     for g in 0..2 {
-        v.push((mem, if is_i32(topo) { rep(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g], mw as u32) } else { task(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g]) }));
+        v.push((mem, if is_i32(topo) || topo.is_g80_bf16() { rep(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g], mw as u32) } else { task(Mm2s, C_DRAIN_CH[g], C_DRAIN_BD0[g]) }));
     }
     for p in 0..2 {
         v.push((mem, rep(Mm2s, B_READ_CH[p], B_GUARD_BD[p], kc as u32)));
@@ -406,13 +443,14 @@ pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
 pub(crate) fn pack_a(geo: &Geometry, a: &[i8]) -> Vec<u8> {
     let (kc, _) = check_geometry(geo);
     assert_eq!(a.len(), geo.m * geo.k, "A must be m*k");
-    let segment = geo.waves * kc * A_HALF_BYTES;
+    let chunk = a_chunk_bytes(geo.topo);
+    let segment = geo.waves * kc * chunk;
     let mut out = vec![0u8; A_COLS * segment];
     assert_eq!(out.len(), geo.a_bytes(), "A stream size");
     for c in 0..A_COLS {
         let (q, h) = (c / 2, c % 2);
         for w in 0..geo.waves { for ch in 0..kc {
-            let at = c * segment + (w * kc + ch) * A_HALF_BYTES;
+            let at = c * segment + (w * kc + ch) * chunk;
             geo.pack_a_half_chunk(a, w * WAVE_M + q * TM, h, ch, &mut out[at..at + A_HALF_BYTES]);
         } }
     }
@@ -423,11 +461,12 @@ pub(crate) fn pack_a(geo: &Geometry, a: &[i8]) -> Vec<u8> {
 pub(crate) fn pack_b(geo: &Geometry, b: &[i8]) -> Vec<u8> {
     let (kc, _) = check_geometry(geo);
     assert_eq!(b.len(), geo.k * geo.n, "B must be k*n");
-    let mut out = vec![0u8; COLS * kc * 2 * B_BYTES];
+    let chunk = b_chunk_bytes(geo.topo);
+    let mut out = vec![0u8; COLS * kc * 2 * chunk];
     assert_eq!(out.len(), geo.b_bytes(), "B stream size");
     for col in 0..COLS { for ch in 0..kc { for par in 0..2 {
         let n0 = (2 * col + par) * TN;
-        let base = (col * kc + ch) * 2 * B_BYTES + par * B_BYTES;
+        let base = (col * kc + ch) * 2 * chunk + par * chunk;
         for kb in 0..KB { for nb in 0..NB { for kk in 0..8 {
             let c0 = n0 + nb * 8;
             if c0 >= geo.n { continue; }
@@ -464,6 +503,9 @@ pub(crate) fn unpack_c(geo: &Geometry, output: &[u8]) -> Vec<i32> {
                 c[row * geo.n + cc] = if i32_tiles {
                     let off = base + at * 4;
                     i32::from_le_bytes(output[off..off + 4].try_into().unwrap())
+                } else if geo.topo.is_g80_bf16() {
+                    let off = base + at * 2;
+                    i32::from(u16::from_le_bytes(output[off..off + 2].try_into().unwrap()))
                 } else { output[base + at] as i8 as i32 };
             }
         } } }
@@ -509,7 +551,7 @@ pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEsti
     let (kc, waves) = (kc as u64, geo.waves as u64);
     let probe = ctl.probe();
     let slow = usize::from(probe.serial);
-    let input_chunk = (B_BYTES / 4) as u64;
+    let input_chunk = (b_chunk_bytes(geo.topo) / 4) as u64;
     let chunk = |cycles: u64| {
         if probe.no_compute { input_chunk } else {
             (cycles + CHUNK_GROWTH + (u64::from(probe.repeat.max(1)) - 1) * WAVEFRONT_BUNDLES).max(input_chunk)
@@ -523,6 +565,13 @@ pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEsti
         let shim_c = 4 * stripe;
         (input_chunk + (waves - 1) * wave_core.max(shim_c) + compute + (I32_HANDOFF_PHASES + 1) * stripe,
             (I32_HANDOFF_PHASES * waves + 1) * stripe)
+    } else if geo.topo.is_g80_bf16() {
+        let phase = (bf16::OUT_BYTES / 4) as u64;
+        let epilogue = bf16::wave_issue_cycles();
+        // Shared pair stage: row0 write/drain, row1 write before its core can
+        // reuse C. Row1's final drain is exposed once at the submit tail.
+        let wave_core = compute + epilogue + 3 * phase;
+        (input_chunk + waves * wave_core + phase, waves * (epilogue + 3 * phase) + phase)
     } else {
         let epilogue = if probe.no_compute { 0 } else { EPILOGUE_CYCLES[slow] };
         let cout_drain = (COUT_BYTES / 4) as u64;
@@ -544,8 +593,8 @@ pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEsti
 }
 
 /// Build the G80 whole-array design (module header): `n = 1280`, `k` a multiple of 64 in `64..=2560`, `m >= 1` padded to 256
-/// rows per wave with at most 256 waves, `Epilogue::Int8 { shift <= 31 }` or `Epilogue::I32` and a `Control` with
-/// `Probe::layout == 0`. Panics with an explanatory message on any other shape before emitting a byte.
+/// rows per wave with at most 256 waves, int8 (`shift <=31`), I32 or direct BF16, and `Probe::layout ==0`.
+/// BF16 requires ordinary compute, no timing-only probe. Invalid shapes panic before any emitted byte.
 pub fn design_g80(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control) -> ArrayDesign {
     if let Epilogue::Int8 { shift } = epi { assert!(shift <= 31, "G80 SRS shift {shift} exceeds 31"); }
     assert_eq!(ctl.probe().layout, 0, "G80 has one fixed data-memory map; Probe::layout={} is not defined", ctl.probe().layout);
@@ -577,4 +626,54 @@ pub fn design_g80(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control) -> 
         v8: Some((epi, ctl)),
         shim_axi: crate::dma::ShimAxi::default(),
     }
+}
+
+/// CPU-only deployment builder for one K2560, N1280 panel. Pads rows to a
+/// complete M256 wave; no Qwen-specific shape or device ownership lives here.
+pub fn build_panel_program(rows_max: usize, epilogue: Epilogue) -> Result<ArrayDesign, String> {
+    if !(1..=256 * WAVE_M).contains(&rows_max) {
+        return Err(format!("G80 rows_max {rows_max} outside 1..={}", 256 * WAVE_M));
+    }
+    Ok(design_g80(rows_max.div_ceil(WAVE_M) * WAVE_M, WAVE_N, 2560, epilogue, Control::Fast))
+}
+
+/// BF16 activation stream. Each K64 E/O half has 4096 code bytes followed
+/// by Dm[128] u16 and De[128] i16; both halves repeat the full token scale row.
+/// Padding tokens have zero scales. Scale metadata is deliberately repeated per
+/// chunk to reuse the existing ping/pong descriptors and locks.
+pub fn pack_a_bf16(design: &ArrayDesign, a: &[i8], scales: &[(u16, i16)]) -> Vec<u8> {
+    let geo = &design.geo;
+    assert!(geo.topo.is_g80_bf16(), "BF16 sidecars require a BF16 G80 design");
+    assert_eq!(scales.len(), geo.m);
+    let mut out = pack_a(geo, a);
+    let segment = geo.a_segment_bytes();
+    for col in 0..A_COLS { for wave in 0..geo.waves { for ch in 0..geo.kc {
+        let base = col * segment + (wave * geo.kc + ch) * bf16::A_BYTES + A_HALF_BYTES;
+        let row0 = wave * WAVE_M + (col / 2) * TM;
+        for t in 0..TM {
+            let (m, e) = scales.get(row0 + t).copied().unwrap_or((0, 0));
+            out[base + 2 * t..base + 2 * t + 2].copy_from_slice(&m.to_le_bytes());
+            out[base + 256 + 2 * t..base + 258 + 2 * t].copy_from_slice(&e.to_le_bytes());
+        }
+    } } }
+    out
+}
+
+/// BF16 resident B panel: each 5120-byte K64 N80 tile is followed by Sm[96]
+/// u16 and Se[96] i16 (80 live +16 zero padding for aligned vector loads).
+pub fn pack_b_bf16(design: &ArrayDesign, b: &[i8], scales: &[(u16, i16)]) -> Vec<u8> {
+    let geo = &design.geo;
+    assert!(geo.topo.is_g80_bf16(), "BF16 sidecars require a BF16 G80 design");
+    assert_eq!(scales.len(), geo.n);
+    let mut out = pack_b(geo, b);
+    for col in 0..COLS { for ch in 0..geo.kc { for parity in 0..2 {
+        let base = ((col * geo.kc + ch) * 2 + parity) * bf16::B_BYTES + B_BYTES;
+        let n0 = (2 * col + parity) * TN;
+        for n in 0..TN {
+            let (m, e) = scales[n0 + n];
+            out[base + 2 * n..base + 2 * n + 2].copy_from_slice(&m.to_le_bytes());
+            out[base + 192 + 2 * n..base + 194 + 2 * n].copy_from_slice(&e.to_le_bytes());
+        }
+    } } }
+    out
 }

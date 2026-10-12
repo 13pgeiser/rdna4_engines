@@ -19,7 +19,7 @@
 //! tests check structure, determinism and the `ws` vector only.
 
 
-use hipfire_npu_trunk::{
+use hipfire_arch_qwen4::npu_trunk::{
     pack_matrix, pack_shape, pack_shape_with_contract, pack_trunk, pack_trunk_with_contract, EpilogueContract, Family,
     FamilyMask, LayerTrunkRefs, MatrixRef, Shape, PANEL_COLS, TRUNK_K,
 };
@@ -512,7 +512,7 @@ fn refs(d: &ShapeData) -> Vec<MatrixRef<'_>> {
     d.blobs.iter().map(|(f, m, b)| MatrixRef { family: *f, mq6: b, m: *m, k: TRUNK_K }).collect()
 }
 
-fn parts_of(map: &hipfire_npu_trunk::ColumnMap) -> Vec<(u32, u32)> {
+fn parts_of(map: &hipfire_arch_qwen4::npu_trunk::ColumnMap) -> Vec<(u32, u32)> {
     map.parts.iter().map(|&(_, c0, n)| (c0, n)).collect()
 }
 
@@ -559,12 +559,16 @@ fn pack_shape_full_mask_matches_oracle_ws_and_structure() {
         // Deterministic.
         let again = pack_shape(shape, &mats, mask).ok().expect("repack");
         assert!(again.panels == packed.panels && again.ws == packed.ws, "{shape:?}: nondeterministic");
-        // I32Fold contract == default; Bf16Direct fails before packing.
+        // Both explicit contracts are supported; I32Fold remains the default.
         let folded = pack_shape_with_contract(EpilogueContract::I32Fold, shape, &mats, mask).ok().expect("I32Fold");
         assert!(folded.panels == packed.panels && folded.ws == packed.ws);
-        assert!(pack_shape_with_contract(EpilogueContract::Bf16Direct, shape, &mats, mask).is_err());
-        assert!(EpilogueContract::Bf16Direct.ensure_supported().is_err());
-        assert!(EpilogueContract::I32Fold.ensure_supported().is_ok());
+        let direct = pack_shape_with_contract(EpilogueContract::Bf16Direct, shape, &mats, mask).unwrap();
+        assert_eq!(direct.scales.len(), map.padded_cols());
+        for ((&raw, &rounded), &(sm, se)) in packed.ws.iter().zip(&direct.ws).zip(&direct.scales) {
+            assert_eq!((sm, se), pm_npu::kernels::w8a8_epi::grid15_up(raw));
+            assert_eq!(rounded, (f64::from(sm) * 2f64.powi(i32::from(se))) as f32);
+            assert!(rounded >= raw);
+        }
     }
 }
 
@@ -651,6 +655,8 @@ fn pack_trunk_layers_share_shape_map_and_ws() {
         assert_eq!(parts_of(&trunk.map[shape.index()]), parts_of(&shape.column_map(mask)));
     }
     assert!(trunk.per_layer[0].as_ref().unwrap().1.panels == trunk.per_layer[2].as_ref().unwrap().1.panels);
-    assert!(pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, mask).is_err());
+    let direct = pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, mask).unwrap();
+    assert_eq!(direct.per_layer.len(), layers.len());
+    assert_eq!(direct.per_layer[0].as_ref().unwrap().1.scales, direct.per_layer[2].as_ref().unwrap().1.scales);
     assert!(pack_trunk_with_contract(EpilogueContract::I32Fold, &layers, mask).is_ok());
 }

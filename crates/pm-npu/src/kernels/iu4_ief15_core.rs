@@ -11,6 +11,9 @@ use super::gemm_core::{pair_acquire, pair_release, Assembler, Control, Cycle, Pa
     A_BD, A_EMPTY, A_FULL, B_BD, B_EMPTY, B_FULL, CORE_BASE, C_BD, C_EMPTY, C_FULL};
 use std::{collections::HashMap, sync::LazyLock};
 
+#[path = "g80_bf16.rs"]
+pub(super) mod g80_bf16;
+
 /// Token rows of one core tile.
 pub const TM: usize = 64;
 /// Feature columns of one core tile.

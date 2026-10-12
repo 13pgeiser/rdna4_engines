@@ -81,3 +81,25 @@ fn default_v9_v10_bytes_match_golden() {
     assert_eq!(got.len(), want.len(), "row count");
     for (g, w) in got.iter().zip(&want) { assert_eq!(g, w, "default design bytes changed"); }
 }
+
+#[test]
+fn g80_legacy_bytes_match_golden() {
+    // Captured before the BF16 changes from npu/trunk-pipeline's I32 cutover.
+    let hashes = [
+        (0xe4085b5059424fc9, 0xae900bee5da82eeb), (0x2dd1f2492aa3df98, 0xae900bee5da82eeb),
+        (0x577123b1d2e5ae25, 0x7503151e9bf64fa1), (0x10e12b171628595e, 0x7503151e9bf64fa1),
+        (0x818eeafa6857be09, 0x87b27dc21c8a5786), (0xde100eb37076ca78, 0x87b27dc21c8a5786),
+        (0xd38932f7c0a8e865, 0xb7d9b0530c9ed98e), (0xebfea186a2ed6ade, 0xb7d9b0530c9ed98e),
+    ];
+    let mut at = 0;
+    for m in [256, 8192] {
+        for epi in [Epilogue::Int8 { shift: 12 }, Epilogue::I32] {
+            for ctl in [Control::Fast, Control::Slow] {
+                let d = pm_npu::kernels::gemm_g80::design_g80(m, 1280, 2560, epi, ctl);
+                println!("G80 {m} {epi:?} {ctl:?} {:016x} {:016x}", fnv(&d.pdi), fnv(&d.insts));
+                assert_eq!((fnv(&d.pdi), fnv(&d.insts)), hashes[at], "G80 {m} {epi:?} {ctl:?} legacy bytes");
+                at += 1;
+            }
+        }
+    }
+}

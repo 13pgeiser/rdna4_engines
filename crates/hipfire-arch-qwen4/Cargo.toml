@@ -16,10 +16,13 @@ rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
 sha2.workspace = true
+pm-npu = { path = "../pm-npu" }
+rayon.workspace = true
 
 [dev-dependencies]
 memmap2.workspace = true
 saddle-quant = { path = "../saddle-quant" }
+half.workspace = true
 
 [features]
 # Explicit developer build opt-in; never part of the default serving build.

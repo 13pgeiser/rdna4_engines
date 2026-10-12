@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! CPU-only weight preparation and G80 program construction for the opt-in
-//! Flash-Next NPU trunk. This crate does not open a device or plan execution.
+//! CPU-only weight preparation and program selection for the opt-in Flash-Next
+//! NPU trunk. Deployment and numerical references live in pm-npu; no device opens here.
 
 mod config;
 mod packing;

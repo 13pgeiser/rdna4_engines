@@ -574,6 +574,7 @@ impl Topo {
     pub(crate) fn is_g80(self) -> bool { matches!(self.kind, Kind::G80 { .. }) }
     /// G80 with the raw i32 epilogue (finite two-stripe C tasks, no C wave-parity state).
     pub(crate) fn is_g80_i32(self) -> bool { matches!(self.kind, Kind::G80 { epi: Epilogue::I32, .. }) }
+    pub(crate) fn is_g80_bf16(self) -> bool { matches!(self.kind, Kind::G80 { epi: Epilogue::Bf16, .. }) }
     /// IEF15 topology: `epochs` K128 epochs, `mw` x `nw` waves of 256 tokens x 256 features.
     pub(crate) fn ief15(ctl: Control, epochs: usize, mw: usize, nw: usize) -> Topo {
         Topo { rows: ROWS, cols: COLS, kind: Kind::Ief15 { ctl, epochs, mw, nw } }
@@ -593,6 +594,7 @@ impl Topo {
         match self.kind {
             Kind::Pair { epi: Epilogue::Int8 { .. }, .. } => COUT_BYTES,
             Kind::G80 { epi: Epilogue::I32, .. } => gemm_core_g80::C_BYTES,
+            Kind::G80 { epi: Epilogue::Bf16, .. } => gemm_core_g80::C_STRIPE_BYTES,
             Kind::G80 { .. } => gemm_core_g80::COUT_BYTES,
             Kind::Ief15 { .. } => iu4_ief15_core::COUT_BYTES,
             _ => C_BYTES,
@@ -662,6 +664,7 @@ impl Geometry {
     /// Bytes of one A host segment: a core-row block (`A_BYTES` per chunk) or, for V8, one injecting
     /// column's A half (`A_HALF_BYTES` per chunk) per wave; V10 and `a_repeat` V9 hold each `mw` tile once (`mw` tiles).
     pub(crate) fn a_segment_bytes(&self) -> usize {
+        if self.topo.is_g80() { return self.waves * self.kc * gemm_g80::a_chunk_bytes(self.topo); }
         if self.topo.is_ief15() { return self.waves * self.kc * iu4_ief15_core::A_HALF_BYTES; }
         let tiles = if self.topo.mw_outer() || self.a_repeat { self.mw } else { self.waves };
         tiles * self.kc * if self.topo.is_pair() { A_HALF_BYTES } else { A_BYTES }
@@ -669,7 +672,7 @@ impl Geometry {
     /// Bytes of one B host segment: every wave's B tile (`waves*kc*B_BYTES`) or, for V9 / V10, each `nw` tile once.
     pub(crate) fn b_segment_bytes(&self) -> usize {
         // G80: per chunk both 80-column N tiles of a column, `[even tile 5120 B, odd tile 5120 B]`.
-        if self.topo.is_g80() { return self.kc * 2 * gemm_core_g80::B_BYTES; }
+        if self.topo.is_g80() { return self.kc * 2 * gemm_g80::b_chunk_bytes(self.topo); }
         if self.topo.is_ief15() { return self.waves * self.kc * iu4_ief15_core::B_BYTES; }
         (if self.topo.resident().is_some() { self.nw } else { self.waves }) * self.kc * B_BYTES
     }
@@ -1765,7 +1768,18 @@ impl ArrayDesign {
 
     /// Packed `[A, B]` for arg0 and arg1; `a` is row-major m*k, `b` row-major k*n.
     pub fn pack_in(&self, a: &[i8], b: &[i8]) -> [Vec<u8>; 2] {
+        assert!(!self.geo.topo.is_g80_bf16(), "BF16 inputs require explicit scale sidecars");
         [self.geo.pack_a(a), self.geo.pack_b(b)]
+    }
+    /// Pack only arg0, without allocating the unused weight stream.
+    pub fn pack_a(&self, a: &[i8]) -> Vec<u8> {
+        assert!(!self.geo.topo.is_g80_bf16(), "BF16 activations require explicit scale sidecars");
+        self.geo.pack_a(a)
+    }
+    /// Pack only arg1, without allocating the unused activation stream.
+    pub fn pack_b(&self, b: &[i8]) -> Vec<u8> {
+        assert!(!self.geo.topo.is_g80_bf16(), "BF16 weights require explicit scale sidecars");
+        self.geo.pack_b(b)
     }
     /// V8 only (streaming B): packed `[A, B]` for the batched GEMM in which the rows of M-wave `mw` (512 rows of
     /// the row-major m*k `a`) are multiplied by the row-major k*n matrix `b_of_mw(mw)`. Output layout and
@@ -1838,6 +1852,7 @@ impl ArrayDesign {
         let (core_epilogue, shim_c) = match epi {
             Epilogue::I32 => ((C_BYTES / 4) as u64, (2 * C_BYTES / 4) as u64),
             Epilogue::Int8 { .. } => (gemm_core::PAIR_EPILOGUE_CYCLES[c], (2 * COUT_BYTES / 4) as u64),
+            Epilogue::Bf16 => unreachable!("direct BF16 is a G80-only epilogue"),
         };
         let wave_core = (g.kc as u64 * (ping + pong)).div_ceil(2) + core_epilogue;
         let startup = if self.variant == Variant::V10 { (g.nw * g.kc * B_BYTES / 4) as u64 } else { 0 };
@@ -1928,6 +1943,7 @@ pub fn apply_epilogue(c: i32, epi: Epilogue) -> i32 {
     match epi {
         Epilogue::I32 => c,
         Epilogue::Int8 { shift } => (i64::from(c) >> shift.min(63)).clamp(-128, 127) as i32,
+        Epilogue::Bf16 => panic!("direct BF16 requires per-feature and per-token scales"),
     }
 }
 
@@ -2782,6 +2798,7 @@ mod tests {
                 Epilogue::Int8 { .. } => for (i, x) in c32.chunks(4).enumerate() {
                     out[o + i] = apply_epilogue(i32::from_le_bytes(x.try_into().unwrap()), epi) as i8 as u8;
                 },
+                Epilogue::Bf16 => unreachable!("direct BF16 is a G80-only epilogue"),
             }
         } } }
         out

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! NPU-trunk mode: the single user-facing switch of the crate.
+//! NPU-trunk mode: the single user-facing switch of the Qwen4 integration.
 //!
 //! The mode is read through the central developer-config accessor
 //! ([`hipfire_config::developer_var`]), so the `HIPFIRE_*` key is registered with the
@@ -150,5 +150,12 @@ mod tests {
     fn env_key_is_the_documented_developer_key() {
         assert_eq!(NPU_TRUNK_ENV, "HIPFIRE_QWEN4_NPU_TRUNK");
         assert_eq!(NPU_TRUNK_DAEMON_KEY, "npu_trunk");
+        let field = hipfire_config::field(NPU_TRUNK_DAEMON_KEY).expect("registered npu_trunk schema");
+        assert_eq!(field.env_compat, Some(NPU_TRUNK_ENV));
+        assert!(matches!(field.default, hipfire_config::DefaultValue::String("off")));
+        for mode in NpuTrunkMode::ALL {
+            assert!(field.validate(&hipfire_config::ConfigValue::String(mode.to_string())).is_ok());
+        }
+        assert!(field.validate(&hipfire_config::ConfigValue::String("invalid".into())).is_err());
     }
 }

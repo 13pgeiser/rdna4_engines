@@ -10,7 +10,7 @@
 //!        npu-gemm M N K --variant V1|V2|V3|V4|V5|V6|V6b [--core Fast|Serial|LockOnly|FastSlowCtl|ClockProbe] [--probe-iters N] [--iters I] [--timeout-ms T] [--dump-status]
 //!        npu-gemm M N K --variant V8|V9|V10 [--epi i32|int8] [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]
 //!        ... [--memory native|vmm-host|vmm-host-uncached] [--burst 0..3] [--axcache 0..15] [--axqos 0..15]
-//!        npu-gemm M 1280 K --variant G80 [--epi i32|int8] [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]   (N exactly 1280, K a multiple of 64 up to 2560; `--epi i32` rejects `--shift`; `--b-prefix` is V10-only and exits 2)
+//!        npu-gemm M 1280 K --variant G80 [--epi i32|int8|bf16] [--shift S] [--core Fast|FastSlowCtl] [--iters I] [--reuse-ctx] [--timeout-ms T] (BF16 accepts grid15-up sidecars; simulator-only arithmetic until silicon validation).
 //!        npu-gemm M N K --variant V10 --b-prefix [same V8|V9|V10 options]             (B prefix mode; V10 only)
 //!        npu-gemm TOKENS FEATURES K --fold-contract ief15 [--iters N] [--loop SECS] [--reuse-ctx] [--lean] [--switch-with T2,F2,K2] [--timeout-ms T] [--dump-status]   (IEF15 N0 probe; K a multiple of 128 with 1..=136 epochs)
 //!        npu-gemm --ief15-probe [--col C] [--timeout-ms T] [--dump PATH] [--dump-status] [--expected-only]   (IEF15 N0 single-core semantics probe: expected bytes from the simulator running the exact PDI+TXN, one fresh-context submit, per-case MATCH/MISMATCH table; `--expected-only` never touches the hardware)
@@ -60,8 +60,9 @@
 //! Int8-epilogue only: `--epi i32` exits 2.
 //! `--variant G80` is the G80 design (`gemm_g80::design_g80`, N exactly 1280, K a multiple of 64 up to 2560;
 //! same `--core`/`--ctl-probe`/`--a-from-hip`/`--reuse-ctx`/`--loop` controls as V8). It takes `--epi int8` (default,
-//! `--shift S`) or `--epi i32` (exact int32 C, `--shift` rejected); every output word of either epilogue is compared with
-//! `ArrayDesign::reference`/`unpack_out`. The G80 i32 epilogue is verified on the simulator only: no silicon validation.
+//! `--shift S`) or `--epi i32` (exact int32 C) or `--epi bf16` (integer exact-product, single RNE).
+//! I32/BF16 reject `--shift`. BF16 uses deterministic grid scales and compares every checked output
+//! against `w8a8_epi::bf16_direct`; it has simulator evidence only, not silicon validation.
 //! `--variant V10` is the mw-outer both-operands-resident design (`gemm_array::design_v10`, same pair core and
 //! compact C as V9, dynamic TXN, context reusable): the whole B segment (`NW*kc*4096` words per row) stays resident in
 //! the memtile and is replayed for every M-wave while A is streamed per M-wave (wave order `w = mw*NW + nw`), so each
@@ -480,8 +481,10 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
             "int8" => Some(Epilogue::Int8 { shift: shift.unwrap_or(12) }),
             "i32" if v9 || v10 => { eprintln!("--variant {} supports --epi int8 only (the int32 epilogue is not implemented for V9/V10)", variant.as_ref().map_or("V9", |v| v.name())); std::process::exit(2) }
             "i32" if shift.is_none() => Some(Epilogue::I32),
+            "bf16" if g80 && shift.is_none() => Some(Epilogue::Bf16),
+            "bf16" => { eprintln!("--epi bf16 needs --variant G80 and no --shift"); std::process::exit(2) }
             "i32" => { eprintln!("--shift needs --epi int8"); std::process::exit(2) }
-            other => { eprintln!("--epi must be i32 or int8, got {other:?}"); std::process::exit(2) }
+            other => { eprintln!("--epi must be i32, int8 or (G80 only) bf16, got {other:?}"); std::process::exit(2) }
         }
     } else if opt_str(args, "--epi").is_some() || opt_str(args, "--shift").is_some() {
         eprintln!("--epi/--shift are only valid with --variant V8, V9, V10 or G80");
@@ -528,6 +531,9 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         Probe::parse(s).unwrap_or_else(|e| { eprintln!("--ctl-probe: {e}"); std::process::exit(2) })
     });
     let timing_only = ctl_probe.is_some_and(Probe::timing_only);
+    if epi == Some(Epilogue::Bf16) && ctl_probe.is_some_and(|p| p.timing_only() || p.layout != 0) {
+        eprintln!("--epi bf16 requires ordinary GEMM compute and layout 0"); std::process::exit(2)
+    }
     let probe_iters: u32 = match opt_str(args, "--probe-iters") {
         None => 0,
         Some(_) if core != CoreVariant::ClockProbe => {
@@ -627,7 +633,22 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         let mut seed = 0x5eed_u64;
         let a: Vec<i8> = (0..m * k).map(|_| lcg(&mut seed)).collect();
         let b: Vec<i8> = (0..k * n).map(|_| lcg(&mut seed)).collect();
-        (d.reference(&a, &b), d.pack_in(&a, &b), d.useful_ops())
+        if epi == Some(Epilogue::Bf16) {
+            use pm_npu::kernels::{gemm_g80::{pack_a_bf16, pack_b_bf16}, w8a8_epi::bf16_direct};
+            let mut scale = || {
+                let mantissa = 16384 + (u16::from(lcg(&mut seed) as u8) << 6);
+                let exponent = -20 + i16::from(lcg(&mut seed) as u8 % 7);
+                (mantissa, exponent)
+            };
+            let ds: Vec<_> = (0..m).map(|_| scale()).collect();
+            let ss: Vec<_> = (0..n).map(|_| scale()).collect();
+            let want = pm_npu::kernels::gemm_i8::cpu_reference(&a, &b, m, n, k).into_iter().enumerate()
+                .map(|(at, i)| { let (sm, se) = ss[at % n]; let (dm, de) = ds[at / n];
+                    i32::from(bf16_direct(i, sm, se, dm, de)) }).collect();
+            (want, [pack_a_bf16(&d, &a, &ds), pack_b_bf16(&d, &b, &ss)], d.useful_ops())
+        } else {
+            (d.reference(&a, &b), d.pack_in(&a, &b), d.useful_ops())
+        }
     };
     let want_c0 = if timing_only { "n/a (timing-only)".to_string() } else if lock_only { format!("{:#010x} (lock pattern)", lock_word(0, 0)) } else { want[0].to_string() };
     let (host_rd, host_wr) = (d.host_bytes_read(), d.host_bytes_written());

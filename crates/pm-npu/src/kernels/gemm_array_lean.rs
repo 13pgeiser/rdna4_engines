@@ -237,7 +237,7 @@ impl ArrayDesign {
                 // G80 I32: the C producers (two-stripe chain per row) and the C drains (four-stripe chain per drain channel) are
                 // finite and run `mw` passes, like the B tasks: after a completed submit they are idle with empty queues and
                 // every C lock is back at its initial value (no lookahead, single slot), for every wave parity. Requeue them.
-                if topo.is_g80_i32() {
+                if topo.is_g80_i32() || topo.is_g80_bf16() {
                     for r in 0..ROWS { mem.requeues.push(task(S2mm, r as u32, C_S2MM_BD[r][0], geo.waves as u32)); }
                     for g in 0..2 { mem.requeues.push(task(Mm2s, PAIR_C_MM2S_CH[g], PAIR_C_MM2S_BD0[g], geo.waves as u32)); }
                 }
@@ -292,7 +292,7 @@ impl ArrayDesign {
                 }
             },
         }
-        if parity.waves_odd && !topo.is_g80_i32() {
+        if parity.waves_odd && !topo.is_g80_i32() && !topo.is_g80_bf16() {
             for r in 0..ROWS { mem.reset(S2mm, r as u32, C_S2MM_BD[r][0]); }
             for g in 0..2 { mem.reset(Mm2s, PAIR_C_MM2S_CH[g], PAIR_C_MM2S_BD0[g]); }
             for r in 0..ROWS {

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 //! Ignored CPU-only sanity check of `pack_matrix` on real MQ6G256V2 trunk tensors of the Flash-Next artifact.
 //!
-//! Run: `cargo test -p hipfire-npu-trunk --release --test model_sanity -- --ignored --nocapture`
+//! Run: `cargo test -p hipfire-arch-qwen4 --release --test npu_trunk_model_sanity -- --ignored --nocapture`
 //! Model: `$HIPFIRE_NPU_TRUNK_TEST_MODEL`, default `/home/kaden/qcal/models/qwen3.8-flash-next-gptq3.mq4`.
 //!
 //! Model pin: `qwen3.8-flash-next-gptq3.mq4`, md5 `be007fc3219e9f6cdb1d4dfa8380625f` (recorded in
@@ -22,7 +22,7 @@
 //! (`npu_a8emu_check.rs` in `/home/kaden/ClaudeCode/warpfront/wt-npu-a8emu`: `f16_bits_to_f32` l.58-75,
 //! `unpack_group` l.138-147, `decode_mq6` l.175-196, weights half of `cpu_w8a8` l.202-217).
 
-use hipfire_npu_trunk::{pack_matrix, TRUNK_K};
+use hipfire_arch_qwen4::npu_trunk::{pack_matrix, TRUNK_K};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Instant;

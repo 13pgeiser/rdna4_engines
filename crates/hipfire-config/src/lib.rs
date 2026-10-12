@@ -3613,6 +3613,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Patch retained PM4 grid dimensions at replay time."
     ),
     field!(
+        "fusions.npu_trunk",
+        "npu_trunk",
+        Fusions,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(&["off", "auto", "on", "emulate"]),
+        false,
+        true,
+        Some("HIPFIRE_QWEN4_NPU_TRUNK"),
+        "Experimental Qwen4 trunk projection engine; off leaves every projection on the GPU."
+    ),
+    field!(
         "fusions.policy",
         "fusion_policy",
         Fusions,

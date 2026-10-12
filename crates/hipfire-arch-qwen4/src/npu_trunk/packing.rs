@@ -20,17 +20,17 @@
 //! pm-npu's canonical G80 `pack_b` takes a row-major `B[k][n]` of one 1280-column panel.
 //! Each selected W8 row (one fused column) is decoded once and transposed straight into one
 //! reused `K × 1280` panel scratch (zeroed per panel, so ragged final panels are zero
-//! padded); the full fused W8 matrix is never materialised. `pm-npu` exposes `pack_b` only
-//! through `ArrayDesign::pack_in(a, b)`, so each panel is packed with a one-row zero `A` and the
-//! packed `A` stream it returns is discarded (unavoidable with the current public API).
+//! padded); the full fused W8 matrix is never materialised. Panel preparation
+//! calls `ArrayDesign::pack_b` directly, without a discarded activation allocation.
 
 use rayon::prelude::*;
 
 use pm_npu::kernels::gemm_array::ArrayDesign;
 use pm_npu::kernels::gemm_core::{Control, Epilogue};
 use pm_npu::kernels::gemm_g80::design_g80;
+use pm_npu::kernels::{gemm_g80::pack_b_bf16, w8a8_epi::grid15_up};
 
-use crate::shapes::{
+use super::shapes::{
     ColumnMap, EpilogueContract, Family, FamilyMask, Shape, PANEL_COLS, TRUNK_K,
 };
 
@@ -62,6 +62,8 @@ pub struct PackedB {
     pub panels: Vec<Vec<u8>>,
     /// Per fused column row scale `ws_n`, zero padded to `map.padded_cols()`.
     pub ws: Vec<f32>,
+    /// Bf16Direct `(Sm, Se)` per padded fused feature; empty for I32Fold.
+    pub scales: Vec<(u16, i16)>,
     pub map: ColumnMap,
 }
 
@@ -125,9 +127,15 @@ fn decode_row(row: &[u8], out: &mut [f32]) {
 
 /// Quantize one row to W8 codes; `w` is a `k`-float scratch. Returns `ws`.
 fn quantize_row(row: &[u8], w: &mut [f32], out: &mut [i8]) -> f32 {
+    quantize_scaled_row(row, w, out, false).0
+}
+
+fn quantize_scaled_row(row: &[u8], w: &mut [f32], out: &mut [i8], direct: bool) -> (f32, (u16, i16)) {
     decode_row(row, w);
     let absmax = w.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
-    let ws = ((absmax as f64) / 127.0) as f32;
+    let raw = ((absmax as f64) / 127.0) as f32;
+    let grid = if direct { grid15_up(raw) } else { (0, 0) };
+    let ws = if direct { (f64::from(grid.0) * 2f64.powi(i32::from(grid.1))) as f32 } else { raw };
     if ws == 0.0 {
         out.fill(0);
     } else {
@@ -136,7 +144,7 @@ fn quantize_row(row: &[u8], w: &mut [f32], out: &mut [i8]) -> f32 {
             *o = ((x / ws).round_ties_even() as i32).clamp(-127, 127) as i8;
         }
     }
-    ws
+    (ws, grid)
 }
 
 /// W8 codes `[m][k]` row-major and per-row scales of an MQ6G256V2 matrix.
@@ -221,14 +229,22 @@ fn packing_design() -> ArrayDesign {
     design_g80(1, PANEL_COLS, TRUNK_K, Epilogue::I32, Control::Fast)
 }
 
+fn packing_design_with_contract(contract: EpilogueContract) -> ArrayDesign {
+    match contract {
+        EpilogueContract::I32Fold => packing_design(),
+        EpilogueContract::Bf16Direct => design_g80(1, PANEL_COLS, TRUNK_K, Epilogue::Bf16, Control::Fast),
+    }
+}
+
 /// Pack validated selected matrices (`selected[i]` is `map.parts[i]`).
 fn pack_validated(design: &ArrayDesign, map: ColumnMap, selected: &[&MatrixRef<'_>]) -> PackedB {
+    let direct = matches!(design.epilogue(), Some(Epilogue::Bf16));
     let panels = map.panel_count();
     let mut ws = vec![0.0f32; map.padded_cols()];
+    let mut scales = if direct { vec![(0, 0); map.padded_cols()] } else { Vec::new() };
     let mut b = vec![0i8; TRUNK_K * PANEL_COLS];
     let mut w = vec![0.0f32; TRUNK_K];
     let mut codes = vec![0i8; TRUNK_K];
-    let zero_a = vec![0i8; TRUNK_K];
     let rb = row_bytes(TRUNK_K);
     let mut out = Vec::with_capacity(panels);
     for p in 0..panels {
@@ -238,16 +254,17 @@ fn pack_validated(design: &ArrayDesign, map: ColumnMap, selected: &[&MatrixRef<'
             let c0 = col0 as usize;
             for fused in c0.max(lo)..(c0 + cols as usize).min(hi) {
                 let (r, c) = (fused - c0, fused - lo);
-                ws[fused] = quantize_row(&mat.mq6[r * rb..(r + 1) * rb], &mut w, &mut codes);
+                let (scale, grid) = quantize_scaled_row(&mat.mq6[r * rb..(r + 1) * rb], &mut w, &mut codes, direct);
+                ws[fused] = scale;
+                if direct { scales[fused] = grid; }
                 for (k, &v) in codes.iter().enumerate() {
                     b[k * PANEL_COLS + c] = v;
                 }
             }
         }
-        let [_discarded_a, packed_b] = design.pack_in(&zero_a, &b);
-        out.push(packed_b);
+        out.push(if direct { pack_b_bf16(design, &b, &scales[lo..hi]) } else { design.pack_b(&b) });
     }
-    PackedB { panels: out, ws, map }
+    PackedB { panels: out, ws, scales, map }
 }
 
 /// Pack one layer's fused `B` for the families of `families` that belong to `shape`
@@ -263,20 +280,19 @@ pub fn pack_shape(
     pack_shape_with_contract(EpilogueContract::I32Fold, shape, matrices, families)
 }
 
-/// [`pack_shape`] for an explicit contract; unsupported contracts fail before any packing.
+/// [`pack_shape`] for an explicit numerical contract.
 pub fn pack_shape_with_contract(
     contract: EpilogueContract,
     shape: Shape,
     matrices: &[MatrixRef<'_>],
     families: FamilyMask,
 ) -> Result<PackedB, String> {
-    contract.ensure_supported()?;
     let selected = select(shape, matrices, families)?;
     let map = shape.column_map(families);
     if map.panel_count() == 0 {
-        return Ok(PackedB { panels: Vec::new(), ws: Vec::new(), map });
+        return Ok(PackedB { panels: Vec::new(), ws: Vec::new(), scales: Vec::new(), map });
     }
-    Ok(pack_validated(&packing_design(), map, &selected))
+    Ok(pack_validated(&packing_design_with_contract(contract), map, &selected))
 }
 
 /// Pack every layer (contract [`EpilogueContract::I32Fold`]).
@@ -287,7 +303,7 @@ pub fn pack_trunk(
     pack_trunk_with_contract(EpilogueContract::I32Fold, layers, families)
 }
 
-/// [`pack_trunk`] for an explicit contract; unsupported contracts fail before any packing.
+/// [`pack_trunk`] for an explicit numerical contract.
 ///
 /// All layers are validated first (errors name the layer index); packing then runs on a
 /// rayon `par_iter`, one layer per job, with results placed by layer index, so the output
@@ -298,7 +314,6 @@ pub fn pack_trunk_with_contract(
     layers: &[LayerTrunkRefs<'_>],
     families: FamilyMask,
 ) -> Result<PackedTrunk, String> {
-    contract.ensure_supported()?;
     let maps = Shape::ALL.map(|s| s.column_map(families));
     let mut jobs = Vec::new();
     for (i, layer) in layers.iter().enumerate() {
@@ -311,7 +326,7 @@ pub fn pack_trunk_with_contract(
 
     let mut packed: Vec<Option<PackedB>> = (0..layers.len()).map(|_| None).collect();
     if !jobs.is_empty() {
-        let design = packing_design();
+        let design = packing_design_with_contract(contract);
         let done: Vec<(usize, PackedB)> = jobs
             .par_iter()
             .map(|(i, shape, selected)| {
@@ -672,24 +687,56 @@ mod tests {
     }
 
     #[test]
-    fn bf16_direct_fails_before_any_validation_or_packing() {
-        let want = "Bf16Direct pending probe B0".to_string();
-        // Deliberately invalid input: the contract error must win.
+    fn bf16_direct_validates_inputs_and_empty_masks() {
         let bad = [mref(Family::GdnB, &[])];
-        assert_eq!(
-            pack_shape_with_contract(EpilogueContract::Bf16Direct, Shape::GdnIn, &bad, FamilyMask::ALL)
-                .unwrap_err(),
-            want
-        );
-        assert_eq!(
-            pack_trunk_with_contract(EpilogueContract::Bf16Direct, &[], FamilyMask::NONE).unwrap_err(),
-            want
-        );
+        let err = pack_shape_with_contract(EpilogueContract::Bf16Direct, Shape::GdnIn, &bad, FamilyMask::ALL).unwrap_err();
+        assert!(err.contains("missing") || err.contains("expected"), "{err}");
+        let empty = pack_trunk_with_contract(EpilogueContract::Bf16Direct, &[], FamilyMask::NONE).unwrap();
+        assert!(empty.per_layer.is_empty());
         let layers = [LayerTrunkRefs { shape: Shape::GdnIn, matrices: bad.to_vec() }];
-        assert_eq!(
-            pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, FamilyMask::ALL).unwrap_err(),
-            want
-        );
+        let err = pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, FamilyMask::ALL).unwrap_err();
+        assert!(err.starts_with("layer 0:"), "{err}");
+    }
+
+    #[test]
+    fn bf16_direct_weights_match_independent_upward_grid_quantization() {
+        let rows = Family::GdnA.cols();
+        let mut mq6 = synth(rows, 0x846271);
+        mq6[..row_bytes(TRUNK_K)].fill(0);
+        let mat = mref(Family::GdnA, &mq6);
+        let packed = pack_shape_with_contract(EpilogueContract::Bf16Direct, Shape::GdnIn, &[mat], Family::GdnA.into()).unwrap();
+        let mut expected_scales = vec![(0u16, 0i16); PANEL_COLS];
+        let mut b = vec![0i8; TRUNK_K * PANEL_COLS];
+        for row in 0..rows {
+            let mut w = Vec::with_capacity(TRUNK_K);
+            for g in mq6[row * row_bytes(TRUNK_K)..(row + 1) * row_bytes(TRUNK_K)].chunks_exact(GROUP_BYTES) {
+                let hd = |i| h2f(u16::from_le_bytes([g[2 * i], g[2 * i + 1]]));
+                for j in 0..256 {
+                    let bit = j * 6;
+                    let mut q = 0u8;
+                    for k in 0..6 { q |= ((g[8 + (bit + k) / 8] >> ((bit + k) % 8)) & 1) << k; }
+                    let product = f32::from(q) * hd(2 * (j / 128));
+                    w.push(product + hd(2 * (j / 128) + 1));
+                }
+            }
+            let absmax = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let raw = (f64::from(absmax) / 127.0) as f32;
+            if raw == 0.0 { continue; }
+            let mut e = f64::from(raw).log2().floor() as i16 - 14;
+            let mut sm = (f64::from(raw) * 2f64.powi(-i32::from(e))).ceil() as u16;
+            if sm == 32768 { sm = 16384; e += 1; }
+            expected_scales[row] = (sm, e);
+            let s = (f64::from(sm) * 2f64.powi(i32::from(e))) as f32;
+            for (k, &value) in w.iter().enumerate() {
+                let v = value / s; let floor = v.floor(); let fraction = v - floor;
+                let rounded = floor + u8::from(fraction > 0.5 || (fraction == 0.5 && floor % 2.0 != 0.0)) as f32;
+                b[k * PANEL_COLS + row] = rounded.clamp(-127.0, 127.0) as i8;
+            }
+        }
+        assert_eq!(packed.scales, expected_scales);
+        let design = packing_design_with_contract(EpilogueContract::Bf16Direct);
+        assert_eq!(packed.panels[0], pack_b_bf16(&design, &b, &expected_scales));
+        assert_eq!(packed.ws[0], 0.0);
     }
 
     // ---- trunk packing ------------------------------------------------------------------

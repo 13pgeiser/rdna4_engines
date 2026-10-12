@@ -1478,11 +1478,14 @@ dependencies = [
 name = "hipfire-arch-qwen4"
 version = "0.4.2"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-runtime",
  "memmap2",
+ "pm-npu",
+ "rayon",
  "rdna-compute",
  "saddle-quant",
  "serde_json",
@@ -1719,16 +1722,6 @@ dependencies = [
  "saddle-core",
  "serde_json",
  "sha2",
-]
-
-[[package]]
-name = "hipfire-npu-trunk"
-version = "0.4.2"
-dependencies = [
- "half",
- "hipfire-config",
- "pm-npu",
- "rayon",
 ]
 
 [[package]]
