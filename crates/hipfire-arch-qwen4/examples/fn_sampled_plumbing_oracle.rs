@@ -70,7 +70,7 @@ use sha2::{Digest, Sha256};
 use hip_bridge::KernargBlob;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 const EOS_NONE: u32 = u32::MAX;
@@ -114,6 +114,50 @@ fn backend() -> RowsBackend {
     } else {
         RowsBackend::Reference
     }
+}
+/// Production PM kernel or its explicit hipcc oracle twin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Impl {
+    Pm,
+    HipTwin,
+}
+impl Impl {
+    fn name(self) -> &'static str {
+        match self {
+            Impl::Pm => "pm",
+            Impl::HipTwin => "hip-twin",
+        }
+    }
+    fn code(self) -> u8 {
+        (self == Impl::HipTwin) as u8
+    }
+    fn parse(v: &str, flag: &str) -> R<Impl> {
+        match v {
+            "pm" => Ok(Impl::Pm),
+            "hip-twin" => Ok(Impl::HipTwin),
+            other => setup(format!("{flag} {other}: want pm|hip-twin")),
+        }
+    }
+}
+static ROWS_IMPL: AtomicU8 = AtomicU8::new(0);
+static ACCEPT_IMPL: AtomicU8 = AtomicU8::new(0);
+static TWIN: AtomicBool = AtomicBool::new(false);
+fn rows_impl() -> Impl {
+    if ROWS_IMPL.load(Ordering::Relaxed) == 1 {
+        Impl::HipTwin
+    } else {
+        Impl::Pm
+    }
+}
+fn accept_impl() -> Impl {
+    if ACCEPT_IMPL.load(Ordering::Relaxed) == 1 {
+        Impl::HipTwin
+    } else {
+        Impl::Pm
+    }
+}
+fn twin_enabled() -> bool {
+    TWIN.load(Ordering::Relaxed)
 }
 fn n_kinds() -> usize {
     if backend() == RowsBackend::CanonicalParallelF32 {
@@ -812,6 +856,12 @@ struct Args {
     skip_timing: bool,
     rows_backend: RowsBackend,
     timing_policy_index: usize,
+    /// Implementation behind the canonical rows backend in windows/graphs/timing.
+    rows_impl: Impl,
+    /// Implementation behind ordered accept in windows/graphs/timing.
+    accept_impl: Impl,
+    /// Cross-check PM against its hipcc twin when the device has PM images.
+    twin_cross_check: bool,
 }
 
 fn parse_args() -> R<Args> {
@@ -831,6 +881,9 @@ fn parse_args() -> R<Args> {
         skip_timing: false,
         rows_backend: RowsBackend::Reference,
         timing_policy_index: 1,
+        rows_impl: Impl::Pm,
+        accept_impl: Impl::Pm,
+        twin_cross_check: true,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -861,6 +914,15 @@ fn parse_args() -> R<Args> {
             "--replays" => a.replays = num(&v, f)? as usize,
             "--timing-iters" => a.timing_iters = num(&v, f)? as usize,
             "--timing-windows" => a.timing_windows = num(&v, f)? as usize,
+            "--rows-impl" => a.rows_impl = Impl::parse(&v, f)?,
+            "--accept-impl" => a.accept_impl = Impl::parse(&v, f)?,
+            "--twin-cross-check" => {
+                a.twin_cross_check = match v.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return setup(format!("--twin-cross-check {other}: want on|off")),
+                }
+            }
             "--rows-backend" => {
                 a.rows_backend = match v.as_str() {
                     "reference" => RowsBackend::Reference,
@@ -1088,6 +1150,8 @@ struct Res {
     props: GpuTensor,
     tape: GpuTensor,
     result: GpuTensor,
+    /// Second result buffer for the PM == HIP twin accept cross-check.
+    result2: GpuTensor,
     cap_k: usize,
     cap_vocab: usize,
 }
@@ -1123,6 +1187,7 @@ fn alloc_res(gpu: &mut Gpu, cap_k: usize, cap_vocab: usize) -> R<Res> {
         props: hip(sc::spec_cpu_ar_alloc_u32(gpu, cap_k.max(1)), "alloc props")?,
         tape: hip(sc::spec_cpu_ar_alloc_f32(gpu, 2 * cap_k + 1), "alloc tape")?,
         result: hip(sc::spec_cpu_ar_alloc_u32(gpu, 2), "alloc result")?,
+        result2: hip(sc::spec_cpu_ar_alloc_u32(gpu, 2), "alloc result2")?,
         cap_k,
         cap_vocab,
     })
@@ -1141,6 +1206,7 @@ fn free_res(gpu: &mut Gpu, res: Res) {
     let _ = gpu.free_tensor(res.props);
     let _ = gpu.free_tensor(res.tape);
     let _ = gpu.free_tensor(res.result);
+    let _ = gpu.free_tensor(res.result2);
 }
 
 // ── windows ──────────────────────────────────────────────────────────
@@ -1566,9 +1632,38 @@ fn rows_enqueue(
             Some(s) => gpu.spec_cpu_ar_rows_enqueue(&res.logits, &res.tgt, s, vocab, rows, policy),
             None => Err(HipError::new(0, "reference rows backend allocated no scratch")),
         },
-        RowsBackend::CanonicalParallelF32 => {
-            gpu.spec_cpu_ar_rows_parallel_enqueue(&res.logits, &res.tgt, vocab, rows, policy)
-        }
+        RowsBackend::CanonicalParallelF32 => match rows_impl() {
+            Impl::Pm => {
+                gpu.spec_cpu_ar_rows_parallel_enqueue(&res.logits, &res.tgt, vocab, rows, policy)
+            }
+            Impl::HipTwin => gpu.spec_cpu_ar_rows_parallel_hip_twin_enqueue(
+                &res.logits,
+                &res.tgt,
+                vocab,
+                rows,
+                policy,
+            ),
+        },
+    }
+}
+
+/// Ordered accept of the given implementation into `result` (PM production
+/// kernel or the explicit hipcc twin), same arguments and bytes.
+fn accept_enqueue_with(
+    gpu: &mut Gpu,
+    res: &Res,
+    which: Impl,
+    result: &GpuTensor,
+    k: usize,
+    eos: u32,
+) -> HipResult<()> {
+    match which {
+        Impl::Pm => gpu.spec_accept_ordered_enqueue(
+            &res.tgt, &res.drf, &res.props, &res.tape, result, k, eos,
+        ),
+        Impl::HipTwin => gpu.spec_accept_ordered_hip_twin_enqueue(
+            &res.tgt, &res.drf, &res.props, &res.tape, result, k, eos,
+        ),
     }
 }
 
@@ -1611,8 +1706,8 @@ fn enqueue_window(
         }
     }
     hip(
-        gpu.spec_accept_ordered_enqueue(&res.tgt, &res.drf, &res.props, &res.tape, &res.result, k, eos),
-        "spec_accept_ordered_enqueue",
+        accept_enqueue_with(gpu, res, accept_impl(), &res.result, k, eos),
+        "ordered accept enqueue",
     )?;
     let now = gpu.graphs.capture_blobs.len();
     nodes.push(("accept".into(), now - last));
@@ -1645,6 +1740,9 @@ struct Stats {
     enq_cand: u64,
     enq_accept: u64,
     enq_traffic: Tally,
+    twin_rows: u64,
+    twin_row_words: u64,
+    twin_accept: u64,
     diag_rows: u64,
     diag_row_mismatch: u64,
     diag_first: Vec<String>,
@@ -1958,9 +2056,146 @@ fn run_window(
     st.enq_rows += 1;
     st.enq_cand += cu.iter().flatten().count() as u64;
     st.enq_accept += 1;
+    if twin_enabled() {
+        // The other ordered-accept implementation on the same resident
+        // target/draft rows, proposals and tape; result words must be equal.
+        let other = if accept_impl() == Impl::Pm { Impl::HipTwin } else { Impl::Pm };
+        sync(gpu)?;
+        h2d(gpu, &res.result2, &u32_bytes(&[0xDEAD_BEEF, 0xDEAD_BEEF]))?;
+        let b = tally();
+        hip(
+            accept_enqueue_with(gpu, res, other, &res.result2, win.k, eos_word(win.eos)),
+            "twin accept enqueue",
+        )?;
+        let d = tally().since(b);
+        if d.any_host_traffic() {
+            return mismatch(format!(
+                "{label} [{}]: transfer/sync inside twin accept enqueue: {}",
+                win.name,
+                d.json()
+            ));
+        }
+        sync(gpu)?;
+        let a = bytes_u32(&d2h(gpu, &res.result, 8)?);
+        let c = bytes_u32(&d2h(gpu, &res.result2, 8)?);
+        if a != c {
+            return mismatch(format!(
+                "{label} [{}]: accept {} words {a:?} != {} words {c:?} (k={} eos={:?} drafts={:?})",
+                win.name,
+                accept_impl().name(),
+                other.name(),
+                win.k,
+                win.eos,
+                win.drafts
+            ));
+        }
+        st.twin_accept += 1;
+    }
     check_window(gpu, res, win, spec, label, st)?;
     st.windows += 1;
     Ok(())
+}
+
+// ── PM == HIP twin ───────────────────────────────────────────────────
+
+/// Production PM kernels versus their explicit hipcc twins on identical
+/// resident inputs. Output buffers are pre-filled with different patterns so a
+/// word neither kernel writes cannot compare equal. No tolerance.
+fn run_twin_rows(
+    gpu: &mut Gpu,
+    corpora_v: &[(usize, Vec<Vec<f32>>)],
+    pols: &[(SampleSpec, String)],
+    st: &mut Stats,
+) -> R<Value> {
+    let max_rows = corpora_v
+        .iter()
+        .map(|(_, r)| r.len())
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 32);
+    let cap_v = corpora_v.iter().map(|(v, _)| *v).max().unwrap_or(1);
+    let res = alloc_res(gpu, max_rows - 1, cap_v)?;
+    let twin = hip(sc::SpecDistRows::new(gpu, max_rows), "twin rows")?;
+    let mut cases = 0u64;
+    for (vocab, rows) in corpora_v {
+        for chunk in rows.chunks(max_rows) {
+            let n = chunk.len();
+            let mut flat = Vec::with_capacity(n * vocab);
+            for r in chunk {
+                flat.extend_from_slice(r);
+            }
+            h2d(gpu, &res.logits, &f32_bytes(&flat))?;
+            for (pi, (spec, pname)) in pols.iter().enumerate() {
+                for (t, pat) in [(&res.tgt, 0xA5A5_A5A5u32), (&twin, 0x5A5A_5A5Au32)] {
+                    h2d(gpu, &t.counts, &u32_bytes(&vec![pat; t.capacity_rows]))?;
+                    h2d(gpu, &t.ids, &u32_bytes(&vec![pat; t.capacity_rows * CAP]))?;
+                    h2d(gpu, &t.probabilities, &u32_bytes(&vec![pat; t.capacity_rows * CAP]))?;
+                }
+                sync(gpu)?;
+                let before = tally();
+                hip(
+                    gpu.spec_cpu_ar_rows_parallel_enqueue(&res.logits, &res.tgt, *vocab, n, policy_of(*spec)),
+                    "pm rows enqueue",
+                )?;
+                hip(
+                    gpu.spec_cpu_ar_rows_parallel_hip_twin_enqueue(&res.logits, &twin, *vocab, n, policy_of(*spec)),
+                    "hip twin rows enqueue",
+                )?;
+                let during = tally().since(before);
+                if during.any_host_traffic() {
+                    return mismatch(format!(
+                        "pm/hip twin rows: transfer/sync inside enqueue calls: {}",
+                        during.json()
+                    ));
+                }
+                st.enq_traffic.add(during);
+                sync(gpu)?;
+                let rd = |t: &sc::SpecDistRows| -> R<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+                    Ok((
+                        bytes_u32(&d2h(gpu, &t.counts, n * 4)?),
+                        bytes_u32(&d2h(gpu, &t.ids, n * CAP * 4)?),
+                        bytes_u32(&d2h(gpu, &t.probabilities, n * CAP * 4)?),
+                    ))
+                };
+                let (pc, pi_, pp) = rd(&res.tgt)?;
+                let (hc, hi, hp) = rd(&twin)?;
+                for r in 0..n {
+                    if pc[r] != hc[r] {
+                        return mismatch(format!(
+                            "pm/hip twin rows vocab={vocab} policy[{pi}]({pname}) row {r}: count pm={} hip={}",
+                            pc[r], hc[r]
+                        ));
+                    }
+                    for i in 0..CAP {
+                        let (a, b) = (r * CAP + i, r * CAP + i);
+                        if pi_[a] != hi[b] || pp[a] != hp[b] {
+                            return mismatch(format!(
+                                "pm/hip twin rows vocab={vocab} policy[{pi}]({pname}) row {r} slot {i} (count {}): \
+                                 pm=(id {}, bits {:#010x}={}) hip=(id {}, bits {:#010x}={})",
+                                pc[r],
+                                pi_[a],
+                                pp[a],
+                                f32::from_bits(pp[a]),
+                                hi[b],
+                                hp[b],
+                                f32::from_bits(hp[b])
+                            ));
+                        }
+                    }
+                }
+                st.twin_rows += n as u64;
+                st.twin_row_words += (n * (1 + 2 * CAP)) as u64;
+                cases += 1;
+            }
+        }
+    }
+    free_res(gpu, res);
+    let _ = twin.free(gpu);
+    Ok(json!({
+        "cases": cases,
+        "compared": "counts + all 64 id slots + all 64 probability slots per row, bit exact PM vs hipcc twin",
+        "vocabs": corpora_v.iter().map(|(v, r)| json!({"vocab": v, "rows": r.len()})).collect::<Vec<_>>(),
+    }))
 }
 
 // ── distribution oracle ──────────────────────────────────────────────
@@ -2835,6 +3070,13 @@ fn fill_stats(rec: &mut Map<String, Value>, st: &Stats) {
         }),
     );
     rec.insert("coverage".into(), json!(st.cov));
+    rec.insert(
+        "pm_hip_twin_compared_exact".into(),
+        json!({
+            "rows": st.twin_rows, "row_words_counts_ids_probs": st.twin_row_words,
+            "accept_result_words_windows": st.twin_accept,
+        }),
+    );
     rec.insert("canonical_target_oracle".into(), exp_diag_json(st));
     rec.insert(
         "enqueue_calls".into(),
@@ -2891,11 +3133,56 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
             json!(std::fs::read(src).ok().map(|b| sha_hex(&b)));
     }
     rec.insert("identity".into(), ident);
-    hip(gpu.spec_cpu_ar_precompile(), "spec_cpu_ar_precompile")?;
-    if backend() == RowsBackend::CanonicalParallelF32 {
+    ROWS_IMPL.store(args.rows_impl.code(), Ordering::Relaxed);
+    ACCEPT_IMPL.store(args.accept_impl.code(), Ordering::Relaxed);
+    let supported = gpu.spec_cpu_ar_device_supported();
+    TWIN.store(supported && args.twin_cross_check, Ordering::Relaxed);
+    {
+        let isa = |name: &str| -> Value {
+            let p = format!(
+                "{}/../hipfire-isa/kernels/{name}.{}.contract.json",
+                env!("CARGO_MANIFEST_DIR"),
+                gpu.arch
+            );
+            json!({"path": p, "sha256": std::fs::read(&p).ok().map(|b| sha_hex(&b))})
+        };
+        rec.insert(
+            "pm_hip_twin_config".into(),
+            json!({
+                "arch": gpu.arch,
+                "device_supported_pm_images": supported,
+                "rows_impl_used_by_windows_when_canonical": args.rows_impl.name(),
+                "accept_impl_used_by_windows": args.accept_impl.name(),
+                "twin_cross_check": supported && args.twin_cross_check,
+                "pm_rows_symbol": sc::spec_cpu_ar_rows_parallel_pm_symbol(&gpu.arch),
+                "pm_accept_symbol": sc::spec_accept_ordered_pm_symbol(&gpu.arch),
+                "rows_contract": isa("spec_sampling_rows_pm"),
+                "accept_contract": isa("spec_accept_pm"),
+                "hip_twin_rows_source": concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels/src/spec_sampling_cpu_ar_parallel.hip"),
+                "hip_twin_accept_and_serial_source": concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels/src/spec_sampling_cpu_ar.hip"),
+            }),
+        );
+    }
+    // Serial reference rows, candidates and the HIP accept twin: explicit
+    // oracle setup. The HIP parallel rows twin is always bound.
+    hip(gpu.spec_cpu_ar_oracle_precompile(), "spec_cpu_ar_oracle_precompile")?;
+    hip(
+        gpu.spec_cpu_ar_rows_parallel_hip_twin_precompile(),
+        "spec_cpu_ar_rows_parallel_hip_twin_precompile",
+    )?;
+    let canonical = backend() == RowsBackend::CanonicalParallelF32;
+    if supported
+        || args.accept_impl == Impl::Pm
+        || (canonical && args.rows_impl == Impl::Pm)
+    {
+        // On an arch without PM images this errors, by design (no fallback).
         hip(
             gpu.spec_cpu_ar_rows_parallel_precompile(),
             "spec_cpu_ar_rows_parallel_precompile",
+        )?;
+        hip(
+            gpu.spec_accept_ordered_precompile(),
+            "spec_accept_ordered_precompile",
         )?;
     }
     let selfcheck = local_law_selfcheck(args.seed)?;
@@ -2989,6 +3276,29 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
             rec.insert("distribution".into(), v);
         }
         Err(e) => return finish_fail(rec, "distribution", e, &st),
+    }
+
+    // 1b. PM == HIP twin, target rows: both kernels on identical resident
+    // logits, every output word compared (counts, all 64 id and probability
+    // slots including zero tails). Runs whenever this device has PM images.
+    if twin_enabled() {
+        let mut trng = Rng(args.seed ^ 0x7770);
+        let mut tc: Vec<(usize, Vec<Vec<f32>>)> = Vec::new();
+        for v in [args.vocab, 37usize, 10, 64, 1023, 1024, 1025, 2047, 2049, 3500] {
+            let rows: Vec<Vec<f32>> = (0..N_KINDS_CANON)
+                .map(|kind| gen_row(kind, v, &mut trng))
+                .collect();
+            tc.push((v, rows));
+        }
+        if let Some(c) = corpora.iter().find(|c| c.name == "real_rows") {
+            tc.push((c.vocab, c.rows.clone()));
+        }
+        match run_twin_rows(&mut gpu, &tc, &pols, &mut st) {
+            Ok(v) => {
+                rec.insert("pm_hip_twin_rows".into(), v);
+            }
+            Err(e) => return finish_fail(rec, "pm_hip_twin_rows", e, &st),
+        }
     }
 
     // 2. Windows: candidates + accept + RNG, direct enqueue.
