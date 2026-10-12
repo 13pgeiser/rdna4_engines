@@ -19,6 +19,7 @@
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::gpu_forward::{
     qwen4_ep_buffer_index, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS,
+    QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::MoeRowGather;
@@ -33,6 +34,7 @@ use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -669,6 +671,9 @@ fn sync_device(gpu: &mut Gpu) -> Result<(), String> {
         .map_err(|error| format!("device synchronize: {error}"))
 }
 
+/// `last_buffer` before any invocation.
+const NO_BUFFER: usize = usize::MAX;
+
 /// The row-gather hook one rank installs into its forward
 /// (`Qwen4GpuForward::attach_ep`).
 pub(crate) struct Qwen4EpRowGatherHook {
@@ -678,6 +683,20 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// Device addresses of this rank's gather buffers, to check the expanded
     /// rows the stage hands over are the buffer it exchanges.
     buffer_ptrs: [usize; QWEN4_EP_GATHER_BUFFERS],
+    /// Buffer index of this rank's previous invocation. The transport's hazard
+    /// rule forbids the same buffer on two consecutive invocations.
+    last_buffer: AtomicUsize,
+}
+
+/// Record `buffer` as the rank's current invocation in `last`; `Err` when the
+/// previous invocation used the same one.
+fn note_gather_buffer(last: &AtomicUsize, rank: usize, buffer: usize) -> Result<(), String> {
+    if last.swap(buffer, Ordering::Relaxed) == buffer {
+        return Err(format!(
+            "qwen4 EP row gather: gather buffer {buffer} of rank {rank} used by two consecutive invocations"
+        ));
+    }
+    Ok(())
 }
 
 impl MoeRowGather for Qwen4EpRowGatherHook {
@@ -685,6 +704,7 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         &self,
         gpu: &mut Gpu,
         layer_idx: u16,
+        slots: usize,
         down_expanded: &GpuTensor,
         topk_indices: &GpuTensor,
     ) -> Result<(), String> {
@@ -696,9 +716,29 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
                 self.rank
             ));
         }
+        note_gather_buffer(&self.last_buffer, self.rank, buffer)?;
         self.gather
-            .exchange(gpu, self.rank, buffer, topk_indices)
+            .exchange(gpu, self.rank, buffer, topk_indices, slots)
             .map_err(|error| format!("qwen4 EP row gather layer {layer_idx} rank {}: {error}", self.rank))
+    }
+}
+
+#[cfg(test)]
+mod gather_hook_tests {
+    use super::*;
+
+    #[test]
+    fn consecutive_gathers_never_reuse_a_buffer() {
+        let last = AtomicUsize::new(NO_BUFFER);
+        // Trunk parity, then the head's two buffers interleaved with the trunk.
+        for buffer in [0, 1, 0, 1, 2, 0, 3, 1, 2, 3, 0] {
+            note_gather_buffer(&last, 1, buffer).unwrap();
+        }
+        let error = note_gather_buffer(&last, 1, 0).unwrap_err();
+        assert!(error.contains("buffer 0") && error.contains("rank 1"), "{error}");
+        // The same buffer twice in a row is refused wherever it occurs.
+        assert!(note_gather_buffer(&last, 1, 2).is_ok());
+        assert!(note_gather_buffer(&last, 1, 2).is_err());
     }
 }
 
@@ -881,7 +921,7 @@ impl Qwen4Bundle {
         let trunk_layers = self.config.num_hidden_layers;
         let spec = EpRowGatherSpec {
             ranks,
-            slots: self.config.num_experts_per_tok,
+            slots: QWEN4_EP_GATHER_MAX_ROWS * self.config.num_experts_per_tok,
             row_bytes: self.config.hidden_size * std::mem::size_of::<f32>(),
         };
         let fingerprint = self.ep_replication_fingerprint();
@@ -1018,6 +1058,7 @@ impl Qwen4Bundle {
                 trunk_layers,
                 gather: gather.clone(),
                 buffer_ptrs: buffers.map(|buffer| buffer.buf.as_ptr() as usize),
+                last_buffer: AtomicUsize::new(NO_BUFFER),
             });
             let mut forward = bundle
                 .execution

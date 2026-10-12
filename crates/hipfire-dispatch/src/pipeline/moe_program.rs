@@ -1094,12 +1094,68 @@ impl<'a> SealedMoeOp<'a> {
     }
 
     pub(super) fn row_gather(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
-        let (params, _) = self.state.decode_parts()?;
-        let gather = params.ep_row_gather.ok_or_else(|| {
-            DispatchError::Hip("sealed moe: row gather lowered without a gather".into())
-        })?;
+        let missing =
+            || DispatchError::Hip("sealed moe: row gather lowered without a gather".into());
+        let overflow =
+            || DispatchError::Hip("sealed moe: row gather extent overflows".into());
+        // The gather, the layer, the slot count and the producer's buffers, per
+        // protocol: one decode row's `k` slots, or a few-row prefill's
+        // `batch_size * k_top` slots in slot order.
+        let (gather, layer_idx, slots, width, down_expanded, topk_indices) =
+            match self.state.call.protocol() {
+                MoeProtocol::IndexedDecode => {
+                    let (params, _) = self.state.decode_parts()?;
+                    let gather = params.ep_row_gather.ok_or_else(missing)?;
+                    (
+                        gather,
+                        params.layer_idx,
+                        params.k,
+                        params.hidden,
+                        params.down_expanded,
+                        params.topk_indices,
+                    )
+                }
+                MoeProtocol::GroupedPrefill => {
+                    let (params, selection) = self.state.prefill_parts()?;
+                    let gather = params.ep_row_gather.ok_or_else(missing)?;
+                    if !selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+                        || !super::qt44_qt53_prefill::writes_slot_ordered_rows(
+                            gpu,
+                            params,
+                            selection.resolution.use_path2,
+                        )
+                    {
+                        return Err(DispatchError::Hip(
+                            "sealed moe: an EP row gather needs the grouped QT44/QT53 down to have written slot-ordered expanded rows".into(),
+                        ));
+                    }
+                    // The unfused shared down runs after the combine and would
+                    // overwrite rows a peer may still be reading.
+                    let shared_out = params.shared_down_out.ok_or_else(|| {
+                        DispatchError::Hip(
+                            "sealed moe: a prefill EP row gather requires a separate shared-down output".into(),
+                        )
+                    })?;
+                    if shared_out.buf.as_ptr() == params.down_expanded.buf.as_ptr() {
+                        return Err(DispatchError::Hip(
+                            "sealed moe: the shared-down output aliases the gathered expanded rows".into(),
+                        ));
+                    }
+                    (
+                        gather,
+                        params.ep_layer_idx,
+                        params
+                            .batch_size
+                            .checked_mul(params.k_top)
+                            .ok_or_else(overflow)?,
+                        params.down_m,
+                        params.down_expanded,
+                        params.topk_indices,
+                    )
+                }
+            };
         // The exchange waits on peer devices and a host barrier; neither can
-        // be recorded into a graph or retained body. EP decode is eager-only.
+        // be recorded into a graph or retained body. EP is eager-only.
         if gpu.graphs.capture_mode
             || gpu.graphs.verify.capturing.is_some()
             || gpu.graphs.replay.capturing.is_some()
@@ -1109,13 +1165,10 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: expert-parallel row gather refused while a graph capture or replay record is armed".into(),
             ));
         }
-        let rows = params
-            .k
-            .checked_mul(params.hidden)
-            .ok_or_else(|| DispatchError::Hip("sealed moe: row gather extent overflows".into()))?;
-        let down_expanded = super::slice_moe_f32_view(params.down_expanded, 0, rows);
+        let rows = slots.checked_mul(width).ok_or_else(overflow)?;
+        let down_expanded = super::slice_moe_f32_view(down_expanded, 0, rows);
         gather
-            .gather_rows(gpu, params.layer_idx, &down_expanded, params.topk_indices)
+            .gather_rows(gpu, layer_idx, slots, &down_expanded, topk_indices)
             .map_err(|error| DispatchError::Hip(format!("sealed moe: EP row gather: {error}")))
     }
 }
@@ -1240,6 +1293,17 @@ fn lower_prefill<'a>(
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
+    if params.ep_row_gather.is_some()
+        && (!selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+            || params.routed_out.is_some())
+    {
+        // The gather fills the expanded rows the grouped QT44/QT53 down wrote,
+        // for the canonical combine into the residual; every other prefill
+        // lowering has a different row layout or EP contract.
+        return Err(DispatchError::Hip(
+            "sealed moe: a prefill EP row gather requires the grouped QT44/QT53 route combining into the residual".into(),
+        ));
+    }
     if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         append_step(
@@ -1271,6 +1335,9 @@ fn lower_prefill<'a>(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::MutationFence),
         )?;
+        if params.ep_row_gather.is_some() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::RowGather))?;
+        }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
         if params.recipe.shared_after_combine() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
@@ -1351,6 +1418,23 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+}
+
+/// The MoE stages a call lowers to, in order (test probe: nothing launches).
+#[cfg(test)]
+pub(super) fn lowered_stages(call: &SealedMoeCall<'_>) -> Result<Vec<MoeStage>, DispatchError> {
+    let state = MoeStepState::new(call);
+    let steps = match call.protocol() {
+        MoeProtocol::IndexedDecode => lower_decode(&state)?,
+        MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
+    };
+    Ok(steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::MoeStage(_, stage) => Some(*stage),
+            _ => None,
+        })
+        .collect())
 }
 
 /// [`execute`] for a call preceded by `Step::Clear(clear)` and, optionally,

@@ -729,19 +729,22 @@ pub trait RoutedExpertWeights {
     }
 }
 
-/// Expert-parallel row exchange for the indexed decode MoE.
+/// Expert-parallel row exchange for the indexed decode MoE and the few-row
+/// grouped QT44/QT53 prefill.
 ///
-/// Invoked once per decode MoE call after the routed down producer wrote the
-/// `k` unweighted expanded rows into `down_expanded` and before the canonical
-/// combine reads them. The implementation must leave every slot whose expert
-/// this rank owns untouched and overwrite every other slot with the owning
-/// rank's bits (a copy, never arithmetic), so the unchanged combine folds
-/// exactly the rows a single device would have produced.
+/// Invoked once per MoE call after the routed down producer wrote `slots`
+/// unweighted expanded rows (slot order, `slots = rows * k`) into
+/// `down_expanded` and before the canonical combine reads them. The
+/// implementation must leave every slot whose expert this rank owns untouched
+/// and overwrite every other slot with the owning rank's bits (a copy, never
+/// arithmetic), so the unchanged combine folds exactly the rows a single
+/// device would have produced. Decode passes `slots = k`.
 pub trait MoeRowGather {
     fn gather_rows(
         &self,
         gpu: &mut rdna_compute::Gpu,
         layer_idx: u16,
+        slots: usize,
         down_expanded: &GpuTensor,
         topk_indices: &GpuTensor,
     ) -> Result<(), String>;
@@ -1181,6 +1184,19 @@ pub struct MoePrefillParams<'a> {
     /// no all-reduce). `None` (the default) accumulates routed into `x_batch`,
     /// byte-identical to pre-EP behavior.
     pub routed_out: Option<&'a GpuTensor>,
+    /// Few-row EP row gather (qwen4 EP speculation): when `Some`, the lowering
+    /// admits only the grouped QT44/QT53 branch and inserts a `RowGather` stage
+    /// between the mutation fence and the combine. `None` (the default) changes
+    /// nothing.
+    pub ep_row_gather: Option<&'a dyn MoeRowGather>,
+    /// Where the unfused shared-expert down writes its F32 rows. `None` ⇒
+    /// `down_expanded` (the shared down runs after the combine and would
+    /// otherwise overwrite rows a peer may still be gathering). Required with
+    /// `ep_row_gather`.
+    pub shared_down_out: Option<&'a GpuTensor>,
+    /// Layer index handed to `ep_row_gather` (it selects the gather buffer);
+    /// read only when `ep_row_gather` is `Some`, `0` otherwise.
+    pub ep_layer_idx: u16,
 }
 /// Dtype-only admission snapshot for grouped MoE prefill.
 ///

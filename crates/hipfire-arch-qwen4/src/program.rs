@@ -282,9 +282,14 @@ pub struct Qwen4MoeBinding<'a> {
     pub expert_down_entries: &'a [usize],
     pub layer_idx: u16,
     pub norm_topk_prob: bool,
-    /// Expert-parallel decode row exchange (`None` outside EP): installed into the
-    /// one-row decode MoE so non-owned expanded rows are filled from their owners.
+    /// Expert-parallel row exchange (`None` outside EP): installed into the
+    /// one-row decode MoE and the few-row grouped prefill MoE so non-owned
+    /// expanded rows are filled from their owners.
     pub row_gather: Option<&'a dyn hipfire_dispatch::families::moe::MoeRowGather>,
+    /// Few-row EP prefill only: where the unfused shared down writes its F32
+    /// rows (the layer's `moe_down_expanded` is then a gather buffer). `None`
+    /// everywhere else.
+    pub shared_down_out: Option<&'a GpuTensor>,
 }
 
 /// Family-owned reusable views into the central program's scratch layout.
@@ -1074,6 +1079,9 @@ fn build_moe_prefill<'a>(
         paro_down: None,
         down_awq_scale: None,
         routed_out: None,
+        ep_row_gather: moe.row_gather,
+        shared_down_out: moe.shared_down_out,
+        ep_layer_idx: moe.layer_idx,
     })
 }
 

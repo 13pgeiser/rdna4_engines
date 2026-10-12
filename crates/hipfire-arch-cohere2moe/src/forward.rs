@@ -823,6 +823,9 @@ pub fn forward_batch(
                     paro_down: params_down_paro,
                     down_awq_scale: None,
                     routed_out: None,
+                    ep_row_gather: None,
+                    shared_down_out: None,
+                    ep_layer_idx: 0,
                 };
                 let call = seal_prefill(bound, &ctx, params)
                     .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;

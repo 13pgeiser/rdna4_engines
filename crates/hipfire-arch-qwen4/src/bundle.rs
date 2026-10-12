@@ -870,6 +870,9 @@ impl Qwen4Bundle {
             &self.config,
             max_seq,
             self.state.qsa_backend(),
+            // The forward is attached before the head: its EP binding (placement
+            // and the rank's dummy expert) builds the head's EP decode table.
+            self.execution.as_ref().and_then(Qwen4GpuForward::ep_binding),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
@@ -1492,6 +1495,7 @@ impl Qwen4Bundle {
             position,
             fresh_qsa_selection,
             MtpStep::Predict,
+            self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?
         .ok_or_else(|| {
@@ -1521,6 +1525,7 @@ impl Qwen4Bundle {
                 position,
                 fresh_qsa_selection,
                 top1_out,
+                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
@@ -1784,6 +1789,7 @@ impl Qwen4Bundle {
                 position,
                 fresh_qsa_selection,
                 MtpStep::Advance,
+                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -1809,6 +1815,7 @@ impl Qwen4Bundle {
                 position,
                 true,
                 MtpStep::Append,
+                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -1932,6 +1939,7 @@ impl Qwen4Bundle {
             position,
             fresh_qsa_selection,
             logits,
+            self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))
     }
