@@ -69,6 +69,10 @@ name = "mtp_dense_det_pm"
 required-features = ["lab"]
 
 [[example]]
+name = "mtp_q8_det_byte_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_shared_gu_pm"
 required-features = ["lab"]
 
