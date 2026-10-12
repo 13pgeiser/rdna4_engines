@@ -129,7 +129,7 @@ continuations diverged could net-lose.
 | Qwen 3.6 27B | code (HumanEval/53) | 44.2 | **185.5** | **4.19×** | 9.25 |
 
 **Config context for the snapshot (not a timeless default):** CLI default
-`dflash_mode` is `"off"` (`crates/hipfire-config/src/lib.rs`); DFlash is opt-in until a campaign
+`dflash_mode` is `"off"` (`crates/hipfire-config/src/lib.rs`), except that the Qwen3.8-27B tiers with a registry-declared draft resolve `auto` ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)); DFlash is opt-in elsewhere until a campaign
 proves a broader win. Enable globally with `hipfire config set dflash_mode auto`
 (dense Qwen 3.5+ on, A3B off unless overridden) or per model with
 `hipfire config qwen3.5:27b set dflash_mode on`. The numbers above were measured

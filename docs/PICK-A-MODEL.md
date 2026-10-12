@@ -35,8 +35,12 @@ more room than the weights alone; see the KV notes in
 
 - **Defaults** (`speculation=auto`, `dflash_mode=off`): eligible MTP paths may
   still engage; DFlash stays off. Force plain AR with
-  `hipfire config set speculation off`.
-- **DFlash** is opt-in: `hipfire pull <tag>-draft`, then
+  `hipfire config set speculation off`. Exception: `qwen3.8:27b` and its
+  `mq3*` / `mq4*` tiers resolve `dflash_mode=auto` from the registry, so a
+  paired draft file that is present is used (absent: MTP `auto` as before);
+  `hipfire config <tag> set dflash_mode off` opts out
+  ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)).
+- **DFlash** elsewhere is opt-in: `hipfire pull <tag>-draft`, then
   `hipfire config <tag> set dflash_mode auto`. It helped code prompts and hurt
   prose in fixture [B]; measure your own workload before leaving it on.
 

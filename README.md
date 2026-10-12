@@ -95,6 +95,10 @@ median of 3:
 | Native MTP decode, tok/s (greedy, 8 mixed prompts) | 87.5 | 68.0 | 27.5 |
 | DFlash decode (opt-in), tok/s (greedy, 8 mixed prompts) | 131.7 | 123.3 | 43.2 |
 
+In 0.4.2, Qwen3.8-27B defaults to DFlash when its registry-paired draft is
+installed; without it, MTP stays `auto`. See the
+[model-scoped default and kill switch](docs/CONFIG.md#qwen38-27b-paired-dflash-default).
+
 On code prompts, DFlash on the R9700 reaches a median of 238.7 tok/s.
 
 Also in v0.4.1: an engine-owned **session cache** for Flash-Next prompt reuse

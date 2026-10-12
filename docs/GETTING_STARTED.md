@@ -411,7 +411,7 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
 | `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
-| `dflash_mode` | **`off`** | DFlash is opt-in; pulling a draft does not enable it |
+| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto`. `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
 | `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no auth, no TLS) |
@@ -424,7 +424,7 @@ hipfire pull qwen3.5:9b-draft
 hipfire config set dflash_mode auto    # or on / per-model
 ```
 
-`auto` uses a pulled draft when present; `on` fails the load without it.
+`auto` uses a pulled draft when present; `on` fails the load without it. Qwen3.8-27B paired tiers already resolve `auto` from the registry, so no `config set` is needed there.
 `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` override the registry sidecar.
 Several tags can share one draft file — `hipfire rm` keeps that sidecar while
 another installed target still declares it (see [CLI.md](CLI.md)).
@@ -455,7 +455,7 @@ regression.
 | HIP / `/dev/kfd` / arch errors | `hipfire diag`; match ROCm/HIP version to arch (above) |
 | Model not found | `hipfire list` / `hipfire list -r`; `hipfire pull <tag>` |
 | Port in use / stale serve | `hipfire ps`; `hipfire stop --force`; check `~/.hipfire/serve.pid` and (detached only) `serve.log` |
-| Draft pulled but no speedup | Expected: `dflash_mode` defaults to **off** |
+| Draft pulled but no speedup | Expected for most models: the schema `dflash_mode` default is **off** (Qwen3.8-27B paired tiers resolve `auto` from the registry; check `hipfire config <tag>` and that the draft file is present, else only MTP runs) |
 | Truncated answers, or empty `content` from an OpenAI client, on thinking models | `max_tokens` covers the `<think>` span too: raise `max_tokens` / `thinking_budget`, or send `"chat_template_kwargs": {"enable_thinking": false}` (see [SERVE.md](SERVE.md)); [MODELS.md](MODELS.md) thinking section |
 
 ```bash

@@ -162,9 +162,19 @@ works, what to measure, what counts as pass/fail.
 - **MQ2 is refused by default.** The quantizer requires
   `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
   cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
-- **`dflash_mode=off` is the default.** Any test exercising DFlash
-  still needs `hipfire config set dflash_mode auto` or
-  `HIPFIRE_DFLASH_DRAFT=<path>` first.
+- **`dflash_mode=off` is the schema default.** Any test exercising DFlash
+  on a model without a registry DFlash policy still needs
+  `hipfire config set dflash_mode auto` or
+  `HIPFIRE_DFLASH_DRAFT=<path>` first. The one exception is the
+  Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b`, `-mq3*`,
+  `-mq4*`, including the canonical `qwen3.8:27b-mq4-xts` fixture): the
+  registry layer sets `speculation.dflash=auto`, so a present paired file
+  activates DFlash with no config, an absent file keeps MTP `auto`, and an
+  explicit `dflash_mode off` (canonical `speculation.dflash=off`) is the
+  kill switch. `dflash_block` stays `auto` (L16 singleton, L8 on a
+  `serve.vmm_batch` serve with ≥ 4 lanes, IU4 verify gates unchanged).
+  DFlash greedy may differ from AR near argmax ties; judge it against the
+  MTP arm and the C1 == C8 state oracle, not byte-equality with AR.
 - **PFlash is deprecated since 0.4.0 and will be removed in 0.5.0.**
   It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*`, still
   loads, warns when used (`prefill_compression` != `off`), and is not
@@ -258,8 +268,9 @@ Legacy `qwen3.{5,6}:{9b,27b}-draft` tags remain pullable.
 
 Files land at `~/.hipfire/models/<canonical-name>`.
 **Do not rename.** Load resolves the draft by its registry-declared
-filename; renaming breaks the pairing — `dflash_mode auto` then runs AR
-(one warning line), `on` fails the load.
+filename; renaming breaks the pairing — an explicit `dflash_mode auto` then
+runs AR (one warning line) and `on` fails the load; a Qwen3.8-27B tier
+(registry `auto`) keeps MTP `auto` when the draft file is absent.
 
 ### Verify hashes after pull (paranoid mode)
 
@@ -472,7 +483,8 @@ If you're testing an actual user UX flow:
 
 ```bash
 hipfire pull qwen3.8:27b-mq4-xts   # target + registry draft sidecar
-hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
+# Qwen3.8-27B paired tiers need no config: the registry resolves dflash=auto.
+# Other models: hipfire config set dflash_mode auto    # opt in (schema default: off)
 # Acceptance draft pin when measuring (optional override of registry sidecar):
 # export HIPFIRE_DFLASH_DRAFT=~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
 hipfire run qwen3.8:27b-mq4-xts "Write a Python function to find the longest substring without repeating characters"

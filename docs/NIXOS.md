@@ -136,7 +136,7 @@ services.hipfire = {
   maxSeq = 32768;
   repeatPenalty = 1.05;
   kvCache = "auto";
-  dflashMode = "off";
+  dflashMode = "off";    # explicit global kill switch; omit to keep the registry per-model default
   idleTimeout = 300;
 
   # Writes native ~/.hipfire/models.toml per-model overrides.
@@ -313,7 +313,7 @@ From `nix/module.nix` (defaults are module defaults, not every CLI default):
 | `maxSeq` | int | `32768` | KV capacity |
 | `repeatPenalty` | float | `1.05` | Stored global; same send caveat as temperature |
 | `kvCache` | str | `"auto"` | KV mode string |
-| `dflashMode` | enum | `"off"` | `on` / `off` / `auto` |
+| `dflashMode` | enum | `"auto"` (unset) | `on` / `off` / `auto`. Leaving it unset writes no `speculation.dflash` to `config.toml`, so the registry's per-model policy applies: `auto` only for Qwen3.8-27B tiers whose registry entry declares a paired DFlash draft ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)); every other model keeps the schema default `off`. Setting it explicitly, including `"auto"`, writes a global `speculation.dflash` that outranks the registry layer (`"auto"` then applies the same `auto` to every model); `"off"` is the kill switch that disables DFlash for all models |
 | `idleTimeout` | int | `300` | Idle unload seconds (`0` = never) |
 | `extraSettings` | attrs | `{}` | Extra config.toml keys (e.g. `"serve.host" = "127.0.0.1"`; legacy `host` is translated) |
 | `perModelSettings` | attrs of attrs | `{}` | Writes native `models.toml` per-model overrides |

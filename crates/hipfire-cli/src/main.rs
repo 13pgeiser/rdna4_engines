@@ -2184,7 +2184,7 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
 /// shared: several registry entries can name the same `dflash.file` (e.g.
 /// `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`, and `qwen3.8:27b-mq4-xt` all declare
 /// `qwen38-27b-dflash-mq4.hfq`). Deleting it while a sibling declarer is
-/// still on disk leaves those siblings running AR under `dflash_mode=auto`
+/// still on disk leaves those siblings without their paired draft under `dflash_mode=auto`
 /// or refusing to load under `on`, so the sidecar is kept — with one stderr
 /// line — whenever any OTHER entry declaring the same file still has its own
 /// target file present in the models dir. The `vision` tower sidecar follows
@@ -3943,10 +3943,11 @@ pub(crate) fn load_params(
 /// Call only once the final `dflash_mode` is known. When the mode is `auto`
 /// or `on`, no explicit draft is set (`params["draft"]`, e.g. from
 /// `developer.dflash_draft`), and `entry.dflash` names a pulled file, wire
-/// it: `on` without the file fails closed, `auto` logs one line and runs AR.
+/// it: `on` without the file fails closed, `auto` logs one line and falls
+/// back to the remaining speculation policy (MTP `auto` when a head exists).
 /// With no entry at all the artifact is not registry-managed (e.g. a path
-/// that merely shares a basename with an entry file): `auto` runs AR as a
-/// bare artifact, but `on` fails closed instead of silently running AR.
+/// that merely shares a basename with an entry file): `auto` wires no draft
+/// for a bare artifact, but `on` fails closed instead of silently running AR.
 /// The sidecar is looked up in `models_dir` first — `find_model_path`
 /// canonicalizes, so a symlinked target's parent is wherever the artifact
 /// really lives, not the models directory the draft was pulled into — then
@@ -3995,7 +3996,7 @@ pub(crate) fn resolve_dflash_sidecar(
         );
     }
     eprintln!(
-        "[hipfire] DFlash draft {} not pulled; running AR — `hipfire pull {tag}`",
+        "[hipfire] DFlash draft {} not pulled; no paired draft, speculation falls back — `hipfire pull {tag}`",
         sidecar.file
     );
     Ok(())
@@ -10389,10 +10390,257 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["mtp_mode"], "auto", "MTP auto stays in effect");
         assert!(
             params.get("draft").is_none(),
-            "auto without a pulled draft runs AR"
+            "auto without a pulled draft wires no draft"
         );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    fn qwen38_27b_dflash_registry() -> RegistryV1 {
+        let dflash = r#""dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}"#;
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{{
+                "qwen3.8:27b":{{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-pro":{{"repo":"x","file":"qwen3.8-27b.mq4-pro","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq5":{{"repo":"x","file":"qwen3.8-27b.mq5","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5}},
+                "qwen3.8:27boops":{{"repo":"x","file":"qwen3.8-27boops.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
+                "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.5:9b":{{"repo":"x","file":"qwen3.5-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
+            }},
+            "aliases":{{"qwen3.8":"qwen3.8:27b","qwen3.8:27b-mq4":"qwen3.8:27b"}}
+        }}"#
+        );
+        RegistryV1::parse(&raw, "test").unwrap()
+    }
+
+    #[test]
+    pub(crate) fn resolved_for_model_defaults_dflash_auto_only_for_paired_qwen38_27b() {
+        // Registry layer lowers dflash=auto only for canonical qwen3.8:27b[-*]
+        // trunks that declare a dflash sidecar; BuiltIn off and MTP auto
+        // stay for everything else, including the no-registry path.
+        let paths = test_paths("registry-dflash-default-scope");
+        fs::create_dir_all(&paths.root).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        for (input, expected) in [
+            ("qwen3.8:27b", "auto"),
+            ("qwen3.8", "auto"),
+            ("qwen3.8:27b-mq4", "auto"),
+            ("qwen3.8:27b-mq4-pro", "auto"),
+            ("qwen3.8:27b-mq5", "off"),
+            ("qwen3.8:27boops", "off"),
+            ("qwen3.8:flash-next", "off"),
+            ("qwen3.8:27b-draft-mq4", "off"),
+            ("qwen3.6:27b", "off"),
+            ("qwen3.5:9b", "off"),
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let resolved = resolved_for_model(&paths, input, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "speculation.dflash").unwrap(),
+                expected,
+                "{input}->{tag}"
+            );
+            assert_eq!(
+                config_string(&resolved, "speculation.mtp").unwrap(),
+                "auto",
+                "{input}->{tag}"
+            );
+            assert_eq!(
+                config_string(&resolved, "speculation.mode").unwrap(),
+                "auto",
+                "{input}->{tag}"
+            );
+        }
+        // No registry tag/entry (bare artifact path): BuiltIn off.
+        let bare = resolved_for_model(&paths, "qwen3.8-27b.mq4", None, None).unwrap();
+        assert_eq!(config_string(&bare, "speculation.dflash").unwrap(), "off");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_wires_default_dflash_draft_for_qwen38_27b_only_when_pulled() {
+        // Paired file present: auto + draft wired. Missing: no draft, MTP auto
+        // unchanged. Non-eligible models never wire a draft even with the file
+        // on disk.
+        let paths = test_paths("registry-dflash-default-load");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+        let load = |resolved: &hipfire_config::ResolvedConfig, tag: &str, entry: &ModelEntry| {
+            load_params(
+                resolved,
+                Some(entry),
+                &paths.models,
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some(tag),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+
+        let missing = load(&resolved, tag, entry);
+        assert_eq!(missing["dflash_mode"], "auto");
+        assert_eq!(missing["mtp_mode"], "auto");
+        assert!(missing.get("draft").is_none(), "no pulled draft, no wiring");
+
+        let draft_path = paths.models.join("qwen38-27b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let present = load(&resolved, tag, entry);
+        assert_eq!(present["dflash_mode"], "auto");
+        assert_eq!(present["mtp_mode"], "auto");
+        assert_eq!(present["draft"], draft_path.display().to_string());
+
+        for input in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27boops",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+            "qwen3.6:27b",
+            "qwen3.5:9b",
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let resolved = resolved_for_model(&paths, input, Some(tag), Some(entry)).unwrap();
+            let params = load(&resolved, tag, entry);
+            assert_eq!(params["dflash_mode"], "off", "{input}");
+            assert_eq!(params["mtp_mode"], "auto", "{input}");
+            assert!(params.get("draft").is_none(), "{input}");
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn qwen38_27b_default_dflash_yields_to_explicit_off_and_blocks_developer_draft() {
+        // The registry layer sits below global/model/one-shot config: an
+        // explicit dflash=off (or speculation.mode=off) wins and strips both
+        // the paired sidecar and a developer.dflash_draft.
+        let paths = test_paths("registry-dflash-default-off-wins");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen38-27b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let developer_draft = "/tmp/developer-draft.hfq";
+        let registry_layer = || NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: tag.to_owned(),
+                revision: "v1".into(),
+            },
+            layer: hipfire_registry::config_layer_for_tag(tag, entry).unwrap(),
+        };
+        let load = |resolved: &hipfire_config::ResolvedConfig| {
+            load_params(
+                resolved,
+                Some(entry),
+                &paths.models,
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some(tag),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        let global = |layer: ConfigLayer| NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("/tmp/global.toml"),
+            },
+            layer,
+        };
+        let model_user = |layer: ConfigLayer| NamedLayer {
+            source: ConfigSource::ModelUser {
+                model: tag.to_owned(),
+                path: PathBuf::from("/tmp/model.toml"),
+            },
+            layer,
+        };
+
+        // Baseline: registry default is on (auto), the pulled draft is wired.
+        let baseline = resolve(vec![registry_layer()]).unwrap();
+        let params = load(&baseline);
+        assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["draft"], draft_path.display().to_string());
+
+        // A developer draft with default auto still wins over the paired file.
+        let mut dev_only = ConfigLayer::default();
+        dev_only
+            .set_cli("developer.dflash_draft", developer_draft)
+            .unwrap();
+        let params = load(&resolve(vec![registry_layer(), global(dev_only)]).unwrap());
+        assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["draft"], developer_draft);
+
+        // Explicit global/model off wins and drops sidecar + developer draft.
+        for scope in ["global", "model"] {
+            let mut user = ConfigLayer::default();
+            user.set_cli("speculation.dflash", "off").unwrap();
+            user.set_cli("developer.dflash_draft", developer_draft)
+                .unwrap();
+            let user_layer = if scope == "global" {
+                global(user)
+            } else {
+                model_user(user)
+            };
+            let resolved = resolve(vec![registry_layer(), user_layer]).unwrap();
+            assert_eq!(
+                config_string(&resolved, "speculation.dflash").unwrap(),
+                "off",
+                "{scope}"
+            );
+            let params = load(&resolved);
+            assert_eq!(params["dflash_mode"], "off", "{scope}");
+            assert!(
+                params.get("draft").is_none(),
+                "{scope}: off blocks sidecar and developer draft"
+            );
+        }
+
+        // One-shot off (as `--set speculation.dflash=off`) wins over a model-user auto.
+        let mut model_auto = ConfigLayer::default();
+        model_auto.set_cli("speculation.dflash", "auto").unwrap();
+        let params = load(
+            &resolve(vec![
+                registry_layer(),
+                model_user(model_auto),
+                NamedLayer {
+                    source: ConfigSource::OneShot {
+                        argument: "speculation.dflash=off".into(),
+                    },
+                    layer: {
+                        let mut layer = ConfigLayer::default();
+                        layer.set_cli("speculation.dflash", "off").unwrap();
+                        layer
+                    },
+                },
+            ])
+            .unwrap(),
+        );
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(params.get("draft").is_none());
+
+        // speculation.mode=off disables DFlash through the selector as well.
+        let mut mode_off = ConfigLayer::default();
+        mode_off.set_cli("speculation.mode", "off").unwrap();
+        let params = load(&resolve(vec![registry_layer(), global(mode_off)]).unwrap());
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(params.get("draft").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -11513,7 +11761,7 @@ mod tests {
         // `on` + a path with no registry entry + no explicit draft fails
         // closed with the not-managed message instead of silently running AR
         // (Fable's earlier note on unregistered basenames). `auto` on the
-        // same file still runs AR as a bare artifact.
+        // same file wires no draft as a bare artifact.
         let paths = test_paths("dflash-on-foreign-path");
         fs::create_dir_all(&paths.models).unwrap();
         let foreign_dir = paths.root.join("elsewhere");

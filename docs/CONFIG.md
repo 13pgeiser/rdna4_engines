@@ -558,7 +558,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 
 | Key | Default | Values / range | Notes |
 |---|---|---|---|
-| `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. |
+| `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Schema default off; one registry-scoped exception.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. The registry layer (below the global / per-model / one-shot config, above the schema default) lowers `speculation.dflash = "auto"` for the Qwen3.8-27B trunk tiers that declare a paired `dflash` draft (`qwen3.8:27b`, `qwen3.8:27b-mq3*`, `qwen3.8:27b-mq4*`; not the `-draft-*` sidecar tags, not tiers without a `dflash` declaration). See [Qwen3.8-27B paired DFlash default](#qwen38-27b-paired-dflash-default). |
 | `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
 | `dflash_adaptive_b` | `false` | bool | **Opt-in.** Adaptive verify-block width: follows the trailing 8-cycle acceptance depth (τ̂+2), full below 2k context. Not output-identical (window boundaries move; per-position sampling stays target-lossless). Auto-suppressed on retained-PM4 verify loads. `HIPFIRE_DFLASH_ADAPTIVE_B=0` is a kill switch read through the `[developer]` namespace (not a schema env alias): it forces the fixed block even when this is `true`, and cannot enable adaptive. |
 | `dflash_block` | `"auto"` | `"auto"` \| int 4–16 | DFlash2 proposal width L (`speculation.dflash_block`, env `HIPFIRE_DFLASH_BLOCK`). Chosen **per serving configuration, never per live batch**: every request of a load (singleton or batched VMM lane) runs the same L, so batched output stays byte-identical to the singleton and text never depends on server load. **Default `auto`** = 8 when `serve.vmm_batch` is on with `continuous_batch_size` ≥ 4 (a full C8 verify step stays at 64 rows instead of 128), else 16. Measured on Qwen3.8-27B + DFlash2 on one R9700: C4 +20 %, C8 +27 %, BetterBench T0.7 C8 +17 %; a lone request on such a batching serve runs about 6 % slower than at 16; task scores tied (HumanEval 157 = 157, GSM8K 5-shot 1,282 vs 1,280, MMLU-Pro 871 = 871). `16` (or `HIPFIRE_DFLASH_BLOCK=16`) restores the previous fixed width. Greedy text depends on L (different window boundaries). Legacy DFlash drafts always run their declared width. Retained-PM4 verify and dense TP2 need 16. The experimental multi-slot route admits only 16 (`auto` resolves to 16 there). |
@@ -579,6 +579,18 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 Legacy compatibility input still wins at the top of the startup ladder for
 the corresponding knobs, but the engine receives only the resolved immutable
 snapshot. Full aliases: [`env-vars.md`](env-vars.md).
+
+### Qwen3.8-27B paired DFlash default
+
+The built-in `speculation.dflash` default stays `off` and `speculation.mtp` stays `auto`. The registry config layer is the only place that changes this, and only for Qwen3.8-27B trunk tags (`qwen3.8:27b` and `qwen3.8:27b-*`, never a longer lookalike) whose registry entry declares a `dflash` sidecar; it writes `speculation.dflash = "auto"`. Explicit global, per-model and one-shot config rank above the registry layer.
+
+- **Paired draft file present** (the registry-declared `dflash.file` next to the model, or a `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` / `run --model-draft` path): the load wires it and DFlash runs.
+- **Paired draft file absent:** nothing fails and nothing is wired. The load keeps MTP `auto` (the registry `mtp` head, as before this default).
+- **Kill switch:** an explicit `dflash_mode off` wins over the registry layer: `hipfire config qwen3.8:27b set dflash_mode off` (per model), `hipfire config set dflash_mode off` (global), or `HIPFIRE_DFLASH_MODE=off`. The canonical key is `speculation.dflash = "off"`.
+- **Unchanged:** every other model keeps the schema `off` (Qwen3.5/3.6, Flash-Next / `arch_id=16`, the `-draft-*` and sidecar tags, and 27B tiers with no `dflash` declaration such as `mq5*` / `mq6*`). `dflash_block` stays `auto`: 16 on a singleton load, 8 on a `serve.vmm_batch` serve with `continuous_batch_size` ≥ 4, and the IU4 verify gates ([above](#mechanism-knobs)) are untouched.
+- **Output:** DFlash greedy decode is not promised byte-identical to AR (or to MTP): near an argmax tie the multi-row verify can pick the other token, and the text then diverges from that point. Batched output stays byte-identical to the singleton within a configuration.
+
+Acceptance evidence for this default (fresh-process determinism, the batching C1 == C8 state oracle, MTP-vs-DFlash task-eval quality, the serve battery and chain text) is collected under `/home/kaden/qcal/release-0.4.2/dflash-default/receipts`; the receipts are populated as the gates run, so no pass is recorded here until a receipt exists.
 
 ---
 ## Vision tower

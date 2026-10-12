@@ -370,8 +370,16 @@ impl ModelEntry {
 /// Backend selection is source-independent at admission. Qwen3.8 entries
 /// with `arch_id=16` (Qwen4) and Muse Glimmer tags write neither length.
 ///
-/// Explicit global/model/one-shot user config remains higher precedence than
-/// this registry layer.
+/// Qwen3.8-27B trunk tiers (`qwen3.8:27b` and `qwen3.8:27b-*`, never a
+/// longer lookalike such as `27boops`) that declare a paired `dflash` sidecar
+/// also lower `speculation.dflash = "auto"`. The load resolver wires the draft
+/// only when that registry-declared file is present; without it MTP `auto`
+/// stays in effect. The schema/BuiltIn default stays `off` for every other
+/// model; `arch_id=16`, draft/dflash sidecars, and tiers with no `dflash`
+/// declaration get no speculation policy.
+///
+/// Explicit global/model/one-shot user config (including `dflash=off`) remains
+/// higher precedence than this registry layer.
 pub fn config_layer_for_tag(
     tag: &str,
     entry: &ModelEntry,
@@ -385,6 +393,12 @@ pub fn config_layer_for_tag(
     if is_qwen_tag_policy {
         layer
             .set("generation.max_tokens", ConfigValue::Integer(81920))
+            .map_err(|error| error.to_string())?;
+    }
+    let is_qwen38_27b_tier = tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-");
+    if is_qwen_tag_policy && is_qwen38_27b_tier && entry.dflash.is_some() {
+        layer
+            .set("speculation.dflash", ConfigValue::String("auto".into()))
             .map_err(|error| error.to_string())?;
     }
     let is_deepseek_tag_policy =
@@ -2569,6 +2583,258 @@ mod tests {
             "aliases":{}
         }"#;
         assert!(RegistryV1::parse(bad3, "test").is_err());
+    }
+
+    #[test]
+    fn qwen38_27b_dflash_auto_is_scoped_to_paired_trunk_tiers() {
+        // `speculation.dflash = "auto"` is lowered only for canonical Qwen3.8-27B
+        // trunk tags (`qwen3.8:27b`, `qwen3.8:27b-*`) that declare a `dflash`
+        // sidecar, are not draft/dflash sidecars, and are not arch_id=16.
+        let dflash = r#""dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}"#;
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{{
+                "qwen3.8:27b":{{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq3":{{"repo":"x","file":"qwen3.8-27b.mq3","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-pro":{{"repo":"x","file":"qwen3.8-27b.mq4-pro","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-xt":{{"repo":"x","file":"qwen3.8-27b.mq4-xt","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq5":{{"repo":"x","file":"qwen3.8-27b.mq5","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5}},
+                "qwen3.8:27boops":{{"repo":"x","file":"qwen3.8-27boops.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
+                "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.8:27b-dflash-mq4":{{"repo":"x","file":"qwen38-27b-dflash.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.5:27b":{{"repo":"x","file":"qwen3.5-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3:8b":{{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.8:9b":{{"repo":"x","file":"qwen3.8-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
+            }},
+            "aliases":{{
+                "qwen3.8":"qwen3.8:27b",
+                "qwen3.8:latest":"qwen3.8:27b",
+                "qwen3.8:27b-mq4":"qwen3.8:27b",
+                "qwen3.8:fast":"qwen3.8:27b-mq4-xt",
+                "qwen3.8:27b-fast":"qwen3.8:27b-mq4-xt"
+            }}
+        }}"#
+        );
+        let registry = RegistryV1::parse(&raw, "test").unwrap();
+        let auto_value = ConfigValue::String("auto".into());
+        let auto = Some(&auto_value);
+
+        // Canonical tags and every alias that resolves to an eligible tag.
+        for input in [
+            "qwen3.8:27b",
+            "qwen3.8:27b-mq3",
+            "qwen3.8:27b-mq4-pro",
+            "qwen3.8:27b-mq4-xt",
+            "qwen3.8",
+            "qwen3.8:latest",
+            "qwen3.8:27b-mq4",
+            "qwen3.8:fast",
+            "qwen3.8:27b-fast",
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert_eq!(layer.get("speculation.dflash"), auto, "{input}->{tag}");
+            // Only the dflash mode is added; MTP and the ngram/mode knobs are untouched.
+            assert!(layer.get("speculation.mtp").is_none(), "{input}->{tag}");
+            assert!(layer.get("speculation.mode").is_none(), "{input}->{tag}");
+            assert_eq!(
+                layer.get("generation.max_tokens"),
+                Some(&ConfigValue::Integer(81920)),
+                "{input}->{tag} keeps the existing max_tokens policy"
+            );
+        }
+
+        // Same family/tier without a registry dflash declaration, a longer
+        // lookalike tier, arch_id=16, draft/dflash sidecar tags, and other
+        // families/sizes never get the policy.
+        for tag in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27boops",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+            "qwen3.8:27b-dflash-mq4",
+            "qwen3.6:27b",
+            "qwen3.5:27b",
+            "qwen3:8b",
+            "qwen3.8:9b",
+        ] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                layer.get("speculation.dflash").is_none(),
+                "{tag} must not default DFlash"
+            );
+        }
+
+        // arch_id and the dflash declaration are both required, not just the tag.
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let mut no_dflash = entry.clone();
+        no_dflash.dflash = None;
+        assert!(config_layer_for_tag(tag, &no_dflash)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+        let mut qwen4 = entry.clone();
+        qwen4.arch_id = Some(16);
+        assert!(config_layer_for_tag(tag, &qwen4)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+        // A different tag with the same dflash-less entry stays off too.
+        assert!(config_layer_for_tag("qwen3.8:27b-mq4-pro", &no_dflash)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+    }
+
+    #[test]
+    fn bundled_dflash_auto_matches_only_declared_qwen38_27b_tiers() {
+        // Source-grounded against checked-in registry/v1.json: DFlash-paired
+        // Qwen3.8-27B trunk tiers lower `auto`; mq5/mq6 tiers (no dflash
+        // declaration), Flash-Next, drafts, and other families do not.
+        let registry = bundled().unwrap();
+        let mut auto_tiers = 0;
+        for (tag, entry) in &registry.models {
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            let expected = (tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-"))
+                && !tag.contains("draft")
+                && !tag.contains("dflash")
+                && entry.arch_id != Some(16)
+                && entry.dflash.is_some();
+            assert_eq!(
+                layer.get("speculation.dflash") == Some(&ConfigValue::String("auto".into())),
+                expected,
+                "{tag}"
+            );
+            if expected {
+                auto_tiers += 1;
+            } else {
+                assert!(layer.get("speculation.dflash").is_none(), "{tag}");
+            }
+        }
+        assert!(
+            auto_tiers >= 1,
+            "at least one bundled Qwen3.8-27B tier declares a DFlash draft"
+        );
+        for tag in [
+            "qwen3.8:27b",
+            "qwen3.8:27b-mq3",
+            "qwen3.8:27b-mq3-xt",
+            "qwen3.8:27b-mq3-pro",
+            "qwen3.8:27b-mq4-xt",
+            "qwen3.8:27b-mq4-xts",
+            "qwen3.8:27b-mq4-pro",
+        ] {
+            let (resolved, entry) = registry.model(tag).unwrap();
+            assert!(entry.dflash.is_some(), "{tag} declares a DFlash draft");
+            assert_eq!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash"),
+                Some(&ConfigValue::String("auto".into())),
+                "{tag}"
+            );
+        }
+        for tag in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27b-mq6-pro",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+        ] {
+            let (resolved, entry) = registry.model(tag).unwrap();
+            assert!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash")
+                    .is_none(),
+                "{tag}"
+            );
+        }
+        for alias in [
+            "qwen3.8",
+            "qwen3.8:latest",
+            "qwen3.8:fast",
+            "qwen3.8:27b-fast",
+        ] {
+            let (resolved, entry) = registry.model(alias).unwrap();
+            assert_eq!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash"),
+                Some(&ConfigValue::String("auto".into())),
+                "{alias}->{resolved}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen38_27b_dflash_auto_yields_to_explicit_user_off() {
+        // Registry layer is lowest; global/model/one-shot dflash=off wins.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,"dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let registry_named = || hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::RegistryModel {
+                tag: tag.to_owned(),
+                revision: "v1".into(),
+            },
+            layer: config_layer_for_tag(tag, entry).unwrap(),
+        };
+        let dflash_of = |layers: Vec<hipfire_config::NamedLayer>| {
+            hipfire_config::resolve(layers)
+                .unwrap()
+                .get("speculation.dflash")
+                .map(|item| item.value.clone())
+        };
+        // Registry alone: auto beats the BuiltIn off default.
+        assert_eq!(
+            dflash_of(vec![registry_named()]),
+            Some(ConfigValue::String("auto".into()))
+        );
+        // Explicit global-user off wins.
+        let mut global_off = ConfigLayer::default();
+        global_off
+            .set("speculation.dflash", ConfigValue::String("off".into()))
+            .unwrap();
+        assert_eq!(
+            dflash_of(vec![
+                registry_named(),
+                hipfire_config::NamedLayer {
+                    source: hipfire_config::ConfigSource::GlobalUser {
+                        path: std::path::PathBuf::from("/tmp/global.toml"),
+                    },
+                    layer: global_off,
+                },
+            ]),
+            Some(ConfigValue::String("off".into()))
+        );
+        // Explicit per-model-user off wins too.
+        let mut model_off = ConfigLayer::default();
+        model_off
+            .set("speculation.dflash", ConfigValue::String("off".into()))
+            .unwrap();
+        assert_eq!(
+            dflash_of(vec![
+                registry_named(),
+                hipfire_config::NamedLayer {
+                    source: hipfire_config::ConfigSource::ModelUser {
+                        model: tag.to_owned(),
+                        path: std::path::PathBuf::from("/tmp/model.toml"),
+                    },
+                    layer: model_off,
+                },
+            ]),
+            Some(ConfigValue::String("off".into()))
+        );
     }
 
     #[test]
