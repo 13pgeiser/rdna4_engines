@@ -943,6 +943,68 @@ TEST(kv_preemption_by_recompute_and_the_undeadlockable_request) {
     CHECK_OK(f.kv.ensure(newcomer, per));
 }
 
+/* THE WINDOW BEHIND A PREFIX HIT: a checkpoint slot carries window_blocks pages a WINDOW group,
+ * window_rows() names the pages a query at P reads from the table that wrote them, seed_window()
+ * gives a resumed sequence fresh pages at the same floor -- and a table whose floor moved past it
+ * answers false, which is the fallback (no snapshot, a full re-prefill). */
+TEST(kv_window_snapshot_rows_and_seed) {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    KVGroupInfo k;
+    k.name = "swa";
+    k.decl.kind = RAD_KV_WINDOW;
+    k.decl.dtype = RAD_BF16;
+    k.decl.n_head_kv = 2;
+    k.decl.head_dim = 8;
+    k.decl.window = 64;
+    k.block_size = 16;
+    k.layers = { 0 };
+    g.push_back(k);
+    Config cfg = small_config();
+    Pools p;
+    CHECK_OK(p.configure(cfg, 0, &rad_malloc_allocator(), &rad_malloc_allocator()));
+    KVManager kv;
+    CHECK_OK(kv.configure(g, cfg, p.kv()));
+    CHECK(kv.has_window_snapshot());
+    CHECK_EQ(kv.checkpoint_bytes(), 5 * kv.plan(G_FULL)->bytes_per_block);
+
+    CHECK_OK(kv.add_sequence(1));
+    CHECK_OK(kv.ensure(1, 400));                         /* a prompt of 400 in one chunk */
+    std::vector<int32_t> rows;
+    CHECK(kv.window_rows(1, 400, &rows));
+    CHECK_EQ((long long)rows.size(), 5ll);               /* padded to window_blocks */
+    /* A query at 400 reads back to 337: blocks 21..24, the floor recycle_window keeps. */
+    for (int j = 0; j < 4; ++j) CHECK_EQ(rows[(size_t)j], kv.block_table(1, G_FULL)[(size_t)(21 + j)]);
+    CHECK_EQ(rows[4], -1);
+    /* A short prefix: the window starts at zero and the rest is padding. */
+    CHECK(kv.window_rows(1, 32, &rows));
+    CHECK_EQ(rows[0], kv.block_table(1, G_FULL)[0]);
+    CHECK_EQ(rows[2], -1);
+    /* Not on a block: no rows. */
+    CHECK(!kv.window_rows(1, 40, &rows));
+    /* The floor moved past it (a decode step slid the window): the fallback. */
+    CHECK_OK(kv.ensure(1, 401));
+    CHECK(!kv.window_rows(1, 64, &rows));
+    CHECK(kv.window_rows(1, 400, &rows));
+
+    /* A resumed sequence: seeded at the floor, extended from there, and its rows are its own. */
+    CHECK_OK(kv.add_sequence(2));
+    CHECK_OK(kv.seed_window(2, 400));
+    CHECK_EQ(kv.first_block_pos(2, G_FULL), 336ll);
+    CHECK_EQ((long long)kv.block_table(2, G_FULL).size(), 4ll);
+    CHECK_EQ(kv.seq_tokens(2), 400ll);
+    CHECK_OK(kv.ensure(2, 432, 400));
+    CHECK_EQ(kv.first_block_pos(2, G_FULL), 336ll);
+    CHECK_EQ((long long)kv.block_table(2, G_FULL).size(), 6ll);
+    std::vector<int32_t> rows2;
+    CHECK(kv.window_rows(2, 400, &rows2));
+    for (int j = 0; j < 4; ++j) CHECK_EQ(rows2[(size_t)j], kv.block_table(2, G_FULL)[(size_t)j]);
+    /* A table already holding window pages is not seeded twice. */
+    CHECK_EQ(kv.seed_window(2, 400), RAD_E_STATE);
+    kv.free_sequence(1);
+    kv.free_sequence(2);
+}
+
 TEST(kv_window_group_recycles_below_the_window) {
     std::vector<KVGroupInfo> g;
     g.push_back(null_group());

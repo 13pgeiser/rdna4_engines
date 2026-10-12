@@ -485,8 +485,34 @@ public:
      * and the restore has to precede the step that consumes it, and both are ordered by the
      * stream rather than by waiting. One pitched copy a stateful group between the card and the
      * store, at the link's rate. RAD_E_INVAL on a bad slot or an unknown sequence. */
-    int checkpoint_save(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s);
-    int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s);
+    int checkpoint_save(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
+                        const std::vector<int32_t>* win = nullptr);
+    int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
+                           const std::vector<int32_t>* win = nullptr);
+
+    /* ---------------- window snapshots (the sliding-window half of a prefix hit) ----------------
+     * A WINDOW group keeps only the blocks its window can still read, so no block list from the
+     * prefix cache describes it. What a later prompt that extends a cached prefix at position P
+     * needs from it is exactly the window behind P: blocks [lo, P/B) with
+     * lo = max(0, P/B - (window_blocks - 1)) -- the floor recycle_window keeps for a query at P.
+     * A checkpoint slot therefore carries, after the linear state, window_blocks pages a WINDOW
+     * group (every layer, layer-major rows), and a hit at a checkpoint restores them into fresh
+     * blocks seeded at that floor.
+     *
+     * has_window_snapshot(): this rank's slot carries a window section. window_rows() names, from
+     * the LEADER's table, the block ids [lo, P/B) of every non-zero WINDOW group in plans() order,
+     * each group padded with -1 to window_blocks -- one vector every rank addresses with its own
+     * pool, because followers keep no sequence tables. False when the sequence does not hold that
+     * range (it is gone, or its floor moved past lo). seed_window() gives a sequence with an empty
+     * WINDOW table the blocks [lo, P/B) a restore will fill, before the ensure that extends it. */
+    bool has_window_snapshot() const { return window_ck_bytes_ > 0; }
+    bool window_rows(uint64_t seq, int64_t pos, std::vector<int32_t>* out) const;
+    int  seed_window(uint64_t seq, int64_t pos);
+    /* The floor and end (block indices) of the window a query at `pos` reads in a group. */
+    static int64_t window_lo(const KVGroupPlan& p, int64_t pos) {
+        const int64_t b = pos / p.block_size - (p.window_blocks - 1);
+        return b > 0 ? b : 0;
+    }
 
     /* Byte address of a state slot, for the slot-mapping builder. Null when the pool has no
      * host-visible base (a device pool), which is the normal case -- the offset is what the step
@@ -509,7 +535,7 @@ private:
 
     /* One traversal serving both checkpoint directions; see checkpoint_save. */
     int checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t ck_slot, bool save,
-                        RadStream s);
+                        RadStream s, const std::vector<int32_t>* win);
 
     struct Seq {
         uint64_t id = 0;
@@ -549,6 +575,7 @@ private:
     HostArena* ck_store_ = nullptr;                   /* set_checkpoint_store */
     int64_t   ck_rank_off_ = 0;
     int64_t   checkpoint_bytes_ = 0;
+    int64_t   window_ck_bytes_ = 0;   /* the window section of checkpoint_bytes_ */
     std::vector<StateClear> clears_;                  /* grabbed slots the engine must zero */
     void*     pool_base_ = nullptr;
     BundleComparison bundling_;

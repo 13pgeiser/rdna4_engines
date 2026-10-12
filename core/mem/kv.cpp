@@ -271,7 +271,13 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
 
     /* ---- fixed costs first: they are not negotiable and they are not per-token ---- */
     checkpoint_bytes_ = 0;
+    window_ck_bytes_ = 0;
     for (const auto& p : plans_) if (p.stateful()) checkpoint_bytes_ += p.bytes_per_state;
+    /* AND THE WINDOW BEHIND A CHECKPOINT, after the linear state (see has_window_snapshot). */
+    for (const auto& p : plans_)
+        if (p.kind == RAD_KV_WINDOW && !p.zero && p.n_layers > 0 && p.window_blocks > 0)
+            window_ck_bytes_ += p.window_blocks * p.bytes_per_block;
+    checkpoint_bytes_ += window_ck_bytes_;
 
     /* EVERY RESERVATION IS PADDED TO RAD_ALIGN_UNIT AND THE BUDGET HAS TO SAY SO. Summing the
      * fixed costs as raw bytes leaves the paged split free to spend the difference, and the plan
@@ -1402,7 +1408,7 @@ void* KVManager::checkpoint_ptr(int32_t slot) const {
  * exactly one piece of code decides its order. Two functions that agreed today would be two
  * functions that could stop agreeing. */
 int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t ck_slot,
-                               bool save, RadStream s) {
+                               bool save, RadStream s, const std::vector<int32_t>* win) {
     /* A SLOT NOBODY HOLDS IS NOT ONE TO WRITE. Rank 0 hands the ids out, so a follower checks the
      * shared store rather than a list of its own. Each refusal says which check it is: a slot the
      * store gave back is a lifetime fault in whoever handed the id out, and nothing about the copy. */
@@ -1466,14 +1472,111 @@ int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t 
         }
         off += nbytes * p.n_layers;
     }
+
+    /* THE WINDOW SECTION: window_blocks pages a WINDOW group, page j of the window in slot j, each
+     * page n_layers rows of one layer's block -- one pitched copy a page. `win` names the pages
+     * (window_rows); -1 is a page below position zero and is left alone either way. */
+    if (window_ck_bytes_ > 0) {
+        if (!win) {
+            RAD_ERR("checkpoint %s slot %d: this model snapshots its window and no window rows "
+                    "were named", dir, (int)ck_slot);
+            return RAD_E_INVAL;
+        }
+        size_t wi = 0;
+        for (size_t g = 0; g < plans_.size(); ++g) {
+            const KVGroupPlan& p = plans_[g];
+            if (p.kind != RAD_KV_WINDOW || p.window_blocks <= 0) continue;
+            const size_t row0 = wi;
+            wi += (size_t)p.window_blocks;
+            if (p.zero || p.n_layers <= 0) continue;
+            if (wi > win->size() || !p.base) {
+                RAD_ERR("checkpoint %s slot %d: window group %d has %zu row(s) named for %lld",
+                        dir, (int)ck_slot, (int)g, win->size(), (long long)wi);
+                return RAD_E_STATE;
+            }
+            const int64_t lb = p.layer_bytes_per_block();
+            for (int64_t j = 0; j < p.window_blocks; ++j) {
+                const int32_t b = (*win)[row0 + (size_t)j];
+                if (b < 0) continue;
+                if (b >= p.n_blocks) return RAD_E_STATE;
+                char* dev = (char*)p.base + (int64_t)b * lb;
+                char* host = ck + off + j * p.bytes_per_block;
+                const int cs = save ? rad_memcpy_2d_async(host, lb, dev, p.layer_stride(), lb,
+                                                          p.n_layers, s)
+                                    : rad_memcpy_2d_async(dev, p.layer_stride(), host, lb, lb,
+                                                          p.n_layers, s);
+                if (cs < 0) {
+                    RAD_ERR("checkpoint %s slot %d: the device refused window page %lld of "
+                            "group %d: %s", dir, (int)ck_slot, (long long)j, (int)g,
+                            rad_strerror(cs));
+                    return cs;
+                }
+            }
+            off += p.window_blocks * p.bytes_per_block;
+        }
+        if (off > checkpoint_bytes_) return RAD_E_STATE;
+    }
     return RAD_OK;
 }
 
-int KVManager::checkpoint_save(const int32_t* slots, int n, int32_t ck, RadStream s) {
-    return checkpoint_copy(slots, n, ck, /*save=*/true, s);
+int KVManager::checkpoint_save(const int32_t* slots, int n, int32_t ck, RadStream s,
+                               const std::vector<int32_t>* win) {
+    return checkpoint_copy(slots, n, ck, /*save=*/true, s, win);
 }
-int KVManager::checkpoint_restore(const int32_t* slots, int n, int32_t ck, RadStream s) {
-    return checkpoint_copy(slots, n, ck, /*save=*/false, s);
+int KVManager::checkpoint_restore(const int32_t* slots, int n, int32_t ck, RadStream s,
+                                  const std::vector<int32_t>* win) {
+    return checkpoint_copy(slots, n, ck, /*save=*/false, s, win);
+}
+
+bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out) const {
+    out->clear();
+    const Seq* s = find(id);
+    if (!s || pos <= 0) return false;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const KVGroupPlan& p = plans_[g];
+        if (p.kind != RAD_KV_WINDOW || p.window_blocks <= 0) continue;
+        const size_t row0 = out->size();
+        out->resize(row0 + (size_t)p.window_blocks, -1);
+        if (p.zero || p.block_size <= 0 || pos % p.block_size != 0) {
+            if (p.zero) continue;
+            return false;
+        }
+        const int64_t lo = window_lo(p, pos), hi = pos / p.block_size;
+        const int64_t first = s->first_block_pos[g] / p.block_size;
+        if (lo < first || hi - first > (int64_t)s->blocks[g].size()) return false;
+        for (int64_t j = lo; j < hi; ++j)
+            (*out)[row0 + (size_t)(j - lo)] = s->blocks[g][(size_t)(j - first)];
+    }
+    return true;
+}
+
+int KVManager::seed_window(uint64_t id, int64_t pos) {
+    Seq* s = find(id);
+    if (!s) return RAD_E_NOTFOUND;
+    /* Check every group before taking anything, as ensure() does. */
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const KVGroupPlan& p = plans_[g];
+        if (p.kind != RAD_KV_WINDOW || p.block_size <= 0) continue;
+        if (!s->blocks[g].empty()) return RAD_E_STATE;
+        if (pos % p.block_size != 0) return RAD_E_INVAL;
+        const int64_t need = pos / p.block_size - window_lo(p, pos);
+        if (need > available_blocks((int32_t)g)) return RAD_E_FULL;
+        RAD_TRY(grow_for((int32_t)g, need));
+    }
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const KVGroupPlan& p = plans_[g];
+        if (p.kind != RAD_KV_WINDOW || p.block_size <= 0) continue;
+        const int64_t lo = window_lo(p, pos), hi = pos / p.block_size;
+        s->first_block_pos[g] = lo * p.block_size;
+        for (int64_t j = lo; j < hi; ++j) {
+            int32_t b = -1;
+            grab_block((int32_t)g, &b);
+            s->blocks[g].push_back(b);
+        }
+        s->dirty_from[g] = 0;
+    }
+    if (s->n_tokens == 0) s->n_tokens = pos;
+    return RAD_OK;
 }
 
 /* HOW MANY COLUMNS A SEQUENCE'S state_index ROW HAS. One per physical copy would be the obvious
