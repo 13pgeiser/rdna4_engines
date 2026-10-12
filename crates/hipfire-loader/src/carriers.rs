@@ -1223,7 +1223,7 @@ pub fn qwen4_ep_vram_layers(
         shared.vmm_granularity,
         shared.spec,
         shared.max_k,
-        false,
+        shared.native_mtp,
         !config.ffn.is_dense(),
         state_format,
         scratch_mode,
