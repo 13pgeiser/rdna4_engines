@@ -257,7 +257,7 @@
 - **Generic (llama-family) DFlash no longer panics the daemon on a 1–3 row verify block.** When a request's remaining budget left the block below the batched-verify minimum, the per-token fallback captured no drafter hidden rows, and `GenericDflashSpeculator::finish_chain` sliced the empty buffer (`dflash_generic.rs:473`, `range end index 20480 out of range for slice of length 0`). The fallback now captures through `forward_scratch_compute_capture`, as per-token prefill does.
 
 
-## v0.4.1.1 — release draft
+## v0.4.1.1 — 2026-10-08
 
 Public release/tag: **v0.4.1.1**; Cargo workspace/package version: **0.4.1+patch.1**. Cargo build metadata does not give this patch higher SemVer precedence than 0.4.1. Managed installs select the public Git tag with `hipfire update --tag v0.4.1.1`; update resolves Git revisions, not a SemVer latest-release ranking.
 
