@@ -3635,7 +3635,7 @@ pub(crate) fn mtp_prefill_chunk(
     };
     // The head's batched rows route: the incumbent batched fill
     // (`HIPFIRE_QWEN4_MTP_BATCHED_FILL`, on by default), or the DET prompt
-    // fill (`HIPFIRE_QWEN4_MTP_APPEND_DET=1` on exact gfx1151), which uses
+    // fill (exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET` on unless `0`), which uses
     // the scratch even with batched fill off. Without a scratch (the head
     // does not support the rows route) the chunk is per-row either way.
     let det = mtp_append_det_enabled(gpu);
@@ -4610,7 +4610,7 @@ pub(crate) fn mtp_batched_fill_enabled() -> bool {
 }
 
 /// Whether this GPU's prompt fill wants the Append scratch: batched fill on,
-/// or the DET prompt fill in force (`HIPFIRE_QWEN4_MTP_APPEND_DET=1`, exact
+/// or the DET prompt fill in force (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on; exact
 /// gfx1151, which uses the scratch even with batched fill off). The head's
 /// own support ([`Qwen4Bundle::mtp_append_rows_supported`]) still applies.
 pub(crate) fn mtp_fill_scratch_wanted(gpu: &Gpu) -> bool {
@@ -4691,7 +4691,7 @@ pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
 /// Whether a native MTP request on this GPU allocates the prompt-fill Append
 /// scratch (`MtpAppendScratch`): exact gfx1151 or gfx1201 with
 /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` on, or exact gfx1151 with
-/// `HIPFIRE_QWEN4_MTP_APPEND_DET=1` (the DET prompt fill needs the scratch
+/// `HIPFIRE_QWEN4_MTP_APPEND_DET` on (the default; the DET prompt fill needs the scratch
 /// even with batched fill off).
 pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
     (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && mtp_fill_scratch_wanted(gpu)

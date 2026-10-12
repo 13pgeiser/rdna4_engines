@@ -1846,7 +1846,7 @@ impl Qwen4Bundle {
     /// that is `None` too.
     ///
     /// `context` names the caller and is passed through unchanged: only
-    /// [`MtpFillContext::PromptFill`] can take the opt-in DET projections.
+    /// [`MtpFillContext::PromptFill`] can take the DET projections.
     pub(crate) fn mtp_append_rows(
         &mut self,
         gpu: &mut Gpu,

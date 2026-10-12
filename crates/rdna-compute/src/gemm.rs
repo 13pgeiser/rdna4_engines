@@ -28455,8 +28455,9 @@ impl Gpu {
     /// [`Gpu::mtp_dense_det_pm_launch`] on the same stream: each output is one ascending K16 WMMA
     /// chain from +0 whatever `n` is, so a row's bytes do not depend on its batch. F16 has a
     /// narrower exponent range than BF16/F32: under/overflow is possible and this is explicitly
-    /// DET, not byte-equal to [`Gpu::gemm_bf16_xf32_multirow`]. Called by the default-off
-    /// `HIPFIRE_QWEN4_MTP_APPEND_DET` prompt-fill append route (fc_embedding, fc_hidden, HC up).
+    /// DET, not byte-equal to [`Gpu::gemm_bf16_xf32_multirow`]. Called by the
+    /// `HIPFIRE_QWEN4_MTP_APPEND_DET` prompt-fill append route (default on, exact gfx1151;
+    /// fc_embedding, fc_hidden, HC up).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf32_mtp_dense_det_pm(
         &mut self,

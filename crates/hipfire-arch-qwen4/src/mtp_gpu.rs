@@ -55,9 +55,14 @@ const MTP_SESSION_WORDS: usize = 7;
 /// launch sequence: the capacity of [`MtpAppendScratch`].
 pub(crate) const MTP_FILL_ROWS: usize = 1024;
 
-/// `HIPFIRE_QWEN4_MTP_APPEND_DET`: the opt-in DET route of the batched
-/// prompt-fill Append ([`MtpFillContext::PromptFill`] only).
+/// `HIPFIRE_QWEN4_MTP_APPEND_DET`: the DET route of the batched prompt-fill
+/// Append ([`MtpFillContext::PromptFill`] only), on by default on exact
+/// gfx1151; `0` is the kill switch.
 pub(crate) const MTP_APPEND_DET_ENV: &str = "HIPFIRE_QWEN4_MTP_APPEND_DET";
+/// Default of [`MTP_APPEND_DET_ENV`] when it is unset (or neither `0` nor
+/// `1`): requested, so exact gfx1151 takes DET and every other arch keeps the
+/// incumbent kernels ([`append_det_active`]).
+const MTP_APPEND_DET_DEFAULT: bool = true;
 
 /// Which caller a batched Append pass (`Qwen4MtpGpu::append_rows`) serves. It
 /// is stated by every caller and never inferred from the hidden row, the
@@ -72,11 +77,11 @@ pub(crate) enum MtpFillContext {
     DecodeFill,
 }
 
-/// `HIPFIRE_QWEN4_MTP_APPEND_DET` as requested: only a literal `1` opts in
-/// (default off); read at every prompt fill. See [`mtp_append_det_enabled`] for
-/// the effective gate.
+/// `HIPFIRE_QWEN4_MTP_APPEND_DET` as requested: on unless `0`
+/// ([`MTP_APPEND_DET_DEFAULT`]); read at every prompt fill. See
+/// [`mtp_append_det_enabled`] for the effective gate.
 pub(crate) fn mtp_append_det_requested() -> bool {
-    hipfire_config::developer_bool(MTP_APPEND_DET_ENV, false)
+    hipfire_config::developer_bool(MTP_APPEND_DET_ENV, MTP_APPEND_DET_DEFAULT)
 }
 
 /// The DET gate from its two inputs: requested and exact gfx1151 (gfx1150,
@@ -85,7 +90,7 @@ fn append_det_active(requested: bool, exact_gfx1151: bool) -> bool {
     requested && exact_gfx1151
 }
 
-/// Whether `HIPFIRE_QWEN4_MTP_APPEND_DET=1` is in force on this GPU: exact
+/// Whether DET (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on) is in force on this GPU: exact
 /// gfx1151 only. This is the machine-level gate; whether one Append pass takes
 /// the DET route also depends on its [`MtpFillContext`] ([`append_rows_det`]).
 pub(crate) fn mtp_append_det_enabled(gpu: &Gpu) -> bool {
@@ -2641,7 +2646,7 @@ impl Qwen4MtpGpu {
     ///
     /// `context` names the caller. [`MtpFillContext::PromptFill`] takes the
     /// DET route (all seven projections through the fixed-row native kernels)
-    /// when `HIPFIRE_QWEN4_MTP_APPEND_DET=1` on exact gfx1151, which also takes
+    /// on exact gfx1151 (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on), which also takes
     /// a lone row; [`MtpFillContext::DecodeFill`] always runs the incumbent
     /// kernels (at least two rows).
     ///
@@ -2830,8 +2835,8 @@ impl Qwen4MtpGpu {
         // anything. Never route these through `project_weight` /
         // `gemm_bf16_xf32_f16_wmma_qwen4` (F16 WMMA from 512 rows).
         //
-        // DET (`PromptFill` with `HIPFIRE_QWEN4_MTP_APPEND_DET=1` on exact
-        // gfx1151, `det` below): all seven projections run the fixed-row
+        // DET (`PromptFill` on exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET`
+        // on unless `0`, `det` below): all seven projections run the fixed-row
         // native kernels instead (F16 WMMA, F32 accumulate, one ascending-K
         // chain per output, no split-K, no epilogue). That arithmetic is
         // deterministic and row-invariant (a row's bytes do not depend on its
@@ -3135,8 +3140,8 @@ mod tests {
     use crate::state::Qwen4State;
 
     #[test]
-    fn append_det_is_off_by_default_and_exact_gfx1151_only() {
-        // Not requested: never on, on any arch.
+    fn append_det_is_exact_gfx1151_only_and_zero_kills_it() {
+        // `0` (not requested): never on, on any arch.
         assert!(!append_det_active(false, true));
         assert!(!append_det_active(false, false));
         // Requested: only exact gfx1151 (`is_gfx1151` is `arch == "gfx1151"`,
@@ -3144,6 +3149,23 @@ mod tests {
         assert!(append_det_active(true, true));
         assert!(!append_det_active(true, false));
         assert_eq!(MTP_APPEND_DET_ENV, "HIPFIRE_QWEN4_MTP_APPEND_DET");
+    }
+
+    #[test]
+    fn append_det_default_resolves_on_for_gfx1151_only() {
+        // Unset resolves to the default: on for exact gfx1151, off on every
+        // other arch through the same `ArchCaps::is_gfx1151` predicate
+        // `mtp_append_det_enabled` reads.
+        use rdna_compute::arch_caps::ArchCaps;
+        use rdna_compute::feature_flags::FeatureFlags;
+        for arch in ["gfx1151", "gfx1150", "gfx1152", "gfx1100", "gfx1201", "gfx942"] {
+            let caps = ArchCaps::new(arch, std::sync::Arc::new(FeatureFlags::for_test(arch)));
+            assert_eq!(
+                append_det_active(MTP_APPEND_DET_DEFAULT, caps.is_gfx1151()),
+                arch == "gfx1151",
+                "{arch}",
+            );
+        }
     }
 
     #[test]
