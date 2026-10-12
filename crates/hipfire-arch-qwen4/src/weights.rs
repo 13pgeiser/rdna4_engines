@@ -58,6 +58,28 @@ fn qwen4_quantized_dtype(dtype: DType) -> bool {
     )
 }
 
+/// The four planar expert-slab dtypes (qt=131..=134) that no qwen4 route has a
+/// kernel for yet.  The qwen4 planner never produces them, but a caller-supplied
+/// [`DType`] could otherwise ride through [`qwen4_target_dtype`]'s
+/// pass-through arm into a declaration and fail much later in a generic
+/// consumer.
+fn qwen4_expert_slab_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ3I4G128R256 | DType::MQ3I4G128R128 | DType::MQ2I4G128R256 | DType::MQ2I4G128R128
+    )
+}
+
+/// Typed refusal of an expert-slab dtype at a result-returning boundary that
+/// receives a caller-supplied [`DType`].
+fn reject_expert_slab_dtype(dtype: DType) -> Result<(), WeightError> {
+    if qwen4_expert_slab_dtype(dtype) {
+        Err(WeightError::ExpertSlabDtypeKernelsUnavailable { dtype })
+    } else {
+        Ok(())
+    }
+}
+
 /// Payloads that stay source-exact BF16 even though they are rank-2 matrices.
 ///
 /// The Qwen4 family quantizes every matrix whose consumers read a quantized
@@ -140,6 +162,14 @@ fn qwen4_quantizable_matrix(name: &str, shape: &[usize]) -> bool {
 /// lossier tier does there: a four-bit trunk opened a reasoning block the model
 /// could not close.  Q8F16 costs 8.5 bpw but needs no rotation basis at all, and
 /// the trunk is a rounding error next to the experts.
+///
+/// Invariant: this takes only a shape, so it can never receive an expert-slab
+/// dtype (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`) and always returns
+/// one of the MQ4/Q8 tiers above.  The public entries that carry a caller
+/// [`DType`] ([`TensorRef::new`], [`Qwen4Manifest::build_with_recipe`],
+/// [`Qwen4Manifest::with_expert_parallel`] and [`Qwen4Weights::assemble`])
+/// refuse those dtypes with [`WeightError::ExpertSlabDtypeKernelsUnavailable`]
+/// before any mapping runs.
 fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
     let k = shape.last().copied().unwrap_or_default();
     if shape.len() == 3 {
@@ -156,6 +186,10 @@ fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
     }
 }
 
+/// Pure mapping: a `requested` dtype that is neither BF16 nor a recognised
+/// packed format is returned unchanged, so this function would preserve an
+/// expert-slab dtype.  It is infallible by design; every public caller that
+/// can hold such a dtype rejects it first (see [`qwen4_matrix_dtype`]).
 fn qwen4_target_dtype(name: &str, shape: &[usize], requested: DType) -> DType {
     if matches!(requested, DType::BF16 | DType::Q8_0) {
         if name == QWEN4_LM_HEAD {
@@ -348,6 +382,16 @@ impl Qwen4TierRecipe {
     /// a device with `Qwen4Capabilities::fp8_experts` (gfx942) may load.
     pub const fn fp8_experts(&self) -> bool {
         self.is_stock_fp8()
+    }
+
+    /// Refuses a recipe whose trunk tier names an expert-slab dtype
+    /// (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`): no qwen4 kernel
+    /// exists for them yet.
+    pub fn reject_expert_slab_dtypes(&self) -> Result<(), WeightError> {
+        match self {
+            Self::FlashNextPacked { trunk_tier, .. } => reject_expert_slab_dtype(*trunk_tier),
+            Self::SyntheticSourceBf16 | Self::SyntheticPacked => Ok(()),
+        }
     }
 }
 
@@ -563,6 +607,7 @@ impl TensorRef {
         if name.is_empty() || shape.is_empty() || shape.iter().any(|&dim| dim == 0) {
             return Err(WeightError::InvalidShape { name, shape });
         }
+        reject_expert_slab_dtype(dtype)?;
         let dtype = qwen4_target_dtype(&name, &shape, dtype);
         Ok(Self {
             name,
@@ -709,6 +754,7 @@ impl Qwen4Manifest {
         config: &Qwen4Config,
         recipe: Qwen4TierRecipe,
     ) -> Result<Self, WeightError> {
+        recipe.reject_expert_slab_dtypes()?;
         config.validate().map_err(WeightError::Config)?;
         let (packed, trunk_tier, mtp_source) = match &recipe {
             Qwen4TierRecipe::FlashNextPacked {
@@ -1272,6 +1318,29 @@ impl Qwen4Manifest {
         })
     }
 
+    /// Refuses a manifest (built here or assembled by hand from its public
+    /// fields) that declares or admits an expert-slab dtype
+    /// (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`) for any weight or
+    /// source constraint, or whose recipe names one.  Pure; no GPU is touched.
+    pub fn reject_expert_slab_dtypes(&self) -> Result<(), WeightError> {
+        self.identity.recipe.reject_expert_slab_dtypes()?;
+        for entry in &self.weights {
+            reject_expert_slab_dtype(entry.dtype)?;
+            match &entry.dtype_constraint.source {
+                hipfire_runtime::weight_manifest::SourceDType::Any => {}
+                hipfire_runtime::weight_manifest::SourceDType::Exact(dtype) => {
+                    reject_expert_slab_dtype(*dtype)?;
+                }
+                hipfire_runtime::weight_manifest::SourceDType::OneOf(dtypes) => {
+                    for dtype in dtypes {
+                        reject_expert_slab_dtype(*dtype)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn entry(&self, name: &str, layer: Option<usize>) -> Option<&WeightEntry> {
         self.weights
             .iter()
@@ -1338,6 +1407,7 @@ impl Qwen4Manifest {
                 ep.rank, ep.ranks
             )));
         }
+        self.reject_expert_slab_dtypes()?;
         if ep.ranks < 2 || ep.rank >= ep.ranks {
             return Err(WeightError::EpPlacement(format!(
                 "rank {} of {} is not an expert-parallel placement",
@@ -2964,6 +3034,7 @@ fn assembly_manifest(
     config: &Qwen4Config,
     recipe: &Qwen4TierRecipe,
 ) -> Result<Qwen4Manifest, WeightError> {
+    recipe.reject_expert_slab_dtypes()?;
     admit_executable_profile(config)?;
     Qwen4Manifest::build_with_recipe(config, recipe.clone())
 }
@@ -3242,6 +3313,12 @@ pub enum WeightError {
     /// An expert-parallel placement that is malformed, or a transaction whose
     /// routed expert tensors do not agree on one.
     EpPlacement(String),
+    /// A planar expert-slab dtype (`MQ3I4G128R256`/`R128`,
+    /// `MQ2I4G128R256`/`R128`) reached a declaration boundary.  The format is
+    /// recognised but no qwen4 GPU kernel route exists for it yet.
+    ExpertSlabDtypeKernelsUnavailable {
+        dtype: DType,
+    },
 }
 
 impl fmt::Display for WeightError {
@@ -3286,6 +3363,11 @@ impl fmt::Display for WeightError {
             Self::UnsupportedProfile { profile, reason } => {
                 write!(f, "Qwen4 profile {profile:?} is not executable: {reason}")
             }
+            Self::ExpertSlabDtypeKernelsUnavailable { dtype } => write!(
+                f,
+                "Qwen4 expert-slab dtype {dtype:?} is unsupported: no GPU kernels exist for the \
+                 MQ3I4G128R256/MQ3I4G128R128/MQ2I4G128R256/MQ2I4G128R128 planar formats yet"
+            ),
             Self::EpPlacement(reason) => write!(f, "Qwen4 expert-parallel placement: {reason}"),
         }
     }
@@ -3446,6 +3528,117 @@ mod tests {
         ] {
             let error = Fp8B128ExpertTable::from_tensor("t", &tensor).unwrap_err();
             assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+    }
+
+    const EXPERT_SLAB_DTYPES: [DType; 4] = [
+        DType::MQ3I4G128R256,
+        DType::MQ3I4G128R128,
+        DType::MQ2I4G128R256,
+        DType::MQ2I4G128R128,
+    ];
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_by_tensor_ref() {
+        for dtype in EXPERT_SLAB_DTYPES {
+            for (name, role, shape) in [
+                (
+                    "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                    TensorRole::RoutedGateUp,
+                    vec![512, 1280, 2560],
+                ),
+                (
+                    "model.language_model.layers.0.mlp.experts.down_proj",
+                    TensorRole::RoutedDown,
+                    vec![512, 2560, 640],
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    TensorRole::QsaQ,
+                    vec![4096, 2560],
+                ),
+            ] {
+                assert_eq!(
+                    TensorRef::new(name, role, Some(0), shape, dtype),
+                    Err(WeightError::ExpertSlabDtypeKernelsUnavailable { dtype }),
+                    "{dtype:?} {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_by_recipe_guard() {
+        let config = pinned_config();
+        for dtype in EXPERT_SLAB_DTYPES {
+            let recipe = Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: dtype,
+                mtp_source: false,
+            };
+            let expected = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype };
+            assert_eq!(recipe.reject_expert_slab_dtypes(), Err(expected.clone()));
+            assert_eq!(
+                Qwen4Manifest::build_with_recipe(&config, recipe.clone()).err(),
+                Some(expected.clone()),
+                "{dtype:?}"
+            );
+            assert_eq!(
+                assembly_manifest(&config, &recipe).err(),
+                Some(expected),
+                "{dtype:?}"
+            );
+        }
+        // The legacy tiers still build.
+        for tier in [DType::Q8_0, DType::MQ6G256V2] {
+            assert!(Qwen4Manifest::build_with_trunk_tier(&config, tier).is_ok());
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_in_raw_manifests() {
+        use hipfire_runtime::weight_manifest::SourceDType;
+        let base = Qwen4Manifest::build(&pinned_config()).unwrap();
+        assert_eq!(base.reject_expert_slab_dtypes(), Ok(()));
+        let placement = Qwen4EpPlacement { rank: 0, ranks: 2 };
+        for dtype in EXPERT_SLAB_DTYPES {
+            let expected = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype };
+            let mut target = base.clone();
+            target.weights[0].dtype = dtype;
+            assert_eq!(target.reject_expert_slab_dtypes(), Err(expected.clone()));
+            assert_eq!(
+                target.with_expert_parallel(placement).err(),
+                Some(expected.clone())
+            );
+            for source in [
+                SourceDType::Exact(dtype),
+                SourceDType::OneOf(vec![DType::BF16, dtype]),
+            ] {
+                let mut constraint = base.clone();
+                constraint.weights[0].dtype_constraint.source = source;
+                assert_eq!(
+                    constraint.reject_expert_slab_dtypes(),
+                    Err(expected.clone())
+                );
+                assert_eq!(
+                    constraint.with_expert_parallel(placement).err(),
+                    Some(expected.clone())
+                );
+            }
+            let mut recipe = base.clone();
+            recipe.identity.recipe = Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: dtype,
+                mtp_source: false,
+            };
+            assert_eq!(recipe.reject_expert_slab_dtypes(), Err(expected));
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtype_error_names_the_dtype() {
+        for dtype in EXPERT_SLAB_DTYPES {
+            let message = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype }.to_string();
+            assert!(message.contains(&format!("{dtype:?}")), "{message}");
+            assert!(message.contains("unsupported"), "{message}");
         }
     }
 

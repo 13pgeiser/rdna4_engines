@@ -400,6 +400,18 @@ decoded back to its codes and scale bits, the output is reopened and every paylo
 re-hashed, and `--cross-check-packs-w3/-w2` additionally compares each slab byte-for-byte with the Python R1
 pack. `--receipt` writes the JSON receipt. An existing `--out` is never overwritten.
 
+The CPU loader builds an O(index entries) `expert_slab_table::ExpertSlabTable`
+from the actual spans: 48 × 512 gate/up-down pairs first, canonical names and
+order, frozen shapes/qtype pairs/group sizes/byte sizes, contiguous aligned
+slabs, no trunk aggregates or stray I4 entries. A valid table receives the
+typed `ExpertSlabKernelsUnavailable` refusal (including W3/W2/MQ4 counts)
+before config/manifest admission or model GPU allocation; pointer-addressed
+MQ4 slabs are also unavailable. Missing or malformed v1 metadata fails closed.
+`validate_expert_slab_scales` separately checks W3/W2 payloads through the shared
+codec, including finite non-negative f16 scales, rejection of -0, and canonical
+midpoint codes for zero-scale groups; it is not run on the default load path.
+Legacy aggregate artifacts retain their existing admission checks and ordering.
+
 ### PARO4G128 probe payload
 
 `quant_type=28` is **not** row-major HFQ4/MQ4. Each tensor stores ParoQuant

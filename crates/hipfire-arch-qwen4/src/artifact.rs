@@ -12,6 +12,8 @@
 
 use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
+use crate::expert_slab_table::{build_expert_slab_table, ExpertSlabTableError};
+use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
 use crate::ple::PleHashMetadata;
 use crate::weights::{
     is_ple_shard_name_within, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, WeightError,
@@ -173,25 +175,90 @@ pub struct Qwen4HfqmArtifact {
 /// lets loader/evaluator callers preserve one diagnostic convention without
 /// exposing private parser helpers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Qwen4ArtifactError {
-    message: String,
+pub enum Qwen4ArtifactError {
+    /// Existing admission diagnostics retain their exact text.
+    Message(String),
+    ExpertSlabsMetadata(ExpertSlabsError),
+    ExpertSlabTable(ExpertSlabTableError),
+    ExpertSlabsMetadataRequired { name: String, quant_type: u8 },
+    ExpertSlabQuantTypeUnavailable { name: String, quant_type: u8 },
+    ExpertSlabKernelsUnavailable { w3: usize, w2: usize, mq4: usize },
 }
 
 impl Qwen4ArtifactError {
     fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
+        Self::Message(message.into())
     }
 }
 
 impl fmt::Display for Qwen4ArtifactError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        match self {
+            Self::Message(message) => f.write_str(message),
+            Self::ExpertSlabsMetadata(error) => write!(f, "qwen4: expert slab metadata: {error}"),
+            Self::ExpertSlabTable(error) => write!(f, "qwen4: expert slab table: {error}"),
+            Self::ExpertSlabsMetadataRequired { name, quant_type } => write!(
+                f,
+                "qwen4: new I4 expert types or per-expert slab names without \
+                 qwen4.expert_slabs v1 metadata are not admitted: {name} (qt={quant_type})"
+            ),
+            Self::ExpertSlabQuantTypeUnavailable { name, quant_type } => write!(
+                f,
+                "qwen4: tensor {name} qt={quant_type} is a planar I4 expert type; \
+                 routed GPU kernels are unavailable in this build"
+            ),
+            Self::ExpertSlabKernelsUnavailable { w3, w2, mq4 } => write!(
+                f,
+                "qwen4: per-expert slab artifact recognized and validated \
+                 (W3={w3}, W2={w2}, MQ4={mq4}); MQ3-I4/MQ2-I4/pointer-addressed MQ4 \
+                 routed kernels are not available on any GPU in this build, refusing to load"
+            ),
+        }
     }
 }
 
-impl std::error::Error for Qwen4ArtifactError {}
+impl std::error::Error for Qwen4ArtifactError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ExpertSlabsMetadata(error) => Some(error),
+            Self::ExpertSlabTable(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Recognize the new layout before legacy config/manifest admission. No
+/// payload reads or GPU work: scale validation is a separate callable API.
+fn refuse_expert_slabs(
+    metadata_json: &str,
+    tensors: &[HfqTensorInfo],
+) -> Result<(), Qwen4ArtifactError> {
+    let metadata = match expert_slabs::parse(metadata_json) {
+        Ok(metadata) => metadata,
+        // Invalid legacy JSON still receives the existing config diagnostic.
+        Err(ExpertSlabsError::InvalidJson(_) | ExpertSlabsError::MetadataNotObject) => None,
+        Err(error) => return Err(Qwen4ArtifactError::ExpertSlabsMetadata(error)),
+    };
+    if let Some(metadata) = metadata {
+        let table = build_expert_slab_table(&metadata, tensors)
+            .map_err(Qwen4ArtifactError::ExpertSlabTable)?;
+        let counts = table.counts();
+        return Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
+            w3: counts.w3,
+            w2: counts.w2,
+            mq4: counts.mq4,
+        });
+    }
+    if let Some(info) = tensors.iter().find(|info| {
+        matches!(info.quant_type, 131..=134) || parse_expert_entry_name(&info.name).is_some()
+    }) {
+        return Err(Qwen4ArtifactError::ExpertSlabsMetadataRequired {
+            name: info.name.clone(),
+            quant_type: info.quant_type,
+        });
+    }
+    Ok(())
+}
 
 /// Escape hatch for deliberately loading an artifact whose manifest target is
 /// quantized while its bytes are BF16 (the unpacked decode path).
@@ -286,6 +353,12 @@ fn validate_weight_geometry(
     entry: &WeightEntry,
     info: &HfqTensorInfo,
 ) -> Result<(), Qwen4ArtifactError> {
+    if matches!(info.quant_type, 131..=134) {
+        return Err(Qwen4ArtifactError::ExpertSlabQuantTypeUnavailable {
+            name: info.name.clone(),
+            quant_type: info.quant_type,
+        });
+    }
     let expected_shape = entry
         .logical_shape
         .iter()
@@ -1154,6 +1227,7 @@ pub fn admit_inventory_headers(
     metadata_json: &str,
     tensors: &[HfqTensorInfo],
 ) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+    refuse_expert_slabs(metadata_json, tensors)?;
     let config = Qwen4Config::from_metadata_json(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
@@ -1170,6 +1244,7 @@ pub fn admit_developer_inventory_headers(
     metadata_json: &str,
     tensors: &[HfqTensorInfo],
 ) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+    refuse_expert_slabs(metadata_json, tensors)?;
     let config = Qwen4Config::from_developer_metadata_json(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
@@ -1210,6 +1285,7 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
             "qwen4: REAP/head overlays are not admitted for exact HFQM inventory",
         ));
     }
+    refuse_expert_slabs(&hfq.metadata_json, hfq.tensors())?;
     let config = parse_artifact_config(&hfq.metadata_json)?;
     let (config, mut manifest) = manifest_for_metadata(config, &hfq.metadata_json)?;
     let ple_config = config.ple.as_ref();
@@ -1832,6 +1908,130 @@ mod tests {
     };
     use hipfire_runtime::ple_sidecar::ple_shard_name;
     use std::path::{Path, PathBuf};
+    fn slab_metadata() -> String {
+        json!({
+            (expert_slabs::EXPERT_SLABS_METADATA_KEY): expert_slabs::ExpertSlabsV1::fn_v1().to_json_value()
+        })
+        .to_string()
+    }
+
+    fn container_refusal(
+        fixture: &str,
+        metadata: &str,
+        tensors: &[HfqMemTensor],
+    ) -> Qwen4ArtifactError {
+        let path = fixture_path(fixture);
+        write_hfqm_package_mem(&path, ARCH_ID, metadata, tensors).unwrap();
+        let hfq = HfqFile::open(&path).unwrap();
+        let error = admit_hfqm_artifact(&hfq).expect_err("CPU admission must refuse slabs");
+        drop(hfq);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+        error
+    }
+
+    #[test]
+    fn slab_container_invalid_table_refuses_before_config_admission() {
+        assert!(matches!(
+            container_refusal("slab-empty-table", &slab_metadata(), &[]),
+            Qwen4ArtifactError::ExpertSlabTable(_)
+        ));
+    }
+
+    #[test]
+    fn slab_container_i4_without_metadata_refuses_each_new_qtype() {
+        for quant_type in 131..=134 {
+            let tensor = HfqMemTensor {
+                name: "stray.weight".into(),
+                quant_type,
+                shape: vec![1, 256],
+                group_size: 128,
+                data: vec![],
+            };
+            assert!(matches!(
+                container_refusal(&format!("slab-no-key-{quant_type}"), "{}", &[tensor]),
+                Qwen4ArtifactError::ExpertSlabsMetadataRequired {
+                    quant_type: found, ..
+                } if found == quant_type
+            ));
+        }
+    }
+
+    #[test]
+    fn slab_container_per_expert_mq4_name_without_metadata_refuses() {
+        let tensor = HfqMemTensor {
+            name: expert_slabs::expert_entry_name(0, 0, expert_slabs::ExpertProj::GateUp),
+            quant_type: 44,
+            shape: vec![1, 256],
+            group_size: 256,
+            data: vec![],
+        };
+        assert!(matches!(
+            container_refusal("slab-name-no-key", "{}", &[tensor]),
+            Qwen4ArtifactError::ExpertSlabsMetadataRequired { quant_type: 44, .. }
+        ));
+    }
+
+    #[test]
+    fn slab_container_malformed_metadata_is_a_typed_refusal() {
+        let metadata = json!({(expert_slabs::EXPERT_SLABS_METADATA_KEY): {"version": 2}});
+        assert!(matches!(
+            container_refusal("slab-bad-key", &metadata.to_string(), &[]),
+            Qwen4ArtifactError::ExpertSlabsMetadata(ExpertSlabsError::Mismatch {
+                field: "version", ..
+            })
+        ));
+    }
+
+    #[test]
+    fn slab_valid_full_inventory_refuses_unavailable_kernels_with_counts() {
+        use expert_slabs::ExpertFormat;
+        let headers = crate::expert_slab_table::full_fn_headers(|layer, expert| {
+            match (layer * 512 + expert) % 3 {
+                0 => ExpertFormat::Mq3I4,
+                1 => ExpertFormat::Mq2I4,
+                _ => ExpertFormat::Mq4Xts,
+            }
+        });
+        let error = refuse_expert_slabs(&slab_metadata(), &headers).unwrap_err();
+        assert_eq!(
+            error,
+            Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
+                w3: 8192, w2: 8192, mq4: 8192,
+            }
+        );
+        assert!(error.to_string().contains("not available on any GPU"));
+    }
+
+    #[test]
+    fn slab_recognition_leaves_legacy_headers_and_invalid_json_to_existing_checks() {
+        refuse_expert_slabs(&flash_next_json(), &flash_next_headers()).unwrap();
+        refuse_expert_slabs("invalid JSON", &[]).unwrap();
+        refuse_expert_slabs("[]", &[]).unwrap();
+    }
+
+    #[test]
+    fn weight_geometry_explicitly_refuses_each_planar_i4_qtype() {
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let entry = &manifest.weights[0];
+        for quant_type in 131..=134 {
+            let info = HfqTensorInfo {
+                name: entry.name.clone(),
+                quant_type,
+                shape: entry.logical_shape.iter().map(|&d| d as u32).collect(),
+                group_size: 128,
+                data_offset: 4096,
+                data_size: 0,
+            };
+            assert!(matches!(
+                validate_weight_geometry(entry, &info),
+                Err(Qwen4ArtifactError::ExpertSlabQuantTypeUnavailable {
+                    quant_type: found, ..
+                }) if found == quant_type
+            ));
+        }
+    }
+
 
     const PLE_MULTIPLIERS_NAME: &str =
         "model.language_model.layers.1.ple.ple_embedding.layer_multipliers";

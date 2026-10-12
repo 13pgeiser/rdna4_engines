@@ -21,6 +21,8 @@ pub mod ep;
 pub mod expert_residency;
 /// Version-1 expert-slab container schema (qt=131..=134 / `(44,53)` per-expert entries).
 pub mod expert_slabs;
+/// Validated CPU-only per-expert payload spans and optional scale validation.
+pub mod expert_slab_table;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
 pub mod kv_backend;
