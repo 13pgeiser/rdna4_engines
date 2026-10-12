@@ -123,6 +123,57 @@ incremental ratios estimates **33.1 / 22.5277 / 13.0855 TOPS**.
 These derived warm-wave numbers, not the optimistic cold-submit ratios,
 are the relevant throughput warning for a resident multi-wave trunk.
 
+### Fused row-major BF16 drain
+
+`gemm_g80::build_panel_program_rowmajor(rows_max, pitch, col0)` writes
+`C[t][col0+n]` at byte `2*(t*pitch+col0+n)`; arg2 is
+`ceil(rows_max/256)*256*pitch*2` bytes. Pitch and col0 must be even.
+The complete padded panel is written (zero padded tokens), but no other
+columns or rows beyond the padded extent are touched. Native-tile BF16
+M256/M8192 PDI/TXN hashes are pinned alongside the unchanged int8/I32 pins.
+
+No retile or additional DMA transfer: the memtile MM2S drain uses four
+inner-first `(step,wrap)` dimensions in 32-bit words:
+`(1,4), (32,10), (4,8), (320,0)`. These read the native 8x8 blocks in
+row order. The two shim tile BDs on each C channel then scatter each
+128x80 tile with `(1,40), (pitch/2,0)`; transfer length is 5120 words.
+Fields are `Bd::memtile_words` words 2..5 (17-bit step-minus-one,
+10-bit wraps) and `Bd::shim_words` words 3..5 (20-bit step-minus-one,
+10-bit wraps), transcribed from aie-rt
+[`xaie2pgbl_params.h`](https://github.com/Xilinx/aie-rt/blob/release/main_aig/driver/src/global/xaie2pgbl_params.h)
+and [`xaie_dma_aieml.c`](https://github.com/Xilinx/aie-rt/blob/release/main_aig/driver/src/dma/xaie_dma_aieml.c).
+Unused outer wrap is zero; length terminates the outer dimension.
+
+At pitches 14080/16640, a 256-row wave step exceeds the shim's 20-bit
+stride/iteration field. The TXN therefore SYNCs both C channels per wave
+before rewriting/requeueing the same two-tile BD chains with the next row
+base. A/B are queued once for the entire submit. This supports all 256
+waves without descriptor/queue overflow; firmware command overhead is not
+covered by the phase-sum cycle estimate.
+
+Build one design with col0=0 per pitch/row bound. All 11 QsaIn / 13 GdnIn
+panels can reuse its PDI and program; advance arg2's base by `2*panel*1280`
+through `append_run_body` or `append_lean_run_body`. Retain the full fused
+arena behind the offset, and enforce `panel_col0+1280 <= pitch`.
+Alternatively the explicit col0 builder changes DDR patch offsets only.
+Shim traffic remains A `4*W*kc*4608`, B `8*kc*2*5504`, C
+`8*W*4*20480` bytes: the phase-sum estimate is unchanged from native tiles.
+The exercised functional simulator reports identical row-major/native ticks:
+M200 K64 **102066**, M513 K64 **289334**, M200 K2560 **209386**,
+M300 K2560 **357502** (pitches 2624/16640/14080/2624 respectively).
+These are modelled timings, not firmware latency or silicon measurements.
+
+Silicon command (not run by this change):
+
+```sh
+target/release/npu-gemm 8192 1280 2560 --variant G80 --epi bf16 \
+  --rowmajor-pitch 16640 --rowmajor-col0 1280 --iters 3 --reuse-ctx
+```
+
+The CLI checks every live value against `bf16_direct`, zero padded rows,
+and poison bytes outside the panel window. Row-major DMA silicon validation
+remains required even though the native-tile BF16 arithmetic is proven.
+
 ## GPU Bf16Direct glue
 
 `rdna_compute::npu_trunk` exposes an explicit `NpuBf16Layout` (padded rows,
@@ -269,3 +320,132 @@ ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
 CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
 nice -n 19 cargo test -p hipfire-arch-qwen4 --release npu_trunk -j 12 -- --nocapture
 ```
+
+## First-light serving route (Linux gfx1151, family B)
+
+`HIPFIRE_QWEN4_NPU_TRUNK=off|emulate|on` is resolved when the forward
+owner loads. `off` returns before packing, NPU/GPU allocations, device opens
+or trace-file opens. The ordinary chunk executor is unchanged except for
+inactive option checks. `auto` is explicitly refused until calibrated admission
+is wired; it is not a silent fallback from `on`.
+
+The opt-in route requires Flash-Next K=2560 and MQ6G256V2 for all eight
+input families. It packs the S1 `Bf16Direct` contract and uploads the exact
+row-major W8 and Sm/Se twin. The bundle retains resident GPU handles, not
+source byte owners, so preparation currently downloads each MQ6 matrix once.
+The load line records `download_ms`, `pack_ms`, actual resident weight bytes,
+mode/families/contract and runtime status. `on` additionally opens the unchanged
+8192-row G80 program, resident 13/11-panel chains and two registered A/C banks;
+any admission/open error fails the load. Calibration is deliberately bypassed,
+with a `first-light-force-full-pairs` load note.
+
+`emulate`, and every unpaired chunk under `on`, use the producer and exact IU8
+BF16-direct GPU twin for rows >=512. Smaller chunks and decode retain the
+ordinary projections. Out-projections retain their MQ6 route. QSA output
+scratch is F32; GDN qkv is BF16 only when the existing chunk-core route reads
+BF16 (otherwise it is exact widened F32); z/a/b are F32.
+
+### Bank state and ordering
+
+`on` requires the full 8192-row scratch plan and single-device placement.
+It allocates a second complete scratch bank only at load. This deliberately
+conservative lab allocation double-buffers:
+
+* token IDs, rotated embeddings, embeddings, **HC residual streams**;
+* HC normalized/low/up/mixed/gates, activation rotation and hidden input;
+* projection/projection2, GDN a/b/gate/beta/recurrent-output/BF16/z/output;
+* QSA index/qgate/k/v/output/selected, attention output;
+* PLE staged/rows/key/value/query/gated/normed/output;
+* router logits, all routed/shared MoE intermediates, grouped permutation,
+  count/offset/tile/gather/down scratch, FFN output, scalar and logits scratch.
+
+The GDN recurrence/convolution, QSA KV/index caches and PLE convolution state
+are deliberately shared, not double-buffered. No MoE scratch must survive a
+layer boundary, but the complete second bank avoids any scratch alias lifetime
+assumption. Opt-in execution uses mapped experts, not donor-layer staging.
+The private NPU owner transfers as one exclusive object with `ArchModel`;
+none of railgun's internal HIP Rc resources escapes that owner.
+
+Only consecutive **full** chunks are paired; boundaries stay at 8192 and any
+tail remains sequential. For each layer:
+
+```text
+prepare(0,A), pack/kick(0,A); prepare(0,B), pack/kick(0,B)
+wait/consume(l,A), retire A, G(l,A)
+prepare(l+1,A), pack/kick(l+1,A)
+wait/consume(l,B), retire B, G(l,B)
+prepare(l+1,B), pack/kick(l+1,B)
+```
+
+`prepare` includes PLE when present and the attention HC read. `G` is mixer
+core/out, attention HC write and MLP HC/MoE/write. The existing typed ops and
+output/HC/MoE fusions execute those fragments; the numerical twin uses the
+same fragment boundaries. `prepare_bank` queues the previous retirement
+event before any new A writes; the relay's A-ready event orders the new submit.
+Retirement follows the last C scatter, not the later core's native-tensor reads.
+The transport's checked GPU wait remains host-gated; this is not a CPU-free
+rejoin and the relay submits NPU chains serially.
+
+Bank A starts at the request's current position; B starts at position+8192.
+Each bank-B QSA view is advanced using bank A's exact `next_lengths()` tuple
+(full/raw/pooled/selected/position), rather than independently guessed offsets.
+GPU `G(l,A)` precedes `G(l,B)`, so B sees A's recurrent updates and appended
+KV. PLE row hashing advances history through A before hashing B. Only after
+both banks finish do the head, requested wide-hidden/MTP capture, QSA metadata
+and global position/history publish; existing caller session snapshots remain
+outside the pair. Pairing never crosses a caller's session segment boundary.
+
+### Overlap trace
+
+With `HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk.jsonl`, successful pairs
+append one JSON object per `(layer,bank)` with `position`, `rows`, `seq`,
+`pack_issue_ns`, `kick_ns`, `npu_submit_ns`, `npu_done_ns`,
+`gpu_wait_enqueue_ns`, `consume_issue_ns`, `mixer_start_ns`, `mixer_end_ns`
+and `anchor_uncertainty_ns`. Host/relay timestamps use Linux CLOCK_MONOTONIC.
+The mixer interval covers the complete `G` fragment, including HC/MoE.
+HIP timing events are resolved only after the pair, relative to a monotonic
+anchor calibrated after initialization and **before** pipeline work; its host
+bracket width is reported as uncertainty. There is no per-layer GPU sync.
+No trace records are emitted for GPU-only tails or `emulate`.
+
+### Parent's Halo gate
+
+No full-model hardware parity or speed claim is established by CPU builds.
+Use the same MQ6 family-B model, prompt and greedy settings in fresh daemons;
+confirm the tokenized prompt contains at least 16384 rows (a file named `p16k`
+is not itself evidence of its token count). Keep chunk admission at 8192.
+Do not inherit the build-only `ROCR_VISIBLE_DEVICES=-1`/`HIP_VISIBLE_DEVICES=-1`.
+
+```sh
+export HIPFIRE_DAEMON_BIN="$PWD/target/release/daemon"
+export HIPFIRE_PREFILL_CHUNK_ROWS=8192
+# MODEL must name the pinned MQ6 family-B artifact, not an MQ4 artifact.
+HIPFIRE_QWEN4_NPU_TRUNK=on \
+HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk-on.jsonl \
+  target/release/hipfire serve "$MODEL" 127.0.0.1 11435 --spec off --max-seq 32768
+```
+
+In a separate terminal, then repeat in fresh processes with `emulate` and `off`:
+
+```sh
+HIPFIRE_QWEN4_NPU_TRUNK=on \
+HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk-bench.jsonl \
+  target/release/hipfire bench "$MODEL" --ttft --prompt-file p16k --runs 3
+
+for mode in on emulate off; do
+  HIPFIRE_LOCAL=1 HIPFIRE_QWEN4_NPU_TRUNK="$mode" \
+    target/release/hipfire run "$MODEL" --temp 0 --repeat-penalty 1 \
+    --spec off --no-stream --max-seq 32768 --max-tokens 64 "$(cat p16k)" \
+    > "/tmp/npu-trunk-$mode.txt"
+done
+cmp /tmp/npu-trunk-on.txt /tmp/npu-trunk-emulate.txt
+# Compare off to the unchanged beta binary's output on the same model/settings,
+# not to emulate (emulate intentionally changes the trunk numerical contract).
+```
+
+If a caller splits the prompt into individual lane tiles/session segments before
+the chunk owner receives it, only pairs within those segments can pipeline.
+EP, compact scratch, calibrated `auto`, ragged NPU programs and CPU-free waits
+are outside this first-light route. CPU bookkeeping tests live under
+`gpu_forward::npu_forward::tests`; the full-model greedy comparison and trace
+overlap inspection remain the parent-run silicon acceptance gate.

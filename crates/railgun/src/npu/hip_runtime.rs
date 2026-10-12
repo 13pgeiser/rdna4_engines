@@ -882,6 +882,17 @@ impl HipRuntime {
         })
     }
 
+    /// Order a foreign producer stream after the last consumer of its arena.
+    pub unsafe fn wait_raw(&self, event: &HipEvent, stream: *mut c_void) -> Result<(), String> {
+        self.owns(&event.shared, "wait event")?;
+        let p = resolve(self.shared.api.lib, ["hipStreamWaitEvent"], RUNTIME_PREFIX)?;
+        let wait: unsafe extern "C" fn(Handle, Handle, u32) -> HipStatus =
+            unsafe { core::mem::transmute(p[0]) };
+        self.shared.check("hipStreamWaitEvent", "foreign stream retire wait", unsafe {
+            wait(stream, event.handle, 0)
+        })
+    }
+
     /// Resolve only the relay's thread-safe entry points. No Rc-owned HIP object crosses threads.
     pub(crate) fn relay_api(&self) -> Result<RelayApi, String> {
         let p = resolve(self.shared.api.lib, ["hipEventQuery", "hipStreamWaitValue32"], RUNTIME_PREFIX)?;

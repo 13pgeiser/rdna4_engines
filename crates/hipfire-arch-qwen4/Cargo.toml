@@ -20,6 +20,9 @@ sha2.workspace = true
 pm-npu = { path = "../pm-npu" }
 rayon.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+railgun = { path = "../railgun", features = ["npu"] }
+
 [dev-dependencies]
 memmap2.workspace = true
 saddle-quant = { path = "../saddle-quant" }

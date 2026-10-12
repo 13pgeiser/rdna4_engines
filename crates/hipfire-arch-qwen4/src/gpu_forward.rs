@@ -59,6 +59,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+#[path = "npu_trunk/forward.rs"]
+mod npu_forward;
+
 pub(crate) const EPSILON: f32 = 1.0e-6;
 /// Default rows of one Qwen4 prefill chunk (the reusable forward scratch).
 ///
@@ -3329,6 +3333,8 @@ pub struct Qwen4GpuForward {
     /// batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`]). Never
     /// set for decode, MTP verify or the MTP head.
     pub(crate) prefill_scope: bool,
+    #[cfg(target_os = "linux")]
+    npu_trunk: Option<npu_forward::NpuForward>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -3534,6 +3540,8 @@ impl Qwen4GpuForward {
         let mut ep: Option<Qwen4ForwardEp> = None;
         let mut trunk_zba = Vec::new();
         let mut trunk_a4 = Vec::new();
+        #[cfg(target_os = "linux")]
+        let mut npu_trunk = None;
         let result = (|| {
             if let Some(placement) = bundle.weights.ep_placement() {
                 let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
@@ -3631,6 +3639,8 @@ impl Qwen4GpuForward {
             } else {
                 gpu.qwen4_trunk_iu4 = false;
             }
+            #[cfg(target_os = "linux")]
+            { npu_trunk = npu_forward::NpuForward::load(gpu, bundle, max_chunk, mode)?; }
             // The Q8_0 decode copies are the Flash-Next decode recipe (they
             // re-quantize its shared-expert and HC matrices); a developer
             // profile decodes the source BF16 weights, so decode and prefill
@@ -3686,6 +3696,8 @@ impl Qwen4GpuForward {
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         if let Err(error) = result {
+            #[cfg(target_os = "linux")]
+            if let Some(npu) = npu_trunk { let _ = npu.free(gpu); }
             if let Some(stage) = expert_stage {
                 let _ = stage.free_gpu(gpu);
             }
@@ -3730,6 +3742,8 @@ impl Qwen4GpuForward {
             qsa_tap: None,
             lane_scope: false,
             prefill_scope: false,
+            #[cfg(target_os = "linux")]
+            npu_trunk,
         })
     }
 
@@ -3926,6 +3940,8 @@ impl Qwen4GpuForward {
             decode_q8,
             route_trace,
             trunk_zba,
+            #[cfg(target_os = "linux")]
+            npu_trunk,
             ..
         } = self;
         // Drain both streams before releasing stage tables, events or scratch.
@@ -3938,6 +3954,10 @@ impl Qwen4GpuForward {
         // The PLE staging bytes may still be read by an enqueued upload:
         // retire it before the device buffers and the host bytes go.
         let mut first = host_ple.free_gpu(gpu);
+        #[cfg(target_os = "linux")]
+        if let Some(npu) = npu_trunk {
+            if let Err(e) = npu.free(gpu) { first.get_or_insert(e); }
+        }
         if let Some(error) = scratch.free_gpu(gpu) {
             first.get_or_insert(error);
         }
@@ -4243,6 +4263,18 @@ impl Qwen4GpuForward {
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         let mut offset = 0usize;
         while offset < tokens.len() {
+            #[cfg(target_os = "linux")]
+            if self.npu_trunk.as_ref().is_some_and(|n| n.pipelined())
+                && npu_forward::pair_rows(tokens.len()-offset,max_chunk).is_some()
+            {
+                let final_pair=self.set_tile_ple_lookahead(tokens,offset,16384,&mut caller_lookahead);
+                let output=if output_rows==Qwen4OutputRows::All || final_pair {
+                    Qwen4OutputPolicy::Rows(output_rows)
+                } else { Qwen4OutputPolicy::None };
+                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+16384],offset,Some(logits),top1,wide_hidden_capture,output)?;
+                offset+=16384;
+                continue;
+            }
             let rows = (tokens.len() - offset).min(max_chunk);
             // The caller's lookahead belongs to the final tile; earlier tiles
             // look ahead to the next tile.
@@ -4339,6 +4371,15 @@ impl Qwen4GpuForward {
         let max_chunk = self.scratch.max_chunk;
         let mut offset = 0usize;
         while offset < tokens.len() {
+            #[cfg(target_os = "linux")]
+            if self.npu_trunk.as_ref().is_some_and(|n| n.pipelined())
+                && npu_forward::pair_rows(tokens.len()-offset,max_chunk).is_some()
+            {
+                self.set_tile_ple_lookahead(tokens,offset,16384,&mut caller_lookahead);
+                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+16384],offset,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
+                offset+=16384;
+                continue;
+            }
             let rows = (tokens.len() - offset).min(max_chunk);
             self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
             let capture_chunk = wide_hidden_capture
@@ -4752,7 +4793,13 @@ impl Qwen4GpuForward {
         // parity observer keeps its historical unsplit transport. A stream
         // capture keeps mapped reads too: a staged forward forks a copy
         // stream and its failure recovery synchronizes the device.
-        let expert_stage = match self.expert_stage.as_ref() {
+        let npu_armed = {
+            #[cfg(target_os = "linux")]
+            { self.npu_trunk.is_some() && n >= 512 }
+            #[cfg(not(target_os = "linux"))]
+            { false }
+        };
+        let expert_stage = match self.expert_stage.as_ref().filter(|_| !npu_armed) {
             Some(stage)
                 if n >= stage.min_rows
                     && (stage.capture || wide_hidden_capture.is_none())
@@ -5534,7 +5581,21 @@ impl Qwen4GpuForward {
                         ))
                     })
                 };
-                if let Some(tap) = self.qsa_tap.as_mut() {
+                if npu_armed {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let npu = self.npu_trunk.as_ref().expect("armed");
+                        match ple_split {
+                            Some(split) => {
+                                let layer = steps[..split].iter().filter(|s| matches!(s, Step::GatedDeltaNet(_) | Step::IndexedAttention(_))).count();
+                                npu.execute_emulate(gpu, &ctx, &mut steps[..split], 0)?;
+                                stage_ple(gpu)?;
+                                npu.execute_emulate(gpu, &ctx, &mut steps[split..], layer)?;
+                            }
+                            None => npu.execute_emulate(gpu, &ctx, &mut steps, 0)?,
+                        }
+                    }
+                } else if let Some(tap) = self.qsa_tap.as_mut() {
                     // Parity tap: run up to and including each QSA step, then
                     // let the observer read that layer's scratch and state.
                     let mut start = 0;

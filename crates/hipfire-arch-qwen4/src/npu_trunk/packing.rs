@@ -169,6 +169,19 @@ pub fn pack_matrix(mq6: &[u8], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
     (w8, ws)
 }
 
+/// Row-major direct-BF16 GPU twin of the resident panel quantizer.
+pub(crate) fn pack_matrix_direct(mq6: &[u8], m: usize, k: usize, output: &mut [u8]) {
+    assert_eq!(k, TRUNK_K);
+    assert_eq!(mq6.len(), m * row_bytes(k));
+    assert_eq!(output.len(), m * k);
+    // i8/u8 have identical size/alignment and every bit pattern is valid.
+    let codes = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<i8>(), output.len()) };
+    let mut row = [0.0; TRUNK_K];
+    for (raw, dst) in mq6.chunks_exact(row_bytes(k)).zip(codes.chunks_exact_mut(k)) {
+        quantize_scaled_row(raw, &mut row, dst, true);
+    }
+}
+
 /// Validate `matrices` against `shape`/`families` and return the selected ones in fused order.
 ///
 /// Every present entry must belong to the shape and appear strictly in fused order (so no

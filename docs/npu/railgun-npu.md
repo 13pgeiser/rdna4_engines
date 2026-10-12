@@ -194,8 +194,13 @@ CPU-alias invalidation and release-store/CLFLUSH of the bank's registered done w
 system-fenced event before C loads. This conservative v1 rejoin is host-gated, not a CPU-free
 wait: failed jobs cannot strand a queued GPU wait or silently admit stale C. Raw done waits
 outside this checked API are unsupported. Sequences never wrap (reopen at i32::MAX).
-`unsafe retire_bank(Seq, stream)` records the last consumer's event; reuse requires its
-completion. `close()` joins the relay (context before BOs), checks GPU retirement, then HIP
+`unsafe retire_bank(Seq, stream)` records the last consumer's event. Before
+the next GPU producer writes A, `unsafe prepare_bank(bank, stream)` queues
+`hipStreamWaitEvent` on that retirement event; the following kick's A-ready
+event then orders the next NPU submit. Callers that do not prepare still need
+completed retirement before kick. `Completion::{submit_ns,done_ns}` are relay
+CLOCK_MONOTONIC timestamps (submit issue and completed timeline observation).
+`close()` joins the relay (context before BOs), checks GPU retirement, then HIP
 unregisters before unmapping. On unretired/stuck GPU work, teardown reports an error and
 quarantines registrations/pages until process exit instead of freeing live operands.
 

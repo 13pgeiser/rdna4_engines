@@ -1485,6 +1485,7 @@ dependencies = [
  "hipfire-runtime",
  "memmap2",
  "pm-npu",
+ "railgun",
  "rayon",
  "rdna-compute",
  "saddle-quant",

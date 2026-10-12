@@ -43,7 +43,20 @@ pub struct HostRegistered { pub npu_handle: u32, pub npu_address: u64, pub host:
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seq { pub bank: usize, pub value: u32 }
 #[derive(Clone, Copy, Debug)]
-pub struct Completion { pub kick_to_done: Duration, pub npu_busy: Duration }
+pub struct Completion {
+    pub kick_to_done: Duration,
+    pub npu_busy: Duration,
+    pub submit_ns: u64,
+    pub done_ns: u64,
+}
+
+/// Linux CLOCK_MONOTONIC timestamp shared by relay and forward trace.
+pub fn monotonic_ns() -> u64 {
+    let mut time = [0i64; 2];
+    // CLOCK_MONOTONIC is always available on the Linux-only NPU backend.
+    assert_eq!(unsafe { super::sys::clock_gettime(1, &mut time) }, 0);
+    time[0] as u64 * 1_000_000_000 + time[1] as u64
+}
 
 struct Pages { ptr: *mut u8, len: usize }
 impl Pages {
@@ -88,7 +101,7 @@ impl Shared {
         }
     }
 }
-struct BankState { generation: u32, kicked: bool, retired: bool }
+struct BankState { generation: u32, kicked: bool, retired: bool, prepared: bool }
 
 /// Async kick, bounded host relay, checked GPU rejoin. No rows/addresses/commands
 /// are patched per kick; padded A rows MUST contain zero codes and zero scales.
@@ -142,7 +155,7 @@ impl NpuTrunkRuntime {
         // Construct the teardown guard before receiving: all early returns join
         // the relay (contexts/BOs) before unregistering/unmapping caller pages.
         let mut rt = Self { hip, api, banks: storage, bindings: Vec::new(), layout, rows_max, layers: keys,
-            state: RefCell::new((0..banks).map(|_| BankState { generation: 0, kicked: false, retired: false }).collect()),
+            state: RefCell::new((0..banks).map(|_| BankState { generation: 0, kicked: false, retired: false, prepared: false }).collect()),
             shared, tx: Some(tx), relay: Some(relay) };
         rt.bindings = init_rx.recv().map_err(|_| "trunk relay exited during open")??;
         Ok(rt)
@@ -161,6 +174,22 @@ impl NpuTrunkRuntime {
     pub fn done_word(&self, bank: usize) -> Result<u64, String> {
         Ok(self.banks.get(bank).ok_or("invalid trunk bank")?.control.registration.ptr())
     }
+
+    /// Enqueue retirement before writing the next A. Must precede producer pack.
+    /// # Safety
+    /// `stream` is live, belongs to this GPU, and carries the following producer.
+    pub unsafe fn prepare_bank(&self, bank: usize, stream: *mut c_void) -> Result<(), String> {
+        let b = self.banks.get(bank).ok_or("invalid trunk bank")?;
+        let mut states = self.state.borrow_mut();
+        let state = &mut states[bank];
+        if state.kicked {
+            if !state.retired { return Err("bank consumer not retired".into()); }
+            self.wait_host(Seq { bank, value: state.generation })?;
+            unsafe { self.hip.wait_raw(&b.retired, stream)?; }
+        }
+        state.prepared = true;
+        Ok(())
+    }
     /// Records a system-release event after GPU A writes on stream, then queues
     /// relay work. Caller must not touch A/C until completion/consumer retirement.
     /// `stream` must be live and on the selected GPU; null selects its default stream.
@@ -171,7 +200,7 @@ impl NpuTrunkRuntime {
         let mut states = self.state.borrow_mut();
         let state = &mut states[bank];
         if state.kicked {
-            if !state.retired || !self.api.query(b.retired.raw())? { return Err("bank consumer not retired".into()); }
+            if !state.retired || (!state.prepared && !self.api.query(b.retired.raw())?) { return Err("bank consumer not retired".into()); }
             self.wait_host(Seq { bank, value: state.generation })?;
         }
         // signed-difference GEQ implementations must never see generation wrap.
@@ -188,6 +217,7 @@ impl NpuTrunkRuntime {
         state.generation = seq.value;
         state.kicked = true;
         state.retired = false;
+        state.prepared = false;
         let enqueue = (|| {
             unsafe { self.hip.record_raw(&b.ready, stream)?; }
             self.tx.as_ref().ok_or("runtime closed")?.try_send(Job { seq, layer, shape, event: b.ready.raw(), start })
@@ -333,10 +363,12 @@ fn relay_main(program: PanelProgram, layers: Vec<LayerPanels>, pages: Vec<BankPa
             let layer = layers.iter().position(|l| l.layer == job.layer && l.shape == job.shape).ok_or("unknown relay layer")?;
             let chain = &resources.chains[layer * pages.len() + job.seq.bank];
             let start = Instant::now();
+            let submit_ns = monotonic_ns();
             let point = resources.ctx.submit_chain(chain)?;
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() { return Err("NPU deadline exhausted after submit".into()); }
             let state = resources.ctx.wait_chain(chain, point, left.as_millis().max(1) as u64)?;
+            let done_ns = monotonic_ns();
             let npu_busy = start.elapsed();
             if state != ERT_STATE_COMPLETED { return Err(format!("NPU chain state {state}, error index {}", chain.error_index())); }
             // Transaction tail synchronizes every C channel before timeline done.
@@ -345,7 +377,7 @@ fn relay_main(program: PanelProgram, layers: Vec<LayerPanels>, pages: Vec<BankPa
             resources.c[job.seq.bank].flush();
             let done = pages[job.seq.bank].done as *mut AtomicU32;
             unsafe { (*done).store(job.seq.value, Ordering::Release); super::clflush(done.cast(), 64); }
-            Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy })
+            Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns })
         })();
         if let Err(e) = &result { fatal = Some(e.clone()); }
         finish(&shared, job.seq, result);
@@ -384,7 +416,7 @@ mod tests {
         assert!(pending.wait(seq, Duration::from_millis(1)).unwrap_err().contains("timed out"));
         finish(&pending, seq, Err("NPU timeout".into()));
         assert_eq!(pending.wait(seq, Duration::ZERO).unwrap_err(), "NPU timeout");
-        finish(&pending, seq, Ok(Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO }));
+        finish(&pending, seq, Ok(Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO, submit_ns: 0, done_ns: 0 }));
         assert!(pending.wait(seq, Duration::ZERO).is_ok());
     }
     #[test] fn owning_fields_teardown_in_declared_order() {
