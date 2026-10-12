@@ -45,6 +45,9 @@ enum { FP8_OPS_BLOCK_SCALE = 0, FP8_OPS_ROW_SCALE = 1 };
 static inline int fp8_ops(const RadArgs* a, Fp8Ops* g, int want_ascale,
                           int wscale = FP8_OPS_BLOCK_SCALE) {
     std::memset(g, 0, sizeof(*g));
+    /* No fp8 or int8 block GEMM reads a partitioned weight's `pb1`/`pb2`; refused, not ignored (see
+     * gemm_ops). */
+    if (r4d_geti_or(a, "pb1", 0) > 0 || r4d_geti_or(a, "pb2", 0) > 0) return R4D_NO(RAD_E_UNSUPPORTED);
     g->a      = r4d_opt(a, F_A);
     g->ascale = r4d_opt(a, F_ASCALE);
     g->b      = r4d_opt(a, F_B);

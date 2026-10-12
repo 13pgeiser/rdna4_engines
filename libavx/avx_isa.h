@@ -97,7 +97,7 @@ int         avx_isa_force(int level);
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(had_quant_act_i8)     X(quant_act_fp8)        X(had_quant_act_fp8)  \
     X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8)   X(dequant)            \
-    X(rmsnorm_quant_fp8)    X(gated_quant_fp8)                                                    \
+    X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      X(givens_rotate)        X(givens_dense_quant) \
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \

@@ -326,7 +326,7 @@ struct GemmOps {
  * the block-scaled fp8 family's quantisers, which every fused producer in arch/common writes) is
  * group 128, read at the operand's own row stride. Anything else is refused by shape: a grid read
  * at the wrong width is an answer that is merely wrong. */
-static inline int mx_ascale_grid(const GemmOps& g, int* group, int* rs) {
+static inline int mx_ascale_grid(const GemmOps& g, int* group, int* rs, int parts = 1) {
     const RadTensor* s = g.ascale;
     if (!s || g.M <= 0) return R4D_NO(RAD_E_INVAL);
     long long cols = 1, rstride = 1;
@@ -340,9 +340,69 @@ static inline int mx_ascale_grid(const GemmOps& g, int* group, int* rs) {
         rstride = cols;
     }
     const long long kb = (g.K + 127) / 128;
-    if (cols == 1 && (s->rank < 2 || rstride == 1)) { *group = 0; *rs = 1; return RAD_OK; }
-    if (cols == kb && rstride >= kb) { *group = 128; *rs = (int)rstride; return RAD_OK; }
+    /* PARTS: the activation's copies sit side by side in a row, so its scale row is `parts` times
+     * as long; each part reads its own kb of them at the row stride. */
+    if (parts == 1 && cols == 1 && (s->rank < 2 || rstride == 1)) { *group = 0; *rs = 1; return RAD_OK; }
+    if (cols == kb * parts && rstride >= kb * parts) { *group = 128; *rs = (int)rstride; return RAD_OK; }
     return R4D_NO(RAD_E_SHAPE);
+}
+
+/* THE PARTS OF A PARTITIONED MXFP4 WEIGHT (gemm_nt_q's `pb1`/`pb2`), as launches.
+ *
+ * A fused projection whose pieces were rotated apart (ParoQuant: gate|up, q|k|v) has one copy of
+ * the activation a piece, written side by side in a row of `a` -- [M, parts * K] -- and its scales
+ * the same, so the weight's rows [0, pb1), [pb1, pb2), [pb2, N) each meet THEIR copy. A part is
+ * then the ordinary product over a window of the planes: the activation from byte p * K of each row
+ * and its scales from p * ceil(K/128), the fragment-order weight from tile n0 / 16 (its bytes are
+ * n0 * K / 2 in), the exponents and reference from column n0, the output from column n0, the last
+ * three with the full planes' row pitch. So the kernels learn only row pitches (`lda`, `ldws`,
+ * `ldc`) and a part is one launch of the kernel the shape would have picked anyway.
+ *
+ * `pb1` = 0 is one part and `pb2` = 0 ends the second part at N, as libref reads them. Bounds are
+ * whole 16-row tiles (the weight's fragment unit). Returns the parts in `p`, K corrected to the
+ * op's own (gemm_ops read the row's width, which is parts * K), and the activation's row pitch in
+ * `lda`. */
+struct MxParts {
+    int       n = 1;
+    long long n0[3] = { 0, 0, 0 }, n1[3] = { 0, 0, 0 };
+    long long lda = 0;                  /* 0: the plane's own K */
+};
+
+/* The bounds `pb1`/`pb2` name over N rows, as every reader takes them: { 0, e1, e2, N }, part i
+ * being [bound[i], bound[i+1]). Returns how many copies of the activation they imply, 1..3. */
+static inline int mx_part_bounds(long long N, long long pb1, long long pb2, long long bound[4]) {
+    const long long e1 = pb1 > 0 && pb1 < N ? pb1 : N;
+    long long e2 = pb2 > 0 && pb2 < N ? pb2 : N;
+    if (e2 < e1) e2 = e1;
+    bound[0] = 0;
+    bound[1] = e1;
+    bound[2] = e2;
+    bound[3] = N;
+    return e2 < N ? 3 : (e1 < N ? 2 : 1);
+}
+
+static inline int mx_parts(const RadArgs* a, GemmOps* g, MxParts* p) {
+    p->n = 1;
+    p->n0[0] = 0;
+    p->n1[0] = g->N;
+    p->lda = 0;
+    long long bound[4];
+    const int segs = mx_part_bounds(g->N, r4d_geti_or(a, "pb1", 0), r4d_geti_or(a, "pb2", 0), bound);
+    if (segs == 1) return RAD_OK;
+    const long long K = r4d_geti_or(a, "K", 0);
+    if (K <= 0) return R4D_NO(RAD_E_INVAL);
+    if (g->K != (long long)segs * K || (bound[1] % 16) || (bound[2] % 16)) return R4D_NO(RAD_E_SHAPE);
+    p->n = 0;
+    for (int i = 0; i < 3; ++i)
+        if (bound[i + 1] > bound[i]) {
+            p->n0[p->n] = bound[i];
+            p->n1[p->n] = bound[i + 1];
+            ++p->n;
+        }
+    if (p->n != segs) return R4D_NO(RAD_E_SHAPE);        /* an empty middle part has no copy to meet */
+    p->lda = g->K;
+    g->K = K;
+    return RAD_OK;
 }
 
 /* Common shape and layout checks. A is [M,K] row-major, C is [M,N] row-major and the weight is
@@ -350,8 +410,13 @@ static inline int mx_ascale_grid(const GemmOps& g, int* group, int* rs) {
  * checked here beyond being present, which is deliberate: the byte count that matters is the one
  * rad-convert wrote from RadLayout.bytes, and re-deriving it from N and K would be a second
  * source for one number. */
-static inline int gemm_ops(const RadArgs* a, GemmOps* g, int quantised) {
+/* `parts`: the caller reads a partitioned weight's `pb1`/`pb2` (mx_parts). Any other row REFUSES them
+ * rather than ignore them -- a part bound it does not apply would multiply every row of the weight by
+ * the first copy of the activation. */
+static inline int gemm_ops(const RadArgs* a, GemmOps* g, int quantised, int parts = 0) {
     std::memset(g, 0, sizeof(*g));
+    if (quantised && !parts && (r4d_geti_or(a, "pb1", 0) > 0 || r4d_geti_or(a, "pb2", 0) > 0))
+        return R4D_NO(RAD_E_UNSUPPORTED);
     if (quantised) {
         g->a      = r4d_opt(a, Q_A);
         g->ascale = r4d_opt(a, Q_ASCALE);

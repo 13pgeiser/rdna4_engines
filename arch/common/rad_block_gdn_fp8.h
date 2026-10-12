@@ -275,7 +275,9 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
      * all of q, all of k and a third of v, a well-formed wrong model. */
     RAD_ARCH_TRY(in.declare(b, nm, g, nm.f("blk.%d.ssm_inz", l), conv_dim + v_dim, g.n_embd,
                             RAD_SHARD_ROW, grp_layer(l), { s.in_qkv, s.in_z }, w.h, w.in.x, 0,
-                            { cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.v_dim() }));
+                            { cfg.k_dim(), cfg.k_dim(), cfg.v_dim(), cfg.v_dim() }, 0, 0,
+                            /* a rotated weight was rotated per CHECKPOINT tensor: q|k|v, then z */
+                            { 2 * cfg.k_dim() + cfg.v_dim(), cfg.v_dim() }));
     if (cfg.uneven()) {
         /* THIS RANK'S HEADS OF EACH PART, in the container's rows: q and k by K head, v and z by
          * V head. The scale plane of a row shard has the same rows (its blocks run along K). */

@@ -39,10 +39,13 @@ made knowingly.
 - `dtype` is always present and always a string. It names the **operand combination**, which is
   why a weight format and an activation format share one key: `bf16`, `f16`/`fp16`, `f32`/`fp32`,
   `fp8_e4m3`, `fp8a8`, `fp8a16`, `w4`, `w4a8`, `w4a8_asym`, `w4a8h`, `w8a8`, `w4a16`, `w8a16`,
-  `w2a8`, `mxfp4a8`. `w4a8h` is `w4a8` with a `group`-wide Walsh–Hadamard along K baked into the
-  stored weight (`docs/MOE-W4.md`), `w4a8_asym` the unsigned-nibble-minus-zero-point grid rather
-  than the symmetric one, and `fp8a8`/`fp8a16` say whether a block-scaled E4M3 weight is met by
-  an fp8 activation or a bf16 one. `q_dtype` and `kv_dtype` are the same key split in two where
+  `w2a8`, `mxfp4a8`, `w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`. `w4a8h` is `w4a8` with a
+  `group`-wide Walsh–Hadamard along K baked into the stored weight (`docs/MOE-W4.md`), `w4a8_asym`
+  the unsigned-nibble-minus-zero-point grid rather than the symmetric one, and `fp8a8`/`fp8a16` say
+  whether a block-scaled E4M3 weight is met by an fp8 activation or a bf16 one. `w5a16` and
+  `w4a16_asym` are ParoQuant's int5 and z-lab's int4 (u5 / u4 codes, an f16 scale and a u8 zero
+  point a 128 of K) against an f16 activation, and `w5a8i8` / `w4a8i8_asym` the same weights
+  against an int8 one with an f32 scale per (row, 128 of K). `q_dtype` and `kv_dtype` are the same key split in two where
   attention reads two formats at once.
 - `M` is the ranged parameter wherever a token count appears. **At most one ranged parameter per
   op** — that is what keeps `rad_issue` a single integer on the hot path.
@@ -376,9 +379,39 @@ spelling of `act`, not the vocabulary's.
 |---|---|---|
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `givens_dense_quant` | `M` `n` `group` `dtype` `parts` `out`:str | `x`, `tdense`w, `rscale`w → `q`, `scale` |
+| `givens_rotate` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `y` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+
+### `givens_dense_quant`: ParoQuant's rotated activation
+
+A weight stored with the `givens` transform (`abi/rad_encoding.h`) is `v = w . D . G_1 ... G_S`: the
+channel scale `D` and `S` stages of disjoint pairwise rotations were applied to each row BEFORE it
+was quantised (ParoQuant, z-lab), so the product the GEMM contracts is `<v, x'>` with
+`x' = x . D^-1 . G_1 ... G_S` -- the activation takes the same rotation, forward, once a token.
+`givens_dense_quant` is that: `x / rscale`, then the rotation, then a block-scaled quantiser (`out`
+names it: `fp8` is `quant_act_fp8`'s, scale `amax / 448`; `i8` is `quant_act_i8g`'s, scale
+`amax / 127`, round to nearest) per `group` columns. The rotation is applied as ONE dense 128 x 128
+f16 matrix a (part, group) -- `tdense`, `[parts * n, 128]` -- the composition of the group's `stages`
+rounds `a' = a cos t + b sin t, b' = b cos t - a sin t` over its pairs. A weight's `pairs` and `angle`
+tables are column indices and angles of the row and each pair lies inside ONE scale group (ParoQuant's
+are within groups of 128), so the matrices are the weight's own: rad-convert composes them once, in f64,
+and stores them as the weight's `t.dense` table, which the layout hook (`r4d_rad_layout_gdense`) only
+moves. The consumers are `gemm_nt_q` at `mxfp4a8`
+(`out` fp8) and at `w4a8i8_asym` / `w5a8i8` (`out` i8); nothing in the weight's codes or exponents
+changed.
+
+A fused projection (gate|up, qkv|z) was rotated PER CHECKPOINT TENSOR, so it has `parts` rotated
+copies of the activation, written side by side -- `q` is `[M, parts * n]`, `scale`
+`[M, parts * n / group]` -- and `pairs` and `angle` stack the parts' `stages` rows each, `rscale`
+one row a part. `gemm_nt_q` then takes `pb1` and `pb2`, the row bounds of the weight's parts: its
+rows `[0, pb1)`, `[pb1, pb2)` and `[pb2, N)` meet copy 0, 1 and 2, and `a`/`a_scale` are the wide
+planes. `givens_rotate` is the same rotation done stage by stage, with no quantiser, `y` in its own dtype (f16), for the 16-bit-activation weights `w5a16` and `w4a16_asym`; their GEMM serves any `M` (rows past 64 run as chunks of 64). The int8 activation of `w5a8i8` / `w4a8i8_asym` is `givens_dense_quant`'s at `out` `i8`. `pb1` absent is one part; `pb2` absent ends the second part at `N`. The `mxfp4a8` rows and the
+asymmetric 4- and 5-bit rows (`w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`) read them, and the
+host rows that do not (`libavx`) refuse a call that names one rather than contract against the
+wrong copy.
 
 ### The int8 and gated fp8 fusions — device-only
 
@@ -435,7 +468,7 @@ waiting on the mover's event — a read of weight bytes that may not have arrive
 |---|---|---|
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
-| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 
 `nt` is A row-major `[M,K]` times B **transposed** `[N,K]`, giving `[M,N]` — the layout every

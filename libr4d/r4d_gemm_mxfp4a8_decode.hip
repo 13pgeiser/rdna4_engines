@@ -119,8 +119,8 @@ template <int DTM, int DKS, bool ABLK>
 static __device__ __forceinline__ void mxd_epilogue(
     const v8f (&acc)[DTM], const float* __restrict__ As, int as_rs,
     const unsigned char* __restrict__ Wref, float* __restrict__ P, unsigned* __restrict__ cnt,
-    __hip_bfloat16* __restrict__ C, int M, int N, int n0, int wave, int col, int kb8, int ks,
-    int kb_end, unsigned* s_last, float* sR) {
+    __hip_bfloat16* __restrict__ C, int M, int N, int ldc, int n0, int wave, int col, int kb8,
+    int ks, int kb_end, unsigned* s_last, float* sR) {
   constexpr int NTHR = R4D_MXD_DWN * 32, BND = R4D_MXD_DWN * 16;
   constexpr int ROWS = R4D_MXD_MTILE * DTM;
   const int tid = threadIdx.x;
@@ -155,7 +155,7 @@ static __device__ __forceinline__ void mxd_epilogue(
           o.y = bf16x2_rne_nan(v[2], v[3]);
           o.z = bf16x2_rne_nan(v[4], v[5]);
           o.w = bf16x2_rne_nan(v[6], v[7]);
-          *(mxd_u4*)(C + (size_t)m * N + nb) = o;
+          *(mxd_u4*)(C + (size_t)m * ldc + nb) = o;
         }
       }
     }
@@ -195,7 +195,7 @@ static __device__ __forceinline__ void mxd_epilogue(
       float sum = 0.f;
 #pragma unroll
       for (int k = 0; k < DKS; ++k) sum += P[((size_t)k * M + m) * N + nn];
-      C[(size_t)m * N + nn] = (__hip_bfloat16)(sum * rf * (ABLK ? 1.f : As[(size_t)m * as_rs]));
+      C[(size_t)m * ldc + nn] = (__hip_bfloat16)(sum * rf * (ABLK ? 1.f : As[(size_t)m * as_rs]));
     }
   }
 }
@@ -220,7 +220,8 @@ void r4d_gemm_mxfp4a8_decode_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
     const unsigned char* __restrict__ Wref, float* __restrict__ P, unsigned* __restrict__ cnt,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int as_rs) {
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int as_rs, int lda, int ldws,
+    int ldc) {
   constexpr int DWN = R4D_MXD_DWN, BND = DWN * 16, NTHR = DWN * 32;
   constexpr int ROWS = R4D_MXD_MTILE * DTM;
   constexpr int STR = DBK + R4D_MXD_PAD;
@@ -266,7 +267,7 @@ void r4d_gemm_mxfp4a8_decode_kernel(
       if (idx < ROWS * DBK) {
         const int r = idx / DBK, c = idx % DBK;
         const int rc = r < M - 1 ? r : M - 1;              // clamp, never predicate
-        *(mxd_u4*)(&sA[r * STR + c]) = *(const mxd_u4*)(A + (size_t)rc * K + k0 + c);
+        *(mxd_u4*)(&sA[r * STR + c]) = *(const mxd_u4*)(A + (size_t)rc * lda + k0 + c);
       }
     }
     // ---- W: fragment-order slots, two adjacent rows a thread (an 8 B request), folded to e4m3
@@ -290,7 +291,7 @@ void r4d_gemm_mxfp4a8_decode_kernel(
         const int blk = (k0 + kst * 16) / R4D_MXFP4_GROUP;
 #pragma unroll
         for (int q = 0; q < 2; ++q) {
-          const int d = r4d_mxfp4_fold_d(Wref[gc + q], Ws[(size_t)blk * N + gc + q]);
+          const int d = r4d_mxfp4_fold_d(Wref[gc + q], Ws[(size_t)blk * ldws + gc + q]);
           unsigned int lo, hi;
           r4d_mxfp4_unpack8(q ? wv[1] : wv[0], d, &lo, &hi);
           *(mxd_u2*)(&sW[(r + q) * STR + kloc]) = mxd_u2{lo, hi};
@@ -323,7 +324,7 @@ void r4d_gemm_mxfp4a8_decode_kernel(
     __syncthreads();
   }
   const int kb_end = s_hi > s_lo ? (k_hi - 1) >> 7 : 0;
-  mxd_epilogue<DTM, DKS, ABLK>(acc, As, as_rs, Wref, P, cnt, C, M, N, n0, wave, col, kb8, ks,
+  mxd_epilogue<DTM, DKS, ABLK>(acc, As, as_rs, Wref, P, cnt, C, M, N, ldc, n0, wave, col, kb8, ks,
                                kb_end, &s_last, sR);
 }
 
@@ -340,7 +341,8 @@ void r4d_gemm_mxfp4a8_decode1_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
     const unsigned char* __restrict__ Wref, float* __restrict__ P, unsigned* __restrict__ cnt,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int as_rs) {
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int as_rs, int lda, int ldws,
+    int ldc) {
   constexpr int DTM = 1, VEC = 4;
   constexpr int DWN = R4D_MXD_DWN, BND = DWN * 16, NTHR = DWN * 32;
   constexpr int ROWS = R4D_MXD_MTILE * DTM;
@@ -403,7 +405,7 @@ void r4d_gemm_mxfp4a8_decode1_kernel(
       if (idx < ROWS * DBK) {
         const int r = idx / DBK, c = idx % DBK;
         const int rc = r < M - 1 ? r : M - 1;
-        ra[j] = *(const mxd_u4*)(A + (size_t)rc * K + k0 + c);
+        ra[j] = *(const mxd_u4*)(A + (size_t)rc * lda + k0 + c);
       }
     }
     const int kstep0 = k0 / 16;
@@ -414,7 +416,7 @@ void r4d_gemm_mxfp4a8_decode1_kernel(
       rw[it] = mxd_ld<NT>((const wv_t*)&Wp[slot]);
       const int blk = (k0 + s_kst[it] * 16) / R4D_MXFP4_GROUP;
 #pragma unroll
-      for (int q = 0; q < VEC; ++q) rd[it][q] = (int)Ws[(size_t)blk * N + s_gc[it] + q];
+      for (int q = 0; q < VEC; ++q) rd[it][q] = (int)Ws[(size_t)blk * ldws + s_gc[it] + q];
     }
   };
   auto store = [&]() {
@@ -472,7 +474,7 @@ void r4d_gemm_mxfp4a8_decode1_kernel(
     __syncthreads();
   }
   const int kb_end = s_hi > s_lo ? (k_hi - 1) >> 7 : 0;
-  mxd_epilogue<DTM, DKS, ABLK>(acc, As, as_rs, Wref, P, cnt, C, M, N, n0, wave, col, kb8, ks,
+  mxd_epilogue<DTM, DKS, ABLK>(acc, As, as_rs, Wref, P, cnt, C, M, N, ldc, n0, wave, col, kb8, ks,
                                kb_end, &s_last, sR);
 }
 
@@ -530,7 +532,7 @@ long mxd_partial_bytes(int M, int N, int ks) {
 
 void mxd_launch(long a, long ascale, long wq, long ws, long wref, long c, int M, int K, int N,
                 int KS, int BK, int NT, int as_group, int as_rs, long stream, long scratch,
-                long scratch_bytes) {
+                long scratch_bytes, int lda, int ldws, int ldc) {
   if (M < 1 || M > R4D_MXD_MTILE * R4D_MXD_MAX_TM)
     throw std::runtime_error("r4d gemm_mxfp4a8_decode: M must be 1..128");
   if (N < 16 || N % 16 || N > R4D_MXD_MAX_N)
@@ -565,10 +567,10 @@ void mxd_launch(long a, long ascale, long wq, long ws, long wref, long c, int M,
   auto Cp = (__hip_bfloat16*)c;
 #define MXD_L(BK_, KS_, TM_, NT_, AB_)                                                         \
   hipLaunchKernelGGL((r4d_gemm_mxfp4a8_decode_kernel<BK_, KS_, TM_, NT_, AB_>), grid, block, 0, \
-                     st, Ap, Sp, Wp, Zp, Rp, P, cnt, Cp, M, K, N, as_rs)
+                     st, Ap, Sp, Wp, Zp, Rp, P, cnt, Cp, M, K, N, as_rs, lda, ldws, ldc)
 #define MXD_L1(BK_, KS_, NT_, AB_)                                                              \
   hipLaunchKernelGGL((r4d_gemm_mxfp4a8_decode1_kernel<BK_, KS_, NT_, AB_>), grid, block, 0, st, \
-                     Ap, Sp, Wp, Zp, Rp, P, cnt, Cp, M, K, N, as_rs)
+                     Ap, Sp, Wp, Zp, Rp, P, cnt, Cp, M, K, N, as_rs, lda, ldws, ldc)
 #define MXD_AB(BK_, KS_, TM_, NT_) \
   { if (ablk) MXD_L(BK_, KS_, TM_, NT_, true); else MXD_L(BK_, KS_, TM_, NT_, false); }
 #define MXD_NT(BK_, KS_, TM_) \
@@ -602,38 +604,58 @@ extern "C" int r4d_gemm_mxfp4a8_decode_max_m(void) { return R4D_MXD_MTILE * R4D_
 // ============================================================== the plugin ABI entry point
 extern "C" int r4d_rad_gemm_mxfp4a8_decode(const RadArgs* a, RadStream s) {
     GemmOps g;
-    int rc = gemm_ops(a, &g, 1);
+    int rc = gemm_ops(a, &g, 1, /*parts=*/1);
     if (rc != RAD_OK) return rc;
     if (g.N < 16 || g.N % 16) return R4D_NO(RAD_E_SHAPE);
+    if (!g.ascale || !g.bref) return R4D_NO(RAD_E_INVAL);
+    MxParts mp;
+    rc = mx_parts(a, &g, &mp);
+    if (rc != RAD_OK) return rc;
     if (g.K % 64) return R4D_NO(RAD_E_SHAPE);
     if (g.M > r4d_gemm_mxfp4a8_decode_max_m() || g.N > R4D_MXD_MAX_N) return R4D_NO(RAD_E_SHAPE);
-    if (!g.ascale || !g.bref) return R4D_NO(RAD_E_INVAL);
     int as_group = 0, as_rs = 1;
-    rc = mx_ascale_grid(g, &as_group, &as_rs);
+    rc = mx_ascale_grid(g, &as_group, &as_rs, mp.n);
     if (rc != RAD_OK) return rc;
     R4dMxDecCfg t;
     r4d_cfg_mxfp4_decode(a, &t);
-    R4D_TRY("gemm_mxfp4a8_decode",
-        mxd_launch(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
-                   r4d_addr(g.bscale), r4d_addr(g.bref), r4d_addr(g.y),
-                   (int)g.M, (int)g.K, (int)g.N, t.ks, t.bk, t.nt, as_group, as_rs,
-                   (long)(uintptr_t)s, (long)(uintptr_t)a->scratch, (long)a->scratch_bytes));
+    const long long kb = (g.K + 127) / 128;
+    for (int p = 0; p < mp.n; ++p) {
+        const long long n0 = mp.n0[p], np = mp.n1[p] - mp.n0[p];
+        R4D_TRY("gemm_mxfp4a8_decode",
+            mxd_launch(r4d_addr(g.a) + p * g.K, r4d_addr(g.ascale) + (long)(p * kb * 4),
+                       r4d_addr(g.b) + n0 * g.K / 2, r4d_addr(g.bscale) + n0,
+                       r4d_addr(g.bref) + n0, r4d_addr(g.y) + n0 * 2,
+                       (int)g.M, (int)g.K, (int)np, t.ks, t.bk, t.nt, as_group, as_rs,
+                       (long)(uintptr_t)s, (long)(uintptr_t)a->scratch, (long)a->scratch_bytes,
+                       (int)(mp.lda ? mp.lda : g.K), (int)g.N, (int)g.N));
+    }
     return RAD_OK;
 }
 
 /* The core sizes the op's scratch from this. `M` is the band's widest, and a narrower M can split
  * wider (the fill rule asks for more blocks at M <= 24), so the size is the widest split over the
- * band times its widest M -- an upper bound on every launch the band can make. */
+ * band times its widest M -- an upper bound on every launch the band can make. A partitioned
+ * weight launches each part at ITS rows, which splits wider than the whole would, so the bound is
+ * the largest of the parts' (they run one after another and share the scratch). */
 extern "C" int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0);
     const long long K = r4d_geti_or(a, "K", 0);
     if (M < 1 || N < 16 || K < 64 || M > r4d_gemm_mxfp4a8_decode_max_m()) return 0;
     R4dMxDecCfg t;
     r4d_cfg_mxfp4_decode(a, &t);
-    int ks = 1;
-    for (int m = 1; m <= (int)M; ++m) {
-        const int k = mxd_plan(m, (int)K, (int)N, t.ks, t.bk, t.nt).ks;
-        if (k > ks) ks = k;
+    long long bound[4];
+    mx_part_bounds(N, r4d_geti_or(a, "pb1", 0), r4d_geti_or(a, "pb2", 0), bound);
+    int64_t worst = 0;
+    for (int i = 0; i < 3; ++i) {
+        const long long np = bound[i + 1] - bound[i];
+        if (np < 16) continue;
+        int ks = 1;
+        for (int m = 1; m <= (int)M; ++m) {
+            const int k = mxd_plan(m, (int)K, (int)np, t.ks, t.bk, t.nt).ks;
+            if (k > ks) ks = k;
+        }
+        const int64_t b = (int64_t)mxd_partial_bytes((int)M, (int)np, ks);
+        if (b > worst) worst = b;
     }
-    return (int64_t)mxd_partial_bytes((int)M, (int)N, ks);
+    return worst;
 }

@@ -166,6 +166,7 @@ const Hooks nHc        { r4d_rad_layout_hc_e4m3, r4d_rad_relayout_hc_e4m3,
 const Hooks nMtp       { r4d_rad_layout_mtp_e4m3, r4d_rad_relayout_mtp_e4m3,
                        r4d_rad_unrelayout_mtp_e4m3 };
 const Hooks nW4        { r4d_rad_layout_w4, r4d_rad_relayout_w4, r4d_rad_unrelayout_w4 };
+const Hooks nW5        { r4d_rad_layout_w5, r4d_rad_relayout_w5, r4d_rad_unrelayout_w5 };
 const Hooks nW8a16     { r4d_rad_layout_w8a16, r4d_rad_relayout_w8a16, nullptr };
 const Hooks nW8a8      { r4d_rad_layout_w8a8, r4d_rad_relayout_w8a8, nullptr };
 const Hooks nW2        { r4d_rad_layout_w2a8, r4d_rad_relayout_w2a8, r4d_rad_unrelayout_w2a8 };
@@ -282,6 +283,34 @@ TEST(dense_int4_symmetric_and_asymmetric) {
                                  { { B, { "codes" } }, { BSCALE, { "scale", "zero" } } }),
                0x5854c2996f14a80eull);
     }
+}
+
+/* ParoQuant's int5: u5 codes as w4's nibble plane plus a fifth-bit plane, the (scale, zero) dwords
+ * of the asymmetric w4 grid -- read back exactly; and a zero point that is not a 5-bit code refused,
+ * since the int8 prefill kernel reads five bits of it where the f16 one reads the whole value. */
+TEST(dense_int5_asymmetric) {
+    NEED_LIBQUANT();
+    const int64_t N = 64, K = 256;
+    const std::vector<float> w = weight(N, K, 19, 1, 128);
+    Opts kp, g;
+    kp.i("N", N).i("K", K).s("dtype", "w5a16");
+    g.s("codes", "u5").s("zero", "u8").i("group", 128).s("scale", "f16");
+    golden("w5", stored("w5", nW5, kp, "rtn", g, "blk.0.ffn_up.weight", N, K, w,
+                        { { B, { "codes" } }, { BSCALE, { "scale", "zero" } } }),
+           0xb0b1f9d187cbf267ull);
+    const Quantised q = quantise(quantizer("rtn"), g, "x", N, K, w);
+    REQUIRE_EQ(q.status, RAD_OK);
+    std::vector<std::vector<uint8_t>> bufs;
+    Selection s = select(q, N, K, { "scale", "zero" }, &bufs);
+    std::memcpy(bufs[0].data(), q.planes[(size_t)s.sel[0]].data(), bufs[0].size());
+    std::memcpy(bufs[1].data(), q.planes[(size_t)s.sel[1]].data(), bufs[1].size());
+    bufs[1][3] = 32;
+    RadLayout L{};
+    REQUIRE_EQ(r4d_rad_layout_w5(kp.data(), kp.n(), BSCALE, &q.enc, s.sel.data(), s.t.data(),
+                                 (int)s.t.size(), &L), RAD_OK);
+    std::vector<uint8_t> dst((size_t)L.bytes);
+    CHECK_EQ(r4d_rad_relayout_w5(kp.data(), kp.n(), BSCALE, &q.enc, s.sel.data(), s.t.data(),
+                                 (int)s.t.size(), dst.data(), L.bytes), RAD_E_FORMAT);
 }
 
 TEST(dense_int8_for_the_f16_and_the_int8_kernel) {
@@ -760,3 +789,77 @@ TEST(a_kernel_refuses_an_encoding_it_does_not_read) {
 }
 
 RAD_TEST_MAIN()
+
+/* ParoQuant's rotation pairs are stored as they are -- and refused at load when a stage is not a
+ * pairing of its own group's 128 columns, which the rotate kernels would index out of bounds. */
+TEST(givens_pairs_are_stored_as_they_are_and_checked) {
+    const int64_t K = 256, R = 2;                    /* two groups, two stages */
+    RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    rad_enc_add_table(&e, "t.pairs", RAD_I32, R, K);
+    const int sel[1] = { rad_enc_find(&e, "t.pairs") };
+    std::vector<int32_t> pairs((size_t)(R * K));
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t c = 0; c < K; ++c)                /* stage 0 reverses each group, stage 1 not */
+            pairs[(size_t)(r * K + c)] = (int32_t)((c / 128) * 128 + (r ? c % 128 : 127 - c % 128));
+    RadTensor t{};
+    t.data = pairs.data();
+    t.dtype = RAD_I32;
+    t.rank = 2;
+    t.shape[0] = R;
+    t.shape[1] = K;
+    t.stride[0] = K;
+    t.stride[1] = 1;
+    Opts kp;
+    kp.i("n", K).i("stages", 1).i("parts", 2);
+    RadLayout L{};
+    CHECK_EQ(r4d_rad_layout_givens_pairs(kp.data(), kp.n(), 2, &e, sel, &t, 1, &L), RAD_E_UNSUPPORTED);
+    REQUIRE_EQ(r4d_rad_layout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, &L), RAD_OK);
+    REQUIRE_EQ(L.bytes, (int64_t)(R * K * 4));
+    std::vector<uint8_t> dst((size_t)L.bytes);
+    REQUIRE_EQ(r4d_rad_relayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, dst.data(), L.bytes),
+               RAD_OK);
+    CHECK_EQ(std::memcmp(dst.data(), pairs.data(), dst.size()), 0);
+    std::vector<int32_t> back((size_t)(R * K), -1);
+    RadTensor tb = t;
+    tb.data = back.data();
+    REQUIRE_EQ(r4d_rad_unrelayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, dst.data(), L.bytes, &tb, 1),
+               RAD_OK);
+    CHECK(back == pairs);
+    /* a pair leaving its group, and a column paired twice in a stage */
+    std::vector<int32_t> out = pairs, dup = pairs;
+    out[(size_t)(K + 5)] = 130;
+    dup[3] = dup[4];
+    for (std::vector<int32_t>* bad : { &out, &dup }) {
+        t.data = bad->data();
+        CHECK_EQ(r4d_rad_relayout_givens_pairs(kp.data(), kp.n(), 1, &e, sel, &t, 1, dst.data(), L.bytes),
+                 RAD_E_FORMAT);
+    }
+}
+
+/* ParoQuant's dense rotation matrices are the "t.dense" table rad-convert composed (checkpoint_test pins the
+ * composition by hash): the layout takes the table as stored, byte for byte, and refuses a view of anything
+ * else -- the pairs and angles, which it would have to compose, included. */
+TEST(givens_dense_layout_is_the_stored_table) {
+    const int64_t K = 256, P = 2, G = 128;
+    RadEncoding e = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    rad_enc_add_table(&e, "t.pairs", RAD_I32, P * 3, K);
+    rad_enc_add_table(&e, "t.angle", RAD_F32, P * 3, K / 2);
+    rad_enc_add_table(&e, "t.dense", RAD_F16, P * K / G, G * G);
+    std::vector<uint16_t> dense((size_t)(P * K / G * G * G));
+    for (size_t i = 0; i < dense.size(); ++i) dense[i] = (uint16_t)(i * 2654435761u >> 7);
+    RadTensor t{};
+    t.data = dense.data(); t.dtype = RAD_F16; t.rank = 2;
+    t.shape[0] = P * K / G; t.shape[1] = G * G; t.stride[0] = G * G; t.stride[1] = 1;
+    Opts kp;
+    kp.i("n", K).i("parts", P);
+    const int sel[1] = { rad_enc_find(&e, "t.dense") };
+    RadLayout L{};
+    REQUIRE_EQ(r4d_rad_layout_gdense(kp.data(), kp.n(), 1, &e, sel, &t, 1, &L), RAD_OK);
+    REQUIRE_EQ(L.bytes, (int64_t)(P * K * G * 2));
+    std::vector<uint8_t> dst((size_t)L.bytes);
+    REQUIRE_EQ(r4d_rad_relayout_gdense(kp.data(), kp.n(), 1, &e, sel, &t, 1, dst.data(), L.bytes), RAD_OK);
+    CHECK_EQ(std::memcmp(dst.data(), dense.data(), dst.size()), 0);
+    const int sel2[2] = { rad_enc_find(&e, "t.pairs"), rad_enc_find(&e, "t.angle") };
+    RadTensor two[2] = { t, t };
+    CHECK(r4d_rad_layout_gdense(kp.data(), kp.n(), 1, &e, sel2, two, 2, &L) != RAD_OK);
+}

@@ -115,7 +115,7 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
     const unsigned char* __restrict__ Wref, __hip_bfloat16* __restrict__ C,
-    int M, int K, int N, int WV, int SK, int as_rs) {
+    int M, int K, int N, int WV, int SK, int as_rs, int lda, int ldws, int ldc) {
   extern __shared__ float red[];
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -189,7 +189,7 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
     for (int i = 0; i < MT; i++) {
       int r = (mt0 + i) * 16 + nlane;
       r = r < M - 1 ? r : M - 1;
-      const unsigned int* pa = (const unsigned int*)(A + (size_t)r * K + kg + mhalf);
+      const unsigned int* pa = (const unsigned int*)(A + (size_t)r * lda + kg + mhalf);
       af[i][0] = (int)pa[0];
       af[i][1] = (int)pa[1];
     }
@@ -200,7 +200,7 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
       // wave reads 128 contiguous bytes. In checkpoint order these would be sixteen rows K/2 bytes
       // apart -- a fully strided read on the operand that dominates traffic.
       const unsigned int wv = Wp[((size_t)wtile[j] * ksteps + kstep) * WAVE32 + lane];
-      const v2i wf = r4d_mxfp4_frag8(wv, r4d_mxfp4_fold_d(wref[j], Ws[(size_t)blk * N + n]));
+      const v2i wf = r4d_mxfp4_frag8(wv, r4d_mxfp4_fold_d(wref[j], Ws[(size_t)blk * ldws + n]));
 #pragma unroll
       for (int i = 0; i < MT; i++)
         acc[j][i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, acc[j][i]);
@@ -232,7 +232,7 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
       if (n >= N || m >= M) continue;
       float v = 0.f;
       for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
-      C[(size_t)m * N + n] =
+      C[(size_t)m * ldc + n] =
           (__hip_bfloat16)(v * __int_as_float((int)Wref[n] << 23) * (ABLK ? 1.f : As[m]));
     }
   }
@@ -243,7 +243,14 @@ extern "C" int r4d_gemm_mxfp4a8_nt_m64_group(void) { return R4D_GEMM_MXFP4_GROUP
 
 extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, long wref, long c,
                                         int M, int K, int N, int WV, int SK, int MB, int NPW,
-                                        int as_group, int as_rs, long stream) {
+                                        int as_group, int as_rs, long stream,
+                                        int lda, int ldws, int ldc) {
+  // The operands of one PART of a partitioned weight (ParoQuant) are windows of larger planes:
+  // the activation a row of lda bytes, the exponents a row of ldws, the output a row of ldc.
+  // 0 is the plane's own width, which is every other caller.
+  if (!lda) lda = K;
+  if (!ldws) ldws = N;
+  if (!ldc) ldc = N;
   if (M < 1 || M > R4D_GEMM_MXFP4_MAX_M)
     throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: M must be 1..64");
   if (N % 16) throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: N must be a multiple of 16");
@@ -273,9 +280,10 @@ extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, l
 #define LAUNCH(MTv, NPv)                                                                          \
   do {                                                                                            \
     if (ablk) hipLaunchKernelGGL((r4d_gemm_mxfp4a8_nt_m64_kernel<MTv, NPv, true>), grid, block,   \
-                                 smem, st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, WV, SK, as_rs);       \
+                                 smem, st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, WV, SK, as_rs, lda, ldws, ldc);   \
     else      hipLaunchKernelGGL((r4d_gemm_mxfp4a8_nt_m64_kernel<MTv, NPv, false>), grid, block,  \
-                                 smem, st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, WV, SK, as_rs);       \
+                                 smem, st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, N, WV, SK, as_rs,        \
+                                 lda, ldws, ldc);                                                 \
   } while (0)
 #define LAUNCH_MB(NPv) switch (MB) { \
     case 1: LAUNCH(1, NPv); break; \
@@ -300,7 +308,7 @@ extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, l
 // is no adapter directory between the core and these launches.
 extern "C" int r4d_rad_gemm_mxfp4a8_m64(const RadArgs* a, RadStream s) {
     GemmOps g;
-    int rc = gemm_ops(a, &g, 1);
+    int rc = gemm_ops(a, &g, 1, /*parts=*/1);
     if (rc != RAD_OK) return rc;
     if (g.N % 16) return R4D_NO(RAD_E_SHAPE);
     if (g.M > r4d_gemm_mxfp4a8_nt_m64_max_m()) return R4D_NO(RAD_E_SHAPE);
@@ -309,18 +317,27 @@ extern "C" int r4d_rad_gemm_mxfp4a8_m64(const RadArgs* a, RadStream s) {
      * so gemm_nt_q carries it as a trailing optional weight operand. Without it the fold has no
      * reference and every element would be scaled against zero. */
     if (!g.bref) return R4D_NO(RAD_E_INVAL);
+    MxParts mp;
+    rc = mx_parts(a, &g, &mp);
+    if (rc != RAD_OK) return rc;
     const int group = r4d_gemm_mxfp4a8_nt_m64_group();
     int as_group = 0, as_rs = 1;
-    rc = mx_ascale_grid(g, &as_group, &as_rs);
+    rc = mx_ascale_grid(g, &as_group, &as_rs, mp.n);
     if (rc != RAD_OK) return rc;
     Cfg c;
     rc = cfg_for(a, g.K, g.M, group, BR_FLAT, &c);
     if (rc != RAD_OK) return rc;
-    R4D_TRY("gemm_mxfp4a8_nt_m64",
-        r4d_gemm_mxfp4a8_nt_m64(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
-                                r4d_addr(g.bscale), r4d_addr(g.bref), r4d_addr(g.y),
-                                (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw,
-                                as_group, as_rs, (long)(uintptr_t)s));
+    const long long kb = (g.K + 127) / 128;
+    for (int p = 0; p < mp.n; ++p) {
+        const long long n0 = mp.n0[p], np = mp.n1[p] - mp.n0[p];
+        R4D_TRY("gemm_mxfp4a8_nt_m64",
+            r4d_gemm_mxfp4a8_nt_m64(r4d_addr(g.a) + p * g.K,
+                                    r4d_addr(g.ascale) + (long)(p * kb * 4),
+                                    r4d_addr(g.b) + n0 * g.K / 2, r4d_addr(g.bscale) + n0,
+                                    r4d_addr(g.bref) + n0, r4d_addr(g.y) + n0 * 2,
+                                    (int)g.M, (int)g.K, (int)np, c.wv, c.sk, c.mb, c.npw,
+                                    as_group, as_rs, (long)(uintptr_t)s,
+                                    (int)(mp.lda ? mp.lda : g.K), (int)g.N, (int)g.N));
+    }
     return RAD_OK;
 }
-

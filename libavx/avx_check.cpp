@@ -771,6 +771,55 @@ static bool hand_cases(const Lib& ref, const Lib& avx, bool verbose, int* n_chec
         hs.push_back(std::move(s));
     }
 
+    /* ---- ParoQuant's rotation over real pairings: every stage of every group a permutation of
+     * its 128 columns read as pairs, two parts of three stages. The dense form over a drawn matrix
+     * a (part, group) -- the op takes whatever matrices the weight stores. --------------------- */
+    {
+        const int64_t M = 5, K = 256, S = 3, P = 2, G = 128;
+        std::vector<int32_t> pr((size_t)(P * S * K));
+        for (int64_t ps = 0; ps < P * S; ++ps)
+            for (int64_t g = 0; g < K / G; ++g) {
+                std::vector<int32_t> perm((size_t)G);
+                for (int64_t i = 0; i < G; ++i) perm[(size_t)i] = (int32_t)i;
+                uint64_t x = 0x9E3779B97F4A7C15ull * (uint64_t)(ps * 31 + g + 1);
+                for (int64_t i = G - 1; i > 0; --i) {
+                    x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
+                    std::swap(perm[(size_t)i], perm[(size_t)(x % (uint64_t)(i + 1))]);
+                }
+                for (int64_t i = 0; i < G; ++i)
+                    pr[(size_t)(ps * K + g * G + i)] = (int32_t)(g * G + perm[(size_t)i]);
+            }
+        const auto h63 = hfill(63);
+        const auto scl = [h63](int64_t i) { return 1.25f + 0.75f * h63(i); };   /* (0.5, 2) */
+        const auto zero = [](int64_t) { return 0.0f; };
+        for (uint32_t ydt : { (uint32_t)RAD_F16, (uint32_t)RAD_F32 }) {
+            Hand h(ydt == RAD_F16 ? "two parts of three stages, y f16" : "two parts of three stages, y f32",
+                   "givens_rotate", 1e-5);
+            h.dense(RAD_BF16, { M, K }, hfill(61))
+             .dense(RAD_I32, { P * S, K }, [pr](int64_t i) { return (float)pr[(size_t)i]; })
+             .dense(RAD_F32, { P * S, K / 2 }, hfill(62, 3.0f))
+             .dense(RAD_F32, { P, K }, scl)
+             .dense(ydt, { M, P * K }, zero, true)
+             .pi("M", M).pi("n", K).pi("group", G).ps("dtype", "bf16").pi("stages", S)
+             .pi("parts", P);
+            hs.push_back(std::move(h));
+        }
+        /* A code may sit on a rounding edge that libref's f64 sum and libavx's f32 sum land on
+         * either side of, one step of the grid: the tolerance is a few such codes in 2560. */
+        for (const char* outq : { "fp8", "i8" }) {
+            const bool i8 = outq[0] == 'i';
+            Hand h(i8 ? "two parts, i8" : "two parts, fp8", "givens_dense_quant", 5e-3);
+            h.dense(RAD_BF16, { M, K }, hfill(64))
+             .dense(RAD_F16, { P * K, G }, hfill(65, 0.1f))
+             .dense(RAD_F32, { P, K }, scl)
+             .dense(i8 ? RAD_I8 : RAD_F8E4M3, { M, P * K }, zero, true)
+             .dense(RAD_F32, { M, P * K / G }, zero, true)
+             .pi("M", M).pi("n", K).pi("group", G).ps("dtype", "bf16").pi("parts", P)
+             .ps("out", outq);
+            hs.push_back(std::move(h));
+        }
+    }
+
     bool ok = true;
     int fails = 0;
     for (Hand& h : hs) {

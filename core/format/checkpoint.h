@@ -62,6 +62,12 @@ struct SrcTensor {
      * RAD_I4; `ct_group` is the K columns one scale of X.weight_scale [N, K / group] covers. 0 for
      * any other tensor. */
     int64_t              ct_group = 0;
+    /* ParoQuant's int5-bitplane (Import::ParoI5): `data` is the AWQ-packed low nibbles qweight
+     * [K, N/8] and the tensor described is the logical [N, K] u5 code matrix; `aux` are the fifth-bit
+     * plane qweight_hi [K, N/32], and the zero points qzeros [G, N/8] and qzeros_hi [G, N/32].
+     * z-lab's int4 (Import::ParoI4) is the same without the fifth-bit planes (aux[0], aux[2] null). */
+    int                  pbits = 0;            /* 5 for int5-bitplane, 4 for z-lab's plain AWQ-packed int4; 0 otherwise */
+    const SrcTensor*     aux[3] = { nullptr, nullptr, nullptr };
 
     int64_t numel() const {
         int64_t n = 1;
@@ -134,11 +140,12 @@ public:
     /* THE CHECKPOINT'S QUANTISATION, IMPORTED WEIGHT BY WEIGHT, or None. Read from
      * quantization_config at open: AutoRound's `auto_round:auto_gptq` export and GPTQ's own (v1,
      * the zero point stored less one) are Gptq; Quark's MXFP4 (fp4 weights, per_group 32, e8m0
-     * scales, no per-layer overrides) is QuarkMx. A quantisation of one of those tools in a form
+     * scales, no per-layer overrides) is QuarkMx; ParoQuant's MXFP4 (`paroquant_mxfp4`: Quark's
+     * codes and exponents in a ROTATED basis, with the rotations beside them) is ParoMx. A quantisation of one of those tools in a form
      * this does not read stays None, with the reason in import_refusal(). */
     /* Its quantization_config keys are then renamed `imported_quantization_config.*`: they
      * describe the tool, not a served format, and a plugin reads the latter there. */
-    enum class Import { None, Gptq, QuarkMx, CtInt4 };
+    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoI5, ParoI4 };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 
@@ -193,6 +200,13 @@ struct CkptWeight {
      * Not trivial -- the rounding means the numbers are not served as shipped -- so the loader
      * refuses one and rad-convert keeps it in `enc`, as it keeps a trivial weight. */
     bool        imported = false;
+    /* PAROQUANT MXFP4, IMPORTED (Import::ParoMx): `imported` too, so the loader refuses it and
+     * rad-convert writes it plane by plane through ckpt_plane_rows. Planes 0 and 1 are Quark's
+     * codes and exponents byte for byte; the rest are the "givens" transform's tables, built here
+     * from `pq_pairs`/`pq_theta`/`pq_scale`, one set per piece (a piece is a row PART: gate and up,
+     * or q, k and v, each rotated on its own). */
+    bool        paro = false;
+    std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale;
     RadEncoding enc{};
     std::string why;
 };
@@ -211,6 +225,11 @@ std::string ckpt_tensor_of(const SrcTensor& t);
  * through a piece or a scale. Each name it reads is added to `hit` when that is given. */
 bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& names,
                     std::unordered_set<std::string>* hit = nullptr);
+
+/* One (part, group) of a ParoQuant rotation as its dense matrix: `S` stages of 64 pairs, the pair's two
+ * group-local columns `ia`/`ib` and angle `th`, stage-major; out[j * 128 + i] (f16) is output j for the
+ * unit vector e_i. It is the "givens" encoding's "t.dense" table, row for row. */
+void paro_compose_dense(int64_t S, const int32_t* ia, const int32_t* ib, const float* th, uint16_t* out);
 
 /* Logical rows [r0, r0 + nr) of `w` as f32 [nr, cols], whatever the pieces are stored as: a
  * plain float widened, FP8 times its block scale, a GGUF block type dequantised. */

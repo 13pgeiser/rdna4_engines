@@ -8,6 +8,7 @@
  */
 #include "rad_test.h"
 #include "format/checkpoint.h"
+#include "format/encoding.h"
 #include "rad_plugin.h"
 
 #include <cmath>
@@ -844,4 +845,420 @@ TEST(a_ct_int4_checkpoint_this_does_not_read_is_refused) {
         CHECK(why.find("weight_scale") != std::string::npos);
         remove_checkpoint(dir);
     }
+}
+
+/* PAROQUANT MXFP4 is Quark's codes and exponents in a rotated basis plus the rotations: each
+ * projection's pairs (group-local int16), theta and channel scales. Gate and up are two PARTS of
+ * the fused weight, and the tables must say so: pairs made whole-row, angles widened, the channel
+ * scale inverted, the part ends. Decoding the planes through the core must then give a weight
+ * that, rotated forward again, is the codes the checkpoint shipped. */
+TEST(a_paroquant_mxfp4_weight_carries_its_rotations_as_parts) {
+    const int64_t K = 128, S = 2;
+    uint32_t rng = 12345;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    auto codes = [&](const std::string& n, int64_t N) {
+        T t{ n, "U8", { N, K / 2 }, {} };
+        for (int64_t i = 0; i < N * K / 2; ++i) t.bytes.push_back((uint8_t)(next() & 0xff));
+        return t;
+    };
+    auto exps = [&](const std::string& n, int64_t N) {
+        T t{ n, "U8", { N, K / 32 }, {} };
+        for (int64_t i = 0; i < N * K / 32; ++i) t.bytes.push_back((uint8_t)(122 + next() % 5));
+        return t;
+    };
+    auto pairs = [&](const std::string& n) {
+        T t{ n, "I16", { S, K }, {} };
+        for (int64_t s = 0; s < S; ++s) {
+            std::vector<int16_t> perm((size_t)K);
+            for (int64_t i = 0; i < K; ++i) perm[(size_t)i] = (int16_t)i;
+            for (int64_t i = K - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[next() % (i + 1)]);
+            for (int64_t i = 0; i < K; ++i) {
+                t.bytes.push_back((uint8_t)(perm[(size_t)i] & 0xff));
+                t.bytes.push_back((uint8_t)(perm[(size_t)i] >> 8));
+            }
+        }
+        return t;
+    };
+    auto f16s = [&](const std::string& n, std::vector<int64_t> shape, float lo, float hi) {
+        T t{ n, "F16", shape, {} };
+        int64_t cnt = 1;
+        for (int64_t d : shape) cnt *= d;
+        for (int64_t i = 0; i < cnt; ++i) {
+            const float f = lo + (hi - lo) * (float)(next() % 1000) / 1000.0f;
+            const uint16_t h = rad_f32_to_f16(f);
+            t.bytes.push_back((uint8_t)(h & 0xff));
+            t.bytes.push_back((uint8_t)(h >> 8));
+        }
+        return t;
+    };
+    const T gw = codes("g.weight", 16), gs = exps("g.weight_scale", 16), gp = pairs("g.pairs"),
+            gt = f16s("g.theta", { S, K / 2 }, -3.0f, 3.0f), gc = f16s("g.channel_scales", { 1, K }, 0.5f, 2.0f);
+    const T uw = codes("u.weight", 16), us = exps("u.weight_scale", 16), up = pairs("u.pairs"),
+            ut = f16s("u.theta", { S, K / 2 }, -3.0f, 3.0f), uc = f16s("u.channel_scales", { 1, K }, 0.5f, 2.0f);
+    // a per-row fp8 head beside them: weight_scale is one f32 a row
+    T hs{ "h.weight_scale", "F32", { 4 }, {} };
+    for (int i = 0; i < 4; ++i) { float f = 0.25f * (float)(i + 1); hs.bytes.resize(hs.bytes.size() + 4); std::memcpy(hs.bytes.data() + 4 * i, &f, 4); }
+    const std::string dir = write_checkpoint(
+        { gw, gs, gp, gt, gc, uw, us, up, ut, uc, fp8("h.weight", { 4, 8 }), hs },
+        "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"paroquant_mxfp4\","
+        "\"format\":\"mxfp4\",\"bits\":4,\"group_size\":128,\"mxfp4_block\":32,\"krot\":2}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ParoMx);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g.weight", "u.weight" }));
+    prog.name_map.push_back(map("h", RAD_MAP_COPY, { "h.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.paro);
+    CHECK(w.imported && !w.trivial);
+    REQUIRE(rad_enc_valid(&w.enc));
+    CHECK_EQ(std::string(w.enc.transform), std::string("givens"));
+    CHECK_EQ(rad_enc_givens_parts(&w.enc), (int64_t)2);
+    CHECK_EQ(w.rows, (int64_t)32);
+    REQUIRE_EQ(w.enc.n_planes, 7);
+
+    std::vector<std::vector<uint8_t>> pl((size_t)w.enc.n_planes);
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
+        pl[(size_t)k].resize((size_t)(pr * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)));
+        REQUIRE_EQ(ckpt_plane_rows(w, k, 0, pr, pl[(size_t)k].data(), &why), RAD_OK);
+    }
+    // codes and exponents are the checkpoint's bytes, joined
+    CHECK_EQ(std::memcmp(pl[0].data(), gw.bytes.data(), gw.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(pl[0].data() + gw.bytes.size(), uw.bytes.data(), uw.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(pl[1].data() + gs.bytes.size(), us.bytes.data(), us.bytes.size()), 0);
+    const int32_t* tp = (const int32_t*)pl[2].data();
+    const float* ta = (const float*)pl[3].data();
+    const float* tsc = (const float*)pl[4].data();
+    const int32_t* tpart = (const int32_t*)pl[5].data();
+    CHECK_EQ(tpart[0], 16);
+    CHECK_EQ(tpart[1], 32);
+    for (int64_t c = 0; c < K; ++c) {
+        CHECK_EQ(tp[c], (int32_t)(*(const int16_t*)(gp.bytes.data() + 2 * c)));             // part 0, stage 0
+        CHECK_EQ(tp[(S + 1) * K + c], (int32_t)(*(const int16_t*)(up.bytes.data() + 2 * (K + c))));  // part 1, stage 1
+        const uint16_t h = *(const uint16_t*)(gc.bytes.data() + 2 * c);
+        CHECK(std::fabs(tsc[c] - 1.0f / rad_f16_to_f32(h)) < 1e-6f);
+    }
+    CHECK(std::fabs(ta[0] - rad_f16_to_f32(*(const uint16_t*)gt.bytes.data())) == 0.0f);
+    /* t.dense: each (part, group) row is that part's stages composed, so T x is x rotated stage by
+     * stage -- checked on a vector against the tables above, in f64, to the f16 the matrix is in */
+    REQUIRE_EQ(std::string(w.enc.plane[6].role), std::string("t.dense"));
+    {
+        const uint16_t* td = (const uint16_t*)pl[6].data();
+        const int64_t nkb = K / 128;
+        double worst_d = 0;
+        for (int64_t part = 0; part < 2; ++part)
+            for (int64_t g = 0; g < nkb; ++g) {
+                std::vector<double> x(128), y(128, 0.0);
+                for (int i = 0; i < 128; ++i) x[(size_t)i] = std::sin(0.7 * i + part + 3.0 * g);
+                for (int j = 0; j < 128; ++j)
+                    for (int i = 0; i < 128; ++i)
+                        y[(size_t)j] += rad_f16_to_f32(td[((part * nkb + g) * 128 + j) * 128 + i]) * x[(size_t)i];
+                std::vector<double> v = x;
+                for (int64_t st = 0; st < S; ++st)
+                    for (int j = 0; j < 64; ++j) {
+                        const int64_t row = part * S + st;
+                        const int a = tp[row * K + g * 128 + 2 * j] - (int)(g * 128);
+                        const int b = tp[row * K + g * 128 + 2 * j + 1] - (int)(g * 128);
+                        const double t = ta[row * (K / 2) + g * 64 + j], va = v[(size_t)a], vb = v[(size_t)b];
+                        v[(size_t)a] = va * std::cos(t) + vb * std::sin(t);
+                        v[(size_t)b] = vb * std::cos(t) - va * std::sin(t);
+                    }
+                for (int j = 0; j < 128; ++j) worst_d = std::max(worst_d, std::fabs(y[(size_t)j] - v[(size_t)j]));
+            }
+        CHECK(worst_d < 5e-3);
+    }
+
+    // decode, rotate forward again with the checkpoint's own convention, compare to the codes
+    const void* data[7];
+    for (int k = 0; k < 7; ++k) data[k] = pl[(size_t)k].data();
+    EncodedView v;
+    enc_view(w.enc, w.rows, w.cols, data, &v);
+    std::vector<float> dec((size_t)(w.rows * K));
+    REQUIRE_EQ(enc_decode_rows(v, 0, w.rows, dec.data(), &why), RAD_OK);
+    const T* cw[2] = { &gw, &uw };
+    const T* es[2] = { &gs, &us };
+    const T* pp[2] = { &gp, &up };
+    const T* th[2] = { &gt, &ut };
+    const T* cc[2] = { &gc, &uc };
+    double worst = 0;
+    for (int64_t r = 0; r < w.rows; ++r) {
+        const int part = r >= 16, rr = r - 16 * part;
+        std::vector<double> x((size_t)K);
+        for (int64_t k = 0; k < K; ++k)
+            x[(size_t)k] = (double)dec[(size_t)(r * K + k)] *
+                           (1.0 / rad_f16_to_f32(*(const uint16_t*)(cc[part]->bytes.data() + 2 * k)));
+        for (int64_t s = 0; s < S; ++s)
+            for (int64_t p = 0; p < K / 2; ++p) {
+                const int16_t* pv = (const int16_t*)pp[part]->bytes.data();
+                const int64_t a = pv[s * K + 2 * p], b = pv[s * K + 2 * p + 1];
+                const double t = rad_f16_to_f32(*(const uint16_t*)(th[part]->bytes.data() + 2 * (s * (K / 2) + p)));
+                const double c = std::cos(t), sn = std::sin(t);
+                const double xa = x[(size_t)a], xb = x[(size_t)b];
+                x[(size_t)a] = xa * c + xb * sn;
+                x[(size_t)b] = xb * c - xa * sn;
+            }
+        for (int64_t k = 0; k < K; ++k) {
+            const uint8_t bt = cw[part]->bytes[(size_t)(rr * K / 2 + k / 2)];
+            const float code = rad_fp4e2m1_to_f32((uint8_t)(k % 2 ? bt >> 4 : bt & 15));
+            const float sc = std::ldexp(1.0f, (int)es[part]->bytes[(size_t)(rr * K / 32 + k / 32)] - 127);
+            worst = std::max(worst, std::fabs(x[(size_t)k] - (double)code * sc));
+        }
+    }
+    CHECK(worst < 1e-4);
+
+    // the per-row fp8 head: one f32 scale a row, read as [N, 1]
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "h", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)0);
+    std::vector<float> f(4 * 8);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 4, f.data(), &why), RAD_OK);
+    for (int r = 0; r < 4; ++r) {
+        const float q = rad_load_f32(fp8("h.weight", { 4, 8 }).bytes.data(), RAD_F8E4M3, r * 8);
+        CHECK_EQ(f[(size_t)(r * 8)], q * 0.25f * (float)(r + 1));
+    }
+    remove_checkpoint(dir);
+}
+
+/* PAROQUANT INT5-BITPLANE: the low nibbles AWQ-packed along N (qweight [K, N/8], eight columns a
+ * word in the order 0,2,4,6,1,3,5,7), a fifth-bit plane (qweight_hi [K, N/32], bit n % 32) and the
+ * same two packings of the zero points. The logical [N, K] weight comes out as u5 codes (a bit
+ * stream along K), an f16 scale and a u8 zero a 128 of K, plus the rotation as `givens` tables. */
+TEST(a_paroquant_int5_weight_is_relaid_row_by_row) {
+    const int64_t N = 64, K = 256, G = K / 128;
+    uint32_t rng = 777;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    std::vector<int> code((size_t)(N * K)), zero((size_t)(N * G));
+    for (auto& c : code) c = (int)(next() % 32);
+    for (auto& z : zero) z = (int)(next() % 32);
+    static const int kOrder[8] = { 0, 2, 4, 6, 1, 3, 5, 7 };
+    auto pack_awq = [&](const std::vector<int>& v, int64_t rows) {       // v[n * rows + r] -> [rows, N/8]
+        T t{ "", "I32", { rows, N / 8 }, {} };
+        t.bytes.assign((size_t)(rows * N / 8 * 4), 0);
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t n = 0; n < N; ++n) {
+                int j = 0;
+                while (kOrder[j] != n % 8) ++j;
+                uint32_t w;
+                uint8_t* p = t.bytes.data() + (r * (N / 8) + n / 8) * 4;
+                std::memcpy(&w, p, 4);
+                w |= (uint32_t)(v[(size_t)(n * rows + r)] & 15) << (4 * j);
+                std::memcpy(p, &w, 4);
+            }
+        return t;
+    };
+    auto pack_hi = [&](const std::vector<int>& v, int64_t rows) {
+        T t{ "", "I32", { rows, N / 32 }, {} };
+        t.bytes.assign((size_t)(rows * N / 32 * 4), 0);
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t n = 0; n < N; ++n) {
+                uint32_t w;
+                uint8_t* p = t.bytes.data() + (r * (N / 32) + n / 32) * 4;
+                std::memcpy(&w, p, 4);
+                w |= (uint32_t)((v[(size_t)(n * rows + r)] >> 4) & 1) << (n % 32);
+                std::memcpy(p, &w, 4);
+            }
+        return t;
+    };
+    T qw = pack_awq(code, K), qwh = pack_hi(code, K), qz = pack_awq(zero, G), qzh = pack_hi(zero, G);
+    qw.name = "q.qweight"; qwh.name = "q.qweight_hi"; qz.name = "q.qzeros"; qzh.name = "q.qzeros_hi";
+    T sc{ "q.scales", "F16", { G, N }, {} };
+    for (int64_t i = 0; i < G * N; ++i) {
+        const uint16_t h = rad_f32_to_f16(0.01f * (float)(1 + next() % 50));
+        sc.bytes.push_back((uint8_t)(h & 0xff));
+        sc.bytes.push_back((uint8_t)(h >> 8));
+    }
+    T pr{ "q.pairs", "I16", { 2, K }, {} };
+    for (int64_t s = 0; s < 2; ++s)
+        for (int64_t i = 0; i < K; ++i) {
+            const int16_t v = (int16_t)(i % 128 ^ 1);                       // adjacent swap: a pairing
+            pr.bytes.push_back((uint8_t)(v & 0xff));
+            pr.bytes.push_back((uint8_t)(v >> 8));
+        }
+    T th{ "q.theta", "F16", { 2, K / 2 }, {} }, cs{ "q.channel_scales", "F16", { 1, K }, {} };
+    for (int64_t i = 0; i < 2 * K / 2; ++i) { const uint16_t h = rad_f32_to_f16(0.3f); th.bytes.push_back(h & 0xff); th.bytes.push_back(h >> 8); }
+    for (int64_t i = 0; i < K; ++i) { const uint16_t h = rad_f32_to_f16(1.5f); cs.bytes.push_back(h & 0xff); cs.bytes.push_back(h >> 8); }
+    const std::string dir = write_checkpoint(
+        { qw, qwh, qz, qzh, sc, pr, th, cs },
+        "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"paroquant\","
+        "\"bits\":5,\"group_size\":128,\"krot\":2,\"format\":\"int5-bitplane\"}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ParoI5);
+    Program prog;
+    prog.name_map.push_back(map("w", RAD_MAP_COPY, { "q.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "w", false, &w, &why), RAD_OK);
+    REQUIRE(w.paro && w.imported);
+    CHECK_EQ(w.rows, N);
+    CHECK_EQ(w.cols, K);
+    REQUIRE(rad_enc_valid(&w.enc));
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_U5);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_F16);
+    CHECK_EQ(w.enc.plane[2].dtype, (uint32_t)RAD_U8);
+    std::vector<std::vector<uint8_t>> pl((size_t)w.enc.n_planes);
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr_ = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr_, &pc);
+        pl[(size_t)k].assign((size_t)(pr_ * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)) + 8, 0);
+        REQUIRE_EQ(ckpt_plane_rows(w, k, 0, pr_, pl[(size_t)k].data(), &why), RAD_OK);
+    }
+    const int64_t rb = rad_enc_row_bytes(RAD_U5, K);
+    int bad = 0;
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k)
+            if ((int)rad_load_f32(pl[0].data() + n * rb, RAD_U5, k) != code[(size_t)(n * K + k)]) ++bad;
+        for (int64_t g = 0; g < G; ++g) {
+            if (pl[2][(size_t)(n * G + g)] != zero[(size_t)(n * G + g)]) ++bad;
+            if (std::memcmp(pl[1].data() + (n * G + g) * 2, sc.bytes.data() + (g * N + n) * 2, 2) != 0) ++bad;
+        }
+    }
+    CHECK_EQ(bad, 0);
+    remove_checkpoint(dir);
+}
+
+/* Z-LAB'S INT4 (`paroquant`, bits 4, no `format`): the int5 test's AWQ nibbles with no fifth-bit
+ * planes, here as a fused gate|up -- two pieces, each with its own rotation, so the weight carries
+ * two parts. Codes and zero points come out row by row per piece, and t.part ends each piece. */
+TEST(a_paroquant_int4_fused_weight_is_two_rotated_parts) {
+    const int64_t N = 32, K = 128, G = K / 128;
+    uint32_t rng = 4242;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    static const int kOrder[8] = { 0, 2, 4, 6, 1, 3, 5, 7 };
+    auto pack_awq = [&](const std::string& name, const std::vector<int>& v, int64_t rows) {
+        T t{ name, "I32", { rows, N / 8 }, {} };
+        t.bytes.assign((size_t)(rows * N / 8 * 4), 0);
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t n = 0; n < N; ++n) {
+                int j = 0;
+                while (kOrder[j] != n % 8) ++j;
+                uint32_t w;
+                uint8_t* p = t.bytes.data() + (r * (N / 8) + n / 8) * 4;
+                std::memcpy(&w, p, 4);
+                w |= (uint32_t)(v[(size_t)(n * rows + r)] & 15) << (4 * j);
+                std::memcpy(p, &w, 4);
+            }
+        return t;
+    };
+    auto f16s = [&](const std::string& name, std::vector<int64_t> shape, float v) {
+        T t{ name, "F16", shape, {} };
+        int64_t cnt = 1;
+        for (int64_t d : shape) cnt *= d;
+        const uint16_t h = rad_f32_to_f16(v);
+        for (int64_t i = 0; i < cnt; ++i) { t.bytes.push_back((uint8_t)(h & 0xff)); t.bytes.push_back((uint8_t)(h >> 8)); }
+        return t;
+    };
+    auto pairs = [&](const std::string& name, int shift) {
+        T t{ name, "I16", { 1, K }, {} };
+        for (int64_t i = 0; i < K; ++i) {
+            const int16_t v = (int16_t)((i ^ shift) % 128);
+            t.bytes.push_back((uint8_t)(v & 0xff));
+            t.bytes.push_back((uint8_t)(v >> 8));
+        }
+        return t;
+    };
+    std::vector<T> ts;
+    std::vector<int> code[2], zero[2];
+    const char* names[2] = { "g", "u" };
+    for (int p = 0; p < 2; ++p) {
+        code[p].resize((size_t)(N * K));
+        zero[p].resize((size_t)(N * G));
+        for (auto& c : code[p]) c = (int)(next() % 16);
+        for (auto& z : zero[p]) z = (int)(next() % 16);
+        const std::string b = names[p];
+        ts.push_back(pack_awq(b + ".qweight", code[p], K));
+        ts.push_back(pack_awq(b + ".qzeros", zero[p], G));
+        ts.push_back(f16s(b + ".scales", { G, N }, 0.01f * (float)(p + 1)));
+        ts.push_back(pairs(b + ".pairs", p + 1));                         // adjacent / next-but-one swaps
+        ts.push_back(f16s(b + ".theta", { 1, K / 2 }, 0.2f));
+        ts.push_back(f16s(b + ".channel_scales", { 1, K }, 1.25f));
+    }
+    const std::string dir = write_checkpoint(ts,
+        "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"paroquant\","
+        "\"bits\":4,\"group_size\":128,\"krot\":1}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ParoI4);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g.weight", "u.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.paro && w.imported);
+    CHECK_EQ(w.rows, 2 * N);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_U4);
+    CHECK_EQ(rad_enc_givens_parts(&w.enc), (int64_t)2);
+    std::vector<std::vector<uint8_t>> pl((size_t)w.enc.n_planes);
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr_ = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr_, &pc);
+        pl[(size_t)k].assign((size_t)(pr_ * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)) + 8, 0);
+        REQUIRE_EQ(ckpt_plane_rows(w, k, 0, pr_, pl[(size_t)k].data(), &why), RAD_OK);
+    }
+    const int64_t rb = rad_enc_row_bytes(RAD_U4, K);
+    int bad = 0;
+    for (int p = 0; p < 2; ++p)
+        for (int64_t n = 0; n < N; ++n) {
+            const int64_t r = p * N + n;
+            for (int64_t k = 0; k < K; ++k)
+                if ((int)rad_load_f32(pl[0].data() + r * rb, RAD_U4, k) != code[p][(size_t)(n * K + k)]) ++bad;
+            for (int64_t g = 0; g < G; ++g)
+                if (pl[2][(size_t)(r * G + g)] != zero[p][(size_t)(n * G + g)]) ++bad;
+        }
+    CHECK_EQ(bad, 0);
+    const int tpart = rad_enc_find(&w.enc, "t.part");
+    REQUIRE(tpart > 0);
+    const int32_t* ends = (const int32_t*)pl[(size_t)tpart].data();
+    CHECK_EQ(ends[0], (int32_t)N);
+    CHECK_EQ(ends[1], (int32_t)(2 * N));
+    remove_checkpoint(dir);
+}
+
+/* THE COMPOSITION IS PINNED BY ITS BYTES. The same pairs and angles the kernel library composed at load
+ * before "t.dense" was a table give the same hash here, so a container that stores the table serves the
+ * matrices the load-time composition did; and each matrix is orthogonal to f16 accuracy. */
+TEST(paro_dense_matrices_are_the_exact_composition) {
+    const int64_t K = 256, P = 2, S = 3, PS = P * S, G = 128;
+    std::vector<int32_t> pairs((size_t)(PS * K));
+    std::vector<float> ang((size_t)(PS * K / 2));
+    for (int64_t r = 0; r < PS; ++r) {
+        const int64_t mul = 2 * r + 3, add = 17 * r + 5;                  /* odd multiplier: a permutation */
+        for (int64_t c = 0; c < K; ++c)
+            pairs[(size_t)(r * K + c)] = (int32_t)((c / G) * G + (c % G * mul + add) % G);
+        for (int64_t j = 0; j < K / 2; ++j) ang[(size_t)(r * K / 2 + j)] = 0.37f * (float)(r + 1) - 0.011f * (float)j;
+    }
+    std::vector<uint16_t> t((size_t)(P * (K / G) * G * G));
+    for (int64_t pt = 0; pt < P; ++pt)
+        for (int64_t g = 0; g < K / G; ++g) {
+            std::vector<int32_t> ia((size_t)(S * 64)), ib((size_t)(S * 64));
+            std::vector<float> th((size_t)(S * 64));
+            for (int64_t st = 0; st < S; ++st)
+                for (int64_t j = 0; j < 64; ++j) {
+                    const int64_t row = pt * S + st, o = st * 64 + j;
+                    ia[(size_t)o] = pairs[(size_t)(row * K + g * G + 2 * j)] - (int32_t)(g * G);
+                    ib[(size_t)o] = pairs[(size_t)(row * K + g * G + 2 * j + 1)] - (int32_t)(g * G);
+                    th[(size_t)o] = ang[(size_t)(row * (K / 2) + g * 64 + j)];
+                }
+            paro_compose_dense(S, ia.data(), ib.data(), th.data(), t.data() + (pt * (K / G) + g) * G * G);
+        }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint8_t b : std::vector<uint8_t>((const uint8_t*)t.data(), (const uint8_t*)t.data() + t.size() * 2))
+        h = (h ^ b) * 1099511628211ull;
+    CHECK_EQ(h, (uint64_t)0x8e72bd2bb541c6e6ull);
+    double worst = 0;
+    for (int64_t pg = 0; pg < P * K / G; ++pg)
+        for (int64_t i = 0; i < G; ++i) {
+            double nrm = 0;
+            for (int64_t j = 0; j < G; ++j) {
+                const double v = rad_f16_to_f32(t[(size_t)((pg * G + j) * G + i)]);
+                nrm += v * v;
+            }
+            worst = std::max(worst, std::fabs(nrm - 1.0));
+        }
+    CHECK(worst < 2e-3);
 }

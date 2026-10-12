@@ -210,6 +210,17 @@ static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 /* No `asum`: that output exists for the asymmetric integer grids and an fp8 grid is symmetric by
  * construction (libr4d/r4d_rows.cpp says the same). */
 static const RadOperandSpec oQuantFp8[]  = { OPD("x"), OUT("q"), OUT("scale") };
+/* ParoQuant's rotation: a rotation per part, to f16 for the 16-bit GEMMs. The three
+ * tables are the "givens" encoding's (abi/rad_encoding.h) and are WEIGHT operands, so they are
+ * resolved, moved and placed with the weight they belong to. */
+static const RadParamSpec pGivensRotate[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                             P_INT("stages"), P_INT("parts") };
+static const RadParamSpec pGivensDense[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                             P_INT("parts"), P_STR("out") };
+static const RadOperandSpec oGivensDense[] = { OPD("x"), WGT("tdense"), WGT("rscale"), OUT("q"),
+                                               OUT("scale") };
+static const RadOperandSpec oGivensRotate[] = { OPD("x"), WGT("pairs"), WGT("angle"), WGT("rscale"),
+                                                OUT("y") };
 
 /* ---- the fp8 fusions ----------------------------------------------------------------------
  * A fused op's operands are the unfused pair's minus the tensor between them, and `out_bf16`
@@ -273,7 +284,10 @@ static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD
                                             OUT("y") };
 
 static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
-                                       P_STR("dtype") };
+                                       P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2") };
+/* The bias form has no parts: a fused projection rotated apart is the plain product's. */
+static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
+                                           P_STR("dtype") };
 /* `a_sum` and `b_ref` are libr4d's, appended AFTER `y` so docs/OPS.md's list stays a positional
  * prefix: the asymmetric 4-bit and 2-bit grids subtract the activation's per-group code sums, and
  * mxfp4 folds a per-output-row reference exponent. Neither is expressible as a weight aux stream,
@@ -825,6 +839,17 @@ static const RadOpSchema kSchemas[] = {
   "previous pick. `hp` absent is a plane of ones, which drops the form to a plain low-rank "
   "bigram. Serial in l by construction -- the predecessor is not known until the previous step "
   "has been decided." },
+{ "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
+  "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
+  "rscale) for each of `parts` rotated copies, T the [128, 128] f16 matrix a (part, 128-column "
+  "group) that its Givens stages compose to, then the block-scaled quantiser `out` names "
+  "(\"i8\": scale amax / 127, round to nearest; \"fp8\": E4M3, amax / 448). q is [M, parts * n] "
+  "and scale [M, parts * n / group]; tdense is [parts * n, 128]. The same activation as "
+  "the sequential rotation, up to the f16 rounding of T." },
+{ "givens_rotate", ARR(pGivensRotate), ARR(oGivensRotate),
+  "ParoQuant's rotation without a quantiser: y = x / rscale rotated by `stages` rounds of Givens "
+  "pairs, `parts` copies side by side ([M, parts * n]) in y's own dtype. For a weight whose GEMM "
+  "reads a 16-bit activation. `group` is the width a pair stays inside." },
 { "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
   "A Walsh-Hadamard rotation of width `group` along n, then symmetric E4M3 per group: scale = "
   "amax(rotated) / 448, shaped [M, n/group] in f32. n must be a multiple of `group` -- a rotation "
@@ -866,7 +891,7 @@ static const RadOpSchema kSchemas[] = {
   "gemm_nt with quantised operands. The group sub-sum is accumulated from the raw codes and "
   "scaled once per group, which is what an int8 or fp8 WMMA kernel does. Scale streams are "
   "[rows, groups] or [rows]; an mxfp4 weight's u8 scale stream is read as OCP e8m0." },
-{ "gemm_nt_q_bias", ARR(pGemmQ), ARR(oGemmQBias), "gemm_nt_q with a per-column bias." },
+{ "gemm_nt_q_bias", ARR(pGemmQBias), ARR(oGemmQBias), "gemm_nt_q with a per-column bias." },
 
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then V per "
@@ -1201,6 +1226,13 @@ SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_givens_rotate", "givens_rotate", "quant",
+       "channel scale and Givens rotations per part, in the output's dtype",
+       "float in, float out; int32 pairs, f32 angles and channel scales", ref_givens_rotate),
+SIMPLE("ref_givens_dense_quant", "givens_dense_quant", "quant",
+       "the rotation as a dense per-group matrix, then the block-scaled int8 or E4M3 quantiser",
+       "float in, int8 or fp8_e4m3 out, f32 scale per group; f16 matrices and f32 channel scales",
+       ref_givens_dense_quant),
 SIMPLE("ref_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",

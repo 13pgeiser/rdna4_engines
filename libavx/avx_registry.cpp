@@ -181,6 +181,16 @@ static const RadParamSpec pQuant[]      = { P_INT("M"), P_INT("n"), P_INT("group
 static const RadOperandSpec oQuant[]    = { OPD("x"), OUT("q"), OUT("scale"), OUT_O("asum") };
 static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 static const RadOperandSpec oQuantFp8[] = { OPD("x"), OUT("q"), OUT("scale") };
+/* ParoQuant's rotation, libref's declaration: the tables are the "givens" encoding's
+ * (abi/rad_encoding.h) and WEIGHT operands, resolved and placed with the weight they belong to. */
+static const RadParamSpec pGivensRotate[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                             P_INT("stages"), P_INT("parts") };
+static const RadParamSpec pGivensDense[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                             P_INT("parts"), P_STR("out") };
+static const RadOperandSpec oGivensDense[] = { OPD("x"), WGT("tdense"), WGT("rscale"), OUT("q"),
+                                               OUT("scale") };
+static const RadOperandSpec oGivensRotate[] = { OPD("x"), WGT("pairs"), WGT("angle"), WGT("rscale"),
+                                                OUT("y") };
 
 /* The fp8 fusions: the unfused pair's operands minus the tensor between them, and `out_bf16` to
  * put even that back. */
@@ -218,6 +228,8 @@ static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD
                                             OUT("y") };
 
 static const RadParamSpec pGemmQ[]        = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
+                                              P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2") };
+static const RadParamSpec pGemmQBias[]    = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                               P_STR("dtype") };
 static const RadOperandSpec oGemmQ[]      = { OPD("a"), OPD_O("a_scale"), WGT("b"), WGT("b_scale"),
                                               OUT("y"), OPD_O("a_sum"), WGT_O("b_ref") };
@@ -565,6 +577,13 @@ static const RadOpSchema kSchemas[] = {
   "the 1/group is folded into the stored weight scale at convert (docs/OPS.md)." },
 { "gram_accum", ARR(pQuant), ARR(oGram),
   "h += x^T x over a dequantised E4M3 activation. `h` is [n, n] and INOUT." },
+{ "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
+  "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
+  "rscale) for each of `parts` rotated copies, then the block-scaled quantiser `out` names "
+  "(\"i8\": amax / 127, round to nearest; \"fp8\": E4M3, amax / 448)." },
+{ "givens_rotate", ARR(pGivensRotate), ARR(oGivensRotate),
+  "ParoQuant's rotation without a quantiser: x / rscale rotated by `stages` rounds of Givens "
+  "pairs, `parts` copies side by side, in y's own dtype." },
 { "had_quant_act_i8", ARR(pQuant), ARR(oHadQuant),
   "Walsh-Hadamard rotation at width `group`, then symmetric int8 with ONE scale per row carrying "
   "the 1/sqrt(group)." },
@@ -589,7 +608,7 @@ static const RadOpSchema kSchemas[] = {
 { "gemm_nt_q", ARR(pGemmQ), ARR(oGemmQ),
   "C = A B^T with group-scaled quantised operands. `a_sum` and `b_ref` are libr4d's asymmetric and "
   "mxfp4 forms and are ignored here, as they are in libref." },
-{ "gemm_nt_q_bias", ARR(pGemmQ), ARR(oGemmQBias), "quantised C = A B^T + bias." },
+{ "gemm_nt_q_bias", ARR(pGemmQBias), ARR(oGemmQBias), "quantised C = A B^T + bias." },
 { "gemm_nt_q_gated", ARR(pGemmQGated), ARR(oGemmQGated),
   "gemm_nt_q over a [N, K] gate_up plane with gated_quant_fp8's pass in the epilogue, byte for "
   "byte the pair. `N` is the weight's rows, twice the fused width; the output is [M, N/2]." },
@@ -782,6 +801,13 @@ SIMPLE("avx_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
        L(had_quant_act_fp8)),
+SIMPLE("avx_givens_rotate", "givens_rotate", "quant",
+       "channel scale and Givens rotations per part, in the output's dtype",
+       "float in, float out; int32 pairs, f32 angles and channel scales", L(givens_rotate)),
+SIMPLE("avx_givens_dense_quant", "givens_dense_quant", "quant",
+       "the rotation as a dense per-group matrix, then the block-scaled int8 or E4M3 quantiser",
+       "float in, int8 or fp8_e4m3 out, f32 scale per group; f16 matrices and f32 channel scales",
+       L(givens_dense_quant)),
 SIMPLE("avx_gram_accum", "gram_accum", "quant",
        "h += x^T x over a dequantised E4M3 activation, or a plain bf16 one",
        "fp8_e4m3 plus an f32 scale per group, or bf16 with no scale, in; an f32 [n][n] "

@@ -592,7 +592,8 @@ void r4d_gemm_w8a8_tiled(long a, long ascale, long wq, long ws, long c, int M, i
 // as_group 0 = one f32 activation scale per row, 128 = one per (row, 128 of K) at row stride as_rs.
 void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, long wref, long c,
                              int M, int K, int N, int WV, int SK, int MB, int NPW,
-                             int as_group, int as_rs, long stream);
+                             int as_group, int as_rs, long stream,
+                             int lda = 0, int ldws = 0, int ldc = 0);
 int  r4d_gemm_mxfp4a8_nt_m64_max_m(void);
 int  r4d_gemm_mxfp4a8_nt_m64_group(void);
 // The same weight tiled for PREFILL: a 256-row block reads A fragments straight from a
@@ -601,8 +602,10 @@ int  r4d_gemm_mxfp4a8_nt_m64_group(void);
 // the per-wave column width in 16-column fragments. as_group 0 = one f32 activation scale per row,
 // 128 = one per (row, 128 of K) at row stride as_rs.
 void r4d_gemm_mxfp4a8_tiled(long at, long ascale, long wq, long ws, long wref, long c,
-                            int M, int K, int N, int TN, int as_group, int as_rs, long stream);
-void r4d_mxfp4a8_tile_a(long a, long at, int M, int K, long stream);
+                            int M, int K, int N, int TN, int as_group, int as_rs, long stream,
+                            int ldws = 0, int ldc = 0);
+// `lda` is the activation's row pitch in bytes (0 = K), for a window of a wider plane.
+void r4d_mxfp4a8_tile_a(long a, long at, int M, int K, long stream, int lda = 0);
 long r4d_mxfp4a8_tile_a_bytes(int M, int K);
 int  r4d_gemm_mxfp4a8_tiled_group(void);
 // The DECODE band (M <= 128) is r4d_rad_gemm_mxfp4a8_decode alone: its split-K partial is the op's

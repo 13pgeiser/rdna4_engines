@@ -551,6 +551,126 @@ AVX_KERNEL(had_quant_act_fp8) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------- givens_rotate */
+/* ParoQuant's activation side for a 16-bit GEMM: each row divided by its channel scales and rotated
+ * by `stages` rounds of disjoint Givens pairs, once a part, the parts side by side in y. libref's
+ * arithmetic (ref_quant.cpp) in its order: the divide, then a' = a cos t + b sin t,
+ * b' = b cos t - a sin t in f32, stage by stage. A pair walk is a gather and a scatter with nothing
+ * to vectorise; what is hoisted is the cos and sin of every angle, a property of the weight and the
+ * same for every row, so they are taken once a call rather than once a row. */
+AVX_KERNEL(givens_rotate) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *pr = &a->t[1], *an = &a->t[2], *sc = &a->t[3], *y = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), S = p_int(a, "stages", 0), P = p_int(a, "parts", 1);
+    const int64_t g = p_int(a, "group", 0);
+    if (n <= 0 || S <= 0 || P <= 0 || (n & 1)) return RAD_E_SHAPE;
+    if (g <= 0 || g > n || n % g != 0) return RAD_E_SHAPE;
+    const int64_t NP = P * S * (n / 2);
+    if (numel(pr) < P * S * n || numel(an) < NP || numel(sc) < P * n) return RAD_E_SHAPE;
+    const int64_t rows = numel(x) / n;
+    if (rows <= 0 || numel(y) < rows * P * n) return RAD_E_SHAPE;
+
+    int32_t* idx = (int32_t*)scratch_raw((size_t)(P * S * n) * sizeof(int32_t) +
+                                         (size_t)(2 * NP + P * n) * sizeof(float) + 64);
+    float* cs = (float*)(idx + P * S * n);
+    float* sn = cs + NP;
+    float* rs = sn + NP;
+    for (int64_t i = 0; i < P * S * n; ++i) {
+        const int64_t c = ldi(pr, i);
+        if (c < 0 || c >= n) return RAD_E_INVAL;
+        idx[i] = (int32_t)c;
+    }
+    for (int64_t j = 0; j < NP; ++j) {
+        const float th = ldt(an, j);
+        cs[j] = std::cos(th);
+        sn[j] = std::sin(th);
+    }
+    for (int64_t k = 0; k < P * n; ++k) rs[k] = ldt(sc, k);
+
+    AVX_PARALLEL_FOR_IF(rows * P * n * S >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)n);
+        float* out = scratch_f32_b((size_t)(P * n));
+        const float* v = in_row(x, rowoff(x, r, n), n, buf);
+        for (int64_t p = 0; p < P; ++p) {
+            float* w = out + p * n;
+            for (int64_t k = 0; k < n; ++k) w[k] = v[k] / rs[p * n + k];
+            for (int64_t st = 0; st < S; ++st) {
+                const int32_t* ip = idx + (p * S + st) * n;
+                const int64_t a0 = (p * S + st) * (n / 2);
+                for (int64_t j = 0; j < n / 2; ++j) {
+                    const float c = cs[a0 + j], s1 = sn[a0 + j];
+                    const float va = w[ip[2 * j]], vb = w[ip[2 * j + 1]];
+                    w[ip[2 * j]] = va * c + vb * s1;
+                    w[ip[2 * j + 1]] = vb * c - va * s1;
+                }
+            }
+        }
+        out_row(y, rowoff(y, r, P * n), P * n, out);
+    }
+    return RAD_OK;
+}
+
+/* --------------------------------------------------------- givens_dense_quant */
+/* The quantising form: the rotation as one dense 128 x 128 f16 matrix a (part, group) -- `tdense`,
+ * which rad-convert composes from the pairs and angles and stores as the weight's "t.dense" table --
+ * then the block-scaled quantiser `out` names: "fp8" E4M3 with scale amax / 448, "i8" scale
+ * amax / 127 rounded to nearest; scale 1 for an all-zero group, as libref. The matrices are widened
+ * to f32 once a call; a row is then a matrix-vector product a group, in f32 where libref sums in
+ * f64, so a code can differ from libref's where the value sits on a rounding edge. */
+AVX_KERNEL(givens_dense_quant) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *tm = &a->t[1], *sc = &a->t[2], *q = &a->t[3], *s = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), P = p_int(a, "parts", 1), g = p_int(a, "group", 0);
+    if (n <= 0 || P <= 0 || g != 128 || n % g != 0) return RAD_E_SHAPE;
+    const bool i8 = q->dtype == RAD_I8;
+    if (!i8 && q->dtype != RAD_F8E4M3) return RAD_E_DTYPE;
+    const char* outs = p_str(a, "out", "");
+    if (std::strcmp(outs, i8 ? "i8" : "fp8") != 0) return RAD_E_DTYPE;   // `out` names q's dtype
+    const int64_t rows = numel(x) / n, ngrp = n / g;
+    if (rows <= 0 || numel(tm) < P * n * g || numel(sc) < P * n || numel(q) < rows * P * n ||
+        numel(s) < rows * P * ngrp) return RAD_E_SHAPE;
+    const float qmax = i8 ? 127.0f : 448.0f;
+
+    float* T = (float*)scratch_raw((size_t)(P * n * g + P * n) * sizeof(float) + 64);
+    float* rs = T + P * n * g;
+    for (int64_t i = 0; i < P * n; ++i) {
+        row_to_f32(tm->dtype, byte_at(tm->data, tm->dtype, rowoff(tm, i, g)), T + i * g, g);
+        rs[i] = ldt(sc, i);
+    }
+
+    AVX_PARALLEL_FOR_IF(rows * P * n * g >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)n);
+        float* out = scratch_f32_b((size_t)(P * n));
+        float* in = scratch_f32_c((size_t)g);
+        const float* v = in_row(x, rowoff(x, r, n), n, buf);
+        for (int64_t p = 0; p < P; ++p)
+            for (int64_t gi = 0; gi < ngrp; ++gi) {
+                for (int64_t i = 0; i < g; ++i) in[i] = v[gi * g + i] / rs[p * n + gi * g + i];
+                float* yv = out + p * n + gi * g;
+                const float* Tg = T + (p * n + gi * g) * g;
+                for (int64_t j = 0; j < g; ++j) {
+                    vf acc = vf_zero();
+                    for (int64_t i = 0; i < g; i += VF_N)
+                        acc = vf_fma(vf_loadu(Tg + j * g + i), vf_loadu(in + i), acc);
+                    yv[j] = vf_hsum(acc);
+                }
+                const float amax = row_amax(yv, g);
+                const float scl = amax > 0.0f ? amax * (1.0f / qmax) : 1.0f;
+                const float inv = 1.0f / scl;
+                for (int64_t j = 0; j < g; ++j) {
+                    float t = yv[j] * inv;
+                    t = t > qmax ? qmax : (t < -qmax ? -qmax : t);
+                    yv[j] = i8 ? std::nearbyint(t) : t;
+                }
+                stt(s, rowoff(s, r, P * ngrp) + (p * ngrp + gi) * laststride(s), scl);
+            }
+        out_row(q, rowoff(q, r, P * n), P * n, out);
+    }
+    return RAD_OK;
+}
+
 /* ---------------------------------------------------------------- the Gram accumulator
  *
  * h[k1][k2] += sum over rows of x[m][k1] * x[m][k2], where x is the DEQUANTISED E4M3 input, or a

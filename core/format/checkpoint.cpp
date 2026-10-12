@@ -585,6 +585,26 @@ void Checkpoint::detect_import() {
         } else {
             import_why_ = "compressed-tensors: " + why;
         }
+    } else if (qm == "paroquant") {
+        /* z-lab's ParoQuant at integer widths, in the "int5-bitplane" packing: AWQ nibbles of the
+         * low four bits plus a bit plane for the fifth, group 128, asymmetric, with the learned
+         * rotations beside. Other widths and packings are not read. */
+        if (qc("format") == "int5-bitplane" && qc("bits") == "5" && qc("group_size") == "128")
+            import_ = Import::ParoI5;
+        else if (qc("format").empty() && qc("bits") == "4" && qc("group_size") == "128")
+            import_ = Import::ParoI4;       /* z-lab's own release: AWQ-packed int4, asymmetric */
+        else
+            import_why_ = "ParoQuant here is neither the int5-bitplane format (5-bit codes) nor z-lab's "
+                          "AWQ-packed int4, in groups of 128, which are the ones this reads";
+    } else if (qm == "paroquant_mxfp4") {
+        /* QUARK'S MXFP4 PLANES IN A ROTATED BASIS: e2m1 codes, an e8m0 exponent a 32 of K, and per
+         * projection the learned Givens rotations (`pairs`, `theta`) and channel scales in groups
+         * of 128 -- z-lab's ParoQuant, retrained for the MXFP4 grid. */
+        if (qc("format") == "mxfp4" && qc("mxfp4_block") == "32" && qc("group_size") == "128")
+            import_ = Import::ParoMx;
+        else
+            import_why_ = "ParoQuant's MXFP4 here is not format mxfp4 with 32-element blocks and "
+                          "rotation groups of 128, which is the one this reads";
     }
     /* THE TOOL'S DESCRIPTION IS KEPT, UNDER ANOTHER NAME. A plugin reads quantization_config as
      * the statement of the format it serves (qwen35_fp8 checks quant_method is "fp8"), and an
@@ -608,7 +628,51 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         return RAD_OK;
     }
 
-    if (import_ == Import::QuarkMx) {
+    if (import_ == Import::ParoI5 || import_ == Import::ParoI4) {
+        const bool i5 = import_ == Import::ParoI5;
+        /* PARO int5: `X.weight` is X.qweight/.qweight_hi (codes), X.scales (f16 [G, N]) and
+         * X.qzeros/.qzeros_hi (zero points). The view carries the logical [N, K] u5 matrix; the
+         * planes are re-laid row by row by ckpt_plane_rows. */
+        const std::string suffix = ".weight";
+        if (name.size() <= suffix.size() ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            return RAD_E_NOTFOUND;
+        const std::string base = name.substr(0, name.size() - suffix.size());
+        const SrcTensor* qw = find(base + ".qweight");
+        if (!qw) return RAD_E_NOTFOUND;
+        const SrcTensor* hi = i5 ? find(base + ".qweight_hi") : nullptr;
+        const SrcTensor* sc = find(base + ".scales");
+        const SrcTensor* qz = find(base + ".qzeros");
+        const SrcTensor* qzh = i5 ? find(base + ".qzeros_hi") : nullptr;
+        if ((i5 && (!hi || !qzh)) || !sc || !qz || qw->rad_dtype != RAD_I32 ||
+            qz->rad_dtype != RAD_I32 || sc->rad_dtype != RAD_F16 || qw->shape.size() != 2 ||
+            qz->shape.size() != 2 || sc->shape.size() != 2 ||
+            (i5 && (hi->rad_dtype != RAD_I32 || qzh->rad_dtype != RAD_I32 ||
+                    hi->shape.size() != 2 || qzh->shape.size() != 2)))
+            return refuse(RAD_E_FORMAT, "'" + qw->name + "' lacks an int32 " +
+                                        (i5 ? "qweight_hi, qzeros_hi, " : "") +
+                                        "qzeros and an f16 scales beside it");
+        const int64_t K = qw->shape[0], N = qw->shape[1] * 8, G = sc->shape[0];
+        if (N % 32 || K % 128 || G * 128 != K || sc->shape[1] != N || qz->shape[0] != G ||
+            qz->shape[1] != N / 8 ||
+            (i5 && (hi->shape[0] != K || hi->shape[1] != N / 32 || qzh->shape[0] != G ||
+                    qzh->shape[1] != N / 32)))
+            return refuse(RAD_E_SHAPE, "'" + qw->name + "' planes do not fit a [" +
+                                       std::to_string(N) + ", " + std::to_string(K) + "] weight");
+        SrcTensor c = *qw;
+        c.name = name;
+        c.rad_dtype = i5 ? RAD_U5 : RAD_U4;
+        c.shape = { N, K };
+        c.pbits = i5 ? 5 : 4;
+        c.aux[0] = hi; c.aux[1] = qz; c.aux[2] = qzh;
+        sliced_.push_back(std::move(c));
+        *codes = &sliced_.back();
+        *scale = sc;
+        imported_[name] = { *codes, *scale };
+        return RAD_OK;
+    }
+
+    if (import_ == Import::QuarkMx || import_ == Import::ParoMx) {
         /* QUARK'S MXFP4 IS THE ENCODING AS IT STANDS: two codes a byte, element 2j in the low
          * nibble, and one biased exponent a 32 of K -- `fp4_e2m1*e8m0[1x32]`. A view renames the
          * dtypes and the logical width; no byte moves. Its excluded layers are plain tensors. */
@@ -850,7 +914,7 @@ std::string ckpt_tensor_of(const SrcTensor& t) {
 bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& names,
                     std::unordered_set<std::string>* hit) {
     bool any = false;
-    for (const auto* list : { &w.pieces, &w.scales })
+    for (const auto* list : { &w.pieces, &w.scales, &w.pq_pairs, &w.pq_theta, &w.pq_scale })
         for (const SrcTensor* t : *list) {
             if (!t) continue;
             const std::string n = ckpt_tensor_of(*t);
@@ -861,6 +925,121 @@ bool ckpt_reads_any(const CkptWeight& w, const std::unordered_set<std::string>& 
         }
     return any;
 }
+
+namespace {
+
+/* The ROTATION GROUP of a ParoQuant checkpoint: pairs address columns within a group of 128. */
+constexpr int64_t kParoGroup = 128;
+
+/* "model.layers.0.mlp.down_proj.weight" -> "model.layers.0.mlp.down_proj" */
+std::string paro_base(const SrcTensor& piece) {
+    std::string n = ckpt_tensor_of(piece);
+    const std::string suffix = ".weight";
+    return n.size() > suffix.size() && n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0
+               ? n.substr(0, n.size() - suffix.size()) : n;
+}
+
+}  /* namespace */
+
+/* ONE (PART, GROUP)'S STAGES COMPOSED INTO ITS DENSE MATRIX: out[j * 128 + i] is output j of the
+ * stages fed the unit vector e_i, applied in table order (stage 0 first) as a' = a cos t + b sin t,
+ * b' = b cos t - a sin t -- libref's loop. In f64 throughout (the f32 angles widened, cos, sin and
+ * every product in double), so the error (~1e-15) is far below an f16 step and the bytes are the
+ * exact composition rounded to f16 by way of f32, whichever libm or summation order computed it. */
+void paro_compose_dense(int64_t S, const int32_t* ia, const int32_t* ib, const float* th,
+                        uint16_t* out) {
+    constexpr int64_t G = kParoGroup, H = kParoGroup / 2;
+    std::vector<double> cs((size_t)(S * H)), sn((size_t)(S * H)), v((size_t)G);
+    for (int64_t o = 0; o < S * H; ++o) {
+        cs[(size_t)o] = std::cos((double)th[o]);
+        sn[(size_t)o] = std::sin((double)th[o]);
+    }
+    for (int64_t i = 0; i < G; ++i) {
+        std::fill(v.begin(), v.end(), 0.0);
+        v[(size_t)i] = 1.0;
+        for (int64_t o = 0; o < S * H; ++o) {
+            const double va = v[(size_t)ia[o]], vb = v[(size_t)ib[o]];
+            v[(size_t)ia[o]] = va * cs[(size_t)o] + vb * sn[(size_t)o];
+            v[(size_t)ib[o]] = vb * cs[(size_t)o] - va * sn[(size_t)o];
+        }
+        for (int64_t j = 0; j < G; ++j) out[j * G + i] = rad_f32_to_f16((float)v[(size_t)j]);
+    }
+}
+
+namespace {
+
+/* PARTS: EACH PIECE OF A ROTATED WEIGHT HAS ITS OWN ROTATION. A fused gate_up or q|k|v is several
+ * checkpoint projections, each learned with its own pairs, angles and channel scales, so the
+ * fused weight is one row PART per piece (abi/rad_encoding.h, "givens"). Gives the encoding its
+ * four tables -- t.pairs and t.angle stage-major per part, t.scale a row per part, t.part the end
+ * row of each -- and refuses a rotation that is not what the kernels read: a pair that leaves its
+ * group of 128, or a stage that does not use every column of a group exactly once. */
+int paro_attach(Checkpoint& ck, CkptWeight* out, std::string* why) {
+    auto refuse = [&](std::string m) {
+        if (why) *why = std::move(m);
+        return (int)RAD_E_FORMAT;
+    };
+    const int64_t K = out->cols, P = (int64_t)out->pieces.size();
+    if (K % kParoGroup) return refuse("'" + out->name + "' has " + std::to_string(K) +
+                                      " columns, which is not whole rotation groups of 128");
+    int64_t S = 0;
+    out->pq_pairs.clear(); out->pq_theta.clear(); out->pq_scale.clear();
+    for (const SrcTensor* piece : out->pieces) {
+        const std::string base = paro_base(*piece);
+        const SrcTensor* pr = ck.find(base + ".pairs");
+        const SrcTensor* th = ck.find(base + ".theta");
+        const SrcTensor* cs = ck.find(base + ".channel_scales");
+        if (!pr || !th || !cs)
+            return refuse("'" + piece->name + "' is a ParoQuant MXFP4 weight and '" + base +
+                          "' lacks its pairs, theta or channel_scales");
+        if (pr->rad_dtype != RAD_I16 || th->rad_dtype != RAD_F16 || cs->rad_dtype != RAD_F16 ||
+            pr->shape.size() != 2 || th->shape.size() != 2 || cs->shape.size() != 2 ||
+            pr->shape[1] != K || th->shape[0] != pr->shape[0] || th->shape[1] != K / 2 ||
+            cs->shape[0] != 1 || cs->shape[1] != K || pr->shape[0] < 1)
+            return refuse("'" + base + "' pairs/theta/channel_scales do not fit a " +
+                          std::to_string(K) + "-column weight (int16 [S, K], f16 [S, K/2], f16 [1, K])");
+        if (S == 0) S = pr->shape[0];
+        if (pr->shape[0] != S)
+            return refuse("the pieces of '" + out->name + "' have different numbers of rotation stages");
+        /* every stage is a perfect matching of each group's 128 columns */
+        const int16_t* pv = (const int16_t*)pr->data;
+        for (int64_t st = 0; st < S; ++st)
+            for (int64_t g = 0; g < K / kParoGroup; ++g) {
+                bool seen[kParoGroup] = {};
+                for (int64_t i = 0; i < kParoGroup; ++i) {
+                    const int v = pv[st * K + g * kParoGroup + i];
+                    if (v < 0 || v >= kParoGroup || seen[v])
+                        return refuse("'" + pr->name + "' stage " + std::to_string(st) + " group " +
+                                      std::to_string(g) + " is not a pairing of its 128 columns");
+                    seen[v] = true;
+                }
+            }
+        out->pq_pairs.push_back(pr);
+        out->pq_theta.push_back(th);
+        out->pq_scale.push_back(cs);
+    }
+    RadEncoding& e = out->enc;
+    rad_enc_copy_str(e.transform, "givens");
+    rad_enc_add_table(&e, "t.pairs", RAD_I32, P * S, K);
+    rad_enc_add_table(&e, "t.angle", RAD_F32, P * S, K / 2);
+    rad_enc_add_table(&e, "t.scale", RAD_F32, P, K);
+    if (P > 1) rad_enc_add_table(&e, "t.part", RAD_I32, 1, P);
+    /* THE DENSE MATRICES, composed here and stored: the prefill quantiser (givens_dense_quant) applies a
+     * (part, group)'s stages as one 128 x 128 matrix, and a matrix is a number a kernel library must
+     * not choose at load (abi/rad_abi.h, weight layout) -- the pairs and angles stay for the stage-wise
+     * rotation the 16-bit GEMMs read. */
+    if (rad_enc_add_table(&e, "t.dense", RAD_F16, P * K / kParoGroup, kParoGroup * kParoGroup) < 0)
+        return refuse("'" + out->name + "' has more planes than an encoding holds");
+    if (!rad_enc_valid(&e)) return refuse("the rotation tables of '" + out->name + "' are malformed");
+    out->imported = true;
+    out->paro = true;
+    out->trivial = false;
+    out->why = "it is ParoQuant MXFP4, which rad-convert imports with its rotation tables -- "
+               "serve the container it writes";
+    return RAD_OK;
+}
+
+}  /* namespace */
 
 int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, bool optional,
                  CkptWeight* out, std::string* why) {
@@ -897,6 +1076,14 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     for (const Src1& s1 : srcs) {
         const SrcTensor* st = ck.find(s1.name);
         const SrcTensor* sc = st ? ck.find(scale_name(s1.name)) : nullptr;
+        /* ParoQuant's fp8 heads and embedding carry ONE f32 SCALE A ROW (`X.weight_scale`, [N]),
+         * not a block plane: Quark's `_scale` naming for a per-channel weight. */
+        if (st && !sc && ck.imports() == Checkpoint::Import::ParoMx &&
+            (st->rad_dtype == RAD_F8E4M3 || st->rad_dtype == RAD_F8E5M2) && st->shape.size() == 2) {
+            const SrcTensor* pr = ck.find(std::string(s1.name) + "_scale");
+            if (pr && pr->rad_dtype == RAD_F32 && pr->shape.size() == 1 && pr->shape[0] == st->shape[0])
+                sc = pr;
+        }
         /* A WEIGHT THE CHECKPOINT SHIPS IN AN IMPORTED FORM is read through that form's views. */
         {
             const SrcTensor *ic = nullptr, *is = nullptr;
@@ -979,6 +1166,25 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                    (gguf_dtype(p0.ggml) ? gguf_dtype(p0.ggml)->name : "block") + " tensor";
     } else if (!same) {
         out->why = "its pieces are stored in different dtypes";
+    } else if (p0.pbits) {
+        /* PARO int5-bitplane: u5 codes, an f16 scale and a u8 zero point a 128 of K, then the
+         * rotation tables. Joined only along rows (gate|up), as every imported form is. */
+        bool fits = d == 0 || out->pieces.size() == 1;
+        for (const SrcTensor* pk : out->pieces) fits = fits && pk->pbits == p0.pbits;
+        if (!fits) {
+            out->why = "its int5 pieces are joined along a column, across their groups";
+        } else {
+            rad_enc_clear(&out->enc);
+            rad_enc_copy_str(out->enc.scheme, "affine");
+            rad_enc_add_plane(&out->enc, "codes", p0.pbits == 5 ? RAD_U5 : RAD_U4, 1, 1);
+            rad_enc_add_plane(&out->enc, "scale", RAD_F16, 1, 128);
+            rad_enc_add_plane(&out->enc, "zero", RAD_U8, 1, 128);
+            const int rc = paro_attach(ck, out, why);
+            if (rc != RAD_OK) return rc;
+            out->why = std::string("it is ParoQuant int") + (p0.pbits == 5 ? "5" : "4") +
+                       ", which rad-convert imports with its zero points and rotation tables -- "
+                       "serve the container it writes";
+        }
     } else if (p0.gptq_bits) {
         /* GPTQ-PACKED, IMPORTED: one width and one group throughout, joined only along rows --
          * a column join would put two pieces' groups in one scale block. */
@@ -1012,6 +1218,10 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_copy_str(out->enc.scheme, "affine");
             rad_enc_add_plane(&out->enc, "codes", RAD_FP4E2M1, 1, 1);
             rad_enc_add_plane(&out->enc, "scale", RAD_E8M0, 1, 32);
+            if (ck.imports() == Checkpoint::Import::ParoMx) {
+                const int rc = paro_attach(ck, out, why);
+                if (rc != RAD_OK) return rc;
+            }
         }
     } else if ((dt == RAD_F8E4M3 || dt == RAD_F8E5M2) && scaled) {
         /* BLOCK-SCALED FP8, byte for byte: the codes and the scale plane are the planes of
@@ -1033,7 +1243,10 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             const int64_t want_r = (r + br - 1) / br, want_c = (c + bc - 1) / bc;
             int64_t sr = 0, scl = 0;
             rad_enc_view((uint32_t)sk.shape.size(), sk.shape.data(), &sr, &scl);
-            if (sk.rad_dtype != sdt || sr != want_r || scl != want_c) {
+            const bool per_row = sk.shape.size() == 1;       /* one scale a row; see above */
+            if (per_row && sk.shape[0] == r && sk.rad_dtype == sdt) {
+                /* fits */
+            } else if (per_row || sk.rad_dtype != sdt || sr != want_r || scl != want_c) {
                 out->trivial = false;
                 out->why = "'" + sk.name + "' is not the [" + std::to_string(want_r) + ", " +
                            std::to_string(want_c) + "] " + std::to_string(br) + "x" +
@@ -1048,7 +1261,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_clear(&out->enc);
             rad_enc_copy_str(out->enc.scheme, "affine");
             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
-            rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
+            if (out->scales[0]->shape.size() == 1) rad_enc_add_plane(&out->enc, "scale", sdt, 1, 0);
+            else rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
         }
     } else if (p0.ct_group) {
         /* CT-INT4, IMPORTED: one group throughout and joined only along rows, as GPTQ's. The codes
@@ -1250,6 +1464,11 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
         return rc;
     };
     if (r0 < 0 || nr < 0 || r0 + nr > w.rows) return refuse(RAD_E_SHAPE, "rows out of range");
+    /* A ROTATED WEIGHT's codes are in the rotated basis; its f32 value would be the unrotated one,
+     * which only a decoder over the container's tables computes. Nothing quantises it again. */
+    if (w.paro)
+        return refuse(RAD_E_UNSUPPORTED, "'" + w.name + "' is a ParoQuant weight, stored rotated; "
+                                         "it is kept as it is and has no f32 view here");
     Joined j;
     j.init(w.pieces, w.concat_dim);
     /* the runs come in order, so the cursor is the elements already written */
@@ -1290,13 +1509,15 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
      * are that piece's. */
     if (!w.scales.empty() && w.scales[0]) {
         const int64_t br = w.enc.n_planes > 1 ? w.enc.plane[1].block[0] : 128;
-        const int64_t bc = w.enc.n_planes > 1 ? w.enc.plane[1].block[1] : 128;
+        /* a block extent of 0 is the whole extent: a scale a row, one column of scales */
+        const int64_t bc0 = w.enc.n_planes > 1 ? w.enc.plane[1].block[1] : 128;
         int64_t base = 0;
         for (size_t k = 0; k < w.pieces.size(); ++k) {
             const SrcTensor& pk = *w.pieces[k];
             const SrcTensor& sk = *w.scales[k];
             int64_t pr = 0, pc = 0;
             rad_enc_view((uint32_t)pk.shape.size(), pk.shape.data(), &pr, &pc);
+            const int64_t bc = bc0 > 0 ? bc0 : pc;
             const int64_t sc = (pc + bc - 1) / bc;
             for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + pr); ++r)
                 for (int64_t c = 0; c < w.cols; ++c)
@@ -1323,7 +1544,116 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     const uint32_t dt = w.enc.plane[k].dtype;
     const int64_t eb = rad_dtype_bits(dt) / 8;
     uint8_t* o = (uint8_t*)dst;
-    if (w.imported) {
+    if (w.paro && w.pieces[0]->pbits && k <= 2) {
+        /* PARO int5-bitplane, RE-LAID a row of the logical [N, K] matrix at a time. The checkpoint
+         * packs along N: qweight [K, N/8] holds eight low nibbles per word in AWQ order (word
+         * column c of a group of eight sits in nibble j, ORDER[j] == c), and qweight_hi [K, N/32]
+         * the fifth bit of 32 columns, bit n % 32. The zero points are the same two packings over
+         * [G, N]. */
+        auto nib = [](int c) { return c % 2 == 0 ? c / 2 : 4 + c / 2; };      /* AWQ order */
+        auto u32 = [](const SrcTensor& t, int64_t i) {
+            uint32_t v;
+            std::memcpy(&v, (const uint8_t*)t.data + i * 4, 4);
+            return v;
+        };
+        int64_t base = 0;
+        for (size_t pi = 0; pi < w.pieces.size(); ++pi) {
+            const SrcTensor* pc = w.pieces[pi];
+            const int64_t Np = pc->shape[0], K = pc->shape[1], G = K / 128;
+            const SrcTensor *hip = pc->aux[0], *qzp = pc->aux[1], *qzhp = pc->aux[2];
+            const SrcTensor& sc = *w.scales[pi];
+            for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + Np); ++r) {
+                const int64_t n = r - base;
+                const int cn = (int)(n % 8);
+                if (k == 0) {
+                    const int pb = pc->pbits;
+                    const int64_t rb = (K * pb + 7) / 8;
+                    std::memset(o, 0, (size_t)rb);
+                    for (int64_t kk = 0; kk < K; ++kk) {
+                        const uint32_t lo = (u32(*pc, kk * (Np / 8) + n / 8) >> (4 * nib(cn))) & 15u;
+                        const uint32_t h = pb == 5 ? (u32(*hip, kk * (Np / 32) + n / 32) >> (n % 32)) & 1u : 0u;
+                        const uint32_t code = lo | (h << 4);
+                        const int64_t bit = kk * pb;
+                        const uint32_t sh = (uint32_t)(bit & 7);
+                        const uint32_t v = code << sh;
+                        o[bit >> 3] |= (uint8_t)(v & 0xFFu);
+                        if (sh + pb > 8) o[(bit >> 3) + 1] |= (uint8_t)(v >> 8);
+                    }
+                    o += rb;
+                } else if (k == 1) {
+                    for (int64_t g = 0; g < G; ++g) {
+                        std::memcpy(o, (const uint8_t*)sc.data + (g * Np + n) * 2, 2);
+                        o += 2;
+                    }
+                } else {
+                    for (int64_t g = 0; g < G; ++g) {
+                        const uint32_t lo = (u32(*qzp, g * (Np / 8) + n / 8) >> (4 * nib(cn))) & 15u;
+                        const uint32_t h = pc->pbits == 5 ? (u32(*qzhp, g * (Np / 32) + n / 32) >> (n % 32)) & 1u : 0u;
+                        *o++ = (uint8_t)(lo | (h << 4));
+                    }
+                }
+            }
+            base += Np;
+        }
+        return RAD_OK;
+    }
+    if (w.paro && std::strncmp(w.enc.plane[k].role, "t.", 2) == 0) {
+        /* A ROTATION TABLE, built from the checkpoint's own tensors a row at a time: the pairs
+         * from group-local to whole-row columns, the angles widened, the channel scale inverted
+         * (the checkpoint multiplies the activation by it; the encoding's t.scale is the factor
+         * the stored row was MULTIPLIED by, so the activation is divided), the part ends. */
+        const RadEncPlane& pl = w.enc.plane[k];
+        const int64_t P = (int64_t)w.pieces.size(), S = w.pq_pairs[0]->shape[0], K = w.cols;
+        const std::string role = pl.role;
+        for (int64_t r = r0; r < r0 + nr; ++r) {
+            if (role == "t.pairs") {
+                const int16_t* pv = (const int16_t*)w.pq_pairs[(size_t)(r / S)]->data + (r % S) * K;
+                int32_t* d = (int32_t*)o;
+                for (int64_t c = 0; c < K; ++c)
+                    d[c] = (int32_t)((c / kParoGroup) * kParoGroup + pv[c]);
+                o += K * 4;
+            } else if (role == "t.angle") {
+                const SrcTensor& th = *w.pq_theta[(size_t)(r / S)];
+                float* d = (float*)o;
+                for (int64_t c = 0; c < K / 2; ++c)
+                    d[c] = rad_load_f32(th.data, th.rad_dtype, (r % S) * (K / 2) + c);
+                o += K / 2 * 4;
+            } else if (role == "t.scale") {
+                const SrcTensor& cs = *w.pq_scale[(size_t)r];
+                float* d = (float*)o;
+                for (int64_t c = 0; c < K; ++c) d[c] = 1.0f / rad_load_f32(cs.data, cs.rad_dtype, c);
+                o += K * 4;
+            } else if (role == "t.part") {
+                int32_t* d = (int32_t*)o;
+                int64_t end = 0;
+                for (int64_t q = 0; q < P; ++q) {
+                    end += w.pieces[(size_t)q]->shape[0];
+                    d[q] = (int32_t)end;
+                }
+                o += P * 4;
+            } else if (role == "t.dense") {
+                /* row r is part r / (K/128), group r % (K/128): its stages, group-local, composed */
+                const int64_t nkb = K / kParoGroup, H = kParoGroup / 2, q = r / nkb, g = r % nkb;
+                const int16_t* pv = (const int16_t*)w.pq_pairs[(size_t)q]->data;
+                const SrcTensor& th = *w.pq_theta[(size_t)q];
+                std::vector<int32_t> ia((size_t)(S * H)), ib((size_t)(S * H));
+                std::vector<float> an((size_t)(S * H));
+                for (int64_t st = 0; st < S; ++st)
+                    for (int64_t j = 0; j < H; ++j) {
+                        const int64_t at = st * H + j;
+                        ia[(size_t)at] = pv[st * K + g * kParoGroup + 2 * j];
+                        ib[(size_t)at] = pv[st * K + g * kParoGroup + 2 * j + 1];
+                        an[(size_t)at] = rad_load_f32(th.data, th.rad_dtype, st * (K / 2) + g * H + j);
+                    }
+                paro_compose_dense(S, ia.data(), ib.data(), an.data(), (uint16_t*)o);
+                o += kParoGroup * kParoGroup * 2;
+            } else {
+                return refuse(RAD_E_STATE, "plane '" + role + "' of a ParoQuant weight is not a table");
+            }
+        }
+        return RAD_OK;
+    }
+    if (w.imported && !w.paro) {
         /* GPTQ-PACKED, RE-LAID: a row of codes is a column of the qweight, its words' bytes in
          * order -- two codes a byte for int4, low nibble first, as the encoding packs them -- each
          * offset to signed by flipping the top bit of every field; a row of scales is a column of
@@ -1392,6 +1722,7 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     for (const SrcTensor* s : src) {
         int64_t sr = 0, scl = 0;
         rad_enc_view((uint32_t)s->shape.size(), s->shape.data(), &sr, &scl);
+        if (s->shape.size() == 1) { sr = s->shape[0]; scl = 1; }       /* one scale a row */
         const int64_t lo = std::max(r0, base), hi = std::min(r0 + nr, base + sr);
         if (hi > lo) {
             std::memcpy(o, (const uint8_t*)s->data + (lo - base) * scl * eb,

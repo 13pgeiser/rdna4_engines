@@ -102,31 +102,77 @@ Rd plane(const EncodedView& v, int idx) {
     return r;
 }
 
-/* Undo a "givens" transform on one row in place: w = v . G_S^T ... G_1^T . D^-1. */
-int givens_inverse(const EncodedView& v, float* row, std::string* why) {
+/* The tables of one row part of a "givens" weight, read once: the cosine and sine of every angle
+ * and the pairs as indices, so undoing a row is arithmetic and not a table walk. A decode asks for
+ * the part its row falls in, and rows of one part follow each other. */
+struct GivensPart {
+    int64_t              part = -1;
+    int64_t              S = 0;
+    std::vector<int32_t> pair;            /* [S][K] */
+    std::vector<double>  cs, sn;          /* [S][K/2] */
+    std::vector<float>   scale;           /* [K], empty without t.scale */
+};
+
+int givens_part(const EncodedView& v, int64_t r, GivensPart* g, std::string* why) {
     const Rd pairs = plane(v, rad_enc_find(&v.enc, "t.pairs"));
     const Rd angle = plane(v, rad_enc_find(&v.enc, "t.angle"));
     const Rd scale = plane(v, rad_enc_find(&v.enc, "t.scale"));
-    const int64_t S = pairs.v->rows, K = v.cols;
-    if (pairs.v->cols != K || angle.v->rows != S || angle.v->cols != K / 2 || (K & 1) ||
-        (scale && (scale.v->rows != 1 || scale.v->cols != K))) {
+    const Rd bound = plane(v, rad_enc_find(&v.enc, "t.part"));
+    const int64_t K = v.cols, P = rad_enc_givens_parts(&v.enc);
+    if (P < 1 || pairs.v->rows % P || pairs.v->cols != K || angle.v->rows != pairs.v->rows ||
+        angle.v->cols != K / 2 || (K & 1) ||
+        (scale && (scale.v->rows != P || scale.v->cols != K))) {
         if (why) *why = fmt("a givens transform's tables do not fit a %lld-column row", K);
         return RAD_E_SHAPE;
     }
-    for (int64_t s = S - 1; s >= 0; --s)
-        for (int64_t p = 0; p < K / 2; ++p) {
-            const int64_t a = (int64_t)pairs.at(s, 2 * p), b = (int64_t)pairs.at(s, 2 * p + 1);
-            if (a < 0 || a >= K || b < 0 || b >= K || a == b) {
-                if (why) *why = fmt("givens stage %lld pairs columns %lld and %lld", s, a, b);
+    int64_t part = 0;
+    while (bound && part + 1 < P && r >= (int64_t)bound.at(0, part)) ++part;
+    if (g->part == part) return RAD_OK;
+    g->part = part;
+    g->S = pairs.v->rows / P;
+    g->pair.assign((size_t)(g->S * K), 0);
+    g->cs.assign((size_t)(g->S * K / 2), 0.0);
+    g->sn.assign((size_t)(g->S * K / 2), 0.0);
+    for (int64_t s = 0; s < g->S; ++s) {
+        for (int64_t k = 0; k < K; ++k) {
+            const int64_t c = (int64_t)pairs.at(part * g->S + s, k);
+            if (c < 0 || c >= K) {
+                if (why) *why = fmt("givens stage %lld names column %lld", s, c);
                 return RAD_E_SHAPE;
             }
-            const double t = angle.at(s, p), c = std::cos(t), sn = std::sin(t);
+            g->pair[(size_t)(s * K + k)] = (int32_t)c;
+        }
+        for (int64_t p = 0; p < K / 2; ++p) {
+            const double t = angle.at(part * g->S + s, p);
+            g->cs[(size_t)(s * K / 2 + p)] = std::cos(t);
+            g->sn[(size_t)(s * K / 2 + p)] = std::sin(t);
+        }
+    }
+    g->scale.clear();
+    if (scale) {
+        g->scale.resize((size_t)K);
+        for (int64_t k = 0; k < K; ++k) g->scale[(size_t)k] = scale.at(part, k);
+    }
+    return RAD_OK;
+}
+
+/* Undo a "givens" transform on one row in place: w = v . G_S^T ... G_1^T . D^-1, with the tables
+ * of the row part `g` holds. */
+int givens_inverse(const GivensPart& g, int64_t K, float* row, std::string* why) {
+    for (int64_t s = g.S - 1; s >= 0; --s)
+        for (int64_t p = 0; p < K / 2; ++p) {
+            const int64_t a = g.pair[(size_t)(s * K + 2 * p)], b = g.pair[(size_t)(s * K + 2 * p + 1)];
+            if (a == b) {
+                if (why) *why = fmt("givens stage %lld pairs column %lld with itself", s, a);
+                return RAD_E_SHAPE;
+            }
+            const double c = g.cs[(size_t)(s * K / 2 + p)], sn = g.sn[(size_t)(s * K / 2 + p)];
             const double x = row[a], y = row[b];
             row[a] = (float)(c * x - sn * y);
             row[b] = (float)(sn * x + c * y);
         }
-    if (scale)
-        for (int64_t k = 0; k < K; ++k) row[k] /= scale.at(0, k);
+    if (!g.scale.empty())
+        for (int64_t k = 0; k < K; ++k) row[k] /= g.scale[(size_t)k];
     return RAD_OK;
 }
 
@@ -219,6 +265,7 @@ int enc_decode_rows(const EncodedView& v, int64_t row0, int64_t n, float* out, s
         return RAD_E_SHAPE;
     }
     std::vector<float> tmp(perm ? (size_t)v.cols : 0);
+    GivensPart gv;
     /* THE COMMON FORM, A ROW AT A TIME: codes with no codebook, sign, zero or minimum and at most
      * one scale level -- int4 experts, fp8 rows, a fixed-scale table. The element walk below
      * resolves every element's dtype and its scale's index through a switch and two divisions,
@@ -288,7 +335,8 @@ int enc_decode_rows(const EncodedView& v, int64_t row0, int64_t n, float* out, s
             }
             std::memcpy(o, tmp.data(), (size_t)v.cols * sizeof(float));
         } else if (giv) {
-            const int st = givens_inverse(v, o, why);
+            int st = givens_part(v, r, &gv, why);
+            if (st == RAD_OK) st = givens_inverse(gv, v.cols, o, why);
             if (st != RAD_OK) return st;
         }
     }

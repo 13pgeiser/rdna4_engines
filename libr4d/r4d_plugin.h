@@ -236,6 +236,12 @@ int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_tiled (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16_m64  (const RadArgs*, RadStream);
+int r4d_rad_gemm_w5a16_m64  (const RadArgs*, RadStream);
+int r4d_rad_gemm_w4a16asym_m64(const RadArgs*, RadStream);
+int r4d_rad_gemm_w4a8i8_tiled(const RadArgs*, RadStream);
+int r4d_rad_gemm_w5a8i8_tiled(const RadArgs*, RadStream);
+int r4d_rad_givens_dense_quant(const RadArgs*, RadStream);
+int r4d_rad_givens_dense_quant_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_gemm_w8a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a8_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a8_tiled (const RadArgs*, RadStream);
@@ -346,6 +352,8 @@ int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_had_quant_act_fp8 (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
+int r4d_rad_givens_rotate (const RadArgs*, RadStream);
+int r4d_rad_givens_rotate_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_rmsnorm_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_gated_quant_fp8 (const RadArgs*, RadStream);
 int r4d_rad_gated_quant_fp8_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
@@ -412,10 +420,26 @@ int r4d_rad_relayout_w8a16(const RadParam*, int, int, const RadEncoding*, const 
                            const RadTensor*, int, void*, int64_t);
 int r4d_rad_relayout_w8a8(const RadParam*, int, int, const RadEncoding*, const int*,
                           const RadTensor*, int, void*, int64_t);
+int r4d_rad_layout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
+                      const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
+                        const RadTensor*, int, void*, int64_t);
+int r4d_rad_unrelayout_w5(const RadParam*, int, int, const RadEncoding*, const int*,
+                          const void*, int64_t, const RadTensor*, int);
+int r4d_rad_layout_gdense(const RadParam*, int, int, const RadEncoding*, const int*,
+                          const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_gdense(const RadParam*, int, int, const RadEncoding*, const int*,
+                            const RadTensor*, int, void*, int64_t);
 int r4d_rad_layout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
                          const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, void*, int64_t);
+int r4d_rad_layout_givens_pairs(const RadParam*, int, int, const RadEncoding*, const int*,
+                                const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_givens_pairs(const RadParam*, int, int, const RadEncoding*, const int*,
+                                  const RadTensor*, int, void*, int64_t);
+int r4d_rad_unrelayout_givens_pairs(const RadParam*, int, int, const RadEncoding*, const int*,
+                                    const void*, int64_t, const RadTensor*, int);
 
 /* -- the small bf16 model ops (r4d_model_bf16.hip) --
  *
