@@ -29,7 +29,7 @@
 //! `HIPFIRE_ROUTE_ORACLE_KV_B` (e.g. `q8`) and both oracles go RED on the KV
 //! geometry assertion. Run explicitly:
 //!
-//!   HIPFIRE_QWEN35_FIXTURE=$HOME/.hipfire/models/qwen3.8-27b.mq4-xt \
+//!   HIPFIRE_QWEN35_FIXTURE=$HOME/.hipfire/models/qwen3.8-27b.mq4-xts \
 //!   HIPFIRE_ORNITH_FIXTURE=$HOME/.hipfire/models/ornith-1.5-35b-a3b.mq4r \
 //!   HIP_VISIBLE_DEVICES=0 flock -w 3600 /tmp/hipfire-gpu.lock \
 //!       cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single \
@@ -61,10 +61,12 @@ const PINNED_KV_TIER: &str = "fwht3";
 /// tier as A (green). Set to `q8`/`asym3` for the anti-vacuity red run.
 const KV_TIER_B_ENV: &str = "HIPFIRE_ROUTE_ORACLE_KV_B";
 
-// Fixture identities per `/home/kaden/hipfire-g4-val/G5-FIXTURE-LOCK.md`
-// (full-file sha256, exact bytes, verified on both hosts).
-const DENSE_SIZE: u64 = 14_980_361_216;
-const DENSE_SHA256: &str = "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7";
+// Fixture identities (full-file sha256, exact bytes). The dense pin is the
+// canonical `qwen3.8:27b-mq4-xts` (registry/v1.json, same as
+// scripts/device-mesh/matrix.json fixture_lock); the older G5-FIXTURE-LOCK.md
+// 14980361216-byte / 9f91556f… upload is superseded. MoE is unchanged.
+const DENSE_SIZE: u64 = 14_987_185_152;
+const DENSE_SHA256: &str = "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae";
 const MOE_SIZE: u64 = 18_700_570_368;
 const MOE_SHA256: &str = "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6";
 
@@ -634,7 +636,7 @@ fn qwen35_dense_single_route_oracle() {
     run_oracle(
         "g1-single-oracle[dense]",
         "HIPFIRE_QWEN35_FIXTURE",
-        "qwen3.8-27b.mq4-xt",
+        "qwen3.8-27b.mq4-xts",
         false,
         DENSE_SIZE,
         DENSE_SHA256,
