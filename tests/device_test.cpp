@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 using rad::DirectFile;
@@ -279,6 +280,214 @@ TEST(memcpy_async_then_stream_sync) {
 
     rad_dev_free(src, RAD_MEM_HOST_PINNED);
     rad_dev_free(dst, RAD_MEM_HOST);
+}
+
+/* A list copy is many copies handed to the card's DMA engine at once, so what it can get wrong is
+ * at the BOUNDARIES: a copy landing a few bytes off, short by its last bytes, or running into its
+ * neighbour. So: dozens of copies, lengths from one word to a few hundred KiB, sources taken out of
+ * order, destinations with gaps whose sentinel bytes must survive, odd lengths and unaligned
+ * sources -- and the bytes read back through an ordinary copy on the same stream, which must wait
+ * for the list. */
+TEST(memcpy_list_async_copies_every_segment_and_nothing_else) {
+    const int nseg = 77;
+    const int64_t gap = 48, slab = 16 << 20;
+    Stream st;
+    auto* src = (uint8_t*)rad_dev_alloc(slab, RAD_MEM_HOST_PINNED);
+    auto* dev = (uint8_t*)rad_dev_alloc(slab, RAD_MEM_DEVICE);
+    auto* back = (uint8_t*)rad_dev_alloc(slab, RAD_MEM_HOST_PINNED);
+    CHECK(src && dev && back);
+    if (!src || !dev || !back) return;
+    fill(src, slab, 0x5EC5u);
+
+    std::vector<RadCopySeg> segs;
+    std::vector<int64_t> s_off, d_off, len;
+    int64_t d = 0, s = slab;
+    for (int i = 0; i < nseg; ++i) {
+        int64_t n = 16 * (1 + (int64_t)((i * 2654435761u) % 13000));   /* 16 B .. ~200 KiB */
+        if (i % 19 == 7) n += 5;                                       /* an odd length */
+        s -= n + 64;                                                   /* sources backwards */
+        if (i % 23 == 11) s -= 4;                                      /* an unaligned source */
+        s_off.push_back(s);
+        d_off.push_back(d);
+        len.push_back(n);
+        d = (d + n + gap + 15) & ~(int64_t)15;
+    }
+    CHECK(s > 0 && d < slab);
+    CHECK_OK(rad_memset_async(dev, 0xA7, slab, st.s));
+    for (int i = 0; i < nseg; ++i) segs.push_back(RadCopySeg{src + s_off[i], dev + d_off[i], len[i]});
+    segs.push_back(RadCopySeg{src, dev, 0});                           /* nothing to copy */
+    CHECK_OK(rad_memcpy_list_async(segs.data(), (int)segs.size(), 0, st.s));
+    CHECK_OK(rad_memcpy_async(back, dev, slab, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+
+    int bad = 0, smashed = 0;
+    for (int i = 0; i < nseg; ++i) {
+        if (std::memcmp(back + d_off[i], src + s_off[i], (size_t)len[i]) != 0) ++bad;
+        const int64_t end = i + 1 < nseg ? d_off[i + 1] : d;
+        for (int64_t j = d_off[i] + len[i]; j < end; ++j)
+            if (back[j] != 0xA7) { ++smashed; break; }
+    }
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(smashed, 0);
+
+    rad_dev_free(src, RAD_MEM_HOST_PINNED);
+    rad_dev_free(dev, RAD_MEM_DEVICE);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
+}
+
+/* THE DMA QUEUE'S RING IS FINITE AND WRAPS. Thousands of lists of small copies write several times
+ * the ring's packets, so lists land across the wrap and behind a full ring; every copy must still
+ * arrive, at its own place. Every other list yields, so the gate's checks wrap as well. */
+TEST(memcpy_list_async_survives_its_ring_wrapping) {
+    const int lists = 1500, per = 64;
+    const int64_t each = 256, total = (int64_t)lists * per * each;
+    Stream st;
+    auto* src = (uint8_t*)rad_dev_alloc(total, RAD_MEM_HOST_PINNED);
+    auto* dev = (uint8_t*)rad_dev_alloc(total, RAD_MEM_DEVICE);
+    auto* back = (uint8_t*)rad_dev_alloc(total, RAD_MEM_HOST_PINNED);
+    CHECK(src && dev && back);
+    if (!src || !dev || !back) return;
+    fill(src, total, 0x3A11u);
+    CHECK_OK(rad_memset_async(dev, 0, total, st.s));
+    std::vector<RadCopySeg> segs((size_t)per);
+    for (int k = 0; k < lists; ++k) {
+        for (int i = 0; i < per; ++i) {
+            const int64_t at = ((int64_t)k * per + i) * each;
+            segs[(size_t)i] = RadCopySeg{src + (total - each - at), dev + at, each};   /* mirrored */
+        }
+        CHECK_OK(rad_memcpy_list_async(segs.data(), per, k & 1 ? RAD_COPY_YIELD : 0, st.s));
+    }
+    CHECK_OK(rad_memcpy_async(back, dev, total, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    int64_t bad = 0;
+    for (int64_t at = 0; at < total; at += each)
+        bad += std::memcmp(back + at, src + (total - each - at), (size_t)each) != 0;
+    CHECK_EQ(bad, (int64_t)0);
+    rad_dev_free(src, RAD_MEM_HOST_PINNED);
+    rad_dev_free(dev, RAD_MEM_DEVICE);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
+}
+
+/* THE ENGINE WRITES PAST THE L2 AND READS PAST IT. A card buffer small enough to stay in the L2 is
+ * read by a kernel, overwritten by a list and read again by a kernel on the same stream: the second
+ * read must see the list's bytes, not the lines the first left behind. And the other way: bytes a
+ * kernel has just written, still dirty in the L2, are what a list copying them to the host must read.
+ * Twelve rounds, each with new bytes. The inbound list yields, which cuts its one copy into pieces
+ * that must join up exactly. */
+TEST(memcpy_list_async_is_ordered_against_the_l2_both_ways) {
+    const int64_t n = 4 << 20;
+    Stream st;
+    auto* src  = (uint8_t*)rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+    auto* back = (uint8_t*)rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+    auto* a    = (uint8_t*)rad_dev_alloc(n, RAD_MEM_DEVICE);
+    auto* b    = (uint8_t*)rad_dev_alloc(n, RAD_MEM_DEVICE);
+    CHECK(src && back && a && b);
+    if (!src || !back || !a || !b) return;
+    int stale = 0, lost = 0;
+    for (int r = 0; r < 12; ++r) {
+        fill(src, n, 0x1000u + (uint32_t)r);
+        CHECK_OK(rad_memset_async(a, 0x40 + r, n, st.s));
+        CHECK_OK(rad_memcpy_async(b, a, n, st.s));                  /* a's lines into the L2 */
+        const RadCopySeg in{src, a, n};
+        CHECK_OK(rad_memcpy_list_async(&in, 1, RAD_COPY_YIELD, st.s));   /* in pieces */
+        CHECK_OK(rad_memcpy_async(b, a, n, st.s));                  /* must read the list's bytes */
+        CHECK_OK(rad_memcpy_async(back, b, n, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        stale += std::memcmp(back, src, (size_t)n) != 0;
+
+        CHECK_OK(rad_memset_async(b, 0x80 + r, n, st.s));          /* dirty in the L2 */
+        const RadCopySeg out{b, back, n};
+        CHECK_OK(rad_memcpy_list_async(&out, 1, 0, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        for (int64_t i = 0; i < n; i += 4093)
+            if (back[i] != (uint8_t)(0x80 + r)) { ++lost; break; }
+    }
+    CHECK_EQ(stale, 0);
+    CHECK_EQ(lost, 0);
+    rad_dev_free(src, RAD_MEM_HOST_PINNED);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
+    rad_dev_free(a, RAD_MEM_DEVICE);
+    rad_dev_free(b, RAD_MEM_DEVICE);
+}
+
+/* A HELD LINK STOPS A YIELDING LIST UNTIL IT IS RELEASED. Stream `c` holds the link, then waits for
+ * a long chain of fills on `slow` before it releases; a yielding list on `t`, ordered behind the
+ * hold, can therefore finish only after the chain has. Without the gate the list -- 64 MiB, a few
+ * milliseconds -- is done long before the chain's tens of milliseconds of fills. A backend without a
+ * DMA engine holds nothing, which it shows by taking a second hold without complaint. */
+TEST(link_hold_stops_a_yielding_list_until_released) {
+    const int64_t n = 64 << 20, big = 256 << 20;
+    Stream c, t, slow;
+    Event held, chain;
+    CHECK_OK(rad_memcpy_list_async(nullptr, 0, 0, t.s));   /* the card's DMA queue, if it has one */
+    CHECK_OK(rad_link_hold(c.s, 1));
+    if (rad_link_hold(c.s, 1) == RAD_OK) return;   /* nothing to hold on this backend */
+    (void)rad_dev_last_error();
+    auto* src  = (uint8_t*)rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+    auto* dst  = (uint8_t*)rad_dev_alloc(n, RAD_MEM_DEVICE);
+    auto* back = (uint8_t*)rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+    auto* fat  = (uint8_t*)rad_dev_alloc(big, RAD_MEM_DEVICE);
+    CHECK(src && dst && back && fat);
+    if (!src || !dst || !back || !fat) { (void)rad_link_hold(c.s, 0); return; }
+    fill(src, n, 0x6A7Eu);
+    for (int k = 0; k < 40; ++k) CHECK_OK(rad_memset_async(fat, k, big, slow.s));
+    CHECK_OK(rad_event_record(chain.e, slow.s));
+    CHECK_OK(rad_event_record(held.e, c.s));
+    CHECK_OK(rad_event_wait(c.s, chain.e));
+    CHECK_OK(rad_link_hold(c.s, 0));
+    CHECK_EQ(rad_link_hold(c.s, 0), RAD_E_STATE);   /* a release must follow a hold */
+    (void)rad_dev_last_error();
+
+    CHECK_OK(rad_event_wait(t.s, held.e));
+    const RadCopySeg seg{src, dst, n};
+    CHECK_OK(rad_memcpy_list_async(&seg, 1, RAD_COPY_YIELD, t.s));
+    CHECK_OK(rad_stream_sync(t.s));
+    CHECK_EQ(rad_event_query(chain.e), 1);
+    CHECK_OK(rad_memcpy_async(back, dst, n, t.s));
+    CHECK_OK(rad_stream_sync(t.s));
+    CHECK(std::memcmp(back, src, (size_t)n) == 0);
+    CHECK_OK(rad_stream_sync(c.s));
+    CHECK_OK(rad_stream_sync(slow.s));
+    rad_dev_free(src, RAD_MEM_HOST_PINNED);
+    rad_dev_free(dst, RAD_MEM_DEVICE);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
+    rad_dev_free(fat, RAD_MEM_DEVICE);
+}
+
+/* A HOLD ENDED BY THE WORK IT COVERED. A collective that knows when its peers' bytes have landed
+ * takes one off the word itself (rad_link_gate) and the stream records it with mode 2, so no
+ * barrier follows. Here the host plays the collective: the word is odd once the hold has taken
+ * effect, even once ended, a yielding list behind it runs, and a second end is refused because
+ * nothing is held. */
+TEST(link_gate_word_ends_a_hold_from_the_work_it_covers) {
+    const int64_t n = 4 << 20;
+    Stream c, t;
+    CHECK_OK(rad_memcpy_list_async(nullptr, 0, 0, t.s));   /* the card's DMA queue, if it has one */
+    volatile long long* g = (volatile long long*)rad_link_gate(c.s);
+    if (!g) return;                                  /* nothing to hold on this backend */
+    CHECK_OK(rad_link_hold(c.s, 1));
+    CHECK_OK(rad_stream_sync(c.s));
+    CHECK_EQ((int)(*g & 1), 1);
+    *g = *g - 1;                                     /* what the launch does once its bytes land */
+    CHECK_OK(rad_link_hold(c.s, 2));
+    CHECK_EQ((int)(*g & 1), 0);
+    CHECK_EQ(rad_link_hold(c.s, 2), RAD_E_STATE);
+    (void)rad_dev_last_error();
+
+    auto* src  = (uint8_t*)rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+    auto* dst  = (uint8_t*)rad_dev_alloc(n, RAD_MEM_DEVICE);
+    auto* back = (uint8_t*)rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+    CHECK(src && dst && back);
+    if (!src || !dst || !back) return;
+    fill(src, n, 0x9A7Eu);
+    const RadCopySeg seg{src, dst, n};
+    CHECK_OK(rad_memcpy_list_async(&seg, 1, RAD_COPY_YIELD, t.s));
+    CHECK_OK(rad_memcpy_async(back, dst, n, t.s));
+    CHECK_OK(rad_stream_sync(t.s));
+    CHECK(std::memcmp(back, src, (size_t)n) == 0);
+    rad_dev_free(src, RAD_MEM_HOST_PINNED);
+    rad_dev_free(dst, RAD_MEM_DEVICE);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
 }
 
 TEST(memset_async) {

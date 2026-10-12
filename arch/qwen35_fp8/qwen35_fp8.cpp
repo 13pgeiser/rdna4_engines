@@ -1097,6 +1097,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, mlp_fold, mlp_add,
                                      mlp_ar_in, mlp_ar_out));
     }
+#if QWEN35_MOE
+    /* Each routed layer predicts the next one's experts at its router input (MoeFP8::xp_next). */
+    for (int64_t l = 0; l + 1 < m.n_main; ++l) m.layers[(size_t)l].mlp.xp_next = &m.layers[(size_t)l + 1].mlp;
+#endif
 
     m.op_final_norm = rw(b, RAD_OP(b, "rmsnorm",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),

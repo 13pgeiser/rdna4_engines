@@ -55,6 +55,14 @@ set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test)
 set(RAD_CHAT_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/chat)
 set(RAD_MEDIA_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/media)
 
+# libstdc++ AHEAD OF rad_core ON EVERY TEST'S LINK LINE. lld extracts an archive member to resolve
+# any undefined symbol, a shared library's imports included: ROCm 10.1's libamdhip64 imports
+# std::string::reserve, g++-14 emits that template weak in rad_graph.cpp.o, and what that object
+# needs in turn reaches dispatch.cpp.o, whose strong device calls replace the weak fakes sched_test,
+# ref_test and runtime_test run on -- with no link error, only a test on the wrong backend. With
+# libstdc++ first, the import resolves to it and no member is extracted for it.
+set(RAD_TEST_CORE stdc++ rad_core)
+
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
@@ -62,28 +70,28 @@ foreach(t ${RAD_TESTS})
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/core/util/rad_util.cpp)
   elseif(n IN_LIST RAD_TESTS_WITH_TOKREF)
     add_executable(${n} ${t})
-    target_link_libraries(${n} PRIVATE rad_tokref rad_core)
+    target_link_libraries(${n} PRIVATE rad_tokref ${RAD_TEST_CORE})
   elseif(n IN_LIST RAD_TESTS_WITH_TOOLS)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/tools/kfixture.cpp
                             ${CMAKE_SOURCE_DIR}/tools/opshapes.cpp)
-    target_link_libraries(${n} PRIVATE rad_core)
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/tools)
   elseif(n IN_LIST RAD_TESTS_WITH_R4D_HOST)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/libr4d/r4d_layout.cpp
                             ${CMAKE_SOURCE_DIR}/libr4d/r4d_fp8_layout.cpp)
-    target_link_libraries(${n} PRIVATE rad_core ${CMAKE_DL_LIBS})
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE} ${CMAKE_DL_LIBS})
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d)
     target_compile_options(${n} PRIVATE -ffp-contract=off)
   elseif(n IN_LIST RAD_TESTS_WITH_GBNF_ORACLE)
     add_executable(${n} ${t} ${CMAKE_CURRENT_SOURCE_DIR}/gbnf_oracle.cpp)
-    target_link_libraries(${n} PRIVATE rad_core)
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
     # The chat templates whose tool-call grammars the engine is held to the oracle on. Checked
     # in, because a template is a few kilobytes and the tokenizer beside it is not.
     target_compile_definitions(${n} PRIVATE
       RAD_GBNF_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data/gbnf")
   else()
     add_executable(${n} ${t})
-    target_link_libraries(${n} PRIVATE rad_core)
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
   endif()
   if(n IN_LIST RAD_TESTS_WITH_LEGACY)
     target_link_libraries(${n} PRIVATE rad_legacy_toolparse)

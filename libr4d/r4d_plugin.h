@@ -111,6 +111,9 @@ int     r4d_rad_attn_prefill_h256_gqa4_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa4_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa4_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa4_scratch(const RadArgs*);
+/* ...and its head_dim 64 prefill leg, LFM2's geometry, which serves every query length. */
+int     r4d_rad_attn_prefill_h64_gqa4_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h64_gqa4_bf16(const RadArgs*, RadStream);
 /* Twelve queries a KV head, head_dim 256 only -- Qwen3.8-Flash-Next's QSA layers. Same body,
  * different instantiation; r4d_attn_paged_h256_gqa12.hip is four lines. */
 int     r4d_rad_attn_prefill_h256_gqa12_fp8 (const RadArgs*, RadStream);
@@ -407,6 +410,7 @@ int r4d_rad_ngram_ids       (const RadArgs*, RadStream);
 int r4d_rad_ngram_ids_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_ple_gate        (const RadArgs*, RadStream);
 int r4d_rad_ple_conv        (const RadArgs*, RadStream);
+int r4d_rad_causal_conv1d   (const RadArgs*, RadStream);
 int r4d_rad_cast            (const RadArgs*, RadStream);
 int r4d_rad_gather_rows     (const RadArgs*, RadStream);
 int r4d_rad_gather_rows_u8  (const RadArgs*, RadStream);
@@ -440,6 +444,8 @@ int r4d_rad_rope            (const RadArgs*, RadStream);
 int r4d_rad_layernorm       (const RadArgs*, RadStream);
 int r4d_rad_layernorm_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_grid_embed      (const RadArgs*, RadStream);
+int r4d_rad_grid_embed_aa    (const RadArgs*, RadStream);
+int r4d_rad_grid_embed_aa_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_grid_embed_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);
 int r4d_rad_gemm_nt_bias    (const RadArgs*, RadStream);
 int r4d_rad_gemm_nt_bias_describe(const RadArgs*, RadStream, RadLaunchDesc*, int, int*);

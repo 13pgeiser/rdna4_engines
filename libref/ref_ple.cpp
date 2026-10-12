@@ -219,19 +219,17 @@ int ref_ple_gate(const RadArgs* a, RadStream) {
  * several would hand a step that accepted only the first of them a history ending at a rejected
  * draft, and one that accepted two a slot nothing wrote.
  */
-int ref_ple_conv(const RadArgs* a, RadStream) {
-    /* NINE positions, four of them optional, so the count is checked and the optionals are tested
-     * one by one -- `have()` would refuse the op for an absent operand that is allowed to be. */
-    if (a->n_t < 9) return RAD_E_INVAL;
-    const RadTensor* x     = t_in(a, 0);
-    const RadTensor* w     = t_in(a, 1);
-    const RadTensor* cs    = t_in(a, 2);
-    const RadTensor* cu    = t_in(a, 3);
-    const RadTensor* resid = t_in(a, 4);      /* optional */
-    const RadTensor* sidx  = t_in(a, 5);      /* optional */
-    const RadTensor* hini  = t_in(a, 6);      /* optional */
-    const RadTensor* nacc  = t_in(a, 7);      /* optional */
-    const RadTensor* y     = t_in(a, 8);
+/* THE DEPTHWISE CAUSAL CONVOLUTION AND ITS ROLLING WINDOW, shared by `ple_conv` (dilated, silu,
+ * an optional residual) and `causal_conv1d` (LFM2's short convolution: undilated, no activation,
+ * no residual). One body, so the two ops cannot disagree about the window's layout. */
+struct ConvArgs {
+    const RadTensor *x, *w, *cs, *cu, *resid, *sidx, *hini, *nacc, *y;
+    bool silu;
+};
+
+static int depthwise_causal_conv(const RadArgs* a, const ConvArgs& o) {
+    const RadTensor *x = o.x, *w = o.w, *cs = o.cs, *cu = o.cu, *resid = o.resid;
+    const RadTensor *sidx = o.sidx, *hini = o.hini, *nacc = o.nacc, *y = o.y;
     if (!x || !w || !cs || !cu || !y) return RAD_E_INVAL;
 
     const int64_t n    = p_int(a, "n", 0);
@@ -303,7 +301,7 @@ int ref_ple_conv(const RadArgs* a, RadStream) {
                 acc += v * ldt(w, c * wrow + j * wcol);
             }
             const float r = resid ? ldt(resid, (bos + t) * rrow + c * rcol) : 0.0f;
-            stt(y, (bos + t) * yrow + c * ycol, r + act_silu(acc));
+            stt(y, (bos + t) * yrow + c * ycol, r + (o.silu ? act_silu(acc) : acc));
         }
     }
 
@@ -344,4 +342,20 @@ int ref_ple_conv(const RadArgs* a, RadStream) {
         }
     }
     return RAD_OK;
+}
+
+int ref_ple_conv(const RadArgs* a, RadStream) {
+    /* NINE positions, four of them optional, so the count is checked and the optionals are tested
+     * one by one -- `have()` would refuse the op for an absent operand that is allowed to be. */
+    if (a->n_t < 9) return RAD_E_INVAL;
+    return depthwise_causal_conv(a, { t_in(a, 0), t_in(a, 1), t_in(a, 2), t_in(a, 3), t_in(a, 4),
+                                      t_in(a, 5), t_in(a, 6), t_in(a, 7), t_in(a, 8), true });
+}
+
+/* ple_conv's operands without `resid`, at dilation one and with no activation. */
+int ref_causal_conv1d(const RadArgs* a, RadStream) {
+    if (a->n_t < 8) return RAD_E_INVAL;
+    if (p_int(a, "dilation", 1) != 1) return RAD_E_INVAL;
+    return depthwise_causal_conv(a, { t_in(a, 0), t_in(a, 1), t_in(a, 2), t_in(a, 3), nullptr,
+                                      t_in(a, 4), t_in(a, 5), t_in(a, 6), t_in(a, 7), false });
 }

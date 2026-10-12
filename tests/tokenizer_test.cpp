@@ -23,6 +23,7 @@
 #include "llama/src/unicode.h"
 
 #include <atomic>
+#include <cstring>
 #include <cstdio>
 #include <map>
 #include <thread>
@@ -346,6 +347,58 @@ TEST(bpe_merges_as_worked_out_by_hand) {
         CHECK(encode_ref(*v, c.text, c.parse_special) == c.ids);
         if (got != c.ids) std::fprintf(stderr, "    '%s': %s\n", c.text, show_ids(got).c_str());
     }
+}
+
+/* `ignore_merges`: "abc" is a vocabulary entry the one merge cannot reach, so the flag is the only
+ * way to get it. It applies to each pre-token after the declared chain (the Lowercase normalizer
+ * and the whitespace split run first), and on both ByteLevel paths: the deferred one that merges
+ * raw bytes, and the materialised one a later Split forces. */
+TEST(bpe_ignore_merges_takes_a_whole_pretoken) {
+    const char* chains[] = {
+        R"({"type":"WhitespaceSplit"})",
+        R"({"type":"Sequence","pretokenizers":[{"type":"WhitespaceSplit"},)"
+        R"({"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]})",
+        R"({"type":"Sequence","pretokenizers":[{"type":"WhitespaceSplit"},)"
+        R"({"type":"ByteLevel","add_prefix_space":false,"use_regex":false},)"
+        R"({"type":"Split","pattern":{"String":" "},"behavior":"Removed"}]})",
+    };
+    for (const char* chain : chains)
+        for (const char* flag : { "", "\"ignore_merges\":false,", "\"ignore_merges\":true," }) {
+            const bool ignore = std::strstr(flag, "true") != nullptr;
+            const std::string js = std::string(R"({"normalizer":{"type":"Lowercase"},"pre_tokenizer":)") +
+                chain + R"(,"model":{"type":"BPE",)" + flag +
+                R"("vocab":{"a":0,"b":1,"c":2,"ab":3,"abc":4,"abc abc":5},"merges":["a b"]}})";
+            auto v = from_json(js.c_str());
+            REQUIRE(v != nullptr);
+            CHECK_EQ(v->build().ignore_merges, ignore);
+            Tokenizer t;
+            CHECK_OK(t.init(v));
+            const std::vector<int32_t> whole{ 4 }, merged{ 3, 2 };
+            for (int repeat = 0; repeat < 2; ++repeat) {   /* the second pass reads the caches */
+                CHECK(encode_new(t, "ABC") == (ignore ? whole : merged));
+                CHECK(encode_new(t, "ABCABC") == (std::vector<int32_t>{ 3, 2, 3, 2 }));
+                CHECK(encode_new(t, "ABC ABC") == (ignore ? std::vector<int32_t>{ 4, 4 }
+                                                          : std::vector<int32_t>{ 3, 2, 3, 2 }));
+            }
+            CHECK(encode_ref(*v, "ABC ABC") == encode_new(t, "ABC ABC"));
+        }
+}
+
+/* A control token read as text stays text: the flag must not turn its spelling back into the
+ * marker when the caller asked for specials not to be parsed. */
+TEST(bpe_ignore_merges_leaves_unparsed_control_tokens_as_text) {
+    auto v = from_json(R"JSON({
+      "added_tokens":[{"id":4,"content":"abc","special":true}],
+      "pre_tokenizer":{"type":"WhitespaceSplit"},
+      "model":{"type":"BPE","ignore_merges":true,
+               "vocab":{"a":0,"b":1,"c":2,"ab":3},"merges":["a b"]}
+    })JSON");
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    CHECK(encode_new(t, "abc", true) == (std::vector<int32_t>{ 4 }));
+    CHECK(encode_new(t, "abc", false) == (std::vector<int32_t>{ 3, 2 }));
+    CHECK(encode_ref(*v, "abc", false) == (std::vector<int32_t>{ 3, 2 }));
 }
 
 TEST(byte_fallback_and_unk_follow_the_declared_chain) {

@@ -332,6 +332,11 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   __shared__ unsigned short cvq[CV ? RU_CVT * RU_K : 1], cvk[CV ? RU_CVT * RU_K : 1];
   __shared__ unsigned short cvv[CV ? RU_CVT * RU_V : 1];
   __shared__ int cvlast;
+  /* THE KEY HEAD'S HISTORY FOR THE REWRITE AT THE END, parked here once its taps are computed: the
+   * two newest history entries and this step's inputs, one channel a thread. Held in registers they
+   * stay live across the whole token loop, ten values a thread that the loop's h, q and k leave no
+   * room for -- they went to scratch, and other values with them. */
+  __shared__ unsigned short cvh[CV ? (CS - 1 + RU_CVT) * THR : 1];
   /* THE TOKEN LOOP'S OWN GLOBAL READS, STAGED THE SAME WAY. Per token the loop reads `a` and `b`
    * (the decay and beta inputs, one scalar each) and the output gate's row, and at decode there
    * is well under a wave a SIMD to hide a load behind -- read in the loop, each is a full global
@@ -494,7 +499,11 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   // A NEGATIVE slot is the pad and ZERO IS A REAL SLOT -- see the same rule in
   // r4d_gdn_conv_w4_h128_bf16.hip. A `<= 0` test here loses the first sequence's state entirely.
   if (si < 0) return;
-  const int grp = row >> 5;                             // fixed 32-row group, see RU_FSTR
+  /* Fixed 32-row group, see RU_FSTR. One per WAVE: a wave's 32 threads are 16 consecutive rows from
+   * a multiple of 16, inside one group whatever VS is (a workgroup's first row is a multiple of
+   * NR >= 32). Said so to the compiler, the factor addresses it scales are scalar; as a lane value
+   * they were 64-bit VGPR offsets live across the token loop and reloaded from scratch there. */
+  const int grp = __builtin_amdgcn_readfirstlane(row >> 5);
 
   float h[RU_HK];
   {
@@ -571,6 +580,11 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       }
     };
     conv(cwa, cba, cha, cxa, (tid < RU_K ? cvq : cvk) + (tid & (RU_K - 1)));
+#pragma unroll
+    for (int i = 1; i < CS; ++i) cvh[(i - 1) * THR + tid] = cha[i];
+#pragma unroll
+    for (int t = 0; t < RU_CVT; ++t)
+      if (t < T) cvh[(CS - 1 + t) * THR + tid] = cxa[t];
     if (tid < RU_V) {
       conv(cwb, cbb, chb, cxb, cvv + tid);
       ru_conv_rewrite(spb, chb, cxb, T, cv.cs_tok);
@@ -808,7 +822,14 @@ void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
       __syncthreads();
       if (!cvlast) return;
     }
-    ru_conv_rewrite(spa, cha, cxa, T, cv.cs_tok);
+    unsigned short rh[CS], rx[RU_CVT];
+    rh[0] = 0;                                  /* never read: the oldest entry is shifted out */
+#pragma unroll
+    for (int i = 1; i < CS; ++i) rh[i] = cvh[(i - 1) * THR + tid];
+#pragma unroll
+    for (int t = 0; t < RU_CVT; ++t)
+      rx[t] = t < T ? cvh[(CS - 1 + t) * THR + tid] : (unsigned short)0;
+    ru_conv_rewrite(spa, rh, rx, T, cv.cs_tok);
   }
 }
 

@@ -32,6 +32,8 @@
 #                      the tree, where a plugin installs beside the engine under the same prefix;
 #                      radiance-config.cmake sets it to the found installation's home, so a plugin
 #                      built out of tree installs where that engine's loader scans.
+#   RAD_HIP_VOPD_REPEATABLE  ON when the HIP compiler's VOPD pairing is repeatable; unset is OFF,
+#                      which turns the pairing off on LLVM 24 (rad_hip_repeatable, below).
 
 # For CMAKE_INSTALL_DATADIR, below. Idempotent, and included here rather than left to the includer
 # because this file is what needs it: a consumer project has no reason to have included it, and the
@@ -154,6 +156,25 @@ function(rad_add_plugin name kind)
   endif()
 endfunction()
 
+# REPEATABLE DEVICE CODE ON LLVM 24. ROCm 10.1's clang (AMD clang 24) does not compile the same
+# source to the same code twice. Its post-RA scheduler pairs VALU instructions for dual issue
+# (VOPD), and the pairing pass (GCNVOPDUtils.cpp) caches each load's transitive load dependencies;
+# fusing a pair adds edges behind that cache, and which entries were cached before a fusion
+# follows the iteration order of a pointer-keyed set -- heap addresses. So every compile can pair
+# differently: r4d_hc_bf16.hip came out with a different .text on each of three builds, a kernel's
+# speed depends on which build it came from, and no comparison between two builds can be trusted.
+# LLVM 22 (ROCm 7.2) pairs without that cache and is repeatable.
+#
+# The image builds its compiler's libLLVM with the cache dropped after every fusion
+# (docker/llvm-vopd-pairing.patch) and says so with RAD_HIP_VOPD_REPEATABLE=ON. Any other LLVM 24
+# has the pairing turned off: repeatable, at a price -- 1.4 to 3.5% on the fp8 prefill tiles.
+function(rad_hip_repeatable tgt)
+  if(CMAKE_HIP_COMPILER_ID STREQUAL "Clang" AND CMAKE_HIP_COMPILER_VERSION VERSION_GREATER_EQUAL 24
+     AND NOT RAD_HIP_VOPD_REPEATABLE)
+    target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mllvm=-amdgpu-enable-vopd=false>)
+  endif()
+endfunction()
+
 # Mark a target's device sources as HIP and pin the architecture. -ffp-contract=off is mandatory
 # for any quantised cross-rank op: two ranks see the two dequantised products in the opposite order
 # and contracting either into an FMA makes them disagree by ~1 ULP, which breaks the
@@ -196,6 +217,7 @@ function(rad_hipify tgt)
   target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:--no-offload-compress>)
   target_link_options(${tgt} PRIVATE $<$<LINK_LANGUAGE:HIP>:--no-offload-compress>)
   target_link_libraries(${tgt} PRIVATE ${RAD_HIP_RUNTIME})
+  rad_hip_repeatable(${tgt})
 endfunction()
 
 # Narrow RAD_GPU_TARGETS to the architectures ONE kernel library actually serves. A library states

@@ -180,6 +180,14 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     /* AN EMBEDDING INPUT RUNS IN ONE STEP OR NOT AT ALL (Request::embed), so one longer than a
      * step could never be admitted and would wait for good. */
     if (r->embed && (int64_t)r->prompt.size() > cfg_.max_tok) return RAD_E_INVAL;
+    /* A SCORED PROMPT names real vocabulary rows, and one step's decision is all it needs:
+     * drafts would be proposed for a continuation nobody reads. */
+    if (r->token_scores) {
+        if (r->embed || r->token_scores->tokens.empty()) return RAD_E_INVAL;
+        for (int32_t t : r->token_scores->tokens)
+            if (t < 0 || t >= prog_->meta.n_vocab) return RAD_E_INVAL;
+        r->may_speculate = false;
+    }
     /* NO ENGINE BEHIND THE QUEUE ANY MORE. Accepting would leave the caller waiting on a step
      * that is never coming, so the sink is failed here -- it is the one thing the caller is
      * listening to -- and the refusal says why. */
@@ -708,7 +716,7 @@ int Scheduler::draft_ngram(SchedReq& s, int depth) const {
  * second clamp is a no-op on it. Reversing them would round a chunk PAST the checkpoint down and
  * then miss the boundary, which is the exact failure this is written to avoid. */
 int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
-                              int64_t* checkpoint_pos) const {
+                              int64_t* checkpoint_pos, int64_t keep_at) const {
     if (checkpoint_pos) *checkpoint_pos = -1;
     int64_t remaining = n_target - n_computed;
     if (remaining <= 0 || budget <= 0) return 0;
@@ -734,6 +742,13 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
                 want = tail - n_computed;
                 if (checkpoint_pos) *checkpoint_pos = tail;
             }
+        }
+        /* AND ONE WHERE THE REQUEST ASKED (Request::checkpoint_at), on its quantum: the end of a
+         * prefix other requests are about to start from. Same split as the interval's. */
+        const int64_t keep = keep_at / geo_.quantum * geo_.quantum;
+        if (keep > n_computed && keep <= n_computed + want && keep <= n_target) {
+            want = keep - n_computed;
+            if (checkpoint_pos) *checkpoint_pos = keep;
         }
     }
 
@@ -998,8 +1013,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
      * for nothing; the hit above is known by now, so the cap is on what really has to run. */
     const int64_t cap = r.embed ? budget   /* whole input or nothing: never held back (below) */
                                 : busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
-    int64_t want = plan_chunk(r.n_computed, target, cap, &ckpt);
-    if (cap < budget && want > 0) admit_full_ = plan_chunk(r.n_computed, target, budget, nullptr);
+    int64_t want = plan_chunk(r.n_computed, target, cap, &ckpt, r.checkpoint_at);
+    if (cap < budget && want > 0)
+        admit_full_ = plan_chunk(r.n_computed, target, budget, nullptr, r.checkpoint_at);
     /* The whole input or nothing this step (Request::embed): the next step starts with a whole
      * budget, and add_locked refused an input no budget holds. */
     if (r.embed && want < target - (int64_t)r.n_computed) want = 0;
@@ -1149,9 +1165,10 @@ const RadBatch* Scheduler::step() {
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
             const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),
                                          /*rows_only=*/shares == 0);
-            want = plan_chunk(r.n_computed, target, cap, &ckpt);
+            want = plan_chunk(r.n_computed, target, cap, &ckpt, r.checkpoint_at);
             if (cap < budget && want > 0 && capped_at < 0) {
-                const int64_t full = plan_chunk(r.n_computed, target, budget, nullptr);
+                const int64_t full = plan_chunk(r.n_computed, target, budget, nullptr,
+                                                r.checkpoint_at);
                 if (want < full) { capped_at = (int32_t)plan_.e.size(); capped_full = full; }
             }
             /* A PREFILL WITH NO ROOM LEFT DOES NOT STOP THE WALK. Under a quantum of budget it can
@@ -1411,7 +1428,7 @@ const RadBatch* Scheduler::step() {
         if (cfg_.busy_prefill_chunk > 0) limit = std::min(limit, std::max(had, cfg_.busy_prefill_chunk));
         int64_t ckpt = -1;
         const int64_t grown = e.ckpt_slot < 0 && limit > had
-            ? plan_chunk(r.n_computed, s.seq_len(), limit, &ckpt) : had;
+            ? plan_chunk(r.n_computed, s.seq_len(), limit, &ckpt, r.checkpoint_at) : had;
         if (grown > had && kv_->ensure(r.id, r.n_computed + grown) >= 0) {
             e.n_tokens = (int32_t)grown;
             e.produces_token = (r.n_computed + grown >= s.seq_len());
@@ -1557,6 +1574,18 @@ const RadBatch* Scheduler::step() {
 }
 
 /* ------------------------------------------------------------------ media */
+bool Scheduler::prefill_continues() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (stage_rows_ <= 0) return false;
+    for (const StepEntry& e : plan_.e) {
+        if (!e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
+            continue;
+        const int64_t left = reqs_[(size_t)e.slot]->seq_len() - ((int64_t)e.ctx_len + e.n_tokens);
+        if (left >= stage_rows_) return true;
+    }
+    return false;
+}
+
 bool Scheduler::media_ready(SchedReq& s) {
     bool ready = true;
     for (mm::Placed& p : s.req->media->items) {

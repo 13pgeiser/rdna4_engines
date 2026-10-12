@@ -145,11 +145,17 @@ static __device__ __forceinline__ void mxd_epilogue(
       for (int i = 0; i < DTM; ++i) {
         const int m = i * 16 + col;
         if (m < M) {
-          union { __hip_bfloat16 h[8]; mxd_u4 v; } o;
+          // rounded as (__hip_bfloat16) rounds, packed in whole registers (see bf16x2_rne_nan)
+          float v[8];
 #pragma unroll
           for (int e = 0; e < 8; ++e)
-            o.h[e] = (__hip_bfloat16)(ABLK ? acc[i][e] * sc[i] * rf[e] : acc[i][e] * rf[e] * sc[i]);
-          *(mxd_u4*)(C + (size_t)m * N + nb) = o.v;
+            v[e] = ABLK ? acc[i][e] * sc[i] * rf[e] : acc[i][e] * rf[e] * sc[i];
+          mxd_u4 o;
+          o.x = bf16x2_rne_nan(v[0], v[1]);
+          o.y = bf16x2_rne_nan(v[2], v[3]);
+          o.z = bf16x2_rne_nan(v[4], v[5]);
+          o.w = bf16x2_rne_nan(v[6], v[7]);
+          *(mxd_u4*)(C + (size_t)m * N + nb) = o;
         }
       }
     }
@@ -194,8 +200,23 @@ static __device__ __forceinline__ void mxd_epilogue(
   }
 }
 
+/* THE WAVES A SIMD EACH TILE SHAPE RUNS AT (R4D_WAVES): the register budget the decode tile was
+ * tuned at, by K block, M fragments and activation-scale form, so a compiler release cannot move
+ * it -- LLVM 24 adds two VGPRs to the DBK 64, three-fragment form and drops it from sixteen waves to
+ * twelve. Where LLVM 22 itself ran out of registers (DBK 128 at seven and eight fragments without
+ * block activation scales, 256 VGPRs and a spill) the budget is the one the tile reaches without
+ * spilling. */
+constexpr int mxd_waves(int dbk, int dtm, bool ablk) {
+  if (dbk == 64)
+    return dtm <= 3 ? 16 : dtm == 4 ? 12 : dtm == 5 ? 10 : dtm == 6 ? (ablk ? 9 : 10)
+         : dtm == 7 ? 9 : (ablk ? 8 : 9);
+  return dtm <= 3 ? 10 : dtm == 4 ? 8 : dtm == 5 ? (ablk ? 8 : 7) : dtm == 6 ? (ablk ? 8 : 6)
+       : 6;
+}
+
 template <int DBK, int DKS, int DTM, bool NT, bool ABLK>
-__global__ __launch_bounds__(R4D_MXD_DWN * 32) void r4d_gemm_mxfp4a8_decode_kernel(
+__global__ __launch_bounds__(R4D_MXD_DWN * 32) R4D_WAVES(mxd_waves(DBK, DTM, ABLK))
+void r4d_gemm_mxfp4a8_decode_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
     const unsigned char* __restrict__ Wref, float* __restrict__ P, unsigned* __restrict__ cnt,
@@ -314,7 +335,8 @@ __global__ __launch_bounds__(R4D_MXD_DWN * 32) void r4d_gemm_mxfp4a8_decode_kern
 // row's reference exponent is read once, not once a slab. Bit-identical to the kernel above at
 // every split: the K order, the fold and the reduction are unchanged.
 template <int DBK, int DKS, bool NT, bool ABLK>
-__global__ __launch_bounds__(R4D_MXD_DWN * 32) void r4d_gemm_mxfp4a8_decode1_kernel(
+__global__ __launch_bounds__(R4D_MXD_DWN * 32) R4D_WAVES(DBK == 64 ? 16 : 12)
+void r4d_gemm_mxfp4a8_decode1_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
     const unsigned char* __restrict__ Wref, float* __restrict__ P, unsigned* __restrict__ cnt,

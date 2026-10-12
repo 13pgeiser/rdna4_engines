@@ -60,6 +60,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         freeb        = std::min(freeb, f.free);
         b.arena      = std::max(b.arena, f.arena);
         b.staging    = std::max(b.staging, f.staging);
+        b.prefetch   = std::max(b.prefetch, f.prefetch);
         if ((int64_t)f.n_queues * f.queue_bytes > b.queues) {
             b.queues      = (int64_t)f.n_queues * f.queue_bytes;
             b.n_queues    = f.n_queues;
@@ -111,7 +112,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     /* What is left after the terms nobody gets to spend. */
     b.drift = kDriverDrift;
     b.claimable = b.capacity - (b.already_held + b.drift + b.headroom + b.arena + b.staging +
-                                b.queues);
+                                b.queues + b.prefetch);
 
     if (b.claimable < 0) {
         b.report = fmt(
@@ -123,6 +124,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
             "  step staging       %10s   (block tables, media and KV tier staging)\n"
             "  hardware queues    %10s   (%d at %s each, measured)\n"
+            "  expert prefetch    %10s   (its ring of expert units and buffers)\n"
             "  ------------------------------\n"
             "  SHORT BY           %10s\n"
             "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
@@ -130,7 +132,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
-            humanb(-b.claimable).c_str());
+            humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str());
         if (log) RAD_ERR("%s", b.report.c_str());
         if (out) *out = b;
         return RAD_E_NOMEM;
@@ -271,7 +273,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      * the headroom. */
     const int64_t granted   = cfg.vram_weights_mib * kMiB + cfg.vram_kv_mib * kMiB;
     const int64_t unclaimed = b.capacity - b.already_held - b.drift - b.arena - b.staging - b.queues -
-                              b.stage - granted;
+                              b.prefetch - b.stage - granted;
     const double  ela       = b.elastic > 0 ? (double)b.elastic : 1.0;
     b.report = fmt(
         "VRAM budget, per card:\n"
@@ -282,6 +284,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         "  step staging       %10s   the step batch's block tables and media staging, and the\n"
         "                                  KV tiers' copy staging\n"
         "  hardware queues    %10s   %d a card at %s each, measured: the engine's streams\n"
+        "  expert prefetch    %10s   the next-layer prefetch's ring of expert units and buffers\n"
         "  %-18s %10s   %s\n"
         "  ------------------------------\n"
         "  claimable          %10s\n"
@@ -299,7 +302,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         "                                  could not place\n",
         humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
         humanb(b.arena).c_str(), humanb(b.staging).c_str(),
-        humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
+        humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(), humanb(b.prefetch).c_str(),
         shared ? "left to the host" : "--gpu-headroom-mib", humanb(b.headroom).c_str(),
         shared ? "integrated graphics: this memory is the host's"
                : "left unclaimed on purpose",

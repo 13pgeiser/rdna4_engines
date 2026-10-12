@@ -45,6 +45,7 @@
  * the slot has retired.
  */
 #pragma once
+#include "../device/device.h"
 #include "../device/directio.h"
 #include "../mem/pools.h"
 #include "heat.h"
@@ -212,6 +213,25 @@ public:
         }
         return got;
     }
+    /* take(), restricted to the free slots `want` accepts: the lowest of them, or -1. A scan of
+     * the free list, which holds the slots on their way back through a swap -- a few dozen. */
+    template <class Want> int64_t take_where(Want want) {
+        size_t best = free_.size();
+        for (size_t i = 0; i < free_.size(); ++i) {
+            const int64_t s = free_[i];
+            if (!covered(s) || held_[(size_t)s] || !want(s)) continue;
+            if (best == free_.size() || s < free_[best]) best = i;
+        }
+        if (best == free_.size()) return -1;
+        const int64_t s = free_[best];
+        free_[best] = free_.back();
+        free_.pop_back();
+        std::make_heap(free_.begin(), free_.end(), std::greater<int64_t>());
+        held_[(size_t)s] = 1;
+        ++n_held_;
+        --n_usable_;
+        return s;
+    }
     /* The highest slot of segment `k` something holds -- a unit, a copy in flight, a slot in
      * quarantine -- or -1. A scan down from the segment's mark. */
     int64_t top_held(int k = 0) const {
@@ -356,6 +376,13 @@ struct MoverConfig {
      * layer. */
     int max_lead_dispatches = 2;
 
+    /* Lent slots kept free for swaps to land in, a slab class (planner.h's
+     * RAD_PLACE_TURNOVER_SLOTS; Mover::balance keeps them). A knob here and not in the plan because the planner charges
+     * nothing for them: they are the KV cache's memory, free only while it lends. A class whose
+     * shadow slots the quarter-of-the-slab cap cut keeps at most the same multiple of them, so a
+     * small loan is not left emptier than it is filled. */
+    int turnover_slots = RAD_PLACE_TURNOVER_SLOTS;
+
     /* The container, for the file tier. Empty means there is no file tier and a unit the planner
      * put there is an error rather than a slow path. */
     std::string container_path;
@@ -393,10 +420,16 @@ struct MoverStats {
     /* Demotions that copied nothing: the unit sat in a lent slot and kept its host copy, so going
      * back to the host tier was a change of address. Counted inside `demotions` as well. */
     uint64_t dropped = 0;
+    /* Host copies a unit in a lent slot gave to a budgeted victim that had no pool slot to go to
+     * (Mover::donor_slot), and such units moved rather than dropped when their loan was recalled
+     * or shrank. */
+    uint64_t donated = 0, relocated = 0;
     uint64_t ssd_reads = 0, ssd_bytes = 0;
     /* The prefill stager's copies (stage_units): layers staged, units and bytes copied, and
-     * pooled units a buffer had no room left for -- those were read across the link in place. */
+     * pooled units a buffer had no room left for -- those were read across the link in place.
+     * `stage_copies` is how many copies carried the units: neighbouring pool slots go as one. */
     uint64_t stage_layers = 0, staged_units = 0, staged_bytes = 0, stage_overflow = 0;
+    uint64_t stage_copies = 0;
     /* The file stager's reads (stage_file_units): routed layers read from the container, the
      * units and bytes they carried, the preads that carried them, and the host time spent inside
      * those reads and waiting for a window's copies to drain -- the two halves of what a step
@@ -547,6 +580,13 @@ public:
     int64_t flex_used_bytes() const { return flex_used_.load(std::memory_order_relaxed); }
     int64_t flex_offered_bytes() const { return flex_offered_.load(std::memory_order_relaxed); }
     int64_t flex_capacity() const;
+    /* The lent slots the fill leaves free for the engine to swap into
+     * (MoverConfig::turnover_slots), summed over the slab classes. */
+    int64_t turnover_slots() const {
+        int64_t n = 0;
+        for (const ClassPools& cp : pools_) n += cp.n_turn;
+        return n;
+    }
     /* THE LOAN PAST WHICH NOTHING MORE WOULD BE USED, in the lender's measure: the one that
      * covers every slot carved from it. The slots were carved no deeper than the units the host
      * pool holds, so a loan this size already has room for every unit that could move -- more VRAM
@@ -556,14 +596,38 @@ public:
     /* FILL EVERY SLOT THERE IS ROOM IN, AND EMPTY EVERY SLOT THE LOAN NO LONGER COVERS -- the
      * half-swaps the heat engine never proposes, because its decision is a COMPARISON and a
      * comparison needs a victim. Not bounded by a count: a slot left empty while a unit streams
-     * across the link is VRAM bought and wasted on every step, so every free slot is filled in
-     * one call, hottest units first, and the copies run at the rate the link carries them. */
-    int balance(HeatEngine* heat);
+     * across the link is VRAM bought and wasted on every step, so every free slot past the
+     * turnover slots is filled in one call, hottest units first, and the copies run at the rate
+     * the link carries them. The turnover slots are left free because the engine's swaps land in
+     * them; filled, they would cap the move rate at what the shadow slots alone allow. When fewer
+     * than the working and turnover slots are free, the coldest lent units are dropped until
+     * enough are -- a change of address, never a copy.
+     *
+     * `turnover` false treats the turnover slots as room, filled like any other: a step bound by
+     * its own staging copies swaps nothing (Engine::tiering_dispatch), and every unit resident is
+     * one its stager does not copy. The next call with it true drops them back out. */
+    int balance(HeatEngine* heat, bool turnover = true);
 
     /* balance() for a rank with no step to ride on. Retires what has landed and fills what is
      * free, so a loan made while the server is idle is filled before the next request rather
-     * than by it. Only while the rank thread is parked. */
+     * than by it -- the turnover slots too while they are held. Only while the rank thread is
+     * parked. */
     int idle_tick(HeatEngine* heat);
+    /* Whether idle ticks keep the turnover slots filled: the engine holds them through a prompt
+     * and the few steps after it (Engine::tiering_dispatch). */
+    void hold_turnover(bool held) { hold_turnover_ = held; }
+    /* Each class's pinned pool as the card addresses it: [lo, hi) and the unit stride. At most `max`. */
+    int pool_ranges(uint64_t* lo, uint64_t* hi, uint64_t* stride, int max) const {
+        int n = 0;
+        for (const ClassPools& cp : pools_)
+            if (cp.pool_dev && cp.stride > 0 && n < max) {
+                lo[n] = (uint64_t)(uintptr_t)cp.pool_dev;
+                hi[n] = lo[n] + (uint64_t)cp.pool.size() * (uint64_t)cp.stride;
+                stride[n] = (uint64_t)cp.stride;
+                ++n;
+            }
+        return n;
+    }
 
     /* Where a unit's bytes are right now, as a device-visible address, or null for a file-tier
      * unit that has not been staged. */
@@ -587,10 +651,20 @@ public:
      * unstage_units publish those units at their pool slots again. The caller must already have
      *               ordered the next writer of `dst` behind every op that read the copies; this
      *               only moves the address the NEXT issue resolves.
+     * stage_need    the room stage_units would fill with `units` given room for all of them, so
+     *               a caller packing several layers into one region can size each one's share;
+     *               `largest`, when not null, gets the room the largest of those units takes.
+     *
+     * The span form packs into up to two stretches, the second taking what the first has no
+     * room left for: a ring's place that wraps past the region's end is two.
      */
+    struct StageSpan { char* dst; int64_t cap; };
     int  stage_units(const std::vector<int32_t>& units, char* dst, int64_t cap, RadEvent after,
                      RadEvent done, std::vector<int32_t>* staged);
+    int  stage_units(const std::vector<int32_t>& units, const StageSpan* spans, int n_spans,
+                     RadEvent after, RadEvent done, std::vector<int32_t>* staged);
     void unstage_units(const std::vector<int32_t>& staged);
+    int64_t stage_need(const std::vector<int32_t>& units, int64_t* largest = nullptr) const;
 
     /* ---- ROUTED LAYERS READ FROM THE CONTAINER: the file stager (core/place/stager.h) --------
      *
@@ -629,18 +703,22 @@ private:
      * mid-layer, because placement would then depend on host timing and stop being reproducible. */
     struct Move {
         enum class State { Free, Copying, Published, Quarantine };
-        /* Five kinds, one state machine. Promote and Demote are the heat engine's swaps. Stage is
+        /* Six kinds, one state machine. Promote and Demote are the heat engine's swaps. Stage is
          * the exact prefetch bringing an offloaded unit into a slot. Release is the same slot
          * going back once the declared order says nothing will read it again this step -- it
          * copies nothing and still needs the quarantine, because the barrier is about kernels
          * already issued and not about bytes in flight. Drop is a unit in a lent slot going back
-         * to the host copy it kept: no copy either, and the same quarantine for the same reason. */
-        enum class Kind { Promote, Demote, Stage, Release, Drop };
+         * to the host copy it kept: no copy either, and the same quarantine for the same reason.
+         * Migrate is a donor (Mover::donor_slot) leaving a lent slot the loan no longer covers
+         * for a free budgeted one, a copy inside the card; `slab_slot` is the slot it leaves and
+         * `to_slot` the one it lands in. */
+        enum class Kind { Promote, Demote, Stage, Release, Drop, Migrate };
         State    state = State::Free;
         Kind     kind = Kind::Promote;
         int32_t  unit = -1;
         int64_t  slab_slot = -1;
         int64_t  pool_slot = -1;
+        int64_t  to_slot = -1;
         RadEvent ev = nullptr;
     };
 
@@ -672,6 +750,11 @@ private:
         int64_t  stride = 0;
         int64_t  n_fixed = 0;          /* slots in the budgeted range; the flex ones start here */
         int64_t  n_work = 0;           /* shadow + staging: free slots the mover needs to move at all */
+        int64_t  n_turn = 0;           /* lent slots kept free past those: the fill stops short
+                                        * of them and balance() drops lent units to rebuild them
+                                        * (MoverConfig::turnover_slots) */
+        int64_t  n_donated = 0;        /* units in lent slots that gave their host copy away
+                                        * (Mover::donor_slot); at most n_turn of them */
         std::vector<char*>   flex_ptr;
         /* ONE SEGMENT OF THE SLAB PER LENDER THAT CARVED SLOTS FOR THIS CLASS. `need[i]` is the
          * loan, in the lender's measure, that covers the segment's i-th slot; ascending, so a
@@ -703,11 +786,36 @@ private:
     RadStream mover_ = nullptr;
     RadStream compute_ = nullptr;
     RadEvent  gate_ = nullptr;          /* recorded on compute, waited on by the mover stream */
+    std::vector<RadCopySeg> stage_segs_;   /* stage_units' list, kept so a layer allocates nothing */
+    struct StagePick { const char* src; int32_t u; int64_t bytes, need; char* dst; };
+    std::vector<StagePick>  stage_picks_;  /* the units stage_units may take, in pool order */
     int       gate_dispatch_ = -1;
 
+    /* A DISPATCH'S SWAP COPIES -- demotions, promotions and migrations -- GO TO THE CARD'S DMA ENGINE
+     * AS ONE LIST (flush_moves), sent at the end of balance() and before anything reads their events.
+     * Each move's event is recorded behind the list, so a move lands with its list. */
+    std::vector<RadCopySeg> move_segs_;
+    std::vector<int32_t>    move_recs_;
+    int  queue_move_copy(void* dst, const void* src, int64_t bytes, int rec);
+    int  flush_moves();
     std::vector<ClassPools> pools_;
     std::vector<UnitState>  unit_;
     std::vector<Move>       moves_;
+    /* Per unit, how many records are Copying it: unit_in_flight() without a walk of the records.
+     * The prefill stager asks for every pooled unit of every layer it stages, and the records
+     * number twice the slots a swap can hold, so a walk would grow with the move budget. */
+    std::vector<uint16_t>   copying_;
+    /* balance()'s drop candidates, (heat, unit), kept between calls so a step allocates nothing. */
+    std::vector<std::pair<float, int32_t>> drop_cand_;
+    bool hold_turnover_ = false;
+    /* donor_slot()'s candidates a class, by layer, each layer's coldest first so its hottest is at
+     * the back; ranked once a dispatch, `at` being the dispatch they were ranked for. */
+    struct DonorRank { int at = -1; std::vector<std::vector<std::pair<float, int32_t>>> by_layer; };
+    std::vector<DonorRank> donors_;
+    /* The layer whose unit each pool slot held when the pool was laid out, a class: the pool is
+     * filled in unit order, so a layer's pooled units start out side by side (pool_slot_for). */
+    std::vector<std::vector<int32_t>> pool_layer_;
+    int32_t n_layers_ = 0;
 
     void*   static_vram_ = nullptr;
     int64_t static_bytes_ = 0;
@@ -756,6 +864,15 @@ private:
     bool unit_in_flight(int32_t unit) const;
     /* A unit in a lent slot back to the host copy it kept. See Move::Kind::Drop. */
     int  drop(int32_t unit, HeatEngine* heat);
+    /* The pool slot a demotion copies `unit` into: one its layer's units started out in, else a
+     * same-layer donor's, else any free one, else any donor's; -1 when there is none. */
+    int64_t pool_slot_for(int32_t unit, HeatEngine* heat);
+    /* A pool slot for a budgeted victim when the pool has none free: the host copy of a unit in a
+     * slot the KV cache lent, which keeps its place in VRAM without one -- a unit of `layer`, or
+     * of any layer when it is negative. -1 when no unit may give one. See the definition. */
+    int64_t donor_slot(size_t klass, int32_t layer, HeatEngine* heat);
+    /* A donor out of a lent slot into a free budgeted one, if one is free: false when none is. */
+    bool migrate(int32_t unit, HeatEngine* heat);
     /* One promotion out of the unit's pool slot into `slot`, which the caller has taken. */
     int  promote_to(int32_t unit, int64_t slot);
     /* Promote the hottest pooled units of one class into up to `room` free slots. */

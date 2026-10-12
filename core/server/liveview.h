@@ -89,8 +89,10 @@ struct ExpertPlane {
     int64_t routed = 0, routed_resident = 0;
     int64_t no_record = 0, starved_slab = 0, starved_pool = 0, quarantined = 0;
     /* The prefill stager's copies (Mover::stage_units), rank 0: layers staged, units and bytes
-     * copied onto the card, and pooled units a buffer had no room for. */
+     * copied onto the card, pooled units a buffer had no room for, and the copies that carried
+     * the units. */
     int64_t stage_layers = 0, staged_units = 0, staged_bytes = 0, stage_overflow = 0;
+    int64_t stage_copies = 0;
     /* HOW MUCH OF THE SLAB IS BORROWED. `flex_bytes` is what the slab holds in VRAM the KV cache
      * lent it; `flex_capacity` is how much the cache is lending right now. The pair is what says
      * whether the boundary between the two pools is moving, and whether what was lent is being

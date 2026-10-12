@@ -3,8 +3,8 @@
 # did not write.
 #
 # FILE... are the paths, in the build image, of every file copied into ROOT from outside the
-# radiance install: the shared libraries, comgr, busybox, the GPU name table. Each is traced to the
-# package that installed it, or to the FFmpeg stage's /opt/ffmpeg. Every package's license files
+# radiance install: the shared libraries, comgr, busybox, curl, jq and the CA bundle's directory.
+# Each is traced to the package that installed it, or to the FFmpeg stage's /opt/ffmpeg. Every package's license files
 # are copied to ROOT/usr/share/doc/<package>/, the license texts Debian's copyright files refer to
 # go to ROOT/usr/share/common-licenses/, and ROOT/usr/share/doc/THIRD-PARTY lists each component
 # with its version, its license files and where its source is. A file that no package owns, or a

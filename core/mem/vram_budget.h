@@ -81,6 +81,9 @@ struct VramFacts {
      * times the ring). */
     int     n_queues    = 0;
     int64_t queue_bytes = 0;
+    /* THE NEXT-LAYER EXPERT PREFETCH's ring of expert units and its buffers (xprefetch.h), where it
+     * will be on; its stream is one of `n_queues`. */
+    int64_t prefetch    = 0;
     int64_t kv_ceiling = 0;   /* KVManager::ceiling(max_ctx) for this rank's declared groups */
     int64_t kv_fixed   = 0;   /* KVManager::fixed_bytes(): the part of the ceiling that is state */
     /* weight_footprint() for this rank, which under tensor parallel is already this card's even
@@ -111,6 +114,7 @@ struct VramBudget {
     int64_t capacity = 0, already_held = 0, headroom = 0, arena = 0, staging = 0;
     int64_t drift = 0;                /* kDriverDrift: what already_held moves by after it is read */
     int64_t queues = 0;               /* n_queues * queue_bytes, from the rank that needs most */
+    int64_t prefetch = 0;             /* the expert prefetch's ring and buffers */
     int     n_queues = 0;
     int64_t queue_bytes = 0;
     int64_t claimable = 0;            /* after the fixed terms above */

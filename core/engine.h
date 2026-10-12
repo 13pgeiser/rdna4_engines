@@ -22,6 +22,7 @@
 #pragma once
 #include "rad_core.h"
 #include "build/startup.h"
+#include "diag/diag.h"
 #include "mem/hostarena.h"
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
@@ -69,6 +70,20 @@ public:
 
     const Program& program() const;
     const Config&  config()  const { return cfg_; }
+
+    /* THE STARTUP REPORT (core/diag/diag.h): every option with the value in force and its source,
+     * the machine, and what on it costs speed or correctness. serve() prints it before it starts
+     * listening with `status` RAD_OK; main prints it with the error start() or serve() stopped
+     * with, so a log of a server that never came up still says what it was running on and what
+     * it had decided -- and ends with that error again on an E line, because the report's lines
+     * now follow the one that said it and a reader of the log's tail would see only them. */
+    void print_startup_report(int status);
+    /* The same, as JSON, with the hardware read again -- a card's link and clock are only
+     * meaningful under load, and /diagnostics is how they are read while a request runs. The
+     * reading is reused for a second, and covers the power-management files of the serving
+     * cards only (hardware_facts). */
+    std::string diagnostics_json() const;
+    bool startup_report_printed() const { return report_printed_; }
 
 private:
     /* One thread per tensor-parallel rank, each owning one device. No IPC, no shared-memory
@@ -218,6 +233,14 @@ private:
      * the device cannot reach until the whole forward pass has run, and that pass is the time the
      * walk hides inside. This is a one-shot gate per step, reset while the ranks are parked at the
      * release, so there is no window in which a rank can read a stale ready flag. */
+    /* THIS STEP'S SCORED ROWS (Request::token_scores): a logits row and the result it fills.
+     * Written by the scheduler thread while the ranks are parked, read by them during the step,
+     * consumed by collect_step. */
+    std::vector<std::pair<int32_t, TokenScores*>> score_rows_;
+    int  stage_scored_rows(const StepPlan& plan, const StepOut& so);
+    int  issue_scored_rows(Rank& r);
+    int  collect_scored_rows();
+
     std::mutex                    build_mu_;
     std::condition_variable       build_cv_;
     bool                          build_ready_  = false;
@@ -383,6 +406,49 @@ private:
     std::vector<int64_t> kld_vocab0_, kld_width_;   /* per rank read: its logits columns */
     /* The engine half of /server_info, as a JSON object. See the definition in engine.cpp. */
     std::string engine_info() const;
+
+    /* ---- what the startup report says about the run (engine_diag.cpp). `decisions_` holds each
+     * value startup resolved and why, recorded where it was resolved; the rest are the facts a
+     * check needs that only startup saw. */
+    std::vector<diag::Decision> decisions_;
+    void decide(const std::string& key, const std::string& value, const std::string& why) {
+        diag::decide(&decisions_, key, value, why);
+    }
+    std::string devnote_;            /* the devices usable_devices left out, and why */
+    int         p2p_measured_ = -1;  /* 1 peer to peer, 0 through host memory, -1 not asked */
+    std::string p2p_blocked_;
+    bool        has_ngram_ = false;  /* the model carries an n-gram table */
+    std::string prefix_off_why_;     /* why the engine itself turned prefix caching off, or "" */
+    std::vector<std::string> env_set_;   /* the RADIANCE_* names set when the engine was made */
+    bool        report_printed_ = false;
+    /* THE RUNTIME'S DEVICES, ASKED ONCE, in start() beside usable_devices, which reads every
+     * device's properties anyway. A report printed after start() failed -- possibly after a device
+     * fault -- then makes no runtime call at all, and /diagnostics, on an HTTP thread, makes none
+     * either: a runtime call there can wait on a lock the launch path holds
+     * (DeviceBackend::vram_used says the same of the dashboard). What only the runtime knows --
+     * each device's PCI address, its name, whether it is integrated, and the runtime's version --
+     * is kept from that one reading. */
+    struct DevId { int device = -1; std::string bdf, name; bool integrated = false; };
+    std::vector<DevId> dev_ids_;
+    std::string        runtime_version_;
+    void identify_devices(const std::vector<std::string>& names);
+    /* WHAT ONLY A SYSTEM CALL ANSWERS (diag::probe_process), asked once when the report is first
+     * printed: the memlock limit cannot change under a running process, and the io_uring probe is
+     * a syscall that /diagnostics has no reason to repeat on every request. */
+    bool        probed_ = false;
+    int64_t     memlock_soft_ = -1;
+    std::string io_uring_;
+    /* THE MACHINE AS /diagnostics LAST READ IT, kept for kDiagReuseNs. The card files are answered
+     * by the SMU under the driver's power-management lock, so a client polling the endpoint must
+     * not turn into a stream of SMU requests beside the serving process; a second's staleness is
+     * nothing to a reading of links and clocks. */
+    mutable std::mutex  diag_mu_;
+    mutable diag::Facts diag_facts_;
+    mutable uint64_t    diag_read_ns_ = 0;
+    /* `serving`: read the power-management files of the cards the ranks serve on only
+     * (diag::collect's `managed`), which is how a running server reads them. */
+    diag::Facts    hardware_facts(bool serving) const;
+    diag::RunFacts run_facts(bool failed) const;
 
     /* One dispatch of the tiering seam: retire what landed, credit last step's routing and issue
      * what the heat engine proposes. A member because Rank is private, and a no-op on a static

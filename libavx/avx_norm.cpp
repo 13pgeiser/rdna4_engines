@@ -284,3 +284,67 @@ AVX_KERNEL(grid_embed) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ grid_embed_aa */
+/* The table resampled as torch's F.interpolate(bilinear, align_corners=False, antialias=True) does
+ * it -- SigLIP2's position embedding -- and added in: libref's grid_embed_aa, operation for
+ * operation. Per axis a triangle filter on half-pixel centres, widened by the scale when
+ * shrinking, its taps inside the table normalised; the rows summed first, f32, rounded once
+ * before the add. A coordinate outside its grid is clamped into it. */
+static void aa_taps(int64_t at, int64_t size, int64_t side, float* w, int64_t* lo, int64_t* cnt) {
+    if (size < 1) size = 1;
+    at = at < 0 ? 0 : (at >= size ? size - 1 : at);
+    const float scale = (float)side / (float)size;
+    const float support = scale > 1.0f ? scale : 1.0f, inv = 1.0f / support;
+    const float center = scale * ((float)at + 0.5f);
+    int64_t a = (int64_t)(center - support + 0.5f), b = (int64_t)(center + support + 0.5f);
+    if (a < 0) a = 0;
+    if (b > side) b = side;
+    float total = 0.0f;
+    for (int64_t j = a; j < b; ++j) {
+        const float d = std::fabs(((float)j - center + 0.5f) * inv);
+        w[j - a] = d < 1.0f ? 1.0f - d : 0.0f;
+        total += w[j - a];
+    }
+    for (int64_t j = a; j < b; ++j) w[j - a] = total != 0.0f ? w[j - a] / total : 0.0f;
+    *lo = a;
+    *cnt = b > a ? b - a : 0;
+}
+
+AVX_KERNEL(grid_embed_aa) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
+    const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
+    const int64_t side = p_int(a, "side", 0);
+    if (n <= 0 || side <= 0 || numel(tab) < side * side * n) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < rows)
+        return RAD_E_SHAPE;
+    const int64_t cs = crd->stride[0], ms = crd->stride[1];
+    const int64_t ts = laststride(tab);
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t g[4];
+        for (int c = 0; c < 4; ++c) g[c] = ldi(crd, c * cs + r * ms);
+        float* wh = scratch_f32((size_t)(2 * side));
+        float* ww = wh + side;
+        int64_t h0 = 0, nh = 0, w0 = 0, nw = 0;
+        aa_taps(g[0], g[2], side, wh, &h0, &nh);
+        aa_taps(g[1], g[3], side, ww, &w0, &nw);
+        const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int64_t y = 0; y < nh; ++y) {
+                float row = 0.0f;
+                for (int64_t c = 0; c < nw; ++c)
+                    row += ldt(tab, rowoff(tab, (h0 + y) * side + w0 + c, n) + i * ts) * ww[c];
+                acc += row * wh[y];
+            }
+            float pe = acc;
+            if (x->dtype == RAD_BF16) pe = rad_bf16_to_f32(rad_f32_to_bf16(pe));
+            stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+        }
+    }
+    return RAD_OK;
+}

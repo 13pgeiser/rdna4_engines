@@ -58,6 +58,8 @@ struct Engine::Rank {
      * Without the split, a placement engine starved of evidence reads exactly like a model whose
      * layers are idle. */
     uint64_t heat_credited = 0, heat_idle = 0;
+    /* Trunk steps in a row whose pass the prefill stager did not arm (Engine::tiering_dispatch). */
+    int unstaged_steps = 0;
     Residency residency;
     KVManager kv;
     PrefixCache prefix;
@@ -84,6 +86,10 @@ struct Engine::Rank {
     StagerChain stagers;
     Ctx       ctx;
     Sampler   sampler;          /* one per rank: each samples its own vocab shard (spec §9) */
+    /* THE SCORED ROWS' LOGITS (Request::token_scores), this rank's vocabulary shard of each,
+     * copied into pinned memory ahead of the sampler. Grown to the most rows a step has scored. */
+    float*    score_host = nullptr;
+    int64_t   score_rows_cap = 0;
     rad_buf   tok_buf = 0;      /* where the chain writes the sampled ids */
     /* THE CARD'S STEP STATE (sched/advance.h): one StepSlot a scheduler slot, and the
      * end-of-generation ids acceptance stops at, sorted. Every rank keeps its own and computes the

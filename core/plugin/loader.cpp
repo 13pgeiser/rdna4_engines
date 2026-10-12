@@ -455,6 +455,7 @@ int Registry::commit_(Staged& s, int order) {
         if (q->decode) enc_add_decoder(q->decode);
     }
     const auto concurrent = dl_fn<RadKernelConcurrentFn>(s.handle, "rad_kernel_concurrent");
+    const auto collective = dl_fn<RadKernelCollectiveFn>(s.handle, "rad_kernel_collective");
     for (const auto& sr : staged_rows) {
         KernelRow row;
         row.info         = sr.first;
@@ -462,6 +463,9 @@ int Registry::commit_(Staged& s, int order) {
         row.plugin_order = order;
         row.index        = sr.second;
         row.concurrent   = concurrent && concurrent(sr.second) != 0;
+        const int coll   = collective ? collective(sr.second) : 0;
+        row.collective   = coll != 0;
+        row.releases_link = coll == 2;
         row.reference    = p.reference;
         rows_.push_back(row);
     }

@@ -19,10 +19,20 @@ namespace rad {
 
 /* One Registry for the life of the process. A Resolved, a Band and a KernelRow all point into a
  * plugin's static tables, and the Program outlives the call that built it, so the registry cannot
- * be a local. registry.h says the same thing about the engine. */
+ * be a local. registry.h says the same thing about the engine.
+ *
+ * NEVER DESTROYED, because exit destroys in the wrong order for it. A function-local static is
+ * constructed before the first plugin is loaded, so its destructor runs AFTER every plugin's own
+ * static destructors -- and closing from there calls each instance's fini into plugin state that
+ * no longer exists. libr4d's router keeps its per-device counter blocks in a global map; fini
+ * looked up and erased a node of the destroyed map, a double free that glibc reported as
+ * "corrupted size vs. prev_size" or "free(): invalid pointer" on whichever exit the heap layout
+ * exposed it. A caller that needs the finis to run closes the registry itself while the plugins
+ * are alive, as Engine's shutdown does; at exit the process is ending and what the instances
+ * hold goes with it. */
 Registry& rad_tools_registry() {
-    static Registry r;
-    return r;
+    static Registry* r = new Registry();
+    return *r;
 }
 
 /* ------------------------------------------------------------------ the reference-kernel gate */

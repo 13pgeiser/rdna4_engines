@@ -102,21 +102,37 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
   auto gain = [&](int i) -> float {
     return w_f32 ? ((const float*)w)[i] : __bfloat162float(((const __hip_bfloat16*)w)[i]);
   };
-  auto normed = [&](int i, float inv) -> float {
-    const float v = __bfloat162float(in[i]);
-    // ROUNDED TO bf16 BEFORE THE ROTATION, which is the whole bit-identity argument at the top of
-    // this file: the reference stores the norm and RoPEs what it reads back.
-    return __bfloat162float(__float2bfloat16(v * inv * (gain(i) + wadd)));
+  // ROUNDED TO bf16 BEFORE THE ROTATION, which is the whole bit-identity argument at the top of
+  // this file: the reference stores the norm and RoPEs what it reads back.
+  auto normed = [&](float v, float g, float inv) -> float {
+    return __bfloat162float(__float2bfloat16(v * inv * (g + wadd)));
   };
 
+  // EVERYTHING THE ROTATION READS IS LOADED HERE, ahead of the reduction, so it is in flight while
+  // the sum of squares goes round: this lane's element and gain, its partner's, and its cos and
+  // sin. None of it depends on the norm. The indices are clamped rather than the loads guarded --
+  // a lane past the head reads its last element, a lane past the rotary range its own element and
+  // column 0 of the table (rot >= 2, so the table has one) -- and the values are used only where
+  // the guards below say.
+  const int tc = t < HD ? t : HD - 1;
+  const bool rl = t < rot, first = t < half;
+  const int pt = rl ? (first ? t + half : t - half) : tc;
+  const int ci = rl ? (first ? t : t - half) : 0;
+  const size_t co = (size_t)p * rot;
+  const float vt = __bfloat162float(in[tc]), gt = gain(tc);
+  const float vp = __bfloat162float(in[pt]), gp = gain(pt);
+  const float c = cs_f32 ? csf[co + ci] : __bfloat162float(csb[co + ci]);
+  const float s = cs_f32 ? csf[co + half + ci] : __bfloat162float(csb[co + half + ci]);
+
   float ss = 0.0f;
-  if (t < HD) { const float v = __bfloat162float(in[t]); ss = v * v; }
+  if (t < HD) ss = vt * vt;
   // rmsnorm_bf16's block_sum, transcribed: the wave butterfly, then the wave partials summed in
   // ASCENDING index order. Both halves matter -- an accumulation over the same values in a
-  // different order breaks the bit-equality argument above.
+  // different order breaks the bit-equality argument above. The barrier orders the partials in LDS
+  // and nothing else, so the loads above stay in flight across it.
   ss = r4d_wave_sum(ss);
   if ((t & 31) == 0) lds[t >> 5] = ss;
-  __syncthreads();
+  lds_barrier();
   float sum = 0.0f;
 #pragma unroll
   for (int wv = 0; wv < THR / 32; ++wv) sum += lds[wv];
@@ -124,15 +140,9 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
 
   float res = 0.0f;
   if (t < HD) {
-    res = normed(t, inv);
-    if (t < rot) {
-      const bool first = t < half;
-      const int pt = first ? t + half : t - half;
-      const int ci = first ? t : t - half;
-      const size_t co = (size_t)p * rot;
-      const float c = cs_f32 ? csf[co + ci] : __bfloat162float(csb[co + ci]);
-      const float s = cs_f32 ? csf[co + half + ci] : __bfloat162float(csb[co + half + ci]);
-      const float xp = normed(pt, inv);
+    res = normed(vt, gt, inv);
+    if (rl) {
+      const float xp = normed(vp, gp, inv);
       res = first ? (res * c - xp * s) : (xp * s + res * c);
     }
   }

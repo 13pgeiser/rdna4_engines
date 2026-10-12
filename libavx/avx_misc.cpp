@@ -176,17 +176,16 @@ AVX_KERNEL(ple_gate) {
  *   Absent, every token commits and the last (width-1)*dilation inputs land at offset zero. The
  *   write happens in a SECOND pass after every read is done, because a sequence longer than the
  *   window would otherwise overwrite history it is still reading. */
-AVX_KERNEL(ple_conv) {
-    if (a->n_t < 9) return RAD_E_INVAL;
-    const RadTensor* x = rad_arg_in(a, 0);
-    const RadTensor* w = rad_arg_in(a, 1);
-    const RadTensor* cs = rad_arg_in(a, 2);
-    const RadTensor* cu = rad_arg_in(a, 3);
-    const RadTensor* resid = rad_arg_in(a, 4);
-    const RadTensor* sidx = rad_arg_in(a, 5);
-    const RadTensor* hini = rad_arg_in(a, 6);
-    const RadTensor* nacc = rad_arg_in(a, 7);
-    const RadTensor* y = rad_arg_in(a, 8);
+/* ONE BODY FOR ple_conv AND causal_conv1d (LFM2's short convolution: undilated, no activation, no
+ * residual), as in libref, so the two cannot disagree about the window's layout. */
+struct ConvOps {
+    const RadTensor *x, *w, *cs, *cu, *resid, *sidx, *hini, *nacc, *y;
+    bool silu;
+};
+
+static int depthwise_causal_conv(const RadArgs* a, const ConvOps& o) {
+    const RadTensor *x = o.x, *w = o.w, *cs = o.cs, *cu = o.cu, *resid = o.resid;
+    const RadTensor *sidx = o.sidx, *hini = o.hini, *nacc = o.nacc, *y = o.y;
     if (!x || !w || !cs || !cu || !y) return RAD_E_INVAL;
 
     const int64_t n = p_int(a, "n", 0);
@@ -260,7 +259,7 @@ AVX_KERNEL(ple_conv) {
                 acc += vv * tap[j];
             }
             const float r = resid ? ldt(resid, (bos + t) * rrow + c * rcol) : 0.0f;
-            stt(y, (bos + t) * yrow + c * ycol, r + acc / (1.0f + std::exp(-acc)));
+            stt(y, (bos + t) * yrow + c * ycol, r + (o.silu ? acc / (1.0f + std::exp(-acc)) : acc));
         }
     }
 
@@ -296,6 +295,22 @@ AVX_KERNEL(ple_conv) {
         }
     }
     return RAD_OK;
+}
+
+AVX_KERNEL(ple_conv) {
+    if (a->n_t < 9) return RAD_E_INVAL;
+    return depthwise_causal_conv(a, { rad_arg_in(a, 0), rad_arg_in(a, 1), rad_arg_in(a, 2),
+                                      rad_arg_in(a, 3), rad_arg_in(a, 4), rad_arg_in(a, 5),
+                                      rad_arg_in(a, 6), rad_arg_in(a, 7), rad_arg_in(a, 8), true });
+}
+
+/* ple_conv's operands without `resid`, at dilation one and with no activation. */
+AVX_KERNEL(causal_conv1d) {
+    if (a->n_t < 8) return RAD_E_INVAL;
+    if (p_int(a, "dilation", 1) != 1) return RAD_E_INVAL;
+    return depthwise_causal_conv(a, { rad_arg_in(a, 0), rad_arg_in(a, 1), rad_arg_in(a, 2),
+                                      rad_arg_in(a, 3), nullptr, rad_arg_in(a, 4),
+                                      rad_arg_in(a, 5), rad_arg_in(a, 6), rad_arg_in(a, 7), false });
 }
 
 /* ------------------------------------------------------------------ ngram_ids

@@ -412,6 +412,9 @@ static void cross_check(const Plugin& pl) {
 }
 
 /* ================================================================== the device phase */
+/* --cold MIB: bytes read through the caches before every timed launch; see st_time_us. */
+static int64_t g_cold = 0;
+
 #ifdef RAD_HAVE_HIP
 
 /* EVERY hipError_t IN THIS FILE IS CHECKED, and that is not pedantry about a `nodiscard`. A
@@ -463,6 +466,63 @@ static void* dalloc(size_t bytes) {
     st_memset(p, 0, bytes);
     g_allocs.push_back(p);
     return p;
+}
+
+/* ---- THE TIMED WINDOW, WARM OR COLD (--cold MIB).
+ *
+ * Warm, a perf mode launches `iters` times back to back on one set of operands, so a weight that
+ * fits in L2 (8 MiB here) or the last-level cache (64 MiB) is read from cache after the first
+ * launch: --perfmoe's whole expert set times at ten thousand GB/s "of weight", sixteen times what
+ * the part's DRAM delivers. The engine streams its weights cold every step, and a change in how a
+ * kernel waits on memory can look free warm and cost microseconds there.
+ *
+ * Cold, every launch is preceded by a read of g_cold bytes through the hierarchy and timed alone
+ * between two events, and the median launch is the figure. The read is device copies into one
+ * kColdChunk destination: copied in full, the span would leave that many dirty lines for the
+ * timed launch to write back, which inflates exactly the bandwidth-bound kernels this mode is for.
+ * The flush buffers are allocated outside dalloc because dfree_all runs between shapes. */
+constexpr int64_t kColdChunk = 4ll << 20;
+
+template <class F>
+static double st_time_us(F&& launch, int iters, hipStream_t s) {
+    if (iters <= 0) return 0.0;
+    if (g_cold <= 0) {
+        hipEvent_t e0, e1;
+        st_ev_create(&e0); st_ev_create(&e1);
+        st_ev_record(e0, s);
+        for (int i = 0; i < iters; ++i) launch(i);
+        st_ev_record(e1, s);
+        st_ev_sync(e1);
+        float ms = 0.0f;
+        st_ev_elapsed(&ms, e0, e1);
+        st_ev_destroy(e0); st_ev_destroy(e1);
+        return (double)ms * 1000.0 / iters;
+    }
+    static void* src = nullptr;
+    static void* dst = nullptr;
+    if (!src && (hipMalloc(&src, (size_t)g_cold) != hipSuccess ||
+                 hipMalloc(&dst, (size_t)std::min(g_cold, kColdChunk)) != hipSuccess)) {
+        std::printf("--cold: no %lld MiB of device memory for the flush\n",
+                    (long long)(g_cold >> 20));
+        std::exit(1);
+    }
+    std::vector<hipEvent_t> ev(2 * (size_t)iters);
+    for (hipEvent_t& e : ev) st_ev_create(&e);
+    for (int i = 0; i < iters; ++i) {
+        for (int64_t off = 0; off < g_cold; off += kColdChunk)
+            hip_ck(hipMemcpyAsync(dst, (const char*)src + off,
+                                  (size_t)std::min(kColdChunk, g_cold - off),
+                                  hipMemcpyDeviceToDevice, s), "hipMemcpyAsync", __LINE__);
+        st_ev_record(ev[2 * (size_t)i], s);
+        launch(i);
+        st_ev_record(ev[2 * (size_t)i + 1], s);
+    }
+    st_ev_sync(ev.back());
+    std::vector<float> t((size_t)iters);
+    for (int i = 0; i < iters; ++i) st_ev_elapsed(&t[(size_t)i], ev[2 * (size_t)i], ev[2 * (size_t)i + 1]);
+    for (hipEvent_t e : ev) st_ev_destroy(e);
+    std::sort(t.begin(), t.end());
+    return (double)t[t.size() / 2] * 1000.0;
 }
 
 static void dfree_all() {
@@ -5328,21 +5388,10 @@ static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> 
         return;
     }
 
-    hipEvent_t e0, e1;
-    st_ev_create(&e0);
-    st_ev_create(&e1);
-    st_ev_record(e0, nullptr);
-    for (int i = 0; i < iters; ++i) {
+    const double us = st_time_us([&](int i) {
         ts[widx].data = (uint8_t*)wbase + (size_t)(i % copies) * wbytes;
         r->launch(&a, nullptr);
-    }
-    st_ev_record(e1, nullptr);
-    st_ev_sync(e1);
-    float ms = 0;
-    st_ev_elapsed(&ms, e0, e1);
-    st_ev_destroy(e0);
-    st_ev_destroy(e1);
-    const double us = (double)ms * 1000.0 / iters;
+    }, iters, nullptr);
     std::printf("  %-22s %8.1f us   %6.1f GB/s\n", name, us, bytes / (us * 1e3));
 }
 
@@ -5557,16 +5606,7 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
             }
             st_ev_destroy(w0); st_ev_destroy(w1);
         }
-        hipEvent_t e0, e1;
-        st_ev_create(&e0); st_ev_create(&e1);
-        st_ev_record(e0, nullptr);
-        for (int i = 0; i < iters; ++i) r->launch(&a, nullptr);
-        st_ev_record(e1, nullptr);
-        st_ev_sync(e1);
-        float ms = 0;
-        st_ev_elapsed(&ms, e0, e1);
-        st_ev_destroy(e0); st_ev_destroy(e1);
-        const double us = (double)ms * 1000.0 / iters;
+        const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
         std::printf("  %-30s %9.2f us   %6.1f GB/s\n", name, us, bytes / (us * 1e3));
     };
 
@@ -5869,16 +5909,7 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
                 }
                 st_ev_destroy(w0); st_ev_destroy(w1);
             }
-            hipEvent_t e0, e1;
-            st_ev_create(&e0); st_ev_create(&e1);
-            st_ev_record(e0, nullptr);
-            for (int i = 0; i < iters; ++i) r->launch(&a, nullptr);
-            st_ev_record(e1, nullptr);
-            st_ev_sync(e1);
-            float ms = 0.0f;
-            st_ev_elapsed(&ms, e0, e1);
-            st_ev_destroy(e0); st_ev_destroy(e1);
-            const double us = (double)ms * 1000.0 / iters;
+            const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
             st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
             std::string same = "";
             if (f == 0) {
@@ -6193,16 +6224,7 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
                 st_ev_elapsed(&wms, w0, w1);
             }
             st_ev_destroy(w0); st_ev_destroy(w1);
-            hipEvent_t e0, e1;
-            st_ev_create(&e0); st_ev_create(&e1);
-            st_ev_record(e0, hs);
-            for (int i = 0; i < iters; ++i) r->launch(&a, rst);
-            st_ev_record(e1, hs);
-            st_ev_sync(e1);
-            float ms = 0.0f;
-            st_ev_elapsed(&ms, e0, e1);
-            st_ev_destroy(e0); st_ev_destroy(e1);
-            const double us = (double)ms * 1000.0 / iters;
+            const double us = st_time_us([&](int) { r->launch(&a, rst); }, iters, hs);
             const double flop = 2.0 * (double)M * (double)HN * (double)(2 * lr + hc);
             std::printf("%s at M=%lld (n %lld, hc %lld, lowrank %lld, inject, fp8 twin + "
                         "rotated), %s: %.1f us a call, %.1f TFLOP/s\n", rn, (long long)M,
@@ -10280,18 +10302,9 @@ static void moe16_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int
                 if (pl.pin_moe) pl.pin_moe(0);
                 continue;
             }
-            hipEvent_t e0, e1;
-            st_ev_create(&e0); st_ev_create(&e1);
             for (int i = 0; i < 3; ++i) r->launch(&a, nullptr);
-            st_ev_record(e0, nullptr);
-            for (int i = 0; i < iters; ++i) r->launch(&a, nullptr);
-            st_ev_record(e1, nullptr);
-            st_ev_sync(e1);
-            float ms = 0.0f;
-            st_ev_elapsed(&ms, e0, e1);
-            st_ev_destroy(e0); st_ev_destroy(e1);
+            const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
             if (pl.pin_moe) pl.pin_moe(0);
-            const double us = (double)ms * 1000.0 / iters;
             st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
             std::string same;
             if (f == 0) first = got;
@@ -11246,6 +11259,8 @@ static void device_phase(const Plugin& pl) {
     attn_case(pl, "attn_decode_h256_gqa6_bf16kv",  256, 6,  1, "bf16",     0);
     attn_case(pl, "attn_decode_h128_gqa4_fp8kv",   128, 4,  1, "fp8_e4m3", 0);
     attn_case(pl, "attn_decode_h128_gqa4_bf16kv",  128, 4,  1, "bf16",     0);
+    attn_case(pl, "attn_prefill_h64_gqa4_bf16kv",   64, 4, 32, "bf16",     1);
+    attn_case(pl, "attn_prefill_h64_gqa4_bf16kv",   64, 4,  1, "bf16",     1);
     attn_gq_fold_case(pl, 3, false);
     attn_gq_fold_case(pl, 24, false);
     attn_gq_fold_case(pl, 3, true);
@@ -12934,6 +12949,11 @@ static void usage(void) {
                 "             prefill-tile form (PF2 from M=512) compared byte for byte and timed\n"
                 "             as one op each;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
+                "  --cold MIB:  with a --perf mode, time cold: read MIB through the caches before\n"
+                "             every timed launch (256 empties this card's L2 and last level) and\n"
+                "             time each launch alone, the median reported. Warm, a weight under\n"
+                "             64 MiB is read from cache after the first launch; the engine reads\n"
+                "             its weights cold.\n"
                 "  --perfmoe M [iters] [experts] [top_k] [pooled%%]:  the routed-expert w4 GEMM,\n"
                 "             both projections at rank 0's tp2 width split, over a skewed routing of\n"
                 "             an M-token chunk (512 experts, top 10 by default); every form, each\n"
@@ -13016,6 +13036,9 @@ int main(int argc, char** argv) {
             qsa_ctx = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) qsa_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) qsa_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--cold")) {
+            if (i + 1 >= argc) { usage(); return 2; }
+            g_cold = std::strtoll(argv[++i], nullptr, 0) << 20;
         } else if (!std::strcmp(argv[i], "--perfmoe")) {
             /* The routed-expert GEMM at a prefill chunk of M tokens, every prefill form. */
             if (i + 1 >= argc) { usage(); return 2; }

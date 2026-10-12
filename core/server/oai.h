@@ -291,6 +291,14 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
  * token ids mixed as ONE prompt, as llama-server reads it. */
 int parse_completion_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err, bool native = false);
+/* A media part's bytes out of a data: URL; any other URL is refused, never fetched. */
+int decode_media_url(const std::string& url, const std::string& field,
+                     std::vector<uint8_t>* out, ApiError* err);
+/* A prompt holding RAD_MEDIA_MARKER once a media part, tokenised with each marker replaced by its
+ * part's processed token run; `media` is consumed in order. */
+int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
+                        std::vector<std::pair<MediaKind, std::vector<uint8_t>>>& media,
+                        const MediaOpts& opts, PromptInput* out, ApiError* err);
 /* Embeddings: fills `out->prompts` with one entry per input. */
 int parse_embeddings_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
                              OaiRequest* out, ApiError* err);

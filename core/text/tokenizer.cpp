@@ -379,6 +379,7 @@ struct TokEncoder {
     uint32_t kind = RAD_TOK_BPE;
     bool     bytelevel = false;              /* the chain has a ByteLevel pre-tokeniser */
     bool     byte_fallback = false;
+    bool     ignore_merges = false;          /* VocabBuild::ignore_merges */
     /* The ByteLevel step at this index is the last step that rewrites text, so the mapping is
      * never materialised: the BPE merges raw bytes against `raw` instead. -1 when that does not
      * hold (no ByteLevel, or a step after it that reads the mapped text). */
@@ -407,6 +408,7 @@ struct TokEncoder {
 
 int TokEncoder::build(const VocabBuild& b, const std::vector<int32_t>& special) {
     kind = b.kind;
+    ignore_merges = b.ignore_merges;
     types = b.types;
     unk = b.unk;
 
@@ -1029,15 +1031,16 @@ void bpe_word(const TokEncoder& e, std::string_view w, std::vector<int32_t>& out
      * the vocabulary promises to round-trip; decomposing one into codepoints and merging back
      * can land on a different sequence, because the merge table was never fitted over them.
      *
-     * ORDINARY VOCABULARY ENTRIES STILL GO THROUGH THE MERGE LOOP, which is HuggingFace's
-     * behaviour at `ignore_merges: false` and is what every checkpoint in scope declares. A
-     * vocabulary setting it TRUE wants the same short-circuit for any word that is already a
-     * token, and this engine does not honour the flag: core/text/tokenizer_json.cpp only warns
-     * when it is set, and the vocabulary has nowhere to carry it. Such a model would tokenise
-     * differently here than it does in transformers, mostly on rare words. Supporting it is a
-     * vocabulary field, not a change to this loop. */
+     * ORDINARY VOCABULARY ENTRIES GO THROUGH THE MERGE LOOP unless the vocabulary sets
+     * `ignore_merges`, which is HuggingFace's short-circuit for a word that is already a token:
+     * the merge table can reach a different split of a rare word than the entry it ships. The
+     * word is the pre-token after the declared chain, and the raw-byte table looks the same entry
+     * up under its byte spelling. A CONTROL entry is not taken whole even then: one that reaches
+     * this loop is text the caller asked to have read as text, and the flag must not turn it back
+     * into the marker. */
     const int32_t whole = table.find(w);
-    if (whole >= 0 && e.types[whole] == RAD_TT_USER_DEFINED) {
+    if (whole >= 0 && (e.types[whole] == RAD_TT_USER_DEFINED ||
+                       (e.ignore_merges && e.types[whole] != RAD_TT_CONTROL))) {
         out.push_back(whole);
         return;
     }

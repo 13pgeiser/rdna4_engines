@@ -57,6 +57,7 @@ driver on the host. [`DOCKER.md`](DOCKER.md) covers it, along with ready compose
 |---|---|
 | **Required** | Linux, a C++20 compiler, CMake 3.21+, Ninja, pthreads |
 | **Optional** | ROCm with `hipcc`, for AMD device kernels. Without it you get the host backend. Set `ROCM_PATH` if it is not at `/opt/rocm` |
+| **With a card** | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup): the host writes every dispatch's arguments into VRAM, and startup refuses a card whose memory the CPU cannot reach |
 | **Optional** | OpenMP, used by the host kernel libraries if present |
 | **For the shell harnesses** | `curl` and `jq` |
 
@@ -486,6 +487,27 @@ the expert slab and the KV cache, and no flag divides it:
 The cache never gets less than one `--max-model-len` sequence, and when both sides fit, both are
 whole. With a lending cache, `--host-pool-mib` is what moves the split: a larger pool takes experts
 off the card and gives the cache more.
+
+**The next layer's experts are fetched ahead at decode.** The experts kept only in the pinned host
+pool are read across the link by the routed GEMMs that need them, while those GEMMs run. At each
+routed layer of a decode pass of up to 16 rows, the engine applies the *next* routed layer's router
+to this layer's router input -- it predicts that layer's choice well -- and the card's second DMA
+engine copies the two likeliest experts that are only in the pool onto the card while the rest of
+this layer runs. Just before the next layer's GEMMs, their weight tables point at the copies that
+have landed, so those GEMMs read them from VRAM. A copy holds the bytes of the pool slot it was made
+from, so this changes no output; a copy that lands late is not used. It is on wherever the pool
+holds experts (`--placement expert_tiered` or `auto`), off under `--deterministic` and where the
+device backend has no second DMA engine, and the startup log says which (`expert prefetch on` /
+`off`). It costs one hardware queue and a ring of six expert units on the card, both in the VRAM
+receipt (`hardware queues`, `expert prefetch`).
+
+It pays only where the steps use enough of what it copies, so it measures that: every 2048
+predictions it looks at the share of its copies the steps routed, and under 30% it rests -- no
+prediction, no copy -- for 8192 passes before measuring again (`expert prefetch resting`, once, in
+the log). On Qwen3.8-Flash-Next at `--tp 1` with the `flashnext-tp1` flags the steps use about half
+of the copies, and the decode step goes from 29.0 to 28.0 ms at one sequence and from 101.3 to 95.3
+ms at four. At `--tp 2` each card keeps most of its experts and the pool holds the ones the steps
+rarely route; under a quarter of the copies were used, it was a loss, and the prefetch rests there.
 
 **An uneven world re-splits its cheaper ranks.** The split above is worked out once, for the rank
 whose cache costs most, and one block table serves every rank. Where a rank's cache costs less per
@@ -1185,6 +1207,7 @@ for a model that takes no images or video.
 | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
+| `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 — §5.12 |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs — §5.9 |
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client — §5.9 |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and the clients built on llama-server's own API — §5.9 |
@@ -1196,6 +1219,7 @@ for a model that takes no images or video.
 | `POST /apply-template` | the prompt a chat request renders to, as llama-server answers it |
 | `POST /v1/chat/completions/input_tokens` | how many tokens that prompt is |
 | `GET /server_info` | the whole configuration of the running engine |
+| `GET /diagnostics` | the startup report as JSON — every option and its source, the hardware read again now, the findings — §7.1. Without `--api-key` it answers only a client on the same machine (§6.6) |
 | `GET /metrics` | Prometheus |
 | `POST /tokenize`, `POST /detokenize` | vLLM's shape (`prompt` or `messages` in, `prompt` out) and llama-server's (`content` in and out, `with_pieces`) |
 | `GET /get_tokenizer_info` | |
@@ -1648,6 +1672,69 @@ agrees to float rounding.
 there and none here, which is OpenAI's default. The values themselves agree with llama-server's to
 bf16 rounding (within 0.1 on Qwen3.5-0.8B, sampled tokens far down the tail included).
 
+### 5.12 Decisions: `/v1/systemone`
+
+LiquidAI's d1-3B is a decision model on LFM2-VL. It is given a state — text, any JSON value,
+pictures, or a mix — and named questions, and each answer is read off the model's distribution at
+the position after the assistant header: `yes`/`no` for a `noul`, one code an option for a
+`choice`, a digit a level for a `score`. Nothing is generated, so an answer is always in its
+schema. The request and response are d1's own (`api.py` in the model's repository), and the
+prompt it renders is d1's `prompt.py` string for string, since the model was trained on exactly
+those.
+
+The endpoint answers only a container that says it is d1, which the checkpoint does not: convert
+it with `--set decision.type=d1`. d1's prompt text, which radiance carries, is Liquid AI's under the
+LFM Open License v1.0, as the model is (NOTICE).
+
+```sh
+rad-convert ~/models/LiquidAI/d1-3B -o d1-3b-bf16.rad --set decision.type=d1
+radiance --model d1-3b-bf16.rad --port 8000
+
+curl -s localhost:8000/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": "I was charged twice this month, please refund one of them.",
+  "questions": {
+    "refund":  {"type": "noul", "instructions": "Is the customer asking for a refund?"},
+    "team":    {"type": "choice", "instructions": "Which team should handle this?",
+                "criteria": {"billing": "Charges, refunds, invoices", "technical": "App or site faults"}},
+    "urgency": {"type": "score", "instructions": "How urgent is this?",
+                "criteria": ["Can wait", "Today", "Blocking the customer now"]}}}'
+```
+
+The answer is an object of the same names, in the same order:
+
+```
+{"answers": {
+   "refund":  {"type": "noul",   "noul": P(yes)},
+   "team":    {"type": "choice", "choice": "billing", "confidence": P(billing),
+               "probabilities": {"billing": ..., "technical": ...}},
+   "urgency": {"type": "score",  "score": the expected level, "confidence": P(likeliest level),
+               "probabilities": {"0": ..., "1": ..., "2": ...},
+               "legend": {"0": "Can wait", "1": "Today", "2": "Blocking the customer now"}}},
+ "usage": {"input_tokens": N, "output_tokens": 0}}
+```
+
+- **`state`** is required: a string, any JSON value (rendered as indented JSON, keys in the order
+  sent), or `null` with pictures alone.
+- **`questions`** is an object of named questions, answered in the order sent. A question is
+  `type` (`noul`, `choice` — the default — or `score`), `instructions`, and `criteria`: for a
+  `noul` optionally `{"true": ..., "false": ...}`; for a `choice` the options, name to description;
+  for a `score` 2 to 10 level descriptions, lowest first.
+- **`images`** is an array of `data:` URLs, placed ahead of the state. Each picture is first
+  scaled down to at most 1024 x 1024 pixels' area, as d1's runner does, then cut as LFM2-VL's
+  processor cuts it: whole when it is small, else into 512-pixel tiles plus a thumbnail.
+- **`noul`** is P(yes); a `choice` names its most probable option; a `score` is the expected level.
+  Each answer is a softmax over its options' raw logits, an option scoring its best spelling.
+- **`usage.input_tokens`** counts what the model read as d1 counts it: the shared state once and
+  each question's own tail.
+
+**Several questions read the state once.** The first runs alone and leaves the state's end in the
+prefix cache — its attention blocks and a checkpoint of LFM2's convolutions there — and the rest
+start from it together, each computing only its own question. A single question is one pass of
+the whole prompt, tokenised as one text, as d1 does.
+
+Against d1's own runner in float32, on eight text cases (one and several questions, JSON and long
+log states): every choice and every `input_tokens` equal, worst probability difference 0.0044.
+
 ## 6. Operate it
 
 ### 6.1 The dashboard
@@ -1688,6 +1775,7 @@ curl -s localhost:8000/stats | jq          # counters, memory, throughput
 curl -s localhost:8000/sessions | jq       # what is stored and where
 curl -s localhost:8000/graph | jq          # the resolved kernel graph
 curl -s localhost:8000/server_info | jq    # model, cards, KV, draft depth, wire
+curl -s localhost:8000/diagnostics | jq    # the startup report, hardware read again now (§7.1)
 ```
 
 `/server_info` is the operator's first question asked of a process that is already running: which
@@ -1782,6 +1870,11 @@ authenticated probe is a server that reports itself down, and the dashboard page
 `/dashboard`), which holds no data — on a 401 it shows a key field, keeps the key in the browser's
 storage and sends it on every fetch of data it makes.
 
+Without a key, `/diagnostics` answers only a client on the same machine (a loopback address) and
+every other one 403: it describes the host — kernel, boot parameters, PCI layout, memory limits —
+and not just the model. Read it with `curl localhost:8000/diagnostics` on the machine, or start
+the server with `--api-key` to read it from elsewhere.
+
 The key is checked, not encrypted: on any network you do not control, bind to localhost and put a
 TLS-terminating reverse proxy in front:
 
@@ -1801,6 +1894,70 @@ released until it does.
 
 ## 7. When something goes wrong
 
+### 7.1 Start with the startup report
+
+The last thing startup prints before `serving on` is one block, `STARTUP REPORT`, in three parts.
+A startup that stops prints it too, after the error, with what it had resolved by then, and ends
+it with an `E` line that repeats the error, so the tail of the log still shows it. It is the part
+of a log to paste into an issue.
+
+- **CONFIGURATION** lists every option the command line takes, from the same table `--help`
+  prints. Each line shows the value in force and where it came from: `default`, `command line`,
+  an environment variable, or `auto`. An `auto` line carries the reason under it: the drafter's
+  depth, where the embedding and the n-gram table went and why, the VRAM split, the placement
+  strategy, and each sampler default with the file it came from, or the built-in default the
+  file left it at. `--api-key` shows only `set` or `not set`.
+- **ENVIRONMENT** names the `RADIANCE_*` variables that are set (§8). It shows only the names,
+  never the values.
+- **DERIVED** shows what startup worked out that no single option states: the VRAM split with the
+  budget report under it, the weights by tier, the KV cache, and the kernel libraries selection
+  used, with the attention rows by name.
+- **HARDWARE** reads the machine from `/proc` and `/sys`, the same files inside the image. It
+  covers the CPU, RAM, swap, kernel, container, cgroup and memlock limits, transparent huge
+  pages, the IOMMU mode from the cards' own groups, TTM's page limit (`ttm.pages_limit`) and
+  `cwsr_enable`. Each display device gets its gfx target, VRAM and BAR, and its PCIe link **at
+  every hop up to the root port**. A card with a switch on it reports its own link at full speed
+  whatever the slot does, so a root port parked at half speed only shows here. The block also
+  shows the card's PCIe power levels, its power cap against its default and its maximum, any
+  voltage offset, and its runtime power management. The cgroup limit is the tightest one from
+  the process's own cgroup up to the root.
+- **FINDINGS** lists warnings first, then notes. Each says what was seen, what it costs, and the
+  fix. Every warning is also printed as a `W` line of its own.
+
+```
+I STARTUP REPORT -- radiance 1.4.0
+I CONFIGURATION -- every option, the value in force, and where it came from
+I   --model                            /models/flashnext.rad                       [command line]
+I   --tp                               2                                           [command line]
+I   --num-speculative-tokens           3                                           [auto]
+I                                        the depth the drafter in this container states as its operating point
+I   --embedding-placement              ram                                         [auto]
+I                                        the table is 606.25 MiB a rank: pinned in host memory and read over the link in place, ...
+I   ...
+I HARDWARE
+I   card 0000:07:00.0  rank 1 (device 1)  gfx1201 "AMD Radeon AI PRO R9700"  31.86 GiB VRAM  NUMA -1  driver amdgpu card1
+I       link   00:01.3 16.0 GT/s x8 (max 32.0 GT/s x8) -> 05:00.0 32.0 GT/s x16 (max 32.0 GT/s x16) -> ... -> 07:00.0 32.0 GT/s x16 (max 32.0 GT/s x16)  [read at 90% busy]
+I       pcie   0: 2.5GT/s, x8 250Mhz | *1: 16.0GT/s, x8 616Mhz | 2: 32.0GT/s, x8 1143Mhz
+I       power  cap 280 W (default 300 W, max 330 W) | voltage offset -75 mV | sclk 500-2350 MHz | ...
+I FINDINGS -- 3 warnings, 4 notes
+I   WARN link-below-max: card 0000:07:00.0 (rank 1): the PCIe link at 0000:00:01.3 runs 16.0 GT/s x8 of its 32.0 GT/s x8 while the card is 90% busy
+I        why: every copy between host memory and the card ... cross this link, so ... a tensor-parallel step waits for it
+I        fix: a link stuck one level down after long uptime has been cleared by a reboot; ...
+```
+
+A PCIe link at rest parks at its lowest speed, so a link below its maximum is only a finding when
+the card was busy as it was read. At startup the cards are mostly idle. `GET /diagnostics` reads
+the hardware again and runs the same checks, so call it during a long prefill to see the links and
+power levels under load. A reading is reused for a second, and the power-management files (DPM
+levels, power caps, busy percentage) are read only for the cards the server runs on: the driver
+answers them from the card's firmware under a lock, and wakes a sleeping card to do it.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findings'
+```
+
+### 7.2 Messages and what they mean
+
 | What you see | What it means | What to do |
 |---|---|---|
 | `N declared op(s) resolve to libref` and the engine exits | No kernel library covers those ops on this card. Serving from the reference implementation would be orders of magnitude slow with nothing to say so | Install a library that covers them, or accept the cost with `--debug-accept-reference-kernels`. The named ops are exactly what a new library must implement |
@@ -1813,7 +1970,7 @@ released until it does.
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |
 | `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps pinned memory system-wide at `ttm.pages_limit`, half of RAM by default | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under the cap the refusal names, or raise it with the kernel parameter `ttm.pages_limit` |
 | `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode was seen to refuse any single pin above about 2.5 GiB; a piece failing means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through but on that host also removed peer access between the cards, which moves every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
-| `a synchronisation has waited 5 s` naming a kernel, then `no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue. The kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps is moved under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits for a queue a serve never lets drain. A voltage offset or other clock instability is the other cause seen on R9700s. If the stall line says the queues **advanced**, the wait was long rather than stuck, and nothing is wrong | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the engine warns at startup when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset puts the power cap, fan curve and voltage offset back to firmware defaults, so re-apply them before every start rather than once at boot. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`; a reboot loses it. `docker inspect` shows exit code 0 for a container Docker has already restarted, which says nothing about how the old process ended |
+| `a synchronisation has waited 5 s` naming a kernel, then `no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue. The kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps is moved under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits for a queue a serve never lets drain. A voltage offset or other clock instability is the other cause seen on R9700s. If the stall line says the queues **advanced**, the wait was long rather than stuck, and nothing is wrong | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the startup report warns when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset puts the power cap, fan curve and voltage offset back to firmware defaults, so re-apply them before every start rather than once at boot. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`; a reboot loses it. `docker inspect` shows exit code 0 for a container Docker has already restarted, which says nothing about how the old process ended |
 | `--draft-model is not implemented` | This engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
 | `context_length_exceeded` on a request | The **prompt alone** does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate at all | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
 | `unknown option '--foo'` and the engine exits | Deliberate. A typo in a budget flag is the difference between the plan you asked for and one the planner invented | Check `radiance --help` |

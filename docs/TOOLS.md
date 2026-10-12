@@ -348,6 +348,8 @@ rad-kbench -m moe.rad   --max-cases 1 --record data/kernels_moe.rkb
 | `--bench` | time each case that passes, on the same bytes |
 | `--bench-iters N`, `--bench-reps N` | launches per rep (20), timed reps (3) |
 | `--bench-warm-ms N` | untimed launches before each timed window (default 500) |
+| `--bench-flush MIB` | time cold: read MIB through the caches before every timed launch (256 empties an R9700's 8 MiB L2 and 64 MiB last level) and time each launch alone between two device events. Implies `--bench` |
+| `--timing-only` | time every device kernel and check nothing: no reference run, read-back, margins or fusion chain, host rows skipped. For comparing builds a checked run has already passed; refuses `--record`. Implies `--bench` |
 | `--report FILE` | write the markdown report |
 | `--analysis FILE` | splice in a fragment from `tools/kbench-analysis.sh` |
 | `--num-speculative-tokens N` | draft depth to declare at |
@@ -365,8 +367,17 @@ running on the same box, pass something small explicitly:
 rad-kbench --home $RADIANCE_HOME --max-cases 1 --max-bytes 1024
 ```
 
-**`--bench` is cache-warm.** It cannot rank a bandwidth-bound kernel the way production runs it.
-Read the caveat the report prints about the GB/s column.
+**`--bench` is cache-warm.** Every launch of a timed window reuses one set of operands, so a weight
+that fits in the last-level cache is read from it after the first launch: a 52 MB bf16 decode weight
+times at 1.45 TB/s warm and at 565 GB/s, the card's DRAM rate, cold. The engine streams its weights
+cold every step. `--bench-flush 256` measures that; use it whenever the comparison is about how a
+kernel waits on memory. Its numbers are device time per launch and are not comparable with a warm
+run's, which divide a window's wall time by its launches.
+
+**`--timing-only` runs the card hotter.** With no host-side check between cases the card is busy
+almost all of the run, and on the same binary its times come out 0.3-0.8% above a checked run's in
+total, compute-bound kernels 1-2%. Compare builds within one mode, interleaved; the ratio between
+two builds matched the checked mode's to within half a percent.
 
 **`--max-cases`.** A 62-layer model presents the same kernel at the same shape sixty times and only
 the weights differ. The default of 4 is not a sample of anything interesting; `--max-cases 1` is

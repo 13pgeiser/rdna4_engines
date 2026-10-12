@@ -119,6 +119,28 @@ __device__ __forceinline__ float sigmoidf_(float v) { return 1.0f / (1.0f + __ex
 __device__ __forceinline__ float siluf_(float v)    { return v * sigmoidf_(v); }
 __device__ __forceinline__ float nbf(float v)       { return bf2f(f2bf(v)); }
 
+/* BF16 IN WHOLE REGISTERS. gfx12's compiler holds a 16-bit value in a register HALF: eight f2bf
+ * results written through a union of shorts are eight half moves before the pack, and a short
+ * loaded on its own is a d16 load that leaves the register's other half live, so it waits on that
+ * register's last write. These keep every value 32 bits wide -- pairs packed with f2bf2, whose
+ * rounding is f2bf's, a pair word's halves read with a shift and a mask, a lone bf16 loaded
+ * zero-extended -- and give the same bits. */
+__device__ __forceinline__ uint4 f2bf8(const float (&f)[8]) {
+    return make_uint4(f2bf2(f[0], f[1]), f2bf2(f[2], f[3]), f2bf2(f[4], f[5]), f2bf2(f[6], f[7]));
+}
+__device__ __forceinline__ void bf8_f(uint4 v, float (&f)[8]) {
+    f[0] = bf16w_lo(v.x); f[1] = bf16w_hi(v.x); f[2] = bf16w_lo(v.y); f[3] = bf16w_hi(v.y);
+    f[4] = bf16w_lo(v.z); f[5] = bf16w_hi(v.z); f[6] = bf16w_lo(v.w); f[7] = bf16w_hi(v.w);
+}
+__device__ __forceinline__ void bf8_f(r4d_u32x4 v, float (&f)[8]) {
+    f[0] = bf16w_lo(v.x); f[1] = bf16w_hi(v.x); f[2] = bf16w_lo(v.y); f[3] = bf16w_hi(v.y);
+    f[4] = bf16w_lo(v.z); f[5] = bf16w_hi(v.z); f[6] = bf16w_lo(v.w); f[7] = bf16w_hi(v.w);
+}
+/* Read through a GLOBAL pointer: through a generic one the load is still flat_load_d16_b16. */
+typedef __attribute__((address_space(1))) const unsigned short* hc_gu16;
+__device__ __forceinline__ uint32_t bfw(const unsigned short* p) { return *(hc_gu16)p; }
+__device__ __forceinline__ float    bfw_f(uint32_t w)            { return __uint_as_float(w << 16); }
+
 /* ---- THE E4M3 MIXING MATRICES (r4d_hc_fp8.h) ------------------------------------------------
  *
  * Every kernel below that reads mix_down or mix_up has an F8 form, selected by the stored dtype:
@@ -152,10 +174,9 @@ __device__ __forceinline__ uint4 e4m3x8_bf16(const unsigned char* __restrict__ c
     const uint2 c = *(const uint2*)codes;
     float f[8];
     e4m3x8(c.x, c.y, f);
-    union { uint4 v; unsigned short s[8]; } o;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) o.s[e] = f2bf(f[e] * sc);
-    return o.v;
+    for (int e = 0; e < 8; ++e) f[e] *= sc;
+    return f2bf8(f);
 }
 
 /* A WAVE'S DOT OF THE NATURAL-ORDER LDS VECTOR WITH ONE E4M3 ROW OF mix_down. A lane takes
@@ -644,22 +665,22 @@ void mtp_enter_kernel(const unsigned short* __restrict__ h, const unsigned short
     constexpr int kSsIter = 5;
     long i = tid;
     for (; i + (long)(kSsIter - 1) * kThreads < n; i += (long)kSsIter * kThreads) {
-        unsigned short ev[kSsIter], hv[kSsIter][kHcMax];
+        uint32_t ev[kSsIter], hv[kSsIter][kHcMax];
 #pragma unroll
         for (int q = 0; q < kSsIter; ++q) {
             const long iq = i + (long)q * kThreads;
-            ev[q] = ep[iq];
+            ev[q] = bfw(ep + iq);
 #pragma unroll
             for (int c = 0; c < kHcMax; ++c)
-                if (c < hc) hv[q][c] = hp[(long)c * n + iq];
+                if (c < hc) hv[q][c] = bfw(hp + (long)c * n + iq);
         }
 #pragma unroll
         for (int q = 0; q < kSsIter; ++q) {
-            const float evf = bf2f(ev[q]);
+            const float evf = bfw_f(ev[q]);
             pe += evf * evf;
 #pragma unroll
             for (int c = 0; c < kHcMax; ++c)
-                if (c < hc) { const float v = bf2f(hv[q][c]); part[c] += v * v; }
+                if (c < hc) { const float v = bfw_f(hv[q][c]); part[c] += v * v; }
         }
     }
     for (; i < n; i += kThreads) {
@@ -723,13 +744,13 @@ void mtp_enter_kernel(const unsigned short* __restrict__ h, const unsigned short
                     const long q = base + (long)tid * 8;
                     if (q >= n) break;
                     const long ch = q & ~(kPer - 1);
-                    unsigned short out[8];
+                    float out[8];
 #pragma unroll
                     for (int t = 0; t < 8; ++t) {
                         const long li = ch + lane8 + (long)t * kWave;
-                        out[t] = f2bf(bf2f(src[li]) * sc * (wv[li] + wadd));
+                        out[t] = bfw_f(bfw(src + li)) * sc * (wv[li] + wadd);
                     }
-                    *(uint4*)(dst + q) = *(const uint4*)out;
+                    *(uint4*)(dst + q) = f2bf8(out);
                 }
             }
         } else {
@@ -785,8 +806,14 @@ constexpr long kHcReadAStaticLds = (long)(kWaves * kHcMax + kHcMax) * (long)size
  * columns share one pass over `h` and one grouped reduction. It is held TRANSPOSED inside each
  * 256-element chunk; wave_dot_swz above is the whole argument for that, and it is the difference
  * between eight conflicted 16-bit LDS reads a chunk and one ds_load_b128. */
+/* THE WAVES A SIMD: nine for the E4M3 dot, the budget it was tuned at. Left to choose, LLVM 24
+ * builds it at 120 VGPRs for twelve waves, which costs 11% at four rows and 20% at seven with the
+ * weight read cold -- the shapes a speculative decode step runs. The bf16 form keeps the full
+ * range, which is what it is built at without the attribute; pinning it to sixteen changes its
+ * code. */
 template <bool F8>
 __global__ __launch_bounds__(kThreads)
+__attribute__((amdgpu_waves_per_eu(F8 ? 9 : 1, F8 ? 9 : 16)))
 void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
                       const void* __restrict__ downv, long dld,
                       const unsigned short* __restrict__ injw,
@@ -882,11 +909,11 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
         float acc = 0.0f;
         long  i = tid;
         for (; i + (long)(kPreSs - 1) * kThreads < n; i += (long)kPreSs * kThreads) {
-            unsigned short hv[kPreSs];
+            uint32_t hv[kPreSs];
 #pragma unroll
-            for (int p = 0; p < kPreSs; ++p) hv[p] = hp[cb + i + (long)p * kThreads];
+            for (int p = 0; p < kPreSs; ++p) hv[p] = bfw(hp + cb + i + (long)p * kThreads);
 #pragma unroll
-            for (int p = 0; p < kPreSs; ++p) { const float v = bf2f(hv[p]); acc += v * v; }
+            for (int p = 0; p < kPreSs; ++p) { const float v = bfw_f(hv[p]); acc += v * v; }
         }
         for (; i < n; i += kThreads) { const float v = bf2f(hp[cb + i]); acc += v * v; }
         acc = wave_sum(acc);
@@ -921,28 +948,28 @@ void hc_read_a_kernel(const unsigned short* __restrict__ h, const float* __restr
                 const long q = base + (long)tid * 8;
                 if (q >= n) break;
                 const long ch = cb + (q & ~(kPer - 1));
-                unsigned short out[8];
+                float out[8];
 #pragma unroll
                 for (int t = 0; t < 8; ++t) {
                     const long li = ch + lane + (long)t * kWave;
-                    out[t] = f2bf(bf2f(hp[li]) * sc * (w[li] + wadd));
+                    out[t] = bfw_f(bfw(hp + li)) * sc * (w[li] + wadd);
                 }
-                *(uint4*)(sN + cb + q) = *(const uint4*)out;
+                *(uint4*)(sN + cb + q) = f2bf8(out);
             }
         } else {
             constexpr int kPreScale = 8;
             long i = tid;
             for (; i + (long)(kPreScale - 1) * kThreads < n; i += (long)kPreScale * kThreads) {
                 float          wv[kPreScale];
-                unsigned short hv[kPreScale];
+                uint32_t       hv[kPreScale];
 #pragma unroll
                 for (int p = 0; p < kPreScale; ++p) {
                     wv[p] = w[cb + i + (long)p * kThreads];
-                    hv[p] = hp[cb + i + (long)p * kThreads];
+                    hv[p] = bfw(hp + cb + i + (long)p * kThreads);
                 }
 #pragma unroll
                 for (int p = 0; p < kPreScale; ++p)
-                    sN[cb + i + (long)p * kThreads] = f2bf(bf2f(hv[p]) * sc * (wv[p] + wadd));
+                    sN[cb + i + (long)p * kThreads] = f2bf(bfw_f(hv[p]) * sc * (wv[p] + wadd));
             }
             for (; i < n; i += kThreads)
                 sN[cb + i] = f2bf(bf2f(hp[cb + i]) * sc * (w[cb + i] + wadd));
@@ -1618,11 +1645,11 @@ void hc_down_tiled_kernel(const unsigned short* __restrict__ h, const float* __r
             long r = r0 + rr; if (r >= rows) r = rows - 1;
             const float sc = scalein[r * kHcMax + c];
             const float* wp = w + k0 + k8;
-            union { uint4 v; unsigned short s[8]; } in, out;
-            in.v = *(const uint4*)(h + r * hrow + k0 + k8);
+            float f8v[8];
+            bf8_f(*(const uint4*)(h + r * hrow + k0 + k8), f8v);
 #pragma unroll
-            for (int e = 0; e < 8; ++e) out.s[e] = f2bf(bf2f(in.s[e]) * sc * (wp[e] + wadd));
-            *(uint4*)(sA + rr * kTAP + k8) = out.v;
+            for (int e = 0; e < 8; ++e) f8v[e] = f8v[e] * sc * (wp[e] + wadd);
+            *(uint4*)(sA + rr * kTAP + k8) = f2bf8(f8v);
         }
         for (int idx = tid; idx < NT * (kTKT / 8); idx += kThreads) {
             const int tt = idx / (kTKT / 8), k8 = (idx % (kTKT / 8)) * 8;
@@ -1786,15 +1813,18 @@ void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __re
         arow[i] = r < rows ? r : rows - 1;
     }
 
-    uint4 pa[kAV];
+    /* The bf16-weight form stages through a native vector: in uint4 LLVM 24 keeps these arrays in
+     * scratch. The fp8 form is promoted either way and keeps uint4, at its tuned register count. */
+    using Stg = std::conditional_t<F8, uint4, r4d_u32x4>;
+    Stg pa[kAV];
     float psc[kAV], pw[8];
-    uint4 pb[kBV];
+    Stg pb[kBV];
     float pbs[kBV];
     auto fetch = [&](long k0) {
         const int c = (int)(k0 / n);
 #pragma unroll
         for (int i = 0; i < kAV; ++i) {
-            pa[i]  = *(const uint4*)(h + arow[i] * hrow + k0 + k8a);
+            pa[i]  = *(const Stg*)(h + arow[i] * hrow + k0 + k8a);
             psc[i] = scalein[arow[i] * kHcMax + c];
         }
 #pragma unroll
@@ -1808,39 +1838,40 @@ void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __re
             if (F8 && col < lr) {
                 const unsigned char* row = (const unsigned char*)downv + col * dld;
                 const uint2 cc = *(const uint2*)(row + k);
-                pb[b]  = make_uint4(cc.x, cc.y, 0u, 0u);
+                pb[b]  = Stg{cc.x, cc.y, 0u, 0u};
                 pbs[b] = ((const float*)(row + HN))[k / r4d_hc8::kDownGroup];
             } else {
                 const unsigned short* src = (col < lr) ? (const unsigned short*)downv + col * HN
                                                        : injw + (col - lr) * HN;
-                pb[b] = *(const uint4*)(src + k);
+                pb[b] = *(const Stg*)(src + k);
             }
         }
     };
     auto stage = [&]() {
 #pragma unroll
         for (int i = 0; i < kAV; ++i) {
-            union { uint4 v; unsigned short s[8]; } in, out;
-            in.v = pa[i];
+            float f8v[8];
+            bf8_f(pa[i], f8v);
 #pragma unroll
-            for (int e = 0; e < 8; ++e) out.s[e] = f2bf(bf2f(in.s[e]) * psc[i] * (pw[e] + wadd));
-            *(uint4*)(sA + (ar + i * kRS) * kTAP + k8a) = out.v;
+            for (int e = 0; e < 8; ++e) f8v[e] = f8v[e] * psc[i] * (pw[e] + wadd);
+            *(uint4*)(sA + (ar + i * kRS) * kTAP + k8a) = f2bf8(f8v);
         }
 #pragma unroll
         for (int b = 0; b < kBV; ++b) {
             const int idx = tid + b * kThreads, tt = idx / kKV, k8 = (idx % kKV) * 8;
             if (idx >= NT * kKV || tt >= nlive * 16) continue;
             long col = c0 + tt; if (col >= ncol) col = ncol - 1;
-            uint4 v = pb[b];
-            if (F8 && col < lr) {
-                float f[8];
-                e4m3x8(v.x, v.y, f);
-                union { uint4 v; unsigned short s[8]; } o;
+            Stg v = pb[b];
+            if constexpr (F8) {
+                if (col < lr) {
+                    float f[8];
+                    e4m3x8(v.x, v.y, f);
 #pragma unroll
-                for (int e = 0; e < 8; ++e) o.s[e] = f2bf(f[e] * pbs[b]);
-                v = o.v;
+                    for (int e = 0; e < 8; ++e) f[e] = f[e] * pbs[b];
+                    v = f2bf8(f);
+                }
             }
-            *(uint4*)(sB + tt * kTAP + k8) = v;
+            *(Stg*)(sB + tt * kTAP + k8) = v;
         }
     };
 
@@ -2303,10 +2334,9 @@ void hc_up_mix_wide_kernel(const void* __restrict__ upv, long uld,
             if constexpr (F8) {
                 float f[8];
                 e4m3x8(v.x, v.y, f);
-                union { uint4 v; unsigned short s[8]; } o;
 #pragma unroll
-                for (int e = 0; e < 8; ++e) o.s[e] = f2bf(f[e] * pbs[i]);
-                v = k0 + k8a + 8 <= lr ? o.v : make_uint4(0u, 0u, 0u, 0u);
+                for (int e = 0; e < 8; ++e) f[e] = f[e] * pbs[i];
+                v = k0 + k8a + 8 <= lr ? f2bf8(f) : make_uint4(0u, 0u, 0u, 0u);
             }
             *(uint4*)(sB + (tr + i * kRS) * kTAP + k8a) = v;
         }
@@ -2341,11 +2371,11 @@ void hc_up_mix_wide_kernel(const void* __restrict__ upv, long uld,
         const int  c  = rem / (CH / 8), i8 = (rem % (CH / 8)) * 8;
         if (r0 + rl >= rows) continue;
         const long j  = (long)c * n + i0 + i8;
-        union { uint4 v; unsigned short s[8]; } in, out;
-        in.v = pn[i];
+        float f8v[8];
+        bf8_f(pn[i], f8v);
 #pragma unroll
-        for (int e = 0; e < 8; ++e) out.s[e] = f2bf(bf2f(in.s[e]) * pns[i] * (w[j + e] + wadd));
-        *(uint4*)(sN + (rl * HC + c) * CH + i8) = out.v;
+        for (int e = 0; e < 8; ++e) f8v[e] = f8v[e] * pns[i] * (w[j + e] + wadd);
+        *(uint4*)(sN + (rl * HC + c) * CH + i8) = f2bf8(f8v);
     }
     __syncthreads();
 
@@ -2629,10 +2659,9 @@ void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict_
                 const float sc = ((const float*)(row + HN))[k / r4d_hc8::kDownGroup];
                 float fv[8];
                 e4m3x8(*(const uint32_t*)(row + k), *(const uint32_t*)(row + k + 8), fv);
-                union { uint4 v; unsigned short s[8]; } u;
 #pragma unroll
-                for (int e = 0; e < 8; ++e) u.s[e] = f2bf(fv[e] * sc);
-                o = u.v;
+                for (int e = 0; e < 8; ++e) fv[e] = fv[e] * sc;
+                o = f2bf8(fv);
             } else {
                 const unsigned short* src = (col < lr) ? (const unsigned short*)downv + col * HN
                                                        : injw + (col - lr) * HN;
@@ -2711,11 +2740,11 @@ void hc_down_pf2_kernel(const unsigned short* __restrict__ h, const float* __res
     auto stageA = [&](unsigned short* dst) {
 #pragma unroll
         for (int i = 0; i < kAV; ++i) {
-            union { uint4 v; unsigned short s[8]; } in, out;
-            in.v = pa[i];
+            float f8v[8];
+            bf8_f(pa[i], f8v);
 #pragma unroll
-            for (int e = 0; e < 8; ++e) out.s[e] = f2bf(bf2f(in.s[e]) * psc[i] * (pw[e] + wadd));
-            *(uint4*)(dst + (ar + i * kRS) * kTAP + k8a) = out.v;
+            for (int e = 0; e < 8; ++e) f8v[e] = f8v[e] * psc[i] * (pw[e] + wadd);
+            *(uint4*)(dst + (ar + i * kRS) * kTAP + k8a) = f2bf8(f8v);
         }
     };
 
@@ -2883,18 +2912,18 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
         for (int k = 0; k < kSsRows; ++k) acc[k] = 0.0f;
         long j = lane;
         for (; j + (long)(kSsPre - 1) * kWave < len; j += (long)kSsPre * kWave) {
-            unsigned short v[kSsRows][kSsPre];
+            uint32_t v[kSsRows][kSsPre];
 #pragma unroll
             for (int k = 0; k < kSsRows; ++k)
                 if (k < nr) {
 #pragma unroll
-                    for (int q = 0; q < kSsPre; ++q) v[k][q] = p[k][j + (long)q * kWave];
+                    for (int q = 0; q < kSsPre; ++q) v[k][q] = bfw(p[k] + j + (long)q * kWave);
                 }
 #pragma unroll
             for (int k = 0; k < kSsRows; ++k)
                 if (k < nr) {
 #pragma unroll
-                    for (int q = 0; q < kSsPre; ++q) { const float f = bf2f(v[k][q]); acc[k] += f * f; }
+                    for (int q = 0; q < kSsPre; ++q) { const float f = bfw_f(v[k][q]); acc[k] += f * f; }
                 }
         }
         for (; j < len; j += kWave)
@@ -2976,28 +3005,40 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
         if constexpr (F8) {
             float f[8];
             e4m3x8(o.c.x, o.c.y, f);
-            union { uint4 v; unsigned short s[8]; } u;
 #pragma unroll
-            for (int q = 0; q < 8; ++q) u.s[q] = f2bf(f[q] * o.s);
-            return u.v;
+            for (int q = 0; q < 8; ++q) f[q] = f[q] * o.s;
+            return f2bf8(f);
         } else {
             return o.v;
         }
     };
+    /* AN A ITEM'S ROWS ARE THE SAME EVERY K STEP: its token and sub-stream are a 64-bit division
+     * by `hc` and its remainder, worked out once here as element offsets. Left in the step, gfx12's
+     * compiler expands the division again every slice -- twenty times over at the 64-row tile and
+     * fifty at the 128-row one -- where LLVM 22 moved it out of the loop. The same addresses. */
+    uint32_t aoh[kAI], aoe[kAI], aow[kAI], ak8[kAI];
+#pragma unroll
+    for (int a = 0; a < kAI; ++a) {
+        const int idx = tid + a * kThreads;
+        const int rr = idx / (kTKT / 8), k8 = (idx % (kTKT / 8)) * 8;
+        const long Ri = r0 + rr;
+        const long rt = (Ri < R) ? Ri / hc : rows - 1, kt = (Ri < R) ? Ri % hc : 0;
+        aoh[a] = (uint32_t)(rt * hrow + kt * n + k8);
+        aoe[a] = (uint32_t)(rt * erow + k8);
+        aow[a] = (uint32_t)(kt * n + k8);
+        ak8[a] = (uint32_t)k8;
+    }
     auto issue = [&](long k0) {
 #pragma unroll
         for (int a = 0; a < kAI; ++a) {
             const int idx = tid + a * kThreads;
             if (idx >= RT * (kTKT / 8)) break;
-            const int rr = idx / (kTKT / 8), k8 = (idx % (kTKT / 8)) * 8;
-            const long Ri = r0 + rr;
-            const long rt = (Ri < R) ? Ri / hc : rows - 1, kt = (Ri < R) ? Ri % hc : 0;
-            ap[a].h   = *(const uint4*)(h + rt * hrow + kt * n + k0 + k8);
-            ap[a].e   = *(const uint4*)(e + rt * erow + k0 + k8);
-            ap[a].wh0 = *(const float4*)(wh + kt * n + k0 + k8);
-            ap[a].wh1 = *(const float4*)(wh + kt * n + k0 + k8 + 4);
-            ap[a].we0 = *(const float4*)(we + k0 + k8);
-            ap[a].we1 = *(const float4*)(we + k0 + k8 + 4);
+            ap[a].h   = *(const uint4*)(h + aoh[a] + k0);
+            ap[a].e   = *(const uint4*)(e + aoe[a] + k0);
+            ap[a].wh0 = *(const float4*)(wh + aow[a] + k0);
+            ap[a].wh1 = *(const float4*)(wh + aow[a] + k0 + 4);
+            ap[a].we0 = *(const float4*)(we + ak8[a] + k0);
+            ap[a].we1 = *(const float4*)(we + ak8[a] + k0 + 4);
         }
 #pragma unroll
         for (int b = 0; b < kBI; ++b) {
@@ -3019,19 +3060,19 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
             if (idx >= RT * (kTKT / 8)) break;
             const int rr = idx / (kTKT / 8), k8 = (idx % (kTKT / 8)) * 8;
             const float sc = s_rs[rr], se = s_re[rr];
-            union { uint4 v; unsigned short s[8]; } in, out;
             const float wp[8] = { ap[a].wh0.x, ap[a].wh0.y, ap[a].wh0.z, ap[a].wh0.w,
                                   ap[a].wh1.x, ap[a].wh1.y, ap[a].wh1.z, ap[a].wh1.w };
             const float wq[8] = { ap[a].we0.x, ap[a].we0.y, ap[a].we0.z, ap[a].we0.w,
                                   ap[a].we1.x, ap[a].we1.y, ap[a].we1.z, ap[a].we1.w };
-            in.v = ap[a].h;
+            float f8v[8];
+            bf8_f(ap[a].h, f8v);
 #pragma unroll
-            for (int q = 0; q < 8; ++q) out.s[q] = f2bf(bf2f(in.s[q]) * sc * (wp[q] + wadd));
-            *(uint4*)(sAh + rr * kTAP + k8) = out.v;
-            in.v = ap[a].e;
+            for (int q = 0; q < 8; ++q) f8v[q] = f8v[q] * sc * (wp[q] + wadd);
+            *(uint4*)(sAh + rr * kTAP + k8) = f2bf8(f8v);
+            bf8_f(ap[a].e, f8v);
 #pragma unroll
-            for (int q = 0; q < 8; ++q) out.s[q] = f2bf(bf2f(in.s[q]) * se * (wq[q] + wadd));
-            *(uint4*)(sAe + rr * kTAP + k8) = out.v;
+            for (int q = 0; q < 8; ++q) f8v[q] = f8v[q] * se * (wq[q] + wadd);
+            *(uint4*)(sAe + rr * kTAP + k8) = f2bf8(f8v);
         }
 #pragma unroll
         for (int b = 0; b < kBI; ++b) {
@@ -3068,11 +3109,14 @@ void mtp_enter_tiled_kernel(const unsigned short* __restrict__ h, const unsigned
             if (nt >= NT16) continue;
             const long j = j0 + nt * 16 + nn;
             if (j >= n) continue;
+            /* The eight rows are consecutive output rows: one division for the first, and the
+             * (token, sub-stream) pair stepped from there rather than divided out again a row. */
+            const long Rq = r0 + mt * 16 + e0;
+            long tq = Rq / hc, kq = Rq % hc;
 #pragma unroll
             for (int q = 0; q < 8; ++q) {
-                const long Ri = r0 + mt * 16 + e0 + q;
-                if (Ri >= R) continue;
-                x[(Ri / hc) * xrow + (Ri % hc) * n + j] = f2bf(acc[im][in][q]);
+                if (Rq + q < R) x[tq * xrow + kq * n + j] = f2bf(acc[im][in][q]);
+                if (++kq == hc) { kq = 0; ++tq; }
             }
         }
     }
@@ -3126,11 +3170,11 @@ void mtp_prefill_scale_kernel(const unsigned short* __restrict__ h,
     float acc = 0.0f;
     long j = lane;
     for (; j + (long)(kPre - 1) * kWave < len; j += (long)kPre * kWave) {
-        unsigned short v[kPre];
+        uint32_t v[kPre];
 #pragma unroll
-        for (int q = 0; q < kPre; ++q) v[q] = p[j + (long)q * kWave];
+        for (int q = 0; q < kPre; ++q) v[q] = bfw(p + j + (long)q * kWave);
 #pragma unroll
-        for (int q = 0; q < kPre; ++q) { const float f = bf2f(v[q]); acc += f * f; }
+        for (int q = 0; q < kPre; ++q) { const float f = bfw_f(v[q]); acc += f * f; }
     }
     for (; j < len; j += kWave) { const float f = bf2f(p[j]); acc += f * f; }
     acc = wave_sum(acc);
@@ -3212,7 +3256,7 @@ void mtp_prefill_gemm_kernel(const unsigned short* __restrict__ src, long srow,
     float4 rg0[AL], rg1[AL];
     uint2  rc[WL];
     float  rsc[WL];
-    uint4  rw[WL];
+    r4d_u32x4 rw[WL];                               /* registers; uint4 would sit in scratch */
     auto fetch = [&](long k0) {
 #pragma unroll
         for (int i = 0; i < AL; ++i) {
@@ -3227,7 +3271,7 @@ void mtp_prefill_gemm_kernel(const unsigned short* __restrict__ src, long srow,
                 rc[i]  = *(const uint2*)(wrow[i] + k);
                 rsc[i] = ((const float*)(wrow[i] + n))[k / r4d_hc8::kDownGroup];
             } else {
-                rw[i] = *(const uint4*)(wsrc[i] + k0);
+                rw[i] = *(const r4d_u32x4*)(wsrc[i] + k0);
             }
         }
     };
@@ -3238,25 +3282,24 @@ void mtp_prefill_gemm_kernel(const unsigned short* __restrict__ src, long srow,
         __syncthreads();                                /* the previous tile's fragments are read */
 #pragma unroll
         for (int i = 0; i < AL; ++i) {
-            union { uint4 v; unsigned short s[8]; } in, out;
-            in.v = ra[i];
+            float f8v[8];
+            bf8_f(ra[i], f8v);
             const float g[8] = { rg0[i].x, rg0[i].y, rg0[i].z, rg0[i].w,
                                  rg1[i].x, rg1[i].y, rg1[i].z, rg1[i].w };
 #pragma unroll
-            for (int q = 0; q < 8; ++q) out.s[q] = f2bf(bf2f(in.s[q]) * asc[i] * (g[q] + wadd));
-            *(uint4*)adst[i] = out.v;
+            for (int q = 0; q < 8; ++q) f8v[q] = f8v[q] * asc[i] * (g[q] + wadd);
+            *(uint4*)adst[i] = f2bf8(f8v);
         }
 #pragma unroll
         for (int i = 0; i < WL; ++i) {
             if constexpr (F8) {
                 float f[8];
                 e4m3x8(rc[i].x, rc[i].y, f);
-                union { uint4 v; unsigned short s[8]; } o;
 #pragma unroll
-                for (int q = 0; q < 8; ++q) o.s[q] = f2bf(f[q] * rsc[i]);
-                *(uint4*)wdst[i] = o.v;
+                for (int q = 0; q < 8; ++q) f[q] = f[q] * rsc[i];
+                *(uint4*)wdst[i] = f2bf8(f);
             } else {
-                *(uint4*)wdst[i] = rw[i];
+                *(r4d_u32x4*)wdst[i] = rw[i];
             }
         }
         __syncthreads();

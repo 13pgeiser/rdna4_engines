@@ -1243,6 +1243,17 @@ int Planner::assign(Plan* p) {
         else if (has_conditional)                           s = Strategy::ExpertTiered;
         else                                                s = Strategy::LayerOffload;
         p->strategy = s;
+        p->strategy_why =
+            s == Strategy::AllVram
+                ? fmt("%s of weights fit the %s weights pool", humanb(total).c_str(),
+                      humanb(p->vram_budget).c_str())
+            : s == Strategy::ExpertTiered
+                ? fmt("%s of weights against a %s weights pool: routed experts, read only when "
+                      "selected, are what spills to host memory", humanb(total).c_str(),
+                      humanb(p->vram_budget).c_str())
+                : fmt("%s of weights against a %s weights pool and no routed experts to spill: "
+                      "whole layers are offloaded", humanb(total).c_str(),
+                      humanb(p->vram_budget).c_str());
         RAD_DEBUG("placement: auto chose %s (%s of weights against a %s budget)",
                   strategy_name(s), humanb(total).c_str(), humanb(p->vram_budget).c_str());
     }

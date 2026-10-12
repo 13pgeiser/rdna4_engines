@@ -117,6 +117,7 @@ std::vector<Case> build_cases() {
                            HF("wadd", 1), HF("gate_eps", 1e-6) });
         add("ple_conv",  { HI("M", 9), HI("n", 128), HI("width", 4), HI("dilation", 2),
                            HS("dtype", dt) });
+        add("causal_conv1d", { HI("M", 9), HI("n", 128), HI("width", 3), HS("dtype", dt) });
     }
     add("ngram_ids", { HI("M", 9), HI("heads", 3), HI("ngram", 4), HI("eos", 2) });
 
@@ -309,6 +310,10 @@ std::vector<Case> build_cases() {
                       HF("theta", 10000.0), HF("scale", 1.0), HS("mode", "axial"),
                       HI("rotary_dim", 72), HS("sections", "18 18"), HS("dtype", dt) });
         add("grid_embed", { HI("M", 20), HI("n", 72), HI("side", 6), HS("dtype", dt) });
+        /* Two table sides. A drawn grid is never larger than the table, so enlarging is
+         * avx_check's hand-built case. */
+        add("grid_embed_aa", { HI("M", 20), HI("n", 72), HI("side", 16), HS("dtype", dt) });
+        add("grid_embed_aa", { HI("M", 40), HI("n", 72), HI("side", 4), HS("dtype", dt) });
     }
 
     /* MoE. `a_order` exists because the two grouped GEMMs of one routed block disagree about it,

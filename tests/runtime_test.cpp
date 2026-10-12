@@ -90,6 +90,13 @@ WEAKDEF int rad_memcpy_2d_async(void* d, int64_t dp, const void* s, int64_t sp,
 WEAKDEF int rad_memset_async(void* d, int v, int64_t n, RadStream) {
     std::memset(d, v, (size_t)n); return RAD_OK;
 }
+WEAKDEF int rad_memcpy_list_async(const RadCopySeg* g, int n, unsigned, RadStream) {
+    for (int i = 0; i < n; ++i)
+        if (g[i].bytes > 0) std::memcpy(g[i].dst, g[i].src, (size_t)g[i].bytes);
+    return RAD_OK;
+}
+WEAKDEF int rad_link_hold(RadStream, int) { return RAD_OK; }
+WEAKDEF void* rad_link_gate(RadStream) { return nullptr; }
 WEAKDEF const char* rad_dev_last_error(void) { return "none"; }
 
 }  /* extern "C" */

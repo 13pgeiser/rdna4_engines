@@ -21,11 +21,13 @@ void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
     }
     /* Merge-block order inverted: a patch's index within its segment is
      * ((block_row * blocks_w + block_col) * merge + in_row) * merge + in_col. */
-    const int64_t seg = (int64_t)grid_h * grid_w;
     const int32_t merge = grid_h / rows_h;
-    const int64_t bw = grid_w / merge;
+    int32_t s = 0;
+    while (s + 1 < n_seg && patch_at(s + 1) <= first) ++s;
     for (int64_t k = 0; k < count; ++k) {
-        const int64_t within = (first + k) % seg;
+        while (s + 1 < n_seg && patch_at(s + 1) <= first + k) ++s;
+        const int64_t within = first + k - patch_at(s);
+        const int64_t bw = seg_w(s) / merge;
         const int64_t in_col = within % merge;
         const int64_t in_row = (within / merge) % merge;
         const int64_t blk = within / (merge * merge);
@@ -33,8 +35,8 @@ void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
         const int64_t col = (blk % bw) * merge + in_col;
         planes[k]             = (int32_t)row;
         planes[count + k]     = (int32_t)col;
-        planes[2 * count + k] = grid_h;
-        planes[3 * count + k] = grid_w;
+        planes[2 * count + k] = seg_h(s);
+        planes[3 * count + k] = seg_w(s);
     }
 }
 

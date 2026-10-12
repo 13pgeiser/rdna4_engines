@@ -155,7 +155,7 @@ double tolerance_for(const std::string& op, const char* dtype, const char* opera
 
 /* ================================================================== the run */
 struct Stats { int checked = 0, passed = 0, failed = 0, skipped = 0, capped = 0, diverged = 0,
-                overrun = 0, guarded = 0;
+                overrun = 0, guarded = 0, timed = 0;
                 double worst = 0; };
 
 struct Row {
@@ -293,6 +293,85 @@ RadStream run_stream() {
  *
  * Returns the median microseconds per launch, or < 0 if any launch refused the shape.
  */
+/* ---- COLD TIMING (--bench-flush): the caches emptied before every timed launch.
+ *
+ * Every launch of a timed window reuses one set of operands, so from the second launch on a weight
+ * that fits in L2 (8 MiB here) or the last-level cache (64 MiB) is read from cache. The engine never
+ * sees that: a step streams every layer's weights once, far more than the caches hold, so each
+ * kernel reads its weight cold. A change that only moves how a kernel waits on DRAM can then look
+ * free in this tool and cost microseconds in the engine, and the reverse.
+ *
+ * So the flush READS `g_bench_flush` bytes through the hierarchy before each launch, and writes
+ * them into one kFlushChunk destination over and over. Read and written in full -- a plain copy or
+ * fill -- the span would leave that many dirty lines behind, and the timed kernel would pay their
+ * write-back as traffic it never asked for, which inflates exactly the bandwidth-bound kernels
+ * this mode is for. Bounded this way the dirty footprint is one chunk.
+ *
+ * A launch is then timed ALONE, between two events on the device, because a flush inside the
+ * window would otherwise be in the number. The figure is the device's, launch latency included
+ * and the host's submission gaps excluded, so it is not the same quantity as the warm window's. */
+int64_t g_bench_flush = 0;
+constexpr int64_t kFlushChunk = 4ll << 20;
+
+/* The flush source and destination, allocated once for the run: an allocation per case would put
+ * the allocator into every case's wall time and churn VRAM the case budget is sized against. */
+bool flush_bufs(void** src, void** dst) {
+    static void* s = nullptr;
+    static void* d = nullptr;
+    if (!s) {
+        s = rad_dev_alloc(g_bench_flush, RAD_MEM_DEVICE);
+        d = rad_dev_alloc(std::min(g_bench_flush, kFlushChunk), RAD_MEM_DEVICE);
+        if (!s || !d) {
+            std::fprintf(stderr, "rad-kbench: --bench-flush: no %lld MiB of device memory for the "
+                                 "flush: %s\n", (long long)(g_bench_flush >> 20),
+                         rad_dev_last_error());
+            return false;
+        }
+    }
+    *src = s;
+    *dst = d;
+    return true;
+}
+
+double time_cold(const RadKernelInfo* info, RadArgs* a, RadStream stream, int iters, int reps,
+                 double* spread_pct) {
+    void* fsrc = nullptr;
+    void* fdst = nullptr;
+    if (!flush_bufs(&fsrc, &fdst)) return -1;
+    static std::vector<RadEvent> ev;
+    while (ev.size() < 2 * (size_t)iters) {
+        RadEvent e = nullptr;
+        if (rad_event_create(&e) < 0) return -1;
+        ev.push_back(e);
+    }
+    std::vector<double> us;
+    us.reserve((size_t)reps);
+    std::vector<double> one((size_t)iters);
+    for (int rep = 0; rep < reps; ++rep) {
+        for (int it = 0; it < iters; ++it) {
+            for (int64_t off = 0; off < g_bench_flush; off += kFlushChunk)
+                if (rad_memcpy_async(fdst, (const uint8_t*)fsrc + off,
+                                     std::min(kFlushChunk, g_bench_flush - off), stream) < 0)
+                    return -1;
+            if (rad_event_record(ev[2 * (size_t)it], stream) < 0) return -1;
+            if (info->launch(a, stream) < 0) return -1;
+            if (rad_event_record(ev[2 * (size_t)it + 1], stream) < 0) return -1;
+        }
+        if (rad_stream_sync(stream) < 0) return -1;
+        for (int it = 0; it < iters; ++it) {
+            float ms = 0.0f;
+            if (rad_event_elapsed_ms(ev[2 * (size_t)it], ev[2 * (size_t)it + 1], &ms) < 0) return -1;
+            one[(size_t)it] = 1e3 * (double)ms;
+        }
+        std::sort(one.begin(), one.end());
+        us.push_back(one[one.size() / 2]);
+    }
+    std::sort(us.begin(), us.end());
+    const double med = us[us.size() / 2];
+    if (spread_pct) *spread_pct = med > 0 ? 100.0 * (us.back() - us.front()) / med : 0.0;
+    return med;
+}
+
 double time_launch(const RadKernelInfo* info, RadArgs* a, RadStream stream,
                    int iters, int reps, int warm_ms, double* spread_pct) {
     if (spread_pct) *spread_pct = -1;
@@ -304,6 +383,7 @@ double time_launch(const RadKernelInfo* info, RadArgs* a, RadStream stream,
         for (int i = 0; i < iters; ++i) if (info->launch(a, stream) < 0) return -1;
         if (rad_stream_sync(stream) < 0) return -1;
     }
+    if (g_bench_flush > 0) return time_cold(info, a, stream, iters, reps, spread_pct);
 
     std::vector<double> us;
     us.reserve((size_t)reps);
@@ -377,7 +457,8 @@ void fold_run(std::vector<LibRow>& libs, const std::vector<Row>& rows) {
         LibRow& l = *it->second;
         ++l.cases;
         if (!r.kernel.empty()) l.ran.insert(r.kernel);
-        if (r.verdict == "ok") ++l.passed; else ++l.failed;
+        if (r.verdict == "ok") ++l.passed;
+        else if (r.verdict != "timed") ++l.failed;
         l.worst = std::max(l.worst, r.rel_l2);
         if (r.us >= 0) l.us.push_back(r.us);
     }
@@ -471,6 +552,9 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
          "has none of its own\n";
     s += fmt("- %d case(s) checked, %d passed, %d failed, %d skipped, %d capped; worst rel_l2 "
              "%.3e\n", st.checked, st.passed, st.failed, st.skipped, st.capped, st.worst);
+    if (st.timed)
+        s += fmt("- %d case(s) timed and NOT checked (`--timing-only`): this report ranks speed "
+                 "only\n", st.timed);
     if (st.diverged)
         s += fmt("- %d case(s) where two libraries describe the same output differently -- not a\n"
                  "  correctness result, see **Divergences** below\n", st.diverged);
@@ -599,6 +683,7 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
         int     n = 0;
         double  worst_rel = -1;
         bool    any_fail = false;
+        bool    any_timed = false;    /* --timing-only: ran and was timed, checked by nothing */
         bool    any_synth = false;
         std::vector<double> us, ref_us;
         /* The WORST spread any rep of any run in the group showed, for the same reason the error
@@ -617,7 +702,8 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
         Agg& a = it->second;
         ++a.n;
         a.worst_rel = std::max(a.worst_rel, r.rel_l2);
-        a.any_fail  = a.any_fail  || r.verdict != "ok";
+        a.any_fail  = a.any_fail  || (r.verdict != "ok" && r.verdict != "timed");
+        a.any_timed = a.any_timed || r.verdict == "timed";
         a.any_synth = a.any_synth || r.synthesised;
         if (r.us >= 0) a.us.push_back(r.us);
         if (r.ref_us >= 0) a.ref_us.push_back(r.ref_us);
@@ -638,7 +724,8 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
         s += "| `" + md_escape(r.op) + "` | `" + md_escape(r.kernel) + "` | " +
              md_escape(r.plugin) + " | " + r.domain + " | `" + md_escape(r.geom) + "` | " +
              md_escape(r.choice.empty() ? "-" : r.choice) + " | " + fmt("%d", a.n) + " | " +
-             (a.any_fail ? "**FAIL**" : "ok") + (a.any_synth ? " (synth w)" : "") + " | " +
+             (a.any_fail ? "**FAIL**" : a.any_timed ? "timed" : "ok") +
+             (a.any_synth ? " (synth w)" : "") + " | " +
              (a.worst_rel < 0 ? "-" : fmt("%.2e", a.worst_rel)) + " | " +
              fmt("%.0e", r.tol) + " |\n";
     }
@@ -646,11 +733,20 @@ int write_report(const std::string& path, const std::vector<Row>& rows,
     /* ================================================================ 4. speed */
     if (benched) {
         s += "\n## Speed\n\n";
-        s += "> **These times rank kernels; they do not size a roofline.** Every launch in a "
-             "timed\n> run reuses one set of operands, so a weight that fits in the last-level "
-             "cache is\n> read from cache after the first launch, and a bandwidth-bound kernel "
-             "can read\n> several times its true rate. Ranking two kernels at one shape is what "
-             "these times are\n> for; a roofline is not.\n>\n> `operands` is the total the case ALLOCATED, not what the kernel read: a "
+        if (g_bench_flush > 0)
+            s += fmt("> **Timed cold (`--bench-flush %lld`).** Before every timed launch %lld MiB "
+                     "were read\n> through the caches, so each launch read its operands from "
+                     "memory as the engine's\n> kernels read their weights, and each was timed "
+                     "alone between two device events:\n> launch latency is in the number, the "
+                     "host's submission gaps are not.\n>\n",
+                     (long long)(g_bench_flush >> 20), (long long)(g_bench_flush >> 20));
+        else
+            s += "> **These times rank kernels; they do not size a roofline.** Every launch in a "
+                 "timed\n> run reuses one set of operands, so a weight that fits in the last-level "
+                 "cache is\n> read from cache after the first launch, and a bandwidth-bound kernel "
+                 "can read\n> several times its true rate. Ranking two kernels at one shape is what "
+                 "these times are\n> for; a roofline is not. `--bench-flush` times them cold.\n>\n";
+        s += "> `operands` is the total the case ALLOCATED, not what the kernel read: a "
              "gather\n> touches M rows of a table, not the table. Dividing the two columns "
              "produces a\n> bandwidth figure this tool cannot stand behind, which is why it does "
              "not print one.\n>\n> The `" + ref_name + "` column is ONE untimed-warmup call, not a "
@@ -801,7 +897,7 @@ int replay_one(const KfCase& c, const Geometry& g, int64_t M,
                const std::vector<std::vector<std::vector<uint8_t>>>& planes, const KernelRow* row,
                const std::string& lib, int dom, const RadOpSchema* schema,
                double tol_override, bool bench, int bench_iters, int bench_reps,
-               int bench_warm_ms, bool verbose,
+               int bench_warm_ms, bool verbose, bool timing_only,
                Stats* st, std::vector<Row>* rows, std::map<std::string, int>* skipped,
                /* The device-side weight cache, owned by the replay driver and shared across every
                 * case: a 206 MB upload repeated once per sweep point is most of a run. */
@@ -1006,8 +1102,8 @@ int replay_one(const KfCase& c, const Geometry& g, int64_t M,
 
     /* The outputs back on the host BEFORE anything is timed: many ops are in place, and a timed
      * loop of twenty launches would leave `rope` rotated twenty-one times and report a large
-     * error on a correct kernel. */
-    if (dom == RAD_DOMAIN_DEVICE) {
+     * error on a correct kernel. A timing-only run checks nothing, so it reads nothing back. */
+    if (dom == RAD_DOMAIN_DEVICE && !timing_only) {
         for (size_t k = 0; k < n_opd; ++k) {
             if (!dev[k].on) continue;
             const int role = schema->operands[k].role;
@@ -1054,7 +1150,7 @@ int replay_one(const KfCase& c, const Geometry& g, int64_t M,
     int64_t nonfinite_gap = 0;
     int n_out = 0;
     std::string per_opd;
-    for (size_t k = 0; k < n_opd; ++k) {
+    for (size_t k = 0; k < n_opd && !timing_only; ++k) {
         const KfOperand& d = c.opd[k];
         if (d.absent || !d.have_ref) continue;
         const int role = schema->operands[k].role;
@@ -1109,13 +1205,17 @@ int replay_one(const KfCase& c, const Geometry& g, int64_t M,
         }
         ++n_out;
     }
-    if (n_out == 0) { ++st->skipped; release(); return RAD_OK; }
+    if (n_out == 0 && !timing_only) { ++st->skipped; release(); return RAD_OK; }
 
     const double tol = worst_tol;
     const bool ok = nonfinite_gap == 0 && all_ok;
-    ++st->checked;
-    st->worst = std::max(st->worst, worst_rel);
-    if (ok) ++st->passed; else ++st->failed;
+    if (timing_only) {
+        ++st->timed;
+    } else {
+        ++st->checked;
+        st->worst = std::max(st->worst, worst_rel);
+        if (ok) ++st->passed; else ++st->failed;
+    }
 
     /* ---------------------------------------------------------------- and the clock */
     double case_us = -1, case_spread = -1;
@@ -1130,7 +1230,7 @@ int replay_one(const KfCase& c, const Geometry& g, int64_t M,
     rw.plugin  = lib;
     rw.geom    = g.str();
     rw.domain  = domain_name(dom);
-    rw.verdict = ok ? "ok" : "**FAIL**";
+    rw.verdict = timing_only ? "timed" : ok ? "ok" : "**FAIL**";
     rw.rel_l2  = worst_rel;
     rw.tol     = tol;
     rw.us      = case_us;
@@ -1140,11 +1240,11 @@ int replay_one(const KfCase& c, const Geometry& g, int64_t M,
         if (!d.absent) rw.bytes += rad_dtype_bytes(d.dtype, rad_numel(d.shape));
     rows->push_back(std::move(rw));
 
-    if (!ok || verbose)
+    if (!timing_only && (!ok || verbose))
         std::printf("  %-22s %-44s %-8s %-28s rel=%.3e max_abs=%.3e max_rel=%.3e tol=%.1e %s\n",
                     c.op.c_str(), g.str().c_str(), domain_name(dom), row->info->name,
                     worst_rel, worst_abs, worst_max_rel, tol, ok ? "ok" : "FAIL");
-    if (!ok && n_out > 1) std::printf("      per operand: %s\n", per_opd.c_str());
+    if (!timing_only && !ok && n_out > 1) std::printf("      per operand: %s\n", per_opd.c_str());
     return RAD_OK;
 }
 
@@ -1189,6 +1289,7 @@ int replay(const Kfixture& fx, const std::string& home,
            const std::vector<std::string>& op_filters, double tol_override, int max_cases,
            int64_t max_case_bytes,
            bool bench, int bench_iters, int bench_reps, int bench_warm_ms, bool verbose,
+           bool timing_only,
            const std::string& report_path, const std::string& fixture_path,
            const std::string& analysis_path) {
     /* The plugins, and NOT an architecture: a kernel library is checked without one, which is
@@ -1380,6 +1481,8 @@ int replay(const Kfixture& fx, const std::string& home,
 
         for (const std::string& lib : libs) {
             for (int dom = 0; dom < RAD_N_DOMAINS; ++dom) {
+                /* A timing-only run times device kernels; a host row has no clock here. */
+                if (timing_only && dom != RAD_DOMAIN_DEVICE) continue;
                 const KernelRow* row = row_in(lib, c.op, g, dom);
                 if (!row) continue;
                 if (max_cases > 0) {
@@ -1424,7 +1527,7 @@ int replay(const Kfixture& fx, const std::string& home,
                 }
                 const int rc = replay_one(c, g, M, in, planes, row, lib, dom, schema, tol_override,
                                           bench, bench_iters, bench_reps, bench_warm_ms, verbose,
-                                          &st, &report_rows, &skipped_ops,
+                                          timing_only, &st, &report_rows, &skipped_ops,
                                           &dcache, &dcache_bytes, dcache_budget, &overruns);
                 (void)rc;
             }
@@ -1446,6 +1549,9 @@ int replay(const Kfixture& fx, const std::string& home,
     std::printf("\n%d checked, %d passed, %d failed, %d skipped, %d diverged, %d capped. "
                 "worst rel_l2 = %.3e\n", st.checked, st.passed, st.failed, st.skipped,
                 st.diverged, st.capped, st.worst);
+    if (timing_only)
+        std::printf("%d timed. Timing only: nothing was checked against a reference.\n",
+                    st.timed);
     std::printf("memory: %d case(s) ran inside guarded allocations, %d wrote outside one\n",
                 st.guarded, st.overrun);
     print_row_coverage(census(reg, ref_name), report_rows);
@@ -1521,6 +1627,13 @@ void usage() {
         "                     Also bounds the weight caches.\n"
         "      --bench        time each case that passes, in the same pass and on the same\n"
         "                     bytes. See the caveat the report prints about the GB/s column.\n"
+        "      --timing-only  time every device kernel and check nothing: no reference run, no\n"
+        "                     comparison, no margins, no fusion chain, host rows skipped. For\n"
+        "                     comparing builds a full run has already checked. Implies --bench.\n"
+        "      --bench-flush MIB  time cold: read MIB through the caches before every timed\n"
+        "                     launch (256 empties this card's 8 MiB L2 and 64 MiB last level),\n"
+        "                     and time each launch alone on the device. The engine reads its\n"
+        "                     weights cold; a warm loop can hide or invent a difference.\n"
         "      --bench-iters N  launches per timed rep (default 20)\n"
         "      --bench-reps N   timed reps, median reported (default 3)\n"
         "      --bench-warm-ms N  untimed launches before each timed window, in ms (default 500).\n"
@@ -1600,6 +1713,10 @@ int main(int argc, char** argv) {
      * nothing checks is a comment. --no-fusion is for bisecting, not for passing. */
     bool     fuse_check = true;
     bool     bench = false;
+    /* TIME, DO NOT CHECK: for comparing builds whose correctness a full run has already shown.
+     * The reference implementation is what a run spends most of its time in -- every case is also
+     * run on the host -- and a timing comparison between two builds repeats it for nothing. */
+    bool     timing_only = false;
     std::string report_path;
     int      bench_iters = 20, bench_reps = 3;
     /* Untimed launches before the timed window. Half a second, which is what libr4d's own
@@ -1643,6 +1760,11 @@ int main(int argc, char** argv) {
             max_case_bytes = (int64_t)std::atoll(next("--max-bytes")) << 20;
         else if (a == "--no-fusion") fuse_check = false;
         else if (a == "--bench")   bench = true;
+        else if (a == "--timing-only") timing_only = true;
+        else if (a == "--bench-flush") {
+            g_bench_flush = (int64_t)std::atoll(next("--bench-flush")) << 20;
+            bench = true;
+        }
         else if (a == "--bench-iters") bench_iters = std::atoi(next("--bench-iters"));
         else if (a == "--bench-reps")  bench_reps  = std::atoi(next("--bench-reps"));
         else if (a == "--bench-warm-ms") bench_warm_ms = std::atoi(next("--bench-warm-ms"));
@@ -1651,6 +1773,16 @@ int main(int argc, char** argv) {
         else if (a == "-v" || a == "--verbose") { verbose = true; log_set_level(Log::Debug); }
         else { std::fprintf(stderr, "rad-kbench: unrecognised argument '%s'. Try --help.\n",
                             a.c_str()); return 2; }
+    }
+
+    if (timing_only) {
+        if (!record_path.empty()) {
+            std::fprintf(stderr, "rad-kbench: --timing-only runs no reference, so it has nothing to "
+                                 "record; drop one of --timing-only and --record\n");
+            return 2;
+        }
+        bench = true;          /* it is the clock or nothing */
+        fuse_check = false;    /* the fusion oracle is a check too */
     }
 
     /* THE CASE BUDGET, RESOLVED FROM WHAT THE MACHINE HAS IF NOBODY SAID.
@@ -1695,8 +1827,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         return replay(fx, home, hierarchy, ref_name, op_filters, tol_override, max_cases, max_case_bytes,
-                      bench, bench_iters, bench_reps, bench_warm_ms, verbose, report_path, fixture_path,
-                      analysis_path);
+                      bench, bench_iters, bench_reps, bench_warm_ms, verbose, timing_only,
+                      report_path, fixture_path, analysis_path);
     }
 
     RadFile f;
@@ -2043,9 +2175,12 @@ int main(int argc, char** argv) {
                  * oracle with it, and a better one: the claim is byte-identity against its own
                  * plugin's chain, not closeness to a host reference. On a model with many fused
                  * ops this is the difference between a page of skips and a page of checks. */
+                /* A timing-only run times the device kernels: a host row has no clock here, and a
+                 * kernel with no oracle is timed on its own description of its operands. */
+                if (timing_only && dom != RAD_DOMAIN_DEVICE) continue;
                 const bool fuse_only = !oracle && fuse_check && dom == RAD_DOMAIN_DEVICE &&
                                        r.row->info->replaces;
-                if (!oracle && !fuse_only) {
+                if (!oracle && !fuse_only && !timing_only) {
                     /* ref's op list is the conventional vocabulary; an op outside it has no
                      * fallback AND no oracle, and that is a deliberate decision (spec §17). */
                     skipped_ops[o.op + "  (no " + ref_name + " kernel: no oracle exists for it)"]++;
@@ -2557,9 +2692,9 @@ int main(int argc, char** argv) {
                  * no median -- libref is the definition of the op and not a contender, and a
                  * column that pretended otherwise would invite tuning it. */
                 const auto tref0 = std::chrono::steady_clock::now();
-                const int s_ref  = oracle ? launch(oracle, t_ref, scratch_b) : RAD_OK;
+                const int s_ref  = oracle && !timing_only ? launch(oracle, t_ref, scratch_b) : RAD_OK;
                 const double ref_us =
-                    oracle && s_ref >= 0
+                    oracle && !timing_only && s_ref >= 0
                         ? std::chrono::duration<double, std::micro>(
                               std::chrono::steady_clock::now() - tref0).count()
                         : -1.0;
@@ -2580,8 +2715,8 @@ int main(int argc, char** argv) {
                  *
                  * So: copy the outputs the checked launch produced into the host buffers first,
                  * then time on the device tensors, which are still bound to device memory and are
-                 * repointed at the host only afterwards. */
-                if (dom == RAD_DOMAIN_DEVICE && s_test >= 0) {
+                 * repointed at the host only afterwards. A timing-only run reads nothing back. */
+                if (dom == RAD_DOMAIN_DEVICE && s_test >= 0 && !timing_only) {
                     for (size_t k = 0; k < sh.size(); ++k) {
                         if (!dev[k].p) continue;
                         const int role = o.schema->operands[k].role;
@@ -2598,7 +2733,7 @@ int main(int argc, char** argv) {
                  * correctness verdict is about did. The margin is reported by the side it is on
                  * and by how far in it was touched, because "wrote 4 bytes past the end" and
                  * "wrote 208 bytes past the end" are different bugs. */
-                if (dom == RAD_DOMAIN_DEVICE && s_test >= 0) {
+                if (dom == RAD_DOMAIN_DEVICE && s_test >= 0 && !timing_only) {
                     auto margin_check = [&](const DevBuf& d, const std::string& what) {
                         if (!d.on) return;
                         uint8_t lo[RED_BYTES], hi[RED_BYTES];
@@ -2935,6 +3070,25 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
+                if (timing_only) {
+                    ++st.timed;
+                    Row rw;
+                    rw.op = o.op;
+                    rw.kernel = r.row->info->name;
+                    rw.plugin = r.row->plugin;
+                    rw.geom = g.str();
+                    rw.domain = domain_name(dom);
+                    rw.choice = r.choice;
+                    rw.verdict = "timed";
+                    rw.us = case_us;
+                    rw.us_spread = case_spread;
+                    rw.synthesised = !from_container;
+                    for (size_t k = 0; k < sh.size(); ++k)
+                        if (!sh[k].absent) rw.bytes += (int64_t)bufs[k].size();
+                    report_rows.push_back(std::move(rw));
+                    continue;
+                }
+
                 /* Compare every OUT and INOUT operand, AND NAME THE WORST ONE. An op with five
                  * outputs reports one number, and which output carries it is most of the
                  * diagnosis: `gdn_conv_update` writing a correct q and k and a wrong conv_state is
@@ -3117,13 +3271,16 @@ int main(int argc, char** argv) {
     std::printf("\n%d checked, %d passed, %d failed, %d skipped, %d diverged, %d capped. "
                 "worst rel_l2 = %.3e\n", st.checked, st.passed, st.failed, st.skipped,
                 st.diverged, st.capped, st.worst);
+    if (timing_only)
+        std::printf("%d timed. Timing only: nothing was checked against a reference.\n",
+                    st.timed);
     std::printf("memory: %d case(s) ran inside guarded allocations, %d wrote outside one\n",
                 st.guarded, st.overrun);
     print_row_coverage(census(reg, ref_name), report_rows);
     if (st.failed == 0 && st.checked > 0)
         std::printf("every resolved kernel agrees with %s on this container's bytes\n",
                     ref_name.c_str());
-    if (st.checked == 0)
+    if (st.checked == 0 && !timing_only)
         std::printf("NOTHING WAS CHECKED. Either every op resolved to %s (so there is nothing to "
                     "falsify) or no op has a shape recipe.\n", ref_name.c_str());
     if (!report_path.empty()) {

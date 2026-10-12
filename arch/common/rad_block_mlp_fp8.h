@@ -90,6 +90,8 @@ struct MlpFP8 {
                  const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* The block over the first `T` rows of its buffers (MoeFP8::step_rows says who asks). */
+    void step_rows(RadCtx* c, int64_t T) const { slice(c, T, 0, T); }
     /* One row slice of the whole block; `rows <= 0` means the rest of the step. */
     void slice(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
 };

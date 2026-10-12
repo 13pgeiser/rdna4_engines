@@ -221,6 +221,7 @@ public:
     int logprobs_for(int64_t row, int32_t token, TokenLogprobs* out) const;
     /* Did `sample_logprobs` resolve? What the server advertises as logprobs support. */
     bool has_logprobs() const { return op_logprobs_ != RAD_NULL_HANDLE; }
+    const SamplerConfig& config() const { return cfg_; }
 
     /* The parameter rows the last build_step or build_greedy staged, and how many. What `run`
      * uploads, readable so the staging can be checked without a device behind it. */

@@ -313,6 +313,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["staged_units"]   = s.experts.staged_units;
             e["staged_bytes"]   = (double)s.experts.staged_bytes;
             e["stage_overflow"] = s.experts.stage_overflow;
+            e["stage_copies"]   = s.experts.stage_copies;
             o["experts"] = std::move(e);
         }
 

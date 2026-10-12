@@ -53,6 +53,11 @@ struct KernelRow {
      * their operands and their scratch, so one may run beside another that shares none of those
      * bytes. False when the plugin does not say. */
     bool                 concurrent = false;
+    /* The plugin's rad_kernel_collective answer for this row: its launches exchange data with
+     * the other ranks' cards, and -- `releases_link` -- end the engine's hold on the link
+     * themselves, through `link_gate`. False when the plugin does not say. */
+    bool                 collective = false;
+    bool                 releases_link = false;
     /* The row's plugin declared itself a reference implementation (RadPluginReferenceFn). */
     bool                 reference = false;
 };
@@ -573,6 +578,17 @@ struct SamplingParams {
     std::shared_ptr<const GbnfProgram> grammar_program;
 };
 
+/* THE RAW LOGITS AT CHOSEN VOCABULARY IDS, read at the prompt's last position: what a caller
+ * that answers from a distribution over a handful of tokens needs (/v1/systemone), and nothing
+ * more of the vocabulary. The caller fills `tokens` before submission; the engine writes `logits`
+ * in the same order, from the logits row BEFORE the sampler touches it, and before the request's
+ * sink finishes. Read them only after a successful finish. Shared, so the result outlives a
+ * caller that left mid-step. */
+struct TokenScores {
+    std::vector<int32_t> tokens;
+    std::vector<float>   logits;
+};
+
 struct Request {
     uint64_t             id = 0;
     std::vector<int32_t> prompt;
@@ -639,6 +655,19 @@ struct Request {
      * reads, and the engine hands them to the KL scorer (core/kld.h). Only the --kld mode sets
      * it; the logits buffer is sized for it there and nowhere else. */
     bool                 score = false;
+
+    /* THE END OF A PREFIX OTHER REQUESTS WILL START FROM, in prompt tokens; 0 for none. On a
+     * model with linear state (convolutions, a recurrence) a prefix hit resumes from a state
+     * checkpoint, and those are written only on the checkpoint interval and at a long prompt's
+     * tail -- neither is where a shared head of a few hundred tokens ends. The scheduler ends a
+     * prefill chunk here, rounded down to its quantum, and writes a checkpoint as it does on the
+     * interval (Scheduler::plan_chunk), so the requests that follow reuse the whole head.
+     * /v1/systemone sets it on the first question of several over one state. */
+    int64_t              checkpoint_at = 0;
+
+    /* NON-NULL: read the raw logits at these ids at the prompt's last position (TokenScores).
+     * The request still samples the one token max_tokens allows; the caller discards it. */
+    std::shared_ptr<TokenScores> token_scores;
 
     /* AN EMBEDDING REQUEST: the whole prompt in ONE step, never split -- an encoder that attends
      * both ways cannot be fed half its input -- and finished at that step with its pooled vector
@@ -964,6 +993,12 @@ struct Config {
      * output to say so, so it is refused unless this says otherwise -- deliberately, and by a
      * flag with `debug` in its name (startup.h, rad_gate_reference_kernels). */
     bool    accept_reference_kernels = false;
+
+    /* WHERE EACH OPTION THE OPERATOR SET CAME FROM, keyed by the option table's spelling:
+     * "command line", or the environment variable that supplied it. An option absent here took
+     * its default or was resolved at startup -- the distinction the startup report
+     * (core/diag/diag.h) prints beside every value. */
+    std::map<std::string, std::string> given;
 };
 
 }  /* namespace rad */

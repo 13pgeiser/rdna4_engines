@@ -176,6 +176,18 @@ struct SlabClass {
 #define RAD_PLACE_FILE_WINDOWS 4
 #define RAD_PLACE_FILE_WINDOW_BYTES ((int64_t)32 << 20)
 
+/* THE HEAT ENGINE'S MOVE BUDGET: swaps a STEP, a slab class. HeatParams::moves_per_step defaults
+ * to it, and the free slots below are sized from it, because the two are one quantity: a swap
+ * that finds no free slot does not happen.
+ *
+ * The engine proposes once a step (Engine::tiering_dispatch), and a step routes every layer, so
+ * the budget has to cover the whole model's turnover. Replaying the routing of a mixed workload
+ * through the engine's policy at Qwen3.8-Flash-Next TP1 (40% of the experts resident), the hit
+ * rate on decode rows is 63.8% at 8 a step, 74.1% at 32, 77.1% at 64 and 77.8% at 128 -- and an
+ * oracle that knows every future routing, held to the same 64 swaps a step, reaches 78.0%. Past
+ * this the move rate, not the ranking, is what bounds the hit rate. */
+#define RAD_PLACE_MOVES_PER_STEP 64
+
 /* SHADOW SLOTS: slab slots that are allocated but hold no unit, so a promotion writes into one
  * and only then publishes and never DMAs over a slot a kernel might still be reading (mover.h).
  *
@@ -184,11 +196,27 @@ struct SlabClass {
  * explicitly and --gpu-headroom-mib is memory the engine promises NOT to touch. So dynamic
  * placement costs a few resident units, and the plan report prints exactly how many.
  *
- * 32 is far past where the knob stops mattering, and MORE is the wrong end of the problem: extra
- * shadows raise the move rate and run SLOWER, because more copies in flight contend with the
- * zero-copy tier for the same link. The quarter-of-the-slab cap only ever binds on a slab too
- * small for the number to be meaningful. */
+ * THESE ARE THE SLOTS THE ENGINE CAN ALWAYS COUNT ON, and the expert floor charges for them
+ * (expert_vram_floor), so every slot here is one the KV cache can never have. The rest of what the
+ * move budget needs is RAD_PLACE_TURNOVER_SLOTS, taken out of the cache's loan instead. The
+ * quarter-of-the-slab cap only ever binds on a slab too small for the number to be meaningful. */
 #define RAD_PLACE_SHADOW_SLOTS 32
+
+/* THE TURNOVER SLOTS: free slab slots the mover keeps out of a loan (Mover::lend_from), past the
+ * shadow slots, by filling the loan's slots only up to them. A swap holds a slot for about three
+ * steps -- the copies go out behind the step that proposed them, the next step's retire publishes
+ * them, and the slot the demotion left comes back only once the compute stream has passed the
+ * quarantine recorded after that publish -- so a budget of RAD_PLACE_MOVES_PER_STEP needs three
+ * times as many free slots, and with fewer the budget is smaller than it says. At 64 a step,
+ * replaying the routing with 32 slots in all reaches 65.9% against 77.9% with 192.
+ *
+ * Out of the loan because that costs the cache nothing: a lent slot left free is one the experts
+ * were borrowing anyway, and charged to the expert floor instead the same slots would come out of
+ * the cache's largest size. When the cache takes memory back, the free slots at the loan's top go
+ * first and the mover rebuilds them by dropping its coldest lent units, which still have their
+ * host copies (Mover::balance); only once nothing is lent does the move rate fall back to what
+ * the shadow slots alone allow. */
+#define RAD_PLACE_TURNOVER_SLOTS (3 * RAD_PLACE_MOVES_PER_STEP - RAD_PLACE_SHADOW_SLOTS)
 
 /* ------------------------------------------------------------------ per-weight result */
 struct Placement {
@@ -206,6 +234,8 @@ class Plan {
 public:
     int      rank = 0, world_size = 1;
     Strategy strategy = Strategy::Auto;
+    /* Why `strategy` is the one it is, when `auto` chose it; empty when it was asked for. */
+    std::string strategy_why;
 
     /* False under Config::deterministic. Dynamic placement sets which experts are resident and
      * residency sets the summation order, so identical inputs do not give identical outputs

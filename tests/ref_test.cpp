@@ -258,6 +258,7 @@ TEST(op_vocabulary) {
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "act_mul", "seg_mean", "pool_rows",
         "relu", "clamp", "conv2d", "conv1d_dw", "rel_sinusoid", "attn_local_rel", "gelu", "silu",
         "sigmoid", "fill", "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv",
+        "causal_conv1d",
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
@@ -269,6 +270,7 @@ TEST(op_vocabulary) {
         "gated_had_quant_i8",
         "dequant",
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
+        "grid_embed_aa",
         "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
         "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
@@ -717,6 +719,110 @@ TEST(op_ple_conv) {
         /* off = num_accepted - 1 = 2, so the window is cs[2..5] = (2, 0, 3, 0) and t=0 reads
          * hist[0]=2, hist[2]=3, x[0]=1 -> 231. Read at offset 0 it would have been 9,2,1 = 921. */
         CHECK_NEAR(y.at(0), 1000.0f + silu(231.0f), 1e-3);
+    }
+}
+
+/* SigLIP2's position resample, against torch's own F.interpolate(bilinear, align_corners=False,
+ * antialias=True) of the same 4 x 4 x 2 table: shrinking to 2 x 3 (the filter widens), growing to
+ * 6 x 5 (half-pixel taps, edges clamped) and to 1 x 1 (the whole table, averaged). */
+TEST(op_grid_embed_aa_is_torchs_antialiased_bilinear) {
+    const int side = 4, n = 2;
+    T tab(RAD_F32, {side * side, n});
+    tab.f({ 0.0f, -0.5f, 0.25f, 1.25f, 0.5f, 0.0f, 0.75f, 1.75f, 1.0f, 2.0f, 1.25f, 0.75f, 1.5f, 2.5f,
+            1.75f, 1.25f, 2.0f, 1.5f, 2.25f, 3.25f, 2.5f, 2.0f, 2.75f, 3.75f, 3.0f, 4.0f, 3.25f,
+            2.75f, 3.5f, 4.5f, 3.75f, 3.25f });
+    struct G { int h, w; std::vector<float> want; };
+    const G cases[] = {
+        { 2, 3, { 0.789286f, 0.996429f, 1.089286f, 1.339286f, 1.389286f, 1.682143f, 2.360714f,
+                  2.653571f, 2.660714f, 2.910714f, 2.960714f, 3.167857f } },
+        { 6, 5, { 0.0f, -0.5f, 0.175f, 0.725f, 0.375f, 0.625f, 0.575f, 0.525f, 0.75f, 1.75f, 0.5f,
+                  0.75f, 0.675f, 0.925f, 0.875f, 1.125f, 1.075f, 1.325f, 1.25f, 1.5f, 1.166667f,
+                  1.916667f, 1.341667f, 1.391667f, 1.541667f, 1.791667f, 1.741667f, 2.191667f,
+                  1.916667f, 1.666667f, 1.833333f, 1.583333f, 2.008333f, 2.458334f, 2.208333f,
+                  2.458333f, 2.408334f, 2.458333f, 2.583333f, 3.333334f, 2.5f, 2.75f, 2.675f,
+                  2.925f, 2.875f, 3.125f, 3.075f, 3.325f, 3.25f, 3.5f, 3.0f, 4.0f, 3.175f, 3.125f,
+                  3.375f, 3.625f, 3.575f, 4.125f, 3.75f, 3.25f } },
+        { 1, 1, { 1.875f, 2.125f } },
+    };
+    for (const G& g : cases) {
+        const int M = g.h * g.w;
+        T x(RAD_F32, {M, n});
+        std::vector<float> zero((size_t)(M * n), 0.0f);
+        x.f(zero);
+        T crd(RAD_I32, {4, M});
+        std::vector<int64_t> c((size_t)(4 * M));
+        for (int r = 0; r < M; ++r) {
+            c[(size_t)r] = r / g.w;
+            c[(size_t)(M + r)] = r % g.w;
+            c[(size_t)(2 * M + r)] = g.h;
+            c[(size_t)(3 * M + r)] = g.w;
+        }
+        crd.n(c);
+        A a; a.t(x).t(tab).t(crd).i("M", M).i("n", n).i("side", side).s("dtype", "f32");
+        CHECK_OK(run("grid_embed_aa", a));
+        for (int i = 0; i < M * n; ++i) CHECK_NEAR(x.at(i), g.want[(size_t)i], 2e-5);
+    }
+}
+
+/* LFM2's short convolution: ple_conv's window at dilation one, with no activation. */
+TEST(op_causal_conv1d) {
+    const int n = 1, wid = 3;
+    /* COLD: zeros in front of the sequence, and the last width-1 inputs left at offset zero. */
+    {
+        T x(RAD_F32, {4, 1}); x.f({ 1, 2, 3, 4 });
+        T w(RAD_F32, {1, 3}); w.f({ 100, 10, 1 });
+        T cs(RAD_F32, {1, 1, 2}); cs.f({ 7, 7 });          /* a recycled slot's leftovers */
+        T cu(RAD_I32, {2}); cu.n({ 0, 4 });
+        T ci(RAD_I32, {1}); ci.n({ 0 });
+        T hi(RAD_I32, {1}); hi.n({ 0 });
+        T y(RAD_F32, {4, 1});
+        A a; a.t(x).t(w).t(cs).t(cu).t(ci).t(hi).tnull().t(y)
+             .i("M", 4).i("n", n).i("width", wid).s("dtype", "f32");
+        CHECK_OK(run("causal_conv1d", a));
+        CHECK_NEAR(y.at(0), 1.0f, 1e-5);                 /* 0, 0, 1 -- no silu */
+        CHECK_NEAR(y.at(1), 12.0f, 1e-5);                /* 0, 1, 2 */
+        CHECK_NEAR(y.at(3), 234.0f, 1e-5);               /* 2, 3, 4 */
+        CHECK_EQ(cs.at(0), 3.0f);
+        CHECK_EQ(cs.at(1), 4.0f);
+    }
+    /* WARM, as two chunks, then a decode step read at num_accepted - 1. */
+    {
+        T w(RAD_F32, {1, 3}); w.f({ 100, 10, 1 });
+        T cs(RAD_F32, {1, 1, 4}); cs.f({ 0, 0, 0, 0 });
+        T ci(RAD_I32, {1}); ci.n({ 0 });
+        T cold(RAD_I32, {1}); cold.n({ 0 });
+        T warm(RAD_I32, {1}); warm.n({ 1 });
+        T x1(RAD_F32, {3, 1}); x1.f({ 1, 2, 3 });
+        T cu1(RAD_I32, {2}); cu1.n({ 0, 3 });
+        T y1(RAD_F32, {3, 1});
+        A a; a.t(x1).t(w).t(cs).t(cu1).t(ci).t(cold).tnull().t(y1)
+             .i("M", 3).i("n", n).i("width", wid).s("dtype", "f32");
+        CHECK_OK(run("causal_conv1d", a));
+        T x2(RAD_F32, {1, 1}); x2.f({ 4 });
+        T cu2(RAD_I32, {2}); cu2.n({ 0, 1 });
+        T y2(RAD_F32, {1, 1});
+        A b; b.t(x2).t(w).t(cs).t(cu2).t(ci).t(warm).tnull().t(y2)
+             .i("M", 1).i("n", n).i("width", wid).s("dtype", "f32");
+        CHECK_OK(run("causal_conv1d", b));
+        CHECK_NEAR(y2.at(0), 234.0f, 1e-5);              /* the one-pass t=3 */
+        /* A verify of two drafts (5, 6) behind it, then a step that kept one of them. */
+        T x3(RAD_F32, {2, 1}); x3.f({ 5, 6 });
+        T cu3(RAD_I32, {2}); cu3.n({ 0, 2 });
+        T na1(RAD_I32, {1}); na1.n({ 1 });
+        T y3(RAD_F32, {2, 1});
+        A c; c.t(x3).t(w).t(cs).t(cu3).t(ci).t(warm).t(na1).t(y3)
+             .i("M", 2).i("n", n).i("width", wid).s("dtype", "f32");
+        CHECK_OK(run("causal_conv1d", c));
+        CHECK_NEAR(y3.at(0), 345.0f, 1e-5);
+        CHECK_NEAR(y3.at(1), 456.0f, 1e-5);
+        T x4(RAD_F32, {1, 1}); x4.f({ 9 });
+        T cu4(RAD_I32, {2}); cu4.n({ 0, 1 });
+        T na2(RAD_I32, {1}); na2.n({ 1 });               /* only 5 was kept: history is (4, 5) */
+        T y4(RAD_F32, {1, 1});
+        A d; d.t(x4).t(w).t(cs).t(cu4).t(ci).t(warm).t(na2).t(y4)
+             .i("M", 1).i("n", n).i("width", wid).s("dtype", "f32");
+        CHECK_OK(run("causal_conv1d", d));
+        CHECK_NEAR(y4.at(0), 459.0f, 1e-5);
     }
 }
 

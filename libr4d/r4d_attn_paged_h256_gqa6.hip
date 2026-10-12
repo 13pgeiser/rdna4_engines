@@ -10,8 +10,8 @@
 // the production configuration).
 //
 // `opt` is a bitmask of the optimisation steps, all of them on:
-//     prefill 3955211 = f16 operands | mask skip | folded query scale | contiguous-k fragments
-//                     | prefetch 4 + scheduling barrier | dot2 row sum | block table in SGPRs
+//     prefill 3954187 = f16 operands | mask skip | folded query scale | contiguous-k fragments
+//                     | prefetch 2 + scheduling barrier | dot2 row sum | block table in SGPRs
 //                     | wide K fetch | V prefetch across the m-tile loop | LDS-scoped barrier
 //     decode  3429947 = the same, minus the wide K fetch (its K never reaches LDS), with the K
 //                       prefetch at 2 rather than 4, plus reading K straight from the paged cache
@@ -50,7 +50,10 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 // would need 68096 B > 65536, so the geometry stops at 48.
 #define P_NWARPS 24
 #define P_TILE   48
-#define P_OPT    3955211
+// K PREFETCH 2, NOT 4. Four fragments in flight hold more than the m-tile loop has to give at six
+// waves a SIMD, and the loop then spills: LLVM 22 to 36 bytes a lane and LLVM 24 to 48, which cost
+// LLVM 24 4% of the prefill. At 2 both compilers spill the same 20 bytes, outside the WMMA groups.
+#define P_OPT    3954187
 
 // KVP: 0 = fp8 e4m3 cache, 1 = bf16 cache. Reached only through the two named wrappers below.
 template <int KVP>

@@ -387,6 +387,16 @@ struct MoeFP8 {
      * `pff`, and down into the same `edn` rows the quantised down left zero. */
     std::vector<int64_t>    prot;
     const char*             prot_list = nullptr;
+    /* THE NEXT-LAYER EXPERT PREFETCH (rad_expert_prefetch). `xp_next` is the next routed layer, which
+     * this one predicts for at its router input -- the architecture links them once every layer is
+     * declared. `xp` is what this layer is to the one before it: its router, and each of the model's
+     * experts' unit -- the four handles its place's tables hold, and its place in the routing counts.
+     * Quantised experts only: a bf16 layer and the protected experts are not described, and a layer
+     * with no description is predicted for by nobody. */
+    const MoeFP8*           xp_next = nullptr;
+    RadPrefetchNext         xp{};
+    std::vector<rad_weight> xp_parts;
+    std::vector<int32_t>    xp_count_at;
     int64_t                 n_reg = 0;
     /* How many weight-table classes the quantised GEMMs take: 2 by parity (`moe_gemm_q`), or 4 by
      * number mod 4 (`moe_gemm_q_mod4`, Config::ff_lo4). */
@@ -461,6 +471,10 @@ struct MoeFP8 {
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* The block over the first `T` rows of its buffers, which a pass that runs it for fewer rows
+     * than its batch has asks for: the MTP head's history pass, which reads the head's output only
+     * at its drafting rows. */
+    void step_rows(RadCtx* c, int64_t T) const;
     /* One pass of at most `c.rows` tokens. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
     void shared_up(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool gate_done = false) const;
@@ -1469,6 +1483,29 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                    RAD_STR("dtype", g.dtype)),
                         RAD_NOWEIGHTS),
                     {w.x, w.h.x}, {w.x});
+
+    /* The layer as the prefetch sees it, by the model's expert number -- what the router ranks. */
+    if (!c.expert_bf16 && c.n_expert_all > 0 && n_reg > 0) {
+        const int64_t na = c.n_expert_all;
+        xp_parts.assign((size_t)(na * 4), 0);
+        xp_count_at.assign((size_t)na, -1);
+        for (int64_t s = 0; s < n_reg; ++s) {
+            const int64_t e = c.expert_base + reg[(size_t)s];
+            if (e < 0 || e >= na) continue;
+            xp_parts[(size_t)(e * 4 + 0)] = w_gu[(size_t)s];
+            xp_parts[(size_t)(e * 4 + 1)] = w_gus[(size_t)s];
+            xp_parts[(size_t)(e * 4 + 2)] = w_dn[(size_t)s];
+            xp_parts[(size_t)(e * 4 + 3)] = w_dns[(size_t)s];
+            xp_count_at[(size_t)e] = (int32_t)s;
+        }
+        xp.layer = layer;
+        xp.router = w_router;
+        xp.n_expert = na;
+        xp.top_k = c.top_k;
+        xp.n_parts = 4;
+        xp.parts = xp_parts.data();
+        xp.count_at = xp_count_at.data();
+    }
     return RAD_OK;
 }
 
@@ -1516,6 +1553,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
      * sharing pool (see declare), so issuing it ahead of its declared position moves no byte. */
 
     /* THE ROUTED ARM. */
+    /* THE NEXT ROUTED LAYER'S PREDICTION, from this router's input, read in place behind the router
+     * on the compute stream (rad_expert_prefetch). A failure there costs the prediction, nothing else. */
+    if (xp_next && xp_next->xp.n_parts > 0)
+        (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, r0, rows, g.n_embd);
     /* THE COUNTS GO STRAIGHT INTO THE CORE'S ROW for this layer when it keeps one, so the
      * report at the end of step() hands them over with no copy -- otherwise a card-local blit
      * a routed layer, a whole dependent dispatch for a kilobyte. */
@@ -1564,6 +1605,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
      * 2 * i + q, and each parity is its own pair of table operands; at four classes expert
      * 4 * i + q, class q holding ceil((n_reg - q) / 4). */
     const int64_t n4[4] = { (n_reg + 3) / 4, (n_reg + 2) / 4, (n_reg + 1) / 4, n_reg / 4 };
+    /* The layer before predicted for this one: its copies go into the tables here, where they landed. */
+    (void)rad_expert_prefetch_step(c_, layer);
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
@@ -1608,6 +1651,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const 
                 brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                 RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
                 brows(w.edn, rows * k));
+    /* This layer's streamed experts are read: the next one's copies cross the link from here. */
+    (void)rad_expert_prefetch_mark(c_);
     /* THE PROTECTED EXPERTS, over the trailing run of the offsets: their sorted rows are the
      * ones the quantised down GEMM above zeroed as past its live count, and the down GEMM
      * here writes them -- after it, which the shared `edn` orders. */
@@ -1733,7 +1778,10 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
 }
 
 inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
-    const int64_t T = batch->n_tok;
+    step_rows(c_, batch->n_tok);
+}
+
+inline void MoeFP8::step_rows(RadCtx* c_, int64_t T) const {
     for (int64_t r0 = 0; r0 < T; r0 += c.rows) {
         const int64_t n = (T - r0 < c.rows) ? (T - r0) : c.rows;
         pass(c_, T, r0, n);

@@ -5,6 +5,9 @@
  * translation unit so that nothing above the transport seam pays for it. */
 #include "cpp-httplib/httplib.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -35,6 +38,26 @@ std::string HttpRequest::param(const std::string& k, const std::string& def) con
     if (it != params.end()) return it->second;
     auto q = query.find(k);
     return q == query.end() ? def : q->second;
+}
+
+bool HttpRequest::peer_is_loopback() const {
+    if (peer.empty()) return true;
+    /* "addr:port", where an IPv6 address carries colons of its own: the port is after the last. */
+    const size_t colon = peer.rfind(':');
+    std::string addr = colon == std::string::npos ? peer : peer.substr(0, colon);
+    if (addr.size() >= 2 && addr.front() == '[' && addr.back() == ']')
+        addr = addr.substr(1, addr.size() - 2);
+    in_addr v4{};
+    if (inet_pton(AF_INET, addr.c_str(), &v4) == 1) return (ntohl(v4.s_addr) >> 24) == 127;
+    in6_addr v6{};
+    if (inet_pton(AF_INET6, addr.c_str(), &v6) != 1) return false;
+    if (IN6_IS_ADDR_LOOPBACK(&v6)) return true;
+    return IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127;
+}
+
+int idle_workers(int n_threads) {
+    const int n = n_threads > 0 ? n_threads : (int)std::thread::hardware_concurrency();
+    return std::max(n, 4);
 }
 
 HttpResponse HttpResponse::json_body(int status, std::string body) {
@@ -326,8 +349,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     svr.set_keep_alive_timeout(o.keep_alive_timeout_s);
     svr.set_payload_max_length(o.max_body_bytes);
 
-    int nt = o.n_threads > 0 ? o.n_threads : (int)std::thread::hardware_concurrency();
-    if (nt < 4) nt = 4;
+    const int nt = idle_workers(o.n_threads);
     const size_t most = (size_t)std::max<int64_t>(o.max_threads, nt);
     const size_t queued = (size_t)std::max<int64_t>(o.max_queued, 0);
     svr.new_task_queue = [nt, most, queued] { return new ConnectionPool((size_t)nt, most, queued); };

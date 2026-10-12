@@ -37,7 +37,8 @@ curl -LC - -O https://huggingface.co/StillDeadcode/minicpm5-2b-fp8/resolve/main/
 
 ## Run with Docker
 
-The host needs Docker and an `amdgpu` driver that supports ROCm 7.2; it does not need ROCm. The
+The host needs Docker and an `amdgpu` driver that supports ROCm 10.1; it does not need ROCm. The
+card needs Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The
 image is [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance), with its
 kernels built for `gfx1201`. Pull it, clone this repository for its compose files, then start a
 model from one of them:
@@ -62,7 +63,8 @@ in the clone (it needs `docker buildx` and tests the build as it goes). Then set
 ## Build from source
 
 You need Linux, git, a C++20 compiler, CMake 3.21+ and Ninja. For the device kernels you also need
-ROCm 7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`). Clone the repository and build in it:
+ROCm 10.1 or 7.2 (`hipcc`; set `ROCM_PATH` if it is not `/opt/rocm`). Clone the repository and
+build in it:
 
 ```sh
 git clone https://codeberg.org/StillDeadcode/radiance.git && cd radiance
@@ -71,6 +73,12 @@ git clone https://codeberg.org/StillDeadcode/radiance.git && cd radiance
 cmake -S . -B build -G Ninja -DRAD_GPU_TARGETS='gfx1201'   # build for cards this machine lacks
 cmake --install build --prefix /opt/radiance # optional; bin/, include/, share/radiance/
 ```
+
+With ROCm 10.1 the build turns the compiler's VOPD pairing (dual-issue instruction pairs) off: its
+LLVM 24 pairs in an order that follows heap addresses, so two builds of the same source can differ.
+The Docker image builds its compiler with the fix and keeps the pairing, which is 1-3% faster on
+the fp8 prefill GEMMs; a compiler that has the same fix is declared with
+`-DRAD_HIP_VOPD_REPEATABLE=ON`. ROCm 7.2 is unaffected.
 
 ## Run without Docker
 

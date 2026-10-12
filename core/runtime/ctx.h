@@ -33,7 +33,9 @@
 #include "device/device.h"
 
 #include <atomic>
+#include <memory>
 #include <string>
+#include <deque>
 #include <vector>
 #include <unordered_map>
 
@@ -44,6 +46,9 @@
 struct RadCtx { };
 
 namespace rad {
+
+struct XpState;
+struct XpLayer;
 
 /* The widest op in the conventional vocabulary is gdn_conv_prep at sixteen operands, with
  * gdn_recurrent_update behind it at fourteen -- both grew when the two kernel plugins' schemas
@@ -64,6 +69,11 @@ struct IssuePlan {
     RadArgs          args{};
     RadLaunchFn      launch = nullptr;
     const KernelRow* row    = nullptr;
+    /* The parameters a launch that holds the link is handed: the geometry's and `link_gate`, for a
+     * row that ends the hold itself; null for every other. Only such a launch takes them, so a
+     * step that holds nothing -- every decode step -- never pays the kernel's read of the word. */
+    const RadParam*  gate_p = nullptr;
+    int              gate_n_p = 0;
 };
 
 /* Per declared op. Trivially copyable on purpose: the bucket table and the issue plans live in two
@@ -79,10 +89,14 @@ struct OpPlan {
     int32_t       n_opd_schema = -1;
     bool          issued   = false;  /* did the run phase ever issue it (spec §16's graph dump) */
     /* IS THIS OP A COLLECTIVE -- i.e. does issuing it put bytes on the interconnect? Set once at
-     * bind, so the accounting on the issue path is a predicted branch and not a string compare.
-     * The link is shared with the expert mover, so separating "how much of it is the all-reduce"
-     * needs the collective's own traffic counted. */
+     * bind, from the rows it resolved to (rad_kernel_collective) and the conventional all_reduce,
+     * so the issue path tests a predicted branch and not a string. The weight stager's copies
+     * share the link, and give way to it while it runs (Ctx::issue_body). */
     bool          collective = false;
+    /* The conventional all_reduce, whose `n` IS the message's element count -- the one collective
+     * the link bill can be charged for without guessing its wire format. The link is shared with
+     * the expert mover, so separating "how much of it is the all-reduce" needs this counted. */
+    bool          billed = false;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -203,7 +217,7 @@ struct CtxDesc {
 /* ------------------------------------------------------------------ Ctx */
 class Ctx : public RadCtx {
 public:
-    Ctx() = default;
+    Ctx();   /* out of line, beside ~Ctx: xp_ points to a type this header only names */
     ~Ctx();
     Ctx(const Ctx&) = delete;
     Ctx& operator=(const Ctx&) = delete;
@@ -266,6 +280,16 @@ public:
      * dense model, where nothing routes and bind_routing allocated nothing. */
     int               n_route_layers() const { return (int)route_.size(); }
     int64_t           route_n_expert() const { return route_n_expert_; }
+
+    /* ---------------------------------------------------- the next-layer expert prefetch
+     * (xprefetch.h). xp_open at bringup, once the placement has made its pinned pools: their device
+     * ranges and unit strides; it stays off -- and the three calls no-ops -- where the backend or the
+     * placement gives it nothing to do. */
+    void xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride, int n);
+    void xp_close();
+    int  xp_predict(const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
+    int  xp_mark();
+    int  xp_step(int layer);
     /* DRAIN, DO NOT SAMPLE. `next_histogram` returns the oldest staging bank holding a LANDED
      * histogram for a step past `after_step` and before `before_step`, or -1; a caller loops on it
      * with the step of the last one it credited and so sees every histogram the device produced,
@@ -489,7 +513,14 @@ private:
      * fresh issue again every kAuditPlays plays. A difference means the pass depends on something
      * the key does not carry, and it fails the step naming the first dispatch that differs -- a
      * silent difference would be wrong output. */
-    enum TapeKind : uint8_t { kTapePlay = 0, kTapeTable = 1, kTapeHost = 2, kTapeRoute = 3 };
+    enum TapeKind : uint8_t { kTapePlay = 0, kTapeTable = 1, kTapeHost = 2, kTapeRoute = 3,
+                              kTapeXp = 4, kTapeXpMark = 5, kTapeXpStep = 6 };
+    /* A prefetch call (Ctx::xp_predict), run again where the pass made it. */
+    struct TapeXp {
+        RadPrefetchNext next{};
+        rad_buf         h = 0;
+        int64_t         r0 = 0, rows = 0, n_embd = 0;
+    };
     struct TapeStep {
         uint8_t kind = kTapePlay;
         uint8_t lane = 0;        /* the lane the host work ran on */
@@ -510,6 +541,7 @@ private:
         std::vector<TapeStep>  steps;
         std::vector<TapeHost>  host;
         std::vector<std::pair<int, RadRouting>> route;
+        std::vector<TapeXp> xp;
         /* What the recording added to the Ctx's counters, and the bookkeeping it ended on. */
         int64_t  issues = 0, ar_calls = 0, ar_bytes = 0, stream_waits = 0, host_syncs = 0;
         bool     touch_pending[2] = {};
@@ -633,6 +665,16 @@ private:
     int issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     ArchStepFn      arch_step_ = nullptr;
 
+    /* The expert prefetch's state (xp_state.h), null while it is off. */
+    std::unique_ptr<XpState> xp_;
+    void xp_free(XpState& x);
+    void xp_serve(XpState& x);
+    void xp_judge(XpState& x);
+    bool xp_bind(XpLayer& L, int layer);
+    int  xp_predict_run(const RadPrefetchNext& next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
+    int  xp_mark_run();
+    int  xp_step_run(int layer);
+
     int       rank_       = 0;
     int       world_size_ = 1;
     int       device_     = 0;
@@ -752,6 +794,9 @@ private:
     std::vector<uint32_t>               unflushed_;
     std::vector<int64_t>                band_table_;
     std::vector<IssuePlan>              issue_table_;
+    /* The parameter lists of the launches handed `link_gate`: the geometry's and that one. A deque,
+     * so a plan's pointer into one stays good as the next is added. */
+    std::deque<std::vector<RadParam>>   gate_params_;
     std::vector<std::atomic<uint8_t>>   op_domain_;   /* sized once, never resized */
 
     std::vector<RouteSlot> route_;
@@ -771,7 +816,7 @@ private:
     /* Profiling. Off by default; when on it restores synchronisations that change the mover's slot
      * supply, so a profiled run is not comparable against an unprofiled one (spec §16). */
     bool                 profiling_ = false;
-    struct ProfSlot { RadEvent a = nullptr, b = nullptr; int32_t op = 0; };
+    struct ProfSlot { RadEvent a = nullptr, b = nullptr; int32_t op = 0; uint8_t lane = 0; };
     std::vector<ProfSlot> prof_ring_;
     size_t                prof_n_ = 0;
     bool                  prof_overflowed_ = false;
@@ -785,6 +830,12 @@ private:
      * the pipeline the op STOPS, not of the arithmetic it does, and the two differ by two orders
      * of magnitude on the PLE gather. */
     std::vector<double>   prof_join_ms_;
+    /* How long each op's lane sat idle before the op started: from the end of the op before it on
+     * that lane to this one's start. A stream wait (a staged layer's copies, the other lane, a
+     * host op's output) and a host that has not issued the op yet both land here, and neither is
+     * in any op's own time -- so a step whose ops sum to less than its wall time says where the
+     * rest went. */
+    std::vector<double>   prof_wait_ms_;
 
     std::atomic<bool> weights_dirty_{false};
     /* Bumped whenever bind_weights rewrites the templates: any weight pointer resolved from one

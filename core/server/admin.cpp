@@ -534,6 +534,32 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
+/* ================================================================== /diagnostics */
+/* The startup report, read again for this request (ServerOptions::diagnostics_json). Behind the
+ * bearer key like /server_info: it names the machine's devices and boot parameters.
+ *
+ * AND WITHOUT A KEY, ONLY TO THIS MACHINE. /server_info without a key describes the model a
+ * client is already talking to; this describes the host -- its kernel, its boot parameters, its
+ * PCI layout, its memory limits -- which a server bound to 0.0.0.0 with no key would otherwise
+ * hand to anyone who can reach the port. A key is the operator's statement of who may ask. */
+HttpResponse Server::handle_diagnostics(const HttpRequest& req) {
+    if (!opt_.diagnostics_json)
+        return error_response(err_not_implemented(
+            "the server was not given a diagnostics provider; this build has no engine attached"),
+                req.peer);
+    if (opt_.api_key.empty() && !req.peer_is_loopback()) {
+        ApiError e;
+        e.status = 403;
+        e.type = "permission_error";
+        e.message = "/diagnostics describes this machine, and a server started without --api-key "
+                    "answers it only to a client on the same machine (a loopback address); start "
+                    "it with --api-key to read it from elsewhere";
+        return error_response(e, req.peer);
+    }
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, opt_.diagnostics_json());
+}
+
 /* ================================================================== /reset_prefix_cache */
 /* 501 when there is no prefix cache to reset, and that is the point: vLLM answers 200 with an
  * empty body whether or not anything happened, so a benchmark that thinks it started cold has no

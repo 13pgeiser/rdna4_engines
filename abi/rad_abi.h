@@ -95,7 +95,8 @@ typedef int     (*RadInitFn)   (const RadParam* p, int n_p, int rank, int world_
 typedef void    (*RadFiniFn)   (void* instance);
 
 /* The launch. Must not allocate and must not synchronise. Returns RAD_OK or negative; a negative
- * return aborts the step and fails the requests in it, naming the kernel and the geometry. */
+ * return aborts the step and fails the requests in it, naming the kernel and the geometry. A launch
+ * handed `link_gate` may return RAD_LINK_ENDED instead of RAD_OK (rad_kernel_collective). */
 typedef int     (*RadLaunchFn) (const RadArgs* a, RadStream stream);
 
 /* ================================================================== the described launch */
@@ -596,6 +597,26 @@ typedef void (*RadPluginCloseFn)(void);
  * that does not export the symbol, or answers 0, has every launch ordered behind everything
  * before it, which is always correct. The symbol name is `rad_kernel_concurrent`. */
 typedef int  (*RadKernelConcurrentFn)(int i);
+
+/* Optional, and a promise about kernel `i` of rad_kernel_at: nonzero means it is a COLLECTIVE --
+ * its launches exchange data with the other ranks' cards, so the interconnect carries their bytes
+ * for as long as they run and the step waits on it. The engine then keeps its own bulk traffic on
+ * the same links (weights it streams onto the card while the card computes) out of their way for
+ * that time. A plugin that does not export the symbol, or answers 0, has only the conventional
+ * `all_reduce` op treated as one. The symbol name is `rad_kernel_collective`.
+ *
+ * 2 promises more: every launch of the kernel ends that time itself, as soon as the last byte the
+ * other ranks send this card for it has landed -- a kernel that reduces after the exchange has the
+ * link to spare for the rest of its run. The engine then hands each launch it holds the link for
+ * the parameter `link_gate`, the address of a 64-bit word in memory the kernel reaches at system
+ * scope; a launch without it holds nothing and has nothing to end. The kernel reads the word on
+ * the device as it starts -- not the host in the launch call, where the hold has not taken effect
+ * yet -- and, once those bytes have landed, takes one off it with a system-scope atomic if it was
+ * odd; an even word it leaves alone. A launch that did so returns RAD_LINK_ENDED; any other
+ * success is RAD_OK, and the engine then ends the hold behind the launch, so a path that does not
+ * know the word is always safe. */
+typedef int  (*RadKernelCollectiveFn)(int i);
+#define RAD_LINK_ENDED 1
 
 /* Optional: nonzero declares this kernel library a REFERENCE implementation -- written to be
  * plainly correct rather than fast. Three things follow, for any library that says so and for no

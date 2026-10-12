@@ -663,6 +663,18 @@ int h_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
     return stream_push((HostStream*)st, t);
 }
 
+/* A copy a segment, queued in list order: this stream has no dispatch to save, and a task holds
+ * no list, so the list is read here, at the call, as the device backend reads it. */
+int h_memcpy_list_async(const RadCopySeg* segs, int n, unsigned, RadStream st) {
+    RAD_TRY(check_stream(st, "rad_memcpy_list_async"));
+    if (n < 0 || (n > 0 && !segs)) {
+        device_set_error("rad_memcpy_list_async: %d segments at %p", n, (const void*)segs);
+        return RAD_E_INVAL;
+    }
+    for (int i = 0; i < n; ++i) RAD_TRY(h_memcpy_async(segs[i].dst, segs[i].src, segs[i].bytes, st));
+    return RAD_OK;
+}
+
 int h_memset_async(void* dst, int value, int64_t bytes, RadStream st) {
     RAD_TRY(check_stream(st, "rad_memset_async"));
     if (bytes == 0) return RAD_OK;
@@ -775,6 +787,8 @@ const DeviceBackend g_host = {
     h_event_query, h_event_sync, h_event_elapsed_ms,
     h_host_wrote,
     h_memcpy_async, h_memcpy_2d_async, h_memset_async, h_memcpy_ranges_async,
+    h_memcpy_list_async,
+    nullptr, nullptr,   /* no DMA engine, so no link to hold */
     /* No recorded passes: a host stream runs its work as it is issued, so there is no queue to
      * write a recording into, and every pass is issued. */
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,

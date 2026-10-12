@@ -2888,6 +2888,41 @@ TEST(server_info_drops_an_engine_blob_that_is_not_an_object) {
     CHECK(has(r2.body, "\"arch\":\"testarch\""));
 }
 
+/* /diagnostics DESCRIBES THE HOST, so without a key it answers this machine only. With a key the
+ * transport's gate has already checked the caller, and any address may ask. */
+TEST(diagnostics_without_a_key_answers_loopback_only) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    ServerOptions o;
+    o.model_id = "test-model";
+    o.diagnostics_json = [] { return std::string(R"({"findings":[]})"); };
+    Server srv(d, o);
+    auto from = [](Server& s, const char* peer) {
+        HttpRequest q;
+        q.path = "/diagnostics";
+        q.peer = peer;
+        return s.router().dispatch(q).status;
+    };
+    CHECK_EQ(from(srv, "127.0.0.1:50122"), 200);
+    CHECK_EQ(from(srv, "127.8.9.10:50122"), 200);
+    CHECK_EQ(from(srv, "::1:50122"), 200);
+    CHECK_EQ(from(srv, "[::1]:50122"), 200);
+    CHECK_EQ(from(srv, "::ffff:127.0.0.1:50122"), 200);
+    CHECK_EQ(from(srv, ""), 200);                       /* in-process */
+    CHECK_EQ(from(srv, "192.168.1.20:50122"), 403);
+    CHECK_EQ(from(srv, "::ffff:10.0.0.7:50122"), 403);
+    CHECK_EQ(from(srv, "fe80::1:50122"), 403);
+    CHECK_EQ(from(srv, "128.0.0.1:50122"), 403);
+
+    ServerOptions ok = o;
+    ok.api_key = "k";
+    Server keyed(d, ok);
+    CHECK_EQ(from(keyed, "192.168.1.20:50122"), 200);
+}
+
 TEST(tokenize_takes_a_prompt_or_messages_and_never_both) {
     Fixture f;
 

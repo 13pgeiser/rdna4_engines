@@ -72,14 +72,29 @@ __global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
   // candidate, so it is computed once per step and read K times out of LDS.
   __shared__ float sa[DSL_MAX_R];
   __shared__ float ssc[DSL_MAX_K];
-  __shared__ int   schosen;         // the previous step's INDEX into its candidate list
+  __shared__ int   spid;            // the token the previous step chose: this step's predecessor
+
+  // THE CANDIDATES A WAVE SCORES, at most this many: c = wave, wave + DSL_WAVES, ...
+  constexpr int CPW = (DSL_MAX_K + DSL_WAVES - 1) / DSL_WAVES;
 
   for (int l = 0; l < steps; ++l) {
     const long row = (long)s * steps + l;
+    // THE STEP'S OWN READS GO FIRST. The candidates' ids and unary scores do not depend on the
+    // predecessor, so they are in flight with its codebook row instead of behind the barrier, each
+    // a round trip of its own in a walk that is nothing but round trips. A wave past K re-reads
+    // the last candidate and scores nothing.
+    int   cid[CPW];
+    float un[CPW];
+#pragma unroll
+    for (int i = 0; i < CPW; ++i) {
+      const int c = wave + i * DSL_WAVES;
+      const long at = row * cand_ld + (c < K ? c : K - 1);
+      cid[i] = cand[at];
+      un[i]  = unary[at];
+    }
     // Step 0's predecessor is the committed anchor; every later step's is the token this walk
-    // picked last time round, which is why the read has to happen after the barrier below.
-    const int pid = (l == 0) ? anchor[(long)s * anchor_stride]
-                             : cand[(row - 1) * cand_ld + schosen];
+    // picked last time round, which thread 0 left in LDS before the barrier that ended that step.
+    const int pid = (l == 0) ? anchor[(long)s * anchor_stride] : spid;
     const bool pid_ok = pid >= 0 && pid < V;
 
     const r4d_u16* __restrict__ prow = pred + (long)(pid_ok ? pid : 0) * R;
@@ -99,16 +114,21 @@ __global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
     __syncthreads();
 
     // One wave a candidate. R is a multiple of the wave, so the strided loop is balanced and the
-    // reduction is five xor-butterfly steps with no barrier inside it.
-    for (int c = wave; c < K; c += DSL_WAVES) {
-      const int cid = cand[row * cand_ld + c];
-      float acc = 0.0f;
-      if (cid >= 0 && cid < V) {
-        const r4d_u16* __restrict__ srow = succ + (long)cid * R;
+    // reduction is five xor-butterfly steps with no barrier inside it. A candidate out of range
+    // reads codebook row 0 and drops the sum, so the row's loads are never in a branch of their
+    // own; its score is its unary term alone either way.
+#pragma unroll
+    for (int i = 0; i < CPW; ++i) {
+      const int c = wave + i * DSL_WAVES;
+      if (c < K) {
+        const bool ok = cid[i] >= 0 && cid[i] < V;
+        const r4d_u16* __restrict__ srow = succ + (long)(ok ? cid[i] : 0) * R;
+        float acc = 0.0f;
+#pragma unroll 8
         for (int r = lane; r < R; r += DSL_WAVE) acc += sa[r] * r4d_bf2f(srow[r]);
+        acc = r4d_wave_sum(ok ? acc : 0.0f);
+        if (lane == 0) ssc[c] = acc + un[i];
       }
-      acc = r4d_wave_sum(acc);
-      if (lane == 0) ssc[c] = acc + unary[row * cand_ld + c];
     }
     __syncthreads();
 
@@ -120,10 +140,11 @@ __global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
       float bv   = -INFINITY;
       for (int c = 0; c < K; ++c)
         if (ssc[c] > bv) { bv = ssc[c]; best = c; }
-      schosen = best;
-      out[(long)s * out_ld + l] = cand[row * cand_ld + best];
+      const int tok = cand[row * cand_ld + best];
+      spid = tok;
+      out[(long)s * out_ld + l] = tok;
     }
-    // Both directions: the next step reads `schosen` and overwrites `sa`, and every other thread
+    // Both directions: the next step reads `spid` and overwrites `sa`, and every other thread
     // is still reading this step's.
     __syncthreads();
   }

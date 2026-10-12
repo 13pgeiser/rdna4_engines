@@ -39,9 +39,26 @@ __device__ __forceinline__ int r4d_q_seq(const int* cu_q, int num_seqs, int q_le
     return lo;
 }
 
+// ---- the occupancy a kernel is built for ---------------------------------------------------------
+// R4D_WAVES(n) fixes the waves a SIMD the compiler schedules a kernel for. Left to itself the
+// scheduler picks that target, trading registers for occupancy or the reverse, and the choice
+// moves between compiler releases: LLVM 24 serialises a GEMM's loads to win one more wave a SIMD,
+// paying a load round trip per WMMA, and elsewhere hoists more loads and gives a wave up. A kernel
+// whose speed rests on a register budget states the budget with this, so the source and not the
+// compiler version decides it. `n` may depend on template arguments.
+#define R4D_WAVES(n) __attribute__((amdgpu_waves_per_eu((n), (n))))
+
 typedef short    v8s __attribute__((ext_vector_type(8)));
 typedef float    v8f __attribute__((ext_vector_type(8)));
 typedef float    v2f __attribute__((ext_vector_type(2)));   // what cvt_pk_f32_fp8 actually returns
+
+/* A 16-BYTE STAGING REGISTER AS A NATIVE VECTOR. HIP's uint4 is a class template wrapping a union,
+ * and an array of them that a K loop carries -- the next tile's chunks, loaded while this tile is
+ * computed -- is not promoted to registers: LLVM 22 and LLVM 24 both keep it in scratch, so every
+ * staged chunk goes global load, scratch store, scratch load, LDS store. The same array of an
+ * ext_vector_type is promoted. Loaded and stored whole only; r4d_dflash_conv_body.h declares the
+ * same type for a source that is also compiled without this header. */
+typedef unsigned int r4d_u32x4 __attribute__((ext_vector_type(4)));
 
 // exp2 with the hardware transcendental.
 
@@ -64,6 +81,55 @@ __device__ __forceinline__ uint16_t f32_to_bf16(float f) {
 __device__ __forceinline__ float bf16_to_f32(uint16_t h) {
     return __builtin_bit_cast(float, (uint32_t)h << 16);
 }
+
+// ---- 16-bit values held in whole registers -------------------------------------------------------
+// LLVM 24 gives gfx12 real 16-bit registers: a value of a 16-bit type lives in one HALF of a VGPR.
+// Two bf16 assembled into a word then cost a shift and a half move each pair where LLVM 22 used one
+// v_perm_b32, a bf16 widened to a float costs a half move and a shift, and a 16-bit load goes into a
+// half (global_load_d16_b16), so it depends on the register's earlier contents and the waitcnt pass
+// waits for them. The helpers below keep bf16 data in whole 32-bit registers from load to store,
+// which compiles to the same code under both compilers. The bits are the same as the 16-bit forms.
+
+// f32 -> bf16 rounded to nearest even, as the HIGH half of a word whose low half is not zero:
+// f32_to_bf16 before its final shift. A NaN can round to infinity here, as there.
+__device__ __forceinline__ uint32_t bf16_hi_rne(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return u + 0x7fffu + ((u >> 16) & 1u);
+}
+// The same as (__hip_bfloat16)f computes it (LLVM's own expansion of the conversion): a NaN stays
+// a NaN, made quiet, and everything else rounds to nearest even. Both results are formed before
+// the choice so it compiles to one v_cndmask: written as `nan ? u | 0x400000 : u + ...`, the
+// rounding is too long to speculate and each element becomes an exec-masked branch.
+__device__ __forceinline__ uint32_t bf16_hi_rne_nan(float f) {
+    const uint32_t u = __float_as_uint(f);
+    const uint32_t r = u + 0x7fffu + ((u >> 16) & 1u), q = u | 0x400000u;
+    return f != f ? q : r;
+}
+// Two such words as one bf16 pair, `lo`'s high half in the low half: one byte permute.
+__device__ __forceinline__ uint32_t bf16_pack_hi(uint32_t lo, uint32_t hi) {
+    return __builtin_amdgcn_perm(hi, lo, 0x07060302u);
+}
+// Two floats as a bf16 pair (`lo` in the low half), rounded as f32_to_bf16 rounds.
+__device__ __forceinline__ uint32_t bf16x2_rne(float lo, float hi) {
+    return bf16_pack_hi(bf16_hi_rne(lo), bf16_hi_rne(hi));
+}
+// Two floats as a bf16 pair, rounded as (__hip_bfloat16) rounds.
+__device__ __forceinline__ uint32_t bf16x2_rne_nan(float lo, float hi) {
+    return bf16_pack_hi(bf16_hi_rne_nan(lo), bf16_hi_rne_nan(hi));
+}
+// A bf16 pair word's two values as floats: a shift and a mask, no conversion.
+__device__ __forceinline__ float bf16w_lo(uint32_t w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bf16w_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
+
+// One 16-bit element of global memory, zero-extended into a whole register (global_load_u16).
+// Read as a uint16_t and widened afterwards, it is loaded into a register half instead
+// (global_load_d16_b16, or d16_hi_b16 straight into the bf16's float position), which waits for
+// the register's other half; through a generic pointer it is a flat load as well. The pointer
+// must address global memory.
+typedef __attribute__((address_space(1))) const uint16_t* r4d_gu16;
+__device__ __forceinline__ uint32_t ldg_u16(const uint16_t* p) { return *(r4d_gu16)p; }
+// The same element as a bf16 widened to float.
+__device__ __forceinline__ float ldg_bf16(const uint16_t* p) { return bf16w_lo(ldg_u16(p)); }
 
 // `lane ^ N` WITHOUT THE LDS PIPE.  `__shfl_xor` lowers to `ds_bpermute_b32` plus an
 // `s_wait_dscnt` -- an LDS round trip, and when the exchange sits on a dependency chain (a dot

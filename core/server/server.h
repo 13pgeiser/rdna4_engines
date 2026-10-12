@@ -57,6 +57,9 @@ struct ServerOptions {
      * /v1/completions answer 501 naming /v1/embeddings, rather than queueing a request the engine
      * would finish after one step with no text. */
     bool        embedding_model = false;
+    /* WHICH DECISION PROTOCOL THE MODEL WAS TRAINED ON, from the container's `decision.type`:
+     * "d1" serves /v1/systemone (systemone.h); empty answers it 501. Never inferred from a name. */
+    std::string decision_type;
     /* What --model named, reported as the model entry's `root` the way vLLM reports the path it
      * loaded: a served name chosen for clients says nothing about which file is behind it. Empty
      * leaves the field out. */
@@ -121,6 +124,13 @@ struct ServerOptions {
      * showing an op as unissued one step before it flips. Registry::select is asked with
      * record = false and mutates nothing else. */
     std::function<std::string()> graph_json;
+    /* THE STARTUP REPORT READ AGAIN, as JSON (core/diag/diag.h): the options in force, the machine
+     * as it is now (the provider may reuse a reading for a second), and what on it costs speed.
+     * Without a key it is answered to loopback clients only (Server::handle_diagnostics). A
+     * provider like the graph's, because a card's link speed and clock only say anything under
+     * load -- a request made during a long prefill is how a link parked below its maximum is told
+     * from one at rest. */
+    std::function<std::string()> diagnostics_json;
 
     std::string api_key;
     bool        cors = true;
@@ -171,6 +181,8 @@ public:
     int  port() const { return transport_.port(); }   /* 0 until run() is accepting */
 
     int64_t  in_flight() const { return in_flight_.load(std::memory_order_relaxed); }
+    /* The admission ceiling as resolved: ServerOptions::queue_depth, or 8 x max_seqs for 0. */
+    int64_t  queue_cap() const { return queue_depth_; }
 
 private:
     struct Generation;
@@ -185,6 +197,7 @@ private:
     HttpResponse handle_chat(const HttpRequest& req);
     HttpResponse handle_completion(const HttpRequest& req);
     HttpResponse handle_embeddings(const HttpRequest& req);
+    HttpResponse handle_systemone(const HttpRequest& req);
     HttpResponse handle_models(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);
 
@@ -213,6 +226,7 @@ private:
     HttpResponse handle_detokenize(const HttpRequest& req);
     HttpResponse handle_tokenizer_info(const HttpRequest& req);
     HttpResponse handle_server_info(const HttpRequest& req);
+    HttpResponse handle_diagnostics(const HttpRequest& req);
     /* What this deployment can do -- chat, tools, reasoning, grammar, media, logprobs, the
      * reasoning efforts it takes -- as /server_info's `capabilities` and the model entry both
      * report it, built in one place so the two cannot disagree. */

@@ -21,7 +21,9 @@ class OpStager {
 public:
     virtual ~OpStager() = default;
 
-    /* The pass is about to be issued: whether the stager takes part in it. */
+    /* The pass is about to be issued: whether the stager takes part in it. Called before the
+     * run phase brings the weight tables up to date, so a stager turning down a pass may give back
+     * weights it published ahead for it (see end_pass). */
     virtual bool begin_pass(const RadBatch* b) = 0;
 
     /* Before op `h` is issued on stream `s`. `*resync` is set when the residency table changed,
@@ -31,7 +33,9 @@ public:
     /* After op `h` was issued on stream `s`: the point a staged weight's last reader is behind. */
     virtual int after_op(rad_op h, RadStream s) = 0;
 
-    /* The pass has been issued, on `s`: nothing the stager published may outlive it. */
+    /* The pass has been issued, on `s`: nothing the stager published for it may outlive it. It
+     * may publish weights for a later pass it expects to arm for, which that pass's begin_pass
+     * keeps or gives back. */
     virtual int end_pass(RadStream s) = 0;
 };
 

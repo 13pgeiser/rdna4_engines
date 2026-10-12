@@ -376,6 +376,42 @@ int rad_route_report(RadCtx* c, int layer, const RadRouting* r);
  * `n_expert` -- the router then writes its own buffer and reports that. */
 int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert);
 
+/* THE NEXT-LAYER EXPERT PREFETCH, at decode. A routed layer names the next routed layer at its router
+ * input; the core applies that layer's router to this layer's input rows, takes the experts the next
+ * layer is likeliest to route that sit in the pinned host pool, and copies them onto the card while
+ * the rest of this layer runs. Just before the next layer's routed GEMMs it points their weight-table
+ * entries at the copies, where the copies have landed and the entries still name the pool slots they
+ * were made from. It changes no result: a copy holds the bytes of its slot. It is on where the
+ * placement keeps experts in a pinned pool and the device backend can spare a DMA engine for it, and
+ * a pass of more than 16 rows makes no prediction; the three calls are no-ops otherwise.
+ *
+ * `parts` names, for each of the next layer's experts, the weights its unit is made of (at most four,
+ * e.g. the gate-up matrix and its scales and the down matrix and its scales), as the routed GEMMs
+ * read them through weight tables; 0 where an expert has fewer or none. An expert is prefetched only
+ * where each of its weights is in exactly one table and all of them sit in one pool slot. The arrays
+ * must outlive the context; the core reads the routing counts only to rank and count, never to choose
+ * an expert's bytes. `layer` is the next layer's index as rad_route_report and
+ * rad_expert_prefetch_step name it; `router` is its router, [n_expert, n_embd] bf16. */
+typedef struct RadPrefetchNext {
+    int               layer;
+    rad_weight        router;
+    int64_t           n_expert, top_k;
+    int64_t           n_parts;
+    const rad_weight* parts;      /* [n_expert * n_parts] */
+    const int32_t*    count_at;   /* [n_expert]: where the expert's count is in the layer's routing
+                                     counts (rad_route_counts), -1 for nowhere; null when at its index */
+} RadPrefetchNext;
+
+/* At this layer's router input: `h` rows [r0, r0 + rows) of n_embd bf16, read in place on another
+ * stream -- the block must not overwrite them before this layer's routed GEMMs. */
+int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows,
+                        int64_t n_embd);
+/* After this layer's routed down GEMM: the copies cross the link from here, under the next layer's
+ * attention rather than under this layer's own streamed experts. */
+int rad_expert_prefetch_mark(RadCtx* c);
+/* Ahead of `layer`'s routed GEMMs, on every routed layer of every pass. */
+int rad_expert_prefetch_step(RadCtx* c, int layer);
+
 /* A weight's pointer, for the rare op that genuinely needs one (a plugin-private kernel invoked
  * outside the op vocabulary). Waits on the mover. Using this forfeits nothing except the ability
  * to move that weight while the pointer is live, so it is legal only within one issue. */

@@ -706,6 +706,7 @@ TEST(vocab_section_round_trip) {
     in.bos = -1; in.eos = 2; in.eot = 2; in.unk = 0; in.pad = -1; in.sep = -1;
     in.add_bos = false;
     in.add_eos = true;
+    in.ignore_merges = true;
     in.chat_template = "{{ messages }}";
     VocabStep s0; s0.kind = RAD_NORM_NFC;             in.steps.push_back(s0);
     VocabStep s1; s1.kind = RAD_PRE_SPLIT; s1.arg0 = "\\p{N}"; s1.iarg = 1; in.steps.push_back(s1);
@@ -749,6 +750,7 @@ TEST(vocab_section_round_trip) {
     CHECK_EQ(out.eos, in.eos);
     CHECK_EQ(out.unk, in.unk);
     CHECK_EQ(out.add_eos, in.add_eos);
+    CHECK_EQ(out.ignore_merges, in.ignore_merges);
     CHECK_EQ(out.chat_template, in.chat_template);
     CHECK_EQ(out.steps.size(), in.steps.size());
     for (size_t i = 0; i < out.steps.size(); ++i) {

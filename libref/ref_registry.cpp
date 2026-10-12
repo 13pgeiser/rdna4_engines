@@ -124,6 +124,11 @@ static const RadParamSpec pPleConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
 static const RadOperandSpec oPleConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                           OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
                                           OPD_O("num_accepted"), OUT("y") };
+static const RadParamSpec pCausalConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+                                             OPD_O("cache_idx"), OPD_O("has_init"),
+                                             OPD_O("num_accepted"), OUT("y") };
 
 static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
@@ -655,6 +660,11 @@ static const RadOpSchema kSchemas[] = {
   "`coord` is [4, M] -- row, column, grid height, grid width -- and the position is sampled "
   "bilinearly with the grid's corners on the table's corners (align_corners), edge taps clamped. "
   "The taps are summed in f32 and rounded to x's dtype, then added to x and rounded again." },
+{ "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
+  "x += the side x side table resampled as torch's F.interpolate(bilinear, align_corners=False, "
+  "antialias=True) resamples it to the row's grid -- SigLIP2's position embedding: per axis a "
+  "triangle filter on half-pixel centres, widened by the scale when shrinking, its in-table taps "
+  "normalised. Separable, f32, rounded once before the add; coordinates clamp into their grid." },
 { "add", ARR(pMnD), ARR(oBinary),
   "y = a + b. An operand carrying exactly n elements against a taller output broadcasts along "
   "rows; nothing else broadcasts." },
@@ -723,6 +733,12 @@ static const RadOpSchema kSchemas[] = {
   "(width-1)*dilation - 1 slots plus one a token. Absent, every token commits: the read is at "
   "offset zero and the last (width-1)*dilation inputs land at offset zero, which is the prefill "
   "chunk. `resid` absent drops the add and leaves the plain convolution." },
+{ "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
+  "y[t] = sum_j w[c][j] * x[t - (width-1-j)], a DEPTHWISE CAUSAL convolution with no activation "
+  "and no residual (LFM2's short convolution, whose gates the caller applies). The state, "
+  "`has_init`, `cache_idx` and `num_accepted` are ple_conv's at dilation one: a window of width-1 "
+  "values, read at `num_accepted - 1` and rewritten shifted by one with every input of a decode "
+  "step behind it, or left as the chunk's last width-1 inputs when `num_accepted` is absent." },
 { "ngram_ids", ARR(pNgramIds), ARR(oNgramIds),
   "ids[m][h] = remainder(hash of the n-gram ending at m, vocab_sizes[h]) + offsets[h], where "
   "hash = t0*mult[0] ^ t1*mult[1] ^ ... over as many shifted tokens as head h's block needs -- "
@@ -1094,6 +1110,9 @@ SIMPLE("ref_layernorm", "layernorm", "norm", "layer norm with gain and bias", DT
        ref_layernorm),
 SIMPLE("ref_grid_embed", "grid_embed", "elem",
        "bilinear resample of a learned position grid, added in", DT_FLOAT, ref_grid_embed),
+SIMPLE("ref_grid_embed_aa", "grid_embed_aa", "elem",
+       "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
+       ref_grid_embed_aa),
 SIMPLE("ref_add", "add", "elem", "elementwise sum", DT_FLOAT, ref_add),
 SIMPLE("ref_mul", "mul", "elem", "elementwise product", DT_FLOAT, ref_mul),
 SIMPLE("ref_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", DT_FLOAT,
@@ -1126,6 +1145,8 @@ SIMPLE("ref_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot
        DT_FLOAT, ref_ple_gate),
 SIMPLE("ref_ple_conv", "ple_conv", "norm", "PLE's dilated depthwise conv, silu and residual add",
        DT_FLOAT, ref_ple_conv),
+SIMPLE("ref_causal_conv1d", "causal_conv1d", "conv", "depthwise causal conv, no activation",
+       DT_FLOAT, ref_causal_conv1d),
 SIMPLE("ref_gather_rows", "gather_rows", "elem", "y[i,:] = x[idx[i],:]", DT_ANY, ref_gather_rows),
 SIMPLE("ref_scatter_rows", "scatter_rows", "elem", "x[idx[i],:] = v[i,:]", DT_ANY, ref_scatter_rows),
 SIMPLE("ref_cast", "cast", "elem", "dtype conversion", DT_ANY, ref_cast),
@@ -1304,4 +1325,10 @@ extern "C" int rad_kernel_count(void) {
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
     return &kKernels[i];
+}
+/* The rows that join the other ranks (ref_collective.cpp), said through the ABI
+ * (RadKernelCollectiveFn) so the gather counts as one as well as the all-reduce. */
+extern "C" int rad_kernel_collective(int i) {
+    const RadKernelInfo* k = rad_kernel_at(i);
+    return k && k->init == ref_collective_init;
 }

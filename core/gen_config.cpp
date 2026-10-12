@@ -41,6 +41,29 @@ std::string GenSampling::describe(const SamplingParams& sp) {
     return buf;
 }
 
+std::vector<GenFieldSource> gen_sampling_sources(const GenSampling& stated, const std::string& src,
+                                                 const SamplingParams& served, const Config& cfg) {
+    std::vector<GenFieldSource> out;
+    auto field = [&](const char* flag, const char* name, bool given, bool said, std::string value) {
+        if (given) return;   /* the option's own row says "command line" */
+        std::string why = said        ? "from " + src
+                        : src.empty() ? std::string("the model states no sampling of its own, so "
+                                                    "this is the built-in default")
+                                      : src + " states no " + name +
+                                            ", so this is the built-in default";
+        out.push_back({ flag, std::move(value), std::move(why) });
+    };
+    field("--temp", "temperature", cfg.sample_temp >= 0.0f, stated.temp >= 0.0f,
+          fmt("%g", (double)served.temp));
+    field("--top-k", "top_k", cfg.sample_top_k >= 0, stated.top_k >= 0,
+          std::to_string(served.top_k));
+    field("--top-p", "top_p", cfg.sample_top_p >= 0.0f, stated.top_p >= 0.0f,
+          fmt("%g", (double)served.top_p));
+    field("--min-p", "min_p", cfg.sample_min_p >= 0.0f, stated.min_p >= 0.0f,
+          fmt("%g", (double)served.min_p));
+    return out;
+}
+
 bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampling* out) {
     nlohmann::json j;
     try { j = nlohmann::json::parse(json_text); }

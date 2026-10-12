@@ -314,15 +314,32 @@ __global__ __launch_bounds__(kThreads) void sigmoid_kernel(
 // ref_silu_mul: y[.., i] = silu(gu[.., i]) * gu[.., n + i].  THE GATE IS THE FIRST HALF, which is
 // the order rad-convert fuses gate_proj and up_proj into one weight in; the two conventions cannot
 // drift because both are stated and neither is inferred.
+//
+// A ROW IS SPLIT OVER grid.y, kSiluPer elements a thread. One workgroup a row put a decode step's few
+// rows on as many workgroups, each walking its row a strided element at a time behind an exp and a
+// divide: latency-bound, and the shape of that walk was up to the compiler. Here a thread's
+// elements are independent and their loads unconditional (a column past the row reads its last
+// element and the store drops it), so they are all in flight at once. Same arithmetic an element.
+constexpr uint32_t kSiluPer = 4;
 __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
     const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
     uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ gr = gu + (size_t)m * gu_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
-    for (uint32_t i = threadIdx.x; i < n; i += kThreads) {
-        const float g = bf2f(gr[i]);
-        yr[i] = f32_to_bf16((g / (1.0f + expf(-g))) * bf2f(gr[n + i]));
+    const uint32_t i0 = blockIdx.y * (kSiluPer * kThreads) + threadIdx.x;
+    uint16_t gv[kSiluPer], uv[kSiluPer];
+#pragma unroll
+    for (uint32_t u = 0; u < kSiluPer; ++u) {
+        const uint32_t i = i0 + u * kThreads, ic = i < n ? i : n - 1u;
+        gv[u] = gr[ic];
+        uv[u] = gr[n + ic];
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < kSiluPer; ++u) {
+        const uint32_t i = i0 + u * kThreads;
+        const float g = bf2f(gv[u]);
+        if (i < n) yr[i] = f32_to_bf16((g / (1.0f + expf(-g))) * bf2f(uv[u]));
     }
 }
 
@@ -776,8 +793,9 @@ extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y
     if (M <= 0 || n <= 0) return -2;
     if (!gu_ld) gu_ld = 2 * n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(silu_mul_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
-                       (const uint16_t*)gu, (uint16_t*)y, (uint32_t)n,
+    const uint32_t chunks = ((uint32_t)n + kSiluPer * kThreads - 1u) / (kSiluPer * kThreads);
+    hipLaunchKernelGGL(silu_mul_kernel, dim3((uint32_t)M, chunks), dim3(kThreads), 0,
+                       (hipStream_t)stream, (const uint16_t*)gu, (uint16_t*)y, (uint32_t)n,
                        (uint32_t)gu_ld, (uint32_t)y_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }

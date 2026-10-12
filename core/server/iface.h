@@ -583,6 +583,9 @@ struct MediaOpts {
     /* Soft tokens (encoder output rows) an image may become, for a processor that sizes images
      * by a token budget (Gemma 4's: 70, 140, 280, 560 or 1120). */
     int32_t image_tokens = 0;
+    /* A picture over this many pixels is first scaled down to that area (PIL's bicubic, sides
+     * truncated), as a model's own pipeline may do before its processor; 0 leaves it as sent. */
+    int64_t max_pixels = 0;
 };
 
 class IMultimodal {

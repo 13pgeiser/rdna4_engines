@@ -123,6 +123,7 @@ struct ArInst {
     /* Where the exchange buffers live: 0 in each rank's own VRAM, written by its peers over P2P;
      * 1 in pinned host memory that every card reaches over its own link (build, below). */
     int  host       = 0;
+    long gate_ctr   = 0;      /* the blocks that have seen their peer's bytes land (r4d_ar_seq.h) */
 };
 
 /* A parameter that may have been declared as a RANGE: init is handed the frozen geometry for one
@@ -138,6 +139,10 @@ long long pgeti_hi(const RadParam* p, int n_p, const char* k, long long dflt) {
 }
 
 long align16(long v) { return (v + 15) & ~15L; }
+
+/* The sequence counters' allocation in words: 2 * nbw (r4d_ar_seq.h) and, after them, the block
+ * counter r4d_ar_link_landed keeps, padded to a cache line. */
+long kSeqWords(long nbw) { return 2L * nbw + 32; }
 
 /* Build the world. `max_numel` is the largest message any launch on this instance will carry.
  *
@@ -220,8 +225,8 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
             fl = r4d_ar_ipc_alloc(flag_words * 4, 1, handle, &hlen);
             if (!fl) { fine_fl = 0; fl = r4d_ar_ipc_alloc(flag_words * 4, 0, handle, &hlen); }
         }
-        sq = r4d_ar_ipc_alloc(2L * maxb * 4, 1, handle, &hlen);
-        if (!sq) { fine_sq = 0; sq = r4d_ar_ipc_alloc(2L * maxb * 4, 0, handle, &hlen); });
+        sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 1, handle, &hlen);
+        if (!sq) { fine_sq = 0; sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen); });
     if (!sc || !fl || !sq) return RAD_E_NOMEM;
 
     /* SAY IT, because the fallback above changes what the KERNEL's fence settings mean. The
@@ -254,6 +259,7 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->my_flags   = fl;
     in->my_seq     = sq;
     in->locpack    = lp;
+    in->gate_ctr   = sq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
     {
         std::lock_guard<std::mutex> lk(g_rv.m);
@@ -481,6 +487,15 @@ extern "C" void r4d_rad_ar_fini(void* instance) {
 }
 
 /* ------------------------------------------------------------------ launch helpers */
+
+/* THE ENGINE'S LINK WORD, where it handed one (rad_abi.h, `link_gate`). Over P2P the fused kernels
+ * end the hold as the peer's push lands, on either wire, and say so (RAD_LINK_ENDED); through the
+ * host mailbox it is the reduce that reads those bytes across the link, so those launches return
+ * RAD_OK and leave the hold to the engine. */
+static long link_gate(const RadArgs* a) {
+    long long g = 0;
+    return rad_args_geti(a, "link_gate", &g) ? (long)g : 0L;
+}
 
 enum { AR_X = 0, AR_Y };
 
@@ -1350,26 +1365,32 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         if (!in->locpack) return RAD_E_STATE;
         int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, R4D_AR_WHT6_NB_CAP);
         if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
         const int rc = r4d_ar_hc_write_wht6(
             in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
             in->locpack, in->slot_bytes, in->slot_bytes / 2, r4d_addr(y), r4d_addr(inj),
             r4d_addr(h), (long)M, (long)n, (long)hc, (long)irow, (long)hrow, r4d_addr(ye),
             r4d_addr(ew), r4d_addr(so), sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L,
             (long)ye_ld, (long)ew_ld, (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig,
-            (long)(uintptr_t)s, nblocks, R4D_AR_WHT6_FUSED_THREADS, cfgv.drain, cfgv.acq);
-        return rc == 0 ? RAD_OK : RAD_E_SHAPE;
+            (long)(uintptr_t)s, nblocks, R4D_AR_WHT6_FUSED_THREADS, cfgv.drain, cfgv.acq,
+            early, early ? in->gate_ctr : 0L);
+        if (rc != 0) return RAD_E_SHAPE;
+        return early ? RAD_LINK_ENDED : RAD_OK;
     }
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
 
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
     const int rc = r4d_ar_gather_hc_write(
         in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
         in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h), (long)M, (long)n, (long)hc,
         (long)irow, (long)hrow, r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
         sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld, (long)sh_ld,
         (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
-        cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L);
-    return rc == 0 ? RAD_OK : RAD_E_SHAPE;
+        cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
+        early ? in->gate_ctr : 0L);
+    if (rc != 0) return RAD_E_SHAPE;
+    return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
 /* AT FOUR RANKS, EXACT WIRE ONLY: r4d_rad_ar_hc_write_4rank with the gather in front, on an
@@ -1477,23 +1498,27 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
         if (!in->locpack) return RAD_E_STATE;
         int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, R4D_AR_WHT6_NB_CAP);
         if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
         const int rc = r4d_ar_hc_write_wht6(
             in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
             in->locpack, in->slot_bytes, in->slot_bytes / 2, r4d_addr(y), r4d_addr(inj),
             r4d_addr(h), (long)M, (long)n, (long)hc, (long)irow, (long)hrow, 0L, 0L, 0L, 0L, 0L,
             0L, 0L, 0L, 0L, 0L, 0L, (long)(uintptr_t)s, nblocks, R4D_AR_WHT6_FUSED_THREADS,
-            cfgv.drain, cfgv.acq);
-        return rc == 0 ? RAD_OK : RAD_E_SHAPE;
+            cfgv.drain, cfgv.acq, early, early ? in->gate_ctr : 0L);
+        if (rc != 0) return RAD_E_SHAPE;
+        return early ? RAD_LINK_ENDED : RAD_OK;
     }
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
 
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
     R4D_TRY("ar_hc_write",
         r4d_ar_hc_write(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
                         in->my_seq, in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h),
                         (long)M, (long)n, (long)hc, (long)irow, (long)hrow, (long)(uintptr_t)s,
-                        nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq));
-    return RAD_OK;
+                        nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq, early,
+                        early ? in->gate_ctr : 0L));
+    return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
 /* AT FOUR RANKS, EXACT WIRE ONLY: the wide one-shot with the write as its epilogue. The four-rank

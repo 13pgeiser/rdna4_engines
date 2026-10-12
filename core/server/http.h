@@ -41,6 +41,9 @@ struct HttpRequest {
     std::string header(const std::string& k, const std::string& def = "") const;
     std::string param(const std::string& k, const std::string& def = "") const;
     bool        peer_gone() const { return closed && closed(); }
+    /* True when the peer is this machine: 127.0.0.0/8, ::1, or either written as an IPv4-mapped
+     * IPv6 address -- and for a request made in-process, which has no peer. */
+    bool        peer_is_loopback() const;
 };
 
 struct HttpResponse {
@@ -128,6 +131,11 @@ struct TransportOptions {
     std::string api_key;                  /* "" disables the check */
     bool        cors = true;
 };
+
+/* The workers the pool keeps while idle for TransportOptions::n_threads: that many, one a
+ * hardware thread for 0, and never fewer than 4. One definition, so the number the startup
+ * report states is the number the transport runs. */
+int idle_workers(int n_threads);
 
 class HttpTransport {
 public:

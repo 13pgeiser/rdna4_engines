@@ -33,6 +33,7 @@
 #include "place/planner.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -91,6 +92,13 @@ int  rad_memset_async(void* d, int v, int64_t n, RadStream) {
     if (n > 0) std::memset(d, v, (size_t)n);
     return RAD_OK;
 }
+int  rad_memcpy_list_async(const RadCopySeg* g, int n, unsigned, RadStream) {
+    for (int i = 0; i < n; ++i)
+        if (g[i].bytes > 0) std::memcpy(g[i].dst, g[i].src, (size_t)g[i].bytes);
+    return RAD_OK;
+}
+int  rad_link_hold(RadStream, int) { return RAD_OK; }
+void* rad_link_gate(RadStream) { return nullptr; }
 const char* rad_dev_last_error(void) { return ""; }
 }  /* extern "C" */
 #endif  /* RAD_PLACE_TEST_FAKE_DEVICE */
@@ -766,11 +774,35 @@ TEST(heat_does_not_thrash_on_an_alternating_pattern) {
     CHECK(unguarded > 100);
 }
 
+/* A PREFILL CHUNK IS CREDITED AS ONE CAPPED HISTOGRAM. Ten times the cap's selections credit a
+ * tenth of each count, so the experts keep their order and one chunk cannot outweigh the decode
+ * steps around it; a histogram under the cap is credited in full. */
+TEST(heat_caps_what_one_histogram_credits) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.credit_cap = 512.0f;
+    CHECK_OK(h.init(hf.plan, hp));
+    const int32_t a = hf.unit_of_expert(4), b = hf.unit_of_expert(5), c = hf.unit_of_expert(6);
+
+    const int32_t big_ids[2] = {4, 5};
+    const int32_t big[2] = {4000, 1120};
+    h.observe_ids(0, big_ids, big, 2);
+    CHECK(std::fabs(h.heat(a) - 400.0f) < 1e-3f);
+    CHECK(std::fabs(h.heat(b) - 112.0f) < 1e-3f);
+
+    const int32_t small_ids[1] = {6};
+    const int32_t small[1] = {12};
+    h.observe_ids(0, small_ids, small, 1);
+    CHECK_EQ(h.heat(c), 12.0f);
+    CHECK(std::fabs(h.heat(a) - 400.0f * hp.decay) < 1e-3f);
+}
+
 TEST(heat_respects_the_move_budget) {
     HeatFixture hf;
     HeatEngine h;
     HeatParams hp;
-    hp.moves_per_dispatch = 3;
+    hp.moves_per_step = 3;
     hp.min_gain = 0.5f;
     CHECK_OK(h.init(hf.plan, hp));
 
@@ -824,7 +856,7 @@ TEST(heat_step_proposes_exactly_what_repeated_picks_would) {
     int agreed = 0;
     for (int trial = 0; trial < 400; ++trial) {
         HeatParams hp;
-        hp.moves_per_dispatch = 1 + (int)rnd(8);
+        hp.moves_per_step = 1 + (int)rnd(8);
         hp.min_gain = (float)rnd(3);
         hp.hysteresis = 1.0f + 0.25f * (float)rnd(3);
         HeatEngine h;
@@ -845,7 +877,7 @@ TEST(heat_step_proposes_exactly_what_repeated_picks_would) {
 
         HeatEngine ref = h;
         std::vector<Swap> want;
-        for (int mv = 0; mv < hp.moves_per_dispatch; ++mv) {
+        for (int mv = 0; mv < hp.moves_per_step; ++mv) {
             Swap sw;
             if (!ref.pick(&sw)) break;
             ref.set_busy(sw.promote, true);
@@ -896,7 +928,7 @@ TEST(heat_swaps_stay_inside_a_slab_class) {
     int agreed = 0, crossed = 0, proposed = 0;
     for (int trial = 0; trial < 400; ++trial) {
         HeatParams hp;
-        hp.moves_per_dispatch = 1 + (int)rnd(8);
+        hp.moves_per_step = 1 + (int)rnd(8);
         hp.min_gain = (float)rnd(3);
         hp.hysteresis = 1.0f + 0.25f * (float)rnd(3);
         HeatEngine h;
@@ -920,7 +952,7 @@ TEST(heat_swaps_stay_inside_a_slab_class) {
         }
         for (int k = 0; k < 5; ++k) h.set_busy((int32_t)rnd((uint32_t)n_unit), true);
 
-        /* The reference: repeated picks, each class taking at most `moves_per_dispatch` -- the
+        /* The reference: repeated picks, each class taking at most `moves_per_step` -- the
          * budget is per class. A pick from a class already at its budget is set aside, busy in
          * the copy only. */
         HeatEngine ref = h;
@@ -933,7 +965,7 @@ TEST(heat_swaps_stay_inside_a_slab_class) {
             ref.set_busy(sw.promote, true);
             ref.set_busy(sw.demote, true);
             int& n = per[(size_t)plan.units[(size_t)sw.promote].slab_class];
-            if (n >= hp.moves_per_dispatch) {
+            if (n >= hp.moves_per_step) {
                 aside[(size_t)sw.promote] = aside[(size_t)sw.demote] = 1;
                 continue;
             }
@@ -987,7 +1019,7 @@ TEST(heat_step_agrees_with_picks_over_a_run_of_dispatches) {
     auto rnd = [&](uint32_t n) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x % n; };
     for (int run = 0; run < 20; ++run) {
         HeatParams hp;
-        hp.moves_per_dispatch = 1 + (int)rnd(3);
+        hp.moves_per_step = 1 + (int)rnd(3);
         hp.min_gain = 1.0f + (float)rnd(4);
         hp.hysteresis = 1.0f + 0.25f * (float)rnd(4);
         HeatEngine h;
@@ -1005,7 +1037,7 @@ TEST(heat_step_agrees_with_picks_over_a_run_of_dispatches) {
             }
             HeatEngine ref = h;
             std::vector<Swap> want;
-            for (int mv = 0; mv < hp.moves_per_dispatch; ++mv) {
+            for (int mv = 0; mv < hp.moves_per_step; ++mv) {
                 Swap sw;
                 if (!ref.pick(&sw)) break;
                 ref.set_busy(sw.promote, true);
@@ -1075,7 +1107,7 @@ TEST(heat_credits_and_prices_every_layout_the_plan_can_have) {
     const int32_t n_unit = (int32_t)plan.units.size();
 
     HeatParams hp;
-    hp.moves_per_dispatch = 3;
+    hp.moves_per_step = 3;
     HeatEngine h;
     CHECK_OK(h.init(plan, hp));
     CHECK(h.enabled());
@@ -1118,7 +1150,7 @@ TEST(heat_credits_and_prices_every_layout_the_plan_can_have) {
 
         HeatEngine ref = h;
         std::vector<Swap> expect;
-        for (int mv = 0; mv < hp.moves_per_dispatch; ++mv) {
+        for (int mv = 0; mv < hp.moves_per_step; ++mv) {
             Swap sw;
             if (!ref.pick(&sw)) break;
             ref.set_busy(sw.promote, true);
@@ -1246,6 +1278,23 @@ TEST(slot_pool_hands_out_and_takes_back) {
      * handed back. */
     CHECK_EQ(s.take(), (int64_t)2);
     CHECK_EQ(s.take(), (int64_t)3);
+    CHECK(s.empty());
+}
+
+/* A TAKE RESTRICTED TO THE SLOTS A CALLER WANTS -- the lowest of them -- leaves every other free
+ * slot free and still handed out lowest first (Mover::pool_slot_for keeps a layer's pool slots
+ * together with it). */
+TEST(a_slot_pool_takes_the_lowest_slot_a_predicate_wants) {
+    SlotPool s;
+    s.init(8, 64);
+    for (int64_t k : {1, 3, 4, 6, 7}) s.add_free(k);
+    CHECK_EQ(s.take_where([](int64_t k) { return k % 3 == 0; }), (int64_t)3);
+    CHECK_EQ(s.take_where([](int64_t k) { return k == 5; }), (int64_t)-1);   /* not free */
+    CHECK_EQ(s.n_free(), (int64_t)4);
+    CHECK_EQ(s.take(), (int64_t)1);
+    CHECK_EQ(s.take_where([](int64_t k) { return k > 4; }), (int64_t)6);
+    CHECK_EQ(s.take(), (int64_t)4);
+    CHECK_EQ(s.take(), (int64_t)7);
     CHECK(s.empty());
 }
 
@@ -1650,11 +1699,17 @@ struct LoanRig {
     ComputeWork work;
     int         d = 0;
     int32_t     planned = 0;
+    /* None by default: these tests are about the loan's mechanics, and on a slab this small the
+     * production count would leave most of the loan empty. The turnover test sets its own. */
+    int         turnover = 0;
+
+    explicit LoanRig(int n_expert = 8) : hf(n_expert) {}
 
     int build() {
         HeatParams hp;
         RAD_TRY(h.init(hf.plan, hp));
         MoverConfig mc;
+        mc.turnover_slots = turnover;
         RAD_TRY(m.init(hf.f.prog, hf.plan, mc));
         RAD_TRY(rad_stream_create(&compute, 0));
         RAD_TRY(m.bind_compute_stream(compute));
@@ -1711,12 +1766,13 @@ TEST(the_lent_slots_hold_nothing_until_a_loan_covers_them) {
 }
 
 /* A LENT SLOT LEFT EMPTY IS VRAM BOUGHT AND WASTED ON EVERY STEP, so a loan is filled in the
- * dispatch it arrives in -- every slot at once, hottest units first -- and not a few units a step. */
+ * dispatch it arrives in -- every slot past the turnover slots at once, hottest units first -- and
+ * not a few units a step. */
 TEST(every_lent_slot_is_filled_in_one_dispatch) {
     LoanRig r;
     CHECK_OK(r.build());
     const int64_t slots = r.m.flex_capacity() / r.hf.plan.classes[0].stride;
-    const int64_t expect = std::min<int64_t>(slots, r.pooled());
+    const int64_t expect = std::min<int64_t>(slots - r.m.turnover_slots(), r.pooled());
     CHECK(expect > 1);
 
     CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
@@ -1750,6 +1806,194 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
     std::sort(at.begin(), at.end());
     for (size_t k = 1; k < at.size(); ++k)
         CHECK(at[k] - at[k - 1] >= r.hf.plan.classes[0].stride);
+}
+
+/* THE TURNOVER SLOTS STAY FREE, AND A SHRINKING LOAN DOES NOT TAKE THEM FOR GOOD. The fill stops
+ * that many slots short of the loan so the engine's swaps have somewhere to land. The free slots
+ * are the loan's top, which is what a cache that wants memory back takes first; the mover then
+ * rebuilds them by dropping the coldest lent units -- each still has its host copy, so nothing
+ * crosses the link -- rather than going without until the loan grows back. */
+TEST(the_turnover_slots_stay_free_and_are_rebuilt_by_drops) {
+    LoanRig r(24);
+    r.turnover = 2;
+    CHECK_OK(r.build());
+    CHECK_EQ(r.m.turnover_slots(), (int64_t)2);
+    const int64_t slots = r.m.flex_capacity() / r.hf.plan.classes[0].stride;
+    CHECK(r.pooled() > slots);           /* more to fill than there is room: only the reserve stops it */
+
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.dispatch());
+    const int32_t full = resident_count(r.h, r.hf.plan);
+    CHECK_EQ(full, r.planned + (int32_t)(slots - 2));
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 2) * r.hf.plan.classes[0].stride);
+
+    /* The fill packs from the bottom, so the free slots are the loan's top: a loan cut to what is
+     * held takes exactly them, and the next dispatch drops two lent units to free two more. */
+    const int64_t held = r.m.loan_held(Mover::kLendKV);
+    CHECK(held < Loan::kAll);
+    const uint64_t d2h = r.m.stats().d2h_bytes;
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, held));
+    for (Deadline dl; (r.m.stats().dropped < 2 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.dispatch());
+    for (int k = 0; k < 4; ++k) CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.stats().dropped, (uint64_t)2);
+    CHECK_EQ(r.m.stats().d2h_bytes, d2h);                          /* nothing crossed the link */
+    CHECK_EQ(resident_count(r.h, r.hf.plan), full - 2);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 4) * r.hf.plan.classes[0].stride);
+
+    /* A STEP THAT STAGES FILLS THEM: it swaps nothing, and a unit left out is one its stager
+     * copies. The next ordinary step drops the two coldest back out. */
+    CHECK_OK(r.m.begin_dispatch(r.d++, &r.h));
+    r.work.run(r.compute);
+    CHECK_OK(r.m.balance(&r.h, /*turnover=*/false));
+    for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) {
+        CHECK_OK(r.m.begin_dispatch(r.d++, &r.h));
+        r.work.run(r.compute);
+        CHECK_OK(r.m.balance(&r.h, false));
+    }
+    CHECK_EQ(resident_count(r.h, r.hf.plan), full);
+    for (Deadline dl; (r.m.stats().dropped < 4 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.dispatch());
+    CHECK_EQ(resident_count(r.h, r.hf.plan), full - 2);
+    CHECK_EQ(r.m.stats().d2h_bytes, d2h);
+
+    /* HELD, AN IDLE TICK FILLS THEM as a staged step does; released, the next one drops them. */
+    r.m.hold_turnover(true);
+    for (Deadline dl; (resident_count(r.h, r.hf.plan) < full || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.m.idle_tick(&r.h));
+    CHECK_EQ(resident_count(r.h, r.hf.plan), full);
+    r.m.hold_turnover(false);
+    for (Deadline dl; (r.m.stats().dropped < 6 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.m.idle_tick(&r.h));
+    CHECK_EQ(resident_count(r.h, r.hf.plan), full - 2);
+    CHECK_EQ(r.m.stats().d2h_bytes, d2h);
+}
+
+namespace {
+/* Every weight of every unit stamped with its own bytes, through the device's copies so the same
+ * test runs on a card, and read back from wherever the residency table says it is now. */
+uint8_t stamp_byte(rad_weight w, size_t i) {
+    uint32_t v = (uint32_t)w * 0x9E3779B1u ^ (uint32_t)i * 0x85EBCA6Bu;
+    v ^= v >> 15; v *= 0x2C1B3C6Du; v ^= v >> 12; v *= 0x297A2D39u; v ^= v >> 15;
+    return (uint8_t)v;
+}
+int stamp_units(LoanRig& r, bool check, int* bad) {
+    RadStream s = nullptr;
+    RAD_TRY(rad_stream_create(&s, 0));
+    std::vector<uint8_t> buf;
+    for (const MoveUnit& mu : r.hf.plan.units)
+        for (rad_weight w : mu.weights) {
+            const size_t n = (size_t)r.hf.f.prog.weights[w].logical_bytes;
+            void* at = r.m.residency()->lookup(w)->ptr;
+            buf.resize(n);
+            if (check) {
+                RAD_TRY(rad_memcpy_async(buf.data(), at, (int64_t)n, s));
+                RAD_TRY(rad_stream_sync(s));
+                for (size_t i = 0; i < n; ++i)
+                    if (buf[i] != stamp_byte(w, i)) { ++*bad; break; }
+            } else {
+                for (size_t i = 0; i < n; ++i) buf[i] = stamp_byte(w, i);
+                RAD_TRY(rad_memcpy_async(at, buf.data(), (int64_t)n, s));
+                RAD_TRY(rad_stream_sync(s));
+            }
+        }
+    rad_stream_destroy(s);
+    return RAD_OK;
+}
+/* A full loan, every unit stamped, then one swap whose budgeted victim finds the pool full: the
+ * promotion lands in a working slot and the victim takes the host copy of a unit in a lent slot. */
+int donate_once(LoanRig& r, bool held = false) {
+    RAD_TRY(stamp_units(r, false, nullptr));
+    RAD_TRY(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        RAD_TRY(r.dispatch());
+    int32_t hot = -1, cold = -1;
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) {
+        if (!r.hf.plan.units[(size_t)u].movable) continue;
+        if (hot < 0 && r.h.tier(u) != Tier::VRAM) hot = u;
+        if (cold < 0 && r.h.tier(u) == Tier::VRAM && !r.loan.inside(r.addr(u))) cold = u;
+    }
+    if (hot < 0 || cold < 0) return RAD_E_STATE;
+    Swap sw;
+    sw.promote = hot;
+    sw.demote = cold;
+    r.h.set_busy(hot, true);
+    r.h.set_busy(cold, true);
+    r.m.hold_turnover(held);
+    RAD_TRY(r.m.issue(sw, &r.h));
+    for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+    if (held) return r.h.tier(hot) == Tier::VRAM && r.h.tier(cold) == Tier::VRAM ? RAD_OK : RAD_E_STATE;
+    return r.h.tier(hot) == Tier::VRAM && r.h.tier(cold) != Tier::VRAM ? RAD_OK : RAD_E_STATE;
+}
+}  /* namespace */
+
+/* A BUDGETED VICTIM WITH NO POOL SLOT TO GO TO TAKES A LENT UNIT'S HOST COPY (Mover::donor_slot):
+ * the pool is sized to the units that live in it, so it has none free here, and without the
+ * donation the budgeted range would turn over only as fast as its working slots come round. A
+ * recall then moves the donor -- it has no host copy to drop to -- and every unit's bytes are
+ * where its table entry says, throughout. */
+TEST(a_budgeted_victim_takes_a_lent_units_host_copy_and_a_recall_moves_the_donor) {
+    LoanRig r(24);
+    r.turnover = 2;
+    CHECK_OK(r.build());
+    CHECK_OK(donate_once(r));
+    CHECK_EQ(r.m.stats().donated, (uint64_t)1);
+    CHECK_EQ(r.m.stats().starved_pool, (uint64_t)0);
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+
+    CHECK_OK(r.m.reclaim(Mover::kLendKV, 0, &r.h));
+    CHECK_EQ(r.m.stats().relocated, (uint64_t)1);
+    CHECK_EQ(r.m.loan_held(Mover::kLendKV), (int64_t)0);
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+        CHECK(!r.loan.inside(r.addr(u)));
+    /* The donor kept its place in VRAM: a working slot was free for it. */
+    CHECK_EQ(resident_count(r.h, r.hf.plan), r.planned + 1);
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+}
+
+/* NO DONATION WHILE THE TURNOVER SLOTS ARE HELD -- through a prompt and the steps right after it:
+ * the demotion is starved as it was before donation, and the budgeted victim stays. */
+TEST(a_held_turnover_takes_no_host_copy) {
+    LoanRig r(24);
+    r.turnover = 2;
+    CHECK_OK(r.build());
+    CHECK_OK(donate_once(r, /*held=*/true));
+    CHECK_EQ(r.m.stats().donated, (uint64_t)0);
+    CHECK(r.m.stats().starved_pool >= 1);
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+}
+
+/* A LOAN THAT SHRINKS UNDER A DONOR moves it out before the slot is given back (balance's sweep):
+ * into the budgeted slot its victim left, a copy inside the card, and the shrink completes once
+ * that lands. The working slot it took is rebuilt the usual way, by demoting the coldest budgeted
+ * unit, and every unit's bytes are where its table entry says throughout. */
+TEST(a_shrinking_loan_moves_a_donor_out_before_its_slot_is_given_back) {
+    LoanRig r(24);
+    r.turnover = 2;
+    CHECK_OK(r.build());
+    CHECK_OK(donate_once(r));
+    CHECK_EQ(r.m.stats().donated, (uint64_t)1);
+    const uint64_t d2h = r.m.stats().d2h_bytes;
+
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, 0));
+    for (Deadline dl; (r.m.loan_held(Mover::kLendKV) > 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.loan_held(Mover::kLendKV), (int64_t)0);
+    CHECK_EQ(r.m.flex_used_bytes(), (int64_t)0);
+    CHECK_EQ(r.m.stats().relocated, (uint64_t)1);
+    CHECK_EQ(r.m.stats().d2h_bytes - d2h, (uint64_t)r.hf.plan.classes[0].stride);
+    CHECK_EQ(resident_count(r.h, r.hf.plan), r.planned);
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+        CHECK(!r.loan.inside(r.addr(u)));
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
 }
 
 /* A UNIT IN A LENT SLOT KEEPS ITS HOST COPY, so giving the slot back is a change of address and
@@ -1980,7 +2224,8 @@ TEST(mover_prefetches_staged_units_against_the_declared_order) {
 /* A ROUTED LAYER'S POOLED UNITS, STAGED FOR ONE PASS (Mover::stage_units). Each copied unit's
  * weights are published at the copy, settled -- the caller orders their readers with one wait --
  * and hold the pool slot's bytes; a unit the buffer has no room for keeps its pool address and is
- * counted; a resident unit is never copied; and unstaging publishes the pool addresses again. */
+ * counted; neighbouring pool slots share a copy; a resident unit is never copied; and unstaging
+ * publishes the pool addresses again. */
 TEST(a_staged_layer_is_published_at_its_copies_and_unstaged_at_its_pool_slots) {
     HeatFixture hf;
     Mover m;
@@ -2017,6 +2262,19 @@ TEST(a_staged_layer_is_published_at_its_copies_and_unstaged_at_its_pool_slots) {
     CHECK_EQ(m.stats().staged_units, (uint64_t)staged.size());
     CHECK_EQ(m.stats().stage_layers, (uint64_t)1);
 
+    /* Units on neighbouring pool slots go as one copy, so the copies are the runs of the staged
+     * units' pool addresses -- fewer than the units, since a fresh pool hands slots out in order. */
+    uint64_t runs = 0;
+    const char* run_end = nullptr;
+    for (int32_t u : staged) {
+        const MoveUnit& mu = hf.plan.units[(size_t)u];
+        const char* slot = (const char*)before[mu.weights[0]] - mu.offset[0];
+        if (slot != run_end) ++runs;
+        run_end = slot + each;
+    }
+    CHECK_EQ(m.stats().stage_copies, runs);
+    CHECK(runs < (uint64_t)staged.size());
+
     /* The copies are on the mover's stream: on the host backend a worker thread runs them. */
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     std::vector<uint8_t> is_staged(hf.plan.units.size(), 0);
@@ -2048,15 +2306,16 @@ TEST(a_staged_layer_is_published_at_its_copies_and_unstaged_at_its_pool_slots) {
     rad_stream_destroy(compute);
 }
 
-/* THE PREFILL STAGER'S ORDER over a pass of two routed layers: the first layer is staged at the
- * pass's first op, the second at the first layer's first op, each layer is published back at its
- * pool slots once the next layer starts, and nothing is staged in a pass it did not arm for.
+/* THE PREFILL STAGER'S ORDER over a pass of two routed layers: at the pass's first op the first
+ * layer goes out and, with room left in the ring, the second behind it; each layer is published
+ * back at its pool slots once the next layer starts; and nothing is staged in a pass it did not
+ * arm for.
  *
  * NOT AT ITS OWN LAST OP. A step longer than the MoE block's pass of rows issues a layer's ops once
  * per pass, so its last op runs again; released at the first run, the second would read copies
- * the mover is already overwriting with the layer two on, and every token past the first pass of
- * a step would be garbage. */
-TEST(the_stager_stages_each_layer_one_layer_ahead_and_releases_it_when_the_next_starts) {
+ * the mover is already overwriting with a layer further on, and every token past the first pass
+ * of a step would be garbage. */
+TEST(the_stager_stages_ahead_and_releases_each_layer_when_the_next_starts) {
     Fixture f;
     const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
     f.op("embed", {emb}, false);
@@ -2103,9 +2362,12 @@ TEST(the_stager_stages_each_layer_one_layer_ahead_and_releases_it_when_the_next_
     const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT);
     const int64_t half = each * 8;
     std::vector<char> region((size_t)(2 * half));
-    auto in_buf = [&](rad_weight w, int b) {
-        const char* p = (const char*)m.residency()->lookup(w)->ptr;
-        return p >= region.data() + b * half && p < region.data() + (b + 1) * half;
+    auto in_ring = [&](const std::vector<rad_weight>& ws) {
+        for (rad_weight w : ws) {
+            const char* p = (const char*)m.residency()->lookup(w)->ptr;
+            if (p < region.data() || p >= region.data() + 2 * half) return false;
+        }
+        return true;
     };
     auto at_home = [&](const std::vector<rad_weight>& ws) {
         for (rad_weight w : ws) if (m.residency()->lookup(w)->ptr != home[w]) return false;
@@ -2116,6 +2378,7 @@ TEST(the_stager_stages_each_layer_one_layer_ahead_and_releases_it_when_the_next_
     CHECK_OK(st.init(f.prog, plan, &m, region.data(), 2 * half, 64));
     REQUIRE(st.enabled());
     CHECK_EQ(st.n_layers(), (size_t)2);
+    CHECK_EQ(st.ring_bytes(), 2 * half);
 
     RadBatch b{};
     b.n_tok = 8;
@@ -2128,42 +2391,326 @@ TEST(the_stager_stages_each_layer_one_layer_ahead_and_releases_it_when_the_next_
     CHECK(st.begin_pass(&b));
 
     bool resync = false;
-    CHECK_OK(st.before_op(0, compute, &resync));      /* embed: the first layer goes out */
+    CHECK_OK(st.before_op(0, compute, &resync));      /* embed: both layers go out */
     CHECK(resync);
-    for (rad_weight w : p0) CHECK(in_buf(w, 0));
-    CHECK(at_home(p1));
+    CHECK(in_ring(p0));
+    CHECK(in_ring(p1));
     CHECK_OK(st.after_op(0, compute));
     CHECK_OK(st.before_op(1, compute, &resync));      /* attn0: nothing */
     CHECK(!resync);
-    CHECK_OK(st.before_op(2, compute, &resync));      /* moe0: the second layer goes out */
-    CHECK(resync);
-    for (rad_weight w : p1) CHECK(in_buf(w, 1));
-    for (rad_weight w : p0) CHECK(in_buf(w, 0));
+    CHECK_OK(st.before_op(2, compute, &resync));      /* moe0: nothing left to stage */
+    CHECK(!resync);
+    CHECK(in_ring(p0));
+    CHECK(in_ring(p1));
     CHECK_OK(st.after_op(2, compute));                /* moe0 is layer 0's last op... */
-    for (rad_weight w : p0) CHECK(in_buf(w, 0));
+    CHECK(in_ring(p0));
     CHECK_OK(st.before_op(2, compute, &resync));      /* ...and runs again for the next rows */
-    for (rad_weight w : p0) CHECK(in_buf(w, 0));
+    CHECK(in_ring(p0));
     CHECK_OK(st.after_op(2, compute));
-    for (rad_weight w : p0) CHECK(in_buf(w, 0));
-    for (rad_weight w : p1) CHECK(in_buf(w, 1));
+    CHECK(in_ring(p0));
+    CHECK(in_ring(p1));
     CHECK_OK(st.before_op(3, compute, &resync));      /* attn1 */
-    for (rad_weight w : p0) CHECK(in_buf(w, 0));
+    CHECK(in_ring(p0));
     CHECK_OK(st.before_op(4, compute, &resync));      /* moe1: layer 0 is past every pass */
     CHECK(at_home(p0));
-    for (rad_weight w : p1) CHECK(in_buf(w, 1));
+    CHECK(in_ring(p1));
     CHECK_OK(st.after_op(4, compute));
     CHECK_OK(st.end_pass(compute));
     CHECK(at_home(p1));
     CHECK_EQ(m.stats().stage_layers, (uint64_t)2);
+    CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
 
-    /* A pass that ends after its first layer went out leaves nothing published at a copy. */
+    /* A pass that ends after its first op leaves nothing published at a copy. */
     CHECK(st.begin_pass(&b));
     CHECK_OK(st.before_op(0, compute, &resync));
-    for (rad_weight w : p0) CHECK(in_buf(w, 0));
+    CHECK(in_ring(p0));
     CHECK_OK(st.end_pass(compute));
     CHECK(at_home(p0));
     CHECK(at_home(p1));
     /* The copies are the mover stream's, and the region is this test's. */
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
+/* THE RING OVER MANY LAYERS AND PASSES: room for three and a half layers, six layers a pass, three
+ * passes, so places lap the region and wrap past its end. At every op, the layers still published
+ * at copies sit in the ring without overlapping one another; at a layer's first op every one of
+ * its pooled units is published at a copy holding the pool slot's bytes and the layers before it
+ * are home; the copies go out more than one layer ahead whenever the room allows; and nothing
+ * spills to a read in place. */
+TEST(the_stager_ring_laps_without_overwriting_a_published_layer) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    constexpr int kL = 6, kE = 8;
+    std::vector<std::vector<rad_weight>> lw(kL);
+    for (int l = 0; l < kL; ++l)
+        for (int e = 0; e < kE; ++e)
+            lw[(size_t)l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." +
+                                             std::to_string(e) + ".weight", 1 * MiB,
+                                             RAD_ACCESS_CONDITIONAL, l, e));
+    for (int l = 0; l < kL; ++l) {
+        f.op("attn" + std::to_string(l), {}, false);
+        f.op("moe" + std::to_string(l), lw[(size_t)l], false);
+    }
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 16;
+    cfg.host_pool_mib = 128;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    std::vector<std::vector<rad_weight>> pw(kL);
+    int64_t most = 0;
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT);
+    for (int l = 0; l < kL; ++l) {
+        for (rad_weight w : lw[(size_t)l])
+            if (plan.weight[w].tier == Tier::HostPinned) pw[(size_t)l].push_back(w);
+        most = std::max(most, each * (int64_t)pw[(size_t)l].size());
+    }
+    REQUIRE(most > 0);
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
+        home[w] = m.residency()->lookup(w)->ptr;
+
+    /* Three and a half of the heaviest layer: three go out at the pass's first op, and the fourth
+     * runs past the region's end. */
+    const int64_t ring = most * 7 / 2 / (2 * RAD_ALIGN_UNIT) * (2 * RAD_ALIGN_UNIT);
+    std::vector<char> region((size_t)ring);
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), ring, 64));
+    REQUIRE(st.enabled());
+    CHECK_EQ(st.n_layers(), (size_t)kL);
+    REQUIRE(st.ring_bytes() == ring);
+
+    auto in_ring = [&](rad_weight w) {
+        const char* p = (const char*)m.residency()->lookup(w)->ptr;
+        return p >= region.data() && p < region.data() + ring;
+    };
+    /* The layers published at copies, and whether any two of their units share a byte. */
+    auto published = [&](std::vector<int>* ls) {
+        std::vector<std::pair<const char*, const char*>> spans;
+        ls->clear();
+        for (int l = 0; l < kL; ++l) {
+            bool any = false;
+            for (rad_weight w : pw[(size_t)l])
+                if (in_ring(w)) {
+                    const char* p = (const char*)m.residency()->lookup(w)->ptr;
+                    spans.emplace_back(p, p + f.prog.weights[w].logical_bytes);
+                    any = true;
+                }
+            if (any) ls->push_back(l);
+        }
+        std::sort(spans.begin(), spans.end());
+        for (size_t i = 1; i < spans.size(); ++i)
+            if (spans[i].first < spans[i - 1].second) return false;
+        return true;
+    };
+
+    RadBatch b{};
+    b.n_tok = 128;
+    st.set_full_arena(true);
+    bool ran_ahead = false;
+    std::vector<int> ls;
+    for (int pass = 0; pass < 3; ++pass) {
+        CHECK(st.begin_pass(&b));
+        const int n_ops = 1 + 2 * kL;
+        for (int h = 0; h < n_ops; ++h) {
+            bool resync = false;
+            CHECK_OK(st.before_op(h, compute, &resync));
+            CHECK(published(&ls));
+            if (h >= 2 && h % 2 == 0) {
+                const int l = (h - 2) / 2;            /* moe_l: the layer's first and last op */
+                for (int k = 0; k < l; ++k)
+                    for (rad_weight w : pw[(size_t)k]) CHECK(!in_ring(w));
+                /* Its copies, settled: the wait the stager issued orders the op; here the test
+                 * drains the mover's stream to read them. */
+                CHECK_OK(rad_stream_sync(m.transfer_stream()));
+                for (rad_weight w : pw[(size_t)l]) {
+                    CHECK(in_ring(w));
+                    CHECK(std::memcmp(m.residency()->lookup(w)->ptr, home[w],
+                                      (size_t)f.prog.weights[w].logical_bytes) == 0);
+                }
+                if (ls.size() > 2) ran_ahead = true;
+            }
+            CHECK_OK(st.after_op(h, compute));
+        }
+        CHECK_OK(st.end_pass(compute));
+        for (int l = 0; l < kL; ++l)
+            for (rad_weight w : pw[(size_t)l]) CHECK(m.residency()->lookup(w)->ptr == home[w]);
+    }
+    CHECK(ran_ahead);
+    CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
+/* THE NEXT STEP'S FIRST LAYERS AND THE DRAFT HEAD. Six trunk layers and a declared draft head's
+ * seventh. The head's layer is not staged at all. With the next step going on with a prompt, a
+ * pass's end stages the next trunk pass's first PrefillStager::lead() layers; a draft pass in
+ * between neither arms nor touches them; the next armed trunk pass reads them where they are, with
+ * the copies holding the pool's bytes; and a trunk pass that does not arm publishes them at home
+ * again before it resolves anything. */
+TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    constexpr int kL = 7, kE = 8;                   /* layer 6 is the draft head's */
+    std::vector<std::vector<rad_weight>> lw(kL);
+    for (int l = 0; l < kL; ++l)
+        for (int e = 0; e < kE; ++e)
+            lw[(size_t)l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." +
+                                             std::to_string(e) + ".weight", 1 * MiB,
+                                             RAD_ACCESS_CONDITIONAL, l, e));
+    for (int l = 0; l < kL; ++l) {
+        f.op("attn" + std::to_string(l), {}, false);
+        f.op("moe" + std::to_string(l), lw[(size_t)l], false);
+    }
+    f.prog.drafter.kind = RAD_DRAFT_SERIAL;
+    f.prog.meta.n_layers = kL - 1;
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 16;
+    cfg.host_pool_mib = 128;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    std::vector<std::vector<rad_weight>> pw(kL);
+    int64_t most = 0;
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT);
+    for (int l = 0; l < kL; ++l) {
+        for (rad_weight w : lw[(size_t)l])
+            if (plan.weight[w].tier == Tier::HostPinned) pw[(size_t)l].push_back(w);
+        most = std::max(most, each * (int64_t)pw[(size_t)l].size());
+    }
+    REQUIRE(most > 0);
+    for (int l = 0; l < kL; ++l) REQUIRE(!pw[(size_t)l].empty());
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
+        home[w] = m.residency()->lookup(w)->ptr;
+
+    /* Room for every trunk layer at once: what the ring holds is the pace's doing, not its size. */
+    const int64_t ring = most * 8 / (2 * RAD_ALIGN_UNIT) * (2 * RAD_ALIGN_UNIT);
+    std::vector<char> region((size_t)ring);
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), ring, 64));
+    REQUIRE(st.enabled());
+    CHECK_EQ(st.n_layers(), (size_t)(kL - 1));
+    const int lead = (int)PrefillStager::lead();
+    REQUIRE(lead >= 1 && lead < kL - 1);
+
+    auto in_ring = [&](int l) {
+        for (rad_weight w : pw[(size_t)l]) {
+            const char* p = (const char*)m.residency()->lookup(w)->ptr;
+            if (p < region.data() || p >= region.data() + ring) return false;
+        }
+        return true;
+    };
+    auto at_home = [&](int l) {
+        for (rad_weight w : pw[(size_t)l]) if (m.residency()->lookup(w)->ptr != home[w]) return false;
+        return true;
+    };
+    auto copies_hold_the_pool = [&](int l) {
+        CHECK_OK(rad_stream_sync(m.transfer_stream()));
+        for (rad_weight w : pw[(size_t)l])
+            if (std::memcmp(m.residency()->lookup(w)->ptr, home[w],
+                            (size_t)f.prog.weights[w].logical_bytes) != 0) return false;
+        return true;
+    };
+    /* A whole trunk pass, checking at each layer's MoE that it reads copies and that the head's
+     * layer is never anywhere but home. */
+    const int n_ops = 1 + 2 * (kL - 1);
+    auto run_pass = [&]() {
+        for (int h = 0; h < n_ops; ++h) {
+            bool resync = false;
+            CHECK_OK(st.before_op(h, compute, &resync));
+            if (h >= 2 && h % 2 == 0) {
+                const int l = (h - 2) / 2;
+                CHECK(in_ring(l));
+                CHECK(copies_hold_the_pool(l));
+            }
+            CHECK(at_home(kL - 1));
+            CHECK_OK(st.after_op(h, compute));
+        }
+    };
+
+    RadBatch b{};
+    b.n_tok = 128;
+    st.set_full_arena(true);
+
+    /* No next step: the end leaves everything home. The engine asks whether the step staged
+     * after the pass has ended, so the answer outlives end_pass. */
+    CHECK(!st.staged());
+    st.set_next_prefill(false);
+    CHECK(st.begin_pass(&b));
+    run_pass();
+    CHECK_OK(st.end_pass(compute));
+    CHECK(st.staged());
+    for (int l = 0; l < kL; ++l) CHECK(at_home(l));
+
+    /* The next step goes on: the first `lead` layers go out at the end. */
+    st.set_next_prefill(true);
+    CHECK(st.begin_pass(&b));
+    run_pass();
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < kL; ++l) CHECK(l < lead ? in_ring(l) : at_home(l));
+    for (int l = 0; l < lead; ++l) CHECK(copies_hold_the_pool(l));
+
+    /* A draft pass neither arms nor gives them back, and leaves the trunk pass's answer. */
+    RadBatch d = b;
+    d.draft_pass = -1;
+    CHECK(!st.begin_pass(&d));
+    CHECK(st.staged());
+    for (int l = 0; l < lead; ++l) CHECK(in_ring(l));
+
+    /* The next armed trunk pass reads them there, and stages nothing at its first op that is
+     * already out. */
+    const uint64_t layers_before = m.stats().stage_layers;
+    st.set_next_prefill(true);
+    CHECK(st.begin_pass(&b));
+    {
+        bool resync = false;
+        CHECK_OK(st.before_op(0, compute, &resync));
+        CHECK_EQ(m.stats().stage_layers, layers_before);
+        CHECK_OK(st.after_op(0, compute));
+    }
+    for (int h = 1; h < n_ops; ++h) {
+        bool resync = false;
+        CHECK_OK(st.before_op(h, compute, &resync));
+        if (h >= 2 && h % 2 == 0) {
+            const int l = (h - 2) / 2;
+            CHECK(in_ring(l));
+            CHECK(copies_hold_the_pool(l));
+        }
+        CHECK_OK(st.after_op(h, compute));
+    }
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < kL; ++l) CHECK(l < lead ? in_ring(l) : at_home(l));
+
+    /* A trunk pass too small to arm: everything home before it resolves a table. */
+    b.n_tok = 8;
+    CHECK(!st.begin_pass(&b));
+    CHECK(!st.staged());
+    for (int l = 0; l < kL; ++l) CHECK(at_home(l));
+    CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     rad_stream_destroy(compute);
 }

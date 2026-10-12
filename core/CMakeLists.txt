@@ -3,7 +3,7 @@
 #
 # Sources are globbed per subdirectory with CONFIGURE_DEPENDS so that adding a file to a component
 # does not mean editing a file another component owns. Re-run cmake if a new file does not appear.
-set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm)
+set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag)
 
 set(RAD_CORE_SRC "")
 foreach(d ${RAD_CORE_DIRS})
@@ -40,6 +40,15 @@ endif()
 if(RAD_HIP_FOUND)
   target_compile_definitions(rad_core PUBLIC RAD_HAVE_HIP=1)
   target_link_libraries(rad_core PUBLIC ${RAD_HIP_RUNTIME} ${RAD_HSA_RUNTIME})
+  # AN EXECUTABLE RUNS THE ROCm IT WAS BUILT AGAINST. The runtime is linked by its full path, but the
+  # HIP driver reports that directory among its implicit link directories, so CMake writes no RPATH
+  # for it: the engine, the tools and the tests loaded whichever libamdhip64.so.7 the system's loader
+  # cache names, and a tree built against a second ROCm beside /opt/rocm ran /opt/rocm's runtime
+  # under its own kernels. A linker flag and not CMake's RPATH, because install rewrites CMake's, and
+  # rewriting it beside the entry ROCm 10's clang gives a shared library left an empty element -- the
+  # current directory -- in the installed plugin.
+  get_filename_component(RAD_HIP_LIBDIR "${RAD_HIP_RUNTIME}" DIRECTORY)
+  target_link_options(rad_core INTERFACE "LINKER:-rpath,${RAD_HIP_LIBDIR}")
   # THE AQL BACKEND'S OWN KERNELS: the copies and fills it dispatches for rad_memcpy_async and
   # rad_memset_async.
   target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device/aql_blit.hip)
@@ -50,6 +59,9 @@ if(RAD_HIP_FOUND)
   # WEIGHT-TABLE ENTRIES WRITTEN IN STREAM ORDER, their values carried in the arguments (runtime/wtab.h).
   target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/wtab.hip)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/runtime/wtab.hip PROPERTIES LANGUAGE HIP)
+  # THE NEXT-LAYER EXPERT PREFETCH's prediction, plan and table patches (runtime/xprefetch.h).
+  target_sources(rad_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/xprefetch.hip)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/runtime/xprefetch.hip PROPERTIES LANGUAGE HIP)
   # THE CORE'S OWN KERNELS ARE BUILT FOR EVERY AMD GPU FAMILY, not only for the cards this build
   # targets. They are what every copy and fill on a card runs, so an engine without a code object
   # for a card cannot start on it -- whatever kernel plugin is installed for that card, and a plugin
@@ -60,6 +72,7 @@ if(RAD_HIP_FOUND)
       gfx9-generic gfx9-4-generic gfx10-1-generic gfx10-3-generic gfx11-generic gfx12-generic)
   list(REMOVE_DUPLICATES RAD_CORE_GPU_TARGETS)
   set_target_properties(rad_core PROPERTIES HIP_ARCHITECTURES "${RAD_CORE_GPU_TARGETS}")
+  rad_hip_repeatable(rad_core)
   # EVERY EXECUTABLE THAT LINKS THE CORE EXPORTS THE HIP ENTRY POINTS THE BACKEND DEFINES. A kernel
   # plugin is dlopen'ed and its hipLaunchKernel binds to the first definition in the global scope,
   # which is the executable's only if the executable exports it. Without this a plugin would launch

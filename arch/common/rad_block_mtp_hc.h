@@ -292,6 +292,22 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                               false, false, kArNone, hc_attn.op_ar_write != 0));
     if (src.qsa.qk_proj)
         RAD_ARCH_TRY(qsa.declare(b, nm, g, l, src.qsa, w.qsa, w.attn.h, qsa_bk));
+    /* ---- draft round 1's rows out of a history pass (RadBatch::draft_out_ids), before the
+     * feed-forward, which then runs over them alone: gathered into `hin`, one row a drafting
+     * sequence in round order, and copied back to the front of `hw`. Two ops and not one because a
+     * gather in place could overwrite a row another sequence has yet to read. */
+    op_dsel = rw(b, RAD_OP(b, "gather_rows",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
+                               RAD_STR("dtype", g.dtype)),
+                    RAD_NOWEIGHTS),
+                {w.hw}, {w.hin});
+    op_dback = rw(b, RAD_OP(b, "cast",
+                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
+                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                     RAD_NOWEIGHTS),
+                 {w.hin}, {w.hw});
+    if (!op_dsel || !op_dback) return RAD_E_INVAL;
+
     /* The rotated expert input rides in this read, as it does on the trunk. */
     HyperConn::Config mcfg = hc;
     HyperConn::Wire   mwire{w.hw, w.x, w.inj};
@@ -321,21 +337,6 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                 RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
                      RAD_NOWEIGHTS),
                  {w.hw}, {w.hin});
-    /* ---- draft round 1's rows out of a history pass (RadBatch::draft_out_ids): gathered into the
-     * carry, one row a drafting sequence in round order, and copied back to the front of `hw` for
-     * the mixer. Two ops and not one because a gather in place could overwrite a row another
-     * sequence has yet to read. */
-    op_dsel = rw(b, RAD_OP(b, "gather_rows",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
-                               RAD_STR("dtype", g.dtype)),
-                    RAD_NOWEIGHTS),
-                {w.hw}, {w.hin});
-    op_dback = rw(b, RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", HN),
-                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.hin}, {w.hw});
-    if (!op_dsel || !op_dback) return RAD_E_INVAL;
 
     /* ---- the head's own mixer: the connection with no write half, which collapses its wide
      * stream to the one hidden state the lm_head reads. No fp8 twin -- that input is bf16. */
@@ -523,39 +524,50 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
               RAD_W(w_fc_h), RAD_W(w_fc_e), brows(w.hw, T));
 
     hc_attn.read(c, T, 0, T);
+
+    /* A HISTORY PASS THAT DRAFTS NOTHING ONLY LEAVES THE HEAD'S STATE BEHIND: the K and V of its
+     * rows and the indexer's block keys and tail, all of which come from the block's input. The
+     * query, the indexer's scores and selection, the attention, its output and everything after
+     * compute the head's stream, which only a drafting row reads. Every prefill chunk but a
+     * prompt's last is such a pass. `n_draft_out` is the batch's and the same on every rank, so
+     * the collectives skipped here are skipped on all of them. */
+    if (r < 0 && batch->n_draft_out <= 0) {
+        qsa.store(c, attn.w.h, batch);
+        attn.store_kv(c, batch);
+        return;
+    }
+
     /* THE INDEXER RUNS FIRST, because the attention reads its selection. It can: this block's
      * input is normed and quantised by the connection above, so `w.h` is already what it will be
      * when the attention runs. */
     qsa.step(c, attn.w.h, batch);
     attn.step(c, batch);
 
-    /* A HISTORY PASS THAT DRAFTS NOTHING ENDS HERE. It exists to leave the head's state behind --
-     * the K and V the attention just stored and the indexer's block keys and tail -- and both are
-     * written above. Everything below computes the head's stream, which only a drafting row
-     * reads: the experts, the two connections around them and the lm_head. Every prefill chunk
-     * but a prompt's last is such a pass, so on those the head costs its attention alone.
-     * `n_draft_out` is the batch's and the same on every rank, so the collectives skipped here
-     * are skipped on all of them. */
-    if (r < 0 && batch->n_draft_out <= 0) return;
-
     hc_attn.write(c, T, 0, T);
 
-    hc_mlp.read(c, T, 0, T);
-    mlp.step(c, batch);
-    hc_mlp.write(c, T, 0, T);
-
-    /* THE CARRY, and only where a round after this one will read it. The last round of a group
-     * is followed by a trunk step. A history pass that drafts takes round 1's rows out of its own
-     * -- into the carry, and back to the front of `hw` for the mixer below. */
-    int64_t L = T;                      /* the rows the lm_head runs over */
+    /* A HISTORY PASS THAT DRAFTS GOES ON WITH ITS DRAFTING ROWS ALONE. They are round 1, and
+     * nothing reads the head's stream at any other row: the experts, their connection and the
+     * lm_head would run over a whole prompt chunk for a handful of rows. So round 1's rows come out
+     * of `hw` first -- gathered into `hin` and copied back to its front, two ops because a gather
+     * in place could overwrite a row another sequence has yet to read -- and everything after runs
+     * as a pass of those rows. */
+    int64_t L = T;                      /* the rows the stream goes on with */
     if (r < 0) {
         L = batch->n_draft_out;
         RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.hw), praw(batch->draft_out_ids, RAD_I32, L),
                     brows(w.hin, L));
         RAD_ISSUE_N(c, op_dback, L, brows(w.hin, L), brows(w.hw, L));
-    } else if (r < depth) {
-        RAD_ISSUE_N(c, op_carry, T, brows(w.hw, T), brows(w.hin, T));
     }
+
+    hc_mlp.read(c, L, 0, L);
+    mlp.step_rows(c, L);
+    hc_mlp.write(c, L, 0, L);
+
+    /* THE CARRY, and only where a round after this one will read it. The last round of a group
+     * is followed by a trunk step; a history pass is round 1, followed by round 2 when the
+     * deployment drafts deeper. */
+    if (r < 0 ? depth > 1 : r < depth)
+        RAD_ISSUE_N(c, op_carry, L, brows(w.hw, L), brows(w.hin, L));
 
     mixer.read(c, L, 0, L);
     if (q2) {

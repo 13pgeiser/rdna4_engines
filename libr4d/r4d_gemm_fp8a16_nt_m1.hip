@@ -319,12 +319,52 @@ __device__ __forceinline__ void rows_dot_mt(const uint8_t* __restrict__ W,
 #pragma unroll
     for (uint32_t i = 0; i < RB * MT; ++i) acc[i] = 0.0f;
 
+    /* AT MT <= 2 EACH PASS'S WEIGHT CHUNK, SCALE AND ACTIVATION ARE LOADED ONE PASS AHEAD (kPre),
+     * so a pass's loads run under the previous pass's arithmetic. Loaded in the pass that uses
+     * them, LLVM 24 issues them and then waits for the first three before it converts anything,
+     * and at M = 2 the head ran 0.65% behind LLVM 22's build; loaded ahead it is level, and M = 1
+     * is unchanged. Held a pass, the activation is eight registers a row, which the wider tiles do
+     * not have: at MT = 32 it spills a thousand slots, so they load in the pass. The last pass
+     * reloads its own chunk rather than reading past the row. */
+    constexpr bool kPre = MT <= 2u;
+    [[maybe_unused]] uint4 wn[RB];
+    [[maybe_unused]] uint32_t sn[RB];
+    [[maybe_unused]] uint4 xn[kPre ? MT : 1][2];
+    auto load = [&](uint32_t c) {
+#pragma unroll
+        for (uint32_t r = 0; r < RB; ++r) {
+            wn[r] = *(const uint4*)(w[r] + c);
+            sn[r] = srow[r][c / kBlock];
+        }
+        if constexpr (kPre) {
+#pragma unroll
+            for (uint32_t m = 0; m < MT; ++m) {
+                const uint4* xm = (const uint4*)(X + (size_t)xrow(m) * a_ld + c);
+                xn[m][0] = xm[0];
+                xn[m][1] = xm[1];
+            }
+        }
+    };
+    if constexpr (kPre)
+        if ((uint32_t)lane * 16u < full) load((uint32_t)lane * 16u);
     for (uint32_t c = (uint32_t)lane * 16u; c < full; c += stride) {
         float wf[RB][16];
         float sc[RB];
+        [[maybe_unused]] uint4 wc[kPre ? RB : 1];
+        [[maybe_unused]] uint32_t scr[kPre ? RB : 1];
+        [[maybe_unused]] uint4 xc[kPre ? MT : 1][2];
+        if constexpr (kPre) {
+#pragma unroll
+            for (uint32_t r = 0; r < RB; ++r) { wc[r] = wn[r]; scr[r] = sn[r]; }
+#pragma unroll
+            for (uint32_t m = 0; m < MT; ++m) { xc[m][0] = xn[m][0]; xc[m][1] = xn[m][1]; }
+            load(c + stride < full ? c + stride : c);
+        }
 #pragma unroll
         for (uint32_t r = 0; r < RB; ++r) {
-            const uint4 packed = *(const uint4*)(w[r] + c);
+            uint4 packed;
+            if constexpr (kPre) packed = wc[r];
+            else packed = *(const uint4*)(w[r] + c);
             const uint32_t* pw = (const uint32_t*)&packed;
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
@@ -335,14 +375,31 @@ __device__ __forceinline__ void rows_dot_mt(const uint8_t* __restrict__ W,
                 wf[r][k * 4 + 2] = e23.x;
                 wf[r][k * 4 + 3] = e23.y;
             }
-            sc[r] = bscale(srow[r][c / kBlock]);
+            if constexpr (kPre) sc[r] = bscale(scr[r]);
+            else sc[r] = bscale(srow[r][c / kBlock]);
         }
 #pragma unroll
         for (uint32_t m = 0; m < MT; ++m) {
-            const uint16_t* xm = X + (size_t)xrow(m) * a_ld + c;
+            /* THE SIXTEEN bf16 AS EIGHT DWORDS, each widened by a shift (the even element) and a
+             * mask (the odd one): the same floats. Read a uint16_t at a time, LLVM 24 moves each
+             * into a 16-bit register half before shifting it -- two instructions an element where
+             * LLVM 22 took one. */
+            uint4 x0, x1;
+            if constexpr (kPre) {
+                x0 = xc[m][0];
+                x1 = xc[m][1];
+            } else {
+                const uint4* xm = (const uint4*)(X + (size_t)xrow(m) * a_ld + c);
+                x0 = xm[0];
+                x1 = xm[1];
+            }
+            const uint32_t xw[8] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
             float xv[16];
 #pragma unroll
-            for (int k = 0; k < 16; ++k) xv[k] = __uint_as_float((uint32_t)xm[k] << 16);
+            for (int k = 0; k < 8; ++k) {
+                xv[2 * k]     = __uint_as_float(xw[k] << 16);
+                xv[2 * k + 1] = __uint_as_float(xw[k] & 0xffff0000u);
+            }
 #pragma unroll
             for (uint32_t r = 0; r < RB; ++r) {
                 float a0 = 0.0f, a1 = 0.0f;
@@ -488,17 +545,34 @@ uint32_t rb_default(uint32_t rows, uint32_t cols) {
 // rather than sixteen. That is what makes the scale a scalar multiply in the epilogue of each
 // block instead of a per-element gather.
 typedef short lm_s8v __attribute__((ext_vector_type(8)));
+typedef unsigned lm_u4v __attribute__((ext_vector_type(4)));
+
+/* TWO DECODED CODES AS ONE bf16 PAIR: the high halves of both floats, by one byte permute. A code
+ * decodes to a float whose low sixteen bits are zero (E4M3's three mantissa bits, an int8's seven),
+ * so its bf16 is exactly those high bits -- f32_to_bf16's rounding adds less than one to the low
+ * half and carries nothing out of it -- and packed here it is one v_perm_b32 a pair, the rounding
+ * adds gone too. Built from f32_to_bf16 and the vector's lanes instead, LLVM 24's 16-bit register
+ * halves turn each pair into two half moves and a shift where LLVM 22 had the permute: 24 more
+ * instructions a K step of the M = 32 tile. The same bits either way. The floats are read with
+ * __float_as_uint, by value: __builtin_bit_cast of a vector's element miscompiles (see the
+ * nontemporal load in r4d_fp8_wmma.h), and here it fed the WMMA garbage.
+ *
+ * Every tile takes it: against the f32_to_bf16 form it is 0.3 to 0.7% faster at M = 4 to 16
+ * (MT 1, K 2048 to 5120), 0.8% at M = 32 (MT 2) and 7.7% at M = 64 (MT 4). */
+__device__ __forceinline__ uint32_t lm_bf16_pair(v2f p) {
+    return __builtin_amdgcn_perm(__float_as_uint(p.y), __float_as_uint(p.x), 0x07060302u);
+}
 
 template <bool I8 = false>
 __device__ __forceinline__ lm_s8v e4m3x8_to_bf16(uint32_t lo, uint32_t hi) {
     const v2f a01 = code_pk<I8, false>(lo), a23 = code_pk<I8, true>(lo);
     const v2f b01 = code_pk<I8, false>(hi), b23 = code_pk<I8, true>(hi);
-    lm_s8v r;
-    r[0] = (short)f32_to_bf16(a01.x); r[1] = (short)f32_to_bf16(a01.y);
-    r[2] = (short)f32_to_bf16(a23.x); r[3] = (short)f32_to_bf16(a23.y);
-    r[4] = (short)f32_to_bf16(b01.x); r[5] = (short)f32_to_bf16(b01.y);
-    r[6] = (short)f32_to_bf16(b23.x); r[7] = (short)f32_to_bf16(b23.y);
-    return r;
+    lm_u4v r;
+    r.x = lm_bf16_pair(a01);
+    r.y = lm_bf16_pair(a23);
+    r.z = lm_bf16_pair(b01);
+    r.w = lm_bf16_pair(b23);
+    return __builtin_bit_cast(lm_s8v, r);
 }
 
 // MT is ceil(M / 16): how many 16-row activation tiles ride the one weight read.
@@ -620,8 +694,21 @@ __device__ __forceinline__ lm_s8v e4m3x8_to_bf16(uint32_t lo, uint32_t hi) {
 // The band is five things it is not: not the register file, not staging latency, not the straddle,
 // not the activation loads, not the activation re-read. It needs a new hypothesis, not another
 // pass over these.
+//
+// ---- THE WAVES A SIMD EACH TILE RUNS AT (R4D_WAVES) --------------------------------------------
+//
+// Two staged blocks a round (FKB = 2) hold 33 KB of LDS, which caps a SIMD at six waves whatever
+// the registers, so six is the target there. One block a round at MT >= 3 is a register budget:
+// seven waves at MT = 3 and six at MT = 4, where two K steps in flight are worth more than a
+// seventh wave (above). MT <= 2 at one block is reachable only through R4D_LM_FKB and keeps the
+// budget it was measured at. Without the target the scheduler is free to trade the activation
+// loads' overlap for occupancy, and at MT = 4 that trade cost 40%.
+constexpr uint32_t lm_waves(uint32_t mt, uint32_t fkb) {
+    return fkb == 2u ? 6u : mt >= 4u ? 6u : mt == 3u ? 7u : mt == 2u ? 9u : 12u;
+}
+
 template <uint32_t MT, uint32_t FKB, bool I8 = false>
-__global__ __launch_bounds__(kDenseThreads) void lm_wmma_kernel(
+__global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void lm_wmma_kernel(
     const uint8_t* __restrict__ W, const uint16_t* __restrict__ A, uint32_t a_ld,
     float* __restrict__ C, uint32_t c_ld,
     uint32_t rows, uint32_t cols, uint32_t w_ld, uint32_t m_real) {
@@ -629,6 +716,7 @@ __global__ __launch_bounds__(kDenseThreads) void lm_wmma_kernel(
     constexpr uint32_t kRows  = kDenseWaves * 16u;         /* weight rows a workgroup covers */
     constexpr uint32_t kPitch = lds_pitch<kFK>();          /* BYTES a staged weight row */
     constexpr uint32_t kWUnits = kRows * (kFK / 16u);      /* 16-byte staging units, weight */
+    constexpr bool     kPre    = MT <= 3u;                  /* activation a K step ahead, below */
 
     __shared__ uint8_t s_w[kRows * kPitch];
 
@@ -650,8 +738,37 @@ __global__ __launch_bounds__(kDenseThreads) void lm_wmma_kernel(
         for (uint32_t t = 0; t < MT; ++t) acc[t] = (f8v)(0.0f);
 
         for (uint32_t kt = 0; kt < cols; kt += kFK) {
-            /* Before the store, because the previous tile's fragment reads are still in flight. */
-            __syncthreads();
+            /* THE ACTIVATION FRAGMENTS ARE LOADED ONE K STEP AHEAD at MT <= 3 (kPre): each step
+             * takes the fragments the step before it loaded and issues the next step's, so their
+             * round trip runs under a step's WMMAs; the tile's first step is issued here, while the
+             * tile stages. Loaded in the step that uses them, LLVM 24 waits for them right after
+             * issuing them, every step -- LLVM 22's schedule had moved the loads a step early
+             * itself. Against LLVM 22's build: M = 4 from +0.44% to level, M = 32 to -1.4%. At
+             * MT = 4 the held fragments take the tile to 238 VGPRs and it runs 3.4% slower, so it
+             * loads in place there. The last step reloads its own fragments rather than reading
+             * past the tile. */
+            [[maybe_unused]] lm_s8v an[kPre ? MT : 1];
+            auto aload = [&](uint32_t kf) {
+#pragma unroll
+                for (uint32_t t = 0; t < MT; ++t) {
+                    const uint32_t m = t * 16u + c, mr = (m < m_real) ? m : (m_real - 1u);
+                    an[t] = *(const lm_s8v*)(A + (size_t)mr * a_ld + kt + kf + h * 8u);
+                }
+            };
+            if constexpr (kPre) aload(0u);
+            /* THE TILE'S BLOCK SCALES ARE READ HERE, ahead of the staging barrier, so they land
+             * while the tile stages and computes. Read where they are used, after a block's
+             * WMMAs, each is a global round trip the wave waits out with nothing else in flight,
+             * and a compiler is free to put the load there: LLVM 24 does for the second block of
+             * an FKB = 2 tile. Read here, M = 4 to 64 run 0.2 to 0.6% faster. */
+            uint16_t sraw[FKB];
+#pragma unroll
+            for (uint32_t sb = 0; sb < FKB; ++sb) sraw[sb] = scl[(kt + sb * kBlock) / kBlock];
+            /* Before the store, because the previous tile's fragment reads are still in flight.
+             * Both barriers order LDS only: no thread reads global memory another one writes, and
+             * __syncthreads() is a fence over every address space, which on gfx12 waits for every
+             * load in flight -- the scale read above and the prefetched fragments with it. */
+            lds_barrier();
 /* HOW MANY STAGING LOADS ARE IN FLIGHT, and it is a REGISTER decision, not a memory one. A round
  * is kFK/32 units a thread -- eight at FKB = 2 -- and unrolling it whole holds eight uint4 results
  * live across the stores, 32 VGPRs on top of MT accumulators and MT partials. At MT >= 3 unrolling
@@ -664,7 +781,7 @@ __global__ __launch_bounds__(kDenseThreads) void lm_wmma_kernel(
                 const uint8_t* src = W + (size_t)((g < rows) ? g : (rows - 1u)) * w_ld + kt + off;
                 *(uint4*)(s_w + (size_t)r * kPitch + off) = *(const uint4*)src;
             }
-            __syncthreads();
+            lds_barrier();
 
             /* One scale block at a time INSIDE the staged tile, so the partial that the block
              * scale multiplies is exactly the one a one-block round forms. FK is a staging width and
@@ -680,19 +797,33 @@ __global__ __launch_bounds__(kDenseThreads) void lm_wmma_kernel(
 #pragma unroll MT >= 4 ? 2 : 4
                 for (uint32_t ks = 0; ks < kBlock; ks += 16u) {
                     const uint32_t kf = sb * kBlock + ks;          /* K inside the staged tile */
+                    [[maybe_unused]] lm_s8v ac[kPre ? MT : 1];
+                    if constexpr (kPre) {
+#pragma unroll
+                        for (uint32_t t = 0; t < MT; ++t) ac[t] = an[t];
+                        aload(kf + 16u < kFK ? kf + 16u : kf);
+                    }
                     const i2v raw = frag<kFK>(s_w, wv * 16u, kf, lane);
-                    const lm_s8v bf = e4m3x8_to_bf16<I8>((uint32_t)raw[0], (uint32_t)raw[1]);
+                    const lm_s8v bf =
+                        e4m3x8_to_bf16<I8>((uint32_t)raw[0], (uint32_t)raw[1]);
+/* THE ACTIVATION LOAD IS UNCONDITIONAL: a padding row reads the last real row again and a select
+ * zeroes it. Guarding the load with `m < m_real` puts each one in its own branch with its WMMA
+ * right behind it, and the compiler is then free to wait for every load before issuing the next
+ * -- MT round trips a K step where one would do. LLVM 24 does exactly that, and it cost M = 64
+ * 40%. The clamped row is always in bounds and already in cache, so the extra loads are free. */
 #pragma unroll
                     for (uint32_t t = 0; t < MT; ++t) {
                         const uint32_t m = t * 16u + c;
-                        const lm_s8v af =
-                            (m < m_real) ? *(const lm_s8v*)(A + (size_t)m * a_ld + kt + kf + h * 8u)
-                                         : (lm_s8v)(short)0;
+                        [[maybe_unused]] const uint32_t mr = (m < m_real) ? m : (m_real - 1u);
+                        lm_s8v af;
+                        if constexpr (kPre) af = ac[t];
+                        else af = *(const lm_s8v*)(A + (size_t)mr * a_ld + kt + kf + h * 8u);
+                        if (m >= m_real) af = (lm_s8v)(short)0;
                         part[t] =
                             __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(af, bf, part[t]);
                     }
                 }
-                const float sc = bscale(scl[(kt + sb * kBlock) / kBlock]);
+                const float sc = bscale(sraw[sb]);
 #pragma unroll
                 for (uint32_t t = 0; t < MT; ++t)
 #pragma unroll

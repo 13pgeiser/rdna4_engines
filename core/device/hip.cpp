@@ -258,6 +258,30 @@ int d_peer_access(int self, int peer) {
     return can ? 1 : 0;
 }
 
+/* The runtime's bus id, rewritten in the kernel's spelling (lower case, four-digit domain) so it
+ * names the same directory under /sys/bus/pci/devices. */
+int d_pci_address(int device, char* out, int cap) {
+    if (!out || cap <= 0) return RAD_E_INVAL;
+    char bus[64] = { 0 };
+    HIP_TRY(hipDeviceGetPCIBusId(bus, (int)sizeof bus, device));
+    unsigned dom = 0, b = 0, d = 0, f = 0;
+    if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &f) != 4) {
+        device_set_error("hipDeviceGetPCIBusId(%d): '%s' is not a PCI address", device, bus);
+        return RAD_E_IO;
+    }
+    std::snprintf(out, (size_t)cap, "%04x:%02x:%02x.%x", dom, b, d, f);
+    return RAD_OK;
+}
+
+/* HIP_VERSION's encoding: major * 10^7 + minor * 10^5 + patch. */
+int d_runtime_version(char* out, int cap) {
+    if (!out || cap <= 0) return RAD_E_INVAL;
+    int v = 0;
+    HIP_TRY(hipRuntimeGetVersion(&v));
+    std::snprintf(out, (size_t)cap, "HIP %d.%d.%d", v / 10000000, (v / 100000) % 100, v % 100000);
+    return RAD_OK;
+}
+
 int d_enable_peer(int self, int peer) {
     if (self == peer) return RAD_OK;
     int can = 0;
@@ -360,7 +384,7 @@ const DeviceBackend g_hip = {
     nullptr, nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr,
     nullptr,
-    nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     /* Recorded passes: likewise the AQL backend's. */
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
 
@@ -373,6 +397,8 @@ const DeviceBackend g_hip = {
     nullptr, nullptr,
     d_integrated,
     d_peer_access,
+    d_pci_address,
+    d_runtime_version,
 };
 
 }  /* namespace */

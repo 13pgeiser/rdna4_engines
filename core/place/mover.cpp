@@ -90,6 +90,7 @@ Mover::~Mover() {
      * that name the events below and the copies into and out of the memory below, so each of
      * those goes only once nothing queued refers to it. */
     if (mover_) {
+        (void)flush_moves();
         rad_stream_sync(mover_);
         rad_stream_destroy(mover_);
     }
@@ -138,6 +139,11 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
                  "it is a test path and not a deployment.");
 
     unit_.assign(plan.units.size(), UnitState{});
+    copying_.assign(plan.units.size(), 0);
+    pool_layer_.assign(plan.classes.size(), {});
+    donors_.assign(plan.classes.size(), DonorRank{});
+    n_layers_ = 0;
+    for (const MoveUnit& mu : plan.units) n_layers_ = std::max(n_layers_, mu.layer + 1);
     pools_.clear();
     pools_.resize(plan.classes.size());
 
@@ -162,6 +168,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             static_need = us.static_off + mu.bytes;
         } else if (mu.tier == Tier::HostPinned) {
             us.pool_slot = n_pool[(size_t)mu.slab_class]++;
+            pool_layer_[(size_t)mu.slab_class].push_back(mu.layer);
         } else if (mu.tier == Tier::HostPageable) {
             us.static_off = align_up(pageable_need, RAD_ALIGN_UNIT);
             pageable_need = us.static_off + mu.bytes;
@@ -170,7 +177,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     }
 
     /* ---- allocate ------------------------------------------------------------------------- */
-    int64_t total_shadow = 0;
+    int64_t total_shadow = 0, total_turn = 0;
     for (size_t c = 0; c < plan.classes.size(); ++c) {
         const SlabClass& sc = plan.classes[c];
         ClassPools& cp = pools_[c];
@@ -193,6 +200,9 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
          * lend_from() adds them once it is. */
         cp.n_fixed = slab_slots;
         cp.n_work = shadow + sc.n_stage;
+        cp.n_turn = std::min<int64_t>(std::max(cfg.turnover_slots, 0),
+                                      shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
+        total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
         if (slab_slots > 0) {
             /* Tail padding: a kernel that assembles a packed code window from a wide read
@@ -366,13 +376,13 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     lead_.assign((size_t)lead + 1, nullptr);
     for (RadEvent& e : lead_) RAD_TRY(rad_event_create_as(&e, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
 
-    /* TWO records per shadow slot, not one. A promotion holds a slab slot for its whole life, so
-     * there can never be more promotions in flight than there are shadows -- but a swap is two
-     * transfers, and the matching demotion needs a record of its own or the pair can never be in
-     * flight together and the engine never issues a demotion at all. That failure is silent: it
-     * shows up as `no_record` where the real symptom is a resident set that only ever grows.
-     * The floor is what makes a one-shadow plan still able to hold a swap. */
-    const int64_t n_records = std::max<int64_t>(2 * total_shadow, 4);
+    /* TWO records per free slot, shadow or turnover, not one. A promotion holds a slab slot for
+     * its whole life, so there can never be more promotions in flight than there are free slots --
+     * but a swap is two transfers, and the matching demotion needs a record of its own or the pair
+     * can never be in flight together and the engine never issues a demotion at all. That failure
+     * is silent: it shows up as `no_record` where the real symptom is a resident set that only ever
+     * grows. The floor is what makes a one-shadow plan still able to hold a swap. */
+    const int64_t n_records = std::max<int64_t>(2 * (total_shadow + total_turn), 4);
     moves_.assign((size_t)n_records, Move{});
     for (Move& m : moves_) RAD_TRY(rad_event_create_local(&m.ev));
 
@@ -383,9 +393,10 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         republish(u);
     }
 
-    RAD_INFO("mover: %lld slab slots (%lld shadow), %lld pinned pool slots, %s static vram%s",
+    RAD_INFO("mover: %lld slab slots (%lld shadow, %lld more kept free out of a loan), %lld pinned "
+             "pool slots, %s static vram%s",
              (long long)[&] { int64_t n = 0; for (auto& c : pools_) n += c.slab.size(); return n; }(),
-             (long long)total_shadow,
+             (long long)total_shadow, (long long)total_turn,
              (long long)[&] { int64_t n = 0; for (auto& c : pools_) n += c.pool.size(); return n; }(),
              humanb(static_bytes_).c_str(), file_.ok() ? ", file tier open" : "");
     /* The pageable host region is allocated here and charged to no budget -- Pools has no
@@ -436,9 +447,7 @@ void Mover::republish(int32_t unit) {
  * a record past Copying has its bytes in place, and treating it as in-flight holds the slot for
  * as long as the record takes to recycle rather than as long as the copy takes to land. */
 bool Mover::unit_in_flight(int32_t unit) const {
-    for (const Move& m : moves_)
-        if (m.state == Move::State::Copying && m.unit == unit) return true;
-    return false;
+    return unit >= 0 && (size_t)unit < copying_.size() && copying_[(size_t)unit] > 0;
 }
 
 int Mover::free_move_record() const {
@@ -577,6 +586,7 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
     m.state = Move::State::Copying;
     m.kind = Move::Kind::Stage;
     m.unit = unit;
+    ++copying_[(size_t)unit];
     m.slab_slot = slab_slot;
     m.pool_slot = -1;
     stats_.h2d_bytes += (uint64_t)us.bytes;
@@ -602,47 +612,98 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
 /* ---- staging within a pass (see mover.h) ---------------------------------------------------- */
 int Mover::stage_units(const std::vector<int32_t>& units, char* dst, int64_t cap, RadEvent after,
                        RadEvent done, std::vector<int32_t>* staged) {
-    if (!plan_ || !dst || !staged || !done) return RAD_E_INVAL;
+    const StageSpan one{dst, cap};
+    return stage_units(units, &one, 1, after, done, staged);
+}
+
+int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans, int n_spans,
+                       RadEvent after, RadEvent done, std::vector<int32_t>* staged) {
+    if (!plan_ || !spans || n_spans < 1 || n_spans > 2 || !staged || !done) return RAD_E_INVAL;
+    for (int k = 0; k < n_spans; ++k)
+        if (!spans[k].dst) return RAD_E_INVAL;
     staged->clear();
-    std::vector<int64_t> at;
-    at.reserve(units.size());
-    int64_t off = 0;
-    bool waited = false;
+    stage_picks_.clear();
     for (int32_t u : units) {
         if (u < 0 || (size_t)u >= unit_.size()) return RAD_E_INVAL;
         const UnitState& us = unit_[(size_t)u];
         if (us.tier != Tier::HostPinned || us.pool_slot < 0 || us.slab_slot >= 0 || us.klass < 0)
             continue;
         if (unit_in_flight(u)) continue;
-        const int64_t need = align_up(us.bytes, RAD_ALIGN_UNIT);
-        if (off + need > cap) { ++stats_.stage_overflow; continue; }
-        if (!waited) {
-            if (after) RAD_TRY(rad_event_wait(mover_, after));
-            waited = true;
-        }
         const ClassPools& cp = pools_[(size_t)us.klass];
         const char* src = (const char*)cp.pool_base + us.pool_slot * cp.stride;
-        RAD_TRY(rad_memcpy_async(dst + off, src, us.bytes, mover_));
-        staged->push_back(u);
-        at.push_back(off);
-        stats_.h2d_bytes += (uint64_t)us.bytes;
-        stats_.staged_bytes += (uint64_t)us.bytes;
-        off += need;
+        stage_picks_.push_back(StagePick{src, u, us.bytes, align_up(us.bytes, RAD_ALIGN_UNIT),
+                                         nullptr});
     }
-    if (staged->empty()) return RAD_OK;
+    if (stage_picks_.empty()) return RAD_OK;
+    /* THE SPANS ARE FILLED IN POOL ORDER, so units on neighbouring pool slots land side by side
+     * and go as one copy. A layer's pooled experts were given their slots together and mostly
+     * still hold them, so a layer's ~90 units go as fewer copies -- each one a launch or a DMA
+     * packet whatever its size. A class's stride is its units' aligned size, so a run's source and
+     * destination advance alike, padding included. A unit the span in hand has no room left for
+     * goes to the start of the next; one that no span has room for is read across the link in
+     * place. */
+    std::sort(stage_picks_.begin(), stage_picks_.end(),
+              [](const StagePick& a, const StagePick& b) { return a.src < b.src; });
+    int k = 0;
+    int64_t off = 0;
+    size_t taken = 0;
+    for (StagePick& p : stage_picks_) {
+        if (off + p.need > spans[k].cap && k + 1 < n_spans && p.need <= spans[k + 1].cap) {
+            ++k;
+            off = 0;
+        }
+        if (off + p.need > spans[k].cap) { ++stats_.stage_overflow; continue; }
+        p.dst = spans[k].dst + off;
+        off += p.need;
+        ++taken;
+    }
+    if (taken == 0) return RAD_OK;
+    if (after) RAD_TRY(rad_event_wait(mover_, after));
+    stage_segs_.clear();
+    for (const StagePick& p : stage_picks_) {
+        if (!p.dst) continue;
+        RadCopySeg* run = stage_segs_.empty() ? nullptr : &stage_segs_.back();
+        if (run && p.src - (const char*)run->src == p.dst - (char*)run->dst)
+            run->bytes = (int64_t)(p.dst - (char*)run->dst) + p.bytes;
+        else
+            stage_segs_.push_back(RadCopySeg{p.src, p.dst, p.bytes});
+        staged->push_back(p.u);
+        stats_.h2d_bytes += (uint64_t)p.bytes;
+        stats_.staged_bytes += (uint64_t)p.bytes;
+    }
+    RAD_TRY(rad_memcpy_list_async(stage_segs_.data(), (int)stage_segs_.size(), RAD_COPY_YIELD,
+                                  mover_));
     RAD_TRY(rad_event_record(done, mover_));
-    for (size_t k = 0; k < staged->size(); ++k) {
-        const MoveUnit& mu = plan_->units[(size_t)(*staged)[k]];
-        for (size_t i = 0; i < mu.weights.size(); ++i)
-            res_.publish(mu.weights[i], dst + at[k] + mu.offset[i]);
+    for (const StagePick& p : stage_picks_) {
+        if (!p.dst) continue;
+        const MoveUnit& mu = plan_->units[(size_t)p.u];
+        for (size_t i = 0; i < mu.weights.size(); ++i) res_.publish(mu.weights[i], p.dst + mu.offset[i]);
     }
     ++stats_.stage_layers;
     stats_.staged_units += (uint64_t)staged->size();
+    stats_.stage_copies += (uint64_t)stage_segs_.size();
     return RAD_OK;
 }
 
 void Mover::unstage_units(const std::vector<int32_t>& staged) {
     for (int32_t u : staged) republish(u);
+}
+
+/* The same choice of units as stage_units, without a cap. */
+int64_t Mover::stage_need(const std::vector<int32_t>& units, int64_t* largest) const {
+    int64_t total = 0, most = 0;
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= unit_.size()) continue;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier != Tier::HostPinned || us.pool_slot < 0 || us.slab_slot >= 0 || us.klass < 0)
+            continue;
+        if (unit_in_flight(u)) continue;
+        const int64_t need = align_up(us.bytes, RAD_ALIGN_UNIT);
+        total += need;
+        most = std::max(most, need);
+    }
+    if (largest) *largest = most;
+    return total;
 }
 
 /* ---- a routed layer read from the container (see mover.h) ---------------------------------- */
@@ -817,7 +878,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         if (record_gate() < 0) return false;
         Move& m = moves_[(size_t)rec];
         {
-            const int64_t g = cp.pool.take();
+            const int64_t g = pool_slot_for(unit, heat);
             if (g < 0) { ++stats_.starved_pool; return false; }
             char* dst = (char*)cp.pool_base + g * cp.stride;
             if (us.slab_slot < 0) { cp.pool.add_free(g); return false; }
@@ -829,11 +890,10 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
              * demotion costs about what a promotion does. That is the exchange rate heat.h's
              * min_gain is tuned against. */
             if (rad_event_wait(mover_, gate_) < 0) { cp.pool.add_free(g); return false; }
-            if (rad_memcpy_async(dst, src, us.bytes, mover_) < 0) {
+            if (queue_move_copy(dst, src, us.bytes, (int)(&m - moves_.data())) < 0) {
                 cp.pool.add_free(g);
                 return false;
             }
-            (void)rad_event_record(m.ev, mover_);
             m.kind = Move::Kind::Demote;
             m.slab_slot = us.slab_slot;
             m.pool_slot = g;
@@ -841,6 +901,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         }
         m.state = Move::State::Copying;
         m.unit = unit;
+        ++copying_[(size_t)unit];
         return true;
     };
 
@@ -1042,6 +1103,133 @@ int Mover::drop(int32_t unit, HeatEngine* heat) {
     return RAD_OK;
 }
 
+/* THE POOL IS SIZED TO THE UNITS THAT LIVE IN IT, so it has a slot free only while a promotion
+ * into a budgeted slot is on its way through the quarantine -- and the budgeted range turns over
+ * only as fast as those few slots come round. A budgeted unit that goes cold then stays, and the
+ * engine's swap drops the coldest lent unit in its place, which is warmer: replaying a mixed
+ * workload's routing at TP1, the hit rate is 72.7% that way against 76.7% with up to n_turn
+ * donors a class, and 78.5% for one resident set with no regions at all.
+ *
+ * A unit in a lent slot keeps its host copy only so that a recall is a change of address. Giving
+ * the copy to the victim costs that for this one unit: a recall moves it, into a free budgeted
+ * slot or back across the link (reclaim), and a loan that shrinks under it moves it the same way
+ * (balance). There is always somewhere for it to go -- each donor's copy went to a unit
+ * whose budgeted slot it left free, so the free budgeted slots and the free pool slots together
+ * number at least the donors. The donors are bounded by the turnover slots, and they come out of
+ * the KV cache's loan only: the arena takes its loan back at every prompt's first chunk, and that
+ * recall stays a change of address.
+ *
+ * THE HOTTEST UNIT GIVES ITS COPY -- of the victim's layer, when pool_slot_for asks for one --
+ * because a donor the engine later demotes needs a pool slot of its own where it would have been a
+ * drop. Its pool slot has no reader: the unit has been resident since its promotion retired, and
+ * the copy into the slot waits on the gate besides. */
+int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
+    ClassPools& cp = pools_[klass];
+    if (cp.n_donated >= cp.n_turn) return -1;
+    /* NOT WHILE THE TURNOVER SLOTS ARE HELD: through a prompt and the few steps after it
+     * (Engine::tiering_dispatch). A donation lets a starved demotion go and the swap behind it
+     * with it, two copies on the stream the next prompt stages on; at TP2, where the resident set
+     * is nine tenths of the experts and a donor buys no decode at all, 26K-token prompts back to
+     * back ran 0.3% slower with them. A decode run reaches the count in a few steps. */
+    if (hold_turnover_) return -1;
+    DonorRank& d = donors_[klass];
+    if (d.at != dispatch_) {
+        d.at = dispatch_;
+        d.by_layer.assign((size_t)std::max(n_layers_, 1), {});
+        for (const ClassPools::Lent& l : cp.lent) {
+            if (l.lender != kLendKV) continue;
+            const int64_t lo = cp.slab.seg_lo(l.seg), hi = cp.slab.target(l.seg);
+            for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
+                const UnitState& us = unit_[(size_t)u];
+                if (us.klass != (int32_t)klass || us.slab_slot < lo || us.slab_slot >= hi) continue;
+                const int32_t ul = plan_->units[(size_t)u].layer;
+                if (ul < 0 || ul >= n_layers_) continue;
+                d.by_layer[(size_t)ul].push_back({ heat ? heat->heat(u) : 0.0f, u });
+            }
+        }
+        for (auto& v : d.by_layer) std::sort(v.begin(), v.end());
+    }
+    for (;;) {
+        /* The hottest candidate of the layer asked for, or of every layer. */
+        std::vector<std::pair<float, int32_t>>* pick = nullptr;
+        if (layer >= 0) {
+            if (layer < (int32_t)d.by_layer.size() && !d.by_layer[(size_t)layer].empty())
+                pick = &d.by_layer[(size_t)layer];
+        } else {
+            for (auto& v : d.by_layer)
+                if (!v.empty() && (!pick || v.back() > pick->back())) pick = &v;
+        }
+        if (!pick) return -1;
+        const int32_t u = pick->back().second;
+        pick->pop_back();
+        UnitState& us = unit_[(size_t)u];
+        if (us.klass != (int32_t)klass || us.pool_slot < 0 || us.slab_slot < 0) continue;
+        if (us.tier != Tier::VRAM || us.site != Site::Device || !cp.slab.covered(us.slab_slot))
+            continue;
+        if ((heat && heat->busy(u)) || unit_in_flight(u)) continue;
+        const int64_t g = us.pool_slot;
+        us.pool_slot = -1;
+        ++cp.n_donated;
+        ++stats_.donated;
+        return g;
+    }
+}
+
+/* THE STAGER COPIES A LAYER'S POOLED UNITS IN RUNS OF NEIGHBOURING POOL SLOTS (stage_units), and
+ * the pool is laid out in unit order, so a layer's pooled units start out side by side. A demotion
+ * that lands in a slot another layer's unit left breaks one run in that layer and starts a run of
+ * one in its own, a copy more in each, for every prompt after it. So a slot one of the unit's own
+ * layer started out in comes first, then a donor of the same layer -- its slot most likely one of
+ * those -- and only then any free slot, or any donor. At TP1, 26K-token prompts with 256 tokens
+ * decoded between them staged a layer in 162 copies without the preference and 112 with it (95
+ * when the budget was 8 swaps a step). */
+int64_t Mover::pool_slot_for(int32_t unit, HeatEngine* heat) {
+    const UnitState& us = unit_[(size_t)unit];
+    ClassPools& cp = pools_[(size_t)us.klass];
+    const int32_t layer = plan_->units[(size_t)unit].layer;
+    const std::vector<int32_t>& home = pool_layer_[(size_t)us.klass];
+    int64_t g = -1;
+    if (layer >= 0) {
+        g = cp.pool.take_where([&](int64_t p) { return (size_t)p < home.size() && home[(size_t)p] == layer; });
+        if (g < 0) g = donor_slot((size_t)us.klass, layer, heat);
+    }
+    if (g < 0) g = cp.pool.take();
+    if (g < 0) g = donor_slot((size_t)us.klass, -1, heat);
+    return g;
+}
+
+bool Mover::migrate(int32_t unit, HeatEngine* heat) {
+    UnitState& us = unit_[(size_t)unit];
+    ClassPools& cp = pools_[(size_t)us.klass];
+    const int64_t to = cp.slab.take();
+    if (to < 0) return false;
+    if (to >= cp.n_fixed) {
+        cp.slab.add_free(to);
+        return false;
+    }
+    const int rec = free_move_record();
+    if (rec < 0 || record_gate() < 0) {
+        if (rec < 0) ++stats_.no_record;
+        cp.slab.add_free(to);
+        return false;
+    }
+    Move& m = moves_[(size_t)rec];
+    if (rad_event_wait(mover_, gate_) < 0 ||
+        queue_move_copy(cp.slot_ptr(to), cp.slot_ptr(us.slab_slot), us.bytes, rec) < 0) {
+        cp.slab.add_free(to);
+        return false;
+    }
+    m.state = Move::State::Copying;
+    m.kind = Move::Kind::Migrate;
+    m.unit = unit;
+    m.slab_slot = us.slab_slot;
+    m.pool_slot = -1;
+    m.to_slot = to;
+    ++copying_[(size_t)unit];
+    if (heat) heat->set_busy(unit, true);
+    return true;
+}
+
 int Mover::promote_to(int32_t unit, int64_t slot) {
     UnitState& us = unit_[(size_t)unit];
     ClassPools& cp = pools_[(size_t)us.klass];
@@ -1052,8 +1240,7 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     const void* src = (const char*)cp.pool_base + us.pool_slot * cp.stride;
     Move& m = moves_[(size_t)rec];
     RAD_TRY(rad_event_wait(mover_, gate_));
-    RAD_TRY(rad_memcpy_async(cp.slot_ptr(slot), src, us.bytes, mover_));
-    (void)rad_event_record(m.ev, mover_);
+    RAD_TRY(queue_move_copy(cp.slot_ptr(slot), src, us.bytes, rec));
     m.kind = Move::Kind::Promote;
     m.slab_slot = slot;
     /* INTO A LENT SLOT, THE HOST COPY STAYS. The loan can be recalled at any time and a unit that
@@ -1063,6 +1250,7 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     m.pool_slot = cp.is_flex(slot) ? -1 : us.pool_slot;
     m.state = Move::State::Copying;
     m.unit = unit;
+    ++copying_[(size_t)unit];
     stats_.h2d_bytes += (uint64_t)us.bytes;
     return RAD_OK;
 }
@@ -1125,7 +1313,7 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
     return RAD_OK;
 }
 
-int Mover::balance(HeatEngine* heat) {
+int Mover::balance(HeatEngine* heat, bool turnover) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;
 
     for (size_t c = 0; c < pools_.size(); ++c) {
@@ -1149,6 +1337,20 @@ int Mover::balance(HeatEngine* heat) {
                     left = true;
                     continue;
                 }
+                /* A donor has no host copy to drop to: it moves into a free budgeted slot, or
+                 * else back across the link, and stays past the loan until the copy lands. */
+                if (us.pool_slot < 0) {
+                    if (migrate(u, heat)) {
+                        drained = true;
+                    } else {
+                        if (heat) heat->set_busy(u, true);
+                        Swap s;
+                        s.demote = u;
+                        if (issue(s, heat) >= 0) drained = true;
+                    }
+                    left = true;
+                    continue;
+                }
                 if (drop(u, heat) < 0) { left = true; break; }
                 drained = true;
             }
@@ -1160,36 +1362,54 @@ int Mover::balance(HeatEngine* heat) {
          * slots that were serving as the reserve leaves the slab too full by that many, and the
          * coldest lent units go -- drops, never copies. A slot already on its way back below the
          * target counts as free, because it is, a barrier from now; draining against it again is
-         * how a slab empties itself. */
+         * how a slab empties itself.
+         *
+         * THE TURNOVER SLOTS ARE REBUILT THE SAME WAY, out of the lent units alone. They are the
+         * top of the lent range, which is exactly what a cache that wants memory back takes first,
+         * and the loan grows back only a prefill chunk at a time: left to the fill, they would be
+         * gone for as long as requests keep arriving. Dropping the coldest lent units costs
+         * nothing on the link -- each still has its host copy -- and gives up the same residents
+         * the slots would have cost anyway. A swap whose demotion found no pool slot is completed
+         * the same way, by the coldest lent unit instead. */
         int64_t pending = 0;
         for (const Move& m : moves_) {
             if (m.state == Move::State::Free || m.unit < 0 || m.slab_slot < 0) continue;
             if (unit_[(size_t)m.unit].klass != (int32_t)c || !cp.slab.covered(m.slab_slot)) continue;
             if (m.kind == Move::Kind::Drop || m.kind == Move::Kind::Demote ||
-                m.kind == Move::Kind::Release)
+                m.kind == Move::Kind::Release || m.kind == Move::Kind::Migrate)
                 ++pending;
         }
-        int64_t short_by = cp.n_work - (cp.slab.n_free() + pending);
-        while (short_by > 0) {
-            int32_t victim = -1;
-            float coldest = 0.0f;
+        const int64_t turn = turnover ? cp.n_turn : 0;
+        int64_t short_by = cp.n_work + turn - (cp.slab.n_free() + pending);
+        if (short_by > 0) {
+            drop_cand_.clear();
             for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
                 const UnitState& us = unit_[(size_t)u];
                 if (us.klass != (int32_t)c || us.slab_slot < 0 || !cp.is_flex(us.slab_slot)) continue;
                 if (us.tier != Tier::VRAM || us.site != Site::Device || us.pool_slot < 0) continue;
                 if (heat && heat->busy(u)) continue;
-                const float h = heat ? heat->heat(u) : 0.0f;
-                if (victim < 0 || h < coldest) { victim = u; coldest = h; }
+                drop_cand_.push_back({ heat ? heat->heat(u) : 0.0f, u });
             }
-            if (victim < 0 || drop(victim, heat) < 0) break;
-            drained = true;
-            --short_by;
+            /* The coldest first, and on a tie the lower unit, so the choice is the same every run. */
+            auto colder = [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
+                return a.first != b.first ? a.first < b.first : a.second < b.second;
+            };
+            const size_t k = std::min(drop_cand_.size(), (size_t)short_by);
+            std::partial_sort(drop_cand_.begin(), drop_cand_.begin() + (ptrdiff_t)k, drop_cand_.end(),
+                              colder);
+            for (size_t i = 0; i < k; ++i) {
+                if (drop(drop_cand_[i].second, heat) < 0) break;
+                drained = true;
+                --short_by;
+            }
         }
         /* AND WITH NO LENT UNIT LEFT TO DROP, THE COLDEST BUDGETED ONE GOES BACK TO THE POOL -- a
-         * real demotion, one a call. A swap can leave the free slots in the lent range, and a loan
-         * that then shrinks away takes them with it; the reserve has to be rebuilt out of the
+         * real demotion, one a call, and for the working reserve only: the turnover slots are the
+         * loan's to give, and a copy across the link to keep them would spend the very link they
+         * exist to save. A swap can leave the free slots in the lent range, and a loan that then
+         * shrinks away takes them with it; the working reserve has to be rebuilt out of the
          * budgeted slots or the mover stops turning over. */
-        if (short_by > 0) {
+        if (short_by > turn) {
             int32_t victim = -1;
             float coldest = 0.0f;
             for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
@@ -1212,17 +1432,17 @@ int Mover::balance(HeatEngine* heat) {
          * trying to hand back. */
         if (drained) continue;
 
-        /* ---- THEN FILL, every free slot past the working reserve. */
-        RAD_TRY(fill(c, cp.slab.n_free() - cp.n_work, heat));
+        /* ---- THEN FILL, every free slot past the working reserve and the turnover slots. */
+        RAD_TRY(fill(c, cp.slab.n_free() - cp.n_work - turn, heat));
     }
     count_flex();
-    return RAD_OK;
+    return flush_moves();
 }
 
 int Mover::idle_tick(HeatEngine* heat) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;
     RAD_TRY(retire(heat));
-    return balance(heat);
+    return balance(heat, !hold_turnover_);
 }
 
 int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
@@ -1235,20 +1455,56 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
     }
     /* NO COPY IS STILL WRITING A SLOT: everything the mover issued has landed, and retiring it
      * publishes the promotions that landed in slots about to be taken back. */
+    RAD_TRY(flush_moves());
     RAD_TRY(rad_stream_sync(mover_));
     RAD_TRY(retire(heat));
 
-    /* EVERY UNIT PAST THE LOAN GOES BACK TO ITS HOST COPY, which is a change of address. */
+    /* EVERY UNIT PAST THE LOAN GOES BACK TO ITS HOST COPY, which is a change of address -- or,
+     * for a donor (donor_slot), which has none, it moves: into a free budgeted slot, a copy inside
+     * the card, or else back across the link into a free pool slot. One of the two is free for
+     * every donor (donor_slot says why). Nothing is published until the copies have landed. */
     std::vector<std::pair<size_t, int64_t>> freed;
+    std::vector<int32_t> moved;
     for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
         UnitState& us = unit_[(size_t)u];
         if (us.klass < 0 || us.slab_slot < 0) continue;
-        const ClassPools& cp = pools_[(size_t)us.klass];
+        ClassPools& cp = pools_[(size_t)us.klass];
         if (!cp.is_flex(us.slab_slot) || cp.slab.covered(us.slab_slot)) continue;
         if (us.pool_slot < 0) {
-            RAD_ERR("mover: unit %d sits in lent slot %lld with no host copy to go back to",
-                    (int)u, (long long)us.slab_slot);
-            return RAD_E_STATE;
+            const int64_t from = us.slab_slot;
+            int64_t to = cp.slab.take();
+            if (to >= cp.n_fixed) {
+                cp.slab.add_free(to);
+                to = -1;
+            }
+            if (to >= 0) {
+                RAD_TRY(rad_memcpy_async(cp.slot_ptr(to), cp.slot_ptr(from), us.bytes, mover_));
+                us.slab_slot = to;
+            } else {
+                const int64_t g = cp.pool.take();
+                if (g < 0) {
+                    RAD_ERR("mover: unit %d gave its host copy away and neither a budgeted slot nor "
+                            "a pool slot is free to move it to", (int)u);
+                    return RAD_E_STATE;
+                }
+                RAD_TRY(rad_memcpy_async((char*)cp.pool_base + g * cp.stride, cp.slot_ptr(from),
+                                         us.bytes, mover_));
+                us.pool_slot = g;
+                us.slab_slot = -1;
+                us.tier = Tier::HostPinned;
+                us.site = Site::DeviceZeroCopy;
+                stats_.d2h_bytes += (uint64_t)us.bytes;
+                ++stats_.demotions;
+                if (heat) {
+                    heat->set_tier(u, Tier::HostPinned);
+                    heat->set_busy(u, false);
+                }
+            }
+            --cp.n_donated;
+            ++stats_.relocated;
+            freed.push_back({ (size_t)us.klass, from });
+            moved.push_back(u);
+            continue;
         }
         freed.push_back({ (size_t)us.klass, us.slab_slot });
         us.slab_slot = -1;
@@ -1261,6 +1517,11 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
             heat->set_tier(u, Tier::HostPinned);
             heat->set_busy(u, false);
         }
+    }
+
+    if (!moved.empty()) {
+        RAD_TRY(rad_stream_sync(mover_));
+        for (int32_t u : moved) republish(u);
     }
 
     /* AND NO KERNEL STILL NAMES ONE. The compute stream is the only reader of the slab -- the
@@ -1279,13 +1540,14 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
         ClassPools& cp = pools_[(size_t)klass];
         if (!cp.is_flex(m.slab_slot) || cp.slab.covered(m.slab_slot)) continue;
         if (m.kind == Move::Kind::Drop || m.kind == Move::Kind::Demote ||
-            m.kind == Move::Kind::Release)
+            m.kind == Move::Kind::Release || m.kind == Move::Kind::Migrate)
             cp.slab.add_free(m.slab_slot);
         if (heat && m.kind != Move::Kind::Stage && m.kind != Move::Kind::Release)
             heat->set_busy(m.unit, false);
+        if (m.state == Move::State::Copying) --copying_[(size_t)m.unit];
         m.state = Move::State::Free;
         m.unit = -1;
-        m.slab_slot = m.pool_slot = -1;
+        m.slab_slot = m.pool_slot = m.to_slot = -1;
     }
     count_flex();
     if (loan_held(lender) > loan_[lender]) {
@@ -1297,13 +1559,38 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
     return RAD_OK;
 }
 
+int Mover::queue_move_copy(void* dst, const void* src, int64_t bytes, int rec) {
+    move_segs_.push_back(RadCopySeg{ src, dst, bytes });
+    move_recs_.push_back((int32_t)rec);
+    return RAD_OK;
+}
+
+/* THE DMA ENGINE AND NOT COPY KERNELS. A copy kernel runs on the compute units beside the step's
+ * kernels: at the heat engine's budget of 64 swaps a step, Qwen3.8-Flash-Next at one card spent 10 ms
+ * a step in about 68 of them while the step took 36. The engine moves the same bytes at the link's
+ * rate and takes nothing from the kernels; decode at one sequence went 34.1 -> 33.0 ms a step, and
+ * two cards, prefill and the output were unchanged. A card with no DMA queue of this process's own
+ * gets the list as copy kernels (rad_memcpy_list_async), as before. The list yields to the link's
+ * collectives like the prefill stager's. */
+int Mover::flush_moves() {
+    if (move_segs_.empty()) return RAD_OK;
+    const int rc = rad_memcpy_list_async(move_segs_.data(), (int)move_segs_.size(), RAD_COPY_YIELD,
+                                         mover_);
+    for (int32_t rec : move_recs_) (void)rad_event_record(moves_[(size_t)rec].ev, mover_);
+    move_segs_.clear();
+    move_recs_.clear();
+    return rc;
+}
+
 int Mover::retire(HeatEngine* heat) {
+    RAD_TRY(flush_moves());
     for (Move& m : moves_) {
         if (m.state != Move::State::Copying) continue;
         const int q = rad_event_query(m.ev);
         if (q < 0) return RAD_E_DEVICE;
         if (q == 0) continue;
 
+        --copying_[(size_t)m.unit];
         UnitState& us = unit_[(size_t)m.unit];
         switch (m.kind) {
             case Move::Kind::Promote:
@@ -1317,6 +1604,9 @@ int Mover::retire(HeatEngine* heat) {
                 if (heat) heat->set_tier(m.unit, Tier::VRAM);
                 break;
             case Move::Kind::Demote:
+                /* Out of a lent slot, the unit was a donor (donor_slot): any other unit there is
+                 * dropped, not demoted. */
+                if (pools_[(size_t)us.klass].is_flex(m.slab_slot)) --pools_[(size_t)us.klass].n_donated;
                 us.pool_slot = m.pool_slot;
                 us.slab_slot = -1;
                 us.tier = Tier::HostPinned;
@@ -1348,8 +1638,13 @@ int Mover::retire(HeatEngine* heat) {
                  * and the pipeline simply stops turning over. */
                 m.state = Move::State::Free;
                 m.unit = -1;
-                m.slab_slot = m.pool_slot = -1;
+                m.slab_slot = m.pool_slot = m.to_slot = -1;
                 continue;
+            case Move::Kind::Migrate:
+                us.slab_slot = m.to_slot;
+                --pools_[(size_t)us.klass].n_donated;
+                ++stats_.relocated;
+                break;
             case Move::Kind::Release:
             case Move::Kind::Drop:
                 break;
@@ -1393,14 +1688,15 @@ int Mover::retire(HeatEngine* heat) {
             case Move::Kind::Demote:  cp.slab.add_free(m.slab_slot); break;
             case Move::Kind::Release: cp.slab.add_free(m.slab_slot); break;
             case Move::Kind::Drop:    cp.slab.add_free(m.slab_slot); break;
+            case Move::Kind::Migrate: cp.slab.add_free(m.slab_slot); break;
             case Move::Kind::Stage:   break;   /* never reaches here; freed as soon as it lands */
         }
         if (heat && (m.kind == Move::Kind::Promote || m.kind == Move::Kind::Demote ||
-                     m.kind == Move::Kind::Drop))
+                     m.kind == Move::Kind::Drop || m.kind == Move::Kind::Migrate))
             heat->set_busy(m.unit, false);
         m.state = Move::State::Free;
         m.unit = -1;
-        m.slab_slot = m.pool_slot = -1;
+        m.slab_slot = m.pool_slot = m.to_slot = -1;
     }
     count_flex();
     return RAD_OK;
@@ -1421,6 +1717,10 @@ std::string Mover::report() const {
              "slot; %llu slots quarantined\n",
              (unsigned long long)stats_.no_record, (unsigned long long)stats_.starved_slab,
              (unsigned long long)stats_.starved_pool, (unsigned long long)stats_.quarantined);
+    if (stats_.donated)
+        s += fmt("  %llu host copies given by lent units to budgeted victims, %llu such units moved "
+                 "by a recall\n",
+                 (unsigned long long)stats_.donated, (unsigned long long)stats_.relocated);
     if (stats_.ssd_reads)
         s += fmt("  file tier: %llu demand reads (%.2f GiB), each a blocking pread in the middle "
                  "of a dispatch. Raise --host-pool-mib.\n",

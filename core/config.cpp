@@ -9,6 +9,7 @@
 #include "format/rope_override.h"
 #include "sample/host_ref.h"
 #include "server/oai.h"
+#include "diag/diag.h"
 
 #include <nlohmann/json.hpp>
 
@@ -755,11 +756,16 @@ int config_parse(int argc, char** argv, Config* c) {
             RAD_ERR("unknown option '%s'", a.c_str());
             return RAD_E_INVAL;
         }
+        /* WHERE EACH OPTION CAME FROM, for the startup report (core/diag/diag.h): every branch
+         * above that returned refused the option, so reaching here is the option taken. Under the
+         * table's spelling, so an alias reports as the option it is. */
+        c->given[S("--gpu-headroom") ? "--gpu-headroom-mib" : a] = "command line";
     }
 
     if (c->radiance_home.empty()) {
         const char* h = getenv("RADIANCE_HOME");
         c->radiance_home = h ? h : RAD_DEFAULT_HOME;
+        if (h) c->given["--radiance-home"] = "environment (RADIANCE_HOME)";
     }
     if (c->kernel_hierarchy.empty()) {
         /* RADIANCE_KERNELS, ahead of the built-in default.
@@ -769,7 +775,10 @@ int config_parse(int argc, char** argv, Config* c) {
          * plugin with rad-kbench or rad-tune has no way to serve with it short of editing every
          * launcher's command line. Same spelling, same separator. */
         const char* e = getenv("RADIANCE_KERNELS");
-        if (e && *e) c->kernel_hierarchy = split_commas(e);
+        if (e && *e) {
+            c->kernel_hierarchy = split_commas(e);
+            c->given["--kernels"] = "environment (RADIANCE_KERNELS)";
+        }
     }
     /* AND THERE IS NO BUILT-IN DEFAULT, deliberately. Naming a library here -- the RDNA4 one, say
      * -- would make the core carry the name of one card's kernels, and on any other machine that
@@ -849,5 +858,191 @@ int config_parse(int argc, char** argv, Config* c) {
 
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ the startup report's rows */
+namespace {
+
+std::string onoff(bool b) { return b ? "on" : "off"; }
+std::string num(int64_t v) { return std::to_string(v); }
+std::string or_none(const std::string& s, const char* none) { return s.empty() ? std::string(none) : s; }
+std::string fnum(double v) {
+    char b[48];
+    snprintf(b, sizeof b, "%g", v);
+    return b;
+}
+template <class T>
+std::string opt(const std::optional<T>& v, const char* unset) {
+    if (!v) return unset;
+    if constexpr (std::is_floating_point_v<T>) return fnum((double)*v);
+    else return std::to_string(*v);
+}
+std::string joined(const std::map<std::string, std::string>& m, const char* sep) {
+    std::string s;
+    for (const auto& [k, v] : m) s += (s.empty() ? "" : ",") + k + sep + v;
+    return s.empty() ? "none" : s;
+}
+
+using Show = std::string (*)(const Config&);
+struct ShowRow { const char* flag; Show show; };
+
+/* HOW EACH OPTION'S VALUE IS SHOWN, one entry an option of the table above, under the same
+ * spelling. config_rows walks the TABLE, so an option missing here still appears in the report --
+ * as "(not shown)" -- and diag_test fails naming it. A sentinel a field uses for "resolved at
+ * startup" (-1, 0, empty) is shown as what it means; the engine's decisions replace it with the
+ * value it resolved to. */
+const ShowRow kShow[] = {
+    { "--model",              [](const Config& c) { return c.model; } },
+    { "--download-dir",       [](const Config& c) { return or_none(c.download_dir, "the XDG cache (~/.cache/radiance/hf)"); } },
+    { "--radiance-home",      [](const Config& c) { return c.radiance_home; } },
+    { "--kernels",            [](const Config& c) {
+          std::string s;
+          for (const std::string& k : c.kernel_hierarchy) s += (s.empty() ? "" : ",") + k;
+          return or_none(s, "every library found"); } },
+    { "--tp",                 [](const Config& c) { return num(c.tp); } },
+    { "--tp-wire",            [](const Config& c) { return std::string(c.tp_wire_exact ? "exact" : "wht6"); } },
+    { "--tp-wire-min-kb",     [](const Config& c) { return num(c.tp_wire_min_kb); } },
+    { "--p2p",                [](const Config& c) {
+          return std::string(c.p2p == RAD_P2P_ON ? "on" : c.p2p == RAD_P2P_OFF ? "off" : "auto"); } },
+    { "--max-num-batched-tokens", [](const Config& c) { return num(c.max_tok); } },
+    { "--busy-prefill-chunk", [](const Config& c) {
+          return c.busy_prefill_chunk < 0 ? std::string("auto")
+               : c.busy_prefill_chunk == 0 ? std::string("off") : num(c.busy_prefill_chunk); } },
+    { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
+    { "--max-model-len",      [](const Config& c) {
+          return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },
+    { "--rope-scaling",       [](const Config& c) { return or_none(c.rope_scaling, "the checkpoint's own"); } },
+    { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
+    { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
+    { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
+    { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
+    { "--ngram-placement",    [](const Config& c) { return std::string(table_placement_name(c.ngram_placement)); } },
+    { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
+    { "--prefix-cache-host-mib", [](const Config& c) {
+          return c.prefix_cache_host_mib ? num(c.prefix_cache_host_mib) : std::string("0 (off)"); } },
+    { "--prefix-cache-dir",   [](const Config& c) { return or_none(c.prefix_cache_dir, "none"); } },
+    { "--prefix-cache-disk-mib", [](const Config& c) {
+          return c.prefix_cache_disk_mib ? num(c.prefix_cache_disk_mib) : std::string("0 (off)"); } },
+    { "--placement",          [](const Config& c) { return c.placement; } },
+    { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
+    { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
+    { "--checkpoint-slots",   [](const Config& c) { return num(c.checkpoint_slots); } },
+    { "--no-prefix-cache",    [](const Config& c) {
+          return std::string(c.prefix_cache ? "not given: prefix caching on" : "prefix caching off"); } },
+    { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
+    { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
+    { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
+    { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
+    { "--host",               [](const Config& c) { return c.host; } },
+    { "--port",               [](const Config& c) { return num(c.port); } },
+    /* A SECRET IS NOT A VALUE. Whether one is set is what a reader of the log needs. */
+    { "--api-key",            [](const Config& c) { return std::string(c.api_key.empty() ? "not set" : "set"); } },
+    { "--served-model-name",  [](const Config& c) { return or_none(c.served_model_name, "the container's name"); } },
+    { "--mm-max-patches",     [](const Config& c) { return c.mm_max_patches < 0 ? std::string("auto") : num(c.mm_max_patches); } },
+    { "--generation-config",  [](const Config& c) { return or_none(c.generation_config, "none"); } },
+    { "--override-chat-template", [](const Config& c) { return or_none(c.override_chat_template, "none (the container's)"); } },
+    { "--temp",               [](const Config& c) { return c.sample_temp < 0 ? std::string("unset") : fnum(c.sample_temp); } },
+    { "--top-k",              [](const Config& c) { return c.sample_top_k < 0 ? std::string("unset") : num(c.sample_top_k); } },
+    { "--top-p",              [](const Config& c) { return c.sample_top_p < 0 ? std::string("unset") : fnum(c.sample_top_p); } },
+    { "--min-p",              [](const Config& c) { return c.sample_min_p < 0 ? std::string("unset") : fnum(c.sample_min_p); } },
+    { "--reasoning-effort",   [](const Config& c) { return or_none(c.reasoning_effort, "the template's default"); } },
+    { "--reasoning-effort-map", [](const Config& c) { return joined(c.reasoning_effort_map, "="); } },
+    { "--thinking-token-budget", [](const Config& c) {
+          return c.thinking_token_budget < 0 ? std::string("none") : num(c.thinking_token_budget); } },
+    { "--typical-p",          [](const Config& c) { return opt(c.sample_typical_p, "the request default"); } },
+    { "--presence-penalty",   [](const Config& c) { return opt(c.sample_pres_penalty, "the request default"); } },
+    { "--frequency-penalty",  [](const Config& c) { return opt(c.sample_freq_penalty, "the request default"); } },
+    { "--repetition-penalty", [](const Config& c) { return opt(c.sample_rep_penalty, "the request default"); } },
+    { "--repeat-last-n",      [](const Config& c) { return opt(c.sample_penalty_last_n, "the request default"); } },
+    { "--dry-multiplier",     [](const Config& c) { return opt(c.sample_dry_multiplier, "the request default"); } },
+    { "--dry-base",           [](const Config& c) { return opt(c.sample_dry_base, "the request default"); } },
+    { "--dry-allowed-length", [](const Config& c) { return opt(c.sample_dry_allowed_length, "the request default"); } },
+    { "--dry-penalty-last-n", [](const Config& c) { return opt(c.sample_dry_penalty_last_n, "the request default"); } },
+    { "--dry-sequence-breakers", [](const Config& c) {
+          /* Replaced, not thrown on, like every dump in the report: the strings reach Config from
+           * outside the engine, and a serialiser that throws would end a startup that is otherwise
+           * sound over one line of its log. */
+          return c.sample_dry_seq_breakers
+                     ? nlohmann::json(*c.sample_dry_seq_breakers)
+                           .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)
+                     : std::string("the request default"); } },
+    { "--xtc-probability",    [](const Config& c) { return opt(c.sample_xtc_probability, "the request default"); } },
+    { "--xtc-threshold",      [](const Config& c) { return opt(c.sample_xtc_threshold, "the request default"); } },
+    { "--default-max-tokens", [](const Config& c) {
+          return c.default_max_tokens > 0 ? num(c.default_max_tokens)
+                                          : std::string("auto (what the context leaves after the prompt)"); } },
+    { "--max-tokens-cap",     [](const Config& c) { return c.max_tokens_cap > 0 ? num(c.max_tokens_cap) : std::string("none"); } },
+    { "--max-n",              [](const Config& c) {
+          return c.max_n > 0 ? num(c.max_n)
+                             : std::string("auto (the larger of 8 and --max-num-seqs)"); } },
+    { "--max-queued-requests", [](const Config& c) {
+          return c.max_queued_requests > 0 ? num(c.max_queued_requests)
+                                           : std::string("auto (8 x --max-num-seqs)"); } },
+    { "--max-stop-strings",   [](const Config& c) { return num(c.max_stop_strings); } },
+    { "--max-stop-bytes",     [](const Config& c) { return num(c.max_stop_bytes); } },
+    { "--chat-template-kwargs", [](const Config& c) { return joined(c.chat_template_kwargs, "="); } },
+    { "--reasoning-format",   [](const Config& c) { return c.reasoning_format; } },
+    { "--http-threads",       [](const Config& c) {
+          return c.http_threads > 0 ? num(c.http_threads)
+                                    : std::string("auto (one a hardware thread, at least 4)"); } },
+    { "--read-timeout",       [](const Config& c) { return num(c.http_read_timeout_s) + " s"; } },
+    { "--write-timeout",      [](const Config& c) { return num(c.http_write_timeout_s) + " s"; } },
+    { "--keep-alive-timeout", [](const Config& c) { return num(c.http_keep_alive_timeout_s) + " s"; } },
+    { "--max-body-mib",       [](const Config& c) { return num(c.http_max_body_mib); } },
+    { "--retry-after",        [](const Config& c) { return num(c.retry_after_s) + " s"; } },
+    { "--no-cors",            [](const Config& c) {
+          return std::string(c.cors ? "not given: CORS headers sent" : "no CORS headers"); } },
+    { "--image-min-pixels",   [](const Config& c) { return opt(c.image_min_pixels, "the container's"); } },
+    { "--image-max-pixels",   [](const Config& c) { return opt(c.image_max_pixels, "the container's"); } },
+    { "--video-min-pixels",   [](const Config& c) { return opt(c.video_min_pixels, "the container's"); } },
+    { "--video-max-pixels",   [](const Config& c) { return opt(c.video_max_pixels, "the container's"); } },
+    { "--video-fps",          [](const Config& c) { return opt(c.video_fps, "the container's"); } },
+    { "--video-min-frames",   [](const Config& c) { return opt(c.video_min_frames, "the container's"); } },
+    { "--video-max-frames",   [](const Config& c) { return opt(c.video_max_frames, "the container's"); } },
+    { "--video-max-frame-tokens", [](const Config& c) { return opt(c.video_max_frame_tokens, "the container's"); } },
+    { "--image-tokens",       [](const Config& c) { return opt(c.image_tokens, "the container's"); } },
+    { "--max-source-pixels",  [](const Config& c) { return opt(c.max_source_pixels, "67108864"); } },
+    { "--kld-record",         [](const Config& c) { return or_none(c.kld_record, "none"); } },
+    { "--kld-ref",            [](const Config& c) { return or_none(c.kld_ref, "none"); } },
+    { "--kld-corpus",         [](const Config& c) { return or_none(c.kld_corpus, "none"); } },
+    { "--kld-out",            [](const Config& c) { return or_none(c.kld_out, "none"); } },
+    { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
+    { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
+    { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },
+    { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
+    { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
+    { "--live",               [](const Config& c) { return onoff(c.live_view); } },
+    { "-v",                   [](const Config& c) { return onoff(c.given.count("-v") > 0); } },
+    { "-vv",                  [](const Config& c) { return onoff(c.given.count("-vv") > 0); } },
+};
+
+}  /* namespace */
+
+namespace diag {
+
+std::vector<ConfigRow> config_rows(const Config& c) {
+    std::vector<ConfigRow> out;
+    for (const Flag& f : g_flags) {
+        /* --help asks for this text and serves nothing; it is not a setting. */
+        if (!std::strcmp(f.name, "--help")) continue;
+        ConfigRow r;
+        r.flag = f.name;
+        r.value = "(not shown)";
+        for (const ShowRow& s : kShow)
+            if (!std::strcmp(s.flag, f.name)) { r.value = s.show(c); break; }
+        auto g = c.given.find(f.name);
+        r.source = g != c.given.end() ? g->second : "default";
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::vector<std::string> config_option_names() {
+    std::vector<std::string> out;
+    for (const Flag& f : g_flags)
+        if (std::strcmp(f.name, "--help")) out.push_back(f.name);
+    return out;
+}
+
+}  /* namespace diag */
 
 }  /* namespace rad */

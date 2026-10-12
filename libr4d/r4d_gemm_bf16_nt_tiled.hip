@@ -29,6 +29,7 @@
 // last valid row, computes a result nobody stores, and never touches memory it does not own.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
+#include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
@@ -95,27 +96,27 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
       for (int j = 0; j < TN; ++j) tot[i][j] = (v8f)(0.f);
   }
 
-  uint4 ra[AL], rw[WL];
+  r4d_u32x4 ra[AL], rw[WL];                       // registers; uint4 would sit in scratch
 #pragma unroll
-  for (int i = 0; i < AL; ++i) ra[i] = *(const uint4*)(A + aoff[i]);
+  for (int i = 0; i < AL; ++i) ra[i] = *(const r4d_u32x4*)(A + aoff[i]);
 #pragma unroll
-  for (int i = 0; i < WL; ++i) rw[i] = *(const uint4*)(W + woff[i]);
+  for (int i = 0; i < WL; ++i) rw[i] = *(const r4d_u32x4*)(W + woff[i]);
 
   const int nk = K / BT_BK;
   int left = spk;                                 // k steps to the end of this split slice
   for (int kt = 0; kt < nk; ++kt) {
     __syncthreads();                              // the previous tile's fragments are all read
 #pragma unroll
-    for (int i = 0; i < AL; ++i) *(uint4*)adst[i] = ra[i];
+    for (int i = 0; i < AL; ++i) *(r4d_u32x4*)adst[i] = ra[i];
 #pragma unroll
-    for (int i = 0; i < WL; ++i) *(uint4*)wdst[i] = rw[i];
+    for (int i = 0; i < WL; ++i) *(r4d_u32x4*)wdst[i] = rw[i];
     __syncthreads();
     if (kt + 1 < nk) {
       const unsigned k1 = (unsigned)(kt + 1) * BT_BK;
 #pragma unroll
-      for (int i = 0; i < AL; ++i) ra[i] = *(const uint4*)(A + aoff[i] + k1);
+      for (int i = 0; i < AL; ++i) ra[i] = *(const r4d_u32x4*)(A + aoff[i] + k1);
 #pragma unroll
-      for (int i = 0; i < WL; ++i) rw[i] = *(const uint4*)(W + woff[i] + k1);
+      for (int i = 0; i < WL; ++i) rw[i] = *(const r4d_u32x4*)(W + woff[i] + k1);
     }
 #pragma unroll
     for (int s = 0; s < BT_BK / 16; ++s) {
@@ -128,6 +129,12 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
       for (int i = 0; i < TM; ++i)
 #pragma unroll
         for (int j = 0; j < TN; ++j) acc[i][j] = mma(af[i], bf[j], acc[i][j]);
+      /* A K STEP'S FRAGMENT READS, THEN ITS PRODUCTS, as the scheduler's groups. Left to itself,
+       * gfx12's compiler spreads each step's LDS reads among the previous step's WMMAs and waits on
+       * them early; grouped, the 128 x 128 tile measured 6 to 9% faster than LLVM 22's schedule at
+       * Flash-Next's shapes (M 384 to 2048, K 2560, N 2560 and 10240). */
+      __builtin_amdgcn_sched_group_barrier(0x100, TM + TN, 0);    /* DS reads */
+      __builtin_amdgcn_sched_group_barrier(0x008, TM * TN, 0);    /* WMMA */
       if constexpr (SPLIT) {
         if (--left == 0) {
           left = spk;

@@ -288,6 +288,24 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
                {w.c}, {w.x});
 
     RAD_ARCH_TRY(attn.declare(b, nm, g, l, kv, rotary_dim, w.attn, src.attn));
+
+    /* DRAFT ROUND 1'S ROWS OUT OF A HISTORY PASS (RadBatch::draft_out_ids), one a drafting
+     * sequence in round order, to the front of the residual stream `x` -- before the feed-forward,
+     * which then runs over those rows alone. Through `hout`, which is dead from the fc's read to
+     * the norm's write, because a gather in place could overwrite a row another sequence has yet to
+     * read. */
+    op_dsel = rw(b, RAD_OP(b, "gather_rows",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd),
+                               RAD_STR("dtype", g.dtype)),
+                    RAD_NOWEIGHTS),
+                {w.x}, {w.hout});
+    op_dback = rw(b, RAD_OP(b, "cast",
+                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd),
+                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                     RAD_NOWEIGHTS),
+                 {w.hout}, {w.x});
+    if (!op_dsel || !op_dback) return RAD_E_INVAL;
+
     RAD_ARCH_TRY(mlp.declare(b, nm, g, l, w.mlp, src.mlp));
 
     op_norm = rw(b, RAD_OP(b, "rmsnorm",
@@ -296,22 +314,6 @@ inline int MtpBlockFP8<Ffn>::declare(RadBuilder* b, Names& nm, const Geom& geom,
                                 RAD_STR("dtype", g.dtype)),
                      RAD_WEIGHTS(w_norm)),
                  {w.x}, {w.hout});
-
-    /* DRAFT ROUND 1'S ROWS OUT OF A HISTORY PASS (RadBatch::draft_out_ids), one a drafting
-     * sequence in round order, to the front of `hout` -- where the lm_head reads a round's rows
-     * and round 2 reads its input. Through `x`, which is dead once the norm has read it, because a
-     * gather in place could overwrite a row another sequence has yet to read. */
-    op_dsel = rw(b, RAD_OP(b, "gather_rows",
-                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd),
-                               RAD_STR("dtype", g.dtype)),
-                    RAD_NOWEIGHTS),
-                {w.hout}, {w.x});
-    op_dback = rw(b, RAD_OP(b, "cast",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd),
-                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.x}, {w.hout});
-    if (!op_dsel || !op_dback) return RAD_E_INVAL;
 
     /* The trunk's lm_head, over the head's hidden state. Banded at the logits buffer's own extent
      * rather than at `rows`: it runs over one row a drafting sequence. */
@@ -435,27 +437,32 @@ inline void MtpBlockFP8<Ffn>::step(RadCtx* c, const RadBatch* batch) const {
 
     RAD_ISSUE(c, op_fc, brows(w.c, T), RAD_W(w_fc), brows(w.x, T));
 
+    /* A HISTORY PASS THAT DRAFTS NOTHING ONLY LEAVES K AND V BEHIND, and they come from the
+     * block's input. The query, the attention, its output, the feed-forward, the norm and the
+     * lm_head compute the head's output, which only a drafting row reads -- and every prefill
+     * chunk but a prompt's last drafts nothing. `n_draft_out` is the batch's and the same on every
+     * rank, so a collective skipped here is skipped on all of them. */
+    if (r < 0 && batch->n_draft_out <= 0) {
+        attn.store_kv(c, batch);
+        return;
+    }
     attn.step(c, batch);
 
-    /* A HISTORY PASS THAT DRAFTS NOTHING ENDS HERE. It exists to leave K and V behind, and the
-     * attention above has stored them. The feed-forward, the norm and the lm_head compute the
-     * head's output, which only a drafting row reads -- and every prefill chunk but a prompt's
-     * last drafts nothing. `n_draft_out` is the batch's and the same on every rank, so a
-     * collective the feed-forward would run is skipped on all of them. */
-    if (r < 0 && batch->n_draft_out <= 0) return;
-
-    mlp.step(c, batch);
-
-    RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.hout, T));
-
-    /* A history pass that drafts brings round 1's rows to the front first. */
-    int64_t L = T;                      /* the rows the lm_head runs over */
+    /* A HISTORY PASS THAT DRAFTS GOES ON WITH ITS DRAFTING ROWS ALONE. They are round 1, and
+     * nothing reads the head's output at any other row: the feed-forward, the norm and the lm_head
+     * would run over a whole prompt chunk for a handful of rows. So round 1's rows come to the
+     * front of `x` first, and everything after runs as a pass of those rows. */
+    int64_t L = T;                      /* the rows the stream goes on with */
     if (r < 0) {
         L = batch->n_draft_out;
-        RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.hout), praw(batch->draft_out_ids, RAD_I32, L),
-                    brows(w.x, L));
-        RAD_ISSUE_N(c, op_dback, L, brows(w.x, L), brows(w.hout, L));
+        RAD_ISSUE_N(c, op_dsel, L, RAD_B(w.x), praw(batch->draft_out_ids, RAD_I32, L),
+                    brows(w.hout, L));
+        RAD_ISSUE_N(c, op_dback, L, brows(w.hout, L), brows(w.x, L));
     }
+
+    mlp.step_rows(c, L);
+
+    RAD_ISSUE(c, op_norm, brows(w.x, L), RAD_W(w_norm), brows(w.hout, L));
     if (q2) {
         /* `dsum` is GROUP-major [n_embd/group][ceil(L/16)*16] and not row-major, so it is passed
          * whole: there is no row slice of it that means anything. */

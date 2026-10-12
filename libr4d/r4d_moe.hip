@@ -773,13 +773,26 @@ __device__ __forceinline__ Stage8 stage8_load_w(const uint8_t* __restrict__ src,
     }
     return r;
 }
+/* A staged tile row as loaded, or the zero a dead row stages. */
+__device__ __forceinline__ Stage8 stage8_keep(const Stage8& s, bool live) {
+    Stage8 r;
+    r.v = live ? s.v : make_uint4(0, 0, 0, 0);
+    r.w = live ? s.w : make_uint4(0, 0, 0, 0);
+    return r;
+}
 template <bool UW>
 __device__ __forceinline__ uint32_t u32_load_w(const uint32_t* p) {
     if constexpr (!UW) return *p;
     return *(r4d_moe_gu32)p;
 }
+/* A 16-BIT SCALE LOADED ZERO-EXTENDED INTO A WHOLE REGISTER. Kept 16-bit, LLVM 24 loads it into a
+ * register HALF (global_load_d16_b16), which leaves the other half live in the same register: the
+ * load then depends on that register's last write, and the waitcnt pass answers with a full wait
+ * at the branch joins around the scale loads. The first pass's three loads -- this scale, the
+ * activation scale, the activation -- went out one round trip each, which cost the down
+ * projection's four-pass blocks 25-30%. Widened here, it is LLVM 22's global_load_u16. */
 template <bool UW>
-__device__ __forceinline__ uint16_t u16_load_w(const uint16_t* p) {
+__device__ __forceinline__ uint32_t u16_load_w(const uint16_t* p) {
     if constexpr (!UW) return *p;
     return *(r4d_moe_gu16)p;
 }
@@ -961,11 +974,23 @@ static_assert(sizeof(MoeTab) == 16, "the code table is four words");
  *
  * RS finds an ES block's run in one round trip -- see the RS note at the run search. It covers
  * up to kMaxExpert experts; a wider expert count takes the chunked search, which numbers the runs
- * the same way. */
+ * the same way.
+ *
+ * THE WAVES A SIMD EACH FORM RUNS AT (R4D_WAVES), as every form was measured: the ES prefill grid
+ * at 9-11 (5 at FK 256, where the staged pass is the register budget), the aligned form at 9-12,
+ * the uniform grid at 8-9. Left to itself LLVM 24 spends about 30 more VGPRs on the aligned
+ * split-K form for one to three fewer waves, which cost its prefill tiles 16-52%. */
+constexpr uint32_t moe_waves(uint32_t ntl, int w4, bool es, bool al, uint32_t fk, bool rs) {
+    return es ? (fk == 256u ? 5u : w4 == 0 ? (rs ? 10u : 11u) : w4 == 1 ? 11u : w4 == 3 ? 9u : 10u)
+         : al ? (ntl == 16u ? (w4 == 1 ? 12u : 9u) : ntl == 8u ? (w4 <= 1 ? 10u : 9u) : 9u)
+              : (w4 <= 1 ? 9u : 8u);
+}
+
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
           bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
           bool RS = false>
-__global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
+__global__ __launch_bounds__(WGM * WGN * kWave) R4D_WAVES(moe_waves(NTL, W4, ES, AL, FK, RS))
+void moe_gemm_q_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
@@ -1325,7 +1350,14 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         if (re <= rs) break;
         /* Not this block's run: walk past it. Block-uniform, so no barrier is skipped by some
          * threads and not others. */
-        if (ES && run != jrun) { rs = re; ++run; continue; }
+        /* Not this block's run: never true, since under ES the loop starts at the block's run.
+         * It stays for the fp8 weight (W4 0) alone, as the back edge it makes: the CFG
+         * structurizer keeps it, and LLVM 24's waitcnt pass then places the decode form's first-pass
+         * waits differently. With it the four-bit forms' first pass went out one load a round trip
+         * (FK 256 gate_up at one and two tokens 4-7% slower than 7.2); without it the fp8 form's
+         * K loop did (11-13% slower at one and two tokens). Each form is built the way it measured
+         * faster: r4d_selftest --perfmoe --cold and the MoE fixture's cold kbench. */
+        if (ES && W4 == 0 && run != jrun) { rs = re; ++run; continue; }
 
         /* The expert's class, and where this block's columns sit in its weight. Block-uniform: a
          * pad tile zeroes the run's rows and moves on without touching LDS or a barrier. `cshift`
@@ -1341,7 +1373,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
             }
             rs = re;
             ++run;
-            if (ES) break;
+            if (ES || AL) break;
             continue;
         }
         const uint32_t wn0 = part * fc + j0;          /* the weight row of the block's column 0 */
@@ -1419,11 +1451,28 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         uint4  bpre4[kBP];      /* W4: packed nibbles, expanded at store time as before */
         uint32_t spre[W4 == 4 ? kBP : 1];   /* W4 4: the same 32 elements' sign bits */
         Stage8 bpre8[kBP];      /* otherwise: the fp8 bytes themselves */
+        /* kUL: WHETHER EACH STAGED ROW IS LIVE. Under kUL a row's tile is loaded whether it is
+         * live or not -- a dead row reads a row that exists -- and the zero it stages is selected
+         * at the LDS store, from these. Loaded only when live, the zero is written into the
+         * load's destination first, and that write lands on registers the previous pass's load
+         * filled: on the path where a wave's lanes all skipped that load's store branch, the
+         * waitcnt pass cannot see the load collected, so it waits for every load in flight before
+         * the write. Each pass's loads then went out one pair a round trip -- three a K step at
+         * the aligned down projection's tile, 15% of its time -- where an unconditional load into
+         * the same registers needs no wait at all (loads of one kind retire in order). The
+         * one-run-a-block form (ES) keeps the guarded loads: unconditional, it measured 1.5%
+         * slower, and it does not have the waits. */
+        constexpr bool kUL = UW && AL;
+        [[maybe_unused]] bool aok[kUL ? kAP : 1];
+        [[maybe_unused]] bool bok[kUL ? kBP : 1];
         /* thread tid < FM: its row's activation scale, one a 128-wide block of the pass */
         float    pas[kBpS] = {};
         /* thread FM + c: column c's weight scale (w4), or the block's (fp8); at W4 3 its four --
          * again one a 128-wide block of the pass */
-        using PwsT = std::conditional_t<W4 == 3, uint32_t, uint16_t>;
+        /* At W4 3 the scale IS 32 bits, its four E4M3 groups packed: a 16-bit register would keep
+         * two of them. Otherwise a 16-bit scale: under AL held zero-extended in a whole register
+         * (see u16_load_w), the other forms measured 1% slower that way and keep it 16-bit. */
+        using PwsT = std::conditional_t<AL || W4 == 3, uint32_t, uint16_t>;
         PwsT pws[kBpS] = {};
         /* UW: the thread's scale as loaded, and whether it is live -- the zero is selected where
          * it is staged. Two registers, one a role, and NOT initialised: the two branches run in
@@ -1433,7 +1482,12 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
         float pau[UW ? kBpS : 1];
         PwsT  pwu[UW ? kBpS : 1];
         bool  pok = false;
-        auto issue = [&](uint32_t cc) {
+        /* `first` is the pass at cc 0 as a TYPE, not a test of cc: the early weight is read there
+         * and nowhere else, and a runtime `cc == 0` in the loop's issue(c0 + FK) is one the compiler
+         * cannot rule out (the sum is unsigned and may wrap), so it kept the ew_ registers live
+         * across every pass -- under LLVM 24, sixteen VGPRs the WMMA block then went without: at
+         * the pinned occupancy it read each fragment pair behind a full LDS wait. */
+        auto issue = [&](uint32_t cc, auto first) {
             const uint32_t kbk = cc / kBlock;
             if constexpr (UW) {
                 /* UNDER UW THE SCALE LOADS ARE UNCONDITIONAL -- from a row that exists when this
@@ -1479,7 +1533,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                     else if constexpr (W4)
                         pws[h] = j0 + nn < fc
                                      ? u16_load_w<UW>(Wsp + (size_t)(wn0 + nn) * ws_ld + kbk + h)
-                                     : (uint16_t)0;
+                                     : 0u;
                     else if (nn == 0)
                         pws[h] = u16_load_w<UW>(Wsp + (size_t)kb_n * ws_ld + kbk + h);
                 }
@@ -1490,26 +1544,40 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                 if (r >= FM) continue;
                 const int32_t tok = s_tok[r];
                 const bool    ok  = tok >= 0 && (r0 + r) >= rs && (r0 + r) < re;
-                apre[p] = stage8_load(Aq + (size_t)(ok ? tok : 0) * a_ld + cc + sk, ok);
+                const uint8_t* src = Aq + (size_t)(ok ? tok : 0) * a_ld + cc + sk;
+                if constexpr (kUL) {
+                    aok[p]  = ok;
+                    apre[p] = stage8_load_w<UW>(src, true);
+                } else
+                    apre[p] = stage8_load(src, ok);
             }
-            if constexpr (AL) {
+            if constexpr (AL && decltype(first)::value) {
+                /* the first pass's weight is already in flight */
                 static_assert(kEwBP == kBP && kEwRPP == kRPP,
                               "the early weight stages the pass issue() would");
-                if (cc == 0) {                /* the first pass's weight is already in flight */
 #pragma unroll
-                    for (uint32_t p = 0; p < kBP; ++p) {
-                        if (sn + p * kRPP >= FN) continue;
-                        /* The dead rows' zeros, as w4_load / stage8_load give them. */
+                for (uint32_t p = 0; p < kBP; ++p) {
+                    if (sn + p * kRPP >= FN) continue;
+                    if constexpr (kUL) {
+                        /* loaded from a row that exists; the store selects the dead rows' zero */
+                        bok[p] = ew_ok[p];
                         if constexpr (W4) {
-                            bpre4[p] = ew_ok[p] ? ew_b4[p] : make_uint4(0, 0, 0, 0);
-                            if constexpr (W4 == 4) spre[p] = ew_ok[p] ? ew_sp[p] : 0u;
-                        } else {
-                            bpre8[p].v = ew_ok[p] ? ew_b8[p].v : make_uint4(0, 0, 0, 0);
-                            bpre8[p].w = ew_ok[p] ? ew_b8[p].w : make_uint4(0, 0, 0, 0);
-                        }
+                            bpre4[p] = ew_b4[p];
+                            if constexpr (W4 == 4) spre[p] = ew_sp[p];
+                        } else
+                            bpre8[p] = ew_b8[p];
+                        continue;
                     }
-                    return;
+                    /* The dead rows' zeros, as w4_load / stage8_load give them. */
+                    if constexpr (W4) {
+                        bpre4[p] = ew_ok[p] ? ew_b4[p] : make_uint4(0, 0, 0, 0);
+                        if constexpr (W4 == 4) spre[p] = ew_ok[p] ? ew_sp[p] : 0u;
+                    } else {
+                        bpre8[p].v = ew_ok[p] ? ew_b8[p].v : make_uint4(0, 0, 0, 0);
+                        bpre8[p].w = ew_ok[p] ? ew_b8[p].w : make_uint4(0, 0, 0, 0);
+                    }
                 }
+                return;
             }
 #pragma unroll
             for (uint32_t p = 0; p < kBP; ++p) {
@@ -1518,21 +1586,23 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                 const bool ok = (j0 + r) < fc;
                 /* W4: half the bytes off the same row, expanded on the way in. `w_ld` is the
                  * PACKED byte pitch there, which is why it is not divided here. At W4 4 the row's
-                 * sign plane follows its K/2 bytes of nibbles, a bit an element. */
+                 * sign plane follows its K/2 bytes of nibbles, a bit an element. Under kUL a dead
+                 * row reads the tile's first row, and the store selects its zero (see bok). */
+                const uint8_t* wr = Wp + (size_t)(kUL && !ok ? wn0 : wn0 + r) * w_ld;
+                if constexpr (kUL) bok[p] = ok;
                 if constexpr (W4) {
-                    const uint8_t* wr = Wp + (size_t)(wn0 + r) * w_ld;
-                    bpre4[p] = w4_load_w<UW>(wr + ((cc + sk) >> 1), ok);
+                    bpre4[p] = w4_load_w<UW>(wr + ((cc + sk) >> 1), kUL || ok);
                     if constexpr (W4 == 4)
-                        spre[p] = ok ? u32_load_w<UW>((const uint32_t*)(wr + (K >> 1) +
-                                                                        ((cc + sk) >> 3)))
-                                     : 0u;
+                        spre[p] = kUL || ok ? u32_load_w<UW>((const uint32_t*)(wr + (K >> 1) +
+                                                                             ((cc + sk) >> 3)))
+                                           : 0u;
                 } else
-                    bpre8[p] = stage8_load_w<UW>(Wp + (size_t)(wn0 + r) * w_ld + cc + sk, ok);
+                    bpre8[p] = stage8_load_w<UW>(wr + cc + sk, kUL || ok);
             }
         };
         /* `s_tok` is settled by the barrier above the run loop and no run rewrites it, so priming
          * ahead of the loop's own barrier reads nothing another thread is still writing. */
-        issue(0);
+        issue(0u, std::true_type{});
 
         /* THE K LOOP'S BARRIERS ORDER LDS AND NOTHING ELSE -- no thread reads what another wrote
          * to global memory inside it. __syncthreads() is a workgroup fence over every address
@@ -1561,18 +1631,21 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
             for (uint32_t p = 0; p < kAP; ++p) {
                 const uint32_t r = sn + p * kRPP;
                 if (r >= FM) continue;
-                stage8_store<FK>(s_a, r, sk, apre[p]);
+                stage8_store<FK>(s_a, r, sk, kUL ? stage8_keep(apre[p], aok[p]) : apre[p]);
             }
 #pragma unroll
             for (uint32_t p = 0; p < kBP; ++p) {
                 const uint32_t r = sn + p * kRPP;
                 if (r >= FN) continue;
+                /* a dead row's zero, where the packed form held it before (see bok) */
+                const bool live = !kUL || bok[p];
+                const uint4 b4 = live ? bpre4[p] : make_uint4(0, 0, 0, 0);
                 if constexpr (W4 == 4)
-                    stage8_store<FK>(s_b, r, sk, w5_expand(bpre4[p], spre[p], tab.v));
+                    stage8_store<FK>(s_b, r, sk, w5_expand(b4, live ? spre[p] : 0u, tab.v));
                 else if constexpr (W4)
-                    stage8_store<FK>(s_b, r, sk, w4_expand(bpre4[p], tab.v));
+                    stage8_store<FK>(s_b, r, sk, w4_expand(b4, tab.v));
                 else
-                    stage8_store<FK>(s_b, r, sk, bpre8[p]);
+                    stage8_store<FK>(s_b, r, sk, kUL ? stage8_keep(bpre8[p], live) : bpre8[p]);
             }
             /* The scales as issued; under UW the dead ones are zeroed here (see issue). */
             auto pas_v = [&](uint32_t h) {
@@ -1601,7 +1674,7 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
                     s_ws[tid - FM] = (W4 || tid == FM) ? bscale(pws_v(0)) : 0.0f;
                 }
             }
-            if (c0 + FK < K) issue(c0 + FK);
+            if (c0 + FK < K) issue(c0 + FK, std::false_type{});
             kbar();
 
             if (!wlive) continue;
@@ -1748,7 +1821,11 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_q_kernel(
 
         rs = re;
         ++run;
-        if (ES) break;                     /* one run a block, and it is done */
+        /* One run a block under ES and AL, and it is done. Under AL a second pass of this loop would
+         * leave at once (the map's run ends at al_end), but as a loop it lets the compiler hoist
+         * the first pass's selects of the early weight out of it, to the top: LLVM 24 does, and
+         * then waits for that weight before the pass's other loads are issued. */
+        if (ES || AL) break;
     }
 }
 /* The whole argument list against the descriptor (see MoeTab): every instantiation takes the same
@@ -1850,11 +1927,15 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
      * the (tile, run) form's runs do: an operand may name fewer rows than its buffer, never more.
      * A run that would start past T is then empty and has no tile, so the tile count also stays
      * inside the grid's bound. */
+    /* The loads are unconditional -- a thread past the experts reads off[n_expert] again and a
+     * select drops it -- so the NPT + 1 of them issue in one round. Guarded, each sits in a branch
+     * of its own with its wait behind it: NPT + 1 round trips in front of the first barrier. */
     uint32_t ov[NPT + 1];
 #pragma unroll
     for (uint32_t k = 0; k <= NPT; ++k) {
         const uint32_t x = tid * NPT + k;
-        const uint32_t o = x <= n_expert ? (uint32_t)off[x] : 0u;
+        const uint32_t raw = (uint32_t)off[x <= n_expert ? x : n_expert];
+        const uint32_t o = x <= n_expert ? raw : 0u;
         ov[k] = o < T ? o : T;
     }
     uint32_t nt[NPT], cnt = 0;
@@ -1947,7 +2028,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     uint4  bpre4[kBP];
     uint32_t spre[W4 == 4 ? kBP : 1];
     Stage8 bpre8[kBP];
-    using PwsT = std::conditional_t<W4 == 3, uint32_t, uint16_t>;
+    using PwsT = uint32_t;              /* a 16-bit scale zero-extended: see u16_load_w */
     float pau[1];
     PwsT  pwu[1];
     bool  pok = false;
@@ -2297,9 +2378,14 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
 #pragma unroll
             for (uint32_t j = 0; j < WN; ++j) acc[i][j] = (mb_v8f)(0.0f);
 
-        /* Chunk c of a tile is row c / kCPR, elements (c % kCPR) * 8 of it; a row outside the run
-         * or a dropped slot stages zeros and issues no load, so the bytes read are the live rows. */
+        /* Chunk c of a tile is row c / kCPR, elements (c % kCPR) * 8 of it. A row outside the run,
+         * a dropped slot or a column past N stages zeros. EVERY LOAD IS ISSUED, a dead row's from a
+         * row that exists -- the activation's row 0, the tile's last weight row -- and the store
+         * selects its zero: a load under its own condition is an exec-masked branch, and the
+         * waitcnt pass then waits inside it, which serialises the pass's loads (moe_gemm_q_kernel's
+         * K-loop note). */
         uint4 apre[kAC], bpre[kBC];
+        bool aok[kAC], bok[kBC];
         auto issue = [&](uint32_t k0) {
 #pragma unroll
             for (uint32_t p = 0; p < kAC; ++p) {
@@ -2307,37 +2393,45 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
                 if (c >= FM * kCPR) continue;
                 const uint32_t r = c / kCPR, kk = (c % kCPR) * 8;
                 const int32_t tok = s_tok[r];
-                const bool ok = tok >= 0 && (r0 + r) >= rs && (r0 + r) < re;
-                apre[p] = ok ? *(const uint4*)(A + (size_t)tok * a_ld + k0 + kk)
-                             : make_uint4(0, 0, 0, 0);
+                aok[p] = tok >= 0 && (r0 + r) >= rs && (r0 + r) < re;
+                apre[p] = *(const uint4*)(A + (size_t)(aok[p] ? tok : 0) * a_ld + k0 + kk);
             }
 #pragma unroll
             for (uint32_t p = 0; p < kBC; ++p) {
                 const uint32_t c = tid + p * NTHR;
                 if (c >= FN * kCPR) continue;
                 const uint32_t r = c / kCPR, kk = (c % kCPR) * 8;
-                bpre[p] = (n0 + r) < N ? *(const uint4*)(Wp + (size_t)(n0 + r) * w_ld + k0 + kk)
-                                       : make_uint4(0, 0, 0, 0);
+                bok[p] = (n0 + r) < N;
+                bpre[p] = *(const uint4*)(Wp + (size_t)(bok[p] ? n0 + r : N - 1) * w_ld + k0 + kk);
             }
         };
         issue(0);
 
+        /* THE K LOOP'S BARRIERS ORDER LDS AND NOTHING ELSE, so they are lds_barrier():
+         * __syncthreads() is a fence over global memory too, `s_wait_loadcnt 0` in front of the
+         * barrier, and the next pass's prefetch would be waited for right after it is issued
+         * instead of behind this pass's WMMA. The prefetch is collected by one explicit wait where
+         * the stores begin -- a release fence on the global address space, the spelling the
+         * waitcnt pass reads as `s_wait_loadcnt 0` (moe_gemm_q_kernel's K-loop note). */
         for (uint32_t k0 = 0; k0 < K; k0 += kBK16) {
-            __syncthreads();                       /* the previous pass's fragments are read */
+            lds_barrier();                         /* the previous pass's fragments are read */
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "global");
 #pragma unroll
             for (uint32_t p = 0; p < kAC; ++p) {
                 const uint32_t c = tid + p * NTHR;
                 if (c >= FM * kCPR) continue;
-                *(uint4*)(s_a + (c / kCPR) * kP16 + (c % kCPR) * 8) = apre[p];
+                *(uint4*)(s_a + (c / kCPR) * kP16 + (c % kCPR) * 8) =
+                    aok[p] ? apre[p] : make_uint4(0, 0, 0, 0);
             }
 #pragma unroll
             for (uint32_t p = 0; p < kBC; ++p) {
                 const uint32_t c = tid + p * NTHR;
                 if (c >= FN * kCPR) continue;
-                *(uint4*)(s_b + (c / kCPR) * kP16 + (c % kCPR) * 8) = bpre[p];
+                *(uint4*)(s_b + (c / kCPR) * kP16 + (c % kCPR) * 8) =
+                    bok[p] ? bpre[p] : make_uint4(0, 0, 0, 0);
             }
             if (k0 + kBK16 < K) issue(k0 + kBK16);
-            __syncthreads();
+            lds_barrier();
 
             if (!wlive) continue;
 #pragma unroll
@@ -3043,7 +3137,8 @@ static inline long long r4d_blockmap_bytes(long long cap) {
 
 /* ONE WORKGROUP, because the whole of it is a scan over at most kMaxExpert counters and a second
  * launch to split that across the device would cost more than the scan does. The offsets are read
- * into LDS once so the scan is not 512 dependent global loads.
+ * once, in parallel, so the scan is not 512 dependent global loads. The launch is NT threads, a
+ * thread owning experts tid, tid + NT, ...
  *
  * THE PREFIX IS PARALLEL: a DPP scan in each wave and one exchange of the wave totals, 256 counts
  * a tile -- three tiles at 512 experts, whose n_expert + 1 counts end one past the second. On one
@@ -3055,20 +3150,31 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     uint32_t* __restrict__ map) {
     constexpr uint32_t NT = 256, NW = NT / kWave, kTiles = (kMaxExpert + NT) / NT;
     __shared__ uint32_t s_cnt[kMaxExpert + 1];
-    __shared__ int32_t  s_off[kMaxExpert + 1];
     __shared__ int32_t  s_wt[kTiles][NW];
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
 
-    for (uint32_t e = tid; e <= n_expert; e += blockDim.x) s_off[e] = off[e];
-    __syncthreads();
+    /* EVERY OFFSET THIS THREAD NEEDS IN ONE ROUND OF LOADS: both ends of each expert it owns
+     * (e = tid + i * NT), the index clamped so every load is unconditional, all issued before the
+     * first is waited on. A loop over e that stores each offset to LDS before the next load makes
+     * one dependent trip to memory per expert a thread owns -- three at 512 experts -- and the
+     * offsets are read cold, straight after the router wrote them. The counts and the map's rows
+     * then come from these registers, so the offsets never pass through LDS. */
+    int32_t lo[kTiles], hi[kTiles];
+#pragma unroll
+    for (uint32_t i = 0; i < kTiles; ++i) {
+        const uint32_t e = tid + i * NT;
+        lo[i] = off[e < n_expert ? e : n_expert];
+        hi[i] = off[e + 1 < n_expert ? e + 1 : n_expert];
+    }
+    const uint32_t live = (uint32_t)off[n_expert];
     /* Blocks this expert needs. A zero-row run needs none, and asking for one would put an empty
      * block in the map that the GEMM would then have to recognise. */
-    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
-        const uint32_t run = (uint32_t)(s_off[e + 1] - s_off[e]);
-        s_cnt[e] = (run + FM - 1) / FM;
+#pragma unroll
+    for (uint32_t i = 0; i < kTiles; ++i) {
+        const uint32_t e = tid + i * NT;
+        if (e < n_expert) s_cnt[e] = ((uint32_t)(hi[i] - lo[i]) + FM - 1) / FM;
     }
     /* The tail of dropped slots, carried as one more "expert" so the scan places it too. */
-    const uint32_t live = (uint32_t)s_off[n_expert];
     if (tid == 0) s_cnt[n_expert] = T > live ? (T - live + FM - 1) / FM : 0u;
     __syncthreads();
 
@@ -3094,13 +3200,16 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     if (tid == 0) map[0] = carry < cap ? carry : cap;    /* the count, clamped to the grid */
     __syncthreads();
 
-    for (uint32_t e = tid; e < n_expert; e += blockDim.x) {
-        const uint32_t run = (uint32_t)(s_off[e + 1] - s_off[e]);
+#pragma unroll
+    for (uint32_t i = 0; i < kTiles; ++i) {
+        const uint32_t e = tid + i * NT;
+        if (e >= n_expert) continue;
+        const uint32_t run = (uint32_t)(hi[i] - lo[i]);
         uint32_t o = s_cnt[e];
         for (uint32_t r = 0; r < run; r += FM, ++o) {
             if (o >= cap) break;
             map[1 + 2 * o + 0] = e;
-            map[1 + 2 * o + 1] = (uint32_t)s_off[e] + r;
+            map[1 + 2 * o + 1] = (uint32_t)lo[i] + r;
         }
     }
     if (tid == 0) {

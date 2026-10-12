@@ -139,11 +139,12 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
         return RAD_OK;
     }
     enabled_ = true;
-    RAD_INFO("heat engine: %lld movable units, %d move%s a dispatch, "
-             "decay %.3f hysteresis %.2f min-gain %.2f",
-             (long long)movable, params_.moves_per_dispatch,
-             params_.moves_per_dispatch == 1 ? "" : "s",
-             (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain);
+    RAD_INFO("heat engine: %lld movable units, %d move%s a step, "
+             "decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f",
+             (long long)movable, params_.moves_per_step,
+             params_.moves_per_step == 1 ? "" : "s",
+             (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
+             (double)params_.credit_cap);
     return RAD_OK;
 }
 
@@ -206,6 +207,13 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
      * (prefetch()), which makes this a no-op. */
     prefetch(counts, n);
 
+    /* The credit cap (HeatParams::credit_cap) scales the whole histogram, so its experts keep
+     * their order. The pricing below counts every pass whatever the credit is. */
+    int64_t total = 0;
+    for (int32_t j = 0; j < n; ++j) total += counts[j] > 0 ? counts[j] : 0;
+    const float cap = params_.credit_cap;
+    const float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
+
     float* __restrict h = heat_.data() + lo;
     for (int32_t j = 0; j < len; ++j) h[j] *= d;
 
@@ -219,7 +227,7 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
         const int32_t c = counts[j];
         const size_t q = (size_t)(lo + j);
         const float was = h[j];
-        const float x = was + (float)c * weight;
+        const float x = was + (float)c * w;
         h[j] = x;
         routed += routed_as_[q] != 0;
         resident += routed_as_[q] == 2;
@@ -380,12 +388,12 @@ bool HeatEngine::pick(Swap* out) const {
     return true;
 }
 
-/* THE WHOLE DISPATCH'S PROPOSALS FROM ONE PASS. Marking a pair busy changes neither a unit's heat
- * nor any layer's resident count, so the m-th pair repeated pick() calls would return is simply the
- * m-th entry at each end of the same ranking. One pass keeps the `moves_per_dispatch` best of each
+/* THE WHOLE STEP'S PROPOSALS FROM ONE PASS. Marking a pair busy changes neither a unit's heat nor
+ * any layer's resident count, so the m-th pair repeated pick() calls would return is simply the
+ * m-th entry at each end of the same ranking. One pass keeps the `moves_per_step` best of each
  * end; the proposals, and the counters that say why the list stopped, are the ones the repeated
- * picks produce. This runs before every pass a rank issues -- draft passes included, where the
- * device waits for the issue -- so a scan per proposed move would be most of its cost. */
+ * picks produce. This runs once a step on the thread that issues the next one, and the budget is
+ * dozens of swaps, so a scan per proposed move would be most of its cost. */
 namespace {
 using Ranked = HeatRanked;
 /* Hotter first, then the layer with fewer residents, then the lower index. */
@@ -414,7 +422,7 @@ int HeatEngine::step(std::vector<Swap>* out) {
     if (!out) return RAD_E_INVAL;
     out->clear();
     if (!enabled_) return RAD_OK;
-    const int k = params_.moves_per_dispatch;
+    const int k = params_.moves_per_step;
     if (k <= 0) return RAD_OK;
 
     /* THE BEST PAIR FROM THE LAYERS' ENDS FIRST. If it fails the guard every pair does -- the

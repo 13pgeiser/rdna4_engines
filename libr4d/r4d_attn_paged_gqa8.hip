@@ -13,13 +13,14 @@
 // bound is the constraint value the selector bands on, so it is stated in the row and nowhere
 // else. A prefill block carries `NWARPS * 16 / gqa` query positions, 48 here against 64 there.
 //
-// WHAT CHANGES WITH HEAD_DIM IS ONE OPTION BIT. `O_KWIDE` fetches 16 K elements a thread and its
+// WHAT CHANGES WITH HEAD_DIM IS HOW K IS FETCHED. `O_KWIDE` fetches 16 K elements a thread and its
 // thread-to-(key, channel) map is written for 16 channels of 16 -- which is head_dim 256 exactly.
-// At 128 it would stage past the tile, so the h128 prefill runs the same option set without it
-// (3430923 against 3955211) and pays one more pass over a tile that is half the size. Everything
-// else -- the lazy reference-max softmax, f16 operands, the folded query scale, contiguous-k
-// fragments, the SGPR block table, the V prefetch, the LDS-scoped barrier -- is unchanged, and
-// each bit is defined and justified in r4d_attn_prefill_h256_gqa6.hip.
+// At 128 it would stage past the tile, so the h128 prefill runs without it and pays one more pass
+// over a tile that is half the size; and its fragments are half as many registers, so it keeps a
+// K prefetch of 4 where head_dim 256 takes 2 (3430923 against 3954187). Everything else -- the
+// lazy reference-max softmax, f16 operands, the folded query scale, contiguous-k fragments, the
+// SGPR block table, the V prefetch, the LDS-scoped barrier -- is unchanged, and each bit is
+// defined and justified in r4d_attn_prefill_h256_gqa6.hip.
 //
 // NO `r4d_attn_dims` HERE. That entry point and the `check_dims_once` assertion built on it are
 // the h256/gqa6 unit's statement about ITSELF, and a second definition would not link. A geometry
@@ -55,6 +56,14 @@ using std::max;
 #define R4D_ATTN_GQA  8
 #define R4D_ATTN_H128 1      /* this ratio also serves head_dim 128 -- MiniCPM5-2B is 16 over 2 */
 #endif
+/* A head_dim 64 PREFILL leg, off unless the including unit asks for it: LFM2 is 32 query heads
+ * over 8 at head_dim 64 (r4d_attn_paged_h256_gqa4.hip). It runs the h128 prefill option set --
+ * O_KWIDE's 16-channel staging is written for 256. There is no decode leg: the split-KV kernel
+ * holds a lane's columns as one or two dwords of codes, which is head_dim 128 or 256, so the
+ * query-tiled kernel serves every query length at this width. */
+#ifndef R4D_ATTN_H64
+#define R4D_ATTN_H64 0
+#endif
 #define GQ_JOIN_(a, b, c) a##b##c
 #define GQ_JOIN(a, b, c)  GQ_JOIN_(a, b, c)
 #define GQ_SYM(pre, suf)  GQ_JOIN(pre, R4D_ATTN_GQA, suf)
@@ -73,8 +82,11 @@ using std::max;
 
 #define G8_P_NWARPS 24
 #define G8_P_TILE   48
-#define G8_P_OPT_256 3955211
-#define G8_P_OPT_128 3430923        // the same set without O_KWIDE; see the header
+// K prefetch 2, as the h256/gqa6 prefill and for the same reason (see P_OPT there): 4 spills the
+// m-tile loop. The head_dim-128 set keeps its prefetch of 4, which fits.
+#define G8_P_OPT_256 3954187
+#define G8_P_OPT_128 3430923        // without O_KWIDE, at prefetch 4; see the header
+#define G8_P_OPT_64  G8_P_OPT_128
 #define G8_D_TILE   16
 #define G8_D_OPT    3429947
 #define G8_D_JPB     2
@@ -228,6 +240,20 @@ extern "C" int GQ_SYM(r4d_rad_attn_prefill_h128_gqa, _bf16)(const RadArgs* a, Ra
     const int rc = fill_paged(a, &r, 128);
     if (rc != RAD_OK) return rc;
     return g8_prefill_launch<128, G8_P_OPT_128, 1>(&r, (hipStream_t)s);
+}
+#endif
+#if R4D_ATTN_H64
+extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _fp8)(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    const int rc = fill_paged(a, &r, 64);
+    if (rc != RAD_OK) return rc;
+    return g8_prefill_launch<64, G8_P_OPT_64, 0>(&r, (hipStream_t)s);
+}
+extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _bf16)(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    const int rc = fill_paged(a, &r, 64);
+    if (rc != RAD_OK) return rc;
+    return g8_prefill_launch<64, G8_P_OPT_64, 1>(&r, (hipStream_t)s);
 }
 #endif
 

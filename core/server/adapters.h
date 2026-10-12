@@ -733,7 +733,8 @@ public:
         if (!accepts(k)) { if (why) *why = "this kind of media is not served"; return RAD_E_UNSUPPORTED; }
         if (k == MediaKind::Audio) return p_->audio(bytes.data(), bytes.size(), out, why);
         return k == MediaKind::Image
-                   ? p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why)
+                   ? p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
+                               opts.max_pixels)
                    : p_->video(bytes.data(), bytes.size(), out, why);
     }
 

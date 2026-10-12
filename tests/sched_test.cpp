@@ -82,6 +82,13 @@ __attribute__((weak)) int rad_memcpy_ranges_async(void* d, const void* s, int64_
         std::memcpy((char*)d + r[i].dst, (const char*)s + r[i].src, (size_t)r[i].bytes);
     return RAD_OK;
 }
+__attribute__((weak)) int rad_memcpy_list_async(const RadCopySeg* g, int n, unsigned, RadStream) {
+    for (int i = 0; i < n; ++i)
+        if (g[i].bytes > 0) std::memcpy(g[i].dst, g[i].src, (size_t)g[i].bytes);
+    return RAD_OK;
+}
+__attribute__((weak)) int rad_link_hold(RadStream, int) { return RAD_OK; }
+__attribute__((weak)) void* rad_link_gate(RadStream) { return nullptr; }
 
 static int g_fake_event;
 __attribute__((weak)) int  rad_event_create(RadEvent* e) { *e = &g_fake_event; return RAD_OK; }
@@ -501,6 +508,7 @@ struct Fixture {
         g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
 
         prog.meta.n_ctx_train = 4096;
+        prog.meta.n_vocab = 512;
 
         /* index 0 is the sentinel every handle table in Program carries */
         prog.ops.emplace_back();
@@ -698,6 +706,38 @@ TEST(prefill_chunks_split_at_the_checkpoint_interval) {
     CHECK_EQ(f.sch.plan_chunk(0, 1000, 50, &ck), 0);
 }
 
+/* A REQUEST'S OWN CHECKPOINT (Request::checkpoint_at): the end of a head other requests share,
+ * on the quantum below it. It splits a chunk the way the interval does and gives way to nothing. */
+TEST(prefill_chunks_split_where_the_request_asks_for_a_checkpoint) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+
+    int64_t ck = -1;
+    /* Inside the first interval, where nothing else would write one: split at 128, the quantum
+     * under 150, then the rest with none. */
+    CHECK_EQ(f.sch.plan_chunk(0, 200, 512, &ck, 150), 128);
+    CHECK_EQ(ck, 128);
+    CHECK_EQ(f.sch.plan_chunk(128, 200, 512, &ck, 150), 72);
+    CHECK_EQ(ck, -1);
+    /* Past the interval checkpoint that comes first, and before the next one. */
+    CHECK_EQ(f.sch.plan_chunk(0, 1000, 512, &ck, 600), 256);
+    CHECK_EQ(ck, 256);
+    CHECK_EQ(f.sch.plan_chunk(512, 1000, 512, &ck, 600), 64);
+    CHECK_EQ(ck, 576);
+    /* On a boundary the chunk would end on anyway, it is that boundary's checkpoint. */
+    CHECK_EQ(f.sch.plan_chunk(0, 1000, 512, &ck, 256), 256);
+    CHECK_EQ(ck, 256);
+    /* A head shorter than a quantum has no boundary to keep. */
+    CHECK_EQ(f.sch.plan_chunk(0, 200, 512, &ck, 40), 200);
+    CHECK_EQ(ck, -1);
+    /* And a budget short of it still ends on a quantum, the checkpoint left for a later chunk. */
+    CHECK_EQ(f.sch.plan_chunk(0, 1000, 100, &ck, 150), 64);
+    CHECK_EQ(ck, -1);
+    CHECK_EQ(f.sch.plan_chunk(64, 1000, 512, &ck, 150), 64);
+    CHECK_EQ(ck, 128);
+}
+
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     Fixture f;
     f.build();
@@ -800,6 +840,33 @@ TEST(add_all_queues_a_set_under_one_lock_and_refuses_members_singly) {
     CHECK(b != nullptr);
     CHECK_EQ(b->n_seq, 2);
     CHECK_EQ(f.sch.metrics().admitted, 2);
+}
+
+/* A scored prompt (Request::token_scores) names real vocabulary rows, and drafts nothing. */
+TEST(a_scored_request_names_real_vocabulary_rows) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int32_t n_vocab = (int32_t)f.prog.meta.n_vocab;
+    REQUIRE(n_vocab > 2);
+    std::unique_ptr<Request> rs[4];
+    const std::vector<std::vector<int32_t>> ids = { { 1, 2 }, {}, { n_vocab }, { -1 } };
+    for (int i = 0; i < 4; ++i) {
+        rs[i] = std::make_unique<Request>();
+        rs[i]->id = f.next_id++;
+        rs[i]->max_tokens = 1;
+        rs[i]->prompt.assign(16, 7);
+        rs[i]->token_scores = std::make_shared<TokenScores>();
+        rs[i]->token_scores->tokens = ids[(size_t)i];
+    }
+    Request* kept = rs[0].get();
+    int rc[4] = { -1, -1, -1, -1 };
+    f.sch.add_all(rs, 4, rc);
+    CHECK_EQ(rc[0], RAD_OK);
+    CHECK_EQ(rc[1], RAD_E_INVAL);
+    CHECK_EQ(rc[2], RAD_E_INVAL);
+    CHECK_EQ(rc[3], RAD_E_INVAL);
+    CHECK(!kept->may_speculate);
 }
 
 TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {

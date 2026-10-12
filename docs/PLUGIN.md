@@ -52,13 +52,14 @@ any shape change in a header a plugin compiles against (`rad_abi.h` says which).
 both in-tree host libraries say — or `""` for a plugin that really is portable. It is printed, not
 trusted: what the engine checks is the code objects your library actually carries (§10).
 
-Four more exports are optional, each looked up by exactly this name:
+Five more exports are optional, each looked up by exactly this name:
 
 | symbol | says |
 |---|---|
 | `int rad_plugin_open(void)` | called once after load. `RAD_E_UNSUPPORTED` **declines this machine** — the library is unloaded and the rest of the installation carries on; any other negative status refuses it as an error |
 | `void rad_plugin_close(void)` | called once at shutdown |
 | `int rad_kernel_concurrent(int i)` | nonzero: kernel `i` touches nothing but its operands and scratch, so independent launches may overlap |
+| `int rad_kernel_collective(int i)` | nonzero: kernel `i` exchanges data with the other ranks' cards, so the engine keeps its own bulk link traffic out of the way while it runs. 2: each launch ends that itself once the other ranks' bytes have landed, through the `link_gate` parameter (rad_abi.h). Without it only the `all_reduce` op counts as one |
 | `int rad_plugin_reference(void)` | nonzero: this library is a **reference implementation** — ranked below every unnamed library, refused for serving unless `--debug-accept-reference-kernels`, and what `rad-kbench` checks the others against. libref says so through this, as any library would |
 
 ---

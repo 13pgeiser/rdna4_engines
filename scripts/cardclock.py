@@ -39,8 +39,8 @@
 # particular must be proven under a SUSTAINED hot load, not a short test: an offset that passes a
 # minute-long selftest can wedge a card twenty minutes into real traffic once it runs at 90 C.
 #
-# Needs Linux amdgpu with a gpu_metrics v1.3 table (RDNA3 / RDNA4 discrete cards); any other layout
-# is refused rather than misread.
+# Needs Linux amdgpu with a gpu_metrics v1.3 table (RDNA3 / RDNA4 discrete cards); a card with any
+# other layout is skipped rather than misread.
 import argparse, glob, json, os, random, re, statistics as st, struct, sys, threading, time, urllib.request
 
 BITS = {0: "PPT0", 1: "PPT1", 2: "PPT2", 3: "PPT3", 4: "SPL", 5: "FPPT", 6: "SPPT", 7: "SPPT_APU",
@@ -107,8 +107,18 @@ def find_cards():
     for dev in sorted(glob.glob("/sys/class/drm/card*/device")):
         if not re.fullmatch(r"card\d+", dev.split("/")[-2]): continue
         if rd(dev + "/vendor") != "0x1002" or not os.path.exists(dev + "/gpu_metrics"): continue
-        c = Card(dev); out.setdefault(c.bdf, c)
-    if not out: raise SystemExit("no AMD card with a gpu_metrics table under /sys/class/drm")
+        c = Card(dev)
+        # ANOTHER LAYOUT IS ANOTHER KIND OF PART, not a reason to stop: an APU's integrated graphics
+        # beside the discrete cards reports a v2.x table, and the engine does not serve on it.
+        try:
+            size, fr, cr = struct.unpack_from("<HBB", open(dev + "/gpu_metrics", "rb").read(4))
+            if (fr, cr) != (1, 3) or size != 120:
+                print(f"{c.bdf}: gpu_metrics v{fr}.{cr} ({size} bytes), not v1.3 -- skipped", file=sys.stderr)
+                continue
+        except (OSError, struct.error):
+            pass
+        out.setdefault(c.bdf, c)
+    if not out: raise SystemExit("no AMD card with a gpu_metrics v1.3 table under /sys/class/drm")
     return list(out.values())
 
 

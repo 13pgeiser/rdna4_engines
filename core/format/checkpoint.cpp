@@ -234,6 +234,10 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     if (const char* mt = gs("model_type")) {
         out->arch.clear();
         for (const char* p = mt; *p; ++p) if (*p != '_') out->arch += *p;
+        /* LFM2-VL is LFM2 with a vision tower, and unlike Qwen's VL releases it names the wrapper
+         * rather than the text model. One plugin serves both, the way one serves a Qwen3.5 with
+         * or without its tower; `model_type` itself stays in the free-form keys. */
+        if (out->arch == "lfm2vl") out->arch = "lfm2";
     }
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 
@@ -257,7 +261,7 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     m.n_expert        = gi("num_experts", gi("num_local_experts", 0));
     m.n_expert_used   = gi("num_experts_per_tok", 0);
     m.n_expert_shared = gi("shared_expert_intermediate_size", 0) ? 1 : 0;
-    m.rms_eps     = (float)gf("rms_norm_eps", 1e-6);
+    m.rms_eps     = (float)gf("rms_norm_eps", gf("norm_eps", 1e-6));   /* LFM2: norm_eps */
     m.rope_theta  = (float)gf("rope_parameters.rope_theta", gf("rope_theta", 10000.0));
     /* The rotary's scaling stays in the free-form keys with its type beside it; the architecture
      * reads both (arch/common/rad_arch.h, yarn_from). A factor copied here without its type would

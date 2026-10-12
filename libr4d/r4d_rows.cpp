@@ -1810,6 +1810,23 @@ static const RadOperandSpec oPleConv[] = {
     { "num_accepted", RAD_OPD_IN,     1 },
     { "y",            RAD_OPD_OUT,    0 },
 };
+/* ple_conv's operands without `resid`, its parameters without `dilation`. */
+static const RadParamSpec pCausalConv[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    { "width", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oCausalConv[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
 
 static const RadParamSpec pNgramIds[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
@@ -2015,6 +2032,12 @@ static const RadOpSchema kSchemas[] = {
            "x += a side x side table resampled bilinearly (corners aligned, taps clamped) to each "
            "row's grid; coord is [4, M] row, column, height, width. The taps are summed in f32 "
            "and rounded before the add."),
+    SCHEMA("grid_embed_aa", pGridEmbed, oGridEmbed,
+           "x += the side x side table resampled as torch's F.interpolate(bilinear, "
+           "align_corners=False, antialias=True) resamples it to the row's grid -- SigLIP2's "
+           "position embedding: per axis a triangle filter on half-pixel centres, widened by the "
+           "scale when shrinking, its in-table taps normalised. Separable, f32, rounded once "
+           "before the add; coordinates clamp into their grid."),
     SCHEMA("gemm_nt_bias", pGemmBias, oGemmBias,
            "y = res + act(a @ b^T + bias), rounded to bf16 after the biased product, after the "
            "activation and after the residual -- the unfused chain's three tensors."),
@@ -2051,6 +2074,10 @@ static const RadOpSchema kSchemas[] = {
            "Absent, every token commits: the read is at offset zero and the last "
            "(width-1)*dilation inputs land at offset zero, which is the prefill chunk. "
            "`resid` absent drops the add and leaves the plain convolution."),
+    SCHEMA("causal_conv1d", pCausalConv, oCausalConv,
+           "y[t] = sum_j w[c][j] * x[t - (width-1-j)], ple_conv at dilation one with no "
+           "activation and no residual: LFM2's short convolution, whose gates the caller applies. "
+           "The window, `has_init`, `cache_idx` and `num_accepted` are ple_conv's."),
     SCHEMA("ngram_ids", pNgramIds, oNgramIds,
            "ids[m][h] = remainder(hash of the n-gram ending at m, vocab_sizes[h]) + offsets[h]. "
            "Heads are `ngram - 1` equal blocks, block b using the (b+2)-gram. A shift that would "
@@ -2468,6 +2495,17 @@ static const RadConstraint cAttnDecodeH256G4Fp8[] = {
 static const RadConstraint cAttnDecodeH256G4Bf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 4), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 16), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+/* The prefill pair at head_dim 64 (LFM2: 32 query heads over 8). There is no decode row at this
+ * width -- the split-KV kernel's lanes hold 128 or 256 columns -- so the query-tiled kernel serves
+ * every q_len. */
+static const RadConstraint cAttnPrefillH64G4Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 64), C_EQ("gqa", 4), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnPrefillH64G4Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 64), C_EQ("gqa", 4), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
 /* TWELVE QUERIES PER KV HEAD, head_dim 256 (r4d_attn_paged_h256_gqa12.hip) -- Qwen3.8-Flash-Next's
  * QSA layers, 24 query heads over 2. `q_len <= 5` is the same `q_len * gqa <= 64` bound the two
@@ -3402,6 +3440,9 @@ static const RadConstraint cPleGate[]   = { C_IN("dtype", "bf16"), C_GE("n", 1),
 static const RadConstraint cPleConv[]   = { C_IN("dtype", "bf16"), C_GE("width", 1),
                                             C_LE("width", 5), C_GE("dilation", 1),
                                             C_LE("dilation", 4) };
+/* The same kernel undilated: the window is width-1 deep, and the taps are held in registers. */
+static const RadConstraint cCausalConv[] = { C_IN("dtype", "bf16"), C_GE("width", 2),
+                                             C_LE("width", 8) };
 static const RadConstraint cKvStore[]   = { C_GE("block_size", 1), C_IN("kv_dtype", "bf16") };
 static const RadConstraint cKvStoreFp8[] = { C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3") };
 static const RadConstraint cRopeRow[]   = { C_GE("head_dim", 1),
@@ -3489,6 +3530,15 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cPleConv), NOTUNE,
   nullptr, nullptr, r4d_rad_ple_conv, nullptr, nullptr, nullptr,
+  nullptr, nullptr },
+
+{ "causal_conv1d_bf16", "causal_conv1d", "conv",
+  "depthwise causal conv with no activation (ple_conv's kernel); one thread a channel",
+  "width 2 to 8, undilated",
+  "bf16 activations, weights and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCausalConv), NOTUNE,
+  nullptr, nullptr, r4d_rad_causal_conv1d, nullptr, nullptr, nullptr,
   nullptr, nullptr },
 
 { "ngram_ids_i32", "ngram_ids", "vocab",
@@ -3683,6 +3733,15 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGridEmbed), NOTUNE,
   nullptr, nullptr, r4d_rad_grid_embed, nullptr, nullptr, nullptr,
   r4d_shape_grid_embed, nullptr, nullptr, r4d_rad_grid_embed_describe },
+
+{ "grid_embed_aa_bf16", "grid_embed_aa", "elem",
+  "a learned position grid resampled as torch's antialiased bilinear and added in (SigLIP2)",
+  "side up to 1024, any n; coord [4, M] dense; one workgroup a row, its taps in LDS",
+  "bf16 x, bf16 or f32 table, i32 coord, f32 taps",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGridEmbed), NOTUNE,
+  nullptr, nullptr, r4d_rad_grid_embed_aa, nullptr, nullptr, nullptr,
+  r4d_shape_grid_embed, nullptr, nullptr, r4d_rad_grid_embed_aa_describe },
 
 { "gemm_bf16_nt_bias_tiled", "gemm_nt_bias", "gemm",
   "biased GEMM C = res + act(A @ W^T + bias): eight waves over an LDS-staged 64-deep K tile, "
@@ -4095,6 +4154,24 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnDecodeH256G4Bf16), ROW(tAttnSplit), nullptr,
   nullptr, nullptr, r4d_rad_attn_decode_h256_gqa4_bf16, r4d_rad_attn_decode_h256_gqa4_scratch,
   nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h64_gqa4_fp8kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 64, 4 queries per kv head, paged block 16, varlen",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH64G4Fp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h64_gqa4_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h64_gqa4_bf16kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 64, 4 queries per kv head, paged block 16, varlen",
+  "bf16 query, bf16 kv cache, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH64G4Bf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h64_gqa4_bf16, nullptr, nullptr, nullptr,
   r4d_shape_attn_paged },
 
 { "attn_prefill_h256_gqa12_fp8kv", "attn_paged", "attn",
@@ -5695,6 +5772,23 @@ extern "C" int rad_kernel_concurrent(int i) {
     for (const char* p : kStateful)
         if (std::strncmp(k->name, p, std::strlen(p)) == 0) return 0;
     return 1;
+}
+
+/* WHICH ROWS ARE COLLECTIVES (rad_abi.h): every row whose instance its init builds with the
+ * exchange buffers, peer flags and handshake of the all-reduce family -- the standalone all-reduces
+ * and gathers, and the norms and hc writes with one folded in -- and each one's `_host` twin, which
+ * exchanges through the pinned mailbox instead. Keyed on the init because that is what makes a row
+ * one: a kernel that reduces across ranks cannot run without the instance only these build. */
+extern "C" int rad_kernel_collective(int i) {
+    const RadKernelInfo* k = rad_kernel_at(i);
+    if (!k || !k->init) return 0;
+    const bool coll = host_init_for(k->init) != nullptr || k->init == r4d_rad_ar_host_init ||
+                      k->init == r4d_rad_ar_ln_host_init || k->init == r4d_rad_ar_hc_wide_host_init;
+    if (!coll) return 0;
+    /* The two-rank hc writes end the engine's link hold themselves, through `link_gate`, as soon as
+     * the peer's push has landed over P2P (RAD_LINK_ENDED); through the host mailbox they leave it
+     * to the engine. */
+    return (k->launch == r4d_rad_ar_hc_write || k->launch == r4d_rad_ar_gather_hc_write) ? 2 : 1;
 }
 
 /* ------------------------------------------------------------------------ tuned config access

@@ -152,8 +152,13 @@ typedef struct RadVocabHeader {
     int32_t  bos, eos, eot, pad_id, unk, sep;
     uint32_t add_bos, add_eos;
     rad_stroff chat_template;
-    uint64_t reserved[4];
+    uint64_t flags;             /* RAD_VOCAB_*; zero in a file written before the field existed */
+    uint64_t reserved[3];
 } RadVocabHeader;
+
+/* BPE: a pre-token that is already a vocabulary entry is emitted whole instead of merged
+ * (tokenizers' `ignore_merges`). LFM2's vocabulary sets it. */
+enum { RAD_VOCAB_IGNORE_MERGES = 1u << 0 };
 
 enum { RAD_TT_NORMAL = 1, RAD_TT_UNKNOWN = 2, RAD_TT_CONTROL = 3,
        RAD_TT_USER_DEFINED = 4, RAD_TT_BYTE = 6 };

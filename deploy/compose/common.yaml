@@ -1,7 +1,7 @@
 # The service every model file in this directory extends. It holds what any radiance container
 # needs on an AMD host; a model file adds only its container and its flags.
 #
-# Each model takes both cards (--tp 2) and the same port, so run one at a time:
+# Each model takes both cards (--tp 2; a -tp1 file one) and the same port, so run one at a time:
 #   docker compose -f flashnext.yaml up -d        start (it comes back after a reboot)
 #   docker compose -f flashnext.yaml logs -f      follow the log
 #   docker compose -f flashnext.yaml down         stop

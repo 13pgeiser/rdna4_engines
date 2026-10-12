@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 # VERSION is what /version reports and what a client checks compatibility against. It is NOT the
 # ABI version -- that lives in abi/rad_abi.h and is read out of the header below, because
 # a plugin contract and a server release do not move together.
-project(radiance VERSION 1.3.0 LANGUAGES C CXX)
+project(radiance VERSION 1.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,6 +22,10 @@ set(RAD_WITH_FFMPEG "AUTO" CACHE STRING "ON | OFF | AUTO -- decode image, video 
 set_property(CACHE RAD_WITH_FFMPEG PROPERTY STRINGS ON OFF AUTO)
 option(RAD_BUILD_TESTS "Build the test suite"                            ON)
 option(RAD_ASAN        "Build with AddressSanitizer"                     OFF)
+# Whether the HIP compiler's VOPD pairing is repeatable. LLVM 24's is not unless it carries the
+# fix the image builds (docker/llvm-vopd-pairing.patch); without this the build turns pairing off
+# on LLVM 24, see rad_hip_repeatable in cmake/RadAddPlugin.cmake.
+option(RAD_HIP_VOPD_REPEATABLE "The HIP compiler's VOPD pairing is repeatable (the image's LLVM 24 is)" OFF)
 
 
 # ---------------------------------------------------------------- HIP detection
@@ -455,3 +459,5 @@ install(FILES vendor/nlohmann/LICENSE.MIT
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME nlohmann-json.LICENSE)
 install(FILES vendor/cpp-httplib/LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME cpp-httplib.LICENSE)
+install(FILES core/server/LICENSE.lfm
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME liquidai-d1.LICENSE)

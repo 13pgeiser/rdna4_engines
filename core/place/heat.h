@@ -35,14 +35,15 @@
  * ---- WHY LFU-WITH-DECAY AND NOT SOMETHING CLEVERER --------------------------------------------
  *
  * Replaying real routing traces against cache policies settles the shape of this. Runtime
- * placement beats static profile placement by a wide margin, so it is worth building; LFU-with-
- * decay and LRU score the same, so the decay constant is not where the wins are and this does not
- * need to be subtle. Belady is a few points of hit rate above both -- but an oracle restricted to
- * a disjoint sample of the future keeps most of that gap, so the remainder is knowledge of the
- * realised future and is not reachable. Of what is left, no statistic of PAST USE captures any of
- * it: an expert never selected has count zero, no age and no history, and most of the space is in
- * that state. The router's own gate value does separate those cases, so a scorer built on it is
- * the one direction here that measurement has not refuted.
+ * placement beats static profile placement by a wide margin, so it is worth building. What bounds
+ * it is the MOVE RATE, not the ranking: held to the same swaps a step at the same step boundaries,
+ * an oracle that knows every future routing scores no better than this policy (78.0% against 78.4%
+ * at 64 swaps a step, Qwen3.8-Flash-Next TP1 with 40% of the experts resident). The unrestricted
+ * Belady figure is far higher -- 92% on the same trace -- because it admits every miss the moment
+ * it happens, and a miss admitted here is a second copy of bytes the GEMM has just streamed. So
+ * the decay constant and the guards are not where the wins are, and this does not need to be
+ * subtle; the budget (RAD_PLACE_MOVES_PER_STEP), the slots behind it, and keeping a prompt's
+ * routing from swamping the answer's (HeatParams::credit_cap) are.
  */
 #pragma once
 #include "planner.h"
@@ -53,14 +54,15 @@
 namespace rad {
 
 struct HeatParams {
-    /* Applied to a layer's whole plane each time that layer is dispatched. Every layer is
-     * dispatched exactly once per forward, so all planes decay in lockstep and heats stay
-     * comparable ACROSS layers -- which the global ranking below depends on.
+    /* Applied to a layer's whole plane each time that layer's histogram is credited. Every layer is
+     * credited once a step, so all planes decay in lockstep and heats stay comparable ACROSS
+     * layers -- which the global ranking below depends on.
      *
-     * 0.98 is a half-life of a few dozen dispatches: long enough to survive a paragraph, short
-     * enough to follow a change of subject. Nearby values are not distinguishable from each other
-     * above the run-to-run spread, which is what the offline replay predicts. */
-    float decay = 0.98f;
+     * 0.95 is a half-life of about fourteen steps. At 64 swaps a step the replay is flat from 0.8
+     * to 0.95 (77.96% to 78.37%) and falls off above it -- 77.1% at 0.98, 74.2% at 0.99 -- because
+     * a heat that remembers longer ranks the experts a conversation has moved past above the ones
+     * it routes to now. */
+    float decay = 0.95f;
 
     /* Promote only when the candidate beats the victim by this ratio. Without it the two ends of
      * the ranking trade places on noise and the engine spends the whole link on churn that
@@ -79,27 +81,40 @@ struct HeatParams {
      * MISS, and a miss is a shard streamed over the same link on the same budget. A tighter bar
      * then gives up hit rate and buys no traffic back.
      *
-     * The exchange rate behind the value: the two link directions share one budget, so
-     * a demotion costs about what a promotion does, and a swap therefore has to repay about 1.4
-     * future hits rather than the 0.74 a half-price demotion would imply. */
+     * What a swap costs is its promotion. The link is close to full duplex -- on an R9700, 28.5
+     * GB/s up and 25.0 down at once, against 28.8 up alone -- so a demotion's copy rides the idle
+     * direction, while a promotion shares the upstream one with every miss the GEMM streams. At
+     * the default budget lower values replay within 0.2 points of hit rate and promote a fifth
+     * more. */
     float min_gain = 1.5f;
 
-    /* A BOUNDED MOVE BUDGET PER LAYER DISPATCH. The apparent risk is that a high budget makes the
-     * mover compete with the tier it is trying to shrink -- a promotion and a streamed miss are
-     * the same bytes over the same link. At this scale that does not bind: a larger budget pays
-     * even though it moves considerably more bytes, because converging sooner is worth more than
-     * the traffic costs. The benefit then SATURATES, and this sits where the knob stops mattering
-     * rather than at the largest value that still helps. Past that point the guard, not the
-     * budget, is what declines the extra opportunities -- so raising this alone is worth nothing
-     * until min_gain moves with it.
+    /* A BOUNDED MOVE BUDGET PER STEP: step() is called once a step, after every layer's histogram
+     * has been credited, and proposes at most this many swaps a slab class. The value and why it
+     * is that are at RAD_PLACE_MOVES_PER_STEP, which also sizes the free slots a swap lands in
+     * (the shadow and turnover slots); a budget raised here without them is spent on
+     * `starved_slab`.
+     *
+     * The apparent risk is that a high budget makes the mover compete with the tier it is trying
+     * to shrink -- a promotion and a streamed miss are the same bytes over the same link. At this
+     * scale that does not bind: each swap moves an expert the ranking says will be read again
+     * soon, and the misses it saves are many times its own bytes.
      *
      * IT IS A BUDGET PER SLAB CLASS. A rank holding an uneven slice of every expert has two expert
      * classes -- the wider slice of one parity's experts and the narrower slice of the other's --
      * each about half a whole expert, and a budget shared between them would move half the bytes
-     * a dispatch that whole experts do: residency would converge half as fast, and a fresh server
-     * would run about 2% slower for its first minute. Per class, the two together move about as
-     * many whole experts as one class of whole experts does. */
-    int moves_per_dispatch = 8;
+     * a step that whole experts do: residency would converge half as fast. Per class, the two
+     * together move about as many whole experts as one class of whole experts does. */
+    int moves_per_step = RAD_PLACE_MOVES_PER_STEP;
+
+    /* THE MOST ONE HISTOGRAM CREDITS, in selections: a histogram that routed more is credited
+     * at this total, each expert in proportion to its count. A decode step routes a few rows a
+     * sequence and stays under it; a prefill chunk routes thousands, and at full weight one chunk
+     * outweighs dozens of decode steps, so for that many steps after a prompt the resident set is
+     * the prompt's rather than the answer's. What the resident set buys a prefill is little in
+     * any case: a chunk reads nearly every expert of a layer, and the stager copies whichever are
+     * not resident. Replaying a mixed workload at Qwen3.8-Flash-Next TP1, decode rows hit 77.3%
+     * uncapped, 78.9% at 1024 and 79.0% at 512 or 256. */
+    float credit_cap = 512.0f;
 
     /* Dispatches to watch before moving anything, and it is 0 because THE GUARD ALREADY DOES THIS
      * JOB. min_gain means a promotion needs `hot >= cold*hysteresis + 1.5`, and against a
@@ -195,7 +210,7 @@ public:
     /* The best swap available, or false when the guards refuse. */
     bool pick(Swap* out) const;
 
-    /* One layer dispatch's worth of proposals, at most `moves_per_dispatch` of them a class.
+    /* One step's worth of proposals, at most `moves_per_step` of them a class.
      *
      * CONTRACT: every unit named in the result is marked busy on the way out. The caller must
      * either issue the transfer -- in which case set_tier() on publish and set_busy(false) after
@@ -284,8 +299,8 @@ private:
      * unit's class as a dense index, -1 for a unit that cannot move. */
     std::vector<int32_t> cls_;
     int32_t              n_cls_ = 1;
-    /* step()'s two ends of the ranking, `moves_per_dispatch` entries a class, kept between calls
-     * so a dispatch allocates nothing. */
+    /* step()'s two ends of the ranking, `moves_per_step` entries a class, kept between calls so a
+     * step allocates nothing. */
     std::vector<HeatRanked> rank_hot_, rank_cold_;
     std::vector<int32_t>    n_hot_, n_cold_, m_of_;
     /* Per slot, its lowest movable unit index: the bound step()'s layer screen needs on a tie. */

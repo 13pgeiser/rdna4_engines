@@ -270,6 +270,47 @@ std::vector<std::string> agent_isas(hsa_agent_t a) {
     return v;
 }
 
+/* The driver's topology node of card `gpu_id`, -1 when no node names it. */
+int topo_node(uint32_t gpu_id) {
+    for (int n = 0; n < 256; ++n) {
+        char path[96];
+        std::snprintf(path, sizeof path, "/sys/class/kfd/kfd/topology/nodes/%d/gpu_id", n);
+        FILE* f = std::fopen(path, "r");
+        if (!f) { if (n > 0) break; continue; }
+        unsigned id = 0;
+        const bool got = std::fscanf(f, "%u", &id) == 1;
+        std::fclose(f);
+        if (got && id == gpu_id) return n;
+    }
+    return -1;
+}
+
+/* WHETHER THE CPU CAN WRITE THE CARD'S VRAM: 1 yes, 0 no, -1 the topology does not say. The driver
+ * maps VRAM for the CPU only where the PCI BAR spans all of it. With a smaller BAR -- Resizable BAR
+ * off in the firmware, or a board without it -- the topology calls the card's memory a private
+ * frame buffer and the runtime maps every VRAM allocation PROT_NONE, which the kernel argument
+ * rings are; the heap type is what the runtime itself decides from. */
+int vram_host_writable(uint32_t gpu_id) {
+    constexpr unsigned long long kHeapFbPrivate = 2;    /* HSA_HEAPTYPE_FRAME_BUFFER_PRIVATE */
+    const int n = gpu_id ? topo_node(gpu_id) : -1;
+    if (n < 0) return -1;
+    int banks = 0;
+    bool priv = false;
+    for (int b = 0; b < 64; ++b, ++banks) {
+        char path[128];
+        std::snprintf(path, sizeof path, "/sys/class/kfd/kfd/topology/nodes/%d/mem_banks/%d/properties",
+                      n, b);
+        FILE* f = std::fopen(path, "r");
+        if (!f) break;
+        char key[128];
+        unsigned long long v = 0;
+        while (std::fscanf(f, "%127s %llu", key, &v) == 2)
+            if (!std::strcmp(key, "heap_type") && v == kHeapFbPrivate) priv = true;
+        std::fclose(f);
+    }
+    return banks == 0 ? -1 : priv ? 0 : 1;
+}
+
 hsa_status_t collect_gpu(hsa_agent_t a, void* data) {
     hsa_device_type_t t;
     if (hsa_agent_get_info(a, HSA_AGENT_INFO_DEVICE, &t) != HSA_STATUS_SUCCESS) return HSA_STATUS_SUCCESS;
@@ -315,6 +356,8 @@ hsa_status_t find_host_fine(hsa_amd_memory_pool_t p, void*) {
 bool interrupts(hsa_signal_t s) {
     return s.handle && reinterpret_cast<const amd_signal_t*>(s.handle)->event_mailbox_ptr != 0;
 }
+
+hsa_status_t on_system_event(const hsa_amd_event_t* e, void*);   /* the memory-fault report */
 
 /* HIP's ordinals and HSA's agents are matched by PCI address rather than by position: the CPU's
  * integrated graphics is an HSA agent too, and HIP's visible-device mask can hide any of them. */
@@ -368,7 +411,21 @@ bool init_devices() {
             g.why = fmt("HIP device %d (%s) has no matching HSA agent with a VRAM pool", i, bus);
             return false;
         }
+        /* Every dispatch's arguments are written by the host into VRAM (a_stream_create), so a
+         * card the CPU cannot write is refused here rather than at the first launch's SIGSEGV. */
+        if (vram_host_writable(g.dev[(size_t)i].kfd_id) == 0) {
+            g.why = fmt("card %d (%s) does not let the CPU write its VRAM: its PCI BAR is smaller "
+                        "than its memory. The AQL backend needs Resizable BAR -- turn on Above 4G "
+                        "Decoding and Resizable BAR in the firmware setup; `lspci -vv` then shows "
+                        "the card's first region as large as its VRAM", i, bus);
+            return false;
+        }
     }
+    /* Refused, a fault is left to the runtime's own handling, which is what the memory-fault
+     * report below exists to replace: so the start says it. */
+    if (hsa_amd_register_system_event_handler(on_system_event, nullptr) != HSA_STATUS_SUCCESS)
+        RAD_WARN("device: the runtime refused the memory-fault report's handler; a GPU memory "
+                 "fault will not be reported, and may hang the server instead of ending it");
     return true;
 }
 
@@ -526,6 +583,8 @@ struct Stream {
     uint64_t        rd = 0;                   /* last read index seen */
     int64_t         last_sys_acq = -(int64_t)kQueuePackets;
     uint64_t        epoch = 0;                /* host epoch at the last system acquire */
+    hsa_signal_t    ride{};                   /* rad_ride: the next dispatch's completion signal */
+    bool            agent_only = false;       /* rad_xp_stream_create: never a system-scope acquire */
     std::atomic<int> fault{0};
     char*           bounce = nullptr;         /* pinned, for pageable copies */
     std::mutex      bounce_mu;
@@ -572,6 +631,9 @@ uint64_t read_progress() {
     return n;
 }
 
+/* The DMA lanes' part of the dump, set once a lane opens (the lanes are kept further down). */
+void (*g_dump_lanes)() = nullptr;
+
 void dump_queues(const char* where) {
     std::lock_guard<std::mutex> lk(G().streams_mu);
     RAD_ERR("device: %s has waited 5 s; the queues:", where);
@@ -602,6 +664,180 @@ void dump_queues(const char* where) {
         RAD_ERR("  device %d queue %p: written %" PRIu64 ", read %" PRIu64 " -> %s", s->ord,
                 (void*)s->q, wr, rd, what.c_str());
     }
+    if (g_dump_lanes) g_dump_lanes();
+}
+
+/* ------------------------------------------------------------------ the memory-fault report
+ *
+ * WHAT A GPU MEMORY FAULT READ, in this process's terms. The runtime's own line gives the card and
+ * the address and nothing else, and an address alone cannot say whether a kernel was handed a
+ * buffer that was freed under it, read past the end of a live one, or followed a pointer that was
+ * never one. So every range this backend hands out is kept with its kind, size and order, and the
+ * latest frees with it, and on a fault the address and the running kernel's pointer arguments are
+ * each placed against both.
+ *
+ * AND THEN THE PROCESS ENDS, at once and without a core. A fault stops the queue it happened on for
+ * good, and what the runtime does next turns on the core-size limit, neither way usefully. With no
+ * core file to write, the HIP runtime's own handler claims the event (HIP_SKIP_ABORT_ON_GPU_ERROR
+ * defaults on) and keeps the error for a HIP call this backend never makes: nothing prints, nothing
+ * aborts, and every wait spins on the stopped queue -- a server that hangs with only the stall
+ * report to say so. With a limit set, the runtime prints its line and writes a GPU core of every
+ * device mapping before it aborts, tens of gigabytes for a served model: minutes of a server that
+ * neither answers nor exits. So the report is followed by fatal() -- exit status 70, no destructors
+ * (they would wait on that queue), no core -- and a supervisor's restart is what brings the server
+ * back. */
+struct AllocRec {
+    uintptr_t base = 0;
+    int64_t   bytes = 0;
+    int       kind = 0;
+    uint64_t  seq = 0;            /* the order it was handed out in, from 1 */
+    uint64_t  freed_ns = 0;       /* when it was freed (CLOCK_MONOTONIC); 0 while it is live */
+};
+std::mutex                    g_alloc_mu;
+std::map<uintptr_t, AllocRec> g_live;       /* by base */
+std::deque<AllocRec>          g_freed;      /* the latest frees, oldest first */
+uint64_t                      g_alloc_seq = 0;
+constexpr size_t              kFreedKept = 1024;
+
+uint64_t mono_ns() {
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+const char* mem_kind(int kind) {
+    switch (kind) {
+        case RAD_MEM_DEVICE:      return "device";
+        case RAD_MEM_HOST:        return "host";
+        case RAD_MEM_HOST_PINNED: return "host-pinned";
+        case RAD_MEM_HOST_MAPPED: return "host-mapped";
+        default:                  return "backend";
+    }
+}
+
+void note_alloc(const void* p, int64_t bytes, int kind) {
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(g_alloc_mu);
+    g_live[(uintptr_t)p] = AllocRec{(uintptr_t)p, bytes, kind, ++g_alloc_seq, 0};
+}
+
+void note_free(const void* p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(g_alloc_mu);
+    auto it = g_live.find((uintptr_t)p);
+    if (it == g_live.end()) return;
+    AllocRec r = it->second;
+    g_live.erase(it);
+    r.freed_ns = mono_ns();
+    g_freed.push_back(r);
+    if (g_freed.size() > kFreedKept) g_freed.pop_front();
+}
+
+std::string rec_str(const AllocRec& r, uintptr_t a) {
+    return fmt("#%" PRIu64 " %s %s at %#" PRIxPTR " +%s", r.seq, mem_kind(r.kind),
+               humanb(r.bytes).c_str(), r.base, humanb((int64_t)(a - r.base)).c_str());
+}
+
+/* Where address `a` lies among this process's ranges: inside a live one, inside one freed since
+ * (the newest such first -- a range handed out again holds the address live as well), or in
+ * neither, with the live ranges either side of it. Called with g_alloc_mu held. */
+std::string where_is(uintptr_t a) {
+    auto it = g_live.upper_bound(a);
+    if (it != g_live.begin()) {
+        const AllocRec& r = std::prev(it)->second;
+        if (a < r.base + (uintptr_t)r.bytes) return "inside live " + rec_str(r, a);
+    }
+    const uint64_t now = mono_ns();
+    for (auto f = g_freed.rbegin(); f != g_freed.rend(); ++f)
+        if (a >= f->base && a < f->base + (uintptr_t)f->bytes)
+            return fmt("inside FREED %s, freed %.1f s ago", rec_str(*f, a).c_str(),
+                       (double)(now - f->freed_ns) * 1e-9);
+    std::string s = "in no range this process holds or recently freed";
+    if (it != g_live.begin()) {
+        const AllocRec& r = std::prev(it)->second;
+        s += fmt("; %s past the end of #%" PRIu64 " %s %s at %#" PRIxPTR,
+                 humanb((int64_t)(a - (r.base + (uintptr_t)r.bytes))).c_str(), r.seq,
+                 mem_kind(r.kind), humanb(r.bytes).c_str(), r.base);
+    }
+    if (it != g_live.end())
+        s += fmt("; %s before #%" PRIu64 " %s %s at %#" PRIxPTR,
+                 humanb((int64_t)(it->second.base - a)).c_str(), it->second.seq,
+                 mem_kind(it->second.kind), humanb(it->second.bytes).c_str(), it->second.base);
+    return s;
+}
+
+/* The runtime's view of the address, which covers what this backend did not allocate itself (a
+ * kernel library's own hipMalloc, the runtime's internals): the allocation it falls in, if any. */
+std::string runtime_view(uintptr_t a) {
+    hsa_amd_pointer_info_t info{};
+    info.size = sizeof info;
+    if (hsa_amd_pointer_info((void*)a, &info, nullptr, nullptr, nullptr) != HSA_STATUS_SUCCESS)
+        return "the runtime could not be asked";
+    if (info.type == HSA_EXT_POINTER_TYPE_UNKNOWN) return "the runtime holds no allocation there";
+    const char* t = info.type == HSA_EXT_POINTER_TYPE_HSA ? "runtime memory"
+                  : info.type == HSA_EXT_POINTER_TYPE_LOCKED ? "a locked host range"
+                  : info.type == HSA_EXT_POINTER_TYPE_IPC ? "an IPC import"
+                  : info.type == HSA_EXT_POINTER_TYPE_GRAPHICS ? "a graphics interop range"
+                  : "a runtime range";
+    return fmt("the runtime has %s of %s at %p", t, humanb((int64_t)info.sizeInBytes).c_str(),
+               info.agentBaseAddress);
+}
+
+/* A word that could be an address in this process: canonical user space, past the null page. */
+bool looks_like_pointer(uint64_t w) { return w >= 0x10000 && w < 0x0000800000000000ull; }
+
+hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
+    if (!e || e->event_type != HSA_AMD_GPU_MEMORY_FAULT_EVENT) return HSA_STATUS_ERROR;
+    const hsa_amd_gpu_memory_fault_info_t& f = e->memory_fault;
+    const uintptr_t va = (uintptr_t)f.virtual_address;
+    int card = -1;
+    for (size_t i = 0; i < G().dev.size(); ++i)
+        if (G().dev[i].agent.handle == f.agent.handle) card = (int)i;
+    std::string why;
+    const uint32_t m = f.fault_reason_mask;
+    if (m & HSA_AMD_MEMORY_FAULT_PAGE_NOT_PRESENT) why += " page-not-present";
+    if (m & HSA_AMD_MEMORY_FAULT_READ_ONLY)        why += " write-to-read-only";
+    if (m & HSA_AMD_MEMORY_FAULT_NX)               why += " execute";
+    if (m & HSA_AMD_MEMORY_FAULT_HOST_ONLY)        why += " host-only";
+    if (m & HSA_AMD_MEMORY_FAULT_IMPRECISE)        why += " imprecise-address";
+    {
+        std::lock_guard<std::mutex> lk(g_alloc_mu);
+        RAD_ERR("device %d: GPU memory fault at %#" PRIxPTR " (%s ): %s; %s", card, va,
+                why.empty() ? " ?" : why.c_str(), where_is(va).c_str(), runtime_view(va).c_str());
+    }
+    /* THE KERNEL THAT RAN, AND WHAT IT WAS GIVEN. A queue's read index stays on a packet until it
+     * completes, so the packet there is the one in flight; every pointer-shaped word of its
+     * arguments is placed like the address, which names the operand a stale or short buffer was
+     * passed as. Card `card`'s queues only, and the arguments read through the BAR as they were
+     * written. */
+    std::lock_guard<std::mutex> sl(G().streams_mu);
+    for (Stream* s : G().streams) {
+        if (s->ord != card) continue;
+        const uint64_t rd = hsa_queue_load_read_index_scacquire(s->q);
+        const uint64_t wr = hsa_queue_load_write_index_scacquire(s->q);
+        if (rd >= wr) continue;
+        auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (rd & s->mask);
+        const uint16_t h = __atomic_load_n(&p->header, __ATOMIC_ACQUIRE);
+        if (((h >> HSA_PACKET_HEADER_TYPE) & 0xff) != HSA_PACKET_TYPE_KERNEL_DISPATCH) continue;
+        std::string name;
+        {
+            std::lock_guard<std::mutex> nl(g_names_mu);
+            auto it = g_names.find(p->kernel_object);
+            name = it != g_names.end() ? it->second : fmt("%#" PRIx64, p->kernel_object);
+        }
+        RAD_ERR("device %d: queue %p packet %" PRIu64 " (of %" PRIu64 " written) ran kernel %s", card,
+                (void*)s->q, rd, wr, name.c_str());
+        const uint64_t* ka = static_cast<const uint64_t*>(p->kernarg_address);
+        if (!ka) continue;
+        std::lock_guard<std::mutex> lk(g_alloc_mu);
+        for (uint32_t i = 0; i < kKargMax / 8; ++i) {
+            const uint64_t w = ka[i];
+            if (!looks_like_pointer(w)) continue;
+            RAD_ERR("  argument +%u = %#" PRIx64 ": %s", i * 8, w, where_is((uintptr_t)w).c_str());
+        }
+    }
+    fatal("a GPU memory fault on device %d stopped its queue for good (the report is above); "
+          "exiting so a restart can bring the server back", card);
 }
 
 /* How long a host wait goes before it reports the queues; see dump_queues. */
@@ -761,6 +997,9 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
     if (forced || lap || s->epoch != ep) {
         s->last_sys_acq = (int64_t)idx;
         s->epoch = ep;
+        /* The prefetch's stream reads nothing the host writes: a system acquire there would only
+         * invalidate the L2 under the compute stream's feet. */
+        if (s->agent_only && !forced) return HSA_FENCE_SCOPE_AGENT;
         return HSA_FENCE_SCOPE_SYSTEM;
     }
     return HSA_FENCE_SCOPE_AGENT;
@@ -832,6 +1071,12 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     p->completion_signal.handle = 0;
     constexpr uint16_t setup = 3u << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
     if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence);
+    /* A ride goes on after the tape has its copy: a recorded packet carries no signal of this
+     * issue's, and a play puts on whichever ride is waiting then (PlayRun::put). */
+    if (s->ride.handle) {
+        p->completion_signal = s->ride;
+        s->ride.handle = 0;
+    }
     const int acq = acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
     publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel), setup);
@@ -908,6 +1153,13 @@ struct PlayRun {
         auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
         std::memcpy(reinterpret_cast<char*>(p) + 4, reinterpret_cast<const char*>(&r.pkt) + 4,
                     sizeof(hsa_kernel_dispatch_packet_t) - 4);
+        /* A ride left waiting by host work between two played stretches (rad_ride) is the first
+         * played dispatch's to complete, as an issued one's would be. A record riding on this
+         * dispatch already has the signal; the ride then waits for the next one. */
+        if (!done.handle && s->ride.handle) {
+            done = s->ride;
+            s->ride.handle = 0;
+        }
         if (done.handle) p->completion_signal = done;
         const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
@@ -1180,8 +1432,12 @@ int a_stream_create(RadStream* out, int high_priority) {
         return RAD_E_NOMEM;
     }
     s->bounce = static_cast<char*>(bb);
+    note_alloc(ka, (int64_t)(s->mask + 1) * kKargSlot, -1);
+    note_alloc(bb, kBounceBytes, -1);
     s->id = g_next_queue_id.fetch_add(1, std::memory_order_relaxed);
     if (s->id >= kMaxQueues) {
+        note_free(bb);
+        note_free(ka);
         hsa_amd_memory_pool_free(bb);
         hsa_amd_memory_pool_free(ka);
         hsa_queue_destroy(s->q);
@@ -1208,6 +1464,8 @@ void a_stream_destroy(RadStream rs) {
     }
     g_queue_by_id[s->id].store(nullptr, std::memory_order_release);
     hsa_queue_destroy(s->q);
+    note_free(s->karg);
+    note_free(s->bounce);
     hsa_amd_memory_pool_free(s->karg);
     hsa_amd_memory_pool_free(s->bounce);
     s->magic = 0;
@@ -1476,6 +1734,7 @@ bool tape_idle(const Tape* t) {
 }
 
 void tape_free(Tape* t) {
+    note_free(t->karg);
     if (t->karg) hsa_amd_memory_pool_free(t->karg);
     t->magic = 0;
     delete t;
@@ -1546,6 +1805,7 @@ RadTape a_tape_end(int keep) {
         std::memcpy(ka, t->karg_host.data(), t->karg_host.size());
         _mm_sfence();
         t->karg = static_cast<char*>(ka);
+        note_alloc(ka, (int64_t)t->karg_host.size(), -1);
         for (TapeRec& r : t->rec)
             if (r.kind == kTapeDispatch) r.pkt.kernarg_address = t->karg + r.karg_off;
     }
@@ -1820,6 +2080,698 @@ int a_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
                                        n, s);
     set_next_fence(0);
     return rc < 0 ? RAD_E_DEVICE : RAD_OK;
+}
+
+/* ---- the DMA lane: a card's own SDMA queue ------------------------------------------------------
+ *
+ * A LIST OF COPIES GOES TO THE CARD'S DMA ENGINE THROUGH A QUEUE OF THIS BACKEND'S OWN, not through
+ * the runtime's copy call. Measured on gfx1201 with 1.3 MB host->card copies beside a kernel stream
+ * that saturates VRAM: this queue moves 28.7 GB/s -- the link -- and costs the kernels nothing; the
+ * runtime's copy call moves 22.0 GB/s and costs them 8%; copy kernels get 2.3 GB/s. The runtime's
+ * difference is in its packets: from gfx10 on it brackets every copy with a write-back and an
+ * invalidation of the WHOLE L2, so a prefill layer's ninety copies were 180 cache flushes under the
+ * running GEMMs, and the engine sat out each flush. Here a list is one wait, its copies and one
+ * write, and the caches are kept by the two barriers that order the list on its AQL stream.
+ *
+ * The queue is the driver's user-mode SDMA queue (AMDKFD_IOC_CREATE_QUEUE), and the driver holds its
+ * buffers to rules the runtime's allocations do not meet: the write pointer must open a one-page GTT
+ * buffer of THIS card, which the scheduler firmware pins into the GART, and the ring must be a buffer
+ * of exactly its own size. So both are allocated here with the driver calls the runtime's thunk makes
+ * for its queues, at an address reserved in this process so the CPU and the card share it, and
+ * CPU-mapped through the render node the thunk bound to the process's GPU address space -- the one
+ * file the driver lets map a buffer of that space.
+ *
+ * Engine 0 only. A second engine on the same direction moved nothing more (the link is the bound)
+ * and cost a VRAM-bound kernel stream 40%. */
+constexpr uint32_t kSdmaCopy     = 1;            /* COPY, sub-op LINEAR */
+constexpr uint32_t kSdmaFence    = 5;
+constexpr uint32_t kSdmaPoll     = 8;            /* POLL_REGMEM */
+constexpr uint64_t kSdmaMaxCopy  = 0x3fffe0;     /* the largest count a linear copy carries */
+constexpr uint64_t kDmaRingBytes = (uint64_t)1 << 20;
+constexpr size_t   kDoorbellPage = 8192;         /* 1024 64-bit doorbells a process */
+/* THE LINK GATE is a signal that only ever counts down: each hold and each release is a barrier
+ * packet on the holding stream whose completion takes one off, so the value is odd exactly while a
+ * hold is in force, and the engine waits on its low bit. Even to start, and far from zero. */
+constexpr int64_t  kGateStart    = (int64_t)1 << 62;
+/* A YIELDING LIST CHECKS THE GATE EVERY MEGABYTE. A check costs the engine ~2 us whatever the word's
+ * place, so this is 5% of its rate, and a hold that starts mid-list shares the link for 36 us at
+ * most; at 2 MB the prefill was slower, at 256 KB the checks cost 17%. */
+constexpr uint64_t kYieldBytes   = (uint64_t)1 << 20;
+
+/* THE QUEUE REQUEST AT THE DRIVER'S CURRENT LAYOUT, NOT THE BUILD MACHINE'S. Naming the SDMA engine
+ * -- queue type 4 and the sdma_engine_id field -- is KFD ioctl 1.17, and the kernel headers a build
+ * sees can be older than the driver the engine runs on: Ubuntu 24.04's <linux/kfd_ioctl.h> is 1.14,
+ * whose struct ends before both fields. The driver copies as many bytes as the ioctl number says and
+ * zero-fills or drops the rest, so this longer form is what every driver is sent; one older than
+ * 1.17 refuses the queue type, and the lane reports that as its reason. */
+struct KfdCreateQueue {
+    uint64_t ring_base_address, write_pointer_address, read_pointer_address, doorbell_offset;
+    uint32_t ring_size, gpu_id, queue_type, queue_percentage, queue_priority, queue_id;
+    uint64_t eop_buffer_address, eop_buffer_size, ctx_save_restore_address;
+    uint32_t ctx_save_restore_size, ctl_stack_size, sdma_engine_id, metadata_ring_size;
+};
+static_assert(sizeof(KfdCreateQueue) == 96, "the KFD 1.22 create-queue layout");
+constexpr uint32_t kKfdQueueSdmaByEngine = 0x4;
+constexpr unsigned long kKfdCreateQueue = _IOWR(AMDKFD_IOCTL_BASE, 0x02, KfdCreateQueue);
+
+struct DmaBo {
+    char*    va = nullptr;
+    size_t   size = 0;
+    uint64_t handle = 0;
+    char*    res = nullptr;                      /* the address reservation it sits in */
+    size_t   res_size = 0;
+};
+
+struct DmaQueue {
+    std::once_flag      once;
+    std::mutex          mu;
+    bool                ok = false;
+    DmaBo               ring, ptrs;
+    uint32_t*           rb = nullptr;
+    volatile uint64_t*  rptr = nullptr;          /* bytes the engine has read, written by the engine */
+    volatile uint64_t*  wptr = nullptr;          /* bytes written, for the firmware */
+    volatile uint64_t*  db = nullptr;
+    uint64_t            w = 0;                   /* bytes written, monotonic */
+    uint32_t            qid = 0;
+    std::once_flag      gate_once;
+    hsa_signal_t        gate{};                  /* the link gate: odd while a stream holds the link */
+    bool                held = false;            /* the last hold issued, for the alternation check */
+    bool                ever_held = false;       /* a stream has held this card's link at least once */
+    std::atomic<bool>   tried{false};            /* dma_open has run, for the startup report */
+    std::string         why;                     /* why it failed */
+    /* A QUEUE WHOSE EVERY LIST ENDS BY WRITING ITS NUMBER to `fin` (the expert prefetch's): the room
+     * check takes the end of the last list finished as the least the engine has read. The read
+     * pointer the engine writes back has been seen to stop moving on such a queue while the engine
+     * ran on, and a ring the host thinks full would wait for ever. */
+    volatile uint32_t*  fin = nullptr;
+    uint32_t            lists = 0;               /* lists handed over; list k ends at ends[k % kDmaEnds] */
+    std::unique_ptr<uint64_t[]> ends;
+};
+constexpr uint32_t kDmaEnds = 4096;
+DmaQueue g_dma[kMaxDevices];
+DmaQueue g_dma_xp[kMaxDevices];   /* the expert prefetch's, on the card's second engine */
+
+/* The render node a card's buffers are CPU-mapped through: /dev/dri/renderD<minor>, the minor from
+ * the driver's topology entry for its gpu_id. */
+int render_minor(uint32_t gpu_id) {
+    const int n = topo_node(gpu_id);
+    if (n < 0) return -1;
+    char path[96];
+    std::snprintf(path, sizeof path, "/sys/class/kfd/kfd/topology/nodes/%d/properties", n);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return -1;
+    char key[128];
+    unsigned long long v = 0;
+    int minor = -1;
+    while (std::fscanf(f, "%127s %llu", key, &v) == 2)
+        if (!std::strcmp(key, "drm_render_minor")) minor = (int)v;
+    std::fclose(f);
+    return minor;
+}
+
+void dma_bo_free(uint32_t gpu_id, DmaBo* b) {
+    if (b->handle) {
+        uint32_t ids[1] = { gpu_id };
+        kfd_ioctl_unmap_memory_from_gpu_args u{};
+        u.handle = b->handle;
+        u.device_ids_array_ptr = (uint64_t)(uintptr_t)ids;
+        u.n_devices = 1;
+        ioctl(G().kfd, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &u);
+        kfd_ioctl_free_memory_of_gpu_args f{};
+        f.handle = b->handle;
+        ioctl(G().kfd, AMDKFD_IOC_FREE_MEMORY_OF_GPU, &f);
+    }
+    if (b->res) munmap(b->res, b->res_size);
+    *b = DmaBo{};
+}
+
+/* A GTT buffer of card `gpu_id`, at one address for the CPU and the card. */
+bool dma_bo(uint32_t gpu_id, int minor, size_t size, DmaBo* b, std::string* why) {
+    const size_t al = (size_t)2 << 20;
+    b->res_size = size + al;
+    void* r = mmap(nullptr, b->res_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (r == MAP_FAILED) {
+        b->res = nullptr;
+        *why = fmt("no address range for a %zu-byte buffer: %s", size, std::strerror(errno));
+        return false;
+    }
+    b->res = (char*)r;
+    b->va = (char*)(((uintptr_t)r + al - 1) & ~(uintptr_t)(al - 1));
+    b->size = size;
+    kfd_ioctl_alloc_memory_of_gpu_args a{};
+    a.va_addr = (uint64_t)(uintptr_t)b->va;
+    a.size = size;
+    a.gpu_id = gpu_id;
+    a.flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+              KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
+              KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+    if (ioctl(G().kfd, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, &a) < 0) {
+        *why = fmt("the driver refused a %zu-byte GTT buffer: %s", size, std::strerror(errno));
+        dma_bo_free(gpu_id, b);
+        return false;
+    }
+    b->handle = a.handle;
+    uint32_t ids[1] = { gpu_id };
+    kfd_ioctl_map_memory_to_gpu_args m{};
+    m.handle = a.handle;
+    m.device_ids_array_ptr = (uint64_t)(uintptr_t)ids;
+    m.n_devices = 1;
+    if (ioctl(G().kfd, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &m) < 0) {
+        *why = fmt("the driver would not map a GTT buffer to the card: %s", std::strerror(errno));
+        dma_bo_free(gpu_id, b);
+        return false;
+    }
+    char want[64];
+    std::snprintf(want, sizeof want, "/dev/dri/renderD%d", minor);
+    if (DIR* d = opendir("/proc/self/fd")) {
+        while (dirent* e = readdir(d)) {
+            char link[300], tgt[128];
+            std::snprintf(link, sizeof link, "/proc/self/fd/%s", e->d_name);
+            const ssize_t n = readlink(link, tgt, sizeof tgt - 1);
+            if (n <= 0) continue;
+            tgt[n] = 0;
+            if (std::strcmp(tgt, want)) continue;
+            const int fd = std::atoi(e->d_name);
+            if (mmap(b->va, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, a.mmap_offset) !=
+                MAP_FAILED) {
+                closedir(d);
+                return true;
+            }
+        }
+        closedir(d);
+    }
+    *why = fmt("no file of this process maps a buffer of the card's address space (%s, the runtime's "
+               "render node, is not open or refused)", want);
+    dma_bo_free(gpu_id, b);
+    return false;
+}
+
+/* THE GATE IS MADE APART FROM THE QUEUE, on first use by either: a launch is handed its address when
+ * its op is bound, and that must not open a DMA queue on a card nothing streams weights onto. */
+hsa_signal_t* gate_signal(int ord) {
+    if (ord < 0 || ord >= kMaxDevices) return nullptr;
+    DmaQueue& q = g_dma[ord];
+    std::call_once(q.gate_once, [&] {
+        if (hsa_amd_signal_create(kGateStart, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &q.gate) !=
+            HSA_STATUS_SUCCESS)
+            q.gate.handle = 0;
+    });
+    return q.gate.handle ? &q.gate : nullptr;
+}
+
+/* The card's queue if it has been opened and is usable; never opens it. */
+DmaQueue* dma_queue_open(int ord) {
+    if (ord < 0 || ord >= kMaxDevices) return nullptr;
+    DmaQueue& q = g_dma[ord];
+    return q.tried.load(std::memory_order_acquire) && q.ok ? &q : nullptr;
+}
+
+bool dma_open(int ord, DmaQueue* q, std::string* why, uint32_t engine = 0, bool gated = true) {
+    const uint32_t gpu_id = G().dev[(size_t)ord].kfd_id;
+    const int minor = gpu_id ? render_minor(gpu_id) : -1;
+    if (G().kfd < 0 || !gpu_id || minor < 0) {
+        *why = "the driver's topology does not name the card's render node";
+        return false;
+    }
+    if (!dma_bo(gpu_id, minor, kDmaRingBytes, &q->ring, why)) return false;
+    if (!dma_bo(gpu_id, minor, 4096, &q->ptrs, why)) { dma_bo_free(gpu_id, &q->ring); return false; }
+    std::memset(q->ring.va, 0, kDmaRingBytes);
+    std::memset(q->ptrs.va, 0, 4096);
+    q->rb = (uint32_t*)q->ring.va;
+    q->rptr = (volatile uint64_t*)q->ptrs.va;
+    q->wptr = (volatile uint64_t*)(q->ptrs.va + 64);
+    KfdCreateQueue a{};
+    a.ring_base_address = (uint64_t)(uintptr_t)q->ring.va;
+    a.ring_size = (uint32_t)kDmaRingBytes;
+    a.read_pointer_address = (uint64_t)(uintptr_t)q->rptr;
+    a.write_pointer_address = (uint64_t)(uintptr_t)q->wptr;
+    a.gpu_id = gpu_id;
+    a.queue_type = kKfdQueueSdmaByEngine;
+    a.sdma_engine_id = engine;
+    a.queue_percentage = KFD_MAX_QUEUE_PERCENTAGE;
+    a.queue_priority = KFD_MAX_QUEUE_PRIORITY;
+    if (ioctl(G().kfd, kKfdCreateQueue, &a) < 0) {
+        *why = fmt("the driver refused an SDMA queue: %s", std::strerror(errno));
+        dma_bo_free(gpu_id, &q->ptrs);
+        dma_bo_free(gpu_id, &q->ring);
+        return false;
+    }
+    q->qid = a.queue_id;
+    /* The offset names the process's doorbell page and, in its low bits, this queue's doorbell in it. */
+    void* m = mmap(nullptr, kDoorbellPage, PROT_READ | PROT_WRITE, MAP_SHARED, G().kfd,
+                   (off_t)(a.doorbell_offset & ~(uint64_t)(kDoorbellPage - 1)));
+    if (m == MAP_FAILED) {
+        *why = fmt("the SDMA queue's doorbell could not be mapped: %s", std::strerror(errno));
+        kfd_ioctl_destroy_queue_args d{};
+        d.queue_id = q->qid;
+        ioctl(G().kfd, AMDKFD_IOC_DESTROY_QUEUE, &d);
+        dma_bo_free(gpu_id, &q->ptrs);
+        dma_bo_free(gpu_id, &q->ring);
+        return false;
+    }
+    q->db = (volatile uint64_t*)((char*)m + (a.doorbell_offset & (kDoorbellPage - 1)));
+    q->w = 0;
+    if (!gated) return true;
+    if (!gate_signal(ord)) {
+        /* The queue stays open and unused: a list without a gate would not know when to yield. */
+        *why = "no signal could be made for the link gate";
+        return false;
+    }
+    return true;
+}
+
+inline uint64_t dma_read(const DmaQueue* q);
+
+/* The DMA lanes beside dump_queues' AQL queues: a list stops at the gate while a hold is in force,
+ * so a gate left odd shows as a lane whose ring is written past what it has read. Read without the
+ * lane's lock, which a stuck writer may hold. */
+void dump_dma_lanes() {
+    for (int c = 0; c < kMaxDevices; ++c) {
+        DmaQueue& q = g_dma[c];
+        if (!q.tried.load(std::memory_order_acquire) || !q.ok) continue;
+        RAD_ERR("  device %d DMA lane: ring written %" PRIu64 " B, read %" PRIu64 " B; link gate %"
+                PRId64 " (%s), last hold issued %s", c, (uint64_t)q.w, (uint64_t)*q.rptr,
+                (int64_t)hsa_signal_load_relaxed(q.gate),
+                (hsa_signal_load_relaxed(q.gate) & 1) ? "held" : "free", q.held ? "on" : "off");
+    }
+    for (int c = 0; c < kMaxDevices; ++c) {
+        DmaQueue& q = g_dma_xp[c];
+        if (!q.tried.load(std::memory_order_acquire) || !q.ok) continue;
+        RAD_ERR("  device %d prefetch DMA queue: ring written %" PRIu64 " B, read %" PRIu64 " B; %u lists "
+                "handed over, %u finished", c, (uint64_t)q.w, dma_read(&q), q.lists, q.fin ? *q.fin : 0u);
+    }
+}
+
+/* The card's queue, made on first use; null, after one warning, where the driver will not give one. */
+DmaQueue* dma_queue(int ord) {
+    if (ord < 0 || ord >= kMaxDevices || ord >= (int)G().dev.size()) return nullptr;
+    DmaQueue& q = g_dma[ord];
+    std::call_once(q.once, [&] {
+        std::string why;
+        const auto t0 = std::chrono::steady_clock::now();
+        q.ok = dma_open(ord, &q, &why);
+        q.why = why;
+        q.tried.store(true, std::memory_order_release);
+        if (q.ok) aql::g_dump_lanes = dump_dma_lanes;
+        if (q.ok)
+            RAD_INFO("device: card %d copy lists go to DMA engine 0 on a queue of this process's own "
+                     "(%.1f ms to open)", ord,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (!q.ok)
+            RAD_WARN("device: card %d has no DMA queue of this process's own (%s); copy lists go as "
+                     "copy kernels, which share the compute units with the running kernels and slow "
+                     "the prefill stager down", ord, why.c_str());
+    });
+    return q.ok ? &q : nullptr;
+}
+
+/* What the engine has read: the read pointer it writes back, or past it the end of the last list a
+ * numbered queue has finished (DmaQueue::fin). */
+inline uint64_t dma_read(const DmaQueue* q) {
+    uint64_t r = *q->rptr;
+    if (q->fin) {
+        const uint32_t k = *q->fin;
+        if (k) r = std::max(r, q->ends[k % kDmaEnds]);
+    }
+    return r;
+}
+
+/* `n` dwords onto the ring, the queue's lock held. A packet never straddles the ring's end: the
+ * tail is padded with single-dword NOPs. The room is what the engine has read: the ring holds a few
+ * hundred layers' lists, so a wait here is the host that far ahead of a stalled engine. */
+int dma_put(DmaQueue* q, const uint32_t* dw, uint64_t n) {
+    const uint64_t cap = kDmaRingBytes / 4;
+    uint64_t at = (q->w / 4) & (cap - 1);
+    const uint64_t pad = at + n > cap ? cap - at : 0;
+    const uint64_t need = (pad + n) * 4;
+    if (q->w + need - dma_read(q) > kDmaRingBytes) {
+        Stall st("a full DMA ring");
+        while (q->w + need - dma_read(q) > kDmaRingBytes) {
+            if (G().faulted.load(std::memory_order_relaxed)) {
+                device_set_error("rad_memcpy_list_async: a queue faulted while the DMA ring was full");
+                return RAD_E_DEVICE;
+            }
+            st.tick();
+            _mm_pause();
+        }
+    }
+    for (uint64_t i = 0; i < pad; ++i) q->rb[at + i] = 0;
+    q->w += pad * 4;
+    at = (q->w / 4) & (cap - 1);
+    for (uint64_t i = 0; i < n; ++i) q->rb[at + i] = dw[i];
+    q->w += n * 4;
+    return RAD_OK;
+}
+
+void dma_kick(DmaQueue* q) {
+    _mm_sfence();
+    *q->wptr = q->w;
+    _mm_sfence();
+    *q->db = q->w;
+}
+
+/* Where the engine reads and writes a signal's value: the 64-bit word the CP decrements and polls. */
+inline uint64_t sig_value_addr(const Sig* g) {
+    return (uint64_t)g->h.handle + offsetof(amd_signal_t, value);
+}
+
+/* ------------------------------------------------- the expert prefetch's device half (rad_xp_*) */
+
+/* The card's prefetch queue, on its second DMA engine (the first is the lane's): made on first use;
+ * null where the driver gives none. Its lists end with a write of their number to a signal's value,
+ * which the room check and rad_xp_behind read. */
+DmaQueue* xp_queue(int ord) {
+    if (ord < 0 || ord >= kMaxDevices || ord >= (int)G().dev.size()) return nullptr;
+    DmaQueue& q = g_dma_xp[ord];
+    std::call_once(q.once, [&] {
+        std::string why;
+        Sig* g = sig_get(false);
+        if (g) {
+            hsa_signal_silent_store_relaxed(g->h, 0);
+            q.ends.reset(new uint64_t[kDmaEnds]());
+            q.ok = dma_open(ord, &q, &why, 1, false);
+            if (q.ok) q.fin = (volatile uint32_t*)(uintptr_t)sig_value_addr(g);
+        } else {
+            why = "no signal could be made for its lists' numbers";
+        }
+        q.why = why;
+        q.tried.store(true, std::memory_order_release);
+        if (!q.ok) RAD_INFO("card %d: no DMA queue on the second engine for the expert prefetch (%s)", ord,
+                            why.c_str());
+    });
+    return q.ok ? &q : nullptr;
+}
+
+int a_xp_supported(int device) { return xp_queue(device) != nullptr; }
+
+int a_xp_stream_create(RadStream* out) {
+    const int rc = a_stream_create(out, 0);
+    if (rc < 0) return rc;
+    ours(*out)->agent_only = true;
+    return RAD_OK;
+}
+
+/* Refused while another ride is waiting for its dispatch on the stream. */
+int a_ride(RadStream rs, void** token) {
+    Stream* s = ours(rs);
+    if (!s || !token) return RAD_E_INVAL;
+    *token = nullptr;
+    Sig* g = sig_get(false);
+    if (!g) return RAD_E_DEVICE;
+    hsa_signal_silent_store_relaxed(g->h, 1);
+    s->lock();
+    const bool busy = s->ride.handle != 0;
+    if (!busy) s->ride = g->h;
+    s->unlock();
+    if (busy) {
+        hsa_signal_silent_store_relaxed(g->h, 0);
+        sig_retire(g);
+        return RAD_E_STATE;
+    }
+    *token = g;
+    return RAD_OK;
+}
+
+int a_ride_wait(RadStream rs, void* token) {
+    Stream* s = ours(rs);
+    Sig* g = (Sig*)token;
+    if (!s || !g) return RAD_E_INVAL;
+    uint64_t idx = 0;
+    const int rc = barrier(s, g->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_AGENT, HSA_FENCE_SCOPE_NONE, &idx);
+    if (rc == RAD_OK) g->waiters.emplace_back(s->id, idx);
+    sig_retire(g);
+    return rc;
+}
+
+void a_ride_release(void* token, RadStream after, int64_t packets) {
+    Sig* g = (Sig*)token;
+    if (!g) return;
+    if (Stream* s = ours(after)) {
+        s->lock();
+        g->waiters.emplace_back(s->id, s->wr + (uint64_t)std::max<int64_t>(packets, 0));
+        s->unlock();
+    }
+    sig_retire(g);
+}
+
+/* Wait for the mark, wait for the card's link gate if a collective has ever held it (TP: the
+ * all-reduce crosses the same link, and the step waits on it, not on these copies), copy, write
+ * `done`, then the list's number. */
+int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* dst, const uint64_t* bytes,
+              uint32_t* done, uint32_t done_val) {
+    DmaQueue* dq = xp_queue(ord);
+    if (!dq) return RAD_E_UNSUPPORTED;
+    Sig* in = (Sig*)mark;
+    DmaQueue* lane = dma_queue_open(ord);
+    std::lock_guard<std::mutex> lk(dq->mu);
+    int rc = RAD_OK;
+    if (in) {
+        const uint64_t ia = sig_value_addr(in);
+        const uint32_t poll[6] = { kSdmaPoll | (3u << 28) /* equal */ | (1u << 31) /* memory */,
+                                   (uint32_t)ia, (uint32_t)(ia >> 32), 0u, 0xffffffffu,
+                                   10u /* interval */ | (0xfffu << 16) /* retry forever */ };
+        rc = dma_put(dq, poll, 6);
+    }
+    if (rc == RAD_OK && n > 0 && lane && lane->ever_held && lane->gate.handle) {
+        const uint64_t ga = (uint64_t)lane->gate.handle + offsetof(amd_signal_t, value);
+        const uint32_t gate[6] = { kSdmaPoll | (3u << 28) /* equal */ | (1u << 31) /* memory */,
+                                   (uint32_t)ga, (uint32_t)(ga >> 32), 0u, 1u /* the low bit */,
+                                   10u /* interval */ | (0xfffu << 16) /* retry forever */ };
+        rc = dma_put(dq, gate, 6);
+    }
+    for (int i = 0; rc == RAD_OK && i < n; ++i)
+        for (uint64_t o = 0; rc == RAD_OK && o < bytes[i]; o += kSdmaMaxCopy) {
+            const uint64_t len = std::min(kSdmaMaxCopy, bytes[i] - o);
+            const uint64_t sa = src[i] + o, da = dst[i] + o;
+            const uint32_t cp[7] = { kSdmaCopy, (uint32_t)(len - 1), 0u, (uint32_t)sa, (uint32_t)(sa >> 32),
+                                     (uint32_t)da, (uint32_t)(da >> 32) };
+            rc = dma_put(dq, cp, 7);
+        }
+    if (rc == RAD_OK && done) {
+        const uint64_t a = (uint64_t)(uintptr_t)done;
+        const uint32_t fence[4] = { kSdmaFence | (3u << 16) /* uncached */, (uint32_t)a, (uint32_t)(a >> 32),
+                                    done_val };
+        rc = dma_put(dq, fence, 4);
+    }
+    if (rc == RAD_OK) {
+        const uint32_t k = dq->lists + 1;
+        const uint64_t a = (uint64_t)(uintptr_t)dq->fin;
+        const uint32_t fence[4] = { kSdmaFence | (3u << 16) /* uncached */, (uint32_t)a, (uint32_t)(a >> 32), k };
+        rc = dma_put(dq, fence, 4);
+        if (rc == RAD_OK) {
+            dq->ends[k % kDmaEnds] = dq->w;
+            dq->lists = k;
+        }
+    }
+    dma_kick(dq);
+    return rc;
+}
+
+int64_t a_xp_behind(int ord) {
+    DmaQueue* dq = (ord >= 0 && ord < kMaxDevices) ? &g_dma_xp[ord] : nullptr;
+    if (!dq || !dq->tried.load(std::memory_order_acquire) || !dq->ok) return 0;
+    std::lock_guard<std::mutex> lk(dq->mu);
+    return (int64_t)(uint32_t)(dq->lists - *dq->fin);
+}
+
+bool card_has_room(int ord, int64_t bytes, const char* what);
+void* a_alloc_uncached(int64_t bytes) {
+    if (bytes <= 0) return nullptr;
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess || !card_has_room(dev, bytes, "rad_dev_alloc_uncached")) return nullptr;
+    void* p = nullptr;
+    if (hipExtMallocWithFlags(&p, (size_t)bytes, hipDeviceMallocUncached) != hipSuccess) return nullptr;
+    return p;
+}
+
+void a_free_uncached(void* p) {
+    if (p) (void)hipFree(p);
+}
+
+/* A LIST: the engine waits for the stream, copies, and the stream waits for the engine (the two
+ * barriers in `flush`). A copy the engine cannot take goes the kernel way, in its place in the
+ * list: pageable memory (staged through a bounce buffer), a peer card's memory, and any copy while a
+ * pass is being recorded -- a tape replays queue packets, and a DMA submission is not one. The two
+ * signals go back to the pool behind the second barrier: by then the engine has written `out`, so
+ * it has stopped reading `in` as well. */
+int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream rs) {
+    Stream* s = ours(rs);
+    if (!s) { device_set_error("rad_memcpy_list_async: not a stream of this backend"); return RAD_E_INVAL; }
+    if (n < 0 || (n > 0 && !segs)) {
+        device_set_error("rad_memcpy_list_async: %d segments at %p", n, (const void*)segs);
+        return RAD_E_INVAL;
+    }
+    if (n == 0) {   /* readies the card's queue; see device.h */
+        (void)dma_queue(s->ord);
+        return RAD_OK;
+    }
+    struct Dma { const RadCopySeg* seg; uint64_t dst, src; };
+    std::vector<Dma> dma;
+    dma.reserve((size_t)n);
+    bool card = false;                       /* a copy reads or writes this card's memory */
+    /* THE ORDER ON THE STREAM IS KEPT BY TWO BARRIERS AND A SIGNAL EACH WAY. The first completes `in`
+     * once everything before the list has; the engine polls `in` before the copies and writes `out`
+     * after them, and the second barrier holds the stream on `out`. The release before is the
+     * system's when a copy touches this card's memory, so the engine reads what kernels wrote and no
+     * dirty L2 line of a destination is written back over its copy later; the acquire after is the
+     * system's always, because the engine writes memory past the L2 and the L2 may still hold the
+     * destination's old bytes. */
+    auto flush = [&]() -> int {
+        if (dma.empty()) return RAD_OK;
+        DmaQueue* dq = dma_queue(s->ord);
+        if (!dq) {
+            for (const Dma& c : dma) RAD_TRY(a_memcpy_async(c.seg->dst, c.seg->src, c.seg->bytes, rs));
+            dma.clear();
+            card = false;
+            return RAD_OK;
+        }
+        Sig* in  = sig_get(false);
+        Sig* out = sig_get(false);
+        if (!in || !out) {
+            if (in) sig_retire(in);
+            if (out) sig_retire(out);
+            device_set_error("rad_memcpy_list_async: no signal could be made");
+            return RAD_E_DEVICE;
+        }
+        hsa_signal_silent_store_relaxed(in->h, 1);
+        hsa_signal_silent_store_relaxed(out->h, 1);
+        int rc = barrier(s, hsa_signal_t{0}, in->h, HSA_FENCE_SCOPE_NONE,
+                         card ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_NONE);
+        if (rc != RAD_OK) {
+            /* The queue has faulted and nothing was submitted: `in` will never complete. */
+            sig_retire(in);
+            sig_retire(out);
+            dma.clear();
+            return rc;
+        }
+        {
+            std::lock_guard<std::mutex> lk(dq->mu);
+            const uint64_t ia = sig_value_addr(in), oa = sig_value_addr(out);
+            const uint32_t poll[6] = { kSdmaPoll | (3u << 28) /* equal */ | (1u << 31) /* memory */,
+                                       (uint32_t)ia, (uint32_t)(ia >> 32), 0u, 0xffffffffu,
+                                       10u /* interval */ | (0xfffu << 16) /* retry forever */ };
+            rc = dma_put(dq, poll, 6);
+            /* A yielding list checks the gate before its first copy and again once a piece's worth
+             * has gone since the last check, its copies cut to that size, so a hold that starts
+             * mid-list shares the link for one piece at most. Not on a card whose link nothing has
+             * held: no collective crosses it (one card serving alone), and the checks would cost
+             * the engine 5% of a link-bound prefill for nothing. */
+            const bool yield = (flags & RAD_COPY_YIELD) != 0 && dq->ever_held;
+            const uint64_t piece = yield ? std::min(kYieldBytes, kSdmaMaxCopy) : kSdmaMaxCopy;
+            const uint64_t ga = (uint64_t)dq->gate.handle + offsetof(amd_signal_t, value);
+            const uint32_t gate[6] = { kSdmaPoll | (3u << 28) /* equal */ | (1u << 31) /* memory */,
+                                       (uint32_t)ga, (uint32_t)(ga >> 32), 0u, 1u /* the low bit */,
+                                       10u /* interval */ | (0xfffu << 16) /* retry forever */ };
+            uint64_t since = piece;
+            for (size_t i = 0; rc == RAD_OK && i < dma.size(); ++i) {
+                const uint64_t bytes = (uint64_t)dma[i].seg->bytes;
+                for (uint64_t o = 0; rc == RAD_OK && o < bytes; o += piece) {
+                    const uint64_t len = std::min(piece, bytes - o);
+                    const uint64_t sa = dma[i].src + o, da = dma[i].dst + o;
+                    if (yield && since >= piece) {
+                        rc = dma_put(dq, gate, 6);
+                        since = 0;
+                        if (rc != RAD_OK) break;
+                    }
+                    const uint32_t cp[7] = { kSdmaCopy, (uint32_t)(len - 1), 0u,
+                                             (uint32_t)sa, (uint32_t)(sa >> 32),
+                                             (uint32_t)da, (uint32_t)(da >> 32) };
+                    rc = dma_put(dq, cp, 7);
+                    since += len;
+                }
+            }
+            if (rc == RAD_OK) {
+                /* The low half of `out`'s value; the high half is already zero. */
+                const uint32_t fence[4] = { kSdmaFence | (3u << 16) /* uncached */,
+                                            (uint32_t)oa, (uint32_t)(oa >> 32), 0u };
+                rc = dma_put(dq, fence, 4);
+            }
+            dma_kick(dq);
+        }
+        /* A list the ring could not take is not waited for: the stream would stop on `out` for good. */
+        if (rc != RAD_OK) hsa_signal_store_screlease(out->h, 0);
+        uint64_t idx = 0;
+        const int br = barrier(s, out->h, hsa_signal_t{0}, HSA_FENCE_SCOPE_SYSTEM,
+                               HSA_FENCE_SCOPE_NONE, &idx);
+        if (br == RAD_OK) {
+            /* `in` is read by the engine, which is done with it once `out` is written. */
+            in->waiters.emplace_back(s->id, idx);
+            out->waiters.emplace_back(s->id, idx);
+        }
+        sig_retire(in);
+        sig_retire(out);
+        dma.clear();
+        card = false;
+        if (br != RAD_OK) return br;
+        return rc;
+    };
+    for (int i = 0; i < n; ++i) {
+        const RadCopySeg& g = segs[i];
+        if (g.bytes == 0) continue;
+        if (g.bytes < 0 || !g.src || !g.dst) {
+            device_set_error("rad_memcpy_list_async: segment %d (%p <- %p, %lld)", i, g.dst, g.src,
+                             (long long)g.bytes);
+            return RAD_E_INVAL;
+        }
+        const void* gd = nullptr;
+        const void* gs = nullptr;
+        const Loc ld = locate(g.dst, s, &gd);
+        const Loc ls = locate(g.src, s, &gs);
+        /* A peer card's memory is the peer's engine's to copy, and the list keeps to this card. */
+        if (capturing() || ld == kPageable || ls == kPageable || ld == kDevPeer || ls == kDevPeer) {
+            RAD_TRY(flush());
+            RAD_TRY(a_memcpy_async(g.dst, g.src, g.bytes, rs));
+            continue;
+        }
+        card = card || ld == kDevLocal || ls == kDevLocal;
+        dma.push_back(Dma{&g, (uint64_t)(uintptr_t)gd, (uint64_t)(uintptr_t)gs});
+    }
+    return flush();
+}
+
+/* A hold or a release is one barrier on the holding stream, completing the gate: it takes effect
+ * once everything before it on the stream is done, which is when the collective issued after it
+ * starts, or when the one before it has finished. A recorded pass holds nothing -- a hold only paces
+ * the lists, and a play issues none. */
+int a_link_hold(RadStream rs, int on) {
+    Stream* s = ours(rs);
+    if (!s) { device_set_error("rad_link_hold: not a stream of this backend"); return RAD_E_INVAL; }
+    if (capturing()) return RAD_OK;
+    /* Only where lists go to the engine: nothing else polls the gate. */
+    DmaQueue* dq = dma_queue_open(s->ord);
+    if (!dq) return RAD_OK;
+    std::lock_guard<std::mutex> lk(dq->mu);
+    if (dq->held == (on == 1)) {
+        device_set_error("rad_link_hold: card %d's link is %s held", s->ord,
+                         on == 1 ? "already" : "not");
+        return RAD_E_STATE;
+    }
+    /* The book follows the queue: a barrier the queue refused changed nothing. */
+    if (on != 2)
+        RAD_TRY(barrier(s, hsa_signal_t{0}, dq->gate, HSA_FENCE_SCOPE_NONE, HSA_FENCE_SCOPE_NONE));
+    dq->held = on == 1;
+    dq->ever_held = dq->ever_held || on == 1;
+    return RAD_OK;
+}
+
+int a_dma_lane(int device, char* out, int cap) {
+    if (device < 0 || device >= kMaxDevices || device >= (int)G().dev.size() || !out || cap <= 0)
+        return RAD_E_INVAL;
+    const DmaQueue& q = g_dma[device];
+    if (!q.tried.load(std::memory_order_acquire))
+        std::snprintf(out, (size_t)cap, "copy lists not used: nothing streams weights onto this card");
+    else if (q.ok)
+        std::snprintf(out, (size_t)cap, "copy lists on DMA engine 0, a queue of this process's own; "
+                                        "they give way to the collectives");
+    else
+        std::snprintf(out, (size_t)cap, "copy lists as copy kernels: %s", q.why.c_str());
+    return RAD_OK;
+}
+
+void* a_link_gate(RadStream rs) {
+    Stream* s = ours(rs);
+    hsa_signal_t* g = s ? gate_signal(s->ord) : nullptr;
+    return g ? (void*)(uintptr_t)(g->handle + offsetof(amd_signal_t, value)) : nullptr;
 }
 
 int a_memset_async(void* dst, int value, int64_t bytes, RadStream rs) {
@@ -2310,12 +3262,18 @@ void* a_alloc(int64_t bytes, int kind) {
         if (hipGetDevice(&dev) == hipSuccess && !card_has_room(dev, bytes, "rad_dev_alloc"))
             return nullptr;
     }
-    if (!pinned_kind(kind)) return g_hip_alloc(bytes, kind);
+    if (!pinned_kind(kind)) {
+        void* p = g_hip_alloc(bytes, kind);
+        note_alloc(p, bytes, kind);
+        return p;
+    }
     if (bytes <= 0) {
         device_set_error("rad_dev_alloc(%lld): size must be positive", (long long)bytes);
         return nullptr;
     }
-    return pin_pieces(bytes);
+    void* p = pin_pieces(bytes);
+    note_alloc(p, bytes, kind);
+    return p;
 }
 
 /* Behind the forgetting every free needs (locate's cache). */
@@ -2323,6 +3281,7 @@ void (*g_hip_free)(void*, int) = nullptr;
 void a_free(void* p, int kind) {
     loc_forget();
     if (!p) return;
+    note_free(p);
     if (pinned_kind(kind)) unpin_pieces(p);
     else if (g_hip_free) g_hip_free(p, kind);
 }
@@ -2417,6 +3376,19 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.memcpy_2d_async = a_memcpy_2d_async;
         g_aql.memset_async = a_memset_async;
         g_aql.memcpy_ranges_async = a_memcpy_ranges_async;
+        g_aql.memcpy_list_async = a_memcpy_list_async;
+        g_aql.link_hold = a_link_hold;
+        g_aql.link_gate = a_link_gate;
+        g_aql.xp_supported = a_xp_supported;
+        g_aql.xp_stream_create = a_xp_stream_create;
+        g_aql.ride = a_ride;
+        g_aql.ride_wait = a_ride_wait;
+        g_aql.ride_release = a_ride_release;
+        g_aql.xp_list = a_xp_list;
+        g_aql.xp_behind = a_xp_behind;
+        g_aql.alloc_uncached = a_alloc_uncached;
+        g_aql.free_uncached = a_free_uncached;
+        g_aql.dma_lane = a_dma_lane;
         g_aql.vmem_granularity = a_vmem_granularity;
         g_aql.vmem_reserve = a_vmem_reserve;
         g_aql.vmem_release = a_vmem_release;

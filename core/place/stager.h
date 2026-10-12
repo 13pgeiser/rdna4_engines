@@ -1,5 +1,5 @@
-/* stager.h -- the prefill stager: a routed layer's non-resident experts copied onto the card one
- * layer ahead of the layer that reads them.
+/* stager.h -- the prefill stager: routed layers' non-resident experts copied onto the card ahead
+ * of the layers that read them.
  *
  * ---- WHY A PREFILL NEEDS IT -------------------------------------------------------------------
  *
@@ -12,44 +12,86 @@
  * work leaves the link idle. Measured with r4d_selftest --perfmoe, the gate_up GEMM of a 2048-token
  * chunk is 1.53 ms with every expert on the card and 4.34 ms with the coldest 13% in host memory.
  *
- * So at a step large enough, the stager copies layer L+1's pooled experts into a VRAM buffer while
- * layer L runs, publishes the copies for layer L+1's ops, and publishes the host addresses again
- * once those ops are behind it. The copy is the same bytes the GEMM would have read, so the output
+ * So at a step large enough, the stager copies the pooled experts of the layers ahead into a VRAM
+ * ring while the layers before them run, publishes the copies for each layer's ops, and publishes
+ * the host addresses again once those ops are behind it. The copy is the same bytes the GEMM would have read, so the output
  * is bit-identical; only when the link carries them moves.
  *
- * ---- WHERE THE BUFFERS ARE, AND WHEN THEY ARE ITS ---------------------------------------------
+ * ---- WHERE THE RING IS, AND WHEN IT IS ITS ---------------------------------------------------
  *
- * Two buffers, each one layer's share of the experts the budget leaves off the card, at the top of
- * the activation arena (Program::arena_stage_off, sized by vram_budget_resolve). A step smaller
- * than the arena's full plan LENDS that top to the expert slab, so the buffers are the stager's
- * only in a step at the full plan -- which is exactly the steps worth staging for -- and the rest of
- * the time they hold resident experts like any other lent slot. The scheduler says which it is,
- * pass by pass (set_full_arena).
+ * One region, the size of two layers' share of the experts the budget leaves off the card, at the
+ * top of the activation arena (Program::arena_stage_off, sized by vram_budget_resolve). A step
+ * smaller than the arena's full plan LENDS that top to the expert slab, so the region is the
+ * stager's only in a step at the full plan -- which is exactly the steps worth staging for -- and
+ * the rest of the time it holds resident experts like any other lent slot. The scheduler says
+ * which it is, pass by pass (set_full_arena).
+ *
+ * ---- WHY A RING AND NOT TWO BUFFERS ------------------------------------------------------------
+ *
+ * Layers do not leave equal parts off the card: at depth, with the KV cache's loan taken back, the
+ * last third of a Qwen3.8-Flash-Next stack pools about twice the median layer. With two buffers of
+ * one share each, layer L+1's copy waits for layer L-1's last op, so the engine idled once a light
+ * layer's copy was done -- 60 to 80 ms of a ~280 ms step -- and a heavy layer's copy, longer than
+ * the layer before it, made every layer after it wait. The ring packs each layer at its own size,
+ * so the copies run as far ahead as the light layers leave room for and the heavy ones start
+ * early. A layer staged further ahead than the next one takes at most half the ring, so the next
+ * layer always has the room two buffers gave it; the next one takes whatever is free.
  *
  * ---- THE ORDER, AND WHAT KEEPS IT SAFE ---------------------------------------------------------
  *
- *   the pass's first op     stage the first routed layer the pass issues, into buffer 0 or 1
- *   a layer's first op      stage the NEXT layer into the other buffer; re-read the residency
- *                           table so this layer's ops resolve the copies made one layer ago
- *   a layer's last op       record "buffer free" on the op's stream; publish the host addresses
- *   the pass's end          the same for anything still staged: nothing outlives its pass
+ *   the pass's first op     stage the first routed layer the pass issues, and the ones after it
+ *                           as far as the pace and the ring allow
+ *   a layer's first op      wait on its copies; publish the host addresses of the layers before
+ *                           it again; stage further layers into the room that gave back
+ *   a layer's last op       record "free" behind it on the op's stream
+ *   the pass's end          the same for anything still staged -- and, when the next step goes on
+ *                           with a prompt, stage the first layers of its trunk pass
  *
- * A copy into a buffer waits on that buffer's "free" event, recorded behind the last op that read
- * the layer it held -- in this pass or an earlier one. The layer's ops wait on the copies' event
- * through ONE stream wait, issued before the layer's first op: the copies are published settled
- * (Mover::stage_units says why), and nothing but the layer's own ops ever resolves them.
+ * A layer's place in the ring is counted in bytes the ring has handed out since bring-up, so a
+ * place laps the region and a copy finds the places it overwrites from the count alone. Before a
+ * copy goes out, the mover's stream waits on the "free" event of every earlier place it laps --
+ * recorded behind the last op that read it, in this pass or an earlier one. The layer's ops wait on
+ * the copies' event through ONE stream wait, issued before the layer's first op: the copies are
+ * published settled (Mover::stage_units says why), and nothing but the layer's own ops ever
+ * resolves them.
  *
- * A LAYER IS STAGED AHEAD ONLY WHEN THE PASS WILL ISSUE IT. A step issues its routed layers across
- * more than one pass -- the trunk in one, the MTP head's in the next -- and the last layer a trunk
- * pass stages ahead would otherwise be the head's, copied for a pass that never reads it and thrown
- * away at its end. The stager learns the last op each kind of pass issues (by draft_pass) and stages
- * a layer ahead only when its first op is at or below it.
+ * ---- HOW FAR AHEAD ----------------------------------------------------------------------------
+ *
+ * A layer's copies go out once the compute stream has reached the MoE of the layer kLead before it,
+ * through an event recorded at that layer's first op. Not as soon as the ring has room: copies that
+ * land long before their layer is read cost the layers they overlap more than they save. Measured at
+ * TP2 on Qwen3.8-Flash-Next, released as soon as there was room, every class of op ran slower and a
+ * 26K-token prompt lost 0.6%; held to one layer ahead, the heavy late layers of a 160K-token prompt
+ * waited again and it lost 2.4%. Three layers ahead covered the late layers at the smallest cost
+ * to the short prompt.
+ *
+ * ---- THE NEXT STEP'S FIRST LAYERS -------------------------------------------------------------
+ *
+ * A step that carries a chunk of a prompt is issued only once the step before it has been read
+ * back, so the copies of its first layers would start with it and its first layer would wait for
+ * all of them. When the engine says the next step goes on with a prompt (set_next_prefill), the
+ * pass's end stages the first layers of the next trunk pass instead, paced on this pass's last
+ * layers as if the two passes were one. They are published at once. The next trunk pass adopts them
+ * when it is armed; a trunk pass that is not publishes their host addresses again in begin_pass,
+ * which the run phase calls before it brings the weight tables up to date. A draft pass in between
+ * reads none of the trunk's layers and leaves them be. With both, against two buffers at TP2: 160K
+ * 1.0-1.4% faster, 26K unchanged; at TP1, where the link carries every pooled expert each step,
+ * 26K 0.6% faster.
+ *
+ * ---- ONLY THE TRUNK ---------------------------------------------------------------------------
+ *
+ * A draft head's routed layer is not the stager's. The head runs in passes of its own -- over a
+ * prefill chunk, the history pass, which needs the head's experts on a prompt's last chunk alone
+ * and there only for the rows that draft, a handful however long the chunk -- so its pooled
+ * experts are read in place like a decode step's. The head's layer is numbered past the
+ * trunk's layers (RadModelMeta::n_layers), left out at bring-up, and a draft pass is never armed.
  */
 #pragma once
 #include "../runtime/stager.h"
 #include "mover.h"
 #include "planner.h"
 
+#include <deque>
 #include <map>
 #include <vector>
 
@@ -60,22 +102,29 @@ public:
     ~PrefillStager() override;
 
     /* The routed layers of `plan` and the ops that read them, and `bytes` of device memory at
-     * `region` as two buffers. `min_rows` is the smallest pass it arms for. Leaves it disabled --
+     * `region` as the ring. `min_rows` is the smallest pass it arms for. Leaves it disabled --
      * enabled() false -- when the plan has no routed layer with a pooled unit to stage. */
     int init(const Program& prog, const Plan& plan, Mover* mover, char* region, int64_t bytes,
              int64_t min_rows);
 
     /* Per pass, before it is released: whether the step runs at the arena's full plan, which is
-     * when the buffers are not lent. */
+     * when the region is not lent. */
     void set_full_arena(bool full) { full_ = full; }
+    /* Per step, before it is released: whether the step after it goes on with a prompt in a pass
+     * this stager arms for, so this step's trunk pass stages that pass's first layers. */
+    void set_next_prefill(bool more) { next_prefill_ = more; }
 
     bool    enabled() const { return !layers_.empty(); }
-    int64_t buffer_bytes() const { return cap_; }
+    int64_t ring_bytes() const { return ring_; }
     /* The smallest pass (in tokens) the stager arms for: a step under it reads every pooled
      * expert of a routed layer synchronously. The scheduler keeps a held-back prefill chunk at
      * or above it (Scheduler::set_stage_rows). */
     int64_t min_rows() const { return min_rows_; }
     size_t  n_layers() const { return layers_.size(); }
+    /* Whether the last trunk pass armed: its routed layers' pooled experts were copied onto the
+     * card through the ring. A draft pass leaves it as the trunk pass set it. */
+    bool    staged() const { return staged_; }
+    static constexpr int32_t lead() { return kLead; }
 
     bool begin_pass(const RadBatch* b) override;
     int  before_op(rad_op h, RadStream s, bool* resync) override;
@@ -92,33 +141,62 @@ private:
     std::vector<int32_t> first_of_;    /* by op: the layer whose first op it is, or -1 */
     std::vector<int32_t> last_of_;     /* by op: the layer whose last op it is, or -1 */
 
+    /* ONE LAYER'S PLACE IN THE RING. [beg, end) is in bytes handed out since bring-up; the
+     * offset in the region is beg modulo its size, and a place never straddles the region's end. */
+    struct Place {
+        int32_t  li = -1;                      /* index into layers_ */
+        int64_t  beg = 0, end = 0;
+        RadEvent done = nullptr;               /* behind its copies, on the mover stream */
+        RadEvent free = nullptr;               /* behind its last reader */
+        bool     free_rec = false;
+        /* Its last op has been issued at least once and `free` is recorded behind it. A step
+         * longer than the MoE block's pass of rows issues a layer's ops once per pass, so the
+         * last op can run again: the copies are published away at the NEXT layer's first op,
+         * which is past every pass, while each run of the last op moves `free` behind itself. */
+        bool     read = false;
+        bool     retired = false;              /* its units are published at their pool slots */
+        std::vector<int32_t> staged;
+    };
+    /* More places than a ring of two shares can hold layers of the smallest share a pass stages;
+     * a full table only stops the copies going further ahead. */
+    static constexpr int kPlaces = 16;
+    Place    place_[kPlaces];
+    std::deque<int32_t>  ring_order_;  /* places in the ring, oldest first; retired ones stay until lapped */
+    std::vector<int32_t> spare_;       /* places not in the ring */
+
     Mover*   mover_ = nullptr;
-    char*    buf_[2] = { nullptr, nullptr };
-    int64_t  cap_ = 0;
+    char*    region_ = nullptr;
+    int64_t  ring_ = 0;
+    int64_t  head_ = 0;                /* bytes handed out since bring-up */
     int64_t  min_rows_ = 0;
-    RadEvent done_[2] = { nullptr, nullptr };   /* behind a buffer's copies, on the mover stream */
-    RadEvent free_[2] = { nullptr, nullptr };   /* behind a buffer's last reader */
-    bool     free_rec_[2] = { false, false };
-    std::vector<int32_t> staged_[2];
-    int32_t  holds_[2] = { -1, -1 };             /* the layer a buffer holds, or -1 */
-    /* The holder's last op has been issued at least once, and `free_` is recorded behind it. A
-     * step longer than the MoE block's pass of rows issues a layer's ops once per pass, so the
-     * last op can run again: the copies are released at the NEXT layer's first op, which is past
-     * every pass, while each run of the last op moves `free_` behind itself. */
-    bool     read_[2] = { false, false };
+
+    /* THE PACE (see the top of this file): layer k's copies wait on the event recorded at the
+     * first op of layer k - kLead, on the compute stream. A layer within kLead of the pass's first
+     * routed layer has no such layer in its pass and goes at once. */
+    static constexpr int32_t kLead = 3;
+    static constexpr int kGates = 64;
+    RadEvent gate_[kGates] = {};
+    int32_t  gate_li_[kGates] = {};    /* the layer each gate was recorded at this pass, or -1 */
+    int32_t  first_li_ = -1;           /* the pass's first routed layer */
 
     bool     full_ = false;
     bool     armed_ = false;
-    bool     first_op_ = false;                  /* the pass has issued nothing yet */
-    std::vector<uint8_t> started_;               /* by layer: staged (or tried) this pass */
-    int32_t  pass_kind_ = 0;
-    int32_t  last_issued_ = -1;
-    std::map<int32_t, int32_t> pass_last_;       /* by draft_pass: the last op such a pass issued */
+    /* armed_ as the last trunk pass's begin_pass set it, which end_pass leaves alone: the engine
+     * asks after the pass has ended. */
+    bool     staged_ = false;
+    bool     next_prefill_ = false;
+    bool     first_op_ = false;        /* the pass has issued nothing yet */
+    int32_t  next_ = 0;                /* the next layer to stage this pass */
+    /* The next trunk pass's first layers, staged at this pass's end: layers [0, n_early_). */
+    int32_t  n_early_ = 0;
 
-    bool will_issue(int32_t li) const;
-    int  start(int32_t li);
-    int  finish(int32_t b, RadStream s);
-    void release(int32_t b);
+    enum { kStaged, kNone, kLater };
+    int  stage_ahead(int32_t cur, bool* resync);
+    int  stage_layer(int32_t li, bool now, RadEvent gate, int* got);
+    void withdraw_early();
+    int  take(int64_t want, bool partial, int32_t* out);
+    int  recycle_front();
+    void retire(Place& p);
 };
 
 /* ---- THE FILE STAGER: routed layers read from the container -------------------------------------

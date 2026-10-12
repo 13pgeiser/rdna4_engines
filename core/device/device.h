@@ -58,6 +58,79 @@ struct RadCopyRange {
 extern "C" int rad_memcpy_ranges_async(void* dst, const void* src, int64_t prefix,
                                        const RadCopyRange* ranges, int n, RadStream s);
 
+/* ONE COPY OF A LIST: `bytes` from `src` to `dst`, both absolute addresses. */
+struct RadCopySeg {
+    const void* src;
+    void*       dst;
+    int64_t     bytes;
+};
+/* MANY UNRELATED COPIES, IN LIST ORDER ON THE STREAM, on the card's DMA engine where the backend
+ * has one. The list is read at the call, so it need not outlive it; the bytes it names do, like
+ * any copy's. A backend without a DMA engine copies the segments one by one, in order. An empty
+ * list puts nothing on the stream, and readies what the backend's first list on that stream's card
+ * would otherwise set up, so a caller can take that cost at bring-up.
+ *
+ * It exists for bulk copies across the link while the card computes -- the prefill stager's,
+ * a layer's pooled experts a call. A copy as a kernel holds a compute unit's slot for as long as
+ * the link takes, and waits for one to free up at every launch: beside kernels that keep every unit
+ * busy, 1.3 MB copies from pinned host memory ran at 2.3 GB/s as kernels and at 28.7 GB/s -- the
+ * link -- on the DMA engine, which cost those kernels nothing (aql.cpp, "the DMA lane").
+ *
+ * RAD_COPY_YIELD makes the list give way to the card's collectives: it waits, between pieces of
+ * about a megabyte, while a stream of that card holds the link (rad_link_hold). */
+#define RAD_COPY_YIELD 1u
+extern "C" int rad_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream s);
+
+/* THE CARD'S LINK, HELD BY A STREAM FOR WHAT IT ISSUES BETWEEN TWO CALLS: `on` 1 at the point in
+ * `s` where traffic the step waits on starts to cross the card's link -- a collective -- and 0
+ * where it ends, or 2 where the work in between ended the hold itself (rad_link_gate). Lists issued
+ * RAD_COPY_YIELD for that card stop between pieces while it is held. The holds of one card
+ * alternate, on then off, in the order they are issued across all its streams: they never nest or
+ * overlap. And the holding stream must not wait, between the two
+ * calls, on anything behind a yielding list -- the list would wait for the hold to end, and the
+ * hold for the list. A backend without a DMA engine holds nothing.
+ *
+ * WHY: a card's inbound link carries a collective's peer bytes and the stager's copies alike, and
+ * the DMA engine takes its share at the link's full rate. A 4 MB all-reduce message that crosses in
+ * 165 us on its own took 301 us beside a layer's copies, and the step waits on every one; the
+ * copies have the rest of the layer to finish in. */
+extern "C" int rad_link_hold(RadStream s, int on);
+
+/* THE WORD THE HOLD IS KEPT IN, for a launch that ends its own: a 64-bit word in memory every
+ * engine and kernel of the card reaches, odd while the link is held. rad_link_hold(s, 2) after a
+ * launch that was handed this address records that the launch released the hold itself, by taking
+ * one off the word -- once, and only if it found it odd -- as soon as the bytes it waited for had
+ * landed. Null where the backend holds nothing. */
+extern "C" void* rad_link_gate(RadStream s);
+
+/* THE EXPERT PREFETCH'S DEVICE HALF (core/runtime/xprefetch.cpp). A backend that cannot make a
+ * dispatch complete a signal, or has no DMA engine to spare for it, leaves these out:
+ * rad_xp_supported is then 0 and the prefetch is off.
+ *
+ * A RIDE is a signal the next dispatch issued on a stream completes -- that dispatch keeps its
+ * ordering bit, so the signal stands for everything before it on the stream -- in place of a
+ * barrier packet of its own between two kernels. rad_ride_wait puts a barrier on another stream
+ * that waits for it and gives the signal back behind that barrier; a ride the DMA engine polls
+ * instead goes back with rad_ride_release once nothing can poll it: at once (`after` null) when the
+ * list that polled it has finished, else once `after` is `packets` dispatches further on, which is
+ * long after the ridden dispatch has completed it.
+ *
+ * rad_xp_list hands the card's prefetch DMA queue a list: wait for `mark` (a ride, or null), copy
+ * the `n` ranges, then write `done_val` to `done` (pinned host memory, or null). rad_xp_behind is how
+ * many lists the queue has been handed and not yet finished. The prefetch's ring is uncached device
+ * memory (rad_dev_alloc_uncached): the engine writes it and kernels read it, and no cache may hold
+ * what a slot held before. */
+extern "C" int     rad_xp_supported(int device);
+extern "C" int     rad_xp_stream_create(RadStream* out);
+extern "C" int     rad_ride(RadStream s, void** token);
+extern "C" int     rad_ride_wait(RadStream s, void* token);
+extern "C" void    rad_ride_release(void* token, RadStream after, int64_t packets);
+extern "C" int     rad_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst,
+                               const uint64_t* bytes, uint32_t* done, uint32_t done_val);
+extern "C" int64_t rad_xp_behind(int device);
+extern "C" void*   rad_dev_alloc_uncached(int64_t bytes);
+extern "C" void    rad_dev_free_uncached(void* p);
+
 namespace rad {
 
 /* A recorded pass, owned by the backend that recorded it. See DeviceBackend::tape_begin. */
@@ -128,6 +201,9 @@ struct DeviceBackend {
     int   (*memset_async)(void* dst, int value, int64_t bytes, RadStream s);
     int   (*memcpy_ranges_async)(void* dst, const void* src, int64_t prefix,
                                  const RadCopyRange* ranges, int n, RadStream s);
+    int   (*memcpy_list_async)(const RadCopySeg* segs, int n, unsigned flags, RadStream s);
+    int   (*link_hold)(RadStream s, int on);
+    void* (*link_gate)(RadStream s);
 
     /* ---- recorded passes. A backend with none leaves these null, and the run phase then issues
      * every pass; see Ctx::run_step for what a tape is for and when one is kept.
@@ -228,6 +304,32 @@ struct DeviceBackend {
      * the backend cannot say. Asked, not enabled: rad_dev_enable_peer is the call that maps the
      * memory. Null on a backend whose devices share one address space, which answers 1. */
     int     (*peer_access)(int self, int peer);
+
+    /* ---- the card's PCI address, "0000:03:00.0", into `out`; RAD_E_UNSUPPORTED from a backend
+     * whose devices are not PCI devices. It is what joins the runtime's device index to the
+     * kernel's description of the same card -- its link, its power limits, its IOMMU group -- in
+     * the startup report (core/diag/diag.h). */
+    int     (*pci_address)(int device, char* out, int cap);
+    /* ---- the device runtime's name and version, "HIP 7.2.25403", into `out`. Null on a backend
+     * with no runtime behind it. */
+    int     (*runtime_version)(char* out, int cap);
+    /* ---- what carries the engine's copy lists for `device` (rad_memcpy_list_async), into `out`:
+     * the card's DMA engine on a queue of the process's own, or why not. Null on a backend that
+     * copies every list segment by segment. */
+    int     (*dma_lane)(int device, char* out, int cap);
+
+    /* ---- the expert prefetch's device half: see rad_xp_supported. Last in the table, so a backend
+     * listing its entries in order leaves them null. */
+    int     (*xp_supported)(int device);
+    int     (*xp_stream_create)(RadStream* out);
+    int     (*ride)(RadStream s, void** token);
+    int     (*ride_wait)(RadStream s, void* token);
+    void    (*ride_release)(void* token, RadStream after, int64_t packets);
+    int     (*xp_list)(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst,
+                       const uint64_t* bytes, uint32_t* done, uint32_t done_val);
+    int64_t (*xp_behind)(int device);
+    void*   (*alloc_uncached)(int64_t bytes);
+    void    (*free_uncached)(void* p);
 };
 
 
@@ -259,6 +361,12 @@ int     dev_code_runs(size_t from, size_t to, int device, std::string* why);
 
 /* The current backend's DeviceBackend::integrated. */
 bool    dev_integrated(int device);
+
+/* The current backend's DeviceBackend::pci_address and runtime_version, "" where it has none. */
+std::string dev_pci_address(int device);
+std::string dev_runtime_version();
+/* The current backend's DeviceBackend::dma_lane, "" where it has none. */
+std::string dev_dma_lane(int device);
 
 /* THE LONGEST RUN OF DISPATCHES A PLAYED TAPE LEAVES UNORDERED. Of any kTapeOverlapRun + 1
  * consecutive packets on a queue, one carries the barrier bit, so a packet having been launched

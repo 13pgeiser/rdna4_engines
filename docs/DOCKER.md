@@ -3,7 +3,7 @@
 The repository builds into one Docker image that holds the engine, its plugins, its tools and the
 recipes, and nothing else: it is assembled from scratch out of the install tree and exactly the
 shared libraries that tree loads. The host needs Docker, an AMD GPU and an `amdgpu` kernel driver
-that supports ROCm 7.2. It does not need ROCm itself, a compiler, or ffmpeg.
+that supports ROCm 10.1. It does not need ROCm itself, a compiler, or ffmpeg.
 
 The image is published as [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance),
 with its kernels built for `gfx1201`: `docker pull stilldeadcode/radiance`. Build it yourself for
@@ -32,26 +32,29 @@ committed: no build directory, no uncommitted edit, no model file. It builds wit
 (`docker buildx`), which runs independent stages side by side and caches each one; with `-s` only
 the remote machine needs buildx.
 
-The `Dockerfile` has three stages:
+The `Dockerfile` has these stages:
 
 | stage | what it does |
 |---|---|
 | `ffmpeg` | FFmpeg 8.1 with only the demuxers `core/mm/media.cpp` admits and the decoders their streams carry (still images, H.264, HEVC, VP8, VP9, AV1 through dav1d, MPEG-1/2/4, Theora, FLV/H.263). The distribution's build brings about 200 packages of encoders, filters and display libraries the engine never calls |
-| `build` | `rocm/dev-ubuntu-24.04:7.2.4` plus cmake, ninja and g++-14. Configures with the kernels compiled for `GPU_TARGETS`, builds, and installs to `/opt/radiance`. Device code is not stored compressed: the engine's AQL backend reads the fat binaries itself and refuses a compressed bundle |
-| `test` | `ctest -LE gpu`: every suite that runs without a card. The image is only produced if they pass |
-| `rootfs` | The install tree, stripped, plus every shared library its binaries and plugins load (resolved by `ldd`, glibc and the ROCm runtime included) in one directory the loader searches by default, `amdgpu.ids`, and a static busybox. Every ELF file is then resolved from inside a chroot of the tree, so the build fails on a library the image lacks |
+| `llvm` | ROCm's `libLLVM` rebuilt from ROCm's own llvm-project, at the exact commit the image's `clang --version` names, with `docker/llvm-vopd-pairing.patch` applied and configured as ROCm ships it. ROCm 10.1's clang does not compile the same source to the same code twice (its VOPD pairing follows heap addresses); the patch makes it repeatable. The library is the only file of the compiler that changes |
+| `build` | `rocm/dev-ubuntu-24.04:10.1.0-full` plus cmake, ninja and g++-14. Every device source is compiled by ROCm's clang from `/opt/rocm-repeatable`, a shadow of the ROCm tree whose `libLLVM` is the `llvm` stage's (`-DRAD_HIP_VOPD_REPEATABLE=ON`, `--rocm-path=/opt/rocm`); the HIP runtime and comgr in the image stay ROCm's own. Configures with the kernels compiled for `GPU_TARGETS`, builds, and installs to `/opt/radiance`. Device code is not stored compressed: the engine's AQL backend reads the fat binaries itself and refuses a compressed bundle |
+| `test` | `docker/llvm-check.sh`, then `ctest -LE gpu`: every suite that runs without a card. The check recompiles one kernel file four ways -- with pairing off the image's compiler must emit ROCm's device code byte for byte, with pairing on three compiles must agree. The image is only produced if both pass |
+| `rootfs` | The install tree, stripped, plus every shared library its binaries and plugins load (resolved by `ldd`, glibc and the ROCm runtime included) in one directory the loader searches by default, and a static busybox. ROCm's `libdrm_amdgpu` carries the card name table compiled in, so no `amdgpu.ids` is needed. Every ELF file is then resolved from inside a chroot of the tree, so the build fails on a library the image lacks |
 | `runtime` | `FROM scratch` and the rootfs. This is the image that ships |
 
-The largest single file is comgr (about 150 MB), which the HIP runtime cannot initialise a device
-without. There is no distribution in the shipped image: no package manager and no shell beyond busybox
-(`docker exec -it <name> sh`). JPEG XL input is refused by name, since its decoder needs libjxl.
+The largest files are the LLVM and Clang libraries comgr loads (about 130 MB and 90 MB), which the
+HIP runtime cannot initialise a device without. There is no distribution in the shipped image: no
+package manager and no shell beyond busybox (`docker exec -it <name> sh`). JPEG XL input is refused
+by name, since its decoder needs libjxl.
 
 A build container has no card to enumerate, so the GPU architecture must be named. A bare-metal
 `./build.sh` detects it instead. `libr4d` builds for gfx12 targets only; any other target in the
 list just gets no RDNA4 kernels.
 
 The ROCm version in the image has to be one the host's kernel driver supports. It is a build
-argument (`ROCM_VERSION`, default 7.2.4).
+argument (`ROCM_VERSION`, default `10.1.0-full`; from ROCm 10 on, the development image is published
+only with the `-full` suffix).
 
 The GPU suites (`mem_test`, `r4d_selftest`, `kbench`) need the card to themselves. They run from
 the `build` stage:
@@ -120,6 +123,7 @@ the cards the engine runs on.
 | file | container | what it is |
 |---|---|---|
 | `flashnext.yaml` | `qwen3.8-next-flash-fp8-iq4r-moe.rad` | Qwen3.8-Flash-Next, 4-bit codebook experts and an int8 trunk; MTP depth 3; idle sessions kept in host memory and on disk |
+| `flashnext-tp1.yaml` | `qwen3.8-next-flash-fp8-iq4r-moe.rad` | The same on one card: a 42 GiB pinned host pool for the experts that do not fit, 4096-token prefill steps, 4 sequences |
 | `flashnext-bf16.yaml` | `qwen3.8-flash-next-bf16.rad` | Qwen3.8-Flash-Next in bf16, streamed from the disk tier. A reference, not a production server |
 | `qwen3.6-35b-a3b.yaml` | `qwen3.6-35b-a3b-fp8.rad` | Qwen3.6-35B-A3B, FP8 |
 | `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |

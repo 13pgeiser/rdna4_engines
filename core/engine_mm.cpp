@@ -83,18 +83,19 @@ int Engine::run_encodes() {
             int64_t np = 0;
             while (i < mine.size()) {
                 mm::Item& it = *mine[i];
-                const int64_t seg_p = (int64_t)it.grid_h * it.grid_w;
-                if (seg_p > max_p) {
-                    RAD_ERR("encoder: a segment of %lld patches does not fit a pass of %lld",
-                            (long long)seg_p, (long long)max_p);
-                    return RAD_E_STATE;
+                const int32_t first = seg;
+                for (; seg < it.n_seg; ++seg) {
+                    const int64_t seg_p = it.patch_at(seg + 1) - it.patch_at(seg);
+                    if (seg_p > max_p) {
+                        RAD_ERR("encoder: a segment of %lld patches does not fit a pass of %lld",
+                                (long long)seg_p, (long long)max_p);
+                        return RAD_E_STATE;
+                    }
+                    if (np + seg_p > max_p) break;
+                    np += seg_p;
                 }
-                const int64_t room = (max_p - np) / seg_p;
-                const int32_t can = (int32_t)std::min<int64_t>(it.n_seg - seg, room);
-                if (can <= 0) break;
-                parts.push_back({ &it, seg, can });
-                np += (int64_t)can * seg_p;
-                seg += can;
+                if (seg == first) break;
+                parts.push_back({ &it, first, seg - first });
                 if (seg == it.n_seg) { ++i; seg = 0; }
             }
             if (parts.empty()) break;
@@ -127,9 +128,10 @@ int Engine::run_encodes() {
             int64_t row = 0;
             for (const BatchBuilder::EncoderPart& p : parts) {
                 mm::Item& it = *const_cast<mm::Item*>(p.item);
-                const int64_t rows = (int64_t)p.n_seg * it.seg_rows;
+                const int64_t first = it.row_at(p.seg0);
+                const int64_t rows = it.row_at(p.seg0 + p.n_seg) - first;
                 const int64_t bytes = rows * n_embd * (int64_t)sizeof(uint16_t);
-                RAD_TRY(rad_memcpy_async(it.embd.data() + (int64_t)p.seg0 * it.seg_rows * n_embd,
+                RAD_TRY(rad_memcpy_async(it.embd.data() + first * n_embd,
                                          static_cast<const char*>(out) +
                                              row * n_embd * (int64_t)sizeof(uint16_t),
                                          bytes, r0.ctx.stream()));

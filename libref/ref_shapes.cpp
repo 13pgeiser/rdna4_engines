@@ -434,6 +434,18 @@ int ref_grid_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("grid_embed", operand, out);
 }
 
+/* grid_embed's operands; the coordinates are drawn over the table's side, as there. */
+int ref_grid_embed_aa_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), side = gi(p, n_p, "side", 0);
+    if (M <= 0 || n <= 0 || side <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });              /* x, INOUT */
+    o.t(D, { side * side, n });    /* table */
+    o.t_idx({ 4, M }, side, -1, 0);
+    return o.finish("grid_embed_aa", operand, out);
+}
+
 int ref_layernorm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -719,6 +731,24 @@ int ref_ple_conv_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx({ S }, 0, M, 0);                         /* num_accepted: read at M - 1 */
     o.t(D, { M, n });                                /* y */
     return o.finish("ple_conv", operand, out);
+}
+
+/* ple_conv's description without `resid` and at dilation one. */
+int ref_causal_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D  = act_dt(p, n_p);
+    const int64_t M   = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), wid = gi(p, n_p, "width", 0);
+    if (M <= 0 || n <= 0 || wid <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = 1, depth = wid - 2 + M;
+    Opd o;
+    o.t(D, { M, n });                                /* x */
+    o.t(D, { n, wid });                              /* w */
+    o.t(D, { S, n, depth });                         /* conv_state, INOUT */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);           /* cu */
+    o.t_idx({ S }, S, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);           /* cache_idx */
+    o.t_idx({ S }, 0, 1, 0);                         /* has_init: warm */
+    o.t_idx({ S }, 0, M, 0);                         /* num_accepted: read at M - 1 */
+    o.t(D, { M, n });                                /* y */
+    return o.finish("causal_conv1d", operand, out);
 }
 
 int ref_ngram_ids_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

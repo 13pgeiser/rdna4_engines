@@ -1190,8 +1190,8 @@ static const char* const MEDIA_MARKER = RAD_MEDIA_MARKER;
  * arbitrary http(s) URL on a caller's behalf turns the inference server into an SSRF proxy with
  * network access to everything the deployment can reach, and no amount of allowlisting makes
  * that a good default. */
-static int decode_media_url(const std::string& url, const std::string& field,
-                            std::vector<uint8_t>* out, ApiError* err) {
+int decode_media_url(const std::string& url, const std::string& field,
+                     std::vector<uint8_t>* out, ApiError* err) {
     if (url.rfind("data:", 0) != 0) {
         *err = err_bad(field, "only data: URLs are accepted; the server does not fetch remote URLs "
                               "on a request's behalf");
@@ -1462,9 +1462,9 @@ static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits
  * Each media part is processed HERE, on the request's own worker, because decoding a video and
  * resizing its frames is the most expensive host work a request can bring: it must not reach the
  * scheduler's thread, where every other request's step would wait on it. */
-static int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
-                               std::vector<std::pair<MediaKind, std::vector<uint8_t>>>& media,
-                               const MediaOpts& opts, PromptInput* out, ApiError* err) {
+int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
+                        std::vector<std::pair<MediaKind, std::vector<uint8_t>>>& media,
+                        const MediaOpts& opts, PromptInput* out, ApiError* err) {
     out->text = rendered;
     auto pm = std::make_shared<mm::PromptMedia>();
     const std::string marker = MEDIA_MARKER;

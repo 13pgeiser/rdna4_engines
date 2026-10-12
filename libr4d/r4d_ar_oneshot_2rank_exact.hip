@@ -142,9 +142,11 @@ __global__ void r4d_ar_hc_write_kernel(
     int4* __restrict__ y4, int4* peer_base, const int4* my_base, unsigned int* peer_flags,
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
     unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
-    int slot_stride16, int drain, int acq, unsigned int nbw) {
+    int slot_stride16, int drain, int acq, unsigned int nbw, long long* gate,
+    unsigned int* gate_ctr) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
   const unsigned int s = s_seq;
   const int slot = (int)s_slot;
@@ -175,6 +177,7 @@ __global__ void r4d_ar_hc_write_kernel(
     }
   }
   __syncthreads();
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
   if (acq) __threadfence_system();
 
   const int wpr = n >> 3;                 // 16B words a row
@@ -225,12 +228,13 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     unsigned int* my_flags, unsigned int* seq_ctrs, const unsigned short* __restrict__ inj,
     unsigned short* __restrict__ h, int n16, int n, int hc, long irow, long hrow,
     int slot_stride16, int drain, int acq, unsigned int nbw, R4dArGather G,
-    const int* __restrict__ inv) {
+    const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   __shared__ int   s_i[R4D_ARG_ROWS * R4D_ARG_SLOTS];
   __shared__ float s_w[R4D_ARG_ROWS * R4D_ARG_SLOTS];
   __shared__ float s_g[R4D_ARG_ROWS];
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
   const unsigned int s = s_seq;
   const int slot = (int)s_slot;
@@ -286,6 +290,7 @@ __global__ void r4d_ar_gather_hc_write_kernel(
     }
   }
   __syncthreads();
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
   if (acq) __threadfence_system();
 
   for (int k = start + tid; k < end; k += nt) {
@@ -398,7 +403,7 @@ int r4d_p2p_copy2d(long dst, long src, long dpitch, long spitch, long width, lon
 void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                      long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n,
                      long hc, long irow, long hrow, long stream_i, long nblocks, long nthreads,
-                     long drain, long acq) {
+                     long drain, long acq, long gate, long gate_ctr) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8) throw std::runtime_error("ar_hc_write: n must be a positive multiple of 8");
   if (hc < 1 || hrow % 8) throw std::runtime_error("ar_hc_write: the streams must be whole 16B words");
@@ -415,7 +420,8 @@ void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long m
   r4d_ar_hc_write_kernel<<<nb, nt, 0, st>>>(
       (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
       (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
-      n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw);
+      n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw,
+      (long long*)gate, (unsigned int*)gate_ctr);
 }
 
 int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
@@ -423,7 +429,7 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
                            long n, long hc, long irow, long hrow, long ye, long ew, long sorted,
                            long sh, long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
                            long top_k, long sig, long stream_i, long nblocks, long nthreads,
-                           long drain, long acq, long inv) {
+                           long drain, long acq, long inv, long gate, long gate_ctr) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
   if (top_k < 1 || top_k > R4D_ARG_SLOTS) return -2;
@@ -466,13 +472,13 @@ int r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags, 
         (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
         (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
         n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
-        (const int*)inv);
+        (const int*)inv, (long long*)gate, (unsigned int*)gate_ctr);
   } else {
     r4d_ar_gather_hc_write_kernel<false><<<nb, nt, 0, st>>>(
         (int4*)y, (int4*)peer_scratch, (const int4*)my_scratch, (unsigned*)peer_flags,
         (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h,
         n16, (int)n, (int)hc, irow, hrow, (int)slot_stride16, (int)drain, (int)acq, nbw, G,
-        nullptr);
+        nullptr, (long long*)gate, (unsigned int*)gate_ctr);
   }
   return (int)hipGetLastError();
 }

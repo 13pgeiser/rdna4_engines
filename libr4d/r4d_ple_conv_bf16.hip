@@ -1,5 +1,6 @@
 // r4d_ple_conv_bf16.hip -- Per-Layer Embedding's dilated depthwise convolution, its silu, and the
-// residual add that finishes the layer.
+// residual add that finishes the layer; and, as `causal_conv1d`, the same convolution with no
+// activation, no residual and no dilation, which is LFM2's short convolution.
 //
 // ============================== WHAT IT COMPUTES ==============================
 //
@@ -83,6 +84,9 @@ static_assert(kPcMaxHist < kPcBT, "the conv history must fit inside tile 0 for t
  * against uses std::exp. The GDN conv, which is instruction-bound, makes the opposite trade. */
 __device__ __forceinline__ float pc_silu(float z) { return z / (1.0f + expf(-z)); }
 
+/* SILU is ple_conv's activation; causal_conv1d (LFM2's short convolution) is the same window
+ * with none, no residual and dilation one. */
+template <bool SILU>
 __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
     uint16_t* __restrict__ cs, const int32_t* __restrict__ cu,
@@ -125,14 +129,15 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
         float acc = 0.0f;
 #pragma unroll
         for (uint32_t j = 0; j < kPcMaxW; ++j) {
-            if (j >= wid) break;
-            const int32_t src = t - (int32_t)hist + (int32_t)(j * dil);
-            const float v = src >= 0 ? bf16_to_f32(xc[(size_t)src * xld])
-                                     : (hc ? bf16_to_f32(hc[(src + (int32_t)hist) * cs_tok]) : 0.0f);
-            acc += v * wt[j];
+            if (j < wid) {
+                const int32_t src = t - (int32_t)hist + (int32_t)(j * dil);
+                const float v = src >= 0 ? bf16_to_f32(xc[(size_t)src * xld])
+                                         : (hc ? bf16_to_f32(hc[(src + (int32_t)hist) * cs_tok]) : 0.0f);
+                acc += v * wt[j];
+            }
         }
         const float r = rc ? bf16_to_f32(rc[(size_t)t * rld]) : 0.0f;
-        yc[(size_t)t * yld] = f32_to_bf16(r + pc_silu(acc));
+        yc[(size_t)t * yld] = f32_to_bf16(r + (SILU ? pc_silu(acc) : acc));
     }
 
     /* THE WINDOW THIS STEP LEAVES BEHIND, in the same launch and with no barrier at all.
@@ -162,47 +167,36 @@ __global__ __launch_bounds__(kPcThreads) void ple_conv_kernel(
     uint16_t keep[kPcMaxHist];
     if (nacc) {
 #pragma unroll
-        for (uint32_t i = 0; i + 1 < kPcMaxHist; ++i) {
-            if (i + 1 >= hist) break;
-            keep[i] = hc ? hc[(size_t)(i + 1) * cs_tok] : (uint16_t)0;
-        }
+        for (uint32_t i = 0; i + 1 < kPcMaxHist; ++i)
+            if (i + 1 < hist) keep[i] = hc ? hc[(size_t)(i + 1) * cs_tok] : (uint16_t)0;
 #pragma unroll
-        for (uint32_t i = 0; i + 1 < kPcMaxHist; ++i) {
-            if (i + 1 >= hist) break;
-            dst[(size_t)i * cs_tok] = keep[i];
-        }
+        for (uint32_t i = 0; i + 1 < kPcMaxHist; ++i)
+            if (i + 1 < hist) dst[(size_t)i * cs_tok] = keep[i];
         for (int32_t t = 0; t < slen && (long long)hist - 1 + t < state_len; ++t)
             dst[(size_t)(hist - 1 + (uint32_t)t) * cs_tok] = xc[(size_t)t * xld];
         return;
     }
 #pragma unroll
     for (uint32_t i = 0; i < kPcMaxHist; ++i) {
-        if (i >= hist) break;
-        const int32_t src = slen - (int32_t)hist + (int32_t)i;
-        keep[i] = src >= 0 ? xc[(size_t)src * xld]
-                           : (hc ? hc[(src + (int32_t)hist) * cs_tok] : (uint16_t)0);
+        if (i < hist) {
+            const int32_t src = slen - (int32_t)hist + (int32_t)i;
+            keep[i] = src >= 0 ? xc[(size_t)src * xld]
+                               : (hc ? hc[(src + (int32_t)hist) * cs_tok] : (uint16_t)0);
+        }
     }
 #pragma unroll
-    for (uint32_t i = 0; i < kPcMaxHist; ++i) {
-        if (i >= hist) break;
-        dst[(size_t)i * cs_tok] = keep[i];
-    }
+    for (uint32_t i = 0; i < kPcMaxHist; ++i)
+        if (i < hist) dst[(size_t)i * cs_tok] = keep[i];
 }
 
 enum { PC_X = 0, PC_W, PC_CS, PC_CU, PC_RESID, PC_CIDX, PC_HINIT, PC_NACC, PC_Y };
+/* causal_conv1d's operands: ple_conv's without `resid`. */
+enum { CC_X = 0, CC_W, CC_CS, CC_CU, CC_CIDX, CC_HINIT, CC_NACC, CC_Y };
 
-}  // namespace
-
-extern "C" int r4d_rad_ple_conv(const RadArgs* a, RadStream s) {
-    const RadTensor* x     = r4d_opt(a, PC_X);
-    const RadTensor* w     = r4d_opt(a, PC_W);
-    const RadTensor* cs    = r4d_opt(a, PC_CS);
-    const RadTensor* cu    = r4d_opt(a, PC_CU);
-    const RadTensor* resid = r4d_opt(a, PC_RESID);
-    const RadTensor* cidx  = r4d_opt(a, PC_CIDX);
-    const RadTensor* hini  = r4d_opt(a, PC_HINIT);
-    const RadTensor* nacc  = r4d_opt(a, PC_NACC);
-    const RadTensor* y     = r4d_opt(a, PC_Y);
+int conv_launch(const RadArgs* a, RadStream s, bool silu, const RadTensor* x, const RadTensor* w,
+                const RadTensor* cs, const RadTensor* cu, const RadTensor* resid,
+                const RadTensor* cidx, const RadTensor* hini, const RadTensor* nacc,
+                const RadTensor* y) {
     if (!x || !w || !cu || !y) return R4D_NO(RAD_E_INVAL);
     if (x->dtype != RAD_BF16 || w->dtype != RAD_BF16 || y->dtype != RAD_BF16)
         return R4D_NO(RAD_E_DTYPE);
@@ -255,8 +249,8 @@ extern "C" int r4d_rad_ple_conv(const RadArgs* a, RadStream s) {
 
     const uint32_t cb = (uint32_t)((n + kPcThreads - 1) / kPcThreads);
     const uint32_t tb = (uint32_t)((T + kPcBT - 1) / kPcBT);
-    hipLaunchKernelGGL(ple_conv_kernel, dim3(cb, tb, (uint32_t)N), dim3(kPcThreads), 0,
-                       (hipStream_t)s,
+    const auto kernel = silu ? ple_conv_kernel<true> : ple_conv_kernel<false>;
+    hipLaunchKernelGGL(kernel, dim3(cb, tb, (uint32_t)N), dim3(kPcThreads), 0, (hipStream_t)s,
                        (const uint16_t*)r4d_addr(x), (const uint16_t*)r4d_addr(w),
                        have_cs ? (uint16_t*)r4d_addr(cs) : nullptr,
                        (const int32_t*)r4d_addr(cu),
@@ -268,4 +262,19 @@ extern "C" int r4d_rad_ple_conv(const RadArgs* a, RadStream s) {
                        (uint32_t)hist, (uint32_t)xld, (uint32_t)rld, (uint32_t)yld, (uint32_t)wld,
                        cs_slot, cs_ch, cs_tok, state_len);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+}
+
+}  // namespace
+
+extern "C" int r4d_rad_ple_conv(const RadArgs* a, RadStream s) {
+    return conv_launch(a, s, true, r4d_opt(a, PC_X), r4d_opt(a, PC_W), r4d_opt(a, PC_CS),
+                       r4d_opt(a, PC_CU), r4d_opt(a, PC_RESID), r4d_opt(a, PC_CIDX),
+                       r4d_opt(a, PC_HINIT), r4d_opt(a, PC_NACC), r4d_opt(a, PC_Y));
+}
+
+extern "C" int r4d_rad_causal_conv1d(const RadArgs* a, RadStream s) {
+    if (r4d_geti_or(a, "dilation", 1) != 1) return R4D_NO(RAD_E_INVAL);
+    return conv_launch(a, s, false, r4d_opt(a, CC_X), r4d_opt(a, CC_W), r4d_opt(a, CC_CS),
+                       r4d_opt(a, CC_CU), nullptr, r4d_opt(a, CC_CIDX), r4d_opt(a, CC_HINIT),
+                       r4d_opt(a, CC_NACC), r4d_opt(a, CC_Y));
 }

@@ -281,11 +281,13 @@ void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_fla
                                long stream, long nblocks, long nthreads, long drain, long acq);
 // The exact all-reduce of `y` [M][n] bf16 with hc_write as its epilogue: h[r][c*n + i] +=
 // inj[r][c] * y[r][i] over the reduced y, byte-identical to all_reduce then hc_write. `irow` and
-// `hrow` are the pitches of inj [M][hc] and h [M][hc*n] in elements; y is tight.
+// `hrow` are the pitches of inj [M][hc] and h [M][hc*n] in elements; y is tight. A non-zero `gate`
+// is the engine's link word, ended once the peer's push has landed (r4d_ar_link_landed); `gate_ctr`
+// is the instance's block counter for it. The gather form below takes the same pair.
 void r4d_ar_hc_write(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                      long seq_ctrs, long slot_stride16, long y, long inj, long h, long M, long n,
                      long hc, long irow, long hrow, long stream, long nblocks, long nthreads,
-                     long drain, long acq);
+                     long drain, long acq, long gate, long gate_ctr);
 // The same with the MoE gather as its prologue: y is not read but produced -- the routed experts'
 // rows `ye` [M*top_k][ye_ld] summed back to token order by the weights `ew` [M][ew_ld] and the
 // sorted list `sorted` [M*top_k], with the shared arm `sh` [M][sh_ld] and its gate `sg` folded
@@ -298,19 +300,21 @@ int  r4d_ar_gather_hc_write(long peer_scratch, long my_scratch, long peer_flags,
                             long n, long hc, long irow, long hrow, long ye, long ew, long sorted,
                             long sh, long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
                             long top_k, long sig, long stream, long nblocks, long nthreads,
-                            long drain, long acq, long inv);
+                            long drain, long acq, long inv, long gate, long gate_ctr);
 // r4d_ar_hc_write and r4d_ar_gather_hc_write on the rotated 6-bit wire (r4d_ar_oneshot_2rank_wht6's
 // format and arithmetic, its loc_pack and scratch split): byte-identical to all_reduce on that wire
 // then hc_write, and with `ye` non-zero to moe_gather, then those two. The gather's operands are
 // r4d_ar_gather_hc_write's; its slot table is built in LDS, and the grid is widened until a
-// block's table fits. M*n must be a multiple of 64. Returns 0, or a negative code for a shape it
-// does not serve.
+// block's table fits. M*n must be a multiple of 64. A non-zero `gate` is the engine's link word,
+// ended by the launch once the peer's bytes have landed (r4d_ar_link_landed); `gate_ctr` is the
+// instance's block counter for it. Returns 0, or a negative code for a shape it does not serve.
 int  r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                           long seq_ctrs, long loc_pack, long slot_stride_bytes,
                           long scale_off_bytes, long y, long inj, long h, long M, long n, long hc,
                           long irow, long hrow, long ye, long ew, long sorted, long sh, long sg,
                           long ye_ld, long ew_ld, long sh_ld, long sg_ld, long top_k, long sig,
-                          long stream, long nblocks, long nthreads, long drain, long acq);
+                          long stream, long nblocks, long nthreads, long drain, long acq,
+                          long gate, long gate_ctr);
 int  r4d_ar_max_blocks(void);                                   // the two 2-rank kernels
 void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems); // rotated-6-bit payload only
 

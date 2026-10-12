@@ -15,8 +15,20 @@ int main(int argc, char** argv) {
     rad::Engine engine(std::move(cfg));
 
     s = engine.start();
-    if (s < 0) return 1;                       /* start() already said what and why */
+    if (s < 0) {
+        /* start() already said what and why; the report adds what it was running on and what it
+         * had decided by then, which is what a log of a server that never came up is read for. */
+        engine.print_startup_report(s);
+        return 1;
+    }
 
     if (engine.config().debug_graph) return engine.dump();
-    return engine.serve() < 0 ? 1 : 0;
+    s = engine.serve();
+    if (s < 0) {
+        /* A refusal between start() and listening (a chat template the defaults cannot render, a
+         * thinking budget the model cannot hold) also ends a server that never came up. */
+        if (!engine.startup_report_printed()) engine.print_startup_report(s);
+        return 1;
+    }
+    return 0;
 }

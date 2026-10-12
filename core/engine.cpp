@@ -34,12 +34,16 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <unistd.h>
 
 namespace rad {
 
 
 
-Engine::Engine(Config cfg) : cfg_(std::move(cfg)) {}
+/* The RADIANCE_* names are taken here, before start(): bring-up sets one of its own
+ * (RADIANCE_GDN_ANCHOR, Engine::configure_kv), and the report lists what the operator set. */
+Engine::Engine(Config cfg)
+    : cfg_(std::move(cfg)), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
@@ -61,6 +65,7 @@ Engine::~Engine() {
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
+    for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
     /* The disk thread first: it reads the host arena and writes the store, both of which go with
      * the ranks and kv_disk_ below. */
     if (pump_) pump_->io.stop();
@@ -79,6 +84,13 @@ Engine::~Engine() {
                  (unsigned long long)r->ctx.route_dropped());
         RAD_INFO("%s", r->mover.report().c_str());
     }
+    /* THE TRANSFER STREAM BEFORE THE CONTEXTS. Ctx::shutdown drains the compute streams and then
+     * frees the arena, but the mover's stream copies into the arena too -- the prefill stager's
+     * ring is its top, and an idle arena lends its slots to the expert slab -- and is drained only
+     * when the mover goes, after it. A fill still landing in a lent arena slot at that moment is
+     * a GPU memory fault on the way out. */
+    for (auto& r : ranks_)
+        if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     for (auto& r : ranks_) r->ctx.shutdown();
     step_state_fini();
     ranks_.clear();
@@ -259,8 +271,13 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         ++r.heat_credited;
     }
 
+    /* NO SWAPS BEHIND A PASS THE STAGER ARMED. Such a step is bound by its own copies -- every
+     * pooled expert of every routed layer crosses the link on the transfer stream a swap would
+     * share -- and the turnover slots a swap would land in are filled for it (below). The
+     * histograms are credited all the same, and the next step that stages nothing swaps on what
+     * they said. */
     std::vector<Swap> swaps;
-    if (r.heat.step(&swaps) < 0) return;
+    if (!r.stager.staged() && r.heat.step(&swaps) < 0) return;
     for (const Swap& s : swaps) {
         /* CONTRACT: every unit the engine named is BUSY on the way out, and a proposal that is
          * silently dropped leaves the pair busy forever. `issue` clears it; `abandon` is what
@@ -270,8 +287,25 @@ void Engine::tiering_dispatch(Rank& r, int step) {
 
     /* AFTER the swaps, because a swap is what the policy asked for and a fill is what the memory
      * allows: spending a move record on a fill that the next swap then needs would let a
-     * boundary the arbiter happens to be moving reorder the engine's own decisions. */
-    (void)r.mover.balance(&r.heat);
+     * boundary the arbiter happens to be moving reorder the engine's own decisions.
+     *
+     * Behind a staged pass the turnover slots are filled too: that step swaps nothing, and kept
+     * free they are residents its stager copies instead -- at TP2 a 160K-token prompt staged
+     * 9.6% more and ran 3-5% slower.
+     *
+     * AND THEY STAY FILLED UNTIL kTurnoverAfter STEPS IN A ROW HAVE STAGED NOTHING, idle ticks
+     * included. A prompt answered in a token or two -- or a pause before the next one -- would
+     * otherwise drop them and copy them straight back at the next prompt's first chunk, across the
+     * link the chunk stages over, and each round trip scatters the lent residents through the
+     * pool runs the stager coalesces its copies on: at TP2, 26K-token prompts back to back ran
+     * 33 copies a staged layer that way against 16 held, and the first prompt after a pause up to
+     * 0.4% slower. A decode run reaches the count in a few steps, and its swaps land in the working
+     * slots until it does. */
+    constexpr int kTurnoverAfter = 4;
+    r.unstaged_steps = r.stager.staged() ? 0 : r.unstaged_steps + 1;
+    const bool hold = r.unstaged_steps < kTurnoverAfter;
+    r.mover.hold_turnover(hold);
+    (void)r.mover.balance(&r.heat, !hold);
 }
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
@@ -318,7 +352,9 @@ void Engine::rank_loop(int index) {
                  * host synchronisation between them: it is more ops on the compute stream and not
                  * a second phase (spec §13). */
                 if (bst >= 0) {
-                    s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
+                    /* The scored rows first: the sampler may rewrite a row in place. */
+                    if (b->draft_pass == 0 && !score_rows_.empty()) s = issue_scored_rows(r);
+                    if (s >= 0) s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
                     if (s < 0) {
                         RAD_ERR("rank %d step %d: sampler: %s", index, b->step, rad_strerror(s));
                         step_status_.store(s, std::memory_order_release);
@@ -574,6 +610,7 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
+        if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
 
         /* THE SAMPLER'S HOST WORK, staged by this lambda either in front of the ranks or -- by
          * default, see build_mu_ in engine.h -- underneath them. It touches request state and the
@@ -1004,6 +1041,76 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* THE SCORED ROWS (Request::token_scores): the logits row at a scored prompt's last position, on
+ * its way to the host before the sampler can rewrite it in place. Three parts, on three threads'
+ * turns: which rows, decided with the rows themselves and while every rank is parked
+ * (stage_scored_rows); one copy a row on each rank's own stream, right ahead of its sampler
+ * (issue_scored_rows); and each request's ids read out of the staging after the step's one wait
+ * (collect_scored_rows), which is ahead of the commit that finishes the request. A whole row
+ * crosses, not the ids: one copy of 512 KB at a 128K vocabulary is cheaper than a copy an id. */
+int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
+    score_rows_.clear();
+    if (embedding_) return RAD_OK;
+    for (size_t i = 0; i < plan.e.size(); ++i) {
+        const Request* r = plan.e[i].req;
+        if (so.first_row[i] < 0 || !r || !r->token_scores || !r->output.empty()) continue;
+        score_rows_.push_back({ so.first_row[i], r->token_scores.get() });
+    }
+    if (score_rows_.empty()) return RAD_OK;
+    const int64_t n = (int64_t)score_rows_.size();
+    for (auto& rk : ranks_) {
+        if (n <= rk->score_rows_cap) continue;
+        if (ranks_.size() > 1) RAD_TRY(rad_dev_set(rk->device));
+        if (rk->score_host) rad_dev_free(rk->score_host, RAD_MEM_HOST_PINNED);
+        const int64_t width = rk->sampler.config().n_vocab_local;
+        rk->score_host = static_cast<float*>(
+            rad_dev_alloc(n * width * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
+        rk->score_rows_cap = rk->score_host ? n : 0;
+        if (!rk->score_host) {
+            RAD_ERR("scored rows: no pinned memory for %lld logits rows", (long long)n);
+            return RAD_E_NOMEM;
+        }
+    }
+    if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    return RAD_OK;
+}
+
+int Engine::issue_scored_rows(Rank& r) {
+    const int64_t width = r.sampler.config().n_vocab_local;
+    const char* logits = static_cast<const char*>(r.ctx.buf_ptr(r.program.logits_buf));
+    if (!logits || !r.score_host) return RAD_E_STATE;
+    for (size_t k = 0; k < score_rows_.size(); ++k)
+        RAD_TRY(rad_memcpy_async(r.score_host + (int64_t)k * width,
+                                 logits + (int64_t)score_rows_[k].first * width * 4,
+                                 width * 4, r.ctx.stream()));
+    return RAD_OK;
+}
+
+int Engine::collect_scored_rows() {
+    if (score_rows_.empty()) return RAD_OK;
+    /* step_end_ fences rank 0's stream; every other rank's copies are fenced here. */
+    for (size_t i = 1; i < ranks_.size(); ++i) {
+        RAD_TRY(rad_dev_set(ranks_[i]->device));
+        RAD_TRY(rad_stream_sync(ranks_[i]->ctx.stream()));
+    }
+    if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    for (size_t k = 0; k < score_rows_.size(); ++k) {
+        TokenScores& ts = *score_rows_[k].second;
+        ts.logits.assign(ts.tokens.size(), 0.0f);
+        for (size_t j = 0; j < ts.tokens.size(); ++j) {
+            const int64_t t = ts.tokens[j];
+            for (auto& rk : ranks_) {
+                const SamplerConfig& sc = rk->sampler.config();
+                if (t < sc.vocab_off || t >= sc.vocab_off + sc.n_vocab_local) continue;
+                ts.logits[j] = rk->score_host[(int64_t)k * sc.n_vocab_local + (t - sc.vocab_off)];
+                break;
+            }
+        }
+    }
+    score_rows_.clear();
+    return RAD_OK;
+}
+
 /* One sampled row's logprobs into the step's table, which is sized on the first row that asks.
  * A ROW WHOSE LOGPROBS CANNOT BE COMPUTED FAILS ITS REQUEST, NOT THE STEP: its numbers are not
  * finite (RAD_E_INVAL), so its entry is left at token -1 (TokenLogprobs), which the scheduler
@@ -1035,6 +1142,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     RAD_TRY(rad_event_sync(step_end_));
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
+    RAD_TRY(collect_scored_rows());
     const std::vector<float>& lg = so.lg;
     const int64_t nv = meta_.n_vocab;
     if (!lg.empty()) {
@@ -1281,6 +1389,10 @@ int Engine::arena_step(const RadBatch* b) {
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];
     if (arena_last_ >= arena_floor_) { arena_floor_ = arena_last_; arena_floor_ns_ = now; }
+    /* Whether the step after this one goes on with a prompt, for the stager to stage that step's
+     * first layers at this one's end. A step issued ahead is a decode step and the plan the
+     * scheduler holds is not its own, so it never says so. */
+    const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
@@ -1296,6 +1408,7 @@ int Engine::arena_step(const RadBatch* b) {
         RAD_TRY(r->ctx.set_level(level));
         /* The full plan lends nothing, so its top -- the staging region -- is the step's. */
         r->stager.set_full_arena(level == 0);
+        r->stager.set_next_prefill(more && level == 0);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     return RAD_OK;
@@ -1602,6 +1715,9 @@ int Engine::serve() {
         /* NO PREFIX CACHE: an encoder keeps no KV to reuse, and attending both ways means a
          * shared prefix does not even compute to the same rows. */
         cfg_.prefix_cache = false;
+        prefix_off_why_ = "an embedding model: an encoder keeps no KV to reuse, and attending both "
+                          "ways means a shared prefix does not compute to the same rows";
+        decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
         RAD_INFO("embedding model: %lld-wide pooled vectors, one step an input, up to %lld "
                  "tokens an input", (long long)pooled_dim_, (long long)cfg_.max_tok);
     }
@@ -1771,6 +1887,7 @@ int Engine::serve() {
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     std::thread stepper([this] { step_loop(); });
 
+    if (cfg_.kld()) print_startup_report(RAD_OK);
     int s = cfg_.kld() ? run_kld() : run_server();
 
     /* Stop the step loop before anything the server owns is destroyed: Request::sink is a raw
@@ -1952,9 +2069,13 @@ void on_signal(int) { g_signalled.store(true, std::memory_order_relaxed); }
  *   SamplingParams' own defaults            the untruncated floor
  *
  * Each source is consulted only if the one above it said nothing at all, so a deployment that
- * names a file gets that file's sampler and not a blend of it with the container's. */
+ * names a file gets that file's sampler and not a blend of it with the container's.
+ *
+ * `stated` and `source`, when given, receive what the source in force read and its name ("" for
+ * none): gen_sampling_sources turns the two into the reason for each field. */
 SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool container,
-                                         const Config& cfg) {
+                                         const Config& cfg, GenSampling* stated = nullptr,
+                                         std::string* source = nullptr) {
     GenSampling g;
     std::string src;
 
@@ -1999,6 +2120,8 @@ SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool containe
 
     const std::string from = src.empty() ? (over.empty() ? "nothing stated it" : "the command line")
                                          : src;
+    if (stated) *stated = g;
+    if (source) *source = src;
     RAD_INFO("sampling defaults for requests that send none: %s (from %s%s%s)",
              GenSampling::describe(sp).c_str(), from.c_str(),
              over.empty() || src.empty() ? "" : ", overridden by", over.c_str());
@@ -2166,6 +2289,7 @@ int Engine::run_server() {
                 s.experts.staged_units   = (int64_t)ms.staged_units;
                 s.experts.staged_bytes   = (int64_t)ms.staged_bytes;
                 s.experts.stage_overflow = (int64_t)ms.stage_overflow;
+                s.experts.stage_copies   = (int64_t)ms.stage_copies;
                 s.experts.flex_bytes    = ranks_[0]->mover.flex_used_bytes();
                 s.experts.flex_capacity = ranks_[0]->mover.flex_offered_bytes();
                 /* THE HEAT ENGINE'S OWN TALLY, which answers a different question from the
@@ -2290,6 +2414,7 @@ int Engine::run_server() {
 
     server::ServerOptions o{};
     o.embedding_model = embedding_;
+    o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
     o.host     = cfg_.host;
@@ -2299,12 +2424,27 @@ int Engine::run_server() {
     /* `n` fans one request out over the batch, so a server that runs more sequences a step takes
      * more choices a request; the floor keeps a small batch from refusing what it would queue. */
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
+    if (cfg_.max_n <= 0)
+        decide("--max-n", std::to_string(o.max_n), "the larger of 8 and --max-num-seqs");
     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     o.model_path = cfg_.model;
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.reasoning_effort_map = cfg_.reasoning_effort_map;
     o.default_thinking_budget = cfg_.thinking_token_budget;
-    o.default_sampling = resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
+    {
+        /* THE FOUR SAMPLER DEFAULTS A FILE CAN STATE, where no flag set them: the value served and,
+         * field by field, the file or metadata it came from. */
+        GenSampling stated;
+        std::string src;
+        o.default_sampling =
+            resolve_sampling_defaults(meta_, file_ != nullptr, cfg_, &stated, &src);
+        for (const GenFieldSource& f : gen_sampling_sources(stated, src, o.default_sampling, cfg_))
+            decide(f.flag, f.value, f.why);
+    }
+    if (cfg_.served_model_name.empty())
+        decide("--served-model-name", o.model_id,
+               meta_.name && *meta_.name ? "the name the container states"
+                                         : "the container states no name");
     o.default_dry_breakers_set = cfg_.sample_dry_seq_breakers.has_value();
     /* An embedding model samples nothing, so it has no logprobs to give. */
     o.supports_logprobs = !embedding_ && ranks_[0]->sampler.has_logprobs();
@@ -2323,7 +2463,10 @@ int Engine::run_server() {
     o.max_stop_bytes  = cfg_.max_stop_bytes;
     o.default_template_kwargs = cfg_.chat_template_kwargs;
     o.reasoning_format = cfg_.reasoning_format;
-    o.n_threads       = cfg_.http_threads;
+    o.n_threads       = server::idle_workers(cfg_.http_threads);
+    if (cfg_.http_threads <= 0)
+        decide("--http-threads", std::to_string(o.n_threads),
+               "one a hardware thread, at least 4");
     o.read_timeout_s  = cfg_.http_read_timeout_s;
     o.write_timeout_s = cfg_.http_write_timeout_s;
     o.keep_alive_timeout_s = cfg_.http_keep_alive_timeout_s;
@@ -2339,6 +2482,9 @@ int Engine::run_server() {
     /* Per request, not once: the dump carries OpInfo::issued, which only becomes true once the
      * run phase has run. See ServerOptions::graph_json. */
     o.graph_json  = [this] { return dump_graph_json(ranks_[0]->program); };
+    /* Read again for a request, from a reading at most a second old (Engine::diagnostics_json):
+     * the links and clocks it reports are only telling under load. */
+    o.diagnostics_json = [this] { return diagnostics_json(); };
 
     /* MEDIA, WHEN THE PROGRAM DECLARED AN ENCODER. The processor reads its geometry from the
      * container and the encoder states the one it was built for; the two meet at the patch width
@@ -2361,6 +2507,14 @@ int Engine::run_server() {
          * A TOKEN-BUDGET PROCESSOR (Gemma 4's) sizes images and frames by soft tokens, not pixel
          * bands: the band flags would do nothing on it, so they are refused by name, and the
          * budgets come from --image-tokens and --video-max-frame-tokens. */
+        /* LFM2-VL's processor takes pictures only, so the video flags would do nothing on it. */
+        if (vc.family == mm::Family::Lfm2 &&
+            (cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_min_frames ||
+             cfg_.video_max_frames || cfg_.video_fps || cfg_.video_max_frame_tokens)) {
+            RAD_ERR("media: this model's processor takes pictures, not video, so the --video-* "
+                    "flags do nothing on it");
+            return RAD_E_INVAL;
+        }
         if (vc.family == mm::Family::Gemma4) {
             if (cfg_.image_min_pixels || cfg_.image_max_pixels || cfg_.video_min_pixels ||
                 cfg_.video_max_pixels || cfg_.video_min_frames) {
@@ -2417,15 +2571,33 @@ int Engine::run_server() {
             return RAD_E_INVAL;
         }
         mm_proc = std::make_unique<mm::Processor>();
-        RAD_TRY(mm_proc->init(vc, [&tok_bridge](const std::string& t) {
-            return tok_bridge.encode(t, /*add_special=*/false, /*parse_special=*/false);
-        }));
+        const int pi = mm_proc->init(
+            vc,
+            [&tok_bridge](const std::string& t) {
+                return tok_bridge.encode(t, /*add_special=*/false, /*parse_special=*/false);
+            },
+            [this](const std::string& t) { return vocab_->find(t); });
+        if (pi < 0) {
+            RAD_ERR("media: the container's processor configuration does not fit this deployment "
+                    "or this vocabulary (a marker it names is missing, or a segment is larger "
+                    "than one encoder pass): %s", rad_strerror(pi));
+            return pi;
+        }
         o.allow_image = (encd.modalities & RAD_MM_IMAGE) != 0;
         o.allow_video = (encd.modalities & RAD_MM_VIDEO) != 0;
         if (!mm::decoder_available())
             RAD_WARN("media: the '%s' encoder is loaded but this build has no media decoder "
                      "(RAD_WITH_FFMPEG), so every media part will be refused",
                      ranks_[0]->program.encoder_name.c_str());
+        else if (mm_proc->config().family == mm::Family::Lfm2)
+            RAD_INFO("media: images through '%s'; a picture resizes to %lld..%lld pixels, or one "
+                     "past %g times that is cut into %d..%d tiles of %d pixels a side plus a "
+                     "thumbnail; %lld patches a pass", ranks_[0]->program.encoder_name.c_str(),
+                     (long long)mm_proc->config().image_min_pixels,
+                     (long long)mm_proc->config().image_max_pixels,
+                     mm_proc->config().max_pixels_tolerance, mm_proc->config().min_tiles,
+                     mm_proc->config().max_tiles, mm_proc->config().tile,
+                     (long long)encd.max_patches);
         else if (mm_proc->config().family == mm::Family::Gemma4)
             RAD_INFO("media: %s%s through '%s'; an image becomes at most %d soft tokens (a "
                      "request's image_tokens may ask for 70..1120), a video %d a frame at %.3g "
@@ -2483,6 +2655,8 @@ int Engine::run_server() {
                                           : "takes no images or video");
 
     server::Server srv(d, o);
+    if (cfg_.max_queued_requests <= 0)
+        decide("--max-queued-requests", std::to_string(srv.queue_cap()), "8 x --max-num-seqs");
 
     /* A TEMPLATE DEFAULT THE TEMPLATE REFUSES is a 400 on every chat request that leaves it to
      * the default, found by the first caller rather than the operator. --chat-template-kwargs
@@ -2530,6 +2704,7 @@ int Engine::run_server() {
                 why.c_str());
         return RAD_E_INVAL;
     }
+    print_startup_report(RAD_OK);
     if (embedding_)
         RAD_INFO("serving on http://%s:%d  (/v1/embeddings; completions and chat are 501)%s",
                  o.host.c_str(), o.port, o.api_key.empty() ? "" : "  -- a bearer key is required");

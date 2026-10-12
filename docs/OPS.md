@@ -165,6 +165,7 @@ adding a kernel plugin; "refused at load" names one op and leaves you to find th
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
+| `grid_embed_aa` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
 | `add` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `mul` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `silu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gate·up) |
@@ -492,6 +493,12 @@ what a separate tensor would hold, so the fused form is the unfused chain to the
 is `[4, M]` (row, column, grid height, grid width), sampled bilinearly with the grid's corners on the
 table's (align_corners), edge taps clamped, the four taps summed in f32 and rounded to `x`'s dtype
 before the add.
+
+**`grid_embed_aa`** is the same addition with SigLIP2's resample: torch's
+`F.interpolate(mode="bilinear", align_corners=False, antialias=True)`. Per axis a triangle filter on
+half-pixel centres, widened by the scale when the grid is smaller than the table, its taps inside the
+table normalised to sum to one; separable, f32, rounded once. A different function from
+`grid_embed`'s, and so a different op rather than a mode a library could ignore.
 
 | op | params | operands |
 |---|---|---|
@@ -910,6 +917,7 @@ form exists, as for `ar_hc_write`.
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
 | `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
+| `causal_conv1d` | `M`(range) `n` `width` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
 
 Separate from `gemm_nt` because `lm_head` is its own access class (`RAD_ACCESS_VOCAB`) and because
 the sampler wants to fuse against it: at a 151K vocab and batch 256 the logits are ~77 MiB a step,
@@ -1171,6 +1179,16 @@ it takes the union of the two contracts instead: `has_init` is prefill's questio
 
 The residual add is folded in because the reference is `gv + silu(conv(gvn))` and the two tensors
 are both `[M, hc*n]` — 10240 wide here. `resid` absent leaves the plain convolution.
+
+### `causal_conv1d`: `ple_conv` without the PLE
+
+    y[t] = sum_j w[c][j] * x[t - (width-1-j)]
+
+LFM2's short convolution: depthwise, causal, undilated, with no activation and no residual — the
+gates around it are separate `mul`s in the architecture. The window and its three optional operands
+are `ple_conv`'s at dilation one, so an architecture issues it the same way, once over its decode
+rows with `num_accepted` and once over its prefill rows without. libr4d, libref and libavx each
+serve both ops from one implementation.
 
 ## Sampling
 

@@ -20,6 +20,7 @@
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
 #include "runtime/arena.h"
+#include "runtime/xprefetch.h"
 #include "sample/gbnf.h"
 #include "sched/scheduler.h"
 #include "text/tokenizer.h"
@@ -166,9 +167,14 @@ static MissReport miss_report(const Program& p, bool host_backend) {
  * an APU machine -- and of those the ones sharing the first one's arch, and prints only what that
  * choice DID, rather than reprinting the backend's inventory. Which devices the backend shows at
  * all is the runtime's to say: ROCR_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES pick them. */
-static int usable_devices(std::vector<int>* out, std::string* inventory, std::string* note) {
+/* `names` receives every device's product name, indexed by device ("" where its properties could
+ * not be read), for the startup report's identification of the cards (Engine::identify_devices):
+ * the properties are read here once, and reading them again visits each device. */
+static int usable_devices(std::vector<int>* out, std::string* inventory, std::string* note,
+                          std::vector<std::string>* names) {
     const int n = rad_dev_count();
     if (n <= 0) return RAD_E_DEVICE;
+    names->assign((size_t)n, std::string());
 
     struct D { int i; std::string arch; bool igpu; };
     std::vector<D> all;
@@ -177,6 +183,7 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
     for (int i = 0; i < n; ++i) {
         RadDeviceProps p{};
         if (rad_dev_props(i, &p) < 0) continue;
+        (*names)[(size_t)i] = p.name;
         const bool igpu = dev_integrated(i);
         inv += fmt("%s%d:%s%s", i ? " " : "", i, p.arch, igpu ? "(integrated)" : "");
         all.push_back({ i, p.arch, igpu });
@@ -635,6 +642,13 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         RAD_INFO("placement: n-gram table (%s) %s%s: %s", humanb(ngram_bytes).c_str(),
                  table_placement_name(ng),
                  cfg_.ngram_placement == TablePlacement::Auto ? " (auto)" : "", ng_why.c_str());
+    decide("--embedding-placement", table_placement_name(emb),
+           emb_max > 0 ? fmt("the table is %s a rank: %s", humanb(emb_max).c_str(), emb_why.c_str())
+                       : emb_why);
+    has_ngram_ = ngram_bytes > 0;
+    decide("--ngram-placement", ngram_bytes > 0 ? table_placement_name(ng) : "n/a",
+           ngram_bytes > 0 ? fmt("the table is %s: %s", humanb(ngram_bytes).c_str(), ng_why.c_str())
+                           : std::string("this model has no n-gram table"));
     return RAD_OK;
 }
 
@@ -906,6 +920,10 @@ int Engine::declare() {
         cfg_.n_spec = 0;
         cfg_.prefix_cache = false;
         if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+        decide("--num-speculative-tokens", "0", "the KL mode scores the trunk's own rows");
+        prefix_off_why_ =
+            "the KL mode: a prefix hit would start a document past positions the reference holds";
+        decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
     if (cfg_.n_spec < 0) {
         RadArchProbe pb{};
@@ -916,6 +934,9 @@ int Engine::declare() {
                      "(--num-speculative-tokens N overrides it)", cfg_.n_spec);
         else
             RAD_INFO("speculation: off -- this container carries no draft head");
+        decide("--num-speculative-tokens", std::to_string(cfg_.n_spec),
+               cfg_.n_spec > 0 ? "the depth the drafter in this container states as its operating point"
+                               : "this container carries no draft head");
     }
     /* THE ENCODER'S PASS SIZE, resolved the same way and for the same reason: whether there is a
      * tower to size is a property of the model file. A container says so (`radiance.encoder`,
@@ -946,6 +967,13 @@ int Engine::declare() {
         if (cfg_.mm_max_patches == 0 && tower)
             RAD_INFO("media: off -- the checkpoint has a vision tower but this container was "
                      "converted without its weights; convert again to serve images and video");
+        decide("--mm-max-patches", std::to_string(cfg_.mm_max_patches),
+               cfg_.mm_max_patches > 0
+                   ? "the model carries a vision tower: 16384 patches is a 2048 x 2048 image, the "
+                     "largest one encoder pass takes"
+               : tower ? "the checkpoint has a vision tower but this container was converted "
+                         "without its weights"
+                       : "the model carries no vision tower");
     }
 
     std::vector<int>         st(ranks_.size(), RAD_OK);
@@ -1217,6 +1245,21 @@ int Engine::plan() {
                 for (RadStream s : q) if (s) rad_stream_destroy(s);
             }
             f.n_queues = 2 + (r->program.scratch_regions > 1 ? 1 : 0);
+            /* THE EXPERT PREFETCH'S STREAM, RING AND BUFFERS, where it can be on: a placement that
+             * keeps experts in a pinned pool, not --deterministic, on a backend with a DMA engine to
+             * spare for it (asked before the free figure below, so its queue there is already held). */
+            WeightFootprint xwf;
+            weight_footprint(r->program, &xwf, TablePlacement::Vram, TablePlacement::Disk, device_is_host(),
+                             file_ != nullptr);
+            if (xwf.routed && xwf.expert_unit_max > 0 && !cfg_.deterministic &&
+                (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device)) {
+                /* Counted as Ctx::bind_routing counts the routed layers: past the trunk where a head is. */
+                int64_t nl = r->program.meta.n_layers;
+                for (const WeightInfo& w : r->program.weights)
+                    if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
+                f.n_queues += 1;
+                f.prefetch = xp_device_bytes(xwf.expert_unit_max, nl);
+            }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
             f.capacity = props.vram_bytes;
@@ -1326,6 +1369,10 @@ int Engine::plan() {
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
+        decide("vram split",
+               fmt("weights %s (experts %s of it), KV cache %s, a card", humanb(vb.weights).c_str(),
+                   humanb(vb.experts).c_str(), humanb(vb.kv).c_str()),
+               vb.report);
         /* The staging region the budget took out of the experts, above everything the buffer plan
          * placed -- so it is at the top of the arena, the part the smaller levels lend. */
         if (vb.stage > 0)
@@ -1478,6 +1525,21 @@ int Engine::plan() {
         if (s < 0) return s;
         /* The slab the planner filled is the pool the mover will fill: one split, read twice. */
         RAD_TRY(plan_check_weights_pool(r->plan, r->pools.weights().bytes()));
+        if (r->index == 0) {
+            decide("--placement", strategy_name(r->plan.strategy),
+                   r->plan.strategy_why.empty() ? std::string("as asked") : r->plan.strategy_why);
+            const int64_t host = r->plan.totals.bytes[(int)Tier::HostPinned] +
+                                 r->plan.totals.bytes[(int)Tier::HostPageable];
+            decide("weights by tier",
+                   fmt("VRAM %s, host pool %s, container on disk %s, mapped %s (rank 0)",
+                       humanb(r->plan.totals.bytes[(int)Tier::VRAM]).c_str(), humanb(host).c_str(),
+                       humanb(r->plan.totals.bytes[(int)Tier::SSD]).c_str(),
+                       humanb(r->plan.totals.bytes[(int)Tier::Mapped]).c_str()),
+                   r->plan.embedding_host_used > 0
+                       ? fmt("the host pool holds the token embedding's %s beside the weights "
+                             "placed there", humanb(r->plan.embedding_host_used).c_str())
+                       : std::string());
+        }
         /* --host-pool-mib IS ONE NUMBER FOR EVERY RANK, allocated whole by Pools::configure, so a
          * re-split rank whose grown weights pool took every weight still holds it. Said, because
          * the `kv: rank N ...` line above reads as if that rank's memory were all accounted for. */
@@ -2511,6 +2573,10 @@ int Engine::load_weights() {
                              "(%s); it is read from the container%s", w.name.c_str(), into,
                              why.c_str(), card ? " by the host gather" : "");
                     cfg_.ngram_resolved = TablePlacement::Disk;
+                    decide("--ngram-placement", "disk",
+                           fmt("auto chose a %s copy in RAM, which could not be made (%s); the "
+                               "rows are read from the container%s", into, why.c_str(),
+                               card ? " by the host gather" : ""));
                 }
                 /* NO READAHEAD ON A MAPPED WEIGHT. What reads one is a host kernel gathering rows
                  * out of it, and the only reason a weight is on this tier at all is that it is far
@@ -2765,6 +2831,14 @@ int Engine::configure_kv() {
     /* Resolved once, for the cache below and for Scheduler::init later. Resolving it separately in
      * each is how the two come to disagree, and the interval is the field where that shows. */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
+    if (geo_.checkpoint_interval != cfg_.checkpoint_interval)
+        decide("--checkpoint-interval",
+               geo_.checkpoint_interval ? std::to_string(geo_.checkpoint_interval) : "0 (none)",
+               geo_.checkpoint_interval
+                   ? fmt("rounded up to a multiple of %lld tokens, the step quantum (the attention "
+                         "block and the linear-state chunk), so a checkpoint is a legal chunk split",
+                         (long long)geo_.quantum)
+                   : std::string("the model keeps no linear state to checkpoint"));
     /* ONE BLOCK TABLE SERVES EVERY RANK (serve() checks it), so every rank carves the SAME number
      * of paged blocks. The ranks' pools are not the same size under an uneven tensor-parallel
      * split -- a rank with more delta-net heads holds more recurrent state, a rank with zero
@@ -3231,8 +3305,13 @@ int Engine::start() {
      * are each attributed to the card they are about. At tp 1 there is nothing to disambiguate. */
     log_rank_tags(cfg_.tp > 1);
 
-    int s = usable_devices(&devs, &inventory, &devnote);
+    std::vector<std::string> dev_names;
+    int s = usable_devices(&devs, &inventory, &devnote, &dev_names);
+    /* Before any refusal below, so a report printed for a startup that stopped here still joins
+     * the runtime's devices to the machine's cards. */
+    identify_devices(dev_names);
     if (!devnote.empty()) RAD_WARN("device: %s", devnote.c_str());
+    devnote_ = devnote;
     if (s < 0) { RAD_ERR("no usable device"); return s; }
 
     if ((int)devs.size() < cfg_.tp) {
@@ -3242,12 +3321,29 @@ int Engine::start() {
     }
 
     RAD_TRY(read_metadata());
+    if (cfg_.max_ctx == 0)
+        decide("--max-model-len", std::to_string(meta_.n_ctx_train),
+               "the model's training context (--max-model-len 0)");
     RAD_TRY(load_vocab());
     /* The cards are chosen, so a kernel library's device code is checked against the ones the
      * ranks will run on and not against whichever device the backend happens to list first. */
     rad_tools_registry().set_code_device(devs[0]);
     rad_tools_registry().set_no_device_code(device_is_host());
     RAD_TRY(load_plugins());
+    {
+        /* THE LIBRARIES THAT LOADED, in the order that decides selection: what --kernels named, or
+         * every library the home holds when it named none. */
+        std::string libs;
+        for (const PluginId& p : plugins_.kernels)
+            libs += (libs.empty() ? "" : ",") + p.name + (p.version.empty() ? "" : "@" + p.version);
+        decide("--kernels", libs.empty() ? "none" : libs,
+               cfg_.kernel_hierarchy.empty()
+                   ? "every kernel library under --radiance-home, in the loader's order (a reference "
+                     "implementation last); architecture plugin " + plugins_.arch_plugin +
+                         (plugins_.arch_version.empty() ? "" : "@" + plugins_.arch_version)
+                   : "the libraries named, in that order; architecture plugin " + plugins_.arch_plugin +
+                         (plugins_.arch_version.empty() ? "" : "@" + plugins_.arch_version));
+    }
 
     ranks_.clear();
     for (int i = 0; i < cfg_.tp; ++i) {
@@ -3291,6 +3387,15 @@ int Engine::start() {
         const bool forced_off = cfg_.p2p == RAD_P2P_OFF;
         if (forced_off) p2p = 0;
         rad_tools_registry().set_device_fact(RAD_FACT_P2P, p2p);
+        p2p_measured_ = (int)p2p;
+        p2p_blocked_ = blocked;
+        if (cfg_.tp > 1)
+            decide("--p2p", p2p ? "peer to peer" : "through pinned host memory",
+                   p2p ? "the driver reports every pair of the ranks' cards can reach the other's memory"
+                   : forced_off ? "--p2p off"
+                                : "the driver reports no peer access between cards " + blocked);
+        else
+            decide("--p2p", "n/a", "one rank: no collective crosses a card");
         if (cfg_.tp > 1) {
             if (p2p) RAD_INFO("device: the %d cards reach each other's memory directly (peer to "
                               "peer)", cfg_.tp);
@@ -3317,6 +3422,27 @@ int Engine::start() {
      * implementation is a container that will serve at reference speed, and that is a decision the
      * operator makes rather than one the engine discovers three minutes into a load. */
     RAD_TRY(rad_gate_reference_kernels(ranks_[0]->program, cfg_.accept_reference_kernels, "serve"));
+    {
+        /* WHAT SELECTION CHOSE, in two lines a reader can compare across machines: how many of the
+         * declared op bands each library serves, and the attention rows by name -- the family whose
+         * choice moves with the card, the head width and the context. */
+        std::map<std::string, int> by_lib;
+        std::set<std::string> attn;
+        for (const OpInfo& op : ranks_[0]->program.ops)
+            for (const Band& b : op.bands)
+                for (int dm = 0; dm < RAD_N_DOMAINS; ++dm) {
+                    const KernelRow* row = b.dom[dm].row;
+                    if (!row || !row->info) continue;
+                    ++by_lib[row->plugin + (dm == RAD_DOMAIN_HOST ? " (host)" : "")];
+                    if (row->info->family && !std::strcmp(row->info->family, "attn"))
+                        attn.insert(op.op + " -> " + row->info->name);
+                }
+        std::string libs, rows;
+        for (const auto& [lib, n] : by_lib) libs += fmt("%s%s %d", libs.empty() ? "" : ", ", lib.c_str(), n);
+        for (const std::string& a : attn) rows += (rows.empty() ? "" : "\n") + a;
+        decide("kernel selection", libs.empty() ? "none" : libs + " op bands",
+               rows.empty() ? std::string() : "attention:\n" + rows);
+    }
 
     RAD_TRY(plan());
     RAD_TRY(load_weights());
@@ -3360,11 +3486,11 @@ int Engine::start() {
                                    (char*)r->ctx.arena_base() + r->program.arena_stage_off,
                                    r->program.arena_stage_bytes, top_level + 1));
             if (r->stager.enabled() && r->index == 0)
-                RAD_INFO("prefill staging: two %s buffers at the top of the arena; a step of "
-                         "more than %lld tokens copies the next of %zu routed layers' pooled "
-                         "experts onto the card while the one before it runs",
-                         humanb(r->stager.buffer_bytes()).c_str(), (long long)top_level,
-                         r->stager.n_layers());
+                RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
+                         "than %lld tokens copies the pooled experts of %zu routed layers onto "
+                         "the card up to %d layers ahead of the layers that read them",
+                         humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
+                         r->stager.n_layers(), (int)PrefillStager::lead());
         }
         /* THE FILE STAGER, wherever the plan put a routed expert on the file tier -- static plan
          * or dynamic, since a file-tier unit has no other address. */
@@ -3411,6 +3537,16 @@ int Engine::start() {
         RAD_TRY(r->mover.lend_from(Mover::kLendKV, strips));
         if (r->mover.flex_capacity() > 0) lending_ = true;
     }
+    /* THE NEXT-LAYER EXPERT PREFETCH, wherever the placement left experts in a pinned pool for a
+     * routed layer's GEMMs to read across the link (core/runtime/xprefetch.h). Its stream and ring are
+     * in the VRAM budget (xp_device_bytes, Engine::plan). Not under --deterministic, where nothing moves. */
+    if (!cfg_.deterministic)
+        for (auto& r : ranks_) {
+            RAD_TRY(rad_dev_set(r->device));
+            uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];
+            const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
+            if (n > 0) r->ctx.xp_open(lo, hi, st, n);
+        }
     (void)rad_dev_set(ranks_[0]->device);
 
     /* THE MOST THE CACHE CAN HOLD, said once in one line: the whole carve, with every block it lends
@@ -3430,6 +3566,15 @@ int Engine::start() {
         }
         const int64_t mlen = cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train;
         const int64_t lent = lending_ ? ranks_[0]->mover.flex_capacity() : 0;
+        if (bytes > 0)
+            decide("kv cache",
+                   fmt("%s a card: %lld tokens, %.1f sessions at %lld", humanb(bytes).c_str(),
+                       (long long)tokens, mlen > 0 ? (double)tokens / (double)mlen : 0.0,
+                       (long long)mlen),
+                   fmt("%s of it is per-sequence state; %s", humanb(state).c_str(),
+                       lent > 0 ? fmt("up to %s is lent to the experts while no request holds it",
+                                      humanb(lent).c_str()).c_str()
+                                : "nothing is lent: it is all the cache's"));
         if (bytes > 0)
             RAD_INFO("kv: the cache can grow to %s a card -- %lld tokens of context, %.1f sessions at "
                      "%lld -- with every block it lends the experts taken back; %s of that is "

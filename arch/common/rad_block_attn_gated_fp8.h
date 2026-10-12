@@ -168,6 +168,11 @@ struct AttnGatedFP8 {
                  bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* The pass's K and V into the cache and nothing else: no query, no attention, no output. What a
+     * pass that only leaves the layer's state behind asks for -- the MTP head's history pass over
+     * a prompt chunk with no row that drafts. The keys are the ones step() stores: the same
+     * projection, norm, rotation and store. */
+    void store_kv(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
@@ -468,6 +473,20 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                 {w.x, w.h.x}, {w.x});
 
     return RAD_OK;
+}
+
+inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
+    const int64_t T = batch->n_tok;
+    if (!ext_in) nq_h.step(c, T);
+    if (op_fill) return;                /* the attention-zero rank holds no heads to store */
+    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    const int32_t* slot = kvb ? kvb->slot_mapping : nullptr;
+    kp.step(c, w.h, w.k, T);
+    vp.step(c, w.h, w.v, T);
+    RAD_ISSUE_N(c, op_k_norm, T * g.n_head_kv, brows(w.k, T), RAD_W(w_k_norm), brows(w.k, T));
+    RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
+    RAD_ISSUE(c, op_kv_store,
+              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
 }
 
 inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch) const {

@@ -30,7 +30,65 @@ static bool soft_budget_ok(int32_t n) {
     return n == 70 || n == 140 || n == 280 || n == 560 || n == 1120;
 }
 
+/* A flag a container flattened from JSON: `true`/`false`, or a number. */
+static bool meta_bool(const RadModelMeta& m, const char* key, bool dflt) {
+    const char* v = rad_meta_gets(&m, key, nullptr);
+    if (!v || !*v) return dflt;
+    if (!std::strcmp(v, "true")) return true;
+    if (!std::strcmp(v, "false")) return false;
+    return std::strtol(v, nullptr, 10) != 0;
+}
+
 int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
+    /* LFM2-VL states its processor twice, in config.json and in processor_config.json's
+     * image_processor; the latter is what the reference processor reads, so it goes first. */
+    if (!std::strcmp(rad_meta_gets(&m, "model_type", ""), "lfm2_vl")) {
+        family = Family::Lfm2;
+        auto key = [](const char* k) { return std::string("processor.image_processor.") + k; };
+        auto geti = [&](const char* k, int64_t dflt) {
+            return rad_meta_geti(&m, key(k).c_str(), rad_meta_geti(&m, k, dflt));
+        };
+        auto getb = [&](const char* k, bool dflt) {
+            return meta_bool(m, key(k).c_str(), meta_bool(m, k, dflt));
+        };
+        patch    = (int32_t)geti("encoder_patch_size", rad_meta_geti(&m, "vision_config.patch_size", 0));
+        merge    = (int32_t)geti("downsample_factor", 0);
+        temporal = 1;
+        tok_image = (int32_t)rad_meta_geti(&m, "image_token_id", -1);
+        if (patch <= 0 || merge <= 0 || tok_image < 0) {
+            if (why) *why = "the container states no LFM2-VL processor geometry (encoder_patch_size, "
+                            "downsample_factor, image_token_id)";
+            return RAD_E_NOTFOUND;
+        }
+        const int64_t f2 = (int64_t)factor() * factor();
+        image_min_pixels = geti("min_image_tokens", 64) * f2;
+        image_max_pixels = geti("max_image_tokens", 256) * f2;
+        video_min_pixels = image_min_pixels;           /* no video; consistent for check() */
+        video_max_pixels = image_max_pixels;
+        /* The markers around a picture and before each tile are what the model was trained on;
+         * a checkpoint that turns them off spells its pictures differently, which is not served. */
+        if (!meta_bool(m, "use_image_special_tokens", true)) {
+            if (why) *why = "use_image_special_tokens is off; this processor writes LFM2-VL's "
+                            "picture markers and serves only the checkpoints that read them";
+            return RAD_E_UNSUPPORTED;
+        }
+        const bool split = getb("do_image_splitting", true);
+        min_tiles = split ? (int32_t)geti("min_tiles", 2) : 1;
+        max_tiles = split ? (int32_t)geti("max_tiles", 10) : 1;
+        tile      = (int32_t)geti("tile_size", 512);
+        use_thumbnail = getb("use_thumbnail", true);
+        max_pixels_tolerance = rad_meta_getf(&m, key("max_pixels_tolerance").c_str(),
+                                             rad_meta_getf(&m, "max_pixels_tolerance", 2.0));
+        max_segment_patches = geti("max_num_patches", 1024);
+        if (!read_triple(m, key("image_mean").c_str(), mean)) read_triple(m, "preprocessor.image_mean", mean);
+        if (!read_triple(m, key("image_std").c_str(), stdv)) read_triple(m, "preprocessor.image_std", stdv);
+        std::string bad;
+        if (check(&bad) < 0) {
+            if (why) *why = "the container's LFM2-VL processor configuration is inconsistent: " + bad;
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     const char* mt = rad_meta_gets(&m, "vision_config.model_type", "");
     if (mt && !std::strcmp(mt, "gemma4_vision")) {
         family   = Family::Gemma4;
@@ -138,6 +196,16 @@ int VisionConfig::check(std::string* why) const {
     if (max_frames < min_frames)
         return no("max_frames " + std::to_string(max_frames) + " is below min_frames " +
                   std::to_string(min_frames));
+    if (family == Family::Lfm2) {
+        if (min_tiles < 1 || max_tiles < min_tiles || tile <= 0 || tile % factor())
+            return no("the tiling (min_tiles " + std::to_string(min_tiles) + ", max_tiles " +
+                      std::to_string(max_tiles) + ", tile_size " + std::to_string(tile) +
+                      ") is not a range of whole merged patches");
+        if (!(max_pixels_tolerance > 0.0) || max_segment_patches <= 0)
+            return no("max_pixels_tolerance and max_num_patches must be positive");
+        for (int c = 0; c < 3; ++c)
+            if (!(stdv[c] > 0.0f)) return no("image_std must be positive");
+    }
     if (family == Family::Gemma4) {
         if (!soft_budget_ok(image_soft_tokens))
             return no("the image soft-token budget " + std::to_string(image_soft_tokens) +
@@ -307,20 +375,21 @@ inline double bicubic(double x) {
     return 0.0;
 }
 
-inline uint8_t clip8(int32_t v) {
-    const int32_t s = v >> kPrec;
+inline uint8_t clip8(int32_t v, int prec) {
+    const int32_t s = v >> prec;
     return (uint8_t)(s < 0 ? 0 : (s > 255 ? 255 : s));
 }
 
 /* One axis: `bounds` gets (first, count) per output pixel and `kk` its fixed-point weights, `ksize`
- * a row. */
+ * a row, `*prec` their fraction bits: PIL's fixed 22, or -- `torch` -- ATen's per-axis choice, the
+ * most bits at which the largest weight still fits an int16. */
 int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
-           std::vector<int32_t>* kk) {
+           std::vector<int32_t>* kk, bool torch, int* prec) {
     const double scale = (double)in_size / (double)out_size;
     const double fscale = scale < 1.0 ? 1.0 : scale;
     const double support = 2.0 * fscale;
     const int ksize = (int)std::ceil(support) * 2 + 1;
-    std::vector<double> k((size_t)ksize);
+    std::vector<double> k((size_t)ksize), w((size_t)out_size * (size_t)ksize, 0.0);
     bounds->assign((size_t)out_size * 2, 0);
     kk->assign((size_t)out_size * (size_t)ksize, 0);
     for (int xx = 0; xx < out_size; ++xx) {
@@ -341,24 +410,32 @@ int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
         for (x = 0; x < xmax; ++x)
             if (ww != 0.0) k[(size_t)x] /= ww;
         for (; x < ksize; ++x) k[(size_t)x] = 0.0;
-        for (x = 0; x < ksize; ++x) {
-            const double v = k[(size_t)x];
-            (*kk)[(size_t)xx * ksize + x] = v < 0 ? (int32_t)(-0.5 + v * (1 << kPrec))
-                                                  : (int32_t)(0.5 + v * (1 << kPrec));
-        }
+        for (x = 0; x < ksize; ++x) w[(size_t)xx * ksize + x] = k[(size_t)x];
         (*bounds)[(size_t)xx * 2]     = xmin;
         (*bounds)[(size_t)xx * 2 + 1] = xmax;
+    }
+    *prec = kPrec;
+    if (torch) {
+        double largest = 0.0;
+        for (double v : w) largest = std::max(largest, v);
+        for (*prec = 0; *prec < 22; ++*prec)
+            if ((int)(0.5 + largest * (1 << (*prec + 1))) >= (1 << 15)) break;
+    }
+    for (size_t i = 0; i < w.size(); ++i) {
+        const double v = w[i];
+        (*kk)[i] = v < 0 ? (int32_t)(-0.5 + v * (1 << *prec)) : (int32_t)(0.5 + v * (1 << *prec));
     }
     return ksize;
 }
 
 }  /* namespace */
 
-void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
+static void resize_bicubic_impl(const Frame& in, int32_t w, int32_t h, Frame* out, bool torch) {
     if (in.w == w && in.h == h) { *out = in; return; }
     std::vector<int32_t> bh, kh, bv, kv;
-    const int ksh = coeffs(in.w, w, &bh, &kh);
-    const int ksv = coeffs(in.h, h, &bv, &kv);
+    int ph = kPrec, pv = kPrec;
+    const int ksh = coeffs(in.w, w, &bh, &kh, torch, &ph);
+    const int ksv = coeffs(in.h, h, &bv, &kv, torch, &pv);
 
     /* The source rows the vertical pass reads, which is all the horizontal pass has to produce. */
     const int y_first = bv[0];
@@ -380,16 +457,16 @@ void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
             for (int xx = 0; xx < w; ++xx) {
                 const int xmin = bh[(size_t)xx * 2], xmax = bh[(size_t)xx * 2 + 1];
                 const int32_t* k = kh.data() + (size_t)xx * ksh;
-                int32_t s0 = 1 << (kPrec - 1), s1 = s0, s2 = s0;
+                int32_t s0 = 1 << (ph - 1), s1 = s0, s2 = s0;
                 for (int x = 0; x < xmax; ++x) {
                     const uint8_t* p = row + (size_t)(x + xmin) * 3;
                     s0 += p[0] * k[x];
                     s1 += p[1] * k[x];
                     s2 += p[2] * k[x];
                 }
-                o[xx * 3 + 0] = clip8(s0);
-                o[xx * 3 + 1] = clip8(s1);
-                o[xx * 3 + 2] = clip8(s2);
+                o[xx * 3 + 0] = clip8(s0, ph);
+                o[xx * 3 + 1] = clip8(s1, ph);
+                o[xx * 3 + 2] = clip8(s2, ph);
             }
         }
         src = &tmp;
@@ -404,18 +481,32 @@ void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
         const int32_t* k = kv.data() + (size_t)yy * ksv;
         uint8_t* o = out->rgb.data() + (size_t)yy * src->w * 3;
         for (int xx = 0; xx < src->w; ++xx) {
-            int32_t s0 = 1 << (kPrec - 1), s1 = s0, s2 = s0;
+            int32_t s0 = 1 << (pv - 1), s1 = s0, s2 = s0;
             for (int y = 0; y < ymax; ++y) {
                 const uint8_t* p = src->rgb.data() + ((size_t)(y + ymin) * src->w + xx) * 3;
                 s0 += p[0] * k[y];
                 s1 += p[1] * k[y];
                 s2 += p[2] * k[y];
             }
-            o[xx * 3 + 0] = clip8(s0);
-            o[xx * 3 + 1] = clip8(s1);
-            o[xx * 3 + 2] = clip8(s2);
+            o[xx * 3 + 0] = clip8(s0, pv);
+            o[xx * 3 + 1] = clip8(s1, pv);
+            o[xx * 3 + 2] = clip8(s2, pv);
         }
     }
+}
+
+void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
+    resize_bicubic_impl(in, w, h, out, false);
+}
+
+void resize_bicubic_torch(const Frame& in, int32_t w, int32_t h, Frame* out) {
+    resize_bicubic_impl(in, w, h, out, true);
+}
+
+void cap_area(const Frame& in, int64_t max_pixels, Frame* out) {
+    if (max_pixels <= 0 || (int64_t)in.w * in.h <= max_pixels) { *out = in; return; }
+    const double scale = std::sqrt((double)max_pixels / ((double)in.w * in.h));
+    resize_bicubic(in, std::max(1, (int)(in.w * scale)), std::max(1, (int)(in.h * scale)), out);
 }
 
 /* ================================================================== patches */
@@ -437,6 +528,10 @@ void content_key(const Item& it, uint64_t* hi, uint64_t* lo) {
                                                (uint64_t)it.grid_h << 21 ^ (uint64_t)it.grid_w);
     uint64_t b = 0xbb67ae8584caa73bull ^
                  mix64(it.kind == Kind::Image ? 1u : it.kind == Kind::Video ? 2u : 3u);
+    /* The tiling, when the segments have sizes of their own: the same patches cut differently
+     * are different encoder inputs. */
+    for (const Item::Segment& sg : it.segments)
+        a = mix64(a ^ ((uint64_t)(uint32_t)sg.h << 32 | (uint32_t)sg.w)) + (uint64_t)sg.patch0;
     const uint8_t* p = reinterpret_cast<const uint8_t*>(it.pixels.data());
     const size_t n = it.pixels.size() * sizeof(uint16_t);
     size_t i = 0;
@@ -536,10 +631,34 @@ void finish_item(const VisionConfig& c, Item* it) {
 /* ================================================================== the processor */
 
 int Processor::init(const VisionConfig& cfg,
-                    std::function<std::vector<int32_t>(const std::string&)> encode_text) {
+                    std::function<std::vector<int32_t>(const std::string&)> encode_text,
+                    std::function<int32_t(const std::string&)> token_id) {
     if (cfg.patch <= 0 || cfg.temporal <= 0 || cfg.merge <= 0 || cfg.max_patches <= 0)
         return RAD_E_INVAL;
     cfg_ = cfg;
+    if (cfg.family == Family::Lfm2) {
+        /* The markers are named, not numbered, in the config: resolved here, every one, so a
+         * vocabulary missing one is refused at startup rather than on the first large picture. */
+        if (!token_id) return RAD_E_INVAL;
+        cfg_.tok_start = token_id("<|image_start|>");
+        cfg_.tok_end   = token_id("<|image_end|>");
+        tok_thumbnail_ = token_id("<|img_thumbnail|>");
+        if (cfg_.tok_start < 0 || cfg_.tok_end < 0 || tok_thumbnail_ < 0) return RAD_E_NOTFOUND;
+        tok_tiles_.assign((size_t)cfg.max_tiles * cfg.max_tiles, -1);
+        for (int32_t r = 1; r <= cfg.max_tiles; ++r)
+            for (int32_t c = 1; r * c <= cfg.max_tiles; ++c) {
+                const int32_t id = token_id("<|img_row_" + std::to_string(r) + "_col_" +
+                                            std::to_string(c) + "|>");
+                if (id < 0) return RAD_E_NOTFOUND;
+                tok_tiles_[(size_t)(r - 1) * cfg.max_tiles + (c - 1)] = id;
+            }
+        /* A tile and the largest thumbnail are one segment each: of the tower and of a pass. */
+        const int64_t seg = std::max<int64_t>((int64_t)(cfg.tile / cfg.patch) * (cfg.tile / cfg.patch),
+                                              cfg.image_max_pixels / ((int64_t)cfg.patch * cfg.patch));
+        if (seg > cfg.max_patches || seg > cfg.max_segment_patches) return RAD_E_INVAL;
+        encode_text_ = std::move(encode_text);
+        return RAD_OK;
+    }
     if (cfg.family == Family::Gemma4) {
         /* A budget is a patch count, and an image is one segment of one pass. */
         if ((int64_t)cfg.image_soft_tokens * cfg.merge * cfg.merge > cfg.max_patches ||
@@ -559,9 +678,133 @@ int Processor::init(const VisionConfig& cfg,
     return RAD_OK;
 }
 
+void lfm2_size(int64_t h, int64_t w, int32_t factor, int64_t min_px, int64_t max_px,
+               int64_t* oh, int64_t* ow) {
+    const double f = factor;
+    int64_t hb = std::max<int64_t>(factor, pyround((double)h / f) * factor);
+    int64_t wb = std::max<int64_t>(factor, pyround((double)w / f) * factor);
+    if (hb * wb > max_px) {
+        const double beta = std::sqrt((double)(h * w) / (double)max_px);
+        hb = std::max<int64_t>(factor, (int64_t)std::floor((double)h / beta / f) * factor);
+        wb = std::max<int64_t>(factor, (int64_t)std::floor((double)w / beta / f) * factor);
+    } else if (hb * wb < min_px) {
+        const double beta = std::sqrt((double)min_px / (double)(h * w));
+        hb = (int64_t)std::ceil((double)h * beta / f) * factor;
+        wb = (int64_t)std::ceil((double)w * beta / f) * factor;
+    }
+    *oh = hb;
+    *ow = wb;
+}
+
+bool lfm2_too_large(int64_t h, int64_t w, int32_t patch, int32_t factor, int64_t max_px,
+                    double tolerance) {
+    const int64_t hb = std::max<int64_t>(patch, pyround((double)h / factor) * factor);
+    const int64_t wb = std::max<int64_t>(patch, pyround((double)w / factor) * factor);
+    return (double)(hb * wb) > (double)max_px * tolerance;
+}
+
+/* The reference walks the ratios sorted by tile count; within one count it orders them as a
+ * Python set happens to, which this walks by columns. The two can differ only on an exact tie
+ * between two grids of one count, both nearest. */
+void lfm2_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32_t tile,
+               int32_t* cols, int32_t* rows) {
+    const double aspect = (double)w / (double)h;
+    double best = INFINITY;
+    *cols = *rows = 1;
+    for (int32_t n = min_tiles; n <= max_tiles; ++n)
+        for (int32_t c = 1; c <= n; ++c) {
+            if (n % c) continue;
+            const int32_t r = n / c;
+            const double diff = std::fabs(aspect - (double)c / (double)r);
+            if (diff < best) {
+                best = diff; *cols = c; *rows = r;
+            } else if (diff == best && (double)(w * h) > 0.5 * tile * tile * (double)n) {
+                *cols = c; *rows = r;
+            }
+        }
+}
+
+/* LFM2-VL's image processor (transformers' Lfm2VlImageProcessor), segment by segment: the tiles
+ * in row-major order, then the thumbnail; within one, patches in merge-block order (each
+ * merge x merge block's patches consecutive, dy then dx -- which is how the projector's pixel
+ * unshuffle reads them, so its merge is a view), each patch (y, x, channel). */
+int Processor::image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    const int32_t F = c.factor(), P = c.patch, M = c.merge;
+    int64_t th = 0, tw = 0;
+    lfm2_size(f.h, f.w, F, c.image_min_pixels, c.image_max_pixels, &th, &tw);
+    const bool large = lfm2_too_large(f.h, f.w, P, F, c.image_max_pixels, c.max_pixels_tolerance);
+    int32_t cols = 1, rows = 1;
+    if (large && !(c.min_tiles == 1 && c.max_tiles == 1))
+        lfm2_grid(f.h, f.w, c.min_tiles, c.max_tiles, c.tile, &cols, &rows);
+    const bool tiled = cols * rows > 1;
+    if (th / P * (tw / P) > std::min(c.max_patches, c.max_segment_patches)) {
+        if (why) *why = "the picture's aspect ratio needs more patches than one encoder segment holds";
+        return RAD_E_INVAL;
+    }
+
+    uint16_t lut[3][256];
+    for (int ch = 0; ch < 3; ++ch)
+        for (int v = 0; v < 256; ++v)
+            lut[ch][v] = rad_f32_to_bf16(((float)v - 255.0f * c.mean[ch]) / (255.0f * c.stdv[ch]));
+
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Image;
+    it->patch_dim = c.patch_dim();
+    it->rope_1d = true;
+    it->expand.push_back(c.tok_start);
+    /* One segment of `frame`'s gh x gw patches from (x0, y0), its placeholders after `marker`. */
+    auto append = [&](const Frame& frame, int x0, int y0, int gh, int gw, int32_t marker) {
+        it->segments.push_back({ gh, gw, it->n_patch });
+        it->n_patch += (int64_t)gh * gw;
+        if (marker >= 0) it->expand.push_back(marker);
+        it->seg_at.push_back((int32_t)it->expand.size());
+        it->expand.insert(it->expand.end(), (size_t)gh * gw / (M * M), c.tok_image);
+        const size_t at = it->pixels.size();
+        it->pixels.resize(at + (size_t)gh * gw * it->patch_dim);
+        uint16_t* dst = it->pixels.data() + at;
+        for (int bh = 0; bh < gh / M; ++bh)
+            for (int bw = 0; bw < gw / M; ++bw)
+                for (int mh = 0; mh < M; ++mh)
+                    for (int mw = 0; mw < M; ++mw)
+                        for (int y = 0; y < P; ++y) {
+                            const uint8_t* row = frame.rgb.data() +
+                                ((size_t)(y0 + (bh * M + mh) * P + y) * frame.w +
+                                 x0 + (bw * M + mw) * P) * 3;
+                            for (int x = 0; x < 3 * P; ++x) *dst++ = lut[x % 3][row[x]];
+                        }
+    };
+    if (tiled) {
+        Frame big;
+        resize_bicubic_torch(f, cols * c.tile, rows * c.tile, &big);
+        const int g = c.tile / P;
+        for (int32_t r = 0; r < rows; ++r)
+            for (int32_t col = 0; col < cols; ++col)
+                append(big, col * c.tile, r * c.tile, g, g,
+                       tok_tiles_[(size_t)r * c.max_tiles + col]);
+    }
+    if (!tiled || c.use_thumbnail) {
+        Frame small;
+        resize_bicubic_torch(f, (int32_t)tw, (int32_t)th, &small);
+        append(small, 0, 0, (int)(th / P), (int)(tw / P), tiled ? tok_thumbnail_ : -1);
+    }
+    it->expand.push_back(c.tok_end);
+    it->n_seg = it->grid_t = (int32_t)it->segments.size();
+    it->grid_h = it->segments[0].h;
+    it->grid_w = it->segments[0].w;
+    it->rows_h = it->grid_h / M;
+    it->rows_w = it->grid_w / M;
+    it->seg_rows = it->rows_h * it->rows_w;
+    if (it->n_seg == 1) it->segments.clear();     /* one segment is the uniform form */
+    content_key(*it, &it->key_hi, &it->key_lo);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
     const VisionConfig& c = cfg_;
     if (c.family == Family::Gemma4) return image_gemma4(f, c.image_soft_tokens, out, why);
+    if (c.family == Family::Lfm2) return image_lfm2(f, out, why);
     int64_t h = 0, w = 0;
     RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
                                &h, &w, why));
@@ -745,7 +988,7 @@ int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::strin
 }
 
 int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
-                     std::shared_ptr<Item>* out, std::string* why) const {
+                     std::shared_ptr<Item>* out, std::string* why, int64_t max_pixels) const {
     if (image_tokens != 0) {
         if (cfg_.family != Family::Gemma4) {
             if (why) *why = "this model's processor sizes an image by its pixels, not by a token "
@@ -762,6 +1005,11 @@ int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
     }
     Frame f;
     RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+    if (max_pixels > 0 && (int64_t)f.w * f.h > max_pixels) {
+        Frame capped;
+        cap_area(f, max_pixels, &capped);
+        f = std::move(capped);
+    }
     if (cfg_.family == Family::Gemma4)
         return image_gemma4(f, image_tokens ? image_tokens : cfg_.image_soft_tokens, out, why);
     return image_from(f, out, why);
@@ -778,6 +1026,10 @@ std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
 
 int Processor::video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
                      std::string* why) const {
+    if (cfg_.family == Family::Lfm2) {
+        if (why) *why = "this model's processor takes pictures, not video";
+        return RAD_E_UNSUPPORTED;
+    }
     Video v;
     const SampleArgs a{ cfg_.fps, cfg_.min_frames, cfg_.max_frames,
                         cfg_.family == Family::Gemma4 };
@@ -1056,19 +1308,24 @@ void PromptMedia::layout() {
     for (size_t pi = 0; pi < items.size(); ++pi) {
         const Placed& p = items[pi];
         const Item& it = *p.item;
+        const int32_t m = it.rows_h > 0 ? it.grid_h / it.rows_h : 1;
         for (int32_t s = 0; s < it.n_seg; ++s) {
             const int64_t run_tok = (int64_t)p.tok + it.seg_at[(size_t)s];
             pos += run_tok - tok;            /* the text in front of the run counts up */
+            const int32_t rh = it.segments.empty() ? it.rows_h : it.seg_h(s) / m;
+            const int32_t rw = it.segments.empty() ? it.rows_w : it.seg_w(s) / m;
             RopeLayout::Run r;
             r.tok = (int32_t)run_tok;
-            r.n = it.seg_rows;
-            r.w = it.rows_w;
+            r.n = (int32_t)(it.row_at(s + 1) - it.row_at(s));
+            r.w = rw;
             r.base = (int32_t)pos;
-            pos += std::max(it.rows_h, it.rows_w);
-            tok = run_tok + it.seg_rows;
+            r.flat = it.rope_1d;
+            /* A grid advances the rotary by its longer side; a 1-D run by its length. */
+            pos += it.rope_1d ? r.n : std::max(rh, rw);
+            tok = run_tok + r.n;
             r.shift = (int32_t)(pos - tok);
             r.item = (int32_t)pi;
-            r.row0 = s * it.seg_rows;
+            r.row0 = (int32_t)it.row_at(s);
             rope.runs.push_back(r);
         }
     }

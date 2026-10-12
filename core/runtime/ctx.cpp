@@ -4,6 +4,7 @@
  */
 #include <vector>
 #include "ctx.h"
+#include "xp_state.h"
 #include "../device/device.h"
 
 #include <algorithm>
@@ -15,6 +16,7 @@ namespace rad {
 
 /* ================================================================== lifecycle */
 
+Ctx::Ctx() = default;
 Ctx::~Ctx() { shutdown(); }
 
 int Ctx::init(const CtxDesc& d) {
@@ -53,6 +55,7 @@ int Ctx::init(const CtxDesc& d) {
 
 void Ctx::shutdown() {
     oracle_close();
+    xp_close();
     /* The one host synchronisation in the whole component, and it is at teardown rather than on
      * the step path. Everything below frees memory the stream may still be reading or writing --
      * the routing staging is the destination of a copy nobody waited on by design (spec §5.5), and
@@ -342,6 +345,7 @@ int Ctx::bind_ops() {
     op_domain_ = std::vector<std::atomic<uint8_t>>(P.ops.size());
     band_table_.clear();
     issue_table_.clear();
+    gate_params_.clear();
 
     int64_t n_bands_total = 0, n_plans = 0;
     for (auto& o : P.ops) { n_bands_total += (int64_t)o.bands.size(); }
@@ -357,9 +361,9 @@ int Ctx::bind_ops() {
         p.n_bands  = (int32_t)oi.bands.size();
         p.plan_off = (int32_t)issue_table_.size();
         p.n_opd_schema = oi.schema ? (int32_t)oi.schema->n_operands : -1;
-        /* The one op whose issue costs interconnect bytes. Matched by name once, here, rather
-         * than on the issue path -- see OpPlan::collective. */
-        p.collective = (oi.op == "all_reduce");
+        /* Matched by name once, here, rather than on the issue path -- see OpPlan::billed. */
+        p.billed     = (oi.op == "all_reduce");
+        p.collective = p.billed;
 
         for (const Band& b : oi.bands) band_table_.push_back(b.hi);
 
@@ -370,6 +374,7 @@ int Ctx::bind_ops() {
                 if (r && r.row && r.row->info && r.row->info->launch) {
                     ip.row     = r.row;
                     ip.launch  = r.row->info->launch;
+                    if (r.row->collective) p.collective = true;
 
                     /* Bound once. args.p views the frozen geometry inside Program::ops, which is
                      * why declare must not touch a Resolved after this point: the vector would
@@ -383,6 +388,20 @@ int Ctx::bind_ops() {
                     ip.args.instance      = r.instance;
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
+                    /* A launch that ends its own hold on the link is handed the word the hold is
+                     * kept in, as one parameter more after the geometry's -- when it holds one. */
+                    if (r.row->releases_link)
+                        if (void* g = rad_link_gate(stream_)) {
+                            std::vector<RadParam>& v =
+                                gate_params_.emplace_back(ip.args.p, ip.args.p + ip.args.n_p);
+                            RadParam q{};
+                            q.key  = "link_gate";
+                            q.kind = RAD_P_INT;
+                            q.ival = (long long)(uintptr_t)g;
+                            v.push_back(q);
+                            ip.gate_p   = v.data();
+                            ip.gate_n_p = (int)v.size();
+                        }
 
                     if (r.scratch_bytes > arena_.scratch_bytes()) {
                         RAD_ERR("op '%s' band %lld kernel %s wants %s of scratch but the plan "
@@ -847,6 +866,7 @@ int Ctx::bind_profiling() {
     prof_calls_.assign(program_->ops.size(), 0);
     prof_host_.assign(program_->ops.size(), 0);
     prof_join_ms_.assign(program_->ops.size(), 0.0);
+    prof_wait_ms_.assign(program_->ops.size(), 0.0);
     if (!profiling_) return RAD_OK;
 
     /* Printed, not buried in a doc. Anyone reading a profiled run's numbers has to see this on the
@@ -888,12 +908,21 @@ void Ctx::profile_collect() {
         ++n_host_syncs_;                     /* counted, so the caveat is a number and not a claim */
         if (rad_stream_sync(stream_) < 0) prof_n_ = 0;
     }
+    /* The idle time before each op, per lane: the first op a lane runs in the step has nothing
+     * before it on that lane, and the gap from the last step is mostly this collection's own
+     * synchronisation, so it is not charged. */
+    const ProfSlot* prev[2] = { nullptr, nullptr };
     for (size_t i = 0; i < prof_n_; ++i) {
         ProfSlot& s = prof_ring_[i];
         float ms = 0.0f;
         if (rad_event_elapsed_ms(s.a, s.b, &ms) < 0) continue;
         prof_ms_[(size_t)s.op]    += (double)ms;
         prof_calls_[(size_t)s.op] += 1;
+        const ProfSlot*& p = prev[s.lane & 1];
+        float gap = 0.0f;
+        if (p && rad_event_elapsed_ms(p->b, s.a, &gap) >= 0 && gap > 0.0f)
+            prof_wait_ms_[(size_t)s.op] += (double)gap;
+        p = &s;
     }
     if (prof_overflowed_) {
         RAD_WARN("per-op timing: the step issued more than %zu ops; the tail was not timed",
@@ -912,9 +941,10 @@ void Ctx::dump_profile() const {
             "enabling this restores synchronisations that change the mover's slot supply.\n"
             "A row marked `host` was timed on the HOST CLOCK around a host-site launch and\n"
             "includes everything that call waited on -- page faults, link reads. The rest are\n"
-            "device event pairs around a kernel.\n\n"
-            "  %10s %12s %10s %5s %10s  %s\n", rank_, "calls", "total ms", "us/call", "site",
-            "join us", "op / geometry");
+            "device event pairs around a kernel. `wait us` is how long, a call, the op's lane\n"
+            "sat idle before it started -- stream waits and issue delays, in no op's time.\n\n"
+            "  %10s %12s %10s %5s %10s %10s  %s\n", rank_, "calls", "total ms", "us/call", "site",
+            "join us", "wait us", "op / geometry");
 
     /* Slowest first: the only ordering anybody reads this table in. */
     std::vector<size_t> order;
@@ -922,7 +952,7 @@ void Ctx::dump_profile() const {
     std::sort(order.begin(), order.end(),
               [&](size_t a, size_t b) { return prof_ms_[a] > prof_ms_[b]; });
 
-    double total = 0.0;
+    double total = 0.0, waited = 0.0;
     for (size_t i : order) {
         const OpInfo& o = program_->ops[i];
         const bool ho = i < prof_host_.size() && prof_host_[i];
@@ -936,13 +966,16 @@ void Ctx::dump_profile() const {
          * tied to anything. */
         const char* wname = !o.weights.empty() && o.weights[0] < program_->weights.size()
                                 ? program_->weights[o.weights[0]].name.c_str() : "-";
-        fprintf(stderr, "  %10lld %12.3f %10.2f %5s %s  %s  %s  #%d %s\n",
+        const double wait = i < prof_wait_ms_.size() ? prof_wait_ms_[i] : 0.0;
+        fprintf(stderr, "  %10lld %12.3f %10.2f %5s %s %10.2f  %s  %s  #%d %s\n",
                 (long long)prof_calls_[i], prof_ms_[i],
                 prof_ms_[i] * 1000.0 / (double)prof_calls_[i], ho ? "host" : "dev", jbuf,
+                wait * 1000.0 / (double)prof_calls_[i],
                 o.op.c_str(), o.base.str().c_str(), (int)o.index, wname);
         total += prof_ms_[i];
+        waited += wait;
     }
-    fprintf(stderr, "  %10s %12.3f\n\n", "total", total);
+    fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
 }
 
 /* ================================================================== the step driver */
@@ -1200,6 +1233,22 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
             same = std::memcmp(&x.t[k], &y.t[k], sizeof(RadTensor)) == 0;
         if (!same) { *why = fmt("host op %zu (op %u) differs", i, (unsigned)x.h); return false; }
     }
+    if (a.xp.size() != b.xp.size()) {
+        *why = fmt("%zu prefetch calls against %zu", a.xp.size(), b.xp.size());
+        return false;
+    }
+    for (size_t i = 0; i < a.xp.size(); ++i) {
+        const TapeXp& x = a.xp[i];
+        const TapeXp& y = b.xp[i];
+        const RadPrefetchNext& u = x.next;
+        const RadPrefetchNext& v = y.next;
+        if (u.layer != v.layer || u.router != v.router || u.n_expert != v.n_expert || u.top_k != v.top_k ||
+            u.n_parts != v.n_parts || u.parts != v.parts || u.count_at != v.count_at || x.h != y.h ||
+            x.r0 != y.r0 || x.rows != y.rows || x.n_embd != y.n_embd) {
+            *why = fmt("prefetch call %zu (for layer %d) differs", i, x.next.layer);
+            return false;
+        }
+    }
     for (size_t i = 0; i < a.route.size(); ++i)
         if (a.route[i].first != b.route[i].first ||
             std::memcmp(&a.route[i].second, &b.route[i].second, sizeof(RadRouting)) != 0) {
@@ -1247,6 +1296,23 @@ int Ctx::play_pass(PassTape& t) {
         case kTapeRoute:
             rc = route_report_impl(t.route[(size_t)st.a].first, &t.route[(size_t)st.a].second,
                                    false);
+            break;
+        case kTapeXp: {
+            const TapeXp& p = t.xp[(size_t)st.a];
+            lane_ = st.lane;
+            rc = xp_ ? xp_predict_run(p.next, p.h, p.r0, p.rows, p.n_embd) : RAD_OK;
+            lane_ = l0;
+            break;
+        }
+        case kTapeXpMark:
+            lane_ = st.lane;
+            rc = xp_ ? xp_mark_run() : RAD_OK;
+            lane_ = l0;
+            break;
+        case kTapeXpStep:
+            lane_ = st.lane;
+            rc = xp_ ? xp_step_run(st.a) : RAD_OK;
+            lane_ = l0;
             break;
         }
         if (rc < 0) {
@@ -1350,6 +1416,11 @@ int Ctx::run_step(const RadBatch* b) {
         return RAD_E_STATE;
     }
 
+    /* BEFORE THE RESIDENCY SYNC: a stager may give back weights it published for this pass when
+     * it turns the pass down (runtime/stager.h), and the sync is what carries that into the
+     * tables the pass resolves. */
+    staging_ = stager_ != nullptr && stager_->begin_pass(b);
+
     /* The mover relocates between steps, never during one. Honouring WeightInfo::generation here
      * costs one relaxed atomic load per step instead of one per weight per issue. */
     if (weights_dirty_.exchange(false, std::memory_order_acq_rel))
@@ -1361,8 +1432,6 @@ int Ctx::run_step(const RadBatch* b) {
     step_fail_.clear();
     prof_n_      = 0;
     in_step_     = true;
-
-    staging_ = stager_ != nullptr && stager_->begin_pass(b);
     {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;

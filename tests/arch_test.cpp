@@ -306,6 +306,14 @@ extern "C" int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert) {
     (void)c; (void)layer; (void)n_expert;
     return nullptr;
 }
+/* No prefetch here: the three calls are the no-ops a core without one makes them. */
+extern "C" int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64_t r0,
+                                   int64_t rows, int64_t n_embd) {
+    (void)c; (void)next; (void)h; (void)r0; (void)rows; (void)n_embd;
+    return RAD_OK;
+}
+extern "C" int rad_expert_prefetch_mark(RadCtx* c) { (void)c; return RAD_OK; }
+extern "C" int rad_expert_prefetch_step(RadCtx* c, int layer) { (void)c; (void)layer; return RAD_OK; }
 /* Non-null and distinct per handle: a plugin only passes these through to rad_route_report. */
 extern "C" void* rad_weight_ptr(RadCtx* c, rad_weight w) { (void)c; return (void*)(uintptr_t)(w * 64 + 8); }
 extern "C" void* rad_buf_ptr   (RadCtx* c, rad_buf    b) { (void)c; return (void*)(uintptr_t)(b * 64 + 16); }
@@ -316,6 +324,8 @@ extern "C" void* rad_buf_ptr   (RadCtx* c, rad_buf    b) { (void)c; return (void
 #include "../arch/qwen4exp_fp8/qwen4exp_fp8.cpp"
 /* And the LLaMA family, for how it reads its rotary scaling. */
 #include "../arch/llama_fp8/llama_fp8.cpp"
+/* And LFM2, whose layer schedule and short convolution are its own. */
+#include "../arch/lfm2_bf16/lfm2_bf16.cpp"
 /* The PLE block on its own: no architecture in this file declares it, and what its step() hands
  * the two windowed ops is a contract of its own (rad_block_ple.h). */
 #include <arch/rad_block_ple.h>
@@ -3085,4 +3095,347 @@ TEST(the_per_expert_tap_keeps_each_experts_gram_whole) {
         for (int64_t x = 0; x < k * k; ++x) bad += got[(size_t)x] != want[(size_t)(e * k * k + x)];
     }
     CHECK_EQ(bad, 0);
+}
+
+/* ==================================================================== LFM2 */
+namespace {
+
+/* d1-3B's graph cut to four layers: conv, conv, attention, conv -- an irregular schedule the
+ * plugin must read, not derive. A VL checkpoint (it has a text_config), tied head. */
+const char* k_lfm2_keys[] = { "text_config.num_hidden_layers", "layer_types", "conv_L_cache",
+                              "tie_word_embeddings" };
+const char* k_lfm2_vals[] = { "4", "conv conv full_attention conv", "3", "true" };
+
+RadModelMeta lfm2_meta(int n_kv = 4) {
+    RadModelMeta m{};
+    m.arch_id = "lfm2"; m.name = "test-lfm2"; m.quant = "";
+    m.n_layers = 4; m.n_embd = 64; m.n_head = 4; m.n_head_kv = 1; m.head_dim = 16;
+    m.n_ff = 128; m.n_vocab = 512; m.n_ctx_train = 32768;
+    m.rms_eps = 1e-5f; m.rope_theta = 1e6f; m.rope_scale = 1.0f;
+    m.n_kv = n_kv; m.kv_key = k_lfm2_keys; m.kv_val = k_lfm2_vals;
+    return m;
+}
+
+std::vector<std::string> lfm2_layer_ops(bool attention) {
+    std::vector<std::string> v = { "rmsnorm" };
+    if (attention) {
+        for (const char* s : { "gemm_nt", "gemm_nt", "gemm_nt", "rmsnorm", "rmsnorm", "rope",
+                               "rope", "attn_paged", "kv_store", "gemm_nt" })
+            v.push_back(s);
+    } else {
+        for (const char* s : { "gemm_nt", "mul", "causal_conv1d", "mul", "gemm_nt" })
+            v.push_back(s);
+    }
+    v.push_back("add");
+    append(v, mlp_ops(false));
+    return v;
+}
+
+}  /* namespace */
+
+TEST(lfm2_declares_the_checkpoints_own_schedule) {
+    RadBuilder b;
+    RadModelMeta meta = lfm2_meta();
+    RadBuildCtx ctx = build_ctx();
+    CHECK_OK(lfm2_bf16::declare(&b, &meta, &ctx));
+
+    std::vector<std::string> want = { "embed_lookup" };
+    for (bool att : { false, false, true, false }) append(want, lfm2_layer_ops(att));
+    for (const char* s : { "gather_rows", "rmsnorm", "logits_gemm" }) want.push_back(s);
+    CHECK_EQ(join(op_names(b)), join(want));
+
+    /* Two state groups: paged KV bound to the one attention layer, and a conv window of
+     * n_embd channels and the checkpoint's width bound to the other three. */
+    REQUIRE(b.kv_groups.size() == 2);
+    CHECK_EQ(b.kv_groups[0].d.kind, (int)RAD_KV_FULL);
+    CHECK_EQ(b.kv_groups[1].d.kind, (int)RAD_KV_CONV);
+    CHECK_EQ(b.kv_groups[1].d.conv_width, (int64_t)3);
+    CHECK_EQ(b.kv_groups[1].d.n_head_kv * b.kv_groups[1].d.head_dim, (int64_t)64);
+    REQUIRE(b.binds.size() == 4);
+    for (const auto& bd : b.binds)
+        CHECK_EQ(bd.second, bd.first == 2 ? (rad_kvgroup)1 : (rad_kvgroup)2);
+
+    /* A plain RMSNorm at the checkpoint's epsilon, NeoX over the whole head. */
+    const RecOp* norm = find_op(b, "rmsnorm");
+    CHECK_NEAR(pflt(norm, "eps"), 1e-5, 1e-9);
+    CHECK_EQ(param(norm, "wadd") ? pflt(norm, "wadd") : 0.0, 0.0);
+    CHECK_EQ(pstr(find_op(b, "rope"), "mode"), "neox");
+    CHECK_EQ(pint(find_op(b, "rope"), "rotary_dim"), 16);
+    CHECK_EQ(pint(find_op(b, "attn_paged"), "gqa"), 4);
+    CHECK_EQ(pint(find_op(b, "causal_conv1d"), "width"), 3);
+
+    /* The VL checkpoint's names, and a tied head read from the embedding when there is no
+     * lm_head of its own. */
+    const RecMap* in = find_map(b, "blk.0.conv_in.weight");
+    REQUIRE(in != nullptr);
+    CHECK_EQ(in->src[0], "model.language_model.layers.0.conv.in_proj.weight");
+    const RecMap* head = find_map(b, "output.weight");
+    REQUIRE(head != nullptr && head->src.size() == 2);
+    CHECK_EQ(head->src[0], "lm_head.weight");
+    CHECK_EQ(head->src[1], "model.language_model.embed_tokens.weight");
+}
+
+TEST(lfm2_text_checkpoint_keeps_its_names_under_model) {
+    /* No text_config: a text-only LFM2, whose layers sit under `model.` */
+    static const char* keys[] = { "layer_types", "conv_L_cache" };
+    static const char* vals[] = { "conv conv full_attention conv", "3" };
+    RadBuilder b;
+    RadModelMeta meta = lfm2_meta();
+    meta.n_kv = 2; meta.kv_key = keys; meta.kv_val = vals;
+    RadBuildCtx ctx = build_ctx();
+    CHECK_OK(lfm2_bf16::declare(&b, &meta, &ctx));
+    const RecMap* q = find_map(b, "blk.2.attn_q.weight");
+    REQUIRE(q != nullptr);
+    CHECK_EQ(q->src[0], "model.layers.2.self_attn.q_proj.weight");
+}
+
+TEST(lfm2_refuses_what_it_does_not_serve) {
+    {
+        RadBuilder b;
+        RadModelMeta meta = lfm2_meta(1);   /* no layer_types */
+        RadBuildCtx ctx = build_ctx();
+        CHECK(lfm2_bf16::declare(&b, &meta, &ctx) < 0);
+    }
+    {
+        RadBuilder b;
+        RadModelMeta meta = lfm2_meta();
+        RadBuildCtx ctx = build_ctx(0, 2);
+        CHECK_EQ(lfm2_bf16::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+    }
+    {
+        static const char* keys[] = { "layer_types", "conv_L_cache" };
+        static const char* vals[] = { "conv sliding_attention conv conv", "3" };
+        RadBuilder b;
+        RadModelMeta meta = lfm2_meta();
+        meta.n_kv = 2; meta.kv_key = keys; meta.kv_val = vals;
+        RadBuildCtx ctx = build_ctx();
+        CHECK_EQ(lfm2_bf16::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+    }
+}
+
+TEST(lfm2_issues_the_convolution_once_per_half_of_a_mixed_step) {
+    RadBuilder b;
+    RadModelMeta meta = lfm2_meta();
+    RadBuildCtx ctx = build_ctx();
+    CHECK_OK(lfm2_bf16::declare(&b, &meta, &ctx));
+
+    /* Two decode rows (a verify of 3 and a plain decode) and one prefill chunk of 5. */
+    static const int32_t tok[9]  = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    static const int32_t pos[9]  = { 40, 41, 42, 30, 0, 1, 2, 3, 4 };
+    static const int32_t cu[4]   = { 0, 3, 4, 9 };
+    static const int32_t ctxl[3] = { 40, 30, 0 };
+    static const int32_t nacc[3] = { 2, 1, 1 };
+    static const int32_t out[3]  = { 2, 3, 8 };
+    static int32_t cv_idx[3] = { 4, 5, 6 };
+    RadKVGroupBatch kv[2]{};
+    kv[0].group = lfm2_bf16::g_model[0].kv_attn;
+    kv[1].group = lfm2_bf16::g_model[0].kv_conv; kv[1].state_index = cv_idx;
+    RadBatch mixed{};
+    mixed.phase = RAD_PHASE_MIXED;
+    mixed.n_tok = 9; mixed.n_seq = 3; mixed.max_q_len = 5;
+    mixed.n_seq_decode = 2; mixed.n_tok_decode = 4;
+    mixed.token_ids = tok; mixed.positions = pos; mixed.cu_seqlens = cu; mixed.ctx_lens = ctxl;
+    mixed.num_accepted = nacc; mixed.n_out = 3; mixed.out_ids = out;
+    mixed.n_kv_groups = 2; mixed.kv = kv;
+
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 1; c.batch = &mixed;
+    lfm2_bf16::step(&c, &mixed);
+    CHECK(c.step_fail.empty());
+
+    int convs = 0;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o) continue;
+        if (o->op == "mul" && i.opd.size() == 3 && i.opd[0].cols > 0) {
+            /* conv(B * x): the B and x thirds of the [B | C | x] row, as column slices. */
+            if (i.opd[1].cols > 0) {
+                CHECK_EQ(i.opd[0].offset, (int64_t)0);
+                CHECK_EQ(i.opd[1].offset, (int64_t)128);
+            } else {
+                CHECK_EQ(i.opd[0].offset, (int64_t)64);    /* C * conv(...) */
+            }
+            CHECK_EQ(i.opd[0].cols, (int64_t)64);
+        }
+        if (o->op != "causal_conv1d") continue;
+        REQUIRE(i.opd.size() == 8);
+        if (convs++ % 2 == 0) {      /* the decode half */
+            CHECK_EQ(i.n, (int64_t)4);
+            CHECK_EQ(i.opd[0].rows, (int64_t)4);
+            CHECK(i.opd[3].raw == (void*)cu);         CHECK_EQ(i.opd[3].rows, (int64_t)3);
+            CHECK(i.opd[4].raw == (void*)cv_idx);
+            CHECK(i.opd[6].raw == (void*)nacc);
+        } else {                     /* the prefill half: arrays from D, rows from the base */
+            CHECK_EQ(i.n, (int64_t)9);
+            CHECK_EQ(i.opd[0].rows, (int64_t)9);
+            CHECK(i.opd[3].raw == (void*)(cu + 2));   CHECK_EQ(i.opd[3].rows, (int64_t)2);
+            CHECK(i.opd[4].raw == (void*)(cv_idx + 2));
+            CHECK(i.opd[5].raw == (void*)(ctxl + 2));
+            CHECK_EQ(i.opd[6].kind, (uint8_t)RAD_OPK_NONE);
+        }
+    }
+    CHECK_EQ(convs, 6);   /* three conv layers, two halves each */
+}
+
+/* ==================================================================== LFM2-VL's tower */
+namespace {
+
+/* lfm2_meta's text model under a SigLIP2 tower cut to two layers of 64 (four heads of 16), d1's
+ * patch, position table and unshuffle, a 96-wide projector. */
+const char* k_lfm2vl_keys[] = { "text_config.num_hidden_layers", "layer_types", "conv_L_cache",
+                                "tie_word_embeddings", "vision_config.model_type",
+                                "vision_config.num_hidden_layers", "vision_config.hidden_size",
+                                "vision_config.num_attention_heads", "vision_config.intermediate_size",
+                                "vision_config.patch_size", "vision_config.num_patches",
+                                "vision_config.hidden_act", "vision_config.vision_use_head",
+                                "downsample_factor", "projector_hidden_size",
+                                "projector_hidden_act", "projector_bias",
+                                "projector_use_layernorm", "max_num_patches" };
+const char* k_lfm2vl_vals[] = { "4", "conv conv full_attention conv", "3", "true",
+                                "siglip2_vision_model", "2", "64", "4", "128", "16", "256",
+                                "gelu_pytorch_tanh", "false", "2", "96", "gelu", "true", "false",
+                                "1024" };
+const char* k_lfm2vl_norm_vals[] = { "4", "conv conv full_attention conv", "3", "true",
+                                     "siglip2_vision_model", "2", "64", "4", "128", "16", "256",
+                                     "gelu_pytorch_tanh", "false", "2", "96", "gelu", "true", "true",
+                                     "1024" };
+
+RadModelMeta lfm2vl_meta(bool proj_norm = false) {
+    RadModelMeta m = lfm2_meta();
+    m.n_kv = (int)(sizeof(k_lfm2vl_keys) / sizeof(k_lfm2vl_keys[0]));
+    m.kv_key = k_lfm2vl_keys;
+    m.kv_val = proj_norm ? k_lfm2vl_norm_vals : k_lfm2vl_vals;
+    return m;
+}
+
+}  /* namespace */
+
+TEST(lfm2_vl_declares_the_siglip2_tower_and_its_projector) {
+    {   /* No encoder budget: text only, whatever the container carries. */
+        RadBuilder b;
+        RadModelMeta meta = lfm2vl_meta();
+        RadBuildCtx ctx = vl_ctx(0);
+        CHECK_OK(lfm2_bf16::declare(&b, &meta, &ctx));
+        CHECK(b.encoder_name.empty());
+        CHECK_EQ(count_op(b, "scatter_rows"), 0);
+    }
+    RadBuilder b;
+    RadModelMeta meta = lfm2vl_meta();
+    RadBuildCtx ctx = vl_ctx(1024);
+    CHECK_OK(lfm2_bf16::declare(&b, &meta, &ctx));
+    CHECK_EQ(b.encoder_name, std::string("vision"));
+    CHECK_EQ(b.encoder.modalities, (uint32_t)RAD_MM_IMAGE);
+    CHECK_EQ(b.encoder.patch_dim, 3 * 16 * 16);
+    CHECK_EQ(b.encoder.merge, 4);
+    CHECK_EQ(b.encoder.max_patches, 1024);
+    CHECK_EQ(b.encoder.n_embd, 64);
+    CHECK_EQ(count_op(b, "scatter_rows"), 1);
+
+    /* 3 stem + 12 a layer + 2 post-norm + 4 projector, each mapped from the checkpoint. */
+    int nv = 0;
+    for (const auto& w : b.weights)
+        if (w.name.rfind("v.", 0) == 0) {
+            ++nv;
+            CHECK(find_map(b, w.name) != nullptr);
+        }
+    CHECK_EQ(nv, 3 + 2 * 12 + 2 + 4);
+    /* q, k and v are concatenated at convert into one QKV weight and one bias. */
+    const RecMap* qkv = find_map(b, "v.blk.1.qkv.weight");
+    REQUIRE(qkv != nullptr);
+    REQUIRE_EQ(qkv->src.size(), (size_t)3);
+    CHECK_EQ(qkv->src[0],
+             std::string("model.vision_tower.vision_model.encoder.layers.1.self_attn.q_proj.weight"));
+    CHECK_EQ(qkv->src[2],
+             std::string("model.vision_tower.vision_model.encoder.layers.1.self_attn.v_proj.weight"));
+    const RecMap* l1 = find_map(b, "v.proj.fc1.weight");
+    REQUIRE(l1 != nullptr);
+    CHECK_EQ(l1->src[0], std::string("model.multi_modal_projector.linear_1.weight"));
+    /* The projector reads four patches as one row; its first layer is erf GELU, the tower's tanh. */
+    const RecWeight* w1 = find_w(b, "v.proj.fc1.weight");
+    REQUIRE(w1 != nullptr);
+    CHECK_EQ(w1->d.shape[0], 96);
+    CHECK_EQ(w1->d.shape[1], 4 * 64);
+    int tanh = 0, erf = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "gemm_nt_bias") {
+            tanh += pstr(&o, "act") == "gelu_tanh";
+            erf += pstr(&o, "act") == "gelu";
+        }
+    CHECK_EQ(tanh, 2);
+    CHECK_EQ(erf, 1);
+    /* No rotary in the tower, the position table resampled as torch's antialiased bilinear, and
+     * the attention's block height bounded by the longest segment the processor makes. */
+    CHECK_EQ(count_op(b, "grid_embed_aa"), 1);
+    CHECK_EQ(count_op(b, "grid_embed"), 0);
+    CHECK_EQ(pint(find_op(b, "attn_dense"), "max_seqlen"), 1024);
+    CHECK_EQ(pint(find_op(b, "attn_dense"), "head_dim"), 16);
+
+    /* A projector with its layer norm declares one over the merged rows. */
+    RadBuilder bn;
+    RadModelMeta mn = lfm2vl_meta(true);
+    CHECK_OK(lfm2_bf16::declare(&bn, &mn, &ctx));
+    CHECK(find_w(bn, "v.proj.norm.weight") != nullptr);
+    CHECK_EQ(count_op(bn, "layernorm"), count_op(b, "layernorm") + 1);
+}
+
+TEST(lfm2_vl_encoder_pass_and_the_rows_it_scatters) {
+    RadBuilder b;
+    RadModelMeta meta = lfm2vl_meta();
+    RadBuildCtx ctx = vl_ctx(1024);
+    CHECK_OK(lfm2_bf16::declare(&b, &meta, &ctx));
+
+    /* A tile of 8 x 8 patches and a thumbnail of 4 x 8. */
+    static uint16_t pix[96 * 768];
+    static int32_t  coord[4 * 96];
+    static const int32_t cu[] = { 0, 64, 96 };
+    RadBatch batch{};
+    batch.enc         = RAD_MM_IMAGE;
+    batch.enc_n_patch = 96;
+    batch.enc_pixels  = pix;
+    batch.enc_coord   = coord;
+    batch.enc_n_seg   = 2;
+    batch.enc_cu      = cu;
+    batch.enc_max_seg = 64;
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 1; c.batch = &batch;
+    lfm2_bf16::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    std::vector<std::string> want = { "gemm_nt_bias", "grid_embed_aa" };
+    for (int l = 0; l < 2; ++l)
+        for (const char* s : { "layernorm", "gemm_nt_bias", "attn_dense", "gemm_nt_bias",
+                               "layernorm", "gemm_nt_bias", "gemm_nt_bias" })
+            want.push_back(s);
+    for (const char* s : { "layernorm", "gemm_nt_bias", "gemm_nt_bias" }) want.push_back(s);
+    CHECK_EQ(join(issued_ops(b, c)), join(want));
+    /* The position resample reads all four coordinate planes; the projector runs on merged rows. */
+    const RecIssue* ge = issue_of(b, c, "grid_embed_aa");
+    REQUIRE(ge != nullptr);
+    CHECK(ge->opd[2].raw == coord);
+    CHECK_EQ(ge->opd[2].rows, 4);
+    CHECK_EQ(c.issues.back().n, 24);
+    const RecIssue* at = issue_of(b, c, "attn_dense");
+    REQUIRE(at != nullptr);
+    CHECK_EQ(at->opd[1].offset, 64);
+    CHECK_EQ(at->opd[2].offset, 128);
+    CHECK(at->opd[3].raw == cu);
+
+    /* A text step with media rows puts them over the lookup, before the first layer. */
+    static const int32_t tok[4] = { 1, 2, 3, 4 }, pos[4] = { 0, 1, 2, 3 }, cus[2] = { 0, 4 };
+    static const int32_t ctxl[1] = { 0 }, out[1] = { 3 }, rows[2] = { 1, 2 };
+    static uint16_t embd[2 * 64];
+    static int32_t cv_idx[1] = { 0 };
+    RadKVGroupBatch kv[2]{};
+    kv[0].group = lfm2_bf16::g_model[0].kv_attn;
+    kv[1].group = lfm2_bf16::g_model[0].kv_conv; kv[1].state_index = cv_idx;
+    RadBatch tb{};
+    tb.phase = RAD_PHASE_PREFILL;
+    tb.n_tok = 4; tb.n_seq = 1; tb.max_q_len = 4;
+    tb.token_ids = tok; tb.positions = pos; tb.cu_seqlens = cus; tb.ctx_lens = ctxl;
+    tb.n_out = 1; tb.out_ids = out; tb.n_kv_groups = 2; tb.kv = kv;
+    tb.n_mm_rows = 2; tb.mm_rows = rows; tb.mm_embd = embd;
+    RadCtx ct; ct.b = &b; ct.rank = 0; ct.world = 1; ct.batch = &tb;
+    lfm2_bf16::step(&ct, &tb);
+    CHECK(ct.step_fail.empty());
+    const std::vector<std::string> ops = issued_ops(b, ct);
+    REQUIRE(ops.size() > 2);
+    CHECK_EQ(ops[0], std::string("embed_lookup"));
+    CHECK_EQ(ops[1], std::string("scatter_rows"));
 }

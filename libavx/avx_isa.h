@@ -86,7 +86,7 @@ int         avx_isa_force(int level);
     /* ---- elementwise and norms */                                                              \
     X(rmsnorm)              X(rmsnorm_add)          X(hc_enter)             X(hc_read)            \
     X(hc_write)             X(mtp_enter)            X(layernorm)            X(add)                \
-    X(grid_embed)                                                                                 \
+    X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)                              \
     X(mul)                  X(silu_mul)             X(gelu)                 X(silu)               \
     X(sigmoid)              X(gather_rows)          X(scatter_rows)         X(ngram_ids)          \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \

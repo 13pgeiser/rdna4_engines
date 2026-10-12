@@ -67,13 +67,16 @@ static std::string device_inventory(const DeviceBackend* b) {
     return s;
 }
 
+#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
 /* COMPUTE WAVE SAVE/RESTORE OFF IS A GPU HANG WAITING FOR AN EVICTION. The driver evicts a
  * process's queues whenever host memory the card maps is moved or reclaimed under memory pressure,
  * and a serve with a host pool or a host KV tier maps gigabytes of it. With
  * amdgpu.cwsr_enable=0 it cannot preempt a running queue and waits for it to drain, which a queue
  * a serve keeps fed never does: the queue stops inside whatever kernel it was running, MES fails
  * REMOVE_QUEUE, and the driver resets the card. Said at startup because nothing later can tell
- * that hang from a kernel bug. */
+ * that hang from a kernel bug -- and said here, as the backend comes up, and not only in the
+ * startup report: a hang during the load ends the process before the report prints, and the
+ * tools that bring a backend up (rad-kbench, rad-tune) print no report at all. */
 static void warn_cwsr_off() {
     FILE* f = std::fopen("/sys/module/amdgpu/parameters/cwsr_enable", "r");
     if (!f) return;
@@ -87,7 +90,6 @@ static void warn_cwsr_off() {
                  "amdgpu.cwsr_enable=1 (module option, then rebuild the initramfs and reboot)");
 }
 
-#if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
 /* THE HOST BACKEND IN A BUILD THAT HAS HIP STILL COUNTS THE GPU CODE PLUGINS BRING. The
  * registration hooks are this build's own exported symbols and see every dlopen'ed kernel
  * library's fat binaries, card or no card, so the plugin loader can bracket each dlopen and know
@@ -535,6 +537,39 @@ int     tape_set_overlap(RadTape t, int i, bool on) {
     return dev()->tape_set_overlap ? dev()->tape_set_overlap(t, i, on ? 1 : 0) : RAD_E_UNSUPPORTED;
 }
 bool    dev_integrated(int device) { return dev()->integrated && dev()->integrated(device) > 0; }
+/* A FAILURE ANSWERED HERE, as "", is not one for the next reader of rad_dev_last_error: that
+ * reader is reporting a failure of its own and would name this one instead. The slot is put back
+ * as the call found it. */
+std::string dev_pci_address(int device) {
+    char buf[64] = { 0 };
+    if (!dev()->pci_address) return std::string();
+    const std::string before = t_last_error;
+    if (dev()->pci_address(device, buf, (int)sizeof buf) < 0) {
+        t_last_error = before;
+        return std::string();
+    }
+    return buf;
+}
+std::string dev_dma_lane(int device) {
+    char buf[256] = { 0 };
+    if (!dev()->dma_lane) return std::string();
+    const std::string before = t_last_error;
+    if (dev()->dma_lane(device, buf, (int)sizeof buf) < 0) {
+        t_last_error = before;
+        return std::string();
+    }
+    return buf;
+}
+std::string dev_runtime_version() {
+    char buf[128] = { 0 };
+    if (!dev()->runtime_version) return std::string();
+    const std::string before = t_last_error;
+    if (dev()->runtime_version(buf, (int)sizeof buf) < 0) {
+        t_last_error = before;
+        return std::string();
+    }
+    return buf;
+}
 int     dev_peer_access(int self, int peer) {
     if (self == peer) return 1;
     return dev()->peer_access ? dev()->peer_access(self, peer) : 1;
@@ -588,6 +623,55 @@ int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
 int rad_memcpy_ranges_async(void* dst, const void* src, int64_t prefix,
                             const RadCopyRange* ranges, int n, RadStream s) {
     return dev()->memcpy_ranges_async(dst, src, prefix, ranges, n, s);
+}
+int rad_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream s) {
+    if (const auto f = dev()->memcpy_list_async) return f(segs, n, flags, s);
+    for (int i = 0; i < n; ++i) RAD_TRY(dev()->memcpy_async(segs[i].dst, segs[i].src, segs[i].bytes, s));
+    return RAD_OK;
+}
+int rad_link_hold(RadStream s, int on) {
+    if (const auto f = dev()->link_hold) return f(s, on);
+    return RAD_OK;
+}
+void* rad_link_gate(RadStream s) {
+    if (const auto f = dev()->link_gate) return f(s);
+    return nullptr;
+}
+int rad_xp_supported(int device) {
+    const auto* d = dev();
+    return d->xp_supported && d->xp_stream_create && d->ride && d->ride_wait && d->ride_release && d->xp_list &&
+           d->xp_behind && d->alloc_uncached && d->free_uncached && d->xp_supported(device);
+}
+int rad_xp_stream_create(RadStream* out) {
+    if (const auto f = dev()->xp_stream_create) return f(out);
+    return RAD_E_UNSUPPORTED;
+}
+int rad_ride(RadStream s, void** token) {
+    if (const auto f = dev()->ride) return f(s, token);
+    return RAD_E_UNSUPPORTED;
+}
+int rad_ride_wait(RadStream s, void* token) {
+    if (const auto f = dev()->ride_wait) return f(s, token);
+    return RAD_E_UNSUPPORTED;
+}
+void rad_ride_release(void* token, RadStream after, int64_t packets) {
+    if (const auto f = dev()->ride_release) f(token, after, packets);
+}
+int rad_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst, const uint64_t* bytes,
+                uint32_t* done, uint32_t done_val) {
+    if (const auto f = dev()->xp_list) return f(device, mark, n, src, dst, bytes, done, done_val);
+    return RAD_E_UNSUPPORTED;
+}
+int64_t rad_xp_behind(int device) {
+    if (const auto f = dev()->xp_behind) return f(device);
+    return 0;
+}
+void* rad_dev_alloc_uncached(int64_t bytes) {
+    if (const auto f = dev()->alloc_uncached) return f(bytes);
+    return nullptr;
+}
+void rad_dev_free_uncached(void* p) {
+    if (const auto f = dev()->free_uncached) f(p);
 }
 
 /* Cleared by reading it, per the header. Never null: a caller printing "%s" on a path where

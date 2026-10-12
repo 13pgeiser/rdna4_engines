@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <type_traits>
 
 namespace {
 
@@ -334,9 +335,34 @@ constexpr bool kNarrowWeightNT = false;
  * per 128x128 tile. Only the fold reads the difference: one weight scale per accumulator row on
  * the narrow path, one per lane's column on the prefill tile. The fp8 instantiations are
  * unaffected. */
+/* THE WAVES A SIMD EACH TILE SHAPE RUNS AT (R4D_WAVES): the register budget every shape here was
+ * tuned at. The narrow tile's NT accumulators and its K-step unroll are sized against it, and a
+ * compiler left to choose moves it either way -- LLVM 24 spends 25 to 55 more VGPRs on NT 3 and 4
+ * at FK 256 and drops a wave or two, which cost the 64-row verify step 15%. One and two waves a
+ * block are held by LDS, not registers, and carry the LDS-bound count. */
+constexpr uint32_t f8_waves(bool full, bool aw, uint32_t nt, uint32_t mw, uint32_t fk, bool i8) {
+    if (!aw) return 6u;
+    if (mw == 1u) return nt == 1u ? 8u : nt == 2u ? 4u : nt == 3u ? 3u : 2u;
+    if (mw == 2u) return nt == 1u ? 12u : nt == 2u ? 8u : nt == 3u ? 5u : 4u;
+    if (!i8) {
+        if (fk == 128u)
+            return nt == 1u ? 16u : nt == 2u ? (full ? 16u : 12u) : nt == 3u ? 10u
+                 : (full && mw >= 8u) ? 10u : 9u;
+        return nt == 1u ? 12u : nt == 2u ? 10u : nt == 3u ? 9u : mw == 4u ? 7u : 8u;
+    }
+    if (fk == 128u)
+        return nt == 1u ? 16u : nt == 2u ? (full ? 10u : 12u) : nt == 3u ? (full ? 9u : 10u)
+             : full ? 7u : 9u;
+    if (nt == 1u) return 12u;
+    if (nt == 2u) return full ? 9u : mw == 4u ? 9u : 10u;
+    if (nt == 3u) return full ? (mw == 16u ? 8u : 7u) : (mw == 4u ? 8u : 9u);
+    return full ? (mw == 4u ? 5u : 6u) : (mw == 4u ? 7u : 8u);
+}
+
 template <bool Full, bool AW, uint32_t NT, uint32_t MT, uint32_t MW, uint32_t FK,
           bool GATED = false, bool I8 = false>
-__global__ __launch_bounds__(MW * kWave) void gemm_fp8a8_kernel(
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, AW, NT, MW, FK, I8))
+void gemm_fp8a8_kernel(
     const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
     const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
     void* __restrict__ Y, void* __restrict__ C, unsigned int* __restrict__ Ctr,
@@ -579,6 +605,25 @@ __global__ __launch_bounds__(MW * kWave) void gemm_fp8a8_kernel(
             }
         }
 
+        /* THE FOLD'S ACTIVATION SCALES, A TILE AHEAD (fp8 prefill tile): eight a lane, read at the
+         * top of the staged tile that ends in a fold so its WMMA cover them. Loaded where the fold
+         * runs, LLVM 24 issues them there and waits for each one in turn. At FK <= kBlock the fold
+         * fires only at a tile's last step, so the tile is known here. */
+        constexpr bool kAsAhead = !AW && !I8 && FK <= kBlock;
+        [[maybe_unused]] float asn[kAsAhead ? MT : 1][8];
+        if constexpr (kAsAhead) {
+            if ((c0 + FK) % kBlock == 0 || c0 + FK >= kend) {
+                const uint32_t kb = (c0 + FK - 1) / kBlock;
+#pragma unroll
+                for (uint32_t i = 0; i < MT; ++i)
+#pragma unroll
+                    for (uint32_t t = 0; t < 8; ++t) {
+                        const uint32_t r = m0 + wm + i * 16 + acc_row(lane, t);
+                        asn[i][t] = (Full || r < rows) ? ((const float*)Sa)[(size_t)r * sa_ld + kb]
+                                                       : 0.0f;
+                    }
+            }
+        }
 #pragma unroll
         for (uint32_t ks = 0; ks < FK; ks += kK) {
             i2v af[MT], bf[NT];
@@ -724,9 +769,12 @@ __global__ __launch_bounds__(MW * kWave) void gemm_fp8a8_kernel(
 #pragma unroll
                         for (uint32_t t = 0; t < 8; ++t) {
                             const uint32_t r = m0 + wm + i * 16 + acc_row(lane, t);
-                            as[i][t] = (Full || r < rows)
-                                           ? ws * ((const float*)Sa)[(size_t)r * sa_ld + kb]
-                                           : 0.0f;
+                            if constexpr (kAsAhead)
+                                as[i][t] = (Full || r < rows) ? ws * asn[i][t] : 0.0f;
+                            else
+                                as[i][t] = (Full || r < rows)
+                                               ? ws * ((const float*)Sa)[(size_t)r * sa_ld + kb]
+                                               : 0.0f;
                         }
 #pragma unroll
                     for (uint32_t i = 0; i < MT; ++i)
@@ -833,11 +881,11 @@ __global__ __launch_bounds__(MW * kWave) void gemm_fp8a8_kernel(
                 *(uint2*)(Q + (size_t)tok * q_ld + col0) =
                     make_uint2((uint32_t)pk[0], (uint32_t)pk[1]);
                 if (Yb) {
-                    __attribute__((aligned(16))) uint16_t hy[8];
-#pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t) hy[t] = f32_to_bf16(v[j][t]);
+                    /* Packed in whole registers (bf16x2_rne, f32_to_bf16's bits): written through
+                     * a uint16_t[8], LLVM 24 assembles the pairs from register halves. */
                     uint16_t* const yr = Yb + (size_t)tok * y_ld + col0;
-                    *(uint4*)yr = *(const uint4*)hy;
+                    *(uint4*)yr = make_uint4(bf16x2_rne(v[j][0], v[j][1]), bf16x2_rne(v[j][2], v[j][3]),
+                                             bf16x2_rne(v[j][4], v[j][5]), bf16x2_rne(v[j][6], v[j][7]));
                 }
 
             }
@@ -873,40 +921,60 @@ __global__ __launch_bounds__(MW * kWave) void gemm_fp8a8_kernel(
      * are exactly when `rows` is a multiple of 8: `r` is already one (m0, wm, i*16 and
      * `(lane>>4)*8` all are), so `col * rows + r` is too. */
     const bool vec8 = AW && (rows & 7u) == 0u;
+    /* THE SPLIT-K AND VEC8 TESTS ARE TAKEN ONCE, outside the store loop. Inside it, gfx12's
+     * compiler keeps a scalar compare and branch on each at every one of the tile's stores -- 64
+     * of each at NT 8 -- where LLVM 22 unswitched the loop; and with the per-element fallback in
+     * the same body it rounds both paths' values to 16-bit halves once, so the vec8 words are
+     * assembled from register halves instead of one byte permute a pair. The same stores either
+     * way. */
+    auto store = [&](auto split, auto v8) {
+        constexpr bool CK = decltype(split)::value;
+        constexpr bool V8 = decltype(v8)::value;
 #pragma unroll
-    for (uint32_t i = 0; i < MT; ++i)
+        for (uint32_t i = 0; i < MT; ++i)
 #pragma unroll
-        for (uint32_t j = 0; j < NT; ++j) {
-            const uint32_t col = n0 + wn + j * 16 + c;
-            if (!Full && col >= nb) continue;
-            const uint32_t rb = m0 + wm + i * 16;
-            const uint32_t r0 = rb + acc_row(lane, 0);
-            if (vec8 && (Full || r0 + 8u <= rows)) {
-                const size_t o = (size_t)col * rows + r0;
-                if (ck) {
-                    __attribute__((aligned(16))) float pv[8];
+            for (uint32_t j = 0; j < NT; ++j) {
+                const uint32_t col = n0 + wn + j * 16 + c;
+                if (!Full && col >= nb) continue;
+                const uint32_t rb = m0 + wm + i * 16;
+                const uint32_t r0 = rb + acc_row(lane, 0);
+                if (V8 && (Full || r0 + 8u <= rows)) {
+                    const size_t o = (size_t)col * rows + r0;
+                    if constexpr (CK) {
+                        __attribute__((aligned(16))) float pv[8];
 #pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t) pv[t] = out[i][j][t];
-                    *(uint4*)(part + o)     = *(const uint4*)pv;
-                    *(uint4*)(part + o + 4) = *(const uint4*)(pv + 4);
-                } else {
-                    __attribute__((aligned(16))) uint16_t hy[8];
-#pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t) hy[t] = f32_to_bf16(out[i][j][t]);
-                    *(uint4*)(c16 + o) = *(const uint4*)hy;
+                        for (uint32_t t = 0; t < 8; ++t) pv[t] = out[i][j][t];
+                        *(uint4*)(part + o)     = *(const uint4*)pv;
+                        *(uint4*)(part + o + 4) = *(const uint4*)(pv + 4);
+                    } else {
+                        /* Packed in whole registers (bf16x2_rne, f32_to_bf16's bits): written
+                         * through a uint16_t[8], LLVM 24 assembles the pairs from register halves
+                         * where LLVM 22 used one byte permute a pair. */
+                        const f8v& ov = out[i][j];
+                        *(uint4*)(c16 + o) = make_uint4(bf16x2_rne(ov[0], ov[1]), bf16x2_rne(ov[2], ov[3]),
+                                                        bf16x2_rne(ov[4], ov[5]), bf16x2_rne(ov[6], ov[7]));
+                    }
+                    continue;
                 }
-                continue;
-            }
 #pragma unroll
-            for (uint32_t t = 0; t < 8; ++t) {
-                const uint32_t r = rb + acc_row(lane, t);
-                if (!Full && r >= rows) continue;
-                // AW: A held the weight, so [r][col] is [N][M] and C is [M][N]. See the AW comment.
-                const size_t o = AW ? (size_t)col * rows + r : (size_t)r * nb + col;
-                if (ck) part[o] = out[i][j][t];
-                else    c16[o]  = f32_to_bf16(out[i][j][t]);
+                for (uint32_t t = 0; t < 8; ++t) {
+                    const uint32_t r = rb + acc_row(lane, t);
+                    if (!Full && r >= rows) continue;
+                    // AW: A held the weight, so [r][col] is [N][M] and C is [M][N]. See the AW
+                    // comment.
+                    const size_t o = AW ? (size_t)col * rows + r : (size_t)r * nb + col;
+                    if constexpr (CK) part[o] = out[i][j][t];
+                    else              c16[o]  = f32_to_bf16(out[i][j][t]);
+                }
             }
-        }
+    };
+    if (vec8) {
+        if (ck) store(std::true_type{}, std::true_type{});
+        else    store(std::false_type{}, std::true_type{});
+    } else {
+        if (ck) store(std::true_type{}, std::false_type{});
+        else    store(std::false_type{}, std::false_type{});
+    }
 
     // ---- THE SPLIT'S FINISHER, WHICH IS WHY THERE IS USUALLY NO SECOND LAUNCH ------------------
     //

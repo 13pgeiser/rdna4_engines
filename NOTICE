@@ -14,8 +14,10 @@ sorted operand's decode kernel), mechkbfan (the token embedding in the pinned ho
 parallelism, serving any world size from the shipped container, the request log, an uneven world's
 per-rank KV and weights split, --rope-scaling, the model entry's context length, root and
 capabilities, /props, the three-rank two-shot all-reduce and tiered-int8 wire, the diagnosis of
-the three-rank lossy-wire crash, and cardclock.py), hazyumps (static YaRN for the Qwen rotary
-paths) and redxherring (--model taking a Hugging Face repo id).
+the three-rank lossy-wire crash, cardclock.py, --busy-prefill-chunk, and curl, jq and a CA bundle
+in the image with hfget.sh under its busybox), hazyumps (static YaRN for the Qwen rotary paths),
+redxherring (--model taking a Hugging Face repo id) and zivius (LiquidAI's LFM2 and LFM2-VL and
+d1's /v1/systemone, after the design of their Codeberg PR 50).
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.
@@ -26,3 +28,9 @@ license text is in the file named beside each.
                   libquant/lq_ggml_*
   nlohmann/json   Copyright (c) 2013-2025 Niels Lohmann             vendor/nlohmann/LICENSE.MIT
   cpp-httplib     Copyright (c) 2017 yhirose                        vendor/cpp-httplib/LICENSE
+
+core/server/systemone.cpp carries text from Liquid AI's d1 (prompt.py and api.py in the
+LiquidAI/d1-3B repository): the prompt it renders, its question blocks, the option codes and their
+fallback codebook and the answer spellings, unchanged, in code rewritten in C++. That text is Liquid
+AI, Inc.'s, under the LFM Open License v1.0, whose terms -- including its limit on commercial use --
+apply to it; the license is in core/server/LICENSE.lfm.

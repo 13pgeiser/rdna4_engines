@@ -37,8 +37,10 @@ using std::max;
 // The same option set the h256 decode kernel ships, K prefetch of 2 included. This geometry does
 // not need it -- head_dim 128 halves both the accumulator and the query, so it sits at 162-179
 // VGPRs and does not spill at 4 -- but 2 is still 0.3-1.3% faster at every concurrency and window,
-// for bit-identical output, so the two legs stay on one number.
-#define B_OPT  3429947
+// for bit-identical output, so the two legs stay on one number -- plus O_KRAW, which loads an
+// m-tile's K codes in one round (see r4d_attn_decode_h256_gqa6.hip): at head_dim 128 that round is
+// 16 VGPRs and leaves the residency where it was.
+#define B_OPT  20207163
 #ifndef B_JPB
 #define B_JPB 2
 #endif

@@ -17,6 +17,7 @@
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 #include "r4d_q8.h"     // the gate quantiser's 8-bit codes: E4M3, or int8 (GQ == 2)
+#include <type_traits>
 
 #define O_F16    1
 #define O_MSKIP  2
@@ -58,6 +59,19 @@
 // conversion is exact, so the fragments, and every byte after them, match the f16 tile's. With more
 // waves a workgroup each would convert the whole tile, so the launcher sets it at one.
 #define O_V8    8388608
+// O_KRAW: with K read straight from the paged cache (KLDS0, CONTIG), an m-tile's K is loaded in ONE
+// round -- all HEAD_DIM/16 fragment loads, issued as soon as the row address is known -- and each
+// fragment is converted from its registers just before its WMMA.
+//
+// The prefetch depth (PF) and the scheduling barrier between a group's loads and its WMMAs say
+// what may overlap, and a compiler is free to honour them literally: LLVM 24 does, and with PF 2 a
+// tile's K then arrives in HEAD_DIM/32 round trips, one after another, which cost the head_dim-128
+// drafter leg 16-19% on a bf16 cache. LLVM 22 lifted the loads over the barriers and issued them in
+// one round. This bit asks for that round explicitly. What is held is the cache's own bytes -- 8 a
+// fragment from fp8, 16 from bf16 -- not the converted fragment, so a full round costs 2 or 4 x
+// HEAD_DIM/16 VGPRs; PF = HEAD_DIM/16 would hold every converted fragment at once and cost the
+// waves a SIMD. The fragments, and every byte after them, are unchanged.
+#define O_KRAW  16777216
 // `__builtin_nontemporal_load` will not take `uint4`/`uint2` -- they are HIP_vector_type class
 // templates, not native vectors -- so the hinted loads go through these and bit-cast the WHOLE
 // value back (never a subscript of it, which miscompiles).
@@ -107,6 +121,8 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     constexpr int KNT   = (OPT & O_KNT)  ? 1 : 0;
     constexpr int V8    = ((OPT & O_V8) && !KVP) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
+    constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
+    static_assert(!KRAW || (OPT & O_CONTIG), "the raw K round reads the contiguous layout");
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
 
@@ -339,6 +355,14 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                      + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM))
                      * (KVP ? 2 : 1);
             }
+            // A fragment's K bytes: 8 elements at 1 byte (fp8) or 2 (bf16), as the branches below read.
+            typedef typename std::conditional<KVP != 0, uint4, uint2>::type kraw_t;
+            kraw_t kraw[KRAW ? NKS : 1];
+            if constexpr (KRAW) {
+                #pragma unroll
+                for (int t = 0; t < NKS; ++t)
+                    kraw[t] = *(const kraw_t*)(grow + (16 * t + 8 * h) * (KVP ? 2 : 1));
+            }
             v8f s = (v8f){0,0,0,0,0,0,0,0};
             #pragma unroll
             for (int g = 0; g < NKS; g += PF) {
@@ -357,17 +381,26 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                         }
                     } else if (KVP) {
                         const uint16_t* kp = (const uint16_t*)grow + 16 * t;
-                        const uint2 l0 = *(const uint2*)(kp + (CTG ? 8 * h : 4 * h));
-                        const uint2 h0 = *(const uint2*)(kp + (CTG ? 8 * h + 4 : 8 + 4 * h));
+                        uint2 l0, h0;
+                        if constexpr (KRAW && KVP != 0) {
+                            const uint4 u = kraw[t];
+                            l0 = make_uint2(u.x, u.y);
+                            h0 = make_uint2(u.z, u.w);
+                        } else {
+                            l0 = *(const uint2*)(kp + (CTG ? 8 * h : 4 * h));
+                            h0 = *(const uint2*)(kp + (CTG ? 8 * h + 4 : 8 + 4 * h));
+                        }
                         kb[j] = D::mk(make_uint2(D::from_bf16w(l0.x), D::from_bf16w(l0.y)),
                                       make_uint2(D::from_bf16w(h0.x), D::from_bf16w(h0.y)));
                     } else {
                         const uint8_t* kp = grow + 16 * t;
                         uint32_t w4[4];
                         // CONTIG makes this ONE 8-byte load where the split map needs two 4-byte.
-                        const uint2 raw = CTG ? *(const uint2*)(kp + 8 * h)
-                                              : make_uint2(*(const uint32_t*)(kp + 4 * h),
-                                                           *(const uint32_t*)(kp + 8 + 4 * h));
+                        uint2 raw;
+                        if constexpr (KRAW && KVP == 0) raw = kraw[t];
+                        else raw = CTG ? *(const uint2*)(kp + 8 * h)
+                                       : make_uint2(*(const uint32_t*)(kp + 4 * h),
+                                                    *(const uint32_t*)(kp + 8 + 4 * h));
                         fp8x8_to_16x4w<D>(raw, w4);
                         kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
                     }

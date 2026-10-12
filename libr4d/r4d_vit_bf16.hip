@@ -120,6 +120,58 @@ __global__ __launch_bounds__(kThr) void grid_embed_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- grid_embed_aa
+// ref_grid_embed_aa: torch's antialiased half-pixel bilinear resample (SigLIP2's position table).
+// Thread 0 lays out the row's two tap lists -- at most `side` each -- in LDS; every thread then
+// takes channels, summing the taps in libref's order (a row of columns, then the rows), and the sum
+// is rounded once before the add.
+__device__ __forceinline__ int aa_taps(int at, int size, int side, float* w, int* lo) {
+    size = size < 1 ? 1 : size;
+    at = at < 0 ? 0 : (at >= size ? size - 1 : at);
+    const float scale = (float)side / (float)size;
+    const float support = scale > 1.0f ? scale : 1.0f, inv = 1.0f / support;
+    const float center = scale * ((float)at + 0.5f);
+    int a = (int)(center - support + 0.5f), b = (int)(center + support + 0.5f);
+    a = a < 0 ? 0 : a;
+    b = b > side ? side : b;
+    float total = 0.0f;
+    for (int j = a; j < b; ++j) {
+        const float d = fabsf(((float)j - center + 0.5f) * inv);
+        w[j - a] = d < 1.0f ? 1.0f - d : 0.0f;
+        total += w[j - a];
+    }
+    for (int j = a; j < b; ++j) w[j - a] = total != 0.0f ? w[j - a] / total : 0.0f;
+    *lo = a;
+    return b > a ? b - a : 0;
+}
+
+template <bool TF32>
+__global__ __launch_bounds__(kThr) void grid_embed_aa_kernel(
+    unsigned short* __restrict__ x, const void* __restrict__ tab, const int32_t* __restrict__ crd,
+    uint32_t n, int side, uint32_t x_ld, uint32_t plane) {
+    extern __shared__ float aa_w[];           // [2 * side]: the row taps, then the column taps
+    __shared__ int aa_span[4];                // h0, nh, w0, nw
+    const uint32_t m = blockIdx.x;
+    if (threadIdx.x == 0) {
+        aa_span[1] = aa_taps(crd[m], crd[2 * plane + m], side, aa_w, &aa_span[0]);
+        aa_span[3] = aa_taps(crd[plane + m], crd[3 * plane + m], side, aa_w + side, &aa_span[2]);
+    }
+    __syncthreads();
+    const int h0 = aa_span[0], nh = aa_span[1], w0 = aa_span[2], nw = aa_span[3];
+    unsigned short* __restrict__ xr = x + (size_t)m * x_ld;
+    for (uint32_t i = threadIdx.x; i < n; i += kThr) {
+        float acc = 0.0f;
+        for (int y = 0; y < nh; ++y) {
+            float row = 0.0f;
+            for (int c = 0; c < nw; ++c)
+                row += ldw<TF32>(tab, (uint32_t)((h0 + y) * side + w0 + c) * n + i) * aa_w[side + c];
+            acc += row * aa_w[y];
+        }
+        const float pe = bf2f(f32_to_bf16(acc));
+        xr[i] = f32_to_bf16(bf2f(xr[i]) + pe);
+    }
+}
+
 // ---------------------------------------------------------------------------- gemm_nt_bias
 #define VB_BK 64
 #define VB_PITCH (VB_BK + 8)      // 144-byte LDS rows: gemm_bf16_nt_tiled's bank argument
@@ -176,29 +228,29 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
 
     // THE K TAIL IS STAGED AS ZEROS: K is a multiple of 8, so a 16-byte chunk is wholly inside K
     // or wholly past it, and a zero chunk contributes exactly nothing to the dot products.
-    const uint4 zero = make_uint4(0, 0, 0, 0);
-    uint4 ra[AL], rw[WL];
+    const r4d_u32x4 zero = (r4d_u32x4)(0u);
+    r4d_u32x4 ra[AL], rw[WL];                       // registers; uint4 would sit in scratch
 #pragma unroll
-    for (int i = 0; i < AL; ++i) ra[i] = ae[i] < K ? *(const uint4*)(A + aoff[i]) : zero;
+    for (int i = 0; i < AL; ++i) ra[i] = ae[i] < K ? *(const r4d_u32x4*)(A + aoff[i]) : zero;
 #pragma unroll
-    for (int i = 0; i < WL; ++i) rw[i] = we[i] < K ? *(const uint4*)(W + woff[i]) : zero;
+    for (int i = 0; i < WL; ++i) rw[i] = we[i] < K ? *(const r4d_u32x4*)(W + woff[i]) : zero;
 
     const int nk = (K + VB_BK - 1) / VB_BK;
     for (int kt = 0; kt < nk; ++kt) {
         __syncthreads();
 #pragma unroll
-        for (int i = 0; i < AL; ++i) *(uint4*)adst[i] = ra[i];
+        for (int i = 0; i < AL; ++i) *(r4d_u32x4*)adst[i] = ra[i];
 #pragma unroll
-        for (int i = 0; i < WL; ++i) *(uint4*)wdst[i] = rw[i];
+        for (int i = 0; i < WL; ++i) *(r4d_u32x4*)wdst[i] = rw[i];
         __syncthreads();
         if (kt + 1 < nk) {
             const int k1 = (kt + 1) * VB_BK;
 #pragma unroll
             for (int i = 0; i < AL; ++i)
-                ra[i] = k1 + ae[i] < K ? *(const uint4*)(A + aoff[i] + k1) : zero;
+                ra[i] = k1 + ae[i] < K ? *(const r4d_u32x4*)(A + aoff[i] + k1) : zero;
 #pragma unroll
             for (int i = 0; i < WL; ++i)
-                rw[i] = k1 + we[i] < K ? *(const uint4*)(W + woff[i] + k1) : zero;
+                rw[i] = k1 + we[i] < K ? *(const r4d_u32x4*)(W + woff[i] + k1) : zero;
         }
 #pragma unroll
         for (int s = 0; s < VB_BK / 16; ++s) {
@@ -306,6 +358,37 @@ static int rad_grid_embed_body(const RadArgs* a, const R4dSink& sk) {
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
 }
 R4D_ENTRY(r4d_rad_grid_embed, rad_grid_embed_body)
+
+/* grid_embed_aa: grid_embed's operands and checks, the antialiased resample. */
+static int rad_grid_embed_aa_body(const RadArgs* a, const R4dSink& sk) {
+    const RadTensor* x   = r4d_opt(a, GE_X);
+    const RadTensor* tab = r4d_opt(a, GE_TAB);
+    const RadTensor* crd = r4d_opt(a, GE_CRD);
+    if (!x || !tab || !crd) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || crd->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+    if (tab->dtype != RAD_BF16 && tab->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(tab)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_geti_or(a, "n", r4d_dim(tab, (int)tab->rank - 1));
+    const long long side = r4d_geti_or(a, "side", 0);
+    if (n <= 0 || side <= 0 || side > 1024 || r4d_numel(tab) < side * side * n)
+        return R4D_NO(RAD_E_SHAPE);
+    long long M = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < M || !r4d_contig(crd))
+        return R4D_NO(RAD_E_SHAPE);
+    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
+    const uint32_t plane = (uint32_t)crd->shape[1];
+    const size_t lds = (size_t)(2 * side) * sizeof(float);
+    if (tab->dtype == RAD_F32)
+        return R4D_EMIT(sk, grid_embed_aa_kernel<true>, dim3((uint32_t)M), dim3(kThr), lds,
+                        (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                        (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
+    return R4D_EMIT(sk, grid_embed_aa_kernel<false>, dim3((uint32_t)M), dim3(kThr), lds,
+                    (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                    (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
+}
+R4D_ENTRY(r4d_rad_grid_embed_aa, rad_grid_embed_aa_body)
 
 /* ------------------------------------------------------------------ gemm_nt_bias */
 enum { GB_A = 0, GB_W, GB_BIAS, GB_RES, GB_Y };

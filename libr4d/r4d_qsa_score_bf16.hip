@@ -357,16 +357,20 @@ __global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
         const int bend = wb0 + tpw * 16 < nbs ? wb0 + tpw * 16 : nbs;
         const int32_t* tab = bt + (size_t)seq * bt_ld;
 
+        /* THE NEXT TILE'S PAGE ID IS READ WHILE THIS TILE'S KEY IS OUT: the key's address
+         * depends on it, so read in its own iteration it is a second load latency every tile. */
+        int pg_next = wb0 + col < bend ? tab[wb0 + col] : -1;
         for (int b0 = wb0; b0 < bend; b0 += 16) {
             /* The A operand: block `b0 + col`'s key, one page-id read and eight fragment loads. A
              * block past the end or without a page reads page 0's key, which always exists, and
              * is overwritten or skipped at the store. */
             const int b  = b0 + col;
-            const int pg = b < bend ? tab[b] : -1;
+            const int pg = pg_next;
             const unsigned short* kp = bk + (size_t)(pg >= 0 ? pg : 0) * bk_ld + 4 * half;
             v8bf kf[kMxKS];
 #pragma unroll
             for (int ks = 0; ks < kMxKS; ++ks) kf[ks] = fragP(kp + ks * 16);
+            pg_next = b + 16 < bend ? tab[b + 16] : -1;
             /* Which of the tile's sixteen blocks have no page: lanes 0-15 each read one. */
             const unsigned absent = (unsigned)__ballot(pg < 0) & 0xFFFFu;
 

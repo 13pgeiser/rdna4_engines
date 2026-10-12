@@ -1,7 +1,8 @@
 /* mm_test.cpp -- the multimodal processor against the reference, number for number.
  *
  * Every expected value in mm_golden.h came out of transformers' own code (tests/mkgolden.py says
- * which function made which table): smart_resize in both forms, the frames a video keeps, the
+ * which function made which table), and in lfm2_golden.h out of its LFM2-VL processor
+ * (tests/mklfm2golden.py): smart_resize in both forms, the frames a video keeps, the
  * patches of a picture and of a clip, the timestamps between a clip's groups, and get_rope_index's
  * positions over a prompt carrying both. A model reads its prompt through all of these at once, so
  * a mistake in any one is a model that still answers -- about a slightly different picture, or
@@ -15,6 +16,7 @@
 #include "mm/media.h"
 #include "mm/processor.h"
 #include "mm_golden.h"
+#include "lfm2_golden.h"
 #include "rad_plugin.h"
 
 #include <algorithm>
@@ -407,6 +409,113 @@ TEST(the_audio_front_end_is_the_references) {
     CHECK_EQ(it->seg_rows, 0);
     CHECK(it->encoded);
     CHECK_EQ(it->expand.size(), (size_t)2);
+}
+
+namespace {
+
+/* LiquidAI d1-3B's processor_config.json, as a container converted from it states it. */
+VisionConfig lfm2_cfg() {
+    VisionConfig c;
+    c.family = Family::Lfm2;
+    c.patch = kLfm2Patch;
+    c.merge = kLfm2Merge;
+    c.temporal = 1;
+    const int64_t f2 = (int64_t)c.factor() * c.factor();
+    c.image_min_pixels = c.video_min_pixels = kLfm2MinTok * f2;
+    c.image_max_pixels = c.video_max_pixels = kLfm2MaxTok * f2;
+    c.min_tiles = kLfm2MinTiles;
+    c.max_tiles = kLfm2MaxTiles;
+    c.tile = kLfm2Tile;
+    c.use_thumbnail = true;
+    c.max_pixels_tolerance = kLfm2Tolerance;
+    c.max_segment_patches = kLfm2MaxPatches;
+    c.tok_image = kLfm2ImageToken;
+    c.max_patches = 4096;
+    return c;
+}
+
+int32_t lfm2_marker(const std::string& name) {
+    for (const GoldLfm2Marker& m : kGoldLfm2Markers)
+        if (name == m.name) return m.id;
+    return -1;
+}
+
+}  /* namespace */
+
+TEST(lfm2_sizes_and_tiles_are_the_references) {
+    for (const GoldLfm2Size& g : kGoldLfm2Size) {
+        int64_t oh = 0, ow = 0;
+        lfm2_size(g.h, g.w, kLfm2Patch * kLfm2Merge, (int64_t)kLfm2MinTok * 1024,
+                  (int64_t)kLfm2MaxTok * 1024, &oh, &ow);
+        int32_t cols = 0, rows = 0;
+        lfm2_grid(g.h, g.w, kLfm2MinTiles, kLfm2MaxTiles, kLfm2Tile, &cols, &rows);
+        const bool large = lfm2_too_large(g.h, g.w, kLfm2Patch, kLfm2Patch * kLfm2Merge,
+                                          (int64_t)kLfm2MaxTok * 1024, kLfm2Tolerance);
+        if (oh != g.oh || ow != g.ow || cols != g.cols || rows != g.rows || large != (g.large != 0))
+            std::fprintf(stderr, "    %lld x %lld: %lld x %lld, %d x %d tiles, large %d; reference "
+                         "%lld x %lld, %d x %d, %d\n", (long long)g.h, (long long)g.w, (long long)oh,
+                         (long long)ow, cols, rows, (int)large, (long long)g.oh, (long long)g.ow,
+                         g.cols, g.rows, g.large);
+        CHECK_EQ(oh, g.oh);
+        CHECK_EQ(ow, g.ow);
+        CHECK_EQ(cols, g.cols);
+        CHECK_EQ(rows, g.rows);
+        CHECK_EQ(large, g.large != 0);
+    }
+}
+
+/* Whole pictures, small to tiled, one area-capped first as d1's runner caps it: every segment's
+ * size and patches, and the tokens that replace the picture. The processor keeps a segment's
+ * patches in merge-block order; the reference's are row-major, so they are put back in that order
+ * (Item::coords) before the hash. */
+TEST(lfm2_pictures_are_the_references) {
+    Processor p;
+    REQUIRE_EQ(p.init(lfm2_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
+                      lfm2_marker), RAD_OK);
+    for (const GoldLfm2Pic& g : kGoldLfm2Pics) {
+        Frame f = frame(g.f, g.h, g.w);
+        if (g.cap > 0) {
+            Frame capped;
+            cap_area(f, g.cap, &capped);
+            f = std::move(capped);
+        }
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image_from(f, &it, &why));
+        REQUIRE(it != nullptr);
+        REQUIRE_EQ(it->n_seg, g.n_seg);
+        const int64_t pd = it->patch_dim;
+        REQUIRE_EQ(pd, (int64_t)3 * kLfm2Patch * kLfm2Patch);
+        for (int32_t s = 0; s < it->n_seg; ++s) {
+            const GoldLfm2Seg& gs = kGoldLfm2Segs[g.seg0 + s];
+            CHECK_EQ(it->seg_h(s), gs.h);
+            CHECK_EQ(it->seg_w(s), gs.w);
+            const int64_t p0 = it->patch_at(s), np = it->patch_at(s + 1) - p0;
+            REQUIRE_EQ(np, (int64_t)gs.h * gs.w);
+            std::vector<int32_t> planes((size_t)(4 * np));
+            it->coords(p0, np, planes.data());
+            std::vector<uint16_t> rowmajor((size_t)(np * pd));
+            for (int64_t k = 0; k < np; ++k) {
+                const int64_t at = (int64_t)planes[(size_t)k] * gs.w + planes[(size_t)(np + k)];
+                std::copy_n(it->pixels.data() + (p0 + k) * pd, pd, rowmajor.data() + at * pd);
+            }
+            if (fnv(rowmajor) != gs.fnv)
+                std::fprintf(stderr, "    picture %d x %d, segment %d of %d (%d x %d): patches differ\n",
+                             g.h, g.w, s, it->n_seg, gs.h, gs.w);
+            CHECK_EQ(fnv(rowmajor), gs.fnv);
+        }
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (int32_t id : it->expand)
+            for (int b = 0; b < 4; ++b) h = (h ^ (uint8_t)((uint32_t)id >> (8 * b))) * 0x100000001b3ull;
+        CHECK_EQ((int32_t)it->expand.size(), g.n_ids);
+        CHECK_EQ(h, g.ids_fnv);
+        /* Each run of placeholders starts where Item::seg_at says, one merged row a token. */
+        REQUIRE_EQ(it->seg_at.size(), (size_t)it->n_seg);
+        for (int32_t s = 0; s < it->n_seg; ++s) {
+            const int64_t at = it->seg_at[(size_t)s], n = it->row_at(s + 1) - it->row_at(s);
+            for (int64_t k = 0; k < n; ++k) CHECK_EQ(it->expand[(size_t)(at + k)], kLfm2ImageToken);
+        }
+    }
 }
 
 RAD_TEST_MAIN()

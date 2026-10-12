@@ -11,8 +11,11 @@
 //
 // NO head_dim 128 LEG. gqa 4 at 128 is the DFlash2 drafter's windowed geometry, which
 // r4d_attn_paged_h128_gqa4.hip serves; R4D_ATTN_H128 leaves those entry points out of this unit.
+// A head_dim 64 PREFILL leg, for LFM2 (32 query heads over 8, d1-3B among them), which serves
+// every query length: the split-KV decode kernel has no 64-wide form.
 // The page is the body's default 16.
 #define R4D_ATTN_GQA  4
 #define R4D_ATTN_H128 0
+#define R4D_ATTN_H64  1
 
 #include "r4d_attn_paged_gqa8.hip"

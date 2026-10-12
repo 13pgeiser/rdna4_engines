@@ -109,6 +109,11 @@ static const RadParamSpec pPleConv[]   = { P_INT("M"), P_INT("n"), P_INT("width"
 static const RadOperandSpec oPleConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                            OPD_O("resid"), OPD_O("cache_idx"), OPD_O("has_init"),
                                            OPD_O("num_accepted"), OUT("y") };
+static const RadParamSpec pCausalConv[]   = { P_INT("M"), P_INT("n"), P_INT("width"),
+                                              P_STR("dtype") };
+static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+                                              OPD_O("cache_idx"), OPD_O("has_init"),
+                                              OPD_O("num_accepted"), OUT("y") };
 
 static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
@@ -495,6 +500,8 @@ static const RadOpSchema kSchemas[] = {
 { "layernorm", ARR(pLayernorm), ARR(oLayernorm), "layer norm with gain and optional bias." },
 { "grid_embed", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += a side x side position table resampled bilinearly to the row's grid." },
+{ "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
+  "x += the table resampled as torch's antialiased half-pixel bilinear, SigLIP2's." },
 { "add", ARR(pMnD), ARR(oBinary), "elementwise sum." },
 { "mul", ARR(pMnD), ARR(oBinary),
   "elementwise product; `b` may have extent 1 on any axis `a` does not and is broadcast along it." },
@@ -525,6 +532,8 @@ static const RadOpSchema kSchemas[] = {
   "PLE gate: three grouped norms, a dot, a signed sqrt." },
 { "ple_conv", ARR(pPleConv), ARR(oPleConv),
   "PLE's dilated depthwise conv, silu and residual add." },
+{ "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
+  "depthwise causal conv with ple_conv's window, no activation and no residual (LFM2)." },
 { "ngram_ids", ARR(pNgramIds), ARR(oNgramIds), "hashed n-gram row ids for PLE." },
 { "gather_rows", ARR(pMnD), ARR(oGather), "y[i,:] = x[idx[i],:]." },
 { "scatter_rows", ARR(pMnD), ARR(oScatterRows),
@@ -697,6 +706,9 @@ SIMPLE("avx_layernorm", "layernorm", "norm", "layer norm with gain and bias", DT
        L(layernorm)),
 SIMPLE("avx_grid_embed", "grid_embed", "elem",
        "bilinear resample of a learned position grid, added in", DT_FLOAT, L(grid_embed)),
+SIMPLE("avx_grid_embed_aa", "grid_embed_aa", "elem",
+       "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
+       L(grid_embed_aa)),
 SIMPLE("avx_add", "add", "elem", "elementwise sum", DT_FLOAT, L(add)),
 SIMPLE("avx_mul", "mul", "elem", "elementwise product, broadcasting b", DT_FLOAT, L(mul)),
 SIMPLE("avx_act_mul", "act_mul", "elem", "act(a) * b over two operands", DT_FLOAT, L(act_mul)),
@@ -732,6 +744,8 @@ SIMPLE("avx_ple_gate", "ple_gate", "norm", "PLE gate: three grouped norms, a dot
        DT_FLOAT, L(ple_gate)),
 SIMPLE("avx_ple_conv", "ple_conv", "norm", "PLE's dilated depthwise conv, silu and residual add",
        DT_FLOAT, L(ple_conv)),
+SIMPLE("avx_causal_conv1d", "causal_conv1d", "conv", "depthwise causal conv, no activation",
+       DT_FLOAT, L(causal_conv1d)),
 SIMPLE("avx_cast", "cast", "elem", "dtype conversion", DT_ANY, L(cast)),
 SIMPLE("avx_softmax", "softmax", "elem", "row-wise softmax", DT_FLOAT, L(softmax)),
 SIMPLE("avx_scale_rows", "scale_rows", "elem", "one scalar per row, broadcast across the row",

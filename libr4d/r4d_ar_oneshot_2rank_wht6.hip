@@ -77,12 +77,14 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
     const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n, int hc,
     long irow, long hrow, int n_groups, int n_chunks, long slot_stride_bytes,
-    long scale_off_bytes, int drain, int acq, unsigned int nbw, R4dArGather G, int rows_max) {
+    long scale_off_bytes, int drain, int acq, unsigned int nbw, R4dArGather G, int rows_max,
+    long long* gate, unsigned int* gate_ctr) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   const int lane = tid & (WAVE - 1), wid = tid / WAVE, nwarp = nt / WAVE;
   const int lig = lane & (LPG - 1), gw = lane / LPG;
   __shared__ unsigned int s_seq, s_slot;
   extern __shared__ int s_tab[];   // slots, weights: [rows_max * top_k]; gates: [rows_max]
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe (cudagraph)
   const unsigned int s = s_seq;
   const Wht6Slot w = wht6_slot(peer_scratch, my_scratch, loc_pack, (int)s_slot,
@@ -145,6 +147,7 @@ __global__ void r4d_ar_hc_write_wht6_kernel(
     wht6_push_chunk<CG>(ld, c, n_groups, lane, lig, gw, w.p_pay, w.p_sc, w.l_pay, w.l_sc);
 
   wht6_handshake(peer_flags, my_flags, b, s, tid, drain, acq);
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   for (int c = c0 + wid; c < c1; c += nwarp)
     wht6_reduce_chunk<CG>(st, c, n_groups, lane, lig, gw, w.m_pay, w.m_sc, w.l_pay, w.l_sc);
@@ -155,7 +158,8 @@ int r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, lo
                          long scale_off_bytes, long y, long inj, long h, long M, long n, long hc,
                          long irow, long hrow, long ye, long ew, long sorted, long sh, long sg,
                          long ye_ld, long ew_ld, long sh_ld, long sg_ld, long top_k, long sig,
-                         long stream_i, long nblocks, long nthreads, long drain, long acq) {
+                         long stream_i, long nblocks, long nthreads, long drain, long acq,
+                         long gate, long gate_ctr) {
   hipStream_t st = (hipStream_t)stream_i;
   if (n <= 0 || M <= 0 || n % 8 || hc < 1 || hrow % 8) return -1;
   if ((M * n) % GROUP) return -1;
@@ -197,7 +201,8 @@ int r4d_ar_hc_write_wht6(long peer_scratch, long my_scratch, long peer_flags, lo
     (unsigned short*)y, (char*)peer_scratch, (const char*)my_scratch, (char*)loc_pack, \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, (const unsigned short*)inj, \
     (unsigned short*)h, (int)n, (int)hc, irow, hrow, n_groups, n_chunks, slot_stride_bytes, \
-    scale_off_bytes, (int)drain, (int)acq, (unsigned)R4D_AR_MAX_BLOCKS, G, rows_max)
+    scale_off_bytes, (int)drain, (int)acq, (unsigned)R4D_AR_MAX_BLOCKS, G, rows_max, \
+    (long long*)gate, (unsigned int*)gate_ctr)
   if (gather) LF(true, kWht6FusedCG);
   else LF(false, kWht6FusedCG);
 #undef LF

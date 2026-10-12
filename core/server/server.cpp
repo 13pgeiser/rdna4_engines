@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include "json_partial.h"
+#include "systemone.h"
 #include "rad_internal.h"
 #include "text/tokenizer.h"
 
@@ -136,6 +137,7 @@ void Server::register_routes() {
     router_.post("/v1/chat/completions", [this](const HttpRequest& q) { return handle_chat(q); });
     router_.post("/v1/completions",      [this](const HttpRequest& q) { return handle_completion(q); });
     router_.post("/v1/embeddings",       [this](const HttpRequest& q) { return handle_embeddings(q); });
+    router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
     router_.get ("/v1/models/:id",       [this](const HttpRequest& q) { return handle_models(q); });
     /* THE SAME ROUTES WITHOUT /v1, as llama-server answers them: a client configured with the
@@ -175,6 +177,7 @@ void Server::register_routes() {
     router_.get ("/version",             [this](const HttpRequest& q) { return handle_version(q); });
     router_.get ("/server_info",         [this](const HttpRequest& q) { return handle_server_info(q); });
     router_.get ("/props",               [this](const HttpRequest& q) { return handle_props(q); });
+    router_.get ("/diagnostics",         [this](const HttpRequest& q) { return handle_diagnostics(q); });
 
     router_.post("/tokenize",            [this](const HttpRequest& q) { return handle_tokenize(q); });
     router_.post("/detokenize",          [this](const HttpRequest& q) { return handle_detokenize(q); });
@@ -1721,6 +1724,158 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
     release(n_in);
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, embeddings_body(r, vecs, u));
+}
+
+/* /v1/systemone (systemone.h): one request a question, each reading its answer's candidates at
+ * the prompt's last position (Request::token_scores) and sampling one token nobody reads.
+ *
+ * SEVERAL QUESTIONS SHARE THE STATE THEY ARE ASKED OVER, and it is read once. The first question
+ * runs alone and leaves the state at the end of that shared head in the prefix cache -- its
+ * attention blocks, and a checkpoint of the convolutions there (Request::checkpoint_at) -- and the
+ * rest are submitted together once it has finished, each starting from that head and computing
+ * only its own tail. d1's own runner shares the head the same way, as one batched tree. */
+HttpResponse Server::handle_systemone(const HttpRequest& req) {
+    if (!deps_.sched || !deps_.tok)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+    if (opt_.decision_type != "d1")
+        return error_response(err_not_implemented(
+            "/v1/systemone serves a decision model; this container does not declare one "
+            "(convert d1 with --set decision.type=d1)"), req.peer);
+
+    DecisionRequest r;
+    ApiError err;
+    if (parse_decision_request(req.body, odeps_, lim_, opt_.model_id, &r, &err) < 0)
+        return error_response(err, req.peer);
+
+    sweep_abandoned();
+    const int n = (int)r.questions.size();
+    if (!admit(n)) {
+        metrics_.observe_rejected();
+        return error_response(err_overloaded(
+            "the admission queue is full; retry after " + std::to_string(opt_.retry_after_s) +
+            "s. The server refuses rather than queueing without bound"), req.peer);
+    }
+    RAD_INFO("systemone admitted%s questions=%d prompt=%lld tok", from_peer(req.peer).c_str(), n,
+             (long long)r.input_tokens);
+
+    std::vector<Generation> gens;
+    std::vector<Request> rqs;
+    std::vector<std::shared_ptr<TokenScores>> scores;
+    for (int i = 0; i < n; ++i) {
+        Generation g;
+        g.index = i;
+        g.sink = std::make_shared<Sink>(16);
+        auto ts = std::make_shared<TokenScores>();
+        ts->tokens = r.questions[(size_t)i].candidates;
+        Request rq;
+        rq.prompt = r.questions[(size_t)i].tokens;
+        rq.media = r.media;
+        rq.token_scores = ts;
+        rq.max_tokens = 1;
+        rq.sp.temp = 0.0f;
+        rq.sink = g.sink.get();
+        if (i == 0 && n > 1) rq.checkpoint_at = r.trunk;
+        rqs.push_back(std::move(rq));
+        gens.push_back(std::move(g));
+        scores.push_back(std::move(ts));
+    }
+    /* The questions handed to the scheduler so far: an early exit retires those and drops the
+     * rest, whose sinks nothing will ever finish. */
+    size_t submitted = 0;
+    auto fail = [&](const std::string& why) {
+        gens.resize(submitted);
+        retire(gens);
+        release(n);
+        ApiError e;
+        e.status = 500;
+        e.type = "internal_server_error";
+        e.message = why;
+        return error_response(e, req.peer);
+    };
+
+    /* Questions [first, last) submitted together and waited for. A non-null response is the
+     * call's answer already: the scheduler refused one, the client left, or the server stops. */
+    std::unique_ptr<HttpResponse> early;
+    auto run = [&](int first, int last) {
+        std::vector<Request> part(std::make_move_iterator(rqs.begin() + first),
+                                  std::make_move_iterator(rqs.begin() + last));
+        std::vector<uint64_t> ids;
+        deps_.sched->submit_all(part, &ids);
+        submitted = (size_t)last;
+        for (size_t k = 0; k < ids.size(); ++k) {
+            Generation& g = gens[(size_t)first + k];
+            g.id = ids[k];
+            g.sink->id = ids[k];
+            if (!ids[k]) {
+                early = std::make_unique<HttpResponse>(
+                    fail("the scheduler refused question " + r.questions[(size_t)first + k].name));
+                return;
+            }
+        }
+        for (;;) {
+            bool all = true;
+            for (int i = first; i < last; ++i) {
+                Generation& g = gens[(size_t)i];
+                if (!g.closed && g.sink->done()) { g.closed = true; g.finish = g.sink->finish_reason(); }
+                all = all && g.closed;
+            }
+            if (all) return;
+            if (req.peer_gone()) {
+                gens.resize(submitted);
+                cancel_all(gens, true);
+                retire(gens);
+                release(n);
+                metrics_.observe_http(499);
+                early = std::make_unique<HttpResponse>(
+                    HttpResponse::text(499, "client closed request\n"));
+                return;
+            }
+            if (stopping_.load()) {
+                gens.resize(submitted);
+                cancel_all(gens, false);
+                retire(gens);
+                release(n);
+                early = std::make_unique<HttpResponse>(
+                    error_response(err_overloaded("the server is shutting down"), req.peer));
+                return;
+            }
+            for (int i = first; i < last; ++i)
+                if (!gens[(size_t)i].closed) { gens[(size_t)i].sink->wait(); break; }
+        }
+    };
+    run(0, 1);
+    if (early) return std::move(*early);
+    /* A first question that failed fails the call; the rest would only repeat it. */
+    if (gens[0].finish == Finish::Error || gens[0].finish == Finish::Cancelled)
+        return fail(gens[0].finish == Finish::Error ? engine_failure(*gens[0].sink)
+                                                    : "the engine cancelled question " +
+                                                          r.questions[0].name);
+    if (n > 1) {
+        run(1, n);
+        if (early) return std::move(*early);
+    }
+
+    json answers = json::object();
+    for (size_t i = 0; i < gens.size(); ++i) {
+        const Generation& g = gens[i];
+        if (g.finish == Finish::Error || g.finish == Finish::Cancelled)
+            return fail(g.finish == Finish::Error ? engine_failure(*g.sink)
+                                                  : "the engine cancelled question " +
+                                                        r.questions[i].name);
+        json a;
+        if (decision_answer(r.questions[i], scores[i]->logits, &a, &err) < 0) {
+            retire(gens);
+            release(n);
+            return error_response(err, req.peer);
+        }
+        answers[r.questions[i].name] = std::move(a);
+    }
+    retire(gens);
+    release(n);
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{
+        { "answers", std::move(answers) },
+        { "usage", { { "input_tokens", r.input_tokens }, { "output_tokens", 0 } } } }));
 }
 
 HttpResponse Server::handle_models(const HttpRequest& req) {

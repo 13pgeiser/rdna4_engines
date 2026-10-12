@@ -161,6 +161,11 @@ __device__ __forceinline__ v2f e4m3_pk(uint32_t q) {
 __device__ __forceinline__ float bscale(uint16_t s) {
     return __uint_as_float((uint32_t)s << 16);
 }
+/* The same scale held zero-extended in a whole register: the form a 16-bit value should stay in
+ * from its load on (see u16_load_w in r4d_moe.hip). The upper sixteen bits must be zero. */
+__device__ __forceinline__ float bscale(uint32_t s) {
+    return __uint_as_float(s << 16);
+}
 
 // ---- LDS staging, shared by both fp8a8 instantiations -------------------------------------------
 //

@@ -25,6 +25,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace rad {
 
@@ -48,6 +49,16 @@ struct GenSampling {
      * indistinguishable from a configured sampler in every other way. */
     static std::string describe(const SamplingParams& sp);
 };
+
+/* WHERE EACH OF THE FOUR FIELDS SERVED CAME FROM, for the startup report (core/diag/diag.h): one
+ * entry a field no flag set, with the option that would have set it, the value served and why.
+ * `stated` is what the source in force read and `src` that source's name ("" for none). A source
+ * can state some fields and not others -- a generation_config.json with a temperature and no
+ * top_k -- and a field it left out is served SamplingParams' own value, so the reason is per field:
+ * one reason for all four would name the file for values that never came from it. */
+struct GenFieldSource { std::string flag, value, why; };
+std::vector<GenFieldSource> gen_sampling_sources(const GenSampling& stated, const std::string& src,
+                                                 const SamplingParams& served, const Config& cfg);
 
 /* Parse the sampler fields out of generation_config.json TEXT. `src` names the origin in any
  * warning. Returns whether anything was taken. Unparseable text warns and takes nothing. */

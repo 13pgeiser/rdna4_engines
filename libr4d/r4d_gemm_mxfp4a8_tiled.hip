@@ -300,13 +300,19 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
     for (int i = 0; i < TM; ++i) {
       const int m = m0 + wm * TM * 16 + i * 16 + col;
       if (m >= M) continue;
-      union { __hip_bfloat16 h[8]; mxt_u4 v; } o;
+      // rounded as (__hip_bfloat16) rounds, packed in whole registers (see bf16x2_rne_nan)
+      float v[8];
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
         const float rf = __int_as_float((int)((rb[e >> 2] >> (8 * (e & 3))) & 0xFF) << 23);
-        o.h[e] = (__hip_bfloat16)(acc[i][j][e] * rf * sc[i]);
+        v[e] = acc[i][j][e] * rf * sc[i];
       }
-      *(mxt_u4*)(C + (size_t)m * N + nb) = o.v;
+      mxt_u4 o;
+      o.x = bf16x2_rne_nan(v[0], v[1]);
+      o.y = bf16x2_rne_nan(v[2], v[3]);
+      o.z = bf16x2_rne_nan(v[4], v[5]);
+      o.w = bf16x2_rne_nan(v[6], v[7]);
+      *(mxt_u4*)(C + (size_t)m * N + nb) = o;
     }
   }
 }

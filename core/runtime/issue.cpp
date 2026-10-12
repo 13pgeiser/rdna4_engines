@@ -873,7 +873,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * operand 0 carries the dtype it is sent in, which is the ACTIVATION's dtype and not the op's
      * `dtype` key -- that key is the architecture's operand-combination spelling ("w4a8"), which
      * is not an element width. Two relaxed adds on seventeen issues a step. */
-    if (p.collective && n_opd > 0) {
+    if (p.billed && n_opd > 0) {
         const int bits = rad_dtype_bits(t[0].dtype);
         ar_calls_.fetch_add(1, std::memory_order_relaxed);
         if (bits > 0) ar_bytes_.fetch_add(n * bits / 8, std::memory_order_relaxed);
@@ -991,6 +991,24 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     if (host_paused) tape_pause(true);
     const int rec0 = rec_ && !host_paused ? tape_mark() : 0;
 
+    /* A COLLECTIVE HAS THE CARD'S LINK TO ITSELF in a pass the stager copies weights through: the
+     * stager's lists yield while the hold is in force (rad_link_hold says why). Taken here, after
+     * every wait this op's operands put on the stream, so the stream waits on nothing between the
+     * hold and its release -- a weight it waited on could be behind a yielding list. */
+    const bool hold = staging_ && p.collective && dom == RAD_DOMAIN_DEVICE;
+    const RadArgs* la = &ip.args;
+    RadArgs gate_args;
+    if (hold) {
+        const int hs = rad_link_hold(cur_stream(), 1);
+        if (hs < 0) return abort_step(h, b, dom, ip, n, hs);
+        if (ip.gate_p) {
+            gate_args = ip.args;
+            gate_args.p = ip.gate_p;
+            gate_args.n_p = ip.gate_n_p;
+            la = &gate_args;
+        }
+    }
+
     int s;
     if (profiling_ && dom == RAD_DOMAIN_HOST) {
 
@@ -1007,7 +1025,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
          * Wall clock and not a device event, so it includes whatever the host call waits on:
          * page faults, the link read of its input, everything. That is the number that matters. */
         const auto t0 = std::chrono::steady_clock::now();
-        s = ip.launch(&ip.args, cur_stream());
+        s = ip.launch(la, cur_stream());
         const auto t1 = std::chrono::steady_clock::now();
         prof_ms_[(size_t)h] +=
             std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1020,12 +1038,13 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         if (prof_n_ < prof_ring_.size()) {
             ProfSlot& ps = prof_ring_[prof_n_++];
             ps.op = (int32_t)h;
+            ps.lane = (uint8_t)lane_;
             rad_event_record(ps.a, cur_stream());
-            s = ip.launch(&ip.args, cur_stream());
+            s = ip.launch(la, cur_stream());
             rad_event_record(ps.b, cur_stream());
         } else {
             prof_overflowed_ = true;
-            s = ip.launch(&ip.args, cur_stream());
+            s = ip.launch(la, cur_stream());
         }
     /* RANK 0 ONLY, FOR THE SECOND TIME IN THIS FILE. `Ctx::issue` runs on every rank thread, so a
      * file-scope accumulator is written by both. Unguarded, the digest above gives wrong NUMBERS
@@ -1034,7 +1053,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      * race at all. Anything this instrument accumulates belongs to one thread. */
     } else if (g_dbg_issue && rank() == 0) {
         const auto ta = std::chrono::steady_clock::now();
-        s = ip.launch(&ip.args, cur_stream());
+        s = ip.launch(la, cur_stream());
         const auto tb = std::chrono::steady_clock::now();
         using us = std::chrono::duration<double, std::micro>;
         g_iss_own += us(ta - t_iss0).count();
@@ -1081,7 +1100,13 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             g_iss_lau_p = g_iss_lau;
         }
     } else {
-        s = ip.launch(&ip.args, cur_stream());
+        s = ip.launch(la, cur_stream());
+    }
+    if (hold) {
+        /* Released whatever the launch said, by a barrier unless the launch said it ended the hold
+         * itself (RAD_LINK_ENDED): a list waiting on the hold would otherwise never end. */
+        const int hr = rad_link_hold(cur_stream(), la != &ip.args && s == RAD_LINK_ENDED ? 2 : 0);
+        if (hr < 0 && s >= 0) s = hr;
     }
     if (host_paused) tape_pause(false);
 
@@ -1313,6 +1338,17 @@ int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
 
 int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert) {
     return c ? static_cast<rad::Ctx*>(c)->route_counts(layer, n_expert) : nullptr;
+}
+
+int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows,
+                        int64_t n_embd) {
+    return c ? static_cast<rad::Ctx*>(c)->xp_predict(next, h, r0, rows, n_embd) : RAD_E_INVAL;
+}
+int rad_expert_prefetch_mark(RadCtx* c) {
+    return c ? static_cast<rad::Ctx*>(c)->xp_mark() : RAD_E_INVAL;
+}
+int rad_expert_prefetch_step(RadCtx* c, int layer) {
+    return c ? static_cast<rad::Ctx*>(c)->xp_step(layer) : RAD_E_INVAL;
 }
 
 void* rad_weight_ptr(RadCtx* c, rad_weight w) {

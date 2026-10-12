@@ -624,6 +624,31 @@ static bool hand_cases(const Lib& ref, const Lib& avx, bool verbose, int* n_chec
          .pi("M", BAND).pi("n", N).pi("width", WIDTH).pi("dilation", DIL).ps("dtype", "f32");
         hs.push_back(std::move(c));
 
+        /* LFM2's form of the same window: width 3, undilated, no residual and no activation. */
+        const int64_t CW = 3, CHIST = CW - 1, CSL = CHIST + 2;
+        Hand k("M = 64 over 5 rows, verifies of 3 and 2", "causal_conv1d", 1e-5);
+        k.dense(RAD_F32, { T, N }, hfill(55))
+         .dense(RAD_F32, { N, CW }, hfill(56, 0.5f))
+         .dense(RAD_F32, { 2, N, CSL }, hfill(57), true)
+         .idx({ 0, 3, 5 })
+         .idx({ 1, 0 })
+         .idx({ 7, 9 })
+         .idx({ 2, 3 })
+         .dense(RAD_F32, { T, N }, hfill(58), true)
+         .pi("M", BAND).pi("n", N).pi("width", CW).ps("dtype", "f32");
+        hs.push_back(std::move(k));
+
+        /* The antialiased resample ENLARGING a 4 x 4 table (a drawn case's grid is never larger
+         * than the table), one row shrinking it, and a 1 x 1 grid. */
+        static const int32_t kAaCrd[4][6] = { { 0, 6, 3, 1, 0, 5 }, { 0, 8, 4, 2, 0, 1 },
+                                              { 7, 7, 7, 2, 1, 7 }, { 9, 9, 9, 3, 1, 9 } };
+        Hand ga("a 4 x 4 table onto 7 x 9, 2 x 3 and 1 x 1 grids", "grid_embed_aa", 1e-6);
+        ga.dense(RAD_F32, { 6, N }, hfill(59), true)
+          .dense(RAD_F32, { 16, N }, hfill(60))
+          .dense(RAD_I32, { 4, 6 }, [](int64_t i) { return (float)kAaCrd[i / 6][i % 6]; })
+          .pi("M", 6).pi("n", N).pi("side", 4).ps("dtype", "f32");
+        hs.push_back(std::move(ga));
+
         Hand n("M = 64 over 5 rows, verifies of 3 and 2", "ngram_ids", 0.0);
         n.idx({ 11, 12, 13, 21, 22 })
          .dense(RAD_I32, { 2, 2 + 2 }, [](int64_t i) { return (float)(100 + i); }, true)

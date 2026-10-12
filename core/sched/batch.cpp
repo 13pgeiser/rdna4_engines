@@ -1287,24 +1287,29 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
     enc_cu_host_[0] = 0;
     for (const EncoderPart& p : parts) {
         const mm::Item& it = *p.item;
-        const int64_t seg_p = (int64_t)it.grid_h * it.grid_w;
-        const int64_t np = seg_p * p.n_seg;
+        if (p.seg0 < 0 || p.n_seg <= 0 || p.seg0 + p.n_seg > it.n_seg) {
+            RAD_ERR("encoder pass: segments [%d, %d) of an item of %d", p.seg0, p.seg0 + p.n_seg,
+                    it.n_seg);
+            return nullptr;
+        }
+        const int64_t np = it.patch_at(p.seg0 + p.n_seg) - it.patch_at(p.seg0);
         if (it.patch_dim != enc_dim || n_patch + np > enc.max_patches ||
-            n_seg + p.n_seg > max_segs || p.seg0 + p.n_seg > it.n_seg) {
+            n_seg + p.n_seg > max_segs) {
             RAD_ERR("encoder pass: %lld patches in %lld segments do not fit the declared pass of "
                     "%lld patches of %lld elements", (long long)(n_patch + np),
                     (long long)(n_seg + p.n_seg), (long long)enc.max_patches, (long long)enc_dim);
             return nullptr;
         }
         std::memcpy(enc_pix_host_ + n_patch * enc_dim,
-                    it.pixels.data() + (int64_t)p.seg0 * seg_p * enc_dim,
+                    it.pixels.data() + it.patch_at(p.seg0) * enc_dim,
                     (size_t)(np * enc_dim) * sizeof(uint16_t));
         n_patch += np;
-        for (int32_t q = 0; q < p.n_seg; ++q) {
+        for (int32_t q = p.seg0; q < p.seg0 + p.n_seg; ++q) {
+            const int64_t seg_p = it.patch_at(q + 1) - it.patch_at(q);
             enc_cu_host_[n_seg + 1] = enc_cu_host_[n_seg] + (int32_t)seg_p;
             ++n_seg;
+            if (seg_p > max_seg) max_seg = seg_p;
         }
-        if (seg_p > max_seg) max_seg = seg_p;
     }
     /* Coordinates in planes of n_patch, which is what makes planes 0 and 1 a dense [2, n_patch]. */
     {
@@ -1312,10 +1317,9 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         int64_t at = 0;
         for (const EncoderPart& p : parts) {
             const mm::Item& it = *p.item;
-            const int64_t seg_p = (int64_t)it.grid_h * it.grid_w;
-            const int64_t np = seg_p * p.n_seg;
+            const int64_t np = it.patch_at(p.seg0 + p.n_seg) - it.patch_at(p.seg0);
             tmp.resize((size_t)(4 * np));
-            it.coords((int64_t)p.seg0 * seg_p, np, tmp.data());
+            it.coords(it.patch_at(p.seg0), np, tmp.data());
             for (int c = 0; c < 4; ++c)
                 std::memcpy(enc_coord_host_ + c * n_patch + at, tmp.data() + c * np,
                             (size_t)np * sizeof(int32_t));

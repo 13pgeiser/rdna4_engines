@@ -154,6 +154,11 @@ struct QsaIndexer {
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Config& cfg,
                 const Wire& wire, const ActFP8& in, rad_kvgroup* bk);
     void step(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
+    /* The block keys and the tail of the pass's rows and nothing else: no query, no score, no
+     * selection. What a pass that only leaves the layer's state behind asks for (see
+     * AttnGatedFP8::store_kv); the stores are the ones step() makes. */
+    void store(RadCtx* c, const ActFP8& in, const RadBatch* batch) const;
+    bool store_keys(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
@@ -314,38 +319,16 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     return RAD_OK;
 }
 
-inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch) const {
-    if (!on()) return;
+/* THE KEYS A PASS LEAVES BEHIND: the block keys of the blocks its rows complete and the tail of
+ * raw keys after them, out of the projection's raw-key head. False when the step carries no batch
+ * for the indexer's groups. */
+inline bool QsaIndexer::store_keys(RadCtx* c_, const RadBatch* batch) const {
     const int64_t T = batch->n_tok, S = batch->n_seq;
-    const int64_t qw = c.heads * c.head_dim;
     const int64_t nw = (c.heads + 1) * c.head_dim;
-    const int64_t koff = qw;                     /* the raw-key head, after the query heads */
-
-    proj.step(c_, in, w.qk, T);
-    /* ONE LAUNCH OR `heads` + 1. The fused form takes the projection WHOLE -- the kernel picks
-     * head `h` out of it at the operand's own row pitch, so the strided view the unfused norm
-     * needs is not taken at all -- and it writes the query heads contiguous and rotated, which is
-     * what the pair below leaves behind. `n_head` 0 is the k-only form: no q_gate, no q_w, no
-     * q_out, and the ninth operand (`gate_out`) is absent as it is everywhere else.
-     *
-     * `T <= qprep_rows` IS THE TABLE'S BOUND and declare() says why it is correctness. */
-    if (op_qprep && T <= qprep_rows && !rope_mixed(batch)) {
-        RAD_ISSUE_N(c_, op_qprep, T,
-                    RAD_NONE, brows(w.qk, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
-                    RAD_NONE, RAD_W(w_qn),
-                    RAD_NONE, brows(w.q, T), RAD_NONE);
-    } else {
-        for (int64_t h = 0; h < c.heads; ++h)
-            RAD_ISSUE_N(c_, op_norm, T,
-                        bcol_at(w.qk, 0, nw, h * c.head_dim, c.head_dim, T), RAD_W(w_qn),
-                        bcol_at(w.q,  0, qw, h * c.head_dim, c.head_dim, T));
-        RAD_ISSUE_N(c_, op_rope, T, brows(w.q, T), rope_posmc(g, batch, T));
-    }
-
+    const int64_t koff = c.heads * c.head_dim;   /* the raw-key head, after the query heads */
     const RadKVGroupBatch* bkb = kv_batch(batch, kv_bk);
-    const RadKVGroupBatch* atb = kv_batch(batch, c.kv_attn);
     const RadKVGroupBatch* tlb = kv_batch(batch, c.kv_tail);
-    if (!bkb || !atb || !tlb) return;
+    if (!bkb || !tlb) return false;
     /* COLUMN 0 OF THE STATE ROW IS THE COMMITTED SLOT. The row is wider than one whenever the
      * deployment speculates -- the manager gives every linear group a second copy then, because
      * the kernel that needed one asked for it -- and this op wants the committed slot in every
@@ -389,6 +372,46 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
                 praw(batch->cu_seqlens, RAD_I32, S + 1),
                 kv_cache(c.kv_tail, layer),
                 praw2(tlb->state_index, RAD_I32, S, tw));
+    return true;
+}
+
+inline void QsaIndexer::store(RadCtx* c_, const ActFP8& in, const RadBatch* batch) const {
+    if (!on()) return;
+    proj.step(c_, in, w.qk, batch->n_tok);
+    (void)store_keys(c_, batch);
+}
+
+inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch) const {
+    if (!on()) return;
+    const int64_t T = batch->n_tok, S = batch->n_seq;
+    const int64_t qw = c.heads * c.head_dim;
+    const int64_t nw = (c.heads + 1) * c.head_dim;
+
+    proj.step(c_, in, w.qk, T);
+    /* ONE LAUNCH OR `heads` + 1. The fused form takes the projection WHOLE -- the kernel picks
+     * head `h` out of it at the operand's own row pitch, so the strided view the unfused norm
+     * needs is not taken at all -- and it writes the query heads contiguous and rotated, which is
+     * what the pair below leaves behind. `n_head` 0 is the k-only form: no q_gate, no q_w, no
+     * q_out, and the ninth operand (`gate_out`) is absent as it is everywhere else.
+     *
+     * `T <= qprep_rows` IS THE TABLE'S BOUND and declare() says why it is correctness. */
+    if (op_qprep && T <= qprep_rows && !rope_mixed(batch)) {
+        RAD_ISSUE_N(c_, op_qprep, T,
+                    RAD_NONE, brows(w.qk, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
+                    RAD_NONE, RAD_W(w_qn),
+                    RAD_NONE, brows(w.q, T), RAD_NONE);
+    } else {
+        for (int64_t h = 0; h < c.heads; ++h)
+            RAD_ISSUE_N(c_, op_norm, T,
+                        bcol_at(w.qk, 0, nw, h * c.head_dim, c.head_dim, T), RAD_W(w_qn),
+                        bcol_at(w.q,  0, qw, h * c.head_dim, c.head_dim, T));
+        RAD_ISSUE_N(c_, op_rope, T, brows(w.q, T), rope_posmc(g, batch, T));
+    }
+
+    /* The keys first: the selection below reads the blocks they complete. */
+    const RadKVGroupBatch* bkb = kv_batch(batch, kv_bk);
+    const RadKVGroupBatch* atb = kv_batch(batch, c.kv_attn);
+    if (!atb || !store_keys(c_, batch)) return;
 
     /* SCORE AND SELECT OVER EVERY QUERY IN THE STEP. A selection does not have to be per-SEQUENCE
      * even though a block table is: both ops take `cu`, the block table stays the sequence's, and

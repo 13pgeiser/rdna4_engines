@@ -457,18 +457,22 @@ public:
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
 
-    /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
-     * token budget, and the checkpoint position it will land on (-1 for none). */
     /* plan_chunk's checkpoint rules, asked after the fact (see the definitions). */
     bool    last_checkpoint(int64_t pos, int64_t target) const;
     int64_t tail_checkpoint(int64_t target) const;
+    /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
+     * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
+     * request's own checkpoint (Request::checkpoint_at), 0 for none. */
     int64_t plan_chunk(int64_t n_computed, int64_t n_target, int64_t budget,
-                       int64_t* checkpoint_pos) const;
+                       int64_t* checkpoint_pos, int64_t keep_at = 0) const;
 
     /* THE SMALLEST STEP THE PREFILL STAGER OVERLAPS, in tokens (0 = no stager), set once by the
      * engine after init. --busy-prefill-chunk keeps a held-back chunk at or above it; see
      * busy_cap. Also where the resolved policy is stated at startup. */
     void    set_stage_rows(int64_t rows);
+    /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
+     * to prefill, so the next step most likely carries a chunk the stager arms for. */
+    bool    prefill_continues() const;
     /* Visible for tests: the most a prefill chunk at `n_computed` of a `n_target`-token sequence
      * may take of `budget` when `reserve` tokens of other work are still to be planned in the step
      * and `shared` says rows are already planned ahead of it. Returns `budget` when

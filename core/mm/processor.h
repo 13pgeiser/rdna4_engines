@@ -49,8 +49,14 @@ enum class Kind { Image, Video, Audio };
  *           fits the soft-token budget (budget * pooling^2), aspect ratio kept; patches (y, x,
  *           channel) as 2 * (u / 255) - 1, the reference model's own input scaling; a video is
  *           frames sampled at `fps` (at most `max_frames`, thinned evenly), each its own segment
- *           at the per-frame budget, each spelled <boi> placeholders <eoi> with no timestamp. */
-enum class Family { QwenVL, Gemma4 };
+ *           at the per-frame budget, each spelled <boi> placeholders <eoi> with no timestamp.
+ *   Lfm2    LFM2-VL's: a picture within its token budget (times a tolerance) is resized whole --
+ *           sides multiples of patch * merge, pixels within the budget's band -- and one past it
+ *           is cut into tile x tile crops, min_tiles..max_tiles of them in the ratio nearest its
+ *           own, followed by the whole picture at the budgeted size as a thumbnail. Patches
+ *           (y, x, channel) normalised by the mean and deviation, resized with torchvision's
+ *           fixed-point bicubic; images only, and the tokens rotate at their positions. */
+enum class Family { QwenVL, Gemma4, Lfm2 };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -69,6 +75,11 @@ struct VisionConfig {
     float   mean[3] = { 0.5f, 0.5f, 0.5f };
     float   stdv[3] = { 0.5f, 0.5f, 0.5f };
     int32_t tok_image = -1, tok_video = -1, tok_start = -1, tok_end = -1;
+    /* Lfm2: the tiling (see Family). `max_segment_patches` is the tower's longest segment. */
+    int32_t min_tiles = 0, max_tiles = 0, tile = 0;
+    bool    use_thumbnail = false;
+    double  max_pixels_tolerance = 0.0;
+    int64_t max_segment_patches = 0;
 
     /* THE DEPLOYMENT'S BOUNDS, not the checkpoint's. `max_patches` is the encoder's pass size: an
      * image is one segment and a segment is never split, so no image may resize past it, and the
@@ -139,7 +150,30 @@ struct Item {
     /* An audio clip's REAL feature frames; the rest of its `grid_h` are the zero frames that make
      * it whole output rows. 0 for a picture or a video. */
     int32_t valid = 0;
-    int64_t n_rows() const { return (int64_t)n_seg * seg_rows; }
+
+    /* SEGMENTS OF THEIR OWN SIZE, when an item's segments differ -- an LFM2-VL picture is its
+     * tiles and a thumbnail -- each `h` x `w` patches from patch `patch0` on. Empty, every segment
+     * is grid_h x grid_w (a picture, a video's temporal groups, an audio clip). The accessors
+     * below are the only way the rest of the engine reads a segment, so both forms look alike. */
+    struct Segment { int32_t h = 0, w = 0; int64_t patch0 = 0; };
+    std::vector<Segment> segments;
+    /* The model rotates this item's tokens at their token positions (LFM2-VL's 1-D rotary), not
+     * on the grid the Qwen-VL family's M-RoPE lays out (RopeLayout). */
+    bool rope_1d = false;
+
+    int32_t seg_h(int32_t s) const { return segments.empty() ? grid_h : segments[(size_t)s].h; }
+    int32_t seg_w(int32_t s) const { return segments.empty() ? grid_w : segments[(size_t)s].w; }
+    /* Segment s's first patch and first output row; s == n_seg is the end of the item. */
+    int64_t patch_at(int32_t s) const {
+        if (segments.empty()) return (int64_t)s * grid_h * grid_w;
+        return s >= n_seg ? n_patch : segments[(size_t)s].patch0;
+    }
+    int64_t row_at(int32_t s) const {
+        if (segments.empty()) return (int64_t)s * seg_rows;
+        const int64_t m = rows_h > 0 ? grid_h / rows_h : 1;
+        return patch_at(s) / (m * m);
+    }
+    int64_t n_rows() const { return row_at(n_seg); }
 
     /* THE TOKENS THAT REPLACE THE MEDIA MARKER, and where in them each segment's run of
      * placeholders starts. Placeholders are the checkpoint's own pad ids, not an arbitrary one:
@@ -175,6 +209,7 @@ struct RopeLayout {
         int32_t shift = 0;      /* rotary minus token index for the text AFTER the run */
         int32_t item = 0;       /* which of PromptMedia::items the run belongs to */
         int32_t row0 = 0;       /* the item's encoder row that its first token takes */
+        bool    flat = false;   /* Item::rope_1d: the run's tokens rotate at their positions */
     };
     std::vector<Run> runs;      /* ascending */
 
@@ -195,7 +230,7 @@ struct RopeLayout {
         const Run* r = last_at(i);
         if (!r) { out[0] = out[1] = out[2] = (int32_t)i; return; }
         const int64_t k = i - r->tok;
-        if (k < r->n) {
+        if (k < r->n && !r->flat) {
             out[0] = r->base;
             out[1] = r->base + (int32_t)(k / r->w);
             out[2] = r->base + (int32_t)(k % r->w);
@@ -231,14 +266,18 @@ struct PromptMedia {
 class Processor {
 public:
     /* `encode_text` tokenises the timestamp text between a video's groups: plain text, no
-     * special tokens added and none parsed. */
-    int init(const VisionConfig& cfg, std::function<std::vector<int32_t>(const std::string&)> encode_text);
+     * special tokens added and none parsed. `token_id` is the id of the vocabulary entry spelled
+     * exactly so, or -1: how a family whose markers the config does not number (LFM2-VL's tile
+     * and thumbnail markers) finds them. */
+    int init(const VisionConfig& cfg, std::function<std::vector<int32_t>(const std::string&)> encode_text,
+             std::function<int32_t(const std::string&)> token_id = {});
     const VisionConfig& config() const { return cfg_; }
 
     /* `image_tokens` is a Gemma 4 soft-token budget for this image (0: the configured one); a
-     * processor that sizes images by pixels refuses a non-zero one. */
+     * processor that sizes images by pixels refuses a non-zero one. `max_pixels`, when set, first
+     * scales a larger picture down to that area (PIL's bicubic), as a caller's own pipeline may. */
     int image(const uint8_t* bytes, size_t n, int32_t image_tokens, std::shared_ptr<Item>* out,
-              std::string* why) const;
+              std::string* why, int64_t max_pixels = 0) const;
     int video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
 
     /* The pieces, exposed for the test suite: an already-decoded picture or frame list. */
@@ -257,6 +296,10 @@ public:
 private:
     int image_gemma4(const Frame& f, int32_t soft, std::shared_ptr<Item>* out,
                      std::string* why) const;
+    int image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    /* Lfm2's markers: <|img_thumbnail|>, and <|img_row_R_col_C|> at (R-1) * max_tiles + C-1. */
+    int32_t              tok_thumbnail_ = -1;
+    std::vector<int32_t> tok_tiles_;
     int video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
     VisionConfig cfg_{};
@@ -288,6 +331,24 @@ int gemma4_size(int64_t h, int64_t w, int32_t patch, int32_t pool, int64_t max_p
 /* PIL's antialiased bicubic resample of packed RGB, bit for bit: fixed-point coefficients, a
  * horizontal pass into an 8-bit intermediate and then a vertical one. */
 void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out);
+/* ...and torchvision's on a uint8 tensor (ATen's CPU kernel), which is the same filter with the
+ * coefficients at the most precision 16 bits hold, chosen per axis, rather than PIL's 22. */
+void resize_bicubic_torch(const Frame& in, int32_t w, int32_t h, Frame* out);
+/* LFM2-VL's smart_resize: (height, width) to multiples of `factor`, at least one each, pixels
+ * within [min_px, max_px] where the rounding left them outside. */
+void lfm2_size(int64_t h, int64_t w, int32_t factor, int64_t min_px, int64_t max_px,
+               int64_t* oh, int64_t* ow);
+/* LFM2-VL's test for a picture to tile: its sides rounded to whole merged patches cover more than
+ * `max_px` times `tolerance` pixels. */
+bool lfm2_too_large(int64_t h, int64_t w, int32_t patch, int32_t factor, int64_t max_px,
+                    double tolerance);
+/* A picture over `max_pixels` scaled down to that area with PIL's bicubic, sides truncated; any
+ * other picture as it is. */
+void cap_area(const Frame& in, int64_t max_pixels, Frame* out);
+/* LFM2-VL's tile grid for a w x h picture: (columns, rows) of the min..max-tile ratio nearest its
+ * aspect, the larger grid of two equally near when the picture fills over half of it. */
+void lfm2_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32_t tile,
+               int32_t* cols, int32_t* rows);
 
 }  /* namespace mm */
 }  /* namespace rad */
