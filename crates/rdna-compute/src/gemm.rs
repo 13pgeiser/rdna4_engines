@@ -1066,6 +1066,41 @@ pub(crate) fn pm_check_output_extent(
     ))
 }
 
+/// Largest Y extent, in bytes, of the MoE symmetric IU4 builder-module down GEMM
+/// (`qwen4_moe_down_iu4_sym_pm_*`): it stores through the original Y base with a raw
+/// `0xffffffff` descriptor and a 32-bit global byte offset (`YOFF`), so the grouped-row
+/// BF16 output must stay `<= u32::MAX` bytes (>= 2^32 wraps onto the head of Y).
+pub(crate) const PM_MOE_DOWN_EXTENT_LIMIT_BYTES: usize = u32::MAX as usize;
+
+/// `grouped_rows * m * 2` (BF16 bytes of the `[grouped_rows, m]` down output) when it
+/// fits [`PM_MOE_DOWN_EXTENT_LIMIT_BYTES`]; `None` on overflow or when too large.
+pub(crate) fn pm_moe_down_extent_bytes(grouped_rows: usize, m: usize) -> Option<usize> {
+    grouped_rows
+        .checked_mul(m)?
+        .checked_mul(2)
+        .filter(|&bytes| bytes <= PM_MOE_DOWN_EXTENT_LIMIT_BYTES)
+}
+
+/// Refuses a MoE symmetric PM down launch whose actual grouped output (`grouped_rows`
+/// after tile padding, `m` output channels, BF16) exceeds the 32-bit byte offset.
+pub(crate) fn pm_check_moe_down_extent(func: &str, grouped_rows: usize, m: usize) -> HipResult<()> {
+    if pm_moe_down_extent_bytes(grouped_rows, m).is_some() {
+        return Ok(());
+    }
+    let extent = grouped_rows
+        .checked_mul(m)
+        .and_then(|elems| elems.checked_mul(2))
+        .map_or_else(|| "overflows usize".to_string(), |bytes| format!("{bytes} bytes"));
+    Err(hip_bridge::HipError::new(
+        0,
+        &format!(
+            "{func}: u32 PM MoE down extent {grouped_rows} grouped rows x {m} x 2 B = {extent} \
+             must be <= u32::MAX bytes (32-bit Y byte offset); slice the prefill into smaller \
+             row chunks"
+        ),
+    ))
+}
+
 /// Whether a PM launch's M/K/N kernel arguments and input descriptors are addressable:
 /// `m`, `k`, `n` fit the kernels' `i32` arguments, the weight stream
 /// `m * (k / 256) * group_bytes` stays within the raw `0x7fffffff` A descriptor
@@ -46610,6 +46645,11 @@ impl Gpu {
                 &format!("{func}: x_row_div * x_src_rows must not exceed {QWEN4_MOE_SYM_PM_MAX_SLOTS}"),
             ));
         }
+        // Builder down entries index Y with a 32-bit byte offset; the slot guard above
+        // does not bound Y. The incumbent hipcc entry (pm == false) is not bound.
+        if pm && down {
+            pm_check_moe_down_extent(func, dims[3], dims[0])?;
+        }
         self.bind_thread()?;
         if pm {
             let image = if arch == 0 { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151 } else { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201 };
@@ -48009,6 +48049,38 @@ mod route_selector_tests {
         assert!(err.contains("overflows usize"), "{err}");
         assert!(pm_check_hc_streams_extent("streams", 2, usize::MAX / 2 + 1, 2).is_err());
         assert!(pm_check_hc_streams_extent("streams", 2, usize::MAX / 4, 1).is_err());
+    }
+
+    #[test]
+    fn pm_moe_down_extent_u32_byte_offset_bound() {
+        let (h, g_std) = (2560usize, 89_600usize);
+        // Standard R = 8192 chunk: G = ceil16(10R + 15 * min(10R, 512)) = 89600 rows.
+        let g_calc = (10 * 8192usize + 15 * (10 * 8192usize).min(512)).div_ceil(16) * 16;
+        assert_eq!(g_calc, g_std);
+        assert_eq!(pm_moe_down_extent_bytes(g_std, h), Some(458_752_000));
+        assert!(pm_check_moe_down_extent("down", g_std, h).is_ok());
+        // R = 83200: G = 839680 rows -> 4_299_161_600 bytes >= 2^32.
+        let g_big = (10 * 83_200usize + 15 * 512).div_ceil(16) * 16;
+        assert_eq!(g_big, 839_680);
+        assert_eq!(pm_moe_down_extent_bytes(g_big, h), None);
+        let err = pm_check_moe_down_extent("down", g_big, h)
+            .expect_err("over-4GiB grouped output must be refused")
+            .to_string();
+        assert!(err.contains("u32 PM MoE down extent"), "{err}");
+        assert!(err.contains("4299161600"), "{err}");
+        // Exact boundary: u32::MAX bytes allowed, 2^32 refused (2 B elements).
+        assert_eq!(pm_moe_down_extent_bytes(1, (u32::MAX as usize - 1) / 2), Some(u32::MAX as usize - 1));
+        assert_eq!(pm_moe_down_extent_bytes(1 << 16, 1 << 15), None); // exactly 2^32
+        assert!(pm_moe_down_extent_bytes((1 << 16) - 1, 1 << 15).is_some());
+        // Between 2^31 and 2^32 is allowed here (the MoE down uses the u32 offset).
+        assert!(pm_moe_down_extent_bytes(1 << 15, 1 << 15).is_some());
+        // Arithmetic overflow is refused with a clear message.
+        let err = pm_check_moe_down_extent("down", usize::MAX, 2)
+            .expect_err("usize overflow must be refused")
+            .to_string();
+        assert!(err.contains("overflows usize"), "{err}");
+        assert!(pm_moe_down_extent_bytes(1 << 40, 1 << 40).is_none());
+        assert!(pm_moe_down_extent_bytes(0, usize::MAX).is_some());
     }
 
     #[test]
