@@ -1652,10 +1652,13 @@ impl DeltaNetSnapshot {
     /// * per layer and family the live buffer and its snapshot buffer have
     ///   the SAME allocated size, and it is at least the exact logical extent
     ///   the kernels write (S = Hv*128^2, scales = Hv*128*4, conv =
-    ///   (2*Hk+Hv)*128*3*4, EF = Hv*128^2*2). S and EF are exact; scales and
-    ///   conv rings may be pool-rounded up (the kernels write only the
-    ///   logical extent). Equal sizes mean an exchange keeps every owner's
-    ///   capacity unchanged. `GpuTensor::byte_size` is NOT used: the Q8 S
+    ///   (2*Hk+Hv)*128*3*4, EF = Hv*128^2*2). S is exact (a direct malloc);
+    ///   scales, conv rings and EF are pooled (`gpu.zeros`) and may be
+    ///   rounded up (the kernels touch only the logical extent). Equal sizes
+    ///   mean an exchange keeps every owner's capacity unchanged (a reused
+    ///   EF bucket of 1,986,560 B for a 1,572,864 B extent refused most
+    ///   sampled C8 chunks before EF was relaxed). `GpuTensor::byte_size` is
+    ///   NOT used: the Q8 S
     ///   container's metadata is F32;
     /// * every buffer on both sides is a HIP-owned allocation (no borrowed
     ///   lane view, VMM arena or host-mapped buffer), so exchanging the
@@ -1689,7 +1692,7 @@ impl DeltaNetSnapshot {
             && fam_ok(&state.s_matrices, &self.s_matrix_bufs, n, ext.s, true)
             && fam_ok(&state.s_scales, &self.s_scale_bufs, n, ext.scales, false)
             && fam_ok(&state.conv_states, &self.conv_state_bufs, n, ext.conv, false)
-            && fam_ok(&state.s_ef_residual, &self.s_ef_residual_bufs, n, ext.ef, true)
+            && fam_ok(&state.s_ef_residual, &self.s_ef_residual_bufs, n, ext.ef, false)
     }
 
     /// Every buffer of `state` and of this snapshot is a HIP-owned allocation.
@@ -13404,11 +13407,17 @@ mod dn_exchange_tests {
         bad_snap.s_matrix_bufs[0] = buf(addr(SNAP, 0, 0), EXT.s + 4096);
         assert!(!bad_snap.exact_extents(&bad, &EXT), "S must stay exact");
 
+        // EF is pooled (`gpu.zeros`), so a reused bucket can be rounded up:
+        // equal rounded banks are admitted (kernels touch only the logical
+        // extent, the exchange keeps each owner's capacity).
+        let mut ok = state(LIVE);
+        ok.s_ef_residual[0].buf = buf(addr(LIVE, 3, 0), EXT.ef + 4096);
+        let mut ok_snap = snapshot(SNAP, &st);
+        ok_snap.s_ef_residual_bufs[0] = buf(addr(SNAP, 3, 0), EXT.ef + 4096);
+        assert!(ok_snap.exact_extents(&ok, &EXT), "equal pool-rounded EF banks are admitted");
         let mut bad = state(LIVE);
         bad.s_ef_residual[0].buf = buf(addr(LIVE, 3, 0), EXT.ef + 4096);
-        let mut bad_snap = snapshot(SNAP, &st);
-        bad_snap.s_ef_residual_bufs[0] = buf(addr(SNAP, 3, 0), EXT.ef + 4096);
-        assert!(!bad_snap.exact_extents(&bad, &EXT), "EF must stay exact");
+        assert!(!sn.exact_extents(&bad, &EXT), "unequal EF banks");
 
         let mut bad = state(LIVE);
         bad.s_ef_residual.pop();

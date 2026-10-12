@@ -1035,6 +1035,203 @@ pub fn dflash_cb_verify(
     Ok(())
 }
 
+/// `HIPFIRE_CB_DN_SAVE_FREE_DIAG=1` (developer var, default off, process
+/// snapshot): [`cb_dn_save_free_admitted`] writes one stderr line per packed
+/// chunk naming the FIRST failing predicate, for
+/// attributing why a chunk keeps the SAVE route. Investigative only: it never
+/// changes the verdict, and when off nothing below runs (no formatting, no
+/// allocation, no extra family walk).
+static CB_DN_SAVE_FREE_DIAG: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_CB_DN_SAVE_FREE_DIAG", false));
+
+/// Early-return refusal of [`cb_dn_save_free_admitted`]. The detail arguments
+/// are only evaluated when `$diag` is set.
+macro_rules! dn_sf_refuse {
+    ($diag:expr, $gpu:expr, $lanes:expr, $lane:expr, $reason:literal, $($detail:tt)+) => {{
+        if $diag {
+            dn_sf_log($gpu, $lanes, $lane, concat!("refuse=", $reason), format_args!($($detail)+));
+        }
+        return false;
+    }};
+}
+
+/// One diagnostic line: chunk lane count / rows / per-lane `b` and sample
+/// temperature, the offending lane's `b`, tape capacity and KV
+/// `compact_offset` when `lane` is given, the process VARROWS switch and the
+/// replay-graph / Redline flags, then the reason-specific `detail`.
+fn dn_sf_log(
+    gpu: &Gpu,
+    lanes: &[DflashCbVerifyLane<'_>],
+    lane: Option<usize>,
+    verdict: &str,
+    detail: std::fmt::Arguments<'_>,
+) {
+    use std::fmt::Write as _;
+    let mut per_lane = String::new();
+    let mut rows = 0usize;
+    let _ = per_lane.write_str(" b=[");
+    for (i, l) in lanes.iter().enumerate() {
+        let b = l.draft.verify_tokens.len();
+        rows += b;
+        let _ = write!(per_lane, "{}{b}", if i == 0 { "" } else { "," });
+    }
+    let _ = per_lane.write_str("] sample_temp=[");
+    for (i, l) in lanes.iter().enumerate() {
+        let _ = write!(per_lane, "{}{}", if i == 0 { "" } else { "," }, l.state.sample_temp);
+    }
+    per_lane.push(']');
+    if let Some((i, l)) = lane.and_then(|i| lanes.get(i).map(|l| (i, l))) {
+        let _ = write!(
+            per_lane,
+            " lane={i} b_i={} tape_max_n={} compact_offset={}",
+            l.draft.verify_tokens.len(),
+            l.state.df.gdn_tape.max_n,
+            l.kv_cache.compact_offset,
+        );
+    }
+    eprintln!(
+        "[cb-dn-save-free-diag] {verdict} lanes={} rows={rows} b0={} varrows={} replay_enabled={} replay_graphs={}{per_lane} {detail}",
+        lanes.len(),
+        lanes.first().map_or(0, |l| l.draft.verify_tokens.len()),
+        lane_gdn_varrows_enabled(),
+        gpu.replay.is_enabled(),
+        gpu.graphs.replay_graph_count(),
+    );
+}
+
+/// Components of [`GdnTape::replay_from_snapshot_admits`] (its private
+/// `replay_ml_admits` rebuilt from public fields), reported separately.
+fn dn_sf_replay_detail(
+    gpu: &Gpu,
+    state: &DeltaNetState,
+    tape: &crate::speculative::GdnTape,
+    snap: &DeltaNetSnapshot,
+    b: usize,
+) -> String {
+    use rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS;
+    let n_la = tape.qkv_bufs.len();
+    format!(
+        "dn_snapshot_flip={} q8={} n_la={n_la} steps_le_tape_max_n={} s_len_eq_n_la={} conv_len_eq_n_la={} \
+         backend_replay_eligible={} (supported={} recording={} steps_in_1..={}={}) mirrors={} \
+         live_ef_len={} snap_ef_len={}",
+        gpu.flags.dn_snapshot_flip,
+        state.quant == qwen35::StateQuant::Q8,
+        b <= tape.max_n,
+        state.s_matrices.len() == n_la,
+        state.conv_states.len() == n_la,
+        gpu.gdn_replay_ml_eligible(tape.n_v_heads, tape.n_key_heads, tape.key_head_dim, tape.value_head_dim, b),
+        gpu.gdn_replay_ml_supported(tape.n_v_heads, tape.n_key_heads, tape.key_head_dim, tape.value_head_dim),
+        gpu.replay.is_recording(),
+        DFLASH_GDN_REPLAY_MAX_STEPS,
+        (1..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&b),
+        snap.mirrors(state),
+        state.s_ef_residual.len(),
+        snap.s_ef_len(),
+    )
+}
+
+/// First failing family/layer of [`DeltaNetSnapshot::cb_verify_owned_exact`],
+/// walked in its own order (geometry, layer count, Q8, S, scales, conv, EF
+/// extents, then HIP ownership). It runs only after `mirrors` passed, so each
+/// snapshot buffer has the live buffer's allocated size; the snapshot's
+/// buffers are private, so its ownership is reported by elimination.
+/// The logical extents repeat `DnCbExtents::for_config` (private to
+/// `speculative.rs`).
+fn dn_sf_owned_detail(state: &DeltaNetState, snap: &DeltaNetSnapshot, config: &Qwen35Config) -> String {
+    if config.conv_kernel_dim != 4 || config.linear_key_head_dim != 128 || config.linear_value_head_dim != 128 {
+        return format!(
+            "geometry conv_kernel_dim={} key_head_dim={} value_head_dim={} (exact kernels need 4/128/128)",
+            config.conv_kernel_dim, config.linear_key_head_dim, config.linear_value_head_dim
+        );
+    }
+    let (hv, hk) = (config.linear_num_value_heads, config.linear_num_key_heads);
+    let n = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == qwen35::LayerType::LinearAttention)
+        .count();
+    if n == 0 {
+        return "no_deltanet_layers".to_string();
+    }
+    if state.quant != qwen35::StateQuant::Q8 {
+        return format!("state_quant={:?} (need Q8)", state.quant);
+    }
+    let conv_channels = 2 * hk * 128 + hv * 128;
+    let fams: [(&str, &[rdna_compute::GpuTensor], usize, bool); 4] = [
+        ("s", state.s_matrices.as_slice(), hv * 128 * 128, true),
+        ("scales", state.s_scales.as_slice(), hv * 128 * 4, false),
+        ("conv", state.conv_states.as_slice(), conv_channels * 3 * 4, false),
+        ("ef", state.s_ef_residual.as_slice(), hv * 128 * 128 * 2, true),
+    ];
+    for (name, live, logical, exact) in fams {
+        if live.len() != n {
+            return format!("family={name} live_len={} expected_layers={n}", live.len());
+        }
+        for (la, t) in live.iter().enumerate() {
+            let sz = t.buf.size();
+            if if exact { sz != logical } else { sz < logical } {
+                return format!(
+                    "family={name} layer={la} live_alloc={sz} snap_alloc_inferred={sz}(from mirrors==true; not read) \
+                     logical={logical} exact_required={exact} hip_owned_live={}",
+                    t.buf.is_hip_allocation()
+                );
+            }
+        }
+    }
+    for (name, live, _, _) in fams {
+        for (la, t) in live.iter().enumerate() {
+            if !t.buf.is_hip_allocation() {
+                return format!(
+                    "family={name} layer={la} live_not_hip_owned vmm={} borrowed={}",
+                    t.buf.is_vmm_owner(),
+                    t.buf.is_borrowed()
+                );
+            }
+        }
+    }
+    format!(
+        "snapshot_hip_ownership=INFERRED_not_observed (candidate: snapshot buffers not HIP-owned, by elimination only: \
+         geometry, extents and live ownership passed; snapshot buffers are private and were not inspected) \
+         snap_bytes={} live_bytes={}",
+        snap.bytes_len(),
+        DeltaNetSnapshot::bytes_for(state)
+    )
+}
+
+/// The first duplicated owner pointer of the sorted chunk vector, how often it
+/// occurs, and every `lane:bank:family[layer]` slot holding it
+/// (`push_owner_ptrs` order: live S/scales/conv/EF then the snapshot's).
+fn dn_sf_alias_detail(lanes: &[DflashCbVerifyLane<'_>], sorted: &[u64]) -> String {
+    use std::fmt::Write as _;
+    let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]).map(|w| w[0]) else {
+        return String::new();
+    };
+    let mut out = format!("dup_ptr={dup:#x} occurrences={} slots:", sorted.iter().filter(|&&p| p == dup).count());
+    let mut tmp: Vec<u64> = Vec::new();
+    for (li, lane) in lanes.iter().enumerate() {
+        let state: &DeltaNetState = &*lane.dn_state;
+        tmp.clear();
+        lane.state.df.target_snap.push_owner_ptrs(state, &mut tmp);
+        let lens = [
+            state.s_matrices.len(),
+            state.s_scales.len(),
+            state.conv_states.len(),
+            state.s_ef_residual.len(),
+        ];
+        let live_len: usize = lens.iter().sum();
+        for (idx, _) in tmp.iter().enumerate().filter(|(_, p)| **p == dup) {
+            let (bank, mut rel) = if idx < live_len { ("live", idx) } else { ("snap", idx - live_len) };
+            let mut fam = 0;
+            while fam < 3 && rel >= lens[fam] {
+                rel -= lens[fam];
+                fam += 1;
+            }
+            let _ = write!(out, " {li}:{bank}:{}[{rel}]", ["s", "scales", "conv", "ef"][fam]);
+        }
+    }
+    out
+}
+
 /// Whole-chunk admission of the save-free DeltaNet verify for one packed chunk
 /// (`lanes` = the chunk's lanes), checked BEFORE any owner is exchanged. All
 /// of the following must hold, otherwise the chunk takes today's SAVE route
@@ -1076,41 +1273,104 @@ pub(crate) fn cb_dn_save_free_admitted(
     lanes: &[DflashCbVerifyLane<'_>],
 ) -> bool {
     use rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS;
+    let diag = *CB_DN_SAVE_FREE_DIAG;
     let Some(first) = lanes.first() else {
-        return false;
+        dn_sf_refuse!(diag, gpu, lanes, None, "empty", "")
     };
     let b0 = first.draft.verify_tokens.len();
     let varrows = lane_gdn_varrows_enabled();
-    if !cb_dn_save_free_enabled()
-        || !gpu.arch_caps.is_gfx1201()
-        || !trunk.gdn_from_ready()
-        || !lane_gdn_batch_ready(gpu, config, lanes.len())
-        || gpu.replay.is_enabled()
-        || gpu.graphs.replay_graph_count() != 0
-    {
-        return false;
+    // Same order and short-circuit as the single `||` chain this replaces.
+    if !cb_dn_save_free_enabled() {
+        dn_sf_refuse!(diag, gpu, lanes, None, "disabled", "")
+    }
+    if !gpu.arch_caps.is_gfx1201() {
+        dn_sf_refuse!(diag, gpu, lanes, None, "arch", "")
+    }
+    if !trunk.gdn_from_ready() {
+        dn_sf_refuse!(diag, gpu, lanes, None, "trunk_from_unready", "")
+    }
+    if !lane_gdn_batch_ready(gpu, config, lanes.len()) {
+        dn_sf_refuse!(
+            diag,
+            gpu,
+            lanes,
+            None,
+            "lane_gdn_unready",
+            "conv_lanes_max={} backend_lane_gdn_admitted={} recording={} capture={} g0_observing={} \
+             env_LANE_GDN_BATCH={:?} env_TAPE_COPY_BATCH={:?}",
+            rdna_compute::lane_gdn::CONV_LANES_MAX,
+            gpu.lane_gdn_batch_admitted(
+                config.linear_num_value_heads,
+                config.linear_num_key_heads,
+                config.linear_key_head_dim,
+                config.linear_value_head_dim,
+            ),
+            gpu.replay.is_recording(),
+            gpu.graphs.capture_mode,
+            gpu.replay.is_g0_observing(),
+            hipfire_config::developer_var("HIPFIRE_CB_LANE_GDN_BATCH").ok(),
+            hipfire_config::developer_var("HIPFIRE_CB_TAPE_COPY_BATCH").ok(),
+        )
+    }
+    if gpu.replay.is_enabled() {
+        dn_sf_refuse!(diag, gpu, lanes, None, "redline_replay_enabled", "")
+    }
+    if gpu.graphs.replay_graph_count() != 0 {
+        dn_sf_refuse!(diag, gpu, lanes, None, "replay_graphs", "")
     }
     let mut ptrs: Vec<u64> = Vec::with_capacity(lanes.len() * 8 * config.n_layers);
-    for lane in lanes {
+    for (li, lane) in lanes.iter().enumerate() {
         let df = &lane.state.df;
         let state: &DeltaNetState = &*lane.dn_state;
         let kv: &KvCache = &*lane.kv_cache;
         let b_i = lane.draft.verify_tokens.len();
-        if !(2..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&b_i)
-            || !(varrows || b_i == b0)
-            || b_i > df.gdn_tape.max_n
-            || !df.gdn_tape.snapshot_source_armed()
-            || !df.gdn_tape.replay_from_snapshot_admits(gpu, state, &df.target_snap, b_i)
-            || !df.target_snap.cb_verify_owned_exact(state, config)
-            || !(kv.quant_q8 || kv.quant_fp8)
-            || kv.compact_offset != 0
-        {
-            return false;
+        if !(2..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&b_i) {
+            dn_sf_refuse!(diag, gpu, lanes, Some(li), "b_range", "allowed=2..={}", DFLASH_GDN_REPLAY_MAX_STEPS)
+        }
+        if !(varrows || b_i == b0) {
+            dn_sf_refuse!(diag, gpu, lanes, Some(li), "b_mixed_no_varrows", "")
+        }
+        if b_i > df.gdn_tape.max_n {
+            dn_sf_refuse!(diag, gpu, lanes, Some(li), "tape_capacity", "")
+        }
+        if !df.gdn_tape.snapshot_source_armed() {
+            dn_sf_refuse!(diag, gpu, lanes, Some(li), "source_unarmed", "")
+        }
+        if !df.gdn_tape.replay_from_snapshot_admits(gpu, state, &df.target_snap, b_i) {
+            dn_sf_refuse!(
+                diag,
+                gpu,
+                lanes,
+                Some(li),
+                "replay_from_refused",
+                "{}",
+                dn_sf_replay_detail(gpu, state, &df.gdn_tape, &df.target_snap, b_i)
+            )
+        }
+        if !df.target_snap.cb_verify_owned_exact(state, config) {
+            dn_sf_refuse!(
+                diag,
+                gpu,
+                lanes,
+                Some(li),
+                "owned_pair_refused",
+                "{}",
+                dn_sf_owned_detail(state, &df.target_snap, config)
+            )
+        }
+        if !(kv.quant_q8 || kv.quant_fp8) {
+            dn_sf_refuse!(diag, gpu, lanes, Some(li), "kv_mode", "quant_q8={} quant_fp8={}", kv.quant_q8, kv.quant_fp8)
+        }
+        if kv.compact_offset != 0 {
+            dn_sf_refuse!(diag, gpu, lanes, Some(li), "compact_offset", "")
         }
         df.target_snap.push_owner_ptrs(state, &mut ptrs);
     }
     ptrs.sort_unstable();
-    ptrs.windows(2).all(|w| w[0] != w[1])
+    if !ptrs.windows(2).all(|w| w[0] != w[1]) {
+        dn_sf_refuse!(diag, gpu, lanes, None, "owner_alias", "{}", dn_sf_alias_detail(lanes, &ptrs))
+    }
+    true
 }
 
 #[cfg(test)]
