@@ -14,25 +14,34 @@ pub const PANEL_N: usize = 1280;
 pub const PANEL_K: usize = 2560;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape { GdnIn, QsaIn }
-impl Shape { pub fn panels(self) -> usize { match self { Self::GdnIn => 13, Self::QsaIn => 11 } } }
+impl Shape {
+    pub fn panels(self) -> usize { match self { Self::GdnIn => 13, Self::QsaIn => 11 } }
+    pub fn pitch(self) -> usize { self.panels() * PANEL_N }
+    fn index(self) -> usize { match self { Self::GdnIn => 0, Self::QsaIn => 1 } }
+}
 
-/// A shared panel design: both shapes use exactly the same PDI/TXN/context.
-/// Supply build_panel_program(rows_max, Epilogue::Bf16)'s bytes unchanged.
-pub struct PanelProgram { pub pdi: Vec<u8>, pub txn: Vec<u8>, pub padded_rows: usize }
+/// One row-major design per shape, with col0=0; every panel reuses it.
+/// Supply build_panel_program_rowmajor(rows_max, shape.pitch(), 0)'s bytes.
+pub struct PanelProgram { pub shape: Shape, pub pdi: Vec<u8>, pub txn: Vec<u8>, pub padded_rows: usize }
 /// Every entry is already pack_b_bf16 encoded, including Sm/Se sidecars.
 pub struct LayerPanels { pub layer: usize, pub shape: Shape, pub panels: Vec<Vec<u8>> }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArenaLayout { pub padded_rows: usize, pub a_bytes: usize, pub b_bytes: usize, pub c_panel_bytes: usize, pub c_bytes: usize }
+pub struct ArenaLayout { pub padded_rows: usize, pub a_bytes: usize, pub b_bytes: usize }
 impl ArenaLayout {
     pub fn new(rows_max: usize) -> Result<Self, String> {
         if !(1..=65536).contains(&rows_max) { return Err("rows_max outside 1..=65536".into()); }
         let padded_rows = rows_max.div_ceil(256) * 256;
-        Ok(Self { padded_rows, a_bytes: padded_rows * 2880, b_bytes: 8 * 40 * 2 * 5504,
-            c_panel_bytes: padded_rows * PANEL_N * 2, c_bytes: padded_rows * PANEL_N * 2 * 13 })
+        Ok(Self { padded_rows, a_bytes: padded_rows * 2880, b_bytes: 8 * 40 * 2 * 5504 })
     }
-    pub fn c_offset(self, panel: usize) -> Result<usize, String> {
-        if panel >= 13 { Err("panel index outside C arena".into()) } else { Ok(panel * self.c_panel_bytes) }
+    pub fn c_bytes(self, shape: Shape) -> usize { self.padded_rows * shape.pitch() * 2 }
+    pub fn c_offset(self, shape: Shape, panel: usize) -> Result<usize, String> {
+        if panel >= shape.panels() { Err("panel index outside C arena".into()) } else { Ok(panel * PANEL_N * 2) }
+    }
+    /// Addressed span, not the full arg2 declaration: offset panels write only
+    /// their 1280 columns on each row, including the final padded row.
+    pub fn c_span(self, shape: Shape) -> usize {
+        ((self.padded_rows - 1) * shape.pitch() + PANEL_N) * 2
     }
 }
 
@@ -79,11 +88,11 @@ impl Arena {
         Ok(Self { registration, pages })
     }
 }
-struct Bank { a: Arena, c: Arena, control: Arena, ready: HipEvent, acquire: HipEvent, retired: HipEvent }
+struct Bank { a: Arena, c: [Arena; 2], control: Arena, ready: HipEvent, acquire: HipEvent, retired: HipEvent }
 #[derive(Clone, Copy)]
 struct Binding { handle: u32, addr: u64 }
 #[derive(Clone, Copy)]
-struct BankPages { a: usize, a_len: usize, c: usize, c_len: usize, done: usize }
+struct BankPages { a: usize, a_len: usize, c: [usize; 2], c_len: [usize; 2], done: usize }
 struct Job { seq: Seq, layer: usize, shape: Shape, event: usize, start: Instant }
 struct Pending { value: u32, result: Option<Result<Completion, String>> }
 struct Shared { pending: Mutex<Vec<Pending>>, changed: Condvar }
@@ -109,7 +118,7 @@ pub struct NpuTrunkRuntime {
     hip: HipRuntime,
     api: RelayApi,
     banks: Vec<Bank>,
-    bindings: Vec<[Binding; 2]>,
+    bindings: Vec<[Binding; 3]>,
     layout: ArenaLayout,
     rows_max: usize,
     layers: Vec<(usize, Shape)>,
@@ -121,13 +130,20 @@ pub struct NpuTrunkRuntime {
 impl NpuTrunkRuntime {
     /// Uses the existing dlopen HIP backend, without a link-time ROCm dependency
     /// or a second GPU runtime crate. pci identifies the same GPU as producer.
-    pub fn open(program: PanelProgram, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str) -> Result<Self, String> {
+    pub fn open(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str) -> Result<Self, String> {
         let layout = ArenaLayout::new(rows_max)?;
         if banks == 0 { return Err("trunk needs at least one bank".into()); }
-        if program.pdi.is_empty() || program.txn.is_empty() { return Err("empty panel program".into()); }
-        if program.padded_rows != layout.padded_rows { return Err("panel program padded_rows mismatch".into()); }
+        let mut shapes = Vec::new();
+        for program in &programs {
+            if shapes.contains(&program.shape) { return Err("duplicate shape program".into()); }
+            if program.pdi.is_empty() || program.txn.is_empty() { return Err("empty panel program".into()); }
+            if program.padded_rows != layout.padded_rows { return Err("panel program padded_rows mismatch".into()); }
+            if programs[0].pdi != program.pdi { return Err("shape programs must share the G80 PDI".into()); }
+            shapes.push(program.shape);
+        }
         let mut keys = Vec::new();
         for l in &layers {
+            if !shapes.contains(&l.shape) { return Err("missing shape program".into()); }
             if keys.contains(&(l.layer, l.shape)) { return Err("duplicate layer/shape".into()); }
             if l.panels.len() != l.shape.panels() || l.panels.iter().any(|b| b.len() != layout.b_bytes) {
                 return Err(format!("layer {} {:?}: invalid BF16 B panel count/size", l.layer, l.shape));
@@ -140,17 +156,19 @@ impl NpuTrunkRuntime {
         let api = hip.relay_api()?;
         let mut storage = Vec::with_capacity(banks);
         for _ in 0..banks {
-            storage.push(Bank { a: Arena::new(&hip, layout.a_bytes)?, c: Arena::new(&hip, layout.c_bytes)?,
+            storage.push(Bank { a: Arena::new(&hip, layout.a_bytes)?,
+                c: [Arena::new(&hip, layout.c_bytes(Shape::GdnIn))?, Arena::new(&hip, layout.c_bytes(Shape::QsaIn))?],
                 control: Arena::new(&hip, 4096)?, ready: hip.system_event()?, acquire: hip.system_event()?, retired: hip.system_event()? });
         }
         let pages = storage.iter().map(|b| BankPages { a: b.a.pages.ptr as usize, a_len: b.a.pages.len,
-            c: b.c.pages.ptr as usize, c_len: b.c.pages.len, done: b.control.pages.ptr as usize }).collect();
+            c: [b.c[0].pages.ptr as usize, b.c[1].pages.ptr as usize],
+            c_len: [b.c[0].pages.len, b.c[1].pages.len], done: b.control.pages.ptr as usize }).collect();
         let shared = Arc::new(Shared { pending: Mutex::new((0..banks).map(|_| Pending { value: 0, result: None }).collect()), changed: Condvar::new() });
         let (tx, rx) = mpsc::sync_channel(banks);
         let (init_tx, init_rx) = mpsc::sync_channel(1);
         let relay_shared = Arc::clone(&shared);
         let relay = thread::Builder::new().name("npu-trunk-relay".into()).spawn(move || {
-            relay_main(program, layers, pages, api, layout, rx, init_tx, relay_shared);
+            relay_main(programs, layers, pages, api, layout, rx, init_tx, relay_shared);
         }).map_err(|e| format!("spawn trunk relay: {e}"))?;
         // Construct the teardown guard before receiving: all early returns join
         // the relay (contexts/BOs) before unregistering/unmapping caller pages.
@@ -162,15 +180,15 @@ impl NpuTrunkRuntime {
     }
     pub fn layout(&self) -> ArenaLayout { self.layout }
     pub fn hip(&self) -> &HipRuntime { &self.hip }
-    fn view(&self, bank: usize, c: bool) -> Result<HostRegistered, String> {
+    fn view(&self, bank: usize, shape: Option<Shape>) -> Result<HostRegistered, String> {
         let b = self.banks.get(bank).ok_or("invalid trunk bank")?;
-        let arena = if c { &b.c } else { &b.a };
-        let binding = self.bindings[bank][usize::from(c)];
+        let arena = shape.map_or(&b.a, |s| &b.c[s.index()]);
+        let binding = self.bindings[bank][shape.map_or(0, |s| 1 + s.index())];
         Ok(HostRegistered { npu_handle: binding.handle, npu_address: binding.addr, host: arena.pages.ptr,
-            device: arena.registration.ptr(), len: if c { self.layout.c_bytes } else { self.layout.a_bytes } })
+            device: arena.registration.ptr(), len: shape.map_or(self.layout.a_bytes, |s| self.layout.c_bytes(s)) })
     }
-    pub fn a_arena(&self, bank: usize) -> Result<HostRegistered, String> { self.view(bank, false) }
-    pub fn c_arena(&self, bank: usize) -> Result<HostRegistered, String> { self.view(bank, true) }
+    pub fn a_arena(&self, bank: usize) -> Result<HostRegistered, String> { self.view(bank, None) }
+    pub fn c_arena(&self, bank: usize, shape: Shape) -> Result<HostRegistered, String> { self.view(bank, Some(shape)) }
     pub fn done_word(&self, bank: usize) -> Result<u64, String> {
         Ok(self.banks.get(bank).ok_or("invalid trunk bank")?.control.registration.ptr())
     }
@@ -290,7 +308,7 @@ impl Drop for NpuTrunkRuntime { fn drop(&mut self) { if let Err(e) = self.shutdo
 // instruction/PDI BOs. The enclosing Device drops only after this owner.
 struct Resources<C, Ch = Chain, P = Prepared, B = Bo> {
     ctx: C, chains: Vec<Ch>, commands: Vec<P>, b: Vec<B>, a: Vec<B>, c: Vec<B>,
-    insts: Option<B>, pdi: B,
+    insts: Vec<B>, pdi: B,
 }
 fn prepared_panel(dev: &Device, insts: &Bo, a: &Bo, b: &Bo, c: &Bo, c_offset: usize, c_bytes: usize) -> Result<Prepared, String> {
     if c_offset.checked_add(c_bytes).is_none_or(|end| end > c.len) { return Err("C panel outside arena".into()); }
@@ -308,27 +326,30 @@ fn finish(shared: &Shared, seq: Seq, result: Result<Completion, String>) {
     pending[seq.bank].result = Some(result);
     shared.changed.notify_all();
 }
-fn relay_main(program: PanelProgram, layers: Vec<LayerPanels>, pages: Vec<BankPages>, api: RelayApi, layout: ArenaLayout,
-    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<[Binding; 2]>, String>>, shared: Arc<Shared>) {
+fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<BankPages>, api: RelayApi, layout: ArenaLayout,
+    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<[Binding; 3]>, String>>, shared: Arc<Shared>) {
     let dev = match Device::open().and_then(|mut d| { d.map_heap(64 << 20)?; Ok(d) }) {
         Ok(d) => d, Err(e) => { let _ = init.send(Err(e)); return; }
     };
     let setup = (|| {
         api.select()?;
-        let pdi = dev.dev_bo(&program.pdi)?;
+        let pdi = dev.dev_bo(&programs[0].pdi)?;
         let ctx = HwCtx::create(&dev, 32, 1)?;
-        let mut r = Resources { ctx, chains: Vec::new(), commands: Vec::new(), b: Vec::new(), a: Vec::new(), c: Vec::new(), insts: None, pdi };
+        let mut r = Resources { ctx, chains: Vec::new(), commands: Vec::new(), b: Vec::new(), a: Vec::new(), c: Vec::new(), insts: Vec::new(), pdi };
         r.ctx.config_cu(&r.pdi)?;
-        r.insts = Some(dev.dev_bo(&program.txn)?);
+        for program in &programs { r.insts.push(dev.dev_bo(&program.txn)?); }
         let mut bindings = Vec::with_capacity(pages.len());
         for p in &pages {
             let a = dev.userptr_bo(p.a as *mut u8, p.a_len)?;
-            let c = dev.userptr_bo(p.c as *mut u8, p.c_len)?;
-            bindings.push([Binding { handle: a.handle, addr: a.dev_addr() }, Binding { handle: c.handle, addr: c.dev_addr() }]);
-            r.a.push(a); r.c.push(c);
+            let c0 = dev.userptr_bo(p.c[0] as *mut u8, p.c_len[0])?;
+            let c1 = dev.userptr_bo(p.c[1] as *mut u8, p.c_len[1])?;
+            bindings.push([Binding { handle: a.handle, addr: a.dev_addr() },
+                Binding { handle: c0.handle, addr: c0.dev_addr() }, Binding { handle: c1.handle, addr: c1.dev_addr() }]);
+            r.a.push(a); r.c.extend([c0, c1]);
         }
         for l in &layers {
             let b_start = r.b.len();
+            let program = programs.iter().position(|p| p.shape == l.shape).ok_or("missing relay shape program")?;
             for bytes in &l.panels {
                 let mut b = dev.shmem_bo(bytes.len())?;
                 b.as_mut_slice().copy_from_slice(bytes); b.flush(); r.b.push(b);
@@ -336,8 +357,8 @@ fn relay_main(program: PanelProgram, layers: Vec<LayerPanels>, pages: Vec<BankPa
             for bank in 0..pages.len() {
                 let start = r.commands.len();
                 for panel in 0..l.shape.panels() {
-                    r.commands.push(prepared_panel(&dev, r.insts.as_ref().unwrap(), &r.a[bank], &r.b[b_start + panel],
-                        &r.c[bank], layout.c_offset(panel)?, layout.c_panel_bytes)?);
+                    r.commands.push(prepared_panel(&dev, &r.insts[program], &r.a[bank], &r.b[b_start + panel],
+                        &r.c[bank * 2 + l.shape.index()], layout.c_offset(l.shape, panel)?, layout.c_span(l.shape))?);
                 }
                 let refs: Vec<_> = r.commands[start..].iter().collect();
                 r.chains.push(Chain::new(&dev, &refs)?);
@@ -374,7 +395,7 @@ fn relay_main(program: PanelProgram, layers: Vec<LayerPanels>, pages: Vec<BankPa
             // Transaction tail synchronizes every C channel before timeline done.
             // Flush CPU aliases, publish success with release ordering, flush the
             // control line so the GPU's uncached wait observes it.
-            resources.c[job.seq.bank].flush();
+            resources.c[job.seq.bank * 2 + job.shape.index()].flush();
             let done = pages[job.seq.bank].done as *mut AtomicU32;
             unsafe { (*done).store(job.seq.value, Ordering::Release); super::clflush(done.cast(), 64); }
             Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns })
@@ -392,10 +413,18 @@ mod tests {
         let l = ArenaLayout::new(8192).unwrap();
         assert_eq!(l.a_bytes, 23_592_960);
         assert_eq!(l.b_bytes, 3_522_560);
-        assert_eq!(l.c_panel_bytes, 20_971_520);
-        assert_eq!(l.c_bytes, 272_629_760);
-        for p in 0..13 { assert_eq!(l.c_offset(p).unwrap(), p * l.c_panel_bytes); }
-        assert!(l.c_offset(13).is_err());
+        for shape in [Shape::GdnIn, Shape::QsaIn] {
+            assert_eq!(l.c_bytes(shape), 8192 * shape.pitch() * 2);
+            for p in 0..shape.panels() {
+                let offset = l.c_offset(shape, p).unwrap();
+                assert_eq!(offset, 2 * p * PANEL_N);
+                assert!(offset + l.c_span(shape) <= l.c_bytes(shape));
+            }
+            assert!(l.c_offset(shape, shape.panels()).is_err());
+            assert_eq!(l.c_offset(shape, shape.panels() - 1).unwrap() + l.c_span(shape), l.c_bytes(shape));
+        }
+        assert_eq!(l.c_bytes(Shape::GdnIn), 272_629_760);
+        assert_eq!(l.c_bytes(Shape::QsaIn), 230_686_720);
         assert_eq!(ArenaLayout::new(257).unwrap().padded_rows, 512);
         assert!(ArenaLayout::new(0).is_err()); assert!(ArenaLayout::new(65537).is_err());
     }
@@ -428,7 +457,7 @@ mod tests {
         // Instantiate the actual production ownership aggregates with tracing
         // resources, exercising their field order without opening either device.
         let npu = Resources { ctx: t("context"), chains: vec![t("chain")], commands: vec![t("command")],
-            b: vec![t("bo")], a: vec![], c: vec![], insts: Some(t("insts")), pdi: t("pdi") };
+            b: vec![t("bo")], a: vec![], c: vec![], insts: vec![t("insts")], pdi: t("pdi") };
         let arena = RegisteredPages { registration: t("unregister"), pages: t("unmap") };
         drop((npu, arena));
         assert_eq!(&*log.borrow(), &["context", "chain", "command", "bo", "insts", "pdi", "unregister", "unmap"]);
@@ -436,7 +465,7 @@ mod tests {
     #[test] fn panel_commands_bind_fixed_arena_offsets() {
         let layout = ArenaLayout::new(8192).unwrap();
         for panel in 0..13 {
-            let c = 0x1234_0000_0000u64 + layout.c_offset(panel).unwrap() as u64;
+            let c = 0x1234_0000_0000u64 + layout.c_offset(Shape::GdnIn, panel).unwrap() as u64;
             let mut words = [0; 17];
             super::super::encode_start_raw(&mut words, 0x1000, 4096, &[0x2000, 0x3000 + panel as u64 * layout.b_bytes as u64, c]);
             assert_eq!(u64::from(words[11]) | (u64::from(words[12]) << 32), c);

@@ -40,6 +40,7 @@ pub use layer_ops::{
     DenseFfnOp, DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GdnRowCapture, GroupedDepthwiseOp,
     HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
     IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
+    execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
 };
 pub use steps::{
     execute_steps, execute_validated_steps, execute_validated_steps_with_moe_hooks,

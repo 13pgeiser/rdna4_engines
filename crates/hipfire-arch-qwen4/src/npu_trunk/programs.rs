@@ -3,12 +3,12 @@
 //!
 //! Every submit of a trunk program multiplies one 256-row-wave-padded A (`rows_max` rounded up to 256 rows, `K = 2560`) by
 //! ONE resident 1280-column B panel, with exact int32 accumulation and either an I32 drain or integer BF16 epilogue.
-//! A shape needs `panel_count` submits per row block; the program is independent of the panel (B is an argument), so
-//! the per-shape design differs between shapes only through the bookkeeping recorded here.
+//! A shape needs `panel_count` submits per row block; the program is independent of the panel (B is an argument).
+//! Row-major programs differ only in their fused C row pitch; native-tile programs share a design.
 
 use pm_npu::kernels::gemm_array::ArrayDesign;
 use pm_npu::kernels::gemm_core::Epilogue;
-use pm_npu::kernels::gemm_g80::build_panel_program;
+use pm_npu::kernels::gemm_g80::{build_panel_program, build_panel_program_rowmajor};
 
 use super::shapes::{EpilogueContract, FamilyMask, Shape};
 
@@ -117,4 +117,41 @@ pub fn build_programs_for_families(
         rows_max: rows,
         per_shape: [program(Shape::ALL[0]), program(Shape::ALL[1])],
     })
+}
+
+/// Full-family direct BF16 programs for fused row-major transport.
+pub fn build_rowmajor_programs(rows_max: usize) -> Result<NpuPrograms, String> {
+    if !(1..=ROWS_LIMIT).contains(&rows_max) {
+        return Err(format!("npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"));
+    }
+    let rows = rows_max.div_ceil(WAVE_ROWS) * WAVE_ROWS;
+    let program = |shape: Shape| -> Result<ShapeProgram, String> {
+        let map = shape.column_map(FamilyMask::ALL);
+        let design = build_panel_program_rowmajor(rows, map.padded_cols(), 0)?;
+        Ok(ShapeProgram {
+            shape, panel_count: map.panel_count(), padded_cols: map.padded_cols(),
+            arg_bytes: [design.args[0].bytes, design.args[1].bytes, design.args[2].bytes],
+            host_bytes_read: design.host_bytes_read(),
+            host_bytes_written: design.host_bytes_written(), design,
+        })
+    };
+    Ok(NpuPrograms {
+        contract: EpilogueContract::Bf16Direct, rows_max: rows,
+        per_shape: [program(Shape::GdnIn)?, program(Shape::QsaIn)?],
+    })
+}
+
+#[cfg(test)]
+mod rowmajor_tests {
+    use super::*;
+
+    #[test]
+    fn shape_programs_declare_fused_arena_sizes() {
+        let programs = build_rowmajor_programs(8192).unwrap();
+        for p in &programs.per_shape {
+            assert_eq!(p.arg_bytes[2], 8192 * p.padded_cols * 2);
+            assert_eq!(p.panel_count * 1280, p.padded_cols);
+        }
+        assert_eq!(programs.per_shape[0].design.pdi, programs.per_shape[1].design.pdi);
+    }
 }

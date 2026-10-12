@@ -51,6 +51,10 @@ Each shape record reports panel count, padded width, per-submit A/B/C argument
 sizes and per-submit host bytes read/written. The designs include PDI and TXN
 bytes; panels reuse their shape's design.
 
+`build_rowmajor_programs(rows_max)` builds full-family BF16-direct designs with
+col0=0 and fused pitches 16640/14080. Arg2 declares the complete fused arena;
+each retained panel command advances its C base by `2*panel*1280` bytes.
+
 ## CPU checks
 
 ```sh
@@ -171,8 +175,8 @@ target/release/npu-gemm 8192 1280 2560 --variant G80 --epi bf16 \
 ```
 
 The CLI checks every live value against `bf16_direct`, zero padded rows,
-and poison bytes outside the panel window. Row-major DMA silicon validation
-remains required even though the native-tile BF16 arithmetic is proven.
+and poison bytes outside the panel window. The row-major drain is proven on
+Halo at 15.05 TOPS; the serving cutover still requires the parent-run gates below.
 
 ## GPU Bf16Direct glue
 
@@ -375,8 +379,9 @@ count) and `zab_source=stock-MQ6-DtoH-before-overlay|stock-MQ6-DtoH`, alongside
 `download_ms`, `pack_ms`, resident weight bytes and runtime status.
 `off` does no download, packing, allocation or new logging; its existing mode
 read moves before overlay application, whose payloads and native route are
-unchanged. `on` additionally opens the unchanged 8192-row G80 program, resident
-13/11-panel chains and two registered A/C banks; any admission/open error fails
+unchanged. `on` additionally opens two fixed 8192-row row-major G80 programs,
+resident 13/11-panel chains, and two banks each with registered A plus separate
+GDN/QSA C arenas; any admission/open error fails
 the load. Calibration is deliberately bypassed with `first-light-force-pairs`.
 
 Both `on` and `emulate` use the same deterministic, segment-local pair plan.
@@ -390,9 +395,12 @@ is computed twice. Both covered executors call the mixer only with `Core` and
 before dtype or `trunk_a4` selection, so it skips A4/IU4 **and** MQ6. A debug
 assertion checks every covered mixer dispatch, with a CPU phase-decision test.
 Uncovered steps retain `Whole` and the unchanged beta IU4 mask/dispatch.
-Under `on` the GPU only packs/consumes covered input projections; out-projections
-and the GPU core/HC/MoE remain native. QSA scratch is F32; GDN qkv is BF16 on
-the existing chunk-core route (otherwise exact widened F32); z/a/b are F32.
+Under `on` the GPU packs A, then the mixer core directly reads read-only BF16
+`Bf16Arena` views of fused C; **there is no consume/retile pass**. Explicit
+`GdnTrunkArenas`/`QsaTrunkArenas` arguments select arena launchers only for
+`Core`; omitted views retain the incumbent native scratch path. `emulate`
+keeps the IU8 twin and its native projection scratch. Out-projections and
+GPU recurrence/attention/HC/MoE remain native.
 
 ### Bank state and ordering
 
@@ -424,27 +432,51 @@ are two full pairs plus 7232 sequential rows. For each layer:
 
 ```text
 prepare(0,A), pack/kick(0,A); prepare(0,B), pack/kick(0,B)
-wait/consume(l,A), retire A, G(l,A)
+wait(l,A), Core(l,A), retire A, Out/HC/MoE(l,A)
 prepare(l+1,A), pack/kick(l+1,A)
-wait/consume(l,B), retire B, G(l,B)
+wait(l,B), Core(l,B), retire B, Out/HC/MoE(l,B)
 prepare(l+1,B), pack/kick(l+1,B)
 ```
 
 `prepare` includes PLE when present and the attention HC read. `G` is mixer
 core/out, attention HC write and MLP HC/MoE/write. The existing typed ops and
 output/HC/MoE fusions execute those fragments; the numerical twin uses the
-same fragment boundaries. `prepare_bank` queues the previous retirement
-event before any new A writes; the relay's A-ready event orders the new submit.
-Retirement follows the last C scatter, not the later core's native-tensor reads.
+same fragment boundaries. Retirement is recorded after the complete Core,
+which encloses every C reader; output projection and the rest of `G` read only
+native scratch. `prepare_bank` queues a wait on that retirement event before
+packing new A on the same stream. `kick` records its system-release A-ready
+event after that wait and pack; the relay queries this event to completion
+before submitting the next chain. Thus
+`old C reads -> retired -> prepare wait -> pack -> ready -> next NPU C writes`,
+even when the next layer changes shape. No arena is overwritten early.
 The transport's checked GPU wait remains host-gated; this is not a CPU-free
 rejoin and the relay submits NPU chains serially.
 
+The exact live readers (pitch/col0 in BF16 elements) are:
+
+| Arena/window | Core reader |
+| --- | --- |
+| GDN 16640 / qkv 0..10240, a 16384..16432, b 16432..16480 | `gated_delta_conv_params_batched_arena`, or its `qknorm` variant |
+| GDN 16640 / z 10240..16384 | chunk `gated_delta_step_gate_wmma[_qknormed]_arena` (retaining normal/inline-Q8 selection), or non-chunk `gated_delta_gate_batched[_rotate]_arena` |
+| QSA 14080 / q 0..12288, k 12288..12800, idx 13312..13952 | out-of-place `indexed_attention_norm_rope_batch_arena` for each window |
+| QSA 14080 / idx key tail 13824..13952 | `indexed_attention_index_key_append_batch_arena` to F32 index scratch and raw-key cache |
+| QSA 14080 / v 12800..13312 | `indexed_attention_cache_append_batch_arena(key=None)`; K comes from normalized F32 scratch |
+
+No reader includes GDN padding 16480..16640 or QSA padding 13952..14080.
+Attention/index selection read transformed F32 scratch, never raw C.
+
 Both NPU programs retain the fixed 8192-row extent. For a partial B, the
 producer explicitly zeros every padded A row; kick records B's live count
-without patching the program, and consume writes only those live rows.
+without patching the program, and all arena readers use only those live rows.
 All GPU layer operations, router views, PLE staging, capture/MTP rows and
 head work use the bank's real row count. Bank B's output offsets remain
 8192, not its own row count.
+Before building a partial B program, every bank-B tensor's logical extent is
+rebound from the existing `Full` scratch plan for its live rows. This includes
+grouped MoE, router and PLE staging/output fields; exact-size kernels never
+receive the 8192-row logical tensor for a shorter bank. Allocation capacities
+and ownership slots remain unchanged, with no GPU allocation/copy; a later
+pair can rebind back to 8192. CPU coverage includes 8151 and 512 rows.
 
 Bank A starts at the request's current position; B starts at position+8192.
 Each bank-B QSA view is advanced using bank A's exact `next_lengths()` tuple
@@ -488,6 +520,7 @@ append one JSON object per `(layer,bank)` with `position`, real live `rows`, `se
 `pack_issue_ns`, `kick_ns`, `npu_submit_ns`, `npu_done_ns`,
 `gpu_wait_enqueue_ns`, `consume_issue_ns`, `mixer_start_ns`, `mixer_end_ns`
 and `anchor_uncertainty_ns`. Host/relay timestamps use Linux CLOCK_MONOTONIC.
+`consume_issue_ns` is retained for trace compatibility and is always zero.
 The mixer interval covers the complete `G` fragment, including HC/MoE.
 HIP timing events are resolved only after the pair, relative to a monotonic
 anchor calibrated after initialization and **before** pipeline work; its host
@@ -501,6 +534,12 @@ Use the same MQ6 family-B model, prompt and greedy settings in fresh daemons;
 confirm the tokenized prompt contains at least 8704 rows (a file named `p16k`
 is not itself evidence of its token count). Keep chunk admission at 8192.
 Do not inherit the build-only `ROCR_VISIBLE_DEVICES=-1`/`HIP_VISIBLE_DEVICES=-1`.
+
+Run transport before either serving arm, with devices visible:
+
+```sh
+target/release/npu-trunk-transport --pci 0000:c0:00.0
+```
 
 ```sh
 export HIPFIRE_DAEMON_BIN="$PWD/target/release/daemon"
@@ -520,6 +559,17 @@ jq -n --arg model "$MODEL" --rawfile prompt p16k \
   | curl -sS http://127.0.0.1:11435/v1/chat/completions \
       -H 'Content-Type: application/json' --data-binary @-
 ```
+Save the response, stop the `on` server, then start a fresh `off` server with
+the same settings and send the identical request:
+
+```sh
+HIPFIRE_QWEN4_NPU_TRUNK=off \
+  target/release/hipfire serve "$MODEL" 127.0.0.1 11435 --max-seq 32768
+```
+
+Compare reported prompt rows and TTFT; `on` must equal the `emulate` greedy
+output, while `off` must equal unchanged beta, not BF16-direct `on`.
+
 
 Native MTP is enabled by default; repeat with `--spec off` for the AR route.
 In a separate terminal, then repeat in fresh processes with `emulate` and `off`:

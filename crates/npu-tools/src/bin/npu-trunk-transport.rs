@@ -2,13 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 //! Production-size two-bank transport gate. No HIP VMM export, no SYNC_BO.
 use npu_tools::coop_gpu;
-use pm_npu::kernels::{gemm_core::Epilogue, gemm_g80, w8a8_epi::bf16_direct};
+use pm_npu::kernels::{gemm_g80, w8a8_epi::bf16_direct};
 use railgun::npu::{clflush, trunk::{NpuTrunkRuntime, LayerPanels, PanelProgram, Shape, Seq, WAIT_TIMEOUT}};
 use std::time::{Duration, Instant};
 const ROWS: usize = 8192;
 const K: usize = 2560;
 const N: usize = 1280;
-const PANELS: usize = 13;
 const CLASSES: usize = 16;
 const ROUNDS: usize = 20;
 const POISON: u8 = 0xa5;
@@ -22,26 +21,45 @@ fn percentile(values: &[f64], p: f64) -> f64 { values[((values.len() - 1) as f64
 fn at<T>(round: Option<usize>, stage: &str, result: Result<T, String>) -> Result<T, String> {
     result.map_err(|e| format!("stage={stage} round={}: {e}", round.map_or_else(|| "none".into(), |r| r.to_string())))
 }
-fn run(pci: &str) -> Result<(), String> {
-    let design = at(None, "build-panel", gemm_g80::build_panel_program(ROWS, Epilogue::Bf16))?;
-    let mut panels = Vec::with_capacity(PANELS);
-    for panel in 0..PANELS {
-        let b: Vec<i8> = (0..K).flat_map(|k| (0..N).map(move |n| b_code(panel, k, n))).collect();
-        let scales: Vec<_> = (0..N).map(|n| sm(panel, n)).collect();
+fn consumer_columns(shape: Shape) -> [std::ops::Range<usize>; 4] {
+    match shape {
+        Shape::GdnIn => [0..10240, 10240..16384, 16384..16432, 16432..16480],
+        Shape::QsaIn => [0..12288, 12288..12800, 12800..13312, 13312..13952],
+    }
+}
+
+fn run(pci: &str, shape: Shape) -> Result<(), String> {
+    let panels_count = shape.panels();
+    let columns = consumer_columns(shape);
+    let live = columns[3].end;
+    // The consumer launch geometry uses precisely these live windows, not a
+    // panel-rounded width. Diagnostic full-C downloads below also check padding.
+    if columns[0].start != 0 || columns.windows(2).any(|w| w[0].end != w[1].start)
+        || columns.iter().any(|r| r.is_empty() || r.end > live) || live >= shape.pitch()
+    {
+        return at(None, "consumer-padding-bounds", Err("consumer reads padded columns".into()));
+    }
+    let design = at(None, "build-panel", gemm_g80::build_panel_program_rowmajor(ROWS, shape.pitch(), 0))?;
+    let mut panels = Vec::with_capacity(panels_count);
+    for panel in 0..panels_count {
+        let b: Vec<i8> = (0..K).flat_map(|k| (0..N).map(move |n|
+            if panel * N + n < live { b_code(panel, k, n) } else { 0 })).collect();
+        let scales: Vec<_> = (0..N).map(|n| if panel * N + n < live { sm(panel, n) } else { (0, 0) }).collect();
         panels.push(gemm_g80::pack_b_bf16(&design, &b, &scales));
     }
-    let program = PanelProgram { pdi: design.pdi.clone(), txn: design.insts.clone(), padded_rows: ROWS };
-    let runtime = at(None, "open-transport", NpuTrunkRuntime::open(program, vec![LayerPanels { layer: 0, shape: Shape::GdnIn, panels }], 2, ROWS, pci))?;
+    let program = PanelProgram { shape, pdi: design.pdi.clone(), txn: design.insts.clone(), padded_rows: ROWS };
+    let runtime = at(None, "open-transport", NpuTrunkRuntime::open(vec![program], vec![LayerPanels { layer: 0, shape, panels }], 2, ROWS, pci))?;
     let outcome = (|| {
         let hip = runtime.hip();
         let layout = runtime.layout();
+        let c_bytes = layout.c_bytes(shape);
         let module = at(None, "load-copy-module", hip.load_module(coop_gpu::CODE_OBJECT))?;
         let copy = at(None, "get-copy-kernel", module.function(coop_gpu::COPY))?;
         let stream = at(None, "create-stream", hip.stream())?;
         let end = at(None, "create-system-event", hip.system_event())?;
         let input = at(None, "allocate-input", hip.allocate(layout.a_bytes, None))?;
-        let output = at(None, "allocate-output", hip.allocate(layout.c_bytes, None))?;
-        let poison = at(None, "allocate-poison", hip.allocate(layout.c_bytes, None))?;
+        let output = at(None, "allocate-output", hip.allocate(c_bytes, None))?;
+        let poison = at(None, "allocate-poison", hip.allocate(c_bytes, None))?;
         at(None, "initialize-poison", hip.memset(&poison, POISON))?;
         let blocks = at(None, "query-compute-units", hip.compute_units())? * 8;
         let gpu_copy = |dst: u64, src: u64, bytes: usize| -> Result<(), String> {
@@ -53,15 +71,15 @@ fn run(pci: &str) -> Result<(), String> {
             hip.record_on(&end, Some(&stream))?;
             hip.wait_event_timeout(&end, WAIT_TIMEOUT)
         };
-        let mut observed = vec![0u8; layout.c_bytes];
+        let mut observed = vec![0u8; c_bytes];
         let mut a = vec![0i8; ROWS * K];
         let mut scales = vec![(0u16, 0i16); ROWS];
-        let mut reference = vec![0u16; PANELS * CLASSES * CLASSES * 3];
+        let mut reference = vec![0u16; panels_count * CLASSES * CLASSES * 3];
         let mut latencies = Vec::with_capacity(ROUNDS);
         let mut busy = Duration::ZERO;
         let mut last_seq = [None; 2];
         let wall = Instant::now();
-        println!("transport rows={ROWS} banks=2 panels={PANELS} rounds={ROUNDS} A={} C={} bytes/bank timeout=3s shim_axi=default", layout.a_bytes, layout.c_bytes);
+        println!("transport shape={shape:?} layout=rowmajor pitch={} live={live} banks=2 panels={panels_count} rounds={ROUNDS} A={} C={c_bytes} bytes/bank timeout=3s shim_axi=default consumer_windows={columns:?}", shape.pitch(), layout.a_bytes);
         for round in 0..ROUNDS {
             let bank = round % 2;
             for row in 0..ROWS {
@@ -73,8 +91,8 @@ fn run(pci: &str) -> Result<(), String> {
             at(Some(round), "upload-packed-A", hip.upload(&input, &packed))?;
             // Independent CPU dot products for EVERY class combination. The
             // operand is periodic in rows/columns, but comparisons cover EVERY
-            // byte of all 13 production-size C panels, not a sampled subset.
-            for panel in 0..PANELS { for r in 0..CLASSES { for n in 0..CLASSES {
+            // byte of the fused row-major C arena, including zero padding.
+            for panel in 0..panels_count { for r in 0..CLASSES { for n in 0..CLASSES {
                 let dot: i32 = (0..K).map(|k| i32::from(a_code(r, k, round)) * i32::from(b_code(panel, k, n))).sum();
                 let (sm, se) = sm(panel, n);
                 for rem in 0..3 {
@@ -83,12 +101,13 @@ fn run(pci: &str) -> Result<(), String> {
                 }
             } } }
             let av = at(Some(round), "A-arena", runtime.a_arena(bank))?;
-            let cv = at(Some(round), "C-arena", runtime.c_arena(bank))?;
-            at(Some(round), "poison-C", gpu_copy(cv.device, poison.ptr(), layout.c_bytes))?;
+            let cv = at(Some(round), "C-arena", runtime.c_arena(bank, shape))?;
+            at(Some(round), "prepare-bank", unsafe { runtime.prepare_bank(bank, stream.raw()) })?;
+            at(Some(round), "poison-C", gpu_copy(cv.device, poison.ptr(), c_bytes))?;
             at(Some(round), "GPU-write-A", gpu_copy(av.device, input.ptr(), layout.a_bytes))?;
-            let seq = at(Some(round), "kick", unsafe { runtime.kick(0, Shape::GdnIn, bank, ROWS, stream.raw()) })?;
+            let seq = at(Some(round), "kick", unsafe { runtime.kick(0, shape, bank, ROWS, stream.raw()) })?;
             let completion = at(Some(round), "wait-GPU", unsafe { runtime.wait_gpu(seq, stream.raw()) })?;
-            at(Some(round), "GPU-read-C", gpu_copy(output.ptr(), cv.device, layout.c_bytes))?;
+            at(Some(round), "GPU-read-C", gpu_copy(output.ptr(), cv.device, c_bytes))?;
             at(Some(round), "retire-bank", unsafe { runtime.retire_bank(seq, stream.raw()) })?;
             last_seq[bank] = Some(seq);
             at(Some(round), "consumer-completion", drain())?;
@@ -98,10 +117,13 @@ fn run(pci: &str) -> Result<(), String> {
             if unsafe { core::slice::from_raw_parts(av.host, av.len) } != &packed[..] {
                 return at(Some(round), "compare-A-alias", Err(format!("bank {bank}: GPU A/userptr alias mismatch")));
             }
-            for panel in 0..PANELS { for row in 0..ROWS { for col in 0..N {
-                let offset = panel * layout.c_panel_bytes + gemm_g80::bf16_output_offset(ROWS, row, col);
+            for panel in 0..panels_count { for row in 0..ROWS { for col in 0..N {
+                let fused_col = panel * N + col;
+                let offset = 2 * (row * shape.pitch() + fused_col);
                 let actual = u16::from_le_bytes([observed[offset], observed[offset + 1]]);
-                let expected = reference[((panel * CLASSES + row % CLASSES) * CLASSES + col % CLASSES) * 3 + row % 3];
+                let expected = if fused_col < live {
+                    reference[((panel * CLASSES + row % CLASSES) * CLASSES + col % CLASSES) * 3 + row % 3]
+                } else { 0 };
                 if actual != expected {
                     return at(Some(round), "compare-C", Err(format!("bank {bank} panel {panel} row {row} col {col}: {actual:04x} != {expected:04x}")));
                 }
@@ -127,9 +149,9 @@ fn run(pci: &str) -> Result<(), String> {
         // Deterministic missing-wait negative: read freshly poisoned C without
         // submitting a replacement NPU job. A racing read could finish after
         // NPU completion and accidentally pass, so it is not used here.
-        let cv = at(None, "negative-C-arena", runtime.c_arena(0))?;
-        at(None, "negative-poison-C", gpu_copy(cv.device, poison.ptr(), layout.c_bytes))?;
-        at(None, "negative-GPU-read-C", gpu_copy(output.ptr(), cv.device, layout.c_bytes))?;
+        let cv = at(None, "negative-C-arena", runtime.c_arena(0, shape))?;
+        at(None, "negative-poison-C", gpu_copy(cv.device, poison.ptr(), c_bytes))?;
+        at(None, "negative-GPU-read-C", gpu_copy(output.ptr(), cv.device, c_bytes))?;
         at(None, "negative-retire-bank", unsafe { runtime.retire_bank(last_seq[0].unwrap(), stream.raw()) })?;
         at(None, "negative-consumer-completion", drain())?;
         at(None, "negative-download-C", hip.download(&output, &mut observed))?;
@@ -140,7 +162,7 @@ fn run(pci: &str) -> Result<(), String> {
             return at(None, "negative-missing-wait", Err("negative not distinguishable from reference".into()));
         }
         println!("negative missing-wait: detected poisoned C without replacement submission (all bytes)");
-        println!("PASS rounds={ROUNDS} negatives=2");
+        println!("PASS shape={shape:?} rounds={ROUNDS} negatives=2 consumer_padding_bounds=checked");
         Ok(())
     })();
     let teardown = at(None, "teardown", runtime.close());
@@ -151,8 +173,32 @@ fn main() {
     let pci = match args.as_slice() {
         [] => "0000:c0:00.0",
         [flag, pci] if flag == "--pci" => pci,
-        [flag] if flag == "--help" => { println!("npu-trunk-transport [--pci 0000:c0:00.0]\n8192 rows, 13 BF16 G80 panels, 2 banks, 20 rounds FIRST, negative controls AFTER, 3 s waits, default shim AXI."); return; }
+        [flag] if flag == "--help" => { println!("npu-trunk-transport [--pci 0000:c0:00.0]\n8192 rows, row-major GdnIn + QsaIn (13/11 panels), 2 banks, 20 rounds/shape FIRST, negatives AFTER, 3 s waits, default shim AXI."); return; }
         _ => { eprintln!("FAIL: stage=arguments round=none: usage: npu-trunk-transport [--pci PCI]"); std::process::exit(1); }
     };
-    if let Err(e) = run(pci) { eprintln!("FAIL: {e}"); std::process::exit(1); }
+    for shape in [Shape::GdnIn, Shape::QsaIn] {
+        if let Err(e) = run(pci, shape) { eprintln!("FAIL shape={shape:?}: {e}"); std::process::exit(1); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consumer_windows_exclude_panel_padding() {
+        for shape in [Shape::GdnIn, Shape::QsaIn] {
+            let columns = consumer_columns(shape);
+            assert_eq!(columns[0].start, 0);
+            for pair in columns.windows(2) { assert_eq!(pair[0].end, pair[1].start); }
+            let live = columns[3].end;
+            assert!(live < shape.pitch());
+            for window in columns {
+                for row in [0, ROWS - 1] {
+                    let end = 2 * (row * shape.pitch() + window.end);
+                    assert!(end <= 2 * (row * shape.pitch() + live));
+                }
+            }
+        }
+    }
 }

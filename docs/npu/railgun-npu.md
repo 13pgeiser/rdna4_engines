@@ -172,15 +172,21 @@ Mirrors the GPU railgun replay tape (`replay_sequence_hash`, FNV-1a 64).
 
 ## 7. Opt-in trunk BF16 transport (0.4.2)
 
-`railgun::npu::trunk::NpuTrunkRuntime::open(PanelProgram, Vec<LayerPanels>, banks, rows_max, pci)`
-accepts the unchanged `pm_npu::kernels::gemm_g80::build_panel_program(rows_max, Epilogue::Bf16)`
-PDI/TXN and resident `pack_b_bf16` panels including Sm/Se. GdnIn/QsaIn use 13/11 START_CUs
-in a retained chain per (layer, shape, bank), sharing one identical panel hardware context.
-The program declares its padded row extent; rows never patch the program. The caller zeros
-all padding codes/scales. A is one `pack_a_bf16` stream (not 13 copies); C is panel-concatenated.
-At 8192 rows each bank has A=23,592,960 B and C=272,629,760 B. `a_arena`/`c_arena`
-return the BO handle/NPU address, anonymous host pointer, HIP device pointer and logical length.
-The BO owner stays on the relay thread. No command/TXN words are changed after open.
+`railgun::npu::trunk::NpuTrunkRuntime::open(Vec<PanelProgram>, Vec<LayerPanels>, banks, rows_max, pci)`
+accepts one `build_panel_program_rowmajor(rows_max, shape.pitch(), 0)` PDI/TXN
+per shape and resident `pack_b_bf16` panels including Sm/Se. The shape programs
+share the same G80 PDI/context but retain distinct pitch-specific instruction BOs.
+GdnIn/QsaIn use 13/11 START_CUs in a retained chain per (layer, shape, bank).
+The program declares its padded row extent; rows never patch the program.
+The caller zeros all padding codes/scales. A is one `pack_a_bf16` stream, not
+13 copies. Each bank owns separate fused row-major C arenas: at 8192 rows,
+A=23,592,960 B, GDN C=272,629,760 B, QSA C=230,686,720 B.
+Panel p binds C at `arena + 2*p*1280` bytes. Bounds check the actual addressed
+span `2*((padded_rows-1)*pitch+1280)`, rather than incorrectly adding the
+full fused arg2 declaration to each panel offset. B residency is unchanged.
+`a_arena(bank)`/`c_arena(bank, shape)` return the BO handle/NPU address,
+anonymous host pointer, HIP device pointer and logical length. The BO owner
+stays on the relay thread. No command/TXN words are changed after open.
 
 The existing dlopen'd `npu::hip_runtime` is used rather than adding hip-bridge to railgun's
 runtime dependency graph. HIP events/registrations remain !Send; only immutable entry points
@@ -200,6 +206,10 @@ the next GPU producer writes A, `unsafe prepare_bank(bank, stream)` queues
 event then orders the next NPU submit. Callers that do not prepare still need
 completed retirement before kick. `Completion::{submit_ns,done_ns}` are relay
 CLOCK_MONOTONIC timestamps (submit issue and completed timeline observation).
+Serving records retirement after mixer Core (all direct arena readers), before
+OutProj. `prepare` waits retirement on the producer stream, A production follows,
+and kick's ready event follows both; the relay must observe ready before submit.
+This orders **all old C reads before the next C DMA write**, not merely A reuse.
 `close()` joins the relay (context before BOs), checks GPU retirement, then HIP
 unregisters before unmapping. On unretired/stuck GPU work, teardown reports an error and
 quarantines registrations/pages until process exit instead of freeing live operands.
@@ -218,16 +228,24 @@ never exported HIP VMM (snapshot-only), never imported-BO SYNC_BO.
 
 Hardware gate (parent runs on Halo): `target/release/npu-trunk-transport --pci 0000:c0:00.0`.
 It uses default shim AXI, two production-size banks, GPU shader copies of CPU-packed A,
-13 panels, all-output BF16 comparisons against CPU integer dots + `bf16_direct` through
-`bf16_output_offset`, and 20 alternating rounds with changed codes/scales. C is poisoned
-before every round. All 20 exact rounds and an `EXACT` p50/p99/max, NPU busy-envelope/wall
-summary run **before** negative controls. The deterministic missing-wait negative then reads
+and both row-major shapes (13 GDN / 11 QSA panels), 20 alternating rounds each.
+Every live BF16 value at `2*(row*pitch+panel*1280+col)` is compared against CPU
+integer dots + `bf16_direct`; padding columns are checked for zero. A CPU
+reader-window gate checks all four consumer families terminate before padding
+(GDN 16480..16640, QSA 13952..14080). The diagnostic full-C shader download
+intentionally includes padding; production Core readers do not. The separate
+`npu_trunk_consumers_check` poison oracle exercises actual arena kernels.
+C is poisoned before each round. Each shape's 20 exact rounds and `EXACT`
+p50/p99/max, busy-envelope/wall summary run **before** its negative controls.
+The deterministic missing-wait negative then reads
 fresh poison without submitting a replacement job; a racing ungated read could legitimately
 finish after NPU completion and is not a reliable negative. A deliberately unsubmitted host
 Seq must error immediately in process (no DRM wait or relay request). The former impossible
 DRM timeline probe was removed after the parent-reported j107 receive timeout hid all rounds.
-Expected output: 20 `round=.. bank=.. seq=.. exact kick->done=..` lines, `EXACT` timing summary,
-two negative-control lines and `PASS rounds=20 negatives=2`. Busy is the host submit-to-timeline
+Expected output per shape: 20 `round=.. bank=.. seq=.. exact kick->done=..` lines,
+an `EXACT` timing summary, two negative-control lines and
+`PASS shape=GdnIn|QsaIn rounds=20 negatives=2 consumer_padding_bounds=checked`.
+Busy is the host submit-to-timeline
 envelope, not an AIE hardware counter; wall includes CPU verification. Any mismatch/error
 exits 1 and identifies `stage=... round=...` (`round=none` for setup/negatives/teardown).
 Production-size visibility and host-registered done-word acceptance by HIP's beta stream-wait
