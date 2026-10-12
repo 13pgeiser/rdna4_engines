@@ -615,7 +615,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1539
+**Count:** 1540
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1768,7 +1768,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE` | crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | crates/hip-bridge/src/ffi.rs, crates/hipfire-arch-qwen4/src/cache_quality.rs | developer |
-| `HIPFIRE_QWEN4_F16_WMMA` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_ctx.rs, crates/rdna-compute/examples/bench_qsa_indexed.rs | developer |
+| `HIPFIRE_QWEN4_F16_WMMA` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_arena_check.rs, crates/hipfire-arch-qwen4/examples/qwen4_qsa_ctx.rs | developer |
 | `HIPFIRE_QWEN4_F16_WMMA_GFX1201` | crates/rdna-compute/examples/bench_qwen4_hc_wmma.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_GDN_CONV_QKNORM` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_GDN_PIPE` | crates/rdna-compute/src/tensor_ops.rs | developer |
@@ -1802,6 +1802,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_PROFILE_CHECKPOINT` | crates/hipfire-arch-qwen4/src/state_parity.rs | developer |
 | `HIPFIRE_QWEN4_PROFILE_SOURCE_CALLBACK` | crates/hipfire-arch-qwen4/src/state_parity.rs | developer |
 | `HIPFIRE_QWEN4_PROJ_REGIONS` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_QWEN4_QSA_F16_ARENA` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_arena_check.rs, crates/hipfire-arch-qwen4/src/state.rs | developer |
 | `HIPFIRE_QWEN4_QSA_PM` | crates/hipfire-isa/src/kernels/qsa_gather.rip.rs, crates/rdna-compute/examples/qsa_pm_check.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SCORE_PM` | crates/rdna-compute/examples/qsa_select_pm_check.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SELECT_EXACT` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/examples/qsa_select_pm_check.rs | developer |

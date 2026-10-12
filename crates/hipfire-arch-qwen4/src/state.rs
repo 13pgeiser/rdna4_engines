@@ -2964,7 +2964,6 @@ mod tests {
             assert!(formats.contains(&QsaKvFormat::Fp8), "gfx1201 serves fp8 QSA state");
         }
         let s = 16_384;
-        let arenas = config.n_full_layers() * QSA_CONTEXT_ARENAS;
         for qsa in formats {
             let format = Qwen4StateFormat {
                 qsa,
@@ -2980,6 +2979,7 @@ mod tests {
             let mut state =
                 Qwen4State::new_with_backend(&mut gpu, &config, s, format, Qwen4KvBackend::Vmm)
                     .expect("VMM state");
+            let arenas: usize = state.qsa.iter().map(|q| q.context_arenas().count()).sum();
             assert_eq!(gpu.vmm_allocation_count(), owners + arenas, "{}", qsa.name());
             assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), 0);
             let granularity = gpu.vmm_granularity(&state.qsa[0].full_keys).unwrap();
