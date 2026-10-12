@@ -555,9 +555,23 @@ pub struct PeerMirrors {
     entries: Vec<(MirrorRole, TensorSpec, GpuTensor)>,
     last_logits: Option<usize>,
     last_top1: Option<usize>,
+    /// This peer's replica of rank 0's native MTP drafter, built on the first
+    /// drafter fan-out ([`Qwen4Bundle::ep_drafter_fanout`]) and freed with the
+    /// mirrors.
+    drafter: Option<crate::mtp_spec::Qwen4MtpDrafter>,
 }
 
 impl PeerMirrors {
+    /// This peer's drafter replica, built from `params` (rank 0's construction
+    /// parameters) on first use.
+    pub(crate) fn drafter(
+        &mut self,
+        params: crate::mtp_spec::ReplicaParams,
+    ) -> &mut crate::mtp_spec::Qwen4MtpDrafter {
+        self.drafter
+            .get_or_insert_with(|| crate::mtp_spec::Qwen4MtpDrafter::new_replica(params))
+    }
+
     fn ensure(
         &mut self,
         gpu: &mut Gpu,
@@ -610,6 +624,12 @@ impl PeerMirrors {
     }
 
     fn free(self, gpu: &mut Gpu) -> Result<(), String> {
+        if let Some(drafter) = self.drafter {
+            <crate::mtp_spec::Qwen4MtpDrafter as hipfire_runtime::spec::MtpDrafter>::mtp_free(
+                Box::new(drafter),
+                gpu,
+            );
+        }
         let mut first = None;
         for (_, _, tensor) in self.entries {
             if let Err(error) = gpu.free_tensor(tensor) {
@@ -1128,6 +1148,56 @@ impl Qwen4Bundle {
         result
             .and_then(|values| agree(what, values))
             .map_err(BundleError::Forward)
+    }
+
+    /// Fan a native-MTP drafter call out to every rank. `lead` runs rank 0's
+    /// `leader` drafter with this bundle (mesh detached, so nested calls run
+    /// locally) on the caller's thread and `gpu`; `follow` runs on every peer
+    /// with that peer's drafter replica (created from rank 0's construction
+    /// parameters on the first call) and its own bundle. Before `follow`, the
+    /// replica replays the target-less calls rank 0 ran since the last fan-out
+    /// (`configure_request`, `mtp_reset`, in order) and mirrors rank 0's n-gram
+    /// arming. The host results must agree on every rank; rank 0's is returned.
+    /// Without a mesh this is exactly `lead`. Neither closure may poll an
+    /// abort: no rank may stop alone.
+    pub(crate) fn ep_drafter_fanout<R: Send + PartialEq + std::fmt::Debug>(
+        &mut self,
+        what: &str,
+        gpu: &mut Gpu,
+        leader: &mut crate::mtp_spec::Qwen4MtpDrafter,
+        lead: impl FnOnce(
+            &mut crate::mtp_spec::Qwen4MtpDrafter,
+            &mut Qwen4Bundle,
+            &mut Gpu,
+        ) -> Result<R, String>,
+        follow: &(dyn Fn(
+            &mut crate::mtp_spec::Qwen4MtpDrafter,
+            &mut Qwen4Bundle,
+            &mut Gpu,
+        ) -> Result<R, String>
+              + Sync),
+    ) -> Result<R, String> {
+        let Some(mesh) = self.ep.take() else {
+            return lead(leader, self, gpu);
+        };
+        let params = leader.replica_params();
+        let ngram_active = leader.ngram_active();
+        let owed = leader.pending_replay().to_vec();
+        let result = mesh.run(
+            || lead(&mut *leader, &mut *self, &mut *gpu),
+            &|bundle, peer_gpu, mirrors| {
+                let replica = mirrors.drafter(params);
+                replica.replay(peer_gpu, &owed)?;
+                replica.mirror_ngram_active(ngram_active);
+                follow(replica, bundle, peer_gpu)
+            },
+        );
+        self.ep = Some(mesh);
+        let agreed = result.and_then(|values| agree(what, values));
+        if agreed.is_ok() {
+            leader.clear_replay();
+        }
+        agreed
     }
 
     /// Refuse an entry point that has no EP replication (lanes, MTP/spec, state

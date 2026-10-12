@@ -159,8 +159,10 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 /// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
 /// owns the load instead: its tape is the single-row AR forward, which no MTP
 /// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
-/// Under expert parallelism (`ep` > 1) the head is never attached: `auto`
-/// stays AR and an explicit `Some(true)` refuses naming EP.
+/// Under expert parallelism (`ep` > 1) the head is attached only on an explicit
+/// request: `Some(true)` admits it (the drafter is replicated on every rank),
+/// while `auto` (`None`) and `Some(false)` stay AR, so the EP default and
+/// flag-off bytes are unchanged.
 pub(crate) fn qwen4_native_mtp(
     spec: SpecLoadCfg,
     gpu_arch: &str,
@@ -170,13 +172,7 @@ pub(crate) fn qwen4_native_mtp(
     ep: usize,
 ) -> Result<bool, String> {
     if ep > 1 {
-        return match spec.mtp {
-            Some(true) => Err(format!(
-                "qwen4: native MTP is not supported with expert parallelism (topology.ep = {ep}); \
-                 unset speculation.mtp or set topology.ep = 1 (HIPFIRE_QWEN4_EP=0)"
-            )),
-            _ => Ok(false),
-        };
+        return Ok(spec.mtp == Some(true));
     }
     let retained = hipfire_runtime::config::retained_redline_default(
         gpu_arch, "qwen4", path, pp, tp, ep, true,
@@ -299,12 +295,6 @@ pub fn qwen4_request_admission(
         return Err(format!(
             "qwen4: only pp=1, tp=1 with expert-parallel ep in {{1, 2, 4}} is admitted (pp={}, tp={}, ep={})",
             effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
-        ));
-    }
-    if effective_mesh.ep > 1 && native_mtp {
-        return Err(format!(
-            "qwen4: native MTP is not supported with expert parallelism (topology.ep = {})",
-            effective_mesh.ep
         ));
     }
     Ok(())
@@ -1862,16 +1852,18 @@ mod tests {
             qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1, 1),
             Ok(true)
         );
-        // Expert parallelism never attaches the head: `auto`/off stay AR, an
-        // explicit `on` refuses and names EP.
+        // Expert parallelism attaches the head only on an explicit `on`:
+        // `auto`/off stay AR.
         for ep in [2, 4] {
             assert_eq!(qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep), Ok(false));
             assert_eq!(
                 qwen4_native_mtp(with(Some(false)), "gfx1201", hfq, 1, 1, ep),
                 Ok(false)
             );
-            let error = qwen4_native_mtp(with(Some(true)), "gfx1201", hfq, 1, 1, ep).unwrap_err();
-            assert!(error.contains("expert parallelism"), "{error}");
+            assert_eq!(
+                qwen4_native_mtp(with(Some(true)), "gfx1201", hfq, 1, 1, ep),
+                Ok(true)
+            );
         }
     }
 
@@ -1892,8 +1884,7 @@ mod tests {
             assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
         }
         for ep in [2, 4] {
-            let error = admit(1, 1, ep, true).unwrap_err();
-            assert!(error.contains("expert parallelism") && error.contains("MTP"), "{error}");
+            assert_eq!(admit(1, 1, ep, true), Ok(()), "ep {ep}");
         }
     }
 

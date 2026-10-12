@@ -94,7 +94,7 @@ Stable/default-on and safety controls:
 | Key | Default | Purpose |
 |---|---:|---|
 | `hardware.allow_mixed_arch` | `false` | Permit heterogeneous multi-GPU topology. |
-| `topology.ep` | `1` | Qwen4 (Flash-Next) expert-parallel degree on gfx1201: `1`, `2` or `4` cards (routed experts shard `e % N`; every card runs the unchanged single-device program; opt-in, ep > 1 refuses MTP/speculation/lanes/PFlash). `HIPFIRE_QWEN4_EP=0` forces `1`. |
+| `topology.ep` | `1` | Qwen4 (Flash-Next) expert-parallel degree on gfx1201: `1`, `2` or `4` cards (routed experts shard `e % N`; every card runs the unchanged single-device program; opt-in). EP admits native MTP only when asked for explicitly (`--spec mtp` / `speculation.mtp = "on"`; `auto` stays AR; the drafter is replicated on every card and greedy output equals single-card MTP); ep > 1 still refuses DFlash/DSpark/n-gram drafting/DDTree/lanes/PFlash and `HIPFIRE_MTP_SAMPLED_MODE=naive`. `HIPFIRE_QWEN4_EP=0` forces `1`. |
 | `hardware.tp_use_rccl` | `true` | RCCL tensor-parallel all-reduce. |
 | `kernel.prefill_batched` | `true` | Batched prefill kernels. |
 | `speculation.draft_f16` | `true` | FP16 DFlash draft activations. |

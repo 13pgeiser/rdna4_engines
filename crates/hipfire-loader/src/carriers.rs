@@ -869,9 +869,10 @@ impl Carrier for Qwen4Carrier {
 }
 
 /// Expert parallelism refuses what the replicated single-device program does
-/// not run: speculation (native MTP, DFlash, DSpark, n-gram, DDTree), drafters
-/// and the other single-device-only load options. Names EP and the escape
-/// hatches. `ep <= 1` never refuses (the single-device caps are unchanged).
+/// not run: DFlash, DSpark, n-gram drafting, DDTree, drafters and the other
+/// single-device-only load options. Native MTP (`--spec mtp`) is admitted: the
+/// drafter is replicated on every rank. Names EP and the escape hatches.
+/// `ep <= 1` never refuses (the single-device caps are unchanged).
 pub(crate) fn qwen4_ep_option_refusal(
     ep: usize,
     draft_path: Option<&str>,
@@ -882,7 +883,6 @@ pub(crate) fn qwen4_ep_option_refusal(
     }
     let spec = options.spec;
     let unsupported = [
-        (spec.mtp == Some(true), "native MTP speculation (--spec mtp)"),
         (draft_path.is_some() || spec.dflash == Some(true), "DFlash"),
         (spec.dspark == Some(true), "DSpark"),
         (spec.ngram_draft == Some(true), "n-gram drafting"),
@@ -920,7 +920,8 @@ pub struct Qwen4RankShared {
     pub kv_mode: String,
     pub state_quant: Option<String>,
     pub spec: SpecLoadCfg,
-    /// Native MTP after admission. Must be `false` for an EP rank.
+    /// Native MTP after admission (EP: only on an explicit `--spec mtp`; every
+    /// rank attaches its own head).
     pub native_mtp: bool,
     pub max_k: usize,
 }
@@ -936,8 +937,8 @@ pub struct Qwen4SessionSeed<'a> {
 /// One loaded rank.
 pub struct Qwen4RankLoad {
     pub bundle: hipfire_arch_qwen4::bundle::Qwen4Bundle,
-    /// Native MTP after the profile check and host-mapped policy (`false` on an
-    /// EP rank).
+    /// Native MTP after the profile check and host-mapped policy (an EP rank
+    /// attaches its own head when it is on).
     pub native_mtp: bool,
     pub max_k: usize,
     /// The admitted context (unified memory resolves it after load).
@@ -1251,7 +1252,7 @@ struct RankCtx<'a> {
 
 /// Load one Qwen4 bundle onto `gpu`: manifest, expert placement and residency,
 /// weight fulfillment, `Qwen4Bundle::assemble_with_ple_rows`, the PLE stores,
-/// the forward program and (single device only) the native MTP head.
+/// the forward program and the native MTP head.
 ///
 /// `ep == None` is the single-device load, byte for byte what the carrier did
 /// inline before. With `ep == Some(rank, ranks)` (`ranks` in 2, 4) this is one
@@ -1259,8 +1260,9 @@ struct RankCtx<'a> {
 /// declared `ExpertSharded { 512, Stride }` and uploaded compactly (this
 /// rank's experts `e % ranks == rank` ascending, `512 / ranks` per stack, in
 /// VRAM or pinned host RAM per the residency policy); everything else is
-/// replicated; the native MTP head is not attached; the rank prints its fit
-/// line and an `qwen4 EP rank r/N` load line. `session` is rank 0's session
+/// replicated; the rank attaches its own native MTP head when it is on; the
+/// rank prints its fit line and an `qwen4 EP rank r/N` load line. `session` is
+/// rank 0's session
 /// cache seed. `expert_vram_layers` (`None` = the env/auto resolution of a
 /// single-device load) pins the expert VRAM split in MoE layers resident of
 /// trunk + MTP (the total = fully resident, the MTP layer last): an EP mesh
@@ -1286,12 +1288,6 @@ pub fn load_qwen4_rank(
         if placement.ranks < 2 || placement.rank >= placement.ranks {
             return Err(format!(
                 "qwen4: rank {} of {} is not an expert-parallel rank",
-                placement.rank, placement.ranks
-            ));
-        }
-        if native_mtp {
-            return Err(format!(
-                "qwen4: native MTP is not supported with expert parallelism (rank {}/{})",
                 placement.rank, placement.ranks
             ));
         }
@@ -2131,11 +2127,12 @@ pub fn load_qwen4_rank(
         }
     if let Some(placement) = ep {
         eprintln!(
-            "qwen4 EP rank {}/{}: loaded on device {} ({} routed experts of 512 per stack, native MTP off, max_seq {max_seq})",
+            "qwen4 EP rank {}/{}: loaded on device {} ({} routed experts of 512 per stack, native MTP {}, max_seq {max_seq})",
             placement.rank,
             placement.ranks,
             ctx.gpu.device_id,
             512 / placement.ranks,
+            if native_mtp { "on" } else { "off" },
         );
     }
     let card_cap = ctx.sequence.map(|sequence| sequence.card_cap);
@@ -5175,7 +5172,6 @@ mod qwen4_admission_tests {
             SourceAdmissionOptions { spec, ..defaults }
         };
         let cases: Vec<(&str, Option<&str>, SourceAdmissionOptions)> = vec![
-            ("native MTP", None, with_spec(&|s| s.mtp = Some(true))),
             ("DFlash", None, with_spec(&|s| s.dflash = Some(true))),
             ("DFlash", Some("draft.hfq"), defaults),
             ("DSpark", None, with_spec(&|s| s.dspark = Some(true))),
@@ -5198,6 +5194,11 @@ mod qwen4_admission_tests {
         ];
         for ep in [2usize, 4] {
             assert!(qwen4_ep_option_refusal(ep, None, &defaults).is_ok(), "ep {ep} plain AR");
+            // Native MTP is admitted: the drafter is replicated on every rank.
+            assert!(
+                qwen4_ep_option_refusal(ep, None, &with_spec(&|s| s.mtp = Some(true))).is_ok(),
+                "ep {ep} native MTP"
+            );
             for (what, draft, options) in &cases {
                 let error = qwen4_ep_option_refusal(ep, *draft, options).expect_err(what);
                 assert!(
