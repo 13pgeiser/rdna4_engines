@@ -1932,10 +1932,11 @@ mod tests {
         let fx = fixture();
         let formats = mixed_formats(TINY);
         let w3 = SynthProvider::new(ExpertFormat::Mq3I4);
-        let base = |out: &Path| SlabWriteConfig {
+        let o = fx.dir.join("x.hfq");
+        let base = || SlabWriteConfig {
             geometry: TINY,
             source: &fx.source,
-            out,
+            out: &o,
             formats: &formats,
             allocation: AllocationSource::Uniform(ExpertFormat::Mq4Xts),
             w3: Some(&w3),
@@ -1944,15 +1945,14 @@ mod tests {
             expected_source_sha256: None,
             progress: false,
         };
-        let o = fx.dir.join("x.hfq");
-        assert!(matches!(write_i4_expert_slabs(&base(&o)), Err(SlabError::Config(_))));
+        assert!(matches!(write_i4_expert_slabs(&base()), Err(SlabError::Config(_))));
         let short = &formats[..3];
         assert!(matches!(
-            write_i4_expert_slabs(&SlabWriteConfig { formats: short, w2: Some(&w3), ..base(&o) }),
+            write_i4_expert_slabs(&SlabWriteConfig { formats: short, w2: Some(&w3), ..base() }),
             Err(SlabError::Config(_))
         ));
         assert!(matches!(
-            write_i4_expert_slabs(&SlabWriteConfig { threads: 0, w2: Some(&w3), ..base(&o) }),
+            write_i4_expert_slabs(&SlabWriteConfig { threads: 0, w2: Some(&w3), ..base() }),
             Err(SlabError::Config(_))
         ));
         assert!(!o.exists());
