@@ -3531,6 +3531,29 @@ impl Qwen4GpuForward {
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
     ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::new_inner(
+            gpu, bundle, max_chunk, mode,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// Prepare the stock MQ6 trunk before the bundle swaps any overlay tensors.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_npu_trunk(
+        gpu: &mut Gpu, bundle: &Qwen4Bundle, pre_overlay: bool,
+    ) -> Result<Option<npu_forward::PreparedTrunk>, Qwen4GpuForwardError> {
+        npu_forward::NpuForward::prepare_stock(gpu, bundle, pre_overlay)
+    }
+
+    pub(crate) fn new_inner(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        #[cfg(target_os = "linux")]
+        npu_prepared: Option<Option<npu_forward::PreparedTrunk>>,
+    ) -> Result<Self, Qwen4GpuForwardError> {
         Self::admit_profile(&bundle.config)?;
         let flash_next = bundle.config.profile.is_flash_next();
         let (scratch, host_token_bytes, host_ple_bytes) =
@@ -3642,7 +3665,7 @@ impl Qwen4GpuForward {
                 gpu.qwen4_trunk_iu4 = false;
             }
             #[cfg(target_os = "linux")]
-            { npu_trunk = npu_forward::NpuForward::load(gpu, bundle, max_chunk, mode)?; }
+            { npu_trunk = npu_forward::NpuForward::load(gpu, bundle, max_chunk, mode, npu_prepared)?; }
             // The Q8_0 decode copies are the Flash-Next decode recipe (they
             // re-quantize its shared-expert and HC matrices); a developer
             // profile decodes the source BF16 weights, so decode and prefill

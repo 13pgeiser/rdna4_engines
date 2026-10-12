@@ -759,9 +759,9 @@ impl Qwen4Bundle {
     /// Apply the pending trunk overlay, if any.  A refusal (payload digest,
     /// weight pre-check) is logged and leaves the base weights; a failure
     /// after replacement started is an error.
-    fn apply_pending_trunk_overlay(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+    fn apply_pending_trunk_overlay(&mut self, gpu: &mut Gpu) -> Result<Option<rdna_compute::TrunkIu4Default>, BundleError> {
         let Some(overlay) = self.trunk_overlay.take() else {
-            return Ok(());
+            return Ok(None);
         };
         let payloads = match overlay.bound.read_verified() {
             Ok(payloads) => payloads,
@@ -770,7 +770,7 @@ impl Qwen4Bundle {
                     "{}",
                     crate::trunk_overlay::overlay_refusal_line(overlay.path(), &reason)
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
         match self
@@ -787,9 +787,10 @@ impl Qwen4Bundle {
             crate::weights::TrunkOverlayOutcome::Applied(applied) => {
                 self.config.trunk_iu4_default = Some(overlay.default);
                 eprintln!("{}", crate::trunk_overlay::applied_line(&overlay, &applied));
+                return Ok(Some(overlay.default));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Attach reusable ordinary-HIP execution resources after the manifest
@@ -866,7 +867,20 @@ impl Qwen4Bundle {
                 );
             }
         }
-        self.apply_pending_trunk_overlay(gpu)?;
+        // The opt-in NPU numerics always read stock MQ6, including z/a/b.
+        // Move their packed CPU panels/twin through the overlay swap; off
+        // returns None without downloads, packing, allocation or logging.
+        #[cfg(target_os = "linux")]
+        let mut npu_prepared = Qwen4GpuForward::prepare_npu_trunk(
+            gpu, self, self.trunk_overlay.is_some(),
+        ).map_err(|error| BundleError::Forward(error.to_string()))?;
+        let overlay_route = self.apply_pending_trunk_overlay(gpu)?;
+        #[cfg(target_os = "linux")]
+        if let Some(prepared) = &mut npu_prepared {
+            prepared.set_overlay_route(overlay_route);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = overlay_route;
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
@@ -882,8 +896,11 @@ impl Qwen4Bundle {
             })
             .unwrap_or_else(|| requested.min(1536));
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
-        let forward = Qwen4GpuForward::new(gpu, self, max_chunk, mode)
-            .map_err(|error| BundleError::Forward(error.to_string()))?;
+        let forward = Qwen4GpuForward::new_inner(
+            gpu, self, max_chunk, mode,
+            #[cfg(target_os = "linux")]
+            Some(npu_prepared),
+        ).map_err(|error| BundleError::Forward(error.to_string()))?;
         let spec_rows = qwen4_spec_logit_rows(max_chunk);
         let logits_len = spec_rows
             .checked_mul(self.config.vocab_size)
