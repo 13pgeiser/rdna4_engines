@@ -4329,6 +4329,15 @@ pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/mq4_r
 /// SHA-256 9509a2cdda96981bfbaa85bdda228a589bf4c2c0fd61cdb9bce8ea55f727acb1
 /// (`sha256sum kernels/qwen4_shared_gu_pm_gfx1151.hxaco`).
 pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_shared_gu_pm_gfx1151.hxaco");
+/// Standalone gfx1151 MTP append DET dense projection (`hipfire-isa` kernel
+/// `mtp_dense_det_gfx11`, module `mtp_dense_det_pm_gfx1151`, entry `mtp_dense_det_pm_gfx1151_w8`):
+/// F16 WMMA `Y32[N, M] = W16[M, K] · X16[N, K]^T`, fixed 128 x 256 tile, one ascending K16 chain
+/// per output, no split-K, 36-byte kernarg (A16, X16, Y32, M, K, N), grid
+/// `[ceil(M/128), ceil(N/256), 1]`, block 256. Reached only by `Gpu::gemm_bf16_xf32_mtp_dense_det_pm`
+/// (no product route, no env flag). The bundle is generated from the emitter after its source
+/// lands (`kernels/mtp_dense_det_pm_gfx1151.hxaco`); its SHA-256 is recorded in the validation
+/// receipt.
+pub const MTP_DENSE_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp_dense_det_pm_gfx1151.hxaco");
 /// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block.
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with

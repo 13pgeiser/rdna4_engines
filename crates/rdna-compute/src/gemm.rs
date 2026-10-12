@@ -231,6 +231,27 @@ pub const fn qwen4_shared_gu_pm_shape(m: usize, k: usize, n: usize) -> bool {
         && (n as u128) * (k as u128) * 2 < (1u128 << 31)
         && (n as u128) * (m as u128) * 2 < (1u128 << 31)
 }
+/// Channels per workgroup (eight waves of sixteen) of `mtp_dense_det_pm_gfx1151_w8`.
+pub const MTP_DENSE_DET_PM_TILE_M: usize = 128;
+/// Projection rows (tokens) per workgroup of `mtp_dense_det_pm_gfx1151_w8`.
+pub const MTP_DENSE_DET_PM_TILE_N: usize = 256;
+/// Entry of the standalone MTP dense DET module (`kernels::MTP_DENSE_DET_PM_GFX1151`).
+pub const MTP_DENSE_DET_PM_ENTRY: &str = "mtp_dense_det_pm_gfx1151_w8";
+/// Shape limits of the standalone MTP dense DET F16 WMMA kernel: `m` channels a multiple of 16,
+/// `k` a multiple of 64 (at least 64), at least one projection row, the A16 (`m*k*2`), X16
+/// (`n*k*2`) and Y32 (`n*m*4`) byte extents below 2^31 (32-bit buffer offsets) and the
+/// `ceil(n / 256)` grid-y within 16 bits. One fixed tile, no split-K: no other bound.
+pub const fn mtp_dense_det_pm_shape(m: usize, k: usize, n: usize) -> bool {
+    m > 0
+        && m % 16 == 0
+        && k >= 64
+        && k % 64 == 0
+        && n > 0
+        && (m as u128) * (k as u128) * 2 < (1u128 << 31)
+        && (n as u128) * (k as u128) * 2 < (1u128 << 31)
+        && (n as u128) * (m as u128) * 4 < (1u128 << 31)
+        && ((n as u128) + (MTP_DENSE_DET_PM_TILE_N as u128) - 1) / (MTP_DENSE_DET_PM_TILE_N as u128) <= 0xffff
+}
 /// gfx1151 selective PM route (`HIPFIRE_QWEN4_MQ6_X4_PM`): the MQ6 X-LDS overwrite
 /// launches (F32, BF16 output, and the a/b/z regions fold, all 128-row `_w8` entries of
 /// `kernels::QWEN4_MQ6_X4_PM_GFX1151`, 256-token tiles) run from the certified builder
@@ -28286,6 +28307,147 @@ impl Gpu {
         Ok(true)
     }
 
+    /// Checks shared by the DET dense wrapper and its launch-only hook: exact gfx1151, shape
+    /// limits ([`mtp_dense_det_pm_shape`]), operand dtypes (`weight` BF16, `x` of `x_dtype`, `y`
+    /// F32) and buffer capacities.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_dense_det_pm_validate(
+        &self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        x_dtype: DType,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let err = |msg: String| hip_bridge::HipError::new(0, &format!("mtp_dense_det_pm: {msg}"));
+        if self.arch != "gfx1151" {
+            return Err(err(format!("requires exact gfx1151 (device is {})", self.arch)));
+        }
+        if !mtp_dense_det_pm_shape(m, k, n) {
+            return Err(err(format!(
+                "shape M={m} K={k} N={n} outside the kernel's limits (M%16==0, K%64==0, N>=1, extents < 2^31)"
+            )));
+        }
+        if weight.dtype != DType::BF16 || x.dtype != x_dtype || y.dtype != DType::F32 {
+            return Err(err(format!(
+                "dtypes must be weight BF16, X {x_dtype:?}, Y F32 (got {:?}, {:?}, {:?})",
+                weight.dtype, x.dtype, y.dtype
+            )));
+        }
+        let x_elem = if x_dtype == DType::F16 { 2 } else { 4 };
+        if weight.buf.size() < m * k * 2 || x.buf.size() < n * k * x_elem || y.buf.size() < n * m * 4 {
+            return Err(err("buffer capacity is too small".into()));
+        }
+        Ok(())
+    }
+
+    /// Launch-only hook of the standalone MTP dense DET GEMM
+    /// (`kernels::MTP_DENSE_DET_PM_GFX1151`, entry `mtp_dense_det_pm_gfx1151_w8`): `y` (F32
+    /// `[n, m]`) from F16 `x16` (`[n, k]`) and the model-lifetime F16 shadow of the BF16 `weight`
+    /// (`[m, k]`; created on first use, keyed by the weight pointer, so the weight must stay
+    /// alive). One fixed 128 x 256 tile and one ascending K16 WMMA chain per output, no split-K,
+    /// no epilogue; DET, not byte-equal to the BF16 incumbent. No X conversion is issued here.
+    /// Errors (nothing launched) outside exact gfx1151 or [`mtp_dense_det_pm_shape`], on a
+    /// dtype / capacity mismatch, a pointer not 16-byte aligned, or `y` overlapping an input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_dense_det_pm_launch(
+        &mut self,
+        weight: &GpuTensor,
+        x16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight, x16, DType::F16, y, m, k, n)?;
+        let err = |msg: String| hip_bridge::HipError::new(0, &format!("mtp_dense_det_pm: {msg}"));
+        let mut ap = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let (mut xp, mut yp) = (x16.buf.as_ptr(), y.buf.as_ptr());
+        let (a_lo, x_lo, y_lo) = (ap as usize, xp as usize, yp as usize);
+        if a_lo % 16 != 0 || x_lo % 16 != 0 || y_lo % 16 != 0 {
+            return Err(err("A16, X16 and Y must be 16-byte aligned".into()));
+        }
+        let overlaps = |lo: usize, len: usize| y_lo < lo + len && lo < y_lo + n * m * 4;
+        if overlaps(a_lo, m * k * 2) || overlaps(x_lo, n * k * 2) {
+            return Err(err("Y overlaps an input".into()));
+        }
+        self.ensure_embedded_kernel("mtp_dense_det_pm_gfx1151", kernels::MTP_DENSE_DET_PM_GFX1151, MTP_DENSE_DET_PM_ENTRY)?;
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, n as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = [
+            m.div_ceil(MTP_DENSE_DET_PM_TILE_M) as u32,
+            n.div_ceil(MTP_DENSE_DET_PM_TILE_N) as u32,
+            1,
+        ];
+        let bytes = m * k * 2 + n * k * 2 + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", MTP_DENSE_DET_PM_ENTRY, bytes);
+        let result = self.launch_maybe_blob(MTP_DENSE_DET_PM_ENTRY, grid, [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Standalone MTP dense DET projection `Y[n, m] = Σ_k W[m, k]·X[n, k]` for a BF16 weight and
+    /// F32 X / Y, directly callable at any `n >= 1` (fc_hidden: `m = k = 2560`). Warms the
+    /// weight's model-lifetime F16 shadow (BF16 -> F32 exact widening -> F16 RNE, once), converts
+    /// X F32 -> F16 RNE uncached on every call, then launches
+    /// [`Gpu::mtp_dense_det_pm_launch`] on the same stream: each output is one ascending K16 WMMA
+    /// chain from +0 whatever `n` is, so a row's bytes do not depend on its batch. F16 has a
+    /// narrower exponent range than BF16/F32: under/overflow is possible and this is explicitly
+    /// DET, not byte-equal to [`Gpu::gemm_bf16_xf32_multirow`]. No product route uses it yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_mtp_dense_det_pm(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight, x, DType::F32, y, m, k, n)?;
+        let x16 = self.qwen4_convert_f16_x(x, n * k)?;
+        self.mtp_dense_det_pm_launch(weight, &x16, y, m, k, n)
+    }
+
+    /// The model-lifetime F16 shadow of the BF16 `[m, k]` `weight` (created on first use,
+    /// keyed by the weight pointer) as a non-owning F16 `[m*k]` view: what
+    /// [`Gpu::mtp_dense_det_pm_launch`] reads as A16, for the standalone DET harness's oracle
+    /// and conversion checks. Do not free the view; keep `weight` alive.
+    pub fn mtp_dense_det_pm_weight_shadow(&mut self, weight: &GpuTensor, m: usize, k: usize) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        if weight.dtype != DType::BF16 || m == 0 || k == 0 || weight.buf.size() < m * k * 2 {
+            return Err(hip_bridge::HipError::new(0, "mtp_dense_det_pm_weight_shadow: needs a BF16 weight of at least m*k elements"));
+        }
+        let ptr = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        Ok(GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr, m * k * 2) },
+            shape: vec![m * k],
+            dtype: DType::F16,
+        })
+    }
+
     /// `Y[b, m] = Σ_k W[m, k]·X[b, k]` for a BF16 weight through a
     /// model-lifetime F16 shadow and the LDS-staged F16 WMMA GEMM, X already
     /// F16.  2.5-5x the BF16 multirow kernel on gfx1151, 4-30x on gfx1201.
@@ -29054,6 +29216,73 @@ impl Gpu {
             grid,
             [block, 1, 1],
             shared_bytes,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// The incumbent gfx1151 sixteen-row `gemm_bf16_xf32_multirow_r16w4_gfx1151` tile launched
+    /// unconditionally (grid `[ceil(m/16), ceil(n/8), 1]`, block 128), bypassing
+    /// [`Gpu::gemm_bf16_xf32_multirow`]'s allowlist: the same kernel and launch it selects for
+    /// an allowlisted `tokens_fast == false` shape (2560 x 2560 at `n = 4096`), for baselines at
+    /// other shapes. Admission mirrors the r16 route: exact gfx1151, BF16 weight, F32 X / Y,
+    /// `m % 16 == 0`, `k % 256 == 0`, `n >= 64`, 16-bit grid dimensions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_multirow_r16w4_forced(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let err = |msg: String| hip_bridge::HipError::new(0, &format!("multirow_r16w4_forced: {msg}"));
+        if self.arch != "gfx1151" {
+            return Err(err(format!("requires exact gfx1151 (device is {})", self.arch)));
+        }
+        if weight.dtype != DType::BF16 || x.dtype != DType::F32 || y.dtype != DType::F32 {
+            return Err(err("requires BF16 weights and F32 activations/output".into()));
+        }
+        if m == 0 || m % 16 != 0 || k == 0 || k % 256 != 0 || n < 64 || n.div_ceil(8) > 0xffff || m.div_ceil(16) > 0xffff {
+            return Err(err(format!("shape M={m} K={k} N={n} outside r16w4 (M%16==0, K%256==0, N>=64)")));
+        }
+        let (wb, xb, yb) = (m * k * 2, n * k * 4, n * m * 4);
+        if weight.buf.size() < wb || x.buf.size() < xb || y.buf.size() < yb {
+            return Err(err("buffer capacity is too small".into()));
+        }
+        let kernel = "gemm_bf16_xf32_multirow_r16w4_gfx1151";
+        self.ensure_kernel(kernel, kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC, kernel)?;
+        let (wp, xp, yp) = (weight.buf.as_ptr(), x.buf.as_ptr(), y.buf.as_ptr());
+        let (mv, kv, nv) = (m as i32, k as i32, n as i32);
+        let mut params = [
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, wb + xb + yb);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [m.div_ceil(16) as u32, n.div_ceil(8) as u32, 1],
+            [128, 1, 1],
+            0,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
