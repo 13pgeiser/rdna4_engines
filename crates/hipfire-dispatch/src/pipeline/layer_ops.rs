@@ -380,6 +380,7 @@ struct ZbaFold<'a> {
     z: usize,
     beta: usize,
     alpha: usize,
+    padded_outputs: Option<[&'a GpuTensor; 3]>,
 }
 
 /// Qwen4 trunk projections (GDN in/out, QSA in/out) of one shared input.
@@ -425,6 +426,25 @@ fn project_trunk(
         } else {
             SmallVec::new()
         };
+        if !gpu.qwen4_trunk_iu4_applies(rows) {
+            if let (Some(n_pad), Some(fold)) = (gpu.qwen4_trunk_iu4_ragged(rows), zba.as_ref()) {
+                if let Some([y_z, y_beta, y_alpha]) = fold.padded_outputs {
+                    let z = projections[fold.z].0;
+                    if [fold.z, fold.beta, fold.alpha].iter()
+                        .all(|&j| a4[j] && mq4.contains(&j))
+                        && projections[fold.beta].0.m == 48
+                        && projections[fold.alpha].0.m == 48
+                        && hip(gpu.qwen4_trunk_zba_ragged(
+                            input, rows, n_pad, k, fold.rows, z.m, y_z, y_beta, y_alpha,
+                        ))?
+                    {
+                        done[fold.z] = true;
+                        done[fold.beta] = true;
+                        done[fold.alpha] = true;
+                    }
+                }
+            }
+        }
         if !dense.is_empty() {
             let reservation = hip(gpu.reserve_int4_mmq(k, rows))?;
             let prepared =
@@ -1787,7 +1807,15 @@ pub fn execute_gated_delta_net_hc(
                 op.trunk_a4 & TrunkFamily::GdnB.bit() != 0,
                 op.trunk_a4 & TrunkFamily::GdnZ.bit() != 0,
             ],
-            op.zba_fold.map(|rows| ZbaFold { rows, z: 3, beta: 2, alpha: 1 }),
+            op.zba_fold.map(|rows| ZbaFold {
+                rows, z: 3, beta: 2, alpha: 1,
+                // The prefill scope excludes compact scratch. The ordinary
+                // Qwen4 plan dedicates these full-capacity fields; unused token
+                // rows are dead and the shared helper checks all byte extents.
+                // Z/a/b stay F32 on both routes; qkv BF16-store and out HC
+                // fusion gates are unchanged and never arm ragged IU4.
+                padded_outputs: Some([op.z_output, op.b, op.a]),
+            }),
             true,
         )?;
     }

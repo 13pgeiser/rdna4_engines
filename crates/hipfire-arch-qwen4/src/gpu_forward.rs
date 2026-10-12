@@ -4419,6 +4419,16 @@ impl Qwen4GpuForward {
             && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled()
             && gpu.arch == "gfx1151";
         let prior_invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
+        // The ordinary plan dedicates HcMixed/GdnZ/GdnA/GdnB to max_chunk
+        // rows (plan allocations at 2677/2682/2683/2688). Only [0,n)
+        // contains live tokens. Compact scratch may alias live fields: never
+        // arm its in-place padding, even if a facade appears large enough.
+        let ragged_scope = self.prefill_scope && gpu.qwen4_trunk_iu4
+            && gpu.arch == "gfx1151"
+            && self.scratch.mode != Qwen4ForwardScratchMode::FnSymGfx1201;
+        let prior_ragged = std::mem::replace(
+            &mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope,
+        );
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -4431,6 +4441,7 @@ impl Qwen4GpuForward {
         );
         gpu.qwen4_scope = scope;
         gpu.prefill_invariant_scope = prior_invariant;
+        gpu.qwen4_trunk_iu4_prefill_scope = prior_ragged;
         result
     }
 

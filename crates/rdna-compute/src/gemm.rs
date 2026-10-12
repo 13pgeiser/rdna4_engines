@@ -45940,6 +45940,31 @@ const QWEN4_MOE_SYM_PM_MAX_SLOTS: usize = 1 << 22;
 const QWEN4_MOE_GROUP_MODULE: &str = "qwen4_moe_scatter_stable_top10";
 const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
 
+static QWEN4_TRUNK_IU4_RAGGED: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_IU4_RAGGED").as_deref() != Ok("0")
+});
+
+/// Padded V2B row count for ragged prefill; aligned chunks keep their old route.
+pub fn qwen4_trunk_iu4_ragged_rows(rows: usize) -> Option<usize> {
+    (rows >= QWEN4_F16_WMMA_MIN_TOKENS && rows % 128 != 0)
+        .then(|| rows.next_multiple_of(256))
+}
+
+#[cfg(test)]
+mod qwen4_trunk_ragged_tests {
+    #[test]
+    fn admission() {
+        for (rows, expected) in [
+            (511, None), (512, None), (8064, None), (8192, None),
+            (513, Some(768)), (777, Some(1024)), (1124, Some(1280)),
+            (1127, Some(1280)), (4097, Some(4352)), (8151, Some(8192)),
+            (8186, Some(8192)), (8191, Some(8192)),
+        ] {
+            assert_eq!(super::qwen4_trunk_iu4_ragged_rows(rows), expected);
+        }
+    }
+}
+
 /// Qwen4 symmetric MQ4 trunk (fn-trunk-iu4): header check, the GDN
 /// Z|beta|alpha fold SET, and the exact-activation MQ4 prefill fallback.
 impl Gpu {
@@ -45980,6 +46005,52 @@ impl Gpu {
             && rows % 128 == 0
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
+    }
+
+    /// Ragged Z|beta|alpha only, never decode, invariant prefill or capture.
+    pub fn qwen4_trunk_iu4_ragged(&self, rows: usize) -> Option<usize> {
+        if self.qwen4_trunk_iu4
+            && self.qwen4_trunk_iu4_prefill_scope
+            && !self.prefill_invariant_scope
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && *QWEN4_TRUNK_IU4_RAGGED
+        {
+            qwen4_trunk_iu4_ragged_rows(rows)
+        } else {
+            None
+        }
+    }
+
+    /// Production ragged sequence, shared with the hardware oracle. The caller
+    /// must establish that padded rows are dead, dedicated F32 scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen4_trunk_zba_ragged(
+        &mut self, input: &GpuTensor, rows: usize, n_pad: usize, k: usize,
+        fold_rows: &GpuTensor, z_m: usize, y_z_pad: &GpuTensor,
+        y_beta_pad: &GpuTensor, y_alpha_pad: &GpuTensor,
+    ) -> HipResult<bool> {
+        if self.qwen4_trunk_iu4_ragged(rows) != Some(n_pad)
+            || input.dtype != DType::F32
+            || input.byte_size() < n_pad * k * 4
+            || [(y_z_pad, z_m), (y_beta_pad, 48), (y_alpha_pad, 48)]
+                .iter().any(|(y, m)| y.dtype != DType::F32 || y.byte_size() < n_pad * m * 4)
+        {
+            return Ok(false);
+        }
+        let tail = input.buf.byte_view(rows * k * 4, (n_pad - rows) * k * 4);
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&tail, 0, tail.size(), stream)?,
+            None => self.hip.memset(&tail, 0, tail.size())?,
+        }
+        // block_i4_128 is [K/128][N]: regenerate at N=n_pad, never reuse a
+        // rows-strided sidecar. Each row's producer and K-only reduction are
+        // identical to aligned IU4; zero input rows yield zero outputs.
+        let reservation = self.reserve_int4_mmq(k, n_pad)?;
+        let prepared = self.rotate_x_mq_i4_batched(input, None, None, reservation, k, n_pad)?;
+        self.gemm_qwen4_trunk_zba_iu4(
+            fold_rows, &prepared, y_z_pad, y_beta_pad, y_alpha_pad, z_m, k, n_pad,
+        )
     }
 
     /// Check every header of one `m x k` QT44 trunk matrix for the symmetric

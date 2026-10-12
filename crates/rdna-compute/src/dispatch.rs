@@ -1211,6 +1211,8 @@ pub struct Gpu {
     /// trunk header passed [`Gpu::qwen4_trunk_sym_check`]. See
     /// [`Gpu::qwen4_trunk_iu4_applies`].
     pub qwen4_trunk_iu4: bool,
+    /// Armed only by the noncompact Qwen4 eager prefill wrapper.
+    pub qwen4_trunk_iu4_prefill_scope: bool,
     /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
     /// armed by the caller for the next residual GEMM, and the deferred add
     /// that GEMM left for the following IU4 RMSNorm. See
@@ -2059,6 +2061,7 @@ impl Gpu {
             draft_rows64_scope: false,
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,
+            qwen4_trunk_iu4_prefill_scope: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]
