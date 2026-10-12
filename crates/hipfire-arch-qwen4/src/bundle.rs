@@ -1009,13 +1009,41 @@ impl Qwen4Bundle {
         }
     }
 
+    /// Forward over `tokens`, returning every row's argmax pick (downloaded).
     pub(crate) fn spec_forward_rows(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
         capture_hidden: bool,
     ) -> Result<Vec<u32>, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All, false)
+        self.spec_forward_rows_with_output(
+            gpu,
+            tokens,
+            capture_hidden,
+            Qwen4OutputRows::All,
+            false,
+            true,
+        )
+    }
+
+    /// [`Self::spec_forward_rows`] for callers that consume the verify's
+    /// resident logits on the device and read no argmax pick: identical
+    /// forward, logits, hidden capture and state, minus the pick readback.
+    pub(crate) fn spec_forward_rows_resident(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        capture_hidden: bool,
+    ) -> Result<(), BundleError> {
+        self.spec_forward_rows_with_output(
+            gpu,
+            tokens,
+            capture_hidden,
+            Qwen4OutputRows::All,
+            false,
+            false,
+        )
+        .map(|_| ())
     }
 
     /// Final-row argmax of one forward over `tokens`: prompt fills and
@@ -1031,6 +1059,7 @@ impl Qwen4Bundle {
             tokens,
             capture_hidden,
             Qwen4OutputRows::Final,
+            true,
             true,
         )?
         .into_iter()
@@ -1094,6 +1123,9 @@ impl Qwen4Bundle {
         result
     }
 
+    /// One spec forward. `download_picks` reads the per-row argmax back; when
+    /// `false` the argmax is still computed on the device (head and logits are
+    /// unchanged) and the returned `Vec` is empty.
     fn spec_forward_rows_with_output(
         &mut self,
         gpu: &mut Gpu,
@@ -1101,6 +1133,7 @@ impl Qwen4Bundle {
         capture_hidden: bool,
         output_rows: Qwen4OutputRows,
         prefill: bool,
+        download_picks: bool,
     ) -> Result<Vec<u32>, BundleError> {
         self.ep_refuse("speculative decoding (spec verify forward)")?;
         if tokens.is_empty() {
@@ -1185,6 +1218,9 @@ impl Qwen4Bundle {
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result?;
+        if !download_picks {
+            return Ok(Vec::new());
+        }
         let bytes_len = output_count * std::mem::size_of::<i32>();
         if self.spec_host_top1.len() < bytes_len {
             return Err(BundleError::Forward(
@@ -1367,6 +1403,15 @@ impl Qwen4Bundle {
             .ok_or_else(|| {
                 BundleError::Forward("Qwen4 spec capture returned no argmax".to_string())
             })
+    }
+
+    /// [`Self::spec_capture_token`] without the argmax pick readback.
+    pub(crate) fn spec_capture_token_resident(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+    ) -> Result<(), BundleError> {
+        self.spec_forward_rows_resident(gpu, std::slice::from_ref(&token), true)
     }
 
     /// One ordinary target-only forward of `token`: a single final row, no

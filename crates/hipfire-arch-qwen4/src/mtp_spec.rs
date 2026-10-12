@@ -297,6 +297,120 @@ impl SpecScratch for Qwen4SpecScratch {
     }
 }
 
+impl Qwen4Bundle {
+    /// The verify transaction behind [`SpecTarget::verify_block`]: snapshot,
+    /// row-armed forward, restore on error, end-position check. `read_picks`
+    /// downloads every row's argmax; `false` leaves the picks on the device
+    /// and returns an empty `Vec` (the logits, hidden capture and state are
+    /// identical).
+    fn verify_block_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        read_picks: bool,
+    ) -> Result<Vec<u32>, String> {
+        let block_size = {
+            let s = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?;
+            if s.target_snapshot.is_some() {
+                return Err("Qwen4 verify_block: target snapshot is already active".to_string());
+            }
+            s.block_size
+        };
+        if block.is_empty() || block.len() > block_size {
+            return Err(format!(
+                "Qwen4 verify block length {} is outside scratch capacity {block_size}",
+                block.len()
+            ));
+        }
+        if self.state.position != position {
+            return Err(format!(
+                "Qwen4 verify_block position mismatch: expected {}, got {position}",
+                self.state.position
+            ));
+        }
+        let end_pos = position
+            .checked_add(block.len())
+            .ok_or_else(|| "Qwen4 verify position overflow".to_string())?;
+        if end_pos > self.state.max_seq_len {
+            return Err(format!(
+                "Qwen4 verify end {end_pos} exceeds context capacity {}",
+                self.state.max_seq_len
+            ));
+        }
+        // The verify leaves per-row rollback points, so a rejected suffix is
+        // dropped without re-running the accepted rows (armed before the
+        // snapshot: the GDN states then need no copy).
+        self.state.row_capture_armed =
+            block.len() >= 2 && self.state.row_capture_rows() >= block.len();
+        let snapshot = match self.snapshot(gpu) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.state.row_capture_armed = false;
+                return Err(error.to_string());
+            }
+        };
+        scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?
+            .target_snapshot = Some(snapshot);
+        let result = if read_picks {
+            self.spec_forward_rows(gpu, block, true)
+        } else {
+            self.spec_forward_rows_resident(gpu, block, true)
+                .map(|()| Vec::new())
+        }
+        .map_err(|error| error.to_string());
+        self.state.row_capture_armed = false;
+        if let Err(error) = &result {
+            let snapshot = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .and_then(|s| s.target_snapshot.take());
+            if let Some(snapshot) = snapshot {
+                self.restore(gpu, snapshot)
+                    .map_err(|restore| format!("{error}; target restore failed: {restore}"))?;
+            }
+            return Err(error.clone());
+        }
+        if self.state.position != end_pos {
+            let mismatch = format!(
+                "Qwen4 verify ended at {}, expected {end_pos}",
+                self.state.position
+            );
+            let snapshot = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .and_then(|s| s.target_snapshot.take());
+            if let Some(snapshot) = snapshot {
+                self.restore(gpu, snapshot)
+                    .map_err(|restore| format!("{mismatch}; target restore failed: {restore}"))?;
+            }
+            return Err(mismatch);
+        }
+        result
+    }
+
+    /// [`SpecTarget::verify_block`] for a window whose acceptance consumes the
+    /// verify's resident logits on the device: the same transaction without
+    /// the argmax pick readback.
+    fn verify_block_resident(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        self.verify_block_rows(gpu, block, position, scratch, false)
+            .map(|_| ())
+    }
+}
+
 impl SpecTarget for Qwen4Bundle {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
@@ -409,85 +523,7 @@ impl SpecTarget for Qwen4Bundle {
         scratch: &mut dyn SpecScratch,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<Vec<u32>, String> {
-        let block_size = {
-            let s = scratch
-                .as_any_mut()
-                .downcast_mut::<Qwen4SpecScratch>()
-                .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?;
-            if s.target_snapshot.is_some() {
-                return Err("Qwen4 verify_block: target snapshot is already active".to_string());
-            }
-            s.block_size
-        };
-        if block.is_empty() || block.len() > block_size {
-            return Err(format!(
-                "Qwen4 verify block length {} is outside scratch capacity {block_size}",
-                block.len()
-            ));
-        }
-        if self.state.position != position {
-            return Err(format!(
-                "Qwen4 verify_block position mismatch: expected {}, got {position}",
-                self.state.position
-            ));
-        }
-        let end_pos = position
-            .checked_add(block.len())
-            .ok_or_else(|| "Qwen4 verify position overflow".to_string())?;
-        if end_pos > self.state.max_seq_len {
-            return Err(format!(
-                "Qwen4 verify end {end_pos} exceeds context capacity {}",
-                self.state.max_seq_len
-            ));
-        }
-        // The verify leaves per-row rollback points, so a rejected suffix is
-        // dropped without re-running the accepted rows (armed before the
-        // snapshot: the GDN states then need no copy).
-        self.state.row_capture_armed =
-            block.len() >= 2 && self.state.row_capture_rows() >= block.len();
-        let snapshot = match self.snapshot(gpu) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.state.row_capture_armed = false;
-                return Err(error.to_string());
-            }
-        };
-        scratch
-            .as_any_mut()
-            .downcast_mut::<Qwen4SpecScratch>()
-            .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?
-            .target_snapshot = Some(snapshot);
-        let result = self
-            .spec_forward_rows(gpu, block, true)
-            .map_err(|error| error.to_string());
-        self.state.row_capture_armed = false;
-        if let Err(error) = &result {
-            let snapshot = scratch
-                .as_any_mut()
-                .downcast_mut::<Qwen4SpecScratch>()
-                .and_then(|s| s.target_snapshot.take());
-            if let Some(snapshot) = snapshot {
-                self.restore(gpu, snapshot)
-                    .map_err(|restore| format!("{error}; target restore failed: {restore}"))?;
-            }
-            return Err(error.clone());
-        }
-        if self.state.position != end_pos {
-            let mismatch = format!(
-                "Qwen4 verify ended at {}, expected {end_pos}",
-                self.state.position
-            );
-            let snapshot = scratch
-                .as_any_mut()
-                .downcast_mut::<Qwen4SpecScratch>()
-                .and_then(|s| s.target_snapshot.take());
-            if let Some(snapshot) = snapshot {
-                self.restore(gpu, snapshot)
-                    .map_err(|restore| format!("{mismatch}; target restore failed: {restore}"))?;
-            }
-            return Err(mismatch);
-        }
-        result
+        self.verify_block_rows(gpu, block, position, scratch, true)
     }
 
     fn commit_prefix(
@@ -1182,6 +1218,10 @@ struct SampledVerify {
     /// The current window took a device row build or device accept; read by
     /// the `accept_route` trace field. Reset by [`Self::begin_window`].
     route_device: bool,
+    /// `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS` is not `0`: a device-route window
+    /// downloads no argmax picks unless trace or phase timers need them
+    /// ([`Self::device_skip_picks`]).
+    sampled_picks: bool,
 }
 
 impl SampledVerify {
@@ -1226,6 +1266,7 @@ impl SampledVerify {
             device: None,
             device_eligible,
             route_device: false,
+            sampled_picks: mtp_sampled_picks_enabled(),
         }
     }
 
@@ -1445,6 +1486,13 @@ impl SampledVerify {
 /// accept). Read once per request by [`SampledVerify::new`].
 pub(crate) fn mtp_device_accept_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_DEVICE_ACCEPT").as_deref() != Ok("0")
+}
+
+/// `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS`: a device-route sampled window skips the
+/// unused greedy argmax pick download (default on; `0` keeps it). Read once
+/// per request by [`SampledVerify::new`].
+fn mtp_sampled_picks_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_SAMPLED_PICKS").as_deref() != Ok("0")
 }
 
 /// Exact supported architecture with the resident device sampler available.
@@ -1957,6 +2005,14 @@ impl SampledVerify {
             && self.device.as_ref().is_some_and(|device| k <= device.capacity)
     }
 
+    /// This window's per-row greedy picks are unused: the device route
+    /// consumes the resident logits, the `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS`
+    /// lever is on, and `keep_picks` (trace or phase timers, which print the
+    /// rows) is off. The verify / row forward then skips the pick download.
+    fn device_skip_picks(&self, k: usize, keep_picks: bool) -> bool {
+        !keep_picks && self.sampled_picks && self.device_ready(k)
+    }
+
     fn device_policy(&self) -> SpecCpuArPolicy {
         SpecCpuArPolicy::new(
             self.spec.temperature,
@@ -2397,6 +2453,9 @@ impl Qwen4MtpDrafter {
         let mut accepted = 0usize;
         let mut row = 0usize;
         let device_rows = sampled.as_deref().is_some_and(|s| s.device_ready(k));
+        let skip_picks = sampled
+            .as_deref()
+            .is_some_and(|s| s.device_skip_picks(k, trace || timers.enabled()));
         loop {
             let token_position = position
                 .checked_add(row)
@@ -2404,9 +2463,16 @@ impl Qwen4MtpDrafter {
             timers.mark(gpu, "target_row");
             let mut pick = {
                 let bundle = Self::bundle(target)?;
-                bundle
-                    .spec_capture_token(gpu, token)
-                    .map_err(|error| error.to_string())?
+                if skip_picks {
+                    bundle
+                        .spec_capture_token_resident(gpu, token)
+                        .map_err(|error| error.to_string())?;
+                    0
+                } else {
+                    bundle
+                        .spec_capture_token(gpu, token)
+                        .map_err(|error| error.to_string())?
+                }
             };
             match sampled.as_deref_mut() {
                 // Naive: the row's target token is its AR-sampler draw.
@@ -2417,7 +2483,9 @@ impl Qwen4MtpDrafter {
                 Some(s) => s.load_target(gpu, Self::bundle(target)?, 0, row)?,
                 None => {}
             }
-            picks.push(pick);
+            if !skip_picks {
+                picks.push(pick);
+            }
             let row_hidden = self.row_hidden()?;
             {
                 let bundle = Self::bundle(target)?;
@@ -3156,13 +3224,25 @@ impl Qwen4MtpDrafter {
                 .scratch
                 .as_mut()
                 .ok_or_else(|| "Qwen4 MTP takeover verify scratch is not allocated".to_string())?;
-            let mut target_picks = bundle.verify_block(gpu, &block, position, scratch.as_mut(), None)?;
-            if target_picks.len() < block.len() {
-                return Err(format!(
-                    "Qwen4 MTP takeover verifier returned {} rows for {n} candidates",
-                    target_picks.len()
-                ));
-            }
+            let skip_picks = sampled
+                .as_deref()
+                .is_some_and(|s| s.device_skip_picks(n, trace || timers.enabled()));
+            let mut target_picks = if skip_picks {
+                // Resident acceptance reads this window's logits on the
+                // device: no argmax pick is downloaded or consulted.
+                bundle.verify_block_resident(gpu, &block, position, scratch.as_mut())?;
+                Vec::new()
+            } else {
+                let target_picks =
+                    bundle.verify_block(gpu, &block, position, scratch.as_mut(), None)?;
+                if target_picks.len() < block.len() {
+                    return Err(format!(
+                        "Qwen4 MTP takeover verifier returned {} rows for {n} candidates",
+                        target_picks.len()
+                    ));
+                }
+                target_picks
+            };
             // The request's shared acceptance: each candidate row's `p` is
             // penalized with the window history plus the candidates before it,
             // and a sampled candidate's `q` is the point mass on it. `accept`
@@ -3369,12 +3449,22 @@ impl Qwen4MtpDrafter {
         let mut accepted = 0usize;
         let mut row = 0usize;
         let device_rows = sampled.as_deref().is_some_and(|s| s.device_ready(n));
+        let skip_picks = sampled
+            .as_deref()
+            .is_some_and(|s| s.device_skip_picks(n, trace || timers.enabled()));
         loop {
             let token_position = position + row;
             timers.mark(gpu, "target_row");
-            let mut pick = Self::bundle(target)?
-                .spec_capture_token(gpu, token)
-                .map_err(|error| error.to_string())?;
+            let mut pick = if skip_picks {
+                Self::bundle(target)?
+                    .spec_capture_token_resident(gpu, token)
+                    .map_err(|error| error.to_string())?;
+                0
+            } else {
+                Self::bundle(target)?
+                    .spec_capture_token(gpu, token)
+                    .map_err(|error| error.to_string())?
+            };
             match sampled.as_deref_mut() {
                 Some(s) if !s.draws_drafts() => {
                     pick = s.naive_draw(gpu, Self::bundle(target)?, 0, row)?
@@ -3383,7 +3473,9 @@ impl Qwen4MtpDrafter {
                 Some(s) => s.load_target(gpu, Self::bundle(target)?, 0, row)?,
                 None => {}
             }
-            picks.push(pick);
+            if !skip_picks {
+                picks.push(pick);
+            }
             timers.mark(gpu, "head_fill");
             let row_hidden = self
                 .row_hidden
@@ -4145,6 +4237,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             block.push(seed);
             block.extend_from_slice(&drafts);
             timers.mark(gpu, "verify");
+            let skip_picks = sampled
+                .as_ref()
+                .is_some_and(|s| s.device_skip_picks(k, trace || timers.enabled()));
             let picks = Self::bundle(target)?;
             let pending_hidden = self
                 .pending_hidden
@@ -4154,15 +4249,25 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 .scratch
                 .as_mut()
                 .ok_or_else(|| "Qwen4 native MTP verify scratch is not allocated".to_string())?;
-            let mut target_picks = picks
-                .verify_block(gpu, &block, position, scratch.as_mut(), None)
-                .map_err(|error| error.to_string())?;
-            if sampled.is_some() && target_picks.len() < k + 1 {
-                return Err(format!(
-                    "Qwen4 sampled MTP verifier returned {} rows for {k} drafts",
-                    target_picks.len()
-                ));
-            }
+            let mut target_picks = if skip_picks {
+                // Resident acceptance reads this window's logits on the
+                // device: no argmax pick is downloaded or consulted.
+                picks
+                    .verify_block_resident(gpu, &block, position, scratch.as_mut())
+                    .map_err(|error| error.to_string())?;
+                Vec::new()
+            } else {
+                let target_picks = picks
+                    .verify_block(gpu, &block, position, scratch.as_mut(), None)
+                    .map_err(|error| error.to_string())?;
+                if sampled.is_some() && target_picks.len() < k + 1 {
+                    return Err(format!(
+                        "Qwen4 sampled MTP verifier returned {} rows for {k} drafts",
+                        target_picks.len()
+                    ));
+                }
+                target_picks
+            };
             // `accept`: the target-row work (penalty prepass, row downloads,
             // host distributions) apart from the verify forward.
             timers.mark(gpu, "accept");
