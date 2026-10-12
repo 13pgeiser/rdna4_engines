@@ -169,3 +169,59 @@ Mirrors the GPU railgun replay tape (`replay_sequence_hash`, FNV-1a 64).
 | ring done protocol | per-slot done lines, equality waits | skipped done word (`Neg::SkipDone`): the missing done line is reported; stale seq patch: 0 of 16 words patched and no new done lines |
 | ring overrun | producer guard `producer_may_publish` (done[s] must equal seq − nslots) | guard refuses; forced in the simulator ⇒ MASKPOLL deadlock reported |
 | AIE2P control rules | `crates/pm-npu/src/isa/rules.rs` in `Program::finish` (unchanged core programs) | its own unit tests |
+
+## 7. Opt-in trunk BF16 transport (0.4.2)
+
+`railgun::npu::trunk::NpuTrunkRuntime::open(PanelProgram, Vec<LayerPanels>, banks, rows_max, pci)`
+accepts the unchanged `pm_npu::kernels::gemm_g80::build_panel_program(rows_max, Epilogue::Bf16)`
+PDI/TXN and resident `pack_b_bf16` panels including Sm/Se. GdnIn/QsaIn use 13/11 START_CUs
+in a retained chain per (layer, shape, bank), sharing one identical panel hardware context.
+The program declares its padded row extent; rows never patch the program. The caller zeros
+all padding codes/scales. A is one `pack_a_bf16` stream (not 13 copies); C is panel-concatenated.
+At 8192 rows each bank has A=23,592,960 B and C=272,629,760 B. `a_arena`/`c_arena`
+return the BO handle/NPU address, anonymous host pointer, HIP device pointer and logical length.
+The BO owner stays on the relay thread. No command/TXN words are changed after open.
+
+The existing dlopen'd `npu::hip_runtime` is used rather than adding hip-bridge to railgun's
+runtime dependency graph. HIP events/registrations remain !Send; only immutable entry points
+and event handles cross to the relay, which selects the original GPU on its own thread.
+`unsafe kick(layer, shape, bank, rows, raw_hip_stream)` records an explicit
+`hipEventReleaseToSystem` event after A production. Bounded event queries precede NPU submit.
+The chain's transaction drains all C channels; a 3 s timeline wait checks COMPLETED before
+CPU-alias invalidation and release-store/CLFLUSH of the bank's registered done word.
+`wait_host(Seq)` propagates submission, event and timeline errors. `unsafe wait_gpu(Seq, stream)`
+**first checks bounded host completion**, then queues `hipStreamWaitValue32(>= seq)` and a
+system-fenced event before C loads. This conservative v1 rejoin is host-gated, not a CPU-free
+wait: failed jobs cannot strand a queued GPU wait or silently admit stale C. Raw done waits
+outside this checked API are unsupported. Sequences never wrap (reopen at i32::MAX).
+`unsafe retire_bank(Seq, stream)` records the last consumer's event; reuse requires its
+completion. `close()` joins the relay (context before BOs), checks GPU retirement, then HIP
+unregisters before unmapping. On unretired/stuck GPU work, teardown reports an error and
+quarantines registrations/pages until process exit instead of freeing live operands.
+
+Visibility is deliberately stronger than a release-value fence:
+[coop-flashnext §3](coop-flashnext.md#3-buffer-ownership-and-visibility) requires compute
+completion/GL2 writeback before A publication and acquire/GL2 invalidate before C loads;
+[§4](coop-flashnext.md#4-per-layer-synchronization-timeline) places these boundaries at each
+handoff. The [HIP event contract](https://github.com/ROCm/hip/blob/amd-staging/include/hip/hip_runtime_api.h)
+defines system sequentially-consistent event fences with cache writeback/invalidation
+(`hipEventDisableSystemFence` explicitly disables them; this runtime never sets it).
+Producer and post-wait consumer events request system release, never device release or
+timing-only fence suppression. CPU CLFLUSH does **not** replace the GPU boundary.
+The memory class is anonymous pages + amdxdna userptr + default coherent hipHostRegister:
+never exported HIP VMM (snapshot-only), never imported-BO SYNC_BO.
+
+Hardware gate (parent runs on Halo): `target/release/npu-trunk-transport --pci 0000:bf:00.0`.
+It uses default shim AXI, two production-size banks, GPU shader copies of CPU-packed A,
+13 panels, all-output BF16 comparisons against CPU integer dots + `bf16_direct` through
+`bf16_output_offset`, and 20 alternating rounds with changed codes/scales. C is poisoned
+before every round. A deterministic missing-wait negative reads poison **before submission**;
+a racing ungated read could legitimately finish after NPU completion and is not a reliable
+negative. An invalid host Seq errors immediately; a separate impossible DRM timeline point
+must error within 3 s. Expected output: two sequence/timeline negative lines, a missing-wait
+negative, 20 `round=.. bank=.. seq=.. exact kick->done=..` lines, and `PASS` with p50/p99/max,
+NPU busy envelope and wall time. Busy is the host submit-to-timeline envelope, not an AIE
+hardware counter; wall includes CPU verification. Any mismatch/error exits 1.
+Production-size visibility and host-registered done-word acceptance by HIP's beta stream-wait
+API remain **unmeasured until this gate runs**; its documented pointer requirement is signal
+memory. The old 4 KiB fixture proof is not evidence that this larger route has passed.

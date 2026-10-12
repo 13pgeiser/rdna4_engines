@@ -15,6 +15,7 @@
 pub mod fclk;
 pub mod tape;
 pub mod hip_runtime;
+pub mod trunk;
 use core::ffi::c_void;
 use core::mem::size_of;
 

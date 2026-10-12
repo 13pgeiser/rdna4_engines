@@ -2940,6 +2940,7 @@ version = "0.4.2"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "parking_lot",
  "railgun-corpus",
  "rdna-compute",
  "redline-rocr",
@@ -3185,9 +3186,11 @@ dependencies = [
 name = "rdna-compute"
 version = "0.4.2"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "libloading",
+ "pm-npu",
  "radiowave",
  "railgun",
  "railgun-corpus",
