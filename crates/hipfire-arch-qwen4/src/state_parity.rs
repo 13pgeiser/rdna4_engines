@@ -20,6 +20,7 @@ use crate::mtp_spec::validate_native_mtp_prefill_request;
 use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
 use hipfire_runtime::external_rows::RowCacheStats;
+use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use rdna_compute::tensor_ops::{
     indexed_attention_cache_append, indexed_attention_pool_rope, indexed_attention_reuse_selection,
