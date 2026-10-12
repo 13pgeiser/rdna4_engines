@@ -1475,6 +1475,7 @@ pub const SITES: &[Site] = &[
     Site { file: "rdna-compute/src/gemm.rs", function: "hc_down_tile_selected", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq4g256v2_xf16_applies", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/gemm.rs", function: "qwen4_trunk_iu4_applies", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
+    Site { file: "rdna-compute/src/gemm.rs", function: "qwen4_trunk_iu4_ragged", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/hc_row_fold.rs", function: "hc_row_fold_applies", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/moe.rs", function: "moe_router_softmax_top10_f32", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/gemm.rs", function: "gemm_mq6g256v2_xf16_applies", occurrences: 2, decisions: &["gfx12-mqv2-prefill-projection-routes", "gfx11-mqv2-prefill-projection-routes"] },
