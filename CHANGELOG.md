@@ -2,6 +2,7 @@
 
 ## Unreleased (0.4.2)
 
+- **Recording inventory covers the recent continuous-batching DFlash admission predicates and MoE row gather.** Classifies all ten previously unregistered recording/capture checks, including lane-table upload refusal, so the offline `railgun-cert` recording-inventory gate remains synchronized with the source tree. Gate command: `cargo test --release -j 12 -p railgun-cert every_recording_predicate_in_the_tree_has_an_inventory_row`.
 - **Qwen4 state-parity `cache_suffix_refusal` test expectation corrected (test-only; no production change).** The scenario deliberately passes `cache_hit = true` at `start_pos = 0` with a complete 3-token fill: an invalid zero-length cached prefix, not an empty fill. Native MTP prefill validation supports valid cache-hit suffixes (`0 < start_pos < prompt_len`, fill exactly the prompt suffix) and refuses position zero with `Qwen4 native MTP cache hit at 0 needs a non-empty suffix of a 3-token prompt`. The GPU compact test now asserts that exact message plus `prompt_len = fill_len = 3`, and a GPU-independent unit test pins the same report so a stale message fails in GPU-less gates.
 - **DFlash continuous-batching draft on gfx1201: lane-batched context fill and fc (`HIPFIRE_CB_DRAFT_LANE_CTX=0` is the developer kill switch).** The batched draft still projected each lane's newly committed target-hidden rows (fc) and each layer's context K/V rows lane by lane: rotate + GEMM (or GEMV) + norm + RoPE per lane, per layer.
   - Rows are now packed by the arithmetic class of their ORIGINAL per-lane segment:
