@@ -45,15 +45,30 @@
 //! Exit status: 0 all exact; 1 any bit/verdict/coverage mismatch or hidden
 //! transfer (stops at the first one); 2 setup, identity or capture failure.
 //! A JSON receipt (identity, counts, timings) goes to stdout and `--out`.
+//!
+//! `--rows-backend reference|canonical-parallel-f32` (default `reference`)
+//! selects the target-row primitive under test. `reference` is the serial
+//! bit-exact law above, unchanged. `canonical-parallel-f32` runs
+//! `spec_cpu_ar_rows_parallel_enqueue`, a NEW target law (canonical
+//! top-pool with lower-token-id ties on numerically equal logits, 64-leaf
+//! tree sums); it is checked bit for bit against a separately named CPU
+//! oracle (`canonical_target`), never against the reference law, and the
+//! receipt names the backend and law. Candidates and ordered accept are the
+//! same literal reference law in both modes. The canonical backend adds
+//! tie-heavy rows across 1024-token tile boundaries, signed-zero ties,
+//! pool-boundary ties, equal-rounded-exp weights and partial final tiles, and
+//! also times policy index 4 (0.8/1.0/pool 64/min_p 0.1).
 
 use hip_bridge::{launch_counters, memory_effects, Graph, GraphExec};
-use hipfire_runtime::spec_sampling::{accept_sampled_prefix, SampleSpec, SparseDist, SpecRng};
+use hipfire_runtime::spec_sampling::{
+    accept_sampled_prefix, SampleSpec, SparseDist as RtDist, SpecRng,
+};
 use rdna_compute::spec_sampling_cpu_ar as sc;
-use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
+use rdna_compute::{DType, Gpu, GpuTensor, HipError, HipResult};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 const EOS_NONE: u32 = u32::MAX;
@@ -61,6 +76,380 @@ const CAP: usize = 64;
 const MAX_K: usize = 8;
 const SENT: u32 = 0xFFFF_FFFF;
 const BUDGET_US: f64 = 200.0;
+
+// ── rows backend + local distribution type ───────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowsBackend {
+    Reference,
+    CanonicalParallelF32,
+}
+impl RowsBackend {
+    fn name(self) -> &'static str {
+        match self {
+            RowsBackend::Reference => "reference",
+            RowsBackend::CanonicalParallelF32 => "canonical-parallel-f32",
+        }
+    }
+    fn law(self) -> &'static str {
+        match self {
+            RowsBackend::Reference => {
+                "cpu_ar serial reference: bit-equal to SparseDist::build_from_logits"
+            }
+            RowsBackend::CanonicalParallelF32 => {
+                "canonical top-pool (higher logit, lower id on numeric ties), 64-leaf tree sums, \
+                 serial nucleus; checked against canonical_target(), NOT bit-equal to the \
+                 reference on tied supports"
+            }
+        }
+    }
+}
+static ROWS_BACKEND: AtomicU8 = AtomicU8::new(0);
+fn backend() -> RowsBackend {
+    if ROWS_BACKEND.load(Ordering::Relaxed) == 1 {
+        RowsBackend::CanonicalParallelF32
+    } else {
+        RowsBackend::Reference
+    }
+}
+fn n_kinds() -> usize {
+    if backend() == RowsBackend::CanonicalParallelF32 {
+        N_KINDS_CANON
+    } else {
+        N_KINDS
+    }
+}
+
+/// Host distribution used by every check. Reference-law and candidate
+/// distributions wrap the runtime `SparseDist` (kept in `rt` so the runtime
+/// accept stays authoritative); canonical-law target rows exist only as
+/// entries, because the runtime type has no constructor for them.
+#[derive(Clone, Default)]
+struct SparseDist {
+    e: Vec<(u32, f32)>,
+    rt: Option<RtDist>,
+}
+impl SparseDist {
+    fn entries(&self) -> &[(u32, f32)] {
+        &self.e
+    }
+    fn prob(&self, token: u32) -> f32 {
+        self.e
+            .iter()
+            .find(|&&(t, _)| t == token)
+            .map_or(0.0, |&(_, p)| p)
+    }
+    /// Inverse-CDF draw; same arithmetic as the runtime `SparseDist::sample`.
+    fn sample(&self, u: f32) -> u32 {
+        let mut acc = 0.0f32;
+        for &(t, p) in &self.e {
+            acc += p;
+            if u < acc {
+                return t;
+            }
+        }
+        self.e.last().map_or(0, |&(t, _)| t)
+    }
+    fn from_rt(r: RtDist) -> Self {
+        Self {
+            e: r.entries().to_vec(),
+            rt: Some(r),
+        }
+    }
+    fn set_point_mass(&mut self, token: u32) {
+        let mut r = RtDist::default();
+        r.set_point_mass(token);
+        *self = Self::from_rt(r);
+    }
+    fn build_from_candidates(
+        &mut self,
+        c: &mut Vec<(u32, f32)>,
+        spec: SampleSpec,
+    ) -> Result<(), String> {
+        let mut r = RtDist::default();
+        r.build_from_candidates(c, spec)?;
+        *self = Self::from_rt(r);
+        Ok(())
+    }
+    /// Target row under the selected backend's law.
+    fn build_from_logits(
+        &mut self,
+        logits: &[f32],
+        spec: SampleSpec,
+        scr: &mut Vec<(u32, f32)>,
+    ) -> Result<(), String> {
+        match backend() {
+            RowsBackend::Reference => {
+                let mut r = RtDist::default();
+                r.build_from_logits(logits, spec, scr)?;
+                *self = Self::from_rt(r);
+            }
+            RowsBackend::CanonicalParallelF32 => {
+                self.e = canonical_target(logits, spec, scr)?;
+                self.rt = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn rt_vec(v: &[SparseDist]) -> Option<Vec<RtDist>> {
+    v.iter().map(|d| d.rt.clone()).collect()
+}
+
+/// Fixed 64-leaf binary sum tree: strides 32,16,8,4,2,1, left = lower index,
+/// missing leaves +0, every add one f32 round-to-nearest (no FMA exists here).
+fn tree64(w: &[f32]) -> f32 {
+    let mut s = [0f32; CAP];
+    for (i, &x) in w.iter().take(CAP).enumerate() {
+        s[i] = x;
+    }
+    let mut stride = CAP / 2;
+    while stride >= 1 {
+        for i in 0..stride {
+            s[i] = s[i] + s[i + stride];
+        }
+        stride /= 2;
+    }
+    s[0]
+}
+
+/// Canonical order: higher numeric logit first, lower token id on equality
+/// (+0 and -0 tie).
+fn canon_before(a: &(u32, f32), b: &(u32, f32)) -> std::cmp::Ordering {
+    b.1.partial_cmp(&a.1)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then(a.0.cmp(&b.0))
+}
+
+/// CPU oracle of the canonical-parallel target law, written from the law's
+/// definition and not from the reference builder: canonical top-`pool` over
+/// the finite logits; weights `exp(RN(RN(l - max) * RN(1/T)))` with
+/// non-finite -> 0; full-pool mass by the 64-leaf tree over the canonical
+/// (pre-sort) weights; stable strict-`>` descending weight sort over the
+/// `pool` slots; min_p floor `RN(min_p * w0)`; capped mass by the same tree
+/// over the sorted prefix; serial nucleus with boundary inclusion; residual
+/// correction when no crossing; p>0 retained in order. Point mass at the
+/// canonical maximum when the full mass is <= 0 or non-finite (token 0 when
+/// nothing is finite).
+fn canonical_target(
+    logits: &[f32],
+    spec: SampleSpec,
+    scr: &mut Vec<(u32, f32)>,
+) -> Result<Vec<(u32, f32)>, String> {
+    if !(spec.temperature > 0.0 && spec.temperature.is_finite()) {
+        return Err(format!("non-positive temperature {}", spec.temperature));
+    }
+    let pool = spec.pool.clamp(1, CAP);
+    scr.clear();
+    scr.extend(
+        logits
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.is_finite())
+            .map(|(i, &l)| (i as u32, l)),
+    );
+    if scr.len() > pool {
+        scr.select_nth_unstable_by(pool - 1, canon_before);
+        scr.truncate(pool);
+    }
+    scr.sort_by(canon_before);
+    let Some(&(top_id, max_logit)) = scr.first() else {
+        return Ok(vec![(0, 1.0)]);
+    };
+    let inv_temp = 1.0f32 / spec.temperature;
+    let mut w = [0f32; CAP];
+    let mut ids = [u32::MAX; CAP];
+    for (i, &(id, l)) in scr.iter().enumerate() {
+        ids[i] = id;
+        let p = ((l - max_logit) * inv_temp).exp();
+        w[i] = if p.is_finite() { p } else { 0.0 };
+    }
+    let full = tree64(&w);
+    if full <= 0.0 || !full.is_finite() {
+        return Ok(vec![(top_id, 1.0)]);
+    }
+    let mut e: Vec<(u32, f32)> = (0..pool).map(|i| (ids[i], w[i])).collect();
+    for i in 1..pool {
+        let mut j = i;
+        while j > 0 && e[j].1 > e[j - 1].1 {
+            e.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    let mut cap = spec.cap.clamp(1, pool);
+    if spec.min_p > 0.0 {
+        let floor = spec.min_p * e[0].1;
+        if let Some(cut) = (1..cap).find(|&i| e[i].1 < floor) {
+            cap = cut;
+        }
+    }
+    let sum = if cap < pool {
+        let mut m = [0f32; CAP];
+        for i in 0..cap {
+            m[i] = e[i].1;
+        }
+        tree64(&m)
+    } else {
+        full
+    };
+    let threshold = spec.top_p * sum;
+    let mut cumulative = 0.0f32;
+    let mut boundary = None;
+    for (i, &(_, p)) in e[..cap].iter().enumerate() {
+        cumulative += p;
+        if cumulative >= threshold {
+            boundary = Some(i + 1);
+            break;
+        }
+    }
+    match boundary {
+        Some(len) => {
+            e.truncate(len);
+            for x in e.iter_mut() {
+                x.1 /= cumulative;
+            }
+        }
+        None => {
+            e.truncate(cap);
+            for x in e.iter_mut() {
+                x.1 /= sum;
+            }
+            e[0].1 += (1.0 - cumulative / sum).max(0.0);
+        }
+    }
+    e.retain(|&(_, p)| p > 0.0);
+    Ok(e)
+}
+
+// ── accept law, local copy (used when a target row has no runtime twin) ──
+
+fn law_residual(p: &SparseDist, q: &SparseDist, u: f32) -> u32 {
+    let residual = |&(token, pt): &(u32, f32)| (token, (pt - q.prob(token)).max(0.0));
+    let mass: f32 = p.e.iter().map(|e| residual(e).1).sum();
+    if !(mass > 0.0) {
+        return p.sample(u);
+    }
+    let target = u * mass;
+    let mut acc = 0.0f32;
+    let mut last = None;
+    for (token, r) in p.e.iter().map(residual) {
+        if r <= 0.0 {
+            continue;
+        }
+        acc += r;
+        if target < acc {
+            return token;
+        }
+        last = Some(token);
+    }
+    last.unwrap_or_else(|| p.sample(u))
+}
+
+/// Same control flow and arithmetic as `accept_sampled_prefix`; returns
+/// (committed, accepted, hit_eos).
+fn law_accept(
+    drafts: &[u32],
+    qs: &[SparseDist],
+    eos: Option<u32>,
+    rng: &mut SpecRng,
+    ps: &[SparseDist],
+) -> (Vec<u32>, usize, bool) {
+    let mut committed = Vec::with_capacity(drafts.len() + 1);
+    let mut accepted = 0usize;
+    for (row, (&draft, q)) in drafts.iter().zip(qs).enumerate() {
+        let p = &ps[row];
+        let (qx, px) = (q.prob(draft), p.prob(draft));
+        let u = rng.next_f32();
+        if qx > 0.0 && u * qx < px {
+            committed.push(draft);
+            accepted += 1;
+            if eos == Some(draft) {
+                return (committed, accepted, true);
+            }
+        } else {
+            let token = law_residual(p, q, rng.next_f32());
+            committed.push(token);
+            return (committed, accepted, eos == Some(token));
+        }
+    }
+    let bonus = ps[drafts.len()].sample(rng.next_f32());
+    committed.push(bonus);
+    (committed, accepted, eos == Some(bonus))
+}
+
+/// The local accept copy must equal the runtime on runtime-built rows; run
+/// before any device work so a diverged copy cannot mask a device bug.
+fn local_law_selfcheck(seed: u64) -> R<u64> {
+    let mut r = Rng(seed ^ 0xC0FFEE);
+    let spec = SampleSpec::cpu_ar(1.0, 0.95, None, 0.0);
+    let vocab = 50usize;
+    let mut mk = |r: &mut Rng| -> R<SparseDist> {
+        let mut ids: Vec<u32> = Vec::new();
+        while ids.len() < 8 {
+            let t = r.below(vocab) as u32;
+            if !ids.contains(&t) {
+                ids.push(t);
+            }
+        }
+        let mut c: Vec<(u32, f32)> = ids.into_iter().map(|t| (t, r.gauss() * 2.0)).collect();
+        let mut d = RtDist::default();
+        d.build_from_candidates(&mut c, spec)
+            .map_err(|e| Fail { code: 2, msg: e })?;
+        Ok(SparseDist::from_rt(d))
+    };
+    let mut n = 0u64;
+    for _ in 0..3000 {
+        let k = r.below(MAX_K + 1);
+        let mut ps = Vec::new();
+        for _ in 0..=k {
+            ps.push(mk(&mut r)?);
+        }
+        let mut qs = Vec::new();
+        let mut drafts = Vec::new();
+        let mut srng = SpecRng::new(r.next());
+        for _ in 0..k {
+            let q = mk(&mut r)?;
+            let x = if r.below(10) < 7 {
+                q.sample(srng.next_f32())
+            } else {
+                r.below(vocab) as u32
+            };
+            drafts.push(x);
+            qs.push(q);
+        }
+        let eos = if r.below(3) == 0 {
+            Some(r.below(vocab) as u32)
+        } else {
+            None
+        };
+        let mut lrng = srng;
+        let (committed, accepted, hit) = law_accept(&drafts, &qs, eos, &mut lrng, &ps);
+        let (Some(rps), Some(rqs)) = (rt_vec(&ps), rt_vec(&qs)) else {
+            return setup("selfcheck rows lost their runtime twin".into());
+        };
+        let mut rrng = srng;
+        let mut tgt = RtDist::default();
+        let acc = accept_sampled_prefix(&drafts, &rqs, eos, &mut rrng, &mut tgt, |row, out| {
+            *out = rps[row].clone();
+            Ok(())
+        })
+        .map_err(|e| Fail { code: 2, msg: e })?;
+        if acc.committed != committed
+            || acc.accepted != accepted
+            || acc.hit_eos != hit
+            || format!("{rrng:?}") != format!("{lrng:?}")
+        {
+            return setup(format!(
+                "local accept-law copy diverges from the runtime: drafts {drafts:?} eos {eos:?} \
+                 local {committed:?}/{accepted}/{hit} runtime {:?}/{}/{}",
+                acc.committed, acc.accepted, acc.hit_eos
+            ));
+        }
+        n += 1;
+    }
+    Ok(n)
+}
 
 // ── failure / errors ─────────────────────────────────────────────────
 
@@ -260,6 +649,8 @@ struct Args {
     expect_uuid: Option<String>,
     expect_bdf: Option<String>,
     skip_timing: bool,
+    rows_backend: RowsBackend,
+    timing_policy_index: usize,
 }
 
 fn parse_args() -> R<Args> {
@@ -277,6 +668,8 @@ fn parse_args() -> R<Args> {
         expect_uuid: None,
         expect_bdf: None,
         skip_timing: false,
+        rows_backend: RowsBackend::Reference,
+        timing_policy_index: 1,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -307,6 +700,18 @@ fn parse_args() -> R<Args> {
             "--replays" => a.replays = num(&v, f)? as usize,
             "--timing-iters" => a.timing_iters = num(&v, f)? as usize,
             "--timing-windows" => a.timing_windows = num(&v, f)? as usize,
+            "--rows-backend" => {
+                a.rows_backend = match v.as_str() {
+                    "reference" => RowsBackend::Reference,
+                    "canonical-parallel-f32" => RowsBackend::CanonicalParallelF32,
+                    other => {
+                        return setup(format!(
+                            "--rows-backend {other}: want reference|canonical-parallel-f32"
+                        ))
+                    }
+                }
+            }
+            "--timing-policy-index" => a.timing_policy_index = num(&v, f)? as usize,
             "--ks" => {
                 a.ks = v
                     .split(',')
@@ -331,6 +736,13 @@ fn parse_args() -> R<Args> {
     }
     if a.timing_windows == 0 || a.timing_iters == 0 {
         return setup("--timing-windows/--timing-iters must be >= 1".into());
+    }
+    if a.timing_policy_index >= policies().len() {
+        return setup(format!(
+            "--timing-policy-index {} out of range (0..{})",
+            a.timing_policy_index,
+            policies().len()
+        ));
     }
     Ok(a)
 }
@@ -360,6 +772,10 @@ impl Rng {
 // ── row shapes, policies ─────────────────────────────────────────────
 
 const N_KINDS: usize = 16;
+/// The canonical backend adds five tie-heavy shapes (tile-boundary ties,
+/// signed-zero ties, pool-boundary ties, ulp-neighbour weights, final-tile
+/// maxima).
+const N_KINDS_CANON: usize = 21;
 
 fn gen_row(kind: usize, v: usize, r: &mut Rng) -> Vec<f32> {
     let mut row: Vec<f32> = match kind {
@@ -383,6 +799,11 @@ fn gen_row(kind: usize, v: usize, r: &mut Rng) -> Vec<f32> {
             .collect(),
         13 => (0..v).map(|_| r.gauss() / (r.unit() + 0.02)).collect(),
         14 => (0..v).map(|i| 1.0 + (i % 7) as f32 * 1e-7).collect(),
+        16 => (0..v).map(|_| r.gauss() - 5.0).collect(),
+        17 => vec![-1.0; v],
+        18 => (0..v).map(|_| r.gauss() - 6.0).collect(),
+        19 => (0..v).map(|_| r.gauss() - 8.0).collect(),
+        20 => (0..v).map(|_| r.gauss() - 5.0).collect(),
         _ => unreachable!(),
     };
     match kind {
@@ -403,6 +824,52 @@ fn gen_row(kind: usize, v: usize, r: &mut Rng) -> Vec<f32> {
             row[b] = 20.0;
         }
         15 => row[r.below(v)] = 1.5,
+        // Equal 5.0 maxima across every 1024-token tile boundary and both
+        // vocabulary ends: far more ties than any pool, lower ids must win.
+        16 => {
+            for b in (1024..v).step_by(1024) {
+                for d in [b - 1, b, b + 1] {
+                    if d < v {
+                        row[d] = 5.0;
+                    }
+                }
+            }
+            for d in [0usize, 1, v - 2, v - 1] {
+                row[d] = 5.0;
+            }
+        }
+        // Top group is +0/-0 mixed; they are numerically equal.
+        17 => {
+            for (n, i) in (0..v).step_by(97).enumerate() {
+                row[i] = if n % 2 == 0 { 0.0 } else { -0.0 };
+            }
+        }
+        // Five clear leaders, then 70 equal 3.0 tokens spread over the whole
+        // vocabulary so pool 20/64 cuts inside the tie group.
+        18 => {
+            for _ in 0..5 {
+                row[r.below(v)] = 9.0;
+            }
+            for n in 0..70usize {
+                row[(n * v / 70).min(v - 1)] = 3.0;
+            }
+        }
+        // 100 logits one ulp apart: distinct logits whose exp rounds equal.
+        19 => {
+            let mut x = 2.0f32;
+            for n in 0..100usize {
+                row[(n * 131 + 7) % v] = x;
+                x = f32::from_bits(x.to_bits() + 1);
+            }
+        }
+        // The maxima sit in the (partial) final tile.
+        20 => {
+            for j in 0..40usize {
+                if j < v {
+                    row[v - 1 - j] = if j < 20 { 6.0 } else { 6.0 - 0.01 * j as f32 };
+                }
+            }
+        }
         _ => {}
     }
     row
@@ -453,7 +920,7 @@ struct Corpus {
 struct Res {
     logits: GpuTensor,
     tgt: sc::SpecDistRows,
-    scratch: sc::SpecDistScratch,
+    scratch: Option<sc::SpecDistScratch>,
     drf: sc::SpecDistRows,
     cand: Vec<GpuTensor>,
     picked: Vec<GpuTensor>,
@@ -470,7 +937,14 @@ fn alloc_res(gpu: &mut Gpu, cap_k: usize, cap_vocab: usize) -> R<Res> {
         "alloc logits",
     )?;
     let tgt = hip(sc::SpecDistRows::new(gpu, cap_k + 1), "SpecDistRows tgt")?;
-    let scratch = hip(sc::SpecDistScratch::new(gpu, cap_k + 1), "SpecDistScratch")?;
+    // The canonical parallel backend has no global scratch.
+    let scratch = match backend() {
+        RowsBackend::Reference => Some(hip(
+            sc::SpecDistScratch::new(gpu, cap_k + 1),
+            "SpecDistScratch",
+        )?),
+        RowsBackend::CanonicalParallelF32 => None,
+    };
     let drf = hip(sc::SpecDistRows::new(gpu, cap_k.max(1)), "SpecDistRows drf")?;
     let mut cand = Vec::new();
     let mut picked = Vec::new();
@@ -496,7 +970,9 @@ fn alloc_res(gpu: &mut Gpu, cap_k: usize, cap_vocab: usize) -> R<Res> {
 fn free_res(gpu: &mut Gpu, res: Res) {
     let _ = res.tgt.free(gpu);
     let _ = res.drf.free(gpu);
-    let _ = res.scratch.free(gpu);
+    if let Some(s) = res.scratch {
+        let _ = s.free(gpu);
+    }
     let _ = gpu.free_tensor(res.logits);
     for t in res.cand.into_iter().chain(res.picked) {
         let _ = gpu.free_tensor(t);
@@ -647,20 +1123,35 @@ fn qs_host(win: &Win, spec: SampleSpec) -> Vec<SparseDist> {
 
 fn host_reference(win: &Win, qs: &[SparseDist], eos: Option<u32>) -> R<RefOut> {
     let mut rng = win.rng_start;
-    let mut tgt = SparseDist::default();
-    let ps = &win.ps;
-    let acc = accept_sampled_prefix(&win.drafts, qs, eos, &mut rng, &mut tgt, |row, out| {
-        *out = ps[row].clone();
-        Ok(())
-    })
-    .map_err(|e| Fail {
-        code: 2,
-        msg: format!("host accept: {e}"),
-    })?;
-    let accepted_eos = acc.hit_eos && acc.committed.len() == acc.accepted;
-    let last = acc.committed.last().copied();
+    let (committed, accepted, hit_eos) = law_accept(&win.drafts, qs, eos, &mut rng, &win.ps);
+    // Reference-law windows: the runtime accept stays authoritative and must
+    // agree with the local copy.
+    if let (Some(rps), Some(rqs)) = (rt_vec(&win.ps), rt_vec(qs)) {
+        let mut rrng = win.rng_start;
+        let mut tgt = RtDist::default();
+        let acc = accept_sampled_prefix(&win.drafts, &rqs, eos, &mut rrng, &mut tgt, |row, out| {
+            *out = rps[row].clone();
+            Ok(())
+        })
+        .map_err(|e| Fail {
+            code: 2,
+            msg: format!("host accept: {e}"),
+        })?;
+        if acc.committed != committed
+            || acc.accepted != accepted
+            || acc.hit_eos != hit_eos
+            || format!("{rrng:?}") != format!("{rng:?}")
+        {
+            return setup(format!(
+                "{}: local accept-law copy diverges from the runtime accept",
+                win.name
+            ));
+        }
+    }
+    let accepted_eos = hit_eos && committed.len() == accepted;
+    let last = committed.last().copied();
     let words = [
-        acc.accepted as u32,
+        accepted as u32,
         if accepted_eos {
             EOS_NONE
         } else {
@@ -675,9 +1166,9 @@ fn host_reference(win: &Win, qs: &[SparseDist], eos: Option<u32>) -> R<RefOut> {
         None => return setup("host RNG consumption not measurable".into()),
     };
     Ok(RefOut {
-        committed: acc.committed,
-        accepted: acc.accepted,
-        hit_eos: acc.hit_eos,
+        committed,
+        accepted,
+        hit_eos,
         words,
         consumed,
     })
@@ -899,6 +1390,26 @@ fn upload_window(gpu: &Gpu, res: &Res, c: &Corpus, win: &Win, qs: &[SparseDist])
 /// only while a capture is open.
 type CallNodes = Vec<(String, usize)>;
 
+/// Target-row enqueue of the selected backend. The canonical parallel
+/// primitive takes no scratch.
+fn rows_enqueue(
+    gpu: &mut Gpu,
+    res: &Res,
+    vocab: usize,
+    rows: usize,
+    policy: sc::SpecCpuArPolicy,
+) -> HipResult<()> {
+    match backend() {
+        RowsBackend::Reference => match res.scratch.as_ref() {
+            Some(s) => gpu.spec_cpu_ar_rows_enqueue(&res.logits, &res.tgt, s, vocab, rows, policy),
+            None => Err(HipError::new(0, "reference rows backend allocated no scratch")),
+        },
+        RowsBackend::CanonicalParallelF32 => {
+            gpu.spec_cpu_ar_rows_parallel_enqueue(&res.logits, &res.tgt, vocab, rows, policy)
+        }
+    }
+}
+
 /// The resident enqueue sequence under test. `cand_us[j] = Some(u)` enqueues
 /// the device candidate q for draft row `j`.
 fn enqueue_window(
@@ -913,8 +1424,8 @@ fn enqueue_window(
     let mut nodes: CallNodes = Vec::new();
     let b0 = gpu.graphs.capture_blobs.len();
     hip(
-        gpu.spec_cpu_ar_rows_enqueue(&res.logits, &res.tgt, &res.scratch, vocab, k + 1, policy),
-        "spec_cpu_ar_rows_enqueue",
+        rows_enqueue(gpu, res, vocab, k + 1, policy),
+        "rows enqueue",
     )?;
     let mut last = gpu.graphs.capture_blobs.len();
     nodes.push(("rows".into(), last - b0));
@@ -1267,14 +1778,7 @@ fn run_distribution(
                 sync(gpu)?;
                 let before = tally();
                 hip(
-                    gpu.spec_cpu_ar_rows_enqueue(
-                        &res.logits,
-                        &res.tgt,
-                        &res.scratch,
-                        *vocab,
-                        chunk.len(),
-                        policy_of(*spec),
-                    ),
+                    rows_enqueue(gpu, &res, *vocab, chunk.len(), policy_of(*spec)),
                     "rows_enqueue",
                 )?;
                 let during = tally().since(before);
@@ -1313,6 +1817,8 @@ fn run_distribution(
     free_res(gpu, res);
     Ok(json!({
         "cases": cases,
+        "rows_backend": backend().name(),
+        "target_law": backend().law(),
         "vocabs": corpora_v.iter().map(|(v, r)| json!({"vocab": v, "rows": r.len()})).collect::<Vec<_>>(),
     }))
 }
@@ -1723,6 +2229,7 @@ struct TW {
     res: Res,
     win: Win,
     qs: Vec<SparseDist>,
+    qs_rt: Vec<RtDist>,
     words: [u32; 2],
     visited: usize,
     q_counts: Vec<u8>,
@@ -1734,17 +2241,18 @@ struct TW {
     g_cand: Option<Captured>,
 }
 
-fn run_timing(
+fn run_timing_policy(
     gpu: &mut Gpu,
     corpora: &[Corpus],
     pols: &[(SampleSpec, String)],
     args: &Args,
+    pi: usize,
 ) -> R<Value> {
     // Real rows when supplied, else the main synthetic corpus.
     let tci = if corpora.len() > 2 { corpora.len() - 1 } else { 0 };
     let c = &corpora[tci];
     let vocab = c.vocab;
-    let pi = 1usize; // 0.7 / 0.95 / pool 20: the AR default family
+    // `pi` indexes policies(); the default (1) is 0.7 / 0.95 / pool 20, the AR default family.
     let spec = pols[pi].0;
     let policy = policy_of(spec);
     let mut dr = Rng(args.seed ^ 0x7131);
@@ -1789,9 +2297,14 @@ fn run_timing(
                 }
             }
             let cu = cand_us_of(&win);
+            let qs_rt: Vec<RtDist> = qs.iter().filter_map(|d| d.rt.clone()).collect();
+            if qs_rt.len() != k {
+                return setup("timing window q rows lack a runtime twin".into());
+            }
             let tw = TW {
                 res,
                 qs,
+                qs_rt,
                 words: rf.words,
                 visited,
                 q_counts: u32_bytes(&counts),
@@ -1840,13 +2353,13 @@ fn run_timing(
                     let mut dl_acc = 0f64;
                     let mut law_acc = 0f64;
                     let mut rng = tw.win.rng_start;
-                    let mut tgt = SparseDist::default();
+                    let mut tgt = RtDist::default();
                     let mut scr = Vec::new();
                     let mut err: Option<Fail> = None;
                     let t = Instant::now();
                     let acc = accept_sampled_prefix(
                         &tw.win.drafts,
-                        &tw.qs,
+                        &tw.qs_rt,
                         tw.win.eos,
                         &mut rng,
                         &mut tgt,
@@ -1868,7 +2381,9 @@ fn run_timing(
                         return Err(e);
                     }
                     let acc = acc.map_err(|e| Fail { code: 2, msg: e })?;
-                    if acc.accepted as u32 != tw.words[0] {
+                    // The existing host route always uses the reference law; its
+                    // verdict only equals the device words under that law.
+                    if backend() == RowsBackend::Reference && acc.accepted as u32 != tw.words[0] {
                         return mismatch(format!("{}: host timing route verdict changed", tw.win.name));
                     }
                     total.push(wall);
@@ -1994,7 +2509,8 @@ fn run_timing(
             within.insert(vn.into(), json!({"p50_us": p50, "within_0_2ms_budget": p50 <= BUDGET_US}));
         }
         out.push(json!({
-            "k": k, "vocab": vocab, "corpus": c.name, "policy": pols[pi].1,
+            "k": k, "vocab": vocab, "corpus": c.name, "policy": pols[pi].1, "policy_index": pi,
+            "rows_backend": backend().name(), "target_law": backend().law(),
             "windows": nw, "iters": iters, "warmup_iters": warm,
             "variants": Value::Object(variants),
             "s1_budget_us": BUDGET_US, "budget_check": Value::Object(within),
@@ -2013,6 +2529,28 @@ fn run_timing(
     let _ = gpu.hip.event_destroy(ev0);
     let _ = gpu.hip.event_destroy(ev1);
     Ok(json!(out))
+}
+
+/// Times the requested policy; the canonical backend also times policy 4
+/// (0.8 / 1.0 / pool 64 / min_p 0.1), the widest-pool case.
+fn run_timing(
+    gpu: &mut Gpu,
+    corpora: &[Corpus],
+    pols: &[(SampleSpec, String)],
+    args: &Args,
+) -> R<Value> {
+    let mut idxs = vec![args.timing_policy_index];
+    if backend() == RowsBackend::CanonicalParallelF32 && args.timing_policy_index != 4 {
+        idxs.push(4);
+    }
+    let mut all = Vec::new();
+    for pi in idxs {
+        match run_timing_policy(gpu, corpora, pols, args, pi)? {
+            Value::Array(a) => all.extend(a),
+            v => all.push(v),
+        }
+    }
+    Ok(Value::Array(all))
 }
 
 // ── identity / main ──────────────────────────────────────────────────
@@ -2095,37 +2633,65 @@ fn finish_fail(rec: &mut Map<String, Value>, stage: &str, e: Fail, st: &Stats) -
 
 fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     let args = parse_args()?;
+    ROWS_BACKEND.store(
+        (args.rows_backend == RowsBackend::CanonicalParallelF32) as u8,
+        Ordering::Relaxed,
+    );
     rec.insert(
         "args".into(),
         json!({"vocab": args.vocab, "seed": args.seed, "windows": args.windows,
                "replays": args.replays, "timing_iters": args.timing_iters,
                "timing_windows": args.timing_windows, "ks": args.ks,
                "rows_f32": args.rows_f32, "rows_vocab": args.rows_vocab,
+               "rows_backend": args.rows_backend.name(),
+               "timing_policy_index": args.timing_policy_index,
                "skip_timing": args.skip_timing}),
     );
     let mut gpu = hip(Gpu::init(), "Gpu::init")?;
     let stream = hip(gpu.hip.stream_create(), "stream_create")?;
     gpu.active_stream = Some(stream);
-    let ident = identity(&gpu, &args)?;
+    let mut ident = identity(&gpu, &args)?;
     eprintln!(
         "[fn_sampled_plumbing_oracle] arch={} uuid={} bdf={}",
         ident["arch"], ident["uuid"], ident["pci_bdf"]
     );
+    ident["rows_backend"] = json!(backend().name());
+    ident["target_law"] = json!(backend().law());
+    if backend() == RowsBackend::CanonicalParallelF32 {
+        let src = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/src/spec_sampling_cpu_ar_parallel.hip"
+        );
+        ident["parallel_kernel_source"] = json!(src);
+        ident["parallel_kernel_source_sha256"] =
+            json!(std::fs::read(src).ok().map(|b| sha_hex(&b)));
+    }
     rec.insert("identity".into(), ident);
     hip(gpu.spec_cpu_ar_precompile(), "spec_cpu_ar_precompile")?;
+    if backend() == RowsBackend::CanonicalParallelF32 {
+        hip(
+            gpu.spec_cpu_ar_rows_parallel_precompile(),
+            "spec_cpu_ar_rows_parallel_precompile",
+        )?;
+    }
+    let selfcheck = local_law_selfcheck(args.seed)?;
+    rec.insert(
+        "local_law_selfcheck".into(),
+        json!({"windows": selfcheck, "equal_to_runtime_accept_sampled_prefix": true}),
+    );
 
     let pols = policies();
     let mut rng = Rng(args.seed);
     // Synthetic corpora: main vocabulary and a small odd one.
     let mut main_rows = Vec::new();
     for _ in 0..3 {
-        for kind in 0..N_KINDS {
+        for kind in 0..n_kinds() {
             main_rows.push(gen_row(kind, args.vocab, &mut rng));
         }
     }
     let mut small_rows = Vec::new();
     for _ in 0..2 {
-        for kind in 0..N_KINDS {
+        for kind in 0..n_kinds() {
             small_rows.push(gen_row(kind, 37, &mut rng));
         }
     }
@@ -2183,8 +2749,16 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     let mut dist_corpora: Vec<(usize, Vec<Vec<f32>>)> =
         corpora.iter().map(|c| (c.vocab, c.rows.clone())).collect();
     for v in [10usize, 64] {
-        let rows: Vec<Vec<f32>> = (0..N_KINDS).map(|kind| gen_row(kind, v, &mut rng)).collect();
+        let rows: Vec<Vec<f32>> = (0..n_kinds()).map(|kind| gen_row(kind, v, &mut rng)).collect();
         dist_corpora.push((v, rows));
+    }
+    if backend() == RowsBackend::CanonicalParallelF32 {
+        // Vocabularies straddling the 1024-token tile boundaries, with
+        // partial final tiles.
+        for v in [1023usize, 1024, 1025, 2047, 2049, 3500] {
+            let rows: Vec<Vec<f32>> = (0..n_kinds()).map(|kind| gen_row(kind, v, &mut rng)).collect();
+            dist_corpora.push((v, rows));
+        }
     }
     match run_distribution(&mut gpu, &dist_corpora, &pols, &mut st) {
         Ok(v) => {
