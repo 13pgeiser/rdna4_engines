@@ -386,6 +386,10 @@ Hessian records, not a `QuantType`). They are planar (codes plane, then f16
 scale plane; codec in `crates/hipfire-runtime/src/mq_i4.rs`), valid only as
 per-expert entries of a Qwen4 artifact declaring `qwen4.expert_slabs` v1
 (`crates/hipfire-arch-qwen4/src/expert_slabs.rs`), and have no GPU kernels yet.
+The CPU byte/arithmetic oracles in `hipfire_runtime::mq_i4_reference` define
+signed A4 unpacking, ascending-K128 fused IU4 folds, the frozen wave32 F4
+decode tree and original-slot scatter. Their module documentation is the
+rounding/order contract for future PeaceMaker kernels, not GPU admission.
 
 **Producing the artifact.** `qwen4_i4_slabs` (`crates/hipfire-quantize/src/bin/qwen4_i4_slabs.rs`, writer
 `hipfire_quantize::i4_slabs::write_i4_expert_slabs`) packs the pinned MQ4-XTS Flash-Next HFQ plus R1
