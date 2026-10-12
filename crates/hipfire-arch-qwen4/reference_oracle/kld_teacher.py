@@ -16,6 +16,11 @@ Usage (ROCm/CUDA torch):
   python3 kld_teacher.py --checkpoint DIR --tokens-from REF.kldref \
       --output TEACHER.logits [--max-chunks N] [--device cuda]
 
+Interpreter: Python 3.13 is required (validated with 3.13.7). The immutable
+upstream AST integrity allowlist pins callable hashes computed over Python
+3.13 AST dumps; Python 3.12 represents the AST differently and fails the
+pinned callable validation even when the source bytes are correct.
+
 Conditions:
   --checkpoint must contain the pinned source safetensors, including BF16
   routed experts and the PLE shards; an MQ4 engine artifact is not a substitute.
