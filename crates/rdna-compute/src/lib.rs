@@ -82,7 +82,8 @@ pub mod uma_memory;
 pub mod vae;
 pub mod trunk_mask;
 pub use trunk_mask::{
-    qwen4_trunk_iu4_mask, Qwen4TrunkMask, TrunkFamily, TRUNK_ALL_BITS, TRUNK_GDN_BITS,
+    qwen4_trunk_iu4_route, Qwen4TrunkIu4Route, Qwen4TrunkMask, TrunkFamily, TrunkIu4Default,
+    TrunkIu4MaskSource, TRUNK_ALL_BITS, TRUNK_GDN_BITS, TRUNK_IU4_DEFAULT_KEY, TRUNK_IU4_ENV,
     TRUNK_QSA_BITS,
 };
 

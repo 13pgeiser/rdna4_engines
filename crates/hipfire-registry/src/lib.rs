@@ -1125,6 +1125,58 @@ mod tests {
     }
 
     #[test]
+    fn flash_next_zab_named_tier_preserves_stock_aliases() {
+        let wire: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        let curated: serde_json::Value =
+            serde_json::from_str(include_str!("../../../registry/models.json")).unwrap();
+        let tag = "qwen3.8:flash-next-mq4-xts-zab";
+        let zab = &wire.models[tag];
+        assert!(zab.repo.is_empty(), "staged artifact must not be pullable");
+        assert_eq!(zab.file, "qwen3.8-flash-next.mq4-xts-zab");
+        assert_eq!(zab.arch_id, Some(16));
+        assert_eq!(zab.quant.as_deref(), Some("mq4"));
+        assert_eq!(
+            zab.sha256.as_deref(),
+            Some("a85a00d192ee7a352d5d1f55f0421691a2553fe90f05d9ae1d7e59fec5b686fa")
+        );
+        assert_eq!(zab.size_bytes, Some(125144775192));
+        let curated_zab: ModelEntry =
+            serde_json::from_value(curated["models"][tag].clone()).unwrap();
+        assert_eq!(zab.sha256, curated_zab.sha256);
+        assert_eq!(zab.size_bytes, curated_zab.size_bytes);
+        assert!(!zab.is_flash_next_xts());
+        assert!(zab.desc.contains("LOCAL-ONLY"));
+        assert!(zab.desc.contains("108 GDN"));
+        assert!(zab.desc.contains("symmetric QT44"));
+        assert!(zab.desc.contains("non-zab bytes unchanged"));
+        assert!(zab.desc.contains("qwen4_trunk_iu4_default=gfx1151-zab-v1"));
+        assert!(zab.desc.contains("HIPFIRE_QWEN4_TRUNK_IU4=0"));
+        assert!(zab.desc.contains("NOT uploaded/pullable"));
+        let settings = zab.recommended_settings.as_ref().unwrap();
+        assert_eq!(settings.temperature, Some(1.0));
+        assert_eq!(settings.top_p, Some(0.95));
+        assert_eq!(settings.top_k, Some(20));
+        assert_eq!(serde_json::to_value(&wire.aliases).unwrap(), curated["aliases"]);
+        assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
+        assert!(!wire.aliases.values().any(|target| target == tag));
+        for stock in FLASH_NEXT_FIXTURE_TAGS {
+            let entry = &wire.models[stock];
+            assert_eq!(entry.repo, FLASH_NEXT_XTS_REPO);
+            assert_eq!(entry.sha256.as_deref(), Some(FLASH_NEXT_XTS_SHA256));
+            assert_eq!(entry.size_bytes, Some(FLASH_NEXT_XTS_SIZE));
+            assert_eq!(
+                entry.file,
+                if stock == "qwen3.8:flash-next-mq4-xts" {
+                    FLASH_NEXT_XTS_CANONICAL_FILE
+                } else {
+                    FLASH_NEXT_XTS_LEGACY_FILE
+                }
+            );
+            assert_eq!(entry.recommended_settings, zab.recommended_settings);
+        }
+    }
+
+    #[test]
     fn flash_next_legacy_spelled_wire_entries_normalize_locally() {
         let wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
         for tag in &FLASH_NEXT_FIXTURE_TAGS[..3] {

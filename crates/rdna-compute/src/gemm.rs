@@ -45943,18 +45943,18 @@ const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
 /// Qwen4 symmetric MQ4 trunk (fn-trunk-iu4): header check, the GDN
 /// Z|beta|alpha fold SET, and the exact-activation MQ4 prefill fallback.
 impl Gpu {
-    /// The trunk route is requested and possible: `HIPFIRE_QWEN4_TRUNK_IU4`
-    /// selects at least one projection family
-    /// ([`crate::trunk_mask::qwen4_trunk_iu4_mask`]; an unparsable value is
-    /// an error the Qwen4 forward reports at load, here it reads as off),
+    /// The trunk route is requested and possible: `mask` (the load's
+    /// effective mask, [`crate::trunk_mask::qwen4_trunk_iu4_route`]: the
+    /// `HIPFIRE_QWEN4_TRUNK_IU4` override, else the artifact's embedded
+    /// default) selects at least one projection family,
     /// exact gfx1151 and the IU4 prefill / symmetric-fold switches the dense
     /// SET kernels need. The artifact's `mq4v2.symmetric` marker is not
     /// required (Qwen4 artifacts record expert symmetry separately): the
     /// forward verifies every MQ4 trunk header on the device and only then
     /// claims the symmetric contract (`mq4v2_symmetric`) the dense SET
     /// kernels read.
-    pub fn qwen4_trunk_iu4_requested(&self) -> bool {
-        crate::trunk_mask::qwen4_trunk_iu4_mask().is_ok_and(|mask| !mask.is_empty())
+    pub fn qwen4_trunk_iu4_requested(&self, mask: &crate::trunk_mask::Qwen4TrunkMask) -> bool {
+        !mask.is_empty()
             && self.arch == "gfx1151"
             && self.flags.iu4_prefill_enabled()
             && self.flags.gfx11_iu4_symfold

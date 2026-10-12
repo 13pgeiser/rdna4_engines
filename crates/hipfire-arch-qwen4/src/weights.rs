@@ -197,8 +197,9 @@ fn qwen4_quant_source() -> DTypeConstraint {
 /// the tier this build happens to write would make a published rung of the
 /// other tier unloadable by the very tree that produced it.
 ///
-/// A third rung is admitted for the opt-in dense IU4 trunk
-/// (`HIPFIRE_QWEN4_TRUNK_IU4`): symmetric MQ4G256V2 (qt=44), the aligned-K
+/// A third rung is admitted for the dense IU4 trunk (opt-in through
+/// `HIPFIRE_QWEN4_TRUNK_IU4`, or the default of an artifact carrying the
+/// `qwen4_trunk_iu4_default` marker): symmetric MQ4G256V2 (qt=44), the aligned-K
 /// 256 group the trunk's GEMV (`gemv_mq4g256v2`) and the dense IU4 SET
 /// kernels read. Other four-bit families stay out: their group width is one
 /// the trunk's decode kernels do not read, and their admission would only

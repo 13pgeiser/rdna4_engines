@@ -19,6 +19,7 @@
 //! the marker.
 
 use crate::ple::{PleHashMetadata, PLE_VALID_ROWS};
+use rdna_compute::{TrunkIu4Default, TRUNK_IU4_DEFAULT_KEY};
 use serde_json::Value;
 use std::fmt;
 
@@ -663,6 +664,12 @@ pub struct Qwen4Config {
     pub mtp_use_dedicated_embeddings: bool,
     /// Authoritative optional native MTP head.
     pub mtp: Option<Qwen4MtpConfig>,
+    /// The dense IU4 trunk default the artifact's bake tooling embedded
+    /// (top-level metadata key [`TRUNK_IU4_DEFAULT_KEY`]); `None` for every
+    /// unmarked artifact. Only the loader's route resolution reads it (see
+    /// [`rdna_compute::qwen4_trunk_iu4_route`]): the shape contract above does
+    /// not depend on it.
+    pub trunk_iu4_default: Option<TrunkIu4Default>,
 }
 
 impl Qwen4Config {
@@ -926,6 +933,7 @@ impl Qwen4Config {
 
         let (num_experts, num_experts_per_tok, moe_intermediate_size, shared, norm_topk_prob) =
             ffn.scalar_mirror();
+        let trunk_iu4_default = parse_trunk_iu4_default(value, &profile)?;
         let cfg = Self {
             architecture_id: ARCH_ID,
             model_type,
@@ -986,6 +994,7 @@ impl Qwen4Config {
             mtp_use_dedicated_embeddings: optional_bool(text, "mtp_use_dedicated_embeddings")
                 .unwrap_or(false),
             mtp,
+            trunk_iu4_default,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -2484,6 +2493,31 @@ fn optional_string(object: &Value, key: &str) -> Option<String> {
     object.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+/// The artifact's trunk default marker: absent is `None`; a present marker
+/// must be a string this build knows and the pinned Flash-Next profile (the
+/// only profile the trunk route runs) must carry it. Anything else is
+/// refused rather than guessed.
+fn parse_trunk_iu4_default(
+    envelope: &Value,
+    profile: &Qwen4Profile,
+) -> Result<Option<TrunkIu4Default>, String> {
+    let Some(marker) = envelope.get(TRUNK_IU4_DEFAULT_KEY) else {
+        return Ok(None);
+    };
+    let marker = marker
+        .as_str()
+        .ok_or_else(|| format!("qwen4: `{TRUNK_IU4_DEFAULT_KEY}` must be a string"))?;
+    let default = TrunkIu4Default::from_marker(marker).ok_or_else(|| {
+        format!("qwen4: `{TRUNK_IU4_DEFAULT_KEY}` {marker:?} is not a trunk default this build knows")
+    })?;
+    if !matches!(profile, Qwen4Profile::FlashNext) {
+        return Err(format!(
+            "qwen4: `{TRUNK_IU4_DEFAULT_KEY}` is only meaningful on the Flash-Next profile"
+        ));
+    }
+    Ok(Some(default))
+}
+
 fn parse_layers(
     value: &Value,
     key: &str,
@@ -2789,6 +2823,104 @@ mod tests {
         assert_eq!(cfg.num_experts, 512);
         assert_eq!(cfg.shared_expert_intermediate_size, 640);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn trunk_iu4_default_marker_is_read_from_the_envelope_root_only_when_known() {
+        let key = TRUNK_IU4_DEFAULT_KEY;
+        assert_eq!(key, "qwen4_trunk_iu4_default");
+        // Unmarked artifacts (wrapped or raw) carry no default.
+        assert_eq!(Qwen4Config::from_nested_value(&fixture()).unwrap().trunk_iu4_default, None);
+        let wrapped = json!({"config": fixture()});
+        assert_eq!(Qwen4Config::from_nested_value(&wrapped).unwrap().trunk_iu4_default, None);
+
+        // The marker rides at the root of the envelope, wrapped or raw.
+        let mut marked_wrapped = json!({"config": fixture()});
+        marked_wrapped[key] = json!("gfx1151-zab-v1");
+        let mut marked_raw = fixture();
+        marked_raw[key] = json!("gfx1151-zab-v1");
+        for value in [&marked_wrapped, &marked_raw] {
+            let cfg = Qwen4Config::from_nested_value(value).unwrap();
+            assert_eq!(cfg.trunk_iu4_default, Some(TrunkIu4Default::Gfx1151ZabV1));
+            assert_eq!(cfg.profile, Qwen4Profile::FlashNext);
+        }
+
+        // The marker is identity metadata, not shape: every other field of the
+        // config is the unmarked one's.
+        let mut stripped = Qwen4Config::from_nested_value(&marked_wrapped).unwrap();
+        stripped.trunk_iu4_default = None;
+        assert_eq!(stripped, Qwen4Config::from_nested_value(&wrapped).unwrap());
+
+        // A marker inside the inner config is not the envelope marker.
+        let mut inner = json!({"config": fixture()});
+        inner["config"][key] = json!("gfx1151-zab-v1");
+        assert_eq!(Qwen4Config::from_nested_value(&inner).unwrap().trunk_iu4_default, None);
+    }
+
+    #[test]
+    fn trunk_iu4_default_marker_refuses_unknown_and_malformed_values() {
+        let key = TRUNK_IU4_DEFAULT_KEY;
+        for bad in [
+            json!("gfx1151-zab-v2"),
+            json!("GFX1151-ZAB-V1"),
+            json!("gfx1201-zab-v1"),
+            json!(""),
+            json!(true),
+            json!(1),
+            json!(null),
+            json!({"id": "gfx1151-zab-v1"}),
+        ] {
+            let mut value = json!({"config": fixture()});
+            value[key] = bad.clone();
+            let error = Qwen4Config::from_nested_value(&value).unwrap_err();
+            assert!(error.contains(key), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn trunk_iu4_default_marker_is_refused_on_a_synthetic_profile() {
+        let mut value = synthetic();
+        value[TRUNK_IU4_DEFAULT_KEY] = json!("gfx1151-zab-v1");
+        let error = dev(&value).unwrap_err();
+        assert!(error.contains(TRUNK_IU4_DEFAULT_KEY), "{error}");
+        assert!(error.contains("Flash-Next"), "{error}");
+        // Unmarked synthetic profiles are unchanged.
+        assert_eq!(dev(&synthetic()).unwrap().trunk_iu4_default, None);
+    }
+
+    #[test]
+    fn trunk_iu4_route_follows_the_marker_arch_and_env_precedence() {
+        use rdna_compute::{Qwen4TrunkMask, TrunkFamily, TrunkIu4MaskSource};
+        let mut marked = json!({"config": fixture()});
+        marked[TRUNK_IU4_DEFAULT_KEY] = json!("gfx1151-zab-v1");
+        let marked = Qwen4Config::from_nested_value(&marked).unwrap();
+        let stock = Qwen4Config::from_nested_value(&json!({"config": fixture()})).unwrap();
+        let zab = TrunkFamily::GdnZ.bit() | TrunkFamily::GdnA.bit() | TrunkFamily::GdnB.bit();
+        let resolve = |env: Option<&str>, arch: &str, cfg: &Qwen4Config| {
+            Qwen4TrunkMask::resolve_iu4(env, arch, cfg.trunk_iu4_default).unwrap()
+        };
+
+        // Marked + exact gfx1151 + no env: the zab default, on every layer.
+        let on = resolve(None, "gfx1151", &marked);
+        assert!(matches!(on.source, TrunkIu4MaskSource::ArtifactDefault(_)));
+        assert!((0..48).all(|layer| on.mask.bits(layer) == zab));
+        // Marked on any other arch, and every unmarked artifact: unchanged (off).
+        for arch in ["gfx1201", "gfx1100", "gfx1150", "gfx942"] {
+            assert!(resolve(None, arch, &marked).mask.is_empty(), "{arch}");
+        }
+        for arch in ["gfx1151", "gfx1201", "gfx1100"] {
+            let off = resolve(None, arch, &stock);
+            assert_eq!(off.source, TrunkIu4MaskSource::Off, "{arch}");
+            assert!(off.mask.is_empty(), "{arch}");
+        }
+        // Explicit env wins: `0` restores the stock route on the marked
+        // artifact, any other value keeps the existing grammar.
+        assert!(resolve(Some("0"), "gfx1151", &marked).mask.is_empty());
+        assert!(resolve(Some(""), "gfx1151", &marked).mask.is_empty());
+        assert_eq!(resolve(Some("gdn.qkv"), "gfx1151", &marked).mask.bits(5), TrunkFamily::GdnQkv.bit());
+        assert_eq!(resolve(Some("1"), "gfx1151", &stock).mask.bits(5), rdna_compute::TRUNK_ALL_BITS);
+        // A marked mask names layers the 48-layer trunk has.
+        assert!(on.mask.check_layers(marked.num_hidden_layers).is_ok());
     }
 
     #[test]

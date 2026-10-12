@@ -1470,6 +1470,22 @@
       "arch_id": 16,
       "quant": "mq4"
     },
+    "qwen3.8:flash-next-mq4-xts-zab": {
+      "repo": "",
+      "file": "qwen3.8-flash-next.mq4-xts-zab",
+      "size_gb": 125.1,
+      "min_vram_gb": 128,
+      "desc": "Qwen3.8-Flash-Next MQ4 XTS ZAB / Qwen4 experimental HFQM (arch 16). LOCAL-ONLY staged artifact, NOT uploaded/pullable; naming lineage hipfire-models/qwen3.8-flash-next. Replaces 108 GDN z/a/b projections with symmetric QT44; non-zab bytes unchanged from the stock MQ4 XTS artifact. Top-level marker qwen4_trunk_iu4_default=gfx1151-zab-v1 enables the artifact-scoped A4 default for gdn.z,gdn.a,gdn.b on exact gfx1151 only. HIPFIRE_QWEN4_TRUNK_IU4=0 disables A4 while keeping QT44 weights; byte-exact rollback requires the stock artifact. Stock artifacts and other GPU architectures retain their existing defaults. Sampling remains stock temperature=1.0/top_p=0.95/top_k=20; no numerical admission claimed.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      },
+      "sha256": "a85a00d192ee7a352d5d1f55f0421691a2553fe90f05d9ae1d7e59fec5b686fa",
+      "size_bytes": 125144775192,
+      "arch_id": 16,
+      "quant": "mq4"
+    },
     "qwen3.8:flash-next-rtn-asym": {
       "repo": "hipfire-models/qwen3.8-flash-next",
       "file": "qwen3.8-flash-next.mq4",

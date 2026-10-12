@@ -3335,7 +3335,7 @@ struct RouteTrace {
     out: std::io::BufWriter<std::fs::File>,
 }
 
-/// Opt-in dense IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4=<mask>`, see
+/// Dense IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4=<mask>`, see
 /// [`rdna_compute::Qwen4TrunkMask`]) over a trunk that may mix symmetric
 /// MQ4G256V2 (QT44) and other tiers (MQ6 ...) per tensor: check on the device
 /// that every MQ4G256V2 trunk projection (GDN qkv/z/a/b/out, QSA
@@ -3346,7 +3346,11 @@ struct RouteTrace {
 /// original tensors stay for decode). Arms `gpu.qwen4_trunk_iu4` iff at least
 /// one trunk tensor is MQ4G256V2 and in the mask (A4 projections > 0) and
 /// every MQ4 one verified. Returns the folds
-/// and the per-layer A4 mask bits (empty when not armed). A bad mask value
+/// and the per-layer A4 mask bits (empty when not armed). The mask is the
+/// `HIPFIRE_QWEN4_TRUNK_IU4` override when that variable is set (`0` = off),
+/// else the artifact's embedded `qwen4_trunk_iu4_default` default on its exact
+/// architecture ([`rdna_compute::qwen4_trunk_iu4_route`]); an unmarked
+/// artifact is off unless the variable selects a mask. A bad mask value
 /// fails the load even when the route cannot arm; nothing else runs unless
 /// the route was requested.
 fn prepare_trunk_iu4(
@@ -3354,11 +3358,27 @@ fn prepare_trunk_iu4(
     bundle: &Qwen4Bundle,
 ) -> Result<(Vec<Option<GpuTensor>>, Vec<u16>), Qwen4GpuForwardError> {
     gpu.qwen4_trunk_iu4 = false;
-    let mask = rdna_compute::qwen4_trunk_iu4_mask().map_err(invalid)?;
+    let route = rdna_compute::qwen4_trunk_iu4_route(&gpu.arch, bundle.config.trunk_iu4_default)
+        .map_err(invalid)?;
+    let mask = &route.mask;
     mask.check_layers(bundle.weights.layer_refs.len())
         .map_err(|error| invalid(format!("HIPFIRE_QWEN4_TRUNK_IU4: {error}")))?;
     let mut folds = Vec::new();
-    if !gpu.qwen4_trunk_iu4_requested() {
+    if !gpu.qwen4_trunk_iu4_requested(mask) {
+        // A marked artifact on its exact arch whose default the env switched
+        // off (`0` / empty): say so, so the kill is visible at load. Unmarked
+        // artifacts and other arches return silently, as before.
+        if let Some(default) = bundle.config.trunk_iu4_default {
+            if route.source == rdna_compute::TrunkIu4MaskSource::Env
+                && mask.is_empty()
+                && gpu.arch == default.arch()
+            {
+                eprintln!(
+                    "  qwen4 IU4 trunk: mask=off (env override), artifact default {} disabled; QT44 trunk weights stay resident, stock route",
+                    default.marker()
+                );
+            }
+        }
         return Ok((folds, Vec::new()));
     }
     let weights = &bundle.weights;
@@ -3403,8 +3423,14 @@ fn prepare_trunk_iu4(
         }
     }
     eprintln!(
-        "  qwen4 IU4 trunk: mask={} MQ4 {verified}/{mq4} verified symmetric, A4 {a4} projections, MQ6/other {other}",
-        mask.canonical()
+        "  qwen4 IU4 trunk: mask={} ({}) MQ4 {verified}/{mq4} verified symmetric, A4 {a4} projections, MQ6/other {other}",
+        mask.canonical(),
+        match route.source {
+            rdna_compute::TrunkIu4MaskSource::Env => "env override".to_owned(),
+            rdna_compute::TrunkIu4MaskSource::ArtifactDefault(default) =>
+                format!("artifact default {}", default.marker()),
+            rdna_compute::TrunkIu4MaskSource::Off => "off".to_owned(),
+        }
     );
     if mq4 == 0 || verified != mq4 || a4 == 0 {
         return Ok((folds, Vec::new()));
