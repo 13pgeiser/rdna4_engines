@@ -2,20 +2,24 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Device twins of the host CPU-AR speculative sampling law
-// (crates/hipfire-runtime/src/spec_sampling.rs):
+// Diagnostic-only device references of the host CPU-AR operation order
+// (crates/hipfire-runtime/src/spec_sampling.rs), not exact-host probability twins:
 //
 //   spec_cpu_ar_rows_f32        SparseDist::build_from_logits   (target p rows)
 //   spec_cpu_ar_candidates_f32  SparseDist::build_from_candidates + sample(u)
 //   spec_accept_ordered_u32     verify_sampled_draft / accept_sampled_prefix
 //
 // Every probability is f32 and every operation is performed in the host
-// program's order, serially (one thread per row / per launch): this is the
-// explicit faithful reference. Nothing fuses: the file is compiled with
-// fp-contract off and each mul/add/sub/div adjacent to another operation is an
-// explicit round-to-nearest intrinsic. `exp` is the plain HIP `expf`; whether
-// it matches host `f32::exp` bit for bit is decided by the exactness gate, not
-// assumed here.
+// program's order, serially (one thread per row / per launch). The literal
+// serial code and API are unchanged. Nothing fuses: fp-contract is off and
+// each mul/add/sub/div adjacent to another operation is an explicit
+// round-to-nearest intrinsic; `exp` is plain HIP `expf`. The CPU probability
+// bit-equality gate was retired after the first gfx1201 synthetic row differed
+// at token 42939: GPU 0x3d66ae67 versus CPU 0x3d66ae68 (1 ULP). This reference
+// is diagnostic-only; no exact-host probability claim is made. The canonical
+// PM candidate still requires its twinHW gate against the HIP twin on gfx1151
+// and gfx1201; retiring the CPU comparison establishes no PM/HIP parity or
+// performance claim.
 //
 // Dist rows are fixed-capacity 64: counts[row] u32, ids[row*64+j] u32,
 // probs[row*64+j] f32, in SparseDist::entries() order (descending

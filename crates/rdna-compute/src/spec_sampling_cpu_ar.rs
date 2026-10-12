@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Resident (device) twins of the host CPU-AR speculative sampling law in
+//! Resident device implementations of the host CPU-AR operation order in
 //! `hipfire-runtime::spec_sampling` (`kernels/src/spec_sampling_cpu_ar.hip`):
 //!
 //! * [`Gpu::spec_cpu_ar_rows_enqueue`] — `SparseDist::build_from_logits` for
@@ -12,16 +12,18 @@
 //! * [`Gpu::spec_accept_ordered_enqueue`] — `accept_sampled_prefix` over the
 //!   resident rows with the host's pre-drawn uniform tape.
 //!
-//! The kernels are a serial, faithful reference of the host arithmetic (same
-//! operation order, no FMA contraction, plain HIP `expf`). Bit equality with
-//! the host, including `expf` versus `f32::exp`, is NOT established: it awaits
-//! the hardware bit-comparison gate. Launches are stream-ordered, atomic-free
-//! and recorded through `launch_maybe_blob`; no enqueue method reads anything
-//! back. Allocate
+//! The unchanged literal serial kernels are diagnostic-only references of the
+//! host operation order (no FMA contraction, plain HIP `expf`), not exact-host
+//! probability twins. The CPU probability bit-equality gate was retired after
+//! the first gfx1201 synthetic row differed at token 42939: GPU `0x3d66ae67`
+//! versus CPU `0x3d66ae68` (1 ULP). No exact-host probability claim is made.
+//! Launches are stream-ordered, atomic-free and recorded through
+//! `launch_maybe_blob`; no enqueue method reads anything back. Allocate
 //! [`SpecDistRows`]/[`SpecDistScratch`]/tapes and call
 //! [`Gpu::spec_cpu_ar_precompile`] before capture or the timed window.
 //!
-//! Production kernels. [`Gpu::spec_cpu_ar_rows_parallel_enqueue`] (the canonical
+//! Production API candidate kernels (twinHW parity still ungated).
+//! [`Gpu::spec_cpu_ar_rows_parallel_enqueue`] (the canonical
 //! parallel target-row law) and [`Gpu::spec_accept_ordered_enqueue`] run the
 //! certified PeaceMaker (builder-emitted) images embedded in `kernels.rs`, with
 //! no hipcc fallback, on exactly gfx1151 and gfx1201
@@ -32,6 +34,9 @@
 //! the serial reference rows and the candidates kernel
 //! ([`Gpu::spec_cpu_ar_oracle_precompile`] binds the three serial HIP kernels,
 //! [`Gpu::spec_cpu_ar_candidates_precompile`] only the candidates kernel).
+//! The canonical PM candidate still requires the twinHW gate against its HIP
+//! twins on gfx1151 and gfx1201; the retired CPU comparison does not establish
+//! PM/HIP parity. No performance claim is made.
 //!
 //! The crate has no integer `DType`: `u32` buffers are `F32`-typed tensors of
 //! the same byte size (the convention of `sampled_rows_compact`); read them
