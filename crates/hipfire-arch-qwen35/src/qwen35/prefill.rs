@@ -729,6 +729,44 @@ fn a4_fa_gate_in_place_enabled() -> bool {
 fn a4_attn_epilogue_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_A4_ATTN_EPI", true)
 }
+/// gfx1201 ragged fp8q packet: `HIPFIRE_FA_RAGGED_PACKET=0` restores the
+/// incumbent admission (no fp8q prep / Q-resident attention for a widened
+/// chunk whose tail is not a whole 512-row run). Default on.
+fn fa_ragged_packet_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_FA_RAGGED_PACKET", true)
+}
+/// Incumbent fp8q n/commit-stride shape predicate (unchanged): single runs
+/// up to 512 rows or whole 512-row runs, with `commit_stride` either absent or
+/// exactly `Some(512)` over whole runs.
+fn fa_fp8q_incumbent_shape(n: usize, commit_stride: Option<usize>) -> bool {
+    (n <= 512 || n % 512 == 0)
+        && (commit_stride.is_none()
+            || (commit_stride == Some(WIDENED_COMMIT_ROWS) && n % WIDENED_COMMIT_ROWS == 0))
+}
+/// New ragged shape: ordinary widened prefill (`commit_stride == Some(512)`)
+/// of `n` in `(512, 32768]` rows with a 64..=511-row tail, whose context ends
+/// exactly at the chunk end and fits the physical cache. Returns
+/// `(prefix_rows, tail_rows)`; the prefix is whole 512-row runs.
+fn fa_ragged_packet_split(
+    n: usize,
+    commit_stride: Option<usize>,
+    start_pos: usize,
+    max_ctx_len: usize,
+    physical_cap: usize,
+) -> Option<(usize, usize)> {
+    let tail = n % WIDENED_COMMIT_ROWS;
+    if commit_stride == Some(WIDENED_COMMIT_ROWS)
+        && n > WIDENED_COMMIT_ROWS
+        && n <= 32768
+        && (64..WIDENED_COMMIT_ROWS).contains(&tail)
+        && start_pos.checked_add(n) == Some(max_ctx_len)
+        && max_ctx_len <= physical_cap
+    {
+        Some((n - tail, tail))
+    } else {
+        None
+    }
+}
 /// gfx1201 FA out-proj producer: fuse the still-standalone
 /// `sigmoid_mul_f32` into the AWQ rotate+IU4 sidecar. This is deliberately
 /// AWQ-only: the arm of record has AWQ sidecars, while every failed predicate
@@ -9606,6 +9644,22 @@ fn batch_chunk_fa_attend(
     if batch_semantics.is_independent() {
         unreachable!("independent variant must carry active_mask");
     }
+    if gfx12_fa_prep_fp8q {
+        // Newly admitted ragged chunks (never produced by the incumbent
+        // admission: its Some(512) arm requires n % 512 == 0) take the direct
+        // range route and return before the aligned/F32 segment paths.
+        if let Some((prefix, tail)) = fa_ragged_packet_split(
+            n,
+            commit_stride,
+            start_pos,
+            max_ctx_len,
+            kv_cache.physical_cap,
+        ) {
+            return batch_chunk_fa_attend_ragged_fp8q(
+                gpu, config, pbs, s, kv_cache, n, prefix, tail, start_pos, layer_idx,
+            );
+        }
+    }
     if let Some(stride) = commit_stride {
         // Exact gfx1201 native-fp8 packet path: write the whole widened
         // chunk once, then let packet grid.z enumerate the equal-length
@@ -9876,6 +9930,91 @@ fn batch_chunk_fa_attend(
     )
 }
 
+/// Newly admitted ragged fp8q chunk (`n = prefix + tail`, prefix whole 512-row
+/// runs, tail 64..=511 rows, `start_pos + n == max_ctx_len`): validate the
+/// native fp8 tier, write all `n` K/V rows once, then run two Q-resident range
+/// attentions over the full two-plane Raw Q (code plane `[n*H*D]`, scale plane
+/// `[n*H*4]`) into segment views of the whole-`n` F32 output. Prefix rows see
+/// context `start_pos + prefix`, tail rows `start_pos + n`; pre-written later
+/// K/V rows are unobservable under the causal mask.
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_fa_attend_ragged_fp8q(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    prefix: usize,
+    tail: usize,
+    start_pos: usize,
+    layer_idx: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(prefix + tail, n);
+    let plan = KvTierPlan::derive(KvTierInputs {
+        pos: start_pos,
+        flash_mode: s.flash_mode as usize,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: n,
+        is_tree: false,
+        ..kv_cache.tier_inputs()
+    })
+    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    if plan.write_key != hipfire_dispatch::types::KernelKey::KvWriteFp8E4m3Batched
+        || plan.attend_key != hipfire_dispatch::types::KernelKey::AttnFp8E4m3KvBatchedMasked
+    {
+        return Err(HipError::new(
+            0,
+            "ragged fp8q packet requires the native fp8 batched KV tier",
+        ));
+    }
+    let q_dim = config.n_heads * config.head_dim;
+    let q_bytes = n * config.n_heads * (config.head_dim + 4);
+    let q_raw = GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), q_bytes) },
+        shape: vec![q_bytes],
+        dtype: DType::Raw,
+    };
+    gpu.kv_cache_write_fp8_e4m3_batched(
+        &kv_cache.k_gpu[layer_idx],
+        &pbs.fa_k_batch,
+        &pbs.positions,
+        config.n_kv_heads,
+        config.head_dim,
+        n,
+    )?;
+    gpu.kv_cache_write_fp8_e4m3_batched(
+        &kv_cache.v_gpu[layer_idx],
+        &pbs.fa_v_batch,
+        &pbs.positions,
+        config.n_kv_heads,
+        config.head_dim,
+        n,
+    )?;
+    for (off, len, max_ctx_len) in [
+        (0, prefix, start_pos + prefix),
+        (prefix, tail, start_pos + n),
+    ] {
+        let positions = pbs.positions.sub_offset(off, len);
+        let out = pbs.fa_attn_out_batch.sub_offset(off * q_dim, len * q_dim);
+        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_gfx1201(
+            &q_raw,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &out,
+            &positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            max_ctx_len,
+            len,
+            n,
+            off,
+        )?;
+    }
+    Ok(())
+}
+
 /// Shared KV-write + flash-attention dispatch tail (F2 extraction).
 ///
 /// `batch_chunk_fa_attend` calls this with the chunk's own FA tensors; the
@@ -10066,11 +10205,23 @@ pub(crate) fn batch_chunk_full_attn_attn(
         && config.n_heads == 24
         && config.n_kv_heads == 4
         && (64..=32768).contains(&n)
-        && (n <= 512 || n % 512 == 0)
         && (64..=262_144).contains(&max_ctx_len)
         && tree_verify.is_none()
-        && (commit_stride.is_none()
-            || (commit_stride == Some(WIDENED_COMMIT_ROWS) && n % WIDENED_COMMIT_ROWS == 0));
+        && (fa_fp8q_incumbent_shape(n, commit_stride)
+            || (fa_ragged_packet_enabled()
+                && fa_ragged_packet_split(
+                    n,
+                    commit_stride,
+                    start_pos,
+                    max_ctx_len,
+                    kv_cache.physical_cap,
+                )
+                .is_some()));
+    // Only the new ragged shape is admitted outside the incumbent n/commit
+    // predicate. It keeps the F32 attention output (no A4 attention epilogue:
+    // the A4 attend step cannot express the two-plane range launches).
+    let newly_admitted_ragged =
+        gfx12_fa_prep_fp8q && !fa_fp8q_incumbent_shape(n, commit_stride);
     // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
     // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
     // the output projection will select a sigmoid producer that reads the
@@ -10098,6 +10249,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // writes that producer's A4 slab (`HIPFIRE_A4_ATTN_EPI=0` keeps the
     // attention + producer pair). Implies the fp8q single-step attend.
     let a4_epi_awq = if fa_gate_in_place
+        && !newly_admitted_ragged
         && gpu.a4_slab_active()
         && gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue)
         && a4_attn_epilogue_enabled()
@@ -17995,5 +18147,39 @@ mod tests {
             "oracle PASS: {} f32 + {nbytes} block bytes identical (K={k} N={N} layer={fa_idx})",
             f32_unfused.len(),
         );
+    }
+
+    #[test]
+    fn fa_ragged_packet_split_admits_only_new_shape() {
+        const S: Option<usize> = Some(WIDENED_COMMIT_ROWS);
+        let cap = 262_144;
+        // New shape: prefix of whole 512-row runs + 64..=511 tail.
+        assert_eq!(fa_ragged_packet_split(1088, S, 0, 1088, cap), Some((1024, 64)));
+        assert_eq!(fa_ragged_packet_split(1023, S, 4096, 5119, cap), Some((512, 511)));
+        assert_eq!(fa_ragged_packet_split(32768 - 448, S, 7, 32768 - 441, cap), Some((32256, 64)));
+        // Tail boundaries, aligned, small, and oversized chunks.
+        assert_eq!(fa_ragged_packet_split(1087, S, 0, 1087, cap), None);
+        assert_eq!(fa_ragged_packet_split(1024, S, 0, 1024, cap), None);
+        assert_eq!(fa_ragged_packet_split(511, S, 0, 511, cap), None);
+        assert_eq!(fa_ragged_packet_split(576, S, 0, 576, cap), Some((512, 64)));
+        assert_eq!(fa_ragged_packet_split(32768 + 64, S, 0, 32768 + 64, cap), None);
+        // Authority: only ordinary widened prefill (`Some(512)`).
+        assert_eq!(fa_ragged_packet_split(1088, None, 0, 1088, cap), None);
+        assert_eq!(fa_ragged_packet_split(1088, Some(256), 0, 1088, cap), None);
+        // Context must end exactly at the chunk end and fit the physical cache.
+        assert_eq!(fa_ragged_packet_split(1088, S, 10, 1088, cap), None);
+        assert_eq!(fa_ragged_packet_split(1088, S, 10, 1099, cap), None);
+        assert_eq!(fa_ragged_packet_split(1088, S, 1000, 2088, 2087), None);
+        assert_eq!(fa_ragged_packet_split(1088, S, usize::MAX, usize::MAX, usize::MAX), None);
+
+        // Incumbent predicate is unchanged and never admits the ragged shape.
+        assert!(fa_fp8q_incumbent_shape(512, None));
+        assert!(fa_fp8q_incumbent_shape(100, None));
+        assert!(fa_fp8q_incumbent_shape(1024, None));
+        assert!(fa_fp8q_incumbent_shape(1024, S));
+        assert!(!fa_fp8q_incumbent_shape(100, S));
+        assert!(!fa_fp8q_incumbent_shape(1088, None));
+        assert!(!fa_fp8q_incumbent_shape(1088, S));
+        assert!(!fa_fp8q_incumbent_shape(1024, Some(256)));
     }
 }

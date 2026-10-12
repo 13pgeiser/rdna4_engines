@@ -6400,6 +6400,7 @@ impl Gpu {
             head_dim,
             max_ctx_len,
             batch_size,
+            None,
         )
     }
 
@@ -6436,6 +6437,7 @@ impl Gpu {
             head_dim,
             max_ctx_len,
             batch_size,
+            None,
         )
     }
 
@@ -6464,7 +6466,49 @@ impl Gpu {
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
             QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, QresidentOut::F32(out), positions,
+            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size, None,
+        )
+    }
+
+    /// Segment of [`Self::attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201`]
+    /// over rows `[q_row_offset, q_row_offset + batch_size)` of a full
+    /// two-plane Raw Q allocation of `q_total_rows` rows:
+    /// `[q_total_rows*H*D fp8 code bytes][q_total_rows*H*4 F32 scale bytes]`.
+    /// `out` and `positions` are already segment views. Same kernel, grid and
+    /// LDS as the full-batch method; only the code/scale base pointers move.
+    /// Segment `batch_size` must be 64..=32768 and either <= 512 or a
+    /// multiple of 512.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        q_total_rows: usize,
+        q_row_offset: usize,
+    ) -> HipResult<()> {
+        if !(64..=32768).contains(&batch_size) || (batch_size > 512 && batch_size % 512 != 0) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "Q8 range attention requires segment batch 64..=32768 and \
+                     <=512 or %512==0, got {batch_size}"
+                ),
+            ));
+        }
+        self.qresident_launch(
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
+            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, QresidentOut::F32(out), positions,
             n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            Some((q_total_rows, q_row_offset)),
         )
     }
 
@@ -6504,7 +6548,7 @@ impl Gpu {
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC,
             QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache,
             QresidentOut::A4Slab { qgate, awq, x_i4 }, positions,
-            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size, None,
         )
     }
 
@@ -6527,6 +6571,7 @@ impl Gpu {
         head_dim: usize,
         max_ctx_len: usize,
         batch_size: usize,
+        q_planes: Option<(usize, usize)>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
@@ -6556,7 +6601,29 @@ impl Gpu {
                 &format!("{symbol} requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"),
             ));
         }
+        if let Some((total_rows, row_offset)) = q_planes {
+            let end = row_offset.checked_add(batch_size);
+            let cap = total_rows.checked_mul(n_heads * (head_dim + 4));
+            if !q8_input
+                || q.dtype != crate::DType::Raw
+                || end.map_or(true, |e| e > total_rows)
+                || cap.map_or(true, |c| q.buf.size() < c)
+            {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "{symbol} Q8 range invalid: total_rows={total_rows} \
+                         row_offset={row_offset} batch={batch_size} q_bytes={}",
+                        q.buf.size()
+                    ),
+                ));
+            }
+        }
         let need_qo = batch_size * n_heads * head_dim;
+        let need_q = match q_planes {
+            Some((total_rows, _)) => total_rows * n_heads * head_dim,
+            None => need_qo,
+        };
         let out_ok = match out {
             QresidentOut::F32(o) => o.numel() >= need_qo,
             QresidentOut::A4Slab { qgate, awq, x_i4 } => {
@@ -6565,7 +6632,7 @@ impl Gpu {
                     && x_i4.buf.size() >= (n_heads * head_dim / 128) * batch_size * 72
             }
         };
-        if q.numel() < need_qo || !out_ok || positions.numel() < batch_size {
+        if q.numel() < need_q || !out_ok || positions.numel() < batch_size {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -6584,10 +6651,20 @@ impl Gpu {
         let grid_z = batch_size.div_ceil(512) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_arg = q.buf.as_ptr();
-        let mut q_scales = if q8_input {
-            unsafe { (q_arg as *mut u8).add(need_qo) as *mut c_void }
-        } else {
+        let mut q_scales = if !q8_input {
             std::ptr::null_mut()
+        } else if let Some((total_rows, row_offset)) = q_planes {
+            // Two planes: [total*H*D code bytes][total*H*4 scale bytes]; the
+            // segment starts `row_offset` rows into each plane.
+            let codes_bytes = total_rows * n_heads * head_dim;
+            let code_off = row_offset * n_heads * head_dim;
+            let scale_off = codes_bytes + row_offset * n_heads * 4;
+            unsafe {
+                q_arg = (q_arg as *mut u8).add(code_off) as *mut c_void;
+                (q.buf.as_ptr() as *mut u8).add(scale_off) as *mut c_void
+            }
+        } else {
+            unsafe { (q_arg as *mut u8).add(need_qo) as *mut c_void }
         };
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
