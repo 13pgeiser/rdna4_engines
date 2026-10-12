@@ -3853,6 +3853,11 @@ impl SparseQRows {
         self.off.len().saturating_sub(1)
     }
 
+    /// Row offsets into `idx` / `val` (`rows() + 1` entries, `[0] == 0`).
+    pub fn offsets(&self) -> &[u32] {
+        &self.off
+    }
+
     /// Row `i`'s strictly ascending ids and their values.
     pub fn row(&self, i: usize) -> (&[u32], &[f32]) {
         let (a, b) = (self.off[i] as usize, self.off[i + 1] as usize);
@@ -4358,6 +4363,117 @@ fn dflash_target_rows_core(
         )?;
     }
     Ok(())
+}
+
+/// `HIPFIRE_DFLASH_DEVICE_ACCEPT=0` (developer kill switch): decide the
+/// singleton sampled window on the host again (the FAST_SAMPLE target rows come
+/// back as sparse/dense host rows and the host accept loop runs). Default on.
+static DFLASH_DEVICE_ACCEPT_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_DEVICE_ACCEPT").map_or(true, |v| v.trim() != "0")
+});
+
+/// The kill switch of the device sampled accept ([`dflash_sampled_accept_device`]).
+#[doc(hidden)]
+pub fn dflash_device_accept_enabled() -> bool {
+    *DFLASH_DEVICE_ACCEPT_ON
+}
+
+/// Whether a sampled window is decided by [`dflash_sampled_accept_device`]:
+/// the switch is on, CACTUS is off (it rewrites the whole dense target row and
+/// keeps the host arithmetic), the selector q is the sparse representation
+/// (`HIPFIRE_DFLASH_SPARSE_TARGET=0` keeps dense q and the host loop) and the
+/// receipt covers the `block.len() - 1` proposed rows. Repeat / n-gram
+/// penalties never reach the sampled arm (they are greedy-only host paths).
+#[doc(hidden)]
+pub fn dflash_device_accept_eligible(
+    enabled: bool,
+    cfg: &DflashSampleCfg,
+    q: &DflashSampledDraft,
+    block_len: usize,
+) -> bool {
+    enabled
+        && !(cfg.cactus_delta > 0.0)
+        && q.sparse
+        && block_len >= 2
+        && q.selected_q.len() == block_len - 1
+        && q.sparse_q.rows() == block_len - 1
+}
+
+/// Singleton sampled window decided entirely on the device. `logits` is the
+/// resident verify logits (at least `block.len() * vocab` elements, one row per
+/// verify position). The temperature softmax / nucleus normalization is
+/// enqueued, then ONE kernel (`dflash_sampled_accept_sparse_q_f32`) takes the
+/// accept tests, the residual and the bonus over those device rows: no
+/// full-vocab D2H, no compaction, no dense q. The host uploads the proposed
+/// tokens, the sparse selector q and `block.len()` uniforms pre-drawn from
+/// `rng` (one per proposed row plus ONE for the residual-or-bonus draw: a
+/// fixed count per window, whatever the outcome) and reads back
+/// `{accept_len, bonus}`. `max_accept` bounds the accepted prefix exactly as
+/// the host loop does (the bonus is then drawn from the boundary row).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_sampled_accept_device(
+    gpu: &mut Gpu,
+    logits: &GpuTensor,
+    block: &[u32],
+    q: &DflashSampledDraft,
+    vocab: usize,
+    cfg: DflashSampleCfg,
+    max_accept: usize,
+    rng: &mut u64,
+) -> HipResult<SampledWindowDecision> {
+    let b = block.len();
+    if !dflash_device_accept_eligible(true, &cfg, q, b) {
+        return Err(HipError::new(0, "device sampled accept: ineligible window (cactus / dense q / receipt shape)"));
+    }
+    let n = b - 1;
+    let uniforms: Vec<f32> = (0..n).map(|_| xorshift_next_unit(rng)).collect();
+    let u_fin = xorshift_next_unit(rng);
+    let mut payload = Vec::new();
+    rdna_compute::dflash_sampled_accept::dflash_accept_pack_payload(
+        &mut payload,
+        &block[1..],
+        &uniforms,
+        u_fin,
+        max_accept,
+        &q.selected_q,
+        q.sparse_q.offsets(),
+        &q.sparse_q.idx,
+        &q.sparse_q.val,
+    )
+    .map_err(|e| HipError::new(0, &format!("device sampled accept: {e}")))?;
+
+    let logits_batch = logits.sub_offset(0, b * vocab);
+    let probs = gpu.alloc_tensor(&[b * vocab], rdna_compute::DType::F32)?;
+    let tau = match gpu.alloc_tensor(&[b], rdna_compute::DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = gpu.free_tensor(probs);
+            return Err(e);
+        }
+    };
+    let z = match gpu.alloc_tensor(&[b], rdna_compute::DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = gpu.free_tensor(probs);
+            let _ = gpu.free_tensor(tau);
+            return Err(e);
+        }
+    };
+    let res = gpu
+        .softmax_temp_topp_batched_into_f32(
+            &logits_batch, &probs, &tau, &z, vocab, b, cfg.temp, cfg.top_p, cfg.top_k, 0.0,
+        )
+        .and_then(|()| gpu.dflash_sampled_accept_sparse_q_f32(&probs, &tau, &z, &payload, n, vocab));
+    let _ = gpu.free_tensor(probs);
+    let _ = gpu.free_tensor(tau);
+    let _ = gpu.free_tensor(z);
+    let d = res?;
+    Ok(SampledWindowDecision {
+        accepted_drafts: d.accept_len,
+        bonus_token: d.bonus,
+        committed_len: d.accept_len + 2,
+    })
 }
 
 /// Selector q rows as the accept loop reads them.
@@ -8777,6 +8893,34 @@ pub fn spec_step_dflash(
             && c8_draft_tokens_dev.is_some()
             && c8_draft_p_at_token_dev.is_some();
 
+        // Singleton sampled window on the device (sparse selector / PLD q, no
+        // CACTUS, FAST_SAMPLE rows): handles the budget bound itself, so it
+        // runs where the C8 chain accept cannot.
+        let device_decision: Option<SampledWindowDecision> = match q_receipt.as_ref() {
+            Some(r)
+                if !gpu_accept
+                    && fast_sample_active
+                    && dflash_device_accept_eligible(
+                        dflash_device_accept_enabled(),
+                        &DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                        r,
+                        b,
+                    ) =>
+            {
+                Some(dflash_sampled_accept_device(
+                    gpu,
+                    &verify_scratch.logits,
+                    &block,
+                    r,
+                    vocab,
+                    DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                    max_accept.unwrap_or(usize::MAX),
+                    rng_state,
+                )?)
+            }
+            _ => None,
+        };
+
         if gpu_accept {
             // ── C8 GPU accept path ──────────────────────────────────────────
             // verify_scratch.logits[0..b*vocab] contains the target logits for
@@ -8842,6 +8986,13 @@ pub fn spec_step_dflash(
             let _ = gpu.free_tensor(tgt_probs_dev);
             let _ = gpu.free_tensor(tau_t_dev);
             let _ = gpu.free_tensor(z_t_dev);
+        } else if let Some(decision) = device_decision {
+            // ── Device accept path (HIPFIRE_DFLASH_DEVICE_ACCEPT) ───────────
+            // Selector / PLD sparse q + resident verify logits: softmax, accept
+            // tests, residual and bonus all on the device; the host only reads
+            // {accept_len, bonus}. See `dflash_sampled_accept_device`.
+            accept_len = decision.accepted_drafts;
+            bonus_token = decision.bonus_token;
         } else {
             // ── Host accept path (PLD / fallback per-row) ──────────────────
             debug_assert!(q_receipt.is_some() || draft_softmaxes.len() == b - 1);
@@ -13581,5 +13732,186 @@ mod dn_exchange_tests {
         assert_eq!(ptrs.len(), 2 * 4 * EXT.n_layers);
         ptrs.sort_unstable();
         assert!(ptrs.windows(2).all(|w| w[0] != w[1]));
+    }
+}
+
+#[cfg(test)]
+mod device_accept_tests {
+    //! Host-only checks of the singleton device sampled accept
+    //! (`HIPFIRE_DFLASH_DEVICE_ACCEPT`): admission, the payload built from the
+    //! real `SparseQRows` (last-write duplicate ids), and the kernel's bit-exact
+    //! host twin against the legacy sparse host loop. The kernel itself is
+    //! compared with the twin by `tests/sampled_dflash_device_accept_hw.rs`.
+    use super::*;
+    use rdna_compute::dflash_sampled_accept::{
+        dflash_accept_pack_payload, dflash_sampled_accept_reference,
+    };
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 24
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn unit(&mut self) -> f32 {
+            (self.next_u64() & 0xFF_FFFF) as f32 / 16_777_216.0
+        }
+    }
+
+    fn sparse_draft(b: usize) -> DflashSampledDraft {
+        let mut d = DflashSampledDraft::default();
+        d.sparse = true;
+        d.block = vec![0; b];
+        d.sparse_q.clear();
+        for i in 0..b - 1 {
+            d.sparse_q.push_row(&[i as u32 + 1], &[1.0], 64).unwrap();
+            d.selected_q.push(1.0);
+        }
+        d
+    }
+
+    #[test]
+    fn admission_follows_switch_cactus_and_q_representation() {
+        let cfg = DflashSampleCfg { temp: 0.7, top_p: 0.9, top_k: 20, cactus_delta: 0.0 };
+        let d = sparse_draft(5);
+        assert!(dflash_device_accept_eligible(true, &cfg, &d, 5));
+        // Kill switch.
+        assert!(!dflash_device_accept_eligible(false, &cfg, &d, 5));
+        // CACTUS keeps the dense host arithmetic.
+        let cactus = DflashSampleCfg { cactus_delta: 0.05, ..cfg };
+        assert!(!dflash_device_accept_eligible(true, &cactus, &d, 5));
+        // Dense q (HIPFIRE_DFLASH_SPARSE_TARGET=0) keeps the host loop.
+        let mut dense = sparse_draft(5);
+        dense.sparse = false;
+        assert!(!dflash_device_accept_eligible(true, &cfg, &dense, 5));
+        // Receipt not covering the window.
+        assert!(!dflash_device_accept_eligible(true, &cfg, &d, 6));
+        assert!(!dflash_device_accept_eligible(true, &cfg, &d, 1));
+        assert!(!dflash_device_accept_eligible(true, &cfg, &DflashSampledDraft::default(), 5));
+    }
+
+    /// Duplicate selector candidate ids: the payload carries the last write.
+    #[test]
+    fn payload_carries_the_last_write_sparse_rows() {
+        let mut q = SparseQRows::with_capacity(1, 8);
+        q.push_row(&[9, 4, 9, 2], &[0.1, 0.2, 0.3, 0.4], 16).unwrap();
+        let mut payload = Vec::new();
+        dflash_accept_pack_payload(&mut payload, &[4], &[0.5], 0.25, 1, &[0.2], q.offsets(), &q.idx, &q.val)
+            .unwrap();
+        // 4n+3 header words, then ids [2, 4, 9] and values [0.4, 0.2, 0.3].
+        let n = 1;
+        let ids = &payload[4 * n + 3..4 * n + 6];
+        let vals: Vec<f32> = payload[4 * n + 6..].iter().map(|&w| f32::from_bits(w)).collect();
+        assert_eq!(ids, &[2, 4, 9]);
+        assert_eq!(vals, vec![0.4, 0.2, 0.3]);
+    }
+
+    /// The device decision (host twin) against the legacy sparse host loop
+    /// with the same uniforms: acceptance reads identical operands, so
+    /// `accept_len` agrees exactly; the residual / bonus differ only by f32
+    /// association (≤ 1 % of windows at a CDF boundary).
+    #[test]
+    fn twin_matches_sparse_host_loop() {
+        let vocab = 512usize;
+        let n = 4usize;
+        let mut rng = Lcg(0xD1CE);
+        let (mut checked, mut bonus_mismatch) = (0usize, 0usize);
+        for round in 0..3000 {
+            // Raw softmax-like rows + nucleus tau/z.
+            let keep = [1usize, 5, 20, 64][round % 4];
+            let mut probs = Vec::new();
+            let (mut tau, mut z) = (Vec::new(), Vec::new());
+            for _ in 0..=n {
+                let mut r: Vec<f32> = (0..vocab).map(|_| rng.unit().powi(6) + 1e-7).collect();
+                let s: f32 = r.iter().sum();
+                r.iter_mut().for_each(|v| *v /= s);
+                let mut sorted = r.clone();
+                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let t = sorted[keep - 1];
+                z.push(r.iter().filter(|&&p| p >= t).sum());
+                tau.push(t);
+                probs.extend(r);
+            }
+            let mut draft = DflashSampledDraft::default();
+            draft.sparse = true;
+            draft.sparse_q.clear();
+            draft.block = vec![0];
+            for _ in 0..n {
+                let cands: Vec<u32> = (0..6).map(|_| rng.below(vocab) as u32).collect();
+                let w: Vec<f32> = (0..6).map(|_| rng.unit() * 0.3 + 0.01).collect();
+                draft.sparse_q.push_row(&cands, &w, vocab).unwrap();
+                // the proposed token is one of the candidates; its q is the row's value.
+                let pick = cands[rng.below(6)];
+                let (ids, vals) = draft.sparse_q.row(draft.sparse_q.rows() - 1);
+                draft.selected_q.push(vals[ids.iter().position(|&i| i == pick).unwrap()]);
+                draft.block.push(pick);
+            }
+            let max_accept = [n, n, n, 2][round % 4];
+            let uniforms: Vec<f32> = (0..n).map(|_| rng.unit()).collect();
+            let u_fin = rng.unit();
+            let mut payload = Vec::new();
+            dflash_accept_pack_payload(
+                &mut payload, &draft.block[1..], &uniforms, u_fin, max_accept, &draft.selected_q,
+                draft.sparse_q.offsets(), &draft.sparse_q.idx, &draft.sparse_q.val,
+            )
+            .unwrap();
+            let dev = dflash_sampled_accept_reference(&probs, &tau, &z, &payload, n, vocab);
+
+            // Legacy sparse loop with the same uniforms.
+            let fast = {
+                let cap = DFLASH_SPARSE_CAP;
+                let mut counts = vec![0u32; n + 1];
+                let mut idx = vec![0u32; (n + 1) * cap];
+                let mut val = vec![0f32; (n + 1) * cap];
+                for r in 0..=n {
+                    let mut c = 0;
+                    for j in 0..vocab {
+                        let p = probs[r * vocab + j];
+                        if p >= tau[r] {
+                            idx[r * cap + c] = j as u32;
+                            val[r * cap + c] = p;
+                            c += 1;
+                        }
+                    }
+                    counts[r] = c as u32;
+                }
+                let mut f = FastTargetRows {
+                    tau: tau.clone(), z: z.clone(), capacity: cap, counts, idx, val,
+                    ..FastTargetRows::default()
+                };
+                let nd = f.plan_dense_rows(vocab).unwrap();
+                assert_eq!(nd, 0);
+                f
+            };
+            let mut accept = 0usize;
+            let mut host_bonus = None;
+            for i in 0..n.min(max_accept) {
+                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(i, vocab) else { unreachable!() };
+                let p_t = sparse_row_prob(idx, val, inv_z, draft.block[i + 1]);
+                if uniforms[i] * draft.selected_q[i].max(f32::MIN_POSITIVE) <= p_t {
+                    accept += 1;
+                } else {
+                    let (qi, qv) = draft.sparse_q.row(i);
+                    host_bonus = Some(sample_residual_sparse(idx, val, inv_z, qi, qv, vocab, u_fin));
+                    break;
+                }
+            }
+            let host_bonus = host_bonus.unwrap_or_else(|| {
+                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(accept, vocab) else { unreachable!() };
+                sample_categorical_sparse(idx, val, inv_z, vocab, u_fin)
+            });
+            assert_eq!(dev.accept_len, accept, "round {round}");
+            checked += 1;
+            if dev.bonus != host_bonus {
+                bonus_mismatch += 1;
+            }
+        }
+        assert!(bonus_mismatch * 100 <= checked, "{bonus_mismatch}/{checked} bonus draws differ");
     }
 }
