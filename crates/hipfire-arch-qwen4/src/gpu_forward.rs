@@ -4264,15 +4264,15 @@ impl Qwen4GpuForward {
         let mut offset = 0usize;
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
-            if self.npu_trunk.as_ref().is_some_and(|n| n.pipelined())
-                && npu_forward::pair_rows(tokens.len()-offset,max_chunk).is_some()
+            if let Some(rows)=self.npu_trunk.as_ref().filter(|n|n.pipelined())
+                .and_then(|_|npu_forward::pair_rows(tokens.len()-offset,max_chunk))
             {
-                let final_pair=self.set_tile_ple_lookahead(tokens,offset,16384,&mut caller_lookahead);
+                let final_pair=self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
                 let output=if output_rows==Qwen4OutputRows::All || final_pair {
                     Qwen4OutputPolicy::Rows(output_rows)
                 } else { Qwen4OutputPolicy::None };
-                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+16384],offset,Some(logits),top1,wide_hidden_capture,output)?;
-                offset+=16384;
+                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,Some(logits),top1,wide_hidden_capture,output)?;
+                offset+=rows;
                 continue;
             }
             let rows = (tokens.len() - offset).min(max_chunk);
@@ -4372,12 +4372,12 @@ impl Qwen4GpuForward {
         let mut offset = 0usize;
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
-            if self.npu_trunk.as_ref().is_some_and(|n| n.pipelined())
-                && npu_forward::pair_rows(tokens.len()-offset,max_chunk).is_some()
+            if let Some(rows)=self.npu_trunk.as_ref().filter(|n|n.pipelined())
+                .and_then(|_|npu_forward::pair_rows(tokens.len()-offset,max_chunk))
             {
-                self.set_tile_ple_lookahead(tokens,offset,16384,&mut caller_lookahead);
-                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+16384],offset,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
-                offset+=16384;
+                self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
+                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
+                offset+=rows;
                 continue;
             }
             let rows = (tokens.len() - offset).min(max_chunk);

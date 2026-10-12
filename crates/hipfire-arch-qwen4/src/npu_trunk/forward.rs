@@ -107,7 +107,7 @@ impl NpuForward {
                 let (scratch,ids,ple)=Qwen4GpuForwardScratch::new(gpu,&bundle.config,rows,scratch_mode)?;
                 (Some(scratch),ids,ple)
             } else { (None,Vec::new(),Vec::new()) };
-            eprintln!("npu-trunk: mode={mode} families=all contract=bf16_direct pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} runtime={} raw=DtoH(no-retained-host-copy) calibration=first-light-force-full-pairs", if runtime.is_some() { "open" } else { "not-opened" });
+            eprintln!("npu-trunk: mode={mode} families=all contract=bf16_direct pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} runtime={} raw=DtoH(no-retained-host-copy) calibration=first-light-force-pairs", if runtime.is_some() { "open" } else { "not-opened" });
             Ok(Some(Self { mode, layers, a, scales: [d0,d1], sums, bank_b, runtime, trace,host_tokens,host_ple }))
         })();
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
@@ -213,7 +213,7 @@ mod layers;
 use railgun::npu::trunk::monotonic_ns;
 
 struct TraceRow {
-    layer: usize, bank: usize, position: usize, seq: u32,
+    layer: usize, bank: usize, position: usize, rows: usize, seq: u32,
     pack_issue_ns: u64, kick_ns: u64, submit_ns: u64, done_ns: u64,
     wait_enqueue_ns: u64, consume_issue_ns: u64,
     start: hip_bridge::Event, end: hip_bridge::Event,
@@ -239,7 +239,7 @@ impl NpuForward {
         execute(gpu,ctx,&program.steps[program.ranges[layer].start..index])?;
         let pack_issue_ns=self.pack(gpu,&program.steps[index],bank,true)?;
         let kick_ns=if records.is_empty(){0}else{monotonic_ns()};
-        let seq=unsafe { rt.kick(layer,transport_shape(self.layers[layer].shape),bank,8192,stream(gpu)).map_err(fail)? };
+        let seq=unsafe { rt.kick(layer,transport_shape(self.layers[layer].shape),bank,program.rows,stream(gpu)).map_err(fail)? };
         if !records.is_empty() {
             let r=&mut records[layer*2+bank];
             r.pack_issue_ns=pack_issue_ns; r.kick_ns=kick_ns; r.seq=seq.value;
@@ -255,7 +255,7 @@ impl NpuForward {
         let outs=self.destinations(&program.steps[index],&qkv)?;
         let consume_issue_ns=monotonic_ns();
         unsafe {
-            gpu.npu_trunk_consume_bf16_fast_ptr(rt.c_arena(bank).map_err(fail)?.device as *mut c_void,layout(self.layers[layer].shape,8192),&outs,8192)?;
+            gpu.npu_trunk_consume_bf16_fast_ptr(rt.c_arena(bank).map_err(fail)?.device as *mut c_void,layout(self.layers[layer].shape,8192),&outs,program.rows)?;
             // C's last consumer is the scatter, not the subsequent mixer.
             rt.retire_bank(seq,stream(gpu)).map_err(fail)?;
         }
@@ -274,7 +274,9 @@ impl NpuForward {
         Ok(())
     }
     pub(super) fn pair(&mut self, owner: &mut Qwen4GpuForward, bundle: &mut Qwen4Bundle, gpu: &mut Gpu, tokens: &[u32], logits: Option<&GpuTensor>, top1: Option<&GpuTensor>, capture: Option<&GpuTensor>, output: Qwen4OutputPolicy) -> Result<(),Qwen4GpuForwardError> {
-        if tokens.len()!=16384 { return Err(fail("pair requires exactly 16384 rows")); }
+        if pair_rows(tokens.len(),8192)!=Some(tokens.len()) {
+            return Err(fail("pair requires bank A=8192 and bank B=512..8192 live rows"));
+        }
         let old_scope=std::mem::replace(&mut gpu.qwen4_scope,true);
         let invariant=owner.prefill_scope && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled();
         let old_invariant=std::mem::replace(&mut gpu.prefill_invariant_scope,invariant);
@@ -285,8 +287,9 @@ impl NpuForward {
     }
     fn pair_scoped(&mut self, owner: &mut Qwen4GpuForward, bundle: &mut Qwen4Bundle, gpu: &mut Gpu, tokens: &[u32], logits: Option<&GpuTensor>, top1: Option<&GpuTensor>, capture: Option<&GpuTensor>, output: Qwen4OutputPolicy) -> Result<(),Qwen4GpuForwardError> {
         owner.restore_expert_stage(gpu)?;
+        let rows=[8192,tokens.len()-8192];
         let position=bundle.state.position;
-        let end=position.checked_add(16384).ok_or_else(||fail("position overflow"))?;
+        let end=position.checked_add(tokens.len()).ok_or_else(||fail("position overflow"))?;
         bundle.release_session_for_growth(gpu,end);
         bundle.state.ensure_mapped_capacity(gpu,end).map_err(fail)?;
         if let Some(qsa)=bundle.state.qsa.first().filter(|q|q.f16_arena.is_none()) {
@@ -298,19 +301,20 @@ impl NpuForward {
         drop(owner.ple_ahead.take());
         let b=self.bank_b.as_ref().expect("on bank B");
         let ra=matrix_view(&owner.scratch.router_logits,8192,router_columns(program_dims(&bundle.config)))?;
-        let rb=matrix_view(&b.router_logits,8192,router_columns(program_dims(&bundle.config)))?;
+        let rb=matrix_view(&b.router_logits,rows[1],router_columns(program_dims(&bundle.config)))?;
         let ctx=DispatchCtx::new(gpu);
         let sa=layer_scratch(&owner.scratch,&ra);
         let sb=layer_scratch(b,&rb);
         let mut programs=[
-            layers::build_program(owner,&owner.scratch,bundle,gpu,&ctx,&sa,0)?,
-            layers::build_program(owner,b,bundle,gpu,&ctx,&sb,1)?,
+            layers::build_program(owner,&owner.scratch,bundle,gpu,&ctx,&sa,0,rows[0])?,
+            layers::build_program(owner,b,bundle,gpu,&ctx,&sb,1,rows[1])?,
         ];
         let mut history=bundle.state.ple_history;
         for bank in 0..2 {
             let scratch=if bank==0 { &owner.scratch } else { b };
-            initialize(gpu,bundle,scratch,&tokens[bank*8192..(bank+1)*8192],&history,programs[bank].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple)?;
-            for &token in &tokens[bank*8192..(bank+1)*8192] { history.push(token); }
+            let bank_tokens=&tokens[bank*8192..bank*8192+rows[bank]];
+            initialize(gpu,bundle,scratch,bank_tokens,&history,programs[bank].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple)?;
+            for &token in bank_tokens { history.push(token); }
         }
         let commits: SmallVec<[_; QWEN4_QSA_INLINE_CAPACITY]>=programs[1].steps.iter().filter_map(|step|match step {
             Step::IndexedAttention(op)=>Some(op.next_lengths().map_err(fail)), _=>None,
@@ -330,7 +334,7 @@ impl NpuForward {
             let after=monotonic_ns();
             anchor_ns=before+(after-before)/2; anchor_uncertainty_ns=after-before;
             for layer in 0..bundle.config.num_hidden_layers { for bank in 0..2 {
-                records.push(TraceRow { layer,bank,position:position+bank*8192,seq:0,pack_issue_ns:0,kick_ns:0,submit_ns:0,done_ns:0,wait_enqueue_ns:0,consume_issue_ns:0,start:gpu.hip.event_create()?,end:gpu.hip.event_create()? });
+                records.push(TraceRow { layer,bank,position:position+bank*8192,rows:rows[bank],seq:0,pack_issue_ns:0,kick_ns:0,submit_ns:0,done_ns:0,wait_enqueue_ns:0,consume_issue_ns:0,start:gpu.hip.event_create()?,end:gpu.hip.event_create()? });
             }}
         }
         let attempt: Result<(),Qwen4GpuForwardError>=(|| {
@@ -345,8 +349,8 @@ impl NpuForward {
                 }
             }
             // Both trunks finish before prompt-end head/capture work.
-            finish_bank(gpu,bundle,&owner.scratch,logits,top1,capture,0,output)?;
-            finish_bank(gpu,bundle,b,logits,top1,capture,1,output)?;
+            finish_bank(gpu,bundle,&owner.scratch,logits,top1,capture,0,rows[0],output)?;
+            finish_bank(gpu,bundle,b,logits,top1,capture,1,rows[1],output)?;
             Ok(())
         })();
         drop(programs);
@@ -356,7 +360,7 @@ impl NpuForward {
                 for r in &records {
                     let start_ns=anchor_ns+(gpu.hip.event_elapsed_ms(anchor,&r.start)? as f64*1e6) as u64;
                     let end_ns=anchor_ns+(gpu.hip.event_elapsed_ms(anchor,&r.end)? as f64*1e6) as u64;
-                    writeln!(out,"{{\"layer\":{},\"bank\":\"{}\",\"position\":{},\"rows\":8192,\"seq\":{},\"pack_issue_ns\":{},\"kick_ns\":{},\"npu_submit_ns\":{},\"npu_done_ns\":{},\"gpu_wait_enqueue_ns\":{},\"consume_issue_ns\":{},\"mixer_start_ns\":{},\"mixer_end_ns\":{},\"anchor_uncertainty_ns\":{}}}",r.layer,if r.bank==0{"A"}else{"B"},r.position,r.seq,r.pack_issue_ns,r.kick_ns,r.submit_ns,r.done_ns,r.wait_enqueue_ns,r.consume_issue_ns,start_ns,end_ns,anchor_uncertainty_ns).map_err(fail)?;
+                    writeln!(out,"{{\"layer\":{},\"bank\":\"{}\",\"position\":{},\"rows\":{},\"seq\":{},\"pack_issue_ns\":{},\"kick_ns\":{},\"npu_submit_ns\":{},\"npu_done_ns\":{},\"gpu_wait_enqueue_ns\":{},\"consume_issue_ns\":{},\"mixer_start_ns\":{},\"mixer_end_ns\":{},\"anchor_uncertainty_ns\":{}}}",r.layer,if r.bank==0{"A"}else{"B"},r.position,r.rows,r.seq,r.pack_issue_ns,r.kick_ns,r.submit_ns,r.done_ns,r.wait_enqueue_ns,r.consume_issue_ns,start_ns,end_ns,anchor_uncertainty_ns).map_err(fail)?;
                 }
                 out.flush().map_err(fail)?;
             }
@@ -367,7 +371,7 @@ impl NpuForward {
         attempt?;
         commit_qsa(bundle,&commits);
         bundle.state.ple_history=history;
-        bundle.state.commit_row_capture(16384);
+        bundle.state.commit_row_capture(tokens.len());
         bundle.state.position=end;
         Ok(())
     }
@@ -400,11 +404,11 @@ fn initialize(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScra
     Ok(())
 }
 
-fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, logits: Option<&GpuTensor>, top1: Option<&GpuTensor>, capture: Option<&GpuTensor>, bank: usize, output: Qwen4OutputPolicy) -> Result<(),Qwen4GpuForwardError> {
-    let config=&bundle.config; let dims=program_dims(config); let n=8192;
+fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, logits: Option<&GpuTensor>, top1: Option<&GpuTensor>, capture: Option<&GpuTensor>, bank: usize, n: usize, output: Qwen4OutputPolicy) -> Result<(),Qwen4GpuForwardError> {
+    let config=&bundle.config; let dims=program_dims(config);
     let bf16=gpu.qwen4_bf16_streams(n);
     if let Some(capture)=capture {
-        let dst=f32_view(capture,bank*n*dims.wide(),n*dims.wide());
+        let dst=f32_view(capture,bank*8192*dims.wide(),n*dims.wide());
         let src=view(&scratch.streams,0,n*dims.wide());
         if bf16 { rdna_compute::tensor_ops::hc_state_bf16_to_f32(gpu,&src,&dst,n*dims.wide())?; }
         else { gpu.copy_d2d(&src,&dst,src.byte_size())?; }
@@ -419,36 +423,54 @@ fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScr
     let lm=dense_ref(&bundle.weights,&bundle.weights.root.lm_head)?;
     execute_final_hyper(gpu,dims,&hyper,&scratch.streams,&scratch_desc,n,bf16).map_err(fail)?;
     let hidden=view(&scratch.hc_mixed,0,n*config.hidden_size);
-    let offset=if rows==n {bank*n*config.vocab_size}else{0};
+    let offset=if rows==n {bank*8192*config.vocab_size}else{0};
     let logits=logits.ok_or_else(||fail("head requires logits"))?.sub_offset(offset,rows*config.vocab_size);
     execute_lm_head(gpu,&lm,&hidden,&logits,n,rows,Some(&scratch.rotation)).map_err(fail)?;
     if let Some(top1)=top1 {
-        let indices=top1.sub_offset(if rows==n{bank*n*4}else{0},rows*4);
+        let indices=top1.sub_offset(if rows==n{bank*8192*4}else{0},rows*4);
         argmax_f32(gpu,&ArgmaxF32 { logits:&logits,indices:&indices,rows,vocab:config.vocab_size })?;
     }
     Ok(())
 }
 
-/// Only complete consecutive 8192-row chunks are paired; the tail keeps the
-/// same boundaries as the GPU numerical twin.
+/// Keep the numerical twin's 8192-row chunk boundary; bank B may be partial.
 pub(super) fn pair_rows(remaining: usize, chunk: usize) -> Option<usize> {
-    (chunk==8192 && remaining>=16384).then_some(16384)
+    if chunk==8192 && remaining>=8192+512 {
+        Some(8192+(remaining-8192).min(8192))
+    } else { None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test] fn pairs_cover_exact_ranges_and_keep_tail() {
-        for rows in [0,511,8192,16383,16384,16385,32768,40960] {
-            let mut at=0; let mut ranges=Vec::new();
+        for rows in [0,511,8192,8703,8704,16200,16383,16384,16385,20000,32768,40000,40960] {
+            let mut at=0; let mut ranges=Vec::new(); let mut banks=Vec::new();
             while at<rows {
-                let n=pair_rows(rows-at,8192).unwrap_or((rows-at).min(8192));
-                ranges.push(at..at+n); at+=n;
+                let paired=pair_rows(rows-at,8192);
+                let n=paired.unwrap_or((rows-at).min(8192));
+                ranges.push(at..at+n);
+                if paired.is_some() {
+                    banks.extend([at..at+8192,at+8192..at+n]);
+                    assert!((512..=8192).contains(&(n-8192)));
+                } else { banks.push(at..at+n); }
+                at+=n;
             }
             assert_eq!(at,rows);
             for pair in ranges.windows(2) { assert_eq!(pair[0].end,pair[1].start); }
-            for r in ranges { if r.len()==16384 { assert_eq!((r.start..r.start+8192).end,(r.start+8192..r.end).start); } }
+            // Emulate splits at the same 8192 boundary, including ragged B.
+            let sequential:Vec<_>=(0..rows).step_by(8192).map(|start|start..(start+8192).min(rows)).collect();
+            assert_eq!(banks,sequential);
+            match rows {
+                16200=>assert_eq!(ranges,vec![0..16200]),
+                16384=>assert_eq!(ranges,vec![0..16384]),
+                20000=>assert_eq!(ranges,vec![0..16384,16384..20000]),
+                40000=>assert_eq!(ranges,vec![0..16384,16384..32768,32768..40000]),
+                _=>{}
+            }
         }
+        assert_eq!(pair_rows(8703,8192),None);
+        assert_eq!(pair_rows(8704,8192),Some(8704));
         assert_eq!(pair_rows(32768,4096),None);
     }
     #[test] fn arena_retirement_precedes_next_pack_and_state_order() {
@@ -474,9 +496,9 @@ mod tests {
 
 pub(super) fn run_pair_request(owner: &mut Qwen4GpuForward, bundle: &mut Qwen4Bundle, gpu: &mut Gpu, tokens: &[u32], offset: usize, logits: Option<&GpuTensor>, top1: Option<&GpuTensor>, capture: Option<&GpuTensor>, output: Qwen4OutputPolicy) -> Result<(),Qwen4GpuForwardError> {
     let all=matches!(output,Qwen4OutputPolicy::Rows(Qwen4OutputRows::All));
-    let logits=logits.map(|t|if all { t.sub_offset(offset*bundle.config.vocab_size,16384*bundle.config.vocab_size) } else { t.sub_offset(0,t.numel()) });
-    let top1=top1.map(|t|if all {t.sub_offset(offset*4,16384*4)}else{t.sub_offset(0,t.numel())});
-    let capture=capture.map(|t|t.sub_offset(offset*program_dims(&bundle.config).wide(),16384*program_dims(&bundle.config).wide()));
+    let logits=logits.map(|t|if all { t.sub_offset(offset*bundle.config.vocab_size,tokens.len()*bundle.config.vocab_size) } else { t.sub_offset(0,t.numel()) });
+    let top1=top1.map(|t|if all {t.sub_offset(offset*4,tokens.len()*4)}else{t.sub_offset(0,t.numel())});
+    let capture=capture.map(|t|t.sub_offset(offset*program_dims(&bundle.config).wide(),tokens.len()*program_dims(&bundle.config).wide()));
     let mut npu=owner.npu_trunk.take().expect("on owner");
     let result=npu.pair(owner,bundle,gpu,tokens,logits.as_ref(),top1.as_ref(),capture.as_ref(),output);
     owner.npu_trunk=Some(npu);

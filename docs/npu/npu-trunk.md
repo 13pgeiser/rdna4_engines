@@ -337,7 +337,7 @@ The load line records `download_ms`, `pack_ms`, actual resident weight bytes,
 mode/families/contract and runtime status. `on` additionally opens the unchanged
 8192-row G80 program, resident 13/11-panel chains and two registered A/C banks;
 any admission/open error fails the load. Calibration is deliberately bypassed,
-with a `first-light-force-full-pairs` load note.
+with a `first-light-force-pairs` load note.
 
 `emulate`, and every unpaired chunk under `on`, use the producer and exact IU8
 BF16-direct GPU twin for rows >=512. Smaller chunks and decode retain the
@@ -366,8 +366,12 @@ assumption. Opt-in execution uses mapped experts, not donor-layer staging.
 The private NPU owner transfers as one exclusive object with `ArchModel`;
 none of railgun's internal HIP Rc resources escapes that owner.
 
-Only consecutive **full** chunks are paired; boundaries stay at 8192 and any
-tail remains sequential. For each layer:
+With an 8192-row chunk cap, pair whenever at least 8192+512 rows remain:
+bank A has 8192 live rows and B has `min(remaining-8192,8192)`.
+The GPU numerical twin uses exactly the same 8192-row boundaries. A shorter
+unpaired chunk remains sequential. For example, 16200 rows are one
+8192+8008 pair, 20000 are a full pair plus 3616 sequential rows, and 40000
+are two full pairs plus 7232 sequential rows. For each layer:
 
 ```text
 prepare(0,A), pack/kick(0,A); prepare(0,B), pack/kick(0,B)
@@ -386,6 +390,13 @@ Retirement follows the last C scatter, not the later core's native-tensor reads.
 The transport's checked GPU wait remains host-gated; this is not a CPU-free
 rejoin and the relay submits NPU chains serially.
 
+Both NPU programs retain the fixed 8192-row extent. For a partial B, the
+producer explicitly zeros every padded A row; kick records B's live count
+without patching the program, and consume writes only those live rows.
+All GPU layer operations, router views, PLE staging, capture/MTP rows and
+head work use the bank's real row count. Bank B's output offsets remain
+8192, not its own row count.
+
 Bank A starts at the request's current position; B starts at position+8192.
 Each bank-B QSA view is advanced using bank A's exact `next_lengths()` tuple
 (full/raw/pooled/selected/position), rather than independently guessed offsets.
@@ -398,7 +409,7 @@ outside the pair. Pairing never crosses a caller's session segment boundary.
 ### Overlap trace
 
 With `HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk.jsonl`, successful pairs
-append one JSON object per `(layer,bank)` with `position`, `rows`, `seq`,
+append one JSON object per `(layer,bank)` with `position`, real live `rows`, `seq`,
 `pack_issue_ns`, `kick_ns`, `npu_submit_ns`, `npu_done_ns`,
 `gpu_wait_enqueue_ns`, `consume_issue_ns`, `mixer_start_ns`, `mixer_end_ns`
 and `anchor_uncertainty_ns`. Host/relay timestamps use Linux CLOCK_MONOTONIC.
@@ -412,7 +423,7 @@ No trace records are emitted for GPU-only tails or `emulate`.
 
 No full-model hardware parity or speed claim is established by CPU builds.
 Use the same MQ6 family-B model, prompt and greedy settings in fresh daemons;
-confirm the tokenized prompt contains at least 16384 rows (a file named `p16k`
+confirm the tokenized prompt contains at least 8704 rows (a file named `p16k`
 is not itself evidence of its token count). Keep chunk admission at 8192.
 Do not inherit the build-only `ROCR_VISIBLE_DEVICES=-1`/`HIP_VISIBLE_DEVICES=-1`.
 
@@ -445,7 +456,7 @@ cmp /tmp/npu-trunk-on.txt /tmp/npu-trunk-emulate.txt
 
 If a caller splits the prompt into individual lane tiles/session segments before
 the chunk owner receives it, only pairs within those segments can pipeline.
-EP, compact scratch, calibrated `auto`, ragged NPU programs and CPU-free waits
+EP, compact scratch, calibrated `auto`, variable-size NPU programs and CPU-free waits
 are outside this first-light route. CPU bookkeeping tests live under
 `gpu_forward::npu_forward::tests`; the full-model greedy comparison and trace
 overlap inspection remain the parent-run silicon acceptance gate.

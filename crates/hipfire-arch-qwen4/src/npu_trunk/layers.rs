@@ -5,10 +5,10 @@ pub(super) struct BankProgram<'a> {
     pub steps: SmallVec<[Step<'a>; QWEN4_STEP_INLINE_CAPACITY]>,
     pub ranges: SmallVec<[std::ops::Range<usize>; 64]>,
     pub ple_rows_f16: bool,
+    pub rows: usize,
 }
-pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4GpuForwardScratch, bundle: &'a Qwen4Bundle, gpu: &Gpu, ctx: &'a DispatchCtx, scratch_desc: &'a Qwen4LayerScratch<'a>, bank: usize) -> Result<BankProgram<'a>, Qwen4GpuForwardError> {
+pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4GpuForwardScratch, bundle: &'a Qwen4Bundle, gpu: &Gpu, ctx: &'a DispatchCtx, scratch_desc: &'a Qwen4LayerScratch<'a>, bank: usize, n: usize) -> Result<BankProgram<'a>, Qwen4GpuForwardError> {
     let config = &bundle.config;
-    let n = 8192;
     let dims = program_dims(config);
     let ple_layer_index = config.ple.as_ref().map(|_| config.ple_layer_ids[0]-1);
     let (ple_head_count,ple_row_width) = config.ple.as_ref().map_or((0,0),|p|(p.head_count,p.row_width));
@@ -167,7 +167,7 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                         input: &scratch.hc_mixed,
                         output_tensor: &scratch.attention_output,
                         rows: n,
-                        start_position: bundle.state.position + bank * n,
+                        start_position: bundle.state.position + bank * 8192,
                         key_heads: dims.linear_num_key_heads,
                         value_heads: dims.linear_num_value_heads,
                         key_dim: dims.linear_key_head_dim,
@@ -351,12 +351,16 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
     if bank == 1 {
         for step in &mut steps {
             if let Step::IndexedAttention(op) = step {
+                // Advance the initial view by A's 8192 rows, not B's live rows.
+                let rows = op.rows;
+                op.rows = 8192;
                 let (full,raw,pooled,selected,position)=op.next_lengths().map_err(fail)?;
+                op.rows = rows;
                 op.state.full_len=full; op.state.raw_len=raw; op.state.pooled_len=pooled;
                 op.state.selected_len=selected; op.state.position=position;
             }
         }
     }
     validate_steps(gpu,&steps).map_err(fail)?;
-    Ok(BankProgram { steps, ranges, ple_rows_f16 })
+    Ok(BankProgram { steps, ranges, ple_rows_f16, rows: n })
 }
