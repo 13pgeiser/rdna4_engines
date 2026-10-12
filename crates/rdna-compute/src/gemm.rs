@@ -1028,6 +1028,95 @@ const fn mq6_x4_pm_gfx1151_shape(m: usize, n: usize) -> bool {
     m >= QWEN4_MQ6_X4_PM_MIN_M_GFX1151 && n >= QWEN4_MQ6_X4_PM_MIN_N_GFX1151
 }
 
+/// Largest output extent, in bytes, a gfx11 builder-module PM kernel can address. The
+/// PM entries build their Y (and HC-stream / mirror) buffer descriptors raw with
+/// `num_records = 0x7fffffff` and index them with 32-bit byte offsets, so a store at or
+/// past 2^31 bytes is silently dropped (and past 2^32 wraps onto the head of the
+/// buffer). The hipcc/U3 entries address with 64-bit pointers and are not bound by it.
+pub(crate) const PM_OUTPUT_EXTENT_LIMIT_BYTES: usize = i32::MAX as usize;
+
+/// `rows * width * elem_bytes` when it is a valid PM output extent
+/// (`<= PM_OUTPUT_EXTENT_LIMIT_BYTES`, i.e. `< 2^31`); `None` on overflow or when too large.
+pub(crate) fn pm_output_extent_bytes(rows: usize, width: usize, elem_bytes: usize) -> Option<usize> {
+    rows.checked_mul(width)?
+        .checked_mul(elem_bytes)
+        .filter(|&bytes| bytes <= PM_OUTPUT_EXTENT_LIMIT_BYTES)
+}
+
+/// Refuses a PM launch whose `what` output (`rows` of `width` elements of `elem_bytes`)
+/// reaches 2^31 bytes; call before any device write of the launch (X conversion, zeroing).
+/// Each output buffer is checked on its own, never an aggregate over regions.
+pub(crate) fn pm_check_output_extent(
+    what: &str, rows: usize, width: usize, elem_bytes: usize,
+) -> HipResult<()> {
+    if pm_output_extent_bytes(rows, width, elem_bytes).is_some() {
+        return Ok(());
+    }
+    let extent = rows
+        .checked_mul(width)
+        .and_then(|elems| elems.checked_mul(elem_bytes))
+        .map_or_else(|| "overflows usize".to_string(), |bytes| format!("{bytes} bytes"));
+    Err(hip_bridge::HipError::new(
+        1,
+        &format!(
+            "PM output extent: {what} {rows} rows x {width} x {elem_bytes} B = {extent} must be \
+             < 2^31 bytes (PM buffer descriptor and 32-bit byte offsets); slice the launch \
+             into token chunks whose output stays under 2^31 bytes"
+        ),
+    ))
+}
+
+/// Whether a PM launch's M/K/N kernel arguments and input descriptors are addressable:
+/// `m`, `k`, `n` fit the kernels' `i32` arguments, the weight stream
+/// `m * (k / 256) * group_bytes` stays within the raw `0x7fffffff` A descriptor
+/// (`<= i32::MAX`), and X (`n * k` F16) within its bounded `u32` descriptor field and
+/// 32-bit row offsets (`<= u32::MAX`). Checked math; overflow is `false`.
+pub(crate) fn pm_input_geometry_fits(m: usize, k: usize, n: usize, group_bytes: usize) -> bool {
+    let weight = m.checked_mul(k / 256).and_then(|groups| groups.checked_mul(group_bytes));
+    let x = n.checked_mul(k).and_then(|elems| elems.checked_mul(2));
+    m <= i32::MAX as usize
+        && k <= i32::MAX as usize
+        && n <= i32::MAX as usize
+        && weight.is_some_and(|bytes| bytes <= i32::MAX as usize)
+        && x.is_some_and(|bytes| bytes <= u32::MAX as usize)
+}
+
+/// Refuses a PM launch (`what`; regions: once per region with that region's `m`, so each
+/// weight is bounded on its own) whose geometry fails [`pm_input_geometry_fits`], before
+/// any device write of the launch.
+pub(crate) fn pm_check_input_geometry(
+    what: &str, m: usize, k: usize, n: usize, group_bytes: usize,
+) -> HipResult<()> {
+    if pm_input_geometry_fits(m, k, n, group_bytes) {
+        return Ok(());
+    }
+    Err(hip_bridge::HipError::new(
+        1,
+        &format!(
+            "PM input geometry: {what} M={m} K={k} N={n} (group {group_bytes} B) needs M, K, N <= \
+             i32::MAX, weight bytes M*(K/256)*{group_bytes} <= i32::MAX (raw A descriptor) and \
+             X bytes N*K*2 <= u32::MAX (bounded X descriptor); slice the launch"
+        ),
+    ))
+}
+
+/// [`pm_check_output_extent`] of an HC-stream buffer `[rows, 4 * m]`; `4 * m` is checked,
+/// an overflow is refused with the same extent error.
+pub(crate) fn pm_check_hc_streams_extent(
+    what: &str, rows: usize, m: usize, elem_bytes: usize,
+) -> HipResult<()> {
+    match m.checked_mul(4) {
+        Some(width) => pm_check_output_extent(what, rows, width, elem_bytes),
+        None => Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "PM output extent: {what} stream width 4 * {m} overflows usize; slice the launch \
+                 into token chunks whose output stays under 2^31 bytes"
+            ),
+        )),
+    }
+}
+
 // U3 tiles: chosen by `mq6_x4_halo_policy` or an explicit HIPFIRE_QWEN4_MQ6_X4_TILE.
 fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usize) {
     let kind = if bf16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
@@ -38693,6 +38782,14 @@ impl Gpu {
                 "gemm_mqv2_residual_wmma_gfx11_bt: K must be a multiple of 256",
             ));
         }
+        // PM entries (gfx1151 `_w8[_bf16out]`, gfx1201 `_w4/_w8`) address Y through a raw
+        // 0x7fffffff descriptor with 32-bit byte offsets: refuse >= 2^31 bytes before the
+        // X conversion below writes anything. The hipcc/U3 entries are not bound by it.
+        if use_pm {
+            let elem_bytes = if y.dtype == DType::BF16 { 2 } else { 4 };
+            pm_check_output_extent("mqv2 PM Y", batch_size, m, elem_bytes)?;
+            pm_check_input_geometry("mqv2 PM", m, k, batch_size, group_bytes)?;
+        }
         self.bind_thread()?;
         if pm1151 {
             self.ensure_embedded_kernel("qwen4_mq6_x4_pm_gfx1151", kernels::QWEN4_MQ6_X4_PM_GFX1151, func_name)?;
@@ -41238,6 +41335,14 @@ impl Gpu {
         }
         let total_m: usize = regions.iter().map(|(_, _, m)| *m).sum();
         let pm1151 = self.mq6_x4_pm_gfx1151(pm, total_m, batch_size);
+        if pm1151 {
+            for (_, y, m) in regions {
+                pm_check_output_extent("MQ6 PM regions Y", batch_size, *m, y.dtype.size())?;
+                pm_check_input_geometry(
+                    "MQ6 PM regions", *m, k, batch_size, crate::dispatch::MQ6G256V2_GROUP_BYTES,
+                )?;
+            }
+        }
         let (module, source, name, rows, block, n_tile) = if self.arch_caps.has_wmma_w32_gfx12() {
             ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
                 Some(kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC),
@@ -41499,6 +41604,10 @@ impl Gpu {
         if m == 0 || batch_size == 0 {
             return Ok(());
         }
+        if pm {
+            pm_check_output_extent("MQ4 PM Y", batch_size, m, if bf16 { 2 } else { 4 })?;
+            pm_check_input_geometry("MQ4 PM", m, k, batch_size, crate::dispatch::MQ4V2_GROUP_BYTES)?;
+        }
         self.bind_thread()?;
         if !pm {
             self.zero_f32_rows(y, m, batch_size)?;
@@ -41572,6 +41681,12 @@ impl Gpu {
             || regions.iter().any(|(_, y, _)| y.dtype != DType::F32)
         {
             return Ok(false);
+        }
+        for (_, _, m) in regions {
+            pm_check_output_extent("MQ4 PM regions Y", batch_size, *m, 4)?;
+            pm_check_input_geometry(
+                "MQ4 PM regions", *m, k, batch_size, crate::dispatch::MQ4V2_GROUP_BYTES,
+            )?;
         }
         let total_m: usize = regions.iter().map(|(_, _, m)| *m).sum();
         let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(128)).sum();
@@ -41648,6 +41763,15 @@ impl Gpu {
         if m == 0 || batch_size == 0 {
             return Ok(());
         }
+        // Streams are `[batch_size, 4 * m]` (BF16 bits or F32), the optional mirror
+        // `[batch_size, m]` F32 and the gates `[batch_size, 4]` F32; all go through raw
+        // 0x7fffffff descriptors in the PM entry.
+        pm_check_input_geometry("MQ4 PM HCW", m, k, batch_size, crate::dispatch::MQ4V2_GROUP_BYTES)?;
+        pm_check_hc_streams_extent("MQ4 PM HC streams", batch_size, m, if hc_bf16 { 2 } else { 4 })?;
+        if mirror.is_some() {
+            pm_check_output_extent("MQ4 PM HC mirror", batch_size, m, 4)?;
+        }
+        pm_check_output_extent("MQ4 PM HC gates", batch_size, 4, 4)?;
         self.bind_thread()?;
         let name = "qwen4_mq4_x4_pm_gfx1151_w8_hcw";
         self.ensure_embedded_kernel("qwen4_mq4_x4_pm_gfx1151", kernels::QWEN4_MQ4_X4_PM_GFX1151, name)?;
@@ -47838,6 +47962,120 @@ mod lds_epi_tests {
 #[cfg(test)]
 mod route_selector_tests {
     use super::*;
+
+    /// The PM launchers' output guard (`pm_check_output_extent`, called by the plain / BF16
+    /// / regions / HC-write entries) refuses extents at or past 2^31 bytes.
+    #[test]
+    fn pm_output_extent_vocab_logits_boundary() {
+        let vocab = 248_320usize;
+        // F32 logits [tokens, vocab]: 2162 tokens fit, 2163 do not.
+        assert!(pm_check_output_extent("Y", 2048, vocab, 4).is_ok());
+        assert!(pm_check_output_extent("Y", 2162, vocab, 4).is_ok());
+        assert_eq!(pm_output_extent_bytes(2162, vocab, 4), Some(2_147_471_360));
+        for tokens in [2163usize, 4096, 4608, 8192] {
+            let err = pm_check_output_extent("Y", tokens, vocab, 4)
+                .expect_err("over-2^31 F32 output must be refused")
+                .to_string();
+            assert!(err.contains("PM output extent"), "{err}");
+            assert!(err.contains("2^31"), "{err}");
+            assert!(err.contains(&format!("{tokens} rows")), "{err}");
+        }
+    }
+
+    #[test]
+    fn pm_output_extent_exact_2_pow_31_boundary() {
+        // Extent 2^31 - 1 is the largest accepted; 2^31 is refused.
+        assert!(pm_check_output_extent("Y", 1, i32::MAX as usize, 1).is_ok());
+        assert!(pm_check_output_extent("Y", 1, 1 << 31, 1).is_err());
+        assert!(pm_check_output_extent("Y", 1 << 20, 1 << 10, 2).is_err()); // exactly 2^31
+        assert!(pm_check_output_extent("Y", (1 << 20) - 1, 1 << 10, 2).is_ok());
+        assert!(pm_output_extent_bytes(1 << 15, 1 << 15, 2).is_none()); // exactly 2^31
+        assert_eq!(pm_output_extent_bytes(0, usize::MAX, 4), Some(0));
+        assert!(pm_check_output_extent("Y", 0, 1 << 40, 4).is_ok());
+    }
+
+    #[test]
+    fn pm_output_extent_arithmetic_overflow_is_refused() {
+        let err = pm_check_output_extent("Y", usize::MAX, 2, 4)
+            .expect_err("usize overflow must be refused")
+            .to_string();
+        assert!(err.contains("overflows usize"), "{err}");
+        assert!(pm_check_output_extent("Y", 1 << 40, 1 << 40, 4).is_err());
+        assert!(pm_check_output_extent("Y", 2, usize::MAX / 2 + 1, 1).is_err());
+        // The HC-stream width `4 * m` is checked: overflow is refused, never wrapped.
+        let err = pm_check_hc_streams_extent("streams", 1, usize::MAX, 2)
+            .expect_err("4 * m overflow must be refused")
+            .to_string();
+        assert!(err.contains("overflows usize"), "{err}");
+        assert!(pm_check_hc_streams_extent("streams", 2, usize::MAX / 2 + 1, 2).is_err());
+        assert!(pm_check_hc_streams_extent("streams", 2, usize::MAX / 4, 1).is_err());
+    }
+
+    #[test]
+    fn pm_output_extent_bf16_bound_is_twice_the_f32_rows() {
+        let vocab = 248_320usize;
+        // BF16 output halves the element bytes: 4324 tokens fit, 4325 do not.
+        assert!(pm_check_output_extent("Y", 4324, vocab, 2).is_ok());
+        assert!(pm_check_output_extent("Y", 4325, vocab, 2).is_err());
+        assert!(pm_check_output_extent("Y", 4325, vocab, 4).is_err());
+        assert!(pm_check_output_extent("Y", 8192, vocab, 2).is_err());
+        // HC streams [tokens, 4 * m] in BF16 bits / F32.
+        let m = 5120usize;
+        assert!(pm_check_output_extent("streams", 52_428, 4 * m, 2).is_ok());
+        assert!(pm_check_output_extent("streams", 52_429, 4 * m, 2).is_err());
+        assert!(pm_check_output_extent("streams", 26_214, 4 * m, 4).is_ok());
+        assert!(pm_check_output_extent("streams", 26_215, 4 * m, 4).is_err());
+    }
+
+    #[test]
+    fn pm_output_extent_regions_are_checked_individually() {
+        // Three regions, each just under 2^31 bytes at F32: the aggregate is far past 2^31
+        // yet every region is a valid PM output, so each is accepted.
+        let tokens = 8192usize;
+        let m_region = (i32::MAX as usize) / (tokens * 4);
+        let regions = [m_region, m_region, m_region];
+        assert!(regions.iter().all(|&m| pm_check_output_extent("Y", tokens, m, 4).is_ok()));
+        assert!(regions.iter().sum::<usize>() * tokens * 4 > i32::MAX as usize);
+        // One region over the limit refuses regardless of the others.
+        let mixed = [64usize, m_region + 1, 64];
+        let refused: Vec<bool> = mixed
+            .iter()
+            .map(|&m| pm_check_output_extent("Y", tokens, m, 4).is_err())
+            .collect();
+        assert_eq!(refused, [false, true, false]);
+    }
+
+    #[test]
+    fn pm_input_geometry_i32_and_descriptor_bounds() {
+        let (g4, g6) = (crate::dispatch::MQ4V2_GROUP_BYTES, crate::dispatch::MQ6G256V2_GROUP_BYTES);
+        // Product shapes: vocab head and a trunk projection at N = 8192 fit.
+        assert!(pm_input_geometry_fits(248_320, 2048, 8192, g6));
+        assert!(pm_input_geometry_fits(248_320, 2048, 8192, g4));
+        assert!(pm_input_geometry_fits(12_288, 2560, 8192, g6));
+        // i32 argument casts.
+        let big = i32::MAX as usize + 1;
+        assert!(!pm_input_geometry_fits(big, 256, 1, 0));
+        assert!(!pm_input_geometry_fits(1, big, 1, 0));
+        assert!(!pm_input_geometry_fits(1, 256, big, g6));
+        assert!(pm_input_geometry_fits(i32::MAX as usize, 256, 1, 0));
+        // Raw A descriptor: weight bytes <= i32::MAX, the exact boundary.
+        let rows_fit = i32::MAX as usize / g6;
+        assert!(pm_input_geometry_fits(rows_fit, 256, 1, g6));
+        assert!(!pm_input_geometry_fits(rows_fit + 1, 256, 1, g6));
+        assert!(!pm_input_geometry_fits(usize::MAX, 256, 1, g6)); // arithmetic overflow
+        // Bounded X descriptor: N*K*2 <= u32::MAX.
+        assert!(pm_input_geometry_fits(1, 256, (u32::MAX as usize / 2) / 256, g6));
+        assert!(!pm_input_geometry_fits(1, 1 << 20, 1 << 12, g6)); // N*K*2 = 2^33
+        assert!(!pm_input_geometry_fits(1, 1 << 30, 1 << 30, g6)); // product wraps u32
+        assert!(!pm_input_geometry_fits(1, i32::MAX as usize, i32::MAX as usize, g6));
+        // Regions bound each weight on its own: three regions at the A limit are each fine.
+        assert!([rows_fit; 3].iter().all(|&m| pm_input_geometry_fits(m, 256, 8192, g6)));
+        let err = pm_check_input_geometry("MQ6 PM regions", rows_fit + 1, 256, 1, g6)
+            .expect_err("over-limit weight must be refused")
+            .to_string();
+        assert!(err.contains("PM input geometry"), "{err}");
+        assert!(pm_check_input_geometry("MQ4 PM", 4096, 2048, 8192, g4).is_ok());
+    }
 
     #[test]
     fn native_mq6_admission_matches_incumbent_at_thresholds() {
