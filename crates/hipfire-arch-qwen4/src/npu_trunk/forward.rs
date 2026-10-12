@@ -359,13 +359,22 @@ fn commit_qsa(bundle: &mut Qwen4Bundle, commits: &[(usize,usize,usize,usize,usiz
 }
 
 impl NpuForward {
-    fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, layer: usize, bank: usize, records: &mut [TraceRow]) -> Result<Seq,Qwen4GpuForwardError> {
+    fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, layer: usize, bank: usize, records: &mut [TraceRow], stage: Option<&crate::bundle::PairSessionStage>) -> Result<Seq,Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref().expect("on runtime");
         unsafe { rt.prepare_bank(bank,stream(gpu)).map_err(fail)?; }
         // Includes PLE (when present) and the attention HC read. Neither reads
         // recurrent/QSA state; bank B's input can be prepared ahead of bank A.
         execute(gpu,ctx,&program.steps[program.ranges[layer].start..index])?;
+        if bank == 0 {
+            if let Some(stage) = stage {
+                for step in &program.steps[program.ranges[layer].start..index] {
+                    if let Step::GroupedDepthwise(op) = step {
+                        stage.copy(gpu, stage.fixed.len() - 2, op.state).map_err(fail)?;
+                    }
+                }
+            }
+        }
         let pack_issue_ns=self.pack(gpu,&program.steps[index],bank,true)?;
         let kick_ns=if records.is_empty(){0}else{monotonic_ns()};
         let seq=unsafe { rt.kick(layer,transport_shape(self.layers[layer].shape),bank,program.rows,stream(gpu)).map_err(fail)? };
@@ -437,6 +446,7 @@ impl NpuForward {
         if let Some(qsa)=bundle.state.qsa.first().filter(|q|q.f16_arena.is_none()) {
             rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(gpu,qsa.format,bundle.config.num_key_value_heads,end)?;
         }
+        let mut stage = bundle.prepare_pair_session_stage(gpu, position + rows[0]).map_err(fail)?;
         self.note_pair(tokens.len(),position);
         // No tape can contain relay/host operations. Decode retains its old route.
         gpu.replay.set_forward_eligible(false);
@@ -454,11 +464,19 @@ impl NpuForward {
             layers::build_program(owner,b,bundle,gpu,&ctx,&sb,1,rows[1])?,
         ];
         let mut history=bundle.state.ple_history;
+        let mut boundary_history = history;
         for bank in 0..2 {
             let scratch=if bank==0 { &owner.scratch } else { b };
             let bank_tokens=&tokens[bank*8192..bank*8192+rows[bank]];
             initialize(gpu,bundle,scratch,bank_tokens,&history,programs[bank].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple)?;
             for &token in bank_tokens { history.push(token); }
+            if bank == 0 { boundary_history = history; }
+        }
+        if let Some(stage) = &mut stage {
+            let commits: SmallVec<[_; QWEN4_QSA_INLINE_CAPACITY]> = programs[0].steps.iter().filter_map(|step| match step {
+                Step::IndexedAttention(op) => Some(op.next_lengths().map_err(fail)), _ => None,
+            }).collect::<Result<_, _>>()?;
+            stage.configure(&bundle.state, boundary_history, &commits).map_err(fail)?;
         }
         let commits: SmallVec<[_; QWEN4_QSA_INLINE_CAPACITY]>=programs[1].steps.iter().filter_map(|step|match step {
             Step::IndexedAttention(op)=>Some(op.next_lengths().map_err(fail)), _=>None,
@@ -483,13 +501,30 @@ impl NpuForward {
         }
         let attempt: Result<(),Qwen4GpuForwardError>=(|| {
             let mut seq=[
-                self.prepare(gpu,&ctx,&programs[0],0,0,&mut records)?,
-                self.prepare(gpu,&ctx,&programs[1],0,1,&mut records)?,
+                self.prepare(gpu,&ctx,&programs[0],0,0,&mut records,stage.as_ref())?,
+                self.prepare(gpu,&ctx,&programs[1],0,1,&mut records,None)?,
             ];
+            let mut gdn_slot = 0;
+            let mut qsa_slot = 0;
             for (layer,bank) in bank_visits(bundle.config.num_hidden_layers) {
                 self.run_bank(gpu,&ctx,&mut programs[bank],layer,bank,seq[bank],&mut records)?;
+                if bank == 0 {
+                    if let Some(stage) = &stage {
+                        match &programs[0].steps[mixer_index(&programs[0], layer)] {
+                            Step::GatedDeltaNet(op) => {
+                                stage.copy_parts(gpu, 2 * gdn_slot, [op.recurrent, op.conv_state]).map_err(fail)?;
+                                gdn_slot += 1;
+                            }
+                            Step::IndexedAttention(op) => {
+                                stage.copy(gpu, 2 * bundle.state.gdn.len() + qsa_slot, op.state.selected_indices).map_err(fail)?;
+                                qsa_slot += 1;
+                            }
+                            _ => unreachable!("typed mixer"),
+                        }
+                    }
+                }
                 if layer+1<bundle.config.num_hidden_layers {
-                    seq[bank]=self.prepare(gpu,&ctx,&programs[bank],layer+1,bank,&mut records)?;
+                    seq[bank]=self.prepare(gpu,&ctx,&programs[bank],layer+1,bank,&mut records,if bank == 0 { stage.as_ref() } else { None })?;
                 }
             }
             // Both trunks finish before prompt-end head/capture work.
@@ -512,11 +547,15 @@ impl NpuForward {
         });
         for r in records { let _=gpu.hip.event_destroy(r.start); let _=gpu.hip.event_destroy(r.end); }
         if let Some(anchor)=anchor { let _=gpu.hip.event_destroy(anchor); }
+        bundle.pair_session_stage = stage;
         attempt?;
         commit_qsa(bundle,&commits);
         bundle.state.ple_history=history;
         bundle.state.commit_row_capture(tokens.len());
         bundle.state.position=end;
+        if bundle.pair_boundary_is_ar() {
+            bundle.publish_pair_session_boundary(gpu, position + rows[0]).map_err(fail)?;
+        }
         Ok(())
     }
 }
@@ -663,20 +702,24 @@ mod tests {
         assert_eq!(pair_rows(32768,4096),None);
     }
     #[test] fn segments_preserve_snapshots_and_native_tails() {
-        // Both arms use this same schedule. Session and message boundaries
-        // split segments before pairing, never after bank A has run.
+        // Both arms allow the A/B split itself as a snapshot boundary.
         let schedule=|end:usize,boundaries:&[usize],planned:bool| {
             let mut pos=0; let mut groups=Vec::new(); let mut banks=Vec::new();
             while pos<end {
                 let boundary=boundaries.iter().copied().find(|b|*b>pos);
-                let rows=qwen4_prefill_segment_rows(pos,end,8192,boundary,planned);
+                let mut rows=qwen4_prefill_segment_rows(pos,end,8192,boundary,planned);
+                if rows > 8192 && boundary == Some(pos + 8192)
+                    && boundaries.iter().any(|&b| b > pos + 8192 && b < pos + rows)
+                {
+                    rows = 8192;
+                }
                 assert!(rows>0);
                 let covered=rows>8192;
                 groups.push(pos..pos+rows);
                 for at in (pos..pos+rows).step_by(8192) {
                     banks.push((at..(at+8192).min(pos+rows),covered));
                 }
-                assert!(boundary.is_none_or(|b|pos+rows<=b));
+                assert!(boundaries.iter().all(|&b| b <= pos || b >= pos+rows || b == pos+8192));
                 pos+=rows;
             }
             (groups,banks)
@@ -686,10 +729,14 @@ mod tests {
             (0..8192,true),(8192..16384,true),(16384..20000,false),
         ]);
         assert_eq!(schedule(8703,&[],true).1,vec![(0..8192,false),(8192..8703,false)]);
-        assert_eq!(schedule(16343,&[8192,16343],true).0,vec![0..8192,8192..16343]);
-        assert_eq!(schedule(20000,&[12000,20000],true).0,vec![0..12000,12000..20000]);
+        assert_eq!(schedule(16343,&[8192,16343],true).0,vec![0..16343]);
+        assert_eq!(schedule(16384,&[8192,16384],true).0,vec![0..16384]);
+        assert_eq!(schedule(16384,&[8192,10000,16384],true).0,
+            vec![0..8192,8192..10000,10000..16384]);
+        assert_eq!(schedule(20000,&[12000,20000],true).0,
+            vec![0..8192,8192..12000,12000..20000]);
         assert_eq!(schedule(20000,&[4000,13000,20000],true).0,
-            vec![0..4000,4000..13000,13000..20000]);
+            vec![0..4000,4000..12192,12192..13000,13000..20000]);
         assert_eq!(qwen4_prefill_segment_rows(8192,40000,8192,Some(8192),true),8192);
         assert!(schedule(40000,&[],false).1.iter().all(|(_,covered)|!*covered));
         for end in [16343,20000,40000] {

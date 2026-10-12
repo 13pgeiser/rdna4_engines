@@ -579,6 +579,9 @@ impl SpecTarget for Qwen4Bundle {
                         }
                     }).map_err(|error|error.to_string())?;
                     if pick.is_some() {last_argmax=pick;}
+                    if bank_end < end && self.pair_boundary_is_ar() {
+                        self.publish_pair_session_boundary(gpu, start_pos + bank_end).map_err(|e| e.to_string())?;
+                    }
                 }
             } else {
                 self.set_ple_lookahead(&tokens[end..]);
@@ -3797,6 +3800,9 @@ pub(crate) fn mtp_prefill_chunk(
             if bank_pick.is_some() {pick=bank_pick;}
             mtp_append_prefill_chunk(bundle,gpu,tokens,pos+bank*max_chunk,0,pending,
                 append_scratch.as_deref_mut(),reuse_trunk_ids,abort)?;
+            if !final_bank {
+                bundle.publish_pair_session_boundary(gpu, pos + max_chunk).map_err(|e| e.to_string())?;
+            }
         }
         return Ok(pick);
     }
@@ -3807,6 +3813,9 @@ pub(crate) fn mtp_prefill_chunk(
         for (bank,tokens) in chunk.chunks(max_chunk).enumerate() {
             mtp_append_prefill_chunk(bundle,gpu,tokens,pos+bank*max_chunk,bank*max_chunk,
                 pending,append_scratch.as_deref_mut(),false,abort)?;
+            if bank == 0 {
+                bundle.publish_pair_session_boundary(gpu, pos + max_chunk).map_err(|e| e.to_string())?;
+            }
         }
     } else {
         mtp_append_prefill_chunk(bundle,gpu,chunk,pos,0,pending,append_scratch,
@@ -4767,10 +4776,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
             let rows=Self::bundle(target)?.prefill_schedule_rows(pos,prompt_tokens.len(),chunk_rows);
             let natural=pos.checked_add(rows)
                 .ok_or_else(||"Qwen4 native MTP prefill position overflow".to_string())?;
-            let boundary = Self::bundle(target)?
-                .session_next_boundary()
-                .filter(|&boundary| boundary > pos && boundary <= natural);
-            let end = boundary.unwrap_or(natural);
+            let end = natural;
             if end <= pos || end > natural {
                 return Err(format!(
                     "Qwen4 native MTP prefill chunk end {end} is outside ({pos}, {natural}]"
@@ -4798,7 +4804,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
             // Target and head both hold the exact state at `end` only now: a
             // due snapshot boundary is reported here, after the forward and the
             // head append of this chunk.
-            if boundary == Some(end) {
+            if Self::bundle(target)?.session_next_boundary() == Some(end) {
                 Self::bundle(target)?
                     .session_at_boundary(gpu, &prompt_tokens[..end])
                     .map_err(|error| error.to_string())?;

@@ -484,8 +484,8 @@ Each bank-B QSA view is advanced using bank A's exact `next_lengths()` tuple
 GPU `G(l,A)` precedes `G(l,B)`, so B sees A's recurrent updates and appended
 KV. PLE row hashing advances history through A before hashing B. Only after
 both banks finish do the head, requested wide-hidden/MTP capture, QSA metadata
-and global position/history publish; existing caller session snapshots remain
-outside the pair. Pairing never crosses a caller's session segment boundary.
+and global position/history publish. A boundary at A's end is retained through
+fixed-state staging without rewinding the live pair-end state.
 
 The serving entry points are `Qwen4MtpDrafter::mtp_prefill` (default native
 MTP), `SpecTarget::spec_advance` (generic speculative target prefill), and
@@ -503,15 +503,14 @@ Only the final bank of a prompt-ending pair runs the target pick; other pairs
 capture silently. Each request logs its first scheduled pair once:
 `npu-trunk: pair rows=8192+8151 position=0` for a 16343-row fresh prompt.
 
-A pair **never crosses a session snapshot boundary**. The default 8-GiB
-session cache attaches periodic 8192-row boundaries and therefore prevents
-pairing on these serving routes. Halo comparisons must set
-`HIPFIRE_SESSION_CACHE_BYTES=0` in both arms. Message-end boundaries are
-likewise respected when session turn snapshots are enabled; an ordinary chat
-template alone does not split the prompt when the cache is disabled.
-Snapshotting bank A inside a pair is deliberately not implemented.
-Generic resumed target advances that cannot report a pending snapshot from
-a full prompt prefix remain native until that snapshot is reported by its owner.
+A pair may cross a session snapshot boundary **only at A's end**. The default
+8-GiB cache's periodic 8192-row snapshots therefore permit full pairs: A's fixed
+state is staged per layer and published at the same cadence as the sequential
+run. Interior A/B boundaries, including message ends, still split the schedule.
+The Halo comparison must retain the default cache and exercise a later prefix
+hit, not disable the cache. See the staging layout and cost details below.
+Generic resumed target advances whose pending snapshot cursor is already behind
+their position remain native until that snapshot is reported by its owner.
 
 ### Overlap trace
 
@@ -544,7 +543,7 @@ target/release/npu-trunk-transport --pci 0000:c0:00.0
 ```sh
 export HIPFIRE_DAEMON_BIN="$PWD/target/release/daemon"
 export HIPFIRE_PREFILL_CHUNK_ROWS=8192
-export HIPFIRE_SESSION_CACHE_BYTES=0
+unset HIPFIRE_SESSION_CACHE_BYTES # retain the product-default 8 GiB prefix cache
 # MODEL must name the pinned MQ6 family-B artifact, not an MQ4 artifact.
 HIPFIRE_QWEN4_NPU_TRUNK=on \
 HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk-on.jsonl \
@@ -559,16 +558,22 @@ jq -n --arg model "$MODEL" --rawfile prompt p16k \
   | curl -sS http://127.0.0.1:11435/v1/chat/completions \
       -H 'Content-Type: application/json' --data-binary @-
 ```
-Save the response, stop the `on` server, then start a fresh `off` server with
-the same settings and send the identical request:
+Save the response, then send a second independent request with the same p16k
+prefix and a different suffix (not the first response's generated continuation).
+Require a reported prefix-cache hit with reused rows > 0. Save that response too.
+Stop the `on` server, then start a fresh `emulate` server with the same settings
+and send both identical requests in the same order:
 
 ```sh
-HIPFIRE_QWEN4_NPU_TRUNK=off \
+HIPFIRE_QWEN4_NPU_TRUNK=emulate \
   target/release/hipfire serve "$MODEL" 127.0.0.1 11435 --max-seq 32768
 ```
 
-Compare reported prompt rows and TTFT; `on` must equal the `emulate` greedy
-output, while `off` must equal unchanged beta, not BF16-direct `on`.
+Compare generated token IDs/content byte-for-byte separately for the cold request
+and cache-hit request (not the nondeterministic response ID/timestamp/timings).
+`on` must equal `emulate` on both. Inspect the `on` trace for paired A/B banks
+despite the default cache. Separately compare `off` to unchanged beta, not to
+BF16-direct `on`; repeat the cold/cache-hit gate with native MTP and `--spec off`.
 
 
 Native MTP is enabled by default; repeat with `--spec off` for the AR route.
@@ -591,14 +596,68 @@ cmp /tmp/npu-trunk-on.txt /tmp/npu-trunk-emulate.txt
 ```
 
 Continuous-batch/lane `prefill_wave` is not paired; its tiles retain the native
-GPU route in both arms. Prefix-cache/message/session segments can only pair
-within their own boundaries; the cache-disabled fresh-request gate above
-avoids snapshot segmentation. EP, compact scratch, calibrated `auto`,
-variable-size NPU programs and CPU-free waits remain outside first light.
+GPU route in both arms. A singleton pair may cross a snapshot boundary only
+when it is exactly the A/B split. An interior A or B boundary still splits the
+schedule; message-end cadence and cache scope are unchanged. EP, compact scratch,
+calibrated `auto`, variable-size NPU programs and CPU-free waits remain outside first light.
 CPU scheduling/capture/retirement tests live under
 `gpu_forward::npu_forward::tests`; existing MTP tests cover head append IDs
 and pick boundaries. Full-model greedy comparison and trace overlap
 inspection remain the parent-run silicon acceptance gate.
+
+### Default-cache snapshot staging
+
+`state.rs::session_layout/session_parts_at` defines the trunk snapshot:
+each GDN layer's recurrent live slot and F32 convolution history; each QSA
+layer's complete selection buffer and append-only K/V, raw-index and completed
+pooled-index prefixes; optional PLE convolution history; and hyper feedback.
+Host metadata is model ID, absolute position, optional two-token PLE context,
+and six words per QSA layer (full/raw/pooled/partial/selected lengths, position).
+`mtp_gpu.rs::session_parts` adds the head's selection buffer, device selected
+length, wide hidden, four append-only streams, model ID, lengths, position,
+step index, and draft policy's full-vocabulary hold/margin bits. Request-local
+pending scratch is not a session-cache part.
+
+For `on`, `session_pair.rs` allocates one reusable fixed-state mirror before
+the first boundary-bearing pair, only with an attached cache. In
+`npu_trunk/forward.rs`, GDN recurrent/conv and QSA selection are copied by a
+stream-ordered copy kernel immediately after each A layer and before its B
+layer. PLE is copied immediately after A's PLE operation, before B's preparation
+can overwrite that shared history; unchanged hyper feedback is copied before
+the pipeline starts. No staging copy synchronizes the host, including on the
+default HIP stream. The ordinary metadata serializer describes A's QSA marks
+and token history without rewinding the live B owners. Debug builds reconstruct
+the layout through the ordinary restore parser and compare fixed sizes, stream
+row widths/counts on the CPU, without draining the stream.
+
+The cache does **not** store QSA KV by lengths alone: `session_cache.rs` copies
+append-only row deltas above the parent and pins that parent. A staged snapshot
+therefore supplies A's lengths over the still-valid live prefixes, plus staged
+fixed bytes. Publication uses the unchanged `SessionCache::at_boundary`:
+after the pair and A's MTP head append, before B's head append; AR publishes
+after the pair. `emulate` publishes from ordinary sequential live owners after
+A, without staging. The next B-end snapshot is ordinary in both arms.
+
+Additional device memory is the sum of trunk fixed-part byte sizes, independent
+of prompt length; no KV mirror and no extra MTP mirror are allocated. At pinned
+Flash-Next geometry with F32 GDN this is **118,177,936 B (112.70 MiB)**:
+36 recurrent/conv pairs, 12 selections of 2051 i32s, nine 10240-wide PLE history
+rows, and 10240 feedback floats. Other GDN storage formats use their actual
+recurrent byte sizes. Host staging retains one metadata blob and 48 row counts.
+Each boundary-bearing pair adds that many logical copy bytes, or about
+236.36 MB of read+write traffic, in 50 copy-kernel launches (one per GDN/QSA
+layer plus PLE and feedback). A hypothetical effective 100–200 GB/s gives
+**2.36–1.18 ms plus launch/serialization cost**; this is a bandwidth estimate,
+not a measured Halo timing. Cache publication's ordinary fixed/row copies and
+allocation costs remain in addition, just as for sequential capture.
+
+CPU acceptance uses GPUs hidden, `nice -n 19`, the worktree's target directory
+and `-j 12`: build `hipfire-daemon`, `hipfire-cli`, and `qwen4_kld --features lab`;
+run `cargo test -p hipfire-arch-qwen4 --lib` and
+`cargo test -p hipfire-runtime --lib session_cache`. These checks do not certify
+snapshot bytes on silicon; the cold/default-cache and branched cache-hit
+`on`/`emulate` Halo gate above remains required.
+
 
 ## Direct BF16 arena consumer interfaces
 

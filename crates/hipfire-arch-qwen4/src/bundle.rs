@@ -46,6 +46,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[path = "session_pair.rs"]
+mod session_pair;
+pub(crate) use session_pair::PairSessionStage;
+
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Architecture-private owner for the fulfilled manifest census.
@@ -249,6 +253,7 @@ pub struct Qwen4Bundle {
     /// Prefill snapshot cache shared by every session (`attach_session_cache`);
     /// `None` = off.
     session: Option<SessionCache>,
+    pub(crate) pair_session_stage: Option<PairSessionStage>,
     /// Committed live state kept for a continuation of the same conversation
     /// (`session_commit_live`); `None` = none. Cleared by `reset`,
     /// `session_clear`, `session_commit` and `session_begin` (it is consumed
@@ -392,10 +397,19 @@ impl SessionState for Qwen4Bundle {
                     .ok_or("Qwen4 MTP resources are not attached")?,
             ),
         };
-        if self.state.position != position || mtp.is_some_and(|mtp| mtp.position() != position) {
+        let staged = self.pair_session_stage.as_ref().filter(|stage| stage.position == Some(position));
+        if (staged.is_none() && self.state.position != position)
+            || mtp.is_some_and(|mtp| mtp.position() != position)
+        {
             return Err(format!("qwen4 session capture: owners not at {position}"));
         }
-        let (mut meta, mut layout) = self.state.session_parts().map_err(|e| e.to_string())?;
+        let SnapshotParts { mut meta, mut layout } = match staged {
+            Some(stage) => stage.snapshot_parts(&self.state).map_err(|e| e.to_string())?,
+            None => {
+                let (meta, layout) = self.state.session_parts().map_err(|e| e.to_string())?;
+                SnapshotParts { meta, layout }
+            }
+        };
         if let Some(mtp) = mtp {
             let (mtp_meta, mtp_layout) = mtp.session_parts().map_err(|e| e.to_string())?;
             meta.extend(mtp_meta);
@@ -647,6 +661,7 @@ impl Qwen4Bundle {
             spec_host_top1: Vec::new(),
             penalty_stage: None,
             session: None,
+            pair_session_stage: None,
             live: None,
             turn: None,
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
@@ -1069,9 +1084,18 @@ impl Qwen4Bundle {
     }
 
     pub(crate) fn prefill_schedule_rows(&self, position: usize, end: usize, chunk: usize) -> usize {
-        crate::gpu_forward::qwen4_prefill_segment_rows(
-            position,end,chunk,self.session_next_boundary(),self.npu_trunk_planned(),
-        )
+        let boundary = self.session_next_boundary();
+        let rows = crate::gpu_forward::qwen4_prefill_segment_rows(
+            position, end, chunk, boundary, self.npu_trunk_planned(),
+        );
+        if rows > chunk && boundary == Some(position + chunk) {
+            if self.session.as_ref().and_then(|cache| cache.next_boundary_after(position + chunk))
+                .is_some_and(|next| next < position + rows)
+            {
+                return chunk;
+            }
+        }
+        rows
     }
 
     fn spec_prefill_capacity(&self, chunk: usize) -> usize {
@@ -2322,6 +2346,7 @@ impl Qwen4Bundle {
         self.begin_npu_trunk_request();
         self.live = None;
         self.turn = None;
+        if let Some(stage) = &mut self.pair_session_stage { stage.position = None; }
         // `None` while the cache itself resets (it drives `self` then).
         if let Some(cache) = self.session.as_mut() {
             cache.live_state_reset();
@@ -2626,18 +2651,22 @@ impl Qwen4Bundle {
         }
         self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
         let mut pos = reused;
-        while let Some(boundary) = self.session_next_boundary() {
-            self.set_ple_lookahead(&prompt[boundary..]);
-            if boundary < prompt.len() {
-                self.forward_chunk_silent(gpu, &prompt[pos..boundary])?;
+        while pos < prompt.len() {
+            let end = if self.npu_trunk_planned() {
+                pos + self.prefill_schedule_rows(pos, prompt.len(), self.spec_chunk_rows().unwrap_or(1))
             } else {
-                self.forward_chunk_final(gpu, &prompt[pos..boundary], logits, None)?;
+                self.session_next_boundary().unwrap_or(prompt.len())
+            };
+            self.set_ple_lookahead(&prompt[end..]);
+            if end < prompt.len() {
+                self.forward_chunk_silent(gpu, &prompt[pos..end])?;
+            } else {
+                self.forward_chunk_final(gpu, &prompt[pos..end], logits, None)?;
             }
-            self.session_at_boundary(gpu, &prompt[..boundary])?;
-            pos = boundary;
-        }
-        if pos < prompt.len() {
-            self.forward_chunk_final(gpu, &prompt[pos..], logits, None)?;
+            if self.session_next_boundary() == Some(end) {
+                self.session_at_boundary(gpu, &prompt[..end])?;
+            }
+            pos = end;
         }
         Ok(())
     }
@@ -3202,6 +3231,7 @@ impl Qwen4Bundle {
             spec_top1,
             spec_hidden,
             session,
+            pair_session_stage,
             penalty_stage,
             lanes,
             ..
@@ -3220,6 +3250,12 @@ impl Qwen4Bundle {
         if let Some(mut session) = session {
             session.clear(gpu);
         }
+        let mut pair_stage_error = None;
+        if let Some(stage) = pair_session_stage {
+            for tensor in stage.fixed {
+                if let Err(error) = gpu.free_tensor(tensor) { pair_stage_error.get_or_insert(error); }
+            }
+        }
         let ple_result = ple_rows
             .map(|rows| rows.unload().map(|_| ()).map_err(BundleError::PleRows))
             .unwrap_or(Ok(()));
@@ -3232,7 +3268,7 @@ impl Qwen4Bundle {
                     .map_err(|error| BundleError::Forward(error.to_string()))
             })
             .unwrap_or(Ok(()));
-        let mut spec_error = None;
+        let mut spec_error = pair_stage_error;
         for tensor in [spec_logits, spec_top1, spec_hidden].into_iter().flatten() {
             if let Err(error) = gpu.free_tensor(tensor) {
                 spec_error.get_or_insert(error);

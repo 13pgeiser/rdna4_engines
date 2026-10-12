@@ -1758,15 +1758,33 @@ impl Qwen4State {
         if self.row_capture_armed {
             return Err(StateError::SnapshotBusy);
         }
-        let mut words = vec![self.model_id, self.position as u64];
-        // The PLE token context is session state only where a PLE step reads it.
+        self.session_parts_at(self.position, self.ple_history, None)
+    }
+
+    /// Describe a bank-A boundary without rewinding the live bank-B owners.
+    pub(crate) fn session_parts_at(
+        &self,
+        position: usize,
+        history: PleHistory,
+        commits: Option<&[(usize, usize, usize, usize, usize)]>,
+    ) -> Result<(Vec<u8>, StateLayout<'_>), StateError> {
+        let mut words = vec![self.model_id, position as u64];
         if self.ple_conv.is_some() {
-            let [ple0, ple1] = self.ple_history.previous();
+            let [ple0, ple1] = history.previous();
             words.extend([u64::from(ple0), u64::from(ple1)]);
         }
         let mut marks = Vec::with_capacity(self.qsa.len());
-        for layer in &self.qsa {
-            let mark = layer.mark();
+        for (slot, layer) in self.qsa.iter().enumerate() {
+            let mut mark = layer.mark();
+            if let Some(commits) = commits {
+                let &(full, raw, pooled, selected, position) =
+                    commits.get(slot).ok_or(StateError::SnapshotShape)?;
+                mark.full_len = full;
+                mark.raw_len = raw;
+                mark.pooled_len = pooled;
+                mark.selected_len = selected;
+                mark.position = position;
+            }
             validate_qsa_mark(&mark, &layer.mark_capacity())?;
             words.extend(
                 [
@@ -1831,6 +1849,11 @@ impl Qwen4State {
             })
             .collect();
         Ok((words[1] as usize, ple, marks))
+    }
+
+    pub(crate) fn session_layout_for_meta(&self, meta: &[u8]) -> Result<StateLayout<'_>, StateError> {
+        let (_, _, marks) = self.parse_session_meta(meta)?;
+        self.session_layout(&marks)
     }
 
     /// Ready the live state for a session snapshot: map the context arenas

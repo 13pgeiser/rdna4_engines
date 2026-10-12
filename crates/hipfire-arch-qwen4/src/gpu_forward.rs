@@ -4394,6 +4394,9 @@ impl Qwen4GpuForward {
             );
             self.npu_covered_scope=prior_covered;
             result?;
+            if offset < covered_until && bundle.pair_boundary_is_ar() {
+                bundle.publish_pair_session_boundary(gpu, bundle.state.position).map_err(|e| invalid(e.to_string()))?;
+            }
             offset = offset
                 .checked_add(rows)
                 .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
@@ -4478,6 +4481,9 @@ impl Qwen4GpuForward {
             );
             self.npu_covered_scope=prior_covered;
             result?;
+            if offset < covered_until && bundle.pair_boundary_is_ar() {
+                bundle.publish_pair_session_boundary(gpu, bundle.state.position).map_err(|e| invalid(e.to_string()))?;
+            }
             offset = offset
                 .checked_add(rows)
                 .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
@@ -6823,18 +6829,19 @@ mod tests {
     }
 }
 
-/// A shared deterministic singleton/MTP schedule; never crosses a snapshot.
+/// A shared deterministic singleton/MTP schedule; only A's end may be internal.
 pub(crate) fn qwen4_prefill_segment_rows(
     position: usize, prompt_end: usize, chunk: usize,
     boundary: Option<usize>, planned: bool,
 ) -> usize {
-    let end=boundary.filter(|&b|b>position).unwrap_or(prompt_end).min(prompt_end);
-    let remaining=end.saturating_sub(position);
-    // A generic resumed advance may not own the full prefix needed to report
-    // a pending snapshot. Until its owner reports it, keep the native route;
-    // never infer later snapshot boundaries from an unadvanced cache cursor.
-    let planned=planned && boundary.is_none_or(|b|b>position);
-    if planned && chunk==8192 && remaining>=8192+512 {
-        remaining.min(16384)
-    } else { remaining.min(chunk) }
+    let remaining = prompt_end.saturating_sub(position);
+    let pair = planned && chunk == 8192 && remaining >= 8192 + 512;
+    let rows = if pair { remaining.min(16384) } else { remaining.min(chunk) };
+    let Some(boundary) = boundary else { return rows; };
+    if boundary <= position { return remaining.min(chunk); }
+    let distance = boundary - position;
+    if pair && distance == chunk { return rows; }
+    // An interior B boundary must leave A as an ordinary sequential bank.
+    if pair && distance > chunk && distance < rows { return chunk; }
+    rows.min(distance)
 }
