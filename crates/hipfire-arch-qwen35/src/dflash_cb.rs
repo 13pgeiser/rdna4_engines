@@ -311,7 +311,7 @@ pub fn dflash_lane_draft(
         &df.draft_config,
         &mut df.draft_scratch,
         &df.verify_scratch,
-        &df.target_hidden_host,
+        &[],
         &block,
         position,
         compact_offset,

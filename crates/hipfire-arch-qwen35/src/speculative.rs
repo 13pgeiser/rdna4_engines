@@ -6924,6 +6924,22 @@ pub fn scatter_hidden_block_to_interleaved(
     Ok(())
 }
 
+/// Append a cold prefill piece only when a caller actually needs its host
+/// shadow. The paired all-sliding speculator has no host reader: it retains
+/// these same rows in `hidden_rb` and scatters the final ring on device.
+pub fn append_prefill_hidden_host(
+    gpu: &Gpu,
+    hidden_rb: &HiddenStateRingBuffer,
+    rows: usize,
+    host: Option<&mut Vec<f32>>,
+) -> HipResult<()> {
+    if let Some(host) = host {
+        let block = download_hidden_block(gpu, hidden_rb, rows)?;
+        host.extend_from_slice(&block);
+    }
+    Ok(())
+}
+
 pub fn download_hidden_block(
     gpu: &Gpu,
     hidden_rb: &HiddenStateRingBuffer,
@@ -7080,7 +7096,7 @@ pub fn dflash_sampled_selector_draft_into(
 ) -> HipResult<()> {
     dflash_sampled_selector_draft_parts_into(
         gpu, weights, &df.draft_weights, &df.draft_config,
-        &mut df.draft_scratch, &df.verify_scratch, &df.target_hidden_host,
+        &mut df.draft_scratch, &df.verify_scratch, &[],
         &df.verify_scratch.logits.sub_offset(0, vocab),
         position, compact_offset, seed, b, vocab, None, false, cfg, rng, out,
     )
@@ -8068,14 +8084,15 @@ pub fn draft_dflash_blocks_batched(
 /// (the seed was already emitted).
 ///
 /// Side effects:
-/// - Appends `accept_len + 1` positions × `num_extract × hidden` floats to
-///   `target_hidden_host`.
+/// - With `ctx_slice=Some`, appends `accept_len + 1` positions ×
+///   `num_extract × hidden` floats to `target_hidden_host`; otherwise the
+///   appended state stays on device and this argument is not read.
 /// - Advances target's KV cache and DeltaNet state by `accept_len + 1`
 ///   positions. Draft has no persistent state.
 ///
 /// Preconditions:
-/// - `target_hidden_host.len() == position × num_extract × hidden` (set up
-///   by `seed_target_hidden_from_prompt`).
+/// - With `ctx_slice=Some`, `target_hidden_host.len() == position ×
+///   num_extract × hidden` (set up by `seed_target_hidden_from_prompt`).
 /// - `position ≤ draft_scratch.max_ctx_len`.
 /// - `draft_cfg.block_size ≤ draft_scratch.max_block_size`.
 ///
@@ -9438,7 +9455,7 @@ fn dense_tp_dflash_gates(
 }
 
 /// Reset every rank to cold state: zero DeltaNet recurrence, rewind KV
-/// compaction, clear hidden rings / draft upload tracking / host shadows, and
+/// compaction, clear hidden rings / draft upload tracking, and
 /// invalidate window receipts. Drains each rank stream so a poisoned window
 /// cannot leak kernels past the reset.
 fn reset_dense_tp_dflash_ranks(
@@ -9453,7 +9470,6 @@ fn reset_dense_tp_dflash_ranks(
         kv_caches[rank].compact_offset = 0;
         states[rank].dflash.hidden_rb.reset();
         states[rank].dflash.draft_scratch.reset_upload_tracking();
-        states[rank].dflash.target_hidden_host.clear();
         states[rank].logical_pos = 0;
         states[rank].receipt_generation = u64::MAX;
     }
@@ -9606,16 +9622,12 @@ pub fn seed_target_hidden_dense_tp2_abortable(
             prompt.len(),
         )
         .map_err(|e| e.to_string())?;
-        states[rank]
-            .dflash
-            .target_hidden_host
-            .extend_from_slice(&host);
         hipfire_runtime::dflash::draft_seed_backfill(
             &mut gpus.devices[rank],
             &states[rank].dflash.draft_weights,
             &states[rank].dflash.draft_config,
             &mut states[rank].dflash.draft_scratch,
-            &states[rank].dflash.target_hidden_host,
+            &host,
             prompt.len(),
         )
         .map_err(|e| e.to_string())?;
@@ -12158,8 +12170,11 @@ impl SeedPrefill {
 /// with [`SeedPrefill`] (AR's plan by default) and calls `abort_check`
 /// between chunks. Returns `Ok(true)` if aborted (state has been fully reset,
 /// so the caller should NOT continue with decode), `Ok(false)` on normal
-/// completion. Each chunk costs one `download_hidden_block` on top of the
-/// forward (a host copy of its hidden rows).
+/// completion. `Some(target_hidden_host)` captures each piece through
+/// `download_hidden_block` (a host sync per piece); `None` leaves the same
+/// hidden rows on device, so the pieces enqueue back to back. Callers pass
+/// `Some` only when the long-reach backfill reads the shadow
+/// (`dflash_prefill_host_required`).
 ///
 /// Used by the daemon's `generate_dflash` to honor client-side
 /// cancellation on long-context retries (cache-miss scenarios where
@@ -12169,7 +12184,7 @@ pub fn seed_target_hidden_from_prompt_abortable(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
     hidden_rb: &mut HiddenStateRingBuffer,
-    target_hidden_host: &mut Vec<f32>,
+    target_hidden_host: Option<&mut Vec<f32>>,
     prompt_tokens: &[u32],
     abort_check: &dyn Fn() -> bool,
     // Optional DeltaNet checkpoint ring for divergent-render resume. When
@@ -12199,7 +12214,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
     gpu: &mut Gpu,
     target: &mut DflashTargetParts<'_>,
     hidden_rb: &mut HiddenStateRingBuffer,
-    target_hidden_host: &mut Vec<f32>,
+    mut target_hidden_host: Option<&mut Vec<f32>>,
     prompt_tokens: &[u32],
     abort_check: &dyn Fn() -> bool,
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
@@ -12207,7 +12222,9 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
     ckpt_cap: usize,
 ) -> HipResult<bool> {
     target.reset_state(gpu)?;
-    target_hidden_host.clear();
+    if let Some(host) = target_hidden_host.as_deref_mut() {
+        host.clear();
+    }
     if let Some(cks) = checkpoints.as_deref_mut() {
         // fresh cold prefill ⇒ stale checkpoints no longer valid; free their GPU buffers
         for (_, snap) in cks.drain(..) {
@@ -12220,7 +12237,9 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
         while seq_pos < prompt_tokens.len() {
             if abort_check() {
                 let _ = target.reset_state(gpu);
-                target_hidden_host.clear();
+                if let Some(host) = target_hidden_host.as_deref_mut() {
+                    host.clear();
+                }
                 if let Some(cks) = checkpoints.as_deref_mut() {
                     for (_, snap) in cks.drain(..) {
                         snap.free_gpu(gpu);
@@ -12233,8 +12252,12 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                 let piece = SeedPrefill::piece_len(hidden_rb, end - seq_pos);
                 let chunk = &prompt_tokens[seq_pos..seq_pos + piece];
                 seed.forward(gpu, target, hidden_rb, chunk, seq_pos, prompt_tokens.len())?;
-                let block = download_hidden_block(gpu, hidden_rb, piece)?;
-                target_hidden_host.extend_from_slice(&block);
+                append_prefill_hidden_host(
+                    gpu,
+                    hidden_rb,
+                    piece,
+                    target_hidden_host.as_deref_mut(),
+                )?;
                 seq_pos += piece;
             }
             if let Some(cks) = checkpoints.as_deref_mut() {

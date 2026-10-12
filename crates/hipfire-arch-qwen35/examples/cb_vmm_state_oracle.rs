@@ -2647,8 +2647,8 @@ fn ring_span(gpu: &Gpu, t: &GpuTensor, row_bytes: usize, rows: usize, modulus: u
 /// ring cursors and live rows in logical order, `TargetHiddenLog` cursors and
 /// absolute positions, valid spans of the draft context rings
 /// (`target_hidden`, projection, per-layer K/V, windowed full-layer K/V),
-/// host-shadow length, and checkpoint positions. Never the unwritten parts of
-/// an allocation.
+/// context capacity / block size, and checkpoint positions. Never the
+/// unwritten parts of an allocation.
 fn df_arrays(gpu: &Gpu, df: &DflashState, ckpt: &[usize]) -> Result<Named> {
     gpu.hip.device_synchronize()?;
     let mut out: Named = Vec::new();
@@ -2688,7 +2688,7 @@ fn df_arrays(gpu: &Gpu, df: &DflashState, ckpt: &[usize]) -> Result<Named> {
         out.push(("draft.k_full".into(), ring_span(gpu, k, kvd * 4, full, wf)?));
         out.push(("draft.v_full".into(), ring_span(gpu, v, kvd * 4, full, wf)?));
     }
-    out.push(("draft.sizes".into(), le_u64s(&[df.target_hidden_host.len() as u64, df.ctx_capacity as u64, df.block_size as u64])));
+    out.push(("draft.sizes".into(), le_u64s(&[df.ctx_capacity as u64, df.block_size as u64])));
     out.push(("checkpoints.positions".into(), le_u64s(&ckpt.iter().map(|&p| p as u64).collect::<Vec<_>>())));
     Ok(out)
 }

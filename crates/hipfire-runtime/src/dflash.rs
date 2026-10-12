@@ -2947,16 +2947,26 @@ fn draft_dtod_at(
 /// Rows per chunk for the windowed-mode post-seed backfill.
 pub const SEED_BACKFILL_CHUNK: usize = 512;
 
+/// Whether [`draft_seed_backfill`] reads its host shadow for a cold prompt of
+/// `prompt_len` rows: only a windowed draft with a dedicated long-reach layer
+/// (`w != w_full`) whose prompt is longer than the SWA window. Legacy mode and
+/// DFlash2 all-sliding drafts (every layer shares the same W ring) never read
+/// it, so a cold prefill may leave the hidden rows on device.
+pub fn draft_seed_backfill_reads_host(ctx_mode: DraftCtxMode, prompt_len: usize) -> bool {
+    matches!(ctx_mode, DraftCtxMode::Windowed { w, w_full } if w != w_full && prompt_len > w)
+}
+
 /// Windowed-mode post-seed backfill: after a cold prefill longer than the
 /// SWA window, the last (full-attention) layer still needs K/V for EVERY
 /// context row — but `hidden_rb` / the draft ring only retain the last
-/// `swa_w`. The host shadow (`target_hidden_host`, cumulative on the cold
-/// path) has the full prompt, so stream it through the ring in chunks:
+/// `swa_w`. The host shadow (cumulative over the cold prefill) has the full
+/// prompt, so stream it through the ring in chunks:
 /// upload → fc → hidden_norm → last-layer wk/wv + k_norm into its
 /// `full_w`-row ring. SWA layers are deliberately skipped — the first
 /// `draft_forward` lazy fill covers their in-window rows bit-identically.
 ///
-/// No-op in Legacy mode or when `prompt_len <= swa_w`. Sets the thlog
+/// No-op (and `host_hidden` unread) unless
+/// [`draft_seed_backfill_reads_host`]. Sets the thlog
 /// full-layer watermark to `prompt_len` so the forward's lazy fill resumes
 /// from the window edge. GEMMs, norms, and RoPE are row-local: chunked ==
 /// monolithic bit-exactly.
@@ -2969,17 +2979,13 @@ pub fn draft_seed_backfill(
     prompt_len: usize,
 ) -> HipResult<()> {
     let (swa_w, full_w) = match scratch.ctx_mode {
-        DraftCtxMode::Legacy => return Ok(()),
-        DraftCtxMode::Windowed { w, w_full } => (w, w_full),
+        DraftCtxMode::Windowed { w, w_full }
+            if draft_seed_backfill_reads_host(scratch.ctx_mode, prompt_len) =>
+        {
+            (w, w_full)
+        }
+        _ => return Ok(()),
     };
-    // DFlash2 all-sliding: every layer shares the same W ring, no dedicated
-    // long-reach layer and no out-of-window backfill needed.
-    if swa_w == full_w {
-        return Ok(());
-    }
-    if prompt_len <= swa_w {
-        return Ok(());
-    }
     let h = cfg.hidden;
     let ne = cfg.num_extract();
     let kvd = cfg.kv_dim();
