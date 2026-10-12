@@ -771,7 +771,7 @@ impl Qwen4Bundle {
         // prefix it reads (`Qwen4GpuForward`); legacy state commits all of
         // it here, as before. A no-op when the route is off for this arch
         // and state format.
-        if let Some(qsa) = self.state.qsa.first() {
+        if let Some(qsa) = self.state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
             let heads = self.config.num_key_value_heads;
             let reserved = match self.state.qsa_backend() {
                 Qwen4KvBackend::Legacy => {
@@ -2225,7 +2225,7 @@ impl Qwen4Bundle {
             .state
             .qsa
             .first()
-            .filter(|qsa| rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(gpu, qsa.format))
+            .filter(|qsa| rdna_compute::tensor_ops::qsa_gather_workspace_needed(gpu, qsa.format, qsa.f16_arena.is_some()))
             .and_then(|_| {
                 rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
                     self.config.num_key_value_heads,
@@ -2751,6 +2751,8 @@ impl Qwen4Bundle {
                     ));
                 }
             }
+            bundle.state.clamp_f16_valid();
+            lane.state.clamp_f16_valid();
             std::mem::swap(&mut bundle.state, &mut lane.state);
             if let (Some(spec), Some(mtp)) = (lane.spec.as_mut(), bundle.mtp.as_mut()) {
                 std::mem::swap(&mut mtp.state, &mut spec.head);
@@ -2846,6 +2848,8 @@ impl Qwen4Bundle {
         }
         let mut head = head;
         let session = self.session.take();
+        self.state.clamp_f16_valid();
+        state.clamp_f16_valid();
         std::mem::swap(&mut self.state, state);
         let resident_draft = match (head.as_mut(), self.mtp.as_mut()) {
             (Some((head_state, draft)), Some(mtp)) => {
@@ -2880,6 +2884,8 @@ impl Qwen4Bundle {
             mtp.draft.set_request_state(resident);
             std::mem::swap(&mut mtp.state, &mut **head_state);
         }
+        self.state.clamp_f16_valid();
+        state.clamp_f16_valid();
         std::mem::swap(&mut self.state, state);
         self.session = session;
         Ok(result)

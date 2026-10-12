@@ -372,6 +372,7 @@ fn append_target_single(
             }
         };
         let result = (|| {
+            qsa.invalidate_f16_arena();
             indexed_attention_cache_append(
                 gpu,
                 &IndexedAttentionCacheAppend {

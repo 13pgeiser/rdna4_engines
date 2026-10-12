@@ -945,7 +945,7 @@ fn forward_lanes_scoped(
                 .map(|lane| lane.state.position + lane.tokens.len())
                 .max()
                 .unwrap_or(0);
-            if let Some(qsa) = lanes[0].state.qsa.first() {
+            if let Some(qsa) = lanes[0].state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
                 rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
                     gpu,
                     qsa.format,
@@ -1397,6 +1397,7 @@ fn forward_lanes_scoped(
                                     raw_index_keys: &qsa.raw_index_keys,
                                     pooled_keys: &qsa.pooled_keys,
                                     selected_indices: &qsa.selected_indices,
+                                    f16_arena: if prefill { qsa.f16_arena_ref() } else { None },
                                     full_capacity: qsa.full_capacity,
                                     raw_capacity: qsa.raw_capacity,
                                     pooled_capacity: qsa.pooled_capacity,
@@ -1695,6 +1696,7 @@ fn forward_lanes_scoped(
                 state.pooled_len = pooled_len;
                 state.selected_len = selected_len;
                 state.position = position;
+                state.clamp_f16_valid();
             }
             for lane in lanes.iter_mut() {
                 for &token in lane.tokens {
@@ -1709,12 +1711,17 @@ fn forward_lanes_scoped(
             }
             Ok(())
         }
-        Err(error) => match ple.abort() {
-            Ok(_) => Err(error),
-            Err(cleanup) => Err(Qwen4GpuForwardError::Ple(format!(
-                "lane step failed: {error}; PLE cleanup failed: {cleanup}"
-            ))),
-        },
+        Err(error) => {
+            for lane in lanes.iter() {
+                lane.state.invalidate_f16_arenas();
+            }
+            match ple.abort() {
+                Ok(_) => Err(error),
+                Err(cleanup) => Err(Qwen4GpuForwardError::Ple(format!(
+                    "lane step failed: {error}; PLE cleanup failed: {cleanup}"
+                ))),
+            }
+        }
     }
 }
 

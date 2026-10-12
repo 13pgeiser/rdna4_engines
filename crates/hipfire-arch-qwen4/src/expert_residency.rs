@@ -247,10 +247,12 @@ pub fn auto_vram_reserve(
     context: &crate::Qwen4ContextCommit,
     chunk_rows: usize,
     mode: Qwen4ForwardScratchMode,
-    qsa_format: rdna_compute::tensor_ops::QsaKvFormat,
+    qsa_layout: impl Into<rdna_compute::tensor_ops::QsaStateLayout>,
     mtp_bytes: Option<u64>,
     gather_bytes: Option<u64>,
 ) -> Result<u64, String> {
+    let qsa_layout = qsa_layout.into();
+    let qsa_format = qsa_layout.kv;
     let overflow = |seq| format!("QSA context state for max_seq {seq} overflows");
     let trunk = |bytes: Option<usize>| {
         bytes
@@ -261,7 +263,22 @@ pub fn auto_vram_reserve(
         .ok_or_else(|| overflow(context.max_seq))?;
     let measured_context = trunk(config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, qsa_format))
         .ok_or_else(|| overflow(AUTO_VRAM_RESERVE_MAX_SEQ))?;
-    let context = committed.saturating_sub(measured_context);
+    // BF-1's extra storage must fit through the admitted context, including
+    // on UMA VMM loads that otherwise charge only the first mapped chunk.
+    // Do not subtract it with the historical (arena-off) measured layout.
+    let arena = if qsa_layout.f16_arena {
+        let capacity = crate::Qwen4ContextCommit { tokens: context.max_seq, ..*context };
+        let plain = capacity.committed_layer_bytes(config, qsa_format)
+            .ok_or_else(|| overflow(context.max_seq))?;
+        let with = capacity.committed_layer_bytes(config, qsa_layout)
+            .ok_or_else(|| overflow(context.max_seq))?;
+        trunk(Some(with.checked_sub(plain).ok_or_else(|| overflow(context.max_seq))?))
+            .ok_or_else(|| overflow(context.max_seq))?
+    } else {
+        0
+    };
+    let context = committed.saturating_sub(measured_context)
+        .checked_add(arena).ok_or_else(|| overflow(context.max_seq))?;
     let overflow = || format!("forward resources for a {chunk_rows}-row chunk overflow");
     let measured = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
         config,
@@ -669,6 +686,25 @@ mod tests {
                 "mtp.layers.0.mlp.experts.down_proj"
             ]
         );
+    }
+
+    #[test]
+    fn f16_arena_reserve_covers_full_capacity_even_with_vmm() {
+        let config = crate::config::compact_test_config();
+        let layout = rdna_compute::tensor_ops::QsaStateLayout {
+            f16_arena: true, ..rdna_compute::tensor_ops::QsaStateLayout::F32
+        };
+        for backend in [crate::Qwen4KvBackend::Legacy, crate::Qwen4KvBackend::Vmm] {
+            let context = crate::Qwen4ContextCommit::new(backend, 262145, 8192, 2 << 20);
+            let plain = auto_vram_reserve(&config, &context, 8192, Full, F32, None, None).unwrap();
+            let with = auto_vram_reserve(&config, &context, 8192, Full, layout, None, None).unwrap();
+            let extra = if backend == crate::Qwen4KvBackend::Vmm {
+                2 * (262148usize * 1024).div_ceil(2 << 20) * (2 << 20) * config.n_full_layers()
+            } else {
+                262148 * layout.f16_arena_bytes_per_token(2, 256) * config.n_full_layers()
+            };
+            assert_eq!(with - plain, extra as u64);
+        }
     }
 
     #[test]

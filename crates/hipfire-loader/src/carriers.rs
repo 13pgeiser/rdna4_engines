@@ -1117,7 +1117,7 @@ fn qwen4_placement_inputs(
     // context is (none when the route is off: the reserve is then unchanged).
     // Bytes already committed by an earlier load in this process are out of
     // `free` and only growth past them is charged.
-    let gather_bytes = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(gpu, qsa_format)
+    let gather_bytes = rdna_compute::tensor_ops::qsa_gather_workspace_needed(gpu, qsa_format, state_format.qsa_f16_arena)
         .then(|| {
             rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
                 config.num_key_value_heads,
@@ -1132,7 +1132,7 @@ fn qwen4_placement_inputs(
         &context,
         chunk_rows,
         scratch_mode,
-        qsa_format,
+        state_format.layout(),
         mtp_bytes,
         gather_bytes,
     )
@@ -1518,6 +1518,9 @@ pub fn load_qwen4_rank(
             backend.name(),
             state_format.gdn.name()
         );
+        if state_format.qsa_f16_arena {
+            eprintln!("  qwen4 QSA F16 arena: on (BF-1, incremental exact prefill; decode F32)");
+        }
         use hipfire_arch_qwen4::expert_residency as residency;
         const MIB: u64 = 1 << 20;
         // Unified memory dropped the mapping above: size from the index.
@@ -1603,7 +1606,7 @@ pub fn load_qwen4_rank(
                     free / MIB
                 );
                 if !fits {
-                    if hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch)) {
+                    if state_format.qsa_f16_arena || hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch)) {
                         return Err(format!(
                             "qwen4: unified memory cannot hold the resident load ({detail}); free host memory"
                         ));
@@ -1800,7 +1803,7 @@ pub fn load_qwen4_rank(
         // (named in the refusal when it does not fit), and VMM storage only
         // reserves as address space.
         let context_state_mib = config
-            .qsa_context_arena_bytes(ctx.max_seq, qsa_format)
+            .qsa_context_arena_bytes(ctx.max_seq, state_format.layout())
             .and_then(|trunk| trunk.checked_mul(config.n_full_layers()))
             .zip(if native_mtp {
                 config.qsa_context_arena_bytes(ctx.max_seq, hipfire_arch_qwen4::QsaKvFormat::F32)

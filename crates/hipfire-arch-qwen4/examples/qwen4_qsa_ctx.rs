@@ -805,11 +805,11 @@ fn main() -> Result<()> {
                 let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, n_ctx);
                 let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
                     backend, n_ctx, chunk, gpu.vmm_recommended_granularity().unwrap_or(1));
-                let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, qsa_format)
+                let gather = rdna_compute::tensor_ops::qsa_gather_workspace_needed(&gpu, qsa_format, state_format.qsa_f16_arena)
                     .then(|| rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(receipt.config.num_key_value_heads, context.tokens))
                     .flatten().map(|bytes| bytes as u64);
                 let reserve = residency::auto_vram_reserve(&receipt.config, &context,
-                    chunk, scratch_mode, qsa_format, None, gather).map_err(err)?;
+                    chunk, scratch_mode, state_format.layout(), None, gather).map_err(err)?;
                 if (free as u64) < non_expert.saturating_add(reserve) {
                     return Err("not enough free VRAM for non-expert weights plus auto reserve".into());
                 }

@@ -24,11 +24,13 @@ use rdna_compute::tensor_ops::{
     hc_activation_fused_f32, hc_state_bf16_add_f32, hc_state_bf16_to_f32, hyper_norm,
     hyper_norm_f16, hyper_norm_gate, hyper_norm_gate_outputs, hyper_read_projected,
     hyper_read_up_fused, hyper_read_up_wmma,
-    hyper_write, hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch,
+    hyper_write, hyper_write_norm, indexed_attention_attention,
+    indexed_attention_attention_batch_with_arena,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
     indexed_attention_index_key_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
-    indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
+    indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32,
+    Bf16Roundtrip, GatedDeltaConv,
     GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
     GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, GdnStateFormat, HcActivationFused,
     HyperNextGates, HyperNorm, HyperNormGate, HyperNormGateOutputs, HyperReadProjected,
@@ -36,7 +38,7 @@ use rdna_compute::tensor_ops::{
     IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
     IndexedAttentionDecodePrologue, IndexedAttentionIndexKeyAppendBatch,
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
-    IndexedAttentionSelectBatch, QsaKvFormat, ScaleF32,
+    IndexedAttentionSelectBatch, QsaF16ArenaRef, QsaKvFormat, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
@@ -2056,8 +2058,11 @@ pub fn execute_gated_delta_net_hc(
 
 /// Borrowed cache tensors plus scalar metadata for one operation.  The
 /// architecture commits these scalar values to persistent state after the
-/// shared step list succeeds. The K/V caches are `format`'s rows and the raw
-/// and pooled index keys its `index_dtype`.
+/// shared step list succeeds. The K/V caches are `format`'s rows and the
+/// raw and pooled index keys its `index_dtype`.
+/// `f16_arena` is the layer's persistent F16 K/V copy of an F32 cache: the
+/// gathered prefill attention converts only new or invalid rows into it
+/// (`None` = per-launch conversion into the shared workspace).
 pub struct IndexedAttentionState<'a> {
     pub format: QsaKvFormat,
     pub full_keys: &'a GpuTensor,
@@ -2065,6 +2070,7 @@ pub struct IndexedAttentionState<'a> {
     pub raw_index_keys: &'a GpuTensor,
     pub pooled_keys: &'a GpuTensor,
     pub selected_indices: &'a GpuTensor,
+    pub f16_arena: Option<QsaF16ArenaRef<'a>>,
     pub full_capacity: usize,
     pub raw_capacity: usize,
     pub pooled_capacity: usize,
@@ -2379,6 +2385,26 @@ impl IndexedAttentionOp<'_> {
                 self.state.format.index_dtype(),
                 "indexed attention pooled keys",
             )?;
+            if let Some(arena) = &self.state.f16_arena {
+                let arena_elements = checked_mul(
+                    rdna_compute::tensor_ops::qsa_f16_arena_rows(self.state.full_capacity),
+                    kv_width,
+                    "indexed attention F16 arena",
+                )?;
+                if self.state.format != QsaKvFormat::F32 || self.head_dim != 256 {
+                    return Err(DispatchError::Hip(
+                        "indexed attention F16 arena needs the F32 K/V state and head_dim 256"
+                            .into(),
+                    ));
+                }
+                require_tensor(arena.keys, arena_elements, DType::F16, "indexed attention F16 arena keys")?;
+                require_tensor(
+                    arena.values,
+                    arena_elements,
+                    DType::F16,
+                    "indexed attention F16 arena values",
+                )?;
+            }
             require_tensor(
                 self.state.selected_indices,
                 checked_mul(
@@ -2665,6 +2691,11 @@ pub fn execute_indexed_attention_hc(
     // keys and indexer; any other width takes the batched launches below.
     let prologue_rotary =
         op.rotary_dim == op.head_dim.min(64) && op.rotary_dim == op.index_dim.min(64);
+    // A rewound position means these F32 rows are about to be replaced.
+    // Clamp before the append, even if a later launch fails.
+    if let Some(arena) = &op.state.f16_arena {
+        arena.valid_len.clamp(initial_position);
+    }
     if gpu.route_rows(op.rows) <= 8
         && op.index_dim <= 256
         && op.head_dim <= 256
@@ -2891,7 +2922,7 @@ pub fn execute_indexed_attention_hc(
         &select,
         op.state.selected_indices,
     ))?;
-    hip(indexed_attention_attention_batch(
+    hip(indexed_attention_attention_batch_with_arena(
         gpu,
         &IndexedAttentionAttentionBatch {
             q_with_gate: &qgate_batch,
@@ -2911,6 +2942,7 @@ pub fn execute_indexed_attention_hc(
             format: op.state.format,
             shape_selected: op.state.selected_capacity,
         },
+        op.state.f16_arena.as_ref(),
     ))?;
     if phase != MixerPhase::Core {
         qsa_project_output(gpu, op, &qsa_output_batch, hc, fused)?;
@@ -3808,6 +3840,7 @@ mod tests {
                 raw_index_keys: t,
                 pooled_keys: t,
                 selected_indices: t,
+                f16_arena: None,
                 full_capacity: 64,
                 raw_capacity: 64,
                 pooled_capacity: 16,

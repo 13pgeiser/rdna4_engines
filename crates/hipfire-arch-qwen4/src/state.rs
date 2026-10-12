@@ -16,8 +16,9 @@ use hipfire_runtime::kv_backend::{
 };
 use hipfire_runtime::session_cache::{RowStream, StateLayout, StatePart};
 use rdna_compute::tensor_ops::{
-    copy_regions, gated_delta_rollback_layers, CopyRegion, GatedDeltaRollbackLayers,
-    GdnStateFormat, QsaKvFormat,
+    copy_regions, gated_delta_rollback_layers, qsa_f16_arena_rows, CopyRegion,
+    GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef, QsaF16ValidLen, QsaKvFormat,
+    QsaStateLayout,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -261,12 +262,25 @@ pub struct GdnGpuState {
     pub conv: GpuTensor,
 }
 
+/// A QSA layer's persistent F16 K/V arena, derived from the layer's F32 K/V
+/// (`HIPFIRE_QWEN4_QSA_F16_ARENA`). `keys` is F16 `[token][width]`, `values`
+/// the block-transposed F16 `[token / 4][width][token % 4]` (the layout
+/// `indexed_attention_kv_f16vb` writes; `width = kv_heads * head_dim`), both
+/// `qsa_f16_arena_rows(full_capacity)` rows. Never snapshot-copied: the next
+/// gathered prefill attend lazily rebuilds invalid rows using the unchanged
+/// converter. `valid_len` counts leading rows equal to `f16(F32 K/V)`.
+pub struct QsaF16Arena {
+    pub keys: GpuTensor,
+    pub values: GpuTensor,
+    pub valid_len: QsaF16ValidLen,
+}
+
 /// A production QSA block.  Full K/V, raw and pooled index buffers have the
 /// max sequence capacity shape; `*_len` fields are active append lengths. The
 /// K/V arenas hold `format`'s rows (`full_row_units` tensor units per token)
 /// and the raw/pooled index keys its `index_dtype`. Under the VMM QSA
-/// backend those four context arenas are VMM owners whose
-/// accessible prefix (`buf.size()`) is only what
+/// backend the context arenas (the optional F16 arena included) are VMM
+/// owners whose accessible prefix (`buf.size()`) is only what
 /// [`Qwen4State::ensure_mapped_capacity`] has mapped; partial/selected
 /// buffers are always fixed allocations.
 pub struct QsaGpuState {
@@ -279,6 +293,8 @@ pub struct QsaGpuState {
     pub partial_keys: GpuTensor,
     pub partial_values: GpuTensor,
     pub selected_indices: GpuTensor,
+    /// Derived F16 K/V (`None` = the gathered attention converts per launch).
+    pub f16_arena: Option<QsaF16Arena>,
     pub full_capacity: usize,
     pub raw_capacity: usize,
     pub pooled_capacity: usize,
@@ -316,45 +332,94 @@ impl QsaGpuState {
         }
     }
 
-    /// The four context arenas, in allocation order.
-    fn context_arenas(&self) -> [&GpuTensor; QSA_CONTEXT_ARENAS] {
+    /// The F16 arena as the attention reads it, `None` without one.
+    pub fn f16_arena_ref(&self) -> Option<QsaF16ArenaRef<'_>> {
+        self.f16_arena.as_ref().map(|arena| QsaF16ArenaRef {
+            keys: &arena.keys,
+            values: &arena.values,
+            valid_len: &arena.valid_len,
+        })
+    }
+
+    /// Leading tokens whose F16 rows are valid against the F32 cache (0
+    /// without an arena).
+    pub fn f16_valid_len(&self) -> usize {
+        self.f16_arena_ref()
+            .map_or(0, |arena| arena.valid(self.full_len))
+    }
+
+    /// Clamp the arena's valid prefix to the F32 cache's committed rows. Every
+    /// path that rewinds `full_len` calls it: rows past the new mark are
+    /// rewritten later without the arena seeing them.
+    pub(crate) fn clamp_f16_valid(&self) {
+        if let Some(arena) = &self.f16_arena {
+            arena.valid_len.clamp(self.full_len);
+        }
+    }
+
+    /// Forget every converted row (reset, or the F32 rows were replaced).
+    pub(crate) fn invalidate_f16_arena(&self) {
+        if let Some(arena) = &self.f16_arena {
+            arena.valid_len.invalidate();
+        }
+    }
+
+
+    /// The context arenas, in allocation order (full K, full V, raw and
+    /// pooled index keys, then the F16 arena's K and V when present).
+    fn context_arenas(&self) -> impl Iterator<Item = &GpuTensor> {
         [
             &self.full_keys,
             &self.full_values,
             &self.raw_index_keys,
             &self.pooled_keys,
         ]
+        .into_iter()
+        .chain(self.f16_arena.iter().flat_map(|arena| [&arena.keys, &arena.values]))
     }
 
-    fn context_arenas_mut(&mut self) -> [ContextArena<'_>; QSA_CONTEXT_ARENAS] {
-        [
+    fn context_arenas_mut(&mut self) -> smallvec::SmallVec<[ContextArena<'_>; 6]> {
+        let mut arenas = smallvec::smallvec![
             ContextArena {
                 tensor: &mut self.full_keys,
                 rows: self.full_capacity,
                 pooled: false,
+                blocks: false,
             },
             ContextArena {
                 tensor: &mut self.full_values,
                 rows: self.full_capacity,
                 pooled: false,
+                blocks: false,
             },
             ContextArena {
                 tensor: &mut self.raw_index_keys,
                 rows: self.raw_capacity,
                 pooled: false,
+                blocks: false,
             },
             ContextArena {
                 tensor: &mut self.pooled_keys,
                 rows: self.pooled_capacity,
                 pooled: true,
+                blocks: false,
             },
-        ]
+        ];
+        if let Some(arena) = &mut self.f16_arena {
+            let rows = qsa_f16_arena_rows(self.full_capacity);
+            for tensor in [&mut arena.keys, &mut arena.values] {
+                arenas.push(ContextArena {
+                    tensor,
+                    rows,
+                    pooled: false,
+                    blocks: true,
+                });
+            }
+        }
+        arenas
     }
 }
 
-/// QSA context arenas per layer: full K, full V, raw and pooled index keys
-/// (the first entries `Qwen4State::new_with_backend` allocates per layer).
-const QSA_CONTEXT_ARENAS: usize = 4;
 
 /// One QSA context arena owner with its row capacity.
 struct ContextArena<'a> {
@@ -362,6 +427,10 @@ struct ContextArena<'a> {
     rows: usize,
     /// One row per `compress` tokens instead of one per token.
     pooled: bool,
+    /// Rows are written in whole four-token blocks (the F16 arena's
+    /// block-transposed V): the mapped prefix covers the covered tokens
+    /// rounded up to four.
+    blocks: bool,
 }
 
 impl ContextArena<'_> {
@@ -537,6 +606,9 @@ pub struct Qwen4StateFormat {
     pub qsa: QsaKvFormat,
     /// GDN recurrent states ([`resolve_gdn_format`]).
     pub gdn: GdnStateFormat,
+    /// Persistent per-layer F16 K/V arenas for the gathered prefill attention
+    /// (`HIPFIRE_QWEN4_QSA_F16_ARENA`, gfx1151; [`resolve_state_format`]).
+    pub qsa_f16_arena: bool,
 }
 
 impl Qwen4StateFormat {
@@ -544,20 +616,33 @@ impl Qwen4StateFormat {
     pub const F32: Self = Self {
         qsa: QsaKvFormat::F32,
         gdn: GdnStateFormat::F32,
+        qsa_f16_arena: false,
     };
+
+    /// The QSA layers' context storage: what admission accounts and the state
+    /// allocates.
+    pub const fn layout(&self) -> QsaStateLayout {
+        QsaStateLayout {
+            kv: self.qsa,
+            f16_arena: self.qsa_f16_arena,
+        }
+    }
 }
 
 /// Both state formats: `kv_request` is `memory.kv_cache`, `state_request`
-/// the `state_quant` load option.
+/// the `state_quant` load option. The exact F16 prefill arena is on by
+/// default only for gfx1151 F32 QSA K/V with head_dim 256.
 pub fn resolve_state_format(
     kv_request: &str,
     state_request: &str,
     gpu: &Gpu,
     config: &Qwen4Config,
 ) -> Result<Qwen4StateFormat, String> {
+    let qsa = resolve_qsa_format(kv_request, gpu, config)?;
     Ok(Qwen4StateFormat {
-        qsa: resolve_qsa_format(kv_request, gpu, config)?,
+        qsa,
         gdn: resolve_gdn_format(state_request, config)?,
+        qsa_f16_arena: rdna_compute::tensor_ops::qsa_f16_arena_enabled(gpu, qsa, config.head_dim),
     })
 }
 
@@ -744,6 +829,8 @@ impl Qwen4StateSnapshotArena {
             mix(layer.partial_keys.numel());
             mix(layer.partial_values.numel());
             mix(layer.selected_indices.buf.size());
+            // The derived arena travels with this owner, but is not copied.
+            mix(layer.f16_arena.as_ref().map_or(0, |arena| arena.keys.numel()));
         }
         mix(state.ple_conv.as_ref().map_or(0, GpuTensor::numel));
         mix(state.hyper_feedback.numel());
@@ -956,6 +1043,19 @@ impl Qwen4State {
                 config.head_dim
             )));
         }
+        let layout = format.layout();
+        if format.qsa_f16_arena && qsa_format != QsaKvFormat::F32 {
+            return Err(StateError::Config(format!(
+                "QSA F16 K/V arena needs exact F32 K/V, not {}",
+                qsa_format.name()
+            )));
+        }
+        if format.qsa_f16_arena && (config.head_dim != 256 || !gpu.arch_caps.is_gfx1151()) {
+            return Err(StateError::Config(format!(
+                "QSA F16 K/V arena needs gfx1151 and head_dim 256, got {} and {}",
+                gpu.arch, config.head_dim
+            )));
+        }
         if max_seq_len == 0 || max_seq_len > config.max_position_embeddings {
             return Err(StateError::InvalidCapacity);
         }
@@ -1038,21 +1138,31 @@ impl Qwen4State {
                             .checked_mul(std::mem::size_of::<i32>())
                             .ok_or(StateError::DimensionOverflow)?;
                         let device = gpu.device_id;
-                        for (index, (elements, dtype)) in [
-                            (full_elements, qsa_format.kv_dtype()),
-                            (full_elements, qsa_format.kv_dtype()),
-                            (raw_elements, qsa_format.index_dtype()),
-                            (pooled_elements, qsa_format.index_dtype()),
-                            (partial_key_elements, DType::F32),
-                            (partial_value_elements, DType::F32),
-                            (selected_bytes, DType::Raw),
-                        ]
-                        .into_iter()
-                        .enumerate()
+                        // The derived F16 K and block-transposed V arenas: whole
+                        // four-token blocks, `full_width` F16 channels per token.
+                        let arena_elements = if layout.f16_arena {
+                            qsa_f16_arena_rows(max_seq_len)
+                                .checked_mul(full_width)
+                                .ok_or(StateError::DimensionOverflow)?
+                        } else {
+                            0
+                        };
+                        // (elements, dtype, context arena: VMM-owned under the VMM backend).
+                        let specs = [
+                            (full_elements, qsa_format.kv_dtype(), true),
+                            (full_elements, qsa_format.kv_dtype(), true),
+                            (raw_elements, layout.index_dtype(), true),
+                            (pooled_elements, layout.index_dtype(), true),
+                            (partial_key_elements, DType::F32, false),
+                            (partial_value_elements, DType::F32, false),
+                            (selected_bytes, DType::Raw, false),
+                            (arena_elements, DType::F16, true),
+                            (arena_elements, DType::F16, true),
+                        ];
+                        for &(elements, dtype, context_arena) in
+                            &specs[..7 + 2 * usize::from(layout.f16_arena)]
                         {
-                            let tensor = if index < QSA_CONTEXT_ARENAS
-                                && backend == Qwen4KvBackend::Vmm
-                            {
+                            let tensor = if context_arena && backend == Qwen4KvBackend::Vmm {
                                 // SAFETY: nothing is mapped; every access is
                                 // bounded by `ensure_mapped_capacity`'s prefix
                                 // (`buf.size()` reports only mapped bytes).
@@ -1104,7 +1214,7 @@ impl Qwen4State {
             .iter()
             .map(|kind| match kind {
                 LayerType::LinearAttention => 2,
-                LayerType::FullAttention => 7,
+                LayerType::FullAttention => 7 + 2 * usize::from(layout.f16_arena),
             })
             .sum::<usize>()
             .checked_add(1 + usize::from(config.ple.is_some()))
@@ -1139,6 +1249,11 @@ impl Qwen4State {
                     let partial_keys = next_tensor();
                     let partial_values = next_tensor();
                     let selected_indices = next_tensor();
+                    let f16_arena = layout.f16_arena.then(|| QsaF16Arena {
+                        keys: next_tensor(),
+                        values: next_tensor(),
+                        valid_len: QsaF16ValidLen::default(),
+                    });
                     qsa.push(QsaGpuState {
                         format: qsa_format,
                         full_row_units,
@@ -1149,6 +1264,7 @@ impl Qwen4State {
                         partial_keys,
                         partial_values,
                         selected_indices,
+                        f16_arena,
                         full_capacity: max_seq_len,
                         raw_capacity: max_seq_len,
                         pooled_capacity,
@@ -1194,7 +1310,10 @@ impl Qwen4State {
                         layer.partial_keys,
                         layer.partial_values,
                         layer.selected_indices,
-                    ] {
+                    ]
+                    .into_iter()
+                    .chain(layer.f16_arena.into_iter().flat_map(|a| [a.keys, a.values]))
+                    {
                         let _ = gpu.free_tensor(tensor);
                     }
                 }
@@ -1278,7 +1397,7 @@ impl Qwen4State {
             .checked_mul(std::mem::size_of::<i32>())?;
         let circular = compress
             .checked_mul(raw_width)?
-            .checked_mul(format.qsa.index_dtype().size())?;
+            .checked_mul(format.layout().index_dtype().size())?;
         let ple = config
             .ple_conv_history_rows()
             .checked_mul(config.hidden_size)?
@@ -1288,7 +1407,7 @@ impl Qwen4State {
             .hc_count
             .checked_mul(config.hidden_size)?
             .checked_mul(f32_bytes)?;
-        let context_arenas = context.committed_layer_bytes(config, format.qsa)?;
+        let context_arenas = context.committed_layer_bytes(config, format.layout())?;
         // Live state plus the snapshot arena's mirror of each in-place part.
         let gdn_layer = recurrent.checked_add(conv)?.checked_mul(2)?;
         let qsa_fixed = partial_keys
@@ -1322,6 +1441,8 @@ impl Qwen4State {
         // VMM context arenas expose only their mapped prefix: nothing past
         // it exists to clear.
         for layer in &mut self.qsa {
+            // Invalidate before the first write, including a failed reset.
+            layer.invalidate_f16_arena();
             for tensor in [
                 &layer.full_keys,
                 &layer.full_values,
@@ -1392,8 +1513,18 @@ impl Qwen4State {
         let max_tokens = self.max_seq_len;
         let mut covered = max_tokens;
         for layer in &mut self.qsa {
+            // Growth replaces only the owner's exposed prefix view, not
+            // existing mappings. Pool drain/retry reclaims free buffers,
+            // never live VMM owners; keep only the committed valid prefix.
+            layer.clamp_f16_valid();
             for arena in layer.context_arenas_mut() {
                 let rows = required_tokens.div_ceil(arena.tokens_per_row(compress));
+                // The F16 V arena writes whole four-token blocks.
+                let rows = if arena.blocks {
+                    qsa_f16_arena_rows(rows).min(arena.rows)
+                } else {
+                    rows
+                };
                 let mapped_rows =
                     grow_context_arena(gpu, arena.tensor, arena.rows, rows, device)?;
                 covered = covered.min(qsa_covered_tokens(
@@ -1725,6 +1856,7 @@ impl Qwen4State {
         self.ensure_mapped_capacity(gpu, required)?;
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
+        self.invalidate_f16_arenas();
         self.session_layout(&marks)
     }
 
@@ -1739,6 +1871,8 @@ impl Qwen4State {
             layer.partial_len = mark.partial_len;
             layer.selected_len = mark.selected_len;
             layer.position = mark.position;
+            // The restored bytes replaced all F32 rows; rebuild lazily.
+            layer.invalidate_f16_arena();
         }
         self.ple_history = ple;
         self.position = position;
@@ -1835,6 +1969,7 @@ impl Qwen4State {
                 layer.partial_len = mark.partial_len;
                 layer.selected_len = mark.selected_len;
                 layer.position = mark.position;
+                layer.clamp_f16_valid();
             }
             self.ple_history = arena.ple_history;
             self.position = arena.position;
@@ -1911,6 +2046,7 @@ impl Qwen4State {
             free(layer.conv);
         }
         for layer in self.qsa {
+            layer.invalidate_f16_arena();
             free(layer.full_keys);
             free(layer.full_values);
             free(layer.raw_index_keys);
@@ -1918,6 +2054,10 @@ impl Qwen4State {
             free(layer.partial_keys);
             free(layer.partial_values);
             free(layer.selected_indices);
+            if let Some(arena) = layer.f16_arena {
+                free(arena.keys);
+                free(arena.values);
+            }
         }
         if let Some(ple_conv) = self.ple_conv {
             free(ple_conv);
@@ -2255,6 +2395,7 @@ impl Qwen4State {
                 - complete * compress)
                 .min(layer.selected_capacity);
             layer.position = position;
+            layer.clamp_f16_valid();
         }
         let mut history = arena.ple_history;
         for &token in &tokens[..keep] {
@@ -2264,6 +2405,24 @@ impl Qwen4State {
         self.position = start + keep;
         Ok(())
     }
+
+    /// Invalidate derived rows before replacing F32 storage, or after a
+    /// failed forward whose append may not have committed.
+    pub(crate) fn invalidate_f16_arenas(&self) {
+        for layer in &self.qsa {
+            layer.invalidate_f16_arena();
+        }
+    }
+
+    /// Clamp every F16 arena's valid prefix to its layer's committed rows (a
+    /// forward failed after its attention converted rows the marks never
+    /// committed).
+    pub fn clamp_f16_valid(&self) {
+        for layer in &self.qsa {
+            layer.clamp_f16_valid();
+        }
+    }
+
     pub fn qsa_mut(&mut self, full_layer_index: usize) -> Option<&mut QsaGpuState> {
         self.qsa.get_mut(full_layer_index)
     }
@@ -2387,6 +2546,29 @@ impl std::error::Error for StateError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f16_arena_bytes_are_counted_for_legacy_and_vmm_states() {
+        let config = crate::config::compact_test_config();
+        let arena = Qwen4StateFormat { qsa_f16_arena: true, ..Qwen4StateFormat::F32 };
+        for backend in [Qwen4KvBackend::Legacy, Qwen4KvBackend::Vmm] {
+            let context = Qwen4ContextCommit::new(backend, 8193, 1025, 2 << 20);
+            let plain = context.committed_layer_bytes(&config, QsaKvFormat::F32).unwrap();
+            let with = context.committed_layer_bytes(&config, arena.layout()).unwrap();
+            assert!(with > plain);
+            assert_eq!(
+                Qwen4State::device_bytes(&config, arena, &context).unwrap()
+                    - Qwen4State::device_bytes(&config, Qwen4StateFormat::F32, &context).unwrap(),
+                (with - plain) * config.n_full_layers(),
+            );
+            let logical = config.qsa_context_arena_bytes(8193, arena.layout()).unwrap()
+                - config.qsa_context_arena_bytes(8193, QsaKvFormat::F32).unwrap();
+            assert_eq!(logical, 8196 * arena.layout().f16_arena_bytes_per_token(2, 256));
+            if backend == Qwen4KvBackend::Legacy {
+                assert_eq!(with - plain, logical);
+            }
+        }
+    }
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok().or_else(|| {
@@ -2787,6 +2969,7 @@ mod tests {
             let format = Qwen4StateFormat {
                 qsa,
                 gdn: GdnStateFormat::F32,
+                ..Qwen4StateFormat::F32
             };
             let owners = gpu.vmm_allocation_count();
             let legacy =
@@ -2865,6 +3048,7 @@ mod tests {
         let format = Qwen4StateFormat {
             qsa: QsaKvFormat::F32,
             gdn: GdnStateFormat::Q8,
+            ..Qwen4StateFormat::F32
         };
         let s = config.max_position_embeddings;
         let layers = config.n_full_layers();

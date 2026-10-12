@@ -4551,7 +4551,7 @@ impl Qwen4GpuForward {
                 ))
             })?;
         if gpu.route_rows(n) >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
-            if let Some(qsa) = bundle.state.qsa.first() {
+            if let Some(qsa) = bundle.state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
                 rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
                     gpu,
                     qsa.format,
@@ -4917,6 +4917,8 @@ impl Qwen4GpuForward {
                             raw_index_keys: &state.raw_index_keys,
                             pooled_keys: &state.pooled_keys,
                             selected_indices: &state.selected_indices,
+                            // Decode and speculative verify never consume the arena.
+                            f16_arena: if self.prefill_scope { state.f16_arena_ref() } else { None },
                             full_capacity: state.full_capacity,
                             raw_capacity: state.raw_capacity,
                             pooled_capacity: state.pooled_capacity,
@@ -5674,6 +5676,7 @@ impl Qwen4GpuForward {
                     state.pooled_len = pooled_len;
                     state.selected_len = selected_len;
                     state.position = position;
+                    state.clamp_f16_valid();
                 }
                 let mut next_history = next_history;
                 for token in tokens.iter().copied() {
@@ -5714,6 +5717,7 @@ impl Qwen4GpuForward {
                 Ok(())
             }
             Err(error) => {
+                bundle.state.invalidate_f16_arenas();
                 // A staged forward that failed before its join may have left
                 // a donor overwritten; nothing may read it until restored.
                 let error = match self.expert_stage.as_ref().map(|stage| stage.restore_blocking(gpu)) {

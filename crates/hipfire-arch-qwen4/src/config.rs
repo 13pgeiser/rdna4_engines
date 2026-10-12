@@ -1610,22 +1610,31 @@ impl Qwen4Config {
         self.indexer_budget + self.indexer_compress_ratio.saturating_sub(1)
     }
 
-    /// Bytes of one QSA layer's context-sized arenas at `max_seq` in
-    /// `format`: full K and V rows, raw index keys, and pooled index keys.
-    /// The trunk has `n_full_layers()` of these and an attached MTP head one
-    /// more (always F32).
+    /// Bytes of one QSA layer's context-sized storage, including its
+    /// optional derived F16 arena (four-token-rounded capacity). The MTP
+    /// head passes its plain F32 format and never owns the derived arena.
     pub fn qsa_context_arena_bytes(
         &self,
         max_seq: usize,
-        format: rdna_compute::tensor_ops::QsaKvFormat,
+        layout: impl Into<rdna_compute::tensor_ops::QsaStateLayout>,
     ) -> Option<usize> {
+        let layout = layout.into();
+        let format = layout.kv;
         let kv_row = format.kv_row_bytes(self.num_key_value_heads, self.head_dim);
         let raw = self.indexer_kv_heads.checked_mul(self.indexer_head_dim)?;
         let index_row = raw.checked_mul(format.index_dtype().size())?;
         let pooled_rows = max_seq.div_ceil(self.indexer_compress_ratio);
         max_seq
             .checked_mul(kv_row.checked_mul(2)?.checked_add(index_row)?)?
-            .checked_add(pooled_rows.checked_mul(index_row)?)
+            .checked_add(pooled_rows.checked_mul(index_row)?)?
+            .checked_add(if layout.f16_arena {
+                max_seq.div_ceil(4).checked_mul(4)?
+                    .checked_mul(self.num_key_value_heads)?
+                    .checked_mul(self.head_dim)?
+                    .checked_mul(4)?
+            } else {
+                0
+            })
     }
 }
 
