@@ -249,6 +249,47 @@ fn route_receipt(gpu: &Gpu, config: &Qwen35Config, bundle: &Qwen35Bundle, max_se
     })
 }
 
+/// Post-init device identity gate, the same check the daemon runs in
+/// `reserve_and_verify_gpus` (`hipfire-daemon/src/main.rs`): observe every
+/// HIP-visible logical device from the live runtime of the initialized `Gpu`
+/// and require `hipfire_config::devices::active_devices()` (the cards
+/// `HIPFIRE_DEVICES` resolved) to `verify_visible` them (arch + PCI bus ID).
+/// Only on success is the daemon's `[devices] verified ...` line printed.
+/// Errors when no `HIPFIRE_DEVICES` selection is active: nothing to verify.
+fn verify_devices(gpu: &Gpu) -> Result<()> {
+    use hipfire_config::devices::{DeviceRoot, IdentitySource, ObservedDevice};
+    let active = hipfire_config::devices::active_devices()
+        .ok_or("no active HIPFIRE_DEVICES selection: set HIPFIRE_DEVICES so the GPU can be verified")?;
+    let with_uuid = DeviceRoot::system().identity_source() == IdentitySource::Hip;
+    let count = gpu.hip.device_count()?;
+    if count < 1 {
+        return Err("no visible GPUs to verify".into());
+    }
+    let observed = (0..count)
+        .map(|id| -> Result<ObservedDevice> {
+            Ok(ObservedDevice {
+                logical: id as usize,
+                arch: gpu.hip.get_arch(id)?,
+                pci_bus_id: gpu.hip.device_pci_bus_id(id)?,
+                uuid: if with_uuid { Some(gpu.hip.device_uuid(id)?) } else { None },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    active.verify_visible(&observed)?;
+    for (seen, device) in observed.iter().zip(&active.devices) {
+        eprintln!(
+            "[devices] verified logical {}: HIP {} {} = index {} {} rocr={}",
+            seen.logical,
+            seen.arch,
+            seen.pci_bus_id,
+            device.index,
+            device.lock_identity(),
+            device.rocr_selector()
+        );
+    }
+    Ok(())
+}
+
 fn run(raw: &[String]) -> Result<()> {
     let t0 = Instant::now();
     let args = Args::parse(raw)?;
@@ -273,6 +314,7 @@ fn run(raw: &[String]) -> Result<()> {
     let prompt_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
 
     let mut gpu = Gpu::init()?;
+    verify_devices(&gpu)?;
     let bundle = load_bundle(&model, max_seq, &mut gpu)?;
     let load_ms = t0.elapsed().as_secs_f64() * 1e3;
     let mut bundle = bundle;
