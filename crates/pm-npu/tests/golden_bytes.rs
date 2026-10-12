@@ -103,3 +103,12 @@ fn g80_legacy_bytes_match_golden() {
         }
     }
 }
+
+#[test]
+fn g80_bf16_native_bytes_match_golden() {
+    for (m, hashes) in [(256, (0x0f0957038d4177ef, 0x2cc33282387023c1)),
+        (8192, (0x3140db0e2c87154f, 0x6dc4a91db3ec53db))] {
+        let d = pm_npu::kernels::gemm_g80::design_g80(m, 1280, 2560, Epilogue::Bf16, Control::Fast);
+        assert_eq!((fnv(&d.pdi), fnv(&d.insts)), hashes, "G80 BF16 native {m} bytes changed");
+    }
+}

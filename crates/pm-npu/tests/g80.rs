@@ -1449,3 +1449,103 @@ fn g80_bf16_multiple_k2560_waves_reuse() {
             &bf16_scales(m, seed), &bf16_scales(N, seed + 3));
     }
 }
+
+#[test]
+fn g80_bf16_rowmajor_poison_traffic_cycles_and_reuse() {
+    use pm_npu::kernels::gemm_g80::{design_g80_bf16_layout, Bf16Layout, pack_a_bf16, pack_b_bf16};
+    use pm_npu::kernels::w8a8_epi::bf16_direct;
+    for (m, k, pitch, col0) in [(200, 64, 2624, 32), (513, 64, 16640, 1280),
+        (200, 2560, 14080, 2560), (300, 2560, 2624, 32)] {
+        let native = design_g80(m, N, k, Epilogue::Bf16, Control::Fast);
+        let d = design_g80_bf16_layout(m, N, k, Epilogue::Bf16, Control::Fast,
+            Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 });
+        assert_eq!(d.host_bytes_written(), native.host_bytes_written());
+        assert_eq!(d.estimate(1_000_000_000).estimated_cycles, native.estimate(1_000_000_000).estimated_cycles);
+        let mut sim = fresh(&d);
+        let lean = d.lean_insts().unwrap();
+        for seed in 0..2 {
+            let (a, b) = pattern_b(m, k, seed != 0);
+            let ds = bf16_scales(m, seed); let ss = bf16_scales(N, seed + 3);
+            let raw = cpu_reference(&a, &b, m, N, k);
+            let mut expected = vec![POISON; d.args[2].bytes];
+            for row in 0..d.waves() * WAVE_M { for col in 0..N {
+                let bits = if row < m {
+                    let (sm, se) = ss[col]; let (dm, de) = ds[row];
+                    bf16_direct(raw[row * N + col], sm, se, dm, de)
+                } else { 0 };
+                let off = 2 * (row * pitch + col0 + col);
+                expected[off..off + 2].copy_from_slice(&bits.to_le_bytes());
+            } }
+            let mut args = vec![pack_a_bf16(&d, &a, &ds), pack_b_bf16(&d, &b, &ss), vec![POISON; d.args[2].bytes]];
+            let before_inputs = [signature(&args[0]), signature(&args[1])];
+            let before = traffic(&sim); let start = sim.ticks;
+            sim.submit(if seed == 0 { &d.insts } else { &lean }, &mut args).unwrap();
+            assert_eq!(args[2], expected, "rowmajor complete poison arena M={m} K={k} seed={seed}");
+            assert_eq!([signature(&args[0]), signature(&args[1])], before_inputs);
+            for (&(col, dir, ch, was), (_, _, _, now)) in before.iter().zip(traffic(&sim)) {
+                let expected = match (dir, ch) {
+                    (Direction::Mm2s, 0) => k / 64 * 2 * 5504,
+                    (Direction::Mm2s, 1) => if col < 4 { d.waves() * k / 64 * 4608 } else { 0 },
+                    (Direction::S2mm, 0 | 1) => d.waves() * 2 * 20480,
+                    _ => panic!("unexpected shim channel"),
+                };
+                assert_eq!(now - was, expected as u64);
+            }
+            if seed == 0 {
+                let tile_ticks = submit_bf16(&mut fresh(&native), &native, &native.insts, m, k, &a, &b, &ds, &ss);
+                eprintln!("rowmajor {m}x{N}x{k} pitch={pitch}: {} modelled ticks vs native {tile_ticks}", sim.ticks - start);
+            }
+        }
+    }
+}
+
+#[test]
+fn g80_bf16_rowmajor_adjacent_panels_one_design_base_offset() {
+    use pm_npu::kernels::gemm_g80::{design_g80_bf16_layout, Bf16Layout, pack_a_bf16, pack_b_bf16};
+    use pm_npu::kernels::w8a8_epi::bf16_direct;
+    let (m, k, pitch, col0) = (300, 64, 2 * N + 64, 32);
+    let d = design_g80_bf16_layout(m, N, k, Epilogue::Bf16, Control::Fast,
+        Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: 0 });
+    let (a, b0) = pattern_b(m, k, false); let (_, b1) = pattern_b(m, k, true);
+    let ds = bf16_scales(m, 0);
+    let mut ah = Vec::new(); let mut bh = Vec::new();
+    let mut expected = vec![POISON; d.args[2].bytes + GAP];
+    let mut txn = Txn::aie2p_8col();
+    for (panel, b) in [&b0, &b1].into_iter().enumerate() {
+        let ss = bf16_scales(N, panel + 3);
+        let base = [ah.len() as u64, bh.len() as u64, (2 * (col0 + panel * N)) as u64];
+        ah.extend(pack_a_bf16(&d, &a, &ds)); bh.extend(pack_b_bf16(&d, b, &ss));
+        if panel == 0 { d.append_run_body(&mut txn, base); }
+        else { d.append_lean_run_body_same_design(&mut txn, base, &[]).unwrap(); }
+        let raw = cpu_reference(&a, b, m, N, k);
+        for row in 0..d.waves() * WAVE_M { for col in 0..N {
+            let bits = if row < m {
+                let (sm, se) = ss[col]; let (dm, de) = ds[row];
+                bf16_direct(raw[row * N + col], sm, se, dm, de)
+            } else { 0 };
+            let off = 2 * (row * pitch + col0 + panel * N + col);
+            expected[off..off + 2].copy_from_slice(&bits.to_le_bytes());
+        } }
+    }
+    let mut args = vec![ah, bh, vec![POISON; expected.len()]];
+    let mut sim = fresh(&d);
+    sim.submit(&txn.to_bytes(), &mut args).unwrap();
+    assert_eq!(args[2], expected, "adjacent panels and trailing guard");
+    let read: u64 = traffic(&sim).iter().filter(|s| s.1 == Direction::Mm2s).map(|s| s.3).sum();
+    let written: u64 = traffic(&sim).iter().filter(|s| s.1 == Direction::S2mm).map(|s| s.3).sum();
+    assert_eq!([read, written], [2 * d.host_bytes_read(), 2 * d.host_bytes_written()]);
+}
+
+#[test]
+fn g80_bf16_rowmajor_builder_bounds() {
+    use pm_npu::kernels::gemm_g80::build_panel_program_rowmajor;
+    for (rows, pitch, col0) in [(0, 16640, 0), (65537, 16640, 0),
+        (256, 1278, 0), (256, 16641, 0), (256, 16640, 1), (256, 16640, 16640)] {
+        assert!(build_panel_program_rowmajor(rows, pitch, col0).is_err());
+    }
+    for pitch in [14080, 16640] {
+        let d = build_panel_program_rowmajor(65536, pitch, 0).unwrap();
+        assert_eq!(d.args[2].bytes, 65536 * pitch * 2);
+        assert_eq!(d.waves(), 256);
+    }
+}

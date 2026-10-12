@@ -174,6 +174,28 @@ pub const WAVE_N: usize = array::G80_WAVE_N;
 const _: () = assert!(WAVE_M == 256 && WAVE_N == 1280 && A_COLS == 4 && A_HALF_BYTES == 4096 && B_BYTES == 5120);
 const _: () = assert!(COUT_BYTES == 10240 && MB == 16 && NB == 10 && KB == 8 && ROWS == 4 && COLS == 8);
 
+/// Host BF16 destination. Strides and starting columns must be even because
+/// AIE2P DMA addresses pairs of BF16 elements as 32-bit words.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Bf16Layout {
+    #[default]
+    NativeTiles,
+    RowMajor { pitch_elems: usize, col0_elems: usize },
+}
+
+impl Bf16Layout {
+    fn validate(self, padded_rows: usize) -> Result<(), String> {
+        if let Self::RowMajor { pitch_elems: pitch, col0_elems: col0 } = self {
+            if pitch % 2 != 0 || col0 % 2 != 0 || pitch / 2 > 1 << 20 ||
+                col0.checked_add(WAVE_N).is_none_or(|end| end > pitch) ||
+                padded_rows.checked_mul(pitch).and_then(|n| n.checked_mul(2)).is_none() {
+                return Err(format!("BF16 row-major needs even pitch/col0, col0+1280 <= pitch <= {}, and a representable arena", 2 << 20));
+            }
+        }
+        Ok(())
+    }
+}
+
 // Memtile map (byte offsets, see the module header).
 const C_OFF: u32 = 0x4000;
 const C_SLOT_STRIDE: u32 = 0xa000;
@@ -341,6 +363,16 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
             v.push((C_S2MM_BD[r][0], producer));
             let id = C_DRAIN_BD0[r / 2] + (r % 2) as u32;
             let mut drain = Bd::new(addr as u64, words);
+            if topo.bf16_rowmajor().is_some() {
+                // Native (mb, nb, i, pair) -> rows (mb, i, nb, pair),
+                // retaining the exact same 5120 stream words and shared stage.
+                drain.dims = [
+                    crate::dma::Dim { step: 1, wrap: 4 },
+                    crate::dma::Dim { step: 32, wrap: 10 },
+                    crate::dma::Dim { step: 4, wrap: 8 },
+                    crate::dma::Dim { step: 320, wrap: 0 },
+                ];
+            }
             drain.locks = BdLocks {
                 acq: Some((array::MEM_LOCK + c_lock(0, r) + 1, -1)),
                 rel: Some((array::MEM_LOCK + c_lock(0, r ^ 1), 1)),
@@ -487,6 +519,12 @@ pub(crate) fn unpack_c(geo: &Geometry, output: &[u8]) -> Vec<i32> {
     check_geometry(geo);
     assert_eq!(output.len(), geo.c_bytes(), "C stream size");
     let i32_tiles = is_i32(geo.topo);
+    if let Some((pitch, col0)) = geo.topo.bf16_rowmajor() {
+        return (0..geo.m).flat_map(|row| (0..geo.n).map(move |col| {
+            let off = 2 * (row * pitch + col0 + col);
+            i32::from(u16::from_le_bytes(output[off..off + 2].try_into().unwrap()))
+        })).collect();
+    }
     let mut c = vec![0i32; geo.m * geo.n];
     for col in 0..COLS { for w in 0..geo.waves { for rho in 0..ROWS {
         let m0 = w * WAVE_M + (rho / 2) * TM;
@@ -596,6 +634,12 @@ pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEsti
 /// rows per wave with at most 256 waves, int8 (`shift <=31`), I32 or direct BF16, and `Probe::layout ==0`.
 /// BF16 requires ordinary compute, no timing-only probe. Invalid shapes panic before any emitted byte.
 pub fn design_g80(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control) -> ArrayDesign {
+    design_g80_bf16_layout(m, n, k, epi, ctl, Bf16Layout::NativeTiles)
+}
+
+/// G80 builder with an explicit BF16 destination; other epilogues require native tiles.
+pub fn design_g80_bf16_layout(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control, layout: Bf16Layout) -> ArrayDesign {
+    assert!(epi == Epilogue::Bf16 || layout == Bf16Layout::NativeTiles, "row-major is BF16-only");
     if let Epilogue::Int8 { shift } = epi { assert!(shift <= 31, "G80 SRS shift {shift} exceeds 31"); }
     assert_eq!(ctl.probe().layout, 0, "G80 has one fixed data-memory map; Probe::layout={} is not defined", ctl.probe().layout);
     assert!(m > 0, "G80 needs M >= 1");
@@ -604,7 +648,9 @@ pub fn design_g80(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control) -> 
         "G80 K must be a multiple of {CHUNK_K} in {CHUNK_K}..={}, got {k}", g80_core::MAX_KC * CHUNK_K);
     let waves = m.div_ceil(WAVE_M);
     assert!(waves <= MAX_WAVES, "G80 M={m} needs {waves} waves, exceeding {MAX_WAVES}");
-    let geo = Geometry::g80(m, n, k, epi, ctl);
+    layout.validate(waves * WAVE_M).unwrap_or_else(|e| panic!("{e}"));
+    let mut geo = Geometry::g80(m, n, k, epi, ctl);
+    if let Kind::G80 { bf16_layout, .. } = &mut geo.topo.kind { *bf16_layout = layout; }
     let topo = geo.topo;
     let program = |role| g80_core::program_pair(geo.kc, geo.waves, role, epi, ctl).finish();
     let (lower, upper) = (program(PairRole::Lower), program(PairRole::Upper));
@@ -635,6 +681,20 @@ pub fn build_panel_program(rows_max: usize, epilogue: Epilogue) -> Result<ArrayD
         return Err(format!("G80 rows_max {rows_max} outside 1..={}", 256 * WAVE_M));
     }
     Ok(design_g80(rows_max.div_ceil(WAVE_M) * WAVE_M, WAVE_N, 2560, epilogue, Control::Fast))
+}
+
+/// K2560 BF16 panel into a fused row-major arena (M padded to 256).
+/// Build once with col0=0 and advance arg2's base by `panel_col0 * 2`
+/// through `append_run_body` / `append_lean_run_body` for every panel.
+/// The caller must retain the full arena allocation behind that offset.
+pub fn build_panel_program_rowmajor(rows_max: usize, pitch: usize, col0: usize) -> Result<ArrayDesign, String> {
+    if !(1..=256 * WAVE_M).contains(&rows_max) {
+        return Err(format!("G80 rows_max {rows_max} outside 1..={}", 256 * WAVE_M));
+    }
+    let rows = rows_max.div_ceil(WAVE_M) * WAVE_M;
+    let layout = Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 };
+    layout.validate(rows)?;
+    Ok(design_g80_bf16_layout(rows, WAVE_N, 2560, Epilogue::Bf16, Control::Fast, layout))
 }
 
 /// BF16 activation stream. Each K64 E/O half has 4096 code bytes followed

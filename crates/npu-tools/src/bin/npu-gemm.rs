@@ -10,7 +10,7 @@
 //!        npu-gemm M N K --variant V1|V2|V3|V4|V5|V6|V6b [--core Fast|Serial|LockOnly|FastSlowCtl|ClockProbe] [--probe-iters N] [--iters I] [--timeout-ms T] [--dump-status]
 //!        npu-gemm M N K --variant V8|V9|V10 [--epi i32|int8] [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]
 //!        ... [--memory native|vmm-host|vmm-host-uncached] [--burst 0..3] [--axcache 0..15] [--axqos 0..15]
-//!        npu-gemm M 1280 K --variant G80 [--epi i32|int8|bf16] [--shift S] [--core Fast|FastSlowCtl] [--iters I] [--reuse-ctx] [--timeout-ms T] (BF16 accepts grid15-up sidecars; simulator-only arithmetic until silicon validation).
+//!        npu-gemm M 1280 K --variant G80 [--epi i32|int8|bf16] [--rowmajor-pitch P --rowmajor-col0 C0] [--shift S] [--core Fast|FastSlowCtl] [--iters I] [--reuse-ctx] [--timeout-ms T].
 //!        npu-gemm M N K --variant V10 --b-prefix [same V8|V9|V10 options]             (B prefix mode; V10 only)
 //!        npu-gemm TOKENS FEATURES K --fold-contract ief15 [--iters N] [--loop SECS] [--reuse-ctx] [--lean] [--switch-with T2,F2,K2] [--timeout-ms T] [--dump-status]   (IEF15 N0 probe; K a multiple of 128 with 1..=136 epochs)
 //!        npu-gemm --ief15-probe [--col C] [--timeout-ms T] [--dump PATH] [--dump-status] [--expected-only]   (IEF15 N0 single-core semantics probe: expected bytes from the simulator running the exact PDI+TXN, one fresh-context submit, per-case MATCH/MISMATCH table; `--expected-only` never touches the hardware)
@@ -62,7 +62,7 @@
 //! same `--core`/`--ctl-probe`/`--a-from-hip`/`--reuse-ctx`/`--loop` controls as V8). It takes `--epi int8` (default,
 //! `--shift S`) or `--epi i32` (exact int32 C) or `--epi bf16` (integer exact-product, single RNE).
 //! I32/BF16 reject `--shift`. BF16 uses deterministic grid scales and compares every checked output
-//! against `w8a8_epi::bf16_direct`; it has simulator evidence only, not silicon validation.
+//! against `w8a8_epi::bf16_direct`. Row-major additionally checks zero padded rows and untouched poison outside the panel window.
 //! `--variant V10` is the mw-outer both-operands-resident design (`gemm_array::design_v10`, same pair core and
 //! compact C as V9, dynamic TXN, context reusable): the whole B segment (`NW*kc*4096` words per row) stays resident in
 //! the memtile and is replayed for every M-wave while A is streamed per M-wave (wave order `w = mw*NW + nw`), so each
@@ -113,7 +113,6 @@
 //! TOPS is useful ops over summed submit -> completion time, wall TOPS over the wall clock including host verification.
 use railgun::npu::hip_runtime::{HipDmabufA, HipMemoryKind};
 use pm_npu::kernels::gemm_array::{design_v10, design_v10_prefix, design_v8, design_v9, design_variant_probe, Variant};
-use pm_npu::kernels::gemm_g80::design_g80;
 use pm_npu::kernels::gemm_core::{clock_probe_cycles_per_iter, Control, CoreVariant, Epilogue, Probe};
 use pm_npu::kernels::gemm_i8::{cpu_reference, design, ArgKind};
 use pm_npu::kernels::iu4::{self, EpochGemm};
@@ -490,6 +489,23 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         eprintln!("--epi/--shift are only valid with --variant V8, V9, V10 or G80");
         std::process::exit(2)
     } else { None };
+    let rowmajor = opt_str(args, "--rowmajor-pitch").map(|p| {
+        let parse = |name: &str, value: &str| value.parse::<usize>().unwrap_or_else(|_| {
+            eprintln!("{name} needs an unsigned integer"); std::process::exit(2)
+        });
+        let pitch = parse("--rowmajor-pitch", p);
+        let col0 = parse("--rowmajor-col0", opt_str(args, "--rowmajor-col0").unwrap_or("0"));
+        if epi != Some(Epilogue::Bf16) || pitch % 2 != 0 || col0 % 2 != 0 ||
+            pitch / 2 > 1 << 20 || col0.checked_add(1280).is_none_or(|end| end > pitch) ||
+            m.div_ceil(256).checked_mul(256).and_then(|r| r.checked_mul(pitch)).and_then(|n| n.checked_mul(2)).is_none() {
+            eprintln!("row-major needs G80 BF16, even pitch/col0, col0+1280 <= pitch <= {}, and a representable arena", 2 << 20);
+            std::process::exit(2)
+        }
+        pm_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }
+    });
+    if rowmajor.is_none() && opt_str(args, "--rowmajor-col0").is_some() {
+        eprintln!("--rowmajor-col0 requires --rowmajor-pitch"); std::process::exit(2)
+    }
     let a_from_hip = args.iter().any(|a| a == "--a-from-hip");
     let memory = opt_str(args, "--memory").map(|s| {
         if !pair || a_from_hip {
@@ -594,7 +610,7 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
             iu4_io = Some((g.padded(&partials), g.pack_in(&w, &x), g.useful_ops()));
             g.design
         }
-        Some(epi) if g80 => design_g80(m, n, k, epi, control),
+        Some(epi) if g80 => pm_npu::kernels::gemm_g80::design_g80_bf16_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
         Some(epi) if v10 && b_prefix => design_v10_prefix(m, n, k, epi, control),
         Some(epi) if v10 => design_v10(m, n, k, epi, control),
         Some(epi) if v9 => design_v9(m, n, k, epi, control),
@@ -755,7 +771,17 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         if got.len() != want.len() {
             return (usize::MAX, got.first().map_or(0, |v| *v).to_string());
         }
-        (got.iter().zip(&want).filter(|(g, w)| g != w).count(), got[0].to_string())
+        let outside_bad = if let Some(pm_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
+            bos[out_idx].as_slice().chunks_exact(2).enumerate().filter(|(at, bytes)| {
+                let col = at % pitch;
+                (col < col0 || col >= col0 + n) && bytes.iter().any(|&b| b != 0xA5)
+            }).count()
+        } else { 0 };
+        let padding_bad = if let Some(pm_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
+            (m..d.waves() * 256).flat_map(|row| (0..n).map(move |col| 2 * (row * pitch + col0 + col)))
+                .filter(|&off| bos[out_idx].as_slice()[off..off + 2] != [0, 0]).count()
+        } else { 0 };
+        (got.iter().zip(&want).filter(|(g, w)| g != w).count() + outside_bad + padding_bad, got[0].to_string())
     };
     let fmt_bad = |bad: usize| {
         if timing_only {

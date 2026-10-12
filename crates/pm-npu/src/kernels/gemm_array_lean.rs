@@ -497,7 +497,7 @@ impl ArrayDesign {
         emit_shim_at(txn, geo, arena_base, shim_bd_words, b_resident);
         // 8. cores last, then wait for the C tokens.
         for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1); }
-        emit_sync(txn, topo, false);
+        emit_output_tail(txn, geo, false, arena_base[2]);
         Ok(())
     }
 }

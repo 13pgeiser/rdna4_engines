@@ -547,7 +547,7 @@ pub(crate) enum Kind {
     Pair { epi: Epilogue, ctl: Control, resident: Option<Resident> },
     /// G80: the V8 pair structure on the 128x80 core ([`gemm_core_g80`], int8 or i32 epilogue). `kc` K64 chunks per tile and
     /// `mw` M-waves fix the memtile B segments and replay counts (N is always one wave of 1280 columns).
-    G80 { epi: Epilogue, ctl: Control, kc: usize, mw: usize },
+    G80 { epi: Epilogue, ctl: Control, kc: usize, mw: usize, bf16_layout: gemm_g80::Bf16Layout },
     /// IEF15 ([`iu4_ief15`]): the V8 pair structure and memtile map on the 64x32 [`iu4_ief15_core`] tile (A/B chunks of 2176 B
     /// per K128 epoch, f32 `Cout` of 8192 B). `epochs` K128 epochs and `mw` x `nw` waves of 256 x 256 fix the host segments.
     Ief15 { ctl: Control, epochs: usize, mw: usize, nw: usize },
@@ -569,12 +569,19 @@ impl Topo {
     }
     /// G80 topology: `kc` K64 chunks, `mw` M-waves of 256 rows; one N wave of 1280 columns.
     pub(crate) fn g80(epi: Epilogue, ctl: Control, kc: usize, mw: usize) -> Topo {
-        Topo { rows: ROWS, cols: COLS, kind: Kind::G80 { epi, ctl, kc, mw } }
+        Topo { rows: ROWS, cols: COLS, kind: Kind::G80 { epi, ctl, kc, mw, bf16_layout: gemm_g80::Bf16Layout::NativeTiles } }
     }
     pub(crate) fn is_g80(self) -> bool { matches!(self.kind, Kind::G80 { .. }) }
     /// G80 with the raw i32 epilogue (finite two-stripe C tasks, no C wave-parity state).
     pub(crate) fn is_g80_i32(self) -> bool { matches!(self.kind, Kind::G80 { epi: Epilogue::I32, .. }) }
     pub(crate) fn is_g80_bf16(self) -> bool { matches!(self.kind, Kind::G80 { epi: Epilogue::Bf16, .. }) }
+    pub(crate) fn bf16_rowmajor(self) -> Option<(usize, usize)> {
+        match self.kind {
+            Kind::G80 { epi: Epilogue::Bf16, bf16_layout: gemm_g80::Bf16Layout::RowMajor { pitch_elems, col0_elems }, .. } =>
+                Some((pitch_elems, col0_elems)),
+            _ => None,
+        }
+    }
     /// IEF15 topology: `epochs` K128 epochs, `mw` x `nw` waves of 256 tokens x 256 features.
     pub(crate) fn ief15(ctl: Control, epochs: usize, mw: usize, nw: usize) -> Topo {
         Topo { rows: ROWS, cols: COLS, kind: Kind::Ief15 { ctl, epochs, mw, nw } }
@@ -687,7 +694,10 @@ impl Geometry {
         a_cols * self.a_segment_bytes()
     }
     pub(crate) fn b_bytes(&self) -> usize { self.topo.cols * self.b_segment_bytes() }
-    pub(crate) fn c_bytes(&self) -> usize { self.topo.cols * self.c_segment_bytes() }
+    pub(crate) fn c_bytes(&self) -> usize {
+        if let Some((pitch, _)) = self.topo.bf16_rowmajor() { self.waves * G80_WAVE_M * pitch * 2 }
+        else { self.topo.cols * self.c_segment_bytes() }
+    }
 
     /// V8 tile `(m offset, n offset)` inside a wave of core `(col, rho)`: A block `2*(rho/2) + col%2`, B block
     /// `col/2`, 64-column half `rho%2`.
@@ -1590,7 +1600,8 @@ fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3], bd_words: bool, s
             if topo.has_a(col as u32) { s.push((2, 0, a_off, geo.waves * kc * A_BYTES / 4, Mm2s, 1, false)); }
             s
         };
-        let streams: Vec<_> = streams.into_iter().filter(|s| !(skip_b && s.1 == 1)).collect();
+        let streams: Vec<_> = streams.into_iter().filter(|s|
+            !(skip_b && s.1 == 1 || topo.bf16_rowmajor().is_some() && s.1 == 2)).collect();
         for &(id, arg, offset, words, ..) in &streams {
             if bd_words { Bd::new(0, words as u32).emit_txn(shim, id, txn); }
             txn.ddr_patch(Bd::address(shim, id) + 4, arg, offset as u64 + base[arg as usize]);
@@ -1599,6 +1610,42 @@ fn emit_shim_at(txn: &mut Txn, geo: &Geometry, base: [u64; 3], bd_words: bool, s
             // `a_repeat` (pair designs): the host A segment is the `mw` tiles once; replay it for every `nw`.
             let repeat = if geo.a_repeat && arg == 0 { geo.nw as u32 } else { 1 };
             Task { direction, channel, bd, repeat, issue_token: token }.emit_txn(shim, txn);
+        }
+    }
+    if geo.topo.bf16_rowmajor().is_some() { emit_rowmajor_wave(txn, geo, base[2], 0); }
+}
+
+/// Two tiles per C channel, row-major in the memtile stream. Only one wave's
+/// BDs is resident at a time: the shim's 20-bit outer stride cannot encode a
+/// 256-row jump at fused pitches 14080/16640. SYNC protects every rewrite.
+fn emit_rowmajor_wave(txn: &mut Txn, geo: &Geometry, base: u64, wave: usize) {
+    let (pitch, col0) = geo.topo.bf16_rowmajor().unwrap();
+    for col in 0..geo.topo.cols {
+        let shim = shim_loc(col as u32);
+        for pair in 0..2 {
+            let first = 1 + pair as u32 * 2;
+            for parity in 0..2 {
+                let id = if parity == 0 { first } else { 4 + pair as u32 };
+                let mut bd = Bd::new(0, 5120);
+                bd.dims[0] = dma::Dim { step: 1, wrap: 40 };
+                bd.dims[1] = dma::Dim { step: (pitch / 2) as u32, wrap: 0 };
+                if parity == 0 { bd.next = Some(4 + pair as u32); }
+                bd.emit_txn(shim, id, txn);
+                let row = wave * G80_WAVE_M + pair * 128;
+                let column = col0 + (2 * col + parity) * 80;
+                txn.ddr_patch(Bd::address(shim, id) + 4, 2, base + (2 * (row * pitch + column)) as u64);
+            }
+            Task { direction: S2mm, channel: pair as u32, bd: first, repeat: 1, issue_token: true }.emit_txn(shim, txn);
+        }
+    }
+}
+
+fn emit_output_tail(txn: &mut Txn, geo: &Geometry, per_column: bool, base: u64) {
+    emit_sync(txn, geo.topo, per_column);
+    if geo.topo.bf16_rowmajor().is_some() {
+        for wave in 1..geo.waves {
+            emit_rowmajor_wave(txn, geo, base, wave);
+            emit_sync(txn, geo.topo, per_column);
         }
     }
 }
@@ -1680,7 +1727,7 @@ fn emit_dynamic_body(txn: &mut Txn, geo: &Geometry, per_column_sync: bool, base:
     emit_shim_at(txn, geo, base, true, false);
     // 6. cores last, then wait for the C token(s).
     for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1); }
-    emit_sync(txn, topo, per_column_sync);
+    emit_output_tail(txn, geo, per_column_sync, base[2]);
 }
 
 /// Built deployment image + command stream; no NPU access occurs here.
@@ -1742,7 +1789,7 @@ impl ArrayDesign {
     /// Bytes the shim DMAs read from DDR (packed A + packed B, including replication/padding).
     pub fn host_bytes_read(&self) -> u64 { (self.geo.a_bytes() + self.geo.b_bytes()) as u64 }
     /// Bytes the shim DMAs write to DDR (padded packed C).
-    pub fn host_bytes_written(&self) -> u64 { self.geo.c_bytes() as u64 }
+    pub fn host_bytes_written(&self) -> u64 { (self.geo.topo.cols * self.geo.c_segment_bytes()) as u64 }
 
     /// Active compute tiles `(col, physical row)` (physical row = core row + 2), column-major.
     pub fn output_tiles(&self) -> Vec<(u32, u32)> {
@@ -1750,13 +1797,21 @@ impl ArrayDesign {
     }
 
     /// Per active compute tile `(col, physical row)`: the packed-C (arg2) byte range of each wave, in wave
-    /// order. Ranges are disjoint and together cover arg2 exactly; they are `C_BYTES` long (V8 with
-    /// `Epilogue::Int8`: `COUT_BYTES`).
+    /// order. Native ranges cover arg2 exactly. Row-major BF16 returns one
+    /// contiguous 80-element row range per tile row (padding columns excluded).
     pub fn output_tile_ranges(&self) -> Vec<((u32, u32), Vec<std::ops::Range<usize>>)> {
         let g = &self.geo;
         let len = g.topo.c_tile_bytes();
         g.topo.cores().map(|t| {
             let (col, r) = (t.col as usize, t.row as usize - 2);
+            if let Some((pitch, col0)) = g.topo.bf16_rowmajor() {
+                let ranges = (0..g.waves).flat_map(|w| (0..128).map(move |i| {
+                    let row = w * G80_WAVE_M + r / 2 * 128 + i;
+                    let base = 2 * (row * pitch + col0 + (2 * col + r % 2) * 80);
+                    base..base + 160
+                })).collect();
+                return ((t.col, t.row), ranges);
+            }
             let ranges = (0..g.waves).map(|w| {
                 let base = if g.topo.is_pair() { g.pair_c_offset(col, w, r) }
                     else { ((col * g.waves + w) * g.topo.rows + r) * C_BYTES };
