@@ -61,6 +61,8 @@ use crate::speculative::{
     dflash_sampled_selector_draft_into, dflash_target_rows_into, DflashSampleCfg, DflashSampledDraft,
     DflashSampledDraftLane, draft_dflash_sampled_blocks_batched,
     dflash_draft_batch_max_rows, dflash_sparse_target_enabled, FastTargetRows, TargetRowsScratch, VerifyScratch,
+    dflash_device_accept_eligible, dflash_device_accept_enabled, dflash_sampled_accept_device,
+    SampledWindowDecision,
 };
 use hipfire_runtime::dflash::DflashScratch;
 use hip_bridge::{HipError, HipResult};
@@ -115,6 +117,8 @@ pub struct DflashVmmLaneState {
     pub picks: Vec<u32>,
     /// Request-owned normalized target rows, consumed before chunk scratch reuse.
     pub sampled_target: FastTargetRows,
+    /// Verify-time sampled decision; consumed by commit without another RNG draw.
+    pub device_decision: Option<SampledWindowDecision>,
     /// Shared singleton first-token / acceptance workspace.
     pub sample_scratch: Vec<f32>,
     /// Actual selector proposal and q, retained beside the planned verify.
@@ -168,6 +172,7 @@ impl DflashVmmLaneState {
             last_window,
             picks: Vec::with_capacity(block),
             sampled_target: FastTargetRows::default(),
+            device_decision: None,
             sample_scratch: Vec::new(),
             sampled_draft: None,
             max_emit: 0,
@@ -255,6 +260,7 @@ impl DflashVmmLaneState {
             last_window: _,
             picks: _,
             sampled_target: _,
+            device_decision: _,
             sample_scratch: _,
             sampled_draft: _,
             max_emit: _,
@@ -382,17 +388,30 @@ fn cb_sampled_packed_head_admitted(
         })
 }
 
+/// Both admitted sampled head sources reproduce the singleton Product-b rows.
+/// `device_ok` is `Gpu::dflash_device_accept_supported()`: the production
+/// kernel is a gfx1201 builder module with no hipcc fallback.
+fn cb_sampled_device_accept_eligible(lane: &DflashCbVerifyLane<'_>, device_ok: bool) -> bool {
+    lane.state.sample_temp > 1e-6
+        && lane.state.sampled_draft.as_ref().is_some_and(|receipt| {
+            dflash_device_accept_eligible(
+                dflash_device_accept_enabled() && device_ok, &lane.state.sample_cfg(),
+                receipt, lane.draft.verify_tokens.len(),
+            )
+        })
+}
+
 /// Number of consecutive lanes at the head of `lanes` that can share ONE
 /// sampled target-rows pass: sampled lanes whose `DflashSampleCfg`
 /// (temperature, top_p, top_k, CACTUS delta, compared bitwise) is identical
 /// and for which the sparse representation is active
 /// ([`dflash_sparse_target_enabled`]; CACTUS and the sparse kill switch stay
 /// on the per-lane dense route). `1` (a singleton) never batches.
-fn cb_sampled_target_run_len(lanes: &[DflashCbVerifyLane<'_>]) -> usize {
+fn cb_sampled_target_run_len(lanes: &[DflashCbVerifyLane<'_>], device_ok: bool) -> usize {
     let Some(first) = lanes.first() else {
         return 0;
     };
-    if first.state.sample_temp <= 1e-6 {
+    if first.state.sample_temp <= 1e-6 || cb_sampled_device_accept_eligible(first, device_ok) {
         return 1;
     }
     let c0 = first.state.sample_cfg();
@@ -407,7 +426,8 @@ fn cb_sampled_target_run_len(lanes: &[DflashCbVerifyLane<'_>]) -> usize {
     };
     lanes
         .iter()
-        .take_while(|l| l.state.sample_temp > 1e-6 && same(&l.state.sample_cfg()))
+        .take_while(|l| l.state.sample_temp > 1e-6
+            && !cb_sampled_device_accept_eligible(l, device_ok) && same(&l.state.sample_cfg()))
         .count()
 }
 
@@ -1033,7 +1053,7 @@ pub fn dflash_cb_verify(
             let mut batched_until = 0usize;
             for li in 0..chunk.len() {
                 if packed_sampled && li >= batched_until && *CB_SAMPLED_TARGET_BATCH {
-                    let n = cb_sampled_target_run_len(&chunk[li..]);
+                    let n = cb_sampled_target_run_len(&chunk[li..], gpu.dflash_device_accept_supported());
                     if n >= 2 {
                         let end = li + n;
                         let run_rows: usize = chunk[li..end].iter().map(|l| l.draft.verify_tokens.len()).sum();
@@ -1050,17 +1070,27 @@ pub fn dflash_cb_verify(
                     }
                 }
                 let in_run = li < batched_until;
+                let device_accept = cb_sampled_device_accept_eligible(&chunk[li], gpu.dflash_device_accept_supported());
                 let lane = &mut chunk[li];
                 let b = lane.draft.verify_tokens.len();
                 let st = &mut *lane.state;
                 st.picks.clear();
+                st.device_decision = None;
                 if st.sample_temp > 1e-6 {
                     let cfg = st.sample_cfg();
                     let v = &st.df.verify_scratch;
                     gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &cb.head.final_hidden.buf, row * dim * 4, b * dim * 4)?;
                     if packed_sampled {
                         st.picks.extend_from_slice(&picks.as_ref().expect("packed sampled head")[row..row + b]);
-                        if !in_run {
+                        if device_accept {
+                            let logits = cb.head.logits.sub_offset(row * vocab, b * vocab);
+                            st.device_decision = Some(dflash_sampled_accept_device(
+                                gpu, &logits, &lane.draft.verify_tokens,
+                                st.sampled_draft.as_ref().expect("eligible sampled receipt"),
+                                vocab, cfg, lane.draft.max_accept, &mut st.rng_state,
+                                &mut *v.device_accept.lock().unwrap_or_else(|e| e.into_inner()),
+                            )?);
+                        } else if !in_run {
                             let logits = cb.head.logits.sub_offset(row * vocab, b * vocab);
                             // Keep normalization at the original lane point/order,
                             // including SparseRows' request-owned representation.
@@ -1077,8 +1107,17 @@ pub fn dflash_cb_verify(
                         )?;
                         st.picks = dflash_download_verify_argmax(gpu, v, b)?;
                         let logits = v.logits.sub_offset(0, b * vocab);
-                        // Materialize before shared scratch or v.logits reuse.
-                        dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                        // Decide/materialize before shared scratch or v.logits reuse.
+                        if device_accept {
+                            st.device_decision = Some(dflash_sampled_accept_device(
+                                gpu, &logits, &lane.draft.verify_tokens,
+                                st.sampled_draft.as_ref().expect("eligible sampled receipt"),
+                                vocab, cfg, lane.draft.max_accept, &mut st.rng_state,
+                                &mut *v.device_accept.lock().unwrap_or_else(|e| e.into_inner()),
+                            )?);
+                        } else {
+                            dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                        }
                     }
                 } else {
                     st.picks.extend_from_slice(&picks.as_ref().expect("greedy head")[row..row + b]);
