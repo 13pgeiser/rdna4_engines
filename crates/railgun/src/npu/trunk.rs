@@ -72,7 +72,6 @@ struct Binding { handle: u32, addr: u64 }
 #[derive(Clone, Copy)]
 struct BankPages { a: usize, a_len: usize, c: usize, c_len: usize, done: usize }
 struct Job { seq: Seq, layer: usize, shape: Shape, event: usize, start: Instant }
-enum Work { Run(Job), InvalidTimeline(mpsc::SyncSender<Result<(), String>>) }
 struct Pending { value: u32, result: Option<Result<Completion, String>> }
 struct Shared { pending: Mutex<Vec<Pending>>, changed: Condvar }
 impl Shared {
@@ -103,7 +102,7 @@ pub struct NpuTrunkRuntime {
     layers: Vec<(usize, Shape)>,
     state: RefCell<Vec<BankState>>,
     shared: Arc<Shared>,
-    tx: Option<mpsc::SyncSender<Work>>,
+    tx: Option<mpsc::SyncSender<Job>>,
     relay: Option<thread::JoinHandle<()>>,
 }
 impl NpuTrunkRuntime {
@@ -191,7 +190,7 @@ impl NpuTrunkRuntime {
         state.retired = false;
         let enqueue = (|| {
             unsafe { self.hip.record_raw(&b.ready, stream)?; }
-            self.tx.as_ref().ok_or("runtime closed")?.try_send(Work::Run(Job { seq, layer, shape, event: b.ready.raw(), start }))
+            self.tx.as_ref().ok_or("runtime closed")?.try_send(Job { seq, layer, shape, event: b.ready.raw(), start })
                 .map_err(|e| format!("trunk relay queue: {e}"))
         })();
         if let Err(e) = enqueue {
@@ -202,16 +201,6 @@ impl NpuTrunkRuntime {
     }
     pub fn wait_host(&self, seq: Seq) -> Result<Completion, String> {
         self.shared.wait(seq, WAIT_TIMEOUT)
-    }
-    /// Hardware negative control, before the first kick only: wait for an
-    /// impossible timeline point without submitting or mutating any command.
-    /// A correct driver returns an error within the 3 s bound.
-    pub fn diagnostic_invalid_timeline(&self) -> Result<(), String> {
-        if self.state.borrow().iter().any(|s| s.kicked) { return Err("timeline probe requires fresh runtime".into()); }
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.tx.as_ref().ok_or("runtime closed")?.try_send(Work::InvalidTimeline(tx))
-            .map_err(|e| format!("timeline probe queue: {e}"))?;
-        rx.recv_timeout(WAIT_TIMEOUT).map_err(|e| format!("timeline probe bounded receive: {e}"))?
     }
     /// Error-gated rejoin: first bounded host completion, then stream GEQ wait
     /// and a system-fenced event (cache writeback/invalidate) before GPU C loads.
@@ -290,7 +279,7 @@ fn finish(shared: &Shared, seq: Seq, result: Result<Completion, String>) {
     shared.changed.notify_all();
 }
 fn relay_main(program: PanelProgram, layers: Vec<LayerPanels>, pages: Vec<BankPages>, api: RelayApi, layout: ArenaLayout,
-    rx: mpsc::Receiver<Work>, init: mpsc::SyncSender<Result<Vec<[Binding; 2]>, String>>, shared: Arc<Shared>) {
+    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<[Binding; 2]>, String>>, shared: Arc<Shared>) {
     let dev = match Device::open().and_then(|mut d| { d.map_heap(64 << 20)?; Ok(d) }) {
         Ok(d) => d, Err(e) => { let _ = init.send(Err(e)); return; }
     };
@@ -329,16 +318,7 @@ fn relay_main(program: PanelProgram, layers: Vec<LayerPanels>, pages: Vec<BankPa
     let (resources, bindings) = match setup { Ok(r) => r, Err(e) => { let _ = init.send(Err(e)); return; } };
     if init.send(Ok(bindings)).is_err() { return; }
     let mut fatal: Option<String> = None;
-    for work in rx {
-        let job = match work {
-            Work::Run(job) => job,
-            Work::InvalidTimeline(reply) => {
-                // Leave 10 ms for forwarding the driver's bounded failure.
-                let result = resources.ctx.wait_chain(&resources.chains[0], u64::MAX, 2990).map(|_| ());
-                let _ = reply.send(result);
-                continue;
-            }
-        };
+    for job in rx {
         let result = (|| {
             if let Some(e) = &fatal { return Err(format!("trunk relay poisoned: {e}")); }
             let deadline = job.start + WAIT_TIMEOUT;

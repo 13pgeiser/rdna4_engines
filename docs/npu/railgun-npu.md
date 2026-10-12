@@ -211,17 +211,20 @@ timing-only fence suppression. CPU CLFLUSH does **not** replace the GPU boundary
 The memory class is anonymous pages + amdxdna userptr + default coherent hipHostRegister:
 never exported HIP VMM (snapshot-only), never imported-BO SYNC_BO.
 
-Hardware gate (parent runs on Halo): `target/release/npu-trunk-transport --pci 0000:bf:00.0`.
+Hardware gate (parent runs on Halo): `target/release/npu-trunk-transport --pci 0000:c0:00.0`.
 It uses default shim AXI, two production-size banks, GPU shader copies of CPU-packed A,
 13 panels, all-output BF16 comparisons against CPU integer dots + `bf16_direct` through
 `bf16_output_offset`, and 20 alternating rounds with changed codes/scales. C is poisoned
-before every round. A deterministic missing-wait negative reads poison **before submission**;
-a racing ungated read could legitimately finish after NPU completion and is not a reliable
-negative. An invalid host Seq errors immediately; a separate impossible DRM timeline point
-must error within 3 s. Expected output: two sequence/timeline negative lines, a missing-wait
-negative, 20 `round=.. bank=.. seq=.. exact kick->done=..` lines, and `PASS` with p50/p99/max,
-NPU busy envelope and wall time. Busy is the host submit-to-timeline envelope, not an AIE
-hardware counter; wall includes CPU verification. Any mismatch/error exits 1.
+before every round. All 20 exact rounds and an `EXACT` p50/p99/max, NPU busy-envelope/wall
+summary run **before** negative controls. The deterministic missing-wait negative then reads
+fresh poison without submitting a replacement job; a racing ungated read could legitimately
+finish after NPU completion and is not a reliable negative. A deliberately unsubmitted host
+Seq must error immediately in process (no DRM wait or relay request). The former impossible
+DRM timeline probe was removed after the parent-reported j107 receive timeout hid all rounds.
+Expected output: 20 `round=.. bank=.. seq=.. exact kick->done=..` lines, `EXACT` timing summary,
+two negative-control lines and `PASS rounds=20 negatives=2`. Busy is the host submit-to-timeline
+envelope, not an AIE hardware counter; wall includes CPU verification. Any mismatch/error
+exits 1 and identifies `stage=... round=...` (`round=none` for setup/negatives/teardown).
 Production-size visibility and host-registered done-word acceptance by HIP's beta stream-wait
 API remain **unmeasured until this gate runs**; its documented pointer requirement is signal
 memory. The old 4 KiB fixture proof is not evidence that this larger route has passed.
