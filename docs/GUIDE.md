@@ -1077,7 +1077,7 @@ one line naming each one the command line moved.
 | `--placement MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `--deterministic` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `--checkpoint-interval N` | 2048 | linear-attention state checkpoint interval, in tokens |
-| `--checkpoint-slots N` | 8 | linear-state snapshots the server may hold at once, **in total**, not per sequence. They live in pinned host memory, not VRAM: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`), allocated at startup. A snapshot is copied off the card after the step that produced it and back before the step that resumes from it. With a disk tier a full store detaches its least recently used snapshot to disk instead of losing it |
+| `--checkpoint-slots N` | 8 | linear-state (hybrid) or sliding-window snapshots the server may hold at once, **in total**, not per sequence. They live in pinned host memory, not VRAM: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`), allocated at startup. A snapshot is copied off the card after the step that produced it and back before the step that resumes from it. With a disk tier a full store detaches its least recently used snapshot to disk instead of losing it |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
 | `--no-prefix-cache` | — | disable prefix caching |
 

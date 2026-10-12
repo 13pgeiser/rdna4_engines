@@ -2839,11 +2839,11 @@ int Engine::configure_kv() {
         if (slot > 0 && n > 0 && cfg_.prefix_cache) {
             if (ck_store_.open(slot, slot * n) != RAD_OK) {
                 RAD_WARN("checkpoint slots: no pinned host memory for %lld snapshot(s) of %s; a "
-                         "hybrid session's prefix hits replay their linear layers from zero. "
+                         "hybrid or sliding-window session's prefix hits prefill from the start. "
                          "Lower --checkpoint-slots.", (long long)n, humanb(slot).c_str());
             } else {
-                RAD_INFO("checkpoint slots: %lld linear-state snapshot(s) of %s in pinned host "
-                         "memory (%s), none of it on the card", (long long)n,
+                RAD_INFO("checkpoint slots: %lld snapshot(s) (linear state or sliding window) of "
+                         "%s in pinned host memory (%s), none of it on the card", (long long)n,
                          humanb(slot).c_str(), humanb(ck_store_.cap_bytes()).c_str());
             }
         }
