@@ -2,7 +2,7 @@
 //! hipfire's dense IU4 prefill GEMM contract (symmetric MQ4G256V2 weights x `block_i4_128` activations, gfx1151
 //! `gemm_mq4g256v2_*_iu4_pm_v2b_*`) and the NPU deployment that produces its per-K128-epoch int32 partials.
 //!
-//! Native operand formats, read unchanged (hipfire `crates/hipfire-isa/src/kernels/iu4_fold.rs`,
+//! Native operand formats, read unchanged (hipfire `crates/peacemaker-isa/src/kernels/iu4_fold.rs`,
 //! `kernels/src/gemm_mq4g256v2_residual_iu4_v2b.gfx11.hip`, `kernels/src/block_i4_128_quant.hip`):
 //! * Weights `W`: `rows` output features, each `K/256` groups of [`GROUP_BYTES`] = `[f16 sc0, f16 zp0, f16 sc1,
 //!   f16 zp1]` + 128 nibble bytes. K half `h` of the group (`K` epoch `e = 2*group + h`) is the 64 bytes at

@@ -30,6 +30,8 @@ jobs:
         run: scripts/mirror-split.sh peacemaker "$RUNNER_TEMP/peacemaker"
       - name: Check standalone workspace
         run: cargo check --workspace --manifest-path "$RUNNER_TEMP/peacemaker/Cargo.toml"
+      - name: Compile standalone tests
+        run: cargo test --workspace --no-run --manifest-path "$RUNNER_TEMP/peacemaker/Cargo.toml"
       - name: Publish PeaceMaker main branch
         env:
           MIRROR_KEY: ${{ secrets.PEACEMAKER_MIRROR_KEY }}

@@ -1283,7 +1283,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC: &str = concat!(
 /// `Gpu::a4_slab_active`): identical math and codes; `HIPFIRE_IU4_SLAB`
 /// stores each K128 block's `block_i4_128` bytes as the planes
 /// `[d 4N][s 4N][qs 0..31: 32N][qs 32..63: 32N]` that the builder `_b1s`
-/// GEMMs stage (`hipfire-isa` `ALayout::Slab`).
+/// GEMMs stage (`peacemaker-isa` `ALayout::Slab`).
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     "#define HIPFIRE_IU4_RTN_RCP 1\n#define HIPFIRE_IU4_SLAB 1\n",
@@ -4205,10 +4205,10 @@ pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen4_moe_iu4_sym.gfx1151.hip")
 );
 /// Certified builder modules of the route's grouped IU4 gate/up SwiGLU and
-/// down GEMMs (`hipfire-isa emit --kernel qwen4_moe_sym --epi all --arch
+/// down GEMMs (`peacemaker-isa emit --kernel qwen4_moe_sym --epi all --arch
 /// ARCH`, one contract-checked `peacemaker custom build` per symbol, M7
 /// obligation-free). Same ABI, grid and bytes as the gfx1151 hipcc entries.
-/// SHA-256 (contracts under `crates/hipfire-isa/kernels/qwen4_moe_sym.*.contract.json`):
+/// SHA-256 (contracts under `crates/peacemaker-isa/kernels/qwen4_moe_sym.*.contract.json`):
 /// gfx1151 ede9af50a2f786eaef14ab12cdaef9eda604adbcd65faa7f170bcd307eba60cc (was 2540a22b…),
 /// gfx1201 792b207ae23ec9d47ab13303c60f700ce46afeddf8f163efd72fd31acdcfd515 (was 7179393f…);
 /// each differs from its predecessor only by the `.comment` stamp
@@ -4218,7 +4218,7 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco");
 /// Certified builder module of the gathered QSA prefill attention
-/// (`hipfire-isa emit --kernel qsa_gather --arch ARCH`, M7 obligation-free):
+/// (`peacemaker-isa emit --kernel qsa_gather --arch ARCH`, M7 obligation-free):
 /// the F16 K / block-transposed V producer and the gathered F16 WMMA
 /// attention, with the ABI, grid, LDS and output bytes of
 /// `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`.
@@ -4230,14 +4230,14 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
 pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
 pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
 /// Certified builder module of the production sampled-DFlash device accept
-/// (`hipfire-isa emit --kernel dflash_accept --arch gfx1201`, M7
+/// (`peacemaker-isa emit --kernel dflash_accept --arch gfx1201`, M7
 /// obligation-free): `dflash_sampled_accept_sparse_q_f32_pm_gfx1201`, with the
 /// ABI, grid, payload and decision words of the retained hipcc oracle
 /// `kernels/src/dflash_sampled_accept_sparse_q.hip`. gfx1201 only, no hipcc
 /// production fallback.
 pub const DFLASH_SAMPLED_ACCEPT_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/dflash_sampled_accept_pm_gfx1201.hxaco");
 /// Certified builder module of the live QSA selector pair
-/// (`hipfire-isa emit --kernel qsa_select --epi all --arch gfx1151`, M7
+/// (`peacemaker-isa emit --kernel qsa_select --epi all --arch gfx1151`, M7
 /// obligation-free): the rows16 F32 score and the select-from-scores kernels,
 /// with the kernargs, grids, blocks and output bytes of
 /// `indexed_attention_select_scores_rows16_f32` /
@@ -4246,7 +4246,7 @@ pub const DFLASH_SAMPLED_ACCEPT_PM_GFX1201: &[u8] = include_bytes!("../../../ker
 /// keep the hipcc kernels).
 pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
 /// Certified builder (PeaceMaker) modules of the production CPU-AR sampling
-/// kernels, gfx1151 and gfx1201 only (`hipfire-isa emit --kernel
+/// kernels, gfx1151 and gfx1201 only (`peacemaker-isa emit --kernel
 /// spec_sampling_rows_pm|spec_accept_pm --arch ARCH`, M7 obligation-free,
 /// native bundle with the shipped `host-x86_64-unknown-linux-gnu-` host entry):
 /// the canonical parallel target-row sampler and the ordered sampled-prefix
@@ -4263,7 +4263,7 @@ pub const SPEC_ACCEPT_ORDERED_PM_GFX1151: &[u8] =
 pub const SPEC_ACCEPT_ORDERED_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/spec_accept_ordered_pm_gfx1201.hxaco");
 /// Certified builder module of gfx1201's MQ6 trunk overwrite GEMM
-/// (`hipfire-isa emit --kernel qwen4_mq6_x4 --epi all --arch gfx1201`, M7
+/// (`peacemaker-isa emit --kernel qwen4_mq6_x4 --epi all --arch gfx1201`, M7
 /// obligation-free; `hipfire peacemaker native-emit` writes the bundle): the
 /// exact twin of hipcc `gemm_mq6g256v2_wmma_gfx12_bt8_x4` (F32 overwrite, BT8
 /// X-LDS) in `kernels/src/qwen4_gemm_mq6g256v2_wmma_gfx12_x4.hip`, with that
@@ -4275,7 +4275,7 @@ pub const SPEC_ACCEPT_ORDERED_PM_GFX1201: &[u8] =
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1201.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");
 /// Certified builder module of gfx1151's MQ6 trunk GEMM
-/// (`hipfire-isa emit --kernel qwen4_mq6_x4_gfx11 --arch gfx1151`, M7
+/// (`peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 --arch gfx1151`, M7
 /// obligation-free): the exact twin of the U3 `resid_bt_xlds<6, 8, 8, true, ..>`
 /// entries in `kernels/src/qwen4_gemm_mqv2_wmma_gfx11_bt.hip`, with their
 /// arguments and output bytes, over 256-token tiles (grid
@@ -4287,7 +4287,7 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
 /// Certified builder module of the gfx1151 Flash-Next lane-step row kernels
-/// (`hipfire-isa emit --kernel qwen4_lane_rows --arch gfx1151`, M7
+/// (`peacemaker-isa emit --kernel qwen4_lane_rows --arch gfx1151`, M7
 /// obligation-free): four multi-column (1..=8 activation columns) GEMVs that
 /// keep every column byte-identical to the 1-row HIP incumbent while sharing
 /// the activation loads across weight rows: `gemv_mq6g256v2_xbatch_pm`,
@@ -4302,7 +4302,7 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/q
 /// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
 pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str = "31efa309145ce2cf7ed481bacfe5fb26b99db503cd4a71113d9c53162421b62a";
 /// Certified builder module of gfx1151's MQ4G256V2 trunk prefill GEMM (the builder
-/// `crates/hipfire-isa/src/kernels/qwen4_mq6_x4_gfx11.rs` over the MQ4G256V2 weight format):
+/// `crates/peacemaker-isa/src/kernels/qwen4_mq6_x4_gfx11.rs` over the MQ4G256V2 weight format):
 /// the exact twin of hipcc `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on a zeroed
 /// output (F16 activations, one ascending-K WMMA chain), over 256-token tiles (grid
 /// `[ceil(M/(16*wr)), ceil(N/256), 1]`, block `32*wr`, static LDS 40960). Entries
@@ -4314,7 +4314,7 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str = "31efa309145ce2cf7ed481bacfe
 /// (`sha256sum kernels/qwen4_mq4_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq4_x4_pm_gfx1151.hxaco");
 /// Certified builder modules of the few-row MQ4G256V2 projection kernel
-/// `gemv_mq4g256v2_rows_x4_pm_gfx{1151,1201}` (`hipfire-isa emit --kernel
+/// `gemv_mq4g256v2_rows_x4_pm_gfx{1151,1201}` (`peacemaker-isa emit --kernel
 /// mq4_rows_x4 --arch gfx{1151,1201}`): MTP verify (2..=8 activation rows) of four
 /// MQ4G256V2 trunk projections per launch, each output bitwise the AR decode GEMV
 /// `gemv_mq4g256v2` (96-byte kernarg: A0..A3, x, y0..y3, M0..M3, K, B; grid
@@ -4328,7 +4328,7 @@ pub const MQ4_ROWS_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mq4_r
 /// (`sha256sum kernels/mq4_rows_x4_pm_gfx1201.hxaco`).
 pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco");
 /// Certified builder module of gfx1151's fused Flash-Next shared-expert gate/up
-/// (`hipfire-isa emit --kernel qwen4_shared_gu_gfx11 --epi all --arch gfx1151`, M7
+/// (`peacemaker-isa emit --kernel qwen4_shared_gu_gfx11 --epi all --arch gfx1151`, M7
 /// obligation-free): one launch of `qwen4_shared_gu_pm_gfx1151_{w8,w4}` replaces the
 /// gate and up `gemm_wmma_lds_128_128_32_64_k64_p` GEMMs, `shared_expert_activation_bf16_f32`
 /// and the shared down's F32 -> F16 hidden conversion, leaving the F16 hidden `[N, I]` and the
@@ -4339,7 +4339,7 @@ pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/mq4_r
 /// SHA-256 9509a2cdda96981bfbaa85bdda228a589bf4c2c0fd61cdb9bce8ea55f727acb1
 /// (`sha256sum kernels/qwen4_shared_gu_pm_gfx1151.hxaco`).
 pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_shared_gu_pm_gfx1151.hxaco");
-/// Standalone gfx1151 MTP append DET dense projection (`hipfire-isa` kernel
+/// Standalone gfx1151 MTP append DET dense projection (`peacemaker-isa` kernel
 /// `mtp_dense_det_gfx11`, module `mtp_dense_det_pm_gfx1151`, entry `mtp_dense_det_pm_gfx1151_w8`):
 /// F16 WMMA `Y32[N, M] = W16[M, K] · X16[N, K]^T`, fixed 128 x 256 tile, one ascending K16 chain
 /// per output, no split-K, 36-byte kernarg (A16, X16, Y32, M, K, N), grid
@@ -4348,7 +4348,7 @@ pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/q
 /// lands (`kernels/mtp_dense_det_pm_gfx1151.hxaco`); its SHA-256 is recorded in the validation
 /// receipt.
 pub const MTP_DENSE_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp_dense_det_pm_gfx1151.hxaco");
-/// gfx1151 MTP append DET Q8_0 -> F16 weight converter (`hipfire-isa` kernel `mtp_q8_det_gfx11`,
+/// gfx1151 MTP append DET Q8_0 -> F16 weight converter (`peacemaker-isa` kernel `mtp_q8_det_gfx11`,
 /// module `mtp_q8_det_pm_gfx1151`, entry `mtp_q8_0_to_f16_pm_gfx1151`): one element per lane,
 /// element `i` of a contiguous Q8_0 `[M, K]` weight (34-byte blocks: F16 scale + 32 int8) is
 /// `F16-RNE(f32(d) * f32(q))`; 20-byte kernarg (src, dst, elems), grid `[ceil(M*K/256), 1, 1]`,
@@ -4735,7 +4735,7 @@ pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
 /// 175a5b506c54118931b5028afba049a326327e58a5724867e2baed0b9dca7efe
 /// (cad59b86 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
 /// nothing else changed)
-/// (`hipfire-isa emit --kernel iu4_v2c --epi all`, one contract-checked
+/// (`peacemaker-isa emit --kernel iu4_v2c --epi all`, one contract-checked
 /// `peacemaker custom build --arch gfx1100` per symbol): the V2C algorithm's
 /// SET, ADD and F1-lite gate/up SiLU entries with every fold op VOPD-paired
 /// (bank-aware; ADD and gate/up mixed-paired), ds_swizzle scale broadcasts
@@ -4852,7 +4852,7 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1: &[u8] =
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control.hxaco");
 /// Certified gfx1201 `_b1s` bundle: the `_b1` K-loop and epilogues staging
-/// the slab activation layout (`hipfire-isa emit --alayout slab`), fed only
+/// the slab activation layout (`peacemaker-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
 /// SHA-256 5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc
@@ -4873,12 +4873,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
 /// carries 4 more `s_wait_alu depctr` guards its GDN loop back edges need
 /// (73168098 otherwise). A/B against the former bundle with
 /// `HIPFIRE_G12_FP8_F2_BUNDLE=<path>`.
-/// Regenerate with `hipfire-isa emit --kernel fp8_gemm --scale both --epi all`
+/// Regenerate with `peacemaker-isa emit --kernel fp8_gemm --scale both --epi all`
 /// and one contract-checked `peacemaker custom build` per Row epilogue.
 pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco");
 /// Certified gfx1201 PeaceMaker bundle of the exact 64..=128-row MQ4V2 verify
-/// GEMMs (`hipfire-isa emit --kernel mq4_verify --epi all --arch gfx1201`,
+/// GEMMs (`peacemaker-isa emit --kernel mq4_verify --epi all --arch gfx1201`,
 /// one native bundle): the twins of the hipcc K32-slab `_vt{4,8}w{4,8}_k32`
 /// symbols with their ABI, grid and output bytes. Sixteen entries
 /// `mq4_verify_{qkvza,qkv,gate_up,residual}_pm_gfx1201_bt{4,8}w{4,8}`.
@@ -4889,7 +4889,7 @@ pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =
 pub const MQ4_VERIFY_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/mq4_verify_pm_gfx1201.hxaco");
 /// Certified gfx1201 PeaceMaker bundle of the FP8 verify GEMM family
-/// (`hipfire-isa emit --kernel mq4_fp8_verify --epi all --arch gfx1201`, one
+/// (`peacemaker-isa emit --kernel mq4_fp8_verify --epi all --arch gfx1201`, one
 /// native bundle): symmetric MQ4G256V2 weights dequantized exactly to E4M3,
 /// per-row E4M3 activations, `v_wmma_f32_16x16x16_fp8_fp8`, per-output
 /// reduction order identical for every row count 1..=128. Thirty-five entries
@@ -4905,7 +4905,7 @@ pub const MQ4_FP8_VERIFY_PM_GFX1201: &[u8] =
 /// ef2f779637e797745651630b916858f64d2a006ca86502df2f4c91f417a64d29.
 pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
     include_bytes!("../../../kernels/mq4v2_fp8_fragment_repack_gfx1201.hsaco");
-/// Certified gfx1151 V2B builder bundle (`hipfire-isa emit --kernel iu4_v2b
+/// Certified gfx1151 V2B builder bundle (`peacemaker-isa emit --kernel iu4_v2b
 /// --epi all --arch gfx1151`, one contract-checked `peacemaker custom build`
 /// per entry): SET, ADD (residual touch + grouped raster, `GSHIFT`) and the
 /// gate/up SiLU, byte-identical to the hipcc V2B `_set`, `_add_touch(_swz)`
@@ -4923,7 +4923,7 @@ pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco");
 
 /// gfx1151 A4 fusion: builder V2B gate/up SiLU on the M512 x N128 tile
-/// (`hipfire-isa` `iu4_v2b_a4`, native writer). Two entries: the fused
+/// (`peacemaker-isa` `iu4_v2b_a4`, native writer). Two entries: the fused
 /// `gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151`, whose epilogue writes
 /// the down projection's 72-byte `block_i4_128` records byte-identical to
 /// `fused_silu_hin_rotate_mq_i4_batched` on its own h, and the stage-1 retile
@@ -9710,7 +9710,7 @@ pub const EP_GATHER_ROWS_BY_SLOT_OWNER_SRC: &str =
 
 /// Certified builder (PeaceMaker) module of the Flash-Next expert-parallel
 /// balanced ownership (default on; `HIPFIRE_EP_BALANCED_OWNERS=0` disables), gfx1201 only
-/// (`hipfire-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201`, M7
+/// (`peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201`, M7
 /// obligation-free, native bundle with the shipped
 /// `host-x86_64-unknown-linux-gnu-` host entry): one 512-thread workgroup that
 /// deals the call's distinct routed experts to ranks in ascending id order and
@@ -9721,21 +9721,21 @@ pub const QWEN4_EP_OWNER_ASSIGN_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_ep_owner_assign_pm_gfx1201.hxaco");
 
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile mask
-/// (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`), gfx1201 only (`hipfire-isa emit --kernel
+/// (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`), gfx1201 only (`peacemaker-isa emit --kernel
 /// ep_tile_mask_pm --arch gfx1201`, M7 obligation-free): a copy of the grouped-GEMM tile
 /// ids with every tile of a non-owned expert set to the -1 sentinel.
 pub const EP_TILE_MASK_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/ep_tile_mask_pm_gfx1201.hxaco");
 
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile pull, two-rank
-/// specialization, gfx1201 only (`hipfire-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm
+/// specialization, gfx1201 only (`peacemaker-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm
 /// --arch gfx1201`, M7 obligation-free, 48-byte kernarg): copies the rows of every non-owned live
 /// tile from the one peer's `y_down_grouped` onto the local buffer.
 pub const EP_TILE_PULL_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1201.hxaco");
 
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile pull, rank-generic
-/// specialization, gfx1201 only (`hipfire-isa emit --kernel
+/// specialization, gfx1201 only (`peacemaker-isa emit --kernel
 /// ep_gather_grouped_rows_by_tile_owner_n4_pm --arch gfx1201`, M7 obligation-free, 72-byte
 /// kernarg): copies the rows of every non-owned live tile from the owner rank's
 /// `y_down_grouped` (one of four source bases, 2 or 4 ranks) onto the local buffer.

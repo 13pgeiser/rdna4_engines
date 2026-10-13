@@ -136,7 +136,7 @@ the derived files carry the SPDX identifier noted below.
   crates/railgun/src/npu/mod.rs (no header text copied).
 
 - crates/npu-tools/native/coop27/v2b_pm_gfx1151.s is hipfire's own PM
-  emitter output (`hipfire-isa emit --kernel iu4_v2b --epi all --arch
+  emitter output (`peacemaker-isa emit --kernel iu4_v2b --epi all --arch
   gfx1151`); coop27 embeds the incumbent code object directly from
   kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco.
 

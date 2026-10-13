@@ -312,7 +312,7 @@ requires finite F16 inputs, as does the screened lab contract. Geometry may be
 larger than the live token count; it must equal the submitted NPU program.
 
 The signed-IU8 WMMA GEMM and BF16/F32 scatter are certified PM gfx1151 kernels
-(`hipfire-isa emit --kernel npu_trunk`, committed image and M7 receipt).
+(`peacemaker-isa emit --kernel npu_trunk`, committed image and M7 receipt).
 Activation grid `ceilf` and epilogue unsigned CLZ currently use hipcc, with the
 two missing ISA-table operations logged in release-0.4.2/PM-GAPS.md. This is an
 opt-in primitive API only: no scheduler, forward hook or NPU device open.

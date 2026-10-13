@@ -27,6 +27,9 @@ sha2.workspace = true
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }
 peacemaker-npu = { path = "../peacemaker-npu" }
+peacemaker-isa = { path = "../peacemaker-isa" }
+peacemaker-ir = { path = "../peacemaker-ir" }
+peacemaker-lift = { path = "../peacemaker-lift" }
 half.workspace = true
 
 [[example]]

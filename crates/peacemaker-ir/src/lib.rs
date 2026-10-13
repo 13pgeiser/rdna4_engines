@@ -214,7 +214,7 @@ mod tests {
     /// Pinned-encoding gate: every declared gfx12 form's sample instruction is
     /// assembled by the ROCm `llvm-mc` and compared byte-for-byte with the
     /// table's committed encoding. Resolves via `ROCM_PATH` like
-    /// `hipfire-isa::toolchain`; a host without the toolchain (the no-GPU CI
+    /// `peacemaker-isa::toolchain`; a host without the toolchain (the no-GPU CI
     /// runner) skips the comparison — the gate still runs wherever the
     /// assembler exists.
     #[test]

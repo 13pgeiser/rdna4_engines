@@ -24,7 +24,7 @@ NPU owns **whole output features** (weight rows), statically per GEMM, as a lead
 | FA q (16) | 8192×12288×5120, 13.722 | `:8108-8123`; `gemm.rs:32630-32655` | n=2560 | SET. `wq.m = 2·q_dim` includes the output gate (`batch.rs:101,350`). Windows must hold **complete head windows** of Q+gate. [INFERENCE] 5 heads × 512 rows for head_dim 256; confirm against `batch.rs:101,350` |
 | FA k,v (32) | 8192×1024×5120, 1.386 | `:8108-8123` | none (n=0) | stays on GPU |
 | o_proj (64) | 8192×5120×6144, 6.706 | `:243-262,8816-8817` | n=1024 | SET `delta`, then the GPU deferred `RN(x+delta)` fold |
-| gate_up (64) | 8192×34816 (two 17408 halves)×5120, 38.547 | `:7428-7456,9658-9686`; `gemm.rs:33869-34000` | n=7168 total = G[0,3584) + U[0,3584) | NPU emits **separate f32 pre-SiLU g and u**. The GPU applies the unchanged f32 SiLU `silu(g)*u` (`W:crates/hipfire-isa/src/kernels/iu4_v2b.rs:753-758`). No Flash BF16 path |
+| gate_up (64) | 8192×34816 (two 17408 halves)×5120, 38.547 | `:7428-7456,9658-9686`; `gemm.rs:33869-34000` | n=7168 total = G[0,3584) + U[0,3584) | NPU emits **separate f32 pre-SiLU g and u**. The GPU applies the unchanged f32 SiLU `silu(g)*u` (`W:crates/peacemaker-isa/src/kernels/iu4_v2b.rs:753-758`). No Flash BF16 path |
 | down (64) | 8192×5120×17408, 18.939 | `:7829-7836,10049-10056`; `gemm.rs:35772-35781` | n=1024 | NPU delta f32. The GPU does `RN(old + delta)` **once** into `x_batch` |
 
 (All numbers are the measured Halo trace of `D27` §1 except the windows, which are the ESTIMATE optimum of §4.)

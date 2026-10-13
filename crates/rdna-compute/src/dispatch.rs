@@ -3584,7 +3584,7 @@ impl Gpu {
     }
 
     /// Load the admitted builder bundle into the same module/function cache as
-    /// JIT kernels. The embedded image keeps runtime independent of hipfire-isa
+    /// JIT kernels. The embedded image keeps runtime independent of peacemaker-isa
     /// and of a working-tree-relative artifact path; it is admitted as an
     /// in-memory code object (no file is written) and every requested export
     /// binds to that one digest. A function already bound to a different image

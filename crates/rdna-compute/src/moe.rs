@@ -3137,7 +3137,7 @@ impl Gpu {
 pub const QWEN4_EP_OWNER_EXPERTS: usize = 512;
 
 /// Module key of the embedded certified builder (PeaceMaker) image of
-/// [`Gpu::qwen4_ep_owner_assign`] (`hipfire-isa emit --kernel
+/// [`Gpu::qwen4_ep_owner_assign`] (`peacemaker-isa emit --kernel
 /// qwen4_ep_owner_assign_pm --arch gfx1201`).
 pub const QWEN4_EP_OWNER_ASSIGN_PM_MODULE: &str = "qwen4_ep_owner_assign_pm_gfx1201";
 /// Device symbol of the builder kernel.
@@ -3150,18 +3150,18 @@ pub fn qwen4_ep_owner_assign_pm_arch(arch: &str) -> bool {
 }
 
 /// Module key of the embedded certified builder (PeaceMaker) image of
-/// [`Gpu::ep_tile_mask`] (`hipfire-isa emit --kernel ep_tile_mask_pm --arch gfx1201`).
+/// [`Gpu::ep_tile_mask`] (`peacemaker-isa emit --kernel ep_tile_mask_pm --arch gfx1201`).
 pub const EP_TILE_MASK_PM_MODULE: &str = "ep_tile_mask_pm_gfx1201";
 /// Device symbol of the tile mask kernel.
 pub const EP_TILE_MASK_PM_SYMBOL: &str = "ep_tile_mask_pm_gfx1201";
 /// Module key of the embedded certified builder (PeaceMaker) image of the two-rank
-/// specialization of [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`hipfire-isa emit --kernel
+/// specialization of [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`peacemaker-isa emit --kernel
 /// ep_gather_grouped_rows_by_tile_owner_pm --arch gfx1201`).
 pub const EP_TILE_PULL_PM_MODULE: &str = "ep_gather_grouped_rows_by_tile_owner_pm_gfx1201";
 /// Device symbol of the two-rank tile pull kernel (one peer base, 48-byte kernarg).
 pub const EP_TILE_PULL_PM_SYMBOL: &str = "ep_gather_grouped_rows_by_tile_owner_pm_gfx1201";
 /// Module key of the embedded certified builder (PeaceMaker) image of the rank-generic
-/// specialization of [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`hipfire-isa emit --kernel
+/// specialization of [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`peacemaker-isa emit --kernel
 /// ep_gather_grouped_rows_by_tile_owner_n4_pm --arch gfx1201`).
 pub const EP_TILE_PULL_N4_PM_MODULE: &str = "ep_gather_grouped_rows_by_tile_owner_n4_pm_gfx1201";
 /// Device symbol of the rank-generic tile pull kernel (four source bases, 72-byte kernarg).

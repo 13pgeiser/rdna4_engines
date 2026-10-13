@@ -15,20 +15,29 @@ The output is a Git repository with a standalone Cargo workspace; check it
 with `cargo check --workspace` in that directory.
 
 The mirror contains `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`,
-and `peacemaker-npu`, plus their minimal transitive path dependency closure.
-There are currently no Cargo path dependencies outside these four crates.
-Tests also read `crates/rocm.rs` and eight `kernels/*.hxaco` fixtures, which
-are retained. Source SPDX headers and LICENSE, LICENSE-APACHE, LICENSE-MIT
-and NOTICE are preserved.
+`peacemaker-npu`, `peacemaker-isa`, and `peacemaker-rip`, plus their minimal
+standalone dependency closure. Source fixtures and SPDX headers are retained.
+A generated PeaceMaker-specific LICENSE points to LICENSE-APACHE,
+LICENSE-MIT and LICENSE-LLVM-EXCEPTION and to hipfire's canonical governance
+documents. NOTICE is preserved.
 
-The split preserves retained revisions, authors, dates, and ancestry.
-Historical `pm-npu` paths map to `peacemaker-npu`. Mixed-purpose monorepo
-commit messages are replaced with neutral canonical source-commit references.
+`radiowave` is self-contained and included for the ISA `toolchain` feature.
+The cross-layer `dflash_accept_emu` integration test lives in
+`rdna-compute/tests`, not the ISA crate; the ISA crate has no dev dependency
+on `rdna-compute`, so the mirror does not pull in hipfire's runtime.
+The shared ROCm helper and emitted kernel fixtures are retained for tests.
+hipfire does not contain the full LLVM exception text; the mirror generates
+LICENSE-LLVM-EXCEPTION from the standard LLVM Project exception.
+
+The split preserves retained revisions, dates, and ancestry, applying the
+checked-in `scripts/mirror.mailmap` to author and committer metadata on every
+run. Generated commits use Kaden Schutt's public `kaden@hipfire.dev` identity.
+Historical crate paths map to their new names. Mixed-purpose monorepo commit
+messages are replaced with neutral canonical source-commit references.
 A deterministic final commit adds the generated workspace, pruned lockfile,
-and README pointing to hipfire. Unrelated hipfire root Cargo.toml/README
-history is not copied. Existing source and artifact provenance is copied
-faithfully; generated tooling and docs contain no private workstation
-provenance.
+README and LICENSE. Unrelated hipfire root Cargo.toml/README history is not
+copied. Existing source and artifact provenance is copied faithfully;
+generated tooling and docs contain no private workstation provenance.
 
 ## One-time setup and release cut
 
@@ -55,14 +64,16 @@ git rebase origin/beta
 # Resolve newly merged NPU imports/manifests to peacemaker_npu/peacemaker-npu;
 # preserve the merged NPU implementation. Regenerate its maps if needed.
 cargo check --workspace --locked
+cargo test -p peacemaker-isa -p peacemaker-rip --no-run --locked
 scripts/mirror-split.sh peacemaker "$CUT_ROOT/mirror-cut/peacemaker"
 cargo check --workspace --manifest-path "$CUT_ROOT/mirror-cut/peacemaker/Cargo.toml"
+cargo test --workspace --no-run --manifest-path "$CUT_ROOT/mirror-cut/peacemaker/Cargo.toml"
 ```
 
 Run the external publication guard over both the hipfire delta and every
 commit delta in the complete filtered history, including generated files.
 CPU-only merge gate specs are
-`-p peacemaker-npu;-p npu-tools;-p hipfire-arch-qwen4;-p rdna-compute;-p peacemaker-ir;-p peacemaker-lift;-p peacemaker-author`.
+`-p peacemaker-npu;-p npu-tools;-p hipfire-arch-qwen4;-p rdna-compute;-p peacemaker-ir;-p peacemaker-lift;-p peacemaker-author;-p peacemaker-isa;-p peacemaker-rip`.
 The operator's merge gate rebases again, regenerates maps, runs documentation
 ratchets and these tests, adds the recording-inventory test, and pushes beta.
 Do not run it during preparation. The beta push triggers the first automatic

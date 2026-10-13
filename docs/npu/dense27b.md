@@ -36,7 +36,7 @@ lm_head is a 1-row GEMV in prefill, not an IU4 GEMM.
 
 ## 2. The GPU route's exact numeric contract
 
-Sources: `W:kernels/src/gemm_mq4g256v2_residual_iu4_v2b.gfx11.hip:14-33,146-157,244-290,346-371,443-483`, `W:crates/hipfire-isa/src/kernels/iu4_fold.rs`, `W:crates/hipfire-isa/src/kernels/iu4_v2b.rs:1-40,521-527`, `W:kernels/src/block_i4_128_quant.hip`.
+Sources: `W:kernels/src/gemm_mq4g256v2_residual_iu4_v2b.gfx11.hip:14-33,146-157,244-290,346-371,443-483`, `W:crates/peacemaker-isa/src/kernels/iu4_fold.rs`, `W:crates/peacemaker-isa/src/kernels/iu4_v2b.rs:1-40,521-527`, `W:kernels/src/block_i4_128_quant.hip`.
 
 1. **Weights (symmetric MQ4G256V2, "XTS").** Each feature row is `K/256` groups of 136 B. A group is `[f16 sc0, f16 zp0, f16 sc1, f16 zp1]` plus 128 nibble bytes. K half `h` (epoch `e = 2*group + h`) is the 64 B at `+8+64h`. Byte `j` holds K `2j` in its low nibble and `2j+1` in its high nibble.
    - Nibbles `u` are unsigned, with `zp == -8*sc`.

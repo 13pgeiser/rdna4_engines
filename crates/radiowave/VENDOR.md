@@ -55,7 +55,7 @@ next re-vendor will silently revert it.
 
 The union schema is a separate serde module: `CompileManifest`,
 `PeacemakerRecord` and `OracleReceipt` (and every existing downstream user:
-`hipfire-isa`, `railgun-cert`, `rdna-compute`) are unchanged. The module is
+`peacemaker-isa`, `railgun-cert`, `rdna-compute`) are unchanged. The module is
 CPU-only and adds no dependency.
 
 To re-vendor the union module later, copy `src/union.rs`,

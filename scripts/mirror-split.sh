@@ -16,6 +16,8 @@
 # it is not on PATH).
 # Requires: git, python3 >= 3.11, git-filter-repo 2.47.0, cargo (settles the
 # generated Cargo.lock).
+# Author and committer metadata is normalized by the checked-in
+# scripts/mirror.mailmap on every run (it is not part of the mirrored tree).
 # See scripts/mirror_split.py for the exact rules.
 set -euo pipefail
 

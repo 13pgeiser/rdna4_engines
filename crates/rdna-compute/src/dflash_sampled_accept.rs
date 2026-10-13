@@ -32,7 +32,7 @@ pub const DFLASH_SAMPLED_ACCEPT_SYMBOL: &str = "dflash_sampled_accept_sparse_q_f
 /// Threads (= CDF segments) of the single block; `DSA_THREADS` in the kernel.
 pub const DFLASH_SAMPLED_ACCEPT_THREADS: usize = 256;
 /// Certified builder (PeaceMaker) module of the production gfx1201 kernel
-/// (`hipfire-isa emit --kernel dflash_accept --arch gfx1201`), same ABI, grid
+/// (`peacemaker-isa emit --kernel dflash_accept --arch gfx1201`), same ABI, grid
 /// and output words as the hipcc oracle.
 pub const DFLASH_SAMPLED_ACCEPT_PM_MODULE: &str = "dflash_sampled_accept_pm_gfx1201";
 /// Device symbol of the production builder kernel.

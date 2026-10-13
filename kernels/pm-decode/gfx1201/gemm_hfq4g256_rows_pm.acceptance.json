@@ -4,7 +4,7 @@
   "arch": "gfx1201",
   "image_sha256": "797358d9320e112003efdfa3ebc7ba684323f7d2b754bc569bfa9207e8b084c7",
   "native_co_sha256": "ede744888afcaacad47980e22f52060d7ea49dbd1675911dcfadda5d84cc7535",
-  "emitter": "crates/hipfire-isa/src/kernels/pm_decode/gemm_hfq4g256_rows_pm.rs",
+  "emitter": "crates/peacemaker-isa/src/kernels/pm_decode/gemm_hfq4g256_rows_pm.rs",
   "rows_per_wave": 4,
   "columns_per_tile": 8,
   "grid": "(ceil(M/4),ceil(N/8),1)",

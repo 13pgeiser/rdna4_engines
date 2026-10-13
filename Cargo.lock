@@ -1685,20 +1685,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hipfire-isa"
-version = "0.4.1"
-dependencies = [
- "peacemaker-author",
- "peacemaker-ir",
- "peacemaker-lift",
- "radiowave",
- "rdna-compute",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "hipfire-loader"
 version = "0.4.2"
 dependencies = [
@@ -1786,18 +1772,6 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "ureq",
-]
-
-[[package]]
-name = "hipfire-rip"
-version = "0.4.2"
-dependencies = [
- "hipfire-isa",
- "peacemaker-author",
- "proc-macro2",
- "quote",
- "serde_json",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -2655,6 +2629,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "peacemaker-isa"
+version = "0.4.1"
+dependencies = [
+ "peacemaker-author",
+ "peacemaker-ir",
+ "peacemaker-lift",
+ "radiowave",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "peacemaker-lift"
 version = "0.4.2"
 dependencies = [
@@ -2672,6 +2659,18 @@ dependencies = [
 [[package]]
 name = "peacemaker-npu"
 version = "0.4.2"
+
+[[package]]
+name = "peacemaker-rip"
+version = "0.4.2"
+dependencies = [
+ "peacemaker-author",
+ "peacemaker-isa",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "percent-encoding"
@@ -3193,6 +3192,9 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "libloading",
+ "peacemaker-ir",
+ "peacemaker-isa",
+ "peacemaker-lift",
  "peacemaker-npu",
  "radiowave",
  "railgun",

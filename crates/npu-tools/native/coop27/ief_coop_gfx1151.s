@@ -1,5 +1,5 @@
 ; PM-native gfx1151 kernels for the dense-27B down co-op prototype (coop27). No vendor assembler.
-; Assembled by peacemaker (wt-land-041m hipfire_isa::native): crates/npu-tools/native/coop27/build.sh.
+; Assembled by peacemaker (wt-land-041m peacemaker_isa::native): crates/npu-tools/native/coop27/build.sh.
 ; Wave32. Host pages shared with the NPU (userptr BO + hipHostRegister) are stored glc slc dlc and loaded glc dlc.
 ;
 ; ief_db    kernarg 32 B: xq u64 @0, dc u64 @8, bc u64 @16, T u32 @24, E u32 @28. Block 256, grid T/256 (E % 4 == 0).

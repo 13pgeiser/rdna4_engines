@@ -3171,7 +3171,7 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     {
         let isa = |name: &str| -> Value {
             let p = format!(
-                "{}/../hipfire-isa/kernels/{name}.{}.contract.json",
+                "{}/../peacemaker-isa/kernels/{name}.{}.contract.json",
                 env!("CARGO_MANIFEST_DIR"),
                 gpu.arch
             );
