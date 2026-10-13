@@ -158,11 +158,11 @@ Repeating sidecars is the explicit traffic tradeoff for retaining the existing
 input ring machinery; pair-stage serialization makes the resident panel fit.
 
 `npu-gemm M 1280 K --variant G80 --epi bf16` supplies deterministic grid
-scales and compares checked outputs to `pm-npu::kernels::w8a8_epi::bf16_direct`.
+scales and compares checked outputs to `peacemaker-npu::kernels::w8a8_epi::bf16_direct`.
 At design time this arithmetic, DMA layout and the simulator timings carried no
 silicon claim; the shipped route has since been validated on hardware (see
 Serving status). The legacy int8/I32 PDI/TXN hashes for M256/M8192, N1280,
-K2560, Fast/Slow remain pinned in `pm-npu`'s `golden_bytes.rs`
+K2560, Fast/Slow remain pinned in `peacemaker-npu`'s `golden_bytes.rs`
 (`g80_legacy_bytes_match_golden`) as records of the pre-BF16 images; no trunk
 serving path uses them.
 

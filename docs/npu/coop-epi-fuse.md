@@ -9,7 +9,7 @@ Model `qwen3.8-27b.mq4-xts` (sha256 `3e38ccba…f6f8ae`), L2 / L42 real weights.
 `logs/coopepi/` (copied from the measurement host). Labels: **M** measured, **E** estimate.
 
 ## 1. What was built (no hipfire edits; everything vendored into `crates/npu-tools/native/coop27/`)
-* **The incumbent in PM text.** `v2b_pm_gfx1151.s` is `hipfire-isa emit --kernel iu4_v2b --epi all --arch gfx1151` from
+* **The incumbent in PM text.** `v2b_pm_gfx1151.s` is `peacemaker-isa emit --kernel iu4_v2b --epi all --arch gfx1151` from
   the 0.4.1 hipfire beta checkout at 9aef0a35f. Peacemaker assembles it to an ELF byte-identical to the one inside the vendored
   `.hxaco` (M, `cmp`).
 * **PM twins, the fold** (`native/build.sh`). `ief_gu_fold` and `ief_add_fold` are the incumbent gate_up SiLU and down ADD

@@ -3,7 +3,7 @@
 > **Lifecycle: historical dark research record (2026-10-03); the contract it implements is
 > not a shipped path.** The IEF15 mixed-contract co-op was never wired into any serving route
 > (see [`fold-contract.md`](fold-contract.md): full IEF15 killed, mixed plan unimplemented).
-> The kernel exists only as dark `pm-npu` code and a lab `npu-gemm --fold-contract ief15`
+> The kernel exists only as dark `peacemaker-npu` code and a lab `npu-gemm --fold-contract ief15`
 > probe. It is unrelated to the 0.4.2 Flash-Next NPU trunk, which is BF16-direct only
 > (calibration schema 4, input projections only, out-projection unwired; no I32/IEF15
 > contract); see [`npu-trunk.md`](npu-trunk.md). Text written before §8 ("nothing below is a

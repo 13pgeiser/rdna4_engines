@@ -3,7 +3,7 @@
 > **Lifecycle: historical dark research record (0.4.1, decided 2026-10-05); superseded as a
 > design.** The full-IEF15 route (G0/G1) is **killed**, and the mixed-contract co-op plan
 > in §§3–8 was never wired into any serving path. Only the dark CPU oracle and NPU
-> pair-core pieces (`tools/npu/fold-model`, `pm-npu::kernels::iu4_ief15*`) exist; the
+> pair-core pieces (`tools/npu/fold-model`, `peacemaker-npu::kernels::iu4_ief15*`) exist; the
 > GPU sidecar/split modules named in §8 were not written. No `I32` or IEF15 contract
 > is a shipped 0.4.2 path: the current Flash-Next NPU trunk is BF16-direct only
 > (calibration schema 4, input projections only; out-projection unwired). See
@@ -93,7 +93,7 @@ Full requested tables [`numeric-tables.md`](../../tools/npu/fold-model/numeric-t
 
 ## 6. Candidate AIE/GPU costs
 
-Slot lower bounds are **estimates/instruction census**, not NPU IEF measurements.16-lane issue model `crates/pm-npu/src/kernels/iu4_fold_model.rs:7-46`; measured GEMM.331cycles/output/epoch (`docs/npu/dense27b.md:90-100`), nativeVMACfloor.25. Vecslot competes with GEMM; apparent.081slack is not automatically free.
+Slot lower bounds are **estimates/instruction census**, not NPU IEF measurements.16-lane issue model `crates/peacemaker-npu/src/kernels/iu4_fold_model.rs:7-46`; measured GEMM.331cycles/output/epoch (`docs/npu/dense27b.md:90-100`), nativeVMACfloor.25. Vecslot competes with GEMM; apparent.081slack is not automatically free.
 
 | Contract | AIE2P additional work per16outputs/epoch | GPU gfx1151 / gfx1201 cost | Rank |
 |---|---|---|---|
@@ -144,7 +144,7 @@ Reviewers own final admission. OriginalG0/G1 are killed. No project-widebuild/te
 
 ### M0 — cheapest NPU arithmetic/rate kill gate
 
-Slice: NPU fold. New `crates/pm-npu/src/kernels/iu4_ief15.rs`, module registration, new scoped `crates/pm-npu/tests/iu4_ief15.rs`, `npu-gemm` explicitIEFprobe. Reuse QT44/72BA4decoders `crates/pm-npu/src/kernels/iu4.rs:36-110`, schedule/emitter `gemm_core.rs:74-115,393-437,785-820`, slotmodel `iu4_fold_model.rs:7-46`. IncumbentV8/V9/G80 untouched.
+Slice: NPU fold. New `crates/peacemaker-npu/src/kernels/iu4_ief15.rs`, module registration, new scoped `crates/peacemaker-npu/tests/iu4_ief15.rs`, `npu-gemm` explicitIEFprobe. Reuse QT44/72BA4decoders `crates/peacemaker-npu/src/kernels/iu4.rs:36-110`, schedule/emitter `gemm_core.rs:74-115,393-437,785-820`, slotmodel `iu4_fold_model.rs:7-46`. IncumbentV8/V9/G80 untouched.
 
 Frozen API: `Ief15Gemm::new(tokens:usize,features:usize,k:usize,ctl:Control)->Result<Self,String>`; `pack_in(&self,w:&Weights<'_>,x:&Acts<'_>,s:&[u16],a:&[i16],d:&[u16],b:&[i16])->Result<[Vec<u8>;2],String>`; `reference` samearguments->`Vec<u8>` LEf32. OwnedArrayDesignuses existing `append_run_body`/`append_lean_run_body` transactionAPI (`docs/npu/railgun-npu.md` §3.4); exportnewwavegeometry, neverassumeV9. Kernelfold:twoK64GEMMchunks ->C32;VMULS15D15->acc64,VSRS0->signedP32,VMAC32×signedC16->I64. Cconversion is lossless [-7168,8192], not saturating. Finalvariable normalization is compare/select plus fixedshifts; AIE has novectorclz/lanevariableshift. C scratch becomes finalf32output onlyafterallreadsretire.
 
@@ -154,15 +154,15 @@ Orderedgate:CPUoracle ->assembler/simulatorrange/RAW/memoryproof ->extremeC,canc
 
 ### M1 — NPU-only sidecar production, no GPU IEF route
 
-Slice: metadata. Own new `W:crates/rdna-compute/src/npu_ief15_scales.rs` and `W:crates/hipfire-isa/src/kernels/npu_ief15_scales.rs`; Shared registrations are integrated centrally. Frozen CPU API `encode_npu_ief15_qt44_scales(payload:&[u8],rows:usize,k:usize)->Result<(Vec<u16>,Vec<i16>),String>` returns S/a from load-time original bytes. Frozen host API `Gpu::fill_npu_ief15_scales(&mut self,xq:&GpuTensor,d:&GpuTensor,b:&GpuTensor,tokens:usize,k:usize)->HipResult<()>` fills caller-preallocated D/b. PMargs `(Xq,D,b,tokens,K)` =threeu64ptrs+twou32,32B. Exact exponent-bit/RNE grid, zero/tie/subnormal/nonfinite rejection, no q changes or weight readback. Regenerate D/b after every A4 write; no flag-off buffers/launches or capture-time allocation. Direct-launch byte oracle with changed inputs, producer-cost measurement and emitted bundle/type handoff are acceptance; no GPU IEF fold/schema.
+Slice: metadata. Own new `W:crates/rdna-compute/src/npu_ief15_scales.rs` and `W:crates/peacemaker-isa/src/kernels/npu_ief15_scales.rs`; Shared registrations are integrated centrally. Frozen CPU API `encode_npu_ief15_qt44_scales(payload:&[u8],rows:usize,k:usize)->Result<(Vec<u16>,Vec<i16>),String>` returns S/a from load-time original bytes. Frozen host API `Gpu::fill_npu_ief15_scales(&mut self,xq:&GpuTensor,d:&GpuTensor,b:&GpuTensor,tokens:usize,k:usize)->HipResult<()>` fills caller-preallocated D/b. PMargs `(Xq,D,b,tokens,K)` =threeu64ptrs+twou32,32B. Exact exponent-bit/RNE grid, zero/tie/subnormal/nonfinite rejection, no q changes or weight readback. Regenerate D/b after every A4 write; no flag-off buffers/launches or capture-time allocation. Direct-launch byte oracle with changed inputs, producer-cost measurement and emitted bundle/type handoff are acceptance; no GPU IEF fold/schema.
 
 ### M2 — current-fold strided split proof (independent of M0)
 
-Slice: GPU current-route. Own new `W:crates/hipfire-isa/src/kernels/iu4_current_split.rs` and `W:crates/rdna-compute/examples/iu4_current_split_probe.rs`; Shared registrations are integrated centrally. Never reuse G0's IEF five-op kernel. Anchor `W:hipfire-isa/src/kernels/iu4_v2b.rs:92-100,508-555,687-748`; preserve WMMA/fmaf/SiLU, change feature-window addresses only. Proposed `emit(Spec{arch:Arch,epi:Epi})->Result<Emitted,String>` uses existing proof types. SET `(A,Xq,Y,M,K,N,LDY,COL0)` =threeu64ptrs+fiveu32,44B; ADD appendsGSHIFT,48B; SiLU `(G,U,Xq,Y,M,K,N,LDY,COL0)` =fourptrs+fiveu32,52B. Rebase A to local rows; Xq shared; Y offset `token*LDY+COL0+row`. SiLU M counts paired hidden features (34816combined rows=>M17408), LDY/COL0 are hidden-output units. Keep M%256 admission; paired cut256hidden/512combined. Flag-off config/schema/bundles unchanged.
+Slice: GPU current-route. Own new `W:crates/peacemaker-isa/src/kernels/iu4_current_split.rs` and `W:crates/rdna-compute/examples/iu4_current_split_probe.rs`; Shared registrations are integrated centrally. Never reuse G0's IEF five-op kernel. Anchor `W:peacemaker-isa/src/kernels/iu4_v2b.rs:92-100,508-555,687-748`; preserve WMMA/fmaf/SiLU, change feature-window addresses only. Proposed `emit(Spec{arch:Arch,epi:Epi})->Result<Emitted,String>` uses existing proof types. SET `(A,Xq,Y,M,K,N,LDY,COL0)` =threeu64ptrs+fiveu32,44B; ADD appendsGSHIFT,48B; SiLU `(G,U,Xq,Y,M,K,N,LDY,COL0)` =fourptrs+fiveu32,52B. Rebase A to local rows; Xq shared; Y offset `token*LDY+COL0+row`. SiLU M counts paired hidden features (34816combined rows=>M17408), LDY/COL0 are hidden-output units. Keep M%256 admission; paired cut256hidden/512combined. Flag-off config/schema/bundles unchanged.
 
 Allsevennamedshapes, splitZ|beta|alphastoresemantics notplainSET, FAprojections, o_projdeferredresidual, gate_upanddownADD. Callsiteanchors `W:rdna-compute/src/gemm.rs:20522-20594,31555`; `hipfire-arch-qwen35/src/qwen35/prefill.rs:249-259,433,5744-5790`. RunLSPfullreferencesbeforeexportchanges. A4produceralreadyshared. CapturemustnotfallthrougholdV2Beageronlypredicate atgemm.rs20532-20533toanothernumericroute. GPU-ownedcolumns byte-equal incumbent; sentineluntouchedNPUcolumns,LDY>M,pairedGU,ADDoldYpadding. ScopedactualPMlaunch,eager/graph/Redlineexactparity;>=3freshprocesstiming identicalinputs. Current-strided>3%weightedslowdownorpackingcostbreakingtargetmodel killsmixedpromise; do notreuseG0cost-freeGPUassumptionafterfailure.
 
-Buildsequence forM1/M2:scopedCPUoracle; `cargo build -p hipfire-isa --features toolchain --bin hipfire-isa`; RustPMnativeemitter `--co/--bundle` (`src/bin/hipfire-isa.rs:23-25`), nohipcc; scopedrdna-computeprobe. Sharedregistrationwritesareintegratedcentrally; /emittedassetinstallationtoavoidraces. M0andM2 canrunindependently withserializedhardwarewindows; M1'sbuffers feedM0+integration afteritsoracle.
+Buildsequence forM1/M2:scopedCPUoracle; `cargo build -p peacemaker-isa --features toolchain --bin peacemaker-isa`; RustPMnativeemitter `--co/--bundle` (`src/bin/peacemaker-isa.rs:23-25`), nohipcc; scopedrdna-computeprobe. Sharedregistrationwritesareintegratedcentrally; /emittedassetinstallationtoavoidraces. M0andM2 canrunindependently withserializedhardwarewindows; M1'sbuffers feedM0+integration afteritsoracle.
 
 ### M3 — caller-owned fixed-map integration/final gate
 

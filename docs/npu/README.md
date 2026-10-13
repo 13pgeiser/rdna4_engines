@@ -25,7 +25,7 @@ performance claims or admission evidence; use the root
 
 | Piece | Where | What |
 |---|---|---|
-| `pm-npu` | `crates/pm-npu` | AIE2P emitter: VLIW encoder/scheduler (`isa`, tables generated from llvm-aie TableGen), CDO/PDI writer, DPU transaction writer, DMA/route/registers, kernel designs (`kernels`: int8 GEMM, whole-array V8–V10/G80, IU4/IEF15, ring, experts, bw probe), and the offline simulator (`sim`). Bins `pm-npu-objdump`, `pm-npu-sim`. |
+| `peacemaker-npu` | `crates/peacemaker-npu` | AIE2P emitter: VLIW encoder/scheduler (`isa`, tables generated from llvm-aie TableGen), CDO/PDI writer, DPU transaction writer, DMA/route/registers, kernel designs (`kernels`: int8 GEMM, whole-array V8–V10/G80, IU4/IEF15, ring, experts, bw probe), and the offline simulator (`sim`). Bins `peacemaker-npu-objdump`, `peacemaker-npu-sim`. |
 | `railgun::npu` | `crates/railgun/src/npu` (feature `npu`; enabled by `hipfire-arch-qwen4` on Linux) | Runtime: device query, DEV_HEAP, hardware context, CONFIG_CU, BOs, eager/prepared/chained submit, persistent ring, `tape`, FCLK guard (`fclk`), dlopen'd HIP interop (`hip_runtime`). |
 | `npu-tools` | `crates/npu-tools` | Every binary: `npu-tools` (`aie-status`, `txn-dump`, `soc-metrics`, `m4`, `tblgen2rs`, `gpu-bw`, `fclk`), `npu-gemm`, `npu-hello`, `npu-experts`, `npu-ring`, `npu-railgun`, `npu-bw`, `npu-coop`, and `coop27` (`--features lab`). |
 | Scripts | `tools/npu/` | Silicon-window harnesses (`npu-window.sh` pins FCLK and takes the timing lock), batch/bisect drivers, the `a4-ec` and `fold-model` offline analyses (standalone cargo projects). |

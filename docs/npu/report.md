@@ -242,9 +242,9 @@ Host changes: **none** (no driver, firmware, IOMMU, kernel-parameter or persiste
 
 ## Handoff for M3 (multi-core int8 GEMM at expert shapes) and M4 (GPU+NPU concurrency)
 
-**State.** The NPU workspace repo `main` holds railgun::npu, pm-npu (encoder, decoder,
+**State.** The NPU workspace repo `main` holds railgun::npu, peacemaker-npu (encoder, decoder,
 VLIW packer, CDO/PDI/TXN, DMA/route, `kernels/gemm_i8.rs` incl. single-core `design()` and the 8×4
-`ArrayPlan` staging), pm-npu-sim, npu-hello, npu-gemm, `tools/npu/npu-window.sh`, `tools/npu/npu-batch.sh`.
+`ArrayPlan` staging), peacemaker-npu-sim, npu-hello, npu-gemm, `tools/npu/npu-window.sh`, `tools/npu/npu-batch.sh`.
 Folded since: scheduler-checker slice (`d3c3cc1`), simulator slice exact-PDI/TXN + whole-array sim (`00a7d86`, `c5ca1dd`), gemm_core v2
 (`646a1fb`), gemm_array + bisect variants (`9232c8a`). Open branches: `npu/m3-kernel` e96b835 (Serial/LockOnly
 core variants, gated), `npu/m3-array` 7e83786 (bisect2 READY, merged e96b835 + main 5f05360: `--core Fast|Serial|LockOnly`, `--dump-status` on success and failure incl. single-core, Rust status decoder, V1 same-lane fix, `tools/npu/npu-bisect2.sh`; not yet merged to main or run on hardware). Vendor corpus:
@@ -437,7 +437,7 @@ B (0x4000..), so every B load and C load collided. Four maps were tried on silic
 The wavefront issues 1070 cycles per chunk; ~290 stall cycles remain (both pair cores read the same A banks; DMA writes
 share banks with core reads).
 
-**AIE2P rule gate (`crates/pm-npu/src/isa/rules.rs`, asked in review).** `Program::finish` now rejects, with the rule and pc:
+**AIE2P rule gate (`crates/peacemaker-npu/src/isa/rules.rs`, asked in review).** `Program::finish` now rejects, with the rule and pc:
 unaligned branch targets (unless the 16-byte line before the target is whole NOP bundles — the form FastSlowCtl and
 the single-core `gemm_i8` ran exact with), any `ls`/`le`/`lc` write (hardware ZOL never looped on silicon), lock requests
 < 4 bundles apart, and branches/DONE/locks or landing targets inside the 5 delay slots. One violating unit test per rule;
@@ -687,7 +687,7 @@ GEMM of every step poisoned and verified (96/96 and 1600/1600 per run):
 | **V10 `--b-prefix`** | 511 → **412** | **32.56** | 239 → 131 | 8,816 / 15,824 B |
 
 ## 2026-10-03 01:02 UTC — Lever 4 (G80, 256×1280 wave, 128×80 core tile): EXACT, faster at every gate_up shape (npu levers 60c2648)
-Paper gates `docs/npu/g80-feasibility.md`; simulator `crates/pm-npu/tests/g80.rs` 51/51 (gate_up 4096×1280×2560, expert M 64/160/200/513,
+Paper gates `docs/npu/g80-feasibility.md`; simulator `crates/peacemaker-npu/tests/g80.rs` 51/51 (gate_up 4096×1280×2560, expert M 64/160/200/513,
 odd/even resubmits, full/lean interleaves, grouped E=3), golden_bytes / levers3 / lean / ring green. Declared risky, approved by
 run alone: 34 s, all 36 checked submits exact (first + final of every loop), V9 health check after (25.39 / 25.04, exact),
 rc=0, accel0 present. Log `logs/levers-w6-60c2648.log`. Single GEMM per submit, busy / wall TOPS (µs/submit):

@@ -33,8 +33,8 @@ emitter (`cand.rs`) and its captured `out_full.txt`, both workspace-local and no
 The +3.5% normalized bank-model regression remains a risk, not a veto; the measured-baseline extrapolation still
 fails the 50-TOPS budget (§7). Smaller TM32/TM64 waves remain paper-only candidates, not implemented replacements.
 
-Source abbreviations: **C** = `crates/pm-npu/src/kernels/gemm_core.rs`; **G** = `crates/pm-npu/src/kernels/gemm_array.rs`;
-**D** = `crates/pm-npu/src/dma.rs`; **R** = `crates/pm-npu/src/route.rs`; **J** =
+Source abbreviations: **C** = `crates/peacemaker-npu/src/kernels/gemm_core.rs`; **G** = `crates/peacemaker-npu/src/kernels/gemm_array.rs`;
+**D** = `crates/peacemaker-npu/src/dma.rs`; **R** = `crates/peacemaker-npu/src/route.rs`; **J** =
 `docs/npu/levers-joint.md`; **F** = `docs/npu/levers-fable.md`.
 All byte counts use signed int8 inputs and int8 SRS output, not the GPU's int4 storage or BF16 epilogue.
 MiB/KiB mean powers of two. Geometry comes from J:121-145 and F:58-63, and expert dimensions from `report.md:79-80`.

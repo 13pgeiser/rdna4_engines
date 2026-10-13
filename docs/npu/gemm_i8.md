@@ -8,7 +8,7 @@
 > BF16-direct only (calibration schema 4, no I32 contract, input projections only;
 > out-projection unwired). See [`npu-trunk.md`](npu-trunk.md) for the current route.
 
-The Rust kernel is `pm_npu::kernels::gemm_i8`. It emits `isa::Program`
+The Rust kernel is `peacemaker_npu::kernels::gemm_i8`. It emits `isa::Program`
 bytes directly; neither build nor execution invokes a vendor compiler. This
 slice was offline when written; the Halo execution gate followed (see `report.md`).
 
