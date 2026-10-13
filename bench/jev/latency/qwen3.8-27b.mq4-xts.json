@@ -1,17 +1,6 @@
 {
  "model": "qwen3.8-27b.mq4-xts",
  "tasks": {
-  "ag-news": {
-   "n": 200,
-   "decide": {
-    "p50_ms": 545.3,
-    "p95_ms": 583.6
-   },
-   "generate": {
-    "p50_ms": 588.2,
-    "p95_ms": 712.4
-   }
-  },
   "banking77": {
    "n": 100,
    "decide": {

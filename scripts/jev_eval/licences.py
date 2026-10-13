@@ -8,12 +8,16 @@ Human decision (2026-09-29): every temperature is fitted on licence-clear
 held-out sources only. The sources below have restrictive or unclear
 redistribution terms; heldout.py `run` does not collect them unless asked
 explicitly (--allow-restricted), and calibrate.py refuses to fit on any row
-from them. Score-type T therefore comes from synth-score alone.
+from them. Score-type T therefore comes from synth-score alone, and noul-type
+T from sms-spam and synth-noul.
 
 Source names are the `source` field of a row: jev-bench task names
 (heldout rows and frozen reported rows alike) and calibration-set names."""
 
-RESTRICTED_SOURCES = frozenset({"ag-news", "duplicates", "yelp-stars", "offensive", "sentiment-it", "hellaswag"})
+# doc-yesno (BoolQ) is CC BY-SA 3.0: share-alike, not Apache-2.0 compatible, so
+# none of its derived rows ship in this repository (maintainer decision 2026-10-13).
+RESTRICTED_SOURCES = frozenset({"ag-news", "duplicates", "yelp-stars", "offensive", "sentiment-it", "hellaswag",
+                                "doc-yesno"})
 
 
 def is_restricted(source):

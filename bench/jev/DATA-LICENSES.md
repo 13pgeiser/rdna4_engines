@@ -24,38 +24,29 @@ adding a new source.
 | `massive-en`, `massive-it` | Amazon MASSIVE | CC BY 4.0 | yes | [HF dataset card](https://huggingface.co/datasets/AmazonScience/massive) |
 | `ledgar` | LEDGAR (LexGLUE) | CC BY 4.0 | yes | [HF dataset card](https://huggingface.co/datasets/coastalcph/lex_glue) |
 | `sms-spam` | UCI SMS Spam Collection | CC BY 4.0 | yes | [UCI ML Repository](https://archive.ics.uci.edu/dataset/228/sms+spam+collection) |
-| `doc-yesno` | BoolQ | CC BY-SA 3.0 | yes, attributed | [HF dataset card](https://huggingface.co/datasets/google/boolq) |
+| `doc-yesno` | BoolQ | CC BY-SA 3.0 (share-alike, not Apache-2.0 compatible) | **no** | [HF dataset card](https://huggingface.co/datasets/google/boolq) |
 | `ag-news` | AG News (di.unipi.it corpus) | Custom, restricts use to "data mining... and any other **non-commercial** activity" | **no** | [original notice](http://groups.di.unipi.it/~gulli/AG_corpus_of_news_articles.html), quoted on [HF dataset card](https://huggingface.co/datasets/fancyzhx/ag_news) |
 | `duplicates` | Quora Question Pairs (via GLUE QQP) | Quora/Kaggle terms: non-commercial, redistribution of raw examples discouraged | **no** (named explicitly in the human decision for this task) | [GLUE benchmark](https://gluebenchmark.com/), [Quora dataset release](https://quoradata.quora.com/First-Quora-Dataset-Release-Question-Pairs) |
 | `offensive` | TweetEval (OffensEval) | Listed "Undefined" on the dataset card; bound to Twitter's ToS, which restricts bulk redistribution of tweet-derived content | **no** | [HF dataset card](https://huggingface.co/datasets/cardiffnlp/tweet_eval) |
 | `sentiment-it` | CardiffNLP tweet_sentiment_multilingual | CC BY 3.0 base, but the card requires compliance with Twitter/Twitter API ToS on top | **no** (Twitter ToS is the binding, more restrictive layer) | [HF dataset card](https://huggingface.co/datasets/cardiffnlp/tweet_sentiment_multilingual) |
 | `yelp-stars` | Yelp Review Full | Yelp Dataset Terms of Use: non-commercial academic use only; explicitly forbids "redistribut[ing] summaries, metrics, or derived statistics" without Yelp's written consent | **no** (named explicitly in the human decision for this task) | [Yelp Dataset Terms of Use](https://s3-media0.fl.yelpcdn.com/assets/srv0/engineering_pages/f64cb2d3efcc/assets/vendor/Dataset_User_Agreement.pdf) |
 
-### `doc-yesno` (BoolQ): the one CC BY-SA 3.0 exception
+### `doc-yesno` (BoolQ): withheld, CC BY-SA 3.0
 
-Human decision (2026-09-29): keep these files, under BoolQ's own licence,
-rather than withhold them.
+BoolQ is CC BY-SA 3.0 (share-alike). Derived files under a share-alike
+licence cannot be carried inside this Apache-2.0 repository, so none ship
+here (maintainer decision, 2026-10-13, superseding the earlier decision to
+keep them under BoolQ's own licence). `scripts/jev_eval/licences.py` lists
+`doc-yesno` as restricted, so it is handled like every other withheld
+source: `heldout.py run` skips it unless named with `--allow-restricted`,
+`calibrate.py fit` refuses its rows, and `report.py` never prints it.
+`noul` temperatures are therefore fitted on sms-spam and synth-noul only.
 
-BoolQ is CC BY-SA 3.0 (share-alike), not the permissive CC BY / MIT / Apache
-terms every other committed source above uses, so it does not just get a
-"Committed: yes" cell — the derived files themselves carry that licence
-forward:
-
-- `bench/jev/*/probs/jevbench_doc-yesno.jsonl.gz`
-- `bench/jev/*/heldout/doc-yesno.jsonl.gz`
-
-These are distributed under **CC BY-SA 3.0**
-(<https://creativecommons.org/licenses/by-sa/3.0/>), with attribution to:
-
-> BoolQ: Exploring the Surprising Difficulty of Natural Yes/No Questions.
-> Clark, Lee, Chang, Kwiatkowski, Collins, Toutanova. NAACL 2019.
-> <https://github.com/google-research-datasets/boolq>
-
-`bench/jev/LICENSE-BoolQ-CC-BY-SA-3.0.txt` carries this same notice next to
-the files it covers. Nothing else in this repository is CC BY-SA 3.0; that
-file's own "Scope" section says so explicitly, and everything else in this
-repository remains Apache-2.0 (see `LICENSE` and `NOTICE` in the project
-root).
+To evaluate on BoolQ locally, `heldout.py build` downloads it (through
+jev-bench's dataset loader) from the [HF dataset](https://huggingface.co/datasets/google/boolq) (CC BY-SA 3.0,
+attribution: Clark et al., "BoolQ: Exploring the Surprising Difficulty of
+Natural Yes/No Questions", NAACL 2019) into `~/.cache/hipfire-jev-calib`;
+any rows you derive from it stay local and carry BoolQ's licence.
 
 ## Calibration sets (`cal_<name>.jsonl`)
 
@@ -70,7 +61,10 @@ root).
 
 - `jev-bench` ([Running-Dolphins/jev-bench](https://github.com/Running-Dolphins/jev-bench), local read-only clone): MIT. Its own `predictions/*.jsonl` (label, top probability, correctness — no text) are explicitly "Committed" by that repo under its MIT licence.
 - `jev-ood-calibration` ([scienthoon/jev-ood-calibration](https://github.com/scienthoon/jev-ood-calibration), local read-only clone): code MIT, synthetic data (`data/`) CC0 (see `synth` row above).
-- **What this repo takes from them:** `report.py` reads their committed `predictions/*.jsonl` and `results/jev_*.jsonl` *locally, from the read-only clones*, only to compute a handful of aggregate numbers (n, accuracy, ECE) printed into `report.md` (the "Jev acc" / "Jev ECE" columns). None of their files, and no per-row Jev data, is copied into this repository. This is well inside their MIT terms even before considering that only derived summary statistics — not rows — are written here.
+- **What this repo takes from them:** the task definitions, prompts and
+  example rows that the eval scripts read *locally, from the read-only
+  clones*, to drive hipfire. No file from either repository, and none of their
+  own results, is copied into this repository or published in `report.md`.
 
 ## What SOURCES.json is
 

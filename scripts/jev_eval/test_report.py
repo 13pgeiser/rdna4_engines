@@ -26,9 +26,8 @@ class RestrictedSources(unittest.TestCase):
             out = Path(d) / "m"
             probs = out / "probs"
             probs.mkdir(parents=True)
-            # Only restricted sources: jev_bench()/jev_cal() (which read the
-            # external read-only clones) must never be reached for them, so
-            # this test stays hermetic like test_calibrate.py/test_heldout.py.
+            # Only restricted sources; the test stays hermetic like
+            # test_calibrate.py/test_heldout.py.
             row = {"source": "ag-news", "type": "choice", "probs": [0.6, 0.4], "gold": 0}
             (probs / "jevbench_ag-news.jsonl").write_text(json.dumps(row) + "\n")
             row2 = {"source": "hellaswag", "type": "choice", "probs": [0.6, 0.4], "gold": 0}

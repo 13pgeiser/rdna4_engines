@@ -449,16 +449,11 @@ align row-for-row with examples rebuilt locally.
   adapter writes its JSONL result schema; its `metrics.py` scores it.
   - Public sets are rebuilt as the first ≤ 2,000 validation rows, filtered,
     then shuffled with `random.Random(1)`.
-- **Report.** Per task: accuracy and top-probability ECE (10 bins) vs Jev's
-  committed answers, with a per-type breakdown.
-  - Jev baselines:
-    - jev-bench accuracy ranges from 0.70 (yelp-stars) to 0.99 (sms-spam);
-    - weak calibration on ledgar (ECE 0.14) and yelp-stars (ECE 0.15);
-    - synthetic tickets: `score` at 0.447 accuracy, ECE 0.306.
+- **Report.** Per task: hipfire's accuracy and top-probability ECE (10 bins),
+  with a per-type breakdown. Only hipfire's own numbers are published.
 - **Latency.** decide vs the same model generating the answer through
   `/v1/chat/completions`, on the same examples and hardware. p50/p95, split
-  into state prefill vs per question. Jev's own latencies include the network
-  and are not comparable.
+  into state prefill vs per question.
 - **Models:** Qwen3.5-4B and Qwen3.6-27B.
 
 **v1 is done when** all four GPU gates pass and the evaluation report exists.
@@ -1286,7 +1281,7 @@ longer depends on the throwaway eval worktree.
 reports, per jev-bench task and per calibration set × type:
 
 - n;
-- Jev accuracy, hipfire accuracy, Jev ECE;
+- hipfire accuracy;
 - hipfire ECE raw and calibrated;
 - hipfire NLL raw and calibrated;
 - for `score` rows, the mean |E[score] − gold| raw and calibrated.

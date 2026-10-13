@@ -38,25 +38,23 @@
    "ship": true
   },
   "noul": {
-   "n": 900,
+   "n": 600,
    "sources": {
-    "doc-yesno": 300,
     "sms-spam": 300,
     "synth-noul": 300
    },
-   "t": 1.363,
+   "t": 0.995,
    "t_ci95": [
-    1.178,
-    1.634
+    0.768,
+    1.226
    ],
-   "nll_raw": 0.3964934543249799,
-   "nll_cal": 0.38379284035279415,
-   "ship": true
+   "nll_raw": 0.2995671136225506,
+   "nll_cal": 0.29956408393008255,
+   "ship": false
   }
  },
  "decide_calibration": {
   "choice": 1.653,
-  "score": 1.48,
-  "noul": 1.363
+  "score": 1.48
  }
 }

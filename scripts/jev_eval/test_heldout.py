@@ -130,7 +130,7 @@ class Licences(unittest.TestCase):
 
     def test_the_restricted_set_is_the_documented_one(self):
         self.assertEqual(licences.RESTRICTED_SOURCES, {"ag-news", "duplicates", "yelp-stars", "offensive",
-                                                       "sentiment-it", "hellaswag"})
+                                                       "sentiment-it", "hellaswag", "doc-yesno"})
 
 
 class ResumePoint(unittest.TestCase):
