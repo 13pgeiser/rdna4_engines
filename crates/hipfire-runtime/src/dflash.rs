@@ -2341,15 +2341,24 @@ pub fn draft_lm_head_overwrite(
     gpu.gemm_mq4g256v2_overwrite_gfx12_dflash(w_buf, rotated, logits, m, k, rows)
 }
 
-/// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
-/// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
-/// HFQ4-G256 GEMM kernel against the pre-rotated weights.
+/// Projection group of a [`gemm_dispatch_shared`] call; selects its kill switch.
 enum SharedProjection {
     Qkv,
     Ffn,
     ContextKv,
 }
 
+/// Run `N` draft projections that read the same input `x` (#838). On exact
+/// gfx1100, eager (no replay recording, no graph capture), 2..=16 rows, every
+/// weight MQ4G256V2 with the same `k` (a multiple of 256), no AWQ sidecar and
+/// scratch for all rows, `x` is FWHT-rotated once and every projection's GEMM
+/// reads that one rotation: the route `gemm_dispatch` would pick per
+/// projection (the S7 overwrite split-K GEMM on F16, else the batched lm_head
+/// GEMM), minus the repeated rotations of identical bytes. Anything else, or
+/// the group's switch off (`kernel.draft_shared_{qkv,ffn,ctx_kv}_rotation`,
+/// default on exact gfx1100), runs [`gemm_dispatch`] once per projection in
+/// order. Inventoried as railgun-cert decision
+/// `dflash-gfx1100-shared-rotation`.
 fn gemm_dispatch_shared<const N: usize>(
     gpu: &mut Gpu,
     x: &GpuTensor,
@@ -2401,6 +2410,9 @@ fn gemm_dispatch_shared<const N: usize>(
     Ok(())
 }
 
+/// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
+/// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
+/// HFQ4-G256 GEMM kernel against the pre-rotated weights.
 fn gemm_dispatch(
     gpu: &mut Gpu,
     x: &GpuTensor,

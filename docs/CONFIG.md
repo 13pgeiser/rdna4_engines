@@ -1222,9 +1222,9 @@ misspelled key is unknown and fails the load with
 | `kernel.deepseek4_q8_wmma` | `deepseek4_q8_wmma` | `HIPFIRE_DEEPSEEK4_Q8_WMMA` | stable |
 | `kernel.deterministic` | `deterministic` | `HIPFIRE_DETERMINISTIC` | experimental |
 | `kernel.dot2_gemv` | `dot2_gemv` | `HIPFIRE_DOT2_GEMV` | experimental |
-| `kernel.draft_shared_ctx_kv_rotation` | `draft_shared_ctx_kv_rotation` | `HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION` | experimental |
-| `kernel.draft_shared_ffn_rotation` | `draft_shared_ffn_rotation` | `HIPFIRE_DRAFT_SHARED_FFN_ROTATION` | experimental |
-| `kernel.draft_shared_qkv_rotation` | `draft_shared_qkv_rotation` | `HIPFIRE_DRAFT_SHARED_QKV_ROTATION` | experimental |
+| `kernel.draft_shared_ctx_kv_rotation` | `draft_shared_ctx_kv_rotation` | `HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION` | stable |
+| `kernel.draft_shared_ffn_rotation` | `draft_shared_ffn_rotation` | `HIPFIRE_DRAFT_SHARED_FFN_ROTATION` | stable |
+| `kernel.draft_shared_qkv_rotation` | `draft_shared_qkv_rotation` | `HIPFIRE_DRAFT_SHARED_QKV_ROTATION` | stable |
 | `kernel.flash_partials_batch` | `flash_partials_batch` | `HIPFIRE_FLASH_PARTIALS_BATCH` | experimental |
 | `kernel.fp16` | `fp16` | `HIPFIRE_FP16` | stable |
 | `kernel.fp8_wmma` | `fp8_wmma` | `HIPFIRE_FP8_WMMA` | experimental |

@@ -596,6 +596,16 @@ pub struct FeatureFlags {
     /// vetoes the gfx1201 DFlash draft overwrite-GEMM route
     /// (`gemm_mq4g256v2_overwrite_gfx12_dflash`), restoring memset + residual.
     pub draft_collapse_off: bool,
+    /// DFlash draft shared MQ4V2 input rotation (#838), one switch per
+    /// projection group: noise Q/K/V (`HIPFIRE_DRAFT_SHARED_QKV_ROTATION`,
+    /// `kernel.draft_shared_qkv_rotation`), FFN gate/up
+    /// (`HIPFIRE_DRAFT_SHARED_FFN_ROTATION`, `kernel.draft_shared_ffn_rotation`)
+    /// and incremental context K/V (`HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION`,
+    /// `kernel.draft_shared_ctx_kv_rotation`). Default ON on exact gfx1100,
+    /// off elsewhere; `=0` restores one rotation per projection. The runtime
+    /// admission (hipfire-runtime `dflash.rs` `gemm_dispatch_shared`) also
+    /// requires exact gfx1100, so the switch is ignored on every other arch.
+    /// Same rotation bytes, same GEMMs; bit-identical outputs.
     pub draft_shared_qkv_rotation: bool,
     pub draft_shared_ffn_rotation: bool,
     pub draft_shared_ctx_kv_rotation: bool,
@@ -1067,9 +1077,12 @@ impl FeatureFlags {
             gdn_pre_fuse_off: value("HIPFIRE_GDN_PRE_FUSE_OFF").ok().as_deref() == Some("1"),
             fa_batch_fuse_off: value("HIPFIRE_FA_BATCH_FUSE_OFF").ok().as_deref() == Some("1"),
             draft_collapse_off: value("HIPFIRE_DRAFT_COLLAPSE_OFF").ok().as_deref() == Some("1"),
-            draft_shared_qkv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_QKV_ROTATION").unwrap_or(true),
-            draft_shared_ffn_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_FFN_ROTATION").unwrap_or(true),
-            draft_shared_ctx_kv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION").unwrap_or(true),
+            draft_shared_qkv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_QKV_ROTATION")
+                .unwrap_or(arch == "gfx1100"),
+            draft_shared_ffn_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_FFN_ROTATION")
+                .unwrap_or(arch == "gfx1100"),
+            draft_shared_ctx_kv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION")
+                .unwrap_or(arch == "gfx1100"),
             ddtree_topk_direct_off: value("HIPFIRE_DDTREE_TOPK_DIRECT_OFF").ok().as_deref()
                 == Some("1"),
             mq_prologue_fuse_off: value("HIPFIRE_MQ_PROLOGUE_FUSE_OFF").ok().as_deref()
@@ -1488,9 +1501,9 @@ impl FeatureFlags {
             gdn_pre_fuse_off: false,
             fa_batch_fuse_off: false,
             draft_collapse_off: false,
-            draft_shared_qkv_rotation: true,
-            draft_shared_ffn_rotation: true,
-            draft_shared_ctx_kv_rotation: true,
+            draft_shared_qkv_rotation: false,
+            draft_shared_ffn_rotation: false,
+            draft_shared_ctx_kv_rotation: false,
             ddtree_topk_direct_off: false,
             mq_prologue_fuse_off: false,
             gdn_replay_ml_off: false,
@@ -2221,34 +2234,53 @@ mod tests {
     }
 
     #[test]
-    fn draft_shared_rotations_default_on() {
-        let flags = FeatureFlags::for_test("gfx1100");
-        assert!(flags.draft_shared_qkv_rotation);
-        assert!(flags.draft_shared_ffn_rotation);
-        assert!(flags.draft_shared_ctx_kv_rotation);
+    fn draft_shared_rotations_default_on_exact_gfx1100_with_independent_opt_out() {
+        // Default process policy: on for exact gfx1100 only (the runtime
+        // admission also requires exact gfx1100).
         let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
-        let flags = FeatureFlags::from_process_config("gfx1100", &process);
-        assert!(flags.draft_shared_qkv_rotation);
-        assert!(flags.draft_shared_ffn_rotation);
-        assert!(flags.draft_shared_ctx_kv_rotation);
-    }
+        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            let on = arch == "gfx1100";
+            assert_eq!(flags.draft_shared_qkv_rotation, on, "arch={arch}");
+            assert_eq!(flags.draft_shared_ffn_rotation, on, "arch={arch}");
+            assert_eq!(flags.draft_shared_ctx_kv_rotation, on, "arch={arch}");
+        }
 
-    #[test]
-    fn draft_shared_rotations_resolve_independently() {
-        for key in ["kernel.draft_shared_qkv_rotation", "kernel.draft_shared_ffn_rotation",
-                    "kernel.draft_shared_ctx_kv_rotation"] {
-            for (value, expected) in [("false", false), ("true", true)] {
-                let mut layer = ConfigLayer::default();
-                layer.set_cli(key, value).unwrap();
-                let resolved = resolve([NamedLayer {
-                    source: ConfigSource::GlobalUser { path: "config.toml".into() }, layer,
-                }]).unwrap();
-                let process = ProcessConfig::from_resolved(&resolved).unwrap();
-                let flags = FeatureFlags::from_process_config("gfx1100", &process);
-                assert_eq!(flags.draft_shared_qkv_rotation, expected || !key.ends_with("shared_qkv_rotation"));
-                assert_eq!(flags.draft_shared_ffn_rotation, expected || !key.ends_with("shared_ffn_rotation"));
-                assert_eq!(flags.draft_shared_ctx_kv_rotation, expected || !key.ends_with("shared_ctx_kv_rotation"));
-            }
+        // Each key opts out on its own, through TOML/CLI and the env spelling.
+        let keys = [
+            ("kernel.draft_shared_qkv_rotation", "HIPFIRE_DRAFT_SHARED_QKV_ROTATION"),
+            ("kernel.draft_shared_ffn_rotation", "HIPFIRE_DRAFT_SHARED_FFN_ROTATION"),
+            ("kernel.draft_shared_ctx_kv_rotation", "HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION"),
+        ];
+        let triple = |f: &FeatureFlags| {
+            [f.draft_shared_qkv_rotation, f.draft_shared_ffn_rotation, f.draft_shared_ctx_kv_rotation]
+        };
+        for (i, (key, env)) in keys.iter().enumerate() {
+            let mut expected = [true; 3];
+            expected[i] = false;
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(key, "false").unwrap();
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                layer,
+            }])
+            .unwrap();
+            let process = ProcessConfig::from_resolved(&resolved).unwrap();
+            assert_eq!(process.legacy_value(env).as_deref(), Some("0"), "{key}");
+            assert_eq!(triple(&FeatureFlags::from_process_config("gfx1100", &process)), expected, "{key}");
+            let from_env = FeatureFlags::from_lookup("gfx1100", |name| {
+                if name == *env {
+                    Ok("0".into())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(triple(&from_env), expected, "{env}=0");
+        }
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1100", "gfx1201"] {
+            assert_eq!(triple(&FeatureFlags::for_test(arch)), [false; 3], "arch={arch}");
         }
     }
 

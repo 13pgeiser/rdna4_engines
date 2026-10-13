@@ -3017,27 +3017,27 @@ pub static FIELDS: &[ConfigField] = &[
         "draft_shared_qkv_rotation",
         Kernel,
         true,
-        true,
+        false,
         "HIPFIRE_DRAFT_SHARED_QKV_ROTATION",
-        "Reuse the MQ4V2 input rotation for eligible gfx1100 draft Q/K/V projections."
+        "Rotate the DFlash draft's MQ4V2 noise Q/K/V input once and reuse it for all three projections (default on exact gfx1100, ignored elsewhere; set to false or HIPFIRE_DRAFT_SHARED_QKV_ROTATION=0 to rotate once per projection; same GEMMs, bit-identical)."
     ),
     process_bool_field!(
         "kernel.draft_shared_ffn_rotation",
         "draft_shared_ffn_rotation",
         Kernel,
         true,
-        true,
+        false,
         "HIPFIRE_DRAFT_SHARED_FFN_ROTATION",
-        "Reuse the MQ4V2 input rotation for eligible gfx1100 draft gate/up projections."
+        "Rotate the DFlash draft's MQ4V2 FFN input once and reuse it for gate and up (default on exact gfx1100, ignored elsewhere; set to false or HIPFIRE_DRAFT_SHARED_FFN_ROTATION=0 to rotate once per projection; same GEMMs, bit-identical)."
     ),
     process_bool_field!(
         "kernel.draft_shared_ctx_kv_rotation",
         "draft_shared_ctx_kv_rotation",
         Kernel,
         true,
-        true,
+        false,
         "HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION",
-        "Reuse the MQ4V2 input rotation for eligible gfx1100 draft context K/V projections."
+        "Rotate the DFlash draft's MQ4V2 incremental context input once and reuse it for K and V (default on exact gfx1100, ignored elsewhere; set to false or HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION=0 to rotate once per projection; same GEMMs, bit-identical)."
     ),
     process_bool_field!(
         "kernel.qkvza_split_tail",
