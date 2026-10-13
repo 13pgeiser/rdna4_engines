@@ -62,15 +62,10 @@
 // reliably rediscover that tree from `+` source in every block shape (the V
 // region compiled strict and drifted 1 ULP on the parity gate). fmaf pins
 // the exact old tree in all six instantiations (capture Q/K/V, replay
-// Q/K/V). Weight/state loads stay in-place (see conv1d_silu_split.hip).
-// On gfx1201 the backend keeps the explicit product of `fmaf(w3, x, w2*s0)`,
-// which rounds w2*s0 instead of w3*x and drifts 1 ULP from the reference, so
-// gfx1201 spells the reference tree's first step as fmaf(w2, s0, w3*x).
-#if defined(__gfx1201__)
+// Q/K/V): the first step rounds w3*x and fuses w2*s0 into it. Spelling it
+// fmaf(w3, x, w2*s0) instead rounds w2*s0 and drifts q_raw by 1 ULP.
+// Weight/state loads stay in-place (see conv1d_silu_split.hip).
 #define GDN_PRE_CONV_FIRST(W3, X, W2, S0) fmaf((W2), (S0), (W3) * (X))
-#else
-#define GDN_PRE_CONV_FIRST(W3, X, W2, S0) fmaf((W3), (X), (W2) * (S0))
-#endif
 #define GDN_PRE_CONV_STEP(X, C, Y)                                            \
     do {                                                                      \
         float x = (X);                                                        \
