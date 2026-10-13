@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Halo-only byte oracle. Run: cargo run --release -p rdna-compute --features lab --example npu_trunk_glue_check
-//! Prints old/fast consume event timings and effective read+write GB/s for both large row counts.
+//! Compares complete old/new packed arenas and sidecars, then reports pack/consume event timings.
 use half::f16;
 use pm_npu::kernels::{gemm_g80::{self,bf16_output_offset},gemm_core::{Epilogue,Control},w8a8_epi::{grid15_up,bf16_direct}};
 use rdna_compute::{Gpu,GpuTensor,DType,npu_trunk::{NpuBf16Layout,NpuTrunkOutput}};
@@ -15,7 +15,12 @@ fn activations()->(Vec<u16>,Vec<i8>,Vec<(u16,i16)>){
     for t in 0..AP {
         for i in 0..K {
             seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;
-            let h=if t==0 {0} else if t==1 {((seed&0x83ff)|1) as u16} else {((seed&0x83ff)|(((8+t%20) as u32)<<10)) as u16};
+            let h=if t==0 {0}
+                else if t==1 {((seed&0x83ff)|1) as u16}
+                else if t==2 {if i%2==0 {0x7bff}else{0xfbff}} // maximum finite F16
+                else if t==3 {f16::from_f32([127.0,0.5,1.5,2.5,-0.5,-1.5,-2.5,126.5][i%8]).to_bits()}
+                else if t==4 {f16::from_f32([127.0625,127.0,126.9375,-127.0625,0.5,-0.5][i%6]).to_bits()}
+                else {((seed&0x83ff)|(((8+t%20) as u32)<<10)) as u16};
             x[t*K+i]=h;
         }
         let am=x[t*K..(t+1)*K].iter().map(|&h|f16::from_bits(h).to_f32().abs()).fold(0f32,f32::max);
@@ -55,11 +60,52 @@ fn timed(gpu:&mut Gpu,label:&str,mut f:impl FnMut(&mut Gpu))->f32 {
     gpu.hip.event_destroy(start).unwrap();gpu.hip.event_destroy(end).unwrap();
     ms
 }
+fn pack_checks(gpu:&mut Gpu,xp:&[u16],ap:&[i8],dp:&[(u16,i16)]) {
+    for rows in [1usize,37,512,4647,8151,8192] {
+        // Offset zero covers all mixed fixtures at large sizes; the other offsets
+        // ensure even the one-row test exercises maxima, RNE ties and scale edges.
+        for offset in [0usize,2,3,4] {
+            let p=rows.div_ceil(256)*256;
+            let layout=NpuBf16Layout{padded_rows:p,k:K,panels:1};
+            let xbytes:Vec<u8>=(0..rows*K).flat_map(|i|xp[(i+offset*K)%(AP*K)].to_le_bytes()).collect();
+            let x=typed(gpu,&xbytes,&[rows,K],DType::F16);
+            let a_cpu:Vec<i8>=(0..p*K).map(|i|if i/K<rows {ap[(i+offset*K)%(AP*K)]}else{0}).collect();
+            let d_cpu:Vec<_>=(0..p).map(|t|if t<rows {dp[(t+offset)%AP]}else{(0,0)}).collect();
+            let a=arena(gpu,layout.a_bytes()+256);let d=arena(gpu,rows*4+256);
+            let old_a=arena(gpu,layout.a_bytes()+256);let old_d=arena(gpu,rows*4+256);
+            gpu.npu_trunk_pack_a_bf16_old(&x,rows,layout,&old_a,&old_d).unwrap();
+            gpu.npu_trunk_pack_a_bf16(&x,rows,layout,&a,&d).unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            let design=gemm_g80::design_g80(p,1280,K,Epilogue::Bf16,Control::Fast);
+            let mut expected_a=gemm_g80::pack_a_bf16(&design,&a_cpu,&d_cpu);
+            expected_a.extend([0xa5;256]);
+            let mut expected_d=sides(&d_cpu[..rows]);expected_d.extend([0xa5;256]);
+            compare("pack new vs CPU (including padding/guard)",&download(gpu,"new A",&a),&expected_a);
+            compare("pack old vs CPU (including padding/guard)",&download(gpu,"old A",&old_a),&expected_a);
+            compare("pack new D vs CPU/guard",&download(gpu,"new D",&d),&expected_d);
+            compare("pack old D vs CPU/guard",&download(gpu,"old D",&old_d),&expected_d);
+            compare("pack old/new arena",&download(gpu,"new A",&a),&download(gpu,"old A",&old_a));
+            compare("pack old/new sidecars",&download(gpu,"new D",&d),&download(gpu,"old D",&old_d));
+            println!("pack_exact rows={rows} fixture_offset={offset} old_vs_new=byte-exact padding=ok guards=ok");
+            if offset==0 {
+                let old=timed(gpu,&format!("pack-old rows={rows} k={K}"),|g|g.npu_trunk_pack_a_bf16_old(&x,rows,layout,&old_a,&old_d).unwrap());
+                let new=timed(gpu,&format!("pack-new rows={rows} k={K}"),|g|g.npu_trunk_pack_a_bf16(&x,rows,layout,&a,&d).unwrap());
+                let traffic=(rows*K*2+layout.a_bytes()+rows*4) as f64;
+                println!("pack_bw rows={rows} old_ms={old:.4} new_ms={new:.4} old_GBps={:.2} new_GBps={:.2} speedup={:.2} target_GBps=180",
+                    traffic/(old as f64*1e6),traffic/(new as f64*1e6),old/new);
+                compare("timed pack old/new arena",&download(gpu,"new A",&a),&download(gpu,"old A",&old_a));
+                compare("timed pack old/new sidecars",&download(gpu,"new D",&d),&download(gpu,"old D",&old_d));
+            }
+            for t in [x,a,d,old_a,old_d]{gpu.free_tensor(t).unwrap();}
+        }
+    }
+}
 fn run(){
     eprintln!("PHASE GPU initialization");
     let mut gpu=Gpu::init().expect("GPU init");assert_eq!(gpu.arch,"gfx1151");
     eprintln!("PHASE CPU activation and integer-dot references");
     let (xp,ap,dp)=activations();
+    pack_checks(&mut gpu,&xp,&ap,&dp);
     let wp:Vec<i8>=(0..WP*K).map(|i|(((i*73+(i/K)*31+(i%K)*(i%K)*3)%255) as i32-127) as i8).collect();
     let dots:Vec<i32>=(0..AP*WP).map(|i|ap[i/WP*K..(i/WP+1)*K].iter().zip(&wp[i%WP*K..(i%WP+1)*K]).map(|(&a,&w)|a as i32*w as i32).sum()).collect();
     // Frozen S1 full ColumnMaps, native projection widths in fused family order.
@@ -78,7 +124,6 @@ fn run(){
         let design=gemm_g80::design_g80(p,1280,K,Epilogue::Bf16,Control::Fast);
         compare("packed A (codes, replicated scales, padding)",&download(&gpu,"packed A",&a),&gemm_g80::pack_a_bf16(&design,&a_cpu,&d_cpu));
         compare("compact D",&download(&gpu,"compact D",&d),&sides(&d_cpu[..rows]));
-        if rows==8192 {timed(&mut gpu,"pack rows8192 k2560",|g|g.npu_trunk_pack_a_bf16(&x,rows,layout,&a,&d).unwrap());}
         for (name,widths) in [("GdnIn",[10240usize,6144,48,48]),("QsaIn",[12288,512,512,640])] {
             eprintln!("PHASE weight/scales/I32/synthetic-C preparation rows={rows} shape={name}");
             let n:usize=widths.iter().sum();let layout=NpuBf16Layout{panels:n.div_ceil(1280),..layout};

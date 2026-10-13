@@ -61,17 +61,29 @@ impl Gpu {
         need(a,layout.a_bytes())?;
         unsafe {self.npu_trunk_pack_a_bf16_ptr(x,rows,layout,a.buf.as_ptr(),d)}
     }
+    /// Lab-only incumbent producer for old/new byte and timing comparisons.
+    #[cfg(feature="lab")]
+    pub fn npu_trunk_pack_a_bf16_old(&mut self,x:&GpuTensor,rows:usize,layout:NpuBf16Layout,a:&GpuTensor,d:&GpuTensor)->HipResult<()> {
+        layout.validate()?;
+        need(a,layout.a_bytes())?;
+        unsafe {self.npu_trunk_pack_a_impl(x,rows,layout,a.buf.as_ptr(),d,false)}
+    }
     /// Same producer into a device-accessible host-registered NPU arena.
     /// # Safety
     /// `a` holds layout.a_bytes() writable bytes and stays alive through stream completion.
     pub unsafe fn npu_trunk_pack_a_bf16_ptr(&mut self,x:&GpuTensor,rows:usize,layout:NpuBf16Layout,a:*mut c_void,d:&GpuTensor)->HipResult<()> {
+        let fast=layout.k==2560 && self.arch_caps.is_gfx1151();
+        unsafe {self.npu_trunk_pack_a_impl(x,rows,layout,a,d,fast)}
+    }
+    unsafe fn npu_trunk_pack_a_impl(&mut self,x:&GpuTensor,rows:usize,layout:NpuBf16Layout,a:*mut c_void,d:&GpuTensor,fast:bool)->HipResult<()> {
         layout.validate()?;
         if x.dtype!=DType::F16 || rows==0 || rows>layout.padded_rows || a.is_null(){return Err(HipError::new(1,"npu trunk: invalid activation"));}
         need(x,rows*layout.k*2)?;need(d,rows*4)?;
-        self.ensure_kernel_public("npu_trunk",kernels::NPU_TRUNK_SRC,"npu_trunk_pack_a_bf16")?;
+        let symbol=if fast {"npu_trunk_pack_a_bf16"}else{"npu_trunk_pack_a_bf16_old"};
+        self.ensure_kernel_public("npu_trunk",kernels::NPU_TRUNK_SRC,symbol)?;
         let mut b=KernargBlob::new();b.push_ptr(x.buf.as_ptr());b.push_ptr(a);b.push_ptr(d.buf.as_ptr());
         for n in [rows,layout.k,layout.padded_rows]{b.push_i32(n as i32);}
-        self.npu_launch("npu_trunk_pack_a_bf16",[layout.padded_rows as u32,1,1],256,b)
+        self.npu_launch(symbol,[if fast {layout.padded_rows as u32/8}else{layout.padded_rows as u32},1,1],256,b)
     }
     /// Scatter panel-major native BF16 tiles, dropping padding. F32 stores widen bits exactly.
     pub fn npu_trunk_consume_bf16(&mut self,c:&GpuTensor,layout:NpuBf16Layout,outs:&[NpuTrunkOutput<'_>],rows:usize)->HipResult<()> {

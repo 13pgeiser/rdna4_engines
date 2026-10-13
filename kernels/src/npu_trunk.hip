@@ -3,7 +3,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-extern "C" __global__ __launch_bounds__(256) void npu_trunk_pack_a_bf16(
+// Retained scalar producer: generic-K fallback and lab byte/timing oracle.
+extern "C" __global__ __launch_bounds__(256) void npu_trunk_pack_a_bf16_old(
     const __half* x, unsigned char* a, unsigned int* d, int rows, int k, int padded_rows) {
     const int t=blockIdx.x, tid=threadIdx.x, kc=k/64, waves=padded_rows/256;
     __shared__ float red[256];
@@ -34,6 +35,81 @@ extern "C" __global__ __launch_bounds__(256) void npu_trunk_pack_a_bf16(
         const size_t off=((size_t)(pair*2+h)*waves*kc+(size_t)wave*kc+ch)*4608+4096;
         ((unsigned short*)(a+off))[rt]=(unsigned short)m;
         ((short*)(a+off+256))[rt]=(short)e;
+    }
+}
+
+// K2560: eight wave32 rows per CTA. Load each half once into 40 packed VGPRs
+// per lane, reduce the finite half magnitude bits, then quantize from registers.
+// LDS joins eight rows so uint4 writes fill entire native 8x8 byte microtiles.
+// No arithmetic reassociation: the scale/quantizer are the scalar oracle's DAG.
+extern "C" __global__ __launch_bounds__(256) void npu_trunk_pack_a_bf16(
+    const __half* __restrict__ x, unsigned char* __restrict__ a,
+    unsigned int* __restrict__ d, int rows, int k, int padded_rows) {
+    constexpr int K=2560, CHUNKS=K/8, PITCH=CHUNKS+1;
+    const int tid=threadIdx.x, lane=tid&31, row=tid>>5;
+    const int first=blockIdx.x*8, t=first+row;
+    __shared__ uint2 codes[8][PITCH];
+    __shared__ __align__(16) unsigned short mantissa[8], exponent[8];
+    uint4 values[10];
+    unsigned int magnitude=0;
+    #pragma unroll
+    for(int j=0;j<10;j++) {
+        uint4 v=make_uint4(0,0,0,0);
+        if(t<rows) v=((const uint4*)(x+(size_t)t*K))[j*32+lane];
+        values[j]=v;
+        const unsigned int words[4]={v.x,v.y,v.z,v.w};
+        #pragma unroll
+        for(int h=0;h<4;h++) {
+            magnitude=max(magnitude,words[h]&0x7fffu);
+            magnitude=max(magnitude,(words[h]>>16)&0x7fffu);
+        }
+    }
+    #pragma unroll
+    for(int s=16;s;s>>=1) magnitude=max(magnitude,__shfl_xor(magnitude,s,32));
+    int m=0,e=0; float inv=0;
+    if(lane==0) {
+        const float am=__half2float(__ushort_as_half((unsigned short)magnitude));
+        if(am!=0) {
+            const float raw=__fdiv_rn(am,127.0f); int ex;
+            const float f=frexpf(raw,&ex); e=ex-15;
+            m=(int)ceilf(__fmul_rn(f,32768.0f));
+            if(m==32768){m=16384;e++;}
+            inv=__fdiv_rn(1.0f,ldexpf((float)m,e));
+        }
+        mantissa[row]=(unsigned short)m; exponent[row]=(unsigned short)e;
+        if(t<rows)d[t]=(unsigned int)m|((unsigned int)(unsigned short)e<<16);
+    }
+    inv=__shfl(inv,0,32);
+    #pragma unroll
+    for(int j=0;j<10;j++) {
+        const uint4 v=values[j];
+        const unsigned int words[4]={v.x,v.y,v.z,v.w};
+        unsigned int lo=0,hi=0;
+        #pragma unroll
+        for(int h=0;h<8;h++) {
+            const unsigned short bits=(unsigned short)(words[h/2]>>((h&1)*16));
+            int q=__float2int_rn(__fmul_rn(__half2float(__ushort_as_half(bits)),inv));
+            q=q>127?127:(q< -127?-127:q);
+            if(h<4)lo|=(unsigned int)(unsigned char)(signed char)q<<(h*8);
+            else hi|=(unsigned int)(unsigned char)(signed char)q<<((h-4)*8);
+        }
+        codes[row][j*32+lane]=make_uint2(lo,hi);
+    }
+    __syncthreads();
+    const int waves=padded_rows/256, kc=K/64, wave=first/256;
+    const int rt=first%128, pair=(first%256)/128, col=pair*2+(rt/8)%2;
+    for(int i=tid;i<CHUNKS*4;i+=256) {
+        const int chunk=i/4, r=(i%4)*2;
+        const uint2 lo=codes[r][chunk], hi=codes[r+1][chunk];
+        const size_t off=((size_t)col*waves*kc+(size_t)wave*kc+chunk/8)*4608
+            +(rt/16)*512+(chunk%8)*64+(rt%8+r)*8;
+        *((uint4*)(a+off))=make_uint4(lo.x,lo.y,hi.x,hi.y);
+    }
+    if(tid<kc*2) {
+        const int ch=tid/2,h=tid%2;
+        const size_t off=((size_t)(pair*2+h)*waves*kc+(size_t)wave*kc+ch)*4608+4096+rt*2;
+        *((uint4*)(a+off))=*((const uint4*)mantissa);
+        *((uint4*)(a+off+256))=*((const uint4*)exponent);
     }
 }
 static __device__ __forceinline__ unsigned short direct(int isum,int sm,int se,int dm,int de){

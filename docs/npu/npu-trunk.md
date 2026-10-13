@@ -223,6 +223,15 @@ device tensor or a device-accessible host-registered arena (`unsafe ..._ptr`).
 Compact scale sidecars are four bytes per token: LE u16 mantissa then LE i16
 exponent. Weight sidecars use the same encoding, indexed by fused column.
 
+On gfx1151 at K2560, A-pack uses eight wave32 rows per workgroup, 128-bit
+activation loads retained in registers, an integer half-magnitude wave max,
+and one LDS barrier to coalesce native 8x8 byte tiles into 128-bit stores.
+The scale and RNE quantizer DAG is unchanged. Other K/architectures retain the
+scalar producer, also exposed as a lab-only old/new oracle. At 8192 rows the
+single-read traffic is 65.57 MB including replicated scales and sidecars;
+180 GB/s implies **0.364 ms** before arithmetic/LDS/launch overhead, an estimate
+pending Halo event timing (not a measured speedup).
+
 `npu_trunk_emulate_bf16` reads exactly that packed A and row-major S1 W8 codes,
 uses caller-owned I32 `[rows,n]` scratch, then applies the lab's all-integer
 single-rounding BF16 epilogue into native outputs. The consumer reads panel-major
@@ -239,7 +248,7 @@ opt-in primitive API only: no scheduler, forward hook or NPU device open.
 Halo GPU byte oracle (do not hide the GPU for this command):
 
 ```sh
-CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
+CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-pack/target \
 nice -n 19 cargo run --release -p rdna-compute --features lab -j 12 \
   --example npu_trunk_glue_check
 ```
@@ -252,8 +261,11 @@ Repeated deterministic input/weight rows cache CPU dots, never GPU answers.
 Typed upload shapes count elements (including guard elements), not bytes.
 The oracle checks shape/dtype byte counts against every allocation and before
 every download, and emits a phase label before launches and comparisons.
-It prints GPU-event timings for 8192-token K2560 pack, both full-width consumers
-and integer GEMMs; any mismatch exits 1. CPU layout/map tests:
+It additionally compares old/new complete A arenas and compact sidecars, including
+padding and poison guards, at 1/37/512/4647/8151/8192 rows. Zero, maximum finite
+F16, RNE half-integer ties and grid-scale boundaries are included even at one row.
+It prints old/new pack GPU-event timings and bandwidth for each row count, plus
+full-width consumer and integer GEMM timings; any mismatch exits 1. CPU layout/map tests:
 `cargo test --release -p hipfire-arch-qwen4 --lib npu_trunk::gpu::tests -j 12`.
 
 ## Stored calibration and deterministic planning (0.4.2)
