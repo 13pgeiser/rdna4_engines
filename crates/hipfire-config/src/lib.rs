@@ -23,6 +23,12 @@ use thiserror::Error;
 
 pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 
+/// Largest `serve.continuous_batch_size` the schema, CLI and serve precheck
+/// accept. It is a configuration ceiling only: runtime memory admission may
+/// still allow fewer live lanes, and per-chunk verify row limits bound rows
+/// per chunk, not the total lane count.
+pub const MAX_CONTINUOUS_BATCH_SIZE: u64 = 256;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("unknown configuration key '{0}'")]
@@ -1186,7 +1192,10 @@ pub static FIELDS: &[ConfigField] = &[
         Serve,
         Process,
         DefaultValue::Integer(1),
-        ValueRule::Integer { min: 1, max: 128 },
+        ValueRule::Integer {
+            min: 1,
+            max: MAX_CONTINUOUS_BATCH_SIZE as i64
+        },
         false,
         false,
         Some("HIPFIRE_CONTINUOUS_BATCH_SIZE"),

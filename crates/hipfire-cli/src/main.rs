@@ -799,7 +799,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
     max_seq: Option<u64>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=hipfire_config::MAX_CONTINUOUS_BATCH_SIZE))]
     continuous_batch_size: Option<u64>,
     /// Serve the embedded chat UI at /ui on the serve listener.
     #[arg(long)]
@@ -11282,6 +11282,53 @@ mod tests {
         );
         assert!(rm("qwen3.8:27bb").contains("did you mean: qwen3.8:27b"));
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn continuous_batch_size_schema_and_cli_share_maximum() {
+        let max = hipfire_config::MAX_CONTINUOUS_BATCH_SIZE;
+        let field = field("serve.continuous_batch_size").expect("continuous_batch_size schema");
+        let hipfire_config::ValueRule::Integer {
+            min: schema_min,
+            max: schema_max,
+        } = field.rule
+        else {
+            panic!("serve.continuous_batch_size must be an integer rule")
+        };
+        assert_eq!(schema_min, 1);
+        assert_eq!(schema_max, i64::try_from(max).unwrap());
+        for lanes in 1..=max {
+            field
+                .validate(&hipfire_config::ConfigValue::Integer(
+                    i64::try_from(lanes).unwrap(),
+                ))
+                .unwrap_or_else(|err| panic!("schema rejected {lanes}: {err}"));
+            let parsed = Cli::try_parse_from([
+                "hipfire",
+                "serve",
+                "--continuous-batch-size",
+                &lanes.to_string(),
+            ])
+            .unwrap_or_else(|err| panic!("CLI rejected {lanes}: {err}"));
+            let Some(Commands::Serve(args)) = parsed.command else {
+                panic!("expected serve command")
+            };
+            assert_eq!(args.continuous_batch_size, Some(lanes));
+        }
+        for lanes in [0, max + 1] {
+            assert!(field
+                .validate(&hipfire_config::ConfigValue::Integer(
+                    i64::try_from(lanes).unwrap()
+                ))
+                .is_err());
+            assert!(Cli::try_parse_from([
+                "hipfire",
+                "serve",
+                "--continuous-batch-size",
+                &lanes.to_string(),
+            ])
+            .is_err());
+        }
     }
 
     #[test]

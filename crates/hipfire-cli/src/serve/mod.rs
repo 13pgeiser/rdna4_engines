@@ -1513,8 +1513,13 @@ pub(crate) fn serve_foreground(
     let continuous_batch_size = args
         .continuous_batch_size
         .unwrap_or(config_u64(&global, "serve.continuous_batch_size")?);
-    if continuous_batch_size == 0 || continuous_batch_size > 256 {
-        bail!("--continuous-batch-size must be between 1 and 256");
+    if continuous_batch_size == 0
+        || continuous_batch_size > hipfire_config::MAX_CONTINUOUS_BATCH_SIZE
+    {
+        bail!(
+            "--continuous-batch-size must be between 1 and {}",
+            hipfire_config::MAX_CONTINUOUS_BATCH_SIZE
+        );
     }
     let vmm_batch = VmmBatchFlags::from_config(&global)?;
     let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
