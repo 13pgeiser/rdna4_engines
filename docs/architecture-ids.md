@@ -2,8 +2,9 @@
 
 Canonical `arch_id` values used by HFQ headers (`HfqFile::arch_id`), safetensors
 directory derivation (`derive_arch_id` in
-`crates/hipfire-runtime/src/safetensors_source.rs`), and the loader carrier
-registry (`crates/hipfire-loader`). Trait markers come from
+`crates/hipfire-runtime/src/safetensors_source.rs`, driven by the
+`model_type` tables in `crates/hipfire-runtime/src/arch_mapping.rs`), and the
+loader carrier registry (`crates/hipfire-loader`). Trait markers come from
 `Architecture::arch_id()` in each arch crate.
 
 One crate may cover multiple runtime ids. The trait’s canonical marker is the
@@ -33,7 +34,7 @@ remain fail-closed for every route outside that exact row; source-derived routin
 | 13 | Gemma 4 (dense text) | `hipfire-arch-gemma4` | `Gemma4Carrier` | Hybrid 5:1 sliding(RoPE θ=10k, hd 256)/full(partial RoPE θ=1e6, hd 512, K=V sharing) GQA, sandwich RMSNorm + `layer_scalar`, gelu_pytorch_tanh SwiGLU, tied lm_head, final logit softcap 30. Dir `gemma4` / `gemma4_text` → 13. Carrier also claims 22. |
 | 14 | Muse Glimmer (dense text) | `hipfire-arch-muse-glimmer` | `MuseGlimmerCarrier` | 3:1 sliding(RoPE θ=500k, SWA 2048)/full(**NoPE**, `layer_rope_theta[i]==0`) GQA 32:2 hd 128, sandwich RMSNorm (`rms_norm_eps` 1e-5 pre / `post_norm_eps` 1e-8 post), scale-less QK-norm + `qk_scale_factor` 3.87, `self_attn.gate_proj` gated attention, silu SwiGLU, **untied** lm_head, `output_multiplier` 0.196116 then softcap 20. Dir `muse_glimmer` / `muse_glimmer_text` → 14. Carrier claims 14 only; the arch-23 drafter rides `HIPFIRE_DFLASH_DRAFT`. `pp>1` and `params.drafter` are refused. |
 | 15 | Maple-Preview (natively-ternary MoE) | `hipfire-arch-maple` | `MapleCarrier` | 3:1 sliding(RoPE θ=10k, SWA 512)/full(**NoPE**, `nope_on_global_attention`) GQA 16:4 hd 128, **QK-norm applied BEFORE RoPE**, **partial rotary 0.5** (first 64 of 128 dims), MoE on EVERY layer (256 experts top-8, `moe_intermediate_size` 512, no shared experts, softmax→topk→renorm), **clamped SwiGLU** `silu(clamp(gate,max=7))*clamp(up,-7,7)`, **untied** lm_head, embedding tensor is `model.word_embeddings` (not `embed_tokens`). Weights are natively ternary and carried losslessly by qt=51 `MQ2G256LloydU`; `intermediate_size` 4096 and `quantize`/`preaffine` are dead keys. Dir `maple` → 15. |
-| 16 | Qwen3.8-Flash-Next / Qwen4 experimental | `hipfire-arch-qwen4` | `Qwen4Carrier` | Hybrid 3:1 GatedDeltaNet / QSA indexed sparse full attention (indexer budget 2,048), 4-stream hyper-connections, PLE n-gram embeddings on layer 2, 512-expert top-10 MoE with a shared expert, one native MTP layer. Admitted as Single-device, text-only HFQM (`max_seq` up to the native 262,144, default 32,768 when omitted). QSA K/V: `auto` is fp8 on exact gfx1201 and the exact `bf16` state elsewhere; `q8` (Q8_0 blocks of 32) is opt-in on gfx11/gfx12 ([`CONFIG.md`](CONFIG.md#mode-k-and-v)). The 54.4 GB PLE table stays in the mapped file and is leased per token. Native greedy MTP attaches by default (`.mq4r` keeps the retained AR route). Vision and PP/TP/EP are refused. |
+| 16 | Qwen3.8-Flash-Next / Qwen4 experimental | `hipfire-arch-qwen4` | `Qwen4Carrier` | Hybrid 3:1 GatedDeltaNet / QSA indexed sparse full attention (indexer budget 2,048), 4-stream hyper-connections, PLE n-gram embeddings on layer 2, 512-expert top-10 MoE with a shared expert, one native MTP layer. The carrier claims **HFQM artifacts only** (`!is_dir`): a safetensors dir with `model_type` `qwen4_exp` / `qwen4_exp_text` derives 16 as a *reserved* source classification (`RESERVED_MODEL_TYPE_TO_ARCH_ID`), but no carrier loads a directory. Text-only; vision and PP/TP are refused. **Expert parallelism** (`topology.ep` 2 or 4, `HIPFIRE_QWEN4_EP=0` kill switch) is admitted on gfx1201 only, with the mesh inside the rank-0 bundle rather than `LoadedModel.ep`; owner-routed prefill and expert staging are default-on at EP2 and EP4 refuses them ([`ARCHITECTURE.md`](ARCHITECTURE.md#qwen4-expert-parallel-mesh-flash-next-ep2ep4)). `max_seq` is bounded by the config `context_limit` (native 262,144; `attention.yarn_factor` / `HIPFIRE_YARN_FACTOR` extends it to factor × original, capped at `QWEN4_MAX_CONTEXT` = 1,048,576), default 32,768 when omitted. QSA K/V: `auto` is fp8 on exact gfx1201 and the exact `bf16` state elsewhere; `q8` (Q8_0 blocks of 32) is opt-in on gfx11/gfx12 ([`CONFIG.md`](CONFIG.md#mode-k-and-v)). PLE rows are not uploaded wholesale: they are read per token from the embedded Q8 rows, `<model>.ple-q8` or the 4-bit `<model>.ple-q4` (`memory.ple_format`, `auto` = **q4 on gfx1151**, q8 elsewhere). A `<model>.trunk-overlay` sidecar (zab: GDN Z/alpha/beta) applies by default only on exact gfx1151. The NPU trunk (`fusions.npu_trunk`) defaults to `auto` and arms only on gfx1151 with an admitted device and calibration. Native MTP attaches by default (greedy, and sampled under `speculation.mtp_sampled`); `.mq4r` keeps the retained AR route, and under EP only an explicit `--spec mtp` attaches it. |
 
 Ids **2–4** are unused in the carrier registry (not claimed). Do not invent
 assignments without a carrier + source mapping.
@@ -45,10 +46,10 @@ them for ordinary dispatch.
 
 | arch_id | Role | Where defined | Notes |
 |---:|---|---|---|
-| 20 | DFlash draft artifact (generic) | `hipfire-quantize` `dflash_convert` (`ARCH_ID_DFLASH_DRAFT`); loader draft open checks `draft_hfq.arch_id == 20` | Generic Qwen-family diffusion draft (fc/hidden_norm/norm naming, `dflash` metadata). Loaded as a draft alongside a compatible target, not as a standalone serve model. |
-| 21 | Qwen3.5 MTP head | `hipfire-quantize` `mtp_extract` (`ARCH_ID_QWEN35_MTP_HEAD`); consumed as `.mq4-mtp` trailer / `.mtp` sidecar on qwen35 trunks | Attached onto arch 5/6 loads (`LoadedModel.qwen35_mtp_head`), not a carrier `arch_id`. Refused before upload unless its metadata `n_embd`/`vocab_size` equal the trunk's hidden size and vocab (`mtp_head::check_mtp_head_for_trunk`). |
+| 20 | DFlash draft artifact (generic) | `hipfire-quantize` `dflash_convert` (`src/bin/dflash_convert.rs`, `ARCH_ID_DFLASH_DRAFT`); loader draft open checks `draft_hfq.arch_id == 20` | Generic Qwen-family diffusion draft (fc/hidden_norm/norm naming, `dflash` metadata). Loaded as a draft alongside a compatible target, not as a standalone serve model. |
+| 21 | Qwen3.5 MTP head | `hipfire-quantize` `mtp_extract` (`src/bin/mtp_extract.rs`, `ARCH_ID_QWEN35_MTP_HEAD`); consumed as `.mq4-mtp` trailer / `.mtp` sidecar on qwen35 trunks | Attached onto arch 5/6 loads (`LoadedModel.qwen35_mtp_head`), not a carrier `arch_id`. Refused before upload unless its metadata `n_embd`/`vocab_size` equal the trunk's hidden size and vocab (`mtp_head::check_mtp_head_for_trunk`). |
 | 22 | Gemma4 EAGLE draft | `hipfire-arch-gemma4` `DRAFTER_ARCH_ID`; claimed by `Gemma4Carrier` alongside 13 | `model_type gemma4_unified_assistant` — hidden-state-consuming EAGLE (pre/post projections, KV-shared layers). Loaded via `params.drafter` on arch 13. **Currently gated off** (`HIPFIRE_GEMMA4_EAGLE=1` to enable): diverges from the greedy AR sequence it is required to reproduce, and is slower. |
-| 23 | Muse Glimmer DFlash draft | `hipfire-arch-muse-glimmer` `GLIMMER_DRAFTER_ARCH_ID` | `model_type muse_glimmer_assistant` — 5-layer block-diffusion draft (encoder.fc/output_norm_enc, block 16, target_layer_ids [1,13,25,37,49], mask 201818). Loaded via `HIPFIRE_DFLASH_DRAFT` on arch 14. NOT a `dflash_convert` 20 artifact (different tensor naming: encoder.fc vs fc, separate `config` envelope). Quantizer auto-maps `muse_glimmer_assistant` → 23 (`hipfire-quantize/src/main.rs:8607`, `hipfire-runtime/src/safetensors_source.rs:271`); HFQ on disk is `arch 23`. |
+| 23 | Muse Glimmer DFlash draft | `hipfire-arch-muse-glimmer` `GLIMMER_DRAFTER_ARCH_ID` | `model_type muse_glimmer_assistant` — 5-layer block-diffusion draft (encoder.fc/output_norm_enc, block 16, target_layer_ids [1,13,25,37,49], mask 201818). Loaded via `HIPFIRE_DFLASH_DRAFT` on arch 14. NOT a `dflash_convert` 20 artifact (different tensor naming: encoder.fc vs fc, separate `config` envelope). The `model_type` table in `arch_mapping.rs` maps `muse_glimmer_assistant` → 23 (the longest `model_type` substring wins, so it beats `muse_glimmer` → 14); HFQ on disk is `arch 23`. |
 | 0xFF | Toy / template | `hipfire-arch-toy` | Never ship; daemon must not dispatch. No current carrier claims it. Registry disjointness tests include `0xFF` and assert at most one claimer — they do **not** assert zero claimers / hard-reserved. |
 | `u32::MAX` | Unclaimed dir sentinel | `safetensors_source::UNCLAIMED_ARCH_ID` | Emitted for unrecognized `model_type`; no carrier matches → fail closed. |
 
@@ -87,7 +88,7 @@ sidecars next to the trunk file; no carrier claims a sidecar id on its own.
 | Namespace | Origin | Examples |
 |---|---|---|
 | HFQ header | `HfqFile::arch_id` written at quantize/pack time | Primary table above; sidecars 20/21 |
-| Safetensors dir | `derive_arch_id(&config)` | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`/`lfm2_vl`→11, `cohere2_moe`→12, `qwen4_exp`/`qwen4_exp_text`→16 |
+| Safetensors dir | `derive_arch_id(&config)` (table: `arch_mapping.rs`; longest `model_type` substring wins; `architectures` is checked before `model_type`) | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6`/`ornith` (+`num_experts`>0→6 else 5), `qwen3_5_moe`/`qwen3moe`→6, `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`/`lfm2_vl`→11, `cohere2_moe`→12, `gemma4`/`gemma4_text`/`gemma4_unified`/`gemma4_unified_text`→13, `muse_glimmer`/`muse_glimmer_text`→14, `maple`→15, `qwen4_exp`/`qwen4_exp_text`→16 (reserved source classification; the carrier claims HFQM only), `gemma4_unified_assistant`→22, `muse_glimmer_assistant`→23, `flux`/`FluxTransformer2DModel`→40, `flux2`/`Flux2Transformer2DModel`→45 |
 
 `Carrier::claims_arch_id(arch_id, is_dir)` may distinguish the two namespaces.
 Today’s carriers are disjoint on bare id for the ids they claim; registry unit
@@ -99,11 +100,14 @@ for `0xFF`).
 
 | Concern | Location |
 |---|---|
-| Load (single arch-dispatch) | `hipfire_loader::load_model` → `REGISTRY` probe |
-| EP load | `hipfire_loader::load_model_ep` (9, 10) |
+| Load (single arch-dispatch) | `hipfire_loader::load_model` → `REGISTRY` probe (`crates/hipfire-loader/src/lib.rs`) |
+| EP load | `hipfire_loader::load_model_ep` (9, 10); Qwen4 EP2/EP4 is attached by `Qwen4Carrier` inside `load_model` (`attach_qwen4_ep_peers`) |
 | Spec target / emitter by id | `hipfire_loader::carrier_for` |
-| Generate short-circuits | `crates/hipfire-daemon/src/main.rs` `generate` (EP first; then 7, 9, 11, 12, 10, 8; else qwen35/llama body) |
-| Trait contract | `crates/hipfire-runtime/src/arch.rs` |
+| Early generate routes | `hipfire_loader::generation_early_route` (13 Gemma 4, 14 Muse Glimmer; 22 is excluded) |
+| Generate producer route | `hipfire_generate::ar::select_generation_route` (EP first; then 16, 7, 9, 11, 12, 15, 10, 14, 8; then PP; then Qwen/LLaMA DFlash/spec; else AR) and the `generate` match in `crates/hipfire-generate/src/ar.rs` |
+| Continuous-batch route | `hipfire_loader::continuous_batch_route` (5/6 Qwen3.5; 16 Qwen4, VMM lanes only) |
+| Bench-decode route | `hipfire_loader::bench_decode_route` (9, 11, 5/6, 13, 14, 16; else unsupported) |
+| Trait contract | `crates/hipfire-runtime/src/arch.rs`, `arch_model.rs` (`ArchModel`) |
 
 Vision-capable loads: Qwen3.5-VL rides ids **5/6** with optional vision
 weights; dots.ocr is id **8**. New vision arches need explicit generate and
