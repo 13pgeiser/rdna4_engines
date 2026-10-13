@@ -491,10 +491,14 @@
   Its hipGraph decode is off when expert `down_proj` is Q8_0, whose atomic
   sum is not replay-exact. Text on the q8-experts and requantized MQ4 26B
   fixtures is unchanged from the previous stack.
-- Gemma 4 joins the engine session cache (`memory.session_cache_bytes`):
-  prefill snapshots the Q8 KV rows every 1024 prompt tokens and continues the
-  previous turn's live state in place when the new prompt extends it. A
-  repeated long prompt restores the snapshot instead of re-prefilling it.
+- Gemma 4 joins the engine session cache (`memory.session_cache_bytes`, `0`
+  = off): prefill snapshots the Q8 KV rows every 1024 prompt tokens and at
+  the prompt length rounded down to the prefill width. The next turn of a
+  conversation resumes there and recomputes the rest of the previous prompt
+  and the decoded reply on the cold prefill grid, so a cached turn is
+  byte-identical to a cold prefill (decode and batched prefill write
+  different KV bits; decoded rows are never reused). A repeated long prompt
+  restores the snapshot instead of re-prefilling it.
   Each request now starts from its own prompt; previously a Gemma 4 request
   continued the previous request's KV in the same process until the context
   filled, so its output depended on what ran before it. The route-generic

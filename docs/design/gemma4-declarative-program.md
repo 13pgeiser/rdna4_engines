@@ -163,10 +163,16 @@ After the program port, Gemma 4 moved onto the seams Qwen4 introduced:
   `SessionState`: a snapshot is the Q8 K/V rows of every cache slot up to its
   position (`RowStream`s, no fixed state), scoped `gemma4/rows{N}` by prefill
   width because batched and per-token prefill write different bits. Boundaries
-  fall every 1024 prompt tokens. The route-generic live/plan/begin/commit
-  logic is `hipfire_runtime::session_cache::SessionDriver`, shared with
-  Qwen4. Each request now plans against its own prompt. Before this, a Gemma 4
-  request continued the previous request's KV in the same process.
+  fall every 1024 prompt tokens and at the prompt length rounded down to the
+  prefill width; the deepest one is the resident snapshot a follow-up turn
+  resumes from. Gemma 4 never continues the live state: decode and batched
+  prefill write different KV bits, so the previous reply and the previous
+  prompt's partial last chunk are recomputed on the cold chunk grid and a
+  cached turn is byte-identical to a cold one. The route-generic
+  plan/begin/commit logic is `hipfire_runtime::session_cache::SessionDriver`,
+  shared with Qwen4 (which also keeps a live continuation). Each request now
+  plans against its own prompt. Before this, a Gemma 4 request continued the
+  previous request's KV in the same process.
 - **Spec seams.** `mtp.rs`: `Gemma4Drafter: MtpDrafter` (driven by the
   generic `MtpSpeculator`) and `SpecTarget for Gemma4Bundle`. A window at
   position `p` holds the pending seed and the target's post-norm hidden of
@@ -249,7 +255,3 @@ contracts, not additional GPU exactness or performance measurements.
 - Batched verify is not bitwise-equal to single-row decode on gfx1151, so
   greedy EAGLE can leave the AR stream at near-tied logits. EAGLE stays
   opt-in until the verify and decode arithmetic match.
-- In the session scenario a follow-up turn restored the newest snapshot
-  instead of extending the previous turn's live state, so its rendered
-  history is not a token-exact extension of that turn (assumed cause: the
-  reply is re-rendered from text; Qwen keeps a verbatim assistant-turn cache).

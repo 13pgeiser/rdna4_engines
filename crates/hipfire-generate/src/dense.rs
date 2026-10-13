@@ -2222,9 +2222,10 @@ fn trace_gemma4_logits(
 ///      106 and decode loops `<turn|>` forever.
 ///
 /// Prompt cache: `Gemma4Bundle::prefill` plans the canonical render against
-/// the engine session cache (this conversation's live state or a cold-exact
-/// snapshot) and the turn commits after `done`; the daemon reports arch 13
-/// `cache_capable` when a cache is attached.
+/// the engine session cache (cold-exact snapshots only: the previous turn's
+/// prompt on the prefill chunk grid, or a cached stride snapshot) and the
+/// turn commits after `done`; the daemon reports arch 13 `cache_capable`
+/// when a cache is attached.
 ///
 /// EAGLE spec-decode (arch-22 drafter via `params.drafter`, opt-in with
 /// `HIPFIRE_GEMMA4_EAGLE=1`) runs greedy requests through the generic
@@ -2408,8 +2409,9 @@ pub fn generate_gemma4(
     } else {
         hipfire_runtime::session_cache::SessionRoute::Ar
     };
-    // Plan against the canonical render: this conversation's live state or
-    // a cached snapshot. Prefill restores it and computes only the rest.
+    // Plan against the canonical render: the previous turn's prompt on the
+    // prefill grid or a cached snapshot. Prefill resumes there and computes
+    // only the rest.
     let reused = hipfire_runtime::arch_model::ArchModel::session_plan(&*bundle, &prompt_ids, route);
     if spec {
         generate_gemma4_spec(
@@ -2573,14 +2575,14 @@ pub fn generate_gemma4(
         active_attempt_id(),
     );
     let _ = stdout.flush();
-    hipfire_runtime::arch_model::ArchModel::session_commit_live(bundle, &m.conversation_tokens);
+    hipfire_runtime::arch_model::ArchModel::session_commit(bundle);
 }
 
 /// Gemma 4 EAGLE spec decode on the generic `generate_spec` core: the
 /// `MtpSpeculator<Gemma4Drafter>` in `m.speculator`, the bundle as
 /// `SpecTarget` and `GemmaSpecEmit`. `reused` prompt tokens come from the
 /// session plan; greedy only. Writes the Gemma `done` envelope and commits
-/// the session's live state.
+/// the session's snapshots.
 #[allow(clippy::too_many_arguments)]
 fn generate_gemma4_spec(
     m: &mut LoadedModel,
@@ -2656,7 +2658,7 @@ fn generate_gemma4_spec(
     );
     let _ = stdout.flush();
     if let Some(state) = m.state.as_deref_mut() {
-        state.session_commit_live(&m.conversation_tokens);
+        state.session_commit();
     }
 }
 
