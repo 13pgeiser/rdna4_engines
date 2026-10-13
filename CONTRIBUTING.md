@@ -91,11 +91,11 @@ downloads:
 
 It runs `cargo check --workspace --examples`, no-GPU Rust unit tests,
 CPU Python tests, the env/docs drift check and the lifecycle check.
-Required CI on `master` is `build (workspace, no GPU)`,
-`unit tests (lib, no GPU)` (the `test` job in
-[`ci.yml`](.github/workflows/ci.yml)) and
+The jobs in [`ci.yml`](.github/workflows/ci.yml) include
+`build (workspace, no GPU)`, `unit + integration tests (no GPU)` and
 `gates (ratchets, layering, registers)` (ratchets, layering, crate maps,
-changelog; not part of `no-gpu-ci.sh`), plus one approving review — see
+changelog; not part of `no-gpu-ci.sh`). Merge also requires an approving
+review — see
 [docs/VALIDATION.md](docs/VALIDATION.md) § Merge bar. Hardware-relevant
 changes still owe claim-matched GPU/model evidence for direct review; that
 evidence is not a separate required CI check.
