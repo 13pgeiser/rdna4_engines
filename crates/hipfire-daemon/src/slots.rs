@@ -469,39 +469,13 @@ impl SlotBackend {
         // serve.queue_timeout_ms = 600000 (10 min). The CLI startup guard rejects
         // serve.max_queue=0 for multi-slot; Rig::build also refuses
         // WaitQueue::new(0, _) as a backstop.
-        let wait_max_count = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.max_queue")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(64);
-        let wait_max_bytes = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.max_queue_bytes")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as u64)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(268435456);
-        let queue_timeout_ms = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.queue_timeout_ms")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as u64)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(30000);
+        let process_config = hipfire_config::active_or_local_process_config();
+        let wait_max_count =
+            integer_or_registered_default(&process_config.values, "serve.max_queue") as usize;
+        let wait_max_bytes =
+            integer_or_registered_default(&process_config.values, "serve.max_queue_bytes") as u64;
+        let queue_timeout_ms =
+            integer_or_registered_default(&process_config.values, "serve.queue_timeout_ms") as u64;
         // Read the structured-output jump-forward flag (spec §7.3 G3).
         // Key registered as serve.structured_jump_forward with env
         // HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD. Default false — no
@@ -2259,6 +2233,22 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Integer config value for `key`, falling back to the registered default in
+/// hipfire-config's field table (single source of truth: a hard-coded
+/// fallback here drifts when the registered default changes).
+///
+/// Panics if `key` is not a registered integer field; that is a programmer
+/// error caught by `waiting_room_fallbacks_are_the_registered_defaults`.
+fn integer_or_registered_default(layer: &hipfire_config::ConfigLayer, key: &str) -> i64 {
+    if let Some(hipfire_config::ConfigValue::Integer(i)) = layer.values.get(key) {
+        return *i;
+    }
+    match hipfire_config::field(key).map(|f| f.default) {
+        Some(hipfire_config::DefaultValue::Integer(i)) => i,
+        _ => panic!("config key {key} is not a registered integer field"),
+    }
+}
+
 // ── Message projection (pure) ────────────────────────────────────────────────
 
 /// Canonical pending-input bytes charged to the admission queue (spec §5.3).
@@ -2853,6 +2843,30 @@ mod tests {
     use hipfire_engine::terminal::{batch_clear_all_terminals, batch_terminal_generation};
     use hipfire_runtime::prompt_frame::Role;
     use serde_json::json;
+
+    /// The waiting-room fallbacks used when the process config lacks a key
+    /// must equal the registered defaults (a hard-coded 30000 ms once
+    /// drifted from the registered 600000 ms).
+    #[test]
+    fn waiting_room_fallbacks_are_the_registered_defaults() {
+        let empty = hipfire_config::ConfigLayer::default();
+        for (key, expected) in [
+            ("serve.max_queue", 64),
+            ("serve.max_queue_bytes", 268_435_456),
+            ("serve.queue_timeout_ms", 600_000),
+        ] {
+            let registered = hipfire_config::field(key).expect("registered key").default;
+            assert!(
+                matches!(registered, hipfire_config::DefaultValue::Integer(i) if i == expected),
+                "{key}: registered default is {registered:?}, expected {expected}"
+            );
+            assert_eq!(integer_or_registered_default(&empty, key), expected, "{key}");
+        }
+        let mut set = hipfire_config::ConfigLayer::default();
+        set.set("serve.queue_timeout_ms", hipfire_config::ConfigValue::Integer(1234))
+            .unwrap();
+        assert_eq!(integer_or_registered_default(&set, "serve.queue_timeout_ms"), 1234);
+    }
 
     #[test]
     fn arch_validation_accepts_5_and_6() {
