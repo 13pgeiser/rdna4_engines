@@ -2187,6 +2187,7 @@ fn run_qsa(
             index_dim,
             position: None,
             grid_bound: blocks,
+            rope_scaling: None,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -2371,6 +2372,7 @@ fn run_qsa(
                 head_stride: head_dim,
                 position: positions[token],
                 rotary_dim: head_dim,
+                rope_scaling: None,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2408,6 +2410,7 @@ fn run_qsa(
                 head_stride: head_dim,
                 position: positions[token],
                 rotary_dim: head_dim,
+                rope_scaling: None,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2451,6 +2454,7 @@ fn run_qsa(
                 head_stride: 8,
                 position: *position,
                 rotary_dim: 8,
+                rope_scaling: None,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -3297,6 +3301,7 @@ fn run_mtp(
             index_dim,
             position: None,
             grid_bound: 1,
+            rope_scaling: None,
         },
     )
     .map_err(|error| error.to_string())?;

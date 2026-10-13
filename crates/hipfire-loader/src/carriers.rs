@@ -642,11 +642,20 @@ impl Carrier for Qwen4Carrier {
                 .map_err(|error| format!("qwen4: VMM granularity: {error}"))?,
             hipfire_arch_qwen4::Qwen4KvBackend::Legacy => 1,
         };
-        if ctx.max_seq == 0 || ctx.max_seq > hipfire_arch_qwen4::QWEN4_MAX_CONTEXT {
+        // The upper bound is the artifact config's window (native, or
+        // factor x 262,144 with static YaRN), read from the metadata alone so
+        // the refusal stays before any placement or allocation.
+        let ModelSource::Hfq(src_hfq) = &src else {
+            return Err(
+                "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
+            );
+        };
+        let max_context = hipfire_arch_qwen4::artifact::artifact_max_context(src_hfq)
+            .map_err(|error| error.to_string())?;
+        if ctx.max_seq == 0 || ctx.max_seq > max_context {
             return Err(format!(
                 "qwen4: max_seq {} is outside the admitted context range 1..={}",
-                ctx.max_seq,
-                hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
+                ctx.max_seq, max_context
             ));
         }
         let ep = hipfire_config::topology::qwen4_ep()?;

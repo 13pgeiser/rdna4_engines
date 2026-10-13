@@ -222,7 +222,7 @@ startup.
 | `presence_penalty` | `0.0` | number 0.0–2.0 | OpenAI-style flat penalty over the repeat window; zero disables it. |
 | `repeat_penalty` | `1.05` | number 1.0–3.0 | Kept low; higher values harm some MQ4 greedy paths (source comment). Stored default only; see send path below. |
 | `max_tokens` | `4096` | int 1–393216 | Per-turn generation cap for run / OpenAI fallback; 384 Ki tokens matches DeepSeek V4 Flash 0731's documented maximum output length. |
-| `max_seq` | automatic on growing Qwen VMM KV | int 512–1048576 when set | Default: min(checkpoint `config.text_config.max_position_embeddings`, card capacity after weights, admitted prefill scratch, and VRAM headroom). Explicit user values override either bound, including the trained window. |
+| `max_seq` | automatic on growing Qwen VMM KV | int 512–1048576 when set | Default: min(checkpoint `config.text_config.max_position_embeddings`, card capacity after weights, admitted prefill scratch, and VRAM headroom). Explicit user values override either bound, including the trained window. Qwen4 (Flash-Next) is the exception: its cap is the config window, 262,144 native or factor × 262,144 with `memory.rope_yarn_factor` / checkpoint YaRN, and a larger explicit value refuses before allocation. |
 | `thinking` | `"on"` | `on` \| `off` | Thinking **mode** (on/off). Independent of effort and of any hard think-token cap. When off wins, effort and cap controls are dropped with a warning. |
 | `reasoning_effort` | `"auto"` | `auto` \| `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | **Semantic** effort only — prompt / framing strength. Field meaning never changes by family and is **never** reinterpreted as a token budget. `auto` means no preference: any resolved non-`auto` value from user config, per-model config, CLI, or an HTTP request wins; only when every layer is unset or `auto` does hipfire's default apply, which is `medium` on the effort-native Qwen3.8 and Ornith 1.5 contracts (the official Qwen3.8 template itself defaults to `xhigh`, so `medium` is a deliberate hipfire choice, not the template default). `reasoning_effort = "xhigh"` restores the previous behavior. Other contracts keep their own `auto` behavior. Unsupported or cross-family values are dropped with a warning (see below). |
 | `thinking_budget` | `"med"` | `low` \| `med` \| `high` \| `xhigh` \| `max` \| `uncapped` | Legacy **named cap preset** only on models that still honor that config route. Not an effort dial. On effort-native models the string is dropped with a warning (no implicit cap). |
@@ -399,7 +399,8 @@ The native MTP layer keeps the exact state. On Flash-Next, each trunk QSA
 layer's context state is 4,736 bytes per token at `bf16`, 1,352 at fp8 and
 1,408 at q8 (12 layers at 262,144 tokens: 14,208, 4,056 and 4,224 MiB). The
 Q8 GDN state is 3.88× smaller than F32. `memory.max_seq` goes up to the
-native 262,144. Index keys hold the same values in every format, so
+native 262,144 (factor × 262,144 with static YaRN,
+[`memory.rope_yarn_factor`](#memoryrope_yarn_factor)). Index keys hold the same values in every format, so
 selection is unchanged; only the attention over the selected K/V rows sees
 the quantization.
 
@@ -459,19 +460,22 @@ until unload, and VMM is not eviction.
 
 Qwen4 `max_seq` on a **unified-memory APU** (gfx1151): omission is
 **automatic** under VMM (legacy storage refuses it and needs an explicit
-value). The context is the model's `max_position_embeddings` (at most
-262,144), capped by **card capacity**: after every load allocation the carrier
+value). The context is the model's window — `max_position_embeddings`
+(262,144 for Flash-Next), or factor × 262,144 with static YaRN (see
+[`memory.rope_yarn_factor`](#memoryrope_yarn_factor)) — capped by **card
+capacity**: after every load allocation the carrier
 measures free device memory and finds the largest context whose remaining VMM
 growth (target and MTP QSA pages, gathered workspace), native MTP request
 buffers and a 2 GiB headroom fit. The load logs one `qwen4 memory admission`
 line with those numbers, and the daemon logs `max_seq: N (bound=model|card;
 model_ctx=…, card_cap=…)`. An explicit `max_seq` that cannot grow refuses at
 load, naming the largest one that fits (with `memory.oom_guard` off it loads
-and only warns). Before any allocation, a fully resident load that does not
+and only warns). An explicit `max_seq` above the window refuses before any
+allocation. Before any allocation, a fully resident load that does not
 fit free device memory refuses the same way. The session cache is not
 charged: its snapshots yield to context growth (see
 `memory.session_cache_bytes`). On a discrete GPU an omitted Qwen4 `max_seq`
-stays 32768 and an explicit one is not checked at load.
+stays 32768 and an explicit one is not checked at load beyond the window.
 
 **Free device memory on unified memory.** Every free-memory sizing site
 (this admission, expert placement, the dense Qwen card bound below, VMM KV
@@ -792,6 +796,37 @@ state and replays only the consumed prefix so the prompt/prefix cache stays
 warm. The next turn prefills only the new suffix instead of a full cold
 prefill (the previous fail-closed path reset and invalidated the cache).
 
+### `memory.rope_yarn_factor`
+
+| Key | Default | Values |
+|---|---|---|
+| `memory.rope_yarn_factor` | unset (`null`) | `null` \| float in `[1, 4]` |
+
+Compat env: `HIPFIRE_ROPE_YARN_FACTOR` ([`env-vars.md`](env-vars.md)). Static
+YaRN RoPE scaling for the Qwen4 (Flash-Next, arch 16) QSA stack. Experimental,
+process-scoped: it applies to every Qwen4 load of the process, so set it in the
+global config or the daemon environment, not a per-request field.
+
+- **unset / `null`** — the checkpoint's own `rope_scaling` / `rope_parameters`
+  decides. A checkpoint carrying `rope_type: "yarn"` loads with that scaling;
+  a stock Flash-Next checkpoint has none and runs the native RoPE. Output is
+  byte-identical to a build without the key.
+- **`1`** — force the native RoPE, even over a checkpoint's own YaRN.
+- **`F` in `(1, 4]`** — static YaRN with factor `F` over the native
+  262,144-token window, with the Hugging Face defaults (`beta_fast` 32,
+  `beta_slow` 1, attention factor `0.1 ln F + 1`). The `rotary_dim / 2`
+  inverse-frequency table is the HF `_compute_yarn_parameters` blend of the
+  native and `1/F`-interpolated frequencies, and every QSA rotation takes the
+  same table and attention factor: the attention q/k, the indexer query, the
+  pooled index keys (at block start), and the MTP head.
+
+With YaRN on, the Qwen4 context cap is `F × 262,144` (`memory.max_seq` is
+admitted up to it; an omitted `max_seq` on a unified-memory APU becomes that
+window capped by card capacity). The cap is checked before any allocation or
+teardown. Static YaRN changes numerics on every context length, including
+short ones (a short-context quality cost); leave it unset unless you need the
+longer window.
+
 ### Qwen4 PLE row tables
 
 The Flash-Next (Qwen4) per-layer-embedding (PLE) n-gram table is 128 shard
@@ -1063,6 +1098,7 @@ uses ambient variables in engine hot paths.
 | `prompt_cache_capacity` | `memory.prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | 32 |
 | `prompt_cache_unbounded` | `memory.prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | false |
 | `session_cache_bytes` | `memory.session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | 8589934592 (8 GiB; `0` off) |
+| `rope_yarn_factor` | `memory.rope_yarn_factor` | `HIPFIRE_ROPE_YARN_FACTOR` | unset (the checkpoint's own rope scaling; native RoPE for Flash-Next); `1` forces native, `(1, 4]` = static YaRN over the native 262,144 window |
 | `ple_hot_store_bytes` | `memory.ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | 0 (off; `auto` = prewarm `MemAvailable` − 4 GiB of the hot-row pack) |
 | `ple_format` | `memory.ple_format` | `HIPFIRE_PLE_FORMAT` | `auto` (q4 on gfx1151, q8 elsewhere; see [Qwen4 PLE row tables](#qwen4-ple-row-tables)) |
 | `ple_prewarm_bytes` | `memory.ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | `auto` (prewarm 15 GiB of the q4 PLE table, capped at `MemAvailable` − 8 GiB; `0` off) |
@@ -1120,7 +1156,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 286 schema keys, plus the `developer.<name>` namespace.
+**Count:** 287 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -1327,6 +1363,7 @@ misspelled key is unknown and fails the load with
 | `memory.ple_prewarm_bytes` | `ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | stable |
 | `memory.prompt_cache_capacity` | `prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | stable |
 | `memory.prompt_cache_unbounded` | `prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | experimental |
+| `memory.rope_yarn_factor` | `rope_yarn_factor` | `HIPFIRE_ROPE_YARN_FACTOR` | experimental |
 | `memory.session_cache_bytes` | `session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | stable |
 | `memory.unsafe_wsl_vmm_kv` | `unsafe_wsl_vmm_kv` | `HIPFIRE_UNSAFE_WSL_VMM_KV` | experimental |
 | `model.deepseek4_experts_per_token` | `deepseek4_experts_per_token` |  | stable |

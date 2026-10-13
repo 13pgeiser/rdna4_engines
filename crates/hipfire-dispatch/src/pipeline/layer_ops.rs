@@ -38,7 +38,7 @@ use rdna_compute::tensor_ops::{
     IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
     IndexedAttentionDecodePrologue, IndexedAttentionIndexKeyAppendBatch,
     IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
-    IndexedAttentionSelectBatch, QsaF16ArenaRef, QsaKvFormat, ScaleF32,
+    IndexedAttentionSelectBatch, QsaF16ArenaRef, QsaKvFormat, QsaRopeScaling, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use rdna_compute::tensor_ops::{
@@ -2266,6 +2266,10 @@ pub struct IndexedAttentionOp<'a> {
     /// they would not derive runs the batched launches (queries/keys) or is
     /// refused (pooled keys).
     pub rotary_dim: usize,
+    /// Static YaRN of every QSA RoPE this op launches (the indexer query, the
+    /// query and key rotations, and the pooled indexer keys); `None` is the
+    /// native `10^7`-base RoPE.
+    pub rope_scaling: Option<QsaRopeScaling<'a>>,
     pub input_width: usize,
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
@@ -2942,6 +2946,7 @@ fn execute_indexed_attention_hc_impl(
                 position: initial_position,
                 rows: op.rows,
                 format: op.state.format,
+                rope_scaling: op.rope_scaling,
             },
         ))?;
     } else {
@@ -2957,6 +2962,7 @@ fn execute_indexed_attention_hc_impl(
                 head_stride: op.index_dim,
                 position_start: initial_position,
                 rotary_dim: op.rotary_dim,
+                rope_scaling: op.rope_scaling,
             },
         ))?;
         if op.state.format.index_dtype() == DType::BF16 {
@@ -3014,6 +3020,7 @@ fn execute_indexed_attention_hc_impl(
                 head_stride: 2 * op.head_dim,
                 position_start: initial_position,
                 rotary_dim: op.rotary_dim,
+                rope_scaling: op.rope_scaling,
             },
         ))?;
         hip(indexed_attention_norm_rope_batch(
@@ -3028,6 +3035,7 @@ fn execute_indexed_attention_hc_impl(
                 head_stride: op.head_dim,
                 position_start: initial_position,
                 rotary_dim: op.rotary_dim,
+                rope_scaling: op.rope_scaling,
             },
         ))?;
         hip(indexed_attention_cache_append_batch(
@@ -3071,6 +3079,7 @@ fn execute_indexed_attention_hc_impl(
                     rows: op.rows,
                 }),
                 grid_bound: op.state.pooled_capacity,
+                rope_scaling: op.rope_scaling,
             },
         ))?;
     }
@@ -4092,6 +4101,7 @@ mod tests {
             mode,
             trunk_a4: 0,
             phase: MixerPhase::Whole,
+            rope_scaling: None,
         }
     }
 

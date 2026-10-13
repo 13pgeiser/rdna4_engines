@@ -1308,13 +1308,9 @@ pub fn admit_source_with_options(
     let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
         // Arch 16 is an executable local-path carrier, but only after its
         // complete source-only boundary succeeds. Keep this before vision/head
-        // handling so every refusal remains pre-allocation.
-        if max_seq > hipfire_arch_qwen4::QWEN4_MAX_CONTEXT {
-            return Err(format!(
-                "qwen4: max_seq {max_seq} exceeds the admitted context limit {}",
-                hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
-            ));
-        }
+        // handling so every refusal remains pre-allocation. The context cap is
+        // the admitted config's window (native, or factor x 262,144 with
+        // static YaRN), checked right after the source admission below.
         let qwen4_kv =
             hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
         // Expert-parallel degree: `topology.ep`, forced to 1 by the
@@ -1342,13 +1338,12 @@ pub fn admit_source_with_options(
             native_mtp,
             spec_mtp,
         )?;
-        let positions = admitted.config.max_position_embeddings;
-        if max_seq > positions {
+        let model_ctx = admitted.config.max_context();
+        if max_seq > model_ctx {
             return Err(format!(
-                "qwen4: max_seq {max_seq} exceeds max_position_embeddings {positions}"
+                "qwen4: max_seq {max_seq} exceeds the admitted context limit {model_ctx}"
             ));
         }
-        let model_ctx = positions.min(hipfire_arch_qwen4::QWEN4_MAX_CONTEXT);
         if unified_memory {
             qwen4_sequence = Some(SequenceResolution {
                 max_seq: if max_seq == 0 { model_ctx } else { max_seq },

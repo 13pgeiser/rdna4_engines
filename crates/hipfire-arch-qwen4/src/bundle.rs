@@ -917,6 +917,15 @@ impl Qwen4Bundle {
             })
             .unwrap_or_else(|| requested.min(1536));
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
+        if let Some(yarn) = self.config.rope_yarn {
+            eprintln!(
+                "  qwen4 rope: static YaRN factor {} over {} positions (attention factor {:.6}), context limit {}",
+                yarn.factor,
+                yarn.original_max_position_embeddings,
+                yarn.attention_factor,
+                self.config.max_context()
+            );
+        }
         let forward = Qwen4GpuForward::new_inner(
             gpu, self, max_chunk, mode,
             #[cfg(target_os = "linux")]
