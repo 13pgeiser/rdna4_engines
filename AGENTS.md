@@ -245,7 +245,8 @@ works, what to measure, what counts as pass/fail.
    bans/licenses/sources, rustfmt on changed files, clippy, env docs and
    lifecycle. It skips the tests and the release build. Pass the branch
    your PR targets (for example `origin/beta`) so ratchet-diff compares
-   against it. Fix every failure before you commit.
+   against it. Fix every failure before you commit. Install cargo-deny first
+   with `cargo install --locked cargo-deny`; missing tools fail the check.
 
 ---
 
