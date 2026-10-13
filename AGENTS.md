@@ -160,7 +160,7 @@ works, what to measure, what counts as pass/fail.
   prefill. MoE/A3B + MQ3 is refused at load time (no MoE-branched WMMA
   path).
 - **MQ2 is refused by default.** The quantizer requires
-  `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
+  `--format mq2 --allow-mq2` (or `HIPFIRE_ALLOW_MQ2=1`) to opt in. Severe quality
   cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
 - **`dflash_mode=off` is the schema default.** Any test exercising DFlash
   on a model without a registry DFlash policy still needs
