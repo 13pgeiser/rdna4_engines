@@ -2235,52 +2235,102 @@ mod tests {
 
     #[test]
     fn draft_shared_rotations_default_on_exact_gfx1100_with_independent_opt_out() {
-        // Default process policy: on for exact gfx1100 only (the runtime
-        // admission also requires exact gfx1100).
-        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
-        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"] {
-            let flags = FeatureFlags::from_process_config(arch, &process);
-            let on = arch == "gfx1100";
-            assert_eq!(flags.draft_shared_qkv_rotation, on, "arch={arch}");
-            assert_eq!(flags.draft_shared_ffn_rotation, on, "arch={arch}");
-            assert_eq!(flags.draft_shared_ctx_kv_rotation, on, "arch={arch}");
-        }
-
-        // Each key opts out on its own, through TOML/CLI and the env spelling.
         let keys = [
             ("kernel.draft_shared_qkv_rotation", "HIPFIRE_DRAFT_SHARED_QKV_ROTATION"),
             ("kernel.draft_shared_ffn_rotation", "HIPFIRE_DRAFT_SHARED_FFN_ROTATION"),
             ("kernel.draft_shared_ctx_kv_rotation", "HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION"),
         ];
+        let arches = ["gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"];
         let triple = |f: &FeatureFlags| {
             [f.draft_shared_qkv_rotation, f.draft_shared_ffn_rotation, f.draft_shared_ctx_kv_rotation]
         };
-        for (i, (key, env)) in keys.iter().enumerate() {
-            let mut expected = [true; 3];
-            expected[i] = false;
-            let mut layer = ConfigLayer::default();
-            layer.set_cli(key, "false").unwrap();
-            let resolved = resolve([NamedLayer {
-                source: ConfigSource::GlobalUser { path: "config.toml".into() },
-                layer,
-            }])
-            .unwrap();
-            let process = ProcessConfig::from_resolved(&resolved).unwrap();
-            assert_eq!(process.legacy_value(env).as_deref(), Some("0"), "{key}");
-            assert_eq!(triple(&FeatureFlags::from_process_config("gfx1100", &process)), expected, "{key}");
-            let from_env = FeatureFlags::from_lookup("gfx1100", |name| {
-                if name == *env {
-                    Ok("0".into())
-                } else {
-                    Err(())
-                }
-            });
-            assert_eq!(triple(&from_env), expected, "{env}=0");
+
+        // Built-in true values must stay absent across the CLI-to-daemon
+        // handoff, so each architecture still selects its own fallback.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let wire = serde_json::to_string(&process).unwrap();
+        let decoded: ProcessConfig = serde_json::from_str(&wire).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, process);
+        for (key, env) in keys {
+            assert_eq!(resolved.get(key).unwrap().value, hipfire_config::ConfigValue::Bool(true));
+            assert!(process.values.get(key).is_none(), "{key}");
+            assert!(decoded.values.get(key).is_none(), "{key}");
+            assert_eq!(decoded.legacy_value(env), None, "{env}");
+            assert!(!wire.contains(key), "{key} must not be serialized");
+        }
+        for arch in arches {
+            let expected = [arch == "gfx1100"; 3];
+            assert_eq!(triple(&FeatureFlags::from_process_config(arch, &process)), expected, "{arch}");
+            assert_eq!(triple(&FeatureFlags::from_process_config(arch, &decoded)), expected, "{arch}");
+            assert_eq!(triple(&FeatureFlags::from_lookup(arch, |_| Err(()))), expected, "{arch}");
+            assert_eq!(triple(&FeatureFlags::for_test(arch)), [false; 3], "{arch}: test baseline");
         }
 
-        // The unit-test constructor stays fully off (deterministic baseline).
-        for arch in ["gfx1100", "gfx1201"] {
-            assert_eq!(triple(&FeatureFlags::for_test(arch)), [false; 3], "arch={arch}");
+        // Each switch independently carries both explicit true and false,
+        // including true equal to the schema default (which must not vanish).
+        for (i, (key, env)) in keys.iter().enumerate() {
+            let schema = hipfire_config::field(key).unwrap();
+            assert_eq!(schema.env_compat, Some(*env));
+            for (enabled, spellings) in [
+                (false, ["0", "false", "off", "no", "FALSE", "Off", "NO"]),
+                (true, ["1", "true", "on", "yes", "TRUE", "On", "YES"]),
+            ] {
+                // TOML booleans lower to typed ConfigValue::Bool before set;
+                // use that pure API rather than a file or ambient environment.
+                let mut toml = ConfigLayer::default();
+                toml.set(key, hipfire_config::ConfigValue::Bool(enabled)).unwrap();
+                let toml_process = ProcessConfig::from_resolved(&resolve([NamedLayer {
+                    source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                    layer: toml,
+                }]).unwrap()).unwrap();
+
+                for raw in spellings {
+                    let mut cli = ConfigLayer::default();
+                    cli.set_cli(key, raw).unwrap();
+                    let mut legacy_cli = ConfigLayer::default();
+                    legacy_cli.set_cli(schema.legacy_key, raw).unwrap();
+                    let mut environment = ConfigLayer::default();
+                    // load_env_layer uses this same schema parser for these
+                    // stable aliases; no process-global env mutation needed.
+                    environment.set(key, schema.parse_cli(raw).unwrap()).unwrap();
+                    for (source, layer) in [
+                        (ConfigSource::OneShot { argument: format!("{key}={raw}") }, cli),
+                        (ConfigSource::OneShot { argument: format!("{}={raw}", schema.legacy_key) }, legacy_cli),
+                        (ConfigSource::LegacyEnv { name: (*env).into() }, environment),
+                    ] {
+                        let resolved = resolve([NamedLayer { source, layer }]).unwrap();
+                        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+                        assert_eq!(process, toml_process, "{key}={raw}");
+                        let wire = serde_json::to_string(&process).unwrap();
+                        let decoded: ProcessConfig = serde_json::from_str(&wire).unwrap();
+                        decoded.validate().unwrap();
+                        assert_eq!(decoded, process, "{key}={raw}");
+                        let normalized = if enabled { "1" } else { "0" };
+                        assert_eq!(decoded.legacy_value(env).as_deref(), Some(normalized), "{key}={raw}");
+                        for (j, (other_key, other_env)) in keys.iter().enumerate() {
+                            if j != i {
+                                assert!(decoded.values.get(other_key).is_none(), "{key} changed {other_key}");
+                                assert_eq!(decoded.legacy_value(other_env), None, "{key} changed {other_env}");
+                            }
+                        }
+                        for arch in arches {
+                            let mut expected = [arch == "gfx1100"; 3];
+                            expected[i] = enabled;
+                            assert_eq!(
+                                triple(&FeatureFlags::from_process_config(arch, &decoded)),
+                                expected,
+                                "{arch}: {key}={raw}"
+                            );
+                            let from_env = FeatureFlags::from_lookup(arch, |name| {
+                                if name == *env { Ok(normalized.into()) } else { Err(()) }
+                            });
+                            assert_eq!(triple(&from_env), expected, "{arch}: {env}={normalized}");
+                        }
+                    }
+                }
+            }
         }
     }
 

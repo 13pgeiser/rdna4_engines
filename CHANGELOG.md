@@ -2,6 +2,9 @@
 
 ## Unreleased (0.4.2)
 
+- **gfx1100 DFlash draft: reuse shared MQ4V2 input rotations (#838 by @HUSRCF).** Noise Q/K/V, FFN gate/up and incremental context K/V rotate their common input once per group instead of once per projection. Each group keeps its existing GEMMs, weights and scratch. Default on exact gfx1100 only; `kernel.draft_shared_qkv_rotation`, `kernel.draft_shared_ffn_rotation` and `kernel.draft_shared_ctx_kv_rotation` set to `false` (or the corresponding `HIPFIRE_DRAFT_SHARED_QKV_ROTATION`, `HIPFIRE_DRAFT_SHARED_FFN_ROTATION`, `HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION` set to `0`) independently restore per-projection rotations.
+  - Admission stays eager-only, 2..=16 token rows, compatible MQ4G256V2 weights with identical K divisible by 256, sufficient existing scratch, no AWQ or GEMM dump. Recorded/captured calls and every other architecture keep their original per-projection dispatch. The already-default stream-ordered draft copies remain unchanged.
+  - Maintainer evidence on gfx1100 (7900 XTX), pinned Qwen3.8-27B XTS plus MQ4V2 draft: default-on, all-switches-off and beta greedy batteries match text, token counts, acceptance τ and cycle counts (5/5); on/off chains match (5/5), VMM throughout. gfx1201 beta versus explicitly-all-switches-on battery also matches (5/5), and the no-GPU flag-default test excludes gfx1201/gfx1151. Sharing removes redundant rotations, not a new numerical GEMM route.
 - Container validation uses supported Python harness commands and honors `HIPFIRE_HOME` for runtime storage.
 - Redline reproduction packages now capture and install indexed-object metadata alongside code objects and hashes for fail-closed kernel verification.
 - Detached `hipfire serve` now preserves `--vision` and forwards `--max-seq` exactly once, matching foreground serving.
