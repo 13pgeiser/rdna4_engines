@@ -1115,7 +1115,7 @@
     },
     {
       "role": "accepted builder twin source (additional incumbent)",
-      "path": "crates/hipfire-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
+      "path": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
       "sha256": "ebdbde12690c2542a5862d9fa1d5513cfa9193cc7364fed8ecc12e452596743d",
       "hashed_with": "sha256sum"
     },
@@ -1283,7 +1283,7 @@
     },
     {
       "role": "H source: m7 static check",
-      "path": "crates/hipfire-isa/src/pm_check.rs",
+      "path": "crates/peacemaker-isa/src/pm_check.rs",
       "sha256": "33b12c3d37a7b2d4715f7a177273259e5ce1609c49cf31d55eec6fd90e2a04e2",
       "hashed_with": "sha256sum"
     }
@@ -1335,7 +1335,7 @@
       }
     },
     "builder_twin": {
-      "file": "crates/hipfire-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
+      "file": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
       "lines": {
         "recipe_header": "1-10",
         "build_gfx1201": "20-50"

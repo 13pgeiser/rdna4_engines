@@ -162,7 +162,7 @@ Island `I1_two_dispatch_duplicate_kernel`, geometry of C1: one frozen arm artifa
 | hipcc incumbent object (Hllvm) | `<release-workdir>/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/kernel.hsaco` | `bd87c3e5a11ae57644a3e462af3398adea5da973cfc95789230d0e6d79b742ca` |
 | hipcc incumbent build command | `<release-workdir>/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/command.json` | `a0d1d53faef63691a0e00312e7360082fd57d2de60551381c4dc1edbbb78b19d` |
 | decode-twin inventory | `<release-workdir>/pm-decode-twins/inventory.json` | `b17f6b13e0c740f40fd9a3090fa3e84603d378afb622671eb487583a70f85f10` |
-| accepted builder twin source (additional incumbent) | `crates/hipfire-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs` | `ebdbde12690c2542a5862d9fa1d5513cfa9193cc7364fed8ecc12e452596743d` |
+| accepted builder twin source (additional incumbent) | `crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs` | `ebdbde12690c2542a5862d9fa1d5513cfa9193cc7364fed8ecc12e452596743d` |
 | accepted builder twin asm | `kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s` | `b320c9d07cebea702fc4bb206d3637505b363de9826fc739ce05ec16979c991f` |
 | accepted builder twin code object | `kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co` | `bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d` |
 | accepted builder twin hxaco | `kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco` | `8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757` |
@@ -190,7 +190,7 @@ Island `I1_two_dispatch_duplicate_kernel`, geometry of C1: one frozen arm artifa
 | H source: ReplayQuiescence | `crates/rdna-compute/src/replay.rs` | `2711fd12c1c5daa4478345bb443518bb03344056084f131d3b83ecdbac7dab4b` |
 | H source: launch_maybe_blob_bound capture boundary | `crates/rdna-compute/src/dispatch.rs` | `bc27840992fb02b05e4b3550797dce797ead42cbb45af428077f77085c013e48` |
 | H source: load_kernel_module/load_embedded_module funnel | `crates/rdna-compute/src/scratch.rs` | `2830287ff2144e4f90bc74f2aaa0683089c57e99fa6bf2aff5ad7691b53ce769` |
-| H source: m7 static check | `crates/hipfire-isa/src/pm_check.rs` | `33b12c3d37a7b2d4715f7a177273259e5ce1609c49cf31d55eec6fd90e2a04e2` |
+| H source: m7 static check | `crates/peacemaker-isa/src/pm_check.rs` | `33b12c3d37a7b2d4715f7a177273259e5ce1609c49cf31d55eec6fd90e2a04e2` |
 
 Pilot-owned files (comp, oracle, reference.rs) are uncommitted working-tree files at freeze: consumers must refuse a different digest rather than follow the live file. Mesa tree has local modifications at freeze (`src/amd/compiler/meson.build`, untracked `aco-shim`); none of the pinned Mesa files above is modified. The three `pin.json` entries match `pin.json:5-9`.
 
