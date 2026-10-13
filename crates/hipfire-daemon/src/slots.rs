@@ -3180,10 +3180,10 @@ mod tests {
     #[test]
     fn load_caps_admit_only_the_default_dflash_block() {
         for ok in [json!({"params": {}}), json!({"params": {"dflash_block": 16}}), json!({"params": {"dflash_block": "auto"}})] {
-            assert!(validate_load_caps(&ok).is_none(), "{ok} must be admitted");
+            assert!(validate_load_caps(&ok, "gfx1100").is_none(), "{ok} must be admitted");
         }
         for bad in [json!({"params": {"dflash_block": 8}}), json!({"params": {"dflash_block": 99}})] {
-            assert!(validate_load_caps(&bad).is_some(), "{bad} must be refused");
+            assert!(validate_load_caps(&bad, "gfx1100").is_some(), "{bad} must be refused");
         }
     }
 

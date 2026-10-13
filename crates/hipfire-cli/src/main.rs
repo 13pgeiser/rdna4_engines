@@ -13641,7 +13641,6 @@ mod tests {
                     engine,
                     paths: paths.clone(),
                     registry,
-                    vmm_batch: crate::serve::VmmBatchFlags::default(),
                     current_path: None,
                     current_arch: None,
                     current_reasoning_contract: ReasoningContract::Unsupported,
