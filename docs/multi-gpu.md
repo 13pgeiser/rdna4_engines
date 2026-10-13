@@ -297,6 +297,33 @@ input); non-owned tiles' activation rows are never consumed. Diagnostics:
 tile by tile, the FFN output and the HC streams of selected layers for
 bitwise comparison with a single card (`fn-ep/coal/s1/compare_chunk.py`).
 
+||||||| parent of c7bb368cc (feat(qwen4-ep): stage compact rank experts without changing decode waits)
+### Flash-Next EP: long-prefill expert staging
+
+`HIPFIRE_EP_EXPERT_STAGE=1` (default off, exact `1` only) admits the existing
+`HIPFIRE_QWEN4_EXPERT_STAGE` pipeline under expert parallelism. Each rank
+borrows its last two resident compact expert layers as alternating DMA stages,
+then restores their original bytes before the forward returns. Residency is
+unchanged; EP2 copies 637.5 MiB per host layer per rank and pins two donor
+mirrors per rank, charged together against the shared host RAM/GTT budgets.
+Decode and verify continue to use mapped experts and host-wait row exchange,
+independent of the staging launch stream. Staging stays outside capture/tapes.
+EP staging requires every trunk MoE in the forward to bind the compact
+owner-routed route: full-table forwards read peer donor VRAM and never stage.
+`begin_forward(ep_compact_all_layers)` is the explicit per-forward admission
+input. Before returning to any full-table EP chunk, every rank must call
+`ep_quiesce(gpu)` and then cross a host barrier before any rank launches it,
+so all donors' restore waits have completed before peer reads.
+
+Stage tables preserve the bound runtime's non-owned entries: peer-mapped
+experts for the full-table route, zero dummy experts for owner-routed compact
+prefill. Owned expert `e` points at donor slot `e / ranks`. Internally
+`Qwen4ExpertStage::prepare_runtime(gpu, layer, runtime)` prepares each full
+table once before binding; compact tables are built at load. The compact-route
+binder may call `tables_compact(layer)`; `tables(layer)` also selects the last
+prepared runtime kind. Single-card tables retain their original parity layout.
+
+
 ### Environment (operator-facing)
 
 Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:

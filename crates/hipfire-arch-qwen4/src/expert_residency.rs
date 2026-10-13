@@ -377,6 +377,17 @@ pub fn host_mapped_bytes_ranks(
     Ok((per_rank, per_rank.saturating_mul(ranks as u64)))
 }
 
+/// Two donor mirrors per rank share one host RAM/GTT budget. Each donor has
+/// separate gate/up and down pinned allocations, including their padding.
+pub(crate) fn expert_stage_mirror_bytes(layer_bytes: usize, ranks: usize) -> Result<u64, String> {
+    (layer_bytes as u64)
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(4 * HOST_MAPPED_PAD_BYTES))
+        .and_then(|bytes| bytes.checked_mul(ranks as u64))
+        .filter(|_| ranks > 0)
+        .ok_or_else(|| "expert stage mirror host charge overflow or zero ranks".to_string())
+}
+
 /// One rank's share of an entry's payload: routed expert stacks split evenly
 /// across `ranks`, everything else is replicated.
 fn rank_share(entry: &WeightEntry, bytes: u64, ranks: usize) -> Result<u64, String> {
@@ -1035,6 +1046,15 @@ mod tests {
         // The pool counts toward the room, byte for byte.
         assert!(check_host_ram(host, Some(host), HOST_RAM_HEADROOM_BYTES).is_ok());
         assert!(check_host_ram(host, Some(host), HOST_RAM_HEADROOM_BYTES - 1).is_err());
+    }
+
+    #[test]
+    fn stage_mirrors_charge_every_rank_on_the_shared_host() {
+        let full = 512 * (1_740_800 + 870_400);
+        assert_eq!(expert_stage_mirror_bytes(full, 1).unwrap(), 2 * full as u64 + 4 * HOST_MAPPED_PAD_BYTES);
+        assert_eq!(expert_stage_mirror_bytes(full / 2, 2).unwrap(), 2 * full as u64 + 8 * HOST_MAPPED_PAD_BYTES);
+        assert!(expert_stage_mirror_bytes(full, 0).is_err());
+        assert!(expert_stage_mirror_bytes(usize::MAX, 2).is_err());
     }
 
     /// `/proc/meminfo` text from `(field, MiB)` pairs.

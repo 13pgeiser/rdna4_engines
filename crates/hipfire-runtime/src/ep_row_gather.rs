@@ -14,8 +14,8 @@
 //!
 //! 1. [`EpRowGather::publish`] records the rank's producer-complete event for a
 //!    buffer index on the stream the producer kernels ran on.
-//! 2. [`EpRowGather::gather`] stream-waits every peer's event for that buffer
-//!    index on the SAME stream, then launches ONE copy-only kernel that, for
+//! 2. [`EpRowGather::gather`] host-waits every peer's event for that buffer
+//!    index (device waits require explicit builder opt-in), then launches ONE copy-only kernel that, for
 //!    slot `s`, copies row `s` of the owner's peer-mapped buffer into the
 //!    rank's own buffer when the owner is not this rank. The owner comes from
 //!    an [`EpSlotOwners`]: `ExpertModulo` (`slot_experts[s] % ranks`, kernel
@@ -239,9 +239,17 @@ pub struct EpRowGatherBuilder {
     spec: EpRowGatherSpec,
     regs: Vec<Option<RankReg>>,
     barrier_timeout: Duration,
+    device_waits: bool,
 }
 
 impl EpRowGatherBuilder {
+    /// Opt into stream waits when a launch stream exists. The default is
+    /// host waits, independent of streams installed by unrelated features.
+    pub fn device_waits(mut self, enabled: bool) -> Self {
+        self.device_waits = enabled;
+        self
+    }
+
     /// Override the host-barrier timeout (default [`DEFAULT_BARRIER_TIMEOUT`]).
     pub fn barrier_timeout(mut self, timeout: Duration) -> Self {
         self.barrier_timeout = timeout;
@@ -362,6 +370,7 @@ impl EpRowGatherBuilder {
             buffers: k,
             barrier: SpinBarrier::new(self.spec.ranks, self.barrier_timeout),
             ranks: states,
+            device_waits: self.device_waits,
         }))
     }
 }
@@ -386,6 +395,7 @@ pub struct EpRowGather {
     buffers: usize,
     ranks: Vec<RankState>,
     barrier: SpinBarrier,
+    device_waits: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -398,6 +408,7 @@ impl EpRowGather {
             spec,
             regs: (0..spec.ranks.min(MAX_RANKS)).map(|_| None).collect(),
             barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
+            device_waits: false,
         }
     }
 
@@ -469,15 +480,15 @@ impl EpRowGather {
         gpu.hip.event_record(event, gpu.active_stream.as_ref())
     }
 
-    /// Stream-wait every peer's `buffer` event, then ONE copy-only kernel: for
+    /// Wait every peer's `buffer` event, then ONE copy-only kernel: for
     /// slot `s`, `owner` is `slot_owners`' owner of `s` (see [`EpSlotOwners`]);
     /// if `owner != rank` copy row `s` of the owner's `buffer[buffer]` into this
     /// rank's `buffer[buffer]`. Owned slots (and slots with a negative id or
     /// owner) are never written. Bit-exact.
     ///
-    /// With no active stream the wait degrades to a host block on each peer
-    /// event (the event must already be recorded: `exchange`, or publish-all
-    /// before gather-any).
+    /// Host waits are the default even with an active stream. A caller that
+    /// opts into `EpRowGatherBuilder::device_waits` uses stream waits when a
+    /// stream exists. Events must already be recorded (publish-all first).
     pub fn gather(
         &self,
         gpu: &mut Gpu,
@@ -504,9 +515,9 @@ impl EpRowGather {
             let event = guard
                 .as_ref()
                 .ok_or_else(|| err("ep_row_gather: gather after release".into()))?;
-            match gpu.active_stream.as_ref() {
-                Some(stream) => gpu.hip.stream_wait_event(stream, event)?,
-                None => gpu.hip.event_synchronize(event)?,
+            match (self.device_waits, gpu.active_stream.as_ref()) {
+                (true, Some(stream)) => gpu.hip.stream_wait_event(stream, event)?,
+                _ => gpu.hip.event_synchronize(event)?,
             }
         }
         match slot_owners {
@@ -647,6 +658,12 @@ mod tests {
         assert!(s.check_call_slots(80).is_ok());
         assert!(s.check_call_slots(0).is_err());
         assert!(s.check_call_slots(81).is_err());
+    }
+
+    #[test]
+    fn device_waits_require_explicit_opt_in() {
+        assert!(!EpRowGather::builder(spec(2, 10, 10240)).device_waits);
+        assert!(EpRowGather::builder(spec(2, 10, 10240)).device_waits(true).device_waits);
     }
 
     #[test]

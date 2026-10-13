@@ -273,9 +273,9 @@ pub const QWEN4_EXPERT_STAGE_CAPTURE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_CAP
 /// forwards keep the mapped path (K3: 1536 rows expose the DMA).
 const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 2048;
 
-/// One Flash-Next layer's routed experts: 512 QT44 gate/up, 512 QT53 down.
-const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 512 * 1_740_800;
-const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 512 * 870_400;
+/// One Flash-Next routed expert's QT44 gate/up and QT53 down bytes.
+const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 1_740_800;
+const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 870_400;
 
 fn qwen4_expert_stage_min_rows() -> usize {
     hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
@@ -2020,6 +2020,14 @@ pub(crate) struct Qwen4ExpertStage {
     /// Static per-expert pointer tables into each donor's gate/up and down
     /// VRAM, parity-major. They never replace a layer's bound mapped tables.
     tables: Vec<GpuTensor>,
+    /// EP tables preserve non-owned pointers from the runtime being bound.
+    compact_tables: Vec<GpuTensor>,
+    compact_keys: Vec<usize>,
+    full_keys: Vec<std::cell::OnceCell<usize>>,
+    compact_bound: Vec<std::cell::Cell<bool>>,
+    first_host: usize,
+    placement: Option<Qwen4EpPlacement>,
+    bytes: [usize; 2],
     copy_stream: hip_bridge::Stream,
     ready: Vec<hip_bridge::Event>,
     free: Vec<hip_bridge::Event>,
@@ -2029,6 +2037,32 @@ pub(crate) struct Qwen4ExpertStage {
 }
 
 impl Qwen4ExpertStage {
+    const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
+
+    /// Per-forward admission: full EP chunk tables read peer donor VRAM and
+    /// must never stage. S1 supplies true only when every trunk MoE layer
+    /// binds the compact owner-routed route. Single-card admission is unchanged.
+    ///
+    /// Entering a compact staged chunk after a full chunk is safe: the donor
+    /// overwrite waits on local `free`, recorded after this chunk's local
+    /// waits on peer ready; peer ready follows the previous forward in the
+    /// peer compute stream, so its earlier donor reads have completed.
+    fn begin_forward(&self, ep_compact_all_layers: bool) -> bool {
+        self.placement.is_none() || ep_compact_all_layers
+    }
+
+    /// Before any full-table EP chunk, S1 calls this on EVERY rank, then
+    /// crosses its host barrier before ANY rank launches that chunk. `join`
+    /// marks donors Resident after enqueueing restore waits, not host completion,
+    /// so even Resident donors must be drained before peers can read them.
+    fn ep_quiesce(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        if gpu.active_stream.as_ref().map(|stream| gpu.hip.stream_is_capturing(stream)).transpose()?.unwrap_or(false) {
+            return Err(invalid("G2 EP quiescence cannot run during capture"));
+        }
+        gpu.hip.device_synchronize()?;
+        self.restore_blocking(gpu)
+    }
+
     fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
@@ -2066,9 +2100,16 @@ impl Qwen4ExpertStage {
         }
         let mut donors = [first_host - 2, first_host - 1];
         donors.sort_by_key(|layer| layer % 2);
-        let layer_bytes = QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES;
-        let mirror_bytes =
-            2 * layer_bytes as u64 + 4 * crate::expert_residency::HOST_MAPPED_PAD_BYTES;
+        let placement = bundle.weights.ep_placement();
+        let ranks = placement.map_or(1, |placement| placement.ranks);
+        let local_experts = config.num_experts / ranks;
+        let bytes = [
+            local_experts * QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
+            local_experts * QWEN4_EXPERT_STAGE_DOWN_BYTES,
+        ];
+        let layer_bytes = bytes.iter().sum::<usize>();
+        let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, ranks)
+            .map_err(invalid)?;
         let admitted = crate::expert_residency::check_host_ram(
             mirror_bytes,
             rdna_compute::kv_slots::mem_available_bytes(),
@@ -2092,13 +2133,13 @@ impl Qwen4ExpertStage {
                 Ok([
                     (
                         &weights.experts_gate_up,
+                        bytes[0],
                         QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
-                        1_740_800,
                     ),
                     (
                         &weights.experts_down,
+                        bytes[1],
                         QWEN4_EXPERT_STAGE_DOWN_BYTES,
-                        870_400,
                     ),
                 ])
             };
@@ -2128,6 +2169,19 @@ impl Qwen4ExpertStage {
             donor_views: Vec::with_capacity(4),
             mirrors: Vec::with_capacity(4),
             tables: Vec::with_capacity(4),
+            compact_tables: Vec::new(),
+            compact_keys: if placement.is_some() {
+                moe.iter().map(|runtime| runtime.expert_gate_up_ptrs.buf.as_ptr() as usize).collect()
+            } else { Vec::new() },
+            full_keys: if placement.is_some() {
+                (0..moe.len()).map(|_| std::cell::OnceCell::new()).collect()
+            } else { Vec::new() },
+            compact_bound: if placement.is_some() {
+                (0..moe.len()).map(|_| std::cell::Cell::new(false)).collect()
+            } else { Vec::new() },
+            first_host,
+            placement,
+            bytes,
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
             free: Vec::with_capacity(2),
@@ -2154,17 +2208,27 @@ impl Qwen4ExpertStage {
                     stage.mirrors.push(gpu.upload_raw_host_mapped(&host, &[bytes])?);
                     drop(host);
                     let base = view.buf.as_ptr() as usize;
-                    let entries = (0..config.num_experts)
-                        .flat_map(|expert| (base + expert * stride).to_ne_bytes())
-                        .collect::<Vec<_>>();
-                    stage
-                        .tables
-                        .push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
-                    gpu.memcpy_htod_auto(
-                        &stage.tables.last().expect("table just allocated").buf,
-                        &entries,
-                    )?;
+                    if placement.is_none() {
+                        let entries = (0..config.num_experts)
+                            .flat_map(|expert| (base + expert * stride).to_ne_bytes())
+                            .collect::<Vec<_>>();
+                        stage.tables.push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
+                        gpu.memcpy_htod_auto(
+                            &stage.tables.last().expect("table just allocated").buf,
+                            &entries,
+                        )?;
+                    }
                     stage.donor_views.push(view);
+                }
+            }
+            if placement.is_some() {
+                for (layer, runtime) in moe.iter().enumerate().skip(first_host) {
+                    for (kind, entries) in [&runtime.expert_gate_up_entries, &runtime.expert_down_entries].into_iter().enumerate() {
+                        let redirected = stage.redirect_entries(layer, kind, entries);
+                        stage.compact_tables.push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
+                        gpu.memcpy_htod_auto(&stage.compact_tables.last().expect("allocated").buf, &redirected)?;
+                        stage.tables.push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
+                    }
                 }
             }
             Ok::<(), Qwen4GpuForwardError>(())
@@ -2188,11 +2252,74 @@ impl Qwen4ExpertStage {
     /// The stage tables a host `layer` reads from on a staged forward.
     fn tables(&self, layer: usize) -> MoeStageTables<'_> {
         let parity = layer % 2;
+        if self.placement.is_some() && self.compact_bound[layer].get() {
+            return self.tables_compact(layer);
+        }
+        let index = if self.placement.is_some() { layer - self.first_host } else { parity };
         MoeStageTables {
-            gate_up: &self.tables[2 * parity],
-            down: &self.tables[2 * parity + 1],
+            gate_up: &self.tables[2 * index],
+            down: &self.tables[2 * index + 1],
             free: &self.free[parity],
         }
+    }
+
+    /// S1 binds this accessor when its compact owner-routed runtime is used.
+    fn tables_compact(&self, layer: usize) -> MoeStageTables<'_> {
+        if self.placement.is_none() {
+            return self.tables(layer);
+        }
+        let index = 2 * (layer - self.first_host);
+        MoeStageTables {
+            gate_up: &self.compact_tables[index],
+            down: &self.compact_tables[index + 1],
+            free: &self.free[layer % 2],
+        }
+    }
+
+    fn redirect_entries(&self, layer: usize, kind: usize, entries: &[usize]) -> Vec<u8> {
+        let placement = self.placement.expect("EP tables");
+        let base = self.donor_views[2 * (layer % 2) + kind].buf.as_ptr() as usize;
+        let stride = [QWEN4_EXPERT_STAGE_GATE_UP_BYTES, QWEN4_EXPERT_STAGE_DOWN_BYTES][kind];
+        entries.iter().enumerate().flat_map(|(expert, &pointer)| {
+            let pointer = if expert % placement.ranks == placement.rank {
+                base + (expert / placement.ranks) * stride
+            } else {
+                pointer
+            };
+            pointer.to_ne_bytes()
+        }).collect()
+    }
+
+    /// Initialize a full EP table once, before any capture/tape. Compact
+    /// tables are built at load and remain separate from peer-mapped tables.
+    fn prepare_runtime(
+        &self,
+        gpu: &Gpu,
+        layer: usize,
+        runtime: Option<&Qwen4MoeLayerRuntime>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if self.placement.is_none() || layer < self.first_host {
+            return Ok(());
+        }
+        let runtime = runtime.ok_or_else(|| invalid("G2 staged EP runtime missing"))?;
+        let key = runtime.expert_gate_up_ptrs.buf.as_ptr() as usize;
+        let compact = key == self.compact_keys[layer];
+        self.compact_bound[layer].set(compact);
+        if compact {
+            return Ok(());
+        }
+        if let Some(&prepared) = self.full_keys[layer].get() {
+            return if prepared == key { Ok(()) } else { Err(invalid("G2 full runtime changed")) };
+        }
+        if gpu.active_stream.as_ref().map(|stream| gpu.hip.stream_is_capturing(stream)).transpose()?.unwrap_or(false) {
+            return Err(invalid("G2 EP stage table initialization cannot run during capture"));
+        }
+        for (kind, entries) in [&runtime.expert_gate_up_entries, &runtime.expert_down_entries].into_iter().enumerate() {
+            let redirected = self.redirect_entries(layer, kind, entries);
+            gpu.memcpy_htod_auto(&self.tables[2 * (layer - self.first_host) + kind].buf, &redirected)?;
+        }
+        self.full_keys[layer].set(key).map_err(|_| invalid("G2 full runtime initialized twice"))?;
+        Ok(())
     }
 
     fn set_state(&self, parity: usize, value: DonorState) {
@@ -2246,7 +2373,7 @@ impl Qwen4ExpertStage {
     ) -> Result<(), Qwen4GpuForwardError> {
         for (kind, (source, bytes)) in sources
             .into_iter()
-            .zip([QWEN4_EXPERT_STAGE_GATE_UP_BYTES, QWEN4_EXPERT_STAGE_DOWN_BYTES])
+            .zip(self.bytes)
             .enumerate()
         {
             gpu.hip.memcpy_htod_async(
@@ -2366,7 +2493,7 @@ impl Qwen4ExpertStage {
                 first.get_or_insert(error);
             }
         }
-        for tensor in self.tables.into_iter().chain(self.mirrors) {
+        for tensor in self.tables.into_iter().chain(self.compact_tables).chain(self.mirrors) {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
             }
@@ -4008,7 +4135,9 @@ impl Qwen4GpuForward {
             }
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
-                if ep.is_none() {
+                if ep.is_none()
+                    || hipfire_config::developer_var(Qwen4ExpertStage::EP_ENV).as_deref() == Ok("1")
+                {
                     expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
                 }
             } else {
@@ -5416,7 +5545,7 @@ impl Qwen4GpuForward {
         // parity observer keeps its historical unsplit transport. A stream
         // capture keeps mapped reads too: a staged forward forks a copy
         // stream and its failure recovery synchronizes the device.
-        let expert_stage = match self.expert_stage.as_ref() {
+        let expert_stage = match self.expert_stage.as_ref().filter(|stage| stage.begin_forward(false)) {
             Some(stage)
                 if n >= stage.min_rows
                     && (stage.capture || wide_hidden_capture.is_none())
@@ -5517,6 +5646,9 @@ impl Qwen4GpuForward {
                 }
                 _ => self.moe.get(layer_index),
             };
+            if let Some(stage) = expert_stage {
+                stage.prepare_runtime(gpu, layer_index, layer_moe)?;
+            }
             let mut description = layer_desc(
                 &bundle.weights,
                 layer,
