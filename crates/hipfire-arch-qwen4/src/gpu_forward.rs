@@ -52,7 +52,7 @@ use hipfire_runtime::external_rows::{RowFetch, RowTicket};
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
 use rdna_compute::moe::Qwen4EpOwnerTables;
 use rdna_compute::replay::{ReplayController, ReplayState, ShadowBodyRoute};
-use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32, QsaRopeScaling};
+use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
@@ -3451,44 +3451,6 @@ pub(crate) fn layer_scratch<'a>(
 pub type Qwen4QsaTap =
     Box<dyn FnMut(&mut Gpu, usize, &IndexedAttentionOp<'_>) -> Result<(), String> + Send>;
 
-/// Device table of a checkpoint's static YaRN RoPE for the QSA kernels (the
-/// inverse frequencies of the `rotary_dim`-wide rotation and the cos/sin
-/// attention factor). Every QSA rotation of a model (trunk and MTP head)
-/// reads the same table; a native-RoPE config owns none.
-pub(crate) struct Qwen4RopeTable {
-    inv_freq: GpuTensor,
-    attention_factor: f32,
-}
-
-impl Qwen4RopeTable {
-    /// `None` when `config` carries no YaRN scaling (the kernels' built-in
-    /// table then stays byte-identical).
-    pub(crate) fn upload(
-        gpu: &mut Gpu,
-        config: &Qwen4Config,
-    ) -> Result<Option<Self>, hip_bridge::HipError> {
-        let (Some(yarn), Some(values)) = (config.rope_yarn, config.rope_yarn_inv_freq()) else {
-            return Ok(None);
-        };
-        let inv_freq = gpu.upload_f32(&values, &[values.len()])?;
-        Ok(Some(Self {
-            inv_freq,
-            attention_factor: yarn.attention_factor as f32,
-        }))
-    }
-
-    pub(crate) fn scaling(&self) -> QsaRopeScaling<'_> {
-        QsaRopeScaling {
-            inv_freq: &self.inv_freq,
-            attention_factor: self.attention_factor,
-        }
-    }
-
-    pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
-        gpu.free_tensor(self.inv_freq).err()
-    }
-}
-
 /// Reusable production forward owner.  Construct it once per assembled bundle
 /// and use `forward_token`/`forward_chunk` repeatedly; both methods share the
 /// exact same chunk implementation.
@@ -3521,8 +3483,6 @@ pub struct Qwen4GpuForward {
     /// `moe` holds the per-layer decode tables, there is no G2 expert stage,
     /// and no forward records or replays a retained body.
     ep: Option<Qwen4ForwardEp>,
-    /// Static YaRN table of the QSA RoPE (`Some` iff the config carries one).
-    pub(crate) rope: Option<Qwen4RopeTable>,
     /// `DECODE_Q8_PER_LAYER` per layer [HC attn down, attn up, mlp down, mlp
     /// up, shared gate, up, down]: BF16 matrices requantized to Q8_0 for
     /// single-token forwards (gfx1151). Batch-1 decode streams every weight
@@ -3787,9 +3747,7 @@ impl Qwen4GpuForward {
         let mut trunk_a4 = Vec::new();
         #[cfg(target_os = "linux")]
         let mut npu_trunk = None;
-        let mut rope: Option<Qwen4RopeTable> = None;
         let result = (|| {
-            rope = Qwen4RopeTable::upload(gpu, &bundle.config)?;
             if let Some(placement) = bundle.weights.ep_placement() {
                 let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
                 for layer in &bundle.weights.layer_refs {
@@ -3954,9 +3912,6 @@ impl Qwen4GpuForward {
             if let Some(ep) = ep {
                 let _ = ep.free_gpu(gpu);
             }
-            if let Some(rope) = rope {
-                let _ = rope.free_gpu(gpu);
-            }
             gpu.qwen4_trunk_iu4 = false;
             for tensor in decode_q8.into_iter().chain(trunk_zba.into_iter().flatten()) {
                 let _ = gpu.free_tensor(tensor);
@@ -3970,7 +3925,6 @@ impl Qwen4GpuForward {
         Ok(Self {
             expert_stage,
             ep,
-            rope,
             scratch,
             host_token_bytes,
             uploaded_id_rows: 0,
@@ -4352,7 +4306,6 @@ impl Qwen4GpuForward {
             moe,
             expert_stage,
             ep,
-            rope,
             token_readback,
             decode_q8,
             route_trace,
@@ -4414,11 +4367,6 @@ impl Qwen4GpuForward {
         }
         if let Some(ep) = ep {
             if let Some(error) = ep.free_gpu(gpu) {
-                first.get_or_insert(error);
-            }
-        }
-        if let Some(rope) = rope {
-            if let Some(error) = rope.free_gpu(gpu) {
                 first.get_or_insert(error);
             }
         }
@@ -5512,7 +5460,6 @@ impl Qwen4GpuForward {
                         input_width: dims.hidden,
                         trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                         phase: MixerPhase::Whole,
-                        rope_scaling: self.rope.as_ref().map(Qwen4RopeTable::scaling),
                     }));
                 }
             }

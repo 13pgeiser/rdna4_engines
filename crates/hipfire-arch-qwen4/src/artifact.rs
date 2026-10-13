@@ -961,35 +961,12 @@ fn admit_ple_metadata(
 /// `hipfire_profile` marker.  Only a build with the explicit
 /// `qwen4-dev-profiles` feature routes the developer marker to the developer
 /// parser; there is no environment or config key that does.
-///
-/// The parsed config then takes the process-scoped static YaRN override
-/// (`memory.rope_yarn_factor`): unset keeps the checkpoint's own rope scaling,
-/// `1` forces the native RoPE, `F > 1` is YaRN `F` over the native window.
-/// This is the single runtime artifact seam, so the loader's admission and the
-/// carrier load see the same config.
 fn parse_artifact_config(metadata_json: &str) -> Result<Qwen4Config, Qwen4ArtifactError> {
     #[cfg(feature = "qwen4-dev-profiles")]
     let parsed = Qwen4Config::from_developer_metadata_json(metadata_json);
     #[cfg(not(feature = "qwen4-dev-profiles"))]
     let parsed = Qwen4Config::from_metadata_json(metadata_json);
-    let config = parsed.map_err(|error| {
-        Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
-    })?;
-    config
-        .with_rope_yarn_factor(hipfire_config::memory::rope_yarn_factor())
-        .map_err(|error| {
-            Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
-        })
-}
-
-/// Positions the artifact's config admits ([`Qwen4Config::max_context`]: the
-/// native window, or factor x native with static YaRN, including the
-/// process-scoped `memory.rope_yarn_factor` override).  Reads the metadata
-/// only (no inventory, payload or GPU), so a loader can bound `max_seq`
-/// before any placement or allocation; [`admit_hfqm_artifact`] derives the
-/// same config.
-pub fn artifact_max_context(hfq: &HfqFile) -> Result<usize, Qwen4ArtifactError> {
-    parse_artifact_config(&hfq.metadata_json).map(|config| config.max_context())
+    parsed.map_err(|error| Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}")))
 }
 
 /// Receipt of a header-only inventory admission: no container, payload,

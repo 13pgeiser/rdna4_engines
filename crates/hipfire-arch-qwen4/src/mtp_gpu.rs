@@ -13,7 +13,7 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode,
     MtpEpGather, Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime,
-    Qwen4MoeScratch, Qwen4RopeTable,
+    Qwen4MoeScratch,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::program::{
@@ -1858,9 +1858,6 @@ pub struct Qwen4MtpGpu {
     pub(crate) state: MtpGpuState,
     /// The MTP layer's routed-expert runtime: `Some` exactly for a MoE FFN.
     pub(crate) moe: Option<Qwen4MoeLayerRuntime>,
-    /// Static YaRN table of the head's QSA RoPE (`Some` iff the config carries
-    /// one); the trunk's own table is the same values, owned separately.
-    pub(crate) rope: Option<Qwen4RopeTable>,
     pub(crate) max_seq: usize,
     /// Draft ranking (`HIPFIRE_MTP_DRAFT_HEAD=mq2..mq6[r]`, default `mq2r`;
     /// anything else = the model's own head). On the shipped Q8_0 head an
@@ -2028,7 +2025,7 @@ impl Qwen4MtpGpu {
             ));
         }
         let ep_bound = ep.is_some();
-        if max_seq == 0 || max_seq > config.max_context() {
+        if max_seq == 0 || max_seq > config.max_position_embeddings {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
         let head = bound_mtp(weights)?;
@@ -2079,21 +2076,10 @@ impl Qwen4MtpGpu {
                 return Err(error);
             }
         };
-        let rope = match Qwen4RopeTable::upload(gpu, config) {
-            Ok(rope) => rope,
-            Err(error) => {
-                let _ = draft.free_gpu(gpu);
-                let _ = moe.map(|moe| moe.free_gpu(gpu));
-                let _ = state.free_gpu(gpu);
-                let _ = scratch.free_gpu(gpu);
-                return Err(error.into());
-            }
-        };
         Ok(Self {
             scratch,
             state,
             moe,
-            rope,
             max_seq,
             draft,
             ep_bound,
@@ -2106,7 +2092,6 @@ impl Qwen4MtpGpu {
             scratch,
             state,
             moe,
-            rope,
             draft,
             ..
         } = self;
@@ -2114,12 +2099,10 @@ impl Qwen4MtpGpu {
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
         let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
-        let rope_error = rope.and_then(|rope| rope.free_gpu(gpu));
         draft_error
             .or(scratch_error)
             .or(state_error)
             .or(moe_error)
-            .or(rope_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
     /// Deliberately dirty the reusable MoE buffers for the bounded profile
@@ -2526,7 +2509,6 @@ impl Qwen4MtpGpu {
                 mode,
                 trunk_a4: 0,
                 phase: MixerPhase::Whole,
-                rope_scaling: self.rope.as_ref().map(Qwen4RopeTable::scaling),
             };
             let lengths = attention.next_lengths()?;
             // Under EP a MoE head step exchanges its expanded rows through the
@@ -3082,7 +3064,6 @@ impl Qwen4MtpGpu {
                     rows,
                     // The one MTP layer keeps the exact F32 QSA state.
                     format: QsaKvFormat::F32,
-                    rope_scaling: self.rope.as_ref().map(Qwen4RopeTable::scaling),
                 },
             )?;
             // Pool exactly the blocks these rows complete, from raw keys the
@@ -3104,7 +3085,6 @@ impl Qwen4MtpGpu {
                             rows,
                         }),
                         grid_bound: state.pooled_capacity,
-                        rope_scaling: self.rope.as_ref().map(Qwen4RopeTable::scaling),
                     },
                 )?;
             }

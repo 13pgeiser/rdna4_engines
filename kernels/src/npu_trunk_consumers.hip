@@ -19,8 +19,6 @@ static __device__ __forceinline__ float qsa_norm_rope_head_arena(
     int head_dim,
     int position,
     int rotary_dim,
-    const float* rope_inv_freq,
-    float rope_scale,
     float* input_row,
     float* row_sum) {
     const int channel = (int)threadIdx.x;
@@ -49,17 +47,10 @@ static __device__ __forceinline__ float qsa_norm_rope_head_arena(
         float other = input_row[partner] * inv
             * (1.0f + bf16_to_f32(norm[partner]));
         int base = channel < half ? channel : partner;
-        // Same HalfSplit table / YaRN contract as qsa_norm_rope_head (tensor_ops.hip).
         float angle = (float)position
-            * (rope_inv_freq != nullptr
-                ? rope_inv_freq[base]
-                : powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim));
+            * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
         float sine = sinf(angle);
         float cosine = cosf(angle);
-        if (rope_inv_freq != nullptr) {
-            sine *= rope_scale;
-            cosine *= rope_scale;
-        }
         value = channel < half ? value * cosine - other * sine
             : other * sine + value * cosine;
     }
@@ -71,8 +62,7 @@ static __device__ __forceinline__ float qsa_norm_rope_head_arena(
 extern "C" __global__ void indexed_attention_norm_rope_batch_arena(
     const __hip_bfloat16* src, float* values, const __hip_bfloat16* norm,
     int rows, int row_stride, int heads, int head_dim, int head_stride,
-    int position_start, int rotary_dim, int src_pitch, int src_col0,
-    const float* rope_inv_freq, float rope_scale) {
+    int position_start, int rotary_dim, int src_pitch, int src_col0) {
     const int row = (int)blockIdx.z, head = (int)blockIdx.x;
     if (row >= rows || head >= heads || blockIdx.y != 0) return;
     const int start = head * head_stride;
@@ -84,8 +74,7 @@ extern "C" __global__ void indexed_attention_norm_rope_batch_arena(
     __shared__ float input_row[256];
     __shared__ float row_sum;
     const float value = qsa_norm_rope_head_arena(in, norm, head_dim, position_start + row,
-                                                rotary_dim, rope_inv_freq, rope_scale,
-                                                input_row, &row_sum);
+                                                rotary_dim, input_row, &row_sum);
     if ((int)threadIdx.x < head_dim) out[threadIdx.x] = value;
 }
 

@@ -1631,16 +1631,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Byte budget for reusable prefill snapshots (session cache; Flash-Next). 0 disables the cache."
     ),
     process_field!(
-        "memory.rope_yarn_factor",
-        "rope_yarn_factor",
-        Memory,
-        DefaultValue::Null,
-        ValueRule::NullableFloat { min: 1.0, max: 4.0 },
-        true,
-        "HIPFIRE_ROPE_YARN_FACTOR",
-        "Static YaRN RoPE scaling for Qwen4 (Flash-Next). Unset/null = the checkpoint's own rope scaling (native RoPE for Flash-Next); 1 = force native RoPE; F in (1, 4] = YaRN factor F over the native 262,144-token window (HF defaults: beta_fast 32, beta_slow 1, attention factor 0.1 ln F + 1), admitting max_seq up to F x 262,144. Changes numerics (short-context quality cost). Process-scoped: applies to every Qwen4 load of the process."
-    ),
-    process_field!(
         "memory.ple_hot_store_bytes",
         "ple_hot_store_bytes",
         Memory,
@@ -7054,26 +7044,6 @@ pub mod memory {
             .unwrap_or(8589934592)
     }
 
-    /// Pure parser behind [`rope_yarn_factor`]: unset, empty and `null` mean
-    /// "no override" (the checkpoint's own rope scaling); anything else is the
-    /// parsed factor. An unparseable value (the config layer rejects those
-    /// before they get here) also resolves to no override.
-    pub fn parse_rope_yarn_factor(raw: Option<&str>) -> Option<f64> {
-        match raw.map(str::trim) {
-            Some(v) if !v.is_empty() && !v.eq_ignore_ascii_case("null") => {
-                v.parse::<f64>().ok().filter(|f| f.is_finite())
-            }
-            _ => None,
-        }
-    }
-
-    /// Static Qwen4 YaRN RoPE factor override (`memory.rope_yarn_factor`,
-    /// compat env `HIPFIRE_ROPE_YARN_FACTOR`); `None` keeps the checkpoint's
-    /// own rope scaling, `Some(1.0)` forces native RoPE.
-    pub fn rope_yarn_factor() -> Option<f64> {
-        parse_rope_yarn_factor(process_value("HIPFIRE_ROPE_YARN_FACTOR").as_deref())
-    }
-
     /// Prewarm budget request of the PLE hot-row store
     /// (`memory.ple_hot_store_bytes`, compat env `HIPFIRE_PLE_HOT_STORE_BYTES`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7436,38 +7406,6 @@ pub mod memory {
             // closed to full residency rather than forcing an offload.
             assert_eq!(parse_gpu_layer_budget(Some("banana")), GpuLayerBudget::Full);
             assert_eq!(parse_gpu_layer_budget(Some("-2")), GpuLayerBudget::Full);
-        }
-
-        #[test]
-        fn rope_yarn_factor_parse() {
-            assert_eq!(parse_rope_yarn_factor(None), None);
-            assert_eq!(parse_rope_yarn_factor(Some("")), None);
-            assert_eq!(parse_rope_yarn_factor(Some("  ")), None);
-            assert_eq!(parse_rope_yarn_factor(Some("null")), None);
-            assert_eq!(parse_rope_yarn_factor(Some("NULL")), None);
-            assert_eq!(parse_rope_yarn_factor(Some("1")), Some(1.0));
-            assert_eq!(parse_rope_yarn_factor(Some(" 2.5 ")), Some(2.5));
-            assert_eq!(parse_rope_yarn_factor(Some("4")), Some(4.0));
-            assert_eq!(parse_rope_yarn_factor(Some("banana")), None);
-            assert_eq!(parse_rope_yarn_factor(Some("nan")), None);
-            let field = crate::FIELDS
-                .iter()
-                .find(|field| field.key == "memory.rope_yarn_factor")
-                .expect("rope_yarn_factor is in the schema");
-            assert!(field.validate(&crate::ConfigValue::Null).is_ok());
-            assert!(field.validate(&crate::ConfigValue::Float(2.0)).is_ok());
-            assert!(field.validate(&crate::ConfigValue::Float(1.0)).is_ok());
-            assert!(field.validate(&crate::ConfigValue::Float(0.5)).is_err());
-            assert!(field.validate(&crate::ConfigValue::Float(4.5)).is_err());
-            assert!(matches!(
-                field.parse_cli("null"),
-                Ok(crate::ConfigValue::Null)
-            ));
-            assert!(matches!(
-                field.parse_cli("2"),
-                Ok(crate::ConfigValue::Float(_))
-            ));
-            assert!(field.parse_cli("8").is_err());
         }
 
         #[test]

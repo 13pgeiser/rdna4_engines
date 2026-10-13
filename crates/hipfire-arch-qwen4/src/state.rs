@@ -1056,7 +1056,7 @@ impl Qwen4State {
                 gpu.arch, config.head_dim
             )));
         }
-        if max_seq_len == 0 || max_seq_len > config.max_context() {
+        if max_seq_len == 0 || max_seq_len > config.max_position_embeddings {
             return Err(StateError::InvalidCapacity);
         }
         let gdn_format = format.gdn;

@@ -58,8 +58,7 @@ use crate::config::LayerType;
 use crate::gpu_forward::{
     decode_copy, dense_ref, hyper_read_desc, invalid, layer_desc, matrix_view, ple_desc,
     program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4GpuForward,
-    Qwen4GpuForwardError, Qwen4GpuForwardScratch, Qwen4RopeTable, ScratchField,
-    DECODE_Q8_PER_LAYER, EPSILON,
+    Qwen4GpuForwardError, Qwen4GpuForwardScratch, ScratchField, DECODE_Q8_PER_LAYER, EPSILON,
 };
 use crate::ple_stage::ple_async_upload;
 use crate::program::{
@@ -1432,7 +1431,6 @@ fn forward_lanes_scoped(
                                 input_width: dims.hidden,
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,
-                                rope_scaling: fwd.rope.as_ref().map(Qwen4RopeTable::scaling),
                             };
                             if matches!(phase, MixerPhase::Whole | MixerPhase::Core) {
                                 let (full_len, raw_len, pooled_len, selected_len, position) =

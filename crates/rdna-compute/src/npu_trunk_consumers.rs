@@ -472,7 +472,6 @@ pub fn indexed_attention_norm_rope_batch_arena(
     let position_offset = args.len() - 4;
     args.push_i32(rotary_dim);
     src.args(&mut args)?;
-    push_qsa_rope_scaling(&mut args, p.rope_scaling, &[p.rotary_dim])?;
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,

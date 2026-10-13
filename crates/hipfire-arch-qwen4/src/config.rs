@@ -563,193 +563,6 @@ impl Qwen4PleConfig {
     }
 }
 
-/// Static YaRN RoPE scaling: HF `rope_type: "yarn"`
-/// (`transformers.modeling_rope_utils._compute_yarn_parameters`), Qwen's
-/// documented route past the native window. The inverse frequency of rotary
-/// pair `i` blends `1 / theta^(2i/d)` (extrapolation) with it divided by
-/// `factor` (interpolation) over a linear ramp between the correction dims of
-/// `beta_fast` and `beta_slow` rotations within
-/// `original_max_position_embeddings`, and the rotation's cos/sin carry
-/// `attention_factor`. Text positions are equal in every interleaved mRoPE
-/// section, so the per-pair table applies unchanged. Only a `factor > 1`
-/// exists: a factor of 1 is the native RoPE.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Qwen4RopeYarn {
-    pub factor: f64,
-    pub original_max_position_embeddings: usize,
-    pub beta_fast: f64,
-    pub beta_slow: f64,
-    /// cos/sin multiplier: explicit, else from `mscale`/`mscale_all_dim`,
-    /// else HF's `0.1 ln(factor) + 1`.
-    pub attention_factor: f64,
-    /// Floor/ceil the correction range (HF default `true`).
-    pub truncate: bool,
-}
-
-impl Qwen4RopeYarn {
-    /// Qwen's documented recipe: `factor` over the native
-    /// `original_max_position_embeddings` with HF's defaults (`beta_fast` 32,
-    /// `beta_slow` 1, `attention_factor` `0.1 ln(factor) + 1`, truncated
-    /// correction range). `None` for a factor of 1.
-    pub fn with_factor(
-        factor: f64,
-        original_max_position_embeddings: usize,
-    ) -> Result<Option<Self>, String> {
-        if !(factor.is_finite() && factor >= 1.0) {
-            return Err(format!("qwen4: YaRN factor {factor} must be a finite number >= 1"));
-        }
-        if factor == 1.0 {
-            return Ok(None);
-        }
-        let yarn = Self {
-            factor,
-            original_max_position_embeddings,
-            beta_fast: 32.0,
-            beta_slow: 1.0,
-            attention_factor: yarn_mscale(factor, 1.0),
-            truncate: true,
-        };
-        yarn.validate()?;
-        Ok(Some(yarn))
-    }
-
-    /// The HF YaRN keys of a `rope_type: "yarn"` parameter object: `factor`
-    /// (required), `original_max_position_embeddings` (else
-    /// `native_positions`), `beta_fast`/`beta_slow`, `attention_factor`,
-    /// `mscale`/`mscale_all_dim` and `truncate`. Other keys (`rope_theta`,
-    /// the mRoPE layout) belong to the base RoPE and are read elsewhere.
-    fn from_parameters(params: &Value, native_positions: usize) -> Result<Option<Self>, String> {
-        let number = |key: &str| -> Result<Option<f64>, String> {
-            match params.get(key) {
-                None | Some(Value::Null) => Ok(None),
-                Some(value) => value
-                    .as_f64()
-                    .map(Some)
-                    .ok_or_else(|| format!("qwen4: YaRN {key} must be a number")),
-            }
-        };
-        let factor = number("factor")?
-            .ok_or_else(|| "qwen4: YaRN rope parameters need a factor".to_string())?;
-        let original = optional_usize(params, "original_max_position_embeddings")?
-            .unwrap_or(native_positions);
-        let Some(mut yarn) = Self::with_factor(factor, original)? else {
-            return Ok(None);
-        };
-        // HF `get("beta_fast") or 32`: a zero falls back like an absent key.
-        yarn.beta_fast = number("beta_fast")?.filter(|b| *b != 0.0).unwrap_or(yarn.beta_fast);
-        yarn.beta_slow = number("beta_slow")?.filter(|b| *b != 0.0).unwrap_or(yarn.beta_slow);
-        yarn.attention_factor = match (
-            number("attention_factor")?,
-            number("mscale")?.filter(|m| *m != 0.0),
-            number("mscale_all_dim")?.filter(|m| *m != 0.0),
-        ) {
-            (Some(explicit), _, _) => explicit,
-            (None, Some(mscale), Some(all_dim)) => {
-                yarn_mscale(factor, mscale) / yarn_mscale(factor, all_dim)
-            }
-            _ => yarn.attention_factor,
-        };
-        if let Some(truncate) = params.get("truncate").filter(|value| !value.is_null()) {
-            yarn.truncate = truncate
-                .as_bool()
-                .ok_or_else(|| "qwen4: YaRN truncate must be boolean".to_string())?;
-        }
-        yarn.validate()?;
-        Ok(Some(yarn))
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        let positive = |value: f64| value.is_finite() && value > 0.0;
-        if !(self.factor.is_finite() && self.factor > 1.0)
-            || self.original_max_position_embeddings == 0
-            || !positive(self.beta_fast)
-            || !positive(self.beta_slow)
-            || !positive(self.attention_factor)
-        {
-            return Err(format!("qwen4: invalid YaRN rope parameters {self:?}"));
-        }
-        Ok(())
-    }
-
-    /// Positions the scaled model admits: `factor x
-    /// original_max_position_embeddings` (HF's implicit
-    /// `max_position_embeddings`).
-    pub fn max_positions(&self) -> usize {
-        (self.factor * self.original_max_position_embeddings as f64).floor() as usize
-    }
-
-    /// The `rotary_dim / 2` inverse frequencies of a `rotary_dim`-wide
-    /// HalfSplit rotation with base `theta`: HF's formula, evaluated in f64
-    /// and rounded once to f32.
-    pub fn inv_freq(&self, rotary_dim: usize, theta: f64) -> Vec<f32> {
-        let dim = rotary_dim as f64;
-        let original = self.original_max_position_embeddings as f64;
-        let correction_dim = |rotations: f64| {
-            dim * (original / (rotations * 2.0 * std::f64::consts::PI)).ln() / (2.0 * theta.ln())
-        };
-        let (mut low, mut high) = (correction_dim(self.beta_fast), correction_dim(self.beta_slow));
-        if self.truncate {
-            low = low.floor();
-            high = high.ceil();
-        }
-        let low = low.max(0.0);
-        let mut high = high.min(dim - 1.0);
-        if low == high {
-            high += 0.001;
-        }
-        (0..rotary_dim / 2)
-            .map(|pair| {
-                let pos_freq = theta.powf((2 * pair) as f64 / dim);
-                let extrapolation = 1.0 / pos_freq;
-                let interpolation = 1.0 / (self.factor * pos_freq);
-                let extrapolation_factor = 1.0 - ((pair as f64 - low) / (high - low)).clamp(0.0, 1.0);
-                (interpolation * (1.0 - extrapolation_factor)
-                    + extrapolation * extrapolation_factor) as f32
-            })
-            .collect()
-    }
-}
-
-/// HF `get_mscale`: `0.1 * mscale * ln(scale) + 1` past a scale of 1.
-fn yarn_mscale(scale: f64, mscale: f64) -> f64 {
-    if scale <= 1.0 {
-        1.0
-    } else {
-        0.1 * mscale * scale.ln() + 1.0
-    }
-}
-
-/// The checkpoint's RoPE scaling: the legacy `rope_scaling` object when
-/// present, else `rope_parameters` (HF folds the former into the latter).
-/// `rope_type` (or legacy `type`) `default`/absent is the native RoPE,
-/// `yarn` is [`Qwen4RopeYarn`]; any other type is refused, never ignored.
-fn parse_rope_scaling(text: &Value, native_positions: usize) -> Result<Option<Qwen4RopeYarn>, String> {
-    let Some(params) = ["rope_scaling", "rope_parameters"]
-        .into_iter()
-        .find_map(|key| text.get(key).filter(|value| !value.is_null()))
-    else {
-        return Ok(None);
-    };
-    let rope_type = params
-        .get("rope_type")
-        .or_else(|| params.get("type"))
-        .filter(|value| !value.is_null())
-        .map(|value| {
-            value
-                .as_str()
-                .ok_or_else(|| "qwen4: rope_type must be a string".to_string())
-        })
-        .transpose()?
-        .unwrap_or("default");
-    match rope_type {
-        "default" => Ok(None),
-        "yarn" => Qwen4RopeYarn::from_parameters(params, native_positions),
-        other => Err(format!(
-            "qwen4: rope_type {other:?} is not supported (default or yarn)"
-        )),
-    }
-}
-
 /// Which parser surface is reading the config.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
@@ -798,10 +611,6 @@ pub struct Qwen4Config {
     pub head_dim: usize,
     pub partial_rotary_factor: f64,
     pub rope_theta: f64,
-    /// Static YaRN RoPE scaling (`None`: the native RoPE). From the
-    /// checkpoint's rope parameters, or a `memory.rope_yarn_factor` request
-    /// ([`Self::with_rope_yarn_factor`]).
-    pub rope_yarn: Option<Qwen4RopeYarn>,
     pub attention_bias: bool,
     pub layer_types: Vec<LayerType>,
     pub full_attention_interval: usize,
@@ -1036,8 +845,6 @@ impl Qwen4Config {
                 partial_rotary_factor.unwrap_or(0.25),
             )
         };
-        let max_position_embeddings = required_usize(text, "max_position_embeddings")?;
-        let rope_yarn = parse_rope_scaling(text, max_position_embeddings)?;
         if synthetic && text.get("eos_token_id").map_or(true, Value::is_null) {
             return Err("qwen4: synthetic profile requires an explicit eos_token_id".into());
         }
@@ -1136,13 +943,12 @@ impl Qwen4Config {
             hidden_size: required_usize(text, "hidden_size")?,
             vocab_size: required_usize(text, "vocab_size")?,
             num_hidden_layers: required_usize(text, "num_hidden_layers")?,
-            max_position_embeddings,
+            max_position_embeddings: required_usize(text, "max_position_embeddings")?,
             num_attention_heads: required_usize(text, "num_attention_heads")?,
             num_key_value_heads: required_usize(text, "num_key_value_heads")?,
             head_dim: required_usize(text, "head_dim")?,
             partial_rotary_factor,
             rope_theta,
-            rope_yarn,
             attention_bias: optional_bool(text, "attention_bias").unwrap_or(false),
             layer_types,
             full_attention_interval: required_usize(text, "full_attention_interval")?,
@@ -1203,9 +1009,6 @@ impl Qwen4Config {
         expect_str(&self.model_type, MODEL_TYPE, "model_type")?;
         expect_str(&self.text_model_type, TEXT_MODEL_TYPE, "text_model_type")?;
         expect_eq(self.dtype, SourceDType::BF16, "dtype")?;
-        if let Some(yarn) = &self.rope_yarn {
-            yarn.validate()?;
-        }
         match &self.profile {
             Qwen4Profile::FlashNext => self.validate_flash_next()?,
             Qwen4Profile::Synthetic(profile) => self.validate_synthetic(profile)?,
@@ -1228,14 +1031,6 @@ impl Qwen4Config {
         expect(self.head_dim, 256, "head_dim")?;
         expect_float(self.partial_rotary_factor, 0.25, "partial_rotary_factor")?;
         expect_float(self.rope_theta, 10_000_000.0, "rope_theta")?;
-        // YaRN scales from the native window, whatever factor it carries.
-        if let Some(yarn) = &self.rope_yarn {
-            expect(
-                yarn.original_max_position_embeddings,
-                262_144,
-                "rope original_max_position_embeddings",
-            )?;
-        }
         expect(self.attention_bias, false, "attention_bias")?;
         expect(self.full_attention_interval, 4, "full_attention_interval")?;
         expect(self.linear_num_key_heads, 16, "linear_num_key_heads")?;
@@ -1791,33 +1586,6 @@ impl Qwen4Config {
         (self.head_dim as f64 * self.partial_rotary_factor).round() as usize
     }
 
-    /// Positions this configuration admits: the native
-    /// `max_position_embeddings`, or the YaRN-scaled window.
-    pub fn max_context(&self) -> usize {
-        self.rope_yarn
-            .map_or(self.max_position_embeddings, |yarn| yarn.max_positions())
-    }
-
-    /// Apply a `memory.rope_yarn_factor` request: `None` keeps the
-    /// checkpoint's own RoPE scaling, `1` forces the native RoPE, and a factor
-    /// `F > 1` is static YaRN with factor `F` over the native
-    /// `max_position_embeddings` (HF defaults otherwise).
-    pub fn with_rope_yarn_factor(mut self, factor: Option<f64>) -> Result<Self, String> {
-        if let Some(factor) = factor {
-            self.rope_yarn = Qwen4RopeYarn::with_factor(factor, self.max_position_embeddings)?;
-            self.validate()?;
-        }
-        Ok(self)
-    }
-
-    /// The YaRN inverse frequencies of the QSA rotations
-    /// ([`Self::rotary_dim`]` / 2` values; the indexer rotates the same
-    /// width), `None` for the native RoPE.
-    pub fn rope_yarn_inv_freq(&self) -> Option<Vec<f32>> {
-        self.rope_yarn
-            .map(|yarn| yarn.inv_freq(self.rotary_dim(), self.rope_theta))
-    }
-
     /// Number of values in each sharded n-gram row (0 without PLE).
     pub fn ple_row_width(&self) -> usize {
         self.ple.as_ref().map_or(0, |ple| ple.row_width)
@@ -1895,19 +1663,7 @@ impl Qwen4Config {
             "num_key_value_heads": self.num_key_value_heads,
             "head_dim": self.head_dim,
             "partial_rotary_factor": self.partial_rotary_factor,
-            "rope_parameters": match &self.rope_yarn {
-                None => json!({"rope_theta": self.rope_theta}),
-                Some(yarn) => json!({
-                    "rope_theta": self.rope_theta,
-                    "rope_type": "yarn",
-                    "factor": yarn.factor,
-                    "original_max_position_embeddings": yarn.original_max_position_embeddings,
-                    "beta_fast": yarn.beta_fast,
-                    "beta_slow": yarn.beta_slow,
-                    "attention_factor": yarn.attention_factor,
-                    "truncate": yarn.truncate,
-                }),
-            },
+            "rope_parameters": {"rope_theta": self.rope_theta},
             "attention_bias": self.attention_bias,
             "layer_types": self.layer_types.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
             "full_attention_interval": self.full_attention_interval,
@@ -2946,122 +2702,6 @@ mod tests {
         assert_eq!(cfg.ple_conv_dilation(), 3);
         assert_eq!(cfg.ple_conv_history_rows(), 9);
         assert_eq!(cfg.qsa_selected_capacity(), 2051);
-    }
-
-    /// `transformers` 5.16.1 `_compute_yarn_parameters` (torch 2.9.1, CPU)
-    /// on a `Qwen4ExpTextConfig` with the pinned Flash-Next rope parameters
-    /// plus `rope_type: yarn`, `original_max_position_embeddings: 262144`
-    /// (generator: `qcal/release-0.4.2/yarn-qwen/oracle/hf_yarn_table.py`).
-    const HF_YARN_F2: [f32; 32] = [
-        1.0, 0.6042964, 0.36517414, 0.2206734, 0.13335215, 0.08058421, 0.048696753, 0.029427273,
-        0.017782794, 0.010746079, 0.0064938166, 0.0039241896, 0.0023713738, 0.0014330127,
-        0.00086596434, 0.0004905929, 0.0002766993, 0.00015526493, 8.660865e-05, 4.7975853e-05,
-        2.6356034e-05, 1.4334169e-05, 7.699632e-06, 4.6528603e-06, 2.8117067e-06, 1.6991041e-06,
-        1.0267624e-06, 6.204689e-07, 3.7494712e-07, 2.2657919e-07, 1.3692099e-07, 8.2740854e-08,
-    ];
-    const HF_YARN_F4: [f32; 32] = [
-        1.0, 0.6042964, 0.36517414, 0.2206734, 0.13335215, 0.08058421, 0.048696753, 0.029427273,
-        0.017782794, 0.010746079, 0.0064938166, 0.0039241896, 0.0023713738, 0.0014330127,
-        0.00086596434, 0.00047423982, 0.00025693508, 0.00013734975, 7.217387e-05, 3.707225e-05,
-        1.8449224e-05, 8.75977e-06, 3.849816e-06, 2.3264301e-06, 1.4058534e-06, 8.4955207e-07,
-        5.133812e-07, 3.1023444e-07, 1.8747356e-07, 1.13289595e-07, 6.8460494e-08, 4.1370427e-08,
-    ];
-
-    fn yarn_fixture(rope_parameters: Value) -> Value {
-        let mut value = fixture();
-        value["text_config"]["rope_parameters"] = rope_parameters;
-        value
-    }
-
-    #[test]
-    fn yarn_table_matches_hf_transformers() {
-        for (factor, golden, attention) in [
-            (2.0, &HF_YARN_F2, 1.0693147180559945),
-            (4.0, &HF_YARN_F4, 1.138629436111989),
-        ] {
-            let yarn = Qwen4RopeYarn::with_factor(factor, 262_144).unwrap().unwrap();
-            assert_eq!(yarn.attention_factor, attention);
-            let table = yarn.inv_freq(64, 10_000_000.0);
-            assert_eq!(table.len(), 32);
-            for (pair, (got, want)) in table.iter().zip(golden.iter()).enumerate() {
-                let rel = ((got - want) / want).abs();
-                assert!(rel <= 1e-6, "factor {factor} pair {pair}: {got} vs HF {want} (rel {rel:e})");
-            }
-            // Pairs below the correction range [14, 22] keep the native
-            // frequency; pairs above it are the native frequency / factor.
-            let pos_freq = |pair: usize| 10_000_000.0f64.powf((2 * pair) as f64 / 64.0);
-            assert_eq!(table[13], (1.0 / pos_freq(13)) as f32);
-            assert_eq!(table[31], (1.0 / (factor * pos_freq(31))) as f32);
-        }
-    }
-
-    #[test]
-    fn rope_scaling_parses_hf_yarn_and_refuses_unknown_types() {
-        let parse = |value: &Value| Qwen4Config::from_value(&json!({"config": value}));
-        // The pinned checkpoint is the native RoPE.
-        let native = parse(&fixture()).unwrap();
-        assert_eq!(native.rope_yarn, None);
-        assert_eq!(native.max_context(), 262_144);
-        assert_eq!(native.rope_yarn_inv_freq(), None);
-        let explicit_default = parse(&yarn_fixture(
-            json!({"rope_type": "default", "rope_theta": 10000000.0}),
-        ))
-        .unwrap();
-        assert_eq!(explicit_default, native);
-        // Qwen's documented recipe, in rope_parameters or legacy rope_scaling.
-        let yarn = parse(&yarn_fixture(json!({
-            "rope_type": "yarn", "rope_theta": 10000000.0, "factor": 2.0,
-            "original_max_position_embeddings": 262144,
-            "mrope_interleaved": true, "mrope_section": [11, 11, 10],
-        })))
-        .unwrap();
-        let expected = Qwen4RopeYarn::with_factor(2.0, 262_144).unwrap();
-        assert_eq!(yarn.rope_yarn, expected);
-        assert_eq!(yarn.max_context(), 524_288);
-        assert_eq!(yarn.rope_yarn_inv_freq().unwrap().len(), 32);
-        let mut legacy = fixture();
-        legacy["text_config"]["rope_scaling"] = json!({"type": "yarn", "factor": 2.0});
-        assert_eq!(parse(&legacy).unwrap().rope_yarn, expected);
-        // HF overrides: explicit attention factor, betas, truncate.
-        let tuned = parse(&yarn_fixture(json!({
-            "rope_type": "yarn", "rope_theta": 10000000.0, "factor": 4.0,
-            "attention_factor": 1.25, "beta_fast": 16, "beta_slow": 2, "truncate": false,
-        })))
-        .unwrap()
-        .rope_yarn
-        .unwrap();
-        assert_eq!(
-            (tuned.attention_factor, tuned.beta_fast, tuned.beta_slow, tuned.truncate),
-            (1.25, 16.0, 2.0, false)
-        );
-        // Factor 1 is the native RoPE; the window must be the native one;
-        // other rope types and malformed YaRN are refused.
-        let unit = parse(&yarn_fixture(json!({"rope_type": "yarn", "factor": 1.0}))).unwrap();
-        assert_eq!(unit.rope_yarn, None);
-        for bad in [
-            json!({"rope_type": "linear", "factor": 2.0}),
-            json!({"rope_type": "yarn"}),
-            json!({"rope_type": "yarn", "factor": 0.5}),
-            json!({"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 32768}),
-            json!({"rope_type": "yarn", "factor": 2.0, "truncate": "yes"}),
-        ] {
-            assert!(parse(&yarn_fixture(bad.clone())).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn rope_yarn_factor_request_overrides_the_checkpoint() {
-        let native = Qwen4Config::from_value(&json!({"config": fixture()})).unwrap();
-        assert_eq!(native.clone().with_rope_yarn_factor(None).unwrap(), native);
-        assert_eq!(native.clone().with_rope_yarn_factor(Some(1.0)).unwrap(), native);
-        let scaled = native.clone().with_rope_yarn_factor(Some(2.0)).unwrap();
-        assert_eq!(scaled.rope_yarn, Qwen4RopeYarn::with_factor(2.0, 262_144).unwrap());
-        assert_eq!(scaled.max_context(), 524_288);
-        assert_eq!(scaled.max_position_embeddings, 262_144);
-        // `1` forces the native RoPE over a checkpoint's YaRN.
-        assert_eq!(scaled.with_rope_yarn_factor(Some(1.0)).unwrap(), native);
-        assert!(native.clone().with_rope_yarn_factor(Some(0.5)).is_err());
-        assert!(native.with_rope_yarn_factor(Some(f64::NAN)).is_err());
     }
 
     #[test]
