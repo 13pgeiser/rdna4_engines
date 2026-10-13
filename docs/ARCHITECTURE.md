@@ -24,8 +24,8 @@ crates/
 ├── peacemaker-ir/            # typed RDNA machine-code representation, gfx12 instruction tables
 ├── peacemaker-lift/          # ELF/bundle/metadata lifter for typed AMDGPU programs
 ├── peacemaker-author/        # typed kernel-authoring core (targets, LDS regions, wait tokens)
-├── hipfire-isa/              # checked instruction Builder (wait ledger, LDS, hazards) + peacemaker tooling
-├── hipfire-rip/              # standalone `.rip` kernel-script front end onto the hipfire-isa builder
+├── peacemaker-isa/           # checked instruction Builder (wait ledger, LDS, hazards) + peacemaker tooling
+├── peacemaker-rip/           # standalone `.rip` kernel-script front end onto the peacemaker-isa builder
 ├── railgun/                  # certified dispatch-program model, gfx12 plan/lowering, shadow diff; feature `npu`: XDNA2 runtime
 ├── railgun-cert/             # offline certifier: kernarg facts as a receipt `railgun` section
 ├── railgun-corpus/           # runtime-side reader for railgun fact records / JIT receipt corpus
@@ -72,7 +72,7 @@ crates/
 ├── redline-dispatch/         # retained-tape record/replay + plan selection
 ├── redline-rocr/             # public ROCr/HSA ABI + PM4 packet builders
 ├── hipfire-xdna/             # minimal raw amdxdna ioctl control plane (opt-in, exact gfx1151)
-├── pm-npu/                   # XDNA2/AIE2P program builder, kernel designs, CPU simulator
+├── peacemaker-npu/           # XDNA2/AIE2P program builder, kernel designs, CPU simulator
 └── npu-tools/                # XDNA2 NPU diagnostics and measurement binaries (railgun feature npu)
 ```
 
@@ -97,10 +97,10 @@ operator runtime.
 | Observability | `hipfire-detect`, `hipfire-atlas` | Detectors; bench corpus schema |
 | Kernel compile policy | `radiowave` | Policy-driven hipcc invocation and AMDGPU code-object inspection behind `rdna-compute`'s compile path |
 | Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline **transport**: record, retain, replay PM4/AQL (see below) |
-| Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`, `hipfire-isa`, `hipfire-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. Authoring and validation, **not** the retained transport (see railgun below) |
+| Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. Authoring and validation, **not** the retained transport (see railgun below) |
 | Direct-KMD research | `redline`, `saddle-lab` | Not the serving transport |
 | Deprecated | `hipfire-pflash` | PFlash prefill compression: deprecated since 0.4.0, removal in 0.5.0 |
-| NPU (XDNA2/AIE2P) | `pm-npu`, `railgun` feature `npu`, `hipfire-arch-qwen4` `npu_trunk`, `npu-tools`, `hipfire-xdna` | `hipfire-arch-qwen4` links `pm-npu` and `railgun`'s `npu` feature on Linux; the Flash-Next trunk route defaults to `auto` and arms only on gfx1151 with an openable NPU and matching calibration (see [Qwen4 NPU trunk](#qwen4-npu-trunk-xdna2)). `npu-tools` and `hipfire-xdna` are diagnostic/experimental ([`npu/README.md`](npu/README.md)) |
+| NPU (XDNA2/AIE2P) | `peacemaker-npu`, `railgun` feature `npu`, `hipfire-arch-qwen4` `npu_trunk`, `npu-tools`, `hipfire-xdna` | `hipfire-arch-qwen4` links `peacemaker-npu` and `railgun`'s `npu` feature on Linux; the Flash-Next trunk route defaults to `auto` and arms only on gfx1151 with an openable NPU and matching calibration (see [Qwen4 NPU trunk](#qwen4-npu-trunk-xdna2)). `npu-tools` and `hipfire-xdna` are diagnostic/experimental ([`npu/README.md`](npu/README.md)) |
 
 The dependency edge runs one way and is checked by `cargo tree`:
 
@@ -226,7 +226,7 @@ hardware-validation record live in [`multi-gpu.md`](multi-gpu.md) and
 ### Qwen4 NPU trunk (XDNA2)
 
 The Flash-Next family-B MQ6 trunk can run its projections on the XDNA2 NPU.
-This is **not** dark: `hipfire-arch-qwen4` depends on `pm-npu` (panel
+This is **not** dark: `hipfire-arch-qwen4` depends on `peacemaker-npu` (panel
 programs, numerical reference) and, on Linux, on `railgun` with feature `npu`
 (amdxdna runtime), and `Qwen4Bundle` prepares the route at load
 (`prepare_npu_trunk`, `crates/hipfire-arch-qwen4/src/npu_trunk/`).
@@ -588,8 +588,8 @@ it records launches, retains the tape and replays it as PM4/AQL through ROCr.
   receipt corpus of runtime-JIT modules and checks coverage; `railgun-corpus` is
   the runtime's read-only view of those records.
 - Kernel authoring and instruction validation sit beneath it in
-  `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`, `hipfire-isa` and
-  `hipfire-rip`.
+  `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`, `peacemaker-isa` and
+  `peacemaker-rip`.
 
 Its product-tree integration is developer-only and opt-in, and certifies no
 route: `HIPFIRE_RAILGUN_SHADOW` diffs railgun's lowering against Redline's
