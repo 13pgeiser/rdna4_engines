@@ -2757,8 +2757,8 @@ fn main() {
                 }
                 let _ = stdout.flush();
             }
-            "generate" => {
 
+            "generate" => {
                 let gen_attempt_id = match require_wire_attempt_id(msg.get("attempt_id")) {
                     Ok(id) => id,
                     Err(reason) => {
