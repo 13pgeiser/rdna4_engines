@@ -15,12 +15,15 @@
 //! 1. [`EpRowGather::publish`] records the rank's producer-complete event for a
 //!    buffer index on the stream the producer kernels ran on.
 //! 2. [`EpRowGather::gather`] stream-waits every peer's event for that buffer
-//!    index on the SAME stream, then launches ONE copy-only kernel
-//!    (`ep_gather_rows_by_owner`) that, for slot `s`, copies row `s` of the
-//!    owner's peer-mapped buffer into the rank's own buffer when
-//!    `slot_experts[s] % ranks != rank`. Owned rows and negative-id slots are
-//!    never written. The copy is uint4 load/store, bit-exact for every pattern
-//!    (±0, NaN payloads, denormals).
+//!    index on the SAME stream, then launches ONE copy-only kernel that, for
+//!    slot `s`, copies row `s` of the owner's peer-mapped buffer into the
+//!    rank's own buffer when the owner is not this rank. The owner comes from
+//!    an [`EpSlotOwners`]: `ExpertModulo` (`slot_experts[s] % ranks`, kernel
+//!    `ep_gather_rows_by_owner`, the static placement) or `Explicit` (an i32
+//!    owner per slot written by the same call's owner assignment, kernel
+//!    `ep_gather_rows_by_slot_owner`, balanced ownership). Owned rows and
+//!    unowned (negative) slots are never written. The copy is uint4
+//!    load/store, bit-exact for every pattern (±0, NaN payloads, denormals).
 //! 3. [`EpRowGather::exchange`] = publish → host barrier over all ranks → gather,
 //!    one host thread per rank.
 //!
@@ -66,6 +69,22 @@ pub const MAX_RANKS: usize = 4;
 /// Supported buffers per rank: `MIN_BUFFERS..=MAX_BUFFERS`.
 pub const MIN_BUFFERS: usize = 2;
 pub const MAX_BUFFERS: usize = 4;
+
+/// Where one gather call takes the owner rank of each slot from. Both are
+/// device tensors of `slots` i32 values in slot order, valid on the calling
+/// rank's stream before the gather runs.
+#[derive(Clone, Copy)]
+pub enum EpSlotOwners<'a> {
+    /// Static placement: slot `s` is owned by rank `slot_experts[s] % ranks`
+    /// (a negative id owns nothing). The historical kernel
+    /// `ep_gather_rows_by_owner`.
+    ExpertModulo(&'a GpuTensor),
+    /// Per-call assigned owners (balanced ownership): slot `s` is owned by rank
+    /// `owners[s]` (a negative value owns nothing), written on this rank's
+    /// stream by the call's owner assignment. Kernel
+    /// `ep_gather_rows_by_slot_owner`.
+    Explicit(&'a GpuTensor),
+}
 
 /// Shape of one gather: `ranks` participants, a per-buffer capacity of `slots`
 /// rows of `row_bytes` each (a call gathers `1..=slots` of them).
@@ -451,9 +470,10 @@ impl EpRowGather {
     }
 
     /// Stream-wait every peer's `buffer` event, then ONE copy-only kernel: for
-    /// slot `s`, `owner = slot_experts[s] % ranks`; if `owner != rank` copy row
-    /// `s` of the owner's `buffer[buffer]` into this rank's `buffer[buffer]`.
-    /// Owned slots (and slots with a negative id) are never written. Bit-exact.
+    /// slot `s`, `owner` is `slot_owners`' owner of `s` (see [`EpSlotOwners`]);
+    /// if `owner != rank` copy row `s` of the owner's `buffer[buffer]` into this
+    /// rank's `buffer[buffer]`. Owned slots (and slots with a negative id or
+    /// owner) are never written. Bit-exact.
     ///
     /// With no active stream the wait degrades to a host block on each peer
     /// event (the event must already be recorded: `exchange`, or publish-all
@@ -463,7 +483,7 @@ impl EpRowGather {
         gpu: &mut Gpu,
         rank: usize,
         buffer: usize,
-        slot_experts: &GpuTensor,
+        slot_owners: EpSlotOwners<'_>,
         slots: usize,
     ) -> HipResult<()> {
         self.check(gpu, rank, buffer)?;
@@ -489,15 +509,26 @@ impl EpRowGather {
                 None => gpu.hip.event_synchronize(event)?,
             }
         }
-        gpu.ep_gather_rows_by_owner(
-            slot_experts,
-            src,
-            self.ranks[rank].ptrs[buffer],
-            slots,
-            self.spec.ranks,
-            rank,
-            self.spec.row_bytes / 16,
-        )
+        match slot_owners {
+            EpSlotOwners::ExpertModulo(slot_experts) => gpu.ep_gather_rows_by_owner(
+                slot_experts,
+                src,
+                self.ranks[rank].ptrs[buffer],
+                slots,
+                self.spec.ranks,
+                rank,
+                self.spec.row_bytes / 16,
+            ),
+            EpSlotOwners::Explicit(owners) => gpu.ep_gather_rows_by_slot_owner(
+                owners,
+                src,
+                self.ranks[rank].ptrs[buffer],
+                slots,
+                self.spec.ranks,
+                rank,
+                self.spec.row_bytes / 16,
+            ),
+        }
     }
 
     /// `publish` → host barrier over all ranks (same round) → `gather`. One host
@@ -508,7 +539,7 @@ impl EpRowGather {
         gpu: &mut Gpu,
         rank: usize,
         buffer: usize,
-        slot_experts: &GpuTensor,
+        slot_owners: EpSlotOwners<'_>,
         slots: usize,
     ) -> HipResult<()> {
         self.spec.check_call_slots(slots)?;
@@ -517,7 +548,7 @@ impl EpRowGather {
             return Err(e);
         }
         self.barrier.wait().map_err(|m| err(m.into()))?;
-        if let Err(e) = self.gather(gpu, rank, buffer, slot_experts, slots) {
+        if let Err(e) = self.gather(gpu, rank, buffer, slot_owners, slots) {
             self.abort();
             return Err(e);
         }

@@ -748,6 +748,27 @@ pub trait MoeRowGather {
         down_expanded: &GpuTensor,
         topk_indices: &GpuTensor,
     ) -> Result<(), String>;
+
+    /// Whether this call's layer uses device-assigned (balanced) ownership:
+    /// the lowering then inserts `MoeStage::OwnerAssign` after routing and
+    /// before any stage that reads the routed expert tables. `false` by
+    /// default (static ownership, no stage).
+    fn assigns_owners(&self, _layer_idx: u16) -> bool {
+        false
+    }
+
+    /// Rewrite the layer's live expert tables and slot owners from
+    /// `topk_indices` (`slots = rows * k`). Runs after routing, before the
+    /// first routed-table reader of the same call.
+    fn assign_owners(
+        &self,
+        _gpu: &mut rdna_compute::Gpu,
+        _layer_idx: u16,
+        _slots: usize,
+        _topk_indices: &GpuTensor,
+    ) -> Result<(), String> {
+        Err("owner assignment not supported".into())
+    }
 }
 
 /// Everything the MoE decode executor arm reads, marshaled by the model from

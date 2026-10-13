@@ -9701,6 +9701,19 @@ pub const COPY_F32_BUFFER_SRC: &str = include_str!("../../../kernels/src/copy_f3
 pub const EP_GATHER_ROWS_BY_OWNER_SRC: &str =
     include_str!("../../../kernels/src/ep_gather_rows_by_owner.hip");
 
+/// Flash-Next expert-parallel row all-gather with explicit slot owners
+/// (balanced ownership, `HIPFIRE_EP_BALANCED_OWNERS=1`): same copy as
+/// [`EP_GATHER_ROWS_BY_OWNER_SRC`] but the owner of slot `s` is
+/// `slot_owner[s]`. Its own module so the modulo kernel's bytes are unchanged.
+pub const EP_GATHER_ROWS_BY_SLOT_OWNER_SRC: &str =
+    include_str!("../../../kernels/src/ep_gather_rows_by_slot_owner.hip");
+
+/// Flash-Next expert-parallel balanced ownership: one 512-thread workgroup that
+/// deals the call's distinct routed experts to ranks in ascending id order and
+/// rewrites the rank's live gate/up + down pointer tables and slot owners.
+pub const QWEN4_EP_OWNER_ASSIGN_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_ep_owner_assign.hip");
+
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.
 /// Replaces the per-row `copy_d2d` loop in the FLUX.1 MMDiT single block's

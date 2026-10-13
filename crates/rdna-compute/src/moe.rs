@@ -3027,6 +3027,396 @@ impl Gpu {
         }
         result
     }
+
+    /// Flash-Next expert-parallel balanced ownership (one workgroup, see
+    /// `kernels/src/qwen4_ep_owner_assign.hip` and [`qwen4_ep_owner_map`]).
+    ///
+    /// Reads the call's `slots` routed ids from `topk_indices` (i32 bit
+    /// patterns, slot order) and rewrites all [`QWEN4_EP_OWNER_EXPERTS`] entries
+    /// of the rank's live gate/up and down pointer tables
+    /// ([`Qwen4EpOwnerTables`]) plus `slots` entries of `slot_owner`.
+    /// Stream-ordered on the active stream; the next launcher reading the live
+    /// tables must follow it on the same stream.
+    pub fn qwen4_ep_owner_assign(
+        &mut self,
+        topk_indices: &GpuTensor,
+        slots: usize,
+        ranks: usize,
+        self_rank: usize,
+        tables: &Qwen4EpOwnerTables,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("qwen4_ep_owner_assign: {what}"),
+            ))
+        };
+        if !(2..=4).contains(&ranks) || self_rank >= ranks {
+            return refuse("ranks must be 2..=4 and self_rank < ranks");
+        }
+        if slots == 0 || slots > QWEN4_EP_OWNER_EXPERTS {
+            return refuse("slots must be 1..=512");
+        }
+        if topk_indices.buf.size() < slots * std::mem::size_of::<i32>() {
+            return refuse("topk_indices holds fewer than `slots` ids");
+        }
+        if !tables.is_complete() {
+            return refuse("a table address is null");
+        }
+        self.ensure_kernel(
+            "qwen4_ep_owner_assign",
+            kernels::QWEN4_EP_OWNER_ASSIGN_SRC,
+            "qwen4_ep_owner_assign",
+        )?;
+        let ids = topk_indices.buf.as_ptr();
+        let full_gate_up = tables.full_gate_up as *mut c_void;
+        let full_down = tables.full_down as *mut c_void;
+        let live_gate_up = tables.live_gate_up as *mut c_void;
+        let live_down = tables.live_down as *mut c_void;
+        let slot_owner = tables.slot_owner as *mut c_void;
+        let dummy_gate_up = tables.dummy_gate_up as u64;
+        let dummy_down = tables.dummy_down as u64;
+        let slots_i32 = slots as i32;
+        let ranks_i32 = ranks as i32;
+        let self_i32 = self_rank as i32;
+        let mut params = [
+            &ids as *const _ as *mut c_void,
+            &full_gate_up as *const _ as *mut c_void,
+            &full_down as *const _ as *mut c_void,
+            &live_gate_up as *const _ as *mut c_void,
+            &live_down as *const _ as *mut c_void,
+            &slot_owner as *const _ as *mut c_void,
+            &dummy_gate_up as *const _ as *mut c_void,
+            &dummy_down as *const _ as *mut c_void,
+            &slots_i32 as *const _ as *mut c_void,
+            &ranks_i32 as *const _ as *mut c_void,
+            &self_i32 as *const _ as *mut c_void,
+        ];
+        let bytes = QWEN4_EP_OWNER_EXPERTS * 8 * 4 + slots * 8;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "qwen4_ep_owner_assign", bytes);
+        let result = self.launch_maybe_blob(
+            "qwen4_ep_owner_assign",
+            [1, 1, 1],
+            [QWEN4_EP_OWNER_EXPERTS as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ids);
+                b.push_ptr(full_gate_up);
+                b.push_ptr(full_down);
+                b.push_ptr(live_gate_up);
+                b.push_ptr(live_down);
+                b.push_ptr(slot_owner);
+                b.push_u64(dummy_gate_up);
+                b.push_u64(dummy_down);
+                b.push_i32(slots_i32);
+                b.push_i32(ranks_i32);
+                b.push_i32(self_i32);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+}
+
+/// Experts per layer `qwen4_ep_owner_assign` handles (Flash-Next's 512; one
+/// thread each).
+pub const QWEN4_EP_OWNER_EXPERTS: usize = 512;
+
+/// Device addresses [`Gpu::qwen4_ep_owner_assign`] reads and writes for one
+/// layer of one rank. `full_*` are the layer's read-only full pointer tables
+/// (512 `u64` each), `live_*` the rank's tables the routed producers read
+/// (rewritten whole per call), `slot_owner` the i32 owner of each slot, and
+/// `dummy_*` this rank's zero dummy expert (gate/up, down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4EpOwnerTables {
+    pub full_gate_up: usize,
+    pub full_down: usize,
+    pub live_gate_up: usize,
+    pub live_down: usize,
+    pub slot_owner: usize,
+    pub dummy_gate_up: usize,
+    pub dummy_down: usize,
+}
+
+impl Qwen4EpOwnerTables {
+    /// Every address is set (a null one would be dereferenced on the device).
+    pub fn is_complete(&self) -> bool {
+        [
+            self.full_gate_up,
+            self.full_down,
+            self.live_gate_up,
+            self.live_down,
+            self.slot_owner,
+            self.dummy_gate_up,
+            self.dummy_down,
+        ]
+        .iter()
+        .all(|&address| address != 0)
+    }
+}
+
+/// Host reference of `qwen4_ep_owner_assign`: deal the call's distinct routed
+/// experts to `ranks` alternately in ascending expert-id order.
+///
+/// Returns `(owner per expert, owner per slot)`: `owners[e]` is
+/// `Some(idx(e) % ranks)` for a routed expert (`idx` = number of routed
+/// experts with a smaller id) and `None` for an expert no slot routes to;
+/// `slot_owners[s]` is the owner of `ids[s]`, `-1` for a negative or
+/// out-of-range id. Pure integer arithmetic: the same on every rank for the
+/// same replicated ids, and per-rank distinct-expert counts differ by at most
+/// one.
+pub fn qwen4_ep_owner_map(ids: &[i32], n_exp: usize, ranks: usize) -> (Vec<Option<usize>>, Vec<i32>) {
+    assert!(ranks >= 1, "qwen4_ep_owner_map: ranks must be at least 1");
+    let in_range = |id: i32| usize::try_from(id).ok().filter(|&expert| expert < n_exp);
+    let mut routed = vec![false; n_exp];
+    for &id in ids {
+        if let Some(expert) = in_range(id) {
+            routed[expert] = true;
+        }
+    }
+    let mut owners = vec![None; n_exp];
+    let mut dealt = 0usize;
+    for (expert, &is_routed) in routed.iter().enumerate() {
+        if is_routed {
+            owners[expert] = Some(dealt % ranks);
+            dealt += 1;
+        }
+    }
+    let slot_owners = ids
+        .iter()
+        .map(|&id| {
+            in_range(id)
+                .and_then(|expert| owners[expert])
+                .map_or(-1, |owner| owner as i32)
+        })
+        .collect();
+    (owners, slot_owners)
+}
+
+#[cfg(test)]
+mod owner_map_tests {
+    use super::*;
+
+    const EXPERTS: usize = QWEN4_EP_OWNER_EXPERTS;
+
+    fn distinct_per_rank(owners: &[Option<usize>], ranks: usize) -> Vec<usize> {
+        let mut counts = vec![0usize; ranks];
+        for owner in owners.iter().flatten() {
+            counts[*owner] += 1;
+        }
+        counts
+    }
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    #[test]
+    fn decode_ten_slots_alternate_in_ascending_id_order() {
+        // Routed ids sorted: 3, 17, 40, 41, 100, 200, 201, 300, 449, 511.
+        let ids = [200, 3, 511, 41, 17, 449, 300, 40, 201, 100];
+        let (owners, slots) = qwen4_ep_owner_map(&ids, EXPERTS, 2);
+        let sorted = [3, 17, 40, 41, 100, 200, 201, 300, 449, 511];
+        for (position, expert) in sorted.iter().enumerate() {
+            assert_eq!(owners[*expert], Some(position % 2), "expert {expert}");
+        }
+        assert_eq!(owners.iter().flatten().count(), 10);
+        assert_eq!(distinct_per_rank(&owners, 2), vec![5, 5]);
+        for (slot, id) in ids.iter().enumerate() {
+            assert_eq!(slots[slot], owners[*id as usize].unwrap() as i32);
+        }
+        // Four ranks: 3, 3, 2, 2.
+        let (owners4, _) = qwen4_ep_owner_map(&ids, EXPERTS, 4);
+        assert_eq!(distinct_per_rank(&owners4, 4), vec![3, 3, 2, 2]);
+        for (position, expert) in sorted.iter().enumerate() {
+            assert_eq!(owners4[*expert], Some(position % 4), "expert {expert}");
+        }
+    }
+
+    #[test]
+    fn static_modulo_would_skew_where_the_map_balances() {
+        // Ten even experts: `e % 2` puts all ten on rank 0.
+        let ids: Vec<i32> = (0..10).map(|j| 2 * j * 7).collect();
+        let (owners, _) = qwen4_ep_owner_map(&ids, EXPERTS, 2);
+        assert_eq!(distinct_per_rank(&owners, 2), vec![5, 5]);
+    }
+
+    #[test]
+    fn verify_forty_slots_with_repeats_share_one_owner_per_expert() {
+        // Four rows of ten slots; experts repeat across rows.
+        let mut ids = Vec::new();
+        for row in 0..4i32 {
+            for j in 0..10i32 {
+                ids.push((j * 37 + row * 11) % 90);
+            }
+        }
+        for ranks in [2usize, 4] {
+            let (owners, slots) = qwen4_ep_owner_map(&ids, EXPERTS, ranks);
+            assert_eq!(slots.len(), ids.len());
+            for (slot, id) in ids.iter().enumerate() {
+                assert_eq!(slots[slot], owners[*id as usize].unwrap() as i32);
+            }
+            let counts = distinct_per_rank(&owners, ranks);
+            let (lo, hi) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+            assert!(hi - lo <= 1, "ranks {ranks}: {counts:?}");
+            assert_eq!(counts.iter().sum::<usize>(), owners.iter().flatten().count());
+            // Repeats across rows share one owner: fewer distinct experts than slots.
+            assert!(owners.iter().flatten().count() < ids.len(), "the fixture must repeat experts");
+        }
+    }
+
+    #[test]
+    fn negative_and_out_of_range_ids_are_unowned() {
+        let ids = [-1, 5, -7, 9, 512, 5, i32::MIN, i32::MAX, 9];
+        let (owners, slots) = qwen4_ep_owner_map(&ids, EXPERTS, 2);
+        assert_eq!(owners.iter().flatten().count(), 2);
+        assert_eq!(owners[5], Some(0));
+        assert_eq!(owners[9], Some(1));
+        assert_eq!(slots, vec![-1, 0, -1, 1, -1, 0, -1, -1, 1]);
+    }
+
+    #[test]
+    fn no_routed_expert_means_no_owner() {
+        let (owners, slots) = qwen4_ep_owner_map(&[-1, -1], EXPERTS, 4);
+        assert!(owners.iter().all(Option::is_none));
+        assert_eq!(slots, vec![-1, -1]);
+    }
+
+    #[test]
+    fn per_rank_counts_differ_by_at_most_one_and_are_deterministic() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for ranks in [2usize, 4] {
+            for slots in [10usize, 20, 40, 80] {
+                for _ in 0..200 {
+                    let ids: Vec<i32> = (0..slots)
+                        .map(|_| match lcg(&mut state) % 11 {
+                            0 => -1,
+                            _ => (lcg(&mut state) % EXPERTS as u64) as i32,
+                        })
+                        .collect();
+                    let first = qwen4_ep_owner_map(&ids, EXPERTS, ranks);
+                    assert_eq!(first, qwen4_ep_owner_map(&ids, EXPERTS, ranks));
+                    let counts = distinct_per_rank(&first.0, ranks);
+                    let (lo, hi) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+                    assert!(hi - lo <= 1, "ranks {ranks} slots {slots}: {counts:?}");
+                    for (slot, id) in ids.iter().enumerate() {
+                        let expected = usize::try_from(*id)
+                            .ok()
+                            .and_then(|expert| first.0[expert])
+                            .map_or(-1, |owner| owner as i32);
+                        assert_eq!(first.1[slot], expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_addresses_must_all_be_set() {
+        let all = Qwen4EpOwnerTables {
+            full_gate_up: 0x1000,
+            full_down: 0x2000,
+            live_gate_up: 0x3000,
+            live_down: 0x4000,
+            slot_owner: 0x5000,
+            dummy_gate_up: 0x6000,
+            dummy_down: 0x7000,
+        };
+        assert!(all.is_complete());
+        assert!(!Qwen4EpOwnerTables { dummy_down: 0, ..all }.is_complete());
+        assert!(!Qwen4EpOwnerTables { full_gate_up: 0, ..all }.is_complete());
+    }
+
+    /// Device check of the kernel against the host reference (ranks 2 and 4,
+    /// decode- and verify-sized id sets). Needs a gfx11/gfx12 GPU; never run
+    /// by the CPU-only gate.
+    #[test]
+    #[ignore = "requires a gfx11/gfx12 GPU and working HIP toolchain"]
+    fn kernel_matches_the_host_reference() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch_caps.has_gfx11_plus_simt() => gpu,
+            _ => {
+                eprintln!("skip: needs a gfx11/gfx12 GPU");
+                return;
+            }
+        };
+        let to_bytes = |v: &[u64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let full_gate_up: Vec<u64> = (0..EXPERTS as u64).map(|e| 0x1_0000_0000 + e * 0x100).collect();
+        let full_down: Vec<u64> = (0..EXPERTS as u64).map(|e| 0x2_0000_0000 + e * 0x80).collect();
+        let (dummy_gate_up, dummy_down) = (0xD000_0000u64, 0xE000_0000u64);
+        let upload = |gpu: &mut Gpu, bytes: &[u8]| gpu.upload_raw(bytes, &[bytes.len()]).expect("upload");
+        let full_gate_up_gpu = upload(&mut gpu, &to_bytes(&full_gate_up));
+        let full_down_gpu = upload(&mut gpu, &to_bytes(&full_down));
+        let live_gate_up_gpu = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+        let live_down_gpu = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
+        let owners_gpu = upload(&mut gpu, &vec![0x55u8; 80 * 4]);
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        for ranks in [2usize, 4] {
+            for slots in [10usize, 40, 80] {
+                for _ in 0..16 {
+                    let ids: Vec<i32> = (0..slots)
+                        .map(|_| match lcg(&mut state) % 9 {
+                            0 => -1,
+                            _ => (lcg(&mut state) % EXPERTS as u64) as i32,
+                        })
+                        .collect();
+                    let id_bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+                    let ids_gpu = upload(&mut gpu, &id_bytes);
+                    let (owners, slot_owners) = qwen4_ep_owner_map(&ids, EXPERTS, ranks);
+                    for rank in 0..ranks {
+                        let tables = Qwen4EpOwnerTables {
+                            full_gate_up: full_gate_up_gpu.buf.as_ptr() as usize,
+                            full_down: full_down_gpu.buf.as_ptr() as usize,
+                            live_gate_up: live_gate_up_gpu.buf.as_ptr() as usize,
+                            live_down: live_down_gpu.buf.as_ptr() as usize,
+                            slot_owner: owners_gpu.buf.as_ptr() as usize,
+                            dummy_gate_up: dummy_gate_up as usize,
+                            dummy_down: dummy_down as usize,
+                        };
+                        // The kernel reads `full_*` through device pointers.
+                        gpu.qwen4_ep_owner_assign(&ids_gpu, slots, ranks, rank, &tables)
+                            .expect("assign launch");
+                        gpu.hip.device_synchronize().expect("sync");
+                        let mut raw = vec![0u8; EXPERTS * 8];
+                        gpu.hip.memcpy_dtoh(&mut raw, &live_gate_up_gpu.buf).expect("gate/up");
+                        let live_gu: Vec<u64> = raw
+                            .chunks_exact(8)
+                            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        gpu.hip.memcpy_dtoh(&mut raw, &live_down_gpu.buf).expect("down");
+                        let live_dn: Vec<u64> = raw
+                            .chunks_exact(8)
+                            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        let mut owner_raw = vec![0u8; slots * 4];
+                        gpu.hip
+                            .memcpy_dtoh(&mut owner_raw, &owners_gpu.buf)
+                            .expect("slot owners");
+                        let device_slots: Vec<i32> = owner_raw
+                            .chunks_exact(4)
+                            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        assert_eq!(device_slots, slot_owners, "ranks {ranks} rank {rank}");
+                        for expert in 0..EXPERTS {
+                            let mine = owners[expert] == Some(rank);
+                            assert_eq!(live_gu[expert], if mine { full_gate_up[expert] } else { dummy_gate_up });
+                            assert_eq!(live_dn[expert], if mine { full_down[expert] } else { dummy_down });
+                        }
+                    }
+                    gpu.free_tensor(ids_gpu).expect("free ids");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

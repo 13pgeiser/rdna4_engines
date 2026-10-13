@@ -6967,6 +6967,101 @@ impl Gpu {
         )
     }
 
+    /// [`Self::ep_gather_rows_by_owner`] with explicit owners (balanced EP
+    /// ownership): row `s` is copied from `src[slot_owner[s]]` when
+    /// `slot_owner[s]` is in `0..n_ranks` and not `self_rank`; slots with a
+    /// negative owner and rows this rank owns are never written. `slot_owner`
+    /// holds `n_slots` i32 values in device memory. Same grid, same uint4 copy,
+    /// bit-exact for every pattern; the kernel lives in its own module
+    /// (`ep_gather_rows_by_slot_owner`) so the modulo kernel's bytes are
+    /// unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ep_gather_rows_by_slot_owner(
+        &mut self,
+        slot_owner: &GpuTensor,
+        src: [usize; 4],
+        dst: usize,
+        n_slots: usize,
+        n_ranks: usize,
+        self_rank: usize,
+        n16: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !(2..=4).contains(&n_ranks) || self_rank >= n_ranks {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_slot_owner: n_ranks must be 2..=4 and self_rank < n_ranks",
+            ));
+        }
+        if n_slots == 0 || n16 == 0 {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_slot_owner: n_slots and n16 must be non-zero",
+            ));
+        }
+        let slot_bytes = n_slots
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| HipError::new(0, "ep_gather_rows_by_slot_owner: n_slots overflow"))?;
+        if slot_owner.buf.size() < slot_bytes {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_slot_owner: slot_owner holds fewer than n_slots owners",
+            ));
+        }
+        let mut slots_i32 = i32::try_from(n_slots)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_slot_owner: n_slots exceeds i32"))?;
+        let mut ranks_i32 = n_ranks as i32;
+        let mut self_i32 = self_rank as i32;
+        let mut n16_i32 = i32::try_from(n16)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_slot_owner: n16 exceeds i32"))?;
+        self.ensure_kernel(
+            "ep_gather_rows_by_slot_owner",
+            crate::kernels::EP_GATHER_ROWS_BY_SLOT_OWNER_SRC,
+            "ep_gather_rows_by_slot_owner",
+        )?;
+        let owners = slot_owner.buf.as_ptr();
+        let s0 = src[0] as *mut c_void;
+        let s1 = src[1] as *mut c_void;
+        let s2 = src[2] as *mut c_void;
+        let s3 = src[3] as *mut c_void;
+        let d = dst as *mut c_void;
+        let mut params: [*mut c_void; 10] = [
+            &owners as *const _ as *mut c_void,
+            &s0 as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &s3 as *const _ as *mut c_void,
+            &d as *const _ as *mut c_void,
+            &mut slots_i32 as *mut _ as *mut c_void,
+            &mut ranks_i32 as *mut _ as *mut c_void,
+            &mut self_i32 as *mut _ as *mut c_void,
+            &mut n16_i32 as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(owners);
+            blob.push_ptr(s0);
+            blob.push_ptr(s1);
+            blob.push_ptr(s2);
+            blob.push_ptr(s3);
+            blob.push_ptr(d);
+            blob.push_i32(slots_i32);
+            blob.push_i32(ranks_i32);
+            blob.push_i32(self_i32);
+            blob.push_i32(n16_i32);
+            blob
+        };
+        let grid_x = (n16 as u32).div_ceil(256);
+        self.launch_maybe_blob(
+            "ep_gather_rows_by_slot_owner",
+            [grid_x, n_slots as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
+
     /// 2D strided F32 row copy, one launch for `n_rows` rows:
     ///
     /// ```text

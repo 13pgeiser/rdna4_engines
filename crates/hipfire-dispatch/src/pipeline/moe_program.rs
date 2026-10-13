@@ -34,6 +34,11 @@ pub enum MoeStage {
     GateSide,
     RouterProjection,
     Route,
+    /// Balanced EP ownership ([`MoeRowGather::assigns_owners`]): rewrites the
+    /// layer's live expert tables and slot owners from the routed ids; lowered
+    /// only immediately after the stage that wrote them, before any routed
+    /// table reader, and only when the installed gather asks for it.
+    OwnerAssign,
     SharedGateUp,
     SharedActivation,
     SharedDown,
@@ -390,6 +395,7 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::GateSide => self.gate_side(gpu),
             MoeStage::RouterProjection => self.router_projection(gpu),
             MoeStage::Route => self.route(gpu),
+            MoeStage::OwnerAssign => self.owner_assign(gpu),
             MoeStage::SharedGateUp => self.shared_gate_up(gpu),
             MoeStage::SharedActivation => self.shared_activation(gpu),
             MoeStage::SharedDown => self.shared_down(gpu),
@@ -1093,6 +1099,51 @@ impl<'a> SealedMoeOp<'a> {
         }
     }
 
+    pub(super) fn owner_assign(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let missing =
+            || DispatchError::Hip("sealed moe: owner assignment lowered without a gather".into());
+        let overflow =
+            || DispatchError::Hip("sealed moe: owner assignment extent overflows".into());
+        // The routed ids must exist before ownership is derived from them.
+        self.state.require_route_ready()?;
+        let (gather, layer_idx, slots, topk_indices) = match self.state.call.protocol() {
+            MoeProtocol::IndexedDecode => {
+                let (params, _) = self.state.decode_parts()?;
+                (
+                    params.ep_row_gather.ok_or_else(missing)?,
+                    params.layer_idx,
+                    params.k,
+                    params.topk_indices,
+                )
+            }
+            MoeProtocol::GroupedPrefill => {
+                let (params, _) = self.state.prefill_parts()?;
+                (
+                    params.ep_row_gather.ok_or_else(missing)?,
+                    params.ep_layer_idx,
+                    params
+                        .batch_size
+                        .checked_mul(params.k_top)
+                        .ok_or_else(overflow)?,
+                    params.topk_indices,
+                )
+            }
+        };
+        // Like the exchange it serves, the assignment is eager-only.
+        if gpu.graphs.capture_mode
+            || gpu.graphs.verify.capturing.is_some()
+            || gpu.graphs.replay.capturing.is_some()
+            || gpu.replay.is_recording()
+        {
+            return Err(DispatchError::Hip(
+                "sealed moe: expert-parallel owner assignment refused while a graph capture or replay record is armed".into(),
+            ));
+        }
+        gather
+            .assign_owners(gpu, layer_idx, slots, topk_indices)
+            .map_err(|error| DispatchError::Hip(format!("sealed moe: EP owner assignment: {error}")))
+    }
+
     pub(super) fn row_gather(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let missing =
             || DispatchError::Hip("sealed moe: row gather lowered without a gather".into());
@@ -1198,6 +1249,12 @@ fn lower_decode<'a>(
         state.call.router_input(),
         MoeRouterInput::PrecomputedSoftmaxTopK | MoeRouterInput::PrecomputedSigmoidTopK
     );
+    // Balanced EP ownership: the stage goes right after the stage that writes
+    // the routed ids and before every routed-table reader. A selection with no
+    // such stage in this program (an adopted route) cannot be balanced.
+    let owner_assign = params
+        .ep_row_gather
+        .is_some_and(|gather| gather.assigns_owners(params.layer_idx));
     match params.recipe {
         MoeRecipe::SoftmaxGatedShared { .. } => {
             if selection.resolution.needs_x_rot_local {
@@ -1209,6 +1266,9 @@ fn lower_decode<'a>(
                 // admitted; the route operation then owns top-k production.
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateSide))?;
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
+                if owner_assign {
+                    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
+                }
             }
             if !params.skip_shared && !params.recipe.shared_after_combine() {
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
@@ -1221,6 +1281,9 @@ fn lower_decode<'a>(
                     Step::MoeStage(op(state), MoeStage::RouterProjection),
                 )?;
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
+                if owner_assign {
+                    append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
+                }
             }
             // Cohere's sigmoid route consumes the normalized natural input
             // first and transforms it only after top-eight selection.
@@ -1228,6 +1291,11 @@ fn lower_decode<'a>(
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
             }
         }
+    }
+    if owner_assign && (adopted || !selection.resolution.use_gpu_topk) {
+        return Err(DispatchError::Hip(
+            "sealed moe: balanced EP ownership needs this program's GPU route stage to write the routed ids".into(),
+        ));
     }
     if selection.resolution.use_gpu_topk {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
@@ -1322,6 +1390,14 @@ fn lower_prefill<'a>(
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
+        // Balanced EP ownership: right after the route wrote the ids, before
+        // the scatter and every routed-table reader.
+        if params
+            .ep_row_gather
+            .is_some_and(|gather| gather.assigns_owners(params.ep_layer_idx))
+        {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
+        }
         if selection.resolution.use_path2 {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }

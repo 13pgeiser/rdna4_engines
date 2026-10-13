@@ -18,19 +18,20 @@
 
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::gpu_forward::{
-    qwen4_ep_buffer_index, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS,
+    qwen4_ep_buffer_index, Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS,
     QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::MoeRowGather;
 use hipfire_runtime::arch_model::ArchModel;
-use hipfire_runtime::ep_row_gather::{EpRowGather, EpRowGatherSpec};
+use hipfire_runtime::ep_row_gather::{EpRowGather, EpRowGatherSpec, EpSlotOwners};
 use hipfire_runtime::sampler::PenaltyTable;
 use hipfire_runtime::serve_contract::{
     sha256_len_prefixed, ArchPolicy, CacheDomain, DeviceTopology, KvLayout, SharingNamespace,
     TemplateIdentity, TokenizerIdentity,
 };
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
+use rdna_compute::moe::Qwen4EpOwnerTables;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -706,6 +707,76 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// Buffer index of this rank's previous invocation. The transport's hazard
     /// rule forbids the same buffer on two consecutive invocations.
     last_buffer: AtomicUsize,
+    /// Balanced-ownership layers (`HIPFIRE_EP_BALANCED_OWNERS=1`), installed
+    /// once after the forward attached its live tables. Never set when off.
+    balanced: OnceLock<BalancedOwners>,
+}
+
+/// What the hook knows of the rank's balanced trunk layers.
+struct BalancedOwners {
+    /// Owner-assign table addresses indexed by trunk layer label.
+    tables: Vec<Option<Qwen4EpOwnerTables>>,
+    /// Non-owning view of the rank's slot-owner buffer (the forward owns it).
+    slot_owner: Mutex<GpuTensor>,
+}
+
+/// The owner-assign tables of a balanced trunk layer; `None` for every other
+/// layer, including the MTP head range (`>= trunk_layers`), whatever
+/// `tables` holds.
+fn balanced_layer_tables(
+    tables: &[Option<Qwen4EpOwnerTables>],
+    layer_idx: u16,
+    trunk_layers: usize,
+) -> Option<&Qwen4EpOwnerTables> {
+    let layer = usize::from(layer_idx);
+    if layer >= trunk_layers {
+        return None;
+    }
+    tables.get(layer).and_then(Option::as_ref)
+}
+
+impl BalancedOwners {
+    fn layer(&self, layer_idx: u16, trunk_layers: usize) -> Option<&Qwen4EpOwnerTables> {
+        balanced_layer_tables(&self.tables, layer_idx, trunk_layers)
+    }
+}
+
+impl Qwen4EpRowGatherHook {
+    fn new(
+        rank: usize,
+        trunk_layers: usize,
+        gather: Arc<EpRowGather>,
+        buffer_ptrs: [usize; QWEN4_EP_GATHER_BUFFERS],
+    ) -> Self {
+        Self {
+            rank,
+            trunk_layers,
+            gather,
+            buffer_ptrs,
+            last_buffer: AtomicUsize::new(NO_BUFFER),
+            balanced: OnceLock::new(),
+        }
+    }
+
+    /// Install the rank's balanced layers (once, after `attach_ep`).
+    fn install_balanced(&self, plan: Qwen4BalancedPlan) -> Result<(), String> {
+        let mut tables: Vec<Option<Qwen4EpOwnerTables>> = vec![None; self.trunk_layers];
+        for (label, layer_tables) in plan.layers {
+            let slot = tables.get_mut(label).ok_or_else(|| {
+                format!(
+                    "qwen4 EP rank {}: balanced layer {label} is outside the {} trunk layers",
+                    self.rank, self.trunk_layers
+                )
+            })?;
+            *slot = Some(layer_tables);
+        }
+        self.balanced
+            .set(BalancedOwners {
+                tables,
+                slot_owner: Mutex::new(plan.slot_owner),
+            })
+            .map_err(|_| format!("qwen4 EP rank {}: balanced owners are already installed", self.rank))
+    }
 }
 
 /// Record `buffer` as the rank's current invocation in `last`; `Err` when the
@@ -737,9 +808,70 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
             ));
         }
         note_gather_buffer(&self.last_buffer, self.rank, buffer)?;
-        self.gather
-            .exchange(gpu, self.rank, buffer, topk_indices, slots)
-            .map_err(|error| format!("qwen4 EP row gather layer {layer_idx} rank {}: {error}", self.rank))
+        // A balanced layer gathers from the owners its own assignment wrote
+        // this call; every other layer keeps the static `e % ranks` placement.
+        let balanced = self
+            .balanced
+            .get()
+            .filter(|balanced| balanced.layer(layer_idx, self.trunk_layers).is_some());
+        let result = match balanced {
+            Some(balanced) => {
+                let owners = lock(&balanced.slot_owner);
+                self.gather.exchange(
+                    gpu,
+                    self.rank,
+                    buffer,
+                    EpSlotOwners::Explicit(&owners),
+                    slots,
+                )
+            }
+            None => self.gather.exchange(
+                gpu,
+                self.rank,
+                buffer,
+                EpSlotOwners::ExpertModulo(topk_indices),
+                slots,
+            ),
+        };
+        result.map_err(|error| format!("qwen4 EP row gather layer {layer_idx} rank {}: {error}", self.rank))
+    }
+
+    fn assigns_owners(&self, layer_idx: u16) -> bool {
+        self.balanced
+            .get()
+            .is_some_and(|balanced| balanced.layer(layer_idx, self.trunk_layers).is_some())
+    }
+
+    fn assign_owners(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: u16,
+        slots: usize,
+        topk_indices: &GpuTensor,
+    ) -> Result<(), String> {
+        let tables = self
+            .balanced
+            .get()
+            .and_then(|balanced| balanced.layer(layer_idx, self.trunk_layers))
+            .ok_or_else(|| {
+                format!(
+                    "qwen4 EP rank {}: layer {layer_idx} is not a balanced trunk layer",
+                    self.rank
+                )
+            })?;
+        gpu.qwen4_ep_owner_assign(
+            topk_indices,
+            slots,
+            self.gather.spec().ranks,
+            self.rank,
+            tables,
+        )
+        .map_err(|error| {
+            format!(
+                "qwen4 EP owner assignment layer {layer_idx} rank {}: {error}",
+                self.rank
+            )
+        })
     }
 }
 
@@ -759,6 +891,31 @@ mod gather_hook_tests {
         // The same buffer twice in a row is refused wherever it occurs.
         assert!(note_gather_buffer(&last, 1, 2).is_ok());
         assert!(note_gather_buffer(&last, 1, 2).is_err());
+    }
+
+    #[test]
+    fn only_balanced_trunk_layers_assign_owners_never_the_mtp_head() {
+        let tables = Qwen4EpOwnerTables {
+            full_gate_up: 0x1000,
+            full_down: 0x2000,
+            live_gate_up: 0x3000,
+            live_down: 0x4000,
+            slot_owner: 0x5000,
+            dummy_gate_up: 0x6000,
+            dummy_down: 0x7000,
+        };
+        // Four trunk layers, two of them balanced; the table vector is longer
+        // than the trunk to prove the head range is excluded by the guard.
+        let by_layer = [None, Some(tables), None, Some(tables), Some(tables)];
+        let trunk_layers = 4;
+        assert_eq!(balanced_layer_tables(&by_layer, 1, trunk_layers), Some(&tables));
+        assert_eq!(balanced_layer_tables(&by_layer, 3, trunk_layers), Some(&tables));
+        assert_eq!(balanced_layer_tables(&by_layer, 0, trunk_layers), None);
+        assert_eq!(balanced_layer_tables(&by_layer, 2, trunk_layers), None);
+        // The MTP head's layer indices start at the trunk layer count.
+        assert_eq!(balanced_layer_tables(&by_layer, 4, trunk_layers), None);
+        assert_eq!(balanced_layer_tables(&by_layer, 5, trunk_layers), None);
+        assert_eq!(balanced_layer_tables(&[], 0, trunk_layers), None);
     }
 }
 
@@ -1073,20 +1230,25 @@ impl Qwen4Bundle {
                 .as_ref()
                 .and_then(|forward| forward.ep_gather_buffers())
                 .ok_or("no EP gather buffers (the forward has no EP placement)")?;
-            let hook: Arc<dyn MoeRowGather + Send + Sync> = Arc::new(Qwen4EpRowGatherHook {
+            let hook = Arc::new(Qwen4EpRowGatherHook::new(
                 rank,
                 trunk_layers,
-                gather: gather.clone(),
-                buffer_ptrs: buffers.map(|buffer| buffer.buf.as_ptr() as usize),
-                last_buffer: AtomicUsize::new(NO_BUFFER),
-            });
+                gather.clone(),
+                buffers.map(|buffer| buffer.buf.as_ptr() as usize),
+            ));
             let mut forward = bundle
                 .execution
                 .take()
                 .ok_or("the forward is not attached")?;
+            let installed: Arc<dyn MoeRowGather + Send + Sync> = hook.clone();
             let result = forward
-                .attach_ep(gpu, bundle, &sources, hook)
-                .map_err(|error| format!("attach EP tables: {error}"));
+                .attach_ep(gpu, bundle, &sources, installed)
+                .map_err(|error| format!("attach EP tables: {error}"))
+                .and_then(|()| match forward.balanced_plan() {
+                    // `HIPFIRE_EP_BALANCED_OWNERS=1` with a host-mapped layer.
+                    Some(plan) => hook.install_balanced(plan),
+                    None => Ok(()),
+                });
             bundle.execution = Some(forward);
             result
         };

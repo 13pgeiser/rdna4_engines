@@ -6981,4 +6981,86 @@ mod tests {
         let error = prefill_stages(Some(&NoopGather), grouped, true).unwrap_err();
         assert!(format!("{error:?}").contains("row gather"), "{error:?}");
     }
+
+    /// A gather that opts the layer into device-assigned ownership.
+    struct OwnerGather;
+
+    impl MoeRowGather for OwnerGather {
+        fn gather_rows(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _slots: usize,
+            _down_expanded: &GpuTensor,
+            _topk_indices: &GpuTensor,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn assigns_owners(&self, _layer_idx: u16) -> bool {
+            true
+        }
+    }
+
+    /// `with` is `without` plus exactly one `OwnerAssign`, placed right after
+    /// the route stage and before every routed-table reader.
+    fn assert_owner_assign_after_route(with: &[MoeStage], without: &[MoeStage]) {
+        assert!(
+            !without.contains(&MoeStage::OwnerAssign),
+            "static ownership lowers no OwnerAssign stage: {without:?}"
+        );
+        assert_eq!(
+            with.iter().filter(|stage| **stage == MoeStage::OwnerAssign).count(),
+            1,
+            "{with:?}"
+        );
+        let route = with
+            .iter()
+            .position(|stage| *stage == MoeStage::Route)
+            .expect("route");
+        assert_eq!(with[route + 1], MoeStage::OwnerAssign, "{with:?}");
+        let assign = route + 1;
+        for reader in [MoeStage::Scatter, MoeStage::GateUp, MoeStage::Down] {
+            if let Some(position) = with.iter().position(|stage| *stage == reader) {
+                assert!(assign < position, "{reader:?} reads the live tables: {with:?}");
+            }
+        }
+        let mut stripped = with.to_vec();
+        stripped.remove(assign);
+        assert_eq!(stripped, without, "only the owner stage differs");
+    }
+
+    #[test]
+    fn decode_lowering_emits_owner_assign_exactly_when_the_gather_asks() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let historical = decode_stages(Some(&NoopGather), grouped).unwrap();
+        let without_gather = decode_stages(None, grouped).unwrap();
+        assert!(!historical.contains(&MoeStage::OwnerAssign));
+        assert!(!without_gather.contains(&MoeStage::OwnerAssign));
+        let balanced = decode_stages(Some(&OwnerGather), grouped).unwrap();
+        assert_owner_assign_after_route(&balanced, &historical);
+    }
+
+    #[test]
+    fn prefill_lowering_emits_owner_assign_exactly_when_the_gather_asks() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let historical = prefill_stages(Some(&NoopGather), grouped, false).unwrap();
+        let without_gather = prefill_stages(None, grouped, false).unwrap();
+        assert!(!historical.contains(&MoeStage::OwnerAssign));
+        assert!(!without_gather.contains(&MoeStage::OwnerAssign));
+        let balanced = prefill_stages(Some(&OwnerGather), grouped, false).unwrap();
+        assert_owner_assign_after_route(&balanced, &historical);
+        // The symmetric declaration lowers through the same stages.
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        let balanced_symmetric = prefill_stages(Some(&OwnerGather), symmetric, false).unwrap();
+        assert_eq!(balanced_symmetric, balanced);
+    }
+
+    #[test]
+    fn owner_gather_off_the_grouped_route_still_refuses() {
+        let error = decode_stages(Some(&OwnerGather), None).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+        let error = prefill_stages(Some(&OwnerGather), None, false).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+    }
 }

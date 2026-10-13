@@ -50,6 +50,7 @@ use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::external_rows::{RowFetch, RowTicket};
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
+use rdna_compute::moe::Qwen4EpOwnerTables;
 use rdna_compute::replay::{ReplayController, ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32, QsaRopeScaling};
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
@@ -1306,6 +1307,37 @@ pub(crate) struct MtpEpGather<'a> {
     pub(crate) buffers: [&'a GpuTensor; QWEN4_EP_GATHER_BUFFERS],
 }
 
+/// `HIPFIRE_EP_BALANCED_OWNERS=1` (default off): per-call balanced expert
+/// ownership on the host-mapped trunk MoE layers of an EP rank. Anything but
+/// the exact value `1` is off, and off builds nothing (no tables, no buffer, no
+/// stage, no kernel load).
+pub const QWEN4_EP_BALANCED_OWNERS_ENV: &str = "HIPFIRE_EP_BALANCED_OWNERS";
+
+fn qwen4_ep_balanced_owners_enabled() -> bool {
+    hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() == Ok("1")
+}
+
+/// One host-mapped trunk MoE layer under balanced ownership: the rank's *live*
+/// expert runtime. It is the layer's full (P2P) addressing
+/// ([`Qwen4MoeLayerRuntime::from_moe_full`]); `qwen4_ep_owner_assign` rewrites
+/// its two pointer tables every call (owned routed experts keep their full
+/// address, every other entry names the rank's zero dummy expert), and the
+/// routed producers read those tables in place of the static EP decode table.
+pub(crate) struct Qwen4BalancedLayer {
+    live: Qwen4MoeLayerRuntime,
+    /// The layer's label (`layer.layer`, what the dispatch hook is called with).
+    label: usize,
+    tables: Qwen4EpOwnerTables,
+}
+
+/// What the row-gather hook needs of a rank's balanced layers: the owner-assign
+/// table addresses per layer label and a non-owning view of the rank's
+/// `slot_owner` buffer (owned by [`Qwen4ForwardEp`], freed with it).
+pub(crate) struct Qwen4BalancedPlan {
+    pub(crate) layers: Vec<(usize, Qwen4EpOwnerTables)>,
+    pub(crate) slot_owner: GpuTensor,
+}
+
 /// Expert-parallel state of one rank's forward (present iff the bundle's
 /// weights carry an EP placement).
 struct Qwen4ForwardEp {
@@ -1318,6 +1350,14 @@ struct Qwen4ForwardEp {
     buffers: [GpuTensor; QWEN4_EP_GATHER_BUFFERS],
     /// Row gather the one-row and few-row forwards install, once attached.
     gather: Option<Arc<dyn MoeRowGather + Send + Sync>>,
+    /// Balanced-ownership state per MoE ordinal (`Some` for every host-mapped
+    /// trunk layer); empty unless `HIPFIRE_EP_BALANCED_OWNERS=1` at
+    /// [`Qwen4GpuForward::attach_ep`].
+    balanced: Vec<Option<Qwen4BalancedLayer>>,
+    /// The rank's `QWEN4_EP_GATHER_MAX_ROWS * k` i32 slot owners, shared by the
+    /// balanced layers (stream-ordered: a call's assignment writes it and the
+    /// same call's gather reads it before the next layer's assignment).
+    slot_owner: Option<GpuTensor>,
 }
 
 impl Qwen4ForwardEp {
@@ -1355,6 +1395,8 @@ impl Qwen4ForwardEp {
             moe_full: Vec::new(),
             buffers,
             gather: None,
+            balanced: Vec::new(),
+            slot_owner: None,
         };
         // The zero fills are stream-ordered; peers read the buffers over P2P
         // on their own streams.
@@ -1369,6 +1411,16 @@ impl Qwen4ForwardEp {
         let mut first = None;
         for layer in self.moe_full {
             if let Some(error) = layer.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        for layer in self.balanced.into_iter().flatten() {
+            if let Some(error) = layer.live.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some(tensor) = self.slot_owner {
+            if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
             }
         }
@@ -4058,6 +4110,35 @@ impl Qwen4GpuForward {
         })
     }
 
+    /// What the rank's row-gather hook needs to run balanced ownership: `None`
+    /// unless `HIPFIRE_EP_BALANCED_OWNERS=1` was set at [`Self::attach_ep`] and
+    /// some trunk MoE layer is host-mapped. The `slot_owner` view is
+    /// non-owning; this forward frees the buffer.
+    pub(crate) fn balanced_plan(&self) -> Option<Qwen4BalancedPlan> {
+        let ep = self.ep.as_ref()?;
+        let owners = ep.slot_owner.as_ref()?;
+        let layers: Vec<(usize, Qwen4EpOwnerTables)> = ep
+            .balanced
+            .iter()
+            .flatten()
+            .map(|layer| (layer.label, layer.tables))
+            .collect();
+        if layers.is_empty() {
+            return None;
+        }
+        Some(Qwen4BalancedPlan {
+            layers,
+            slot_owner: GpuTensor {
+                // SAFETY: a `Borrowed` alias of the buffer `Qwen4ForwardEp`
+                // owns until `free_gpu`; the hook that holds it lives inside
+                // that forward and is never used after the forward is freed.
+                buf: unsafe { owners.buf.alias() },
+                shape: owners.shape.clone(),
+                dtype: owners.dtype,
+            },
+        })
+    }
+
     /// After every rank is loaded and P2P is enabled on every rank: build this
     /// rank's full (P2P) chunk tables from all ranks' sources
     /// (`peers[rank][moe_layer]`), take the symmetric-IU4 verdict a single
@@ -4072,6 +4153,14 @@ impl Qwen4GpuForward {
     ) -> Result<(), Qwen4GpuForwardError> {
         let layers = self.moe.len();
         let max_chunk = self.scratch.max_chunk;
+        // The EP decode runtime's route-selecting properties per MoE ordinal
+        // (host-mapped, symmetric, all-MQ4 gate/up): a balanced layer's live
+        // runtime must select the same sealed route.
+        let moe_traits: Vec<(bool, bool, bool)> = self
+            .moe
+            .iter()
+            .map(|moe| (moe.host_mapped, moe.symmetric, moe.experts_all_gate_up_mq4))
+            .collect();
         let Some(ep) = self.ep.as_mut() else {
             return Err(invalid("attach_ep on a forward without an EP placement"));
         };
@@ -4095,19 +4184,26 @@ impl Qwen4GpuForward {
             }
         }
         let config = &bundle.config;
+        let balanced_on = qwen4_ep_balanced_owners_enabled();
+        let dummy = ep.dummy.source();
+        let layer_peers_of = |ordinal: usize| -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
+            peers
+                .iter()
+                .map(|sources| {
+                    sources.get(ordinal).copied().ok_or_else(|| {
+                        invalid(format!("attach_ep is missing MoE layer {ordinal}"))
+                    })
+                })
+                .collect()
+        };
         let mut full: Vec<Qwen4MoeLayerRuntime> = Vec::with_capacity(layers);
+        let mut balanced: Vec<Option<Qwen4BalancedLayer>> = Vec::new();
+        let mut slot_owner: Option<GpuTensor> = None;
         let result = (|| -> Result<(), Qwen4GpuForwardError> {
             let mut ordinal = 0usize;
             for layer in &bundle.weights.layer_refs {
                 if let Some(weights) = layer.ffn.moe() {
-                    let layer_peers = peers
-                        .iter()
-                        .map(|sources| {
-                            sources.get(ordinal).copied().ok_or_else(|| {
-                                invalid(format!("attach_ep is missing MoE layer {ordinal}"))
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let layer_peers = layer_peers_of(ordinal)?;
                     full.push(Qwen4MoeLayerRuntime::from_moe_full(
                         gpu,
                         &bundle.weights,
@@ -4144,15 +4240,95 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
+            // Balanced ownership (`HIPFIRE_EP_BALANCED_OWNERS=1`): every
+            // host-mapped trunk layer gets a live runtime of the same full
+            // addressing, whose tables the per-call owner assignment
+            // rewrites. Nothing is built, allocated or loaded when off.
+            if balanced_on {
+                let mut ordinal = 0usize;
+                for layer in &bundle.weights.layer_refs {
+                    let Some(weights) = layer.ffn.moe() else {
+                        continue;
+                    };
+                    let (host_mapped, symmetric, all_mq4) = moe_traits[ordinal];
+                    if !host_mapped {
+                        balanced.push(None);
+                        ordinal += 1;
+                        continue;
+                    }
+                    let owners = match slot_owner.as_ref() {
+                        Some(owners) => owners.buf.as_ptr() as usize,
+                        None => {
+                            let tensor = gpu.zeros(
+                                &[QWEN4_EP_GATHER_MAX_ROWS * config.num_experts_per_tok],
+                                DType::F32,
+                            )?;
+                            let address = tensor.buf.as_ptr() as usize;
+                            slot_owner = Some(tensor);
+                            address
+                        }
+                    };
+                    let live = Qwen4MoeLayerRuntime::from_moe_full(
+                        gpu,
+                        &bundle.weights,
+                        weights,
+                        layer.layer,
+                        config,
+                        placement,
+                        &layer_peers_of(ordinal)?,
+                    )?;
+                    if live.symmetric != symmetric
+                        || live.host_mapped != host_mapped
+                        || live.experts_all_gate_up_mq4 != all_mq4
+                    {
+                        let _ = live.free_gpu(gpu);
+                        return Err(invalid(format!(
+                            "layer {} balanced runtime selects a different sealed route than the EP decode runtime",
+                            layer.layer
+                        )));
+                    }
+                    let tables = Qwen4EpOwnerTables {
+                        full_gate_up: full[ordinal].expert_gate_up_ptrs.buf.as_ptr() as usize,
+                        full_down: full[ordinal].expert_down_ptrs.buf.as_ptr() as usize,
+                        live_gate_up: live.expert_gate_up_ptrs.buf.as_ptr() as usize,
+                        live_down: live.expert_down_ptrs.buf.as_ptr() as usize,
+                        slot_owner: owners,
+                        dummy_gate_up: dummy.gate_up_base,
+                        dummy_down: dummy.down_base,
+                    };
+                    balanced.push(Some(Qwen4BalancedLayer {
+                        live,
+                        label: layer.layer,
+                        tables,
+                    }));
+                    ordinal += 1;
+                }
+            }
             Ok(())
         })();
         if let Err(error) = result {
             for layer in full {
                 let _ = layer.free_gpu(gpu);
             }
+            for layer in balanced.into_iter().flatten() {
+                let _ = layer.live.free_gpu(gpu);
+            }
+            if let Some(tensor) = slot_owner {
+                let _ = gpu.free_tensor(tensor);
+            }
             return Err(error);
         }
+        if balanced_on {
+            eprintln!(
+                "qwen4 EP rank {}/{}: balanced ownership on {} host-mapped MoE layers",
+                placement.rank,
+                placement.ranks,
+                balanced.iter().flatten().count()
+            );
+        }
         ep.moe_full = full;
+        ep.balanced = balanced;
+        ep.slot_owner = slot_owner;
         ep.gather = Some(gather);
         Ok(())
     }
@@ -5150,8 +5326,20 @@ impl Qwen4GpuForward {
                 }));
             }
 
-            let layer_moe = match ep {
-                Some(ep) if route_n > 1 && !ep_few_rows => ep.moe_full.get(layer_index),
+            // Balanced ownership: a host-mapped trunk layer of a gathered EP
+            // forward (one row, or few rows) binds its live runtime, whose
+            // tables the layer's owner assignment rewrites after routing.
+            // Every other layer keeps the static EP table (or the full table
+            // for chunk forwards). `ep.balanced` is empty unless the env
+            // lever was on at attach, so off binds exactly what it always did.
+            let balanced_live = ep
+                .filter(|_| ep_gathered)
+                .and_then(|ep| ep.balanced.get(layer_index))
+                .and_then(Option::as_ref)
+                .map(|balanced| &balanced.live);
+            let layer_moe = match (balanced_live, ep) {
+                (Some(live), _) => Some(live),
+                (None, Some(ep)) if route_n > 1 && !ep_few_rows => ep.moe_full.get(layer_index),
                 _ => self.moe.get(layer_index),
             };
             let mut description = layer_desc(
@@ -5161,7 +5349,8 @@ impl Qwen4GpuForward {
                 &config,
                 &self.decode_q8,
                 route_n,
-                expert_stage,
+                // Staged expert tables never replace the live table.
+                expert_stage.filter(|_| balanced_live.is_none()),
             )?;
             if let (Some(gather), Qwen4FfnBinding::Moe(binding)) =
                 (ep_gather, &mut description.ffn)

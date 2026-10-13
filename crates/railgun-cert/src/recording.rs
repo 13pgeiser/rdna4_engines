@@ -1279,6 +1279,7 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-dispatch/src/pipeline/layer_ops.rs", function: "execute_grouped_depthwise", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "hipfire-dispatch/src/pipeline/mod.rs", function: "dump_hidden_localize", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },
     Site { file: "hipfire-dispatch/src/pipeline/moe_program.rs", function: "absorbs_clear", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
+    Site { file: "hipfire-dispatch/src/pipeline/moe_program.rs", function: "owner_assign", occurrences: 4, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-dispatch/src/pipeline/moe_program.rs", function: "row_gather", occurrences: 4, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-dispatch/src/pipeline/sealed_moe.rs", function: "validate_for_gpu", occurrences: 1, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-generate/src/redline.rs", function: "redline_bench_decode_deepseek4", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },
