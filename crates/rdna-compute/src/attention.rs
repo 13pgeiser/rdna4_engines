@@ -24333,7 +24333,11 @@ mod tests {
 
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
-        flux_attn_route_name, gfx1100_q8_fa2_split_admitted, gfx1100_q8_fa2_split_partials_len, gfx1100_split_capture_assets_ready, kv_slot_paged_symbol, pack_attention_q8_0_fa2_gqa_gfx11_kernarg, q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported, q8_multirow_fail_closed_after_split_miss, replay_stable_tile_count,
+        flux_attn_route_name, gfx1100_q8_fa2_split_admitted, gfx1100_q8_fa2_split_partials_len,
+        gfx1100_split_capture_assets_ready, kv_slot_paged_symbol,
+        pack_attention_q8_0_fa2_gqa_gfx11_kernarg, q8_flash_default_tile_size,
+        q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported,
+        q8_multirow_fail_closed_after_split_miss, replay_stable_tile_count,
     };
     use crate::DType;
     use std::ffi::c_void;
