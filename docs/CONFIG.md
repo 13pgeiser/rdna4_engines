@@ -1078,7 +1078,7 @@ ranges are the schema's; every key also appears in the generated
 | `model.deepseek4_experts_per_token` | `null` | `null` or int 1–6; DeepSeek V4 routed experts per token (`null` keeps the checkpoint default). |
 | `hardware.deepseek4_compute_placement` | `"single"` | `single` or `dense-expert-split(dense=<selector>,experts=<selector>)` with two distinct device selectors. |
 | `serve.vmm_batch` | `false` | bool; route eligible concurrent requests through the VMM continuous-batching executor (per-request VMM KV, one resident target). Off keeps the VMM singleton route. Env `HIPFIRE_SERVE_VMM_BATCH`. |
-| `serve.continuous_batch_size` | `1` | int 1–128; maximum coexisting eligible batch lanes (`1` = sequential). Env `HIPFIRE_CONTINUOUS_BATCH_SIZE`. |
+| `serve.continuous_batch_size` | `1` | int 1–256; number of eligible concurrent batch lanes (`1` = sequential), subject to memory admission. The runtime batch width is dynamic: it follows the lanes in flight and is not fixed at this value, and the 128-row/63-token chunk sizes are not lane limits. Env `HIPFIRE_CONTINUOUS_BATCH_SIZE`; the `serve --continuous-batch-size` flag takes the same range. |
 | `serve.batch_spec` | `true` | bool; cross-request speculative verify rows on the VMM batch route (`false` disables batched speculation only). |
 | `serve.batch_nonexact` | `false` | bool; permit explicitly labeled non-bit-exact batched arithmetic on the VMM batch route. |
 | `serve.batch_sampled` | `true` | bool, applies only with `serve.vmm_batch`; admits sampled requests to the batch route only in the lane mode the singleton route selects for them. `false` keeps them on the serialized singleton route. |

@@ -200,7 +200,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | `--idle-timeout <s>` | Unload after idle seconds (`0` = never; max `86400`). |
 | `--no-prewarm` | Do not load the configured default model before accepting requests (lazy-load on first request). |
 | `--tp N` | Tensor/expert-parallel degree, `1..=64` (supported paths only). |
-| `--continuous-batch-size N` | Maximum concurrent eligible batched lanes, `1..=256` on the flag (`1` preserves sequential behavior); the `serve.continuous_batch_size` config key is bounded `1..=128`. Forwarded by `serve -d`. |
+| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, `1..=256` (`1` preserves sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits. Forwarded by `serve -d`. |
 | `--ui` | Serve the embedded chat UI at `/ui` on the serve listener. |
 | `--open` | Open the chat UI in the default browser once serving; implies `--ui`. With `-d` the browser launch happens in the launching process and the detached child only enables the route. |
 | `--vision <path>` | Vision-tower sidecar wired into every model load of this process. Skipped while `vision_mode=off` (default). **Foreground serve only:** `serve -d` does not forward it to the detached child, so set `HIPFIRE_VISION_SIDECAR` or the registry `vision` slot for a detached service. |

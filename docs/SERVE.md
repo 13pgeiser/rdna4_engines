@@ -86,7 +86,7 @@ environment variable.
 | `--spec <mode>` (alias `--speculation`) | Speculation mode for every load: `off`, `auto`, `ngram`, `dflash`, `mtp`, `dspark`; `off` disables MTP/DFlash |
 | `--idle-timeout <s>` | Idle model-unload timeout, 0..86400 s (`0` = never); overrides `serve.idle_timeout_seconds` |
 | `--tp N` | Tensor/expert-parallel degree (1..64) |
-| `--continuous-batch-size N` | Maximum concurrent eligible batched lanes, 1..256 on the flag (`1` keeps sequential behavior); the `serve.continuous_batch_size` config key is bounded 1..128 |
+| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, 1..256 (`1` keeps sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits |
 | `--vision <path>` | Vision-tower sidecar wired into every model load; overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Honored by foreground serve only: `-d` does not forward it to the child |
 | `--ui` | Serve the embedded chat UI (see below) |
 | `--open` | Open the chat UI in the default browser once serving; implies `--ui` |
