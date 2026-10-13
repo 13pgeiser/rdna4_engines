@@ -566,7 +566,7 @@ impl SessionCache {
         } else if let Some(resident) = &self.resident {
             restore_resident(gpu, state, route, resident)
         } else {
-            self.restore(gpu, state, route, &domain, &prompt[..reused])
+            self.restore(gpu, state, route, &domain, &prompt[..reused], prompt.len())
         };
         if let Err(error) = restored {
             let _ = state.reset(gpu);
@@ -629,7 +629,8 @@ impl SessionCache {
 
     /// Copy the snapshot of `prefix` and its ancestors into the live state,
     /// promoting disk links to the device (or staging them in temporary
-    /// buffers when the device tier has no room).
+    /// buffers when the device tier has no room). `end` is the length of the
+    /// prompt in flight, the context the state grows through.
     fn restore(
         &mut self,
         gpu: &mut Gpu,
@@ -637,6 +638,7 @@ impl SessionCache {
         route: SessionRoute,
         domain: &CacheDomain,
         prefix: &[u32],
+        end: usize,
     ) -> Result<(), String> {
         let missing = format!(
             "session cache: planned {}-token snapshot is no longer present",
@@ -666,7 +668,7 @@ impl SessionCache {
             }
         }
         keys.reverse();
-        let growth = state.growth_reserve_bytes(gpu);
+        let growth = state.growth_reserve_bytes(gpu, end);
         if let Some(disk) = &mut self.disk {
             for key in &keys {
                 if disk.contains(key) {
