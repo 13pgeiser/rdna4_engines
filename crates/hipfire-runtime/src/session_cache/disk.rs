@@ -130,22 +130,56 @@ fn decode_header(mut cur: &[u8]) -> Option<(Key, StoredSnapshot)> {
         1 => Some(take_key(cur)?),
         _ => return None,
     };
+    if parent
+        .as_ref()
+        .is_some_and(|p| p.0 != key.0 || p.1 >= key.1)
+    {
+        return None;
+    }
+    // Mirror super::layout, but reject overflow before its unchecked helpers
+    // can see data from disk.
+    let mut packed_bytes = 0usize;
+    let mut add_part = |bytes: usize| -> Option<()> {
+        packed_bytes = packed_bytes
+            .checked_next_multiple_of(super::PART_ALIGN)?
+            .checked_add(bytes)?;
+        Some(())
+    };
     let n_fixed = take_usize(cur)?;
+    if n_fixed > cur.len() / 8 {
+        return None;
+    }
     let fixed_bytes = (0..n_fixed)
-        .map(|_| take_usize(cur))
+        .map(|_| {
+            let bytes = take_usize(cur)?;
+            add_part(bytes)?;
+            Some(bytes)
+        })
         .collect::<Option<Vec<_>>>()?;
     let n_segments = take_usize(cur)?;
+    if n_segments > cur.len() / 24 {
+        return None;
+    }
     let segments = (0..n_segments)
         .map(|_| {
-            Some(Segment {
+            let segment = Segment {
                 row_bytes: take_usize(cur)?,
                 from: take_usize(cur)?,
                 to: take_usize(cur)?,
-            })
+            };
+            let bytes = segment
+                .to
+                .checked_sub(segment.from)?
+                .checked_mul(segment.row_bytes)?;
+            add_part(bytes)?;
+            Some(segment)
         })
         .collect::<Option<Vec<_>>>()?;
     let meta = take_bytes(cur)?.to_vec();
     let bytes = take_u64(cur)?;
+    if !cur.is_empty() || usize::try_from(bytes).ok()? != packed_bytes {
+        return None;
+    }
     let snapshot = StoredSnapshot {
         location: SnapshotLocation::Disk {
             path: PathBuf::new(),
@@ -207,7 +241,7 @@ fn scan(path: &Path, build: &[u8; 32]) -> Option<Scanned> {
     let mut header = vec![0u8; header_len as usize];
     file.read_exact(&mut header).ok()?;
     let (key, mut snapshot) = decode_header(&header)?;
-    if len != payload_offset(header_len) + snapshot.bytes {
+    if len != payload_offset(header_len).checked_add(snapshot.bytes)? {
         return None;
     }
     snapshot.location = SnapshotLocation::Disk {
@@ -599,4 +633,431 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve_contract::{
+        ArchPolicy, DeviceTopology, KvLayout, SharingNamespace, TemplateIdentity, TokenizerIdentity,
+    };
+
+    const BUILD: [u8; 32] = [17; 32];
+    const OTHER_BUILD: [u8; 32] = [23; 32];
+
+    fn domain() -> CacheDomain {
+        CacheDomain {
+            model_content_digest: vec![1],
+            model_load_epoch: 1,
+            sidecar_digests: vec![],
+            tokenizer: TokenizerIdentity {
+                vocab_digest: vec![2],
+                config_digest: vec![3],
+            },
+            template: TemplateIdentity {
+                template_digest: vec![4],
+                normalization_tag: "jinja".into(),
+            },
+            arch_policy: ArchPolicy {
+                arch_tag: "toy".into(),
+                state_abi_tag: String::new(),
+                position_attention_tag: String::new(),
+            },
+            kv_layout: KvLayout {
+                k_stride_bytes: vec![],
+                v_stride_bytes: vec![],
+                layout_tag: String::new(),
+            },
+            device: DeviceTopology {
+                device_id: "gpu-0".into(),
+                topology_id: "single".into(),
+                allocation_epoch: 1,
+            },
+            namespace: SharingNamespace {
+                domain_id: "default".into(),
+            },
+        }
+    }
+
+    fn key(p: u64) -> Key {
+        (domain(), p, p + 1)
+    }
+
+    fn snapshot(parent: Option<Key>) -> StoredSnapshot {
+        let fixed_bytes = vec![3, 256, 0];
+        let segments = vec![
+            Segment {
+                row_bytes: 16,
+                from: 0,
+                to: 2,
+            },
+            Segment {
+                row_bytes: 0,
+                from: 5,
+                to: 5,
+            },
+            Segment {
+                row_bytes: 7,
+                from: 1,
+                to: 4,
+            },
+        ];
+        let bytes = super::super::layout(
+            fixed_bytes
+                .iter()
+                .copied()
+                .chain(segments.iter().map(Segment::bytes)),
+        )
+        .1 as u64;
+        StoredSnapshot {
+            location: SnapshotLocation::Disk {
+                path: PathBuf::new(),
+                file_bytes: 0,
+            },
+            parent,
+            fixed_bytes,
+            segments,
+            meta: vec![0, 1, 255, 7],
+            bytes,
+        }
+    }
+
+    fn assert_snapshot_eq(actual: &StoredSnapshot, expected: &StoredSnapshot) {
+        assert_eq!(actual.parent, expected.parent);
+        assert_eq!(actual.fixed_bytes, expected.fixed_bytes);
+        assert!(actual.segments == expected.segments);
+        assert_eq!(actual.meta, expected.meta);
+        assert_eq!(actual.bytes, expected.bytes);
+        assert_eq!(actual.offsets(), expected.offsets());
+    }
+
+    // CPU-only file authoring: no DeviceBuffer, Gpu or HIP initialization.
+    fn write_header(path: &Path, build: &[u8; 32], header: &[u8]) -> File {
+        let mut file = File::create(path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(build).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file
+    }
+
+    fn write_snapshot(
+        dir: &Path,
+        build: &[u8; 32],
+        key: &Key,
+        snapshot: &StoredSnapshot,
+    ) -> PathBuf {
+        let path = dir.join(format!("{}.snap", file_stem(build, key)));
+        let header = encode_header(key, snapshot);
+        let mut file = write_header(&path, build, &header);
+        file.seek(SeekFrom::Start(payload_offset(header.len() as u64)))
+            .unwrap();
+        file.write_all(&vec![0x5a; snapshot.bytes as usize])
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn header_roundtrip_root_and_child() {
+        for parent in [None, Some(key(128))] {
+            let key = key(256);
+            let snapshot = snapshot(parent);
+            let encoded = encode_header(&key, &snapshot);
+            let (decoded_key, decoded) = decode_header(&encoded).unwrap();
+            assert_eq!(decoded_key, key);
+            assert_snapshot_eq(&decoded, &snapshot);
+            assert_eq!(encode_header(&decoded_key, &decoded), encoded);
+            match decoded.location {
+                SnapshotLocation::Disk { path, file_bytes } => {
+                    assert!(path.as_os_str().is_empty());
+                    assert_eq!(file_bytes, 0);
+                }
+                _ => panic!("decoded header must have a disk placeholder"),
+            }
+        }
+    }
+
+    #[test]
+    fn header_rejects_truncation_trailing_bytes_and_bad_tags() {
+        let key = key(256);
+        for parent in [None, Some(self::key(128))] {
+            let encoded = encode_header(&key, &snapshot(parent));
+            for end in 0..encoded.len() {
+                assert!(
+                    decode_header(&encoded[..end]).is_none(),
+                    "truncated at {end}"
+                );
+            }
+            let mut trailing = encoded;
+            trailing.push(0);
+            assert!(decode_header(&trailing).is_none());
+        }
+        let mut prefix = Vec::new();
+        put_key(&mut prefix, &key);
+        let parent_tag = prefix.len();
+        let mut bad_tag = encode_header(&key, &snapshot(None));
+        bad_tag[parent_tag] = 2;
+        assert!(decode_header(&bad_tag).is_none());
+        let mut bad_domain = Vec::new();
+        put_bytes(&mut bad_domain, b"not a canonical cache domain");
+        assert!(decode_header(&bad_domain).is_none());
+        assert!(decode_header(&u64::MAX.to_le_bytes()).is_none());
+    }
+
+    #[test]
+    fn header_rejects_unbounded_counts() {
+        for count in [u64::MAX, MAX_HEADER] {
+            let mut fixed = Vec::new();
+            put_key(&mut fixed, &key(128));
+            fixed.push(0);
+            put_u64(&mut fixed, count);
+            assert!(decode_header(&fixed).is_none());
+            let mut segments = Vec::new();
+            put_key(&mut segments, &key(128));
+            segments.push(0);
+            put_u64(&mut segments, 0);
+            put_u64(&mut segments, count);
+            assert!(decode_header(&segments).is_none());
+        }
+    }
+
+    #[test]
+    fn header_rejects_invalid_segments_and_layout_overflow() {
+        let key = key(128);
+        for segment in [
+            Segment {
+                row_bytes: 1,
+                from: 2,
+                to: 1,
+            },
+            Segment {
+                row_bytes: usize::MAX,
+                from: 0,
+                to: 2,
+            },
+        ] {
+            let mut snapshot = snapshot(None);
+            snapshot.fixed_bytes.clear();
+            snapshot.segments = vec![segment];
+            snapshot.bytes = 0;
+            assert!(decode_header(&encode_header(&key, &snapshot)).is_none());
+        }
+        // Overflow in alignment, addition, and fixed-to-segment alignment.
+        for (fixed, segments) in [
+            (vec![usize::MAX, 0], vec![]),
+            (
+                vec![usize::MAX - (super::super::PART_ALIGN - 1), 256],
+                vec![],
+            ),
+            (
+                vec![usize::MAX],
+                vec![Segment {
+                    row_bytes: 0,
+                    from: 0,
+                    to: 0,
+                }],
+            ),
+        ] {
+            let mut snapshot = snapshot(None);
+            snapshot.fixed_bytes = fixed;
+            snapshot.segments = segments;
+            snapshot.bytes = 0;
+            assert!(decode_header(&encode_header(&key, &snapshot)).is_none());
+        }
+    }
+
+    #[test]
+    fn header_rejects_size_mismatch_and_invalid_parent() {
+        let key = key(256);
+        let mut wrong_size = snapshot(None);
+        wrong_size.bytes += 1;
+        assert!(decode_header(&encode_header(&key, &wrong_size)).is_none());
+        wrong_size.bytes = u64::MAX;
+        assert!(decode_header(&encode_header(&key, &wrong_size)).is_none());
+        let mut foreign_domain = domain();
+        foreign_domain.namespace.domain_id = "another namespace".into();
+        for parent in [key.clone(), self::key(512), (foreign_domain, 128, 129)] {
+            assert!(decode_header(&encode_header(&key, &snapshot(Some(parent)))).is_none());
+        }
+    }
+
+    #[test]
+    fn scan_rejects_payload_size_and_offset_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = key(128);
+        let snapshot = snapshot(None);
+        let path = write_snapshot(dir.path(), &BUILD, &key, &snapshot);
+        let len = fs::metadata(&path).unwrap().len();
+        let file = File::options().write(true).open(&path).unwrap();
+        for invalid_len in [len - 1, len + 1] {
+            file.set_len(invalid_len).unwrap();
+            assert!(scan(&path, &BUILD).is_none());
+        }
+        let mut huge = self::snapshot(None);
+        huge.fixed_bytes = vec![usize::MAX];
+        huge.segments.clear();
+        huge.bytes = usize::MAX as u64;
+        let header = encode_header(&key, &huge);
+        // A single maximal part is a valid layout, but cannot be a file on
+        // 64-bit targets once its nonzero payload offset is included.
+        assert!(decode_header(&header).is_some());
+        drop(write_header(&path, &BUILD, &header));
+        assert!(scan(&path, &BUILD).is_none());
+    }
+
+    #[test]
+    fn startup_indexes_valid_files_and_cleans_malformed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = key(128);
+        let child = key(256);
+        let root_snapshot = snapshot(None);
+        let child_snapshot = snapshot(Some(root.clone()));
+        let root_path = write_snapshot(dir.path(), &BUILD, &root, &root_snapshot);
+        let child_path = write_snapshot(dir.path(), &BUILD, &child, &child_snapshot);
+        let bad_magic = dir.path().join("bad-magic.snap");
+        fs::write(&bad_magic, b"not a snapshot").unwrap();
+        let trailing = dir.path().join("trailing.snap");
+        let mut header = encode_header(&key(512), &snapshot(None));
+        header.push(0);
+        drop(write_header(&trailing, &BUILD, &header));
+        let oversized = dir.path().join("oversized.snap");
+        let mut file = write_header(&oversized, &BUILD, &[]);
+        file.seek(SeekFrom::Start(40)).unwrap();
+        file.write_all(&(MAX_HEADER + 1).to_le_bytes()).unwrap();
+        drop(file);
+        let truncated = dir.path().join("truncated.snap");
+        drop(write_header(
+            &truncated,
+            &BUILD,
+            &encode_header(&key(512), &snapshot(None)),
+        ));
+        let temporary = dir.path().join("interrupted.tmp");
+        fs::write(&temporary, b"unfinished").unwrap();
+        let unrelated = dir.path().join("keep.txt");
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        let tier = DiskTier::open(dir.path(), u64::MAX, BUILD).unwrap();
+        assert!(tier.contains(&root));
+        assert!(tier.contains(&child));
+        assert_snapshot_eq(tier.peek(&root).unwrap(), &root_snapshot);
+        assert_snapshot_eq(tier.peek(&child).unwrap(), &child_snapshot);
+        assert_eq!(tier.kids.get(&root), Some(&vec![child.clone()]));
+        let total =
+            fs::metadata(&root_path).unwrap().len() + fs::metadata(&child_path).unwrap().len();
+        assert_eq!(tier.pool.total_bytes(), total);
+        assert_eq!(tier.foreign_files(), 0);
+        assert!(tier.staging.is_empty());
+        for path in [bad_magic, trailing, oversized, truncated, temporary] {
+            assert!(!path.exists(), "not cleaned: {}", path.display());
+        }
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn startup_isolates_other_builds_and_reopens_after_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = key(128);
+        let child = key(256);
+        let root_path = write_snapshot(dir.path(), &BUILD, &root, &snapshot(None));
+        let child_path = write_snapshot(dir.path(), &BUILD, &child, &snapshot(Some(root.clone())));
+        let tier = DiskTier::open(dir.path(), u64::MAX, OTHER_BUILD).unwrap();
+        assert!(!tier.contains(&root));
+        assert!(!tier.contains(&child));
+        assert_eq!(tier.pool.total_bytes(), 0);
+        assert_eq!(tier.foreign_files(), 2);
+        assert_eq!(
+            tier.foreign_bytes,
+            fs::metadata(&root_path).unwrap().len() + fs::metadata(&child_path).unwrap().len()
+        );
+        drop(tier);
+        let tier = DiskTier::open(dir.path(), u64::MAX, BUILD).unwrap();
+        assert!(tier.contains(&root));
+        assert!(tier.contains(&child));
+        assert_eq!(tier.foreign_files(), 0);
+        let mut file = File::open(&child_path).unwrap();
+        let offset = payload_offset(encode_header(&child, &snapshot(Some(root))).len() as u64);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut payload = Vec::new();
+        file.read_to_end(&mut payload).unwrap();
+        assert_eq!(
+            payload,
+            vec![0x5a; tier.peek(&child).unwrap().bytes as usize]
+        );
+    }
+
+    #[test]
+    fn startup_removes_orphans_and_their_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = key(128);
+        let orphan = key(256);
+        let descendant = key(512);
+        let root = key(1024);
+        let orphan_path = write_snapshot(
+            dir.path(),
+            &BUILD,
+            &orphan,
+            &snapshot(Some(missing.clone())),
+        );
+        let descendant_path = write_snapshot(
+            dir.path(),
+            &BUILD,
+            &descendant,
+            &snapshot(Some(orphan.clone())),
+        );
+        let foreign_path = write_snapshot(dir.path(), &OTHER_BUILD, &missing, &snapshot(None));
+        let root_path = write_snapshot(dir.path(), &BUILD, &root, &snapshot(None));
+        let tier = DiskTier::open(dir.path(), u64::MAX, BUILD).unwrap();
+        assert!(!tier.contains(&missing));
+        assert!(!tier.contains(&orphan));
+        assert!(!tier.contains(&descendant));
+        assert!(!orphan_path.exists());
+        assert!(!descendant_path.exists());
+        assert!(tier.contains(&root));
+        assert!(root_path.exists());
+        assert!(foreign_path.exists());
+        assert_eq!(tier.foreign_files(), 1);
+        assert!(tier.kids.is_empty());
+    }
+
+    #[test]
+    fn directory_lock_refuses_concurrent_open_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = key(128);
+        write_snapshot(dir.path(), &BUILD, &root, &snapshot(None));
+        let tier = DiskTier::open(dir.path(), u64::MAX, BUILD).unwrap();
+        let path = dir.path().to_path_buf();
+        let error = std::thread::spawn(move || {
+            DiskTier::open(&path, u64::MAX, BUILD)
+                .err()
+                .expect("second open must fail")
+        })
+        .join()
+        .unwrap();
+        assert!(error.contains("locked by another process"), "{error}");
+        drop(tier);
+        let reopened = DiskTier::open(dir.path(), u64::MAX, BUILD).unwrap();
+        assert!(reopened.contains(&root));
+    }
+
+    #[test]
+    fn startup_budget_counts_file_padding_and_evicts_foreign_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = key(128);
+        let current = write_snapshot(dir.path(), &BUILD, &root, &snapshot(None));
+        let foreign = write_snapshot(dir.path(), &OTHER_BUILD, &key(256), &snapshot(None));
+        let file_bytes = fs::metadata(&current).unwrap().len();
+        let tier = DiskTier::open(dir.path(), file_bytes, BUILD).unwrap();
+        assert!(tier.contains(&root));
+        assert_eq!(tier.pool.total_bytes(), file_bytes);
+        assert_eq!(tier.foreign_files(), 0);
+        assert_eq!(tier.foreign_bytes, 0);
+        assert!(!foreign.exists());
+        assert!(current.exists());
+        drop(tier);
+        let tier = DiskTier::open(dir.path(), file_bytes - 1, BUILD).unwrap();
+        assert!(!tier.contains(&root));
+        assert_eq!(tier.pool.total_bytes(), 0);
+        assert!(!current.exists());
+    }
 }
