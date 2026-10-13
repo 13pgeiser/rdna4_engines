@@ -2183,12 +2183,16 @@ static __device__ __forceinline__ void gated_delta_params_flat_arena(
     const int head = flat % heads;
     const float al = bf16_to_f32(a_log[head]);
     const float dt = bf16_to_f32(dt_bias[head]);
-    const float value = bf16_to_f32(a[(size_t)(flat / heads) * a_pitch + a_col0 + head]) + dt;
+    const float av = a_pitch ? bf16_to_f32(a[(size_t)(flat / heads) * a_pitch + a_col0 + head])
+        : bf16_to_f32(bf16_round(((const float*)a)[flat]));
+    const float bv = b_pitch ? bf16_to_f32(b[(size_t)(flat / heads) * b_pitch + b_col0 + head])
+        : bf16_to_f32(bf16_round(((const float*)b)[flat]));
+    const float value = av + dt;
     const float softplus = value > 20.0f
         ? value
         : (value < -20.0f ? expf(value) : log1pf(expf(value)));
     gate[flat] = -expf(al) * softplus;
-    beta[flat] = 1.0f / (1.0f + expf(-bf16_to_f32(b[(size_t)(flat / heads) * b_pitch + b_col0 + head])));
+    beta[flat] = 1.0f / (1.0f + expf(-bv));
 }
 #endif
 
@@ -2248,7 +2252,7 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
         if (input_bf16) {
             __hip_bfloat16 b;
 #ifdef NPU_TRUNK_ARENA
-            b.data = ((const unsigned short*)input)[(size_t)j * input_pitch + input_col0 + channel];
+            b.data = ((const unsigned short*)input)[input_pitch ? (size_t)j * input_pitch + input_col0 + channel : j * channels + channel];
 #else
             b.data = ((const unsigned short*)input)[j * channels + channel];
 #endif
@@ -2421,7 +2425,7 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
         auto in4 = [&](int j, __hip_bfloat16 (&o)[4]) {
             if (input_bf16) {
 #ifdef NPU_TRUNK_ARENA
-                const uint2 w = *(const uint2*)(in_u16 + (size_t)j * input_pitch + input_col0 + c0);
+                const uint2 w = *(const uint2*)(in_u16 + (input_pitch ? (size_t)j * input_pitch + input_col0 + c0 : (size_t)j * channels + c0));
 #else
                 const uint2 w = *(const uint2*)(in_u16 + (size_t)j * channels + c0);
 #endif
@@ -2520,7 +2524,7 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
         if (input_bf16) {
             __hip_bfloat16 b;
 #ifdef NPU_TRUNK_ARENA
-            b.data = ((const unsigned short*)input)[(size_t)j * input_pitch + input_col0 + channel];
+            b.data = ((const unsigned short*)input)[input_pitch ? (size_t)j * input_pitch + input_col0 + channel : j * channels + channel];
 #else
             b.data = ((const unsigned short*)input)[j * channels + channel];
 #endif

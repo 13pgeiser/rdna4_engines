@@ -48,12 +48,12 @@ fn arena_launch(gpu: &mut Gpu, name: &str, grid: [u32;3], threads: u32, args: &m
 }
 
 pub fn gated_delta_conv_batched_arena(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>, src: Bf16Arena<'_>) -> HipResult<()> {
-    conv_arena(gpu, p, None, None, src)
+    conv_arena(gpu, p, None, None, Some(src))
 }
 /// Fused-convolution API with direct arena parameters; no materialization.
 pub fn gated_delta_conv_params_batched_arena(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>,
     params: &GatedDeltaParamsBatched<'_>, src: Bf16Arena<'_>, a: Bf16Arena<'_>, b: Bf16Arena<'_>) -> HipResult<()> {
-    conv_arena(gpu, p, Some((params, a, b)), None, src)
+    conv_arena(gpu, p, Some((params, Some(a), Some(b))), None, Some(src))
 }
 pub fn gated_delta_conv_params_qknorm_batched_arena(gpu: &mut Gpu, conv: &GatedDeltaConvBatched<'_>,
     params: &GatedDeltaParamsBatched<'_>, step: &GatedDeltaStepBatched<'_>, keep_qk_conv: bool,
@@ -63,18 +63,58 @@ pub fn gated_delta_conv_params_qknorm_batched_arena(gpu: &mut Gpu, conv: &GatedD
     let scratch = gpu.qwen4_f16_x_scratch(2 * step.rows * qk)?;
     let qn = scratch.buf.as_ptr();
     let kn = unsafe { (qn as *mut u8).add(step.rows * qk * 2) } as *mut std::ffi::c_void;
+    conv_arena(gpu, conv, Some((params, Some(a), Some(b))), Some(ConvQkNorm { qn, kn, keep_qk_conv }), Some(src))
+}
+
+/// Each absent source retains its native projection dtype and layout.
+pub fn gated_delta_conv_params_batched_mixed(gpu: &mut Gpu, conv: &GatedDeltaConvBatched<'_>,
+    params: &GatedDeltaParamsBatched<'_>, src: Option<Bf16Arena<'_>>, a: Option<Bf16Arena<'_>>, b: Option<Bf16Arena<'_>>) -> HipResult<()> {
+    conv_arena(gpu, conv, Some((params, a, b)), None, src)
+}
+pub fn gated_delta_conv_params_qknorm_batched_mixed(gpu: &mut Gpu, conv: &GatedDeltaConvBatched<'_>,
+    params: &GatedDeltaParamsBatched<'_>, step: &GatedDeltaStepBatched<'_>, keep_qk_conv: bool,
+    src: Option<Bf16Arena<'_>>, a: Option<Bf16Arena<'_>>, b: Option<Bf16Arena<'_>>) -> HipResult<()> {
+    if !gated_delta_conv_qknorm_geometry(gpu, step, conv) { return Err(HipError::new(0, "invalid arena qknorm geometry")); }
+    let qk = checked_product(step.key_heads, step.key_dim, "arena qknorm")?;
+    let scratch = gpu.qwen4_f16_x_scratch(2 * step.rows * qk)?;
+    let qn = scratch.buf.as_ptr();
+    let kn = unsafe { (qn as *mut u8).add(step.rows * qk * 2) } as *mut std::ffi::c_void;
     conv_arena(gpu, conv, Some((params, a, b)), Some(ConvQkNorm { qn, kn, keep_qk_conv }), src)
 }
 
+fn mixed_source<'a>(src: Option<Bf16Arena<'a>>, native: &'a GpuTensor, rows: usize, cols: usize) -> HipResult<&'a GpuTensor> {
+    if let Some(src) = src { src.validate(rows, cols)?; Ok(src.tensor) }
+    else {
+        if native.dtype != DType::F32 && native.dtype != DType::BF16 {
+            return Err(HipError::new(0, "mixed source needs native F32/BF16"));
+        }
+        if native.numel() < rows * cols { return Err(HipError::new(0, "undersized native source")); }
+        Ok(native)
+    }
+}
+fn mixed_args(src: Option<Bf16Arena<'_>>, args: &mut KernargBlob) -> HipResult<()> {
+    if let Some(src) = src { src.args(args) } else { args.push_i32(0); args.push_i32(0); Ok(()) }
+}
 
 fn conv_arena(
     gpu: &mut Gpu,
     p: &GatedDeltaConvBatched<'_>,
-    params: Option<(&GatedDeltaParamsBatched<'_>, Bf16Arena<'_>, Bf16Arena<'_>)>,
+    params: Option<(&GatedDeltaParamsBatched<'_>, Option<Bf16Arena<'_>>, Option<Bf16Arena<'_>>)>,
     qk_norm: Option<ConvQkNorm>,
-    src: Bf16Arena<'_>,
+    src: Option<Bf16Arena<'_>>,
 ) -> HipResult<()> {
-    if let Some((q, a, b)) = params { validate_arena_params(q, a, b)?; }
+    if let Some((q, a, b)) = params {
+        mixed_source(a, q.a, q.rows, q.heads)?; mixed_source(b, q.b, q.rows, q.heads)?;
+        if a.is_none() { ensure_f32(q.a)?; }
+        if b.is_none() { ensure_f32(q.b)?; }
+        for t in [q.gate, q.beta] {
+            ensure_f32(t)?;
+            if t.numel() != q.rows * q.heads { return Err(HipError::new(0, "parameter output shape")); }
+        }
+        for t in [q.a_log, q.dt_bias] {
+            if t.dtype != DType::BF16 || t.numel() != q.heads { return Err(HipError::new(0, "parameter weight shape")); }
+        }
+    }
     for tensor in [p.history, p.next_history] {
         ensure_f32(tensor)?;
     }
@@ -83,11 +123,11 @@ fn conv_arena(
     if !output_bf16 {
         ensure_f32(p.output)?;
     }
-    src.validate(p.rows, p.channels)?;
-    if qk_norm.is_some() && (src.row_pitch_elems % 4 != 0 || src.col0_elems % 4 != 0 || src.tensor.buf.as_ptr() as usize % 8 != 0) {
+    let input = mixed_source(src, p.input, p.rows, p.channels)?;
+    let input_bf16 = src.is_some() || p.input.dtype == DType::BF16;
+    if qk_norm.is_some() && src.is_some_and(|s| s.row_pitch_elems % 4 != 0 || s.col0_elems % 4 != 0 || s.tensor.buf.as_ptr() as usize % 8 != 0) {
         return Err(HipError::new(0, "arena qknorm input must be 8-byte aligned"));
     }
-    let input_bf16 = true;
     if p.kernel.dtype != DType::BF16
         || p.rows == 0
         || p.channels == 0
@@ -126,7 +166,7 @@ fn conv_arena(
     };
     gpu.ensure_kernel_public("npu_trunk_consumers", ARENA_SRC, kernel)?;
     let mut args = KernargBlob::new();
-    for tensor in [src.tensor, p.kernel, p.history, p.output, p.next_history] {
+    for tensor in [input, p.kernel, p.history, p.output, p.next_history] {
         args.push_ptr(tensor.buf.as_ptr());
     }
     args.push_i32(rows);
@@ -141,7 +181,7 @@ fn conv_arena(
     args.push_i32(i32::from(input_bf16));
     let (param_elements, param_heads) = match params {
         Some((q, a, b)) => {
-            for tensor in [a.tensor, b.tensor, q.a_log, q.dt_bias, q.gate, q.beta] {
+            for tensor in [a.map_or(q.a, |s| s.tensor), b.map_or(q.b, |s| s.tensor), q.a_log, q.dt_bias, q.gate, q.beta] {
                 args.push_ptr(tensor.buf.as_ptr());
             }
             (q.rows * q.heads, q.heads)
@@ -159,9 +199,9 @@ fn conv_arena(
         args.push_ptr(norm.qn);
         args.push_ptr(norm.kn);
     }
-    src.args(&mut args)?;
+    mixed_args(src, &mut args)?;
     if let Some((_, a, b)) = params {
-        a.args(&mut args)?; b.args(&mut args)?;
+        mixed_args(a, &mut args)?; mixed_args(b, &mut args)?;
     } else {
         for _ in 0..4 { args.push_i32(0); }
     }

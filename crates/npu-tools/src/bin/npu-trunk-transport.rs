@@ -50,7 +50,7 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
         let scales: Vec<_> = (0..N).map(|n| if panel * N + n < live { sm(panel, n) } else { (0, 0) }).collect();
         panels.push(gemm_g80::pack_b_bf16(&design, &b, &scales));
     }
-    let program = PanelProgram { shape, pdi: design.pdi.clone(), txn: design.insts.clone(), padded_rows: ROWS };
+    let program = PanelProgram { shape, pdi: design.pdi.clone(), txn: design.insts.clone(), padded_rows: ROWS, pitch: shape.pitch() };
     let runtime = at(None, "open-transport", NpuTrunkRuntime::open(vec![program], vec![LayerPanels { layer: 0, shape, panels }], 2, ROWS, pci))?;
     let outcome = (|| {
         let hip = runtime.hip();
@@ -207,7 +207,7 @@ fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Res
     // production watchdog cancellation, not an environment-dependent test shim.
     let panels = (0..shape.panels()).map(|_| vec![0; layout.b_bytes]).collect();
     let runtime = at(None, "negative-timeout-open", NpuTrunkRuntime::open_with_watchdog(
-        vec![PanelProgram { shape, pdi, txn, padded_rows: ROWS }],
+        vec![PanelProgram { shape, pdi, txn, padded_rows: ROWS, pitch: shape.pitch() }],
         vec![LayerPanels { layer: 0, shape, panels }], 1, ROWS, pci, Duration::from_nanos(1)))?;
     let outcome = (|| {
         let hip = runtime.hip();

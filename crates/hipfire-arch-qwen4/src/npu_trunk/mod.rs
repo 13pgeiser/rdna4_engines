@@ -11,7 +11,7 @@ mod programs;
 mod shapes;
 
 pub(crate) use packing::pack_matrix_direct;
-pub(crate) use programs::build_rowmajor_programs;
+pub(crate) use programs::build_rowmajor_programs_for_families;
 
 pub use calibration::{
     CalKey, Calibration, ContentionCalibration, DeviceKey, FamilyCalibration, GlueCalibration,

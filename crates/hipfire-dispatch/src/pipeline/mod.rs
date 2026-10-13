@@ -41,6 +41,7 @@ pub use layer_ops::{
     HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
     IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
     execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
+    execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered,
 };
 pub use steps::{
     execute_steps, execute_validated_steps, execute_validated_steps_with_moe_hooks,

@@ -51,9 +51,11 @@ Each shape record reports panel count, padded width, per-submit A/B/C argument
 sizes and per-submit host bytes read/written. The designs include PDI and TXN
 bytes; panels reuse their shape's design.
 
-`build_rowmajor_programs(rows_max)` builds full-family BF16-direct designs with
-col0=0 and fused pitches 16640/14080. Arg2 declares the complete fused arena;
-each retained panel command advances its C base by `2*panel*1280` bytes.
+`build_rowmajor_programs_for_families(rows_max, mask)` builds BF16-direct designs
+with col0=0 and the selected map's padded fused pitch. qkv-only GdnIn is exactly
+8 panels / pitch 10240. Zero-panel shapes are never submitted or given GPU views.
+Arg2 declares the compact fused arena; each retained panel command advances its
+C base by `2*panel*1280` bytes.
 
 ## CPU checks
 
@@ -417,15 +419,16 @@ packing, new allocations, device opens, trace opens or new logging.
 | Mode | Calibration missing/invalid/key mismatch | Match: all selected | Match: subset/none |
 | --- | --- | --- | --- |
 | `off` | No I/O | GPU-only | GPU-only |
-| `auto` | Route off, one reason line | Admit stored plan | Route off, subset/none reason |
-| `on` | `calibration=none (forced)` | Log selection; force all families | Log selection; force all families |
+| `auto` | Route off, one reason line | Admit stored plan | Admit subset plan; none stays native |
+| `on` | `calibration=none (forced)`, ALL | Use selected families; force pairs | Use subset; none stays native |
 | `emulate` | Same as `on`, GPU twin | Same as `on`, GPU twin | Same as `on`, GPU twin |
 
 An auto key mismatch logs exactly `npu-trunk: off (calibration key mismatch: <field>)`.
 Matching records log `load_log_line` with selection, key/hash, crossover and
-predicted 16K/64K times. Subset execution is not implemented in 0.4.2.
+predicted 16K/64K times. Packing, twin, row-major programs, C arenas and request
+planning all use that same selected mask. Without a match, forced modes use ALL.
 Auto derives n* once at load. Each request's uncached prompt segment runs
-`plan(cal, ALL, rows)` and logs `request_log_line` once. Only natural planned
+`plan(cal, selected, rows)` and logs `request_log_line` once. Only natural planned
 8192+B pairs, with B >= `max(512, cal.gpu.min_bank_rows)`, execute above n*.
 Split/rebalanced/rebanked ranges are projected to ordinary GPU chunks, never
 force-paired. The logged executable projection reflects those restrictions;
@@ -515,11 +518,11 @@ Only paired banks use BF16-direct numerics: `on`/`auto` consume NPU results, whi
 Unpaired chunks/tails, rows below 512, decode and uncovered paths retain the
 incumbent GPU projections in **both** modes: z/a/b take the same A4/IU4 overlay
 route as `off` wherever that native route applies. No paired input projection
-is computed twice. Both covered executors call the mixer only with `Core` and
-`OutProj`; GDN's `Whole|InProj` guard encloses the entire `project_trunk` call,
-before dtype or `trunk_a4` selection, so it skips A4/IU4 **and** MQ6. A debug
-assertion checks every covered mixer dispatch, with a CPU phase-decision test.
-Uncovered steps retain `Whole` and the unchanged beta IU4 mask/dispatch.
+is computed twice: `project_trunk_masked` starts covered families as completed,
+then runs only uncovered families through the existing MQ6/A4/IU4 dispatch
+and native scratch, in each bank's GPU fragment before Core. The debug assertion
+is per family, in addition to the Core/OutProj phase assertion.
+Shapes with no selected families keep Whole/native execution in both banks.
 Under `on` the GPU packs A, then the mixer core directly reads read-only BF16
 `Bf16Arena` views of fused C; **there is no consume/retile pass**. Explicit
 `GdnTrunkArenas`/`QsaTrunkArenas` arguments select arena launchers only for
@@ -527,26 +530,91 @@ Under `on` the GPU packs A, then the mixer core directly reads read-only BF16
 keeps the IU8 twin and its native projection scratch. Out-projections and
 GPU recurrence/attention/HC/MoE remain native.
 
+Each arena family is `Option<Bf16Arena>`: GDN's fused convolution/parameter
+consumer independently reads qkv from its arena or native BF16/F32 projection,
+and a/b from their arenas or native F32 scratch. A zero pitch in the opt-in
+kernel ABI denotes contiguous F32 scratch, with the incumbent parameter-core
+BF16 rounding. Z selects the existing
+native gate/chunk kernel when absent. QSA selects native norm/RoPE, index append
+and V cache append per absent family. Emulate scatters only covered twin outputs
+to native scratch, runs the identical uncovered projection dispatcher, and
+executes the incumbent core; arena readers preserve the same BF16 numeric values.
+Calibration selection still groups zab and kvidx because costs are measured
+per group; dispatch and column maps support independent family views.
+
 ### Bank state and ordering
 
 `on` requires the full 8192-row scratch plan and single-device placement.
-It allocates a second complete scratch bank only at load. This deliberately
-conservative lab allocation double-buffers:
+Bank B is a load-time view of bank A's layer-local buffers, with only the
+three persistent fields allocated privately. Bank A's ownership/capacities
+and all `off` allocations remain unchanged.
 
-* token IDs, rotated embeddings, embeddings, **HC residual streams**;
-* HC normalized/low/up/mixed/gates, activation rotation and hidden input;
-* projection/projection2, GDN a/b/gate/beta/recurrent-output/BF16/z/output;
-* QSA index/qgate/k/v/output/selected, attention output;
-* PLE staged/rows/key/value/query/gated/normed/output;
-* router logits, all routed/shared MoE intermediates, grouped permutation,
-  count/offset/tile/gather/down scratch, FFN output, scalar and logits scratch.
+| Bank-B fields | Storage | Why |
+| --- | --- | --- |
+| `streams` | Private | HC residual rows persist through every layer and final capture/head; B must not overwrite A's rows. |
+| `hc_mixed` | Private | Prepared mixer input survives the other bank's prepare/fragment. Uncovered native projections also read it in Core. |
+| `ple_rows` | Private | Initialized token-dependent PLE input survives until its layer's prepare. |
+| `token_ids`, `embedding_rot`, `embeddings`, `ple_staged` | Shared | Each bank's initialization consumes these completely before the next initialization on the same stream. MTP uploads its own prompt IDs. |
+| `hc_normalized`, `hc_low`, `hc_up`, `rotation`, `gdn_bf16` | Shared | Each prepare/fragment/head consumes its own values before returning; no value is handed across their boundaries. |
+| `hc_gates` | Shared | Prepare ends before the mixer, so its HC read cannot fuse with the later HC write. That write computes its gates; MLP HC read/write fusions remain entirely inside one fragment. |
+| `projection`, `projection2`, `gdn_a`, `gdn_b`, `gdn_gate`, `gdn_beta`, `gdn_recurrent_output`, `gdn_z`, `gdn_output` | Shared | Native uncovered projections, GDN Core and OutProj finish every use inside G(l,bank). |
+| `qsa_index`, `qsa_qgate`, `qsa_k`, `qsa_v`, `qsa_output`, `qsa_selected`, `attention_output` | Shared | QSA transform/cache/index/attention and the attention HC write finish inside the fragment. |
+| `ple_key`, `ple_value`, `ple_query`, `ple_gated`, `ple_normed`, `ple_output` | Shared | The PLE prepare consumes these before the bank switch. `ple_normed` is retained for ordinary verify rollback, not prompt pairs; pair snapshots copy fixed convolution state instead. |
+| `router_logits`, `moe_x_rot`, `moe_gate_up`, `moe_gate`, `moe_up`, `moe_hidden`, `ffn_output`, `moe_shared_output`, `moe_gate_batch`, `moe_up_batch`, `moe_rot_batch`, `moe_topk_indices`, `moe_topk_weights`, `moe_down_expanded`, `moe_scalar`, `moe_expert_token_counts`, `moe_expert_offsets`, `moe_sorted_slot_index`, `moe_expert_tile_ids`, `moe_inverse_perm`, `moe_y_gate_up_grouped`, `moe_y_down_grouped` | Shared | Routing, shared/routed expert work, permutation/gather/combine and the FFN HC write finish before the next fragment. |
+| `logits` | Shared | Head scratch is reused only after the preceding bank's head has consumed it. Requested logits/capture rows live in separate caller-owned outputs. |
 
-The GDN recurrence/convolution, QSA KV/index caches and PLE convolution state
-are deliberately shared, not double-buffered. No MoE scratch must survive a
-layer boundary, but the complete second bank avoids any scratch alias lifetime
-assumption. Opt-in execution uses mapped experts, not donor-layer staging.
-The private NPU owner transfers as one exclusive object with `ArchModel`;
-none of railgun's internal HIP Rc resources escapes that owner.
+The same-stream order is the sharing contract, not host launch completion.
+`pack(l+1,A)` is queued before `G(l,B)`; its source `hc_mixed` is private.
+Rotation's temporary F16 input is consumed by that pack before any subsequent
+GPU rotation overwrites it. NPU DMA reads only its separately registered,
+bank-private A arena, never the shared GPU layer intermediates.
+Capture/MTP copies each bank's private `streams` into its own output row range
+after both trunks finish. GDN recurrence/convolution, QSA KV/index caches and
+PLE convolution state remain shared model state: B observes A's ordered updates.
+Opt-in execution uses mapped experts, not donor-layer staging.
+The private NPU owner closes the runtime and frees bank B before bank A;
+borrowed fields are never freed by B. None of railgun's internal HIP Rc
+resources escapes the exclusive owner.
+
+### Load footprint
+
+Only `emulate` uploads the row-major W8 twin and its weight Sm/Se scales,
+or allocates its packed-A and I32 `sums` buffers. Physical `on`/admitted `auto`
+retain NPU panels instead; tails, unpaired chunks and uncovered projections
+use the native GPU route. Two compact activation sidecar buffers (32 KiB
+each at 8192 rows) remain required by the GPU A-pack producer in both modes;
+they are not the twin's weight scales.
+The load log reports `resident_bytes=npu_panels_bytes+gpu_twin_bytes` for
+resident weights, plus `bank_b_bytes` for the new private scratch allocation.
+
+The Flash-Next **full-family baseline**, at 8192 rows (36 GDN, 12 QSA), saves:
+
+| Removed allocation | Bytes |
+| --- | ---: |
+| Bank-B layer-local scratch (`Full` plan 8,957,998,980 minus private 503,316,480) | 8,454,682,500 |
+| GPU W8 twin (`(36*16640+12*14080)*2560`) | 1,966,080,000 |
+| Twin weight Sm/Se (`(36*16640+12*14080)*4`) | 3,072,000 |
+| Twin I32 sums (`8192*16640*4`) | 545,259,520 |
+| Twin packed A (`4*32*40*4608`) | 23,592,960 |
+| **Total** | **10,992,686,980 (10.237738 GiB)** |
+
+The twin-only subtotal is 2,538,004,480 bytes (2.363701 GiB); bank-B sharing
+saves 7.874037 GiB and leaves 480 MiB private. Subset panel/twin savings are
+additional and mask-dependent; the log reflects the actual selected mask.
+These are allocation-plan bytes, not a fresh measurement of GTT residency.
+CPU tests `npu_bank_sharing_covers_every_field_and_never_crosses_a_bank_switch`
+and `npu_private_bank_bytes_are_pinned_at_full_and_partial_rows` enumerate all
+58 fields, check produced-value lifetimes against the actual A/B event order,
+and pin private bytes for 8192, 8151 and 512 rows.
+
+Sharing is unsafe if a future change spans a prepare/mixer boundary with an
+HC fusion, stages projections before the other bank's fragment, adds a
+cross-bank stream, or retains a layer-local value for later capture/rollback.
+Such a change must update the exhaustive lifetime table and private set.
+Partial B changes its view metadata only; A's tensor extents and capacities
+stay intact. Numerical operations/order and external capture offsets are
+unchanged, but full-model `on`/`emulate` byte parity and GTT savings still
+require the parent's Halo hardware gate.
 
 With an 8192-row chunk cap, pair whenever at least 8192+512 rows remain:
 bank A has 8192 live rows and B has `min(remaining-8192,8192)`.
@@ -812,9 +880,11 @@ snapshot bytes on silicon; the cold/default-cache and branched cache-hit
 `rdna_compute::tensor_ops::Bf16Arena { tensor, row_pitch_elems, col0_elems }`
 is an immutable BF16 view; pitch and column offset are **elements**, not bytes.
 The tensor can be a borrowed GPU-visible host-registered buffer and must remain
-alive through stream completion. `ColumnMap` is authoritative: GDN pitch 16640,
-qkv at 0, z at 10240, **a at 16384, b at 16432**; QSA pitch 14080,
-qgate at 0, k at 12288, v at 12800, index at 13312. Qgate is 24 repetitions of
+alive through stream completion. `ColumnMap` is authoritative for the selected
+mask. The ALL baseline has GDN pitch 16640, qkv at 0, z at 10240,
+**a at 16384, b at 16432**; QSA pitch 14080, qgate at 0, k at 12288, v at 12800,
+index at 13312. Subsets compact these offsets and pad only the fused total.
+Qgate is 24 repetitions of
 `q[256] | gate[256]`, not a global q/gate split. Index is `query[512] | key[128]`.
 
 All functions below take `gpu` first and return `HipResult<()>`. `p`, `conv`,
@@ -826,6 +896,8 @@ all non-projection arguments retain their meaning.
 | `gated_delta_conv_batched_arena(p, qkv)` | `p.input` ignored; output and history unchanged, including aliasing | hipcc compile-time twin |
 | `gated_delta_conv_params_batched_arena(conv, params, qkv, a, b)` | Input/a/b fields ignored; fused convolution and parameter blocks | hipcc compile-time twin |
 | `gated_delta_conv_params_qknorm_batched_arena(conv, params, step, keep_qk_conv, qkv, a, b)` | Same fusion; QN/KN go to the incumbent shared scratch | hipcc compile-time twin |
+| `gated_delta_conv_params_batched_mixed(conv, params, qkv?, a?, b?)` | Each absent source reads native scratch; present sources use immutable BF16 views | hipcc opt-in twin |
+| `gated_delta_conv_params_qknorm_batched_mixed(conv, params, step, keep_qk_conv, qkv?, a?, b?)` | Same mixed sources and QN/KN scratch contract | hipcc opt-in twin |
 | `gated_delta_params_batched_arena(p, a, b)` | `p.a/p.b` ignored; gate/beta remain contiguous F32 | hipcc |
 | `gated_delta_gate_arena(p, z)` | `p.z` ignored; single-row, read-only recurrent input | hipcc |
 | `gated_delta_gate_batched_arena(p, z)` | `p.z` ignored; rounded recurrent input updated as before | hipcc |
@@ -873,6 +945,12 @@ prefix/suffix guards. It verifies the materializer independently against CPU
 bit widening, prints old timings including materialization versus direct reads,
 checks immutable arena bytes, and exits 1 on any mismatch. GPU parity/timings
 are parent-run silicon evidence, not implied by CPU build/test success.
+
+The mixed oracle additionally uses a compact qkv-only pitch of 10240 with
+native F32 z/a/b carrying nonzero low mantissa bits. It compares fused
+convolution/parameters and both Q/K-normalization keep modes, including
+history and QN/KN scratch; native F32 projections retain the incumbent core's
+BF16 rounding at parameter consumption, not at projection storage.
 
 Replay follows the incumbent position contracts: cache/raw-key stores and
 RoPE positions are bound to replay position; compact F32 scratch-tail writes

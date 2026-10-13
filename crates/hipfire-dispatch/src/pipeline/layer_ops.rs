@@ -42,8 +42,8 @@ use rdna_compute::tensor_ops::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use rdna_compute::tensor_ops::{
-    Bf16Arena, gated_delta_conv_params_batched_arena,
-    gated_delta_conv_params_qknorm_batched_arena, gated_delta_gate_batched_arena,
+    Bf16Arena, gated_delta_conv_params_batched_mixed,
+    gated_delta_conv_params_qknorm_batched_mixed, gated_delta_gate_batched_arena,
     gated_delta_gate_batched_rotate_arena, gated_delta_step_gate_wmma_arena,
     gated_delta_step_gate_wmma_qknormed_arena, indexed_attention_norm_rope_batch_arena,
     indexed_attention_cache_append_batch_arena, indexed_attention_index_key_append_batch_arena,
@@ -423,12 +423,24 @@ fn project_trunk(
     zba: Option<ZbaFold<'_>>,
     gdn_in_proj: bool,
 ) -> Result<(), DispatchError> {
+    project_trunk_masked(gpu, input, rows, rotation, projections, a4, zba, gdn_in_proj, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_trunk_masked(
+    gpu: &mut Gpu, input: &GpuTensor, rows: usize, rotation: &GpuTensor,
+    projections: &[(&WeightRef<'_>, &GpuTensor)], a4: &[bool], zba: Option<ZbaFold<'_>>,
+    gdn_in_proj: bool, covered: &[bool],
+) -> Result<(), DispatchError> {
     debug_assert_eq!(a4.len(), projections.len());
-    let mut done: SmallVec<[bool; 4]> = SmallVec::from_elem(false, projections.len());
+    debug_assert!(covered.is_empty() || covered.len() == projections.len());
+    let mut done: SmallVec<[bool; 4]> = if covered.is_empty() {
+        SmallVec::from_elem(false, projections.len())
+    } else { covered.iter().copied().collect() };
     let k = projections.iter().find(|(w, _)| w.dtype == DType::MQ4G256V2).map(|(w, _)| w.k);
     if let (Some(k), DType::F32) = (k, input.dtype) {
         let mq4: SmallVec<[usize; 4]> = (0..projections.len())
-            .filter(|&j| projections[j].0.dtype == DType::MQ4G256V2 && projections[j].0.k == k)
+            .filter(|&j| !done[j] && projections[j].0.dtype == DType::MQ4G256V2 && projections[j].0.k == k)
             .collect();
         let dense: SmallVec<[usize; 4]> = if gpu.qwen4_trunk_iu4_applies(rows) {
             mq4.iter().copied().filter(|&j| a4[j]).collect()
@@ -491,6 +503,8 @@ fn project_trunk(
     if done.iter().all(|d| !d) {
         return project_weights(gpu, input, rows, Some(rotation), projections);
     }
+    debug_assert!(covered.is_empty() || (0..projections.len()).all(|j| !covered[j] || done[j]),
+        "covered family must never be computed by native projection dispatch");
     let rest: SmallVec<[(&WeightRef<'_>, &GpuTensor); 4]> =
         (0..projections.len()).filter(|&j| !done[j]).map(|j| projections[j]).collect();
     if rest.is_empty() {
@@ -1466,17 +1480,17 @@ pub enum MixerPhase {
 /// Read-only fused projection inputs, borrowed only for a Core dispatch.
 #[derive(Clone, Copy)]
 pub struct GdnTrunkArenas<'a> {
-    pub qkv: Bf16Arena<'a>,
-    pub z: Bf16Arena<'a>,
-    pub a: Bf16Arena<'a>,
-    pub b: Bf16Arena<'a>,
+    pub qkv: Option<Bf16Arena<'a>>,
+    pub z: Option<Bf16Arena<'a>>,
+    pub a: Option<Bf16Arena<'a>>,
+    pub b: Option<Bf16Arena<'a>>,
 }
 #[derive(Clone, Copy)]
 pub struct QsaTrunkArenas<'a> {
-    pub q: Bf16Arena<'a>,
-    pub k: Bf16Arena<'a>,
-    pub v: Bf16Arena<'a>,
-    pub idx: Bf16Arena<'a>,
+    pub q: Option<Bf16Arena<'a>>,
+    pub k: Option<Bf16Arena<'a>>,
+    pub v: Option<Bf16Arena<'a>>,
+    pub idx: Option<Bf16Arena<'a>>,
 }
 
 fn core_arena<T>(phase: MixerPhase, arenas: Option<T>) -> Option<T> {
@@ -1737,7 +1751,7 @@ pub fn execute_gated_delta_net_hc(
     hc: Option<&HyperWriteOp<'_>>,
     fused: &mut bool,
 ) -> Result<(), DispatchError> {
-    execute_gated_delta_net_hc_impl(gpu, op, hc, fused, None)
+    execute_gated_delta_net_hc_impl(gpu, op, hc, fused, None, None)
 }
 
 /// Core-only direct read; the ordinary/emulated operation has no arena args.
@@ -1748,15 +1762,21 @@ pub fn execute_gated_delta_net_arena(
         return Err(DispatchError::Hip("GDN trunk arena requires Core phase".into()));
     }
     op.validate_for_gpu(gpu)?;
-    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, Some(arenas))
+    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, Some(arenas), None)
+}
+
+/// Native input projections only, skipping qkv/a/b/z covered by the trunk.
+pub fn execute_gated_delta_net_uncovered(gpu: &mut Gpu, op: &GatedDeltaNetOp<'_>, covered: [bool; 4]) -> Result<(), DispatchError> {
+    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, None, Some(covered))
 }
 
 fn execute_gated_delta_net_hc_impl(
     gpu: &mut Gpu, op: &GatedDeltaNetOp<'_>, hc: Option<&HyperWriteOp<'_>>,
     fused: &mut bool, arenas: Option<GdnTrunkArenas<'_>>,
+    projection_only: Option<[bool; 4]>,
 ) -> Result<(), DispatchError> {
     op.check_phase()?;
-    let phase = op.phase;
+    let phase = if projection_only.is_some() { MixerPhase::InProj } else { op.phase };
     let arenas = core_arena(phase, arenas);
     let qk = op.key_heads * op.key_dim;
     let value = op.value_heads * op.value_dim;
@@ -1837,11 +1857,11 @@ fn execute_gated_delta_net_hc_impl(
                 _ => false,
             }
     };
-    if arenas.is_some() || bf16_store(&op.qkv, TrunkFamily::GdnQkv.bit(), gpu) {
+    if arenas.is_some_and(|a| a.qkv.is_some()) || bf16_store(&op.qkv, TrunkFamily::GdnQkv.bit(), gpu) {
         projection.dtype = DType::BF16;
     }
     if matches!(phase, MixerPhase::Whole | MixerPhase::InProj) {
-        project_trunk(
+        project_trunk_masked(
             gpu,
             op.input,
             op.rows,
@@ -1868,6 +1888,7 @@ fn execute_gated_delta_net_hc_impl(
                 padded_outputs: Some([op.z_output, op.b, op.a]),
             }),
             true,
+            projection_only.as_ref().map_or(&[][..], |m| &m[..]),
         )?;
     }
     if phase == MixerPhase::InProj {
@@ -1933,11 +1954,11 @@ fn execute_gated_delta_net_hc_impl(
             hip(rdna_compute::fn_gdn_dense::run(gpu, &conv, &gate_params, &step))?;
         } else if let Some(src) = arenas {
             if fused_qk {
-                hip(gated_delta_conv_params_qknorm_batched_arena(
+                hip(gated_delta_conv_params_qknorm_batched_mixed(
                     gpu, &conv, &gate_params, &step, false, src.qkv, src.a, src.b,
                 ))?;
             } else {
-                hip(gated_delta_conv_params_batched_arena(
+                hip(gated_delta_conv_params_batched_mixed(
                     gpu, &conv, &gate_params, src.qkv, src.a, src.b,
                 ))?;
             }
@@ -1969,11 +1990,11 @@ fn execute_gated_delta_net_hc_impl(
         // The F16 prefill route fuses the gate into the chunked WMMA
         // recurrence (KLD-gated); otherwise the exact kernels run.
         if chunked {
-            if let Some(src) = arenas {
+            if let Some(src) = arenas.and_then(|a| a.z) {
                 if fused_qk {
-                    hip(gated_delta_step_gate_wmma_qknormed_arena(gpu, &step, &gated, src.z))?;
+                    hip(gated_delta_step_gate_wmma_qknormed_arena(gpu, &step, &gated, src))?;
                 } else {
-                    hip(gated_delta_step_gate_wmma_arena(gpu, &step, &gated, src.z))?;
+                    hip(gated_delta_step_gate_wmma_arena(gpu, &step, &gated, src))?;
                 }
             } else if fused_qk {
                 hip(gated_delta_step_gate_wmma_qknormed(gpu, &step, &gated))?;
@@ -2000,14 +2021,14 @@ fn execute_gated_delta_net_hc_impl(
                 }
             } else if rotate {
                 let rotated = view(op.rotation, 0, op.rows * value);
-                if let Some(src) = arenas {
-                    hip(gated_delta_gate_batched_rotate_arena(gpu, &gated, &rotated, src.z))?;
+                if let Some(src) = arenas.and_then(|a| a.z) {
+                    hip(gated_delta_gate_batched_rotate_arena(gpu, &gated, &rotated, src))?;
                 } else {
                     hip(gated_delta_gate_batched_rotate(gpu, &gated, &rotated))?;
                 }
             } else {
-                if let Some(src) = arenas {
-                    hip(gated_delta_gate_batched_arena(gpu, &gated, src.z))?;
+                if let Some(src) = arenas.and_then(|a| a.z) {
+                    hip(gated_delta_gate_batched_arena(gpu, &gated, src))?;
                 } else {
                     hip(gated_delta_gate_batched(gpu, &gated))?;
                 }
@@ -2708,7 +2729,7 @@ pub fn execute_indexed_attention_hc(
     hc: Option<&HyperWriteOp<'_>>,
     fused: &mut bool,
 ) -> Result<(), DispatchError> {
-    execute_indexed_attention_hc_impl(gpu, op, hc, fused, None)
+    execute_indexed_attention_hc_impl(gpu, op, hc, fused, None, None)
 }
 
 pub fn execute_indexed_attention_arena(
@@ -2718,15 +2739,28 @@ pub fn execute_indexed_attention_arena(
         return Err(DispatchError::Hip("QSA trunk arena requires Core phase".into()));
     }
     op.validate_for_gpu(gpu)?;
-    execute_indexed_attention_hc_impl(gpu, op, None, &mut false, Some(arenas))
+    execute_indexed_attention_hc_impl(gpu, op, None, &mut false, Some(arenas), None)
+}
+
+/// Native input projections only, skipping idx/q/k/v covered by the trunk.
+pub fn execute_indexed_attention_uncovered(gpu: &mut Gpu, op: &IndexedAttentionOp<'_>, covered: [bool; 4]) -> Result<(), DispatchError> {
+    execute_indexed_attention_hc_impl(gpu, op, None, &mut false, None, Some(covered))
+}
+
+fn qsa_norm_source(gpu: &mut Gpu, p: &IndexedAttentionNormRopeBatch<'_>, src: Option<Bf16Arena<'_>>) -> Result<(), DispatchError> {
+    hip(match src {
+        Some(src) => indexed_attention_norm_rope_batch_arena(gpu, p, src),
+        None => indexed_attention_norm_rope_batch(gpu, p),
+    })
 }
 
 fn execute_indexed_attention_hc_impl(
     gpu: &mut Gpu, op: &IndexedAttentionOp<'_>, hc: Option<&HyperWriteOp<'_>>,
     fused: &mut bool, arenas: Option<QsaTrunkArenas<'_>>,
+    projection_only: Option<[bool; 4]>,
 ) -> Result<(), DispatchError> {
     op.check_phase()?;
-    let phase = op.phase;
+    let phase = if projection_only.is_some() { MixerPhase::InProj } else { op.phase };
     let arenas = core_arena(phase, arenas);
     let index_width = (op.index_heads + op.index_kv_heads) * op.index_dim;
     let index_q_width = op.index_heads * op.index_dim;
@@ -2768,8 +2802,9 @@ fn execute_indexed_attention_hc_impl(
         _ => &a4_all,
     };
     if matches!(phase, MixerPhase::Whole | MixerPhase::InProj) {
-        project_trunk(gpu, op.input, op.rows, op.rotation, projections, a4, None, false)?;
-        qsa_projection_hook_run(gpu, op)?;
+        project_trunk_masked(gpu, op.input, op.rows, op.rotation, projections, a4, None, false,
+            projection_only.as_ref().map_or(&[][..], |m| &m[..]))?;
+        if projection_only.is_none() { qsa_projection_hook_run(gpu, op)?; }
     }
     if phase == MixerPhase::InProj {
         return Ok(());
@@ -2788,7 +2823,7 @@ fn execute_indexed_attention_hc_impl(
         arena.valid_len.clamp(initial_position);
     }
     if let Some(src) = arenas {
-        hip(indexed_attention_norm_rope_batch_arena(
+        qsa_norm_source(
             gpu,
             &IndexedAttentionNormRopeBatch {
                 values: &index_batch, norm: op.indexer_q_norm, rows: op.rows,
@@ -2796,16 +2831,22 @@ fn execute_indexed_attention_hc_impl(
                 head_stride: op.index_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
             },
             src.idx,
-        ))?;
-        hip(indexed_attention_index_key_append_batch_arena(
-            gpu,
-            &IndexedAttentionIndexKeyAppendBatch {
-                index_rows: &index_batch, raw_index_keys: op.state.raw_index_keys,
-                rows: op.rows, index_q_width, index_kv_width, position_start: initial_position,
-            },
-            src.idx,
-        ))?;
-        hip(indexed_attention_norm_rope_batch_arena(
+        )?;
+        let append = IndexedAttentionIndexKeyAppendBatch {
+            index_rows: &index_batch, raw_index_keys: op.state.raw_index_keys,
+            rows: op.rows, index_q_width, index_kv_width, position_start: initial_position,
+        };
+        if let Some(idx) = src.idx {
+            hip(indexed_attention_index_key_append_batch_arena(gpu, &append, idx))?;
+        } else if op.state.format.index_dtype() == DType::BF16 {
+            hip(indexed_attention_index_key_append_batch(gpu, &append))?;
+        } else {
+            hip(gpu.bf16_round_trip_f32_strided(&index_batch, op.rows, index_q_width, index_width, index_kv_width))?;
+            let keys = view(&index_batch, index_q_width, op.rows * index_width - index_q_width);
+            hip(gpu.copy_rows_strided_f32(&keys, op.state.raw_index_keys, op.rows, index_kv_width,
+                index_width, index_kv_width, initial_position * index_kv_width, Some(index_kv_width)))?;
+        }
+        qsa_norm_source(
             gpu,
             &IndexedAttentionNormRopeBatch {
                 values: &qgate_batch, norm: op.q_norm, rows: op.rows,
@@ -2813,8 +2854,8 @@ fn execute_indexed_attention_hc_impl(
                 head_stride: 2 * op.head_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
             },
             src.q,
-        ))?;
-        hip(indexed_attention_norm_rope_batch_arena(
+        )?;
+        qsa_norm_source(
             gpu,
             &IndexedAttentionNormRopeBatch {
                 values: &k_batch, norm: op.k_norm, rows: op.rows,
@@ -2822,16 +2863,17 @@ fn execute_indexed_attention_hc_impl(
                 head_stride: op.head_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
             },
             src.k,
-        ))?;
-        hip(indexed_attention_cache_append_batch_arena(
-            gpu,
-            &IndexedAttentionCacheAppendBatch {
-                key: &k_batch, value: &v_batch, full_keys: op.state.full_keys,
-                full_values: op.state.full_values, rows: op.rows, kv_heads: op.kv_heads,
-                head_dim: op.head_dim, position_start: initial_position, format: op.state.format,
-            },
-            None, src.v,
-        ))?;
+        )?;
+        let append = IndexedAttentionCacheAppendBatch {
+            key: &k_batch, value: &v_batch, full_keys: op.state.full_keys,
+            full_values: op.state.full_values, rows: op.rows, kv_heads: op.kv_heads,
+            head_dim: op.head_dim, position_start: initial_position, format: op.state.format,
+        };
+        if let Some(v) = src.v {
+            hip(indexed_attention_cache_append_batch_arena(gpu, &append, None, v))?;
+        } else {
+            hip(indexed_attention_cache_append_batch(gpu, &append))?;
+        }
     } else if gpu.route_rows(op.rows) <= 8
         && op.index_dim <= 256
         && op.head_dim <= 256
@@ -4546,6 +4588,24 @@ mod tests {
 mod trunk_arena_dispatch_tests {
     use super::*;
 
+    #[test]
+    fn partial_views_preserve_native_sources_per_family() {
+        let tensor = GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::dangling_mut(), 256 * 10240 * 2) },
+            shape: vec![256, 10240], dtype: DType::BF16,
+        };
+        let qkv = Bf16Arena { tensor: &tensor, row_pitch_elems: 10240, col0_elems: 0 };
+        let gdn = core_arena(MixerPhase::Core, Some(GdnTrunkArenas {
+            qkv: Some(qkv), z: None, a: None, b: None,
+        })).unwrap();
+        assert!(gdn.qkv.is_some());
+        assert!(gdn.z.is_none() && gdn.a.is_none() && gdn.b.is_none());
+        let qsa = core_arena(MixerPhase::Core, Some(QsaTrunkArenas {
+            q: None, k: Some(qkv), v: None, idx: None,
+        })).unwrap();
+        assert!(qsa.k.is_some());
+        assert!(qsa.q.is_none() && qsa.v.is_none() && qsa.idx.is_none());
+    }
     #[test]
     fn only_explicit_core_views_select_arena_consumers() {
         for phase in [MixerPhase::Whole, MixerPhase::InProj, MixerPhase::Core, MixerPhase::OutProj] {

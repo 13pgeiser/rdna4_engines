@@ -193,6 +193,69 @@ fn gdn(g: &mut Gpu, rows: usize) {
     equal("GDN source arena remains immutable",&bytes,&snapshot(g,&arena));
     for t in [arena,qkv,z,a,b,al,dt,norm,kernel,projection].into_iter().chain(gates).chain(betas) {g.free_tensor(t).unwrap();}
 }
+
+// qkv-only compact arena plus genuinely F32 native z/a/b. Keep low mantissa
+// bits in scratch and check the incumbent core's BF16 rounding at consumption.
+fn native_f32(g: &mut Gpu, n: usize, seed: u32) -> GpuTensor {
+    let bytes: Vec<_> = random_bits(n,seed).into_iter().enumerate().flat_map(|(i,b)| {
+        (f32::from_bits((b as u32)<<16) + (i%31) as f32 / 777.0).to_le_bytes()
+    }).collect();
+    typed(g,&bytes,n,DType::F32)
+}
+fn gdn_mixed(g: &mut Gpu, rows: usize) {
+    let pitch=10240;
+    let cpu=random_bits(rows*pitch,0xabc7);
+    let bytes:Vec<_>=cpu.iter().flat_map(|b|b.to_le_bytes()).collect();
+    let arena=typed(g,&bytes,cpu.len(),DType::BF16);
+    let qkv=check_materialize(g,&cpu,&arena,rows,pitch,0,10240,DType::BF16);
+    let a=native_f32(g,rows*48,47); let b=native_f32(g,rows*48,53);
+    let z=native_f32(g,rows*6144,59);
+    let al=weights(g,48,0xc040); let dt=weights(g,48,0x3e00);
+    let norm=weights(g,128,0x3f80); let kernel=random(g,10240*4,DType::BF16,61);
+    let gates=[filled(g,rows*48,DType::F32),filled(g,rows*48,DType::F32)];
+    let betas=[filled(g,rows*48,DType::F32),filled(g,rows*48,DType::F32)];
+    for (dtype,qknorm,keep) in [(DType::F32,false,false),(DType::BF16,false,false),
+        (DType::BF16,true,false),(DType::BF16,true,true)] {
+        let outputs=[filled(g,rows*10240,dtype),filled(g,rows*10240,dtype)];
+        let history=[random(g,3*10240,DType::F32,67),random(g,3*10240,DType::F32,67)];
+        let state=g.zeros(&[48*128*128],DType::F32).unwrap();
+        let sp=step(&qkv,&gates[0],&betas[0],&state,&qkv,rows);
+        let old=timed(g,|g| {
+            let c=conv(&qkv,&kernel,&history[0],&outputs[0],rows);
+            let p=params(&a,&b,&al,&dt,&gates[0],&betas[0],rows);
+            if qknorm {gated_delta_conv_params_qknorm_batched(g,&c,&p,&sp,keep).unwrap();}
+            else {gated_delta_conv_params_batched(g,&c,&p).unwrap();}
+        });
+        let old_qnk=if qknorm {let t=g.qwen4_f16_x_scratch(2*rows*2048).unwrap();Some(snapshot(g,&t))}else{None};
+        let new=timed(g,|g| {
+            let c=conv(&qkv,&kernel,&history[1],&outputs[1],rows);
+            let p=params(&a,&b,&al,&dt,&gates[1],&betas[1],rows);
+            if qknorm {gated_delta_conv_params_qknorm_batched_mixed(g,&c,&p,&sp,keep,Some(view(&arena,pitch,0)),None,None).unwrap();}
+            else {gated_delta_conv_params_batched_mixed(g,&c,&p,Some(view(&arena,pitch,0)),None,None).unwrap();}
+        });
+        if let Some(expected)=old_qnk {
+            let t=g.qwen4_f16_x_scratch(2*rows*2048).unwrap();
+            equal("mixed qknorm QN/KN",&expected,&snapshot(g,&t));
+        }
+        compare(g,"mixed convolution",&outputs[0],&outputs[1]);
+        compare(g,"mixed convolution history",&history[0],&history[1]);
+        compare(g,"mixed native alpha gate",&gates[0],&gates[1]);
+        compare(g,"mixed native beta",&betas[0],&betas[1]);
+        report(&format!("mixed qkv-arena native-zab {dtype:?} qknorm={qknorm} keep={keep}"),rows,pitch,old,new);
+        for t in outputs.into_iter().chain(history).chain([state]) {g.free_tensor(t).unwrap();}
+    }
+    let recurrent=[random(g,rows*6144,DType::F32,71),random(g,rows*6144,DType::F32,71)];
+    let outputs=[filled(g,rows*6144,DType::F32),filled(g,rows*6144,DType::F32)];
+    for i in 0..2 {
+        let p=GatedDeltaGateBatched {recurrent_output:&recurrent[i],z:&z,norm:&norm,output:&outputs[i],rows,value_heads:48,value_dim:128};
+        gated_delta_gate_batched(g,&p).unwrap();
+    }
+    g.hip.device_synchronize().unwrap();
+    compare(g,"mixed native z gate",&outputs[0],&outputs[1]);
+    compare(g,"mixed native z recurrent rounding",&recurrent[0],&recurrent[1]);
+    equal("mixed immutable compact qkv arena",&bytes,&snapshot(g,&arena));
+    for t in [arena,qkv,a,b,z,al,dt,norm,kernel].into_iter().chain(gates).chain(betas).chain(outputs).chain(recurrent) {g.free_tensor(t).unwrap();}
+}
 fn qsa(g: &mut Gpu, rows: usize) {
     let pitch=14080;let cpu=random_bits(rows*pitch,0x9713);
     let bytes:Vec<_>=cpu.iter().flat_map(|b|b.to_le_bytes()).collect();let arena=typed(g,&bytes,cpu.len(),DType::BF16);
@@ -240,7 +303,7 @@ fn qsa(g: &mut Gpu, rows: usize) {
 }
 fn run() {
     let mut gpu=Gpu::init().expect("GPU init");assert_eq!(gpu.arch,"gfx1151","Halo-only oracle");
-    for rows in [8192,4647] {gdn(&mut gpu,rows);qsa(&mut gpu,rows);}
+    for rows in [8192,4647] {gdn(&mut gpu,rows);gdn_mixed(&mut gpu,rows);qsa(&mut gpu,rows);}
     println!("RESULT PASS: all consumer outputs/state byte-exact");
 }
 fn main() {if std::panic::catch_unwind(run).is_err() {eprintln!("RESULT FAIL");std::process::exit(1);}}

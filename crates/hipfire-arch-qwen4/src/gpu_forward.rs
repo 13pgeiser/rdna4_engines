@@ -2437,6 +2437,71 @@ pub(crate) enum ScratchField {
 
 impl ScratchField {
     pub(crate) const COUNT: usize = Self::Logits as usize + 1;
+    const ALL: [Self; Self::COUNT] = [
+        Self::TokenIds, Self::EmbeddingRot, Self::Embeddings, Self::Streams,
+        Self::HcNormalized, Self::HcLow, Self::HcUp, Self::HcMixed, Self::HcGates,
+        Self::Rotation, Self::Projection, Self::Projection2,
+        Self::GdnA, Self::GdnB, Self::GdnGate, Self::GdnBeta,
+        Self::GdnRecurrentOutput, Self::GdnBf16, Self::GdnZ, Self::GdnOutput,
+        Self::QsaIndex, Self::QsaQgate, Self::QsaK, Self::QsaV, Self::QsaOutput,
+        Self::QsaSelected, Self::AttentionOutput, Self::PleStaged, Self::PleRows,
+        Self::PleKey, Self::PleValue, Self::PleQuery, Self::PleGated,
+        Self::PleNormed, Self::PleOutput, Self::RouterLogits, Self::MoeXRot,
+        Self::MoeGateUp, Self::MoeGate, Self::MoeUp, Self::MoeHidden,
+        Self::FfnOutput, Self::MoeSharedOutput, Self::MoeGateBatch,
+        Self::MoeUpBatch, Self::MoeRotBatch, Self::MoeTopkIndices,
+        Self::MoeTopkWeights, Self::MoeDownExpanded, Self::MoeScalar,
+        Self::MoeExpertTokenCounts, Self::MoeExpertOffsets, Self::MoeSortedSlotIndex,
+        Self::MoeExpertTileIds, Self::MoeInversePerm, Self::MoeYGateUpGrouped,
+        Self::MoeYDownGrouped, Self::Logits,
+    ];
+
+    /// Pair execution splits before the mixer: prepare's HC read cannot fuse
+    /// with its HC write, so only `HcMixed` survives that split. MLP HC fusions
+    /// remain wholly inside a fragment. Keep this exhaustive when adding fields.
+    fn npu_bank_lifetime(self) -> NpuBankLifetime {
+        use NpuBankLifetime as L;
+        match self {
+            Self::TokenIds | Self::EmbeddingRot | Self::Embeddings | Self::PleStaged => L::Initialize,
+            Self::Streams => L::Residual,
+            Self::HcMixed => L::PreparedInput,
+            Self::PleRows => L::StagedRows,
+            Self::HcNormalized | Self::HcLow | Self::HcUp | Self::Rotation | Self::GdnBf16
+            | Self::PleKey | Self::PleValue | Self::PleQuery | Self::PleGated
+            | Self::PleNormed | Self::PleOutput => L::PrepareAndFragment,
+            Self::HcGates | Self::Projection | Self::Projection2
+            | Self::GdnA | Self::GdnB | Self::GdnGate | Self::GdnBeta
+            | Self::GdnRecurrentOutput | Self::GdnZ | Self::GdnOutput
+            | Self::QsaIndex | Self::QsaQgate | Self::QsaK | Self::QsaV
+            | Self::QsaOutput | Self::QsaSelected | Self::AttentionOutput
+            | Self::RouterLogits
+            | Self::MoeXRot | Self::MoeGateUp | Self::MoeGate | Self::MoeUp
+            | Self::MoeHidden | Self::FfnOutput | Self::MoeSharedOutput
+            | Self::MoeGateBatch | Self::MoeUpBatch | Self::MoeRotBatch
+            | Self::MoeTopkIndices | Self::MoeTopkWeights | Self::MoeDownExpanded
+            | Self::MoeScalar | Self::MoeExpertTokenCounts | Self::MoeExpertOffsets
+            | Self::MoeSortedSlotIndex | Self::MoeExpertTileIds | Self::MoeInversePerm
+            | Self::MoeYGateUpGrouped | Self::MoeYDownGrouped => L::Fragment,
+            Self::Logits => L::Finish,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NpuBankLifetime {
+    Initialize,
+    Residual,
+    PreparedInput,
+    StagedRows,
+    PrepareAndFragment,
+    Fragment,
+    Finish,
+}
+
+impl NpuBankLifetime {
+    fn private(self) -> bool {
+        matches!(self, Self::Residual | Self::PreparedInput | Self::StagedRows)
+    }
 }
 
 /// One field of a scratch plan.
@@ -2507,7 +2572,7 @@ pub(crate) fn owner_pitch_extent(
 }
 
 /// Device buffers shared by one forward object.  All allocations happen in
-/// `new`; token/chunk execution only creates borrowed subviews.
+/// `new`/`new_npu_bank`; token/chunk execution only creates borrowed subviews.
 ///
 /// In [`Qwen4ForwardScratchMode::FnSymGfx1201`] eight fields are borrowed
 /// views of another field's allocation (see [`Self::plan`]); only owners are
@@ -2517,6 +2582,9 @@ pub struct Qwen4GpuForwardScratch {
     pub mode: Qwen4ForwardScratchMode,
     /// The plan this scratch was built from, in [`ScratchField`] order.
     pub(crate) slots: Vec<ScratchSlot>,
+    /// NPU bank B borrows every layer-local field from bank A; only the
+    /// bank-private lifetimes are owned here. Bank A outlives this view.
+    bank_a_borrowed: bool,
     pub token_ids: GpuTensor,
     pub embedding_rot: GpuTensor,
     pub embeddings: GpuTensor,
@@ -2928,11 +2996,54 @@ impl Qwen4GpuForwardScratch {
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
     ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        Self::allocate(gpu, config, max_chunk, mode, None)
+    }
+
+    /// Allocate only state live across the A/B switch. All borrowed pointers
+    /// remain owned by `bank_a`, which must outlive this bank and GPU work.
+    fn new_npu_bank(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        bank_a: &Self,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        if bank_a.mode != Qwen4ForwardScratchMode::Full {
+            return Err(invalid("NPU shared bank requires full scratch"));
+        }
+        Self::allocate(gpu, config, bank_a.max_chunk, bank_a.mode, Some(bank_a))
+    }
+
+    #[cfg(test)]
+    fn npu_bank_device_bytes(
+        config: &Qwen4Config,
+        max_chunk: usize,
+    ) -> Result<u64, Qwen4GpuForwardError> {
+        let (slots, _) = Self::plan(config, max_chunk, Qwen4ForwardScratchMode::Full)?;
+        Self::npu_bank_plan_bytes(&slots)
+    }
+
+    fn npu_bank_plan_bytes(slots: &[ScratchSlot]) -> Result<u64, Qwen4GpuForwardError> {
+        slots.iter().enumerate().try_fold(0u64, |total, (index, slot)| {
+            // The exhaustive field table is shared by allocation and freeing.
+            let private = ScratchField::ALL[index].npu_bank_lifetime().private();
+            total.checked_add(if private { slot.bytes()? as u64 } else { 0 })
+                .ok_or_else(|| invalid("NPU bank device bytes overflow"))
+        })
+    }
+
+    fn allocate(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        bank_a: Option<&Self>,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
         let (slots, max_ple_bytes) = Self::plan(config, max_chunk, mode)?;
         // Owners first; a view needs its owner's pointer.
         let mut tensors: Vec<Option<GpuTensor>> = Vec::with_capacity(slots.len());
-        for slot in &slots {
-            if slot.owner.is_some() {
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.owner.is_some()
+                || (bank_a.is_some() && !ScratchField::ALL[index].npu_bank_lifetime().private())
+            {
                 tensors.push(None);
                 continue;
             }
@@ -2956,6 +3067,14 @@ impl Qwen4GpuForwardScratch {
                 tensors[index] = Some(view);
             }
         }
+        if let Some(bank_a) = bank_a {
+            for (index, slot) in slots.iter().enumerate() {
+                let field = ScratchField::ALL[index];
+                if !field.npu_bank_lifetime().private() {
+                    tensors[index] = Some(bank_a.field_tensor(field).sub_offset(0, slot.elements));
+                }
+            }
+        }
         let mut take = |field: ScratchField| {
             tensors[field as usize]
                 .take()
@@ -2965,6 +3084,7 @@ impl Qwen4GpuForwardScratch {
         let scratch = Self {
             max_chunk,
             mode,
+            bank_a_borrowed: bank_a.is_some(),
             token_ids: take(F::TokenIds),
             embedding_rot: take(F::EmbeddingRot),
             embeddings: take(F::Embeddings),
@@ -3134,6 +3254,7 @@ impl Qwen4GpuForwardScratch {
     /// freed once, through its owner.
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let slots = self.slots;
+        let bank_a_borrowed = self.bank_a_borrowed;
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -3196,8 +3317,10 @@ impl Qwen4GpuForwardScratch {
         ];
         debug_assert_eq!(tensors.len(), slots.len());
         let mut first = None;
-        for (tensor, slot) in tensors.into_iter().zip(slots) {
-            if slot.owner.is_some() {
+        for (index, (tensor, slot)) in tensors.into_iter().zip(slots).enumerate() {
+            if slot.owner.is_some()
+                || (bank_a_borrowed && !ScratchField::ALL[index].npu_bank_lifetime().private())
+            {
                 continue;
             }
             if let Err(error) = gpu.free_tensor(tensor) {
@@ -3665,7 +3788,7 @@ impl Qwen4GpuForward {
                 gpu.qwen4_trunk_iu4 = false;
             }
             #[cfg(target_os = "linux")]
-            { npu_trunk = npu_forward::NpuForward::load(gpu, bundle, max_chunk, mode, npu_prepared)?; }
+            { npu_trunk = npu_forward::NpuForward::load(gpu, bundle, &scratch, max_chunk, mode, npu_prepared)?; }
             // The Q8_0 decode copies are the Flash-Next decode recipe (they
             // re-quantize its shared-expert and HC matrices); a developer
             // profile decodes the source BF16 weights, so decode and prefill
@@ -6371,6 +6494,82 @@ mod tests {
     fn grouped_rows(rows: u64) -> u64 {
         let slots = 10 * rows;
         (slots + 15 * slots.min(512)).div_ceil(16) * 16
+    }
+
+    #[test]
+    fn npu_bank_sharing_covers_every_field_and_never_crosses_a_bank_switch() {
+        use super::NpuBankLifetime as L;
+        // Event order from pair_scoped, for two layers with PLE on layer 1:
+        // initialize A/B, prepare(0,A/B), G(0,A), prepare(1,A), G(0,B),
+        // prepare(1,B), G(1,A/B), finish A/B. Each event is a complete
+        // same-stream sequence; an interval is one produced value's lifetime,
+        // not the lifetime of its allocation.
+        let banks = [0, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1];
+        let local_init = [(0, 0), (1, 1)];
+        let residual = [(0, 10), (1, 11)];
+        let input = [(2, 4), (3, 6), (5, 8), (7, 9)];
+        let ple_rows = [(0, 5), (1, 7)];
+        let prepare_and_fragment = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6),
+            (7, 7), (8, 8), (9, 9), (10, 10), (11, 11)];
+        let fragments = [(4, 4), (6, 6), (8, 8), (9, 9)];
+        let finish = [(10, 10), (11, 11)];
+        // This independent data-flow table is also the full private/shared
+        // inventory. HC prepare cannot pair its gates with a write outside
+        // its step slice; fragment-local HC fusions consume their gates before
+        // returning. PLE normed rows are retained only for verify rollback,
+        // not prompt pairs; session capture copies fixed state, not this field.
+        let rules: &[(L, &[F], &[(usize, usize)])] = &[
+            (L::Initialize, &[F::TokenIds, F::EmbeddingRot, F::Embeddings, F::PleStaged], &local_init),
+            (L::Residual, &[F::Streams], &residual),
+            (L::PreparedInput, &[F::HcMixed], &input),
+            (L::StagedRows, &[F::PleRows], &ple_rows),
+            (L::PrepareAndFragment, &[F::HcNormalized, F::HcLow, F::HcUp,
+                F::Rotation, F::GdnBf16, F::PleKey, F::PleValue, F::PleQuery,
+                F::PleGated, F::PleNormed, F::PleOutput], &prepare_and_fragment),
+            (L::Fragment, &[F::HcGates, F::Projection, F::Projection2, F::GdnA,
+                F::GdnB, F::GdnGate, F::GdnBeta, F::GdnRecurrentOutput, F::GdnZ,
+                F::GdnOutput, F::QsaIndex, F::QsaQgate, F::QsaK, F::QsaV,
+                F::QsaOutput, F::QsaSelected, F::AttentionOutput, F::RouterLogits,
+                F::MoeXRot, F::MoeGateUp, F::MoeGate, F::MoeUp, F::MoeHidden,
+                F::FfnOutput, F::MoeSharedOutput, F::MoeGateBatch, F::MoeUpBatch,
+                F::MoeRotBatch, F::MoeTopkIndices, F::MoeTopkWeights,
+                F::MoeDownExpanded, F::MoeScalar, F::MoeExpertTokenCounts,
+                F::MoeExpertOffsets, F::MoeSortedSlotIndex, F::MoeExpertTileIds,
+                F::MoeInversePerm, F::MoeYGateUpGrouped, F::MoeYDownGrouped], &fragments),
+            (L::Finish, &[F::Logits], &finish),
+        ];
+        let mut seen = [false; F::COUNT];
+        for &(lifetime, fields, intervals) in rules {
+            let crosses_bank = intervals.iter().any(|&(first, last)|
+                banks[first..=last].iter().any(|&bank| bank != banks[first]));
+            for &field in fields {
+                assert!(!std::mem::replace(&mut seen[field as usize], true), "{field:?} repeated");
+                assert_eq!(field.npu_bank_lifetime(), lifetime, "{field:?}");
+                assert_eq!(field.npu_bank_lifetime().private(), crosses_bank, "{field:?}");
+            }
+        }
+        assert!(seen.into_iter().all(|field| field));
+        for (index, field) in F::ALL.into_iter().enumerate() {
+            assert_eq!(field as usize, index);
+        }
+        assert_eq!(F::ALL.into_iter().filter(|field| field.npu_bank_lifetime().private())
+            .collect::<Vec<_>>(), [F::Streams, F::HcMixed, F::PleRows]);
+    }
+
+    #[test]
+    fn npu_private_bank_bytes_are_pinned_at_full_and_partial_rows() {
+        let config = fn_config();
+        for rows in [512, 8151, 8192] {
+            let private = Scratch::npu_bank_device_bytes(&config, rows).unwrap();
+            let slots = plan(rows, Mode::Full);
+            let expected = [F::Streams, F::HcMixed, F::PleRows].into_iter()
+                .map(|field| field_bytes(&slots, field)).sum::<u64>();
+            assert_eq!(private, expected);
+            assert_eq!(private, rows as u64 * (4 * 2560 + 2560 + 2560) * 4);
+        }
+        let private = Scratch::npu_bank_device_bytes(&config, 8192).unwrap();
+        assert_eq!(private, 503_316_480);
+        assert_eq!(scratch_bytes(8192, Mode::Full) - private, 8_454_682_500);
     }
 
     #[test]

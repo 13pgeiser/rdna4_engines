@@ -7,18 +7,20 @@ use railgun::npu::trunk::{NpuTrunkRuntime, LayerPanels, PanelProgram, Seq};
 use rdna_compute::tensor_ops::Bf16Arena;
 use hipfire_dispatch::pipeline::{
     execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
+    execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered,
 };
 use std::{ffi::c_void, io::Write};
 
 pub(super) struct NpuForward {
     mode: NpuTrunkMode,
+    families: FamilyMask,
     layers: Vec<NpuLayer>,
-    a: GpuTensor,
+    emulation: Option<EmulationScratch>,
+    // The pack producer writes compact activation sidecars in both modes.
     scales: [GpuTensor; 2],
-    sums: GpuTensor,
     bank_b: Option<Qwen4GpuForwardScratch>,
     runtime: Option<NpuTrunkRuntime>,
-    arenas: Option<[[GpuTensor; 2]; 2]>,
+    arenas: Option<[[Option<GpuTensor>; 2]; 2]>,
     trace: Option<std::io::BufWriter<std::fs::File>>,
     host_tokens: Vec<u8>,
     host_ple: Vec<u8>,
@@ -34,24 +36,33 @@ pub(super) struct NpuForward {
 // shares it, and every execution uses the destination thread's selected Gpu.
 // The relay only sees immutable entry points and raw events, not those Rcs.
 unsafe impl Send for NpuForward {}
-struct NpuLayer { shape: Shape, map: trunk::ColumnMap, w: GpuTensor, scales: GpuTensor }
+struct NpuLayer { shape: Shape, map: trunk::ColumnMap, twin: Option<GpuTwin> }
+struct GpuTwin { w: GpuTensor, scales: GpuTensor }
+struct EmulationScratch { a: GpuTensor, sums: GpuTensor }
 fn fail(e: impl std::fmt::Display) -> Qwen4GpuForwardError { invalid(format!("npu-trunk: {e}")) }
 fn stream(gpu: &Gpu) -> *mut c_void { gpu.active_stream.as_ref().map_or(std::ptr::null_mut(), |s| s.as_raw()) }
-fn layout(shape: Shape, rows: usize) -> NpuBf16Layout {
-    NpuBf16Layout { padded_rows: rows.div_ceil(256) * 256, k: 2560, panels: shape.column_map(FamilyMask::ALL).panel_count() }
+fn layout(map: &trunk::ColumnMap, rows: usize) -> NpuBf16Layout {
+    NpuBf16Layout { padded_rows: rows.div_ceil(256) * 256, k: 2560, panels: map.panel_count() }
+}
+fn family_view<'a>(map: &trunk::ColumnMap, tensor: &'a GpuTensor, family: Family) -> Option<Bf16Arena<'a>> {
+    map.parts.iter().find(|&&(f, _, _)| f == family).map(|&(_, col, _)| Bf16Arena {
+        tensor, row_pitch_elems: map.padded_cols(), col0_elems: col as usize,
+    })
 }
 fn transport_shape(shape: Shape) -> railgun::npu::trunk::Shape {
     match shape { Shape::GdnIn => railgun::npu::trunk::Shape::GdnIn, Shape::QsaIn => railgun::npu::trunk::Shape::QsaIn }
 }
 
-fn registered_c_view(rt: &NpuTrunkRuntime, bank: usize, shape: Shape) -> Result<GpuTensor, Qwen4GpuForwardError> {
+fn registered_c_view(rt: &NpuTrunkRuntime, bank: usize, shape: Shape, families: FamilyMask) -> Result<Option<GpuTensor>, Qwen4GpuForwardError> {
+    let map = shape.column_map(families);
+    if map.panel_count() == 0 { return Ok(None); }
     let arena = rt.c_arena(bank, transport_shape(shape)).map_err(fail)?;
     // Borrowed metadata only: runtime owns the registration/pages until all
     // bank retirement events complete. Never free this as a GPU allocation.
-    Ok(GpuTensor {
+    Ok(Some(GpuTensor {
         buf: unsafe { hip_bridge::DeviceBuffer::from_raw(arena.device as *mut c_void, arena.len) },
-        shape: vec![8192, shape.column_map(FamilyMask::ALL).padded_cols()], dtype: DType::BF16,
-    })
+        shape: vec![8192, map.padded_cols()], dtype: DType::BF16,
+    }))
 }
 
 /// Rebind logical extents only; the dedicated bank's allocation capacity and
@@ -100,10 +111,10 @@ fn bind_bank_rows(s: &mut Qwen4GpuForwardScratch, config: &Qwen4Config, rows: us
     ], &slots)
 }
 
-/// Load-only CPU preparation, moved into the forward after overlay replacement.
+/// Stock MQ6 rows retained only until the post-overlay calibration selects a mask.
 pub(crate) struct PreparedTrunk {
     mode: NpuTrunkMode,
-    layers: Vec<(Shape, trunk::PackedB, Vec<u8>)>,
+    layers: Vec<(Shape, Vec<(usize, Vec<u8>)>)>,
     download_ms: f64,
     pack_ms: f64,
     pre_overlay: bool,
@@ -128,7 +139,7 @@ impl NpuForward {
             return Err(fail("requires Flash-Next family B, K=2560, gfx1151"));
         }
         // Download each stock MQ6 matrix exactly once, before any overlay swap.
-        // Only packed host panels/twin survive this function; no stock GPU copy.
+        // Load packs only the calibrated families, then drops these host rows.
         let started = Instant::now();
         let mut raw = Vec::with_capacity(bundle.weights.layer_refs.len());
         for l in &bundle.weights.layer_refs {
@@ -152,33 +163,15 @@ impl NpuForward {
             raw.push((shape, mats));
         }
         let download_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let started = Instant::now();
-        let refs: Vec<_> = raw.iter().map(|(shape, mats)| trunk::LayerTrunkRefs {
-            shape: *shape, matrices: shape.column_map(FamilyMask::ALL).parts.iter().zip(mats).map(|(&(family, _, _), (m, bytes))|
-                trunk::MatrixRef { family, mq6: bytes, m: *m, k: 2560 }).collect(),
-        }).collect();
-        // Reuse the existing parallel panel preparation and shared design.
-        let packed = trunk::pack_trunk_with_contract(EpilogueContract::Bf16Direct, &refs, FamilyMask::ALL).map_err(fail)?;
-        drop(refs);
-        let mut layers = Vec::with_capacity(raw.len());
-        for (entry, (_, mats)) in packed.per_layer.into_iter().zip(raw) {
-            let (shape, b) = entry.ok_or_else(|| fail("missing packed layer"))?;
-            let mut codes = vec![0u8; b.map.padded_cols() * 2560];
-            for (&(_, col, _), (m, bytes)) in b.map.parts.iter().zip(&mats) {
-                trunk::pack_matrix_direct(bytes, *m, 2560, &mut codes[col as usize * 2560..(col as usize + m) * 2560]);
-            }
-            layers.push((shape, b, codes));
-        }
-        let pack_ms = started.elapsed().as_secs_f64() * 1000.0;
-        Ok(Some(PreparedTrunk { mode, layers, download_ms, pack_ms, pre_overlay, overlay_route: None }))
+        Ok(Some(PreparedTrunk { mode, layers: raw, download_ms, pack_ms: 0.0, pre_overlay, overlay_route: None }))
     }
 
-    pub(super) fn load(gpu: &mut Gpu, bundle: &Qwen4Bundle, rows: usize, scratch_mode: Qwen4ForwardScratchMode, prepared: Option<Option<PreparedTrunk>>) -> Result<Option<Self>, Qwen4GpuForwardError> {
+    pub(super) fn load(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, rows: usize, scratch_mode: Qwen4ForwardScratchMode, prepared: Option<Option<PreparedTrunk>>) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let Some(prepared) = (match prepared {
             Some(prepared) => prepared,
             None => Self::prepare_stock(gpu, bundle, false)?,
         }) else { return Ok(None); };
-        let PreparedTrunk { mode, layers: packed, download_ms, mut pack_ms, pre_overlay, overlay_route } = prepared;
+        let PreparedTrunk { mode, layers: raw, download_ms, mut pack_ms, pre_overlay, overlay_route } = prepared;
         let trunk_route = overlay_route.map_or_else(|| "stock".to_owned(), |default| format!("overlay:{}", default.marker()));
         let matched = (|| -> Result<(trunk::Calibration, trunk::CalKey, FamilyMask), String> {
             let cal = trunk::Calibration::load(hipfire_config::npu_trunk_calibration_path())
@@ -194,13 +187,13 @@ impl NpuForward {
             };
             Ok((cal, key, selected))
         })();
-        let (calibration, n_star) = match matched {
+        let (calibration, n_star, families) = match matched {
             Ok((cal, key, selected)) => {
                 let n_star = trunk::crossover(&cal, selected);
                 eprintln!("{}", trunk::load_log_line(&cal, &trunk::LoadLogKey {
                     current: &key, mode: &mode.to_string(), families: selected,
                 }, n_star, &trunk::plan(&cal, selected, 16384), &trunk::plan(&cal, selected, 65536)));
-                (Some(cal), n_star)
+                (Some(cal), n_star, selected)
             }
             Err(reason) if mode == NpuTrunkMode::Auto => {
                 eprintln!("npu-trunk: off ({reason})");
@@ -208,9 +201,10 @@ impl NpuForward {
             }
             Err(reason) => {
                 eprintln!("npu-trunk: mode={mode} calibration=none (forced) reason={reason}");
-                (None, None)
+                (None, None, FamilyMask::ALL)
             }
         };
+        if families.is_empty() { return Ok(None); }
         let physical = mode != NpuTrunkMode::Emulate;
         if physical && (rows != 8192 || scratch_mode != Qwen4ForwardScratchMode::Full || bundle.weights.ep_placement().is_some()) {
             if mode == NpuTrunkMode::Auto {
@@ -219,50 +213,92 @@ impl NpuForward {
             }
             return Err(fail("on requires two full 8192-row banks, full scratch and single-device placement"));
         }
+        let packing_started = Instant::now();
+        let refs: Vec<_> = raw.iter().map(|(shape, mats)| trunk::LayerTrunkRefs {
+            shape: *shape, matrices: shape.column_map(FamilyMask::ALL).parts.iter().zip(mats).map(|(&(family, _, _), (m, bytes))|
+                trunk::MatrixRef { family, mq6: bytes, m: *m, k: 2560 }).collect(),
+        }).collect();
+        let packed_trunk = trunk::pack_trunk_with_contract(EpilogueContract::Bf16Direct, &refs, families).map_err(fail)?;
+        drop(refs);
+        let mut packed = Vec::with_capacity(raw.len());
+        for (entry, (shape, mats)) in packed_trunk.per_layer.into_iter().zip(raw) {
+            let b = entry.map(|(_, b)| b).unwrap_or_else(|| trunk::PackedB {
+                panels: Vec::new(), ws: Vec::new(), scales: Vec::new(), map: shape.column_map(families),
+            });
+            let mut codes = if mode == NpuTrunkMode::Emulate { vec![0u8; b.map.padded_cols() * 2560] } else { Vec::new() };
+            if mode == NpuTrunkMode::Emulate {
+                let full = shape.column_map(FamilyMask::ALL);
+                for &(family, col, width) in &b.map.parts {
+                    let i = full.parts.iter().position(|&(f, _, _)| f == family).expect("shape family");
+                    let (m, bytes) = &mats[i];
+                    debug_assert_eq!(*m, width as usize);
+                    trunk::pack_matrix_direct(bytes, *m, 2560, &mut codes[col as usize * 2560..(col as usize + m) * 2560]);
+                }
+            }
+            packed.push((shape, b, codes));
+        }
+        pack_ms += packing_started.elapsed().as_secs_f64() * 1000.0;
         let started = Instant::now();
         let mut allocations = Vec::new();
         let result = (|| {
             let mut layers = Vec::new();
             let mut resident = Vec::new();
-            let mut resident_bytes = 0usize;
+            let mut npu_panels_bytes = 0usize;
+            let mut gpu_twin_bytes = 0usize;
             for (index, (shape, b, codes)) in packed.into_iter().enumerate() {
-                let sidecars: Vec<_> = b.scales.iter().flat_map(|(m,e)| m.to_le_bytes().into_iter().chain(e.to_le_bytes())).collect();
-                let w = gpu.upload_raw(&codes, &[codes.len()])?; allocations.push(w.sub_offset(0, w.numel()));
-                let scales = gpu.upload_raw(&sidecars, &[sidecars.len()])?; allocations.push(scales.sub_offset(0, scales.numel()));
-                resident_bytes += codes.len() + sidecars.len()
-                    + if physical {b.panels.iter().map(Vec::len).sum::<usize>()}else{0};
-                resident.push(LayerPanels { layer: index, shape: transport_shape(shape), panels: b.panels });
-                layers.push(NpuLayer { shape, map: b.map, w, scales });
+                let twin = if !physical && !b.map.parts.is_empty() {
+                    let sidecars: Vec<_> = b.scales.iter().flat_map(|(m,e)| m.to_le_bytes().into_iter().chain(e.to_le_bytes())).collect();
+                    let w = gpu.upload_raw(&codes, &[codes.len()])?; allocations.push(w.sub_offset(0, w.numel()));
+                    let scales = gpu.upload_raw(&sidecars, &[sidecars.len()])?; allocations.push(scales.sub_offset(0, scales.numel()));
+                    gpu_twin_bytes += codes.len() + sidecars.len();
+                    Some(GpuTwin { w, scales })
+                } else { None };
+                if physical && !b.panels.is_empty() {
+                    npu_panels_bytes += b.panels.iter().map(Vec::len).sum::<usize>();
+                    resident.push(LayerPanels { layer: index, shape: transport_shape(shape), panels: b.panels });
+                }
+                layers.push(NpuLayer { shape, map: b.map, twin });
             }
-            let a = gpu.zeros(&[layout(Shape::GdnIn, rows).a_bytes()], DType::Raw)?; allocations.push(a.sub_offset(0, a.numel()));
+            let emulation = if physical { None } else {
+                // A geometry depends only on rows and K, not selected columns.
+                let a_bytes = NpuBf16Layout { padded_rows: rows.div_ceil(256) * 256, k: 2560, panels: 1 }.a_bytes();
+                let a = gpu.zeros(&[a_bytes], DType::Raw)?; allocations.push(a.sub_offset(0, a.numel()));
+                let cols = layers.iter().map(|layer| layer.map.padded_cols()).max().unwrap_or(0).max(1);
+                let sums = gpu.zeros(&[rows * cols * 4], DType::Raw)?; allocations.push(sums.sub_offset(0, sums.numel()));
+                Some(EmulationScratch { a, sums })
+            };
             let d0 = gpu.zeros(&[rows * 4], DType::Raw)?; allocations.push(d0.sub_offset(0, d0.numel()));
             let d1 = gpu.zeros(&[rows * 4], DType::Raw)?; allocations.push(d1.sub_offset(0, d1.numel()));
-            let sums = gpu.zeros(&[rows * 16640 * 4], DType::Raw)?; allocations.push(sums.sub_offset(0, sums.numel()));
+            let resident_bytes = npu_panels_bytes + gpu_twin_bytes;
             let trace = hipfire_config::developer_var("HIPFIRE_QWEN4_NPU_TRUNK_TRACE").ok().filter(|s| !s.is_empty()).map(|path| {
                 std::fs::OpenOptions::new().create(true).append(true).open(path).map(std::io::BufWriter::new).map_err(fail)
             }).transpose()?;
             pack_ms += started.elapsed().as_secs_f64() * 1000.0;
             let runtime = if physical {
-                let programs = trunk::build_rowmajor_programs(8192).map_err(fail)?;
-                let programs = programs.per_shape.into_iter().map(|p| PanelProgram {
-                    shape: transport_shape(p.shape), pdi: p.design.pdi, txn: p.design.insts, padded_rows: 8192,
+                let programs = trunk::build_rowmajor_programs_for_families(8192, families).map_err(fail)?;
+                let programs = programs.per_shape.into_iter().filter(|p| p.panel_count != 0).map(|p| PanelProgram {
+                    shape: transport_shape(p.shape), pdi: p.design.pdi, txn: p.design.insts, padded_rows: 8192, pitch: p.padded_cols,
                 }).collect();
                 let pci = gpu.hip.device_pci_bus_id(gpu.device_id)?;
                 Some(NpuTrunkRuntime::open(programs, resident, 2, 8192, &pci).map_err(fail)?)
             } else { None };
             let arenas = runtime.as_ref().map(|rt| -> Result<_, Qwen4GpuForwardError> {
                 Ok([
-                    [registered_c_view(rt, 0, Shape::GdnIn)?, registered_c_view(rt, 0, Shape::QsaIn)?],
-                    [registered_c_view(rt, 1, Shape::GdnIn)?, registered_c_view(rt, 1, Shape::QsaIn)?],
+                    [registered_c_view(rt, 0, Shape::GdnIn, families)?, registered_c_view(rt, 0, Shape::QsaIn, families)?],
+                    [registered_c_view(rt, 1, Shape::GdnIn, families)?, registered_c_view(rt, 1, Shape::QsaIn, families)?],
                 ])
             }).transpose()?;
             let (bank_b,host_tokens,host_ple) = if physical {
-                let (scratch,ids,ple)=Qwen4GpuForwardScratch::new(gpu,&bundle.config,rows,scratch_mode)?;
+                let (scratch,ids,ple)=Qwen4GpuForwardScratch::new_npu_bank(gpu,&bundle.config,scratch)?;
                 (Some(scratch),ids,ple)
             } else { (None,Vec::new(),Vec::new()) };
             let zab_source = if pre_overlay { "stock-MQ6-DtoH-before-overlay" } else { "stock-MQ6-DtoH" };
-            eprintln!("npu-trunk: mode={mode} families=all contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} runtime={} raw=DtoH(no-retained-host-copy)", if runtime.is_some() { "open" } else { "not-opened" });
-            Ok(Some(Self { mode, layers, a, scales: [d0,d1], sums, bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
+            let bank_b_bytes = match bank_b.as_ref() {
+                Some(bank) => Qwen4GpuForwardScratch::npu_bank_plan_bytes(&bank.slots)?,
+                None => 0,
+            };
+            eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
+            Ok(Some(Self { mode, families, layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
                 calibration, n_star, request_plan: None, request_origin: 0 }))
         })();
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
@@ -273,7 +309,7 @@ impl NpuForward {
     pub(super) fn plan_request(&mut self, rows: usize, position: usize) {
         if self.request_plan.is_some() || self.mode != NpuTrunkMode::Auto { return; }
         let cal = self.calibration.as_ref().expect("auto requires matched calibration");
-        let planned = trunk::plan(cal, FamilyMask::ALL, rows);
+        let planned = trunk::plan(cal, self.families, rows);
         let executable = trunk::executable_plan(cal, &planned, rows, self.n_star);
         eprintln!("{}", trunk::request_log_line(rows, &executable));
         self.request_origin = position;
@@ -295,7 +331,9 @@ impl NpuForward {
         let mut first = None;
         if let Some(rt) = self.runtime { if let Err(e) = rt.close() { first = Some(hip_bridge::HipError::new(1, &e)); } }
         if let Some(b) = self.bank_b { if let Some(e) = b.free_gpu(gpu) { first.get_or_insert(e); } }
-        for t in self.layers.into_iter().flat_map(|l| [l.w,l.scales]).chain([self.a,self.sums]).chain(self.scales) {
+        let twins = self.layers.into_iter().filter_map(|layer| layer.twin).flat_map(|twin| [twin.w, twin.scales]);
+        let emulation = self.emulation.into_iter().flat_map(|scratch| [scratch.a, scratch.sums]);
+        for t in twins.chain(emulation).chain(self.scales) {
             if let Err(e) = gpu.free_tensor(t) { first.get_or_insert(e); }
         }
         first.map_or(Ok(()), Err)
@@ -322,34 +360,49 @@ impl NpuForward {
             _ => Err(fail("expected mixer step")),
         }
     }
+    fn shape_map(&self, shape: Shape) -> &trunk::ColumnMap {
+        &self.layers.iter().find(|l| l.shape == shape).expect("Flash-Next shape").map
+    }
     fn destinations<'a>(&self, step: &'a Step<'_>, qkv: &'a GpuTensor) -> Result<SmallVec<[NpuTrunkOutput<'a>; 4]>, Qwen4GpuForwardError> {
         let (shape, targets): (Shape, [(Family, &GpuTensor); 4]) = match step {
             Step::GatedDeltaNet(op) => (Shape::GdnIn, [(Family::GdnQkv,qkv),(Family::GdnZ,op.z_output),(Family::GdnA,op.a),(Family::GdnB,op.b)]),
             Step::IndexedAttention(op) => (Shape::QsaIn, [(Family::QsaQ,op.qgate_scratch),(Family::QsaK,op.k_scratch),(Family::QsaV,op.v_scratch),(Family::QsaIdx,op.index_scratch)]),
             _ => return Err(fail("expected mixer")),
         };
-        let map = shape.column_map(FamilyMask::ALL);
-        targets.into_iter().map(|(f,t)| map.gpu_output(f,t).map_err(Into::into)).collect()
+        let map = self.shape_map(shape);
+        targets.into_iter().filter(|(f,_)| self.families.contains(*f)).map(|(f,t)| map.gpu_output(f,t).map_err(Into::into)).collect()
     }
     fn pack(&self, gpu: &mut Gpu, step: &Step<'_>, bank: usize, pipe: bool) -> Result<u64, Qwen4GpuForwardError> {
         let (input, rows, shape) = match step { Step::GatedDeltaNet(op) => (op.input,op.rows,Shape::GdnIn), Step::IndexedAttention(op) => (op.input,op.rows,Shape::QsaIn), _ => return Err(fail("pack expected mixer")) };
+        let map = self.shape_map(shape);
         let x = gpu.rotate_x_mq_batched_f16(input,2560,rows)?;
         let pack_issue_ns=if pipe && self.trace.is_some() {monotonic_ns()}else{0};
         if pipe {
             let rt = self.runtime.as_ref().ok_or_else(|| fail("runtime missing"))?;
-            unsafe { gpu.npu_trunk_pack_a_bf16_ptr(&x,rows,layout(shape,8192),rt.a_arena(bank).map_err(fail)?.device as *mut c_void,&self.scales[bank])?; }
-        } else { gpu.npu_trunk_pack_a_bf16(&x,rows,layout(shape,rows),&self.a,&self.scales[bank])?; }
+            unsafe { gpu.npu_trunk_pack_a_bf16_ptr(&x,rows,layout(map,8192),rt.a_arena(bank).map_err(fail)?.device as *mut c_void,&self.scales[bank])?; }
+        } else { gpu.npu_trunk_pack_a_bf16(&x,rows,layout(map,rows),&self.emulation.as_ref().expect("emulate scratch").a,&self.scales[bank])?; }
         Ok(pack_issue_ns)
     }
     fn emulate(&self, gpu: &mut Gpu, layer: usize, step: &Step<'_>) -> Result<(), Qwen4GpuForwardError> {
         self.pack(gpu, step, 0, false)?;
         let qkv = self.qkv_view(gpu,step)?;
-        let shape = self.layers[layer].shape;
         let rows = match step { Step::GatedDeltaNet(op)=>op.rows, Step::IndexedAttention(op)=>op.rows, _=>unreachable!() };
         let outs = self.destinations(step,&qkv)?;
         let l = &self.layers[layer];
-        gpu.npu_trunk_emulate_bf16(&self.a,&l.w,&l.scales,&self.scales[0],&self.sums,layout(shape,rows),rows,l.map.padded_cols(),&outs)?;
+        let scratch = self.emulation.as_ref().expect("emulate scratch");
+        let twin = l.twin.as_ref().expect("emulate twin");
+        gpu.npu_trunk_emulate_bf16(&scratch.a,&twin.w,&twin.scales,&self.scales[0],&scratch.sums,layout(&l.map,rows),rows,l.map.padded_cols(),&outs)?;
         Ok(())
+    }
+    fn uncovered(&self, gpu: &mut Gpu, step: &Step<'_>) -> Result<(), Qwen4GpuForwardError> {
+        let covered = |families: [Family; 4]| families.map(|f| self.families.contains(f));
+        match step {
+            Step::GatedDeltaNet(op) => execute_gated_delta_net_uncovered(gpu, op,
+                covered([Family::GdnQkv, Family::GdnA, Family::GdnB, Family::GdnZ])).map_err(fail),
+            Step::IndexedAttention(op) => execute_indexed_attention_uncovered(gpu, op,
+                covered([Family::QsaIdx, Family::QsaQ, Family::QsaK, Family::QsaV])).map_err(fail),
+            _ => unreachable!("typed mixer"),
+        }
     }
 }
 
@@ -375,10 +428,14 @@ impl NpuForward {
         for index in 0..steps.len() {
             if !matches!(steps[index],Step::GatedDeltaNet(_) | Step::IndexedAttention(_)) { continue; }
             execute(gpu,ctx,&steps[start..index])?;
-            self.emulate(gpu,layer,&steps[index])?;
-            phase(&mut steps[index],MixerPhase::Core);
-            execute(gpu,ctx,&steps[index..=index])?;
-            phase(&mut steps[index],MixerPhase::OutProj);
+            let covered = self.layers[layer].map.panel_count() != 0;
+            if covered {
+                self.emulate(gpu,layer,&steps[index])?;
+                self.uncovered(gpu,&steps[index])?;
+                phase(&mut steps[index],MixerPhase::Core);
+                execute(gpu,ctx,&steps[index..=index])?;
+                phase(&mut steps[index],MixerPhase::OutProj);
+            }
             // Use the same layer boundaries as the pipelined route, preserving
             // output/HC/MoE fusions but never fusing across a bank boundary.
             let next=(index+1..steps.len()).find(|&j|matches!(steps[j],Step::GatedDeltaNet(_) | Step::IndexedAttention(_)));
@@ -386,7 +443,8 @@ impl NpuForward {
                 let read=j-1;
                 if read>0 && matches!(steps[read-1],Step::GroupedDepthwise(_)) {read-1}else{read}
             });
-            execute(gpu,ctx,&steps[index..end])?;
+            if covered { execute(gpu,ctx,&steps[index..end])?; }
+            else { execute_validated_steps(gpu,ctx,&steps[index..end]).map_err(fail)?; }
             phase(&mut steps[index],MixerPhase::Whole);
             start=end;
             layer+=1;
@@ -417,16 +475,16 @@ fn commit_qsa(bundle: &mut Qwen4Bundle, commits: &[(usize,usize,usize,usize,usiz
 }
 
 impl NpuForward {
-    fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, layer: usize, bank: usize, records: &mut [TraceRow], stage: Option<&crate::bundle::PairSessionStage>) -> Result<Seq,Qwen4GpuForwardError> {
+    fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, layer: usize, bank: usize, records: &mut [TraceRow], stage: Option<&crate::bundle::PairSessionStage>) -> Result<Option<Seq>,Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref().expect("on runtime");
-        unsafe { rt.prepare_bank(bank,stream(gpu)).map_err(fail)?; }
-        if layer > 0 && !records.is_empty() {
-            // prepare_bank has already checked this generation. Harvest trace
-            // timestamps before kick replaces the bank's terminal record.
-            let r=&mut records[(layer-1)*2+bank];
-            let completion=rt.wait_host(Seq { bank, value:r.seq }).map_err(fail)?;
-            r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
+        let covered = self.layers[layer].map.panel_count() != 0;
+        if covered {
+            unsafe { rt.prepare_bank(bank,stream(gpu)).map_err(fail)?; }
+            if let Some(r) = records.iter_mut().take(layer*2).rev().find(|r| r.bank == bank && r.seq != 0 && r.done_ns == 0) {
+                let completion=rt.wait_host(Seq { bank, value:r.seq }).map_err(fail)?;
+                r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
+            }
         }
         // Includes PLE (when present) and the attention HC read. Neither reads
         // recurrent/QSA state; bank B's input can be prepared ahead of bank A.
@@ -440,6 +498,7 @@ impl NpuForward {
                 }
             }
         }
+        if !covered { return Ok(None); }
         let pack_issue_ns=self.pack(gpu,&program.steps[index],bank,true)?;
         let kick_ns=if records.is_empty(){0}else{monotonic_ns()};
         let seq=unsafe { rt.kick(layer,transport_shape(self.layers[layer].shape),bank,program.rows,stream(gpu)).map_err(fail)? };
@@ -447,26 +506,29 @@ impl NpuForward {
             let r=&mut records[layer*2+bank];
             r.pack_issue_ns=pack_issue_ns; r.kick_ns=kick_ns; r.seq=seq.value;
         }
-        Ok(seq)
+        Ok(Some(seq))
     }
-    fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, layer: usize, bank: usize, seq: Seq, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
+    fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, layer: usize, bank: usize, seq: Option<Seq>, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref().expect("on runtime");
-        unsafe { rt.wait_gpu(seq,stream(gpu)).map_err(fail)?; }
+        if let Some(seq) = seq { unsafe { rt.wait_gpu(seq,stream(gpu)).map_err(fail)?; } }
         let wait_enqueue_ns=monotonic_ns();
         if !records.is_empty() {
             let r=&mut records[layer*2+bank];
             r.wait_enqueue_ns=wait_enqueue_ns; r.consume_issue_ns=0;
             gpu.hip.event_record(&r.start,gpu.active_stream.as_ref())?;
         }
+        if seq.is_none() {
+            execute_validated_steps(gpu,ctx,&program.steps[index..program.ranges[layer].end]).map_err(fail)?;
+            if !records.is_empty() { gpu.hip.event_record(&records[layer*2+bank].end,gpu.active_stream.as_ref())?; }
+            return Ok(());
+        }
+        self.uncovered(gpu,&program.steps[index])?;
         phase(&mut program.steps[index],MixerPhase::Core);
         let shape = self.layers[layer].shape;
-        let tensor = &self.arenas.as_ref().expect("on arena views")[bank][shape.index()];
+        let tensor = self.arenas.as_ref().expect("on arena views")[bank][shape.index()].as_ref().expect("selected shape arena");
         let map = &self.layers[layer].map;
-        let family = |family| {
-            let &(_, col0, _) = map.parts.iter().find(|&&(f, _, _)| f == family).expect("full family map");
-            Bf16Arena { tensor, row_pitch_elems: map.padded_cols(), col0_elems: col0 as usize }
-        };
+        let family = |family| family_view(map, tensor, family);
         match &program.steps[index] {
             Step::GatedDeltaNet(op) => execute_gated_delta_net_arena(gpu, op, GdnTrunkArenas {
                 qkv: family(Family::GdnQkv), z: family(Family::GdnZ),
@@ -482,7 +544,7 @@ impl NpuForward {
         // cache/index appends). OutProj and the remaining layer read only scratch.
         // prepare_bank waits this event before packing A; kick records ready
         // after that wait/pack, and the relay waits ready before its next C write.
-        unsafe { rt.retire_bank(seq,stream(gpu)).map_err(fail)?; }
+        unsafe { rt.retire_bank(seq.expect("covered bank sequence"),stream(gpu)).map_err(fail)?; }
         phase(&mut program.steps[index],MixerPhase::OutProj);
         execute(gpu,ctx,&program.steps[index..program.ranges[layer].end])?;
         if !records.is_empty() { gpu.hip.event_record(&records[layer*2+bank].end,gpu.active_stream.as_ref())?; }
@@ -568,6 +630,7 @@ impl NpuForward {
                 self.prepare(gpu,&ctx,&programs[0],0,0,&mut records,stage.as_ref())?,
                 self.prepare(gpu,&ctx,&programs[1],0,1,&mut records,None)?,
             ];
+            let mut last_seq = seq;
             let mut gdn_slot = 0;
             let mut qsa_slot = 0;
             for (layer,bank) in bank_visits(bundle.config.num_hidden_layers) {
@@ -589,6 +652,7 @@ impl NpuForward {
                 }
                 if layer+1<bundle.config.num_hidden_layers {
                     seq[bank]=self.prepare(gpu,&ctx,&programs[bank],layer+1,bank,&mut records,if bank == 0 { stage.as_ref() } else { None })?;
+                    if seq[bank].is_some() { last_seq[bank] = seq[bank]; }
                 }
             }
             // Only already-enqueued chains are checked here. Failed terminal
@@ -596,10 +660,11 @@ impl NpuForward {
             // output/head/capture or request state is published on that path.
             let rt=self.runtime.as_ref().expect("on runtime");
             for bank in 0..2 {
-                let completion=rt.wait_host(seq[bank]).map_err(fail)?;
-                if !records.is_empty() {
-                    let r=&mut records[(bundle.config.num_hidden_layers-1)*2+bank];
-                    r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
+                if let Some(seq) = last_seq[bank] {
+                    let completion=rt.wait_host(seq).map_err(fail)?;
+                    if let Some(r) = records.iter_mut().rev().find(|r| r.bank == bank && r.seq == seq.value) {
+                        r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
+                    }
                 }
             }
             rt.check_error().map_err(fail)?;
@@ -701,6 +766,29 @@ pub(super) fn pair_rows(remaining: usize, chunk: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn every_mask_selects_only_covered_family_views() {
+        for bits in 0..=u8::MAX {
+            let mask = FamilyMask::from_bits(bits);
+            for shape in Shape::ALL {
+                let map = shape.column_map(mask);
+                let tensor = GpuTensor {
+                    buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::dangling_mut(), 256 * map.padded_cols() * 2) },
+                    shape: vec![256, map.padded_cols()], dtype: DType::BF16,
+                };
+                let mut col = 0;
+                for family in Family::ALL.into_iter().filter(|f| f.shape() == shape) {
+                    let view = family_view(&map, &tensor, family);
+                    assert_eq!(view.is_some(), mask.contains(family));
+                    if let Some(view) = view {
+                        assert_eq!((view.col0_elems, view.row_pitch_elems), (col, map.padded_cols()));
+                        col += family.cols();
+                    }
+                }
+                assert_eq!(map.panel_count(), col.div_ceil(1280));
+                assert_eq!(map.padded_cols(), col.div_ceil(1280) * 1280);
+            }
+        }
+    }
     #[test] fn partial_bank_views_use_live_rows_and_keep_allocation_capacity() {
         let config = crate::config::compact_test_config();
         let dims = program_dims(&config);

@@ -250,12 +250,11 @@ pub fn select_families(cal: &Calibration) -> (FamilyMask, SelectionReport) {
     (families, SelectionReport { subsets, best_families })
 }
 
-/// 0.4.2 can execute only the full four-family selection.
+/// Admit any nonempty calibrated family subset.
 pub fn auto_admission(cal: &Calibration, current: &CalKey) -> Result<FamilyMask, String> {
     cal.key_matches(current)?;
     let (families, _) = select_families(cal);
     if families.is_empty() { return Err("calibration selects no families".into()); }
-    if families != FamilyMask::ALL { return Err("calibration selects a subset; 0.4.2 requires all four families".into()); }
     Ok(families)
 }
 

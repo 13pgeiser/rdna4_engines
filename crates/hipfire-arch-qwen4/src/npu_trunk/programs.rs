@@ -119,15 +119,16 @@ pub fn build_programs_for_families(
     })
 }
 
-/// Full-family direct BF16 programs for fused row-major transport.
-pub fn build_rowmajor_programs(rows_max: usize) -> Result<NpuPrograms, String> {
+/// Compacted row-major pitches; zero-panel shapes are not submitted.
+pub fn build_rowmajor_programs_for_families(rows_max: usize, families: FamilyMask) -> Result<NpuPrograms, String> {
     if !(1..=ROWS_LIMIT).contains(&rows_max) {
         return Err(format!("npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"));
     }
     let rows = rows_max.div_ceil(WAVE_ROWS) * WAVE_ROWS;
     let program = |shape: Shape| -> Result<ShapeProgram, String> {
-        let map = shape.column_map(FamilyMask::ALL);
-        let design = build_panel_program_rowmajor(rows, map.padded_cols(), 0)?;
+        let map = shape.column_map(families);
+        // A zero-panel record carries a valid unused design, never an arena.
+        let design = build_panel_program_rowmajor(rows, map.padded_cols().max(1280), 0)?;
         Ok(ShapeProgram {
             shape, panel_count: map.panel_count(), padded_cols: map.padded_cols(),
             arg_bytes: [design.args[0].bytes, design.args[1].bytes, design.args[2].bytes],
@@ -143,15 +144,24 @@ pub fn build_rowmajor_programs(rows_max: usize) -> Result<NpuPrograms, String> {
 
 #[cfg(test)]
 mod rowmajor_tests {
+    use super::super::Family;
     use super::*;
 
     #[test]
     fn shape_programs_declare_fused_arena_sizes() {
-        let programs = build_rowmajor_programs(8192).unwrap();
+        let programs = build_rowmajor_programs_for_families(8192, FamilyMask::ALL).unwrap();
         for p in &programs.per_shape {
             assert_eq!(p.arg_bytes[2], 8192 * p.padded_cols * 2);
             assert_eq!(p.panel_count * 1280, p.padded_cols);
         }
         assert_eq!(programs.per_shape[0].design.pdi, programs.per_shape[1].design.pdi);
+    }
+    #[test]
+    fn qkv_only_compacts_pitch_and_omits_qsa() {
+        let programs = build_rowmajor_programs_for_families(256, Family::GdnQkv.into()).unwrap();
+        let gdn = programs.get(Shape::GdnIn);
+        assert_eq!((gdn.panel_count, gdn.padded_cols), (8, 10240));
+        assert_eq!(gdn.arg_bytes[2], 256 * 10240 * 2);
+        assert_eq!(programs.get(Shape::QsaIn).panel_count, 0);
     }
 }

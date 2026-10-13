@@ -247,7 +247,7 @@ fn npu_trunk_auto_admission_matrix() {
     let mut subset = c.clone();
     subset.gpu.trunk_in_ms_per_8192.insert("zab".into(), 0.0);
     assert_eq!(select_families(&subset).0, FamilyMask::from(Family::GdnQkv) | FamilyMask::QSA);
-    assert_eq!(auto_admission(&subset, &subset.key), Err("calibration selects a subset; 0.4.2 requires all four families".into()));
+    assert_eq!(auto_admission(&subset, &subset.key), Ok(FamilyMask::from(Family::GdnQkv) | FamilyMask::QSA));
     let mut none = c.clone();
     none.npu.tops_corun = 0.001;
     assert_eq!(select_families(&none).0, FamilyMask::NONE);

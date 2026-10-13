@@ -25,27 +25,28 @@ impl Shape {
 }
 
 /// One row-major design per shape, with col0=0; every panel reuses it.
-/// Supply build_panel_program_rowmajor(rows_max, shape.pitch(), 0)'s bytes.
-pub struct PanelProgram { pub shape: Shape, pub pdi: Vec<u8>, pub txn: Vec<u8>, pub padded_rows: usize }
+/// Supply build_panel_program_rowmajor(rows_max, pitch, 0)'s bytes.
+pub struct PanelProgram { pub shape: Shape, pub pdi: Vec<u8>, pub txn: Vec<u8>, pub padded_rows: usize, pub pitch: usize }
 /// Every entry is already pack_b_bf16 encoded, including Sm/Se sidecars.
 pub struct LayerPanels { pub layer: usize, pub shape: Shape, pub panels: Vec<Vec<u8>> }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArenaLayout { pub padded_rows: usize, pub a_bytes: usize, pub b_bytes: usize }
+pub struct ArenaLayout { pub padded_rows: usize, pub a_bytes: usize, pub b_bytes: usize, pitches: [usize; 2] }
 impl ArenaLayout {
     pub fn new(rows_max: usize) -> Result<Self, String> {
         if !(1..=65536).contains(&rows_max) { return Err("rows_max outside 1..=65536".into()); }
         let padded_rows = rows_max.div_ceil(256) * 256;
-        Ok(Self { padded_rows, a_bytes: padded_rows * 2880, b_bytes: 8 * 40 * 2 * 5504 })
+        Ok(Self { padded_rows, a_bytes: padded_rows * 2880, b_bytes: 8 * 40 * 2 * 5504,
+            pitches: [Shape::GdnIn.pitch(), Shape::QsaIn.pitch()] })
     }
-    pub fn c_bytes(self, shape: Shape) -> usize { self.padded_rows * shape.pitch() * 2 }
+    pub fn c_bytes(self, shape: Shape) -> usize { self.padded_rows * self.pitches[shape.index()] * 2 }
     pub fn c_offset(self, shape: Shape, panel: usize) -> Result<usize, String> {
-        if panel >= shape.panels() { Err("panel index outside C arena".into()) } else { Ok(panel * PANEL_N * 2) }
+        if panel >= self.pitches[shape.index()] / PANEL_N { Err("panel index outside C arena".into()) } else { Ok(panel * PANEL_N * 2) }
     }
     /// Addressed span, not the full arg2 declaration: offset panels write only
     /// their 1280 columns on each row, including the final padded row.
     pub fn c_span(self, shape: Shape) -> usize {
-        ((self.padded_rows - 1) * shape.pitch() + PANEL_N) * 2
+        ((self.padded_rows - 1) * self.pitches[shape.index()] + PANEL_N) * 2
     }
 }
 
@@ -193,13 +194,18 @@ impl NpuTrunkRuntime {
     /// there are no production environment flags or injected success/failure hooks.
     pub fn open_with_watchdog(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str, watchdog: Duration) -> Result<Self, String> {
         if watchdog.is_zero() || watchdog > WAIT_TIMEOUT { return Err("chain watchdog outside (0, WAIT_TIMEOUT]".into()); }
-        let layout = ArenaLayout::new(rows_max)?;
+        let mut layout = ArenaLayout::new(rows_max)?;
+        layout.pitches = [0; 2];
         if banks == 0 { return Err("trunk needs at least one bank".into()); }
         let mut shapes = Vec::new();
         for program in &programs {
             if shapes.contains(&program.shape) { return Err("duplicate shape program".into()); }
             if program.pdi.is_empty() || program.txn.is_empty() { return Err("empty panel program".into()); }
             if program.padded_rows != layout.padded_rows { return Err("panel program padded_rows mismatch".into()); }
+            if program.pitch == 0 || program.pitch % PANEL_N != 0 || program.pitch > program.shape.pitch() {
+                return Err("invalid compacted panel pitch".into());
+            }
+            layout.pitches[program.shape.index()] = program.pitch;
             if programs[0].pdi != program.pdi { return Err("shape programs must share the G80 PDI".into()); }
             shapes.push(program.shape);
         }
@@ -207,7 +213,7 @@ impl NpuTrunkRuntime {
         for l in &layers {
             if !shapes.contains(&l.shape) { return Err("missing shape program".into()); }
             if keys.contains(&(l.layer, l.shape)) { return Err("duplicate layer/shape".into()); }
-            if l.panels.len() != l.shape.panels() || l.panels.iter().any(|b| b.len() != layout.b_bytes) {
+            if l.panels.len() != layout.pitches[l.shape.index()] / PANEL_N || l.panels.iter().any(|b| b.len() != layout.b_bytes) {
                 return Err(format!("layer {} {:?}: invalid BF16 B panel count/size", l.layer, l.shape));
             }
             keys.push((l.layer, l.shape));
@@ -219,7 +225,9 @@ impl NpuTrunkRuntime {
         let mut storage = Vec::with_capacity(banks);
         for _ in 0..banks {
             storage.push(Bank { a: Arena::new(&hip, layout.a_bytes)?,
-                c: [Arena::new(&hip, layout.c_bytes(Shape::GdnIn))?, Arena::new(&hip, layout.c_bytes(Shape::QsaIn))?],
+                // An absent shape keeps only one registration page for the fixed
+                // binding table, never a full output arena.
+                c: [Arena::new(&hip, layout.c_bytes(Shape::GdnIn).max(4096))?, Arena::new(&hip, layout.c_bytes(Shape::QsaIn).max(4096))?],
                 control: Arena::new(&hip, 4096)?, ready: hip.system_event()?, acquire: hip.system_event()?, retired: hip.system_event()? });
         }
         let pages = storage.iter().map(|b| BankPages { a: b.a.pages.ptr as usize, a_len: b.a.pages.len,
@@ -431,7 +439,7 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             }
             for bank in 0..pages.len() {
                 let start = r.commands.len();
-                for panel in 0..l.shape.panels() {
+                for panel in 0..l.panels.len() {
                     r.commands.push(prepared_panel(&dev, &r.insts[program], &r.a[bank], &r.b[b_start + panel],
                         &r.c[bank * 2 + l.shape.index()], layout.c_offset(l.shape, panel)?, layout.c_span(l.shape))?);
                 }
@@ -490,6 +498,18 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn compacted_qkv_arena_has_eight_panel_windows() {
+        let mut l = ArenaLayout::new(8192).unwrap();
+        l.pitches = [10240, 0];
+        assert_eq!(l.c_bytes(Shape::GdnIn), 8192 * 10240 * 2);
+        assert_eq!(l.c_bytes(Shape::QsaIn), 0);
+        for panel in 0..8 {
+            assert_eq!(l.c_offset(Shape::GdnIn, panel).unwrap(), panel * 1280 * 2);
+            assert!(l.c_offset(Shape::GdnIn, panel).unwrap() + l.c_span(Shape::GdnIn) <= l.c_bytes(Shape::GdnIn));
+        }
+        assert!(l.c_offset(Shape::GdnIn, 8).is_err());
+        assert!(l.c_offset(Shape::QsaIn, 0).is_err());
+    }
     #[test] fn production_arena_sizes_and_offsets() {
         let l = ArenaLayout::new(8192).unwrap();
         assert_eq!(l.a_bytes, 23_592_960);
