@@ -6865,7 +6865,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     if let Some(tape) = gdn_tape.as_ref() {
         if let Some(sink) = tape_sink {
             push_gdn_tape_copies(sink, tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
-        } else if fusion == DflashFusionCtx::ChainVerify
+        } else if fusion.is_chain_verify()
             && matches!(batch_semantics, BatchSemantics::Sequential)
             && tree_verify.as_ref().and_then(|c| c.parent_indices).is_none()
             && verify_tape_copy_batch_enabled()
@@ -13448,7 +13448,7 @@ fn forward_prefill_chunk_pair(
     );
     let ctx = DispatchCtx::new(gpu)
         .with_workload(dispatch_workload)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify);
+        .with_verify_tile_attend(fusion.is_chain_verify());
 
     // Mask slot is call-relative: rebase per half.
     let mo_c = mask_override.as_ref().and_then(|ovr| {
@@ -14384,7 +14384,7 @@ pub(crate) fn forward_batch_chunk_impl(
                 && (n % 512 == 0 || (64..512).contains(&(n % 512)))));
     let ctx = DispatchCtx::new(gpu)
         .with_workload(dispatch_workload)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify)
+        .with_verify_tile_attend(fusion.is_chain_verify())
         .with_batch_size(n);
 
     for layer_idx in layer_start..layer_end {

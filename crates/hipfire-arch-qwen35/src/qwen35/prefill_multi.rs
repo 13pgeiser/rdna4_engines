@@ -562,7 +562,7 @@ fn lane_gdn_chunk_admitted(
             || (lane_gdn_varrows_enabled()
                 && reqs.iter().all(|r| (1..=LANE_GDN_VARROWS_MAX_N).contains(&r.tokens.len()))))
         && reqs.iter().all(|r| {
-            r.fusion == DflashFusionCtx::ChainVerify && r.gdn_tape.is_some_and(|t| r.tokens.len() <= t.max_n)
+            r.fusion.is_chain_verify() && r.gdn_tape.is_some_and(|t| r.tokens.len() <= t.max_n)
         })
 }
 
@@ -670,7 +670,7 @@ fn lane_fa_chunk_admitted(
             false,
             false,
         );
-        if r.fusion != DflashFusionCtx::ChainVerify
+        if !r.fusion.is_chain_verify()
             || !kv.quant_fp8
             || kv.compact_offset != 0
             || !(MIN_BATCH..64).contains(&n)
@@ -876,7 +876,7 @@ fn attn_fp8_twin_eligible(
         && kv.quant_fp8
         && (MIN_BATCH..64).contains(&n)
         && start_pos + n <= 4096
-        && fusion != DflashFusionCtx::ChainVerify)
+        && !fusion.is_chain_verify())
     {
         return false;
     }
@@ -1565,7 +1565,7 @@ pub fn forward_prefill_batch_multi(
                     for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
                         let n = r.tokens.len();
                         let max_ctx_len = r.start_pos + n;
-                        let rctx = if r.fusion == DflashFusionCtx::ChainVerify { &chain_ctx } else { &ctx };
+                        let rctx = if r.fusion.is_chain_verify() { &chain_ctx } else { &ctx };
                         let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, r.fusion, n);
                         let multirow = q8_multirow_attn_admitted(
                             gpu.arch_caps.arch(),
