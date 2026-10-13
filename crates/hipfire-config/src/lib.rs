@@ -3617,12 +3617,12 @@ pub static FIELDS: &[ConfigField] = &[
         "npu_trunk",
         Fusions,
         ModelLoad,
-        DefaultValue::String("off"),
+        DefaultValue::String("auto"),
         ValueRule::Enum(&["off", "auto", "on", "emulate"]),
         false,
         true,
         Some("HIPFIRE_QWEN4_NPU_TRUNK"),
-        "Experimental Qwen4 trunk projection engine; off leaves every projection on the GPU."
+        "Qwen4 trunk projection engine; auto admits calibrated gfx1151 NPU prefill, off is the GPU-only kill switch."
     ),
     field!(
         "fusions.npu_trunk_calibration",
@@ -3634,7 +3634,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_QWEN4_NPU_TRUNK_CAL"),
-        "Stored NPU trunk calibration path; empty resolves to <hipfire home>/npu-trunk/calibration.json; never read when off."
+        "NPU trunk calibration path; empty resolves to <hipfire home>/npu-trunk/calibration.json; absent file uses the keyed builtin; never read when effectively off."
     ),
     field!(
         "fusions.policy",

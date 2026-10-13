@@ -4,9 +4,7 @@
 
 //! NPU-trunk mode: the single user-facing switch of the Qwen4 integration.
 //!
-//! The mode is read through the central developer-config accessor
-//! ([`hipfire_config::developer_var`]), so the `HIPFIRE_*` key is registered with the
-//! process configuration automatically and no `std::env` access happens here.
+//! The mode borrows the central process-config snapshot without allocating.
 
 use std::fmt;
 use std::str::FromStr;
@@ -18,13 +16,13 @@ pub const NPU_TRUNK_DAEMON_KEY: &str = "npu_trunk";
 
 /// How the Flash-Next trunk projections reach the NPU.
 ///
-/// `Off` (the default) never allocates, never opens a device and never packs weights.
+/// `Auto` is the default; it resolves silently to `Off` outside gfx1151.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NpuTrunkMode {
     /// Trunk projections stay on the GPU; nothing NPU-related is touched.
-    #[default]
     Off,
     /// Use the NPU when it is present and the plan predicts a gain, else fall back to the GPU.
+    #[default]
     Auto,
     /// Require the NPU; failure to open it is an error.
     On,
@@ -51,26 +49,29 @@ impl NpuTrunkMode {
         matches!(self, Self::Off)
     }
 
-    /// Parse an optional raw value: `None` (key absent) is [`NpuTrunkMode::Off`]; a present value
-    /// must be a valid spelling (an empty value is an error, never silently `Off`).
+    /// An absent key defaults to `Auto`; a present value must be valid.
     pub fn from_value(value: Option<&str>) -> Result<Self, String> {
         match value {
-            None => Ok(Self::Off),
+            None => Ok(Self::Auto),
             Some(raw) => raw
                 .parse::<Self>()
                 .map_err(|e| format!("{NPU_TRUNK_ENV}: {e}")),
         }
     }
 
-    /// Resolve the mode from the process configuration (`HIPFIRE_QWEN4_NPU_TRUNK`); unset is `Off`.
+    /// Borrow the validated process snapshot; no per-load allocation or I/O.
     pub fn from_env() -> Result<Self, String> {
-        match hipfire_config::developer_var(NPU_TRUNK_ENV) {
-            Ok(raw) => Self::from_value(Some(&raw)),
-            Err(std::env::VarError::NotPresent) => Ok(Self::Off),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                Err(format!("{NPU_TRUNK_ENV}: value is not valid UTF-8"))
-            }
-        }
+        let config = hipfire_config::active_or_local_process_config();
+        let raw = match config.values.values.get("fusions.npu_trunk") {
+            Some(hipfire_config::ConfigValue::String(raw)) => Some(raw.as_str()),
+            _ => None,
+        };
+        Self::from_value(raw)
+    }
+
+    /// Resolve auto before any arch-specific work, logging or allocation.
+    pub fn resolve(self, arch: &str) -> Self {
+        if self == Self::Auto && arch != "gfx1151" { Self::Off } else { self }
     }
 }
 
@@ -79,16 +80,11 @@ impl FromStr for NpuTrunkMode {
 
     /// Case-insensitive, surrounding whitespace ignored: `off`, `auto`, `on`, `emulate`.
     fn from_str(s: &str) -> Result<Self, String> {
-        let t = s.trim().to_ascii_lowercase();
-        match t.as_str() {
-            "off" => Ok(Self::Off),
-            "auto" => Ok(Self::Auto),
-            "on" => Ok(Self::On),
-            "emulate" => Ok(Self::Emulate),
-            _ => Err(format!(
-                "invalid npu trunk mode {s:?} (expected off, auto, on or emulate)"
-            )),
+        let t = s.trim();
+        for mode in Self::ALL {
+            if t.eq_ignore_ascii_case(mode.as_str()) { return Ok(mode); }
         }
+        Err(format!("invalid npu trunk mode {s:?} (expected off, auto, on or emulate)"))
     }
 }
 
@@ -103,9 +99,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_off() {
-        assert_eq!(NpuTrunkMode::default(), NpuTrunkMode::Off);
-        assert!(NpuTrunkMode::default().is_off());
+    fn default_auto_resolves_per_arch() {
+        assert_eq!(NpuTrunkMode::default(), NpuTrunkMode::Auto);
+        assert_eq!(NpuTrunkMode::Auto.resolve("gfx1151"), NpuTrunkMode::Auto);
+        for arch in ["gfx1201", "gfx1100"] {
+            assert_eq!(NpuTrunkMode::Auto.resolve(arch), NpuTrunkMode::Off);
+            for mode in [NpuTrunkMode::Off, NpuTrunkMode::On, NpuTrunkMode::Emulate] {
+                assert_eq!(mode.resolve(arch), mode);
+            }
+        }
         assert!(!NpuTrunkMode::On.is_off());
     }
 
@@ -137,8 +139,8 @@ mod tests {
     }
 
     #[test]
-    fn from_value_absent_is_off_present_is_strict() {
-        assert_eq!(NpuTrunkMode::from_value(None), Ok(NpuTrunkMode::Off));
+    fn from_value_absent_is_auto_present_is_strict() {
+        assert_eq!(NpuTrunkMode::from_value(None), Ok(NpuTrunkMode::Auto));
         assert_eq!(NpuTrunkMode::from_value(Some("on")), Ok(NpuTrunkMode::On));
         let err = NpuTrunkMode::from_value(Some("")).unwrap_err();
         assert!(err.starts_with(NPU_TRUNK_ENV), "{err}");
@@ -152,7 +154,7 @@ mod tests {
         assert_eq!(NPU_TRUNK_DAEMON_KEY, "npu_trunk");
         let field = hipfire_config::field(NPU_TRUNK_DAEMON_KEY).expect("registered npu_trunk schema");
         assert_eq!(field.env_compat, Some(NPU_TRUNK_ENV));
-        assert!(matches!(field.default, hipfire_config::DefaultValue::String("off")));
+        assert!(matches!(field.default, hipfire_config::DefaultValue::String("auto")));
         for mode in NpuTrunkMode::ALL {
             assert!(field.validate(&hipfire_config::ConfigValue::String(mode.to_string())).is_ok());
         }

@@ -2,6 +2,8 @@
 //! Weight preparation, program selection and thin GPU glue for the opt-in
 //! Flash-Next NPU trunk. References live in pm-npu; no device opens here.
 
+pub(crate) mod admission;
+pub(crate) use calibration::{npu_firmware, runtime_key_with_firmware};
 mod calibration;
 mod config;
 mod gpu;

@@ -3669,9 +3669,9 @@ impl Qwen4GpuForward {
     /// Prepare the stock MQ6 trunk before the bundle swaps any overlay tensors.
     #[cfg(target_os = "linux")]
     pub(crate) fn prepare_npu_trunk(
-        gpu: &mut Gpu, bundle: &Qwen4Bundle, pre_overlay: bool,
+        gpu: &mut Gpu, bundle: &Qwen4Bundle, pre_overlay: bool, rows: usize, mode: Qwen4ForwardScratchMode,
     ) -> Result<Option<npu_forward::PreparedTrunk>, Qwen4GpuForwardError> {
-        npu_forward::NpuForward::prepare_stock(gpu, bundle, pre_overlay)
+        npu_forward::NpuForward::prepare_stock(gpu, bundle, pre_overlay, rows, mode)
     }
 
     pub(crate) fn new_inner(

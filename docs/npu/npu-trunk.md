@@ -4,9 +4,9 @@ The Qwen4 `npu_trunk` module owns CPU-only model preparation for hipfire 0.4.2;
 `pm-npu` owns the numerical reference, panel layout and deployment builder.
 Neither preparation path opens hardware or schedules prefill.
 
-`NpuTrunkMode::from_env()` reads `HIPFIRE_QWEN4_NPU_TRUNK` through
-`hipfire_config::developer_var`: `off` (default), `auto`, `on`, or `emulate`.
-Parsing a mode does not arm a route.
+`NpuTrunkMode::from_env()` borrows the central process snapshot for
+`HIPFIRE_QWEN4_NPU_TRUNK`: `off`, `auto` (default), `on`, or `emulate`.
+At load, auto resolves silently to off on every arch except gfx1151.
 
 ## Shapes and masks
 
@@ -410,13 +410,48 @@ nice -n 19 cargo test -p hipfire-arch-qwen4 --lib npu_trunk -j 12
 ## Calibrated serving route (Linux gfx1151, family B)
 
 `HIPFIRE_QWEN4_NPU_TRUNK=off|auto|on|emulate` is resolved at load.
-`off` stays the default and returns before index hashing, calibration reads,
-packing, new allocations, device opens, trace opens or new logging.
+The default is `auto`, effective only on gfx1151 (Strix Halo). Other arches
+resolve auto silently to off before index hashing, calibration/device I/O,
+packing, NPU allocations, trace opens or new logging. Explicit on/emulate
+refuse non-gfx1151. `off` / `fusions.npu_trunk = off` is the kill switch.
+
 `fusions.npu_trunk_calibration` (alias `npu_trunk_calibration`, env
 `HIPFIRE_QWEN4_NPU_TRUNK_CAL`) defaults, when empty, to
-`<hipfire home>/npu-trunk/calibration.json`.
+`<hipfire home>/npu-trunk/calibration.json`. A file at that path takes precedence.
+Only an absent file falls back to compiled-in measured Halo schema-3 records:
+`halo-xdna2-overlay-v4.json` (`overlay:gfx1151-zab-v1`) or
+`halo-xdna2-stock-v2.json` (`stock`). The stock lab record is schema-compatible,
+keyed stock, and measured for `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`.
+Invalid/unreadable files never fall back. Both sources require identical key
+checks; successful arming logs `cal_source=file|builtin`. The reference key is
+gfx1151 / `0000:c0:00.0`, firmware `1.1.2.65`, uname `7.3.0-rc7-perfopt+`,
+model index `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013`,
+BF16 and the matching stock/overlay route; the builtin does not admit other keys.
 
-| Mode | Calibration missing/invalid/key mismatch | Match: all selected | Match: subset/none |
+Admission runs in this order, before any stock MQ6 download/packing or NPU allocation:
+
+1. Flash-Next family-B K=2560, stock MQ6 shapes for every trunk family,
+   single-device/no EP, full scratch, 8192-row maximum chunk.
+2. The exact `/dev/accel/accel0` node railgun opens must be an amdxdna PCI
+   device with readable, nonempty `fw_version`; no runtime open yet.
+3. Load file-or-builtin calibration and match device, firmware, build contract,
+   uname, model index sha, epilogue and anticipated trunk route; select families.
+4. Download stock MQ6 before the overlay swap, pack only admitted families,
+   recheck the successfully applied route and actual scratch plan, then open
+   the runtime and allocate the second bank. Any auto preparation/open failure
+   frees partial resources and runs GPU-only. Armed logs are emitted only after success.
+
+Every auto refusal on gfx1151 logs exactly one `npu-trunk: off (<reason>)` line;
+it never fails a load. After admission, sticky runtime errors still fail the
+request closed; GPU fallback must not publish partial NPU results.
+
+The default-on decision uses Halo default serve config with the zab overlay,
+three fresh processes per arm: p16k 7,878 → 7,173 ms (−8.9%),
+p56k 30,052 → 27,867 ms (−7.3%). Greedy `on` and `emulate` bytes match;
+flag-off `serve_harness` battery and chain match beta. Kaden accepted S11 j103
+BF16-direct family B: ΔKLD WT2 −0.0005 / code24 +0.0052 (cap +0.015).
+
+| Mode | Calibration unavailable/invalid/key mismatch | Match: all selected | Match: subset/none |
 | --- | --- | --- | --- |
 | `off` | No I/O | GPU-only | GPU-only |
 | `auto` | Route off, one reason line | Admit stored plan | Admit subset plan; none stays native |
@@ -434,7 +469,7 @@ Split/rebalanced/rebanked ranges are projected to ordinary GPU chunks, never
 force-paired. The logged executable projection reflects those restrictions;
 snapshot boundaries may additionally veto a candidate pair.
 
-For both current stock and overlay records, executable pair starts/lengths are:
+For the historical stock-v2/overlay-v2 planner records, executable pair starts/lengths are:
 8000 and 9000: none; 16343: `(0,16343)`; 20000: `(0,16384)`;
 57544: `(0,16384),(16384,16384),(32768,16384)` with a GPU tail;
 65536: those three plus `(49152,16384)`. n* is 6848 stock / 8256 overlay,
@@ -491,14 +526,14 @@ that 57544's final rebalanced step is GPU-only. The previously documented
 snapshot and quality/TTFT gates still apply; CPU acceptance is not a silicon claim.
 
 
-The opt-in route requires Flash-Next K=2560 and stock MQ6G256V2 for all eight
-input families. In `attach_forward`, preparation downloads each stock matrix
-once and packs the S1 `Bf16Direct` panels and exact row-major W8/Sm/Se twin
-**before** applying the pending trunk overlay or developer requantization.
-Raw MQ6 host bytes are released layer by layer. Only packed host results cross
-the overlay swap, then move into the forward/runtime; no extra stock GPU copies
-are retained. This moves the existing download/packing cost earlier without
-adding a transfer or a second preparation pass.
+The route requires Flash-Next K=2560 and stock MQ6G256V2 for all eight
+input families. After metadata/device/calibration admission, `attach_forward`
+downloads stock MQ6 and packs auto's selected S1 `Bf16Direct` panels **before**
+applying the pending trunk overlay or developer requantization. Only packed
+panels cross the overlay swap under auto; raw bytes are released. Forced
+on/emulate retain stock host rows until the successfully applied route selects
+their calibration, then pack panels (and the exact row-major W8/Sm/Se twin
+for emulation). No extra stock GPU copies or second download are retained.
 
 Both arms still load the beta `<model>.trunk-overlay`. Covered z/a/b use W8 from
 the **stock MQ6**, never the replacement QT44 bytes. The existing load line adds
@@ -509,8 +544,8 @@ count) and `zab_source=stock-MQ6-DtoH-before-overlay|stock-MQ6-DtoH`, alongside
 read moves before overlay application, whose payloads and native route are
 unchanged. `on` and admitted `auto` open two fixed 8192-row row-major G80 programs,
 resident 13/11-panel chains, and two banks each with registered A plus separate
-GDN/QSA C arenas; hardware open errors fail the load. Auto rejects an unsupported
-scratch/placement plan without opening the NPU.
+GDN/QSA C arenas. Hardware open errors fail forced on loads; auto frees partial
+resources, logs one refusal and remains GPU-only.
 
 Both `on` and `emulate` use the same deterministic, segment-local pair plan.
 Only paired banks use BF16-direct numerics: `on`/`auto` consume NPU results, while

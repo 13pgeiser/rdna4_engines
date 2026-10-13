@@ -889,12 +889,11 @@ impl Qwen4Bundle {
                 );
             }
         }
-        // The opt-in NPU numerics always read stock MQ6, including z/a/b.
-        // Move their packed CPU panels/twin through the overlay swap; off
-        // returns None without downloads, packing, allocation or logging.
+        // Admitted NPU numerics read stock MQ6, including z/a/b, before the
+        // overlay swap. Effective off does no downloads, allocation or logging.
         #[cfg(target_os = "linux")]
         let mut npu_prepared = Qwen4GpuForward::prepare_npu_trunk(
-            gpu, self, self.trunk_overlay.is_some(),
+            gpu, self, self.trunk_overlay.is_some(), requested, mode,
         ).map_err(|error| BundleError::Forward(error.to_string()))?;
         let overlay_route = self.apply_pending_trunk_overlay(gpu)?;
         #[cfg(target_os = "linux")]

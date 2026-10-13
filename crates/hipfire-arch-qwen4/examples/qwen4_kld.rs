@@ -213,7 +213,7 @@ impl Model {
                 ),
                 (None, _) => None,
             };
-        let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq);
+        let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
         let source = HfqModelSource::from_hfq(hfq);
         let transaction = fulfill_manifest_from_payloads(
             &receipt.manifest.weights,

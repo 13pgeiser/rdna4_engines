@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Opt-in calibrated scheduler. The ordinary forward performs no new I/O when off.
+//! Calibrated Halo scheduler. Effective off performs no new I/O or allocation.
 use super::*;
 use crate::npu_trunk::{self as trunk, Family, FamilyMask, Shape, NpuTrunkMode, EpilogueContract};
 use rdna_compute::npu_trunk::{NpuBf16Layout, NpuTrunkOutput};
@@ -120,14 +120,21 @@ fn bind_bank_rows(s: &mut Qwen4GpuForwardScratch, config: &Qwen4Config, rows: us
     ], &slots)
 }
 
-/// Stock MQ6 rows retained only until the post-overlay calibration selects a mask.
+/// Auto panels are packed before the overlay swap; forced modes retain stock
+/// bytes until the successfully applied route determines their calibration.
+enum PreparedLayers {
+    Stock(Vec<(Shape, Vec<(usize, Vec<u8>)>)>),
+    Packed(Vec<(Shape, trunk::PackedB, Vec<u8>)>),
+}
 pub(crate) struct PreparedTrunk {
     mode: NpuTrunkMode,
-    layers: Vec<(Shape, Vec<(usize, Vec<u8>)>)>,
+    layers: PreparedLayers,
     download_ms: f64,
     pack_ms: f64,
     pre_overlay: bool,
     overlay_route: Option<rdna_compute::TrunkIu4Default>,
+    matched: Option<(trunk::Calibration, trunk::CalKey, &'static str)>,
+    families: FamilyMask,
 }
 
 impl PreparedTrunk {
@@ -136,116 +143,169 @@ impl PreparedTrunk {
     }
 }
 
+fn match_calibration(gpu: &Gpu, bundle: &Qwen4Bundle, route: &str, mode: NpuTrunkMode, firmware: Option<&str>) -> Result<(trunk::Calibration, trunk::CalKey, &'static str, FamilyMask), String> {
+    let (cal, source) = trunk::Calibration::load_with_builtin(hipfire_config::npu_trunk_calibration_path(), route)
+        .map_err(|e| format!("calibration unavailable: {e}"))?;
+    let index = bundle.npu_model_index.as_ref().ok_or("model index identity unavailable")?.as_ref().map_err(Clone::clone)?;
+    let pci = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| e.to_string())?;
+    let key = match firmware {
+        Some(firmware) => trunk::runtime_key_with_firmware(&gpu.arch, &pci, firmware, index, route)?,
+        None => trunk::runtime_calibration_key(&gpu.arch, &pci, index, route)?,
+    };
+    let families = if mode == NpuTrunkMode::Auto { trunk::auto_admission(&cal, &key)? } else {
+        cal.key_matches(&key)?;
+        trunk::select_families(&cal).0
+    };
+    Ok((cal, key, source, families))
+}
+
+fn pack_stock(mode: NpuTrunkMode, raw: Vec<(Shape, Vec<(usize, Vec<u8>)>)>, families: FamilyMask) -> Result<Vec<(Shape, trunk::PackedB, Vec<u8>)>, Qwen4GpuForwardError> {
+    let refs: Vec<_> = raw.iter().map(|(shape, mats)| trunk::LayerTrunkRefs {
+        shape: *shape, matrices: shape.column_map(FamilyMask::ALL).parts.iter().zip(mats).map(|(&(family, _, _), (m, bytes))|
+            trunk::MatrixRef { family, mq6: bytes, m: *m, k: 2560 }).collect(),
+    }).collect();
+    let packed_trunk = trunk::pack_trunk_with_contract(EpilogueContract::Bf16Direct, &refs, families).map_err(fail)?;
+    drop(refs);
+    let mut packed = Vec::with_capacity(raw.len());
+    for (entry, (shape, mats)) in packed_trunk.per_layer.into_iter().zip(raw) {
+        let b = entry.map(|(_, b)| b).unwrap_or_else(|| trunk::PackedB {
+            panels: Vec::new(), ws: Vec::new(), scales: Vec::new(), map: shape.column_map(families),
+        });
+        let mut codes = if mode == NpuTrunkMode::Emulate { vec![0u8; b.map.padded_cols() * 2560] } else { Vec::new() };
+        if mode == NpuTrunkMode::Emulate {
+            let full = shape.column_map(FamilyMask::ALL);
+            for &(family, col, width) in &b.map.parts {
+                let i = full.parts.iter().position(|&(f, _, _)| f == family).expect("shape family");
+                let (m, bytes) = &mats[i];
+                debug_assert_eq!(*m, width as usize);
+                trunk::pack_matrix_direct(bytes, *m, 2560, &mut codes[col as usize * 2560..(col as usize + m) * 2560]);
+            }
+        }
+        packed.push((shape, b, codes));
+    }
+    Ok(packed)
+}
+
 impl NpuForward {
-    pub(crate) fn prepare_stock(gpu: &mut Gpu, bundle: &Qwen4Bundle, pre_overlay: bool) -> Result<Option<PreparedTrunk>, Qwen4GpuForwardError> {
-        let mode = NpuTrunkMode::from_env().map_err(fail)?;
+    pub(crate) fn prepare_stock(gpu: &mut Gpu, bundle: &Qwen4Bundle, pre_overlay: bool, rows: usize, scratch_mode: Qwen4ForwardScratchMode) -> Result<Option<PreparedTrunk>, Qwen4GpuForwardError> {
+        let mode = NpuTrunkMode::from_env().map_err(fail)?.resolve(&gpu.arch);
         if mode.is_off() { return Ok(None); }
-        if gpu.arch != "gfx1151" || !bundle.config.profile.is_flash_next() || bundle.config.hidden_size != 2560 {
-            if mode == NpuTrunkMode::Auto {
-                eprintln!("npu-trunk: off (requires Flash-Next family B, K=2560, gfx1151)");
-                return Ok(None);
-            }
-            return Err(fail("requires Flash-Next family B, K=2560, gfx1151"));
-        }
-        // Download each stock MQ6 matrix exactly once, before any overlay swap.
-        // Load packs only the calibrated families, then drops these host rows.
-        let started = Instant::now();
-        let mut raw = Vec::with_capacity(bundle.weights.layer_refs.len());
-        for l in &bundle.weights.layer_refs {
-            let (shape, refs) = if let Some(g) = &l.gdn {
-                (Shape::GdnIn, [&g.qkv, &g.z, &g.in_proj_a, &g.in_proj_b])
-            } else if let Some(q) = &l.attention {
-                (Shape::QsaIn, [&q.q, &q.k, &q.v, &q.indexer_qk])
-            } else { return Err(fail("layer has no trunk projections")); };
-            let mut mats = Vec::with_capacity(4);
-            for reference in refs {
-                let w = bundle.weights.resident(reference)?;
-                if w.dtype != DType::MQ6G256V2 { return Err(fail(format!("{} must be MQ6G256V2, got {:?}", reference.name, w.dtype))); }
-                if reference.shape.len() != 2 || reference.shape[1] != 2560 {
-                    return Err(fail(format!("{} must have K=2560", reference.name)));
+        let result = trunk::admission::prepare_after_checks(
+            || {
+                if gpu.arch != "gfx1151" || !bundle.config.profile.is_flash_next() || bundle.config.hidden_size != 2560 {
+                    return Err(fail("requires Flash-Next family B, K=2560, gfx1151"));
                 }
-                let m = reference.shape[0];
-                let mut bytes = vec![0; m * 2560 / 256 * 200];
-                gpu.hip.memcpy_dtoh(&mut bytes, &w.buf)?;
-                mats.push((m, bytes));
-            }
-            raw.push((shape, mats));
-        }
-        let download_ms = started.elapsed().as_secs_f64() * 1000.0;
-        Ok(Some(PreparedTrunk { mode, layers: raw, download_ms, pack_ms: 0.0, pre_overlay, overlay_route: None }))
+                if mode != NpuTrunkMode::Emulate && (rows != 8192 || scratch_mode != Qwen4ForwardScratchMode::Full || bundle.weights.ep_placement().is_some()) {
+                    return Err(fail("requires full 8192-row scratch and single-device/no-EP placement"));
+                }
+                // Validate every source before any download, packing or NPU allocation.
+                for l in &bundle.weights.layer_refs {
+                    let (refs, widths) = if let Some(g) = &l.gdn {
+                        ([&g.qkv, &g.z, &g.in_proj_a, &g.in_proj_b], [10240, 6144, 48, 48])
+                    } else if let Some(q) = &l.attention {
+                        ([&q.q, &q.k, &q.v, &q.indexer_qk], [12288, 512, 512, 640])
+                    } else { return Err(fail("layer has no trunk projections")); };
+                    for (reference, width) in refs.into_iter().zip(widths) {
+                        let w = bundle.weights.resident(reference)?;
+                        if w.dtype != DType::MQ6G256V2 || reference.shape.as_slice() != [width, 2560] {
+                            return Err(fail(format!("{} requires stock MQ6G256V2 [{width},2560]", reference.name)));
+                        }
+                    }
+                }
+                if mode == NpuTrunkMode::Auto {
+                    // Reject the memory rung downgrade before downloading stock rows.
+                    let (free, _) = gpu.device_mem_info()?;
+                    let required = qwen4_forward_device_bytes(&bundle.config, rows, scratch_mode)
+                        .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES));
+                    if required.is_none_or(|bytes| bytes > free as u64) {
+                        return Err(fail("8192-row full scratch does not fit the single-device memory rung"));
+                    }
+                }
+                Ok(())
+            },
+            || if mode == NpuTrunkMode::Auto { trunk::npu_firmware().map(Some).map_err(fail) } else { Ok(None) },
+            |firmware| {
+                let route = bundle.trunk_overlay.as_ref().map(|overlay| overlay.default).or(bundle.config.trunk_iu4_default);
+                if mode != NpuTrunkMode::Auto { return Ok((None, FamilyMask::ALL, route)); }
+                let trunk_route = route.map_or_else(|| "stock".to_owned(), |default| format!("overlay:{}", default.marker()));
+                let (cal, key, source, families) = match_calibration(gpu, bundle, &trunk_route, mode, firmware.as_deref()).map_err(fail)?;
+                Ok((Some((cal, key, source)), families, route))
+            },
+            |(matched, families, overlay_route)| {
+                let started = Instant::now();
+                let mut raw = Vec::with_capacity(bundle.weights.layer_refs.len());
+                for l in &bundle.weights.layer_refs {
+                    let (shape, refs) = if let Some(g) = &l.gdn {
+                        (Shape::GdnIn, [&g.qkv, &g.z, &g.in_proj_a, &g.in_proj_b])
+                    } else if let Some(q) = &l.attention {
+                        (Shape::QsaIn, [&q.q, &q.k, &q.v, &q.indexer_qk])
+                    } else { unreachable!("eligibility checked"); };
+                    let mut mats = Vec::with_capacity(4);
+                    for (reference, &family) in refs.into_iter().zip(shape.families()) {
+                        let m = reference.shape[0];
+                        let bytes = if mode != NpuTrunkMode::Auto || families.contains(family) {
+                            let w = bundle.weights.resident(reference)?;
+                            let mut bytes = vec![0; m * 2560 / 256 * 200];
+                            gpu.hip.memcpy_dtoh(&mut bytes, &w.buf)?;
+                            bytes
+                        } else { Vec::new() };
+                        mats.push((m, bytes));
+                    }
+                    raw.push((shape, mats));
+                }
+                let download_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let packing_started = Instant::now();
+                let layers = if mode == NpuTrunkMode::Auto {
+                    PreparedLayers::Packed(pack_stock(mode, raw, families)?)
+                } else { PreparedLayers::Stock(raw) };
+                let pack_ms = packing_started.elapsed().as_secs_f64() * 1000.0;
+                Ok(Some(PreparedTrunk { mode, layers, download_ms, pack_ms, pre_overlay, overlay_route, matched, families }))
+            },
+        );
+        trunk::admission::finish(mode, result)
     }
 
     pub(super) fn load(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, rows: usize, scratch_mode: Qwen4ForwardScratchMode, prepared: Option<Option<PreparedTrunk>>) -> Result<Option<Self>, Qwen4GpuForwardError> {
+        let mode = NpuTrunkMode::from_env().map_err(fail)?.resolve(&gpu.arch);
+        if mode.is_off() { return Ok(None); }
+        trunk::admission::finish(mode, Self::load_admitted(gpu, bundle, scratch, rows, scratch_mode, prepared))
+    }
+
+    fn load_admitted(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, rows: usize, scratch_mode: Qwen4ForwardScratchMode, prepared: Option<Option<PreparedTrunk>>) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let Some(prepared) = (match prepared {
             Some(prepared) => prepared,
-            None => Self::prepare_stock(gpu, bundle, false)?,
+            None => Self::prepare_stock(gpu, bundle, false, rows, scratch_mode)?,
         }) else { return Ok(None); };
-        let PreparedTrunk { mode, layers: raw, download_ms, mut pack_ms, pre_overlay, overlay_route } = prepared;
+        let PreparedTrunk { mode, layers, download_ms, mut pack_ms, pre_overlay, overlay_route, matched, mut families } = prepared;
         let trunk_route = overlay_route.map_or_else(|| "stock".to_owned(), |default| format!("overlay:{}", default.marker()));
-        let matched = (|| -> Result<(trunk::Calibration, trunk::CalKey, FamilyMask), String> {
-            let cal = trunk::Calibration::load(hipfire_config::npu_trunk_calibration_path())
-                .map_err(|e| format!("calibration unavailable: {e}"))?;
-            let index = bundle.npu_model_index.as_ref().ok_or("model index identity unavailable")?.as_ref().map_err(Clone::clone)?;
-            let pci = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| e.to_string())?;
-            let key = trunk::runtime_calibration_key(&gpu.arch, &pci, index, &trunk_route)?;
-            let selected = if mode == NpuTrunkMode::Auto {
-                trunk::auto_admission(&cal, &key)?
-            } else {
-                cal.key_matches(&key)?;
-                trunk::select_families(&cal).0
-            };
-            Ok((cal, key, selected))
-        })();
-        let (calibration, n_star, families) = match matched {
-            Ok((cal, key, selected)) => {
-                let n_star = trunk::crossover(&cal, selected);
-                eprintln!("{}", trunk::load_log_line(&cal, &trunk::LoadLogKey {
-                    current: &key, mode: &mode.to_string(), families: selected,
-                }, n_star, &trunk::plan(&cal, selected, 16384), &trunk::plan(&cal, selected, 65536)));
-                (Some(cal), n_star, selected)
+        let matched = if mode == NpuTrunkMode::Auto { matched } else {
+            match match_calibration(gpu, bundle, &trunk_route, mode, None) {
+                Ok((cal, key, source, selected)) => { families = selected; Some((cal, key, source)) }
+                Err(reason) => {
+                    eprintln!("npu-trunk: mode={mode} calibration=none (forced) reason={reason}");
+                    None
+                }
             }
-            Err(reason) if mode == NpuTrunkMode::Auto => {
-                eprintln!("npu-trunk: off ({reason})");
-                return Ok(None);
+        };
+        let (calibration, n_star, cal_key, cal_source) = match matched {
+            Some((cal, mut key, source)) => {
+                key.trunk_route.clone_from(&trunk_route);
+                cal.key_matches(&key).map_err(fail)?;
+                let n_star = trunk::crossover(&cal, families);
+                (Some(cal), n_star, Some(key), source)
             }
-            Err(reason) => {
-                eprintln!("npu-trunk: mode={mode} calibration=none (forced) reason={reason}");
-                (None, None, FamilyMask::ALL)
-            }
+            None => (None, None, None, "none"),
         };
         if families.is_empty() { return Ok(None); }
         let physical = mode != NpuTrunkMode::Emulate;
         if physical && (rows != 8192 || scratch_mode != Qwen4ForwardScratchMode::Full || bundle.weights.ep_placement().is_some()) {
-            if mode == NpuTrunkMode::Auto {
-                eprintln!("npu-trunk: off (requires two full 8192-row banks, full scratch and single-device placement)");
-                return Ok(None);
-            }
-            return Err(fail("on requires two full 8192-row banks, full scratch and single-device placement"));
+            return Err(fail("requires two full 8192-row banks, full scratch and single-device placement"));
         }
         let packing_started = Instant::now();
-        let refs: Vec<_> = raw.iter().map(|(shape, mats)| trunk::LayerTrunkRefs {
-            shape: *shape, matrices: shape.column_map(FamilyMask::ALL).parts.iter().zip(mats).map(|(&(family, _, _), (m, bytes))|
-                trunk::MatrixRef { family, mq6: bytes, m: *m, k: 2560 }).collect(),
-        }).collect();
-        let packed_trunk = trunk::pack_trunk_with_contract(EpilogueContract::Bf16Direct, &refs, families).map_err(fail)?;
-        drop(refs);
-        let mut packed = Vec::with_capacity(raw.len());
-        for (entry, (shape, mats)) in packed_trunk.per_layer.into_iter().zip(raw) {
-            let b = entry.map(|(_, b)| b).unwrap_or_else(|| trunk::PackedB {
-                panels: Vec::new(), ws: Vec::new(), scales: Vec::new(), map: shape.column_map(families),
-            });
-            let mut codes = if mode == NpuTrunkMode::Emulate { vec![0u8; b.map.padded_cols() * 2560] } else { Vec::new() };
-            if mode == NpuTrunkMode::Emulate {
-                let full = shape.column_map(FamilyMask::ALL);
-                for &(family, col, width) in &b.map.parts {
-                    let i = full.parts.iter().position(|&(f, _, _)| f == family).expect("shape family");
-                    let (m, bytes) = &mats[i];
-                    debug_assert_eq!(*m, width as usize);
-                    trunk::pack_matrix_direct(bytes, *m, 2560, &mut codes[col as usize * 2560..(col as usize + m) * 2560]);
-                }
-            }
-            packed.push((shape, b, codes));
-        }
+        let packed = match layers {
+            PreparedLayers::Packed(packed) => packed,
+            PreparedLayers::Stock(raw) => pack_stock(mode, raw, families)?,
+        };
         pack_ms += packing_started.elapsed().as_secs_f64() * 1000.0;
         let started = Instant::now();
         let mut allocations = Vec::new();
@@ -306,6 +366,11 @@ impl NpuForward {
                 Some(bank) => Qwen4GpuForwardScratch::npu_bank_plan_bytes(&bank.slots)?,
                 None => 0,
             };
+            if let (Some(cal), Some(key)) = (&calibration, &cal_key) {
+                eprintln!("{} cal_source={cal_source}", trunk::load_log_line(cal, &trunk::LoadLogKey {
+                    current: key, mode: mode.as_str(), families,
+                }, n_star, &trunk::plan(cal, families, 16384), &trunk::plan(cal, families, 65536)));
+            }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
             Ok(Some(Self { mode, families, layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
                 calibration, n_star, request_plan: None, request_origin: 0 }))

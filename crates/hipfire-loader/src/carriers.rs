@@ -1858,7 +1858,7 @@ pub fn load_qwen4_rank(
             }
             _ => None,
         };
-        let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq);
+        let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
         let source = HfqModelSource::from_hfq(hfq);
         // Every allocation of the weight sweep is immutable model data: railgun
         // check mode verifies it unchanged instead of snapshotting it (§2.4).

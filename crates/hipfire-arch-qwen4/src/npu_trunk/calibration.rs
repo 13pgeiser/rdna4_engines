@@ -91,6 +91,23 @@ impl Calibration {
         cal.validate()?;
         Ok(cal)
     }
+    /// Only a missing file falls back; invalid/unreadable files are authoritative.
+    pub fn load_with_builtin(path: impl AsRef<Path>, route: &str) -> Result<(Self, &'static str), String> {
+        let (bytes, source) = match fs::read(path) {
+            Ok(bytes) => (std::borrow::Cow::Owned(bytes), "file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let json = match route {
+                    "stock" => include_str!("calibrations/halo-xdna2-stock-v2.json"),
+                    _ => include_str!("calibrations/halo-xdna2-overlay-v4.json"),
+                };
+                (std::borrow::Cow::Borrowed(json.as_bytes()), "builtin")
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let cal: Self = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        cal.validate()?;
+        Ok((cal, source))
+    }
     pub fn store(&self, path: impl AsRef<Path>) -> Result<(), String> {
         self.validate()?;
         let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
@@ -165,26 +182,99 @@ pub fn calibration_key(arch: &str, pci_bdf: &str, firmware: &str, release: &str,
     }
 }
 
+/// Probe the exact accel node railgun opens, without opening the runtime.
+#[cfg(unix)]
+pub(crate) fn npu_firmware() -> Result<String, String> {
+    use std::os::unix::fs::FileTypeExt;
+    let node = fs::metadata("/dev/accel/accel0").map_err(|e| format!("NPU accel0 unavailable: {e}"))?;
+    if !node.file_type().is_char_device() { return Err("NPU accel0 is not an accel device".into()); }
+    let device = Path::new("/sys/class/accel/accel0/device");
+    let driver = fs::read_link(device.join("driver")).map_err(|e| format!("NPU driver: {e}"))?;
+    if driver.file_name().is_none_or(|name| name != "amdxdna") { return Err("NPU accel0 is not amdxdna".into()); }
+    let pci = fs::canonicalize(device).map_err(|e| format!("NPU PCI device: {e}"))?;
+    if pci.file_name().is_none_or(|name| !name.to_string_lossy().contains(':')) {
+        return Err("NPU accel0 PCI identity unavailable".into());
+    }
+    let firmware = fs::read_to_string(device.join("fw_version")).map_err(|e| format!("NPU fw_version: {e}"))?;
+    if firmware.trim().is_empty() { return Err("NPU fw_version is empty".into()); }
+    Ok(firmware)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn npu_firmware() -> Result<String, String> {
+    Err("NPU accel0 unavailable on this platform".into())
+}
+
 /// Read only unprivileged metadata, never open a GPU/NPU or time work.
 pub fn runtime_calibration_key(arch: &str, pci_bdf: &str, index: &str, trunk_route: &str) -> Result<CalKey, String> {
     // railgun opens accel0; key that exact device, not the first PCI directory.
-    let device = Path::new("/sys/class/accel/accel0/device");
-    let firmware = fs::read_to_string(device.join("fw_version")).map_err(|e| format!("NPU fw_version: {e}"))?;
+    let firmware = npu_firmware()?;
+    runtime_key_with_firmware(arch, pci_bdf, &firmware, index, trunk_route)
+}
+
+pub(crate) fn runtime_key_with_firmware(arch: &str, pci_bdf: &str, firmware: &str, index: &str, trunk_route: &str) -> Result<CalKey, String> {
     let release = std::process::Command::new("uname").arg("-r").output().map_err(|e| format!("uname -r: {e}"))?;
     if !release.status.success() { return Err("uname -r failed".into()); }
     let release = std::str::from_utf8(&release.stdout).map_err(|e| e.to_string())?;
     // PerfOpt's armed message is privileged dmesg, with no sysfs/proc ABI.
     // Schema 3 deliberately keys kernel identity on uname_release alone.
-    Ok(calibration_key(arch, pci_bdf, &firmware, release, index, trunk_route))
+    Ok(calibration_key(arch, pci_bdf, firmware, release, index, trunk_route))
 }
 
 /// Capture the base before it moves into the source owner. Off performs no I/O.
-pub fn model_index_identity(hfq: &hipfire_runtime::hfq::HfqFile) -> Option<Result<String, String>> {
-    if super::NpuTrunkMode::from_env().ok().is_none_or(|mode| mode.is_off()) { return None; }
+pub fn model_index_identity(hfq: &hipfire_runtime::hfq::HfqFile, arch: &str) -> Option<Result<String, String>> {
+    if super::NpuTrunkMode::from_env().ok().is_none_or(|mode| mode.resolve(arch).is_off()) { return None; }
     Some(hfq.index_sha256().map(|hash| {
         use std::fmt::Write;
         let mut hex = String::with_capacity(64);
         for byte in hash { write!(&mut hex, "{byte:02x}").expect("write to String"); }
         hex
     }).map_err(|e| format!("model index identity: {e}")))
+}
+
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+
+    #[test]
+    fn measured_builtin_keys_validate_for_this_build() {
+        for (json, route) in [
+            (include_str!("calibrations/halo-xdna2-overlay-v4.json"), "overlay:gfx1151-zab-v1"),
+            (include_str!("calibrations/halo-xdna2-stock-v2.json"), "stock"),
+        ] {
+            let cal: Calibration = serde_json::from_str(json).unwrap();
+            cal.validate().unwrap();
+            assert_eq!(cal.key.build, calibration_build_identity());
+            assert_eq!(cal.key.trunk_route, route);
+            let key = calibration_key("gfx1151", "0000:c0:00.0", "1.1.2.65",
+                "7.3.0-rc7-perfopt+", "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013", route);
+            cal.key_matches(&key).unwrap();
+            assert!(!super::super::auto_admission(&cal, &key).unwrap().is_empty());
+            let mut mismatched = key;
+            mismatched.device.npu_fw_version.push('x');
+            assert_eq!(cal.key_matches(&mismatched), Err("calibration key mismatch: device.npu_fw_version".into()));
+        }
+    }
+
+    #[test]
+    fn file_precedes_builtin_and_invalid_file_never_falls_back() {
+        let dir = std::env::temp_dir().join(format!("hipfire-builtin-cal-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calibration.json");
+        let (mut builtin, source) = Calibration::load_with_builtin(&path, "stock").unwrap();
+        assert_eq!(source, "builtin");
+        assert_eq!(builtin.key.trunk_route, "stock");
+        builtin.key.device.npu_fw_version = "custom-file".into();
+        builtin.store(&path).unwrap();
+        let (file, source) = Calibration::load_with_builtin(&path, "stock").unwrap();
+        assert_eq!(source, "file");
+        assert_eq!(file.key.device.npu_fw_version, "custom-file");
+        fs::write(&path, b"{}").unwrap();
+        assert!(Calibration::load_with_builtin(&path, "stock").is_err());
+        fs::remove_file(&path).unwrap();
+        let (overlay, source) = Calibration::load_with_builtin(&path, "overlay:gfx1151-zab-v1").unwrap();
+        assert_eq!(source, "builtin");
+        assert_eq!(overlay.key.trunk_route, "overlay:gfx1151-zab-v1");
+        fs::remove_dir(dir).unwrap();
+    }
 }

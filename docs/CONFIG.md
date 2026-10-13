@@ -110,8 +110,8 @@ Stable/default-on and safety controls:
 | `fusions.qkv_bias` | `true` | Fold supported QKV bias launches. |
 | `kernel.rocblas_off` | `false` | Disable rocBLAS dispatch. |
 | `fusions.force_unfused` | `false` | Force supported projection paths unfused. |
-| `fusions.npu_trunk` | `"off"` | Opt-in Flash-Next gfx1151 trunk: `off|auto|on|emulate`. Auto requires matching stored calibration selecting all four families; forced modes retain all-family natural pairing. |
-| `fusions.npu_trunk_calibration` | `""` | Empty resolves to `<hipfire home>/npu-trunk/calibration.json`; alias `npu_trunk_calibration`, env `HIPFIRE_QWEN4_NPU_TRUNK_CAL`. No calibration/index I/O when trunk mode is off. See [NPU trunk](npu/npu-trunk.md). |
+| `fusions.npu_trunk` | `"auto"` | Default-on Flash-Next family-B MQ6 trunk on gfx1151: `off|auto|on|emulate`. Auto arms only with an open NPU and matching calibration selecting a nonempty family set; load refusals log once and use GPU-only. Every other arch resolves auto silently to off, without NPU I/O/allocation. `off` is the kill switch; forced on/emulate refuse other arches. |
+| `fusions.npu_trunk_calibration` | `""` | Empty resolves to `<hipfire home>/npu-trunk/calibration.json`; alias `npu_trunk_calibration`, env `HIPFIRE_QWEN4_NPU_TRUNK_CAL`. A file wins; an absent file uses compiled-in measured Halo overlay/stock calibration. Invalid/unreadable files never fall back. Both sources have identical strict key checks; armed logs include `cal_source=file|builtin`. No calibration/index I/O when effectively off. See [NPU trunk](npu/npu-trunk.md). |
 | `speculation.dflash_tree` | `false` | Enable DDTree tree-SWOR verification. |
 | `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates only the host `MemAvailable` headroom check; the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
 
