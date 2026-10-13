@@ -3,7 +3,7 @@
 use super::*;
 use crate::npu_trunk::{self as trunk, Family, FamilyMask, Shape, NpuTrunkMode, EpilogueContract};
 use rdna_compute::npu_trunk::{NpuBf16Layout, NpuTrunkOutput};
-use railgun::npu::trunk::{NpuTrunkRuntime, LayerPanels, PanelProgram, Seq};
+use railgun::npu::trunk::{padded_rows_of, NpuTrunkRuntime, LayerPanels, OpenOptions, PanelBuild, PanelProgram, Seq, TxnBuilder, MAX_ADAPTIVE_CONTEXTS};
 use rdna_compute::tensor_ops::Bf16Arena;
 use hipfire_dispatch::pipeline::{
     execute_gated_delta_net_core_rows, execute_grouped_depthwise_rows, execute_indexed_attention_core_rows, CoreWindow,
@@ -30,6 +30,8 @@ pub(super) struct NpuForward {
     n_star: Option<usize>,
     request_plan: Option<trunk::Plan>,
     request_origin: usize,
+    /// Wave-padded bank rows below 8192 whose row-adaptive NPU programs this load admitted ([`admitted_plan`]).
+    adaptive: Vec<usize>,
 }
 
 // SAFETY: this private owner exclusively owns the entire railgun HIP Rc graph;
@@ -351,7 +353,15 @@ impl NpuForward {
                     shape: transport_shape(p.shape), pdi: p.design.pdi, txn: p.design.insts, padded_rows: 8192, pitch: p.padded_cols,
                 }).collect();
                 let pci = gpu.hip.device_pci_bus_id(gpu.device_id)?;
-                Some(NpuTrunkRuntime::open(programs, resident, 2, 8192, &pci).map_err(fail)?)
+                // Row-adaptive chains: a bank of fewer rows runs the program of its own wave count (the cores' wave loop
+                // count is in the PDI), built on the relay thread the first time that row count is kicked.
+                let cols = [Shape::GdnIn, Shape::QsaIn].map(|shape| shape.column_map(families).padded_cols());
+                let builder: TxnBuilder = std::sync::Arc::new(move |shape, rows| {
+                    use railgun::npu::trunk::Shape as T;
+                    let (shape, cols) = match shape { T::GdnIn => (Shape::GdnIn, cols[0]), T::QsaIn => (Shape::QsaIn, cols[1]), T::GdnOut => (Shape::GdnOut, 0), T::QsaO => (Shape::QsaO, 0) };
+                    trunk::build_program_for_rows(shape, cols, rows).map(|(pdi, txn)| PanelBuild { pdi, txn })
+                });
+                Some(NpuTrunkRuntime::open_with_builder(programs, resident, 2, 8192, &pci, OpenOptions::default(), Some(builder)).map_err(fail)?)
             } else { None };
             let arenas = runtime.as_ref().map(|rt| -> Result<_, Qwen4GpuForwardError> {
                 Ok([
@@ -379,7 +389,7 @@ impl NpuForward {
             }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
             Ok(Some(Self { mode, families, layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
-                calibration, n_star, request_plan: None, request_origin: 0 }))
+                calibration, n_star, request_plan: None, request_origin: 0, adaptive: Vec::new() }))
         })();
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
         result
@@ -393,7 +403,9 @@ impl NpuForward {
     pub(super) fn plan_request(&mut self, rows: usize, position: usize) {
         let Some(cal) = self.calibration.as_ref() else { return };
         if self.request_plan.is_some() { return; }
-        let executable = request_plan(cal, self.mode, self.families, self.n_star, rows);
+        let executable = admitted_plan(request_plan(cal, self.mode, self.families, self.n_star, rows), &mut self.adaptive, |planned| {
+            trunk::executable_plan(cal, planned, rows, armed_from(self.mode, self.n_star))
+        });
         if self.mode == NpuTrunkMode::Auto { eprintln!("{}", trunk::request_log_line(rows, &executable)); }
         self.request_origin = position;
         self.request_plan = Some(executable);
@@ -456,7 +468,10 @@ impl NpuForward {
         let pack_issue_ns=if pipe && self.trace.is_some() {monotonic_ns()}else{0};
         if pipe {
             let rt = self.runtime.as_ref().ok_or_else(|| fail("runtime missing"))?;
-            unsafe { gpu.npu_trunk_pack_a_bf16_ptr(&x,rows,layout(map,8192),rt.a_arena(bank).map_err(fail)?.device as *mut c_void,&self.scales[bank])?; }
+            // The A stream is laid out for the bank's own wave count: the chain the relay runs for this kick has exactly that
+            // many waves (`chain_rows` is the one decision both sides use).
+            let padded = rt.chain_rows(transport_shape(shape), rows);
+            unsafe { gpu.npu_trunk_pack_a_bf16_ptr(&x,rows,layout(map,padded),rt.a_arena(bank).map_err(fail)?.device as *mut c_void,&self.scales[bank])?; }
         } else { gpu.npu_trunk_pack_a_bf16(&x,rows,layout(map,rows),&self.emulation.as_ref().expect("emulate scratch").a,&self.scales[bank])?; }
         Ok(pack_issue_ns)
     }
@@ -1032,7 +1047,30 @@ fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScr
 /// take the planner's pairs from the first row.
 fn request_plan(cal: &trunk::Calibration, mode: NpuTrunkMode, families: FamilyMask, n_star: Option<usize>, rows: usize) -> trunk::Plan {
     let planned = trunk::plan(cal, families, rows);
-    trunk::executable_plan(cal, &planned, rows, if mode == NpuTrunkMode::Auto { n_star } else { Some(0) })
+    trunk::executable_plan(cal, &planned, rows, armed_from(mode, n_star))
+}
+/// The row the executable plan arms pairs from: the crossover `n_star` in `auto`, the first row in the forced modes.
+fn armed_from(mode: NpuTrunkMode, n_star: Option<usize>) -> Option<usize> {
+    if mode == NpuTrunkMode::Auto { n_star } else { Some(0) }
+}
+/// A bank below 8192 rows runs the row-adaptive NPU program of its own wave count, one relay hardware context per distinct
+/// count and at most [`MAX_ADAPTIVE_CONTEXTS`] per load. Admits the wave counts of `executable`'s pairs into `admitted`
+/// (first-use order, the order the relay meets them). A pair that would exceed the budget is dropped and `replan` rebuilds
+/// the plan from the remaining pairs, so its rows run GPU-native rather than through a full 8192-row NPU chain. Every mode
+/// applies it, so `on` and `emulate` demote the same pairs.
+fn admitted_plan(executable: trunk::Plan, admitted: &mut Vec<usize>, replan: impl Fn(&trunk::Plan) -> trunk::Plan) -> trunk::Plan {
+    let mut kept = executable.clone();
+    kept.steps.retain(|step| {
+        let trunk::Step::Pipe { a, b } = step else { return true };
+        let mut next = admitted.clone();
+        for rows in [a.len(), b.len()].map(|rows| padded_rows_of(transport_shape(Shape::GdnIn), rows)) {
+            if rows < trunk::CHUNK && !next.contains(&rows) { next.push(rows); }
+        }
+        let fits = next.len() <= MAX_ADAPTIVE_CONTEXTS;
+        if fits { *admitted = next; }
+        fits
+    });
+    if kept.steps.len() == executable.steps.len() { executable } else { replan(&kept) }
 }
 /// Rows of the planned pair starting at `position` (the request began at `origin`) when it fits the remaining rows.
 fn planned_banks(plan: &trunk::Plan, origin: usize, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
@@ -1335,6 +1373,35 @@ mod tests {
         // The forced modes pair from the first row, auto only from the crossover.
         assert!(pairs(NpuTrunkMode::Auto, 4096).is_empty());
         assert_eq!(planned_banks(&request_plan(&cal, NpuTrunkMode::On, families, star, 9319), 0, 0, 9319, 4096), None);
+    }
+    #[test] fn row_adaptive_budget_demotes_pairs_beyond_it_to_gpu_chunks() {
+        // A long-lived load meets many bank sizes: the first MAX_ADAPTIVE_CONTEXTS wave counts are admitted and keep their
+        // pairs; a pair needing another wave count runs GPU-native, never through a full 8192-row NPU chain.
+        let (cal, _) = Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", "overlay:gfx1151-zab-v1").unwrap();
+        let families = trunk::select_families(&cal).0;
+        let star = trunk::crossover(&cal, families);
+        let classes = |plan: &trunk::Plan| plan.steps.iter().flat_map(|step| match step {
+            trunk::Step::Pipe { a, b } => vec![a.len(), b.len()],
+            trunk::Step::Gpu { .. } => Vec::new(),
+        }).map(|rows| padded_rows_of(transport_shape(Shape::GdnIn), rows)).filter(|&rows| rows < trunk::CHUNK).collect::<Vec<_>>();
+        let (mut admitted, mut demoted) = (Vec::new(), 0);
+        for rows in (8704..16384).step_by(256) {
+            let full = request_plan(&cal, NpuTrunkMode::Auto, families, star, rows);
+            let got = admitted_plan(full.clone(), &mut admitted,
+                |kept| trunk::executable_plan(&cal, kept, rows, armed_from(NpuTrunkMode::Auto, star)));
+            assert!(admitted.len() <= MAX_ADAPTIVE_CONTEXTS, "{rows}");
+            assert!(classes(&got).iter().all(|r| admitted.contains(r)), "{rows}");
+            if got != full { assert!(classes(&got).is_empty(), "{rows}"); demoted += 1; }
+            let end = got.steps.last().map(|step| match step { trunk::Step::Gpu { chunk } => chunk.end, trunk::Step::Pipe { b, .. } => b.end });
+            assert_eq!(end, Some(rows), "{rows}");
+        }
+        assert_eq!(admitted.len(), MAX_ADAPTIVE_CONTEXTS);
+        assert!(demoted > 0);
+        // An admitted wave count keeps its rebalanced pair.
+        let nine = request_plan(&cal, NpuTrunkMode::Auto, families, star, 9319);
+        let mut first = Vec::new();
+        assert_eq!(admitted_plan(nine.clone(), &mut first, |_| unreachable!()), nine);
+        assert_eq!(first, vec![4864]);
     }
     #[test] fn rebalanced_pairs_schedule_with_and_without_the_session_cache() {
         let cal = fixture_calibration("g80bf16-overlay-v2.json");

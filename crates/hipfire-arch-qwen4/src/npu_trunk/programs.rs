@@ -194,6 +194,26 @@ pub fn build_out_programs(rows_max: usize) -> Result<NpuOutPrograms, String> {
     Ok(NpuOutPrograms { rows_max: rows, per_shape: [program(Shape::GdnOut)?, program(Shape::QsaO)?] })
 }
 
+/// Rows of a `rows`-row bank rounded up to the whole waves of `shape`'s program: 256-row waves (input shapes), 512-row
+/// waves (out shapes). The relay runs the TXN of exactly this many rows and the producer packs A for exactly this many.
+pub fn wave_padded_rows(shape: Shape, rows: usize) -> usize {
+    let wave = if shape.is_out() { OUT_WAVE_ROWS } else { WAVE_ROWS };
+    rows.div_ceil(wave) * wave
+}
+
+/// The PDI and command stream (TXN) of `shape`'s program at `padded_rows` (a whole number of the shape's waves), with the
+/// same fused C pitch (`padded_cols` for input shapes, [`OUT_COLS`] for out shapes) as the full-row program. The 32 cores'
+/// wave loop count is part of the PDI, so every row count is its own PDI (one relay hardware context) and TXN; the two input
+/// shapes of one row count share their PDI. Pure CPU; the relay builds and caches one per (shape, rows).
+pub fn build_program_for_rows(shape: Shape, padded_cols: usize, padded_rows: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if padded_rows == 0 || padded_rows != wave_padded_rows(shape, padded_rows) || padded_rows > ROWS_LIMIT {
+        return Err(format!("npu-trunk: {padded_rows} rows is not a whole number of {shape} waves within 1..={ROWS_LIMIT}"));
+    }
+    let design = if shape.is_out() { build_panel_program_out(padded_rows, OUT_COLS, 0)? }
+        else { build_panel_program_rowmajor(padded_rows, padded_cols.max(1280), 0)? };
+    Ok((design.pdi, design.insts))
+}
+
 #[cfg(test)]
 mod rowmajor_tests {
     use super::super::Family;
@@ -215,5 +235,47 @@ mod rowmajor_tests {
         assert_eq!((gdn.panel_count, gdn.padded_cols), (8, 10240));
         assert_eq!(gdn.arg_bytes[2], 256 * 10240 * 2);
         assert_eq!(programs.get(Shape::QsaIn).panel_count, 0);
+    }
+    #[test]
+    fn row_adaptive_programs_are_whole_wave_pdi_and_txn_pairs() {
+        use std::time::Instant;
+        let full = build_rowmajor_programs_for_families(8192, FamilyMask::ALL).unwrap();
+        let out_full = build_out_programs(8192).unwrap();
+        for (shape, rows, padded) in [(Shape::GdnIn, 4672, 4864), (Shape::QsaIn, 4647, 4864), (Shape::GdnIn, 1127, 1280), (Shape::QsaO, 4672, 5120),
+            (Shape::QsaO, 8192, 8192), (Shape::GdnIn, 8192, 8192)] {
+            assert_eq!(wave_padded_rows(shape, rows), padded);
+        }
+        // The full-row program is the 8192-row case of the builder, byte for byte.
+        for shape in [Shape::GdnIn, Shape::QsaIn] {
+            let program = full.get(shape);
+            let (pdi, txn) = build_program_for_rows(shape, program.padded_cols, 8192).unwrap();
+            assert_eq!((pdi, txn), (program.design.pdi.clone(), program.design.insts.clone()));
+        }
+        let (pdi, txn) = build_program_for_rows(Shape::QsaO, OUT_COLS, 8192).unwrap();
+        assert_eq!((pdi, txn), (out_full.get(Shape::QsaO).design.pdi.clone(), out_full.get(Shape::QsaO).design.insts.clone()));
+        // Other row counts: the PDI carries the wave loop count (every count differs from the full one), the two input
+        // shapes of one row count share it, the TXN shrinks with the waves. Build cost is printed (`--nocapture`).
+        let (gdn_cols, qsa_cols) = (full.get(Shape::GdnIn).padded_cols, full.get(Shape::QsaIn).padded_cols);
+        let mut previous = 0;
+        for rows in [256usize, 1280, 4352, 4864, 6144] {
+            let started = Instant::now();
+            let (gdn_pdi, gdn_txn) = build_program_for_rows(Shape::GdnIn, gdn_cols, rows).unwrap();
+            let gdn_ms = started.elapsed().as_secs_f64() * 1e3;
+            let started = Instant::now();
+            let (qsa_pdi, qsa_txn) = build_program_for_rows(Shape::QsaIn, qsa_cols, rows).unwrap();
+            let qsa_ms = started.elapsed().as_secs_f64() * 1e3;
+            println!("program rows={rows} waves={} gdn_in txn={} B build={gdn_ms:.1} ms, qsa_in txn={} B build={qsa_ms:.1} ms, pdi={} B",
+                rows / 256, gdn_txn.len(), qsa_txn.len(), gdn_pdi.len());
+            assert_eq!(gdn_pdi, qsa_pdi, "{rows}");
+            assert_ne!(gdn_pdi, full.get(Shape::GdnIn).design.pdi, "{rows}");
+            assert!(gdn_txn.len() > previous && gdn_txn.len() < full.get(Shape::GdnIn).design.insts.len());
+            previous = gdn_txn.len();
+        }
+        let started = Instant::now();
+        let (out_pdi, out_txn) = build_program_for_rows(Shape::QsaO, OUT_COLS, 5120).unwrap();
+        println!("program rows=5120 waves=10 qsa_o txn={} B build={:.1} ms pdi={} B", out_txn.len(), started.elapsed().as_secs_f64() * 1e3, out_pdi.len());
+        assert_ne!(out_pdi, out_full.get(Shape::QsaO).design.pdi);
+        for bad in [0usize, 100, 8000, ROWS_LIMIT + 256] { assert!(build_program_for_rows(Shape::GdnIn, 16640, bad).is_err(), "{bad}"); }
+        assert!(build_program_for_rows(Shape::QsaO, OUT_COLS, 4864).is_err(), "out waves are 512 rows");
     }
 }

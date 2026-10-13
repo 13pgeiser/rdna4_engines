@@ -33,7 +33,8 @@ pub use packing::{
     LayerTrunkRefs, MatrixRef, PackedB, PackedOut, PackedTrunk,
 };
 pub use programs::{
-    build_out_programs, build_programs, build_programs_for_families, NpuOutPrograms, NpuPrograms, ShapeProgram,
+    build_out_programs, build_program_for_rows, build_programs, build_programs_for_families, wave_padded_rows,
+    NpuOutPrograms, NpuPrograms, ShapeProgram,
 };
 pub use shapes::{
     ColumnMap, EpilogueContract, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,

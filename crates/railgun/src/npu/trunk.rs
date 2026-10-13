@@ -35,6 +35,21 @@ impl Shape {
 /// Supply build_panel_program_rowmajor(rows_max, pitch, 0)'s bytes (input shapes) or
 /// build_panel_program_out(rows_max, 2560, 0)'s bytes (out shapes: a different PDI, one hardware context per distinct PDI).
 pub struct PanelProgram { pub shape: Shape, pub pdi: Vec<u8>, pub txn: Vec<u8>, pub padded_rows: usize, pub pitch: usize }
+/// The program of one shape at one row count: the G80 PDI (its 32 cores' wave loop count is part of it) and the TXN.
+pub struct PanelBuild { pub pdi: Vec<u8>, pub txn: Vec<u8> }
+/// Builds a shape's program for a padded row count (a whole number of the shape's waves; pure CPU, tens of ms), called on
+/// the relay thread the first time a (shape, rows) chain is kicked and cached after.
+pub type TxnBuilder = Arc<dyn Fn(Shape, usize) -> Result<PanelBuild, String> + Send + Sync>;
+/// Hardware contexts the row-adaptive chains may hold beyond the full-row ones: the (class, rows) variants in use. A kick
+/// whose variant would exceed it runs the full-row chain.
+pub const MAX_ADAPTIVE_CONTEXTS: usize = 4;
+/// Rows of a bank of `rows` live rows rounded up to the whole waves of the shape's program: 256-row waves (input
+/// shapes), 512-row waves (out shapes). The A arena is packed for exactly this many rows and the chain runs exactly this
+/// many waves.
+pub fn padded_rows_of(shape: Shape, rows: usize) -> usize {
+    let wave = if shape.is_out() { 512 } else { 256 };
+    rows.div_ceil(wave) * wave
+}
 /// Every entry is already pack_b_bf16 encoded, including Sm/Se sidecars.
 pub struct LayerPanels { pub layer: usize, pub shape: Shape, pub panels: Vec<Vec<u8>> }
 
@@ -87,6 +102,8 @@ pub struct Completion {
     pub done_ns: u64,
     /// CLOCK_MONOTONIC immediately after publishing/flushing the terminal word.
     pub signal_write_ns: u64,
+    /// Host time the relay spent building the row-adaptive program of this chain (zero when it was cached or full-row).
+    pub chain_build: Duration,
 }
 
 /// Linux CLOCK_MONOTONIC timestamp shared by relay and forward trace.
@@ -126,7 +143,7 @@ struct Binding { handle: u32, addr: u64 }
 type BankBindings = [Binding; 6];
 #[derive(Clone, Copy)]
 struct BankPages { a: [usize; 2], a_len: [usize; 2], c: [usize; 4], c_len: [usize; 4] }
-struct Job { seq: Seq, layer: usize, shape: Shape, event: usize, start: Instant }
+struct Job { seq: Seq, layer: usize, shape: Shape, rows: usize, event: usize, start: Instant }
 struct Pending { value: u32, result: Option<Result<Completion, String>> }
 struct Status { pending: Vec<Pending>, failure: Option<String>, stopping: bool }
 struct Shared { status: Mutex<Status>, changed: Condvar, signals: Vec<usize> }
@@ -225,6 +242,8 @@ pub struct NpuTrunkRuntime {
     rows_max: usize,
     layers: Vec<(usize, Shape)>,
     state: RefCell<Vec<BankState>>,
+    builder: bool,
+    variants: RefCell<Vec<(bool, usize)>>,
     shared: Arc<Shared>,
     tx: Option<mpsc::SyncSender<Job>>,
     relay: Option<thread::JoinHandle<()>>,
@@ -238,6 +257,11 @@ impl NpuTrunkRuntime {
     /// CPU oracle access requires `cpu_reads`; a 1 ns watchdog forces the real
     /// timeout path in the transport gate without a production environment flag.
     pub fn open_with_options(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str, options: OpenOptions) -> Result<Self, String> {
+        Self::open_with_builder(programs, layers, banks, rows_max, pci, options, None)
+    }
+    /// [`Self::open_with_options`] with a row-adaptive program builder: a kick of fewer rows than the full program runs
+    /// the program of its own wave count (see [`TxnBuilder`]); without one every kick runs the full-row chain.
+    pub fn open_with_builder(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str, options: OpenOptions, builder: Option<TxnBuilder>) -> Result<Self, String> {
         if options.watchdog.is_zero() || options.watchdog > WAIT_TIMEOUT { return Err("chain watchdog outside (0, WAIT_TIMEOUT]".into()); }
         let mut layout = ArenaLayout::new(rows_max)?;
         layout.pitches = [0; 4];
@@ -291,14 +315,15 @@ impl NpuTrunkRuntime {
         let (tx, rx) = mpsc::sync_channel(banks);
         let (init_tx, init_rx) = mpsc::sync_channel(1);
         let relay_shared = Arc::clone(&shared);
+        let has_builder = builder.is_some();
         let relay = thread::Builder::new().name("npu-trunk-relay".into()).spawn(move || {
-            relay_main(programs, layers, pages, api, layout, rx, init_tx, relay_shared, options);
+            relay_main(programs, layers, pages, api, layout, builder, rx, init_tx, relay_shared, options);
         }).map_err(|e| format!("spawn trunk relay: {e}"))?;
         // Construct the teardown guard before receiving: all early returns join
         // the relay (contexts/BOs) before unregistering/unmapping caller pages.
         let mut rt = Self { hip, api, banks: storage, bindings: Vec::new(), layout, rows_max, layers: keys,
             state: RefCell::new((0..banks).map(|_| BankState { generation: 0, kicked: false, retired: false, prepared: false }).collect()),
-            shared, tx: Some(tx), relay: Some(relay) };
+            builder: has_builder, variants: RefCell::new(Vec::new()), shared, tx: Some(tx), relay: Some(relay) };
         rt.bindings = init_rx.recv().map_err(|_| "trunk relay exited during open")??;
         Ok(rt)
     }
@@ -340,6 +365,21 @@ impl NpuTrunkRuntime {
         state.prepared = true;
         Ok(())
     }
+    /// Padded rows the producer packs A for and the chain of a `rows`-row bank of `shape` runs: the bank's whole waves when
+    /// the runtime has a program builder and the (class, rows) variant fits the context budget
+    /// ([`MAX_ADAPTIVE_CONTEXTS`]), else the full-row program's rows. Deterministic per runtime (the admitted variants are
+    /// remembered), so the pack and the kick of one bank always agree.
+    pub fn chain_rows(&self, shape: Shape, rows: usize) -> usize {
+        let full = self.layout.padded_rows_for(shape);
+        let padded = padded_rows_of(shape, rows);
+        if !self.builder || padded >= full { return full; }
+        let class = (shape.is_out(), padded);
+        let mut variants = self.variants.borrow_mut();
+        if variants.contains(&class) { return padded; }
+        if variants.len() >= MAX_ADAPTIVE_CONTEXTS { return full; }
+        variants.push(class);
+        padded
+    }
     /// Records a system-release event after GPU A writes on stream, then queues
     /// relay work. Caller must not touch A/C until completion/consumer retirement.
     /// `stream` must be live and on the selected GPU; null selects its default stream.
@@ -372,7 +412,7 @@ impl NpuTrunkRuntime {
         state.prepared = false;
         let enqueue = (|| {
             unsafe { self.hip.record_raw(&b.ready, stream)?; }
-            self.tx.as_ref().ok_or("runtime closed")?.try_send(Job { seq, layer, shape, event: b.ready.raw(), start })
+            self.tx.as_ref().ok_or("runtime closed")?.try_send(Job { seq, layer, shape, rows: self.chain_rows(shape, rows), event: b.ready.raw(), start })
                 .map_err(|e| format!("trunk relay queue: {e}"))
         })();
         if let Err(e) = enqueue {
@@ -449,10 +489,11 @@ impl Drop for NpuTrunkRuntime {
 }
 
 // The order is intentional and tested below: contexts (one per distinct PDI), chains, commands, operands,
-// instruction/PDI BOs. The enclosing Device drops only after this owner.
+// instruction/PDI BOs; the row-adaptive extras sit beside their fixed counterparts. The enclosing Device drops only
+// after this owner.
 struct Resources<C, Ch = Chain, P = Prepared, B = Bo> {
-    ctxs: Vec<C>, chains: Vec<Ch>, commands: Vec<P>, b: Vec<B>, a: Vec<B>, a_out: Vec<B>, c: Vec<B>,
-    insts: Vec<B>, pdis: Vec<B>,
+    ctxs: Vec<C>, extra_ctxs: Vec<C>, chains: Vec<Ch>, extra_chains: Vec<Ch>, commands: Vec<P>, extra_commands: Vec<P>,
+    b: Vec<B>, a: Vec<B>, a_out: Vec<B>, c: Vec<B>, insts: Vec<B>, extra_insts: Vec<B>, pdis: Vec<B>, extra_pdis: Vec<B>,
 }
 /// Distinct PDIs in first-use order: `(first program of each, program -> PDI index)`. Programs with byte-identical PDIs
 /// (every input shape; both out shapes) share one hardware context, programs with different PDIs get their own.
@@ -478,7 +519,61 @@ fn prepared_panel(dev: &Device, insts: &Bo, a: &Bo, b: &Bo, c: &Bo, c_offset: us
     super::write_words(&command.cmd, &words);
     Ok(command)
 }
+/// Row-adaptive state of the relay: which (class, padded rows) contexts, (shape, padded rows) TXN BOs and
+/// (layer, bank, padded rows) chains exist, as indices into the `extra_*` vectors of [`Resources`].
+#[derive(Default)]
+struct Adaptive {
+    ctx: std::collections::HashMap<(bool, usize), usize>,
+    pdi: std::collections::HashMap<(bool, usize), Vec<u8>>,
+    insts: std::collections::HashMap<(usize, usize), usize>,
+    chains: std::collections::HashMap<(usize, usize, usize), usize>,
+}
+/// The chain and hardware context of (`layer`, `bank`) for a bank of `padded` rows (a whole number of the shape's waves,
+/// smaller than the full program), built and cached on first use: the PDI/TXN of that row count from `build`, one hardware
+/// context per distinct (class, rows) PDI (the 32 cores' loop count is part of the PDI), the layer's panel commands
+/// against the bank's own A/B/C arenas. The host admits at most [`MAX_ADAPTIVE_CONTEXTS`] variants
+/// ([`NpuTrunkRuntime::chain_rows`]), so a larger set is an error.
+#[allow(clippy::too_many_arguments)]
+fn adaptive_chain<'d>(dev: &'d Device, build: &TxnBuilder, layout: ArenaLayout, layers: &[LayerPanels], b_starts: &[usize],
+    layer: usize, bank: usize, shape: Shape, padded: usize, r: &mut Resources<HwCtx<'d>>, ad: &mut Adaptive) -> Result<Option<(usize, usize)>, String> {
+    let class = (shape.is_out(), padded);
+    if let Some(&chain) = ad.chains.get(&(layer, bank, padded)) { return Ok(Some((chain, ad.ctx[&class]))); }
+    if !ad.ctx.contains_key(&class) && ad.ctx.len() >= MAX_ADAPTIVE_CONTEXTS { return Err(format!("row-adaptive context budget {MAX_ADAPTIVE_CONTEXTS} exceeded at {padded} rows")); }
+    let insts_key = (shape.index(), padded);
+    if !ad.insts.contains_key(&insts_key) {
+        let PanelBuild { pdi, txn } = build(shape, padded)?;
+        if txn.is_empty() || pdi.is_empty() { return Err(format!("empty row-adaptive program for {shape:?} at {padded} rows")); }
+        match ad.pdi.get(&class) {
+            Some(have) if *have != pdi => return Err(format!("{shape:?} and its class built different PDIs at {padded} rows")),
+            Some(_) => {}
+            None => {
+                let bo = dev.dev_bo(&pdi)?;
+                let ctx = HwCtx::create(dev, 32, 1)?;
+                ctx.config_cu(&bo)?;
+                r.extra_pdis.push(bo); r.extra_ctxs.push(ctx);
+                ad.ctx.insert(class, r.extra_ctxs.len() - 1);
+                ad.pdi.insert(class, pdi);
+            }
+        }
+        r.extra_insts.push(dev.dev_bo(&txn)?);
+        ad.insts.insert(insts_key, r.extra_insts.len() - 1);
+    }
+    let (insts, l) = (ad.insts[&insts_key], &layers[layer]);
+    let start = r.extra_commands.len();
+    let a = if shape.is_out() { &r.a_out[bank] } else { &r.a[bank] };
+    for panel in 0..l.panels.len() {
+        let command = prepared_panel(dev, &r.extra_insts[insts], a, &r.b[b_starts[layer] + panel],
+            &r.c[bank * 4 + shape.index()], layout.c_offset(shape, panel)?, layout.c_span(shape))?;
+        r.extra_commands.push(command);
+    }
+    let refs: Vec<_> = r.extra_commands[start..].iter().collect();
+    r.extra_chains.push(Chain::new(dev, &refs)?);
+    let chain = r.extra_chains.len() - 1;
+    ad.chains.insert((layer, bank, padded), chain);
+    Ok(Some((chain, ad.ctx[&class])))
+}
 fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<BankPages>, api: RelayApi, layout: ArenaLayout,
+    build: Option<TxnBuilder>,
     rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<BankBindings>, String>>, shared: Arc<Shared>, options: OpenOptions) {
     let dev = match Device::open().and_then(|mut d| { d.map_heap(64 << 20)?; Ok(d) }) {
         Ok(d) => d, Err(e) => { let _ = init.send(Err(e)); return; }
@@ -486,8 +581,9 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
     let (pdi_firsts, pdi_of_program) = distinct_pdis(&programs);
     let setup = (|| {
         api.select()?;
-        let mut r = Resources { ctxs: Vec::new(), chains: Vec::new(), commands: Vec::new(), b: Vec::new(), a: Vec::new(),
-            a_out: Vec::new(), c: Vec::new(), insts: Vec::new(), pdis: Vec::new() };
+        let mut r = Resources { ctxs: Vec::new(), extra_ctxs: Vec::new(), chains: Vec::new(), extra_chains: Vec::new(),
+            commands: Vec::new(), extra_commands: Vec::new(), b: Vec::new(), a: Vec::new(),
+            a_out: Vec::new(), c: Vec::new(), insts: Vec::new(), extra_insts: Vec::new(), pdis: Vec::new(), extra_pdis: Vec::new() };
         // One context per distinct PDI, created and configured in first-use order; the single relay thread submits to
         // them serially, so at most one chain is in flight.
         for &first in &pdi_firsts {
@@ -511,8 +607,10 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             bindings.push(binding);
             r.a.push(a); r.a_out.push(a_out);
         }
+        let mut b_starts = Vec::with_capacity(layers.len());
         for l in &layers {
             let b_start = r.b.len();
+            b_starts.push(b_start);
             let program = programs.iter().position(|p| p.shape == l.shape).ok_or("missing relay shape program")?;
             for bytes in &l.panels {
                 let mut b = dev.shmem_bo(bytes.len())?;
@@ -533,9 +631,10 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
         // Evict any initialization lines once, before handing arenas to devices.
         // Production CPU code never accesses A/C again.
         for arena in r.a.iter().chain(&r.a_out).chain(&r.c) { arena.flush(); }
-        Ok::<_, String>((r, bindings))
+        Ok::<_, String>((r, bindings, b_starts))
     })();
-    let (resources, bindings) = match setup { Ok(r) => r, Err(e) => { let _ = init.send(Err(e)); return; } };
+    let (mut resources, bindings, b_starts) = match setup { Ok(r) => r, Err(e) => { let _ = init.send(Err(e)); return; } };
+    let mut ad = Adaptive::default();
     if init.send(Ok(bindings)).is_err() { return; }
     // Declared after resources, so unwinding releases waits before context/BO
     // destruction (which may itself wait for a device job to be cancelled).
@@ -561,10 +660,24 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             options.flush_for_cpu_reads(|| {
                 if job.shape.is_out() { resources.a_out[job.seq.bank].flush() } else { resources.a[job.seq.bank].flush() }
             });
-            let chain = &resources.chains[layer * pages.len() + job.seq.bank];
             // The shape's PDI selects its hardware context (the programs list holds one entry per shape).
             let program = programs.iter().position(|p| p.shape == job.shape).ok_or("missing relay shape program")?;
-            let ctx = &resources.ctxs[pdi_of_program[program]];
+            // Row-adaptive chain: the program of the bank's own wave count (its PDI loops over exactly that many waves),
+            // built on first use. `job.rows` is the padded row count the host chose ([`NpuTrunkRuntime::chain_rows`]); the
+            // full-row count (or a runtime without a builder) runs the full-row chain, exactly as before.
+            let padded = job.rows;
+            let build_started = Instant::now();
+            let adaptive = match &build {
+                Some(build) if padded != programs[program].padded_rows => {
+                    adaptive_chain(&dev, build, layout, &layers, &b_starts, layer, job.seq.bank, job.shape, padded, &mut resources, &mut ad)?
+                }
+                _ => None,
+            };
+            let chain_build = if adaptive.is_some() { build_started.elapsed() } else { Duration::ZERO };
+            let (chain, ctx) = match adaptive {
+                Some((chain, ctx)) => (&resources.extra_chains[chain], &resources.extra_ctxs[ctx]),
+                None => (&resources.chains[layer * pages.len() + job.seq.bank], &resources.ctxs[pdi_of_program[program]]),
+            };
             let start = Instant::now();
             let watchdog = options.watchdog;
             let chain_watchdog = Watchdog::new(start, watchdog);
@@ -581,7 +694,7 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             // GPU consumers wait on the terminal word then system-acquire; CPU
             // caches hold no C lines in production after the open-time flush.
             options.flush_for_cpu_reads(|| resources.c[job.seq.bank * 4 + job.shape.index()].flush());
-            Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns, signal_write_ns: 0 })
+            Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns, signal_write_ns: 0, chain_build })
         })();
         if let Err(e) = &result { fatal = Some(e.clone()); }
         shared.finish(job.seq, result);
@@ -604,6 +717,23 @@ mod tests {
         }
         assert!(!OpenOptions::default().cpu_reads);
     }
+    #[test] fn bank_rows_map_to_whole_waves() {
+        // In-projection waves are 256 rows, out-projection waves 512; a bank's chain runs exactly these.
+        for (shape, rows, padded) in [(Shape::GdnIn, 1, 256), (Shape::GdnIn, 256, 256), (Shape::QsaIn, 1127, 1280), (Shape::GdnIn, 4647, 4864),
+            (Shape::GdnIn, 4672, 4864), (Shape::QsaIn, 4180, 4352), (Shape::GdnIn, 8192, 8192), (Shape::QsaO, 1127, 1536),
+            (Shape::QsaO, 4672, 5120), (Shape::GdnOut, 8192, 8192)] {
+            assert_eq!(padded_rows_of(shape, rows), padded, "{shape:?} {rows}");
+            assert!(padded >= rows && padded - rows < shape_wave(shape));
+        }
+        // The packed A of a bank is a prefix of the arena: 2880 B per padded row (K2560), 6912 B (K6144).
+        let layout = ArenaLayout::new(8192).unwrap();
+        for rows in [1127usize, 4647, 4672, 8192] {
+            assert!(padded_rows_of(Shape::GdnIn, rows) * 2880 <= layout.a_bytes);
+            assert!(padded_rows_of(Shape::QsaO, rows) * 6912 <= layout.a_out_bytes);
+        }
+        assert!(MAX_ADAPTIVE_CONTEXTS >= 2, "a rebalanced request needs one in-projection and one out variant");
+    }
+    fn shape_wave(shape: Shape) -> usize { if shape.is_out() { 512 } else { 256 } }
     #[test] fn compacted_qkv_arena_has_eight_panel_windows() {
         let mut l = ArenaLayout::new(8192).unwrap();
         l.pitches = [10240, 0, 0, 0];
@@ -690,7 +820,7 @@ mod tests {
         }), changed: Condvar::new(), signals: signals.iter().map(|s| &s.0 as *const AtomicU32 as usize).collect() }
     }
     fn completion() -> Completion {
-        Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO, submit_ns: 1, done_ns: 2, signal_write_ns: 0 }
+        Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO, submit_ns: 1, done_ns: 2, signal_write_ns: 0, chain_build: Duration::ZERO }
     }
     #[test] fn invalid_timeout_and_failed_sequences_are_bounded() {
         let signals = [Signal(AtomicU32::new(2))];
@@ -761,11 +891,13 @@ mod tests {
         let t = |name| Trace(name, Rc::clone(&log));
         // Instantiate the actual production ownership aggregates with tracing
         // resources, exercising their field order without opening either device.
-        let npu = Resources { ctxs: vec![t("context"), t("context2")], chains: vec![t("chain")], commands: vec![t("command")],
-            b: vec![t("bo")], a: vec![], a_out: vec![t("a_out")], c: vec![], insts: vec![t("insts")], pdis: vec![t("pdi"), t("pdi2")] };
+        let npu = Resources { ctxs: vec![t("context"), t("context2")], extra_ctxs: vec![t("adaptive-context")], chains: vec![t("chain")],
+            extra_chains: vec![t("adaptive-chain")], commands: vec![t("command")], extra_commands: vec![t("adaptive-command")],
+            b: vec![t("bo")], a: vec![], a_out: vec![t("a_out")], c: vec![], insts: vec![t("insts")], extra_insts: vec![t("adaptive-insts")],
+            pdis: vec![t("pdi"), t("pdi2")], extra_pdis: vec![t("adaptive-pdi")] };
         let arena = RegisteredPages { registration: t("unregister"), pages: t("unmap") };
         drop((npu, arena));
-        assert_eq!(&*log.borrow(), &["context", "context2", "chain", "command", "bo", "a_out", "insts", "pdi", "pdi2", "unregister", "unmap"]);
+        assert_eq!(&*log.borrow(), &["context", "context2", "adaptive-context", "chain", "adaptive-chain", "command", "adaptive-command", "bo", "a_out", "insts", "adaptive-insts", "pdi", "pdi2", "adaptive-pdi", "unregister", "unmap"]);
     }
     #[test] fn panel_commands_bind_fixed_arena_offsets() {
         let layout = ArenaLayout::new(8192).unwrap();
