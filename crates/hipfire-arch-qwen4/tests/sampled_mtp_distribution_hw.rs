@@ -180,7 +180,7 @@ use hipfire_arch_qwen4::mtp_spec::{qwen4_ngram_mod_config, Qwen4MtpDrafter};
 use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource, SourcePayload};
 use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};

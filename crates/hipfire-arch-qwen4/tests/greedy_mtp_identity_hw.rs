@@ -83,7 +83,7 @@ use hipfire_arch_qwen4::{admit_hfqm_artifact, GdnStateFormat, Qwen4KvBackend};
 use hipfire_dispatch::pipeline::DraftHeadPolicy;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource, SourcePayload};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
 use hipfire_runtime::spec::{MtpDrafter, SpecRequestConfig};
 use hipfire_runtime::tokenizer::Tokenizer;
