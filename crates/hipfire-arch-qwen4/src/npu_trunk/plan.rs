@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Pure deterministic crossover model. No clock or hardware input.
-use super::{Calibration, CalKey, Family, FamilyMask};
-use super::calibration::FAMILY_NAMES;
+use super::{Calibration, CalKey, Family, FamilyCalibration, FamilyMask};
+use super::calibration::{OutFamily, FAMILY_NAMES, OUT_FAMILY_NAMES};
 use sha2::{Digest, Sha256};
 use std::ops::Range;
 
@@ -16,7 +16,7 @@ pub struct Plan { pub steps: Vec<Step>, pub t_gpu_ms: f64, pub t_pipe_ms: f64 }
 #[derive(Clone, Copy, Debug)]
 pub struct GpuChunk { pub total: f64, pub gdn_rest: f64, pub qsa_rest: f64, pub trunk: [f64; 4] }
 #[derive(Clone, Copy, Debug)]
-pub struct BankSegments { pub gpu: [f64; 2], pub npu: [f64; 2], pub chunk: GpuChunk }
+pub struct BankSegments { pub gpu: [f64; 2], pub npu: [f64; 2], pub npu_out: [f64; 2], pub bytes: [f64; 2], pub chunk: GpuChunk }
 #[derive(Clone, Copy, Debug)]
 pub struct PairTime { pub t: f64, pub stall: f64, pub extra: f64, pub fill: f64, pub gpu_only: f64 }
 
@@ -29,9 +29,23 @@ pub fn gpu_chunk(cal: &Calibration, rows: usize, prefix: usize) -> GpuChunk {
     let qsa_rest = (g.uniform_per_layer_ms + g.qsa_per_layer_ms + g.qsa_growth_per_layer_ms_per_8192_prefix * pre) * f;
     GpuChunk { total: 36.0 * gdn_rest + 12.0 * qsa_rest + trunk.iter().sum::<f64>() + g.fixed_per_chunk_ms, gdn_rest, qsa_rest, trunk }
 }
+fn npu_ms_with(rows: usize, cols: usize, k: usize, panel: usize, tops: f64) -> f64 {
+    let padded = cols.div_ceil(panel) * panel;
+    2.0 * rows as f64 * padded as f64 * k as f64 / (tops * 1e12) * 1e3
+}
 pub fn npu_ms(cal: &Calibration, rows: usize, cols: usize) -> f64 {
-    let padded = cols.div_ceil(cal.npu.panel_cols) * cal.npu.panel_cols;
-    2.0 * rows as f64 * padded as f64 * 2560.0 / (cal.npu.tops_corun * 1e12) * 1e3
+    npu_ms_with(rows, cols, 2560, cal.npu.panel_cols, cal.npu.tops_corun)
+}
+/// Out family of layer kind `k` (0 = `gdn.out`, 1 = `qsa.o`): its calibration and out-projection block.
+fn out_family(cal: &Calibration, k: usize) -> (&FamilyCalibration, &OutFamily) {
+    let family = &cal.families[OUT_FAMILY_NAMES[k]];
+    (family, family.out.as_ref().expect("validated: out families carry an out block"))
+}
+/// Co-run NPU compute time of an out family: its simulator alone rate scaled by the in-proj co-run factor.
+fn out_ms(cal: &Calibration, k: usize, rows: usize) -> f64 {
+    let (family, o) = out_family(cal, k);
+    let tops = o.tops_alone * cal.npu.tops_corun / cal.npu.tops_alone.expect("validated: out families need npu.tops_alone");
+    npu_ms_with(rows, family.cols, o.k, o.panel_cols, tops)
 }
 fn selected(families: FamilyMask) -> [bool; 4] {
     [families.contains(Family::GdnQkv),
@@ -46,16 +60,34 @@ fn supported(families: FamilyMask) -> bool {
     }
     !families.is_empty()
 }
+/// What the planner moves to the NPU: the grouped in-proj families (qkv, zab, q, kvidx) and the out families
+/// (`gdn.out`, `qsa.o`). `supported` is false for an empty or partial-group selection, which stays GPU-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moved { pub inproj: [bool; 4], pub out: [bool; 2], pub supported: bool }
+impl Moved {
+    pub fn new(inproj: [bool; 4], out: [bool; 2]) -> Self {
+        Self { inproj, out, supported: inproj.iter().chain(&out).any(|moved| *moved) }
+    }
+}
+impl From<FamilyMask> for Moved {
+    fn from(families: FamilyMask) -> Self {
+        Self { supported: supported(families), ..Self::new(selected(families), [false; 2]) }
+    }
+}
 pub fn bank_segments(cal: &Calibration, families: FamilyMask, rows: usize, prefix: usize) -> BankSegments {
+    bank_segments_moved(cal, Moved::from(families), rows, prefix)
+}
+/// Per-layer-kind GPU segment, NPU in-proj / out chains and NPU DRAM bytes of one bank visit. A moved out family
+/// removes its GPU o-proj GEMM from the GPU segment and adds the K=6144 pack.
+pub fn bank_segments_moved(cal: &Calibration, moved: Moved, rows: usize, prefix: usize) -> BankSegments {
     let chunk = gpu_chunk(cal, rows, prefix);
-    let moved = selected(families);
     let f = rows as f64 / CHUNK as f64;
     let mut cols = [0; 2];
     let mut kept = [0.0; 2];
     let mut consume = [0.0; 2];
     for (i, name) in FAMILY_NAMES.iter().enumerate() {
         let kind = usize::from(cal.families[*name].layer == "qsa");
-        if moved[i] {
+        if moved.inproj[i] {
             let family = &cal.families[*name];
             cols[kind] += family.cols;
             if cal.glue.consume_mode == "retile" {
@@ -65,25 +97,69 @@ pub fn bank_segments(cal: &Calibration, families: FamilyMask, rows: usize, prefi
     }
     let mut gpu = [chunk.gdn_rest + kept[0] / 36.0, chunk.qsa_rest + kept[1] / 12.0];
     let mut npu = [0.0; 2];
+    let mut npu_out = [0.0; 2];
+    let mut bytes = [0.0; 2];
     for k in 0..2 {
         if cols[k] != 0 {
             gpu[k] += cal.glue.pack_ms_8192 * f;
             npu[k] = npu_ms(cal, rows, cols[k]) + cal.glue.sync_ms;
         }
         gpu[k] += consume[k] * f;
+        if cols[k] != 0 || moved.out[k] { gpu[k] += cal.glue.visit_ms_8192 * f; }
+        let padded = cols[k].div_ceil(cal.npu.panel_cols) * cal.npu.panel_cols;
+        bytes[k] = 2.0 * rows as f64 * padded as f64 * 2560.0 / 1e3 * cal.npu.bytes_per_kop;
+        if moved.out[k] {
+            let (family, o) = out_family(cal, k);
+            gpu[k] += (cal.glue.pack_ms_8192 * o.k as f64 / 2560.0 - o.gpu_ms_per_8192) * f;
+            npu_out[k] = out_ms(cal, k, rows) + cal.glue.sync_ms;
+            bytes[k] += 2.0 * rows as f64 * family.cols as f64 * o.k as f64 / 1e3 * o.bytes_per_kop;
+        }
     }
-    BankSegments { gpu, npu, chunk }
+    BankSegments { gpu, npu, npu_out, bytes, chunk }
 }
-pub fn alpha_extra(cal: &Calibration, gpu_other: f64, npu_this: f64) -> f64 {
-    (cal.contention.alpha_overlap - 1.0) * gpu_other.min(npu_this)
+/// Extra GPU ms while NPU chains `npu_this` (moving `nbytes` of DRAM traffic) overlap the other bank's GPU segment:
+/// the legacy burst term plus the per-byte contention (`ms_per_gb`).
+pub fn contention_extra(cal: &Calibration, gpu_other: f64, npu_this: f64, nbytes: f64) -> f64 {
+    (cal.contention.alpha_overlap - 1.0) * gpu_other.min(npu_this) + cal.contention.ms_per_gb * nbytes / 1e9
+}
+/// Per QSA layer stall of the order `C_A C_B P_A P_B` (a moved `qsa.o`): I(l+1,A) overlaps P_B(l), I(l+1,B)
+/// overlaps C_A(l+1), O_A overlaps C_B, O_B overlaps P_A; each chain stalls by `max(0, chain - window)`. Windows are
+/// the measured 16K-pair Core/post phases scaled by rows (Core is linear in the prefix); the post window loses the
+/// GPU o-proj GEMM and gains the K=6144 pack; the in-proj chain is the calibrated chain scaled by its columns.
+fn qsa_order_stall(cal: &Calibration, moved: Moved, (r1, p1): (usize, usize), (r2, p2): (usize, usize), o1: f64, o2: f64) -> f64 {
+    let q = cal.qsa_order.as_ref().expect("validated: qsa.o requires qsa_order");
+    let o = &out_family(cal, 1).1;
+    let (f1, f2) = (r1 as f64 / CHUNK as f64, r2 as f64 / CHUNK as f64);
+    let core = |p: usize| q.core_a_ms + (q.core_b_ms - q.core_a_ms) * p as f64 / CHUNK as f64;
+    let post = q.post_ms - o.gpu_ms_per_8192 + cal.glue.pack_ms_8192 * o.k as f64 / 2560.0;
+    let qsa_cols = |all: bool| -> usize { [2usize, 3].iter().filter(|i| all || moved.inproj[**i]).map(|i| cal.families[FAMILY_NAMES[*i]].cols).sum() };
+    let reference = npu_ms(cal, CHUNK, qsa_cols(true));
+    let cols = qsa_cols(false);
+    let chain = |r: usize| if cols == 0 { 0.0 } else { q.inproj_chain_ms * npu_ms(cal, r, cols) / reference };
+    let (c_a, c_b) = (core(p1) * f1, core(p2) * f2);
+    let (p_a, p_b) = (post * f1, post * f2);
+    (chain(r1) - p_b).max(0.0) + (chain(r2) - c_a).max(0.0) + (o1 - c_b).max(0.0) + (o2 - p_a).max(0.0)
+}
+/// Steady-state stall per layer. A moved `qsa.o` forces the order `C_A C_B P_A P_B` (`qsa_order_stall`). Everywhere
+/// else the NPU chains of a bank (in-proj, plus the out chain when moved) stall the GPU by what exceeds the other
+/// bank's GPU window: zero at the measured balanced pairs (stall ~1 ms/pair, fill only), real for an unbalanced pair.
+fn layer_stall(cal: &Calibration, moved: Moved, k: usize, a: (usize, usize), b: (usize, usize), sa: &BankSegments, sb: &BankSegments) -> f64 {
+    if k == 1 && moved.out[1] {
+        return qsa_order_stall(cal, moved, a, b, sa.npu_out[1], sb.npu_out[1]);
+    }
+    (sb.npu[k] + sb.npu_out[k] - sa.gpu[k]).max(0.0) + (sa.npu[k] + sa.npu_out[k] - sb.gpu[k]).max(0.0)
 }
 pub fn pair_time(cal: &Calibration, families: FamilyMask, r1: usize, p1: usize, r2: usize, p2: usize) -> PairTime {
-    let a = bank_segments(cal, families, r1, p1);
-    let b = bank_segments(cal, families, r2, p2);
+    pair_time_moved(cal, Moved::from(families), r1, p1, r2, p2)
+}
+pub fn pair_time_moved(cal: &Calibration, moved: Moved, r1: usize, p1: usize, r2: usize, p2: usize) -> PairTime {
+    let a = bank_segments_moved(cal, moved, r1, p1);
+    let b = bank_segments_moved(cal, moved, r2, p2);
     let mut pr = PairTime { t: 0.0, stall: 0.0, extra: 0.0, fill: if a.npu[0] != 0.0 { a.npu[0] } else { a.npu[1] }, gpu_only: a.chunk.total + b.chunk.total };
     for (k, layers) in [36.0, 12.0].into_iter().enumerate() {
-        let s = (b.npu[k] - a.gpu[k]).max(0.0) + (a.npu[k] - b.gpu[k]).max(0.0);
-        let e = alpha_extra(cal, a.gpu[k], b.npu[k]) + alpha_extra(cal, b.gpu[k], a.npu[k]);
+        let s = layer_stall(cal, moved, k, (r1, p1), (r2, p2), &a, &b);
+        let e = contention_extra(cal, a.gpu[k], b.npu[k] + b.npu_out[k], b.bytes[k])
+            + contention_extra(cal, b.gpu[k], a.npu[k] + a.npu_out[k], a.bytes[k]);
         pr.t += layers * (a.gpu[k] + b.gpu[k] + s + e);
         pr.stall += layers * s;
         pr.extra += layers * e;
@@ -99,10 +175,13 @@ struct Choice { consumed: usize, split: Option<usize> }
 /// GPU wins exact ties; natural earlier pairs win ties against rebalance/re-bank.
 /// The grouped calibration supports whole zab/kvidx groups; partial masks stay GPU-only.
 pub fn plan(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
+    plan_moved(cal, Moved::from(families), rows)
+}
+pub fn plan_moved(cal: &Calibration, moved: Moved, rows: usize) -> Plan {
     let len = rows.div_ceil(CHUNK);
     let g: Vec<_> = (0..len).map(|i| gpu_chunk(cal, (rows - i * CHUNK).min(CHUNK), i * CHUNK).total).collect();
     let t_gpu_ms = g.iter().sum();
-    if !supported(families) {
+    if !moved.supported {
         return Plan { steps: (0..len).map(|i| Step::Gpu { chunk: i * CHUNK..((i + 1) * CHUNK).min(rows) }).collect(), t_gpu_ms, t_pipe_ms: t_gpu_ms };
     }
     let mut best = vec![0.0; len + 1];
@@ -112,7 +191,7 @@ pub fn plan(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
         if i >= 2 {
             let start = (i - 2) * CHUNK;
             let last = (rows - (i - 1) * CHUNK).min(CHUNK);
-            let pr = pair_time(cal, families, CHUNK, start, last, start + CHUNK);
+            let pr = pair_time_moved(cal, moved, CHUNK, start, last, start + CHUNK);
             if beats(cal, pr.t, pr.gpu_only) && best[i - 2] + pr.t < best[i] {
                 best[i] = best[i - 2] + pr.t;
                 choice[i] = Choice { consumed: 2, split: Some(CHUNK) };
@@ -124,7 +203,7 @@ pub fn plan(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
         let total = rows - start;
         let h1 = half(total);
         let h2 = total - h1;
-        let pr = pair_time(cal, families, h1, start, h2, start + h1);
+        let pr = pair_time_moved(cal, moved, h1, start, h2, start + h1);
         if h1.min(h2) >= cal.gpu.min_bank_rows && beats(cal, pr.t, g[len - 2] + g[len - 1]) && best[len - 2] + pr.t < best[len] {
             best[len] = best[len - 2] + pr.t;
             choice[len] = Choice { consumed: 2, split: Some(h1) };
@@ -132,7 +211,7 @@ pub fn plan(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
     }
     if len == 1 && rows >= 2 * cal.gpu.min_bank_rows {
         let h1 = half(rows);
-        let t = pair_time(cal, families, h1, 0, rows - h1, h1).t + cal.gpu.boundary_tax_ms;
+        let t = pair_time_moved(cal, moved, h1, 0, rows - h1, h1).t + cal.gpu.boundary_tax_ms;
         if beats(cal, t, g[0]) && t < best[1] {
             best[1] = t;
             choice[1] = Choice { consumed: 1, split: Some(h1) };
@@ -149,7 +228,7 @@ pub fn plan(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
             let mut eligible = true;
             for k in (0..nb).step_by(2) {
                 let r2 = if k + 2 == nb { last as usize } else { size };
-                let pr = pair_time(cal, families, size, k * size, r2, (k + 1) * size);
+                let pr = pair_time_moved(cal, moved, size, k * size, r2, (k + 1) * size);
                 t += pr.t;
                 if cal.margin != 0.0 && !beats(cal, pr.t, pr.gpu_only) { eligible = false; }
             }
@@ -198,6 +277,8 @@ pub struct SelectionRow {
     pub relative: [f64; 3],
     pub mean_relative: f64,
     pub beats_margin_16384: bool,
+    /// Every family of the subset is `selectable`; only these can win.
+    pub selectable: bool,
 }
 #[derive(Clone, Debug)]
 pub struct SelectionReport {
@@ -226,7 +307,8 @@ fn compare_selection(a: &SelectionRow, b: &SelectionRow) -> std::cmp::Ordering {
                 .cmp(names.into_iter().filter(|name| b.family_names().any(|n| n == *name)))
         })
 }
-/// Select the minimum mean T_pipe/T_gpu across the three fixed prompt sizes.
+/// Select the minimum mean T_pipe/T_gpu across the three fixed prompt sizes among the subsets whose every family is
+/// `selectable` (the out families `gdn.out` / `qsa.o` are not in the in-proj mask and stay at zero selection).
 /// Gate that winner (not a runner-up) by the strict 16384-row margin.
 pub fn select_families(cal: &Calibration) -> (FamilyMask, SelectionReport) {
     let mut subsets = Vec::with_capacity(15);
@@ -237,13 +319,17 @@ pub fn select_families(cal: &Calibration) -> (FamilyMask, SelectionReport) {
         let t_gpu_ms = std::array::from_fn(|i| plans[i].t_gpu_ms);
         // A zero-cost GPU baseline has no possible strict improvement.
         let relative = std::array::from_fn(|i| if t_gpu_ms[i] == 0.0 { 1.0 } else { t_pipe_ms[i] / t_gpu_ms[i] });
+        let selectable = FAMILY_NAMES.iter().enumerate().all(|(i, name)| bits & (1 << i) == 0 || cal.families[*name].selectable);
         subsets.push(SelectionRow {
             families, t_pipe_ms, t_gpu_ms, relative,
             mean_relative: relative.iter().sum::<f64>() / 3.0,
             beats_margin_16384: beats(cal, t_pipe_ms[0], t_gpu_ms[0]),
+            selectable,
         });
     }
-    let best = subsets.iter().min_by(|a, b| compare_selection(a, b)).expect("15 nonempty subsets");
+    let Some(best) = subsets.iter().filter(|row| row.selectable).min_by(|a, b| compare_selection(a, b)) else {
+        return (FamilyMask::NONE, SelectionReport { subsets, best_families: FamilyMask::NONE });
+    };
     let families = if best.beats_margin_16384 { best.families } else { FamilyMask::NONE };
     let best_families = best.families;
     (families, SelectionReport { subsets, best_families })

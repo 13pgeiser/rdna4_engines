@@ -375,7 +375,7 @@ carry schema 4 identity; measured cost inputs and Python/Rust cost goldens are u
 `plan(&Calibration, FamilyMask, rows) -> Plan` and
 `crossover(&Calibration, FamilyMask) -> Option<usize>` port the reference
 `npu-trunk/crossover_model.py`, SHA256
-`7e7a23afb9df5546358a25141c06006c0bfc20d292ef2274ddb8882612192096`.
+`294bf437f58c8ac1568c5531a99034b6360bf0b8b1df9a4a2daf06ccf76da0ce`.
 The planner uses an 8192-row chunk DP, GPU-only/pair choices, 64-aligned
 tail rebalance, even re-banking with boundary tax, and a taxed single-chunk
 split. `Step::Gpu { chunk }` and `Step::Pipe { a, b }` carry exact half-open
@@ -384,7 +384,17 @@ existing earlier pairing wins ties against rebalance/re-bank. `min_bank_rows`
 has the reference's placement (rebalance, single split, and re-bank eligibility).
 GPU costs distinguish 36 GDN and 12 QSA layers and prefix-dependent attention;
 NPU time rounds fused columns up to `panel_cols`. Contention is a burst term
-`(alpha_overlap - 1) * min(G_other, N_this)`, not whole-prefill slowdown.
+`(alpha_overlap - 1) * min(G_other, N_this)` plus, when `ms_per_gb` is set,
+`ms_per_gb * bytes / 1e9` over the NPU DRAM bytes of the overlapped chains
+(whole-prefill slowdown is not modelled). The per-layer stall is
+`max(0, N_chain - G_other)` per bank: with the measured balanced pairs (K1: GDN chain
+58.3 vs window 61.5 ms) it is zero, so the stall is the pipeline fill alone (steady
+state ~1 ms/pair, GPU wait 40 ms = A0 fill) and it only bites unbalanced pairs.
+The planner takes a `Moved` set (`Moved::from(FamilyMask)` for the in-proj families;
+`pair_time_moved` / `bank_segments_moved` / `plan_moved` also take `gdn.out`/`qsa.o`,
+which no `FamilyMask` bit reaches yet, so `select_families` never selects them).
+A moved `qsa.o` prices the order `C_A C_B P_A P_B`: each chain stalls by
+`max(0, chain - the GPU window it overlaps)` with the measured Core/post windows.
 GPU segments include pack once per moved layer shape and consume on each
 selected family's live (not panel-padded) columns. `consume_mode=retile`
 charges `rows/8192 * cols * consume_ms_per_col_8192[out_dtype]` per layer;
@@ -456,7 +466,18 @@ The measurements schema is the same as the schema-version-4 output record:
   co-running rate, measured or declared traffic, chosen output contract, padding.
 * `contention.alpha_overlap` (>=1) and `model`: fitted/measured overlap
   slowdown and the provenance/fit description. The planner consumes the alpha;
-  it does not reinterpret the descriptive model string.
+  it does not reinterpret the descriptive model string. Optional
+  `contention.ms_per_gb` (v5): contention per NPU DRAM GB of the overlapped family
+  chains (`bytes_per_kop * kops` per chain, plus the out family's own bytes/kop).
+* Optional (v5, absent in v4 records, which load unchanged): `glue.visit_ms_8192`
+  (GPU overhead per 8192 rows of a bank visit that moves families),
+  `npu.tops_alone` (in-proj alone rate the co-run rate is measured against),
+  `families.gdn.out` / `families.qsa.o` (an `out` block: `k`, `panel_cols`,
+  simulator `tops_alone`, `bytes_per_kop`, `gpu_ms_per_8192` of the GPU o-proj GEMM it
+  removes; their co-run rate is `tops_alone * npu.tops_corun / npu.tops_alone`), a
+  per-family `selectable` flag (default true; the two out families ship `false`), and
+  `qsa_order` (measured QSA Core/post windows and in-proj chain for the order
+  `C_A C_B P_A P_B`; required with `qsa.o`).
 
 Collect once per exact device/build/kernel/PerfOpt/model/epilogue/trunk-route tuple.
 The lab procedure is in `/home/kaden/qcal/release-0.4.2/npu-trunk/`:
@@ -483,7 +504,11 @@ stock/overlay × retile/direct, nonzero margins and a zero-cost GPU
 baseline, plus 40 exact-range plans. `golden-exec.json` pins the executable
 projection (`executable_plan`: natural and rebalanced pairs) and the prefill group
 schedule (`schedule`: banks and the in-bank snapshot cut, cache off / on / on
-without sub-launches) for 8000..65536 rows on the stock/overlay records. The same
+without sub-launches) for 8000..65536 rows on the stock/overlay records.
+`golden-v5.json` (fixture `g80bf16-overlay-v5.json`) pins the refit model: the 63-subset
+selection table (the 15 in-proj subsets compared in Rust, out-family subsets `selectable: false`),
+per-set bank segments (in-proj/out chains, NPU bytes), pair times (stall, contention, fill)
+and plans including the out families. The same
 tests run in the library and the `npu_trunk_plan` integration target (the
 schedule golden runs in the library, where the scheduler is visible).
 **All goldens are generated** by

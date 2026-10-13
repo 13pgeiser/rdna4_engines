@@ -17,12 +17,13 @@ pub(crate) use programs::build_rowmajor_programs_for_families;
 
 pub use calibration::{
     CalKey, Calibration, ContentionCalibration, DeviceKey, FamilyCalibration, GlueCalibration,
-    GpuCalibration, KernelKey, NpuCalibration, CALIBRATION_SCHEMA_VERSION,
+    GpuCalibration, KernelKey, NpuCalibration, OutFamily, QsaOrder, CALIBRATION_SCHEMA_VERSION,
     calibration_build_identity, calibration_key, runtime_calibration_key, model_index_identity,
 };
 pub use plan::{
-    alpha_extra, bank_segments, crossover, gpu_chunk, load_log_line, npu_ms, pair_time, plan,
-    request_log_line, select_families, BankSegments, GpuChunk, LoadLogKey, PairTime, Plan,
+    bank_segments, bank_segments_moved, contention_extra, crossover, gpu_chunk, load_log_line, npu_ms,
+    pair_time, pair_time_moved, plan, plan_moved,
+    request_log_line, select_families, BankSegments, GpuChunk, LoadLogKey, Moved, PairTime, Plan,
     SelectionReport, SelectionRow, Step, CHUNK, SELECTION_ROWS,
     auto_admission, executable_plan, planned_pair, planned_pair_rows,
 };

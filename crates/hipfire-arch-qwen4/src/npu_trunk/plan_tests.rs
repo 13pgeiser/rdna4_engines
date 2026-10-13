@@ -317,3 +317,133 @@ fn npu_trunk_auto_maps_natural_and_rebalanced_pairs() {
         assert!(!admitted(4096..8000, 8000..12288, 12288), "unaligned start");
     }
 }
+
+/// Names of the Python model (`qkv zab q kvidx gdn.out qsa.o`) as the planner's moved set.
+fn moved_names(names: &Value) -> Moved {
+    let (mut inproj, mut out) = ([false; 4], [false; 2]);
+    for name in names.as_array().unwrap() {
+        match name.as_str().unwrap() {
+            "qkv" => inproj[0] = true, "zab" => inproj[1] = true, "q" => inproj[2] = true, "kvidx" => inproj[3] = true,
+            "gdn.out" => out[0] = true, "qsa.o" => out[1] = true,
+            other => panic!("unknown golden family {other}"),
+        }
+    }
+    Moved::new(inproj, out)
+}
+fn v5_golden() -> (Calibration, Value) {
+    let vectors: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/npu_trunk/golden-v5.json"))).unwrap();
+    let v = vectors[0].clone();
+    let cal: Calibration = serde_json::from_value(v["calibration"].clone()).unwrap();
+    cal.validate().unwrap();
+    (cal, v)
+}
+#[test]
+fn npu_trunk_v5_goldens_match_python() {
+    let (cal, v) = v5_golden();
+    let (selected, report) = select_families(&cal);
+    assert_eq!(selected, grouped_mask(&v["selected"]));
+    assert_eq!(report.subsets.len(), 15);
+    for (actual, expected) in report.subsets.iter().zip(v["subsets"].as_array().unwrap()) {
+        assert_eq!(actual.families, grouped_mask(&expected["families"]));
+        assert_eq!(actual.selectable, expected["selectable"].as_bool().unwrap());
+        assert_eq!(actual.beats_margin_16384, expected["beats_margin_16384"].as_bool().unwrap());
+        close(actual.mean_relative, &expected["mean_relative"]);
+        for i in 0..3 {
+            close(actual.t_pipe_ms[i], &expected["t_pipe_ms"][i]);
+            close(actual.t_gpu_ms[i], &expected["t_gpu_ms"][i]);
+        }
+    }
+    // The Python table also holds the out-family subsets; none of them is selectable and none can win.
+    let python_rows = v["subsets"].as_array().unwrap();
+    assert_eq!(python_rows.len(), 63);
+    for row in python_rows {
+        let has_out = row["families"].as_array().unwrap().iter().any(|n| n == "gdn.out" || n == "qsa.o");
+        assert_eq!(row["selectable"].as_bool().unwrap(), !has_out);
+    }
+    assert!(!cal.families["qsa.o"].selectable && !cal.families["gdn.out"].selectable);
+    for expected in v["bank_segments"].as_array().unwrap() {
+        let actual = bank_segments_moved(&cal, moved_names(&expected["families"]),
+            expected["rows"].as_u64().unwrap() as usize, expected["prefix"].as_u64().unwrap() as usize);
+        for i in 0..2 {
+            close(actual.gpu[i], &expected["gpu"][i]);
+            close(actual.npu[i], &expected["npu"][i]);
+            close(actual.npu_out[i], &expected["npu_out"][i]);
+            close(actual.bytes[i], &expected["bytes"][i]);
+        }
+    }
+    for expected in v["pair_times"].as_array().unwrap() {
+        let b: Vec<usize> = expected["banks"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as usize).collect();
+        let actual = pair_time_moved(&cal, moved_names(&expected["families"]), b[0], b[1], b[2], b[3]);
+        for (value, key) in [(actual.t, "t"), (actual.stall, "stall"), (actual.extra, "extra"), (actual.fill, "fill"), (actual.gpu_only, "gpu_only")] {
+            close(value, &expected[key]);
+        }
+    }
+    for family_plans in v["plans"].as_array().unwrap() {
+        let moved = moved_names(&family_plans["families"]);
+        for expected in family_plans["plans"].as_array().unwrap() {
+            let actual = plan_moved(&cal, moved, expected["rows"].as_u64().unwrap() as usize);
+            let range = |r: &Value| r[0].as_u64().unwrap() as usize..r[1].as_u64().unwrap() as usize;
+            let steps: Vec<_> = expected["steps"].as_array().unwrap().iter().map(|s| match s.get("gpu") {
+                Some(r) => Step::Gpu { chunk: range(r) },
+                None => Step::Pipe { a: range(&s["pipe"][0]), b: range(&s["pipe"][1]) },
+            }).collect();
+            assert_eq!(actual.steps, steps, "{} {}", family_plans["families"], expected["python_plan"]);
+            close(actual.t_pipe_ms, &expected["t_pipe_ms"]);
+            close(actual.t_gpu_ms, &expected["t_gpu_ms"]);
+        }
+    }
+}
+#[test]
+fn npu_trunk_v5_model_terms() {
+    let (cal, _) = v5_golden();
+    let all = Moved::from(FamilyMask::ALL);
+    // Stall = pipeline fill only: no steady-state stall, fill is the first in-proj chain, contention is byte-linear.
+    let pair = pair_time_moved(&cal, all, 8192, 0, 8151, 8192);
+    assert_eq!(pair.stall, 0.0);
+    assert_eq!(pair.fill, bank_segments_moved(&cal, all, 8192, 0).npu[0]);
+    assert!((pair.extra - 200.0).abs() < 0.5, "16K in-pipeline contention {}", pair.extra);
+    // The out families never enter the in-proj mask, so the load-time selection cannot contain them.
+    assert_eq!(Moved::from(FamilyMask::ALL).out, [false, false]);
+    // A QSA out family stalls on the order C_A C_B P_A P_B: out chain only (no in-proj) stalls nothing here, with the
+    // in-proj chains the post-GEMM window shrinks and the layer stalls.
+    let qsa_out = pair_time_moved(&cal, Moved::new([false; 4], [false, true]), 8192, 0, 8151, 8192);
+    assert_eq!(qsa_out.stall, 0.0);
+    let both = pair_time_moved(&cal, Moved::new([true, true, true, true], [false, true]), 8192, 0, 8151, 8192);
+    assert!(both.stall > 0.0);
+    // The out chain is NPU time and DRAM bytes, and the GPU o-proj GEMM leaves the GPU segment.
+    let seg = bank_segments_moved(&cal, Moved::new([false; 4], [true, true]), 8192, 0);
+    let base = bank_segments_moved(&cal, Moved::new([false; 4], [false; 2]), 8192, 0);
+    assert!(seg.npu_out[0] > 0.0 && seg.npu_out[1] > 0.0 && seg.npu == base.npu);
+    assert!(seg.bytes[1] > 0.0 && seg.gpu[1] < base.gpu[1]);
+    // Selection stays in-proj: gating an in-proj family out of selection removes its subsets from the contest.
+    let mut gated = cal.clone();
+    gated.families.get_mut("q").unwrap().selectable = false;
+    let (picked, report) = select_families(&gated);
+    assert!(report.subsets.iter().any(|r| !r.selectable) && !picked.contains(Family::QsaQ));
+}
+#[test]
+fn npu_trunk_v5_validation() {
+    let (cal, _) = v5_golden();
+    let mut v = serde_json::to_value(&cal).unwrap();
+    v["families"]["qsa.o"].as_object_mut().unwrap().remove("out");
+    assert!(serde_json::from_value::<Calibration>(v).unwrap().validate().is_err());
+    let mut v = serde_json::to_value(&cal).unwrap();
+    v.as_object_mut().unwrap().remove("qsa_order");
+    assert!(serde_json::from_value::<Calibration>(v).unwrap().validate().is_err());
+    let mut v = serde_json::to_value(&cal).unwrap();
+    v["npu"].as_object_mut().unwrap().remove("tops_alone");
+    assert!(serde_json::from_value::<Calibration>(v).unwrap().validate().is_err());
+    let mut v = serde_json::to_value(&cal).unwrap();
+    v["families"]["qkv"]["out"] = v["families"]["qsa.o"]["out"].clone();
+    assert!(serde_json::from_value::<Calibration>(v).unwrap().validate().is_err());
+    let mut v = serde_json::to_value(&cal).unwrap();
+    v["families"]["other"] = v["families"]["qkv"].clone();
+    assert!(serde_json::from_value::<Calibration>(v).unwrap().validate().is_err());
+    let mut invalid = cal.clone(); invalid.contention.ms_per_gb = f64::NAN; assert!(invalid.validate().is_err());
+    // v4 files (no out families, no per-byte contention) still load unchanged.
+    let v4: Calibration = serde_json::from_str(include_str!("calibrations/halo-xdna2-overlay-v4.json")).unwrap();
+    v4.validate().unwrap();
+    assert!(v4.qsa_order.is_none() && v4.contention.ms_per_gb == 0.0 && v4.families.len() == 4);
+    let roundtrip: Value = serde_json::to_value(&v4).unwrap();
+    assert!(roundtrip["contention"].get("ms_per_gb").is_none() && roundtrip.get("qsa_order").is_none());
+}

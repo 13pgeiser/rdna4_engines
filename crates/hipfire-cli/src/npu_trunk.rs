@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use hipfire_arch_qwen4::npu_trunk::{
     CalKey, Calibration, ContentionCalibration, FamilyCalibration, GlueCalibration,
-    GpuCalibration, NpuCalibration, CALIBRATION_SCHEMA_VERSION,
+    GpuCalibration, NpuCalibration, QsaOrder, CALIBRATION_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
@@ -28,6 +28,8 @@ struct Measurements {
     npu: NpuCalibration,
     contention: ContentionCalibration,
     margin: f64,
+    #[serde(default)]
+    qsa_order: Option<QsaOrder>,
 }
 impl Measurements {
     fn assemble(self, uname_release: &str) -> Result<Calibration> {
@@ -40,7 +42,7 @@ impl Measurements {
         let cal = Calibration {
             schema_version: CALIBRATION_SCHEMA_VERSION,
             key: self.key, gpu: self.gpu, families: self.families, glue: self.glue,
-            npu: self.npu, contention: self.contention, margin: self.margin,
+            npu: self.npu, contention: self.contention, margin: self.margin, qsa_order: self.qsa_order,
         };
         cal.validate().map_err(anyhow::Error::msg)?;
         Ok(cal)

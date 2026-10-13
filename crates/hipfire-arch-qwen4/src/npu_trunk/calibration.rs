@@ -9,6 +9,7 @@ pub fn calibration_build_identity() -> String {
     format!("hipfire-{}:npu-trunk-bf16-rowmajor-v1", env!("CARGO_PKG_VERSION"))
 }
 pub(crate) const FAMILY_NAMES: [&str; 4] = ["qkv", "zab", "q", "kvidx"];
+pub(crate) const OUT_FAMILY_NAMES: [&str; 2] = ["gdn.out", "qsa.o"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,11 +52,32 @@ pub struct GpuCalibration {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FamilyCalibration { pub layer: String, pub cols: usize, pub out_dtype: String }
+pub struct FamilyCalibration {
+    pub layer: String,
+    pub cols: usize,
+    pub out_dtype: String,
+    /// `false` keeps the family out of `select_families` until it is measured.
+    #[serde(default = "selectable_default", skip_serializing_if = "is_true")]
+    pub selectable: bool,
+    /// Out-projection families only (`gdn.out`, `qsa.o`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out: Option<OutFamily>,
+}
+/// Out-projection shape (N = `cols`, K = `k`, `panel_cols` wide panels), its simulator rate alone, its NPU DRAM bytes
+/// per kilo-op and the GPU o-proj GEMM time it removes from the layer per 8192 rows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutFamily { pub k: usize, pub panel_cols: usize, pub tops_alone: f64, pub bytes_per_kop: f64, pub gpu_ms_per_8192: f64 }
+fn selectable_default() -> bool { true }
+fn is_true(v: &bool) -> bool { *v }
+fn is_zero(v: &f64) -> bool { *v == 0.0 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlueCalibration {
     pub pack_ms_8192: f64,
+    /// GPU overhead per 8192 rows of a bank visit that moves families (events, split prepare/pack, wake).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub visit_ms_8192: f64,
     pub sync_ms: f64,
     pub consume_mode: String,
     pub consume_ms_per_col_8192: BTreeMap<String, f64>,
@@ -64,13 +86,27 @@ pub struct GlueCalibration {
 #[serde(deny_unknown_fields)]
 pub struct NpuCalibration {
     pub tops_corun: f64,
+    /// In-proj alone rate the co-run rate is measured against; the out families scale their alone rate by
+    /// `tops_corun / tops_alone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tops_alone: Option<f64>,
     pub bytes_per_kop: f64,
     pub epilogue: String,
     pub panel_cols: usize,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ContentionCalibration { pub alpha_overlap: f64, pub model: String }
+pub struct ContentionCalibration {
+    pub alpha_overlap: f64,
+    /// Contention per NPU DRAM GB of the overlapped family chains (0 = burst model only).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ms_per_gb: f64,
+    pub model: String,
+}
+/// Measured per-8192-row QSA phase times at the 16K pair (bank A prefix 0, bank B prefix 8192).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QsaOrder { pub core_a_ms: f64, pub core_b_ms: f64, pub post_ms: f64, pub inproj_chain_ms: f64 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Calibration {
@@ -82,6 +118,9 @@ pub struct Calibration {
     pub npu: NpuCalibration,
     pub contention: ContentionCalibration,
     pub margin: f64,
+    /// Measured QSA phase windows for the order `C_A C_B P_A P_B` that moving `qsa.o` forces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qsa_order: Option<QsaOrder>,
 }
 impl Calibration {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
@@ -150,7 +189,12 @@ impl Calibration {
             ("kernel.uname_release", &self.key.kernel.uname_release), ("contention.model", &self.contention.model),
         ] { if value.trim().is_empty() { return Err(format!("{name} must not be empty")); } }
         if self.key.model_index_sha256.len() != 64 || !self.key.model_index_sha256.bytes().all(|c| c.is_ascii_hexdigit()) { return Err("model_index_sha256 must be 64 hex digits".into()); }
-        if self.families.len() != 4 || self.gpu.trunk_in_ms_per_8192.len() != 4 { return Err("expected qkv,zab,q,kvidx calibration families".into()); }
+        if self.gpu.trunk_in_ms_per_8192.len() != 4 { return Err("expected qkv,zab,q,kvidx calibration families".into()); }
+        for name in self.families.keys() {
+            if !FAMILY_NAMES.contains(&name.as_str()) && !OUT_FAMILY_NAMES.contains(&name.as_str()) {
+                return Err(format!("unknown families.{name}"));
+            }
+        }
         for (i, name) in FAMILY_NAMES.iter().enumerate() {
             let f = self.families.get(*name).ok_or_else(|| format!("missing families.{name}"))?;
             if f.cols == 0 || f.layer != if i < 2 { "gdn" } else { "qsa" } { return Err(format!("invalid families.{name}")); }
@@ -162,11 +206,41 @@ impl Calibration {
             ("uniform_per_layer_ms", self.gpu.uniform_per_layer_ms), ("gdn_core_per_layer_ms", self.gpu.gdn_core_per_layer_ms),
             ("qsa_per_layer_ms", self.gpu.qsa_per_layer_ms), ("qsa_growth_per_layer_ms_per_8192_prefix", self.gpu.qsa_growth_per_layer_ms_per_8192_prefix),
             ("fixed_per_chunk_ms", self.gpu.fixed_per_chunk_ms), ("boundary_tax_ms", self.gpu.boundary_tax_ms),
-            ("pack_ms_8192", self.glue.pack_ms_8192),
+            ("pack_ms_8192", self.glue.pack_ms_8192), ("visit_ms_8192", self.glue.visit_ms_8192),
             ("sync_ms", self.glue.sync_ms), ("bytes_per_kop", self.npu.bytes_per_kop),
         ] { if !value.is_finite() || value < 0.0 { return Err(format!("{name} must be finite and nonnegative")); } }
         if !self.npu.tops_corun.is_finite() || self.npu.tops_corun <= 0.0 { return Err("tops_corun must be finite and positive".into()); }
         if !self.contention.alpha_overlap.is_finite() || self.contention.alpha_overlap < 1.0 { return Err("alpha_overlap must be finite and >= 1".into()); }
+        if !self.contention.ms_per_gb.is_finite() || self.contention.ms_per_gb < 0.0 { return Err("ms_per_gb must be finite and nonnegative".into()); }
+        self.validate_out_families()?;
+        Ok(())
+    }
+    /// The optional out-projection families (`gdn.out`, `qsa.o`): their own shape, rate and GPU o-proj cost, the
+    /// in-proj alone rate their co-run rate is scaled by, and (for `qsa.o`) the measured QSA phase windows.
+    fn validate_out_families(&self) -> Result<(), String> {
+        for (name, layer) in OUT_FAMILY_NAMES.into_iter().zip(["gdn", "qsa"]) {
+            let Some(f) = self.families.get(name) else { continue };
+            let Some(o) = &f.out else { return Err(format!("families.{name} needs an out block")); };
+            if f.cols == 0 || f.layer != layer || f.out_dtype != "bf16" { return Err(format!("invalid families.{name}")); }
+            if o.k == 0 || o.panel_cols == 0 { return Err(format!("invalid families.{name}.out")); }
+            for (field, value) in [("tops_alone", o.tops_alone), ("bytes_per_kop", o.bytes_per_kop), ("gpu_ms_per_8192", o.gpu_ms_per_8192)] {
+                if !value.is_finite() || value < 0.0 || (field == "tops_alone" && value == 0.0) {
+                    return Err(format!("invalid families.{name}.out.{field}"));
+                }
+            }
+            if !self.npu.tops_alone.is_some_and(|t| t.is_finite() && t > 0.0) { return Err("out families need a positive npu.tops_alone".into()); }
+        }
+        for name in FAMILY_NAMES {
+            if self.families.get(name).is_some_and(|f| f.out.is_some()) { return Err(format!("families.{name} must not carry an out block")); }
+        }
+        if self.families.contains_key("qsa.o") {
+            let q = self.qsa_order.as_ref().ok_or("qsa.o needs qsa_order")?;
+            for (field, value) in [("core_a_ms", q.core_a_ms), ("core_b_ms", q.core_b_ms), ("post_ms", q.post_ms), ("inproj_chain_ms", q.inproj_chain_ms)] {
+                if !value.is_finite() || value < 0.0 { return Err(format!("qsa_order.{field} must be finite and nonnegative")); }
+            }
+        } else if self.qsa_order.is_some() {
+            return Err("qsa_order without families.qsa.o".into());
+        }
         Ok(())
     }
 }
