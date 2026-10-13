@@ -2720,6 +2720,13 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
     if !matches!(mode, OffloadExec::Cpu | OffloadExec::Passback) {
         return;
     }
+    if mode == OffloadExec::Passback {
+        eprintln!(
+            "passback: memory.offload_exec=passback is non-deterministic by design — its CPU/GPU \
+             row split is scheduled per process, so generated tokens may change across runs; \
+             choose cpu or pcie for reproducible output"
+        );
+    }
     let spilled = config.i_gpu_start;
     if spilled == 0 {
         eprintln!(
