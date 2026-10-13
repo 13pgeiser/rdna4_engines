@@ -671,7 +671,10 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
             && matches!(
                 pair,
                 kv_mode::KvPair::Native(hipfire_runtime::kv_mode::KvMode::Q8)
-                    | kv_mode::KvPair::Split(hipfire_runtime::kv_mode::KvMode::Q8, llama::VMode::Q8)
+                    | kv_mode::KvPair::Split(
+                        hipfire_runtime::kv_mode::KvMode::Q8,
+                        llama::VMode::Q8
+                    )
             ),
         ctx.kv_backend,
     )?;
@@ -1561,9 +1564,11 @@ mod tests {
     #[test]
     fn gfx1100_split_verify_refuses_legacy_kv() {
         assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Vmm).is_ok());
-        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy)
-            .unwrap_err()
-            .contains("admits VMM KV only"));
+        assert!(
+            validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy)
+                .unwrap_err()
+                .contains("admits VMM KV only")
+        );
         // Outside the opt-in envelope or off plain Q8 the route never runs,
         // so the backend is not this check's concern.
         assert!(validate_gfx1100_split_verify_kv(false, true, KvBackend::Legacy).is_ok());

@@ -39,11 +39,11 @@ use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::context::DispatchWorkload;
+use hipfire_dispatch::families::attention::gfx1100_split_verify_admitted as dispatch_gfx1100_split_verify_admitted;
+use hipfire_dispatch::families::attention::gfx1100_split_verify_min_ctx as dispatch_gfx1100_split_verify_min_ctx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::attention::Gfx1100SplitVerifyModel;
 use hipfire_dispatch::families::attention::Gfx1100SplitVerifyRoute;
-use hipfire_dispatch::families::attention::gfx1100_split_verify_admitted as dispatch_gfx1100_split_verify_admitted;
-use hipfire_dispatch::families::attention::gfx1100_split_verify_min_ctx as dispatch_gfx1100_split_verify_min_ctx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
@@ -6867,7 +6867,10 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
             push_gdn_tape_copies(sink, tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
         } else if fusion.is_chain_verify()
             && matches!(batch_semantics, BatchSemantics::Sequential)
-            && tree_verify.as_ref().and_then(|c| c.parent_indices).is_none()
+            && tree_verify
+                .as_ref()
+                .and_then(|c| c.parent_indices)
+                .is_none()
             && verify_tape_copy_batch_enabled()
         {
             // Singleton chain verify: one batched launch for the same three
@@ -10407,7 +10410,12 @@ fn batch_chunk_fa_attend_a4(
 /// switch clear, never DFlash chain verify, GQA 24/4 HD256 with a 64-wide
 /// rotary. Shared by [`batch_chunk_full_attn_attn`] and the multi-request
 /// chunk, which evaluates it per request with that request's `fusion`/`n`.
-fn gfx12_fa_prep_admitted(gpu: &Gpu, config: &Qwen35Config, fusion: DflashFusionCtx, n: usize) -> bool {
+fn gfx12_fa_prep_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> bool {
     gpu.arch == "gfx1201"
         && gpu.flags.gfx12_fa_prep_fused
         && !fusion.is_chain_verify()
