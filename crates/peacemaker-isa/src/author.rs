@@ -38,7 +38,8 @@ impl Backend for Builder {
         self.seal.check(auth)?;
         let (&first, rest) = slots.split_first().ok_or("LDS load without a slot")?;
         let old = self.lds.clone();
-        let result = rest.iter().try_for_each(|&slot| self.lds.load(slot)).and_then(|()| self.ds_load_slot(first, insn));
+        let result = rest.iter().try_for_each(|&slot| self.lds.load(slot)).and_then(|()| self.ds_load_slot(first, insn))
+            .and_then(|()| rest.iter().try_for_each(|&slot| self.ledger.tag_lds_load(slot)));
         if result.is_err() { self.lds = old }
         result
     }

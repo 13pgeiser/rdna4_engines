@@ -4950,9 +4950,13 @@ pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
 /// `fused_silu_hin_rotate_mq_i4_batched` on its own h, and the stage-1 retile
 /// twin `gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_m512_gfx1151` (same ABI and h
 /// bits as the V2B SiLU entry). Selected on exact gfx1151 V2B admission only
-/// via `HIPFIRE_V2B_A4_EPI` (`retile` / `1`; default off);
-/// `HIPFIRE_V2B_A4_PM_BUNDLE=<path>` loads another bundle instead.
-/// SHA-256 948e84aec58728d76ecb1390ce54b2049700d3a44e4b726c26d448a38feb5a42.
+/// via `HIPFIRE_V2B_A4_EPI` (fused by default; `retile` selects the twin,
+/// `0` the unfused path); `HIPFIRE_V2B_A4_PM_BUNDLE=<path>` loads another
+/// bundle instead. Since 0.4.2 the epilogue's panel-retire barrier waits for
+/// the round-0 panel loads (`s_waitcnt lgkmcnt(0)`): without it a WGP's other
+/// CU could overwrite a panel row before this wave read it, which made the
+/// output depend on co-tenant GPU load.
+/// SHA-256 09dbc6403013c7eab1b13e659faf6662f9c47477b64e2b5200be62e0f358b556.
 pub const GEMM_MQ4G256V2_GATE_UP_SILU_A4_IU4_PM_V2B_GFX1151: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151.hxaco");
 

@@ -40,6 +40,37 @@ fn gfx11_lds_barrier_drains_pending_stores_first() {
     assert!(b.ledger().is_empty());
 }
 
+/// WAR at a retiring barrier: a DS load still queued when the barrier
+/// retires its slot could, on a WGP, read another wave's post-barrier store
+/// (the A4 panel-round race). The barrier retires exactly the loads of the
+/// retired slots: `lgkmcnt(n)` keeps the younger loads of other slots in
+/// flight, and a barrier retiring nothing the wave reads adds no wait.
+#[test]
+fn gfx11_retiring_barrier_waits_for_the_retired_slots_loads() {
+    for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+        let mut b = probe(arch);
+        let a = b.lds_slot("A", 0, 256).unwrap();
+        let c = b.lds_slot("C", 256, 256).unwrap();
+        for (slot, addr) in [(a, 2u8), (c, 5)] {
+            b.ds_store(slot, Instruction::new(format!("ds_store_b32 v{addr}, v0"), vec![], vec![v(addr), v(0)]).memory(MemoryClass::DsStore)).unwrap();
+        }
+        b.barrier(&[Transition::Ready(a), Transition::Ready(c)]).unwrap();
+        b.ds_load(a, Instruction::new("ds_load_b32 v3, v2", vec![v(3)], vec![v(2)]).memory(MemoryClass::DsLoad)).unwrap();
+        b.ds_load(c, Instruction::new("ds_load_b32 v4, v5", vec![v(4)], vec![v(5)]).memory(MemoryClass::DsLoad)).unwrap();
+        b.barrier(&[Transition::Retire(a)]).unwrap();
+        let text: Vec<&str> = b.program().instructions.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(&text[text.len() - 2..], ["s_waitcnt lgkmcnt(1)", "s_barrier"], "{arch:?}");
+        // C's load is still pending and C is not retired: no wait.
+        let before = b.program().instructions.len();
+        b.barrier(&[]).unwrap();
+        assert_eq!(b.program().instructions[before].text, "s_barrier", "{arch:?}");
+        b.barrier(&[Transition::Retire(c)]).unwrap();
+        let text: Vec<&str> = b.program().instructions.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(&text[text.len() - 2..], ["s_waitcnt lgkmcnt(0)", "s_barrier"], "{arch:?}");
+        assert!(b.ledger().is_empty());
+    }
+}
+
 #[test]
 fn gfx11_combines_vm_and_lgkm_waits_into_one_s_waitcnt() {
     let mut b = probe(Arch::Gfx1100);

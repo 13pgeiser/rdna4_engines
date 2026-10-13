@@ -36,6 +36,9 @@ pub struct Pending {
     pub maybe: bool,
     /// Ids of the same counter slot on other joined paths (`Ledger::join`).
     pub aliases: Vec<u64>,
+    /// LDS slots a DS load reads (`Ledger::tag_lds_load`; union over joined
+    /// paths). A barrier that retires one of them must first retire the load.
+    pub lds_slots: Vec<usize>,
 }
 impl Pending {
     fn has(&self, id: u64) -> bool { self.id == id || self.aliases.contains(&id) }
@@ -84,7 +87,7 @@ impl Ledger {
             id: self.next_id, counter,
             defs: if load { insn.defs.clone() } else { vec![] },
             src_locks: if load { vec![] } else { insn.uses.clone() },
-            in_order, family, order, maybe: false, aliases: vec![],
+            in_order, family, order, maybe: false, aliases: vec![], lds_slots: vec![],
         });
         self.next_id += 1;
     }
@@ -113,6 +116,35 @@ impl Ledger {
             }
         }
         waits
+    }
+
+    /// Mark the most recently recorded operation (a DS load) as reading LDS
+    /// slot `slot`.
+    pub fn tag_lds_load(&mut self, slot: usize) -> Result<(), String> {
+        match self.pending.last_mut() {
+            Some(p) if p.id + 1 == self.next_id && p.family == MemoryFamily::Ds && p.src_locks.is_empty() => {
+                if !p.lds_slots.contains(&slot) { p.lds_slots.push(slot) }
+                Ok(())
+            }
+            _ => Err("tag_lds_load: the last recorded operation is not a pending DS load".into()),
+        }
+    }
+
+    /// The wait that retires every pending DS load reading one of `slots`
+    /// (`None` when there is none). A workgroup barrier does not wait for
+    /// memory counters: on a WGP the other CU's waves may store to a retired
+    /// slot before this wave's earlier load of it has read LDS (WAR), so a
+    /// barrier that retires a slot must retire its loads first. The count is
+    /// `required`'s: the younger operations of the counter when it retires in
+    /// issue order, else zero.
+    pub fn retire_loads_of(&self, slots: &[usize]) -> Option<(Counter, u8)> {
+        let (index, pending) = self.pending.iter().enumerate().rev()
+            .find(|(_, p)| p.lds_slots.iter().any(|s| slots.contains(s)))?;
+        let peers = self.pending.iter().filter(|p| p.counter == pending.counter);
+        let ordered = pending.in_order && peers.clone().all(|p| p.in_order && !p.maybe && p.order == pending.order);
+        let younger = self.pending.iter().skip(index + 1).filter(|p| p.counter == pending.counter).count();
+        let count = if ordered && younger <= 63 { younger as u8 } else { 0 };
+        Some((pending.counter, count))
     }
 
     /// An operation retires once `count` younger operations of its counter
@@ -162,6 +194,7 @@ impl Ledger {
             for (p, o) in self.pending.iter().filter(|p| p.counter == *c).zip(theirs) {
                 let mut p = p.clone();
                 for id in o.ids() { if !p.has(id) { p.aliases.push(id) } }
+                for s in &o.lds_slots { if !p.lds_slots.contains(s) { p.lds_slots.push(*s) } }
                 merged.push(p);
             }
         }
@@ -171,6 +204,7 @@ impl Ledger {
                 Some(o) => {
                     p.maybe |= o.maybe;
                     for id in o.ids() { if !p.has(id) { p.aliases.push(id) } }
+                    for s in &o.lds_slots { if !p.lds_slots.contains(s) { p.lds_slots.push(*s) } }
                 }
                 None => p.maybe = true,
             }

@@ -146,7 +146,17 @@ impl Builder {
  pub fn ds_store(&mut self,slot:usize,insn:Instruction)->Result<(),String>{self.untyped()?;self.ds_store_slot(slot,insn)}
  fn ds_store_slot(&mut self,slot:usize,insn:Instruction)->Result<(),String>{if insn.memory!=Some(MemoryClass::DsStore)||!insn.mnemonic().starts_with("ds_store"){return Err("ds_store requires an LDS store instruction".into())}let old=self.lds.clone();self.lds.store(slot)?;self.lds_access_allowed=true;let result=self.push(insn);self.lds_access_allowed=false;if result.is_err(){self.lds=old}result}
  pub fn ds_load(&mut self,slot:usize,insn:Instruction)->Result<(),String>{self.untyped()?;self.ds_load_slot(slot,insn)}
- fn ds_load_slot(&mut self,slot:usize,insn:Instruction)->Result<(),String>{if insn.memory!=Some(MemoryClass::DsLoad)||!insn.mnemonic().starts_with("ds_load"){return Err("ds_load requires an LDS load instruction".into())}let old=self.lds.clone();self.lds.load(slot)?;self.lds_access_allowed=true;let result=self.push(insn);self.lds_access_allowed=false;if result.is_err(){self.lds=old}result}
+ fn ds_load_slot(&mut self,slot:usize,insn:Instruction)->Result<(),String>{if insn.memory!=Some(MemoryClass::DsLoad)||!insn.mnemonic().starts_with("ds_load"){return Err("ds_load requires an LDS load instruction".into())}let old=self.lds.clone();self.lds.load(slot)?;self.lds_access_allowed=true;let result=self.push(insn).and_then(|()|self.ledger.tag_lds_load(slot));self.lds_access_allowed=false;if result.is_err(){self.lds=old}result}
+ /// Before a barrier: drain LDS stores (RAW, the barrier publishes them),
+ /// else retire the pending DS loads of every slot the barrier retires
+ /// (WAR: after the barrier another wave may store to that slot, and on a
+ /// WGP the other CU's store can land before this wave's queued load reads).
+ /// `s_barrier` waits for no memory counter of its own.
+ fn barrier_waits(&mut self,transitions:&[Transition],ds:Counter)->Result<(),String>{
+  if self.ledger.pending_stores(){return self.emit_wait(ds,0,Reason::Barrier)}
+  let retired:Vec<usize>=transitions.iter().filter_map(|t|match t {Transition::Retire(id)=>Some(*id),Transition::Ready(_)=>None}).collect();
+  match self.ledger.retire_loads_of(&retired) {Some((counter,count))=>self.emit_wait(counter,count,Reason::Barrier),None=>Ok(())}
+ }
  /// Cross-lane exchange on the LDS crossbar (`ds_swizzle_b32`, or `ds_bpermute_b32`
  /// with its lane-byte address and data VGPR uses): it counts on LGKM like a DS load
  /// but reads and writes no LDS memory, so it carries no slot.
@@ -175,7 +185,7 @@ impl Builder {
  pub fn barrier_signal(&mut self,transitions:&[Transition])->Result<(),String>{self.untyped()?;self.signal(transitions)}
  fn signal(&mut self,transitions:&[Transition])->Result<(),String>{
   if !self.spec.arch.gfx12(){return Err("split barriers require gfx12".into())}
-  if self.ledger.pending_stores(){self.emit_wait(Counter::Ds,0,Reason::Barrier)?}
+  self.barrier_waits(transitions,Counter::Ds)?;
   self.lds.barrier_signal(transitions,!self.ledger.pending_stores())?;
   self.pending_barrier=Some(transitions.to_vec());
   self.program.instructions.push(Instruction::new("s_barrier_signal -1",vec![],vec![]));
@@ -194,7 +204,7 @@ impl Builder {
  fn full_barrier(&mut self,transitions:&[Transition],scope:MemoryScope)->Result<(),String>{
   if self.spec.arch.gfx12(){self.signal(transitions)?;self.arrive()?}
   else {
-   if self.ledger.pending_stores(){self.emit_wait(Counter::Lgkm,0,Reason::Barrier)?}
+   self.barrier_waits(transitions,Counter::Lgkm)?;
    self.lds.barrier(transitions,!self.ledger.pending_stores())?;
    let pc_index=self.program.instructions.len();
    self.program.instructions.push(Instruction::new("s_barrier",vec![],vec![]));
