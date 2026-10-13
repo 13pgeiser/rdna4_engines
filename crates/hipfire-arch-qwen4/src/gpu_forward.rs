@@ -33,7 +33,8 @@ use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeRouteCapability,
     MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy, MoeRowGather, MoeSharedDecode,
-    MoeSharedDtypes, MoeSharedWeights, MoeStageTables, RoutedExpertWeights,
+    MoeSharedDtypes, MoeSharedWeights, MoeStageTables, MoeTileExchange, MoeTileExchangeParams,
+    RoutedExpertWeights,
 };
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
@@ -811,6 +812,7 @@ pub(crate) fn layer_desc<'a>(
                 norm_topk_prob: config.norm_topk_prob,
                 row_gather: None,
                 shared_down_out: None,
+                tile_exchange: None,
             })
         }
         _ => {
@@ -1317,6 +1319,121 @@ fn qwen4_ep_balanced_owners_enabled() -> bool {
     hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
 }
 
+/// `HIPFIRE_EP_OWNER_ROUTED_PREFILL=1` (default off): owner-routed chunk MoE on EP2.
+/// A prefill chunk of at least 512 rows whose layer verified symmetric on both ranks
+/// runs the symmetric IU4 GEMMs on the compact (owned-experts-only) table with the
+/// tiles of the peer's experts masked out, then pulls the peer-owned tiles' BF16
+/// grouped down rows over P2P (`MoeTileExchange`) instead of computing every expert
+/// twice. Every other chunk keeps the full-table route. Anything but the exact value
+/// `1` is off, and off allocates nothing, lowers no stage and loads no kernel.
+pub const QWEN4_EP_OWNER_ROUTED_PREFILL_ENV: &str = "HIPFIRE_EP_OWNER_ROUTED_PREFILL";
+
+fn qwen4_ep_owner_routed_prefill_enabled() -> bool {
+    hipfire_config::developer_var(QWEN4_EP_OWNER_ROUTED_PREFILL_ENV).as_deref() == Ok("1")
+}
+
+/// One rank's owner-routed chunk MoE state. The buffers exist from forward construction
+/// (before the mesh enables peers, so a peer-mapped allocation never lags the mapping);
+/// the hook is installed once every rank agreed on the per-layer symmetric verdicts.
+pub(crate) struct Qwen4TileRoute {
+    /// Owner rank of every expert (`i32` per expert, `e % ranks`): the mask and the pull
+    /// read it as an input.
+    owner_table: GpuTensor,
+    /// The masked tile ids gate/up and down read (`i32` per tile of the padded capacity).
+    tile_ids_owned: GpuTensor,
+    /// Padded tile capacity the exchange is registered for.
+    max_tiles: usize,
+    /// Per layer: the compact layer's symmetric verdict, taken on the full tables in
+    /// `attach_ep`. Empty until then.
+    verdicts: Vec<bool>,
+    /// The installed transport (`None` until the mesh agreed).
+    hook: Option<Arc<dyn MoeTileExchange + Send + Sync>>,
+}
+
+impl Qwen4TileRoute {
+    /// Admit the lever for this load or log why not and return `None` (nothing allocated).
+    #[allow(clippy::too_many_arguments)]
+    fn admit(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        scratch: &Qwen4GpuForwardScratch,
+        mode: Qwen4ForwardScratchMode,
+        max_chunk: usize,
+        flash_next: bool,
+    ) -> Result<Option<Self>, Qwen4GpuForwardError> {
+        let refuse = |reason: &str| {
+            eprintln!(
+                "qwen4 EP rank {}/{}: owner-routed prefill not admitted ({reason}); chunks keep the full-table route",
+                placement.rank, placement.ranks
+            );
+            Ok(None)
+        };
+        if placement.ranks != 2 {
+            return refuse("needs exactly 2 ranks");
+        }
+        if gpu.arch != "gfx1201" {
+            return refuse("needs gfx1201");
+        }
+        if !flash_next {
+            return refuse("needs the Flash-Next profile");
+        }
+        if !gpu.flags.moe_grouped_gemm || !gpu.qwen4_moe_sym_iu4_requested() {
+            return refuse("the symmetric IU4 route is not requested");
+        }
+        if mode != Qwen4ForwardScratchMode::Full {
+            // The compact plan lends `y_down_grouped` to a phase-disjoint field the peer
+            // would be reading.
+            return refuse("the compact scratch plan aliases y_down_grouped");
+        }
+        // Sym scratch before the mesh enables peers (the grouped-row buffer and the masked
+        // ids are allocated now; ROCm does not map later allocations).
+        gpu.reserve_qwen4_moe_sym(
+            max_chunk,
+            config.num_experts_per_tok,
+            config.num_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
+        )?;
+        let word = std::mem::size_of::<i32>();
+        let tile_bytes = 16 * config.hidden_size * DType::BF16.size();
+        let tile_capacity = scratch.moe_expert_tile_ids.buf.size() / word;
+        let max_tiles = tile_capacity.min(scratch.moe_y_down_grouped.buf.size() / tile_bytes);
+        if max_tiles == 0 {
+            return refuse("no tile capacity");
+        }
+        let owners: Vec<u8> = (0..config.num_experts)
+            .flat_map(|expert| ((expert % placement.ranks) as i32).to_le_bytes())
+            .collect();
+        let owner_table = gpu.upload_raw(&owners, &[owners.len()])?;
+        let sentinels = vec![0xFFu8; tile_capacity * word];
+        let tile_ids_owned = match gpu.upload_raw(&sentinels, &[sentinels.len()]) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(owner_table);
+                return Err(error.into());
+            }
+        };
+        Ok(Some(Self {
+            owner_table,
+            tile_ids_owned,
+            max_tiles,
+            verdicts: Vec::new(),
+            hook: None,
+        }))
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for tensor in [self.owner_table, self.tile_ids_owned] {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
 /// One host-mapped trunk MoE layer under balanced ownership: the rank's *live*
 /// expert runtime. It is the layer's full (P2P) addressing
 /// ([`Qwen4MoeLayerRuntime::from_moe_full`]); `qwen4_ep_owner_assign` rewrites
@@ -1358,6 +1475,9 @@ struct Qwen4ForwardEp {
     /// balanced layers (stream-ordered: a call's assignment writes it and the
     /// same call's gather reads it before the next layer's assignment).
     slot_owner: Option<GpuTensor>,
+    /// Owner-routed chunk MoE state (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, admitted at
+    /// construction); `None` when the lever is off or refused.
+    tile: Option<Qwen4TileRoute>,
 }
 
 impl Qwen4ForwardEp {
@@ -1397,6 +1517,7 @@ impl Qwen4ForwardEp {
             gather: None,
             balanced: Vec::new(),
             slot_owner: None,
+            tile: None,
         };
         // The zero fills are stream-ordered; peers read the buffers over P2P
         // on their own streams.
@@ -1416,6 +1537,11 @@ impl Qwen4ForwardEp {
         }
         for layer in self.balanced.into_iter().flatten() {
             if let Some(error) = layer.live.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some(route) = self.tile {
+            if let Some(error) = route.free_gpu(gpu) {
                 first.get_or_insert(error);
             }
         }
@@ -3837,6 +3963,21 @@ impl Qwen4GpuForward {
             // module loads) unless the route was requested.
             // (An EP rank verifies its full chunk tables in `attach_ep`, once
             // every peer's experts are mapped.)
+            // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): its grouped-row
+            // buffer, masked tile ids and sym scratch exist before the mesh enables peers.
+            if let Some(state) = ep.as_mut() {
+                if qwen4_ep_owner_routed_prefill_enabled() {
+                    state.tile = Qwen4TileRoute::admit(
+                        gpu,
+                        &bundle.config,
+                        state.placement,
+                        &scratch,
+                        mode,
+                        max_chunk,
+                        flash_next,
+                    )?;
+                }
+            }
             if ep.is_none() && !moe.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
                 let mut verified = 0usize;
                 for layer in &mut moe {
@@ -4312,10 +4453,65 @@ impl Qwen4GpuForward {
                 balanced.iter().flatten().count()
             );
         }
+        if let Some(route) = ep.tile.as_mut() {
+            // The compact table carries no verdict of its own under EP (the verification
+            // above ran on the full tables; same experts, same bytes): the mesh compares
+            // both ranks' vectors before anything is propagated to the compact layers.
+            route.verdicts = full.iter().map(|layer| layer.symmetric).collect();
+        }
         ep.moe_full = full;
         ep.balanced = balanced;
         ep.slot_owner = slot_owner;
         ep.gather = Some(gather);
+        Ok(())
+    }
+
+    /// This rank's grouped-row buffer (the peer reads it) and the tile capacity the
+    /// exchange is registered for, or `None` when not admitted.
+    pub(crate) fn ep_tile_registration(&self) -> Option<(&GpuTensor, usize)> {
+        let route = self.ep.as_ref()?.tile.as_ref()?;
+        Some((&self.scratch.moe_y_down_grouped, route.max_tiles))
+    }
+
+    /// The per-layer symmetric verdicts taken in `attach_ep` (`None` when not admitted).
+    pub(crate) fn ep_tile_verdicts(&self) -> Option<Vec<bool>> {
+        Some(self.ep.as_ref()?.tile.as_ref()?.verdicts.clone())
+    }
+
+    /// A non-owning view of the rank's owner table for the transport hook (owned by the
+    /// forward, freed with it; the hook is never used after the forward is freed).
+    pub(crate) fn ep_tile_owner_table_view(&self) -> Option<GpuTensor> {
+        let table = &self.ep.as_ref()?.tile.as_ref()?.owner_table;
+        Some(GpuTensor {
+            // SAFETY: a `Borrowed` alias of the buffer `Qwen4TileRoute` owns until
+            // `free_gpu`; the hook that holds it lives inside this forward.
+            buf: unsafe { table.buf.alias() },
+            shape: table.shape.clone(),
+            dtype: table.dtype,
+        })
+    }
+
+    /// Install the agreed transport: every layer's compact runtime takes the symmetric
+    /// verdict (same experts, same bytes as the full tables it was taken on), so a chunk of
+    /// at least 512 rows binds the compact table with the tile exchange. Refused unless
+    /// every layer verified symmetric (the mesh checked both ranks agree).
+    pub(crate) fn install_tile_exchange(
+        &mut self,
+        hook: Arc<dyn MoeTileExchange + Send + Sync>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let layers = self.moe.len();
+        let Some(route) = self.ep.as_mut().and_then(|ep| ep.tile.as_mut()) else {
+            return Err(invalid("owner-routed prefill was not admitted on this rank"));
+        };
+        if route.verdicts.len() != layers || !route.verdicts.iter().all(|&symmetric| symmetric) {
+            return Err(invalid(
+                "owner-routed prefill needs every layer verified symmetric on the full tables",
+            ));
+        }
+        route.hook = Some(hook);
+        for layer in &mut self.moe {
+            layer.symmetric = true;
+        }
         Ok(())
     }
 
@@ -5187,6 +5383,25 @@ impl Qwen4GpuForward {
                     ..layer_scratch(&self.scratch, &router_logits)
                 })
             });
+        // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, hook installed by
+        // the mesh): a chunk on the symmetric IU4 route (>= 512 routing rows that are the
+        // launch rows) binds each layer's compact table plus the tile exchange; every
+        // other chunk keeps the full-table route exactly as without the lever.
+        let tile_route = ep
+            .filter(|_| route_n > 1 && !ep_few_rows)
+            .and_then(|ep| ep.tile.as_ref())
+            .filter(|route| route.hook.is_some());
+        let tile_active =
+            tile_route.is_some() && route_n == n && gpu.qwen4_moe_sym_iu4_applies(route_n);
+        if let Some(route) = tile_route.filter(|_| !tile_active) {
+            // A full-table chunk also writes `y_down_grouped`: it may start only after the
+            // peer finished pulling this rank's rows of the last exchange.
+            if let Some(hook) = route.hook.as_ref() {
+                hook.before_down(gpu)
+                    .map_err(|error| invalid(format!("EP tile exchange: {error}")))?;
+            }
+        }
+        let tile_route = tile_route.filter(|_| tile_active);
         if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
         {
             return Err(invalid(
@@ -5223,6 +5438,9 @@ impl Qwen4GpuForward {
         // the BF16 key/value projections (decided once; the step op and the
         // staging closure agree on it).
         let mut ple_rows_f16 = false;
+        // `HIPFIRE_CHUNK_DUMP_DIR` (developer diagnostic; off by default).
+        let chunk_dump = crate::chunk_dump::config().filter(|_| route_n > 1);
+        let mut dump_ends: Vec<(usize, usize, bool)> = Vec::new();
         for layer_index in 0..config.num_hidden_layers {
             let layer = &bundle.weights.layer_refs[layer_index];
             if ple_layer_index == Some(layer_index) {
@@ -5290,7 +5508,13 @@ impl Qwen4GpuForward {
                 .map(|balanced| &balanced.live);
             let layer_moe = match (balanced_live, ep) {
                 (Some(live), _) => Some(live),
-                (None, Some(ep)) if route_n > 1 && !ep_few_rows => ep.moe_full.get(layer_index),
+                (None, Some(ep)) if route_n > 1 && !ep_few_rows => {
+                    if tile_route.is_some() {
+                        self.moe.get(layer_index)
+                    } else {
+                        ep.moe_full.get(layer_index)
+                    }
+                }
                 _ => self.moe.get(layer_index),
             };
             let mut description = layer_desc(
@@ -5311,6 +5535,16 @@ impl Qwen4GpuForward {
                     // The gather buffer is the combine's `down_expanded`; the
                     // unfused shared down writes the ordinary scratch.
                     binding.shared_down_out = Some(&self.scratch.moe_down_expanded);
+                }
+            }
+            if let (Some(route), Qwen4FfnBinding::Moe(binding)) =
+                (tile_route, &mut description.ffn)
+            {
+                if let Some(hook) = route.hook.as_deref() {
+                    binding.tile_exchange = Some(MoeTileExchangeParams {
+                        exchange: hook,
+                        tile_ids_owned: &route.tile_ids_owned,
+                    });
                 }
             }
             let attn_read = &description.attn_hyper.read;
@@ -5567,6 +5801,11 @@ impl Qwen4GpuForward {
                 branches: dims.hc_count,
                 hidden: config.hidden_size,
             }));
+            if chunk_dump.is_some_and(|dump| dump.wants(layer_index)) {
+                let bf16_grouped =
+                    layer_moe.is_some_and(|moe| moe.symmetric) && gpu.qwen4_moe_sym_iu4_applies(route_n);
+                dump_ends.push((layer_index, steps.len(), bf16_grouped));
+            }
         }
         validate_steps(gpu, &steps).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("preflight Qwen4 typed program: {error:?}"))
@@ -5997,7 +6236,36 @@ impl Qwen4GpuForward {
                         ))
                     })
                 };
-                if let Some(tap) = self.qsa_tap.as_mut() {
+                if !dump_ends.is_empty() && expert_stage.is_none() && self.qsa_tap.is_none() {
+                    // `HIPFIRE_CHUNK_DUMP_DIR`: run the chunk in segments that end after
+                    // each selected layer and dump that boundary (diagnostic only).
+                    let dump = chunk_dump.expect("dump ends imply the dump is enabled");
+                    let mut start = 0;
+                    for index in 0..steps.len() {
+                        if ple_split == Some(index) {
+                            execute(gpu, &steps[start..index])?;
+                            stage_ple(gpu)?;
+                            start = index;
+                        }
+                        if let Some(&(layer, _, bf16_grouped)) =
+                            dump_ends.iter().find(|(_, end, _)| *end == index + 1)
+                        {
+                            execute(gpu, &steps[start..=index])?;
+                            start = index + 1;
+                            dump.dump_layer(
+                                gpu,
+                                &self.scratch,
+                                &config,
+                                layer,
+                                bundle.state.position,
+                                n,
+                                bf16_grouped,
+                            )
+                            .map_err(|error| invalid(format!("chunk dump: {error}")))?;
+                        }
+                    }
+                    execute(gpu, &steps[start..])?;
+                } else if let Some(tap) = self.qsa_tap.as_mut() {
                     // Parity tap: run up to and including each QSA step, then
                     // let the observer read that layer's scratch and state.
                     let mut start = 0;

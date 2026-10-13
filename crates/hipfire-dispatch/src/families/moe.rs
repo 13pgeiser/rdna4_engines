@@ -771,6 +771,64 @@ pub trait MoeRowGather {
     }
 }
 
+/// Expert-parallel owner-routed chunk exchange of the grouped symmetric IU4
+/// prefill (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`).
+///
+/// Every rank runs the same router, top-k and stable grouping, so the grouped
+/// row layout (`expert_tile_ids`, `sorted_slot_index`, `inverse_perm`) is
+/// identical on all ranks. Each rank then computes only the tiles of the
+/// experts it owns: the lowering inserts `MoeStage::TileMask` after the
+/// scatter (a copy of the tile ids with every non-owned tile set to the `-1`
+/// sentinel the symmetric GEMMs already exit on, written to
+/// [`MoeTileExchangeParams::tile_ids_owned`]; gate/up and down read that copy)
+/// and `MoeStage::TileExchange` between the mutation fence and the combine,
+/// where [`Self::exchange`] fills every non-owned live tile's BF16 grouped
+/// rows of `y_down_grouped` from the owning rank (a copy, never arithmetic),
+/// so the unchanged BF16-row combine reads exactly the rows a single device
+/// produced.
+///
+/// Protocol (eager only; all ranks execute the same invocation sequence):
+/// `exchange` records this rank's producer-complete event, passes a host
+/// barrier, waits the peer's event, pulls, records its completion event and
+/// passes a second host barrier; [`Self::before_down`] enqueues, right before
+/// the NEXT invocation's routed down overwrites `y_down_grouped`, the wait for
+/// the peer's completion of the previous pull (the peer reads this rank's
+/// buffer only between its producer and completion events).
+pub trait MoeTileExchange {
+    /// This rank, the device table of the owner rank of every expert (`i32`
+    /// per expert, at least `n_experts` words) and `n_experts`; the mask and
+    /// the pull read them as inputs, never as constants.
+    fn owners(&self) -> (usize, &GpuTensor, usize);
+
+    /// Enqueue, on the launch stream, the wait that the peer finished pulling
+    /// this rank's rows of the previous invocation. Called by the routed down
+    /// stage immediately before it writes `y_down_grouped`; a no-op before the
+    /// first invocation.
+    fn before_down(&self, gpu: &mut rdna_compute::Gpu) -> Result<(), String>;
+
+    /// Publish this rank's `y_down_grouped` and pull the peer-owned tiles into
+    /// it. `tile_ids` is the UNMASKED scatter output (the pull's predicate is
+    /// `tile_ids[t] >= 0 && owner(tile_ids[t]) != rank`), `tiles` the padded
+    /// tile capacity (`grouped_rows / 16`).
+    fn exchange(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        layer_idx: u16,
+        tile_ids: &GpuTensor,
+        y_down_grouped: &GpuTensor,
+        tiles: usize,
+    ) -> Result<(), String>;
+}
+
+/// The owner-routed chunk exchange of one MoE call: the transport and the
+/// layer's masked tile id buffer (an `i32` per tile, at least the padded tile
+/// capacity; never aliasing `expert_tile_ids`).
+#[derive(Clone, Copy)]
+pub struct MoeTileExchangeParams<'a> {
+    pub exchange: &'a dyn MoeTileExchange,
+    pub tile_ids_owned: &'a GpuTensor,
+}
+
 /// Everything the MoE decode executor arm reads, marshaled by the model from
 /// its weight/config/scratch structs. Resolution is owned by the family
 /// (the model passes only the dtype snapshot + k); the executor computes
@@ -1218,6 +1276,13 @@ pub struct MoePrefillParams<'a> {
     /// Layer index handed to `ep_row_gather` (it selects the gather buffer);
     /// read only when `ep_row_gather` is `Some`, `0` otherwise.
     pub ep_layer_idx: u16,
+    /// Owner-routed EP chunk exchange (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): when
+    /// `Some`, the lowering admits only the grouped symmetric IU4 prefill (the
+    /// verified-symmetric QT44/QT53 route at >= 512 rows), inserts a
+    /// `TileMask` stage after the scatter and a `TileExchange` stage between the
+    /// mutation fence and the combine, and the grouped gate/up and down read
+    /// the masked tile ids. `None` (the default) changes nothing.
+    pub ep_tile_exchange: Option<MoeTileExchangeParams<'a>>,
 }
 /// Dtype-only admission snapshot for grouped MoE prefill.
 ///

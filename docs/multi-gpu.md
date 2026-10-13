@@ -261,6 +261,42 @@ forwards (more than 8 rows) and the MTP head keep the static split. With
 added. Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
 MoE layers` at attach when it is on.
 
+### Flash-Next EP2: owner-routed prefill chunks (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`)
+
+Without the lever every EP2 rank runs the whole 512-expert grouped MoE of every
+prefill chunk, reading the peer's experts through P2P weight tables, so two
+cards do the work of one and the chunk is slower than a single card.
+`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1` (default off; EP2 on gfx1201 only) splits
+that work. Both ranks still run the router, top-k and the stable grouping (a
+deterministic function of replicated bytes, so the grouped layout is identical
+on both). Each rank then runs the grouped symmetric IU4 gate/up and down on its
+own experts' tiles only: a PeaceMaker kernel (`ep_tile_mask_pm_gfx1201`) writes
+a copy of the tile ids with every tile of a peer expert set to the `-1`
+sentinel the symmetric kernels already return on before any load, and the
+kernels read the copy (the scatter's ids are never modified). The rank then
+pulls every peer-owned tile's sixteen BF16 grouped rows of `y_down_grouped`
+(`ep_gather_grouped_rows_by_tile_owner_pm_gfx1201`: predicated 16-byte loads
+from the peer's peer-mapped buffer, ~105 MB per layer) and the unchanged
+BF16-row combine reads exactly the bytes a single card stores. Per layer: a
+producer event after the routed down, a host barrier, a wait on the peer's
+event, the pull, a completion event and a second host barrier; the wait for
+the peer's completion is enqueued right before the rank's next routed down
+(one layer of trunk work later). Two alternating event pairs make the buffer
+reuse safe. Without an installed launch stream the waits are host
+`hipEventSynchronize` calls, as in the decode row gather.
+
+Scope: chunks of at least 512 rows when every MoE layer verified symmetric on
+both ranks. A tail chunk of 9 to 511 rows, few-row forwards (2 to 8 rows),
+decode and the MTP head keep today's route. Per rank one `qwen4 EP rank r/n:
+owner-routed prefill not admitted (reason)` line explains a refusal (ranks
+other than 2, not gfx1201, the sym-IU4 route not requested, the compact scratch
+plan, mismatching per-layer verdicts); EP4 keeps its full-table route. The
+rotation of the grouped activations still runs over every slot (it has no tile
+input); non-owned tiles' activation rows are never consumed. Diagnostics:
+`fn_ep_oracle --chunk-dump` (`HIPFIRE_CHUNK_DUMP_DIR`) digests `y_down_grouped`
+tile by tile, the FFN output and the HC streams of selected layers for
+bitwise comparison with a single card (`fn-ep/coal/s1/compare_chunk.py`).
+
 ### Environment (operator-facing)
 
 Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:

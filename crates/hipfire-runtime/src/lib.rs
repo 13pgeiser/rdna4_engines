@@ -43,6 +43,7 @@ pub mod dspark_block_controller;
 pub mod dspark_core;
 pub mod ep;
 pub mod ep_row_gather;
+pub mod ep_tile_exchange;
 pub mod eval_common;
 pub mod external_rows;
 pub mod gguf;

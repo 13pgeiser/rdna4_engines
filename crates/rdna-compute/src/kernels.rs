@@ -9720,6 +9720,20 @@ pub const EP_GATHER_ROWS_BY_SLOT_OWNER_SRC: &str =
 pub const QWEN4_EP_OWNER_ASSIGN_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_ep_owner_assign_pm_gfx1201.hxaco");
 
+/// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile mask
+/// (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`), gfx1201 only (`hipfire-isa emit --kernel
+/// ep_tile_mask_pm --arch gfx1201`, M7 obligation-free): a copy of the grouped-GEMM tile
+/// ids with every tile of a non-owned expert set to the -1 sentinel.
+pub const EP_TILE_MASK_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/ep_tile_mask_pm_gfx1201.hxaco");
+
+/// Certified builder (PeaceMaker) module of the owner-routed chunk MoE peer tile pull,
+/// gfx1201 only (`hipfire-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm --arch
+/// gfx1201`, M7 obligation-free): copies the rows of every non-owned live tile from the
+/// peer's `y_down_grouped` onto the local buffer.
+pub const EP_TILE_PULL_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1201.hxaco");
+
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.
 /// Replaces the per-row `copy_d2d` loop in the FLUX.1 MMDiT single block's

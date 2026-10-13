@@ -22,9 +22,10 @@ use crate::gpu_forward::{
     QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
-use hipfire_dispatch::families::moe::MoeRowGather;
+use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::ep_row_gather::{EpRowGather, EpRowGatherSpec, EpSlotOwners};
+use hipfire_runtime::ep_tile_exchange::{EpTileExchange, EpTileExchangeSpec};
 use hipfire_runtime::sampler::PenaltyTable;
 use hipfire_runtime::serve_contract::{
     sha256_len_prefixed, ArchPolicy, CacheDomain, DeviceTopology, KvLayout, SharingNamespace,
@@ -656,6 +657,7 @@ pub struct Qwen4EpPeer {
     bundle: Qwen4Bundle,
     mirrors: PeerMirrors,
     gather: Option<Arc<EpRowGather>>,
+    tile: Option<Arc<EpTileExchange>>,
 }
 
 impl Qwen4EpPeer {
@@ -674,6 +676,12 @@ impl Qwen4EpPeer {
                 gather
                     .release(self.rank, &mut self.gpu)
                     .map_err(|error| format!("release gather events: {error}")),
+            );
+        }
+        if let Some(tile) = self.tile.take() {
+            note(
+                tile.release(self.rank, &mut self.gpu)
+                    .map_err(|error| format!("release tile exchange events: {error}")),
             );
         }
         note(
@@ -920,10 +928,90 @@ mod gather_hook_tests {
     }
 }
 
+/// The grouped-row capacity (padded tiles) a rank registered for the owner-routed chunk
+/// MoE, `None` when the rank did not admit it.
+fn tile_capacity(bundle: &Qwen4Bundle) -> Option<usize> {
+    bundle
+        .execution
+        .as_ref()
+        .and_then(|forward| forward.ep_tile_registration())
+        .map(|(_, tiles)| tiles)
+}
+
+/// A rank's per-layer symmetric verdicts (`attach_ep`), `None` when the lever was not
+/// admitted on this rank.
+fn tile_verdicts(bundle: &Qwen4Bundle) -> Option<Vec<bool>> {
+    bundle
+        .execution
+        .as_ref()
+        .and_then(|forward| forward.ep_tile_verdicts())
+}
+
+/// The owner-routed chunk exchange one rank installs into its forward
+/// (`Qwen4GpuForward::install_tile_exchange`): the shared transport, this rank and a
+/// non-owning view of the rank's owner table (`e % ranks`).
+pub(crate) struct Qwen4EpTileExchangeHook {
+    rank: usize,
+    tile: Arc<EpTileExchange>,
+    owner_table: GpuTensor,
+    experts: usize,
+}
+
+impl Qwen4EpTileExchangeHook {
+    pub(crate) fn new(
+        rank: usize,
+        tile: Arc<EpTileExchange>,
+        owner_table: GpuTensor,
+        experts: usize,
+    ) -> Self {
+        Self {
+            rank,
+            tile,
+            owner_table,
+            experts,
+        }
+    }
+}
+
+// SAFETY: `owner_table` is a `Borrowed` alias of a device buffer the forward owns until
+// `free_gpu` (read-only after upload: the hook only hands its device address to launches on
+// the calling rank's own stream) and the hook never outlives that forward; HIP device
+// pointers carry no thread affinity.
+unsafe impl Send for Qwen4EpTileExchangeHook {}
+unsafe impl Sync for Qwen4EpTileExchangeHook {}
+
+impl MoeTileExchange for Qwen4EpTileExchangeHook {
+    fn owners(&self) -> (usize, &GpuTensor, usize) {
+        (self.rank, &self.owner_table, self.experts)
+    }
+
+    fn before_down(&self, gpu: &mut Gpu) -> Result<(), String> {
+        self.tile
+            .before_down(gpu, self.rank)
+            .map_err(|error| error.to_string())
+    }
+
+    fn exchange(
+        &self,
+        gpu: &mut Gpu,
+        _layer_idx: u16,
+        tile_ids: &GpuTensor,
+        y_down_grouped: &GpuTensor,
+        tiles: usize,
+    ) -> Result<(), String> {
+        self.tile
+            .exchange(gpu, self.rank, &self.owner_table, tile_ids, y_down_grouped, tiles)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// The attached mesh, owned by rank 0's bundle (`Qwen4Bundle::ep`).
 pub struct Qwen4EpMesh {
     pool: PeerPool<Qwen4EpPeer>,
     gather: Arc<EpRowGather>,
+    /// Owner-routed chunk MoE transport (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`); `None`
+    /// when the lever is off or was not admitted on every rank.
+    tile: Option<Arc<EpTileExchange>>,
     ranks: usize,
     device_ids: Vec<i32>,
     used_bytes: Vec<u64>,
@@ -977,7 +1065,7 @@ impl Qwen4EpMesh {
     /// Drain every rank, stop the workers (each frees its own bundle on its
     /// thread) and release rank 0's gather events. Always attempts every step.
     pub(crate) fn close(self, gpu: &mut Gpu) -> Result<(), String> {
-        let Self { pool, gather, .. } = self;
+        let Self { pool, gather, tile, .. } = self;
         let mut first: Option<String> = None;
         let drained = pool.run_all_forced(
             || sync_device(gpu),
@@ -991,6 +1079,11 @@ impl Qwen4EpMesh {
         }
         if let Err(error) = gather.release(0, gpu) {
             first.get_or_insert(format!("rank 0: release gather events: {error}"));
+        }
+        if let Some(tile) = tile {
+            if let Err(error) = tile.release(0, gpu) {
+                first.get_or_insert(format!("rank 0: release tile exchange events: {error}"));
+            }
         }
         first.map_or(Ok(()), Err)
     }
@@ -1121,6 +1214,7 @@ impl Qwen4Bundle {
                             bundle,
                             mirrors: PeerMirrors::default(),
                             gather: None,
+                            tile: None,
                         };
                         let checked = peer.check_replica(&config, placement, &fingerprint);
                         match checked {
@@ -1185,17 +1279,102 @@ impl Qwen4Bundle {
             .map_err(|error| format!("build gather transport: {error}"))?;
         let abort = gather.clone();
         pool.set_abort(move || abort.abort());
+        let tile_slot: Mutex<Option<Arc<EpTileExchange>>> = Mutex::new(None);
         let release_rank0 = |gpu: &mut Gpu, error: String| -> String {
             gather.abort();
             let _ = gather.release(0, gpu);
+            if let Some(tile) = lock(&tile_slot).as_ref() {
+                tile.abort();
+                let _ = tile.release(0, gpu);
+            }
             error
         };
 
+        // 2b. Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): every rank that
+        // admitted it at construction registers its grouped-row buffer (allocated before
+        // P2P is enabled below) with one transport.
+        let capacities = {
+            let me = &*self;
+            pool.run_all(
+                || Ok(tile_capacity(me)),
+                &|_, peer: &mut Qwen4EpPeer| Ok(tile_capacity(&peer.bundle)),
+            )
+        };
+        let capacities = match capacities {
+            Ok(capacities) => capacities,
+            Err(error) => return Err(release_rank0(gpu, error)),
+        };
+        let admitted = capacities.iter().filter(|c| c.is_some()).count();
+        if admitted != 0 && admitted != ranks {
+            eprintln!(
+                "qwen4 EP: owner-routed prefill admitted on {admitted}/{ranks} ranks only; chunks keep the full-table route"
+            );
+        }
+        if admitted == ranks {
+            let tile_spec = EpTileExchangeSpec {
+                ranks,
+                experts: self.config.num_experts,
+                row_u4: self.config.hidden_size * std::mem::size_of::<u16>() / 16,
+                max_tiles: capacities.iter().flatten().copied().min().unwrap_or(0),
+            };
+            let tile_builder = Mutex::new(Some(EpTileExchange::builder(tile_spec)));
+            let register_tile =
+                |rank: usize, bundle: &Qwen4Bundle, gpu: &mut Gpu| -> Result<(), String> {
+                    let (buffer, _) = bundle
+                        .execution
+                        .as_ref()
+                        .and_then(|forward| forward.ep_tile_registration())
+                        .ok_or("no EP tile registration")?;
+                    lock(&tile_builder)
+                        .as_mut()
+                        .ok_or("tile exchange builder already consumed")?
+                        .register(rank, gpu, buffer)
+                        .map_err(|error| format!("register tile exchange buffers: {error}"))
+                };
+            let registered = {
+                let me = &*self;
+                let gpu0 = &mut *gpu;
+                pool.run_all(
+                    || register_tile(0, me, gpu0),
+                    &|rank, peer: &mut Qwen4EpPeer| register_tile(rank, &peer.bundle, &mut peer.gpu),
+                )
+            };
+            if let Err(error) = registered {
+                return Err(release_rank0(gpu, error));
+            }
+            let built = lock(&tile_builder)
+                .take()
+                .ok_or_else(|| "tile exchange builder already consumed".to_string())
+                .and_then(|builder| {
+                    builder
+                        .build()
+                        .map_err(|error| format!("build tile exchange transport: {error}"))
+                });
+            match built {
+                Ok(tile) => {
+                    let abort = tile.clone();
+                    let gather_abort = gather.clone();
+                    pool.set_abort(move || {
+                        gather_abort.abort();
+                        abort.abort();
+                    });
+                    *lock(&tile_slot) = Some(tile);
+                }
+                Err(error) => return Err(release_rank0(gpu, error.to_string())),
+            }
+        }
+
         // 3. P2P after every load/allocation exists.
+        let tile = lock(&tile_slot).clone();
         let enable = |rank: usize, gpu: &mut Gpu| -> Result<(), String> {
             gather
                 .enable_peers(rank, gpu)
-                .map_err(|error| format!("enable peer access: {error}"))
+                .map_err(|error| format!("enable peer access: {error}"))?;
+            if let Some(tile) = tile.as_ref() {
+                tile.enable_peers(rank, gpu)
+                    .map_err(|error| format!("enable tile exchange peer access: {error}"))?;
+            }
+            Ok(())
         };
         let enabled = {
             let gpu0 = &mut *gpu;
@@ -1203,6 +1382,7 @@ impl Qwen4Bundle {
                 || enable(0, gpu0),
                 &|rank, peer: &mut Qwen4EpPeer| {
                     peer.gather = Some(gather.clone());
+                    peer.tile = tile.clone();
                     enable(rank, &mut peer.gpu)
                 },
             )
@@ -1266,6 +1446,79 @@ impl Qwen4Bundle {
             return Err(release_rank0(gpu, error));
         }
 
+        // 5b. Owner-routed chunk MoE: every rank's per-layer symmetric verdicts (taken on
+        // the full tables in `attach_ep`) must be identical and all-true; only then does
+        // each rank propagate them to its compact layers and install the exchange. Any
+        // mismatch refuses the lever for this load: never a per-rank route divergence.
+        if let Some(tile) = tile.as_ref() {
+            let verdicts = {
+                let me = &*self;
+                pool.run_all(
+                    || Ok(tile_verdicts(me)),
+                    &|_, peer: &mut Qwen4EpPeer| Ok(tile_verdicts(&peer.bundle)),
+                )
+            };
+            let verdicts = match verdicts {
+                Ok(verdicts) => verdicts,
+                Err(error) => return Err(release_rank0(gpu, error)),
+            };
+            let first = verdicts.first().cloned().flatten();
+            let agreed = first
+                .as_ref()
+                .is_some_and(|layers| !layers.is_empty() && layers.iter().all(|&symmetric| symmetric))
+                && verdicts.iter().all(|layers| layers.as_ref() == first.as_ref());
+            if agreed {
+                let experts = self.config.num_experts;
+                let install = |rank: usize, bundle: &mut Qwen4Bundle| -> Result<(), String> {
+                    let mut forward = bundle
+                        .execution
+                        .take()
+                        .ok_or("the forward is not attached")?;
+                    let result = (|| {
+                        let table = forward
+                            .ep_tile_owner_table_view()
+                            .ok_or("the forward has no owner table")?;
+                        let hook: Arc<dyn MoeTileExchange + Send + Sync> = Arc::new(
+                            Qwen4EpTileExchangeHook::new(rank, tile.clone(), table, experts),
+                        );
+                        forward
+                            .install_tile_exchange(hook)
+                            .map_err(|error| format!("install tile exchange: {error}"))
+                    })();
+                    bundle.execution = Some(forward);
+                    result
+                };
+                let installed = {
+                    let me = &mut *self;
+                    pool.run_all(
+                        || install(0, me),
+                        &|rank, peer: &mut Qwen4EpPeer| install(rank, &mut peer.bundle),
+                    )
+                };
+                if let Err(error) = installed {
+                    return Err(release_rank0(gpu, error));
+                }
+                eprintln!(
+                    "qwen4 EP: owner-routed prefill on ({} MoE layers symmetric on every rank, \
+                     owners e % {ranks})",
+                    first.as_ref().map_or(0, Vec::len)
+                );
+            } else {
+                let counts: Vec<String> = verdicts
+                    .iter()
+                    .map(|layers| {
+                        layers.as_ref().map_or("n/a".to_string(), |layers| {
+                            format!("{}/{}", layers.iter().filter(|&&s| s).count(), layers.len())
+                        })
+                    })
+                    .collect();
+                eprintln!(
+                    "qwen4 EP: owner-routed prefill refused (per-rank symmetric layers {counts:?} \
+                     are not identical and complete); chunks keep the full-table route"
+                );
+            }
+        }
+
         // 6. Per-rank device memory in use.
         let used = |gpu: &Gpu| -> Result<u64, String> {
             let (free, total) = gpu
@@ -1285,6 +1538,7 @@ impl Qwen4Bundle {
         Ok(Qwen4EpMesh {
             pool,
             gather,
+            tile,
             ranks,
             device_ids,
             used_bytes,

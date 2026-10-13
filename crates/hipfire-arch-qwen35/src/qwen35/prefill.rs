@@ -5034,6 +5034,7 @@ fn build_moe_prefill_params<'a>(
         ep_row_gather: None,
         shared_down_out: None,
         ep_layer_idx: 0,
+        ep_tile_exchange: None,
     };
     Ok((bound, moe_prefill_params))
 }

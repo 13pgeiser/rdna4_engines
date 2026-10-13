@@ -163,7 +163,7 @@ fn err(msg: String) -> HipError {
 // ───────────────────────────── host barrier ─────────────────────────────
 
 /// Generation-counting spin(+yield) barrier with an abort flag and a timeout.
-struct SpinBarrier {
+pub(crate) struct SpinBarrier {
     parties: usize,
     arrived: AtomicUsize,
     generation: AtomicUsize,
@@ -172,7 +172,7 @@ struct SpinBarrier {
 }
 
 impl SpinBarrier {
-    fn new(parties: usize, timeout: Duration) -> Self {
+    pub(crate) fn new(parties: usize, timeout: Duration) -> Self {
         Self {
             parties,
             arrived: AtomicUsize::new(0),
@@ -182,18 +182,18 @@ impl SpinBarrier {
         }
     }
 
-    fn abort(&self) {
+    pub(crate) fn abort(&self) {
         self.aborted.store(true, Ordering::SeqCst);
     }
 
-    fn is_aborted(&self) -> bool {
+    pub(crate) fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
     }
 
     /// Block until all `parties` arrive. Err when aborted (before or while
     /// waiting) or on timeout; a timeout also aborts the barrier so every other
     /// waiter fails promptly instead of timing out on its own.
-    fn wait(&self) -> Result<(), &'static str> {
+    pub(crate) fn wait(&self) -> Result<(), &'static str> {
         if self.is_aborted() {
             return Err("ep_row_gather barrier aborted");
         }

@@ -52,6 +52,15 @@ pub enum MoeStage {
     /// ([`MoeParams::ep_row_gather`]); lowered only between `MutationFence`
     /// and `Combine` of an indexed decode that supplies a gather.
     RowGather,
+    /// Owner-routed EP chunk exchange ([`MoePrefillParams::ep_tile_exchange`]): the
+    /// masked copy of the tile ids (non-owned experts' tiles set to the -1 sentinel
+    /// the grouped symmetric GEMMs exit on); lowered only right after the
+    /// scatter of a grouped symmetric prefill that supplies an exchange.
+    TileMask,
+    /// Expert-parallel copy-only exchange of peer-owned grouped down rows
+    /// ([`MoePrefillParams::ep_tile_exchange`]); lowered only between
+    /// `MutationFence` and `Combine` of that same prefill.
+    TileExchange,
     Combine,
     HostExperts,
 }
@@ -406,6 +415,8 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::Down => self.down(gpu),
             MoeStage::MutationFence => self.mutation_fence(gpu),
             MoeStage::RowGather => self.row_gather(gpu),
+            MoeStage::TileMask => self.tile_mask(gpu),
+            MoeStage::TileExchange => self.tile_exchange(gpu),
             MoeStage::Combine => self.combine(gpu),
             MoeStage::HostExperts => self.host_experts(gpu),
         }
@@ -1222,6 +1233,23 @@ impl<'a> SealedMoeOp<'a> {
             .gather_rows(gpu, layer_idx, slots, &down_expanded, topk_indices)
             .map_err(|error| DispatchError::Hip(format!("sealed moe: EP row gather: {error}")))
     }
+
+    pub(super) fn tile_mask(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, selection) = self.state.prefill_parts()?;
+        let tx = params.ep_tile_exchange.ok_or_else(|| {
+            DispatchError::Hip("sealed moe: tile mask lowered without a tile exchange".into())
+        })?;
+        self.state.require_route_ready()?;
+        super::qt44_qt53_prefill::tile_mask(gpu, params, tx, selection.path2_m_total)
+    }
+
+    pub(super) fn tile_exchange(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, selection) = self.state.prefill_parts()?;
+        let tx = params.ep_tile_exchange.ok_or_else(|| {
+            DispatchError::Hip("sealed moe: tile exchange lowered without a tile exchange".into())
+        })?;
+        super::qt44_qt53_prefill::tile_exchange(gpu, params, tx, selection.path2_m_total)
+    }
 }
 
 /// Append one borrowed instruction without allowing SmallVec to spill.
@@ -1372,6 +1400,19 @@ fn lower_prefill<'a>(
             "sealed moe: a prefill EP row gather requires the grouped QT44/QT53 route combining into the residual".into(),
         ));
     }
+    if params.ep_tile_exchange.is_some()
+        && (selection.route != Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric)
+            || !selection.resolution.use_path2
+            || params.routed_out.is_some()
+            || params.ep_row_gather.is_some())
+    {
+        // The exchange moves the BF16 grouped rows of the symmetric IU4 down for
+        // the canonical combine into the residual; every other prefill lowering
+        // has a different row layout, a different down kernel or EP contract.
+        return Err(DispatchError::Hip(
+            "sealed moe: a prefill EP tile exchange requires the grouped symmetric IU4 route combining into the residual".into(),
+        ));
+    }
     if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         append_step(
@@ -1401,6 +1442,9 @@ fn lower_prefill<'a>(
         if selection.resolution.use_path2 {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }
+        if params.ep_tile_exchange.is_some() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::TileMask))?;
+        }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
         if selection.resolution.use_path2 {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
@@ -1413,6 +1457,9 @@ fn lower_prefill<'a>(
         )?;
         if params.ep_row_gather.is_some() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::RowGather))?;
+        }
+        if params.ep_tile_exchange.is_some() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::TileExchange))?;
         }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
         if params.recipe.shared_after_combine() {

@@ -15,6 +15,7 @@ pub mod artifact;
 pub mod bundle;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod cache_quality;
+pub mod chunk_dump;
 pub mod config;
 pub mod ep;
 pub mod expert_residency;

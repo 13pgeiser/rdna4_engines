@@ -29,7 +29,7 @@
 //!     [--state-steps 1,64,256] [--save-logits-steps 5,6] \
 //!     [--moe-dump-positions 0,1] [--perturb-rank R --perturb-step S] \
 //!     [--kv-mode M] [--state-quant Q] [--skip-model-hash] \
-//!     [--truncate-prompt-tokens N]
+//!     [--truncate-prompt-tokens N] [--chunk-dump LAYERS|default]
 //! ```
 //!
 //! `--moe-dump-positions` labels decode forwards 0-based (`position-<P>` under
@@ -163,6 +163,9 @@ struct Args {
     state_quant: Option<String>,
     skip_model_hash: bool,
     truncate_prompt_tokens: Option<usize>,
+    /// `--chunk-dump LAYERS|default`: digest the prefill chunks of these layers
+    /// (`hipfire_arch_qwen4::chunk_dump`).
+    chunk_dump: Option<String>,
     /// `--spec mtp`: drive the load's native MTP speculator instead of AR.
     mtp: Option<MtpArgs>,
 }
@@ -204,6 +207,7 @@ fn parse_args() -> R<Args> {
     let mut state_quant = None;
     let mut skip_model_hash = false;
     let mut truncate_prompt_tokens = None;
+    let mut chunk_dump: Option<String> = None;
     let mut spec_mtp = false;
     let mut temp = 0.0f32;
     let mut top_p = 1.0f32;
@@ -250,6 +254,7 @@ fn parse_args() -> R<Args> {
                 }
             }
             "--state-every" => state_every = value("--state-every")?.parse::<usize>().map_err(e)?.max(1),
+            "--chunk-dump" => chunk_dump = Some(value("--chunk-dump")?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -279,6 +284,7 @@ fn parse_args() -> R<Args> {
         state_quant,
         skip_model_hash,
         truncate_prompt_tokens,
+        chunk_dump,
         mtp: spec_mtp.then_some(MtpArgs {
             temp,
             top_p,
@@ -557,6 +563,21 @@ fn mtp_prompt(
 fn run() -> R<()> {
     let args = parse_args()?;
     std::fs::create_dir_all(&args.out).map_err(|x| format!("create {}: {x}", args.out.display()))?;
+    if let Some(layers) = args.chunk_dump.as_deref() {
+        // Chunk-row dumps (`hipfire_arch_qwen4::chunk_dump`): the arm's prefill chunks of the
+        // selected layers are digested under `<out>/chunk-dump/`; `fn-ep/oracle/compare.py
+        // chunk` compares arms. Set before the model loads (no thread exists yet).
+        // SAFETY: single-threaded at this point of `run`.
+        unsafe {
+            std::env::set_var(
+                hipfire_arch_qwen4::chunk_dump::CHUNK_DUMP_DIR_ENV,
+                args.out.join("chunk-dump"),
+            );
+            if layers != "default" {
+                std::env::set_var(hipfire_arch_qwen4::chunk_dump::CHUNK_DUMP_LAYERS_ENV, layers);
+            }
+        }
+    }
     let dump = moe_dump::enabled();
     if dump {
         if args.moe_dump_positions.is_empty() {
@@ -686,6 +707,7 @@ fn run() -> R<()> {
         "vocab": vocab,
         "state_steps": args.state_steps,
         "moe_dump_positions": args.moe_dump_positions,
+        "chunk_dump": args.chunk_dump,
         "perturb": args.perturb.map(|(rank, step)| json!({"rank": rank, "step": step})),
         "prompts": prompt_meta,
         "completed": false,

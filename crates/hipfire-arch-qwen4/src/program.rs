@@ -292,6 +292,10 @@ pub struct Qwen4MoeBinding<'a> {
     /// rows (the layer's `moe_down_expanded` is then a gather buffer). `None`
     /// everywhere else.
     pub shared_down_out: Option<&'a GpuTensor>,
+    /// Owner-routed EP chunk exchange (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): installed
+    /// into the chunk (prefill) MoE of a layer whose compact table runs the
+    /// symmetric IU4 route on the owned tiles only. `None` everywhere else.
+    pub tile_exchange: Option<hipfire_dispatch::families::moe::MoeTileExchangeParams<'a>>,
 }
 
 /// Family-owned reusable views into the central program's scratch layout.
@@ -1084,6 +1088,7 @@ fn build_moe_prefill<'a>(
         ep_row_gather: moe.row_gather,
         shared_down_out: moe.shared_down_out,
         ep_layer_idx: moe.layer_idx,
+        ep_tile_exchange: moe.tile_exchange,
     })
 }
 

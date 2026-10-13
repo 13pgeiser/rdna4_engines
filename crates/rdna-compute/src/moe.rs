@@ -3149,6 +3149,216 @@ pub fn qwen4_ep_owner_assign_pm_arch(arch: &str) -> bool {
     arch == "gfx1201"
 }
 
+/// Module key of the embedded certified builder (PeaceMaker) image of
+/// [`Gpu::ep_tile_mask`] (`hipfire-isa emit --kernel ep_tile_mask_pm --arch gfx1201`).
+pub const EP_TILE_MASK_PM_MODULE: &str = "ep_tile_mask_pm_gfx1201";
+/// Device symbol of the tile mask kernel.
+pub const EP_TILE_MASK_PM_SYMBOL: &str = "ep_tile_mask_pm_gfx1201";
+/// Module key of the embedded certified builder (PeaceMaker) image of
+/// [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`hipfire-isa emit --kernel
+/// ep_gather_grouped_rows_by_tile_owner_pm --arch gfx1201`).
+pub const EP_TILE_PULL_PM_MODULE: &str = "ep_gather_grouped_rows_by_tile_owner_pm_gfx1201";
+/// Device symbol of the tile pull kernel.
+pub const EP_TILE_PULL_PM_SYMBOL: &str = "ep_gather_grouped_rows_by_tile_owner_pm_gfx1201";
+/// Grouped rows of one tile (the symmetric IU4 GEMMs' `m` tile).
+pub const EP_TILE_ROWS: usize = 16;
+/// Threads (tiles) per workgroup of the mask kernel.
+const EP_TILE_MASK_BLOCK: u32 = 256;
+/// uint4 moved per workgroup trip of the pull kernel; a tile is a multiple of it.
+const EP_TILE_PULL_TRIP_U4: usize = 1024;
+
+impl Gpu {
+    /// Owner-routed chunk MoE tile mask (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): write a COPY of
+    /// the grouped-GEMM tile ids, `tile_ids_owned[t] = tile_ids[t]` when the tile's expert is
+    /// owned by `rank` (`owner_table[tile_ids[t]] == rank`, an i32 per expert) and `-1`
+    /// otherwise (the padding sentinel included). `tile_ids` is never written. One thread per
+    /// tile over `tiles`, the certified builder kernel [`EP_TILE_MASK_PM_SYMBOL`]; gfx1201 only
+    /// (there is no hipcc fallback). Stream-ordered on the active stream.
+    pub fn ep_tile_mask(
+        &mut self,
+        tile_ids: &GpuTensor,
+        tile_ids_owned: &GpuTensor,
+        owner_table: &GpuTensor,
+        tiles: usize,
+        n_experts: usize,
+        rank: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(0, &format!("ep_tile_mask: {what}")))
+        };
+        if !qwen4_ep_owner_assign_pm_arch(&self.arch) {
+            return refuse(&format!(
+                "the tile mask is a gfx1201 builder module (device is {}); no hipcc fallback",
+                self.arch
+            ));
+        }
+        let word = std::mem::size_of::<i32>();
+        if tiles == 0 || i32::try_from(tiles).is_err() || n_experts == 0 || i32::try_from(n_experts).is_err() {
+            return refuse("need 0 < tiles and 0 < n_experts, both within i32");
+        }
+        if rank > i32::MAX as usize {
+            return refuse("rank exceeds i32");
+        }
+        if tile_ids.buf.size() < tiles * word || tile_ids_owned.buf.size() < tiles * word {
+            return refuse("tile id buffers hold fewer than `tiles` words");
+        }
+        if owner_table.buf.size() < n_experts * word {
+            return refuse("owner table holds fewer than `n_experts` words");
+        }
+        if tile_ids.buf.as_ptr() == tile_ids_owned.buf.as_ptr() {
+            return refuse("the owned copy must not alias the source tile ids");
+        }
+        self.ensure_embedded_kernel(
+            EP_TILE_MASK_PM_MODULE,
+            kernels::EP_TILE_MASK_PM_GFX1201,
+            EP_TILE_MASK_PM_SYMBOL,
+        )?;
+        let ids = tile_ids.buf.as_ptr();
+        let owned = tile_ids_owned.buf.as_ptr();
+        let table = owner_table.buf.as_ptr();
+        let (tiles_i32, experts_i32, rank_i32) = (tiles as i32, n_experts as i32, rank as i32);
+        let mut params = [
+            &ids as *const _ as *mut c_void,
+            &owned as *const _ as *mut c_void,
+            &table as *const _ as *mut c_void,
+            &tiles_i32 as *const _ as *mut c_void,
+            &experts_i32 as *const _ as *mut c_void,
+            &rank_i32 as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", EP_TILE_MASK_PM_SYMBOL, tiles * word * 2);
+        let result = self.launch_maybe_blob(
+            EP_TILE_MASK_PM_SYMBOL,
+            [(tiles as u32).div_ceil(EP_TILE_MASK_BLOCK), 1, 1],
+            [EP_TILE_MASK_BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ids);
+                b.push_ptr(owned);
+                b.push_ptr(table);
+                b.push_i32(tiles_i32);
+                b.push_i32(experts_i32);
+                b.push_i32(rank_i32);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Owner-routed chunk MoE tile pull: for every live tile whose expert another rank owns
+    /// (`0 <= tile_ids[t] < n_experts` and `owner_table[tile_ids[t]] != rank`), copy the
+    /// tile's [`EP_TILE_ROWS`] grouped rows (`row_u4` uint4 each) of the PEER's grouped-rows
+    /// buffer at virtual address `peer_src` (peer-mapped device memory) onto the same rows of
+    /// `dst`. Rows of owned tiles, of the padding tail and of workgroups past `tiles` are never
+    /// written. Bit-exact uint4 copy; the certified builder kernel
+    /// [`EP_TILE_PULL_PM_SYMBOL`], gfx1201 only. Stream-ordered on the active stream; the
+    /// caller orders it after the peer's producer event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ep_gather_grouped_rows_by_tile_owner(
+        &mut self,
+        tile_ids: &GpuTensor,
+        owner_table: &GpuTensor,
+        peer_src: usize,
+        dst: &GpuTensor,
+        tiles: usize,
+        n_experts: usize,
+        rank: usize,
+        row_u4: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("ep_gather_grouped_rows_by_tile_owner: {what}"),
+            ))
+        };
+        if !qwen4_ep_owner_assign_pm_arch(&self.arch) {
+            return refuse(&format!(
+                "the tile pull is a gfx1201 builder module (device is {}); no hipcc fallback",
+                self.arch
+            ));
+        }
+        let word = std::mem::size_of::<i32>();
+        if tiles == 0 || n_experts == 0 || peer_src == 0 || rank > i32::MAX as usize {
+            return refuse("need tiles > 0, n_experts > 0, a peer base and a rank within i32");
+        }
+        let tile_u4 = EP_TILE_ROWS.checked_mul(row_u4).unwrap_or(0);
+        if tile_u4 == 0 || tile_u4 % EP_TILE_PULL_TRIP_U4 != 0 {
+            return refuse("a tile must be a non-zero multiple of 1024 uint4");
+        }
+        let tile_bytes = tile_u4 * 16;
+        let span = tiles.checked_mul(tile_bytes).filter(|&span| span <= u32::MAX as usize);
+        let Some(span) = span else {
+            return refuse("tiles * tile bytes must fit 32 bits");
+        };
+        if i32::try_from(tiles).is_err() || i32::try_from(n_experts).is_err() || i32::try_from(tile_u4).is_err() {
+            return refuse("an extent exceeds i32");
+        }
+        if tile_ids.buf.size() < tiles * word {
+            return refuse("tile_ids holds fewer than `tiles` words");
+        }
+        if owner_table.buf.size() < n_experts * word {
+            return refuse("owner table holds fewer than `n_experts` words");
+        }
+        if dst.buf.size() < span {
+            return refuse("the destination holds fewer than `tiles` tiles");
+        }
+        if peer_src == dst.buf.as_ptr() as usize {
+            return refuse("the peer source is this rank's own buffer");
+        }
+        self.ensure_embedded_kernel(
+            EP_TILE_PULL_PM_MODULE,
+            kernels::EP_TILE_PULL_PM_GFX1201,
+            EP_TILE_PULL_PM_SYMBOL,
+        )?;
+        let ids = tile_ids.buf.as_ptr();
+        let table = owner_table.buf.as_ptr();
+        let peer = peer_src as *mut c_void;
+        let out = dst.buf.as_ptr();
+        let (experts_i32, rank_i32, tile_u4_i32, tiles_i32) =
+            (n_experts as i32, rank as i32, tile_u4 as i32, tiles as i32);
+        let mut params = [
+            &ids as *const _ as *mut c_void,
+            &table as *const _ as *mut c_void,
+            &peer as *const _ as *mut c_void,
+            &out as *const _ as *mut c_void,
+            &experts_i32 as *const _ as *mut c_void,
+            &rank_i32 as *const _ as *mut c_void,
+            &tile_u4_i32 as *const _ as *mut c_void,
+            &tiles_i32 as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", EP_TILE_PULL_PM_SYMBOL, span);
+        let result = self.launch_maybe_blob(
+            EP_TILE_PULL_PM_SYMBOL,
+            [tiles as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ids);
+                b.push_ptr(table);
+                b.push_ptr(peer);
+                b.push_ptr(out);
+                b.push_i32(experts_i32);
+                b.push_i32(rank_i32);
+                b.push_i32(tile_u4_i32);
+                b.push_i32(tiles_i32);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+}
+
 /// Device addresses [`Gpu::qwen4_ep_owner_assign`] reads and writes for one
 /// layer of one rank. `full_*` are the layer's read-only full pointer tables
 /// (512 `u64` each), `live_*` the rank's tables the routed producers read
@@ -3942,5 +4152,98 @@ mod span_guard_tests {
     #[test]
     fn overflowing_span_is_refused() {
         assert!(require_span(&tensor(64), &[usize::MAX, 2], "huge").is_err());
+    }
+}
+
+#[cfg(test)]
+mod ep_tile_tests {
+    use super::*;
+
+    #[test]
+    fn the_embedded_images_export_their_launcher_symbols() {
+        for (image, symbol, module) in [
+            (kernels::EP_TILE_MASK_PM_GFX1201, EP_TILE_MASK_PM_SYMBOL, EP_TILE_MASK_PM_MODULE),
+            (kernels::EP_TILE_PULL_PM_GFX1201, EP_TILE_PULL_PM_SYMBOL, EP_TILE_PULL_PM_MODULE),
+        ] {
+            assert!(image.windows(4).any(|w| w == b"\x7fELF"), "no device ELF in the {symbol} bundle");
+            assert!(image.windows(symbol.len()).any(|w| w == symbol.as_bytes()), "{symbol} missing from its image");
+            assert_eq!(module, symbol);
+        }
+    }
+
+    /// Device check of the production launchers (the embedded certified builder kernels): the
+    /// mask equals the host law, the source ids are untouched, and the pull copies exactly the
+    /// non-owned live tiles of a second device buffer (standing in for the peer's) onto the
+    /// destination. Needs a gfx1201 GPU; never run by the CPU-only gate.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn mask_and_pull_match_the_host_reference() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if qwen4_ep_owner_assign_pm_arch(&gpu.arch) => gpu,
+            _ => {
+                eprintln!("skip: the tile kernels are gfx1201 only");
+                return;
+            }
+        };
+        const EXPERTS: usize = 512;
+        const ROW_U4: usize = 320; // 2560 BF16
+        let tile_bytes = EP_TILE_ROWS * ROW_U4 * 16;
+        let upload = |gpu: &mut Gpu, bytes: &[u8]| gpu.upload_raw(bytes, &[bytes.len()]).expect("upload");
+        let words = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let owner: Vec<i32> = (0..EXPERTS as i32).map(|e| e % 2).collect();
+        let owner_gpu = upload(&mut gpu, &words(&owner));
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |bound: usize| {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound
+        };
+        for tiles in [1usize, 3, 255, 256, 257, 700] {
+            let live = tiles - next(tiles / 3 + 1);
+            let mut ids: Vec<i32> = (0..live).map(|_| next(EXPERTS) as i32).collect();
+            ids.resize(tiles, -1);
+            let peer: Vec<u8> = (0..tiles * tile_bytes).map(|i| (next(251) as u8) ^ (i as u8)).collect();
+            let ids_gpu = upload(&mut gpu, &words(&ids));
+            let peer_gpu = upload(&mut gpu, &peer);
+            for rank in 0..2usize {
+                let owned_gpu = upload(&mut gpu, &vec![0x5Au8; tiles * 4]);
+                let dst_gpu = upload(&mut gpu, &vec![0xC3u8; tiles * tile_bytes]);
+                gpu.ep_tile_mask(&ids_gpu, &owned_gpu, &owner_gpu, tiles, EXPERTS, rank).expect("mask");
+                gpu.ep_gather_grouped_rows_by_tile_owner(
+                    &ids_gpu,
+                    &owner_gpu,
+                    peer_gpu.buf.as_ptr() as usize,
+                    &dst_gpu,
+                    tiles,
+                    EXPERTS,
+                    rank,
+                    ROW_U4,
+                )
+                .expect("pull");
+                gpu.hip.device_synchronize().expect("sync");
+                let mut raw = vec![0u8; tiles * 4];
+                gpu.hip.memcpy_dtoh(&mut raw, &owned_gpu.buf).expect("owned");
+                let device_owned: Vec<i32> = raw.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+                let want_owned: Vec<i32> = ids
+                    .iter()
+                    .map(|&id| if id >= 0 && owner[id as usize] == rank as i32 { id } else { -1 })
+                    .collect();
+                assert_eq!(device_owned, want_owned, "tiles {tiles} rank {rank}: mask");
+                gpu.hip.memcpy_dtoh(&mut raw, &ids_gpu.buf).expect("ids");
+                assert_eq!(raw, words(&ids), "tiles {tiles}: the source ids were modified");
+                let mut dst = vec![0u8; tiles * tile_bytes];
+                gpu.hip.memcpy_dtoh(&mut dst, &dst_gpu.buf).expect("dst");
+                let mut want = vec![0xC3u8; tiles * tile_bytes];
+                for (t, &id) in ids.iter().enumerate() {
+                    if id >= 0 && owner[id as usize] != rank as i32 {
+                        want[t * tile_bytes..(t + 1) * tile_bytes].copy_from_slice(&peer[t * tile_bytes..(t + 1) * tile_bytes]);
+                    }
+                }
+                assert!(dst == want, "tiles {tiles} rank {rank}: pull");
+                gpu.free_tensor(owned_gpu).expect("free owned");
+                gpu.free_tensor(dst_gpu).expect("free dst");
+            }
+            gpu.free_tensor(ids_gpu).expect("free ids");
+            gpu.free_tensor(peer_gpu).expect("free peer");
+        }
     }
 }

@@ -6563,6 +6563,7 @@ mod tests {
             ep_row_gather: None,
             shared_down_out: None,
             ep_layer_idx: 0,
+            ep_tile_exchange: None,
         }
     }
 
@@ -7062,5 +7063,109 @@ mod tests {
         assert!(format!("{error:?}").contains("row gather"), "{error:?}");
         let error = prefill_stages(Some(&OwnerGather), None, false).unwrap_err();
         assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+    }
+
+    /// A tile exchange that never runs (lowering tests only).
+    struct NoopTileExchange;
+
+    impl crate::families::moe::MoeTileExchange for NoopTileExchange {
+        fn owners(&self) -> (usize, &GpuTensor, usize) {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn before_down(&self, _gpu: &mut Gpu) -> Result<(), String> {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn exchange(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _tile_ids: &GpuTensor,
+            _y_down_grouped: &GpuTensor,
+            _tiles: usize,
+        ) -> Result<(), String> {
+            unreachable!("lowering does not run stages")
+        }
+    }
+
+    /// The grouped prefill lowering with an owner-routed tile exchange installed (or not).
+    fn tile_prefill_stages(
+        exchange: Option<&dyn crate::families::moe::MoeTileExchange>,
+        gather: Option<&dyn MoeRowGather>,
+        route: Option<MoeRouteCapability>,
+        partial: bool,
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = prefill_scratch(0xE9_0000);
+        let params = MoePrefillParams {
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ep_row_gather: gather,
+            // Lowering never reads the masked ids; any tensor stands in for them.
+            ep_tile_exchange: exchange.map(|exchange| crate::families::moe::MoeTileExchangeParams {
+                exchange,
+                tile_ids_owned: &scratch.partial,
+            }),
+            ..ep_prefill_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                partial.then_some(&scratch.partial),
+            )
+        };
+        let selection = prefill_selection(&ctx, &params, route);
+        let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
+        moe_program::lowered_stages(&call)
+    }
+
+    /// `with` is `without` plus exactly one `TileMask` right after the scatter and one
+    /// `TileExchange` between the mutation fence and the combine.
+    fn assert_tile_stages(with: &[MoeStage], without: &[MoeStage]) {
+        for stage in [MoeStage::TileMask, MoeStage::TileExchange] {
+            assert!(!without.contains(&stage), "no exchange installed, no {stage:?}: {without:?}");
+            assert_eq!(with.iter().filter(|s| **s == stage).count(), 1, "{with:?}");
+        }
+        let scatter = with.iter().position(|s| *s == MoeStage::Scatter).expect("scatter");
+        assert_eq!(with[scatter + 1], MoeStage::TileMask, "{with:?}");
+        assert_eq!(with[scatter + 2], MoeStage::GateUp, "{with:?}");
+        let fence = with.iter().position(|s| *s == MoeStage::MutationFence).expect("fence");
+        assert_eq!(with[fence + 1], MoeStage::TileExchange, "{with:?}");
+        assert_eq!(with[fence + 2], MoeStage::Combine, "{with:?}");
+        let mut stripped = with.to_vec();
+        stripped.retain(|s| !matches!(s, MoeStage::TileMask | MoeStage::TileExchange));
+        assert_eq!(stripped, without, "only the two tile stages differ");
+    }
+
+    #[test]
+    fn prefill_lowering_emits_tile_stages_exactly_when_installed_on_the_symmetric_route() {
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        let without = tile_prefill_stages(None, None, symmetric, false).unwrap();
+        let with = tile_prefill_stages(Some(&NoopTileExchange), None, symmetric, false).unwrap();
+        assert_tile_stages(&with, &without);
+        // The unmasked symmetric lowering is the historical one.
+        assert_eq!(without, prefill_stages(None, symmetric, false).unwrap());
+    }
+
+    #[test]
+    fn prefill_lowering_refuses_a_tile_exchange_off_the_symmetric_route() {
+        for route in [None, Some(MoeRouteCapability::Qt44Qt53Grouped)] {
+            let error = tile_prefill_stages(Some(&NoopTileExchange), None, route, false).unwrap_err();
+            assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
+        }
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        // A compact EP partial and the few-row row gather are other EP contracts.
+        let error = tile_prefill_stages(Some(&NoopTileExchange), None, symmetric, true).unwrap_err();
+        assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
+        let error = tile_prefill_stages(Some(&NoopTileExchange), Some(&NoopGather), symmetric, false).unwrap_err();
+        assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
     }
 }

@@ -826,6 +826,7 @@ pub fn forward_batch(
                     ep_row_gather: None,
                     shared_down_out: None,
                     ep_layer_idx: 0,
+                    ep_tile_exchange: None,
                 };
                 let call = seal_prefill(bound, &ctx, params)
                     .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;

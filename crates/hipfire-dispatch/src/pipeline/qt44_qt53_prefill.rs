@@ -11,7 +11,7 @@
 
 use super::layer_ops::hip;
 use crate::families::gemv::WeightRef;
-use crate::families::moe::{MoePrefillParams, MoeRouteCapability};
+use crate::families::moe::{MoePrefillParams, MoeRouteCapability, MoeTileExchangeParams};
 use crate::types::DispatchError;
 use rdna_compute::moe::SharedExpertActivation;
 use rdna_compute::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
@@ -1030,6 +1030,93 @@ fn down_wmma(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     p.down_k == p.mi && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, p.batch_size * p.k_top)
 }
 
+
+/// The tile ids the grouped symmetric GEMMs read: the scatter's `expert_tile_ids`, or under the
+/// owner-routed EP chunk exchange its masked copy (`-1` on every tile of an expert another rank
+/// owns).
+fn gemm_tile_ids<'p>(p: &'p MoePrefillParams<'_>) -> &'p GpuTensor {
+    p.ep_tile_exchange
+        .map_or(p.expert_tile_ids, |tx| tx.tile_ids_owned)
+}
+
+fn tile_exchange_eager_only(gpu: &Gpu, what: &str) -> Result<(), DispatchError> {
+    // The exchange waits on peer devices and a host barrier; neither can be
+    // recorded into a graph or retained body. EP is eager-only.
+    if gpu.graphs.capture_mode
+        || gpu.graphs.verify.capturing.is_some()
+        || gpu.graphs.replay.capturing.is_some()
+        || gpu.replay.is_recording()
+    {
+        return Err(DispatchError::Hip(format!(
+            "sealed moe: expert-parallel tile {what} refused while a graph capture or replay record is armed"
+        )));
+    }
+    Ok(())
+}
+
+/// Padded tile capacity of a grouped layout (the symmetric GEMMs' grid height).
+fn grouped_tiles(grouped_rows: usize) -> usize {
+    grouped_rows.div_ceil(16)
+}
+
+/// Owner-routed EP chunk MoE, after the scatter: write the masked copy of the tile ids (the
+/// owner of every expert is the exchange's table input). Valid only on the symmetric IU4 arm.
+pub(crate) fn tile_mask(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    tx: MoeTileExchangeParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    require_geometry(p)?;
+    if !sym_iu4(gpu, p, true) {
+        return Err(DispatchError::Hip(
+            "qt44 tile mask: the owner-routed chunk exchange needs the symmetric IU4 arm".into(),
+        ));
+    }
+    tile_exchange_eager_only(gpu, "mask")?;
+    let (rank, table, n_exp) = tx.exchange.owners();
+    if n_exp != p.n_exp {
+        return Err(DispatchError::Hip(format!(
+            "qt44 tile mask: the owner table covers {n_exp} experts, the layer has {}",
+            p.n_exp
+        )));
+    }
+    hip(gpu.ep_tile_mask(
+        p.expert_tile_ids,
+        tx.tile_ids_owned,
+        table,
+        grouped_tiles(grouped_rows),
+        n_exp,
+        rank,
+    ))
+}
+
+/// Owner-routed EP chunk MoE, between the mutation fence and the combine: fill every
+/// peer-owned live tile of `y_down_grouped` from its owner.
+pub(crate) fn tile_exchange(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    tx: MoeTileExchangeParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    require_geometry(p)?;
+    if !sym_iu4(gpu, p, true) {
+        return Err(DispatchError::Hip(
+            "qt44 tile exchange: the owner-routed chunk exchange needs the symmetric IU4 arm".into(),
+        ));
+    }
+    tile_exchange_eager_only(gpu, "exchange")?;
+    tx.exchange
+        .exchange(
+            gpu,
+            p.ep_layer_idx,
+            p.expert_tile_ids,
+            p.y_down_grouped,
+            grouped_tiles(grouped_rows),
+        )
+        .map_err(|error| DispatchError::Hip(format!("qt44 tile exchange: {error}")))
+}
+
 /// Whether gate/up stores the SwiGLU activation (BF16) straight from its
 /// epilogue and `down` unscatters it fused with the 128-wide rotation.
 fn gateup_silu(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
@@ -1058,7 +1145,7 @@ pub(crate) fn gate_up(
         let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
         return hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
             gate_up_ptrs,
-            p.expert_tile_ids,
+            gemm_tile_ids(p),
             p.sorted_slot_index,
             &xq,
             p.y_gate_up_grouped,
@@ -1307,9 +1394,17 @@ fn down_stage(
             grouped_rows,
             total_slots,
         ))?;
+        if let Some(tx) = p.ep_tile_exchange {
+            // The peer reads this rank's `y_down_grouped` between its producer
+            // and completion events of the previous layer's exchange: no write
+            // before its pull completed.
+            tx.exchange
+                .before_down(gpu)
+                .map_err(|error| DispatchError::Hip(format!("qt44 tile exchange: {error}")))?;
+        }
         hip(gpu.gemm_qwen4_moe_down_iu4_sym(
             down_ptrs,
-            p.expert_tile_ids,
+            gemm_tile_ids(p),
             p.sorted_slot_index,
             &xq,
             p.y_down_grouped,

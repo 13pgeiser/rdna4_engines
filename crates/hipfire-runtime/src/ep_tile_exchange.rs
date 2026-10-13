@@ -1,0 +1,603 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Flash-Next expert-parallel (EP2) owner-routed chunk MoE exchange transport
+//! (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`).
+//!
+//! Both ranks run the same router, top-k and stable grouping of a prefill chunk
+//! layer, so the grouped row layout (`expert_tile_ids`, `sorted_slot_index`,
+//! `inverse_perm`) is byte-identical on both. Each rank runs the grouped
+//! symmetric IU4 GEMMs on the tiles of the experts it owns only (the dispatch
+//! layer's masked tile ids) and writes the BF16 grouped rows of those tiles into
+//! its `y_down_grouped`. This transport then gives each rank the peer-owned
+//! tiles' rows before the unchanged BF16-row combine reads them:
+//!
+//! 1. [`EpTileExchange::exchange`] records the rank's producer-complete event
+//!    `ready[k % 2]` after the routed down
+//!    (`HIP_EVENT_RELEASE_TO_SYSTEM`, as [`crate::ep_row_gather::EpRowGather`]
+//!    does), passes a host barrier, waits the peer's `ready[k % 2]` (a stream
+//!    wait when `gpu.active_stream` is installed, else a host
+//!    `hipEventSynchronize` — exactly the row gather's two branches), launches
+//!    the pull kernel (`ep_gather_grouped_rows_by_tile_owner`: for every live
+//!    tile of a peer-owned expert, copy the tile's sixteen rows of the PEER's
+//!    `y_down_grouped` onto the same rows of this rank's), records `done[k % 2]`
+//!    and passes a second host barrier. `k` is the rank's exchange counter; both
+//!    ranks execute the same invocation sequence (replicated routing, one
+//!    admission verdict per layer).
+//! 2. [`EpTileExchange::before_down`] is called right before the NEXT
+//!    invocation's routed down writes `y_down_grouped`: it enqueues the wait for
+//!    the peer's `done[(k - 1) % 2]`. The peer's pull of THIS rank's rows ends
+//!    at that event, so the down may then overwrite them. The wait sits one
+//!    layer of trunk work after the pull it covers, so it is never exposed.
+//!
+//! Hazard argument (the `ep_row_gather` one, verbatim shape): `y_down_grouped`
+//! has one writer per row — the owner's down for owned tiles, the local pull for
+//! the rest — and the peer reads only this rank's OWNED rows, between this
+//! rank's `ready(k)` and the peer's `done(k)`. This rank overwrites those rows
+//! (layer k+1's down) only after `before_down` waited the peer's `done(k)`. Two
+//! alternating event pairs suffice because every invocation passes two host
+//! barriers: an event of parity `p` is re-recorded (invocation k+2) only after
+//! the peer enqueued its wait on the previous record of the same event
+//! (invocation k, before barrier 2 of k+1), and a host barrier guarantees an
+//! event is recorded before any peer enqueues a wait on it.
+//!
+//! Eager only (events, host barriers and peer reads are not usable inside a
+//! captured or retained body); no signal kernels; failures poison the barriers
+//! so the peer returns an error instead of waiting out the timeout.
+//!
+//! # Lifetime
+//!
+//! `hip_bridge::Event` has no `Drop`: the events are created on each rank's
+//! device in [`EpTileExchangeBuilder::register`] and freed by the explicit
+//! [`EpTileExchange::release`], one call per rank after every wait on them has
+//! drained.
+
+use crate::ep_row_gather::{SpinBarrier, DEFAULT_BARRIER_TIMEOUT};
+use hip_bridge::{
+    Event, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_EVENT_DISABLE_TIMING,
+    HIP_EVENT_RELEASE_TO_SYSTEM,
+};
+use rdna_compute::{Gpu, GpuTensor};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+/// Supported ranks: the pull kernel names exactly one peer source.
+pub const RANKS: usize = 2;
+
+/// Shape of the exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpTileExchangeSpec {
+    /// Participants; exactly [`RANKS`].
+    pub ranks: usize,
+    /// Experts the owner table covers.
+    pub experts: usize,
+    /// uint4 per grouped row (`hidden * 2 / 16` for BF16 rows).
+    pub row_u4: usize,
+    /// Padded tile capacity of one call (the registered buffer holds at least
+    /// this many tiles of 16 rows).
+    pub max_tiles: usize,
+}
+
+impl EpTileExchangeSpec {
+    /// Bytes of one tile (16 grouped rows).
+    pub fn tile_bytes(&self) -> usize {
+        16 * self.row_u4 * 16
+    }
+
+    /// Bytes the registered buffer must hold.
+    pub fn buffer_bytes(&self) -> usize {
+        self.max_tiles * self.tile_bytes()
+    }
+
+    pub fn validate(&self) -> HipResult<()> {
+        if self.ranks != RANKS {
+            return Err(err(format!(
+                "ep_tile_exchange: ranks must be {RANKS}, got {}",
+                self.ranks
+            )));
+        }
+        if self.experts == 0 || i32::try_from(self.experts).is_err() {
+            return Err(err("ep_tile_exchange: experts must be 1..=i32::MAX".into()));
+        }
+        // The pull kernel moves 1024 uint4 per workgroup trip.
+        let tile_u4 = self.row_u4.checked_mul(16).unwrap_or(0);
+        if tile_u4 == 0 || tile_u4 % 1024 != 0 {
+            return Err(err(format!(
+                "ep_tile_exchange: row_u4 {} gives a tile that is not a non-zero multiple of 1024 uint4",
+                self.row_u4
+            )));
+        }
+        let total = self
+            .max_tiles
+            .checked_mul(self.tile_bytes())
+            .filter(|&bytes| bytes <= u32::MAX as usize);
+        if self.max_tiles == 0 || total.is_none() {
+            return Err(err(format!(
+                "ep_tile_exchange: max_tiles {} x {} B per tile must be non-zero and fit 32 bits",
+                self.max_tiles,
+                self.tile_bytes()
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_call(&self, tiles: usize) -> HipResult<()> {
+        if tiles == 0 || tiles > self.max_tiles {
+            return Err(err(format!(
+                "ep_tile_exchange: call tiles {tiles} outside 1..={} (registered capacity)",
+                self.max_tiles
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn err(msg: String) -> HipError {
+    HipError::new(0, &msg)
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Parity of the event pair exchange invocation `k` uses.
+pub const fn parity(k: u64) -> usize {
+    (k % 2) as usize
+}
+
+/// Event parity the next down must wait on after `done` exchanges, `None`
+/// before the first one: the peer's completion of the last exchange.
+pub const fn pending_done_parity(done: u64) -> Option<usize> {
+    if done == 0 {
+        None
+    } else {
+        Some(parity(done - 1))
+    }
+}
+
+struct RankReg {
+    device_id: i32,
+    base: usize,
+    len: usize,
+    ready: [Event; 2],
+    done: [Event; 2],
+}
+
+/// Collects one registration per rank, then builds the shared transport.
+pub struct EpTileExchangeBuilder {
+    spec: EpTileExchangeSpec,
+    regs: Vec<Option<RankReg>>,
+    barrier_timeout: Duration,
+}
+
+impl EpTileExchangeBuilder {
+    /// Override the host-barrier timeout (default
+    /// [`DEFAULT_BARRIER_TIMEOUT`]).
+    pub fn barrier_timeout(mut self, timeout: Duration) -> Self {
+        self.barrier_timeout = timeout;
+        self
+    }
+
+    /// One call per rank, on any thread, with that rank's `Gpu`.
+    /// `y_down_grouped` is the rank's grouped-row buffer (>= the spec's
+    /// [`EpTileExchangeSpec::buffer_bytes`]); its base is what the peer reads.
+    /// Creates the rank's four events (two producer, two completion;
+    /// disable-timing, release to system scope so peer reads observe the
+    /// producer's writes) on its device.
+    pub fn register(
+        &mut self,
+        rank: usize,
+        gpu: &mut Gpu,
+        y_down_grouped: &GpuTensor,
+    ) -> HipResult<()> {
+        self.spec.validate()?;
+        if rank >= RANKS {
+            return Err(err(format!(
+                "ep_tile_exchange: register rank {rank} out of range (ranks={RANKS})"
+            )));
+        }
+        if self.regs[rank].is_some() {
+            return Err(err(format!("ep_tile_exchange: rank {rank} registered twice")));
+        }
+        let len = y_down_grouped.buf.size();
+        let base = y_down_grouped.buf.as_ptr() as usize;
+        if base == 0 || len < self.spec.buffer_bytes() {
+            return Err(err(format!(
+                "ep_tile_exchange: rank {rank} y_down_grouped holds {len} B, needs {} B ({} tiles x {} B)",
+                self.spec.buffer_bytes(),
+                self.spec.max_tiles,
+                self.spec.tile_bytes()
+            )));
+        }
+        gpu.bind_thread()?;
+        let flags = HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM;
+        let mut made: Vec<Event> = Vec::with_capacity(4);
+        for _ in 0..4 {
+            match gpu.hip.event_create_with_flags(flags) {
+                Ok(event) => made.push(event),
+                Err(error) => {
+                    for event in made {
+                        let _ = gpu.hip.event_destroy(event);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let mut made = made.into_iter();
+        let mut next = || made.next().expect("four events were created");
+        self.regs[rank] = Some(RankReg {
+            device_id: gpu.device_id,
+            base,
+            len,
+            ready: [next(), next()],
+            done: [next(), next()],
+        });
+        Ok(())
+    }
+
+    /// Finish: every rank registered, distinct devices.
+    pub fn build(self) -> HipResult<Arc<EpTileExchange>> {
+        self.spec.validate()?;
+        let mut ranks = Vec::with_capacity(RANKS);
+        let mut missing = None;
+        for (rank, reg) in self.regs.into_iter().enumerate() {
+            match reg {
+                Some(r) => ranks.push(r),
+                None => missing = missing.or(Some(rank)),
+            }
+        }
+        if let Some(rank) = missing {
+            return Err(err(format!(
+                "ep_tile_exchange: rank {rank} never registered (builder dropped; registered events leak)"
+            )));
+        }
+        if ranks[0].device_id == ranks[1].device_id {
+            return Err(err(format!(
+                "ep_tile_exchange: two ranks share device {}",
+                ranks[0].device_id
+            )));
+        }
+        let states = ranks
+            .into_iter()
+            .map(|r| RankState {
+                device_id: r.device_id,
+                base: r.base,
+                len: r.len,
+                ready: r.ready.map(|e| Mutex::new(Some(e))),
+                done: r.done.map(|e| Mutex::new(Some(e))),
+                exchanged: AtomicU64::new(0),
+                waited: AtomicU64::new(0),
+                peers_enabled: AtomicBool::new(false),
+            })
+            .collect();
+        Ok(Arc::new(EpTileExchange {
+            spec: self.spec,
+            barrier: SpinBarrier::new(RANKS, self.barrier_timeout),
+            ranks: states,
+        }))
+    }
+}
+
+struct RankState {
+    device_id: i32,
+    /// Device address of this rank's `y_down_grouped` (valid on the peer after
+    /// `enable_peers`; ROCm uses one unified address space).
+    base: usize,
+    len: usize,
+    /// Producer-complete events by exchange parity. `None` after `release`. The
+    /// `Mutex` makes the type `Sync` (`Event` is `Send` only); it is
+    /// uncontended by protocol.
+    ready: [Mutex<Option<Event>>; 2],
+    /// Pull-complete events by exchange parity.
+    done: [Mutex<Option<Event>>; 2],
+    /// Exchanges this rank has run (its invocation counter `k`).
+    exchanged: AtomicU64,
+    /// Exchanges whose peer completion this rank already waited for.
+    waited: AtomicU64,
+    peers_enabled: AtomicBool,
+}
+
+/// Shared EP tile-exchange transport (`Arc<EpTileExchange>`, one clone per rank
+/// thread).
+pub struct EpTileExchange {
+    spec: EpTileExchangeSpec,
+    ranks: Vec<RankState>,
+    barrier: SpinBarrier,
+}
+
+impl EpTileExchange {
+    pub fn builder(spec: EpTileExchangeSpec) -> EpTileExchangeBuilder {
+        EpTileExchangeBuilder {
+            spec,
+            regs: (0..RANKS).map(|_| None).collect(),
+            barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
+        }
+    }
+
+    pub fn spec(&self) -> EpTileExchangeSpec {
+        self.spec
+    }
+
+    /// Exchanges `rank` has run.
+    pub fn exchanged(&self, rank: usize) -> u64 {
+        self.ranks[rank].exchanged.load(Ordering::Acquire)
+    }
+
+    fn check(&self, gpu: &Gpu, rank: usize) -> HipResult<()> {
+        if rank >= RANKS {
+            return Err(err(format!(
+                "ep_tile_exchange: rank {rank} out of range (ranks={RANKS})"
+            )));
+        }
+        if gpu.device_id != self.ranks[rank].device_id {
+            return Err(err(format!(
+                "ep_tile_exchange: rank {rank} is device {} but was given a Gpu on device {}",
+                self.ranks[rank].device_id, gpu.device_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Enable P2P from this rank's device to the peer's (idempotent; the row
+    /// gather's `enable_peers` already did it on the production path). Call on
+    /// the rank's thread AFTER every peer-read allocation exists — ROCm does
+    /// not map later allocations.
+    pub fn enable_peers(&self, rank: usize, gpu: &mut Gpu) -> HipResult<()> {
+        self.check(gpu, rank)?;
+        gpu.bind_thread()?;
+        let peer = &self.ranks[1 - rank];
+        if !gpu.hip.can_access_peer(gpu.device_id, peer.device_id)? {
+            return Err(err(format!(
+                "ep_tile_exchange: device {} cannot access peer device {} (rank {rank} -> {})",
+                gpu.device_id,
+                peer.device_id,
+                1 - rank
+            )));
+        }
+        match gpu.hip.enable_peer_access(peer.device_id) {
+            Ok(()) => {}
+            Err(e) if e.code == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED => {}
+            Err(e) => return Err(e),
+        }
+        self.ranks[rank].peers_enabled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Stream-wait (an installed `gpu.active_stream`) or host-wait (none: the
+    /// row gather's stream-less branch) the peer's event.
+    fn wait_peer(&self, gpu: &mut Gpu, slot: &Mutex<Option<Event>>, what: &str) -> HipResult<()> {
+        let guard = lock(slot);
+        let event = guard
+            .as_ref()
+            .ok_or_else(|| err(format!("ep_tile_exchange: {what} after release")))?;
+        match gpu.active_stream.as_ref() {
+            Some(stream) => gpu.hip.stream_wait_event(stream, event),
+            None => gpu.hip.event_synchronize(event),
+        }
+    }
+
+    fn record(&self, gpu: &mut Gpu, slot: &Mutex<Option<Event>>, what: &str) -> HipResult<()> {
+        let guard = lock(slot);
+        let event = guard
+            .as_ref()
+            .ok_or_else(|| err(format!("ep_tile_exchange: {what} after release")))?;
+        gpu.hip.event_record(event, gpu.active_stream.as_ref())
+    }
+
+    /// Right before this rank's routed down (or any other writer of
+    /// `y_down_grouped`) overwrites `y_down_grouped`: wait for the peer to have
+    /// finished pulling this rank's rows of the last exchange (the peer's
+    /// `done` of that exchange). A no-op before the first exchange and when
+    /// that wait was already enqueued (once per exchange).
+    pub fn before_down(&self, gpu: &mut Gpu, rank: usize) -> HipResult<()> {
+        self.check(gpu, rank)?;
+        if self.is_aborted() {
+            return Err(err("ep_tile_exchange: aborted".into()));
+        }
+        let me = &self.ranks[rank];
+        let exchanged = me.exchanged.load(Ordering::Acquire);
+        let Some(p) = pending_done_parity(exchanged) else {
+            return Ok(());
+        };
+        if me.waited.load(Ordering::Acquire) == exchanged {
+            return Ok(());
+        }
+        gpu.bind_thread()?;
+        let result = self.wait_peer(gpu, &self.ranks[1 - rank].done[p], "done wait");
+        match result {
+            Ok(()) => me.waited.store(exchanged, Ordering::Release),
+            Err(_) => self.abort(),
+        }
+        result
+    }
+
+    /// One exchange: publish `y_down_grouped` → host barrier → wait the peer's
+    /// producer event → pull the peer-owned live tiles → record the completion
+    /// event → host barrier. `tile_ids` is the UNMASKED scatter output,
+    /// `owner_table` the device table of the owner rank per expert, `tiles` the
+    /// padded tile capacity of the layout, `y_down_grouped` this rank's
+    /// registered buffer. A failure poisons the barriers so the peer returns
+    /// an error instead of waiting out the timeout.
+    pub fn exchange(
+        &self,
+        gpu: &mut Gpu,
+        rank: usize,
+        owner_table: &GpuTensor,
+        tile_ids: &GpuTensor,
+        y_down_grouped: &GpuTensor,
+        tiles: usize,
+    ) -> HipResult<()> {
+        let result = self.exchange_inner(gpu, rank, owner_table, tile_ids, y_down_grouped, tiles);
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    fn exchange_inner(
+        &self,
+        gpu: &mut Gpu,
+        rank: usize,
+        owner_table: &GpuTensor,
+        tile_ids: &GpuTensor,
+        y_down_grouped: &GpuTensor,
+        tiles: usize,
+    ) -> HipResult<()> {
+        self.check(gpu, rank)?;
+        self.spec.check_call(tiles)?;
+        gpu.bind_thread()?;
+        let me = &self.ranks[rank];
+        let peer = &self.ranks[1 - rank];
+        if !me.peers_enabled.load(Ordering::Acquire) {
+            return Err(err(format!(
+                "ep_tile_exchange: exchange on rank {rank} before enable_peers"
+            )));
+        }
+        if y_down_grouped.buf.as_ptr() as usize != me.base || y_down_grouped.buf.size() != me.len {
+            return Err(err(format!(
+                "ep_tile_exchange: rank {rank} was handed a y_down_grouped other than the registered buffer"
+            )));
+        }
+        let k = me.exchanged.load(Ordering::Acquire);
+        let p = parity(k);
+        self.record(gpu, &me.ready[p], "publish")?;
+        self.barrier.wait().map_err(|m| err(m.into()))?;
+        self.wait_peer(gpu, &peer.ready[p], "ready wait")?;
+        gpu.ep_gather_grouped_rows_by_tile_owner(
+            tile_ids,
+            owner_table,
+            peer.base,
+            y_down_grouped,
+            tiles,
+            self.spec.experts,
+            rank,
+            self.spec.row_u4,
+        )?;
+        self.record(gpu, &me.done[p], "completion")?;
+        self.barrier.wait().map_err(|m| err(m.into()))?;
+        me.exchanged.store(k + 1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Poison the barriers: every current/future waiter returns Err (a rank
+    /// failed). Barrier waits time out (default 30 s) with Err rather than
+    /// hanging.
+    pub fn abort(&self) {
+        self.barrier.abort();
+    }
+
+    /// Whether `abort` was called (or a barrier wait timed out).
+    pub fn is_aborted(&self) -> bool {
+        self.barrier.is_aborted()
+    }
+
+    /// Destroy this rank's events. Call once per rank on that rank's thread,
+    /// after the rank's stream and every peer stream that waits on them have
+    /// drained. Later calls return Err.
+    pub fn release(&self, rank: usize, gpu: &mut Gpu) -> HipResult<()> {
+        self.check(gpu, rank)?;
+        gpu.bind_thread()?;
+        let mut first = Ok(());
+        let state = &self.ranks[rank];
+        for slot in state.ready.iter().chain(state.done.iter()) {
+            if let Some(event) = lock(slot).take() {
+                let r = gpu.hip.event_destroy(event);
+                if first.is_ok() {
+                    first = r;
+                }
+            }
+        }
+        first
+    }
+}
+
+impl Drop for EpTileExchange {
+    fn drop(&mut self) {
+        let live = self
+            .ranks
+            .iter()
+            .filter(|r| r.ready.iter().chain(r.done.iter()).any(|e| lock(e).is_some()))
+            .count();
+        if live > 0 {
+            eprintln!(
+                "WARN: EpTileExchange dropped with events live on {live} rank(s) — \
+                 call release(rank, gpu) on each rank first; HIP event handles leaked."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(max_tiles: usize) -> EpTileExchangeSpec {
+        EpTileExchangeSpec {
+            ranks: 2,
+            experts: 512,
+            row_u4: 320,
+            max_tiles,
+        }
+    }
+
+    #[test]
+    fn production_shape_validates() {
+        let s = spec(3_040);
+        assert!(s.validate().is_ok());
+        assert_eq!(s.tile_bytes(), 81_920);
+        assert_eq!(s.buffer_bytes(), 3_040 * 81_920);
+    }
+
+    #[test]
+    fn spec_validation_refuses_everything_else() {
+        assert!(EpTileExchangeSpec { ranks: 4, ..spec(8) }.validate().is_err());
+        assert!(EpTileExchangeSpec { ranks: 1, ..spec(8) }.validate().is_err());
+        assert!(EpTileExchangeSpec { experts: 0, ..spec(8) }.validate().is_err());
+        assert!(EpTileExchangeSpec { experts: usize::MAX, ..spec(8) }.validate().is_err());
+        assert!(EpTileExchangeSpec { row_u4: 0, ..spec(8) }.validate().is_err());
+        // 16 rows x 72 uint4 = 1152 uint4: not a multiple of 1024.
+        assert!(EpTileExchangeSpec { row_u4: 72, ..spec(8) }.validate().is_err());
+        assert!(spec(0).validate().is_err());
+        // 60,000 tiles x 80 KiB exceeds 32 bits.
+        assert!(spec(60_000).validate().is_err());
+    }
+
+    #[test]
+    fn call_tiles_within_capacity() {
+        let s = spec(3_040);
+        assert!(s.check_call(1).is_ok());
+        assert!(s.check_call(3_040).is_ok());
+        assert!(s.check_call(0).is_err());
+        assert!(s.check_call(3_041).is_err());
+    }
+
+    /// The next down waits the peer's completion of the LAST exchange: parity
+    /// alternates and nothing is owed before the first one.
+    #[test]
+    fn done_wait_parity_follows_the_last_exchange() {
+        assert_eq!(pending_done_parity(0), None);
+        assert_eq!(pending_done_parity(1), Some(0));
+        assert_eq!(pending_done_parity(2), Some(1));
+        assert_eq!(pending_done_parity(3), Some(0));
+        assert_eq!(pending_done_parity(48), Some(1));
+        assert_eq!(pending_done_parity(49), Some(0));
+        assert_eq!((parity(0), parity(1), parity(2), parity(47), parity(48)), (0, 1, 0, 1, 0));
+    }
+
+    #[test]
+    fn builder_requires_valid_spec_and_all_ranks() {
+        let b = EpTileExchange::builder(EpTileExchangeSpec { ranks: 4, ..spec(8) });
+        assert!(b.build().is_err());
+        let b = EpTileExchange::builder(spec(8));
+        assert!(b.build().is_err(), "no rank registered");
+    }
+
+    #[test]
+    fn send_sync_arc() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EpTileExchange>();
+        assert_send_sync::<Arc<EpTileExchange>>();
+    }
+}
