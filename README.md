@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png" />
+  <img alt="hipfire: LLM inference for AMD GPUs" src="docs/assets/hero-light.png" width="100%" />
+</picture>
+
 <h1 align="center">hipfire</h1>
 
 <p align="center">
@@ -98,13 +103,19 @@ Every figure below comes from the [CHANGELOG](CHANGELOG.md) Unreleased
 the method and the kill switch. Each figure is a measurement on one fixture,
 not a general throughput claim.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/gains-042-dark.svg" />
+  <img alt="hipfire 0.4.2 measured before and after: Strix Halo 27B DFlash decode, 27B DFlash-default prefill, Flash-Next NPU TTFT, EP2 prefill" src="docs/assets/readme/gains-042-light.svg" width="880" />
+</picture>
+
 - **Flash-Next EP2.** Owner-routed prefill and long-prefill expert staging
   are on by default when two R9700s (gfx1201) admit EP2. Balanced per-call
   expert ownership and native MTP also run under EP. EP4 owner-routed
   prefill is still refused at admission.
-  *Measured on 2x R9700 (gfx1201), pinned Flash-Next XTS, committed 8K-token
-  prompt, 2026-10-13: prefill went from 3,036 tok/s on one card to 3,942 tok/s
-  on EP2 (1.30x).* See [multi-GPU serving](docs/multi-gpu.md).
+  *Measured on 2x R9700 (gfx1201), pinned Flash-Next XTS, committed prompts,
+  2026-10-13: prefill went from 3,033 to 3,943 tok/s at 8K (1.30x) and from
+  3,754 to 4,308 tok/s at 16K (1.15x), one card vs EP2.* See
+  [multi-GPU serving](docs/multi-gpu.md).
 - **Flash-Next NPU prefill route on Strix Halo.** `fusions.npu_trunk = "auto"`
   runs the pipelined trunk input projections on the XDNA2 NPU. It needs
   exact gfx1151, an open NPU and a matching calibration. Any other system
@@ -198,6 +209,11 @@ defaults, sidecars and provenance. To bring your own model, use
 | RDNA3.5 | `gfx1150`–`gfx1152` | WMMA kernels; Strix Halo (gfx1151) XDNA2 NPU prefill route |
 | RDNA4 | `gfx1200`, `gfx1201` | WMMA kernels, retained-PM4 Redline route, EP2 multi-GPU |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/gpu-matrix-dark.svg" />
+  <img alt="GPU support matrix: architecture families against decode, prefill WMMA, DFlash, MTP, NPU prefill and Redline" src="docs/assets/readme/gpu-matrix-light.svg" width="880" />
+</picture>
+
 Kernels are chosen through typed per-architecture dispatch tables. A
 specialization that is not available falls back to the portable or
 architecture fallback kernel. It is never borrowed from a neighbouring GPU
@@ -213,9 +229,10 @@ interfaces. If a graph is unsupported, shadow validation fails, the ABI does
 not match, a queue faults or the model changes, Redline falls back to
 ordinary HIP dispatch.
 
-<p align="center">
-  <img width="1200" alt="Hipfire runtime and Redline validated replay path, with fail-closed ordinary HIP fallback" src="docs/assets/readme/redline-runtime.svg" />
-</p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/architecture-dark.svg" />
+  <img alt="hipfire architecture: model file, loader and runtime; PeaceMaker builds and certifies kernels with hipcc twins as oracles and builds NPU programs; Redline records, certifies and replays; serve" src="docs/assets/readme/architecture-light.svg" width="880" />
+</picture>
 
 The [Golden Redline guide](docs/GOLDEN-REDLINE.md) reproduces the sealed
 MQ4R fixture (`python3 -m tools.redline golden`). Historical MQ4R
