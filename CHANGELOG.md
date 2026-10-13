@@ -531,14 +531,16 @@
   - compute the LM head on the last chunk only.
   Batched prefill changes floating-point reduction order; it is not a
   byte-identity claim against per-token prefill.
-- Gemma 4 26B-A4B long-context decode: flash-decode tiles that lie wholly
-  below the sliding window exit without reading V, and the Q8 reduce skips
-  them and loads tile partials eight at a time (both bit-exact, for every
-  model on these kernels). On gfx1151 the Gemma decode shapes (head_dim 256 /
-  GQA 2, head_dim 512 / GQA 8) run a GQA-shared 8-wave tile
-  (`HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the reference tile),
-  and the HFQ4-G128 routed down kernel computes eight rows per workgroup
-  with all eight experts' loads in flight.
+- Gemma 4 long-context decode runs its own Q8 flash-decode pair: in
+  `attention_flash_q8_0_tile_swa` tiles that lie wholly below the sliding
+  window exit without reading V, and `attention_flash_q8_0_reduce_skip` skips
+  them and loads tile partials eight at a time. Only Gemma 4 launches them;
+  the shared `attention_flash_q8_0_tile` / `_reduce` modules every other
+  model runs are unchanged. On gfx1151 the Gemma decode shapes
+  (head_dim 256 / GQA 2, head_dim 512 / GQA 8) run a GQA-shared 8-wave tile
+  (`HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the swa tile), also
+  only from Gemma 4. The HFQ4-G128 routed down kernel computes eight rows per
+  workgroup with all eight experts' loads in flight.
 
 ### Known issues
 

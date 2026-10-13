@@ -7930,6 +7930,20 @@ pub const ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC: &str = concat!(
 pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_reduce.hip");
 
+/// Gemma 4 decode twin of [`ATTENTION_FLASH_Q8_0_TILE_SRC`]
+/// (`attention_flash_q8_0_tile_swa`): same ABI and partials; a tile wholly
+/// below the sliding window publishes an empty partial without reading V.
+/// Pair with [`ATTENTION_FLASH_Q8_0_REDUCE_SKIP_SRC`].
+pub const ATTENTION_FLASH_Q8_0_TILE_SWA_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_swa.hip");
+
+/// Gemma 4 decode twin of [`ATTENTION_FLASH_Q8_0_REDUCE_SRC`]
+/// (`attention_flash_q8_0_reduce_skip`): never reads the V partials of a
+/// zero-weight tile, parallel global max, eight-wide partial loads. Same
+/// result as the reference reduce on fully written partials.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_SKIP_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_skip.hip");
+
 /// gfx1100-only Qwen attention reduce/gate/MQ epilogue. Kept in a separate
 /// translation unit so its dormant body cannot perturb portable/gfx12 reducer
 /// codegen.

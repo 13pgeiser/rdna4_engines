@@ -1255,8 +1255,15 @@ fn dispatch_attend(
                 let seq_len = io.pos + 1;
                 let fp = io.flash_partials.unwrap();
                 // window comes from the plan (cohere2moe: sliding_window on
-                // Sliding layers, 0 on full layers; 0 == plain flash).
-                hip!(gpu.attention_flash_q8_0_windowed(
+                // Sliding layers, 0 on full layers; 0 == plain flash). Gemma 4
+                // decode opts into its own tile/reduce pair.
+                let attend = if plan.gemma_tiles {
+                    Gpu::attention_flash_q8_0_windowed_gemma
+                } else {
+                    Gpu::attention_flash_q8_0_windowed
+                };
+                hip!(attend(
+                    gpu,
                     io.q,
                     io.k_cache,
                     io.v_cache,

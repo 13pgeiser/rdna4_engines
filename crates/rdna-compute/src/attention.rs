@@ -404,9 +404,11 @@ fn q8_decode_attn_gqa_gfx1151_admitted(
 /// gfx1151 Q8_0 decode attention for the Gemma 4 26B-A4B shapes through a
 /// GQA-shared, 8-wave tile (`attention_flash_q8_0_tile_gqa_gemma.gfx1151.hip`):
 /// head_dim 256 with GQA group 2 (sliding layers) and head_dim 512 with group
-/// 8 (full layers), tile 128, any window. Same partials as the reference tile
-/// and the same reduce, not bit-identical (different summation order).
-/// `HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the reference tile.
+/// 8 (full layers), tile 128, any window. Same partials as the reference tile,
+/// paired with `attention_flash_q8_0_reduce_skip`; not bit-identical
+/// (different summation order). Reached only through the Gemma 4 decode entry
+/// point ([`Gpu::attention_flash_q8_0_windowed_gemma`]).
+/// `HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the swa tile.
 fn q8_decode_attn_gqa_gemma_gfx1151(
     gpu: &Gpu,
     n_heads: usize,
@@ -10458,6 +10460,48 @@ impl Gpu {
             window,
             None,
             None,
+            false,
+        )
+    }
+
+    /// Gemma 4 decode twin of [`Self::attention_flash_q8_0_windowed`]: the
+    /// tile pass runs `attention_flash_q8_0_tile_swa` (a tile wholly below the
+    /// window publishes an empty partial without reading V) or, on gfx1151 at
+    /// the Gemma 4 GQA shapes, the GQA-shared Gemma tile, and the reduce runs
+    /// `attention_flash_q8_0_reduce_skip`. Every other caller keeps the
+    /// shared `attention_flash_q8_0_tile` / `_reduce` modules.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_windowed_gemma(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window: i32,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_windowed_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            window,
+            None,
+            None,
+            true,
         )
     }
 
@@ -10495,6 +10539,7 @@ impl Gpu {
             0,
             Some(gate),
             None,
+            false,
         )
     }
 
@@ -10534,6 +10579,7 @@ impl Gpu {
             0,
             Some(gate),
             Some(awq_scale),
+            false,
         )
     }
 
@@ -10554,6 +10600,8 @@ impl Gpu {
         window: i32,
         output_gate: Option<&GpuTensor>,
         output_awq_scale: Option<&GpuTensor>,
+        // Gemma 4 decode only: swa tile / Gemma GQA tile + skip reduce.
+        gemma_tiles: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
@@ -10635,7 +10683,7 @@ impl Gpu {
         }
 
         // ── Tile kernel ──
-        let gemma_gqa = if output_gate.is_none() {
+        let gemma_gqa = if gemma_tiles && output_gate.is_none() {
             q8_decode_attn_gqa_gemma_gfx1151(self, n_heads, n_kv_heads, head_dim, tile_size)
         } else {
             None
@@ -10654,6 +10702,12 @@ impl Gpu {
                 "attention_flash_q8_0_tile_dpp_gfx1151",
                 kernels::ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC,
                 "attention_flash_q8_0_tile",
+            )
+        } else if gemma_tiles {
+            (
+                "attention_flash_q8_0_tile_swa",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_SWA_SRC,
+                "attention_flash_q8_0_tile_swa",
             )
         } else {
             (
@@ -10756,8 +10810,20 @@ impl Gpu {
                     max_tiles,
                 )?;
             } else {
-                const KERNEL: &str = "attention_flash_q8_0_reduce";
-                self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, KERNEL)?;
+                // The swa and Gemma GQA tiles leave the V partials of an
+                // empty tile unwritten; only the skip reduce never reads them.
+                let (kernel, src) = if gemma_tiles {
+                    (
+                        "attention_flash_q8_0_reduce_skip",
+                        kernels::ATTENTION_FLASH_Q8_0_REDUCE_SKIP_SRC,
+                    )
+                } else {
+                    (
+                        "attention_flash_q8_0_reduce",
+                        kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                    )
+                };
+                self.ensure_kernel(kernel, src, kernel)?;
                 let mut params: Vec<*mut c_void> = vec![
                     &p_ptr as *const _ as *mut c_void,
                     &o_ptr as *const _ as *mut c_void,
@@ -10768,7 +10834,7 @@ impl Gpu {
                     &mt as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
-                    KERNEL,
+                    kernel,
                     [n_heads as u32, 1, 1],
                     [256, 1, 1],
                     (max_tiles * 4) as u32,

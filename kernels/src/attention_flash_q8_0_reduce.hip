@@ -48,25 +48,15 @@ __global__ void attention_flash_q8_0_reduce(
     extern __shared__ float corr_lut[]; // [max_tiles]
     __shared__ float global_max_shared;
     __shared__ float global_sum_shared;
-    __shared__ float wave_max[32];
 
-    // Global max over tiles with a positive sum. fmaxf is exact and
-    // order-independent, so a parallel reduction equals the reference's
-    // increasing-tile serial order; it avoids a serial chain of global loads.
-    float local_max = -1e30f;
-    for (int tile = tid; tile < n_tiles; tile += blockDim.x) {
-        const float* p = partials + (h * max_tiles + tile) * stride;
-        if (p[1] > 0.0f)
-            local_max = fmaxf(local_max, p[0]);
-    }
-    for (int off = warpSize / 2; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
-    if ((tid % warpSize) == 0) wave_max[tid / warpSize] = local_max;
-    __syncthreads();
+    // Preserve the reference kernel's increasing-tile fmax order exactly.
     if (tid == 0) {
         float global_max = -1e30f;
-        for (int w = 0; w < (int)((blockDim.x + warpSize - 1) / warpSize); w++)
-            global_max = fmaxf(global_max, wave_max[w]);
+        for (int tile = 0; tile < n_tiles; tile++) {
+            const float* p = partials + (h * max_tiles + tile) * stride;
+            if (p[1] > 0.0f)
+                global_max = fmaxf(global_max, p[0]);
+        }
         global_max_shared = global_max;
     }
     __syncthreads();
@@ -79,21 +69,10 @@ __global__ void attention_flash_q8_0_reduce(
     }
     __syncthreads();
 
-    // Preserve the reference kernel's increasing-tile global-sum order; the
-    // p[1] loads are issued eight at a time so they overlap.
+    // Preserve the reference kernel's increasing-tile global-sum order.
     if (tid == 0) {
         float global_sum = 0.0f;
-        int tile = 0;
-        for (; tile + 8 <= n_tiles; tile += 8) {
-            float s[8];
-#pragma unroll
-            for (int j = 0; j < 8; j++)
-                s[j] = partials[(h * max_tiles + tile + j) * stride + 1];
-#pragma unroll
-            for (int j = 0; j < 8; j++)
-                global_sum += s[j] * corr_lut[tile + j];
-        }
-        for (; tile < n_tiles; tile++) {
+        for (int tile = 0; tile < n_tiles; tile++) {
             const float* p = partials + (h * max_tiles + tile) * stride;
             global_sum += p[1] * corr_lut[tile];
         }
@@ -104,26 +83,9 @@ __global__ void attention_flash_q8_0_reduce(
     const float inv_sum = global_sum_shared > 0.0f ? 1.0f / global_sum_shared : 0.0f;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float g = 0.0f;
-        // Zero-weight tiles (empty or fully masked) add exactly 0; their V
-        // partials may be unwritten, so do not read them. Loads are issued
-        // eight tiles at a time; the adds keep increasing-tile order.
-        int tile = 0;
-        for (; tile + 8 <= n_tiles; tile += 8) {
-            float c[8], v[8];
-#pragma unroll
-            for (int j = 0; j < 8; j++) c[j] = corr_lut[tile + j];
-#pragma unroll
-            for (int j = 0; j < 8; j++)
-                v[j] = c[j] != 0.0f ? partials[(h * max_tiles + tile + j) * stride + 2 + d] : 0.0f;
-#pragma unroll
-            for (int j = 0; j < 8; j++)
-                if (c[j] != 0.0f) g += v[j] * c[j];
-        }
-        for (; tile < n_tiles; tile++) {
-            const float c = corr_lut[tile];
-            if (c == 0.0f) continue;
+        for (int tile = 0; tile < n_tiles; tile++) {
             const float* p = partials + (h * max_tiles + tile) * stride;
-            g += p[2 + d] * c;
+            g += p[2 + d] * corr_lut[tile];
         }
         out[h * head_dim + d] = g * inv_sum;
     }

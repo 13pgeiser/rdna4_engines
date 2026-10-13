@@ -277,6 +277,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("kv_cache_write_q8_0_independent_masked", prepend_kv_slot_desc(kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC), ["kv_cache_write_q8_0_independent_masked"]);
     add!("attention_flash_q8_0_tile", kernels::ATTENTION_FLASH_Q8_0_TILE_SRC, ["attention_flash_q8_0_tile"]);
     add!("attention_flash_q8_0_reduce", kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, ["attention_flash_q8_0_reduce"]);
+    // Gemma 4 decode twins of the two modules above (attention.rs
+    // `attention_flash_q8_0_windowed_impl` with `gemma_tiles`).
+    add!("attention_flash_q8_0_tile_swa", kernels::ATTENTION_FLASH_Q8_0_TILE_SWA_SRC, ["attention_flash_q8_0_tile_swa"]);
+    add!("attention_flash_q8_0_reduce_skip", kernels::ATTENTION_FLASH_Q8_0_REDUCE_SKIP_SRC, ["attention_flash_q8_0_reduce_skip"]);
     // Multi-slot (slot-descriptor) launches of the q8 and asym3 KV routes run
     // separately named `*_paged` modules (attention.rs `ensure_kv_slot_kernel`,
     // `ensure_givens4_kv_slot_kernel`, `attention_q8_0_flash_prefill_wmma_slots`).
@@ -1848,8 +1852,10 @@ mod tests {
         // builder module, not a hipcc entry), and the 27B AR route's plain q8
         // Q-resident v2 attention and `_gil_` slab sigmoid producer (ragged
         // fp8q chunks and `HIPFIRE_A4_ATTN_EPI=0`). Those 140 keys plus the
-        // opt-in exact-K5120 gate/up twin are additional to P0's 92.
-        assert_eq!(registry.len(), count + 141, "unexpected gfx1201 inventory size");
+        // opt-in exact-K5120 gate/up twin and the Gemma 4 decode twins
+        // `attention_flash_q8_0_tile_swa` / `attention_flash_q8_0_reduce_skip`
+        // are additional to P0's 92.
+        assert_eq!(registry.len(), count + 143, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
@@ -1885,10 +1891,7 @@ mod tests {
         // four `sample_top_p_parallel*` modules' penalty prepass now finds
         // each token's (last index, count) by an LDS sort; the per-token
         // update and every result bit are unchanged (sampler oracle dumps).
-        const REPINNED_SINCE_P0: [&str; 21] = [
-            "attention_flash_fp8_e4m3_tile",
-            "attention_flash_q8_0_reduce",
-            "attention_flash_q8_0_tile",
+        const REPINNED_SINCE_P0: [&str; 18] = [
             "conv1d_silu_split_qknorm_b256",
             "fused_qk_l2_norm_scale",
             "fused_rmsnorm_mq_rotate",

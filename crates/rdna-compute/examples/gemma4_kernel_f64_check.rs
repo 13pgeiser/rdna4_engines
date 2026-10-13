@@ -5,7 +5,7 @@
 // The Gemma 4 26B-A4B gfx1151 kernels against an f64 CPU reference, at the
 // model's shapes (head_dim 256 / 16q:8kv / window 1024 sliding, head_dim 512 /
 // 16q:2kv full; routed experts M 2816, K 704, top-8):
-//   * decode Q8_0 flash attention (`attention_flash_q8_0_windowed`); run with
+//   * decode Q8_0 flash attention (`attention_flash_q8_0_windowed_gemma`); run with
 //     HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0 to compare the reference tile;
 //   * batched prefill attention (`attention_q8_0_prefill_gqa_wmma`);
 //   * the HFQ4-G128 routed down projection, per-row and grouped;
@@ -97,7 +97,7 @@ fn main() {
         let pos = ((seq - 1) as i32).to_le_bytes();
         let pos_t = gpu.upload_raw(&pos, &[1]).unwrap();
         let partials = gpu.zeros(&[nh * max_seq.div_ceil(16) * (2 + hd)], DType::F32).unwrap();
-        gpu.attention_flash_q8_0_windowed(
+        gpu.attention_flash_q8_0_windowed_gemma(
             &q, &k, &v, &out, &pos_t.buf, seq, nh, nkv, hd, max_seq, &partials, window,
         )
         .unwrap();
@@ -288,7 +288,7 @@ fn main() {
         for seq in [290usize, 32768] {
             let pos_t = gpu.upload_raw(&((seq - 1) as i32).to_le_bytes(), &[1]).unwrap();
             let mut run = |gpu: &mut Gpu| {
-                gpu.attention_flash_q8_0_windowed(
+                gpu.attention_flash_q8_0_windowed_gemma(
                     &q, &k, &v, &out, &pos_t.buf, seq, nh, nkv, hd, max_seq, &partials, window,
                 )
                 .unwrap()

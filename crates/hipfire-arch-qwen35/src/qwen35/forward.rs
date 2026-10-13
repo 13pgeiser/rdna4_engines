@@ -8050,6 +8050,7 @@ mod tests {
             uses_givens: false,
             batch_size: 1,
             window: 0,
+            gemma_tiles: false,
         };
         assert!(qwen35_fa_kvwrite_fold_route_supported(&plan));
         assert!(!qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {

@@ -1459,6 +1459,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // tiles and the head-dim-split reduces keep their reference twins'
         // 13/7-argument ABIs and pointer effects.
         "attention_flash_q8_0_tile"
+        | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
         | "attention_flash_q8_0_tile_gqa_gfx1151"
@@ -1467,6 +1468,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
         "attention_flash_q8_0_reduce"
+        | "attention_flash_q8_0_reduce_skip"
         | "attention_flash_reduce_dsplit_gfx1201"
         | "attention_flash_reduce_dsplit_gfx1151" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
@@ -1856,6 +1858,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "attention_q8_0_fa2_gqa_partial_gfx1100" => Some(64),
         "attention_q8_0_fa2_gqa_merge_gfx1100" => Some(32),
         "attention_flash_q8_0_reduce"
+        | "attention_flash_q8_0_reduce_skip"
         | "attention_flash_reduce_dsplit_gfx1201"
         | "attention_flash_reduce_dsplit_gfx1151"
         | "fused_rmsnorm_mq_rotate"
@@ -1915,6 +1918,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
+        | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "gated_norm_mq_rotate_awq_k6144_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"

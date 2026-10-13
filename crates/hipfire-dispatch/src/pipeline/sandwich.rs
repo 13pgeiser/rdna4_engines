@@ -640,7 +640,7 @@ impl SandwichAttentionOp<'_> {
             return self.attend_rows(gpu);
         }
         let kv = &self.kv;
-        let plan = KvTierPlan::derive(KvTierInputs {
+        let mut plan = KvTierPlan::derive(KvTierInputs {
             pos: self.position,
             batch_size: 1,
             q8_windowed: true,
@@ -648,6 +648,9 @@ impl SandwichAttentionOp<'_> {
             ..kv.tier
         })
         .map_err(hip)?;
+        // Gemma 4 decode runs its own Q8 tile/reduce pair; the shared
+        // modules stay exactly as every other model runs them.
+        plan.gemma_tiles = true;
         let io = AttnParams {
             q: self.q,
             k: self.k,
