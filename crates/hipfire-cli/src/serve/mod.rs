@@ -1248,6 +1248,64 @@ pub(crate) fn parse_bind(
     Ok((address.to_owned(), port.unwrap_or(default_port)))
 }
 
+/// Builds the detached child's argv. `--open` stays a parent-only action; the
+/// child receives `--ui`, and `--detach` is replaced by `--foreground-child`.
+fn detached_serve_command(
+    executable: &Path,
+    args: &ServeArgs,
+    host: &str,
+    port: u16,
+) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .arg("serve")
+        .arg(host)
+        .arg(port.to_string())
+        .arg("--foreground-child");
+    if args.no_prewarm {
+        command.arg("--no-prewarm");
+    }
+    if let Some(model) = &args.model {
+        command.arg("--model").arg(model);
+    }
+    if let Some(mode) = &args.kv_mode {
+        command.arg("--kv-mode").arg(mode);
+    }
+    if let Some(k) = &args.kv_k {
+        command.arg("--kv-k").arg(k);
+    }
+    if let Some(v) = &args.kv_v {
+        command.arg("--kv-v").arg(v);
+    }
+    if let Some(backend) = &args.kv_backend {
+        command.arg("--kv-backend").arg(backend);
+    }
+    if let Some(vision) = &args.vision {
+        command.arg("--vision").arg(vision);
+    }
+    if let Some(max_seq) = args.max_seq {
+        command.arg("--max-seq").arg(max_seq.to_string());
+    }
+    if let Some(seconds) = args.idle_timeout {
+        command.arg("--idle-timeout").arg(seconds.to_string());
+    }
+    if let Some(tp) = args.tp {
+        command.arg("--tp").arg(tp.to_string());
+    }
+    if let Some(batch) = args.continuous_batch_size {
+        command
+            .arg("--continuous-batch-size")
+            .arg(batch.to_string());
+    }
+    if let Some(selector) = &args.speculation {
+        command.arg("--spec").arg(selector);
+    }
+    if args.ui || args.open {
+        command.arg("--ui");
+    }
+    command
+}
+
 pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Result<()> {
     fs::create_dir_all(&paths.root)?;
     let log_path = paths.root.join("serve.log");
@@ -1296,58 +1354,11 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
     // an early exit.
     let log_start = log.metadata().map(|meta| meta.len()).unwrap_or(0);
     let executable = env::current_exe().context("failed to resolve native hipfire binary")?;
-    let mut command = Command::new(executable);
+    let mut command = detached_serve_command(&executable, args, host, port);
     command
-        .arg("serve")
-        .arg(host)
-        .arg(port.to_string())
-        .arg("--foreground-child")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    if args.no_prewarm {
-        command.arg("--no-prewarm");
-    }
-    if let Some(model) = &args.model {
-        command.arg("--model").arg(model);
-    }
-    if let Some(mode) = &args.kv_mode {
-        command.arg("--kv-mode").arg(mode);
-    }
-    if let Some(k) = &args.kv_k {
-        command.arg("--kv-k").arg(k);
-    }
-    if let Some(v) = &args.kv_v {
-        command.arg("--kv-v").arg(v);
-    }
-    if let Some(backend) = &args.kv_backend {
-        command.arg("--kv-backend").arg(backend);
-    }
-    if let Some(max_seq) = args.max_seq {
-        command.arg("--max-seq").arg(max_seq.to_string());
-    }
-    if let Some(seconds) = args.idle_timeout {
-        command.arg("--idle-timeout").arg(seconds.to_string());
-    }
-    if let Some(tp) = args.tp {
-        command.arg("--tp").arg(tp.to_string());
-    }
-    if let Some(batch) = args.continuous_batch_size {
-        command
-            .arg("--continuous-batch-size")
-            .arg(batch.to_string());
-    }
-    if let Some(selector) = &args.speculation {
-        command.arg("--spec").arg(selector);
-    }
-    if let Some(max_seq) = args.max_seq {
-        command.arg("--max-seq").arg(max_seq.to_string());
-    }
-    if args.ui || args.open {
-        // --open is a one-shot launcher action in the parent; the detached
-        // child only needs the route enabled.
-        command.arg("--ui");
-    }
     let mut child = command.spawn().context("failed to detach native serve")?;
     let child_pid = u64::from(child.id());
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -2747,6 +2758,156 @@ mod tests {
         assert_eq!(args.max_seq, Some(65_536));
         assert_eq!(args.idle_timeout, Some(0));
         assert_eq!(args.tp, Some(2));
+    }
+
+    fn parse_serve_args(argv: &[&str]) -> ServeArgs {
+        let parsed = Cli::try_parse_from(argv).unwrap();
+        let Some(Commands::Serve(args)) = parsed.command else {
+            panic!("expected serve command")
+        };
+        args
+    }
+
+    fn command_args(command: &Command) -> Vec<std::ffi::OsString> {
+        command.get_args().map(std::ffi::OsStr::to_owned).collect()
+    }
+
+    fn flag_values<'a>(
+        argv: &'a [std::ffi::OsString],
+        flag: &str,
+    ) -> Vec<Option<&'a std::ffi::OsString>> {
+        argv.iter()
+            .enumerate()
+            .filter(|(_, value)| value.as_os_str() == std::ffi::OsStr::new(flag))
+            .map(|(index, _)| argv.get(index + 1))
+            .collect()
+    }
+
+    fn reparse_child(argv: &[std::ffi::OsString]) -> ServeArgs {
+        let parsed = Cli::try_parse_from(
+            std::iter::once(std::ffi::OsString::from("hipfire")).chain(argv.iter().cloned()),
+        )
+        .unwrap();
+        let Some(Commands::Serve(args)) = parsed.command else {
+            panic!("expected serve command")
+        };
+        args
+    }
+
+    #[test]
+    fn detached_serve_command_forwards_every_option_once() {
+        let vision = "/tmp/hipfire vision/tower with spaces.hfq";
+        let args = parse_serve_args(&[
+            "hipfire",
+            "serve",
+            "10.0.0.5:9000",
+            "--model",
+            "qwen:test",
+            "--detach",
+            "--no-prewarm",
+            "--kv-mode",
+            "q8",
+            "--kv-k",
+            "q8",
+            "--kv-v",
+            "q4",
+            "--kv-backend",
+            "vmm",
+            "--vision",
+            vision,
+            "--idle-timeout",
+            "30",
+            "--tp",
+            "2",
+            "--spec",
+            "mtp",
+            "--max-seq",
+            "8192",
+            "--continuous-batch-size",
+            "4",
+            "--open",
+        ]);
+        assert!(args.detach && args.open && !args.ui);
+
+        let executable = Path::new("/opt/hipfire/bin/hipfire");
+        let command = detached_serve_command(executable, &args, "10.0.0.5", 9000);
+        assert_eq!(command.get_program(), executable.as_os_str());
+        let argv = command_args(&command);
+
+        assert_eq!(
+            flag_values(&argv, "--vision"),
+            vec![Some(&std::ffi::OsString::from(vision))]
+        );
+        assert_eq!(
+            flag_values(&argv, "--max-seq"),
+            vec![Some(&std::ffi::OsString::from("8192"))]
+        );
+        for flag in [
+            "--foreground-child",
+            "--no-prewarm",
+            "--model",
+            "--kv-mode",
+            "--kv-k",
+            "--kv-v",
+            "--kv-backend",
+            "--idle-timeout",
+            "--tp",
+            "--continuous-batch-size",
+            "--spec",
+            "--ui",
+        ] {
+            assert_eq!(flag_values(&argv, flag).len(), 1, "{flag} must appear once");
+        }
+        for absent in ["--detach", "--background", "--open", "-d"] {
+            assert!(
+                flag_values(&argv, absent).is_empty(),
+                "{absent} must not be forwarded"
+            );
+        }
+
+        let child = reparse_child(&argv);
+        assert_eq!(child.positionals, ["10.0.0.5", "9000"]);
+        assert_eq!(child.model, args.model);
+        assert_eq!(child.no_prewarm, args.no_prewarm);
+        assert_eq!(child.kv_mode, args.kv_mode);
+        assert_eq!(child.kv_k, args.kv_k);
+        assert_eq!(child.kv_v, args.kv_v);
+        assert_eq!(child.kv_backend, args.kv_backend);
+        assert_eq!(child.vision, args.vision);
+        assert_eq!(child.vision, Some(PathBuf::from(vision)));
+        assert_eq!(child.idle_timeout, args.idle_timeout);
+        assert_eq!(child.tp, args.tp);
+        assert_eq!(child.speculation, args.speculation);
+        assert_eq!(child.max_seq, Some(8192));
+        assert_eq!(child.continuous_batch_size, args.continuous_batch_size);
+        assert!(child.foreground_child);
+        assert!(!child.detach);
+        assert!(!child.open);
+        assert!(child.ui);
+    }
+
+    #[test]
+    fn detached_serve_command_omits_absent_options() {
+        let args = parse_serve_args(&["hipfire", "serve", "--detach"]);
+        let command = detached_serve_command(
+            Path::new("/opt/hipfire/bin/hipfire"),
+            &args,
+            "127.0.0.1",
+            11520,
+        );
+        let argv = command_args(&command);
+        assert_eq!(
+            argv,
+            ["serve", "127.0.0.1", "11520", "--foreground-child"]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
+
+        let child = reparse_child(&argv);
+        assert_eq!(child.positionals, ["127.0.0.1", "11520"]);
+        assert!(child.model.is_none() && child.vision.is_none() && child.max_seq.is_none());
+        assert!(child.foreground_child);
+        assert!(!child.detach && !child.open && !child.ui);
     }
 
     #[test]
