@@ -4,10 +4,11 @@ These fixtures and the runner are prepared but **not run**. `memory.rope_yarn_fa
 experimental and has no retrieval receipt above 262,144 tokens yet. Runs above 57K on the Halo
 need Main's explicit OK. `niah.sh` refuses them unless `MAIN_OK_LONGCTX=1` is set.
 
-- `gen_niah_long.py TOKENIZER_JSON OUT_DIR` regenerates the three fixtures byte-identically; the
-  sha256 values are in `manifest.json`. It uses the format of
-  `benchmarks/longctx/niah/generate_niah_multi.py` (consumed by `scripts/serve_harness.py --niah-file`),
-  calibrated with the Qwen3.x tokenizer (`crates/hipfire-runtime/tests/fixtures/hf_tokenizer_corpus/tokenizer.json`).
+- `gen_niah_long.py TOKENIZER_JSON OUT_DIR` regenerates the three fixtures byte-identically. They are not
+  committed (4.4 MB). `manifest.json` pins each fixture's sha256, token count and needle offsets, plus the
+  tokenizer sha256. It uses the format of `benchmarks/longctx/niah/generate_niah_multi.py` (consumed by
+  `scripts/serve_harness.py --niah-file`), calibrated with the Qwen3.x tokenizer
+  (`crates/hipfire-runtime/tests/fixtures/hf_tokenizer_corpus/tokenizer.json`).
   Each fixture has four needles:
 
   | Fixture | Filler tokens | Needle token offsets | Needles past 262,144 |
