@@ -3,7 +3,7 @@
 //! Production-size two-bank transport gate. No HIP VMM export, no SYNC_BO.
 use npu_tools::coop_gpu;
 use pm_npu::kernels::{gemm_g80, w8a8_epi::bf16_direct};
-use railgun::npu::{clflush, trunk::{monotonic_ns, NpuTrunkRuntime, LayerPanels, PanelProgram, Shape, Seq, WAIT_TIMEOUT, CHAIN_WATCHDOG}};
+use railgun::npu::{clflush, trunk::{monotonic_ns, NpuTrunkRuntime, OpenOptions, LayerPanels, PanelProgram, Shape, Seq, WAIT_TIMEOUT, CHAIN_WATCHDOG}};
 use std::time::{Duration, Instant};
 const ROWS: usize = 8192;
 const K: usize = 2560;
@@ -51,7 +51,7 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
         panels.push(gemm_g80::pack_b_bf16(&design, &b, &scales));
     }
     let program = PanelProgram { shape, pdi: design.pdi.clone(), txn: design.insts.clone(), padded_rows: ROWS, pitch: shape.pitch() };
-    let runtime = at(None, "open-transport", NpuTrunkRuntime::open(vec![program], vec![LayerPanels { layer: 0, shape, panels }], 2, ROWS, pci))?;
+    let runtime = at(None, "open-transport", NpuTrunkRuntime::open_with_options(vec![program], vec![LayerPanels { layer: 0, shape, panels }], 2, ROWS, pci, OpenOptions { cpu_reads: true, ..OpenOptions::default() }))?;
     let outcome = (|| {
         let hip = runtime.hip();
         let layout = runtime.layout();
@@ -137,6 +137,11 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             let resume_ns = resume_latency_ns(anchor_ns, at(Some(round), "GPU-resume-time", hip.elapsed_ms(&anchor, &resumed))?, completion.done_ns);
             resumes.push(resume_ns as f64 / 1000.0);
             at(Some(round), "download-C", hip.download(&output, &mut observed))?;
+            // The oracle intentionally reads C's CPU alias; open opted into
+            // per-completion invalidation before terminal publication.
+            if unsafe { core::slice::from_raw_parts(cv.host, cv.len) } != &observed[..] {
+                return at(Some(round), "compare-C-alias", Err(format!("bank {bank}: GPU C/userptr alias mismatch")));
+            }
             // Also prove the entire GPU-written A aliases the anonymous pages.
             unsafe { clflush(av.host, av.len); }
             if unsafe { core::slice::from_raw_parts(av.host, av.len) } != &packed[..] {
@@ -206,9 +211,10 @@ fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Res
     // EXEC_CMD must return before its 1 ns deadline can be checked. This exercises
     // production watchdog cancellation, not an environment-dependent test shim.
     let panels = (0..shape.panels()).map(|_| vec![0; layout.b_bytes]).collect();
-    let runtime = at(None, "negative-timeout-open", NpuTrunkRuntime::open_with_watchdog(
+    let runtime = at(None, "negative-timeout-open", NpuTrunkRuntime::open_with_options(
         vec![PanelProgram { shape, pdi, txn, padded_rows: ROWS, pitch: shape.pitch() }],
-        vec![LayerPanels { layer: 0, shape, panels }], 1, ROWS, pci, Duration::from_nanos(1)))?;
+        vec![LayerPanels { layer: 0, shape, panels }], 1, ROWS, pci,
+        OpenOptions { watchdog: Duration::from_nanos(1), cpu_reads: true }))?;
     let outcome = (|| {
         let hip = runtime.hip();
         let stream = at(None, "negative-timeout-stream", hip.stream())?;

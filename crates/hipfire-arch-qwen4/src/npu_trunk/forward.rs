@@ -436,10 +436,11 @@ impl NpuForward {
         let map = self.shape_map(shape);
         targets.into_iter().filter(|(f,_)| self.families.contains(*f)).map(|(f,t)| map.gpu_output(f,t).map_err(Into::into)).collect()
     }
-    fn pack(&self, gpu: &mut Gpu, step: &Step<'_>, bank: usize, pipe: bool) -> Result<u64, Qwen4GpuForwardError> {
+    fn pack(&self, gpu: &mut Gpu, step: &Step<'_>, bank: usize, pipe: bool, prep_end: Option<&hip_bridge::Event>) -> Result<u64, Qwen4GpuForwardError> {
         let (input, rows, shape) = match step { Step::GatedDeltaNet(op) => (op.input,op.rows,Shape::GdnIn), Step::IndexedAttention(op) => (op.input,op.rows,Shape::QsaIn), _ => return Err(fail("pack expected mixer")) };
         let map = self.shape_map(shape);
         let x = gpu.rotate_x_mq_batched_f16(input,2560,rows)?;
+        if let Some(event) = prep_end { gpu.hip.event_record(event, gpu.active_stream.as_ref())?; }
         let pack_issue_ns=if pipe && self.trace.is_some() {monotonic_ns()}else{0};
         if pipe {
             let rt = self.runtime.as_ref().ok_or_else(|| fail("runtime missing"))?;
@@ -448,7 +449,7 @@ impl NpuForward {
         Ok(pack_issue_ns)
     }
     fn emulate(&self, gpu: &mut Gpu, layer: usize, step: &Step<'_>) -> Result<(), Qwen4GpuForwardError> {
-        self.pack(gpu, step, 0, false)?;
+        self.pack(gpu, step, 0, false, None)?;
         let qkv = self.qkv_view(gpu,step)?;
         let rows = match step { Step::GatedDeltaNet(op)=>op.rows, Step::IndexedAttention(op)=>op.rows, _=>unreachable!() };
         let outs = self.destinations(step,&qkv)?;
@@ -523,9 +524,30 @@ use railgun::npu::trunk::monotonic_ns;
 
 struct TraceRow {
     layer: usize, bank: usize, position: usize, rows: usize, seq: u32,
-    pack_issue_ns: u64, kick_ns: u64, submit_ns: u64, done_ns: u64,
+    pack_issue_ns: u64, kick_ns: u64, submit_ns: u64, done_ns: u64, signal_write_ns: u64,
     wait_enqueue_ns: u64, consume_issue_ns: u64,
     start: hip_bridge::Event, end: hip_bridge::Event,
+    prep_begin: hip_bridge::Event,
+    prep_end: hip_bridge::Event, pack_end: hip_bridge::Event,
+    wait_begin: hip_bridge::Event, wait_end: hip_bridge::Event,
+}
+/// Scalar JSONL schema, independent of HIP handles so CPU tests exercise the
+/// same serializer as the after-pair event resolver. Existing keys stay ordered.
+#[derive(Default, serde::Serialize)]
+struct TraceRecord {
+    layer: usize, bank: &'static str, position: usize, rows: usize, seq: u32,
+    pack_issue_ns: u64, kick_ns: u64, npu_submit_ns: u64, npu_done_ns: u64,
+    gpu_wait_enqueue_ns: u64, consume_issue_ns: u64,
+    mixer_start_ns: u64, mixer_end_ns: u64,
+    anchor_uncertainty_ns: u64,
+    prep_begin_ns: u64, prep_end_ns: u64, pack_end_ns: u64,
+    wait_begin_ns: u64, wait_end_ns: u64, signal_write_ns: u64,
+}
+impl TraceRecord {
+    fn write(&self, out: &mut impl Write) -> std::io::Result<()> {
+        serde_json::to_writer(&mut *out, self)?;
+        writeln!(out)
+    }
 }
 fn mixer_index(program: &layers::BankProgram<'_>, layer: usize) -> usize {
     program.ranges[layer].clone().find(|&i| matches!(program.steps[i],Step::GatedDeltaNet(_) | Step::IndexedAttention(_))).expect("typed layer has a mixer")
@@ -543,11 +565,14 @@ impl NpuForward {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref().expect("on runtime");
         let covered = self.layers[layer].map.panel_count() != 0;
+        if let Some(r) = records.get(layer*2+bank) {
+            gpu.hip.event_record(&r.prep_begin, gpu.active_stream.as_ref())?;
+        }
         if covered {
             unsafe { rt.prepare_bank(bank,stream(gpu)).map_err(fail)?; }
             if let Some(r) = records.iter_mut().take(layer*2).rev().find(|r| r.bank == bank && r.seq != 0 && r.done_ns == 0) {
                 let completion=rt.wait_host(Seq { bank, value:r.seq }).map_err(fail)?;
-                r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
+                r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns; r.signal_write_ns=completion.signal_write_ns;
             }
         }
         // Includes PLE (when present) and the attention HC read. Neither reads
@@ -562,8 +587,19 @@ impl NpuForward {
                 }
             }
         }
-        if !covered { return Ok(None); }
-        let pack_issue_ns=self.pack(gpu,&program.steps[index],bank,true)?;
+        let prep_end = records.get(layer*2+bank).map(|r| &r.prep_end);
+        if !covered {
+            if let Some(r) = records.get(layer*2+bank) {
+                for event in [&r.prep_end, &r.pack_end] {
+                    gpu.hip.event_record(event, gpu.active_stream.as_ref())?;
+                }
+            }
+            return Ok(None);
+        }
+        let pack_issue_ns=self.pack(gpu,&program.steps[index],bank,true,prep_end)?;
+        if let Some(r) = records.get(layer*2+bank) {
+            gpu.hip.event_record(&r.pack_end, gpu.active_stream.as_ref())?;
+        }
         let kick_ns=if records.is_empty(){0}else{monotonic_ns()};
         let seq=unsafe { rt.kick(layer,transport_shape(self.layers[layer].shape),bank,program.rows,stream(gpu)).map_err(fail)? };
         if !records.is_empty() {
@@ -575,11 +611,15 @@ impl NpuForward {
     fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, layer: usize, bank: usize, seq: Option<Seq>, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref().expect("on runtime");
+        if let Some(r) = records.get(layer*2+bank) {
+            gpu.hip.event_record(&r.wait_begin, gpu.active_stream.as_ref())?;
+        }
         if let Some(seq) = seq { unsafe { rt.wait_gpu(seq,stream(gpu)).map_err(fail)?; } }
         let wait_enqueue_ns=monotonic_ns();
         if !records.is_empty() {
             let r=&mut records[layer*2+bank];
             r.wait_enqueue_ns=wait_enqueue_ns; r.consume_issue_ns=0;
+            gpu.hip.event_record(&r.wait_end,gpu.active_stream.as_ref())?;
             gpu.hip.event_record(&r.start,gpu.active_stream.as_ref())?;
         }
         if seq.is_none() {
@@ -691,7 +731,7 @@ impl NpuForward {
             let after=monotonic_ns();
             anchor_ns=before+(after-before)/2; anchor_uncertainty_ns=after-before;
             for layer in 0..bundle.config.num_hidden_layers { for bank in 0..2 {
-                records.push(TraceRow { layer,bank,position:position+bank*8192,rows:rows[bank],seq:0,pack_issue_ns:0,kick_ns:0,submit_ns:0,done_ns:0,wait_enqueue_ns:0,consume_issue_ns:0,start:gpu.hip.event_create()?,end:gpu.hip.event_create()? });
+                records.push(TraceRow { layer,bank,position:position+bank*8192,rows:rows[bank],seq:0,pack_issue_ns:0,kick_ns:0,submit_ns:0,done_ns:0,signal_write_ns:0,wait_enqueue_ns:0,consume_issue_ns:0,prep_begin:gpu.hip.event_create()?,prep_end:gpu.hip.event_create()?,pack_end:gpu.hip.event_create()?,wait_begin:gpu.hip.event_create()?,wait_end:gpu.hip.event_create()?,start:gpu.hip.event_create()?,end:gpu.hip.event_create()? });
             }}
         }
         let attempt: Result<(),Qwen4GpuForwardError>=(|| {
@@ -732,7 +772,7 @@ impl NpuForward {
                 if let Some(seq) = last_seq[bank] {
                     let completion=rt.wait_host(seq).map_err(fail)?;
                     if let Some(r) = records.iter_mut().rev().find(|r| r.bank == bank && r.seq == seq.value) {
-                        r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns;
+                        r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns; r.signal_write_ns=completion.signal_write_ns;
                     }
                 }
             }
@@ -749,13 +789,25 @@ impl NpuForward {
                 for r in &records {
                     let start_ns=anchor_ns+(gpu.hip.event_elapsed_ms(anchor,&r.start)? as f64*1e6) as u64;
                     let end_ns=anchor_ns+(gpu.hip.event_elapsed_ms(anchor,&r.end)? as f64*1e6) as u64;
-                    writeln!(out,"{{\"layer\":{},\"bank\":\"{}\",\"position\":{},\"rows\":{},\"seq\":{},\"pack_issue_ns\":{},\"kick_ns\":{},\"npu_submit_ns\":{},\"npu_done_ns\":{},\"gpu_wait_enqueue_ns\":{},\"consume_issue_ns\":{},\"mixer_start_ns\":{},\"mixer_end_ns\":{},\"anchor_uncertainty_ns\":{}}}",r.layer,if r.bank==0{"A"}else{"B"},r.position,r.rows,r.seq,r.pack_issue_ns,r.kick_ns,r.submit_ns,r.done_ns,r.wait_enqueue_ns,r.consume_issue_ns,start_ns,end_ns,anchor_uncertainty_ns).map_err(fail)?;
+                    let stamp = |event| -> Result<u64, hip_bridge::HipError> {
+                        Ok(anchor_ns+(gpu.hip.event_elapsed_ms(anchor,event)? as f64*1e6) as u64)
+                    };
+                    TraceRecord {
+                        layer:r.layer, bank:if r.bank==0{"A"}else{"B"}, position:r.position, rows:r.rows, seq:r.seq,
+                        pack_issue_ns:r.pack_issue_ns, kick_ns:r.kick_ns, npu_submit_ns:r.submit_ns, npu_done_ns:r.done_ns,
+                        gpu_wait_enqueue_ns:r.wait_enqueue_ns, consume_issue_ns:r.consume_issue_ns,
+                        mixer_start_ns:start_ns, mixer_end_ns:end_ns, anchor_uncertainty_ns,
+                        prep_begin_ns:stamp(&r.prep_begin)?, prep_end_ns:stamp(&r.prep_end)?, pack_end_ns:stamp(&r.pack_end)?,
+                        wait_begin_ns:stamp(&r.wait_begin)?, wait_end_ns:stamp(&r.wait_end)?, signal_write_ns:r.signal_write_ns,
+                    }.write(out).map_err(fail)?;
                 }
                 out.flush().map_err(fail)?;
             }
             Ok(())
         });
-        for r in records { let _=gpu.hip.event_destroy(r.start); let _=gpu.hip.event_destroy(r.end); }
+        for r in records {
+            for event in [r.prep_begin,r.prep_end,r.pack_end,r.wait_begin,r.wait_end,r.start,r.end] { let _=gpu.hip.event_destroy(event); }
+        }
         if let Some(anchor)=anchor { let _=gpu.hip.event_destroy(anchor); }
         bundle.pair_session_stage = stage;
         attempt?;
@@ -835,6 +887,25 @@ pub(super) fn pair_rows(remaining: usize, chunk: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn trace_jsonl_preserves_schema_and_adds_fine_timestamps() {
+        let record = TraceRecord { layer:3, bank:"B", rows:512, seq:7, prep_begin_ns:11,
+            prep_end_ns:12, pack_end_ns:13, wait_begin_ns:14, wait_end_ns:17,
+            signal_write_ns:16, ..Default::default() };
+        let mut bytes = Vec::new();
+        record.write(&mut bytes).unwrap();
+        assert_eq!(bytes.iter().filter(|&&b| b==b'\n').count(), 1);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let fields = ["layer","bank","position","rows","seq","pack_issue_ns","kick_ns",
+            "npu_submit_ns","npu_done_ns","gpu_wait_enqueue_ns","consume_issue_ns",
+            "mixer_start_ns","mixer_end_ns","anchor_uncertainty_ns",
+            "prep_begin_ns","prep_end_ns","pack_end_ns","wait_begin_ns","wait_end_ns","signal_write_ns"];
+        assert_eq!(json.as_object().unwrap().len(), fields.len());
+        for key in fields { assert!(json.get(key).is_some(), "{key}"); }
+        assert_eq!(json["bank"], "B");
+        assert_eq!(json["prep_begin_ns"], 11);
+        assert_eq!(json["wait_end_ns"], 17);
+        assert_eq!(json["signal_write_ns"], 16);
+    }
     #[test] fn every_mask_selects_only_covered_family_views() {
         for bits in 0..=u8::MAX {
             let mask = FamilyMask::from_bits(bits);

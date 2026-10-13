@@ -770,6 +770,13 @@ append one JSON object per `(layer,bank)` with `position`, real live `rows`, `se
 `pack_issue_ns`, `kick_ns`, `npu_submit_ns`, `npu_done_ns`,
 `gpu_wait_enqueue_ns`, `consume_issue_ns`, `mixer_start_ns`, `mixer_end_ns`
 and `anchor_uncertainty_ns`. Host/relay timestamps use Linux CLOCK_MONOTONIC.
+Fine fields `prep_begin_ns`, `prep_end_ns`, `pack_end_ns`, `wait_begin_ns`,
+`wait_end_ns`, and `signal_write_ns` separate GPU HC/PLE/rotation preparation,
+packing, the device wait plus system acquire, and relay terminal publication.
+`prep_end_ns` follows rotation and precedes packing; `pack_end_ns` follows the
+pack kernel. `signal_write_ns` is sampled after the terminal store and its 64-B
+CLFLUSH. All GPU timestamps are after-pair HIP event resolutions, not CPU issue
+times. The same-stream pipeline and its bank/snapshot ordering are unchanged.
 `consume_issue_ns` is retained for trace compatibility and is always zero.
 The mixer interval covers the complete `G` fragment, including HC/MoE.
 HIP timing events are resolved only after the pair, relative to a monotonic

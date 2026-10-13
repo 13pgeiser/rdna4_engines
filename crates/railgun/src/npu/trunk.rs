@@ -62,6 +62,8 @@ pub struct Completion {
     pub npu_busy: Duration,
     pub submit_ns: u64,
     pub done_ns: u64,
+    /// CLOCK_MONOTONIC immediately after publishing/flushing the terminal word.
+    pub signal_write_ns: u64,
 }
 
 /// Linux CLOCK_MONOTONIC timestamp shared by relay and forward trace.
@@ -126,23 +128,25 @@ impl Shared {
     }
     // First terminal result wins: shutdown cannot be overwritten by a late
     // successful timeline observation. Record failure BEFORE releasing the GPU.
-    fn finish(&self, seq: Seq, result: Result<Completion, String>) {
+    fn finish(&self, seq: Seq, mut result: Result<Completion, String>) {
         let mut status = self.status.lock();
         let Some(p) = status.pending.get(seq.bank) else { return; };
         if p.value != seq.value || p.result.is_some() { return; }
         if let Err(e) = &result {
             if status.failure.is_none() { status.failure = Some(format!("trunk {seq:?}: {e}")); }
         }
+        let signal_write_ns = self.publish(seq);
+        if let Ok(completion) = &mut result { completion.signal_write_ns = signal_write_ns; }
         status.pending[seq.bank].result = Some(result);
-        self.publish(seq);
         self.changed.notify_all();
     }
-    fn publish(&self, seq: Seq) {
+    fn publish(&self, seq: Seq) -> u64 {
         // No generation wrap or skipped reuse: both success and failure are
         // terminal for this generation. The registered coherent line is alive
         // until the relay has joined and all queued GPU consumers have retired.
         let done = self.signals[seq.bank] as *mut AtomicU32;
         unsafe { (*done).store(seq.value, Ordering::Release); super::clflush(done.cast(), 64); }
+        monotonic_ns()
     }
     fn stop(&self, reason: &str) {
         let mut status = self.status.lock();
@@ -168,6 +172,22 @@ impl Watchdog {
 }
 struct BankState { generation: u32, kicked: bool, retired: bool, prepared: bool }
 
+/// Explicit diagnostic access and chain watchdog; production never touches
+/// A/C from the CPU after open. CPU oracle users must opt into arena invalidation.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenOptions {
+    pub watchdog: Duration,
+    pub cpu_reads: bool,
+}
+impl Default for OpenOptions {
+    fn default() -> Self { Self { watchdog: CHAIN_WATCHDOG, cpu_reads: false } }
+}
+impl OpenOptions {
+    fn flush_for_cpu_reads(self, flush: impl FnOnce()) {
+        if self.cpu_reads { flush(); }
+    }
+}
+
 /// Async kick and enqueue-ahead GPU rejoin, with terminal failure signalling.
 /// No rows/addresses/commands are patched per kick; padded A MUST be zeroed.
 pub struct NpuTrunkRuntime {
@@ -187,13 +207,12 @@ impl NpuTrunkRuntime {
     /// Uses the existing dlopen HIP backend, without a link-time ROCm dependency
     /// or a second GPU runtime crate. pci identifies the same GPU as producer.
     pub fn open(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str) -> Result<Self, String> {
-        Self::open_with_watchdog(programs, layers, banks, rows_max, pci, CHAIN_WATCHDOG)
+        Self::open_with_options(programs, layers, banks, rows_max, pci, OpenOptions::default())
     }
-    /// Override the chain-only watchdog for a different measured chain envelope.
-    /// The transport gate uses a 1 ns budget to force the real timeout path;
-    /// there are no production environment flags or injected success/failure hooks.
-    pub fn open_with_watchdog(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str, watchdog: Duration) -> Result<Self, String> {
-        if watchdog.is_zero() || watchdog > WAIT_TIMEOUT { return Err("chain watchdog outside (0, WAIT_TIMEOUT]".into()); }
+    /// CPU oracle access requires `cpu_reads`; a 1 ns watchdog forces the real
+    /// timeout path in the transport gate without a production environment flag.
+    pub fn open_with_options(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str, options: OpenOptions) -> Result<Self, String> {
+        if options.watchdog.is_zero() || options.watchdog > WAIT_TIMEOUT { return Err("chain watchdog outside (0, WAIT_TIMEOUT]".into()); }
         let mut layout = ArenaLayout::new(rows_max)?;
         layout.pitches = [0; 2];
         if banks == 0 { return Err("trunk needs at least one bank".into()); }
@@ -241,7 +260,7 @@ impl NpuTrunkRuntime {
         let (init_tx, init_rx) = mpsc::sync_channel(1);
         let relay_shared = Arc::clone(&shared);
         let relay = thread::Builder::new().name("npu-trunk-relay".into()).spawn(move || {
-            relay_main(programs, layers, pages, api, layout, rx, init_tx, relay_shared, watchdog);
+            relay_main(programs, layers, pages, api, layout, rx, init_tx, relay_shared, options);
         }).map_err(|e| format!("spawn trunk relay: {e}"))?;
         // Construct the teardown guard before receiving: all early returns join
         // the relay (contexts/BOs) before unregistering/unmapping caller pages.
@@ -410,7 +429,7 @@ fn prepared_panel(dev: &Device, insts: &Bo, a: &Bo, b: &Bo, c: &Bo, c_offset: us
     Ok(command)
 }
 fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<BankPages>, api: RelayApi, layout: ArenaLayout,
-    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<[Binding; 3]>, String>>, shared: Arc<Shared>, watchdog: Duration) {
+    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<[Binding; 3]>, String>>, shared: Arc<Shared>, options: OpenOptions) {
     let dev = match Device::open().and_then(|mut d| { d.map_heap(64 << 20)?; Ok(d) }) {
         Ok(d) => d, Err(e) => { let _ = init.send(Err(e)); return; }
     };
@@ -447,6 +466,10 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
                 r.chains.push(Chain::new(&dev, &refs)?);
             }
         }
+        // Anonymous pages start zeroed; registrations/userptr setup is complete.
+        // Evict any initialization lines once, before handing arenas to devices.
+        // Production CPU code never accesses A/C again.
+        for arena in r.a.iter().chain(&r.c) { arena.flush(); }
         Ok::<_, String>((r, bindings))
     })();
     let (resources, bindings) = match setup { Ok(r) => r, Err(e) => { let _ = init.send(Err(e)); return; } };
@@ -468,12 +491,14 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
                 if api.query(job.event)? { break; }
                 thread::sleep(Duration::from_micros(20));
             }
-            // HIP system event released GPU writes. Invalidate CPU aliases
-            // before DMA; no SYNC_BO (especially not on imported BOs).
-            resources.a[job.seq.bank].flush();
+            // GPU system release makes A writes visible to NPU DMA in DRAM.
+            // Production has no CPU A lines after the open-time flush; only the
+            // diagnostic oracle can have cached aliases. Never SYNC_BO.
+            options.flush_for_cpu_reads(|| resources.a[job.seq.bank].flush());
             let layer = layers.iter().position(|l| l.layer == job.layer && l.shape == job.shape).ok_or("unknown relay layer")?;
             let chain = &resources.chains[layer * pages.len() + job.seq.bank];
             let start = Instant::now();
+            let watchdog = options.watchdog;
             let chain_watchdog = Watchdog::new(start, watchdog);
             let submit_ns = monotonic_ns();
             let point = resources.ctx.submit_chain(chain)?;
@@ -484,10 +509,11 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             chain_watchdog.remaining(Instant::now())?;
             let npu_busy = start.elapsed();
             if state != ERT_STATE_COMPLETED { return Err(format!("NPU chain state {state}, error index {}", chain.error_index())); }
-            // Transaction tail synchronizes every C channel before timeline done.
-            // Flush CPU aliases before the terminal signal/system acquire event.
-            resources.c[job.seq.bank * 2 + job.shape.index()].flush();
-            Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns })
+            // The transaction tail synchronizes all NPU C DMA writes to DRAM.
+            // GPU consumers wait on the terminal word then system-acquire; CPU
+            // caches hold no C lines in production after the open-time flush.
+            options.flush_for_cpu_reads(|| resources.c[job.seq.bank * 2 + job.shape.index()].flush());
+            Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns, signal_write_ns: 0 })
         })();
         if let Err(e) = &result { fatal = Some(e.clone()); }
         shared.finish(job.seq, result);
@@ -498,6 +524,18 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn arena_flush_policy_keeps_production_device_only() {
+        for cpu_reads in [false, true] {
+            let options = OpenOptions { cpu_reads, ..OpenOptions::default() };
+            let mut flushes = 0;
+            for _ in 0..20 {
+                options.flush_for_cpu_reads(|| flushes += 1); // A before submit
+                options.flush_for_cpu_reads(|| flushes += 1); // C after completion
+            }
+            assert_eq!(flushes, if cpu_reads { 40 } else { 0 });
+        }
+        assert!(!OpenOptions::default().cpu_reads);
+    }
     #[test] fn compacted_qkv_arena_has_eight_panel_windows() {
         let mut l = ArenaLayout::new(8192).unwrap();
         l.pitches = [10240, 0];
@@ -547,7 +585,7 @@ mod tests {
         }), changed: Condvar::new(), signals: signals.iter().map(|s| &s.0 as *const AtomicU32 as usize).collect() }
     }
     fn completion() -> Completion {
-        Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO, submit_ns: 1, done_ns: 2 }
+        Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO, submit_ns: 1, done_ns: 2, signal_write_ns: 0 }
     }
     #[test] fn invalid_timeout_and_failed_sequences_are_bounded() {
         let signals = [Signal(AtomicU32::new(2))];
@@ -572,6 +610,7 @@ mod tests {
         assert_eq!(signals[0].0.load(Ordering::Acquire), 0);
         pending.finish(seq, Ok(completion()));
         assert_eq!(pending.wait(seq, Duration::ZERO).unwrap().done_ns, 2);
+        assert!(pending.wait(seq, Duration::ZERO).unwrap().signal_write_ns >= 2);
         pending.status.lock().pending[0] = Pending { value: 2, result: None };
         pending.finish(seq, Err("stale".into()));
         assert_eq!(signals[0].0.load(Ordering::Acquire), 1);

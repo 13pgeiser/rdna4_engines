@@ -246,6 +246,22 @@ timing-only fence suppression. CPU CLFLUSH does **not** replace the GPU boundary
 The memory class is anonymous pages + amdxdna userptr + default coherent hipHostRegister:
 never exported HIP VMM (snapshot-only), never imported-BO SYNC_BO.
 
+A and C are flushed **once at open**, after anonymous-page initialization and
+registration/userptr setup. In production the CPU never reads or writes either
+arena after that flush, so it holds no arena cache lines. GPU system release
+publishes A writes to DRAM before the relay submits NPU DMA reads. NPU DMA writes
+C to DRAM; the transaction tail completes all C channels before timeline done.
+The GPU alone consumes C, through registered memory after the terminal device
+wait and system acquire. Thus per-chain A/C CLFLUSH is unnecessary in production;
+it cannot replace either GPU fence. The terminal signal's release store and
+64-B CLFLUSH remain on every completion.
+
+`NpuTrunkRuntime::open_with_options` explicitly opts CPU oracle users into
+`OpenOptions { cpu_reads: true, ..Default::default() }`: A is flushed before
+submit and C after completion, before publishing the terminal word. The
+transport gate uses this option and compares both CPU arena aliases against the
+GPU-produced/downloaded bytes. Production `open` defaults to device-only access.
+
 Hardware gate (parent runs on Halo): `target/release/npu-trunk-transport --pci 0000:c0:00.0`.
 It uses default shim AXI, two production-size banks, GPU shader copies of CPU-packed A,
 and both row-major shapes (13 GDN / 11 QSA panels), 20 alternating rounds each.
