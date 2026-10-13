@@ -73,6 +73,14 @@ fn owner_mask_preserves_owned_and_skips_unowned() -> Result<()> {
             let ids:Vec<i32>=bytes(&g,&tiles,p/16*4)?.chunks_exact(4).map(|b|i32::from_le_bytes(b.try_into().unwrap())).collect();
             assert!(ids.iter().any(|&e|e>=0 && e%2==0));assert!(ids.iter().any(|&e|e>=0 && e%2==1));
             let owned=g.upload_raw(&ints(ids.iter().map(|&e|if e>=0 && e%2==0 {e}else{-1})),&[p/16])?;
+            // S1: the production PM mask kernel (owner table `e % 2`, rank 0) must equal the host mask word for word, and its copy is what the GEMMs below read.
+            let owner=g.upload_raw(&ints((0..E).map(|e|(e%2) as i32)),&[E])?;
+            let owned_pm=raw(&mut g,p/16*4)?;g.hip.memset(&owned_pm.buf,0x5a,p/16*4)?;
+            g.ep_tile_mask(&tiles,&owned_pm,&owner,p/16,E,0)?;g.hip.device_synchronize()?;
+            let (host_owned,pm_owned,source_after)=(bytes(&g,&owned,p/16*4)?,bytes(&g,&owned_pm,p/16*4)?,bytes(&g,&tiles,p/16*4)?);
+            let mask_bad=host_owned.chunks_exact(4).zip(pm_owned.chunks_exact(4)).filter(|(a,b)|a!=b).count()+source_after.chunks_exact(4).zip(ids.iter()).filter(|(a,&e)|i32::from_le_bytes((*a).try_into().unwrap())!=e).count();
+            println!("M0_PM_MASK rows={n} layer={layer} tiles={} mismatching_u32={mask_bad}",p/16);failures+=mask_bad;
+            let owned=owned_pm;
             let ygu=raw(&mut g,p*I*2)?;let ydn=raw(&mut g,p*H*2)?;
             for nt in [1,4,8] {
                 let mut reference=Vec::new();
