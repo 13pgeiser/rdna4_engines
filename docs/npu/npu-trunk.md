@@ -681,12 +681,18 @@ without patching the program, and all arena readers use only those live rows.
 All GPU layer operations, router views, PLE staging, capture/MTP rows and
 head work use the bank's real row count. Bank B's output offsets remain
 8192, not its own row count.
-Before building a partial B program, every bank-B tensor's logical extent is
-rebound from the existing `Full` scratch plan for its live rows. This includes
-grouped MoE, router and PLE staging/output fields; exact-size kernels never
-receive the 8192-row logical tensor for a shorter bank. Allocation capacities
-and ownership slots remain unchanged, with no GPU allocation/copy; a later
-pair can rebind back to 8192. CPU coverage includes 8151 and 512 rows.
+Before building a partial B program, row-checked bank-B extents are rebound
+from the existing `Full` plan for live rows (including grouped MoE, router,
+PLE staging/output). Four dedicated native padding buffers—HcMixed, GdnZ,
+GdnA and GdnB—retain their original max-chunk logical capacities, exactly as
+sequential `off`/`emulate` prefill. Mixer operations still pass live rows:
+8192/512 take dense IU4 when admitted; 8151 takes the same padded ragged IU4
+route (or the same native fallback when ragged is disabled) in both modes.
+The pair and sequential forward share the native prefill-scope gate and
+restore it on success/error. Padded input clearing touches private HcMixed;
+shared z/a/b outputs are produced and consumed only inside one GPU fragment,
+never across prepare. Allocation/ownership stay unchanged, with no extra
+allocation/copy. CPU coverage pins decisions and extents at 8192, 8151 and 512.
 
 Bank A starts at the request's current position; B starts at position+8192.
 Each bank-B QSA view is advanced using bank A's exact `next_lengths()` tuple

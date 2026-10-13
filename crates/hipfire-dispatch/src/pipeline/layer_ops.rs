@@ -4589,6 +4589,13 @@ mod trunk_arena_dispatch_tests {
     use super::*;
 
     #[test]
+    fn trunk_projection_route_geometry_uses_live_rows() {
+        for (rows, dense, ragged) in [(8192, true, None), (8151, false, Some(8192)), (512, true, None)] {
+            assert_eq!(rdna_compute::gemm::qwen4_trunk_iu4_dense_rows(rows), dense);
+            assert_eq!(rdna_compute::gemm::qwen4_trunk_iu4_ragged_rows(rows), ragged);
+        }
+    }
+    #[test]
     fn partial_views_preserve_native_sources_per_family() {
         let tensor = GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::dangling_mut(), 256 * 10240 * 2) },

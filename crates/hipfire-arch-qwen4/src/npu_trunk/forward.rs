@@ -83,14 +83,23 @@ fn bind_bank_extents(tensors: &mut [&mut GpuTensor], slots: &[ScratchSlot]) -> R
     Ok(())
 }
 
+fn preserve_native_projection_capacity(live: &mut [ScratchSlot], capacity: &[ScratchSlot]) {
+    // The native ragged producer pads only these four dedicated buffers.
+    // Eligibility must see the same max_chunk capacity as sequential prefill;
+    // mixer/kernel row counts stay the live rows, never the padded capacity.
+    for field in [ScratchField::HcMixed, ScratchField::GdnZ, ScratchField::GdnA, ScratchField::GdnB] {
+        live[field as usize].elements = capacity[field as usize].elements;
+    }
+}
+
 fn bind_bank_rows(s: &mut Qwen4GpuForwardScratch, config: &Qwen4Config, rows: usize) -> Result<(), Qwen4GpuForwardError> {
     if s.mode != Qwen4ForwardScratchMode::Full || rows == 0 || rows > s.max_chunk {
         return Err(fail("bank live views require full scratch within its row capacity"));
     }
-    let (slots, _) = Qwen4GpuForwardScratch::plan(config, rows, Qwen4ForwardScratchMode::Full)?;
-    // ScratchField order, identical to the existing allocation/free tables.
-    // Every row-checked binding (including PLE staging and grouped MoE) receives
-    // the same live-row plan, rather than selectively narrowing one failing field.
+    let (mut slots, _) = Qwen4GpuForwardScratch::plan(config, rows, Qwen4ForwardScratchMode::Full)?;
+    preserve_native_projection_capacity(&mut slots, &s.slots);
+    // Other row-checked bindings (including PLE and grouped MoE) use live rows.
+    // ScratchField order is identical to the existing allocation/free tables.
     bind_bank_extents(&mut [
         &mut s.token_ids, &mut s.embedding_rot, &mut s.embeddings, &mut s.streams,
         &mut s.hc_normalized, &mut s.hc_low, &mut s.hc_up, &mut s.hc_mixed, &mut s.hc_gates,
@@ -557,8 +566,13 @@ impl NpuForward {
         let old_scope=std::mem::replace(&mut gpu.qwen4_scope,true);
         let invariant=owner.prefill_scope && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled();
         let old_invariant=std::mem::replace(&mut gpu.prefill_invariant_scope,invariant);
+        let ragged_scope = native_trunk_prefill_scope(
+            owner.prefill_scope, gpu.qwen4_trunk_iu4, &gpu.arch, owner.scratch.mode,
+        );
+        let old_ragged = std::mem::replace(&mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope);
         let result=self.pair_scoped(owner,bundle,gpu,tokens,logits,top1,capture,output);
         gpu.qwen4_scope=old_scope; gpu.prefill_invariant_scope=old_invariant;
+        gpu.qwen4_trunk_iu4_prefill_scope = old_ragged;
         if result.is_err() { bundle.state.invalidate_f16_arenas(); }
         result
     }
@@ -798,7 +812,8 @@ mod tests {
             shape: vec![slot.elements], dtype: slot.dtype,
         }).collect();
         for rows in [8151, 512, 8192] {
-            let (live, _) = Qwen4GpuForwardScratch::plan(&config, rows, Qwen4ForwardScratchMode::Full).unwrap();
+            let (mut live, _) = Qwen4GpuForwardScratch::plan(&config, rows, Qwen4ForwardScratchMode::Full).unwrap();
+            preserve_native_projection_capacity(&mut live, &capacity);
             bind_bank_extents(&mut bank.iter_mut().collect::<Vec<_>>(), &live).unwrap();
             for (field, (tensor, slot)) in bank.iter().zip(&live).enumerate() {
                 assert_eq!(tensor.numel(), slot.elements, "field {field} rows {rows}");
@@ -812,6 +827,29 @@ mod tests {
             assert_eq!(at(ScratchField::MoeTopkIndices).numel(), rows * config.num_experts_per_tok * 4);
             assert_eq!(at(ScratchField::MoeYGateUpGrouped).numel(), live[ScratchField::MoeYGateUpGrouped as usize].elements);
             assert_eq!(f32_view(at(ScratchField::Streams), 0, rows * dims.wide()).numel(), rows * dims.wide());
+            for field in [ScratchField::HcMixed, ScratchField::GdnZ, ScratchField::GdnA, ScratchField::GdnB] {
+                assert_eq!(at(field).numel(), capacity[field as usize].elements);
+            }
+        }
+    }
+    #[test] fn native_trunk_bank_decisions_use_live_rows_and_sequential_capacity() {
+        let config = crate::config::compact_test_config();
+        let (capacity, _) = Qwen4GpuForwardScratch::plan(&config, 8192, Qwen4ForwardScratchMode::Full).unwrap();
+        assert!(native_trunk_prefill_scope(true, true, "gfx1151", Qwen4ForwardScratchMode::Full));
+        assert!(!native_trunk_prefill_scope(false, true, "gfx1151", Qwen4ForwardScratchMode::Full));
+        assert!(!native_trunk_prefill_scope(true, true, "gfx1151", Qwen4ForwardScratchMode::FnSymGfx1201));
+        for rows in [8192, 8151, 512] {
+            let (mut live, _) = Qwen4GpuForwardScratch::plan(&config, rows, Qwen4ForwardScratchMode::Full).unwrap();
+            preserve_native_projection_capacity(&mut live, &capacity);
+            let padded = rdna_compute::gemm::qwen4_trunk_iu4_ragged_rows(rows);
+            assert_eq!(padded, (rows == 8151).then_some(8192));
+            for (field, width) in [(ScratchField::HcMixed, config.hidden_size),
+                (ScratchField::GdnZ, config.linear_num_value_heads * config.linear_value_head_dim),
+                (ScratchField::GdnA, config.linear_num_value_heads), (ScratchField::GdnB, config.linear_num_value_heads)] {
+                let padded = padded.unwrap_or(rows);
+                assert!(live[field as usize].elements >= padded * width);
+                assert_eq!(live[field as usize].elements, capacity[field as usize].elements);
+            }
         }
     }
     #[test] fn covered_phases_skip_all_native_projection_routes() {

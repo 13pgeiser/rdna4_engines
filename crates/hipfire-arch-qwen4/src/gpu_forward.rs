@@ -138,6 +138,11 @@ pub enum Qwen4ForwardScratchMode {
     FnSymGfx1201,
 }
 
+/// Identical native trunk padding scope for sequential and paired prefill.
+fn native_trunk_prefill_scope(prefill: bool, iu4: bool, arch: &str, mode: Qwen4ForwardScratchMode) -> bool {
+    prefill && iu4 && arch == "gfx1151" && mode == Qwen4ForwardScratchMode::Full
+}
+
 /// Rows the `FnSymGfx1201` plan sizes the F32 fallback MoE buffers for.  A
 /// larger MoE invocation that is not on the symmetric IU4 route has no buffer
 /// to run in; dispatch refuses it before its first launch.
@@ -4713,9 +4718,9 @@ impl Qwen4GpuForward {
         // rows (plan allocations at 2677/2682/2683/2688). Only [0,n)
         // contains live tokens. Compact scratch may alias live fields: never
         // arm its in-place padding, even if a facade appears large enough.
-        let ragged_scope = self.prefill_scope && gpu.qwen4_trunk_iu4
-            && gpu.arch == "gfx1151"
-            && self.scratch.mode != Qwen4ForwardScratchMode::FnSymGfx1201;
+        let ragged_scope = native_trunk_prefill_scope(
+            self.prefill_scope, gpu.qwen4_trunk_iu4, &gpu.arch, self.scratch.mode,
+        );
         let prior_ragged = std::mem::replace(
             &mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope,
         );

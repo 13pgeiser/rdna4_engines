@@ -46280,6 +46280,10 @@ static QWEN4_TRUNK_IU4_RAGGED: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_IU4_RAGGED").as_deref() != Ok("0")
 });
 
+/// Dense eligibility uses live rows, never a tensor's allocation capacity.
+pub fn qwen4_trunk_iu4_dense_rows(rows: usize) -> bool {
+    rows >= QWEN4_F16_WMMA_MIN_TOKENS && rows % 128 == 0
+}
 /// Padded V2B row count for ragged prefill; aligned chunks keep their old route.
 pub fn qwen4_trunk_iu4_ragged_rows(rows: usize) -> Option<usize> {
     (rows >= QWEN4_F16_WMMA_MIN_TOKENS && rows % 128 != 0)
@@ -46337,8 +46341,7 @@ impl Gpu {
     pub fn qwen4_trunk_iu4_applies(&self, rows: usize) -> bool {
         self.qwen4_trunk_iu4
             && !self.prefill_invariant_scope
-            && rows >= QWEN4_F16_WMMA_MIN_TOKENS
-            && rows % 128 == 0
+            && qwen4_trunk_iu4_dense_rows(rows)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
     }
