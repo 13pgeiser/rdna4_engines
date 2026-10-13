@@ -24,7 +24,7 @@ pub use plan::{
     alpha_extra, bank_segments, crossover, gpu_chunk, load_log_line, npu_ms, pair_time, plan,
     request_log_line, select_families, BankSegments, GpuChunk, LoadLogKey, PairTime, Plan,
     SelectionReport, SelectionRow, Step, CHUNK, SELECTION_ROWS,
-    auto_admission, executable_plan, planned_pair_rows,
+    auto_admission, executable_plan, planned_pair, planned_pair_rows,
 };
 pub use config::{NpuTrunkMode, NPU_TRUNK_DAEMON_KEY, NPU_TRUNK_ENV};
 pub use packing::{

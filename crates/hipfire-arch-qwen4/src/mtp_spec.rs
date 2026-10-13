@@ -567,12 +567,19 @@ impl SpecTarget for Qwen4Bundle {
             } else {(tokens.len()-offset).min(max_chunk)};
             let end=offset+rows;
             let covered=self.npu_trunk_planned() && rows>max_chunk;
-            if covered {self.note_npu_trunk_pair(rows,start_pos+offset);}
-            if covered && !self.npu_trunk_pipelined() {
-                // One numerical-twin bank at a time; hidden capacity stays at
-                // max_chunk. Uncovered advances retain the incumbent route.
-                for bank in (offset..end).step_by(max_chunk) {
-                    let bank_end=(bank+max_chunk).min(end);
+            // The pair's banks and its interior session snapshot row.
+            let shape=if covered {
+                Some(self.npu_trunk_pair_shape(start_pos+offset,tokens.len()-offset,max_chunk)
+                    .filter(|shape|shape.total()==rows)
+                    .ok_or_else(||"Qwen4 npu-trunk: scheduled pair group has no matching plan".to_string())?)
+            } else {None};
+            if let Some(shape)=&shape {self.note_npu_trunk_pair(shape.rows,start_pos+offset);}
+            if let (Some(shape),false)=(&shape,self.npu_trunk_pipelined()) {
+                // One numerical-twin chunk at a time (the banks, split at the
+                // snapshot row); hidden capacity stays at max_chunk. Uncovered
+                // advances retain the incumbent route.
+                for piece in shape.pieces() {
+                    let (bank,bank_end)=(offset+piece.start,offset+piece.end);
                     self.set_ple_lookahead(&tokens[bank_end..]);
                     let pick=self.with_npu_trunk_coverage(true,|bundle| {
                         if bank_end==tokens.len() {
@@ -3792,32 +3799,40 @@ pub(crate) fn mtp_prefill_chunk(
 ) -> Result<Option<u32>, String> {
     let max_chunk=bundle.spec_chunk_rows().unwrap_or(1).max(1);
     let paired=bundle.npu_trunk_planned() && chunk.len()>max_chunk;
-    if paired {bundle.note_npu_trunk_pair(chunk.len(),pos);}
-    if paired && !bundle.npu_trunk_pipelined() {
+    // The pair's banks and its interior snapshot row; the head appends, like the
+    // numerical twin's chunks, follow the same banks and cut.
+    let shape=if paired {
+        Some(bundle.npu_trunk_pair_shape(pos,chunk.len(),max_chunk).filter(|shape|shape.total()==chunk.len())
+            .ok_or_else(||"Qwen4 npu-trunk: scheduled pair group has no matching plan".to_string())?)
+    } else {None};
+    if let Some(shape)=&shape {bundle.note_npu_trunk_pair(shape.rows,pos);}
+    if let (Some(shape),false)=(&shape,bundle.npu_trunk_pipelined()) {
         let mut pick=None;
-        for (bank,tokens) in chunk.chunks(max_chunk).enumerate() {
-            let final_bank=(bank+1)*max_chunk>=chunk.len();
+        for piece in shape.pieces() {
+            let tokens=&chunk[piece.clone()];
+            let final_bank=piece.end==chunk.len();
             let bank_pick=bundle.with_npu_trunk_coverage(true,|bundle| {
                 mtp_prefill_target(bundle,gpu,tokens,needs_pick && final_bank)
             })?;
             if bank_pick.is_some() {pick=bank_pick;}
-            mtp_append_prefill_chunk(bundle,gpu,tokens,pos+bank*max_chunk,0,pending,
+            mtp_append_prefill_chunk(bundle,gpu,tokens,pos+piece.start,0,pending,
                 append_scratch.as_deref_mut(),reuse_trunk_ids,abort)?;
             if !final_bank {
-                bundle.publish_pair_session_boundary(gpu, pos + max_chunk).map_err(|e| e.to_string())?;
+                bundle.publish_pair_session_boundary(gpu, pos + piece.end).map_err(|e| e.to_string())?;
             }
         }
         return Ok(pick);
     }
     let pick=mtp_prefill_target(bundle,gpu,chunk,needs_pick)?;
-    if paired {
+    if let Some(shape)=&shape {
         // The target captured both banks together, but head append boundaries,
         // prompt-id uploads and pending rows remain those of the sequential run.
-        for (bank,tokens) in chunk.chunks(max_chunk).enumerate() {
-            mtp_append_prefill_chunk(bundle,gpu,tokens,pos+bank*max_chunk,bank*max_chunk,
+        for piece in shape.pieces() {
+            let tokens=&chunk[piece.clone()];
+            mtp_append_prefill_chunk(bundle,gpu,tokens,pos+piece.start,piece.start,
                 pending,append_scratch.as_deref_mut(),false,abort)?;
-            if bank == 0 {
-                bundle.publish_pair_session_boundary(gpu, pos + max_chunk).map_err(|e| e.to_string())?;
+            if piece.end<chunk.len() {
+                bundle.publish_pair_session_boundary(gpu, pos + piece.end).map_err(|e| e.to_string())?;
             }
         }
     } else {

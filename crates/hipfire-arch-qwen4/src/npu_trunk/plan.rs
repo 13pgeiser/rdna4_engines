@@ -257,8 +257,22 @@ pub fn auto_admission(cal: &Calibration, current: &CalKey) -> Result<FamilyMask,
     Ok(families)
 }
 
-/// Project S5 onto the executor's existing natural chunk boundaries.
-/// Split/rebalanced/rebanked steps stay GPU-only; never substitute force-pairs.
+/// Whether `a` + `b` is a pair the executor can run: the natural 8192 + B pair
+/// (B in `[minimum, 8192]`) or the planner's last-two-chunk rebalanced pair, two
+/// banks of about equal rows (64-row aligned split, each in `[minimum, 8192]`)
+/// that end the request. Split and re-bank geometries match neither.
+fn executable_pair(a: &Range<usize>, b: &Range<usize>, rows: usize, minimum: usize) -> bool {
+    if a.start % CHUNK != 0 || b.start != a.end { return false; }
+    let natural = a.len() == CHUNK && (minimum..=CHUNK).contains(&b.len()) && b.end == (a.start + 2 * CHUNK).min(rows);
+    let rebalanced = a.len() != CHUNK && a.len() % 64 == 0
+        && a.len().min(b.len()) >= minimum && a.len().max(b.len()) <= CHUNK
+        && b.end == rows && b.end - a.start > CHUNK;
+    natural || rebalanced
+}
+
+/// Project S5 onto the executor: natural pairs at the natural chunk boundaries
+/// and the rebalanced last pair (`pipe-rebalanced`). Split/rebanked steps stay
+/// GPU-only; never substitute force-pairs.
 pub fn executable_plan(cal: &Calibration, planned: &Plan, rows: usize, n_star: Option<usize>) -> Plan {
     let minimum = 512.max(cal.gpu.min_bank_rows);
     let armed = n_star.is_some_and(|n| rows >= n);
@@ -267,10 +281,7 @@ pub fn executable_plan(cal: &Calibration, planned: &Plan, rows: usize, n_star: O
     let mut t_pipe_ms = 0.0;
     while at < rows {
         let pair = armed.then(|| planned.steps.iter().find_map(|step| match step {
-            Step::Pipe { a, b } if a.start == at && a.start % CHUNK == 0
-                && a.len() == CHUNK && b.start == a.end
-                && (minimum..=CHUNK).contains(&b.len())
-                && b.end == (at + 2 * CHUNK).min(rows) => Some((a.clone(), b.clone())),
+            Step::Pipe { a, b } if a.start == at && executable_pair(a, b, rows, minimum) => Some((a.clone(), b.clone())),
             _ => None,
         })).flatten();
         if let Some((a, b)) = pair {
@@ -287,11 +298,16 @@ pub fn executable_plan(cal: &Calibration, planned: &Plan, rows: usize, n_star: O
     Plan { steps, t_gpu_ms: planned.t_gpu_ms, t_pipe_ms }
 }
 
-pub fn planned_pair_rows(planned: &Plan, offset: usize) -> Option<usize> {
+/// Rows of the planned pair starting at `offset`: bank A, then bank B.
+pub fn planned_pair(planned: &Plan, offset: usize) -> Option<(usize, usize)> {
     planned.steps.iter().find_map(|step| match step {
-        Step::Pipe { a, b } if a.start == offset => Some(b.end - a.start),
+        Step::Pipe { a, b } if a.start == offset => Some((a.len(), b.len())),
         _ => None,
     })
+}
+
+pub fn planned_pair_rows(planned: &Plan, offset: usize) -> Option<usize> {
+    planned_pair(planned, offset).map(|(a, b)| a + b)
 }
 /// Load-time log context, all caller-supplied deterministic state.
 pub struct LoadLogKey<'a> { pub current: &'a CalKey, pub mode: &'a str, pub families: FamilyMask }

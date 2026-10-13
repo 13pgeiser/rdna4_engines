@@ -270,7 +270,9 @@ full-width consumer and integer GEMM timings; any mismatch exits 1. CPU layout/m
 
 ## Stored calibration and deterministic planning (0.4.2)
 
-`Calibration::{load,store,validate,key_matches}` uses schema version **3** JSON.
+`Calibration::{load,store,validate,key_matches}` uses schema version **4** JSON
+(4 removed `glue.fold_ms_per_col_8192` and the I32 contract: `npu.epilogue` and
+`key.epilogue` must be `bf16`, BF16-direct only).
 Measured fields are mandatory; only an omitted `key.build` defaults to the
 release contract. Unknown fields/versions and invalid costs are errors.
 Runtime `CalKey` derives:
@@ -282,7 +284,7 @@ Runtime `CalKey` derives:
   `calibrate-npu-trunk`; no git SHA and no binary hashing.
 * `kernel.uname_release`: trimmed `uname -r`. The recorded PerfOpt arming
   signal is `AMD-Vi: PerfOpt armed` in privileged dmesg, not a readable
-  sysfs/proc ABI. Schema 3 therefore drops `perfopt_armed`, rather than inventing
+  sysfs/proc ABI. Schema 3+ therefore drops `perfopt_armed`, rather than inventing
   a boolean from a kernel name. Recollect if boot arming changes under the same
   release: this key cannot distinguish that case.
 * `model_index_sha256`: HFQ bytes `[0,data_offset)`, using
@@ -296,7 +298,7 @@ Runtime `CalKey` derives:
 Mismatch reasons name the first differing field in this order. Loading stored
 calibration never measures or recalibrates. The two `g80bf16-{stock,overlay}-v2.json`
 lab files and corresponding fixtures retain their historical filenames but now
-carry schema 3 identity; measured cost inputs and Python/Rust cost goldens are unchanged.
+carry schema 4 identity; measured cost inputs and Python/Rust cost goldens are unchanged.
 
 `plan(&Calibration, FamilyMask, rows) -> Plan` and
 `crossover(&Calibration, FamilyMask) -> Option<usize>` port the reference
@@ -358,9 +360,9 @@ hipfire calibrate-npu-trunk --from measurements.json --out cal.json
 
 This command assembles and validates an already measured record; it does **not**
 perform measurements, probe hardware, fit contention, or default measured costs.
-The measurements schema is the same as the schema-version-3 output record:
+The measurements schema is the same as the schema-version-4 output record:
 
-* `schema_version: 3`, `margin` and the current `key` described above.
+* `schema_version: 4`, `margin` and the current `key` described above.
   The collector supplies device/firmware, kernel release, model **index** digest,
   epilogue and trunk route. Omitted `key.build` uses the stable release/NPU
   contract. The CLI checks `uname -r` and refuses a kernel mismatch. Serving
@@ -373,8 +375,8 @@ The measurements schema is the same as the schema-version-3 output record:
 * `families`: those four names, each with `layer` (`gdn` for qkv/zab,
   `qsa` for q/kvidx), positive fused `cols`, and `out_dtype` (`bf16` for qkv,
   `f32` for the other families in today's serving route).
-* `glue.pack_ms_8192`, `fold_ms_per_col_8192`, `sync_ms`: measured
-  pack/fold/sync costs (fold is charged only for the I32 contract).
+* `glue.pack_ms_8192`, `sync_ms`: measured pack/sync costs (schema 4 has no
+  fold term: every contract is BF16-direct).
   `glue.consume_mode` is `retile|direct`; the required
   `consume_ms_per_col_8192` object contains finite nonnegative `bf16` and `f32`
   costs. Direct mode keeps those measurements but charges zero consume.
@@ -395,17 +397,27 @@ the CLI performs only offline assembly and never claims to have measured.
 
 ### Offline golden parity
 
-`tests/fixtures/npu_trunk` preserves all four original calibration JSONs plus
-`g80bf16-measured.json` unchanged. `golden.json` captures the actual Python CLI
+`tests/fixtures/npu_trunk` preserves the three BF16 legacy calibration JSONs
+(`g80bf16-{est-fast,est-slow,measured}.json`) and the stock/overlay v2 records;
+the I32 records (`g80i32-est`, `v8i32-measured`) are gone with the I32 contract.
+`golden.json` captures the actual Python CLI
 stdout and full-precision imported-model times/plans for both family sets,
 at 8192, 9319, 12288, 16384, 24576, 32768, 57544, 65536 and each crossover:
-90 exact-range vectors, 10 crossovers, relative time tolerance 1e-6.
+54 exact-range vectors, 6 crossovers, relative time tolerance 1e-6.
 Tests adapt legacy fixture keys/version/margin and Python's absent-panel default
 (`panel_cols=1` for V8), not measured costs.
 `golden-v2.json` adds all-subset selection and half-bank consume vectors for
-stock/overlay × retile/direct, nonzero margins, I32 fold, and a zero-cost GPU
-baseline, plus 44 exact-range plans. The same tests run in the library and
-the `npu_trunk_plan` integration target.
+stock/overlay × retile/direct, nonzero margins and a zero-cost GPU
+baseline, plus 40 exact-range plans. `golden-exec.json` pins the executable
+projection (`executable_plan`: natural and rebalanced pairs) and the prefill group
+schedule (`schedule`: banks and the in-bank snapshot cut, cache off / on / on
+without sub-launches) for 8000..65536 rows on the stock/overlay records. The same
+tests run in the library and the `npu_trunk_plan` integration target (the
+schedule golden runs in the library, where the scheduler is visible).
+**All goldens are generated** by
+`python3 /home/kaden/qcal/release-0.4.2/npu-trunk/gen_goldens.py
+crates/hipfire-arch-qwen4/tests/fixtures/npu_trunk` from `crossover_model.py`
+and the fixture calibrations (a pure function; no hardware), never edited by hand.
 The migrated lab `g80bf16-{stock,overlay}-v2.json` records preserve measured
 costs and add Halo j110 consume rates: BF16 `2.85/16480`, F32 `4.60/16480`
 ms per column per 8192 rows. Overlay changes only trunk identity and zab
@@ -430,7 +442,7 @@ refuse non-gfx1151. `off` / `fusions.npu_trunk = off` is the kill switch.
 `fusions.npu_trunk_calibration` (alias `npu_trunk_calibration`, env
 `HIPFIRE_QWEN4_NPU_TRUNK_CAL`) defaults, when empty, to
 `<hipfire home>/npu-trunk/calibration.json`. A file at that path takes precedence.
-Only an absent file falls back to compiled-in measured Halo schema-3 records:
+Only an absent file falls back to compiled-in measured Halo schema-4 records:
 `halo-xdna2-overlay-v4.json` (`overlay:gfx1151-zab-v1`) or
 `halo-xdna2-stock-v2.json` (`stock`). The stock lab record is schema-compatible,
 keyed stock, and measured for `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`.
@@ -475,17 +487,23 @@ Matching records log `load_log_line` with selection, key/hash, crossover and
 predicted 16K/64K times. Packing, twin, row-major programs, C arenas and request
 planning all use that same selected mask. Without a match, forced modes use ALL.
 Auto derives n* once at load. Each request's uncached prompt segment runs
-`plan(cal, selected, rows)` and logs `request_log_line` once. Only natural planned
-8192+B pairs, with B >= `max(512, cal.gpu.min_bank_rows)`, execute above n*.
-Split/rebalanced/rebanked ranges are projected to ordinary GPU chunks, never
-force-paired. The logged executable projection reflects those restrictions;
-snapshot boundaries may additionally veto a candidate pair.
+`plan(cal, selected, rows)` and logs `request_log_line` once. Natural planned
+8192+B pairs, with B >= `max(512, cal.gpu.min_bank_rows)`, and the planner's
+`pipe-rebalanced` last pair (two banks <= 8192 rows, 64-aligned split, each >=
+`max(512, min_bank_rows)`, ending the request) execute above n*. Split and
+rebanked ranges are projected to ordinary GPU chunks, never force-paired. The
+logged executable projection reflects those restrictions; a second snapshot row
+inside a pair may additionally shorten a candidate group. Rebalanced pairs and
+in-bank snapshot cuts need the invariant prefill profile (launch routing that
+does not depend on a launch's rows); without it only natural pairs run.
 
 For the historical stock-v2/overlay-v2 planner records, executable pair starts/lengths are:
-8000 and 9000: none; 16343: `(0,16343)`; 20000: `(0,16384)`;
-57544: `(0,16384),(16384,16384),(32768,16384)` with a GPU tail;
-65536: those three plus `(49152,16384)`. n* is 6848 stock / 8256 overlay,
-but the executor cannot run the planner's smaller split-bank candidates.
+8000: none; 9000: `(0,9000)` (4544+4456); 9319: `(0,9319)` (4672+4647);
+16343: `(0,16343)`; 20000: `(0,16384)`; 57544:
+`(0,16384),(16384,16384),(32768,16384),(49152,8392)` (4224+4168 tail);
+65536: four `16384` pairs. n* is 6848 stock / 8256 overlay. The Python mapping is
+`crossover_model.py executable_plan`/`schedule`; Rust is checked against
+`golden-exec.json` generated by `gen_goldens.py` (see Fixtures).
 
 ### Installing and testing auto on hipx (parent hardware gate)
 
@@ -533,8 +551,10 @@ not an off/mismatch reason. Require the actual prompt row count and one request
 plan line; 16343 rows must select one 8192+8151 pair. Repeat fresh processes
 for `auto` and `off` at 16K/57K, and a greedy prefix-sharing second request
 through `serve_ttft.py --greedy` with the same model and default cache.
-Confirm short prompts stay GPU-only (8000/9000 have no executable pair), and
-that 57544's final rebalanced step is GPU-only. The previously documented
+Confirm sub-8256-row prompts (8000) stay GPU-only; 9319 must plan one rebalanced
+4672+4647 pair and 57556 must plan 4224+4180 as its final pair, each with
+`on == emulate` greedy output including a prefix hit at the 8192 snapshot taken
+inside bank B's Core sub-launch (C1 gate). The previously documented
 snapshot and quality/TTFT gates still apply; CPU acceptance is not a silicon claim.
 
 
@@ -663,12 +683,17 @@ stay intact. Numerical operations/order and external capture offsets are
 unchanged, but full-model `on`/`emulate` byte parity and GTT savings still
 require the parent's Halo hardware gate.
 
-With an 8192-row chunk cap, pair whenever at least 8192+512 rows remain:
-bank A has 8192 live rows and B has `min(remaining-8192,8192)`.
-The GPU numerical twin uses exactly the same 8192-row boundaries. A shorter
-unpaired chunk remains sequential. For example, 16200 rows are one
-8192+8008 pair, 20000 are a full pair plus 3616 sequential rows, and 40000
-are two full pairs plus 7232 sequential rows. For each layer:
+With an 8192-row chunk cap, a natural pair is 8192+B whenever at least 8192+512
+rows remain: bank A has 8192 live rows and B has `min(remaining-8192,8192)`. The
+planner's rebalanced last pair (two banks of about equal rows, 64-row aligned
+split, each at least `max(512, min_bank_rows)`, e.g. 9,319 as 4672+4647 or the
+57K tail 8404 as 4224+4180) runs the same executor: both banks bind their live
+rows (`bind_bank_rows`; bank A's full extents are restored after the pair) and
+bank B's state view advances by A's rows. The GPU numerical twin uses exactly
+the same bank boundaries. A shorter unpaired chunk remains sequential. For
+example, 16200 rows are one 8192+8008 pair, 20000 are a full pair plus 3616
+sequential rows, and 40000 are two full pairs plus 7232 sequential rows. For
+each layer:
 
 ```text
 prepare(0,A), pack/kick(0,A); prepare(0,B), pack/kick(0,B)
@@ -766,12 +791,23 @@ Only the final bank of a prompt-ending pair runs the target pick; other pairs
 capture silently. Forced modes log their first scheduled pair once:
 `npu-trunk: pair rows=8192+8151 position=0` for a 16343-row fresh prompt.
 
-A pair may cross a session snapshot boundary **only at A's end**. The default
-8-GiB cache's periodic 8192-row snapshots therefore permit full pairs: A's fixed
-state is staged per layer and published at the same cadence as the sequential
-run. Interior A/B boundaries, including message ends, still split the schedule.
-The Halo comparison must retain the default cache and exercise a later prefix
-hit, not disable the cache. See the staging layout and cost details below.
+A pair may carry **one interior session snapshot row**, anywhere in the group
+(C1, 0.4.2). At the A/B split bank A runs whole and its fixed state is staged
+after it, as before. Inside a bank (`CutSite::Bank`), that bank's Core runs as
+two launches `[0,r)` and `[r,rows)` (`execute_*_core_rows`, `CoreWindow`):
+GDN: each launch ends with the ordinary chunk-end Q8 round trip (frame
+`position + lo + rows - 1`) and the conv ring cursor `(start + lo) % 3`; QSA:
+the second launch starts from `next_lengths_after(r)`; the PLE grouped depthwise
+step of that bank splits at the same row. The staged copies (GDN recurrent +
+conv state, QSA selected indices, PLE conv state) are taken after the first
+launch and never after the second; the layer's input projections, output
+projection, HC and MoE stay bank-wide. A second interior snapshot row (or any
+interior row without the invariant prefill profile) ends the group at the
+first boundary as an ordinary sequential bank. The numerical twin cuts at the
+same rows (`PairShape::pieces`: the banks, further split at the cut), so
+`on == emulate` holds by construction; the Halo comparison must retain the
+default cache and exercise a later prefix hit at 8192 after a rebalanced pair.
+See the staging layout and cost details below.
 Generic resumed target advances whose pending snapshot cursor is already behind
 their position remain native until that snapshot is reported by its owner.
 

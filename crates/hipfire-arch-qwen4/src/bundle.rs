@@ -1085,24 +1085,31 @@ impl Qwen4Bundle {
         if let Some(forward)=&mut self.execution { forward.begin_npu_trunk_request(); }
     }
 
-    pub(crate) fn note_npu_trunk_pair(&mut self, rows: usize, position: usize) {
+    pub(crate) fn note_npu_trunk_pair(&mut self, rows: [usize; 2], position: usize) {
         if let Some(forward)=&mut self.execution {forward.note_npu_trunk_pair(rows,position);}
     }
 
+    /// The first still-pending snapshot boundary strictly after `position`.
+    pub(crate) fn session_boundary_after(&self, position: usize) -> Option<usize> {
+        self.session.as_ref()?.next_boundary_after(position)
+    }
+
+    /// Banks and snapshot cut of the planned pair starting at `position` (the
+    /// executor and the numerical twin both chunk from this shape).
+    pub(crate) fn npu_trunk_pair_shape(&self, position: usize, remaining: usize, chunk: usize) -> Option<crate::gpu_forward::PairShape> {
+        let banks = self.execution.as_ref()?.npu_trunk_pair(position, remaining, chunk)?;
+        Some(crate::gpu_forward::PairShape::new(banks, position, self.session_next_boundary()))
+    }
+
     pub(crate) fn prefill_schedule_rows(&self, position: usize, end: usize, chunk: usize) -> usize {
-        let boundary = self.session_next_boundary();
-        let rows = crate::gpu_forward::qwen4_prefill_segment_rows(
-            position, end, chunk, boundary,
-            self.execution.as_ref().is_some_and(|f| f.npu_trunk_pair_rows(position, end - position, chunk).is_some()),
-        );
-        if rows > chunk && boundary == Some(position + chunk) {
-            if self.session.as_ref().and_then(|cache| cache.next_boundary_after(position + chunk))
-                .is_some_and(|next| next < position + rows)
-            {
-                return chunk;
-            }
-        }
-        rows
+        let next = self.session_next_boundary();
+        let boundaries = crate::gpu_forward::SessionBoundaries {
+            next,
+            after: next.and_then(|next| self.session_boundary_after(next)),
+        };
+        let planned = self.execution.as_ref().is_some_and(|f| f.npu_trunk_pair(position, end - position, chunk).is_some());
+        let cuts = self.execution.as_ref().is_some_and(|f| f.npu_trunk_cuts_admitted());
+        crate::gpu_forward::qwen4_prefill_segment_rows(position, end, chunk, boundaries, planned, cuts)
     }
 
     fn spec_prefill_capacity(&self, chunk: usize) -> usize {

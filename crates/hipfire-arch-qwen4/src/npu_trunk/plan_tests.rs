@@ -255,14 +255,15 @@ fn npu_trunk_auto_admission_matrix() {
 }
 
 #[test]
-fn npu_trunk_auto_maps_only_planned_natural_pairs() {
+fn npu_trunk_auto_maps_natural_and_rebalanced_pairs() {
     for file in ["g80bf16-stock-v2.json", "g80bf16-overlay-v2.json"] {
         let c = Calibration::load(fixture(file)).unwrap();
         let star = crossover(&c, FamilyMask::ALL);
         for (rows, expected) in [
-            (8000, vec![]), (9000, vec![]), (16343, vec![(0, 16343)]),
+            (8000, vec![]), (9000, vec![(0, 9000)]), (9319, vec![(0, 9319)]), (16343, vec![(0, 16343)]),
             (20000, vec![(0, 16384)]),
-            (57544, vec![(0, 16384), (16384, 16384), (32768, 16384)]),
+            (57544, vec![(0, 16384), (16384, 16384), (32768, 16384), (49152, 8392)]),
+            (57556, vec![(0, 16384), (16384, 16384), (32768, 16384), (49152, 8404)]),
             (65536, vec![(0, 16384), (16384, 16384), (32768, 16384), (49152, 16384)]),
         ] {
             let planned = plan(&c, FamilyMask::ALL, rows);
@@ -278,8 +279,11 @@ fn npu_trunk_auto_maps_only_planned_natural_pairs() {
                     Step::Gpu { chunk } => (chunk.start, chunk.end),
                     Step::Pipe { a, b } => {
                         assert_eq!(planned_pair_rows(&executable, a.start), Some(b.end - a.start));
-                        assert_eq!(a.len(), CHUNK);
-                        assert!(b.len() >= 512.max(c.gpu.min_bank_rows));
+                        assert_eq!(planned_pair(&executable, a.start), Some((a.len(), b.len())));
+                        let minimum = 512.max(c.gpu.min_bank_rows);
+                        assert!(a.len().min(b.len()) >= minimum && a.len().max(b.len()) <= CHUNK);
+                        // Natural 8192 + B, or the rebalanced end of the request.
+                        assert!(a.len() == CHUNK || (a.len() % 64 == 0 && b.end == rows && b.end - a.start > CHUNK));
                         (a.start, b.end)
                     }
                 };
@@ -297,5 +301,19 @@ fn npu_trunk_auto_maps_only_planned_natural_pairs() {
         let rebank = Plan { steps: vec![Step::Pipe { a: 0..5000, b: 5000..10000 },
             Step::Pipe { a: 10000..15000, b: 15000..20000 }], t_gpu_ms: 1.0, t_pipe_ms: 0.5 };
         assert!(executable_plan(&c, &rebank, 20000, Some(0)).steps.iter().all(|s| matches!(s, Step::Gpu { .. })));
+        // Only the rebalanced geometry is new: unaligned, split, too-small or
+        // not-ending-at-the-request pairs stay GPU-only.
+        let admitted = |a: std::ops::Range<usize>, b: std::ops::Range<usize>, rows: usize| {
+            let p = Plan { steps: vec![Step::Pipe { a, b }], t_gpu_ms: 1.0, t_pipe_ms: 0.5 };
+            executable_plan(&c, &p, rows, Some(0)).steps.iter().any(|s| matches!(s, Step::Pipe { .. }))
+        };
+        assert!(admitted(0..4672, 4672..9319, 9319));
+        assert!(admitted(49152..53376, 53376..57556, 57556));
+        assert!(!admitted(0..4650, 4650..9319, 9319), "split not 64-aligned");
+        assert!(!admitted(0..4096, 4096..8192, 8192), "single-chunk split");
+        assert!(!admitted(0..1024, 1024..9319, 9319), "bank A below the minimum, bank B above a chunk");
+        assert!(!admitted(0..4672, 4672..9000, 9319), "does not end the request");
+        assert!(!admitted(0..64, 64..9319, 9319), "bank below the minimum");
+        assert!(!admitted(4096..8000, 8000..12288, 12288), "unaligned start");
     }
 }

@@ -42,6 +42,8 @@ pub use layer_ops::{
     IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
     execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
     execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered, gdn_qkv_projection_bf16,
+    execute_gated_delta_net_core_rows, execute_grouped_depthwise_rows, execute_indexed_attention_core_rows,
+    CoreWindow,
 };
 pub use steps::{
     execute_steps, execute_validated_steps, execute_validated_steps_with_moe_hooks,

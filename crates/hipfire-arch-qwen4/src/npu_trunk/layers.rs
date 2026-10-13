@@ -7,7 +7,7 @@ pub(super) struct BankProgram<'a> {
     pub ple_rows_f16: bool,
     pub rows: usize,
 }
-pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4GpuForwardScratch, bundle: &'a Qwen4Bundle, gpu: &Gpu, ctx: &'a DispatchCtx, scratch_desc: &'a Qwen4LayerScratch<'a>, bank: usize, n: usize) -> Result<BankProgram<'a>, Qwen4GpuForwardError> {
+pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4GpuForwardScratch, bundle: &'a Qwen4Bundle, gpu: &Gpu, ctx: &'a DispatchCtx, scratch_desc: &'a Qwen4LayerScratch<'a>, offset: usize, n: usize) -> Result<BankProgram<'a>, Qwen4GpuForwardError> {
     let config = &bundle.config;
     let dims = program_dims(config);
     let ple_layer_index = config.ple.as_ref().map(|_| config.ple_layer_ids[0]-1);
@@ -167,7 +167,7 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                         input: &scratch.hc_mixed,
                         output_tensor: &scratch.attention_output,
                         rows: n,
-                        start_position: bundle.state.position + bank * 8192,
+                        start_position: bundle.state.position + offset,
                         key_heads: dims.linear_num_key_heads,
                         value_heads: dims.linear_num_value_heads,
                         key_dim: dims.linear_key_head_dim,
@@ -349,12 +349,12 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
             }));
             ranges.push(begin..steps.len());
         }
-    if bank == 1 {
+    if offset != 0 {
         for step in &mut steps {
             if let Step::IndexedAttention(op) = step {
-                // Advance the initial view by A's 8192 rows, not B's live rows.
+                // Advance the initial view by the rows before this bank, not its live rows.
                 let rows = op.rows;
-                op.rows = 8192;
+                op.rows = offset;
                 let (full,raw,pooled,selected,position)=op.next_lengths().map_err(fail)?;
                 op.rows = rows;
                 op.state.full_len=full; op.state.raw_len=raw; op.state.pooled_len=pooled;

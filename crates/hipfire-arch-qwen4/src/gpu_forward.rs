@@ -3979,14 +3979,25 @@ impl Qwen4GpuForward {
         let _ = (rows, position);
     }
 
-    pub(crate) fn npu_trunk_pair_rows(&self, position: usize, remaining: usize, chunk: usize) -> Option<usize> {
+    /// Rows of banks A and B of the pair the plan starts at `position`.
+    pub(crate) fn npu_trunk_pair(&self, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
         #[cfg(target_os = "linux")]
-        { self.npu_trunk.as_ref().and_then(|n| n.selected_pair_rows(position, remaining, chunk)) }
+        { self.npu_trunk.as_ref().and_then(|n| n.selected_pair(position, remaining, chunk)) }
         #[cfg(not(target_os = "linux"))]
         { let _ = (position, remaining, chunk); None }
     }
 
-    pub(crate) fn note_npu_trunk_pair(&mut self, rows: usize, position: usize) {
+    /// Whether pairs may run an in-bank Core sub-launch at a session snapshot
+    /// row or split into banks other than 8192 + B. Both need the invariant
+    /// prefill profile, whose routing does not depend on a launch's rows.
+    pub(crate) fn npu_trunk_cuts_admitted(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        { self.npu_trunk.is_some() && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled() }
+        #[cfg(not(target_os = "linux"))]
+        { false }
+    }
+
+    pub(crate) fn note_npu_trunk_pair(&mut self, rows: [usize; 2], position: usize) {
         #[cfg(target_os = "linux")]
         if let Some(npu)=&mut self.npu_trunk {npu.note_pair(rows,position);}
         #[cfg(not(target_os = "linux"))]
@@ -4634,25 +4645,35 @@ impl Qwen4GpuForward {
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         let mut offset = 0usize;
         let mut covered_until=0;
+        // The numerical twin's chunks of a covered group: the pair's banks split
+        // at an interior session snapshot row (absolute offsets in `tokens`).
+        let mut twin_chunks: Vec<std::ops::Range<usize>> = Vec::new();
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
             if offset>=covered_until {
-                if let Some(rows)=self.npu_trunk_pair_rows(bundle.state.position,tokens.len()-offset,max_chunk)
+                if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
                 {
-                    self.note_npu_trunk_pair(rows,bundle.state.position);
+                    let shape=PairShape::new(banks,bundle.state.position,bundle.session_next_boundary());
+                    let rows=shape.total();
+                    self.note_npu_trunk_pair(banks,bundle.state.position);
                     if self.npu_trunk_pipelined() {
                         let final_pair=self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
                         let output=if output_rows==Qwen4OutputRows::All || final_pair {
                             Qwen4OutputPolicy::Rows(output_rows)
                         } else { Qwen4OutputPolicy::None };
-                        npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,Some(logits),top1,wide_hidden_capture,output)?;
+                        npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,banks,Some(logits),top1,wide_hidden_capture,output)?;
                         offset+=rows;
                         continue;
                     }
                     covered_until=offset+rows;
+                    twin_chunks=shape.pieces().into_iter().map(|piece|offset+piece.start..offset+piece.end).collect();
                 }
             }
-            let rows = (tokens.len() - offset).min(max_chunk);
+            let rows = if offset<covered_until {
+                twin_chunks.iter().find(|piece|piece.start==offset).map_or_else(
+                    ||Err(invalid("npu-trunk: twin chunk does not start at the offset")),
+                    |piece|Ok(piece.len()))?
+            } else { (tokens.len() - offset).min(max_chunk) };
             // The caller's lookahead belongs to the final tile; earlier tiles
             // look ahead to the next tile.
             let final_chunk =
@@ -4756,22 +4777,30 @@ impl Qwen4GpuForward {
         let max_chunk = self.scratch.max_chunk;
         let mut offset = 0usize;
         let mut covered_until=0;
+        let mut twin_chunks: Vec<std::ops::Range<usize>> = Vec::new();
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
             if offset>=covered_until {
-                if let Some(rows)=self.npu_trunk_pair_rows(bundle.state.position,tokens.len()-offset,max_chunk)
+                if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
                 {
-                    self.note_npu_trunk_pair(rows,bundle.state.position);
+                    let shape=PairShape::new(banks,bundle.state.position,bundle.session_next_boundary());
+                    let rows=shape.total();
+                    self.note_npu_trunk_pair(banks,bundle.state.position);
                     if self.npu_trunk_pipelined() {
                         self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
-                        npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
+                        npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,banks,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
                         offset+=rows;
                         continue;
                     }
                     covered_until=offset+rows;
+                    twin_chunks=shape.pieces().into_iter().map(|piece|offset+piece.start..offset+piece.end).collect();
                 }
             }
-            let rows = (tokens.len() - offset).min(max_chunk);
+            let rows = if offset<covered_until {
+                twin_chunks.iter().find(|piece|piece.start==offset).map_or_else(
+                    ||Err(invalid("npu-trunk: twin chunk does not start at the offset")),
+                    |piece|Ok(piece.len()))?
+            } else { (tokens.len() - offset).min(max_chunk) };
             self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
             let capture_chunk = wide_hidden_capture
                 .zip(capture_width)
@@ -7237,19 +7266,90 @@ mod tests {
     }
 }
 
-/// A shared deterministic singleton/MTP schedule; only A's end may be internal.
+/// The session cache's next pending snapshot boundary and the one after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionBoundaries {
+    pub next: Option<usize>,
+    pub after: Option<usize>,
+}
+
+/// A shared deterministic singleton/MTP schedule. A planned pair covers
+/// `min(remaining, 2 * chunk)` rows. With `cuts` one interior session boundary
+/// rides the in-bank Core sub-launch; a second interior boundary (or `cuts`
+/// off) ends the group at the first one, as an ordinary sequential bank.
 pub(crate) fn qwen4_prefill_segment_rows(
     position: usize, prompt_end: usize, chunk: usize,
-    boundary: Option<usize>, planned: bool,
+    boundaries: SessionBoundaries, planned: bool, cuts: bool,
 ) -> usize {
     let remaining = prompt_end.saturating_sub(position);
-    let pair = planned && chunk == 8192 && remaining >= 8192 + 512;
-    let rows = if pair { remaining.min(16384) } else { remaining.min(chunk) };
-    let Some(boundary) = boundary else { return rows; };
+    let pair = planned && chunk == 8192 && remaining > chunk;
+    let rows = if pair { remaining.min(2 * chunk) } else { remaining.min(chunk) };
+    let Some(boundary) = boundaries.next else { return rows; };
     if boundary <= position { return remaining.min(chunk); }
     let distance = boundary - position;
-    if pair && distance == chunk { return rows; }
-    // An interior B boundary must leave A as an ordinary sequential bank.
+    if pair && cuts {
+        if distance < rows && boundaries.after.is_some_and(|next| next < position + rows) {
+            return distance.min(chunk);
+        }
+        return rows;
+    }
+    if pair && distance == chunk {
+        // Another boundary inside B would need a sub-launch.
+        return if boundaries.after.is_some_and(|next| next < position + rows) { chunk } else { rows };
+    }
+    // Without sub-launches an interior B boundary must leave A as an ordinary
+    // sequential bank.
     if pair && distance > chunk && distance < rows { return chunk; }
     rows.min(distance)
+}
+
+/// Where in a pair group the session snapshot row falls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutSite {
+    /// No interior snapshot row (the group end is published by the driver).
+    None,
+    /// Exactly the A/B boundary: bank A runs whole, state staged after it.
+    Split,
+    /// Inside `bank` at its local `row`: that bank's Core runs as two launches.
+    Bank { bank: usize, row: usize },
+}
+
+/// Bank and sub-launch geometry of one pair group: two banks and the group-local
+/// row of an interior session snapshot. Both the executor and the numerical twin
+/// derive their chunking from this, so they cut at identical rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PairShape {
+    pub rows: [usize; 2],
+    pub cut: Option<usize>,
+}
+
+impl PairShape {
+    /// `cut` is the session boundary `boundary` made group-local at `position`;
+    /// only a boundary strictly inside the group is a cut.
+    pub(crate) fn new(rows: [usize; 2], position: usize, boundary: Option<usize>) -> Self {
+        let total = rows[0] + rows[1];
+        let cut = boundary.filter(|&b| b > position && b < position + total).map(|b| b - position);
+        Self { rows, cut }
+    }
+
+    pub(crate) fn total(&self) -> usize { self.rows[0] + self.rows[1] }
+
+    pub(crate) fn site(&self) -> CutSite {
+        match self.cut {
+            None => CutSite::None,
+            Some(cut) if cut == self.rows[0] => CutSite::Split,
+            Some(cut) if cut < self.rows[0] => CutSite::Bank { bank: 0, row: cut },
+            Some(cut) => CutSite::Bank { bank: 1, row: cut - self.rows[0] },
+        }
+    }
+
+    /// Group-local row ranges of the sequential chunks the numerical twin runs:
+    /// the banks, further split at the cut (a sub-launch is a chunk boundary).
+    pub(crate) fn pieces(&self) -> Vec<std::ops::Range<usize>> {
+        let mut points = vec![0, self.rows[0], self.total()];
+        points.extend(self.cut);
+        points.sort_unstable();
+        points.dedup();
+        points.windows(2).map(|w| w[0]..w[1]).collect()
+    }
 }

@@ -1790,7 +1790,7 @@ pub fn execute_gated_delta_net_hc(
     hc: Option<&HyperWriteOp<'_>>,
     fused: &mut bool,
 ) -> Result<(), DispatchError> {
-    execute_gated_delta_net_hc_impl(gpu, op, hc, fused, None, None)
+    execute_gated_delta_net_hc_impl(gpu, op, hc, fused, None, None, None)
 }
 
 /// Core-only direct read; the ordinary/emulated operation has no arena args.
@@ -1801,42 +1801,284 @@ pub fn execute_gated_delta_net_arena(
         return Err(DispatchError::Hip("GDN trunk arena requires Core phase".into()));
     }
     op.validate_for_gpu(gpu)?;
-    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, Some(arenas), None)
+    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, Some(arenas), None, None)
+}
+
+/// Rows `[lo, lo + rows)` of a bank-wide mixer launch. The in-bank session
+/// sub-launch runs a bank's Core (and its PLE depthwise step) as two windows
+/// split at a snapshot row; each window ends with the ordinary chunk-end state
+/// round trip (GDN Q8 frame `position + lo + rows - 1`, QSA `next_lengths`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreWindow {
+    pub lo: usize,
+    pub rows: usize,
+}
+
+impl CoreWindow {
+    fn within(self, bank_rows: usize) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.lo.checked_add(self.rows).is_none_or(|end| end > bank_rows) {
+            return Err(DispatchError::Hip(format!(
+                "core window {}+{} is outside the bank's {bank_rows} rows", self.lo, self.rows
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Absolute position of a Core launch's first row (`lo` rows into the bank, or
+/// the bank start for a whole launch): the GDN ring cursor and the Q8 frame
+/// `position + rows - 1` of a window follow from it.
+fn core_window_position(start_position: usize, lo: Option<usize>) -> usize {
+    start_position + lo.unwrap_or(0)
+}
+
+/// A fused-arena view whose row 0 is row `lo` of the source arena (a
+/// non-owning sub-view of the same device bytes).
+struct ShiftedArena {
+    tensor: GpuTensor,
+    row_pitch_elems: usize,
+    col0_elems: usize,
+}
+
+impl ShiftedArena {
+    fn new(arena: Option<Bf16Arena<'_>>, lo: usize) -> Result<Option<Self>, DispatchError> {
+        arena
+            .map(|arena| {
+                let skip = lo
+                    .checked_mul(arena.row_pitch_elems)
+                    .filter(|skip| *skip <= arena.tensor.numel())
+                    .ok_or_else(|| DispatchError::Hip("arena row window overflows".into()))?;
+                Ok(Self {
+                    tensor: arena.tensor.sub_offset(skip, arena.tensor.numel() - skip),
+                    row_pitch_elems: arena.row_pitch_elems,
+                    col0_elems: arena.col0_elems,
+                })
+            })
+            .transpose()
+    }
+
+    fn arena(&self) -> Bf16Arena<'_> {
+        Bf16Arena {
+            tensor: &self.tensor,
+            row_pitch_elems: self.row_pitch_elems,
+            col0_elems: self.col0_elems,
+        }
+    }
+}
+
+/// Core of `window`'s rows only; the input projections ran bank-wide into the
+/// op's scratch (`arenas` is `None` when the native route projected them).
+pub fn execute_gated_delta_net_core_rows(
+    gpu: &mut Gpu, op: &GatedDeltaNetOp<'_>, arenas: Option<GdnTrunkArenas<'_>>, window: CoreWindow,
+) -> Result<(), DispatchError> {
+    if op.phase != MixerPhase::Core {
+        return Err(DispatchError::Hip("GDN core window requires Core phase".into()));
+    }
+    window.within(op.rows)?;
+    op.validate_for_gpu(gpu)?;
+    let shifted = arenas
+        .map(|a| {
+            Ok::<_, DispatchError>([
+                ShiftedArena::new(a.qkv, window.lo)?, ShiftedArena::new(a.z, window.lo)?,
+                ShiftedArena::new(a.a, window.lo)?, ShiftedArena::new(a.b, window.lo)?,
+            ])
+        })
+        .transpose()?;
+    let view_arenas = shifted.as_ref().map(|s| GdnTrunkArenas {
+        qkv: s[0].as_ref().map(ShiftedArena::arena), z: s[1].as_ref().map(ShiftedArena::arena),
+        a: s[2].as_ref().map(ShiftedArena::arena), b: s[3].as_ref().map(ShiftedArena::arena),
+    });
+    let whole = window.lo == 0 && window.rows == op.rows;
+    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, view_arenas, None, (!whole).then_some(window))
+}
+
+/// QSA Core of `window`'s rows: the same op over a row sub-range whose cache
+/// position and lengths are those after the rows before it
+/// ([`IndexedAttentionOp::next_lengths_after`]).
+pub fn execute_indexed_attention_core_rows(
+    gpu: &mut Gpu, op: &IndexedAttentionOp<'_>, arenas: Option<QsaTrunkArenas<'_>>, window: CoreWindow,
+) -> Result<(), DispatchError> {
+    if op.phase != MixerPhase::Core {
+        return Err(DispatchError::Hip("QSA core window requires Core phase".into()));
+    }
+    window.within(op.rows)?;
+    op.validate_for_gpu(gpu)?;
+    let CoreWindow { lo, rows } = window;
+    let index_width = (op.index_heads + op.index_kv_heads) * op.index_dim;
+    let q_width = op.heads * op.head_dim;
+    let kv_width = op.kv_heads * op.head_dim;
+    let index_scratch = view(op.index_scratch, lo * index_width, rows * index_width);
+    let qgate_scratch = view(op.qgate_scratch, lo * 2 * q_width, rows * 2 * q_width);
+    let k_scratch = view(op.k_scratch, lo * kv_width, rows * kv_width);
+    let v_scratch = view(op.v_scratch, lo * kv_width, rows * kv_width);
+    let qsa_output = view(op.qsa_output, lo * q_width, rows * q_width);
+    let (full_len, raw_len, pooled_len, selected_len, position) = if lo == 0 {
+        (op.state.full_len, op.state.raw_len, op.state.pooled_len, op.state.selected_len, op.state.position)
+    } else {
+        op.next_lengths_after(lo)?
+    };
+    let state = IndexedAttentionState {
+        format: op.state.format,
+        full_keys: op.state.full_keys,
+        full_values: op.state.full_values,
+        raw_index_keys: op.state.raw_index_keys,
+        pooled_keys: op.state.pooled_keys,
+        selected_indices: op.state.selected_indices,
+        f16_arena: op.state.f16_arena,
+        full_capacity: op.state.full_capacity,
+        raw_capacity: op.state.raw_capacity,
+        pooled_capacity: op.state.pooled_capacity,
+        selected_capacity: op.state.selected_capacity,
+        position_capacity: op.state.position_capacity,
+        full_len,
+        raw_len,
+        pooled_len,
+        selected_len,
+        position,
+    };
+    let sub = IndexedAttentionOp {
+        indexer_qk: op.indexer_qk,
+        indexer_q_norm: op.indexer_q_norm,
+        indexer_k_norm: op.indexer_k_norm,
+        q: op.q,
+        k: op.k,
+        v: op.v,
+        q_norm: op.q_norm,
+        k_norm: op.k_norm,
+        output: op.output,
+        state,
+        input: op.input,
+        index_scratch: &index_scratch,
+        qgate_scratch: &qgate_scratch,
+        k_scratch: &k_scratch,
+        v_scratch: &v_scratch,
+        qsa_output: &qsa_output,
+        // Per-row selections are consumed inside the launch.
+        selected_scratch: op.selected_scratch,
+        attention_output: op.attention_output,
+        bf16_scratch: op.bf16_scratch,
+        rows,
+        index_heads: op.index_heads,
+        index_kv_heads: op.index_kv_heads,
+        index_dim: op.index_dim,
+        budget: op.budget,
+        compress: op.compress,
+        heads: op.heads,
+        kv_heads: op.kv_heads,
+        head_dim: op.head_dim,
+        rotary_dim: op.rotary_dim,
+        rope: op.rope,
+        input_width: op.input_width,
+        rotation: op.rotation,
+        mode: op.mode,
+        trunk_a4: op.trunk_a4,
+        phase: MixerPhase::Core,
+    };
+    sub.validate_for_gpu(gpu)?;
+    let shifted = arenas
+        .map(|a| {
+            Ok::<_, DispatchError>([
+                ShiftedArena::new(a.q, lo)?, ShiftedArena::new(a.k, lo)?,
+                ShiftedArena::new(a.v, lo)?, ShiftedArena::new(a.idx, lo)?,
+            ])
+        })
+        .transpose()?;
+    let view_arenas = shifted.as_ref().map(|s| QsaTrunkArenas {
+        q: s[0].as_ref().map(ShiftedArena::arena), k: s[1].as_ref().map(ShiftedArena::arena),
+        v: s[2].as_ref().map(ShiftedArena::arena), idx: s[3].as_ref().map(ShiftedArena::arena),
+    });
+    execute_indexed_attention_hc_impl(gpu, &sub, None, &mut false, view_arenas, None)
+}
+
+/// The PLE grouped depthwise step over `window`'s rows (state carries across
+/// windows exactly as across chunks).
+pub fn execute_grouped_depthwise_rows(
+    gpu: &mut Gpu, op: &GroupedDepthwiseOp<'_>, window: CoreWindow,
+) -> Result<(), DispatchError> {
+    window.within(op.rows)?;
+    let CoreWindow { lo, rows } = window;
+    let channels = op.branches * op.hidden;
+    if channels % 2 != 0 || op.embed_dim % 2 != 0 {
+        return Err(DispatchError::Hip("grouped depthwise window needs even row widths".into()));
+    }
+    // HC streams hold BF16 bits (2 bytes) when `state_bf16`; the PLE rows are
+    // F16 (2 bytes) when `rows_f16`, else F32. Both tensors are F32-labeled.
+    let streams = view(op.streams, if op.state_bf16 { lo * channels / 2 } else { lo * channels }, rows * channels);
+    let ple_rows = view(op.rows_tensor, if op.rows_f16 { lo * op.embed_dim / 2 } else { lo * op.embed_dim }, rows * op.embed_dim);
+    let sub = GroupedDepthwiseOp {
+        state_bf16: op.state_bf16,
+        rows_f16: op.rows_f16,
+        key: op.key,
+        value: op.value,
+        norm_key: op.norm_key,
+        norm_query: op.norm_query,
+        norm_conv: op.norm_conv,
+        conv: op.conv,
+        state: op.state,
+        streams: &streams,
+        rows_tensor: &ple_rows,
+        query: op.query,
+        key_scratch: op.key_scratch,
+        value_scratch: op.value_scratch,
+        gated: op.gated,
+        normed: op.normed,
+        output: op.output,
+        rows,
+        branches: op.branches,
+        hidden: op.hidden,
+        embed_dim: op.embed_dim,
+        kernel_size: op.kernel_size,
+        dilation: op.dilation,
+        epsilon: op.epsilon,
+        rotation: op.rotation,
+    };
+    execute_grouped_depthwise(gpu, &sub)
 }
 
 /// Native input projections only, skipping qkv/a/b/z covered by the trunk.
 pub fn execute_gated_delta_net_uncovered(gpu: &mut Gpu, op: &GatedDeltaNetOp<'_>, covered: [bool; 4]) -> Result<(), DispatchError> {
-    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, None, Some(covered))
+    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, None, Some(covered), None)
 }
 
 fn execute_gated_delta_net_hc_impl(
     gpu: &mut Gpu, op: &GatedDeltaNetOp<'_>, hc: Option<&HyperWriteOp<'_>>,
     fused: &mut bool, arenas: Option<GdnTrunkArenas<'_>>,
     projection_only: Option<[bool; 4]>,
+    window: Option<CoreWindow>,
 ) -> Result<(), DispatchError> {
     op.check_phase()?;
     let phase = if projection_only.is_some() { MixerPhase::InProj } else { op.phase };
     let arenas = core_arena(phase, arenas);
+    // A row window is a Core launch over rows `[lo, lo + rows)` of a bank whose
+    // input projections ran bank-wide: row-shaped inputs are offset by `lo`,
+    // scratch only this launch touches starts at row 0, and the stored-layout
+    // decisions (BF16 qkv / output) stay those of the whole bank.
+    let (lo, rows) = window.map_or((0, op.rows), |w| (w.lo, w.rows));
+    if let Some(w) = window {
+        if phase != MixerPhase::Core || w.rows == 0 || w.lo + w.rows > op.rows || op.row_capture.is_some() {
+            return Err(DispatchError::Hip("GDN core window needs a Core op without row capture inside its rows".into()));
+        }
+    }
     let qk = op.key_heads * op.key_dim;
     let value = op.value_heads * op.value_dim;
     let qkv = 2 * qk + value;
     let mut projection = view(op.projection, 0, op.rows * qkv);
-    let projection2 = view(op.projection2, 0, op.rows * qkv);
-    let a = view(op.a, 0, op.rows * op.value_heads);
-    let b = view(op.b, 0, op.rows * op.value_heads);
-    let mut gate = view(op.gate, 0, op.rows * op.value_heads);
-    let mut beta = view(op.beta, 0, op.rows * op.value_heads);
-    let z = view(op.z_output, 0, op.rows * value);
+    let projection2 = view(op.projection2, 0, rows * qkv);
+    let a = view(op.a, lo * op.value_heads, rows * op.value_heads);
+    let b = view(op.b, lo * op.value_heads, rows * op.value_heads);
+    let mut gate = view(op.gate, 0, rows * op.value_heads);
+    let mut beta = view(op.beta, 0, rows * op.value_heads);
+    let z = view(op.z_output, lo * value, rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
     let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
-        && gpu.route_rows(op.rows) > 1
+        && gpu.route_rows(rows) > 1
         && op.key_dim == 128
         && op.value_dim == 128
         && op.conv_kernel == 4;
     if arenas.is_some() && (!persistent_batch || op.row_capture.is_some()) {
         return Err(DispatchError::Hip("GDN trunk arena needs batched k4 without row capture".into()));
     }
-    let recurrent_output = view(op.recurrent_output, 0, op.rows * value);
+    let recurrent_output = view(op.recurrent_output, 0, rows * value);
     if op.row_capture.is_some() && !persistent_batch {
         return Err(DispatchError::Hip(
             "GDN row capture needs the few-row persistent recurrence route".into(),
@@ -1847,7 +2089,7 @@ fn execute_gated_delta_net_hc_impl(
     // write them straight into it. A split core receives the projection
     // the input phase left in `op.projection`, copied into the capture
     // unchanged (the convolution reads the same values either way).
-    let mut conv_output = view(op.projection2, 0, op.rows * qkv);
+    let mut conv_output = view(op.projection2, 0, rows * qkv);
     if let Some(capture) = capture {
         let inputs = view(capture.inputs, 0, op.rows * qkv);
         if phase == MixerPhase::Core {
@@ -1866,13 +2108,13 @@ fn execute_gated_delta_net_hc_impl(
         state: op.recurrent,
         output: &recurrent_output,
         row_states: capture.map(|c| &c.states),
-        rows: op.rows,
+        rows,
         qkv_width: qkv,
         key_heads: op.key_heads,
         value_heads: op.value_heads,
         key_dim: op.key_dim,
         value_dim: op.value_dim,
-        position: op.start_position,
+        position: core_window_position(op.start_position, window.map(|w| w.lo)),
     };
     let chunked = persistent_batch && gated_delta_chunk_route(gpu, &dims);
     if chunked && capture.is_some() {
@@ -1898,6 +2140,13 @@ fn execute_gated_delta_net_hc_impl(
     };
     if arenas.is_some_and(|a| a.qkv.is_some()) || bf16_store(&op.qkv, TrunkFamily::GdnQkv.bit(), gpu) {
         projection.dtype = DType::BF16;
+    }
+    if window.is_some() {
+        if !persistent_batch {
+            return Err(DispatchError::Hip("GDN core window needs the batched k4 route".into()));
+        }
+        // After the dtype decision: BF16 rows are 2 bytes wide.
+        projection = projection.sub_offset(lo * qkv, rows * qkv);
     }
     if matches!(phase, MixerPhase::Whole | MixerPhase::InProj) {
         project_trunk_masked(
@@ -1941,7 +2190,7 @@ fn execute_gated_delta_net_hc_impl(
             gdn_output.dtype = DType::BF16;
         }
     } else if persistent_batch {
-        let start_cursor = op.start_position % history_rows;
+        let start_cursor = core_window_position(op.start_position, window.map(|w| w.lo)) % history_rows;
         // The F16 prefill route's chunked recurrence reads the convolution
         // output as packed BF16 (every value is BF16-rounded already).
         if chunked {
@@ -1953,7 +2202,7 @@ fn execute_gated_delta_net_hc_impl(
             history: op.conv_state,
             output: &conv_output,
             next_history: op.conv_state,
-            rows: op.rows,
+            rows,
             channels: qkv,
             history_rows,
             kernel_size: op.conv_kernel,
@@ -1966,7 +2215,7 @@ fn execute_gated_delta_net_hc_impl(
             dt_bias: op.dt_bias,
             gate: &gate,
             beta: &beta,
-            rows: op.rows,
+            rows,
             heads: op.value_heads,
         };
         let step = GatedDeltaStepBatched {
@@ -2017,12 +2266,17 @@ fn execute_gated_delta_net_hc_impl(
         if bf16_store(&op.output, TrunkFamily::GdnOut.bit(), gpu) {
             gdn_output.dtype = DType::BF16;
         }
+        if window.is_some() {
+            // The core's output rows are read bank-wide by the output projection:
+            // this window writes its own rows (BF16 rows are 2 bytes wide).
+            gdn_output = gdn_output.sub_offset(lo * value, rows * value);
+        }
         let gated = GatedDeltaGateBatched {
             recurrent_output: &recurrent_output,
             z: &z,
             norm: op.norm,
             output: &gdn_output,
-            rows: op.rows,
+            rows,
             value_heads: op.value_heads,
             value_dim: op.value_dim,
         };
@@ -2053,13 +2307,13 @@ fn execute_gated_delta_net_hc_impl(
                 // `recurrent_output` is scratch with no reader after the gate.
                 #[cfg(feature = "deltanet")]
                 if rotate {
-                    let rotated = view(op.rotation, 0, op.rows * value);
+                    let rotated = view(op.rotation, lo * value, rows * value);
                     hip(rdna_compute::fn_gdn_dense::gate(gpu, &gated, Some(&rotated)))?;
                 } else {
                     hip(rdna_compute::fn_gdn_dense::gate(gpu, &gated, None))?;
                 }
             } else if rotate {
-                let rotated = view(op.rotation, 0, op.rows * value);
+                let rotated = view(op.rotation, lo * value, rows * value);
                 if let Some(src) = arenas.and_then(|a| a.z) {
                     hip(gated_delta_gate_batched_rotate_arena(gpu, &gated, &rotated, src))?;
                 } else {
@@ -2637,10 +2891,17 @@ impl IndexedAttentionOp<'_> {
     /// Host bookkeeping for a successful QSA step, shared by HIP and retained
     /// replay. The architecture commits it only after the forward succeeds.
     pub fn next_lengths(&self) -> Result<(usize, usize, usize, usize, usize), DispatchError> {
+        self.next_lengths_after(self.rows)
+    }
+
+    /// [`Self::next_lengths`] after only the first `rows` rows of this op: the
+    /// state a launch over those rows commits (a session snapshot row inside a
+    /// bank, or the start of the window after it).
+    pub fn next_lengths_after(&self, rows: usize) -> Result<(usize, usize, usize, usize, usize), DispatchError> {
         let final_position = self
             .state
             .position
-            .checked_add(self.rows)
+            .checked_add(rows)
             .ok_or_else(|| DispatchError::Hip("indexed attention position overflows".into()))?;
         if self.compress == 0 {
             return Err(DispatchError::Hip(
@@ -4110,6 +4371,50 @@ mod tests {
             trunk_a4: 0,
             phase: MixerPhase::Whole,
         }
+    }
+
+    #[test]
+    fn qsa_core_windows_compose_to_the_whole_launch() {
+        let t = tensor(1, DType::F32);
+        for position in [0usize, 20, 8191] {
+            for rows in [4647usize, 4672, 8192] {
+                let whole = indexed_attention(&t, rows, position, 3, IndexedAttentionMode::Full);
+                for r in [1usize, 64, 4096, rows - 1] {
+                    // The first window commits exactly what a chunk of r rows commits.
+                    let first = whole.next_lengths_after(r).unwrap();
+                    let chunk = indexed_attention(&t, r, position, 3, IndexedAttentionMode::Full);
+                    assert_eq!(first, chunk.next_lengths().unwrap(), "pos {position} rows {rows} r {r}");
+                    assert_eq!((first.0, first.1, first.4), (position + r, position + r, position + r));
+                    assert_eq!(first.2, (position + r) / 4);
+                    // The second starts from that commit and ends where the whole launch does.
+                    let second = indexed_attention(&t, rows - r, first.4, first.3, IndexedAttentionMode::Full);
+                    assert_eq!(second.next_lengths().unwrap(), whole.next_lengths().unwrap());
+                }
+                assert_eq!(whole.next_lengths_after(rows).unwrap(), whole.next_lengths().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn gdn_core_windows_continue_the_ring_cursor_and_requantize_at_chunk_ends() {
+        // The Q8 frame of a launch is `position + rows - 1` (tensor_ops); a window
+        // starts at `start + lo`, so the first window's frame is `start + r - 1` and
+        // the second's the whole bank's, with the conv ring cursor carried over.
+        let history_rows = 3;
+        for start in [0usize, 8192, 49152, 57343] {
+            for rows in [4647usize, 4672, 8192] {
+                for r in [1usize, 64, 4096, rows - 1] {
+                    let (first, second) = (CoreWindow { lo: 0, rows: r }, CoreWindow { lo: r, rows: rows - r });
+                    let position = |w: CoreWindow| core_window_position(start, Some(w.lo));
+                    assert_eq!(position(first), start);
+                    assert_eq!(position(first) + first.rows - 1, start + r - 1);
+                    assert_eq!(position(second), start + r);
+                    assert_eq!(position(second) + second.rows - 1, start + rows - 1);
+                    assert_eq!(position(second) % history_rows, (position(first) % history_rows + r) % history_rows);
+                }
+            }
+        }
+        assert_eq!(core_window_position(7, None), 7);
     }
 
     #[test]
