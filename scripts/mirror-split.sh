@@ -10,7 +10,7 @@
 # Reads the committed tree and history of the source checkout (HEAD, or
 # MIRROR_SOURCE_REV) and never touches it. The destination (default
 # mirror-preview/peacemaker under the source checkout) must not exist. It never
-# pushes; pushing is the workflow's job.
+# pushes; scripts/mirror-push.sh gates and pushes.
 #
 # Environment: MIRROR_SOURCE_REV, MIRROR_FILTER_REPO (path of git-filter-repo if
 # it is not on PATH).

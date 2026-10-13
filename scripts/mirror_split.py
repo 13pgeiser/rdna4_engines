@@ -4,7 +4,7 @@
 
     scripts/mirror-split.sh peacemaker [destination]
 
-Never pushes; the caller does. The source checkout is only read. The destination
+Never pushes; scripts/mirror-push.sh gates and pushes. The source checkout is only read. The destination
 (default mirror-preview/peacemaker under the source checkout) must not exist.
 Environment: MIRROR_SOURCE_REV (source commit-ish, default HEAD),
 MIRROR_FILTER_REPO (path of git-filter-repo 2.47.0 if it is not on PATH).
