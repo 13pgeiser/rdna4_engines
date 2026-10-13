@@ -73,9 +73,9 @@ cargo test --workspace --no-run --manifest-path "$CUT_ROOT/mirror-cut/peacemaker
 Run the external publication guard over both the hipfire delta and every
 commit delta in the complete filtered history, including generated files.
 CPU-only merge gate specs are
-`-p peacemaker-npu;-p npu-tools;-p hipfire-arch-qwen4;-p rdna-compute;-p peacemaker-ir;-p peacemaker-lift;-p peacemaker-author;-p peacemaker-isa;-p peacemaker-rip`.
+`-p peacemaker-npu --lib;-p peacemaker-isa --lib;-p peacemaker-rip --lib;-p railgun-cert every_recording_predicate_in_the_tree_has_an_inventory_row;-p npu-tools;-p hipfire-arch-qwen4;-p rdna-compute;-p peacemaker-ir;-p peacemaker-lift;-p peacemaker-author;-p radiowave`.
 The operator's merge gate rebases again, regenerates maps, runs documentation
-ratchets and these tests, adds the recording-inventory test, and pushes beta.
+ratchets and these tests, and pushes beta.
 Do not run it during preparation. The beta push triggers the first automatic
 PeaceMaker publication using `PEACEMAKER_MIRROR_KEY`.
 
