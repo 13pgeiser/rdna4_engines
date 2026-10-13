@@ -1414,6 +1414,11 @@ impl Qwen4TileRoute {
         if !tile_ranks_supported(placement.ranks) {
             return refuse("needs 2 or 4 ranks");
         }
+        if placement.ranks == 4 {
+            // The transport and the 4-source pull are rank-generic and CPU-tested, but the EP4
+            // exactness cells have not run on hardware: EP4 keeps the full-table route.
+            return refuse("EP4 owner-routed prefill not yet gated");
+        }
         if gpu.arch != "gfx1201" {
             return refuse("needs gfx1201");
         }
@@ -4165,7 +4170,8 @@ impl Qwen4GpuForward {
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
                 if ep.is_none()
-                    || hipfire_config::developer_var(Qwen4ExpertStage::EP_ENV).as_deref() == Ok("1")
+                    || (hipfire_config::developer_var(Qwen4ExpertStage::EP_ENV).as_deref() == Ok("1")
+                        && ep.as_ref().is_some_and(|state| state.tile.is_some()))
                 {
                     expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
                 }
@@ -5563,13 +5569,13 @@ impl Qwen4GpuForward {
         // G2 expert stage under EP: a full-table chunk reads another rank's donor VRAM, so every
         // rank drains its stage donors and crosses a host barrier before ANY rank launches it.
         if ep.is_some() && route_n > 1 && !ep_few_rows && !tile_active {
-            if let Some(stage) = self.expert_stage.as_ref() {
-                let hook = ep
-                    .and_then(|ep| ep.tile.as_ref())
-                    .and_then(|route| route.hook.as_ref())
-                    .ok_or_else(|| {
-                        invalid("an EP expert stage needs the owner-routed tile exchange's host barrier")
-                    })?;
+            // A stage is only ever USED (donors overwritten) on forwards that bind the compact
+            // route, which needs the installed exchange; without its hook no forward staged, so
+            // there is nothing to drain.
+            let hook = ep
+                .and_then(|ep| ep.tile.as_ref())
+                .and_then(|route| route.hook.as_ref());
+            if let (Some(stage), Some(hook)) = (self.expert_stage.as_ref(), hook) {
                 stage.ep_quiesce(gpu)?;
                 hook.host_barrier()
                     .map_err(|error| invalid(format!("EP stage quiesce barrier: {error}")))?;

@@ -265,7 +265,7 @@ MoE layers` at attach when it is on.
 
 Without the lever every EP rank runs the whole 512-expert grouped MoE of every
 prefill chunk, reading its peers' experts through P2P weight tables.
-`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1` (default off; two or four gfx1201 ranks)
+`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1` (default off; EP2 on gfx1201; EP4 is refused at admission with `EP4 owner-routed prefill not yet gated` until its hardware cells have run, the code is rank-generic)
 splits that work. All ranks still run the router, top-k and stable grouping
 (a deterministic function of replicated bytes, so the grouped layout is
 identical everywhere). Each rank runs the grouped symmetric IU4 gate/up and
