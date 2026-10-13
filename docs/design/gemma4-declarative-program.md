@@ -201,6 +201,37 @@ request):
   vs PR head 3.368/3.122/2.633/3.639/2.977. The first token now comes from
   prefill, and each window pairs its seed with the hidden that predicted it.
 
+### Beta integration: resident cache, EP and paired boundaries
+
+The `SessionDriver` cutover retains beta's HIPF-46 resident-cache lifecycle
+(`crates/hipfire-runtime/src/session_cache.rs`):
+
+- `commit` publishes pending snapshots and drops the driver's live record and
+  request prompt, but keeps the resident snapshot backed by the owners' row
+  streams. `forget_live`, used after an external owner reset, calls
+  `SessionCache::live_state_reset` to invalidate both published and pending
+  residents; their buffers are released at the next begin or clear. `clear`
+  drops live/turn state and frees all cached, pending and deferred buffers.
+- Boundary capture retains the request end in `Turn.end` and passes that end
+  to `growth_reserve_bytes`, reserving for the remaining prefill rather than
+  only the boundary being captured.
+- `plan_capped` considers actual snapshot reuse points at or below the cap and
+  filters live reuse by the same cap; it does not truncate a deeper live record
+  into an invented reuse point. A snapshot at the cap is eligible because the
+  planning prefix includes one more token, while reuse still leaves the last
+  prompt token to compute. Qwen4's `ep_session_plan` (`src/ep.rs`) lowers the cap
+  to the smallest rank plan and replans until every rank agrees.
+- Qwen4's paired scheduler (`src/bundle.rs`) uses the forwarded
+  `next_boundary_after` to inspect a later boundary without consuming the
+  capture cursor. Paired publication (`src/session_pair.rs`) uses `turn_route`
+  and `at_turn_boundary` to capture the canonical prompt held by the driver,
+  without another token copy; missing prompts and out-of-range positions are
+  rejected before capture. The optional PLE owner, `pair_session_stage`, EP
+  fanout and NPU request planning remain architecture-owned.
+
+The Qwen4 paths above are under `crates/hipfire-arch-qwen4`. These are source
+contracts, not additional GPU exactness or performance measurements.
+
 ## Progress
 
 | Piece | State | Commit |

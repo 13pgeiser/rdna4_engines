@@ -1508,6 +1508,56 @@ mod tests {
         assert_eq!(cache.next_boundary_after(16384), None);
         assert_eq!(cache.next_boundary(), Some(8192));
     }
+
+    #[test]
+    fn driver_boundary_lookahead_forwards_without_consuming() {
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), 8 << 30));
+        assert_eq!(driver.next_boundary(), None);
+        assert_eq!(driver.next_boundary_after(0), None);
+        driver.cache.turn = Some(Turn {
+            domain: domain(),
+            route: SessionRoute::Mtp,
+            boundaries: VecDeque::from([8192, 10000, 16384]),
+            end: 16384,
+        });
+        for (position, expected) in [
+            (0, Some(8192)),
+            (8191, Some(8192)),
+            (8192, Some(10000)),
+            (10000, Some(16384)),
+            (16384, None),
+            (usize::MAX, None),
+        ] {
+            assert_eq!(driver.next_boundary_after(position), expected);
+            assert_eq!(driver.next_boundary(), Some(8192));
+        }
+        assert_eq!(
+            driver.cache.turn.as_ref().unwrap().boundaries,
+            VecDeque::from([8192, 10000, 16384])
+        );
+        driver.commit();
+        assert_eq!(driver.next_boundary_after(0), None);
+    }
+
+    #[test]
+    fn driver_turn_route_tracks_the_in_flight_request_only() {
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), 0));
+        assert_eq!(driver.turn_route(), None);
+        for route in [SessionRoute::Ar, SessionRoute::Mtp] {
+            driver.live = Some(record(&[1, 2], route));
+            assert_eq!(driver.turn_route(), None);
+            driver.turn = Some((vec![1, 2, 3], route));
+            assert_eq!(driver.turn_route(), Some(route));
+            driver.commit();
+            assert_eq!(driver.turn_route(), None);
+            assert!(driver.live.is_none());
+            driver.turn = Some((vec![1, 2, 3], route));
+            driver.live = Some(record(&[1, 2], route));
+            driver.forget_live();
+            assert_eq!(driver.turn_route(), None);
+            assert!(driver.live.is_none());
+        }
+    }
     use crate::serve_contract::{
         ArchPolicy, DeviceTopology, KvLayout, SharingNamespace, TemplateIdentity, TokenizerIdentity,
     };
@@ -2110,6 +2160,7 @@ mod tests {
         assert_eq!(plan_start(8192, Some(300)), 8192);
     }
 
+    /// GPU: capped snapshot/live selection and canonical boundary forwarding.
     #[test]
     fn driver_continues_live_state_and_restores_snapshots() {
         let Ok(mut gpu) = Gpu::init() else {
@@ -2133,7 +2184,7 @@ mod tests {
             let live = driver.begin(gpu, toy, p, AR, reused, false).unwrap();
             while let Some(b) = driver.next_boundary() {
                 toy.advance(gpu, &p[..b]);
-                driver.at_boundary(gpu, toy, &p[..b]).unwrap();
+                driver.at_turn_boundary(gpu, toy, b).unwrap();
             }
             toy.advance(gpu, p);
             (reused, live)
@@ -2148,6 +2199,28 @@ mod tests {
         // Turn 2 extends the consumed history: continue in place.
         let mut turn2 = consumed.clone();
         turn2.extend(prompt(2, 9));
+        // The cap applies to each source, not to the final reuse length:
+        // rejecting the deeper live record must fall back to a real snapshot.
+        for (cap, expected) in [
+            (0, 0),
+            (STRIDE - 1, 0),
+            (STRIDE, STRIDE),
+            (consumed.len() - 1, STRIDE),
+            (consumed.len(), consumed.len()),
+            (consumed.len() + 1, consumed.len()),
+            (turn2.len(), consumed.len()),
+            (usize::MAX, consumed.len()),
+        ] {
+            assert_eq!(driver.plan_capped(&toy, &turn2, AR, cap), expected);
+        }
+        assert_eq!(driver.plan(&toy, &turn2, AR), consumed.len());
+        assert_eq!(driver.plan_capped(&toy, &turn2, MTP, usize::MAX), STRIDE);
+        let mut divergent = turn2.clone();
+        divergent[STRIDE] ^= 1;
+        assert_eq!(driver.plan_capped(&toy, &divergent, AR, usize::MAX), STRIDE);
+        for cap in [0, STRIDE, usize::MAX] {
+            assert_eq!(driver.plan_capped(&toy, &[], AR, cap), 0);
+        }
         assert_eq!(
             prefill(&mut driver, &mut toy, gpu, &turn2),
             (consumed.len(), true)
@@ -2158,9 +2231,141 @@ mod tests {
         driver.commit();
         let mut other = turn1[..STRIDE].to_vec();
         other.extend(prompt(3, 4));
+        assert!(driver.live.is_none());
+        for (cap, expected) in [
+            (0, 0),
+            (STRIDE - 1, 0),
+            (STRIDE, STRIDE),
+            (STRIDE + 1, STRIDE),
+            (usize::MAX, STRIDE),
+        ] {
+            assert_eq!(driver.plan_capped(&toy, &other, AR, cap), expected);
+        }
         assert_eq!(prefill(&mut driver, &mut toy, gpu, &other), (STRIDE, false));
         assert_eq!(toy.bytes(gpu), (fixed_of(&other), rows_of(&other)));
+        // A shorter live conversation loses to a deeper snapshot only when
+        // that snapshot is within the cap.
+        let short = &other[..STRIDE / 2];
+        assert!(!driver.begin(gpu, &mut toy, short, AR, 0, false).unwrap());
+        toy.advance(gpu, short);
+        driver.commit_live(&toy, short);
+        for (cap, expected) in [
+            (short.len() - 1, 0),
+            (short.len(), short.len()),
+            (STRIDE - 1, short.len()),
+            (STRIDE, STRIDE),
+            (usize::MAX, STRIDE),
+        ] {
+            assert_eq!(driver.plan_capped(&toy, &other, AR, cap), expected);
+        }
         driver.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    /// GPU: real captures distinguish a resident from pooled/live reuse.
+    #[test]
+    fn driver_validates_canonical_boundaries_and_preserves_resident_until_reset() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let mut toy = Toy {
+            fixed: gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap(),
+            rows: gpu
+                .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+                .unwrap(),
+            position: 0,
+        };
+        let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), one - 1));
+        assert_eq!(
+            driver.at_turn_boundary(gpu, &mut toy, STRIDE).unwrap_err(),
+            "session boundary has no prompt in flight"
+        );
+
+        let canonical = prompt(1, 2 * STRIDE + 5);
+        let mut request = canonical.clone();
+        assert!(!driver.begin(gpu, &mut toy, &request, MTP, 0, false).unwrap());
+        assert_eq!(driver.turn_route(), Some(MTP));
+        // The caller's buffer is no longer the prompt in flight.
+        request[0] ^= 1;
+        assert_eq!(
+            driver
+                .at_turn_boundary(gpu, &mut toy, canonical.len() + 1)
+                .unwrap_err(),
+            "session boundary exceeds the prompt in flight"
+        );
+        assert!(driver.at_turn_boundary(gpu, &mut toy, STRIDE - 1).is_err());
+        assert_eq!(driver.next_boundary(), Some(STRIDE));
+        assert_eq!(toy.position, 0);
+        assert!(driver.cache.pending.is_empty());
+        assert!(driver.cache.resident_pending.is_none());
+        while let Some(b) = driver.next_boundary() {
+            toy.advance(gpu, &canonical[..b]);
+            driver.at_turn_boundary(gpu, &mut toy, b).unwrap();
+        }
+        toy.advance(gpu, &canonical);
+        assert_eq!(driver.plan(&toy, &canonical, MTP), 0);
+        driver.commit();
+        assert_eq!(driver.turn_route(), None);
+        assert!(driver.live.is_none());
+        assert_eq!(driver.cache.stored_bytes(), 0);
+        assert_eq!(driver.plan(&toy, &canonical, MTP), 2 * STRIDE);
+        assert_eq!(driver.plan(&toy, &request, MTP), 0);
+        // Even a second, empty commit must not invalidate the resident.
+        driver.commit();
+        assert_eq!(driver.plan(&toy, &canonical, MTP), 2 * STRIDE);
+
+        let mut continuation = canonical.clone();
+        continuation.extend(prompt(2, STRIDE));
+        assert!(!driver
+            .begin(gpu, &mut toy, &continuation, MTP, 2 * STRIDE, false)
+            .unwrap());
+        assert_eq!(
+            toy.bytes(gpu),
+            (fixed_of(&canonical[..2 * STRIDE]), rows_of(&canonical[..2 * STRIDE]))
+        );
+        toy.advance(gpu, &continuation[..3 * STRIDE]);
+        driver.at_turn_boundary(gpu, &mut toy, 3 * STRIDE).unwrap();
+        assert!(driver.cache.resident.is_some());
+        assert!(driver.cache.resident_pending.is_some());
+        // An external reset invalidates both published and uncommitted
+        // residents; deferred buffers are released by clear.
+        toy.reset(gpu).unwrap();
+        driver.forget_live();
+        assert_eq!(driver.turn_route(), None);
+        assert!(driver.cache.resident.is_none());
+        assert!(driver.cache.resident_pending.is_none());
+        assert_eq!(driver.cache.release_bufs.len(), 2);
+        assert_eq!(driver.plan(&toy, &continuation, MTP), 0);
+        assert_eq!(
+            driver.at_turn_boundary(gpu, &mut toy, 3 * STRIDE).unwrap_err(),
+            "session boundary has no prompt in flight"
+        );
+        driver.clear(gpu);
+        assert!(driver.cache.release_bufs.is_empty());
+        assert_eq!(driver.next_boundary(), None);
+
+        // Clear must also drop a committed live record and resident, not
+        // just the deferred buffers from forget_live.
+        driver.begin(gpu, &mut toy, &canonical, AR, 0, false).unwrap();
+        while let Some(b) = driver.next_boundary() {
+            toy.advance(gpu, &canonical[..b]);
+            driver.at_turn_boundary(gpu, &mut toy, b).unwrap();
+        }
+        toy.advance(gpu, &canonical);
+        driver.commit_live(&toy, &canonical);
+        assert!(driver.live.is_some());
+        assert!(driver.cache.resident.is_some());
+        driver.clear(gpu);
+        assert!(driver.live.is_none());
+        assert_eq!(driver.turn_route(), None);
+        assert!(driver.cache.resident.is_none());
+        assert!(driver.cache.resident_pending.is_none());
+        assert_eq!(driver.cache.stored_bytes(), 0);
+        assert_eq!(driver.plan(&toy, &continuation, AR), 0);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
     }

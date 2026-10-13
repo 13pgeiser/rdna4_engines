@@ -462,16 +462,15 @@
   from `hipfire_dispatch`; dense and E-series batched prefill and EAGLE verify
   run the same program with `rows > 1`. The Gemma 4 super-op path and its
   `HIPFIRE_FORWARD_LOWERED` hand arms are gone.
-  - 12B, E2B and E4B decode, batched prefill and EAGLE verify are
-    byte-identical, logits included; EAGLE tau is unchanged.
   - The 26B-A4B now takes the 12B's fused qk-norm+RoPE and post-norm+residual
     kernels. Greedy text stays coherent and can diverge late.
   - `calib_sweep`, `eval_hipfire` and `prefill_parity_gemma4` prefill Gemma 4
-    through the same program (`forward::forward_prefill_batch`, 256-row
-    chunks, Q8 KV). The dispatch sandwich projections feed the calibration
-    collector, so any architecture on these steps calibrates without
-    per-architecture taps. Gemma calibration and KLD numbers move: the tools
-    now use the serve kernels. The 26B-A4B MoE block runs batched too.
+    through the same program (`forward::forward_prefill_batch`, with
+    architecture-specific chunk sizes, Q8 KV). The dispatch sandwich
+    projections feed the calibration collector, so any architecture on these
+    steps calibrates without per-architecture taps. Gemma calibration and
+    KLD numbers move: the tools now use the serve kernels. The 26B-A4B MoE
+    block runs batched too.
   - `HIPFIRE_BATCHED_PREFILL` and `HIPFIRE_WMMA_PREFILL` are removed.
   - The `HIPFIRE_GEMMA4_FUSED_{FFN,QK,QK_ROPE,POSTNORM,ATTN_NORM,PROJ}` developer
     switches are removed; the fused routes are always on. The debug switches
@@ -526,9 +525,8 @@
   - attend with a GQA-shared WMMA flash kernel, sliding window included
     (`HIPFIRE_Q8_PREFILL_GQA_WMMA=0` restores the tile kernels);
   - compute the LM head on the last chunk only.
-  Greedy continuations differ from per-token prefill only by reduction order:
-  the reference continuation's NLL moves by at most 0.02 nats/token across
-  12B, E2B, E4B and both 26B fixtures.
+  Batched prefill changes floating-point reduction order; it is not a
+  byte-identity claim against per-token prefill.
 - Gemma 4 26B-A4B long-context decode: flash-decode tiles that lie wholly
   below the sliding window exit without reading V, and the Q8 reduce skips
   them and loads tile partials eight at a time (both bit-exact, for every
