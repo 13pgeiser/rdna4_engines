@@ -427,14 +427,23 @@ mod tests {
     fn prompt_end_boundary_is_on_the_prefill_grid() {
         let prompt = vec![7u32; 1136];
         // Stride multiple, then the prompt rounded down to the width.
-        assert_eq!(grid_boundaries(64, &prompt, 0, 1136), vec![SESSION_STRIDE, 1088]);
+        assert_eq!(
+            grid_boundaries(64, &prompt, 0, 1136),
+            vec![SESSION_STRIDE, 1088]
+        );
         assert_eq!(grid_boundaries(256, &prompt, 0, 1136), vec![SESSION_STRIDE]);
         // Per-token prefill resumes at the prompt end itself.
         assert_eq!(grid_boundaries(1, &prompt, 1106, 1136), vec![1136]);
         // Nothing at or below `after`, nothing above `up_to`.
-        assert_eq!(grid_boundaries(64, &prompt, 1088, 1136), Vec::<usize>::new());
+        assert_eq!(
+            grid_boundaries(64, &prompt, 1088, 1136),
+            Vec::<usize>::new()
+        );
         assert_eq!(grid_boundaries(64, &prompt, 0, 1087), vec![SESSION_STRIDE]);
         // A width that does not divide the stride stays ascending.
-        assert_eq!(grid_boundaries(100, &prompt[..1050], 0, 1050), vec![1000, SESSION_STRIDE]);
+        assert_eq!(
+            grid_boundaries(100, &prompt[..1050], 0, 1050),
+            vec![1000, SESSION_STRIDE]
+        );
     }
 }
