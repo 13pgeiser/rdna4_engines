@@ -39,8 +39,8 @@ use crate::mtp_spec::{
     finish_native_window, mtp_prefill_chunk,
     mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
     mtp_skip_intermediate_pick_enabled, observe_agreement, Agreement, DraftPairing, FloorRoute,
-    MtpFloor, NativeFinish, NativeWindow, DRAFT_ACCEPT_MAX, MTP_AGREEMENT_PRIOR, MTP_MAX_DEPTH,
-    MTP_ROW_WORTH,
+    MtpFloor, NativeFinish, NativeWindow, DRAFT_ACCEPT_MAX, MTP_AGREEMENT_DECAY, MTP_AGREEMENT_PRIOR,
+    MTP_MAX_DEPTH, MTP_ROW_WORTH,
 };
 use crate::lane::Qwen4LaneStore;
 use crate::state::Qwen4StateSnapshot;
@@ -328,7 +328,7 @@ impl LaneSpecPolicy {
 
     /// A finished batched window of budget `k` priced at `units` AR rows.
     pub(crate) fn observe_batched(&mut self, window: &MtpWindow, units: f32, k: usize) {
-        observe_agreement(&mut self.agreement, window);
+        observe_agreement(&mut self.agreement, window, MTP_AGREEMENT_DECAY);
         if self.floor_enabled {
             self.floor
                 .observe_native(NativeWindow::Batched, window, units, k, &self.agreement);
@@ -341,7 +341,7 @@ impl LaneSpecPolicy {
         if k == 0 {
             return;
         }
-        observe_agreement(&mut self.agreement, window);
+        observe_agreement(&mut self.agreement, window, MTP_AGREEMENT_DECAY);
         if self.floor_enabled {
             self.floor
                 .observe_native(NativeWindow::Interleaved, window, 1.0, k, &self.agreement);
@@ -999,6 +999,42 @@ mod tests {
         for lanes in 0..=16 {
             assert_eq!(model.window_units(lanes, 0, 0.5), 1.0, "fed, C {lanes}");
         }
+    }
+
+    #[test]
+    fn fresh_and_promoted_lanes_keep_the_short_agreement_decay() {
+        assert_eq!(MTP_AGREEMENT_DECAY, 0.875);
+        for floor_enabled in [false, true] {
+            let inherited = [(4.0, 5.0); MTP_MAX_DEPTH];
+            for mut policy in [
+                LaneSpecPolicy::with_floor(3, floor_enabled),
+                LaneSpecPolicy::promoted_with_floor(3, inherited, false, floor_enabled),
+            ] {
+                let mut expected = policy.agreement[0];
+                policy.observe_batched(&window(1, 0, 1), 1.0, 3);
+                expected = (expected.0 * 0.875, expected.1 * 0.875 + 1.0);
+                assert_eq!(policy.agreement[0], expected);
+                policy.observe_ar_synced(&window(2, 1, 1), 3);
+                expected = (expected.0 * 0.875 + 1.0, expected.1 * 0.875 + 1.0);
+                assert_eq!(policy.agreement[0], expected);
+                let unchanged = policy.agreement;
+                policy.observe_ar_synced(&window(2, 1, 1), 0);
+                assert_eq!(policy.agreement, unchanged);
+            }
+        }
+    }
+
+    #[test]
+    fn lane_floor_retains_the_short_cost_decay() {
+        // These three windows pay at 0.875, but not at 0.97, after the
+        // lane floor's three-window probe budget.
+        let mut policy = LaneSpecPolicy::with_floor(1, true);
+        policy.route(1, LabRoutes::Floor);
+        for units in [3.0, 0.8, 2.05] {
+            policy.observe_batched(&window(2, 1, 1), units, 1);
+        }
+        assert!(!policy.retired());
+        assert_eq!(policy.route(1, LabRoutes::Floor), LaneRoute::Batched { k_max: 1 });
     }
 
     #[test]

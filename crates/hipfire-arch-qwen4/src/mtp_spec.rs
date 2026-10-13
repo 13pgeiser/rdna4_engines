@@ -733,13 +733,17 @@ fn takeover_probe(gpu: &Gpu, start: Instant) -> TakeoverProbe {
 /// 8 ~98) plus ~2.7 ms per draft step.
 pub(crate) const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
 /// Per-window decay of the per-depth agreement counts, and of the AR floor's
-/// measured window costs and n-gram yield history (~30-window memory). The
-/// floor retires a request to AR, stickily, once no native route's measured
-/// cost per expected token beats AR. With an ~8-window memory (0.875) an
-/// early run of rejections or one slow window retired requests that native
-/// MTP was winning: on sampled HumanEval/0-9, /1 and /6 retired in every run.
-/// Decaying only the agreement at 0.97 still retired /6 in every run.
-const MTP_AGREEMENT_DECAY: f32 = 0.97;
+/// measured window costs and n-gram yield history (~8-window memory): the
+/// Flash-Next lanes' value, and the singleton drafter's on every arch
+/// without a measured longer memory ([`singleton_agreement_decay`]).
+pub(crate) const MTP_AGREEMENT_DECAY: f32 = 0.875;
+/// The singleton drafter's decay on gfx1151 (~30-window memory). The floor
+/// retires a request to AR, stickily, once no native route's measured cost
+/// per expected token beats AR. With the ~8-window memory an early run of
+/// rejections or one slow window retired requests that native MTP was
+/// winning: on sampled HumanEval/0-9 (Strix Halo), /1 and /6 retired in every
+/// run. Decaying only the agreement at 0.97 still retired /6 in every run.
+const MTP_AGREEMENT_DECAY_GFX1151: f32 = 0.97;
 /// Per-depth (accepted, compared) counts a request starts from (0.8).
 pub(crate) const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
 /// Per-window relaxation of a depth the window did not compare toward
@@ -820,6 +824,18 @@ fn singleton_floor_min_windows() -> usize {
         .unwrap_or(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
 }
 
+/// The singleton drafter's agreement / floor-cost / n-gram-yield decay on
+/// `arch`: [`MTP_AGREEMENT_DECAY_GFX1151`] on gfx1151, where the longer
+/// memory was measured, else [`MTP_AGREEMENT_DECAY`]. The lanes keep
+/// [`MTP_AGREEMENT_DECAY`].
+fn singleton_agreement_decay(arch: &str) -> f32 {
+    if arch == "gfx1151" {
+        MTP_AGREEMENT_DECAY_GFX1151
+    } else {
+        MTP_AGREEMENT_DECAY
+    }
+}
+
 pub(crate) type Agreement = [(f32, f32); MTP_MAX_DEPTH];
 
 /// Route the floor picks for one native window.
@@ -842,11 +858,11 @@ fn valid_us(us: f32) -> bool {
     us.is_finite() && us > 0.0
 }
 
-/// Add one observation to a decayed `(sum, weight)` pair; only the entry
-/// being observed decays.
-fn decay_add(entry: &mut (f32, f32), sum: f32, weight: f32) {
-    entry.0 = entry.0 * MTP_AGREEMENT_DECAY + sum;
-    entry.1 = entry.1 * MTP_AGREEMENT_DECAY + weight;
+/// Add one observation to a `decay`-decayed `(sum, weight)` pair; only the
+/// entry being observed decays.
+fn decay_add(entry: &mut (f32, f32), sum: f32, weight: f32, decay: f32) {
+    entry.0 = entry.0 * decay + sum;
+    entry.1 = entry.1 * decay + weight;
 }
 
 /// Expected tokens a `depth`-draft window emits (the seed's bonus plus the
@@ -863,18 +879,18 @@ pub(crate) fn expected_emitted(agreement: &Agreement, depth: usize) -> f32 {
 
 /// Only the drafts compared before the first rejection count, so each
 /// depth measures the agreement conditional on its prefix being accepted
-/// (the same quantity on both routes). Compared depths decay and take the
-/// observation; depths the window did not compare relax toward
+/// (the same quantity on both routes). Compared depths decay by `decay` and
+/// take the observation; depths the window did not compare relax toward
 /// `MTP_AGREEMENT_PRIOR` (`MTP_AGREEMENT_RELAX`) instead of decaying, so a
 /// depth rejected once is re-explored rather than frozen below its
 /// threshold.
-pub(crate) fn observe_agreement(agreement: &mut Agreement, window: &MtpWindow) {
+pub(crate) fn observe_agreement(agreement: &mut Agreement, window: &MtpWindow, decay: f32) {
     let compared = (window.accepted + 1).min(window.drafts_generated);
     let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
     for (depth, (accepted, total)) in agreement.iter_mut().enumerate() {
         if depth < compared {
-            *accepted *= MTP_AGREEMENT_DECAY;
-            *total *= MTP_AGREEMENT_DECAY;
+            *accepted *= decay;
+            *total *= decay;
             *total += 1.0;
             *accepted += f32::from(u8::from(depth < window.accepted));
         } else {
@@ -952,6 +968,8 @@ pub(crate) struct MtpFloor {
     /// Decayed realized (wall us, emitted tokens) over every valid window
     /// observed after calibration, native and external alike.
     combined: (f32, f32),
+    /// Per-window decay of every decayed pair above.
+    decay: f32,
 }
 
 impl MtpFloor {
@@ -960,7 +978,8 @@ impl MtpFloor {
     }
 
     /// A fresh floor that may retire only after `retire_after` observed
-    /// windows (at least the probe budget).
+    /// windows (at least the probe budget), decaying by
+    /// [`MTP_AGREEMENT_DECAY`].
     pub(crate) fn with_retire_after(retire_after: usize) -> Self {
         Self {
             calibrated: false,
@@ -974,7 +993,13 @@ impl MtpFloor {
             external: (0.0, 0.0),
             external_blocked: false,
             combined: (0.0, 0.0),
+            decay: MTP_AGREEMENT_DECAY,
         }
+    }
+
+    /// The same floor decaying its measured costs by `decay`.
+    pub(crate) fn with_decay(self, decay: f32) -> Self {
+        Self { decay, ..self }
     }
 
     /// Whether the floor retired stickily to head-free AR.
@@ -1026,10 +1051,12 @@ impl MtpFloor {
         // An unusable timing records no cost but still spends probe budget,
         // so the number of unmeasured windows stays bounded.
         if valid_us(us) {
-            decay_add(&mut self.combined, us, window.committed.len() as f32);
+            let decay = self.decay;
+            decay_add(&mut self.combined, us, window.committed.len() as f32, decay);
             match route {
                 NativeWindow::Interleaved => {
-                    decay_add(&mut self.interleaved, us, window.committed.len() as f32);
+                    let emitted = window.committed.len() as f32;
+                    decay_add(&mut self.interleaved, us, emitted, decay);
                 }
                 NativeWindow::Batched => {
                     if let Some(entry) = self
@@ -1037,7 +1064,7 @@ impl MtpFloor {
                         .get_mut(window.drafts_generated)
                         .filter(|_| window.drafts_generated >= 1)
                     {
-                        decay_add(entry, us, 1.0);
+                        decay_add(entry, us, 1.0, decay);
                     }
                 }
             }
@@ -1059,11 +1086,12 @@ impl MtpFloor {
     ) -> bool {
         if !self.retired && drafts > 0 {
             if valid_us(wall_us) {
+                let decay = self.decay;
                 if self.calibrated {
-                    decay_add(&mut self.combined, wall_us, emitted as f32);
+                    decay_add(&mut self.combined, wall_us, emitted as f32, decay);
                 }
                 if emitted > 0 {
-                    decay_add(&mut self.external, wall_us, emitted as f32);
+                    decay_add(&mut self.external, wall_us, emitted as f32, decay);
                 }
             }
             self.count_probe();
@@ -2370,6 +2398,9 @@ pub struct Qwen4MtpDrafter {
     ngram_yield: (f32, f32),
     /// Single-row and additional-row verify milliseconds for the loaded arch.
     ngram_row_cost: Option<(f32, f32)>,
+    /// Per-window decay of `agreement`, `ngram_yield` and the floor's
+    /// measured costs on the loaded arch ([`singleton_agreement_decay`]).
+    agreement_decay: f32,
     /// `[seed, candidates..]` of the current takeover window (reused).
     takeover_block: Vec<u32>,
     /// Same-request AR floor model; reset only by `configure_request`
@@ -2418,6 +2449,7 @@ impl Qwen4MtpDrafter {
             ngram_candidates: Vec::new(),
             ngram_yield: (0.0, 0.0),
             ngram_row_cost: None,
+            agreement_decay: MTP_AGREEMENT_DECAY,
             takeover_block: Vec::new(),
             floor: MtpFloor::new(),
             floor_enabled: true,
@@ -2459,7 +2491,7 @@ impl Qwen4MtpDrafter {
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
     ) -> Result<(), String> {
-        self.ngram_row_cost = Self::ngram_row_cost_for(gpu);
+        self.bind_arch(gpu);
         let width = {
             let bundle = Self::bundle(target)?;
             bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -2786,7 +2818,7 @@ impl Qwen4MtpDrafter {
 
     /// See the free [`observe_agreement`].
     fn observe_agreement(&mut self, window: &MtpWindow) {
-        observe_agreement(&mut self.agreement, window);
+        observe_agreement(&mut self.agreement, window, self.agreement_decay);
     }
 
     /// See the free [`batched_depth`].
@@ -3321,8 +3353,9 @@ impl Qwen4MtpDrafter {
             self.takeover_window(gpu, target, position, seed, emitted, &candidates, eos, probe);
         self.ngram_candidates = candidates;
         let window = window?;
-        self.ngram_yield.0 = self.ngram_yield.0 * MTP_AGREEMENT_DECAY + window.committed.len() as f32;
-        self.ngram_yield.1 = self.ngram_yield.1 * MTP_AGREEMENT_DECAY + 1.0;
+        let decay = self.agreement_decay;
+        self.ngram_yield.0 = self.ngram_yield.0 * decay + window.committed.len() as f32;
+        self.ngram_yield.1 = self.ngram_yield.1 * decay + 1.0;
         self.stats.ngram_mod_windows += 1;
         self.stats.ngram_mod_drafts += window.drafts_generated;
         self.stats.ngram_mod_accepted += window.accepted;
@@ -4098,6 +4131,14 @@ impl Qwen4MtpDrafter {
         }
     }
 
+    /// Bind the loaded arch's n-gram row prices and singleton decay (the
+    /// request's floor takes the decay too).
+    fn bind_arch(&mut self, gpu: &Gpu) {
+        self.ngram_row_cost = Self::ngram_row_cost_for(gpu);
+        self.agreement_decay = singleton_agreement_decay(&gpu.arch);
+        self.floor.decay = self.agreement_decay;
+    }
+
     /// Every timing- or host-state-dependent decision of the next window,
     /// host only: the forced-route environment, the floor's retirement and
     /// calibration, the n-gram pool's hit (and its yield gate), the floor's
@@ -4837,9 +4878,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
         if ep {
             self.refuse_naive_under_ep()?;
         }
-        // The floor's n-gram pricing reads the arch before the window's
-        // resource pass sets it again (to the same value).
-        self.ngram_row_cost = Self::ngram_row_cost_for(gpu);
+        // The floor's n-gram pricing and decay read the arch before the
+        // window's resource pass sets them again (to the same values).
+        self.bind_arch(gpu);
         let mut plan = self.plan_window(emitted, k)?;
         if !ep {
             return self.run_window(gpu, target, position, seed, emitted, eos, &plan);
@@ -4990,7 +5031,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
     /// `HIPFIRE_MTP_SAMPLED_MODE=naive`; greedy requests keep the argmax match.
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
-        self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows());
+        self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows())
+            .with_decay(self.agreement_decay);
         self.floor_enabled =
             hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0");
         if let Some(device) = self.sampled.as_mut().and_then(|state| state.device.take()) {
@@ -6004,6 +6046,93 @@ mod tests {
         }
         let n = recovered_after.expect("depth 3 must be re-explored");
         assert!(n < 40, "depth 3 returned only after {n} windows");
+    }
+
+    #[test]
+    fn singleton_decay_is_long_on_gfx1151_only_and_reaches_the_request_floor() {
+        assert_eq!(MTP_AGREEMENT_DECAY, 0.875);
+        assert_eq!(MTP_AGREEMENT_DECAY_GFX1151, 0.97);
+        assert_eq!(singleton_agreement_decay("gfx1151"), 0.97);
+        for arch in [
+            "",
+            "gfx1150",
+            "gfx1152",
+            "gfx1201",
+            "gfx1200",
+            "gfx1100",
+            "gfx942",
+            "gfx1151:sramecc+",
+            "GFX1151",
+        ] {
+            assert_eq!(singleton_agreement_decay(arch), 0.875, "{arch}");
+        }
+        assert_eq!(MtpFloor::new().decay, 0.875);
+        // Binding an arch selects one decay for agreement and every floor
+        // cost pair; configuring another request must preserve that choice.
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        assert_eq!(drafter.agreement_decay, 0.875);
+        for arch in ["gfx1151", "gfx1201", "gfx1151", "gfx942"] {
+            let decay = singleton_agreement_decay(arch);
+            drafter.agreement_decay = decay;
+            drafter.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+            MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+            assert_eq!(drafter.floor.decay, decay, "{arch}");
+            drafter.observe_agreement(&window(0, 1));
+            let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
+            assert_eq!(
+                drafter.agreement[0],
+                (prior_accepted * decay, prior_total * decay + 1.0),
+                "{arch}"
+            );
+            drafter.floor.observe_calibration(100.0, &drafter.agreement);
+            let mut combined = (0.0, 0.0);
+            for route in [NativeWindow::Interleaved, NativeWindow::Batched] {
+                for _ in 0..2 {
+                    drafter.floor.observe_native(
+                        route,
+                        &window(1, 1),
+                        40.0,
+                        3,
+                        &drafter.agreement,
+                    );
+                    combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
+                }
+            }
+            assert_eq!(drafter.floor.combined, combined);
+            assert_eq!(
+                drafter.floor.interleaved,
+                (40.0 * decay + 40.0, 2.0 * decay + 2.0)
+            );
+            assert_eq!(
+                drafter.floor.batched[1],
+                (40.0 * decay + 40.0, decay + 1.0)
+            );
+            for _ in 0..2 {
+                assert!(!drafter.floor.observe_external(2, 40.0, 1, &drafter.agreement));
+                combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
+            }
+            assert_eq!(drafter.floor.combined, combined);
+            assert_eq!(
+                drafter.floor.external,
+                (40.0 * decay + 40.0, 2.0 * decay + 2.0)
+            );
+            drafter.floor.retired = true;
+            drafter.ngram_yield = (8.0, 2.0);
+            let agreement = drafter.agreement;
+            MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+            assert_eq!(drafter.agreement_decay, decay);
+            assert_eq!(drafter.floor.decay, decay);
+            assert!(!drafter.floor.retired);
+            assert!(!drafter.floor.calibrated);
+            assert_eq!(drafter.floor.observed, 0);
+            assert_eq!(drafter.floor.combined, (0.0, 0.0));
+            assert_eq!(drafter.floor.external, (0.0, 0.0));
+            assert_eq!(drafter.floor.interleaved, (0.0, 0.0));
+            assert_eq!(drafter.floor.batched, [(0.0, 0.0); MTP_WINDOW_COST.len()]);
+            assert_eq!(drafter.ngram_yield, (0.0, 0.0));
+            // Agreement restarts during prefill, not configure_request.
+            assert_eq!(drafter.agreement, agreement);
+        }
     }
 
     #[test]
