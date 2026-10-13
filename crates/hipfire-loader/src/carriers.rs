@@ -1798,22 +1798,18 @@ pub fn load_qwen4_rank(
                 gib(mem_available.unwrap_or(0)),
                 gib(ttm_pool)
             );
-            if native_mtp
-                && !crate::admission::qwen4_mtp_with_host_mapped_experts(
-                    ctx.spec,
-                    &ctx.gpu.arch,
+        if native_mtp
+            && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, moved)
+        {
+            native_mtp = false;
+            eprintln!(
+                "{}",
+                hipfire_config::mtp_host_spill_decline_line(
+                    "qwen4 native",
                     moved,
+                    host_bytes,
+                    &format!("on {}", ctx.gpu.arch),
                 )
-            {
-                native_mtp = false;
-                eprintln!(
-                    "{}",
-                    hipfire_config::mtp_host_spill_decline_line(
-                        "qwen4 native",
-                        moved,
-                        host_bytes,
-                        &format!("on {}", ctx.gpu.arch),
-                    )
                 );
         }
     }

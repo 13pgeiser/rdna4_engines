@@ -817,18 +817,20 @@ Two checks exist; only one is gated:
 |---|---|---|
 | `memory.gpu_layer_budget` | unset/null (fully resident on every model) | int 0–65536 \| `auto`/`-1` |
 | `memory.moe_expert_budget` | unset/null (fully resident on every model) | int 0–65536 \| `auto`/`-1` |
-| `memory.offload_exec` | `pcie` | `pcie` \| `cpu` |
+| `memory.offload_exec` | `pcie` | `pcie` \| `cpu` \| `passback` |
+| `memory.offload_passback_share` | `auto` | `auto` \| number in `(0, 0.5]` \| `0` |
 
-Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OFFLOAD_EXEC`. All three are `ModelLoad`-scoped (`hipfire config set memory.*`, per-model overlay, or env); there is no `--offload` CLI flag.
+Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OFFLOAD_EXEC`, `HIPFIRE_OFFLOAD_PASSBACK_SHARE`. All four are `ModelLoad`-scoped (`hipfire config set memory.*`, per-model overlay, or env); there is no `--offload` CLI flag.
 
 - **Counting.** Both budgets count layers kept **on** the GPU, not offloaded — `3` on a 64-layer model spills 61. `gpu_layer_budget` spills whole-layer prefixes (`[0 .. n-N)`); `moe_expert_budget` spills only routed experts. On an expert-only spill, attention, router and shared expert stay resident; embedding, `lm_head` and KV stay resident in either case.
 - **Explicit auto-fit.** `auto`/`-1` opts into fit-based placement: the smallest spill that loads, **routed experts first**, whole layers only when the expert tier cannot free enough; a model that already fits stays fully resident. Unset/null budgets leave weights device-resident on every model, including Qwen MoE; there is no implicit spill. Manual `N` budgets are hard pins and are never silently widened — a pinned placement that does not fit refuses the load naming the knob.
 - **Scope.** Explicit auto-fit runs only on spillable single-GPU text-trunk loads (`pp == 1`, no paged experts, no REAP keep-map); unset stays resident everywhere. Offload is Qwen3.5-dense/MoE only — any other arch, `tp > 1`, `pp > 1`, EP, a VL tower, paged experts or a REAP keep-map with a configured spill fails the load closed.
-- **Execution.** `memory.offload_exec` decides **who multiplies**, never what spills. `pcie` (default; unset/empty/unknown fall back to it) runs the GPU kernels against host-mapped weights over the link. `cpu` executes those GEMVs on the host, and on a `moe_expert_budget` spill recomputes each selected routed expert's whole FFN on the CPU for AR single-token decode and any `<=4`-row batched forward (narrow speculative verify and accepted-prefix rollback included; wider prefill keeps the GPU grouped PCIe read). `cpu` disables hipGraph capture for the model's lifetime and is refused together with a retained-replay (Redline) backend.
+- **Execution.** `memory.offload_exec` decides **who multiplies**, never what spills. `pcie` (default; unset/empty/unknown fall back to it) runs the GPU kernels against host-mapped weights over the link. `cpu` executes those GEMVs on the host, and on a `moe_expert_budget` spill recomputes each selected routed expert's whole FFN on the CPU for AR single-token decode and any `<=4`-row batched forward (narrow speculative verify and accepted-prefix rollback included; wider prefill keeps the GPU grouped PCIe read). `passback` runs both engines at once on a spilled dense step, split by output rows per `memory.offload_passback_share`; routed experts on a `moe_expert_budget` spill take the same CPU splice as `cpu`. `cpu` and `passback` disable hipGraph capture for the model's lifetime and are refused together with a retained-replay (Redline) backend.
 - **Load lines.** A spill prints `partial offload: {host} of {n} layers host-placed[, routed experts host on {k} layers], device weights {X} MiB of {Y} MiB available` plus the pinned-host report and the `kv reserved:` accounting line; a fit prints `partial offload: model fits - every layer resident`. A `cpu` load adds the `cpu exec: {covered}/{spilled} spilled layers fully covered …; uncovered quants: …` coverage line.
 - **Spec.** Native MTP is opt-in on any host-mapped expert spill — see the `mtp_mode` row. Full write-up: [`env-vars.md`](env-vars.md) offload rows and [`plans/partial-gpu-offload-design.md`](plans/partial-gpu-offload-design.md).
 - **Narrow verify routing.** Resident MoE `SpeculativeVerify` batches retain beta's legacy grouped route. Narrow Path1 applies only to host-mapped routed projections; the coalesced gfx1201 host-weight narrow kernel remains available.
 - **CPU execution route.** Once MTP is enabled on a CPU-spilled Qwen3.5-family model, single-token decode, forced advances and terminal flushes automatically use the CPU-splice-capable executor. No `HIPFIRE_FORWARD_LOWERED=0` override is required. This execution routing does not change the MTP `auto` admission policy above.
+**`passback` output is not reproducible run to run, by design.** `cpu` and `pcie` run a layer's GEMV on different engines, so their arithmetic need not agree, and `passback`'s row split is scheduled per process from the seeding probe and the online arm timings — two identical greedy runs mix the engines differently. Within a mode at a fixed split the output is deterministic, and `memory.offload_passback_share = 0` is byte-identical to `memory.offload_exec = cpu`. Pin the share before diffing `passback` output against a reference. Design: [`plans/partial-gpu-offload-design.md`](plans/partial-gpu-offload-design.md#622-pass-back-scheduled-co-inference-of-the-spilled-layers-memoryoffload_execpassback).
 
 ### Prompt / assistant-turn cache
 
@@ -1296,7 +1298,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 288 schema keys, plus the `developer.<name>` namespace.
+**Count:** 295 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|

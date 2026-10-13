@@ -2589,14 +2589,18 @@ pub use hipfire_runtime::model_load::Layout;
 ///
 /// Follows the same silence contract as the residency report in
 /// [`super::config::apply_offload_policy`]: nothing is printed unless
-/// `memory.offload_exec` was actually configured to `cpu`, so a stock-vs-branch
-/// log diff stays readable.
+/// `memory.offload_exec` was actually configured to `cpu`/`passback` — except for
+/// one informational line when a pass-back share is set in a mode that cannot
+/// read it (the key is inert, not misconfigured; see
+/// [`hipfire_config::memory::stray_passback_share_configured`]).
 pub fn report_cpu_exec_coverage(
     hfq: &HfqFile,
     config: &Qwen35Config,
     placement: Option<&hipfire_runtime::offload::Placement>,
 ) {
-    use hipfire_config::memory::{offload_exec, OffloadExec};
+    use hipfire_config::memory::{
+        offload_exec, offload_passback_share, stray_passback_share_configured, OffloadExec,
+    };
     use hipfire_runtime::offload::{ExpertResidency, WeightResidency};
     use std::collections::BTreeSet;
 
@@ -2610,6 +2614,13 @@ pub fn report_cpu_exec_coverage(
     let mode = offload_exec();
     if !matches!(mode, OffloadExec::Cpu | OffloadExec::Passback) {
         return;
+    }
+    if mode == OffloadExec::Passback {
+        eprintln!(
+            "passback: memory.offload_exec=passback is non-deterministic by design — its CPU/GPU \
+             row split is scheduled per process, so generated tokens may change across runs; \
+             choose cpu or pcie for reproducible output"
+        );
     }
     // The loaded placement is the only honest statement of what spilled: a
     // config-level mirror would be 0 for an experts-only spill and report
@@ -2637,7 +2648,7 @@ pub fn report_cpu_exec_coverage(
     };
     if host_layers.is_empty() && expert_layers.is_empty() {
         eprintln!(
-            "cpu exec: memory.offload_exec=cpu but nothing is spilled \
+            "cpu exec: memory.offload_exec={mode} but nothing is spilled \
              (memory.gpu_layer_budget / memory.moe_expert_budget leave every weight resident) — \
              every step stays on the GPU"
         );
@@ -2648,8 +2659,9 @@ pub fn report_cpu_exec_coverage(
     spilled.extend(expert_layers.iter().copied());
 
     // The expert splice is the same model-level decision the loader made
-    // (`memory.offload_exec=cpu` + the `HIPFIRE_MOE_CPU_EXPERTS` kill-switch), so
-    // when it is armed a host-placed layer's routed FFN runs on the CPU too.
+    // (`memory.offload_exec=cpu|passback` + the `HIPFIRE_MOE_CPU_EXPERTS`
+    // kill-switch), so when it is armed a host-placed layer's routed FFN runs on
+    // the CPU too.
     let expert_cpu = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled();
     let mut covered = 0usize;
     let mut splittable = 0usize;
@@ -2658,6 +2670,9 @@ pub fn report_cpu_exec_coverage(
         let own_host = host_layers.contains(layer);
         let experts_host = expert_layers.contains(layer);
         let mut layer_covered = true;
+        // Only a host-placed layer's own weights are split by `passback`; a
+        // layer that spilled only its routed experts runs them on the CPU splice.
+        let mut layer_splittable = own_host;
         // A host-placed layer's own weights run through the generic CPU seam;
         // check that every one of its tensors has a CPU decoder.
         if own_host {
@@ -2678,13 +2693,13 @@ pub fn report_cpu_exec_coverage(
                     layer_covered = false;
                     uncovered.insert(format!("{dtype:?}"));
                 }
-            }
-            // A splittable layer additionally needs the CPU's *vector* row dot:
-            // with the scalar decoder the CPU rate is far below the GPU's PCIe
-            // read rate, so the best split is all-GPU and `passback` would only
-            // add launches (see `offload_split`'s feasibility gate).
-            if !hipfire_dispatch::passback_capable_format(dtype) {
-                layer_splittable = false;
+                // A splittable layer additionally needs the CPU's *vector* row dot:
+                // with the scalar decoder the CPU rate is far below the GPU's PCIe
+                // read rate, so the best split is all-GPU and `passback` would only
+                // add launches (see `offload_split`'s feasibility gate).
+                if !hipfire_dispatch::passback_capable_format(dtype) {
+                    layer_splittable = false;
+                }
             }
         }
         // Routed experts are covered only when the splice is armed; otherwise they
@@ -2729,7 +2744,8 @@ pub fn report_cpu_exec_coverage(
     if mode == OffloadExec::Passback {
         let min_mib = hipfire_dispatch::offload_split::MIN_SPLIT_BYTES / (1 << 20);
         eprintln!(
-            "passback: {splittable}/{spilled} spilled layers splittable; share {}; min step {min_mib} MiB",
+            "passback: {splittable}/{} spilled layers splittable; share {}; min step {min_mib} MiB",
+            spilled.len(),
             offload_passback_share(),
         );
     }

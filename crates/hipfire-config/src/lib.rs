@@ -7578,6 +7578,25 @@ pub mod memory {
         developer_var("HIPFIRE_PLE_HOT_DEBUG").is_ok_and(|v| v == "1")
     }
 
+    /// Byte budget of the session cache's disk tier
+    /// (`memory.session_cache_disk_bytes`, compat env
+    /// `HIPFIRE_SESSION_CACHE_DISK_BYTES`); 0 disables it.
+    pub fn session_cache_disk_bytes() -> u64 {
+        process_value("HIPFIRE_SESSION_CACHE_DISK_BYTES")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Directory of the session cache's disk tier (`memory.session_cache_dir`,
+    /// compat env `HIPFIRE_SESSION_CACHE_DIR`); empty =
+    /// `$HIPFIRE_HOME/session-cache`.
+    pub fn session_cache_dir() -> std::path::PathBuf {
+        match process_value("HIPFIRE_SESSION_CACHE_DIR") {
+            Some(value) if !value.trim().is_empty() => super::expand_tilde(value.trim()),
+            _ => crate::ConfigPaths::discover().root.join("session-cache"),
+        }
+    }
+
     /// The configured routed-expert [`OffloadBudget`] from the process snapshot
     /// (`memory.moe_expert_budget`). Same parser and spelling as
     /// [`gpu_layer_budget`]: unset/empty/unparseable is [`OffloadBudget::Full`]
@@ -7750,6 +7769,61 @@ pub mod memory {
     /// The configured [`OffloadExec`] from the process snapshot.
     pub fn offload_exec() -> OffloadExec {
         parse_offload_exec(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
+    }
+
+    /// How much of a split step the GPU takes (`memory.offload_passback_share`).
+    ///
+    /// Read only when [`offload_exec`] is [`OffloadExec::Passback`]; in any other
+    /// mode the key is inert (see [`stray_passback_share_notice`]).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum PassbackShare {
+        /// Scheduled from this host's own measured engine rates.
+        Auto,
+        /// Pinned by the user. `0.0` disables the pass-back.
+        Share(f64),
+    }
+
+    impl std::fmt::Display for PassbackShare {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                PassbackShare::Auto => write!(f, "auto"),
+                PassbackShare::Share(v) => write!(f, "{v}"),
+            }
+        }
+    }
+
+    /// Pure truth table behind [`offload_passback_share`]. Unset, empty and
+    /// unknown all resolve to `Auto`; the schema ([`super::ValueRule::PassbackShare`])
+    /// rejects an out-of-range number before this runs, so the fallback here is
+    /// belt-and-braces rather than the primary guard.
+    pub fn parse_passback_share(raw: Option<&str>) -> PassbackShare {
+        match raw.map(|v| v.trim()) {
+            Some("auto") => PassbackShare::Auto,
+            Some(v) => match v.parse::<f64>() {
+                Ok(f) if (0.0..=0.5).contains(&f) => PassbackShare::Share(f),
+                _ => PassbackShare::Auto,
+            },
+            None => PassbackShare::Auto,
+        }
+    }
+
+    /// The configured [`PassbackShare`] from the process snapshot.
+    pub fn offload_passback_share() -> PassbackShare {
+        parse_passback_share(process_value("HIPFIRE_OFFLOAD_PASSBACK_SHARE").as_deref())
+    }
+
+    /// `true` when a share is set but the mode cannot read it, so the load can
+    /// print one informational line instead of silently ignoring the key.
+    ///
+    /// The mode is the selector and the share is its modifier, so a share in a
+    /// `pcie`/`cpu` run is not a misconfiguration to refuse — just an inert key
+    /// worth naming once.
+    pub fn stray_passback_share_configured() -> bool {
+        let Some(raw) = process_value("HIPFIRE_OFFLOAD_PASSBACK_SHARE") else {
+            return false;
+        };
+        let mode = offload_exec();
+        mode != OffloadExec::Passback && raw.trim() != "" && raw.trim() != "auto"
     }
 
     // Placement arithmetic (`largest_fitting_tail`, the policy→split call) lives

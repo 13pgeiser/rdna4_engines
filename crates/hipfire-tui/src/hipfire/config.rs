@@ -115,6 +115,7 @@ impl ConfigState {
             Some("gpu_layer_budget"),  // Offload
             Some("moe_expert_budget"), // Offload (MoE experts)
             Some("offload_exec"),      // Offload exec
+            Some("offload_passback_share"), // Pass-back GPU share
             Some("thinking"),
             Some("reasoning_effort"),
             Some("thinking_budget"),

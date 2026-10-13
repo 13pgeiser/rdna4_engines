@@ -101,8 +101,9 @@ pub fn passback_enabled() -> bool {
     host_exec_mode() == HostExecMode::Passback
 }
 
-/// Whether the CPU expert splice is armed: `memory.offload_exec=cpu` and the
-/// `HIPFIRE_MOE_CPU_EXPERTS=0` kill-switch unset. This is the *model-level*
+/// Whether the CPU expert splice is armed: `memory.offload_exec=cpu` (or
+/// `passback`, which splits only dense steps and runs routed experts on this
+/// splice) and the `HIPFIRE_MOE_CPU_EXPERTS=0` kill-switch unset. This is the *model-level*
 /// decision; the loader additionally requires a host-placed packed layer with no
 /// AWQ sidecar, and records the armed sink on the layer weights.
 pub fn moe_cpu_experts_enabled() -> bool {
@@ -518,47 +519,36 @@ pub fn run_host_mapped_gemv(
     rotate_input: bool,
     out: &GpuTensor,
 ) -> Result<(), DispatchError> {
-    let q = host_mapped_quant(gpu, w)?;
-    let (m, k) = (w.m, w.k);
-    let bytes = gpu
-        .host_bytes(w.buf)
-        .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
-    let activation_len = activation_stage_len(w, rotate_input)?;
-    let stage_len = activation_len
-        .checked_add(m)
-        .ok_or_else(|| cpu_err("dense transfer extent overflows"))?;
-    with_cpu_transfer(gpu, stage_len, |transfer| {
-        let d2h_ns = prepare_activation(gpu, w, x, rotate_input, transfer)?;
-        let t1 = Instant::now();
-        {
-            let (activation, y) = transfer_values(transfer, stage_len).split_at_mut(activation_len);
-            gemv(q, bytes, m, k, &activation[..k], y);
-        }
-        let gemv_ns = t1.elapsed().as_nanos() as u64;
-        let t2 = Instant::now();
-        upload_transfer(gpu, transfer, out, activation_len, m)?;
-        let h2d_ns = t2.elapsed().as_nanos() as u64;
-        CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-        trace_step(
-            q,
-            w,
-            rotate_input,
-            false,
-            StepTiming { d2h_ns, gemv_ns, h2d_ns },
-        );
-        Ok(())
-    })
+    let plan = CpuStep {
+        w,
+        x,
+        rotate_input,
+        out,
+        residual: None,
+    };
+    let step_start = Instant::now();
+    let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
+    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm)?;
+    finish_step(
+        arm.q,
+        w,
+        rotate_input,
+        false,
+        HostExec::Cpu,
+        step_start,
+        StepTiming {
+            d2h_ns: arm.d2h_ns,
+            gemv_ns,
+            h2d_ns,
+        },
+    );
+    Ok(())
 }
 
-fn activation_stage_len(w: &WeightRef, rotate_input: bool) -> Result<usize, DispatchError> {
-    w.k.checked_mul(if rotate_input && w.awq_scale.is_some() { 2 } else { 1 })
-        .ok_or_else(|| cpu_err("activation transfer extent overflows"))
-}
-
-/// Download into owned pinned storage and apply the launcher's pre-rotation
-/// transforms. The trace's `d2h` figure covers AWQ divide and FWHT as well as
-/// the copies. Independent activation/scale downloads share one readiness
-/// boundary, which also retires the preceding same-stream CPU return.
+/// Read the activation for a CPU step, applying the same pre-rotation
+/// transforms the launcher's rotate step would, and return it with the elapsed
+/// nanoseconds — the trace's `d2h` figure, which therefore covers the AWQ divide
+/// and the FWHT whenever they apply, not just the copy.
 ///
 /// * AWQ (`w.awq_scale`): the quantizer pre-scaled the weights by `s` and the
 ///   rotate kernel divides the activation by it (`(W·s)·(x/s) = W·x`). This
@@ -575,25 +565,17 @@ pub(crate) fn prepare_activation(
     w: &WeightRef,
     x: &GpuTensor,
     rotate_input: bool,
-    transfer: &mut hip_bridge::PinnedTransferBuffer,
-) -> Result<u64, DispatchError> {
+) -> Result<(Vec<f32>, u64), DispatchError> {
     let t0 = Instant::now();
-    download_transfer(gpu, transfer, x, 0, w.k)?;
+    let mut host = download_f32(gpu, x, w.k)?;
     if rotate_input {
         if let Some(scale) = w.awq_scale {
-            download_transfer(gpu, transfer, scale, w.k, w.k)?;
+            let scale = download_f32(gpu, scale, w.k)?;
+            divide_by_awq_scale(&mut host, &scale);
         }
+        rotate_x(&mut host);
     }
-    transfer.complete(&gpu.hip).map_err(|e| cpu_err(&format!("D2H completion: {e}")))?;
-    if rotate_input {
-        let values = transfer_values(transfer, activation_stage_len(w, rotate_input)?);
-        let (host, scale) = values.split_at_mut(w.k);
-        if w.awq_scale.is_some() {
-            divide_by_awq_scale(host, scale);
-        }
-        rotate_x(host);
-    }
-    Ok(t0.elapsed().as_nanos() as u64)
+    Ok((host, t0.elapsed().as_nanos() as u64))
 }
 
 /// The CPU arm of a host-executed step: every blocking device read already done
@@ -712,42 +694,30 @@ pub fn run_host_mapped_gemv_residual(
     // the weights were encoded post-rotation — the same rule `run_step` derives
     // from a `Raw` input.
     let rotate_input = dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256;
-    let bytes = gpu
-        .host_bytes(w.buf)
-        .ok_or_else(|| cpu_err("weight tensor is host-mapped but has no host pointer"))?;
-    let activation_len = activation_stage_len(w, rotate_input)?;
-    let stage_len = m
-        .checked_mul(2)
-        .and_then(|n| activation_len.checked_add(n))
-        .ok_or_else(|| cpu_err("dense residual transfer extent overflows"))?;
-    with_cpu_transfer(gpu, stage_len, |transfer| {
-        let d2h_ns = prepare_activation(gpu, w, x, rotate_input, transfer)?;
-        let t1 = Instant::now();
-        {
-            let (activation, rest) = transfer_values(transfer, stage_len).split_at_mut(activation_len);
-            gemv(q, bytes, m, k, &activation[..k], &mut rest[..m]);
-        }
-        let gemv_ns = t1.elapsed().as_nanos() as u64;
-        let t2 = Instant::now();
-        download_transfer(gpu, transfer, acc, activation_len + m, m)?;
-        transfer.complete(&gpu.hip).map_err(|e| cpu_err(&format!("residual D2H completion: {e}")))?;
-        {
-            let (_, rest) = transfer_values(transfer, stage_len).split_at_mut(activation_len);
-            let (y, acc_host) = rest.split_at_mut(m);
-            residual_add(acc_host, y);
-        }
-        upload_transfer(gpu, transfer, acc, activation_len + m, m)?;
-        let h2d_ns = t2.elapsed().as_nanos() as u64;
-        CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-        trace_step(
-            q,
-            w,
-            rotate_input,
-            true,
-            StepTiming { d2h_ns, gemv_ns, h2d_ns },
-        );
-        Ok(())
-    })
+    let plan = CpuStep {
+        w,
+        x,
+        rotate_input,
+        out: acc,
+        residual: Some(acc),
+    };
+    let step_start = Instant::now();
+    let arm = cpu_arm_prepare(gpu, &plan, 0..w.m)?;
+    let (gemv_ns, h2d_ns) = cpu_arm_finish(gpu, &arm)?;
+    finish_step(
+        arm.q,
+        w,
+        rotate_input,
+        true,
+        HostExec::Cpu,
+        step_start,
+        StepTiming {
+            d2h_ns: arm.d2h_ns,
+            gemv_ns,
+            h2d_ns,
+        },
+    );
+    Ok(())
 }
 
 /// One selected expert's host-resident weight bytes for the CPU splice.
@@ -1237,6 +1207,41 @@ fn moe_cpu_experts_host(
     }
     timing.combine_ns = t_combine.elapsed().as_nanos() as u64;
     Ok(())
+}
+
+/// Close out an executed step: count it, charge a whole-CPU step's wall time to
+/// the GPU-idle account, and feed the per-shape trace. One call site per executed
+/// step, so the counters and the trace can never disagree about how many ran.
+///
+/// A pass-back split step is counted in [`SPLIT_STEPS`]/[`SPLIT_GPU_ROWS`]/
+/// [`SPLIT_WALL_NS`] instead of [`CPU_STEPS`]/[`CPU_STEP_WALL_NS`], because its
+/// wall contains real GPU work and would otherwise inflate the CPU-idle lower
+/// bound [`report_idle`] documents.
+///
+/// `pub(crate)` so the pass-back's split step reports through the same single
+/// call site.
+pub(crate) fn finish_step(
+    q: CpuQuant,
+    w: &WeightRef,
+    rotated: bool,
+    residual: bool,
+    exec: HostExec,
+    step_start: Instant,
+    timing: StepTiming,
+) {
+    match exec {
+        HostExec::Cpu => {
+            CPU_STEPS.fetch_add(1, Ordering::Relaxed);
+            CPU_STEP_WALL_NS
+                .fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        HostExec::Split { gpu_rows } => {
+            SPLIT_STEPS.fetch_add(1, Ordering::Relaxed);
+            SPLIT_GPU_ROWS.fetch_add(gpu_rows as u64, Ordering::Relaxed);
+            SPLIT_WALL_NS.fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+    trace_step(q, w, rotated, residual, exec, timing);
 }
 
 /// Which projection of a selected expert a [`MoeJobSource`] job reads.
@@ -1787,6 +1792,18 @@ fn download_into_f32(
         unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
     gpu.memcpy_dtoh_auto(bytes, &t.buf)
         .map_err(|e| cpu_err(&format!("D2H: {e}")))
+}
+
+fn upload_f32(gpu: &Gpu, t: &GpuTensor, v: &[f32]) -> Result<(), DispatchError> {
+    assert!(
+        t.numel() >= v.len(),
+        "cpu exec: destination has {} elements, source has {}",
+        t.numel(),
+        v.len()
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+    gpu.memcpy_htod_auto(&t.buf, bytes)
+        .map_err(|e| cpu_err(&format!("H2D: {e}")))
 }
 
 /// Reuse owned pinned storage across CPU steps. Growth/device transitions

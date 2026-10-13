@@ -1718,7 +1718,16 @@ where
     let trace_on = hipfire_dispatch::moe_trace_enabled();
     let t_layer = trace_on.then(std::time::Instant::now);
     let t_attn = trace_on.then(std::time::Instant::now);
-    let attn_dtype = require_batchable_deltanet_moe_layer(layer)?;
+    let arch = gpu.arch.as_str();
+    let qkvza_plan = plan_q8_fused_or_plain(
+        plan_proj_group(
+            &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+            "DeltaNetMoE qkvza",
+            arch,
+        )?,
+        q8_wmma_arch,
+    );
+    slots_check_residual_weight(&layer.wo, "DeltaNetMoE wo", arch)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -2991,7 +3000,12 @@ fn run_fullattn_moe_layer_slots(
     let trace_on = hipfire_dispatch::moe_trace_enabled();
     let t_layer = trace_on.then(std::time::Instant::now);
     let t_attn = trace_on.then(std::time::Instant::now);
-    let attn_dtype = require_batchable_fullattn_moe_layer(layer)?;
+    let arch = gpu.arch.as_str();
+    let qkv_plan = plan_q8_fused_or_plain(
+        plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttnMoE qkv", arch)?,
+        q8_wmma_arch,
+    );
+    slots_check_residual_weight(&layer.wo, "FullAttnMoE wo", arch)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
     let dim = config.dim;

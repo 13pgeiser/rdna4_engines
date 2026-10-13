@@ -306,19 +306,23 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   accumulate (the residual is the destination; a residual step never writes its
   `out` scratch). `weight_gemv_swiglu_residual` — the one op family that fuses a
   GEMV into a kernel the seam cannot see — splits itself: GPU `silu_mul_f32`,
-  then the CPU GEMV plus residual.
-- **Async CPU return.** Dense outputs and routed-expert residuals return with
-  `hipMemcpyAsync` from reusable, owned pinned transfer storage on the active
-  GPU stream (default stream when none is active). Dense GEMV writes directly
-  into that storage; no temporary-vector upload or extra output staging copy.
-  The next same-stream D2H batch is enqueued through raw owned extents before
-  exposing host slices. Its existing completion barrier retires the previous
-  upload and makes CPU reuse safe. Normal returns add no host wait or event.
-  Allocation growth, stream/device changes, and teardown retire pending access;
-  a failed drain retains the allocation rather than freeing a live DMA source.
-  Host readback or another GPU stream still needs an explicit dependency.
-  `h2d` timing now measures enqueue API wall time, not DMA completion; judge
-  gains using timing-disabled throughput, not the shorter splice trace alone.
+  then the CPU GEMV plus residual. Under `passback` it now hands that residual
+  GEMV to the co-inference seam as a `Step::GemvResidual` (falling back to the
+  whole-CPU path when the seam declines), so the dense FFN down-projection is
+  co-inferenced instead of run wholly on the CPU — measured **+3.8 % / +2.6 %** on
+  the 9B at 8 / 16 of 32 spilled (interleaved fresh-process pairs, passback mode;
+  § 6.2.2).
+- **Async CPU return.** Routed-expert residuals return with `hipMemcpyAsync`
+  from reusable, owned pinned transfer storage on the active GPU stream
+  (default stream when none is active). The next same-stream D2H batch is
+  enqueued through raw owned extents before exposing host slices. Its existing
+  completion barrier retires the previous upload and makes CPU reuse safe.
+  Normal returns add no host wait or event. Allocation growth, stream/device
+  changes, and teardown retire pending access; a failed drain retains the
+  allocation rather than freeing a live DMA source. Dense CPU steps keep the
+  two-phase `cpu_arm_prepare`/`cpu_arm_finish` arm that `passback` interleaves
+  a GPU launch into. `h2d` timing in the splice trace measures enqueue API wall
+  time, not DMA completion; judge gains using timing-disabled throughput.
 - **Native MTP with CPU-deferred experts.** Qwen3.5-family MTP is available.
   Narrow verify and accepted-prefix rollback retain the existing `<=4`-row CPU splice;
   wider forwards retain the GPU grouped PCIe read. At the CPU-deferred expert

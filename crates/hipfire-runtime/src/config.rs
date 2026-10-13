@@ -106,7 +106,9 @@ fn cpu_offload_configured_from(
     expert: hipfire_config::memory::OffloadBudget,
 ) -> bool {
     use hipfire_config::memory::{OffloadBudget, OffloadExec};
-    if exec != OffloadExec::Cpu {
+    // `passback` runs the CPU arm of a spilled step too, so it is a CPU
+    // offload for this predicate exactly like `cpu`.
+    if !matches!(exec, OffloadExec::Cpu | OffloadExec::Passback) {
         return false;
     }
     !matches!((layer, expert), (OffloadBudget::Full, OffloadBudget::Full))
@@ -617,6 +619,11 @@ mod tests {
             OffloadBudget::Full,
             OffloadBudget::Full
         ));
+        assert!(!cpu_offload_configured_from(
+            OffloadExec::Passback,
+            OffloadBudget::Full,
+            OffloadBudget::Full
+        ));
         // cpu with either tier placed at all is configured — the expert tier and
         // the `auto` spelling included, which the older layer-tier-only check
         // missed.
@@ -628,6 +635,8 @@ mod tests {
             (OffloadBudget::Full, OffloadBudget::Auto),
         ] {
             assert!(cpu_offload_configured_from(OffloadExec::Cpu, layer, expert));
+            // `passback` runs the CPU arm of a spilled step, so it counts too.
+            assert!(cpu_offload_configured_from(OffloadExec::Passback, layer, expert));
         }
     }
 }
