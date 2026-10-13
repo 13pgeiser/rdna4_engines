@@ -53,9 +53,11 @@ pub enum Qwen4FfnDims {
     },
 }
 
-/// RoPE base theta hard-coded by the QSA RoPE kernels
-/// (`kernels/src/tensor_ops.hip:2830,3126,3445` use 10,000,000).  A profile
-/// whose `rope_theta` differs cannot run full-attention layers on them.
+/// RoPE base theta hard-coded by the QSA RoPE kernels (the `indexed_attention_*`
+/// rotations in `kernels/src/tensor_ops.hip` and the NPU-trunk arena twin in
+/// `kernels/src/npu_trunk_consumers.hip` use 10,000,000; YaRN scaling is a
+/// separate kernel argument).  A profile whose `rope_theta` differs cannot run
+/// full-attention layers on them.
 pub const QWEN4_QSA_KERNEL_ROPE_THETA: f64 = 10_000_000.0;
 
 /// Dimensions used by all Qwen4 layer-major operations.  The architecture

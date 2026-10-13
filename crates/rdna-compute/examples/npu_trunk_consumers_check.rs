@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! gfx1151 byte oracle for every direct-arena trunk reader; no NPU required.
 use hip_bridge::KernargBlob;
-use rdna_compute::{tensor_ops::*, DType, Gpu, GpuTensor};
+use rdna_compute::{rope::{Rope, RopeScaling, RopeYarn, Yarn}, tensor_ops::*, DType, Gpu, GpuTensor};
 
-const TENSOR_SRC: &str = concat!(include_str!("../../../kernels/src/mq_fwht256.h"), include_str!("../../../kernels/src/tensor_ops.hip"));
+const TENSOR_SRC: &str = concat!(include_str!("../../../kernels/src/mq_fwht256.h"), include_str!("../../../kernels/src/rope_yarn.h"), include_str!("../../../kernels/src/tensor_ops.hip"));
 const CHUNK_SRC: &str = include_str!("../../../kernels/src/gated_delta_chunk_wmma.gfx1151.hip");
 const Q8_SRC: &str = include_str!("../../../kernels/src/gated_delta_chunk_q8_wmma.gfx1151.hip");
 const CHUNK_ARENA_SRC: &str = concat!("#define NPU_TRUNK_ARENA 1\n#define gated_delta_chunk_gate_wmma gated_delta_chunk_gate_wmma_arena\n", include_str!("../../../kernels/src/gated_delta_chunk_wmma.gfx1151.hip"));
@@ -264,13 +264,21 @@ fn qsa(g: &mut Gpu, rows: usize) {
     let value=check_materialize(g,&cpu,&arena,rows,pitch,12800,512,DType::F32);
     let index=check_materialize(g,&cpu,&arena,rows,pitch,13312,640,DType::F32);
     let mut normalized_key=None;let mut normalized_index=None;
+    // YaRN factor 4 over 262,144 (Qwen3.8 README override), rotary width 64.
+    let yarn64=Rope{theta:1e7,scaling:RopeScaling::Yarn(Yarn::new(4.0,262_144,None,None,None,None))}.yarn(64);
     for (label,col,width,heads,dim,stride,input) in [("qgate",0,12288,24,256,512,&qgate),("k",12288,512,2,256,256,&key),("idx",13312,640,4,128,128,&index)] {
         let norm=weights(g,dim,0x3e80);let out=filled(g,rows*width,DType::F32);
-        let p=|values| IndexedAttentionNormRopeBatch {values,norm:&norm,rows,row_stride:width,heads,head_dim:dim,head_stride:stride,position_start:3,rotary_dim:64};
+        let p=|values| IndexedAttentionNormRopeBatch {values,norm:&norm,rows,row_stride:width,heads,head_dim:dim,head_stride:stride,position_start:3,rotary_dim:64,yarn:RopeYarn::OFF};
+        // YaRN past the native window first; the plain pass below re-materializes `input`.
+        let py=|values| IndexedAttentionNormRopeBatch {position_start:300_003,yarn:yarn64,..p(values)};
+        let scaled=filled(g,rows*width,DType::F32);
+        materialize(g,view(&arena,pitch,col),input,rows,width);indexed_attention_norm_rope_batch(g,&py(input)).unwrap();
+        indexed_attention_norm_rope_batch_arena(g,&py(&scaled),view(&arena,pitch,col)).unwrap();
+        compare(g,"YaRN norm/RoPE columns incl untouched gates/index key",input,&scaled);
         let old=timed(g,|g| {materialize(g,view(&arena,pitch,col),input,rows,width);indexed_attention_norm_rope_batch(g,&p(input)).unwrap();});
         let new=timed(g,|g| indexed_attention_norm_rope_batch_arena(g,&p(&out),view(&arena,pitch,col)).unwrap());
         compare(g,"all norm/RoPE columns incl untouched gates/index key",input,&out);report(&format!("norm_rope {label}"),rows,pitch,old,new);
-        g.free_tensor(norm).unwrap();
+        g.free_tensor(norm).unwrap();g.free_tensor(scaled).unwrap();
         if label=="k" {normalized_key=Some(out);}else if label=="idx" {normalized_index=Some(out);}else {g.free_tensor(out).unwrap();}
     }
     let normalized_key=normalized_key.unwrap();let normalized_index=normalized_index.unwrap();

@@ -1953,7 +1953,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "8644743ad6bc0a0d05bb5c6d6d4e180f7164a7da0d7fb3a8b8a83b46195632db",
+      "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",

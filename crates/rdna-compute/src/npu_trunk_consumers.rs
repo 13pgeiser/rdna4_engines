@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 pub(crate) const ARENA_SRC: &str = concat!(
     "#define NPU_TRUNK_ARENA 1\n#define gated_delta_conv_bf16_f32_batched_k4 gated_delta_conv_batched_arena\n#define gated_delta_conv_qknorm_bf16_f32_batched_k4 gated_delta_conv_qknorm_batched_arena\n",
     include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/rope_yarn.h"),
     include_str!("../../../kernels/src/tensor_ops.hip"),
     include_str!("../../../kernels/src/npu_trunk_consumers.hip")
 );
@@ -472,6 +473,8 @@ pub fn indexed_attention_norm_rope_batch_arena(
     let position_offset = args.len() - 4;
     args.push_i32(rotary_dim);
     src.args(&mut args)?;
+    // After the declared position field, as in the incumbent launcher.
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -761,5 +764,61 @@ mod tests {
         assert!(!GATED_DELTA_CHUNK_WMMA_SRC.contains("#define NPU_TRUNK_ARENA"));
         assert!(!GATED_DELTA_CHUNK_Q8_WMMA_SRC.contains("#define NPU_TRUNK_ARENA"));
         assert!(ARENA_SRC.starts_with("#define NPU_TRUNK_ARENA 1"));
+    }
+    /// The arena QSA norm/RoPE twin equals the incumbent batched launch bit for
+    /// bit (every column, including the untouched gate / index-key tails),
+    /// unscaled and under YaRN (factor 4 over 262,144) past the native window.
+    #[test]
+    fn qsa_norm_rope_arena_matches_incumbent_with_and_without_yarn() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        use crate::rope::{Rope, RopeScaling, RopeYarn, Yarn};
+        let yarn = Rope {
+            theta: 1e7,
+            scaling: RopeScaling::Yarn(Yarn::new(4.0, 262_144, None, None, None, None)),
+        }
+        .yarn(64);
+        // Finite BF16 values (truncated f32 bit patterns) in a pitched arena.
+        let bf16 = |x: f32| (x.to_bits() >> 16) as u16;
+        let (rows, pitch, col) = (5usize, 1792usize, 96usize);
+        let bits: Vec<u16> = (0..rows * pitch)
+            .map(|i| bf16(((i * 37) % 101) as f32 / 25.0 - 2.0))
+            .collect();
+        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let mut arena = gpu.upload_raw(&bytes, &[bits.len()]).expect("arena upload");
+        arena.dtype = DType::BF16;
+        // (heads, head_dim, head_stride, width): query+gate rows and index rows.
+        for (heads, head_dim, head_stride, width) in [(2, 256, 512, 1024), (4, 128, 128, 640)] {
+            let norm_bits: Vec<u8> = (0..head_dim)
+                .flat_map(|c| bf16((c % 7) as f32 * 0.125 - 0.25).to_le_bytes())
+                .collect();
+            let mut norm = gpu.upload_raw(&norm_bits, &[head_dim]).expect("norm upload");
+            norm.dtype = DType::BF16;
+            let input: Vec<f32> = (0..rows * width)
+                .map(|i| f32::from_bits((bits[(i / width) * pitch + col + i % width] as u32) << 16))
+                .collect();
+            for (position_start, yarn) in [(3, RopeYarn::OFF), (300_003, yarn)] {
+                let incumbent = gpu.upload_f32(&input, &[input.len()]).expect("incumbent upload");
+                let direct = gpu.upload_f32(&vec![f32::NAN; input.len()], &[input.len()]).expect("direct upload");
+                let p = |values| IndexedAttentionNormRopeBatch {
+                    values, norm: &norm, rows, row_stride: width, heads, head_dim, head_stride,
+                    position_start, rotary_dim: 64, yarn,
+                };
+                indexed_attention_norm_rope_batch(&mut gpu, &p(&incumbent)).expect("incumbent");
+                let src = Bf16Arena { tensor: &arena, row_pitch_elems: pitch, col0_elems: col };
+                indexed_attention_norm_rope_batch_arena(&mut gpu, &p(&direct), src).expect("arena");
+                let want = gpu.download_f32(&incumbent).expect("incumbent download");
+                let got = gpu.download_f32(&direct).expect("direct download");
+                for (index, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.to_bits(), w.to_bits(), "{heads}x{head_dim} {yarn:?} at {index}: {g} vs {w}");
+                }
+                gpu.free_tensor(incumbent).expect("free incumbent");
+                gpu.free_tensor(direct).expect("free direct");
+            }
+            gpu.free_tensor(norm).expect("free norm");
+        }
+        gpu.free_tensor(arena).expect("free arena");
     }
 }
