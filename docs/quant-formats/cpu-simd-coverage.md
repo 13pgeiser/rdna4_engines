@@ -6,7 +6,10 @@ vector path is tested against). Companion to
 [`qt-register.txt`](qt-register.txt) (the authoritative qt-number allocation).
 
 **Every format the crate can decode has a vector kernel.** This file exists to say
-which kernel, under which gate, and what the kernel still does not cover.
+which kernel, under which gate, and what the kernel still does not cover. The
+`CpuQuant` set is the CPU-offload subset of the qt space (see
+[`qt-register.txt`](qt-register.txt) for the full allocation); being listed here
+is a decode/kernel fact, not product admission of that format.
 
 Source of truth in-tree:
 - Dispatch gate `simd::row_dot_enabled(q, requested)` and the format→kernel map
@@ -116,8 +119,12 @@ any runner.
   an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32-37
   (HFP4/MFP4 family: per-row 16 B header + per-32 block scales), qt 28/29
   (PARO4G128(-T), a Givens rotation on the *activation*), qt 38/39
-  (`MQ{2,3}G256GL`, MoE-indexed only). See `quant.rs`'s test module for the
-  itemised reasoning.
+  (`MQ{2,3}G256GL`, MoE-indexed only), qt 22 (`TidI32`, a routing table, not a
+  weight), qt 42 (`MFP4G32E8G128`, qt 34 row layout with 128-wide rotation
+  groups), qt 52 (`MQ4G256V2L`, codes index an external per-tensor
+  `lloyd_levels` sidecar rather than a per-group header), qt 53 (`MQ4G128V2`,
+  68 B per-128 groups, admitted by typed Qwen4 consumers only). See `quant.rs`'s
+  test module for the itemised reasoning on the older entries.
 - **Non-x86_64.** `avx2_available()` is `false`, so every format stays scalar;
   there is no NEON path.
 - **MoE / non-qwen35 arches** are out of scope for the CPU-offload *work* (the
@@ -133,7 +140,7 @@ qt 49 for `qwen3.8-27b.mq3-xt`.
 
 ## Verification
 
-`cargo test -p hipfire-cpu` (26 tests, GPU-free — the crate is a leaf):
+`cargo test -p hipfire-cpu` (GPU-free — the crate is a leaf):
 
 - `every_cpu_decodable_format_has_a_kernel` — the kernel table in `simd::tests`
   names exactly the formats `from_quant_type` maps, and nothing else. A format
@@ -153,7 +160,7 @@ qt 49 for `qwen3.8-27b.mq3-xt`.
   against an independent f64 oracle over every format.
 
 Beyond the crate, `cargo test -p hipfire-arch-qwen35 --test gpu_gemv_parity --
---ignored` (needs the GPU; run here on gfx1201) compares the **production GPU
+--ignored` (needs the GPU; run on a gfx1201 device) compares the **production GPU
 launcher** against this crate's GEMV with the vector path active: real fixture
 tensors (`qwen3.5-2b.mq4`, `qwen3.5-2b.mq6`, `qwen3.5-2b.mq3` — qt 13/15/**20** —
 and `qwen3.5-9b.mq4`, with AWQ and pre-rotated arms, m up to 12288, k up to 6144)
@@ -171,8 +178,9 @@ this arch` on gfx1201, so their parity could not run (the crate's
 canonical-table oracle still covers them); and F16/F32/Bf16 are absent from the
 test's synthesised table, so those three rest on the crate tests alone.
 
-Kernel-level microbench (m=4096, k=5120, same rayon pool both arms, best of 3 —
-not a serve-path measurement), speedup of the AVX2 row dot over the scalar decode:
+Kernel-level microbench (historical landing-time measurement; m=4096, k=5120,
+same rayon pool both arms, best of 3 — not a serve-path measurement, re-measure
+before quoting), speedup of the AVX2 row dot over the scalar decode:
 
 | qt | speedup | qt | speedup | qt | speedup | qt | speedup |
 |---:|---:|---:|---:|---:|---:|---:|---:|
