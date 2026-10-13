@@ -137,7 +137,7 @@ KV are refused at load rather than silently falling back; select
 `memory.kv_backend = "vmm"` or disable the flag. HipGraph/retained recording
 and Redline remain conditionally admitted, not universally enabled by this
 flag. See [`env-vars.md`](env-vars.md) (`HIPFIRE_GFX1100_FA2_SPLIT_VERIFY`) for
-the live-context threshold and capture/recording requirements.
+the live-context threshold and capture/recording requirements. Not a supported default: ON is a different-numerics route (split-KV partial/merge reduction order), not greedy-byte-identical to OFF; on gfx1100 with a 20.7K-token prompt, greedy DFlash text stays coherent but diverges from OFF after about 700 characters. Promoting it to a default would need KLD, a task tie and maintainer approval.
 
 `kernel.mq4v2_gateup_k5120` (exact gfx1100, K=5120, 17408 rows per output) is default on since 0.4.1: that gate/up decode runs on a fixed-group-count kernel whose output is byte-identical to the generic one. Set `hipfire config set kernel.mq4v2_gateup_k5120 false` to restore the generic route; the one-shot compatibility override is `HIPFIRE_MQ4V2_GATEUP_K5120=0` / `1`. This process-wide setting is snapshotted at GPU initialization; restart an existing daemon after changing it. Other architectures, shapes, and quantization formats keep their existing routes. Compiler-less installations need a kernel pack containing `fused_gate_up_mq4g256v2_k5120_gfx1100` (the 0.4.1 gfx1100 pack carries it).
 
