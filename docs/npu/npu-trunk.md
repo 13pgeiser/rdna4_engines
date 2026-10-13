@@ -216,7 +216,7 @@ validation and the serving cutover still requires the parent-run gates below.
 
 ## G80 N512 out-projection program (K = 6144, simulator only)
 
-`pm-npu::kernels::gemm_g80_n512` (`design_g80_n512(m, 512, 6144, Epilogue::Bf16, Fast)`,
+`peacemaker-npu::kernels::gemm_g80_n512` (`design_g80_n512(m, 512, 6144, Epilogue::Bf16, Fast)`,
 `build_panel_program_out(rows_max, pitch, col0)`) is the program of the QSA `o_proj` / GDN
 `out_proj` shapes (`Shape::{QsaO, GdnOut}`, N = 2560 = five 512-column panels, one pass each,
 K = 6144). Numerics: integer-exact accumulation on the array over the whole K, one RNE to BF16
@@ -247,7 +247,7 @@ panel `p` at `col0 = 512*p`, `append_run_body` / `append_lean_run_body` with `ar
 
 ### Gate K0 (design round verdict section 2), simulator ticks, never silicon
 
-`cargo test --release -p pm-npu --test g80 g80_n512 -- --nocapture` (golden bytes: complete padded
+`cargo test --release -p peacemaker-npu --test g80 g80_n512 -- --nocapture` (golden bytes: complete padded
 arena equal to the `bf16_direct` twin over the limb x sign x tie fixture at K = 6144, 1 / 2 / 16
 waves, padded rows zero, outside-window poison untouched, five adjacent panels in one buffer, lean
 and forced-requeue bodies, kc 1..99). Measured with `g80_n512_gate_k0_*`:
