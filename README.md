@@ -17,6 +17,7 @@
   <a href="#whats-new-in-042">What's new</a> ·
   <a href="#models">Models</a> ·
   <a href="#gpu-support">GPU support</a> ·
+  <a href="#peacemaker">PeaceMaker</a> ·
   <a href="#install">Install</a> ·
   <a href="#documentation">Docs</a>
 </p>
@@ -223,6 +224,49 @@ measurements are in the
 For the integration boundary, see
 [HIPFIRE-GRAFT.md](crates/redline-dispatch/HIPFIRE-GRAFT.md).
 
+## PeaceMaker
+
+PeaceMaker is hipfire's own kernel toolchain. It builds AMD GPU and XDNA2
+NPU programs directly, without hipcc. It works on typed machine code, and it
+can lift existing code objects so they can be checked against what
+PeaceMaker emits. It has six crates:
+
+| Crate | Role |
+|---|---|
+| `peacemaker-ir` | Typed RDNA machine-code representation and instruction tables |
+| `peacemaker-lift` | Lifter for ELF, offload bundles, descriptors and metadata. Decoded kernels are re-encoded from typed fields and compared word for word |
+| `peacemaker-isa` | Kernel builder and emitter (`peacemaker-isa` binary), with region import, wait-ledger checks and certification |
+| `peacemaker-author` | PM kernel language (milestone M0, experimental, build-time only) |
+| `peacemaker-rip` | Standalone `.rip` front end that lowers Rust-shaped kernel scripts onto the builder, without rustc |
+| `peacemaker-npu` | XDNA2 / AIE2P program builder: encoder/scheduler, CDO/PDI and DPU transaction writers, CPU simulator |
+
+In 0.4.2, more production routes run builder-emitted, M7-certified
+PeaceMaker kernels. These ship as embedded `kernels/*.hxaco` modules with
+shape contracts. The hipcc versions of those kernels are kept only as oracle
+twins for exactness tests, not as runtime fallbacks. Examples from the
+[CHANGELOG](CHANGELOG.md):
+
+- sampled DFlash device acceptance on gfx1201
+- CPU-AR sampled target rows and ordered acceptance on gfx1151 and gfx1201
+- Flash-Next EP owner assignment on gfx1201
+- the gfx1151 MTP prompt-fill projections
+
+The Strix Halo NPU prefill route builds its programs with `peacemaker-npu`.
+The offline `railgun-cert` recording-inventory gate keeps the list of
+recording and capture predicates in sync with the source tree. A kernel
+route with a certified PeaceMaker kernel is still subject to hipfire's
+normal admission and validation gates.
+
+PeaceMaker is also published as a standalone repository,
+[github.com/warpfront/peacemaker](https://github.com/warpfront/peacemaker).
+`scripts/mirror-push.sh peacemaker` builds a history-preserving split of
+the PeaceMaker crates and their path dependencies. It then checks that the
+split builds and tests on its own, checks author identities and runs the
+publication guard on every commit. Only then does it push to `main`. Like
+hipfire, PeaceMaker is Apache-2.0. Some files remain MIT under their
+per-file SPDX header, and the mirror's LICENSE adds the LLVM exception
+notice (see `scripts/mirror_split.py`).
+
 ## Install
 
 Linux with ROCm 6 or newer:
@@ -299,6 +343,8 @@ since 0.4.0. They are unsupported and will be removed in 0.5.0. See
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Admitted measurements and claim requirements |
 | [VALIDATION.md](docs/VALIDATION.md) | Correctness and speed gates |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Benchmark protocol |
+| [peacemaker-isa map](crates/peacemaker-isa/map.md) / [peacemaker-author map](crates/peacemaker-author/map.md) | PeaceMaker builder and kernel language |
+| [npu/README.md](docs/npu/README.md) / [peacemaker-npu map](crates/peacemaker-npu/map.md) | XDNA2 NPU builder, simulator and tools |
 | [NIXOS.md](docs/NIXOS.md) / [CONTAINER.md](docs/CONTAINER.md) | NixOS and container builds |
 
 ## Contributing
