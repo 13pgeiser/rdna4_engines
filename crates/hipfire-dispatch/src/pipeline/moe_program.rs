@@ -2049,11 +2049,11 @@ pub(super) fn select_decode(
 /// Resolve all grouped-prefill choices without a GPU or an instruction list.
 ///
 /// The prefill [`MoePrefillResolution`] reads owner-derived residency via
-/// `routed_experts.host_mapped_projections()`: on narrow gfx1201 MTP verify
-/// with a host-mapped uniform MQ4 gate_up+down, Path 2 (grouped-WMMA) is
-/// re-admitted. Residency comes from the packed weight owners — never inferred
-/// from borrowed tensor kinds — so resident-only weights or any other
-/// format/arch keep the indexed Path 1 policy unchanged.
+/// `routed_experts.host_mapped_projections()`. A narrow MTP verify window over
+/// host-mapped experts takes the indexed Path 1, except a host-mapped uniform
+/// MQ4 gate_up+down on gfx1201, which is re-admitted to Path 2 (grouped-WMMA).
+/// Residency comes from the packed weight owners — never inferred from
+/// borrowed tensor kinds — and resident experts keep the legacy route.
 pub(super) fn select_prefill(
     ctx: &DispatchCtx,
     params: &MoePrefillParams<'_>,

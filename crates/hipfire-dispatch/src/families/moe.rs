@@ -1642,18 +1642,20 @@ impl MoePrefillResolution {
         Self::resolve_with_batch_ctx(d, arch, flags, 0, false, false)
     }
 
-    /// Batch- and workload-aware resolution. Narrow *verify* batches (MTP
-    /// verify, n <= 4) take the indexed Path 1. Prompt chunks keep the
-    /// legacy route regardless of width — only `SpeculativeVerify` moves.
-    /// `batch == 0` (unknown) preserves the legacy shape-blind behavior.
+    /// Batch- and workload-aware resolution. A narrow *verify* batch (MTP
+    /// verify, n <= 4) whose routed projections are host-mapped takes the
+    /// indexed Path 1. Prompt chunks keep the legacy route regardless of width,
+    /// and so does a verify batch over device-resident experts: the Path 1
+    /// evidence is host-spilled verify only, and Path 1 accumulates in a
+    /// different order than the resident grouped route. `batch == 0` (unknown)
+    /// preserves the legacy shape-blind behavior.
     ///
-    /// `has_host_projection` opts into one narrow-verify exception: with a
-    /// host-mapped uniform MQ4 gate_up+down on gfx1201 and no mixed-expert
-    /// layer, Path 2 (grouped-WMMA) is re-admitted even for a verify batch.
-    /// The caller MUST set this only when the routed projections are actually
-    /// host-mapped (see [`RoutedExpertWeights::host_mapped_projections`]);
-    /// resident-only weights or any other format/arch keep the indexed Path 1
-    /// policy unchanged. `resolve` (batch0 legacy) always passes `false`.
+    /// `has_host_projection` is authoritative: the caller MUST set it only when
+    /// the routed projections are actually host-mapped (see
+    /// [`RoutedExpertWeights::host_mapped_projections`]). One exception inside
+    /// the host-mapped case: a host-mapped uniform MQ4 gate_up+down on gfx1201
+    /// with no mixed-expert layer is re-admitted to Path 2 (grouped-WMMA).
+    /// `resolve` (batch0 legacy) always passes `false`.
     pub fn resolve_with_batch_ctx(
         d: &MoeDtypes<'_>,
         arch: &rdna_compute::arch_caps::ArchCaps,
@@ -1663,14 +1665,16 @@ impl MoePrefillResolution {
         has_host_projection: bool,
     ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
-        let narrow_verify = is_verify && batch != 0 && batch <= NARROW_VERIFY_MAX_ROWS;
+        // Resident routed experts never take the narrow-verify route: only a
+        // host-mapped verify window moves to Path 1.
+        let narrow_verify =
+            is_verify && has_host_projection && batch != 0 && batch <= NARROW_VERIFY_MAX_ROWS;
         // Host-mapped uniform MQ4 gate_up+down on a narrow gfx1201 verify:
-        // re-admit Path 2 (grouped-WMMA) for this one offloaded case. Only when
-        // the caller reports host projections — resident-only weights or any
-        // other format/arch keep the indexed Path 1 policy. The later mixed /
-        // MQ6 / E8 logic below is unchanged and still governs every other path.
-        // Lower bound of 2 is load-bearing: a 1-row window is decode, not a
-        // verify window, so it must not take the coalesced/Path-2 re-admit.
+        // re-admit Path 2 (grouped-WMMA) for this one offloaded case. The later
+        // mixed / MQ6 / E8 logic below is unchanged and still governs every
+        // other path. Lower bound of 2 is load-bearing: a 1-row window is
+        // decode, not a verify window, so it must not take the coalesced/Path-2
+        // re-admit.
         let offloaded_uniform_verify = narrow_verify
             && (2..=NARROW_VERIFY_MAX_ROWS).contains(&batch)
             && arch.is_gfx1201()
