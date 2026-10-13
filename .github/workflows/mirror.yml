@@ -9,24 +9,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: mirror-peacemaker
+  cancel-in-progress: false
+
 jobs:
-  mirror:
+  peacemaker:
     if: github.ref == 'refs/heads/beta'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: peacemaker
-            branch: main
-            key: PEACEMAKER_MIRROR_KEY
-          - name: redline
-            branch: master
-            key: REDLINE_MIRROR_KEY
-    concurrency:
-      group: mirror-${{ matrix.name }}
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,18 +27,12 @@ jobs:
       - name: Install history filter
         run: python3 -m pip install git-filter-repo==2.47.0
       - name: Split canonical history
-        env:
-          MIRROR_NAME: ${{ matrix.name }}
-        run: scripts/mirror-split.sh "$MIRROR_NAME" "$RUNNER_TEMP/mirror-$MIRROR_NAME"
+        run: scripts/mirror-split.sh peacemaker "$RUNNER_TEMP/peacemaker"
       - name: Check standalone workspace
+        run: cargo check --workspace --manifest-path "$RUNNER_TEMP/peacemaker/Cargo.toml"
+      - name: Publish PeaceMaker main branch
         env:
-          MIRROR_NAME: ${{ matrix.name }}
-        run: cargo check --workspace --manifest-path "$RUNNER_TEMP/mirror-$MIRROR_NAME/Cargo.toml"
-      - name: Publish mirror branch
-        env:
-          MIRROR_NAME: ${{ matrix.name }}
-          MIRROR_BRANCH: ${{ matrix.branch }}
-          MIRROR_KEY: ${{ secrets[matrix.key] }}
+          MIRROR_KEY: ${{ secrets.PEACEMAKER_MIRROR_KEY }}
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.sha }}
         shell: bash
@@ -67,11 +52,5 @@ jobs:
           printf '%s\n' "$MIRROR_KEY" > "$key_file"
           trap 'rm -f "$key_file"' EXIT
           export GIT_SSH_COMMAND="ssh -i $key_file -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
-          if [ "$MIRROR_NAME" = peacemaker ]; then
-            git -C "$RUNNER_TEMP/mirror-$MIRROR_NAME" push --force \
-              "git@github.com:warpfront/$MIRROR_NAME.git" "HEAD:refs/heads/$MIRROR_BRANCH"
-          else
-            # Redline is an overlay: retain master history and reject races.
-            git -C "$RUNNER_TEMP/mirror-$MIRROR_NAME" push \
-              "git@github.com:warpfront/$MIRROR_NAME.git" "HEAD:refs/heads/$MIRROR_BRANCH"
-          fi
+          git -C "$RUNNER_TEMP/peacemaker" push --force \
+            git@github.com:warpfront/peacemaker.git HEAD:refs/heads/main
