@@ -4230,6 +4230,7 @@ fn qwen35_fa_kvwrite_fold_route_supported(plan: &KvTierPlan) -> bool {
     plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteQ8_0
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0
         && plan.batch_size == 1
+        && plan.v_mode_bits == 8
 }
 
 /// KV cache write + attention dispatch. Inline from original.
@@ -7807,6 +7808,11 @@ mod tests {
         assert!(!qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
             batch_size: 2, ..plan
         }));
+        for v_mode_bits in [2, 3, 4] {
+            assert!(!qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
+                v_mode_bits, ..plan
+            }), "Lloyd V bits={v_mode_bits}");
+        }
         for (write_key, attend_key) in [
             (KernelKey::KvWriteQ8_0, KernelKey::AttnQ8_0Kv),
             (KernelKey::KvWriteQ8_0, KernelKey::AttnFlashQ8_0Windowed),
