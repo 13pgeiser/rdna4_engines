@@ -5,7 +5,7 @@
 #     --owner YarnQwen -- /home/kaden/pm-wave/yarn-qwen/niah.sh ARM...
 #   ARM = FIXTURE:FACTOR:MAXSEQ:KV   e.g. 48k:native:57344:auto  48k:2:57344:auto  500k:2:524288:q8
 # Standing rule: nothing above 57K context on the Halo without Main's explicit OK (the 300k/500k arms are
-# prepared, not run, until then). FACTOR native = no override; F = HIPFIRE_ROPE_YARN_FACTOR=F.
+# prepared, not run, until then). FACTOR native = no override; F = HIPFIRE_YARN_FACTOR=F (engine YaRN).
 # The 500K memory plan: kv q8 (QSA K/V Q8_0 + BF16 index arenas), session cache off, MTP off.
 set -uo pipefail
 R=/home/kaden/pm-wave/yarn-qwen
@@ -27,7 +27,7 @@ for spec in "$@"; do
   done
   E+=(HOME="$O/home" HIPFIRE_LOCK_DIR="$O/lockdir" HIPFIRE_KERNEL_CACHE="$R/kcache" HIPFIRE_NO_REGISTRY_FETCH=1
     HIPFIRE_DAEMON_BIN="$BIN/daemon" HIPFIRE_CLI_BIN="$BIN/hipfire" HIPFIRE_SESSION_CACHE_BYTES=0)
-  [ "$factor" != native ] && E+=(HIPFIRE_ROPE_YARN_FACTOR="$factor")
+  [ "$factor" != native ] && E+=(HIPFIRE_YARN_FACTOR="$factor")
   H=(python3 -I "$R/serve_harness.py" --model "$M" --mtp off --dflash off --mode battery --sampling greedy
     --thinking off --max-tokens 160 --max-seq "$maxseq" --kv "$kv" --niah-file "$R/niah/niah_long_$fixture.jsonl"
     --port ${PORT:-19571} --serve-log "$O/serve.log" --out "$O/niah.json")

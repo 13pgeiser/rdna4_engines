@@ -1,7 +1,8 @@
 # Qwen4 static YaRN: long-context retrieval (research, not product)
 
-These fixtures and the runner are prepared but **not run**. `memory.rope_yarn_factor` is
-experimental and has no retrieval receipt above 262,144 tokens yet. Runs above 57K on the Halo
+These multi-needle fixtures and the runner are prepared but **not run** here. They exercise the
+engine-level YaRN override `attention.yarn_factor` / `HIPFIRE_YARN_FACTOR` (#856); its own evidence is
+a single passphrase needle in 295K- and 499K-token prompts on gfx1151. Runs above 57K on the Halo
 need Main's explicit OK. `niah.sh` refuses them unless `MAIN_OK_LONGCTX=1` is set.
 
 - `gen_niah_long.py TOKENIZER_JSON OUT_DIR` regenerates the three fixtures byte-identically. They are not
