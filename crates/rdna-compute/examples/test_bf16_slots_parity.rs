@@ -103,6 +103,26 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {
         .collect()
 }
 
+/// Compare raw IEEE bits, including the sign of zero.
+fn same_f32_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_f32_bits;
+
+    #[test]
+    fn bit_parity_rejects_signed_zero_length_and_nonfinite_mismatches() {
+        assert!(same_f32_bits(&[0.0, -0.0, 1.0], &[0.0, -0.0, 1.0]));
+        assert!(!same_f32_bits(&[0.0], &[-0.0]));
+        assert!(!same_f32_bits(&[1.0], &[]));
+        assert!(!same_f32_bits(&[f32::NAN], &[f32::NAN]));
+        assert!(!same_f32_bits(&[f32::INFINITY], &[f32::INFINITY]));
+    }
+}
+
 fn upload_raw(gpu: &Gpu, bytes: &[u8]) -> GpuTensor {
     gpu.upload_raw(bytes, &[bytes.len()]).expect("upload raw")
 }
@@ -208,7 +228,7 @@ fn fp8_slab(gpu: &mut Gpu, rng: &mut Rng) -> Vec<u8> {
 }
 
 /// One `attention_flash_fp8_e4m3_batched_masked_slots` launch (the slots fp8
-/// reader) with a partials buffer sized for the whole batch at tile size 1.
+/// reader) with a partials buffer sized for the current tile count.
 #[allow(clippy::too_many_arguments)]
 fn fp8_attn_slots(
     gpu: &mut Gpu,
@@ -220,7 +240,8 @@ fn fp8_attn_slots(
     descs: Option<&GpuTensor>,
     rows: Option<&GpuTensor>,
 ) {
-    let partials = upload_f32(gpu, &vec![0.0f32; BATCH * N_HEADS * MAX_CTX * (2 + HEAD_DIM)]);
+    let max_tiles = MAX_CTX.div_ceil(gpu.attn_tile_size());
+    let partials = upload_f32(gpu, &vec![0.0f32; BATCH * N_HEADS * max_tiles * (2 + HEAD_DIM)]);
     gpu.attention_flash_fp8_e4m3_batched_masked_slots(
         q,
         k,
@@ -265,7 +286,7 @@ fn fp8_slots_parity(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, rng: &mut Rng
     assert!(dr.iter().all(|x| x.is_finite()), "check 4a: fp8 reference output is not finite");
     assert!(dr.iter().any(|x| *x != 0.0), "check 4a: fp8 reference output is all zero");
     assert!(
-        dr == download_f32(gpu, &out_zero),
+        same_f32_bits(&dr, &download_f32(gpu, &out_zero)),
         "check 4a: fp8 zero-base descriptor launch diverged from the legacy path"
     );
     eprintln!("check 4a fp8 zero-base parity: BIT-EXACT ({} elements)", dr.len());
@@ -277,7 +298,7 @@ fn fp8_slots_parity(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, rng: &mut Rng
     let out_under = out_dev(gpu);
     fp8_attn_slots(gpu, q, &k_arena, &v_arena, &out_under, pos, Some(&descs_off), Some(&rows1));
     assert!(
-        download_f32(gpu, &out_under) == dr,
+        same_f32_bits(&download_f32(gpu, &out_under), &dr),
         "check 4b: fp8 slot-1 base honoring diverged from the plain-cache run"
     );
     eprintln!("check 4b fp8 non-zero-base understudy: BIT-EXACT, poison untouched");
@@ -300,7 +321,7 @@ fn fp8_slots_parity(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, rng: &mut Rng
     for row in 0..BATCH {
         let want = if row % 2 == 0 { &d0 } else { &dr };
         assert!(
-            d_mix[row * stride..(row + 1) * stride] == want[row * stride..(row + 1) * stride],
+            same_f32_bits(&d_mix[row * stride..(row + 1) * stride], &want[row * stride..(row + 1) * stride]),
             "check 4c: fp8 row {row} (slot {}) diverged from its plain-cache reference",
             row % 2
         );
@@ -372,7 +393,7 @@ fn main() {
     );
     let (dr, dz) = (download_f32(&gpu, &out_ref), download_f32(&gpu, &out_zero));
     assert!(
-        dr == dz,
+        same_f32_bits(&dr, &dz),
         "check 1a: zero-base descriptor launch diverged from the legacy path"
     );
     eprintln!("check 1a zero-base parity: BIT-EXACT ({} elements)", dr.len());
@@ -397,7 +418,7 @@ fn main() {
         Some(&rows1),
     );
     let du = download_f32(&gpu, &out_under);
-    assert!(du == dr, "check 1b: slot-1 base honoring diverged from the plain-cache run");
+    assert!(same_f32_bits(&du, &dr), "check 1b: slot-1 base honoring diverged from the plain-cache run");
     eprintln!("check 1b non-zero-base understudy: BIT-EXACT, poison untouched");
 
     // ── Check 1c: two-slot mix ───────────────────────────────────────────
@@ -438,7 +459,7 @@ fn main() {
         let got = &d_mix[row * stride..(row + 1) * stride];
         let refv = &want[row * stride..(row + 1) * stride];
         assert!(
-            got == refv,
+            same_f32_bits(got, refv),
             "check 1c: row {row} (slot {}) diverged from its plain-cache reference",
             if *want0 { 0 } else { 1 }
         );
