@@ -648,6 +648,11 @@ def main():
         help="run only retained PM4 shadow replays, without HIP/blob parity arms",
     )
     parser.add_argument(
+        "--kv-v",
+        choices=("q8", "lloyd2", "lloyd3", "lloyd4"),
+        help="V-cache tier sent as the load's kv_v override (default: the kv-mode's own V)",
+    )
+    parser.add_argument(
         "--state-quant",
         choices=("q8", "fp32", "q4"),
         help=(
@@ -815,6 +820,7 @@ def main():
         "draft_bytes": draft.stat().st_size if draft is not None else None,
         "daemon": str(daemon_path),
         "kv_mode": args.kv_mode,
+        "kv_v": args.kv_v,
         "automatic_clocks_required": True,
         "prefill": {},
         "decode": {},
@@ -831,6 +837,7 @@ def main():
             "dspark_mode": "on" if args.dspark_verify_shadow else "off",
             "mtp_mode": "off",
             "ngram_draft": False,
+            **({"kv_v": args.kv_v} if args.kv_v is not None else {}),
         }
         # DeepSeek4 discovers `<stem>-dspark.<ext>` itself. Passing the same file
         # through params.draft would incorrectly enter the Qwen DFlash lm_head
