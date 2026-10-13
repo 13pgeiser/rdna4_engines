@@ -4624,9 +4624,15 @@ pub struct LoadedCatalog {
 
 /// Resolve the opt-in trunk calibration path without reading the file.
 pub fn npu_trunk_calibration_path() -> PathBuf {
-    developer_var("HIPFIRE_QWEN4_NPU_TRUNK_CAL").ok()
-        .filter(|path| !path.trim().is_empty()).map(PathBuf::from)
-        .unwrap_or_else(|| ConfigPaths::discover().root.join("npu-trunk/calibration.json"))
+    developer_var("HIPFIRE_QWEN4_NPU_TRUNK_CAL")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            ConfigPaths::discover()
+                .root
+                .join("npu-trunk/calibration.json")
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -6044,16 +6050,39 @@ mod tests {
         let path_field = field("fusions.npu_trunk_calibration").unwrap();
         assert_eq!(path_field.legacy_key, "npu_trunk_calibration");
         assert_eq!(path_field.env_compat, Some("HIPFIRE_QWEN4_NPU_TRUNK_CAL"));
-        assert_eq!(path_field.default.to_value(), ConfigValue::String(String::new()));
-        assert_eq!(path_field.parse_cli("/tmp/cal.json").unwrap(), ConfigValue::String("/tmp/cal.json".into()));
+        assert_eq!(
+            path_field.default.to_value(),
+            ConfigValue::String(String::new())
+        );
+        assert_eq!(
+            path_field.parse_cli("/tmp/cal.json").unwrap(),
+            ConfigValue::String("/tmp/cal.json".into())
+        );
         let mut layer = ConfigLayer::default();
-        layer.values.insert(path_field.key.into(), ConfigValue::String("/tmp/cal.json".into()));
-        let process = ProcessConfig::from_resolved(&resolve([NamedLayer {
-            source: ConfigSource::LegacyEnv { name: "HIPFIRE_QWEN4_NPU_TRUNK_CAL".into() }, layer,
-        }]).unwrap()).unwrap();
-        assert_eq!(process.legacy_value("HIPFIRE_QWEN4_NPU_TRUNK_CAL"), Some("/tmp/cal.json".into()));
-        assert_eq!(ConfigPaths::under("/tmp/hipfire").root.join("npu-trunk/calibration.json"),
-            PathBuf::from("/tmp/hipfire/npu-trunk/calibration.json"));
+        layer.values.insert(
+            path_field.key.into(),
+            ConfigValue::String("/tmp/cal.json".into()),
+        );
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_QWEN4_NPU_TRUNK_CAL".into(),
+                },
+                layer,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            process.legacy_value("HIPFIRE_QWEN4_NPU_TRUNK_CAL"),
+            Some("/tmp/cal.json".into())
+        );
+        assert_eq!(
+            ConfigPaths::under("/tmp/hipfire")
+                .root
+                .join("npu-trunk/calibration.json"),
+            PathBuf::from("/tmp/hipfire/npu-trunk/calibration.json")
+        );
     }
     #[test]
     fn npu_spillover_defaults_off_with_env_parse() {
@@ -6972,7 +7001,10 @@ pub mod topology {
 
     /// Qwen4 degree from raw inputs: the kill switch wins over any (even
     /// invalid) configured value.
-    pub fn resolve_qwen4_ep(configured: Option<&str>, kill_switch: Option<&str>) -> Result<usize, String> {
+    pub fn resolve_qwen4_ep(
+        configured: Option<&str>,
+        kill_switch: Option<&str>,
+    ) -> Result<usize, String> {
         if qwen4_ep_killed(kill_switch) {
             return Ok(1);
         }
@@ -7006,7 +7038,10 @@ pub mod topology {
             assert_eq!(parse_ep(Some("4")), Ok(4));
             for bad in ["0", "3", "5", "8", "-1", "two", "2.0"] {
                 let err = parse_ep(Some(bad)).unwrap_err();
-                assert!(err.contains("topology.ep") && err.contains("1, 2, 4"), "{bad}: {err}");
+                assert!(
+                    err.contains("topology.ep") && err.contains("1, 2, 4"),
+                    "{bad}: {err}"
+                );
             }
         }
 
@@ -7035,7 +7070,10 @@ pub mod topology {
             assert!(field.validate(&crate::ConfigValue::Integer(4)).is_ok());
             assert!(field.validate(&crate::ConfigValue::Integer(0)).is_err());
             assert!(field.validate(&crate::ConfigValue::Integer(5)).is_err());
-            assert!(matches!(field.parse_cli("2"), Ok(crate::ConfigValue::Integer(2))));
+            assert!(matches!(
+                field.parse_cli("2"),
+                Ok(crate::ConfigValue::Integer(2))
+            ));
             assert!(matches!(field.default, crate::DefaultValue::Integer(1)));
         }
     }

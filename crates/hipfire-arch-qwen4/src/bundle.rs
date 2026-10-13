@@ -18,9 +18,7 @@ use crate::gpu_forward::{
     QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
-use crate::mtp_gpu::{
-    MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu,
-};
+use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::Qwen4StateFormat;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
@@ -398,14 +396,22 @@ impl SessionState for Qwen4Bundle {
                     .ok_or("Qwen4 MTP resources are not attached")?,
             ),
         };
-        let staged = self.pair_session_stage.as_ref().filter(|stage| stage.position == Some(position));
+        let staged = self
+            .pair_session_stage
+            .as_ref()
+            .filter(|stage| stage.position == Some(position));
         if (staged.is_none() && self.state.position != position)
             || mtp.is_some_and(|mtp| mtp.position() != position)
         {
             return Err(format!("qwen4 session capture: owners not at {position}"));
         }
-        let SnapshotParts { mut meta, mut layout } = match staged {
-            Some(stage) => stage.snapshot_parts(&self.state).map_err(|e| e.to_string())?,
+        let SnapshotParts {
+            mut meta,
+            mut layout,
+        } = match staged {
+            Some(stage) => stage
+                .snapshot_parts(&self.state)
+                .map_err(|e| e.to_string())?,
             None => {
                 let (meta, layout) = self.state.session_parts().map_err(|e| e.to_string())?;
                 SnapshotParts { meta, layout }
@@ -781,7 +787,10 @@ impl Qwen4Bundle {
     /// Apply the pending trunk overlay, if any.  A refusal (payload digest,
     /// weight pre-check) is logged and leaves the base weights; a failure
     /// after replacement started is an error.
-    fn apply_pending_trunk_overlay(&mut self, gpu: &mut Gpu) -> Result<Option<rdna_compute::TrunkIu4Default>, BundleError> {
+    fn apply_pending_trunk_overlay(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<Option<rdna_compute::TrunkIu4Default>, BundleError> {
         let Some(overlay) = self.trunk_overlay.take() else {
             return Ok(None);
         };
@@ -893,8 +902,13 @@ impl Qwen4Bundle {
         // overlay swap. Effective off does no downloads, allocation or logging.
         #[cfg(target_os = "linux")]
         let mut npu_prepared = Qwen4GpuForward::prepare_npu_trunk(
-            gpu, self, self.trunk_overlay.is_some(), requested, mode,
-        ).map_err(|error| BundleError::Forward(error.to_string()))?;
+            gpu,
+            self,
+            self.trunk_overlay.is_some(),
+            requested,
+            mode,
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))?;
         let overlay_route = self.apply_pending_trunk_overlay(gpu)?;
         #[cfg(target_os = "linux")]
         if let Some(prepared) = &mut npu_prepared {
@@ -918,10 +932,14 @@ impl Qwen4Bundle {
             .unwrap_or_else(|| requested.min(1536));
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
         let forward = Qwen4GpuForward::new_inner(
-            gpu, self, max_chunk, mode,
+            gpu,
+            self,
+            max_chunk,
+            mode,
             #[cfg(target_os = "linux")]
             Some(npu_prepared),
-        ).map_err(|error| BundleError::Forward(error.to_string()))?;
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))?;
         let spec_rows = qwen4_spec_logit_rows(max_chunk);
         let logits_len = spec_rows
             .checked_mul(self.config.vocab_size)
@@ -974,7 +992,9 @@ impl Qwen4Bundle {
             self.state.qsa_backend(),
             // The forward is attached before the head: its EP binding (placement
             // and the rank's dummy expert) builds the head's EP decode table.
-            self.execution.as_ref().and_then(Qwen4GpuForward::ep_binding),
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::ep_binding),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
@@ -1005,9 +1025,12 @@ impl Qwen4Bundle {
                 "Qwen4 spec hidden capacity is zero".to_string(),
             ));
         }
-        let rows=spec_hidden_capacity_rows(
-            rows,self.spec_chunk_rows().unwrap_or(rows),self.npu_trunk_pipelined(),
-        ).ok_or_else(||BundleError::Forward("spec hidden capacity overflow".into()))?;
+        let rows = spec_hidden_capacity_rows(
+            rows,
+            self.spec_chunk_rows().unwrap_or(rows),
+            self.npu_trunk_pipelined(),
+        )
+        .ok_or_else(|| BundleError::Forward("spec hidden capacity overflow".into()))?;
         let width = self
             .config
             .hc_count
@@ -1074,15 +1097,21 @@ impl Qwen4Bundle {
     }
 
     pub(crate) fn npu_trunk_pipelined(&self) -> bool {
-        self.execution.as_ref().is_some_and(|f|f.npu_trunk_pipelined())
+        self.execution
+            .as_ref()
+            .is_some_and(|f| f.npu_trunk_pipelined())
     }
 
     pub(crate) fn npu_trunk_planned(&self) -> bool {
-        self.execution.as_ref().is_some_and(|f|f.npu_trunk_planned())
+        self.execution
+            .as_ref()
+            .is_some_and(|f| f.npu_trunk_planned())
     }
 
     pub(crate) fn begin_npu_trunk_request(&mut self) {
-        if let Some(forward)=&mut self.execution { forward.begin_npu_trunk_request(); }
+        if let Some(forward) = &mut self.execution {
+            forward.begin_npu_trunk_request();
+        }
     }
 
     /// The first still-pending snapshot boundary strictly after `position`.
@@ -1092,9 +1121,21 @@ impl Qwen4Bundle {
 
     /// Banks and snapshot cut of the planned pair starting at `position`, the
     /// geometry both the pair executor and the MTP head appends follow.
-    pub(crate) fn npu_trunk_pair_shape(&self, position: usize, remaining: usize, chunk: usize) -> Option<crate::gpu_forward::PairShape> {
-        let banks = self.execution.as_ref()?.npu_trunk_pair(position, remaining, chunk)?;
-        Some(crate::gpu_forward::PairShape::new(banks, position, self.session_next_boundary()))
+    pub(crate) fn npu_trunk_pair_shape(
+        &self,
+        position: usize,
+        remaining: usize,
+        chunk: usize,
+    ) -> Option<crate::gpu_forward::PairShape> {
+        let banks = self
+            .execution
+            .as_ref()?
+            .npu_trunk_pair(position, remaining, chunk)?;
+        Some(crate::gpu_forward::PairShape::new(
+            banks,
+            position,
+            self.session_next_boundary(),
+        ))
     }
 
     pub(crate) fn prefill_schedule_rows(&self, position: usize, end: usize, chunk: usize) -> usize {
@@ -1103,12 +1144,19 @@ impl Qwen4Bundle {
             next,
             after: next.and_then(|next| self.session_boundary_after(next)),
         };
-        let planned = self.execution.as_ref().is_some_and(|f| f.npu_trunk_pair(position, end - position, chunk).is_some());
+        let planned = self
+            .execution
+            .as_ref()
+            .is_some_and(|f| f.npu_trunk_pair(position, end - position, chunk).is_some());
         crate::gpu_forward::qwen4_prefill_segment_rows(position, end, chunk, boundaries, planned)
     }
 
     fn spec_prefill_capacity(&self, chunk: usize) -> usize {
-        if self.npu_trunk_pipelined() {chunk*2}else{chunk}
+        if self.npu_trunk_pipelined() {
+            chunk * 2
+        } else {
+            chunk
+        }
     }
     /// The `<|im_end|>` token message-end snapshots split after, when active.
     fn turn_end_token_active(&self) -> Option<u32> {
@@ -1224,12 +1272,15 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
-        self.spec_prefill_rows_without_pick(gpu,tokens,true)
+        self.spec_prefill_rows_without_pick(gpu, tokens, true)
     }
 
     pub(crate) fn spec_prefill_rows_without_pick(
-        &mut self, gpu: &mut Gpu, tokens: &[u32], capture_hidden: bool,
-    ) -> Result<(),BundleError> {
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        capture_hidden: bool,
+    ) -> Result<(), BundleError> {
         self.ep_refuse("speculative decoding (spec prefill)")?;
         if tokens.is_empty() {
             return Err(BundleError::Forward(
@@ -1244,22 +1295,34 @@ impl Qwen4Bundle {
             })?
             .scratch
             .max_chunk;
-        let capacity=self.spec_prefill_capacity(max_chunk);
+        let capacity = self.spec_prefill_capacity(max_chunk);
         if tokens.len() > capacity {
             return Err(BundleError::Forward(format!(
                 "Qwen4 spec block length {} exceeds capacity {capacity}",
                 tokens.len()
             )));
         }
-        let hidden=if capture_hidden {
-            let width=self.config.hc_count.checked_mul(self.config.hidden_size)
-                .ok_or_else(||BundleError::Forward("spec hidden width overflow".into()))?;
-            let len=tokens.len().checked_mul(width)
-                .ok_or_else(||BundleError::Forward("spec hidden row overflow".into()))?;
-            Some(self.spec_hidden.as_ref()
-                .ok_or_else(||BundleError::Forward("Qwen4 spec hidden is not allocated".into()))?
-                .sub_offset(0,len))
-        } else {None};
+        let hidden = if capture_hidden {
+            let width = self
+                .config
+                .hc_count
+                .checked_mul(self.config.hidden_size)
+                .ok_or_else(|| BundleError::Forward("spec hidden width overflow".into()))?;
+            let len = tokens
+                .len()
+                .checked_mul(width)
+                .ok_or_else(|| BundleError::Forward("spec hidden row overflow".into()))?;
+            Some(
+                self.spec_hidden
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BundleError::Forward("Qwen4 spec hidden is not allocated".into())
+                    })?
+                    .sub_offset(0, len),
+            )
+        } else {
+            None
+        };
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -1298,7 +1361,11 @@ impl Qwen4Bundle {
             })?
             .scratch
             .max_chunk;
-        let capacity=if prefill {self.spec_prefill_capacity(max_chunk)}else{max_chunk};
+        let capacity = if prefill {
+            self.spec_prefill_capacity(max_chunk)
+        } else {
+            max_chunk
+        };
         if tokens.len() > capacity {
             return Err(BundleError::Forward(format!(
                 "Qwen4 spec block length {} exceeds capacity {capacity}",
@@ -1640,7 +1707,9 @@ impl Qwen4Bundle {
             position,
             fresh_qsa_selection,
             MtpStep::Predict,
-            self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?
         .ok_or_else(|| {
@@ -1670,7 +1739,9 @@ impl Qwen4Bundle {
                 position,
                 fresh_qsa_selection,
                 top1_out,
-                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
+                self.execution
+                    .as_ref()
+                    .and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
@@ -1934,7 +2005,9 @@ impl Qwen4Bundle {
                 position,
                 fresh_qsa_selection,
                 MtpStep::Advance,
-                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
+                self.execution
+                    .as_ref()
+                    .and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -1960,7 +2033,9 @@ impl Qwen4Bundle {
                 position,
                 true,
                 MtpStep::Append,
-                self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
+                self.execution
+                    .as_ref()
+                    .and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -2084,7 +2159,9 @@ impl Qwen4Bundle {
             position,
             fresh_qsa_selection,
             logits,
-            self.execution.as_ref().and_then(Qwen4GpuForward::mtp_ep_gather),
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))
     }
@@ -2340,7 +2417,9 @@ impl Qwen4Bundle {
         self.begin_npu_trunk_request();
         self.live = None;
         self.turn = None;
-        if let Some(stage) = &mut self.pair_session_stage { stage.position = None; }
+        if let Some(stage) = &mut self.pair_session_stage {
+            stage.position = None;
+        }
         // `None` while the cache itself resets (it drives `self` then).
         if let Some(cache) = self.session.as_mut() {
             cache.live_state_reset();
@@ -2387,7 +2466,13 @@ impl Qwen4Bundle {
             .state
             .qsa
             .first()
-            .filter(|qsa| rdna_compute::tensor_ops::qsa_gather_workspace_needed(gpu, qsa.format, qsa.f16_arena.is_some()))
+            .filter(|qsa| {
+                rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+                    gpu,
+                    qsa.format,
+                    qsa.f16_arena.is_some(),
+                )
+            })
             .and_then(|_| {
                 rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
                     self.config.num_key_value_heads,
@@ -2612,10 +2697,16 @@ impl Qwen4Bundle {
     }
 
     pub(crate) fn spec_advance_session_boundary(
-        &mut self, gpu: &mut Gpu, prefix: &[u32],
-    ) -> Result<(),BundleError> {
-        if self.turn.as_ref().is_some_and(|(_,route)|*route==SessionRoute::Ar) {
-            self.session_at_boundary(gpu,prefix)?;
+        &mut self,
+        gpu: &mut Gpu,
+        prefix: &[u32],
+    ) -> Result<(), BundleError> {
+        if self
+            .turn
+            .as_ref()
+            .is_some_and(|(_, route)| *route == SessionRoute::Ar)
+        {
+            self.session_at_boundary(gpu, prefix)?;
         }
         Ok(())
     }
@@ -2651,7 +2742,11 @@ impl Qwen4Bundle {
         let mut pos = reused;
         while pos < prompt.len() {
             let end = if self.npu_trunk_planned() {
-                pos + self.prefill_schedule_rows(pos, prompt.len(), self.spec_chunk_rows().unwrap_or(1))
+                pos + self.prefill_schedule_rows(
+                    pos,
+                    prompt.len(),
+                    self.spec_chunk_rows().unwrap_or(1),
+                )
             } else {
                 self.session_next_boundary().unwrap_or(prompt.len())
             };
@@ -3251,7 +3346,9 @@ impl Qwen4Bundle {
         let mut pair_stage_error = None;
         if let Some(stage) = pair_session_stage {
             for tensor in stage.fixed {
-                if let Err(error) = gpu.free_tensor(tensor) { pair_stage_error.get_or_insert(error); }
+                if let Err(error) = gpu.free_tensor(tensor) {
+                    pair_stage_error.get_or_insert(error);
+                }
             }
         }
         let ple_result = ple_rows
@@ -4614,6 +4711,14 @@ mod tests {
 
 /// The correctness twin retains one-chunk capture; only actual NPU pipelining
 /// needs simultaneous A/B hidden rows.
-pub(crate) fn spec_hidden_capacity_rows(rows: usize, chunk: usize, pipelined: bool) -> Option<usize> {
-    if pipelined {Some(rows.max(chunk.checked_mul(2)?))}else{Some(rows)}
+pub(crate) fn spec_hidden_capacity_rows(
+    rows: usize,
+    chunk: usize,
+    pipelined: bool,
+) -> Option<usize> {
+    if pipelined {
+        Some(rows.max(chunk.checked_mul(2)?))
+    } else {
+        Some(rows)
+    }
 }

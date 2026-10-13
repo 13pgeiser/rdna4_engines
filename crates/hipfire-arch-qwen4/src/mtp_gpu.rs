@@ -11,9 +11,8 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode,
-    MtpEpGather, Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime,
-    Qwen4MoeScratch,
+    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, MtpEpGather,
+    Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::program::{
@@ -524,9 +523,7 @@ impl AppendWidths {
                 .checked_mul(config.indexer_head_dim)?
                 .checked_add(index_kv_width)?,
             index_kv_width,
-            kv_width: config
-                .num_key_value_heads
-                .checked_mul(config.head_dim)?,
+            kv_width: config.num_key_value_heads.checked_mul(config.head_dim)?,
         })
     }
 }
@@ -693,11 +690,16 @@ impl MtpAppendScratch {
     /// Non-owning view of `rows` prompt-chunk ids from row `first` of the
     /// last [`Self::upload_prompt_ids`] upload, for `append_rows`'s
     /// `device_ids`. The view must not be freed.
-    pub(crate) fn prompt_ids_view(&self, first: usize, rows: usize) -> Result<GpuTensor, MtpGpuError> {
+    pub(crate) fn prompt_ids_view(
+        &self,
+        first: usize,
+        rows: usize,
+    ) -> Result<GpuTensor, MtpGpuError> {
         match first.checked_add(rows) {
-            Some(end) if end <= self.id_rows => Ok(self
-                .prompt_ids
-                .sub_offset(first * std::mem::size_of::<i32>(), rows * std::mem::size_of::<i32>())),
+            Some(end) if end <= self.id_rows => Ok(self.prompt_ids.sub_offset(
+                first * std::mem::size_of::<i32>(),
+                rows * std::mem::size_of::<i32>(),
+            )),
             _ => Err(invalid("MTP prompt id view is outside the id capacity")),
         }
     }
@@ -819,9 +821,17 @@ impl<'a> AppendWeights<'a> {
         let qsa = qsa_desc(weights, &mtp.attention)?;
         // The tiled Q8_0 projection is the K = 2560 staged kernel.
         if w.hidden != 2560 {
-            return Err(invalid("MTP batched append Q8_0 projections need hidden 2560"));
+            return Err(invalid(
+                "MTP batched append Q8_0 projections need hidden 2560",
+            ));
         }
-        check("indexer_qk", &qsa.indexer_qk, DType::Q8_0, w.index_width, w.hidden)?;
+        check(
+            "indexer_qk",
+            &qsa.indexer_qk,
+            DType::Q8_0,
+            w.index_width,
+            w.hidden,
+        )?;
         check("k_proj", &qsa.k, DType::Q8_0, w.kv_width, w.hidden)?;
         check("v_proj", &qsa.v, DType::Q8_0, w.kv_width, w.hidden)?;
         Ok(Self {
@@ -1171,7 +1181,10 @@ impl MtpGpuState {
     /// first chunk's mapped pages, the rest being virtual until forwards
     /// map it), then the selection and wide-hidden carry, twice with their
     /// snapshot backups.
-    pub(crate) fn device_bytes(config: &Qwen4Config, context: &Qwen4ContextCommit) -> Option<usize> {
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        context: &Qwen4ContextCommit,
+    ) -> Option<usize> {
         let carry = config
             .qsa_selected_capacity()
             .checked_mul(std::mem::size_of::<i32>())?
@@ -1693,15 +1706,11 @@ impl MtpGpuState {
         words: &[u64],
     ) -> Result<StateLayout<'_>, MtpGpuError> {
         let mark = self.parse_session_mark(words)?;
-        let required = mark
-            .position
-            .max(mark.full_len)
-            .max(mark.raw_len)
-            .max(
-                mark.pooled_len
-                    .saturating_mul(self.compress)
-                    .min(self.full_capacity),
-            );
+        let required = mark.position.max(mark.full_len).max(mark.raw_len).max(
+            mark.pooled_len
+                .saturating_mul(self.compress)
+                .min(self.full_capacity),
+        );
         self.ensure_mapped_capacity(gpu, required)?;
         self.snapshot_arena.invalidate();
         self.request_epoch = self.request_epoch.wrapping_add(1);
@@ -2521,9 +2530,8 @@ impl Qwen4MtpGpu {
                 && step != MtpStep::Append
                 && matches!(&mtp.ffn, Qwen4FfnWeights::Moe(_))
             {
-                let ep = ep.ok_or_else(|| {
-                    invalid("an EP MTP head step needs the forward's row gather")
-                })?;
+                let ep = ep
+                    .ok_or_else(|| invalid("an EP MTP head step needs the forward's row gather"))?;
                 let parity = (self.moe_steps % 2) as usize;
                 self.moe_steps = self.moe_steps.wrapping_add(1);
                 Some((
@@ -2856,13 +2864,7 @@ impl Qwen4MtpGpu {
         let qsa_v = view(&scratch.qsa_v, w.kv_width);
 
         // Embed (`Step::Embed`): the Q8_0 table, one grid row per token.
-        gpu.embedding_lookup_q8_batched(
-            mw.embedding,
-            &token_embedding,
-            token_ids,
-            rows,
-            w.hidden,
-        )?;
+        gpu.embedding_lookup_q8_batched(mw.embedding, &token_embedding, token_ids, rows, w.hidden)?;
         hyper_norm(
             gpu,
             &HyperNorm {
@@ -3226,7 +3228,9 @@ mod tests {
         // `mtp_append_det_enabled` reads.
         use rdna_compute::arch_caps::ArchCaps;
         use rdna_compute::feature_flags::FeatureFlags;
-        for arch in ["gfx1151", "gfx1150", "gfx1152", "gfx1100", "gfx1201", "gfx942"] {
+        for arch in [
+            "gfx1151", "gfx1150", "gfx1152", "gfx1100", "gfx1201", "gfx942",
+        ] {
             let caps = ArchCaps::new(arch, std::sync::Arc::new(FeatureFlags::for_test(arch)));
             assert_eq!(
                 append_det_active(MTP_APPEND_DET_DEFAULT, caps.is_gfx1151()),

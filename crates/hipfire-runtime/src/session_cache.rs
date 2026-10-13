@@ -887,7 +887,12 @@ impl SessionCache {
     /// architecture uses this to reject an interior bank-B boundary without
     /// consuming the bank-A boundary or changing the capture cadence.
     pub fn next_boundary_after(&self, position: usize) -> Option<usize> {
-        self.turn.as_ref()?.boundaries.iter().copied().find(|&p| p > position)
+        self.turn
+            .as_ref()?
+            .boundaries
+            .iter()
+            .copied()
+            .find(|&p| p > position)
     }
 
     /// The live state reached `prefix.len()`, the boundary
@@ -1221,7 +1226,8 @@ mod tests {
     fn boundary_lookahead_does_not_consume_the_capture_cursor() {
         let mut cache = SessionCache::new(domain(), 8 << 30);
         cache.turn = Some(Turn {
-            domain: domain(), route: SessionRoute::Mtp,
+            domain: domain(),
+            route: SessionRoute::Mtp,
             boundaries: VecDeque::from([8192, 10000, 16384]),
         });
         assert_eq!(cache.next_boundary(), Some(8192));
