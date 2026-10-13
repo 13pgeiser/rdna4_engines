@@ -633,6 +633,25 @@ pub(crate) fn tensor_layer_index(name: &str) -> Option<usize> {
     rest[..end].parse().ok()
 }
 
+/// Per-tier discriminant: K/V spans are stride-shaped, so a snapshot must
+/// never restore into a different KV tier. Preserve the historical tags.
+fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
+    use hipfire_runtime::kv_mode::KvMode;
+
+    match kv_mode {
+        KvMode::Q8 => 1,
+        KvMode::Asym2 => 21,
+        KvMode::Asym3 => 31,
+        KvMode::Asym4 => 41,
+        KvMode::Fwht2 => 22,
+        KvMode::Fwht3 => 32,
+        KvMode::Fwht4 => 42,
+        KvMode::Fp8 => 11,
+        KvMode::Bf16 => 12,
+        KvMode::F16 => 13,
+    }
+}
+
 impl Rig {
     /// Build the GPU rig.
     ///
@@ -857,9 +876,9 @@ impl Rig {
         // load at best and mis-reads cache bytes at worst. Fail closed here,
         // naming the arch and the fix, before preflight or any arena exists.
         //
-        // untested-hw: the gfx1201 fp8 slots path (write/attend kernels,
-        // tier plan, pool) was implemented from the q8 slots template; no
-        // gfx1201 host was available to exercise it.
+        // Descriptor-kernel evidence: `test_bf16_slots_parity` check 4 on
+        // gfx1201 covers zero/nonzero bases, two-slot reads, and writes.
+        // This does not establish full-serve parity.
         if matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Fp8)
             && !gpu.arch_caps.is_gfx1201()
         {
@@ -1365,27 +1384,7 @@ impl Rig {
             .iter()
             .map(|t| t.buf.size() as u64)
             .sum();
-        // kv_dtype_tag: a per-tier discriminant so a snapshot captured under
-        // one KV tier can never be restored into a rig running another — the
-        // payload's K/V spans are stride-shaped, and a mismatched restore
-        // would be silent corruption. q8 keeps tag 1 (historical).
-        let kv_dtype_tag: u32 = match kv_mode {
-            hipfire_runtime::kv_mode::KvMode::Q8 => 1,
-            hipfire_runtime::kv_mode::KvMode::Asym2 => 21,
-            hipfire_runtime::kv_mode::KvMode::Asym3 => 31,
-            hipfire_runtime::kv_mode::KvMode::Asym4 => 41,
-            hipfire_runtime::kv_mode::KvMode::Fwht2 => 22,
-            hipfire_runtime::kv_mode::KvMode::Fwht3 => 32,
-            hipfire_runtime::kv_mode::KvMode::Fwht4 => 42,
-            hipfire_runtime::kv_mode::KvMode::Bf16 => 12,
-            hipfire_runtime::kv_mode::KvMode::F16 => 13,
-            other => {
-                // Sentinel or unnamed tier (auto-select placeholder / native
-                // tier with no slot-arena stamp) reached Rig::build — refuse
-                // rather than stamp a wrong layout.
-                return Err(format!("kv mode {other:?} has no slot snapshot tag"));
-            }
-        };
+        let kv_dtype_tag = slot_snapshot_kv_tag(kv_mode);
         let stamp = SnapshotStamp {
             model_hash: weight_bytes,
             kv_dtype_tag,
@@ -6859,6 +6858,35 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_snapshot_kv_tags_are_stable_and_unique() {
+        use hipfire_runtime::kv_mode::KvMode;
+
+        let tags = [
+            (KvMode::Q8, 1),
+            (KvMode::Asym2, 21),
+            (KvMode::Asym3, 31),
+            (KvMode::Asym4, 41),
+            (KvMode::Fwht2, 22),
+            (KvMode::Fwht3, 32),
+            (KvMode::Fwht4, 42),
+            (KvMode::Fp8, 11),
+            (KvMode::Bf16, 12),
+            (KvMode::F16, 13),
+        ]
+        .map(|(mode, expected)| {
+            let actual = slot_snapshot_kv_tag(mode);
+            assert_eq!(actual, expected);
+            actual
+        });
+        for (index, tag) in tags.iter().enumerate() {
+            assert!(
+                !tags[index + 1..].contains(tag),
+                "duplicate slot snapshot KV tag {tag}"
+            );
+        }
+    }
 
     /// The offload admission gate decides which tensors are charged to the device
     /// by parsing the layer ordinal out of an HFQ tensor name, so a name it fails

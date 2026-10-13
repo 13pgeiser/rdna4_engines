@@ -2283,8 +2283,9 @@ impl Gpu {
     /// several independent sequences into disjoint KV slabs. Both `None` =
     /// byte-identical to the plain variant.
     ///
-    /// untested-hw: gfx1201-only path, implemented from the q8 slots template;
-    /// no gfx1201 host was available.
+    /// Descriptor write evidence: `test_bf16_slots_parity` check 4d on
+    /// gfx1201 compares slot-base bytes and preserves slot-0 poison.
+    /// This is a kernel-level check, not full-serve parity.
     #[allow(clippy::too_many_arguments)]
     pub fn kv_cache_write_fp8_e4m3_batched_slots(
         &mut self,
