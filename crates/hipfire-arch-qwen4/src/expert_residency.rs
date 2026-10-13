@@ -1057,6 +1057,24 @@ mod tests {
         assert!(expert_stage_mirror_bytes(usize::MAX, 2).is_err());
     }
 
+    #[test]
+    fn ep4_stage_mirrors_charge_all_four_ranks_against_host_and_gtt() {
+        let full = 512 * (1_740_800 + 870_400);
+        let charge = expert_stage_mirror_bytes(full / 4, 4).unwrap();
+        assert_eq!(charge, 2 * full as u64 + 16 * HOST_MAPPED_PAD_BYTES);
+        // Same payload as EP2 (the ranks split it); every extra rank adds its own pads.
+        let ep2 = expert_stage_mirror_bytes(full / 2, 2).unwrap();
+        assert_eq!(charge - ep2, 8 * HOST_MAPPED_PAD_BYTES);
+        // Host RAM admission takes the total over all four ranks, byte for byte.
+        assert!(check_host_ram(charge, Some(charge + HOST_RAM_HEADROOM_BYTES), 0).is_ok());
+        assert!(check_host_ram(charge, Some(charge + HOST_RAM_HEADROOM_BYTES - 1), 0).is_err());
+        // So does the GTT cap: one rank's quarter fits where the four-rank total does not.
+        let budget = |limit_bytes| Some(GttBudget { limit_bytes, used_bytes: 0 });
+        assert!(check_gtt_cap(charge, budget(charge)).is_ok());
+        assert!(check_gtt_cap(charge, budget(charge - 1)).is_err());
+        assert!(check_gtt_cap(charge / 4, budget(charge - 1)).is_ok());
+    }
+
     /// `/proc/meminfo` text from `(field, MiB)` pairs.
     fn meminfo(fields: &[(&str, u64)]) -> String {
         fields.iter().map(|(key, mib)| format!("{key}:{:>16} kB\n", mib << 10)).collect()

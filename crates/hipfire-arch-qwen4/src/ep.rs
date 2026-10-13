@@ -14,7 +14,8 @@
 //! The thread/latch/poison machinery ([`PeerPool`]) is generic over the peer
 //! state so it is testable without a device. [`Qwen4EpMesh`] is the Qwen4
 //! instantiation: peers are [`Qwen4EpPeer`] and a failure on any rank aborts
-//! the row-gather barrier so no rank is left waiting on a dead peer.
+//! the row-gather barrier so no rank is left waiting on a dead peer. The mesh is
+//! rank-generic over EP2 and EP4 (`attach_ep_mesh` admits `1 + peers` of 2 or 4).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::gpu_forward::{
@@ -947,6 +948,17 @@ fn tile_verdicts(bundle: &Qwen4Bundle) -> Option<Vec<bool>> {
         .and_then(|forward| forward.ep_tile_verdicts())
 }
 
+/// The per-layer verdict vector every rank agreed on: `Some` only when every rank admitted
+/// the lever, the vectors are identical, non-empty and every layer is symmetric. Any `None`,
+/// mismatch or false layer refuses the lever for the whole mesh.
+fn agreed_tile_verdicts(verdicts: &[Option<Vec<bool>>]) -> Option<&Vec<bool>> {
+    let first = verdicts.first()?.as_ref()?;
+    (!first.is_empty()
+        && first.iter().all(|&symmetric| symmetric)
+        && verdicts.iter().all(|layers| layers.as_ref() == Some(first)))
+    .then_some(first)
+}
+
 /// The owner-routed chunk exchange one rank installs into its forward
 /// (`Qwen4GpuForward::install_tile_exchange`): the shared transport, this rank and a
 /// non-owning view of the rank's owner table (`e % ranks`).
@@ -1158,6 +1170,9 @@ impl Qwen4Bundle {
     /// 4. every rank reports its compact expert sources;
     /// 5. every rank builds its full (P2P) tables from all sources and installs
     ///    the row-gather hook (`Qwen4GpuForward::attach_ep`);
+    /// 5b. with `HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, every rank's tile-exchange
+    ///    registration and symmetric verdicts are collected (`run_all`, every rank, EP2
+    ///    and EP4); the exchange is installed only if all ranks admitted and agree;
     /// 6. per-rank memory is recorded and the mesh is stored in `self`.
     ///
     /// On `Err` the bundle must be freed, not served (rank 0's forward may
@@ -1450,10 +1465,10 @@ impl Qwen4Bundle {
             return Err(release_rank0(gpu, error));
         }
 
-        // 5b. Owner-routed chunk MoE: every rank's per-layer symmetric verdicts (taken on
-        // the full tables in `attach_ep`) must be identical and all-true; only then does
-        // each rank propagate them to its compact layers and install the exchange. Any
-        // mismatch refuses the lever for this load: never a per-rank route divergence.
+        // 5b. Owner-routed chunk MoE (EP2/EP4): every rank's per-layer symmetric verdicts (taken
+        // on the full tables in `attach_ep`) must be identical and all-true on ALL ranks; only
+        // then does every rank propagate them to its compact layers and install the exchange.
+        // Any mismatch refuses the lever for this load: never a per-rank route divergence.
         if let Some(tile) = tile.as_ref() {
             let verdicts = {
                 let me = &*self;
@@ -1466,12 +1481,9 @@ impl Qwen4Bundle {
                 Ok(verdicts) => verdicts,
                 Err(error) => return Err(release_rank0(gpu, error)),
             };
-            let first = verdicts.first().cloned().flatten();
-            let agreed = first
-                .as_ref()
-                .is_some_and(|layers| !layers.is_empty() && layers.iter().all(|&symmetric| symmetric))
-                && verdicts.iter().all(|layers| layers.as_ref() == first.as_ref());
-            if agreed {
+            let agreed = agreed_tile_verdicts(&verdicts);
+            let layer_count = agreed.map_or(0, Vec::len);
+            if agreed.is_some() {
                 let experts = self.config.num_experts;
                 let install = |rank: usize, bundle: &mut Qwen4Bundle| -> Result<(), String> {
                     let mut forward = bundle
@@ -1505,7 +1517,7 @@ impl Qwen4Bundle {
                 eprintln!(
                     "qwen4 EP: owner-routed prefill on ({} MoE layers symmetric on every rank, \
                      owners e % {ranks})",
-                    first.as_ref().map_or(0, Vec::len)
+                    layer_count
                 );
             } else {
                 let counts: Vec<String> = verdicts
@@ -2233,5 +2245,35 @@ mod tests {
                 dtype: DType::F32,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod tile_verdict_tests {
+    use super::agreed_tile_verdicts;
+
+    #[test]
+    fn agreement_needs_every_rank_identical_and_complete() {
+        for ranks in [2usize, 4] {
+            let all = vec![Some(vec![true; 40]); ranks];
+            assert_eq!(agreed_tile_verdicts(&all).map(Vec::len), Some(40), "{ranks}");
+            // One rank that did not admit the lever refuses it for all.
+            for absent in 0..ranks {
+                let mut mixed = all.clone();
+                mixed[absent] = None;
+                assert!(agreed_tile_verdicts(&mixed).is_none(), "{ranks} absent {absent}");
+            }
+            // One rank with one asymmetric layer, or a different layer count, refuses.
+            for odd in 0..ranks {
+                let mut asymmetric = all.clone();
+                asymmetric[odd].as_mut().unwrap()[7] = false;
+                assert!(agreed_tile_verdicts(&asymmetric).is_none(), "{ranks} asym {odd}");
+                let mut shorter = all.clone();
+                shorter[odd].as_mut().unwrap().pop();
+                assert!(agreed_tile_verdicts(&shorter).is_none(), "{ranks} short {odd}");
+            }
+        }
+        assert!(agreed_tile_verdicts(&[]).is_none());
+        assert!(agreed_tile_verdicts(&[Some(Vec::new()), Some(Vec::new())]).is_none());
     }
 }

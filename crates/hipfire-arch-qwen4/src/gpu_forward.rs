@@ -1319,17 +1319,59 @@ fn qwen4_ep_balanced_owners_enabled() -> bool {
     hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
 }
 
-/// `HIPFIRE_EP_OWNER_ROUTED_PREFILL=1` (default off): owner-routed chunk MoE on EP2.
-/// A prefill chunk of at least 512 rows whose layer verified symmetric on both ranks
-/// runs the symmetric IU4 GEMMs on the compact (owned-experts-only) table with the
-/// tiles of the peer's experts masked out, then pulls the peer-owned tiles' BF16
-/// grouped down rows over P2P (`MoeTileExchange`) instead of computing every expert
-/// twice. Every other chunk keeps the full-table route. Anything but the exact value
-/// `1` is off, and off allocates nothing, lowers no stage and loads no kernel.
+/// `HIPFIRE_EP_OWNER_ROUTED_PREFILL=1` (default off): owner-routed chunk MoE on EP2 and EP4
+/// (rank-generic: owner of expert `e` is `e % ranks`). A prefill chunk of at least 512 rows
+/// whose layer verified symmetric on every rank runs the symmetric IU4 GEMMs on the compact
+/// (owned-experts-only) table with the tiles of the other ranks' experts masked out, then
+/// pulls each other-rank-owned tile's BF16 grouped down rows over P2P (`MoeTileExchange`)
+/// instead of computing every expert on every rank. Every other chunk keeps the full-table
+/// route. Anything but the exact value `1` is off, and off allocates nothing, lowers no
+/// stage and loads no kernel.
 pub const QWEN4_EP_OWNER_ROUTED_PREFILL_ENV: &str = "HIPFIRE_EP_OWNER_ROUTED_PREFILL";
 
 fn qwen4_ep_owner_routed_prefill_enabled() -> bool {
     hipfire_config::developer_var(QWEN4_EP_OWNER_ROUTED_PREFILL_ENV).as_deref() == Ok("1")
+}
+
+/// Rank counts the owner-routed chunk MoE admits: EP2 and EP4, matching the mesh
+/// (`attach_ep_mesh`) and the four-source launcher ABI.
+const fn tile_ranks_supported(ranks: usize) -> bool {
+    matches!(ranks, 2 | 4)
+}
+
+/// The `experts` little-endian i32 owners (`expert % ranks`) the launcher reads.
+fn tile_owner_table_bytes(experts: usize, ranks: usize) -> Vec<u8> {
+    (0..experts)
+        .flat_map(|expert| ((expert % ranks) as i32).to_le_bytes())
+        .collect()
+}
+
+/// Per-rank donor mirror bytes of one G2 stage layer (`[gate/up, down]`): a rank hosts
+/// `experts / ranks` experts of each kind.
+fn stage_donor_bytes(experts: usize, ranks: usize) -> [usize; 2] {
+    let local_experts = experts / ranks;
+    [
+        local_experts * QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
+        local_experts * QWEN4_EXPERT_STAGE_DOWN_BYTES,
+    ]
+}
+
+/// Redirect the entries of the experts this rank owns (`e % ranks == rank`) into its donor
+/// buffer at `base`, slot `e / ranks`; every other entry keeps its pointer.
+fn redirect_owned_entries(
+    placement: Qwen4EpPlacement,
+    base: usize,
+    stride: usize,
+    entries: &[usize],
+) -> Vec<u8> {
+    entries.iter().enumerate().flat_map(|(expert, &pointer)| {
+        let pointer = if expert % placement.ranks == placement.rank {
+            base + (expert / placement.ranks) * stride
+        } else {
+            pointer
+        };
+        pointer.to_ne_bytes()
+    }).collect()
 }
 
 /// One rank's owner-routed chunk MoE state. The buffers exist from forward construction
@@ -1369,8 +1411,8 @@ impl Qwen4TileRoute {
             );
             Ok(None)
         };
-        if placement.ranks != 2 {
-            return refuse("needs exactly 2 ranks");
+        if !tile_ranks_supported(placement.ranks) {
+            return refuse("needs 2 or 4 ranks");
         }
         if gpu.arch != "gfx1201" {
             return refuse("needs gfx1201");
@@ -1402,9 +1444,7 @@ impl Qwen4TileRoute {
         if max_tiles == 0 {
             return refuse("no tile capacity");
         }
-        let owners: Vec<u8> = (0..config.num_experts)
-            .flat_map(|expert| ((expert % placement.ranks) as i32).to_le_bytes())
-            .collect();
+        let owners = tile_owner_table_bytes(config.num_experts, placement.ranks);
         let owner_table = gpu.upload_raw(&owners, &[owners.len()])?;
         let sentinels = vec![0xFFu8; tile_capacity * word];
         let tile_ids_owned = match gpu.upload_raw(&sentinels, &[sentinels.len()]) {
@@ -2039,8 +2079,8 @@ pub(crate) struct Qwen4ExpertStage {
 impl Qwen4ExpertStage {
     const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
 
-    /// Per-forward admission: full EP chunk tables read peer donor VRAM and
-    /// must never stage. S1 supplies true only when every trunk MoE layer
+    /// Per-forward admission: full EP (EP2/EP4) chunk tables read other ranks' donor VRAM
+    /// and must never stage. S1 supplies true only when every trunk MoE layer
     /// binds the compact owner-routed route. Single-card admission is unchanged.
     ///
     /// Entering a compact staged chunk after a full chunk is safe: the donor
@@ -2102,11 +2142,7 @@ impl Qwen4ExpertStage {
         donors.sort_by_key(|layer| layer % 2);
         let placement = bundle.weights.ep_placement();
         let ranks = placement.map_or(1, |placement| placement.ranks);
-        let local_experts = config.num_experts / ranks;
-        let bytes = [
-            local_experts * QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
-            local_experts * QWEN4_EXPERT_STAGE_DOWN_BYTES,
-        ];
+        let bytes = stage_donor_bytes(config.num_experts, ranks);
         let layer_bytes = bytes.iter().sum::<usize>();
         let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, ranks)
             .map_err(invalid)?;
@@ -2280,14 +2316,7 @@ impl Qwen4ExpertStage {
         let placement = self.placement.expect("EP tables");
         let base = self.donor_views[2 * (layer % 2) + kind].buf.as_ptr() as usize;
         let stride = [QWEN4_EXPERT_STAGE_GATE_UP_BYTES, QWEN4_EXPERT_STAGE_DOWN_BYTES][kind];
-        entries.iter().enumerate().flat_map(|(expert, &pointer)| {
-            let pointer = if expert % placement.ranks == placement.rank {
-                base + (expert / placement.ranks) * stride
-            } else {
-                pointer
-            };
-            pointer.to_ne_bytes()
-        }).collect()
+        redirect_owned_entries(placement, base, stride, entries)
     }
 
     /// Initialize a full EP table once, before any capture/tape. Compact
@@ -4585,7 +4614,7 @@ impl Qwen4GpuForward {
         if let Some(route) = ep.tile.as_mut() {
             // The compact table carries no verdict of its own under EP (the verification
             // above ran on the full tables; same experts, same bytes): the mesh compares
-            // both ranks' vectors before anything is propagated to the compact layers.
+            // all ranks' vectors before anything is propagated to the compact layers.
             route.verdicts = full.iter().map(|layer| layer.symmetric).collect();
         }
         ep.moe_full = full;
@@ -4623,7 +4652,7 @@ impl Qwen4GpuForward {
     /// Install the agreed transport: every layer's compact runtime takes the symmetric
     /// verdict (same experts, same bytes as the full tables it was taken on), so a chunk of
     /// at least 512 rows binds the compact table with the tile exchange. Refused unless
-    /// every layer verified symmetric (the mesh checked both ranks agree).
+    /// every layer verified symmetric (the mesh checked every rank agrees).
     pub(crate) fn install_tile_exchange(
         &mut self,
         hook: Arc<dyn MoeTileExchange + Send + Sync>,
@@ -5531,7 +5560,7 @@ impl Qwen4GpuForward {
             }
         }
         let tile_route = tile_route.filter(|_| tile_active);
-        // G2 expert stage under EP: a full-table chunk reads the peer's donor VRAM, so every
+        // G2 expert stage under EP: a full-table chunk reads another rank's donor VRAM, so every
         // rank drains its stage donors and crosses a host barrier before ANY rank launches it.
         if ep.is_some() && route_n > 1 && !ep_few_rows && !tile_active {
             if let Some(stage) = self.expert_stage.as_ref() {
@@ -7719,5 +7748,73 @@ impl PairShape {
         points.sort_unstable();
         points.dedup();
         points.windows(2).map(|w| w[0]..w[1]).collect()
+    }
+}
+
+#[cfg(test)]
+mod ep_rank_generic_tests {
+    use super::*;
+
+    fn owners(table: &[u8]) -> Vec<i32> {
+        table
+            .chunks_exact(4)
+            .map(|word| i32::from_le_bytes(word.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn owner_routed_prefill_admits_exactly_ep2_and_ep4() {
+        for ranks in [2usize, 4] {
+            assert!(tile_ranks_supported(ranks), "{ranks}");
+        }
+        for ranks in [0usize, 1, 3, 5, 6, 8] {
+            assert!(!tile_ranks_supported(ranks), "{ranks}");
+        }
+    }
+
+    #[test]
+    fn owner_table_is_expert_modulo_ranks_and_balanced() {
+        for ranks in [2usize, 4] {
+            let table = owners(&tile_owner_table_bytes(512, ranks));
+            assert_eq!(table.len(), 512);
+            assert!(table.iter().enumerate().all(|(e, &o)| o == (e % ranks) as i32));
+            for rank in 0..ranks {
+                assert_eq!(table.iter().filter(|&&o| o == rank as i32).count(), 512 / ranks);
+            }
+        }
+    }
+
+    #[test]
+    fn stage_donor_bytes_split_by_every_rank_and_total_the_full_layer() {
+        let full = 512 * (QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES);
+        for ranks in [1usize, 2, 4] {
+            let [gate_up, down] = stage_donor_bytes(512, ranks);
+            assert_eq!(gate_up, 512 / ranks * QWEN4_EXPERT_STAGE_GATE_UP_BYTES);
+            assert_eq!(down, 512 / ranks * QWEN4_EXPERT_STAGE_DOWN_BYTES);
+            assert_eq!((gate_up + down) * ranks, full);
+        }
+    }
+
+    #[test]
+    fn ep4_donor_redirect_covers_each_expert_once_and_keeps_peer_pointers() {
+        let ranks = 4usize;
+        let stride = QWEN4_EXPERT_STAGE_GATE_UP_BYTES;
+        let base = 0x10_0000usize;
+        let entries: Vec<usize> = (0..512).map(|e| 0x9000_0000 + e).collect();
+        let mut claimed = vec![0usize; 512];
+        for rank in 0..ranks {
+            let placement = Qwen4EpPlacement { rank, ranks };
+            let bytes = redirect_owned_entries(placement, base, stride, &entries);
+            for (expert, word) in bytes.chunks_exact(std::mem::size_of::<usize>()).enumerate() {
+                let pointer = usize::from_ne_bytes(word.try_into().unwrap());
+                if expert % ranks == rank {
+                    assert_eq!(pointer, base + (expert / ranks) * stride, "rank {rank} expert {expert}");
+                    claimed[expert] += 1;
+                } else {
+                    assert_eq!(pointer, entries[expert], "rank {rank} expert {expert}");
+                }
+            }
+        }
+        assert!(claimed.iter().all(|&count| count == 1));
     }
 }

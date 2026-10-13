@@ -9727,12 +9727,20 @@ pub const QWEN4_EP_OWNER_ASSIGN_PM_GFX1201: &[u8] =
 pub const EP_TILE_MASK_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/ep_tile_mask_pm_gfx1201.hxaco");
 
-/// Certified builder (PeaceMaker) module of the owner-routed chunk MoE peer tile pull,
-/// gfx1201 only (`hipfire-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm --arch
-/// gfx1201`, M7 obligation-free): copies the rows of every non-owned live tile from the
-/// owner rank's `y_down_grouped` (one of four source bases, 2 or 4 ranks) onto the local buffer.
+/// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile pull, two-rank
+/// specialization, gfx1201 only (`hipfire-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm
+/// --arch gfx1201`, M7 obligation-free, 48-byte kernarg): copies the rows of every non-owned live
+/// tile from the one peer's `y_down_grouped` onto the local buffer.
 pub const EP_TILE_PULL_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1201.hxaco");
+
+/// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile pull, rank-generic
+/// specialization, gfx1201 only (`hipfire-isa emit --kernel
+/// ep_gather_grouped_rows_by_tile_owner_n4_pm --arch gfx1201`, M7 obligation-free, 72-byte
+/// kernarg): copies the rows of every non-owned live tile from the owner rank's
+/// `y_down_grouped` (one of four source bases, 2 or 4 ranks) onto the local buffer.
+pub const EP_TILE_PULL_N4_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_n4_pm_gfx1201.hxaco");
 
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.

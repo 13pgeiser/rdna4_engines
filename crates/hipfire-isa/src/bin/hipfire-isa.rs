@@ -99,9 +99,10 @@ fn ep_tile_mask(arch:Arch)->Result<(String,Vec<u8>),String>{
  let (_,text,proof)=hipfire_isa::kernels::ep_tile_mask::emit_module(arch)?;
  Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))
 }
-/// The PM peer tile pull of the owner-routed EP chunk MoE (`ep_gather_grouped_rows_by_tile_owner_pm_gfx1201`), one symbol per module.
-fn ep_tile_pull(arch:Arch)->Result<(String,Vec<u8>),String>{
- let (_,text,proof)=hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner::emit_module(arch)?;
+/// The PM tile pull of the owner-routed EP chunk MoE, one symbol per module: `ep_gather_grouped_rows_by_tile_owner_pm_gfx1201`
+/// (`Variant::Ep2`, the 48-byte two-rank kernel) or `ep_gather_grouped_rows_by_tile_owner_n4_pm_gfx1201` (`Variant::N4`, the 72-byte rank-generic kernel).
+fn ep_tile_pull(variant:hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant,arch:Arch)->Result<(String,Vec<u8>),String>{
+ let (_,text,proof)=hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner::emit_module(variant,arch)?;
  Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))
 }
 /// `all` (default) emits F32 score + select; `bf16` emits only BF16-pooled score.
@@ -326,7 +327,8 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "spec_accept_pm"=>spec_accept(arch)?,
   "qwen4_ep_owner_assign_pm"=>qwen4_ep_owner_assign(arch)?,
   "ep_tile_mask_pm"=>ep_tile_mask(arch)?,
-  "ep_gather_grouped_rows_by_tile_owner_pm"=>ep_tile_pull(arch)?,
+  "ep_gather_grouped_rows_by_tile_owner_pm"=>ep_tile_pull(hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,arch)?,
+  "ep_gather_grouped_rows_by_tile_owner_n4_pm"=>ep_tile_pull(hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::N4,arch)?,
   "qwen4_mq6_x4"=>qwen4_mq6_x4(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4_gfx11"=>qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "npu_trunk"=>{if arch!=Arch::Gfx1151{return Err("npu_trunk is gfx1151 only".into())} let (_,text,proof)=hipfire_isa::npu_trunk::emit_module()?;(text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?)},
@@ -346,10 +348,10 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  let mq4v=kernel=="mq4_verify";
  let mq4f8=kernel=="mq4_fp8_verify";
  let lane_rows=kernel=="qwen4_lane_rows"||kernel=="npu_trunk"||kernel=="npu_trunk_arena";
- let spec_pm=kernel=="spec_sampling_rows_pm"||kernel=="spec_accept_pm"||kernel=="qwen4_ep_owner_assign_pm"||kernel=="ep_tile_mask_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_pm";
+ let spec_pm=kernel=="spec_sampling_rows_pm"||kernel=="spec_accept_pm"||kernel=="qwen4_ep_owner_assign_pm"||kernel=="ep_tile_mask_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_n4_pm";
  let mtp_q8=kernel=="mtp_q8_det_gfx11";
  let mtp_det=kernel=="mtp_dense_det_gfx11"||mtp_q8;
- if pm_module.is_none()&&!mq4v&&!mq4f8&&!lane_rows&&!spec_pm&&!mtp_det&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into())}
+ if pm_module.is_none()&&!mq4v&&!mq4f8&&!lane_rows&&!spec_pm&&!mtp_det&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n4_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into())}
  if spec_pm&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into())}
  if lane_rows&&shape.is_some() {return Err("qwen4_lane_rows has no --shape contract (use --m7)".into())}
  if lane_rows&&co.is_none() {return Err("qwen4_lane_rows emission requires --co (M7 certifies the linked object)".into())}
@@ -423,9 +425,11 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   } else if kernel=="ep_tile_mask_pm" {
    let e=hipfire_isa::kernels::ep_tile_mask::emit(arch)?;
    (hipfire_isa::kernels::ep_tile_mask::symbol(arch),hipfire_isa::kernels::ep_tile_mask::contract(arch,&e))
-  } else if kernel=="ep_gather_grouped_rows_by_tile_owner_pm" {
-   let e=hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner::emit(arch)?;
-   (hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner::symbol(arch),hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner::contract(arch,&e))
+  } else if kernel=="ep_gather_grouped_rows_by_tile_owner_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_n4_pm" {
+   use hipfire_isa::kernels::ep_gather_grouped_rows_by_tile_owner as pull;
+   let variant=if kernel=="ep_gather_grouped_rows_by_tile_owner_pm" {pull::Variant::Ep2} else {pull::Variant::N4};
+   let e=pull::emit(variant,arch)?;
+   (pull::symbol(variant,arch),pull::contract(variant,arch,&e))
   } else {
    let e=hipfire_isa::kernels::spec_accept_pm::emit(arch)?;
    (hipfire_isa::kernels::spec_accept_pm::symbol(arch),hipfire_isa::kernels::spec_accept_pm::contract(arch,&e))
