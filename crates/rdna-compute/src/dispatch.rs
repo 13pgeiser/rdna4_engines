@@ -5910,12 +5910,14 @@ impl Gpu {
     /// this is set — the one central gate, read by the arch forward paths and
     /// the graph/replay controllers instead of a config-level mirror.
     pub fn owns_host_cpu_weights(&self) -> bool {
+        // bind_thread: skip — pure ownership-policy read; no device call.
         self.graphs.host_cpu_weights
     }
 
     /// Record whether the model now being loaded owns CPU-executed (host)
     /// weights. Set once per load from the resolved placement; cleared on unload.
     pub fn set_host_cpu_weights(&mut self, on: bool) {
+        // bind_thread: skip — updates CPU-side graph/replay policy; no device call.
         self.graphs.host_cpu_weights = on;
         self.replay.set_host_cpu_weights(on);
     }
