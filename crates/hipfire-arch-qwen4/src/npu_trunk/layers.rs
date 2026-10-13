@@ -245,6 +245,7 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                         input_width: dims.hidden,
                         trunk_a4: owner.trunk_a4.get(layer_index).copied().unwrap_or(0),
                         phase: MixerPhase::Whole,
+                        rope_scaling: owner.rope.as_ref().map(crate::gpu_forward::Qwen4RopeTable::scaling),
                     }));
                 }
             }

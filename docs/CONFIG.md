@@ -807,6 +807,13 @@ YaRN RoPE scaling for the Qwen4 (Flash-Next, arch 16) QSA stack. Experimental,
 process-scoped: it applies to every Qwen4 load of the process, so set it in the
 global config or the daemon environment, not a per-request field.
 
+**Status: experimental — no >262K retrieval receipt yet.** The evidence is
+short-context only: the HF table oracle, GPU-vs-CPU kernel oracles past
+262,144 positions, flag-off byte identity, and the factor-2 S11 screen
+(WT2 +0.0068, code24 +0.0091 KLD, within the +0.015 cap). No retrieval above
+262,144 tokens has been run. `hipfire bench` still caps `--pp`/`--ctx` at the
+checkpoint's declared 262,144; `hipfire serve` is the long-context path.
+
 - **unset / `null`** — the checkpoint's own `rope_scaling` / `rope_parameters`
   decides. A checkpoint carrying `rope_type: "yarn"` loads with that scaling;
   a stock Flash-Next checkpoint has none and runs the native RoPE. Output is

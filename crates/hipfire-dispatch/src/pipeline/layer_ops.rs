@@ -2872,6 +2872,7 @@ fn execute_indexed_attention_hc_impl(
                 values: &index_batch, norm: op.indexer_q_norm, rows: op.rows,
                 row_stride: index_width, heads: op.index_heads, head_dim: op.index_dim,
                 head_stride: op.index_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
+                rope_scaling: op.rope_scaling,
             },
             src.idx,
         )?;
@@ -2895,6 +2896,7 @@ fn execute_indexed_attention_hc_impl(
                 values: &qgate_batch, norm: op.q_norm, rows: op.rows,
                 row_stride: 2 * q_width, heads: op.heads, head_dim: op.head_dim,
                 head_stride: 2 * op.head_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
+                rope_scaling: op.rope_scaling,
             },
             src.q,
         )?;
@@ -2904,6 +2906,7 @@ fn execute_indexed_attention_hc_impl(
                 values: &k_batch, norm: op.k_norm, rows: op.rows,
                 row_stride: kv_width, heads: op.kv_heads, head_dim: op.head_dim,
                 head_stride: op.head_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
+                rope_scaling: op.rope_scaling,
             },
             src.k,
         )?;
