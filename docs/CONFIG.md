@@ -1082,6 +1082,26 @@ host; there is no transparent rebind.
 Lowered directly into the startup/load policy. `HIPFIRE_CHAT_TEMPLATE_FILE`
 and `HIPFIRE_DEFAULT_CHATML` remain legacy one-shot aliases.
 
+### Opt-in community Qwen template
+
+The official Qwen chat template stays the default. The community
+[froggeric Qwen chat template](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
+(v22.5, Apache-2.0) can be used as an opt-in override. Download its `.jinja`
+file, then pick one of:
+
+- `hipfire config set prompt.chat_template <path>`
+- `HIPFIRE_CHAT_TEMPLATE_FILE=<path>` in the environment
+- `~/.hipfire/templates/<model-basename>.j2` for a single model (used when no
+  configured path is set)
+
+It changes the prompt, not the engine: default reasoning effort is medium,
+reasoning history is preserved by default, `<|think_on|>` / `<|think_off|>`
+toggle thinking per message, and the tool prompt carries extra guidance.
+
+Overriding the template changes prompt tokens. That can move speculative-decode
+acceptance and task scores, so re-measure before comparing against numbers taken
+with the official template.
+
 ---
 
 ## Additional schema keys
