@@ -231,7 +231,7 @@ impl Rig {
             ranks: self.n,
             slots: SLOTS,
             row_bytes: ROW_BYTES,
-        });
+        }).device_waits(true);
         for r in 0..self.n {
             let set: Vec<&GpuTensor> = self.bufs[r].iter().take(k).collect();
             ctx(b.register(r, &mut self.gpus[r], &set), &format!("register rank {r}"))?;
