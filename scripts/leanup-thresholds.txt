@@ -74,6 +74,20 @@ required_features_daemon    == 0
 # the embed arm's thread-creation bound, the multi-slot engine spawn and its
 # carrier-delegated slot preflight, and the request-named-model reload policy.
 # Same paydown as the 5392 raise: factor the per-verb refusal boilerplate out.
+# RATCHET-RAISE 5392 -> 5495 (#855, arch 17, the qwen3.5 multi-vector
+# embedding encoder pplx-embed-v2): +103 lines in daemon main.rs, in two hunks.
+#   +77  the `embed` verb arm: the multi-slot worker spawn with its
+#        thread-creation bound checked before spawning, the no-model and
+#        not-an-embedding-checkpoint refusals, and the call into
+#        hipfire-generate::embed, which owns the body (the img_generate
+#        precedent, so main.rs names no arch-crate type);
+#   +26  the `generate` arm's refusal of an embedding checkpoint, keyed after
+#        the attempt id and admission token are bound (an attempt-0 refusal
+#        hangs the caller; without any refusal the generic body downcasts the
+#        wrong bundle and panics the daemon).
+# Both guards classify through `hipfire_loader::wire_verb`, so `daemon_arch_id`
+# stays 0. Paid down when the message loop's per-verb refusal boilerplate is
+# factored out.
 daemon_lines                <= 5495
 
 # Examples compile on every `cargo build --all-targets`. Archived research
