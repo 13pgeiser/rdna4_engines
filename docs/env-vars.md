@@ -673,7 +673,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1594
+**Count:** 1595
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1119,7 +1119,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FAULT_PREFIX_PUBLISH` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-runtime/examples/test_serve_prefix_cache.rs | developer |
 | `HIPFIRE_FA_BATCH_FUSE_OFF` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_FA_KVWRITE_FOLD` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/railgun-cert/src/recording.rs | developer |
-| `HIPFIRE_FA_PERTOKEN_MIN_CTX` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/railgun-cert/src/recording.rs | developer |
+| `HIPFIRE_FA_PERTOKEN_MIN_CTX` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-dispatch/src/families/attention.rs | developer |
 | `HIPFIRE_FA_RAGGED_PACKET` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_FIXED_TIER` | crates/hipfire-quantize/src/model_filter.rs, crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_FLASH_ATTN_CK_LIB` | crates/hipfire-config/src/lib.rs, crates/railgun-cert/src/recording.rs | experimental |
