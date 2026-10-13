@@ -751,6 +751,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "qwen4_wmma_lds_64_128_32_64_k64_p_s2", "qwen4_wmma_lds_64_128_32_64_k64_p_s4", "qwen4_wmma_lds_64_128_32_64_k64_p_s8",
             "qwen4_wmma_lds_64_128_32_64_k64_s4", "qwen4_wmma_lds_64_64_32_32_k64_p_s4", "qwen4_wmma_lds_64_64_32_64_k64_p",
             "qwen4_wmma_lds_64_64_32_64_k64_p_s2", "qwen4_wmma_lds_64_64_32_64_k64_p_s4", "qwen4_wmma_lds_reduce",
+            // Arch17 pitched projections: gfx1201-only, unsplit ascending K.
+            "qwen4_wmma_lds_64_64_32_64_k64_p_ld",
+            "qwen4_wmma_lds_64_128_32_64_k64_p_ld",
+            "qwen4_wmma_lds_128_128_32_64_k64_ld",
+            "qwen4_wmma_lds_128_256_32_64_k64_ld",
         ]);
         add!("hyper_read_up_wmma_gfx1201", crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1201_SRC, [
             "hyper_read_up_wmma_bf16_gfx1201", "hyper_read_up_wmma_bf16_gfx1201_t128",

@@ -470,6 +470,30 @@ impl LdsTileSplitK {
     }
 }
 
+/// Static entry names for the four admitted pitched, unsplit gfx1201 tiles.
+fn splitk_ld_entry(tile: LdsTileSplitK) -> Option<&'static str> {
+    match (
+        tile.bm, tile.bn, tile.wm, tile.wn, tile.pipe, tile.split, tile.ks,
+    ) {
+        (64, 64, 32, 64, true, 1, 64) => Some("qwen4_wmma_lds_64_64_32_64_k64_p_ld"),
+        (64, 128, 32, 64, true, 1, 64) => Some("qwen4_wmma_lds_64_128_32_64_k64_p_ld"),
+        (128, 128, 32, 64, false, 1, 64) => Some("qwen4_wmma_lds_128_128_32_64_k64_ld"),
+        (128, 256, 32, 64, false, 1, 64) => Some("qwen4_wmma_lds_128_256_32_64_k64_ld"),
+        _ => None,
+    }
+}
+
+/// Geometry admitted by the gfx1201-only pitched, unsplit LDS route.
+fn splitk_ld_supported(tile: LdsTileSplitK, k: usize, lda: usize, ldx: usize) -> bool {
+    k > 0
+        && k % 64 == 0
+        && lda >= k
+        && ldx >= k
+        && lda % 16 == 0
+        && ldx % 16 == 0
+        && splitk_ld_entry(tile).is_some()
+}
+
 /// Fused epilogue for [`Gpu::gemm_f16_x_f16_wmma_lds_epi`].
 ///
 /// Every FLUX MMDiT GEMM is followed by a fixed elementwise pass — a cast to
@@ -29213,6 +29237,97 @@ impl Gpu {
         )
     }
 
+    /// Pitched F16 weights/activations to packed `[B, M]` F32 output on gfx1201.
+    /// Only the four supported unsplit k64 tiles are admitted: accumulation is
+    /// ascending K in one accumulator, with no split scratch or reduction.
+    /// `lda` and `ldx` are element pitches, at least K and divisible by 16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_splitk_ld(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        tile: LdsTileSplitK,
+        lda: usize,
+        ldx: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        assert!(
+            self.arch_caps.is_gfx1201(),
+            "gemm_f16_x_f16_wmma_lds_splitk_ld is gfx1201-only (arch {})",
+            self.arch
+        );
+        assert_eq!(a_f16.dtype, DType::F16, "splitk_ld: A must be F16");
+        assert_eq!(x_f16.dtype, DType::F16, "splitk_ld: X must be F16");
+        assert_eq!(y_f32.dtype, DType::F32, "splitk_ld: Y must be F32");
+        assert!(
+            splitk_ld_supported(tile, k, lda, ldx),
+            "gemm_f16_x_f16_wmma_lds_splitk_ld: unsupported tile/K/pitch: {tile:?}, K={k}, lda={lda}, ldx={ldx}"
+        );
+        Self::check_lds_pitch(
+            "gemm_f16_x_f16_wmma_lds_splitk_ld",
+            a_f16,
+            x_f16,
+            m,
+            k,
+            batch_size,
+            lda,
+            ldx,
+        );
+        assert!(
+            y_f32.numel() >= batch_size * m,
+            "gemm_f16_x_f16_wmma_lds_splitk_ld: output too small for [{batch_size}, {m}]"
+        );
+        self.bind_thread()?;
+        let entry = splitk_ld_entry(tile).expect("validated pitched split1 tile");
+        self.ensure_kernel(
+            "gemm_wmma_lds_splitk",
+            kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC,
+            entry,
+        )?;
+        let ap = a_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let lai = lda as i32;
+        let lxi = ldx as i32;
+        let mut params: [*mut c_void; 8] = [
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
+            &lai as *const _ as *mut c_void,
+            &lxi as *const _ as *mut c_void,
+        ];
+        let threads = ((tile.bm / tile.wm) * (tile.bn / tile.wn) * 32) as u32;
+        let grid = [
+            m.div_ceil(tile.bm) as u32,
+            batch_size.div_ceil(tile.bn) as u32,
+            1,
+        ];
+        self.launch_maybe_blob(entry, grid, [threads, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b.push_i32(lai);
+            b.push_i32(lxi);
+            b
+        })
+    }
+
     /// gfx1201 tile for the Qwen4 BF16 projections, measured on the R9700
     /// against a 25-tile sweep (event-timed, 10-20 reps;
     /// `qcal/release-0.4.0/qwen4-hc-wmma/logs/sweep{1,2}.txt`), multirow in
@@ -47574,6 +47689,59 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splitk_ld_rejects_invalid_pitch_and_geometry() {
+        let tile = LdsTileSplitK::new(64, 64, 32, 64, true, 1);
+        assert!(splitk_ld_supported(tile, 64, 80, 96));
+        for (k, lda, ldx) in [
+            (0, 64, 64),
+            (32, 64, 64),
+            (64, 48, 64),
+            (64, 64, 48),
+            (64, 65, 64),
+            (64, 64, 65),
+        ] {
+            assert!(!splitk_ld_supported(tile, k, lda, ldx));
+        }
+        for invalid in [
+            LdsTileSplitK { split: 4, ..tile },
+            LdsTileSplitK { ks: 32, ..tile },
+            LdsTileSplitK { wm: 64, ..tile },
+            LdsTileSplitK {
+                pipe: false,
+                ..tile
+            },
+            LdsTileSplitK { bm: 256, ..tile },
+        ] {
+            assert!(!splitk_ld_supported(invalid, 64, 64, 64));
+        }
+    }
+
+    #[test]
+    fn splitk_ld_entries_match_source_and_registry() {
+        let registered = crate::kernel_registry::lookup("gfx1201", "gemm_wmma_lds_splitk", "")
+            .expect("gfx1201 split-K module");
+        let gfx1151 = crate::kernel_registry::lookup("gfx1151", "gemm_wmma_lds_splitk", "")
+            .expect("gfx1151 packed module");
+        for tile in [
+            LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+            LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+            LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+            LdsTileSplitK::new(128, 256, 32, 64, false, 1),
+        ] {
+            assert!(splitk_ld_supported(tile, 128, 144, 160));
+            let entry = splitk_ld_entry(tile).expect("admitted pitched split1 tile");
+            assert!(registered.symbols.contains(&entry));
+            assert!(!gfx1151.symbols.contains(&entry));
+            assert!(kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC
+                .contains(&format!("SK_KERNEL_LD({entry},")));
+        }
+        assert_eq!(
+            registered.source(),
+            kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC
+        );
+    }
 
     #[test]
     #[ignore = "requires GPU, HIPFIRE_QWEN4_SHARED_DOWN_EPI=1 and the F16 WMMA route"]
