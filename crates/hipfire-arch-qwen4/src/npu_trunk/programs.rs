@@ -2,7 +2,7 @@
 //! G80 program construction: one deployment image + command stream per trunk shape, CPU only (no device is opened).
 //!
 //! Every submit of a trunk program multiplies one 256-row-wave-padded A (`rows_max` rounded up to 256 rows, `K = 2560`) by
-//! ONE resident 1280-column B panel, with exact int32 accumulation and either an I32 drain or integer BF16 epilogue.
+//! ONE resident 1280-column B panel, with exact int32 accumulation and the integer direct-BF16 epilogue.
 //! A shape needs `panel_count` submits per row block; the program is independent of the panel (B is an argument).
 //! Row-major programs differ only in their fused C row pitch; native-tile programs share a design.
 
@@ -30,7 +30,7 @@ pub struct ShapeProgram {
     pub arg_bytes: [usize; 3],
     /// Host bytes read by ONE submit (packed A + one packed B panel).
     pub host_bytes_read: u64,
-    /// Host bytes written by ONE submit (the native I32 or BF16 C arena).
+    /// Host bytes written by ONE submit (the BF16 C arena).
     pub host_bytes_written: u64,
 }
 
@@ -88,7 +88,6 @@ pub fn build_programs_for_families(
     families: FamilyMask,
 ) -> Result<NpuPrograms, String> {
     let epilogue = match contract {
-        EpilogueContract::I32Fold => Epilogue::I32,
         EpilogueContract::Bf16Direct => Epilogue::Bf16,
     };
     if !(1..=ROWS_LIMIT).contains(&rows_max) {

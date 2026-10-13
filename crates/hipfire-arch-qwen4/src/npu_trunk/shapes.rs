@@ -19,13 +19,12 @@ pub const TRUNK_K: usize = 2560;
 /// Output columns of one NPU panel (the G80 wave width).
 pub const PANEL_COLS: usize = 1280;
 
-/// Epilogue contract of the NPU path (see INTERFACES.md §0).
+/// Epilogue contract of the NPU path (see INTERFACES.md §0): the NPU accumulates exactly in integers and emits
+/// BF16 directly; there is no int32 partial, combine or fold on the GPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EpilogueContract {
-    /// Raw I32 from the NPU, folded on the GPU: `y = (f32)(((f64)I * (f64)ws_n) * (f64)d_t)`.
-    #[default]
-    I32Fold,
     /// Exact integer product of I and grid15-up scales, rounded once to IEEE BF16.
+    #[default]
     Bf16Direct,
 }
 
@@ -33,8 +32,7 @@ impl EpilogueContract {
     /// Spelling used in load logs.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::I32Fold => "i32fold",
-            Self::Bf16Direct => "bf16direct",
+            Self::Bf16Direct => "bf16_direct",
         }
     }
 }
@@ -405,8 +403,7 @@ mod tests {
 
     #[test]
     fn epilogue_contract_spellings() {
-        assert_eq!(EpilogueContract::default(), EpilogueContract::I32Fold);
-        assert_eq!(EpilogueContract::I32Fold.as_str(), "i32fold");
-        assert_eq!(EpilogueContract::Bf16Direct.as_str(), "bf16direct");
+        assert_eq!(EpilogueContract::default(), EpilogueContract::Bf16Direct);
+        assert_eq!(EpilogueContract::Bf16Direct.as_str(), "bf16_direct");
     }
 }

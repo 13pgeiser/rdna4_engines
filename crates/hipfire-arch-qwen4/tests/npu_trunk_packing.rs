@@ -516,8 +516,17 @@ fn parts_of(map: &hipfire_arch_qwen4::npu_trunk::ColumnMap) -> Vec<(u32, u32)> {
     map.parts.iter().map(|&(_, c0, n)| (c0, n)).collect()
 }
 
+/// Oracle W8 row scale rounded up to the direct-BF16 grid15 scale `Sm * 2^Se` (what the packer stores in `ws`).
+fn grid_ws(raw: f32) -> f32 {
+    let (sm, se) = pm_npu::kernels::w8a8_epi::grid15_up(raw);
+    (f64::from(sm) * 2f64.powi(i32::from(se))) as f32
+}
+
 fn expected_ws(blobs: &[(Family, usize, Vec<u8>)]) -> Vec<Vec<f32>> {
-    blobs.iter().map(|(_, m, b)| wprep_w8(&decode_mq6(b, *m, TRUNK_K), *m, TRUNK_K).1).collect()
+    blobs
+        .iter()
+        .map(|(_, m, b)| wprep_w8(&decode_mq6(b, *m, TRUNK_K), *m, TRUNK_K).1.into_iter().map(grid_ws).collect())
+        .collect()
 }
 
 #[test]
@@ -559,15 +568,13 @@ fn pack_shape_full_mask_matches_oracle_ws_and_structure() {
         // Deterministic.
         let again = pack_shape(shape, &mats, mask).ok().expect("repack");
         assert!(again.panels == packed.panels && again.ws == packed.ws, "{shape:?}: nondeterministic");
-        // Both explicit contracts are supported; I32Fold remains the default.
-        let folded = pack_shape_with_contract(EpilogueContract::I32Fold, shape, &mats, mask).ok().expect("I32Fold");
-        assert!(folded.panels == packed.panels && folded.ws == packed.ws);
+        // The explicit contract is the default; scales are the grid15-up decomposition of `ws`.
         let direct = pack_shape_with_contract(EpilogueContract::Bf16Direct, shape, &mats, mask).unwrap();
+        assert!(direct.panels == packed.panels && direct.ws == packed.ws);
         assert_eq!(direct.scales.len(), map.padded_cols());
-        for ((&raw, &rounded), &(sm, se)) in packed.ws.iter().zip(&direct.ws).zip(&direct.scales) {
-            assert_eq!((sm, se), pm_npu::kernels::w8a8_epi::grid15_up(raw));
+        for (&rounded, &(sm, se)) in direct.ws.iter().zip(&direct.scales) {
             assert_eq!(rounded, (f64::from(sm) * 2f64.powi(i32::from(se))) as f32);
-            assert!(rounded >= raw);
+            assert_eq!((sm, se), pm_npu::kernels::w8a8_epi::grid15_up(rounded));
         }
     }
 }
@@ -658,5 +665,5 @@ fn pack_trunk_layers_share_shape_map_and_ws() {
     let direct = pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, mask).unwrap();
     assert_eq!(direct.per_layer.len(), layers.len());
     assert_eq!(direct.per_layer[0].as_ref().unwrap().1.scales, direct.per_layer[2].as_ref().unwrap().1.scales);
-    assert!(pack_trunk_with_contract(EpilogueContract::I32Fold, &layers, mask).is_ok());
+    assert!(pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, mask).is_ok());
 }

@@ -36,14 +36,15 @@ errors after validating the matrix metadata.
 directly. `PackedB::ws` contains the padded fused scales.
 `pack_trunk` preserves layer order and stores per-layer shape/panels and scales.
 
-The ordinary pack functions select `EpilogueContract::I32Fold`.
-`Bf16Direct` rounds each raw weight scale upward with `pm-npu`'s public
-`grid15_up`, quantizes with that exact grid scale, and returns padded `(Sm,Se)`
-sidecars in `PackedB::scales` as well as embedding them in each packed panel.
+The only contract is `EpilogueContract::Bf16Direct` (`as_str` "bf16_direct"; the `I32Fold` contract and its
+GPU fold were removed: no int32 partial, combine or fold exists in the product route). The ordinary pack
+functions use it: `Bf16Direct` rounds each raw weight scale upward with `pm-npu`'s public `grid15_up`,
+quantizes with that exact grid scale, and returns padded `(Sm,Se)` sidecars in `PackedB::scales` as well
+as embedding them in each packed panel; `PackedB::ws` holds the grid scale as f32.
 
 ## Programs
 
-`build_programs(contract, rows_max)` selects one G80 I32 or direct-BF16/Fast
+`build_programs(contract, rows_max)` selects one G80 direct-BF16/Fast
 design per shape, via `pm-npu::kernels::gemm_g80::build_panel_program`.
 M is rounded up to 256, N=1280, K=2560; `rows_max` must be 1..=65536.
 `build_programs_for_families` uses the same compacted maps as weight packing.

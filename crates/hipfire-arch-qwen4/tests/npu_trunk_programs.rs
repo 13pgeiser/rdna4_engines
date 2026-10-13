@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Metadata of `build_programs` / `build_programs_for_families`: G80 I32 argument sizes (computed here from the documented
-//! layout, not from the design), row bounds and rounding, direct BF16 sidecars, and masked panel counts.
+//! Metadata of `build_programs` / `build_programs_for_families`: G80 direct-BF16 argument sizes (computed here from the
+//! documented layout, not from the design), row bounds and rounding, sidecar bytes, and masked panel counts.
 //! Nothing here runs the simulator or touches a device.
 use hipfire_arch_qwen4::npu_trunk::{
     build_programs, build_programs_for_families, EpilogueContract, Family, FamilyMask, NpuPrograms, Shape, PANEL_COLS, TRUNK_K,
@@ -8,12 +8,12 @@ use hipfire_arch_qwen4::npu_trunk::{
 
 const WAVE_M: usize = 256;
 const K_CHUNK: usize = 64;
-/// One K chunk of the A half one injecting column carries (128 rows x 64 / 2).
-const A_CHUNK: usize = 4096;
-/// One K chunk of one core column's B segment (two 80-wide N tiles x 64).
-const B_CHUNK: usize = 10240;
-/// One core int32 C tile (128 x 80 words).
-const C_TILE: usize = 128 * 80 * 4;
+/// One K chunk of the A half one injecting column carries (128 rows x 64 / 2 codes + Dm[128] + De[128]).
+const A_CHUNK: usize = 4096 + 512;
+/// One K chunk of one core column's B segment (two 80-wide N tiles x 64 codes + Sm[96] + Se[96] each).
+const B_CHUNK: usize = 2 * (5120 + 384);
+/// One core BF16 C tile (128 x 80 x 2 bytes).
+const C_TILE: usize = 128 * 80 * 2;
 const COLS: usize = 8;
 const A_COLS: usize = 4;
 
@@ -56,34 +56,34 @@ fn check(progs: &NpuPrograms, rows_requested: usize, selected: FamilyMask, what:
 
 #[test]
 fn full_mask_published_panel_counts() {
-    let progs = build_programs(EpilogueContract::I32Fold, 1).unwrap();
+    let progs = build_programs(EpilogueContract::Bf16Direct, 1).unwrap();
     // GdnIn qkv|z|a|b = 10240+6144+48+48 = 16480 cols, QsaIn q|k|v|idx = 12288+512+512+640 = 13952 cols.
     let (g, q) = (progs.get(Shape::GdnIn), progs.get(Shape::QsaIn));
     assert_eq!((g.panel_count, g.padded_cols), (13, 16640));
     assert_eq!((q.panel_count, q.padded_cols), (11, 14080));
-    assert!(matches!(progs.contract, EpilogueContract::I32Fold));
+    assert!(matches!(progs.contract, EpilogueContract::Bf16Direct));
 }
 
 #[test]
-fn rows_are_rounded_to_waves_and_sizes_follow_the_g80_i32_layout() {
+fn rows_are_rounded_to_waves_and_sizes_follow_the_g80_bf16_layout() {
     for rows in [1, 2, 255, 256, 257, 511, 512, 513, 4096, 16384, 65535, 65536] {
-        let progs = build_programs(EpilogueContract::I32Fold, rows).unwrap();
+        let progs = build_programs(EpilogueContract::Bf16Direct, rows).unwrap();
         check(&progs, rows, FamilyMask::ALL, &format!("rows {rows}"));
     }
 }
 
 #[test]
 fn per_submit_sizes_pin_known_values() {
-    // One wave: A 4 cols * 40 chunks * 4096 = 655360, B 8 * 40 * 10240 = 3276800, C 8 * 4 * 40960 = 1310720.
-    let one = build_programs(EpilogueContract::I32Fold, 256).unwrap();
+    // One wave: A 4 cols * 40 chunks * 4608 = 737280, B 8 * 40 * 11008 = 3522560, C 8 * 4 * 20480 = 655360.
+    let one = build_programs(EpilogueContract::Bf16Direct, 256).unwrap();
     for shape in Shape::ALL {
-        assert_eq!(one.get(shape).arg_bytes, [655_360, 3_276_800, 1_310_720]);
+        assert_eq!(one.get(shape).arg_bytes, [737_280, 3_522_560, 655_360]);
     }
     // 256 waves: A and C scale with the waves, B does not.
-    let max = build_programs(EpilogueContract::I32Fold, 65536).unwrap();
+    let max = build_programs(EpilogueContract::Bf16Direct, 65536).unwrap();
     for shape in Shape::ALL {
         let p = max.get(shape);
-        assert_eq!(p.arg_bytes, [655_360 * 256, 3_276_800, 1_310_720 * 256]);
+        assert_eq!(p.arg_bytes, [737_280 * 256, 3_522_560, 655_360 * 256]);
         assert_eq!(p.design.waves(), 256);
     }
 }
@@ -91,9 +91,9 @@ fn per_submit_sizes_pin_known_values() {
 #[test]
 fn rows_outside_one_to_65536_are_rejected_without_building() {
     for rows in [0, 65537, 65792, usize::MAX] {
-        let err = build_programs(EpilogueContract::I32Fold, rows).unwrap_err();
+        let err = build_programs(EpilogueContract::Bf16Direct, rows).unwrap_err();
         assert!(err.contains(&rows.to_string()) && err.contains("65536"), "rows {rows}: {err}");
-        assert!(build_programs_for_families(EpilogueContract::I32Fold, rows, FamilyMask::ALL).is_err());
+        assert!(build_programs_for_families(EpilogueContract::Bf16Direct, rows, FamilyMask::ALL).is_err());
     }
 }
 
@@ -133,7 +133,7 @@ fn masked_programs_follow_the_column_map_panel_counts() {
     ];
     for (name, m) in masks {
         for rows in [1, 300] {
-            let progs = build_programs_for_families(EpilogueContract::I32Fold, rows, m).unwrap();
+            let progs = build_programs_for_families(EpilogueContract::Bf16Direct, rows, m).unwrap();
             check(&progs, rows, m, name);
             for shape in Shape::ALL {
                 let map = shape.column_map(m);
@@ -144,29 +144,29 @@ fn masked_programs_follow_the_column_map_panel_counts() {
         }
     }
     // Hand-checked values independent of Family::cols().
-    let p = build_programs_for_families(EpilogueContract::I32Fold, 256, mask(&[GdnA, GdnB])).unwrap();
+    let p = build_programs_for_families(EpilogueContract::Bf16Direct, 256, mask(&[GdnA, GdnB])).unwrap();
     assert_eq!((p.get(Shape::GdnIn).panel_count, p.get(Shape::GdnIn).padded_cols), (1, 1280));
     assert_eq!((p.get(Shape::QsaIn).panel_count, p.get(Shape::QsaIn).padded_cols), (0, 0));
-    let p = build_programs_for_families(EpilogueContract::I32Fold, 256, mask(&[QsaIdx])).unwrap();
+    let p = build_programs_for_families(EpilogueContract::Bf16Direct, 256, mask(&[QsaIdx])).unwrap();
     assert_eq!((p.get(Shape::GdnIn).panel_count, p.get(Shape::QsaIn).panel_count), (0, 1));
-    let p = build_programs_for_families(EpilogueContract::I32Fold, 256, mask(&[GdnQkv])).unwrap();
+    let p = build_programs_for_families(EpilogueContract::Bf16Direct, 256, mask(&[GdnQkv])).unwrap();
     assert_eq!(p.get(Shape::GdnIn).panel_count, 8);
-    let p = build_programs_for_families(EpilogueContract::I32Fold, 256, mask(&[QsaQ])).unwrap();
+    let p = build_programs_for_families(EpilogueContract::Bf16Direct, 256, mask(&[QsaQ])).unwrap();
     assert_eq!(p.get(Shape::QsaIn).panel_count, 10);
     // A zero-panel shape still carries the (mask-independent) design and sizes of its row block.
-    assert_eq!(p.get(Shape::GdnIn).arg_bytes, [655_360, 3_276_800, 1_310_720]);
+    assert_eq!(p.get(Shape::GdnIn).arg_bytes, [737_280, 3_522_560, 655_360]);
 }
 
 #[test]
 fn empty_mask_is_rejected() {
-    let err = build_programs_for_families(EpilogueContract::I32Fold, 256, FamilyMask::NONE).unwrap_err();
+    let err = build_programs_for_families(EpilogueContract::Bf16Direct, 256, FamilyMask::NONE).unwrap_err();
     assert!(err.contains("no families"), "{err}");
 }
 
 #[test]
 fn full_build_is_the_all_families_masked_build() {
-    let a = build_programs(EpilogueContract::I32Fold, 1000).unwrap();
-    let b = build_programs_for_families(EpilogueContract::I32Fold, 1000, FamilyMask::ALL).unwrap();
+    let a = build_programs(EpilogueContract::Bf16Direct, 1000).unwrap();
+    let b = build_programs_for_families(EpilogueContract::Bf16Direct, 1000, FamilyMask::ALL).unwrap();
     assert_eq!(a.rows_max, b.rows_max);
     for shape in Shape::ALL {
         let (x, y) = (a.get(shape), b.get(shape));
