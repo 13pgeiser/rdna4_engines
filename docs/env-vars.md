@@ -634,7 +634,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1562
+**Count:** 1563
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2063,6 +2063,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SESSION_CACHE_BYTES` | crates/hipfire-config/src/lib.rs, experiments/qwen4-yarn-longctx/niah.sh | stable |
 | `HIPFIRE_SESSION_CACHE_DIR` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SESSION_CACHE_DISK_WRITE_PHASE` | crates/hipfire-arch-qwen4/tests/session_cache_hw.rs | harness |
 | `HIPFIRE_SESSION_CACHE_MODEL` | crates/hipfire-arch-qwen4/tests/session_cache_hw.rs | harness |
 | `HIPFIRE_SHARED_VMM_DEVICE` | crates/hip-bridge/examples/shared_vmm_fd_probe.rs | harness |
 | `HIPFIRE_SILU_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
