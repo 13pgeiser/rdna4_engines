@@ -233,28 +233,6 @@ HIPFIRE_DEVICES=gfx1201,gfx1201 hipfire serve <minimax-or-deepseek4-tag> --tp 2
 EP does not honor a non-default `--kv-mode` the same way single-GPU load does
 today — the CLI warns when both are set. Reload without a DFlash draft for EP.
 
-### Flash-Next EP2: decode-heavy prefill chunk (`HIPFIRE_PREFILL_CHUNK_ROWS=1536`)
-
-A Flash-Next EP load reserves VRAM for one prefill chunk (4,096 rows on
-gfx1201) before it decides how many routed-expert layers stay resident; the
-rest are read from pinned host memory every decode step. With
-`HIPFIRE_PREFILL_CHUNK_ROWS=1536` (config `prefill.chunk_rows = 1536`) the
-reserve shrinks from 8.53 to 5.86 GiB and EP2 on two 32 GB R9700s keeps 33
-instead of 29 of the 49 MoE layers resident. This is an opt-in trade, not a
-default:
-
-- **Decode-heavy use:** native MTP decode +8.3% on code and +6.2% on prose
-  (EP2, 3 fresh processes per arm; 81.1 → 87.8 and 63.2 → 67.1 tok/s).
-- **Prefill is about 1.6× slower:** each smaller chunk still streams the
-  peer's experts once, so a 9,319-token prompt prefills at 1,406 instead of
-  ~2,270 tok/s (TTFT 6.6 s instead of 4.1 s).
-- **Prompts longer than 1,536 tokens are a separate numerics configuration.**
-  EP2 at 1,536 is byte-identical to one card at 1,536, but not to the default
-  4,096-row chunk: the chunk boundaries change the prefill arithmetic, and
-  greedy output can differ from the first token. Prompts of 1,536 tokens or
-  fewer prefill in one chunk under both settings and are unaffected (expert
-  residency is bit-exact).
-
 ### Environment (operator-facing)
 
 Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
