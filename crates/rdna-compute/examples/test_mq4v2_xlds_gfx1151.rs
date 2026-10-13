@@ -122,7 +122,9 @@ fn alloc_outs(gpu: &mut Gpu, rows: &[usize], n: usize) -> Vec<GpuTensor> {
 
 fn fetch(gpu: &Gpu, ts: &[GpuTensor]) -> Vec<Vec<f32>> {
     gpu.hip.device_synchronize().expect("sync");
-    ts.iter().map(|t| gpu.download_f32(t).expect("download")).collect()
+    ts.iter()
+        .map(|t| gpu.download_f32(t).expect("download"))
+        .collect()
 }
 
 fn main() {
@@ -151,8 +153,18 @@ fn main() {
     let gate_up_cases: [(usize, usize, usize); 2] = [(17408, 17408, 5120), (1000, 1048, 2560)];
     for &(gm, um, k) in &gate_up_cases {
         let shape = format!("({gm},{um},K={k})");
-        let a_gate = gpu.upload_raw(&random_mq4v2(&mut rng, gm, k), &[gm * (k / 256) * GROUP_BYTES]).expect("up gate");
-        let a_up = gpu.upload_raw(&random_mq4v2(&mut rng, um, k), &[um * (k / 256) * GROUP_BYTES]).expect("up up");
+        let a_gate = gpu
+            .upload_raw(
+                &random_mq4v2(&mut rng, gm, k),
+                &[gm * (k / 256) * GROUP_BYTES],
+            )
+            .expect("up gate");
+        let a_up = gpu
+            .upload_raw(
+                &random_mq4v2(&mut rng, um, k),
+                &[um * (k / 256) * GROUP_BYTES],
+            )
+            .expect("up up");
         for &n in &ns {
             let xh: Vec<f32> = (0..n * k).map(|_| rng.range(-2.0, 2.0)).collect();
             let x = upload_f32(&mut gpu, &xh);
@@ -162,17 +174,39 @@ fn main() {
             set_flag(&mut gpu, false);
             gpu.gemm_gate_up_mq4g256v2_wmma(&a_gate, &a_up, &x, &ref_y[0], &ref_y[1], gm, um, k, n)
                 .expect("base gate_up");
-            gpu.gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(&a_gate, &a_up, &x, &got_y[0], &got_y[1], gm, um, k, n)
-                .expect("xlds gate_up");
-            let ok = compare("gate_up", &shape, n, &fetch(&gpu, &got_y), &fetch(&gpu, &ref_y));
+            gpu.gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(
+                &a_gate, &a_up, &x, &got_y[0], &got_y[1], gm, um, k, n,
+            )
+            .expect("xlds gate_up");
+            let ok = compare(
+                "gate_up",
+                &shape,
+                n,
+                &fetch(&gpu, &got_y),
+                &fetch(&gpu, &ref_y),
+            );
             all_ok &= ok;
             let wb = weight_bytes(&rows, k);
-            let base = timed(&mut gpu, |g| {
-                g.gemm_gate_up_mq4g256v2_wmma(&a_gate, &a_up, &x, &ref_y[0], &ref_y[1], gm, um, k, n).unwrap()
-            }, wb);
-            let xl = timed(&mut gpu, |g| {
-                g.gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(&a_gate, &a_up, &x, &got_y[0], &got_y[1], gm, um, k, n).unwrap()
-            }, wb);
+            let base = timed(
+                &mut gpu,
+                |g| {
+                    g.gemm_gate_up_mq4g256v2_wmma(
+                        &a_gate, &a_up, &x, &ref_y[0], &ref_y[1], gm, um, k, n,
+                    )
+                    .unwrap()
+                },
+                wb,
+            );
+            let xl = timed(
+                &mut gpu,
+                |g| {
+                    g.gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(
+                        &a_gate, &a_up, &x, &got_y[0], &got_y[1], gm, um, k, n,
+                    )
+                    .unwrap()
+                },
+                wb,
+            );
             report("gate_up", &shape, n, base, xl);
         }
     }
@@ -184,7 +218,13 @@ fn main() {
         let rows = [qm, zm, bm, am];
         let w: Vec<GpuTensor> = rows
             .iter()
-            .map(|&m| gpu.upload_raw(&random_mq4v2(&mut rng, m, k), &[m * (k / 256) * GROUP_BYTES]).expect("up w"))
+            .map(|&m| {
+                gpu.upload_raw(
+                    &random_mq4v2(&mut rng, m, k),
+                    &[m * (k / 256) * GROUP_BYTES],
+                )
+                .expect("up w")
+            })
             .collect();
         for &n in &ns {
             let xh: Vec<f32> = (0..n * k).map(|_| rng.range(-2.0, 2.0)).collect();
@@ -192,19 +232,47 @@ fn main() {
             let ref_y = alloc_outs(&mut gpu, &rows, n);
             let got_y = alloc_outs(&mut gpu, &rows, n);
             set_flag(&mut gpu, false);
-            gpu.gemm_qkvza_mq4g256v2_wmma(&w[0], &w[1], &w[2], &w[3], &x, &ref_y[0], &ref_y[1], &ref_y[2], &ref_y[3], qm, zm, bm, am, k, n)
-                .expect("base qkvza");
-            gpu.gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(&w[0], &w[1], &w[2], &w[3], &x, &got_y[0], &got_y[1], &got_y[2], &got_y[3], qm, zm, bm, am, k, n)
-                .expect("xlds qkvza");
-            let ok = compare("qkvza", &shape, n, &fetch(&gpu, &got_y), &fetch(&gpu, &ref_y));
+            gpu.gemm_qkvza_mq4g256v2_wmma(
+                &w[0], &w[1], &w[2], &w[3], &x, &ref_y[0], &ref_y[1], &ref_y[2], &ref_y[3], qm, zm,
+                bm, am, k, n,
+            )
+            .expect("base qkvza");
+            gpu.gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(
+                &w[0], &w[1], &w[2], &w[3], &x, &got_y[0], &got_y[1], &got_y[2], &got_y[3], qm, zm,
+                bm, am, k, n,
+            )
+            .expect("xlds qkvza");
+            let ok = compare(
+                "qkvza",
+                &shape,
+                n,
+                &fetch(&gpu, &got_y),
+                &fetch(&gpu, &ref_y),
+            );
             all_ok &= ok;
             let wb = weight_bytes(&rows, k);
-            let base = timed(&mut gpu, |g| {
-                g.gemm_qkvza_mq4g256v2_wmma(&w[0], &w[1], &w[2], &w[3], &x, &ref_y[0], &ref_y[1], &ref_y[2], &ref_y[3], qm, zm, bm, am, k, n).unwrap()
-            }, wb);
-            let xl = timed(&mut gpu, |g| {
-                g.gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(&w[0], &w[1], &w[2], &w[3], &x, &got_y[0], &got_y[1], &got_y[2], &got_y[3], qm, zm, bm, am, k, n).unwrap()
-            }, wb);
+            let base = timed(
+                &mut gpu,
+                |g| {
+                    g.gemm_qkvza_mq4g256v2_wmma(
+                        &w[0], &w[1], &w[2], &w[3], &x, &ref_y[0], &ref_y[1], &ref_y[2], &ref_y[3],
+                        qm, zm, bm, am, k, n,
+                    )
+                    .unwrap()
+                },
+                wb,
+            );
+            let xl = timed(
+                &mut gpu,
+                |g| {
+                    g.gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(
+                        &w[0], &w[1], &w[2], &w[3], &x, &got_y[0], &got_y[1], &got_y[2], &got_y[3],
+                        qm, zm, bm, am, k, n,
+                    )
+                    .unwrap()
+                },
+                wb,
+            );
             report("qkvza", &shape, n, base, xl);
         }
     }
@@ -216,7 +284,13 @@ fn main() {
         let rows = [qm, km, vm];
         let w: Vec<GpuTensor> = rows
             .iter()
-            .map(|&m| gpu.upload_raw(&random_mq4v2(&mut rng, m, k), &[m * (k / 256) * GROUP_BYTES]).expect("up w"))
+            .map(|&m| {
+                gpu.upload_raw(
+                    &random_mq4v2(&mut rng, m, k),
+                    &[m * (k / 256) * GROUP_BYTES],
+                )
+                .expect("up w")
+            })
             .collect();
         for &n in &ns {
             let xh: Vec<f32> = (0..n * k).map(|_| rng.range(-2.0, 2.0)).collect();
@@ -224,28 +298,52 @@ fn main() {
             let ref_y = alloc_outs(&mut gpu, &rows, n);
             let got_y = alloc_outs(&mut gpu, &rows, n);
             set_flag(&mut gpu, false);
-            gpu.gemm_qkv_mq4g256v2_wmma(&w[0], &w[1], &w[2], &x, &ref_y[0], &ref_y[1], &ref_y[2], qm, km, vm, k, n)
-                .expect("base qkv");
-            gpu.gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(&w[0], &w[1], &w[2], &x, &got_y[0], &got_y[1], &got_y[2], qm, km, vm, k, n)
-                .expect("xlds qkv");
+            gpu.gemm_qkv_mq4g256v2_wmma(
+                &w[0], &w[1], &w[2], &x, &ref_y[0], &ref_y[1], &ref_y[2], qm, km, vm, k, n,
+            )
+            .expect("base qkv");
+            gpu.gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(
+                &w[0], &w[1], &w[2], &x, &got_y[0], &got_y[1], &got_y[2], qm, km, vm, k, n,
+            )
+            .expect("xlds qkv");
             let ok = compare("qkv", &shape, n, &fetch(&gpu, &got_y), &fetch(&gpu, &ref_y));
             all_ok &= ok;
             let wb = weight_bytes(&rows, k);
-            let base = timed(&mut gpu, |g| {
-                g.gemm_qkv_mq4g256v2_wmma(&w[0], &w[1], &w[2], &x, &ref_y[0], &ref_y[1], &ref_y[2], qm, km, vm, k, n).unwrap()
-            }, wb);
-            let xl = timed(&mut gpu, |g| {
-                g.gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(&w[0], &w[1], &w[2], &x, &got_y[0], &got_y[1], &got_y[2], qm, km, vm, k, n).unwrap()
-            }, wb);
+            let base = timed(
+                &mut gpu,
+                |g| {
+                    g.gemm_qkv_mq4g256v2_wmma(
+                        &w[0], &w[1], &w[2], &x, &ref_y[0], &ref_y[1], &ref_y[2], qm, km, vm, k, n,
+                    )
+                    .unwrap()
+                },
+                wb,
+            );
+            let xl = timed(
+                &mut gpu,
+                |g| {
+                    g.gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(
+                        &w[0], &w[1], &w[2], &x, &got_y[0], &got_y[1], &got_y[2], qm, km, vm, k, n,
+                    )
+                    .unwrap()
+                },
+                wb,
+            );
             report("qkv", &shape, n, base, xl);
         }
     }
 
     // residual (Y += W@X)
-    let residual_cases: [(usize, usize); 4] = [(5120, 17408), (5120, 6144), (248320, 5120), (1000, 1536)];
+    let residual_cases: [(usize, usize); 4] =
+        [(5120, 17408), (5120, 6144), (248320, 5120), (1000, 1536)];
     for &(m, k) in &residual_cases {
         let shape = format!("(M={m},K={k})");
-        let a = gpu.upload_raw(&random_mq4v2(&mut rng, m, k), &[m * (k / 256) * GROUP_BYTES]).expect("up w");
+        let a = gpu
+            .upload_raw(
+                &random_mq4v2(&mut rng, m, k),
+                &[m * (k / 256) * GROUP_BYTES],
+            )
+            .expect("up w");
         for &n in &ns {
             let xh: Vec<f32> = (0..n * k).map(|_| rng.range(-2.0, 2.0)).collect();
             let x = upload_f32(&mut gpu, &xh);
@@ -253,8 +351,10 @@ fn main() {
             let y_ref = upload_f32(&mut gpu, &yh);
             let y_got = upload_f32(&mut gpu, &yh);
             set_flag(&mut gpu, false);
-            gpu.gemm_mq4g256v2_residual_wmma(&a, &x, &y_ref, m, k, n).expect("base residual");
-            gpu.gemm_mq4g256v2_residual_wmma_gfx1151_xlds(&a, &x, &y_got, m, k, n).expect("xlds residual");
+            gpu.gemm_mq4g256v2_residual_wmma(&a, &x, &y_ref, m, k, n)
+                .expect("base residual");
+            gpu.gemm_mq4g256v2_residual_wmma_gfx1151_xlds(&a, &x, &y_got, m, k, n)
+                .expect("xlds residual");
             let ok = compare(
                 "residual",
                 &shape,
@@ -266,8 +366,22 @@ fn main() {
             let wb = weight_bytes(&[m], k);
             // Timing accumulates into scratch outputs (Y += W@X), not the checked ones.
             let y_t = upload_f32(&mut gpu, &yh);
-            let base = timed(&mut gpu, |g| g.gemm_mq4g256v2_residual_wmma(&a, &x, &y_t, m, k, n).unwrap(), wb);
-            let xl = timed(&mut gpu, |g| g.gemm_mq4g256v2_residual_wmma_gfx1151_xlds(&a, &x, &y_t, m, k, n).unwrap(), wb);
+            let base = timed(
+                &mut gpu,
+                |g| {
+                    g.gemm_mq4g256v2_residual_wmma(&a, &x, &y_t, m, k, n)
+                        .unwrap()
+                },
+                wb,
+            );
+            let xl = timed(
+                &mut gpu,
+                |g| {
+                    g.gemm_mq4g256v2_residual_wmma_gfx1151_xlds(&a, &x, &y_t, m, k, n)
+                        .unwrap()
+                },
+                wb,
+            );
             report("residual", &shape, n, base, xl);
         }
     }
