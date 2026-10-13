@@ -7,7 +7,7 @@ use railgun::npu::trunk::{NpuTrunkRuntime, LayerPanels, PanelProgram, Seq};
 use rdna_compute::tensor_ops::Bf16Arena;
 use hipfire_dispatch::pipeline::{
     execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
-    execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered,
+    execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered, gdn_qkv_projection_bf16,
 };
 use std::{ffi::c_void, io::Write};
 
@@ -416,18 +416,8 @@ impl NpuForward {
         match step {
             Step::GatedDeltaNet(op) => {
                 let mut qkv = op.projection.sub_offset(0, op.rows * 10240);
-                let dims = rdna_compute::tensor_ops::GatedDeltaStepBatched {
-                    projection: op.projection2, gate: op.gate, beta: op.beta,
-                    state: op.recurrent, output: op.recurrent_output, row_states: None,
-                    rows: op.rows, qkv_width: 10240, key_heads: op.key_heads,
-                    value_heads: op.value_heads, key_dim: op.key_dim,
-                    value_dim: op.value_dim, position: op.start_position,
-                };
                 // Match the core's native projection dtype, including chunk-off.
-                if op.key_dim==128 && op.value_dim==128 && op.conv_kernel==4
-                    && rdna_compute::tensor_ops::gated_delta_chunk_route(gpu,&dims)
-                    && gpu.gemm_mq6g256v2_xf16_applies(2560,op.rows)
-                { qkv.dtype=DType::BF16; }
+                if gdn_qkv_projection_bf16(gpu, op) { qkv.dtype=DType::BF16; }
                 Ok(qkv)
             }
             Step::IndexedAttention(op) => Ok(op.qgate_scratch.sub_offset(0, op.rows * 12288)),

@@ -1735,6 +1735,45 @@ impl GatedDeltaNetOp<'_> {
     }
 }
 
+/// Whether the native GDN mixer stores `op`'s qkv projection as BF16 (the
+/// chunked batched route with a BF16-storing MQ6/MQ4 GEMM), i.e. the dtype of
+/// `op.projection` that [`execute_gated_delta_net`] writes and its convolution
+/// reads. Exported so producers outside the dispatch (the NPU trunk twin) write
+/// the same layout instead of re-deriving it.
+pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
+    let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
+        && gpu.route_rows(op.rows) > 1
+        && op.key_dim == 128
+        && op.value_dim == 128
+        && op.conv_kernel == 4;
+    let dims = GatedDeltaStepBatched {
+        projection: op.projection2,
+        gate: op.gate,
+        beta: op.beta,
+        state: op.recurrent,
+        output: op.recurrent_output,
+        row_states: None,
+        rows: op.rows,
+        qkv_width: op.key_heads * op.key_dim * 2 + op.value_heads * op.value_dim,
+        key_heads: op.key_heads,
+        value_heads: op.value_heads,
+        key_dim: op.key_dim,
+        value_dim: op.value_dim,
+        position: op.start_position,
+    };
+    persistent_batch
+        && gated_delta_chunk_route(gpu, &dims)
+        && match op.qkv.dtype {
+            DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(op.qkv.k, op.rows),
+            DType::MQ4G256V2 => {
+                gpu.gemm_mq4g256v2_pm_applies(op.qkv.k, op.rows)
+                    && !(op.trunk_a4 & TrunkFamily::GdnQkv.bit() != 0
+                        && gpu.qwen4_trunk_iu4_applies(op.rows))
+            }
+            _ => false,
+        }
+}
+
 pub fn execute_gated_delta_net(
     gpu: &mut Gpu,
     op: &GatedDeltaNetOp<'_>,
