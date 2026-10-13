@@ -75,7 +75,7 @@ anything above.
 > (`is_x86_feature_detected!("avx512f") == true`, measured 2026-09-27); the base
 > record's "AVX-512 is not available on this host (Zen 3)" is wrong, and
 > `/proc/cpuinfo` alone has been misread here before. The CPU kernels are gated on
-> AVX2+FMA+F16C **for portability, not because of this box**: the fleet's `k9lin`
+> AVX2+FMA+F16C **for portability, not because of this box**: the fleet's RDNA3 workstation
 > is a Zen 2 AM4 with no AVX-512, so an AVX-512 kernel without its own
 > `is_x86_feature_detected!` gate would be a win here and a `SIGILL` there.
 
