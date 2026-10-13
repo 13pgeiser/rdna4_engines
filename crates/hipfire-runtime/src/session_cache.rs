@@ -355,9 +355,12 @@ impl SessionCache {
     }
 
     /// Published on the device or on disk.
-    fn present(&self, key: &Key) -> bool {
-        self.pool.contains(&key.0, key.1, key.2)
-            || self.disk.as_ref().is_some_and(|disk| disk.contains(key))
+    fn present(&self, domain: &CacheDomain, p: u64, fp: u64) -> bool {
+        self.pool.contains(domain, p, fp)
+            || self
+                .disk
+                .as_ref()
+                .is_some_and(|disk| disk.pool.contains(domain, p, fp))
     }
 
     /// Longest cached prefix of `prompt` (always shorter than the prompt, so
@@ -385,7 +388,7 @@ impl SessionCache {
             .snapshot_boundaries(prompt, resident, prompt.len() - 1)
             .into_iter()
             .rev()
-            .find(|&p| self.present(&(domain.clone(), p as u64, prefix_fingerprint(&prompt[..p]))))
+            .find(|&p| self.present(&domain, p as u64, prefix_fingerprint(&prompt[..p])))
             .unwrap_or(resident)
     }
 
@@ -911,7 +914,7 @@ impl SessionCache {
         turn.boundaries.pop_front();
         let (domain, route, p) = (turn.domain.clone(), turn.route, prefix.len());
         let fp = prefix_fingerprint(prefix);
-        let in_pool = self.present(&(domain.clone(), p as u64, fp));
+        let in_pool = self.present(&domain, p as u64, fp);
         let growth = state.growth_reserve_bytes(gpu);
         let ancestors: Vec<Key> = if in_pool {
             Vec::new()
