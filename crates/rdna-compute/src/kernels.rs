@@ -9730,7 +9730,7 @@ pub const EP_TILE_MASK_PM_GFX1201: &[u8] =
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE peer tile pull,
 /// gfx1201 only (`hipfire-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm --arch
 /// gfx1201`, M7 obligation-free): copies the rows of every non-owned live tile from the
-/// peer's `y_down_grouped` onto the local buffer.
+/// owner rank's `y_down_grouped` (one of four source bases, 2 or 4 ranks) onto the local buffer.
 pub const EP_TILE_PULL_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1201.hxaco");
 

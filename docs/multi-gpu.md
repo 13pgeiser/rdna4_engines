@@ -297,7 +297,6 @@ input); non-owned tiles' activation rows are never consumed. Diagnostics:
 tile by tile, the FFN output and the HC streams of selected layers for
 bitwise comparison with a single card (`fn-ep/coal/s1/compare_chunk.py`).
 
-||||||| parent of c7bb368cc (feat(qwen4-ep): stage compact rank experts without changing decode waits)
 ### Flash-Next EP: long-prefill expert staging
 
 `HIPFIRE_EP_EXPERT_STAGE=1` (default off, exact `1` only) admits the existing
@@ -322,6 +321,24 @@ prefill. Owned expert `e` points at donor slot `e / ranks`. Internally
 table once before binding; compact tables are built at load. The compact-route
 binder may call `tables_compact(layer)`; `tables(layer)` also selects the last
 prepared runtime kind. Single-card tables retain their original parity layout.
+
+### Rehostable owner-routed tile exchange
+
+The PeaceMaker tile mask and pull kernels and runtime `EpTileExchange` are
+model-independent building blocks for two or four ranks on gfx1201. The mask
+reads `owner_table[expert]`; the pull selects one of four registered source
+bases by that same logical owner rank. Every rank waits all peers' ready
+events before pulling, and all peers' done events before overwriting its
+grouped-row buffer. Two alternating event pairs and two host barriers per
+exchange preserve the buffer lifetime without another row bank.
+
+The owner table can be derived from the generic runtime's
+`ExpertExecutionPlan::rank_ownership()` (`ExpertRankOwnership`), retaining
+logical ranks rather than physical device IDs. This transport does not change
+the generic EP schedule's numerical combine contract or attach itself to a
+model. The Flash-Next admission, route binding, verdict propagation and
+expert-staging plumbing above remain EP2-only pending their generic-engine
+rehost; adding EP4 transport support does not admit those levers on EP4.
 
 
 ### Environment (operator-facing)

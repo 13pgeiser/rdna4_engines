@@ -2,49 +2,86 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Flash-Next expert-parallel (EP2) owner-routed chunk MoE exchange transport
-//! (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`).
+//! Flash-Next expert-parallel (EP, 2 or 4 ranks) owner-routed chunk MoE
+//! exchange transport (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`).
 //!
-//! Both ranks run the same router, top-k and stable grouping of a prefill chunk
+//! Every rank runs the same router, top-k and stable grouping of a prefill chunk
 //! layer, so the grouped row layout (`expert_tile_ids`, `sorted_slot_index`,
-//! `inverse_perm`) is byte-identical on both. Each rank runs the grouped
+//! `inverse_perm`) is byte-identical on all. Each rank runs the grouped
 //! symmetric IU4 GEMMs on the tiles of the experts it owns only (the dispatch
 //! layer's masked tile ids) and writes the BF16 grouped rows of those tiles into
 //! its `y_down_grouped`. This transport then gives each rank the peer-owned
-//! tiles' rows before the unchanged BF16-row combine reads them:
+//! tiles' rows before the unchanged BF16-row combine reads them. The owner
+//! table is the generic engine's (`ExpertRankOwnership`) per-expert owner rank,
+//! uploaded by the caller; this module only reads it on the device.
 //!
 //! 1. [`EpTileExchange::exchange`] records the rank's producer-complete event
 //!    `ready[k % 2]` after the routed down
 //!    (`HIP_EVENT_RELEASE_TO_SYSTEM`, as [`crate::ep_row_gather::EpRowGather`]
-//!    does), passes a host barrier, waits the peer's `ready[k % 2]` (a stream
-//!    wait when `gpu.active_stream` is installed, else a host
-//!    `hipEventSynchronize` — exactly the row gather's two branches), launches
-//!    the pull kernel (`ep_gather_grouped_rows_by_tile_owner`: for every live
-//!    tile of a peer-owned expert, copy the tile's sixteen rows of the PEER's
-//!    `y_down_grouped` onto the same rows of this rank's), records `done[k % 2]`
-//!    and passes a second host barrier. `k` is the rank's exchange counter; both
-//!    ranks execute the same invocation sequence (replicated routing, one
-//!    admission verdict per layer).
+//!    does), passes a host barrier, waits EVERY other rank's `ready[k % 2]`
+//!    (ascending rank; a stream wait when `gpu.active_stream` is installed,
+//!    else a host `hipEventSynchronize` — exactly the row gather's two
+//!    branches), launches ONE pull kernel
+//!    (`ep_gather_grouped_rows_by_tile_owner`: for every live tile of a
+//!    nonlocal-owned expert, copy the tile's sixteen rows of the OWNER's
+//!    `y_down_grouped`, selected from a four-slot source table, onto the same
+//!    rows of this rank's), records `done[k % 2]` and passes a second host
+//!    barrier. `k` is the rank's exchange counter; all ranks execute the same
+//!    invocation sequence (replicated routing, one admission verdict per layer).
 //! 2. [`EpTileExchange::before_down`] is called right before the NEXT
-//!    invocation's routed down writes `y_down_grouped`: it enqueues the wait for
-//!    the peer's `done[(k - 1) % 2]`. The peer's pull of THIS rank's rows ends
-//!    at that event, so the down may then overwrite them. The wait sits one
-//!    layer of trunk work after the pull it covers, so it is never exposed.
+//!    writer of `y_down_grouped` (the next invocation's routed down, or the
+//!    full-table route after an owner-routed layer): it enqueues the wait for
+//!    EVERY other rank's `done[(k - 1) % 2]`, even when all of this rank's
+//!    tiles were local (a peer may still be reading its owned rows). The wait
+//!    sits one layer of trunk work after the pull it covers, so it is never
+//!    exposed.
 //!
-//! Hazard argument (the `ep_row_gather` one, verbatim shape): `y_down_grouped`
-//! has one writer per row — the owner's down for owned tiles, the local pull for
-//! the rest — and the peer reads only this rank's OWNED rows, between this
-//! rank's `ready(k)` and the peer's `done(k)`. This rank overwrites those rows
-//! (layer k+1's down) only after `before_down` waited the peer's `done(k)`. Two
-//! alternating event pairs suffice because every invocation passes two host
-//! barriers: an event of parity `p` is re-recorded (invocation k+2) only after
-//! the peer enqueued its wait on the previous record of the same event
-//! (invocation k, before barrier 2 of k+1), and a host barrier guarantees an
-//! event is recorded before any peer enqueues a wait on it.
+//! # Hazard argument (N ranks, N in {2, 4})
+//!
+//! Fix a row `R` of rank `o`'s `y_down_grouped`, owned by `o` in exchange `k`.
+//! Its only writer in an exchange is `o`'s routed down (stream order on `o`):
+//! every rank's pull writes only ITS OWN `y_down_grouped`, onto rows whose
+//! owner is another rank, so a pull never writes a row any peer reads (peers
+//! read only rows their OWNER owns). Each row of a rank's buffer therefore has
+//! one writer stream, and rows of `o`'s buffer are read by a rank `r != o` only
+//! between `o`'s `ready(k)` and `r`'s `done(k)`.
+//!
+//! * Producer → reader, pairwise for each `(o, r)`: `o`'s down of `R` precedes
+//!   `ready_o(k)` in `o`'s stream; barrier 1 of `k` orders `ready_o(k)`'s
+//!   RECORD before `r`'s wait enqueue; `r`'s stream waits `ready_o(k)` before the
+//!   pull launch, so the pull's read of `R` follows `o`'s write. `r` waits all
+//!   `N-1` peers, so this holds for every pair simultaneously.
+//! * Reader → next writer, pairwise for each `(o, r)`: the pull's read of `R`
+//!   precedes `done_r(k)` in `r`'s stream. `o`'s next write of `R` (layer `k+1`'s
+//!   down, or a full-table-route writer) is preceded by `before_down`, which
+//!   enqueues a wait on `done_r(k)` for EVERY `r != o`, so the write follows
+//!   every reader's read. `waited` advances only after all `N-1` waits are
+//!   enqueued, so a partial wait set is never taken for a complete one (a
+//!   failure aborts and no later write is issued).
+//! * Event re-record. Two alternating event pairs suffice because every
+//!   invocation passes two host barriers. `ready_o` of parity `p` is
+//!   re-recorded at invocation `k+2` only after every rank `r != o` enqueued its
+//!   wait on the record of invocation `k` (those waits precede `r`'s `done(k)`
+//!   record and barrier 2 of `k`, which `o` passes before starting `k+1`). The
+//!   `done_r` of parity `p` is re-recorded at invocation `k+2`, after barrier 1
+//!   of `k+2`, hence after barrier 1 of `k+1`; every `o != r` enqueued its wait
+//!   on `done_r(k)` in `before_down` BEFORE recording its `ready(k+1)` (the
+//!   barrier-1 arrival), so all `N-1` waiters have submitted. Neither barrier is
+//!   N-specific: a host barrier over `ranks` parties orders each rank's earlier
+//!   enqueues before every rank's later ones.
+//! * Record before wait: barrier 1 follows every rank's `ready(k)` record and
+//!   precedes every wait on it. `done(k)` is recorded before barrier 2 of `k`
+//!   and waited only in a later `before_down`, after barrier 2.
+//! * Last pending done across route transitions: `before_down`'s obligation is
+//!   derived from the exchange counter alone ([`pending_done_parity`]), so the
+//!   last exchange's `done` stays owed through any number of layers that take
+//!   the full-table route (which do not exchange) until the first writer of
+//!   `y_down_grouped` after them calls `before_down`. Caller contract: every
+//!   writer of `y_down_grouped` after an exchange is preceded by `before_down`.
 //!
 //! Eager only (events, host barriers and peer reads are not usable inside a
 //! captured or retained body); no signal kernels; failures poison the barriers
-//! so the peer returns an error instead of waiting out the timeout.
+//! so the other ranks return an error instead of waiting out the timeout.
 //!
 //! # Lifetime
 //!
@@ -63,13 +100,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// Supported ranks: the pull kernel names exactly one peer source.
-pub const RANKS: usize = 2;
+/// Largest supported rank count: the pull kernel takes a four-slot source
+/// table. Supported counts are exactly 2 and this.
+pub const MAX_RANKS: usize = 4;
 
 /// Shape of the exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpTileExchangeSpec {
-    /// Participants; exactly [`RANKS`].
+    /// Participants; 2 or [`MAX_RANKS`].
     pub ranks: usize,
     /// Experts the owner table covers.
     pub experts: usize,
@@ -92,9 +130,9 @@ impl EpTileExchangeSpec {
     }
 
     pub fn validate(&self) -> HipResult<()> {
-        if self.ranks != RANKS {
+        if !matches!(self.ranks, 2 | MAX_RANKS) {
             return Err(err(format!(
-                "ep_tile_exchange: ranks must be {RANKS}, got {}",
+                "ep_tile_exchange: ranks must be 2 or {MAX_RANKS}, got {}",
                 self.ranks
             )));
         }
@@ -157,6 +195,32 @@ pub const fn pending_done_parity(done: u64) -> Option<usize> {
     }
 }
 
+/// Every rank except `rank`, ascending: the order each rank waits the others'
+/// `ready`/`done` events (at N=2 the single peer).
+fn peers(ranks: usize, rank: usize) -> impl Iterator<Item = usize> {
+    (0..ranks).filter(move |&r| r != rank)
+}
+
+/// The pull kernel's four-slot source table: slot `r` is rank `r`'s
+/// `y_down_grouped` base (this rank's own slot is its destination, a valid
+/// local base); slots past the rank count stay zero. A fixed stack array so
+/// an exchange allocates nothing.
+fn pull_sources(bases: impl Iterator<Item = usize>) -> [usize; MAX_RANKS] {
+    let mut sources = [0usize; MAX_RANKS];
+    for (slot, base) in sources.iter_mut().zip(bases) {
+        *slot = base;
+    }
+    sources
+}
+
+/// First device id that two ranks share, if any.
+fn shared_device(devices: &[i32]) -> Option<i32> {
+    devices
+        .iter()
+        .enumerate()
+        .find_map(|(i, d)| devices[..i].contains(d).then_some(*d))
+}
+
 struct RankReg {
     device_id: i32,
     base: usize,
@@ -193,9 +257,10 @@ impl EpTileExchangeBuilder {
         y_down_grouped: &GpuTensor,
     ) -> HipResult<()> {
         self.spec.validate()?;
-        if rank >= RANKS {
+        if rank >= self.spec.ranks {
             return Err(err(format!(
-                "ep_tile_exchange: register rank {rank} out of range (ranks={RANKS})"
+                "ep_tile_exchange: register rank {rank} out of range (ranks={})",
+                self.spec.ranks
             )));
         }
         if self.regs[rank].is_some() {
@@ -240,7 +305,7 @@ impl EpTileExchangeBuilder {
     /// Finish: every rank registered, distinct devices.
     pub fn build(self) -> HipResult<Arc<EpTileExchange>> {
         self.spec.validate()?;
-        let mut ranks = Vec::with_capacity(RANKS);
+        let mut ranks = Vec::with_capacity(self.spec.ranks);
         let mut missing = None;
         for (rank, reg) in self.regs.into_iter().enumerate() {
             match reg {
@@ -253,10 +318,10 @@ impl EpTileExchangeBuilder {
                 "ep_tile_exchange: rank {rank} never registered (builder dropped; registered events leak)"
             )));
         }
-        if ranks[0].device_id == ranks[1].device_id {
+        let devices: Vec<i32> = ranks.iter().map(|r| r.device_id).collect();
+        if let Some(device) = shared_device(&devices) {
             return Err(err(format!(
-                "ep_tile_exchange: two ranks share device {}",
-                ranks[0].device_id
+                "ep_tile_exchange: two ranks share device {device}"
             )));
         }
         let states = ranks
@@ -274,7 +339,7 @@ impl EpTileExchangeBuilder {
             .collect();
         Ok(Arc::new(EpTileExchange {
             spec: self.spec,
-            barrier: SpinBarrier::new(RANKS, self.barrier_timeout),
+            barrier: SpinBarrier::new(self.spec.ranks, self.barrier_timeout),
             ranks: states,
         }))
     }
@@ -294,7 +359,7 @@ struct RankState {
     done: [Mutex<Option<Event>>; 2],
     /// Exchanges this rank has run (its invocation counter `k`).
     exchanged: AtomicU64,
-    /// Exchanges whose peer completion this rank already waited for.
+    /// Exchanges whose peer completions this rank already waited for (all peers).
     waited: AtomicU64,
     peers_enabled: AtomicBool,
 }
@@ -311,7 +376,7 @@ impl EpTileExchange {
     pub fn builder(spec: EpTileExchangeSpec) -> EpTileExchangeBuilder {
         EpTileExchangeBuilder {
             spec,
-            regs: (0..RANKS).map(|_| None).collect(),
+            regs: (0..spec.ranks.min(MAX_RANKS)).map(|_| None).collect(),
             barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
         }
     }
@@ -326,9 +391,10 @@ impl EpTileExchange {
     }
 
     fn check(&self, gpu: &Gpu, rank: usize) -> HipResult<()> {
-        if rank >= RANKS {
+        if rank >= self.spec.ranks {
             return Err(err(format!(
-                "ep_tile_exchange: rank {rank} out of range (ranks={RANKS})"
+                "ep_tile_exchange: rank {rank} out of range (ranks={})",
+                self.spec.ranks
             )));
         }
         if gpu.device_id != self.ranks[rank].device_id {
@@ -340,26 +406,26 @@ impl EpTileExchange {
         Ok(())
     }
 
-    /// Enable P2P from this rank's device to the peer's (idempotent; the row
-    /// gather's `enable_peers` already did it on the production path). Call on
+    /// Enable P2P from this rank's device to EVERY other rank's (idempotent; the
+    /// row gather's `enable_peers` already did it on the production path). Call on
     /// the rank's thread AFTER every peer-read allocation exists — ROCm does
     /// not map later allocations.
     pub fn enable_peers(&self, rank: usize, gpu: &mut Gpu) -> HipResult<()> {
         self.check(gpu, rank)?;
         gpu.bind_thread()?;
-        let peer = &self.ranks[1 - rank];
-        if !gpu.hip.can_access_peer(gpu.device_id, peer.device_id)? {
-            return Err(err(format!(
-                "ep_tile_exchange: device {} cannot access peer device {} (rank {rank} -> {})",
-                gpu.device_id,
-                peer.device_id,
-                1 - rank
-            )));
-        }
-        match gpu.hip.enable_peer_access(peer.device_id) {
-            Ok(()) => {}
-            Err(e) if e.code == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED => {}
-            Err(e) => return Err(e),
+        for q in peers(self.spec.ranks, rank) {
+            let peer = &self.ranks[q];
+            if !gpu.hip.can_access_peer(gpu.device_id, peer.device_id)? {
+                return Err(err(format!(
+                    "ep_tile_exchange: device {} cannot access peer device {} (rank {rank} -> {q})",
+                    gpu.device_id, peer.device_id
+                )));
+            }
+            match gpu.hip.enable_peer_access(peer.device_id) {
+                Ok(()) => {}
+                Err(e) if e.code == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED => {}
+                Err(e) => return Err(e),
+            }
         }
         self.ranks[rank].peers_enabled.store(true, Ordering::Release);
         Ok(())
@@ -387,10 +453,14 @@ impl EpTileExchange {
     }
 
     /// Right before this rank's routed down (or any other writer of
-    /// `y_down_grouped`) overwrites `y_down_grouped`: wait for the peer to have
-    /// finished pulling this rank's rows of the last exchange (the peer's
-    /// `done` of that exchange). A no-op before the first exchange and when
-    /// that wait was already enqueued (once per exchange).
+    /// `y_down_grouped`, including the full-table route after an owner-routed
+    /// layer) overwrites `y_down_grouped`: wait for EVERY peer to have finished
+    /// pulling this rank's rows of the last exchange (each peer's `done` of that
+    /// exchange), ascending rank, whether or not this rank's own tiles were all
+    /// local — a peer may still be reading any owned row. A no-op before the
+    /// first exchange and when those waits were already enqueued (once per
+    /// exchange). `waited` advances only after every peer wait was enqueued; any
+    /// failure aborts the transport.
     pub fn before_down(&self, gpu: &mut Gpu, rank: usize) -> HipResult<()> {
         self.check(gpu, rank)?;
         if self.is_aborted() {
@@ -405,7 +475,8 @@ impl EpTileExchange {
             return Ok(());
         }
         gpu.bind_thread()?;
-        let result = self.wait_peer(gpu, &self.ranks[1 - rank].done[p], "done wait");
+        let result = peers(self.spec.ranks, rank)
+            .try_for_each(|q| self.wait_peer(gpu, &self.ranks[q].done[p], "done wait"));
         match result {
             Ok(()) => me.waited.store(exchanged, Ordering::Release),
             Err(_) => self.abort(),
@@ -413,13 +484,15 @@ impl EpTileExchange {
         result
     }
 
-    /// One exchange: publish `y_down_grouped` → host barrier → wait the peer's
-    /// producer event → pull the peer-owned live tiles → record the completion
-    /// event → host barrier. `tile_ids` is the UNMASKED scatter output,
-    /// `owner_table` the device table of the owner rank per expert, `tiles` the
-    /// padded tile capacity of the layout, `y_down_grouped` this rank's
-    /// registered buffer. A failure poisons the barriers so the peer returns
-    /// an error instead of waiting out the timeout.
+    /// One exchange: publish `y_down_grouped` → host barrier → wait EVERY
+    /// peer's producer event (ascending rank) → pull the live tiles of every
+    /// peer-owned expert in one launch → record the completion event → host
+    /// barrier. `tile_ids` is the UNMASKED scatter output, `owner_table` the
+    /// device table of the owner rank per expert (`ExpertRankOwnership`
+    /// semantics: values in `0..ranks`), `tiles` the padded tile capacity of
+    /// the layout, `y_down_grouped` this rank's registered buffer. A failure
+    /// poisons the barriers so the other ranks return an error instead of
+    /// waiting out the timeout.
     pub fn exchange(
         &self,
         gpu: &mut Gpu,
@@ -448,8 +521,8 @@ impl EpTileExchange {
         self.check(gpu, rank)?;
         self.spec.check_call(tiles)?;
         gpu.bind_thread()?;
+        let ranks = self.spec.ranks;
         let me = &self.ranks[rank];
-        let peer = &self.ranks[1 - rank];
         if !me.peers_enabled.load(Ordering::Acquire) {
             return Err(err(format!(
                 "ep_tile_exchange: exchange on rank {rank} before enable_peers"
@@ -464,14 +537,20 @@ impl EpTileExchange {
         let p = parity(k);
         self.record(gpu, &me.ready[p], "publish")?;
         self.barrier.wait().map_err(|m| err(m.into()))?;
-        self.wait_peer(gpu, &peer.ready[p], "ready wait")?;
+        for q in peers(ranks, rank) {
+            self.wait_peer(gpu, &self.ranks[q].ready[p], "ready wait")?;
+        }
+        // Local base allowed (slot `rank` is this rank's own `y_down_grouped`);
+        // slots past `ranks` stay zero. Fixed array: no per-exchange allocation.
+        let sources = pull_sources(self.ranks.iter().map(|r| r.base));
         gpu.ep_gather_grouped_rows_by_tile_owner(
             tile_ids,
             owner_table,
-            peer.base,
+            sources,
             y_down_grouped,
             tiles,
             self.spec.experts,
+            ranks,
             rank,
             self.spec.row_u4,
         )?;
@@ -481,7 +560,7 @@ impl EpTileExchange {
         Ok(())
     }
 
-    /// One cross-rank host barrier (both ranks call it at the same point). A timeout or an
+    /// One cross-rank host barrier (every rank calls it at the same point). A timeout or an
     /// abort returns Err and poisons the transport.
     pub fn host_barrier(&self) -> HipResult<()> {
         self.barrier.wait().map_err(|m| err(m.into()))
@@ -557,9 +636,16 @@ mod tests {
     }
 
     #[test]
+    fn supported_rank_counts_validate() {
+        assert!(EpTileExchangeSpec { ranks: 2, ..spec(8) }.validate().is_ok());
+        assert!(EpTileExchangeSpec { ranks: 4, ..spec(8) }.validate().is_ok());
+    }
+
+    #[test]
     fn spec_validation_refuses_everything_else() {
-        assert!(EpTileExchangeSpec { ranks: 4, ..spec(8) }.validate().is_err());
-        assert!(EpTileExchangeSpec { ranks: 1, ..spec(8) }.validate().is_err());
+        for ranks in [0, 1, 3, 5, 8, usize::MAX] {
+            assert!(EpTileExchangeSpec { ranks, ..spec(8) }.validate().is_err(), "ranks={ranks}");
+        }
         assert!(EpTileExchangeSpec { experts: 0, ..spec(8) }.validate().is_err());
         assert!(EpTileExchangeSpec { experts: usize::MAX, ..spec(8) }.validate().is_err());
         assert!(EpTileExchangeSpec { row_u4: 0, ..spec(8) }.validate().is_err());
@@ -594,10 +680,84 @@ mod tests {
 
     #[test]
     fn builder_requires_valid_spec_and_all_ranks() {
-        let b = EpTileExchange::builder(EpTileExchangeSpec { ranks: 4, ..spec(8) });
-        assert!(b.build().is_err());
-        let b = EpTileExchange::builder(spec(8));
-        assert!(b.build().is_err(), "no rank registered");
+        // Unsupported rank counts fail at build on the spec, before any registration.
+        for ranks in [0, 1, 3, 5, 8] {
+            let b = EpTileExchange::builder(EpTileExchangeSpec { ranks, ..spec(8) });
+            assert!(b.build().is_err(), "ranks={ranks}");
+        }
+        // Supported counts with nothing registered: the missing registration is the refusal.
+        for ranks in [2, 4] {
+            let b = EpTileExchange::builder(EpTileExchangeSpec { ranks, ..spec(8) });
+            assert!(b.build().is_err(), "ranks={ranks}: no rank registered");
+        }
+    }
+
+    #[test]
+    fn builder_holds_one_slot_per_supported_rank() {
+        for ranks in [2, 4] {
+            let b = EpTileExchange::builder(EpTileExchangeSpec { ranks, ..spec(8) });
+            assert_eq!(b.regs.len(), ranks);
+            assert!(b.regs.iter().all(Option::is_none));
+        }
+        // An unsupported spec never sizes a registration table past MAX_RANKS.
+        let b = EpTileExchange::builder(EpTileExchangeSpec { ranks: usize::MAX, ..spec(8) });
+        assert!(b.regs.len() <= MAX_RANKS);
+    }
+
+    /// Every rank waits every OTHER rank's event, in ascending rank order; at N=2
+    /// that is the single peer (the original EP2 wait order).
+    #[test]
+    fn peer_wait_order_covers_every_other_rank_ascending() {
+        assert_eq!(peers(2, 0).collect::<Vec<_>>(), [1]);
+        assert_eq!(peers(2, 1).collect::<Vec<_>>(), [0]);
+        assert_eq!(peers(4, 0).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(peers(4, 1).collect::<Vec<_>>(), [0, 2, 3]);
+        assert_eq!(peers(4, 2).collect::<Vec<_>>(), [0, 1, 3]);
+        assert_eq!(peers(4, 3).collect::<Vec<_>>(), [0, 1, 2]);
+        // Pairwise coverage: every ordered pair (waiter, writer) appears exactly once.
+        for ranks in [2, 4] {
+            for waiter in 0..ranks {
+                for writer in 0..ranks {
+                    let hits = peers(ranks, waiter).filter(|&q| q == writer).count();
+                    assert_eq!(hits, usize::from(waiter != writer));
+                }
+            }
+        }
+    }
+
+    /// The pull kernel's source table: rank r's base at index r (the local base
+    /// stays valid), unused slots zero, fixed-size (no per-exchange allocation).
+    #[test]
+    fn pull_sources_layout() {
+        assert_eq!(pull_sources([0x1000, 0x2000].into_iter()), [0x1000, 0x2000, 0, 0]);
+        assert_eq!(
+            pull_sources([0x1000, 0x2000, 0x3000, 0x4000].into_iter()),
+            [0x1000, 0x2000, 0x3000, 0x4000]
+        );
+    }
+
+    #[test]
+    fn distinct_devices_required() {
+        assert_eq!(shared_device(&[0, 1]), None);
+        assert_eq!(shared_device(&[3, 1, 0, 2]), None);
+        assert_eq!(shared_device(&[0, 0]), Some(0));
+        assert_eq!(shared_device(&[0, 1, 2, 1]), Some(1));
+    }
+
+    /// N-rank schedule: after the exchange counter reaches `done`, every rank's
+    /// `before_down` waits the same parity of EVERY peer's `done`, once, and the
+    /// last pending done persists across any number of non-exchange (full-route)
+    /// layers because it is derived from the counter alone.
+    #[test]
+    fn last_pending_done_persists_across_full_route_layers() {
+        for done in 1..8u64 {
+            let p = pending_done_parity(done).unwrap();
+            assert_eq!(p, parity(done - 1));
+            // Layers on the full-table route do not advance the counter.
+            for _full_route_layer in 0..5 {
+                assert_eq!(pending_done_parity(done), Some(p));
+            }
+        }
     }
 
     #[test]

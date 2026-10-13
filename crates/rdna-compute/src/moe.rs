@@ -3252,21 +3252,26 @@ impl Gpu {
 
     /// Owner-routed chunk MoE tile pull: for every live tile whose expert another rank owns
     /// (`0 <= tile_ids[t] < n_experts` and `owner_table[tile_ids[t]] != rank`), copy the
-    /// tile's [`EP_TILE_ROWS`] grouped rows (`row_u4` uint4 each) of the PEER's grouped-rows
-    /// buffer at virtual address `peer_src` (peer-mapped device memory) onto the same rows of
-    /// `dst`. Rows of owned tiles, of the padding tail and of workgroups past `tiles` are never
-    /// written. Bit-exact uint4 copy; the certified builder kernel
+    /// tile's [`EP_TILE_ROWS`] grouped rows (`row_u4` uint4 each) of the OWNER's grouped-rows
+    /// buffer, the virtual address `sources[owner_table[tile_ids[t]]]` (peer-mapped device
+    /// memory), onto the same rows of `dst`. `ranks` (2 or 4, host validation only, not a
+    /// kernel argument) bounds the slots in use; `sources[rank]` may be `dst`'s own address
+    /// (the local slot is never read), every other slot below `ranks` must be a mapped peer
+    /// base, and slots from `ranks` up are passed as null. One launch and one code path serve
+    /// both rank counts. Rows of owned tiles, of the padding tail and of workgroups past
+    /// `tiles` are never written. Bit-exact uint4 copy; the certified builder kernel
     /// [`EP_TILE_PULL_PM_SYMBOL`], gfx1201 only. Stream-ordered on the active stream; the
-    /// caller orders it after the peer's producer event.
+    /// caller orders it after every peer's producer event.
     #[allow(clippy::too_many_arguments)]
     pub fn ep_gather_grouped_rows_by_tile_owner(
         &mut self,
         tile_ids: &GpuTensor,
         owner_table: &GpuTensor,
-        peer_src: usize,
+        sources: [usize; 4],
         dst: &GpuTensor,
         tiles: usize,
         n_experts: usize,
+        ranks: usize,
         rank: usize,
         row_u4: usize,
     ) -> HipResult<()> {
@@ -3284,8 +3289,11 @@ impl Gpu {
             ));
         }
         let word = std::mem::size_of::<i32>();
-        if tiles == 0 || n_experts == 0 || peer_src == 0 || rank > i32::MAX as usize {
-            return refuse("need tiles > 0, n_experts > 0, a peer base and a rank within i32");
+        if !matches!(ranks, 2 | 4) || rank >= ranks {
+            return refuse("ranks must be 2 or 4 and rank below ranks");
+        }
+        if tiles == 0 || n_experts == 0 || sources.iter().enumerate().any(|(r, &base)| r < ranks && r != rank && base == 0) {
+            return refuse("need tiles > 0, n_experts > 0 and a base for every peer rank");
         }
         let tile_u4 = EP_TILE_ROWS.checked_mul(row_u4).unwrap_or(0);
         if tile_u4 == 0 || tile_u4 % EP_TILE_PULL_TRIP_U4 != 0 {
@@ -3308,8 +3316,10 @@ impl Gpu {
         if dst.buf.size() < span {
             return refuse("the destination holds fewer than `tiles` tiles");
         }
-        if peer_src == dst.buf.as_ptr() as usize {
-            return refuse("the peer source is this rank's own buffer");
+        for (r, &base) in sources.iter().enumerate().take(ranks) {
+            if r != rank && base == dst.buf.as_ptr() as usize {
+                return refuse("a peer source is this rank's own buffer");
+            }
         }
         self.ensure_embedded_kernel(
             EP_TILE_PULL_PM_MODULE,
@@ -3318,14 +3328,19 @@ impl Gpu {
         )?;
         let ids = tile_ids.buf.as_ptr();
         let table = owner_table.buf.as_ptr();
-        let peer = peer_src as *mut c_void;
+        // Slots past `ranks` are never named by a valid owner table: pass them as null.
+        let srcs: [*mut c_void; 4] =
+            std::array::from_fn(|r| if r < ranks { sources[r] as *mut c_void } else { std::ptr::null_mut() });
         let out = dst.buf.as_ptr();
         let (experts_i32, rank_i32, tile_u4_i32, tiles_i32) =
             (n_experts as i32, rank as i32, tile_u4 as i32, tiles as i32);
         let mut params = [
             &ids as *const _ as *mut c_void,
             &table as *const _ as *mut c_void,
-            &peer as *const _ as *mut c_void,
+            &srcs[0] as *const _ as *mut c_void,
+            &srcs[1] as *const _ as *mut c_void,
+            &srcs[2] as *const _ as *mut c_void,
+            &srcs[3] as *const _ as *mut c_void,
             &out as *const _ as *mut c_void,
             &experts_i32 as *const _ as *mut c_void,
             &rank_i32 as *const _ as *mut c_void,
@@ -3343,7 +3358,9 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ids);
                 b.push_ptr(table);
-                b.push_ptr(peer);
+                for src in srcs {
+                    b.push_ptr(src);
+                }
                 b.push_ptr(out);
                 b.push_i32(experts_i32);
                 b.push_i32(rank_i32);
@@ -4208,13 +4225,18 @@ mod ep_tile_tests {
                 let owned_gpu = upload(&mut gpu, &vec![0x5Au8; tiles * 4]);
                 let dst_gpu = upload(&mut gpu, &vec![0xC3u8; tiles * tile_bytes]);
                 gpu.ep_tile_mask(&ids_gpu, &owned_gpu, &owner_gpu, tiles, EXPERTS, rank).expect("mask");
+                // N2: the local slot is this rank's destination, the other slot the stand-in peer.
+                let mut sources = [0usize; 4];
+                sources[rank] = dst_gpu.buf.as_ptr() as usize;
+                sources[1 - rank] = peer_gpu.buf.as_ptr() as usize;
                 gpu.ep_gather_grouped_rows_by_tile_owner(
                     &ids_gpu,
                     &owner_gpu,
-                    peer_gpu.buf.as_ptr() as usize,
+                    sources,
                     &dst_gpu,
                     tiles,
                     EXPERTS,
+                    2,
                     rank,
                     ROW_U4,
                 )

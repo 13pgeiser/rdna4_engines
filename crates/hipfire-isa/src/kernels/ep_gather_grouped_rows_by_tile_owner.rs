@@ -12,30 +12,34 @@
 //! tail, are never written. Pure `buffer_load_b128` / `buffer_store_b128`: the
 //! copy is bit-exact for every pattern (+-0, NaN payloads, denormals).
 //!
-//! ABI (eight arguments, 48 bytes): tile_ids `*i32` @0, owner_table `*i32` @8
-//! (one owner rank per expert), peer_src `*u8` @16 (the peer's `y_down_grouped`
-//! base), dst `*u8` @24 (this rank's), n_experts i32 @32, rank i32 @36, tile_u4
-//! i32 @40 (uint4 per tile = 16 rows x row_bytes / 16), tiles i32 @44. Grid
-//! `[tiles, 1, 1]` (the padded tile capacity), block 256, no LDS, no barrier,
-//! no scratch. Contract (the caller's checks): `tile_u4 % 1024 == 0`, `tiles *
-//! tile_u4 * 16 <= 2^32 - 1`, `tile_ids` holds `tiles` words, `owner_table`
-//! holds `n_experts` words, the peer base is mapped and the tile range is inside
-//! both buffers.
+//! ABI (eleven arguments, 72 bytes): tile_ids `*i32` @0, owner_table `*i32` @8
+//! (one owner rank per expert), src0..src3 `*u8` @16/@24/@32/@40 (the bases of
+//! rank 0..3's `y_down_grouped`; the entry of this rank may be the destination
+//! itself and the entries of ranks the launch does not use are never read), dst
+//! `*u8` @48 (this rank's), n_experts i32 @56, rank i32 @60, tile_u4 i32 @64
+//! (uint4 per tile = 16 rows x row_bytes / 16), tiles i32 @68. Grid `[tiles, 1,
+//! 1]` (the padded tile capacity), block 256, no LDS, no barrier, no scratch.
+//! Contract (the caller's checks): `tile_u4 % 1024 == 0`, `tiles * tile_u4 * 16
+//! <= 2^32 - 1`, `tile_ids` holds `tiles` words, `owner_table` holds `n_experts`
+//! words, every source slot an owner can name is mapped and the tile range is
+//! inside it and inside dst. One code path serves 2 and 4 ranks.
 //!
 //! Law (the same predicate as the mask kernel's complement):
 //! ```text
 //!   pull(t) = 0 <= tile_ids[t] < n_experts && owner_table[tile_ids[t]] != rank
-//!   pull(t) => dst[t * 16 rows ..+ 16 rows] = peer_src[same bytes]
+//!             && owner_table[tile_ids[t]] < 4
+//!   pull(t) => dst[t * 16 rows ..+ 16 rows] = src[owner_table[tile_ids[t]]][same bytes]
 //! ```
 //!
 //! Schedule: workgroup `t` reads its id with an SMEM load and returns
-//! (workgroup-uniform) when it is the padding sentinel / out of range or the
-//! owner is this rank, before any VMEM access. A pulling workgroup walks the
-//! tile `1024 * 16` bytes per trip through two raw buffer descriptors (the
-//! peer's virtual address is just a descriptor base): each lane keeps four
-//! `buffer_load_b128` in flight at byte `16 tid + {0, 4096, 8192, 12288}` of the
-//! trip, then stores them to the same offsets; the two bases advance by 16384
-//! bytes per trip (`tile_u4 / 1024` trips).
+//! (workgroup-uniform) when it is the padding sentinel / out of range, the
+//! owner is this rank or the owner is not a rank in `[0, 4)`, before any VMEM
+//! access. A pulling workgroup loads `src[owner]` with one SMEM load from the
+//! kernarg segment and walks the tile `1024 * 16` bytes per trip through two raw
+//! buffer descriptors (the owner's virtual address is just a descriptor base):
+//! each lane keeps four `buffer_load_b128` in flight at byte `16 tid + {0, 4096,
+//! 8192, 12288}` of the trip, then stores them to the same offsets; the two bases
+//! advance by 16384 bytes per trip (`tile_u4 / 1024` trips).
 use super::common::{add64, add64_imm, bload, bstore_b128, op, s, smem, sop, srd_tail, v};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, insn::Instruction, plan::Access, reg::{Kind, Live}};
 use peacemaker_author::{End, Gfx1201, Scc, WgUniform, Workgroup};
@@ -50,18 +54,21 @@ pub const UNROLL: u32 = 4;
 /// uint4 moved per workgroup trip; `tile_u4` is a multiple of it.
 pub const TRIP_U4: u32 = BLOCK * UNROLL;
 /// Kernarg bytes.
-pub const KERNARG_BYTES: u32 = 48;
+pub const KERNARG_BYTES: u32 = 72;
+/// Supported source slots (ranks 0..4); the EP2 launch passes two live bases.
+pub const MAX_RANKS: u32 = 4;
 
 pub fn symbol(arch: Arch) -> String { format!("ep_gather_grouped_rows_by_tile_owner_pm_{}", arch.name()) }
 pub fn module(arch: Arch) -> String { format!("ep_gather_grouped_rows_by_tile_owner_pm_{}", arch.name()) }
 
 // ---- SGPRs ------------------------------------------------------------------
 const KARG: u8 = 0;
-// kernarg words 0..8 -> s8..s15 (tile_ids 8:9, table 10:11, peer 12:13, dst 14:15), words 8..12 -> s16..s19.
-const TIDS: u8 = 8; const TABLE: u8 = 10; const PEER: u8 = 12; const DST: u8 = 14;
+// kernarg words 0..4 -> s8..s11 (tile_ids 8:9, table 10:11), dst (@48) -> s12:13, words @56..72 -> s16..s19.
+// The per-tile source base is loaded from kernarg[16 + 8 * owner] into SRC; KSLOT is that kernarg address.
+const TIDS: u8 = 8; const TABLE: u8 = 10; const DST: u8 = 12; const KSLOT: u8 = 14;
 const NEXP: u8 = 16; const RANK: u8 = 17; const TU4: u8 = 18; const TILES: u8 = 19;
 const WGX: u8 = 20; const ID: u8 = 21; const OWN: u8 = 22; const T0: u8 = 23; const T64: u8 = 24;
-const TRIPS: u8 = 26; const BYTES: u8 = 27;
+const TRIPS: u8 = 26; const BYTES: u8 = 27; const SRC: u8 = 28;
 // Source / destination raw buffer descriptors of the trip loop (4-aligned SGPR quads).
 const SRD_SRC: u8 = 32; const SRD_OUT: u8 = 36;
 const S_END: u8 = 40;
@@ -76,12 +83,15 @@ fn kernargs() -> KernargLayout {
     KernargLayout::new(KERNARG_BYTES)
         .pointer_access("tile_ids", 0, Access::ReadOnly)
         .pointer_access("owner_table", 8, Access::ReadOnly)
-        .pointer_access("peer_src", 16, Access::ReadOnly)
-        .pointer_access("dst", 24, Access::WriteOnly)
-        .hidden("n_experts", 32, 4, "by_value")
-        .hidden("rank", 36, 4, "by_value")
-        .hidden("tile_u4", 40, 4, "by_value")
-        .hidden("tiles", 44, 4, "by_value")
+        .pointer_access("src0", 16, Access::ReadOnly)
+        .pointer_access("src1", 24, Access::ReadOnly)
+        .pointer_access("src2", 32, Access::ReadOnly)
+        .pointer_access("src3", 40, Access::ReadOnly)
+        .pointer_access("dst", 48, Access::WriteOnly)
+        .hidden("n_experts", 56, 4, "by_value")
+        .hidden("rank", 60, 4, "by_value")
+        .hidden("tile_u4", 64, 4, "by_value")
+        .hidden("tiles", 68, 4, "by_value")
 }
 
 fn plan() -> Result<RegPlan, String> {
@@ -130,8 +140,9 @@ fn kernel(wg: &mut Wg) -> R {
 /// destination pairs at the tile's first byte and `TRIPS` = `tile_u4 / 1024`.
 fn prologue(wg: &mut Wg, end: &End) -> R {
     let b = wg.isa();
-    smem(b, TIDS, 8, KARG, 0x00)?;
-    smem(b, NEXP, 4, KARG, 0x20)?;
+    smem(b, TIDS, 4, KARG, 0x00)?;
+    smem(b, DST, 2, KARG, 0x30)?;
+    smem(b, NEXP, 4, KARG, 0x38)?;
     // Workgroup id x (gfx12: ttmp9) = the tile.
     sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?;
     let outside = cmp_wg(wg, format!("s_cmp_ge_u32 s{WGX}, s{TILES}"), &[s(WGX), s(TILES)])?;
@@ -150,13 +161,21 @@ fn prologue(wg: &mut Wg, end: &End) -> R {
     smem(b, OWN, 1, T64, 0)?;
     let mine = cmp_wg(wg, format!("s_cmp_eq_u32 s{OWN}, s{RANK}"), &[s(OWN), s(RANK)])?;
     wg.exit_if(mine, end)?;
+    // The owner is a rank in [0, 4): anything else (never produced by the caller) is not pulled,
+    // so the source-base lookup below stays inside the four source slots. Source base =
+    // kernarg[16 + 8 * owner] (one SMEM load at a scalar-computed kernarg address).
+    let range = cmp_wg(wg, format!("s_cmp_ge_u32 s{OWN}, {MAX_RANKS}"), &[s(OWN)])?;
+    wg.exit_if(range, end)?;
     // Tile byte offset = tile * tile_u4 * 16 (fits 32 bits by contract); trips; the
     // source / destination raw descriptors (base = pointer + tile offset, num_records =
     // the tile's bytes).
     let b = wg.isa();
+    sop(b, format!("s_lshl_b32 s{T0}, s{OWN}, 3"), &[T0], &[OWN])?;
+    add64(b, KSLOT, KARG, T0)?;
+    smem(b, SRC, 2, KSLOT, 16)?;
     sop(b, format!("s_lshl_b32 s{BYTES}, s{TU4}, 4"), &[BYTES], &[TU4])?;
     sop(b, format!("s_mul_i32 s{T0}, s{WGX}, s{BYTES}"), &[T0], &[WGX, BYTES])?;
-    add64(b, SRD_SRC, PEER, T0)?;
+    add64(b, SRD_SRC, SRC, T0)?;
     srd_tail(b, SRD_SRC, Some(BYTES))?;
     add64(b, SRD_OUT, DST, T0)?;
     srd_tail(b, SRD_OUT, Some(BYTES))?;

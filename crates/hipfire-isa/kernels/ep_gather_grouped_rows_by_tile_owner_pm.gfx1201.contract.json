@@ -5,8 +5,8 @@
     "s_barrier_signal": 0,
     "s_barrier_wait": 0,
     "s_endpgm": 1,
-    "s_load_b128": 1,
-    "s_load_b256": 1,
+    "s_load_b128": 2,
+    "s_load_b256": 0,
     "s_load_b32": 2
   },
   "forbidden": [
