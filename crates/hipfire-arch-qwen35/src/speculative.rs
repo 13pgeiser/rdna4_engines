@@ -1493,13 +1493,16 @@ impl DeltaNetSnapshot {
         Some((fwd_buf, rev_buf, n_items))
     }
 
-    /// S1 arch gate. gfx1100 (S1) and exact gfx1201 (railgun E0 port). The
-    /// kernel is a pure byte copy with no arch-specific code; the `_gfx1100`
-    /// suffix on its symbol is historical. `HIPFIRE_DN_SNAPSHOT_BULK_OFF=1`
-    /// opts out on both.
+    /// S1 arch gate. gfx1100 (S1), exact gfx1201 (railgun E0 port) and exact
+    /// gfx1151. The kernel is a pure byte copy with no arch-specific code
+    /// (plain `float4` loads/stores, no intrinsics); the `_gfx1100` suffix on
+    /// its symbol is historical. `HIPFIRE_DN_SNAPSHOT_BULK_OFF=1` opts out on
+    /// all three.
     fn bulk_arch(gpu: &Gpu) -> bool {
         !gpu.flags.dn_snapshot_bulk_off
-            && (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
+            && (gpu.arch_caps.is_gfx1100()
+                || gpu.arch_caps.is_gfx1151()
+                || gpu.arch_caps.is_gfx1201())
     }
 
     /// S1: shared fast-path gate. Returns the table + count to launch, or
@@ -1571,7 +1574,7 @@ impl DeltaNetSnapshot {
             bulk_n_items: 0,
             bulk_fingerprint: Self::bulk_fingerprint(state),
         };
-        // Arm the bulk route (gfx1100 / gfx1201): JIT + table upload happen
+        // Arm the bulk route (gfx1100 / gfx1151 / gfx1201): JIT + table upload happen
         // here at setup, never in a decode cycle. Any failure leaves the
         // snapshot on the legacy memcpy path.
         if Self::bulk_arch(gpu) {
@@ -1789,7 +1792,7 @@ impl DeltaNetSnapshot {
 
     /// Copy live state → backup (S/scale/conv + EF residual).
     ///
-    /// S1: on gfx1100/gfx1201 with armed tables and a matching fingerprint this is a
+    /// S1: on gfx1100/gfx1151/gfx1201 with armed tables and a matching fingerprint this is a
     /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
     /// the forward table (plus a stream sync preserving the synchronous
     /// contract); otherwise the legacy per-tensor memcpy loop below runs.
@@ -1869,7 +1872,7 @@ impl DeltaNetSnapshot {
 
     /// Copy backup → live state (rewinds recurrent + EF residual to the snapshot).
     ///
-    /// S1: on gfx1100/gfx1201 with armed tables and a matching fingerprint this is a
+    /// S1: on gfx1100/gfx1151/gfx1201 with armed tables and a matching fingerprint this is a
     /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
     /// the reverse table (plus a stream sync preserving the synchronous
     /// contract); otherwise the legacy per-tensor memcpy loop below runs.
@@ -3471,13 +3474,13 @@ impl HiddenStateRingBuffer {
         if let Some(stream) = gpu.active_stream.as_ref() {
             gpu.hip.stream_synchronize(stream)?;
         }
-        // S2 launch fusion: exact gfx1100 commit5 kernel. Copies
+        // S2 launch fusion: pure-copy commit5 kernel (exact gfx1100/gfx1151/gfx1201). Copies
         // staging[ext][r, :] -> layer_bufs[ext][(head + r) % max_pos, :] for
         // all five extracts in one launch (bit-identical: one writer per
         // destination element, no FP arithmetic on the data). The launch
         // also ensures the scatter5 symbol, which the same-cycle scatter
         // reuses without its own `&mut` ensure. Any failed predicate
-        // (non-gfx1100, kill switch, capture/recording, non-5-extract or
+        // (non-admitted arch, kill switch, capture/recording, non-5-extract or
         // non-F32 shapes, n > max_pos) falls through to today's loop.
         // Head/written advance only after successful enqueue, preserving the
         // existing stream synchronization boundary above.
@@ -6875,12 +6878,12 @@ pub fn scatter_hidden_block_to_interleaved(
     // block_size <= max_pos ⇒ r_skip = 0, identical behaviour.
     let r_skip = block_size.saturating_sub(max_pos);
     let start_slot = (head + max_pos - (block_size - r_skip)) % max_pos;
-    // S2 launch fusion: exact gfx1100 scatter5 kernel. Copies the retained
+    // S2 launch fusion: pure-copy scatter5 kernel (exact gfx1100/gfx1151/gfx1201). Copies the retained
     // block rows into dst[((dst_row_offset + r) % dst_modulus), ext, :] in
     // one launch (bit-identical: one writer per destination element, no FP
     // arithmetic on the data; usize::MAX keeps absolute addressing). The
     // symbol is ensured by the same-cycle fused commit, which strictly
-    // precedes every fused scatter; without it (seed paths, non-gfx1100,
+    // precedes every fused scatter; without it (seed paths, non-admitted arch,
     // kill switch, capture/recording, funny shapes) the launcher reports
     // false and the loop below runs byte-for-byte as before. Never mutates
     // head/written or the source ring.
