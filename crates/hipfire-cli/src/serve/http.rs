@@ -1309,9 +1309,9 @@ async fn handle_embeddings(
             ))
         }
     };
-    // One input per request (the daemon encodes serially; batching is a
-    // follow-up). A list of length 1 is accepted; anything else refuses
-    // rather than silently dropping inputs.
+    // One input per HTTP request; the multi-slot engine batches concurrent
+    // requests behind this endpoint. A list of length 1 is accepted; longer
+    // lists refuse rather than silently dropping inputs.
     let input = body
         .get("input")
         .ok_or_else(|| "input is required".to_string())?;
