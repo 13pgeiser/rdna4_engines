@@ -47722,8 +47722,9 @@ mod tests {
     fn splitk_ld_entries_match_source_and_registry() {
         let registered = crate::kernel_registry::lookup("gfx1201", "gemm_wmma_lds_splitk", "")
             .expect("gfx1201 split-K module");
-        let gfx1151 = crate::kernel_registry::lookup("gfx1151", "gemm_wmma_lds_splitk", "")
-            .expect("gfx1151 packed module");
+        for arch in ["gfx1100", "gfx1151"] {
+            assert!(crate::kernel_registry::lookup(arch, "gemm_wmma_lds_splitk", "").is_err());
+        }
         for tile in [
             LdsTileSplitK::new(64, 64, 32, 64, true, 1),
             LdsTileSplitK::new(64, 128, 32, 64, true, 1),
@@ -47733,7 +47734,6 @@ mod tests {
             assert!(splitk_ld_supported(tile, 128, 144, 160));
             let entry = splitk_ld_entry(tile).expect("admitted pitched split1 tile");
             assert!(registered.symbols.contains(&entry));
-            assert!(!gfx1151.symbols.contains(&entry));
             assert!(kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC
                 .contains(&format!("SK_KERNEL_LD({entry},")));
         }
