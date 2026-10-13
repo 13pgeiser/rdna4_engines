@@ -1319,18 +1319,24 @@ fn qwen4_ep_balanced_owners_enabled() -> bool {
     hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
 }
 
-/// `HIPFIRE_EP_OWNER_ROUTED_PREFILL=1` (default off): owner-routed chunk MoE on EP2 and EP4
-/// (rank-generic: owner of expert `e` is `e % ranks`). A prefill chunk of at least 512 rows
-/// whose layer verified symmetric on every rank runs the symmetric IU4 GEMMs on the compact
-/// (owned-experts-only) table with the tiles of the other ranks' experts masked out, then
-/// pulls each other-rank-owned tile's BF16 grouped down rows over P2P (`MoeTileExchange`)
-/// instead of computing every expert on every rank. Every other chunk keeps the full-table
-/// route. Anything but the exact value `1` is off, and off allocates nothing, lowers no
-/// stage and loads no kernel.
+/// `HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2; `=0` is the kill switch): owner-routed
+/// chunk MoE (rank-generic code; EP4 is still refused at admission). A prefill chunk of at least
+/// 512 rows whose layer verified symmetric on every rank runs the symmetric IU4 GEMMs on the
+/// compact (owned-experts-only) table with the tiles of the other ranks' experts masked out, then
+/// pulls each other-rank-owned tile's BF16 grouped down rows over P2P (`MoeTileExchange`) instead
+/// of computing every expert on every rank. Every other chunk keeps the full-table route. Only
+/// the exact value `0` is off (unset or any other value is on, like `HIPFIRE_EP_BALANCED_OWNERS`);
+/// every other admission condition still applies, and off allocates nothing, lowers no stage and
+/// loads no kernel.
 pub const QWEN4_EP_OWNER_ROUTED_PREFILL_ENV: &str = "HIPFIRE_EP_OWNER_ROUTED_PREFILL";
 
+/// The shared EP lever rule: default on, exact `0` off.
+fn ep_lever_on(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
 fn qwen4_ep_owner_routed_prefill_enabled() -> bool {
-    hipfire_config::developer_var(QWEN4_EP_OWNER_ROUTED_PREFILL_ENV).as_deref() == Ok("1")
+    ep_lever_on(hipfire_config::developer_var(QWEN4_EP_OWNER_ROUTED_PREFILL_ENV).ok().as_deref())
 }
 
 /// Rank counts the owner-routed chunk MoE admits: EP2 and EP4, matching the mesh
@@ -4170,7 +4176,7 @@ impl Qwen4GpuForward {
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
                 if ep.is_none()
-                    || (hipfire_config::developer_var(Qwen4ExpertStage::EP_ENV).as_deref() == Ok("1")
+                    || (ep_lever_on(hipfire_config::developer_var(Qwen4ExpertStage::EP_ENV).ok().as_deref())
                         && ep.as_ref().is_some_and(|state| state.tile.is_some()))
                 {
                     expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
@@ -7760,6 +7766,16 @@ impl PairShape {
 #[cfg(test)]
 mod ep_rank_generic_tests {
     use super::*;
+
+    /// Default on, exact `0` is the kill switch, anything else leaves it on.
+    #[test]
+    fn ep_levers_are_default_on_with_an_exact_zero_kill_switch() {
+        assert!(ep_lever_on(None));
+        assert!(ep_lever_on(Some("1")));
+        assert!(ep_lever_on(Some("")));
+        assert!(ep_lever_on(Some("true")));
+        assert!(!ep_lever_on(Some("0")));
+    }
 
     fn owners(table: &[u8]) -> Vec<i32> {
         table

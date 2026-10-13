@@ -265,7 +265,7 @@ MoE layers` at attach when it is on.
 
 Without the lever every EP rank runs the whole 512-expert grouped MoE of every
 prefill chunk, reading its peers' experts through P2P weight tables.
-`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1` (default off; EP2 on gfx1201; EP4 is refused at admission with `EP4 owner-routed prefill not yet gated` until its hardware cells have run, the code is rank-generic)
+`HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2 on gfx1201; `=0` is the kill switch, any other value or unset is on; single card unchanged; EP4 is refused at admission with `EP4 owner-routed prefill not yet gated` until its hardware cells have run, the code is rank-generic)
 splits that work. All ranks still run the router, top-k and stable grouping
 (a deterministic function of replicated bytes, so the grouped layout is
 identical everywhere). Each rank runs the grouped symmetric IU4 gate/up and
@@ -299,7 +299,7 @@ bitwise comparison with a single card (`fn-ep/coal/s1/compare_chunk.py`).
 
 ### Flash-Next EP: long-prefill expert staging
 
-`HIPFIRE_EP_EXPERT_STAGE=1` (default off, exact `1` only) admits the existing
+`HIPFIRE_EP_EXPERT_STAGE` (default ON under EP2 when the owner-routed prefill is admitted; `=0` is the kill switch, any other value or unset is on) admits the existing
 `HIPFIRE_QWEN4_EXPERT_STAGE` pipeline under expert parallelism. Each rank
 borrows its last two resident compact expert layers as alternating DMA stages,
 then restores their original bytes before the forward returns. Residency is
