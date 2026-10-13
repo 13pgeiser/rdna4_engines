@@ -69,11 +69,7 @@ __global__ void HIPFIRE_QWEN35_FA_PREP_KERNEL(
     sdata[tid] = normed;
     __syncthreads();
 
-    // Match rope_partial_halfsplit_f32's source expression, pair mapping, AND
-    // FMA contraction: clang's natural contraction of the standalone kernel's
-    // `q0 * sin_a + q1 * cos_a` is fma(q1, cos_a, q0*sin_a); writing the
-    // sin-branch with the other operand order (or uncontracted) produces
-    // ulp-level diffs that flip greedy tokens (observed on 16Q/4K).
+    // Match rope_partial_halfsplit_f32's source expression and pair mapping.
     if (tid < HALF) {
         const int pos = *pos_buf;
         const float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)NROT);

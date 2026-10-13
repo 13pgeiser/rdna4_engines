@@ -8273,6 +8273,11 @@ pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
 
 /// Exact gfx1100 Qwen3.6 full-attention decode preparation: deinterleave Q and
 /// gate, RMS-normalize Q/K, then apply partial half-split RoPE head-locally.
+/// Its RoPE sin-branch must keep the standalone `rope_partial_halfsplit_f32`
+/// FMA contraction (`fma(q1, cos_a, q0 * sin_a)`): another operand order, or
+/// no contraction, gives ulp-level diffs that flip greedy tokens (seen on
+/// 16Q/4K). The note lives here because the `.hip` bytes feed frozen module
+/// manifests.
 pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
 /// Qwen3.6-27B 24Q/4K body shared by the gfx1100 and exact-gfx1201 twins. The
